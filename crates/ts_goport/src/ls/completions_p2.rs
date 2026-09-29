@@ -623,11 +623,15 @@ impl LanguageService {
             } else {
                 dot.end()
             };
-            replacement_span = Some(self.create_lsp_range_from_bounds(
+            let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(
                 astnav::get_start_of_node(dot, file, false /*includeJSDoc*/),
                 end,
                 file,
-            ));
+            );
+            if !fidelity.is_exact() {
+                return Ok(None);
+            }
+            replacement_span = Some(lsp_range);
         }
 
         if data.jsx_initializer.is_initializer {
@@ -636,8 +640,12 @@ impl LanguageService {
             }
             insert_text = format!("{{{insert_text}}}");
             if data.jsx_initializer.initializer.is_some() {
-                replacement_span =
-                    Some(self.create_lsp_range_from_node(data.jsx_initializer.initializer, file));
+                let (lsp_range, fidelity) =
+                    self.create_lsp_range_from_node(data.jsx_initializer.initializer, file);
+                if !fidelity.is_exact() {
+                    return Ok(None);
+                }
+                replacement_span = Some(lsp_range);
             }
         }
 
@@ -675,11 +683,15 @@ impl LanguageService {
             } else {
                 data.property_access_to_convert.expression()
             };
-            replacement_span = Some(self.create_lsp_range_from_bounds(
+            let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(
                 astnav::get_start_of_node(wrap_node, file, false /*includeJSDoc*/),
                 data.property_access_to_convert.end(),
                 file,
-            ));
+            );
+            if !fidelity.is_exact() {
+                return Ok(None);
+            }
+            replacement_span = Some(lsp_range);
         }
 
         if origin_is_type_only_alias(origin) {
@@ -1474,7 +1486,10 @@ impl LanguageService {
 
         let mut erase_range: Option<lsproto::Range> = None;
         if range_pos < range_end {
-            erase_range = Some(self.create_lsp_range_from_bounds(range_pos, range_end, file));
+            let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(range_pos, range_end, file);
+            if fidelity.is_exact() {
+                erase_range = Some(lsp_range);
+            }
         }
 
         PresentMemberModifiers {
@@ -2759,7 +2774,13 @@ impl LanguageService {
             SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral => {
                 self.create_range_from_string_literal_like_content(file, context_token, position)
             }
-            _ => Some(self.create_lsp_range_from_node(context_token, file)),
+            _ => {
+                let (lsp_range, fidelity) = self.create_lsp_range_from_node(context_token, file);
+                if !fidelity.is_exact() {
+                    return None;
+                }
+                Some(lsp_range)
+            }
         }
     }
 
@@ -2779,7 +2800,12 @@ impl LanguageService {
             }
             replacement_end = position.min(node.end());
         }
-        Some(self.create_lsp_range_from_bounds(node_start + 1, replacement_end, file))
+        let (lsp_range, fidelity) =
+            self.create_lsp_range_from_bounds(node_start + 1, replacement_end, file);
+        if !fidelity.is_exact() {
+            return None;
+        }
+        Some(lsp_range)
     }
 }
 
@@ -3219,7 +3245,10 @@ impl LanguageService {
                 || location.kind() == SyntaxKind::PrivateIdentifier)
         {
             let start = astnav::get_start_of_node(location, file, false /*includeJSDoc*/);
-            return Some(self.create_lsp_range_from_bounds(start, location.end(), file));
+            let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(start, location.end(), file);
+            if fidelity.is_exact() {
+                return Some(lsp_range);
+            }
         }
         None
     }

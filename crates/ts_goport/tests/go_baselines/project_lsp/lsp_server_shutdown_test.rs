@@ -45,6 +45,7 @@ fn server_options(
         typings_location: String::new(),
         parse_cache: None,
         npm_install: None,
+        spawn: None,
         progress_delay: Duration::ZERO,
         set_parent_process_id: None,
     }
@@ -90,7 +91,10 @@ child_test! {
             client: None,
             logger: Some(logger),
             npm_executor: None,
+            spawner: None,
+            content_mapper_logger: None,
             parse_cache: None,
+            content_mapped_parse_cache: None,
         });
         *server.session.borrow_mut() = Some(session.clone());
 

@@ -2,6 +2,7 @@
 
 use crate::project::prelude::*;
 
+use crate::contentmapper;
 use crate::frontend::core_ext::ensure_script_kind_from_file_name;
 use crate::frontend::parser;
 use xxhash_rust::xxh3::xxh3_128;
@@ -55,6 +56,96 @@ pub fn new_parse_cache_key(
         hash,
         script_kind,
     }
+}
+
+// Go: project/parsecache.go:36 ContentMappedParseCacheKey (tsgo#4712)
+// ContentMappedParseCacheKey identifies the complete output bundle for one mapped input. Hash folds the
+// original content, mapper transform identity, and diagnostic locale together.
+// PORT: the embedded `ast.SourceFileParseOptions` is copied field by field,
+// as in `ParseCacheKey`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ContentMappedParseCacheKey {
+    pub file_name: String,
+    pub path: tspath::Path,
+    pub jsx: bool,
+    pub force: bool,
+    pub hash: u128,
+}
+
+impl ContentMappedParseCacheKey {
+    /// Go `ContentMappedParseCacheKey{SourceFileParseOptions: options, Hash: hash}`.
+    pub fn new(options: &parser::SourceFileParseOptions, hash: u128) -> ContentMappedParseCacheKey {
+        ContentMappedParseCacheKey {
+            file_name: options.file_name.clone(),
+            path: options.path.clone(),
+            jsx: options.external_module_indicator_options.jsx,
+            force: options.external_module_indicator_options.force,
+            hash,
+        }
+    }
+
+    /// Go `key.SourceFileParseOptions` (the embedded value).
+    pub fn source_file_parse_options(&self) -> parser::SourceFileParseOptions {
+        parser::SourceFileParseOptions {
+            file_name: self.file_name.clone(),
+            path: self.path.clone(),
+            external_module_indicator_options: parser::ExternalModuleIndicatorOptions {
+                jsx: self.jsx,
+                force: self.force,
+            },
+        }
+    }
+}
+
+// Go: project/parsecache.go:43 contentMappedParseCacheKey (tsgo#4712)
+// PORT: Go `xxh3.Uint128` `Hi` is the high 64 bits of the `u128`, `Lo` the
+// low 64 bits.
+pub fn content_mapped_parse_cache_key(
+    options: &parser::SourceFileParseOptions,
+    raw_hash: u128,
+    transform_identity: u128,
+    diagnostic_locale: &locale::Locale,
+) -> ContentMappedParseCacheKey {
+    let diagnostic_locale = diagnostic_locale.string();
+    let mut buf = Vec::with_capacity(32 + diagnostic_locale.len());
+    buf.extend_from_slice(&((raw_hash >> 64) as u64).to_le_bytes());
+    buf.extend_from_slice(&(raw_hash as u64).to_le_bytes());
+    buf.extend_from_slice(&((transform_identity >> 64) as u64).to_le_bytes());
+    buf.extend_from_slice(&(transform_identity as u64).to_le_bytes());
+    buf.extend_from_slice(diagnostic_locale.as_bytes());
+    ContentMappedParseCacheKey::new(options, xxh3_128(&buf))
+}
+
+// Go: project/parsecache.go:54 parseCacheKeyForFile (tsgo#4712)
+// parseCacheKeyForFile reconstructs the ordinary parse-cache key for a source file held by a program.
+pub fn parse_cache_key_for_file(file: &parser::ParsedSourceFile) -> ParseCacheKey {
+    program_file_key(file.parse_options(), file.text, file.script_kind)
+}
+
+// Go: project/parsecache.go:58 contentMappedParseCacheKeyForFile (tsgo#4712)
+pub fn content_mapped_parse_cache_key_for_file(
+    file: &parser::ParsedSourceFile,
+) -> ContentMappedParseCacheKey {
+    ContentMappedParseCacheKey::new(
+        file.content_mapper_parse_options(),
+        source_file_hash(file.text),
+    )
+}
+
+// Go: project/parsecache.go:63 parseCacheKeyForDuplicate (tsgo#4712)
+// parseCacheKeyForDuplicate reconstructs an ordinary parse-cache key for a deduplicated source file.
+pub fn parse_cache_key_for_duplicate(file: &compiler::DuplicateSourceFile) -> ParseCacheKey {
+    program_file_key(&file.parse_options, file.text, file.script_kind)
+}
+
+// Go: project/parsecache.go:67 contentMappedParseCacheKeyForDuplicate (tsgo#4712)
+pub fn content_mapped_parse_cache_key_for_duplicate(
+    file: &compiler::DuplicateSourceFile,
+) -> ContentMappedParseCacheKey {
+    ContentMappedParseCacheKey::new(
+        &file.content_mapper_parse_options,
+        source_file_hash(file.text),
+    )
 }
 
 /// The value the parse cache holds: Go `*ast.SourceFile` after
@@ -116,9 +207,80 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
     )
 }
 
+// Go: project/parsecache.go:84 ContentMappedParseCache (tsgo#4712)
+// PORT: Go embeds `*RefCountCache`; the type alias gives the same methods.
+// One reference owns the canonical file and all supplemental files as a
+// bundle (`contentmapper::SourceFiles`). Callers ref and deref the
+// canonical file only.
+pub type ContentMappedParseCache =
+    RefCountCache<ContentMappedParseCacheKey, contentmapper::SourceFiles, ()>;
+
+// Go: project/parsecache.go:90 NewContentMappedParseCache (tsgo#4712)
+pub fn new_content_mapped_parse_cache(
+    options: RefCountCacheOptions,
+) -> Rc<ContentMappedParseCache> {
+    new_ref_count_cache(
+        options,
+        |_: &ContentMappedParseCacheKey, (): ()| -> contentmapper::SourceFiles {
+            panic!("content-mapped source files must be produced with AcquireOrError")
+        },
+    )
+}
+
+/// Go `file.Hash = hash` for a file that the content-mapped parse cache
+/// holds (project/compilerhost.go GetContentMappedSourceFiles).
+// PORT: see `TEXT_HASHES`. A content-mapped file's Go `Hash` is the hash of
+// its cache key, not of its text.
+pub fn set_source_file_hash(file: &parser::ParsedSourceFile, hash: u128) {
+    TEXT_HASHES.with_borrow_mut(|hashes| {
+        hashes.insert(text_id(file.text), hash);
+    });
+}
+
+/// Go `file.Hash` of a file that the parse cache or the content-mapped
+/// parse cache made on this thread. For any other text it is the xxh3-128
+/// of the text (Go `fh.Hash()`).
+// PORT: for the api encoder (Go `Hash` of a content-mapped file is its key
+// hash) and the key helpers above.
+pub fn source_file_hash(text: &'static str) -> u128 {
+    TEXT_HASHES
+        .with_borrow(|hashes| hashes.get(&text_id(text)).copied())
+        .unwrap_or_else(|| xxh3_128(text.as_bytes()))
+}
+
+/// Go `contentMappedParseCache.Deref(key)` for a program file or a
+/// duplicate source file. When the bundle entry is gone, the hashes of its
+/// files are forgotten too.
+// PORT: see `deref_program_file`.
+pub fn deref_content_mapped_file(
+    cache: &ContentMappedParseCache,
+    key: &ContentMappedParseCacheKey,
+) {
+    let bundle = cache
+        .entries
+        .borrow()
+        .get(key)
+        .and_then(|entry| entry.value.borrow().clone());
+    // PORT: called by path so `std::ops::Deref::deref` can not win.
+    ContentMappedParseCache::deref(cache, key);
+    if !cache.has(key)
+        && let Some(bundle) = bundle
+    {
+        TEXT_HASHES.with_borrow_mut(|hashes| {
+            if let Some(canonical) = &bundle.canonical {
+                hashes.remove(&text_id(canonical.text));
+            }
+            for supplemental in &bundle.supplemental {
+                hashes.remove(&text_id(supplemental.text));
+            }
+        });
+    }
+}
+
 thread_local! {
     /// Go `file.Hash` of each text that the parse cache parsed on this
-    /// thread, by `text_id`.
+    /// thread, by `text_id`. It also holds the Go `Hash` of the files of the
+    /// content-mapped parse cache (`set_source_file_hash`).
     // PORT: `ParsedSourceFile` has no `Hash` field. This map lets program
     // clones and snapshot disposal find the hash without hashing every file
     // text again. `deref_program_file` removes an entry with its cache
@@ -142,10 +304,7 @@ fn program_file_key(
     text: &'static str,
     script_kind: ScriptKind,
 ) -> ParseCacheKey {
-    let hash = TEXT_HASHES
-        .with_borrow(|hashes| hashes.get(&text_id(text)).copied())
-        .unwrap_or_else(|| xxh3_128(text.as_bytes()));
-    new_parse_cache_key(options, hash, script_kind)
+    new_parse_cache_key(options, source_file_hash(text), script_kind)
 }
 
 /// Go `parseCache.Ref(NewParseCacheKey(file.ParseOptions(), file.Hash,

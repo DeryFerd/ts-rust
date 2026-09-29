@@ -10,53 +10,54 @@ impl<P: ProgramView> LanguageService<P> {
     // composing content-mapper span maps and declaration source maps as needed. LS features should use this
     // for cross-file results instead of calling getMappedLocation or lsconv.ToLSPLocation directly.
     // This unfiltered form is appropriate for diagnostics and text edits.
-    // PORT: Go first checks `file.ContentMapper() != ""` and then returns
-    // `l.converters.ToLSPLocation(file, fileRange)`. The AST has no tsgo#4712
-    // content mapper info yet (syntax lane), and Go `ContentMapper()` is ""
-    // without it, so every file takes the `getMappedLocation` path. At pin B
-    // `getMappedLocation` returns the fidelity of `ToLSPRange` on a script
-    // that is not content-mapped, which is `FidelityExact`. The Rust
-    // `get_mapped_location` returns only the location, so the fidelity is
-    // written here.
     pub fn source_file_range_to_lsp_location(
         &self,
         file: Node,
         file_range: TextRange,
     ) -> (lsproto::Location, Fidelity) {
-        (
-            self.get_mapped_location(source_file_file_name(file), file_range),
-            Fidelity::EXACT,
-        )
+        if !source_file_content_mapper(file).is_empty() {
+            return self.converters.to_lsp_location(&file, file_range);
+        }
+        self.get_mapped_location(source_file_file_name(file), file_range)
     }
 
     // Go: ls/source_map.go:28 sourceFileRangeToLSPLocationForFeature
     // sourceFileRangeToLSPLocationForFeature is the preferred conversion for visible LS results that may
     // come from another file. It applies content-mapper feature filtering and follows declaration source maps.
     // Do not use it for diagnostics or text edits.
-    // PORT: as `source_file_range_to_lsp_location`. The content-mapped path
-    // is Go `l.converters.ToLSPLocationForFeature(file, fileRange, feature)`,
-    // so `feature` has no use until that path is ported.
     pub fn source_file_range_to_lsp_location_for_feature(
         &self,
         file: Node,
         file_range: TextRange,
-        _feature: Feature,
+        feature: Feature,
     ) -> (lsproto::Location, Fidelity) {
-        (
-            self.get_mapped_location(source_file_file_name(file), file_range),
-            Fidelity::EXACT,
-        )
+        if !source_file_content_mapper(file).is_empty() {
+            return self
+                .converters
+                .to_lsp_location_for_feature(&file, file_range, feature);
+        }
+        self.get_mapped_location(source_file_file_name(file), file_range)
     }
 
-    // Go: ls/source_map.go:12 getMappedLocation
-    pub fn get_mapped_location(&self, file_name: &str, file_range: TextRange) -> lsproto::Location {
+    // Go: ls/source_map.go:38 getMappedLocation
+    // getMappedLocation follows declaration source maps from a .d.ts range to its source location.
+    // It is an implementation detail of sourceFileRangeToLSPLocation; LS features should not call it directly,
+    // because it does not preserve a content-mapper projection or apply span-map feature filtering.
+    pub fn get_mapped_location(
+        &self,
+        file_name: &str,
+        file_range: TextRange,
+    ) -> (lsproto::Location, Fidelity) {
         let Some(start_pos) = self.try_get_source_position(file_name, file_range.pos()) else {
-            let lsp_range =
+            let (lsp_range, fidelity) =
                 self.create_lsp_range_from_range(file_range, &self.get_script(file_name));
-            return lsproto::Location {
-                uri: lsconv::file_name_to_document_uri(file_name),
-                range: lsp_range,
-            };
+            return (
+                lsproto::Location {
+                    uri: lsconv::file_name_to_document_uri(file_name),
+                    range: lsp_range,
+                },
+                fidelity,
+            );
         };
         let mut end_pos = self.try_get_source_position(file_name, file_range.end());
         if end_pos.as_ref().is_none_or(|end_pos| {
@@ -72,16 +73,19 @@ impl<P: ProgramView> LanguageService<P> {
         }
         let end_pos = end_pos.expect("set above");
         let new_range = TextRange::new(start_pos.pos, end_pos.pos);
-        let lsp_range =
+        let (lsp_range, fidelity) =
             self.create_lsp_range_from_range(new_range, &self.get_script(&start_pos.file_name));
-        lsproto::Location {
-            uri: lsconv::file_name_to_document_uri(&start_pos.file_name),
-            range: lsp_range,
-        }
+        (
+            lsproto::Location {
+                uri: lsconv::file_name_to_document_uri(&start_pos.file_name),
+                range: lsp_range,
+            },
+            fidelity,
+        )
     }
 }
 
-// Go: ls/source_map.go:39 script
+// Go: ls/source_map.go:65 script
 #[derive(Clone, Debug, Default)]
 pub struct Script {
     pub file_name: String,
@@ -89,14 +93,29 @@ pub struct Script {
 }
 
 impl lsconv::Script for Script {
-    // Go: ls/source_map.go:44 FileName
+    // Go: ls/source_map.go:70 FileName
     fn file_name(&self) -> &str {
         &self.file_name
     }
 
-    // Go: ls/source_map.go:48 Text
+    // Go: ls/source_map.go:74 OriginalFileName
+    fn original_file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    // Go: ls/source_map.go:76 Text
     fn text(&self) -> &str {
         &self.text
+    }
+
+    // Go: ls/source_map.go:80 OriginalText
+    fn original_text(&self) -> &str {
+        &self.text
+    }
+
+    // Go: ls/source_map.go:81 SpanMap
+    fn span_map(&self) -> Option<&crate::spanmap::SpanMap> {
+        None
     }
 }
 
@@ -120,7 +139,7 @@ impl lsconv::Script for Option<Script> {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/source_map.go:52 getScript
+    // Go: ls/source_map.go:85 getScript
     // PORT: Go returns `*script`; nil is `None`. Go passes the result as an
     // `lsconv.Script` even when it is nil, so `Option<Script>` implements
     // `lsconv::Script` too (above); pass `&self.get_script(name)`.
@@ -135,7 +154,7 @@ impl<P: ProgramView> LanguageService<P> {
         })
     }
 
-    // Go: ls/source_map.go:60 tryGetSourcePosition
+    // Go: ls/source_map.go:93 tryGetSourcePosition
     // PORT: Go `core.TextPos` is `i32`; the `*sourcemap.DocumentPosition`
     // result is `Option`.
     pub fn try_get_source_position(
@@ -154,7 +173,7 @@ impl<P: ProgramView> LanguageService<P> {
         new_pos
     }
 
-    // Go: ls/source_map.go:73 tryGetSourcePositionWorker
+    // Go: ls/source_map.go:106 tryGetSourcePositionWorker
     pub fn try_get_source_position_worker(
         &self,
         file_name: &str,
@@ -184,7 +203,7 @@ impl<P: ProgramView> LanguageService<P> {
 // PORT: the generated position is read only by `getNonLocalDefinition`,
 // which runs on the dispatch thread, so these two stay on `NewProgram`.
 impl LanguageService {
-    // Go: ls/source_map.go:92 tryGetGeneratedPosition
+    // Go: ls/source_map.go:125 tryGetGeneratedPosition
     pub fn try_get_generated_position(
         &self,
         file_name: &str,
@@ -201,7 +220,7 @@ impl LanguageService {
         new_pos
     }
 
-    // Go: ls/source_map.go:105 tryGetGeneratedPositionWorker
+    // Go: ls/source_map.go:138 tryGetGeneratedPositionWorker
     pub fn try_get_generated_position_worker(
         &self,
         file_name: &str,

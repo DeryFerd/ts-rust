@@ -220,7 +220,10 @@ pub fn bare_session(files: super::projecttestutil::FileMap) -> Rc<Session> {
         client: None,
         logger: None,
         npm_executor: None,
+        spawner: None,
+        content_mapper_logger: None,
         parse_cache: None,
+        content_mapped_parse_cache: None,
     })
 }
 

@@ -253,8 +253,7 @@ child_test! {
                     new_text: "export const temporary = 1;".to_string(),
                 },
             )
-            .err()
-            .expect("expected an error");
+            .expect_err("expected an error");
         assert!(
             err.error().contains("unsupported file extension"),
             "expected error containing \"unsupported file extension\", got {:?}",

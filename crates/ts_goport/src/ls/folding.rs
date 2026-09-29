@@ -1,5 +1,7 @@
 use crate::ls::prelude::*;
 
+use crate::spanmap::Feature;
+
 // Go `internal/ls/folding.go`: textDocument/foldingRange.
 
 use crate::frontend::scanner::get_leading_comment_ranges;
@@ -52,14 +54,22 @@ impl LanguageService {
         let mut result = Vec::with_capacity(ranges.len());
         for mut r in ranges {
             if r.end_character.is_some() && r.end_character.unwrap() > 0 {
-                let end_offset = self.converters.line_and_character_to_position(
-                    &source_file,
-                    &lsproto::Position {
+                let positions = lsconv::from_lsp_position_for_source_file(
+                    &self.converters,
+                    source_file,
+                    lsproto::Position {
                         line: r.end_line,
                         character: r.end_character.unwrap(),
                     },
+                    Feature::FOLDING_RANGES,
                 );
-                if end_offset > 0 && end_offset as usize <= source_text.len() {
+                if positions.len() == 1
+                    && positions[0].script == source_file
+                    && !positions[0].fidelity.is_none()
+                    && positions[0].position > 0
+                    && positions[0].position as usize <= source_text.len()
+                {
+                    let end_offset = positions[0].position;
                     let fold_end_char = source_text.as_bytes()[(end_offset - 1) as usize];
                     if fold_end_char == b'}'
                         || fold_end_char == b']'
@@ -118,7 +128,7 @@ impl LanguageService {
             let last_import = current - 1;
             if last_import != first_import {
                 let folding_range_kind = lsproto::FoldingRangeKind::IMPORTS;
-                folding_range.push(create_folding_range_from_bounds(
+                let imports = create_folding_range_from_bounds(
                     ctx,
                     astnav::get_start_of_node(
                         astnav::find_child_of_kind(
@@ -133,7 +143,10 @@ impl LanguageService {
                     folding_range_kind,
                     source_file,
                     self,
-                ));
+                );
+                if let Some(imports) = imports {
+                    folding_range.push(imports);
+                }
             }
         }
 
@@ -186,8 +199,11 @@ impl LanguageService {
                     .windows(2)
                     .position(|w| w == b"//")
                     .map_or(-1, |i| i as i32);
-                let comment_start =
+                let (comment_start, fidelity) =
                     self.create_lsp_position(comment_index + current_line_start, source_file);
+                if fidelity.is_none() {
+                    continue;
+                }
                 let folding_range_kind_region = lsproto::FoldingRangeKind::REGION;
                 let mut region = lsproto::FoldingRange {
                     start_line: comment_start.line,
@@ -209,7 +225,11 @@ impl LanguageService {
             } else {
                 if !regions.is_empty() {
                     let mut region = regions.pop().unwrap();
-                    let ending_position = self.create_lsp_position(line_end, source_file);
+                    let (ending_position, fidelity) =
+                        self.create_lsp_position(line_end, source_file);
+                    if fidelity.is_none() {
+                        continue;
+                    }
                     region.end_line = ending_position.line;
                     region.end_character = Some(ending_position.character);
                     out.push(region);
@@ -408,14 +428,14 @@ fn add_outlining_for_leading_comments_for_pos(
      -> Option<lsproto::FoldingRange> {
         // Only outline spans of two or more consecutive single line comments
         if single_line_comment_count > 1 {
-            return Some(create_folding_range_from_bounds(
+            return create_folding_range_from_bounds(
                 ctx,
                 first_single_line_comment_start,
                 last_single_line_comment_end,
                 folding_range_kind_comment.clone(),
                 source_file,
                 l,
-            ));
+            );
         }
         None
     };
@@ -464,14 +484,17 @@ fn add_outlining_for_leading_comments_for_pos(
                 if let Some(comments) = comments {
                     folding_range.push(comments);
                 }
-                folding_range.push(create_folding_range_from_bounds(
+                let comment = create_folding_range_from_bounds(
                     ctx,
                     comment_pos,
                     comment_end,
                     folding_range_kind_comment.clone(),
                     source_file,
                     l,
-                ));
+                );
+                if let Some(comment) = comment {
+                    folding_range.push(comment);
+                }
                 single_line_comment_count = 0;
             }
             _ => crate::gostd::debug::assert_never(
@@ -588,9 +611,17 @@ fn get_outlining_span_for_node(
                     // PORT: Go `fallthrough` into the default case.
                     // Block was a standalone block.  In this case we want to only collapse
                     // the span of the block, independent of any parent span.
+                    let (text_range, fidelity) = l.create_lsp_range_from_node_for_feature(
+                        n,
+                        source_file,
+                        Feature::FOLDING_RANGES,
+                    );
+                    if fidelity.is_none() {
+                        return None;
+                    }
                     return Some(create_folding_range(
                         ctx,
-                        l.create_lsp_range_from_node(n, source_file),
+                        text_range,
                         lsproto::FoldingRangeKind::default(),
                         "",
                     ));
@@ -598,9 +629,17 @@ fn get_outlining_span_for_node(
                 _ => {
                     // Block was a standalone block.  In this case we want to only collapse
                     // the span of the block, independent of any parent span.
+                    let (text_range, fidelity) = l.create_lsp_range_from_node_for_feature(
+                        n,
+                        source_file,
+                        Feature::FOLDING_RANGES,
+                    );
+                    if fidelity.is_none() {
+                        return None;
+                    }
                     return Some(create_folding_range(
                         ctx,
-                        l.create_lsp_range_from_node(n, source_file),
+                        text_range,
                         lsproto::FoldingRangeKind::default(),
                         "",
                     ));
@@ -667,7 +706,7 @@ fn get_outlining_span_for_node(
             );
         }
         SyntaxKind::JsxElement | SyntaxKind::JsxFragment => {
-            return Some(span_for_jsx_element(ctx, n, source_file, l));
+            return span_for_jsx_element(ctx, n, source_file, l);
         }
         SyntaxKind::JsxSelfClosingElement | SyntaxKind::JsxOpeningElement => {
             return span_for_jsx_attributes(ctx, n, source_file, l);
@@ -731,14 +770,14 @@ fn span_for_import_export_elements(
     {
         return None;
     }
-    Some(range_between_tokens(
+    range_between_tokens(
         ctx,
         open_token,
         close_token,
         source_file,
         false, /*useFullStart*/
         l,
-    ))
+    )
 }
 
 // Go: ls/folding.go:423 spanForParenthesizedExpression
@@ -752,7 +791,10 @@ fn span_for_parenthesized_expression(
     if crate::printer::positions_are_on_same_line(start, node.end(), source_file) {
         return None;
     }
-    let text_range = l.create_lsp_range_from_bounds(start, node.end(), source_file);
+    let (text_range, fidelity) = l.create_lsp_range_from_bounds(start, node.end(), source_file);
+    if fidelity.is_none() {
+        return None;
+    }
     Some(create_folding_range(
         ctx,
         text_range,
@@ -784,14 +826,14 @@ fn span_for_call_expression(
         return None;
     }
 
-    Some(range_between_tokens(
+    range_between_tokens(
         ctx,
         open_token,
         close_token,
         source_file,
         true, /*useFullStart*/
         l,
-    ))
+    )
 }
 
 // Go: ls/folding.go:445 spanForArrowFunction
@@ -812,11 +854,14 @@ fn span_for_arrow_function(
     {
         return None;
     }
-    let text_range = l.create_lsp_range_from_bounds(
+    let (text_range, fidelity) = l.create_lsp_range_from_bounds(
         arrow_function_node.body().pos(),
         arrow_function_node.body().end(),
         source_file,
     );
+    if fidelity.is_none() {
+        return None;
+    }
     Some(create_folding_range(
         ctx,
         text_range,
@@ -835,27 +880,27 @@ fn span_for_template_literal(
     if node.kind() == SyntaxKind::NoSubstitutionTemplateLiteral && node.text().is_empty() {
         return None;
     }
-    Some(create_folding_range_from_bounds(
+    create_folding_range_from_bounds(
         ctx,
         astnav::get_start_of_node(node, source_file, false /*includeJSDoc*/),
         node.end(),
         lsproto::FoldingRangeKind::default(),
         source_file,
         l,
-    ))
+    )
 }
 
-// Go: ls/folding.go:461 spanForJSXElement
-// PORT: Go returns a `*FoldingRange` that is never nil, so this returns the value.
+// Go: ls/folding.go:486 spanForJSXElement
+// PORT: Go returns `*FoldingRange`; nil is `None`.
 fn span_for_jsx_element(
     ctx: &Context,
     node: Node,
     source_file: Node,
     l: &LanguageService,
-) -> lsproto::FoldingRange {
+) -> Option<lsproto::FoldingRange> {
     if node.kind() == SyntaxKind::JsxElement {
         let jsx_element = node;
-        let text_range = l.create_lsp_range_from_bounds(
+        let (text_range, fidelity) = l.create_lsp_range_from_bounds(
             astnav::get_start_of_node(
                 jsx_element.opening_element(),
                 source_file,
@@ -864,18 +909,21 @@ fn span_for_jsx_element(
             jsx_element.closing_element().end(),
             source_file,
         );
+        if fidelity.is_none() {
+            return None;
+        }
         let tag_name = get_text_of_node(jsx_element.opening_element().tag_name());
         let banner_text = format!("<{tag_name}>...</{tag_name}>");
-        return create_folding_range(
+        return Some(create_folding_range(
             ctx,
             text_range,
             lsproto::FoldingRangeKind::default(),
             &banner_text,
-        );
+        ));
     }
     // JsxFragment
     let jsx_fragment = node;
-    let text_range = l.create_lsp_range_from_bounds(
+    let (text_range, fidelity) = l.create_lsp_range_from_bounds(
         astnav::get_start_of_node(
             jsx_fragment.opening_fragment(),
             source_file,
@@ -884,12 +932,15 @@ fn span_for_jsx_element(
         jsx_fragment.closing_fragment().end(),
         source_file,
     );
-    create_folding_range(
+    if fidelity.is_none() {
+        return None;
+    }
+    Some(create_folding_range(
         ctx,
         text_range,
         lsproto::FoldingRangeKind::default(),
         "<>...</>",
-    )
+    ))
 }
 
 // Go: ls/folding.go:475 spanForJSXAttributes
@@ -908,14 +959,14 @@ fn span_for_jsx_attributes(
     if attributes.properties().is_empty() {
         return None;
     }
-    Some(create_folding_range_from_bounds(
+    create_folding_range_from_bounds(
         ctx,
         astnav::get_start_of_node(node, source_file, false /*includeJSDoc*/),
         node.end(),
         lsproto::FoldingRangeKind::default(),
         source_file,
         l,
-    ))
+    )
 }
 
 // Go: ls/folding.go:488 spanForNodeArray
@@ -926,9 +977,14 @@ fn span_for_node_array(
     l: &LanguageService,
 ) -> Option<lsproto::FoldingRange> {
     if statements.is_some() && !statements.nodes().is_empty() {
+        let (text_range, fidelity) =
+            l.create_lsp_range_from_bounds(statements.pos(), statements.end(), source_file);
+        if fidelity.is_none() {
+            return None;
+        }
         return Some(create_folding_range(
             ctx,
-            l.create_lsp_range_from_bounds(statements.pos(), statements.end(), source_file),
+            text_range,
             lsproto::FoldingRangeKind::default(),
             "",
         ));
@@ -952,20 +1008,20 @@ fn span_for_node(
     let open_token = astnav::find_child_of_kind(node, open, source_file);
     let close_token = astnav::find_child_of_kind(node, close_brace, source_file);
     if open_token.is_some() && close_token.is_some() {
-        return Some(range_between_tokens(
+        return range_between_tokens(
             ctx,
             open_token,
             close_token,
             source_file,
             use_full_start,
             l,
-        ));
+        );
     }
     None
 }
 
-// Go: ls/folding.go:508 rangeBetweenTokens
-// PORT: Go returns a `*FoldingRange` that is never nil, so this returns the value.
+// Go: ls/folding.go:543 rangeBetweenTokens
+// PORT: Go returns `*FoldingRange`; nil is `None`.
 fn range_between_tokens(
     ctx: &Context,
     open_token: Node,
@@ -973,19 +1029,25 @@ fn range_between_tokens(
     source_file: Node,
     use_full_start: bool,
     l: &LanguageService,
-) -> lsproto::FoldingRange {
-    let text_range;
-    if use_full_start {
-        text_range =
-            l.create_lsp_range_from_bounds(open_token.pos(), close_token.end(), source_file);
+) -> Option<lsproto::FoldingRange> {
+    let (text_range, fidelity) = if use_full_start {
+        l.create_lsp_range_from_bounds(open_token.pos(), close_token.end(), source_file)
     } else {
-        text_range = l.create_lsp_range_from_bounds(
+        l.create_lsp_range_from_bounds(
             astnav::get_start_of_node(open_token, source_file, false /*includeJSDoc*/),
             close_token.end(),
             source_file,
-        );
+        )
+    };
+    if fidelity.is_none() {
+        return None;
     }
-    create_folding_range(ctx, text_range, lsproto::FoldingRangeKind::default(), "")
+    Some(create_folding_range(
+        ctx,
+        text_range,
+        lsproto::FoldingRangeKind::default(),
+        "",
+    ))
 }
 
 // Go: ls/folding.go:518 supportsCollapsedText
@@ -1024,8 +1086,8 @@ fn create_folding_range(
     result
 }
 
-// Go: ls/folding.go:540 createFoldingRangeFromBounds
-// PORT: Go returns a `*FoldingRange` that is never nil, so this returns the value.
+// Go: ls/folding.go:579 createFoldingRangeFromBounds
+// PORT: Go returns `*FoldingRange`; nil is `None`.
 fn create_folding_range_from_bounds(
     ctx: &Context,
     pos: i32,
@@ -1033,13 +1095,12 @@ fn create_folding_range_from_bounds(
     folding_range_kind: lsproto::FoldingRangeKind,
     source_file: Node,
     l: &LanguageService,
-) -> lsproto::FoldingRange {
-    create_folding_range(
-        ctx,
-        l.create_lsp_range_from_bounds(pos, end, source_file),
-        folding_range_kind,
-        "",
-    )
+) -> Option<lsproto::FoldingRange> {
+    let (text_range, fidelity) = l.create_lsp_range_from_bounds(pos, end, source_file);
+    if fidelity.is_none() {
+        return None;
+    }
+    Some(create_folding_range(ctx, text_range, folding_range_kind, ""))
 }
 
 // Go: ls/folding.go:544 functionSpan
@@ -1053,14 +1114,14 @@ fn function_span(
     let open_token = try_get_function_open_token(node, body, source_file);
     let close_token = astnav::find_child_of_kind(body, SyntaxKind::CloseBraceToken, source_file);
     if open_token.is_some() && close_token.is_some() {
-        return Some(range_between_tokens(
+        return range_between_tokens(
             ctx,
             open_token,
             close_token,
             source_file,
             true, /*useFullStart*/
             l,
-        ));
+        );
     }
     None
 }

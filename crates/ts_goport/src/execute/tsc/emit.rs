@@ -164,9 +164,17 @@ pub fn emit_and_report_statistics(input: &EmitInput) -> (CompileAndEmitResult, O
     (result, statistics)
 }
 
+/// Go `input.Sys.Now().Sub(start)`. A clock that goes back gives zero.
+fn since(sys: &dyn System, start: SystemTime) -> std::time::Duration {
+    sys.now().duration_since(start).unwrap_or_default()
+}
+
 // Go: execute/tsc/emit.go:74 EmitFilesAndReportErrors
-// PORT: Go times each bind and check call with `sys.Now()`; the port keeps
-// the same assignments.
+// PORT: Go times each bind, check and emit call with `sys.Now()`, and so
+// does the port. When the incremental program started the check before
+// (`Program::start_check`, `tsc -p` and `tsc -b`), the check time adds the
+// time of that start (`Program::take_started_check_time`), and the check
+// call times the wait for the rest.
 pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
     let mut result = CompileAndEmitResult::default();
     result.times = input.compile_times.clone();
@@ -188,9 +196,9 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
                     true,
                 )
             });
-            let bind_start = std::time::Instant::now();
+            let bind_start = input.sys.now();
             let diags = program_like.get_bind_diagnostics(file);
-            times.borrow_mut().bind_time = bind_start.elapsed();
+            times.borrow_mut().bind_time = since(input.sys, bind_start);
             diags
         },
         &mut |file| {
@@ -202,10 +210,11 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
                     true,
                 )
             });
-            let check_start = std::time::Instant::now();
+            let check_start = input.sys.now();
             let diags = program_like.get_semantic_diagnostics(file);
-            times.borrow_mut().check_time = check_start.elapsed();
+            times.borrow_mut().check_time = since(input.sys, check_start);
             if let Some(program) = program_like.as_incremental_program() {
+                times.borrow_mut().check_time += program.take_started_check_time();
                 let nested_emit_time = program.take_nested_emit_time();
                 let mut times = times.borrow_mut();
                 if nested_emit_time > times.check_time {
@@ -227,12 +236,12 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
         ..EmitResult::default()
     };
     if !program_like.options().list_files_only.is_true() {
-        let emit_start = std::time::Instant::now();
+        let emit_start = input.sys.now();
         emit_result = program_like.emit(EmitOptions {
             write_file: input.write_file.clone(),
             ..EmitOptions::default()
         });
-        result.times.borrow_mut().emit_time += emit_start.elapsed();
+        result.times.borrow_mut().emit_time += since(input.sys, emit_start);
     }
     all_diagnostics.extend(emit_result.diagnostics.iter().cloned());
     // PORT: testing

@@ -165,7 +165,7 @@ pub fn module_specifier_to_valid_identifier(
     module_specifier: &str,
     force_capitalize: bool,
 ) -> String {
-    let without_extension = crate::frontend::tspath::remove_file_extension(module_specifier);
+    let without_extension = crate::frontend::tspath::remove_any_file_extension(module_specifier);
     let base_name = crate::frontend::tspath::get_base_file_name(
         without_extension
             .strip_suffix("/index")

@@ -3409,14 +3409,14 @@ pub fn is_emit_blocked(emit_file_name: &str) -> bool {
         .is_some_and(|go| go.is_emit_blocked(emit_file_name))
 }
 
-// Go: compiler/program.go:1927 SourceFileMayBeEmitted
+// Go: compiler/program.go:2132 SourceFileMayBeEmitted
 pub fn source_file_may_be_emitted(source_file: Node, force_dts_emit: bool) -> bool {
     // Go: ls/autoimport/aliasresolver.go:228 (unimplemented)
     alias_resolver_unimplemented();
     source_file_may_be_emitted_worker(source_file, force_dts_emit, false)
 }
 
-// Go: compiler/emitter.go:451 sourceFileMayBeEmitted
+// Go: compiler/emitter.go:464 sourceFileMayBeEmitted
 fn source_file_may_be_emitted_worker(
     source_file: Node,
     force_dts_emit: bool,
@@ -3457,54 +3457,71 @@ fn source_file_may_be_emitted_worker(
     if !is_json_source_file(source_file) {
         return true;
     }
+    json_file_may_be_emitted(
+        &info.file_name,
+        options,
+        get_current_directory(),
+        use_case_sensitive_file_names(),
+    )
+}
+
+// Go: compiler/emitter.go:504-521 (the JSON file part of sourceFileMayBeEmitted)
+// PORT: its own function, so the tests below can run it without a loaded
+// program. Like `frontend::compiler::source_file_may_be_emitted`, it uses the
+// Go ports in `frontend::outputpaths` and `frontend::tspath`. Go result to
+// keep: `GetNormalizedAbsolutePath` removes the trailing separator of the
+// common directory (except for a root), so a file under it gets a rooted
+// output path that is never its own path, even when outDir is the common
+// directory.
+fn json_file_may_be_emitted(
+    file_name: &str,
+    options: &CompilerOptions,
+    current_directory: &str,
+    use_case_sensitive_file_names: bool,
+) -> bool {
+    use crate::frontend::outputpaths;
+    use crate::frontend::tspath::{
+        ComparePathsOptions, compare_paths, get_normalized_absolute_path,
+    };
+
     // Json file is not emitted if outDir is not specified
     if options.out_dir.is_empty() {
         return false;
     }
+
     // Otherwise, if rootDir is specified or a config file exists, we know the common source directory and can check if the file would be emitted in the same location
     if !options.root_dir.is_empty() || !options.config_file_path.is_empty() {
-        let cwd = get_current_directory();
-        let cs = state().case_sensitivity;
-        let common_dir = ts_path::resolve_path(
-            cwd,
-            &[&get_common_source_directory(options, Vec::new, cwd, cs)],
+        let common_dir = get_normalized_absolute_path(
+            &outputpaths::get_common_source_directory(
+                options,
+                Vec::new,
+                current_directory,
+                use_case_sensitive_file_names,
+                None,
+            ),
+            current_directory,
         );
-        let output_path = get_source_file_path_in_new_dir_worker(
-            &info.file_name,
+        let output_path = outputpaths::get_source_file_path_in_new_dir_worker(
+            file_name,
             &options.out_dir,
-            cwd,
+            current_directory,
             &common_dir,
-            cs,
+            use_case_sensitive_file_names,
         );
-        if ts_path::canonicalize(&info.file_name, cwd, cs)
-            == ts_path::canonicalize(&output_path, cwd, cs)
+        if compare_paths(
+            file_name,
+            &output_path,
+            &ComparePathsOptions {
+                use_case_sensitive_file_names,
+                current_directory: current_directory.to_string(),
+            },
+        ) == 0
         {
             return false;
         }
     }
-    true
-}
 
-// Go: outputpaths/outputpaths.go:175 GetSourceFilePathInNewDirWorker
-// tsgo#4900: `TrimFilePathPrefix` cuts the common source directory by runes,
-// not by its byte length.
-fn get_source_file_path_in_new_dir_worker(
-    file_name: &str,
-    new_dir_path: &str,
-    current_directory: &str,
-    common_source_directory: &str,
-    case_sensitivity: CaseSensitivity,
-) -> String {
-    let source_file_path = ts_path::resolve_path(current_directory, &[file_name]);
-    let common = ts_path::ensure_trailing_directory_separator(common_source_directory);
-    match crate::frontend::tspath::trim_file_path_prefix(
-        &source_file_path,
-        &common,
-        case_sensitivity == CaseSensitivity::Sensitive,
-    ) {
-        Some(trimmed) => ts_path::combine_paths(new_dir_path, &[&trimmed]),
-        None => ts_path::combine_paths(new_dir_path, &[&source_file_path]),
-    }
+    true
 }
 
 // Go: compiler/program.go:1792 GetSourceFile
@@ -5504,4 +5521,83 @@ impl<R> PendingCheckerJobs<R> {
 /// The pool index of the checker for `file` (Go `fileAssociations[file]`).
 pub fn checker_index_of_file(file: Node) -> usize {
     checker_index_for_file(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go: compiler/emitter.go:504-521. No Go test covers this part. The
+    // expected values come from Go at pin B (16c25522e123): the same calls in
+    // a Go test, and for the cases marked "oracle" also a `noEmit`
+    // incremental tsgo run, where a JSON file that Go may emit is in
+    // `affectedFilesPendingEmit`.
+    #[test]
+    fn json_file_may_be_emitted_matches_go() {
+        // (file, outDir, rootDir, config file path, may be emitted)
+        let cases = [
+            // No outDir.
+            ("/proj/src/data.json", "", "/proj/src", "", false),
+            // No rootDir and no config file: the common directory is unknown.
+            ("/proj/src/data.json", "/proj/dist", "", "", true),
+            // oracle: under rootDir.
+            ("/proj/src/data.json", "/proj/dist", "/proj/src", "", true),
+            // oracle: outside rootDir, the output path is the file itself.
+            ("/proj/data.json", "/proj/dist", "/proj/src", "", false),
+            // oracle: outDir is rootDir.
+            ("/proj/src/data.json", "/proj/src", "/proj/src", "", true),
+            // oracle: outDir is the config file directory.
+            (
+                "/proj/src/data.json",
+                "/proj",
+                "",
+                "/proj/tsconfig.json",
+                true,
+            ),
+            // oracle: the path starts with rootDir, but not at a separator.
+            (
+                "/proj/src-data/data.json",
+                "/proj/dist",
+                "/proj/src",
+                "",
+                true,
+            ),
+            // A root keeps its separator.
+            ("/data.json", "/", "/", "", false),
+        ];
+        for (file, out_dir, root_dir, config_file_path, expected) in cases {
+            let options = CompilerOptions {
+                out_dir: out_dir.to_string(),
+                root_dir: root_dir.to_string(),
+                config_file_path: config_file_path.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                json_file_may_be_emitted(file, &options, "/proj", true),
+                expected,
+                "{file} outDir {out_dir:?} rootDir {root_dir:?} config {config_file_path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_file_may_be_emitted_case_insensitive() {
+        let options = CompilerOptions {
+            out_dir: "/proj/dist".to_string(),
+            root_dir: "/proj/SRC".to_string(),
+            ..Default::default()
+        };
+        assert!(json_file_may_be_emitted(
+            "/proj/src/data.json",
+            &options,
+            "/proj",
+            false
+        ));
+        assert!(!json_file_may_be_emitted(
+            "/proj/src/data.json",
+            &options,
+            "/proj",
+            true
+        ));
+    }
 }

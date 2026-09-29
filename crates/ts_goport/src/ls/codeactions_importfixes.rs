@@ -126,7 +126,7 @@ fn get_all_import_code_actions(
 
     let mut import_diags: Vec<Diagnostic> = Vec::new();
     for diag in all_diagnostics {
-        if contains_error_code(&IMPORT_FIX_ERROR_CODES, diag.code()) {
+        if is_fixable_diagnostic(&diag, &IMPORT_FIX_ERROR_CODES) {
             import_diags.push(diag);
         }
     }
@@ -405,10 +405,13 @@ fn get_fixes_info_for_non_umd_import(
     let mut all_info: Vec<FixInfo> = Vec::new();
 
     // Compute usage position for JSDoc import type fixes
-    let usage_position = fix_context.ls.converters.position_to_line_and_character(
+    let (usage_position, fidelity) = fix_context.ls.converters.to_lsp_position(
         &fix_context.source_file,
         get_token_pos_of_node(symbol_token, fix_context.source_file, false),
     );
+    if !fidelity.is_exact() {
+        return Vec::new();
+    }
 
     for sn in &symbol_names {
         // Type-only imports are handled by the promotion code path, not the auto-import path.

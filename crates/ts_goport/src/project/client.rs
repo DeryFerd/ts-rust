@@ -19,6 +19,12 @@ pub trait Client {
         watchers: &[lsproto::FileSystemWatcher],
     ) -> Result<(), GoError>;
     fn unwatch_files(&self, ctx: &Context, id: WatcherID) -> Result<(), GoError>;
+    // tsgo#4712
+    fn register_content_mapper_extensions(
+        &self,
+        ctx: &Context,
+        extensions: &[String],
+    ) -> Result<(), GoError>;
     fn refresh_diagnostics(&self, ctx: &Context) -> Result<(), GoError>;
     fn publish_diagnostics(
         &self,

@@ -73,7 +73,7 @@ impl LanguageService {
             return lsproto::LocationOrLocationsOrDefinitionLinksOrNull::default();
         }
 
-        let origin_selection_range = self.create_lsp_range_from_node(node, file);
+        let (origin_selection_range, _) = self.create_lsp_range_from_node(node, file);
         if let Some(reference) = &reference {
             if reference.file.is_some() {
                 return self.create_definition_locations(
@@ -238,7 +238,7 @@ impl LanguageService {
         if node.kind() == SyntaxKind::SourceFile {
             return lsproto::LocationOrLocationsOrDefinitionLinksOrNull::default();
         }
-        let origin_selection_range = self.create_lsp_range_from_node(node, file);
+        let (origin_selection_range, _) = self.create_lsp_range_from_node(node, file);
 
         let (checker, _done) = ls_program::get_type_checker_for_file(program, ctx, file);
         let c = &mut *checker.borrow_mut();

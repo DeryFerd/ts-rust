@@ -13,6 +13,7 @@ use crate::project::prelude::*;
 use crate::contentmapper;
 use crate::frontend::parser;
 use std::cell::Cell;
+use xxhash_rust::xxh3::xxh3_128;
 
 // Go: project/compilerhost.go:16 compilerHost
 pub struct CompilerHost {
@@ -103,14 +104,17 @@ impl CompilerHost {
     }
 
     // Go: project/compilerhost.go:153 compilerHost.ensureContentMapperProject (tsgo#4712)
-    // PORT: `ProjectCollectionBuilder` has no `contentMapperHost` yet (the
-    // #4712 builder and session part is not ported), so the host is Go's
-    // nil host and the project stays `None`.
-    fn ensure_content_mapper_project(&self) {
+    pub fn ensure_content_mapper_project(&self) {
         if self.content_mapper_once.replace(true) {
             return;
         }
-        let content_mapper_host: Option<Rc<dyn contentmapper::Host>> = None;
+        let content_mapper_host = self
+            .builder
+            .borrow()
+            .as_ref()
+            .expect("invalid memory address or nil pointer dereference: compilerHost.builder")
+            .content_mapper_host
+            .clone();
         let Some(content_mapper_host) = content_mapper_host else {
             return;
         };
@@ -205,10 +209,9 @@ impl compiler::CompilerHost for CompilerHost {
 
     // Go: project/compilerhost.go:112 compilerHost.GetContentMappedSourceFiles (tsgo#4712)
     // GetContentMappedSourceFile implements compiler.CompilerHost.
-    // PORT: the builder has no `contentMappedParseCache` yet, so there is no
-    // cache key (diagnostic locale, transform identity hash), no `Hash` on
-    // the files and no `Deref` on a collision: each call transforms and
-    // parses. A file that cannot be read is `Ok` with no canonical file.
+    // PORT: a file that cannot be read is `Ok` with no canonical file (Go
+    // returns the zero value and a nil error). Go `file.Hash = key.Hash` is
+    // `set_source_file_hash` (project/parsecache.rs).
     fn get_content_mapped_source_files(
         &self,
         parse_options: &parser::SourceFileParseOptions,
@@ -221,25 +224,62 @@ impl compiler::CompilerHost for CompilerHost {
         else {
             return Ok(contentmapper::SourceFiles::default());
         };
+        let builder = self
+            .builder
+            .borrow()
+            .clone()
+            .expect("invalid memory address or nil pointer dereference: compilerHost.builder");
+        let mut diagnostic_locale = locale::DEFAULT;
+        if let Some(client) = &builder.client {
+            diagnostic_locale = client.get_locale();
+        }
         self.ensure_content_mapper_project();
         let Some(project) = self.content_mapper_project.borrow().clone() else {
             return Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone());
         };
-        // PORT: Go hashes the identity into the cache key; only its error
-        // is used here.
-        if let Err(err) = project.identity(mapper) {
-            return Err(contentmapper::new_transform_error(
-                contentmapper::TransformErrorKind::PROJECT,
-                Some(err),
-            )
-            .to_go_error());
-        }
-        let files =
-            contentmapper::transform_and_parse(parse_options, &fh.content(), mapper, &*project)?;
+        let identity = match project.identity(mapper) {
+            Ok(identity) => identity,
+            Err(err) => {
+                return Err(contentmapper::new_transform_error(
+                    contentmapper::TransformErrorKind::PROJECT,
+                    Some(err),
+                )
+                .to_go_error());
+            }
+        };
+        let transform_identity = xxh3_128(identity.as_bytes());
+        let key = content_mapped_parse_cache_key(
+            parse_options,
+            fh.hash(),
+            transform_identity,
+            &diagnostic_locale,
+        );
+        let files = builder
+            .content_mapped_parse_cache
+            .acquire_or_error(key.clone(), || {
+                let files = contentmapper::transform_and_parse(
+                    parse_options,
+                    &fh.content(),
+                    mapper,
+                    &*project,
+                )?;
+                if let Some(canonical) = &files.canonical {
+                    set_source_file_hash(canonical, key.hash);
+                }
+                for supplemental in &files.supplemental {
+                    set_source_file_hash(supplemental, key.hash);
+                }
+                Ok(files)
+            })?;
         let fs = compiler::CompilerHost::fs(self);
-        contentmapper::check_supplemental_file_name_collisions(&files, &|name: &str| {
-            vfs::Fs::file_exists(&*fs, name)
-        })?;
+        if let Err(err) =
+            contentmapper::check_supplemental_file_name_collisions(&files, &|name: &str| {
+                vfs::Fs::file_exists(&*fs, name)
+            })
+        {
+            deref_content_mapped_file(&builder.content_mapped_parse_cache, &key);
+            return Err(err);
+        }
         Ok(files)
     }
 

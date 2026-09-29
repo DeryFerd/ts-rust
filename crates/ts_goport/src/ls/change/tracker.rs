@@ -192,23 +192,12 @@ impl Tracker {
     /// content mapper's span map when the file is content-mapped. If the range does not fall entirely within a
     /// single verbatim span the edit cannot be represented safely in the original text: the file is recorded so
     /// GetChanges drops its edits, and a best-effort range is returned so the accumulated edits stay well-formed.
-    // PORT: Go `t.converters.ToLSPRange` returns `(lsproto.Range, spanmap.Fidelity)`.
-    // The Rust `to_lsp_range` returns only the range (the ls/lsconv port
-    // does not map through the span map yet), so the fidelity is Go's
-    // `virtualRangeToOriginal` answer for the same `Script`: exact when
-    // `SpanMap()` is nil, else `VirtualToOriginalSpan`. The file name and
-    // span map are the `lsconv::Script` methods of the file root `Node`, as
-    // the converters and the tracker callers read them.
     pub(crate) fn to_lsp_edit_range(
         &mut self,
         source_file: Node,
         text_range: TextRange,
     ) -> lsproto::Range {
-        let r = self.converters.to_lsp_range(&source_file, text_range);
-        let fidelity = match lsconv::Script::span_map(&source_file) {
-            None => spanmap::Fidelity::EXACT,
-            Some(span_map) => SpanMap::virtual_to_original_span(Some(span_map), text_range).1,
-        };
+        let (r, fidelity) = self.converters.to_lsp_range(&source_file, text_range);
         if !fidelity.is_exact() {
             // The range does not map into a single verbatim span, so the edit cannot be represented safely in
             // the original text. Record the file so GetChanges drops its edits, keeping the best-effort range so

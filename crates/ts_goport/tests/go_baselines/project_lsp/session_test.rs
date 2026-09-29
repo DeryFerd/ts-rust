@@ -1413,6 +1413,43 @@ child_test! {
 }
 
 child_test! {
+    // Go: session_test.go:1519 TestSession/locale change invalidates programs (tsgo#4712)
+    fn locale_change_invalidates_programs() {
+        let (session, _utils) = projecttestutil::setup(files(&[
+            ("/src/tsconfig.json", "{}"),
+            ("/src/index.ts", "export const x = 1;"),
+        ]));
+        let uri = "file:///src/index.ts";
+        let config_path = "/src/tsconfig.json";
+        open(&session, uri, "export const x = 1;");
+        let _ = language_service(&session, uri);
+        let program_of = |session: &Rc<Session>| {
+            configured_project(session, config_path)
+                .expect("configured project")
+                .borrow()
+                .program
+                .expect("program")
+        };
+        let initial_program = program_of(&session);
+
+        let mut preferences = session.config();
+        preferences.code_lens.references_code_lens_enabled = Tristate::True;
+        session.configure(preferences.clone());
+        let _ = language_service(&session, uri);
+        let program_after_code_lens_change = program_of(&session);
+        assert!(std::ptr::eq(program_after_code_lens_change, initial_program));
+
+        preferences.locale = "fr".to_string();
+        session.configure(preferences);
+        let _ = language_service(&session, uri);
+        let program_after_locale_change = program_of(&session);
+        assert!(!std::ptr::eq(program_after_locale_change, initial_program));
+        // Go: defer session.Close()
+        session.close();
+    }
+}
+
+child_test! {
     // Go: session_test.go:1551 TestSession/adds locale to background contexts
     fn adds_locale_to_background_contexts() {
         let (session, utils) = projecttestutil::setup(files(&[]));
@@ -1679,7 +1716,10 @@ child_test! {
             client: None,
             logger: None,
             npm_executor: None,
+            spawner: None,
+            content_mapper_logger: None,
             parse_cache: None,
+            content_mapped_parse_cache: None,
         });
 
         open(&session, INDEX_URI, "");

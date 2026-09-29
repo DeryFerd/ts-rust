@@ -16,6 +16,7 @@ use crate::ls::prelude::*;
 
 use crate::flags_macros::{go_enum, go_flags};
 use crate::frontend::scanner::scanner_p1::{RUNE_ERROR, rune_to_char, utf8_decode_rune_in_string};
+use crate::spanmap::Feature;
 use std::sync::LazyLock;
 
 // Go: ls/completions.go:32 ErrNeedsAutoImports
@@ -33,7 +34,7 @@ impl LanguageService {
         lsp_position: lsproto::Position,
         context: Option<&lsproto::CompletionContext>,
     ) -> Result<lsproto::CompletionResponse, GoError> {
-        let (_, file) = self.get_program_and_file(document_uri);
+        let (program, file) = self.get_program_and_file(document_uri);
         let mut trigger_character: Option<String> = None;
         if let Some(context) = context {
             trigger_character = context.trigger_character.clone();
@@ -43,9 +44,19 @@ impl LanguageService {
             &self.format_options(),
             &self.format_options().editor_settings.new_line_character,
         );
-        let position = self
-            .converters
-            .line_and_character_to_position(&file, &lsp_position);
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            file,
+            lsp_position,
+            Feature::COMPLETION,
+        );
+        if positions.is_empty() || !positions[0].fidelity.is_exact() {
+            // In a content-mapped file the cursor is outside a verbatim span, so any completion committed here
+            // could not be applied to the original text. Offer nothing rather than edits at a bogus location.
+            return Ok(lsproto::CompletionItemsOrListOrNull::default());
+        }
+        let file = positions[0].script;
+        let position = positions[0].position;
         let completion_list_internal = self.get_completions_at_position(
             ctx,
             file,
@@ -53,15 +64,61 @@ impl LanguageService {
             trigger_character,
             false, /*includeSymbols*/
         )?;
-        let completion_list = ensure_item_data(
-            source_file_file_name(file),
+        let mut completion_list = ensure_item_data(
+            file,
             position,
             CompletionList::to_lsp(completion_list_internal.as_ref()),
         );
+        if lsconv::Script::span_map(&file).is_some() {
+            self.filter_content_mapped_auto_imports(ctx, program, file, completion_list.as_mut());
+        }
         Ok(lsproto::CompletionItemsOrListOrNull {
             items: None,
             list: completion_list,
         })
+    }
+
+    // Go: ls/completions.go:79 filterContentMappedAutoImports
+    // filterContentMappedAutoImports eagerly resolves auto-import edits for a content-mapped file and drops any
+    // completion whose import edit cannot be placed entirely within verbatim spans (it would otherwise insert
+    // an import into synthesized virtual code with no counterpart in the original file). Surviving auto-imports carry
+    // their additional edits directly so the client applies correct original-text positions on commit.
+    // PORT: Go filters `list.Items` in place (`list.Items[:0]`); here
+    // `retain_mut`, which keeps the order.
+    pub fn filter_content_mapped_auto_imports(
+        &self,
+        ctx: &Context,
+        program: &'static compiler::NewProgram,
+        file: Node,
+        list: Option<&mut lsproto::CompletionList>,
+    ) {
+        let Some(list) = list else {
+            return;
+        };
+        list.items.retain_mut(|item| {
+            let Some(auto_import) = item.data.as_ref().and_then(|data| data.auto_import.as_ref())
+            else {
+                return true;
+            };
+            let (edits, description, ok) = autoimport::Fix {
+                auto_import_fix: auto_import.clone(),
+                ..Default::default()
+            }
+            .edits(
+                ctx,
+                file,
+                program.options(),
+                &self.format_options(),
+                &self.converters,
+                &self.user_preferences(),
+            );
+            if !ok {
+                return false;
+            }
+            item.additional_text_edits = Some(edits);
+            item.detail = str_ptr_to(&description);
+            true
+        });
     }
 
     // Go: ls/completions.go:61 GetCompletionsAtPosition
@@ -111,11 +168,11 @@ pub struct CompletionList {
     pub items: Vec<CompletionItem>,
 }
 
-// Go: ls/completions.go:77 ensureItemData
+// Go: ls/completions.go:123 ensureItemData
 // PORT: Go fills `item.Data` through the list pointer; the list is moved in
 // and returned.
 pub fn ensure_item_data(
-    file_name: &str,
+    file: Node,
     pos: i32,
     list: Option<lsproto::CompletionList>,
 ) -> Option<lsproto::CompletionList> {
@@ -125,14 +182,33 @@ pub fn ensure_item_data(
     for item in &mut list.items {
         if item.data.is_none() {
             item.data = Some(lsproto::CompletionItemData {
-                file_name: file_name.to_string(),
+                file_name: source_file_original_file_name(file).to_string(),
                 position: pos,
+                supplemental_file_index: supplemental_file_index(file),
                 name: item.label.clone(),
                 ..Default::default()
             });
         }
     }
     Some(list)
+}
+
+// Go: ls/completions.go:140 supplementalFileIndex
+// PORT: Go `*int32`; nil is `None`.
+pub fn supplemental_file_index(file: Node) -> Option<i32> {
+    let canonical = source_file_canonical_source_file(file);
+    if canonical.is_nil() {
+        return None;
+    }
+    for (i, &supplemental) in source_file_supplemental_source_files(canonical)
+        .iter()
+        .enumerate()
+    {
+        if supplemental == file {
+            return Some(i as i32);
+        }
+    }
+    panic!("supplemental source file is not linked from its canonical source file");
 }
 
 // Go: ls/completions.go:153 sourceFileForSupplementalFileIndex
@@ -142,10 +218,7 @@ pub fn source_file_for_supplemental_file_index(file: Node, index: Option<i32>) -
     let Some(index) = index else {
         return file;
     };
-    // PORT: Go `file.SupplementalSourceFiles()`. The AST has no tsgo#4712
-    // content mapper info yet (syntax lane), and Go returns nil for a file
-    // without it, so the list is empty and every index is out of range.
-    let supplemental: &[Node] = &[];
+    let supplemental = source_file_supplemental_source_files(file);
     if index >= 0 && (index as usize) < supplemental.len() {
         return supplemental[index as usize];
     }
@@ -293,8 +366,15 @@ go_enum!(CompletionKind, i32 {
     STRING = 5;
 });
 
-// Go: ls/completions.go:189 TriggerCharacters
-pub static TRIGGER_CHARACTERS: [&str; 10] = [".", "\"", "'", "`", "/", "@", "<", "#", " ", "*"];
+// Go: ls/completions.go:260 CompletionTriggerCharacters
+pub static COMPLETION_TRIGGER_CHARACTERS: [&str; 10] =
+    [".", "\"", "'", "`", "/", "@", "<", "#", " ", "*"];
+
+// PORT: tsgo#4712 renamed Go `TriggerCharacters` to
+// `CompletionTriggerCharacters`. `lsp/server.rs` (server lane) still reads
+// the old name. Remove this alias when it reads
+// `COMPLETION_TRIGGER_CHARACTERS` (lane ls notes for root).
+pub use self::COMPLETION_TRIGGER_CHARACTERS as TRIGGER_CHARACTERS;
 
 // Go: ls/completions.go:192 allCommitCharacters
 // All commit characters, valid when `isNewIdentifierLocation` is false.
@@ -1889,7 +1969,7 @@ impl GetCompletionDataState<'_> {
         true
     }
 
-    // Go: ls/completions.go:1132 getCompletionData.collectAutoImports
+    // Go: ls/completions.go:1220 getCompletionData.collectAutoImports
     // Mutates `symbols`, `symbolToOriginInfoMap`, and `symbolToSortTextMap`
     // PORT: `View.GetCompletions` takes the request checker (w3 decision).
     fn collect_auto_imports(&mut self) -> Result<(), GoError> {
@@ -1904,12 +1984,19 @@ impl GetCompletionDataState<'_> {
 
         // import { type | -> token text should be blank
         let mut lower_case_token_text = String::new();
-        let mut usage_position = self.l.create_lsp_position(self.position, self.file);
+        let (mut usage_position, mut fidelity) =
+            self.l.create_lsp_position(self.position, self.file);
+        if !fidelity.is_exact() {
+            return Ok(());
+        }
         if self.previous_token.is_some() && is_identifier(self.previous_token) {
-            usage_position = self.l.create_lsp_position(
+            (usage_position, fidelity) = self.l.create_lsp_position(
                 get_token_pos_of_node(self.previous_token, self.file, false /*includeJSDoc*/),
                 self.file,
             );
+            if !fidelity.is_exact() {
+                return Ok(());
+            }
             if !(self.previous_token == self.context_token
                 && self.import_statement_completion.is_some())
             {

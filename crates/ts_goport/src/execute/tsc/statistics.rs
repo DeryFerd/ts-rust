@@ -125,7 +125,7 @@ pub fn statistics_from_program(compile_times: &CompileTimes, mem_stats: &MemStat
         instantiations: crate::program::instantiation_count(),
         memory_used: mem_stats.alloc,
         memory_allocs: mem_stats.mallocs,
-        compile_times: Some(*compile_times),
+        compile_times: Some(compile_times.clone()),
         ..Statistics::default()
     }
 }
@@ -158,6 +158,7 @@ impl Statistics {
         // Go dereferences the pointer; a nil one panics there.
         let compile_times = self
             .compile_times
+            .as_ref()
             .expect("statistics without compile times");
         if !compile_times.config_time.is_zero() {
             table.add_duration(&format!("{prefix}Config time"), compile_times.config_time);
@@ -184,8 +185,56 @@ impl Statistics {
                 compile_times.changes_compute_time,
             );
         }
+        self.add_content_mapper_statistics(&mut table, prefix);
         table.add_duration(&format!("{prefix}Total time"), compile_times.total_time);
         table.print(w);
+    }
+
+    // Go: execute/tsc/statistics.go:132 addContentMapperStatistics (tsgo#4712)
+    // PORT: Go `slices.Sorted(maps.Keys(timings.Mappers))` sorts the
+    // identities by their bytes, as `str` ordering does.
+    fn add_content_mapper_statistics(&self, table: &mut Table, prefix: &str) {
+        let timings = &self
+            .compile_times
+            .as_ref()
+            .expect("statistics without compile times")
+            .content_mapper_times;
+        if !timings.request_wait.is_zero() {
+            table.add_duration(
+                &format!("{prefix}Content mapper request wait time"),
+                timings.request_wait,
+            );
+        }
+        let mut identities: Vec<&String> = timings.mappers.keys().collect();
+        identities.sort();
+        for identity in identities {
+            let mapper = &timings.mappers[identity];
+            let initialization_count = mapper.spawn.count;
+            if initialization_count != 0 {
+                table.add_duration(
+                    &format!("{prefix}{identity} initialization time"),
+                    mapper.spawn.duration + mapper.initialize.duration,
+                );
+            }
+            if mapper.transform.count != 0 {
+                table.add_duration(
+                    &format!("{prefix}{identity} transform time"),
+                    mapper.transform.duration,
+                );
+            }
+            if mapper.open_project.count != 0 {
+                table.add_duration(
+                    &format!("{prefix}{identity} openProject time"),
+                    mapper.open_project.duration,
+                );
+            }
+            if mapper.close_project.count != 0 {
+                table.add_duration(
+                    &format!("{prefix}{identity} closeProject time"),
+                    mapper.close_project.duration,
+                );
+            }
+        }
     }
 
     // Go: execute/tsc/statistics.go:84 Report
@@ -218,6 +267,7 @@ impl Statistics {
         self.memory_allocs += stat.memory_allocs;
         let stat_times = stat
             .compile_times
+            .as_ref()
             .expect("statistics without compile times");
         compile_times.config_time += stat_times.config_time;
         compile_times.build_info_read_time += stat_times.build_info_read_time;
@@ -255,6 +305,56 @@ mod tests {
             "Files:                    750\n\
              Memory used:          165135K\n\
              Changes compute time:  0.033s\n"
+        );
+    }
+
+    // The content mapper rows (tsgo#4712): identities in sorted order, and
+    // only the operations that ran. Go's map order is random, so the sort
+    // is what makes the rows stable.
+    #[test]
+    fn content_mapper_rows_are_sorted_and_skip_unused_operations() {
+        use crate::contentmapper::{MapperTimings, OperationTiming};
+        let ran = |millis| OperationTiming {
+            count: 1,
+            duration: Duration::from_millis(millis),
+        };
+        let mut compile_times = CompileTimes::default();
+        compile_times.content_mapper_times.request_wait = Duration::from_millis(5);
+        compile_times.content_mapper_times.mappers.insert(
+            "z-mapper".to_string(),
+            MapperTimings {
+                transform: ran(20),
+                ..MapperTimings::default()
+            },
+        );
+        compile_times.content_mapper_times.mappers.insert(
+            "a-mapper".to_string(),
+            MapperTimings {
+                spawn: ran(1),
+                initialize: ran(2),
+                open_project: ran(3),
+                ..MapperTimings::default()
+            },
+        );
+        let statistics = Statistics {
+            compile_times: Some(compile_times),
+            ..Statistics::default()
+        };
+        let mut table = Table::default();
+        statistics.add_content_mapper_statistics(&mut table, "");
+        let rows: Vec<(&str, &str)> = table
+            .rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.value.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Content mapper request wait time", "0.005s"),
+                ("a-mapper initialization time", "0.003s"),
+                ("a-mapper openProject time", "0.003s"),
+                ("z-mapper transform time", "0.020s"),
+            ]
         );
     }
 }

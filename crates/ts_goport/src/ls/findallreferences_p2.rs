@@ -781,12 +781,9 @@ impl<P: ProgramView> LanguageService<P> {
                             .range;
                         Some(Rc::new(RefCell::new(ReferenceEntry {
                             kind: EntryKind::RANGE,
-                            node: Node::NIL,
-                            context: Node::NIL,
-                            file_name: source_file_file_name(reference.referencing_file)
-                                .to_string(),
+                            source_file: reference.referencing_file,
                             text_range: Some(text_range),
-                            lsp_range: None,
+                            ..Default::default()
                         })))
                     }
                     _ => None,

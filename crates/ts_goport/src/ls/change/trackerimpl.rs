@@ -6,9 +6,10 @@ use crate::frontend::core_textchange::apply_bulk_edits;
 use crate::frontend::parser::utilities::get_js_doc_comment_ranges;
 use crate::frontend::scanner::scanner_p1::{rune_to_char, utf8_decode_rune_in_string};
 use crate::frontend::scanner::{get_leading_comment_ranges, get_trailing_comment_ranges};
+use crate::spanmap::Feature;
 
 impl Tracker {
-    // Go: ls/change/trackerimpl.go:21 getTextChangesFromChanges
+    // Go: ls/change/trackerimpl.go:23 getTextChangesFromChanges
     // PORT: Go ranges over the MultiMap's Go map (random order) and sorts
     // each file's slice in place. The IndexMap walks files in insertion
     // order; the map is taken out for the loop (the edits are mutated) and
@@ -17,6 +18,12 @@ impl Tracker {
         let mut changes: IndexMap<String, Vec<lsproto::TextEdit>> = IndexMap::new();
         let mut tracker_changes = std::mem::take(&mut self.changes);
         for (&source_file, changes_in_file) in tracker_changes.iter_mut() {
+            if self
+                .unmappable_files
+                .contains(source_file_original_file_name(source_file))
+            {
+                continue;
+            }
             // order changes by start position
             // If the start position is the same, put the shorter range first, since an empty range (x, x) may precede (x, y) but not vice-versa.
             changes_in_file.sort_by(|a, b| lsproto::compare_ranges(a.range, b.range).cmp(&0));
@@ -40,7 +47,7 @@ impl Tracker {
 
             // PORT: Go `core.MapNonNil`; the callback never returns nil.
             let text_changes: Vec<lsproto::TextEdit> = changes_in_file
-                .iter_mut()
+                .iter()
                 .map(|change| {
                     // !!! targetSourceFile
 
@@ -58,17 +65,25 @@ impl Tracker {
                 .collect();
 
             if !text_changes.is_empty() {
-                changes.insert(source_file_file_name(source_file).to_string(), text_changes);
+                let file_name = source_file_original_file_name(source_file);
+                if self.unmappable_files.contains(file_name) {
+                    continue;
+                }
+                changes
+                    .entry(file_name.to_string())
+                    .or_default()
+                    .extend(text_changes);
             }
         }
         self.changes = tracker_changes;
         changes
     }
 
-    // Go: ls/change/trackerimpl.go:57 computeNewText
+    // Go: ls/change/trackerimpl.go:66 computeNewText
+    // PORT: Go takes `change *trackerEdit` and only reads it.
     fn compute_new_text(
-        &self,
-        change: &mut TrackerEdit,
+        &mut self,
+        change: &TrackerEdit,
         target_source_file: Node,
         source_file: Node,
     ) -> String {
@@ -78,64 +93,85 @@ impl Tracker {
             _ => {}
         }
 
-        let pos = self
-            .converters
-            .line_and_character_to_position(&source_file, &change.range.start);
-        // PORT: Go `formatNode` closes over `change` and reads
-        // `change.options` when it runs. Here it takes the options, because
-        // the multiple-nodes case sets `change.options.joiner` first.
-        let format_node = |n: Node, options: &NodeOptions| -> String {
-            self.get_formatted_text_of_node(n, target_source_file, source_file, pos, options)
-        };
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            source_file,
+            change.range.start,
+            Feature::ALL,
+        );
+        let mut result = String::new();
+        let mut found = false;
+        // The original range may have multiple verbatim copies; it is safe to lose their identity only when
+        // formatting at every exact projection produces the same edit.
+        for mapped in positions {
+            if !mapped.fidelity.is_exact() {
+                continue;
+            }
+            let projection = mapped.script;
+            let pos = mapped.position;
+            let format_node = |n: Node| -> String {
+                self.get_formatted_text_of_node(n, target_source_file, projection, pos, &change.options)
+            };
 
-        let text: String;
-        match change.kind {
-            TrackerEditKind::REPLACE_WITH_MULTIPLE_NODES => {
-                if change.options.joiner.is_empty() {
-                    change.options.joiner = self.new_line.clone();
+            let text: String = match change.kind {
+                TrackerEditKind::REPLACE_WITH_MULTIPLE_NODES => {
+                    let mut joiner = change.options.joiner.as_str();
+                    if joiner.is_empty() {
+                        joiner = self.new_line.as_str();
+                    }
+                    let parts: Vec<String> = change
+                        .nodes
+                        .iter()
+                        .map(|&n| {
+                            let formatted = format_node(n);
+                            formatted
+                                .strip_suffix(self.new_line.as_str())
+                                .unwrap_or(&formatted)
+                                .to_string()
+                        })
+                        .collect();
+                    parts.join(joiner)
                 }
-                let parts: Vec<String> = change
-                    .nodes
-                    .iter()
-                    .map(|&n| {
-                        let formatted = format_node(n, &change.options);
-                        formatted
-                            .strip_suffix(self.new_line.as_str())
-                            .unwrap_or(&formatted)
-                            .to_string()
-                    })
-                    .collect();
-                text = parts.join(&change.options.joiner);
+                TrackerEditKind::REPLACE_WITH_SINGLE_NODE => format_node(change.node),
+                _ => {
+                    panic!(
+                        "change kind {} should have been handled earlier",
+                        change.kind.0
+                    );
+                }
+            };
+            // Strip initial indentation if text will be inserted in the middle of the line.
+            let mut no_indent: &str = &text;
+            if !(change.options.indentation.is_some()
+                || format::get_line_start_position_for_position(pos, projection) == pos)
+            {
+                // PORT: Go `strings.TrimLeftFunc(text, unicode.IsSpace)`. Rust
+                // `char::is_whitespace` is the Unicode White_Space set, which is
+                // Go's `unicode.IsSpace` set (including U+0085 and U+00A0).
+                no_indent = text.trim_start_matches(char::is_whitespace);
             }
-            TrackerEditKind::REPLACE_WITH_SINGLE_NODE => {
-                text = format_node(change.node, &change.options);
+            let suffix = if no_indent.ends_with(change.options.suffix.as_str()) {
+                ""
+            } else {
+                change.options.suffix.as_str()
+            };
+            let candidate = change.options.prefix.clone() + no_indent + suffix;
+            if found && candidate != result {
+                self.unmappable_files
+                    .insert(source_file_original_file_name(source_file).to_string());
+                return String::new();
             }
-            _ => {
-                panic!(
-                    "change kind {} should have been handled earlier",
-                    change.kind.0
-                );
-            }
+            result = candidate;
+            found = true;
         }
-        // strip initial indentation (spaces or tabs) if text will be inserted in the middle of the line
-        let mut no_indent: &str = &text;
-        if !(change.options.indentation.is_some()
-            || format::get_line_start_position_for_position(pos, target_source_file) == pos)
-        {
-            // PORT: Go `strings.TrimLeftFunc(text, unicode.IsSpace)`. Rust
-            // `char::is_whitespace` is the Unicode White_Space set, which is
-            // Go's `unicode.IsSpace` set (including U+0085 and U+00A0).
-            no_indent = text.trim_start_matches(char::is_whitespace);
+        if !found {
+            self.unmappable_files
+                .insert(source_file_original_file_name(source_file).to_string());
         }
-        let suffix = if no_indent.ends_with(change.options.suffix.as_str()) {
-            ""
-        } else {
-            change.options.suffix.as_str()
-        };
-        change.options.prefix.clone() + no_indent + suffix
+        result
     }
 
-    // Go: ls/change/trackerimpl.go:92 getFormattedTextOfNode
+    // Go: ls/change/trackerimpl.go:122 getFormattedTextOfNode
     /** Note: this may mutate `nodeIn`. */
     // PORT: Go passes `options NodeOptions` by value; it is only read, so it
     // is passed by reference.
@@ -161,8 +197,7 @@ impl Tracker {
                     source_file,
                     &format_options,
                     options.prefix == self.new_line
-                        || format::get_line_start_position_for_position(pos, target_source_file)
-                            == pos,
+                        || format::get_line_start_position_for_position(pos, source_file) == pos,
                 );
             }
             Some(indentation) => {
@@ -231,24 +266,22 @@ impl Tracker {
         (text, source_file_like)
     }
 
-    // Go: ls/change/trackerimpl.go:161 GetAdjustedRange
+    // Go: ls/change/trackerimpl.go:167 GetAdjustedRange
     // method on the changeTracker because use of converters
     /// GetAdjustedRange computes the adjusted range for a node in a source file, accounting for trivia.
     pub fn get_adjusted_range(
-        &self,
+        &mut self,
         source_file: Node,
         start_node: Node,
         end_node: Node,
         leading_option: LeadingTriviaOption,
         trailing_option: TrailingTriviaOption,
     ) -> lsproto::Range {
-        self.converters.to_lsp_range(
-            &source_file,
-            TextRange::new(
-                self.get_adjusted_start_position(source_file, start_node, leading_option, false),
-                self.get_adjusted_end_position(source_file, end_node, trailing_option),
-            ),
-        )
+        let text_range = TextRange::new(
+            self.get_adjusted_start_position(source_file, start_node, leading_option, false),
+            self.get_adjusted_end_position(source_file, end_node, trailing_option),
+        );
+        self.to_lsp_edit_range(source_file, text_range)
     }
 
     // Go: ls/change/trackerimpl.go:172 getAdjustedStartPosition

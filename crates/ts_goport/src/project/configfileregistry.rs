@@ -21,6 +21,33 @@ pub struct ConfigFileRegistry {
     // customConfigFileName is the custom config file name preference that was
     // used when building this registry's configFileNames cache.
     pub custom_config_file_name: String,
+    // tsgo#4712. PORT: Go nil pointer is `None`.
+    pub all_configured_content_mappers: Option<Rc<ConfiguredContentMappers>>,
+}
+
+// Go: project/configfileregistry.go:28 configuredContentMappers (tsgo#4712)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConfiguredContentMappers {
+    pub extensions: Vec<String>,
+}
+
+// Go: project/configfileregistry.go:32 collectConfiguredContentMappers (tsgo#4712)
+pub fn collect_configured_content_mappers<'a>(
+    command_lines: impl IntoIterator<Item = &'a tsoptions::ParsedCommandLine>,
+) -> Rc<ConfiguredContentMappers> {
+    let mut seen_extensions: FxHashSet<String> = FxHashSet::default();
+    let mut extensions: Vec<String> = Vec::new();
+    for command_line in command_lines {
+        for mapper in command_line.content_mappers() {
+            for extension in &mapper.definition.extensions {
+                if seen_extensions.insert(extension.clone()) {
+                    extensions.push(extension.clone());
+                }
+            }
+        }
+    }
+    extensions.sort();
+    Rc::new(ConfiguredContentMappers { extensions })
 }
 
 // Go: project/configfileregistry.go:25 configFileEntry
@@ -170,7 +197,23 @@ impl ConfigFileRegistry {
             configs: self.configs.clone(),
             config_file_names: self.config_file_names.clone(),
             custom_config_file_name: self.custom_config_file_name.clone(),
+            all_configured_content_mappers: self.all_configured_content_mappers.clone(),
         }
+    }
+
+    // Go: project/configfileregistry.go:48 ConfigFileRegistry.contentMappers (tsgo#4712)
+    // PORT: Go map order is random; the result is sorted and has no
+    // duplicates, so the order of the configs does not change it.
+    pub fn content_mappers(&self) -> Rc<ConfiguredContentMappers> {
+        if let Some(all_configured_content_mappers) = &self.all_configured_content_mappers {
+            return all_configured_content_mappers.clone();
+        }
+        let command_lines: Vec<Rc<tsoptions::ParsedCommandLine>> = self
+            .configs
+            .values()
+            .filter_map(|entry| entry.borrow().command_line.clone())
+            .collect();
+        collect_configured_content_mappers(command_lines.iter().map(|c| &**c))
     }
 
     // Go: project/configfileregistry.go:126 ConfigFileRegistry.ForEachTestConfigEntry

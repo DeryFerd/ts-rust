@@ -25,6 +25,7 @@
 
 use crate::project::prelude::*;
 
+use crate::contentmapper;
 use std::cell::Cell;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -52,6 +53,21 @@ impl UpdateReason {
     pub const REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS: UpdateReason = UpdateReason(9);
     pub const IDLE_CLEAN_DISK_CACHE: UpdateReason = UpdateReason(10);
     pub const DID_CHANGE_CONFIG_FILE: UpdateReason = UpdateReason(11);
+    // tsgo#4712
+    pub const DID_CHANGE_CONTENT_MAPPER_CONTRIBUTIONS: UpdateReason = UpdateReason(12);
+}
+
+// Go: project/session.go:38 ErrNoProjectForUnknownScriptKind (tsgo#4712)
+// ErrNoProjectForUnknownScriptKind identifies requests for otherwise unsupported files.
+pub static ERR_NO_PROJECT_FOR_UNKNOWN_SCRIPT_KIND: std::sync::LazyLock<GoError> =
+    std::sync::LazyLock::new(|| gostd::errors::new("no project for unknown script kind"));
+
+// Go: project/session.go:57 ContentMapperContributions (tsgo#4712)
+// PORT: Go `[]*contentmapper.Mapper` is `Vec<Rc<Mapper>>`.
+#[derive(Clone, Debug, Default)]
+pub struct ContentMapperContributions {
+    pub mappers: Vec<Rc<contentmapper::Mapper>>,
+    pub extensions: Vec<String>,
 }
 
 // Go: project/session.go:51 watchRequestTimeout
@@ -72,6 +88,9 @@ pub struct SessionOptions {
     pub logging_enabled: bool,
     pub telemetry_enabled: bool,
     pub push_diagnostics_enabled: bool,
+    // RunExternalCode allows configured content mappers to run their (external) processes,
+    // gated on workspace trust by the client. It corresponds to the --runExternalCode CLI flag.
+    pub run_external_code: bool,
     pub debounce_delay: Duration,
     pub checker_pool_options: CheckerPoolOptions,
 }
@@ -85,7 +104,11 @@ pub struct SessionInit {
     pub client: Option<Rc<dyn Client>>,
     pub logger: Option<Rc<dyn logging::Logger>>,
     pub npm_executor: Option<Rc<dyn ata::NpmExecutor>>,
+    // Spawner launches content mapper processes. It is nil when the host cannot spawn processes.
+    pub spawner: Option<Rc<dyn contentmapper::Spawner>>,
+    pub content_mapper_logger: Option<contentmapper::Logger>,
     pub parse_cache: Option<Rc<ParseCache>>,
+    pub content_mapped_parse_cache: Option<Rc<ContentMappedParseCache>>,
 }
 
 // Go: project/session.go:85 Session
@@ -107,11 +130,27 @@ pub struct Session {
     pub client: Option<Rc<dyn Client>>,
     pub logger: Option<Rc<dyn logging::Logger>>,
     pub npm_executor: Option<Rc<dyn ata::NpmExecutor>>,
+    // contentMapperHost drives configured content mappers for all projects in the session. It is nil unless
+    // the workspace is trusted (RunExternalCode) and a spawner is available. It is shared so
+    // projects that use the same mapper share a single process, and is closed when the session ends.
+    pub content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
+    // contentMapperTimings is the cumulative host snapshot at the most recent session snapshot adoption.
+    // PORT: `contentMapperTimingsMu` is dropped (one thread).
+    pub content_mapper_timings: RefCell<contentmapper::Timings>,
     pub fs: Rc<OverlayFS>,
+
+    // registeredContentMapperSnapshotID is the ID of the newest snapshot whose registration has been
+    // applied. Registration runs from background tasks that may finish out of order, so
+    // contentMapperRegistrationMu serializes updates and the snapshot ID keeps a stale task from
+    // overwriting a newer snapshot's registration.
+    // PORT: `contentMapperRegistrationMu` is dropped (one thread).
+    pub registered_content_mapper_extensions: RefCell<Vec<String>>,
+    pub registered_content_mapper_snapshot_id: Cell<u64>,
 
     // parseCache is the ref-counted cache of source files used when
     // creating programs during snapshot cloning.
     pub parse_cache: Rc<ParseCache>,
+    pub content_mapped_parse_cache: Rc<ContentMappedParseCache>,
     // PORT: the parse cache references that auto-import registry clones
     // keep after the clone, one per path (see
     // `AutoImportRegistryCloneHost::dispose`). No Go counterpart.
@@ -202,6 +241,29 @@ pub struct Session {
     pub global_diag_publish_pending: Cell<bool>,
 }
 
+// Go: project/session.go:219 newContentMapperHost (tsgo#4712)
+// newContentMapperHost creates the session's shared content mapper host when the workspace is trusted and
+// a spawner is available; otherwise it returns nil, and configured content mappers are rejected by the
+// config-file gate.
+pub fn new_content_mapper_host(init: &SessionInit) -> Option<Rc<dyn contentmapper::Host>> {
+    let spawner = match &init.spawner {
+        Some(spawner) if init.options.run_external_code => spawner.clone(),
+        _ => return None,
+    };
+    let mut diagnostic_locale = locale::DEFAULT;
+    if let Some(client) = &init.client {
+        diagnostic_locale = client.get_locale();
+    }
+    Some(contentmapper::new_host_with_options(
+        &init.background_ctx,
+        spawner,
+        diagnostic_locale,
+        contentmapper::HostOptions {
+            logger: init.content_mapper_logger.clone(),
+        },
+    ))
+}
+
 // Go: project/session.go:180 NewSession
 pub fn new_session(init: &SessionInit) -> Rc<Session> {
     let current_directory = init.options.current_directory.clone();
@@ -219,6 +281,12 @@ pub fn new_session(init: &SessionInit) -> Rc<Session> {
     if parse_cache.is_none() {
         parse_cache = Some(new_parse_cache(RefCountCacheOptions::default()));
     }
+    let mut content_mapped_parse_cache = init.content_mapped_parse_cache.clone();
+    if content_mapped_parse_cache.is_none() {
+        content_mapped_parse_cache = Some(new_content_mapped_parse_cache(
+            RefCountCacheOptions::default(),
+        ));
+    }
     let extended_config_cache = new_extended_config_cache();
 
     let mut session_logger = init.logger.clone();
@@ -232,8 +300,13 @@ pub fn new_session(init: &SessionInit) -> Rc<Session> {
         client: init.client.clone(),
         logger: session_logger,
         npm_executor: init.npm_executor.clone(),
+        content_mapper_host: new_content_mapper_host(init),
+        content_mapper_timings: RefCell::new(contentmapper::Timings::default()),
         fs: overlay_fs,
+        registered_content_mapper_extensions: RefCell::new(Vec::new()),
+        registered_content_mapper_snapshot_id: Cell::new(0),
         parse_cache: parse_cache.expect(NIL_DEREF),
+        content_mapped_parse_cache: content_mapped_parse_cache.expect(NIL_DEREF),
         auto_import_parse_keys: Rc::new(RefCell::new(FxHashMap::default())),
         extended_config_cache,
         program_counter: Rc::new(ProgramCounter::default()),
@@ -315,6 +388,9 @@ pub fn new_session(init: &SessionInit) -> Rc<Session> {
         );
         *session.typings_installer.borrow_mut() = Some(typings_installer);
     }
+    if let Some(content_mapper_host) = &session.content_mapper_host {
+        *session.content_mapper_timings.borrow_mut() = content_mapper_host.timings();
+    }
 
     session
 }
@@ -385,15 +461,21 @@ impl Session {
     }
 
     // Go: project/session.go:346 Configure
+    // PORT: `configureMu` and `userConfigRWMu` are dropped (one thread).
     pub fn configure(self: &Rc<Self>, config: lsutil::UserPreferences) {
         self.pending_user_config_changes.set(true);
         let old_config = self.workspace_user_preferences.replace(config.clone());
 
         if !config.locale.is_empty() {
-            self.client
-                .as_ref()
-                .expect(NIL_DEREF)
-                .set_locale(&config.locale);
+            let client = self.client.as_ref().expect(NIL_DEREF);
+            let old_locale = client.get_locale();
+            client.set_locale(&config.locale);
+            let new_locale = client.get_locale();
+            if old_locale.string() != new_locale.string()
+                && let Some(content_mapper_host) = &self.content_mapper_host
+            {
+                content_mapper_host.set_locale(new_locale);
+            }
         }
 
         // Tell the client to re-request certain commands depending on user preference changes.
@@ -445,6 +527,40 @@ impl Session {
         );
     }
 
+    // Go: project/session.go:405 SetContentMapperContributions (tsgo#4712)
+    // SetContentMapperContributions atomically replaces extension-provided inferred-project mappers and
+    // discovers configured projects for matching open documents. Configured projects never consume these mappers.
+    // PORT: `snapshotUpdateMu` and `pendingFileChangesMu` are dropped (one
+    // thread).
+    pub fn set_content_mapper_contributions(
+        self: &Rc<Self>,
+        ctx: &Context,
+        contributions: ContentMapperContributions,
+        document_uris: Vec<lsproto::DocumentUri>,
+    ) {
+        if !self.options.run_external_code {
+            return;
+        }
+        self.cancel_scheduled_snapshot_update();
+        let (changes, overlays) = self.flush_changes_locked(ctx);
+        self.update_snapshot_exported(
+            ctx,
+            overlays,
+            SnapshotChange {
+                reason: UpdateReason::DID_CHANGE_CONTENT_MAPPER_CONTRIBUTIONS,
+                file_changes: changes,
+                content_mapper_contributions: Some(contributions),
+                resource_request: ResourceRequest {
+                    configured_project_documents: document_uris,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let snapshot = self.snapshot();
+        let _ = self.update_content_mapper_registrations(ctx, &snapshot);
+    }
+
     // Go: project/session.go:320 DidCloseFile
     pub fn did_close_file(self: &Rc<Self>, _ctx: &Context, uri: &lsproto::DocumentUri) {
         self.cancel_warm_auto_import_cache();
@@ -465,7 +581,6 @@ impl Session {
         version: i32,
         changes: &[lsproto::TextDocumentContentChangePartialOrWholeDocument],
     ) {
-        self.cancel_diagnostics_refresh();
         self.cancel_warm_auto_import_cache();
         self.schedule_idle_cache_clean();
         self.pending_file_changes.borrow_mut().push(FileChange {
@@ -475,6 +590,35 @@ impl Session {
             changes: changes.to_vec(),
             ..Default::default()
         });
+
+        // Editing a content-mapped file changes the program like any source edit, but the client's
+        // pull-diagnostics machinery won't re-request diagnostics for dependent files: the content-mapped file is not
+        // in the diagnostic provider's document selector, so a change to it never triggers the client's
+        // inter-file re-pull. Prompt a workspace refresh so dependents update. We skip the debounce here so the
+        // edit doesn't feel sluggish (normal source edits are pulled per-keystroke client-side); the refresh is
+        // still coalesced. Ordinary source files are handled entirely client-side, so we cancel any pending
+        // refresh for them as before.
+        if self.is_content_mapper_file(uri) {
+            self.schedule_diagnostics_refresh(Duration::ZERO);
+        } else {
+            self.cancel_diagnostics_refresh();
+        }
+    }
+
+    // Go: project/session.go:467 isContentMapperFile (tsgo#4712)
+    // isContentMapperFile reports whether uri is a content-mapped file handled by a configured content mapper, based
+    // on the extensions currently registered with the client for text document synchronization.
+    pub fn is_content_mapper_file(&self, uri: &lsproto::DocumentUri) -> bool {
+        let snapshot = self.snapshot();
+        let configured = snapshot.config_file_registry.content_mappers();
+        let mut extensions: Vec<&str> = configured.extensions.iter().map(String::as_str).collect();
+        extensions.extend(
+            snapshot
+                .inferred_project_content_mapper_extensions
+                .iter()
+                .map(String::as_str),
+        );
+        tspath::file_extension_is_one_of(&uri.file_name(), &extensions)
     }
 
     // Go: project/session.go:346 DidSaveFile
@@ -497,7 +641,14 @@ impl Session {
         let mut file_changes: Vec<FileChange> = Vec::with_capacity(changes.len());
         let mut has_relevant_change = false;
         let mut has_config_change = false;
-        let config_file_registry = self.snapshot().config_file_registry.clone();
+        let snapshot = self.snapshot();
+        let config_file_registry = snapshot.config_file_registry.clone();
+        let (content_mapper_extensions, content_mapper_watched_files) =
+            snapshot.content_mapper_watch_state();
+        let content_mapper_extensions: Vec<&str> = content_mapper_extensions
+            .iter()
+            .map(String::as_str)
+            .collect();
         for change in changes {
             let kind = match change.type_ {
                 lsproto::FileChangeType::CREATED => FileChangeKind::WATCH_CREATE,
@@ -520,6 +671,10 @@ impl Session {
             if !has_relevant_change {
                 let file_name = change.uri.file_name();
                 let path = (self.to_path)(&file_name).remove_trailing_directory_separator();
+                if content_mapper_watched_files.contains(&path) {
+                    has_relevant_change = true;
+                    continue;
+                }
                 let path_str = path.as_str();
                 let i = path_str.rfind('.');
                 if i.is_none_or(|i| path_str.rfind('/').is_some_and(|slash| slash > i)) {
@@ -537,7 +692,9 @@ impl Session {
                         }
                     }
                 } else if let Some(i) = i {
-                    if is_relevant_extension(&path_str[i..]) {
+                    if is_relevant_extension(&path_str[i..])
+                        || tspath::file_extension_is_one_of(path_str, &content_mapper_extensions)
+                    {
                         has_relevant_change = true;
                     }
                 }
@@ -549,7 +706,7 @@ impl Session {
         if has_relevant_change {
             // Schedule a debounced diagnostics refresh only for paths
             // that can affect the TypeScript program (relevant extensions or directories).
-            self.schedule_diagnostics_refresh();
+            self.schedule_diagnostics_refresh_exported();
         }
         if has_config_change {
             // Config file diagnostics are pushed on snapshot updates rather than pulled,
@@ -579,15 +736,25 @@ impl Session {
         );
     }
 
-    // Go: project/session.go:394 ScheduleDiagnosticsRefresh
+    // Go: project/session.go:570 ScheduleDiagnosticsRefresh
+    // PORT: `_exported`, because Go also has `scheduleDiagnosticsRefresh`.
+    pub fn schedule_diagnostics_refresh_exported(self: &Rc<Self>) {
+        self.schedule_diagnostics_refresh(self.options.debounce_delay);
+    }
+
+    // Go: project/session.go:577 scheduleDiagnosticsRefresh (tsgo#4712)
+    // scheduleDiagnosticsRefresh schedules a coalesced workspace diagnostics refresh after delay. A delay of
+    // 0 refreshes as soon as the background queue runs the task; it is used for interactive edits (e.g. a
+    // content-mapped file) where the debounce would make dependent-file diagnostics feel sluggish.
     // PORT: Go sleeps inside the background task with
     // `select { case <-time.After(delay): case <-ctx.Done(): }`. Here the
     // task arms a `gostd::local::after_func` timer for the delay, and the
     // rest of the task runs when it fires; a cancelled context makes it
     // return then (Go returns at once; nothing else differs). The task
     // keeps a `background::TaskHold` until then, so `Queue::wait` (Go
-    // `WaitForBackgroundTasks`) waits for the refresh, as Go's does.
-    pub fn schedule_diagnostics_refresh(self: &Rc<Self>) {
+    // `WaitForBackgroundTasks`) waits for the refresh, as Go's does. A zero
+    // delay runs the rest of the task at once, as Go does.
+    pub fn schedule_diagnostics_refresh(self: &Rc<Self>, delay: Duration) {
         // Cancel any existing scheduled diagnostics refresh
         let existing_cancel = self.diagnostics_refresh_cancel.borrow().clone();
         if let Some(existing_cancel) = existing_cancel {
@@ -604,15 +771,14 @@ impl Session {
         let generation = self.diagnostics_refresh_generation.get();
         *self.diagnostics_refresh_cancel.borrow_mut() = Some(cancel.clone());
 
-        // Enqueue the debounced diagnostics refresh
+        // Enqueue the (optionally debounced) diagnostics refresh
         let s = self.clone();
         self.background_queue.enqueue(&debounce_ctx, move |ctx| {
             let ctx = ctx.clone();
-            let delay = s.options.debounce_delay;
             let hold = s.background_queue.hold();
             let mut task = Some(move || {
                 let run = || {
-                    // Sleep for the debounce delay
+                    // Wait out the debounce window; a newer event cancels this one.
                     if ctx.err().is_some() {
                         // Context was cancelled, newer events arrived
                         return;
@@ -645,14 +811,18 @@ impl Session {
                 cancel();
                 drop(hold);
             });
-            gostd::local::after_func(
-                delay,
-                Box::new(move || {
-                    if let Some(task) = task.take() {
-                        task();
-                    }
-                }),
-            );
+            if delay > Duration::ZERO {
+                gostd::local::after_func(
+                    delay,
+                    Box::new(move || {
+                        if let Some(task) = task.take() {
+                            task();
+                        }
+                    }),
+                );
+            } else if let Some(task) = task.take() {
+                task();
+            }
         });
     }
 
@@ -1583,6 +1753,22 @@ impl Session {
             caller_ref,
         );
         let Some(project) = snapshot.get_default_project(uri) else {
+            // tsgo#4712
+            if caller_ref {
+                Snapshot::deref(&snapshot, self);
+            }
+            if let Some(file) = snapshot.get_file(&uri.file_name())
+                && file.kind() == ScriptKind::UNKNOWN
+            {
+                return Err(gostd::errors::errorf(
+                    format!(
+                        "{}: no project found for URI {}",
+                        ERR_NO_PROJECT_FOR_UNKNOWN_SCRIPT_KIND.error(),
+                        uri
+                    ),
+                    vec![ERR_NO_PROJECT_FOR_UNKNOWN_SCRIPT_KIND.clone()],
+                ));
+            }
             return Err(gostd::errors::errorf(
                 format!("no project found for URI {}", uri),
                 vec![],
@@ -1968,14 +2154,16 @@ impl Session {
             // Session hasn't moved on; adopt the new snapshot. The clone's initial
             // ref is transferred to become the session's ref for its current snapshot.
             *self.snapshot.borrow_mut() = new_snapshot.clone();
+            Snapshot::deref(&old_snapshot, self);
+            let content_mapper_timings = self.take_content_mapper_timing_delta();
             if self.options.logging_enabled {
                 self.logger.logf(&format!(
                     "Adopted snapshot {} (parent {}) as current session snapshot (replacing {})",
                     new_snapshot.id, new_snapshot.parent_id, old_snapshot.id
                 ));
                 self.logger.log(&new_snapshot.builder_logs.string());
+                self.log_content_mapper_timings(&content_mapper_timings);
             }
-            Snapshot::deref(&old_snapshot, self);
         } else {
             // Session has moved on to a newer snapshot; discard this one.
             // Release the clone's initial ref. If a handler is still using
@@ -2044,12 +2232,14 @@ impl Session {
         if caller_ref {
             new_snapshot.ref_();
         }
+        let mut content_mapper_timings = contentmapper::Timings::default();
         if !Rc::ptr_eq(&new_snapshot, &old_snapshot) {
             // Release the session's reference to the old snapshot. The new snapshot's
             // clone ref (1) is transferred to become the session's ref for its current
             // snapshot. Other holders (e.g. active handlers) keep the old snapshot alive
             // via their own refs until they complete.
             Snapshot::deref(&old_snapshot, self);
+            content_mapper_timings = self.take_content_mapper_timing_delta();
         }
 
         // Enqueue ATA updates if needed
@@ -2073,6 +2263,7 @@ impl Session {
                     ));
                     s.logger.log(&new_snapshot.builder_logs.string());
                     s.log_project_changes(old_snapshot, new_snapshot);
+                    s.log_content_mapper_timings(&content_mapper_timings);
                     s.logger.log("");
                 }
                 if s.options.watch_enabled {
@@ -2082,12 +2273,77 @@ impl Session {
                         }
                     }
                 }
+                let _ = s.update_content_mapper_registrations(ctx, new_snapshot);
                 s.publish_program_diagnostics(old_snapshot, new_snapshot);
                 s.send_project_info_telemetry_for_new_projects(old_snapshot, new_snapshot);
                 s.warm_auto_import_cache(ctx, &change, old_snapshot, new_snapshot);
             });
 
         new_snapshot
+    }
+
+    // Go: project/session.go:1489 takeContentMapperTimingDelta (tsgo#4712)
+    pub fn take_content_mapper_timing_delta(&self) -> contentmapper::Timings {
+        let Some(content_mapper_host) = &self.content_mapper_host else {
+            return contentmapper::Timings::default();
+        };
+        let current = content_mapper_host.timings();
+        let delta = current.since(&self.content_mapper_timings.borrow());
+        *self.content_mapper_timings.borrow_mut() = current;
+        delta
+    }
+
+    // Go: project/session.go:1501 logContentMapperTimings (tsgo#4712)
+    // PORT: Go `%v` of a `time.Duration` is `{:?}` (log only), as in the
+    // other session logs. Go sorts the map keys.
+    pub fn log_content_mapper_timings(&self, timings: &contentmapper::Timings) {
+        if timings.request_wait.is_zero() {
+            return;
+        }
+        self.logger
+            .log("Content mapper timings since previous snapshot adoption:");
+        if !timings.request_wait.is_zero() {
+            self.logger
+                .logf(&format!("  Request wait time: {:?}", timings.request_wait));
+        }
+        let mut identities: Vec<&String> = timings.mappers.keys().collect();
+        identities.sort();
+        for identity in identities {
+            let mapper = &timings.mappers[identity];
+            if mapper.spawn.count == 0
+                && mapper.open_project.count == 0
+                && mapper.close_project.count == 0
+                && mapper.transform.count == 0
+            {
+                continue;
+            }
+            self.logger.logf(&format!("  {identity}:"));
+            if mapper.spawn.count != 0 {
+                self.logger.logf(&format!(
+                    "    Initializations: {} ({:?})",
+                    mapper.spawn.count,
+                    mapper.spawn.duration + mapper.initialize.duration
+                ));
+            }
+            if mapper.open_project.count != 0 {
+                self.logger.logf(&format!(
+                    "    openProject requests: {} ({:?})",
+                    mapper.open_project.count, mapper.open_project.duration
+                ));
+            }
+            if mapper.close_project.count != 0 {
+                self.logger.logf(&format!(
+                    "    closeProject requests: {} ({:?})",
+                    mapper.close_project.count, mapper.close_project.duration
+                ));
+            }
+            if mapper.transform.count != 0 {
+                self.logger.logf(&format!(
+                    "    Transforms: {} ({:?})",
+                    mapper.transform.count, mapper.transform.duration
+                ));
+            }
+        }
     }
 
     // Go: project/session.go:1249 WaitForBackgroundTasks
@@ -2221,6 +2477,57 @@ pub fn update_watch<T>(
 }
 
 impl Session {
+    // Go: project/session.go:1621 updateContentMapperRegistrations (tsgo#4712)
+    // updateContentMapperRegistrations computes the union of content mapper extensions across all loaded
+    // configs in the new snapshot and, when the set changes, asks the client to synchronize text documents
+    // with those extensions. This is how an otherwise unsupported file (e.g. a `.vue`) begins flowing to the server once a
+    // config that maps it is discovered.
+    // PORT: `contentMapperRegistrationMu` is dropped (one thread).
+    pub fn update_content_mapper_registrations(
+        &self,
+        ctx: &Context,
+        snapshot: &Snapshot,
+    ) -> Result<(), GoError> {
+        let Some(client) = &self.client else {
+            return Ok(());
+        };
+        let content_mappers = snapshot.config_file_registry.content_mappers();
+        let mut extensions = content_mappers.extensions.clone();
+        extensions.extend(
+            snapshot
+                .inferred_project_content_mapper_extensions
+                .iter()
+                .cloned(),
+        );
+        extensions.sort();
+        extensions.dedup();
+
+        // Background tasks may finish out of order; never let an older snapshot's task overwrite the
+        // registration derived from a newer one.
+        if snapshot.id() <= self.registered_content_mapper_snapshot_id.get() {
+            return Ok(());
+        }
+        if extensions == *self.registered_content_mapper_extensions.borrow() {
+            self.registered_content_mapper_snapshot_id
+                .set(snapshot.id());
+            return Ok(());
+        }
+        // RegisterContentMapperExtensions replaces the prior registration wholesale (unregistering extensions
+        // that are no longer mapped and registering the current set), so an empty set removes the registration
+        // once the last mapping config unloads. On failure we leave the state unadvanced so the next snapshot
+        // update retries.
+        if let Err(err) = client.register_content_mapper_extensions(ctx, &extensions) {
+            if self.options.logging_enabled {
+                self.logger.log(&err.error());
+            }
+            return Err(err);
+        }
+        *self.registered_content_mapper_extensions.borrow_mut() = extensions;
+        self.registered_content_mapper_snapshot_id
+            .set(snapshot.id());
+        Ok(())
+    }
+
     // Go: project/session.go:1334 updateWatches
     // PORT: the Go closures all append to `errors`, so it is a `RefCell`.
     // Go ranges over the config map (random order); the port uses the
@@ -2317,6 +2624,14 @@ impl Session {
                     added_project.typings_watch.as_deref(),
                 );
                 errors.borrow_mut().extend(typings);
+                let content_mapper = update_watch(
+                    &ctx,
+                    self,
+                    &self.logger,
+                    None,
+                    added_project.content_mapper_watch.as_deref(),
+                );
+                errors.borrow_mut().extend(content_mapper);
             },
             |_: &tspath::Path, removed_project| {
                 let removed_project = removed_project.borrow();
@@ -2336,6 +2651,14 @@ impl Session {
                     None,
                 );
                 errors.borrow_mut().extend(typings);
+                let content_mapper = update_watch(
+                    &ctx,
+                    self,
+                    &self.logger,
+                    removed_project.content_mapper_watch.as_deref(),
+                    None,
+                );
+                errors.borrow_mut().extend(content_mapper);
             },
             |_: &tspath::Path, old_project, new_project| {
                 let old_project = old_project.borrow();
@@ -2384,6 +2707,29 @@ impl Session {
                         &self.logger,
                         None,
                         new_project.typings_watch.as_deref(),
+                    );
+                    errors.borrow_mut().extend(retried);
+                }
+                if WatchedFiles::id(old_project.content_mapper_watch.as_deref())
+                    != WatchedFiles::id(new_project.content_mapper_watch.as_deref())
+                {
+                    let changed = update_watch(
+                        &ctx,
+                        self,
+                        &self.logger,
+                        old_project.content_mapper_watch.as_deref(),
+                        new_project.content_mapper_watch.as_deref(),
+                    );
+                    errors.borrow_mut().extend(changed);
+                } else if self.watches.is_pending(&WatchedFiles::id(
+                    new_project.content_mapper_watch.as_deref(),
+                )) {
+                    let retried = update_watch(
+                        &ctx,
+                        self,
+                        &self.logger,
+                        None,
+                        new_project.content_mapper_watch.as_deref(),
                     );
                     errors.borrow_mut().extend(retried);
                 }
@@ -2443,6 +2789,9 @@ impl Session {
         // Cancel periodic performance telemetry
         self.stop_performance_telemetry();
         self.background_queue.close();
+        if let Some(content_mapper_host) = &self.content_mapper_host {
+            let _ = content_mapper_host.close();
+        }
     }
 
     // Go: project/session.go:1424 flushChanges
@@ -2711,7 +3060,7 @@ impl Session {
                 != new_prefs.report_style_checks_as_warnings
             || old_prefs.enable_validation != new_prefs.enable_validation
         {
-            self.schedule_diagnostics_refresh();
+            self.schedule_diagnostics_refresh_exported();
         }
     }
 
@@ -2724,7 +3073,7 @@ impl Session {
         if old_prefs.is_ata_disabled() && !new_prefs.is_ata_disabled() {
             // ATA was re-enabled; schedule a diagnostics refresh so the next snapshot update
             // re-triggers ATA for existing projects with the new setting.
-            self.schedule_diagnostics_refresh();
+            self.schedule_diagnostics_refresh_exported();
         }
     }
 
@@ -3037,7 +3386,7 @@ impl Session {
                                         logs: log_tree,
                                     }),
                                 );
-                                s.schedule_diagnostics_refresh();
+                                s.schedule_diagnostics_refresh_exported();
                             }
                         }
                     }

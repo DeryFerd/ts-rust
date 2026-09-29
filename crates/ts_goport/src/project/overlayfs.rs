@@ -9,6 +9,7 @@
 use crate::project::prelude::*;
 
 use crate::frontend::core_ext::get_script_kind_from_file_name;
+use crate::frontend::core_textchange::TextChange;
 use std::cell::{Cell, OnceCell};
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -291,16 +292,33 @@ impl FileHandle for Overlay {
     }
 }
 
-// PORT: Go passes an `*Overlay` to `Converters.FromLSPTextChange` as an
-// `lsconv.Script` (its `FileName` and `Text` methods). tsgo #4712 adds
-// `OriginalFileName` (the file name), `SpanMap` (nil) and `OriginalText`
-// (the content) to `lsconv.Script`. They come here with that trait change.
+// PORT: Go passes an `*Overlay` to `lsconv.FromLSPRange` as an
+// `lsconv.Script` (its `FileName` and `Text` methods and the tsgo#4712
+// methods below).
 impl lsconv::Script for Overlay {
     fn file_name(&self) -> &str {
         &self.file_base.file_name
     }
 
     fn text(&self) -> &str {
+        &self.file_base.content
+    }
+
+    // Go: project/overlayfs.go:147 Overlay.OriginalFileName (tsgo#4712)
+    fn original_file_name(&self) -> &str {
+        &self.file_base.file_name
+    }
+
+    // Go: project/overlayfs.go:152 Overlay.SpanMap (tsgo#4712)
+    // SpanMap and OriginalText satisfy lsconv.Script. An overlay holds the editor's raw text (for a
+    // content-mapped file, that is the original foreign text, not the transformed output), so it never
+    // carries a span map and its original text is its own text.
+    fn span_map(&self) -> Option<&crate::spanmap::SpanMap> {
+        None
+    }
+
+    // Go: project/overlayfs.go:154 Overlay.OriginalText (tsgo#4712)
+    fn original_text(&self) -> &str {
         &self.file_base.content
     }
 }
@@ -554,12 +572,22 @@ impl OverlayFS {
                             .clone()
                             .expect("invalid memory address or nil pointer dereference");
                         if let Some(partial_change) = &text_change.partial {
-                            // PORT: tsgo #4712 uses `lsconv.FromLSPRange(converters, o,
-                            // partialChange.Range, spanmap.FeatureAll)` and asserts one
-                            // range. An overlay has no span map, so that range is this one.
-                            let new_content = converters
-                                .from_lsp_text_change(&*cur, partial_change)
-                                .apply_to(&cur.file_base.content);
+                            // tsgo#4712
+                            let ranges = lsconv::from_lsp_range(
+                                &converters,
+                                &*cur,
+                                partial_change.range,
+                                crate::spanmap::Feature::ALL,
+                            );
+                            crate::go_assert!(
+                                ranges.len() == 1,
+                                "expected exactly one range for partial change"
+                            );
+                            let text_change = TextChange {
+                                text_range: ranges[0].span,
+                                new_text: partial_change.text.clone(),
+                            };
+                            let new_content = text_change.apply_to(&cur.file_base.content);
                             *o_cell.borrow_mut() = Some(Rc::new(new_overlay(
                                 &cur.file_base.file_name,
                                 new_content,

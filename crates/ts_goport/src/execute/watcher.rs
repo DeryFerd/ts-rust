@@ -23,7 +23,7 @@ use crate::execute::execute_tsc::{get_trace_from_sys, new_program_version, os_wr
 use crate::execute::incremental;
 use crate::execute::tsc::compile::{
     CommandLineTesting, CompileAndEmitResult, CompileTimes, System, SystemParseConfigHost,
-    write_str,
+    new_content_mapper_host, write_str,
 };
 use crate::execute::tsc::diagnostics::{
     DiagnosticReporter, DiagnosticsReporter, create_watch_status_reporter,
@@ -282,13 +282,8 @@ pub fn create_watcher(
 impl Watcher {
     // Go: execute/watcher.go:136 (*Watcher).start
     pub fn start(&mut self, ctx: &Context) {
-        // Go: w.contentMapperHost = tsc.NewContentMapperHost(ctx, w.sys, w.config.CompilerOptions())
-        // PORT: the port's `tsc::System` has no `Spawn` and there is no
-        // `tsc::new_content_mapper_host` yet (tsgo#4712, tsc/compile.go).
-        // The watcher has no host: Go's value without `runExternalCode`.
-        // A content-mapped file then fails its transform with
-        // `ErrProjectUnavailable`, as in Go without that option.
-        self.content_mapper_host = None;
+        self.content_mapper_host =
+            new_content_mapper_host(ctx, &self.sys, self.config.compiler_options());
         let config = self.config.clone();
         self.replace_content_mapper_project(&config);
         self.wm.borrow().lock();

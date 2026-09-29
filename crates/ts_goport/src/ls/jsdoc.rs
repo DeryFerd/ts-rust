@@ -403,7 +403,7 @@ pub fn is_node_with_name(node: Node, name: &str) -> bool {
     is_identifier(node_name) && node_name.text() == name
 }
 
-// Go: ls/jsdoc.go:309 noMappedLocation
-pub fn no_mapped_location(_: &str, _: TextRange) -> lsproto::Location {
-    lsproto::Location::default()
+// Go: ls/jsdoc.go:310 noMappedLocation
+pub fn no_mapped_location(_: Node, _: TextRange) -> (lsproto::Location, crate::spanmap::Fidelity) {
+    (lsproto::Location::default(), crate::spanmap::Fidelity::NONE)
 }

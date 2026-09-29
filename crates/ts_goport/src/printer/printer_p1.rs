@@ -602,8 +602,12 @@ fn get_text_of_node_worker(
 }
 
 /// Go `scanner.GetSourceTextOfNodeFromSourceFile` that borrows the source
-/// slice. The missing-node and reparser-literal cases use the String form.
+/// slice. The missing-node, reparser-literal and JSDoc cases use the String
+/// form.
 // PERF: no new String for the common case.
+// PORT: the JSDoc test is a cheap superset of the private scanner
+// `isJSDocTypeExpressionOrChild` (tsgo#4839). The String form makes the exact
+// check and strips the ` * ` line prefixes of a JSDoc type.
 fn source_text_of_node_cow(
     source_file: Node,
     node: Node,
@@ -611,9 +615,10 @@ fn source_text_of_node_cow(
     skip_trivia_memo: &SkipTriviaMemo,
 ) -> Cow<'static, str> {
     if node_is_missing(node)
-        || node
-            .flags()
-            .intersects(NodeFlags::REPARSER_TRANSFORMED_LITERAL)
+        || is_js_doc_type_expression(node)
+        || node.flags().intersects(
+            NodeFlags::REPARSER_TRANSFORMED_LITERAL | NodeFlags::JS_DOC | NodeFlags::REPARSED,
+        )
     {
         return Cow::Owned(get_source_text_of_node_from_source_file(
             source_file,

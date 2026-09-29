@@ -9,7 +9,8 @@
 
 use crate::project::prelude::*;
 
-use std::cell::Cell;
+use crate::contentmapper;
+use std::cell::{Cell, OnceCell};
 use std::panic::AssertUnwindSafe;
 use std::time::Instant;
 
@@ -37,10 +38,50 @@ pub struct Snapshot {
     pub auto_imports: Option<Rc<autoimport::Registry>>,
     pub auto_imports_watch: Option<Rc<WatchedFiles<FxHashMap<tspath::Path, String>>>>,
     pub compiler_options_for_inferred_projects: Option<Rc<CompilerOptions>>,
+    pub inferred_project_content_mappers: Vec<Rc<contentmapper::Mapper>>,
+    pub inferred_project_content_mapper_extensions: Vec<String>,
     pub user_preferences: lsutil::UserPreferences,
+    // tsgo#4712. PORT: Go `contentMapperWatchStateOnce` with the fields
+    // `contentMapperExtensions` and `contentMapperWatchedFiles` is one
+    // `OnceCell` of both.
+    pub content_mapper_watch_state: OnceCell<(Vec<String>, Rc<FxHashSet<tspath::Path>>)>,
 
     pub builder_logs: Option<Rc<logging::LogTree>>,
     pub api_error: Option<GoError>,
+}
+
+impl Snapshot {
+    // Go: project/snapshot.go:57 contentMapperWatchState (tsgo#4712)
+    pub fn content_mapper_watch_state(&self) -> (Vec<String>, Rc<FxHashSet<tspath::Path>>) {
+        self.content_mapper_watch_state
+            .get_or_init(|| {
+                let configured = self.config_file_registry.content_mappers();
+                let mut content_mapper_extensions = configured.extensions.clone();
+                content_mapper_extensions.extend(
+                    self.inferred_project_content_mapper_extensions
+                        .iter()
+                        .cloned(),
+                );
+                content_mapper_extensions.sort();
+                content_mapper_extensions.dedup();
+
+                let mut content_mapper_watched_files: FxHashSet<tspath::Path> =
+                    FxHashSet::default();
+                for project in self.project_collection.projects() {
+                    let project = project.borrow();
+                    if let Some(watched_files) = &project.content_mapper_watched_files {
+                        for path in watched_files.iter() {
+                            content_mapper_watched_files.insert(path.clone());
+                        }
+                    }
+                }
+                (
+                    content_mapper_extensions,
+                    Rc::new(content_mapper_watched_files),
+                )
+            })
+            .clone()
+    }
 }
 
 // Go: project/snapshot.go:97 (*Snapshot).LSPLineMap, as a function of the
@@ -99,7 +140,10 @@ pub fn new_snapshot(
         config_file_registry,
         project_collection,
         compiler_options_for_inferred_projects,
+        inferred_project_content_mappers: Vec::new(),
+        inferred_project_content_mapper_extensions: Vec::new(),
         user_preferences,
+        content_mapper_watch_state: OnceCell::new(),
         auto_imports,
         auto_imports_watch,
 
@@ -367,6 +411,8 @@ pub struct SnapshotChange {
     // It should only be set the value in the next snapshot should be changed. If nil, the
     // value from the previous snapshot will be copied to the new snapshot.
     pub compiler_options_for_inferred_projects: Option<Rc<CompilerOptions>>,
+    // tsgo#4712. PORT: Go nil pointer is `None`.
+    pub content_mapper_contributions: Option<ContentMapperContributions>,
     pub new_config: Option<lsutil::UserPreferences>,
     // ataChanges contains ATA-related changes to apply to projects in the new snapshot.
     pub ata_changes: FxHashMap<tspath::Path, Rc<ATAStateChange>>,
@@ -519,11 +565,24 @@ impl Snapshot {
                 logger.logf("Reason: IdleCleanDiskCache");
             } else if *reason == UpdateReason::DID_CHANGE_CONFIG_FILE {
                 logger.logf(&format!("Reason: DidChangeConfigFile - {}", get_details()));
+            } else if *reason == UpdateReason::DID_CHANGE_CONTENT_MAPPER_CONTRIBUTIONS {
+                logger.logf(&format!(
+                    "Reason: DidChangeContentMapperContributions - {}",
+                    get_details()
+                ));
             }
         }
         let logger = logger_out.clone();
 
         let start = Instant::now();
+        let configured_content_mappers = self.config_file_registry.content_mappers();
+        let mut inferred_content_mappers = self.inferred_project_content_mappers.clone();
+        let mut inferred_content_mapper_extensions =
+            self.inferred_project_content_mapper_extensions.clone();
+        if let Some(contributions) = &change.content_mapper_contributions {
+            inferred_content_mappers = contributions.mappers.clone();
+            inferred_content_mapper_extensions = contributions.extensions.clone();
+        }
         let fs = new_snapshot_fs_builder(
             session.fs.fs.clone(),
             self.fs.overlays.clone(),
@@ -563,7 +622,20 @@ impl Snapshot {
                 ));
             }
         } else {
-            change.file_changes = fs.expand_and_filter_watch_events(change.file_changes);
+            let content_mapper_extensions = if change.content_mapper_contributions.is_none() {
+                self.content_mapper_watch_state().0
+            } else {
+                let mut content_mapper_extensions = configured_content_mappers.extensions.clone();
+                content_mapper_extensions
+                    .extend(inferred_content_mapper_extensions.iter().cloned());
+                content_mapper_extensions
+            };
+            let (_, content_mapper_watched_files) = self.content_mapper_watch_state();
+            change.file_changes = fs.expand_and_filter_watch_events(
+                change.file_changes,
+                &content_mapper_extensions,
+                Some(&*content_mapper_watched_files),
+            );
             change.file_changes = self.fs.expand_realpath_aliases(change.file_changes);
             change.file_changes = fs.mark_dirty_files(change.file_changes);
             change.file_changes = fs.convert_open_and_close_to_changes(change.file_changes);
@@ -594,10 +666,14 @@ impl Snapshot {
             self.config_file_registry.clone(),
             &self.project_collection.api_state,
             compiler_options_for_inferred_projects.clone(),
+            inferred_content_mappers.clone(),
+            inferred_content_mapper_extensions.clone(),
             self.session_options.clone(),
             &custom_config_file_name,
             session.parse_cache.clone(),
+            session.content_mapped_parse_cache.clone(),
             session.extended_config_cache.clone(),
+            session.content_mapper_host.clone(),
             session.client.clone(),
         );
 
@@ -608,6 +684,18 @@ impl Snapshot {
 
         project_collection_builder
             .did_change_custom_config_file_name(logger.fork("DidChangeCustomConfigFileName"));
+        if change.content_mapper_contributions.is_some() {
+            project_collection_builder.did_change_content_mapper_contributions(
+                logger.fork("DidChangeContentMapperContributions"),
+            );
+        }
+        if let Some(new_config) = &change.new_config {
+            project_collection_builder.did_change_user_preferences(
+                &self.user_preferences,
+                new_config,
+                logger.fork("DidChangeUserPreferences"),
+            );
+        }
 
         if !change.file_changes.is_empty() {
             project_collection_builder
@@ -781,6 +869,8 @@ impl Snapshot {
             s.parent_id = self.id;
             s.project_collection = project_collection;
             s.config_file_registry = config_file_registry;
+            s.inferred_project_content_mappers = inferred_content_mappers;
+            s.inferred_project_content_mapper_extensions = inferred_content_mapper_extensions;
             s.builder_logs = logger.clone();
             s.api_error = api_error;
         }
@@ -892,6 +982,9 @@ impl Snapshot {
             // PORT: Go `project.Program` (the field).
             if let Some(program) = project.program {
                 if session.program_counter.deref(program) {
+                    if let Some(content_mapper_project) = program.content_mapper_project() {
+                        let _ = content_mapper_project.close();
+                    }
                     // This program is no longer referenced by any snapshot.
                     // Mark its checker pool as discarded so its idle-cleanup timer stops
                     // keeping the pool alive, allowing the pool and any idle checkers it
@@ -900,20 +993,40 @@ impl Snapshot {
                         checker_pool.discard();
                     }
                     for file in program.source_files() {
-                        deref_program_file(
-                            &session.parse_cache,
-                            file.parse_options(),
-                            file.text,
-                            file.script_kind,
-                        );
+                        if !file.is_content_mapper_failure_stub()
+                            && !file.is_content_mapper_supplemental()
+                        {
+                            if !file.content_mapper().is_empty() {
+                                deref_content_mapped_file(
+                                    &session.content_mapped_parse_cache,
+                                    &content_mapped_parse_cache_key_for_file(file),
+                                );
+                            } else {
+                                deref_program_file(
+                                    &session.parse_cache,
+                                    file.parse_options(),
+                                    file.text,
+                                    file.script_kind,
+                                );
+                            }
+                        }
                     }
                     for file in program.duplicate_source_files() {
-                        deref_program_file(
-                            &session.parse_cache,
-                            &file.parse_options,
-                            file.text,
-                            file.script_kind,
-                        );
+                        if !file.is_content_mapper_failure_stub {
+                            if !file.content_mapper.is_empty() {
+                                deref_content_mapped_file(
+                                    &session.content_mapped_parse_cache,
+                                    &content_mapped_parse_cache_key_for_duplicate(file),
+                                );
+                            } else {
+                                deref_program_file(
+                                    &session.parse_cache,
+                                    &file.parse_options,
+                                    file.text,
+                                    file.script_kind,
+                                );
+                            }
+                        }
                     }
                     // PORT: Go frees the program when nothing references it.
                     // The port frees its checkers and its program version

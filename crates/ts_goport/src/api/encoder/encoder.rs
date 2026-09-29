@@ -314,11 +314,17 @@ struct Uint128 {
 }
 
 /// Go `sourceFile.Hash`.
-// PORT: ts_goport keeps no `SourceFile.Hash` field. Only the project parse
-// cache sets Go `file.Hash` (project/parsecache.go NewParseCache), to
-// `fh.Hash()`: the xxh3-128 of the file content, which is the parsed text.
-// So the hash is computed here on demand (the same value) for a file of a
-// language server program, which the parse cache made. Any other parse
+// PORT: ts_goport keeps no `SourceFile.Hash` field. At pin B only the two
+// project parse caches set Go `file.Hash`:
+// - project/parsecache.go NewParseCache sets `fh.Hash()`, the xxh3-128 of
+//   the file content, which is the parsed text.
+// - project/compilerhost.go GetContentMappedSourceFiles (tsgo#4712) sets
+//   the hash of the cache key on the canonical file and on each
+//   supplemental file of a content-mapped file.
+// The project parse cache keeps each value by file text
+// (`project::parsecache::source_file_hash`, which gives the xxh3-128 of the
+// text for a text it did not record). This reads it for a file of a
+// language server program, which the parse caches made. Any other parse
 // (Go `parser.ParseSourceFile`, for example a tsconfig from
 // `tsoptions.NewTsconfigSourceFileFromFilePath`) keeps Go Hash 0. Such a
 // file is in no program, also when a publish kept its parse (the root
@@ -326,18 +332,14 @@ struct Uint128 {
 // So the test is "a program made here has this file"
 // (`program_parsed_source_file`), not "some parse of this file exists"
 // (`parsed_source_file_of`, which also finds that root config).
-// PORT: Go gives a content-mapped file (project/compilerhost.go
-// GetContentMappedSourceFiles) the hash of its cache key, not of its text.
-// The port has no content-mapped parse cache yet, so such a file gets the
-// text hash here.
 fn source_file_content_hash(source_file: Node) -> Uint128 {
-    let from_parse_cache = !source_file.is_nil()
-        && !is_synthetic_node(source_file)
-        && crate::program::ls_program::program_parsed_source_file(source_file).is_some();
-    if !from_parse_cache {
+    if source_file.is_nil() || is_synthetic_node(source_file) {
         return Uint128::default();
     }
-    let h = xxhash_rust::xxh3::xxh3_128(source_file_text(source_file).as_bytes());
+    let Some(parsed) = crate::program::ls_program::program_parsed_source_file(source_file) else {
+        return Uint128::default();
+    };
+    let h = crate::project::parsecache::source_file_hash(parsed.text);
     Uint128 {
         hi: (h >> 64) as u64,
         lo: h as u64,

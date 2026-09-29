@@ -1,5 +1,7 @@
 use crate::ls::prelude::*;
 
+use crate::spanmap::{Feature, Fidelity};
+
 // Go: ls/hover.go:20 symbolFormatFlags
 pub const SYMBOL_FORMAT_FLAGS: SymbolFormatFlags =
     SymbolFormatFlags::WRITE_TYPE_PARAMETERS_OR_ARGUMENTS
@@ -13,7 +15,7 @@ pub const TYPE_FORMAT_FLAGS: TypeFormatFlags =
         .union(TypeFormatFlags::USE_INSTANTIATION_EXPRESSIONS);
 
 impl LanguageService {
-    // Go: ls/hover.go:25 ProvideHover
+    // Go: ls/hover.go:28 ProvideHover
     pub fn provide_hover(
         &self,
         ctx: &Context,
@@ -29,9 +31,17 @@ impl LanguageService {
         }
 
         let (program, file) = self.get_program_and_file(&params.text_document.uri);
-        let position = self
-            .converters
-            .line_and_character_to_position(&file, &params.position);
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            file,
+            params.position,
+            Feature::HOVER,
+        );
+        if positions.is_empty() || !positions[0].fidelity.is_single_segment() {
+            return Ok(lsproto::HoverOrNull::default());
+        }
+        let file = positions[0].script;
+        let position = positions[0].position;
         let node = astnav::get_touching_property_name(file, position);
         if is_source_file(node)
             || is_property_access_or_qualified_name(node)
@@ -72,7 +82,11 @@ impl LanguageService {
         if quick_info.is_empty() {
             return Ok(lsproto::HoverOrNull::default());
         }
-        let hover_range = self.get_lsp_range_of_node(range_node, Node::NIL, Node::NIL);
+        let range_file = get_source_file_of_node(range_node);
+        let text_range = get_range_of_node(range_node, range_file, Node::NIL /*endNode*/);
+        let (hover_range, hover_fidelity) =
+            self.converters
+                .to_lsp_range_for_feature(&range_file, text_range, Feature::HOVER);
 
         let content = if content_format == lsproto::MarkupKind::MARKDOWN {
             format_quick_info(&quick_info) + &documentation
@@ -88,9 +102,11 @@ impl LanguageService {
                 }),
                 ..Default::default()
             },
-            range: Some(hover_range),
             ..Default::default()
         };
+        if hover_fidelity.is_single_segment() {
+            hover.range = Some(hover_range);
+        }
 
         if caps.experimental.hover_verbosity_level {
             hover.can_increase_verbosity = vc.can_increase_verbosity.get() && !vc.truncated.get();
@@ -133,7 +149,7 @@ impl LanguageService {
         Ok(lsproto::HoverOrNull { hover: Some(hover) })
     }
 
-    // Go: ls/hover.go:117 getQuickInfoAndDocumentationForSymbol
+    // Go: ls/hover.go:128 getQuickInfoAndDocumentationForSymbol
     pub fn get_quick_info_and_documentation_for_symbol(
         &self,
         c: &mut Checker,
@@ -153,11 +169,8 @@ impl LanguageService {
         }
         let quick_info_runs = info.display_parts.borrow().get_runs(c);
 
-        let get_mapped_location = &|file_name: &str, file_range: TextRange| {
-            self.get_mapped_location(file_name, file_range)
-        };
         let documentation = get_documentation_for_symbol(
-            get_mapped_location,
+            &self.documentation_location_mapper(Feature::HOVER),
             c,
             symbol,
             node,
@@ -177,7 +190,7 @@ impl LanguageService {
         let mut vs_documentation = String::new();
         if vs_capability {
             vs_documentation = get_documentation_for_symbol(
-                get_mapped_location,
+                &self.documentation_location_mapper(Feature::HOVER),
                 c,
                 symbol,
                 node,
@@ -191,17 +204,31 @@ impl LanguageService {
     }
 }
 
-/// Go `func(string, core.TextRange) lsproto.Location`: `l.getMappedLocation`
-/// or `noMappedLocation` (tsgo#4893).
-pub type GetMappedLocation<'a> = &'a dyn Fn(&str, TextRange) -> lsproto::Location;
+// Go: ls/hover.go:158 documentationLocationMapper
+/// `l.documentationLocationMapper(feature)` or `noMappedLocation`.
+// PORT: Go passes the func value; here a reference to the closure.
+pub type DocumentationLocationMapper<'a> =
+    &'a dyn Fn(Node, TextRange) -> (lsproto::Location, Fidelity);
 
-// Go: ls/hover.go:147 getDocumentationForSymbol
+impl<P: ProgramView> LanguageService<P> {
+    // Go: ls/hover.go:160 documentationLocationMapper
+    pub fn documentation_location_mapper(
+        &self,
+        feature: Feature,
+    ) -> impl Fn(Node, TextRange) -> (lsproto::Location, Fidelity) + '_ {
+        move |file: Node, file_range: TextRange| {
+            self.source_file_range_to_lsp_location_for_feature(file, file_range, feature)
+        }
+    }
+}
+
+// Go: ls/hover.go:166 getDocumentationForSymbol
 // getDocumentationForSymbol tries each documentation source in turn (call-signature documentation,
 // declaration JSDoc, root-symbol JSDoc, alias target JSDoc) and returns the first non-empty result,
 // formatted for contentFormat. commentOnly restricts the result to the JSDoc summary, excluding the
 // @tag section.
 pub fn get_documentation_for_symbol(
-    get_mapped_location: GetMappedLocation<'_>,
+    get_mapped_location: DocumentationLocationMapper<'_>,
     c: &mut Checker,
     symbol: SymbolId,
     node: Node,
@@ -258,9 +285,9 @@ pub fn get_documentation_for_symbol(
     )
 }
 
-// Go: ls/hover.go:166 documentationFromSignature
+// Go: ls/hover.go:185 documentationFromSignature
 pub fn documentation_from_signature(
-    get_mapped_location: GetMappedLocation<'_>,
+    get_mapped_location: DocumentationLocationMapper<'_>,
     c: &mut Checker,
     symbol: SymbolId,
     node: Node,
@@ -294,9 +321,9 @@ pub fn documentation_from_signature(
     String::new()
 }
 
-// Go: ls/hover.go:184 documentationFromAlias
+// Go: ls/hover.go:203 documentationFromAlias
 pub fn documentation_from_alias(
-    get_mapped_location: GetMappedLocation<'_>,
+    get_mapped_location: DocumentationLocationMapper<'_>,
     c: &mut Checker,
     symbol: SymbolId,
     node: Node,
@@ -350,9 +377,9 @@ pub fn documentation_from_alias(
     String::new()
 }
 
-// Go: ls/hover.go:213 documentationFromRootSymbols
+// Go: ls/hover.go:232 documentationFromRootSymbols
 pub fn documentation_from_root_symbols(
-    get_mapped_location: GetMappedLocation<'_>,
+    get_mapped_location: DocumentationLocationMapper<'_>,
     c: &mut Checker,
     symbol: SymbolId,
     node: Node,
@@ -396,9 +423,9 @@ pub fn documentation_from_root_symbols(
     docs.join("\n")
 }
 
-// Go: ls/hover.go:241 getDocumentationFromDeclaration
+// Go: ls/hover.go:260 getDocumentationFromDeclaration
 pub fn get_documentation_from_declaration(
-    get_mapped_location: GetMappedLocation<'_>,
+    get_mapped_location: DocumentationLocationMapper<'_>,
     c: &mut Checker,
     symbol: SymbolId,
     declaration: Node,
@@ -1601,9 +1628,9 @@ pub fn write_code(b: &mut String, lang: &str, code: &str) {
     b.push('\n');
 }
 
-// Go: ls/hover.go:956 writeComments
+// Go: ls/hover.go:975 writeComments
 pub fn write_comments(
-    get_mapped_location: GetMappedLocation<'_>,
+    get_mapped_location: DocumentationLocationMapper<'_>,
     b: &mut String,
     c: &mut Checker,
     comments: &[Node],
@@ -1639,9 +1666,9 @@ pub fn write_comments(
     }
 }
 
-// Go: ls/hover.go:969 writeJSDocLink
+// Go: ls/hover.go:988 writeJSDocLink
 pub fn write_js_doc_link(
-    get_mapped_location: GetMappedLocation<'_>,
+    get_mapped_location: DocumentationLocationMapper<'_>,
     b: &mut String,
     c: &mut Checker,
     link: Node,
@@ -1682,9 +1709,9 @@ pub fn write_js_doc_link(
     write_name_link(get_mapped_location, b, c, name, text, quote, is_markdown);
 }
 
-// Go: ls/hover.go:1001 writeNameLink
+// Go: ls/hover.go:1020 writeNameLink
 pub fn write_name_link(
-    get_mapped_location: GetMappedLocation<'_>,
+    get_mapped_location: DocumentationLocationMapper<'_>,
     b: &mut String,
     c: &mut Checker,
     name: Node,
@@ -1702,16 +1729,13 @@ pub fn write_name_link(
         } else {
             declaration
         };
-        let loc = get_mapped_location(
-            source_file_file_name(file),
-            create_range_from_node(node, file),
-        );
+        let (loc, fidelity) = get_mapped_location(file, create_range_from_node(node, file));
         let prefix_len = if text.starts_with("()") { 2 } else { 0 };
         let mut link_text = trim_comment_prefix(&text[prefix_len..]).to_string();
         if link_text.is_empty() {
             link_text = get_entity_name_string(name) + &text[..prefix_len];
         }
-        if is_markdown {
+        if is_markdown && fidelity.is_single_segment() {
             let link_uri = format!(
                 "{}#{},{}-{},{}",
                 loc.uri,

@@ -1043,9 +1043,13 @@ impl LanguageService {
         }
         if let Some(optional_replacement_span) = optional_replacement_span {
             // Ported from vscode ts extension.
+            let (end, fidelity) = self.create_lsp_position(position, file);
+            if !fidelity.is_exact() {
+                return item_defaults;
+            }
             let insert_range = lsproto::Range {
                 start: optional_replacement_span.start,
-                end: self.create_lsp_position(position, file),
+                end,
             };
             if client_supports_default_edit_range(ctx) {
                 // Go: core.OrElse(itemDefaults, &lsproto.CompletionItemDefaults{})
@@ -1169,8 +1173,11 @@ impl LanguageService {
         let tag_name = jsx_closing_element.parent().opening_element().tag_name();
         let closing_tag = get_text_of_node(tag_name);
         let full_closing_tag = closing_tag + if has_closing_angle_bracket { "" } else { ">" };
-        let optional_replacement_span =
-            Some(self.create_lsp_range_from_node(jsx_closing_element.tag_name(), file));
+        let (optional_replacement_span, fidelity) =
+            self.create_lsp_range_from_node(jsx_closing_element.tag_name(), file);
+        if !fidelity.is_exact() {
+            return None;
+        }
         let default_commit_characters =
             get_default_commit_characters(false /*isNewIdentifierLocation*/);
 
@@ -1208,7 +1215,7 @@ impl LanguageService {
             file,
             &mut items,
             Some(&default_commit_characters),
-            optional_replacement_span,
+            Some(optional_replacement_span),
         );
 
         Some(CompletionList {
@@ -1249,8 +1256,9 @@ impl LanguageService {
 
         let kind = get_completions_symbol_kind(element_kind);
         let data = lsproto::CompletionItemData {
-            file_name: source_file_file_name(file).to_string(),
+            file_name: source_file_original_file_name(file).to_string(),
             position,
+            supplemental_file_index: supplemental_file_index(file),
             source: source.to_string(),
             name: name.clone(),
             auto_import: auto_import_fix,

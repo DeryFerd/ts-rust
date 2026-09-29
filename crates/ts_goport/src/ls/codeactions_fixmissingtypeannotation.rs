@@ -186,7 +186,7 @@ fn get_all_isolated_declarations_code_actions(
     };
 
     for diag in all_diags {
-        if contains_error_code(&ISOLATED_DECLARATIONS_FIX_ERROR_CODES, diag.code) {
+        if is_fixable_diagnostic(&diag, &ISOLATED_DECLARATIONS_FIX_ERROR_CODES) {
             let span = TextRange::new(diag.pos, diag.end);
             fixer.add_type_annotation(span);
         }
@@ -200,7 +200,7 @@ fn get_all_isolated_declarations_code_actions(
     let (mut changes, _) = change_tracker.get_changes();
     // PORT: Go indexes the map; a missing file gives a nil slice.
     let file_changes = changes
-        .shift_remove(source_file_file_name(fix_context.source_file))
+        .shift_remove(source_file_original_file_name(fix_context.source_file))
         .unwrap_or_default();
     if file_changes.is_empty() {
         return Ok(None);
@@ -261,7 +261,7 @@ fn try_code_action(
     let (mut changes, _) = change_tracker.get_changes();
     // PORT: Go indexes the map; a missing file gives a nil slice.
     let mut file_changes = changes
-        .shift_remove(source_file_file_name(fix_context.source_file))
+        .shift_remove(source_file_original_file_name(fix_context.source_file))
         .unwrap_or_default();
 
     // Add import edits if import adder has fixes

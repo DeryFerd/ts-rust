@@ -131,10 +131,7 @@ fn get_all_code_actions_to_fix_class_incorrectly_implements_interface(
     let mut seen_class_declarations: FxHashSet<Node> = FxHashSet::default();
 
     for diag in get_all_diagnostics(context, fix_context.program, fix_context.source_file) {
-        if contains_error_code(
-            &FIX_CLASS_INCORRECTLY_IMPLEMENTS_INTERFACE_ERROR_CODES,
-            diag.code,
-        ) {
+        if is_fixable_diagnostic(&diag, &FIX_CLASS_INCORRECTLY_IMPLEMENTS_INTERFACE_ERROR_CODES) {
             let class_declaration =
                 get_class(fix_context.source_file, TextRange::new(diag.pos, diag.end));
             if class_declaration.is_nil() {

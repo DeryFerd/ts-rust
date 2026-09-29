@@ -11,6 +11,7 @@ use super::hash::FileInfo;
 use super::hash::*;
 use super::snapshot::*;
 use crate::frontend::prelude::*;
+use crate::gostd::GoError;
 use crate::program::source_file_may_be_emitted;
 
 /// Go `core.Map` over a slice that is nil when empty (`slices.Collect`,
@@ -20,10 +21,18 @@ fn non_empty<T>(items: Vec<T>) -> Option<Vec<T>> {
 }
 
 // Go: incremental/snapshottobuildinfo.go:18 snapshotToBuildInfo
-#[must_use]
-pub fn snapshot_to_build_info(snapshot: &Snapshot, build_info_file_name: &str) -> BuildInfo {
+// PORT: Go `program.ContentMapperProject()` is the Go frontend program's
+// (none on the legacy path, which has no content mappers).
+pub fn snapshot_to_build_info(
+    snapshot: &Snapshot,
+    build_info_file_name: &str,
+) -> Result<BuildInfo, GoError> {
+    let content_mapper_project = crate::program::go_frontend_program()
+        .and_then(crate::frontend::compiler::NewProgram::content_mapper_project);
+    let content_mapper_identities = content_mapper_identities(content_mapper_project.as_deref())?;
     let build_info = BuildInfo {
         version: version().to_string(),
+        content_mapper_identities,
         ..BuildInfo::default()
     };
     let mut to = ToBuildInfo {
@@ -60,7 +69,7 @@ pub fn snapshot_to_build_info(snapshot: &Snapshot, build_info_file_name: &str) -
     to.build_info.semantic_errors = snapshot.has_semantic_errors;
     to.build_info.check_pending = snapshot.check_pending;
     to.set_package_jsons();
-    to.build_info
+    Ok(to.build_info)
 }
 
 // Go: incremental/snapshottobuildinfo.go:57 toBuildInfo
@@ -177,6 +186,8 @@ impl ToBuildInfo<'_> {
                     end: d.end,
                     code: d.code,
                     category: d.category,
+                    source: d.source.clone(),
+                    message_text: d.message_text.clone(),
                     message_key: d.message_key.clone(),
                     message_args: non_empty(d.message_args.clone()),
                     message_chain: non_empty(
@@ -221,6 +232,8 @@ impl ToBuildInfo<'_> {
                     end,
                     code: d.code(),
                     category: d.category() as i32,
+                    source: d.source().to_string(),
+                    message_text: d.message_text().to_string(),
                     message_key: d.message_key().to_string(),
                     message_args: non_empty(d.message_args().to_vec()),
                     message_chain: non_empty(

@@ -154,7 +154,11 @@ pub type WatchFilesFunc =
 
 pub type GetLocaleFunc = Box<dyn Fn() -> ts_goport::locale::Locale>;
 
+pub type SetLocaleFunc = Box<dyn Fn(&str)>;
+
 pub type RefreshCodeLensFunc = Box<dyn Fn(&Context) -> Result<(), GoError>>;
+
+pub type RegisterContentMapperExtensionsFunc = Box<dyn Fn(&Context, &[String]) -> Result<(), GoError>>;
 
 // Go: clientmock_generated.go:58 ClientMock
 #[derive(Default)]
@@ -162,10 +166,15 @@ pub struct ClientMock {
     pub watch_files_func: RefCell<Option<WatchFilesFunc>>,
     // Go `GetLocaleFunc` (#4660).
     pub get_locale_func: RefCell<Option<GetLocaleFunc>>,
+    // Go `SetLocaleFunc`.
+    pub set_locale_func: RefCell<Option<SetLocaleFunc>>,
     // Go `RefreshCodeLensFunc`.
     pub refresh_code_lens_func: RefCell<Option<RefreshCodeLensFunc>>,
+    // Go `RegisterContentMapperExtensionsFunc` (tsgo#4712).
+    pub register_content_mapper_extensions_func: RefCell<Option<RegisterContentMapperExtensionsFunc>>,
     watch_files: RefCell<Vec<WatchFilesCall>>,
     unwatch_files: RefCell<Vec<WatcherID>>,
+    register_content_mapper_extensions: RefCell<Vec<Vec<String>>>,
     refresh_diagnostics: RefCell<usize>,
     publish_diagnostics: RefCell<Vec<lsproto::PublishDiagnosticsParams>>,
     refresh_inlay_hints: RefCell<usize>,
@@ -183,6 +192,10 @@ impl ClientMock {
     }
     pub fn unwatch_files_calls(&self) -> Vec<WatcherID> {
         self.unwatch_files.borrow().clone()
+    }
+    /// Go `RegisterContentMapperExtensionsCalls()`: the `Extensions` of each call.
+    pub fn register_content_mapper_extensions_calls(&self) -> Vec<Vec<String>> {
+        self.register_content_mapper_extensions.borrow().clone()
     }
     /// Go `len(RefreshDiagnosticsCalls())`.
     pub fn refresh_diagnostics_calls(&self) -> usize {
@@ -235,6 +248,20 @@ impl Client for ClientMock {
         self.unwatch_files.borrow_mut().push(id);
         Ok(())
     }
+    // Go: clientmock_generated.go:463 ClientMock.RegisterContentMapperExtensions (tsgo#4712)
+    fn register_content_mapper_extensions(
+        &self,
+        ctx: &Context,
+        extensions: &[String],
+    ) -> Result<(), GoError> {
+        self.register_content_mapper_extensions
+            .borrow_mut()
+            .push(extensions.to_vec());
+        match &*self.register_content_mapper_extensions_func.borrow() {
+            Some(f) => f(ctx, extensions),
+            None => Ok(()),
+        }
+    }
     fn refresh_diagnostics(&self, _ctx: &Context) -> Result<(), GoError> {
         *self.refresh_diagnostics.borrow_mut() += 1;
         Ok(())
@@ -281,6 +308,9 @@ impl Client for ClientMock {
     }
     fn set_locale(&self, locale: &str) {
         self.set_locale.borrow_mut().push(locale.to_string());
+        if let Some(f) = &*self.set_locale_func.borrow() {
+            f(locale);
+        }
     }
     fn get_locale(&self) -> ts_goport::locale::Locale {
         *self.get_locale.borrow_mut() += 1;
@@ -616,6 +646,7 @@ pub fn default_session_options() -> SessionOptions {
         logging_enabled: true,
         telemetry_enabled: false,
         push_diagnostics_enabled: true,
+        run_external_code: false,
         debounce_delay: Duration::ZERO,
         checker_pool_options: Default::default(),
     }
@@ -673,7 +704,10 @@ pub fn get_session_init_options(
             client: Some(client),
             logger: Some(logger),
             npm_executor: Some(npm_executor),
+            spawner: None,
+            content_mapper_logger: None,
             parse_cache: None,
+            content_mapped_parse_cache: None,
         },
         session_utils,
     )

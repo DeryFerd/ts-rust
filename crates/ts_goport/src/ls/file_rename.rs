@@ -340,13 +340,12 @@ pub fn try_update_config_string(
         return false;
     }
 
-    let lsp_range = lsproto::Range {
-        start: converters.position_to_line_and_character(
-            &config_file,
-            get_token_pos_of_node(element, config_file, false) + 1,
-        ),
-        end: converters.position_to_line_and_character(&config_file, element.end() - 1),
-    };
+    let text_range = TextRange::new(
+        get_token_pos_of_node(element, config_file, false) + 1,
+        element.end() - 1,
+    );
+    let (lsp_range, fidelity) = converters.to_lsp_range(&config_file, text_range);
+    crate::go_assert!(fidelity.is_exact(), "config files are not content-mapped");
     change_tracker.replace_range_with_text(
         config_file,
         lsp_range,
@@ -399,7 +398,7 @@ impl LanguageService {
 
         let mut moved_files: Vec<MovedFile> = Vec::new();
         for &source_file in &all_files {
-            let (new_file_name, ok) = old_to_new(source_file_file_name(source_file));
+            let (new_file_name, ok) = old_to_new(source_file_original_file_name(source_file));
             if ok {
                 moved_files.push(MovedFile {
                     source_file,
@@ -409,9 +408,9 @@ impl LanguageService {
         }
 
         for source_file in all_files {
-            let old_file_name = source_file_file_name(source_file);
-            let (new_from_old, file_moved) = old_to_new(source_file_file_name(source_file));
-            let mut new_import_from_path = source_file_file_name(source_file).to_string();
+            let old_file_name = source_file_original_file_name(source_file);
+            let (new_from_old, file_moved) = old_to_new(old_file_name);
+            let mut new_import_from_path = old_file_name.to_string();
             if file_moved {
                 new_import_from_path = new_from_old;
             }
@@ -427,11 +426,7 @@ impl LanguageService {
                     &ref_.file_name,
                 );
                 if updated != ref_.file_name {
-                    change_tracker.replace_range_with_text(
-                        source_file,
-                        self.converters.to_lsp_range(&source_file, ref_.range),
-                        &updated,
-                    );
+                    change_tracker.replace_text_range_with_text(source_file, ref_.range, &updated);
                 }
             }
 
@@ -448,12 +443,9 @@ impl LanguageService {
                     &module_specifier_preferences,
                 );
                 if !updated.is_empty() && updated != import_string_literal.text() {
-                    change_tracker.replace_range_with_text(
+                    change_tracker.replace_text_range_with_text(
                         source_file,
-                        self.converters.to_lsp_range(
-                            &source_file,
-                            create_string_text_range(source_file, import_string_literal),
-                        ),
+                        create_string_text_range(source_file, import_string_literal),
                         &updated,
                     );
                 }

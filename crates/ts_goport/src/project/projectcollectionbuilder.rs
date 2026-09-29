@@ -13,6 +13,8 @@
 
 use crate::project::prelude::*;
 
+use crate::contentmapper;
+use crate::frontend::core_ext::get_script_kind_from_file_name;
 use crate::frontend::{core_bfs, core_ls_ext, core_workgroup};
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -34,16 +36,22 @@ impl ProjectLoadKind {
 }
 
 // Go: project/projectcollectionbuilder.go:29 ProjectCollectionBuilder
+// PORT: tsgo#4712 adds the content-mapped parse cache, the content mapper
+// host (Go nil interface is `None`) and the inferred project mappers.
 pub struct ProjectCollectionBuilder {
     pub session_options: Rc<SessionOptions>,
     pub parse_cache: Rc<ParseCache>,
+    pub content_mapped_parse_cache: Rc<ContentMappedParseCache>,
     pub extended_config_cache: Rc<ExtendedConfigCache>,
+    pub content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
 
     pub ctx: Context,
     pub fs: Rc<SnapshotFSBuilder>,
     pub base: Rc<ProjectCollection>,
     pub compiler_options_for_inferred_projects: Option<Rc<CompilerOptions>>,
+    pub inferred_content_mappers: Vec<Rc<contentmapper::Mapper>>,
+    pub inferred_content_mapper_extensions: Vec<String>,
     pub config_file_registry_builder: Rc<ConfigFileRegistryBuilder>,
 
     pub client: Option<Rc<dyn Client>>, // optional; used for project loading notifications
@@ -74,10 +82,14 @@ pub fn new_project_collection_builder(
     old_config_file_registry: Rc<ConfigFileRegistry>,
     old_api_state: &APIState,
     compiler_options_for_inferred_projects: Option<Rc<CompilerOptions>>,
+    inferred_content_mappers: Vec<Rc<contentmapper::Mapper>>,
+    inferred_content_mapper_extensions: Vec<String>,
     session_options: Rc<SessionOptions>,
     custom_config_file_name: &str,
     parse_cache: Rc<ParseCache>,
+    content_mapped_parse_cache: Rc<ContentMappedParseCache>,
     extended_config_cache: Rc<ExtendedConfigCache>,
+    content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
     client: Option<Rc<dyn Client>>,
 ) -> Rc<ProjectCollectionBuilder> {
     let config_file_registry_builder = new_config_file_registry_builder(
@@ -98,9 +110,13 @@ pub fn new_project_collection_builder(
         to_path: fs.to_path.clone(),
         fs,
         compiler_options_for_inferred_projects,
+        inferred_content_mappers,
+        inferred_content_mapper_extensions,
         session_options,
         parse_cache,
+        content_mapped_parse_cache,
         extended_config_cache,
+        content_mapper_host,
         config_file_registry_builder,
         new_snapshot_id,
         configured_projects: dirty::new_sync_map(
@@ -388,11 +404,34 @@ impl ProjectCollectionBuilder {
                 || !summary.closed.is_empty(),
         );
 
-        let mut changed_files: Vec<tspath::Path> = Vec::with_capacity(summary.changed.len());
-        for uri in &summary.changed {
-            let file_name = uri.file_name();
-            let path = (self.to_path)(&file_name);
-            changed_files.push(path);
+        let to_paths = |uris: &FxHashSet<lsproto::DocumentUri>| -> Vec<tspath::Path> {
+            let mut paths: Vec<tspath::Path> = Vec::with_capacity(uris.len());
+            for uri in uris {
+                paths.push((self.to_path)(&uri.file_name()));
+            }
+            paths
+        };
+        let changed_files = to_paths(&summary.changed);
+        let deleted_files = to_paths(&summary.deleted);
+        let created_files = to_paths(&summary.created);
+        if self.content_mapper_host.is_some() {
+            let all_watch_changes: Vec<tspath::Path> = changed_files
+                .iter()
+                .chain(&deleted_files)
+                .chain(&created_files)
+                .cloned()
+                .collect();
+            self.for_each_project(
+                &mut |entry: &dyn dirty::Value<Rc<RefCell<Project>>>| -> bool {
+                    self.refresh_content_mapper_project_for_changes(
+                        entry,
+                        &all_watch_changes,
+                        summary.has_excessive_non_create_watch_events(),
+                        logger.clone(),
+                    );
+                    true
+                },
+            );
         }
 
         let config_change_logger = logger.fork("Checking for changes affecting config files");
@@ -459,16 +498,9 @@ impl ProjectCollectionBuilder {
 
                 // Handle deleted files
                 if !summary.deleted.is_empty() {
-                    let mut deleted_paths: Vec<tspath::Path> =
-                        Vec::with_capacity(summary.deleted.len());
-                    for uri in &summary.deleted {
-                        let file_name = uri.file_name();
-                        let path = (self.to_path)(&file_name);
-                        deleted_paths.push(path);
-                    }
                     self.mark_files_changed(
                         entry,
-                        &deleted_paths,
+                        &deleted_files,
                         lsproto::FileChangeType::DELETED,
                         logger.clone(),
                     );
@@ -476,16 +508,9 @@ impl ProjectCollectionBuilder {
 
                 // Handle created files
                 if !summary.created.is_empty() {
-                    let mut created_paths: Vec<tspath::Path> =
-                        Vec::with_capacity(summary.created.len());
-                    for uri in &summary.created {
-                        let file_name = uri.file_name();
-                        let path = (self.to_path)(&file_name);
-                        created_paths.push(path);
-                    }
                     self.mark_files_changed(
                         entry,
-                        &created_paths,
+                        &created_files,
                         lsproto::FileChangeType::CREATED,
                         logger.clone(),
                     );
@@ -508,6 +533,54 @@ impl ProjectCollectionBuilder {
             );
             self.cleanup_configured_projects(&open_file_result.retain, logger);
         }
+    }
+
+    // Go: project/projectcollectionbuilder.go:346 refreshContentMapperProjectForChanges (tsgo#4712)
+    pub fn refresh_content_mapper_project_for_changes(
+        &self,
+        entry: &dyn dirty::Value<Rc<RefCell<Project>>>,
+        paths: &[tspath::Path],
+        refresh_all: bool,
+        logger: Option<Rc<logging::LogTree>>,
+    ) {
+        let project = entry.value().expect(NIL_DEREF);
+        let (program, content_mapper_watched_files) = {
+            let project = project.borrow();
+            (
+                project.program,
+                project.content_mapper_watched_files.clone(),
+            )
+        };
+        let (Some(program), Some(content_mapper_watched_files)) =
+            (program, content_mapper_watched_files)
+        else {
+            return;
+        };
+        let mut affected = refresh_all;
+        if !affected
+            && paths
+                .iter()
+                .any(|path| content_mapper_watched_files.contains(path))
+        {
+            affected = true;
+        }
+        if !affected {
+            return;
+        }
+        if let Some(content_mapper_project) = program.content_mapper_project() {
+            let _ = content_mapper_project.refresh();
+        }
+        entry.change(&mut |p: &Rc<RefCell<Project>>| {
+            let mut p = p.borrow_mut();
+            p.dirty = true;
+            p.dirty_file_path = tspath::Path::default();
+            if logger.is_some() {
+                logger.logf(&format!(
+                    "Marking project as dirty due to content mapper configuration changes: {}",
+                    p.config_file_path
+                ));
+            }
+        });
     }
 
     // Go: project/projectcollectionbuilder.go:341 cleanupConfiguredProjects
@@ -676,6 +749,17 @@ impl ProjectCollectionBuilder {
         self.update_inferred_project_roots(self.collect_inferred_project_roots(), logger);
     }
 
+    // Go: project/projectcollectionbuilder.go:489 DidChangeContentMapperContributions (tsgo#4712)
+    pub fn did_change_content_mapper_contributions(
+        self: &Rc<Self>,
+        logger: Option<Rc<logging::LogTree>>,
+    ) {
+        self.cleanup_inferred_project(logger.clone());
+        if self.inferred_project.value().is_some() {
+            self.update_program(&*self.inferred_project, logger);
+        }
+    }
+
     // Go: project/projectcollectionbuilder.go:449 ensureInferredProjectIncludesClosedFile
     pub fn ensure_inferred_project_includes_closed_file(
         self: &Rc<Self>,
@@ -721,7 +805,10 @@ impl ProjectCollectionBuilder {
             // See if we can find a default project without updating a bunch of stuff.
             if let Some(result) = self.find_default_project(&file_name, &path) {
                 has_changes = self.update_program(&*result, logger.clone()) || has_changes;
-                if result.value().is_some() {
+                if result
+                    .value()
+                    .is_some_and(|project| project.borrow().contains_file(&path))
+                {
                     if has_changes {
                         self.cleanup_inferred_project(logger.clone());
                         if self.inferred_project.value().is_some() {
@@ -1033,6 +1120,34 @@ impl ProjectCollectionBuilder {
         *self.file_default_projects.borrow_mut() = FxHashMap::default();
         self.default_projects_invalidated.set(true);
         self.program_structure_changed.set(true);
+    }
+
+    // Go: project/projectcollectionbuilder.go:733 DidChangeUserPreferences (tsgo#4712)
+    pub fn did_change_user_preferences(
+        self: &Rc<Self>,
+        old_preferences: &lsutil::UserPreferences,
+        new_preferences: &lsutil::UserPreferences,
+        logger: Option<Rc<logging::LogTree>>,
+    ) {
+        if old_preferences.locale == new_preferences.locale {
+            return;
+        }
+        self.for_each_project(
+            &mut |entry: &dyn dirty::Value<Rc<RefCell<Project>>>| -> bool {
+                entry.change(&mut |p: &Rc<RefCell<Project>>| {
+                    let mut p = p.borrow_mut();
+                    p.dirty = true;
+                    p.dirty_file_path = tspath::Path::default();
+                    if logger.is_some() {
+                        logger.logf(&format!(
+                            "Marking project as dirty due to locale change: {}",
+                            p.config_file_path
+                        ));
+                    }
+                });
+                true
+            },
+        );
     }
 
     // Go: project/projectcollectionbuilder.go:609 markProjectsAffectedByConfigChanges
@@ -1612,9 +1727,13 @@ impl ProjectCollectionBuilder {
     // again, so the port takes the `Vec` by value.
     pub fn update_inferred_project_roots(
         self: &Rc<Self>,
-        mut root_file_names: Vec<String>,
+        root_file_names: Vec<String>,
         logger: Option<Rc<logging::LogTree>>,
     ) -> bool {
+        let mut root_file_names: Vec<String> = root_file_names
+            .into_iter()
+            .filter(|file_name| self.is_supported_in_inferred_project(file_name))
+            .collect();
         if root_file_names.is_empty() {
             if self.inferred_project.value().is_some() {
                 if logger.is_some() {
@@ -1627,11 +1746,13 @@ impl ProjectCollectionBuilder {
         }
 
         root_file_names.sort();
+        let content_mappers = &self.inferred_content_mappers;
         if self.inferred_project.value().is_none() {
             self.inferred_project.set(new_inferred_project(
                 &self.session_options.current_directory,
                 self.compiler_options_for_inferred_projects.clone(),
                 &root_file_names,
+                content_mappers,
                 self,
                 logger,
             ));
@@ -1649,9 +1770,10 @@ impl ProjectCollectionBuilder {
             if let Some(compiler_options) = &self.compiler_options_for_inferred_projects {
                 new_compiler_options = compiler_options.clone();
             }
-            let new_command_line = Rc::new(tsoptions::new_parsed_command_line(
+            let new_command_line = Rc::new(new_inferred_project_command_line(
                 new_compiler_options,
                 root_file_names.clone(),
+                content_mappers,
                 tspath::ComparePathsOptions {
                     use_case_sensitive_file_names: self.fs.fs.use_case_sensitive_file_names(),
                     current_directory: self.session_options.current_directory.clone(),
@@ -1660,11 +1782,17 @@ impl ProjectCollectionBuilder {
             let changed = self.inferred_project.change_if(
                 &mut |p: Option<&Rc<RefCell<Project>>>| -> bool {
                     let p = p.expect(NIL_DEREF).borrow();
-                    p.command_line
-                        .as_ref()
-                        .expect(NIL_DEREF)
-                        .file_names_by_path()
-                        != new_command_line.file_names_by_path()
+                    let command_line = p.command_line.as_ref().expect(NIL_DEREF);
+                    // PORT: Go `slices.Equal` on `[]*contentmapper.Mapper`
+                    // compares the pointers.
+                    command_line.file_names_by_path() != new_command_line.file_names_by_path()
+                        || command_line.content_mappers().len()
+                            != new_command_line.content_mappers().len()
+                        || command_line
+                            .content_mappers()
+                            .iter()
+                            .zip(new_command_line.content_mappers())
+                            .any(|(a, b)| !Rc::ptr_eq(a, b))
                 },
                 &mut |p: &Rc<RefCell<Project>>| {
                     if logger.is_some() {
@@ -1682,6 +1810,27 @@ impl ProjectCollectionBuilder {
             }
         }
         true
+    }
+
+    // Go: project/projectcollectionbuilder.go:1151 isSupportedInInferredProject (tsgo#4712)
+    pub fn is_supported_in_inferred_project(&self, file_name: &str) -> bool {
+        if tspath::is_dynamic_file_name(file_name)
+            || get_script_kind_from_file_name(file_name) != ScriptKind::UNKNOWN
+        {
+            return true;
+        }
+        if let Some(file) = self.fs.get_file(file_name)
+            && file.is_overlay()
+            && tspath::get_any_extension_from_path(file_name, &[], false).is_empty()
+        {
+            return true;
+        }
+        let extensions: Vec<&str> = self
+            .inferred_content_mapper_extensions
+            .iter()
+            .map(String::as_str)
+            .collect();
+        tspath::file_extension_is_one_of(file_name, &extensions)
     }
 
     // Go: project/projectcollectionbuilder.go:1010 updateProgram
@@ -1786,12 +1935,65 @@ impl ProjectCollectionBuilder {
                     // CreateProgram returns the pool its CreateCheckerPool
                     // closure made for this program (project.rs). `None` is
                     // the failed Go type assertion.
+                    // tsgo#4712
+                    let (new_host, content_mappers) = {
+                        let p = project.borrow();
+                        (
+                            p.host.clone().expect(NIL_DEREF),
+                            p.command_line
+                                .as_ref()
+                                .expect(NIL_DEREF)
+                                .content_mappers()
+                                .to_vec(),
+                        )
+                    };
+                    let mut watched_files: Vec<String> = Vec::new();
+                    for mapper in &content_mappers {
+                        if !mapper.definition.package.is_empty()
+                            && mapper.contribution_id.is_empty()
+                            && !mapper.package_directory.is_empty()
+                        {
+                            watched_files.push(tspath::combine_paths(
+                                &mapper.package_directory,
+                                &["package.json"],
+                            ));
+                        }
+                    }
+                    if result
+                        .program
+                        .source_files()
+                        .iter()
+                        .any(|file| !file.content_mapper().is_empty())
+                    {
+                        new_host.ensure_content_mapper_project();
+                    }
+                    let content_mapper_project =
+                        compiler::CompilerHost::content_mapper_project(&*new_host);
+                    if let Some(content_mapper_project) = content_mapper_project {
+                        let dynamic_watched_files =
+                            content_mapper_project.watched_files().unwrap_or_default();
+                        watched_files.extend(dynamic_watched_files);
+                    }
+                    watched_files.sort();
+                    watched_files.dedup();
+                    let mut content_mapper_watched_files: FxHashSet<tspath::Path> =
+                        FxHashSet::with_capacity_and_hasher(
+                            watched_files.len(),
+                            Default::default(),
+                        );
+                    for file_name in &watched_files {
+                        content_mapper_watched_files.insert((self.to_path)(file_name));
+                    }
                     let checker_pool = result.checker_pool.clone().unwrap_or_else(|| {
                         panic!(
                             "interface conversion: compiler.CheckerPool is not *project.checkerPool"
                         )
                     });
                     let mut p = project.borrow_mut();
+                    let content_mapper_watch =
+                        WatchedFiles::clone_(p.content_mapper_watch.as_deref(), watched_files);
+                    p.content_mapper_watch = content_mapper_watch;
+                    p.content_mapper_watched_files = Some(Rc::new(content_mapper_watched_files));
                     p.program = Some(result.program);
                     p.checker_pool = Some(checker_pool);
                     p.program_update_kind = result.update_kind;

@@ -64,6 +64,10 @@ pub struct Program {
 
     // PORT: not in Go. What `start_check` read and started (see there).
     started: RefCell<StartedCheck>,
+    // PORT: not in Go. The time that `start_check` spent in the part of
+    // `GetSemanticDiagnostics` that it does before it sends the check (see
+    // `take_started_check_time`).
+    started_check_time: Cell<Duration>,
 }
 
 /// The work of `tsc.EmitFilesAndReportErrors` that `Program::start_check`
@@ -102,6 +106,7 @@ pub fn new_program(
         nested_emit_start: Cell::new(None),
         nested_emit_time: Cell::new(Duration::ZERO),
         started: RefCell::default(),
+        started_check_time: Cell::new(Duration::ZERO),
     };
 
     if testing {
@@ -137,6 +142,13 @@ pub fn read_build_info_program(
     if !build_info.is_valid_version() || !build_info.is_incremental() {
         return None;
     }
+    // If any configured content mapper's identity has changed, files it produced may be stale, so the
+    // old program cannot be reused.
+    let content_mapper_project = host.content_mapper_project();
+    match content_mapper_identities(content_mapper_project.as_deref()) {
+        Ok(identities) if build_info.content_mapper_identities_match(identities.as_deref()) => {}
+        _ => return None,
+    }
 
     // Convert to information that can be used to create incremental program
     Some(Program {
@@ -153,6 +165,7 @@ pub fn read_build_info_program(
         nested_emit_start: Cell::new(None),
         nested_emit_time: Cell::new(Duration::ZERO),
         started: RefCell::default(),
+        started_check_time: Cell::new(Duration::ZERO),
     })
 }
 
@@ -216,6 +229,19 @@ impl Program {
     #[must_use]
     pub fn take_nested_emit_time(&self) -> Duration {
         self.nested_emit_time.replace(Duration::ZERO)
+    }
+
+    /// PORT: not in Go. The time that `start_check` spent on the affected
+    /// files (`collectAllAffectedFiles`, with the nested declaration emits
+    /// of their signatures) before it sent the check, by the
+    /// `nestedEmitNow` clock (Go `sys.Now`); zero when it did not run. Go
+    /// does that work inside the `GetSemanticDiagnostics` call that
+    /// `tsc.EmitFilesAndReportErrors` times as the check. That call adds
+    /// this time to its own, so the nested emit time that it then moves to
+    /// the emit time is inside the check time, as in Go.
+    #[must_use]
+    pub fn take_started_check_time(&self) -> Duration {
+        self.started_check_time.replace(Duration::ZERO)
     }
 
     // PORT: testing. Go `testingData.SemanticDiagnosticsPerFile.Load(path)`,
@@ -385,10 +411,15 @@ impl Program {
         if has_global_diagnostics {
             return;
         }
+        let check_start = self.nested_emit_now.as_ref().map(|now| now());
         if let Some(affected_files) = self.semantic_diagnostics_files_to_check(Node::NIL) {
             self.started.borrow_mut().check = Some(
                 start_semantic_diagnostics_without_no_emit_filtering(&affected_files),
             );
+        }
+        if let (Some(now), Some(check_start)) = (&self.nested_emit_now, check_start) {
+            self.started_check_time
+                .set(now().duration_since(check_start).unwrap_or_default());
         }
     }
 
@@ -702,7 +733,17 @@ impl Program {
         if !self.snapshot.borrow().build_info_emit_pending {
             return None;
         }
-        let build_info = snapshot_to_build_info(&self.snapshot.borrow(), &build_info_file_name);
+        let build_info =
+            match snapshot_to_build_info(&self.snapshot.borrow(), &build_info_file_name) {
+                Ok(build_info) => build_info,
+                Err(err) => {
+                    return Some(EmitResult {
+                        emit_skipped: true,
+                        diagnostics: vec![content_mapper_project_diagnostic(&err)],
+                        ..EmitResult::default()
+                    });
+                }
+            };
         let text = match marshal_build_info(&build_info) {
             Ok(text) => text,
             Err(err) => panic!("Failed to marshal build info: {err}"),

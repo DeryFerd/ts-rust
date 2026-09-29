@@ -383,15 +383,12 @@ impl incremental::Host for BuildHost {
 
 // Go: build/compilerHost.go:13 compilerHost
 // PORT: the host that the build task gives `compiler.NewProgram`: the
-// build host with the task's trace writer.
-// PORT: Go also has the field `contentMapperProject` (tsgo#4712), that
-// `compileAndEmit` sets from `getContentMapperProject` (buildtask.go:83).
-// The Rust build task does not port that yet (the orchestrator has no
-// `contentMapperHost`), so the Go field is always nil. The field waits
-// for that port; `content_mapper_project` returns `None` in its place.
+// build host with the task's trace writer. Go nil `contentMapperProject`
+// is `None`.
 pub struct BuildCompilerHost {
     pub host: Rc<BuildHost>,
     pub trace: TraceFn,
+    pub content_mapper_project: Option<Rc<dyn Project>>,
 }
 
 impl CompilerHost for BuildCompilerHost {
@@ -444,9 +441,8 @@ impl CompilerHost for BuildCompilerHost {
     }
 
     // Go: build/compilerHost.go:56 (*compilerHost).ContentMapperProject (tsgo#4712)
-    // PORT: Go returns the `contentMapperProject` field (see the struct).
     fn content_mapper_project(&self) -> Option<Rc<dyn Project>> {
-        None
+        self.content_mapper_project.clone()
     }
 
     // Go: build/compilerHost.go:60 (*compilerHost).GetResolvedProjectReference

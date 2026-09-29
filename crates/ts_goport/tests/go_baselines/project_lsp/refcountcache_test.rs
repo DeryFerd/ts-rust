@@ -6,16 +6,108 @@
 
 use std::rc::Rc;
 
+use ts_goport::ast::ContentMapperSourceFileInfo;
+use ts_goport::contentmapper::SourceFiles;
+use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::compiler::DuplicateSourceFile;
-use ts_goport::frontend::parser::ParsedSourceFile;
+use ts_goport::frontend::parser::{self, ParsedSourceFile, SourceFileParseOptions};
+use ts_goport::frontend::tspath::Path;
+use ts_goport::gostd::GoError;
 use ts_goport::lsp::lsproto;
 use ts_goport::project::{
-    HashedSourceFile, ParseCacheKey, ProgramUpdateKind, RefCountCacheEntry, ResourceRequest,
-    Session, SnapshotChange, UpdateReason, new_parse_cache_key,
+    ContentMappedParseCache, ContentMappedParseCacheKey, HashedSourceFile, ParseCacheKey,
+    ProgramUpdateKind, RefCountCacheEntry, RefCountCacheOptions, ResourceRequest, Session,
+    SnapshotChange, UpdateReason, content_mapped_parse_cache_key_for_duplicate,
+    content_mapped_parse_cache_key_for_file, new_content_mapped_parse_cache, new_parse_cache_key,
+    set_source_file_hash,
 };
 
 use super::projecttestutil::{FileMap, files};
 use super::util::*;
+
+// Go: refcountcache_test.go:21 TestContentMappedParseCacheBundleLifetime (tsgo#4712)
+// PORT: Go uses empty `&ast.SourceFile{}` values; here two parsed empty files.
+#[test]
+fn test_content_mapped_parse_cache_bundle_lifetime() {
+    let cache = new_content_mapped_parse_cache(RefCountCacheOptions::default());
+    let key = ContentMappedParseCacheKey::new(
+        &SourceFileParseOptions {
+            file_name: "/component.vue".to_string(),
+            path: Path("/component.vue".to_string()),
+            ..Default::default()
+        },
+        0,
+    );
+    let canonical = Rc::new(parser::parse_source_file(
+        &SourceFileParseOptions::default(),
+        "",
+        ScriptKind::TS,
+    ));
+    let supplemental = Rc::new(parser::parse_source_file(
+        &SourceFileParseOptions::default(),
+        "",
+        ScriptKind::TS,
+    ));
+    let produced = SourceFiles {
+        canonical: Some(canonical.clone()),
+        supplemental: vec![supplemental.clone()],
+    };
+
+    // The cache owns the complete transform result as one value, so reuse preserves every file's identity.
+    let acquired = cache
+        .acquire_or_error(key.clone(), || Ok::<_, GoError>(produced))
+        .expect("assert.NilError");
+    assert!(Rc::ptr_eq(acquired.canonical.as_ref().expect("canonical"), &canonical));
+    assert!(Rc::ptr_eq(&acquired.supplemental[0], &supplemental));
+    let reused = cache
+        .acquire_or_error(key.clone(), || -> Result<SourceFiles, GoError> {
+            panic!("cached bundle should be reused")
+        })
+        .expect("assert.NilError");
+    assert!(Rc::ptr_eq(reused.canonical.as_ref().expect("canonical"), &canonical));
+    assert!(Rc::ptr_eq(&reused.supplemental[0], &supplemental));
+
+    // Canonical and supplemental files share the bundle's refcount and disappear after its final release.
+    ContentMappedParseCache::deref(&cache, &key);
+    assert!(cache.has(&key));
+    ContentMappedParseCache::deref(&cache, &key);
+    assert!(!cache.has(&key));
+}
+
+// Go: refcountcache_test.go:48 TestContentMappedParseCacheKeyReconstruction (tsgo#4712)
+// PORT: Go `file.Hash = hash` is `set_source_file_hash`. A Rust
+// `DuplicateSourceFile` has the file text, not Go's `Hash`; its hash is the
+// hash of that text, so the duplicate shares the file's text.
+#[test]
+fn test_content_mapped_parse_cache_key_reconstruction() {
+    let acquire_options = SourceFileParseOptions {
+        file_name: "/component.box".to_string(),
+        path: Path("/component.box".to_string()),
+        ..Default::default()
+    };
+    let mut mapped_options = acquire_options.clone();
+    mapped_options.external_module_indicator_options.force = true;
+    let hash = xxhash_rust::xxh3::xxh3_128(b"cache key");
+    let file = parser::parse_source_file(&mapped_options, "export {};", ScriptKind::TS);
+    set_source_file_hash(&file, hash);
+    file.set_content_mapper_info(ContentMapperSourceFileInfo {
+        content_mapper: "mapper".to_string(),
+        parse_options: acquire_options.clone(),
+        ..Default::default()
+    });
+    let expected = ContentMappedParseCacheKey::new(&acquire_options, hash);
+    assert_eq!(content_mapped_parse_cache_key_for_file(&file), expected);
+
+    let duplicate = DuplicateSourceFile {
+        parse_options: mapped_options,
+        content_mapper_parse_options: acquire_options,
+        text: file.text,
+        script_kind: ScriptKind::UNKNOWN,
+        content_mapper: "mapper".to_string(),
+        is_content_mapper_failure_stub: false,
+    };
+    assert_eq!(content_mapped_parse_cache_key_for_duplicate(&duplicate), expected);
+}
 
 // Go: refcountcache_test.go:23 setup
 fn setup(files: FileMap) -> Rc<Session> {

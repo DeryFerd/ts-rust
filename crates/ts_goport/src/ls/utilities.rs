@@ -10,6 +10,7 @@
 use crate::ls::prelude::*;
 
 use crate::frontend::parser::ParsedSourceFile;
+use crate::spanmap::{Feature, Fidelity};
 use std::cell::Cell;
 
 // Go: ls/utilities.go:25 quoteReplacer
@@ -398,17 +399,28 @@ pub fn is_in_right_side_of_internal_import_equals_declaration(node: Node) -> boo
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/utilities.go:287 createLspRangeFromNode
-    pub fn create_lsp_range_from_node(&self, node: Node, file: Node) -> lsproto::Range {
+    // Go: ls/utilities.go:288 createLspRangeFromNode
+    pub fn create_lsp_range_from_node(&self, node: Node, file: Node) -> (lsproto::Range, Fidelity) {
         self.create_lsp_range_from_bounds(
             get_token_pos_of_node(node, file, false /*includeJSDoc*/),
             node.end(),
             file,
         )
     }
+
+    // Go: ls/utilities.go:292 createLspRangeFromNodeForFeature
+    pub fn create_lsp_range_from_node_for_feature(
+        &self,
+        node: Node,
+        file: Node,
+        feature: Feature,
+    ) -> (lsproto::Range, Fidelity) {
+        self.converters
+            .to_lsp_range_for_feature(&file, create_range_from_node(node, file), feature)
+    }
 }
 
-// Go: ls/utilities.go:291 createRangeFromNode
+// Go: ls/utilities.go:296 createRangeFromNode
 pub fn create_range_from_node(node: Node, file: Node) -> TextRange {
     TextRange::new(
         get_token_pos_of_node(node, file, false /*includeJSDoc*/),
@@ -417,26 +429,30 @@ pub fn create_range_from_node(node: Node, file: Node) -> TextRange {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/utilities.go:295 createLspRangeFromBounds
+    // Go: ls/utilities.go:300 createLspRangeFromBounds
     // PORT: Go passes the `*ast.SourceFile` as an `lsconv.Script`.
-    pub fn create_lsp_range_from_bounds(&self, start: i32, end: i32, file: Node) -> lsproto::Range {
+    pub fn create_lsp_range_from_bounds(
+        &self,
+        start: i32,
+        end: i32,
+        file: Node,
+    ) -> (lsproto::Range, Fidelity) {
         self.converters
             .to_lsp_range(&file, TextRange::new(start, end))
     }
 
-    // Go: ls/utilities.go:299 createLspRangeFromRange
+    // Go: ls/utilities.go:304 createLspRangeFromRange
     pub fn create_lsp_range_from_range(
         &self,
         text_range: TextRange,
         script: &dyn lsconv::Script,
-    ) -> lsproto::Range {
+    ) -> (lsproto::Range, Fidelity) {
         self.converters.to_lsp_range(script, text_range)
     }
 
-    // Go: ls/utilities.go:303 createLspPosition
-    pub fn create_lsp_position(&self, position: i32, file: Node) -> lsproto::Position {
-        self.converters
-            .position_to_line_and_character(&file, position)
+    // Go: ls/utilities.go:308 createLspPosition
+    pub fn create_lsp_position(&self, position: i32, file: Node) -> (lsproto::Position, Fidelity) {
+        self.converters.to_lsp_position(&file, position)
     }
 }
 

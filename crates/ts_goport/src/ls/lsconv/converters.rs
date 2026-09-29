@@ -13,11 +13,28 @@ use crate::spanmap::{self, Feature, Fidelity, SpanMap};
 use std::ops::Deref;
 use std::sync::LazyLock;
 
-// Go: ls/lsconv/converters.go:23 Converters
+// Go: ls/lsconv/converters.go:25 Converters
 // PORT: Go `getLineMap func(fileName string) *LSPLineMap`; a nil map is `None`.
 pub struct Converters {
     get_line_map: Box<dyn Fn(&str) -> Option<Rc<LSPLineMap>>>,
     position_encoding: lsproto::PositionEncodingKind,
+}
+
+// Go: ls/lsconv/converters.go:30 MappedSpan
+// PORT: Go embeds `spanmap.MappedSpan`; `Deref` gives its fields (`span`,
+// `fidelity`) as Go field promotion does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MappedSpan<T> {
+    pub script: T,
+    pub mapped_span: spanmap::MappedSpan,
+}
+
+impl<T> Deref for MappedSpan<T> {
+    type Target = spanmap::MappedSpan;
+
+    fn deref(&self) -> &spanmap::MappedSpan {
+        &self.mapped_span
+    }
 }
 
 // Go: ls/lsconv/converters.go:35 MappedPosition
@@ -64,42 +81,63 @@ pub trait Script {
     }
 }
 
-// PORT: Go `*ast.SourceFile` implements Script through its `FileName` and
-// `Text` methods. Here the file is its root `Node`. The inherent
-// `Node::text` (Go `Node.Text`) wins in method syntax, so pass a file as
-// `&dyn Script` (or call `Script::text(&file)`), as Go passes it as a Script.
+// PORT: Go passes pointers (`*ast.SourceFile`, `*testScript`, `*Overlay`)
+// as a `Script`; the generic `FromLSPRange` and `FromLSPPosition` keep the
+// pointer as `T`. A reference to a script is a script, so `T` can be a
+// reference here.
+impl<S: Script + ?Sized> Script for &S {
+    fn file_name(&self) -> &str {
+        (**self).file_name()
+    }
+
+    fn original_file_name(&self) -> &str {
+        (**self).original_file_name()
+    }
+
+    fn text(&self) -> &str {
+        (**self).text()
+    }
+
+    fn span_map(&self) -> Option<&SpanMap> {
+        (**self).span_map()
+    }
+
+    fn original_text(&self) -> &str {
+        (**self).original_text()
+    }
+}
+
+// PORT: Go `*ast.SourceFile` implements Script through its `FileName`,
+// `OriginalFileName`, `Text`, `SpanMap` and `OriginalText` methods. Here the
+// file is its root `Node`. The inherent `Node::text` (Go `Node.Text`) wins
+// in method syntax, so pass a file as `&dyn Script` (or call
+// `Script::text(&file)`), as Go passes it as a Script.
 impl Script for Node {
     fn file_name(&self) -> &str {
         source_file_file_name(*self)
+    }
+
+    // Go: ast/ast.go:2569 (*SourceFile).OriginalFileName
+    fn original_file_name(&self) -> &str {
+        source_file_original_file_name(*self)
     }
 
     fn text(&self) -> &str {
         source_file_text(*self)
     }
 
-    // Go: ast/ast.go:2569 (*SourceFile).OriginalFileName
-    // PORT: stand-in until the syntax lane stores the tsgo#4712 content
-    // mapper info on source files. Without that info no file has a
-    // canonical source file, and Go returns `FileName()`.
-    fn original_file_name(&self) -> &str {
-        source_file_file_name(*self)
-    }
-
     // Go: ast/ast.go:2579 (*SourceFile).SpanMap
-    // PORT: stand-in, as above. Go returns nil without content mapper info.
     fn span_map(&self) -> Option<&SpanMap> {
-        None
+        source_file_span_map(*self)
     }
 
     // Go: ast/ast.go:2561 (*SourceFile).OriginalText
-    // PORT: stand-in, as above. Go returns the file text without content
-    // mapper info.
     fn original_text(&self) -> &str {
-        source_file_text(*self)
+        source_file_original_text(*self)
     }
 }
 
-// Go: ls/lsconv/converters.go:33 NewConverters
+// Go: ls/lsconv/converters.go:52 NewConverters
 // PORT: Go returns `*Converters`, which the session, snapshots and language
 // services share; here `Rc<Converters>`.
 pub fn new_converters(
@@ -125,42 +163,298 @@ impl Converters {
         (self.get_line_map)(file_name).expect("invalid memory address or nil pointer dereference")
     }
 
-    // Go: ls/lsconv/converters.go:40 ToLSPRange
-    pub fn to_lsp_range(&self, script: &dyn Script, text_range: TextRange) -> lsproto::Range {
-        lsproto::Range {
-            start: self.position_to_line_and_character(script, text_range.pos()),
-            end: self.position_to_line_and_character(script, text_range.end()),
-        }
+    // Go: ls/lsconv/converters.go:66 ToLSPRange
+    // ToLSPRange converts a range in a SourceFile (or a script read from the file system after declaration
+    // mapping) to an lsproto.Range. If the file is a content-mapped virtual SourceFile, the range is mapped
+    // through the file's span map and the fidelity of that mapping is returned. For normal files, the second
+    // return value is FidelityExact.
+    pub fn to_lsp_range(
+        &self,
+        script: &dyn Script,
+        text_range: TextRange,
+    ) -> (lsproto::Range, Fidelity) {
+        let (script, text_range, fidelity) = virtual_range_to_original(script, text_range, None);
+        (
+            lsproto::Range {
+                start: self.position_to_line_and_character(&script, text_range.pos()),
+                end: self.position_to_line_and_character(&script, text_range.end()),
+            },
+            fidelity,
+        )
     }
 
-    // Go: ls/lsconv/converters.go:47 FromLSPRange
-    // PORT: Go passes the range by value; here by reference.
-    pub fn from_lsp_range(&self, script: &dyn Script, text_range: &lsproto::Range) -> TextRange {
+    // Go: ls/lsconv/converters.go:78 ToLSPRangeForFeature
+    // ToLSPRangeForFeature is [Converters.ToLSPRange] for an LS feature. For a content-mapped file, it returns
+    // FidelityNone unless the entire virtual range is covered by contiguous segments that participate in
+    // feature; the returned range is still the best-effort mapped range. For normal files, it behaves like
+    // [Converters.ToLSPRange].
+    pub fn to_lsp_range_for_feature(
+        &self,
+        script: &dyn Script,
+        text_range: TextRange,
+        feature: Feature,
+    ) -> (lsproto::Range, Fidelity) {
+        let (script, text_range, fidelity) =
+            virtual_range_to_original(script, text_range, Some(feature));
+        (
+            lsproto::Range {
+                start: self.position_to_line_and_character(&script, text_range.pos()),
+                end: self.position_to_line_and_character(&script, text_range.end()),
+            },
+            fidelity,
+        )
+    }
+
+    // Go: ls/lsconv/converters.go:89 ToLSPPosition
+    // ToLSPPosition converts a position in a SourceFile (or a script read from the file system after
+    // declaration mapping) to an lsproto.Position. Positions in content-mapped files are mapped through
+    // the file's span map; positions in normal files return FidelityExact.
+    pub fn to_lsp_position(
+        &self,
+        script: &dyn Script,
+        position: i32,
+    ) -> (lsproto::Position, Fidelity) {
+        let (script, position, fidelity) = virtual_position_to_original(script, position, None);
+        (
+            self.position_to_line_and_character(&script, position),
+            fidelity,
+        )
+    }
+
+    // Go: ls/lsconv/converters.go:98 ToLSPPositionForFeature
+    // ToLSPPositionForFeature is [Converters.ToLSPPosition] for an LS feature. For a content-mapped file, it returns
+    // FidelityNone when the virtual position is not in a segment that participates in feature; the
+    // returned position is still the best-effort mapped position. For normal files, it behaves like
+    // [Converters.ToLSPPosition].
+    pub fn to_lsp_position_for_feature(
+        &self,
+        script: &dyn Script,
+        position: i32,
+        feature: Feature,
+    ) -> (lsproto::Position, Fidelity) {
+        let (script, position, fidelity) =
+            virtual_position_to_original(script, position, Some(feature));
+        (
+            self.position_to_line_and_character(&script, position),
+            fidelity,
+        )
+    }
+
+    // Go: ls/lsconv/converters.go:107 ToLSPLocation
+    // ToLSPLocation converts a range in a SourceFile or script to an lsproto.Location. If the file is a content-mapped
+    // virtual SourceFile, the range is mapped through the file's span map and the fidelity of that mapping is returned.
+    // For normal files, the second return value is FidelityExact. If the file is a supplemental output of a content mapper,
+    // the file's original file name is used for the URI (e.g. App.astro.0.ts -> App.astro).
+    pub fn to_lsp_location(
+        &self,
+        script: &dyn Script,
+        rng: TextRange,
+    ) -> (lsproto::Location, Fidelity) {
+        let (lsp_range, fidelity) = self.to_lsp_range(script, rng);
+        (
+            lsproto::Location {
+                uri: file_name_to_document_uri(script.original_file_name()),
+                range: lsp_range,
+            },
+            fidelity,
+        )
+    }
+
+    // Go: ls/lsconv/converters.go:119 ToLSPLocationForFeature
+    // ToLSPLocationForFeature is [Converters.ToLSPLocation] for an LS feature. For a content-mapped file, it returns
+    // FidelityNone when the virtual position is not in a segment that participates in feature; the
+    // returned position is still the best-effort mapped position. For normal files, it behaves like
+    // [Converters.ToLSPLocation].
+    pub fn to_lsp_location_for_feature(
+        &self,
+        script: &dyn Script,
+        rng: TextRange,
+        feature: Feature,
+    ) -> (lsproto::Location, Fidelity) {
+        let (lsp_range, fidelity) = self.to_lsp_range_for_feature(script, rng, feature);
+        (
+            lsproto::Location {
+                uri: file_name_to_document_uri(script.original_file_name()),
+                range: lsp_range,
+            },
+            fidelity,
+        )
+    }
+
+    // PORT: Go removed `(*Converters).FromLSPRange` (the one-span form) in
+    // tsgo#4712; the free `from_lsp_range` below replaces it. This one stays
+    // only for `from_lsp_text_change`, see there.
+    fn from_lsp_range_raw(&self, script: &dyn Script, text_range: &lsproto::Range) -> TextRange {
         TextRange::new(
             self.line_and_character_to_position(script, &text_range.start),
             self.line_and_character_to_position(script, &text_range.end),
         )
     }
 
-    // Go: ls/lsconv/converters.go:54 FromLSPTextChange
+    // PORT: Go removed `(*Converters).FromLSPTextChange` in tsgo#4712. At pin
+    // B, Go project/overlayfs.go:369 calls `lsconv.FromLSPRange(converters,
+    // o, partialChange.Range, spanmap.FeatureAll)`, asserts one range and
+    // builds the `core.TextChange` itself. The server lane's
+    // `project/overlayfs.rs` still calls this method. An overlay has no span
+    // map, so the result is the same. Remove this method when overlayfs.rs
+    // takes the Go B form (lane ls notes for root).
     pub fn from_lsp_text_change(
         &self,
         script: &dyn Script,
         change: &lsproto::TextDocumentContentChangePartial,
     ) -> TextChange {
         TextChange {
-            text_range: self.from_lsp_range(script, &change.range),
+            text_range: self.from_lsp_range_raw(script, &change.range),
             new_text: change.text.clone(),
         }
     }
+}
 
-    // Go: ls/lsconv/converters.go:61 ToLSPLocation
-    pub fn to_lsp_location(&self, script: &dyn Script, rng: TextRange) -> lsproto::Location {
-        lsproto::Location {
-            uri: file_name_to_document_uri(script.file_name()),
-            range: self.to_lsp_range(script, rng),
+// Go: ls/lsconv/converters.go:127 FromLSPRange
+// FromLSPRange converts an lsproto.Range to offsets in one Script. For a content-mapped script, results
+// include each virtual projection covered by segments that participate in feature; it returns no
+// results when no projection qualifies. Normal scripts return one exact span.
+#[must_use]
+pub fn from_lsp_range<T: Script + Clone>(
+    c: &Converters,
+    script: T,
+    text_range: lsproto::Range,
+    feature: Feature,
+) -> Vec<MappedSpan<T>> {
+    lsp_range_to_virtual(c, &[script], text_range, feature)
+}
+
+// Go: ls/lsconv/converters.go:134 FromLSPRangeForSourceFile
+// FromLSPRangeForSourceFile converts an lsproto.Range to offsets in a SourceFile. When the file has
+// supplemental content-mapper outputs, results include every qualifying virtual projection across the
+// canonical and supplemental files. Projections not participating in feature are omitted.
+#[must_use]
+pub fn from_lsp_range_for_source_file(
+    c: &Converters,
+    file: Node,
+    text_range: lsproto::Range,
+    feature: Feature,
+) -> Vec<MappedSpan<Node>> {
+    let files = source_file_projections(file);
+    lsp_range_to_virtual(c, &files, text_range, feature)
+}
+
+// Go: ls/lsconv/converters.go:149 FromLSPRangeIntersectingForSourceFile
+// FromLSPRangeIntersectingForSourceFile projects every feature-enabled intersection with textRange
+// across the canonical and supplemental virtual files. Unlike FromLSPRangeForSourceFile, the original
+// range endpoints need not be mapped. This is intended for read-only range requests such as semantic
+// tokens and inlay hints, where an editor commonly asks for a viewport spanning host markup:
+//
+//	original: <template>...</template><script>const x = 1</script><style>...</style>
+//	          [---------------- requested viewport ---------------------------------)
+//	                                          [----------) mapped script
+//
+// The result contains the script intersection even though both viewport endpoints are outside it.
+#[must_use]
+pub fn from_lsp_range_intersecting_for_source_file(
+    c: &Converters,
+    file: Node,
+    text_range: lsproto::Range,
+    feature: Feature,
+) -> Vec<MappedSpan<Node>> {
+    let files = source_file_projections(file);
+    let mut result = Vec::with_capacity(files.len());
+    for script in files {
+        let Some(spans) = Script::span_map(&script) else {
+            result.push(MappedSpan {
+                script,
+                mapped_span: spanmap::MappedSpan {
+                    span: TextRange::new(
+                        c.line_and_character_to_position(&script, &text_range.start),
+                        c.line_and_character_to_position(&script, &text_range.end),
+                    ),
+                    fidelity: Fidelity::EXACT,
+                },
+            });
+            continue;
+        };
+        let original = OriginalTextScript {
+            file_name: Script::original_file_name(&script),
+            text: Script::original_text(&script),
+        };
+        let original_range = TextRange::new(
+            c.line_and_character_to_position(&original, &text_range.start),
+            c.line_and_character_to_position(&original, &text_range.end),
+        );
+        for mapped in
+            SpanMap::original_to_virtual_intersecting_spans(Some(spans), original_range, feature)
+        {
+            result.push(MappedSpan {
+                script,
+                mapped_span: mapped,
+            });
         }
     }
+    result
+}
+
+// Go: ls/lsconv/converters.go:179 lspRangeToVirtual
+fn lsp_range_to_virtual<T: Script + Clone>(
+    c: &Converters,
+    scripts: &[T],
+    text_range: lsproto::Range,
+    feature: Feature,
+) -> Vec<MappedSpan<T>> {
+    let mut result = Vec::with_capacity(scripts.len());
+    for script in scripts {
+        for mapped in c.lsp_range_to_virtual(script, text_range, feature) {
+            result.push(MappedSpan {
+                script: script.clone(),
+                mapped_span: mapped,
+            });
+        }
+    }
+    result
+}
+
+impl Converters {
+    // Go: ls/lsconv/converters.go:189 (*Converters).lspRangeToVirtual
+    fn lsp_range_to_virtual(
+        &self,
+        script: &dyn Script,
+        text_range: lsproto::Range,
+        feature: Feature,
+    ) -> Vec<spanmap::MappedSpan> {
+        let Some(spans) = script.span_map() else {
+            return vec![spanmap::MappedSpan {
+                span: TextRange::new(
+                    self.line_and_character_to_position(script, &text_range.start),
+                    self.line_and_character_to_position(script, &text_range.end),
+                ),
+                fidelity: Fidelity::EXACT,
+            }];
+        };
+        // A content-mapped script's line map is its original text's, so convert against that text and then map
+        // the resulting original range forward into the virtual text.
+        let original = OriginalTextScript {
+            file_name: script.original_file_name(),
+            text: script.original_text(),
+        };
+        let orig_range = TextRange::new(
+            self.line_and_character_to_position(&original, &text_range.start),
+            self.line_and_character_to_position(&original, &text_range.end),
+        );
+        SpanMap::original_to_virtual_spans(Some(spans), orig_range, feature)
+    }
+}
+
+// Go: ls/lsconv/converters.go:213 FromLSPPosition
+// FromLSPPosition converts an lsproto.Position to offsets in one Script. For a content-mapped script,
+// results include each virtual projection whose segment participates in feature; it returns no results
+// when no projection qualifies. Normal scripts return one exact position.
+#[must_use]
+pub fn from_lsp_position<T: Script + Clone>(
+    c: &Converters,
+    script: T,
+    position: lsproto::Position,
+    feature: Feature,
+) -> Vec<MappedPosition<T>> {
+    lsp_position_to_virtual(c, &[script], position, feature)
 }
 
 // Go: ls/lsconv/converters.go:220 FromLSPPositionForSourceFile
@@ -180,10 +474,7 @@ pub fn from_lsp_position_for_source_file(
 
 // Go: ls/lsconv/converters.go:225 sourceFileProjections
 fn source_file_projections(file: Node) -> Vec<Node> {
-    // PORT: Go `file.SupplementalSourceFiles()`. The AST has no tsgo#4712
-    // content mapper info yet (syntax lane), and Go returns nil for a file
-    // without it, so the list is empty.
-    let supplemental: &[Node] = &[];
+    let supplemental = source_file_supplemental_source_files(file);
     let mut files = Vec::with_capacity(1 + supplemental.len());
     files.push(file);
     files.extend_from_slice(supplemental);
@@ -232,7 +523,113 @@ impl Converters {
     }
 }
 
+/// The Go `Script` interface value that `virtualRangeToOriginal`,
+/// `virtualPositionToOriginal` and `diagnosticScriptAndRange` return: the
+/// script they were given, or an `originalTextScript` over its original
+/// text.
+enum ScriptOrOriginal<'a> {
+    Script(&'a dyn Script),
+    Original(OriginalTextScript<'a>),
+}
+
+impl Script for ScriptOrOriginal<'_> {
+    fn file_name(&self) -> &str {
+        match self {
+            ScriptOrOriginal::Script(s) => s.file_name(),
+            ScriptOrOriginal::Original(s) => s.file_name(),
+        }
+    }
+
+    fn original_file_name(&self) -> &str {
+        match self {
+            ScriptOrOriginal::Script(s) => s.original_file_name(),
+            ScriptOrOriginal::Original(s) => s.original_file_name(),
+        }
+    }
+
+    fn text(&self) -> &str {
+        match self {
+            ScriptOrOriginal::Script(s) => s.text(),
+            ScriptOrOriginal::Original(s) => s.text(),
+        }
+    }
+
+    fn span_map(&self) -> Option<&SpanMap> {
+        match self {
+            ScriptOrOriginal::Script(s) => s.span_map(),
+            ScriptOrOriginal::Original(s) => s.span_map(),
+        }
+    }
+
+    fn original_text(&self) -> &str {
+        match self {
+            ScriptOrOriginal::Script(s) => s.original_text(),
+            ScriptOrOriginal::Original(s) => s.original_text(),
+        }
+    }
+}
+
+// Go: ls/lsconv/converters.go:254 virtualRangeToOriginal
+// virtualRangeToOriginal maps a content mapper's virtual range back to its original text.
+// A nil feature bypasses feature filtering for diagnostics and edits.
+// PORT: Go `feature *spanmap.Feature`; nil is `None`.
+fn virtual_range_to_original(
+    script: &dyn Script,
+    text_range: TextRange,
+    feature: Option<Feature>,
+) -> (ScriptOrOriginal<'_>, TextRange, Fidelity) {
+    let Some(span_map) = script.span_map() else {
+        return (
+            ScriptOrOriginal::Script(script),
+            text_range,
+            Fidelity::EXACT,
+        );
+    };
+    let (mapped, fidelity) = match feature {
+        None => SpanMap::virtual_to_original_span(Some(span_map), text_range),
+        Some(feature) => {
+            SpanMap::virtual_to_original_span_for_feature(Some(span_map), text_range, feature)
+        }
+    };
+    (
+        ScriptOrOriginal::Original(OriginalTextScript {
+            file_name: script.original_file_name(),
+            text: script.original_text(),
+        }),
+        mapped,
+        fidelity,
+    )
+}
+
+// Go: ls/lsconv/converters.go:269 virtualPositionToOriginal
+// virtualPositionToOriginal is the single-position analog of virtualRangeToOriginal.
+fn virtual_position_to_original(
+    script: &dyn Script,
+    position: i32,
+    feature: Option<Feature>,
+) -> (ScriptOrOriginal<'_>, i32, Fidelity) {
+    let Some(span_map) = script.span_map() else {
+        return (ScriptOrOriginal::Script(script), position, Fidelity::EXACT);
+    };
+    let (mapped, fidelity) = match feature {
+        None => SpanMap::virtual_to_original_position(Some(span_map), position),
+        Some(feature) => {
+            SpanMap::virtual_to_original_position_for_feature(Some(span_map), position, feature)
+        }
+    };
+    (
+        ScriptOrOriginal::Original(OriginalTextScript {
+            file_name: script.original_file_name(),
+            text: script.original_text(),
+        }),
+        mapped,
+        fidelity,
+    )
+}
+
 // Go: ls/lsconv/converters.go:589 originalTextScript
+// originalTextScript presents a content-mapped file's original (untransformed) text as a Script, so that
+// ranges already mapped into that text convert to the correct line/character positions.
 // PORT: Go copies the two strings; here the script borrows them.
 struct OriginalTextScript<'a> {
     file_name: &'a str,
@@ -266,7 +663,7 @@ impl Script for OriginalTextScript<'_> {
     }
 }
 
-// Go: ls/lsconv/converters.go:68 LanguageKindToScriptKind
+// Go: ls/lsconv/converters.go:283 LanguageKindToScriptKind
 // PORT: Go passes the string value; here by reference.
 #[must_use]
 pub fn language_kind_to_script_kind(language_id: &lsproto::LanguageKind) -> ScriptKind {
@@ -280,7 +677,7 @@ pub fn language_kind_to_script_kind(language_id: &lsproto::LanguageKind) -> Scri
     }
 }
 
-// Go: ls/lsconv/converters.go:86 extraEscapeReplacer
+// Go: ls/lsconv/converters.go:301 extraEscapeReplacer
 // https://github.com/microsoft/vscode-uri/blob/edfdccd976efaf4bb8fdeca87e97c47257721729/src/uri.ts#L455
 // PORT: Go `strings.NewReplacer` with one-byte old strings (Go picks its byte
 // replacer). The pairs are kept in Go order; `extra_escape_replacer_replace`
@@ -329,7 +726,7 @@ fn extra_escape_replacer_replace(s: &str) -> String {
     out
 }
 
-// Go: ls/lsconv/converters.go:110 FileNameToDocumentURI
+// Go: ls/lsconv/converters.go:325 FileNameToDocumentURI
 #[must_use]
 pub fn file_name_to_document_uri(file_name: &str) -> lsproto::DocumentUri {
     if is_bundled(file_name) {
@@ -387,14 +784,24 @@ fn utf16_rune_len(r: i32) -> i32 {
 // from Go. Otherwise the decoder follows Go `utf8.DecodeRuneInString`, also
 // at a position inside a character.
 impl Converters {
-    // Go: ls/lsconv/converters.go:144 LineAndCharacterToPosition
+    // Go: ls/lsconv/converters.go:359 lineAndCharacterToPosition
     // PORT: Go passes the position by value; here by reference.
+    // PORT: Go makes this raw conversion private in tsgo#4712 (the LS uses
+    // `from_lsp_position`, `from_lsp_range` and their SourceFile forms). It
+    // stays `pub` because the converters tests in
+    // `tests/go_baselines/units_emit/ls_tests.rs` (not lane ls) still call it.
+    // Make it private when that file takes the Go B test form (lane ls notes
+    // for root). Do not call it from LS code.
     pub fn line_and_character_to_position(
         &self,
         script: &dyn Script,
         line_and_character: &lsproto::Position,
     ) -> i32 {
         // UTF-8/16 0-indexed line and character to UTF-8 offset
+        crate::go_assert!(
+            script.span_map().is_none(),
+            "raw coordinate conversion requires a non-content-mapped script"
+        );
 
         let line_map = self.line_map_of(script.file_name());
 
@@ -445,13 +852,20 @@ impl Converters {
         pos as i32
     }
 
-    // Go: ls/lsconv/converters.go:194 PositionToLineAndCharacter
+    // Go: ls/lsconv/converters.go:410 positionToLineAndCharacter
+    // PORT: private in Go since tsgo#4712, `pub` here for the same reason as
+    // `line_and_character_to_position`. Do not call it from LS code; use
+    // `to_lsp_position`.
     pub fn position_to_line_and_character(
         &self,
         script: &dyn Script,
         position: i32,
     ) -> lsproto::Position {
         // UTF-8 offset to UTF-8/16 0-indexed line and character
+        crate::go_assert!(
+            script.span_map().is_none(),
+            "raw coordinate conversion requires a non-content-mapped script"
+        );
 
         let position = i32::max(0, position.min(script.text().len() as i32));
 
@@ -503,7 +917,7 @@ impl Converters {
     }
 }
 
-// Go: ls/lsconv/converters.go:227 diagnosticOptions
+// Go: ls/lsconv/converters.go:444 diagnosticOptions
 struct DiagnosticOptions {
     report_style_checks_as_warnings: bool,
     related_information: bool,
@@ -511,7 +925,7 @@ struct DiagnosticOptions {
     visual_studio: bool,
 }
 
-// Go: ls/lsconv/converters.go:235 DiagnosticToLSPPull
+// Go: ls/lsconv/converters.go:452 DiagnosticToLSPPull
 // DiagnosticToLSPPull converts a diagnostic for pull diagnostics (textDocument/diagnostic)
 pub fn diagnostic_to_lsp_pull(
     ctx: &Context,
@@ -534,7 +948,7 @@ pub fn diagnostic_to_lsp_pull(
     )
 }
 
-// Go: ls/lsconv/converters.go:247 DiagnosticToLSPPush
+// Go: ls/lsconv/converters.go:464 DiagnosticToLSPPush
 // DiagnosticToLSPPush converts a diagnostic for push diagnostics (textDocument/publishDiagnostics)
 pub fn diagnostic_to_lsp_push(
     ctx: &Context,
@@ -556,7 +970,7 @@ pub fn diagnostic_to_lsp_push(
     )
 }
 
-// Go: ls/lsconv/converters.go:258 styleCheckDiagnostics
+// Go: ls/lsconv/converters.go:475 styleCheckDiagnostics
 // https://github.com/microsoft/vscode/blob/93e08afe0469712706ca4e268f778cfadf1a43ef/extensions/typescript-language-features/src/typeScriptServiceClientHost.ts#L40C7-L40C29
 static STYLE_CHECK_DIAGNOSTICS: LazyLock<FxHashSet<i32>> = LazyLock::new(|| {
     [
@@ -573,7 +987,7 @@ static STYLE_CHECK_DIAGNOSTICS: LazyLock<FxHashSet<i32>> = LazyLock::new(|| {
     .collect()
 });
 
-// Go: ls/lsconv/converters.go:269 diagnosticToLSP
+// Go: ls/lsconv/converters.go:486 diagnosticToLSP
 fn diagnostic_to_lsp(
     ctx: &Context,
     converters: &Converters,
@@ -581,12 +995,7 @@ fn diagnostic_to_lsp(
     opts: DiagnosticOptions,
 ) -> lsproto::Diagnostic {
     let locale = locale::from_context(ctx);
-    let mut severity = match diagnostic.category() {
-        ts_diagnostics::Category::Suggestion => lsproto::DiagnosticSeverity::HINT,
-        ts_diagnostics::Category::Message => lsproto::DiagnosticSeverity::INFORMATION,
-        ts_diagnostics::Category::Warning => lsproto::DiagnosticSeverity::WARNING,
-        _ => lsproto::DiagnosticSeverity::ERROR,
-    };
+    let mut severity = diagnostic_severity(diagnostic.category());
 
     if opts.report_style_checks_as_warnings
         && severity == lsproto::DiagnosticSeverity::ERROR
@@ -599,10 +1008,19 @@ fn diagnostic_to_lsp(
     if opts.related_information {
         related_information = Vec::with_capacity(diagnostic.related_information().len());
         for related in diagnostic.related_information() {
+            let related_file = related.file();
+            let (script, loc) =
+                diagnostic_script_and_range(&related_file, related.loc(), related.source());
+            let (mut related_range, fidelity) = converters.to_lsp_range(&script, loc);
+            if fidelity.is_none() {
+                // Related diagnostic information cannot omit its location. Use an explicit file-level
+                // location instead of presenting the synthesized span's insertion point as related source.
+                related_range = lsproto::Range::default();
+            }
             related_information.push(lsproto::DiagnosticRelatedInformation {
                 location: lsproto::Location {
-                    uri: file_name_to_document_uri(source_file_file_name(related.file())),
-                    range: converters.to_lsp_range(&related.file(), related.loc()),
+                    uri: file_name_to_document_uri(source_file_original_file_name(related_file)),
+                    range: related_range,
                 },
                 message: related.localize(&locale),
             });
@@ -633,11 +1051,23 @@ fn diagnostic_to_lsp(
     // For diagnostics without a file (e.g., program diagnostics), use a zero range
     let mut lsp_range = lsproto::Range::default();
     if diagnostic.file().is_some() {
-        lsp_range = converters.to_lsp_range(&diagnostic.file(), diagnostic.loc());
+        let file = diagnostic.file();
+        let (script, loc) =
+            diagnostic_script_and_range(&file, diagnostic.loc(), diagnostic.source());
+        let fidelity: Fidelity;
+        (lsp_range, fidelity) = converters.to_lsp_range(&script, loc);
+        if fidelity.is_none() {
+            // Diagnostics must carry a range. A zero range honestly means "this file" when the
+            // diagnostic arose entirely in synthesized code and has no original source span.
+            lsp_range = lsproto::Range::default();
+        }
     }
 
     let code: Option<lsproto::IntegerOrString>;
-    let mut source: Option<String> = None;
+    let mut source_text = diagnostic.source().to_string();
+    if source_text.is_empty() {
+        source_text = "ts".to_string();
+    }
     if opts.visual_studio {
         code = Some(lsproto::IntegerOrString {
             string: Some(format!("TS{}", diagnostic.code())),
@@ -648,7 +1078,6 @@ fn diagnostic_to_lsp(
             integer: Some(diagnostic.code()),
             ..Default::default()
         });
-        source = Some("ts".to_string());
     }
 
     lsproto::Diagnostic {
@@ -659,14 +1088,60 @@ fn diagnostic_to_lsp(
             string: Some(message_chain_to_string(diagnostic, &locale)),
             ..Default::default()
         },
-        source,
+        source: Some(source_text),
         related_information: ptr_to_slice_if_non_empty(related_information),
         tags: ptr_to_slice_if_non_empty(tags),
         ..Default::default()
     }
 }
 
-// Go: ls/lsconv/converters.go:342 messageChainToString
+// Go: ls/lsconv/converters.go:570 diagnosticScriptAndRange
+// diagnosticScriptAndRange resolves the text basis and range to report a diagnostic against. For a
+// content-mapped file it maps the diagnostic's virtual range back to the original text so
+// the range lines up with what the editor shows; the original text's line map is already what
+// getLineMap returns for the file. A range in synthesized code has no original counterpart, so it is
+// surfaced at the top of the file. Non-mapped files are returned unchanged.
+// PORT: Go returns the file itself as the `Script`; here a reference to the
+// caller's file root `Node`. A nil file is `Node::NIL`, which Go also
+// returns as is.
+fn diagnostic_script_and_range<'a>(
+    file: &'a Node,
+    loc: TextRange,
+    source: &str,
+) -> (ScriptOrOriginal<'a>, TextRange) {
+    // PORT: Go `file == nil || file.SpanMap() == nil`; the span map of a nil
+    // file is `None`.
+    let Some(span_map) = source_file_span_map(*file) else {
+        return (ScriptOrOriginal::Script(file), loc);
+    };
+    let original = OriginalTextScript {
+        file_name: source_file_original_file_name(*file),
+        text: source_file_original_text(*file),
+    };
+    if !source.is_empty() {
+        // A content mapper's own diagnostics already carry original-text ranges.
+        return (ScriptOrOriginal::Original(original), loc);
+    }
+    let (mapped, fidelity) = SpanMap::virtual_to_original_span(Some(span_map), loc);
+    if fidelity == Fidelity::NONE {
+        // Entirely synthesized code has no original location; surface it at the top of the file.
+        return (ScriptOrOriginal::Original(original), TextRange::new(0, 0));
+    }
+    (ScriptOrOriginal::Original(original), mapped)
+}
+
+// Go: ls/lsconv/converters.go:601 diagnosticSeverity
+// diagnosticSeverity maps a diagnostic category to its LSP severity.
+fn diagnostic_severity(category: ts_diagnostics::Category) -> lsproto::DiagnosticSeverity {
+    match category {
+        ts_diagnostics::Category::Suggestion => lsproto::DiagnosticSeverity::HINT,
+        ts_diagnostics::Category::Message => lsproto::DiagnosticSeverity::INFORMATION,
+        ts_diagnostics::Category::Warning => lsproto::DiagnosticSeverity::WARNING,
+        _ => lsproto::DiagnosticSeverity::ERROR,
+    }
+}
+
+// Go: ls/lsconv/converters.go:614 messageChainToString
 fn message_chain_to_string(diagnostic: &Diagnostic, locale: &locale::Locale) -> String {
     if diagnostic.message_chain().is_empty() {
         return diagnostic.localize(locale);
@@ -676,7 +1151,7 @@ fn message_chain_to_string(diagnostic: &Diagnostic, locale: &locale::Locale) -> 
     b
 }
 
-// Go: ls/lsconv/converters.go:351 ptrToSliceIfNonEmpty
+// Go: ls/lsconv/converters.go:623 ptrToSliceIfNonEmpty
 fn ptr_to_slice_if_non_empty<T>(s: Vec<T>) -> Option<Vec<T>> {
     if s.is_empty() {
         return None;

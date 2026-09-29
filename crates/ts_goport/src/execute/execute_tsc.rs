@@ -42,7 +42,8 @@ use crate::execute::tsc::{
     CommandLineResult, CompileTimes, CompilerProgram, DiagnosticReporter, DiagnosticsReporter,
     EmitInput, ExitStatus, ProgramLike, System, SystemParseConfigHost, create_diagnostic_reporter,
     create_report_error_summary, emit_and_report_statistics, get_trace_with_writer_from_sys,
-    print_build_help, print_help, print_version, write_config_file, write_str,
+    new_content_mapper_host, print_build_help, print_help, print_version, write_config_file,
+    write_str,
 };
 use crate::execute::watcher::create_watcher;
 use crate::frontend::json::json_marshal_indent_write;
@@ -455,6 +456,7 @@ pub fn tsc_compilation(
         };
     } else if config_for_compilation.compiler_options().is_incremental() {
         return perform_incremental_compilation(
+            ctx,
             &sys,
             config_for_compilation,
             report_diagnostic,
@@ -466,7 +468,8 @@ pub fn tsc_compilation(
         );
     }
     perform_compilation(
-        &*sys,
+        ctx,
+        &sys,
         config_for_compilation,
         report_diagnostic,
         report_error_summary,
@@ -558,11 +561,15 @@ fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) ->
 // the second global diagnostics read and the emit, before
 // `EmitAndReportStatistics` (`Program::start_check_and_emit`). Each checker
 // then emits when its own check ends. `EmitAndReportStatistics` makes the
-// same calls as in Go and waits for that work. Its check time is the wait
-// for the check, and its emit time the wait for the rest of the emit.
+// same calls as in Go and waits for that work. Its check time is the time
+// that `start_check` spent on the affected files plus the wait for the
+// check (`Program::take_started_check_time`), and its emit time the wait
+// for the rest of the emit.
 // PORT: `sys_rc` is the `Rc` so that the incremental program can keep
-// `sys.Now` (Go passes the method value). The body uses `sys: &dyn System`.
+// `sys.Now` (Go passes the method value) and the content mapper host can
+// keep `sys` as its spawner. The body uses `sys: &dyn System`.
 fn perform_incremental_compilation(
+    ctx: &Context,
     sys_rc: &Rc<dyn System>,
     config: ParsedCommandLine,
     report_diagnostic: DiagnosticReporter,
@@ -574,7 +581,7 @@ fn perform_incremental_compilation(
 ) -> CommandLineResult {
     let sys: &dyn System = &**sys_rc;
     start_lib_prefetch(sys, &config, testing.is_some());
-    let content_mapper_host = new_content_mapper_host();
+    let content_mapper_host = new_content_mapper_host(ctx, sys_rc, config.compiler_options());
     let content_mapper_project = get_content_mapper_project(content_mapper_host.as_ref(), &config);
     let _close_content_mapper_project = CloseContentMapperProject(content_mapper_project.clone());
     let host = new_cached_fs_compiler_host(
@@ -615,8 +622,9 @@ fn perform_incremental_compilation(
         )),
     };
     compile_times.borrow_mut().changes_compute_time = since(sys, changes_compute_start);
-    // Go: compileTimes.ContentMapperTimes = contentMapperHost.Timings()
-    // PORT: missing, see `new_content_mapper_host`.
+    if let Some(content_mapper_host) = &content_mapper_host {
+        compile_times.borrow_mut().content_mapper_times = content_mapper_host.timings();
+    }
     // PORT: the bin check after NewProgram (see `TscCompilationHooks`).
     if let Err(status) = hooks.program_created() {
         stop_tracing(sys);
@@ -662,9 +670,12 @@ fn perform_incremental_compilation(
     result(emit_result.status)
 }
 
-// Go: execute/tsc.go:333 performCompilation
+// Go: execute/tsc.go:345 performCompilation
+// PORT: `sys_rc` is the `Rc` so that the content mapper host can keep
+// `sys` as its spawner. The body uses `sys: &dyn System`.
 fn perform_compilation(
-    sys: &dyn System,
+    ctx: &Context,
+    sys_rc: &Rc<dyn System>,
     config: ParsedCommandLine,
     report_diagnostic: DiagnosticReporter,
     report_error_summary: DiagnosticsReporter,
@@ -673,8 +684,9 @@ fn perform_compilation(
     testing: Option<Rc<dyn CommandLineTesting>>,
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
+    let sys: &dyn System = &**sys_rc;
     start_lib_prefetch(sys, &config, testing.is_some());
-    let content_mapper_host = new_content_mapper_host();
+    let content_mapper_host = new_content_mapper_host(ctx, sys_rc, config.compiler_options());
     let content_mapper_project = get_content_mapper_project(content_mapper_host.as_ref(), &config);
     let _close_content_mapper_project = CloseContentMapperProject(content_mapper_project.clone());
     let host = new_cached_fs_compiler_host(
@@ -692,8 +704,9 @@ fn perform_compilation(
     let parse_start = sys.now();
     install_program(host, config.clone());
     compile_times.borrow_mut().parse_time = since(sys, parse_start);
-    // Go: compileTimes.ContentMapperTimes = contentMapperHost.Timings()
-    // PORT: missing, see `new_content_mapper_host`.
+    if let Some(content_mapper_host) = &content_mapper_host {
+        compile_times.borrow_mut().content_mapper_times = content_mapper_host.timings();
+    }
     // PORT: the bin check after NewProgram (see `TscCompilationHooks`).
     if let Err(status) = hooks.program_created() {
         stop_tracing(sys);
@@ -734,18 +747,6 @@ pub(crate) fn start_lib_prefetch(sys: &dyn System, config: &ParsedCommandLine, t
         sys.fs().use_case_sensitive_file_names(),
         &sys.default_library_path(),
     );
-}
-
-/// Go `tsc.NewContentMapperHost(ctx, sys, config.CompilerOptions())`
-/// (execute/tsc/compile.go:89, tsgo#4712).
-// PORT: the execute/tsc port has no `NewContentMapperHost` yet. It needs
-// `System.Spawn` and the content mapper stderr logger. Until then the host
-// is Go's value without `--runExternalCode`: nil. There is then no content
-// mapper project and no `CompileTimes.ContentMapperTimes`, and a
-// content-mapped file fails its transform with `ErrProjectUnavailable`, as
-// in Go without that option.
-fn new_content_mapper_host() -> Option<Rc<dyn ContentMapperHost>> {
-    None
 }
 
 /// Go `defer contentMapperProject.Close()`: closes the project when the

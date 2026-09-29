@@ -145,6 +145,7 @@ pub fn new_lsp_client(
                 typings_location: String::new(),
                 parse_cache: None,
                 npm_install: None,
+                spawn: None,
                 progress_delay: Duration::ZERO,
                 set_parent_process_id: None,
             });

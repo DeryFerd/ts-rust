@@ -69,7 +69,7 @@ impl LanguageService {
                 // PORT: Go reads `ref.Pos()` through the pointer; a nil
                 // pointer panics there.
                 let ref_ = ref_.expect("invalid memory address or nil pointer dereference");
-                let origin_selection_range =
+                let (origin_selection_range, _) =
                     self.create_lsp_range_from_bounds(ref_.range.pos(), ref_.range.end(), file);
                 return Ok(self.create_definition_locations(
                     origin_selection_range,
@@ -82,7 +82,7 @@ impl LanguageService {
             return Ok(lsproto::LocationOrLocationsOrDefinitionLinksOrNull::default());
         }
 
-        let origin_selection_range = self.create_lsp_range_from_node(node, file);
+        let (origin_selection_range, _) = self.create_lsp_range_from_node(node, file);
 
         // If the cursor is directly on a module specifier string, resolve to the
         // implementation file's entry point.

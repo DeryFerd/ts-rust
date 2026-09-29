@@ -187,9 +187,14 @@ impl LanguageService {
         from_file: Node,
     ) -> Result<Option<Rc<autoimport::View>>, GoError> {
         let registry = self.host.auto_import_registry();
+        let mut registry_file = from_file;
+        let canonical = source_file_canonical_source_file(from_file);
+        if canonical.is_some() {
+            registry_file = canonical;
+        }
         if !autoimport::Registry::is_prepared_for_importing_file(
             registry.as_deref(),
-            source_file_file_name(from_file),
+            source_file_file_name(registry_file),
             &self.project_path,
             &self.user_preferences(),
         ) {

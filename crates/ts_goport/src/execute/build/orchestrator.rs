@@ -32,13 +32,14 @@
 //! each started task to the end at once, in build order, so the one test
 //! file system and clock see one ordered sequence (see `build_all_tasks`).
 
+use crate::contentmapper;
 use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::host::BuildHost;
 use crate::execute::incremental::build_info::{BuildInfo, is_build_info_file_name_default_library};
 use crate::execute::incremental::incremental::new_build_info_reader;
 use crate::execute::tsc::compile::{
-    CommandLineResult, ExitStatus, System, Watcher, Writer, write_str,
+    CommandLineResult, ExitStatus, System, Watcher, Writer, new_content_mapper_host, write_str,
 };
 use crate::execute::tsc::diagnostics::{
     DiagnosticReporter, DiagnosticsReporter, create_builder_status_reporter,
@@ -127,6 +128,12 @@ pub struct Orchestrator {
     pub(crate) opts: Options,
     pub(crate) compare_paths_options: ComparePathsOptions,
     pub(crate) host: Rc<BuildHost>,
+
+    // contentMapperHost transforms content-mapped files; it is created once per build session (when
+    // enabled) and shared across all projects so mapper processes are consolidated. It closes itself when
+    // the session context is cancelled (see contentmapper.New).
+    // PORT: Go nil is `None`.
+    pub(crate) content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
 
     // order generation result
     tasks: FxHashMap<Path, Rc<RefCell<BuildTask>>>,
@@ -221,6 +228,9 @@ impl Orchestrator {
                         // Reuse existing task if config is same
                         task = Some(existing.clone());
                     } else {
+                        if let Some(project) = &existing.borrow().content_mapper_project {
+                            let _ = project.close();
+                        }
                         build_info = existing.borrow().build_info_entry.clone();
                     }
                 }
@@ -333,13 +343,34 @@ impl Orchestrator {
                 &mut circularity_stack,
             );
         }
+        if let Some(old_tasks) = old_tasks {
+            for (path, old_task) in old_tasks {
+                if self
+                    .tasks
+                    .get(path)
+                    .is_some_and(|task| Rc::ptr_eq(task, old_task))
+                {
+                    continue;
+                }
+                if let Some(project) = &old_task.borrow().content_mapper_project {
+                    let _ = project.close();
+                }
+            }
+        }
     }
 
     // Go: build/orchestrator.go:226 (*Orchestrator).Start
     // PORT: Go returns the orchestrator itself as `result.Watcher`, so this
     // takes the boxed orchestrator. `Watch` blocks in the watch loop until
     // `ctx` ends (orchestrator_watch.rs).
+    // PORT: Go `defer o.contentMapperHost.Close()` runs when `start`
+    // returns; `start` has one return, so the close is written before it.
     pub fn start(mut self: Box<Self>, ctx: &Context) -> CommandLineResult {
+        self.content_mapper_host =
+            new_content_mapper_host(ctx, &self.opts.sys, &self.opts.command.compiler_options);
+        let close_content_mapper_host = self.content_mapper_host.clone().filter(|_| {
+            !self.opts.command.compiler_options.watch.is_true() || self.opts.testing.is_none()
+        });
         if self.opts.command.compiler_options.watch.is_true() {
             (self
                 .watch_status_reporter
@@ -354,6 +385,9 @@ impl Orchestrator {
         if self.opts.command.compiler_options.watch.is_true() {
             self.watch(ctx);
             result.watcher = Some(self as Box<dyn Watcher>);
+        }
+        if let Some(host) = close_content_mapper_host {
+            let _ = host.close();
         }
         result
     }
@@ -655,6 +689,10 @@ impl BuildTaskOrchestrator for Orchestrator {
     fn testing(&self) -> Option<Rc<dyn CommandLineTesting>> {
         self.opts.testing.clone()
     }
+
+    fn content_mapper_host(&self) -> Option<Rc<dyn contentmapper::Host>> {
+        self.content_mapper_host.clone()
+    }
 }
 
 // Go: build/orchestrator.go:603 NewOrchestrator
@@ -679,6 +717,7 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
         opts,
         compare_paths_options,
         host,
+        content_mapper_host: None,
         tasks: FxHashMap::default(),
         order: Vec::new(),
         errors: Vec::new(),

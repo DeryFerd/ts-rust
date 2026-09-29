@@ -1,6 +1,17 @@
 use crate::ls::prelude::*;
 
-// Go: ls/signaturehelp.go:20 callInvocation
+use crate::spanmap::Feature;
+
+// Go: ls/signaturehelp.go:25 SignatureHelpTriggerCharacters
+// SignatureHelpTriggerCharacters and SignatureHelpRetriggerCharacters are the characters that trigger and
+// re-trigger signature help. They are advertised both in the static server capabilities and in the dynamic
+// content-mapper registration, so they live here to keep those two declarations in sync.
+// PORT: Go `[]string` package variables; here constant slices.
+pub const SIGNATURE_HELP_TRIGGER_CHARACTERS: &[&str] = &["(", ",", "<"];
+// Go: ls/signaturehelp.go:26 SignatureHelpRetriggerCharacters
+pub const SIGNATURE_HELP_RETRIGGER_CHARACTERS: &[&str] = &[")"];
+
+// Go: ls/signaturehelp.go:30 callInvocation
 #[derive(Clone, Copy, Debug)]
 pub struct CallInvocation {
     pub node: Node,
@@ -47,10 +58,20 @@ impl LanguageService {
         context: Option<&lsproto::SignatureHelpContext>,
     ) -> Result<lsproto::SignatureHelpResponse, GoError> {
         let (program, source_file) = self.get_program_and_file(document_uri);
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            source_file,
+            position,
+            Feature::SIGNATURE_HELP,
+        );
+        if positions.is_empty() || !positions[0].fidelity.is_single_segment() {
+            return Ok(lsproto::SignatureHelpOrNull::default());
+        }
+        let source_file = positions[0].script;
+        let pos = positions[0].position;
         let items = self.get_signature_help_items(
             ctx,
-            self.converters
-                .line_and_character_to_position(&source_file, &position),
+            pos,
             program,
             source_file,
             context,
@@ -682,9 +703,7 @@ impl LanguageService {
         let declaration = c.sig(candidate).declaration;
         if declaration.is_some() {
             let doc = get_documentation_from_declaration(
-                &|file_name: &str, file_range: TextRange| {
-                    self.get_mapped_location(file_name, file_range)
-                },
+                &self.documentation_location_mapper(Feature::SIGNATURE_HELP),
                 c,
                 SymbolId::NIL,
                 declaration,
@@ -1056,9 +1075,7 @@ impl LanguageService {
         let value_declaration = c.sym(parameter).value_declaration;
         if value_declaration.is_some() {
             let doc = get_documentation_from_declaration(
-                &|file_name: &str, file_range: TextRange| {
-                    self.get_mapped_location(file_name, file_range)
-                },
+                &self.documentation_location_mapper(Feature::SIGNATURE_HELP),
                 c,
                 SymbolId::NIL,
                 value_declaration,

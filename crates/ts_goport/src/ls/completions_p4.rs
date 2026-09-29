@@ -483,7 +483,11 @@ impl LanguageService {
         // Use token position (excluding JSDoc/trivia) instead of node.Pos() to avoid including JSDoc comments
         let token_pos = get_token_pos_of_node(node, source_file, false /*includeJSDoc*/);
         if get_lines_between_positions(source_file, token_pos, node.end()) == 0 {
-            return Some(self.create_lsp_range_from_node(node, source_file));
+            let (lsp_range, fidelity) = self.create_lsp_range_from_node(node, source_file);
+            if !fidelity.is_exact() {
+                return None;
+            }
+            return Some(lsp_range);
         }
 
         if node.kind() == SyntaxKind::ImportKeyword || node.kind() == SyntaxKind::ImportSpecifier {
@@ -536,11 +540,15 @@ impl LanguageService {
             without_module_specifier.end(),
         ) == 0
         {
-            return Some(self.create_lsp_range_from_bounds(
+            let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(
                 without_module_specifier.pos(),
                 without_module_specifier.end(),
                 source_file,
-            ));
+            );
+            if !fidelity.is_exact() {
+                return None;
+            }
+            return Some(lsp_range);
         }
         None
     }
@@ -1558,8 +1566,9 @@ impl LanguageService {
                     None
                 },
                 data: Some(lsproto::CompletionItemData {
-                    file_name: source_file_file_name(file).to_string(),
+                    file_name: source_file_original_file_name(file).to_string(),
                     position,
+                    supplemental_file_index: supplemental_file_index(file),
                     name,
                     source: COMPLETION_SOURCE_SWITCH_CASES.to_string(),
                     auto_import: None,
