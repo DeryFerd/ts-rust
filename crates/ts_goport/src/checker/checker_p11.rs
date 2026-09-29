@@ -1003,8 +1003,7 @@ impl Checker {
         if self.call_like_expression_may_have_type_arguments(node) {
             // Check type arguments even though we will give an error that untyped calls may not accept type arguments.
             // This gets us diagnostics for the type arguments and marks them as referenced.
-            let type_arguments = node.type_arguments().to_vec();
-            self.check_source_elements(&type_arguments);
+            self.check_source_elements(node.type_arguments());
         }
         match node.kind() {
             SyntaxKind::TaggedTemplateExpression => {
@@ -1017,7 +1016,7 @@ impl Checker {
                 self.check_expression(node.left());
             }
             SyntaxKind::CallExpression | SyntaxKind::NewExpression => {
-                for argument in node.arguments().to_vec() {
+                for argument in node.arguments() {
                     self.check_expression(argument);
                 }
             }
@@ -1313,7 +1312,7 @@ impl Checker {
         if will_transform_static_elements_of_decorated_class
             || will_transform_private_elements_or_class_static_blocks
         {
-            for member in node.members().to_vec() {
+            for member in node.members() {
                 if will_transform_static_elements_of_decorated_class
                     && class_element_or_class_element_parameter_is_decorated(false, member, node)
                 {
@@ -1377,8 +1376,7 @@ impl Checker {
 
     // Go: checker/checker.go:10086 checkClassExpressionDeferred
     pub fn check_class_expression_deferred(&mut self, node: Node) {
-        let members = node.members().to_vec();
-        self.check_source_elements(&members);
+        self.check_source_elements(node.members());
         self.register_for_unused_identifiers_check(node);
     }
 

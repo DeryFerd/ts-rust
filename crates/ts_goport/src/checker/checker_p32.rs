@@ -797,10 +797,10 @@ impl Checker {
         }
         let contextual_signature = self.get_contextual_signature(fn_);
         if contextual_signature.is_some() {
-            let parameters = fn_.parameters().to_vec();
+            let parameters = fn_.parameters();
             let index = parameters
                 .iter()
-                .position(|&p| p == parameter)
+                .position(|p| p == parameter)
                 .map_or(-1, |i| i as i32)
                 - if get_this_parameter(fn_).is_some() {
                     1
@@ -808,7 +808,7 @@ impl Checker {
                     0
                 };
             if has_dot_dot_dot_token(parameter)
-                && parameters.last().copied().unwrap_or(Node::NIL) == parameter
+                && parameters.last().unwrap_or(Node::NIL) == parameter
             {
                 return self.get_rest_type_at_position(contextual_signature, index, false);
             }

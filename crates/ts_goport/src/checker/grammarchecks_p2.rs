@@ -1,6 +1,7 @@
 //! Port of typescript-go `internal/checker/grammarchecks.go` lines 952-1857.
 
 use crate::prelude::*;
+use std::borrow::Cow;
 
 use crate::diagnostics::Message;
 
@@ -133,11 +134,11 @@ impl Checker {
         node: Node,
         in_destructuring: bool,
     ) -> bool {
-        let mut seen: FxHashMap<String, DeclarationMeaning> = FxHashMap::default();
+        let mut seen: FxHashMap<Cow<'static, str>, DeclarationMeaning> = FxHashMap::default();
 
         // PORT: Go reads `node.Properties.Nodes` with a nil check; `properties()`
         // is empty for a nil list.
-        let properties = node.properties().to_vec();
+        let properties = node.properties();
         for prop in properties {
             if prop.kind() == SyntaxKind::SpreadAssignment {
                 let spread_expression = prop.expression();

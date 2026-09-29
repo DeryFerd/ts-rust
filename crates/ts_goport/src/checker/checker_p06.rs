@@ -392,7 +392,7 @@ impl Checker {
             return;
         }
         let constructor = find_constructor_declaration(node);
-        for member in node.members().to_vec() {
+        for member in node.members() {
             if member.modifier_flags().intersects(ModifierFlags::AMBIENT) {
                 continue;
             }
@@ -522,7 +522,7 @@ impl Checker {
                 args!["interface"],
             );
         }
-        self.check_type_parameters(&node.type_parameters().to_vec());
+        self.check_type_parameters(node.type_parameters());
         self.check_type_name_is_reserved(node.name(), diag::Interface_name_cannot_be_0);
         self.check_exports_on_merged_declarations(node);
         let symbol = self.get_symbol_of_declaration(node);
@@ -558,7 +558,7 @@ impl Checker {
             }
             self.check_type_reference_node(heritage_element);
         }
-        self.check_source_elements(&node.members().to_vec());
+        self.check_source_elements(node.members());
         self.check_class_or_interface_for_duplicate_index_signatures(node);
         self.register_for_unused_identifiers_check(node);
     }
@@ -648,7 +648,7 @@ impl Checker {
         self.check_grammar_modifiers(node);
         self.check_collisions_for_declaration_name(node, node.name());
         self.check_exports_on_merged_declarations(node);
-        self.check_source_elements(&node.members().to_vec());
+        self.check_source_elements(node.members());
 
         if self.should_check_erasable_syntax(node) && !node.flags().intersects(NodeFlags::AMBIENT) {
             self.error(
@@ -826,8 +826,7 @@ impl Checker {
             {
                 let export_modifier = node
                     .modifier_nodes()
-                    .to_vec()
-                    .into_iter()
+                    .iter()
                     .find(|m| m.kind() == SyntaxKind::ExportKeyword)
                     .unwrap_or(Node::NIL);
                 self.error(
@@ -849,7 +848,7 @@ impl Checker {
                     self.sym(s).flags.intersects(SymbolFlags::TRANSIENT)
                 };
                 if check_body && node.body().is_some() {
-                    for statement in node.body().statements().to_vec() {
+                    for statement in node.body().statements() {
                         self.check_module_augmentation_element(statement);
                     }
                 }
@@ -918,7 +917,7 @@ impl Checker {
         match node.kind() {
             SyntaxKind::VariableStatement => {
                 // error each individual name in variable statement instead of marking the entire variable statement
-                for decl in node.declaration_list().declarations().nodes().to_vec() {
+                for decl in node.declaration_list().declarations().nodes() {
                     self.check_module_augmentation_element(decl);
                 }
             }
@@ -948,7 +947,7 @@ impl Checker {
             SyntaxKind::BindingElement | SyntaxKind::VariableDeclaration => {
                 let name = node.name();
                 if is_binding_pattern(name) {
-                    for el in name.elements().to_vec() {
+                    for el in name.elements() {
                         // mark individual names in binding pattern
                         self.check_module_augmentation_element(el);
                     }
@@ -1005,7 +1004,7 @@ impl Checker {
                         resolved_module =
                             self.resolve_external_module_name(node, node.module_specifier(), false);
                         if resolved_module.is_some() {
-                            for binding in named_bindings.elements().to_vec() {
+                            for binding in named_bindings.elements() {
                                 self.check_import_binding(binding);
                             }
                         }
@@ -1360,7 +1359,7 @@ impl Checker {
             if export_clause.is_some() && !is_namespace_export(export_clause) {
                 // export { x, y }
                 // export { x, y } from "foo"
-                for binding in export_clause.elements().to_vec() {
+                for binding in export_clause.elements() {
                     self.check_export_specifier(binding);
                 }
                 let in_ambient_external_module =

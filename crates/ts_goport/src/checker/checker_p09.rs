@@ -783,7 +783,7 @@ impl Checker {
 
     // Go: checker/checker.go:7996 checkArrayLiteral
     pub fn check_array_literal(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
-        let elements = node.elements().to_vec();
+        let elements = node.elements();
         let mut element_types: Vec<TypeId> = vec![TypeId::NIL; elements.len()];
         let mut element_infos: Vec<TupleElementInfo> =
             vec![TupleElementInfo::default(); elements.len()];
@@ -804,7 +804,7 @@ impl Checker {
                             }
                 });
         let mut has_omitted_expression = false;
-        for (i, &e) in elements.iter().enumerate() {
+        for (i, e) in elements.iter().enumerate() {
             if is_spread_element(e) {
                 let spread_type = self.check_expression_ex(e.expression(), check_mode);
                 if self.is_array_like_type(spread_type) {
@@ -1252,7 +1252,7 @@ impl Checker {
                 self.check_type_assignable_to(options_type, nullable, args[1], None);
             }
             if is_object_literal_expression(args[1]) {
-                for prop in args[1].properties().to_vec() {
+                for prop in args[1].properties() {
                     if is_property_assignment(prop)
                         && is_identifier(prop.name())
                         && prop.name().text() == "assert"

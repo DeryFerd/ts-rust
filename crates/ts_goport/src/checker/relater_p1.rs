@@ -1086,7 +1086,7 @@ impl Checker {
             return false;
         }
         let mut reported_error = false;
-        for prop in node.properties().to_vec() {
+        for prop in node.properties() {
             if is_spread_assignment(prop) {
                 continue;
             }
@@ -1166,7 +1166,7 @@ impl Checker {
             }
         }
         let mut reported_error = false;
-        for (i, element) in node.elements().to_vec().into_iter().enumerate() {
+        for (i, element) in node.elements().iter().enumerate() {
             if is_omitted_expression(element)
                 || self.is_tuple_like_type(target)
                     && self

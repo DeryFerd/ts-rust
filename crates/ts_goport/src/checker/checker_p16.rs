@@ -285,6 +285,7 @@ impl Checker {
         source: SymbolId,
         unidirectional: bool,
     ) -> SymbolId {
+        self.merge_version += 1;
         let source_flags = self.sym(source).flags;
         let target_flags = self.sym(target).flags;
         if !target_flags.intersects(get_excluded_symbol_flags(source_flags))
@@ -659,6 +660,7 @@ impl Checker {
 
     // Go: checker/checker.go:14292 recordMergedSymbol
     pub fn record_merged_symbol(&mut self, target: SymbolId, source: SymbolId) {
+        self.merge_version += 1;
         self.merged_symbols.insert(source, target);
     }
 

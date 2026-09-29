@@ -1748,12 +1748,15 @@ impl Checker {
             // compares ids instead of hashing and comparing text.
             let name = self.sym(target_prop).name.clone();
             let source_prop = self.get_property_of_type_name(source, &name);
+            // PERF: the skip set is empty outside the language service, and
+            // then no declaration is in it, so the scan is skipped.
             if source_prop.is_some()
-                && !self
-                    .sym(source_prop)
-                    .declarations
-                    .iter()
-                    .any(|&d| self.is_skip_direct_inference_node(d))
+                && (self.skip_direct_inference_nodes.is_empty()
+                    || !self
+                        .sym(source_prop)
+                        .declarations
+                        .iter()
+                        .any(|&d| self.is_skip_direct_inference_node(d)))
             {
                 let source_type = self.get_type_of_symbol(source_prop);
                 let source_optional = self

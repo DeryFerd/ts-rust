@@ -904,7 +904,7 @@ impl Checker {
             }
             let mut non_rest_names: Vec<Node> = Vec::new();
             if !all_properties.is_nil() {
-                for other_property in all_properties.nodes().to_vec() {
+                for other_property in all_properties.nodes() {
                     if !is_spread_assignment(other_property) {
                         non_rest_names.push(other_property.name());
                     }

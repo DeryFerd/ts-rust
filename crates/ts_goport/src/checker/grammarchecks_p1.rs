@@ -352,7 +352,7 @@ impl Checker {
         // [...leadingDecorators, ...leadingModifiers, ...trailingDecorators, ...trailingModifiers]. It is an error to
         // have both leading and trailing decorators.
         let mut has_leading_decorators = false;
-        let modifiers = node.modifier_nodes().to_vec();
+        let modifiers = node.modifier_nodes();
         for modifier in modifiers {
             if is_decorator(modifier) {
                 if !node_can_be_decorated(
@@ -1644,7 +1644,7 @@ impl Checker {
             );
         }
 
-        for node in types.nodes().to_vec() {
+        for node in types.nodes() {
             if self.check_grammar_expression_with_type_arguments(node) {
                 return true;
             }
@@ -1684,7 +1684,7 @@ impl Checker {
         let heritage_clauses = node.heritage_clauses();
 
         if !self.check_grammar_modifiers(node) && heritage_clauses.is_some() {
-            for heritage_clause_node in heritage_clauses.nodes().to_vec() {
+            for heritage_clause_node in heritage_clauses.nodes() {
                 let heritage_clause = heritage_clause_node;
                 if heritage_clause.token() == SyntaxKind::ExtendsKeyword {
                     if seen_extends_clause {

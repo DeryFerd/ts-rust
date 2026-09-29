@@ -10,7 +10,7 @@ impl Checker {
     // Go: checker/checker.go:23118 getTypeArgumentsFromNode
     pub fn get_type_arguments_from_node(&mut self, node: Node) -> Vec<TypeId> {
         let mut result = Vec::new();
-        for n in node.type_arguments().to_vec() {
+        for n in node.type_arguments() {
             result.push(self.get_type_from_type_node(n));
         }
         result
@@ -47,7 +47,7 @@ impl Checker {
                     return self.may_resolve_type_alias(node.element_type());
                 }
                 SyntaxKind::TupleType => {
-                    for e in node.elements().to_vec() {
+                    for e in node.elements() {
                         if self.may_resolve_type_alias(e) {
                             return true;
                         }
@@ -58,7 +58,7 @@ impl Checker {
                     if has_default_type_arguments {
                         return true;
                     }
-                    for a in node.type_arguments().to_vec() {
+                    for a in node.type_arguments() {
                         if self.may_resolve_type_alias(a) {
                             return true;
                         }
@@ -116,7 +116,7 @@ impl Checker {
                     || self.may_resolve_type_alias(node.type_().element_type())
             }
             SyntaxKind::UnionType | SyntaxKind::IntersectionType => {
-                for t in node.types().nodes().to_vec() {
+                for t in node.types().nodes() {
                     if self.may_resolve_type_alias(t) {
                         return true;
                     }
@@ -580,15 +580,15 @@ impl Checker {
      */
     // Go: checker/checker.go:23482 getTypeFromTypeAliasReference
     pub fn get_type_from_type_alias_reference(&mut self, node: Node, symbol: SymbolId) -> TypeId {
-        let type_arguments = node.type_arguments().to_vec();
+        let type_arguments = node.type_arguments();
         if self
             .sym(symbol)
             .check_flags
             .intersects(CheckFlags::UNRESOLVED)
         {
             let mut alias_type_arguments = Vec::new();
-            for a in &type_arguments {
-                alias_type_arguments.push(self.get_type_from_type_node(*a));
+            for a in type_arguments {
+                alias_type_arguments.push(self.get_type_from_type_node(a));
             }
             let alias = Rc::new(TypeAlias {
                 symbol,
@@ -936,10 +936,8 @@ impl Checker {
                         outer_type_parameters.extend(infer_type_parameters);
                         return outer_type_parameters;
                     }
-                    let mut outer_and_own_type_parameters = self.append_type_parameters(
-                        outer_type_parameters,
-                        &node.type_parameters().to_vec(),
-                    );
+                    let mut outer_and_own_type_parameters =
+                        self.append_type_parameters(outer_type_parameters, node.type_parameters());
                     let mut this_type = TypeId::NIL;
                     if include_this_types
                         && (kind == SyntaxKind::ClassDeclaration
@@ -1006,7 +1004,7 @@ impl Checker {
                 ],
             ) || is_type_alias(node)
             {
-                types = self.append_type_parameters(types, &node.type_parameters().to_vec());
+                types = self.append_type_parameters(types, node.type_parameters());
             }
         }
         types
@@ -1019,10 +1017,10 @@ impl Checker {
     pub fn append_type_parameters(
         &mut self,
         type_parameters: Vec<TypeId>,
-        declarations: &[Node],
+        declarations: NodeSlice,
     ) -> Vec<TypeId> {
         let mut type_parameters = type_parameters;
-        for &declaration in declarations {
+        for declaration in declarations {
             let symbol = self.get_symbol_of_declaration(declaration);
             let tp = self.get_declared_type_of_type_parameter(symbol);
             // Go: core.AppendIfUnique
@@ -1111,7 +1109,7 @@ impl Checker {
             let mut member_type_list = Vec::new();
             for &declaration in self.sym(symbol).declarations.clone().iter() {
                 if declaration.kind() == SyntaxKind::EnumDeclaration {
-                    for member in declaration.members().to_vec() {
+                    for member in declaration.members() {
                         if !has_dynamic_name(member) {
                             let member_symbol = self.get_symbol_of_declaration(member);
                             let value = self.get_enum_member_value(member).value;
@@ -1190,7 +1188,7 @@ impl Checker {
             node_links.flags |= NodeCheckFlags::ENUM_VALUES_COMPUTED;
             let mut auto_value: Option<Number> = Some(Number::new(0.0));
             let mut previous = Node::NIL;
-            for member in node.members().to_vec() {
+            for member in node.members() {
                 let result = self.compute_enum_member_value(member, auto_value, previous);
                 let number_value = match &result.value {
                     Some(LiteralValue::Number(value)) => Some(*value),
@@ -1517,7 +1515,7 @@ impl Checker {
                 resolved_type = self.empty_object_type;
             } else if !(node.kind() == SyntaxKind::TupleType && {
                 let mut some = false;
-                for e in node.elements().to_vec() {
+                for e in node.elements() {
                     if self.is_variadic_tuple_element(e) {
                         some = true;
                         break;
@@ -1541,7 +1539,7 @@ impl Checker {
                     vec![self.get_type_from_type_node(node.element_type())]
                 } else {
                     let mut types = Vec::new();
-                    for e in node.elements().to_vec() {
+                    for e in node.elements() {
                         types.push(self.get_type_from_type_node(e));
                     }
                     types

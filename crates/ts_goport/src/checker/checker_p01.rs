@@ -1026,6 +1026,12 @@ pub struct Checker {
     pub type_to_string_nodebuilder: Option<Rc<RefCell<NodeBuilder>>>,
     /// PORT: not in Go. Reusable buffers of `get_named_members`.
     pub(crate) named_members_scratch: crate::checker::checker_p24::NamedMembersScratch,
+    /// PERF: not in Go. See `MatchingReferenceMemo`.
+    pub(crate) matching_reference_memo: crate::checker::flow_p2::MatchingReferenceMemo,
+    /// PERF: not in Go. Counts the merges (`merge_symbol` and
+    /// `record_merged_symbol`), so a memo of a merged symbol or of the flags
+    /// a merge adds knows when to read them again.
+    pub(crate) merge_version: u64,
 
     // Arenas (PORTING.md "Checker data"). Index 0 of each is a dummy entry
     // so handle value 0 stays nil.
@@ -1483,6 +1489,8 @@ impl Checker {
             deferred_diagnostic_callbacks: Vec::new(),
             type_to_string_nodebuilder: None,
             named_members_scratch: Default::default(),
+            matching_reference_memo: Default::default(),
+            merge_version: 0,
             symbols: bound_symbols,
             types: ChunkedArena::with_nil(Type::default()),
             signatures: vec![Signature::default()],
