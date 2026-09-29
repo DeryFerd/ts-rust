@@ -868,28 +868,6 @@ pub(crate) struct VersionStore {
 }
 
 impl VersionStore {
-    /// Frees up to `max` of the owned nodes and pending lists of a dead
-    /// version (`ast::free_dead_file_versions`, lsshells M3g), last first.
-    /// True when none is left. Nothing reads a dead version.
-    pub(crate) fn free_owned_nodes(&mut self, max: usize) -> bool {
-        let Some(owned) = self.store.owned.as_deref_mut() else {
-            return true;
-        };
-        if !owned.pending.is_empty() {
-            owned
-                .pending
-                .truncate(owned.pending.len().saturating_sub(max));
-            return false;
-        }
-        // A flat table that another holder shares is freed with the last
-        // one.
-        let Some(flat) = Arc::get_mut(&mut owned.flat) else {
-            return true;
-        };
-        flat.truncate(flat.len().saturating_sub(max));
-        flat.is_empty()
-    }
-
     /// The `GoFile` of the version.
     #[inline]
     pub(crate) fn go_file(&self) -> &GoFile {
