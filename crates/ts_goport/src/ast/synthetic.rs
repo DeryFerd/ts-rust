@@ -722,13 +722,13 @@ fn synthetic_ast_node(n: Node) -> HeldNode {
     })
 }
 
-/// The ts_ast node of a parsed node (store or legacy), or `None` for a
-/// synthetic node. Go dereferences the pointer, so nil panics.
+/// The ts_ast node of a parsed (store) node, or `None` for a synthetic
+/// node. Go dereferences the pointer, so nil panics.
 // In a one-program process almost every read after the publish is a tier 0
 // store node, so only that path is inlined into callers. The synthetic file
 // index is never a store id, so checking the store tables first gives the
 // same result as the order that `static_ast_node_slow` keeps (synthetic,
-// store, legacy).
+// store).
 #[inline]
 #[must_use]
 pub fn static_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
@@ -740,25 +740,18 @@ pub fn static_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
 }
 
 /// `static_ast_node` for a node that is not a published store node: a
-/// synthetic node (`None`), an unpublished (built or detached) store node or
-/// a legacy node.
+/// synthetic node (`None`) or an unpublished (built or detached) store node.
+/// Panics for any other node.
 #[cold]
 #[inline(never)]
 fn static_ast_node_slow(n: Node) -> Option<&'static ts_ast::Node> {
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return None;
     }
-    if let Some(node) = try_store_ast_node(n) {
-        return Some(node);
+    match try_store_ast_node(n) {
+        Some(node) => Some(node),
+        None => panic!("node {n:?} is not synthetic and has no store"),
     }
-    Some(
-        crate::ast::go_file(n.file_index())
-            .legacy_source()
-            .parse
-            .arena
-            .get(n.node_id())
-            .expect("node is not in its file arena"),
-    )
 }
 
 /// The ts_ast data of parsed node `n`, for code that reads parsed nodes
@@ -1653,7 +1646,6 @@ mod tests {
         std::thread::spawn(|| {
             let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
                 id: next_program_id(),
-                program: None,
                 source_file_order: Vec::new(),
                 options: CompilerOptions::default(),
                 bound_symbols: std::sync::OnceLock::new(),

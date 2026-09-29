@@ -6,7 +6,7 @@ use crate::prelude::*;
 
 use crate::frontend::vfs::osvfs_fs;
 
-use super::deps::{self, OutputPathsHost};
+use super::deps::OutputPathsHost;
 use super::packagejson::{self, InfoCacheEntry, PackageJson};
 use super::symlinks::KnownSymlinks;
 use super::tspath;
@@ -162,50 +162,6 @@ fn get_package_scope_for_path(directory: &str) -> Option<Rc<InfoCacheEntry>> {
     )
 }
 
-// Go: module/resolver.go ResolvePackageDirectory
-// PORT: the Go resolver runs a full node_modules package lookup. This walks
-// the ancestor `node_modules` directories of the containing file, tries
-// `<dep>` and then `@types/<dep>`, and uses the real path of the first
-// directory that exists. It returns `(original_path, resolved)`. Like Go,
-// `original_path` is empty when the real path is the same.
-fn resolve_package_directory(
-    package_name: &str,
-    containing_file: &str,
-) -> Option<(String, String)> {
-    let fs = osvfs_fs();
-    let containing_directory = tspath::get_directory_path(containing_file);
-    tspath::for_each_ancestor_directory_stopping_at_global_cache(
-        "",
-        &containing_directory,
-        |directory| {
-            if tspath::get_base_file_name(directory) == "node_modules" {
-                return (None, false);
-            }
-            let node_modules = tspath::combine_paths(directory, &["node_modules"]);
-            let mut candidates = vec![tspath::combine_paths(&node_modules, &[package_name])];
-            if !package_name.starts_with("@types/") {
-                candidates.push(tspath::combine_paths(
-                    &node_modules,
-                    &["@types", &deps::mangle_scoped_package_name(package_name)],
-                ));
-            }
-            for candidate in candidates {
-                if fs.directory_exists(&candidate) {
-                    let candidate = tspath::normalize_path(&candidate);
-                    let real = tspath::normalize_path(&fs.realpath(&candidate));
-                    let original = if real == candidate {
-                        String::new()
-                    } else {
-                        candidate
-                    };
-                    return (Some((original, real)), true);
-                }
-            }
-            (None, false)
-        },
-    )
-}
-
 impl OutputPathsHost for ProgramHost {
     fn common_source_directory(&self) -> String {
         crate::program::common_source_directory().to_string()
@@ -226,90 +182,8 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
         if let Some(cached) = with_program_caches(|c| c.known_symlinks.clone()) {
             return Some(cached);
         }
-        if let Some(go) = crate::program::get_go_symlink_cache() {
-            let known_symlinks = Rc::new((*go).clone());
-            with_program_caches(|c| c.known_symlinks = Some(known_symlinks.clone()));
-            return Some(known_symlinks);
-        }
-        // PORT: the rest is the legacy loader only. It approximates Go with
-        // the data that loader keeps.
-        let cwd = crate::program::get_current_directory();
-        let case = crate::program::use_case_sensitive_file_names();
-        let mut known_symlinks = KnownSymlinks::new(cwd, case);
-
-        // Resolved modules store realpath information when they're resolved inside node_modules
-        // PORT: type reference directive resolutions are not kept by the
-        // program in this crate.
-        for resolutions in crate::program::get_resolved_modules().values() {
-            for resolution in resolutions.values() {
-                known_symlinks
-                    .process_resolution(&resolution.original_path, &resolution.resolved_file_name);
-            }
-        }
-
-        // Check other dependencies for symlinks
-        let mut seen_package_jsons: FxHashSet<tspath::Path> = FxHashSet::default();
-        for file in crate::program::source_files() {
-            let meta = crate::program::get_source_file_meta_data(&source_file_info(file).path);
-            if meta.package_json_directory.is_empty()
-                || !crate::program::source_file_may_be_emitted(file, false)
-                || !seen_package_jsons.insert(tspath::to_path(
-                    &meta.package_json_directory,
-                    cwd,
-                    case,
-                ))
-            {
-                continue;
-            }
-            let package_json_name =
-                tspath::combine_paths(&meta.package_json_directory, &["package.json"]);
-            let Some(contents) = self
-                .get_package_json_info(&package_json_name)
-                .and_then(|info| {
-                    info.get_contents()
-                        .map(|c| c.fields.get_runtime_dependency_names())
-                })
-            else {
-                continue;
-            };
-
-            for dep in contents {
-                // Skip work in common case: we already saved a symlink for this package directory
-                // in the node_modules adjacent to this package.json
-                let possible_directory_path = tspath::to_path(
-                    &tspath::combine_paths(&meta.package_json_directory, &["node_modules", &dep]),
-                    cwd,
-                    case,
-                );
-                if known_symlinks.has_directory(&possible_directory_path) {
-                    continue;
-                }
-                if !dep.starts_with("@types") {
-                    let types_name = format!("@types/{}", deps::mangle_scoped_package_name(&dep));
-                    let possible_types_directory_path = tspath::to_path(
-                        &tspath::combine_paths(
-                            &meta.package_json_directory,
-                            &["node_modules", &types_name],
-                        ),
-                        cwd,
-                        case,
-                    );
-                    if known_symlinks.has_directory(&possible_types_directory_path) {
-                        continue;
-                    }
-                }
-
-                if let Some((original_path, resolved)) =
-                    resolve_package_directory(&dep, &package_json_name)
-                {
-                    known_symlinks.process_resolution(
-                        &tspath::combine_paths(&original_path, &["package.json"]),
-                        &tspath::combine_paths(&resolved, &["package.json"]),
-                    );
-                }
-            }
-        }
-        let known_symlinks = Rc::new(known_symlinks);
+        let go = crate::program::get_go_symlink_cache()?;
+        let known_symlinks = Rc::new((*go).clone());
         with_program_caches(|c| c.known_symlinks = Some(known_symlinks.clone()));
         Some(known_symlinks)
     }

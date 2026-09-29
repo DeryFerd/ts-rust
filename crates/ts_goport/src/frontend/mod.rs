@@ -1,6 +1,5 @@
 //! Go frontend port: scanner, parser, tspath, vfs, tsoptions, module
-//! resolution and the program loader. Selected with `GOPORT_FRONTEND=go`
-//! (see `program.rs`). The legacy frontend stays the default.
+//! resolution and the program loader.
 //!
 //! The modules that come from `goport_util` below are declared in
 //! `src/goport_util_root.rs`.
