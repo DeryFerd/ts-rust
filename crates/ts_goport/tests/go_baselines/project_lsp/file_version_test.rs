@@ -27,6 +27,8 @@ use super::projecttestutil::{FileMap, files, wrapped_map_fs};
 use super::util::*;
 
 const CONFIG: &str = "/home/projects/TS/p1/tsconfig.json";
+/// Owned nodes on (lsshells M3c, off by default) for a child test.
+const OWNED_NODES: &[(&str, &str)] = &[("GOPORT_OWNED_NODES", "1")];
 const INDEX_URI: &str = "file:///home/projects/TS/p1/index.ts";
 const INDEX_FILE: &str = "/home/projects/TS/p1/index.ts";
 const INDEX_TEXT: &str = "import { a } from './a';\nexport const x = a + 1;";
@@ -116,10 +118,11 @@ child_test! {
 }
 
 child_test! {
+    env OWNED_NODES;
     // The astdata nodes of each edited version belong to its store
-    // (lsshells M3c): a new version adds its nodes and a dead version frees
-    // them, so the count does not grow with the edits. The first version
-    // of each file is a static parse and owns none.
+    // (lsshells M3c, `GOPORT_OWNED_NODES=1`): a new version adds its nodes
+    // and a dead version frees them, so the count does not grow with the
+    // edits. The first version of each file is a static parse and owns none.
     fn edited_file_nodes_die_with_their_version() {
         let session = open_p1();
         assert_eq!(owned_node_count(), 0, "a first version is a static parse");
@@ -197,13 +200,14 @@ fn panic_message(read: impl FnOnce()) -> Option<String> {
 }
 
 child_test! {
+    env OWNED_NODES;
     // A freeable version keeps no parse: its `GoFile` owns copies of the
     // parse diagnostics and the JSDoc cache, and its JSDoc slice reads the
     // cache at each use. When the version dies they go with it, and a read
     // of its store, its `GoFile` or its node data panics (a stale read never
     // reads other data). Its header columns are leaked in its node shell
     // (lsshells M3 repair), so a stale header read gives the data of that
-    // node; its node data and lists are freed with it (M3c).
+    // node; with owned nodes (M3c) its node data and lists are freed with it.
     fn freeable_version_owns_its_lists_and_a_stale_read_panics() {
         let session = bare_session(files(&[
             (
@@ -333,9 +337,10 @@ const TWIN_FILE: &str = "/home/projects/TS/p1/twin.ts";
 const EDITED_TEXT: &str = "import { a } from './a';\nexport const x = a + 2;";
 
 child_test! {
+    env OWNED_NODES;
     // Twin files: twin.ts has the text of index.ts after an edit, so its
-    // static first version and the freeable edited version of index.ts are
-    // twin parses. Every accessor gives the same answer on both: node
+    // static first version and the freeable edited version of index.ts
+    // (with owned nodes, M3c) are twin parses. Every accessor gives the same answer on both: node
     // columns, binder data, file info, line map, name table, declaration
     // map, imports and diagnostics.
     fn twin_parses_answer_the_same() {
@@ -463,15 +468,16 @@ fn flag_off_keeps_every_file_version_static() {
     );
 }
 
-/// `GOPORT_OWNED_NODES=0` in a session: an edited version is freeable (its
-/// store and `GoFile` go with it), but its parse is static, as before
-/// lsshells M3c: no store owns astdata nodes, and the node data of a dead
-/// version still reads, from its node shell.
+/// Owned nodes off (the default; `GOPORT_OWNED_NODES` unset) in a session:
+/// an edited version is freeable (its store and `GoFile` go with it), but
+/// its parse is static, as before lsshells M3c: no store owns astdata
+/// nodes, and the node data of a dead version still reads, from its node
+/// shell.
 #[test]
 fn owned_nodes_off_keeps_node_data_leaked() {
     let path = concat!(module_path!(), "::owned_nodes_off_keeps_node_data_leaked");
     let test = path.split_once("::").map_or(path, |(_, rest)| rest);
-    crate::support::child::run_test_in_child_with_env(test, &[("GOPORT_OWNED_NODES", "0")], || {
+    crate::support::child::run_test_in_child(test, || {
         crate::project_lsp::projecttestutil::install_fs_override();
         let session = open_p1();
         body_edit(&session, 2, "2");

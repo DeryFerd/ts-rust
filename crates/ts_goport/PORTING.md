@@ -350,13 +350,15 @@ The batch that adds it is not accepted until Theo approves.
   in its node shell, the tier 1 publish of its id, so a header or child
   read of the edited file stays inline (a pinned read per node read made
   edits 3 to 4 ms slower); the child link column is dropped, and the
-  binder's child walk reads the node data. Its parse was a freeable parse
-  (`enter_freeable_parse`, opened by the parse cache, M3c), so its store
+  binder's child walk reads the node data. With `GOPORT_OWNED_NODES=1` its
+  parse was a freeable parse (`enter_freeable_parse`, opened by the parse
+  cache, M3c), so its store
   owns its astdata nodes, pending lists, JSDoc cache and parse diagnostics
   (`OwnedAst`), and they are freed with the version; its node data reads
   are pinned reads, and its lists are `StoreList` handles. A prefetched
-  parse keeps its nodes leaked (its node column is in the shell), and
-  `GOPORT_OWNED_NODES=0` makes every parse do so, as before M3c. Its
+  parse keeps its nodes leaked (its node column is in the shell), and so
+  does every parse by default (owned nodes off: each pinned node data read
+  made edits 0.9 to 1.6 ms slower), as before M3c. Its
   `SourceFileInfo` owns copies of
   the parse lists (`KeptData::Owned`), so the publish keeps no parse, and
   its name table, position map and declaration map are fields of the

@@ -23,8 +23,10 @@
 //! modifier bits, children, resolved) are leaked in its node shell, the
 //! tier 1 publish of its id, so the header and child reads stay inline
 //! (`ast::store::node_shell`); the child link column is dropped.
-//! M3c: its parse was a freeable parse (`ast::enter_freeable_parse`), so
-//! its store owns its astdata nodes (node structs and data boxes), its
+//! M3c (with `GOPORT_OWNED_NODES=1`; off by default, see
+//! `owned_nodes_enabled`): its parse was a freeable parse
+//! (`ast::enter_freeable_parse`), so its store owns its astdata nodes (node
+//! structs and data boxes), its
 //! pending lists and its parse lists (`ast::store::OwnedAst`), and they go
 //! with the version. The node shell has no node column: a node data read
 //! of the file is a scoped read of the pinned version

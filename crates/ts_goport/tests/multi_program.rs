@@ -101,8 +101,13 @@ fn programs_after_an_unrelated_program() {
 }
 
 /// lsshells M3b. `GOPORT_FREE_FILE_VERSIONS=1` turns freeing on in
-/// `goport_multiprog` (a CLI process, where it is off by default).
-const FREE_FILE_VERSIONS: &[(&str, &str)] = &[("GOPORT_FREE_FILE_VERSIONS", "1")];
+/// `goport_multiprog` (a CLI process, where it is off by default), and
+/// `GOPORT_OWNED_NODES=1` makes the parse of each freed version own its
+/// nodes (M3c, off by default), so the checker reads them in scopes.
+const FREE_FILE_VERSIONS: &[(&str, &str)] = &[
+    ("GOPORT_FREE_FILE_VERSIONS", "1"),
+    ("GOPORT_OWNED_NODES", "1"),
+];
 
 /// lsshells M3b: with freeing on, each new parse of B is a freeable file
 /// version (its store and `GoFile` belong to the version, not to a leaked
