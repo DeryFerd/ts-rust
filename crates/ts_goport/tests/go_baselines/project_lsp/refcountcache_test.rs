@@ -62,7 +62,7 @@ fn parse_cache_files() -> FileMap {
     files(&[(MAIN, "const x = 1;"), (UTILS, "export function util() {}")])
 }
 
-fn inferred_program(session: &Session) -> &'static ts_goport::frontend::compiler::NewProgram {
+fn inferred_program(session: &Session) -> Rc<ts_goport::frontend::compiler::NewProgram> {
     session
         .snapshot()
         .project_collection
@@ -70,6 +70,7 @@ fn inferred_program(session: &Session) -> &'static ts_goport::frontend::compiler
         .expect("inferred project")
         .borrow()
         .program
+        .clone()
         .expect("inferred program")
 }
 
@@ -294,7 +295,7 @@ child_test! {
         open(&session, ENTRY_URI, entry_text);
 
         // The upper-cased name is recorded as a duplicate, and it should appear exactly once.
-        let program = language_service(&session, ENTRY_URI).get_program();
+        let program = Rc::clone(&language_service(&session, ENTRY_URI).program);
         let dup_keys: Vec<ParseCacheKey> = program
             .duplicate_source_files()
             .iter()
@@ -316,7 +317,7 @@ child_test! {
             2,
             "import { dep } from \"./sub/dep\";\nimport \"./a\";\nimport \"./b\";\nimport \"./c\";\nexport const e = dep;",
         );
-        let rebuilt_program = language_service(&session, ENTRY_URI).get_program();
+        let rebuilt_program = Rc::clone(&language_service(&session, ENTRY_URI).program);
         session.wait_for_background_tasks();
 
         // Every parse-cache key referenced by the live program must still exist.
@@ -478,7 +479,7 @@ child_test! {
         let project = clone.get_default_project(&u).expect("default project");
         assert_eq!(project.borrow().program_last_update, clone.id);
 
-        let main = project.borrow().program.expect("program").get_source_file(MAIN).unwrap();
+        let main = project.borrow().program.as_ref().expect("program").get_source_file(MAIN).unwrap();
         let main_key = key(&main);
         let main_entry = load(&session, &main_key).expect("main entry");
         assert_eq!(ref_count(&main_entry), 1);

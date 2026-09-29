@@ -97,7 +97,7 @@ impl SnapshotData {
     pub fn get_program(
         &self,
         project_handle: &ProjectID,
-    ) -> Result<&'static compiler::NewProgram, GoError> {
+    ) -> Result<Rc<compiler::NewProgram>, GoError> {
         let proj = self.get_project(project_handle)?;
 
         let program = proj.borrow().get_program();
@@ -717,7 +717,7 @@ pub fn snapshot_handle(snapshot: &project::Snapshot) -> SnapshotID {
 // PORT: Go `done func()` is the `Release` guard; it runs when the setup drops.
 pub struct CheckerSetup {
     pub sd: Rc<SnapshotData>,
-    pub program: &'static compiler::NewProgram,
+    pub program: Rc<compiler::NewProgram>,
     pub checker: Rc<RefCell<Checker>>,
     pub done: ls_program::Release,
     pub project_id: ProjectID,
@@ -826,7 +826,7 @@ impl Session {
         let program = sd.get_program(project_handle)?;
 
         let (c, done) = ls_program::get_type_checker(
-            program,
+            &program,
             &core_context::with_checker_lifetime(ctx, CheckerLifetime::API),
         );
         Ok(CheckerSetup {
@@ -853,7 +853,7 @@ impl Session {
     pub fn setup_language_service(
         &self,
         sd: &SnapshotData,
-        program: &'static compiler::NewProgram,
+        program: Rc<compiler::NewProgram>,
         project_handle: &ProjectID,
         active_file: &str,
     ) -> Result<ls::LanguageService, GoError> {
@@ -1626,7 +1626,7 @@ impl Session {
     ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let program = sd.get_program(&params.project)?;
+        let program = &sd.get_program(&params.project)?;
         // The encoder reads lazy JSDoc (file header, "Current program").
         let _program = ls_program::enter(program);
 
@@ -1669,7 +1669,7 @@ impl Session {
     ) -> Result<Vec<String>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let program = sd.get_program(&params.project)?;
+        let program = &sd.get_program(&params.project)?;
 
         let source_files = program.get_source_files();
         let mut result = Vec::with_capacity(source_files.len());
@@ -1689,7 +1689,7 @@ impl Session {
     ) -> Result<Option<SourceFileMetadata>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let program = sd.get_program(&params.project)?;
+        let program = &sd.get_program(&params.project)?;
 
         let Some(source_file) = program.get_source_file(&params.file.to_file_name()) else {
             return Ok(None);
@@ -1807,7 +1807,7 @@ impl Session {
 
         let node = setup
             .sd
-            .resolve_node_handle(setup.program, &params.location)?;
+            .resolve_node_handle(&setup.program, &params.location)?;
         if node.is_nil() {
             return Ok(None);
         }
@@ -1835,7 +1835,7 @@ impl Session {
         let mut results: Vec<Option<SymbolResponse>> =
             (0..params.locations.len()).map(|_| None).collect();
         for (i, loc) in params.locations.iter().enumerate() {
-            let node = setup.sd.resolve_node_handle(setup.program, loc)?;
+            let node = setup.sd.resolve_node_handle(&setup.program, loc)?;
             if node.is_nil() {
                 continue;
             }
@@ -1946,7 +1946,7 @@ impl Session {
         if !params.location.0.is_empty() {
             location = setup
                 .sd
-                .resolve_node_handle(setup.program, &params.location)?;
+                .resolve_node_handle(&setup.program, &params.location)?;
         } else if let (Some(file), Some(position)) = (&params.file, params.position) {
             let source_file = setup
                 .program
@@ -2016,7 +2016,7 @@ impl Session {
 
         let node = setup
             .sd
-            .resolve_node_handle(setup.program, &params.location)?;
+            .resolve_node_handle(&setup.program, &params.location)?;
         if node.is_nil() {
             return Ok(None);
         }
@@ -2039,7 +2039,7 @@ impl Session {
 
         let node = setup
             .sd
-            .resolve_node_handle(setup.program, &params.location)?;
+            .resolve_node_handle(&setup.program, &params.location)?;
         if node.is_nil() {
             return Ok(None);
         }
@@ -2064,7 +2064,7 @@ impl Session {
         let mut results: Vec<Option<TypeResponse>> =
             (0..params.locations.len()).map(|_| None).collect();
         for (i, loc) in params.locations.iter().enumerate() {
-            let node = setup.sd.resolve_node_handle(setup.program, loc)?;
+            let node = setup.sd.resolve_node_handle(&setup.program, loc)?;
             if node.is_nil() {
                 continue;
             }

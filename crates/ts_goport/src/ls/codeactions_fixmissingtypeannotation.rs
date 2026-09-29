@@ -291,7 +291,7 @@ fn try_code_action(
 // isolatedDeclarationsFixer encapsulates the state for fixing isolated declarations errors.
 struct IsolatedDeclarationsFixer<'a> {
     source_file: Node,
-    program: &'static compiler::NewProgram,
+    program: &'a compiler::NewProgram,
     checker: &'a mut Checker,
     change_tracker: &'a mut change::Tracker,
     import_adder: Option<&'a mut (dyn autoimport::ImportAdder + 'static)>,

@@ -178,7 +178,7 @@ fn outside_node_modules_changes(file_events: Vec<lsproto::FileEvent>, expect_con
             "Config should have been reloaded for changes outside node_modules"
         );
         assert!(
-            has_file(p, "/project/src/rootFile.ts"),
+            has_file(&p, "/project/src/rootFile.ts"),
             "New root file should be present"
         );
     } else {
@@ -188,7 +188,7 @@ fn outside_node_modules_changes(file_events: Vec<lsproto::FileEvent>, expect_con
             "Config should not have been reloaded for changes outside node_modules"
         );
         assert!(
-            !has_file(p, "/project/src/rootFile.ts"),
+            !has_file(&p, "/project/src/rootFile.ts"),
             "New root file should not be present"
         );
     }

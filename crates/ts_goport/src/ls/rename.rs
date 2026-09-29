@@ -1,6 +1,6 @@
 //! Port of Go `ls/rename.go`.
 //!
-//! PORT: Go `*compiler.Program` is `&'static compiler::NewProgram`. A Go
+//! PORT: Go `*compiler.Program` is `&compiler::NewProgram`. A Go
 //! checker lease `ch, done := program.GetTypeChecker(ctx)` is
 //! `ls_program::get_type_checker`, with `done` kept alive to the end of the
 //! scope (Go `defer done()`).
@@ -164,7 +164,7 @@ impl<P: ProgramView> LanguageService<P> {
         new_name: &str,
         node: Node,
         source_file: Node,
-        program: P,
+        program: &P,
     ) -> (RenameInfo, bool) {
         // Go: `defer done()`; `_done` releases the lease at the end of the scope.
         let (checker, _done) = program.get_type_checker(ctx);
@@ -276,7 +276,7 @@ impl<P: ProgramView> LanguageService<P> {
         node: Node,
         symbol: SymbolId,
         ch: &mut Checker,
-        program: P,
+        program: &P,
     ) -> Option<&'static Message> {
         for &declaration in ch.sym(symbol).declarations.iter() {
             if is_defined_in_library_file(program, declaration) {
@@ -308,7 +308,7 @@ impl<P: ProgramView> LanguageService<P> {
 
 // Go: ls/rename.go:181 isDefinedInLibraryFile
 // isDefinedInLibraryFile checks if a declaration is from a default library file (e.g., lib.d.ts).
-pub fn is_defined_in_library_file<P: ProgramView>(program: P, declaration: Node) -> bool {
+pub fn is_defined_in_library_file<P: ProgramView>(program: &P, declaration: Node) -> bool {
     let decl_source_file = get_source_file_of_node(declaration);
     program.is_source_file_default_library(&tspath::Path(
         source_file_info(decl_source_file).path.clone(),

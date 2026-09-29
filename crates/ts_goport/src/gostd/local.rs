@@ -21,11 +21,20 @@
 //! it does not delay a request that has arrived. `run_pending` does not run
 //! it.
 //!
-//! The queues are per thread: `go`, `go_idle`, `after_func`, `run_pending`
-//! and `run_idle` act on the calling thread's queues.
+//! Garbage (`drop_later`) is a third queue, for large frees that Go's
+//! garbage collector does in the background (a released program, the
+//! parse tasks of a load). On a thread whose dispatch loop called
+//! `keep_garbage`, the values wait until the loop calls `drop_garbage`
+//! after a message, so the free is not in the answer time. On other
+//! threads `drop_later` drops at once.
+//!
+//! The queues are per thread: `go`, `go_idle`, `after_func`, `run_pending`,
+//! `run_idle`, `drop_later` and `drop_garbage` act on the calling thread's
+//! queues.
 
 use crate::prelude::*;
 
+use std::any::Any;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -65,6 +74,8 @@ struct LocalState {
     timers: RefCell<FxHashMap<u64, Rc<LocalTimerInner>>>,
     /// Jobs from `go_idle`, oldest first.
     idle: RefCell<VecDeque<Box<dyn FnOnce()>>>,
+    /// Values from `drop_later`, oldest first. None until `keep_garbage`.
+    garbage: RefCell<Option<VecDeque<Box<dyn Any>>>>,
 }
 
 thread_local! {
@@ -78,6 +89,7 @@ thread_local! {
         jobs: RefCell::new(FxHashMap::default()),
         timers: RefCell::new(FxHashMap::default()),
         idle: RefCell::new(VecDeque::new()),
+        garbage: RefCell::new(None),
     };
 }
 
@@ -121,6 +133,54 @@ pub fn run_idle() -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// The most values that `drop_garbage` keeps while a message waits. More
+/// are dropped at once, so a stream of messages with no gap between them
+/// does not keep old programs.
+const GARBAGE_LIMIT: usize = 16;
+
+/// Makes `drop_later` on this thread keep its values until `drop_garbage`.
+/// The dispatch loop calls it once, before its first message.
+pub fn keep_garbage() {
+    LOCAL.with(|l| {
+        l.garbage.borrow_mut().get_or_insert_with(VecDeque::new);
+    });
+}
+
+/// Drops `value` in a later `drop_garbage` on this thread, or now when this
+/// thread did not call `keep_garbage`. No Go counterpart: Go's garbage
+/// collector frees old data in the background, never in a request.
+pub fn drop_later(value: Box<dyn Any>) {
+    let value = LOCAL.with(|l| match l.garbage.borrow_mut().as_mut() {
+        Some(garbage) => {
+            garbage.push_back(value);
+            None
+        }
+        None => Some(value),
+    });
+    drop(value);
+}
+
+/// Drops the values of `drop_later`, oldest first, until none is left or
+/// `busy()` is true (a message waits). While more than `GARBAGE_LIMIT`
+/// values wait, it drops them even when busy.
+pub fn drop_garbage(busy: impl Fn() -> bool) {
+    loop {
+        // The borrow ends before the drop: a drop can call `drop_later`.
+        let value = LOCAL.with(|l| {
+            let mut garbage = l.garbage.borrow_mut();
+            let garbage = garbage.as_mut()?;
+            if garbage.is_empty() || (garbage.len() <= GARBAGE_LIMIT && busy()) {
+                return None;
+            }
+            garbage.pop_front()
+        });
+        let Some(value) = value else {
+            return;
+        };
+        drop(value);
     }
 }
 

@@ -1002,7 +1002,7 @@ impl<P: ProgramView> LanguageService<P> {
         ctx: &Context,
         position: i32,
         node: Node,
-        program: P,
+        program: &P,
         is_rename: bool,
         implementations: bool,
     ) -> Vec<Rc<RefCell<SymbolAndEntries>>> {
@@ -1687,12 +1687,12 @@ impl<P: ProgramView> LanguageService<P> {
     // `Vec` of lists (a nil list is empty). Go returns a non-nil slice.
     pub fn merge_references(
         &self,
-        program: P,
+        program: &P,
         references_to_merge: Vec<Vec<Rc<RefCell<SymbolAndEntries>>>>,
     ) -> Vec<Rc<RefCell<SymbolAndEntries>>> {
         let mut result: Vec<Rc<RefCell<SymbolAndEntries>>> = Vec::new();
         let get_source_file_index_of_entry =
-            |program: P, entry: &Rc<RefCell<ReferenceEntry>>| -> i32 {
+            |program: &P, entry: &Rc<RefCell<ReferenceEntry>>| -> i32 {
                 let source_file = {
                     let entry = entry.borrow();
                     if entry.kind == EntryKind::RANGE {
@@ -1780,7 +1780,7 @@ impl<P: ProgramView> LanguageService<P> {
             ctx,
             position,
             node,
-            self.program,
+            &self.program,
             source_files,
             RefOptions {
                 use_: ReferenceUse::REFERENCES,
@@ -1825,7 +1825,7 @@ impl LanguageService {
         let mut decl_names: FxHashMap<Node, bool> = FxHashMap::default();
         {
             // PORT: Go reads `symbol.Declarations` directly; see the file header.
-            let (checker, _done) = ls_program::get_type_checker(self.program, ctx);
+            let (checker, _done) = ls_program::get_type_checker(&self.program, ctx);
             let checker = checker.borrow();
             for entry in &entries {
                 let entry = entry.borrow();
@@ -1888,7 +1888,7 @@ impl<P: ProgramView> LanguageService<P> {
         ctx: &Context,
         position: i32,
         mut node: Node,
-        program: P,
+        program: &P,
         source_files: &[Node],
         options: RefOptions,
     ) -> Vec<Rc<RefCell<SymbolAndEntries>>> {

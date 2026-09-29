@@ -25,27 +25,18 @@ use rustc_hash::FxHashSet;
 use std::rc::Rc;
 use ts_diagnostics::Message;
 
-/// The Go frontend program. It is not thread-safe, so only the loading
-/// thread holds it (`FRONTENDS`). The checker reads `GoSharedState`.
-pub(super) struct GoFrontendState {
-    pub(super) program: &'static NewProgram,
-}
-
 /// Thread-safe copies of the Go frontend data that checker code reads.
 /// Built once on the loading thread, before any checker exists.
 // PORT: Go shares the frontend program between checker goroutines. The
 // Rust frontend uses `Rc` and `RefCell`, so the values the checker asks for
-// are copied here instead.
+// are copied here instead. The module resolutions are the exception: the
+// frontend keeps them behind `Arc`, so they are shared.
 pub(super) struct GoSharedState {
-    /// Go `processedFiles.resolvedModules`, by file path, then by module
-    /// name. Each name holds its (mode, resolution) pairs. Shared with the
-    /// version this one was updated from when the frontend shares the map.
-    // PERF: keyed by name, not by `ModeAwareCacheKey`, so a lookup borrows
-    // the specifier text instead of copying it into an owned key. The keys
-    // and resolutions borrow the leaked frontend program instead of copying
-    // each `ResolvedModule`. Only the loading thread touches the frontend
-    // `Rc` counts; checker threads read the immutable values.
-    resolved_modules: Arc<ResolvedModules>,
+    /// Go `processedFiles.resolvedModules`: the frontend map itself, which
+    /// clones of the frontend program share too.
+    // PERF: no copy. A lookup borrows the specifier text
+    // (`ModeAwareKey`).
+    resolved_modules: Arc<FrontendResolutions>,
     /// Go `processedFiles.jsxRuntimeImportSpecifiers`, by file path.
     jsx_runtime_import_specifiers: FxHashMap<String, (String, Node)>,
     /// Go `processedFiles.importHelpersImportSpecifiers`, by file path.
@@ -64,14 +55,12 @@ pub(super) struct GoSharedState {
     /// Go `GetSourceFileFromReference` of each preserved `/// <reference
     /// path>` of a program file, by file index and reference file name.
     references: FxHashMap<(usize, String), Node>,
-    /// Go `Program.CommonSourceDirectory`.
-    common_source_directory: String,
     /// Go `processedFiles.outputFileToProjectReferenceSource`, by path.
     output_file_to_project_reference_source: FxHashMap<String, String>,
     /// Go `projectReferenceFileMapper.sourceToProjectReference`, by path.
-    source_to_project_reference: FxHashMap<String, SourceOutputAndProjectReference>,
+    source_to_project_reference: FxHashMap<String, Arc<SourceOutputAndProjectReference>>,
     /// Go `projectReferenceFileMapper.outputDtsToProjectReference`, by path.
-    output_dts_to_project_reference: FxHashMap<String, SourceOutputAndProjectReference>,
+    output_dts_to_project_reference: FxHashMap<String, Arc<SourceOutputAndProjectReference>>,
     /// Go `projectReferenceFileMapper.opts.canUseProjectReferenceSource()`.
     can_use_project_reference_source: bool,
     /// Go `GetRedirectForResolution` of each program file, by file index.
@@ -95,10 +84,8 @@ pub(super) struct GoSharedState {
 type FrontendSourceOutput = crate::frontend::tsoptions::SourceOutputAndProjectReference;
 
 /// `GoSharedState::resolved_modules`.
-type ResolvedModules = FxHashMap<
-    &'static str,
-    FxHashMap<&'static str, Vec<(ResolutionMode, &'static ResolvedModule)>>,
->;
+type FrontendResolutions =
+    FxHashMap<GoPath, crate::frontend::module::ModeAwareCache<Arc<ResolvedModule>>>;
 
 /// Thread-safe copies of the frontend project references. Go shares one
 /// `*ParsedCommandLine` per referenced project, so each is copied once.
@@ -120,16 +107,16 @@ impl ProjectReferenceCopies {
             .clone()
     }
 
-    fn entry(&mut self, entry: &FrontendSourceOutput) -> SourceOutputAndProjectReference {
+    fn entry(&mut self, entry: &FrontendSourceOutput) -> Arc<SourceOutputAndProjectReference> {
         let parsed = entry
             .resolved
             .upgrade()
             .expect("the referenced project command line is alive");
-        SourceOutputAndProjectReference {
+        Arc::new(SourceOutputAndProjectReference {
             source: entry.source.clone(),
             output_dts: entry.output_dts.clone(),
             resolved: self.resolved(&parsed),
-        }
+        })
     }
 }
 
@@ -220,8 +207,8 @@ pub(super) fn try_load_version(
     let _scope = crate::core::enter_program(None);
     let cwd = current_directory()?;
     let opts = load_config(config_path, edit_options, &mut CompileTimes::default())?;
-    let np: &'static NewProgram = Box::leak(Box::new(new_program(opts)));
-    Ok(build_program(np, Entry::Version, cwd, None))
+    let np = Rc::new(new_program(opts));
+    Ok(build_program(&np, Entry::Version, cwd, None))
 }
 
 /// `update_program_version` (program.rs).
@@ -230,10 +217,9 @@ pub(super) fn update_program_version(
     changed_file: &str,
 ) -> (&'static GoProgram, bool) {
     let old_np = FRONTENDS
-        .with(|frontends| frontends.borrow().get(&old.id).copied())
-        .expect("the old program version has no frontend on this thread")
-        .program;
-    let cwd = old.state.get().expect("program not loaded").cwd.clone();
+        .with(|frontends| frontends.borrow().get(&old.id).cloned())
+        .expect("the old program version has no frontend on this thread");
+    let cwd = state_of(old).cwd.clone();
     // A new version parses with no current program, like the first load.
     let _scope = crate::core::enter_program(None);
     // PORT: Go watch gives `UpdateProgram` a host whose cache no longer has
@@ -253,13 +239,13 @@ pub(super) fn update_program_version(
         old_np.use_case_sensitive_file_names(),
     );
     let (np, _, reused) = old_np.update_program(&changed_path, host);
-    let np: &'static NewProgram = Box::leak(Box::new(np));
-    (build_program(np, Entry::Version, cwd, Some(old)), reused)
+    let np = Rc::new(np);
+    (build_program(&np, Entry::Version, cwd, Some(old)), reused)
 }
 
 /// `new_program_version` (program.rs).
 pub(super) fn new_program_version(
-    np: &'static NewProgram,
+    np: &Rc<NewProgram>,
     previous: Option<&'static GoProgram>,
 ) -> &'static GoProgram {
     // The files are built and published with no current program, like the
@@ -335,13 +321,8 @@ pub(super) fn resolve_js_doc_outside_program(file: Node, node: Node) -> Option<&
         .with(|inputs| inputs.borrow().get(&store).cloned())
         .or_else(|| {
             let path = GoPath(source_file_info(file).path.clone());
-            let programs: Vec<&'static NewProgram> = FRONTENDS.with(|frontends| {
-                frontends
-                    .borrow()
-                    .values()
-                    .map(|frontend| frontend.program)
-                    .collect()
-            });
+            let programs: Vec<Rc<NewProgram>> =
+                FRONTENDS.with(|frontends| frontends.borrow().values().cloned().collect());
             programs.into_iter().find_map(|program| {
                 let parsed = program
                     .get_source_file_by_path(&path)
@@ -354,6 +335,17 @@ pub(super) fn resolve_js_doc_outside_program(file: Node, node: Node) -> Option<&
             })
         })?;
     Some(parse_lazy_js_doc(&input, node))
+}
+
+// Go: compiler/program.go:122 FileExists (the Go frontend program)
+// PORT: the loading thread asks the program host (with its cache). A
+// checker worker asks its own uncached copy of the same file system.
+pub(super) fn file_exists(path: &str) -> bool {
+    let id = prog().id;
+    if let Some(go) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned()) {
+        return go.file_exists(path);
+    }
+    WORKER_FS.with(|fs| fs.file_exists(path))
 }
 
 /// The case sensitivity of the OS file system.
@@ -369,8 +361,10 @@ fn case_sensitivity() -> CaseSensitivity {
 /// (`publish_file_stores`). `parsed` holds the program files by store id.
 /// A store that is not a program file is a file that the language server
 /// parsed outside a program load (`PARSED_UNPUBLISHED`), or a config file.
+/// Each parse that gets its Go file here is kept for good (see the PERF
+/// note below).
 fn go_files_of_unpublished_stores(
-    parsed: &FxHashMap<usize, &'static ParsedSourceFile>,
+    parsed: &FxHashMap<usize, &Rc<ParsedSourceFile>>,
     cwd: &str,
     case_sensitivity: CaseSensitivity,
 ) -> Vec<GoFile> {
@@ -390,15 +384,18 @@ fn go_files_of_unpublished_stores(
             OUTSIDE_PARSE_INPUTS.with(|inputs| inputs.borrow_mut().insert(store, input));
         }
         // PERF: `program_file_info` borrows the parse. A published file is
-        // never freed, so a parse outside a program is kept for good, like
-        // the leaked frontend program keeps the parses of its files.
-        let file: Option<&'static ParsedSourceFile> = match parsed.get(&store) {
-            Some(&file) => Some(file),
-            None => outside.get(&store).map(|file| {
+        // never freed, so its parse is kept for good, whether a program or
+        // the parse cache made it. The frontend program is freed with its
+        // last holder; this keeps only the parses. A file that an earlier
+        // publish gave its Go file keeps the parse of that publish.
+        let file: Option<&'static ParsedSourceFile> = parsed
+            .get(&store)
+            .copied()
+            .or_else(|| outside.get(&store))
+            .map(|file| {
                 let kept: &'static Rc<ParsedSourceFile> = Box::leak(Box::new(Rc::clone(file)));
                 &**kept
-            }),
-        };
+            });
         let info = match file {
             Some(file) => program_file_info(store, file),
             None => other_store_info(store, cwd, case_sensitivity),
@@ -501,10 +498,12 @@ fn load_config(
 pub(super) fn install_new_program(opts: ProgramOptions) -> Result<&'static GoProgram, String> {
     let cwd = current_directory()?;
     // PERF: the program of a one-program process is never freed, so its
-    // loader state is not freed either (`with_loader_state_forgotten`).
-    let new_program: &'static NewProgram =
-        Box::leak(Box::new(with_loader_state_forgotten(|| new_program(opts))));
-    Ok(build_program(new_program, Entry::Only, cwd, None))
+    // loader state is not freed either (`with_loader_state_forgotten`). The
+    // forgotten clone keeps the program when `FRONTENDS` drops at process
+    // exit, so the exit does not free it either.
+    let new_program = Rc::new(with_loader_state_forgotten(|| new_program(opts)));
+    std::mem::forget(Rc::clone(&new_program));
+    Ok(build_program(&new_program, Entry::Only, cwd, None))
 }
 
 /// How `build_program` makes a program known.
@@ -524,7 +523,7 @@ enum Entry {
 /// updated from, if it is still loaded; the new state shares its copies of
 /// unchanged frontend data (`GoSharedState::new`).
 fn build_program(
-    np: &'static NewProgram,
+    np: &Rc<NewProgram>,
     entry: Entry,
     cwd: String,
     previous: Option<&'static GoProgram>,
@@ -533,16 +532,17 @@ fn build_program(
     let case_sensitivity = case_sensitivity();
     let options = np.options().clone();
 
-    // PERF: the program is leaked, so its files are `&'static` and each
-    // `SourceFileInfo` can borrow their fields instead of copying them.
-    // The maps are sized up front: this is serial work before the bind.
+    // PERF: the publish keeps the parse of each new file, so each
+    // `SourceFileInfo` can borrow its fields instead of copying them
+    // (`go_files_of_unpublished_stores`). The maps are sized up front: this
+    // is serial work before the bind.
     let file_count = np.source_files().len();
-    let mut parsed: FxHashMap<usize, &'static ParsedSourceFile> =
+    let mut parsed: FxHashMap<usize, &Rc<ParsedSourceFile>> =
         FxHashMap::with_capacity_and_hasher(file_count, Default::default());
     let mut source_file_order = Vec::with_capacity(file_count);
     for file in np.source_files() {
         source_file_order.push(file.store);
-        parsed.insert(file.store, &**file);
+        parsed.insert(file.store, file);
     }
 
     let files = go_files_of_unpublished_stores(&parsed, &cwd, case_sensitivity);
@@ -578,10 +578,9 @@ fn build_program(
     }
 
     let id = next_program_id();
-    let frontend: &'static GoFrontendState = Box::leak(Box::new(GoFrontendState { program: np }));
     FRONTENDS.with(|frontends| {
         assert!(
-            frontends.borrow_mut().insert(id, frontend).is_none(),
+            frontends.borrow_mut().insert(id, Rc::clone(np)).is_none(),
             "program {id} already loaded"
         );
     });
@@ -605,41 +604,81 @@ fn build_program(
         bound_symbols: OnceLock::new(),
         state: OnceLock::new(),
     }));
-    let _scope = match entry {
+    let one_program = match entry {
         Entry::Only => {
             set_prog(program);
-            None
+            true
         }
         Entry::Version => {
             register_program_version(program);
-            Some(crate::core::enter_program(Some(program)))
+            false
         }
     };
-    // With the program current, like the lazy Go reads it replaces.
+    let _scope = (!one_program).then(|| crate::core::enter_program(Some(program)));
+    // With the program current, like the lazy Go reads it replaces. The old
+    // version is still loaded, so its tables are in its slot.
     let previous = previous.and_then(|old| {
-        let old_np = FRONTENDS.with(|frontends| frontends.borrow().get(&old.id).copied())?;
-        let old_shared = old.state.get()?.go.as_ref()?;
-        Some((old_np.program, old_shared))
+        let old_np = FRONTENDS.with(|frontends| frontends.borrow().get(&old.id).cloned())?;
+        let TablesSlot::Version(slot) = &old.state.get()?.tables else {
+            return None;
+        };
+        let old_tables = slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        old_tables.go.is_some().then_some((old_np, old_tables))
     });
-    let shared = GoSharedState::new(np, &parsed, previous);
+    let shared = GoSharedState::new(
+        np,
+        &parsed,
+        previous
+            .as_ref()
+            .and_then(|(old_np, old)| Some((&**old_np, old.go.as_ref()?))),
+    );
+    drop(previous);
+    let tables = VersionTables {
+        file_meta,
+        go: Some(shared),
+        ..VersionTables::new(file_by_path)
+    };
     let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
         cwd,
         case_sensitivity,
         fs: legacy_fs,
-        file_by_path,
-        file_meta,
-        config_diagnostics: Vec::new(),
-        program_diagnostics: Vec::new(),
-        external_locations: Vec::new(),
         resolved_modules: OnceLock::new(),
-        common_source_directory: OnceLock::new(),
-        file_associations: OnceLock::new(),
-        declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
-        go: Some(shared),
+        common_source_directory: OnceLock::from(common_source_directory_of(np)),
         alias_resolver: false,
+        tables: TablesSlot::new(tables, one_program),
     }));
     assert!(program.state.set(program_state).is_ok());
     program
+}
+
+// Go: compiler/program.go:1562 CommonSourceDirectory.
+// PORT: Go computes it on first use, and `checkSourceFilesBelongToPath`
+// then adds include diagnostics. Go uses it first either in
+// `verifyCompilerOptions`, which the frontend program has already run, or
+// during emit, after the program diagnostics are reported. So the value is
+// computed when the program is built, without the check, which adds
+// nothing.
+fn common_source_directory_of(p: &NewProgram) -> String {
+    let files = &p.processed_files;
+    crate::frontend::outputpaths::get_common_source_directory(
+        p.options(),
+        || {
+            files
+                .files
+                .iter()
+                .filter(|file| {
+                    p.source_file_may_be_emitted(file, false) && !file.is_declaration_file
+                })
+                .map(|file| file.file_name().to_string())
+                .collect()
+        },
+        &p.get_current_directory(),
+        p.use_case_sensitive_file_names(),
+        None,
+    )
 }
 
 /// Go `getTraceFromSys` (tsc.go:280) with no testing hooks:
@@ -658,9 +697,9 @@ fn trace_from_sys() -> TraceFn {
 }
 
 /// `SourceFileInfo` of a program file, from the Go parser fields. The Go
-/// program fields are in `ProgramState::file_meta`.
-// PERF: the diagnostics, reparsed clones and JSDoc cache borrow the leaked
-// parsed file. The other lists stay copies: `source_file_parser_fields`
+/// program fields are in `VersionTables::file_meta`.
+// PERF: the diagnostics, reparsed clones and JSDoc cache borrow the parsed
+// file, which the publish keeps. The other lists stay copies: `source_file_parser_fields`
 // (ast/synthetic.rs) copies them out as owned lists, and the frontend
 // program still reads the parsed file.
 fn program_file_info(store: usize, file: &'static ParsedSourceFile) -> SourceFileInfo {
@@ -745,11 +784,10 @@ impl GoSharedState {
     /// is the frontend program and shared state of the version that `p` was
     /// updated from. Its copies are shared where `p` shares the frontend
     /// data they were copied from, so a new version copies only what
-    /// changed. A version is never freed, so each copy would leak once per
-    /// edit.
+    /// changed, and the versions that are alive keep one copy.
     fn new(
-        p: &'static NewProgram,
-        parsed: &FxHashMap<usize, &'static ParsedSourceFile>,
+        p: &NewProgram,
+        parsed: &FxHashMap<usize, &Rc<ParsedSourceFile>>,
         previous: Option<(&NewProgram, &GoSharedState)>,
     ) -> Self {
         let files = &p.processed_files;
@@ -757,7 +795,7 @@ impl GoSharedState {
         // references with the old program and keeps every file path, so
         // equal pointers mean equal copies.
         let same_resolutions = previous.filter(|(old, _)| {
-            Rc::ptr_eq(
+            Arc::ptr_eq(
                 &files.resolved_modules,
                 &old.processed_files.resolved_modules,
             ) && match (
@@ -768,28 +806,7 @@ impl GoSharedState {
                 (mapper, old_mapper) => mapper.is_none() && old_mapper.is_none(),
             }
         });
-        let resolved_modules = match same_resolutions {
-            Some((_, old)) => Arc::clone(&old.resolved_modules),
-            None => Arc::new(
-                files
-                    .resolved_modules
-                    .iter()
-                    .map(|(path, cache)| {
-                        let mut by_name: FxHashMap<
-                            &'static str,
-                            Vec<(ResolutionMode, &'static ResolvedModule)>,
-                        > = FxHashMap::default();
-                        for (key, resolved) in cache {
-                            by_name
-                                .entry(key.name.as_str())
-                                .or_default()
-                                .push((key.mode, &**resolved));
-                        }
-                        (path.0.as_str(), by_name)
-                    })
-                    .collect(),
-            ),
-        };
+        let resolved_modules = Arc::clone(&files.resolved_modules);
         let jsx_runtime_import_specifiers = files
             .jsx_runtime_import_specifiers
             .iter()
@@ -870,28 +887,6 @@ impl GoSharedState {
                     })
             })
             .collect();
-        // Go: compiler/program.go:1562 CommonSourceDirectory.
-        // PORT: Go computes it on first use, and `checkSourceFilesBelongToPath`
-        // then adds include diagnostics. Go uses it first either in
-        // `verifyCompilerOptions`, which the frontend program has already run,
-        // or during emit, after the program diagnostics are reported. So the
-        // value is computed here without the check, which adds nothing.
-        let common_source_directory = crate::frontend::outputpaths::get_common_source_directory(
-            p.options(),
-            || {
-                files
-                    .files
-                    .iter()
-                    .filter(|file| {
-                        p.source_file_may_be_emitted(file, false) && !file.is_declaration_file
-                    })
-                    .map(|file| file.file_name().to_string())
-                    .collect()
-            },
-            &p.get_current_directory(),
-            p.use_case_sensitive_file_names(),
-            None,
-        );
         let output_file_to_project_reference_source = files
             .output_file_to_project_reference_source
             .iter()
@@ -913,7 +908,7 @@ impl GoSharedState {
         let redirects_for_resolution = parsed
             .iter()
             .filter_map(|(&store, file)| {
-                let redirect = p.get_redirect_for_resolution(&**file)?;
+                let redirect = p.get_redirect_for_resolution(&***file)?;
                 Some((store, project_references.resolved(&redirect)))
             })
             .collect();
@@ -967,7 +962,6 @@ impl GoSharedState {
             parse_file_redirects,
             redirect_targets,
             references,
-            common_source_directory,
             output_file_to_project_reference_source,
             source_to_project_reference,
             output_dts_to_project_reference,
@@ -994,50 +988,41 @@ impl GoSharedState {
     pub(super) fn get_project_reference_from_source(
         &self,
         path: &str,
-    ) -> Option<&SourceOutputAndProjectReference> {
-        self.source_to_project_reference.get(path)
+    ) -> Option<Arc<SourceOutputAndProjectReference>> {
+        self.source_to_project_reference.get(path).cloned()
     }
 
     // Go: compiler/projectreferencefilemapper.go:68 getProjectReferenceFromOutputDts
     pub(super) fn get_project_reference_from_output_dts(
         &self,
         path: &str,
-    ) -> Option<&SourceOutputAndProjectReference> {
-        self.output_dts_to_project_reference.get(path)
+    ) -> Option<Arc<SourceOutputAndProjectReference>> {
+        self.output_dts_to_project_reference.get(path).cloned()
     }
 
     // Go: compiler/projectreferencefilemapper.go:72 isSourceFromProjectReference
     pub(super) fn is_source_from_project_reference(&self, path: &str) -> bool {
-        self.can_use_project_reference_source
-            && self.get_project_reference_from_source(path).is_some()
+        self.can_use_project_reference_source && self.source_to_project_reference.contains_key(path)
     }
 
     // Go: compiler/program.go:190 GetRedirectForResolution (for program files)
     pub(super) fn get_redirect_for_resolution(
         &self,
         file: Node,
-    ) -> Option<&ResolvedProjectReference> {
-        self.redirects_for_resolution
-            .get(&file.file_index())
-            .map(|r| &**r)
+    ) -> Option<&Arc<ResolvedProjectReference>> {
+        self.redirects_for_resolution.get(&file.file_index())
     }
 
     // Go: compiler/program.go:199 GetResolvedProjectReferences
-    pub(super) fn get_resolved_project_references(&self) -> Vec<Option<&ResolvedProjectReference>> {
-        self.resolved_project_references
-            .iter()
-            .map(|r| r.as_deref())
-            .collect()
-    }
-
-    // Go: compiler/program.go:1562 CommonSourceDirectory
-    pub(super) fn common_source_directory(&self) -> &str {
-        &self.common_source_directory
+    pub(super) fn get_resolved_project_references(
+        &self,
+    ) -> Vec<Option<Arc<ResolvedProjectReference>>> {
+        self.resolved_project_references.clone()
     }
 
     // Go: compiler/program.go:2017 GetSymlinkCache
-    pub(crate) fn known_symlinks(&self) -> &crate::modulespecifiers::symlinks::KnownSymlinks {
-        &self.known_symlinks
+    pub(crate) fn known_symlinks(&self) -> Arc<crate::modulespecifiers::symlinks::KnownSymlinks> {
+        Arc::clone(&self.known_symlinks)
     }
 
     // Go: compiler/program.go:195 GetParseFileRedirect (for resolved module
@@ -1073,17 +1058,6 @@ impl GoSharedState {
         parse_lazy_js_doc(input, node)
     }
 
-    // Go: compiler/program.go:122 FileExists
-    // PORT: the loading thread asks the program host (with its cache). A
-    // checker worker asks its own uncached copy of the same file system.
-    pub(super) fn file_exists(&self, path: &str) -> bool {
-        let id = prog().id;
-        if let Some(go) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).copied()) {
-            return go.program.file_exists(path);
-        }
-        WORKER_FS.with(|fs| fs.file_exists(path))
-    }
-
     // Go: compiler/program.go:494 GetResolvedModule
     // PERF: returns a borrow, and looks the name up as `&str`. A name has at
     // most one entry per mode, so the mode scan finds the Go map entry.
@@ -1092,14 +1066,11 @@ impl GoSharedState {
         file: Node,
         module_reference: &str,
         mode: ResolutionMode,
-    ) -> Option<&ResolvedModule> {
+    ) -> Option<&Arc<ResolvedModule>> {
         let path = source_file_info(file).path.as_str();
         self.resolved_modules
             .get(path)?
-            .get(module_reference)?
-            .iter()
-            .find(|(entry_mode, _)| *entry_mode == mode)
-            .map(|&(_, resolved)| resolved)
+            .get(&(module_reference, mode) as &dyn crate::frontend::module::ModeAwareKey)
     }
 
     // Go: compiler/program.go:516 GetResolvedModules (ranged over: every
@@ -1107,12 +1078,11 @@ impl GoSharedState {
     // PERF: borrows the version's own map, as Go returns `p.resolvedModules`
     // with no copy. The order is the map order; Go ranges over maps in a
     // random order.
-    pub(super) fn resolved_modules(&self) -> impl Iterator<Item = &'static ResolvedModule> + '_ {
+    pub(super) fn resolved_modules(&self) -> impl Iterator<Item = &ResolvedModule> + '_ {
         self.resolved_modules
             .values()
-            .flat_map(|by_name| by_name.values())
-            .flatten()
-            .map(|&(_, resolved)| resolved)
+            .flat_map(|cache| cache.values())
+            .map(|resolved| &**resolved)
     }
 
     // Go: compiler/program.go:1916 GetJSXRuntimeImportSpecifier

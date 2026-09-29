@@ -65,7 +65,7 @@ impl LanguageService {
         &self,
         ctx: &Context,
         position: i32,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         source_file: Node,
         context: Option<&lsproto::SignatureHelpContext>,
     ) -> Option<lsproto::SignatureHelp> {
@@ -312,7 +312,7 @@ impl LanguageService {
         &self,
         ctx: &Context,
         argument_info: &ArgumentListInfo,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         c: &mut Checker,
     ) -> Option<lsproto::SignatureHelp> {
         if argument_info.invocation.contextual_invocation.is_some() {

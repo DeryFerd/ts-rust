@@ -4,23 +4,24 @@ use crate::project::prelude::*;
 
 // Go: project/programcounter.go:9 programCounter
 // PORT: `mu` is dropped (one thread). Go `map[*compiler.Program]int32` is
-// keyed by the program address (PORTING "Programs and checkers"). A Go nil
-// map is an empty map.
+// keyed by the program address (PORTING "Programs and checkers"). The
+// address is not used again while its entry exists: each counted snapshot
+// holds the program's `Rc`. A Go nil map is an empty map.
 #[derive(Default)]
 pub struct ProgramCounter {
     pub refs: RefCell<FxHashMap<usize, i32>>,
 }
 
 // PORT: Go map key `*compiler.Program`.
-fn program_key(program: &'static crate::frontend::compiler::NewProgram) -> usize {
-    program as *const crate::frontend::compiler::NewProgram as usize
+fn program_key(program: &crate::frontend::compiler::NewProgram) -> usize {
+    std::ptr::from_ref(program).addr()
 }
 
 impl ProgramCounter {
     // Go: project/programcounter.go:16 Ref
     // Ref increments the reference count for a program. If the program is not
     // yet tracked, it is added with a reference count of 1.
-    pub fn ref_(&self, program: &'static crate::frontend::compiler::NewProgram) {
+    pub fn ref_(&self, program: &crate::frontend::compiler::NewProgram) {
         // Go: `if c.refs == nil { c.refs = make(...) }` (the port map always exists).
         *self
             .refs
@@ -30,7 +31,7 @@ impl ProgramCounter {
     }
 
     // Go: project/programcounter.go:25 Deref
-    pub fn deref(&self, program: &'static crate::frontend::compiler::NewProgram) -> bool {
+    pub fn deref(&self, program: &crate::frontend::compiler::NewProgram) -> bool {
         let key = program_key(program);
         let mut refs = self.refs.borrow_mut();
         let Some(&count) = refs.get(&key) else {

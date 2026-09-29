@@ -297,8 +297,8 @@ child_test! {
 
         // Verify initial state - both files should be in the project
         let p = program(&session, index_uri);
-        assert!(has_file(p, "/home/projects/TS/p1/src/index.ts"), "index.ts should be in project");
-        assert!(has_file(p, "/home/projects/TS/p1/src/x.ts"), "x.ts should be in project");
+        assert!(has_file(&p, "/home/projects/TS/p1/src/index.ts"), "index.ts should be in project");
+        assert!(has_file(&p, "/home/projects/TS/p1/src/x.ts"), "x.ts should be in project");
 
         // Step 2: In a single batch change:
         // - Delete x.ts from disk (but leave it open)
@@ -317,23 +317,23 @@ child_test! {
 
         // Step 3 & 4: Request LS for the deleted but still open file
         let p = program(&session, x_uri);
-        assert!(has_file(p, "/home/projects/TS/p1/src/index.ts"), "index.ts should still be in project");
+        assert!(has_file(&p, "/home/projects/TS/p1/src/index.ts"), "index.ts should still be in project");
         assert!(
-            has_file(p, "/home/projects/TS/p1/src/x.ts"),
+            has_file(&p, "/home/projects/TS/p1/src/x.ts"),
             "x.ts should still be in project (open overlay)"
         );
-        assert!(has_file(p, "/home/projects/TS/p1/src/y.ts"), "y.ts should be in project (new file)");
+        assert!(has_file(&p, "/home/projects/TS/p1/src/y.ts"), "y.ts should be in project (new file)");
 
         // Step 5: Close the deleted file
         close(&session, x_uri);
 
         // Step 6: On next LS request, x.ts should be excluded
         let p = program(&session, index_uri);
-        assert!(has_file(p, "/home/projects/TS/p1/src/index.ts"), "index.ts should still be in project");
+        assert!(has_file(&p, "/home/projects/TS/p1/src/index.ts"), "index.ts should still be in project");
         assert!(
-            !has_file(p, "/home/projects/TS/p1/src/x.ts"),
+            !has_file(&p, "/home/projects/TS/p1/src/x.ts"),
             "x.ts should no longer be in project (closed and deleted)"
         );
-        assert!(has_file(p, "/home/projects/TS/p1/src/y.ts"), "y.ts should still be in project");
+        assert!(has_file(&p, "/home/projects/TS/p1/src/y.ts"), "y.ts should still be in project");
     }
 }

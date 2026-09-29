@@ -17,12 +17,12 @@ fn file_text(files: &FileMap, name: &str) -> String {
 /// The one project of the session, which must be configured.
 fn only_configured_program(
     session: &std::rc::Rc<ts_goport::project::Session>,
-) -> &'static ts_goport::frontend::compiler::NewProgram {
+) -> std::rc::Rc<ts_goport::frontend::compiler::NewProgram> {
     let projects = session.snapshot().project_collection.projects();
     assert_eq!(projects.len(), 1);
     let p = projects[0].borrow();
     assert_eq!(p.kind, Kind::CONFIGURED);
-    p.program.expect("program")
+    p.program.clone().expect("program")
 }
 
 child_test! {
@@ -157,6 +157,7 @@ child_test! {
         let program_before = session.snapshot().project_collection.projects()[0]
             .borrow()
             .program
+            .clone()
             .expect("program");
 
         utils
@@ -170,8 +171,9 @@ child_test! {
         let program_after = session.snapshot().project_collection.projects()[0]
             .borrow()
             .program
+            .clone()
             .expect("program");
-        assert!(!same_program(program_after, program_before));
+        assert!(!same_program(&program_after, &program_before));
     }
 }
 

@@ -45,7 +45,7 @@ pub(crate) fn new_program(
     cwd: &str,
     file_names: &[&str],
     options: CompilerOptions,
-) -> &'static NewProgram {
+) -> Rc<NewProgram> {
     let config = ParsedCommandLine {
         parsed_config: ParsedOptions {
             compiler_options: Rc::new(options),
@@ -62,7 +62,7 @@ pub(crate) fn new_program_with_config(
     fs: Rc<dyn Fs>,
     cwd: &str,
     config: Rc<ParsedCommandLine>,
-) -> &'static NewProgram {
+) -> Rc<NewProgram> {
     let host = new_compiler_host(cwd, bundled::wrap_fs(fs), &bundled::lib_path(), None, None);
     ls_program::new_program(
         ProgramOptions {
@@ -78,7 +78,7 @@ pub(crate) fn new_program_with_config(
 }
 
 /// Go `p.GetSourceFile(fileName)`.
-pub(crate) fn source_file(p: &'static NewProgram, file_name: &str) -> Rc<ParsedSourceFile> {
+pub(crate) fn source_file(p: &NewProgram, file_name: &str) -> Rc<ParsedSourceFile> {
     p.get_source_file(file_name)
         .unwrap_or_else(|| panic!("program has no file {file_name}"))
 }

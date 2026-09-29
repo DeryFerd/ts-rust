@@ -1805,7 +1805,7 @@ pub fn to_context_range(
 /// its parser fields.
 // PORT: `NewProgram` methods take the program's `ParsedSourceFile`; the file
 // root `Node` maps to the program file with the same path.
-fn parsed_source_file(program: &'static compiler::NewProgram, file: Node) -> Rc<ParsedSourceFile> {
+fn parsed_source_file(program: &compiler::NewProgram, file: Node) -> Rc<ParsedSourceFile> {
     program
         .get_source_file_by_path(&tspath::Path(source_file_info(file).path.clone()))
         .expect("source file is not in the program")
@@ -1816,7 +1816,7 @@ fn parsed_source_file(program: &'static compiler::NewProgram, file: Node) -> Rc<
 pub fn get_reference_at_position(
     source_file: Node,
     position: i32,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
 ) -> Option<RefInfo> {
     let info = source_file_info(source_file);
     if let Some(reference_path) = find_reference_in_position(&info.referenced_files, position) {

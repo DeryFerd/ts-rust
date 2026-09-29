@@ -89,7 +89,7 @@ impl Semaphore {
 // by the file root `Node` (Go `*ast.SourceFile`).
 pub struct CheckerPool {
     pub opts: CheckerPoolOptions,
-    pub program: &'static compiler::NewProgram,
+    pub program: Rc<compiler::NewProgram>,
 
     // discarded is set when the pool's program has been replaced. The pool
     // remains fully functional but stops its idle-cleanup timer so that
@@ -141,7 +141,7 @@ pub struct CheckerPool {
 // PORT: Go `log func(msg string)` (nil-able) is `Option<Rc<dyn Fn(&str)>>`.
 pub fn new_checker_pool(
     opts: CheckerPoolOptions,
-    program: &'static compiler::NewProgram,
+    program: Rc<compiler::NewProgram>,
     log: Option<Rc<dyn Fn(&str)>>,
 ) -> Rc<CheckerPool> {
     let mut opts = opts;
@@ -339,7 +339,7 @@ impl CheckerPool {
         let missing = self.checkers.borrow()[DIAG_INDEX as usize].is_none();
         if missing {
             (self.log)("checkerpool: Creating diagnostics checker");
-            let c = Rc::new(RefCell::new(ls_program::new_checker(self.program)));
+            let c = Rc::new(RefCell::new(ls_program::new_checker(&self.program)));
             self.checkers.borrow_mut()[DIAG_INDEX as usize] = Some(c);
         }
 
@@ -454,7 +454,7 @@ impl CheckerPool {
             let empty = self.checkers.borrow()[i].is_none();
             if empty {
                 (self.log)(&format!("checkerpool: Creating query checker {i}"));
-                let c = Rc::new(RefCell::new(ls_program::new_checker(self.program)));
+                let c = Rc::new(RefCell::new(ls_program::new_checker(&self.program)));
                 self.checkers.borrow_mut()[i] = Some(c.clone());
                 return (c, i as i32);
             }
@@ -470,7 +470,7 @@ impl CheckerPool {
         let missing = self.persistent_checker.borrow().is_none();
         if missing {
             (self.log)("checkerpool: Creating persistent checker");
-            let c = Rc::new(RefCell::new(ls_program::new_checker(self.program)));
+            let c = Rc::new(RefCell::new(ls_program::new_checker(&self.program)));
             *self.persistent_checker.borrow_mut() = Some(c);
         }
 

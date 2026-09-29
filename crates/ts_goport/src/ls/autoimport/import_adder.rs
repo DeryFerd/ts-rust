@@ -98,7 +98,7 @@ pub struct ImportAdderImpl {
 // callers pass the Go arguments.
 pub fn new_import_adder(
     ctx: &Context,
-    _program: &'static compiler::NewProgram,
+    _program: &compiler::NewProgram,
     _file: Node,
     view: Rc<View>,
     format_options: lsutil::FormatCodeSettings,
@@ -163,7 +163,8 @@ impl ImportAdder for ImportAdderImpl {
     // order); see the file header.
     fn edits(&mut self) -> Vec<lsproto::TextEdit> {
         // !!! organize imports?
-        let program = self.view.program;
+        let view = Rc::clone(&self.view);
+        let program = &*view.program;
         let importing_file = self.view.importing_file;
         let mut tracker = change::new_tracker(
             &self.ctx,
@@ -246,7 +247,8 @@ impl ImportAdder for ImportAdderImpl {
     // so that multiple imports from the same module are coalesced into a single import statement.
     fn add_import_fix(&mut self, fix: Rc<Fix>) {
         let symbol_name = fix.name.clone();
-        let program = self.view.program;
+        let view = Rc::clone(&self.view);
+        let program = &*view.program;
         let compiler_options = program.options();
 
         match fix.kind {

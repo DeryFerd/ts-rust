@@ -96,7 +96,7 @@ pub fn probably_uses_semicolons(file: Node) -> bool {
 // Go: ls/lsutil/utilities.go:78 ShouldUseUriStyleNodeCoreModules
 pub fn should_use_uri_style_node_core_modules(
     file: Node,
-    program: &'static crate::frontend::compiler::NewProgram,
+    program: &crate::frontend::compiler::NewProgram,
 ) -> Tristate {
     for node in source_file_imports(file).iter() {
         let text = node.text();
