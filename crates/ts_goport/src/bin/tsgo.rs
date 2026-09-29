@@ -21,8 +21,9 @@
 //! Not Go: when the run gets 4 KiB pages, a worker copy of the binary does
 //! the work, so the exit does not wait for its memory to unmap (`launch`).
 //! PORT: Go `core.ApplyDebugStackLimit` (`TS_GO_DEBUG_STACK_LIMIT`) is a
-//! debug setting and is skipped. The work runs on a thread with a 1 GiB
-//! stack, like the other goport bins.
+//! debug setting and is skipped. The work runs on a thread with the stack
+//! size of `gostd::stack::max_stack_size` (1 GiB with no address space or
+//! data limit), like the other goport bins.
 //! PORT: Go `osSys` and `newSystem` (cmd/tsgo/sys.go) are ported as
 //! `OsSystem` and `new_os_system` in execute/tsc/compile.rs.
 //! PORT: `enablevtprocessing_windows.go` (the Windows console) is not
@@ -42,10 +43,6 @@ use ts_goport::gostd::context;
 use ts_goport::prelude::*;
 
 const UNPORTED_PREFIX: &str = "unported Go code";
-
-/// Stack size for the main work thread. The checker recurses deeply on
-/// large projects.
-const STACK_SIZE: usize = 1 << 30;
 
 /// jemalloc is the global allocator (default feature `jemalloc`). A build
 /// without the feature uses glibc malloc. See `goport.rs`
@@ -91,11 +88,12 @@ fn main() {
     let start = Instant::now();
     install_panic_hook();
     // The thread ends the process itself once `run_main` has written the
-    // output, so the exit does not wait for the thread stacks (1 GiB each)
-    // to unmap, the thread-local destructors or the join.
+    // output, so the exit does not wait for the thread stacks (up to 1 GiB
+    // each, `max_stack_size`) to unmap, the thread-local destructors or the
+    // join.
     let work = std::thread::Builder::new()
         .name("tsgo".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || exit(run_main(start)));
     // Reached only when the thread cannot start or `run_main` panics.
     let _ = work.map(std::thread::JoinHandle::join);
@@ -108,28 +106,30 @@ fn main() {
 /// comes from `budget` (`ThreadBudget::one_program`): with the signal thread
 /// it is 7 here, and 10 at 8 or more cores (3 spare arenas for the parse
 /// workers that a large program adds). At 6, two checkers share one arena
-/// lock (zod: 3.9k voluntary context switches, 0.5k at 7). The variable
-/// stays set, so the exec runs once. A jemalloc build with `JEMALLOC_CONF`
-/// built in does not exec.
+/// lock (zod: 3.9k voluntary context switches, 0.5k at 7). Under an address
+/// space or data limit, glibc malloc gets `arena_max=1`, with jemalloc too.
+/// The variables stay set, so the exec runs once. A jemalloc build with
+/// `JEMALLOC_CONF` built in execs only under a limit.
 fn set_malloc_tunables(budget: &ThreadBudget) {
-    // Unused off Linux and with jemalloc.
+    // Unused off Linux.
     let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
+        let mut vars = Vec::new();
         // A build with `JEMALLOC_CONF` built into jemalloc
         // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set by `scripts/build-release.sh`)
-        // needs no exec: jemalloc reads it at its start, and
+        // needs no exec for it: jemalloc reads it at its start, and
         // `_RJEM_MALLOC_CONF` still overrides it.
         #[cfg(feature = "jemalloc")]
-        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") == Some(JEMALLOC_CONF) {
-            return;
+        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") != Some(JEMALLOC_CONF) {
+            vars.push(("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF)));
         }
-        #[cfg(not(feature = "jemalloc"))]
-        let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
-        #[cfg(feature = "jemalloc")]
-        let (name, value) = ("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF));
-        if std::env::var_os(name).is_some() {
+        if let Some(value) = budget.glibc_tunables() {
+            vars.push(("GLIBC_TUNABLES", value));
+        }
+        vars.retain(|(name, _)| std::env::var_os(name).is_none());
+        if vars.is_empty() {
             return;
         }
         let Ok(exe) = std::env::current_exe() else {
@@ -141,7 +141,7 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
             command.arg0(arg0);
         }
         // `exec` returns only when it fails.
-        let _ = command.args(args).env(name, value).exec();
+        let _ = command.args(args).envs(vars).exec();
     }
 }
 

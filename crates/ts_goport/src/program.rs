@@ -387,7 +387,7 @@ fn create_emit_pool(count: usize) -> EmitPool {
             let released = Arc::clone(&released);
             std::thread::Builder::new()
                 .name(format!("emit-{index}"))
-                .stack_size(CHECKER_STACK_SIZE)
+                .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
                     seed.install();
                     loop {
@@ -1294,12 +1294,27 @@ impl ThreadBudget {
     }
 
     /// The `GLIBC_TUNABLES` value of this budget (see `bin/goport.rs`
-    /// `set_malloc_tunables`).
-    pub fn glibc_tunables(&self) -> String {
-        format!(
-            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max={}:glibc.malloc.top_pad=67108864",
-            self.arena_max
-        )
+    /// `set_malloc_tunables`), or `None` to set none.
+    /// - glibc malloc (a build without the `jemalloc` feature): the huge
+    ///   page settings, `arena_max` and the top pad.
+    /// - jemalloc: glibc malloc serves only glibc itself (the thread-local
+    ///   destructor list and the attributes of each thread), so it needs
+    ///   nothing with no limit.
+    ///
+    /// Under an address space or data limit (`gostd::stack::memory_limit`),
+    /// `arena_max` is 1. Each thread that calls glibc malloc gets its own
+    /// arena, up to 8 per core, and each arena reserves 64 MiB of address
+    /// space, which the limit counts in full. With jemalloc, effect at
+    /// `ulimit -v 2G` then gives Go's output (without it: out of memory).
+    pub fn glibc_tunables(&self) -> Option<String> {
+        let limited = crate::gostd::stack::memory_limit().is_some();
+        if cfg!(feature = "jemalloc") {
+            return limited.then(|| String::from("glibc.malloc.arena_max=1"));
+        }
+        let arena_max = if limited { 1 } else { self.arena_max };
+        Some(format!(
+            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max={arena_max}:glibc.malloc.top_pad=67108864"
+        ))
     }
 }
 
@@ -1416,7 +1431,7 @@ fn bind_files_parallel(symbols: &mut SymbolArena) {
             let seed = WorkerSeed::take();
             let (files, order, queue, sender) = (&files, &order, &queue, sender.clone());
             std::thread::Builder::new()
-                .stack_size(CHECKER_STACK_SIZE)
+                .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn_scoped(scope, move || {
                     seed.install();
                     let mut state = queue.lock();
@@ -2313,10 +2328,6 @@ pub fn get_packages_map() -> FxHashMap<String, bool> {
 // results match the Go grouping and do not depend on thread timing.
 // ---------------------------------------------------------------------------
 
-/// Stack size of a checker worker thread. The checker recurses deeply on
-/// large projects.
-const CHECKER_STACK_SIZE: usize = 1 << 30;
-
 thread_local! {
     /// The checker pools of the loading thread, by `GoProgram::id`.
     static POOLS: RefCell<FxHashMap<u32, CheckerPool>> = RefCell::new(FxHashMap::default());
@@ -2420,7 +2431,7 @@ fn create_checkers() -> CheckerPool {
             let seed = WorkerSeed::take();
             let thread = std::thread::Builder::new()
                 .name(format!("checker-{index}"))
-                .stack_size(CHECKER_STACK_SIZE)
+                .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
                     seed.install();
                     let checker = Checker::new(index);

@@ -18,15 +18,12 @@ use std::sync::{Arc, LazyLock};
 // PORT: `bin/goport.rs` `main` calls `run_main` before its own compile
 // path and exits with the status it returns.
 
-/// Stack size of the thread that runs `--lsp` and `--api` (the LSP
-/// dispatch thread). Same as the goport worker thread.
-const STACK_SIZE: usize = 1 << 30;
-
 // Go: cmd/tsgo/main.go:17 runMain
 // PORT: `args` is Go `os.Args[1:]`. `None` means Go continues with
 // `execute.CommandLine`; goport continues with its own compile path, which
 // replaces it. Go `core.ApplyDebugStackLimit()` (the TS_GO_DEBUG_STACK_LIMIT
-// override) becomes the 1 GiB stack of the thread that runs the command.
+// override) becomes the stack of the thread that runs the command
+// (`gostd::stack::max_stack_size`).
 // PORT: Go `signal.NotifyContext` before `execute.CommandLine` is in
 // `bin/tsgo.rs`, which runs that path; the goport compile path has none.
 pub fn run_main(args: &[String]) -> Option<i32> {
@@ -40,13 +37,14 @@ pub fn run_main(args: &[String]) -> Option<i32> {
     None
 }
 
-// PORT: runs `f` on a new thread with a 1 GiB stack and returns its status.
+// PORT: runs `f` on a new thread with the Go maximum stack
+// (`gostd::stack::max_stack_size`) and returns its status.
 // A panic that reaches the top of that thread ends Go with a crash; goport
 // returns `EXIT_UNPORTED` (70), as `bin/goport.rs` does for a failed worker.
 fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
     let worker = std::thread::Builder::new()
         .name("tsgo".to_string())
-        .stack_size(STACK_SIZE)
+        .stack_size(crate::gostd::stack::max_stack_size())
         .spawn(move || f(args));
     match worker.map(std::thread::JoinHandle::join) {
         Ok(Ok(code)) => code,

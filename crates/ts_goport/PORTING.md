@@ -395,6 +395,15 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   With `noEmit` or `emitDeclarationOnly` no JS part moves. An emit that
   moves no JS part runs as with the pool off and makes no pool. The
   language server does not emit through `program_emit`.
+- A thread that runs Go code (the work thread of a binary, and the parse,
+  bind, checker, emit, search and goroutine threads) gets the stack size of
+  `gostd::stack::max_stack_size`: 1 GiB, the Go maximum goroutine stack. A
+  Rust stack does not grow, so it is reserved at the start. Under an address
+  space or data limit (`ulimit -v`, `ulimit -d`), the size is 1/64 of the
+  limit and glibc malloc gets one arena (`ThreadBudget::glibc_tunables`),
+  so the threads start and the heap keeps room. The 1/64 share does not
+  count the threads, so with many checkers a run under a low limit can
+  still fail where Go runs (see `gostd/stack.rs`).
 - `tsc -p` with an incremental program starts its emit with the check (not
   in Go; `incremental::Program::start_check_and_emit`). Go waits for the
   whole check, reads the global diagnostics again, then emits. Here the

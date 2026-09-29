@@ -21,10 +21,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, Once, OnceLock};
 use std::time::{Duration, Instant};
 
-// PORT: Go stacks grow to 1 GB; goroutines started here get the same
-// maximum stack as the crate's checker threads.
-const GOROUTINE_STACK_SIZE: usize = 1 << 30;
-
 // PORT: Go mutexes do not poison. A panic while a lock is held leaves the
 // data as it is, as in Go.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -35,7 +31,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 fn go(f: Box<dyn FnOnce() + Send>) {
     std::thread::Builder::new()
         .name("goroutine".to_string())
-        .stack_size(GOROUTINE_STACK_SIZE)
+        .stack_size(crate::gostd::stack::max_stack_size())
         .spawn(f)
         .expect("context: failed to start a goroutine");
 }
