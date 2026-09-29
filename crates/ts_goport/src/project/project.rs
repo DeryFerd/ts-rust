@@ -279,6 +279,11 @@ impl Project {
         self.config_file_name.clone()
     }
 
+    // Go: project/project.go:198 Project.CurrentDirectory (ts#63935)
+    pub fn current_directory(&self) -> String {
+        self.current_directory.clone()
+    }
+
     // Go: project/project.go:177 Project.DisplayName
     // DisplayName returns a short, human-readable name for the project,
     // relative to the given workspace root directory.
