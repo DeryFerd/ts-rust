@@ -261,6 +261,9 @@ impl Method {
     pub const GET_TYPES_OF_SYMBOLS: Method = Method(Cow::Borrowed("getTypesOfSymbols"));
     pub const GET_DECLARED_TYPE_OF_SYMBOL: Method =
         Method(Cow::Borrowed("getDeclaredTypeOfSymbol"));
+    // ts#63956
+    pub const GET_NON_MISSING_TYPE_OF_SYMBOL: Method =
+        Method(Cow::Borrowed("getNonMissingTypeOfSymbol"));
     pub const GET_SOURCE_FILE: Method = Method(Cow::Borrowed("getSourceFile"));
     pub const GET_SOURCE_FILE_NAMES: Method = Method(Cow::Borrowed("getSourceFileNames"));
     pub const GET_SOURCE_FILE_METADATA: Method = Method(Cow::Borrowed("getSourceFileMetadata"));
@@ -892,6 +895,11 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_DECLARED_TYPE_OF_SYMBOL,
+        unmarshaller_for::<GetTypeOfSymbolParams>,
+    );
+    // ts#63956
+    m.insert(
+        Method::GET_NON_MISSING_TYPE_OF_SYMBOL,
         unmarshaller_for::<GetTypeOfSymbolParams>,
     );
     m.insert(Method::RESOLVE_NAME, unmarshaller_for::<ResolveNameParams>);

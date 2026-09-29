@@ -1071,6 +1071,10 @@ impl ipc::Handler for Session {
             m if m == Method::GET_DECLARED_TYPE_OF_SYMBOL.0 => self
                 .handle_get_declared_type_of_symbol(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#63956
+            m if m == Method::GET_NON_MISSING_TYPE_OF_SYMBOL.0 => self
+                .handle_get_non_missing_type_of_symbol(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::RESOLVE_NAME.0 => self
                 .handle_resolve_name(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -2503,6 +2507,25 @@ impl Session {
             .checker
             .borrow_mut()
             .get_declared_type_of_symbol_exported(symbol);
+        Ok(setup.new_type_response(t))
+    }
+
+    // Go: api/session.go handleGetNonMissingTypeOfSymbol (ts#63956)
+    // handleGetNonMissingTypeOfSymbol returns the type of a symbol, excluding the missing type.
+    pub fn handle_get_non_missing_type_of_symbol(
+        &self,
+        ctx: &Context,
+        params: &GetTypeOfSymbolParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+
+        let t = setup
+            .checker
+            .borrow_mut()
+            .get_non_missing_type_of_symbol_exported(symbol);
         Ok(setup.new_type_response(t))
     }
 
