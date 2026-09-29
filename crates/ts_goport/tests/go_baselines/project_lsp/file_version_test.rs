@@ -355,6 +355,8 @@ child_test! {
         assert_eq!(jsdoc.len(), 1);
         assert_eq!(jsdoc.get(0).kind(), SyntaxKind::JsDoc);
         let statement_kind = statement.kind();
+        let statement_flags = statement.flags();
+        assert!(edited.locals().is_some(), "index.js declares x and y");
 
         edit(&session, JS_URI, 3, (1, 17), (1, 18), "3");
         let live = program(&session, JS_URI);
@@ -367,11 +369,15 @@ child_test! {
             let _ = source_file_info(edited).file_name.len();
         });
         assert_eq!(info.as_deref(), Some(stale.as_str()), "a GoFile read of a dead version");
-        let flags = panic_message(|| {
-            let _ = statement.flags();
+        // AST node records, step 2: the flags (with the binder bits), the
+        // symbol and the flow node are in the node record, in the leaked node
+        // shell as the kind is. The other binder fields are in the `GoFile`.
+        let locals = panic_message(|| {
+            let _ = edited.locals();
         });
-        assert_eq!(flags.as_deref(), Some(stale.as_str()), "a binder read of a dead version");
+        assert_eq!(locals.as_deref(), Some(stale.as_str()), "a binder read of a dead version");
         assert_eq!(statement.kind(), statement_kind, "a node column read of a dead version");
+        assert_eq!(statement.flags(), statement_flags, "a node record read of a dead version");
         let data = panic_message(|| {
             let _ = statement.declaration_list();
         });

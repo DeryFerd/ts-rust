@@ -750,12 +750,14 @@ pub fn js_emit_needs_checker(source_file: Node) -> bool {
 
 /// PORT: not in Go. True when `source_file` may have an `EnumDeclaration`.
 /// The binder gives every enum declaration a symbol with an enum flag
-/// (`bind_enum_declaration`), so this scans the file's binder entries, which
-/// are fewer than its nodes, instead of walking its tree. A merged symbol
-/// (an enum and a namespace of one name) also counts, which only keeps a JS
-/// part on the checker thread. It is true for a file that is not bound.
+/// (`bind_enum_declaration`), so this scans the symbols in the node records
+/// of the file and its binder extras (local symbols) instead of walking its
+/// tree. A merged symbol (an enum and a namespace of one name) also counts,
+/// which only keeps a JS part on the checker thread. It is true for a file
+/// that is not bound.
 fn may_have_enum_declaration(source_file: Node) -> bool {
-    let go_file = crate::ast::go_file(source_file.file_index());
+    let file = source_file.file_index();
+    let go_file = crate::ast::go_file(file);
     let (Some(node_bind), Some(symbols)) = (
         go_file.node_bind.get(),
         crate::program::bound_symbols_of(prog()),
@@ -765,10 +767,11 @@ fn may_have_enum_declaration(source_file: Node) -> bool {
     let is_enum = |symbol: SymbolId| {
         symbol.is_some() && symbols.sym(symbol).flags.intersects(SymbolFlags::ENUM)
     };
-    let (_, _, entries) = node_bind.parts();
-    entries
-        .iter()
-        .any(|entry| is_enum(entry.symbol) || is_enum(entry.local_symbol))
+    crate::ast::frozen_store_any_symbol(file, is_enum).unwrap_or(true)
+        || node_bind
+            .extras()
+            .iter()
+            .any(|extra| is_enum(extra.local_symbol))
 }
 
 // Go: compiler/emitter.go:107 getScriptTransformers
