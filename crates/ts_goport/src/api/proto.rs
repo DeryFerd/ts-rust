@@ -25,7 +25,7 @@ use crate::frontend::json::{
     JsonDecoder, JsonError, JsonToken, MarshalerTo, UnmarshalerFrom, json_unmarshal_decode,
 };
 use crate::frontend::json_ext::{
-    AnyValue, ErrorPos, IsZero, LspAny, SemanticError, go_type_name, marshal_field,
+    AnyValue, ErrorPos, IsZero, JsonValue, LspAny, SemanticError, go_type_name, marshal_field,
     marshal_field_omitzero, marshal_opt_field, unmarshal_root, unmarshal_struct_fields,
     wrap_method_error, write_object_end, write_object_start,
 };
@@ -102,6 +102,29 @@ pub struct Method(pub Cow<'static, str>);
 impl std::fmt::Display for Method {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+// PORT: `Method` is a Go string type; `BatchRequest.Method` and
+// `BatchResponse.Method` (ts#63937) use the v2 string arshaler.
+impl MarshalerTo for Method {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.as_ref().marshal_json_to(enc)
+    }
+}
+
+impl UnmarshalerFrom for Method {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let mut s = String::new();
+        json_ext::unmarshal_string_as(dec, &mut s, &go_type_name::<Self>())?;
+        self.0 = Cow::Owned(s);
+        Ok(())
+    }
+}
+
+impl IsZero for Method {
+    fn is_zero(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -205,6 +228,9 @@ pub fn parse_project_handle(handle: &ProjectID) -> tspath::Path {
 // Go: proto.go:56
 impl Method {
     pub const RELEASE: Method = Method(Cow::Borrowed("release"));
+
+    // ts#63937
+    pub const BATCH_REQUESTS: Method = Method(Cow::Borrowed("batchRequests"));
 
     // tsgo#4915: MethodGetServerTiming and MethodResetServerTiming are gone;
     // the connection answers them (`ipc::timing`).
@@ -756,6 +782,11 @@ pub type Unmarshaler = fn(&[u8]) -> Result<Option<Box<dyn AnyValue>>, GoError>;
 // Go: proto.go:308 unmarshalers
 pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::new(|| {
     let mut m: FxHashMap<Method, Unmarshaler> = FxHashMap::default();
+    // ts#63937
+    m.insert(
+        Method::BATCH_REQUESTS,
+        unmarshaller_for::<BatchRequestsParams>,
+    );
     m.insert(Method::RELEASE, unmarshaller_for::<ReleaseParams>);
     m.insert(Method::INITIALIZE, no_params);
     m.insert(
@@ -1449,6 +1480,53 @@ proto_json!(marshal TranspileOutputResponse {
     output_text: "outputText" plain,
     diagnostics: "diagnostics" omitempty,
     source_map_text: "sourceMapText" omitempty,
+});
+
+// Go: proto.go BatchRequestsParams (ts#63937)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BatchRequestsParams {
+    pub requests: Vec<BatchRequest>,
+}
+
+proto_json!(both BatchRequestsParams {
+    requests: "requests" plain,
+});
+
+// Go: proto.go BatchRequest (ts#63937)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BatchRequest {
+    pub method: Method,
+    pub params: JsonValue,
+}
+
+proto_json!(both BatchRequest {
+    method: "method" plain,
+    params: "params" omitempty,
+});
+
+// Go: proto.go BatchRequestsResponse (ts#63937)
+#[derive(Debug, Default)]
+pub struct BatchRequestsResponse {
+    pub responses: Vec<BatchResponse>,
+}
+
+proto_json!(marshal BatchRequestsResponse {
+    responses: "responses" plain,
+});
+
+// Go: proto.go BatchResponse (ts#63937)
+// PORT: Go `Result any` is the handler result (`None` is a nil `any`).
+#[derive(Debug, Default)]
+pub struct BatchResponse {
+    pub method: Method,
+    pub result: Option<Box<dyn AnyValue>>,
+    pub error: String,
+}
+
+proto_json!(marshal BatchResponse {
+    method: "method" plain,
+    result: "result" plain,
+    error: "error" omitempty,
 });
 
 // ReleaseParams are the parameters for the release method.

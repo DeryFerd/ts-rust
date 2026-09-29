@@ -989,6 +989,10 @@ impl ipc::Handler for Session {
         };
 
         match method {
+            // ts#63937
+            m if m == Method::BATCH_REQUESTS.0 => self
+                .handle_batch_requests(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::RELEASE.0 => self.handle_release(ctx, Some(assert_params(&parsed))),
             m if m == Method::INITIALIZE.0 => self.handle_initialize(ctx).map(to_any),
             m if m == Method::UPDATE_SNAPSHOT.0 => self
@@ -1416,6 +1420,47 @@ impl ipc::Handler for Session {
     ) -> Result<(), GoError> {
         // TODO: Implement notification handling
         Ok(())
+    }
+}
+
+impl Session {
+    // Go: api/session.go handleBatchRequests (ts#63937)
+    pub fn handle_batch_requests(
+        &self,
+        ctx: &Context,
+        params: &BatchRequestsParams,
+    ) -> Result<BatchRequestsResponse, GoError> {
+        let mut responses = Vec::with_capacity(params.requests.len());
+        for request in &params.requests {
+            responses.push(self.handle_batch_request(ctx, request));
+        }
+        Ok(BatchRequestsResponse { responses })
+    }
+
+    // Go: api/session.go handleBatchRequest (ts#63937)
+    // PORT: Go recovers a panic in a deferred function; `catch_unwind` covers
+    // the same call. Go `debug.Stack()` is the backtrace at the recover point.
+    pub fn handle_batch_request(&self, ctx: &Context, request: &BatchRequest) -> BatchResponse {
+        let mut response = BatchResponse {
+            method: request.method.clone(),
+            ..Default::default()
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ipc::Handler::handle_request(self, ctx, &request.method.0, request.params.clone())
+        }));
+        match outcome {
+            Ok(Ok(result)) => response.result = result,
+            Ok(Err(err)) => response.error = err.error(),
+            Err(recovered) => {
+                response.result = None;
+                response.error = format!(
+                    "panic: {}\n{}",
+                    ipc::conn::recovered_value(recovered.as_ref()),
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
+        response
     }
 }
 
