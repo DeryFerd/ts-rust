@@ -166,7 +166,9 @@ impl Checker {
         f: &Rc<RefCell<FlowState>>,
         flow: FlowNodeId,
     ) -> FlowType {
-        let flow_node = flow.get_flow();
+        // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+        let mut flow_node_guard = None;
+        let flow_node = flow.get_flow_in(&mut flow_node_guard);
         let data = flow_node.as_flow_switch_clause_data();
         let expr = skip_parentheses(data.switch_statement.expression());
         let flow_type = self.get_type_at_flow_node(f, flow_node.antecedent);
@@ -468,7 +470,9 @@ impl Checker {
         let mut seen_incomplete = false;
         let mut bypass_flow = FlowNodeId::NIL;
         for &antecedent in antecedents {
-            let antecedent_node = antecedent.get_flow();
+            // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            let mut antecedent_node_guard = None;
+            let antecedent_node = antecedent.get_flow_in(&mut antecedent_node_guard);
             if bypass_flow.is_nil()
                 && antecedent_node.flags.intersects(FlowFlags::SWITCH_CLAUSE)
                 && antecedent_node.as_flow_switch_clause_data().is_empty()
@@ -735,7 +739,9 @@ impl Checker {
     ) -> FlowType {
         let declared_type = f.borrow().declared_type;
         if declared_type == self.auto_type || declared_type == self.auto_array_type {
-            let flow_node = flow.get_flow();
+            // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            let mut flow_node_guard = None;
+            let flow_node = flow.get_flow_in(&mut flow_node_guard);
             let node = flow_node.node;
             let expr = if is_call_expression(node) {
                 node.expression().expression()

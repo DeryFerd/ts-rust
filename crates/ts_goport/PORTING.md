@@ -236,20 +236,27 @@ methods reach the AST through it.
   so they belong to the thread. `GOPORT_SYNTHETIC_OWNERS=0` turns owners
   off.
 - Store columns and the other registry tables of a published file are read
-  through one file lookup (`frozen_read` and the `frozen!` macro in
+  through one file lookup (the `frozen!` macro and `static_frozen_of` in
   `ast/store.rs`), not `FROZEN.get()` directly. It checks tier 0 (the
   first publish), then, inline, tier 1 (every later publish), then a
   freeable file version (out of line, pinned while the read runs), so the
   nodes of a later program (`tsc -b`, an edited file) read the same
   columns as the nodes of the first program. The tier 1 and freeable parts
   are a cold block, so they add no code to the hot path of a one-program
-  process; keep new tier 1 work after `later_publish_path()`. A read gets
+  process; keep new tier 1 work after `later_publish_path()`, and keep one
+  inline copy of the read (after the static tiers join). A read gets
   a borrow for its closure only, so it copies its result out. A new column
   gets a `Frozen` table and a reader that calls `frozen!` with that table.
   A reader that must return a `&'static` slice of a table uses the static
   tiers only (`static_frozen`) and gives `None` for a freeable version,
   so the caller takes the exact slow path (`frozen_store_children`,
-  `frozen_resolved`).
+  `frozen_resolved`). The inline fast paths of the node reads (`kind`,
+  `parent`, `flags`, `loc`, children, `Node::new`, `bind`) use
+  `frozen_static!` (static tiers, no call), as a one-program process needs;
+  a node of a freeable version misses them, and the caller's slow path
+  reads it first with one pinned read (`freeable_store_kind`,
+  `freeable_store_parent`, ...). Use `frozen_static!` only where `None`
+  sends the caller to such an exact path.
 
 ## Program (owned by program.rs)
 

@@ -159,7 +159,7 @@ static MADE: AtomicUsize = AtomicUsize::new(0);
 static EDITOR_PROCESS: AtomicBool = AtomicBool::new(false);
 
 /// Set when the first freeable version is published. Until then a registry
-/// read (`ast::store::frozen_read`) never looks for a version.
+/// read (`frozen!` in `ast/store.rs`) never looks for a version.
 static FREEABLE_PUBLISHED: AtomicBool = AtomicBool::new(false);
 
 /// Raised by each program release (`release_file_version_pins`). A thread

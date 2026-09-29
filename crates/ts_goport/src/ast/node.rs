@@ -1033,6 +1033,25 @@ fn synthetic_bind_field<T>(n: Node, field: impl FnOnce(&NodeBindData) -> T) -> T
     field(&synthetic_bind(n))
 }
 
+/// The flow nodes of `go_file`. Panics before its binder built them.
+#[inline]
+fn flow_nodes_of(go_file: &GoFile) -> &[FlowNode] {
+    go_file
+        .flow_nodes
+        .get()
+        .expect("flow nodes are not built for this file")
+}
+
+/// The binder data of node slot `index` of `go_file`: nil values before the
+/// file is bound.
+#[inline]
+fn node_bind_in(go_file: &GoFile, index: usize) -> &NodeBindData {
+    match go_file.node_bind.get() {
+        Some(v) => v.get(index),
+        None => &NO_BIND,
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // core.TextRange (internal/core/text.go)
 // ──────────────────────────────────────────────────────────────────────
@@ -1194,13 +1213,12 @@ enum SliceRepr {
     Nodes(&'static [Node]),
     /// The `len` nodes of a list of this thread's synthetic arena.
     Synthetic { list: SyntheticList, len: u32 },
-    /// Go `SourceFile.Imports()` of a freeable file version (lsshells M3b),
-    /// read at each use (`NodeSlice::from_file_imports`).
-    FileImports { file: u32 },
-    /// The eager JSDoc of `host` in the JSDoc cache of freeable file
-    /// version `file` (lsshells M3b), read at each use
-    /// (`NodeSlice::from_file_js_doc`).
-    FileJsDoc { file: u32, host: Node },
+    /// A list of `len` nodes of freeable file version `file` (lsshells M3b),
+    /// read at each use (`file_list_node`): Go `SourceFile.Imports()` when
+    /// `host` is nil (`NodeSlice::from_file_imports`), else the eager JSDoc
+    /// of `host` in its JSDoc cache (`NodeSlice::from_file_js_doc`). A
+    /// published list does not change, so its length is kept here.
+    FileList { file: u32, len: u32, host: Node },
 }
 
 impl Default for NodeSlice {
@@ -1233,15 +1251,22 @@ impl NodeSlice {
     /// version). A use after the version dies panics.
     #[must_use]
     pub fn from_file_imports(file: usize) -> Self {
-        Self(SliceRepr::FileImports { file: file as u32 })
+        Self::from_file_list(file, Node::NIL)
     }
 
     /// The JSDoc cache entry of `host` in published file `file`, read at
     /// each use (see `from_file_imports`). `host` must be in the cache.
     #[must_use]
     pub fn from_file_js_doc(file: usize, host: Node) -> Self {
-        Self(SliceRepr::FileJsDoc {
+        debug_assert!(host.is_some());
+        Self::from_file_list(file, host)
+    }
+
+    /// `SliceRepr::FileList` of `file` and `host`.
+    fn from_file_list(file: usize, host: Node) -> Self {
+        Self(SliceRepr::FileList {
             file: file as u32,
+            len: file_list_len(file, host) as u32,
             host,
         })
     }
@@ -1262,12 +1287,7 @@ impl NodeSlice {
             SliceRepr::Ids { ids, .. } => ids.len(),
             SliceRepr::Nodes(nodes) => nodes.len(),
             SliceRepr::Synthetic { len, .. } => len as usize,
-            SliceRepr::FileImports { file } => {
-                crate::ast::with_go_file(file as usize, |g| g.info.imports.len())
-            }
-            SliceRepr::FileJsDoc { file, host } => {
-                crate::ast::with_go_file(file as usize, |g| g.info.jsdoc_cache[&host].len())
-            }
+            SliceRepr::FileList { len, .. } => len as usize,
         }
     }
 
@@ -1290,12 +1310,7 @@ impl NodeSlice {
                 );
                 synthetic_list_node(list, i)
             }
-            SliceRepr::FileImports { file } => {
-                crate::ast::with_go_file(file as usize, |g| g.info.imports[i])
-            }
-            SliceRepr::FileJsDoc { file, host } => {
-                crate::ast::with_go_file(file as usize, |g| g.info.jsdoc_cache[&host][i])
-            }
+            SliceRepr::FileList { file, host, .. } => file_list_node(file as usize, host, i),
         }
     }
 
@@ -1327,9 +1342,7 @@ impl NodeSlice {
                 Some(frozen) => SliceIds::Frozen(ids, frozen),
                 None => SliceIds::Slow,
             },
-            SliceRepr::Synthetic { .. }
-            | SliceRepr::FileImports { .. }
-            | SliceRepr::FileJsDoc { .. } => SliceIds::Slow,
+            SliceRepr::Synthetic { .. } | SliceRepr::FileList { .. } => SliceIds::Slow,
         };
         NodeSliceIter {
             slice: self,
@@ -1343,6 +1356,33 @@ impl NodeSlice {
     pub fn to_vec(self) -> Vec<Node> {
         self.iter().collect()
     }
+}
+
+/// The length of the list of `SliceRepr::FileList { file, host }`.
+fn file_list_len(file: usize, host: Node) -> usize {
+    crate::ast::with_go_file(file, |g| {
+        if host.is_nil() {
+            g.info.imports.len()
+        } else {
+            g.info.jsdoc_cache[&host].len()
+        }
+    })
+}
+
+/// Node `i` of `SliceRepr::FileList { file, host }`. Panics when `i` is
+/// out of range, like Go.
+// PERF: lsshells M3b. Out of line, so `NodeSlice::get` keeps the R134
+// inline code for the other variants.
+#[cold]
+#[inline(never)]
+fn file_list_node(file: usize, host: Node, i: usize) -> Node {
+    crate::ast::with_go_file(file, |g| {
+        if host.is_nil() {
+            g.info.imports[i]
+        } else {
+            g.info.jsdoc_cache[&host][i]
+        }
+    })
 }
 
 // PERF: 24 bytes. The synthetic list is a variant of `SyntheticList`, whose
@@ -2013,6 +2053,9 @@ impl Node {
 
     #[inline(never)]
     fn kind_slow(self) -> SyntaxKind {
+        if let Some(kind) = freeable_store_kind(self) {
+            return kind;
+        }
         // A store node holds the Go kind in its header.
         if let Some(h) = try_store_header(self) {
             return h.kind;
@@ -2077,6 +2120,10 @@ impl Node {
         if let Some(h) = active_store_header(self) {
             return h.flags;
         }
+        // A freeable file version is published and bound.
+        if let Some(flags) = freeable_store_flags(self) {
+            return flags | self.added_flags();
+        }
         if is_synthetic_node(self) {
             return synthetic_flags(self);
         }
@@ -2103,6 +2150,9 @@ impl Node {
 
     #[inline(never)]
     fn parent_slow(self) -> Node {
+        if let Some(parent) = freeable_store_parent(self) {
+            return parent;
+        }
         if is_synthetic_node(self) {
             return synthetic_parent(self);
         }
@@ -2124,6 +2174,9 @@ impl Node {
 
     #[inline(never)]
     fn loc_slow(self) -> TextRange {
+        if let Some(loc) = freeable_store_loc(self) {
+            return loc;
+        }
         if is_synthetic_node(self) {
             return synthetic_loc(self);
         }
@@ -2168,21 +2221,36 @@ impl Node {
     // PERF: the program file path stays small enough to inline, and it loads
     // only the field. The synthetic path (thread-local arena and `RefCell`
     // borrow) is cold.
-    // PERF: lsshells M3b. The file is read in a closure (`with_go_file`),
-    // so a node of a freeable file version makes no `FileRef` guard.
+    // PERF: lsshells M3b. A static file (tier 0, tier 1) is read inline with
+    // no call, as in R134. A freeable file version is read out of line and
+    // copied (`bind_slow`), so it makes no `FileRef` guard.
     #[inline]
     fn bind_field<T>(self, field: impl FnOnce(&NodeBindData) -> T) -> T {
         if is_synthetic_node(self) {
             return synthetic_bind_field(self, field);
         }
         let index = nid(self).index();
-        crate::ast::with_go_file(self.file_index(), |go_file| {
-            let bind: &NodeBindData = match go_file.node_bind.get() {
-                Some(v) => v.get(index),
-                None => &NO_BIND,
-            };
-            field(bind)
-        })
+        let copy;
+        let bind = match crate::ast::static_go_file(self.file_index()) {
+            Some(go_file) => node_bind_in(go_file, index),
+            None => {
+                copy = self.bind_slow(index);
+                &copy
+            }
+        };
+        field(bind)
+    }
+
+    /// The binder data of node slot `index` of a freeable file version
+    /// (lsshells M3b), copied out. Panics when the file is not published.
+    #[cold]
+    #[inline(never)]
+    fn bind_slow(self, index: usize) -> NodeBindData {
+        let file = self.file_index();
+        match crate::ast::freeable_go_file_read(file, |go_file| *node_bind_in(go_file, index)) {
+            Some(bind) => bind,
+            None => crate::ast::with_go_file(file, |go_file| *node_bind_in(go_file, index)),
+        }
     }
 
     // Go: ast.go:198 Name
@@ -2355,9 +2423,51 @@ impl Node {
 impl FlowNodeId {
     /// Go `*FlowNode` dereference. The guard pins a freeable file version
     /// while it lives; copy the fields out rather than keep it.
+    // PERF: lsshells M3b. A static file (tier 0, tier 1) returns its
+    // `FileRef::Static` inline, as R134 returned the `&'static FlowNode`;
+    // the synthetic flow file and a freeable file version are out of line
+    // (`get_flow_slow`). The synthetic id is above every publish, so the
+    // static test misses it.
     #[must_use]
     pub fn get_flow(self) -> FileRef<FlowNode> {
+        match self.static_flow() {
+            Some(data) => FileRef::Static(data),
+            None => self.get_flow_slow(),
+        }
+    }
+
+    /// Go `*FlowNode` dereference for a hot walk: the `'static` borrow of a
+    /// static file (tier 0, tier 1), with no guard, or the borrow of a guard
+    /// that `guard` keeps (a synthetic flow node or a freeable file
+    /// version). Use: `let mut guard = None; let data = flow.get_flow_in(&mut
+    /// guard);`.
+    // PERF: lsshells M3b. The checker flow walks read one flow node per
+    // step. A `FileRef` there is returned through memory, matched at each
+    // read and dropped at each step: `goport -p` ran about 0.3% more
+    // instructions in them (lsshells/m3/M3b/prof p7). This gives R134's
+    // `&'static FlowNode` for a static file.
+    #[inline]
+    pub fn get_flow_in(self, guard: &mut Option<FileRef<FlowNode>>) -> &FlowNode {
+        match self.static_flow() {
+            Some(data) => data,
+            None => guard.insert(self.get_flow_slow()),
+        }
+    }
+
+    /// The flow node of a static file (tier 0, tier 1), or `None` for any
+    /// other flow node (synthetic, a freeable file version).
+    #[inline]
+    fn static_flow(self) -> Option<&'static FlowNode> {
         assert!(self.is_some(), "nil flow node dereference");
+        let g = crate::ast::static_go_file(self.file_index())?;
+        Some(&flow_nodes_of(g)[self.local_index()])
+    }
+
+    /// `get_flow` for a synthetic flow node or a node of a freeable file
+    /// version.
+    #[cold]
+    #[inline(never)]
+    fn get_flow_slow(self) -> FileRef<FlowNode> {
         if self.file_index() == crate::checker::SYNTHETIC_FLOW_FILE {
             return FileRef::Static(crate::checker::synthetic_flow(self));
         }

@@ -1317,6 +1317,10 @@ pub fn get_source_file_of_node(node: Node) -> Node {
         debug_assert_eq!(root, walk_to_source_file(node));
         return root;
     }
+    if let Some(root) = crate::ast::freeable_source_file_of_node(node) {
+        debug_assert_eq!(root, walk_to_source_file(node));
+        return root;
+    }
     walk_to_source_file(node)
 }
 

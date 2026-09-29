@@ -195,7 +195,9 @@ impl Checker {
         f.borrow_mut().depth += 1;
         let mut shared_flow = FlowNodeId::NIL;
         loop {
-            let flow_data = flow.get_flow();
+            // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            let mut flow_data_guard = None;
+            let flow_data = flow.get_flow_in(&mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
                 // We cache results of flow type resolution for shared nodes that were previously visited in
@@ -322,7 +324,9 @@ impl Checker {
         f: &Rc<RefCell<FlowState>>,
         flow: FlowNodeId,
     ) -> FlowType {
-        let flow_data = flow.get_flow();
+        // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+        let mut flow_data_guard = None;
+        let flow_data = flow.get_flow_in(&mut flow_data_guard);
         let node = flow_data.node;
         let (reference, declared_type) = {
             let fb = f.borrow();
@@ -459,7 +463,9 @@ impl Checker {
         f: &Rc<RefCell<FlowState>>,
         flow: FlowNodeId,
     ) -> FlowType {
-        let flow_data = flow.get_flow();
+        // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+        let mut flow_data_guard = None;
+        let flow_data = flow.get_flow_in(&mut flow_data_guard);
         let signature = self.get_effects_signature(flow_data.node);
         if signature.is_some() {
             let predicate = self.get_type_predicate_of_signature(signature);
@@ -593,7 +599,9 @@ impl Checker {
         f: &Rc<RefCell<FlowState>>,
         flow: FlowNodeId,
     ) -> FlowType {
-        let flow_data = flow.get_flow();
+        // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+        let mut flow_data_guard = None;
+        let flow_data = flow.get_flow_in(&mut flow_data_guard);
         let flow_type = self.get_type_at_flow_node(f, flow_data.antecedent);
         if self.ty(flow_type.t).flags.intersects(TypeFlags::NEVER) {
             return flow_type;

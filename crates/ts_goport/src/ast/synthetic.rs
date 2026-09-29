@@ -739,12 +739,15 @@ pub fn static_ast_node(n: Node) -> Option<&'static crate::astdata::Node> {
     }
 }
 
-/// `static_ast_node` for a node that is not a published store node: a
-/// synthetic node (`None`) or an unpublished (built or detached) store node.
-/// Panics for any other node.
+/// `static_ast_node` for a node that is not in a static publish: a node of
+/// a freeable file version, a synthetic node (`None`) or an unpublished
+/// (built or detached) store node. Panics for any other node.
 #[cold]
 #[inline(never)]
 fn static_ast_node_slow(n: Node) -> Option<&'static crate::astdata::Node> {
+    if let Some(node) = crate::ast::freeable_store_ast_node(n) {
+        return Some(node);
+    }
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return None;
     }
