@@ -379,6 +379,8 @@ impl Method {
     pub const GET_DOCUMENTATION_COMMENT: Method = Method(Cow::Borrowed("getDocumentationComment"));
     pub const IS_ARRAY_TYPE: Method = Method(Cow::Borrowed("isArrayType"));
     pub const IS_TUPLE_TYPE: Method = Method(Cow::Borrowed("isTupleType"));
+    // ts#63943
+    pub const IS_READONLY_SYMBOL: Method = Method(Cow::Borrowed("isReadonlySymbol"));
 
     // Reference methods
     pub const GET_REFERENCES_TO_SYMBOL_IN_FILE: Method =
@@ -1197,6 +1199,11 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(Method::IS_ARRAY_TYPE, unmarshaller_for::<CheckerTypeParams>);
     m.insert(Method::IS_TUPLE_TYPE, unmarshaller_for::<CheckerTypeParams>);
+    // ts#63943
+    m.insert(
+        Method::IS_READONLY_SYMBOL,
+        unmarshaller_for::<CheckerSymbolParams>,
+    );
     m.insert(
         Method::GET_REFERENCES_TO_SYMBOL_IN_FILE,
         unmarshaller_for::<GetReferencesToSymbolInFileParams>,

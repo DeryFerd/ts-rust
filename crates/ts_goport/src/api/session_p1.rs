@@ -1321,6 +1321,10 @@ impl ipc::Handler for Session {
             m if m == Method::IS_TUPLE_TYPE.0 => self
                 .handle_is_tuple_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#63943
+            m if m == Method::IS_READONLY_SYMBOL.0 => self
+                .handle_is_readonly_symbol(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_ANY_TYPE.0 => self
                 .handle_get_intrinsic_type(ctx, assert_params(&parsed), Checker::get_any_type)
                 .map(to_any),

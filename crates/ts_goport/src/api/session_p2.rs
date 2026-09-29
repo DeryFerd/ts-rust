@@ -1179,6 +1179,25 @@ impl Session {
         Ok(result)
     }
 
+    // Go: api/session.go handleIsReadonlySymbol (ts#63943)
+    // handleIsReadonlySymbol returns whether a symbol is a readonly symbol.
+    pub fn handle_is_readonly_symbol(
+        &self,
+        ctx: &Context,
+        params: &CheckerSymbolParams,
+    ) -> Result<bool, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+
+        let result = setup
+            .checker
+            .borrow_mut()
+            .is_readonly_symbol_exported(symbol);
+        Ok(result)
+    }
+
     // Go: api/session.go:1922 handleGetBaseTypes
     // handleGetBaseTypes returns the base types of an interface/class type.
     pub fn handle_get_base_types(
