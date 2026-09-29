@@ -1322,9 +1322,6 @@ impl ipc::Handler for Session {
             m if m == Method::IS_ARRAY_TYPE.0 => self
                 .handle_is_array_type(ctx, assert_params(&parsed))
                 .map(to_any),
-            m if m == Method::IS_TUPLE_TYPE.0 => self
-                .handle_is_tuple_type(ctx, assert_params(&parsed))
-                .map(to_any),
             // ts#63943
             m if m == Method::IS_READONLY_SYMBOL.0 => self
                 .handle_is_readonly_symbol(ctx, assert_params(&parsed))

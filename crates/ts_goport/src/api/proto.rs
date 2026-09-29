@@ -381,7 +381,7 @@ impl Method {
     pub const GET_JS_DOC_TAGS: Method = Method(Cow::Borrowed("getJsDocTags"));
     pub const GET_DOCUMENTATION_COMMENT: Method = Method(Cow::Borrowed("getDocumentationComment"));
     pub const IS_ARRAY_TYPE: Method = Method(Cow::Borrowed("isArrayType"));
-    pub const IS_TUPLE_TYPE: Method = Method(Cow::Borrowed("isTupleType"));
+    // ts#64080: MethodIsTupleType is gone; TypeResponse.IsTupleType replaces it.
     // ts#63943
     pub const IS_READONLY_SYMBOL: Method = Method(Cow::Borrowed("isReadonlySymbol"));
 
@@ -1206,7 +1206,6 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<CheckerSymbolParams>,
     );
     m.insert(Method::IS_ARRAY_TYPE, unmarshaller_for::<CheckerTypeParams>);
-    m.insert(Method::IS_TUPLE_TYPE, unmarshaller_for::<CheckerTypeParams>);
     // ts#63943
     m.insert(
         Method::IS_READONLY_SYMBOL,
@@ -1942,6 +1941,8 @@ pub struct TypeResponse {
     pub id: TypeID,
     pub flags: u32,
     pub object_flags: u32,
+    // ts#64080
+    pub is_tuple_type: bool,
 
     // Value is literal type data. BigInt literals are encoded as signed decimal
     // strings because JSON cannot represent bigint; absent values are null.
@@ -2002,6 +2003,7 @@ impl MarshalerTo for TypeResponse {
         marshal_field(enc, &mut first, "id", &self.id)?;
         marshal_field(enc, &mut first, "flags", &self.flags)?;
         marshal_field_omitempty(enc, &mut first, "objectFlags", &self.object_flags)?;
+        marshal_field_omitempty(enc, &mut first, "isTupleType", &self.is_tuple_type)?;
         marshal_field(enc, &mut first, "value", &self.value)?;
         marshal_field_omitzero(enc, &mut first, "target", &self.target)?;
         marshal_field_omitempty(enc, &mut first, "typeParameters", &self.type_parameters)?;
@@ -2080,19 +2082,20 @@ pub fn new_type_response(c: &Checker, t: TypeId, id: TypeID) -> TypeResponse {
         }
     } else if flags.intersects(TypeFlags::OBJECT) {
         resp.object_flags = ty.object_flags().0;
+        // ts#64080
+        resp.is_tuple_type = c.is_tuple_type_exported(t);
         let object_flags = ty.object_flags();
         if object_flags.intersects(ObjectFlags::REFERENCE) {
-            // PORT: Go takes `tuple.AsTypeReference()` or `t.AsTypeReference()`
-            // and calls the promoted `Type.Target()` of the same type.
-            if object_flags.intersects(ObjectFlags::TUPLE) {
+            // PORT: Go takes `ref := t.AsTypeReference()` and calls the
+            // promoted `Type.Target()` of the same type.
+            let _ = ty.as_type_reference();
+            if c.is_tuple_type_target(t) {
                 let tuple = ty.as_tuple_type();
                 resp.element_flags = tuple.element_flags();
                 let fixed_len = tuple.fixed_length();
                 resp.fixed_length = Some(fixed_len);
                 let is_readonly = tuple.is_readonly();
                 resp.tuple_readonly = Some(is_readonly);
-            } else {
-                let _ = ty.as_type_reference();
             }
             if ty.target().is_some() {
                 resp.target = type_handle(ty.target());

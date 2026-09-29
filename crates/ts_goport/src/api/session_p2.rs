@@ -1163,22 +1163,6 @@ impl Session {
         Ok(result)
     }
 
-    // Go: api/session.go:2159 handleIsTupleType
-    // handleIsTupleType returns whether a type is a tuple type.
-    pub fn handle_is_tuple_type(
-        &self,
-        ctx: &Context,
-        params: &CheckerTypeParams,
-    ) -> Result<bool, GoError> {
-        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
-
-        let (owner, t) = setup.resolve_type_handle(params.type_)?;
-        let t = checker_type(&setup.checker, &owner, t);
-
-        let result = setup.checker.borrow().is_tuple_type_exported(t);
-        Ok(result)
-    }
-
     // Go: api/session.go handleIsReadonlySymbol (ts#63943)
     // handleIsReadonlySymbol returns whether a symbol is a readonly symbol.
     pub fn handle_is_readonly_symbol(
