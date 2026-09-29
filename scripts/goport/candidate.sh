@@ -125,10 +125,24 @@ check_branch() {
   sha=$(git rev-parse --verify --quiet "$branch^{commit}") || die "unknown branch or commit: $branch"
   scope
   say "check $branch ${sha:0:9} against $(st .batch.checkout) ${base:0:9}; scope: ${POS[*]}${NEG[*]:+ except ${NEG[*]}}"
+  # Reverts: a path where the checkout already has main's version (an accepted change, merged into main),
+  # the branch has another version, and the branch did not change the path since its merge base with main.
+  # Applying the branch would undo the accepted change (bump B wave 3 would have reverted R131's Cargo
+  # files). Merge main into the branch first. Paths where the checkout is older than main do not count.
+  mb=$(git merge-base main "$sha")
+  local -a own
+  local -A main_blob base_blob
+  local mode type obj
+  mapfile -t own < <(git diff --no-renames --name-only "$mb" "$sha")
+  while IFS=$' \t' read -r -d '' mode type obj path; do main_blob[$path]=$obj; done < <(git ls-tree -r -z main)
+  while IFS=$' \t' read -r -d '' mode type obj path; do base_blob[$path]=$obj; done < <(git ls-tree -r -z "$base")
   while IFS= read -r -d '' status && IFS= read -r -d '' path; do
     if in_scope "$path" "${NEG[@]}"; then skipped=$((skipped + 1)); continue; fi
     n=$((n + 1))
     in_scope "$path" "${POS[@]}" || problems+=("outside allowedChangedFiles: $path")
+    if [[ -n ${base_blob[$path]:-} && ${main_blob[$path]:-} == "${base_blob[$path]}" ]] && ! in_list "$path" "${own[@]}"; then
+      problems+=("reverts $path: the checkout has main's version and the branch did not change it (merge main into the branch first)")
+    fi
     if [[ $status != D && $path == *.rs ]]; then
       nrs=$((nrs + 1))
       fmt_clean "$sha:$path" || problems+=("rustfmt --edition 2024 would change $path")
@@ -138,7 +152,6 @@ check_branch() {
   # Protected paths the branch itself changed (from its merge base with main, so paths that only main changed
   # since do not count). A batch that must change one lists the exact path and no exclude glob names it.
   mapfile -t protected < <(python3 "$G/open_revision.py" --protected)
-  mb=$(git merge-base main "$sha")
   while IFS= read -r -d '' path; do
     in_scope "$path" "${protected[@]}" || continue
     if in_list "$path" "${POS[@]}" && ! in_scope "$path" "${NEG[@]}"; then continue; fi
@@ -280,6 +293,9 @@ side_unit() {
     say "$(date -u +%FT%TZ) build release bins in $TARGET"
     if [[ $DRY == 0 ]]; then exec 8> /tmp/ts-rust-candidate-target.lock; flock 8; fi
     # Evidence bins: the shipped toolchain (not the nightly edit-loop default) and no incremental cache.
+    # The split crates are cleaned first: a build of them from another worktree in this target would look
+    # fresh (R132 side try 1). ts_goport itself is rebuilt whenever the applied source changes.
+    run_sh "cd $wt && TS_CARGO_NIGHTLY=0 TS_CARGO_LOCK_ID=candidate-side TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$TARGET $ROOT/scripts/run-cargo-capped.sh clean --release -p goport_util -p goport_lsproto > $C/clean.log 2>&1"
     run_sh "cd $wt && TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=12 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$TARGET $ROOT/scripts/run-cargo-capped.sh build --locked --release -p ts_goport ${BINS[*]/#/--bin } > $C/build.log 2>&1"
     run_sh "rm -rf $B.new && mkdir $B.new && cd $TARGET/release && cp ${BINS[*]} $B.new/ && cd $B.new && sha256sum ${BINS[*]} > bins.sha256 && echo $commit > COMMIT"
     if [[ $DRY == 0 ]]; then

@@ -4,8 +4,9 @@
 # usage: scripts/goport/build-goport-tests.sh <checkout> <testbin-dir>
 #
 # Builds like the candidate release bins (candidate.sh side): the default toolchain (TS_CARGO_NIGHTLY=0),
-# no incremental cache, --release --locked, in the shared candidate target runtime/cargo-target under
-# its lock /tmp/ts-rust-candidate-target.lock. The test binaries: the lib tests and every [[test]]
+# no incremental cache, --release --locked, in the shared candidate target runtime/cargo-target (only for
+# the checker-port checkout; any other checkout builds in <checkout>/target/goport-tests) under the lock
+# /tmp/ts-rust-candidate-target.lock. The test binaries: the lib tests and every [[test]]
 # target (go_baselines too, which has test = false) of each workspace member that is not in
 # NOT_PROTECTED below. `cargo metadata` of the checkout gives the list, so a new crate (a parts/ crate,
 # a kept crate) or a new tests/*.rs target joins the set with no edit here. Bin and example targets have
@@ -44,8 +45,16 @@ fail() { echo "build-goport-tests.sh: $2" >&2; echo "FAIL rc=$1"; exit "$1"; }
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # The main checkout: the parent of the common git dir (this script can run from a worktree).
 ROOT=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
-TARGET=$ROOT/target/continuation-r97-goport/runtime/cargo-target
 CO=$(realpath -- "$1") || fail 2 "no checkout $1"
+# The shared candidate target only for the candidate checkout. Cargo names a path crate's artifacts by its
+# path relative to the workspace root, so the same crate built from another worktree lands on the same
+# files, and its dep-info then points at that worktree: a later candidate build sees it as fresh and links
+# stale code (R132 side try 1, goport_util from goport-legacy1). Other checkouts use their own target.
+if [[ $CO == "$ROOT/target/worktrees/checker-port" ]]; then
+  TARGET=$ROOT/target/continuation-r97-goport/runtime/cargo-target
+else
+  TARGET=$CO/target/goport-tests
+fi
 TB=$(realpath -m -- "$2")
 [[ ! -e $TB ]] || fail 2 "$TB exists (a test bin dir is never replaced)"
 [[ -f $CO/crates/ts_goport/Cargo.toml ]] || fail 2 "$CO has no crates/ts_goport"
