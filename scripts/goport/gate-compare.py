@@ -42,6 +42,13 @@ The base growth comes from a growth FAIL detail, or else from the base gate's ru
 (for a MATCH item). When it is unknown, a FAIL is a regression. When every project's cap is 1.00, root
 closes the openDefects record, and from then on every FAIL is a regression.
 
+Tools. The manifest records the sha256 of every tool that judges the items: oracle, goDumper, gate,
+allowList, each stage script (scripts; most of them live under target/, which no protected path covers)
+and the cached Go outputs (oracleCaches). Each hash must equal the base run's hash. A changed or removed
+tool is a regression unless the batch in --state lists that exact change in gateToolChanges:
+{"key": "<key as in toolChanges>", "from": "<base sha256>", "to": "<new sha256>", "reason": "..."}; the
+reviewer judges each listed change. A tool that the base run did not record is listed in newTools only.
+
 Prints one JSON object, and writes it to --out when given. Exit 0: no regression.
 Exit 1: regressions. Exit 2: bad input.
 """
@@ -121,12 +128,29 @@ def run_growth(manifest_path, manifest, item):
     return None
 
 
-def open_defects(state_path):
+def read_batch(state_path):
     try:
-        batch = json.load(open(state_path))['batch']
+        return json.load(open(state_path))['batch']
     except (OSError, KeyError, ValueError) as e:
         fail(f'cannot read the batch from {state_path}: {e}')
+
+
+def open_defects(batch):
     return {d.get('id') for d in batch.get('openDefects') or [] if str(d.get('status', '')).startswith('open')}
+
+
+def tool_hashes(m):
+    """key -> sha256 of every tool the manifest records."""
+    h = {}
+    for k in ('oracle', 'goDumper', 'gate', 'allowList'):
+        v = m.get(k)
+        if isinstance(v, dict) and v.get('sha256'):
+            h[k] = v['sha256']
+    for path, sha in (m.get('scripts') or {}).items():
+        h[f'script:{path}'] = sha
+    for path, sha in (m.get('oracleCaches') or {}).items():
+        h[f'oracleCache:{path}'] = sha
+    return h
 
 
 def main():
@@ -138,7 +162,8 @@ def main():
     a = p.parse_args()
     bm, base, bhead = load(a.base)
     nm, new, nhead = load(a.new)
-    defects = open_defects(a.state)
+    batch = read_batch(a.state)
+    defects = open_defects(batch)
     # Allow entries of the base allow list, by (entry id, condition).
     base_allow = {(e['id'], e['condition']) for e in (bm.get('allowList') or {}).get('entries', [])}
     regressions, fixed, known_open, reallowed = [], [], [], []
@@ -209,6 +234,21 @@ def main():
                 regress(i, base[i], n, f'growth {"unknown" if g is None else f"{g:.2f}"} after the cap of {project} was lowered '
                                        f'to {NORMAL_LIMIT:.2f} (base growth {c["baseGrowth"]:.2f})')
 
+    # Tools: every hash the base recorded must be equal in the new run, or be listed in batch.gateToolChanges.
+    listed = {(c.get('key'), c.get('from'), c.get('to')) for c in batch.get('gateToolChanges') or []}
+    bt, nt = tool_hashes(bm), tool_hashes(nm)
+    tool_changes = []
+    for k, bsha in sorted(bt.items()):
+        nsha = nt.get(k)
+        if nsha == bsha:
+            continue
+        ok = (k, bsha, nsha) in listed
+        tool_changes.append({'key': k, 'from': bsha, 'to': nsha, 'listed': ok})
+        if not ok:
+            regressions.append({'id': f'tool/{k}', 'base': bsha, 'new': nsha or 'REMOVED',
+                                'why': 'tool changed and not listed in batch.gateToolChanges' if nsha else 'tool removed',
+                                'detail': k})
+
     # Allow entries the new run used that the base allow list did not have. The reviewer checks them.
     used = {(e['id'], e['condition']) for r in new.values() for e in r.get('allowedBy') or []}
     out = {'base': bhead, 'new': nhead,
@@ -221,6 +261,7 @@ def main():
            'pinChanged': bhead['upstreamPin'] != nhead['upstreamPin'], 'modeChanged': bhead['mode'] != nhead['mode'],
            'allowListChanged': (nm.get('allowList') or {}).get('sha256') != (bm.get('allowList') or {}).get('sha256'),
            'newAllowEntries': [{'id': i, 'condition': c} for i, c in sorted(used - base_allow)],
+           'toolChanges': tool_changes, 'newTools': sorted(k for k in nt if k not in bt),
            'regressions': regressions, 'knownOpen': known_open, 'reallowed': reallowed, 'fixed': sorted(fixed),
            'newIds': sorted(i for i in new if i not in base),
            'counts': {'baseItems': len(base), 'items': len(new), 'regressions': len(regressions),

@@ -550,6 +550,8 @@ print(json.dumps({
     'gate': {'path': gate, 'sha256': sha(gate)},
     'allowList': {'path': allow, 'sha256': sha(allow)},
     'scripts': {str(p): sha(p) for p in scripts},
+    # The cached Go outputs of the sweep stages (gate-compare.py compares them with the base run).
+    'oracleCaches': {str(p.resolve()): sha(p) for p in sorted((R / 'oracle-sweep').glob('*.txt'))},
     **({'upstreamPin': os.environ['GOPORT_PIN_ACTIVE']} if os.environ.get('GOPORT_PIN_ACTIVE') else {}),
 }))
 EOF

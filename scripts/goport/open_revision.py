@@ -62,7 +62,7 @@ PROTECTED = list(dict.fromkeys([
                                       'build-goport-tests.sh', 'goport-tests.sh', 'compare-tests.py',
                                       'gate.sh', 'gate-allow.txt', 'gate-compare.py', 'ls_edit_bench.py',
                                       'bound2.sh', 'lsp_oracle.py', 'api_oracle.py', 'oracle-compare.py',
-                                      'np-suite.sh', 'remote.sh')),
+                                      'np-suite.sh', 'remote.sh', 'purge-foreign-fingerprints.py')),
     *runner_scripts()]))
 # Scope of a goport batch: the whole repository except the saved state, target/ and PROTECTED.
 # candidate.sh check and open read it through --allowed. "!" entries exclude.

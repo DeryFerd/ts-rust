@@ -290,14 +290,20 @@ side_unit() {
   # Bins (release profile). The target lock keeps another side run from replacing the target's bins
   # between this build and the copy.
   if [[ -f $B/bins.sha256 ]]; then say "reuse bins $B (built from $(cat "$B/COMMIT"))"; else
-    say "$(date -u +%FT%TZ) build release bins in $TARGET"
+    # The shared candidate target only for the candidate checkout: another checkout builds in its own
+    # target. Cargo names a workspace crate's artifacts by its workspace-relative path and judges freshness
+    # by mtime, so a build from another worktree into the shared target can look fresh to the next
+    # checker-port build and be linked as stale code (R132 side try 1: goport_util from goport-legacy1).
+    local target=$TARGET
+    [[ $(realpath "$wt") == "$(realpath "$CHECKER_PORT")" ]] || target=$wt/target/candidate-side
+    say "$(date -u +%FT%TZ) build release bins in $target"
     if [[ $DRY == 0 ]]; then exec 8> /tmp/ts-rust-candidate-target.lock; flock 8; fi
     # Evidence bins: the shipped toolchain (not the nightly edit-loop default) and no incremental cache.
-    # The split crates are cleaned first: a build of them from another worktree in this target would look
-    # fresh (R132 side try 1). ts_goport itself is rebuilt whenever the applied source changes.
-    run_sh "cd $wt && TS_CARGO_NIGHTLY=0 TS_CARGO_LOCK_ID=candidate-side TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$TARGET $ROOT/scripts/run-cargo-capped.sh clean --release -p goport_util -p goport_lsproto > $C/clean.log 2>&1"
-    run_sh "cd $wt && TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=12 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$TARGET $ROOT/scripts/run-cargo-capped.sh build --locked --release -p ts_goport ${BINS[*]/#/--bin } > $C/build.log 2>&1"
-    run_sh "rm -rf $B.new && mkdir $B.new && cd $TARGET/release && cp ${BINS[*]} $B.new/ && cd $B.new && sha256sum ${BINS[*]} > bins.sha256 && echo $commit > COMMIT"
+    # Units whose dep-info names another checkout's files (a crate with sources outside its package dir,
+    # like goport_util) are removed first, so cargo builds them again from this checkout.
+    run_sh "python3 $G/purge-foreign-fingerprints.py $target $wt > $C/purge.log 2>&1"
+    run_sh "cd $wt && TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=12 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$target $ROOT/scripts/run-cargo-capped.sh build --locked --release -p ts_goport ${BINS[*]/#/--bin } > $C/build.log 2>&1"
+    run_sh "rm -rf $B.new && mkdir $B.new && cd $target/release && cp ${BINS[*]} $B.new/ && cd $B.new && sha256sum ${BINS[*]} > bins.sha256 && echo $commit > COMMIT"
     if [[ $DRY == 0 ]]; then
       exec 8>&-
       [[ $(evidence_key "$wt" "$pin") == "$key" ]] || die "the source changed during the build; $B.new is not cached"
@@ -592,7 +598,8 @@ if gc:
     n = gc['counts']
     ev.append(f"Gate compare with base {base['batch']} R{base['revision']} {base['gate']['path']} ({gc['base']['label']}): "
               f"{n['regressions']} regressions, {n['knownOpen']} open-defect items under their caps, {n['fixed']} fixed; "
-              f"pin changed {gc['pinChanged']}, allow list changed {gc['allowListChanged']}, new allow entries {len(gc['newAllowEntries'])}. "
+              f"pin changed {gc['pinChanged']}, allow list changed {gc['allowListChanged']}, new allow entries {len(gc['newAllowEntries'])}, "
+              f"tool changes {[(t['key'], t['listed']) for t in gc.get('toolChanges', [])]}. "
               f"Cap rule: {gc['capRule']}. Caps now: " + ', '.join(f"{p} {c['cap']:.2f}{' (lowered)' if c['lowered'] else ''}" for p, c in gc['longCaps'].items())
               + '.' + (' Open-defect items: ' + '; '.join(f"{k['id']} growth {k['growth']:.2f} (cap {k['cap']:.2f}, base {k['baseGrowth']:.2f})" for k in gc['knownOpen']) + '.' if gc['knownOpen'] else ''))
     if gc['regressions']:

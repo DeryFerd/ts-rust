@@ -116,6 +116,8 @@ echo "$(date -u +%FT%TZ) build test bins of $CO ${commit:0:9} (crates tree ${tre
 # the copy. Cargo runs with fd 8 closed, so a started sccache server does not keep the lock.
 exec 8> /tmp/ts-rust-candidate-target.lock
 flock 8
+python3 "$here/purge-foreign-fingerprints.py" "$TARGET" "$CO" > "$NEW/logs/purge.log" 2>&1 ||
+  fail 5 "fingerprint purge failed; see $NEW/logs/purge.log"
 cargo_test() {
   (cd "$CO" && TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 TS_CARGO_LOCK_ID=candidate-side \
     TS_CARGO_JOBS="${TS_CARGO_JOBS:-12}" TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR="$TARGET" \
