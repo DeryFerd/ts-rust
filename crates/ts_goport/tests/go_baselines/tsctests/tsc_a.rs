@@ -2552,6 +2552,47 @@ fn tsc_incremental_inputs() -> Vec<TscInput> {
             command_line_args: args!["--noEmit"],
             ..Default::default()
         },
+        TscInput {
+            sub_scenario: "json module diagnostics are cleared after fixing the json file".into(),
+            files: file_map! {
+                "/home/src/workspaces/project/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"strict": true,
+							"noEmit": true,
+							"incremental": true,
+							"resolveJsonModule": true,
+							"esModuleInterop": true
+						}
+					}"#),
+                "/home/src/workspaces/project/data.json" => r#"{ "title": "hello" }"#,
+                "/home/src/workspaces/project/check.ts" => dedent(r#"
+					import type data from "./data.json";
+
+					type Shape = { title: string };
+					type Covers<T extends Shape> = T;
+
+					export type Check = Covers<typeof data>;
+				"#),
+            },
+            edits: vec![
+                TscEdit {
+                    caption: "remove required property".into(),
+                    edit: edit(|sys: &TestSys| {
+                        sys.write_file_no_error("/home/src/workspaces/project/data.json", "{}");
+                    }),
+                    ..Default::default()
+                },
+                TscEdit {
+                    caption: "restore required property".into(),
+                    edit: edit(|sys: &TestSys| {
+                        sys.write_file_no_error("/home/src/workspaces/project/data.json", r#"{ "title": "fixed" }"#);
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
     ]
 }
 
