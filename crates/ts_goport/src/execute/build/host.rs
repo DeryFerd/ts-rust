@@ -12,6 +12,8 @@
 
 use crate::contentmapper::{self, Mapper, Project, SourceFiles};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
+use crate::execute::build::config_prefetch::ConfigPrefetch;
+use crate::execute::build::orchestrator::MTimePrefetch;
 use crate::execute::build::parse_cache::ParseCache;
 use crate::execute::incremental::incremental;
 use crate::execute::tsc::compile::System;
@@ -102,9 +104,17 @@ pub struct BuildHost {
 
     // caches that stay as long as they are needed
     pub resolved_references: ParseCache<Path, Rc<ParsedCommandLine>>,
+    // PORT: not in Go (perf). The threads that parse the configs of the
+    // graph ahead of `get_resolved_project_reference` (config_prefetch.rs).
+    pub config_prefetch: RefCell<Option<ConfigPrefetch>>,
     // PORT: Go `*collections.SyncMap`. The task `writeFile` stores into it
     // from the checker threads.
     pub m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
+    // PORT: not in Go (perf). The mtimes that the build info threads read
+    // for the up-to-date checks of this build cycle (orchestrator.rs
+    // `BuildInfoPrefetch`). `load_or_store_m_time` takes one where it would
+    // read the file system.
+    pub m_time_prefetch: RefCell<Option<MTimePrefetch>>,
 }
 
 impl BuildHost {
@@ -137,7 +147,26 @@ impl BuildHost {
             source_files: ParseCache::default(),
             config_times: RefCell::new(FxHashMap::default()),
             resolved_references: ParseCache::default(),
+            config_prefetch: RefCell::new(None),
             m_times: Arc::default(),
+            m_time_prefetch: RefCell::new(None),
+        }
+    }
+
+    // Go: build/host.go:72, the raw command line options of
+    // `GetResolvedProjectReference`: wrapped in a "compilerOptions" key to
+    // match the tsconfig.json structure.
+    pub fn command_line_raw(&self) -> Option<IndexMap<String, CompilerOptionsValue>> {
+        match &self.command.raw {
+            CompilerOptionsValue::Map(raw) => {
+                let mut wrapped = IndexMap::default();
+                wrapped.insert(
+                    "compilerOptions".to_string(),
+                    CompilerOptionsValue::Map(raw.clone()),
+                );
+                Some(wrapped)
+            }
+            _ => None,
         }
     }
 
@@ -188,7 +217,17 @@ impl BuildHost {
             }
         }
         if !found {
-            m_time = incremental::get_m_time(&*self.host, file);
+            // PORT: perf. An mtime that a build info thread read.
+            let prefetched = self.m_time_prefetch.borrow().as_ref().and_then(|m_times| {
+                m_times
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&path)
+            });
+            m_time = match prefetched {
+                Some(m_time) => m_time,
+                None => incremental::get_m_time(&*self.host, file),
+            };
         }
         if store {
             m_time = *self
@@ -320,17 +359,7 @@ impl CompilerHost for BuildHost {
             |path| {
                 let config_start = self.sys.now();
                 // Wrap command line options in "compilerOptions" key to match tsconfig.json structure
-                let command_line_raw = match &self.command.raw {
-                    CompilerOptionsValue::Map(raw) => {
-                        let mut wrapped = IndexMap::default();
-                        wrapped.insert(
-                            "compilerOptions".to_string(),
-                            CompilerOptionsValue::Map(raw.clone()),
-                        );
-                        Some(wrapped)
-                    }
-                    _ => None,
-                };
+                let command_line_raw = self.command_line_raw();
                 let (command_line, _) = get_parsed_command_line_of_config_file_path(
                     file_name,
                     path.clone(),
@@ -363,6 +392,36 @@ impl ParseConfigHost for BuildHost {
 
     fn get_current_directory(&self) -> String {
         self.host.get_current_directory()
+    }
+
+    // PORT: not in Go (perf). The file names that a config thread matched
+    // (config_prefetch.rs), else Go `getFileNamesFromConfigSpecs`.
+    fn get_file_names_from_config_specs(
+        &self,
+        config_file_name: &str,
+        config_file_specs: &ConfigFileSpecs,
+        base_path: &str,
+        options: Option<&CompilerOptions>,
+        extra_extensions: &[String],
+    ) -> (Vec<String>, i32) {
+        let fs = ParseConfigHost::fs(self);
+        match &*self.config_prefetch.borrow() {
+            Some(prefetch) => prefetch.get_file_names_from_config_specs(
+                config_file_name,
+                config_file_specs,
+                base_path,
+                options,
+                extra_extensions,
+                &*fs,
+            ),
+            None => get_file_names_from_config_specs(
+                config_file_specs,
+                base_path,
+                options,
+                &*fs,
+                extra_extensions,
+            ),
+        }
     }
 }
 
