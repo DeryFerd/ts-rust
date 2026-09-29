@@ -15,9 +15,8 @@ and limitations under the License.
 
 
 /// <reference lib="es2026" />
-/// <reference lib="esnext.intl" />
-/// <reference lib="esnext.decorators" />
-/// <reference lib="esnext.disposable" />
-/// <reference lib="esnext.sharedmemory" />
-/// <reference lib="esnext.temporal" />
-/// <reference lib="esnext.date" />
+/// <reference lib="dom" />
+/// <reference lib="webworker.importscripts" />
+/// <reference lib="scripthost" />
+/// <reference lib="dom.iterable" />
+/// <reference lib="dom.asynciterable" />

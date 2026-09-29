@@ -14,10 +14,12 @@ and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference lib="es2026" />
-/// <reference lib="esnext.intl" />
-/// <reference lib="esnext.decorators" />
-/// <reference lib="esnext.disposable" />
-/// <reference lib="esnext.sharedmemory" />
-/// <reference lib="esnext.temporal" />
-/// <reference lib="esnext.date" />
+/// <reference lib="es2025.iterator" />
+
+interface IteratorConstructor {
+    /**
+     * Creates an iterator that yields the values of each iterable in sequence.
+     * @param iterables Iterable objects to concatenate.
+     */
+    concat<T extends readonly unknown[] | []>(...iterables: { -readonly [K in keyof T]: Iterable<T[K]> & object }): IteratorObject<T[number], undefined, unknown>;
+}

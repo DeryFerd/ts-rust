@@ -14,10 +14,14 @@ and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference lib="es2026" />
-/// <reference lib="esnext.intl" />
-/// <reference lib="esnext.decorators" />
-/// <reference lib="esnext.disposable" />
-/// <reference lib="esnext.sharedmemory" />
-/// <reference lib="esnext.temporal" />
-/// <reference lib="esnext.date" />
+/// <reference lib="es2015.iterable" />
+
+interface Math {
+    /**
+     * Sums the values in an iterable while minimizing loss of precision.
+     * @param items An iterable of numbers to sum.
+     * @throws {TypeError} If `items` is not iterable or contains a value that is not a number.
+     * @throws {RangeError} If `items` contains 2^53 or more values.
+     */
+    sumPrecise(items: Iterable<number>): number;
+}
