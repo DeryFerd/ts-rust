@@ -42,6 +42,7 @@ pub(crate) mod util;
 
 mod api_session_apistate_test;
 mod api_session_completion_test;
+mod api_session_temporary_test;
 mod ata_discovertypings_test;
 mod ata_installnpmpackages_test;
 mod ata_test;
