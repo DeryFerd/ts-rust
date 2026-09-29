@@ -6,7 +6,8 @@
 # defines incomplete().
 #
 # EXIT2_PINS lists the Go pins at which tsgo exits 2 for diagnostics under --noEmit (tsgo #4407,
-# bbdf7a24b; the first pin is 16c25522e123, bump B). A later pin bump adds its pin here.
+# bbdf7a24b; the first pin is 16c25522e123, bump B; 673a5f17d713 is bump C). A later pin bump adds its
+# pin here.
 # - At any other pin, and with no pin, the old rule holds byte for byte: a run is complete with exit 0
 #   or 1 and no "unported" line on stderr (GOPORT_MAX_EXIT 1).
 # - At a pin in EXIT2_PINS, exit 2 is complete too, and a Go "panic: " line on stderr makes a run
@@ -14,7 +15,7 @@
 # Exits over GOPORT_MAX_EXIT are a crash (70: unported code or a Rust panic; 124: timeout; 128+N: a
 # signal). The stages that run Go in the same run (emit, corpus-diag, corpus-emit, typesyms) keep their
 # own rules and do not read this file.
-EXIT2_PINS="16c25522e123"
+EXIT2_PINS="16c25522e123 673a5f17d713"
 
 GOPORT_MAX_EXIT=1
 for exit2_pin in $EXIT2_PINS; do
