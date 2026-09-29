@@ -166,17 +166,9 @@ impl ResolutionState<'_> {
     }
 
     // Go: module/resolver.go:1236 getParsedPatternsForPaths
-    // PORT: `sync.Once` is a `None` check on the cached field.
     pub fn get_parsed_patterns_for_paths(&mut self) -> Rc<ParsedPatterns> {
-        if Rc::ptr_eq(&self.compiler_options, &self.resolver.compiler_options) {
-            return self.resolver.get_parsed_patterns_for_paths();
-        }
-        if self.parsed_patterns_for_paths.is_none() {
-            self.parsed_patterns_for_paths = Some(Rc::new(try_parse_patterns(
-                self.compiler_options.paths.as_ref(),
-            )));
-        }
-        self.parsed_patterns_for_paths.clone().unwrap()
+        self.resolver
+            .get_parsed_patterns_for_paths(&self.compiler_options)
     }
 
     // Go: module/resolver.go:1246 tryLoadModuleUsingPathsIfEligible
@@ -1405,17 +1397,12 @@ pub struct ParsedPatterns {
 }
 
 impl Resolver {
-    // Go: module/resolver.go:1976 getParsedPatternsForPaths
-    // PORT: `sync.Once` is a `None` check on `caches.parsed_patterns_for_paths`
-    // (a `RefCell<Option<Rc<ParsedPatterns>>>`).
-    pub fn get_parsed_patterns_for_paths(&self) -> Rc<ParsedPatterns> {
-        let mut cached = self.caches.parsed_patterns_for_paths.borrow_mut();
-        if cached.is_none() {
-            *cached = Some(Rc::new(try_parse_patterns(
-                self.compiler_options.paths.as_ref(),
-            )));
-        }
-        cached.clone().unwrap()
+    // Go: module/resolver.go:1991 getParsedPatternsForPaths
+    pub fn get_parsed_patterns_for_paths(
+        &self,
+        compiler_options: &Rc<CompilerOptions>,
+    ) -> Rc<ParsedPatterns> {
+        self.caches.parsed_patterns_for_paths.get(compiler_options)
     }
 }
 
@@ -1429,13 +1416,17 @@ pub fn try_parse_patterns(
     let paths = path_mappings.keys();
 
     let mut num_patterns = 0;
+    let mut num_matchables = 0;
     for path in paths.clone() {
         let pattern = try_parse_pattern(path);
-        if pattern.is_valid() && pattern.star_index == -1 {
-            num_patterns += 1;
+        if pattern.is_valid() {
+            if pattern.star_index == -1 {
+                num_matchables += 1;
+            } else {
+                num_patterns += 1;
+            }
         }
     }
-    let num_matchables = path_mappings.len() - num_patterns;
 
     let mut patterns: Vec<Pattern> = Vec::new();
     let mut matchable_string_set: FxHashSet<String> = FxHashSet::default();

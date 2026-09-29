@@ -88,7 +88,6 @@ impl Resolver {
             candidate_ending_is_from_config: false,
             resolved_package_directory: false,
             diagnostics: Vec::new(),
-            parsed_patterns_for_paths: None,
         };
         if let Some(info) = package_json.as_ref().filter(|p| p.exists()) {
             let exports = &info.contents.as_ref().unwrap().fields.path_fields.exports;

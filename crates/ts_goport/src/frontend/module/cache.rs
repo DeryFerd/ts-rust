@@ -78,20 +78,59 @@ impl TypeRefDirectiveResolutionCache {
     }
 }
 
-// Go: module/cache.go:52 caches
+// Go: module/cache.go:50 parsedPatternsCache
+// PORT: Go keys the `SyncMap` by the `*OrderedMap` of `paths`, and the key
+// keeps that map alive. The Rust `paths` map is a field of the
+// `CompilerOptions`, so the key is the address of that field (0 for a nil
+// map), and the entry holds the options `Rc` that owns it.
+#[derive(Default)]
+pub struct ParsedPatternsCache {
+    cache: RefCell<FxHashMap<usize, (Rc<CompilerOptions>, Rc<ParsedPatterns>)>>,
+}
+
+impl ParsedPatternsCache {
+    // Go: module/cache.go:54 parsedPatternsCache.Get
+    // PORT: Go takes `compilerOptions.Paths`; this takes the options that
+    // own it (see the type).
+    pub fn get(&self, compiler_options: &Rc<CompilerOptions>) -> Rc<ParsedPatterns> {
+        let path_mappings = compiler_options.paths.as_ref();
+        let key = path_mappings.map_or(0, |path_mappings| {
+            std::ptr::from_ref(path_mappings) as usize
+        });
+        if let Some((_, patterns)) = self.cache.borrow().get(&key) {
+            return patterns.clone();
+        }
+        let patterns = Rc::new(try_parse_patterns(path_mappings));
+        self.cache
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| (compiler_options.clone(), patterns))
+            .1
+            .clone()
+    }
+
+    /// Drops the entries (`Caches::release`).
+    // PORT: not in Go.
+    fn clear(&self) {
+        let entries = std::mem::take(&mut *self.cache.borrow_mut());
+        drop(entries);
+    }
+}
+
+// Go: module/cache.go:62 caches
 // PORT: Go `*packagejson.InfoCache` is shared between resolvers
 // (`ResolverOptions.PackageJsonCache`), so it is `Rc<InfoCache>`. `InfoCache`
-// has interior mutability, like the Go `SyncMap`. Go `sync.Once` plus the
-// pointer field is a `RefCell<Option<..>>`, filled on first use.
+// has interior mutability, like the Go `SyncMap`.
 pub struct Caches {
     pub package_json_info_cache: Rc<InfoCache>,
 
     pub module_resolution_cache: ModuleResolutionCache,
     pub type_ref_directive_resolution_cache: TypeRefDirectiveResolutionCache,
 
-    // Cached representation for `core.CompilerOptions.paths`.
-    // Doesn't handle other path patterns like in `typesVersions`.
-    pub parsed_patterns_for_paths: RefCell<Option<Rc<ParsedPatterns>>>,
+    // Cached representations for `core.CompilerOptions.paths`, keyed by the
+    // path mappings themselves. This does not handle other path patterns such
+    // as `typesVersions`.
+    pub parsed_patterns_for_paths: ParsedPatternsCache,
 
     /// The resolution caches that this resolver shares with the other
     /// resolvers of one program load (see `SharedResolutionCache`). `None`
@@ -118,7 +157,7 @@ impl Caches {
             package_json_info_cache,
             module_resolution_cache: ModuleResolutionCache::default(),
             type_ref_directive_resolution_cache: TypeRefDirectiveResolutionCache::default(),
-            parsed_patterns_for_paths: RefCell::new(None),
+            parsed_patterns_for_paths: ParsedPatternsCache::default(),
             shared: None,
             package_json_log: RefCell::new(Vec::new()),
             worker_package_jsons: RefCell::new(Vec::new()),
@@ -134,9 +173,9 @@ impl Caches {
         let modules = std::mem::take(&mut *self.module_resolution_cache.cache.borrow_mut());
         let type_ref_directives =
             std::mem::take(&mut *self.type_ref_directive_resolution_cache.cache.borrow_mut());
-        let patterns = self.parsed_patterns_for_paths.borrow_mut().take();
+        self.parsed_patterns_for_paths.clear();
         let worker_package_jsons = std::mem::take(&mut *self.worker_package_jsons.borrow_mut());
-        drop((modules, type_ref_directives, patterns, worker_package_jsons));
+        drop((modules, type_ref_directives, worker_package_jsons));
         if Rc::strong_count(&self.package_json_info_cache) == 1 {
             self.package_json_info_cache.clear();
         }

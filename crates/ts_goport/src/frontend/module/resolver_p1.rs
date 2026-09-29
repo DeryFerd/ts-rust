@@ -139,12 +139,6 @@ pub struct ResolutionState<'a> {
     pub candidate_ending_is_from_config: bool,
     pub resolved_package_directory: bool,
     pub diagnostics: Vec<Diagnostic>,
-
-    // Similar to whats on resolver but only done if compilerOptions are for project reference redirect
-    // Cached representation for `core.CompilerOptions.paths`.
-    // Doesn't handle other path patterns like in `typesVersions`.
-    // PORT: Go `sync.Once` plus the pointer field is an `Option`.
-    pub parsed_patterns_for_paths: Option<Rc<ParsedPatterns>>,
 }
 
 impl<'a> ResolutionState<'a> {
@@ -166,7 +160,6 @@ impl<'a> ResolutionState<'a> {
             candidate_ending_is_from_config: false,
             resolved_package_directory: false,
             diagnostics: Vec::new(),
-            parsed_patterns_for_paths: None,
         }
     }
 }
