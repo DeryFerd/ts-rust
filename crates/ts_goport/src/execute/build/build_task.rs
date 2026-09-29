@@ -6,7 +6,7 @@ use crate::execute::build::up_to_date_status::*;
 use crate::execute::incremental::build_info::{
     content_mapper_identities, is_build_info_file_name_default_library,
 };
-use crate::execute::incremental::emit_files::fs_error_text;
+use crate::execute::incremental::emit_files::{buffer_early_emit_writes, fs_error_text};
 use crate::execute::incremental::incremental::{BuildInfoReader, Host as IncrementalHost};
 use crate::execute::incremental::program::{
     NestedEmitNow, Program as IncrementalProgram, new_program as new_incremental_program,
@@ -41,7 +41,8 @@ use std::time::SystemTime;
 // `order` (see orchestrator.rs). The work that Go does on the task
 // goroutines still runs at the same time: each program checks on its own
 // checker threads from `build_project_start` on (`start_check`), emits on
-// them, and frees them in the background (`release_task_program`).
+// them when the check ends (the writes wait for `build_project_finish`),
+// and frees them in the background (`release_task_program`).
 //
 // PORT: the watch-only `updateWatch` and `resetConfig` are in
 // orchestrator_watch.rs, with the orchestrator watch code.
@@ -224,6 +225,11 @@ struct PendingCompile {
     report_diagnostic: DiagnosticReporter,
     errors: Rc<RefCell<Vec<Diagnostic>>>,
     compile_times: Rc<RefCell<CompileTimes>>,
+    // Go `t.writeFile`, and the build info that it wrote.
+    write_file: WriteFile,
+    written_build_info: WrittenBuildInfo,
+    // `incremental_program.start_emit` ran (see `compile_and_emit_start`).
+    emit_started: bool,
 }
 
 impl BuildTask {
@@ -570,6 +576,14 @@ impl BuildTask {
         // Go: compiler.NewProgram(compiler.ProgramOptions{Config, Host})
         let program = crate::execute::execute_tsc::new_program_version(compiler_host, resolved);
         compile_times.borrow_mut().parse_time = elapsed(&*sys, parse_start);
+        let written_build_info: WrittenBuildInfo = Arc::default();
+        let write_file = new_task_write_file(
+            written_build_info.clone(),
+            self.store_output_time_stamp(orchestrator),
+            host.m_times.clone(),
+            orchestrator.compare_paths_options().clone(),
+        );
+        let emit_started = testing.is_none();
         let changes_compute_start = sys.now();
         let incremental_program = {
             let _scope = crate::core::enter_program(Some(program));
@@ -585,14 +599,30 @@ impl BuildTask {
                 testing.is_some(),
             );
             compile_times.borrow_mut().changes_compute_time = elapsed(&*sys, changes_compute_start);
-            // PORT: Go checks this project on its goroutine while other
-            // tasks make their programs and emit. Here the check starts on
-            // this program's checker threads now, and the emit
-            // (`compile_and_emit_finish`) waits for it. The statistics'
-            // check time is the time of that wait plus the time that
+            // PORT: Go checks and emits this project on its goroutine
+            // while other tasks make their programs and emit. Here the
+            // check starts on this program's checker threads now, and so
+            // does the emit, behind the check, as in `tsc -p` (when the
+            // rules of `Program::start_emit` allow it; else the emit runs
+            // in `compile_and_emit_finish`). The emit keeps its writes
+            // until `compile_and_emit_finish`, which writes them first
+            // (`buffer_early_emit_writes`): the tasks still write in build
+            // order, and a task that runs beside others reads the file
+            // system before they write. The statistics' check time is the
+            // time of the wait for the check plus the time that
             // `start_check` spent on the affected files
             // (`Program::take_started_check_time`).
+            // PORT: testing. A test finishes the task at once, and its emit
+            // starts there, as without the early start.
             incremental_program.start_check();
+            if emit_started {
+                buffer_early_emit_writes(|| {
+                    incremental_program.start_emit(EmitOptions {
+                        write_file: Some(write_file.clone()),
+                        ..EmitOptions::default()
+                    });
+                });
+            }
             incremental_program
         };
         self.compile = Some(PendingCompile {
@@ -603,6 +633,9 @@ impl BuildTask {
             report_diagnostic,
             errors,
             compile_times,
+            write_file,
+            written_build_info,
+            emit_started,
         });
         true
     }
@@ -618,17 +651,13 @@ impl BuildTask {
             report_diagnostic,
             errors,
             compile_times,
+            write_file,
+            written_build_info,
+            emit_started,
         } = self.compile.take().expect("compile_and_emit_start ran");
         let sys = orchestrator.sys();
         let host = orchestrator.host();
         let resolved = self.resolved().clone();
-        let written_build_info: WrittenBuildInfo = Arc::default();
-        let write_file = new_task_write_file(
-            written_build_info.clone(),
-            self.store_output_time_stamp(orchestrator),
-            host.m_times.clone(),
-            orchestrator.compare_paths_options().clone(),
-        );
         let (result, statistics) = {
             let _scope = crate::core::enter_program(Some(program));
             WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = Some(sys.clone()));
@@ -636,11 +665,14 @@ impl BuildTask {
             // `tsc -p` (`Program::start_check_and_emit`), with the options of
             // the emit call in `EmitFilesAndReportErrors` (the same
             // `WriteFile`). `EmitAndReportStatistics` makes the same calls
-            // as in Go and waits for that work.
-            incremental_program.start_emit(EmitOptions {
-                write_file: Some(write_file.clone()),
-                ..EmitOptions::default()
-            });
+            // as in Go and waits for that work. Outside tests the emit
+            // started with the program (`compile_and_emit_start`).
+            if !emit_started {
+                incremental_program.start_emit(EmitOptions {
+                    write_file: Some(write_file.clone()),
+                    ..EmitOptions::default()
+                });
+            }
             let emitted = emit_and_report_statistics(&EmitInput {
                 sys: &*sys,
                 program_like: &incremental_program,
