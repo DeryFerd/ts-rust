@@ -666,6 +666,16 @@ pub fn new_in_process_test_sys(input: &TscInput) -> Rc<TestSys> {
 /// stack. A test that compiles in its own process uses this, because the
 /// OS override is for the whole process.
 pub fn run_test_in_child(test: &str, body: impl FnOnce() + Send + 'static) {
+    run_test_in_child_with_env(test, &[], body);
+}
+
+/// `run_test_in_child` with the environment variables `env` set in the
+/// child, for a flag that the process reads once.
+pub fn run_test_in_child_with_env(
+    test: &str,
+    env: &[(&str, &str)],
+    body: impl FnOnce() + Send + 'static,
+) {
     if std::env::var_os(IN_CHILD_ENV).is_some_and(|value| value == test) {
         run_on_compile_thread(test, body);
         return;
@@ -674,6 +684,7 @@ pub fn run_test_in_child(test: &str, body: impl FnOnce() + Send + 'static) {
     let output = std::process::Command::new(exe)
         .args(["--exact", test, "--nocapture", "--test-threads", "1"])
         .env(IN_CHILD_ENV, test)
+        .envs(env.iter().copied())
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap_or_else(|err| panic!("cannot run {test}: {err}"));

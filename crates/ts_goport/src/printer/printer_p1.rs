@@ -419,11 +419,13 @@ impl Printer {
     // as `set_source_map_source` does. `source_file_ecma_line_map` of the
     // synthetic node would compute and leak a new map for each file. The
     // result is cached for one file in `current_line_map_cache`.
-    pub(crate) fn current_line_map(&self) -> &'static [i32] {
+    // lsshells M3b: the map of a freeable file version is a pinned guard,
+    // which the cache does not keep.
+    pub(crate) fn current_line_map(&self) -> FileRef<[i32]> {
         let file = self.current_source_file;
         let (cached_file, cached_line_map) = self.current_line_map_cache.get();
         if cached_file == file && file.is_some() {
-            return cached_line_map;
+            return FileRef::Static(cached_line_map);
         }
         let mut line_source = file;
         if is_synthetic_node(file) {
@@ -443,7 +445,9 @@ impl Printer {
             }
         }
         let line_map = source_file_ecma_line_map(line_source);
-        self.current_line_map_cache.set((file, line_map));
+        if let Some(static_map) = line_map.as_static() {
+            self.current_line_map_cache.set((file, static_map));
+        }
         line_map
     }
 }
@@ -1225,7 +1229,7 @@ impl Printer {
 
         let text = source_file_text(self.current_source_file);
         let line_map = self.current_line_map();
-        self.write_comment_range_worker(text, line_map, comment.kind, comment.text_range);
+        self.write_comment_range_worker(text, &line_map, comment.kind, comment.text_range);
     }
 
     // Go: printer/printer.go:648 writeCommentRangeWorker

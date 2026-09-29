@@ -156,7 +156,7 @@ impl LanguageService {
     ) -> Vec<lsproto::FoldingRange> {
         let mut regions: Vec<lsproto::FoldingRange> = Vec::with_capacity(40);
         let mut out = Vec::with_capacity(40);
-        let line_starts = get_ecma_line_starts(source_file);
+        let line_starts = &*get_ecma_line_starts(source_file);
         for &current_line_start in line_starts {
             let line_end = get_line_end_of_position(source_file, current_line_start);
             // PORT: Go slices the text by bytes. A line that ends in a

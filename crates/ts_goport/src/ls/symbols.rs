@@ -830,7 +830,7 @@ pub fn provide_workspace_symbols(
         }
         // PORT: Go iterates the declaration map in random order; the infos
         // are sorted below.
-        let declaration_map = source_file_get_declaration_map(source_file);
+        let declaration_map = &*source_file_get_declaration_map(source_file);
         for (name, declarations) in declaration_map {
             let score = get_match_score(name, query);
             if score >= 0 {

@@ -2861,9 +2861,10 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
 pub use goport_util::core::*;
 
 /// One version of a loaded source file: one per file id. The file registry
-/// (`ast/store.rs`) owns it from `publish_file_stores` on; read it with
-/// `crate::ast::go_file`. Program versions that share a file version share
-/// this value. Parser data is ready when the file is published. The binder
+/// (`ast/store.rs`) owns it from `publish_file_stores` on, or the
+/// `FileVersion` of a freeable file version (lsshells M3b); read it with
+/// `crate::ast::go_file` (a `FileRef` guard) or `crate::ast::with_go_file`.
+/// Program versions that share a file version share this value. Parser data is ready when the file is published. The binder
 /// fills the `OnceLock` fields once per file version.
 pub struct GoFile {
     /// The ts_compiler source file (arena, text, file name). None for a
@@ -2914,8 +2915,9 @@ impl GoFile {
 }
 
 impl GoProgram {
-    /// Go `Program.SourceFiles()`: the program files in Go order.
-    pub fn source_files(&self) -> impl Iterator<Item = &'static GoFile> {
+    /// Go `Program.SourceFiles()`: the program files in Go order. Each guard
+    /// pins a freeable file version while it lives (see `ast::go_file`).
+    pub fn source_files(&self) -> impl Iterator<Item = crate::ast::FileRef<GoFile>> {
         self.source_file_order
             .iter()
             .map(|&index| crate::ast::go_file(index))

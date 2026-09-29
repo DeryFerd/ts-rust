@@ -918,7 +918,7 @@ pub fn get_syntactic_diagnostics(
             let mut diags: Vec<Diagnostic> = info
                 .diagnostics
                 .iter()
-                .chain(info.js_diagnostics)
+                .chain(info.js_diagnostics.iter())
                 .cloned()
                 .collect();
             // For JS files that won't be checked by the checker (no checkJs/ts-check), we need

@@ -696,7 +696,8 @@ impl Checker {
                     let jsx_fragment_pragma = get_pragma_from_source_file(file, "jsxfrag");
                     if jsx_fragment_pragma.is_some() {
                         // PORT: Go `pragma.Args["factory"].Value` (zero value when absent).
-                        let factory = get_pragma_argument(jsx_fragment_pragma, "factory");
+                        let factory =
+                            get_pragma_argument(jsx_fragment_pragma.as_deref(), "factory");
                         let local_jsx_fragment_factory = self.parse_isolated_entity_name(&factory);
                         self.source_file_links.get(file).local_jsx_fragment_factory =
                             local_jsx_fragment_factory;
@@ -759,7 +760,7 @@ impl Checker {
         let jsx_pragma = get_pragma_from_source_file(file, "jsx");
         if jsx_pragma.is_some() {
             // PORT: Go `pragma.Args["factory"].Value` (zero value when absent).
-            let factory = get_pragma_argument(jsx_pragma, "factory");
+            let factory = get_pragma_argument(jsx_pragma.as_deref(), "factory");
             let local_jsx_factory = self.parse_isolated_entity_name(&factory);
             self.source_file_links.get(file).local_jsx_factory = local_jsx_factory;
             if local_jsx_factory.is_some() {
@@ -799,7 +800,7 @@ impl Checker {
                 let jsx_frag_pragma = get_pragma_from_source_file(file, "jsxfrag");
                 if jsx_frag_pragma.is_some() {
                     // PORT: Go `pragma.Args["factory"].Value` (zero value when absent).
-                    let factory = get_pragma_argument(jsx_frag_pragma, "factory");
+                    let factory = get_pragma_argument(jsx_frag_pragma.as_deref(), "factory");
                     let local_jsx_fragment_factory = self.parse_isolated_entity_name(&factory);
                     self.source_file_links.get(file).local_jsx_fragment_factory =
                         local_jsx_fragment_factory;

@@ -1,10 +1,10 @@
 //! Rust-only: the owner and liveness of freeable file versions (lsshells
-//! M3a).
+//! M3a, M3b).
 //!
 //! Go frees an `*ast.SourceFile` when no program and no parse cache entry
 //! holds it (project/snapshot.go:537 `dispose`: `parseCache.Deref` for each
-//! file of a released program). Here a published file store is leaked
-//! (`ast/store.rs`), so every file id stays readable. A `FileVersion` gives
+//! file of a released program). Here a static published file store is
+//! leaked (`ast/store.rs`), so its id stays readable. A `FileVersion` gives
 //! a file version the Go lifetime:
 //! - its parse holds it (`ParsedSourceFile::version`), so each frontend
 //!   program (`NewProgram`) and each parse cache entry that has the parse
@@ -12,12 +12,21 @@
 //! - the tables of each program version that has the file hold it
 //!   (`program::VersionTables`), so a checker, bind, emit or search thread
 //!   that was seeded from that version holds it too (`WorkerSeed`);
+//! - a thread that reads it pins it (`with_file_version`, `PINS`) until the
+//!   next program release (`release_file_version_pins`) or its end;
+//! - a `FileRef` guard holds it while the guard lives;
 //! - the registry here keeps only a `Weak`.
 //!
-//! When the last holder lets go, the version is dead: its id goes to
-//! `DEAD_FILES`, and each per-file thread-local map (`PerFileMap`) forgets
-//! the entries of that id when it is next written. The store, the node data
-//! and the `GoFile` stay leaked in this step.
+//! M3b: at publish the version takes its `FileStore` (headers and all
+//! columns) and its `GoFile` (info, `node_bind`, `file_bind`,
+//! `flow_nodes`) (`ast::store::VersionStore`). No `Frozen` is leaked for
+//! it and it has no tier 1 slot. The node structs stay in the bump arena.
+//! When the last holder lets go, the version is dead: its store and
+//! `GoFile` are freed, its id goes to `DEAD_FILES`, and each per-file
+//! thread-local map (`PerFileMap`) forgets the entries of that id when it
+//! is next written. A later read of the id panics with "file version N is
+//! released": ids are never reused, so a missed holder panics and never
+//! reads another file.
 //!
 //! Freeable rule (`free_file_versions`, `freeable_path`): only a parse of
 //! the language server parse cache (project/parsecache.rs), in a language
@@ -26,6 +35,7 @@
 //! never get a `FileVersion`. `GOPORT_FREE_FILE_VERSIONS=0` turns it off
 //! (the behavior before M3a); `=1` turns it on in any process.
 
+use super::store::VersionStore;
 use crate::prelude::*;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,30 +43,95 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 /// The owner of one freeable file version. It is `Send + Sync`: a program
 /// version's tables carry it to worker threads.
-#[derive(Debug)]
 pub struct FileVersion {
     /// The file id (the store id).
     file: usize,
+    /// The store and `GoFile` of the version, set by the publish (M3b).
+    published: OnceLock<VersionStore>,
+    /// Go `SourceFile.nameTable` of this version (ast.go:2532 to 2543;
+    /// `ast::source_file_get_name_table`). A static file keeps it in the
+    /// thread-local `NAME_TABLES` (node.rs).
+    pub(crate) name_table: OnceLock<FxHashMap<String, i32>>,
+    /// Go `SourceFile.positionMap` (`ast::source_file_get_position_map`).
+    pub(crate) position_map: OnceLock<PositionMap>,
+    /// Go `SourceFile.declarationMap`
+    /// (`ast::source_file_get_declaration_map`).
+    pub(crate) declaration_map: OnceLock<FxHashMap<String, Vec<Node>>>,
+}
+
+impl std::fmt::Debug for FileVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileVersion")
+            .field("file", &self.file)
+            .field("published", &self.published.get().is_some())
+            .finish()
+    }
 }
 
 impl FileVersion {
     /// The owner of file version `file`, registered in the registry. The
     /// language server parse cache makes it (`freeable_path`).
     pub(crate) fn new(file: usize) -> Arc<Self> {
-        let version = Arc::new(FileVersion { file });
+        let version = Arc::new(FileVersion {
+            file,
+            published: OnceLock::new(),
+            name_table: OnceLock::new(),
+            position_map: OnceLock::new(),
+            declaration_map: OnceLock::new(),
+        });
         lock(&VERSIONS).insert(file, Arc::downgrade(&version));
         MADE.fetch_add(1, Ordering::Relaxed);
         version
     }
+
+    /// The file id (the store id) of this version.
+    #[must_use]
+    pub fn file(&self) -> usize {
+        self.file
+    }
+
+    /// Gives the version its published store and `GoFile`
+    /// (`publish_file_stores`). Panics when it has them already.
+    pub(crate) fn set_published(&self, store: VersionStore) {
+        FREEABLE_PUBLISHED.store(true, Ordering::Release);
+        assert!(
+            self.published.set(store).is_ok(),
+            "file version {} is already published",
+            self.file
+        );
+    }
+
+    /// The published store and `GoFile`, or `None` before the publish.
+    #[inline]
+    pub(crate) fn published(&self) -> Option<&VersionStore> {
+        self.published.get()
+    }
+
+    /// The `GoFile` of this version. Panics before the publish. A
+    /// `FileRef::Pinned` getter starts here.
+    #[inline]
+    #[must_use]
+    pub fn go_file(&self) -> &GoFile {
+        match self.published.get() {
+            Some(store) => store.go_file(),
+            None => panic!("file version {} is not published", self.file),
+        }
+    }
 }
 
 impl Drop for FileVersion {
+    // The store and `GoFile` (`published`) are freed after this, with the
+    // fields.
     fn drop(&mut self) {
+        // The id is dead before the registry entry goes, so a reader that
+        // still finds the entry and cannot upgrade it panics (`released`).
+        {
+            let mut dead = lock(&DEAD_FILES);
+            dead.push(self.file);
+            DEAD_COUNT.store(dead.len(), Ordering::Release);
+        }
         // File ids are never reused, so the entry is this version's.
         lock(&VERSIONS).remove(&self.file);
-        let mut dead = lock(&DEAD_FILES);
-        dead.push(self.file);
-        DEAD_COUNT.store(dead.len(), Ordering::Release);
     }
 }
 
@@ -80,6 +155,14 @@ static MADE: AtomicUsize = AtomicUsize::new(0);
 /// Set by `project::new_session`: this process runs the language server or
 /// the API.
 static EDITOR_PROCESS: AtomicBool = AtomicBool::new(false);
+
+/// Set when the first freeable version is published. Until then a registry
+/// read (`ast::store::frozen_read`) never looks for a version.
+static FREEABLE_PUBLISHED: AtomicBool = AtomicBool::new(false);
+
+/// Raised by each program release (`release_file_version_pins`). A thread
+/// whose pins are from an older epoch drops them at its next pinned read.
+static PIN_EPOCH: AtomicUsize = AtomicUsize::new(0);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -149,6 +232,260 @@ pub(crate) fn live_file_versions(files: impl Iterator<Item = usize>) -> Vec<Arc<
     weak.iter().filter_map(Weak::upgrade).collect()
 }
 
+/// True once a freeable version is published in this process. A CLI
+/// process never sets it, so its registry reads never look for a version.
+#[inline]
+pub(crate) fn any_freeable_published() -> bool {
+    FREEABLE_PUBLISHED.load(Ordering::Acquire)
+}
+
+/// True when `file` was a freeable version that died.
+// PERF: a scan, on the path of a read that found no live version only.
+fn is_dead_file(file: usize) -> bool {
+    lock(&DEAD_FILES).contains(&file)
+}
+
+/// Panics for a read of dead file version `file`.
+#[cold]
+#[inline(never)]
+fn released(file: usize) -> ! {
+    panic!("file version {file} is released")
+}
+
+/// The pins of one thread: the versions it read since the last program
+/// release (`PIN_EPOCH`), by file id.
+struct Pins {
+    epoch: usize,
+    // PERF: a thread reads few freeable versions (the edited files), so a
+    // scan is faster than a map.
+    list: Vec<(usize, Arc<FileVersion>)>,
+}
+
+thread_local! {
+    /// The file versions this thread pinned (`with_file_version`).
+    static PINS: RefCell<Pins> = const {
+        RefCell::new(Pins {
+            epoch: 0,
+            list: Vec::new(),
+        })
+    };
+}
+
+/// Runs `read` on the live version `file`, pinned on this thread. `None`
+/// when `file` is no live version (a static, synthetic or unknown id).
+/// Panics when `file` was a freeable version that died: a stale read never
+/// reads other data. `ast::store` calls it only after the static tiers
+/// missed.
+// PERF: a hit is a thread-local borrow, an epoch compare and a short scan,
+// with no atomic write. `read` runs while the pins are borrowed, so a read
+// inside `read` that misses runs with its own `Arc` and pins nothing.
+#[inline]
+pub(crate) fn with_file_version<R>(file: usize, read: impl FnOnce(&FileVersion) -> R) -> Option<R> {
+    let mut read = Some(read);
+    let hit = PINS
+        .try_with(|pins| {
+            let pins = pins.try_borrow().ok()?;
+            if pins.epoch != PIN_EPOCH.load(Ordering::Acquire) {
+                return None;
+            }
+            let (_, version) = pins.list.iter().find(|(id, _)| *id == file)?;
+            let read = read.take()?;
+            Some(read(version.as_ref()))
+        })
+        .ok()
+        .flatten();
+    if hit.is_some() {
+        return hit;
+    }
+    // The closure took `read` only on a hit.
+    let read = read.take()?;
+    let version = pin_file_version(file)?;
+    Some(read(version.as_ref()))
+}
+
+/// The live version `file`, pinned on this thread, as an owned `Arc` (for a
+/// `FileRef` guard). `None` and panics as `with_file_version`.
+pub(crate) fn pinned_file_version(file: usize) -> Option<Arc<FileVersion>> {
+    let hit = PINS
+        .try_with(|pins| {
+            let pins = pins.try_borrow().ok()?;
+            if pins.epoch != PIN_EPOCH.load(Ordering::Acquire) {
+                return None;
+            }
+            pins.list
+                .iter()
+                .find(|(id, _)| *id == file)
+                .map(|(_, version)| Arc::clone(version))
+        })
+        .ok()
+        .flatten();
+    match hit {
+        Some(version) => Some(version),
+        None => pin_file_version(file),
+    }
+}
+
+/// The pin miss: the version from the registry, added to this thread's
+/// pins (after the pins of an older epoch are dropped).
+#[cold]
+#[inline(never)]
+fn pin_file_version(file: usize) -> Option<Arc<FileVersion>> {
+    let weak = lock(&VERSIONS).get(&file).cloned();
+    // Upgraded after the lock ends: the last drop of a version locks it.
+    let Some(version) = weak.and_then(|weak| weak.upgrade()) else {
+        if is_dead_file(file) {
+            released(file);
+        }
+        return None;
+    };
+    let expired = PINS
+        .try_with(|pins| {
+            let mut pins = pins.try_borrow_mut().ok()?;
+            let epoch = PIN_EPOCH.load(Ordering::Acquire);
+            let expired = if pins.epoch == epoch {
+                Vec::new()
+            } else {
+                pins.epoch = epoch;
+                std::mem::take(&mut pins.list)
+            };
+            pins.list.push((file, Arc::clone(&version)));
+            Some(expired)
+        })
+        .ok()
+        .flatten();
+    // Dropped after the borrow ends: the last pin of a version frees it.
+    drop(expired);
+    Some(version)
+}
+
+/// Drops the pins of this thread and makes every other thread drop its
+/// pins at its next pinned read. A program release calls it
+/// (`program::ReleasedProgram`), so a version that only the released
+/// program read dies with its other holders. The versions that the live
+/// programs read are pinned again on their next read.
+pub fn release_file_version_pins() {
+    PIN_EPOCH.fetch_add(1, Ordering::AcqRel);
+    let pins = PINS
+        .try_with(|pins| {
+            let mut pins = pins.try_borrow_mut().ok()?;
+            Some(std::mem::take(&mut pins.list))
+        })
+        .ok()
+        .flatten();
+    // Dropped after the borrow ends.
+    drop(pins);
+}
+
+/// A borrow of per-file data (lsshells M3b), the return type of the file
+/// data accessors (`ast::go_file`, `ast::source_file_info`,
+/// `FlowNodeId::get_flow`, ...). It derefs to the data.
+/// - `Static`: a file that is never freed (tier 0, tier 1, synthetic or
+///   leaked data). `as_static` gives the `'static` borrow.
+/// - `Pinned`: a freeable file version. The guard holds the version, so the
+///   data lives while the guard does. `get(version, key)` finds the data;
+///   it is a plain function (no captures), `key` is its argument (a slot or
+///   flow index, or 0).
+///
+/// Keep a guard only as long as the data is needed: a kept guard keeps its
+/// file version alive. To keep a value past the guard, copy or clone it.
+pub enum FileRef<T: ?Sized + 'static> {
+    Static(&'static T),
+    Pinned {
+        version: Arc<FileVersion>,
+        key: usize,
+        get: fn(&FileVersion, usize) -> &T,
+    },
+}
+
+impl<T: ?Sized + 'static> FileRef<T> {
+    /// The `'static` borrow of a static file, or `None` for a pinned
+    /// version.
+    #[inline]
+    #[must_use]
+    pub fn as_static(&self) -> Option<&'static T> {
+        match self {
+            FileRef::Static(value) => Some(value),
+            FileRef::Pinned { .. } => None,
+        }
+    }
+
+    /// The file version that a pinned guard holds, or `None` for a static
+    /// file.
+    #[must_use]
+    pub fn version(&self) -> Option<&Arc<FileVersion>> {
+        match self {
+            FileRef::Static(_) => None,
+            FileRef::Pinned { version, .. } => Some(version),
+        }
+    }
+}
+
+impl<T: ?Sized + 'static> Deref for FileRef<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        match self {
+            FileRef::Static(value) => value,
+            FileRef::Pinned { version, key, get } => get(&**version, *key),
+        }
+    }
+}
+
+impl<T: ?Sized + 'static> Clone for FileRef<T> {
+    fn clone(&self) -> Self {
+        match self {
+            FileRef::Static(value) => FileRef::Static(value),
+            FileRef::Pinned { version, key, get } => FileRef::Pinned {
+                version: Arc::clone(version),
+                key: *key,
+                get: *get,
+            },
+        }
+    }
+}
+
+impl<T: 'static> Default for FileRef<[T]> {
+    /// An empty static list.
+    fn default() -> Self {
+        FileRef::Static(&[])
+    }
+}
+
+impl<T: ?Sized + std::fmt::Debug + 'static> std::fmt::Debug for FileRef<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+/// `FileRef` to `$part` of the `GoFile` of published file `$file` (a file
+/// id). `$part` is a place expression of `$g` (the `GoFile`) and `$k` (the
+/// value of `$key`; name it `_key` when `$part` does not use it). It is
+/// written once and used for both variants, so it must not capture anything
+/// else. Panics when `$file` is not published.
+// PORT: a `FileRef::Pinned` getter must be a plain function, so the part is
+// repeated in a non-capturing closure.
+macro_rules! go_file_ref {
+    ($file:expr, $key:expr, |$g:ident, $k:ident| $part:expr) => {{
+        let key: usize = $key;
+        match $crate::ast::go_file($file) {
+            $crate::ast::FileRef::Static($g) => {
+                let $k = key;
+                $crate::ast::FileRef::Static(&$part)
+            }
+            $crate::ast::FileRef::Pinned { version, .. } => $crate::ast::FileRef::Pinned {
+                version,
+                key,
+                get: |version, $k| {
+                    let $g = version.go_file();
+                    &$part
+                },
+            },
+        }
+    }};
+}
+pub(crate) use go_file_ref;
+
 /// A weak handle to a file version. Tests use it to see when the version
 /// dies.
 pub struct FileVersionProbe(Weak<FileVersion>);
@@ -184,8 +521,8 @@ pub fn dead_file_versions() -> usize {
 /// A thread-local map with per-file entries: each key is a node, and the
 /// entry belongs to the file of that node. It forgets the entries of dead
 /// file versions when it is next written (`write`). A read (`Deref`) can
-/// still find such an entry before that. The store of a dead version is
-/// still leaked, so the entry is still valid.
+/// still find such an entry before that; its value is owned by the map, so
+/// it is still valid, but a key of a dead version is never read again.
 #[derive(Clone, Debug)]
 pub(crate) struct PerFileMap<V> {
     /// `DEAD_COUNT` when the map last forgot dead entries.

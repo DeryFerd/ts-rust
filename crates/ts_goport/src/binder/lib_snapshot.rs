@@ -182,7 +182,7 @@ impl SnapshotKey {
             sources: SOURCES_HASH,
             nodes: u32::try_from(go_file.parser_flags.len()).ok()?,
             text: text_hash(file),
-            parse: parse_hash(file, go_file)?,
+            parse: parse_hash(file, &go_file)?,
         })
     }
 
@@ -398,7 +398,7 @@ fn load_section(file: Node, section: &[u8]) -> Result<(BoundFile, SymbolArena), 
     let go_file = crate::ast::go_file(file.file_index());
     let mut r = SnapshotReader::new(section);
     let key = SnapshotKey::read(&mut r).ok_or("load")?;
-    key.check(file, go_file)?;
+    key.check(file, &go_file)?;
     decode(file, key.nodes, r).ok_or("load")
 }
 

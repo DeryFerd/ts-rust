@@ -383,14 +383,15 @@ fn go_files_of_unpublished_stores(
             });
             OUTSIDE_PARSE_INPUTS.with(|inputs| inputs.borrow_mut().insert(store, input));
         }
-        // PERF: the `SourceFileInfo` borrows lists of the parse. A published
-        // file is never freed, so its parse is kept for good, whether a
-        // program or the parse cache made it. The frontend program is freed
-        // with its last holder; this keeps only the parses. A file that an
-        // earlier publish gave its Go file keeps the parse of that publish.
-        // A freeable file version (lsshells M3a) keeps no parse: the parse
-        // holds the version, so a kept parse would keep it alive. Its
-        // `SourceFileInfo` borrows leaked copies of the lists instead.
+        // PERF: the `SourceFileInfo` of a static file borrows lists of the
+        // parse. A static published file is never freed, so its parse is
+        // kept for good, whether a program or the parse cache made it. The
+        // frontend program is freed with its last holder; this keeps only
+        // the parses. A file that an earlier publish gave its Go file keeps
+        // the parse of that publish. A freeable file version (lsshells M3a)
+        // keeps no parse: the parse holds the version, so a kept parse would
+        // keep it alive. Its `SourceFileInfo` owns copies of the lists
+        // instead, which are freed with the version (M3b).
         let file = parsed.get(&store).copied().or_else(|| outside.get(&store));
         let info = match file {
             Some(file) => {
@@ -705,47 +706,48 @@ fn trace_from_sys() -> TraceFn {
     })
 }
 
-/// The parse lists that a `SourceFileInfo` borrows for good.
+/// The parse lists that a `SourceFileInfo` keeps.
 struct KeptLists {
-    diagnostics: &'static [Diagnostic],
-    js_diagnostics: &'static [Diagnostic],
-    jsdoc_diagnostics: &'static [Diagnostic],
-    reparsed_clones: &'static [Node],
-    jsdoc_cache: &'static FxHashMap<Node, Vec<Node>>,
+    diagnostics: KeptData<[Diagnostic]>,
+    js_diagnostics: KeptData<[Diagnostic]>,
+    jsdoc_diagnostics: KeptData<[Diagnostic]>,
+    reparsed_clones: KeptData<[Node]>,
+    jsdoc_cache: KeptData<FxHashMap<Node, Vec<Node>>>,
 }
 
 impl KeptLists {
     /// The lists of `file`, a parse that the publish keeps for good.
     fn borrowed(file: &'static ParsedSourceFile) -> Self {
         Self {
-            diagnostics: &file.diagnostics,
-            js_diagnostics: &file.js_diagnostics,
-            jsdoc_diagnostics: &file.jsdoc_diagnostics,
-            reparsed_clones: &file.reparsed_clones,
-            jsdoc_cache: &file.jsdoc_cache,
+            diagnostics: KeptData::Borrowed(&file.diagnostics),
+            js_diagnostics: KeptData::Borrowed(&file.js_diagnostics),
+            jsdoc_diagnostics: KeptData::Borrowed(&file.jsdoc_diagnostics),
+            reparsed_clones: KeptData::Borrowed(&file.reparsed_clones),
+            jsdoc_cache: KeptData::Borrowed(&file.jsdoc_cache),
         }
     }
 
-    /// Leaked copies of the lists of `file`, a freeable file version whose
-    /// parse is not kept. The lists of a TypeScript file are almost always
-    /// empty, and an empty list is not copied.
+    /// Owned copies of the lists of `file`, a freeable file version whose
+    /// parse is not kept (lsshells M3b: they are freed with the version).
+    /// The lists of a TypeScript file are almost always empty, and an empty
+    /// list is not copied.
     fn copied(file: &ParsedSourceFile) -> Self {
-        fn leak<T: Clone>(list: &[T]) -> &'static [T] {
+        fn copy<T: Clone>(list: &[T]) -> KeptData<[T]> {
             if list.is_empty() {
-                &[]
+                KeptData::Borrowed(&[])
             } else {
-                Box::leak(list.to_vec().into_boxed_slice())
+                KeptData::Owned(list.into())
             }
         }
         Self {
-            diagnostics: leak(&file.diagnostics),
-            js_diagnostics: leak(&file.js_diagnostics),
-            jsdoc_diagnostics: leak(&file.jsdoc_diagnostics),
-            reparsed_clones: leak(&file.reparsed_clones),
+            diagnostics: copy(&file.diagnostics),
+            js_diagnostics: copy(&file.js_diagnostics),
+            jsdoc_diagnostics: copy(&file.jsdoc_diagnostics),
+            reparsed_clones: copy(&file.reparsed_clones),
             jsdoc_cache: if file.jsdoc_cache.is_empty() {
-                &super::EMPTY_JSDOC_CACHE
+                KeptData::Borrowed(&super::EMPTY_JSDOC_CACHE)
             } else {
-                Box::leak(Box::new(file.jsdoc_cache.clone()))
+                KeptData::Owned(Box::new(file.jsdoc_cache.clone()))
             },
         }
     }
@@ -753,8 +755,8 @@ impl KeptLists {
 
 /// `SourceFileInfo` of a program file, from the Go parser fields. The Go
 /// program fields are in `VersionTables::file_meta`.
-// PERF: the diagnostics, reparsed clones and JSDoc cache borrow `lists`:
-// the lists of the parse, which the publish keeps, or leaked copies for a
+// PERF: the diagnostics, reparsed clones and JSDoc cache are `lists`: the
+// lists of the parse, which the publish keeps, or owned copies for a
 // freeable file version. The other lists stay copies: `source_file_parser_fields`
 // (ast/synthetic.rs) copies them out as owned lists, and the frontend
 // program still reads the parsed file.
@@ -811,9 +813,9 @@ fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) 
         type_reference_directives: Vec::new(),
         lib_reference_directives: Vec::new(),
         comment_directives: Vec::new(),
-        diagnostics: &[],
-        js_diagnostics: &[],
-        jsdoc_diagnostics: &[],
+        diagnostics: KeptData::Borrowed(&[]),
+        js_diagnostics: KeptData::Borrowed(&[]),
+        jsdoc_diagnostics: KeptData::Borrowed(&[]),
         has_lazy_js_doc: false,
         // The parser flag of the config file, when the store was parsed.
         contains_non_ascii: file_store_contains_non_ascii(store),
@@ -823,12 +825,12 @@ fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) 
     let late = LateSourceFileInfo {
         file_index: store,
         external_module_indicator: Node::NIL,
-        reparsed_clones: &[],
+        reparsed_clones: KeptData::Borrowed(&[]),
         imports: Vec::new(),
         module_augmentations: Vec::new(),
         ambient_module_names: Vec::new(),
         uses_uri_style_node_core_modules: Tristate::Unknown,
-        jsdoc_cache: &EMPTY_JSDOC_CACHE,
+        jsdoc_cache: KeptData::Borrowed(&EMPTY_JSDOC_CACHE),
         post_bind: OnceLock::new(),
     };
     assert!(info.late.set(late).is_ok());
@@ -1123,7 +1125,8 @@ impl GoSharedState {
         module_reference: &str,
         mode: ResolutionMode,
     ) -> Option<&Arc<ResolvedModule>> {
-        let path = source_file_info(file).path.as_str();
+        let info = source_file_info(file);
+        let path = info.path.as_str();
         self.resolved_modules
             .get(path)?
             .get(&(module_reference, mode) as &dyn crate::frontend::module::ModeAwareKey)

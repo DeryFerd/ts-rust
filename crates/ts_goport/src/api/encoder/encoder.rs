@@ -346,7 +346,7 @@ fn source_file_text_count(source_file: Node) -> usize {
 // program (Go `parser.ParseSourceFile`, as the encoder tests do) is not
 // published and has no `GoFile`; its `ParsedSourceFile` has them.
 enum SourceFileFields {
-    Published(&'static SourceFileInfo),
+    Published(FileRef<SourceFileInfo>),
     Parsed(Rc<ParsedSourceFile>),
 }
 
@@ -644,7 +644,7 @@ fn encode_tree(
     let extended_data: Vec<u8> = Vec::new();
     let structured_data: Vec<u8> = Vec::new();
     let strs: StringTable;
-    let mut position_map: Option<&'static PositionMap> = None;
+    let mut position_map: Option<FileRef<PositionMap>> = None;
     if root_node.kind() == SyntaxKind::SourceFile {
         strs = new_string_table(
             source_file_text(source_file),
@@ -657,8 +657,13 @@ fn encode_tree(
             position_map = Some(source_file_get_position_map(source_file));
         }
     }
+    // lsshells M3b: the map of a freeable file version is copied, so the
+    // encoder keeps no file version alive.
     let position_map: Cow<'static, PositionMap> = match position_map {
-        Some(map) => Cow::Borrowed(map),
+        Some(map) => match map.as_static() {
+            Some(map) => Cow::Borrowed(map),
+            None => Cow::Owned((*map).clone()),
+        },
         None => Cow::Owned(compute_position_map("")),
     };
     let mut initial_node_count: usize = 0;

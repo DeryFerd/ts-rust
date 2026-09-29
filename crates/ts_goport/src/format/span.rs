@@ -113,19 +113,21 @@ pub fn range_has_no_errors(_: TextRange) -> bool {
 
 // Go: format/span.go:112 prepareRangeContainsErrorFunction
 // PORT: Go returns `func(r core.TextRange) bool`. The closure advances
-// `index`, so it is `FnMut`.
-pub fn prepare_range_contains_error_function<'a>(
-    errors: &'a [Diagnostic],
+// `index`, so it is `FnMut`. It keeps the ranges of the errors it picks,
+// not the errors, so it does not borrow `errors` (a file version guard).
+pub fn prepare_range_contains_error_function(
+    errors: &[Diagnostic],
     original_range: TextRange,
-) -> Box<dyn FnMut(TextRange) -> bool + 'a> {
+) -> Box<dyn FnMut(TextRange) -> bool> {
     if errors.is_empty() {
         return Box::new(range_has_no_errors);
     }
 
     // pick only errors that fall in range
-    let mut sorted: Vec<&'a Diagnostic> = errors
+    let mut sorted: Vec<TextRange> = errors
         .iter()
-        .filter(|d| original_range.overlaps(d.loc()))
+        .map(Diagnostic::loc)
+        .filter(|loc| original_range.overlaps(*loc))
         .collect();
     if sorted.is_empty() {
         return Box::new(range_has_no_errors);
@@ -149,7 +151,7 @@ pub fn prepare_range_contains_error_function<'a>(
                 return false;
             }
 
-            if r.overlaps(err.loc()) {
+            if r.overlaps(err) {
                 // specified range overlaps with error range
                 return true;
             }
@@ -1317,7 +1319,7 @@ impl FormatSpanWorker {
         line2: i32,
         r: TextRangeWithKind,
     ) {
-        let line_starts = get_ecma_line_starts(self.source_file);
+        let line_starts = &*get_ecma_line_starts(self.source_file);
         for line in line1..line2 {
             let line_start_position = line_starts[line as usize];
             let line_end_position = get_ecma_end_line_position(self.source_file, line);

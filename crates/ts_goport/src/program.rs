@@ -173,14 +173,14 @@ pub struct SourceFileInfo {
     pub type_reference_directives: Vec<FileReference>,
     pub lib_reference_directives: Vec<FileReference>,
     pub comment_directives: Vec<CommentDirective>,
-    // PERF: the diagnostic lists borrow the parsed file of the Go frontend
-    // instead of copying it. The publish of the file keeps that parse for
-    // good (see `go_files_of_unpublished_stores`), except for a freeable
-    // file version, which borrows leaked copies. The legacy path leaks its
-    // own lists.
-    pub diagnostics: &'static [Diagnostic],
-    pub js_diagnostics: &'static [Diagnostic],
-    pub jsdoc_diagnostics: &'static [Diagnostic],
+    // PERF: the diagnostic lists of a static file borrow the parsed file of
+    // the Go frontend instead of copying it. The publish of the file keeps
+    // that parse for good (see `go_files_of_unpublished_stores`). A freeable
+    // file version (lsshells M3b) keeps no parse and owns copies, which are
+    // freed with it. The legacy path leaks its own lists.
+    pub diagnostics: KeptData<[Diagnostic]>,
+    pub js_diagnostics: KeptData<[Diagnostic]>,
+    pub jsdoc_diagnostics: KeptData<[Diagnostic]>,
     /// True when a JSDoc cache miss means "not parsed" (Go parses lazily).
     pub has_lazy_js_doc: bool,
     /// Go `SourceFile.ContainsNonASCII`: the scanner decoded a non-ASCII
@@ -190,6 +190,26 @@ pub struct SourceFileInfo {
     /// full-start ranges (see `ast::go_view`).
     pub trivia: crate::ast::go_view::TriviaRuns,
     late: OnceLock<LateSourceFileInfo>,
+}
+
+/// A parse list that a `SourceFileInfo` keeps (lsshells M3b): borrowed for
+/// good from the parse that a static publish keeps (or leaked), or owned by
+/// the `GoFile` of a freeable file version. It derefs to the list.
+pub enum KeptData<T: ?Sized + 'static> {
+    Borrowed(&'static T),
+    Owned(Box<T>),
+}
+
+impl<T: ?Sized + 'static> Deref for KeptData<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        match self {
+            KeptData::Borrowed(value) => value,
+            KeptData::Owned(value) => value,
+        }
+    }
 }
 
 impl Deref for SourceFileInfo {
@@ -207,15 +227,16 @@ pub struct LateSourceFileInfo {
     pub file_index: usize,
     pub external_module_indicator: Node,
     // PERF: like the diagnostic lists, `reparsed_clones` and `jsdoc_cache`
-    // borrow leaked data. The JSDoc cache has one list per host node, so a
-    // copy costs one allocation per entry.
-    pub reparsed_clones: &'static [Node],
+    // of a static file borrow the kept parse; a freeable file version owns
+    // copies. The JSDoc cache has one list per host node, so a copy costs
+    // one allocation per entry.
+    pub reparsed_clones: KeptData<[Node]>,
     pub imports: Vec<Node>,
     pub module_augmentations: Vec<Node>,
     pub ambient_module_names: Vec<String>,
     pub uses_uri_style_node_core_modules: Tristate,
     /// Go `SourceFile.jsdocCache`: parsed JSDoc nodes by host node.
-    pub jsdoc_cache: &'static FxHashMap<Node, Vec<Node>>,
+    pub jsdoc_cache: KeptData<FxHashMap<Node, Vec<Node>>>,
     post_bind: OnceLock<PostBindInfo>,
 }
 
@@ -243,12 +264,16 @@ impl Deref for LateSourceFileInfo {
         if let Some(info) = self.post_bind.get() {
             return info;
         }
-        let file = crate::ast::go_file(self.file_index);
-        let Some(file_bind) = file.file_bind.get() else {
+        let indicator = crate::ast::with_go_file(self.file_index, |file| {
+            file.file_bind
+                .get()
+                .map(|file_bind| file_bind.common_js_module_indicator)
+        });
+        let Some(common_js_module_indicator) = indicator else {
             return &NOT_BOUND;
         };
         self.post_bind.get_or_init(|| PostBindInfo {
-            common_js_module_indicator: file_bind.common_js_module_indicator,
+            common_js_module_indicator,
         })
     }
 }
@@ -1105,7 +1130,7 @@ pub fn install(program: &'static GoProgram) {
     set_prog(program);
     for &index in &program.source_file_order {
         let file = crate::ast::go_file(index);
-        let late = build_late_info(index, file);
+        let late = build_late_info(index, &file);
         assert!(
             file.info.late.set(late).is_ok(),
             "SourceFileInfo installed twice"
@@ -1771,11 +1796,11 @@ fn build_early_info(
         type_reference_directives: fields.type_reference_directives,
         lib_reference_directives: fields.lib_reference_directives,
         comment_directives,
-        diagnostics: diagnostics.leak(),
+        diagnostics: KeptData::Borrowed(diagnostics.leak()),
         // PORT: the Rust parser does not report Go `JSDiagnostics` or
         // `JSDocDiagnostics` separately; they stay empty.
-        js_diagnostics: &[],
-        jsdoc_diagnostics: &[],
+        js_diagnostics: KeptData::Borrowed(&[]),
+        jsdoc_diagnostics: KeptData::Borrowed(&[]),
         has_lazy_js_doc: script_kind == ScriptKind::JS || script_kind == ScriptKind::JSX,
         // PORT: the legacy parser has no Go scanner flag. A string literal
         // with no escape or newline does not set the Go flag, so this can be
@@ -1789,7 +1814,7 @@ fn build_early_info(
 
 // Go: parser/parser.go finishSourceFile (tree part) and
 // parser/references.go collectExternalModuleReferences
-fn build_late_info(index: usize, file: &'static GoFile) -> LateSourceFileInfo {
+fn build_late_info(index: usize, file: &GoFile) -> LateSourceFileInfo {
     let root = file.root;
     let info = &file.info;
 
@@ -1825,18 +1850,18 @@ fn build_late_info(index: usize, file: &'static GoFile) -> LateSourceFileInfo {
     LateSourceFileInfo {
         file_index: index,
         external_module_indicator,
-        reparsed_clones: reparsed_clones.leak(),
+        reparsed_clones: KeptData::Borrowed(reparsed_clones.leak()),
         imports: refs.imports,
         module_augmentations: refs.module_augmentations,
         ambient_module_names: refs.ambient_module_names,
         uses_uri_style_node_core_modules: refs.uses_uri_style_node_core_modules,
         // PORT: JS files treat a cache miss as an unported lazy parse; TS
         // files get the eager Go entries.
-        jsdoc_cache: if info.has_lazy_js_doc {
+        jsdoc_cache: KeptData::Borrowed(if info.has_lazy_js_doc {
             &EMPTY_JSDOC_CACHE
         } else {
             &*Box::leak(Box::new(crate::ast::build_jsdoc_cache(root)))
-        },
+        }),
         post_bind: OnceLock::new(),
     }
 }
@@ -2883,9 +2908,9 @@ fn get_emit_syntax_for_usage_location_worker(
 // case here.
 // ---------------------------------------------------------------------------
 
-fn file_info_by_path(path: &str) -> Option<&'static SourceFileInfo> {
+fn file_info_by_path(path: &str) -> Option<FileRef<SourceFileInfo>> {
     with_tables(|tables| tables.file_by_path.get(path).copied())
-        .map(|index| &crate::ast::go_file(index).info)
+        .map(|index| crate::ast::file_version::go_file_ref!(index, 0, |g, _key| g.info))
 }
 
 /// Lazy JSDoc of `node` in `file` on the Go frontend path (Go
@@ -3153,6 +3178,17 @@ pub fn release_program_later(program: &'static GoProgram) -> ReleasedProgram {
 pub struct ReleasedProgram {
     frontend: Option<Rc<crate::frontend::compiler::NewProgram>>,
     tables: Option<Arc<VersionTables>>,
+}
+
+impl Drop for ReleasedProgram {
+    // lsshells M3b: this thread drops its file version pins, and the other
+    // threads drop theirs at their next pinned read, so a freeable file
+    // version of the released program dies with its other holders (the
+    // fields below, the parse cache entry). The live versions are pinned
+    // again when they are read.
+    fn drop(&mut self) {
+        crate::ast::release_file_version_pins();
+    }
 }
 
 /// `release_program` that does not wait for the checker workers: they free
@@ -4492,7 +4528,7 @@ pub fn get_syntactic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
         let mut diags: Vec<Diagnostic> = info
             .diagnostics
             .iter()
-            .chain(info.js_diagnostics)
+            .chain(info.js_diagnostics.iter())
             .cloned()
             .collect();
         // For JS files that won't be checked by the checker (no checkJs/ts-check), we need
@@ -5064,7 +5100,7 @@ fn get_diagnostics_with_preceding_directives(
         let line = get_ecma_line_of_position(source_file, directive.loc.pos());
         directives_by_line.insert(line, *directive);
     }
-    let line_starts = get_ecma_line_starts(source_file);
+    let line_starts = &*get_ecma_line_starts(source_file);
     let text = source_file_text(source_file);
     let mut filtered = Vec::with_capacity(diags.len());
     for diagnostic in diags {

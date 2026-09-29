@@ -580,7 +580,7 @@ fn write_code_snippet(
         }
 
         // Go scanner.GetECMAPositionOfLineAndByteOffset
-        let line_starts = get_ecma_line_starts(source_file);
+        let line_starts = &*get_ecma_line_starts(source_file);
         let line_start = compute_position_of_line_and_byte_offset(line_starts, i, 0);
         let line_end = if i < last_line_of_file {
             compute_position_of_line_and_byte_offset(line_starts, i + 1, 0)

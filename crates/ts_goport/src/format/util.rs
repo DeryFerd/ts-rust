@@ -75,7 +75,7 @@ pub fn get_close_token_for_open_token(kind: SyntaxKind) -> SyntaxKind {
 
 // Go: format/util.go:78 GetLineStartPositionForPosition
 pub fn get_line_start_position_for_position(position: i32, source_file: Node) -> i32 {
-    let line_starts = get_ecma_line_starts(source_file);
+    let line_starts = &*get_ecma_line_starts(source_file);
     let line = get_ecma_line_of_position(source_file, position);
     line_starts[line as usize]
 }

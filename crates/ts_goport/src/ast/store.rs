@@ -46,18 +46,26 @@
 //!
 //! The registry:
 //! - One file id is one file version. Ids only grow (`PUBLISHED` is the
-//!   next unused id), and a published file is never changed or freed. A new
-//!   program version shares the ids of its unchanged files.
+//!   next unused id), and a published file is never changed. A static
+//!   published file is never freed; a freeable file version is freed with
+//!   its last holder (lsshells M3b, `ast/file_version.rs`), and a read of
+//!   its id after that panics. A new program version shares the ids of its
+//!   unchanged files.
 //! - Tier 0 (`FROZEN`) is the first publish: program 1, or the files of the
 //!   legacy loader. Its dense tables are indexed by file id.
 //! - Tier 1 (`LATER`) holds every later publish (edited files, other
 //!   programs). One slot per id points at the `Frozen` of its publish.
+//! - A freeable file version (an edited file in a language server or API
+//!   process) has no tier 1 slot: its `FileVersion` owns its store and
+//!   `GoFile` (`VersionStore`).
 //! - Every read of a published store goes through one inline lookup
-//!   (`frozen_of`): tier 0 first, then the tier 1 slot of the id, in a cold
-//!   block so a one-program process keeps the tier 0 code layout. So the
-//!   hot node reads in `node.rs` and the perf columns (kinds, names,
-//!   modifier bits, children, links, facts) answer for the nodes of a later
-//!   program too, and return `None` on a miss.
+//!   (`frozen_read`, `frozen!`): tier 0 first, then the tier 1 slot of the
+//!   id, then the freeable version, in a cold block so a one-program
+//!   process keeps the tier 0 code layout. So the hot node reads in
+//!   `node.rs` and the perf columns (kinds, names, modifier bits, children,
+//!   links, facts) answer for the nodes of a later program too, and return
+//!   `None` on a miss. A read gets a borrow for its closure only; the
+//!   accessors that return a borrow return a `FileRef` guard.
 //! - After a registry miss, a synthetic id has no store (a few compares, no
 //!   call). Any other id takes one cold call: the detached store, then the
 //!   build stores of this thread.
@@ -737,42 +745,60 @@ fn is_storeless_id(file: usize) -> bool {
 /// per-store header and node tables for the hot node reads. File `file` of
 /// the publish is at index `file - base`. Tier 0 has `base` 0, so its hot
 /// reads index the tables by file id.
-struct Frozen {
+///
+/// Tier 0 and tier 1 are `Frozen<'static>` (leaked). A freeable file
+/// version (lsshells M3b) owns its store and `GoFile` (`VersionStore`); a
+/// read of it sees a one-file `Frozen` view that borrows them for the read
+/// (`VersionStore::view`).
+struct Frozen<'a> {
     /// The first file id of the publish.
     base: usize,
-    stores: &'static [FileStore],
-    headers: Box<[&'static [NodeHeader]]>,
-    nodes: Box<[&'static [Option<&'static ts_ast::Node>]]>,
+    stores: &'a [FileStore],
+    headers: &'a [&'a [NodeHeader]],
+    nodes: &'a [&'a [Option<&'static ts_ast::Node>]],
     /// `headers[file][i].kind`, packed (`FileStore::kinds`). `Node::kind`
     /// reads only this.
-    kinds: Box<[&'static [SyntaxKind]]>,
+    kinds: &'a [&'a [SyntaxKind]],
     /// U1 (a): `FileStore::names` of each store (`Node::text_name`).
-    names: Box<[&'static [Name]]>,
+    names: &'a [&'a [Name]],
     /// U1 (b): `FileStore::modifier_bits` of each store
     /// (`Node::modifier_flags`).
-    modifier_bits: Box<[&'static [u16]]>,
+    modifier_bits: &'a [&'a [u16]],
     /// What `Node::new` reads for each store, and its facts.
-    per_store: Box<[FrozenStore]>,
+    per_store: &'a [FrozenStore<'a>],
     /// The `GoFile` of each file id of the publish.
-    go_files: Box<[GoFile]>,
+    go_files: &'a [GoFile],
     /// True for the legacy loader: `go_files` only, no stores.
     legacy: bool,
 }
 
 /// The per-store part of `Frozen` that `Node::new` reads.
 #[derive(Clone, Copy)]
-struct FrozenStore {
+struct FrozenStore<'a> {
     /// `try_resolve_store_id(file, i)` for every slot, computed once
     /// (`FileStore::resolved`). Empty for an alias-free store.
-    resolved: &'static [Node],
+    resolved: &'a [Node],
     /// What slot 0 resolves to (Go `nil`).
     nil: Node,
     facts: StoreFacts,
     /// U4: `FileStore::children`. Next to `resolved`, so a child read loads
     /// one per-store record.
-    children: &'static [SlotChildren],
+    children: &'a [SlotChildren],
     /// R2-5: `FileStore::links`.
-    links: &'static [SlotLinks],
+    links: &'a [SlotLinks],
+}
+
+impl<'a> FrozenStore<'a> {
+    /// The per-store part of store `s`, whose slot 0 resolves to `nil`.
+    fn of(s: &'a FileStore, nil: Node) -> Self {
+        FrozenStore {
+            resolved: &s.resolved,
+            nil,
+            facts: s.facts,
+            children: &s.children,
+            links: &s.links,
+        }
+    }
 }
 
 /// `try_resolve_store_id(file, index)` for store `file` of publish `f`, whose
@@ -781,7 +807,7 @@ struct FrozenStore {
 // the slot handle (or the slot 0 value), so `Node::new` needs no load from
 // a per-slot table.
 #[inline]
-fn frozen_resolve_slot(f: &Frozen, s: &FrozenStore, file: usize, index: usize) -> Node {
+fn frozen_resolve_slot(f: &Frozen<'_>, s: &FrozenStore<'_>, file: usize, index: usize) -> Node {
     if !s.facts.alias_free {
         return s.resolved[index];
     }
@@ -802,14 +828,63 @@ fn frozen_resolve_slot(f: &Frozen, s: &FrozenStore, file: usize, index: usize) -
     n
 }
 
+/// The store and `GoFile` of a freeable file version (lsshells M3b), owned
+/// by its `FileVersion` (`ast::file_version`). The publish moves them here
+/// instead of into a leaked `Frozen`; they are freed with the version.
+pub(crate) struct VersionStore {
+    /// The file id.
+    file: usize,
+    store: FileStore,
+    go_file: GoFile,
+    /// What slot 0 resolves to (`FrozenStore::nil`).
+    nil: Node,
+}
+
+impl VersionStore {
+    /// The `GoFile` of the version.
+    #[inline]
+    pub(crate) fn go_file(&self) -> &GoFile {
+        &self.go_file
+    }
+
+    /// Runs `read` on a one-file `Frozen` view of this version: the file is
+    /// at index 0.
+    // PERF: the view is made on the stack for each read. After inlining,
+    // only the fields that `read` uses are loaded.
+    #[inline]
+    fn view<R>(&self, read: impl for<'v> FnOnce(&'v Frozen<'v>) -> R) -> R {
+        let s = &self.store;
+        let headers: &[NodeHeader] = &s.headers;
+        let nodes: &[Option<&'static ts_ast::Node>] = &s.nodes;
+        let kinds: &[SyntaxKind] = &s.kinds;
+        let names: &[Name] = &s.names;
+        let modifier_bits: &[u16] = &s.modifier_bits;
+        let per_store = FrozenStore::of(s, self.nil);
+        let frozen = Frozen {
+            base: self.file,
+            stores: std::slice::from_ref(s),
+            headers: std::slice::from_ref(&headers),
+            nodes: std::slice::from_ref(&nodes),
+            kinds: std::slice::from_ref(&kinds),
+            names: std::slice::from_ref(&names),
+            modifier_bits: std::slice::from_ref(&modifier_bits),
+            per_store: std::slice::from_ref(&per_store),
+            go_files: std::slice::from_ref(&self.go_file),
+            legacy: false,
+        };
+        read(&frozen)
+    }
+}
+
 /// Tier 0: the first publish.
-static FROZEN: OnceLock<Frozen> = OnceLock::new();
+static FROZEN: OnceLock<Frozen<'static>> = OnceLock::new();
 
 /// The tier 1 slots of `LATER_CHUNK` consecutive file ids.
-type LaterChunk = [OnceLock<&'static Frozen>; LATER_CHUNK];
+type LaterChunk = [OnceLock<&'static Frozen<'static>>; LATER_CHUNK];
 
 /// Tier 1: the publish of each file id after the first publish. Each later
-/// publish is leaked once, and the slot of each of its ids names it.
+/// publish is leaked once, and the slot of each of its ids names it. A
+/// freeable file version has no slot (M3b).
 static LATER: [OnceLock<Box<LaterChunk>>; TIER1_LIMIT / LATER_CHUNK] =
     [const { OnceLock::new() }; TIER1_LIMIT / LATER_CHUNK];
 
@@ -824,16 +899,16 @@ static PUBLISHED: AtomicUsize = AtomicUsize::new(0);
 // (the chunk and the slot of its id) than a node of the first program, not
 // two out-of-line calls and a closure. Before M3 the perf columns also
 // missed for such a node, so its reads took the slow paths in `node.rs`.
-// `inline(always)`: in `frozen_of` it is in a cold block, where LLVM
+// `inline(always)`: in `frozen_read` it is in a cold block, where LLVM
 // inlines less.
 #[inline(always)]
-fn later(file: usize) -> Option<(&'static Frozen, usize)> {
+fn later(file: usize) -> Option<(&'static Frozen<'static>, usize)> {
     let chunk = LATER.get(file / LATER_CHUNK)?.get()?;
-    let frozen: &'static Frozen = *chunk[file % LATER_CHUNK].get()?;
+    let frozen: &'static Frozen<'static> = chunk[file % LATER_CHUNK].get()?;
     Some((frozen, file - frozen.base))
 }
 
-/// Marks the tier 1 part of `frozen_of` as cold. It does nothing.
+/// Marks the tier 1 part of `frozen_read` as cold. It does nothing.
 // PERF: rustc gives a branch into a block that calls a `#[cold]` function
 // a low weight (`find_cold_blocks`), and LLVM puts that block after the hot
 // code. `std::hint::cold_path` does the same, but is stable only from Rust
@@ -845,13 +920,16 @@ fn later_publish_path() {}
 
 /// The one file lookup of the registry reads (PORTING.md "AST": store
 /// columns are read through one helper): for published store file `file`,
-/// its publish, the index of `file` in that publish, and that entry of the
-/// table that `table` picks. Tier 0 first, then tier 1 (`later`). `None`
-/// for any other file: unpublished, synthetic, provisional or legacy (a
-/// legacy publish has entries in `go_files` only).
-// PERF: M3. The tier 0 test is the bounds check of the picked table. The
-// entry is found before the two tiers join, so the caller indexes it with
-// no second bounds check.
+/// `read(publish, index of file in it)`. Tier 0 first, then tier 1
+/// (`later`), then a freeable file version (`freeable_read`, lsshells M3b),
+/// which is pinned while `read` runs. `len(publish)` is the length of the
+/// table that `read` indexes, so a file that the table does not hold gives
+/// `None`, as for any other file: unpublished, synthetic, provisional or
+/// legacy (a legacy publish has entries in `go_files` only). Panics for a
+/// dead file version. `read` gets a borrow for the read only, so it copies
+/// its result out. Use the `frozen!` macro.
+// PERF: M3. The tier 0 test is the bounds check of the table that `read`
+// indexes (`len`), so LLVM drops the second check in `read`.
 // PERF: M3 `goport -p` cost (mp3). A one-program process never runs tier 1:
 // its only tier 0 misses are synthetic ids, which leave at the
 // `TIER1_LIMIT` compare. But tier 1 code inline in each hot read site made
@@ -859,15 +937,17 @@ fn later_publish_path() {}
 // instructions; `mp2/m3.md`). So tier 1 is a cold block
 // (`later_publish_path`) that LLVM puts after the hot code. A later program
 // still reads tier 1 inline, with no call. A runtime "later publish" flag
-// would not help: it removes no code from the read sites.
+// would not help: it removes no code from the read sites. The freeable
+// branch is one more out-of-line call at the end of the cold block.
 #[inline]
-fn frozen_of<T: 'static>(
+fn frozen_read<R>(
     file: usize,
-    table: impl Fn(&'static Frozen) -> &'static [T],
-) -> Option<(&'static Frozen, usize, &'static T)> {
+    len: impl Fn(&Frozen<'_>) -> usize,
+    read: impl for<'a> FnOnce(&'a Frozen<'a>, usize) -> R,
+) -> Option<R> {
     let tier0 = FROZEN.get()?;
-    if let Some(entry) = table(tier0).get(file) {
-        return Some((tier0, file, entry));
+    if file < len(tier0) {
+        return Some(read(tier0, file));
     }
     // A synthetic or provisional id is in no publish. It leaves here,
     // outside the cold block.
@@ -875,8 +955,80 @@ fn frozen_of<T: 'static>(
         return None;
     }
     later_publish_path();
+    if let Some((f, local)) = later(file) {
+        return (local < len(f)).then(|| read(f, local));
+    }
+    freeable_read(file, |f| (len(f) > 0).then(|| read(f, 0)))
+}
+
+/// `frozen_read` for a table of `Frozen`: `$body` runs with `$f` (the
+/// publish), `$local` (the index of the file in it) and `$entry`
+/// (`&$f.$table[$local]`), and gives the result.
+macro_rules! frozen {
+    ($file:expr, $table:ident, |$f:pat_param, $local:pat_param, $entry:pat_param| $body:expr) => {
+        frozen_read(
+            $file,
+            |f| f.$table.len(),
+            |f, local| {
+                let $entry = &f.$table[local];
+                let ($f, $local) = (f, local);
+                $body
+            },
+        )
+    };
+}
+
+/// The freeable branch of `frozen_read`: `read` on the view of live file
+/// version `file` (lsshells M3b). `None` for any other id and before the
+/// version is published. Panics for a dead version.
+#[cold]
+#[inline(never)]
+fn freeable_read<R>(
+    file: usize,
+    read: impl for<'a> FnOnce(&'a Frozen<'a>) -> Option<R>,
+) -> Option<R> {
+    if !super::file_version::any_freeable_published() || file >= PUBLISHED.load(Ordering::Acquire) {
+        return None;
+    }
+    super::file_version::with_file_version(file, |version| {
+        version.published().and_then(|store| store.view(read))
+    })
+    .flatten()
+}
+
+/// The static part of `frozen_read` (tier 0 and tier 1) for table `table`,
+/// with a `'static` entry. `None` for a freeable file version, as for any
+/// other file.
+#[inline]
+fn static_frozen<T: 'static>(
+    file: usize,
+    table: impl Fn(&'static Frozen<'static>) -> &'static [T],
+) -> Option<&'static T> {
+    let tier0 = FROZEN.get()?;
+    if let Some(entry) = table(tier0).get(file) {
+        return Some(entry);
+    }
+    if file >= TIER1_LIMIT {
+        return None;
+    }
+    later_publish_path();
     let (f, local) = later(file)?;
-    Some((f, local, table(f).get(local)?))
+    table(f).get(local)
+}
+
+/// The live freeable version of published file `file` as an owned `Arc`,
+/// for a `FileRef::Pinned` guard. `None` for any other id and before the
+/// version is published. Panics for a dead version.
+#[cold]
+#[inline(never)]
+fn published_version(file: usize) -> Option<std::sync::Arc<super::FileVersion>> {
+    if file >= TIER1_LIMIT
+        || !super::file_version::any_freeable_published()
+        || file >= PUBLISHED.load(Ordering::Acquire)
+    {
+        return None;
+    }
+    super::file_version::pinned_file_version(file).filter(|version| version.published().is_some())
 }
 
 /// The handle of slot `index` in store `file`. Does not resolve aliases.
@@ -891,7 +1043,7 @@ fn slot_index(n: Node) -> usize {
 }
 
 /// The unpublished store `file` of this thread (active, detached or built),
-/// after a registry miss (`frozen_of`). Before the first publish every
+/// after a registry miss (`frozen_read`). Before the first publish every
 /// store is here. After it, a synthetic id (or any id when tier 0 is
 /// legacy) has no store (a few compares, no call), and any other id takes
 /// one cold call.
@@ -911,15 +1063,20 @@ fn unpublished_store_after_publish(file: usize) -> Option<StoreCell> {
     build_store(file)
 }
 
-/// Runs `f` on store `file`: published (tier 0 or tier 1), or an
-/// unpublished store of this thread. `None` when this thread cannot see a
-/// store `file`.
+/// Runs `f` on store `file`: published (tier 0, tier 1 or a freeable file
+/// version), or an unpublished store of this thread. `None` when this
+/// thread cannot see a store `file`.
 #[inline]
 fn try_with_store<R>(file: usize, f: impl FnOnce(&FileStore) -> R) -> Option<R> {
-    match frozen_of(file, |fr| fr.stores) {
-        Some((_, _, store)) => Some(f(store)),
-        None => unpublished_store(file).map(|store| f(&store.borrow())),
+    let mut f = Some(f);
+    // `frozen!` gives `None` only when it did not call its body.
+    if let Some(result) = frozen!(file, stores, |_, _, store| {
+        (f.take().expect("the store is read once"))(store)
+    }) {
+        return Some(result);
     }
+    let f = f.take()?;
+    unpublished_store(file).map(|store| f(&store.borrow()))
 }
 
 fn with_store<R>(file: usize, f: impl FnOnce(&FileStore) -> R) -> R {
@@ -1248,11 +1405,13 @@ pub fn adopt_detached_store(detached: DetachedStore) -> StoreRemap {
 // File registry
 // ──────────────────────────────────────────────────────────────────────
 
-/// The `GoFile` of published file `file` (tier 0 or tier 1). Panics when it
-/// is not published.
+/// The `GoFile` of published file `file` (tier 0, tier 1 or a freeable
+/// file version). Panics when it is not published, and for a dead file
+/// version. The guard pins a freeable version while it lives; hot readers
+/// use `with_go_file`, which pins nothing past the read.
 #[inline]
 #[must_use]
-pub fn go_file(file: usize) -> &'static GoFile {
+pub fn go_file(file: usize) -> FileRef<GoFile> {
     match try_go_file(file) {
         Some(go_file) => go_file,
         None => not_published(file),
@@ -1269,15 +1428,42 @@ fn not_published(file: usize) -> ! {
 /// an unknown id.
 #[inline]
 #[must_use]
-pub fn try_go_file(file: usize) -> Option<&'static GoFile> {
-    frozen_of(file, |f| &f.go_files[..]).map(|(_, _, go_file)| go_file)
+pub fn try_go_file(file: usize) -> Option<FileRef<GoFile>> {
+    if let Some(go_file) = static_frozen(file, |f| f.go_files) {
+        return Some(FileRef::Static(go_file));
+    }
+    let version = published_version(file)?;
+    Some(FileRef::Pinned {
+        version,
+        key: 0,
+        get: |version, _| version.go_file(),
+    })
 }
 
-/// True when `file` has a `GoFile` in the registry (tier 0 or tier 1).
+/// Runs `f` on the `GoFile` of published file `file`, or gives `None` as
+/// `try_go_file`. It pins a freeable version only while `f` runs, so it
+/// costs no guard: hot readers (`Node::bind`) use it.
+#[inline]
+pub fn try_with_go_file<R>(file: usize, f: impl FnOnce(&GoFile) -> R) -> Option<R> {
+    frozen!(file, go_files, |_, _, go_file| f(go_file))
+}
+
+/// `try_with_go_file`, which panics as `go_file` when `file` is not
+/// published.
+#[inline]
+pub fn with_go_file<R>(file: usize, f: impl FnOnce(&GoFile) -> R) -> R {
+    match try_with_go_file(file, f) {
+        Some(result) => result,
+        None => not_published(file),
+    }
+}
+
+/// True when `file` has a `GoFile` in the registry (tier 0, tier 1 or a
+/// freeable file version).
 #[inline]
 #[must_use]
 pub fn is_published(file: usize) -> bool {
-    try_go_file(file).is_some()
+    try_with_go_file(file, |_| ()).is_some()
 }
 
 /// Ids of the stores that this thread built and did not publish, in id
@@ -1298,7 +1484,7 @@ pub fn unpublished_file_ids() -> std::ops::Range<usize> {
 #[inline]
 #[must_use]
 pub fn has_file_store(file: usize) -> bool {
-    frozen_of(file, |f| &f.headers[..]).is_some() || unpublished_store(file).is_some()
+    frozen!(file, headers, |_, _, _| ()).is_some() || unpublished_store(file).is_some()
 }
 
 /// True when `n` is a node of a store file.
@@ -1749,8 +1935,9 @@ pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
 /// `GoFile` of id `unpublished_file_ids().start + i`. The legacy loader has
 /// no stores and passes its files. The loader calls this once per program,
 /// before `core::set_prog`. The stores are then read-only, and any thread
-/// can read them. The first publish is tier 0; later ones go to tier 1. An
-/// empty later publish does nothing.
+/// can read them. The first publish is tier 0; later ones go to tier 1,
+/// except a freeable file version (lsshells M3b), which owns its store and
+/// `GoFile`. An empty later publish does nothing.
 // PORT: Go needs no publish; its nodes are heap objects. The publish also
 // computes `NodeHeader::source_file_is_root` for `get_source_file_of_node`.
 pub fn publish_file_stores(go_files: Vec<GoFile>) {
@@ -1793,41 +1980,106 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
     }
     let mut stores: Vec<FileStore> = cells.iter().map(|cell| cell.take()).collect();
     publish_stores(&mut stores, base);
-    let stores: &'static [FileStore] = Box::leak(stores.into_boxed_slice());
-    // PERF: query Q7. The per-store tables are made already, so this only
-    // collects slices.
-    let frozen = Frozen {
-        base,
-        stores,
-        headers: stores.iter().map(|s| &s.headers[..]).collect(),
-        nodes: stores.iter().map(|s| &s.nodes[..]).collect(),
-        kinds: stores.iter().map(|s| &s.kinds[..]).collect(),
-        names: stores.iter().map(|s| &s.names[..]).collect(),
-        modifier_bits: stores.iter().map(|s| &s.modifier_bits[..]).collect(),
-        per_store: stores
-            .iter()
-            .enumerate()
-            .map(|(i, s)| FrozenStore {
-                resolved: &s.resolved[..],
-                nil: resolve_slot(base + i, NIL_SLOT as usize, &s.nodes, &s.headers),
-                facts: s.facts,
-                children: &s.children[..],
-                links: &s.links[..],
-            })
-            .collect(),
-        go_files: go_files.into_boxed_slice(),
-        legacy,
-    };
     if tier0.is_none() {
         assert_eq!(base, 0, "the first publish must start at file id 0");
         assert!(
-            FROZEN.set(frozen).is_ok(),
+            FROZEN
+                .set(leaked_frozen(base, stores, go_files, legacy))
+                .is_ok(),
             "another thread made the first publish"
         );
         return;
     }
-    let frozen: &'static Frozen = Box::leak(Box::new(frozen));
-    for file in base..base + count {
+    // lsshells M3b: a freeable file version (a live `FileVersion` of the
+    // id, made by the language server parse cache) takes its store and
+    // `GoFile`, and gets no tier 1 slot. The other files go to tier 1 in
+    // runs of consecutive ids, one leaked `Frozen` per run.
+    let versions: FxHashMap<usize, std::sync::Arc<super::FileVersion>> =
+        super::file_version::live_file_versions(base..base + count)
+            .into_iter()
+            .map(|version| (version.file(), version))
+            .collect();
+    if versions.is_empty() {
+        publish_later(leaked_frozen(base, stores, go_files, legacy));
+        return;
+    }
+    let mut run_start = base;
+    let mut run_stores = Vec::new();
+    let mut run_files = Vec::new();
+    for (i, (store, go_file)) in stores.into_iter().zip(go_files).enumerate() {
+        let file = base + i;
+        let Some(version) = versions.get(&file) else {
+            run_stores.push(store);
+            run_files.push(go_file);
+            continue;
+        };
+        if !run_stores.is_empty() {
+            publish_later(leaked_frozen(
+                run_start,
+                std::mem::take(&mut run_stores),
+                std::mem::take(&mut run_files),
+                false,
+            ));
+        }
+        run_start = file + 1;
+        let nil = resolve_slot(file, NIL_SLOT as usize, &store.nodes, &store.headers);
+        version.set_published(VersionStore {
+            file,
+            store,
+            go_file,
+            nil,
+        });
+    }
+    if !run_stores.is_empty() {
+        publish_later(leaked_frozen(run_start, run_stores, run_files, false));
+    }
+}
+
+/// The leaked `Frozen` of the published `stores` and `go_files`, whose first
+/// file id is `base` (tier 0 or one tier 1 publish).
+// PERF: query Q7. The per-store tables are made already, so this only
+// collects slices.
+fn leaked_frozen(
+    base: usize,
+    stores: Vec<FileStore>,
+    go_files: Vec<GoFile>,
+    legacy: bool,
+) -> Frozen<'static> {
+    let stores: &'static [FileStore] = Box::leak(stores.into_boxed_slice());
+    Frozen {
+        base,
+        stores,
+        headers: Box::leak(stores.iter().map(|s| &s.headers[..]).collect::<Box<[_]>>()),
+        nodes: Box::leak(stores.iter().map(|s| &s.nodes[..]).collect::<Box<[_]>>()),
+        kinds: Box::leak(stores.iter().map(|s| &s.kinds[..]).collect::<Box<[_]>>()),
+        names: Box::leak(stores.iter().map(|s| &s.names[..]).collect::<Box<[_]>>()),
+        modifier_bits: Box::leak(
+            stores
+                .iter()
+                .map(|s| &s.modifier_bits[..])
+                .collect::<Box<[_]>>(),
+        ),
+        per_store: Box::leak(
+            stores
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let nil = resolve_slot(base + i, NIL_SLOT as usize, &s.nodes, &s.headers);
+                    FrozenStore::of(s, nil)
+                })
+                .collect::<Box<[_]>>(),
+        ),
+        go_files: Box::leak(go_files.into_boxed_slice()),
+        legacy,
+    }
+}
+
+/// Leaks tier 1 publish `frozen` and points the tier 1 slot of each of its
+/// file ids at it.
+fn publish_later(frozen: Frozen<'static>) {
+    let count = frozen.stores.len().max(frozen.go_files.len());
+    let frozen: &'static Frozen<'static> = Box::leak(Box::new(frozen));
+    for file in frozen.base..frozen.base + count {
         let chunk = LATER[file / LATER_CHUNK]
             .get_or_init(|| Box::new([const { OnceLock::new() }; LATER_CHUNK]));
         assert!(
@@ -1915,8 +2167,13 @@ pub fn resolve_store_id(file: usize, id: ts_ast::NodeId) -> Node {
     let index = id.index();
     // The nil slot or an alias slot: the target is in the header
     // (`resolve_slot`).
-    if let Some((f, local, nodes)) = frozen_of(file, |f| &f.nodes[..]) {
-        return resolve_slot(file, index, nodes, f.headers[local]);
+    if let Some(n) = frozen!(file, nodes, |f, local, nodes| resolve_slot(
+        file,
+        index,
+        nodes,
+        f.headers[local]
+    )) {
+        return n;
     }
     with_store(file, |s| resolve_slot(file, index, &s.nodes, &s.headers))
 }
@@ -1925,8 +2182,10 @@ pub fn resolve_store_id(file: usize, id: ts_ast::NodeId) -> Node {
 #[inline]
 #[must_use]
 pub fn store_ast_node(n: Node) -> &'static ts_ast::Node {
-    if let Some((_, _, nodes)) = frozen_of(n.file_index(), |f| &f.nodes[..]) {
-        return slot_node(nodes[slot_index(n)]);
+    if let Some(node) = frozen!(n.file_index(), nodes, |_, _, nodes| slot_node(
+        nodes[slot_index(n)]
+    )) {
+        return node;
     }
     with_store(n.file_index(), |s| slot_node(s.nodes[slot_index(n)]))
 }
@@ -1936,12 +2195,14 @@ pub fn store_ast_node(n: Node) -> &'static ts_ast::Node {
 #[must_use]
 pub fn store_header(n: Node) -> NodeHeader {
     let (file, index) = (n.file_index(), slot_index(n));
-    if let Some((f, local, headers)) = frozen_of(file, |f| &f.headers[..]) {
+    if let Some(header) = frozen!(file, headers, |f, local, headers| {
         debug_assert!(
             f.nodes[local][index].is_some(),
             "store handle does not name a node slot"
         );
-        return headers[index].read(file);
+        headers[index].read(file)
+    }) {
+        return header;
     }
     with_store(file, |s| {
         debug_assert!(
@@ -1954,7 +2215,7 @@ pub fn store_header(n: Node) -> NodeHeader {
 
 /// The header of `n` when it is a store node (kind, parser flags, parent,
 /// loc): one thread-local load for the active store, one table lookup in
-/// the registry (`frozen_of`), one more thread-local access for another
+/// the registry (`frozen_read`), one more thread-local access for another
 /// unpublished store. `None` for nil, synthetic and legacy nodes. With it a
 /// node read needs no separate `has_file_store` call.
 // PERF: query Q8. The active store is checked first and inline; every
@@ -1974,8 +2235,8 @@ pub fn try_store_header(n: Node) -> Option<NodeHeader> {
 /// `try_store_header` for a node that is not in the active store.
 #[inline(never)]
 fn try_store_header_slow(file: usize, index: usize) -> Option<NodeHeader> {
-    if let Some((_, _, headers)) = frozen_of(file, |f| &f.headers[..]) {
-        return Some(headers[index].read(file));
+    if let Some(header) = frozen!(file, headers, |_, _, headers| headers[index].read(file)) {
+        return Some(header);
     }
     unpublished_store(file).map(|store| store.borrow().headers[index].read(file))
 }
@@ -1994,50 +2255,50 @@ pub fn active_store_header(n: Node) -> Option<NodeHeader> {
     Some(store.borrow().headers[slot_index(n)].read(file))
 }
 
-/// Go `node.Kind` of a published store node (tier 0 or tier 1, see
-/// `frozen_of`). `None` for any other node: nil, synthetic, legacy and
-/// unpublished store nodes.
+/// Go `node.Kind` of a published store node (tier 0, tier 1 or a freeable
+/// file version, see `frozen_read`). `None` for any other node: nil,
+/// synthetic, legacy and unpublished store nodes.
 #[inline]
 #[must_use]
 pub fn frozen_store_kind(n: Node) -> Option<SyntaxKind> {
     if n.is_nil() {
         return None;
     }
-    let (_, _, kinds) = frozen_of(n.file_index(), |f| &f.kinds[..])?;
-    Some(kinds[slot_index(n)])
+    frozen!(n.file_index(), kinds, |_, _, kinds| kinds[slot_index(n)])
 }
 
-/// The header of a published store node, by reference, so a read of one
-/// field does not copy the whole header. The parent is still in its stored
-/// form (see `LOCAL_STORE`). `None` as for `frozen_store_kind`.
+/// `read` on the header of a published store node, by reference, so a read
+/// of one field does not copy the whole header. The parent is still in its
+/// stored form (see `LOCAL_STORE`). `None` as for `frozen_store_kind`.
 #[inline]
-fn frozen_header(n: Node) -> Option<&'static NodeHeader> {
+fn frozen_header<R>(n: Node, read: impl FnOnce(&NodeHeader) -> R) -> Option<R> {
     if n.is_nil() {
         return None;
     }
-    let (_, _, headers) = frozen_of(n.file_index(), |f| &f.headers[..])?;
-    Some(&headers[slot_index(n)])
+    frozen!(n.file_index(), headers, |_, _, headers| read(
+        &headers[slot_index(n)]
+    ))
 }
 
 /// Parser `node.Flags` of a published store node (see `frozen_header`).
 #[inline]
 #[must_use]
 pub fn frozen_store_flags(n: Node) -> Option<NodeFlags> {
-    frozen_header(n).map(|h| h.flags)
+    frozen_header(n, |h| h.flags)
 }
 
 /// Go `node.Loc` of a published store node (see `frozen_header`).
 #[inline]
 #[must_use]
 pub fn frozen_store_loc(n: Node) -> Option<TextRange> {
-    frozen_header(n).map(|h| h.loc)
+    frozen_header(n, |h| h.loc)
 }
 
 /// Go `node.Parent` of a published store node (see `frozen_header`).
 #[inline]
 #[must_use]
 pub fn frozen_store_parent(n: Node) -> Option<Node> {
-    frozen_header(n).map(|h| h.read(n.file_index()).parent)
+    frozen_header(n, |h| h.read(n.file_index()).parent)
 }
 
 /// The ts_ast node of a published store node: the inlined fast path of
@@ -2049,8 +2310,8 @@ pub fn frozen_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
     if n.is_nil() {
         return None;
     }
-    let (_, _, nodes) = frozen_of(n.file_index(), |f| &f.nodes[..])?;
-    Some(nodes[slot_index(n)].expect("store handle does not name a node slot"))
+    frozen!(n.file_index(), nodes, |_, _, nodes| nodes[slot_index(n)]
+        .expect("store handle does not name a node slot"))
 }
 
 /// `store_ast_node(n)` when `n` is a store node, in one lookup (see
@@ -2072,8 +2333,8 @@ pub fn try_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
 /// `try_store_ast_node` for a node that is not in the active store.
 #[inline(never)]
 fn try_store_ast_node_slow(file: usize, index: usize) -> Option<&'static ts_ast::Node> {
-    if let Some((_, _, nodes)) = frozen_of(file, |f| &f.nodes[..]) {
-        return Some(slot_node(nodes[index]));
+    if let Some(node) = frozen!(file, nodes, |_, _, nodes| slot_node(nodes[index])) {
+        return Some(node);
     }
     unpublished_store(file).map(|store| slot_node(store.borrow().nodes[index]))
 }
@@ -2101,8 +2362,10 @@ pub fn try_resolve_store_id(file: usize, id: ts_ast::NodeId) -> Option<Node> {
 /// `try_resolve_store_id` for a file that is not the active store.
 #[inline(never)]
 fn try_resolve_store_id_slow(file: usize, index: usize) -> Option<Node> {
-    if let Some((f, _, s)) = frozen_of(file, |f| &f.per_store[..]) {
-        return Some(frozen_resolve_slot(f, s, file, index));
+    if let Some(n) = frozen!(file, per_store, |f, _, s| frozen_resolve_slot(
+        f, s, file, index
+    )) {
+        return Some(n);
     }
     unpublished_store(file).map(|store| {
         let s = store.borrow();
@@ -2134,8 +2397,8 @@ pub fn store_identifier_name(n: Node) -> Option<Name> {
         return None;
     }
     let (file, index) = (n.file_index(), slot_index(n));
-    if let Some((_, _, names)) = frozen_of(file, |f| &f.names[..]) {
-        return Some(names[index].clone());
+    if let Some(name) = frozen!(file, names, |_, _, names| names[index].clone()) {
+        return Some(name);
     }
     store_identifier_name_slow(file, index)
 }
@@ -2174,12 +2437,13 @@ fn resolve_slot(
 
 /// `try_resolve_store_id(file, _)` for every slot of published store
 /// `file` (tier 0 or tier 1), indexed by `NodeId::index()`. `None` for any
-/// other file and for an alias-free store, which has no table (`Node::new`
-/// resolves its ids without one).
+/// other file, for a freeable file version (its table is not `'static`)
+/// and for an alias-free store, which has no table (`Node::new` resolves
+/// its ids without one). On `None` the caller resolves each id.
 #[inline]
 #[must_use]
 pub fn frozen_resolved(file: usize) -> Option<&'static [Node]> {
-    let (_, _, s) = frozen_of(file, |f| &f.per_store[..])?;
+    let s = static_frozen(file, |f| f.per_store)?;
     (!s.facts.alias_free).then_some(s.resolved)
 }
 
@@ -2190,16 +2454,20 @@ pub fn frozen_resolved(file: usize) -> Option<&'static [Node]> {
 #[inline]
 #[must_use]
 pub fn frozen_resolve_store_id(file: usize, id: ts_ast::NodeId) -> Option<Node> {
-    let (f, _, s) = frozen_of(file, |f| &f.per_store[..])?;
-    Some(frozen_resolve_slot(f, s, file, id.index()))
+    frozen!(file, per_store, |f, _, s| frozen_resolve_slot(
+        f,
+        s,
+        file,
+        id.index()
+    ))
 }
 
-/// The `StoreFacts` of published store `file` (tier 0 or tier 1). `None`
-/// for any other file.
+/// The `StoreFacts` of published store `file` (tier 0, tier 1 or a
+/// freeable file version). `None` for any other file.
 #[inline]
 #[must_use]
 pub fn frozen_store_facts(file: usize) -> Option<StoreFacts> {
-    frozen_of(file, |f| &f.per_store[..]).map(|(_, _, s)| s.facts)
+    frozen!(file, per_store, |_, _, s| s.facts)
 }
 
 /// The `StoreFacts` of the store of `n` when it is a published store node.
@@ -2216,13 +2484,29 @@ pub fn frozen_node_store_facts(n: Node) -> Option<StoreFacts> {
 
 /// Go `SourceFile.ECMALineMap()` of published store file `file`. It is
 /// computed once and shared by every thread. `None` for an unpublished
-/// store or a file without a store.
+/// store or a file without a store. A freeable file version keeps it in its
+/// store, so the guard pins the version.
 #[must_use]
-pub fn frozen_file_ecma_line_starts(file: usize) -> Option<&'static [i32]> {
-    let (_, _, store) = frozen_of(file, |f| f.stores)?;
-    Some(store.ecma_line_starts.get_or_init(|| {
-        crate::scanner_util::compute_ecma_line_starts(store.text).into_boxed_slice()
-    }))
+pub fn frozen_file_ecma_line_starts(file: usize) -> Option<FileRef<[i32]>> {
+    fn line_starts(store: &FileStore) -> &[i32] {
+        store.ecma_line_starts.get_or_init(|| {
+            crate::scanner_util::compute_ecma_line_starts(store.text).into_boxed_slice()
+        })
+    }
+    if let Some(store) = static_frozen(file, |f| f.stores) {
+        return Some(FileRef::Static(line_starts(store)));
+    }
+    let version = published_version(file)?;
+    Some(FileRef::Pinned {
+        version,
+        key: 0,
+        get: |version, _| {
+            let store = version
+                .published()
+                .expect("a pinned file version is published");
+            line_starts(&store.store)
+        },
+    })
 }
 
 /// Go `GetSourceFileOfNode(n)` in O(1), when `n` is a published store node
@@ -2233,10 +2517,11 @@ pub fn frozen_source_file_of_node(n: Node) -> Option<Node> {
     if n.is_nil() {
         return None;
     }
-    let (f, local, headers) = frozen_of(n.file_index(), |f| &f.headers[..])?;
-    headers[slot_index(n)]
-        .source_file_is_root
-        .then(|| f.stores[local].root)
+    frozen!(n.file_index(), headers, |f, local, headers| headers
+        [slot_index(n)]
+    .source_file_is_root
+    .then(|| f.stores[local].root))
+    .flatten()
 }
 
 /// U1 (a): Go `node.Text()` of a published Identifier or PrivateIdentifier
@@ -2250,13 +2535,17 @@ pub fn frozen_store_text_name(n: Node) -> Option<Name> {
         return None;
     }
     let index = slot_index(n);
-    let (f, local, kinds) = frozen_of(n.file_index(), |f| &f.kinds[..])?;
-    match kinds[index] {
-        SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier => {
-            Some(f.names[local][index].clone())
+    frozen!(
+        n.file_index(),
+        kinds,
+        |f, local, kinds| match kinds[index] {
+            SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier => {
+                Some(f.names[local][index].clone())
+            }
+            _ => None,
         }
-        _ => None,
-    }
+    )
+    .flatten()
 }
 
 /// U1 (a): Go `scanner.GetIdentifierToken(node.Text()) != KindIdentifier` of
@@ -2265,12 +2554,14 @@ pub fn frozen_store_text_name(n: Node) -> Option<Name> {
 #[inline]
 #[must_use]
 pub fn frozen_store_text_is_keyword(n: Node) -> Option<bool> {
-    let h = frozen_header(n)?;
-    matches!(
-        h.kind,
-        SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier
-    )
-    .then_some(h.text_is_keyword)
+    frozen_header(n, |h| {
+        matches!(
+            h.kind,
+            SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier
+        )
+        .then_some(h.text_is_keyword)
+    })
+    .flatten()
 }
 
 /// U1 (b): Go `node.ModifierFlags()` (the flags of the node's own modifier
@@ -2283,9 +2574,10 @@ pub fn frozen_store_modifier_flags(n: Node) -> Option<ModifierFlags> {
     if n.is_nil() {
         return None;
     }
-    let (_, _, bits) = frozen_of(n.file_index(), |f| &f.modifier_bits[..])?;
-    bits.get(slot_index(n))
-        .map(|&bits| ModifierFlags(u32::from(bits)))
+    frozen!(n.file_index(), modifier_bits, |_, _, bits| bits
+        .get(slot_index(n))
+        .map(|&bits| ModifierFlags(u32::from(bits))))
+    .flatten()
 }
 
 /// U4 (CH6, bind A): Go `n.Name()`, `n.Expression()`, `n.PostfixToken()` or
@@ -2302,7 +2594,22 @@ pub fn frozen_store_child(n: Node, which: StoreChild) -> Option<Node> {
         return None;
     }
     let file = n.file_index();
-    let (f, _, s) = frozen_of(file, |f| &f.per_store[..])?;
+    frozen!(file, per_store, |f, _, s| column_store_child(
+        f, s, n, which
+    ))
+    .flatten()
+}
+
+/// `frozen_store_child` in the publish `f` of `n`, whose per-store part is
+/// `s`.
+#[inline]
+fn column_store_child(
+    f: &Frozen<'_>,
+    s: &FrozenStore<'_>,
+    n: Node,
+    which: StoreChild,
+) -> Option<Node> {
+    let file = n.file_index();
     let entry = *s.children.get(slot_index(n))?;
     let id = match which {
         StoreChild::Name => {
@@ -2365,17 +2672,19 @@ pub fn frozen_store_lacks_type_arguments(n: Node) -> bool {
     if n.is_nil() {
         return false;
     }
-    frozen_of(n.file_index(), |f| &f.per_store[..]).is_some_and(|(_, _, s)| {
+    frozen!(n.file_index(), per_store, |_, _, s| {
         s.children
             .get(slot_index(n))
             .is_some_and(|entry| entry.has_no_type_arguments())
     })
+    .unwrap_or(false)
 }
 
 /// R2-5: the children of a published store node (tier 0 or tier 1) in Go
 /// `ForEachChild` order, from the link column of its store (`SlotLinks`),
 /// without its node data. `None` when the chain of `n` is not known and for
-/// any other node (nil, synthetic, legacy, unpublished): the caller uses
+/// any other node (nil, synthetic, legacy, unpublished, or a freeable file
+/// version, whose column is not `'static`): the caller uses
 /// `for_each_child`.
 #[inline]
 #[must_use]
@@ -2384,7 +2693,7 @@ pub fn frozen_store_children(n: Node) -> Option<StoreChildren> {
         return None;
     }
     let file = n.file_index();
-    let (_, _, s) = frozen_of(file, |f| &f.per_store[..])?;
+    let s = static_frozen(file, |f| f.per_store)?;
     let links = s.links;
     let first = links.get(slot_index(n))?.first_child;
     (first != LINK_NONE).then_some(StoreChildren {
@@ -2420,7 +2729,7 @@ impl Iterator for StoreChildren {
 
 /// The node of child id `id` of store `file` in a `children` entry.
 #[inline]
-fn column_child(f: &Frozen, s: &FrozenStore, file: usize, id: u32) -> Node {
+fn column_child(f: &Frozen<'_>, s: &FrozenStore<'_>, file: usize, id: u32) -> Node {
     // Slot 0 stands for Go nil, as for an optional field that is nil and a
     // kind without the field: it resolves to `FrozenStore::nil`, which is
     // nil (the header of slot 0 never changes).
@@ -2450,29 +2759,41 @@ pub enum AncestorWalk {
 #[inline]
 pub fn frozen_find_ancestor(
     n: Node,
-    mut callback: impl FnMut(Node, SyntaxKind) -> bool,
+    callback: impl FnMut(Node, SyntaxKind) -> bool,
 ) -> Option<AncestorWalk> {
     if n.is_nil() {
         return None;
     }
     let file = n.file_index();
-    let (f, local, &headers) = frozen_of(file, |f| &f.headers[..])?;
-    let kinds = f.kinds[local];
-    let mut index = slot_index(n);
+    frozen!(file, headers, |f, local, &headers| {
+        store_find_ancestor(file, headers, f.kinds[local], slot_index(n), callback)
+    })
+}
+
+/// `frozen_find_ancestor` in store `file`, whose header and kind tables
+/// are `headers` and `kinds`, from slot `index`.
+#[inline]
+fn store_find_ancestor(
+    file: usize,
+    headers: &[NodeHeader],
+    kinds: &[SyntaxKind],
+    mut index: usize,
+    mut callback: impl FnMut(Node, SyntaxKind) -> bool,
+) -> AncestorWalk {
     loop {
         let node = handle(file, index as u32);
         if callback(node, kinds[index]) {
-            return Some(AncestorWalk::Found(node));
+            return AncestorWalk::Found(node);
         }
         // The stored parent (`NodeHeader::read`): a `LOCAL_STORE` handle is
         // a node of this store; anything else is nil or another store.
         let parent = headers[index].parent;
         if parent.file_index() != LOCAL_STORE {
-            return Some(if parent.is_nil() {
+            return if parent.is_nil() {
                 AncestorWalk::Found(Node::NIL)
             } else {
                 AncestorWalk::Next(parent)
-            });
+            };
         }
         index = slot_index(parent);
     }
@@ -2489,13 +2810,14 @@ pub fn frozen_store_parent_kind(n: Node) -> Option<(Node, SyntaxKind)> {
         return None;
     }
     let file = n.file_index();
-    let (f, local, headers) = frozen_of(file, |f| &f.headers[..])?;
-    let parent = headers[slot_index(n)].parent;
-    if parent.file_index() != LOCAL_STORE {
-        return None;
-    }
-    let index = slot_index(parent);
-    Some((handle(file, index as u32), f.kinds[local][index]))
+    frozen!(file, headers, |f, local, headers| {
+        let parent = headers[slot_index(n)].parent;
+        (parent.file_index() == LOCAL_STORE).then(|| {
+            let index = slot_index(parent);
+            (handle(file, index as u32), f.kinds[local][index])
+        })
+    })
+    .flatten()
 }
 
 /// U4 (CH7): true when `n` is a published store node and no node of its store
@@ -2509,8 +2831,9 @@ pub fn frozen_store_lacks_deprecated_tag(n: Node) -> bool {
     if n.is_nil() {
         return false;
     }
-    frozen_of(n.file_index(), |f| &f.per_store[..])
-        .is_some_and(|(_, _, s)| s.facts.parents_local && !s.facts.has_deprecated_tag)
+    frozen!(n.file_index(), per_store, |_, _, s| s.facts.parents_local
+        && !s.facts.has_deprecated_tag)
+    .unwrap_or(false)
 }
 
 /// U1 (c): how `Node::new(file, id)` maps the child ids of one published
@@ -2542,30 +2865,38 @@ impl FrozenIds {
     }
 }
 
-/// U1 (c): the `FrozenIds` of published store `file` (tier 0 or tier 1).
-/// `None` for any other file (unpublished, synthetic or legacy).
+/// U1 (c): the `FrozenIds` of published store `file` (tier 0 or tier 1, or
+/// an alias-free freeable file version). `None` for any other file
+/// (unpublished, synthetic, legacy, or a freeable version with alias slots,
+/// whose table is not `'static`): the caller resolves each id.
 #[inline]
 #[must_use]
 pub fn frozen_store_ids(file: usize) -> Option<FrozenIds> {
-    let (_, _, s) = frozen_of(file, |f| &f.per_store[..])?;
-    Some(if s.facts.alias_free {
-        FrozenIds::Direct {
-            base: (file as u64) << 32,
-            nil: s.nil,
-        }
-    } else {
-        FrozenIds::Table(s.resolved)
-    })
+    let base = (file as u64) << 32;
+    if let Some(s) = static_frozen(file, |f| f.per_store) {
+        return Some(if s.facts.alias_free {
+            FrozenIds::Direct { base, nil: s.nil }
+        } else {
+            FrozenIds::Table(s.resolved)
+        });
+    }
+    frozen!(file, per_store, |_, _, s| s
+        .facts
+        .alias_free
+        .then_some(FrozenIds::Direct { base, nil: s.nil }))
+    .flatten()
 }
 
 /// U1 (e): capacity hints for binding published store file `file`
-/// (`NodeBindBuilder` entries, flow nodes), tier 0 or tier 1. `None` for an
-/// unpublished store and a file without a store.
+/// (`NodeBindBuilder` entries, flow nodes), tier 0, tier 1 or a freeable
+/// file version. `None` for an unpublished store and a file without a
+/// store.
 #[must_use]
 pub fn frozen_store_bind_estimate(file: usize) -> Option<(usize, usize)> {
-    let (_, _, store) = frozen_of(file, |f| f.stores)?;
-    let e = store.bind_estimate;
-    Some((e.entries as usize, e.flow_nodes as usize))
+    frozen!(file, stores, |_, _, store| {
+        let e = store.bind_estimate;
+        (e.entries as usize, e.flow_nodes as usize)
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────
