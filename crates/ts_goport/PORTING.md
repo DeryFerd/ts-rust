@@ -47,7 +47,7 @@ the most literal port and add a `// PORT:` comment that explains the choice.
   numeric values). Operators: `a|b` works, `a&b != 0` -> `a.intersects(b)`,
   `a&b == b` -> `a.contains(b)`, `a&^b` -> `a.without(b)`, `a&b` -> `a & b`.
   Raw bits: `.0`.
-- `ast.KindFoo` -> `SyntaxKind::Foo` (`ts_ast::SyntaxKind`). Only difference:
+- `ast.KindFoo` -> `SyntaxKind::Foo` (`astdata::SyntaxKind`). Only difference:
   Go `JSDoc...`/`JS...` kinds are spelled `JsDoc...`/`Js...`
   (`ast.KindJSDocTypeTag` -> `SyntaxKind::JsDocTypeTag`,
   `ast.KindJSImportDeclaration` -> `SyntaxKind::JsImportDeclaration`).
@@ -55,7 +55,7 @@ the most literal port and add a `// PORT:` comment that explains the choice.
   (compare with `>=`/`<=`; SyntaxKind is `Ord`).
 - Diagnostics: `diagnostics.Type_0_is_not_assignable_to_type_1` ->
   `diag::Type_0_is_not_assignable_to_type_1` (exact Go name,
-  `&'static ts_diagnostics::Message`).
+  `&'static diagnostics::Message`).
 - Go package-level functions in `checker` -> `impl Checker` methods when they
   touch type, symbol, signature, mapper or checker data, else free `pub fn`.
   Package-level functions in `ast`, `scanner`, `binder` that take a symbol
@@ -82,11 +82,11 @@ the most literal port and add a `// PORT:` comment that explains the choice.
 | `*TypeMapper` | `MapperId` |
 | `*InferenceContext` | `InferenceContextId` |
 | `*InferenceInfo` | `usize` index into `inference_contexts[ctx].inferences` (pass the context id too) |
-| `*diagnostics.Message` | `&'static Message` (`ts_diagnostics::Message`) |
+| `*diagnostics.Message` | `&'static Message` (`diagnostics::Message`) |
 | `*ast.Diagnostic` | `Diagnostic` (owned, `core::Diagnostic`) |
 | `[]*T` param | `&[T]` ; `[]*T` field or return | `Vec<T>` |
 | `string` param | `&str` ; field or return | `String` |
-| `int` | `i32` ; `int64` | `i64` ; `uint32` | `u32` ; `jsnum.Number` | `ts_jsnum::Number` |
+| `int` | `i32` ; `int64` | `i64` ; `uint32` | `u32` ; `jsnum.Number` | `jsnum::Number` |
 | `bool` | `bool` |
 | `any` literal value (LiteralType.value) | `LiteralValue` enum defined in `checker/types.rs` |
 | `core.Tristate` | `Tristate` (in `options.rs`) |
@@ -193,7 +193,7 @@ methods reach the AST through it.
   `pos()`, `end()`, `loc()`, `has_trailing_comma()`, `is_nil()`.
   `ModifierList` has `.nodes()`, `.modifier_flags()`, `is_nil()`.
 - `NodeList`, `ModifierList` and `NodeSlice` are Copy handles defined in
-  `ast/node.rs`. A list of parsed data points at its ts_ast list (it lives
+  `ast/node.rs`. A list of parsed data points at its astdata list (it lives
   for the process). A list of synthetic data is an index into the thread's
   synthetic arena (`SyntheticList`), so it is valid only on the thread
   that made it, like a synthetic `Node`. Equality is Go pointer equality.
@@ -241,12 +241,50 @@ The batch that adds it is not accepted until Theo approves.
   from `publish_file_stores` on; read it with `ast::go_file(id)`. Program
   versions share the file versions they have in common, as Go shares
   unchanged `SourceFile` objects.
-- `program::release_program` frees the checker pool, the emit pool and the
-  frontend of a version. Each checker worker frees its checker and the
-  synthetic nodes it made (`free_synthetic_nodes`), and each emit thread
-  frees its synthetic nodes. The program shell and the file versions stay
-  leaked for now. A one-program process forgets its checkers and the
-  synthetic nodes of both pools at the end, like Go.
+- The per-version program tables (files by path, file metadata,
+  diagnostics, checker file associations, the declaration diagnostic cache
+  and the Go frontend copies in `GoSharedState`) are in
+  `program::VersionTables`, behind an `Arc` in the leaked `ProgramState`.
+  Read them with `with_tables(|tables| ..)`, which caches the current
+  version's `Arc` in a thread-local, so a hit costs no atomic operation.
+  A closure must not enter another program. An accessor that returned a
+  `&'static` borrow of the tables returns an `Arc` clone
+  (`get_redirect_for_resolution`, `get_project_reference_from_source`,
+  `get_go_symlink_cache`, ...). The program of a one-program process
+  leaks its tables and reads them with no lock or thread-local.
+- `program::release_program` frees the checker pool, the emit pool, the
+  frontend and the tables of a version. The frontend `NewProgram` goes
+  with its last `Rc` holder. Its parses stay: the publish that gives a
+  file its `GoFile` keeps that file's parse, because the `GoFile` borrows
+  it. `GoSharedState` owns its copies of the frontend data. The module
+  resolutions are not copied: the frontend keeps them in an `Arc` map of
+  `Arc<ResolvedModule>`, and `GoSharedState` shares that map (a lookup
+  borrows the name through `module::ModeAwareKey`). Each checker worker frees its
+  checker and the synthetic nodes it made (`free_synthetic_nodes`), and
+  each emit thread frees its synthetic nodes. A worker, bind, emit or
+  search thread gets a copy of the tables `Arc` in its `WorkerSeed` and
+  keeps it until it ends, so a thread can finish its work after the
+  release, as a Go goroutine that holds the program does. A read of a
+  released version's tables on a thread with no copy panics ("program
+  version N is released"). `GOPORT_KEEP_VERSION_TABLES=1` keeps them (A/B
+  runs and a field fallback). The `GoProgram` shell and the file versions
+  stay leaked for now. A one-program process forgets its checkers and the
+  synthetic nodes of both pools at the end, like Go. Watch mode uses
+  `program::release_program_later`: the old checker pool stops before the
+  new build, but the frontend and the tables are freed after the status
+  report, so the free is not in the rebuild time.
+- The parse tasks of a load go with the loader. Go's garbage collector
+  frees them. Here the `sub_tasks` and `loaded_task` links make an `Rc`
+  cycle when files import each other, so the `FilesParser` drop takes
+  those links out. A one-program process forgets the loader
+  (`with_loader_state_forgotten`), so it does not pay for the free.
+- Go's garbage collector frees old data in the background, never in a
+  request. On the dispatch thread of the LSP server, the large frees
+  wait until the answer is sent (`gostd::local::drop_later`): the tables
+  and frontend program of a released version (`ls_program::release_now`)
+  and the parse tasks of a load. The dispatch loop drops them after each
+  message, while no message waits (`drop_garbage`); more than 16 are
+  dropped even when messages wait. Other threads drop them at once.
 - A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
   like Go: each project's program is a version made with `new_program` and
   `program::new_program_version`, and it is released when its task
@@ -573,8 +611,9 @@ program version:
   dispatch thread. Items commit in queue order, so the results are those
   of a serial run in Go start order.
 - The search code is generic over `ProgramView`
-  (`LanguageService<P = &'static NewProgram>`). Keep new code on that path
-  generic, and keep `Rc` values and checkers on their thread.
+  (`LanguageService<P = NewProgram>` holds `Rc<P>`; the search code takes
+  `&P`). Keep new code on that path generic, and keep `Rc` values and
+  checkers on their thread.
 
 ### Go runtime (`crate::gostd`)
 
@@ -635,9 +674,15 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 ### Programs and checkers
 
 - Go `*compiler.Program` in ls, project and api code is
-  `&'static compiler::NewProgram` (leaked for the process like
-  `GoProgram`; `Copy`; pointer equality is `std::ptr::eq`; a map key is
-  `p as *const _ as usize`).
+  `Rc<compiler::NewProgram>` where it is stored (a project, a checker
+  pool, a language service, the `ls_program` registry, `FRONTENDS`) and
+  `&compiler::NewProgram` where code only reads it. Holding the `Rc`
+  keeps the program alive, as a Go pointer does. Pointer equality is
+  `Rc::ptr_eq` (`std::ptr::eq` for two borrows). A map key is the
+  address only while the map's owner holds the `Rc`
+  (`ls_program` registry, `programCounter`); a per-thread cache that can
+  outlive the program uses the program version id
+  (`ProgramView::identity`).
 - Go `compiler.NewProgram(opts)` is `ls_program::new_program(opts,
   create_checker_pool)`; `p.UpdateProgram(..)` is
   `ls_program::update_program(p, ..)`. Go `ProgramOptions.CreateCheckerPool`
@@ -660,8 +705,10 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   snapshot `programCounter.Deref`). It frees the checker pools of `p`, its
   program version and the synthetic nodes that the dispatch thread made
   while the version was current, now or when the last guard of `p` drops.
-  The `NewProgram`, the `GoProgram` shell and the file versions stay leaked
-  (multi-program M2, M3). A compiler host drops its data
+  The version's tables go with it (see "Program"). The registry drops its
+  `Rc` of `p`, so the `NewProgram` is freed with its last holder. The
+  `GoProgram` shell and the file versions stay leaked (M3). A compiler
+  host drops its data
   (`CompilerHost::release`, not in Go) when no live program uses it. A
   program uses its own host and the host of the load that made its files:
   a clone shares the old program's processed files (Go `UpdateProgram`),
@@ -714,8 +761,7 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 
 ### Scanning
 
-- ls, astnav and format code scan with the literal Go scanner
-  `frontend::scanner::Scanner`, not `RsScanner`.
+- All code scans with the Go scanner `frontend::scanner::Scanner`.
 - Go `scanner.GetScannerForSourceFile(f, pos)` is
   `scanner_ls::get_scanner_for_source_file(f, pos)` and
   `scanner.GetECMAPositionOfLineAndByteOffset` is

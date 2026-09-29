@@ -1,9 +1,9 @@
 //! Port of typescript-go `checker/relater.go` lines 1827-2795.
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use ts_diagnostics::Message;
 
 impl Checker {
     // Go: checker/relater.go:1827 getNameableDeclarationAtPosition

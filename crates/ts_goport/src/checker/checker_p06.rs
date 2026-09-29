@@ -2,8 +2,8 @@
 //! property initialization, interface/enum/module declarations, imports and
 //! exports).
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 // PORT: Go `tspath.IsExternalModuleNameRelative`, `tspath.FileExtensionIsOneOf`
 // and their helpers. tspath has no port in this crate, so these private

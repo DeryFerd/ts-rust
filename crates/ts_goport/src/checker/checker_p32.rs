@@ -1,10 +1,10 @@
 //! Port of typescript-go `internal/checker/checker.go` lines 28753-29671.
 //! Read `crates/ts_goport/PORTING.md` before editing.
 
+use crate::jsnum::Number;
 use crate::prelude::*;
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use ts_jsnum::Number;
 
 impl Checker {
     // Go: checker/checker.go:28753 getTypeOfFirstParameterOfSignature

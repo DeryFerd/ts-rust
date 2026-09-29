@@ -11,11 +11,54 @@ pub trait ResolutionHost {
 }
 
 // Go: module/types.go:19 ModeAwareCacheKey
+// PORT: the derived `Hash` must stay the one of `dyn ModeAwareKey` (name,
+// then mode).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ModeAwareCacheKey {
     pub name: String,
     pub mode: ResolutionMode,
 }
+
+/// A `ModeAwareCache` key by its parts. `cache.get(&(name, mode) as &dyn
+/// ModeAwareKey)` looks up a borrowed name with no owned key. No Go
+/// counterpart.
+pub trait ModeAwareKey {
+    fn parts(&self) -> (&str, ResolutionMode);
+}
+
+impl ModeAwareKey for ModeAwareCacheKey {
+    fn parts(&self) -> (&str, ResolutionMode) {
+        (&self.name, self.mode)
+    }
+}
+
+impl ModeAwareKey for (&str, ResolutionMode) {
+    fn parts(&self) -> (&str, ResolutionMode) {
+        *self
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn ModeAwareKey + 'a> for ModeAwareCacheKey {
+    fn borrow(&self) -> &(dyn ModeAwareKey + 'a) {
+        self
+    }
+}
+
+impl std::hash::Hash for dyn ModeAwareKey + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let (name, mode) = self.parts();
+        name.hash(state);
+        mode.hash(state);
+    }
+}
+
+impl PartialEq for dyn ModeAwareKey + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for dyn ModeAwareKey + '_ {}
 
 // Go: module/types.go:24 ResolvedProjectReference
 // PORT: Go `module.ResolvedProjectReference` is an interface. The name

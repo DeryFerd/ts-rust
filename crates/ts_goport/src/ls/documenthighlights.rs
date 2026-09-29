@@ -137,7 +137,7 @@ impl LanguageService {
         ctx: &Context,
         position: i32,
         node: Node,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         source_files: &[Node],
     ) -> Vec<lsproto::MultiDocumentHighlight> {
         let options = RefOptions {

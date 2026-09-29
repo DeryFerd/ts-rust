@@ -448,16 +448,16 @@ fn test_import_elision() {
                         ..Default::default()
                     },
                 );
-                let _current = ls_program::enter(p);
-                let file = source_file(p, main).root;
+                let _current = ls_program::enter(&p);
+                let file = source_file(&p, main).root;
                 check_diagnostics(file)?;
                 if !other.is_empty() {
-                    check_diagnostics(source_file(p, "/other.ts").root)?;
+                    check_diagnostics(source_file(&p, "/other.ts").root)?;
                 }
 
                 let compiler_options: &'static CompilerOptions = Box::leak(Box::default());
 
-                let (c, release) = ls_program::get_type_checker(p, &context::background());
+                let (c, release) = ls_program::get_type_checker(&p, &context::background());
                 let emit_resolver = get_emit_resolver_of_shared_checker(&c);
                 let emit_resolver: Rc<dyn ts_goport::printer::EmitResolver> = emit_resolver;
 

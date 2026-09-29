@@ -268,7 +268,7 @@ fn send_job<Req: Send + 'static, Resp: Send + 'static>(
         view.end_job();
         reply.send(outcome);
     });
-    let program = ls.program;
+    let program = &*ls.program;
     SEARCH_THREADS.with(|threads| {
         let mut threads = threads.borrow_mut();
         let jobs = threads
@@ -285,7 +285,7 @@ fn send_job<Req: Send + 'static, Resp: Send + 'static>(
 
 /// Ends the search thread of `program` once its queued jobs ran. Called when
 /// the program is released (Go frees its checkers with it).
-pub fn release_search_thread(program: &'static compiler::NewProgram) {
+pub fn release_search_thread(program: &compiler::NewProgram) {
     SEARCH_THREADS.with(|threads| threads.borrow_mut().remove(&program.identity()));
 }
 
@@ -323,20 +323,24 @@ pub fn answer_query(ls: &LanguageService, query: HostQuery) -> HostAnswer {
             referencing_file,
             target,
         } => HostAnswer::FileReferences(ProgramView::references_to_file(
-            ls.program,
+            &*ls.program,
             referencing_file,
             target,
         )),
         HostQuery::ReferenceAtPosition {
             source_file,
             position,
-        } => HostAnswer::RefInfo(get_reference_at_position(source_file, position, ls.program)),
+        } => HostAnswer::RefInfo(get_reference_at_position(
+            source_file,
+            position,
+            &ls.program,
+        )),
     }));
     answered.unwrap_or_else(|payload| HostAnswer::Panic(panic_payload_text(&*payload)))
 }
 
 /// Starts the search thread of `program` and returns its job queue.
-fn spawn_search_thread(program: &'static compiler::NewProgram) -> mpsc::Sender<Job> {
+fn spawn_search_thread(program: &compiler::NewProgram) -> mpsc::Sender<Job> {
     // Go binds every file before it makes a checker (`BindSourceFiles`).
     // Bind here, so that the seed holds what binding made on this thread.
     ls_program::bind_source_files(program);
@@ -403,7 +407,7 @@ fn run_search<K: CrossProjectSearch>(
         let host: Rc<dyn Host> = Rc::new(WorkerHost::new(view, &job));
         let ls = new_language_service_for_view(
             job.project_path.clone(),
-            &**view,
+            Rc::clone(view),
             host,
             job.preferences.clone(),
             ls_program::enter_version(view.data.version),
@@ -467,7 +471,7 @@ pub struct SearchProgramData {
 }
 
 impl SearchProgramData {
-    fn new(p: &'static compiler::NewProgram) -> Self {
+    fn new(p: &compiler::NewProgram) -> Self {
         let roots: Vec<Node> = p.get_source_files().iter().map(|f| f.root).collect();
         let mut root_indexes: FxHashMap<Node, i32> = FxHashMap::default();
         for (i, &root) in roots.iter().enumerate() {
@@ -523,7 +527,7 @@ impl SearchProgramData {
     }
 }
 
-/// The program of a search thread, and its checker. `&SearchView` is the
+/// The program of a search thread, and its checker. `SearchView` is the
 /// `ProgramView` of the thread's language services.
 pub struct SearchView {
     data: Arc<SearchProgramData>,
@@ -687,16 +691,16 @@ impl SearchView {
     }
 }
 
-impl<'w> ProgramView for &'w SearchView {
-    fn identity(self) -> usize {
-        Arc::as_ptr(&self.data) as *const () as usize
+impl ProgramView for SearchView {
+    fn identity(&self) -> usize {
+        self.data.version.id as usize
     }
 
-    fn get_current_directory(self) -> String {
+    fn get_current_directory(&self) -> String {
         self.data.current_directory.clone()
     }
 
-    fn source_file_root(self, file_name: &str) -> Node {
+    fn source_file_root(&self, file_name: &str) -> Node {
         let path = tspath::to_path(
             file_name,
             &self.data.current_directory,
@@ -705,26 +709,26 @@ impl<'w> ProgramView for &'w SearchView {
         self.data.by_path.get(&path).copied().unwrap_or(Node::NIL)
     }
 
-    fn source_file_roots(self) -> Vec<Node> {
+    fn source_file_roots(&self) -> Vec<Node> {
         self.data.roots.clone()
     }
 
-    fn source_file_index(self, file: Node) -> i32 {
+    fn source_file_index(&self, file: Node) -> i32 {
         self.data.root_indexes.get(&file).copied().unwrap_or(-1)
     }
 
-    fn is_source_from_project_reference(self, path: &tspath::Path) -> bool {
+    fn is_source_from_project_reference(&self, path: &tspath::Path) -> bool {
         if self.data.by_path.contains_key(path) {
             return self.data.project_reference_sources.contains(path);
         }
         self.query_bool(HostQuery::IsSourceFromProjectReference(path.clone()))
     }
 
-    fn is_source_file_default_library(self, path: &tspath::Path) -> bool {
+    fn is_source_file_default_library(&self, path: &tspath::Path) -> bool {
         self.data.default_libraries.contains(path)
     }
 
-    fn jsx_runtime_import_specifier(self, path: &tspath::Path) -> Node {
+    fn jsx_runtime_import_specifier(&self, path: &tspath::Path) -> Node {
         self.data
             .jsx_runtime_import_specifiers
             .get(path)
@@ -732,7 +736,7 @@ impl<'w> ProgramView for &'w SearchView {
             .unwrap_or(Node::NIL)
     }
 
-    fn import_helpers_import_specifier(self, path: &tspath::Path) -> Node {
+    fn import_helpers_import_specifier(&self, path: &tspath::Path) -> Node {
         self.data
             .import_helpers_import_specifiers
             .get(path)
@@ -740,7 +744,7 @@ impl<'w> ProgramView for &'w SearchView {
             .unwrap_or(Node::NIL)
     }
 
-    fn references_to_file(self, referencing_file: Node, target: Node) -> Vec<FileReference> {
+    fn references_to_file(&self, referencing_file: Node, target: Node) -> Vec<FileReference> {
         if self.data.root_indexes.contains_key(&referencing_file)
             && !self.data.files_with_references.contains(&referencing_file)
         {
@@ -755,7 +759,7 @@ impl<'w> ProgramView for &'w SearchView {
         }
     }
 
-    fn reference_at_position(self, source_file: Node, position: i32) -> Option<RefInfo> {
+    fn reference_at_position(&self, source_file: Node, position: i32) -> Option<RefInfo> {
         match self.query(HostQuery::ReferenceAtPosition {
             source_file,
             position,
@@ -765,7 +769,7 @@ impl<'w> ProgramView for &'w SearchView {
         }
     }
 
-    fn get_type_checker(self, _ctx: &Context) -> (Rc<RefCell<Checker>>, ls_program::Release) {
+    fn get_type_checker(&self, _ctx: &Context) -> (Rc<RefCell<Checker>>, ls_program::Release) {
         let mut slot = self.checker.borrow_mut();
         let checker = slot.get_or_insert_with(|| {
             let index = NEXT_SEARCH_CHECKER_INDEX.fetch_add(1, Ordering::Relaxed);

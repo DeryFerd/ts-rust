@@ -697,7 +697,7 @@ impl EmitResolver {
             }
             Some(LiteralValue::Number(value)) => {
                 if value.is_infinite() {
-                    if value > ts_jsnum::Number(0.0) {
+                    if value > crate::jsnum::Number(0.0) {
                         return factory.new_identifier("Infinity");
                     }
                     return factory.new_prefix_unary_expression(

@@ -1,6 +1,6 @@
 # Diagnostic catalog provenance
 
-The file crates/ts_diagnostics/src/catalog.rs is generated from
+The file crates/ts_goport/src/diagnostics/catalog.rs is generated from
 internal/diagnostics/diagnostics_generated.go in the cached
 microsoft/typescript-go checkout at commit
 dc37b5249ab60e2bbce936f71b883e6c8136167e (2026-06-19).

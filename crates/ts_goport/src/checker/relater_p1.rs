@@ -3,8 +3,8 @@
 //! simple and enum relations, error elaboration, weak type and known
 //! property checks, recursion identities, and best matching type selection.
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 // PORT: the Go flag types `SignatureCheckMode`, `MinArgumentCountFlags`,
 // `IntersectionState`, `RecursionFlags`, `ExpandingFlags` and
@@ -1177,12 +1177,12 @@ impl Checker {
             if is_omitted_expression(element)
                 || self.is_tuple_like_type(target)
                     && self
-                        .get_property_of_type(target, &ts_jsnum::Number(i as f64).to_string())
+                        .get_property_of_type(target, &crate::jsnum::Number(i as f64).to_string())
                         .is_nil()
             {
                 continue;
             }
-            let name_type = self.get_number_literal_type(ts_jsnum::Number(i as f64));
+            let name_type = self.get_number_literal_type(crate::jsnum::Number(i as f64));
             let check_node = self.get_effective_check_node(element);
             reported_error = self.elaborate_element(
                 source,

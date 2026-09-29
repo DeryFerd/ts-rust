@@ -109,7 +109,8 @@ fi
 # - TS_CARGO_NIGHTLY=0 keeps the default toolchain. `--profile goport` (shipped
 #   and timing bins: build-release.sh, build-pgo.sh), RUSTUP_TOOLCHAIN and a
 #   `+toolchain` argument keep it too. -Zthreads is the job count, at most 8.
-# - TS_CARGO_INCREMENTAL unset: incremental ts_goport in edit-loop builds only.
+# - TS_CARGO_INCREMENTAL unset: incremental ts_goport and its parts (goport_util,
+#   goport_lsproto) in edit-loop builds only.
 #   Other crates stay non-incremental, so sccache still caches them. 0 turns it
 #   off, 1 turns it on for every workspace crate.
 goport_profile=0
@@ -163,6 +164,10 @@ case "$incremental" in
     cargo_args+=(
       --config profile.dev.package.ts_goport.incremental=true
       --config profile.release.package.ts_goport.incremental=true
+      --config profile.dev.package.goport_util.incremental=true
+      --config profile.release.package.goport_util.incremental=true
+      --config profile.dev.package.goport_lsproto.incremental=true
+      --config profile.release.package.goport_lsproto.incremental=true
     )
     ;;
   *)

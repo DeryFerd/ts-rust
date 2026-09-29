@@ -122,7 +122,7 @@ impl Checker {
                     }
                 } else if self.is_array_like_type(parent_type) {
                     let index_type =
-                        self.get_number_literal_type(ts_jsnum::Number(f64::from(index)));
+                        self.get_number_literal_type(crate::jsnum::Number(f64::from(index)));
                     let mut declared_type = self.get_indexed_access_type_or_undefined(
                         parent_type,
                         index_type,
@@ -876,7 +876,7 @@ impl Checker {
         }
         let widened = self.get_widened_type(t);
         let type_as_string = self.type_to_string_exported(widened);
-        let diagnostic: &'static ts_diagnostics::Message;
+        let diagnostic: &'static crate::diagnostics::Message;
         match declaration.kind() {
             SyntaxKind::BinaryExpression
             | SyntaxKind::PropertyDeclaration

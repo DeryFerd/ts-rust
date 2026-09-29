@@ -40,7 +40,7 @@ pub struct CodeFixContext<'a> {
     pub source_file: Node,
     pub span: TextRange,
     pub error_code: i32,
-    pub program: &'static compiler::NewProgram,
+    pub program: &'a compiler::NewProgram,
     pub ls: &'a LanguageService,
     pub diagnostic: Option<&'a lsproto::Diagnostic>,
     pub params: Option<&'a lsproto::CodeActionParams>,
@@ -221,7 +221,7 @@ impl LanguageService {
     fn get_fix_all_quick_fixes(
         &self,
         ctx: &Context,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         file: Node,
         uri: &lsproto::DocumentUri,
         fix_id_seen: &IndexMap<String, &'static CodeFixProvider>,
@@ -288,7 +288,7 @@ impl LanguageService {
 // syntactic, suggestion, declaration) to match ProvideDiagnostics.
 fn has_multiple_fixable_diagnostics(
     ctx: &Context,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     file: Node,
     error_codes: &[i32],
 ) -> bool {
@@ -351,7 +351,7 @@ impl LanguageService {
     fn create_fix_all_action(
         &self,
         ctx: &Context,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         file: Node,
         uri: &lsproto::DocumentUri,
     ) -> Result<Option<lsproto::CommandOrCodeAction>, GoError> {
@@ -455,7 +455,7 @@ impl LanguageService {
     fn create_organize_imports_action(
         &self,
         ctx: &Context,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         file: Node,
         kind: lsproto::CodeActionKind,
     ) -> lsproto::CommandOrCodeAction {

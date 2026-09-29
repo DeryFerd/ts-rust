@@ -10,8 +10,8 @@
 //! `&mut dyn FnMut(&mut Checker, TypeId, TypeId) -> bool` (wrapped in
 //! `Option` where Go passes nil).
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 impl Checker {
     // Go: checker/checker.go:12101 tryGetThisTypeAt
@@ -480,7 +480,7 @@ impl Checker {
                         | SyntaxKind::GreaterThanGreaterThanGreaterThanEqualsToken => {
                             let rhs_eval = (self.evaluate.clone())(self, right, right);
                             if let Some(LiteralValue::Number(num_value)) = rhs_eval.value {
-                                if num_value.abs() >= ts_jsnum::Number::new(32.0) {
+                                if num_value.abs() >= crate::jsnum::Number::new(32.0) {
                                     // Elevate from suggestion to error within an enum member
                                     self.error_or_suggestion(
                                         is_enum_member(walk_up_parenthesized_expressions(right.parent().parent())),
@@ -489,7 +489,7 @@ impl Checker {
                                         args![
                                             get_text_of_node(left),
                                             token_to_string(operator),
-                                            num_value.remainder(ts_jsnum::Number::new(32.0))
+                                            num_value.remainder(crate::jsnum::Number::new(32.0))
                                         ],
                                     );
                                 }
@@ -980,7 +980,7 @@ impl Checker {
         if !is_omitted_expression(element) {
             if !is_spread_element(element) {
                 let index_type =
-                    self.get_number_literal_type(ts_jsnum::Number::new(element_index as f64));
+                    self.get_number_literal_type(crate::jsnum::Number::new(element_index as f64));
                 if self.is_array_like_type(source_type) {
                     // We create a synthetic expression so that getIndexedAccessType doesn't get confused
                     // when the element is a SyntaxKind.ElementAccessExpression.

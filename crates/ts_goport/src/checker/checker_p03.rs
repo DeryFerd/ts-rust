@@ -91,10 +91,10 @@ pub fn is_property_immediately_referenced_within_declaration(
 
 // PORT: Go `node.AsTypeParameterDeclaration().Expression`. The Go `Node.Expression()`
 // method panics on type parameters, and fields.rs skips the clashing field name, so
-// the field is read from the ts_ast data directly.
+// the field is read from the astdata data directly.
 fn type_parameter_declaration_expression(node: Node) -> Node {
     with_ast_data(node, |d| match d {
-        ts_ast::NodeData::TypeParameterDeclaration(d) => match d.expression {
+        crate::astdata::NodeData::TypeParameterDeclaration(d) => match d.expression {
             Some(id) => Node::new(node.file_index(), id),
             None => Node::NIL,
         },

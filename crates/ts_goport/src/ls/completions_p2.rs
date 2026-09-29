@@ -187,7 +187,7 @@ impl LanguageService {
                     file,
                     position,
                     compiler_options,
-                    self.program,
+                    &self.program,
                     type_checker,
                 )?;
                 if let Some(cases_item) = cases_item {

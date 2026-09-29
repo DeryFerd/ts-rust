@@ -1,7 +1,7 @@
 //! Port of typescript-go `internal/ast/utilities.go` lines 906-1805.
 
+use crate::astdata::NodeData;
 use crate::prelude::*;
-use ts_ast::NodeData;
 
 // Go: ast/utilities.go:906 SetImportsOfSourceFile
 // PORT: skipped. Go documents it as "should never be called outside the

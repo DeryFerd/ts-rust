@@ -13,7 +13,6 @@ use super::Subtests;
 use crate::support::baseline;
 use std::cell::Cell;
 use std::rc::Rc;
-use ts_ast::{NodeData, SyntaxKind};
 use ts_goport::api::encoder::{
     HEADER_OFFSET_NODES, HEADER_OFFSET_STRING_DATA, HEADER_OFFSET_STRING_OFFSETS,
     NODE_DATA_STRING_INDEX_MASK, NODE_DATA_TYPE_MASK, NODE_DATA_TYPE_STRING, NODE_OFFSET_DATA,
@@ -25,6 +24,7 @@ use ts_goport::ast::{
     NodeVisitor, NodeVisitorHooks, new_node_visitor, source_file_file_name, source_file_text,
     with_ast_data,
 };
+use ts_goport::astdata::{NodeData, SyntaxKind};
 use ts_goport::core::Node;
 use ts_goport::flags::{NodeFlags, ScriptKind};
 use ts_goport::frontend::parser::{self, SourceFileParseOptions};

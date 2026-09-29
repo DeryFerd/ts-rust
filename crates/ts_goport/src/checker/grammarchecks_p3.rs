@@ -385,8 +385,8 @@ impl Checker {
         // 1) when `node` represents an integer <= 2 ** 53 - 1, `node.text` is its exact string representation and thus `value` precisely represents the integer.
         // 2) otherwise, although `node.text` may be imprecise string representation, its mathematical value and consequently `value` cannot be less than 2 ** 53,
         //    thus the result of the predicate won't be affected.
-        let value = ts_jsnum::from_string(&node.text());
-        if value <= ts_jsnum::MAX_SAFE_INTEGER {
+        let value = crate::jsnum::from_string(&node.text());
+        if value <= crate::jsnum::MAX_SAFE_INTEGER {
             return;
         }
 
@@ -483,7 +483,7 @@ impl Checker {
         let node_list = named_bindings.element_list();
         for specifier in node_list.nodes().iter() {
             let specifier_is_type_only: bool;
-            let message: &'static ts_diagnostics::Message;
+            let message: &'static crate::diagnostics::Message;
             if specifier.kind() == SyntaxKind::ImportSpecifier {
                 specifier_is_type_only = specifier.is_type_only();
                 message = diag::The_type_modifier_cannot_be_used_on_a_named_import_when_import_type_is_used_on_its_import_statement;

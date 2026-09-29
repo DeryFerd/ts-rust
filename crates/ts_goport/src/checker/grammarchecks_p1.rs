@@ -1,7 +1,7 @@
 //! Go `checker/grammarchecks.go` lines 1-951.
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 impl Checker {
     // Go: checker/grammarchecks.go:18 grammarErrorOnFirstToken
@@ -125,7 +125,7 @@ impl Checker {
                     let e = &pending[i];
                     start == e.pos() && length == e.len()
                 });
-                if message.category() == ts_diagnostics::Category::Message
+                if message.category() == crate::diagnostics::Category::Message
                     && last_error.is_some()
                     && matches_last
                 {

@@ -122,7 +122,7 @@ impl FlowNodeId {
 /// Go `*ast.Node` (and every alias: `*ast.Expression`, `*ast.TypeNode`,
 /// `*ast.SourceFile`, ...). High 32 bits: file id in the file registry
 /// (`ast/store.rs`). For a ported-parser file this is also its store id.
-/// Low 32 bits: `ts_ast::NodeId::index() + 1`. Zero is nil.
+/// Low 32 bits: `crate::astdata::NodeId::index() + 1`. Zero is nil.
 /// Node methods (kind, parent, fields, binder data) live in `crate::ast`.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Debug)]
 pub struct Node(pub u64);
@@ -147,7 +147,7 @@ impl Node {
 
     #[inline]
     #[must_use]
-    pub fn new(file: usize, node: ts_ast::NodeId) -> Self {
+    pub fn new(file: usize, node: crate::astdata::NodeId) -> Self {
         // After freeze, a store file resolves every child id with no store
         // borrow: an alias-free store gives the slot 0 value for id 0 and
         // the raw handle `(file << 32) | (id + 1)` for any other id, with no
@@ -160,7 +160,7 @@ impl Node {
     }
 
     #[inline(never)]
-    fn new_slow(file: usize, node: ts_ast::NodeId) -> Self {
+    fn new_slow(file: usize, node: crate::astdata::NodeId) -> Self {
         // Child ids inside factory-made nodes live in the synthetic id space.
         if file == crate::ast::SYNTHETIC_NODE_FILE {
             return crate::ast::resolve_synthetic_id(node);
@@ -179,8 +179,8 @@ impl Node {
     }
 
     #[must_use]
-    pub fn node_id(self) -> ts_ast::NodeId {
-        ts_ast::NodeId::new(((self.0 & 0xffff_ffff) - 1) as u32)
+    pub fn node_id(self) -> crate::astdata::NodeId {
+        crate::astdata::NodeId::new(((self.0 & 0xffff_ffff) - 1) as u32)
     }
 }
 
@@ -2503,8 +2503,8 @@ pub struct Diagnostic {
     pub pos: i32,
     pub end: i32,
     pub code: i32,
-    pub category: ts_diagnostics::Category,
-    pub message: &'static ts_diagnostics::Message,
+    pub category: crate::diagnostics::Category,
+    pub message: &'static crate::diagnostics::Message,
     pub message_args: Vec<String>,
     pub message_chain: Vec<Diagnostic>,
     pub related_information: Vec<Diagnostic>,
@@ -2857,107 +2857,8 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
     }
 }
 
-/// Unported hits of every thread, by Go name.
-static UNPORTED_NAMES: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-/// Records one hit of unported Go code. The runner reports every name.
-/// A run with any hit is not a match.
-pub fn record_unported(go_name: &'static str) {
-    let mut names = UNPORTED_NAMES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *names.entry(go_name).or_default() += 1;
-}
-
-/// All unported names hit so far on any thread, with hit counts.
-#[must_use]
-pub fn unported_report() -> Vec<(&'static str, u64)> {
-    let names = UNPORTED_NAMES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    names.iter().map(|(k, v)| (*k, *v)).collect()
-}
-
-/// Puts back the unported hits that `unported_report` returned. Work that
-/// is thrown away and redone uses it, so the hits are not counted twice.
-pub fn restore_unported(report: &[(&'static str, u64)]) {
-    let mut names = UNPORTED_NAMES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *names = report.iter().copied().collect();
-}
-
-/// Marks unported Go code. It records the hit, then panics so the gap is
-/// loud. Use only where a port is missing, never as a fallback.
-#[macro_export]
-macro_rules! unported {
-    ($go_name:expr) => {{
-        $crate::core::record_unported($go_name);
-        panic!("unported Go code: {}", $go_name)
-    }};
-}
-
-/// The panic payload of `go_panic`.
-pub struct GoPanic {
-    /// The Go panic value as the Go runtime prints it (port form).
-    pub message: String,
-    /// The port site, for the stderr report.
-    pub location: &'static std::panic::Location<'static>,
-}
-
-/// Go `panic(message)` at a site where the pinned Go panics on the same
-/// input. It is not a port gap, so the run ends as the Go runtime ends it:
-/// guards that keep a run going after a port gap pass it on
-/// (`resume_go_panic`), and the bins write the output so far, print it with
-/// `print_go_panic` and exit `EXIT_GO_PANIC`. Other panics stay port gaps
-/// (`execute::tsc::EXIT_UNPORTED`).
-#[track_caller]
-pub fn go_panic(message: String) -> ! {
-    std::panic::panic_any(GoPanic {
-        message,
-        location: std::panic::Location::caller(),
-    })
-}
-
-/// `go_panic` with the Go runtime text for a nil pointer dereference, at a
-/// site where the pinned Go dereferences nil on the same input. It is cold
-/// and out of line, so the nil check at a hot site is one compare.
-#[cold]
-#[inline(never)]
-#[track_caller]
-pub fn go_nil_dereference() -> ! {
-    go_panic("runtime error: invalid memory address or nil pointer dereference".to_string())
-}
-
-/// The Go runtime exit code after a panic that nothing recovers.
-pub const EXIT_GO_PANIC: i32 = 2;
-
-/// Continues a caught `go_panic`. Returns any other payload.
-pub fn resume_go_panic(payload: Box<dyn std::any::Any + Send>) -> Box<dyn std::any::Any + Send> {
-    if payload.is::<GoPanic>() {
-        std::panic::resume_unwind(payload);
-    }
-    payload
-}
-
-/// Prints a caught `go_panic` to stderr and returns true. The first line is
-/// the Go runtime one (`panic: <message>`). The port site takes the place of
-/// the goroutine trace. False for any other payload.
-pub fn print_go_panic(payload: &(dyn std::any::Any + Send)) -> bool {
-    let Some(panic) = payload.downcast_ref::<GoPanic>() else {
-        return false;
-    };
-    let text = format!(
-        "panic: {}\n\n\t{}:{}\n",
-        panic.message,
-        panic.location.file(),
-        panic.location.line()
-    );
-    use std::io::Write;
-    let _ = std::io::stderr().write_all(&crate::scanner_util::go_string_bytes(&text));
-    true
-}
+// Go panics and unported hits: `gopanic.rs` in goport_util.
+pub use goport_util::core::*;
 
 /// One version of a loaded source file: one per file id. The file registry
 /// (`ast/store.rs`) owns it from `publish_file_stores` on; read it with
@@ -2965,11 +2866,7 @@ pub fn print_go_panic(payload: &(dyn std::any::Any + Send)) -> bool {
 /// this value. Parser data is ready when the file is published. The binder
 /// fills the `OnceLock` fields once per file version.
 pub struct GoFile {
-    /// The ts_compiler source file (arena, text, file name). None for a
-    /// file parsed by the Go frontend (`GOPORT_FRONTEND=go`), whose nodes
-    /// live in a node store (`ast::store`).
-    pub source: Option<&'static ts_compiler::SourceFile>,
-    /// The `SourceFile` node.
+    /// The `SourceFile` node. Its nodes live in a node store (`ast::store`).
     pub root: Node,
     /// Go `node.Flags` from the parser for each node, indexed by
     /// `NodeId::index()`. It includes the Go parser context flags.
@@ -2990,8 +2887,6 @@ pub struct GoProgram {
     /// Unique in the process, from `next_program_id`. It keys the checker
     /// pool and the frontend of the program on the loading thread.
     pub id: u32,
-    /// The legacy graph. None on the Go frontend path.
-    pub program: Option<&'static ts_compiler::Program>,
     /// File ids in Go `Program.SourceFiles()` order.
     pub source_file_order: Vec<usize>,
     pub options: crate::options::CompilerOptions,
@@ -3000,16 +2895,6 @@ pub struct GoProgram {
     /// Program state (`program::state()`). Set once, after the files are
     /// published.
     pub(crate) state: std::sync::OnceLock<&'static crate::program::ProgramState>,
-}
-
-impl GoFile {
-    /// The legacy source file. Panics for a Go frontend file; callers check
-    /// `ast::store::has_file_store` first.
-    #[must_use]
-    pub fn legacy_source(&self) -> &'static ts_compiler::SourceFile {
-        self.source
-            .expect("legacy source read for a Go frontend file")
-    }
 }
 
 impl GoProgram {

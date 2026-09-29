@@ -1211,7 +1211,7 @@ impl Checker {
                 if result == Ternary::FALSE && report_errors {
                     // The errors reported here serve as markers that trigger error chain reduction in the (*Relater).reportError
                     // method. The markers are elided in the final diagnostic chain and never actually reported.
-                    let message: &'static ts_diagnostics::Message;
+                    let message: &'static crate::diagnostics::Message;
                     let source_is_construct =
                         self.sig(source).flags.intersects(SignatureFlags::CONSTRUCT);
                     if self.sig(source).parameters.is_empty()
@@ -1478,7 +1478,7 @@ impl Checker {
                     .intersects(ElementFlags::VARIABLE)
                 || index < self.target_tuple_type(rest_type).fixed_length
             {
-                let index_type = self.get_number_literal_type(ts_jsnum::Number(index as f64));
+                let index_type = self.get_number_literal_type(crate::jsnum::Number(index as f64));
                 return self.get_indexed_access_type(rest_type, index_type);
             }
         }

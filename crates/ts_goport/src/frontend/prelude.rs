@@ -2,6 +2,7 @@
 //! It adds the frontend modules to the crate prelude. Names that exist in
 //! both are picked explicitly below.
 
+pub use crate::diagnostics::Message;
 pub use crate::frontend::bundled::*;
 pub use crate::frontend::compiler::*;
 pub use crate::frontend::core_ext::*;
@@ -15,7 +16,6 @@ pub use crate::frontend::tsoptions::*;
 pub use crate::frontend::tspath::*;
 pub use crate::frontend::vfs::*;
 pub use crate::prelude::*;
-pub use ts_diagnostics::Message;
 
 // Names that exist in both the crate prelude and the frontend.
 pub use crate::frontend::outputpaths::*;

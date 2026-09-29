@@ -4,7 +4,7 @@
 //! a `Node` handle whose file index is `SYNTHETIC_NODE_FILE`. Its low 32 bits
 //! index a thread-local slot list (like `SYNTHETIC_FLOW_FILE` for flow nodes).
 //!
-//! Each node slot names a `ts_ast::Node` (kind and `NodeData`) that the
+//! Each node slot names a `crate::astdata::Node` (kind and `NodeData`) that the
 //! thread owns, so the accessors in `node.rs` and `fields.rs` that match on
 //! `NodeData` work on synthetic nodes too. Child ids inside that data are ids
 //! in the synthetic id space:
@@ -12,13 +12,13 @@
 //! - a parsed child (Go shares the pointer) uses an alias slot. `Node::new`
 //!   resolves an alias slot to the parsed node, so identity is kept:
 //!   `synthetic.name() == parsed_name` is true, like Go pointer equality;
-//! - Go `nil` in a field that ts_ast stores as a required `NodeId` uses slot 0,
+//! - Go `nil` in a field that astdata stores as a required `NodeId` uses slot 0,
 //!   which resolves to `Node::NIL`.
 //!
 //! Go mutates factory nodes after creation (`node.Parent = p`, `node.Loc = l`,
 //! `node.Flags |= f`, `node.FlowNodeData().FlowNode = f`,
 //! `node.AsX().Symbol = s`). Those fields live in the slot, not in the
-//! `ts_ast::Node`, and `node.rs` reads them through the hooks below.
+//! `crate::astdata::Node`, and `node.rs` reads them through the hooks below.
 //!
 //! Ownership: the slots, the node data, the factory lists and the node
 //! slices that reads make belong to the thread's arena. Nothing hands out a
@@ -58,14 +58,14 @@
 //! (`ast/store.rs`). Go code that writes a field of a parsed node needs its
 //! own port decision.
 
+use crate::astdata::NodeData;
 use crate::prelude::*;
 use std::cell::{Cell, OnceCell};
-use ts_ast::NodeData;
 
 /// File index of synthetic nodes. `SYNTHETIC_FLOW_FILE` is `0xffff_ffff`.
 pub const SYNTHETIC_NODE_FILE: usize = 0xffff_fffe;
 
-/// Slot 0: Go `nil` stored in a ts_ast field that has no `Option`.
+/// Slot 0: Go `nil` stored in a astdata field that has no `Option`.
 const NIL_SLOT: u32 = 0;
 
 /// One synthetic slot.
@@ -82,7 +82,7 @@ enum Slot {
 /// The mutable Go `NodeBase` fields of a factory node.
 #[derive(Clone)]
 struct SyntheticNode {
-    /// The ts_ast node (kind and data): an entry of `SyntheticArena::datas`.
+    /// The astdata node (kind and data): an entry of `SyntheticArena::datas`.
     /// A Go write to a data field or to the kind adds a new entry and moves
     /// the node to it, so a list handle taken before the write still reads
     /// the old list, like a Go `*NodeList` pointer.
@@ -104,7 +104,7 @@ struct SyntheticNode {
 /// `EndOfFileToken`, which are in the node data) of a SourceFile that the
 /// factory made: `NewSourceFile` sets the first group, `copyFrom` and later
 /// Go writes (`result.AsSourceFile().IsDeclarationFile = true`) set the rest.
-// PORT: a parsed SourceFile keeps these fields in `SourceFileInfo`. ts_ast
+// PORT: a parsed SourceFile keeps these fields in `SourceFileInfo`. astdata
 // node data cannot hold them, so a factory SourceFile keeps them in its slot.
 // Go `parseOptions` is kept as its file name and path; the external module
 // indicator options are only read by the parser. `ContainsNonASCII` and
@@ -139,8 +139,8 @@ pub struct SyntheticSourceFileData {
 /// (`copy_synthetic_list`).
 #[derive(Clone)]
 enum OwnList {
-    Nodes(ts_ast::NodeList),
-    Modifiers(ts_ast::ModifierList),
+    Nodes(crate::astdata::NodeList),
+    Modifiers(crate::astdata::ModifierList),
 }
 
 impl OwnList {
@@ -164,13 +164,13 @@ const SLOT_CHUNK: usize = CHUNK_BYTES / size_of::<Slot>();
 const _: () = assert!(SLOT_CHUNK >= 128);
 
 /// Cells per chunk of `SyntheticArena::datas`. The `Rc` header is 16 bytes.
-const DATA_CHUNK: usize = (CHUNK_BYTES - 16) / size_of::<OnceCell<ts_ast::Node>>();
+const DATA_CHUNK: usize = (CHUNK_BYTES - 16) / size_of::<OnceCell<crate::astdata::Node>>();
 
 /// Lists per chunk of `SyntheticArena::lists`.
 const LIST_CHUNK: usize = CHUNK_BYTES / size_of::<OwnList>();
 
 /// A chunk of `SyntheticArena::datas`: cells that fill in order.
-type DataChunk = Rc<[OnceCell<ts_ast::Node>]>;
+type DataChunk = Rc<[OnceCell<crate::astdata::Node>]>;
 
 /// The panic of a read of an entry whose owner was freed.
 const FREED: &str = "synthetic node of a released program version is read";
@@ -206,7 +206,7 @@ struct SyntheticArena {
     slot_owner: Vec<OwnerKey>,
     /// Alias slot of each parsed node, so one parsed node gets one slot.
     aliases: FxHashMap<Node, u32>,
-    /// The ts_ast nodes of the node slots (see `SyntheticNode::data`), in
+    /// The astdata nodes of the node slots (see `SyntheticNode::data`), in
     /// chunks of `DATA_CHUNK`. A read holds the chunk of its node (an `Rc`),
     /// so it can hold the node while the arena is not borrowed, even when
     /// the owner of the chunk is freed meanwhile. A new node fills the next
@@ -333,10 +333,10 @@ impl SyntheticArena {
         index as u32
     }
 
-    /// The ts_ast node of data entry `index`. Panics when its owner was
+    /// The astdata node of data entry `index`. Panics when its owner was
     /// freed.
     #[inline]
-    fn data(&self, index: u32) -> &ts_ast::Node {
+    fn data(&self, index: u32) -> &crate::astdata::Node {
         let i = index as usize;
         self.datas[i / DATA_CHUNK].as_ref().expect(FREED)[i % DATA_CHUNK]
             .get()
@@ -344,7 +344,7 @@ impl SyntheticArena {
     }
 
     /// Adds a data entry of `owner` and returns its index.
-    fn push_data(&mut self, owner: OwnerKey, node: ts_ast::Node) -> u32 {
+    fn push_data(&mut self, owner: OwnerKey, node: crate::astdata::Node) -> u32 {
         let chunks = self.chunks(owner);
         let fill = chunks.data_fill;
         let open = chunks
@@ -546,7 +546,7 @@ pub struct SyntheticSeed {
     slots: Vec<Option<Vec<Slot>>>,
     aliases: FxHashMap<Node, u32>,
     /// The filled cells of each chunk of `SyntheticArena::datas`.
-    datas: Vec<Option<Vec<ts_ast::Node>>>,
+    datas: Vec<Option<Vec<crate::astdata::Node>>>,
     lists: Vec<Option<Vec<OwnList>>>,
     slices: Vec<Box<[Node]>>,
     slots_made: usize,
@@ -663,7 +663,7 @@ pub fn is_synthetic_node(n: Node) -> bool {
 /// Hook for `Node::new(SYNTHETIC_NODE_FILE, id)`: the Go node that a child id
 /// inside synthetic `NodeData` stands for.
 #[must_use]
-pub fn resolve_synthetic_id(id: ts_ast::NodeId) -> Node {
+pub fn resolve_synthetic_id(id: crate::astdata::NodeId) -> Node {
     ARENA.with(|a| a.borrow().resolve(id.index()))
 }
 
@@ -689,7 +689,7 @@ fn with_node_mut<R>(n: Node, f: impl FnOnce(&mut SyntheticNode) -> R) -> R {
 // Node data reads
 // ──────────────────────────────────────────────────────────────────────
 
-/// The ts_ast node of a synthetic node, held apart from the arena by its
+/// The astdata node of a synthetic node, held apart from the arena by its
 /// chunk (see `SyntheticArena::datas`).
 struct HeldNode {
     chunk: DataChunk,
@@ -697,17 +697,17 @@ struct HeldNode {
 }
 
 impl std::ops::Deref for HeldNode {
-    type Target = ts_ast::Node;
+    type Target = crate::astdata::Node;
 
     #[inline]
-    fn deref(&self) -> &ts_ast::Node {
+    fn deref(&self) -> &crate::astdata::Node {
         self.chunk[self.cell]
             .get()
             .expect("synthetic node data entry is not filled")
     }
 }
 
-/// The ts_ast node (kind and data) of synthetic node `n`, held apart from
+/// The astdata node (kind and data) of synthetic node `n`, held apart from
 /// the arena, so the reader can make and change synthetic nodes.
 #[cold]
 #[inline(never)]
@@ -722,16 +722,16 @@ fn synthetic_ast_node(n: Node) -> HeldNode {
     })
 }
 
-/// The ts_ast node of a parsed node (store or legacy), or `None` for a
-/// synthetic node. Go dereferences the pointer, so nil panics.
+/// The astdata node of a parsed (store) node, or `None` for a synthetic
+/// node. Go dereferences the pointer, so nil panics.
 // In a one-program process almost every read after the publish is a tier 0
 // store node, so only that path is inlined into callers. The synthetic file
 // index is never a store id, so checking the store tables first gives the
 // same result as the order that `static_ast_node_slow` keeps (synthetic,
-// store, legacy).
+// store).
 #[inline]
 #[must_use]
-pub fn static_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
+pub fn static_ast_node(n: Node) -> Option<&'static crate::astdata::Node> {
     assert!(n.is_some(), "nil node dereference");
     match frozen_store_ast_node(n) {
         Some(node) => Some(node),
@@ -740,28 +740,21 @@ pub fn static_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
 }
 
 /// `static_ast_node` for a node that is not a published store node: a
-/// synthetic node (`None`), an unpublished (built or detached) store node or
-/// a legacy node.
+/// synthetic node (`None`) or an unpublished (built or detached) store node.
+/// Panics for any other node.
 #[cold]
 #[inline(never)]
-fn static_ast_node_slow(n: Node) -> Option<&'static ts_ast::Node> {
+fn static_ast_node_slow(n: Node) -> Option<&'static crate::astdata::Node> {
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return None;
     }
-    if let Some(node) = try_store_ast_node(n) {
-        return Some(node);
+    match try_store_ast_node(n) {
+        Some(node) => Some(node),
+        None => panic!("node {n:?} is not synthetic and has no store"),
     }
-    Some(
-        crate::ast::go_file(n.file_index())
-            .legacy_source()
-            .parse
-            .arena
-            .get(n.node_id())
-            .expect("node is not in its file arena"),
-    )
 }
 
-/// The ts_ast data of parsed node `n`, for code that reads parsed nodes
+/// The astdata data of parsed node `n`, for code that reads parsed nodes
 /// only: the binder, which loads the data of a node once and passes it to
 /// the `_in` field reads (`data_accessor!`). Panics on a synthetic node.
 #[inline]
@@ -773,13 +766,13 @@ pub fn parsed_node_data(n: Node) -> &'static NodeData {
     }
 }
 
-/// Calls `f` with the ts_ast node (kind and data) of any node, parsed or
+/// Calls `f` with the astdata node (kind and data) of any node, parsed or
 /// synthetic. Go dereferences the pointer, so nil panics. `f` cannot keep a
 /// reference into the node. For a synthetic node the arena is not borrowed
 /// while `f` runs, so `f` can make and change synthetic nodes. Hot node
 /// reads use the `with_data!` macro instead.
 #[inline]
-pub fn with_ast_node<R>(n: Node, f: impl FnOnce(&ts_ast::Node) -> R) -> R {
+pub fn with_ast_node<R>(n: Node, f: impl FnOnce(&crate::astdata::Node) -> R) -> R {
     // One call of `f`, so a small `f` is inlined (see `with_data!`).
     let synthetic;
     let node = match static_ast_node(n) {
@@ -792,7 +785,7 @@ pub fn with_ast_node<R>(n: Node, f: impl FnOnce(&ts_ast::Node) -> R) -> R {
     f(node)
 }
 
-/// Calls `f` with the ts_ast data of any node, parsed or synthetic.
+/// Calls `f` with the astdata data of any node, parsed or synthetic.
 #[inline]
 pub fn with_ast_data<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
     with_ast_node(n, |node| f(&node.data))
@@ -801,11 +794,11 @@ pub fn with_ast_data<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
 /// `with_ast_node` for a synthetic node, out of line.
 #[cold]
 #[inline(never)]
-pub fn with_synthetic_ast_node<R>(n: Node, f: impl FnOnce(&ts_ast::Node) -> R) -> R {
+pub fn with_synthetic_ast_node<R>(n: Node, f: impl FnOnce(&crate::astdata::Node) -> R) -> R {
     f(&synthetic_ast_node(n))
 }
 
-/// `$body` with `$d` bound to the ts_ast data (`&NodeData`) of node `$n`,
+/// `$body` with `$d` bound to the astdata data (`&NodeData`) of node `$n`,
 /// parsed or synthetic, like `with_ast_data`. Go dereferences the pointer, so
 /// nil panics. `$body` cannot keep a reference into the data, and it cannot
 /// `return` from the caller.
@@ -821,11 +814,11 @@ macro_rules! with_data {
         let n__: $crate::core::Node = $n;
         match $crate::ast::synthetic::static_ast_node(n__) {
             Some(node__) => {
-                let $d: &ts_ast::NodeData = &node__.data;
+                let $d: &crate::astdata::NodeData = &node__.data;
                 $body
             }
             None => $crate::ast::synthetic::with_synthetic_ast_node(n__, |node__| {
-                let $d: &ts_ast::NodeData = &node__.data;
+                let $d: &crate::astdata::NodeData = &node__.data;
                 $body
             }),
         }
@@ -842,7 +835,7 @@ macro_rules! list_of {
         let n__: $crate::core::Node = $n;
         match $crate::ast::synthetic::static_ast_node(n__) {
             Some(node__) => {
-                let $d: &'static ts_ast::NodeData = &node__.data;
+                let $d: &'static crate::astdata::NodeData = &node__.data;
                 let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
                 found.map(|l| {
                     $crate::ast::NodeList::from_ts(
@@ -863,7 +856,7 @@ macro_rules! modifiers_of {
         let n__: $crate::core::Node = $n;
         match $crate::ast::synthetic::static_ast_node(n__) {
             Some(node__) => {
-                let $d: &'static ts_ast::NodeData = &node__.data;
+                let $d: &'static crate::astdata::NodeData = &node__.data;
                 let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
                 found.map(|m| {
                     $crate::ast::ModifierList::from_ts(
@@ -881,14 +874,14 @@ pub(crate) use modifiers_of;
 /// A list or modifier list read from node data.
 #[derive(Clone, Copy)]
 pub enum AnyList<'a> {
-    Nodes(&'a ts_ast::NodeList),
-    Modifiers(&'a ts_ast::ModifierList),
+    Nodes(&'a crate::astdata::NodeList),
+    Modifiers(&'a crate::astdata::ModifierList),
 }
 
 impl<'a> AnyList<'a> {
     /// The node list (for a modifier list, its `NodeList`).
     #[must_use]
-    pub fn nodes(self) -> &'a ts_ast::NodeList {
+    pub fn nodes(self) -> &'a crate::astdata::NodeList {
         match self {
             Self::Nodes(l) => l,
             Self::Modifiers(m) => &m.list,
@@ -897,7 +890,7 @@ impl<'a> AnyList<'a> {
 
     /// The modifier list. Panics on a node list.
     #[must_use]
-    pub fn modifiers(self) -> &'a ts_ast::ModifierList {
+    pub fn modifiers(self) -> &'a crate::astdata::ModifierList {
         match self {
             Self::Modifiers(m) => m,
             Self::Nodes(_) => panic!("a NodeList is not a ModifierList"),
@@ -1095,17 +1088,17 @@ pub fn new_synthetic_slice(nodes: Vec<Node>) -> SyntheticList {
 /// a read has in place (the `Node::for_each_child_and_lists` hook). The
 /// thread's arena owns the copy.
 #[must_use]
-pub fn copy_synthetic_list(list: &ts_ast::NodeList) -> NodeList {
+pub fn copy_synthetic_list(list: &crate::astdata::NodeList) -> NodeList {
     NodeList::synthetic(push_own_list(OwnList::Nodes(list.clone())))
 }
 
 /// Parser `createMissingList` for synthetic `list` (see
 /// `NodeList::with_missing_marker`): a new empty factory list at the `Loc`
-/// of `list`, with the ts_ast `has_trailing_comma` bit set.
+/// of `list`, with the astdata `has_trailing_comma` bit set.
 #[must_use]
 pub fn synthetic_missing_list(list: SyntheticList) -> SyntheticList {
     let range = with_synthetic_list(list, |l| l.nodes().range);
-    push_own_list(OwnList::Nodes(ts_ast::NodeList {
+    push_own_list(OwnList::Nodes(crate::astdata::NodeList {
         range,
         nodes: Vec::new(),
         has_trailing_comma: true,
@@ -1151,11 +1144,14 @@ pub fn set_node_flags(n: Node, flags: NodeFlags) {
     with_node_mut(n, |s| s.flags = flags);
 }
 
-/// Gives synthetic node `n` a new ts_ast node that `f` makes from the
+/// Gives synthetic node `n` a new astdata node that `f` makes from the
 /// current one. The old one stays in the arena for the list handles taken
 /// before (see `SyntheticNode::data`). The new one belongs to the owner of
 /// `n`. `f` must not make or change synthetic nodes.
-fn replace_synthetic_ast_node(n: Node, f: impl FnOnce(&ts_ast::Node) -> ts_ast::Node) {
+fn replace_synthetic_ast_node(
+    n: Node,
+    f: impl FnOnce(&crate::astdata::Node) -> crate::astdata::Node,
+) {
     assert!(
         is_synthetic_node(n),
         "cannot mutate a parsed node (kind {:?})",
@@ -1177,7 +1173,7 @@ fn replace_synthetic_ast_node(n: Node, f: impl FnOnce(&ts_ast::Node) -> ts_ast::
 /// A Go write to a data field of a node (`node.AsX().Field = v`): `data` is
 /// the node's data with that field changed. Works on factory nodes and on
 /// nodes of a ported-parser file that is not finished.
-// PORT: ts_ast data is shared, so the node gets a new ts_ast node with the
+// PORT: astdata data is shared, so the node gets a new astdata node with the
 // same kind. Writes are rare.
 pub fn replace_node_data(n: Node, data: NodeData) {
     if is_store_node(n) {
@@ -1196,7 +1192,7 @@ pub fn replace_node_data(n: Node, data: NodeData) {
 /// Go `node.Kind = kind` on a factory node. The new kind must fit the node
 /// data (Go only does this between kinds with one data struct, such as
 /// `KindJSImportDeclaration` to `KindImportDeclaration`).
-// PORT: the kind lives in the ts_ast node, so the node gets a new ts_ast
+// PORT: the kind lives in the astdata node, so the node gets a new astdata
 // node with the same data.
 pub fn set_node_kind(n: Node, kind: SyntaxKind) {
     replace_synthetic_ast_node(n, |old| {
@@ -1210,12 +1206,12 @@ pub fn set_node_kind(n: Node, kind: SyntaxKind) {
     });
 }
 
-/// A ts_ast node for synthetic data. Only kind and data are read; the
+/// A astdata node for synthetic data. Only kind and data are read; the
 /// header lives in the slot.
-fn new_ts_node(kind: SyntaxKind, data: NodeData) -> ts_ast::Node {
-    ts_ast::Node {
+fn new_ts_node(kind: SyntaxKind, data: NodeData) -> crate::astdata::Node {
+    crate::astdata::Node {
         kind,
-        flags: ts_ast::NodeFlags(0),
+        flags: crate::astdata::NodeFlags(0),
         range: undefined_ts_range(),
         parent: None,
         data,
@@ -1444,27 +1440,27 @@ pub fn source_file_copy_from(node: Node, other: Node) {
 /// Nil maps to the nil slot. A parsed node gets (or reuses) an alias slot,
 /// which belongs to the thread.
 #[must_use]
-pub fn synthetic_child_id(n: Node) -> ts_ast::NodeId {
+pub fn synthetic_child_id(n: Node) -> crate::astdata::NodeId {
     if n.is_nil() {
-        return ts_ast::NodeId::new(NIL_SLOT);
+        return crate::astdata::NodeId::new(NIL_SLOT);
     }
     if n.file_index() == SYNTHETIC_NODE_FILE {
-        return ts_ast::NodeId::new(slot_index(n) as u32);
+        return crate::astdata::NodeId::new(slot_index(n) as u32);
     }
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
         if let Some(&index) = a.aliases.get(&n) {
-            return ts_ast::NodeId::new(index);
+            return crate::astdata::NodeId::new(index);
         }
         let index = a.push_slot(OwnerKey::Base, Slot::Alias(n));
         a.aliases.insert(n, index);
-        ts_ast::NodeId::new(index)
+        crate::astdata::NodeId::new(index)
     })
 }
 
-/// Like `synthetic_child_id`, for ts_ast fields that are `Option<NodeId>`.
+/// Like `synthetic_child_id`, for astdata fields that are `Option<NodeId>`.
 #[must_use]
-pub fn synthetic_opt_child_id(n: Node) -> Option<ts_ast::NodeId> {
+pub fn synthetic_opt_child_id(n: Node) -> Option<crate::astdata::NodeId> {
     if n.is_nil() {
         None
     } else {
@@ -1472,23 +1468,23 @@ pub fn synthetic_opt_child_id(n: Node) -> Option<ts_ast::NodeId> {
     }
 }
 
-/// Go `core.UndefinedTextRange()` in ts_ast form. `TextPos` is `u32`; the
+/// Go `core.UndefinedTextRange()` in astdata form. `TextPos` is `u32`; the
 /// `as i32` in `node.rs` `text_range_of` turns `u32::MAX` back into `-1`.
-fn undefined_ts_range() -> ts_core::TextRange {
+fn undefined_ts_range() -> crate::astdata::text::TextRange {
     ts_range(TextRange::undefined())
 }
 
-/// A Go `core.TextRange` in ts_ast form (`-1` is stored as `u32::MAX`).
-fn ts_range(loc: TextRange) -> ts_core::TextRange {
-    ts_core::TextRange {
-        start: ts_core::TextPos::new(loc.pos() as u32),
-        end: ts_core::TextPos::new(loc.end() as u32),
+/// A Go `core.TextRange` in astdata form (`-1` is stored as `u32::MAX`).
+fn ts_range(loc: TextRange) -> crate::astdata::text::TextRange {
+    crate::astdata::text::TextRange {
+        start: crate::astdata::text::TextPos::new(loc.pos() as u32),
+        end: crate::astdata::text::TextPos::new(loc.end() as u32),
     }
 }
 
-/// The ts_ast list for a synthetic node's list field.
-fn ts_list(nodes: &[Node], loc: TextRange, has_trailing_comma: bool) -> ts_ast::NodeList {
-    ts_ast::NodeList {
+/// The astdata list for a synthetic node's list field.
+fn ts_list(nodes: &[Node], loc: TextRange, has_trailing_comma: bool) -> crate::astdata::NodeList {
+    crate::astdata::NodeList {
         range: ts_range(loc),
         nodes: nodes.iter().map(|&n| synthetic_child_id(n)).collect(),
         has_trailing_comma,
@@ -1508,9 +1504,9 @@ pub fn new_synthetic_node_list(nodes: &[Node], loc: TextRange) -> NodeList {
 /// node.rs recomputes `ModifiersToFlags(nodes)`, as the Go factory does.
 #[must_use]
 pub fn new_synthetic_modifier_list(nodes: &[Node], loc: TextRange) -> ModifierList {
-    let list = ts_ast::ModifierList {
+    let list = crate::astdata::ModifierList {
         list: ts_list(nodes, loc, false),
-        flags: ts_ast::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
+        flags: crate::astdata::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
     };
     ModifierList::synthetic(push_own_list(OwnList::Modifiers(list)))
 }
@@ -1518,11 +1514,11 @@ pub fn new_synthetic_modifier_list(nodes: &[Node], loc: TextRange) -> ModifierLi
 /// A list value to store inside new synthetic `NodeData`. Go stores the
 /// `*NodeList` pointer; a list that already is synthetic is copied as is, and
 /// a parsed list is rebuilt over alias ids with its own `Loc`.
-// PORT: ts_ast stores lists by value, so a synthetic node that takes a
+// PORT: astdata stores lists by value, so a synthetic node that takes a
 // parsed (or another synthetic) list gets a copy. `NodeList` equality on the
 // copy is false where Go compares equal pointers.
 #[must_use]
-pub fn synthetic_list_value(list: NodeList) -> Option<ts_ast::NodeList> {
+pub fn synthetic_list_value(list: NodeList) -> Option<crate::astdata::NodeList> {
     if list.is_nil() {
         return None;
     }
@@ -1533,17 +1529,17 @@ pub fn synthetic_list_value(list: NodeList) -> Option<ts_ast::NodeList> {
     Some(ts_list(&nodes, list.loc(), list.stored_trailing_comma()))
 }
 
-/// Like `synthetic_list_value` for a list field that ts_ast requires. Go
+/// Like `synthetic_list_value` for a list field that astdata requires. Go
 /// `nil` becomes an empty list with an undefined `Loc`.
 // PORT: Go keeps `nil`; `NodeList::is_nil` on that field is false here.
 #[must_use]
-pub fn synthetic_req_list_value(list: NodeList) -> ts_ast::NodeList {
+pub fn synthetic_req_list_value(list: NodeList) -> crate::astdata::NodeList {
     synthetic_list_value(list).unwrap_or_else(|| ts_list(&[], TextRange::undefined(), false))
 }
 
 /// A modifier list value to store inside new synthetic `NodeData`.
 #[must_use]
-pub fn synthetic_modifiers_value(modifiers: ModifierList) -> Option<ts_ast::ModifierList> {
+pub fn synthetic_modifiers_value(modifiers: ModifierList) -> Option<crate::astdata::ModifierList> {
     if modifiers.is_nil() {
         return None;
     }
@@ -1551,13 +1547,13 @@ pub fn synthetic_modifiers_value(modifiers: ModifierList) -> Option<ts_ast::Modi
         return Some(with_synthetic_list(m, |m| m.modifiers().clone()));
     }
     let nodes = modifiers.nodes().to_vec();
-    Some(ts_ast::ModifierList {
+    Some(crate::astdata::ModifierList {
         list: ts_list(
             &nodes,
             modifiers.loc(),
             modifiers.node_list().stored_trailing_comma(),
         ),
-        flags: ts_ast::ModifierFlags(modifiers_to_flags(&nodes).0 as u32),
+        flags: crate::astdata::ModifierFlags(modifiers_to_flags(&nodes).0 as u32),
     })
 }
 
@@ -1653,7 +1649,6 @@ mod tests {
         std::thread::spawn(|| {
             let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
                 id: next_program_id(),
-                program: None,
                 source_file_order: Vec::new(),
                 options: CompilerOptions::default(),
                 bound_symbols: std::sync::OnceLock::new(),

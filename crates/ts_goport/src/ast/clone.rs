@@ -3,11 +3,11 @@
 //! `ast/deepclone.go`.
 //!
 //! Go dispatches `node.Clone(f)` on the node data type. Here
-//! `NodeFactory::clone_node` matches on the ts_ast `NodeData` variant, which
+//! `NodeFactory::clone_node` matches on the astdata `NodeData` variant, which
 //! has one variant per Go data type.
 
+use crate::astdata::NodeData as D;
 use crate::prelude::*;
-use ts_ast::NodeData as D;
 
 // Go: ast/ast.go:112 cloneNode
 // PORT: Go name `cloneNode` is `clone_node_from`, because

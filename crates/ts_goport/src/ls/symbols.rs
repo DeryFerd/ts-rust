@@ -797,12 +797,12 @@ pub struct DeclarationInfo {
 }
 
 // Go: ls/symbols.go:522 ProvideWorkspaceSymbols
-// PORT: Go `[]*compiler.Program` is `&[&'static compiler::NewProgram]`, Go
+// PORT: Go `[]*compiler.Program` is `&[Rc<compiler::NewProgram>]`, Go
 // `*lsconv.Converters` is `&lsconv::Converters`, and the preferences are
 // passed by reference.
 pub fn provide_workspace_symbols(
     ctx: &Context,
-    programs: &[&'static compiler::NewProgram],
+    programs: &[Rc<compiler::NewProgram>],
     converters: &lsconv::Converters,
     preferences: &lsutil::UserPreferences,
     query: &str,
@@ -813,7 +813,7 @@ pub fn provide_workspace_symbols(
     // order. The infos are sorted below, so only ties can differ from Go.
     // The value is the Go `*ast.SourceFile`, the root node of the parsed file.
     let mut source_files: IndexMap<tspath::Path, Node> = IndexMap::default();
-    for &program in programs {
+    for program in programs {
         for source_file in program.source_files() {
             if (program.has_ts_file() || !source_file.is_declaration_file)
                 && !should_exclude_file(source_file, program, exclude_library_symbols)
@@ -883,7 +883,7 @@ pub fn provide_workspace_symbols(
 // parsed file, so this does too.
 pub fn should_exclude_file(
     file: &ParsedSourceFile,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     exclude_library_symbols: bool,
 ) -> bool {
     exclude_library_symbols

@@ -1,6 +1,6 @@
 //! Port of Go `ls/callhierarchy.go`.
 //!
-//! PORT: Go `*compiler.Program` is `&'static compiler::NewProgram`. Go
+//! PORT: Go `*compiler.Program` is `&compiler::NewProgram`. Go
 //! `program.GetTypeChecker(ctx)` and `GetTypeCheckerForFile(ctx, file)` lease
 //! a checker through `ls_program`; the `Release` guard stays alive to the end
 //! of the Go function, as Go's `defer done()`.
@@ -170,7 +170,7 @@ pub fn get_symbol_of_call_hierarchy_declaration(c: &mut Checker, node: Node) -> 
 // Gets the text and range for the name of a call hierarchy declaration.
 // PORT: Go named results `(text string, pos int, end int)` are a tuple.
 pub fn get_call_hierarchy_item_name(
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     node: Node,
 ) -> (String, i32, i32) {
     if is_source_file(node) {
@@ -252,7 +252,7 @@ pub fn get_call_hierarchy_item_name(
 
 // Go: ls/callhierarchy.go:219 getTextOfCallHierarchyName
 pub fn get_text_of_call_hierarchy_name(
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     source_node: Node,
     name: Node,
     print_node: Node,
@@ -302,7 +302,7 @@ pub fn get_text_of_call_hierarchy_name(
 
 // Go: ls/callhierarchy.go:248 getCallHierarchyItemContainerName
 pub fn get_call_hierarchy_item_container_name(
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     node: Node,
 ) -> String {
     if is_assigned_expression(node) {
@@ -512,7 +512,7 @@ pub fn find_implementation_or_all_initial_declarations(
 // Resolves the call hierarchy declaration for a node.
 // PORT: Go returns `any`; a nil result is `None`.
 pub fn resolve_call_hierarchy_declaration(
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     location: Node,
 ) -> Option<CallHierarchyDeclarationOrDeclarations> {
     // A call hierarchy item must refer to either a SourceFile, Module Declaration, Class Static Block, or something intrinsically callable that has a name:
@@ -620,7 +620,7 @@ impl LanguageService {
     // Creates a `CallHierarchyItem` for a call hierarchy declaration.
     pub fn create_call_hierarchy_item(
         &self,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         node: Node,
     ) -> lsproto::CallHierarchyItem {
         let source_file = get_source_file_of_node(node);
@@ -720,7 +720,7 @@ impl LanguageService {
     // Go: ls/callhierarchy.go:565 convertCallSiteGroupToIncomingCall
     pub fn convert_call_site_group_to_incoming_call(
         &self,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         entries: &[CallSite],
     ) -> lsproto::CallHierarchyIncomingCall {
         let mut from_ranges: Vec<lsproto::Range> = Vec::with_capacity(entries.len());
@@ -793,7 +793,7 @@ impl LanguageService {
     pub fn get_incoming_calls(
         &self,
         ctx: &Context,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         declaration: Node,
         orchestrator: Option<&dyn CrossProjectOrchestrator>,
     ) -> Result<lsproto::CallHierarchyIncomingCallsResponse, GoError> {
@@ -900,12 +900,12 @@ impl LanguageService {
 }
 
 // Go: ls/callhierarchy.go:691 callSiteCollector
-pub struct CallSiteCollector {
-    pub program: &'static compiler::NewProgram,
+pub struct CallSiteCollector<'a> {
+    pub program: &'a compiler::NewProgram,
     pub call_sites: Vec<CallSite>,
 }
 
-impl CallSiteCollector {
+impl CallSiteCollector<'_> {
     // Go: ls/callhierarchy.go:696 recordCallSite
     pub fn record_call_site(&mut self, node: Node) {
         let mut target = Node::NIL;
@@ -1083,7 +1083,7 @@ impl CallSiteCollector {
 // `RefCell` borrow held across that call would be a second borrow, so this
 // takes the leased `Rc` and borrows it only for `findImplementation`.
 pub fn collect_call_sites(
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     c: &Rc<RefCell<Checker>>,
     node: Node,
 ) -> Vec<CallSite> {
@@ -1179,7 +1179,7 @@ impl LanguageService {
     // Go: ls/callhierarchy.go:922 convertCallSiteGroupToOutgoingCall
     pub fn convert_call_site_group_to_outgoing_call(
         &self,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         entries: &[CallSite],
     ) -> lsproto::CallHierarchyOutgoingCall {
         let mut from_ranges: Vec<lsproto::Range> = Vec::with_capacity(entries.len());
@@ -1201,7 +1201,7 @@ impl LanguageService {
     // PORT: Go returns nil or a non-empty slice; nil is an empty `Vec`.
     pub fn get_outgoing_calls(
         &self,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         declaration: Node,
     ) -> Vec<lsproto::CallHierarchyOutgoingCall> {
         if declaration.flags().intersects(NodeFlags::AMBIENT)

@@ -13,8 +13,8 @@
 //! PORT: Go `p.nodeSliceArena` only saves allocations. Here each call uses a
 //! new `Vec`.
 
+use crate::astdata::NodeData as D;
 use crate::frontend::prelude::*;
-use ts_ast::NodeData as D;
 
 /// Go `node.AsX().Field = v`: clones the data of `n`, lets `f` change it and
 /// stores it back.
@@ -26,7 +26,7 @@ fn mutate(n: Node, f: impl FnOnce(&mut D)) {
 
 /// Runs `$body` with `$d` bound to the data of a function-like node (Go
 /// `FunctionLikeData()`). `$index_body` is for IndexSignatureDeclaration,
-/// whose `type_` field is required in ts_ast. Other kinds panic, like a Go
+/// whose `type_` field is required in astdata. Other kinds panic, like a Go
 /// nil `FunctionLikeData()` dereference.
 macro_rules! with_function_like_data {
     ($data:expr, $d:ident => $body:expr, index $i:ident => $index_body:expr) => {

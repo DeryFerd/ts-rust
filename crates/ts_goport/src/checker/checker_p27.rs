@@ -4,9 +4,9 @@
 //! object flags, and the basic type constructors (`newType` ...
 //! `newLiteralType`).
 
+use crate::jsnum::Number;
 use crate::prelude::*;
 use smallvec::SmallVec;
-use ts_jsnum::Number;
 
 impl Checker {
     // Go: checker/checker.go:24046 isVariadicTupleElement

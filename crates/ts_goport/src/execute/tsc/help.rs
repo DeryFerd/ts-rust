@@ -10,13 +10,13 @@ use crate::prelude::*;
 
 use super::compile::{System, write_str};
 use super::diagnostics::{Colors, create_colors, go_pad, go_repeat};
+use crate::diagnostics::Message;
 use crate::diagnostics_loc::message_localize;
 use crate::frontend::tsoptions::{
     CommandLineOption, CommandLineOptionKind, CompilerOptionsValue, OPTIONS_DECLARATIONS,
     OPTIONS_FOR_BUILD, OPTIONS_FOR_WATCH, ParsedCommandLine, TSC_BUILD_OPTION,
 };
 use crate::locale::Locale;
-use ts_diagnostics::Message;
 
 // Go: execute/tsc/help.go:15 PrintVersion
 pub fn print_version(sys: &dyn System, locale: &Locale) {

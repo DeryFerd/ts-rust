@@ -3,7 +3,7 @@
 use crate::prelude::*;
 use std::borrow::Cow;
 
-use ts_diagnostics::Message;
+use crate::diagnostics::Message;
 
 impl Checker {
     // Go: checker/grammarchecks.go:952 checkGrammarInterfaceDeclaration

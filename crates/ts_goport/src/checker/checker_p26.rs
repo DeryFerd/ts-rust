@@ -3,8 +3,8 @@
 //! type alias references, declared types of symbols, enum member values,
 //! and array/tuple type nodes).
 
+use crate::jsnum::Number;
 use crate::prelude::*;
-use ts_jsnum::Number;
 
 impl Checker {
     // Go: checker/checker.go:23118 getTypeArgumentsFromNode
@@ -1350,7 +1350,7 @@ impl Checker {
                         // is more predicated on the fact that the single-file resolution *didn't* resolve to a
                         // different meaning of `Infinity` or `NaN`. Transpilers handle this no problem.
                         return new_result(
-                            Some(LiteralValue::Number(ts_jsnum::from_string(expr.text()))),
+                            Some(LiteralValue::Number(crate::jsnum::from_string(expr.text()))),
                             false,
                             false,
                             false,

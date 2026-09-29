@@ -16,8 +16,8 @@
 //! names (see `PORTING.md`, Program section). `*module.ResolvedModule` is
 //! `Option<&ResolvedModule>`.
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 // PORT: Go compares `*diagnostics.Message` pointers. A nil message is `None`.
 fn message_is_p17(message: Option<&'static Message>, target: &'static Message) -> bool {
@@ -2674,8 +2674,8 @@ mod core_p17 {
 /// Private copy of Go `module.GetResolutionDiagnostic`.
 mod module_p17 {
     use super::tspath_p17::*;
+    use crate::diagnostics::Message;
     use crate::prelude::*;
-    use ts_diagnostics::Message;
 
     // Go: module/util.go:125 GetResolutionDiagnostic
     pub fn get_resolution_diagnostic(

@@ -30,7 +30,7 @@ go_flags!(PreserveOptionalFlags, i32 {
 pub struct MissingMemberFixer<'a> {
     pub change_tracker: &'a mut change::Tracker,
     pub type_checker: &'a mut Checker,
-    pub program: &'static compiler::NewProgram,
+    pub program: &'a compiler::NewProgram,
     pub preferences: lsutil::UserPreferences,
     pub import_adder: Option<&'a mut (dyn autoimport::ImportAdder + 'static)>,
     pub locale: locale::Locale,
@@ -39,7 +39,7 @@ pub struct MissingMemberFixer<'a> {
 // Go: ls/codeactions_missingmemberfixer.go:35 newMissingMemberFixer
 pub fn new_missing_member_fixer<'a>(
     change_tracker: &'a mut change::Tracker,
-    program: &'static compiler::NewProgram,
+    program: &'a compiler::NewProgram,
     type_checker: &'a mut Checker,
     preferences: lsutil::UserPreferences,
     import_adder: Option<&'a mut (dyn autoimport::ImportAdder + 'static)>,

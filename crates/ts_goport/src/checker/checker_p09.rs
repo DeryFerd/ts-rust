@@ -390,13 +390,13 @@ impl Checker {
             }
             SyntaxKind::NumericLiteral => {
                 self.check_grammar_numeric_literal(node);
-                let t = self.get_number_literal_type(ts_jsnum::from_string(node.text()));
+                let t = self.get_number_literal_type(crate::jsnum::from_string(node.text()));
                 return self.get_fresh_type_of_literal_type(t);
             }
             SyntaxKind::BigIntLiteral => {
                 self.check_grammar_big_int_literal(node);
-                let t = self.get_big_int_literal_type(ts_jsnum::PseudoBigInt::new(
-                    &ts_jsnum::parse_pseudo_big_int(node.text()),
+                let t = self.get_big_int_literal_type(crate::jsnum::PseudoBigInt::new(
+                    &crate::jsnum::parse_pseudo_big_int(node.text()),
                     false, /*negative*/
                 ));
                 return self.get_fresh_type_of_literal_type(t);

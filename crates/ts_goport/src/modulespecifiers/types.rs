@@ -5,6 +5,7 @@ use crate::prelude::*;
 use super::packagejson::InfoCacheEntry;
 use super::symlinks::KnownSymlinks;
 use super::tspath;
+use std::sync::Arc;
 
 // Go: modulespecifiers/types.go:13 SourceFileForSpecifierGeneration
 pub trait SourceFileForSpecifierGeneration {
@@ -100,7 +101,7 @@ pub trait ModuleSpecifierGenerationHost {
     fn get_project_reference_from_source(
         &self,
         path: &tspath::Path,
-    ) -> Option<&'static SourceOutputAndProjectReference>;
+    ) -> Option<Arc<SourceOutputAndProjectReference>>;
     fn get_redirect_targets(&self, path: &tspath::Path) -> Vec<String>;
     fn get_source_of_project_reference_if_output_included(&self, file: Node) -> String;
 

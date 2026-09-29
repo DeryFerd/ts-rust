@@ -518,14 +518,14 @@ pub(crate) fn new_program_version(
     host: Rc<dyn CompilerHost>,
     config: Rc<ParsedCommandLine>,
 ) -> &'static crate::core::GoProgram {
-    let np: &'static crate::frontend::compiler::NewProgram = {
+    let np = {
         // The frontend parses with no current program, like the first load.
         let _scope = crate::core::enter_program(None);
-        Box::leak(Box::new(crate::frontend::compiler::new_program(
-            program_options(host, config),
+        Rc::new(crate::frontend::compiler::new_program(program_options(
+            host, config,
         )))
     };
-    crate::program::new_program_version(np, None)
+    crate::program::new_program_version(&np, None)
 }
 
 /// The Go `compiler.ProgramOptions` of a tsc program.

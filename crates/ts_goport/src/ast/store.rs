@@ -7,18 +7,17 @@
 //! bits are the slot index + 1.
 //!
 //! Each slot has a header (Go kind plus the mutable Go `NodeBase` fields:
-//! parent, flags, loc) and, for a node slot, a leaked `ts_ast::Node` that
+//! parent, flags, loc) and, for a node slot, a leaked `crate::astdata::Node` that
 //! holds the node data. Child ids inside that data are slot indexes of the
 //! same store:
 //! - a child in the same file uses its own slot index;
 //! - a child from another file or a synthetic child (Go shares the pointer)
 //!   uses an alias slot, which `Node::new` resolves to that node;
-//! - Go `nil` in a field that ts_ast stores as a required `NodeId` uses
+//! - Go `nil` in a field that astdata stores as a required `NodeId` uses
 //!   slot 0, which resolves to `Node::NIL`.
 //!
-//! `node.rs` reads kind, loc, flags and parent from the header for files that
-//! have a store. Files of the legacy loader (ts_parser) never have a store,
-//! so their reads do not change.
+//! `node.rs` reads kind, loc, flags and parent from the header of every
+//! parsed node. Only synthetic nodes have no store.
 //!
 //! Phases of a store:
 //! - Build: the parser runs on one thread and writes the stores of that
@@ -48,8 +47,8 @@
 //! - One file id is one file version. Ids only grow (`PUBLISHED` is the
 //!   next unused id), and a published file is never changed or freed. A new
 //!   program version shares the ids of its unchanged files.
-//! - Tier 0 (`FROZEN`) is the first publish: program 1, or the files of the
-//!   legacy loader. Its dense tables are indexed by file id.
+//! - Tier 0 (`FROZEN`) is the first publish: program 1. Its dense tables
+//!   are indexed by file id.
 //! - Tier 1 (`LATER`) holds every later publish (edited files, other
 //!   programs). One slot per id points at the `Frozen` of its publish.
 //! - Every read of a published store goes through one inline lookup
@@ -64,25 +63,21 @@
 //!
 //! Binder data is not stored here: it stays in `GoFile::node_bind`, indexed
 //! by slot index.
-//!
-//! PORT: a program is either all legacy files or all store files. A legacy
-//! publish has only `GoFile`s. It must be the only publish: file ids are
-//! store ids, so no store can be made or published after it.
 
+use crate::astdata::NodeData;
 use crate::frontend::parser::SourceFileParseOptions;
 use crate::prelude::*;
 use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use ts_ast::NodeData;
 
-/// Slot 0: Go `nil` stored in a ts_ast field that has no `Option`.
+/// Slot 0: Go `nil` stored in a astdata field that has no `Option`.
 const NIL_SLOT: u32 = 0;
 
-/// Position that marks a Go `nil` list in a ts_ast list field that has no
+/// Position that marks a Go `nil` list in a astdata list field that has no
 /// `Option`. Go positions are byte offsets, so they never reach it, and
 /// `u32::MAX` is already the undefined position `-1`.
-// PORT: ts_ast cannot change under the R97 rules. For store nodes the factory
+// PORT: astdata cannot change under the R97 rules. For store nodes the factory
 // stores Go `nil` in a required list field as an empty list at this position,
 // and `NodeList::is_nil` reads it back as nil (plan risk 1).
 pub const NIL_LIST_POS: u32 = u32::MAX - 1;
@@ -152,9 +147,9 @@ struct FileStore {
     file_name: &'static str,
     text: &'static str,
     headers: Vec<NodeHeader>,
-    /// The ts_ast node (kind and data) of each node slot. `None` for the nil
+    /// The astdata node (kind and data) of each node slot. `None` for the nil
     /// slot and alias slots.
-    nodes: Vec<Option<&'static ts_ast::Node>>,
+    nodes: Vec<Option<&'static crate::astdata::Node>>,
     /// Alias slot of each foreign node, so one node gets one slot. Emptied
     /// by `publish_file_stores`.
     aliases: FxHashMap<Node, u32>,
@@ -317,7 +312,7 @@ impl StoreFacts {
 
 /// U4 (CH6, bind A): two child ids of a node slot, so that `Node::name`,
 /// `Node::expression`, `Node::postfix_token` and `Node::question_token` of a
-/// published store node need no load of its ts_ast node and data
+/// published store node need no load of its astdata node and data
 /// (`FileStore::children`, `frozen_store_child`). C2 adds a third field for
 /// `Node::type_`, `Node::initializer`, `Node::type_name` and
 /// `Node::type_argument_list`. The ids are store-local
@@ -742,7 +737,7 @@ struct Frozen {
     base: usize,
     stores: &'static [FileStore],
     headers: Box<[&'static [NodeHeader]]>,
-    nodes: Box<[&'static [Option<&'static ts_ast::Node>]]>,
+    nodes: Box<[&'static [Option<&'static crate::astdata::Node>]]>,
     /// `headers[file][i].kind`, packed (`FileStore::kinds`). `Node::kind`
     /// reads only this.
     kinds: Box<[&'static [SyntaxKind]]>,
@@ -755,8 +750,6 @@ struct Frozen {
     per_store: Box<[FrozenStore]>,
     /// The `GoFile` of each file id of the publish.
     go_files: Box<[GoFile]>,
-    /// True for the legacy loader: `go_files` only, no stores.
-    legacy: bool,
 }
 
 /// The per-store part of `Frozen` that `Node::new` reads.
@@ -847,8 +840,7 @@ fn later_publish_path() {}
 /// columns are read through one helper): for published store file `file`,
 /// its publish, the index of `file` in that publish, and that entry of the
 /// table that `table` picks. Tier 0 first, then tier 1 (`later`). `None`
-/// for any other file: unpublished, synthetic, provisional or legacy (a
-/// legacy publish has entries in `go_files` only).
+/// for any other file: unpublished, synthetic or provisional.
 // PERF: M3. The tier 0 test is the bounds check of the picked table. The
 // entry is found before the two tiers join, so the caller indexes it with
 // no second bounds check.
@@ -892,14 +884,13 @@ fn slot_index(n: Node) -> usize {
 
 /// The unpublished store `file` of this thread (active, detached or built),
 /// after a registry miss (`frozen_of`). Before the first publish every
-/// store is here. After it, a synthetic id (or any id when tier 0 is
-/// legacy) has no store (a few compares, no call), and any other id takes
-/// one cold call.
+/// store is here. After it, a synthetic id has no store (a few compares,
+/// no call), and any other id takes one cold call.
 #[inline]
 fn unpublished_store(file: usize) -> Option<StoreCell> {
     match FROZEN.get() {
         None => build_store(file),
-        Some(tier0) if tier0.legacy || is_storeless_id(file) => None,
+        Some(_) if is_storeless_id(file) => None,
         Some(_) => unpublished_store_after_publish(file),
     }
 }
@@ -972,7 +963,6 @@ fn with_slot_mut<R>(n: Node, f: impl FnOnce(&mut NodeHeader) -> R) -> R {
 /// follow parse order (see `BuildStores`). The store becomes the active
 /// store of this thread.
 pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
-    assert_no_legacy_publish();
     let store: StoreCell = leak_in_ast_arena(RefCell::new(FileStore::new(file_name, text)));
     let id = BUILD.with(|b| {
         let mut b = b.borrow_mut();
@@ -982,15 +972,6 @@ pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
     });
     ACTIVE.set(Some((id, store)));
     id
-}
-
-/// Panics when tier 0 is a legacy publish: its file ids would collide with
-/// store ids.
-fn assert_no_legacy_publish() {
-    assert!(
-        FROZEN.get().is_none_or(|tier0| !tier0.legacy),
-        "a legacy program is published; file ids would collide with store ids"
-    );
 }
 
 /// Text bytes per slot that a new store reserves for (`FileStore::new`).
@@ -1042,7 +1023,7 @@ impl FileStore {
     fn slot_text_name(
         &mut self,
         kind: SyntaxKind,
-        node: &'static ts_ast::Node,
+        node: &'static crate::astdata::Node,
         text: Option<&str>,
     ) -> (Name, bool) {
         if !matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier) {
@@ -1205,7 +1186,6 @@ impl StoreRemap {
 /// handle map for the values the parse returned with it. The store becomes
 /// the active store of this thread.
 pub fn adopt_detached_store(detached: DetachedStore) -> StoreRemap {
-    assert_no_legacy_publish();
     assert!(
         detached.is_self_contained(),
         "cannot adopt a store that names other stores"
@@ -1733,7 +1713,7 @@ pub fn file_store_slot_count(file: usize) -> usize {
 
 /// The parser `node.Flags` of every slot, indexed by slot index. Nil and
 /// alias slots give no flags. The loader fills `GoFile::parser_flags` from
-/// this, so the binder reads the same flags as for a legacy file.
+/// this for the binder.
 #[must_use]
 pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
     let computed = |s: &FileStore| s.headers.iter().map(|h| h.flags).collect();
@@ -1746,8 +1726,8 @@ pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
 }
 
 /// Publishes the build stores of this thread: `go_files[i]` is the
-/// `GoFile` of id `unpublished_file_ids().start + i`. The legacy loader has
-/// no stores and passes its files. The loader calls this once per program,
+/// `GoFile` of id `unpublished_file_ids().start + i`. The loader calls this
+/// once per program,
 /// before `core::set_prog`. The stores are then read-only, and any thread
 /// can read them. The first publish is tier 0; later ones go to tier 1. An
 /// empty later publish does nothing.
@@ -1765,24 +1745,17 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
     } else {
         base
     };
-    let legacy = cells.is_empty() && !go_files.is_empty();
     assert!(
-        legacy || go_files.len() == cells.len(),
+        go_files.len() == cells.len(),
         "a publish needs one GoFile per store ({} stores, {} GoFiles)",
         cells.len(),
         go_files.len()
     );
     let tier0 = FROZEN.get();
-    if let Some(tier0) = tier0 {
-        assert!(
-            !tier0.legacy && !legacy,
-            "a legacy program must be the only publish; file ids would collide with store ids"
-        );
-        if go_files.is_empty() {
-            return;
-        }
+    if tier0.is_some() && go_files.is_empty() {
+        return;
     }
-    let count = cells.len().max(go_files.len());
+    let count = cells.len();
     assert!(base + count <= TIER1_LIMIT, "too many file ids");
     if let Err(published) =
         PUBLISHED.compare_exchange(base, base + count, Ordering::AcqRel, Ordering::Acquire)
@@ -1816,7 +1789,6 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
             })
             .collect(),
         go_files: go_files.into_boxed_slice(),
-        legacy,
     };
     if tier0.is_none() {
         assert_eq!(base, 0, "the first publish must start at file id 0");
@@ -1911,7 +1883,7 @@ fn mark_source_file_roots(store: &mut FileStore) {
 /// id inside store `NodeData` stands for.
 #[inline]
 #[must_use]
-pub fn resolve_store_id(file: usize, id: ts_ast::NodeId) -> Node {
+pub fn resolve_store_id(file: usize, id: crate::astdata::NodeId) -> Node {
     let index = id.index();
     // The nil slot or an alias slot: the target is in the header
     // (`resolve_slot`).
@@ -1921,10 +1893,10 @@ pub fn resolve_store_id(file: usize, id: ts_ast::NodeId) -> Node {
     with_store(file, |s| resolve_slot(file, index, &s.nodes, &s.headers))
 }
 
-/// Hook for `raw(n)`: the ts_ast node (Go kind and data) of a store node.
+/// Hook for `raw(n)`: the astdata node (Go kind and data) of a store node.
 #[inline]
 #[must_use]
-pub fn store_ast_node(n: Node) -> &'static ts_ast::Node {
+pub fn store_ast_node(n: Node) -> &'static crate::astdata::Node {
     if let Some((_, _, nodes)) = frozen_of(n.file_index(), |f| &f.nodes[..]) {
         return slot_node(nodes[slot_index(n)]);
     }
@@ -1955,7 +1927,7 @@ pub fn store_header(n: Node) -> NodeHeader {
 /// The header of `n` when it is a store node (kind, parser flags, parent,
 /// loc): one thread-local load for the active store, one table lookup in
 /// the registry (`frozen_of`), one more thread-local access for another
-/// unpublished store. `None` for nil, synthetic and legacy nodes. With it a
+/// unpublished store. `None` for nil and synthetic nodes. With it a
 /// node read needs no separate `has_file_store` call.
 // PERF: query Q8. The active store is checked first and inline; every
 // other case is out of line.
@@ -1995,7 +1967,7 @@ pub fn active_store_header(n: Node) -> Option<NodeHeader> {
 }
 
 /// Go `node.Kind` of a published store node (tier 0 or tier 1, see
-/// `frozen_of`). `None` for any other node: nil, synthetic, legacy and
+/// `frozen_of`). `None` for any other node: nil, synthetic and
 /// unpublished store nodes.
 #[inline]
 #[must_use]
@@ -2040,12 +2012,12 @@ pub fn frozen_store_parent(n: Node) -> Option<Node> {
     frozen_header(n).map(|h| h.read(n.file_index()).parent)
 }
 
-/// The ts_ast node of a published store node: the inlined fast path of
+/// The astdata node of a published store node: the inlined fast path of
 /// `static_ast_node`. `None` as for `frozen_store_kind`. Panics like
 /// `try_store_ast_node` on a nil or alias slot.
 #[inline]
 #[must_use]
-pub fn frozen_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
+pub fn frozen_store_ast_node(n: Node) -> Option<&'static crate::astdata::Node> {
     if n.is_nil() {
         return None;
     }
@@ -2054,10 +2026,10 @@ pub fn frozen_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
 }
 
 /// `store_ast_node(n)` when `n` is a store node, in one lookup (see
-/// `try_store_header`). `None` for nil, synthetic and legacy nodes.
+/// `try_store_header`). `None` for nil and synthetic nodes.
 #[inline]
 #[must_use]
-pub fn try_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
+pub fn try_store_ast_node(n: Node) -> Option<&'static crate::astdata::Node> {
     if n.is_nil() {
         return None;
     }
@@ -2071,16 +2043,16 @@ pub fn try_store_ast_node(n: Node) -> Option<&'static ts_ast::Node> {
 
 /// `try_store_ast_node` for a node that is not in the active store.
 #[inline(never)]
-fn try_store_ast_node_slow(file: usize, index: usize) -> Option<&'static ts_ast::Node> {
+fn try_store_ast_node_slow(file: usize, index: usize) -> Option<&'static crate::astdata::Node> {
     if let Some((_, _, nodes)) = frozen_of(file, |f| &f.nodes[..]) {
         return Some(slot_node(nodes[index]));
     }
     unpublished_store(file).map(|store| slot_node(store.borrow().nodes[index]))
 }
 
-/// The ts_ast node of a node slot. Panics on the nil slot and alias slots.
+/// The astdata node of a node slot. Panics on the nil slot and alias slots.
 #[inline]
-fn slot_node(slot: Option<&'static ts_ast::Node>) -> &'static ts_ast::Node {
+fn slot_node(slot: Option<&'static crate::astdata::Node>) -> &'static crate::astdata::Node {
     slot.expect("store handle does not name a node slot")
 }
 
@@ -2088,7 +2060,7 @@ fn slot_node(slot: Option<&'static ts_ast::Node>) -> &'static ts_ast::Node {
 /// `try_store_header`). `None` when it has none.
 #[inline]
 #[must_use]
-pub fn try_resolve_store_id(file: usize, id: ts_ast::NodeId) -> Option<Node> {
+pub fn try_resolve_store_id(file: usize, id: crate::astdata::NodeId) -> Option<Node> {
     let index = id.index();
     // PERF: query Q8, see `ACTIVE`.
     if let Some(store) = active_store(file) {
@@ -2114,7 +2086,7 @@ fn try_resolve_store_id_slow(file: usize, index: usize) -> Option<Node> {
 /// for a store node made by `alloc_store_name_node` or
 /// `alloc_store_shared_name_node` (see `store_identifier_name`) and for
 /// other kinds.
-fn identifier_text(node: &ts_ast::Node) -> &str {
+fn identifier_text(node: &crate::astdata::Node) -> &str {
     match &node.data {
         NodeData::Identifier(d) => &d.text,
         NodeData::PrivateIdentifier(d) => &d.text,
@@ -2125,7 +2097,7 @@ fn identifier_text(node: &ts_ast::Node) -> &str {
 /// U1 (d): Go `node.Text()` of an Identifier or PrivateIdentifier store
 /// node, from the name column of its slot (`FileStore::names`, or
 /// `build_names` while the file is parsed), in tier 0, tier 1 or an
-/// unpublished store of this thread. `None` for nil, synthetic and legacy
+/// unpublished store of this thread. `None` for nil and synthetic
 /// nodes. `Name::default()` (the empty text) for other slots.
 #[inline]
 #[must_use]
@@ -2163,7 +2135,7 @@ fn store_identifier_name_slow(file: usize, index: usize) -> Option<Name> {
 fn resolve_slot(
     file: usize,
     index: usize,
-    nodes: &[Option<&'static ts_ast::Node>],
+    nodes: &[Option<&'static crate::astdata::Node>],
     headers: &[NodeHeader],
 ) -> Node {
     match nodes[index] {
@@ -2185,11 +2157,11 @@ pub fn frozen_resolved(file: usize) -> Option<&'static [Node]> {
 
 /// Hook for `Node::new(file, id)` on a published store (tier 0 or tier 1):
 /// `try_resolve_store_id(file, id)` without a per-slot table load for an
-/// alias-free store. `None` for any other file (unpublished, synthetic or
-/// legacy).
+/// alias-free store. `None` for any other file (unpublished or
+/// synthetic).
 #[inline]
 #[must_use]
-pub fn frozen_resolve_store_id(file: usize, id: ts_ast::NodeId) -> Option<Node> {
+pub fn frozen_resolve_store_id(file: usize, id: crate::astdata::NodeId) -> Option<Node> {
     let (f, _, s) = frozen_of(file, |f| &f.per_store[..])?;
     Some(frozen_resolve_slot(f, s, file, id.index()))
 }
@@ -2203,7 +2175,7 @@ pub fn frozen_store_facts(file: usize) -> Option<StoreFacts> {
 }
 
 /// The `StoreFacts` of the store of `n` when it is a published store node.
-/// `None` for any other node: nil, synthetic, legacy and unpublished store
+/// `None` for any other node: nil, synthetic and unpublished store
 /// nodes.
 #[inline]
 #[must_use]
@@ -2242,7 +2214,7 @@ pub fn frozen_source_file_of_node(n: Node) -> Option<Node> {
 /// U1 (a): Go `node.Text()` of a published Identifier or PrivateIdentifier
 /// store node (tier 0 or tier 1), interned when its slot was made
 /// (`FileStore::names`). `None` for other kinds and for any other node:
-/// nil, synthetic, legacy and unpublished store nodes.
+/// nil, synthetic and unpublished store nodes.
 #[inline]
 #[must_use]
 pub fn frozen_store_text_name(n: Node) -> Option<Name> {
@@ -2276,7 +2248,7 @@ pub fn frozen_store_text_is_keyword(n: Node) -> Option<bool> {
 /// U1 (b): Go `node.ModifierFlags()` (the flags of the node's own modifier
 /// list) of a published store node (tier 0 or tier 1), from
 /// `FileStore::modifier_bits`. `None` for a store whose column is empty and
-/// for any other node: nil, synthetic, legacy and unpublished store nodes.
+/// for any other node: nil, synthetic and unpublished store nodes.
 #[inline]
 #[must_use]
 pub fn frozen_store_modifier_flags(n: Node) -> Option<ModifierFlags> {
@@ -2293,7 +2265,7 @@ pub fn frozen_store_modifier_flags(n: Node) -> Option<ModifierFlags> {
 /// tier 1), from the `children` column of its store (`SlotChildren`),
 /// resolved like `Node::new`. C2: also Go `n.Type()`, `n.Initializer()` and
 /// `n.AsTypeReference().TypeName`. `None` when the entry is unknown and for
-/// any other node (nil, synthetic, legacy, unpublished): the caller reads
+/// any other node (nil, synthetic, unpublished): the caller reads
 /// the node data.
 #[inline]
 #[must_use]
@@ -2358,7 +2330,7 @@ pub fn frozen_store_child(n: Node, which: StoreChild) -> Option<Node> {
 /// C2: true when `n` is a published store node whose Go `TypeArgumentList()`
 /// is nil with no list in its node data (`SlotChildren` `NO_TYPE_ARGUMENTS`),
 /// so `Node::type_argument_list` is `NodeList::NIL`. False when not known and
-/// for any other node (nil, synthetic, legacy, unpublished).
+/// for any other node (nil, synthetic, unpublished).
 #[inline]
 #[must_use]
 pub fn frozen_store_lacks_type_arguments(n: Node) -> bool {
@@ -2375,7 +2347,7 @@ pub fn frozen_store_lacks_type_arguments(n: Node) -> bool {
 /// R2-5: the children of a published store node (tier 0 or tier 1) in Go
 /// `ForEachChild` order, from the link column of its store (`SlotLinks`),
 /// without its node data. `None` when the chain of `n` is not known and for
-/// any other node (nil, synthetic, legacy, unpublished): the caller uses
+/// any other node (nil, synthetic, unpublished): the caller uses
 /// `for_each_child`.
 #[inline]
 #[must_use]
@@ -2528,7 +2500,7 @@ impl FrozenIds {
     /// `Node::new(file, id)` for the store this value was read for.
     #[inline]
     #[must_use]
-    pub fn node(self, id: ts_ast::NodeId) -> Node {
+    pub fn node(self, id: crate::astdata::NodeId) -> Node {
         match self {
             FrozenIds::Table(resolved) => resolved[id.index()],
             FrozenIds::Direct { base, nil } => {
@@ -2543,7 +2515,7 @@ impl FrozenIds {
 }
 
 /// U1 (c): the `FrozenIds` of published store `file` (tier 0 or tier 1).
-/// `None` for any other file (unpublished, synthetic or legacy).
+/// `None` for any other file (unpublished or synthetic).
 #[inline]
 #[must_use]
 pub fn frozen_store_ids(file: usize) -> Option<FrozenIds> {
@@ -2585,7 +2557,7 @@ fn thread_build_cell(n: Node) -> Option<StoreCell> {
     // two compares, as the one-program `FROZEN` check. The active store is
     // never in tier 0 (its id is at least the published count).
     if let Some(tier0) = FROZEN.get()
-        && (file < tier0.headers.len() || is_storeless_id(file) || tier0.legacy)
+        && (file < tier0.headers.len() || is_storeless_id(file))
     {
         return None;
     }
@@ -2994,7 +2966,7 @@ pub(crate) struct LibParseSlotView {
     pub(crate) parent: u32,
     pub(crate) first_child: u32,
     pub(crate) next_sibling: u32,
-    pub(crate) node: &'static ts_ast::Node,
+    pub(crate) node: &'static crate::astdata::Node,
     /// The slot points at the shared name node of its kind (S1).
     pub(crate) shared_name: bool,
     pub(crate) name: Name,
@@ -3004,7 +2976,7 @@ pub(crate) struct LibParseSlotView {
 /// R3-1, tests: the slots after slot 0 of store `file`, a store of this
 /// thread whose parse is finished and that is not published. An error when
 /// a snapshot cannot keep the store: an alias slot, a parent in another
-/// store, or a ts_ast node with other base fields than `ast_node` gives.
+/// store, or a astdata node with other base fields than `ast_node` gives.
 #[cfg(test)]
 pub(crate) fn lib_parse_slot_views(file: usize) -> Result<Vec<LibParseSlotView>, String> {
     with_store(file, |s| {
@@ -3016,7 +2988,7 @@ pub(crate) fn lib_parse_slot_views(file: usize) -> Result<Vec<LibParseSlotView>,
         }
         let base = ast_node(
             SyntaxKind::Unknown,
-            NodeData::Token(Box::new(ts_ast::TokenData)),
+            NodeData::Token(Box::new(crate::astdata::TokenData)),
         );
         let mut views = Vec::with_capacity(s.headers.len());
         for index in 1..s.headers.len() {
@@ -3190,12 +3162,12 @@ pub(crate) fn leak_in_ast_arena<T>(value: T) -> &'static T {
     arena.alloc(value)
 }
 
-/// A ts_ast node with kind `kind` and data `data`. Only kind and data are
+/// A astdata node with kind `kind` and data `data`. Only kind and data are
 /// read for store and synthetic nodes; the header lives in the slot.
-fn ast_node(kind: SyntaxKind, data: NodeData) -> ts_ast::Node {
-    ts_ast::Node {
+fn ast_node(kind: SyntaxKind, data: NodeData) -> crate::astdata::Node {
+    crate::astdata::Node {
         kind,
-        flags: ts_ast::NodeFlags(0),
+        flags: crate::astdata::NodeFlags(0),
         range: ts_range(TextRange::undefined()),
         parent: None,
         data,
@@ -3203,29 +3175,32 @@ fn ast_node(kind: SyntaxKind, data: NodeData) -> ts_ast::Node {
 }
 
 /// `ast_node(kind, data)`, leaked in this thread's AST arena.
-fn leak_ast_node(kind: SyntaxKind, data: NodeData) -> &'static ts_ast::Node {
+fn leak_ast_node(kind: SyntaxKind, data: NodeData) -> &'static crate::astdata::Node {
     leak_in_ast_arena(ast_node(kind, data))
 }
 
-/// S1: the one ts_ast node that every store Identifier (or
+/// S1: the one astdata node that every store Identifier (or
 /// PrivateIdentifier, by `kind`) made by `alloc_store_shared_name_node`
 /// points at. Its data is the Go factory payload with the default fields:
 /// no flow node (the binder keeps flow nodes in its tables) and an empty
 /// text (the name column holds the text).
-fn shared_name_node(kind: SyntaxKind) -> &'static ts_ast::Node {
-    static IDENTIFIER: OnceLock<&'static ts_ast::Node> = OnceLock::new();
-    static PRIVATE_IDENTIFIER: OnceLock<&'static ts_ast::Node> = OnceLock::new();
-    let leak = |data| -> &'static ts_ast::Node { Box::leak(Box::new(ast_node(kind, data))) };
+fn shared_name_node(kind: SyntaxKind) -> &'static crate::astdata::Node {
+    static IDENTIFIER: OnceLock<&'static crate::astdata::Node> = OnceLock::new();
+    static PRIVATE_IDENTIFIER: OnceLock<&'static crate::astdata::Node> = OnceLock::new();
+    let leak =
+        |data| -> &'static crate::astdata::Node { Box::leak(Box::new(ast_node(kind, data))) };
     match kind {
         SyntaxKind::Identifier => *IDENTIFIER.get_or_init(|| {
-            leak(NodeData::Identifier(Box::new(ts_ast::IdentifierData {
-                flow_node: None,
-                text: String::new(),
-            })))
+            leak(NodeData::Identifier(Box::new(
+                crate::astdata::IdentifierData {
+                    flow_node: None,
+                    text: String::new(),
+                },
+            )))
         }),
         SyntaxKind::PrivateIdentifier => *PRIVATE_IDENTIFIER.get_or_init(|| {
             leak(NodeData::PrivateIdentifier(Box::new(
-                ts_ast::PrivateIdentifierData {
+                crate::astdata::PrivateIdentifierData {
                     text: String::new(),
                 },
             )))
@@ -3236,17 +3211,17 @@ fn shared_name_node(kind: SyntaxKind) -> &'static ts_ast::Node {
 
 /// S1, debug builds: panics unless `data` (the payload the factory builds
 /// for a store name node of kind `kind`) equals the data of the shared node
-/// of `kind`. The struct patterns name every field, so a new ts_ast field
+/// of `kind`. The struct patterns name every field, so a new astdata field
 /// does not compile here until it is checked.
 #[cfg(debug_assertions)]
 pub fn debug_assert_shared_name_data(kind: SyntaxKind, data: &NodeData) {
     let same = match (data, &shared_name_node(kind).data) {
         (NodeData::Identifier(a), NodeData::Identifier(b)) => {
-            let ts_ast::IdentifierData { flow_node, text } = &**a;
+            let crate::astdata::IdentifierData { flow_node, text } = &**a;
             *flow_node == b.flow_node && *text == b.text
         }
         (NodeData::PrivateIdentifier(a), NodeData::PrivateIdentifier(b)) => {
-            let ts_ast::PrivateIdentifierData { text } = &**a;
+            let crate::astdata::PrivateIdentifierData { text } = &**a;
             *text == b.text
         }
         _ => false,
@@ -3276,16 +3251,16 @@ pub fn alloc_store_name_node(file: usize, kind: SyntaxKind, data: NodeData, text
 }
 
 /// S1: `alloc_store_name_node` for the Go factory payload of a name node
-/// (no flow node, empty data text), without a new data box or ts_ast node:
+/// (no flow node, empty data text), without a new data box or astdata node:
 /// the slot points at the process-wide node of `kind` (`shared_name_node`).
 /// The name column holds `text`. The factory checks its payload against the
 /// shared one in debug builds (`debug_assert_shared_name_data`).
 // PERF: S1. Saves one malloc and about 88 bytes per identifier (a 32-byte
 // data box and a 40-byte arena node). Sharing one node is safe because a
-// ts_ast node is never changed in place: its data has no interior
+// astdata node is never changed in place: its data has no interior
 // mutability, the crate forbids unsafe code, and a data write gives the slot
 // a new node (`replace_store_node_data`). No code uses the address of a
-// ts_ast node as an identity (the `data_accessor!` `_in` debug check only
+// astdata node as an identity (the `data_accessor!` `_in` debug check only
 // compares the data of one node with itself).
 pub fn alloc_store_shared_name_node(file: usize, kind: SyntaxKind, text: &str) -> Node {
     alloc_store_slot_node(file, kind, shared_name_node(kind), Some(text))
@@ -3301,12 +3276,12 @@ fn alloc_store_slot(file: usize, kind: SyntaxKind, data: NodeData, text: Option<
     alloc_store_slot_node(file, kind, leak_ast_node(kind, data), text)
 }
 
-/// `alloc_store_slot` for a ts_ast node that is already made.
+/// `alloc_store_slot` for a astdata node that is already made.
 #[inline]
 fn alloc_store_slot_node(
     file: usize,
     kind: SyntaxKind,
-    node: &'static ts_ast::Node,
+    node: &'static crate::astdata::Node,
     text: Option<&str>,
 ) -> Node {
     debug_assert!(
@@ -3347,22 +3322,22 @@ fn alloc_store_slot_node(
 // alias path is out of line, so the function body stays small.
 #[inline]
 #[must_use]
-pub fn store_child_id(file: usize, n: Node) -> ts_ast::NodeId {
+pub fn store_child_id(file: usize, n: Node) -> crate::astdata::NodeId {
     if n.is_nil() {
-        return ts_ast::NodeId::new(NIL_SLOT);
+        return crate::astdata::NodeId::new(NIL_SLOT);
     }
     if n.file_index() == file {
-        return ts_ast::NodeId::new(slot_index(n) as u32);
+        return crate::astdata::NodeId::new(slot_index(n) as u32);
     }
     store_alias_id(file, n)
 }
 
 /// The alias slot of foreign node `n` in store `file` (`store_child_id`).
 #[inline(never)]
-fn store_alias_id(file: usize, n: Node) -> ts_ast::NodeId {
+fn store_alias_id(file: usize, n: Node) -> crate::astdata::NodeId {
     with_store_mut(file, |s| {
         if let Some(&index) = s.aliases.get(&n) {
-            return ts_ast::NodeId::new(index);
+            return crate::astdata::NodeId::new(index);
         }
         let index = s.headers.len() as u32;
         s.headers.push(NodeHeader::target(n));
@@ -3373,13 +3348,13 @@ fn store_alias_id(file: usize, n: Node) -> ts_ast::NodeId {
         s.build_links.push(SlotLinks::NONE);
         s.debug_assert_build_columns();
         s.aliases.insert(n, index);
-        ts_ast::NodeId::new(index)
+        crate::astdata::NodeId::new(index)
     })
 }
 
-/// Like `store_child_id`, for ts_ast fields that are `Option<NodeId>`.
+/// Like `store_child_id`, for astdata fields that are `Option<NodeId>`.
 #[must_use]
-pub fn store_opt_child_id(file: usize, n: Node) -> Option<ts_ast::NodeId> {
+pub fn store_opt_child_id(file: usize, n: Node) -> Option<crate::astdata::NodeId> {
     if n.is_nil() {
         None
     } else {
@@ -3387,17 +3362,17 @@ pub fn store_opt_child_id(file: usize, n: Node) -> Option<ts_ast::NodeId> {
     }
 }
 
-/// A Go `core.TextRange` in ts_ast form (`-1` is stored as `u32::MAX`).
-fn ts_range(loc: TextRange) -> ts_core::TextRange {
-    ts_core::TextRange {
-        start: ts_core::TextPos::new(loc.pos() as u32),
-        end: ts_core::TextPos::new(loc.end() as u32),
+/// A Go `core.TextRange` in astdata form (`-1` is stored as `u32::MAX`).
+fn ts_range(loc: TextRange) -> crate::astdata::text::TextRange {
+    crate::astdata::text::TextRange {
+        start: crate::astdata::text::TextPos::new(loc.pos() as u32),
+        end: crate::astdata::text::TextPos::new(loc.end() as u32),
     }
 }
 
-/// The ts_ast list for a list of store `file`.
-fn ts_list(file: usize, nodes: &[Node], loc: TextRange) -> ts_ast::NodeList {
-    ts_ast::NodeList {
+/// The astdata list for a list of store `file`.
+fn ts_list(file: usize, nodes: &[Node], loc: TextRange) -> crate::astdata::NodeList {
+    crate::astdata::NodeList {
         range: ts_range(loc),
         nodes: nodes.iter().map(|&n| store_child_id(file, n)).collect(),
         has_trailing_comma: false,
@@ -3406,15 +3381,15 @@ fn ts_list(file: usize, nodes: &[Node], loc: TextRange) -> ts_ast::NodeList {
 
 /// U1 (e): a list that the parser made in a store and that no node data
 /// holds yet: what a pending `NodeList` handle names. Its ids live in the
-/// AST bump arena. `store_list_value` builds the ts_ast list from it, once
+/// AST bump arena. `store_list_value` builds the astdata list from it, once
 /// for each node data that stores it.
 #[derive(Debug)]
 pub struct PendingList {
-    /// Go `list.Loc` in ts_ast form (`ts_range`).
-    pub(crate) range: ts_core::TextRange,
+    /// Go `list.Loc` in astdata form (`ts_range`).
+    pub(crate) range: crate::astdata::text::TextRange,
     /// The store ids of the nodes (`store_child_id`).
-    pub(crate) nodes: &'static [ts_ast::NodeId],
-    /// The ts_ast bit (`NodeList::stored_trailing_comma`).
+    pub(crate) nodes: &'static [crate::astdata::NodeId],
+    /// The astdata bit (`NodeList::stored_trailing_comma`).
     pub(crate) has_trailing_comma: bool,
 }
 
@@ -3430,9 +3405,9 @@ impl PendingList {
         }
     }
 
-    /// The ts_ast list with the same range, ids and bit.
-    fn to_ts(&self) -> ts_ast::NodeList {
-        ts_ast::NodeList {
+    /// The astdata list with the same range, ids and bit.
+    fn to_ts(&self) -> crate::astdata::NodeList {
+        crate::astdata::NodeList {
             range: self.range,
             nodes: self.nodes.to_vec(),
             has_trailing_comma: self.has_trailing_comma,
@@ -3445,13 +3420,13 @@ impl PendingList {
 #[derive(Debug)]
 pub struct PendingModifierList {
     pub(crate) list: PendingList,
-    pub(crate) flags: ts_ast::ModifierFlags,
+    pub(crate) flags: crate::astdata::ModifierFlags,
 }
 
 impl PendingModifierList {
-    /// The ts_ast modifier list with the same list and flags.
-    fn to_ts(&self) -> ts_ast::ModifierList {
-        ts_ast::ModifierList {
+    /// The astdata modifier list with the same list and flags.
+    fn to_ts(&self) -> crate::astdata::ModifierList {
+        crate::astdata::ModifierList {
             list: self.list.to_ts(),
             flags: self.flags,
         }
@@ -3474,7 +3449,7 @@ pub fn new_store_node_list(file: usize, nodes: &[Node], loc: TextRange) -> NodeL
 pub fn new_store_modifier_list(file: usize, nodes: &[Node], loc: TextRange) -> ModifierList {
     let list = leak_in_ast_arena(PendingModifierList {
         list: PendingList::new(file, nodes, loc),
-        flags: ts_ast::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
+        flags: crate::astdata::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
     });
     ModifierList::pending(file, list)
 }
@@ -3482,15 +3457,15 @@ pub fn new_store_modifier_list(file: usize, nodes: &[Node], loc: TextRange) -> M
 /// A list value to store inside new `NodeData` of store `file`. Go stores
 /// the `*NodeList` pointer. A list of the same store is copied as is; any
 /// other list is rebuilt over ids of this store with its own `Loc`.
-// PORT: ts_ast stores lists by value, so `NodeList` equality on the copy is
+// PORT: astdata stores lists by value, so `NodeList` equality on the copy is
 // false where Go compares equal pointers (plan risk 2).
 #[must_use]
-pub fn store_list_value(file: usize, list: NodeList) -> Option<ts_ast::NodeList> {
+pub fn store_list_value(file: usize, list: NodeList) -> Option<crate::astdata::NodeList> {
     if list.is_nil() {
         return None;
     }
     if list.file() == file {
-        // U1 (e): the ts_ast list of a pending list is made here, once.
+        // U1 (e): the astdata list of a pending list is made here, once.
         if let Some(p) = list.pending_list() {
             return Some(p.to_ts());
         }
@@ -3502,15 +3477,15 @@ pub fn store_list_value(file: usize, list: NodeList) -> Option<ts_ast::NodeList>
     Some(ts_list(file, &nodes, list.loc()))
 }
 
-/// Like `store_list_value` for a list field that ts_ast requires. Go `nil`
+/// Like `store_list_value` for a list field that astdata requires. Go `nil`
 /// becomes an empty list at `NIL_LIST_POS`, which `NodeList::is_nil` reads
 /// as nil.
 #[must_use]
-pub fn store_req_list_value(file: usize, list: NodeList) -> ts_ast::NodeList {
-    store_list_value(file, list).unwrap_or_else(|| ts_ast::NodeList {
-        range: ts_core::TextRange {
-            start: ts_core::TextPos::new(NIL_LIST_POS),
-            end: ts_core::TextPos::new(NIL_LIST_POS),
+pub fn store_req_list_value(file: usize, list: NodeList) -> crate::astdata::NodeList {
+    store_list_value(file, list).unwrap_or_else(|| crate::astdata::NodeList {
+        range: crate::astdata::text::TextRange {
+            start: crate::astdata::text::TextPos::new(NIL_LIST_POS),
+            end: crate::astdata::text::TextPos::new(NIL_LIST_POS),
         },
         nodes: Vec::new(),
         has_trailing_comma: false,
@@ -3519,7 +3494,10 @@ pub fn store_req_list_value(file: usize, list: NodeList) -> ts_ast::NodeList {
 
 /// A modifier list value to store inside new `NodeData` of store `file`.
 #[must_use]
-pub fn store_modifiers_value(file: usize, modifiers: ModifierList) -> Option<ts_ast::ModifierList> {
+pub fn store_modifiers_value(
+    file: usize,
+    modifiers: ModifierList,
+) -> Option<crate::astdata::ModifierList> {
     if modifiers.is_nil() {
         return None;
     }
@@ -3533,16 +3511,16 @@ pub fn store_modifiers_value(file: usize, modifiers: ModifierList) -> Option<ts_
         }
     }
     let nodes = modifiers.nodes().to_vec();
-    Some(ts_ast::ModifierList {
+    Some(crate::astdata::ModifierList {
         list: ts_list(file, &nodes, modifiers.loc()),
-        flags: ts_ast::ModifierFlags(modifiers_to_flags(&nodes).0 as u32),
+        flags: crate::astdata::ModifierFlags(modifiers_to_flags(&nodes).0 as u32),
     })
 }
 
 /// True when `l` is the Go `nil` marker of a required list field.
 #[inline]
 #[must_use]
-pub fn is_nil_list_marker(l: &ts_ast::NodeList) -> bool {
+pub fn is_nil_list_marker(l: &crate::astdata::NodeList) -> bool {
     is_nil_list_range(&l.range)
 }
 
@@ -3550,7 +3528,7 @@ pub fn is_nil_list_marker(l: &ts_ast::NodeList) -> bool {
 /// (`NIL_LIST_POS`).
 #[inline]
 #[must_use]
-pub fn is_nil_list_range(range: &ts_core::TextRange) -> bool {
+pub fn is_nil_list_range(range: &crate::astdata::text::TextRange) -> bool {
     range.start.get() == NIL_LIST_POS && range.end.get() == NIL_LIST_POS
 }
 
@@ -3952,7 +3930,7 @@ mod tests {
         let private = f.new_private_identifier("#p");
         let missing = f.new_identifier("");
         assert!(identifier_text(store_ast_node(id)).is_empty());
-        // S1: every store identifier points at one shared ts_ast node.
+        // S1: every store identifier points at one shared astdata node.
         assert!(std::ptr::eq(store_ast_node(id), store_ast_node(missing)));
         assert!(std::ptr::eq(
             store_ast_node(id),
