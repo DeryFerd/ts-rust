@@ -1294,12 +1294,27 @@ impl ThreadBudget {
     }
 
     /// The `GLIBC_TUNABLES` value of this budget (see `bin/goport.rs`
-    /// `set_malloc_tunables`).
-    pub fn glibc_tunables(&self) -> String {
-        format!(
-            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max={}:glibc.malloc.top_pad=67108864",
-            self.arena_max
-        )
+    /// `set_malloc_tunables`), or `None` to set none.
+    /// - glibc malloc (a build without the `jemalloc` feature): the huge
+    ///   page settings, `arena_max` and the top pad.
+    /// - jemalloc: glibc malloc serves only glibc itself (the thread-local
+    ///   destructor list and the attributes of each thread), so it needs
+    ///   nothing with no limit.
+    ///
+    /// Under an address space or data limit (`gostd::stack::memory_limit`),
+    /// `arena_max` is 1. Each thread that calls glibc malloc gets its own
+    /// arena, up to 8 per core, and each arena reserves 64 MiB of address
+    /// space, which the limit counts in full. With jemalloc, effect at
+    /// `ulimit -v 2G` then gives Go's output (without it: out of memory).
+    pub fn glibc_tunables(&self) -> Option<String> {
+        let limited = crate::gostd::stack::memory_limit().is_some();
+        if cfg!(feature = "jemalloc") {
+            return limited.then(|| String::from("glibc.malloc.arena_max=1"));
+        }
+        let arena_max = if limited { 1 } else { self.arena_max };
+        Some(format!(
+            "glibc.malloc.hugetlb=1:glibc.malloc.arena_max={arena_max}:glibc.malloc.top_pad=67108864"
+        ))
     }
 }
 

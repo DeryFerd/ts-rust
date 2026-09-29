@@ -71,27 +71,30 @@ fn main() {
 /// Copied from `goport.rs` `set_malloc_tunables`, which explains the
 /// values. jemalloc gets `JEMALLOC_CONF`. With glibc malloc, a build runs
 /// about 20 threads per program, so `arena_max` is 16 here
-/// (`ThreadBudget::WIDE`). The variable stays set, so the exec runs once.
-/// A jemalloc build with `JEMALLOC_CONF` built in does not exec.
+/// (`ThreadBudget::WIDE`). Under an address space or data limit, glibc
+/// malloc gets `arena_max=1`, with jemalloc too. The variables stay set, so
+/// the exec runs once. A jemalloc build with `JEMALLOC_CONF` built in execs
+/// only under a limit.
 fn set_malloc_tunables(budget: &ThreadBudget) {
-    // Unused off Linux and with jemalloc.
+    // Unused off Linux.
     let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
+        let mut vars = Vec::new();
         // A build with `JEMALLOC_CONF` built into jemalloc
         // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set by `scripts/build-release.sh`)
-        // needs no exec: jemalloc reads it at its start, and
+        // needs no exec for it: jemalloc reads it at its start, and
         // `_RJEM_MALLOC_CONF` still overrides it.
         #[cfg(feature = "jemalloc")]
-        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") == Some(JEMALLOC_CONF) {
-            return;
+        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") != Some(JEMALLOC_CONF) {
+            vars.push(("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF)));
         }
-        #[cfg(not(feature = "jemalloc"))]
-        let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
-        #[cfg(feature = "jemalloc")]
-        let (name, value) = ("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF));
-        if std::env::var_os(name).is_some() {
+        if let Some(value) = budget.glibc_tunables() {
+            vars.push(("GLIBC_TUNABLES", value));
+        }
+        vars.retain(|(name, _)| std::env::var_os(name).is_none());
+        if vars.is_empty() {
             return;
         }
         let Ok(exe) = std::env::current_exe() else {
@@ -103,7 +106,7 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
             command.arg0(arg0);
         }
         // `exec` returns only when it fails.
-        let _ = command.args(args).env(name, value).exec();
+        let _ = command.args(args).envs(vars).exec();
     }
 }
 

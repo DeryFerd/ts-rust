@@ -19,8 +19,9 @@
 //! `cmd::tsgo::main::notify_context`. Only watch and build mode read the
 //! context; a plain compile goes on after a signal, as in Go.
 //! PORT: Go `core.ApplyDebugStackLimit` (`TS_GO_DEBUG_STACK_LIMIT`) is a
-//! debug setting and is skipped. The work runs on a thread with a 1 GiB
-//! stack, like the other goport bins.
+//! debug setting and is skipped. The work runs on a thread with the stack
+//! size of `gostd::stack::max_stack_size` (1 GiB with no address space or
+//! data limit), like the other goport bins.
 //! PORT: Go `osSys` and `newSystem` (cmd/tsgo/sys.go) are ported as
 //! `OsSystem` and `new_os_system` in execute/tsc/compile.rs.
 //! PORT: `enablevtprocessing_windows.go` (the Windows console) is not
@@ -86,28 +87,30 @@ fn main() {
 /// comes from `budget` (`ThreadBudget::one_program`): with the signal thread
 /// it is 7 here, and 10 at 8 or more cores (3 spare arenas for the parse
 /// workers that a large program adds). At 6, two checkers share one arena
-/// lock (zod: 3.9k voluntary context switches, 0.5k at 7). The variable
-/// stays set, so the exec runs once. A jemalloc build with `JEMALLOC_CONF`
-/// built in does not exec.
+/// lock (zod: 3.9k voluntary context switches, 0.5k at 7). Under an address
+/// space or data limit, glibc malloc gets `arena_max=1`, with jemalloc too.
+/// The variables stay set, so the exec runs once. A jemalloc build with
+/// `JEMALLOC_CONF` built in execs only under a limit.
 fn set_malloc_tunables(budget: &ThreadBudget) {
-    // Unused off Linux and with jemalloc.
+    // Unused off Linux.
     let _ = budget;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::os::unix::process::CommandExt;
+        let mut vars = Vec::new();
         // A build with `JEMALLOC_CONF` built into jemalloc
         // (`JEMALLOC_SYS_WITH_MALLOC_CONF`, set by `scripts/build-release.sh`)
-        // needs no exec: jemalloc reads it at its start, and
+        // needs no exec for it: jemalloc reads it at its start, and
         // `_RJEM_MALLOC_CONF` still overrides it.
         #[cfg(feature = "jemalloc")]
-        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") == Some(JEMALLOC_CONF) {
-            return;
+        if option_env!("JEMALLOC_SYS_WITH_MALLOC_CONF") != Some(JEMALLOC_CONF) {
+            vars.push(("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF)));
         }
-        #[cfg(not(feature = "jemalloc"))]
-        let (name, value) = ("GLIBC_TUNABLES", budget.glibc_tunables());
-        #[cfg(feature = "jemalloc")]
-        let (name, value) = ("_RJEM_MALLOC_CONF", String::from(JEMALLOC_CONF));
-        if std::env::var_os(name).is_some() {
+        if let Some(value) = budget.glibc_tunables() {
+            vars.push(("GLIBC_TUNABLES", value));
+        }
+        vars.retain(|(name, _)| std::env::var_os(name).is_none());
+        if vars.is_empty() {
             return;
         }
         let Ok(exe) = std::env::current_exe() else {
@@ -119,7 +122,7 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
             command.arg0(arg0);
         }
         // `exec` returns only when it fails.
-        let _ = command.args(args).env(name, value).exec();
+        let _ = command.args(args).envs(vars).exec();
     }
 }
 

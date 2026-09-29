@@ -21,8 +21,13 @@ const MAX_STACK_SIZE: usize = 1 << 30;
 /// The smallest stack under a limit: the Linux default for a main thread.
 const MIN_STACK_SIZE: usize = 8 << 20;
 
-/// Under a limit, each stack gets 1/64 of it, so the stacks of 32 threads
-/// take at most half of the limit, and the heap keeps the other half.
+/// Under a limit, each stack gets 1/64 of it. The share does not count the
+/// threads: 32 stacks take half of the limit and 64 take all of it. Query
+/// core, where Go exits 0 in each case: `--checkers 16` and `--checkers 32`
+/// give Go's output at `ulimit -v 1G` and `2G`. `--checkers 48` does at 2G,
+/// but at 1G a checker thread cannot start and the run then ends out of
+/// memory (exit 134). `--checkers 64` exits 70 ("cannot start a checker
+/// thread") at both.
 const LIMIT_SHARE: u64 = 64;
 
 /// The stack size of a thread that runs Go code: 1 GiB, or 1/64 of the
@@ -42,20 +47,28 @@ fn stack_size_for(limit: Option<u64>) -> usize {
     })
 }
 
-/// The smallest of the soft address space limit (RLIMIT_AS), the soft data
-/// limit (RLIMIT_DATA, which counts thread stacks too) and the address
-/// space of a 32-bit pointer. `None` when there is no limit.
+/// The smallest of `memory_limit` and the address space of a 32-bit
+/// pointer. `None` when there is no limit.
 fn address_space_limit() -> Option<u64> {
     // `None` on a 64-bit system.
     let pointer = 1u64.checked_shl(usize::BITS);
+    memory_limit().into_iter().chain(pointer).min()
+}
+
+/// The smaller of the soft address space limit (RLIMIT_AS) and the soft
+/// data limit (RLIMIT_DATA, which counts thread stacks too). `None` when
+/// neither is set, and off Unix.
+pub fn memory_limit() -> Option<u64> {
     #[cfg(unix)]
-    let rlimits = {
+    {
         use rustix::process::{Resource, getrlimit};
-        [Resource::As, Resource::Data].map(|resource| getrlimit(resource).current)
-    };
+        [Resource::As, Resource::Data]
+            .into_iter()
+            .filter_map(|resource| getrlimit(resource).current)
+            .min()
+    }
     #[cfg(not(unix))]
-    let rlimits: [Option<u64>; 0] = [];
-    rlimits.into_iter().chain([pointer]).flatten().min()
+    None
 }
 
 #[cfg(test)]
