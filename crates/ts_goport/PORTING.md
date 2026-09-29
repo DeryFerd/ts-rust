@@ -412,9 +412,13 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   `declarationDir`, no `node_modules` in them, no `preserveSymlinks`, no
   `outFile`). `noEmit`, `noEmitOnError`, `--singleThreaded`, a trace and
   `GOPORT_EARLY_EMIT=0` keep Go's order. `tsc -b`, watch, the plain
-  program and the goport bins do not start early. With the early start,
-  `--extendedDiagnostics` "Check time" is the wait for the check and "Emit
-  time" the wait for the rest of the emit after it.
+  program and the goport bins do not start early. With the early start
+  (and in `tsc -b`, which starts the check when it makes the program),
+  `--extendedDiagnostics` "Check time" is the time that `start_check`
+  spent on the affected files (`Program::take_started_check_time`) plus
+  the wait for the check, less the nested declaration emit time, as in Go.
+  "Emit time" is that nested emit time plus the wait for the rest of the
+  emit.
 - Transformers return factory (synthetic) SourceFiles. `source_file_info`
   and the printer's identifier set map one to the parsed file with the same
   path (Go `copyFrom`). `get_ecma_line_starts` caches its line map by node,

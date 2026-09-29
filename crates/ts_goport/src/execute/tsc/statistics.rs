@@ -21,7 +21,7 @@ struct Table {
 }
 
 impl Table {
-    // Go: execute/tsc/statistics.go:22 add
+    // Go: execute/tsc/statistics.go:24 add
     // PORT: Go `add` takes `any` and formats a `time.Duration` with
     // `formatDuration`. Durations use `add_duration` here.
     fn add(&mut self, name: &str, value: impl std::fmt::Display) {
@@ -35,7 +35,7 @@ impl Table {
         self.add(name, format_duration(value));
     }
 
-    // Go: execute/tsc/statistics.go:29 print
+    // Go: execute/tsc/statistics.go:31 print
     fn print(&self, w: &mut String) {
         let mut name_width = 0;
         let mut value_width = 0;
@@ -56,16 +56,16 @@ impl Table {
     }
 }
 
-// Go: execute/tsc/statistics.go:42 formatDuration
+// Go: execute/tsc/statistics.go:44 formatDuration
 fn format_duration(d: Duration) -> String {
     format!("{:.3}s", d.as_secs_f64())
 }
 
-// PORT: Go execute/tsc/statistics.go:46 `identifierCount` has no caller
+// PORT: Go execute/tsc/statistics.go:48 `identifierCount` has no caller
 // (`statisticsFromProgram` uses `Program.IdentifierCount`), so it is not
 // ported.
 
-// Go: execute/tsc/statistics.go:54 Statistics
+// Go: execute/tsc/statistics.go:56 Statistics
 #[derive(Clone, Debug, Default)]
 pub struct Statistics {
     is_aggregate: bool,
@@ -111,7 +111,7 @@ pub fn read_mem_stats() -> MemStats {
     MemStats { alloc, mallocs: 0 }
 }
 
-// Go: execute/tsc/statistics.go:70 statisticsFromProgram
+// Go: execute/tsc/statistics.go:72 statisticsFromProgram
 // PORT: Go reads the program and the compile times from `EmitInput`. The
 // program is the current program (`prog()`) here.
 #[must_use]
@@ -131,7 +131,7 @@ pub fn statistics_from_program(compile_times: &CompileTimes, mem_stats: &MemStat
 }
 
 impl Statistics {
-    // Go: execute/tsc/statistics.go:84 Report, the table part.
+    // Go: execute/tsc/statistics.go:86 Report, the table part.
     // PORT: this writes the table to a string. `report_to` is Go `Report`
     // with the writer and the `CommandLineTesting` hooks.
     pub fn report(&self, w: &mut String) {
@@ -237,7 +237,7 @@ impl Statistics {
         }
     }
 
-    // Go: execute/tsc/statistics.go:84 Report
+    // Go: execute/tsc/statistics.go:86 Report
     // PORT: testing. Go `defer testing.OnStatisticsEnd(w)` runs after the
     // table is written.
     pub fn report_to(&self, w: &Writer, testing: Option<Rc<dyn CommandLineTesting>>) {
@@ -252,7 +252,7 @@ impl Statistics {
         }
     }
 
-    // Go: execute/tsc/statistics.go:130 Aggregate
+    // Go: execute/tsc/statistics.go:155 Aggregate
     pub fn aggregate(&mut self, stat: &Statistics) {
         self.is_aggregate = true;
         let compile_times = self.compile_times.get_or_insert_with(CompileTimes::default);
@@ -278,7 +278,7 @@ impl Statistics {
         compile_times.changes_compute_time += stat_times.changes_compute_time;
     }
 
-    // Go: execute/tsc/statistics.go:155 SetTotalTime
+    // Go: execute/tsc/statistics.go:178 SetTotalTime
     pub fn set_total_time(&mut self, total_time: Duration) {
         self.compile_times
             .get_or_insert_with(CompileTimes::default)

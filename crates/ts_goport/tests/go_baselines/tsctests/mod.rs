@@ -1,7 +1,10 @@
+mod contentmapper_watch;
 mod showconfig;
 mod tsbuild_a;
 mod tsbuild_b;
+mod tsbuild_contentmapper;
 mod tsc_a;
 mod tsc_b;
+mod tsc_contentmapper;
 mod tscwatch;
 mod watcher_race;

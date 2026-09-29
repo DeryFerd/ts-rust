@@ -183,7 +183,7 @@ impl ParseConfigHost for SystemParseConfigHost<'_> {
     }
 }
 
-// Go: execute/tsc/compile.go:30 ExitStatus
+// Go: execute/tsc/compile.go:50 ExitStatus
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(i32)]
 pub enum ExitStatus {
@@ -232,14 +232,14 @@ pub trait Watcher {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
-// Go: execute/tsc/compile.go:45 CommandLineResult
+// Go: execute/tsc/compile.go:65 CommandLineResult
 #[derive(Default)]
 pub struct CommandLineResult {
     pub status: ExitStatus,
     pub watcher: Option<Box<dyn Watcher>>,
 }
 
-// Go: execute/tsc/compile.go:50 CommandLineTesting
+// Go: execute/tsc/compile.go:70 CommandLineTesting
 // PORT: testing. The Go test harness hook (tsctests/sys.go `TestSys`).
 // Every real run passes `None` (Go nil), so it takes the Go nil paths. Go
 // `io.Writer` is `Writer`. Go `*collections.SyncMap[tspath.Path,
@@ -280,7 +280,7 @@ pub struct CompileTimes {
     pub changes_compute_time: Duration,
 }
 
-// Go: execute/tsc/compile.go:76 CompileAndEmitResult
+// Go: execute/tsc/compile.go:110 CompileAndEmitResult
 // PORT: Go `*compiler.EmitResult` is never nil after `EmitFilesAndReportErrors`,
 // so it is a value here (`Default` for the Go zero result). Go `times` is a
 // pointer shared with the caller's `CompileTimes`.
@@ -292,7 +292,7 @@ pub struct CompileAndEmitResult {
     pub(crate) times: Rc<RefCell<CompileTimes>>,
 }
 
-// Go: cmd/tsgo/sys.go:17 osSys
+// Go: cmd/tsgo/sys.go:19 osSys
 // PORT: added here so the library and the bins share one system.
 pub struct OsSystem {
     writer: Writer,
@@ -302,7 +302,7 @@ pub struct OsSystem {
     start: std::time::Instant,
 }
 
-// Go: cmd/tsgo/sys.go:62 newSystem
+// Go: cmd/tsgo/sys.go:124 newSystem
 // PORT: Go exits with `ExitStatusInvalidProject_OutputsSkipped` when the
 // current directory cannot be read; this returns that status instead.
 pub fn new_os_system() -> Result<OsSystem, ExitStatus> {
@@ -348,24 +348,24 @@ impl System for OsSystem {
     fn error_writer(&self) -> ErrorWriter {
         Arc::new(Mutex::new(GoErrorOutput))
     }
-    // Go: cmd/tsgo/sys.go:33 FS
+    // Go: cmd/tsgo/sys.go:35 FS
     fn fs(&self) -> Rc<dyn Fs> {
         self.fs.clone()
     }
-    // Go: cmd/tsgo/sys.go:37 DefaultLibraryPath
+    // Go: cmd/tsgo/sys.go:39 DefaultLibraryPath
     fn default_library_path(&self) -> String {
         self.default_library_path.clone()
     }
-    // Go: cmd/tsgo/sys.go:41 GetCurrentDirectory
+    // Go: cmd/tsgo/sys.go:43 GetCurrentDirectory
     fn get_current_directory(&self) -> String {
         self.cwd.clone()
     }
-    // Go: cmd/tsgo/sys.go:49 WriteOutputIsTTY
+    // Go: cmd/tsgo/sys.go:55 WriteOutputIsTTY
     fn write_output_is_tty(&self) -> bool {
         use std::io::IsTerminal;
         std::io::stdout().is_terminal()
     }
-    // Go: cmd/tsgo/sys.go:53 GetWidthOfTerminal
+    // Go: cmd/tsgo/sys.go:59 GetWidthOfTerminal
     // Go `term.GetSize(int(os.Stdout.Fd()))` is the TIOCGWINSZ ioctl on
     // stdout, and gives width 0 on error (golang.org/x/term v0.44.0
     // term_unix.go:59 getSize).
@@ -391,11 +391,11 @@ impl System for OsSystem {
     ) -> Result<Arc<dyn ProcessExitState>, GoError> {
         spawn_process(command, dir, stderr)
     }
-    // Go: cmd/tsgo/sys.go:29 Now
+    // Go: cmd/tsgo/sys.go:31 Now
     fn now(&self) -> SystemTime {
         SystemTime::now()
     }
-    // Go: cmd/tsgo/sys.go:25 SinceStart
+    // Go: cmd/tsgo/sys.go:27 SinceStart
     fn since_start(&self) -> Duration {
         self.start.elapsed()
     }
@@ -415,7 +415,8 @@ const CHILD_PROCESS_WAIT_DELAY: Duration = Duration::from_secs(1);
 // closes the parent ends while the connection may still read and the
 // stderr copy may still run, and a socket `shutdown` ends those blocked
 // calls in safe Rust. Go `stderr` `io.Discard` is `None` (the null device
-// here). Go `cmd.Env` nil and the argv[0] of the name are kept.
+// here). Go `cmd.Env` nil and the argv[0] of the name are kept. With a
+// `dir`, Go's `Cmd.environ` adds `PWD=` its absolute path, and so does this.
 pub fn spawn_process(
     command: &[String],
     dir: &str,
@@ -437,6 +438,14 @@ pub fn spawn_process(
     } else {
         look_path(name)?
     };
+    // Go os/exec/exec.go `(*Cmd).environ`, called by `Start` before the
+    // process starts: when `Dir` is set, the child's `PWD` is
+    // `filepath.Abs(Dir)`, and an `Abs` error ends `Start`.
+    let pwd = if dir.is_empty() {
+        None
+    } else {
+        Some(go_abs(dir)?)
+    };
     // Go os/exec_posix.go startProcess: the `Dir` check with op "chdir".
     if !dir.is_empty()
         && let Err(err) = std::fs::metadata(dir)
@@ -451,8 +460,9 @@ pub fn spawn_process(
     let (stdout, child_stdout) = UnixStream::pair().map_err(io_error)?;
     let mut cmd = Command::new(&program);
     cmd.arg0(name).args(&command[1..]);
-    if !dir.is_empty() {
+    if let Some(pwd) = pwd {
         cmd.current_dir(dir);
+        cmd.env("PWD", pwd);
     }
     cmd.stdin(Stdio::from(OwnedFd::from(child_stdin)));
     cmd.stdout(Stdio::from(OwnedFd::from(child_stdout)));
@@ -636,6 +646,34 @@ fn find_executable(file: &str) -> bool {
         Err(Errno::NOSYS | Errno::PERM) => metadata.permissions().mode() & 0o111 != 0,
         Err(_) => false,
     }
+}
+
+/// Go `filepath.Abs(path)` on Unix (path/filepath/path_unix.go `unixAbs`).
+fn go_abs(path: &str) -> Result<String, GoError> {
+    if path.starts_with('/') {
+        return Ok(go_path_clean(path));
+    }
+    let wd = go_getwd()?;
+    Ok(go_path_clean(&format!("{wd}/{path}")))
+}
+
+/// Go `os.Getwd()` on Unix (os/getwd.go): `$PWD` when it is absolute and
+/// names the current directory, else the `getcwd` result.
+fn go_getwd() -> Result<String, GoError> {
+    use std::os::unix::fs::MetadataExt;
+    let dot = std::fs::metadata(".")
+        .map_err(|err| crate::gostd::errors::new(format!("stat .: {}", go_errno_text(&err))))?;
+    if let Ok(dir) = std::env::var("PWD")
+        && dir.starts_with('/')
+        && let Ok(d) = std::fs::metadata(&dir)
+        && d.dev() == dot.dev()
+        && d.ino() == dot.ino()
+    {
+        return Ok(dir);
+    }
+    std::env::current_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .map_err(|err| crate::gostd::errors::new(format!("getwd: {}", go_errno_text(&err))))
 }
 
 /// Go `path.Clean` (the Unix `filepath.Clean`).

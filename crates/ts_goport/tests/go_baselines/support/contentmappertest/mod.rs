@@ -32,9 +32,9 @@ mod synthesizing;
 mod transforming;
 mod verbatim;
 
-// The re-exports keep the whole exported API of the Go package. The tests
-// that use the rest of it (tsc, project, LSP) are ported later, so
-// `unused_imports` is allowed on the items that no test uses yet.
+// The re-exports keep the whole exported API of the Go package. Some items
+// have no user in the ported tests, so `unused_imports` is allowed on the
+// lines that hold them.
 #[allow(unused_imports)]
 pub use dynamic_verbatim::ProjectLifecycle;
 pub use manifest::{PACKAGE_NAME, package_json};

@@ -705,3 +705,40 @@ pub fn ast_diag_to_build_info_diag(d: &Diagnostic) -> BuildInfoDiagnosticWithFil
     }
     b
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go: incremental/external_diagnostic_test.go:14 TestExternalDiagnosticBuildInfoRoundTrip (tsgo#4712)
+    // PORT: Go `toDiagnostic(nil, file)` has no program argument here.
+    #[test]
+    fn test_external_diagnostic_build_info_round_trip() {
+        let file = parse_source_file(
+            &SourceFileParseOptions {
+                file_name: "/app.vue".to_string(),
+                path: Path("/app.vue".to_string()),
+                ..Default::default()
+            },
+            "",
+            ScriptKind::TS,
+        )
+        .root;
+        let diagnostic = crate::ast::new_external_diagnostic(
+            file,
+            TextRange::new(1, 2),
+            "vue",
+            crate::diagnostics::Category::Warning,
+            1001,
+            "mapper warning",
+        );
+
+        let serialized = ast_diag_to_build_info_diag(&diagnostic);
+        assert_eq!(serialized.source, "vue");
+        assert_eq!(serialized.message_text, "mapper warning");
+
+        let restored = serialized.to_diagnostic(file);
+        assert_eq!(restored.source(), "vue");
+        assert_eq!(restored.localize(&crate::locale::DEFAULT), "mapper warning");
+    }
+}

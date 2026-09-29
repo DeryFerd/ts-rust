@@ -1,8 +1,9 @@
 //! Rust ports of the Go compiler, emit and language service unit tests
 //! (sub-track S3): ast, scanner, parser, sourcemap, module,
-//! modulespecifiers, outputpaths, compiler, checker, execute/build, execute/tsc, printer,
-//! transformers/tstransforms, ls, ls/lsconv and ls/lsutil, with the Go test
-//! helpers testutil/parsetestutil and testutil/emittestutil.
+//! modulespecifiers, outputpaths, compiler, checker, execute/build,
+//! execute/incremental, execute/tsc, printer, transformers/tstransforms, ls,
+//! ls/lsconv and ls/lsutil, with the Go test helpers testutil/parsetestutil
+//! and testutil/emittestutil.
 //!
 //! Expected values are the Go test literals. A test that shows a port bug
 //! has `#[ignore = "bug: S3-NNN ..."]`; the bug is in
@@ -20,6 +21,7 @@
 //! override are process-wide in the port.
 
 mod ast_tests;
+mod buildinfo_contentmapper_tests;
 mod checkerpool_tests;
 mod childprog;
 mod emittestutil;
