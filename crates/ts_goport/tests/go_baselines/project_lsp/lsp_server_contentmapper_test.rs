@@ -243,6 +243,18 @@ child_test! {
                     Some("**/*.vue")
                 );
             }
+            // ts#63951
+            if registration.id == "content-mapper-code-action" {
+                let options = registration
+                    .register_options
+                    .as_ref()
+                    .and_then(|options| options.text_document_code_action.as_ref())
+                    .expect("expected textDocument/codeAction register options");
+                assert_eq!(
+                    options.code_action_kinds.clone().expect("code action kinds"),
+                    super::lsp_server_projectinfo_test::expected_code_action_kinds()
+                );
+            }
             if registration.id == "content-mapper-semantic-tokens" {
                 let options = registration
                     .register_options
