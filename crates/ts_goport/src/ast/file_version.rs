@@ -79,6 +79,8 @@ pub struct FileVersion {
     /// Go `SourceFile.declarationMap`
     /// (`ast::source_file_get_declaration_map`).
     pub(crate) declaration_map: OnceLock<FxHashMap<String, Vec<Node>>>,
+    /// Go `SourceFile.identifiers` (`ast::source_file_has_identifier`).
+    pub(crate) identifiers: OnceLock<FxHashSet<&'static str>>,
 }
 
 impl std::fmt::Debug for FileVersion {
@@ -100,6 +102,7 @@ impl FileVersion {
             name_table: OnceLock::new(),
             position_map: OnceLock::new(),
             declaration_map: OnceLock::new(),
+            identifiers: OnceLock::new(),
         });
         lock(&VERSIONS).insert(file, Arc::downgrade(&version));
         MADE.fetch_add(1, Ordering::Relaxed);

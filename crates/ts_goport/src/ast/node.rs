@@ -5922,13 +5922,20 @@ pub fn source_file_is_content_mapper_supplemental(file: Node) -> bool {
 
 // Go: ast.go:2687 (*SourceFile).HasIdentifier
 // PORT: Go `identifiersOnce` is a per-thread cache (`IDENTIFIER_SETS`) for a
-// parsed file, whose id is never reused. A factory SourceFile collects its
-// set on each call, because a released program frees its synthetic nodes
-// and a later node can get the same handle.
+// parsed file, whose id is never reused. A freeable file version keeps its
+// set, which is freed with it (lsshells M3). A factory SourceFile collects
+// its set on each call, because a released program frees its synthetic
+// nodes and a later node can get the same handle.
 #[must_use]
 pub fn source_file_has_identifier(file: Node, name: &str) -> bool {
     if is_synthetic_node(file) {
         return collect_identifiers_for_source_file(file).contains(name);
+    }
+    if let Some(version) = file_version_of(file) {
+        return version
+            .identifiers
+            .get_or_init(|| collect_identifiers_for_source_file(file))
+            .contains(name);
     }
     if let Some(identifiers) = IDENTIFIER_SETS.with(|c| c.borrow().get(&file).copied()) {
         return identifiers.contains(name);
