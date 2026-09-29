@@ -71,7 +71,8 @@ pub const HEADER_OFFSET_NODES: usize = 40;
 pub const HEADER_SIZE: usize = 44;
 
 // Go: api/encoder/encoder.go:66 ProtocolVersion
-pub const PROTOCOL_VERSION: u8 = 7;
+// ts#63957: 7 -> 8.
+pub const PROTOCOL_VERSION: u8 = 8;
 
 // Source File Binary Format
 // =========================
@@ -209,7 +210,8 @@ pub const PROTOCOL_VERSION: u8 = 7;
 // NodeLists are represented as normal nodes with the special `kind` value `0xff_ff_ff_ff`. They are considered the parent
 // of their contents in the encoded format. A client reconstructing an AST similar to TypeScript's internal representation
 // should instead set the `parent` pointers of a NodeList's children to the NodeList's parent. A NodeList's `data` field
-// is the uint32 length of the list, and does not use one of the data types described below.
+// is the uint32 length of the list, and does not use one of the data types described below. A NodeList's `flags` field
+// is not used for AST node flags (NodeLists have none); bit 0 instead encodes `HasTrailingComma`.
 //
 // For node types other than NodeList, the node data field encodes one of the following, determined by the first 2 bits of
 // the field:
@@ -778,7 +780,8 @@ fn encode_tree(
                     0,
                     st.parent_index,
                     node_list.nodes().len() as u32,
-                    0,
+                    // ts#63957
+                    u32::from(bool_to_byte(node_list.has_trailing_comma())),
                 ];
                 append_uint32s(&mut st.nodes, &values);
 

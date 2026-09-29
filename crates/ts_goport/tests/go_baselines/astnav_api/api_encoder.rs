@@ -100,8 +100,8 @@ fn test_encode_source_file() {
 #[test]
 fn test_encode_content_mapper_source_file_metadata() {
     assert_eq!(
-        PROTOCOL_VERSION, 7,
-        "protocol version = {PROTOCOL_VERSION}, want 7"
+        PROTOCOL_VERSION, 8,
+        "protocol version = {PROTOCOL_VERSION}, want 8"
     );
     let file = Rc::new(parser::parse_source_file(
         &SourceFileParseOptions {
