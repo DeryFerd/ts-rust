@@ -5,12 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ts_ast = { path = "../ts_ast" }
-ts_core = { path = "../ts_core" }
-ts_diagnostics = { path = "../ts_diagnostics" }
-ts_jsnum = { path = "../ts_jsnum" }
-ts_scanner = { path = "../ts_scanner" }
-ts_path = { path = "../ts_path" }
 # Parts of this crate built as their own crates. Their files stay in src/
 # (see src/goport_util_root.rs and src/goport_lsproto_root.rs).
 goport_lsproto = { path = "parts/goport_lsproto" }

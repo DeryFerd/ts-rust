@@ -1,4 +1,6 @@
-//! TypeScript diagnostic messages and rendered diagnostic instances.
+//! TypeScript diagnostic messages and rendered diagnostic instances. This
+//! was the `ts_diagnostics` crate; `catalog.rs` comes from
+//! `tools/ts_diagnostics_codegen`.
 
 mod catalog;
 

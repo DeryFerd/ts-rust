@@ -702,7 +702,7 @@ impl project::Client for Server {
 
     // Go: server.go:352 ProgressStart
     // ProgressStart implements project.Client.
-    fn progress_start(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    fn progress_start(&self, message: &'static crate::diagnostics::Message, args: Vec<String>) {
         if let Some(project_progress) = self.shared.project_progress.get() {
             project_progress.start(message, args);
         }
@@ -710,7 +710,7 @@ impl project::Client for Server {
 
     // Go: server.go:359 ProgressFinish
     // ProgressFinish implements project.Client.
-    fn progress_finish(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    fn progress_finish(&self, message: &'static crate::diagnostics::Message, args: Vec<String>) {
         if let Some(project_progress) = self.shared.project_progress.get() {
             project_progress.finish(message, args);
         }

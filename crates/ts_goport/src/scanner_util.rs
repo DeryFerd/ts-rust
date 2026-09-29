@@ -4,15 +4,16 @@
 //! `stringutil/identifier.go`, `stringutil/js_case.go` (plus the generated
 //! Unicode tables at the end of this file) and a few `core/core.go` helpers.
 //!
-//! Full tokenization (Go `Scanner.Scan`) is delegated to crate `ts_scanner`
-//! through the Go-shaped [`RsScanner`] wrapper below.
+//! Full tokenization (Go `Scanner.Scan`) uses the Go scanner port
+//! (`frontend::scanner::Scanner`), through
+//! `frontend::scanner::scanner_ls::get_scanner_for_source_file`.
 //!
 //! Go `rune` ports to `char` where the value is a real code point. Go strings
 //! that hold WTF-8 lone-surrogate sentinels cannot exist in a Rust `&str`, so
 //! the surrogate helpers take `u32` code points.
 
+use crate::frontend::scanner::scanner_ls::get_scanner_for_source_file;
 use crate::prelude::*;
-use std::borrow::Cow;
 
 // ---------------------------------------------------------------------------
 // Go `unicode/utf8` helpers (private).
@@ -647,11 +648,6 @@ pub fn compare_booleans(a: bool, b: bool) -> i32 {
 // scanner/scanner.go
 // ---------------------------------------------------------------------------
 
-/// Go `ErrorCallback func(diagnostic *diagnostics.Message, start, length int, args ...any)`.
-// PORT: `ts_scanner` reports finished diagnostics without their format
-// arguments, so the callback gets no args.
-pub type RsErrorCallback = Box<dyn FnMut(&'static ts_diagnostics::Message, i32, i32)>;
-
 /// Go `textToKeyword` map, in Go source order.
 static TEXT_TO_KEYWORD: &[(&str, SyntaxKind)] = &[
     ("abstract", SyntaxKind::AbstractKeyword),
@@ -1064,7 +1060,7 @@ pub(crate) fn is_conflict_marker_trivia(text: &str, pos: usize) -> bool {
 pub(crate) fn scan_conflict_marker_trivia(
     text: &str,
     pos: usize,
-    report_error: Option<&mut dyn FnMut(&'static ts_diagnostics::Message, i32, i32)>,
+    report_error: Option<&mut dyn FnMut(&'static crate::diagnostics::Message, i32, i32)>,
 ) -> usize {
     if let Some(report_error) = report_error {
         report_error(
@@ -1142,326 +1138,16 @@ pub fn get_shebang(text: &str) -> String {
     text[..end].to_string()
 }
 
-/// Go `scanner.Scanner`, reduced to the API the checker and binder use.
-/// Tokenization is delegated to `ts_scanner::Scanner`. Each `scan` builds a
-/// short-lived `ts_scanner::Scanner` over `text`, restores the saved
-/// checkpoint (or the reset position), scans one token and copies the Go
-/// `ScannerState` fields out of it.
-// PORT: `ts_scanner` has no script target and no JSDoc asterisk state for
-// these callers; `script_target` is stored for Go parity only.
-pub struct RsScanner {
-    text: Cow<'static, str>,
-    language_variant: LanguageVariant,
-    script_target: ScriptTarget,
-    on_error: Option<RsErrorCallback>,
-    skip_trivia: bool,
-    // Go ScannerState.
-    pos: i32,
-    full_start_pos: i32,
-    token_start: i32,
-    token: SyntaxKind,
-    token_value: String,
-    token_flags: TokenFlags,
-    /// The `ts_scanner` state after the last scan. `None` after a reset.
-    checkpoint: Option<ts_scanner::ScannerCheckpoint>,
-}
-
-// Go: scanner/scanner.go:218 defaultScanner
-fn default_scanner() -> RsScanner {
-    RsScanner {
-        text: Cow::Borrowed(""),
-        language_variant: LanguageVariant::STANDARD,
-        script_target: ScriptTarget::NONE,
-        on_error: None,
-        skip_trivia: true,
-        pos: 0,
-        full_start_pos: 0,
-        token_start: 0,
-        token: SyntaxKind::Unknown,
-        token_value: String::new(),
-        token_flags: TokenFlags::NONE,
-        checkpoint: None,
-    }
-}
-
-// Go: scanner/scanner.go:225 NewScanner
-pub fn rs_new_scanner() -> RsScanner {
-    default_scanner()
-}
-
-/// Maps `ts_scanner` token flags (same bit layout as Go) to Go `ast.TokenFlags`.
-fn go_token_flags(flags: ts_scanner::TokenFlags) -> TokenFlags {
-    use ts_scanner::TokenFlags as T;
-    let pairs = [
-        (T::PRECEDING_LINE_BREAK, TokenFlags::PRECEDING_LINE_BREAK),
-        (
-            T::PRECEDING_JSDOC_COMMENT,
-            TokenFlags::PRECEDING_JS_DOC_COMMENT,
-        ),
-        (T::UNTERMINATED, TokenFlags::UNTERMINATED),
-        (
-            T::EXTENDED_UNICODE_ESCAPE,
-            TokenFlags::EXTENDED_UNICODE_ESCAPE,
-        ),
-        (T::SCIENTIFIC, TokenFlags::SCIENTIFIC),
-        (T::OCTAL, TokenFlags::OCTAL),
-        (T::HEX_SPECIFIER, TokenFlags::HEX_SPECIFIER),
-        (T::BINARY_SPECIFIER, TokenFlags::BINARY_SPECIFIER),
-        (T::OCTAL_SPECIFIER, TokenFlags::OCTAL_SPECIFIER),
-        (T::CONTAINS_SEPARATOR, TokenFlags::CONTAINS_SEPARATOR),
-        (T::UNICODE_ESCAPE, TokenFlags::UNICODE_ESCAPE),
-        (
-            T::CONTAINS_INVALID_ESCAPE,
-            TokenFlags::CONTAINS_INVALID_ESCAPE,
-        ),
-        (T::HEX_ESCAPE, TokenFlags::HEX_ESCAPE),
-        (T::CONTAINS_LEADING_ZERO, TokenFlags::CONTAINS_LEADING_ZERO),
-        (
-            T::CONTAINS_INVALID_SEPARATOR,
-            TokenFlags::CONTAINS_INVALID_SEPARATOR,
-        ),
-        (
-            T::PRECEDING_JSDOC_LEADING_ASTERISKS,
-            TokenFlags::PRECEDING_JS_DOC_LEADING_ASTERISKS,
-        ),
-        (T::SINGLE_QUOTE, TokenFlags::SINGLE_QUOTE),
-        (
-            T::PRECEDING_JSDOC_WITH_DEPRECATED,
-            TokenFlags::PRECEDING_JS_DOC_WITH_DEPRECATED,
-        ),
-        (
-            T::PRECEDING_JSDOC_WITH_SEE_OR_LINK,
-            TokenFlags::PRECEDING_JS_DOC_WITH_SEE_OR_LINK,
-        ),
-    ];
-    let mut result = TokenFlags::NONE;
-    for (from, to) in pairs {
-        if flags.contains(from) {
-            result |= to;
-        }
-    }
-    result
-}
-
-impl RsScanner {
-    // Go: scanner/scanner.go:245 Text
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    // Go: scanner/scanner.go:249 Token
-    pub fn token(&self) -> SyntaxKind {
-        self.token
-    }
-
-    // Go: scanner/scanner.go:253 TokenFlags
-    pub fn token_flags(&self) -> TokenFlags {
-        self.token_flags
-    }
-
-    // Go: scanner/scanner.go:257 TokenFullStart
-    pub fn token_full_start(&self) -> i32 {
-        self.full_start_pos
-    }
-
-    // Go: scanner/scanner.go:261 TokenStart
-    pub fn token_start(&self) -> i32 {
-        self.token_start
-    }
-
-    // Go: scanner/scanner.go:265 TokenEnd
-    pub fn token_end(&self) -> i32 {
-        self.pos
-    }
-
-    // Go: scanner/scanner.go:269 TokenText
-    pub fn token_text(&self) -> &str {
-        &self.text[self.token_start as usize..self.pos as usize]
-    }
-
-    // Go: scanner/scanner.go:273 TokenValue
-    pub fn token_value(&self) -> &str {
-        &self.token_value
-    }
-
-    // Go: scanner/scanner.go:277 TokenRange
-    pub fn token_range(&self) -> TextRange {
-        TextRange::new(self.token_start, self.pos)
-    }
-
-    // Go: scanner/scanner.go:293 ResetPos
-    pub fn reset_pos(&mut self, pos: i32) {
-        assert!(pos >= 0, "Cannot reset token state to negative position");
-        self.pos = pos;
-        self.full_start_pos = pos;
-        self.token_start = pos;
-        self.checkpoint = None;
-    }
-
-    // Go: scanner/scanner.go:302 ResetTokenState
-    pub fn reset_token_state(&mut self, pos: i32) {
-        self.reset_pos(pos);
-        self.token = SyntaxKind::Unknown;
-        self.token_value = String::new();
-        self.token_flags = TokenFlags::NONE;
-    }
-
-    // Go: scanner/scanner.go:317 SetSkipTrivia
-    pub fn set_skip_trivia(&mut self, skip: bool) {
-        self.skip_trivia = skip;
-    }
-
-    // Go: scanner/scanner.go:396 SetText
-    pub fn set_text(&mut self, text: impl Into<Cow<'static, str>>) {
-        self.text = text.into();
-        self.pos = 0;
-        self.full_start_pos = 0;
-        self.token_start = 0;
-        self.token = SyntaxKind::Unknown;
-        self.token_value = String::new();
-        self.token_flags = TokenFlags::NONE;
-        self.checkpoint = None;
-    }
-
-    // Go: scanner/scanner.go:402 SetOnError
-    pub fn set_on_error(&mut self, error_callback: Option<RsErrorCallback>) {
-        self.on_error = error_callback;
-    }
-
-    // Go: scanner/scanner.go:406 SetLanguageVariant
-    pub fn set_language_variant(&mut self, language_variant: LanguageVariant) {
-        self.language_variant = language_variant;
-    }
-
-    // Go: scanner/scanner.go:410 SetScriptTarget
-    pub fn set_script_target(&mut self, script_target: ScriptTarget) {
-        self.script_target = script_target;
-    }
-
-    // Go: scanner/scanner.go:414 languageVersion
-    #[allow(dead_code)]
-    fn language_version(&self) -> ScriptTarget {
-        if self.script_target == ScriptTarget::NONE {
-            return ScriptTarget::LATEST;
-        }
-        self.script_target
-    }
-
-    // Go: scanner/scanner.go:481 Scan
-    // PORT: delegates to `ts_scanner::Scanner::scan`. Diagnostics go to
-    // `on_error` with their start and length; format args are not available.
-    // Go leaves `tokenValue` stale for tokens without a value; this port
-    // clears it.
-    pub fn scan(&mut self) -> SyntaxKind {
-        self.run_inner(|inner| inner.scan())
-    }
-
-    // Go: scanner/scanner.go:1079 ReScanSlashToken
-    // PORT: delegates to `ts_scanner`. With `report_errors`, the checker's
-    // quantifier-bound checks run and their diagnostics go to `on_error`.
-    pub fn re_scan_slash_token(&mut self, report_errors: bool) -> SyntaxKind {
-        if self.token != SyntaxKind::SlashToken && self.token != SyntaxKind::SlashEqualsToken {
-            return self.token;
-        }
-        if self.checkpoint.is_none() {
-            // Restore the inner state of the current token by scanning it again.
-            let start = self.full_start_pos;
-            self.reset_pos(start);
-            self.scan();
-        }
-        self.run_inner(|inner| {
-            if report_errors {
-                inner.rescan_slash_token_with_quantifier_checks()
-            } else {
-                inner.rescan_slash_token()
-            }
-        })
-    }
-
-    /// Restores the `ts_scanner` state, runs `op` for one token and copies the
-    /// Go `ScannerState` fields and diagnostics out of it.
-    fn run_inner(
-        &mut self,
-        op: impl for<'x> FnOnce(&mut ts_scanner::Scanner<'x>) -> ts_scanner::Token<'x>,
-    ) -> SyntaxKind {
-        let mut inner = ts_scanner::Scanner::new(&self.text);
-        inner.set_skip_trivia(self.skip_trivia);
-        inner.set_language_variant(if self.language_variant == LanguageVariant::JSX {
-            ts_scanner::LanguageVariant::Jsx
-        } else {
-            ts_scanner::LanguageVariant::Standard
-        });
-        match self.checkpoint.take() {
-            Some(checkpoint) => inner.rewind(checkpoint),
-            None => inner.reset_pos(self.pos as usize),
-        }
-        let token = op(&mut inner);
-        self.full_start_pos = token.full_start.get() as i32;
-        self.token_start = token.range.start.get() as i32;
-        self.pos = token.range.end.get() as i32;
-        self.token = token.kind;
-        self.token_value = token
-            .value
-            .as_ref()
-            .map(js_string_to_token_value)
-            .unwrap_or_default();
-        self.token_flags = go_token_flags(token.flags);
-        let checkpoint = inner.mark();
-        // Go: scanner/scanner.go:425 errorAt calls onError only when it is set.
-        // PORT: Go passes the `*diagnostics.Message` itself. ts_scanner gives
-        // the catalog code instead. Every ts_scanner diagnostic has one:
-        // `Scanner::error` maps each message it reports to its code and
-        // `Scanner::error_with_code` takes the code, and both look the code
-        // up in the catalog when they report it. So both lookups here hold.
-        let diagnostics: Vec<(&'static ts_diagnostics::Message, i32, i32)> =
-            if self.on_error.is_some() {
-                inner
-                    .diagnostics()
-                    .iter()
-                    .map(|d| {
-                        let code = d
-                            .code
-                            .expect("ts_scanner reports every diagnostic with a code");
-                        let message = ts_diagnostics::message_by_code(code)
-                            .expect("ts_scanner diagnostic codes are in the catalog");
-                        let start = d.range.start.get() as i32;
-                        (message, start, d.range.end.get() as i32 - start)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        drop(inner);
-        self.checkpoint = Some(checkpoint);
-        if let Some(on_error) = self.on_error.as_mut() {
-            for (message, start, length) in diagnostics {
-                on_error(message, start, length);
-            }
-        }
-        self.token
-    }
-}
-
-// Go: scanner/scanner.go:2519 GetScannerForSourceFile
-pub fn get_scanner_for_source_file(source_file: Node, pos: i32) -> RsScanner {
-    let mut s = rs_new_scanner();
-    s.text = Cow::Borrowed(source_file_text(source_file));
-    s.pos = pos;
-    s.language_variant = source_file_info(source_file).language_variant;
-    s.scan();
-    s
-}
-
 // Go: scanner/scanner.go:2529 ScanTokenAtPosition
 pub fn scan_token_at_position(source_file: Node, pos: i32) -> SyntaxKind {
     let s = get_scanner_for_source_file(source_file, pos);
-    s.token
+    s.token()
 }
 
 // Go: scanner/scanner.go:2534 GetRangeOfTokenAtPosition
 pub fn get_range_of_token_at_position(source_file: Node, pos: i32) -> TextRange {
     let s = get_scanner_for_source_file(source_file, pos);
-    TextRange::new(s.token_start, s.pos)
+    TextRange::new(s.token_start(), s.token_end())
 }
 
 // Go: scanner/scanner.go:2539 GetTokenPosOfNode

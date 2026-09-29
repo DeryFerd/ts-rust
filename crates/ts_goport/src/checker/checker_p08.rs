@@ -126,7 +126,7 @@ impl Checker {
         t: TypeId,
         allow_async_iterables: bool,
     ) -> Diagnostic {
-        let message: &'static ts_diagnostics::Message = if allow_async_iterables {
+        let message: &'static crate::diagnostics::Message = if allow_async_iterables {
             diag::Type_0_must_have_a_Symbol_asyncIterator_method_that_returns_an_async_iterator
         } else {
             diag::Type_0_must_have_a_Symbol_iterator_method_that_returns_an_iterator
@@ -159,7 +159,7 @@ impl Checker {
         use_: IterationUse,
         input_type: TypeId,
         allows_strings: bool,
-    ) -> (&'static ts_diagnostics::Message, bool) {
+    ) -> (&'static crate::diagnostics::Message, bool) {
         let yield_type = self.get_iteration_type_of_iterable(
             use_,
             IterationTypeKind::YIELD,
@@ -348,7 +348,7 @@ impl Checker {
                                 node.name().is_some(),
                                 "An ImportClause with a symbol should have a name"
                             );
-                            let message: &'static ts_diagnostics::Message = if self
+                            let message: &'static crate::diagnostics::Message = if self
                                 .compiler_options
                                 .verbatim_module_syntax
                                 .is_true()
@@ -559,7 +559,7 @@ impl Checker {
     pub fn check_type_name_is_reserved(
         &mut self,
         name: Node,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
     ) {
         // TS 1.0 spec (April 2014): 3.6.1
         // The predefined type keywords are reserved and cannot be used as names of user defined types.
@@ -873,7 +873,7 @@ impl Checker {
                 self.add_diagnostic(diagnostic);
             } else {
                 let mut suggestion = diagnostic.clone();
-                suggestion.set_category(ts_diagnostics::Category::Suggestion);
+                suggestion.set_category(crate::diagnostics::Category::Suggestion);
                 self.add_suggestion_diagnostic(suggestion);
             }
         }

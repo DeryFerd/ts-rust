@@ -413,7 +413,7 @@ impl Checker {
             let ia = self.ty(t).as_indexed_access_type();
             (ia.index_type, ia.object_type)
         };
-        let zero = self.get_number_literal_type(ts_jsnum::Number::new(0.0));
+        let zero = self.get_number_literal_type(crate::jsnum::Number::new(0.0));
         let tuple = self.create_tuple_type(&[replacement]);
         let mapper = self.new_type_mapper(&[index_type, object_type], &[zero, tuple]);
         self.instantiate_type(instantiable, mapper)

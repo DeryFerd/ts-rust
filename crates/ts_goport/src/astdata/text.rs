@@ -1,4 +1,5 @@
-//! Shared compiler primitives.
+//! Shared compiler primitives (`TextRange`, `JsString`, `SourceText`). This
+//! was the `ts_core` crate.
 
 use std::{fmt, ops::Range, sync::Arc};
 

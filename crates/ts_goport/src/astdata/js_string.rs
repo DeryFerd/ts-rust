@@ -1,4 +1,4 @@
-use ts_core::JsString;
+use crate::astdata::text::JsString;
 
 const ESCAPE: char = '\u{10fffd}';
 const SURROGATE_PAYLOAD_START: u32 = 0xe000;
@@ -82,7 +82,7 @@ pub fn append_js_string(target: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use ts_core::JsString;
+    use crate::astdata::text::JsString;
 
     use super::{
         ESCAPE, append_js_string, decode_js_string, encode_js_string, normalize_js_string,

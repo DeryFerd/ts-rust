@@ -15,8 +15,8 @@
 //!   `Option<&mut Vec<SignatureId>>`.
 //! - Go `c.addDeferredDiagnostic(func())` takes `Rc<dyn Fn(&mut Checker)>`.
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 impl Checker {
     // Go: checker/checker.go:5715 hasExportedMembersOfKind

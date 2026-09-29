@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 // Go: lsp/progress.go:13 progressEvent
 pub struct ProgressEvent {
-    pub message: &'static ts_diagnostics::Message,
+    pub message: &'static crate::diagnostics::Message,
     pub args: Vec<String>,
     pub finish: bool,
 }
@@ -28,7 +28,7 @@ pub trait ProgressReporter: Send + Sync {
     // PORT: `None` is Go's nil channel (never closed).
     fn done(&self) -> Option<Done>;
     // localize converts a diagnostic message to a display string.
-    fn localize(&self, msg: &'static ts_diagnostics::Message, args: Vec<String>) -> String;
+    fn localize(&self, msg: &'static crate::diagnostics::Message, args: Vec<String>) -> String;
     // createWorkDoneProgress asks the client to create a progress token.
     fn create_work_done_progress(&self, token: &str);
     // sendProgress sends a $/progress notification.
@@ -48,7 +48,7 @@ impl ProgressReporter for ServerProgressReporter {
     }
 
     // Go: lsp/progress.go:42 serverProgressReporter.localize
-    fn localize(&self, msg: &'static ts_diagnostics::Message, args: Vec<String>) -> String {
+    fn localize(&self, msg: &'static crate::diagnostics::Message, args: Vec<String>) -> String {
         crate::diagnostics_loc::message_localize(msg, &self.server.locale(), &args)
     }
 
@@ -141,7 +141,7 @@ pub fn new_project_loading_progress_from_reporter(
 
 impl ProjectLoadingProgress {
     // Go: lsp/progress.go:90 start
-    pub fn start(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    pub fn start(&self, message: &'static crate::diagnostics::Message, args: Vec<String>) {
         self.send_or_drop(ProgressEvent {
             message,
             args,
@@ -150,7 +150,7 @@ impl ProjectLoadingProgress {
     }
 
     // Go: lsp/progress.go:99 finish
-    pub fn finish(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    pub fn finish(&self, message: &'static crate::diagnostics::Message, args: Vec<String>) {
         self.send_or_drop(ProgressEvent {
             message,
             args,

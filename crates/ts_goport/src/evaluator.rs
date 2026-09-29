@@ -1,8 +1,8 @@
 //! Port of Go package `evaluator` (`internal/evaluator/evaluator.go`).
 //! Constant evaluation of enum member initializers and template literal types.
 
+use crate::jsnum::{Number, PseudoBigInt};
 use crate::prelude::*;
-use ts_jsnum::{Number, PseudoBigInt};
 
 // PORT: Go `evaluator.Result` is named `EvaluatorResult` here. A type named
 // `Result` would be glob-exported through the prelude and shadow
@@ -214,7 +214,7 @@ fn evaluate_expression(
         }
         SyntaxKind::NumericLiteral => {
             return new_result(
-                Some(LiteralValue::Number(ts_jsnum::from_string(expr.text()))),
+                Some(LiteralValue::Number(crate::jsnum::from_string(expr.text()))),
                 false,
                 false,
                 false,

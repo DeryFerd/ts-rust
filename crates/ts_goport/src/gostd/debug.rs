@@ -11,8 +11,8 @@
 //! - `debug.AssertNever(x[, m])`: `debug::assert_never(&detail, m)`.
 //! - `debug.FailBadSyntaxKind(n[, m])`: `debug::fail_bad_syntax_kind(n.kind(), m)`.
 
+use crate::astdata::SyntaxKind;
 use crate::core::go_panic;
-use ts_ast::SyntaxKind;
 
 // Go: debug/debug.go:7 Fail
 #[cold]

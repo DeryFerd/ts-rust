@@ -28,10 +28,9 @@ evidence that every existing line was produced by that model name.
 ## Current state
 
 `crates/ts_goport` has two parts crates, `goport_util` and `goport_lsproto`, in
-`crates/ts_goport/parts`. It still uses six small crates from the first
-prototype (`ts_ast`, `ts_core`, `ts_diagnostics`, `ts_jsnum`, `ts_path` and
-`ts_scanner`) and the lib files in `crates/ts_bundled/libs`. `tools/ts_ast_codegen` and
-`tools/ts_diagnostics_codegen` generate parts of `ts_ast` and `ts_diagnostics`.
+`crates/ts_goport/parts`. It uses the lib files in `crates/ts_bundled/libs`.
+`tools/ts_ast_codegen` and `tools/ts_diagnostics_codegen` generate
+`crates/ts_goport/src/astdata` and `crates/ts_goport/src/diagnostics/catalog.rs`.
 
 On 2026-09-28 the rest of the first prototype (the legacy parser, binder,
 checker, printer, compiler, CLI, LSP and their tools) was deleted. It is in the

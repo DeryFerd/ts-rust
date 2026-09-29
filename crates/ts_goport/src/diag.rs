@@ -2,7 +2,7 @@
 //! Go `diagnostics.Name` messages. Use them as `diag::Name`.
 #![allow(non_upper_case_globals, clippy::unreadable_literal)]
 
-use ts_diagnostics::{CATALOG, Category, Message};
+use crate::diagnostics::{CATALOG, Category, Message};
 
 pub static Unterminated_string_literal: &Message = &CATALOG[0];
 pub static Identifier_expected: &Message = &CATALOG[1];
@@ -2655,8 +2655,8 @@ pub static Organize_Imports: &Message = &CATALOG[2150];
 pub static Remove_Unused_Imports: &Message = &CATALOG[2151];
 pub static Sort_Imports: &Message = &CATALOG[2152];
 
-// PORT: messages that Go at the pin has and `ts_diagnostics::CATALOG` (old pin) lacks.
-// `crates/ts_diagnostics` is still at the old pin (as `crates/ts_bundled/libs` is for the
+// PORT: messages that Go at the pin has and `crate::diagnostics::CATALOG` (old pin) lacks.
+// `src/diagnostics/catalog.rs` is still at the old pin (as `crates/ts_bundled/libs` is for the
 // libs). Only the language service uses these, so no code or key lookup (`message_by_code`,
 // `message_by_key`) needs to find them.
 pub static JSDoc_comment: &Message = &Message::new(

@@ -1,6 +1,6 @@
 use std::ops::{BitOr, BitOrAssign};
 
-use crate::{FileId, FlowNodeId, NodeArenaId, NodeRef};
+use crate::astdata::{FileId, FlowNodeId, NodeArenaId, NodeRef};
 
 /// Control-flow node flags.
 ///
@@ -367,7 +367,7 @@ impl FlowNodeArena {
 #[cfg(test)]
 mod tests {
     use super::{FlowFlags, FlowNode, FlowNodeArena, FlowNodePayload};
-    use crate::{FileId, NodeArena, NodeId, NodeRef};
+    use crate::astdata::{FileId, NodeArena, NodeId, NodeRef};
 
     #[test]
     fn flags_match_typescript_go_bit_layout() {

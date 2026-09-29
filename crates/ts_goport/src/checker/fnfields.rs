@@ -1,8 +1,8 @@
 //! Method wrappers for Go function-valued Checker fields, so ported code can
 //! write `self.resolve_name(..)` like Go `c.resolveName(..)`. Generated.
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 impl Checker {
     pub fn compare_symbols(&mut self, a: SymbolId, b: SymbolId) -> i32 {

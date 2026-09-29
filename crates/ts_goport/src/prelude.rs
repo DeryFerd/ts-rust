@@ -4,6 +4,7 @@ pub use crate::args;
 pub use crate::ast::*;
 // Explicit import: `printer::NodeFactory` must not shadow `ast::NodeFactory`.
 pub use crate::ast::NodeFactory;
+pub use crate::astdata::SyntaxKind;
 pub use crate::binder::*;
 pub use crate::checker::*;
 pub use crate::core::*;
@@ -21,7 +22,6 @@ pub use indexmap::{IndexMap, IndexSet};
 pub use rustc_hash::{FxHashMap, FxHashSet};
 pub use std::cell::RefCell;
 pub use std::rc::Rc;
-pub use ts_ast::SyntaxKind;
 
 // Names that more than one glob above exports. Pick one explicitly so the
 // globs are not ambiguous.

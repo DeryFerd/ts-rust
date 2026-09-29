@@ -1,9 +1,12 @@
-//! TypeScript syntax model.
+//! TypeScript syntax model: `SyntaxKind`, the node arena and the `*Data`
+//! node structs (`ast_generated.rs` and `syntax_kind.rs` come from
+//! `tools/ts_ast_codegen`). This was the `ts_ast` crate; `text` was `ts_core`.
 
 mod ast_generated;
 mod flow;
 mod js_string;
 mod syntax_kind;
+pub mod text;
 
 pub use ast_generated::*;
 pub use flow::*;
@@ -245,7 +248,7 @@ impl NodeRef {
 mod tests {
     use std::{ops::ControlFlow, panic::AssertUnwindSafe};
 
-    use ts_core::TextRange;
+    use crate::astdata::text::TextRange;
 
     use super::{
         ConditionalExpressionData, DoStatementData, FileId, ImportDeclarationData,

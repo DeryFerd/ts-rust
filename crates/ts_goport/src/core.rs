@@ -122,7 +122,7 @@ impl FlowNodeId {
 /// Go `*ast.Node` (and every alias: `*ast.Expression`, `*ast.TypeNode`,
 /// `*ast.SourceFile`, ...). High 32 bits: file id in the file registry
 /// (`ast/store.rs`). For a ported-parser file this is also its store id.
-/// Low 32 bits: `ts_ast::NodeId::index() + 1`. Zero is nil.
+/// Low 32 bits: `crate::astdata::NodeId::index() + 1`. Zero is nil.
 /// Node methods (kind, parent, fields, binder data) live in `crate::ast`.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Debug)]
 pub struct Node(pub u64);
@@ -147,7 +147,7 @@ impl Node {
 
     #[inline]
     #[must_use]
-    pub fn new(file: usize, node: ts_ast::NodeId) -> Self {
+    pub fn new(file: usize, node: crate::astdata::NodeId) -> Self {
         // After freeze, a store file resolves every child id with no store
         // borrow: an alias-free store gives the slot 0 value for id 0 and
         // the raw handle `(file << 32) | (id + 1)` for any other id, with no
@@ -160,7 +160,7 @@ impl Node {
     }
 
     #[inline(never)]
-    fn new_slow(file: usize, node: ts_ast::NodeId) -> Self {
+    fn new_slow(file: usize, node: crate::astdata::NodeId) -> Self {
         // Child ids inside factory-made nodes live in the synthetic id space.
         if file == crate::ast::SYNTHETIC_NODE_FILE {
             return crate::ast::resolve_synthetic_id(node);
@@ -179,8 +179,8 @@ impl Node {
     }
 
     #[must_use]
-    pub fn node_id(self) -> ts_ast::NodeId {
-        ts_ast::NodeId::new(((self.0 & 0xffff_ffff) - 1) as u32)
+    pub fn node_id(self) -> crate::astdata::NodeId {
+        crate::astdata::NodeId::new(((self.0 & 0xffff_ffff) - 1) as u32)
     }
 }
 
@@ -2503,8 +2503,8 @@ pub struct Diagnostic {
     pub pos: i32,
     pub end: i32,
     pub code: i32,
-    pub category: ts_diagnostics::Category,
-    pub message: &'static ts_diagnostics::Message,
+    pub category: crate::diagnostics::Category,
+    pub message: &'static crate::diagnostics::Message,
     pub message_args: Vec<String>,
     pub message_chain: Vec<Diagnostic>,
     pub related_information: Vec<Diagnostic>,
