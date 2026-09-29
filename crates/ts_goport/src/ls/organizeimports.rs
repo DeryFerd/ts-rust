@@ -42,11 +42,11 @@ impl LanguageService {
             self.format_options(),
             self.converters.clone(),
         );
-        let should_sort = *kind == lsproto::CodeActionKind::SOURCE_SORT_IMPORTS
-            || *kind == lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS;
+        let should_sort = *kind == lsproto::CodeActionKind::SOURCE_SORT_IMPORTS_TS
+            || *kind == lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS_TS;
         let should_combine = should_sort;
-        let should_remove = *kind == lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS
-            || *kind == lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS;
+        let should_remove = *kind == lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS_TS
+            || *kind == lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS_TS;
         let top_level_import_decls =
             lsutil::filter_import_declarations(&source_file.statements().to_vec());
         let top_level_import_group_decls =
@@ -112,7 +112,7 @@ impl LanguageService {
             );
         }
 
-        if *kind != lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS {
+        if *kind != lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS_TS {
             let top_level_export_group_decls = get_top_level_export_groups(source_file);
             for export_group_decl in &top_level_export_group_decls {
                 organize_exports_worker(
@@ -155,7 +155,7 @@ impl LanguageService {
                 );
             }
 
-            if *kind != lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS {
+            if *kind != lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS_TS {
                 let mut ambient_module_export_decls: Vec<Node> = Vec::new();
                 for s in module_body.statements().iter() {
                     if s.kind() == SyntaxKind::ExportDeclaration {
