@@ -194,9 +194,11 @@ impl Checker {
         }
         f.borrow_mut().depth += 1;
         let mut shared_flow = FlowNodeId::NIL;
+        // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+        // lsshells M3 repair: one guard for the whole walk, so the steps in
+        // one freeable file version share one pin (`get_flow_in`).
+        let mut flow_data_guard = None;
         loop {
-            // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
-            let mut flow_data_guard = None;
             let flow_data = flow.get_flow_in(&mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
@@ -214,19 +216,19 @@ impl Checker {
             }
             let t: FlowType;
             if flags.intersects(FlowFlags::ASSIGNMENT) {
-                t = self.get_type_at_flow_assignment(f, flow);
+                t = self.get_type_at_flow_assignment(f, flow, flow_data);
                 if t.is_nil() {
                     flow = flow_data.antecedent;
                     continue;
                 }
             } else if flags.intersects(FlowFlags::CALL) {
-                t = self.get_type_at_flow_call(f, flow);
+                t = self.get_type_at_flow_call(f, flow_data);
                 if t.is_nil() {
                     flow = flow_data.antecedent;
                     continue;
                 }
             } else if flags.intersects(FlowFlags::CONDITION) {
-                t = self.get_type_at_flow_condition(f, flow);
+                t = self.get_type_at_flow_condition(f, flow_data);
             } else if flags.intersects(FlowFlags::SWITCH_CLAUSE) {
                 t = self.get_type_at_switch_clause(f, flow);
             } else if flags.intersects(FlowFlags::BRANCH_LABEL) {
@@ -319,14 +321,15 @@ pub fn get_branch_label_antecedents(
 
 impl Checker {
     // Go: checker/flow.go:216 getTypeAtFlowAssignment
+    // PERF: lsshells M3 repair. `flow_data` is `flow.get_flow()`, which the
+    // caller has read (as main's perf14), so a freeable file version is not
+    // pinned again.
     pub fn get_type_at_flow_assignment(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
         flow: FlowNodeId,
+        flow_data: &FlowNode,
     ) -> FlowType {
-        // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
-        let mut flow_data_guard = None;
-        let flow_data = flow.get_flow_in(&mut flow_data_guard);
         let node = flow_data.node;
         let (reference, declared_type) = {
             let fb = f.borrow();
@@ -458,14 +461,13 @@ impl Checker {
     }
 
     // Go: checker/flow.go:292 getTypeAtFlowCall
+    // PERF: lsshells M3 repair. `flow_data` is the flow node that the caller
+    // has read (see `get_type_at_flow_assignment`).
     pub fn get_type_at_flow_call(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow: FlowNodeId,
+        flow_data: &FlowNode,
     ) -> FlowType {
-        // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
-        let mut flow_data_guard = None;
-        let flow_data = flow.get_flow_in(&mut flow_data_guard);
         let signature = self.get_effects_signature(flow_data.node);
         if signature.is_some() {
             let predicate = self.get_type_predicate_of_signature(signature);
@@ -594,14 +596,13 @@ impl Checker {
     }
 
     // Go: checker/flow.go:353 getTypeAtFlowCondition
+    // PERF: lsshells M3 repair. `flow_data` is the flow node that the caller
+    // has read (see `get_type_at_flow_assignment`).
     pub fn get_type_at_flow_condition(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow: FlowNodeId,
+        flow_data: &FlowNode,
     ) -> FlowType {
-        // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
-        let mut flow_data_guard = None;
-        let flow_data = flow.get_flow_in(&mut flow_data_guard);
         let flow_type = self.get_type_at_flow_node(f, flow_data.antecedent);
         if self.ty(flow_type.t).flags.intersects(TypeFlags::NEVER) {
             return flow_type;

@@ -161,11 +161,6 @@ impl Node {
 
     #[inline(never)]
     fn new_slow(file: usize, node: crate::astdata::NodeId) -> Self {
-        // A freeable file version (lsshells M3b) reads its store with one
-        // pinned read.
-        if let Some(n) = crate::ast::freeable_resolve_store_id(file, node) {
-            return n;
-        }
         // Child ids inside factory-made nodes live in the synthetic id space.
         if file == crate::ast::SYNTHETIC_NODE_FILE {
             return crate::ast::resolve_synthetic_id(node);

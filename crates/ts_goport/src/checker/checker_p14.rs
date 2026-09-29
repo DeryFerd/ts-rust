@@ -90,10 +90,7 @@ impl Checker {
         }
         if is_source_file(container) {
             // look up in the source file's locals or exports
-            if source_file_info(container)
-                .external_module_indicator
-                .is_some()
-            {
+            if with_source_file_info(container, |info| info.external_module_indicator).is_some() {
                 // TODO: Maybe issue a better error than 'object is possibly undefined'
                 return self.undefined_type;
             }

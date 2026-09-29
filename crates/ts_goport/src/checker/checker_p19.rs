@@ -195,8 +195,7 @@ impl Checker {
         } else if flags.intersects(SymbolFlags::VALUE_MODULE)
             && value_declaration.is_some()
             && is_source_file(value_declaration)
-            && source_file_info(value_declaration)
-                .common_js_module_indicator
+            && with_source_file_info(value_declaration, |info| info.common_js_module_indicator)
                 .is_some()
         {
             let resolved_module =

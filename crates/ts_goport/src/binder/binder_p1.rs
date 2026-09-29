@@ -517,7 +517,7 @@ impl Binder {
 
     /// Go `b.file.IsDeclarationFile`.
     pub fn file_is_declaration_file(&self) -> bool {
-        source_file_info(self.file).is_declaration_file
+        with_source_file_info(self.file, |info| info.is_declaration_file)
     }
 
     /// Go `ast.IsExternalOrCommonJSModule(b.file)` while binding. The binder
@@ -1852,7 +1852,7 @@ impl Binder {
                 diag::Global_module_exports_may_only_appear_in_module_files,
                 vec![],
             );
-        } else if !source_file_info(parent).is_declaration_file {
+        } else if !with_source_file_info(parent, |info| info.is_declaration_file) {
             self.error_on_node(
                 node,
                 diag::Global_module_exports_may_only_appear_in_declaration_files,

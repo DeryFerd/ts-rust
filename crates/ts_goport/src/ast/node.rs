@@ -1014,6 +1014,10 @@ pub const BINDER_ADDED_FLAGS: NodeFlags = NodeFlags::EXPORT_CONTEXT
     .union(NodeFlags::UNREACHABLE)
     .union(NodeFlags::THIS_NODE_OR_ANY_SUB_NODES_HAS_ERROR);
 
+/// Every `NodeFlags` bit that the binder does not add: the mask of
+/// `Node::parser_flags` for "all the parser flags".
+pub const PARSER_ONLY_FLAGS: NodeFlags = NodeFlags(!BINDER_ADDED_FLAGS.0);
+
 /// Binder data for nodes of a file that is not bound yet.
 static NO_BIND: NodeBindData = NodeBindData {
     symbol: SymbolId::NIL,
@@ -1333,6 +1337,7 @@ impl NodeSlice {
     }
 
     #[must_use]
+    #[inline]
     pub fn iter(self) -> NodeSliceIter {
         let ids = match self.0 {
             SliceRepr::Nodes(nodes) => SliceIds::Nodes(nodes),
@@ -2053,9 +2058,6 @@ impl Node {
 
     #[inline(never)]
     fn kind_slow(self) -> SyntaxKind {
-        if let Some(kind) = freeable_store_kind(self) {
-            return kind;
-        }
         // A store node holds the Go kind in its header.
         if let Some(h) = try_store_header(self) {
             return h.kind;
@@ -2120,10 +2122,6 @@ impl Node {
         if let Some(h) = active_store_header(self) {
             return h.flags;
         }
-        // A freeable file version is published and bound.
-        if let Some(flags) = freeable_store_flags(self) {
-            return flags | self.added_flags();
-        }
         if is_synthetic_node(self) {
             return synthetic_flags(self);
         }
@@ -2150,9 +2148,6 @@ impl Node {
 
     #[inline(never)]
     fn parent_slow(self) -> Node {
-        if let Some(parent) = freeable_store_parent(self) {
-            return parent;
-        }
         if is_synthetic_node(self) {
             return synthetic_parent(self);
         }
@@ -2174,9 +2169,6 @@ impl Node {
 
     #[inline(never)]
     fn loc_slow(self) -> TextRange {
-        if let Some(loc) = freeable_store_loc(self) {
-            return loc;
-        }
         if is_synthetic_node(self) {
             return synthetic_loc(self);
         }
@@ -2222,34 +2214,33 @@ impl Node {
     // only the field. The synthetic path (thread-local arena and `RefCell`
     // borrow) is cold.
     // PERF: lsshells M3b. A static file (tier 0, tier 1) is read inline with
-    // no call, as in R134. A freeable file version is read out of line and
-    // copied (`bind_slow`), so it makes no `FileRef` guard.
+    // no call, as in R134. A freeable file version is read out of line
+    // (`bind_field_slow`), so it makes no `FileRef` guard.
+    // PERF: lsshells M3 repair. `field` runs in the out-of-line read too, so
+    // the inline part keeps no stack copy of the data: a copy made
+    // `bind_field` too big to inline in 9 places, and `goport -p` ran more
+    // instructions.
     #[inline]
     fn bind_field<T>(self, field: impl FnOnce(&NodeBindData) -> T) -> T {
         if is_synthetic_node(self) {
             return synthetic_bind_field(self, field);
         }
         let index = nid(self).index();
-        let copy;
-        let bind = match crate::ast::static_go_file(self.file_index()) {
-            Some(go_file) => node_bind_in(go_file, index),
-            None => {
-                copy = self.bind_slow(index);
-                &copy
-            }
-        };
-        field(bind)
+        match crate::ast::static_go_file(self.file_index()) {
+            Some(go_file) => field(node_bind_in(go_file, index)),
+            None => self.bind_field_slow(index, field),
+        }
     }
 
-    /// The binder data of node slot `index` of a freeable file version
-    /// (lsshells M3b), copied out. Panics when the file is not published.
+    /// `bind_field` of node slot `index` of a freeable file version
+    /// (lsshells M3b). Panics when the file is not published.
     #[cold]
     #[inline(never)]
-    fn bind_slow(self, index: usize) -> NodeBindData {
+    fn bind_field_slow<T>(self, index: usize, field: impl FnOnce(&NodeBindData) -> T) -> T {
         let file = self.file_index();
         match crate::ast::freeable_go_file_read(file, |go_file| *node_bind_in(go_file, index)) {
-            Some(bind) => bind,
-            None => crate::ast::with_go_file(file, |go_file| *node_bind_in(go_file, index)),
+            Some(bind) => field(&bind),
+            None => crate::ast::with_go_file(file, |go_file| field(node_bind_in(go_file, index))),
         }
     }
 
@@ -2450,8 +2441,28 @@ impl FlowNodeId {
     pub fn get_flow_in(self, guard: &mut Option<FileRef<FlowNode>>) -> &FlowNode {
         match self.static_flow() {
             Some(data) => data,
-            None => guard.insert(self.get_flow_slow()),
+            None => self.get_flow_in_slow(guard),
         }
+    }
+
+    /// `get_flow_in` for a synthetic flow node or a node of a freeable file
+    /// version. A guard that pins the version of this flow node already is
+    /// pointed at it, with no new `Arc`.
+    // PERF: lsshells M3 repair. A flow walk of the edited file reads one flow
+    // node per step; a new `FileRef` per step cloned and dropped the `Arc` of
+    // the version (two atomic writes per step).
+    #[cold]
+    #[inline(never)]
+    fn get_flow_in_slow(self, guard: &mut Option<FileRef<FlowNode>>) -> &FlowNode {
+        let file = self.file_index();
+        match guard {
+            Some(FileRef::Pinned { version, key, get }) if version.file() == file => {
+                *key = self.local_index();
+                *get = flow_node_in;
+            }
+            _ => *guard = Some(self.get_flow_slow()),
+        }
+        guard.as_deref().expect("the guard is set")
     }
 
     /// The flow node of a static file (tier 0, tier 1), or `None` for any
@@ -2471,11 +2482,21 @@ impl FlowNodeId {
         if self.file_index() == crate::checker::SYNTHETIC_FLOW_FILE {
             return FileRef::Static(crate::checker::synthetic_flow(self));
         }
-        crate::ast::file_version::go_file_ref!(self.file_index(), self.local_index(), |g, index| g
-            .flow_nodes
-            .get()
-            .expect("flow nodes are not built for this file")[index])
+        match crate::ast::go_file(self.file_index()) {
+            FileRef::Static(g) => FileRef::Static(&flow_nodes_of(g)[self.local_index()]),
+            FileRef::Pinned { version, .. } => FileRef::Pinned {
+                version,
+                key: self.local_index(),
+                get: flow_node_in,
+            },
+        }
     }
+}
+
+/// Flow node `index` of freeable file version `version` (the getter of a
+/// pinned flow node guard).
+fn flow_node_in(version: &FileVersion, index: usize) -> &FlowNode {
+    &flow_nodes_of(version.go_file())[index]
 }
 
 /// Go `file.AsSourceFile()` fields that the parser and program set. The
@@ -2484,6 +2505,22 @@ impl FlowNodeId {
 pub fn source_file_info(file: Node) -> FileRef<crate::program::SourceFileInfo> {
     let file = published_source_file(file);
     crate::ast::file_version::go_file_ref!(file.file_index(), 0, |g, _key| g.info)
+}
+
+/// Runs `read` on `source_file_info(file)` with no guard: a freeable file
+/// version is pinned only while `read` runs (see `ast::with_go_file`).
+// PERF: lsshells M3 repair. A `FileRef` guard of a freeable file version
+// clones and drops its `Arc` (two atomic writes). The checker reads one
+// field of the info of the edited file many times per edit
+// (`is_external_module`, `is_declaration_file`, ...), so those readers use
+// this.
+#[inline]
+pub fn with_source_file_info<R>(
+    file: Node,
+    read: impl FnOnce(&crate::program::SourceFileInfo) -> R,
+) -> R {
+    let file = published_source_file(file);
+    crate::ast::with_go_file(file.file_index(), |g| read(&g.info))
 }
 
 /// The published SourceFile whose info `source_file_info(file)` reads:
@@ -2506,7 +2543,7 @@ pub fn source_file_language_variant(file: Node) -> LanguageVariant {
     if !is_synthetic_node(file) && is_file_store_before_program(file.file_index()) {
         return file_store_language_variant(file.file_index());
     }
-    source_file_info(file).language_variant
+    with_source_file_info(file, |info| info.language_variant)
 }
 
 /// Go `file.AsSourceFile()` fields that the binder sets. The guard pins a
@@ -5359,7 +5396,7 @@ thread_local! {
 
 /// The live freeable file version of `file` (a SourceFile node), or `None`
 /// for a static, unpublished or synthetic file.
-fn file_version_of(file: Node) -> Option<std::sync::Arc<FileVersion>> {
+fn file_version_of(file: Node) -> Option<crate::ast::VersionPin> {
     if is_synthetic_node(file) {
         return None;
     }
@@ -5531,7 +5568,7 @@ fn compute_name_table(file: Node) -> FxHashMap<String, i32> {
 // Go: ast.go:2751 (*SourceFile).IsBound
 #[must_use]
 pub fn source_file_is_bound(file: Node) -> bool {
-    file.go_file().file_bind.get().is_some()
+    crate::ast::with_go_file(file.file_index(), |g| g.file_bind.get().is_some())
 }
 
 // Go: ast.go:2756 (*SourceFile).GetPositionMap
@@ -5572,7 +5609,7 @@ fn compute_source_file_position_map(file: Node) -> PositionMap {
     } else if is_file_store_before_program(file.file_index()) {
         file_store_contains_non_ascii(file.file_index())
     } else {
-        source_file_info(file).contains_non_ascii
+        with_source_file_info(file, |info| info.contains_non_ascii)
     };
     if contains_non_ascii {
         compute_position_map(source_file_text(file))

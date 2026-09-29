@@ -239,24 +239,26 @@ methods reach the AST through it.
   through one file lookup (the `frozen!` macro and `static_frozen_of` in
   `ast/store.rs`), not `FROZEN.get()` directly. It checks tier 0 (the
   first publish), then, inline, tier 1 (every later publish), then a
-  freeable file version (out of line, pinned while the read runs), so the
-  nodes of a later program (`tsc -b`, an edited file) read the same
-  columns as the nodes of the first program. The tier 1 and freeable parts
+  freeable file version (its store and `GoFile`; out of line, pinned while
+  the read runs), so the nodes of a later program (`tsc -b`, an edited
+  file) read the same columns as the nodes of the first program. The tier
+  1 slot of a freeable version names its node shell (its node columns,
+  leaked), so its node reads are tier 1 reads. The tier 1 and freeable parts
   are a cold block, so they add no code to the hot path of a one-program
   process; keep new tier 1 work after `later_publish_path()`, and keep one
   inline copy of the read (after the static tiers join). A read gets
   a borrow for its closure only, so it copies its result out. A new column
   gets a `Frozen` table and a reader that calls `frozen!` with that table.
   A reader that must return a `&'static` slice of a table uses the static
-  tiers only (`static_frozen`) and gives `None` for a freeable version,
-  so the caller takes the exact slow path (`frozen_store_children`,
-  `frozen_resolved`). The inline fast paths of the node reads (`kind`,
-  `parent`, `flags`, `loc`, children, `Node::new`, `bind`) use
-  `frozen_static!` (static tiers, no call), as a one-program process needs;
-  a node of a freeable version misses them, and the caller's slow path
-  reads it first with one pinned read (`freeable_store_kind`,
-  `freeable_store_parent`, ...). Use `frozen_static!` only where `None`
-  sends the caller to such an exact path.
+  tiers only (`static_frozen`), which have the node shell tables of a
+  freeable version but not its store or `GoFile`. The inline fast paths
+  of the node reads (`kind`, `parent`, `flags`, `loc`, children,
+  `Node::new`, `bind`) use `frozen_static!` (static tiers, no call), as a
+  one-program process needs; the binder data of a freeable version is
+  read out of line with one pinned read (`Node::bind_field`). A node
+  shell has no link column, so `frozen_store_children` gives `None` and
+  the caller reads the node data. Use `frozen_static!` only where `None`
+  sends the caller to an exact path.
 
 ## Program (owned by program.rs)
 
@@ -328,8 +330,12 @@ The batch that adds it is not accepted until Theo approves.
   next program release (`release_file_version_pins`, run when a
   `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The
   registry keeps a `Weak`. At publish the version takes its `FileStore`
-  (headers and all columns) and its `GoFile` (M3b): no `Frozen` is leaked
-  for it and it has no tier 1 slot. Its `SourceFileInfo` owns copies of
+  and its `GoFile` (M3b). Its node columns (headers, nodes, kinds, names,
+  modifier bits, children; 52 bytes per node) are leaked in its node
+  shell, the tier 1 publish of its id, so a node read of the edited file
+  stays inline (a pinned read per node read made edits 3 to 4 ms slower);
+  the child link column is dropped, and the binder's child walk reads the
+  node data. Its `SourceFileInfo` owns copies of
   the parse lists (`KeptData::Owned`), so the publish keeps no parse, and
   its name table, position map and declaration map are fields of the
   version, as in Go. When its last holder lets go, the store and the

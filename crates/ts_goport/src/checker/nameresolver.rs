@@ -362,9 +362,10 @@ impl NameResolver {
                             );
                             if result.is_some() {
                                 if is_source_file(location)
-                                    && source_file_info(location)
-                                        .common_js_module_indicator
-                                        .is_some()
+                                    && with_source_file_info(location, |info| {
+                                        info.common_js_module_indicator
+                                    })
+                                    .is_some()
                                     && !c
                                         .symbol_arena()
                                         .sym(result)

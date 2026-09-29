@@ -1124,8 +1124,10 @@ pub fn is_function_block(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:717 IsBlockOrCatchScoped
+// PERF: lsshells M3 repair. `BLOCK_SCOPED` has no binder bit, so the walk
+// reads no binder data (`get_combined_parser_flags`).
 pub fn is_block_or_catch_scoped(declaration: Node) -> bool {
-    get_combined_node_flags(declaration).intersects(NodeFlags::BLOCK_SCOPED)
+    !get_combined_parser_flags(declaration, NodeFlags::BLOCK_SCOPED).is_empty()
         || is_catch_clause_variable_declaration_or_binding_element(declaration)
 }
 
@@ -1314,10 +1316,6 @@ pub fn walk_up_parenthesized_types(node: Node) -> Node {
 // (synthetic nodes, nodes before the freeze) walk the parents like Go.
 pub fn get_source_file_of_node(node: Node) -> Node {
     if let Some(root) = frozen_source_file_of_node(node) {
-        debug_assert_eq!(root, walk_to_source_file(node));
-        return root;
-    }
-    if let Some(root) = crate::ast::freeable_source_file_of_node(node) {
         debug_assert_eq!(root, walk_to_source_file(node));
         return root;
     }

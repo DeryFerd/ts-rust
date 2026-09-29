@@ -17,10 +17,13 @@
 //! - a `FileRef` guard holds it while the guard lives;
 //! - the registry here keeps only a `Weak`.
 //!
-//! M3b: at publish the version takes its `FileStore` (headers and all
-//! columns) and its `GoFile` (info, `node_bind`, `file_bind`,
-//! `flow_nodes`) (`ast::store::VersionStore`). No `Frozen` is leaked for
-//! it and it has no tier 1 slot. The node structs stay in the bump arena.
+//! M3b: at publish the version takes its `FileStore` and its `GoFile`
+//! (info, `node_bind`, `file_bind`, `flow_nodes`)
+//! (`ast::store::VersionStore`). Its node columns (headers, nodes, kinds,
+//! names, modifier bits, children) are leaked in its node shell, the tier
+//! 1 publish of its id, so node reads stay inline
+//! (`ast::store::node_shell`); the child link column is dropped. The node
+//! structs stay in the bump arena.
 //! When the last holder lets go, the version is dead: its store and
 //! `GoFile` are freed, its id goes to `DEAD_FILES`, and each per-file
 //! thread-local map (`PerFileMap`) forgets the entries of that id when it
@@ -39,7 +42,9 @@
 
 use super::store::VersionStore;
 use crate::prelude::*;
+use std::cell::Cell;
 use std::ops::Deref;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
@@ -254,13 +259,47 @@ fn released(file: usize) -> ! {
     panic!("file version {file} is released")
 }
 
+/// A pin of a file version on one thread: the `Arc` in a thread-local
+/// `Rc`. The pins of a thread (`PINS`) and the `FileRef` guards that it
+/// made share it.
+// PERF: lsshells M3 repair. A guard clones and drops the `Rc` (no atomic
+// write); a flow walk of the edited file makes one guard per flow node, and
+// an `Arc` clone per guard made query-core edits about 0.3 ms slower.
+pub type VersionPin = Rc<Arc<FileVersion>>;
+
 /// The pins of one thread: the versions it read since the last program
 /// release (`PIN_EPOCH`), by file id.
 struct Pins {
     epoch: usize,
     // PERF: a thread reads few freeable versions (the edited files), so a
     // scan is faster than a map.
-    list: Vec<(usize, Arc<FileVersion>)>,
+    list: Vec<(usize, VersionPin)>,
+    /// The index in `list` of the last hit, tested before the scan.
+    // PERF: lsshells M3 repair. Most pinned reads in a row are of one file
+    // (the edited file).
+    last: Cell<usize>,
+}
+
+impl Pins {
+    /// The pinned version `file` of the current epoch.
+    #[inline]
+    fn find(&self, file: usize) -> Option<&VersionPin> {
+        if self.epoch != PIN_EPOCH.load(Ordering::Acquire) {
+            return None;
+        }
+        match self.list.get(self.last.get()) {
+            Some((id, version)) if *id == file => Some(version),
+            _ => self.find_scan(file),
+        }
+    }
+
+    /// `find` after a miss of the last hit.
+    #[inline(never)]
+    fn find_scan(&self, file: usize) -> Option<&VersionPin> {
+        let index = self.list.iter().position(|(id, _)| *id == file)?;
+        self.last.set(index);
+        Some(&self.list[index].1)
+    }
 }
 
 thread_local! {
@@ -269,6 +308,7 @@ thread_local! {
         RefCell::new(Pins {
             epoch: 0,
             list: Vec::new(),
+            last: Cell::new(0),
         })
     };
 }
@@ -287,12 +327,9 @@ pub(crate) fn with_file_version<R>(file: usize, read: impl FnOnce(&FileVersion) 
     let hit = PINS
         .try_with(|pins| {
             let pins = pins.try_borrow().ok()?;
-            if pins.epoch != PIN_EPOCH.load(Ordering::Acquire) {
-                return None;
-            }
-            let (_, version) = pins.list.iter().find(|(id, _)| *id == file)?;
+            let version = pins.find(file)?;
             let read = read.take()?;
-            Some(read(version.as_ref()))
+            Some(read(&**version))
         })
         .ok()
         .flatten();
@@ -302,22 +339,16 @@ pub(crate) fn with_file_version<R>(file: usize, read: impl FnOnce(&FileVersion) 
     // The closure took `read` only on a hit.
     let read = read.take()?;
     let version = pin_file_version(file)?;
-    Some(read(version.as_ref()))
+    Some(read(&**version))
 }
 
-/// The live version `file`, pinned on this thread, as an owned `Arc` (for a
-/// `FileRef` guard). `None` and panics as `with_file_version`.
-pub(crate) fn pinned_file_version(file: usize) -> Option<Arc<FileVersion>> {
+/// The live version `file`, pinned on this thread, as a pin that a
+/// `FileRef` guard keeps. `None` and panics as `with_file_version`.
+pub(crate) fn pinned_file_version(file: usize) -> Option<VersionPin> {
     let hit = PINS
         .try_with(|pins| {
             let pins = pins.try_borrow().ok()?;
-            if pins.epoch != PIN_EPOCH.load(Ordering::Acquire) {
-                return None;
-            }
-            pins.list
-                .iter()
-                .find(|(id, _)| *id == file)
-                .map(|(_, version)| Arc::clone(version))
+            pins.find(file).map(Rc::clone)
         })
         .ok()
         .flatten();
@@ -331,7 +362,7 @@ pub(crate) fn pinned_file_version(file: usize) -> Option<Arc<FileVersion>> {
 /// pins (after the pins of an older epoch are dropped).
 #[cold]
 #[inline(never)]
-fn pin_file_version(file: usize) -> Option<Arc<FileVersion>> {
+fn pin_file_version(file: usize) -> Option<VersionPin> {
     let weak = lock(&VERSIONS).get(&file).cloned();
     // Upgraded after the lock ends: the last drop of a version locks it.
     let Some(version) = weak.and_then(|weak| weak.upgrade()) else {
@@ -340,6 +371,7 @@ fn pin_file_version(file: usize) -> Option<Arc<FileVersion>> {
         }
         return None;
     };
+    let version = Rc::new(version);
     let expired = PINS
         .try_with(|pins| {
             let mut pins = pins.try_borrow_mut().ok()?;
@@ -350,7 +382,8 @@ fn pin_file_version(file: usize) -> Option<Arc<FileVersion>> {
                 pins.epoch = epoch;
                 std::mem::take(&mut pins.list)
             };
-            pins.list.push((file, Arc::clone(&version)));
+            pins.list.push((file, Rc::clone(&version)));
+            pins.last.set(pins.list.len() - 1);
             Some(expired)
         })
         .ok()
@@ -383,17 +416,18 @@ pub fn release_file_version_pins() {
 /// `FlowNodeId::get_flow`, ...). It derefs to the data.
 /// - `Static`: a file that is never freed (tier 0, tier 1, synthetic or
 ///   leaked data). `as_static` gives the `'static` borrow.
-/// - `Pinned`: a freeable file version. The guard holds the version, so the
-///   data lives while the guard does. `get(version, key)` finds the data;
-///   it is a plain function (no captures), `key` is its argument (a slot or
-///   flow index, or 0).
+/// - `Pinned`: a freeable file version. The guard holds the version (a
+///   thread-local pin, `VersionPin`, so a guard stays on its thread), and
+///   the data lives while the guard does. `get(version, key)` finds the
+///   data; it is a plain function (no captures), `key` is its argument (a
+///   slot or flow index, or 0).
 ///
 /// Keep a guard only as long as the data is needed: a kept guard keeps its
 /// file version alive. To keep a value past the guard, copy or clone it.
 pub enum FileRef<T: ?Sized + 'static> {
     Static(&'static T),
     Pinned {
-        version: Arc<FileVersion>,
+        version: VersionPin,
         key: usize,
         get: fn(&FileVersion, usize) -> &T,
     },
@@ -414,7 +448,7 @@ impl<T: ?Sized + 'static> FileRef<T> {
     /// The file version that a pinned guard holds, or `None` for a static
     /// file.
     #[must_use]
-    pub fn version(&self) -> Option<&Arc<FileVersion>> {
+    pub fn version(&self) -> Option<&VersionPin> {
         match self {
             FileRef::Static(_) => None,
             FileRef::Pinned { version, .. } => Some(version),
@@ -439,7 +473,7 @@ impl<T: ?Sized + 'static> Clone for FileRef<T> {
         match self {
             FileRef::Static(value) => FileRef::Static(value),
             FileRef::Pinned { version, key, get } => FileRef::Pinned {
-                version: Arc::clone(version),
+                version: Rc::clone(version),
                 key: *key,
                 get: *get,
             },

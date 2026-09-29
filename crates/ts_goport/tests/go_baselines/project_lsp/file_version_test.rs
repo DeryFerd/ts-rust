@@ -170,7 +170,9 @@ child_test! {
     // A freeable version keeps no parse: its `GoFile` owns copies of the
     // parse diagnostics and the JSDoc cache, and its JSDoc slice reads the
     // cache at each use. When the version dies they go with it, and a read
-    // of the dead version panics (a stale read never reads other data).
+    // of its store or `GoFile` panics (a stale read never reads other data).
+    // Its node columns are leaked in its node shell (lsshells M3 repair), so
+    // a stale node read gives the data of that node.
     fn freeable_version_owns_its_lists_and_a_stale_read_panics() {
         let session = bare_session(files(&[
             (
@@ -203,6 +205,7 @@ child_test! {
         let jsdoc = statement.js_doc(edited);
         assert_eq!(jsdoc.len(), 1);
         assert_eq!(jsdoc.get(0).kind(), SyntaxKind::JsDoc);
+        let statement_kind = statement.kind();
 
         edit(&session, JS_URI, 3, (1, 17), (1, 18), "3");
         let live = program(&session, JS_URI);
@@ -215,10 +218,11 @@ child_test! {
             let _ = source_file_info(edited).file_name.len();
         });
         assert_eq!(info.as_deref(), Some(stale.as_str()), "a GoFile read of a dead version");
-        let kind = panic_message(|| {
-            let _ = statement.kind();
+        let flags = panic_message(|| {
+            let _ = statement.flags();
         });
-        assert_eq!(kind.as_deref(), Some(stale.as_str()), "a column read of a dead version");
+        assert_eq!(flags.as_deref(), Some(stale.as_str()), "a binder read of a dead version");
+        assert_eq!(statement.kind(), statement_kind, "a node column read of a dead version");
         assert_eq!(diagnostics(root(&live, JS_FILE)), static_diagnostics);
         assert_eq!(diagnostics(first), static_diagnostics, "the first version is static");
     }

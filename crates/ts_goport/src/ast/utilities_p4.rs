@@ -191,8 +191,12 @@ pub fn is_module_exports_qualified_name(node: Node) -> bool {
 
 // Go: ast/utilities.go:2863 IsCheckJSEnabledForFile
 pub fn is_check_js_enabled_for_file(source_file: Node, compiler_options: &CompilerOptions) -> bool {
-    if let Some(directive) = &source_file_info(source_file).check_js_directive {
-        return directive.enabled;
+    if let Some(enabled) = with_source_file_info(source_file, |info| {
+        info.check_js_directive
+            .as_ref()
+            .map(|directive| directive.enabled)
+    }) {
+        return enabled;
     }
     compiler_options.check_js == Tristate::True
 }
@@ -200,9 +204,10 @@ pub fn is_check_js_enabled_for_file(source_file: Node, compiler_options: &Compil
 // Go: ast/utilities.go:2870 IsPlainJSFile
 pub fn is_plain_js_file(file: Node, check_js: Tristate) -> bool {
     file.is_some()
-        && (source_file_info(file).script_kind == ScriptKind::JS
-            || source_file_info(file).script_kind == ScriptKind::JSX)
-        && source_file_info(file).check_js_directive.is_none()
+        && with_source_file_info(file, |info| {
+            (info.script_kind == ScriptKind::JS || info.script_kind == ScriptKind::JSX)
+                && info.check_js_directive.is_none()
+        })
         && check_js == Tristate::Unknown
 }
 

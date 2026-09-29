@@ -91,13 +91,22 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18595 getCombinedNodeFlagsCached
+    // PORT: the result has no binder-added bit (`BINDER_ADDED_FLAGS`). Every
+    // caller (and `get_declaration_node_flags_from_symbol`) tests parser
+    // bits only: block scope, `CONSTANT`, `AMBIENT` and the deprecated tag.
+    // A caller that needs a binder bit uses `get_combined_node_flags`.
+    // PERF: lsshells M3 repair. The walk reads no binder data, which is a
+    // pinned read for the edited file in a language server; `narrow_type`
+    // and the discriminant checks made it one of the most frequent reads of
+    // that file.
     pub fn get_combined_node_flags_cached(&mut self, node: Node) -> NodeFlags {
         // we hold onto the last node and result to speed up repeated lookups against the same node.
         if self.last_get_combined_node_flags_node == node {
             return self.last_get_combined_node_flags_result;
         }
         self.last_get_combined_node_flags_node = node;
-        self.last_get_combined_node_flags_result = get_combined_node_flags(node);
+        self.last_get_combined_node_flags_result =
+            get_combined_parser_flags(node, PARSER_ONLY_FLAGS);
         self.last_get_combined_node_flags_result
     }
 

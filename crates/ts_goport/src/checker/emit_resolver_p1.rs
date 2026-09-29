@@ -579,9 +579,10 @@ pub(super) fn is_common_js_module_exports(node: Node) -> bool {
     if is_binary_expression(node)
         && is_expression_statement(node.parent())
         && is_source_file(node.parent().parent())
-        && source_file_info(node.parent().parent())
-            .common_js_module_indicator
-            .is_some()
+        && with_source_file_info(node.parent().parent(), |info| {
+            info.common_js_module_indicator
+        })
+        .is_some()
     {
         let kind = get_assignment_declaration_kind(node);
         if kind == JSDeclarationKind::MODULE_EXPORTS || kind == JSDeclarationKind::EXPORTS_PROPERTY
@@ -761,7 +762,7 @@ impl crate::printer::EmitResolver for EmitResolver {
             // does nothing. Synthetic files have no store facts and walk.
             if frozen_node_store_facts(file).is_some_and(|facts| {
                 facts.alias_free && facts.parents_local && !facts.has_export_alias_kind
-            }) && source_file_info(file).common_js_module_indicator.is_nil()
+            }) && with_source_file_info(file, |info| info.common_js_module_indicator).is_nil()
             {
                 return;
             }

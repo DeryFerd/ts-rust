@@ -415,7 +415,7 @@ fn get_node_flags(node: Node) -> NodeFlags {
 // PERF: U4 (CH7). The same walk as `get_combined_node_flags`, without the
 // binder data of each node. `(a | b | c) & mask` is
 // `(a & mask) | (b & mask) | (c & mask)`.
-fn get_combined_parser_flags(node: Node, mask: NodeFlags) -> NodeFlags {
+pub fn get_combined_parser_flags(node: Node, mask: NodeFlags) -> NodeFlags {
     get_combined_flags(node, |n: Node| n.parser_flags(mask))
 }
 
@@ -530,7 +530,7 @@ pub fn walk_up_binding_elements_and_patterns(binding: Node) -> Node {
 
 // Go: ast/utilities.go:1271 IsSourceFileJS
 pub fn is_source_file_js(file: Node) -> bool {
-    let script_kind = source_file_info(file).script_kind;
+    let script_kind = with_source_file_info(file, |info| info.script_kind);
     script_kind == ScriptKind::JS || script_kind == ScriptKind::JSX
 }
 
@@ -1043,13 +1043,14 @@ pub fn is_ambient_module_symbol_name(s: &str) -> bool {
 // Go: ast/utilities.go:1641 IsExternalModule
 /// PORT: Go takes `*SourceFile`; this takes the SourceFile node.
 pub fn is_external_module(file: Node) -> bool {
-    source_file_info(file).external_module_indicator.is_some()
+    with_source_file_info(file, |info| info.external_module_indicator.is_some())
 }
 
 // Go: ast/utilities.go:1645 IsExternalOrCommonJSModule
 pub fn is_external_or_common_js_module(file: Node) -> bool {
-    let info = source_file_info(file);
-    info.external_module_indicator.is_some() || info.common_js_module_indicator.is_some()
+    with_source_file_info(file, |info| {
+        info.external_module_indicator.is_some() || info.common_js_module_indicator.is_some()
+    })
 }
 
 // Go: ast/utilities.go:1650 IsEffectiveExternalModule
@@ -1057,7 +1058,7 @@ pub fn is_external_or_common_js_module(file: Node) -> bool {
 pub fn is_effective_external_module(node: Node, compiler_options: &CompilerOptions) -> bool {
     is_external_module(node)
         || (is_common_js_containing_module_kind(compiler_options.get_emit_module_kind())
-            && source_file_info(node).common_js_module_indicator.is_some())
+            && with_source_file_info(node, |info| info.common_js_module_indicator.is_some()))
 }
 
 // Go: ast/utilities.go:1654 isCommonJSContainingModuleKind
