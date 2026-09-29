@@ -2864,8 +2864,9 @@ pub use goport_util::core::*;
 /// (`ast/store.rs`) owns it from `publish_file_stores` on, or the
 /// `FileVersion` of a freeable file version (lsshells M3b); read it with
 /// `crate::ast::go_file` (a `FileRef` guard) or `crate::ast::with_go_file`.
-/// Program versions that share a file version share this value. Parser data is ready when the file is published. The binder
-/// fills the `OnceLock` fields once per file version.
+/// Program versions that share a file version share this value. Parser
+/// data is ready when the file is published. The binder fills the
+/// `OnceLock` fields once per file version.
 pub struct GoFile {
     /// The `SourceFile` node. Its nodes live in a node store (`ast::store`).
     pub root: Node,

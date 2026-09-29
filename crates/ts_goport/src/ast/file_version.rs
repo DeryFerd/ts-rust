@@ -33,7 +33,9 @@
 //! server or API process, of a path that a publish on this thread published
 //! before. So tier 0, the first version of each file and every CLI publish
 //! never get a `FileVersion`. `GOPORT_FREE_FILE_VERSIONS=0` turns it off
-//! (the behavior before M3a); `=1` turns it on in any process.
+//! (the behavior before M3a); `=1` turns it on in any process, and then
+//! `program::update_program_version` (`goport_multiprog`) applies the same
+//! rule to its new parses.
 
 use super::store::VersionStore;
 use crate::prelude::*;

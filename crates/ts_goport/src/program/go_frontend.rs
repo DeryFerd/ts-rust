@@ -234,8 +234,29 @@ pub(super) fn update_program_version(
         old_np.use_case_sensitive_file_names(),
     );
     let (np, _, reused) = old_np.update_program(&changed_path, host);
+    mark_freeable_parses(&np);
     let np = Rc::new(np);
     (build_program(&np, Entry::Version, cwd, Some(old)), reused)
+}
+
+/// Gives each new parse of `np` (its store is not published) of a path
+/// that this thread published before a `FileVersion`, as the language
+/// server parse cache does (`ast::freeable_path`). Only
+/// `update_program_version` (`goport_multiprog`) calls it, and the rule is
+/// off there unless `GOPORT_FREE_FILE_VERSIONS=1`, so a measurement can
+/// turn it on (lsshells M3b).
+fn mark_freeable_parses(np: &NewProgram) {
+    if !crate::ast::free_file_versions() {
+        return;
+    }
+    for file in np.get_source_files() {
+        if file.version.get().is_none()
+            && !crate::ast::is_published(file.store)
+            && crate::ast::freeable_path(&file.path().0)
+        {
+            let _ = file.version.set(crate::ast::FileVersion::new(file.store));
+        }
+    }
 }
 
 /// `new_program_version` (program.rs).

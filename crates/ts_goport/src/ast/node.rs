@@ -5229,9 +5229,12 @@ impl Node {
 // ──────────────────────────────────────────────────────────────────────
 
 // PORT: the caches below are per thread and leaked, for static files
-// (tier 0, tier 1, synthetic). A freeable file version keeps them in its
-// `FileVersion` (lsshells M3b), as Go keeps them on the `SourceFile`, so
-// they are freed with it (`version_cache`).
+// (tier 0, tier 1, synthetic) and files that are not published yet. A
+// published freeable file version (lsshells M3b) keeps them on its
+// `FileVersion` (`name_table`, `position_map`, `declaration_map`; see
+// `file_version_of`) and its ECMA line map in its store
+// (`frozen_file_ecma_line_starts`), as Go keeps them on the `SourceFile`,
+// so they are freed with it.
 thread_local! {
     /// Go `SourceFile.ecmaLineMap`, computed once per file.
     static ECMA_LINE_MAPS: RefCell<FxHashMap<Node, &'static [i32]>> = RefCell::new(FxHashMap::default());

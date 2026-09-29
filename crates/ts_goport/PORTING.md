@@ -169,7 +169,9 @@ methods reach the AST through it.
   freed) or a freeable file version (`ast/file_version.rs`), so the file
   data accessors return a `FileRef<T>` guard, not a `&'static T`:
   `ast::go_file`, `try_go_file`, `source_file_info`, `file_bind_data`,
-  `FlowNodeId::get_flow`, the five `source_file_*diagnostics`,
+  `FlowNodeId::get_flow`, `source_file_diagnostics`,
+  `source_file_js_diagnostics`, `source_file_jsdoc_diagnostics`,
+  `source_file_bind_diagnostics`,
   `source_file_ecma_line_map`, `get_ecma_line_starts`,
   `source_file_get_name_table`, `source_file_get_position_map`,
   `source_file_get_declaration_map`, `get_pragma_from_source_file`. It
@@ -183,7 +185,7 @@ methods reach the AST through it.
   N is released"); it never reads another file.
 - Binder data (Go fields set by the binder on nodes): `n.symbol()`,
   `n.local_symbol()`, `n.locals()`, `n.flow_node_data().flow_node`... use
-  `n.bind() -> &'static NodeBindData` and its fields; Go `node.Symbol()` ->
+  `n.bind() -> NodeBindData` (a copy) and its fields; Go `node.Symbol()` ->
   `n.symbol()`, `node.Locals()` -> `n.locals()`, `node.LocalSymbol()` ->
   `n.local_symbol()`, `node.FlowNodeData().FlowNode` -> `n.flow_node()`,
   `EndFlowNode`/`ReturnFlowNode` -> `n.end_flow_node()`/`n.return_flow_node()`.
@@ -331,7 +333,9 @@ The batch that adds it is not accepted until Theo approves.
   data (bump arena) and the text stay leaked for now. Tier 0, the first
   version of each file and every CLI publish never get one.
   `GOPORT_FREE_FILE_VERSIONS=0` turns this off, `=1` turns it on in any
-  process.
+  process; there `update_program_version` (`goport_multiprog`) also gives
+  each new parse of a published path a version, so a leak record can
+  measure it.
 - A `tsc -b` build (`goport_build`, `tsgo -b`) is a multi-program process,
   like Go: each project's program is a version made with `new_program` and
   `program::new_program_version`, and it is released when its task

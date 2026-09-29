@@ -18,7 +18,11 @@
 //! reports it, releases the previous one and prints
 //! `cycle <i> reused=<b> rss_kb=<VmRSS> hwm_kb=<VmHWM>`. The text of a
 //! version alternates, so each report must equal the report of the last
-//! version with the same text; a difference fails the run.
+//! version with the same text; a difference fails the run. After the last
+//! release it prints `file_versions made=<n> dead=<m>`: the freeable file
+//! versions (lsshells M3b) that the process made and freed. They are 0
+//! unless `GOPORT_FREE_FILE_VERSIONS=1`, which gives each new parse of the
+//! changed file a freeable version, as the language server does.
 //!
 //! Both modes put the original text back into the changed file at the end,
 //! also after a failed check. A failed check or an unported hit panics.
@@ -141,8 +145,9 @@ fn pair(config: &str, changed: &str, new_text_file: &str, out: &Path, first: Opt
 }
 
 /// Step 5 of `pair`: the changed file has a new version in B, both versions
-/// are published and keep their text, published nodes are read-only, and a
-/// reused B shares every other file version of A in the same order.
+/// are published and keep their text, published nodes are read-only, a
+/// reused B shares every other file version of A in the same order, and the
+/// new version is freeable only when the flag turns freeing on.
 fn check_versions(
     a: &GoProgram,
     b: &GoProgram,
@@ -195,6 +200,18 @@ fn check_versions(
             "set_store_node_parent on a node of published file {id} did not panic"
         );
     }
+    // lsshells M3b: the first version of the changed file is static. Its
+    // version in B is a freeable file version exactly when
+    // `GOPORT_FREE_FILE_VERSIONS=1` (see `cycles`).
+    assert!(
+        file_version_probe(go_file(a_changed).root).is_none(),
+        "file {a_changed} (A) is not static"
+    );
+    assert_eq!(
+        file_version_probe(go_file(b_changed).root).is_some(),
+        free_file_versions(),
+        "file {b_changed} (B) is a freeable file version only when GOPORT_FREE_FILE_VERSIONS=1"
+    );
 }
 
 /// The `cycles` mode: a leak record over `count` edits.
@@ -222,6 +239,11 @@ fn cycles(config: &str, changed: &str, count: usize) {
         println!("cycle {i} reused={reused} rss_kb={rss} hwm_kb={hwm}");
     }
     release_program(current);
+    println!(
+        "file_versions made={} dead={}",
+        file_versions_made(),
+        dead_file_versions()
+    );
     drop(restore);
 }
 

@@ -1801,7 +1801,10 @@ pub fn try_load_version(
 /// absolute). It reads `changed_file` from disk again. When the edit keeps
 /// the imports and references, the new version shares every other file
 /// version with `old` and the second value is true. Else every file is
-/// parsed again. `old` stays usable. Loading thread only.
+/// parsed again. `old` stays usable. Loading thread only. With
+/// `GOPORT_FREE_FILE_VERSIONS=1`, each new parse of a path that was
+/// published before is a freeable file version (lsshells M3b), as in the
+/// language server.
 pub fn update_program_version(
     old: &'static GoProgram,
     changed_file: &str,
@@ -1856,8 +1859,9 @@ pub fn bind_file_outside_program(file: Node) {
 /// program tables (`VersionTables`), which are freed when no other thread
 /// holds them. Do not use `program` after this: a read of its tables
 /// panics. The frontend program is freed with its last `Rc` holder. The
-/// `GoProgram` and the file versions stay leaked. Panics when `program` is
-/// current on this thread.
+/// `GoProgram` and the static file versions stay leaked; a freeable file
+/// version is freed with its last holder (`ast/file_version.rs`). Panics
+/// when `program` is current on this thread.
 pub fn release_program(program: &'static GoProgram) {
     drop(release_program_with(program, CheckerPool::shut_down));
 }

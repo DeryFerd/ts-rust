@@ -1912,11 +1912,10 @@ pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
 
 /// Publishes the build stores of this thread: `go_files[i]` is the
 /// `GoFile` of id `unpublished_file_ids().start + i`. The loader calls this
-/// once per program,
-/// before `core::set_prog`. The stores are then read-only, and any thread
-/// can read them. The first publish is tier 0; later ones go to tier 1,
-/// except a freeable file version (lsshells M3b), which owns its store and
-/// `GoFile`. An empty later publish does nothing.
+/// once per program, before `core::set_prog`. The stores are then
+/// read-only, and any thread can read them. The first publish is tier 0;
+/// later ones go to tier 1, except a freeable file version (lsshells M3b),
+/// which owns its store and `GoFile`. An empty later publish does nothing.
 // PORT: Go needs no publish; its nodes are heap objects. The publish also
 // computes `NodeHeader::source_file_is_root` for `get_source_file_of_node`.
 pub fn publish_file_stores(go_files: Vec<GoFile>) {

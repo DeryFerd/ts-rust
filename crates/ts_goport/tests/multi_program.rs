@@ -100,6 +100,105 @@ fn programs_after_an_unrelated_program() {
     assert_new_c_error(&pair);
 }
 
+/// lsshells M3b. `GOPORT_FREE_FILE_VERSIONS=1` turns freeing on in
+/// `goport_multiprog` (a CLI process, where it is off by default).
+const FREE_FILE_VERSIONS: &[(&str, &str)] = &[("GOPORT_FREE_FILE_VERSIONS", "1")];
+
+/// lsshells M3b: with freeing on, each new parse of B is a freeable file
+/// version (its store and `GoFile` belong to the version, not to a leaked
+/// tier 1 publish), and `goport_multiprog` checks that. A and B still report
+/// like fresh runs, for an edit that keeps the imports (only the changed
+/// file is new) and for one that adds an import (every file is new).
+// PORT: no Go counterpart.
+#[test]
+fn freeable_file_versions_report_like_fresh_runs() {
+    let pair = check_pair_with_env(
+        "free-keeps-imports",
+        Some("edits/a.ts"),
+        false,
+        FREE_FILE_VERSIONS,
+    );
+    assert!(
+        pair.reused,
+        "an edit with the same imports must reuse the other files"
+    );
+    assert_new_c_error(&pair);
+    let pair = check_pair_with_env(
+        "free-changes-imports",
+        Some("edits/a-imports.ts"),
+        false,
+        FREE_FILE_VERSIONS,
+    );
+    assert!(
+        !pair.reused,
+        "an edit that adds an import must rebuild the program"
+    );
+    assert_new_c_error(&pair);
+}
+
+/// lsshells M3b: `goport_multiprog cycles` with freeing on frees every
+/// freeable file version once no program has it: after the last release,
+/// each version it made is dead. Each report equals the report of the last
+/// version with the same text (`cycles` checks it). A CLI process with the
+/// flag unset makes no file version and frees nothing.
+// PORT: no Go counterpart.
+#[test]
+fn cycles_free_file_versions_only_when_the_flag_is_on() {
+    const CYCLES: usize = 4;
+    let (made, dead) = run_cycles("cycles-default", CYCLES, &[]);
+    assert_eq!((made, dead), (0, 0), "a CLI process makes no file version");
+    let (made, dead) = run_cycles("cycles-free", CYCLES, FREE_FILE_VERSIONS);
+    assert!(
+        made >= CYCLES,
+        "each cycle parses the changed file again, so it makes a file version (made {made})"
+    );
+    assert_eq!(
+        dead, made,
+        "a file version outlives every program that had it (a missed holder)"
+    );
+}
+
+/// Runs `goport_multiprog cycles` `count` times on a new copy of the fixture
+/// with `env` set, and gives the numbers of its last line,
+/// `file_versions made=<n> dead=<m>`. `GOPORT_FREE_FILE_VERSIONS` is unset
+/// unless `env` sets it, so the test environment does not change the
+/// default.
+fn run_cycles(test: &str, count: usize, env: &[(&str, &str)]) -> (usize, usize) {
+    let root = scratch_dir(test);
+    let project = root.join("project");
+    copy_dir(Path::new(FIXTURE), &project);
+    let changed = project.join(CHANGED);
+    let original = read(&changed);
+    let run = Command::new(env!("CARGO_BIN_EXE_goport_multiprog"))
+        .arg("cycles")
+        .arg("tsconfig.json")
+        .arg(&changed)
+        .arg(count.to_string())
+        .env_remove("GOPORT_FREE_FILE_VERSIONS")
+        .envs(env.iter().copied())
+        .current_dir(&project)
+        .output()
+        .expect("run goport_multiprog");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(
+        run.status.success(),
+        "goport_multiprog cycles failed ({}) in {}:\n{stdout}\n{}",
+        run.status,
+        root.display(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(read(&changed), original, "cycles must restore {CHANGED}");
+    let counts = stdout
+        .lines()
+        .last()
+        .and_then(|line| line.strip_prefix("file_versions made="))
+        .and_then(|rest| rest.split_once(" dead="))
+        .and_then(|(made, dead)| Some((made.parse().ok()?, dead.parse().ok()?)))
+        .unwrap_or_else(|| panic!("no file_versions line in the cycles output:\n{stdout}"));
+    fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+    counts
+}
+
 /// The projects of the live tests: the fixture dir, the
 /// `goport_live_programs` mode and a line that its `checker.txt` must hold.
 /// The `emit` and `linked` lines are `import(...)` types, so the checkers
@@ -475,6 +574,17 @@ fn read_tree(dir: &Path) -> BTreeMap<String, String> {
 /// loads, reports and releases a second copy, so A and B are not the first
 /// program of the process.
 fn check_pair(test: &str, edit: Option<&str>, with_first: bool) -> Pair {
+    check_pair_with_env(test, edit, with_first, &[])
+}
+
+/// `check_pair` with `env` set for `goport_multiprog` (not for the fresh
+/// `goport` runs).
+fn check_pair_with_env(
+    test: &str,
+    edit: Option<&str>,
+    with_first: bool,
+    env: &[(&str, &str)],
+) -> Pair {
     let root = scratch_dir(test);
     let project = root.join("project");
     copy_dir(Path::new(FIXTURE), &project);
@@ -506,6 +616,7 @@ fn check_pair(test: &str, edit: Option<&str>, with_first: bool) -> Pair {
     }
     let run = Command::new(env!("CARGO_BIN_EXE_goport_multiprog"))
         .args(&args)
+        .envs(env.iter().copied())
         .current_dir(&project)
         .output()
         .expect("run goport_multiprog");
