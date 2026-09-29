@@ -1291,6 +1291,27 @@ impl Checker {
         is_write: bool,
     ) -> ModifierFlags {
         let sym = self.sym(s);
+        if sym.check_flags.intersects(CheckFlags::SYNTHETIC) {
+            let check_flags = sym.check_flags;
+            let mut access_modifier = ModifierFlags::NONE;
+            if !is_write && check_flags.intersects(CheckFlags::CONTAINS_PUBLIC)
+                || is_write && check_flags.intersects(CheckFlags::CONTAINS_WRITE_PUBLIC)
+            {
+                access_modifier = ModifierFlags::PUBLIC;
+            } else if !is_write && check_flags.intersects(CheckFlags::CONTAINS_PROTECTED)
+                || is_write && check_flags.intersects(CheckFlags::CONTAINS_WRITE_PROTECTED)
+            {
+                access_modifier = ModifierFlags::PROTECTED;
+            } else if !is_write && check_flags.intersects(CheckFlags::CONTAINS_PRIVATE)
+                || is_write && check_flags.intersects(CheckFlags::CONTAINS_WRITE_PRIVATE)
+            {
+                access_modifier = ModifierFlags::PRIVATE;
+            }
+            if check_flags.intersects(CheckFlags::CONTAINS_STATIC) {
+                return access_modifier | ModifierFlags::STATIC;
+            }
+            return access_modifier;
+        }
         if sym.value_declaration.is_some() {
             let mut declaration = Node::NIL;
             if is_write {
@@ -1317,20 +1338,6 @@ impl Checker {
                 return flags;
             }
             return flags.without(ModifierFlags::ACCESSIBILITY_MODIFIER);
-        }
-        if sym.check_flags.intersects(CheckFlags::SYNTHETIC) {
-            let access_modifier = if sym.check_flags.intersects(CheckFlags::CONTAINS_PRIVATE) {
-                ModifierFlags::PRIVATE
-            } else if sym.check_flags.intersects(CheckFlags::CONTAINS_PUBLIC) {
-                ModifierFlags::PUBLIC
-            } else {
-                ModifierFlags::PROTECTED
-            };
-            let mut static_modifier = ModifierFlags::NONE;
-            if sym.check_flags.intersects(CheckFlags::CONTAINS_STATIC) {
-                static_modifier = ModifierFlags::STATIC;
-            }
-            return access_modifier | static_modifier;
         }
         if sym.flags.intersects(SymbolFlags::PROTOTYPE) {
             return ModifierFlags::PUBLIC | ModifierFlags::STATIC;

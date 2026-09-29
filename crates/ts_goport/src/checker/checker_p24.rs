@@ -275,6 +275,8 @@ impl Checker {
                 let modifiers;
                 if prop.is_some() {
                     modifiers = self.get_declaration_modifier_flags_from_symbol(prop);
+                    let write_modifiers = self
+                        .get_declaration_modifier_flags_from_symbol_ex(prop, true /*isWrite*/);
                     let prop_symbol_flags = self.sym(prop).flags;
                     if prop_symbol_flags.intersects(SymbolFlags::CLASS_MEMBER) {
                         if is_union {
@@ -343,14 +345,27 @@ impl Checker {
                     } else if !is_union && !self.is_readonly_symbol(prop) {
                         check_flags = check_flags.without(CheckFlags::READONLY);
                     }
-                    if !modifiers.intersects(ModifierFlags::NON_PUBLIC_ACCESSIBILITY_MODIFIER) {
+                    if modifiers.intersects(ModifierFlags::PROTECTED)
+                        && !modifiers.intersects(ModifierFlags::PUBLIC)
+                    {
+                        check_flags |= CheckFlags::CONTAINS_PROTECTED;
+                    } else if modifiers.intersects(ModifierFlags::PRIVATE)
+                        && !modifiers.intersects(ModifierFlags::PUBLIC)
+                    {
+                        check_flags |= CheckFlags::CONTAINS_PRIVATE;
+                    } else {
                         check_flags |= CheckFlags::CONTAINS_PUBLIC;
                     }
-                    if modifiers.intersects(ModifierFlags::PROTECTED) {
-                        check_flags |= CheckFlags::CONTAINS_PROTECTED;
-                    }
-                    if modifiers.intersects(ModifierFlags::PRIVATE) {
-                        check_flags |= CheckFlags::CONTAINS_PRIVATE;
+                    if write_modifiers.intersects(ModifierFlags::PROTECTED)
+                        && !write_modifiers.intersects(ModifierFlags::PUBLIC)
+                    {
+                        check_flags |= CheckFlags::CONTAINS_WRITE_PROTECTED;
+                    } else if write_modifiers.intersects(ModifierFlags::PRIVATE)
+                        && !write_modifiers.intersects(ModifierFlags::PUBLIC)
+                    {
+                        check_flags |= CheckFlags::CONTAINS_WRITE_PRIVATE;
+                    } else {
+                        check_flags |= CheckFlags::CONTAINS_WRITE_PUBLIC;
                     }
                     if modifiers.intersects(ModifierFlags::STATIC) {
                         check_flags |= CheckFlags::CONTAINS_STATIC;
@@ -395,16 +410,36 @@ impl Checker {
                 }
             }
         }
-        if single_prop.is_nil()
-            || is_union
-                && (!prop_set.is_empty() || check_flags.intersects(CheckFlags::PARTIAL))
-                && check_flags
-                    .intersects(CheckFlags::CONTAINS_PRIVATE | CheckFlags::CONTAINS_PROTECTED)
-                && !(!prop_set.is_empty() && self.has_common_declaration(&prop_set))
-        {
-            // No property was found, or, in a union, a property has a private or protected declaration in one
-            // constituent, but is missing or has a different declaration in another constituent.
+        if single_prop.is_nil() {
+            // No property was found
             return SymbolId::NIL;
+        }
+        if is_union
+            && (!prop_set.is_empty() || check_flags.intersects(CheckFlags::PARTIAL))
+            && check_flags.intersects(
+                CheckFlags::CONTAINS_PRIVATE
+                    | CheckFlags::CONTAINS_PROTECTED
+                    | CheckFlags::CONTAINS_WRITE_PRIVATE
+                    | CheckFlags::CONTAINS_WRITE_PROTECTED,
+            )
+            && !(!prop_set.is_empty() && self.has_common_declaration(&prop_set))
+        {
+            // A property in a union has a private or protected declaration in one constituent, but is missing
+            // or has a different declaration in another constituent. If the private or protected declaration is
+            // for reading, we don't create a property.
+            if check_flags.intersects(CheckFlags::CONTAINS_PRIVATE | CheckFlags::CONTAINS_PROTECTED)
+            {
+                return SymbolId::NIL;
+            }
+            // Otherwise, if the private or protected declaration is for writing, reduce accessibility to that of
+            // the most restricted constituent.
+            if check_flags.intersects(CheckFlags::CONTAINS_WRITE_PRIVATE) {
+                check_flags = check_flags.without(
+                    CheckFlags::CONTAINS_WRITE_PUBLIC | CheckFlags::CONTAINS_WRITE_PROTECTED,
+                );
+            } else if check_flags.intersects(CheckFlags::CONTAINS_WRITE_PROTECTED) {
+                check_flags = check_flags.without(CheckFlags::CONTAINS_WRITE_PUBLIC);
+            }
         }
         if prop_set.is_empty()
             && !check_flags.intersects(CheckFlags::READ_PARTIAL)
