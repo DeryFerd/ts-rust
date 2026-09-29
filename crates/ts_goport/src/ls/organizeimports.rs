@@ -33,7 +33,7 @@ impl LanguageService {
         &self,
         ctx: &Context,
         source_file: Node,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         kind: &lsproto::CodeActionKind,
     ) -> IndexMap<String, Vec<lsproto::TextEdit>> {
         let mut change_tracker = change::new_tracker(
@@ -198,7 +198,7 @@ fn organize_imports_worker(
     should_combine: bool,
     should_remove: bool,
     source_file: Node,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     change_tracker: &mut change::Tracker,
     ctx: &Context,
 ) {
@@ -345,7 +345,7 @@ fn remove_unused_imports(
     old_imports: &[Node],
     source_file: Node,
     type_checker: &mut Checker,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     change_tracker: &mut change::Tracker,
 ) -> Vec<Node> {
     let compiler_options = program.options();

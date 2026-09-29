@@ -214,7 +214,7 @@ fn is_external_module_symbol_in(symbols: &SymbolArena, module_symbol: SymbolId) 
 // (the results go into a set).
 pub fn get_resolved_package_names(
     ctx: &Context,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
 ) -> FxHashSet<String> {
     let raw_names = program.resolved_package_names();
     let unresolved_package_names = program.unresolved_package_names();
@@ -267,7 +267,7 @@ pub fn get_resolved_package_names(
 // This is used during node_modules bucket building to redirect extraction
 // from output files to source files when the output is from a project reference.
 pub fn add_project_reference_output_mappings(
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     result: &mut FxHashMap<tspath::Path, String>,
 ) {
     let refs = program.get_resolved_project_references();
@@ -300,9 +300,9 @@ pub fn add_project_reference_output_mappings(
 // with the Go deadlock text. A release after `closePool` panics like a send
 // on a closed channel.
 pub fn create_checker_pool(
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
 ) -> (
-    Box<dyn Fn() -> (Rc<RefCell<Checker>>, ls_program::Release)>,
+    Box<dyn Fn() -> (Rc<RefCell<Checker>>, ls_program::Release) + '_>,
     Box<dyn Fn()>,
     Box<dyn Fn() -> i32>,
 ) {
@@ -329,7 +329,7 @@ pub fn create_checker_pool(
         }
     };
 
-    let get_checker: Box<dyn Fn() -> (Rc<RefCell<Checker>>, ls_program::Release)> = {
+    let get_checker: Box<dyn Fn() -> (Rc<RefCell<Checker>>, ls_program::Release) + '_> = {
         let pool = pool.clone();
         let created = created.clone();
         Box::new(move || {

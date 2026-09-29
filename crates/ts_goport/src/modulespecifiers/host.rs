@@ -11,6 +11,7 @@ use super::packagejson::{self, InfoCacheEntry, PackageJson};
 use super::symlinks::KnownSymlinks;
 use super::tspath;
 use super::types::ModuleSpecifierGenerationHost;
+use std::sync::Arc;
 
 /// The current program (`prog()`) as a `ModuleSpecifierGenerationHost`.
 /// The program state is reached through the current program, so the host has
@@ -226,7 +227,7 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
             return Some(cached);
         }
         if let Some(go) = crate::program::get_go_symlink_cache() {
-            let known_symlinks = Rc::new(go.clone());
+            let known_symlinks = Rc::new((*go).clone());
             with_program_caches(|c| c.known_symlinks = Some(known_symlinks.clone()));
             return Some(known_symlinks);
         }
@@ -334,7 +335,7 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
     fn get_project_reference_from_source(
         &self,
         path: &tspath::Path,
-    ) -> Option<&'static SourceOutputAndProjectReference> {
+    ) -> Option<Arc<SourceOutputAndProjectReference>> {
         crate::program::get_project_reference_from_source(path)
     }
 

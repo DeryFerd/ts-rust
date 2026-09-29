@@ -149,13 +149,13 @@ impl autoimport::RegistryCloneHost for AutoImportRegistryCloneHost {
     fn get_default_project(
         &self,
         path: &tspath::Path,
-    ) -> (tspath::Path, Option<&'static compiler::NewProgram>) {
+    ) -> (tspath::Path, Option<Rc<compiler::NewProgram>>) {
         let Some(project) = self.project_collection.get_default_project(path) else {
             return (tspath::Path::default(), None);
         };
         let project = project.borrow();
         // PORT: Go `project.GetProgram()` is the field read.
-        (project.config_file_path.clone(), project.program)
+        (project.config_file_path.clone(), project.program.clone())
     }
 
     // Go: project/autoimport.go:145 GetProgramForProject
@@ -163,10 +163,10 @@ impl autoimport::RegistryCloneHost for AutoImportRegistryCloneHost {
     fn get_program_for_project(
         &self,
         project_path: &tspath::Path,
-    ) -> Option<&'static compiler::NewProgram> {
+    ) -> Option<Rc<compiler::NewProgram>> {
         let project = self.project_collection.get_project_by_path(project_path)?;
         // PORT: Go `project.GetProgram()` is the field read.
-        let program = project.borrow().program;
+        let program = project.borrow().program.clone();
         program
     }
 

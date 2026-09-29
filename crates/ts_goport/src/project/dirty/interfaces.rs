@@ -20,8 +20,9 @@
 //!    `*configFileEntry`, `*diskFile`, `*Snapshot`, ...) is `Rc<X>`, or
 //!    `Rc<RefCell<X>>` when Go mutates it after sharing. A pointer that can
 //!    be nil is `Option<..>`. Go pointer equality is `Rc::ptr_eq`
-//!    (`std::ptr::eq` for `&'static compiler::NewProgram`). A pointer map
-//!    key is `Rc::as_ptr(&p) as usize` (programs: `p as *const _ as usize`).
+//!    (`std::ptr::eq` for a `&compiler::NewProgram` borrow). A pointer map
+//!    key is `Rc::as_ptr(&p) as usize`, for programs too; the key is valid
+//!    while a holder of the `Rc` keeps the address in use.
 //! 3. `dirty` values. The value type `T` of `dirty::Box`, `dirty::Map` and
 //!    `dirty::SyncMap` is the non-nil handle: `Rc<RefCell<X>>` for Go `*X`,
 //!    `dirty::CloneableMap<K, V>` for a Go map. `T: Clone` copies the handle

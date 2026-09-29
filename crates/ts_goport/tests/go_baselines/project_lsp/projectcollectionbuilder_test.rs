@@ -435,7 +435,7 @@ child_test! {
             .project_collection
             .inferred_project()
             .expect("inferred project");
-        let program = inferred_project.borrow().program.expect("program");
+        let program = inferred_project.borrow().program.clone().expect("program");
         assert_eq!(
             program.command_line().file_names(),
             ["/project/a.ts", "/project/b.ts", "/project/c.ts"]
@@ -582,7 +582,7 @@ child_test! {
 
         // Verify initial state: #utils resolves to utils.ts, so utils.ts is in the program
         let p = program(&session, index_uri);
-        assert_eq!(all_sem_diag_count(p), 0, "should have no diagnostics with correct package.json");
+        assert_eq!(all_sem_diag_count(&p), 0, "should have no diagnostics with correct package.json");
 
         // Now change the package.json to point #utils at a non-existent file
         utils
@@ -602,7 +602,7 @@ child_test! {
 
         let updated_program = program(&session, index_uri);
         assert_eq!(
-            all_sem_diag_count(updated_program),
+            all_sem_diag_count(&updated_program),
             1,
             "should have diagnostics after package.json change"
         );

@@ -38,11 +38,11 @@ pub fn close(session: &Rc<Session>, u: &str) {
 
 /// Go `session.GetLanguageService(ctx, uri)` with `assert.NilError`, then
 /// `ls.GetProgram()`.
-pub fn program(session: &Rc<Session>, u: &str) -> &'static NewProgram {
-    session
+pub fn program(session: &Rc<Session>, u: &str) -> Rc<NewProgram> {
+    let ls = session
         .get_language_service(&bg(), &uri(u))
-        .unwrap_or_else(|err| panic!("GetLanguageService({u}): {}", err.error()))
-        .get_program()
+        .unwrap_or_else(|err| panic!("GetLanguageService({u}): {}", err.error()));
+    Rc::clone(&ls.program)
 }
 
 /// Go `program.GetSourceFile(name) != nil`.
@@ -59,7 +59,7 @@ pub fn text(p: &NewProgram, name: &str) -> String {
 }
 
 /// Go `len(program.GetSemanticDiagnostics(projecttestutil.WithRequestID(ctx), program.GetSourceFile(name)))`.
-pub fn sem_diag_count(p: &'static NewProgram, name: &str) -> usize {
+pub fn sem_diag_count(p: &NewProgram, name: &str) -> usize {
     let file = p
         .get_source_file(name)
         .unwrap_or_else(|| panic!("no source file {name}"));
@@ -225,7 +225,7 @@ pub fn bare_session(files: super::projecttestutil::FileMap) -> Rc<Session> {
 }
 
 /// Go `session.GetLanguageService(ctx, uri)` then `ls.GetProgram()`.
-pub fn program_of(session: &Rc<Session>, u: &str) -> &'static NewProgram {
+pub fn program_of(session: &Rc<Session>, u: &str) -> Rc<NewProgram> {
     program(session, u)
 }
 
@@ -255,7 +255,7 @@ pub fn default_project_kind(session: &Rc<Session>, u: &str) -> ts_goport::projec
 }
 
 /// Go `len(program.GetSemanticDiagnostics(ctx, nil))`: every file.
-pub fn all_sem_diag_count(p: &'static NewProgram) -> usize {
+pub fn all_sem_diag_count(p: &NewProgram) -> usize {
     ls_program::get_semantic_diagnostics(p, &bg(), ts_goport::core::Node::NIL).len()
 }
 

@@ -9,7 +9,7 @@ use crate::ls::prelude::*;
 // (plan contract C3).
 pub fn get_all_diagnostics(
     ctx: &Context,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     file: Node,
 ) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();

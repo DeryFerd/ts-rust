@@ -75,7 +75,7 @@ child_test! {
         let p = program(&session, APP_URI);
         // Verify the local config.js file is included in the program
         assert!(
-            has_file(p, "/user/username/projects/project/config.js"),
+            has_file(&p, "/user/username/projects/project/config.js"),
             "local config.js should be included"
         );
 
@@ -132,7 +132,7 @@ child_test! {
 
         // Verify the types file was installed
         let p = program(&session, APP_URI);
-        assert!(has_file(p, &typings_file("jquery")), "jquery types should be installed");
+        assert!(has_file(&p, &typings_file("jquery")), "jquery types should be installed");
     }
 }
 
@@ -291,7 +291,7 @@ fn two_calls_and_jquery_installed(session: &Rc<Session>, utils: &SessionUtils) {
     // Verify the types file was installed
     let p = program(session, APP_URI);
     assert!(
-        has_file(p, &typings_file("jquery")),
+        has_file(&p, &typings_file("jquery")),
         "jquery types should be installed"
     );
 }
@@ -363,7 +363,7 @@ child_test! {
 
         // Verify types file present
         let p = program(&session, APP_URI);
-        assert!(has_file(p, &typings_file("commander")));
+        assert!(has_file(&p, &typings_file("commander")));
     }
 }
 
@@ -383,9 +383,9 @@ child_test! {
 
         let p = program(&session, APP_URI);
         // Types file present
-        assert!(has_file(p, &typings_file("commander")));
+        assert!(has_file(&p, &typings_file("commander")));
         // JS resolution should be dropped
-        assert!(!has_file(p, "/user/username/projects/node_modules/commander/index.js"));
+        assert!(!has_file(&p, "/user/username/projects/node_modules/commander/index.js"));
     }
 }
 
@@ -411,7 +411,7 @@ fn cache_files(dev_version: &str, lock: &str) -> FileMap {
 
 fn jquery_typings_text(session: &Rc<Session>) -> String {
     let p = program(session, APP_URI);
-    text(p, &typings_file("jquery"))
+    text(&p, &typings_file("jquery"))
 }
 
 child_test! {
@@ -504,10 +504,10 @@ child_test! {
 
         // Verify the types files were installed
         let p = program(&session, APP_URI);
-        assert!(has_file(p, &typings_file("node")), "node types should be installed");
-        assert!(has_file(p, &typings_file("commander")), "commander types should be installed");
+        assert!(has_file(&p, &typings_file("node")), "node types should be installed");
+        assert!(has_file(&p, &typings_file("commander")), "commander types should be installed");
         assert!(
-            has_file(p, &typings_file("ember__component")),
+            has_file(&p, &typings_file("ember__component")),
             "ember__component types should be installed"
         );
     }

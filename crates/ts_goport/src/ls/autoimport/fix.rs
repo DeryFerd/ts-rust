@@ -1028,7 +1028,7 @@ impl View {
             })];
         }
 
-        let import_kind = get_import_kind(self.importing_file, export, self.program);
+        let import_kind = get_import_kind(self.importing_file, export, &self.program);
         let add_as_type_only =
             get_add_as_type_only(is_valid_type_only_use_site, export, self.program.options());
 
@@ -1102,7 +1102,7 @@ impl View {
             return None;
         }
 
-        if get_import_kind(self.importing_file, export, self.program) != lsproto::ImportKind::NAMED
+        if get_import_kind(self.importing_file, export, &self.program) != lsproto::ImportKind::NAMED
         {
             return None;
         }
@@ -1190,7 +1190,7 @@ impl View {
             return None;
         }
 
-        let import_kind = get_import_kind(self.importing_file, export, self.program);
+        let import_kind = get_import_kind(self.importing_file, export, &self.program);
         if import_kind == lsproto::ImportKind::COMMON_JS
             || import_kind == lsproto::ImportKind::NAMESPACE
         {
@@ -1306,7 +1306,7 @@ impl View {
 fn get_import_kind(
     importing_file: Node,
     export: &Export,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
 ) -> lsproto::ImportKind {
     if program.options().verbatim_module_syntax.is_true()
         && program.get_emit_module_format_of_file(&source_file_has_file_name(importing_file))
@@ -1630,7 +1630,7 @@ impl View {
                 &a.module_specifier,
                 &b.module_specifier,
                 self.importing_file,
-                self.program,
+                &self.program,
             );
             if comparison != 0 {
                 return comparison;
@@ -1700,7 +1700,7 @@ impl View {
         a: &str,
         b: &str,
         _importing_file: Node,
-        _program: &'static compiler::NewProgram,
+        _program: &compiler::NewProgram,
     ) -> i32 {
         if a.starts_with("node:") && !b.starts_with("node:") {
             if self.should_use_uri_style_node_core_modules.is_true() {

@@ -3,7 +3,7 @@ use crate::ls::prelude::*;
 // Port of Go `ls/string_completions.go`.
 //
 // PORT (whole file):
-// - Go `*compiler.Program` is `&'static compiler::NewProgram` (plan
+// - Go `*compiler.Program` is `&compiler::NewProgram` (plan
 //   D-PROGRAM). Package.json lookups and the typings cache location are
 //   `NewProgram` methods, run on the dispatch thread.
 // - Go passes `program` where a `modulespecifiers.ModuleSpecifierGenerationHost`
@@ -798,7 +798,7 @@ impl LanguageService {
         &self,
         file: Node,
         node: Node,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         checker: &mut Checker,
     ) -> StringLiteralCompletions {
         let name_and_kinds = self
@@ -871,7 +871,7 @@ impl LanguageService {
         &self,
         file: Node,
         node: Node,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         checker: &mut Checker,
     ) -> Vec<ModuleCompletionNameAndKind> {
         let literal_value = tspath::normalize_slashes(node.text());
@@ -934,7 +934,7 @@ impl LanguageService {
         fragment: &str,
         script_path: &str,
         mode: ResolutionMode,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         type_checker: &mut Checker,
         extension_options: &ExtensionOptions,
     ) -> Vec<ModuleCompletionNameAndKind> {
@@ -1256,7 +1256,7 @@ impl LanguageService {
     // Go: ls/string_completions.go:900 getCompletionEntriesFromTypings
     fn get_completion_entries_from_typings(
         &self,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         script_path: &str,
         fragment_directory: &str,
         extension_options: &ExtensionOptions,
@@ -1306,7 +1306,7 @@ impl LanguageService {
         options: &CompilerOptions,
         fragment_directory: &str,
         extension_options: &ExtensionOptions,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         seen: &mut FxHashMap<String, bool>,
         result: &mut ModuleCompletionNameAndKindSet,
     ) {
@@ -1483,7 +1483,7 @@ impl LanguageService {
         &self,
         literal_value: &str,
         script_directory: &str,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         script_path: &tspath::Path,
         extension_options: &ExtensionOptions,
     ) -> Vec<ModuleCompletionNameAndKind> {
@@ -1521,7 +1521,7 @@ impl LanguageService {
         root_dirs: &[String],
         fragment: &str,
         script_directory: &str,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         exclude: &str,
         extension_options: &ExtensionOptions,
     ) -> Vec<ModuleCompletionNameAndKind> {
@@ -1723,7 +1723,7 @@ impl LanguageService {
         fragment: &str,
         script_directory: &str,
         extension_options: &ExtensionOptions,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         module_specifier_is_relative: bool,
         exclude: &str,
         result: &mut ModuleCompletionNameAndKindSet,
@@ -1846,7 +1846,7 @@ impl LanguageService {
     fn add_completion_entries_from_paths(
         &self,
         result: &mut ModuleCompletionNameAndKindSet,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         fragment: &str,
         base_directory: &str,
         extension_options: &ExtensionOptions,
@@ -1889,7 +1889,7 @@ impl LanguageService {
     fn add_completion_entries_from_paths_or_exports_or_imports(
         &self,
         result: &mut ModuleCompletionNameAndKindSet,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         is_exports: bool,
         is_imports: bool,
         fragment: &str,
@@ -1986,7 +1986,7 @@ impl LanguageService {
         is_exports: bool,
         is_imports: bool,
         extension_options: &ExtensionOptions,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
     ) -> Vec<ModuleCompletionNameAndKind> {
         let mut fragment_directory = get_fragment_directory(fragment);
         if !fragment_directory.is_empty() {
@@ -2133,7 +2133,7 @@ impl LanguageService {
         is_exports: bool,
         is_imports: bool,
         extension_options: &ExtensionOptions,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
     ) -> Vec<ModuleCompletionNameAndKind> {
         let parsed = module::try_parse_pattern(pattern);
         if !parsed.is_valid() || parsed.star_index == -1 {
@@ -2411,7 +2411,7 @@ fn get_possible_original_input_path_without_changing_ext(
 // Go: ls/string_completions.go:1826 getFilenameWithExtensionOption
 fn get_filename_with_extension_option(
     name: &str,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     extension_options: &ExtensionOptions,
     is_exports_or_imports_wildcard: bool,
 ) -> (String, String) {
@@ -2843,7 +2843,7 @@ impl LanguageService {
         &self,
         file: Node,
         position: i32,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         _checker: &mut Checker,
     ) -> Vec<PathCompletion> {
         let compiler_options = program.options();
