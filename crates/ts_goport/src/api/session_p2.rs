@@ -1675,6 +1675,26 @@ impl Session {
         Ok(setup.new_symbol_response(aliased))
     }
 
+    // Go: api/session.go handleMethodGetTargetSymbol (ts#63945)
+    // handleGetTargetSymbol returns the target symbol if the symbol is instantiated,
+    // otherwise returns the provided symbol.
+    pub fn handle_method_get_target_symbol(
+        &self,
+        ctx: &Context,
+        params: &CheckerSymbolParams,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+
+        let target = setup
+            .checker
+            .borrow_mut()
+            .get_target_symbol_exported(symbol);
+        Ok(setup.new_symbol_response(target))
+    }
+
     // Go: api/session.go:2632 handleGetMemberInModuleExports
     // handleGetMemberInModuleExports returns an export by name from a module symbol.
     pub fn handle_get_member_in_module_exports(

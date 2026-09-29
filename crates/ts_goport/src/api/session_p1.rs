@@ -1296,6 +1296,10 @@ impl ipc::Handler for Session {
             m if m == Method::GET_IMMEDIATE_ALIASED_SYMBOL.0 => self
                 .handle_get_immediate_aliased_symbol(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#63945
+            m if m == Method::GET_TARGET_SYMBOL.0 => self
+                .handle_method_get_target_symbol(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_FULLY_QUALIFIED_NAME.0 => self
                 .handle_get_fully_qualified_name(ctx, assert_params(&parsed))
                 .map(to_any),

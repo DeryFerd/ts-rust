@@ -369,6 +369,8 @@ impl Method {
     pub const GET_ALIASED_SYMBOL: Method = Method(Cow::Borrowed("getAliasedSymbol"));
     pub const GET_IMMEDIATE_ALIASED_SYMBOL: Method =
         Method(Cow::Borrowed("getImmediateAliasedSymbol"));
+    // ts#63945
+    pub const GET_TARGET_SYMBOL: Method = Method(Cow::Borrowed("getTargetSymbol"));
     pub const GET_FULLY_QUALIFIED_NAME: Method = Method(Cow::Borrowed("getFullyQualifiedName"));
     pub const GET_EXPORTS_OF_MODULE: Method = Method(Cow::Borrowed("getExportsOfModule"));
     pub const GET_MEMBER_IN_MODULE_EXPORTS: Method =
@@ -1166,6 +1168,11 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_IMMEDIATE_ALIASED_SYMBOL,
+        unmarshaller_for::<CheckerSymbolParams>,
+    );
+    // ts#63945
+    m.insert(
+        Method::GET_TARGET_SYMBOL,
         unmarshaller_for::<CheckerSymbolParams>,
     );
     m.insert(
