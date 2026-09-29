@@ -18,6 +18,8 @@
 //! Go `signal.NotifyContext(ctx, SIGINT, SIGTERM)` is
 //! `cmd::tsgo::main::notify_context`. Only watch and build mode read the
 //! context; a plain compile goes on after a signal, as in Go.
+//! Not Go: when the run gets 4 KiB pages, a worker copy of the binary does
+//! the work, so the exit does not wait for its memory to unmap (`launch`).
 //! PORT: Go `core.ApplyDebugStackLimit` (`TS_GO_DEBUG_STACK_LIMIT`) is a
 //! debug setting and is skipped. The work runs on a thread with a 1 GiB
 //! stack, like the other goport bins.
@@ -151,7 +153,8 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
 /// `GOPORT_LAUNCH=0` never starts a worker and `GOPORT_LAUNCH=1` always
 /// does. None when this process runs the work: it is a worker, no worker is
 /// wanted, `--lsp`, `--api` or watch mode (they end on their own), or the
-/// worker cannot start.
+/// worker cannot start. The launcher sends SIGINT and SIGTERM on to the
+/// worker (`forward_signals`).
 #[cfg(target_os = "linux")]
 fn launch(huge_pages: bool) -> Option<i32> {
     use std::io::Read;
@@ -168,9 +171,12 @@ fn launch(huge_pages: bool) -> Option<i32> {
     let mut args = std::env::args_os();
     let program = args.next()?;
     let args: Vec<_> = args.collect();
+    // Go `getInputOptionName`: an option name has one or two leading '-'.
     let watch = |a: &std::ffi::OsString| {
         a.to_str()
-            .is_some_and(|a| a.eq_ignore_ascii_case("--watch") || a.eq_ignore_ascii_case("-w"))
+            .and_then(|a| a.strip_prefix('-'))
+            .map(|a| a.strip_prefix('-').unwrap_or(a))
+            .is_some_and(|a| a.eq_ignore_ascii_case("watch") || a.eq_ignore_ascii_case("w"))
     };
     if args.first().is_some_and(|a| a == "--lsp" || a == "--api") || args.iter().any(watch) {
         return None;
@@ -186,6 +192,7 @@ fn launch(huge_pages: bool) -> Option<i32> {
         .spawn()
         .ok()?;
     drop(write);
+    forward_signals(&worker);
     let mut code = [0; 4];
     if std::fs::File::from(read).read_exact(&mut code).is_ok() {
         return Some(i32::from_le_bytes(code));
@@ -197,6 +204,29 @@ fn launch(huge_pages: bool) -> Option<i32> {
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
         Err(_) => EXIT_UNPORTED,
     })
+}
+
+/// Sends each SIGINT and SIGTERM that the launcher gets on to `worker`, on
+/// a thread. So a signal reaches the work as in a run without a worker:
+/// `notify_context` catches it there, and a plain compile goes on, as in
+/// Go. Without this, the signal would end the launcher and then the parent
+/// death signal would kill the worker.
+#[cfg(target_os = "linux")]
+fn forward_signals(worker: &std::process::Child) {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    let pid = rustix::process::Pid::from_child(worker);
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("forward-signals".to_string())
+        .spawn(move || {
+            for signal in signals.forever() {
+                if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
+                    let _ = rustix::process::kill_process(pid, signal);
+                }
+            }
+        });
 }
 
 /// Ends the process with `code`. A worker (see `launch`) first points its
