@@ -868,4 +868,6 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 - API handles across checkers: a type, signature or checker-made symbol of
   one project sent with another project of the same snapshot stays
   `unported!` (a Rust id indexes one checker's arena).
-- Windows named pipes (`--api --pipe` on Windows) return an error.
+- Windows named pipes (`--api --pipe` on Windows) use miow's safe
+  `NamedPipe` (D-W1), not winio's overlapped I/O: `Close` does not end an
+  `Accept` that waits on another thread (see `ipc/transport.rs`).

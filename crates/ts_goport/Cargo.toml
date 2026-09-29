@@ -21,9 +21,17 @@ rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "st
 # Go `os/signal` Notify for `signal.NotifyContext` in cmd/tsgo (--watch, --lsp).
 signal-hook = "=0.4.4"
 
-# jemalloc does not build for msvc; the `jemalloc` feature does nothing there.
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+# jemalloc does not build for Windows (msvc, or gnu through zig); the
+# `jemalloc` feature does nothing there.
+[target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { version = "=0.7.0", optional = true }
+
+# ipc/transport.rs: Windows named pipes for `--pipe` (Go `winio.ListenPipe`),
+# through miow's safe `NamedPipe` API. execute/tsc/compile.rs: Go
+# `os.SameFile` in the Windows `LookPath`. No `unsafe` here (D-W1).
+[target.'cfg(windows)'.dependencies]
+miow = "=0.6.1"
+same-file = "=1.0.6"
 
 # `process`: prctl(PR_SET_THP_DISABLE) in thp_guard.rs.
 [target.'cfg(target_os = "linux")'.dependencies]

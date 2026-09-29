@@ -299,6 +299,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "miow"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "name-to-handle-at"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -616,9 +625,11 @@ dependencies = [
  "indexmap",
  "jiff",
  "memchr",
+ "miow",
  "nix",
  "rustc-hash",
  "rustix",
+ "same-file",
  "signal-hook",
  "smallvec",
  "tikv-jemallocator",

@@ -20,8 +20,14 @@ num-bigint = "=0.4.6"
 num-traits = "=0.2.19"
 ryu-js = "=1.0.2"
 rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "termios"] }
+
 # fswatch/canonicalize_darwin.rs: NFC for macOS watch paths (Go calls
-# CoreFoundation). Built on every target so its Go unit tests run on Linux.
+# CoreFoundation). The dev-dependency builds it into this crate's own tests
+# on every target, so its Go unit tests run on Linux.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+unicode-normalization = "=0.1.25"
+
+[dev-dependencies]
 unicode-normalization = "=0.1.25"
 
 # fswatch/unix.rs (Linux only): fanotify_init/fanotify_mark and

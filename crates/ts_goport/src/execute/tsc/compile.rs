@@ -423,6 +423,7 @@ const CHILD_PROCESS_WAIT_DELAY: Duration = Duration::from_secs(1);
 // calls in safe Rust. Go `stderr` `io.Discard` is `None` (the null device
 // here). Go `cmd.Env` nil and the argv[0] of the name are kept. With a
 // `dir`, Go's `Cmd.environ` adds `PWD=` its absolute path, and so does this.
+#[cfg(unix)]
 pub fn spawn_process(
     command: &[String],
     dir: &str,
@@ -514,6 +515,7 @@ pub fn spawn_process(
 // Close kills and reaps the process.
 // PORT: Go `cmd.ProcessState` after `Wait` is `exit_code` (the Go
 // `ExitCode()` value). `child` is `None` after `Close`.
+#[cfg(unix)]
 struct ChildProcess {
     child: Mutex<Option<std::process::Child>>,
     stdin: std::os::unix::net::UnixStream,
@@ -523,11 +525,13 @@ struct ChildProcess {
 }
 
 /// The parent end of the child's stderr and the end signal of its copy.
+#[cfg(unix)]
 struct ChildStderr {
     stream: std::os::unix::net::UnixStream,
     done: std::sync::mpsc::Receiver<()>,
 }
 
+#[cfg(unix)]
 impl crate::ipc::ReadWriteCloser for ChildProcess {
     // Go: cmd/tsgo/sys.go:101 childProcess.Read
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -606,6 +610,7 @@ impl ProcessExitState for ChildProcess {
 /// a slash, with the Go `exec.Error` texts.
 // PORT: Go `execerrdot` is its default: a match in a relative PATH entry is
 // the `ErrDot` error.
+#[cfg(unix)]
 fn look_path(file: &str) -> Result<String, GoError> {
     let exec_error = |text: &str| {
         crate::gostd::errors::new(format!(
@@ -634,6 +639,7 @@ fn look_path(file: &str) -> Result<String, GoError> {
 }
 
 /// Go os/exec/lp_unix.go `findExecutable(file) == nil`.
+#[cfg(unix)]
 fn find_executable(file: &str) -> bool {
     use rustix::fs::{Access, AtFlags, CWD, accessat};
     use rustix::io::Errno;
@@ -655,6 +661,7 @@ fn find_executable(file: &str) -> bool {
 }
 
 /// Go `filepath.Abs(path)` on Unix (path/filepath/path_unix.go `unixAbs`).
+#[cfg(unix)]
 fn go_abs(path: &str) -> Result<String, GoError> {
     if path.starts_with('/') {
         return Ok(go_path_clean(path));
@@ -665,6 +672,7 @@ fn go_abs(path: &str) -> Result<String, GoError> {
 
 /// Go `os.Getwd()` on Unix (os/getwd.go): `$PWD` when it is absolute and
 /// names the current directory, else the `getcwd` result.
+#[cfg(unix)]
 fn go_getwd() -> Result<String, GoError> {
     use std::os::unix::fs::MetadataExt;
     let dot = std::fs::metadata(".")
@@ -683,6 +691,7 @@ fn go_getwd() -> Result<String, GoError> {
 }
 
 /// Go `path.Clean` (the Unix `filepath.Clean`).
+#[cfg(unix)]
 fn go_path_clean(path: &str) -> String {
     if path.is_empty() {
         return ".".to_string();
@@ -734,6 +743,7 @@ fn go_path_clean(path: &str) -> String {
 
 /// The Go text of an OS error: Go's errno table is the C text with a
 /// lowercase first letter, without Rust's " (os error N)".
+#[cfg(unix)]
 fn go_errno_text(err: &std::io::Error) -> String {
     let text = err.to_string();
     let text = match err.raw_os_error() {
@@ -747,6 +757,544 @@ fn go_errno_text(err: &std::io::Error) -> String {
     match chars.next() {
         Some(first) => first.to_lowercase().chain(chars).collect(),
         None => String::new(),
+    }
+}
+
+/// The Go text of an OS error on Windows: Go `syscall.Errno.Error()` is the
+/// system message, which is Rust's text without its " (os error N)".
+#[cfg(windows)]
+fn go_errno_text(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match err.raw_os_error() {
+        Some(code) => text
+            .strip_suffix(&format!(" (os error {code})"))
+            .unwrap_or(&text)
+            .to_string(),
+        None => text,
+    }
+}
+
+// Go: cmd/tsgo/sys.go:74 spawnProcess (tsgo#4712), on Windows
+// spawnProcess launches a process and adapts its stdio to an io.ReadWriteCloser (Read is its stdout,
+// Write is its stdin).
+// PORT: Go `exec.Command` and `Start` find the program with
+// os/exec/lp_windows.go (`win_exec`): `LookPath` for a bare name, else
+// `lookExtensions` (in `Command` for an absolute name, in `Start` against
+// `Dir` for a relative one). syscall `StartProcess` then makes the path
+// absolute against `Dir`. Their Go error texts reach the content mapper
+// diagnostics, so this makes the same texts. The child's stdin, stdout and
+// stderr are anonymous pipes (`std::io::pipe`), as in Go. `Close` kills and
+// reaps the child, which closes the child's ends, so a blocked read of its
+// stdout or stderr ends. Go `stderr` `io.Discard` is `None` (the null
+// device here). Go's `Cmd.environ` adds no `PWD` on Windows.
+// PORT divergence: std's `Command` starts the command line with the path
+// it runs, where Go keeps the name as the first word.
+#[cfg(windows)]
+pub fn spawn_process(
+    command: &[String],
+    dir: &str,
+    stderr: Option<Box<dyn std::io::Write + Send>>,
+) -> Result<Arc<dyn ProcessExitState>, GoError> {
+    use std::process::{Command, Stdio};
+
+    let name = command.first().map_or("", String::as_str);
+    // Go `exec.Command`: `LookPath` when the name is its own `Base`, and
+    // `lookExtensions(name, "")` for an absolute name. An error there is
+    // `cmd.Err`, which `Start` returns.
+    let (path, looked_up) = if win_exec::base(name) == name {
+        (win_exec::look_path(name)?, None)
+    } else if win_exec::is_abs(name) {
+        (name.to_string(), Some(win_exec::look_extensions(name, "")?))
+    } else {
+        (name.to_string(), None)
+    };
+    // Go `Start`: "exec: no command" for an empty path.
+    if path.is_empty() {
+        return Err(crate::gostd::errors::new("exec: no command"));
+    }
+    // Go `Start` on Windows: the extension lookup that `Command` did not
+    // make, against `Dir`.
+    let lp = match looked_up {
+        Some(lp) => lp,
+        None => win_exec::look_extensions(&path, dir)?,
+    };
+    // Go os/exec_posix.go startProcess: the `Dir` check with op "chdir".
+    if !dir.is_empty()
+        && let Err(err) = std::fs::metadata(crate::frontend::vfs::os_path(dir))
+    {
+        return Err(crate::gostd::errors::new(format!(
+            "chdir {dir}: {}",
+            go_errno_text(&err)
+        )));
+    }
+    let fork_exec_error =
+        |text: String| crate::gostd::errors::new(format!("fork/exec {lp}: {text}"));
+    // Go syscall/exec_windows.go StartProcess: CreateProcess looks for the
+    // program before it changes to `Dir`, so a path relative to `Dir` is
+    // made absolute first.
+    let program = if dir.is_empty() {
+        lp.clone()
+    } else {
+        win_exec::join_exe_dir_and_fname(dir, &lp).map_err(fork_exec_error)?
+    };
+    let io_error = |err: std::io::Error| crate::gostd::errors::new(go_errno_text(&err));
+    let (child_stdin, stdin) = std::io::pipe().map_err(io_error)?;
+    let (stdout, child_stdout) = std::io::pipe().map_err(io_error)?;
+    let mut cmd = Command::new(crate::frontend::vfs::os_path(&program).as_os_str());
+    cmd.args(&command[1..]);
+    if !dir.is_empty() {
+        cmd.current_dir(crate::frontend::vfs::os_path(dir));
+    }
+    cmd.stdin(Stdio::from(child_stdin));
+    cmd.stdout(Stdio::from(child_stdout));
+    let mut stderr_copy = None;
+    match stderr {
+        Some(writer) => {
+            let (reader, child_stderr) = std::io::pipe().map_err(io_error)?;
+            cmd.stderr(Stdio::from(child_stderr));
+            stderr_copy = Some((reader, writer));
+        }
+        None => {
+            cmd.stderr(Stdio::null());
+        }
+    }
+    let spawned = cmd.spawn();
+    // The command holds the child's ends; drop them so that a read sees the
+    // end of the stream when the child exits.
+    drop(cmd);
+    let child = spawned.map_err(|err| fork_exec_error(go_errno_text(&err)))?;
+    // Go copies a non-file `cmd.Stderr` on a goroutine.
+    let stderr_done = stderr_copy.map(|(mut reader, mut writer)| {
+        let (done_tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut reader, &mut writer);
+            let _ = done_tx.send(());
+        });
+        done
+    });
+    Ok(Arc::new(ChildProcess {
+        child: Mutex::new(Some(child)),
+        stdin: Mutex::new(Some(Arc::new(stdin))),
+        stdout,
+        stderr_done: Mutex::new(stderr_done),
+        exit_code: Mutex::new(None),
+    }))
+}
+
+// Go: cmd/tsgo/sys.go:95 childProcess (tsgo#4712), on Windows
+// PORT: `stdin` is `None` after `Close`; a write that runs meanwhile keeps
+// its own reference, so `Close` never waits for it. `stderr_done` is the
+// end signal of the stderr copy.
+#[cfg(windows)]
+struct ChildProcess {
+    child: Mutex<Option<std::process::Child>>,
+    stdin: Mutex<Option<Arc<std::io::PipeWriter>>>,
+    stdout: std::io::PipeReader,
+    stderr_done: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    exit_code: Mutex<Option<i32>>,
+}
+
+#[cfg(windows)]
+impl crate::ipc::ReadWriteCloser for ChildProcess {
+    // Go: cmd/tsgo/sys.go:101 childProcess.Read
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut &self.stdout, buf)
+    }
+
+    // Go: cmd/tsgo/sys.go:102 childProcess.Write
+    fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+        let stdin = self
+            .stdin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match stdin {
+            Some(stdin) => std::io::Write::write(&mut &*stdin, buf),
+            None => Err(std::io::ErrorKind::BrokenPipe.into()),
+        }
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    // Go: cmd/tsgo/sys.go:111 childProcess.Close
+    // PORT: as on Unix (see there). Go's `Process.Kill` is TerminateProcess
+    // with exit code 1, and so is std's `kill`.
+    fn close(&self) -> Result<(), GoError> {
+        drop(
+            self.stdin
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+        let Some(mut child) = self
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        else {
+            return Err(crate::gostd::errors::new("exec: Wait was already called"));
+        };
+        let _ = child.kill();
+        let waited = child.wait();
+        let stderr_done = self
+            .stderr_done
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(done) = stderr_done {
+            let _ = done.recv_timeout(CHILD_PROCESS_WAIT_DELAY);
+        }
+        match waited {
+            Ok(status) => {
+                *self
+                    .exit_code
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(status.code().unwrap_or(-1));
+                Ok(())
+            }
+            Err(err) => Err(crate::gostd::errors::new(format!(
+                "wait: {}",
+                go_errno_text(&err)
+            ))),
+        }
+    }
+}
+
+/// Go os/exec/lp_windows.go (go1.26) and the Windows `path/filepath` and
+/// syscall helpers that it and `StartProcess` use. Each function returns
+/// the Go error text of its Go counterpart.
+// PORT: Go `execerrdot` is its default: a match in the current directory
+// or in a relative PATH entry is the `ErrDot` error.
+#[cfg(windows)]
+mod win_exec {
+    use super::go_errno_text;
+    use crate::frontend::vfs::{
+        filepath_clean, filepath_volume_name_len, go_string_from_os, os_path,
+        win_is_path_separator as is_slash,
+    };
+    use crate::gostd::{GoError, errors, strconv};
+
+    /// Go `exec.ErrNotFound` on Windows.
+    const ERR_NOT_FOUND: &str = "executable file not found in %PATH%";
+    /// Go `exec.ErrDot`.
+    const ERR_DOT: &str = "cannot run executable found relative to current directory";
+    /// Go `syscall.EINVAL` on Windows.
+    const EINVAL: &str = "invalid argument";
+
+    /// Go `&exec.Error{Name: name, Err: err}`.
+    fn exec_error(name: &str, err: &str) -> GoError {
+        errors::new(format!("exec: {}: {err}", strconv::quote(name)))
+    }
+
+    // Go: os/exec/exec.go validateLookPath
+    fn validate_look_path(s: &str) -> Result<(), GoError> {
+        match s {
+            "" | "." | ".." => Err(exec_error(s, ERR_NOT_FOUND)),
+            _ => Ok(()),
+        }
+    }
+
+    // Go: lp_windows.go chkStat
+    // PORT: Go `os.Stat` fails with op "GetFileAttributesEx" when the file
+    // does not exist, else with op "CreateFile".
+    fn chk_stat(file: &str) -> Result<(), String> {
+        match std::fs::metadata(os_path(file)) {
+            Ok(d) if d.is_dir() => Err("permission denied".to_string()),
+            Ok(_) => Ok(()),
+            Err(err) => {
+                let op = if err.kind() == std::io::ErrorKind::NotFound {
+                    "GetFileAttributesEx"
+                } else {
+                    "CreateFile"
+                };
+                Err(format!("{op} {file}: {}", go_errno_text(&err)))
+            }
+        }
+    }
+
+    // Go: lp_windows.go hasExt
+    fn has_ext(file: &str) -> bool {
+        match file.rfind('.') {
+            None => false,
+            Some(i) => file.rfind([':', '\\', '/']).is_none_or(|j| j < i),
+        }
+    }
+
+    // Go: lp_windows.go findExecutable
+    fn find_executable(file: &str, exts: &[String]) -> Result<String, String> {
+        if exts.is_empty() {
+            return chk_stat(file).map(|()| file.to_string());
+        }
+        if has_ext(file) && chk_stat(file).is_ok() {
+            return Ok(file.to_string());
+        }
+        for e in exts {
+            let f = format!("{file}{e}");
+            if chk_stat(&f).is_ok() {
+                return Ok(f);
+            }
+        }
+        if has_ext(file) {
+            return Err("file does not exist".to_string());
+        }
+        Err(ERR_NOT_FOUND.to_string())
+    }
+
+    // Go: lp_windows.go lookPath (exec.LookPath)
+    pub fn look_path(file: &str) -> Result<String, GoError> {
+        validate_look_path(file)?;
+        look_path_exts(file, &path_ext())
+    }
+
+    // Go: lp_windows.go lookExtensions
+    /// The path of `path` with the extension that `LookPath` would add,
+    /// looked up against `dir` when `path` is relative to it.
+    pub fn look_extensions(path: &str, dir: &str) -> Result<String, GoError> {
+        validate_look_path(path)?;
+        let path = if base(path) == path {
+            format!(".\\{path}")
+        } else {
+            path.to_string()
+        };
+        let exts = path_ext();
+        let ext = ext(&path);
+        if !ext.is_empty() && exts.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+            return Ok(path);
+        }
+        if dir.is_empty()
+            || filepath_volume_name_len(path.as_bytes()) != 0
+            || (path.len() > 1 && is_slash(path.as_bytes()[0]))
+        {
+            return look_path_exts(&path, &exts);
+        }
+        let dirandpath = join(dir, &path);
+        // We assume that LookPath will only add file extension.
+        let lp = look_path_exts(&dirandpath, &exts)?;
+        let ext = lp.strip_prefix(dirandpath.as_str()).unwrap_or(&lp);
+        Ok(format!("{path}{ext}"))
+    }
+
+    // Go: lp_windows.go pathExt
+    fn path_ext() -> Vec<String> {
+        match std::env::var("PATHEXT") {
+            Ok(x) if !x.is_empty() => x
+                .to_lowercase()
+                .split(';')
+                .filter(|e| !e.is_empty())
+                .map(|e| {
+                    if e.starts_with('.') {
+                        e.to_string()
+                    } else {
+                        format!(".{e}")
+                    }
+                })
+                .collect(),
+            _ => [".com", ".exe", ".bat", ".cmd"].map(String::from).to_vec(),
+        }
+    }
+
+    // Go: lp_windows.go lookPathExts
+    // PORT: Go compares the two matches with `os.Lstat` and `os.SameFile`;
+    // `same_file` opens both (it follows a link, Lstat does not).
+    fn look_path_exts(file: &str, exts: &[String]) -> Result<String, GoError> {
+        if file.contains([':', '\\', '/']) {
+            return find_executable(file, exts).map_err(|err| exec_error(file, &err));
+        }
+        // The first match that `ErrDot` rejects: one in the current
+        // directory, or in a relative PATH entry.
+        let mut dot: Option<String> = None;
+        if std::env::var_os("NoDefaultCurrentDirectoryInExePath").is_none()
+            && let Ok(f) = find_executable(&join(".", file), exts)
+        {
+            dot = Some(f);
+        }
+        let path = std::env::var("path").unwrap_or_default();
+        for dir in split_list(&path) {
+            if dir.is_empty() {
+                continue;
+            }
+            let Ok(f) = find_executable(&join(&dir, file), exts) else {
+                continue;
+            };
+            if let Some(dotf) = &dot
+                && !same_file::is_same_file(os_path(dotf), os_path(&f)).unwrap_or(false)
+            {
+                return Err(exec_error(file, ERR_DOT));
+            }
+            if !is_abs(&f) {
+                dot.get_or_insert(f);
+                continue;
+            }
+            return Ok(f);
+        }
+        if dot.is_some() {
+            return Err(exec_error(file, ERR_DOT));
+        }
+        Err(exec_error(file, ERR_NOT_FOUND))
+    }
+
+    // Go: path/filepath/path_windows.go splitList
+    fn split_list(path: &str) -> Vec<String> {
+        if path.is_empty() {
+            return Vec::new();
+        }
+        // Split path, respecting but preserving quotes.
+        let mut list = Vec::new();
+        let mut start = 0;
+        let mut quo = false;
+        for (i, c) in path.bytes().enumerate() {
+            match c {
+                b'"' => quo = !quo,
+                b';' if !quo => {
+                    list.push(&path[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        list.push(&path[start..]);
+        // Remove quotes.
+        list.into_iter().map(|s| s.replace('"', "")).collect()
+    }
+
+    // Go: path/filepath/path_windows.go join, for two elements
+    fn join(a: &str, b: &str) -> String {
+        let mut out = String::new();
+        let mut last = 0u8;
+        for e in [a, b] {
+            let mut e = e;
+            // The first non-empty path element is added unchanged. After a
+            // colon, the path stays relative to the current directory on a
+            // drive and no separator is added.
+            if !out.is_empty() && is_slash(last) {
+                // If the path ends in a slash, strip any leading slashes from the next
+                // path element to avoid creating a UNC path (any path starting with "\\")
+                // from non-UNC elements.
+                e = e.trim_start_matches(['\\', '/']);
+                // If the path is \ and the next path element is ??,
+                // add an extra .\ to create \.\?? rather than \??\
+                // (a Root Local Device path).
+                if out.len() == 1
+                    && e.starts_with("??")
+                    && (e.len() == 2 || is_slash(e.as_bytes()[2]))
+                {
+                    out.push_str(".\\");
+                }
+            } else if !out.is_empty() && last != b':' {
+                // In all other cases, add a separator between elements.
+                out.push('\\');
+                last = b'\\';
+            }
+            if let Some(&l) = e.as_bytes().last() {
+                out.push_str(e);
+                last = l;
+            }
+        }
+        if out.is_empty() {
+            return out;
+        }
+        filepath_clean(&out)
+    }
+
+    // Go: internal/filepathlite/path.go Base (Windows)
+    pub fn base(path: &str) -> &str {
+        if path.is_empty() {
+            return ".";
+        }
+        // Strip trailing slashes.
+        let path = path.trim_end_matches(['\\', '/']);
+        // Throw away volume name
+        let path = &path[filepath_volume_name_len(path.as_bytes()).min(path.len())..];
+        // Find the last element
+        let path = match path.rfind(['\\', '/']) {
+            Some(i) => &path[i + 1..],
+            None => path,
+        };
+        // If empty now, it had only slashes.
+        if path.is_empty() { "\\" } else { path }
+    }
+
+    // Go: internal/filepathlite/path.go Ext
+    fn ext(path: &str) -> &str {
+        for (i, c) in path.bytes().enumerate().rev() {
+            if is_slash(c) {
+                break;
+            }
+            if c == b'.' {
+                return &path[i..];
+            }
+        }
+        ""
+    }
+
+    // Go: internal/filepathlite/path_windows.go IsAbs
+    pub fn is_abs(path: &str) -> bool {
+        let b = path.as_bytes();
+        let l = filepath_volume_name_len(b);
+        if l == 0 {
+            return false;
+        }
+        // If the volume name starts with a double slash, this is an absolute path.
+        if is_slash(b[0]) && is_slash(b[1]) {
+            return true;
+        }
+        b.get(l).is_some_and(|&c| is_slash(c))
+    }
+
+    // Go: syscall/exec_windows.go FullPath (GetFullPathNameW)
+    fn full_path(name: &str) -> Result<String, String> {
+        std::path::absolute(os_path(name))
+            .map(go_string_from_os)
+            .map_err(|err| go_errno_text(&err))
+    }
+
+    // Go: syscall/exec_windows.go normalizeDir
+    fn normalize_dir(dir: &str) -> Result<String, String> {
+        let ndir = full_path(dir)?;
+        let b = ndir.as_bytes();
+        if b.len() > 2 && is_slash(b[0]) && is_slash(b[1]) {
+            // dir cannot have \\server\share\path form
+            return Err(EINVAL.to_string());
+        }
+        Ok(ndir)
+    }
+
+    // Go: syscall/exec_windows.go joinExeDirAndFName
+    /// `p` made absolute against `dir`.
+    pub fn join_exe_dir_and_fname(dir: &str, p: &str) -> Result<String, String> {
+        let b = p.as_bytes();
+        if b.is_empty() {
+            return Err(EINVAL.to_string());
+        }
+        if b.len() > 2 && is_slash(b[0]) && is_slash(b[1]) {
+            // \\server\share\path form
+            return Ok(p.to_string());
+        }
+        if b.len() > 1 && b[1] == b':' {
+            // has drive letter
+            if b.len() == 2 {
+                return Err(EINVAL.to_string());
+            }
+            if is_slash(b[2]) {
+                return Ok(p.to_string());
+            }
+            let d = normalize_dir(dir)?;
+            if b[0].to_ascii_uppercase() == d.as_bytes()[0].to_ascii_uppercase() {
+                full_path(&format!("{d}\\{}", &p[2..]))
+            } else {
+                full_path(p)
+            }
+        } else {
+            // no drive letter
+            let d = normalize_dir(dir)?;
+            if is_slash(b[0]) {
+                full_path(&format!("{}{p}", d.get(..2).unwrap_or(&d)))
+            } else {
+                full_path(&format!("{d}\\{p}"))
+            }
+        }
     }
 }
 
@@ -833,6 +1381,7 @@ mod tests {
     // Go: cmd/tsgo/sys_unix_test.go:17 TestChildProcessCloseDoesNotWaitForLauncherDescendants (tsgo#4712)
     // PORT: Go reads the first line with `bufio.Reader`; this reads bytes
     // up to the newline. Go `syscall.Kill` is rustix `kill_process`.
+    #[cfg(unix)]
     #[test]
     fn test_child_process_close_does_not_wait_for_launcher_descendants() {
         use crate::cmd::tsgo::prelude::is_process_alive;
