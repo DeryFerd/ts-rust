@@ -326,6 +326,11 @@ impl Checker {
         self.is_array_type(t)
     }
 
+    // Go: checker/exports.go:228 IsReadonlySymbol
+    pub fn is_readonly_symbol_exported(&mut self, symbol: SymbolId) -> bool {
+        self.is_readonly_symbol(symbol)
+    }
+
     // Go: checker/exports.go:196 GetReturnTypeOfSignature
     pub fn get_return_type_of_signature_exported(&mut self, sig: SignatureId) -> TypeId {
         self.get_return_type_of_signature(sig)
