@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { BASELINE_SHA256, CARRY_FORWARD_RULE, CHECKPOINT_SHA256, GOPORT_BASELINE_SHA256, GOPORT_RULE, INHERITED_PIN, LAST_LEGACY_REVISION,
-  TOOLS, checkBatch, readEvidenceFile } from "./check-typechecker-batch.mjs";
+  TOOLS, canonicalJson, checkBatch, readEvidenceFile } from "./check-typechecker-batch.mjs";
 
 const SOURCE = "a".repeat(64);
 const RESULT = "b".repeat(64);
@@ -485,8 +486,17 @@ function writeJson(path, value) {
   return path;
 }
 
+// Writes JSON lines as a gzip file.
+function writeGz(path, lines) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, gzipSync(lines.map(line => JSON.stringify(line)).join("\n") + "\n"));
+  return path;
+}
+
 // The real gate-compare.py and oracle-compare.py on temp copies of the fixture files: a gate
-// manifest with the runs/ files next to it, the gate id map, and the traces of an oracle results dir.
+// manifest with the runs/ files next to it, the gate id map, and per oracle results dir its traces,
+// summary.json, manifest.json and goport's responses (f.responses). The compare output names the
+// fixture dirs and labels, as a real output names the real ones.
 function fixtureTools(f) {
   return {
     gitInputs,
@@ -500,18 +510,26 @@ function fixtureTools(f) {
       return TOOLS.gateCompare(writeJson(join(dir, "base/manifest.json"), f.files[from].value),
         writeJson(join(dir, "new/manifest.json"), f.files[to].value), defects, toolChanges, map && { path: map, sha256: idMap.sha256 });
     }),
-    oracleCompare: (base, now) => inTemp(dir => {
-      for (const [side, path] of [["base", base], ["new", now]]) {
-        for (const item of f.oracle[relative(ROOT, path)] ?? []) writeJson(join(dir, side, "traces", item.battery, `${item.trace}.json`), item);
+    oracleCompare: (bases, now, options) => inTemp(dir => {
+      const sides = [...bases.map((path, i) => [`base${i}`, relative(ROOT, path)]), ["new", relative(ROOT, now)]];
+      for (const [side, from] of sides) {
+        const run = join(dir, "results", side);
+        for (const item of f.oracle[from] ?? []) writeJson(join(run, "traces", item.battery, `${item.trace}.json`), item);
+        for (const name of ["summary.json", "manifest.json"]) if (f.files[`${from}/${name}`]) writeJson(join(run, name), f.files[`${from}/${name}`].value);
+        for (const [name, lines] of Object.entries(f.responses?.[from] ?? {})) writeGz(join(run, "responses", `${name}.jsonl.gz`), lines);
       }
-      return TOOLS.oracleCompare(join(dir, "base"), join(dir, "new"));
+      const output = TOOLS.oracleCompare(sides.slice(0, -1).map(([side]) => join(dir, "results", side)), join(dir, "results/new"), options);
+      for (const [head, [, from]] of [...(output.bases ?? [output.base]).map((head, i) => [head, sides[i]]), [output.new, sides.at(-1)]]) {
+        Object.assign(head, { dir: from, label: basename(from) });
+      }
+      return output;
     }),
     keptGateRuns: dir => Object.keys(f.files).filter(path => dirname(path) === dir && /^gate-compare-fail-.+\.json$/.test(basename(path))).sort(),
   };
 }
 
-// lsp_oracle.py summary.json of the traces of one run.
-function lspSummary(traces) {
+// lsp_oracle.py summary.json of the traces of one run, with its goldens (oracle sha256 values) when given.
+function lspSummary(traces, oracleSha256) {
   const batteries = {};
   for (const item of traces) {
     const battery = batteries[item.battery] ??= { traces: 0, requests: 0, crashExits: 0, classes: {} };
@@ -519,22 +537,28 @@ function lspSummary(traces) {
     battery.requests += item.events.length;
     for (const event of item.events) battery.classes[event.class] = (battery.classes[event.class] ?? 0) + 1;
   }
-  return { format: "goport-lsp-summary/1", goport: [{ path: "bins/tsgo", sha256: TSGO }], batteries };
+  return { format: "goport-lsp-summary/1", goport: [{ path: "bins/tsgo", sha256: TSGO }], batteries, ...(oracleSha256 && { oracleSha256 }) };
 }
 
-// Writes the pinned oracle-compare.py output (and compare) of both oracle records from the
-// current traces, and the LSP run's summary.json, as candidate.sh and accept_revision.py do.
+// Writes the LSP run's summary.json and the pinned oracle-compare.py output (and compare) of both
+// oracle records from the current traces, as candidate.sh and accept_revision.py do: with the answer
+// sets of protectedBase and of the batch, and with batch.oracleRebase its runs as the base (bases),
+// --parity with its known diffs and --identity.
 function pinOracles(f) {
-  for (const [field, sha] of [["languageServerOracle", "6"], ["apiOracle", "f"]]) {
-    const record = f.state.batch[field];
-    const output = f.tools.oracleCompare(resolve(ROOT, record.base.dir), resolve(ROOT, record.dir));
-    output.base.dir = record.base.dir;
-    output.new.dir = record.dir;
+  const { batch } = f.state, lsp = batch.languageServerOracle.dir;
+  f.put(`${lsp}/summary.json`, "0", lspSummary(f.oracle[lsp], f.lspGoldens));
+  const sets = [...new Map([...(batch.protectedBase?.oracleAnswers ?? []), ...(batch.oracleAnswers ?? [])]
+    .map(ref => [`${ref.kind} ${ref.sha256}`, ref])).values()];
+  for (const [field, sha, kind] of [["languageServerOracle", "6", "lsp"], ["apiOracle", "f", "api"]]) {
+    const record = batch[field], rebase = batch.oracleRebase?.[kind];
+    const bases = rebase ? rebase.runs : [record.base];
+    if (rebase) Object.assign(record, { base: { label: bases[0].label, dir: bases[0].dir }, bases: bases.map(({ label, dir }) => ({ label, dir })) });
+    const answers = sets.filter(ref => ref.kind === kind).map(ref => ({ ...ref, path: resolve(ROOT, ref.path) }));
+    const output = f.tools.oracleCompare(bases.map(run => resolve(ROOT, run.dir)), resolve(ROOT, record.dir),
+      { kind, answers, parity: Boolean(rebase), knownDiffs: (rebase?.knownDiffs ?? []).map(diff => diff.key), identity: Boolean(rebase) });
     record.output = f.put(`${field}-compare.json`, sha, output);
     record.compare = structuredClone(output.total);
   }
-  const lsp = f.state.batch.languageServerOracle.dir;
-  f.put(`${lsp}/summary.json`, "0", lspSummary(f.oracle[lsp]));
 }
 
 function goportFixture() {
@@ -641,7 +665,9 @@ function rebind(f) {
   const { batch } = f.state;
   for (const item of [batch.recoveryHistory.at(-1), batch.auditor, batch.reviewer]) {
     Object.assign(item, { goportTestsSha256: batch.goportTests.sha256, gateSha256: batch.gate.sha256,
-      nameMapSha256: batch.goportTests.nameMap?.sha256 ?? null, gateIdMapSha256: batch.gateIdMap?.sha256 ?? null });
+      nameMapSha256: batch.goportTests.nameMap?.sha256 ?? null, gateIdMapSha256: batch.gateIdMap?.sha256 ?? null,
+      oracleRebaseSha256: batch.oracleRebase ? createHash("sha256").update(canonicalJson(batch.oracleRebase)).digest("hex") : null,
+      oracleAnswersSha256: (batch.oracleAnswers ?? []).map(ref => ref.sha256).sort() });
   }
 }
 
@@ -1429,4 +1455,250 @@ test("goport unbound history rows come from the standing rule list, never the cu
   assert.equal(check(f).verdict, "PASS");
   f.state.batch.recoveryHistory[6].sourceFingerprint = null;
   stopped(f, /Invalid or reset recovery history/);
+});
+
+// Oracle answer sets and rebase runs (reviewer ruling 10, r139-diag/reviewer-ruling.md). GOLDEN_A and GOLDEN_B
+// are the oracles of GO_PIN and NEW_PIN; BASE_TSGO is the tsgo of the base batch's gate (batch-0).
+const [GOLDEN_A, GOLDEN_B, BASE_TSGO] = ["a1".repeat(32), "b2".repeat(32), "b".repeat(64)];
+
+// An answer set file (goport-oracle-answers/1) in dir, named in the fixture by its absolute path: each request key
+// gets its Go answers, each from one Go golden at the set's oracle. The answers are JSON objects with one key, so
+// JSON.stringify is canon().
+function answerSet(f, dir, name, requests, { kind = "lsp", oracle = GOLDEN_A, pin = GO_PIN } = {}) {
+  const doc = { format: "goport-oracle-answers/1", kind, pin, oracleSha256: oracle, goldenSha12: oracle.slice(0, 12), requests: {} };
+  for (const [key, answers] of Object.entries(requests)) {
+    const battery = key.slice(0, key.indexOf("/")), traceName = key.slice(key.indexOf("/") + 1, key.lastIndexOf("#"));
+    doc.requests[key] = { method: "m", multiset: [], answers: answers.map((answer, n) => ({ answer,
+      sha256: createHash("sha256").update(JSON.stringify(answer)).digest("hex"),
+      sources: [`target/rerun/r${n + 1}/golden/${oracle.slice(0, 12)}/${battery}/${traceName}.golden.jsonl.gz`] })) };
+  }
+  const bytes = gzipSync(JSON.stringify(doc)), path = join(dir, name);
+  writeFileSync(path, bytes);
+  const ref = { kind, path, sha256: createHash("sha256").update(bytes).digest("hex"), pin };
+  f.put(path, ref.sha256, null);
+  return ref;
+}
+
+// goport answers {items: [answer]} to the LSP request b1/t1#1 in the new run.
+function lspAnswer(f, answer) {
+  f.responses = { "lsp/lsp-r132": { "b1/t1": [{ i: 1, method: "m", status: "ok", response: { result: { items: [answer] } } }] } };
+}
+
+// batch-0 keeps b1/t1#1 flaky with the answer set set (condition 5 after its acceptance): the base and the new
+// LSP runs have it flaky_oracle, the new run at the oracle golden, and goport answers "b".
+function withBaseAnswers(f, set, { golden = GOLDEN_A } = {}) {
+  f.files["docs/typechecker-batches/batch-0.json"].value.oracleAnswers = [set];
+  f.state.batch.protectedBase.oracleAnswers = [set];
+  f.state.batch.oracleAnswers = [set];
+  f.oracle["lsp/lsp-r131"][0].events[1].class = "flaky_oracle";
+  f.oracle["lsp/lsp-r132"][0].events[1].class = "flaky_oracle";
+  f.lspGoldens = [golden];
+  lspAnswer(f, "b");
+  rebind(f);
+  pinOracles(f);
+}
+
+test("answer sets keep a base flake request protected at their pin (ruling 10 condition 5)", () => inTemp(dir => {
+  const f = goportFixture(), set = answerSet(f, dir, "base.json.gz", { "b1/t1#1": [{ items: ["a"] }, { items: ["b"] }] });
+  withBaseAnswers(f, set);
+  const result = check(f);
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+  assert.deepEqual([result.oracles.lsp.retainedByAnswers, result.oracles.lsp.retained], [1, 3]);
+  // An answer outside the set is lost.
+  lspAnswer(f, "c");
+  pinOracles(f);
+  stopped(f, /languageServerOracle: 1 lost protected base requests/);
+  // At another oracle only (a later pin bump) the set does not apply and the request is protected like a same request.
+  const g = goportFixture();
+  withBaseAnswers(g, answerSet(g, dir, "base.json.gz", { "b1/t1#1": [{ items: ["a"] }, { items: ["b"] }] }), { golden: GOLDEN_B });
+  stopped(g, /languageServerOracle: 1 lost protected base requests/);
+  const saved = g.files["languageServerOracle-compare.json"].value;
+  assert.deepEqual([saved.answers[0].notApplied, saved.lostFirst[0].carried], [1, true]);
+  // protectedBase, batch.oracleAnswers and the pinned compares must name the base batch's answer sets.
+  for (const [change, pattern] of [
+    [h => { h.state.batch.protectedBase.oracleAnswers = []; }, /batch.protectedBase differs from the base that accepted batch batch-0 gives/],
+    [h => { h.state.batch.oracleAnswers = []; rebind(h); }, /batch.oracleAnswers must keep the answer sets of the base at the batch pin/],
+    [h => { h.files["languageServerOracle-compare.json"].value.answers = []; }, /languageServerOracle.output must use the answer sets/],
+    [h => { h.state.batch.reviewer.oracleAnswersSha256 = []; }, /Verdict is not bound to this batch, source, and goport test/]]) {
+    const h = goportFixture();
+    withBaseAnswers(h, answerSet(h, dir, "base.json.gz", { "b1/t1#1": [{ items: ["a"] }, { items: ["b"] }] }));
+    change(h);
+    stopped(h, pattern);
+  }
+}));
+
+test("an answer set with another sha256 or a bad answer is refused", () => inTemp(dir => {
+  const f = goportFixture(), set = answerSet(f, dir, "base.json.gz", { "b1/t1#1": [{ items: ["a"] }, { items: ["b"] }] });
+  withBaseAnswers(f, set);
+  f.files["docs/typechecker-batches/batch-0.json"].value.oracleAnswers = [{ ...set, sha256: "e".repeat(64) }];
+  stopped(f, /Evidence hash mismatch/);
+  // oracle-compare.py itself refuses it (exit 2), and a set whose answer sha256 is not that of its text.
+  const run = sha => f.tools.oracleCompare([resolve(ROOT, "lsp/lsp-r131")], resolve(ROOT, "lsp/lsp-r132"),
+    { kind: "lsp", answers: [{ ...set, sha256: sha }] });
+  assert.throws(() => run("e".repeat(64)), /oracle-compare.py failed \(exit 2\): .*does not have the sha256 e{64}/);
+  const doc = JSON.parse(gunzipSync(readFileSync(set.path)));
+  doc.requests["b1/t1#1"].answers[0].sha256 = "0".repeat(64);
+  const bytes = gzipSync(JSON.stringify(doc));
+  writeFileSync(set.path, bytes);
+  assert.throws(() => run(createHash("sha256").update(bytes).digest("hex")), /exit 2\): .*has an answer whose sha256 is not that of its canon\(\) text/);
+}));
+
+test("only a pin-bump batch adds answer sets, at the batch pin", () => inTemp(dir => {
+  const added = (f, pin) => {
+    f.state.batch.oracleAnswers = [answerSet(f, dir, `${pin}.json.gz`, { "b1/t1#1": [{ items: ["a"] }, { items: ["b"] }] },
+      { pin, oracle: pin === GO_PIN ? GOLDEN_A : GOLDEN_B })];
+    rebind(f);
+    pinOracles(f);
+  };
+  let f = goportFixture();
+  added(f, GO_PIN);
+  stopped(f, /batch.oracleAnswers .* is not an answer set of the base: only a pin-bump batch can add one/);
+  f = goportFixture();
+  f.results.pin = f.gateNew.upstreamPin = NEW_PIN;
+  f.state.batch.upstreamPin = { from: GO_PIN, to: NEW_PIN };
+  added(f, GO_PIN);
+  stopped(f, /batch.oracleAnswers .* is at the Go pin 52168999f3dc, not the batch pin 16c25522e123/);
+  added(f, NEW_PIN);
+  const result = check(f);
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+}));
+
+// A pin bump with batch.oracleRebase: batch-0's bins (BASE_TSGO) ran again at NEW_PIN (GOLDEN_B) as lsp/lsp-r131-atB
+// (and lsp/lsp-r131-atB2 when two) and api/api-r131-atB. At NEW_PIN Go's answer to b1/t1#1 varies: flaky_oracle in the
+// rebase runs and in the new run, so the rebase base does not protect it, while the base batch's own run (GOLDEN_A) does.
+// lsp: the classes of b1/t1 in each LSP rebase run.
+function withRebase(f, { lsp = [["same", "flaky_oracle", "not_run"]], knownDiffs = [], answers = [] } = {}) {
+  f.results.pin = f.gateNew.upstreamPin = NEW_PIN;
+  f.state.batch.upstreamPin = { from: GO_PIN, to: NEW_PIN, oracleSha256: GOLDEN_B };
+  f.files["gate/r131/manifest.json"].value.binaries = { tsgo: { path: "bins-r131/tsgo", sha256: BASE_TSGO } };
+  f.oracle["lsp/lsp-r132"][0].events[1].class = "flaky_oracle";
+  f.lspGoldens = [GOLDEN_B];
+  f.files["api/api-r132/manifest.json"].value.batteries.qc.oracleSha = GOLDEN_B;
+  const lspRuns = lsp.map((classes, i) => {
+    const dir = `lsp/lsp-r131-atB${i ? i + 1 : ""}`;
+    f.oracle[dir] = [trace("b1", "t1", classes), trace("b1", "t2", ["same", "oracle_error_same"]), trace("b2", "t3", ["diff"])];
+    f.put(`${dir}/summary.json`, "0", { ...lspSummary(f.oracle[dir], [GOLDEN_B]), goport: [{ path: "bins-r131/tsgo", sha256: BASE_TSGO }] });
+    return { label: basename(dir), dir };
+  });
+  f.oracle["api/api-r131-atB"] = [trace("qc", "a1", ["same", "goport_error"])];
+  f.put("api/api-r131-atB/manifest.json", "0", { batteries: { qc: { goportSha: BASE_TSGO, oracleSha: GOLDEN_B, traces: 1 } } });
+  f.state.batch.oracleRebase = {
+    lsp: { runs: lspRuns, binsSha256: BASE_TSGO, oracleSha256: GOLDEN_B },
+    api: { runs: [{ label: "api-r131-atB", dir: "api/api-r131-atB" }], binsSha256: BASE_TSGO, oracleSha256: GOLDEN_B, knownDiffs } };
+  f.state.batch.oracleAnswers = answers;
+  resultsShas(f);
+}
+
+// Sets the resultsSha256 of each rebase run from oracle-compare.py --identity, then rebinds and pins the compares.
+function resultsShas(f) {
+  for (const kind of ["lsp", "api"]) {
+    const { runs } = f.state.batch.oracleRebase[kind];
+    const record = f.state.batch[kind === "lsp" ? "languageServerOracle" : "apiOracle"];
+    const out = f.tools.oracleCompare(runs.map(run => resolve(ROOT, run.dir)), resolve(ROOT, record.dir), { kind, identity: true });
+    (out.bases ?? [out.base]).forEach((head, i) => { runs[i].resultsSha256 = head.resultsSha256; });
+  }
+  rebind(f);
+  pinOracles(f);
+}
+
+test("the oracle base of a pin bump is the base bins measured again at the new pin (ruling 10 conditions 1 and 2)", () => {
+  // Without oracleRebase the Go-side flake of b1/t1#1 is a loss against batch-0's run at the old pin.
+  let f = goportFixture();
+  f.results.pin = f.gateNew.upstreamPin = NEW_PIN;
+  f.state.batch.upstreamPin = { from: GO_PIN, to: NEW_PIN };
+  f.oracle["lsp/lsp-r132"][0].events[1].class = "flaky_oracle";
+  pinOracles(f);
+  stopped(f, /languageServerOracle: 1 lost protected base requests/);
+  f = goportFixture();
+  withRebase(f);
+  let result = check(f);
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+  assert.deepEqual(result.oracles.lsp, { label: "lsp-r132", base: "lsp-r131-atB", traces: 3, requests: 6, retained: 3, recovered: 1,
+    lost: 0, unrun: 0, absent: 0, newRequests: 0 });
+  assert.equal(f.state.batch.languageServerOracle.output.path, "languageServerOracle-compare.json");
+  // The runs, their tsgo and oracle, and their hashes are bound; each mismatch stops.
+  const oracleRebaseSha = () => createHash("sha256").update(canonicalJson(f.state.batch.oracleRebase)).digest("hex");
+  assert.equal(f.state.batch.reviewer.oracleRebaseSha256, oracleRebaseSha());
+  for (const [change, pattern] of [
+    [g => { g.state.batch.upstreamPin = { from: GO_PIN, to: GO_PIN, oracleSha256: GOLDEN_B }; g.results.pin = g.gateNew.upstreamPin = GO_PIN; rebind(g); },
+      /batch.oracleRebase is only for a pin-bump batch; base batch batch-0 is at the batch pin 52168999f3dc/],
+    [g => { g.state.batch.oracleRebase.lsp.binsSha256 = TSGO; rebind(g); }, /batch.oracleRebase.lsp.binsSha256 must be the tsgo sha256 of the base batch's gate manifest/],
+    [g => { g.state.batch.oracleRebase.api.oracleSha256 = GOLDEN_A; rebind(g); }, /batch.oracleRebase.api.oracleSha256 must be the oracle of the batch pin/],
+    [g => { g.files["lsp/lsp-r131-atB/summary.json"].value.goport[0].sha256 = TSGO; resultsShas(g); }, /rebase run lsp-r131-atB ran tsgo 0{64}, not the base batch's b{64}/],
+    [g => { g.files["api/api-r131-atB/manifest.json"].value.batteries.qc.oracleSha = GOLDEN_A; resultsShas(g); }, /rebase run api-r131-atB used the oracle a1a1.*, not the batch pin's/],
+    [g => { g.state.batch.oracleRebase.lsp.runs[0].resultsSha256 = "e".repeat(64); rebind(g); }, /rebase run lsp-r131-atB \(lsp\/lsp-r131-atB\) has resultsSha256 /],
+    [g => { g.state.batch.oracleRebase.lsp.knownDiffs = [{ key: "b1/t1#1", reason: "r" }]; rebind(g); }, /knownDiffs must list each \{key, reason\} once; the LSP has none/],
+    [g => { g.state.batch.auditor.oracleRebaseSha256 = null; }, /Verdict is not bound to this batch/],
+    [g => { g.state.batch.languageServerOracle.bases = g.state.batch.languageServerOracle.bases.slice(0, 0); },
+      /languageServerOracle needs its results dir and the base run lsp\/lsp-r131-atB/]]) {
+    const g = goportFixture();
+    withRebase(g);
+    change(g);
+    stopped(g, pattern);
+  }
+  // Every rebase run counts: b1/t1#1 is same in a second run, so the new run's flaky_oracle is a loss.
+  f = goportFixture();
+  withRebase(f, { lsp: [["same", "flaky_oracle", "not_run"], ["same", "same", "not_run"]] });
+  result = stopped(f, /languageServerOracle: 1 lost protected base requests/);
+  const saved = f.files["languageServerOracle-compare.json"].value;
+  assert.deepEqual([saved.bases.map(head => head.label), saved.lostFirst[0].event], [["lsp-r131-atB", "lsp-r131-atB2"], "1"]);
+  // b1/t1#0 is same in the first run only: still protected, and retained.
+  withRebase(f, { lsp: [["same", "flaky_oracle", "not_run"], ["diff", "flaky_oracle", "not_run"]] });
+  result = check(f);
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+  assert.deepEqual([result.oracles.lsp.base, result.oracles.lsp.retained], ["lsp-r131-atB,lsp-r131-atB2", 3]);
+});
+
+test("with oracleRebase the new runs must match Go at the batch pin (ruling 10 condition 3)", () => inTemp(dir => {
+  // LSP: an oracle_error_diff of a new request is a parity problem, though it is no loss.
+  let f = goportFixture();
+  withRebase(f);
+  f.oracle["lsp/lsp-r132"][2].events[0].class = "oracle_error_diff";
+  resultsShas(f);
+  stopped(f, /languageServerOracle: the new run does not match Go at the batch pin .*b2\/t3#0 oracle_error_diff: oracle_error_diff in the new run/);
+  // API: a diff needs a known diff with a reason; a known diff must be a diff in the new run; goport_error is never allowed.
+  f = goportFixture();
+  withRebase(f);
+  f.oracle["api/api-r132"][0].events[1].class = "diff";
+  resultsShas(f);
+  stopped(f, /apiOracle: the new run does not match Go at the batch pin .*qc\/a1#1 diff: diff in the new run, not a known diff/);
+  withRebase(f, { knownDiffs: [{ key: "qc/a1#1", reason: "Go-side: the oracle answers another order" }] });
+  let result = check(f);
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+  f.oracle["api/api-r132"][0].events[1].class = "same";
+  resultsShas(f);
+  stopped(f, /apiOracle: the new run does not match Go at the batch pin .*qc\/a1#1 same: known diff is not a diff in the new run/);
+  f.oracle["api/api-r132"][0].events[1].class = "goport_error";
+  withRebase(f, { knownDiffs: [{ key: "qc/a1#1", reason: "r" }] });
+  stopped(f, /qc\/a1#1 goport_error: goport_error in the new run/);
+  // A request of the batch's answer set: goport's answer must be in the set, whatever its class.
+  f = goportFixture();
+  const set = answerSet(f, dir, "b.json.gz", { "b1/t1#1": [{ items: ["a"] }, { items: ["b"] }] }, { oracle: GOLDEN_B, pin: NEW_PIN });
+  lspAnswer(f, "b");
+  withRebase(f, { answers: [set] });
+  result = check(f);
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+  assert.equal(result.oracles.lsp.retainedByAnswers, 1);
+  assert.deepEqual(f.state.batch.reviewer.oracleAnswersSha256, [set.sha256]);
+  lspAnswer(f, "c");
+  resultsShas(f);
+  stopped(f, /languageServerOracle: 1 lost protected base requests.*b1\/t1#1 flaky_oracle: goport's answer \(sha256 [0-9a-f]{12}\) is not in the answer set/);
+  // A set of the batch pin at another oracle would apply to nothing.
+  f = goportFixture();
+  lspAnswer(f, "b");
+  withRebase(f, { answers: [answerSet(f, dir, "a.json.gz", { "b1/t1#1": [{ items: ["a"] }, { items: ["b"] }] }, { oracle: GOLDEN_A, pin: NEW_PIN })] });
+  stopped(f, /languageServerOracle: an answer set of the batch pin 16c25522e123 is not at its oracle/);
+  // The pinned compare must be a parity compare.
+  f = goportFixture();
+  withRebase(f);
+  delete f.files["apiOracle-compare.json"].value.parity;
+  stopped(f, /apiOracle.output must be a compare with --parity, the 0 known diffs and --identity/);
+}));
+
+test("oracle-compare.py without options prints the output of before the options", () => {
+  const f = goportFixture();
+  const out = f.tools.oracleCompare([resolve(ROOT, "lsp/lsp-r131")], resolve(ROOT, "lsp/lsp-r132"), {});
+  assert.deepEqual([Object.keys(out), Object.keys(out.base), Object.keys(out.total)],
+    [["base", "new", "protectedClasses", "total", "batteries", "lostFirst"], ["dir", "label", "traces", "requests"],
+      ["retained", "recovered", "lost", "unrun", "absent", "newRequests"]]);
 });
