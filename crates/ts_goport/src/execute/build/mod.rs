@@ -2,6 +2,7 @@
 
 pub mod build_task;
 pub mod command_line;
+pub mod config_prefetch;
 pub mod host;
 pub mod orchestrator;
 pub mod orchestrator_watch;
