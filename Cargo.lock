@@ -144,11 +144,11 @@ dependencies = [
  "memchr",
  "name-to-handle-at",
  "nix",
+ "num-bigint",
+ "num-traits",
  "rustc-hash",
  "rustix",
- "ts_ast",
- "ts_core",
- "ts_diagnostics",
+ "ryu-js",
 ]
 
 [[package]]
@@ -495,27 +495,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "ts_ast"
-version = "7.0.0-dev"
-dependencies = [
- "ts_core",
-]
-
-[[package]]
 name = "ts_ast_codegen"
 version = "7.0.0-dev"
 dependencies = [
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "ts_core"
-version = "7.0.0-dev"
-
-[[package]]
-name = "ts_diagnostics"
-version = "7.0.0-dev"
 
 [[package]]
 name = "ts_diagnostics_codegen"
@@ -543,20 +528,7 @@ dependencies = [
  "signal-hook",
  "smallvec",
  "tikv-jemallocator",
- "ts_ast",
- "ts_core",
- "ts_diagnostics",
- "ts_jsnum",
  "xxhash-rust",
-]
-
-[[package]]
-name = "ts_jsnum"
-version = "7.0.0-dev"
-dependencies = [
- "num-bigint",
- "num-traits",
- "ryu-js",
 ]
 
 [[package]]

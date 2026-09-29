@@ -50,7 +50,7 @@ fn go_parse_int(s: &str, base: u32, bit_size: u32) -> i64 {
 
 /// Go `jsnum.FromString(text).String()`.
 fn js_number_string(text: &str) -> String {
-    ts_jsnum::Number::from_string(text).to_string()
+    crate::jsnum::Number::from_string(text).to_string()
 }
 
 /// Whether `js_number_string(text) == text` is known without parsing: a
@@ -1430,9 +1430,9 @@ impl Scanner {
                 .token_flags
                 .intersects(TokenFlags::BINARY_OR_OCTAL_SPECIFIER)
             {
-                // PORT: `ts_jsnum::parse_pseudo_big_int` strips the trailing
+                // PORT: `crate::jsnum::parse_pseudo_big_int` strips the trailing
                 // `n` that Go `ParsePseudoBigInt` also ignores.
-                value = ts_jsnum::parse_pseudo_big_int(&value) + "n";
+                value = crate::jsnum::parse_pseudo_big_int(&value) + "n";
             }
             self.set_token_value(&value);
             self.scanner_state.pos += 1;

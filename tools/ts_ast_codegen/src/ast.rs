@@ -597,8 +597,8 @@ impl<'a> AstGenerator<'a> {
         )
         .unwrap();
         writeln!(output).unwrap();
-        writeln!(output, "use crate::SyntaxKind;").unwrap();
-        writeln!(output, "use ts_core::TextRange;").unwrap();
+        writeln!(output, "use super::SyntaxKind;").unwrap();
+        writeln!(output, "use super::text::TextRange;").unwrap();
         writeln!(output).unwrap();
         write_foundations(&mut output);
 

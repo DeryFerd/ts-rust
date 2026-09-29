@@ -3,8 +3,8 @@
 //! effective call arguments, decorator call signatures, contextual property
 //! types, apparent contextual types and object literal discrimination.
 
+use crate::jsnum::Number;
 use crate::prelude::*;
-use ts_jsnum::Number;
 
 impl Checker {
     // Go: checker/checker.go:29672 getContextualTypeForObjectLiteralElement
@@ -1165,7 +1165,7 @@ impl Checker {
     ) -> TypeId {
         if self.is_tuple_type(t)
             && is_numeric_literal_name(name)
-            && ts_jsnum::from_string(name) >= Number::new(0.0)
+            && crate::jsnum::from_string(name) >= Number::new(0.0)
         {
             let fixed_length = self.target_tuple_type(t).fixed_length;
             let rest_type = self.get_element_type_of_slice_of_tuple_type(

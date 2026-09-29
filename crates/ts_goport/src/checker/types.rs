@@ -15,8 +15,8 @@
 //! PORT: all Go struct fields are `pub` so other port files can read and
 //! write them like Go code in the same package does.
 
+use crate::jsnum::{Number, PseudoBigInt};
 use crate::prelude::*;
-use ts_jsnum::{Number, PseudoBigInt};
 
 /// An immutable list. It works like a Go slice over an array that is never
 /// written again: a clone or a sub-slice copies no elements (a sub-slice of

@@ -17,8 +17,8 @@
 //! Go `newNode` does not set parents. Callers set `Parent` when Go does, with
 //! `set_node_parent`.
 
+use crate::astdata::NodeData as D;
 use crate::prelude::*;
-use ts_ast::NodeData as D;
 
 /// Go `*ast.NodeFactory`.
 // PORT: Go `NodeFactoryHooks` (OnCreate/OnUpdate/OnClone) live in
@@ -47,11 +47,11 @@ pub enum NodeFactoryTarget {
 }
 
 /// ts_ast token flags from Go token flags.
-fn token_flags(flags: TokenFlags) -> ts_ast::TokenFlags {
-    ts_ast::TokenFlags(flags.bits() as u32)
+fn token_flags(flags: TokenFlags) -> crate::astdata::TokenFlags {
+    crate::astdata::TokenFlags(flags.bits() as u32)
 }
 
-const NO_TOKEN_FLAGS: ts_ast::TokenFlags = ts_ast::TokenFlags(0);
+const NO_TOKEN_FLAGS: crate::astdata::TokenFlags = crate::astdata::TokenFlags(0);
 
 impl NodeFactory {
     #[must_use]
@@ -76,7 +76,7 @@ impl NodeFactory {
     }
 
     /// Target-space id of a required child.
-    pub(crate) fn id(&self, n: Node) -> ts_ast::NodeId {
+    pub(crate) fn id(&self, n: Node) -> crate::astdata::NodeId {
         match self.target {
             NodeFactoryTarget::Synthetic => synthetic_child_id(n),
             NodeFactoryTarget::File(store) => store_child_id(store, n),
@@ -84,7 +84,7 @@ impl NodeFactory {
     }
 
     /// Target-space id of an optional child.
-    pub(crate) fn oid(&self, n: Node) -> Option<ts_ast::NodeId> {
+    pub(crate) fn oid(&self, n: Node) -> Option<crate::astdata::NodeId> {
         match self.target {
             NodeFactoryTarget::Synthetic => synthetic_opt_child_id(n),
             NodeFactoryTarget::File(store) => store_opt_child_id(store, n),
@@ -92,7 +92,7 @@ impl NodeFactory {
     }
 
     /// A required list field.
-    pub(crate) fn req_list(&self, l: NodeList) -> ts_ast::NodeList {
+    pub(crate) fn req_list(&self, l: NodeList) -> crate::astdata::NodeList {
         match self.target {
             NodeFactoryTarget::Synthetic => synthetic_req_list_value(l),
             NodeFactoryTarget::File(store) => store_req_list_value(store, l),
@@ -100,7 +100,7 @@ impl NodeFactory {
     }
 
     /// An optional list field.
-    pub(crate) fn opt_list(&self, l: NodeList) -> Option<ts_ast::NodeList> {
+    pub(crate) fn opt_list(&self, l: NodeList) -> Option<crate::astdata::NodeList> {
         match self.target {
             NodeFactoryTarget::Synthetic => synthetic_list_value(l),
             NodeFactoryTarget::File(store) => store_list_value(store, l),
@@ -108,7 +108,7 @@ impl NodeFactory {
     }
 
     /// A modifiers field.
-    pub(crate) fn mods(&self, m: ModifierList) -> Option<ts_ast::ModifierList> {
+    pub(crate) fn mods(&self, m: ModifierList) -> Option<crate::astdata::ModifierList> {
         match self.target {
             NodeFactoryTarget::Synthetic => synthetic_modifiers_value(m),
             NodeFactoryTarget::File(store) => store_modifiers_value(store, m),
@@ -221,9 +221,9 @@ impl NodeFactory {
         }
         let node = self.new_node(
             SyntaxKind::SourceFile,
-            D::SourceFile(Box::new(ts_ast::SourceFileData {
+            D::SourceFile(Box::new(crate::astdata::SourceFileData {
                 end_of_file_token: self.id(end_of_file_token),
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 statements: self.req_list(statements),
                 symbol: None,
@@ -308,7 +308,7 @@ impl NodeFactory {
 
     // Go: ast/ast_generated.go:599 NewToken
     pub fn new_token(&self, kind: SyntaxKind) -> Node {
-        self.new_node(kind, D::Token(Box::new(ts_ast::TokenData)))
+        self.new_node(kind, D::Token(Box::new(crate::astdata::TokenData)))
     }
 
     // Go: ast/ast.go:1674 NewModifier
@@ -319,7 +319,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:792 NewIdentifier
     pub fn new_identifier(&self, text: impl AsRef<str> + Into<String>) -> Node {
         self.new_name_node(SyntaxKind::Identifier, text, |text| {
-            D::Identifier(Box::new(ts_ast::IdentifierData {
+            D::Identifier(Box::new(crate::astdata::IdentifierData {
                 flow_node: None,
                 text,
             }))
@@ -329,7 +329,7 @@ impl NodeFactory {
     // Go: ast/ast_generated.go:816 NewPrivateIdentifier
     pub fn new_private_identifier(&self, text: impl AsRef<str> + Into<String>) -> Node {
         self.new_name_node(SyntaxKind::PrivateIdentifier, text, |text| {
-            D::PrivateIdentifier(Box::new(ts_ast::PrivateIdentifierData { text }))
+            D::PrivateIdentifier(Box::new(crate::astdata::PrivateIdentifierData { text }))
         })
     }
 
@@ -337,7 +337,7 @@ impl NodeFactory {
     pub fn new_qualified_name(&self, left: Node, right: Node) -> Node {
         self.new_node(
             SyntaxKind::QualifiedName,
-            D::QualifiedName(Box::new(ts_ast::QualifiedNameData {
+            D::QualifiedName(Box::new(crate::astdata::QualifiedNameData {
                 flow_node: None,
                 left: self.id(left),
                 right: self.id(right),
@@ -350,7 +350,7 @@ impl NodeFactory {
     pub fn new_computed_property_name(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ComputedPropertyName,
-            D::ComputedPropertyName(Box::new(ts_ast::ComputedPropertyNameData {
+            D::ComputedPropertyName(Box::new(crate::astdata::ComputedPropertyNameData {
                 expression: self.id(expression),
                 facts: 0,
             })),
@@ -361,7 +361,7 @@ impl NodeFactory {
     pub fn new_string_literal(&self, text: impl Into<String>, flags: TokenFlags) -> Node {
         self.new_text_node(
             SyntaxKind::StringLiteral,
-            D::StringLiteral(Box::new(ts_ast::StringLiteralData {
+            D::StringLiteral(Box::new(crate::astdata::StringLiteralData {
                 text: text.into(),
                 token_flags: token_flags(flags & TokenFlags::STRING_LITERAL_FLAGS),
             })),
@@ -372,7 +372,7 @@ impl NodeFactory {
     pub fn new_numeric_literal(&self, text: impl Into<String>, flags: TokenFlags) -> Node {
         self.new_text_node(
             SyntaxKind::NumericLiteral,
-            D::NumericLiteral(Box::new(ts_ast::NumericLiteralData {
+            D::NumericLiteral(Box::new(crate::astdata::NumericLiteralData {
                 text: text.into(),
                 token_flags: token_flags(flags & TokenFlags::NUMERIC_LITERAL_FLAGS),
             })),
@@ -383,7 +383,7 @@ impl NodeFactory {
     pub fn new_big_int_literal(&self, text: impl Into<String>, flags: TokenFlags) -> Node {
         self.new_text_node(
             SyntaxKind::BigIntLiteral,
-            D::BigIntLiteral(Box::new(ts_ast::BigIntLiteralData {
+            D::BigIntLiteral(Box::new(crate::astdata::BigIntLiteralData {
                 text: text.into(),
                 token_flags: token_flags(flags & TokenFlags::NUMERIC_LITERAL_FLAGS),
             })),
@@ -398,7 +398,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_text_node(
             SyntaxKind::RegularExpressionLiteral,
-            D::RegularExpressionLiteral(Box::new(ts_ast::RegularExpressionLiteralData {
+            D::RegularExpressionLiteral(Box::new(crate::astdata::RegularExpressionLiteralData {
                 text: text.into(),
                 token_flags: token_flags(flags & TokenFlags::REGULAR_EXPRESSION_LITERAL_FLAGS),
             })),
@@ -414,15 +414,17 @@ impl NodeFactory {
     ) -> Node {
         self.new_text_node(
             SyntaxKind::NoSubstitutionTemplateLiteral,
-            D::NoSubstitutionTemplateLiteral(Box::new(ts_ast::NoSubstitutionTemplateLiteralData {
-                raw_text: String::new(),
-                symbol: None,
-                template_flags: token_flags(
-                    template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS,
-                ),
-                text: text.into(),
-                token_flags: NO_TOKEN_FLAGS,
-            })),
+            D::NoSubstitutionTemplateLiteral(Box::new(
+                crate::astdata::NoSubstitutionTemplateLiteralData {
+                    raw_text: String::new(),
+                    symbol: None,
+                    template_flags: token_flags(
+                        template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS,
+                    ),
+                    text: text.into(),
+                    token_flags: NO_TOKEN_FLAGS,
+                },
+            )),
         )
     }
 
@@ -435,7 +437,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_text_node(
             SyntaxKind::TemplateHead,
-            D::TemplateHead(Box::new(ts_ast::TemplateHeadData {
+            D::TemplateHead(Box::new(crate::astdata::TemplateHeadData {
                 raw_text: raw_text.into(),
                 template_flags: token_flags(
                     template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS,
@@ -455,7 +457,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_text_node(
             SyntaxKind::TemplateMiddle,
-            D::TemplateMiddle(Box::new(ts_ast::TemplateMiddleData {
+            D::TemplateMiddle(Box::new(crate::astdata::TemplateMiddleData {
                 raw_text: raw_text.into(),
                 template_flags: token_flags(
                     template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS,
@@ -475,7 +477,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_text_node(
             SyntaxKind::TemplateTail,
-            D::TemplateTail(Box::new(ts_ast::TemplateTailData {
+            D::TemplateTail(Box::new(crate::astdata::TemplateTailData {
                 raw_text: raw_text.into(),
                 template_flags: token_flags(
                     template_flags & TokenFlags::TEMPLATE_LITERAL_LIKE_FLAGS,
@@ -492,7 +494,7 @@ impl NodeFactory {
     pub fn new_keyword_type_node(&self, kind: SyntaxKind) -> Node {
         self.new_node(
             kind,
-            D::KeywordTypeNode(Box::new(ts_ast::KeywordTypeNodeData)),
+            D::KeywordTypeNode(Box::new(crate::astdata::KeywordTypeNodeData)),
         )
     }
 
@@ -500,7 +502,7 @@ impl NodeFactory {
     pub fn new_union_type_node(&self, types: NodeList) -> Node {
         self.new_node(
             SyntaxKind::UnionType,
-            D::UnionTypeNode(Box::new(ts_ast::UnionTypeNodeData {
+            D::UnionTypeNode(Box::new(crate::astdata::UnionTypeNodeData {
                 types: self.req_list(types),
             })),
         )
@@ -510,7 +512,7 @@ impl NodeFactory {
     pub fn new_intersection_type_node(&self, types: NodeList) -> Node {
         self.new_node(
             SyntaxKind::IntersectionType,
-            D::IntersectionTypeNode(Box::new(ts_ast::IntersectionTypeNodeData {
+            D::IntersectionTypeNode(Box::new(crate::astdata::IntersectionTypeNodeData {
                 types: self.req_list(types),
             })),
         )
@@ -526,11 +528,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ConditionalType,
-            D::ConditionalTypeNode(Box::new(ts_ast::ConditionalTypeNodeData {
+            D::ConditionalTypeNode(Box::new(crate::astdata::ConditionalTypeNodeData {
                 check_type: self.id(check_type),
                 extends_type: self.id(extends_type),
                 false_type: self.id(false_type),
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 true_type: self.id(true_type),
             })),
@@ -541,7 +543,7 @@ impl NodeFactory {
     pub fn new_type_operator_node(&self, operator: SyntaxKind, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::TypeOperator,
-            D::TypeOperatorNode(Box::new(ts_ast::TypeOperatorNodeData {
+            D::TypeOperatorNode(Box::new(crate::astdata::TypeOperatorNodeData {
                 operator,
                 type_: self.id(type_node),
             })),
@@ -552,7 +554,7 @@ impl NodeFactory {
     pub fn new_infer_type_node(&self, type_parameter: Node) -> Node {
         self.new_node(
             SyntaxKind::InferType,
-            D::InferTypeNode(Box::new(ts_ast::InferTypeNodeData {
+            D::InferTypeNode(Box::new(crate::astdata::InferTypeNodeData {
                 type_parameter: self.id(type_parameter),
             })),
         )
@@ -562,7 +564,7 @@ impl NodeFactory {
     pub fn new_array_type_node(&self, element_type: Node) -> Node {
         self.new_node(
             SyntaxKind::ArrayType,
-            D::ArrayTypeNode(Box::new(ts_ast::ArrayTypeNodeData {
+            D::ArrayTypeNode(Box::new(crate::astdata::ArrayTypeNodeData {
                 element_type: self.id(element_type),
             })),
         )
@@ -572,7 +574,7 @@ impl NodeFactory {
     pub fn new_indexed_access_type_node(&self, object_type: Node, index_type: Node) -> Node {
         self.new_node(
             SyntaxKind::IndexedAccessType,
-            D::IndexedAccessTypeNode(Box::new(ts_ast::IndexedAccessTypeNodeData {
+            D::IndexedAccessTypeNode(Box::new(crate::astdata::IndexedAccessTypeNodeData {
                 index_type: self.id(index_type),
                 object_type: self.id(object_type),
             })),
@@ -583,7 +585,7 @@ impl NodeFactory {
     pub fn new_type_reference_node(&self, type_name: Node, type_arguments: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TypeReference,
-            D::TypeReferenceNode(Box::new(ts_ast::TypeReferenceNodeData {
+            D::TypeReferenceNode(Box::new(crate::astdata::TypeReferenceNodeData {
                 type_arguments: self.opt_list(type_arguments),
                 type_name: self.id(type_name),
             })),
@@ -598,11 +600,13 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ExpressionWithTypeArguments,
-            D::ExpressionWithTypeArguments(Box::new(ts_ast::ExpressionWithTypeArgumentsData {
-                expression: self.id(expression),
-                type_arguments: self.opt_list(type_arguments),
-                facts: 0,
-            })),
+            D::ExpressionWithTypeArguments(Box::new(
+                crate::astdata::ExpressionWithTypeArgumentsData {
+                    expression: self.id(expression),
+                    type_arguments: self.opt_list(type_arguments),
+                    facts: 0,
+                },
+            )),
         )
     }
 
@@ -610,7 +614,7 @@ impl NodeFactory {
     pub fn new_literal_type_node(&self, literal: Node) -> Node {
         self.new_node(
             SyntaxKind::LiteralType,
-            D::LiteralTypeNode(Box::new(ts_ast::LiteralTypeNodeData {
+            D::LiteralTypeNode(Box::new(crate::astdata::LiteralTypeNodeData {
                 literal: self.id(literal),
             })),
         )
@@ -620,7 +624,7 @@ impl NodeFactory {
     pub fn new_this_type_node(&self) -> Node {
         self.new_node(
             SyntaxKind::ThisType,
-            D::ThisTypeNode(Box::new(ts_ast::ThisTypeNodeData)),
+            D::ThisTypeNode(Box::new(crate::astdata::ThisTypeNodeData)),
         )
     }
 
@@ -633,7 +637,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::TypePredicate,
-            D::TypePredicateNode(Box::new(ts_ast::TypePredicateNodeData {
+            D::TypePredicateNode(Box::new(crate::astdata::TypePredicateNodeData {
                 asserts_modifier: self.oid(asserts_modifier),
                 parameter_name: self.id(parameter_name),
                 type_: self.oid(type_node),
@@ -645,7 +649,7 @@ impl NodeFactory {
     pub fn new_type_query_node(&self, expr_name: Node, type_arguments: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TypeQuery,
-            D::TypeQueryNode(Box::new(ts_ast::TypeQueryNodeData {
+            D::TypeQueryNode(Box::new(crate::astdata::TypeQueryNodeData {
                 expr_name: self.id(expr_name),
                 type_arguments: self.opt_list(type_arguments),
             })),
@@ -664,8 +668,8 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::MappedType,
-            D::MappedTypeNode(Box::new(ts_ast::MappedTypeNodeData {
-                locals: ts_ast::SymbolTable,
+            D::MappedTypeNode(Box::new(crate::astdata::MappedTypeNodeData {
+                locals: crate::astdata::SymbolTable,
                 members: self.opt_list(members),
                 name_type: self.oid(name_type),
                 next_container: None,
@@ -682,7 +686,7 @@ impl NodeFactory {
     pub fn new_type_literal_node(&self, members: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TypeLiteral,
-            D::TypeLiteralNode(Box::new(ts_ast::TypeLiteralNodeData {
+            D::TypeLiteralNode(Box::new(crate::astdata::TypeLiteralNodeData {
                 members: self.req_list(members),
                 symbol: None,
             })),
@@ -693,7 +697,7 @@ impl NodeFactory {
     pub fn new_tuple_type_node(&self, elements: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TupleType,
-            D::TupleTypeNode(Box::new(ts_ast::TupleTypeNodeData {
+            D::TupleTypeNode(Box::new(crate::astdata::TupleTypeNodeData {
                 elements: self.req_list(elements),
             })),
         )
@@ -709,7 +713,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::NamedTupleMember,
-            D::NamedTupleMember(Box::new(ts_ast::NamedTupleMemberData {
+            D::NamedTupleMember(Box::new(crate::astdata::NamedTupleMemberData {
                 dot_dot_dot_token: self.oid(dot_dot_dot_token),
                 question_token: self.oid(question_token),
                 symbol: None,
@@ -723,7 +727,7 @@ impl NodeFactory {
     pub fn new_optional_type_node(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::OptionalType,
-            D::OptionalTypeNode(Box::new(ts_ast::OptionalTypeNodeData {
+            D::OptionalTypeNode(Box::new(crate::astdata::OptionalTypeNodeData {
                 type_: self.id(type_node),
             })),
         )
@@ -733,7 +737,7 @@ impl NodeFactory {
     pub fn new_rest_type_node(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::RestType,
-            D::RestTypeNode(Box::new(ts_ast::RestTypeNodeData {
+            D::RestTypeNode(Box::new(crate::astdata::RestTypeNodeData {
                 type_: self.id(type_node),
             })),
         )
@@ -743,7 +747,7 @@ impl NodeFactory {
     pub fn new_parenthesized_type_node(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::ParenthesizedType,
-            D::ParenthesizedTypeNode(Box::new(ts_ast::ParenthesizedTypeNodeData {
+            D::ParenthesizedTypeNode(Box::new(crate::astdata::ParenthesizedTypeNodeData {
                 type_: self.id(type_node),
             })),
         )
@@ -758,9 +762,9 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::FunctionType,
-            D::FunctionTypeNode(Box::new(ts_ast::FunctionTypeNodeData {
+            D::FunctionTypeNode(Box::new(crate::astdata::FunctionTypeNodeData {
                 full_signature: None,
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 parameters: self.req_list(parameters),
                 symbol: None,
@@ -781,9 +785,9 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ConstructorType,
-            D::ConstructorTypeNode(Box::new(ts_ast::ConstructorTypeNodeData {
+            D::ConstructorTypeNode(Box::new(crate::astdata::ConstructorTypeNodeData {
                 full_signature: None,
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 parameters: self.req_list(parameters),
                 symbol: None,
@@ -798,7 +802,7 @@ impl NodeFactory {
     pub fn new_template_literal_type_node(&self, head: Node, template_spans: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TemplateLiteralType,
-            D::TemplateLiteralTypeNode(Box::new(ts_ast::TemplateLiteralTypeNodeData {
+            D::TemplateLiteralTypeNode(Box::new(crate::astdata::TemplateLiteralTypeNodeData {
                 head: self.id(head),
                 template_spans: self.req_list(template_spans),
             })),
@@ -809,7 +813,7 @@ impl NodeFactory {
     pub fn new_template_literal_type_span(&self, type_node: Node, literal: Node) -> Node {
         self.new_node(
             SyntaxKind::TemplateLiteralTypeSpan,
-            D::TemplateLiteralTypeSpan(Box::new(ts_ast::TemplateLiteralTypeSpanData {
+            D::TemplateLiteralTypeSpan(Box::new(crate::astdata::TemplateLiteralTypeSpanData {
                 literal: self.id(literal),
                 type_: self.id(type_node),
             })),
@@ -827,7 +831,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ImportType,
-            D::ImportTypeNode(Box::new(ts_ast::ImportTypeNodeData {
+            D::ImportTypeNode(Box::new(crate::astdata::ImportTypeNodeData {
                 argument: self.id(argument),
                 attributes: self.oid(attributes),
                 is_type_of,
@@ -850,7 +854,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::TypeParameter,
-            D::TypeParameterDeclaration(Box::new(ts_ast::TypeParameterDeclarationData {
+            D::TypeParameterDeclaration(Box::new(crate::astdata::TypeParameterDeclarationData {
                 constraint: self.oid(constraint),
                 default_type: self.oid(default_type),
                 expression: self.oid(expression),
@@ -873,7 +877,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::Parameter,
-            D::ParameterDeclaration(Box::new(ts_ast::ParameterDeclarationData {
+            D::ParameterDeclaration(Box::new(crate::astdata::ParameterDeclarationData {
                 dot_dot_dot_token: self.oid(dot_dot_dot_token),
                 initializer: self.oid(initializer),
                 question_token: self.oid(question_token),
@@ -895,9 +899,9 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::CallSignature,
-            D::CallSignatureDeclaration(Box::new(ts_ast::CallSignatureDeclarationData {
+            D::CallSignatureDeclaration(Box::new(crate::astdata::CallSignatureDeclarationData {
                 full_signature: None,
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 parameters: self.req_list(parameters),
                 symbol: None,
@@ -916,15 +920,17 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ConstructSignature,
-            D::ConstructSignatureDeclaration(Box::new(ts_ast::ConstructSignatureDeclarationData {
-                full_signature: None,
-                locals: ts_ast::SymbolTable,
-                next_container: None,
-                parameters: self.req_list(parameters),
-                symbol: None,
-                type_: self.oid(type_node),
-                type_parameters: self.opt_list(type_parameters),
-            })),
+            D::ConstructSignatureDeclaration(Box::new(
+                crate::astdata::ConstructSignatureDeclarationData {
+                    full_signature: None,
+                    locals: crate::astdata::SymbolTable,
+                    next_container: None,
+                    parameters: self.req_list(parameters),
+                    symbol: None,
+                    type_: self.oid(type_node),
+                    type_parameters: self.opt_list(type_parameters),
+                },
+            )),
         )
     }
 
@@ -940,12 +946,12 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::Constructor,
-            D::ConstructorDeclaration(Box::new(ts_ast::ConstructorDeclarationData {
+            D::ConstructorDeclaration(Box::new(crate::astdata::ConstructorDeclarationData {
                 asterisk_token: None,
                 body: self.oid(body),
                 end_flow_node: None,
                 full_signature: self.oid(full_signature),
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 parameters: self.req_list(parameters),
                 return_flow_node: None,
@@ -972,13 +978,13 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::GetAccessor,
-            D::GetAccessorDeclaration(Box::new(ts_ast::GetAccessorDeclarationData {
+            D::GetAccessorDeclaration(Box::new(crate::astdata::GetAccessorDeclarationData {
                 asterisk_token: None,
                 body: self.oid(body),
                 end_flow_node: None,
                 flow_node: None,
                 full_signature: self.oid(full_signature),
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 parameters: self.req_list(parameters),
                 postfix_token: None,
@@ -1006,13 +1012,13 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::SetAccessor,
-            D::SetAccessorDeclaration(Box::new(ts_ast::SetAccessorDeclarationData {
+            D::SetAccessorDeclaration(Box::new(crate::astdata::SetAccessorDeclarationData {
                 asterisk_token: None,
                 body: self.oid(body),
                 end_flow_node: None,
                 flow_node: None,
                 full_signature: self.oid(full_signature),
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 parameters: self.req_list(parameters),
                 postfix_token: None,
@@ -1037,9 +1043,9 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::IndexSignature,
-            D::IndexSignatureDeclaration(Box::new(ts_ast::IndexSignatureDeclarationData {
+            D::IndexSignatureDeclaration(Box::new(crate::astdata::IndexSignatureDeclarationData {
                 full_signature: None,
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 parameters: self.req_list(parameters),
                 symbol: None,
@@ -1062,18 +1068,20 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::MethodSignature,
-            D::MethodSignatureDeclaration(Box::new(ts_ast::MethodSignatureDeclarationData {
-                full_signature: None,
-                locals: ts_ast::SymbolTable,
-                next_container: None,
-                parameters: self.req_list(parameters),
-                postfix_token: self.oid(postfix_token),
-                symbol: None,
-                type_: self.oid(type_node),
-                type_parameters: self.opt_list(type_parameters),
-                modifiers: self.mods(modifiers),
-                name: self.id(name),
-            })),
+            D::MethodSignatureDeclaration(Box::new(
+                crate::astdata::MethodSignatureDeclarationData {
+                    full_signature: None,
+                    locals: crate::astdata::SymbolTable,
+                    next_container: None,
+                    parameters: self.req_list(parameters),
+                    postfix_token: self.oid(postfix_token),
+                    symbol: None,
+                    type_: self.oid(type_node),
+                    type_parameters: self.opt_list(type_parameters),
+                    modifiers: self.mods(modifiers),
+                    name: self.id(name),
+                },
+            )),
         )
     }
 
@@ -1093,13 +1101,13 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::MethodDeclaration,
-            D::MethodDeclaration(Box::new(ts_ast::MethodDeclarationData {
+            D::MethodDeclaration(Box::new(crate::astdata::MethodDeclarationData {
                 asterisk_token: self.oid(asterisk_token),
                 body: self.oid(body),
                 end_flow_node: None,
                 flow_node: None,
                 full_signature: self.oid(full_signature),
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 parameters: self.req_list(parameters),
                 postfix_token: self.oid(postfix_token),
@@ -1126,14 +1134,16 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::PropertySignature,
-            D::PropertySignatureDeclaration(Box::new(ts_ast::PropertySignatureDeclarationData {
-                initializer: self.id(initializer),
-                postfix_token: self.oid(postfix_token),
-                symbol: None,
-                type_: self.id(type_node),
-                modifiers: self.mods(modifiers),
-                name: self.id(name),
-            })),
+            D::PropertySignatureDeclaration(Box::new(
+                crate::astdata::PropertySignatureDeclarationData {
+                    initializer: self.id(initializer),
+                    postfix_token: self.oid(postfix_token),
+                    symbol: None,
+                    type_: self.id(type_node),
+                    modifiers: self.mods(modifiers),
+                    name: self.id(name),
+                },
+            )),
         )
     }
 
@@ -1148,7 +1158,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::PropertyDeclaration,
-            D::PropertyDeclaration(Box::new(ts_ast::PropertyDeclarationData {
+            D::PropertyDeclaration(Box::new(crate::astdata::PropertyDeclarationData {
                 initializer: self.oid(initializer),
                 postfix_token: self.oid(postfix_token),
                 symbol: None,
@@ -1164,7 +1174,7 @@ impl NodeFactory {
     pub fn new_not_emitted_type_element(&self) -> Node {
         self.new_node(
             SyntaxKind::NotEmittedTypeElement,
-            D::NotEmittedTypeElement(Box::new(ts_ast::NotEmittedTypeElementData)),
+            D::NotEmittedTypeElement(Box::new(crate::astdata::NotEmittedTypeElementData)),
         )
     }
 
@@ -1174,7 +1184,7 @@ impl NodeFactory {
     pub fn new_enum_member(&self, name: Node, initializer: Node) -> Node {
         self.new_node(
             SyntaxKind::EnumMember,
-            D::EnumMember(Box::new(ts_ast::EnumMemberData {
+            D::EnumMember(Box::new(crate::astdata::EnumMemberData {
                 initializer: self.oid(initializer),
                 postfix_token: None,
                 symbol: None,
@@ -1194,7 +1204,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::EnumDeclaration,
-            D::EnumDeclaration(Box::new(ts_ast::EnumDeclarationData {
+            D::EnumDeclaration(Box::new(crate::astdata::EnumDeclarationData {
                 flow_node: None,
                 local_symbol: None,
                 members: self.req_list(members),
@@ -1221,14 +1231,14 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::FunctionDeclaration,
-            D::FunctionDeclaration(Box::new(ts_ast::FunctionDeclarationData {
+            D::FunctionDeclaration(Box::new(crate::astdata::FunctionDeclarationData {
                 asterisk_token: self.oid(asterisk_token),
                 body: self.oid(body),
                 end_flow_node: None,
                 flow_node: None,
                 full_signature: self.oid(full_signature),
                 local_symbol: None,
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 parameters: self.req_list(parameters),
                 return_flow_node: None,
@@ -1253,11 +1263,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ClassDeclaration,
-            D::ClassDeclaration(Box::new(ts_ast::ClassDeclarationData {
+            D::ClassDeclaration(Box::new(crate::astdata::ClassDeclarationData {
                 flow_node: None,
                 heritage_clauses: self.opt_list(heritage_clauses),
                 local_symbol: None,
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 members: self.req_list(members),
                 next_container: None,
                 symbol: None,
@@ -1280,10 +1290,10 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ClassExpression,
-            D::ClassExpression(Box::new(ts_ast::ClassExpressionData {
+            D::ClassExpression(Box::new(crate::astdata::ClassExpressionData {
                 heritage_clauses: self.opt_list(heritage_clauses),
                 local_symbol: None,
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 members: self.req_list(members),
                 next_container: None,
                 symbol: None,
@@ -1299,7 +1309,7 @@ impl NodeFactory {
     pub fn new_heritage_clause(&self, token: SyntaxKind, types: NodeList) -> Node {
         self.new_node(
             SyntaxKind::HeritageClause,
-            D::HeritageClause(Box::new(ts_ast::HeritageClauseData {
+            D::HeritageClause(Box::new(crate::astdata::HeritageClauseData {
                 token,
                 types: self.req_list(types),
                 facts: 0,
@@ -1318,7 +1328,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::InterfaceDeclaration,
-            D::InterfaceDeclaration(Box::new(ts_ast::InterfaceDeclarationData {
+            D::InterfaceDeclaration(Box::new(crate::astdata::InterfaceDeclarationData {
                 flow_node: None,
                 heritage_clauses: self.opt_list(heritage_clauses),
                 local_symbol: None,
@@ -1341,10 +1351,10 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::TypeAliasDeclaration,
-            D::TypeAliasDeclaration(Box::new(ts_ast::TypeAliasDeclarationData {
+            D::TypeAliasDeclaration(Box::new(crate::astdata::TypeAliasDeclarationData {
                 flow_node: None,
                 local_symbol: None,
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 symbol: None,
                 type_: self.id(type_node),
@@ -1365,14 +1375,14 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ModuleDeclaration,
-            D::ModuleDeclaration(Box::new(ts_ast::ModuleDeclarationData {
+            D::ModuleDeclaration(Box::new(crate::astdata::ModuleDeclarationData {
                 asterisk_token: None,
                 body: self.oid(body),
                 end_flow_node: None,
                 flow_node: None,
                 keyword,
                 local_symbol: None,
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 symbol: None,
                 facts: 0,
@@ -1386,7 +1396,7 @@ impl NodeFactory {
     pub fn new_module_block(&self, statements: NodeList) -> Node {
         self.new_node(
             SyntaxKind::ModuleBlock,
-            D::ModuleBlock(Box::new(ts_ast::ModuleBlockData {
+            D::ModuleBlock(Box::new(crate::astdata::ModuleBlockData {
                 flow_node: None,
                 statements: self.req_list(statements),
                 facts: 0,
@@ -1398,7 +1408,7 @@ impl NodeFactory {
     pub fn new_import_attribute(&self, name: Node, value: Node) -> Node {
         self.new_node(
             SyntaxKind::ImportAttribute,
-            D::ImportAttribute(Box::new(ts_ast::ImportAttributeData {
+            D::ImportAttribute(Box::new(crate::astdata::ImportAttributeData {
                 value: self.id(value),
                 facts: 0,
                 name: self.id(name),
@@ -1415,7 +1425,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ImportAttributes,
-            D::ImportAttributes(Box::new(ts_ast::ImportAttributesData {
+            D::ImportAttributes(Box::new(crate::astdata::ImportAttributesData {
                 attributes: self.req_list(attributes),
                 multi_line,
                 token,
@@ -1434,7 +1444,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ExportAssignment,
-            D::ExportAssignment(Box::new(ts_ast::ExportAssignmentData {
+            D::ExportAssignment(Box::new(crate::astdata::ExportAssignmentData {
                 expression: self.id(expression),
                 flow_node: None,
                 is_export_equals,
@@ -1450,7 +1460,7 @@ impl NodeFactory {
     pub fn new_named_exports(&self, elements: NodeList) -> Node {
         self.new_node(
             SyntaxKind::NamedExports,
-            D::NamedExports(Box::new(ts_ast::NamedExportsData {
+            D::NamedExports(Box::new(crate::astdata::NamedExportsData {
                 elements: self.req_list(elements),
                 facts: 0,
             })),
@@ -1466,7 +1476,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ExportSpecifier,
-            D::ExportSpecifier(Box::new(ts_ast::ExportSpecifierData {
+            D::ExportSpecifier(Box::new(crate::astdata::ExportSpecifierData {
                 is_type_only,
                 local_symbol: None,
                 property_name: self.oid(property_name),
@@ -1488,7 +1498,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ExportDeclaration,
-            D::ExportDeclaration(Box::new(ts_ast::ExportDeclarationData {
+            D::ExportDeclaration(Box::new(crate::astdata::ExportDeclarationData {
                 attributes: self.oid(attributes),
                 export_clause: self.oid(export_clause),
                 flow_node: None,
@@ -1511,7 +1521,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ImportDeclaration,
-            D::ImportDeclaration(Box::new(ts_ast::ImportDeclarationData {
+            D::ImportDeclaration(Box::new(crate::astdata::ImportDeclarationData {
                 attributes: self.oid(attributes),
                 flow_node: None,
                 import_clause: self.oid(import_clause),
@@ -1527,7 +1537,7 @@ impl NodeFactory {
     pub fn new_external_module_reference(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ExternalModuleReference,
-            D::ExternalModuleReference(Box::new(ts_ast::ExternalModuleReferenceData {
+            D::ExternalModuleReference(Box::new(crate::astdata::ExternalModuleReferenceData {
                 expression: self.id(expression),
             })),
         )
@@ -1537,7 +1547,7 @@ impl NodeFactory {
     pub fn new_named_imports(&self, elements: NodeList) -> Node {
         self.new_node(
             SyntaxKind::NamedImports,
-            D::NamedImports(Box::new(ts_ast::NamedImportsData {
+            D::NamedImports(Box::new(crate::astdata::NamedImportsData {
                 elements: self.req_list(elements),
                 facts: 0,
             })),
@@ -1549,7 +1559,7 @@ impl NodeFactory {
         let children = children.iter().map(|&n| self.id(n)).collect();
         self.new_node(
             SyntaxKind::SyntaxList,
-            D::SyntaxList(Box::new(ts_ast::SyntaxListData { children })),
+            D::SyntaxList(Box::new(crate::astdata::SyntaxListData { children })),
         )
     }
 
@@ -1563,7 +1573,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ImportEqualsDeclaration,
-            D::ImportEqualsDeclaration(Box::new(ts_ast::ImportEqualsDeclarationData {
+            D::ImportEqualsDeclaration(Box::new(crate::astdata::ImportEqualsDeclarationData {
                 flow_node: None,
                 is_type_only,
                 local_symbol: None,
@@ -1586,7 +1596,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ImportClause,
-            D::ImportClause(Box::new(ts_ast::ImportClauseData {
+            D::ImportClause(Box::new(crate::astdata::ImportClauseData {
                 local_symbol: None,
                 named_bindings: self.oid(named_bindings),
                 phase_modifier: if phase_modifier == SyntaxKind::Unknown {
@@ -1610,7 +1620,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ImportSpecifier,
-            D::ImportSpecifier(Box::new(ts_ast::ImportSpecifierData {
+            D::ImportSpecifier(Box::new(crate::astdata::ImportSpecifierData {
                 is_type_only,
                 local_symbol: None,
                 property_name: self.oid(property_name),
@@ -1627,7 +1637,9 @@ impl NodeFactory {
     pub fn new_keyword_expression(&self, kind: SyntaxKind) -> Node {
         self.new_node(
             kind,
-            D::KeywordExpression(Box::new(ts_ast::KeywordExpressionData { flow_node: None })),
+            D::KeywordExpression(Box::new(crate::astdata::KeywordExpressionData {
+                flow_node: None,
+            })),
         )
     }
 
@@ -1641,7 +1653,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_chain_node(
             SyntaxKind::PropertyAccessExpression,
-            D::PropertyAccessExpression(Box::new(ts_ast::PropertyAccessExpressionData {
+            D::PropertyAccessExpression(Box::new(crate::astdata::PropertyAccessExpressionData {
                 expression: self.id(expression),
                 flow_node: None,
                 question_dot_token: self.oid(question_dot_token),
@@ -1662,7 +1674,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_chain_node(
             SyntaxKind::ElementAccessExpression,
-            D::ElementAccessExpression(Box::new(ts_ast::ElementAccessExpressionData {
+            D::ElementAccessExpression(Box::new(crate::astdata::ElementAccessExpressionData {
                 argument_expression: self.id(argument_expression),
                 expression: self.id(expression),
                 flow_node: None,
@@ -1684,7 +1696,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_chain_node(
             SyntaxKind::CallExpression,
-            D::CallExpression(Box::new(ts_ast::CallExpressionData {
+            D::CallExpression(Box::new(crate::astdata::CallExpressionData {
                 arguments: self.req_list(arguments),
                 expression: self.id(expression),
                 question_dot_token: self.oid(question_dot_token),
@@ -1705,7 +1717,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::NewExpression,
-            D::NewExpression(Box::new(ts_ast::NewExpressionData {
+            D::NewExpression(Box::new(crate::astdata::NewExpressionData {
                 arguments: self.opt_list(arguments),
                 expression: self.id(expression),
                 type_arguments: self.opt_list(type_arguments),
@@ -1718,7 +1730,7 @@ impl NodeFactory {
     pub fn new_non_null_expression(&self, expression: Node, flags: NodeFlags) -> Node {
         self.new_chain_node(
             SyntaxKind::NonNullExpression,
-            D::NonNullExpression(Box::new(ts_ast::NonNullExpressionData {
+            D::NonNullExpression(Box::new(crate::astdata::NonNullExpressionData {
                 expression: self.id(expression),
             })),
             flags,
@@ -1736,7 +1748,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_chain_node(
             SyntaxKind::TaggedTemplateExpression,
-            D::TaggedTemplateExpression(Box::new(ts_ast::TaggedTemplateExpressionData {
+            D::TaggedTemplateExpression(Box::new(crate::astdata::TaggedTemplateExpressionData {
                 question_dot_token: self.oid(question_dot_token),
                 tag: self.id(tag),
                 template: self.id(template),
@@ -1751,7 +1763,7 @@ impl NodeFactory {
     pub fn new_prefix_unary_expression(&self, operator: SyntaxKind, operand: Node) -> Node {
         self.new_node(
             SyntaxKind::PrefixUnaryExpression,
-            D::PrefixUnaryExpression(Box::new(ts_ast::PrefixUnaryExpressionData {
+            D::PrefixUnaryExpression(Box::new(crate::astdata::PrefixUnaryExpressionData {
                 operand: self.id(operand),
                 operator,
             })),
@@ -1769,7 +1781,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::BinaryExpression,
-            D::BinaryExpression(Box::new(ts_ast::BinaryExpressionData {
+            D::BinaryExpression(Box::new(crate::astdata::BinaryExpressionData {
                 left: self.id(left),
                 operator_token: self.id(operator_token),
                 right: self.id(right),
@@ -1792,7 +1804,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ConditionalExpression,
-            D::ConditionalExpression(Box::new(ts_ast::ConditionalExpressionData {
+            D::ConditionalExpression(Box::new(crate::astdata::ConditionalExpressionData {
                 colon_token: self.id(colon_token),
                 condition: self.id(condition),
                 question_token: self.id(question_token),
@@ -1807,7 +1819,7 @@ impl NodeFactory {
     pub fn new_parenthesized_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ParenthesizedExpression,
-            D::ParenthesizedExpression(Box::new(ts_ast::ParenthesizedExpressionData {
+            D::ParenthesizedExpression(Box::new(crate::astdata::ParenthesizedExpressionData {
                 expression: self.id(expression),
             })),
         )
@@ -1828,13 +1840,13 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::FunctionExpression,
-            D::FunctionExpression(Box::new(ts_ast::FunctionExpressionData {
+            D::FunctionExpression(Box::new(crate::astdata::FunctionExpressionData {
                 asterisk_token: self.oid(asterisk_token),
                 body: self.id(body),
                 end_flow_node: None,
                 flow_node: None,
                 full_signature: self.oid(full_signature),
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 parameters: self.req_list(parameters),
                 return_flow_node: None,
@@ -1862,14 +1874,14 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ArrowFunction,
-            D::ArrowFunction(Box::new(ts_ast::ArrowFunctionData {
+            D::ArrowFunction(Box::new(crate::astdata::ArrowFunctionData {
                 asterisk_token: None,
                 body: self.id(body),
                 end_flow_node: None,
                 equals_greater_than_token: self.id(equals_greater_than_token),
                 flow_node: None,
                 full_signature: self.oid(full_signature),
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 next_container: None,
                 parameters: self.req_list(parameters),
                 symbol: None,
@@ -1892,10 +1904,10 @@ impl NodeFactory {
     ) -> Node {
         let node = self.new_node(
             SyntaxKind::SyntheticExpression,
-            D::SyntheticExpression(Box::new(ts_ast::SyntheticExpressionData {
+            D::SyntheticExpression(Box::new(crate::astdata::SyntheticExpressionData {
                 is_spread,
                 tuple_name_source: self.oid(tuple_name_source),
-                type_: ts_ast::OpaqueValue,
+                type_: crate::astdata::OpaqueValue,
             })),
         );
         set_synthetic_expression_type(node, type_);
@@ -1906,7 +1918,7 @@ impl NodeFactory {
     pub fn new_spread_element(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::SpreadElement,
-            D::SpreadElement(Box::new(ts_ast::SpreadElementData {
+            D::SpreadElement(Box::new(crate::astdata::SpreadElementData {
                 expression: self.id(expression),
             })),
         )
@@ -1916,7 +1928,7 @@ impl NodeFactory {
     pub fn new_array_literal_expression(&self, elements: NodeList, multi_line: bool) -> Node {
         self.new_node(
             SyntaxKind::ArrayLiteralExpression,
-            D::ArrayLiteralExpression(Box::new(ts_ast::ArrayLiteralExpressionData {
+            D::ArrayLiteralExpression(Box::new(crate::astdata::ArrayLiteralExpressionData {
                 elements: self.req_list(elements),
                 multi_line,
                 facts: 0,
@@ -1928,7 +1940,7 @@ impl NodeFactory {
     pub fn new_object_literal_expression(&self, properties: NodeList, multi_line: bool) -> Node {
         self.new_node(
             SyntaxKind::ObjectLiteralExpression,
-            D::ObjectLiteralExpression(Box::new(ts_ast::ObjectLiteralExpressionData {
+            D::ObjectLiteralExpression(Box::new(crate::astdata::ObjectLiteralExpressionData {
                 multi_line,
                 properties: self.req_list(properties),
                 symbol: None,
@@ -1948,7 +1960,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::PropertyAssignment,
-            D::PropertyAssignment(Box::new(ts_ast::PropertyAssignmentData {
+            D::PropertyAssignment(Box::new(crate::astdata::PropertyAssignmentData {
                 initializer: self.id(initializer),
                 postfix_token: self.oid(postfix_token),
                 symbol: None,
@@ -1964,7 +1976,7 @@ impl NodeFactory {
     pub fn new_as_expression(&self, expression: Node, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::AsExpression,
-            D::AsExpression(Box::new(ts_ast::AsExpressionData {
+            D::AsExpression(Box::new(crate::astdata::AsExpressionData {
                 expression: self.id(expression),
                 type_: self.id(type_node),
             })),
@@ -1975,7 +1987,7 @@ impl NodeFactory {
     pub fn new_satisfies_expression(&self, expression: Node, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::SatisfiesExpression,
-            D::SatisfiesExpression(Box::new(ts_ast::SatisfiesExpressionData {
+            D::SatisfiesExpression(Box::new(crate::astdata::SatisfiesExpressionData {
                 expression: self.id(expression),
                 type_: self.id(type_node),
             })),
@@ -1986,7 +1998,7 @@ impl NodeFactory {
     pub fn new_type_assertion(&self, type_node: Node, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::TypeAssertionExpression,
-            D::TypeAssertion(Box::new(ts_ast::TypeAssertionData {
+            D::TypeAssertion(Box::new(crate::astdata::TypeAssertionData {
                 expression: self.id(expression),
                 type_: self.id(type_node),
             })),
@@ -1997,7 +2009,7 @@ impl NodeFactory {
     pub fn new_delete_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::DeleteExpression,
-            D::DeleteExpression(Box::new(ts_ast::DeleteExpressionData {
+            D::DeleteExpression(Box::new(crate::astdata::DeleteExpressionData {
                 expression: self.id(expression),
             })),
         )
@@ -2007,7 +2019,7 @@ impl NodeFactory {
     pub fn new_type_of_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::TypeOfExpression,
-            D::TypeOfExpression(Box::new(ts_ast::TypeOfExpressionData {
+            D::TypeOfExpression(Box::new(crate::astdata::TypeOfExpressionData {
                 expression: self.id(expression),
             })),
         )
@@ -2017,7 +2029,7 @@ impl NodeFactory {
     pub fn new_void_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::VoidExpression,
-            D::VoidExpression(Box::new(ts_ast::VoidExpressionData {
+            D::VoidExpression(Box::new(crate::astdata::VoidExpressionData {
                 expression: self.id(expression),
             })),
         )
@@ -2027,7 +2039,7 @@ impl NodeFactory {
     pub fn new_await_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::AwaitExpression,
-            D::AwaitExpression(Box::new(ts_ast::AwaitExpressionData {
+            D::AwaitExpression(Box::new(crate::astdata::AwaitExpressionData {
                 expression: self.id(expression),
             })),
         )
@@ -2037,7 +2049,7 @@ impl NodeFactory {
     pub fn new_yield_expression(&self, asterisk_token: Node, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::YieldExpression,
-            D::YieldExpression(Box::new(ts_ast::YieldExpressionData {
+            D::YieldExpression(Box::new(crate::astdata::YieldExpressionData {
                 asterisk_token: self.oid(asterisk_token),
                 expression: self.oid(expression),
             })),
@@ -2048,7 +2060,7 @@ impl NodeFactory {
     pub fn new_decorator(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::Decorator,
-            D::Decorator(Box::new(ts_ast::DecoratorData {
+            D::Decorator(Box::new(crate::astdata::DecoratorData {
                 expression: self.id(expression),
                 facts: 0,
             })),
@@ -2061,9 +2073,9 @@ impl NodeFactory {
     pub fn new_block(&self, statements: NodeList, multi_line: bool) -> Node {
         self.new_node(
             SyntaxKind::Block,
-            D::Block(Box::new(ts_ast::BlockData {
+            D::Block(Box::new(crate::astdata::BlockData {
                 flow_node: None,
-                locals: ts_ast::SymbolTable,
+                locals: crate::astdata::SymbolTable,
                 multi_line,
                 next_container: None,
                 statements: self.req_list(statements),
@@ -2076,7 +2088,7 @@ impl NodeFactory {
     pub fn new_variable_statement(&self, modifiers: ModifierList, declaration_list: Node) -> Node {
         self.new_node(
             SyntaxKind::VariableStatement,
-            D::VariableStatement(Box::new(ts_ast::VariableStatementData {
+            D::VariableStatement(Box::new(crate::astdata::VariableStatementData {
                 declaration_list: self.id(declaration_list),
                 flow_node: None,
                 facts: 0,
@@ -2095,7 +2107,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::VariableDeclaration,
-            D::VariableDeclaration(Box::new(ts_ast::VariableDeclarationData {
+            D::VariableDeclaration(Box::new(crate::astdata::VariableDeclarationData {
                 exclamation_token: self.oid(exclamation_token),
                 initializer: self.oid(initializer),
                 local_symbol: None,
@@ -2111,7 +2123,7 @@ impl NodeFactory {
     pub fn new_variable_declaration_list(&self, declarations: NodeList, flags: NodeFlags) -> Node {
         let node = self.new_node(
             SyntaxKind::VariableDeclarationList,
-            D::VariableDeclarationList(Box::new(ts_ast::VariableDeclarationListData {
+            D::VariableDeclarationList(Box::new(crate::astdata::VariableDeclarationListData {
                 declarations: self.req_list(declarations),
                 facts: 0,
             })),
@@ -2124,7 +2136,7 @@ impl NodeFactory {
     pub fn new_expression_statement(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ExpressionStatement,
-            D::ExpressionStatement(Box::new(ts_ast::ExpressionStatementData {
+            D::ExpressionStatement(Box::new(crate::astdata::ExpressionStatementData {
                 expression: self.id(expression),
                 flow_node: None,
             })),
@@ -2135,7 +2147,7 @@ impl NodeFactory {
     pub fn new_return_statement(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ReturnStatement,
-            D::ReturnStatement(Box::new(ts_ast::ReturnStatementData {
+            D::ReturnStatement(Box::new(crate::astdata::ReturnStatementData {
                 expression: self.oid(expression),
                 flow_node: None,
                 facts: 0,
@@ -2152,7 +2164,7 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::IfStatement,
-            D::IfStatement(Box::new(ts_ast::IfStatementData {
+            D::IfStatement(Box::new(crate::astdata::IfStatementData {
                 else_statement: self.oid(else_statement),
                 expression: self.id(expression),
                 flow_node: None,
@@ -2166,7 +2178,9 @@ impl NodeFactory {
     pub fn new_empty_statement(&self) -> Node {
         self.new_node(
             SyntaxKind::EmptyStatement,
-            D::EmptyStatement(Box::new(ts_ast::EmptyStatementData { flow_node: None })),
+            D::EmptyStatement(Box::new(crate::astdata::EmptyStatementData {
+                flow_node: None,
+            })),
         )
     }
 
@@ -2174,7 +2188,7 @@ impl NodeFactory {
     pub fn new_not_emitted_statement(&self) -> Node {
         self.new_node(
             SyntaxKind::NotEmittedStatement,
-            D::NotEmittedStatement(Box::new(ts_ast::NotEmittedStatementData {
+            D::NotEmittedStatement(Box::new(crate::astdata::NotEmittedStatementData {
                 flow_node: None,
             })),
         )

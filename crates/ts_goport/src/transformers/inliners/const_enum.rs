@@ -84,7 +84,7 @@ impl TransformerVisit for ConstEnumInliningTransformer {
                         LiteralValue::String(v) => f.new_string_literal(v, TokenFlags::NONE),
                         // technically not supported by strada, and issues a checker error, handled here for completeness
                         LiteralValue::PseudoBigInt(v) => {
-                            if v == ts_jsnum::PseudoBigInt::default() {
+                            if v == crate::jsnum::PseudoBigInt::default() {
                                 f.new_big_int_literal("0", TokenFlags::NONE)
                             } else if !v.negative {
                                 f.new_big_int_literal(v.base10_value, TokenFlags::NONE)

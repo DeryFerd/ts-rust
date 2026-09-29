@@ -1,9 +1,9 @@
 //! Port of `transformers/declarations/diagnostics.go`.
 
 use crate::checker::utilities_p1::new_diagnostic_for_node;
+use crate::diagnostics::Message;
 use crate::prelude::*;
 use crate::printer::{EmitResolver, SymbolAccessibility, SymbolAccessibilityResult};
-use ts_diagnostics::Message;
 
 // Go: transformers/declarations/diagnostics.go:10 GetSymbolAccessibilityDiagnostic
 // PORT: a Go func value is an `Rc<dyn Fn>` so the transformer can save and

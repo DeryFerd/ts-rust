@@ -1,7 +1,7 @@
 //! Port of Go `checker/checker.go` lines 9355-10268.
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 // PORT: Go `core.FirstOrNil` / `core.ElementOrNil` over a `NodeSlice`.
 fn node_slice_element_or_nil(nodes: NodeSlice, index: usize) -> Node {

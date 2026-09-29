@@ -3527,7 +3527,7 @@ pub fn get_diagnostics_of_any_program(
 // PORT: built on each call from the generated message statics (a static set
 // cannot read them at compile time). It is only used for plain JS files.
 fn is_plain_js_error(code: i32) -> bool {
-    let messages: [&'static ts_diagnostics::Message; 91] = [
+    let messages: [&'static crate::diagnostics::Message; 91] = [
         // binder errors
         diag::Cannot_redeclare_block_scoped_variable_0,
         diag::A_module_cannot_have_multiple_default_exports,

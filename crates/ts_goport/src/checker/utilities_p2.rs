@@ -1,15 +1,15 @@
 //! Go `internal/checker/utilities.go` lines 904-1844.
 
+use crate::jsnum::PseudoBigInt;
 use crate::prelude::*;
 use std::cell::Cell;
-use ts_jsnum::PseudoBigInt;
 
 // Go: checker/utilities.go:904 isValidNumberString
 pub fn is_valid_number_string(s: &str, round_trip_only: bool) -> bool {
     if s.is_empty() {
         return false;
     }
-    let n = ts_jsnum::from_string(s);
+    let n = crate::jsnum::from_string(s);
     !n.is_nan() && !n.is_infinite() && (!round_trip_only || n.to_string() == s)
 }
 
@@ -23,7 +23,7 @@ pub fn is_valid_big_int_string(s: &str, round_trip_only: bool) -> bool {
     let success = Rc::new(Cell::new(true));
     let success_in_callback = success.clone();
     scanner.set_on_error(Some(Box::new(
-        move |_diagnostic: &'static ts_diagnostics::Message,
+        move |_diagnostic: &'static crate::diagnostics::Message,
               _start: i32,
               _length: i32,
               _args: Vec<String>| {
@@ -48,7 +48,7 @@ pub fn is_valid_big_int_string(s: &str, round_trip_only: bool) -> bool {
         && !flags.intersects(TokenFlags::CONTAINS_SEPARATOR)
         && (!round_trip_only
             || s == pseudo_big_int_to_string(&PseudoBigInt::new(
-                &ts_jsnum::parse_pseudo_big_int(scanner.token_value()),
+                &crate::jsnum::parse_pseudo_big_int(scanner.token_value()),
                 negative,
             )))
 }
@@ -1414,7 +1414,7 @@ impl Checker {
 // `Vec<String>`, the argument type of `new_diagnostic_for_node`.
 #[derive(Clone, Debug)]
 pub struct DiagnosticDetails {
-    pub message: &'static ts_diagnostics::Message,
+    pub message: &'static crate::diagnostics::Message,
     pub args: Vec<String>,
 }
 

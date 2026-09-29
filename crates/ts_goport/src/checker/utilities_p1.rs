@@ -13,7 +13,7 @@ use crate::prelude::*;
 // Go: checker/utilities.go:22 NewDiagnosticForNode
 pub fn new_diagnostic_for_node(
     node: Node,
-    message: &'static ts_diagnostics::Message,
+    message: &'static crate::diagnostics::Message,
     args: Vec<String>,
 ) -> Diagnostic {
     let mut file = Node::NIL;
@@ -29,7 +29,7 @@ pub fn new_diagnostic_for_node(
 pub fn new_diagnostic_chain_for_node(
     chain: Option<Diagnostic>,
     node: Node,
-    message: &'static ts_diagnostics::Message,
+    message: &'static crate::diagnostics::Message,
     args: Vec<String>,
 ) -> Diagnostic {
     if chain.is_some() {
@@ -739,7 +739,7 @@ fn clamp_compare(v: i64) -> i32 {
 
 // PORT: Go `cmp.Compare` on `jsnum.Number` (a float64): NaN is less than any
 // other value and equal to NaN; -0 equals +0.
-fn compare_numbers(a: ts_jsnum::Number, b: ts_jsnum::Number) -> i32 {
+fn compare_numbers(a: crate::jsnum::Number, b: crate::jsnum::Number) -> i32 {
     let (x, y) = (a.0, b.0);
     let x_nan = x.is_nan();
     let y_nan = y.is_nan();
@@ -1037,7 +1037,7 @@ fn literal_string_value(t: &Type) -> &str {
 }
 
 // PORT: Go `t.AsLiteralType().value.(jsnum.Number)`.
-fn literal_number_value(t: &Type) -> ts_jsnum::Number {
+fn literal_number_value(t: &Type) -> crate::jsnum::Number {
     match t.as_literal_type().value.as_ref() {
         Some(LiteralValue::Number(n)) => *n,
         _ => panic!("interface conversion: interface {{}} is not jsnum.Number"),
@@ -1548,7 +1548,7 @@ pub fn is_numeric_literal_name(name: &str) -> bool {
     // Note that this accepts the values 'Infinity', '-Infinity', and 'NaN', and that this is intentional.
     // This is desired behavior, because when indexing with them as numeric entities, you are indexing
     // with the strings '"Infinity"', '"-Infinity"', and '"NaN"' respectively.
-    ts_jsnum::from_string(name).to_string() == name
+    crate::jsnum::from_string(name).to_string() == name
 }
 
 // Go: checker/utilities.go:901 isThisProperty

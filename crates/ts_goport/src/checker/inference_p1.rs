@@ -1276,16 +1276,16 @@ impl Checker {
                                     } else if left_flags.intersects(TypeFlags::NUMBER) {
                                         left
                                     } else if right_flags.intersects(TypeFlags::NUMBER) {
-                                        c.get_number_literal_type(ts_jsnum::from_string(&str))
+                                        c.get_number_literal_type(crate::jsnum::from_string(&str))
                                     } else if left_flags.intersects(TypeFlags::ENUM) {
                                         left
                                     } else if right_flags.intersects(TypeFlags::ENUM) {
-                                        c.get_number_literal_type(ts_jsnum::from_string(&str))
+                                        c.get_number_literal_type(crate::jsnum::from_string(&str))
                                     } else if left_flags.intersects(TypeFlags::NUMBER_LITERAL) {
                                         left
                                     } else if right_flags.intersects(TypeFlags::NUMBER_LITERAL)
                                         && c.get_number_literal_value(right)
-                                            == ts_jsnum::from_string(&str)
+                                            == crate::jsnum::from_string(&str)
                                     {
                                         right
                                     } else if left_flags.intersects(TypeFlags::BIG_INT) {

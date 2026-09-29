@@ -14,10 +14,10 @@ use std::time::SystemTime;
 use super::compile::{System, Writer, write_str};
 // PORT: testing (the status reporters)
 use super::compile::CommandLineTesting;
+use crate::diagnostics::Category;
 use crate::diagnostics_loc::{localize, message_localize};
 use crate::frontend::tspath::{ComparePathsOptions, convert_to_relative_path, path_is_absolute};
 use crate::locale::Locale;
-use ts_diagnostics::Category;
 
 // Go: diagnosticwriter/diagnosticwriter.go:101 FormattingOptions
 #[derive(Clone, Debug, Default)]

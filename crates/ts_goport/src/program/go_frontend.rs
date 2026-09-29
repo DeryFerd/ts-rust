@@ -10,6 +10,7 @@ use crate::ast::store::{
     file_store_contains_non_ascii, file_store_file_name, file_store_parser_flags,
     publish_file_stores, unpublished_file_ids,
 };
+use crate::diagnostics::Message;
 use crate::frontend::bundled;
 use crate::frontend::compiler::{
     NewProgram, ProgramOptions, TraceFn, new_cached_fs_compiler_host, new_program,
@@ -24,7 +25,6 @@ use crate::frontend::tspath::Path as GoPath;
 use crate::frontend::vfs::{Fs, osvfs_fs};
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
-use ts_diagnostics::Message;
 
 /// Thread-safe copies of the Go frontend data that checker code reads.
 /// Built once on the loading thread, before any checker exists.

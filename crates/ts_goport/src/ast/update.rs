@@ -2932,7 +2932,7 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:8546 UpdateJSDocLink
-    // PORT: Go `text []string` and `core.Same`; ts_ast stores the link text as one string, compared by value.
+    // PORT: Go `text []string` and `core.Same`; astdata stores the link text as one string, compared by value.
     pub fn update_js_doc_link(&self, node: Node, name: Node, text: &str) -> Node {
         if name != node.name() || text != node.text() {
             // PORT: Go passes the `[]string` text; here the one joined string.
@@ -2946,7 +2946,7 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:8590 UpdateJSDocLinkPlain
-    // PORT: Go `text []string` and `core.Same`; ts_ast stores the link text as one string, compared by value.
+    // PORT: Go `text []string` and `core.Same`; astdata stores the link text as one string, compared by value.
     pub fn update_js_doc_link_plain(&self, node: Node, name: Node, text: &str) -> Node {
         if name != node.name() || text != node.text() {
             // PORT: Go passes the `[]string` text; here the one joined string.
@@ -2960,7 +2960,7 @@ impl NodeFactory {
     }
 
     // Go: ast/ast_generated.go:8634 UpdateJSDocLinkCode
-    // PORT: Go `text []string` and `core.Same`; ts_ast stores the link text as one string, compared by value.
+    // PORT: Go `text []string` and `core.Same`; astdata stores the link text as one string, compared by value.
     pub fn update_js_doc_link_code(&self, node: Node, name: Node, text: &str) -> Node {
         if name != node.name() || text != node.text() {
             // PORT: Go passes the `[]string` text; here the one joined string.
@@ -3097,7 +3097,7 @@ impl NodeFactory {
 // kinds; this keeps Go's panic from `AsImportAttributes`.
 pub(crate) fn import_attributes_list(node: Node) -> NodeList {
     crate::ast::synthetic::list_of!(node, |d| match d {
-        ts_ast::NodeData::ImportAttributes(d) => Some(Some(AnyList::Nodes(&d.attributes))),
+        crate::astdata::NodeData::ImportAttributes(d) => Some(Some(AnyList::Nodes(&d.attributes))),
         _ => None,
     })
     .unwrap_or_else(|| panic!("AsImportAttributes called on {:?}", node.kind()))

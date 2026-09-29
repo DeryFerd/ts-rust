@@ -4,7 +4,7 @@
 //! `TextRange`).
 //!
 //! Go reads the AST without a context. So do we: every method reaches the
-//! parsed ts_ast arena through the file registry (`ast/store.rs`
+//! parsed astdata arena through the file registry (`ast/store.rs`
 //! `go_file`). Nodes of a ported-parser file are
 //! read from its node store (`ast/store.rs`), and factory nodes from the
 //! synthetic arena (`ast/synthetic.rs`).
@@ -18,18 +18,18 @@
 //! `MutableNode` setters and the `AsFlow*` casts are out of scope.
 
 use crate::ast::synthetic::{list_of, modifiers_of, with_data};
+use crate::astdata::NodeData;
 use crate::prelude::*;
-use ts_ast::NodeData;
 
 // ──────────────────────────────────────────────────────────────────────
 // Arena helpers
 // ──────────────────────────────────────────────────────────────────────
 
-/// The ts_ast id of `n`.
+/// The astdata id of `n`.
 // PORT: `Node::node_id` in core.rs passes a usize to `NodeId::new(u32)`, so
 // this file computes the id itself.
-fn nid(n: Node) -> ts_ast::NodeId {
-    ts_ast::NodeId::new(((n.0 & 0xffff_ffff) - 1) as u32)
+fn nid(n: Node) -> crate::astdata::NodeId {
+    crate::astdata::NodeId::new(((n.0 & 0xffff_ffff) - 1) as u32)
 }
 
 /// The selector result for a list field (see `list_of!`): `req` for a
@@ -48,7 +48,7 @@ macro_rules! sel_field {
 }
 
 /// Go `nil` for an optional child.
-fn opt(file: usize, id: Option<ts_ast::NodeId>) -> Node {
+fn opt(file: usize, id: Option<crate::astdata::NodeId>) -> Node {
     match id {
         Some(id) => Node::new(file, id),
         None => Node::NIL,
@@ -56,22 +56,22 @@ fn opt(file: usize, id: Option<ts_ast::NodeId>) -> Node {
 }
 
 /// A required child.
-fn req(file: usize, id: ts_ast::NodeId) -> Node {
+fn req(file: usize, id: crate::astdata::NodeId) -> Node {
     Node::new(file, id)
 }
 
 /// A required list.
-fn list(file: usize, l: &'static ts_ast::NodeList) -> NodeList {
+fn list(file: usize, l: &'static crate::astdata::NodeList) -> NodeList {
     NodeList::from_ts(file, Some(l))
 }
 
 /// An optional list. `None` is Go `nil`.
-fn opt_list(file: usize, l: &'static Option<ts_ast::NodeList>) -> NodeList {
+fn opt_list(file: usize, l: &'static Option<crate::astdata::NodeList>) -> NodeList {
     NodeList::from_ts(file, l.as_ref())
 }
 
 /// An optional modifier list. `None` is Go `nil`.
-fn mods(file: usize, m: &'static Option<ts_ast::ModifierList>) -> ModifierList {
+fn mods(file: usize, m: &'static Option<crate::astdata::ModifierList>) -> ModifierList {
     ModifierList::from_ts(file, m.as_ref())
 }
 
@@ -82,12 +82,12 @@ fn mods(file: usize, m: &'static Option<ts_ast::ModifierList>) -> ModifierList {
 #[derive(Clone, Copy)]
 struct DataList<'a> {
     file: usize,
-    list: Option<&'a ts_ast::NodeList>,
+    list: Option<&'a crate::astdata::NodeList>,
 }
 
 impl<'a> DataList<'a> {
     /// A required list.
-    fn req(file: usize, l: &'a ts_ast::NodeList) -> Self {
+    fn req(file: usize, l: &'a crate::astdata::NodeList) -> Self {
         Self {
             file,
             list: Some(l),
@@ -95,7 +95,7 @@ impl<'a> DataList<'a> {
     }
 
     /// An optional list.
-    fn opt(file: usize, l: &'a Option<ts_ast::NodeList>) -> Self {
+    fn opt(file: usize, l: &'a Option<crate::astdata::NodeList>) -> Self {
         Self {
             file,
             list: l.as_ref(),
@@ -103,7 +103,7 @@ impl<'a> DataList<'a> {
     }
 
     /// The list of an optional modifier list.
-    fn mods(file: usize, m: &'a Option<ts_ast::ModifierList>) -> Self {
+    fn mods(file: usize, m: &'a Option<crate::astdata::ModifierList>) -> Self {
         Self {
             file,
             list: m.as_ref().map(|m| &m.list),
@@ -132,13 +132,13 @@ impl<'a> DataList<'a> {
 
 /// `ModifierList::modifier_flags` of a modifier list read in place from
 /// node data (store or synthetic).
-fn in_place_modifier_flags(m: &Option<ts_ast::ModifierList>) -> ModifierFlags {
+fn in_place_modifier_flags(m: &Option<crate::astdata::ModifierList>) -> ModifierFlags {
     m.as_ref()
         .map_or(ModifierFlags::NONE, |m| ModifierFlags(m.flags.0))
 }
 
 /// True when data variant `$v` fits a node of kind `$k`. This mirrors
-/// `ts_ast::NodeData::matches_syntax_kind`: a variant named like a kind fits
+/// `crate::astdata::NodeData::matches_syntax_kind`: a variant named like a kind fits
 /// that kind, and the other variants are listed here. A variant that is not
 /// listed and is not named like a kind does not compile.
 macro_rules! variant_has_kind {
@@ -325,7 +325,7 @@ macro_rules! match_data {
 ///
 /// PERF: a tier 0 store node whose kind fits no listed variant gives `$def`
 /// from the packed kind table (`kind_lacks_data!`), without the pointer
-/// chase to its ts_ast node and data.
+/// chase to its astdata node and data.
 macro_rules! by_data {
     ($n:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$file:ident, $d:ident| $e:expr),+ $(,)?) => {{
         let node: Node = $n;
@@ -480,7 +480,7 @@ macro_rules! store_node_modifier_bits_fn {
         /// `Node::modifiers().modifier_flags()` gives for it (store lists hold
         /// their Go flags). 0 when the node has no list. The kind test comes
         /// first, so most nodes are not loaded (`FileStore::modifier_bits`).
-        pub(crate) fn store_node_modifier_bits(kind: SyntaxKind, node: &ts_ast::Node) -> u32 {
+        pub(crate) fn store_node_modifier_bits(kind: SyntaxKind, node: &crate::astdata::Node) -> u32 {
             let mut has_list = false;
             $(has_list |= variant_has_kind!($v, kind);)+
             if !has_list {
@@ -846,35 +846,38 @@ macro_rules! own_question_token_accessor {
 }
 
 /// `Some(opt(file, id))`, for `own_question_token`.
-fn some_opt(file: usize, id: Option<ts_ast::NodeId>) -> Option<Node> {
+fn some_opt(file: usize, id: Option<crate::astdata::NodeId>) -> Option<Node> {
     Some(opt(file, id))
 }
 
 /// `Some(req(file, id))`, for `own_question_token`.
-fn some_req(file: usize, id: ts_ast::NodeId) -> Option<Node> {
+fn some_req(file: usize, id: crate::astdata::NodeId) -> Option<Node> {
     Some(req(file, id))
 }
 
 /// The `list_of!` selector result of an optional type argument list field,
 /// for `Node::type_argument_list` over the `type_arguments_arms!` arms.
-fn sel_type_arguments(_file: usize, l: &Option<ts_ast::NodeList>) -> Option<Option<AnyList<'_>>> {
+fn sel_type_arguments(
+    _file: usize,
+    l: &Option<crate::astdata::NodeList>,
+) -> Option<Option<AnyList<'_>>> {
     Some(l.as_ref().map(AnyList::Nodes))
 }
 
 /// A `SlotChildren` id of an optional child field: 0 (the nil slot) for Go
 /// nil.
-fn column_opt_id(id: Option<ts_ast::NodeId>) -> u32 {
+fn column_opt_id(id: Option<crate::astdata::NodeId>) -> u32 {
     id.map_or(0, column_req_id)
 }
 
 /// A `SlotChildren` id of a required child field.
-fn column_req_id(id: ts_ast::NodeId) -> u32 {
+fn column_req_id(id: crate::astdata::NodeId) -> u32 {
     // Child ids are `u32` slot indexes.
     id.index() as u32
 }
 
 /// U4 (CH6, bind A): the `SlotChildren` entry of a store node of kind `kind`
-/// with ts_ast node `node`, from the arm lists of `Node::name`,
+/// with astdata node `node`, from the arm lists of `Node::name`,
 /// `Node::expression`, `Node::postfix_token` and `Node::question_token`,
 /// and (C2) of `Node::type_`, `Node::initializer`, `Node::type_name` and
 /// `Node::type_argument_list`. Store data always fits the header kind
@@ -883,7 +886,7 @@ fn column_req_id(id: ts_ast::NodeId) -> u32 {
 /// data.
 // PERF: called when the slot is made, while its data is hot (a few data
 // matches), so no pass over the node data is needed later.
-pub(crate) fn store_node_children(kind: SyntaxKind, node: &ts_ast::Node) -> SlotChildren {
+pub(crate) fn store_node_children(kind: SyntaxKind, node: &crate::astdata::Node) -> SlotChildren {
     debug_assert!(
         node.data.matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
@@ -901,16 +904,18 @@ pub(crate) fn store_node_children(kind: SyntaxKind, node: &ts_ast::Node) -> Slot
 
 /// `store_node_children` for node data `data`.
 fn store_node_children_from_data(data: &NodeData) -> SlotChildren {
-    let id_opt = |_: usize, id: Option<ts_ast::NodeId>| Some(column_opt_id(id));
-    let id_req = |_: usize, id: ts_ast::NodeId| Some(column_req_id(id));
+    let id_opt = |_: usize, id: Option<crate::astdata::NodeId>| Some(column_opt_id(id));
+    let id_req = |_: usize, id: crate::astdata::NodeId| Some(column_req_id(id));
     let name = name_arms!(
         match_data!(0, data, Some(0), [QualifiedName] => |_f, _d| None,),
         id_opt,
         id_req
     );
-    let tagged_opt =
-        |tag: u32| move |_: usize, id: Option<ts_ast::NodeId>| Some((tag, column_opt_id(id)));
-    let tagged_req = |tag: u32| move |_: usize, id: ts_ast::NodeId| Some((tag, column_req_id(id)));
+    let tagged_opt = |tag: u32| {
+        move |_: usize, id: Option<crate::astdata::NodeId>| Some((tag, column_opt_id(id)))
+    };
+    let tagged_req =
+        |tag: u32| move |_: usize, id: crate::astdata::NodeId| Some((tag, column_req_id(id)));
     let (expr_opt, expr_req) = (
         tagged_opt(SlotChildren::TAG_EXPRESSION),
         tagged_req(SlotChildren::TAG_EXPRESSION),
@@ -943,7 +948,7 @@ fn store_node_children_from_data(data: &NodeData) -> SlotChildren {
         },
     };
     // Only a missing list gives `NodeList::NIL` itself.
-    let list_is_none = |_: usize, list: &Option<ts_ast::NodeList>| list.is_none();
+    let list_is_none = |_: usize, list: &Option<crate::astdata::NodeList>| list.is_none();
     let no_type_arguments = type_arguments_arms!(match_data!(0, data, true,), list_is_none);
     SlotChildren::new(name, other).with_typed(Some(typed), no_type_arguments)
 }
@@ -1140,8 +1145,8 @@ pub fn compare_text_ranges(r1: TextRange, r2: TextRange) -> i32 {
     r1.end - r2.end
 }
 
-/// A ts_ast range as a Go `core.TextRange`.
-fn text_range_of(r: &ts_core::TextRange) -> TextRange {
+/// A astdata range as a Go `core.TextRange`.
+fn text_range_of(r: &crate::astdata::text::TextRange) -> TextRange {
     TextRange::new(r.start.get() as i32, r.end.get() as i32)
 }
 
@@ -1172,7 +1177,7 @@ fn question_of_postfix(postfix: Node) -> Node {
 // NodeSlice: Go `[]*Node`
 // ──────────────────────────────────────────────────────────────────────
 
-/// Go `[]*Node`. It points at a ts_ast id list of one file, at a slice of
+/// Go `[]*Node`. It points at a astdata id list of one file, at a slice of
 /// `Node`s that lives for the process, or at a list of this thread's
 /// synthetic arena. The default value is Go `nil`.
 #[derive(Clone, Copy, Debug)]
@@ -1183,7 +1188,7 @@ enum SliceRepr {
     /// Ts_ast ids in `file`.
     Ids {
         file: u32,
-        ids: &'static [ts_ast::NodeId],
+        ids: &'static [crate::astdata::NodeId],
     },
     /// Nodes that live for the process.
     Nodes(&'static [Node]),
@@ -1201,9 +1206,9 @@ impl NodeSlice {
     /// Go `nil`.
     pub const NIL: Self = Self(SliceRepr::Nodes(&[]));
 
-    /// A slice over ts_ast ids in `file`.
+    /// A slice over astdata ids in `file`.
     #[must_use]
-    pub fn from_ids(file: usize, ids: &'static [ts_ast::NodeId]) -> Self {
+    pub fn from_ids(file: usize, ids: &'static [crate::astdata::NodeId]) -> Self {
         Self(SliceRepr::Ids {
             file: file as u32,
             ids,
@@ -1312,7 +1317,7 @@ enum SliceIds {
     /// The nodes of the slice (`NodeSlice::from_nodes`).
     Nodes(&'static [Node]),
     /// The ids of the slice, of a frozen store (`frozen_store_ids`).
-    Frozen(&'static [ts_ast::NodeId], FrozenIds),
+    Frozen(&'static [crate::astdata::NodeId], FrozenIds),
     /// `NodeSlice::get` per node: ids before freeze and synthetic lists.
     Slow,
 }
@@ -1401,7 +1406,7 @@ impl IntoIterator for &NodeSlice {
 /// equality, like Go.
 // PERF: U1 (e). A list that the parser made in a store and that no node
 // data holds yet is a pending handle (`PendingList`): its ids live in the
-// AST bump arena, and `store_list_value` builds the ts_ast list once, in the
+// AST bump arena, and `store_list_value` builds the astdata list once, in the
 // node data. The handle stays 16 bytes (tag, file or index, pointer), so it
 // returns in registers; that is why the synthetic lists are variants here,
 // not a nested `SyntheticList`. The checker reads `Ts` handles of parsed
@@ -1415,11 +1420,11 @@ enum ListRef {
     /// Go `nil`.
     #[default]
     Nil,
-    /// A ts_ast list field of the node data of store `file`. It lives for
+    /// A astdata list field of the node data of store `file`. It lives for
     /// the process.
     Ts {
         file: u32,
-        list: &'static ts_ast::NodeList,
+        list: &'static crate::astdata::NodeList,
     },
     /// A store list of store `file` that no node data holds yet.
     Pending {
@@ -1458,7 +1463,7 @@ impl PartialEq for NodeList {
             (true, true) => true,
             (false, false) => match (self.0, other.0) {
                 (ListRef::Ts { list: a, .. }, ListRef::Ts { list: b, .. }) => std::ptr::eq(a, b),
-                // A pending handle equals only itself (the ts_ast copies in
+                // A pending handle equals only itself (the astdata copies in
                 // node data are other lists, plan risk 2).
                 (ListRef::Pending { list: a, .. }, ListRef::Pending { list: b, .. }) => {
                     std::ptr::eq(a, b)
@@ -1479,11 +1484,11 @@ impl NodeList {
     /// Go `nil`.
     pub const NIL: Self = Self(ListRef::Nil);
 
-    /// The handle of ts_ast list `list` of parsed file `file`: a list field
+    /// The handle of astdata list `list` of parsed file `file`: a list field
     /// of node data, or a leaked list. `None` is Go `nil`.
     #[inline]
     #[must_use]
-    pub fn from_ts(file: usize, list: Option<&'static ts_ast::NodeList>) -> Self {
+    pub fn from_ts(file: usize, list: Option<&'static crate::astdata::NodeList>) -> Self {
         match list {
             Some(list) => Self(ListRef::Ts {
                 file: file as u32,
@@ -1521,11 +1526,11 @@ impl NodeList {
         }
     }
 
-    /// The ts_ast list of a handle of parsed data. `None` for
+    /// The astdata list of a handle of parsed data. `None` for
     /// `NodeList::NIL`, a pending list and a synthetic list.
     #[inline]
     #[must_use]
-    pub fn ts_list(self) -> Option<&'static ts_ast::NodeList> {
+    pub fn ts_list(self) -> Option<&'static crate::astdata::NodeList> {
         match self.0 {
             ListRef::Ts { list, .. } => Some(list),
             _ => None,
@@ -1563,7 +1568,7 @@ impl NodeList {
         }
     }
 
-    /// The ts_ast `has_trailing_comma` bit of the list, false for
+    /// The astdata `has_trailing_comma` bit of the list, false for
     /// `NodeList::NIL`. Go computes `HasTrailingComma` from the list ends
     /// (`has_trailing_comma`). The parser sets this bit on an empty list as
     /// the missing-list marker (`with_missing_marker`), and synthetic copies
@@ -1581,7 +1586,7 @@ impl NodeList {
     }
 
     /// Parser `createMissingList`: a new empty list at the `Loc` of this
-    /// (empty) list, with the ts_ast `has_trailing_comma` bit set, the marker
+    /// (empty) list, with the astdata `has_trailing_comma` bit set, the marker
     /// that parser.rs `is_missing_node_list` reads. Go `nil` stays nil.
     #[must_use]
     pub fn with_missing_marker(self) -> NodeList {
@@ -1589,7 +1594,7 @@ impl NodeList {
             ListRef::Nil => self,
             ListRef::Ts { file, list } => Self(ListRef::Ts {
                 file,
-                list: Box::leak(Box::new(ts_ast::NodeList {
+                list: Box::leak(Box::new(crate::astdata::NodeList {
                     range: list.range,
                     nodes: Vec::new(),
                     has_trailing_comma: true,
@@ -1611,7 +1616,7 @@ impl NodeList {
         }
     }
 
-    /// Go `list == nil`. A required ts_ast list field of a store node holds
+    /// Go `list == nil`. A required astdata list field of a store node holds
     /// Go `nil` as a marker list (`store::NIL_LIST_POS`). A synthetic list is
     /// never a marker: synthetic data holds Go `nil` in a required list field
     /// as an empty list with an undefined `Loc` (`synthetic_req_list_value`).
@@ -1703,10 +1708,10 @@ enum ModifiersRef {
     /// Go `nil`.
     #[default]
     Nil,
-    /// A ts_ast list of parsed file `file` (see `ListRef::Ts`).
+    /// A astdata list of parsed file `file` (see `ListRef::Ts`).
     Ts {
         file: u32,
-        list: &'static ts_ast::ModifierList,
+        list: &'static crate::astdata::ModifierList,
     },
     /// A store list of store `file` that no node data holds yet.
     Pending {
@@ -1756,11 +1761,11 @@ impl ModifierList {
     /// Go `nil`.
     pub const NIL: Self = Self(ModifiersRef::Nil);
 
-    /// The handle of ts_ast list `list` of file `file` (see
+    /// The handle of astdata list `list` of file `file` (see
     /// `NodeList::from_ts`). `None` is Go `nil`.
     #[inline]
     #[must_use]
-    pub fn from_ts(file: usize, list: Option<&'static ts_ast::ModifierList>) -> Self {
+    pub fn from_ts(file: usize, list: Option<&'static crate::astdata::ModifierList>) -> Self {
         match list {
             Some(list) => Self(ModifiersRef::Ts {
                 file: file as u32,
@@ -1802,11 +1807,11 @@ impl ModifierList {
         }
     }
 
-    /// The ts_ast list of a handle of parsed data. `None` for
+    /// The astdata list of a handle of parsed data. `None` for
     /// `ModifierList::NIL`, a pending list and a synthetic list.
     #[inline]
     #[must_use]
-    pub fn ts_list(self) -> Option<&'static ts_ast::ModifierList> {
+    pub fn ts_list(self) -> Option<&'static crate::astdata::ModifierList> {
         match self.0 {
             ModifiersRef::Ts { list, .. } => Some(list),
             _ => None,
@@ -2353,9 +2358,9 @@ pub fn file_bind_data(file: Node) -> &'static FileBindData {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Go `AsCaseOrDefaultClause().Expression`. Nil for a default clause.
-// PORT: ts_ast stores a required expression id on both clause kinds. Go
+// PORT: astdata stores a required expression id on both clause kinds. Go
 // leaves it nil for `default:`, so the kind decides.
-fn case_expression(n: Node, file: usize, id: ts_ast::NodeId) -> Node {
+fn case_expression(n: Node, file: usize, id: crate::astdata::NodeId) -> Node {
     if n.kind() == SyntaxKind::CaseClause {
         req(file, id)
     } else {
@@ -3277,7 +3282,7 @@ fn for_each_synthetic_child(
 // `Node::new_slow`), a store lookup each.
 pub(crate) fn for_each_store_child_id(
     kind: SyntaxKind,
-    node: &'static ts_ast::Node,
+    node: &'static crate::astdata::Node,
     v: impl FnMut(u32) -> bool,
 ) -> bool {
     walk_children(&node.data, &mut StoreChildIds { kind, v })
@@ -3292,19 +3297,19 @@ pub(crate) fn for_each_store_child_id(
 /// for a factory node (`SyntheticChildVisit`).
 trait ChildVisit<'d> {
     /// A required child field (Go `visit`).
-    fn node(&mut self, id: ts_ast::NodeId) -> bool;
+    fn node(&mut self, id: crate::astdata::NodeId) -> bool;
     /// An optional child field (Go `visit`).
-    fn opt(&mut self, id: Option<ts_ast::NodeId>) -> bool;
+    fn opt(&mut self, id: Option<crate::astdata::NodeId>) -> bool;
     /// A required list field (Go `visitNodeList`).
-    fn list(&mut self, l: &'d ts_ast::NodeList) -> bool;
+    fn list(&mut self, l: &'d crate::astdata::NodeList) -> bool;
     /// An optional list field (Go `visitNodeList`).
-    fn opt_list(&mut self, l: &'d Option<ts_ast::NodeList>) -> bool;
+    fn opt_list(&mut self, l: &'d Option<crate::astdata::NodeList>) -> bool;
     /// A modifier list field (Go `visitModifiers`).
-    fn mods(&mut self, m: &'d Option<ts_ast::ModifierList>) -> bool;
+    fn mods(&mut self, m: &'d Option<crate::astdata::ModifierList>) -> bool;
     /// A Go `[]*Node` field with no list (Go `visitNodes`).
-    fn ids(&mut self, ids: &'d [ts_ast::NodeId]) -> bool;
+    fn ids(&mut self, ids: &'d [crate::astdata::NodeId]) -> bool;
     /// Go `CaseOrDefaultClause.Expression` (see `case_expression`).
-    fn case_expression(&mut self, id: ts_ast::NodeId) -> bool;
+    fn case_expression(&mut self, id: crate::astdata::NodeId) -> bool;
 }
 
 /// The generic walk of `for_each_child_impl`.
@@ -3336,39 +3341,39 @@ impl NodeChildVisit<'_, '_> {
 
 impl ChildVisit<'static> for NodeChildVisit<'_, '_> {
     #[inline(always)]
-    fn node(&mut self, id: ts_ast::NodeId) -> bool {
+    fn node(&mut self, id: crate::astdata::NodeId) -> bool {
         visit(self.v, req(self.file, id))
     }
 
     #[inline(always)]
-    fn opt(&mut self, id: Option<ts_ast::NodeId>) -> bool {
+    fn opt(&mut self, id: Option<crate::astdata::NodeId>) -> bool {
         visit(self.v, opt(self.file, id))
     }
 
     #[inline(always)]
-    fn list(&mut self, l: &'static ts_ast::NodeList) -> bool {
+    fn list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
         self.visit_list(list(self.file, l))
     }
 
     #[inline(always)]
-    fn opt_list(&mut self, l: &'static Option<ts_ast::NodeList>) -> bool {
+    fn opt_list(&mut self, l: &'static Option<crate::astdata::NodeList>) -> bool {
         self.visit_list(opt_list(self.file, l))
     }
 
     #[inline(always)]
-    fn mods(&mut self, m: &'static Option<ts_ast::ModifierList>) -> bool {
+    fn mods(&mut self, m: &'static Option<crate::astdata::ModifierList>) -> bool {
         let m = mods(self.file, m);
         self.report(m.node_list(), true);
         visit_modifiers(self.v, m)
     }
 
     #[inline(always)]
-    fn ids(&mut self, ids: &'static [ts_ast::NodeId]) -> bool {
+    fn ids(&mut self, ids: &'static [crate::astdata::NodeId]) -> bool {
         visit_nodes(self.v, NodeSlice::from_ids(self.file, ids))
     }
 
     #[inline(always)]
-    fn case_expression(&mut self, id: ts_ast::NodeId) -> bool {
+    fn case_expression(&mut self, id: crate::astdata::NodeId) -> bool {
         visit(self.v, case_expression(self.n, self.file, id))
     }
 }
@@ -3411,35 +3416,35 @@ impl SyntheticChildVisit<'_, '_> {
 }
 
 impl<'d> ChildVisit<'d> for SyntheticChildVisit<'_, '_> {
-    fn node(&mut self, id: ts_ast::NodeId) -> bool {
+    fn node(&mut self, id: crate::astdata::NodeId) -> bool {
         visit(self.v, req(SYNTHETIC_NODE_FILE, id))
     }
 
-    fn opt(&mut self, id: Option<ts_ast::NodeId>) -> bool {
+    fn opt(&mut self, id: Option<crate::astdata::NodeId>) -> bool {
         visit(self.v, opt(SYNTHETIC_NODE_FILE, id))
     }
 
-    fn list(&mut self, l: &'d ts_ast::NodeList) -> bool {
+    fn list(&mut self, l: &'d crate::astdata::NodeList) -> bool {
         self.visit_list(DataList::req(SYNTHETIC_NODE_FILE, l))
     }
 
-    fn opt_list(&mut self, l: &'d Option<ts_ast::NodeList>) -> bool {
+    fn opt_list(&mut self, l: &'d Option<crate::astdata::NodeList>) -> bool {
         self.visit_list(DataList::opt(SYNTHETIC_NODE_FILE, l))
     }
 
     // Go `visitModifiers`: `ModifierList::is_some` has no nil marker.
-    fn mods(&mut self, m: &'d Option<ts_ast::ModifierList>) -> bool {
+    fn mods(&mut self, m: &'d Option<crate::astdata::ModifierList>) -> bool {
         let l = DataList::mods(SYNTHETIC_NODE_FILE, m);
         self.report(l, true);
         l.list.is_some() && self.visit_nodes(l)
     }
 
-    fn ids(&mut self, ids: &'d [ts_ast::NodeId]) -> bool {
+    fn ids(&mut self, ids: &'d [crate::astdata::NodeId]) -> bool {
         ids.iter()
             .any(|&id| (self.v)(Node::new(SYNTHETIC_NODE_FILE, id)))
     }
 
-    fn case_expression(&mut self, id: ts_ast::NodeId) -> bool {
+    fn case_expression(&mut self, id: crate::astdata::NodeId) -> bool {
         visit(self.v, case_expression(self.n, SYNTHETIC_NODE_FILE, id))
     }
 }
@@ -3455,39 +3460,39 @@ struct StoreChildIds<F> {
 
 impl<F: FnMut(u32) -> bool> ChildVisit<'static> for StoreChildIds<F> {
     #[inline(always)]
-    fn node(&mut self, id: ts_ast::NodeId) -> bool {
+    fn node(&mut self, id: crate::astdata::NodeId) -> bool {
         id.index() != 0 && (self.v)(id.index() as u32)
     }
 
     #[inline(always)]
-    fn opt(&mut self, id: Option<ts_ast::NodeId>) -> bool {
+    fn opt(&mut self, id: Option<crate::astdata::NodeId>) -> bool {
         id.is_some_and(|id| self.node(id))
     }
 
     // `NodeList::is_nil` of a store list: the nil marker list.
     #[inline(always)]
-    fn list(&mut self, l: &'static ts_ast::NodeList) -> bool {
+    fn list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
         !is_nil_list_marker(l) && self.ids(&l.nodes)
     }
 
     #[inline(always)]
-    fn opt_list(&mut self, l: &'static Option<ts_ast::NodeList>) -> bool {
+    fn opt_list(&mut self, l: &'static Option<crate::astdata::NodeList>) -> bool {
         l.as_ref().is_some_and(|l| self.list(l))
     }
 
     // `ModifierList::is_nil` is only `None`.
     #[inline(always)]
-    fn mods(&mut self, m: &'static Option<ts_ast::ModifierList>) -> bool {
+    fn mods(&mut self, m: &'static Option<crate::astdata::ModifierList>) -> bool {
         m.as_ref().is_some_and(|m| self.ids(&m.list.nodes))
     }
 
     #[inline(always)]
-    fn ids(&mut self, ids: &'static [ts_ast::NodeId]) -> bool {
+    fn ids(&mut self, ids: &'static [crate::astdata::NodeId]) -> bool {
         ids.iter().any(|id| (self.v)(id.index() as u32))
     }
 
     #[inline(always)]
-    fn case_expression(&mut self, id: ts_ast::NodeId) -> bool {
+    fn case_expression(&mut self, id: crate::astdata::NodeId) -> bool {
         self.kind == SyntaxKind::CaseClause && self.node(id)
     }
 }
@@ -4118,7 +4123,7 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
             propagate_eraseable(opt(f, $x))
         };
     }
-    let ambient = |m: &Option<ts_ast::ModifierList>| {
+    let ambient = |m: &Option<crate::astdata::ModifierList>| {
         in_place_modifier_flags(m).intersects(ModifierFlags::AMBIENT)
     };
     let jsx = SubtreeFacts::SUBTREE_CONTAINS_JSX;
@@ -4690,7 +4695,7 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
 
 /// Go `node.modifiers != nil && node.modifiers.ModifierFlags&ModifierFlagsAsync != 0`
 /// for the modifier list `m` of a node, read in place.
-fn modifiers_have_async(m: &Option<ts_ast::ModifierList>) -> bool {
+fn modifiers_have_async(m: &Option<crate::astdata::ModifierList>) -> bool {
     in_place_modifier_flags(m).intersects(ModifierFlags::ASYNC)
 }
 

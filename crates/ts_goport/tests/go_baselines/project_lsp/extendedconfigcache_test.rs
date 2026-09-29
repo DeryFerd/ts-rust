@@ -44,8 +44,8 @@ impl Client for NoopClient {
     fn refresh_code_lens(&self, _: &Context) -> Result<(), GoError> {
         Ok(())
     }
-    fn progress_start(&self, _: &'static ts_diagnostics::Message, _: Vec<String>) {}
-    fn progress_finish(&self, _: &'static ts_diagnostics::Message, _: Vec<String>) {}
+    fn progress_start(&self, _: &'static ts_goport::diagnostics::Message, _: Vec<String>) {}
+    fn progress_finish(&self, _: &'static ts_goport::diagnostics::Message, _: Vec<String>) {}
     fn send_telemetry(&self, _: &Context, _: lsproto::TelemetryEvent) -> Result<(), GoError> {
         Ok(())
     }

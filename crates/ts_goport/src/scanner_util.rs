@@ -1060,7 +1060,7 @@ pub(crate) fn is_conflict_marker_trivia(text: &str, pos: usize) -> bool {
 pub(crate) fn scan_conflict_marker_trivia(
     text: &str,
     pos: usize,
-    report_error: Option<&mut dyn FnMut(&'static ts_diagnostics::Message, i32, i32)>,
+    report_error: Option<&mut dyn FnMut(&'static crate::diagnostics::Message, i32, i32)>,
 ) -> usize {
     if let Some(report_error) = report_error {
         report_error(

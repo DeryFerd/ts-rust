@@ -718,7 +718,7 @@ impl Checker {
         }
         // The reactNamespace/jsxFactory's root symbol should be marked as 'used' so we don't incorrectly elide its import.
         // And if there is no reactNamespace/jsxFactory's symbol in scope when targeting React emit, we should issue an error.
-        let jsx_factory_ref_err: Option<&'static ts_diagnostics::Message> =
+        let jsx_factory_ref_err: Option<&'static crate::diagnostics::Message> =
             if self.compiler_options.jsx == JsxEmit::REACT {
                 Some(diag::This_JSX_tag_requires_0_to_be_in_scope_but_it_could_not_be_found)
             } else {

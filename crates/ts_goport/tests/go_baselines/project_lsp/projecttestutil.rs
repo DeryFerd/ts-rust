@@ -145,7 +145,7 @@ pub struct WatchFilesCall {
 /// Go `ClientMock.calls.ProgressStart` / `ProgressFinish` entry.
 #[derive(Clone)]
 pub struct ProgressCall {
-    pub message: &'static ts_diagnostics::Message,
+    pub message: &'static ts_goport::diagnostics::Message,
     pub args: Vec<String>,
 }
 
@@ -237,12 +237,16 @@ impl Client for ClientMock {
         *self.refresh_code_lens.borrow_mut() += 1;
         Ok(())
     }
-    fn progress_start(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    fn progress_start(&self, message: &'static ts_goport::diagnostics::Message, args: Vec<String>) {
         self.progress_start
             .borrow_mut()
             .push(ProgressCall { message, args });
     }
-    fn progress_finish(&self, message: &'static ts_diagnostics::Message, args: Vec<String>) {
+    fn progress_finish(
+        &self,
+        message: &'static ts_goport::diagnostics::Message,
+        args: Vec<String>,
+    ) {
         self.progress_finish
             .borrow_mut()
             .push(ProgressCall { message, args });

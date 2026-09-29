@@ -1,8 +1,8 @@
 //! Port of `checker/checker.go` lines 10269-11171 (createUnionSignature
 //! through checkIdentifier).
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 // PORT: Go `getInstantiationExpressionType` keeps its state in closure
 // variables shared by nested recursive closures. This struct holds that
@@ -1013,21 +1013,22 @@ impl Checker {
         match operand.kind() {
             SyntaxKind::NumericLiteral => match operator {
                 SyntaxKind::MinusToken => {
-                    let literal = self
-                        .get_number_literal_type(-ts_jsnum::Number::from_string(operand.text()));
+                    let literal = self.get_number_literal_type(-crate::jsnum::Number::from_string(
+                        operand.text(),
+                    ));
                     return self.get_fresh_type_of_literal_type(literal);
                 }
                 SyntaxKind::PlusToken => {
-                    let literal =
-                        self.get_number_literal_type(ts_jsnum::Number::from_string(operand.text()));
+                    let literal = self
+                        .get_number_literal_type(crate::jsnum::Number::from_string(operand.text()));
                     return self.get_fresh_type_of_literal_type(literal);
                 }
                 _ => {}
             },
             SyntaxKind::BigIntLiteral => {
                 if operator == SyntaxKind::MinusToken {
-                    let literal = self.get_big_int_literal_type(ts_jsnum::PseudoBigInt::new(
-                        &ts_jsnum::parse_pseudo_big_int(operand.text()),
+                    let literal = self.get_big_int_literal_type(crate::jsnum::PseudoBigInt::new(
+                        &crate::jsnum::parse_pseudo_big_int(operand.text()),
                         true, /*negative*/
                     ));
                     return self.get_fresh_type_of_literal_type(literal);

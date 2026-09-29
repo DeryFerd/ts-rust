@@ -13,8 +13,8 @@
 
 use crate::prelude::*;
 
+use crate::diagnostics::Message;
 use std::cell::Cell;
-use ts_diagnostics::Message;
 
 /// Go `func(location *ast.Node, name string, meaning ast.SymbolFlags, nameNotFoundMessage *diagnostics.Message, isUse bool, excludeGlobals bool) *ast.Symbol`.
 pub type ResolveNameHook =
