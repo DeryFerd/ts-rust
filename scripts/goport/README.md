@@ -9,8 +9,6 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
 - `perf.sh <label> <bin>...`: median of 3 wall time and peak RSS on Query, Hono, zod and effect,
   runs interleaved across the binaries. It refuses to start above load 1.5 (`PERF_WAIT=1` waits
   for a quiet host). zbook is rarely quiet: run it on dbook-lan or mini-abf9.
-- `roster_fp.py <checkout>`: fingerprint of every file outside `crates/ts_goport`. Equal values
-  allow the goport-only roster carry-forward (docs/typechecker-accountability.md).
 - `facts [section...]`: in one call, the paths and versions agents look up before their first edit: main
   against origin, the accepted revision (commit, bins checked against the gate manifest, gate, evidence),
   the Go pins with checkouts and oracles, the project tsconfigs, the newest lane bins, active `goport-*`
@@ -19,7 +17,8 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
   running labels, age). `wfstatus <run-id>` prints that run's agent results. Use it instead of
   parsing `journal.jsonl` by hand.
 - `prune-worktrees.py`: lists stale worktrees and merged branches. `--apply` removes them.
-- `fp.py <checkout>`: the source fingerprint recorded in the saved state.
+- `fp.py <checkout>`: the source fingerprint recorded in the saved state. `fpcommit.py <checkout> <commit>`
+  gives the same value for the checkout as it was at a commit.
 - `gate.sh` also runs an editor stage (memory and answers limits of `ls_edit_bench.py` on Query
   core and Hono), so `--bins` must hold `tsgo` too. Build the bins with `--release --bins`.
 - `ls_edit_bench.py --rust BIN`: editor sessions (typing, error then fix, VS Code request mix, imports,
@@ -33,8 +32,79 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
   zod and effect.
 
 Revision bindings made before this move pin `/tmp/port/fp.py`. That copy is identical.
-`tmp-port.sh restore` puts back the legacy `/tmp/port` files and the cargo pool runner after a
-reboot or a tmpfiles cleanup (a login does it too). Put new tools here, never in `/tmp`.
+`tmp-port.sh restore` puts back the legacy `/tmp/port` files after a reboot or a tmpfiles cleanup
+(a login does it too). It stays after the legacy roster: the sweep step of `scripts/upstream/rerecord.sh`
+runs it first (the oracle sweeps write their build info under `/tmp/port`), and the runners in
+`compat/p5-corpus` and `typesyms/scale` call `/tmp/port/treehash.py`. Put new tools here, never in `/tmp`.
+
+## Revision pipeline
+
+The protected set is goport's own tests and the gate items (`docs/typechecker-accountability.md`,
+"Protected set"). The base of a candidate is the last accepted revision: its goport test results
+(after a legacy batch, `docs/goport-protected/tests-r131.json.gz`), its gate manifest and its LSP
+and API oracle results (after a legacy batch, its LSP run and the rule's `apiBaseline` `api-r131`,
+an API run of the R131 bins). `open_revision.py --base` prints it. The legacy roster drive is
+retired. R132 is the last legacy revision.
+
+1. `candidate.sh check <branch>`: scope and rustfmt of the branch against the checkout
+   `target/worktrees/checker-port`. A goport batch may change every path except
+   `docs/typechecker-state`, `docs/typechecker-batches`, `target/` and the protected paths
+   (`open_revision.py --protected`: the tools, runners, oracles, baseline and rules that judge the
+   protected set, `remote.sh`, `UPSTREAM.json` (the oracle and Go checkout of each pin),
+   `scripts/run-cargo-capped.sh` (it builds the test and release bins and runs clippy), and every
+   script that `gate.sh` and `bound2.sh` run from the repository, which it reads from their text).
+   The check fails when the branch changes a protected path since its merge base with `main`,
+   unless the batch lists that exact path (with Theo's approval).
+2. `candidate.sh open <rev> <branch> --hypothesis TEXT --change TEXT --new-batch <id> --origin TEXT`:
+   applies the branch to the checkout in one commit and records the revision (`open_revision.py`,
+   the only state write). Leave out `--new-batch` for a later revision of an open batch. Then commit
+   the state.
+3. `candidate.sh side <rev> [--gate-host HOST] [--name-map TSV]`: in a systemd unit, the release
+   bins, the goport tests (`build-goport-tests.sh`, `goport-tests.sh`, then `compare-tests.py`
+   against the base results), two bound runs, the full gate and `gate-compare.py` against the base
+   gate manifest, the LSP oracle (`lsp_oracle.py`) and the API oracle (`api_oracle.py`, 10
+   batteries) each compared per request with the base results (`oracle-compare.py`), and rustfmt
+   and clippy on `ts_goport` and the kept crates. Wait for `SIDE DONE`. A pin bump that
+   renames Go tests, or a moved test, needs `--name-map` (old suite, old name, new suite, new name,
+   then the evidence). A gate run that fails its compare stays in the evidence cache for good, as
+   `gate-fail-<gate label>.json` and `gate-compare-fail-<gate label>.json`, and the next `side` runs a
+   new gate with a new label (repeat-run rule). Before the verdicts, root records a flake note
+   `flake-r<rev>-<name>` for each item of a failed run, naming the item id and the run label, with
+   the evidence that the flake rule asks for.
+4. `candidate.sh verdict-request <rev>`: the texts for the auditor and the reviewer, with every
+   failed gate run of the source and its flake notes, then the accept command. The texts ask for a
+   verdict that names the goport tests, gate manifest and name map sha256.
+5. After two PASS verdicts: `accept_revision.py --revision <rev> --evidence <cache dir> --scope TEXT
+   --outcome TEXT`. It refuses a failed gate run that has no flake note for an item. It records the
+   evidence and the verdicts (the history row and both verdicts carry `goportTestsSha256`,
+   `gateSha256` and `nameMapSha256`), and every gate run of the source in `gateRuns` (each failed
+   run with its regressions and flake notes, then the batch gate). It runs
+   `check-typechecker-batch.mjs`, and records the acceptance only when the check passes. The check
+   also finds each kept `gate-compare-fail-<label>.json`, runs `gate-compare.py` on that run again
+   and needs a flake note for each regressed item, so skipping the refusal does not pass.
+
+`gate-compare.py <base manifest> <new manifest>` compares the gate item by item: a base MATCH stays
+MATCH, or becomes ALLOWED only by an allow entry that the base allow list has too (the
+single-threaded-equal items change between MATCH and ALLOWED on the same bins). An ALLOWED item needs
+a verified allow condition, and a removed id or a new FAIL is a regression. The open editor
+long-growth items (`editor/*/long`) may FAIL only while the batch has the open defect
+`editor-long-growth`, only on growth, and only up to a fixed cap per project: query-core 1.58 and
+hono 1.28 MiB/edit (`LONG_CAP` in `gate-compare.py`, the one place of the caps; the output lists them
+in `longCaps`). Each cap is the highest growth of a good build + 0.15, and it does not follow the base,
+so growth cannot add up over revisions. Caps only go down. A batch that fixes some growth can lower
+`LONG_CAP` (a protected path the batch lists; the reviewer checks the value). A cap also goes down by
+itself to 1.00, the lowest value of the gate's own limit (2 x Go + 1), once the base Rust growth of that
+project is at or under 1.00: from then on its item must be MATCH with growth at or under 1.00. A MATCH
+at a higher growth does not lower it, because the gate's limit follows Go's slope and the same bins
+can then FAIL.
+
+`oracle-compare.py <base results dir> <new results dir>` compares two LSP or API oracle results per
+request: a base request that was `same` or `oracle_error_same` must stay so. It exits 1 on a lost,
+unrun or absent request.
+
+`candidate.sh` runs its local helpers from its own checkout, so a worktree copy can be tried with
+`--dry-run` before its merge. The state, `target/` and the host commands (`gate.sh` and the oracles,
+which `remote.sh sync-scripts` copies from the main checkout) always use the main checkout.
 
 ## Build toolchain
 
@@ -55,8 +125,8 @@ with the pinned `nightly-2026-06-17` and `-Zthreads=8` (the job count, at most 8
   are byte-equal to 1.93.0 bins, the quick gate is equal item for item, and `perf.sh` run time is
   equal within 1%.
 - 1.93.0 stays for `--profile goport` (shipped and timing bins: `build-release.sh`, `build-pgo.sh`),
-  `fmt`, `clippy`, any command with `RUSTUP_TOOLCHAIN` or a `+toolchain` argument, and the protected
-  cargo roster (its pool runner calls cargo directly). For timing, build every side with the same
+  `fmt`, `clippy`, any command with `RUSTUP_TOOLCHAIN` or a `+toolchain` argument, and the candidate
+  evidence builds (see below). For timing, build every side with the same
   toolchain.
 - `TS_CARGO_NIGHTLY=0` uses the default toolchain. `TS_CARGO_INCREMENTAL=0` turns incremental off;
   `1` turns it on for every workspace crate. After an internal compiler error, build again with both
@@ -70,7 +140,7 @@ with the pinned `nightly-2026-06-17` and `-Zthreads=8` (the job count, at most 8
   one host: `buildbench-remote.sh dbook-lan defaults` from the worktree under test (the `setup`
   session copies its source to the host first). `buildbench-report.py <runs-dir>...` makes the table.
 
-Revision evidence is the exception: `candidate.sh side` builds its release bins with `TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0`, so the gate, bound runs and oracles test bins from the shipped toolchain with no incremental cache (the evidence key records the toolchain).
+Revision evidence is the exception: `candidate.sh side` builds its release bins and its test bins with `TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0`, so the goport tests, gate, bound runs and oracles test bins from the shipped toolchain with no incremental cache (the evidence key records the toolchain).
 
 ## Editor sessions: `ls_edit_bench.py`
 
