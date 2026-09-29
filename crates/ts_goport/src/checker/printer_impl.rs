@@ -74,14 +74,29 @@ pub fn create_printer_with_remove_comments(emit_context: Rc<EmitContext>) -> Pri
     )
 }
 
-// Go: checker/printer.go:21 createPrinterWithRemoveCommentsOmitTrailingSemicolonNeverAsciiEscape
-pub fn create_printer_with_remove_comments_omit_trailing_semicolon_never_ascii_escape(
+// Go: checker/printer.go:21 createPrinterWithRemoveCommentsOmitTrailingSemicolon
+pub fn create_printer_with_remove_comments_omit_trailing_semicolon(
     emit_context: Rc<EmitContext>,
 ) -> Printer {
-    // TODO: OmitTrailingSemicolon support
     new_printer(
         PrinterOptions {
             remove_comments: true,
+            omit_trailing_semicolon: true,
+            ..Default::default()
+        },
+        PrintHandlers::default(),
+        Some(emit_context),
+    )
+}
+
+// Go: checker/printer.go:28 createPrinterWithRemoveCommentsOmitTrailingSemicolonNeverAsciiEscape
+pub fn create_printer_with_remove_comments_omit_trailing_semicolon_never_ascii_escape(
+    emit_context: Rc<EmitContext>,
+) -> Printer {
+    new_printer(
+        PrinterOptions {
+            remove_comments: true,
+            omit_trailing_semicolon: true,
             never_ascii_escape: true,
             ..Default::default()
         },
@@ -103,190 +118,6 @@ pub fn create_printer_with_remove_comments_never_ascii_escape(
         PrintHandlers::default(),
         Some(emit_context),
     )
-}
-
-// Go: checker/printer.go:36 semicolonRemoverWriter
-pub struct SemicolonRemoverWriter {
-    has_pending_semicolon: bool,
-    inner: Rc<RefCell<dyn EmitTextWriter>>,
-}
-
-impl SemicolonRemoverWriter {
-    // Go: checker/printer.go:41 commitSemicolon
-    fn commit_semicolon(&mut self) {
-        if self.has_pending_semicolon {
-            self.inner.borrow_mut().write_trailing_semicolon(";");
-            self.has_pending_semicolon = false;
-        }
-    }
-}
-
-impl EmitTextWriter for SemicolonRemoverWriter {
-    // Go: checker/printer.go:48 Clear
-    fn clear(&mut self) {
-        self.inner.borrow_mut().clear();
-    }
-
-    // Go: checker/printer.go:52 DecreaseIndent
-    fn decrease_indent(&mut self) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().decrease_indent();
-    }
-
-    // Go: checker/printer.go:57 GetColumn
-    fn get_column(&self) -> i32 {
-        self.inner.borrow().get_column()
-    }
-
-    // Go: checker/printer.go:61 GetIndent
-    fn get_indent(&self) -> i32 {
-        self.inner.borrow().get_indent()
-    }
-
-    // Go: checker/printer.go:65 GetLine
-    fn get_line(&self) -> i32 {
-        self.inner.borrow().get_line()
-    }
-
-    // Go: checker/printer.go:69 GetTextPos
-    fn get_text_pos(&self) -> i32 {
-        self.inner.borrow().get_text_pos()
-    }
-
-    // Go: checker/printer.go:73 HasTrailingComment
-    fn has_trailing_comment(&self) -> bool {
-        self.inner.borrow().has_trailing_comment()
-    }
-
-    // Go: checker/printer.go:77 HasTrailingWhitespace
-    fn has_trailing_whitespace(&self) -> bool {
-        self.inner.borrow().has_trailing_whitespace()
-    }
-
-    // Go: checker/printer.go:81 IncreaseIndent
-    fn increase_indent(&mut self) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().increase_indent();
-    }
-
-    // Go: checker/printer.go:86 IsAtStartOfLine
-    fn is_at_start_of_line(&self) -> bool {
-        self.inner.borrow().is_at_start_of_line()
-    }
-
-    // Go: checker/printer.go:90 RawWrite
-    fn raw_write(&mut self, s1: &str) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().raw_write(s1);
-    }
-
-    // Go: checker/printer.go:95 String
-    // PORT: the trait method takes `&self`, so it cannot commit the pending
-    // semicolon into the inner writer. It returns the text that Go returns
-    // after the commit. A later write commits the semicolon, so the inner
-    // writer ends with the same text as in Go. This assumes the inner
-    // writer writes `text` for WriteTrailingSemicolon, as the Go writers do.
-    fn string(&self) -> String {
-        let mut text = self.inner.borrow().string();
-        if self.has_pending_semicolon {
-            // Go `WriteTrailingSemicolon(";")` on the inner writer writes ";".
-            text.push(';');
-        }
-        text
-    }
-
-    // Go: checker/printer.go:100 Write
-    fn write(&mut self, s1: &str) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write(s1);
-    }
-
-    // Go: checker/printer.go:105 WriteComment
-    fn write_comment(&mut self, text: &str) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_comment(text);
-    }
-
-    // Go: checker/printer.go:110 WriteKeyword
-    fn write_keyword(&mut self, text: &str) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_keyword(text);
-    }
-
-    // Go: checker/printer.go:115 WriteLine
-    fn write_line(&mut self) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_line();
-    }
-
-    // Go: checker/printer.go:120 WriteLineForce
-    fn write_line_force(&mut self, force: bool) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_line_force(force);
-    }
-
-    // Go: checker/printer.go:125 WriteLiteral
-    fn write_literal(&mut self, s1: &str) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_literal(s1);
-    }
-
-    // Go: checker/printer.go:130 WriteOperator
-    fn write_operator(&mut self, text: &str) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_operator(text);
-    }
-
-    // Go: checker/printer.go:135 WriteParameter
-    fn write_parameter(&mut self, text: &str) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_parameter(text);
-    }
-
-    // Go: checker/printer.go:140 WriteProperty
-    fn write_property(&mut self, text: &str) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_property(text);
-    }
-
-    // Go: checker/printer.go:145 WritePunctuation
-    fn write_punctuation(&mut self, text: &str) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_punctuation(text);
-    }
-
-    // Go: checker/printer.go:150 WriteSpace
-    fn write_space(&mut self, text: &str) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_space(text);
-    }
-
-    // Go: checker/printer.go:155 WriteStringLiteral
-    fn write_string_literal(&mut self, text: &str) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_string_literal(text);
-    }
-
-    // Go: checker/printer.go:160 WriteSymbol
-    fn write_symbol(&mut self, text: &str, symbol: SymbolId) {
-        self.commit_semicolon();
-        self.inner.borrow_mut().write_symbol(text, symbol);
-    }
-
-    // Go: checker/printer.go:165 WriteTrailingSemicolon
-    fn write_trailing_semicolon(&mut self, _text: &str) {
-        self.has_pending_semicolon = true;
-    }
-}
-
-// Go: checker/printer.go:169 getTrailingSemicolonDeferringWriter
-pub fn get_trailing_semicolon_deferring_writer(
-    writer: Rc<RefCell<dyn EmitTextWriter>>,
-) -> Rc<RefCell<dyn EmitTextWriter>> {
-    Rc::new(RefCell::new(SemicolonRemoverWriter {
-        has_pending_semicolon: false,
-        inner: writer,
-    }))
 }
 
 // Go: checker/printer.go:181 toNodeBuilderFlags
@@ -476,9 +307,11 @@ impl Checker {
         let mut printer_ = if enclosing_declaration.is_some()
             && enclosing_declaration.kind() == SyntaxKind::SourceFile
         {
-            create_printer_with_remove_comments_never_ascii_escape(emit_context)
+            create_printer_with_remove_comments_omit_trailing_semicolon_never_ascii_escape(
+                emit_context,
+            )
         } else {
-            create_printer_with_remove_comments(emit_context)
+            create_printer_with_remove_comments_omit_trailing_semicolon(emit_context)
         };
 
         let entity = if flags.intersects(SymbolFormatFlags::ALLOW_ANY_NODE_KIND) {
@@ -503,12 +336,7 @@ impl Checker {
             )
         }; // TODO: GH#18217
         let inner: Rc<RefCell<dyn EmitTextWriter>> = writer.clone();
-        printer_.write_exported(
-            entity,
-            source_file,
-            get_trailing_semicolon_deferring_writer(inner),
-            None,
-        ); // TODO: GH#18217
+        printer_.write_exported(entity, source_file, inner, None); // TODO: GH#18217
         let text = writer.borrow().string();
         text
     }
@@ -566,23 +394,13 @@ impl Checker {
         if flags.intersects(TypeFormatFlags::MULTILINE_OBJECT_LITERALS) {
             let writer = Rc::new(RefCell::new(new_text_writer("\n", 0)));
             let inner: Rc<RefCell<dyn EmitTextWriter>> = writer.clone();
-            p.write_exported(
-                sig,
-                source_file,
-                get_trailing_semicolon_deferring_writer(inner),
-                None,
-            );
+            p.write_exported(sig, source_file, inner, None);
             let text = writer.borrow().string();
             return text;
         }
         let writer = Rc::new(RefCell::new(get_single_line_string_writer()));
         let inner: Rc<RefCell<dyn EmitTextWriter>> = writer.clone();
-        p.write_exported(
-            sig,
-            source_file,
-            get_trailing_semicolon_deferring_writer(inner),
-            None,
-        );
+        p.write_exported(sig, source_file, inner, None);
         let text = writer.borrow().string();
         text
     }

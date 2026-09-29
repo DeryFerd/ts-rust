@@ -48,6 +48,8 @@ pub struct BuildInfoDiagnosticWithFileName {
     pub end: i32,
     pub code: i32,
     pub category: i32,
+    pub source: String,
+    pub message_text: String,
     pub message_key: String,
     pub message_args: Vec<String>,
     pub message_chain: Vec<BuildInfoDiagnosticWithFileName>,
@@ -143,7 +145,7 @@ impl BuildInfoDiagnosticWithFileName {
             .iter()
             .map(|info| info.to_diagnostic(file_for_diagnostic))
             .collect();
-        new_diagnostic_from_serialized(
+        let mut diagnostic = new_diagnostic_from_serialized(
             file_for_diagnostic,
             port_text_range(file_for_diagnostic, self.pos, self.end),
             self.code,
@@ -155,7 +157,11 @@ impl BuildInfoDiagnosticWithFileName {
             self.reports_unnecessary,
             self.reports_deprecated,
             self.skipped_on_no_emit,
-        )
+        );
+        if !self.source.is_empty() || !self.message_text.is_empty() {
+            diagnostic.set_external_data(&self.source, &self.message_text);
+        }
+        diagnostic
     }
 
     // Go: incremental/snapshot.go:201 toDiagnosticWithoutRepopulate

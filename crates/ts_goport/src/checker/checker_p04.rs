@@ -171,6 +171,9 @@ impl Checker {
 
     // Go: checker/checker.go:3041 checkTypePredicate
     pub fn check_type_predicate(&mut self, node: Node) {
+        // Always check the predicate's type so nested type errors are reported even when the
+        // predicate is in an invalid position, keeping diagnostics stable.
+        self.check_source_element(node.type_());
         let parent = self.get_type_predicate_parent(node);
         if parent.is_nil() {
             // The parent must not be valid.
@@ -182,7 +185,6 @@ impl Checker {
         if type_predicate.is_nil() {
             return;
         }
-        self.check_source_element(node.type_());
         let parameter_name = node.parameter_name();
         let pred_kind = self.pred(type_predicate).kind;
         if pred_kind != TypePredicateKind::THIS && pred_kind != TypePredicateKind::ASSERTS_THIS {

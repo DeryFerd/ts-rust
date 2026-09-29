@@ -21,6 +21,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ts_goport::baseline::type_symbol::TestFile;
+use ts_goport::contentmapper::{self, Mapper, ProjectSpec};
 use ts_goport::core::{ProgramScope, enter_program};
 use ts_goport::emitter::program_emit::{EmitOptions, EmitResult, WriteFile, WriteFileData};
 use ts_goport::execute::incremental::build_info::BuildInfo;
@@ -36,8 +37,10 @@ use ts_goport::frontend::compiler::{CompilerHost, ProgramOptions, new_compiler_h
 use ts_goport::frontend::outputpaths::get_output_extension;
 use ts_goport::frontend::prelude::*;
 use ts_goport::frontend::vfs::{OsOverride, install_os_override};
+use ts_goport::gostd::context::background;
 use ts_goport::program as tsprogram;
 
+use crate::support::contentmappertest;
 use crate::support::harnessutil::TracerForBaselining;
 use crate::support::vfstest::{self, MapFile, MapFs};
 use crate::tsoptions::tsoptionstest::type_script_submodule_path;
@@ -96,11 +99,24 @@ pub fn skip(message: String) -> ! {
 }
 
 /// The part of a Go `*tsoptions.ParsedCommandLine` that `CompileFilesEx`
-/// reads: `ConfigFile` and `Errors`.
+/// reads: `ConfigFile`, `Errors` and `ParsedConfig.ContentMappers`
+/// (tsgo#4712).
 #[derive(Clone, Default)]
 pub struct TsConfigPart {
     pub config_file: Option<Rc<TsConfigSourceFile>>,
     pub errors: Vec<Diagnostic>,
+    pub content_mappers: Vec<Rc<Mapper>>,
+}
+
+/// Go `defer f()`: runs `f` when the scope ends, also on a panic.
+struct Defer<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
 }
 
 // Go: harnessutil.go:79 CompileFiles
@@ -144,6 +160,7 @@ pub fn compile_files(
     let tsconfig_part = tsconfig.map(|tsconfig| TsConfigPart {
         config_file: tsconfig.config_file.clone(),
         errors: tsconfig.errors.clone(),
+        content_mappers: tsconfig.parsed_config.content_mappers.clone(),
     });
     compile_files_ex(
         input_files,
@@ -251,6 +268,10 @@ pub fn compile_files_ex(
         }
     }
 
+    let content_mappers: Vec<Rc<Mapper>> = tsconfig
+        .map(|tsconfig| tsconfig.content_mappers.clone())
+        .unwrap_or_default();
+
     // Create fake FS for testing
     let mut testfs: BTreeMap<String, MapFile> = BTreeMap::new();
     for file in input_files {
@@ -281,6 +302,51 @@ pub fn compile_files_ex(
     );
     let recorder = OutputRecorder::default();
 
+    // Content mappers, when trusted, are served in-process by the test mapper (see contentmappertest).
+    // The host is shared by the pre- and post-emit programs and torn down when this compilation finishes.
+    let content_mapper_host: Option<Rc<dyn contentmapper::Host>> =
+        (compiler_options.run_external_code.is_true() && !content_mappers.is_empty()).then(|| {
+            contentmapper::new_host(
+                &background(),
+                contentmappertest::new_spawner(),
+                ts_goport::locale::DEFAULT,
+            )
+        });
+    let _close_content_mapper_host = Defer(content_mapper_host.clone().map(|host| {
+        move || {
+            let _ = host.close();
+        }
+    }));
+
+    let config = Rc::new(ParsedCommandLine {
+        parsed_config: ParsedOptions {
+            compiler_options: Rc::new(compiler_options.clone()),
+            file_names: program_file_names,
+            content_mappers,
+            ..ParsedOptions::default()
+        },
+        config_file: tsconfig.and_then(|tsconfig| tsconfig.config_file.clone()),
+        errors: tsconfig
+            .map(|tsconfig| tsconfig.errors.clone())
+            .unwrap_or_default(),
+        ..ParsedCommandLine::default()
+    });
+    // PORT: Go `Host.Project` returns nil only after `Close`, which cannot
+    // happen here.
+    let content_mapper_project: Option<Rc<dyn contentmapper::Project>> =
+        content_mapper_host.as_ref().and_then(|host| {
+            host.project(ProjectSpec {
+                config_file_name: config.config_name().to_string(),
+                mappers: config.content_mappers().to_vec(),
+                compiler_options: Some(config.compiler_options().clone()),
+            })
+        });
+    let _close_content_mapper_project = Defer(content_mapper_project.clone().map(|project| {
+        move || {
+            let _ = project.close();
+        }
+    }));
+
     let tracer_bytes: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
     let tracer_writer: Writer = tracer_bytes.clone();
     let tracer = Rc::new(RefCell::new(TracerForBaselining::new(
@@ -291,20 +357,8 @@ pub fn compile_files_ex(
         tracer_writer,
         Some(tracer_bytes),
     )));
-    let host = create_compiler_host(current_directory, tracer.clone());
-    let config = ParsedCommandLine {
-        parsed_config: ParsedOptions {
-            compiler_options: Rc::new(compiler_options.clone()),
-            file_names: program_file_names,
-            ..ParsedOptions::default()
-        },
-        config_file: tsconfig.and_then(|tsconfig| tsconfig.config_file.clone()),
-        errors: tsconfig
-            .map(|tsconfig| tsconfig.errors.clone())
-            .unwrap_or_default(),
-        ..ParsedCommandLine::default()
-    };
-    let mut result = compile_files_with_host(host, Rc::new(config), harness_options, &recorder);
+    let host = create_compiler_host(current_directory, tracer.clone(), content_mapper_project);
+    let mut result = compile_files_with_host(host, config, harness_options, &recorder);
     result.symlinks = symlinks.clone();
     result.trace = tracer.borrow().string();
     result.repeat_inputs = Some(Box::new(CompileInputs {
@@ -591,6 +645,7 @@ fn go_atoi(value: &str) -> Option<i32> {
 fn create_compiler_host(
     current_directory: &str,
     tracer: Rc<RefCell<TracerForBaselining>>,
+    content_mapper_project: Option<Rc<dyn contentmapper::Project>>,
 ) -> Rc<dyn CompilerHost> {
     let fs = bundled::wrap_fs(global_fs().fs());
     new_compiler_host(
@@ -601,6 +656,7 @@ fn create_compiler_host(
         Some(Rc::new(move |msg: &'static Message, args: Vec<String>| {
             tracer.borrow_mut().trace(msg, args);
         })),
+        content_mapper_project,
     )
 }
 
@@ -639,6 +695,7 @@ fn compile_files_with_host(
         parsed_config: ParsedOptions {
             compiler_options: Rc::new(pre_compiler_options),
             file_names: config.file_names().to_vec(),
+            content_mappers: config.content_mappers().to_vec(),
             ..ParsedOptions::default()
         },
         config_file: config.config_file.clone(),
@@ -943,7 +1000,74 @@ impl CompilationResult {
                 );
             }
         }
+        if ext == get_declaration_emit_extension_for_path(&path) {
+            return self.change_to_declaration_extension(&path);
+        }
         change_extension(&path, ext)
+    }
+
+    /// Go `outputpaths.ChangeToDeclarationExtension(path, c.Program.Program())`
+    /// (tsgo#4712).
+    pub fn change_to_declaration_extension(&self, path: &str) -> String {
+        let _scope = self.enter_program_only();
+        let program =
+            tsprogram::go_frontend_program().expect("a harness program has a Go frontend");
+        ts_goport::frontend::outputpaths::change_to_declaration_extension(path, &*program)
+    }
+
+    /// Go `c.Program.GetSourceFile(fileName).ContentMapper()`, or `None`
+    /// when the program has no such file (tsgo#4712).
+    pub fn source_file_content_mapper(&self, file_name: &str) -> Option<String> {
+        let _scope = self.enter_program_only();
+        let file = tsprogram::get_source_file(file_name);
+        file.is_some()
+            .then(|| ts_goport::ast::source_file_content_mapper(file).to_string())
+    }
+
+    /// Go `core.Some(c.Program.GetSourceFiles(), func(file) bool { return
+    /// file.ContentMapper() != "" })` (tsgo#4712).
+    pub fn has_content_mapped_source_files(&self) -> bool {
+        let _scope = self.enter_program_only();
+        tsprogram::source_files()
+            .into_iter()
+            .any(|file| !ts_goport::ast::source_file_content_mapper(file).is_empty())
+    }
+
+    /// The files of Go `c.Program.GetSourceFiles()` that a content mapper
+    /// made, with that mapper: Go `c.Program.Program().GetContentMapper(file)`
+    /// is not nil (tsgo#4712). In program order.
+    pub fn content_mapped_source_files(&self) -> Vec<(Node, Rc<Mapper>)> {
+        let _scope = self.enter_program_only();
+        tsprogram::source_files()
+            .into_iter()
+            .filter_map(|file| self.get_content_mapper(file).map(|mapper| (file, mapper)))
+            .collect()
+    }
+
+    // Go: compiler/program.go:497 (*Program).GetContentMapper (tsgo#4712)
+    // PORT: in Go only the compiler runner and the content mapper baseline
+    // call it, so the port keeps it with them. `p.opts.Config` is the
+    // command line that the program was made with.
+    fn get_content_mapper(&self, file: Node) -> Option<Rc<Mapper>> {
+        let content_mapper = ts_goport::ast::source_file_content_mapper(file);
+        if content_mapper.is_empty() {
+            return None;
+        }
+        let mapper = self
+            .command_line
+            .get_content_mapper_for_file_name(source_file_file_name(file))?;
+        (mapper.identity() == content_mapper).then_some(mapper)
+    }
+
+    /// Go `file.Content = sf.Text()` in `newCompilerTest` (tsgo#4712). Go
+    /// changes the `*TestFile` values that `CompileFiles` got, so its
+    /// `Repeat` closure compiles the new content. This gives `repeat` the
+    /// same files.
+    pub fn set_repeat_files(&mut self, input_files: &[TestFile], other_files: &[TestFile]) {
+        if let Some(inputs) = self.repeat_inputs.as_mut() {
+            inputs.input_files = input_files.to_vec();
+            inputs.other_files = other_files.to_vec();
+        }
     }
 
     /// Makes the program current on this thread and its file system the
@@ -1079,7 +1203,7 @@ fn create_program(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) -> 
         };
         let old_program = read_build_info_program(&config, &reader, &*host);
         let incremental_program =
-            new_incremental_program(old_program.as_ref(), create_host(host), false);
+            new_incremental_program(old_program.as_ref(), create_host(host), None, false);
         return ProgramLike::Incremental(Box::new(incremental_program));
     }
     ProgramLike::Program(program)
@@ -1101,12 +1225,13 @@ fn test_program_is_single_threaded() -> bool {
 }
 
 // Go: harnessutil.go:944 EnumerateFiles
-pub fn enumerate_files(folder: &str, test_regex: fn(&str) -> bool, recursive: bool) -> Vec<String> {
-    list_files_worker(test_regex, recursive, folder)
-        .unwrap_or_else(|err| panic!("Could not read compiler test files: {err}"))
-        .iter()
-        .map(|path| normalize_slashes(path))
-        .collect()
+pub fn enumerate_files(
+    folder: &str,
+    test_regex: fn(&str) -> bool,
+    recursive: bool,
+) -> std::io::Result<Vec<String>> {
+    let files = list_files_worker(test_regex, recursive, folder)?;
+    Ok(files.iter().map(|path| normalize_slashes(path)).collect())
 }
 
 // Go: harnessutil.go:956 listFilesWorker

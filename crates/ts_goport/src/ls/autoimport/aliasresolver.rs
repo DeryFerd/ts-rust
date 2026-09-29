@@ -482,6 +482,13 @@ impl AliasResolver {
         go_panic("unimplemented".to_string())
     }
 
+    // Go: ls/autoimport/aliasresolver.go:158 ContentMapperExtensions
+    // ContentMapperExtensions implements checker.Program.
+    // PORT: the Go nil slice is an empty `Vec`.
+    pub fn content_mapper_extensions(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     // Go: ls/autoimport/aliasresolver.go:158 FileExists
     // FileExists implements checker.Program.
     pub fn file_exists(&self, file_name: &str) -> bool {

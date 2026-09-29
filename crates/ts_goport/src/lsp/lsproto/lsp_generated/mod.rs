@@ -9,6 +9,7 @@ mod structures_p1;
 mod structures_p2;
 mod structures_p3;
 mod structures_p4;
+mod structures_p5;
 mod unions;
 
 pub use enumerations::*;
@@ -19,4 +20,5 @@ pub use structures_p1::*;
 pub use structures_p2::*;
 pub use structures_p3::*;
 pub use structures_p4::*;
+pub use structures_p5::*;
 pub use unions::*;

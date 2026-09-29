@@ -46,8 +46,7 @@ impl Checker {
             if !self.is_error_type(super_type) {
                 // In super call, the candidate signatures are the matching arity signatures of the base constructor function instantiated
                 // with the type arguments specified in the extends clause.
-                let base_type_node =
-                    get_extends_heritage_clause_element(get_containing_class(node));
+                let base_type_node = get_class_extends_heritage_element(get_containing_class(node));
                 if base_type_node.is_some() {
                     let base_constructors = self.get_instantiated_constructors_for_type_arguments(
                         super_type,
@@ -546,13 +545,13 @@ impl Checker {
                 apparent_type,
                 SignatureKind::CALL,
             );
-            let mut diag = new_diagnostic_chain(Some(details), head_message, args![]);
-            // PORT: Go adds the diagnostic pointer and then lets
-            // invocationErrorRecovery attach related info to it. Diagnostics are
-            // owned values here, so the recovery runs first and the finished
-            // diagnostic is added after it.
-            self.invocation_error_recovery(apparent_type, SignatureKind::CALL, &mut diag);
-            self.add_diagnostic(diag);
+            let diag = new_diagnostic_chain(Some(details), head_message, args![]);
+            // Go (#4825): the recovery adds related info to the stored
+            // diagnostic (see `invocation_error_recovery` for the order).
+            let recovery = self.invocation_error_recovery(apparent_type, SignatureKind::CALL);
+            if let Some(diag) = self.add_diagnostic(diag) {
+                diag.add_related_info(recovery);
+            }
             return self.resolve_error_call(node);
         }
         let decorator_signature = self.get_decorator_call_signature(node);

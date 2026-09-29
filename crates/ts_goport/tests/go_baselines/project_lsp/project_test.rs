@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use ts_goport::diag;
 use ts_goport::lsp::lsproto;
+use ts_goport::program::ls_program;
 use ts_goport::project::{ProgramUpdateKind, Session};
 
 use super::projecttestutil::{self, ProgressCall, TypingsInstallerOptions, files};
@@ -64,6 +65,70 @@ child_test! {
         edit(&session, SRC_INDEX, 2, (0, 20), (0, 20), "\n");
         let _ = language_service(&session, SRC_INDEX);
         assert_eq!(configured_update_kind(&session, "/src/tsconfig.json"), ProgramUpdateKind::CLONED);
+    }
+}
+
+child_test! {
+    // Go: project_test.go:83 TestProjectProgramUpdateKind/NewFiles when import resolution mode changes
+    // #4792
+    fn program_update_kind_new_files_when_import_resolution_mode_changes() {
+        let index = r#"import type { Value } from "pkg" with { "resolution-mode": "require" };
+const value: Value = { mode: "require" };"#;
+        let (session, _) = projecttestutil::setup(files(&[
+            (
+                "/src/tsconfig.json",
+                r#"{
+				"compilerOptions":{"module":"preserve","moduleResolution":"bundler","noEmit":true},
+				"files":["index.ts"]
+			}"#,
+            ),
+            ("/src/index.ts", index),
+            (
+                "/src/node_modules/pkg/package.json",
+                r#"{
+				"name": "pkg",
+				"version": "1.0.0",
+				"exports": {
+					".": {
+						"import": "./index.mjs",
+						"require": "./index.js"
+					}
+				}
+			}"#,
+            ),
+            ("/src/node_modules/pkg/index.d.mts", r#"export interface Value { mode: "import" }"#),
+            ("/src/node_modules/pkg/index.d.ts", r#"export interface Value { mode: "require" }"#),
+        ]));
+        open(&session, SRC_INDEX, index);
+        let p = program(&session, SRC_INDEX);
+        assert_eq!(sem_diag_count(&p, "/src/index.ts"), 0);
+
+        session.did_change_file(
+            &bg(),
+            &uri(SRC_INDEX),
+            2,
+            &[lsproto::TextDocumentContentChangePartialOrWholeDocument {
+                partial: None,
+                whole_document: Some(lsproto::TextDocumentContentChangeWholeDocument {
+                    text: r#"import type { Value } from "pkg" with { "resolution-mode": "import" };
+const value: Value = { mode: "require" };"#
+                        .to_string(),
+                }),
+            }],
+        );
+        let p = program(&session, SRC_INDEX);
+        let file = p
+            .get_source_file("/src/index.ts")
+            .expect("no source file /src/index.ts");
+        let diags = ls_program::get_semantic_diagnostics(
+            &p,
+            &projecttestutil::with_request_id(&bg()),
+            file.root,
+        );
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code(), diag::Type_0_is_not_assignable_to_type_1.code() as i32);
+
+        assert_eq!(configured_update_kind(&session, "/src/tsconfig.json"), ProgramUpdateKind::NEW_FILES);
     }
 }
 
@@ -321,6 +386,50 @@ child_test! {
             last_tsconfig_call.diagnostics.len(),
             0,
             "expected no diagnostics after removing baseUrl option"
+        );
+    }
+}
+
+child_test! {
+    // Go: project_test.go:462 TestPushDiagnostics/updates diagnostics when a config file changes on disk with no follow-up request
+    fn push_diagnostics_updates_diagnostics_when_a_config_file_changes_on_disk_with_no_follow_up_request() {
+        let (session, utils) = projecttestutil::setup(files(&[
+            ("/src/tsconfig.json", r#"{"compilerOptions": {}}"#),
+            ("/src/index.ts", "export const x = 1;"),
+        ]));
+        open(&session, SRC_INDEX, "export const x = 1;");
+        let _ = language_service(&session, SRC_INDEX);
+        session.wait_for_background_tasks();
+
+        let calls_before_change = utils.client().publish_diagnostics_calls().len();
+
+        // Editors do not attach the language server to JSON documents, so a config file
+        // edit only reaches the session through the file watcher. Config file diagnostics
+        // are pushed, so they must be republished without waiting for a client request.
+        utils
+            .fs()
+            .write_file("/src/tsconfig.json", r#"{"compilerOptions": {"target": "nope"}}"#)
+            .unwrap();
+        watch(&session, &[(CHANGED, "file:///src/tsconfig.json")]);
+        session.wait_for_background_tasks();
+
+        let calls = utils.client().publish_diagnostics_calls();
+        let tsconfig_calls =
+            filter_diagnostics_by_uri(&calls, "file:///src/tsconfig.json", calls_before_change);
+        assert!(
+            !tsconfig_calls.is_empty(),
+            "expected PublishDiagnostics call for tsconfig.json after watched file change"
+        );
+        let last_tsconfig_call = &tsconfig_calls[tsconfig_calls.len() - 1];
+
+        let expected_message = "Argument for '--target' option must be:";
+        assert!(
+            last_tsconfig_call
+                .diagnostics
+                .iter()
+                .any(|diag| diag.message.as_string().contains(expected_message)),
+            "expected invalid target diagnostic on tsconfig.json, got: {:?}",
+            last_tsconfig_call.diagnostics
         );
     }
 }

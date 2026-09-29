@@ -197,6 +197,47 @@ pub fn has_ts_or_tsx_suffix(s: &str) -> bool {
     s.ends_with(".ts") || s.ends_with(".tsx")
 }
 
+// Go: transpile_runner.go:23 transpileBaselineRegex
+/// Go `regexp.MustCompile(`\.[cm]?[tj]sx?$`).MatchString(s)`.
+pub fn has_transpile_test_suffix(s: &str) -> bool {
+    let s = s.strip_suffix('x').unwrap_or(s);
+    let Some(s) = s.strip_suffix("ts").or_else(|| s.strip_suffix("js")) else {
+        return false;
+    };
+    let s = s
+        .strip_suffix('c')
+        .or_else(|| s.strip_suffix('m'))
+        .unwrap_or(s);
+    s.ends_with('.')
+}
+
+// Go: tsbaseline/contentmapper_baseline.go:16 ansiEscape (tsgo#4712)
+/// Go `ansiEscape.ReplaceAllString(s, "")` with `\x1b\[[0-9;]*m`: removes
+/// each ANSI color sequence.
+pub fn replace_ansi_escapes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'm') {
+                out.push_str(&s[copied..i]);
+                i = j + 1;
+                copied = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
 /// Go `tsExtension.ReplaceAllString(path, replacement)` with `\.tsx?$`.
 pub fn replace_ts_extension(path: &str, replacement: &str) -> String {
     if let Some(stem) = path.strip_suffix(".tsx") {
@@ -410,6 +451,28 @@ mod tests {
             Some(("/a/b ", "/c/d"))
         );
         assert_eq!(match_link_line("// @link: /a/b"), None);
+    }
+
+    #[test]
+    fn transpile_test_suffix() {
+        for name in ["a.ts", "a.tsx", "a.js", "a.jsx", "a.cts", "a.mjs", "a.c.ts"] {
+            assert!(has_transpile_test_suffix(name), "{name}");
+        }
+        for name in ["a.d", "a.xts", "a.mcts", "a.tsxx", "a.ts.map", "ats", "a.x"] {
+            assert!(!has_transpile_test_suffix(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn ansi_escapes() {
+        assert_eq!(
+            replace_ansi_escapes("\x1b[91merror\x1b[0m TS1: \x1b[1;30mx\x1b[m"),
+            "error TS1: x"
+        );
+        assert_eq!(
+            replace_ansi_escapes("\x1b[9x \x1b[ \x1b"),
+            "\x1b[9x \x1b[ \x1b"
+        );
     }
 
     #[test]

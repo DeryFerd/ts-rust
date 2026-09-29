@@ -1,5 +1,5 @@
-//! Port of internal/api/transport.go, with internal/api/transport_windows.go
-//! as a `cfg(windows)` stub at the end.
+//! Port of internal/ipc/transport.go, with internal/ipc/transport_windows.go
+//! as a `cfg(windows)` stub at the end (internal/api before tsgo#4712).
 //!
 //! PORT: Go `io.ReadWriteCloser` (what `Transport.Accept` returns) is the
 //! trait `ReadWriteCloser`. Go hands the same value to the protocol reader,
@@ -8,7 +8,7 @@
 //! `ConnReader` and `ConnWriter` are the `std::io` views that the protocols
 //! read and write through. Go `net.Listener` is the trait `NetListener`.
 
-use crate::api::prelude::*;
+use crate::ipc::prelude::*;
 
 use crate::gostd::{GoError, errors};
 use std::io::{Read, Write};
@@ -54,7 +54,7 @@ pub trait NetListener: Send + Sync {
     fn addr(&self) -> String;
 }
 
-// Go: transport.go:9 Transport
+// Go: ipc/transport.go:9 Transport
 // Transport is an interface for accepting connections from API clients.
 pub trait Transport {
     // Accept waits for and returns the next connection.
@@ -63,13 +63,13 @@ pub trait Transport {
     fn close(&mut self) -> Result<(), GoError>;
 }
 
-// Go: transport.go:17 PipeTransport
+// Go: ipc/transport.go:17 PipeTransport
 // PipeTransport accepts connections on a Unix domain socket or Windows named pipe.
 pub struct PipeTransport {
     listener: Box<dyn NetListener>,
 }
 
-// Go: transport.go:23 NewPipeTransport
+// Go: ipc/transport.go:23 NewPipeTransport
 // NewPipeTransport creates a new transport listening on the given path.
 // On Unix, this creates a Unix domain socket. On Windows, this creates a named pipe.
 pub fn new_pipe_transport(path: &str) -> Result<PipeTransport, GoError> {
@@ -80,19 +80,19 @@ pub fn new_pipe_transport(path: &str) -> Result<PipeTransport, GoError> {
 // PORT: the Go methods are also inherent methods, so callers need not
 // import `Transport`.
 impl PipeTransport {
-    // Go: transport.go:32 Accept
+    // Go: ipc/transport.go:32 Accept
     // Accept implements Transport.
     pub fn accept(&self) -> Result<Arc<dyn ReadWriteCloser>, GoError> {
         self.listener.accept()
     }
 
-    // Go: transport.go:37 Close
+    // Go: ipc/transport.go:37 Close
     // Close implements Transport.
     pub fn close(&self) -> Result<(), GoError> {
         self.listener.close()
     }
 
-    // Go: transport.go:42 Path
+    // Go: ipc/transport.go:42 Path
     // Path returns the path of the pipe/socket.
     pub fn path(&self) -> String {
         self.listener.addr()
@@ -109,7 +109,7 @@ impl Transport for PipeTransport {
     }
 }
 
-// Go: transport.go:48 StdioTransport
+// Go: ipc/transport.go:48 StdioTransport
 // StdioTransport wraps stdin/stdout as a single connection transport.
 // It only accepts one connection.
 // PORT: Go `io.ReadCloser` / `io.WriteCloser` are boxed `Read` / `Write`
@@ -121,7 +121,7 @@ pub struct StdioTransport {
     used: bool,
 }
 
-// Go: transport.go:55 NewStdioTransport
+// Go: ipc/transport.go:55 NewStdioTransport
 // NewStdioTransport creates a transport using the given stdin/stdout.
 pub fn new_stdio_transport(
     stdin: Option<Box<dyn Read + Send>>,
@@ -135,7 +135,7 @@ pub fn new_stdio_transport(
 }
 
 impl StdioTransport {
-    // Go: transport.go:63 Accept
+    // Go: ipc/transport.go:63 Accept
     // Accept implements Transport.
     pub fn accept(&mut self) -> Result<Arc<dyn ReadWriteCloser>, GoError> {
         if self.used {
@@ -148,7 +148,7 @@ impl StdioTransport {
         }))
     }
 
-    // Go: transport.go:77 Close
+    // Go: ipc/transport.go:77 Close
     // Close implements Transport.
     pub fn close(&mut self) -> Result<(), GoError> {
         Ok(())
@@ -165,7 +165,7 @@ impl Transport for StdioTransport {
     }
 }
 
-// Go: transport.go:81 stdioConn
+// Go: ipc/transport.go:81 stdioConn
 // PORT: Go embeds the reader and writer; here each sits behind a mutex so
 // the connection can be shared (`ReadWriteCloser` takes `&self`).
 struct StdioConn {
@@ -193,7 +193,7 @@ impl ReadWriteCloser for StdioConn {
         lock(&self.stdout).as_mut().expect(NIL_DEREF).flush()
     }
 
-    // Go: transport.go:88 Close
+    // Go: ipc/transport.go:88 Close
     // PORT: Go closes both files. The port drops both handles; dropping
     // `std::io::Stdin` / `Stdout` leaves the process streams open, and a
     // drop reports no error.
@@ -207,13 +207,13 @@ impl ReadWriteCloser for StdioConn {
 }
 
 #[cfg(unix)]
-use crate::api::transport_unix::new_pipe_listener;
+use crate::ipc::transport_unix::new_pipe_listener;
 
 // ---------------------------------------------------------------------------
 // transport_windows.go (//go:build windows)
 // ---------------------------------------------------------------------------
 
-// Go: transport_windows.go:12 newPipeListener
+// Go: ipc/transport_windows.go:12 newPipeListener
 // newPipeListener creates a Windows named pipe listener.
 // PORT: Go uses `winio.ListenPipe`, which is not ported (Windows only). The
 // port fails the way `ListenPipe` fails when named pipes are unavailable:
@@ -226,7 +226,7 @@ pub fn new_pipe_listener(path: &str) -> Result<Box<dyn NetListener>, GoError> {
     )))
 }
 
-// Go: transport_windows.go:17 GeneratePipePath
+// Go: ipc/transport_windows.go:17 GeneratePipePath
 // GeneratePipePath returns a platform-appropriate pipe path for the given name.
 #[cfg(windows)]
 pub fn generate_pipe_path(name: &str) -> String {

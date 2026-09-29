@@ -1,3 +1,4 @@
+use crate::contentmapper::{Mapper, OptionPathSegment};
 use crate::frontend::prelude::*;
 
 // This file ports tsoptions/tsconfigparsing.go lines 901 to 1833.
@@ -60,12 +61,16 @@ fn convert_type_acquisition_from_json_worker(
 // Go: tsoptions/tsconfigparsing.go:924 parseOwnConfigOfJson
 // PORT: Go stores a `[]string` (maybe nil) in the `any` field, so the field
 // is never Go nil. It is always `Some` here.
+// PORT: Go sets the converted `compileOnSave` in the caller's map, which
+// becomes `raw`. The port changes its own copy, which becomes `raw`; the
+// caller does not read `json` again.
 fn parse_own_config_of_json(
     json: &IndexMap<String, CompilerOptionsValue>,
     host: &dyn ParseConfigHost,
     base_path: &str,
     config_file_name: &str,
 ) -> (ParsedTsconfig, Vec<Diagnostic>) {
+    let mut json = json.clone();
     let nil = CompilerOptionsValue::Nil;
     let mut errors: Vec<Diagnostic> = Vec::new();
     if json.contains_key("excludes") {
@@ -86,8 +91,18 @@ fn parse_own_config_of_json(
     );
     errors.extend(err);
     errors.extend(err2);
-    // watchOptions := convertWatchOptionsFromJsonWorker(json.watchOptions, basePath, errors)
-    // json.compileOnSave = convertCompileOnSaveOptionFromJson(json, basePath, errors)
+    if let Some(compile_on_save) = json.get("compileOnSave").cloned() {
+        let (converted, compile_on_save_errors) = convert_json_option(
+            *COMPILE_ON_SAVE_COMMAND_LINE_OPTION,
+            compile_on_save,
+            base_path,
+            Node::NIL,
+            Node::NIL,
+            Node::NIL,
+        );
+        errors.extend(compile_on_save_errors);
+        json.insert("compileOnSave".to_string(), converted);
+    }
     let mut extended_config_path: Vec<String> = Vec::new();
     let extends = json.get("extends").unwrap_or(&nil);
     if !extends.is_nil() && *extends != CompilerOptionsValue::String(String::new()) {
@@ -104,7 +119,7 @@ fn parse_own_config_of_json(
         errors.extend(err);
     }
     let parsed_config = ParsedTsconfig {
-        raw: CompilerOptionsValue::Map(json.clone()),
+        raw: CompilerOptionsValue::Map(json),
         options: Some(options),
         type_acquisition: Some(type_acquisition),
         extended_config_path: Some(extended_config_path),
@@ -428,6 +443,18 @@ pub fn parse_config(
                         }
                     }
                 }
+                // tsgo#4712. PORT: Go `result.contentMappers, _ = ....([]any)`
+                // sets nil for a value that is not an array.
+                if let Some(extended_raw_map) = raw_as_map(extends_raw)
+                    && extended_raw_map.contains_key("contentMappers")
+                {
+                    result.content_mappers = match extended_raw_map.get("contentMappers") {
+                        Some(CompilerOptionsValue::List(content_mappers)) => {
+                            Some(content_mappers.clone())
+                        }
+                        _ => None,
+                    };
+                }
                 if let Some(extended_raw_map) = raw_as_map(extends_raw)
                     && extended_raw_map.contains_key("compileOnSave")
                     && let Some(CompilerOptionsValue::Bool(compile_on_save)) =
@@ -453,6 +480,15 @@ pub fn parse_config(
         if let Some(files) = result.files.take() {
             raw_as_map_mut(&mut own_config.raw)
                 .insert("files".to_string(), CompilerOptionsValue::List(files));
+        }
+        // tsgo#4712
+        if let Some(content_mappers) = result.content_mappers.take()
+            && !raw_as_map_mut(&mut own_config.raw).contains_key("contentMappers")
+        {
+            raw_as_map_mut(&mut own_config.raw).insert(
+                "contentMappers".to_string(),
+                CompilerOptionsValue::List(content_mappers),
+            );
         }
         if result.compile_on_save
             && !raw_as_map_mut(&mut own_config.raw).contains_key("compileOnSave")
@@ -483,9 +519,6 @@ pub fn parse_config(
             raw_as_map(&own_config.raw),
         );
         own_config.options = Some(result.options);
-        // ownConfig.watchOptions = ownConfig.watchOptions && result.watchOptions ?
-        //     assignWatchOptions(result, ownConfig.watchOptions) :
-        //     ownConfig.watchOptions || result.watchOptions;
     }
     (own_config, errors)
 }
@@ -502,10 +535,9 @@ struct PropOfRaw {
 
 // Go: tsoptions/tsconfigparsing.go:1210 getPropFromRaw (closure in parseJsonConfigFileContentWorker)
 // PORT: the Go closure is a private function. `is_json` is Go
-// `sourceFile == nil`. Go `reflect.TypeOf(nil).Kind()` panics on a nil
-// element; JSON conversion drops nil elements, so `validate_element` sees
-// no `Nil`. A Go `[]string` value makes the `.([]any)` assertion panic;
-// so does this port.
+// `sourceFile == nil`. A nil element fails both element checks, as in Go.
+// A Go `[]string` value makes the `.([]any)` assertion panic; so does this
+// port.
 fn get_prop_from_raw(
     raw_config: &IndexMap<String, CompilerOptionsValue>,
     is_json: bool,
@@ -558,8 +590,8 @@ fn is_map_element(element: &CompilerOptionsValue) -> bool {
     matches!(element, CompilerOptionsValue::Map(_))
 }
 
-/// Go `reflect.TypeOf(element).Kind() == reflect.String`.
-fn is_string_element(element: &CompilerOptionsValue) -> bool {
+// Go: tsoptions/tsconfigparsing.go:1226 isStringValue
+fn is_string_value(element: &CompilerOptionsValue) -> bool {
     matches!(element, CompilerOptionsValue::String(_))
 }
 
@@ -577,7 +609,7 @@ fn spec_list_value(specs: &Option<Vec<CompilerOptionsValue>>) -> CompilerOptions
 /// `internal/json` (json v2): compact output, a nil slice is `[]`, and only
 /// `"`, `\` and control characters are escaped.
 // PORT: only the value kinds that JSON conversion makes are handled.
-fn stringify_json(value: &CompilerOptionsValue, out: &mut String) {
+pub(crate) fn stringify_json(value: &CompilerOptionsValue, out: &mut String) {
     match value {
         CompilerOptionsValue::Nil => out.push_str("[]"),
         CompilerOptionsValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -650,7 +682,6 @@ pub fn parse_json_config_file_content_worker(
     existing_options_raw: Option<&IndexMap<String, CompilerOptionsValue>>,
     config_file_name: &str,
     resolution_stack: &[Path],
-    extra_file_extensions: &[FileExtensionInfo],
     extended_config_cache: Option<&dyn ExtendedConfigCache>,
 ) -> ParsedCommandLine {
     debug_assert!(
@@ -701,7 +732,7 @@ pub fn parse_json_config_file_content_worker(
         is_json,
         &mut errors,
         "files",
-        is_string_element,
+        is_string_value,
         "string",
     );
     if file_specs.slice_value.is_some() || file_specs.wrong_value.is_empty() {
@@ -748,7 +779,7 @@ pub fn parse_json_config_file_content_worker(
         is_json,
         &mut errors,
         "include",
-        is_string_element,
+        is_string_value,
         "string",
     );
     let mut exclude_specs = get_prop_from_raw(
@@ -756,7 +787,7 @@ pub fn parse_json_config_file_content_worker(
         is_json,
         &mut errors,
         "exclude",
-        is_string_element,
+        is_string_value,
         "string",
     );
     let mut is_default_include_spec = false;
@@ -862,6 +893,146 @@ pub fn parse_json_config_file_content_worker(
         source_file.config_file_specs = Some(config_file_specs.clone());
     }
 
+    // tsgo#4712
+    let content_mapper_source_file = tsconfig_node;
+    let mut content_mappers: Vec<Mapper> = Vec::new();
+    let mut content_mapper_indices: Vec<i32> = Vec::new();
+    let content_mappers_of_raw = get_prop_from_raw(
+        &raw_config,
+        is_json,
+        &mut errors,
+        "contentMappers",
+        is_map_element,
+        "object",
+    );
+    for (i, element) in content_mappers_of_raw
+        .slice_value
+        .iter()
+        .flatten()
+        .enumerate()
+    {
+        let (mapper, mapper_errors) = parse_content_mapper(element);
+        for mapper_error in mapper_errors {
+            errors.push(set_content_mapper_diagnostic_location(
+                mapper_error,
+                content_mapper_source_file,
+                get_content_mapper_syntax(content_mapper_source_file, i as i32, ""),
+            ));
+        }
+        if let Some(mapper) = mapper {
+            content_mappers.push(mapper);
+            content_mapper_indices.push(i as i32);
+        }
+    }
+    let total_content_mapper_extensions: usize = content_mappers
+        .iter()
+        .map(|mapper| mapper.definition.extensions.len())
+        .sum();
+    let mut seen_content_mapper_extensions: FxHashSet<String> =
+        FxHashSet::with_capacity_and_hasher(total_content_mapper_extensions, Default::default());
+    let mut content_mapper_extensions: Vec<String> =
+        Vec::with_capacity(total_content_mapper_extensions);
+    let native_extensions: Vec<&str> = ALL_SUPPORTED_EXTENSIONS_WITH_JSON
+        .iter()
+        .flat_map(|group| group.iter().copied())
+        .collect();
+    for (j, mapper) in content_mappers.iter_mut().enumerate() {
+        let mut valid_extensions: Vec<String> =
+            Vec::with_capacity(mapper.definition.extensions.len());
+        for ext in &mapper.definition.extensions {
+            let ext_node = get_content_mapper_extension_syntax(
+                content_mapper_source_file,
+                content_mapper_indices[j],
+                ext,
+            );
+            if !ext.starts_with('.') {
+                errors.push(set_content_mapper_diagnostic_location(
+                    new_compiler_diagnostic(
+                        diag::Content_mapper_file_extension_0_must_begin_with_a,
+                        args![ext],
+                    ),
+                    content_mapper_source_file,
+                    ext_node,
+                ));
+            } else if native_extensions.contains(&ext.as_str()) {
+                errors.push(set_content_mapper_diagnostic_location(
+                    new_compiler_diagnostic(
+                        diag::Content_mapper_file_extension_0_is_a_built_in_extension_and_cannot_be_registered_by_a_content_mapper,
+                        args![ext],
+                    ),
+                    content_mapper_source_file,
+                    ext_node,
+                ));
+            } else if seen_content_mapper_extensions.contains(ext) {
+                errors.push(set_content_mapper_diagnostic_location(
+                    new_compiler_diagnostic(
+                        diag::Content_mapper_file_extension_0_is_registered_by_more_than_one_content_mapper,
+                        args![ext],
+                    ),
+                    content_mapper_source_file,
+                    ext_node,
+                ));
+            } else {
+                seen_content_mapper_extensions.insert(ext.clone());
+                content_mapper_extensions.push(ext.clone());
+                valid_extensions.push(ext.clone());
+            }
+        }
+        mapper.definition.extensions = valid_extensions;
+    }
+    if !content_mappers.is_empty()
+        && !parsed_config
+            .options
+            .as_ref()
+            .is_some_and(|options| options.run_external_code.is_true())
+    {
+        errors.push(set_content_mapper_diagnostic_location(
+            new_compiler_diagnostic(
+                diag::Content_mappers_require_the_runExternalCode_command_line_flag_to_be_enabled,
+                args![],
+            ),
+            content_mapper_source_file,
+            get_content_mappers_key_syntax(content_mapper_source_file),
+        ));
+        // Without the flag the mappers are not trusted to run, so drop them entirely: their extensions are
+        // not registered and their files are not intercepted (they are treated as unknown foreign files).
+        content_mappers = Vec::new();
+        content_mapper_extensions = Vec::new();
+    } else if !content_mappers.is_empty() {
+        // Resolve each mapper's package.json now so its name, version, and run command are available to
+        // everything downstream (diagnostics, build-info staleness) without executing anything.
+        let containing_file = if config_file_name.is_empty() {
+            combine_paths(&base_path_for_file_names, &["tsconfig.json"])
+        } else {
+            config_file_name.to_string()
+        };
+        let mut resolved_content_mappers: Vec<Mapper> = Vec::with_capacity(content_mappers.len());
+        for (j, mut mapper) in content_mappers.into_iter().enumerate() {
+            let (manifest, package_directory, diagnostic) =
+                resolve_content_mapper_manifest(host, &containing_file, &mapper.definition.package);
+            mapper.package_directory = package_directory;
+            if let Some(diagnostic) = diagnostic {
+                errors.push(set_content_mapper_diagnostic_location(
+                    diagnostic,
+                    content_mapper_source_file,
+                    get_content_mapper_syntax(
+                        content_mapper_source_file,
+                        content_mapper_indices[j],
+                        "package",
+                    ),
+                ));
+                continue;
+            }
+            mapper.manifest = manifest;
+            resolved_content_mappers.push(mapper);
+        }
+        content_mappers = resolved_content_mappers;
+        content_mapper_extensions = content_mappers
+            .iter()
+            .flat_map(|mapper| mapper.definition.extensions.iter().cloned())
+            .collect();
+    }
+
     // Go: getFileNames(basePathForFileNames)
     let (file_names, literal_file_names_len) = {
         let parsed_config_options = parsed_config.options.as_ref();
@@ -870,7 +1041,7 @@ pub fn parse_json_config_file_content_worker(
             &base_path_for_file_names,
             parsed_config_options,
             &*host.fs(),
-            extra_file_extensions,
+            &content_mapper_extensions,
         );
         if should_report_no_input_files(
             &file_names,
@@ -888,6 +1059,12 @@ pub fn parse_json_config_file_content_worker(
         }
         (file_names, literal_file_names_len)
     };
+    let mut compile_on_save = false;
+    if let CompilerOptionsValue::Map(raw) = &parsed_config.raw
+        && let Some(CompilerOptionsValue::Bool(value)) = raw.get("compileOnSave")
+    {
+        compile_on_save = *value;
+    }
 
     // Go: getProjectReferences(basePathForFileNames)
     // PORT: Go nil is `None`. A `references` list, even `[]`, is `Some`.
@@ -902,23 +1079,44 @@ pub fn parse_json_config_file_content_worker(
     );
     if let Some(references) = &new_references_of_raw.slice_value {
         let project_references = project_references.insert(Vec::new());
-        for reference in references {
-            for r in parse_project_reference(reference) {
-                if r.path.is_empty() {
-                    if is_json {
-                        errors.push(new_compiler_diagnostic(
-                            diag::Compiler_option_0_requires_a_value_of_type_1,
-                            args!["reference.path", "string"],
-                        ));
-                    }
-                } else {
-                    project_references.push(ProjectReference {
-                        path: get_normalized_absolute_path(&r.path, &base_path_for_file_names),
-                        original_path: r.path.clone(),
-                        circular: r.circular,
-                    });
-                }
+        for (index, reference) in references.iter().enumerate() {
+            let Some(r) = parse_project_reference(reference) else {
+                continue;
+            };
+            if !r.has_path || !r.path_valid {
+                errors.push(create_diagnostic_at_project_reference_property(
+                    source_file.as_ref(),
+                    index,
+                    "path",
+                    diag::Compiler_option_0_requires_a_value_of_type_1,
+                    args!["reference.path", "string"],
+                ));
+                continue;
             }
+            if r.reference.path.is_empty() {
+                errors.push(create_diagnostic_at_project_reference_property(
+                    source_file.as_ref(),
+                    index,
+                    "path",
+                    diag::Compiler_option_0_cannot_be_given_an_empty_string,
+                    args!["reference.path"],
+                ));
+                continue;
+            }
+            if r.has_circular && !r.circular_valid {
+                errors.push(create_diagnostic_at_project_reference_property(
+                    source_file.as_ref(),
+                    index,
+                    "circular",
+                    diag::Compiler_option_0_requires_a_value_of_type_1,
+                    args!["reference.circular", "boolean"],
+                ));
+            }
+            project_references.push(ProjectReference {
+                path: get_normalized_absolute_path(&r.reference.path, &base_path_for_file_names),
+                original_path: r.reference.path.clone(),
+                circular: r.reference.circular,
+            });
         }
     }
 
@@ -927,15 +1125,15 @@ pub fn parse_json_config_file_content_worker(
             // PORT: Go nil options become the default options.
             compiler_options: Rc::new(parsed_config.options.unwrap_or_default()),
             type_acquisition: parsed_config.type_acquisition,
-            // WatchOptions:      nil,
             file_names,
             project_references,
+            content_mappers: content_mappers.into_iter().map(Rc::new).collect(),
         },
         config_file: source_file.map(Rc::new),
         raw: parsed_config.raw,
         errors,
+        compile_on_save: Some(compile_on_save),
 
-        extra_file_extensions: extra_file_extensions.to_vec(),
         compare_paths_options: ComparePathsOptions {
             use_case_sensitive_file_names: host.fs().use_case_sensitive_file_names(),
             current_directory: base_path_for_file_names,
@@ -980,8 +1178,8 @@ fn validate_specs(
     };
     let mut errors: Vec<Diagnostic> = Vec::new();
     let mut final_specs: Vec<String> = Vec::new();
-    for spec in specs {
-        let CompilerOptionsValue::String(spec) = spec else {
+    for value in specs {
+        let CompilerOptionsValue::String(spec) = value else {
             continue;
         };
         let diag = spec_to_diagnostic(spec, disallow_trailing_recursion);
@@ -1104,6 +1302,45 @@ pub fn create_diagnostic_at_reference_syntax(
     })
 }
 
+// Go: tsoptions/tsconfigparsing.go:1636 createDiagnosticAtProjectReferenceProperty
+// PORT: Go `*TsConfigSourceFile` is `Option<&TsConfigSourceFile>`; the Go
+// variadic `args` is a `Vec`.
+fn create_diagnostic_at_project_reference_property(
+    source_file: Option<&TsConfigSourceFile>,
+    index: usize,
+    property_name: &str,
+    message: &'static Message,
+    args: Vec<String>,
+) -> Diagnostic {
+    let mut node = Node::NIL;
+    if let Some(source_file) = source_file {
+        node = for_each_tsconfig_prop_array(source_file.source_file, "references", |property| {
+            if is_array_literal_expression(property.initializer()) {
+                let elements = property.initializer().elements();
+                if elements.len() > index && is_object_literal_expression(elements.get(index)) {
+                    if let Some(property_node) = for_each_property_assignment(
+                        elements.get(index),
+                        property_name,
+                        |property| Some(property.initializer()),
+                        &[],
+                    ) {
+                        return Some(property_node);
+                    }
+                    return Some(elements.get(index));
+                }
+            }
+            None
+        })
+        .unwrap_or(Node::NIL);
+    }
+    create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
+        tsconfig_to_source_file(source_file),
+        node,
+        message,
+        args,
+    )
+}
+
 // Go: tsoptions/tsconfigparsing.go:1493 GetCallbackForFindingPropertyAssignmentByValue
 pub fn get_callback_for_finding_property_assignment_by_value(
     value: &str,
@@ -1134,6 +1371,151 @@ pub fn get_options_syntax_by_array_element_value(
         &[],
     )
     .unwrap_or(Node::NIL)
+}
+
+// Go: tsoptions/tsconfigparsing.go:1676 getContentMapperSyntax (tsgo#4712)
+// getContentMapperSyntax returns the tsconfig JSON node to attribute a diagnostic about the content
+// mapper at index to: the value of subKey within that mapper's object (when subKey is non-empty),
+// falling back to the mapper element, then to the "contentMappers" array. An index outside the array
+// (e.g. -1) yields the array itself. Returns nil when there is no source file (JSON API).
+// PORT: Go nil `*ast.Node` is `Node::NIL`.
+fn get_content_mapper_syntax(source_file: Node, index: i32, sub_key: &str) -> Node {
+    if source_file.is_nil() {
+        return Node::NIL;
+    }
+    for_each_tsconfig_prop_array(source_file, "contentMappers", |property| {
+        if !is_array_literal_expression(property.initializer()) {
+            return Some(property.initializer());
+        }
+        let elements = property.initializer().elements();
+        if index < 0 || index as usize >= elements.len() {
+            return Some(property.initializer());
+        }
+        let element = elements.get(index as usize);
+        if !sub_key.is_empty() && is_object_literal_expression(element) {
+            let node = for_each_property_assignment(
+                element,
+                sub_key,
+                |property| Some(property.initializer()),
+                &[],
+            );
+            if let Some(node) = node
+                && node.is_some()
+            {
+                return Some(node);
+            }
+        }
+        Some(element)
+    })
+    .unwrap_or(Node::NIL)
+}
+
+// Go: tsoptions/tsconfigparsing.go:1700 GetContentMapperOptionDiagnosticLocation (tsgo#4712)
+// PORT: Go returns `(*ast.SourceFile, core.TextRange)`; the file is a
+// `Node` (`Node::NIL` for nil). Go `slices.Index` compares the mapper
+// pointers (`Rc::ptr_eq`). Go indexes the array with a negative
+// `segment.Index` and panics; here a negative index finds no element.
+pub fn get_content_mapper_option_diagnostic_location(
+    config: Option<&ParsedCommandLine>,
+    mapper: &Rc<Mapper>,
+    path: &[OptionPathSegment],
+) -> (Node, TextRange) {
+    let Some(config) = config else {
+        return (Node::NIL, TextRange::undefined());
+    };
+    let Some(config_file) = &config.config_file else {
+        return (Node::NIL, TextRange::undefined());
+    };
+    let index = config
+        .content_mappers()
+        .iter()
+        .position(|m| Rc::ptr_eq(m, mapper))
+        .map_or(-1, |i| i as i32);
+    let mapper_node = get_content_mapper_syntax(config_file.source_file, index, "");
+    let mut node = get_content_mapper_syntax(config_file.source_file, index, "options");
+    if node.is_nil() {
+        node = mapper_node;
+    }
+    for segment in path {
+        let mut next = Node::NIL;
+        if segment.is_index && is_array_literal_expression(node) {
+            let elements = node.elements();
+            if let Ok(i) = usize::try_from(segment.index)
+                && i < elements.len()
+            {
+                next = elements.get(i);
+            }
+        } else if !segment.is_index && is_object_literal_expression(node) {
+            next = for_each_property_assignment(
+                node,
+                &segment.property,
+                |property| Some(property.initializer()),
+                &[],
+            )
+            .unwrap_or(Node::NIL);
+        }
+        if next.is_nil() {
+            break;
+        }
+        node = next;
+    }
+    if node.is_nil() {
+        return (Node::NIL, TextRange::undefined());
+    }
+    let file = config_file.source_file;
+    (
+        file,
+        TextRange::new(skip_trivia(source_file_text(file), node.pos()), node.end()),
+    )
+}
+
+// Go: tsoptions/tsconfigparsing.go:1737 getContentMappersKeySyntax (tsgo#4712)
+// getContentMappersKeySyntax returns the "contentMappers" property key node, used to attribute a
+// diagnostic about the setting as a whole rather than a specific mapper.
+fn get_content_mappers_key_syntax(source_file: Node) -> Node {
+    if source_file.is_nil() {
+        return Node::NIL;
+    }
+    for_each_tsconfig_prop_array(source_file, "contentMappers", |property| {
+        Some(property.name())
+    })
+    .unwrap_or(Node::NIL)
+}
+
+// Go: tsoptions/tsconfigparsing.go:1748 getContentMapperExtensionSyntax (tsgo#4712)
+// getContentMapperExtensionSyntax returns the node for a specific extension string within the content
+// mapper at index, falling back to the "extensions" array or the mapper element.
+fn get_content_mapper_extension_syntax(source_file: Node, index: i32, ext: &str) -> Node {
+    let node = get_content_mapper_syntax(source_file, index, "extensions");
+    if node.is_some() && is_array_literal_expression(node) {
+        if let Some(element) = node
+            .elements()
+            .iter()
+            .find(|element| is_string_literal(*element) && element.text() == ext)
+        {
+            return element;
+        }
+    }
+    node
+}
+
+// Go: tsoptions/tsconfigparsing.go:1763 setContentMapperDiagnosticLocation (tsgo#4712)
+// setContentMapperDiagnosticLocation attaches a source location to a content mapper diagnostic when a
+// tsconfig source file and node are available (the jsonSourceFile API), leaving it as a location-less
+// compiler diagnostic otherwise (the JSON API).
+fn set_content_mapper_diagnostic_location(
+    mut diagnostic: Diagnostic,
+    source_file: Node,
+    node: Node,
+) -> Diagnostic {
+    if source_file.is_some() && node.is_some() {
+        diagnostic.set_file(source_file);
+        diagnostic.set_location(TextRange::new(
+            skip_trivia(source_file_text(source_file), node.pos()),
+            node.end(),
+        ));
+    }
+    diagnostic
 }
 
 // Go: tsoptions/tsconfigparsing.go:1508 ForEachPropertyAssignment
@@ -1334,7 +1716,7 @@ fn remove_wildcard_files_with_lower_priority_extension(
 // basePath is the base path for any relative file specifications.
 // options is the Compiler options.
 // host is the host used to resolve files and directories.
-// extraFileExtensions optionally file extra file extension information from host
+// extraExtensions are additional file extensions (e.g. from content mappers) to treat as supported.
 // Go: tsoptions/tsconfigparsing.go:1660 getFileNamesFromConfigSpecs
 // PORT: Go `options` can be nil only after a config cycle; Go
 // `GetSupportedExtensions` then panics on the nil pointer, and so does this
@@ -1344,10 +1726,8 @@ pub(crate) fn get_file_names_from_config_specs(
     base_path: &str, // considering this is the current directory
     options: Option<&CompilerOptions>,
     host: &dyn Fs,
-    extra_file_extensions: &[FileExtensionInfo],
+    extra_extensions: &[String],
 ) -> (Vec<String>, i32) {
-    let _ = extra_file_extensions;
-    let extra_file_extensions: &[FileExtensionInfo] = &[];
     let base_path = normalize_path(base_path);
     let key_mappper = |value: &str| -> String {
         get_canonical_file_name(value, host.use_case_sensitive_file_names())
@@ -1371,7 +1751,7 @@ pub(crate) fn get_file_names_from_config_specs(
     // once and store it on the expansion context.
     let supported_extensions = get_supported_extensions(
         options.expect("nil pointer dereference: options"),
-        extra_file_extensions,
+        extra_extensions,
     );
     let supported_extensions_with_json_if_resolve_json_module =
         get_supported_extensions_with_json_if_resolve_json_module(
@@ -1478,33 +1858,29 @@ fn owned_groups(groups: &[&[&str]]) -> Vec<Vec<String>> {
 
 // Go: tsoptions/tsconfigparsing.go:1753 GetSupportedExtensions
 // PORT: Go returns the shared tspath tables; this returns owned copies.
+// tsgo#4712: the extra extensions are plain extension strings.
 pub fn get_supported_extensions(
     compiler_options: &CompilerOptions,
-    extra_file_extensions: &[FileExtensionInfo],
+    extra_extensions: &[String],
 ) -> Vec<Vec<String>> {
     let need_js_extensions = compiler_options.get_allow_js();
-    if extra_file_extensions.is_empty() {
-        if need_js_extensions {
-            return owned_groups(ALL_SUPPORTED_EXTENSIONS);
-        } else {
-            return owned_groups(SUPPORTED_TS_EXTENSIONS);
-        }
-    }
     let builtins = if need_js_extensions {
         owned_groups(ALL_SUPPORTED_EXTENSIONS)
     } else {
         owned_groups(SUPPORTED_TS_EXTENSIONS)
     };
+    if extra_extensions.is_empty() {
+        return builtins;
+    }
     let flat_builtins: Vec<&String> = builtins.iter().flatten().collect();
     let mut result: Vec<Vec<String>> = Vec::new();
-    for x in extra_file_extensions {
-        if x.script_kind == ScriptKind::DEFERRED
-            || (need_js_extensions
-                && (x.script_kind == ScriptKind::JS || x.script_kind == ScriptKind::JSX))
-                && !flat_builtins.contains(&&x.extension)
-        {
-            result.push(vec![x.extension.clone()]);
+    for ext in extra_extensions {
+        if !flat_builtins.contains(&ext) {
+            result.push(vec![ext.clone()]);
         }
+    }
+    if result.is_empty() {
+        return builtins;
     }
     let mut extensions = builtins.clone();
     extensions.extend(result);
@@ -1595,7 +1971,6 @@ pub fn get_parsed_command_line_of_config_file_path(
             options,
             options_raw,
             config_file_name,
-            &[],
             &[],
             extended_config_cache,
         )),

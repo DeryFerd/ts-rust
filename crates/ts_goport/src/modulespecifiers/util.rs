@@ -226,10 +226,11 @@ pub(crate) fn try_get_any_file_from_path(
     // !!! TODO: shouldn't this use readdir instead of fileexists for perf?
     // We check all js, `node` and `json` extensions in addition to TS, since node module resolution would also choose those over the directory
     // PORT: Go builds the groups with tsoptions.GetSupportedExtensions
-    // (AllowJs plus the `node` and `json` extra extensions). Neither extra
-    // has a deferred or JS script kind, so Go drops both and the result is
-    // tspath.AllSupportedExtensions.
-    let ext_groups = tspath::ALL_SUPPORTED_EXTENSIONS;
+    // (AllowJs plus the extra extensions ".node" and ".json"). tsgo#4712:
+    // neither is a built-in extension, so each is added as its own group
+    // after tspath.AllSupportedExtensions.
+    let extra_groups: &[&[&str]] = &[&[".node"], &[".json"]];
+    let ext_groups = tspath::ALL_SUPPORTED_EXTENSIONS.iter().chain(extra_groups);
     for exts in ext_groups {
         for e in exts.iter() {
             let full_path = format!("{path}{e}");

@@ -948,9 +948,10 @@ impl Checker {
                 }
                 let base_type_nodes = get_extends_heritage_clause_elements(declaration);
                 for node in base_type_nodes {
-                    if is_entity_name_expression(node.expression()) {
+                    let name = get_heritage_clause_element_name(node);
+                    if is_entity_name(name) || is_entity_name_expression(name) {
                         let base_symbol = self.resolve_entity_name(
-                            node.expression(),
+                            name,
                             SymbolFlags::TYPE,
                             true, /*ignoreErrors*/
                             false,
@@ -974,22 +975,6 @@ impl Checker {
         }
         true
     }
-}
-
-// Go: checker/checker.go:17283 hashWrite32
-// PORT: Go is generic over `~int32 | ~uint32`; callers pass the value as
-// `u32` (`TypeId.0`, flag `.0`, or `as u32`).
-#[inline]
-pub fn hash_write32(h: &mut KeyHasher, value: u32) {
-    h.write_u32(value);
-}
-
-// Go: checker/checker.go:17293 hashWrite64
-// PORT: Go is generic over `~int | ~uint | ~int64 | ~uint64`; callers pass
-// the value as `u64` (Go `uint64(value)` conversion, so negative ints wrap).
-#[inline]
-pub fn hash_write64(h: &mut KeyHasher, value: u64) {
-    h.write_u64(value);
 }
 
 // Go: checker/checker.go:17307 CacheHashKey
@@ -1016,153 +1001,6 @@ impl CacheHashKey {
     // Go: checker/checker.go:17309 CacheHashKey.IsZero
     pub fn is_zero(&self) -> bool {
         self.hi == 0 && self.lo == 0
-    }
-}
-
-/// Go `xxh3.Hasher` as used by `keyBuilder`.
-///
-/// PORT: the crate has no xxh3 dependency and the contract forbids new ones,
-/// so `xxh3_hash128` below is a hand port of `zeebo/xxh3` `Hash128` (seed 0).
-/// Go's streaming `Hasher` buffers the bytes and gives the same result as
-/// `Hash128` over all written bytes, so this hasher buffers them too. Split
-/// writes hash the same as one write, like Go.
-///
-/// PERF: the bytes go into a fixed inline buffer, so a fixed-size write is
-/// one bounds check and one fixed-size copy. The buffer costs a 256-byte zero
-/// fill for each new hasher (safe code cannot leave it uninitialized). Keys up
-/// to 256 bytes stay inline. A longer key moves all its bytes to `spill` once
-/// and writes there after that.
-#[derive(Clone)]
-pub struct KeyHasher {
-    /// Number of bytes written. Past `KEY_HASHER_INLINE` the bytes are in
-    /// `spill`, and `inline` is not read.
-    len: usize,
-    inline: [u8; KEY_HASHER_INLINE],
-    /// Empty until the key grows past `inline`; then holds every byte.
-    spill: Vec<u8>,
-}
-
-const KEY_HASHER_INLINE: usize = 256;
-
-impl Default for KeyHasher {
-    #[inline]
-    fn default() -> Self {
-        KeyHasher {
-            len: 0,
-            inline: [0; KEY_HASHER_INLINE],
-            spill: Vec::new(),
-        }
-    }
-}
-
-impl std::fmt::Debug for KeyHasher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KeyHasher")
-            .field("bytes", &self.bytes())
-            .finish()
-    }
-}
-
-impl KeyHasher {
-    /// The bytes written so far.
-    #[inline]
-    fn bytes(&self) -> &[u8] {
-        if self.len <= KEY_HASHER_INLINE {
-            &self.inline[..self.len]
-        } else {
-            &self.spill
-        }
-    }
-
-    /// Go `h.Write(bytes)`.
-    #[inline]
-    pub fn write(&mut self, bytes: &[u8]) {
-        let len = self.len;
-        let room = self
-            .inline
-            .get_mut(len..)
-            .and_then(|rest| rest.get_mut(..bytes.len()));
-        if let Some(dst) = room {
-            dst.copy_from_slice(bytes);
-            self.len = len + bytes.len();
-        } else {
-            self.write_spill(bytes);
-        }
-    }
-
-    /// Appends `bytes` to the heap buffer, first moving the inline bytes
-    /// there if this is the first write past the inline buffer.
-    #[cold]
-    #[inline(never)]
-    fn write_spill(&mut self, bytes: &[u8]) {
-        if self.len <= KEY_HASHER_INLINE {
-            self.spill.reserve(2 * KEY_HASHER_INLINE);
-            self.spill.extend_from_slice(&self.inline[..self.len]);
-        }
-        self.spill.extend_from_slice(bytes);
-        self.len += bytes.len();
-    }
-
-    /// Fixed-size write. `N` is a constant, so the room test is one compare
-    /// and the copy is one store.
-    #[inline(always)]
-    fn write_array<const N: usize>(&mut self, bytes: [u8; N]) {
-        let len = self.len;
-        if len <= KEY_HASHER_INLINE - N {
-            self.inline[len..len + N].copy_from_slice(&bytes);
-            self.len = len + N;
-        } else {
-            self.write_spill(&bytes);
-        }
-    }
-
-    /// Go `h.Write([]byte{c})` (`keyBuilder.writeByte`).
-    #[inline]
-    pub fn write_byte(&mut self, c: u8) {
-        self.write_array([c]);
-    }
-
-    /// Go `hashWrite32`: the 4 little-endian bytes of `value`.
-    #[inline]
-    pub fn write_u32(&mut self, value: u32) {
-        self.write_array(value.to_le_bytes());
-    }
-
-    /// Go `hashWrite64`: the 8 little-endian bytes of `value`.
-    #[inline]
-    pub fn write_u64(&mut self, value: u64) {
-        self.write_array(value.to_le_bytes());
-    }
-
-    /// Go `keyBuilder.writeTypes`: the count as `writeInt` (8 bytes) and then
-    /// `hashWrite32` of each type id. One room test for the whole list.
-    #[inline]
-    fn write_type_list(&mut self, types: &[TypeId]) {
-        let count = (types.len() as i32 as i64 as u64).to_le_bytes();
-        let len = self.len;
-        let room = self
-            .inline
-            .get_mut(len..)
-            .and_then(|rest| rest.get_mut(..count.len() + 4 * types.len()));
-        let Some(dst) = room else {
-            self.write_u64(u64::from_le_bytes(count));
-            for &t in types {
-                self.write_u32(t.0);
-            }
-            return;
-        };
-        let (head, tail) = dst.split_at_mut(count.len());
-        head.copy_from_slice(&count);
-        for (d, &t) in tail.chunks_exact_mut(4).zip(types) {
-            d.copy_from_slice(&t.0.to_le_bytes());
-        }
-        self.len = len + count.len() + 4 * types.len();
-    }
-
-    /// Go `h.Sum128()`.
-    pub fn sum128(&self) -> CacheHashKey {
-        let (hi, lo) = xxh3_hash128(self.bytes());
-        CacheHashKey { hi, lo }
     }
 }
 
@@ -1308,7 +1146,7 @@ fn xxh3_hash128_9to16(input_lo: u64, input_hi: u64, l: u64) -> (u64, u64) {
 }
 
 /// `xxh3_hash128` of a short key built in a stack array, with no
-/// `KeyHasher`. `N` is 9..=16, so the length dispatch is gone and the two
+/// `KeyBuilder`. `N` is 9..=16, so the length dispatch is gone and the two
 /// 8-byte reads fold into register moves.
 #[inline(always)]
 fn short_key_hash<const N: usize>(p: &[u8; N]) -> CacheHashKey {
@@ -1434,52 +1272,154 @@ fn xxh3_hash128(p: &[u8]) -> (u64, u64) {
     (xxh3_avalanche(hi), xxh3_avalanche(lo))
 }
 
-// Go: checker/checker.go:17313 keyBuilder
-#[derive(Clone, Debug, Default)]
+// Go: checker/checker.go:17438 keyBuilder
+// PORT: Go hashes with `xxh3.Hash128`. The crate has no xxh3 dependency and
+// the contract forbids new ones, so `xxh3_hash128` in this file is a hand
+// port of `zeebo/xxh3` `Hash128` (seed 0). A Go nil `overflowBuffer` is an
+// empty one.
+#[derive(Clone)]
 pub struct KeyBuilder {
-    pub h: KeyHasher,
+    pub inline_length: usize,
+    pub overflow_buffer: Vec<u8>,
+    pub inline_buffer: [u8; KEY_BUILDER_INLINE_BUFFER_LEN],
+}
+
+/// Go `len(keyBuilder.inlineBuffer)`.
+const KEY_BUILDER_INLINE_BUFFER_LEN: usize = 192;
+
+impl Default for KeyBuilder {
+    #[inline]
+    fn default() -> Self {
+        KeyBuilder {
+            inline_length: 0,
+            overflow_buffer: Vec::new(),
+            inline_buffer: [0; KEY_BUILDER_INLINE_BUFFER_LEN],
+        }
+    }
+}
+
+impl std::fmt::Debug for KeyBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyBuilder")
+            .field("overflow_buffer", &self.overflow_buffer)
+            .field("inline_buffer", &&self.inline_buffer[..self.inline_length])
+            .finish()
+    }
 }
 
 impl KeyBuilder {
-    // Go: checker/checker.go:17317 keyBuilder.hash
+    // Go: checker/checker.go:17444 keyBuilder.hash
     pub fn hash(&self) -> CacheHashKey {
-        self.h.sum128()
+        let (hi, lo) = if self.overflow_buffer.is_empty() {
+            xxh3_hash128(&self.inline_buffer[..self.inline_length])
+        } else {
+            let mut bytes = self.overflow_buffer.clone();
+            bytes.extend_from_slice(&self.inline_buffer[..self.inline_length]);
+            xxh3_hash128(&bytes)
+        };
+        CacheHashKey { hi, lo }
     }
 
-    // Go: checker/checker.go:17321 keyBuilder.writeByte
+    // Go: checker/checker.go:17451 keyBuilder.spill
+    // spill moves the buffered bytes onto the end of overflowBuffer, so the key's byte
+    // stream stays overflowBuffer followed by inlineBuffer.
+    #[cold]
+    #[inline(never)]
+    fn spill(&mut self) {
+        self.overflow_buffer
+            .extend_from_slice(&self.inline_buffer[..self.inline_length]);
+        self.inline_length = 0;
+    }
+
+    // Go: checker/checker.go:17458 keyBuilder.writeByte
+    #[inline]
     pub fn write_byte(&mut self, c: u8) {
-        self.h.write_byte(c);
+        if self.inline_length == self.inline_buffer.len() {
+            self.spill();
+        }
+        self.inline_buffer[self.inline_length] = c;
+        self.inline_length += 1;
     }
 
-    // Go: checker/checker.go:17325 keyBuilder.writeString
+    // Go: checker/checker.go:17466 keyBuilder.writeString
     pub fn write_string(&mut self, s: &str) {
-        self.h.write(s.as_bytes());
+        if self.inline_length + s.len() > self.inline_buffer.len() {
+            self.spill();
+            if s.len() > self.inline_buffer.len() {
+                self.overflow_buffer.extend_from_slice(s.as_bytes());
+                return;
+            }
+        }
+        self.inline_buffer[self.inline_length..self.inline_length + s.len()]
+            .copy_from_slice(s.as_bytes());
+        self.inline_length += s.len();
     }
 
-    // Go: checker/checker.go:17329 keyBuilder.writeInt
+    // Go: checker/checker.go:17477 keyBuilder.writeUint32
+    #[inline]
+    pub fn write_uint32(&mut self, v: u32) {
+        if self.inline_length + 4 > self.inline_buffer.len() {
+            self.spill();
+        }
+        self.inline_buffer[self.inline_length..self.inline_length + 4]
+            .copy_from_slice(&v.to_le_bytes());
+        self.inline_length += 4;
+    }
+
+    // Go: checker/checker.go:17485 keyBuilder.writeUint64
+    #[inline]
+    pub fn write_uint64(&mut self, v: u64) {
+        if self.inline_length + 8 > self.inline_buffer.len() {
+            self.spill();
+        }
+        self.inline_buffer[self.inline_length..self.inline_length + 8]
+            .copy_from_slice(&v.to_le_bytes());
+        self.inline_length += 8;
+    }
+
+    // Go: checker/checker.go:17493 keyBuilder.writeInt
     pub fn write_int(&mut self, value: i32) {
-        hash_write64(&mut self.h, value as i64 as u64);
+        self.write_uint64(value as i64 as u64);
     }
 
-    // Go: checker/checker.go:17333 keyBuilder.writeSymbol
+    // Go: checker/checker.go:17497 keyBuilder.writeSymbol
     // PORT: `ast.GetSymbolId` takes the symbol arena per the contract.
     pub fn write_symbol(&mut self, symbols: &SymbolArena, s: SymbolId) {
-        hash_write64(&mut self.h, get_symbol_id(symbols, s));
+        self.write_uint64(get_symbol_id(symbols, s));
     }
 
-    // Go: checker/checker.go:17337 keyBuilder.writeType
+    // Go: checker/checker.go:17501 keyBuilder.writeType
     // PORT: Go writes `t.id`; the handle value is the type id.
     #[inline]
     pub fn write_type(&mut self, t: TypeId) {
-        hash_write32(&mut self.h, t.0);
+        self.write_uint32(t.0);
     }
 
-    // Go: checker/checker.go:17341 keyBuilder.writeTypes
-    // PERF: `write_type_list` writes the same bytes as `write_int(len)` and
-    // then `write_type` for each type, with one room test for the list.
+    // Go: checker/checker.go:17505 keyBuilder.writeTypes
+    // PERF: when the whole list fits in the inline buffer, it is written with
+    // one room test. The bytes are the same as `write_int(len)` and then
+    // `write_type` for each type.
     #[inline]
     pub fn write_types(&mut self, types: &[TypeId]) {
-        self.h.write_type_list(types);
+        let len = self.inline_length;
+        let size = 8 + 4 * types.len();
+        let room = self
+            .inline_buffer
+            .get_mut(len..)
+            .and_then(|rest| rest.get_mut(..size));
+        let Some(dst) = room else {
+            self.write_int(types.len() as i32);
+            for &t in types {
+                self.write_type(t);
+            }
+            return;
+        };
+        let (head, tail) = dst.split_at_mut(8);
+        head.copy_from_slice(&(types.len() as i32 as i64 as u64).to_le_bytes());
+        for (d, &t) in tail.chunks_exact_mut(4).zip(types) {
+            d.copy_from_slice(&t.0.to_le_bytes());
+        }
+        self.inline_length = len + size;
     }
 
     // Go: checker/checker.go:17348 keyBuilder.writeAlias
@@ -1578,7 +1518,7 @@ impl KeyBuilder {
     // Go: checker/checker.go:17393 keyBuilder.writeNodeId
     // PORT: Go `ast.NodeId` is a `uint64` (`get_node_id` returns `u64`).
     pub fn write_node_id(&mut self, id: u64) {
-        hash_write64(&mut self.h, id);
+        self.write_uint64(id);
     }
 
     // Go: checker/checker.go:17397 keyBuilder.writeNode
@@ -1612,8 +1552,8 @@ fn alias_key_len(alias: Option<(SymbolId, &[TypeId])>) -> usize {
 
 /// PERF: a cache key built in a 64-byte stack array, for the hot
 /// `getTypeInstantiationKey`, `getConditionalTypeKey` and
-/// `getIntersectionKey`. A `KeyBuilder` zero-fills 256 bytes and owns a
-/// `spill` vector, and its type list copy loop becomes a `memcpy` call.
+/// `getIntersectionKey`. A `KeyBuilder` zero-fills 192 bytes and owns an
+/// overflow vector, and its type list copy loop becomes a `memcpy` call.
 /// Here the fill is 64 bytes (safe code must initialize the array; this is
 /// a few vector stores and no call), and lists of up to 4 types are
 /// fixed-size stores. The caller tests the room for the whole key once and
@@ -1900,7 +1840,7 @@ pub fn get_indexed_access_key(
     let mut b = KeyBuilder::default();
     b.write_type(object_type);
     b.write_type(index_type);
-    hash_write32(&mut b.h, access_flags.0);
+    b.write_uint32(access_flags.0);
     b.write_alias(symbols, alias);
     b.hash()
 }
@@ -2072,7 +2012,7 @@ impl Checker {
             b.write_byte(b'g');
             let constrained =
                 b.write_generic_type_references(self, source, target, ignore_constraints);
-            hash_write32(&mut b.h, intersection_state.0);
+            b.write_uint32(intersection_state.0);
             return (b.hash(), constrained);
         }
         // PERF: the plain key is 13 bytes ('s', source, target, intersection
@@ -2089,7 +2029,7 @@ impl Checker {
             b.write_byte(b's');
             b.write_type(source);
             b.write_type(target);
-            hash_write32(&mut b.h, intersection_state.0);
+            b.write_uint32(intersection_state.0);
             b.hash()
         });
         (key, false)
@@ -2297,9 +2237,11 @@ mod key_hash_tests {
         }
     }
 
-    /// `KeyHasher` hashes the bytes it was given, in order, for keys that
+    /// `KeyBuilder` hashes the bytes it was given, in order, for keys that
     /// stay inline and keys that spill past the inline buffer. The short
     /// `get_type_list_key` paths hash the same bytes as the builder.
+    /// The test keeps its accepted name from before tsgo#4784 renamed
+    /// `KeyHasher` to `KeyBuilder`.
     #[test]
     fn key_hasher_and_short_keys_match_bytes() {
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
@@ -2310,34 +2252,42 @@ mod key_hash_tests {
             x
         };
         for _ in 0..2_000 {
-            let mut h = KeyHasher::default();
+            let mut b = KeyBuilder::default();
             let mut want = Vec::new();
             let writes = next() % 200;
             for _ in 0..writes {
                 let v = next();
                 match v % 5 {
                     0 => {
-                        h.write_byte(v as u8);
+                        b.write_byte(v as u8);
                         want.push(v as u8);
                     }
                     1 => {
-                        h.write_u32(v as u32);
+                        b.write_uint32(v as u32);
                         want.extend((v as u32).to_le_bytes());
                     }
                     2 => {
-                        h.write_u64(v);
+                        b.write_uint64(v);
                         want.extend(v.to_le_bytes());
                     }
                     3 => {
-                        let bytes = v.to_le_bytes();
-                        let s = &bytes[..(v >> 60) as usize % 9];
-                        h.write(s);
-                        want.extend_from_slice(s);
+                        // Short strings, and now and then one longer than the
+                        // inline buffer (Go writes it straight to the overflow).
+                        let n = if (v >> 52) % 16 == 0 {
+                            200 + (v >> 40) as usize % 100
+                        } else {
+                            (v >> 60) as usize % 9
+                        };
+                        let s: String = (0..n)
+                            .map(|i| (b'a' + ((v >> (i % 60)) % 26) as u8) as char)
+                            .collect();
+                        b.write_string(&s);
+                        want.extend_from_slice(s.as_bytes());
                     }
                     _ => {
                         let types: Vec<TypeId> =
                             (0..(v >> 56) % 80).map(|_| TypeId(next() as u32)).collect();
-                        h.write_type_list(&types);
+                        b.write_types(&types);
                         want.extend((types.len() as u64).to_le_bytes());
                         for t in &types {
                             want.extend(t.0.to_le_bytes());
@@ -2346,7 +2296,7 @@ mod key_hash_tests {
                 }
             }
             let (hi, lo) = xxh3_hash128(&want);
-            assert_eq!(h.sum128(), CacheHashKey { hi, lo }, "len {}", want.len());
+            assert_eq!(b.hash(), CacheHashKey { hi, lo }, "len {}", want.len());
         }
         for _ in 0..100_000 {
             let (t0, t1) = (TypeId(next() as u32), TypeId(next() as u32));

@@ -4,8 +4,10 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::tspath;
 use ts_goport::frontend::vfs::{Replacements, wrapvfs_wrap};
+use ts_goport::locale;
 use ts_goport::ls::lsutil;
 use ts_goport::lsp::lsproto;
 use ts_goport::options::Tristate;
@@ -132,6 +134,30 @@ child_test! {
 
         let program = program(&session, &p1_uri("index.js"));
         assert!(has_file(&program, &p1("index.js")));
+    }
+}
+
+child_test! {
+    // Go: session_test.go:116 TestSession/DidOpenFile/inferred project extensionless file
+    fn did_open_file_inferred_project_extensionless_file() {
+        let script_files = files(&[("/home/projects/TS/p1/script", "const x = 1;")]);
+        let (session, _) = projecttestutil::setup(script_files);
+
+        open_kind(
+            &session,
+            &p1_uri("script"),
+            "const x = 1;",
+            lsproto::LanguageKind("plaintext".into()),
+        );
+
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.project_collection.projects().len(), 1);
+        assert!(snapshot.project_collection.inferred_project().is_some());
+
+        let program = program(&session, &p1_uri("script"));
+        let file = program.get_source_file(&p1("script"));
+        assert!(file.is_some());
+        assert_eq!(file.unwrap().script_kind, ScriptKind::TS);
     }
 }
 
@@ -1231,6 +1257,107 @@ child_test! {
     }
 }
 
+child_test! {
+    // Go: session_test.go:1405 TestSession/DidChangeWatchedFiles/skips irrelevant extensions
+    fn did_change_watched_files_skips_irrelevant_extensions() {
+        let files = files(&[
+            (
+                "/home/projects/TS/p1/tsconfig.json",
+                r#"{
+					"compilerOptions": {},
+					"include": ["src"]
+				}"#,
+            ),
+            ("/home/projects/TS/p1/src/index.ts", "export const x = 1;"),
+        ]);
+        let (session, utils) = projecttestutil::setup(files);
+
+        open(&session, &p1_uri("src/index.ts"), "export const x = 1;");
+        session.wait_for_background_tasks();
+
+        let mut baseline_refresh_count = utils.client().refresh_diagnostics_calls();
+
+        // Scenario A: irrelevant .svg
+        watch(&session, &[(CREATED, &p1_uri("icon.svg"))]);
+        session.wait_for_background_tasks();
+        let mut refresh_count = utils.client().refresh_diagnostics_calls();
+        assert_eq!(
+            refresh_count, baseline_refresh_count,
+            "irrelevant .svg should not trigger refresh"
+        );
+
+        // Scenario B: relevant .ts
+        watch(&session, &[(CREATED, &p1_uri("src/new.ts"))]);
+        session.wait_for_background_tasks();
+        refresh_count = utils.client().refresh_diagnostics_calls();
+        assert!(
+            refresh_count > baseline_refresh_count,
+            "relevant .ts should trigger refresh"
+        );
+        baseline_refresh_count = refresh_count;
+
+        // Scenario C: tsconfig.json
+        watch(&session, &[(CHANGED, &p1_uri("tsconfig.json"))]);
+        session.wait_for_background_tasks();
+        refresh_count = utils.client().refresh_diagnostics_calls();
+        assert!(
+            refresh_count > baseline_refresh_count,
+            "tsconfig.json should trigger refresh"
+        );
+        baseline_refresh_count = refresh_count;
+
+        // Scenario D: directory creation (no extension)
+        utils
+            .fs_from_file_map()
+            .mkdir_all(
+                "home/projects/TS/p1/node_modules/@types",
+                ts_goport::frontend::vfs::FileMode::PERM,
+            )
+            .unwrap();
+        watch(&session, &[(CREATED, &p1_uri("node_modules/@types"))]);
+        session.wait_for_background_tasks();
+        refresh_count = utils.client().refresh_diagnostics_calls();
+        assert!(
+            refresh_count > baseline_refresh_count,
+            "directory change should trigger refresh"
+        );
+        baseline_refresh_count = refresh_count;
+
+        // Scenario E: mixed batch
+        watch(
+            &session,
+            &[
+                (CREATED, &p1_uri("icon.png")),
+                (CHANGED, &p1_uri("src/index.ts")),
+            ],
+        );
+        session.wait_for_background_tasks();
+        refresh_count = utils.client().refresh_diagnostics_calls();
+        assert!(
+            refresh_count > baseline_refresh_count,
+            "mixed batch with relevant file should trigger refresh"
+        );
+        baseline_refresh_count = refresh_count;
+
+        // Scenario F: package install noise
+        watch(
+            &session,
+            &[
+                (CREATED, &p1_uri("node_modules/pkg/LICENSE")),
+                (CREATED, &p1_uri("README.md")),
+                (CREATED, &p1_uri("LICENSE.txt")),
+                (CREATED, &p1_uri("style.css")),
+            ],
+        );
+        session.wait_for_background_tasks();
+        refresh_count = utils.client().refresh_diagnostics_calls();
+        assert_eq!(
+            refresh_count, baseline_refresh_count,
+            "package install noise should not trigger refresh"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Preferences
 // ---------------------------------------------------------------------------
@@ -1267,6 +1394,81 @@ child_test! {
             1,
             "expected one RefreshInlayHints call after inlay hints preference change"
         );
+    }
+}
+
+child_test! {
+    // Go: session_test.go:1506 TestSession/sets locale when configured
+    fn sets_locale_when_configured() {
+        let (session, utils) = projecttestutil::setup(files(&[]));
+        let mut prefs = lsutil::new_default_user_preferences();
+        prefs.locale = "fr".to_string();
+
+        session.configure(prefs);
+
+        let set_locale_calls = utils.client().set_locale_calls();
+        assert_eq!(set_locale_calls.len(), 1);
+        assert_eq!(set_locale_calls[0], "fr");
+    }
+}
+
+child_test! {
+    // Go: session_test.go:1519 TestSession/locale change invalidates programs (tsgo#4712)
+    fn locale_change_invalidates_programs() {
+        let (session, _utils) = projecttestutil::setup(files(&[
+            ("/src/tsconfig.json", "{}"),
+            ("/src/index.ts", "export const x = 1;"),
+        ]));
+        let uri = "file:///src/index.ts";
+        let config_path = "/src/tsconfig.json";
+        open(&session, uri, "export const x = 1;");
+        let _ = language_service(&session, uri);
+        let program_of = |session: &Rc<Session>| {
+            configured_project(session, config_path)
+                .expect("configured project")
+                .borrow()
+                .program
+                .clone()
+                .expect("program")
+        };
+        let initial_program = program_of(&session);
+
+        let mut preferences = session.config();
+        preferences.code_lens.references_code_lens_enabled = Tristate::True;
+        session.configure(preferences.clone());
+        let _ = language_service(&session, uri);
+        let program_after_code_lens_change = program_of(&session);
+        assert!(Rc::ptr_eq(&program_after_code_lens_change, &initial_program));
+
+        preferences.locale = "fr".to_string();
+        session.configure(preferences);
+        let _ = language_service(&session, uri);
+        let program_after_locale_change = program_of(&session);
+        assert!(!Rc::ptr_eq(&program_after_locale_change, &initial_program));
+        // Go: defer session.Close()
+        session.close();
+    }
+}
+
+child_test! {
+    // Go: session_test.go:1551 TestSession/adds locale to background contexts
+    fn adds_locale_to_background_contexts() {
+        let (session, utils) = projecttestutil::setup(files(&[]));
+        let (fr, ok) = locale::parse("fr");
+        assert!(ok);
+        let get_locale_fr = fr.clone();
+        *utils.client().get_locale_func.borrow_mut() = Some(Box::new(move || get_locale_fr.clone()));
+        let code_lens_fr = fr.clone();
+        *utils.client().refresh_code_lens_func.borrow_mut() = Some(Box::new(move |ctx: &ts_goport::gostd::Context| {
+            assert_eq!(locale::from_context(ctx), code_lens_fr);
+            Ok(())
+        }));
+        let mut prefs = lsutil::new_default_user_preferences();
+        prefs.code_lens.references_code_lens_enabled = Tristate::True;
+
+        session.configure(prefs);
+
+        assert_eq!(utils.client().refresh_code_lens_calls(), 1);
     }
 }
 
@@ -1515,7 +1717,10 @@ child_test! {
             client: None,
             logger: None,
             npm_executor: None,
+            spawner: None,
+            content_mapper_logger: None,
             parse_cache: None,
+            content_mapped_parse_cache: None,
         });
 
         open(&session, INDEX_URI, "");

@@ -28,6 +28,10 @@ impl Client for NoopClient {
     fn unwatch_files(&self, _: &Context, _: WatcherID) -> Result<(), GoError> {
         Ok(())
     }
+    // Go: extendedconfigcache_test.go:28 noopClient.RegisterContentMapperExtensions (tsgo#4712)
+    fn register_content_mapper_extensions(&self, _: &Context, _: &[String]) -> Result<(), GoError> {
+        Ok(())
+    }
     fn refresh_diagnostics(&self, _: &Context) -> Result<(), GoError> {
         Ok(())
     }
@@ -52,6 +56,12 @@ impl Client for NoopClient {
     fn is_active(&self) -> bool {
         true
     }
+    // Go: extendedconfigcache_test.go:52 noopClient.GetLocale
+    fn get_locale(&self) -> ts_goport::locale::Locale {
+        ts_goport::locale::DEFAULT
+    }
+    // Go: extendedconfigcache_test.go:54 noopClient.SetLocale
+    fn set_locale(&self, _: &str) {}
 }
 
 // Go: extendedconfigcache_test.go:57 setup
@@ -70,7 +80,10 @@ fn setup(files: FileMap) -> Rc<Session> {
         client: Some(client),
         logger: Some(logger),
         npm_executor: None,
+        spawner: None,
+        content_mapper_logger: None,
         parse_cache: None,
+        content_mapped_parse_cache: None,
     })
 }
 

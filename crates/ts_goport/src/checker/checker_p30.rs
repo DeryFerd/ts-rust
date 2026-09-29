@@ -548,11 +548,12 @@ impl Checker {
             .collect();
         let source_value = string_literal_value(self, source);
         let this: &Checker = self;
-        get_spelling_suggestion(
+        get_spelling_suggestion_with_max_candidate_count(
             &source_value,
             candidates,
             |t: &TypeId| string_literal_value(this, *t),
             |a: &TypeId, b: &TypeId| this.compare_types(*a, *b),
+            1000,
         )
     }
 }
@@ -932,27 +933,27 @@ impl Checker {
                 let error_node = self.get_constraint_declaration(t);
                 if error_node.is_some() {
                     let type_string = self.type_to_string_exported(t);
-                    let count_before = self.diagnostics.count;
-                    let diagnostic = self.error(
+                    let current_node = self.current_node;
+                    let add_related = current_node.is_some()
+                        && !is_node_descendant_of(error_node, current_node)
+                        && !is_node_descendant_of(current_node, error_node);
+                    // Inlined `c.error`, so the related info goes on the stored
+                    // diagnostic (#4825: it can be an equal one added before).
+                    // When it is discarded, Go changes a diagnostic that is not
+                    // stored, so nothing is done.
+                    let diagnostic = new_diagnostic_for_node(
                         error_node,
                         diag::Type_parameter_0_has_a_circular_constraint,
                         args![type_string],
                     );
-                    let current_node = self.current_node;
-                    if current_node.is_some()
-                        && !is_node_descendant_of(error_node, current_node)
-                        && !is_node_descendant_of(current_node, error_node)
+                    if let Some(diagnostic) = self.add_diagnostic(diagnostic)
+                        && add_related
                     {
-                        let related = new_diagnostic_for_node(
+                        diagnostic.add_related_info(Some(new_diagnostic_for_node(
                             current_node,
                             diag::Circularity_originates_in_type_at_this_location,
                             args![],
-                        );
-                        self.p30_add_related_info_to_stored_error(
-                            &diagnostic,
-                            count_before,
-                            related,
-                        );
+                        )));
                     }
                 }
             }
@@ -966,35 +967,6 @@ impl Checker {
             constrained.resolved_base_constraint = constraint;
         }
         constraint
-    }
-
-    // PORT: Go calls `AddRelatedInfo` on the `*ast.Diagnostic` that `c.error` already
-    // added to `c.diagnostics`. Diagnostics are owned values here (`error` adds a
-    // clone), so this finds the stored copy (the last diagnostic added for the same
-    // file, since nothing is added in between) and appends to it. When `addDiagnostic`
-    // discarded the diagnostic (maximum serialization level), the count did not change
-    // and Go's mutation is unobservable, so nothing is done.
-    fn p30_add_related_info_to_stored_error(
-        &mut self,
-        reported: &Diagnostic,
-        count_before: i32,
-        related: Diagnostic,
-    ) {
-        if self.diagnostics.count == count_before {
-            return;
-        }
-        let stored = if reported.file().is_some() {
-            let file_name = source_file_file_name(reported.file()).to_string();
-            self.diagnostics
-                .file_diagnostics
-                .get_mut(&file_name)
-                .and_then(|list| list.last_mut())
-        } else {
-            self.diagnostics.non_file_diagnostics.last_mut()
-        };
-        if let Some(stored) = stored {
-            stored.add_related_info(Some(related));
-        }
     }
 
     // Go: checker/checker.go:27350 computeBaseConstraint
@@ -1487,6 +1459,64 @@ impl Checker {
                 .intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION);
         }
         false
+    }
+
+    // Return true the given type is a primitive union type where no two literal type constituents are
+    // comparable. Specifically, that means (a) the union doesn't contain literals from different enum
+    // types, and (b) the union doesn't contain both enum literals and string or number literals.
+    // Go: checker/checker.go:27821 isUniformUnionType
+    pub fn is_uniform_union_type(&mut self, t: TypeId) -> bool {
+        if self
+            .ty(t)
+            .object_flags
+            .intersects(ObjectFlags::PRIMITIVE_UNION)
+        {
+            if !self
+                .ty(t)
+                .object_flags
+                .intersects(ObjectFlags::IS_UNIFORM_ENUM_COMPUTED)
+            {
+                let types = self.ty(t).types_list();
+                let uniform = if self.compute_is_uniform_union_type(&types) {
+                    ObjectFlags::IS_UNIFORM_ENUM
+                } else {
+                    ObjectFlags::NONE
+                };
+                self.ty_mut(t).object_flags |= ObjectFlags::IS_UNIFORM_ENUM_COMPUTED | uniform;
+            }
+            return self
+                .ty(t)
+                .object_flags
+                .intersects(ObjectFlags::IS_UNIFORM_ENUM);
+        }
+        false
+    }
+
+    // Go: checker/checker.go:27831 computeIsUniformUnionType
+    pub fn compute_is_uniform_union_type(&mut self, types: &[TypeId]) -> bool {
+        let mut enum_symbol = SymbolId::NIL;
+        let mut has_string_or_number_literal = false;
+        for &t in types {
+            let flags = self.ty(t).flags;
+            if flags.intersects(TypeFlags::ENUM_LIKE) {
+                if has_string_or_number_literal {
+                    return false;
+                }
+                let symbol = self.ty(t).symbol;
+                let parent = self.get_parent_of_symbol(symbol);
+                if enum_symbol.is_nil() {
+                    enum_symbol = parent;
+                } else if enum_symbol != parent {
+                    return false;
+                }
+            } else if flags.intersects(TypeFlags::STRING_OR_NUMBER_LITERAL) {
+                if enum_symbol.is_some() {
+                    return false;
+                }
+                has_string_or_number_literal = true;
+            }
+        }
+        true
     }
 
     // Go: checker/checker.go:27684 containsUndefinedType

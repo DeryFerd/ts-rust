@@ -1,16 +1,16 @@
-//! Port of internal/api/protocol.go.
+//! Port of internal/ipc/protocol.go (internal/api/protocol.go before tsgo#4712).
 
-use crate::api::prelude::*;
+use crate::ipc::prelude::*;
 
 use crate::frontend::json_ext::AnyValue;
 use crate::gostd::GoError;
 use crate::jsonrpc;
 
-// Go: protocol.go:8 Message
+// Go: ipc/protocol.go:8 Message
 // Message is an alias for jsonrpc.Message for convenience.
 pub type Message = jsonrpc::Message;
 
-// Go: protocol.go:11 Protocol
+// Go: ipc/protocol.go:11 Protocol
 // Protocol defines the interface for reading and writing API messages.
 // PORT: Go `*jsonrpc.ID` parameters are `Option<&jsonrpc::ID>` (nil is
 // `None`); Go `any` params and results are `Option<Box<dyn AnyValue>>`

@@ -82,8 +82,14 @@ fn alias_resolver_with_type_error() -> (Rc<AliasResolver>, Node) {
     bind_alias_resolver_source_file("/", root);
 
     let resolution_host: Rc<dyn module::ResolutionHost> = host.clone();
-    let resolver =
-        module::new_resolver(resolution_host, Rc::new(CompilerOptions::default()), "", "");
+    // Go: module.NewResolver(host, core.EmptyCompilerOptions, "", "", nil)
+    let resolver = module::new_resolver(
+        resolution_host,
+        Rc::new(CompilerOptions::default()),
+        "",
+        "",
+        Vec::new(),
+    );
     let r = new_alias_resolver(
         vec![root],
         FxHashMap::default(),

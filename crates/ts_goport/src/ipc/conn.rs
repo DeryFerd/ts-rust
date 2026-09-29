@@ -1,24 +1,24 @@
-//! Port of internal/api/conn.go.
+//! Port of internal/ipc/conn.go (internal/api/conn.go before tsgo#4712).
 //!
 //! PORT: the API session and project state live on one thread, so the
 //! handler and the connections are `Rc` values and their methods take
 //! `&self`. Go `json.Value` is `JsonValue`; Go `any` params and results are
 //! `Option<Box<dyn AnyValue>>` (nil is `None`).
 
-use crate::api::prelude::*;
+use crate::ipc::prelude::*;
 
 use crate::frontend::json::{UnmarshalerFrom, json_unmarshal};
 use crate::frontend::json_ext::{AnyValue, JsonValue};
 use crate::gostd::{Context, GoError, errors};
 use std::sync::LazyLock;
 
-// Go: conn.go:10
+// Go: ipc/conn.go:10
 pub static ERR_CONN_CLOSED: LazyLock<GoError> =
-    LazyLock::new(|| errors::new("api: connection closed"));
+    LazyLock::new(|| errors::new("ipc: connection closed"));
 pub static ERR_REQUEST_TIMEOUT: LazyLock<GoError> =
-    LazyLock::new(|| errors::new("api: request timeout"));
+    LazyLock::new(|| errors::new("ipc: request timeout"));
 
-// Go: conn.go:16 Handler
+// Go: ipc/conn.go:16 Handler
 // Handler processes incoming API requests and notifications.
 pub trait Handler {
     // HandleRequest handles an incoming request and returns a result or error.
@@ -37,7 +37,7 @@ pub trait Handler {
     ) -> Result<(), GoError>;
 }
 
-// Go: conn.go:24 Conn
+// Go: ipc/conn.go:24 Conn
 // Conn represents a bidirectional connection for API communication.
 pub trait Conn {
     // Run starts processing messages on the connection.
@@ -61,7 +61,7 @@ pub trait Conn {
     ) -> Result<(), GoError>;
 }
 
-// Go: conn.go:37 UnmarshalParams
+// Go: ipc/conn.go:37 UnmarshalParams
 // UnmarshalParams is a helper to unmarshal params into a typed struct.
 // PORT: Go returns `*T`; nil is `None`.
 pub fn unmarshal_params<T: UnmarshalerFrom + Default>(

@@ -1,5 +1,6 @@
 pub mod baseline;
 pub mod child;
+pub mod contentmappertest;
 pub mod fsbaselineutil;
 pub mod harnessutil;
 pub mod iovfs;

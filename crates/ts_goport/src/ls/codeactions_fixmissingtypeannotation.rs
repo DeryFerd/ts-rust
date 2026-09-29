@@ -31,7 +31,7 @@ static ISOLATED_DECLARATIONS_FIX_ERROR_CODES: LazyLock<Vec<i32>> = LazyLock::new
         diag::Parameter_must_have_an_explicit_type_annotation_with_isolatedDeclarations.code() as i32,
         diag::Property_must_have_an_explicit_type_annotation_with_isolatedDeclarations.code() as i32,
         diag::Expression_type_can_t_be_inferred_with_isolatedDeclarations.code() as i32,
-        diag::Binding_elements_can_t_be_exported_directly_with_isolatedDeclarations.code() as i32,
+        diag::Binding_elements_with_initializers_can_t_be_exported_directly_with_isolatedDeclarations.code() as i32,
         diag::Computed_property_names_on_class_or_object_literals_cannot_be_inferred_with_isolatedDeclarations.code() as i32,
         diag::Computed_properties_must_be_number_or_string_literals_variables_or_dotted_expressions_with_isolatedDeclarations.code() as i32,
         diag::Enum_member_initializers_must_be_computable_without_references_to_external_symbols_with_isolatedDeclarations.code() as i32,
@@ -186,7 +186,7 @@ fn get_all_isolated_declarations_code_actions(
     };
 
     for diag in all_diags {
-        if contains_error_code(&ISOLATED_DECLARATIONS_FIX_ERROR_CODES, diag.code) {
+        if is_fixable_diagnostic(&diag, &ISOLATED_DECLARATIONS_FIX_ERROR_CODES) {
             let span = TextRange::new(diag.pos, diag.end);
             fixer.add_type_annotation(span);
         }
@@ -197,10 +197,10 @@ fn get_all_isolated_declarations_code_actions(
         fixer.add_symbol_to_existing_import(sym);
     }
 
-    let mut changes = change_tracker.get_changes();
+    let (mut changes, _) = change_tracker.get_changes();
     // PORT: Go indexes the map; a missing file gives a nil slice.
     let file_changes = changes
-        .shift_remove(source_file_file_name(fix_context.source_file))
+        .shift_remove(source_file_original_file_name(fix_context.source_file))
         .unwrap_or_default();
     if file_changes.is_empty() {
         return Ok(None);
@@ -258,10 +258,10 @@ fn try_code_action(
         fixer.add_symbol_to_existing_import(sym);
     }
 
-    let mut changes = change_tracker.get_changes();
+    let (mut changes, _) = change_tracker.get_changes();
     // PORT: Go indexes the map; a missing file gives a nil slice.
     let mut file_changes = changes
-        .shift_remove(source_file_file_name(fix_context.source_file))
+        .shift_remove(source_file_original_file_name(fix_context.source_file))
         .unwrap_or_default();
 
     // Add import edits if import adder has fixes

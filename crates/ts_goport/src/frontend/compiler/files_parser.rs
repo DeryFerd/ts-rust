@@ -21,6 +21,9 @@ pub struct ParseTask {
     pub loaded: bool,
     pub started_sub_tasks: bool,
     pub is_for_automatic_type_directive: bool,
+    // tsgo#4712
+    pub is_content_mapper_supplemental: bool,
+    pub failed_lookup: bool,
     pub include_reason: Option<Rc<FileIncludeReason>>,
     pub package_id: PackageId,
 
@@ -62,6 +65,11 @@ impl ParseTask {
             self.load_automatic_type_directives(loader);
             return;
         }
+        if self.failed_lookup {
+            // The root file name did not resolve to a supported extension; the task
+            // exists only to carry its processing diagnostic, so nothing is parsed.
+            return;
+        }
         let _trace = crate::tracing::get().map(|tr| {
             tr.push(
                 crate::tracing::Phase::Program,
@@ -79,7 +87,7 @@ impl ParseTask {
             return;
         }
 
-        if has_extension(&self.normalized_file_path) {
+        if !self.is_content_mapper_supplemental && has_extension(&self.normalized_file_path) {
             let compiler_options = loader.opts.config.compiler_options();
             let allow_non_ts_extensions = compiler_options.allow_non_ts_extensions.is_true();
             if !allow_non_ts_extensions {
@@ -124,11 +132,23 @@ impl ParseTask {
             self.metadata = loader.load_source_file_meta_data(&self.normalized_file_path);
         }
 
-        let Some(file) = loader.parse_source_file(self) else {
+        // tsgo#4712: a content mapper supplemental task comes with its file.
+        let file = match self.file.clone() {
+            Some(file) => Some(file),
+            None => loader.parse_source_file(self),
+        };
+        let Some(file) = file else {
             return;
         };
 
         self.file = Some(file.clone());
+        let virtual_file_name = file.virtual_file_name();
+        if !virtual_file_name.is_empty() {
+            self.metadata.implied_node_format = get_implied_node_format_for_file(
+                virtual_file_name,
+                &self.metadata.package_json_type,
+            );
+        }
         self.sub_tasks = Vec::with_capacity(
             file.referenced_files.len() + file.imports.len() + file.module_augmentations.len(),
         );
@@ -184,6 +204,19 @@ impl ParseTask {
         }
 
         loader.resolve_imports_and_module_augmentations(self);
+        // tsgo#4712
+        for supplemental in file.supplemental_source_files() {
+            self.sub_tasks.push(Rc::new(RefCell::new(ParseTask {
+                normalized_file_path: supplemental.file_name().to_string(),
+                file: Some(supplemental.clone()),
+                is_content_mapper_supplemental: true,
+                include_reason: Some(new_file_include_reason(
+                    FileIncludeKind::CONTENT_MAPPER_SUPPLEMENTAL,
+                    FileIncludeData::Path(self.path.clone()),
+                )),
+                ..Default::default()
+            })));
+        }
     }
 
     // Go: filesparser.go:161 (*parseTask).redirect
@@ -469,9 +502,22 @@ impl FilesParser {
         } else {
             depth
         };
+        // tsgo#4712: the loader never parses a content mapper supplemental
+        // file (it comes with its task) or a content-mapped file (the host
+        // transforms it on the loading thread).
         if task.is_for_automatic_type_directive
             || task.loaded
+            || task.is_content_mapper_supplemental
             || task.elide_on_depth && current_depth > self.max_depth
+            || !loader.content_mapper_extensions.is_empty()
+                && file_extension_is_one_of(
+                    &task.normalized_file_path,
+                    &loader
+                        .content_mapper_extensions
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                )
         {
             return None;
         }
@@ -781,8 +827,14 @@ impl FilesParser {
                             {
                                 self.duplicate_source_files.push(DuplicateSourceFile {
                                     parse_options: file.parse_options().clone(),
+                                    content_mapper_parse_options: file
+                                        .content_mapper_parse_options()
+                                        .clone(),
                                     text: file.text,
                                     script_kind: file.script_kind,
+                                    content_mapper: file.content_mapper().to_string(),
+                                    is_content_mapper_failure_stub: file
+                                        .is_content_mapper_failure_stub(),
                                 });
                             }
                         }
@@ -869,8 +921,14 @@ impl FilesParser {
                                     // the host, so snapshot disposal must release that extra owner.
                                     self.duplicate_source_files.push(DuplicateSourceFile {
                                         parse_options: file.parse_options().clone(),
+                                        content_mapper_parse_options: file
+                                            .content_mapper_parse_options()
+                                            .clone(),
                                         text: file.text,
                                         script_kind: file.script_kind,
+                                        content_mapper: file.content_mapper().to_string(),
+                                        is_content_mapper_failure_stub: file
+                                            .is_content_mapper_failure_stub(),
                                     });
                                 }
                                 self.redirect_targets_map
@@ -1088,6 +1146,8 @@ impl FilesParser {
                 .map(Rc::new),
             redirect_targets_map: redirect_targets_map.map(Rc::new),
             redirect_files_by_path: redirect_files_by_path.map(Rc::new),
+            // tsgo#4712
+            content_mapper_diagnostics: loader.content_mapper_diagnostics.borrow().clone(),
         }
     }
 
@@ -1376,6 +1436,9 @@ struct WorkerResolveConfig {
     options: CompilerOptions,
     typings_location: String,
     project_name: String,
+    /// Go `opts.Config.ContentMapperExtensions()`, the resolver's extra
+    /// extensions (tsgo#4712).
+    extra_extensions: Vec<String>,
     /// The cache that the loader's resolver reads (`FileLoader::shared_resolution`).
     /// `None`: the worker answers are only hints for the parse queue.
     shared: Option<Arc<SharedResolutionCache>>,
@@ -1392,6 +1455,7 @@ impl WorkerResolveConfig {
             options: (**options).clone(),
             typings_location: loader.opts.typings_location.clone(),
             project_name: loader.opts.project_name.clone(),
+            extra_extensions: loader.content_mapper_extensions.clone(),
             shared: loader.shared_resolution.clone(),
         })
     }
@@ -2028,6 +2092,7 @@ impl WorkerResolver {
             options.clone(),
             &config.typings_location,
             &config.project_name,
+            config.extra_extensions.clone(),
         );
         resolver.caches.shared = config.shared.clone().map(|cache| SharedResolutionLink {
             cache,

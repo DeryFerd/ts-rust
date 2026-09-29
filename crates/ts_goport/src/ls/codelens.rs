@@ -3,6 +3,7 @@
 use crate::ls::prelude::*;
 
 use crate::frontend::json::{MarshalerTo, json_marshal, json_unmarshal};
+use crate::spanmap::Feature;
 
 impl LanguageService {
     // Go: ls/codelens.go:15 ProvideCodeLenses
@@ -66,25 +67,27 @@ impl CodeLensVisitor<'_> {
             if self.user_prefs.references_code_lens_enabled.is_true()
                 && is_valid_reference_lens_node(node, self.user_prefs)
             {
-                let lens = self.ls.new_code_lens_for_node(
+                if let Some(code_lens) = self.ls.new_code_lens_for_node(
                     self.document_uri,
                     self.file,
                     node,
                     lsproto::CodeLensKind::REFERENCES,
-                );
-                self.result.push(lens);
+                ) {
+                    self.result.push(code_lens);
+                }
             }
 
             if self.user_prefs.implementations_code_lens_enabled.is_true()
                 && is_valid_implementations_code_lens_node(node, self.user_prefs)
             {
-                let lens = self.ls.new_code_lens_for_node(
+                if let Some(code_lens) = self.ls.new_code_lens_for_node(
                     self.document_uri,
                     self.file,
                     node,
                     lsproto::CodeLensKind::IMPLEMENTATIONS,
-                );
-                self.result.push(lens);
+                ) {
+                    self.result.push(code_lens);
+                }
             }
         }
 
@@ -216,34 +219,38 @@ fn to_lsp_any<T: MarshalerTo + ?Sized>(value: &T) -> LspAny {
 }
 
 impl LanguageService {
-    // Go: ls/codelens.go:132 newCodeLensForNode
+    // Go: ls/codelens.go:137 newCodeLensForNode
+    // PORT: Go returns `*lsproto.CodeLens`; nil is `None`.
     pub fn new_code_lens_for_node(
         &self,
         file_uri: &lsproto::DocumentUri,
         file: Node,
         node: Node,
         kind: lsproto::CodeLensKind,
-    ) -> lsproto::CodeLens {
+    ) -> Option<lsproto::CodeLens> {
         let mut node_for_range = node;
         let node_name = node.name();
         if node_name.is_some() {
             node_for_range = node_name;
         }
         let pos = skip_trivia(source_file_text(file), node_for_range.pos());
+        let (lsp_range, fidelity) = self.converters.to_lsp_range_for_feature(
+            &file,
+            TextRange::new(pos, node.end()),
+            Feature::CODE_LENS,
+        );
+        if fidelity.is_none() {
+            return None;
+        }
 
-        lsproto::CodeLens {
-            range: lsproto::Range {
-                start: self.converters.position_to_line_and_character(&file, pos),
-                end: self
-                    .converters
-                    .position_to_line_and_character(&file, node.end()),
-            },
+        Some(lsproto::CodeLens {
+            range: lsp_range,
             data: Some(lsproto::CodeLensData {
                 kind,
                 uri: file_uri.clone(),
             }),
             ..Default::default()
-        }
+        })
     }
 }
 

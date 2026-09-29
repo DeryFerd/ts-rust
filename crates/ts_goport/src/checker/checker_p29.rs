@@ -562,31 +562,37 @@ impl Checker {
     // Go: checker/checker.go:26284 eachUnionContains
     pub fn each_union_contains(&self, union_types: &[TypeId], t: TypeId) -> bool {
         for &u in union_types {
-            let types = self.ty(u).types();
-            if !self.contains_type(types, t) {
-                if t == self.missing_type {
-                    return self.contains_type(types, self.undefined_type);
-                }
-                if t == self.undefined_type {
-                    return self.contains_type(types, self.missing_type);
-                }
-                let mut primitive = TypeId::NIL;
-                let tf = self.ty(t).flags;
-                if tf.intersects(TypeFlags::STRING_LITERAL) {
-                    primitive = self.string_type;
-                } else if tf.intersects(TypeFlags::ENUM | TypeFlags::NUMBER_LITERAL) {
-                    primitive = self.number_type;
-                } else if tf.intersects(TypeFlags::BIG_INT_LITERAL) {
-                    primitive = self.bigint_type;
-                } else if tf.intersects(TypeFlags::UNIQUE_ES_SYMBOL) {
-                    primitive = self.es_symbol_type;
-                }
-                if primitive.is_nil() || !self.contains_type(types, primitive) {
-                    return false;
-                }
+            if !self.union_contains_type(u, t, true /*matchSymbol*/) {
+                return false;
             }
         }
         true
+    }
+
+    // Go: checker/checker.go:26407 unionContainsType
+    pub fn union_contains_type(&self, union: TypeId, t: TypeId, match_symbol: bool) -> bool {
+        let types = self.ty(union).types();
+        if self.contains_type(types, t) {
+            return true;
+        }
+        if t == self.missing_type {
+            return self.contains_type(types, self.undefined_type);
+        }
+        if t == self.undefined_type {
+            return self.contains_type(types, self.missing_type);
+        }
+        let mut primitive = TypeId::NIL;
+        let tf = self.ty(t).flags;
+        if tf.intersects(TypeFlags::STRING_LITERAL) {
+            primitive = self.string_type;
+        } else if tf.intersects(TypeFlags::ENUM | TypeFlags::NUMBER_LITERAL) {
+            primitive = self.number_type;
+        } else if tf.intersects(TypeFlags::BIG_INT_LITERAL) {
+            primitive = self.bigint_type;
+        } else if tf.intersects(TypeFlags::UNIQUE_ES_SYMBOL) && match_symbol {
+            primitive = self.es_symbol_type;
+        }
+        primitive.is_some() && self.contains_type(types, primitive)
     }
 
     // Go: checker/checker.go:26313 getCrossProductIntersections
@@ -904,7 +910,40 @@ impl Checker {
 
     // Go: checker/checker.go:26477 removeType
     pub fn remove_type(&mut self, t: TypeId, target_type: TypeId) -> TypeId {
-        self.filter_type(t, &mut |_c: &mut Checker, t: TypeId| t != target_type)
+        if !self.ty(t).flags.intersects(TypeFlags::UNION) {
+            if t == target_type {
+                return self.never_type;
+            }
+            return t;
+        }
+        let origin = self.ty(t).as_union_type().origin;
+        if origin.is_some()
+            && self.ty(origin).flags.intersects(TypeFlags::UNION)
+            && self.contains_type(self.ty(origin).types(), target_type)
+        {
+            return self.filter_type(t, &mut |_c: &mut Checker, t: TypeId| t != target_type);
+        }
+        let types = self.ty(t).types();
+        if let Ok(i) =
+            types.binary_search_by(|&probe| self.compare_types(probe, target_type).cmp(&0))
+        {
+            if types.len() == 2 {
+                return types[1 - i];
+            }
+            // Remove the target type from the slice.
+            let mut filtered = Vec::with_capacity(types.len() - 1);
+            filtered.extend_from_slice(&types[..i]);
+            filtered.extend_from_slice(&types[i + 1..]);
+            let object_flags = self.ty(t).object_flags
+                & (ObjectFlags::PRIMITIVE_UNION | ObjectFlags::CONTAINS_INTERSECTIONS);
+            return self.get_union_type_from_sorted_list(
+                &filtered,
+                object_flags,
+                None,        /*alias*/
+                TypeId::NIL, /*origin*/
+            );
+        }
+        t
     }
 
     // Go: checker/checker.go:26481 containsType
@@ -1194,27 +1233,35 @@ impl Checker {
                     .iter()
                     .any(|&t| self.is_key_type_included(t, include))
     }
+}
 
-    // Go: checker/checker.go:26661 checkComputedPropertyName
+// Go: checker/checker.go:26702 isInvalidComputedPropertyName
+pub fn is_invalid_computed_property_name(node: Node) -> bool {
+    let grandparent = node.parent().parent();
+    (is_type_literal_node(grandparent)
+        || is_class_like(grandparent)
+        || is_interface_declaration(grandparent))
+        && is_binary_expression(node.expression())
+        && node.expression().operator_token().kind() == SyntaxKind::InKeyword
+        && !is_accessor(node.parent())
+}
+
+impl Checker {
+    // Go: checker/checker.go:26708 checkComputedPropertyName
     // PORT: Go holds a pointer to the links; here each access reads
-    // `self.type_node_links.get(expression)` again.
+    // `self.type_node_links.get(node)` again.
     pub fn check_computed_property_name(&mut self, node: Node) -> TypeId {
         let expression = node.expression();
-        if self.type_node_links.get(expression).resolved_type.is_nil() {
-            let grandparent = node.parent().parent();
-            if (is_type_literal_node(grandparent)
-                || is_class_like(grandparent)
-                || is_interface_declaration(grandparent))
-                && is_binary_expression(expression)
-                && expression.operator_token().kind() == SyntaxKind::InKeyword
-                && !is_accessor(node.parent())
-            {
+        if self.type_node_links.get(node).resolved_type.is_nil() {
+            let circular_constraint_type = self.circular_constraint_type;
+            self.type_node_links.get(node).resolved_type = circular_constraint_type;
+            if is_invalid_computed_property_name(node) {
                 let error_type = self.error_type;
-                self.type_node_links.get(expression).resolved_type = error_type;
+                self.type_node_links.get(node).resolved_type = error_type;
                 return error_type;
             }
             let resolved_type = self.check_expression(expression);
-            self.type_node_links.get(expression).resolved_type = resolved_type;
+            self.type_node_links.get(node).resolved_type = resolved_type;
             // This will allow types number, string, symbol or any. It will also allow enums, the unknown
             // type, and any union of these types (like string | number).
             if self.ty(resolved_type).flags.intersects(TypeFlags::NULLABLE)
@@ -1233,7 +1280,7 @@ impl Checker {
                 );
             }
         }
-        self.type_node_links.get(expression).resolved_type
+        self.type_node_links.get(node).resolved_type
     }
 
     // Go: checker/checker.go:26682 isNoInferType

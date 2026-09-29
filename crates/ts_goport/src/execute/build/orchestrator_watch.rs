@@ -1,8 +1,8 @@
-//! Go: execute/build/orchestrator.go:239-510, the watch part of the build
+//! Go: execute/build/orchestrator.go:264-658, the watch part of the build
 //! orchestrator (`Watch`, `updateWatch`, `resetCaches`,
 //! `checkTasksForEventChanges`, `computeDesiredWatches`, `DoCycle`), with
-//! `rangeTask` (orchestrator.go:540) for these callers, and
-//! execute/build/buildtask.go:698-717 (`updateWatch`, `resetConfig`).
+//! `rangeTask` (orchestrator.go:688) for these callers, and
+//! execute/build/buildtask.go:825-844 (`updateWatch`, `resetConfig`).
 //!
 //! PORT: Go runs `DoCycle` from `WatchManager.RunLoop` on the goroutine
 //! that called `Watch`. The port does the same on the orchestrator thread.
@@ -17,12 +17,12 @@
 //! PORT: each project compiles in this process (build_task.rs). A watch
 //! cycle makes new program versions, and each is released when its task
 //! reports. The old program is read from build info, as Go does in build
-//! mode (buildtask.go:199).
+//! mode (buildtask.go:251).
 
 use crate::execute::build::build_task::BuildTask;
 use crate::execute::build::orchestrator::Orchestrator;
 use crate::execute::tsc::compile::{Watcher, write_str};
-use crate::execute::watchmanager::{can_watch_directory, is_dir_covered_by_watch};
+use crate::execute::watchmanager::{DirWatchSet, can_watch_directory, new_dir_watch_set};
 use crate::frontend::prelude::*;
 use crate::fswatch;
 use crate::gostd::Context;
@@ -30,7 +30,7 @@ use std::sync::PoisonError;
 use std::time::SystemTime;
 
 impl Orchestrator {
-    // Go: build/orchestrator.go:239 (*Orchestrator).Watch
+    // Go: build/orchestrator.go:264 (*Orchestrator).Watch
     pub fn watch(&mut self, ctx: &Context) {
         self.wm.borrow().lock();
 
@@ -64,7 +64,7 @@ impl Orchestrator {
         }
     }
 
-    // Go: build/orchestrator.go:264 (*Orchestrator).updateWatch
+    // Go: build/orchestrator.go:289 (*Orchestrator).updateWatch
     pub fn update_watch(&self) {
         let old_cache = std::mem::take(
             &mut *self
@@ -78,7 +78,7 @@ impl Orchestrator {
         });
     }
 
-    // Go: build/orchestrator.go:272 (*Orchestrator).resetCaches
+    // Go: build/orchestrator.go:297 (*Orchestrator).resetCaches
     pub fn reset_caches(&self) {
         // Clean out all the caches
         // PORT: Go reaches the cached file system as
@@ -90,7 +90,7 @@ impl Orchestrator {
         *self.host.config_times.borrow_mut() = FxHashMap::default();
     }
 
-    // Go: build/orchestrator.go:281 (*Orchestrator).checkTasksForEventChanges
+    // Go: build/orchestrator.go:306 (*Orchestrator).checkTasksForEventChanges
     // PORT: Go map iteration order is random; `changed_paths` is an
     // `FxHashMap`. The result does not depend on the order.
     pub fn check_tasks_for_event_changes(
@@ -136,8 +136,49 @@ impl Orchestrator {
             if config_changed {
                 continue;
             }
+            // tsgo#4712: a changed mapper package manifest reloads the config.
+            for mapper in resolved.content_mappers() {
+                if mapper.package_directory.is_empty() || !mapper.contribution_id.is_empty() {
+                    continue;
+                }
+                let manifest_path =
+                    self.to_path(&combine_paths(&mapper.package_directory, &["package.json"]));
+                if normalized_paths.contains_key(&manifest_path) {
+                    task.reset_config(self, &path);
+                    *needs_config_update = true;
+                    *needs_update = true;
+                    config_changed = true;
+                    break;
+                }
+            }
+            if config_changed {
+                continue;
+            }
 
             let mut root_changed = false;
+            // tsgo#4712: a changed file that a mapper watches refreshes the
+            // mapper project. PORT: Go gets no files with the error.
+            if let Some(project) = task.content_mapper_project.clone() {
+                let watched_files = match project.watched_files() {
+                    Ok(watched_files) => watched_files,
+                    Err(err) => {
+                        task.content_mapper_project_err = Some(err);
+                        task.reset_status();
+                        *needs_update = true;
+                        root_changed = true;
+                        Vec::new()
+                    }
+                };
+                for file_name in &watched_files {
+                    if normalized_paths.contains_key(&self.to_path(file_name)) {
+                        task.refresh_content_mapper_project();
+                        task.reset_status();
+                        *needs_update = true;
+                        root_changed = true;
+                        break;
+                    }
+                }
+            }
             let file_names = resolved.file_names();
             let mut roots: FxHashSet<Path> =
                 FxHashSet::with_capacity_and_hasher(file_names.len(), Default::default());
@@ -232,7 +273,7 @@ impl Orchestrator {
         }
     }
 
-    // Go: build/orchestrator.go:406 (*Orchestrator).packageJsonLookupChanged
+    // Go: build/orchestrator.go:464 (*Orchestrator).packageJsonLookupChanged
     // PORT: Go ranges over a map (random order); the result does not depend
     // on the order.
     fn package_json_lookup_changed(
@@ -258,26 +299,25 @@ impl Orchestrator {
         false
     }
 
-    // Go: build/orchestrator.go:419 (*Orchestrator).computeDesiredWatches
+    // Go: build/orchestrator.go:477 (*Orchestrator).computeDesiredWatches
     // PORT: Go ranges over `WildcardDirectories()` (a map, random order);
     // the result does not depend on the order.
     pub fn compute_desired_watches(&self) -> FxHashMap<String, bool> {
-        let mut desired_dirs: FxHashMap<String, bool> = FxHashMap::default();
+        let mut desired_dirs = new_dir_watch_set(self.compare_paths_options.clone());
         let fs = CompilerHost::fs(&*self.host);
 
         for config in &self.order {
             let path = self.to_path(config);
             let task = self.get_task(&path);
-            let task = task.borrow();
+            // PORT: mutable for Go `task.contentMapperProjectErr = err`.
+            let mut task = task.borrow_mut();
 
             // Watch config file directory
             let config_dir = get_directory_path(&task.config);
             let real_config_dir = fs.realpath(&config_dir);
-            if !desired_dirs.contains_key(&real_config_dir) {
-                desired_dirs.insert(real_config_dir, false);
-            }
+            desired_dirs.set(&real_config_dir, false);
 
-            let Some(resolved) = &task.resolved else {
+            let Some(resolved) = task.resolved.clone() else {
                 continue;
             };
 
@@ -285,19 +325,13 @@ impl Orchestrator {
             for cfg_path in resolved.extended_source_files() {
                 let real_path = fs.realpath(cfg_path);
                 let dir = get_directory_path(&real_path);
-                if !desired_dirs.contains_key(&dir) {
-                    desired_dirs.insert(dir, false);
-                }
+                desired_dirs.set(&dir, false);
             }
 
             // Wildcard directories from tsconfig
             for (dir, recursive) in resolved.wildcard_directories() {
                 let real_dir = fs.realpath(dir);
-                if let Some(existing) = desired_dirs.get(&real_dir).copied() {
-                    desired_dirs.insert(real_dir, existing || *recursive);
-                } else {
-                    desired_dirs.insert(real_dir, *recursive);
-                }
+                desired_dirs.set(&real_dir, *recursive);
             }
 
             // Input file directories not already covered
@@ -305,10 +339,39 @@ impl Orchestrator {
                 let abs_path =
                     get_normalized_absolute_path(file_name, &self.opts.sys.get_current_directory());
                 let dir = get_directory_path(&abs_path);
-                if !is_dir_covered_by_watch(&desired_dirs, &dir, &self.compare_paths_options)
-                    && can_watch_directory(&dir)
-                {
-                    desired_dirs.insert(dir, false);
+                if !desired_dirs.covered(&dir) && can_watch_directory(&dir) {
+                    desired_dirs.set(&dir, false);
+                }
+                // tsgo#4712: the directories of the mapper package manifests.
+                // Go does this once per input file.
+                for mapper in resolved.content_mappers() {
+                    if mapper.package_directory.is_empty() || !mapper.contribution_id.is_empty() {
+                        continue;
+                    }
+                    let manifest_path =
+                        fs.realpath(&combine_paths(&mapper.package_directory, &["package.json"]));
+                    let dir = get_directory_path(&manifest_path);
+                    if !desired_dirs.covered(&dir) && can_watch_directory(&dir) {
+                        desired_dirs.set(&dir, false);
+                    }
+                }
+            }
+            // tsgo#4712: the directories of the files that the mappers watch.
+            // PORT: Go gets no files with the error.
+            if let Some(project) = task.content_mapper_project.clone() {
+                let watched_files = match project.watched_files() {
+                    Ok(watched_files) => watched_files,
+                    Err(err) => {
+                        task.content_mapper_project_err = Some(err);
+                        Vec::new()
+                    }
+                };
+                for file_name in &watched_files {
+                    let abs_path = fs.realpath(file_name);
+                    let dir = get_directory_path(&abs_path);
+                    if !desired_dirs.covered(&dir) && can_watch_directory(&dir) {
+                        desired_dirs.set(&dir, false);
+                    }
                 }
             }
 
@@ -332,13 +395,8 @@ impl Orchestrator {
                             continue;
                         }
                         let dir = get_directory_path(&abs_path);
-                        if !is_dir_covered_by_watch(
-                            &desired_dirs,
-                            &dir,
-                            &self.compare_paths_options,
-                        ) && can_watch_directory(&dir)
-                        {
-                            desired_dirs.insert(dir, false);
+                        if !desired_dirs.covered(&dir) && can_watch_directory(&dir) {
+                            desired_dirs.set(&dir, false);
                         }
                     }
                     for package_json in build_info.get_package_jsons(&build_info_dir) {
@@ -354,24 +412,18 @@ impl Orchestrator {
             }
         }
 
-        self.wm.borrow().resolve_desired_dirs(&desired_dirs)
+        self.wm.borrow().resolve_desired_dirs(desired_dirs.dirs())
     }
 
-    // Go: build/orchestrator.go:503 (*Orchestrator).addWatchDir
-    fn add_watch_dir(&self, desired_dirs: &mut FxHashMap<String, bool>, dir: &str) {
-        if !is_dir_covered_by_watch(desired_dirs, dir, &self.compare_paths_options)
-            && can_watch_directory(dir)
-        {
-            desired_dirs.insert(dir.to_string(), false);
+    // Go: build/orchestrator.go:572 (*Orchestrator).addWatchDir
+    fn add_watch_dir(&self, desired_dirs: &mut DirWatchSet, dir: &str) {
+        if !desired_dirs.covered(dir) && can_watch_directory(dir) {
+            desired_dirs.set(dir, false);
         }
     }
 
-    // Go: build/orchestrator.go:509 (*Orchestrator).addPackageJsonWatchDirs
-    fn add_package_json_watch_dirs(
-        &self,
-        desired_dirs: &mut FxHashMap<String, bool>,
-        package_json: &str,
-    ) {
+    // Go: build/orchestrator.go:578 (*Orchestrator).addPackageJsonWatchDirs
+    fn add_package_json_watch_dirs(&self, desired_dirs: &mut DirWatchSet, package_json: &str) {
         let dir = get_directory_path(package_json);
         let mut dirs = vec![dir.clone()];
         let mut found_node_modules = false;
@@ -402,7 +454,7 @@ impl Orchestrator {
         }
     }
 
-    // Go: build/orchestrator.go:459 (*Orchestrator).DoCycle
+    // Go: build/orchestrator.go:607 (*Orchestrator).DoCycle
     // PORT: Go unlocks with `defer`; the port unlocks before each return.
     pub fn do_cycle(&mut self) {
         self.wm.borrow().lock();
@@ -471,7 +523,7 @@ impl Orchestrator {
         self.wm.borrow().unlock();
     }
 
-    // Go: build/orchestrator.go:540 (*Orchestrator).rangeTask
+    // Go: build/orchestrator.go:688 (*Orchestrator).rangeTask
     // PORT: the build itself uses `build_all_tasks` (orchestrator.rs). The
     // watch callers pass an `f` that touches only its own task and the host
     // caches, so the tasks run one at a time in `order`, the order in which
@@ -489,15 +541,19 @@ impl Orchestrator {
     }
 }
 
-// Go: build/orchestrator.go:78 `var _ tsc.Watcher = (*Orchestrator)(nil)`
+// Go: build/orchestrator.go:85 `var _ tsc.Watcher = (*Orchestrator)(nil)`
 impl Watcher for Orchestrator {
     fn do_cycle(&mut self) {
         Orchestrator::do_cycle(self);
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl BuildTask {
-    // Go: build/buildtask.go:698 (*BuildTask).updateWatch
+    // Go: build/buildtask.go:825 (*BuildTask).updateWatch
     // PORT: Go takes the old `*SyncMap`; the old map is passed by reference.
     pub fn update_watch(
         &self,
@@ -515,7 +571,7 @@ impl BuildTask {
         }
     }
 
-    // Go: build/buildtask.go:714 (*BuildTask).resetConfig
+    // Go: build/buildtask.go:841 (*BuildTask).resetConfig
     pub fn reset_config(&mut self, orchestrator: &Orchestrator, path: &Path) {
         self.dirty = true;
         orchestrator.host.resolved_references.delete(path);

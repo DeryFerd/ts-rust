@@ -1,8 +1,11 @@
+use crate::contentmapper::Mapper;
 use crate::frontend::prelude::*;
+use crate::frontend::stringutil_ls::equate_string_case_insensitive;
 use std::cell::OnceCell;
 use std::rc::Weak;
 
-// This file ports tsoptions/parsedcommandline.go and core/parsedoptions.go.
+// This file ports tsoptions/parsedcommandline.go. `ParsedOptions` is in
+// `parsed_options.rs` (tsgo#4712 moves it from core to tsoptions).
 // PORT: Go `sync.Once` plus a cached field is a single-threaded `OnceCell`.
 // PORT: Go methods that check `p == nil` take `&self`, which is never nil.
 // A Go nil `*ParsedCommandLine` is `Option<ParsedCommandLine>` at the caller.
@@ -13,6 +16,30 @@ use std::rc::Weak;
 const FILE_GLOB_PATTERN: &str = "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json}";
 // Go: tsoptions/parsedcommandline.go:23 recursiveFileGlobPattern
 const RECURSIVE_FILE_GLOB_PATTERN: &str = "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json}";
+
+impl ParsedCommandLine {
+    // Go: tsoptions/parsedcommandline.go:31 (*ParsedCommandLine).fileGlobPatterns (tsgo#4712)
+    // fileGlobPatterns returns the include file glob patterns for this command line, augmenting the
+    // built-in patterns with the extensions registered by its content mappers so that created
+    // content-mapped files are recognized as possible root files.
+    fn file_glob_patterns(&self) -> (String, String) {
+        let mapper_extensions = self.content_mapper_extensions();
+        if mapper_extensions.is_empty() {
+            return (
+                FILE_GLOB_PATTERN.to_string(),
+                RECURSIVE_FILE_GLOB_PATTERN.to_string(),
+            );
+        }
+        let mut extensions: Vec<&str> = Vec::with_capacity(9 + mapper_extensions.len());
+        extensions.extend(["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "json"]);
+        for extension in &mapper_extensions {
+            extensions.push(extension.strip_prefix('.').unwrap_or(extension));
+        }
+        let file_glob = format!("*.{{{}}}", extensions.join(","));
+        let recursive_file_glob = format!("**/{file_glob}");
+        (file_glob, recursive_file_glob)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Go: glob/glob.go
@@ -388,27 +415,6 @@ fn glob_split(input: &[u8]) -> (&[u8], &[u8]) {
     (first, &[])
 }
 
-// Go: core/parsedoptions.go:3 ParsedOptions
-// PORT: Go `*CompilerOptions` is `Rc<CompilerOptions>`, so copies of the
-// struct share it like Go pointers do. Go `*TypeAcquisition` is an
-// `Option`. Go `[]*ProjectReference` is `Option<Vec<ProjectReference>>`:
-// `None` is Go nil (no `references` in the config) and `Some(vec![])` is
-// Go `"references": []`. The build checks that difference.
-// PORT: the Go `WatchOptions` field is left out. The crate has no
-// `WatchOptions` type, and Go `ParseJsonConfigFileContent` never sets it.
-// PORT: `PartialEq` is Go `reflect.DeepEqual` (execute/watcher.go
-// recheckTsConfig). The `Option` keeps the Go nil and empty slice apart for
-// `project_references`; other `Vec` fields have no nil, so those two compare
-// equal there.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ParsedOptions {
-    pub compiler_options: Rc<CompilerOptions>,
-    pub type_acquisition: Option<TypeAcquisition>,
-
-    pub file_names: Vec<String>,
-    pub project_references: Option<Vec<ProjectReference>>,
-}
-
 // PORT: the two Go maps that `ParseInputOutputNames` fills in one `Once`.
 #[derive(Debug, Default)]
 pub struct SourceAndOutputMaps {
@@ -435,7 +441,6 @@ pub struct ParsedCommandLine {
     pub compare_paths_options: ComparePathsOptions,
     pub wildcard_directories: OnceCell<FxHashMap<String, bool>>,
     pub include_globs: OnceCell<Vec<Glob>>,
-    pub extra_file_extensions: Vec<FileExtensionInfo>,
 
     pub source_and_output_maps: OnceCell<SourceAndOutputMaps>,
 
@@ -468,6 +473,31 @@ pub fn new_parsed_command_line(
         },
         compare_paths_options,
         ..Default::default()
+    }
+}
+
+impl ParsedCommandLine {
+    // Go: tsoptions/parsedcommandline.go:91 (*ParsedCommandLine).WithFileNames (tsgo#4712)
+    // PORT: Go returns a new pointer; this returns the value. Go copies the
+    // cached `wildcardDirectories` map and `includeGlobs` slice but not their
+    // `sync.Once`; this clones both cache cells, as
+    // `reload_file_names_of_parsed_command_line` does.
+    #[must_use]
+    pub fn with_file_names(&self, file_names: Vec<String>) -> ParsedCommandLine {
+        let mut parsed_config = self.parsed_config.clone();
+        parsed_config.file_names = file_names;
+        ParsedCommandLine {
+            parsed_config,
+            config_file: self.config_file.clone(),
+            errors: self.errors.clone(),
+            raw: self.raw.clone(),
+            compile_on_save: self.compile_on_save,
+            compare_paths_options: self.compare_paths_options.clone(),
+            wildcard_directories: self.wildcard_directories.clone(),
+            include_globs: self.include_globs.clone(),
+            literal_file_names_len: self.literal_file_names_len,
+            ..Default::default()
+        }
     }
 }
 
@@ -669,7 +699,9 @@ impl ParsedCommandLine {
             if opts.get_emit_declarations() {
                 let dts_file_name = get_output_declaration_file_name_worker(file_name, opts, self);
                 if !dts_file_name.is_empty() {
-                    let are_maps = opts.get_are_declaration_maps_enabled();
+                    // tsgo#4712: no declaration map for a content-mapped file.
+                    let are_maps = self.get_content_mapper_for_file_name(file_name).is_none()
+                        && opts.get_are_declaration_maps_enabled();
                     let declaration_map = format!("{dts_file_name}.map");
                     result.push(dts_file_name);
                     if are_maps {
@@ -716,12 +748,14 @@ impl ParsedCommandLine {
     pub fn wildcard_directory_globs(&self) -> &[Glob] {
         let wildcard_directories = self.wildcard_directories();
         self.include_globs.get_or_init(|| {
+            // tsgo#4712
+            let (file_glob, recursive_file_glob) = self.file_glob_patterns();
             let mut globs = Vec::with_capacity(wildcard_directories.len());
             for (dir, recursive) in wildcard_directories {
                 let pattern = if *recursive {
-                    RECURSIVE_FILE_GLOB_PATTERN
+                    &recursive_file_glob
                 } else {
-                    FILE_GLOB_PATTERN
+                    &file_glob
                 };
                 if let Ok(parsed) = glob_parse(&format!("{}/{}", normalize_path(dir), pattern)) {
                     globs.push(parsed);
@@ -807,6 +841,44 @@ impl ParsedCommandLine {
         self.parsed_config.project_references.is_some()
     }
 
+    // Go: tsoptions/parsedcommandline.go:347 (*ParsedCommandLine).ContentMappers (tsgo#4712)
+    pub fn content_mappers(&self) -> &[Rc<Mapper>] {
+        &self.parsed_config.content_mappers
+    }
+
+    // Go: tsoptions/parsedcommandline.go:356 (*ParsedCommandLine).ContentMapperExtensions (tsgo#4712)
+    // ContentMapperExtensions returns the flattened list of file extensions registered by the
+    // config's content mappers.
+    // PORT: Go builds a new slice on each call (`core.FlatMap`).
+    pub fn content_mapper_extensions(&self) -> Vec<String> {
+        self.content_mappers()
+            .iter()
+            .flat_map(|m| m.definition.extensions.iter().cloned())
+            .collect()
+    }
+
+    // Go: tsoptions/parsedcommandline.go:364 (*ParsedCommandLine).GetContentMapperForFileName (tsgo#4712)
+    // GetContentMapperForFileName returns the configured content mapper whose extensions include fileName,
+    // or nil if no content mapper is registered for the file's extension.
+    // PORT: Go nil is `None`.
+    pub fn get_content_mapper_for_file_name(&self, file_name: &str) -> Option<Rc<Mapper>> {
+        let ignore_case = !self.use_case_sensitive_file_names();
+        let extension = get_longest_extension_from_path(
+            file_name,
+            &self.content_mapper_extensions(),
+            ignore_case,
+        );
+        for mapper in self.content_mappers() {
+            if mapper.definition.extensions.iter().any(|mapper_extension| {
+                extension == *mapper_extension
+                    || ignore_case && equate_string_case_insensitive(&extension, mapper_extension)
+            }) {
+                return Some(mapper.clone());
+            }
+        }
+        None
+    }
+
     // Go: tsoptions/parsedcommandline.go:313 (*ParsedCommandLine).ResolvedProjectReferencePaths
     pub fn resolved_project_reference_paths(&self) -> &[String] {
         self.resolved_project_reference_paths.get_or_init(|| {
@@ -865,6 +937,13 @@ impl ParsedCommandLine {
                 if include_path == path {
                     return true;
                 }
+            }
+        }
+        // tsgo#4712
+        if self.get_content_mapper_for_file_name(file_name).is_some() {
+            let directory_path = path.get_directory_path();
+            if self.possibly_matches_directory_name(&directory_path) {
+                return true;
             }
         }
         let wildcard_directory_globs = self.wildcard_directory_globs();
@@ -939,7 +1018,7 @@ impl ParsedCommandLine {
             self.get_current_directory(),
             Some(&**self.compiler_options()),
             fs,
-            &self.extra_file_extensions,
+            &self.content_mapper_extensions(),
         );
         parsed_config.file_names = file_names;
         ParsedCommandLine {
@@ -951,7 +1030,6 @@ impl ParsedCommandLine {
             compare_paths_options: self.compare_paths_options.clone(),
             wildcard_directories: self.wildcard_directories.clone(),
             include_globs: self.include_globs.clone(),
-            extra_file_extensions: self.extra_file_extensions.clone(),
             literal_file_names_len,
             ..Default::default()
         }
@@ -990,6 +1068,10 @@ impl OutputPathsHost for ParsedCommandLine {
     }
     fn use_case_sensitive_file_names(&self) -> bool {
         ParsedCommandLine::use_case_sensitive_file_names(self)
+    }
+    // tsgo#4712
+    fn content_mapper_extensions(&self) -> Vec<String> {
+        ParsedCommandLine::content_mapper_extensions(self)
     }
 }
 

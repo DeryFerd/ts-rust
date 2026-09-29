@@ -362,6 +362,10 @@ impl Watcher {
                 failed = true;
                 break;
             }
+            if self.closed.get() {
+                new_watch.close();
+                return Err(errors::new("lspwatcher: closed"));
+            }
             self.watches
                 .borrow_mut()
                 .entry(id.to_string())

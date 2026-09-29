@@ -115,7 +115,7 @@ pub fn bool_to_tristate(b: bool) -> Tristate {
 // ---------------------------------------------------------------------------
 
 /// Go `core.CompilerOptions`. Field names are the Go names in snake case.
-/// Upstream keeps this struct in sync with the API's `compilerOptions.ts`.
+/// CompilerOptions contains the compiler options exposed by the API.
 // Go: core/compileroptions.go:16 CompilerOptions
 // PORT: Go `noCopy` is dropped. Go `[]string` fields are
 // `Option<Vec<String>>`: a nil slice is `None` and an empty non-nil slice is
@@ -241,7 +241,10 @@ pub struct CompilerOptions {
     pub out_file: String,
 
     // Internal fields
-    pub config_file_path: String,
+    // PORT: tsgo#4915 tags these `internal:"true"` (and the deprecated fields
+    // above `deprecated:"true"`) for the TS API generator. The JSON is the
+    // same, so the port has no tags.
+    pub config_file_path: String, // internal, but intentionally exposed via API
     pub no_dts_resolution: Tristate,
     pub paths_base_path: String,
     pub diagnostics: Tristate,
@@ -261,6 +264,8 @@ pub struct CompilerOptions {
     pub build: Tristate,
     pub help: Tristate,
     pub all: Tristate,
+    // tsgo#4712
+    pub run_external_code: Tristate,
 
     pub pprof_dir: String,
     pub single_threaded: Tristate,
@@ -720,9 +725,10 @@ impl std::fmt::Display for LanguageVariant {
 }
 
 impl ScriptKind {
-    // Go: core/scriptkind_stringer_generated.go String
-    // PORT: matches the named constants, so it follows whatever value
-    // `crate::flags` gives `ScriptKind::DEFERRED`. Go iota makes it 7.
+    // Go: core/scriptkind_stringer_generated.go:25 String
+    // tsgo#4712: values 5 (formerly ScriptKindExternal) and 7 (formerly
+    // ScriptKindDeferred) are reserved and print as "ScriptKind(5)" and
+    // "ScriptKind(7)".
     #[must_use]
     pub fn string(self) -> String {
         let name = match self {
@@ -731,9 +737,7 @@ impl ScriptKind {
             ScriptKind::JSX => "ScriptKindJSX",
             ScriptKind::TS => "ScriptKindTS",
             ScriptKind::TSX => "ScriptKindTSX",
-            ScriptKind::EXTERNAL => "ScriptKindExternal",
             ScriptKind::JSON => "ScriptKindJSON",
-            ScriptKind::DEFERRED => "ScriptKindDeferred",
             _ => return format!("ScriptKind({})", self.0),
         };
         name.to_string()

@@ -1161,8 +1161,7 @@ impl Checker {
         // PORT: the set is built in a stack `TypeSet` and reduced in place.
         // `get_union_type_from_sorted_list` copies it only when it creates
         // the union.
-        let mut type_set = TypeSet::with_capacity(types.len());
-        let includes = self.add_types_to_union(&mut type_set, TypeFlags::NONE, types);
+        let (mut type_set, includes) = self.add_types_to_union(types);
         if union_reduction != UnionReduction::NONE {
             if includes.intersects(TypeFlags::ANY_OR_UNKNOWN) {
                 if includes.intersects(TypeFlags::ANY) {
@@ -1317,105 +1316,66 @@ impl Checker {
         self.union_types.values().copied().collect()
     }
 
-    // Go: checker/checker.go:25663 addTypesToUnion
-    // PORT: Go threads the slice through and returns it; Rust grows the
-    // caller's set in place and returns only `includes`.
-    pub fn add_types_to_union(
-        &mut self,
-        type_set: &mut TypeSet,
-        includes: TypeFlags,
-        types: &[TypeId],
-    ) -> TypeFlags {
-        let mut includes = includes;
-        let mut last_type = TypeId::NIL;
-        for &t in types {
-            if t != last_type {
-                if self.ty(t).flags.intersects(TypeFlags::UNION) {
-                    let (has_alias, origin, u_types) = {
-                        let ty = self.ty(t);
-                        let u = ty.as_union_type();
-                        (
-                            ty.alias.is_some(),
-                            u.origin,
-                            u.union_or_intersection.types.clone(),
-                        )
-                    };
-                    if has_alias || origin.is_some() {
-                        includes |= TypeFlags::UNION;
-                    }
-                    includes = self.add_types_to_union(type_set, includes, &u_types);
-                } else {
-                    includes = self.add_type_to_union(type_set, includes, t);
-                }
-                last_type = t;
+    // Go: checker/checker.go:25709 addTypesToUnion
+    pub fn add_types_to_union(&mut self, source_types: &[TypeId]) -> (TypeSet, TypeFlags) {
+        let mut types = TypeSet::with_capacity(source_types.len());
+        let mut includes = TypeFlags::NONE;
+        // PORT: Go closure `addType`; it reads the checker and grows `types` and `includes`.
+        fn add_type(c: &Checker, types: &mut TypeSet, includes: &mut TypeFlags, t: TypeId) {
+            let flags = c.ty(t).flags;
+            let object_flags = c.ty(t).object_flags;
+            // We ignore 'never' types in unions
+            if flags.intersects(TypeFlags::NEVER) {
+                return;
             }
-        }
-        includes
-    }
-
-    // Go: checker/checker.go:25682 addTypeToUnion
-    pub fn add_type_to_union(
-        &mut self,
-        type_set: &mut TypeSet,
-        includes: TypeFlags,
-        t: TypeId,
-    ) -> TypeFlags {
-        let mut includes = includes;
-        let flags = self.ty(t).flags;
-        let object_flags = self.ty(t).object_flags;
-        // We ignore 'never' types in unions
-        if !flags.intersects(TypeFlags::NEVER) {
-            includes |= flags & TypeFlags::INCLUDES_MASK;
+            *includes |= flags & TypeFlags::INCLUDES_MASK;
             if flags.intersects(TypeFlags::INSTANTIABLE) {
-                includes |= TypeFlags::INCLUDES_INSTANTIABLE;
+                *includes |= TypeFlags::INCLUDES_INSTANTIABLE;
             }
             if flags.intersects(TypeFlags::INTERSECTION)
                 && object_flags.intersects(ObjectFlags::IS_CONSTRAINED_TYPE_VARIABLE)
             {
-                includes |= TypeFlags::INCLUDES_CONSTRAINED_TYPE_VARIABLE;
+                *includes |= TypeFlags::INCLUDES_CONSTRAINED_TYPE_VARIABLE;
             }
-            if t == self.wildcard_type {
-                includes |= TypeFlags::INCLUDES_WILDCARD;
+            if t == c.wildcard_type {
+                *includes |= TypeFlags::INCLUDES_WILDCARD;
             }
-            if self.is_error_type(t) {
-                includes |= TypeFlags::INCLUDES_ERROR;
+            if c.is_error_type(t) {
+                *includes |= TypeFlags::INCLUDES_ERROR;
             }
-            if !self.strict_null_checks && flags.intersects(TypeFlags::NULLABLE) {
+            if !c.strict_null_checks && flags.intersects(TypeFlags::NULLABLE) {
                 if !object_flags.intersects(ObjectFlags::CONTAINS_WIDENING_TYPE) {
-                    includes |= TypeFlags::INCLUDES_NON_WIDENING_TYPE;
+                    *includes |= TypeFlags::INCLUDES_NON_WIDENING_TYPE;
                 }
-            } else {
-                // PORT: the set is sorted and has no duplicates, so the Rust
-                // insertion index matches Go `slices.BinarySearchFunc`.
-                // PERF: many callers add types from an already sorted list, so
-                // compare with the last element first. `compare_types` is a
-                // total order that ends with a type id compare, so "after the
-                // last" means append and "equal to the last" means found. Both
-                // give the binary search result. Otherwise search as before.
-                let len = type_set.len();
-                let last_cmp = type_set.last().map(|&last| self.compare_types(last, t));
-                match last_cmp {
-                    Some(c) if c <= 0 => {
-                        debug_assert_eq!(
-                            type_set.binary_search_by(|&p| self.compare_types(p, t).cmp(&0)),
-                            if c < 0 { Err(len) } else { Ok(len - 1) },
-                            "sorted-append fast path disagrees with binary search"
-                        );
-                        if c < 0 {
-                            type_set.push(t);
-                        }
+                return;
+            }
+            types.push(t);
+        }
+        let mut last_type = TypeId::NIL;
+        for &t in source_types {
+            if t != last_type {
+                if self.ty(t).flags.intersects(TypeFlags::UNION) {
+                    let ty = self.ty(t);
+                    let u = ty.as_union_type();
+                    if ty.alias.is_some() || u.origin.is_some() {
+                        includes |= TypeFlags::UNION;
                     }
-                    _ => {
-                        if let Err(index) =
-                            type_set.binary_search_by(|&probe| self.compare_types(probe, t).cmp(&0))
-                        {
-                            type_set.insert(index, t);
-                        }
+                    for &s in u.union_or_intersection.types.iter() {
+                        add_type(self, &mut types, &mut includes, s);
                     }
+                } else {
+                    add_type(self, &mut types, &mut includes, t);
                 }
+                last_type = t;
             }
         }
-        includes
+        if types.len() >= 2 {
+            // Sort and deduplicate types
+            // Go: checker/checker.go:25933 slices.SortStableFunc(types, CompareTypes)
+            crate::gostd::slices::sort_stable_func(&mut types, |&a, &b| self.compare_types(a, b));
+            types.dedup();
+        }
+        (types, includes)
     }
 
     // Go: checker/checker.go:25712 addNamedUnions

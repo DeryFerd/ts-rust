@@ -166,8 +166,11 @@ impl Checker {
             if is_in_js_file(node) && !is_in_json_file(node) {
                 self.ty_mut(result).object_flags |= ObjectFlags::JS_LITERAL;
             }
+            // An expando object literal has no property children (len == 0), so there
+            // is nothing to check here.
             return result;
         }
+        self.check_node_deferred(node);
         let in_destructuring_pattern = is_assignment_target(node);
         // Grammar checking
         self.check_grammar_object_literal_expression(node, in_destructuring_pattern);
@@ -505,6 +508,37 @@ impl Checker {
             self.pattern_for_type.insert(result, node);
         }
         result
+    }
+
+    // Go: checker/checker.go:13447 checkContextualDeprecations
+    // Runs as a deferred check of an object literal or JSX attributes node, so
+    // each property is checked once and not on every inference pass.
+    pub fn check_contextual_deprecations(&mut self, node: Node) {
+        let contextual_type = self.get_apparent_type_of_contextual_type(node, ContextFlags::NONE);
+        for property in node.properties().to_vec() {
+            if self.is_canceled() {
+                return;
+            }
+            let name = property.name();
+            if name.is_some() && !is_computed_property_name(name) {
+                self.check_deprecated_property(name, contextual_type);
+            }
+        }
+    }
+
+    // Go: checker/checker.go:13459 checkDeprecatedProperty
+    pub fn check_deprecated_property(&mut self, name: Node, contextual_type: TypeId) {
+        if contextual_type.is_nil() {
+            return;
+        }
+        let prop = self.get_property_of_type(contextual_type, name.text());
+        if prop.is_nil() || self.sym(prop).declarations.is_empty() {
+            return;
+        }
+        if self.is_deprecated_symbol(prop) {
+            let prop_declarations = self.sym(prop).declarations.clone();
+            self.add_deprecated_suggestion(name, &prop_declarations, name.text());
+        }
     }
 
     // Go: checker/checker.go:13301 checkSpreadPropOverrides
@@ -1209,61 +1243,74 @@ impl Checker {
                 && !has_dot_dot_dot_token(declaration)
                 && declaration.parent().elements().len() >= 2
             {
-                let parent = declaration.parent().parent();
-                let root_declaration = get_root_declaration(parent);
-                if is_variable_declaration(root_declaration)
-                    && self
-                        .get_combined_node_flags_cached(root_declaration)
-                        .intersects(NodeFlags::CONSTANT)
-                    || is_parameter_declaration(root_declaration)
+                let root_declaration = get_root_declaration(declaration);
+                let root_initializer = root_declaration.initializer();
+                // Avoid declaration circularity without blocking binding defaults or nested callbacks.
+                // PORT: Go `break` leaves the switch case; here the rest of the case is in the `if`.
+                if !(root_initializer.is_some()
+                    && is_node_descendant_of(location, root_initializer)
+                    && self.get_control_flow_container(declaration)
+                        == self.get_control_flow_container(location))
                 {
-                    if !self
-                        .node_links
-                        .get(parent)
-                        .flags
-                        .intersects(NodeCheckFlags::IN_CHECK_IDENTIFIER)
+                    let parent = declaration.parent().parent();
+                    if is_variable_declaration(root_declaration)
+                        && self
+                            .get_combined_node_flags_cached(root_declaration)
+                            .intersects(NodeFlags::CONSTANT)
+                        || is_parameter_declaration(root_declaration)
                     {
-                        self.node_links.get(parent).flags |= NodeCheckFlags::IN_CHECK_IDENTIFIER;
-                        let parent_type =
-                            self.get_type_for_binding_element_parent(parent, CheckMode::NORMAL);
-                        let mut parent_type_constraint = TypeId::NIL;
-                        if parent_type.is_some() {
-                            parent_type_constraint = self
-                                .map_type(parent_type, &mut |c: &mut Checker, t: TypeId| {
-                                    c.get_base_constraint_or_type(t)
-                                });
-                        }
-                        if parent_type_constraint.is_some()
-                            && self
-                                .ty(parent_type_constraint)
-                                .flags
-                                .intersects(TypeFlags::UNION)
-                            && !(is_parameter_declaration(root_declaration)
-                                && self.is_some_symbol_assigned(root_declaration))
+                        if !self
+                            .node_links
+                            .get(parent)
+                            .flags
+                            .intersects(NodeCheckFlags::IN_CHECK_IDENTIFIER)
                         {
-                            let pattern = declaration.parent();
-                            let narrowed_type = self.get_flow_type_of_reference_ex(
-                                pattern,
-                                parent_type_constraint,
-                                parent_type_constraint,
-                                Node::NIL, /*flowContainer*/
-                                get_flow_node_of_node(location),
-                            );
-                            if self.ty(narrowed_type).flags.intersects(TypeFlags::NEVER) {
-                                t = self.never_type;
-                            } else {
-                                // Destructurings are validated against the parent type elsewhere. Here we disable tuple bounds
-                                // checks because the narrowed type may have lower arity than the full parent type. For example,
-                                // for the declaration [x, y]: [1, 2] | [3], we may have narrowed the parent type to just [3].
-                                t = self.get_binding_element_type_from_parent_type(
-                                    declaration,
-                                    narrowed_type,
-                                    true, /*noTupleBoundsCheck*/
+                            self.node_links.get(parent).flags |=
+                                NodeCheckFlags::IN_CHECK_IDENTIFIER;
+                            let parent_type =
+                                self.get_type_for_binding_element_parent(parent, CheckMode::NORMAL);
+                            let mut parent_type_constraint = TypeId::NIL;
+                            if parent_type.is_some() {
+                                parent_type_constraint = self.map_type(
+                                    parent_type,
+                                    &mut |c: &mut Checker, t: TypeId| {
+                                        c.get_base_constraint_or_type(t)
+                                    },
                                 );
                             }
+                            // Guard parent-type resolution only; flow analysis should allow re-entrant narrowing
+                            let links = self.node_links.get(parent);
+                            links.flags = links.flags.without(NodeCheckFlags::IN_CHECK_IDENTIFIER);
+                            if parent_type_constraint.is_some()
+                                && self
+                                    .ty(parent_type_constraint)
+                                    .flags
+                                    .intersects(TypeFlags::UNION)
+                                && !(is_parameter_declaration(root_declaration)
+                                    && self.is_some_symbol_assigned(root_declaration))
+                            {
+                                let pattern = declaration.parent();
+                                let narrowed_type = self.get_flow_type_of_reference_ex(
+                                    pattern,
+                                    parent_type_constraint,
+                                    parent_type_constraint,
+                                    Node::NIL, /*flowContainer*/
+                                    get_flow_node_of_node(location),
+                                );
+                                if self.ty(narrowed_type).flags.intersects(TypeFlags::NEVER) {
+                                    t = self.never_type;
+                                } else {
+                                    // Destructurings are validated against the parent type elsewhere. Here we disable tuple bounds
+                                    // checks because the narrowed type may have lower arity than the full parent type. For example,
+                                    // for the declaration [x, y]: [1, 2] | [3], we may have narrowed the parent type to just [3].
+                                    t = self.get_binding_element_type_from_parent_type(
+                                        declaration,
+                                        narrowed_type,
+                                        true, /*noTupleBoundsCheck*/
+                                    );
+                                }
+                            }
                         }
-                        let links = self.node_links.get(parent);
-                        links.flags = links.flags.without(NodeCheckFlags::IN_CHECK_IDENTIFIER);
                     }
                 }
             // If we have a const-like parameter with no type annotation or initializer, and if the parameter is contextually
@@ -1526,7 +1573,7 @@ impl Checker {
             &text,
             SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS,
             None,
-            true,  /*isUse*/
+            false, /*isUse*/
             false, /*excludeGlobals*/
         )
     }
@@ -1621,12 +1668,12 @@ impl Checker {
         if self.was_canceled {
             return Vec::new();
         }
-        let file_name = source_file_file_name(source_file).to_string();
+        // Go (#4825) passes the source file, not its name.
         if is_suggestion {
             self.suggestion_diagnostics
-                .get_diagnostics_for_file(&file_name)
+                .get_diagnostics_for_file(source_file)
         } else {
-            self.diagnostics.get_diagnostics_for_file(&file_name)
+            self.diagnostics.get_diagnostics_for_file(source_file)
         }
     }
 
@@ -1638,9 +1685,7 @@ impl Checker {
 
     // Go: checker/checker.go:13896 addDeferredDiagnostic
     pub fn add_deferred_diagnostic(&mut self, callback: Rc<dyn Fn(&mut Checker)>) {
-        if self.save_deferred_diagnostics {
-            self.deferred_diagnostic_callbacks.push(callback);
-        }
+        self.deferred_diagnostic_callbacks.push(callback);
     }
 
     // Go: checker/checker.go:13902 produceDeferredDiagnostics
@@ -1653,24 +1698,33 @@ impl Checker {
     }
 
     // Go: checker/checker.go:13909 addDiagnostic
-    pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
+    // PORT: Go (#4825) returns the stored `*ast.Diagnostic`: an equal one that is
+    // already in the collection, or this one. A caller that changes the result
+    // changes the stored diagnostic. Here `Some` is the stored diagnostic. `None`
+    // means it was discarded: Go then returns it unstored, and a change to it is
+    // not seen.
+    pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) -> Option<&mut Diagnostic> {
         // Discard diagnostics created while at the maximum number of recursive TypeToString invocations.
         if self.serialization_level < MAX_SERIALIZATION_LEVEL {
-            self.diagnostics.add(diagnostic);
+            return Some(self.diagnostics.add(diagnostic));
         }
+        None
     }
 
     // Go: checker/checker.go:13916 addSuggestionDiagnostic
-    pub fn add_suggestion_diagnostic(&mut self, diagnostic: Diagnostic) {
+    // PORT: the stored diagnostic, or `None` when discarded (see `add_diagnostic`).
+    pub fn add_suggestion_diagnostic(&mut self, diagnostic: Diagnostic) -> Option<&mut Diagnostic> {
         // Discard diagnostics created while at the maximum number of recursive TypeToString invocations.
         if self.serialization_level < MAX_SERIALIZATION_LEVEL {
-            self.suggestion_diagnostics.add(diagnostic);
+            return Some(self.suggestion_diagnostics.add(diagnostic));
         }
+        None
     }
 
     // Go: checker/checker.go:13923 error
-    // PORT: Go returns the shared `*ast.Diagnostic` that was added. Here a clone is added
-    // and the value is returned, so callers that mutate the result must re-add it themselves.
+    // PORT: Go (#4825) returns `c.addDiagnostic(...)`, the stored diagnostic or the
+    // discarded one. Here the result is a clone of it. A caller that changes the
+    // stored diagnostic calls `add_diagnostic` and changes the one it returns.
     pub fn error(
         &mut self,
         location: Node,
@@ -1678,7 +1732,10 @@ impl Checker {
         args: Vec<String>,
     ) -> Diagnostic {
         let diagnostic = new_diagnostic_for_node(location, message, args);
-        self.add_diagnostic(diagnostic.clone());
+        // Inlined `c.addDiagnostic`, so the discarded diagnostic can be returned.
+        if self.serialization_level < MAX_SERIALIZATION_LEVEL {
+            return self.diagnostics.add(diagnostic).clone();
+        }
         diagnostic
     }
 }

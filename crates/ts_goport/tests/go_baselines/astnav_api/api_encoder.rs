@@ -14,15 +14,17 @@ use crate::support::baseline;
 use std::cell::Cell;
 use std::rc::Rc;
 use ts_goport::api::encoder::{
-    HEADER_OFFSET_NODES, HEADER_OFFSET_STRING_DATA, HEADER_OFFSET_STRING_OFFSETS,
-    NODE_DATA_STRING_INDEX_MASK, NODE_DATA_TYPE_MASK, NODE_DATA_TYPE_STRING, NODE_OFFSET_DATA,
-    NODE_OFFSET_END, NODE_OFFSET_KIND, NODE_OFFSET_NEXT, NODE_OFFSET_PARENT, NODE_OFFSET_POS,
-    NODE_SIZE, SYNTAX_KIND_NODE_LIST, build_node_index_table, decode_nodes, decode_source_file,
-    encode_node, encode_source_file, go_kind_string,
+    HEADER_OFFSET_EXTENDED_DATA, HEADER_OFFSET_NODES, HEADER_OFFSET_STRING_DATA,
+    HEADER_OFFSET_STRING_OFFSETS, HEADER_OFFSET_STRUCTURED_DATA, NODE_DATA_STRING_INDEX_MASK,
+    NODE_DATA_TYPE_MASK, NODE_DATA_TYPE_STRING, NODE_OFFSET_DATA, NODE_OFFSET_END,
+    NODE_OFFSET_KIND, NODE_OFFSET_NEXT, NODE_OFFSET_PARENT, NODE_OFFSET_POS, NODE_SIZE,
+    PROTOCOL_VERSION, SYNTAX_KIND_NODE_LIST, build_node_index_table, decode_nodes,
+    decode_source_file, encode_node, encode_source_file, go_kind_string,
 };
 use ts_goport::ast::{
-    NodeVisitor, NodeVisitorHooks, new_node_visitor, source_file_file_name, source_file_text,
-    with_ast_data,
+    ContentMapperSourceFileInfo, MappedDiagnosticDirective, MappedDiagnosticDirectivePolicy,
+    NodeVisitor, NodeVisitorHooks, TextRange, new_node_visitor, source_file_file_name,
+    source_file_text, with_ast_data,
 };
 use ts_goport::astdata::{NodeData, SyntaxKind};
 use ts_goport::core::Node;
@@ -92,7 +94,88 @@ fn test_encode_source_file() {
     t.finish();
 }
 
-// Go: api/encoder/encoder_test.go:38 TestEncodeSourceFileWithUnicodeEscapes
+// Go: api/encoder/encoder_test.go:38 TestEncodeContentMapperSourceFileMetadata (tsgo#4712)
+// PORT: Go sets the info on the parsed `*ast.SourceFile`. Here it is set on
+// the recorded `ParsedSourceFile`, as the content mapper transform does.
+#[test]
+fn test_encode_content_mapper_source_file_metadata() {
+    assert_eq!(
+        PROTOCOL_VERSION, 7,
+        "protocol version = {PROTOCOL_VERSION}, want 7"
+    );
+    let file = Rc::new(parser::parse_source_file(
+        &SourceFileParseOptions {
+            file_name: "/component.vue".to_string(),
+            path: Path("/component.vue".to_string()),
+            ..Default::default()
+        },
+        "😀virtual",
+        ScriptKind::TS,
+    ));
+    program::note_parsed_source_file(&file);
+    file.set_content_mapper_info(ContentMapperSourceFileInfo {
+        original_text: "😀original".to_string(),
+        content_mapper: "mapper@1.0.0".to_string(),
+        virtual_file_name: "/component.vue.ts".to_string(),
+        diagnostic_directives: vec![MappedDiagnosticDirective {
+            original_range: TextRange::new(4, 5),
+            virtual_range: TextRange::new(4, 11),
+            policy: MappedDiagnosticDirectivePolicy::EXPECT,
+            unused_code: 2578,
+            unused_message_text: "Unused framework directive.".to_string(),
+            source: "mapper".to_string(),
+        }],
+        ..Default::default()
+    });
+    let source_file = file.root;
+
+    let (buf, _) = encode_source_file(source_file).expect("assert.NilError");
+    let nodes_offset = read_uint32(&buf, HEADER_OFFSET_NODES);
+    let root_data = read_uint32(&buf, nodes_offset as usize + NODE_SIZE + NODE_OFFSET_DATA);
+    let extended_offset =
+        read_uint32(&buf, HEADER_OFFSET_EXTENDED_DATA) + (root_data & NODE_DATA_STRING_INDEX_MASK);
+    assert!(
+        extended_offset as usize + 76 <= buf.len(),
+        "invalid extended offset {} (nodes={} rootData={:#x} extendedData={} len={})",
+        extended_offset,
+        nodes_offset,
+        root_data,
+        read_uint32(&buf, HEADER_OFFSET_EXTENDED_DATA),
+        buf.len()
+    );
+    let content_mapper_index = read_uint32(&buf, extended_offset as usize + 64);
+    let virtual_file_name_index = read_uint32(&buf, extended_offset as usize + 68);
+    let diagnostic_directives_offset = read_uint32(&buf, extended_offset as usize + 72);
+    assert_eq!(encoded_string(&buf, content_mapper_index), "mapper@1.0.0");
+    assert_eq!(
+        encoded_string(&buf, virtual_file_name_index),
+        "/component.vue.ts"
+    );
+    let structured_data_offset = read_uint32(&buf, HEADER_OFFSET_STRUCTURED_DATA);
+    let directive_offset = (structured_data_offset + diagnostic_directives_offset) as usize;
+    assert_eq!(
+        &buf[directive_offset..directive_offset + 10],
+        &[
+            0x91, // one directive
+            0x96, // six-element tuple
+            2, 1, // original range [2, 3) in UTF-16
+            2, 7, // virtual range [2, 9) in UTF-16
+            1, // expect policy
+            0xcd, 10, 18, // unused diagnostic code 2578
+        ]
+    );
+}
+
+// Go: api/encoder/encoder_test.go:86 encodedString
+fn encoded_string(buf: &[u8], index: u32) -> String {
+    let string_offsets = read_uint32(buf, HEADER_OFFSET_STRING_OFFSETS);
+    let string_data = read_uint32(buf, HEADER_OFFSET_STRING_DATA);
+    let start = read_uint32(buf, (string_offsets + index * 4) as usize);
+    let end = read_uint32(buf, (string_offsets + index * 4 + 4) as usize);
+    go_string_from_bytes(buf[(string_data + start) as usize..(string_data + end) as usize].to_vec())
+}
+
+// Go: api/encoder/encoder_test.go:94 TestEncodeSourceFileWithUnicodeEscapes
 #[test]
 fn test_encode_source_file_with_unicode_escapes() {
     let source_file = parse_source_file(
@@ -115,7 +198,7 @@ fn test_encode_source_file_with_unicode_escapes() {
     t.finish();
 }
 
-// Go: api/encoder/encoder_test.go:56 TestBuildNodeIndexTableMatchesEncode
+// Go: api/encoder/encoder_test.go:112 TestBuildNodeIndexTableMatchesEncode
 #[test]
 fn test_build_node_index_table_matches_encode() {
     let source_file = parse_source_file(
@@ -163,16 +246,16 @@ fn test_build_node_index_table_matches_encode() {
     }
 }
 
-// Go: api/encoder/encoder_test.go:88 BenchmarkEncodeSourceFile
-// Go: api/encoder/encoder_test.go:104 BenchmarkBuildNodeIndexTable
+// Go: api/encoder/encoder_test.go:144 BenchmarkEncodeSourceFile
+// Go: api/encoder/encoder_test.go:160 BenchmarkBuildNodeIndexTable
 // PORT: not ported (benchmarks).
 
-// Go: api/encoder/encoder_test.go:119 readUint32
+// Go: api/encoder/encoder_test.go:175 readUint32
 fn read_uint32(buf: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(buf[offset..offset + 4].try_into().expect("four bytes"))
 }
 
-// Go: api/encoder/encoder_test.go:123 formatEncodedSourceFile
+// Go: api/encoder/encoder_test.go:179 formatEncodedSourceFile
 fn format_encoded_source_file(encoded: &[u8]) -> String {
     let mut result = String::new();
     let offset_nodes = read_uint32(encoded, HEADER_OFFSET_NODES);

@@ -491,7 +491,10 @@ fn get_parameter_declaration_type_visibility_diagnostic_message(
                 )
             }
         }
-        SyntaxKind::FunctionDeclaration | SyntaxKind::FunctionType => select_diagnostic_based_on_module_name(
+        SyntaxKind::FunctionDeclaration
+        | SyntaxKind::FunctionType
+        | SyntaxKind::ArrowFunction
+        | SyntaxKind::FunctionExpression => select_diagnostic_based_on_module_name(
             r,
             diag::Parameter_0_of_exported_function_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named,
             diag::Parameter_0_of_exported_function_has_or_is_using_name_1_from_private_module_2,
@@ -756,7 +759,7 @@ fn create_return_type_error(node: Node) -> Diagnostic {
 fn create_binding_element_error(node: Node) -> Diagnostic {
     create_diagnostic_for_node(
         node,
-        diag::Binding_elements_can_t_be_exported_directly_with_isolatedDeclarations,
+        diag::Binding_elements_with_initializers_can_t_be_exported_directly_with_isolatedDeclarations,
         args![],
     )
 }

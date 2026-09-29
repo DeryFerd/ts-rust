@@ -13,26 +13,32 @@
 //! <kind>\t<pass|fail|skip>\t<escaped message>
 //! ```
 //!
-//! and `done` last. `kind` is `compile` (the Go test around
-//! `newCompilerTest`), `config` (a skipped configuration), `error`,
-//! `output`, `sourcemap`, `sourcemaprecord`, `types`, `symbols`,
-//! `moduleresolution`, `unionordering`, `parentpointers`, or `test` (a
-//! panic between the subtests). A child that ends without `done` is a
-//! `crash`.
+//! and `done` last. For the compiler runner, `kind` is `compile` (the Go
+//! test around `newCompilerTest`), `config` (a skipped configuration),
+//! `error`, `contentmapper` (Go "content mapper", tsgo#4712), `output`,
+//! `sourcemap`, `sourcemaprecord`, `types`, `symbols`,
+//! `moduleresolution`, `unionordering` or `parentpointers`. For the
+//! transpile runner (transpile_runner.rs), it is `options`, `js` or `dts`.
+//! For both, `test` is a panic between the subtests. A child that ends
+//! without `done` is a `crash`.
 //!
-//! Environment of the parent:
-//! - `COMPILER_RUNNER_FILTER=<substring>`: runs the cases whose key
+//! Environment of the parent. `<P>` is `COMPILER_RUNNER` for `TestLocal`
+//! and `TestSubmodule`, and `TRANSPILE_RUNNER` for `TestTranspile`, so a
+//! run of the default set writes the results of each runner to its own
+//! file:
+//! - `<P>_FILTER=<substring>`: runs the cases whose key
 //!   (`<local|submodule>/<suite>/<configured name>`) contains it.
-//! - `COMPILER_RUNNER_SHARD=<i>/<n>`: runs the test files whose index
-//!   (both runners, in enumeration order) is `i` modulo `n`.
-//! - `COMPILER_RUNNER_JOBS` (default 4): child processes at once.
-//! - `COMPILER_RUNNER_TIMEOUT` (seconds, default 600): a child that runs
-//!   longer is killed and is a `crash`.
-//! - `COMPILER_RUNNER_RESULTS=<file>`: writes every result as
+//! - `<P>_SHARD=<i>/<n>`: runs the test files whose index (in enumeration
+//!   order; for the compiler runner, both of its runners) is `i` modulo `n`.
+//! - `<P>_JOBS` (default 4): child processes at once.
+//! - `<P>_TIMEOUT` (seconds, default 600): a child that runs longer is
+//!   killed and is a `crash`.
+//! - `<P>_RESULTS=<file>`: writes every result as
 //!   `<status>\t<kind>\t<key>\t<escaped message>` and the compared baselines
 //!   as `baseline\t<relative path>`.
-//! - `COMPILER_RUNNER_TMP` (default `tests2/S1/tmp`): request, response and
-//!   stderr files, deleted after use unless `COMPILER_RUNNER_KEEP=1`.
+//! - `COMPILER_RUNNER_TMP` (default `tests2/S1/tmp`, both runners): request,
+//!   response and stderr files, deleted after use unless
+//!   `COMPILER_RUNNER_KEEP=1`.
 //! - `TS_TEST_PROGRAM_SINGLE_THREADED=false` (the Go variable, read by
 //!   `harness::create_program`): programs use more than one checker, as in
 //!   the Go CI job "concurrent test programs". The references are the same.
@@ -53,15 +59,18 @@ use super::runner::{
     CompilerTestType, ConfigCase, Outcome, enumerate_config_cases, new_compiler_baseline_runner,
     payload_text, run_single_config_test,
 };
+use super::transpile_runner;
 
 /// The libtest name of the child test (see mod.rs).
 const CHILD_TEST: &str = "compiler_runner::__compiler_runner_child";
 const REQUEST_ENV: &str = "COMPILER_RUNNER_REQUEST";
-const FILTER_ENV: &str = "COMPILER_RUNNER_FILTER";
-const SHARD_ENV: &str = "COMPILER_RUNNER_SHARD";
-const JOBS_ENV: &str = "COMPILER_RUNNER_JOBS";
-const TIMEOUT_ENV: &str = "COMPILER_RUNNER_TIMEOUT";
-const RESULTS_ENV: &str = "COMPILER_RUNNER_RESULTS";
+/// The environment prefix of the compiler runner (see the module comment).
+const COMPILER_ENV_PREFIX: &str = "COMPILER_RUNNER";
+const FILTER_VAR: &str = "FILTER";
+const SHARD_VAR: &str = "SHARD";
+const JOBS_VAR: &str = "JOBS";
+const TIMEOUT_VAR: &str = "TIMEOUT";
+const RESULTS_VAR: &str = "RESULTS";
 const TMP_ENV: &str = "COMPILER_RUNNER_TMP";
 const KEEP_ENV: &str = "COMPILER_RUNNER_KEEP";
 const DEFAULT_TMP: &str =
@@ -147,12 +156,14 @@ pub fn child_entry() {
             .map(|value| unescape(value))
             .unwrap_or_else(|| panic!("request has no {key}"))
     };
+    let suite = field("suite");
     let case = ConfigCase {
         is_submodule: field("submodule") == "true",
-        suite: if field("suite") == "compiler" {
-            CompilerTestType::Regression.string()
-        } else {
-            CompilerTestType::Conformance.string()
+        suite: match suite.as_str() {
+            "compiler" => CompilerTestType::Regression.string(),
+            "conformance" => CompilerTestType::Conformance.string(),
+            transpile_runner::TRANSPILE_SUITE => transpile_runner::TRANSPILE_SUITE,
+            other => panic!("request has an unknown suite {other}"),
         },
         filename: field("file"),
         configuration: fields.get("configuration").map(|value| unescape(value)),
@@ -200,7 +211,11 @@ pub fn child_entry() {
                 ));
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_single_config_test(&case, &mut report);
+                if case.suite == transpile_runner::TRANSPILE_SUITE {
+                    transpile_runner::run_single_config_test(&case, &mut report);
+                } else {
+                    run_single_config_test(&case, &mut report);
+                }
             }));
             if let Err(payload) = result {
                 report(
@@ -246,9 +261,15 @@ fn keep_files() -> bool {
     std::env::var_os(KEEP_ENV).is_some_and(|value| value == "1")
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
+/// The value of `<prefix>_<name>`, when it is set and not empty.
+fn runner_var(prefix: &str, name: &str) -> Option<String> {
+    std::env::var(format!("{prefix}_{name}"))
         .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn env_usize(prefix: &str, name: &str, default: usize) -> usize {
+    runner_var(prefix, name)
         .and_then(|value| value.parse().ok())
         .filter(|&value| value > 0)
         .unwrap_or(default)
@@ -404,9 +425,9 @@ fn known_failures() -> BTreeMap<(String, String), String> {
     known
 }
 
-/// The shard of `COMPILER_RUNNER_SHARD`: (index, count).
-fn shard() -> Option<(usize, usize)> {
-    let value = std::env::var(SHARD_ENV).ok()?;
+/// The shard of `<prefix>_SHARD`: (index, count).
+fn shard(prefix: &str) -> Option<(usize, usize)> {
+    let value = runner_var(prefix, SHARD_VAR)?;
     let (i, n) = value.split_once('/')?;
     let (i, n): (usize, usize) = (i.parse().ok()?, n.parse().ok()?);
     (n > 0 && i < n).then_some((i, n))
@@ -415,11 +436,8 @@ fn shard() -> Option<(usize, usize)> {
 // Go: compiler_runner_test.go:20 runCompilerTests
 pub fn run_compiler_tests(is_submodule: bool) {
     if is_submodule
-        && !crate::tsoptions::tsoptionstest::type_script_submodule_path()
-            .join("package.json")
-            .exists()
+        && crate::tsoptions::tsoptionstest::skip_if_no_type_script_submodule("TestSubmodule")
     {
-        eprintln!("skipped: TypeScript submodule does not exist");
         return;
     }
 
@@ -447,8 +465,26 @@ pub fn run_compiler_tests(is_submodule: bool) {
         cases.extend(runner_cases);
         failures.extend(errors);
     }
-    let filter = std::env::var(FILTER_ENV).ok().filter(|f| !f.is_empty());
-    let shard = shard();
+    let label = if is_submodule {
+        "compiler runner (submodule)"
+    } else {
+        "compiler runner (local)"
+    };
+    run_cases(label, COMPILER_ENV_PREFIX, cases, failures);
+}
+
+/// The parent side of a runner: runs each case in a child process, reports
+/// the results and panics on a failure that `known_failures.txt` does not
+/// list. `failures` are the failures of the enumeration. `env_prefix` is
+/// the `<P>` of the module comment; `label` names the runner in the log.
+pub fn run_cases(
+    label: &str,
+    env_prefix: &str,
+    mut cases: Vec<ConfigCase>,
+    mut failures: Vec<String>,
+) {
+    let filter = runner_var(env_prefix, FILTER_VAR);
+    let shard = shard(env_prefix);
     cases.retain(|case| {
         filter
             .as_ref()
@@ -456,13 +492,12 @@ pub fn run_compiler_tests(is_submodule: bool) {
             && shard.is_none_or(|(i, n)| case.file_index % n == i)
     });
 
-    let jobs = env_usize(JOBS_ENV, DEFAULT_JOBS);
-    let timeout = Duration::from_secs(env_usize(TIMEOUT_ENV, DEFAULT_TIMEOUT_SECS as usize) as u64);
-    eprintln!(
-        "compiler runner ({}): {} cases, {jobs} jobs",
-        if is_submodule { "submodule" } else { "local" },
-        cases.len()
-    );
+    let jobs = env_usize(env_prefix, JOBS_VAR, DEFAULT_JOBS);
+    let timeout =
+        Duration::from_secs(
+            env_usize(env_prefix, TIMEOUT_VAR, DEFAULT_TIMEOUT_SECS as usize) as u64,
+        );
+    eprintln!("{label}: {} cases, {jobs} jobs", cases.len());
 
     let queue: Arc<Mutex<VecDeque<(usize, ConfigCase)>>> =
         Arc::new(Mutex::new(cases.iter().cloned().enumerate().collect()));
@@ -490,7 +525,7 @@ pub fn run_compiler_tests(is_submodule: bool) {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)[index] = Some(result);
                     let count = finished.fetch_add(1, Ordering::Relaxed) + 1;
                     if count % 500 == 0 {
-                        eprintln!("compiler runner: {count}/{total} cases");
+                        eprintln!("{label}: {count}/{total} cases");
                     }
                 }
             });
@@ -534,9 +569,7 @@ pub fn run_compiler_tests(is_submodule: bool) {
         }
     }
 
-    if let Ok(path) = std::env::var(RESULTS_ENV)
-        && !path.is_empty()
-    {
+    if let Some(path) = runner_var(env_prefix, RESULTS_VAR) {
         let mut text = report_lines.join("\n");
         text.push('\n');
         std::fs::write(&path, text).unwrap_or_else(|err| panic!("cannot write {path}: {err}"));
