@@ -49,8 +49,22 @@ declare const console: { log(msg: any): void; };
     )
 }
 
-// Go: tsc_test.go:14 TestTscCommandline
+// Go: tsc_test.go:15 TestTscCommandline
 fn tsc_commandline_inputs() -> Vec<TscInput> {
+    // Go: tsc_test.go:17 colorTest (ts#63941)
+    let color_test = |sub_scenario: &str, env: &[(&str, &str)], output_is_tty: bool| TscInput {
+        sub_scenario: sub_scenario.into(),
+        files: file_map! {
+            "/home/src/workspaces/project/index.ts" => "const x: string = 1;",
+        },
+        command_line_args: args!["index.ts", "--noEmit"],
+        env: env
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+        output_is_tty: Some(output_is_tty),
+        ..Default::default()
+    };
     vec![
         TscInput {
             sub_scenario: "show help with ExitStatus.DiagnosticsPresent_OutputsSkipped".into(),
@@ -63,28 +77,20 @@ fn tsc_commandline_inputs() -> Vec<TscInput> {
             sub_scenario: "show help with ExitStatus.DiagnosticsPresent_OutputsSkipped when host cannot provide terminal width".into(),
             ..Default::default()
         },
-        TscInput {
-            sub_scenario: "does not add color when NO_COLOR is set".into(),
-            env: BTreeMap::from([
-                ("NO_COLOR".to_string(), "true".to_string()),
-            ]),
-            ..Default::default()
-        },
-        TscInput {
-            sub_scenario: "adds color when FORCE_COLOR is set".into(),
-            env: BTreeMap::from([
-                ("FORCE_COLOR".to_string(), "true".to_string()),
-            ]),
-            ..Default::default()
-        },
-        TscInput {
-            sub_scenario: "does not add color when NO_COLOR is set even if FORCE_COLOR is set".into(),
-            env: BTreeMap::from([
-                ("NO_COLOR".to_string(), "true".to_string()),
-                ("FORCE_COLOR".to_string(), "true".to_string()),
-            ]),
-            ..Default::default()
-        },
+        color_test("does not add color when NO_COLOR is set", &[("NO_COLOR", "true")], true),
+        color_test("adds color when NO_COLOR is empty", &[("NO_COLOR", "")], true),
+        color_test("adds color when FORCE_COLOR is empty and output is not a TTY", &[("FORCE_COLOR", "")], false),
+        color_test("does not add color when FORCE_COLOR is zero", &[("FORCE_COLOR", "0")], true),
+        color_test("adds color when FORCE_COLOR is one and output is not a TTY", &[("FORCE_COLOR", "1")], false),
+        color_test("adds color when FORCE_COLOR is two and output is not a TTY", &[("FORCE_COLOR", "2")], false),
+        color_test("adds color when FORCE_COLOR is three and output is not a TTY", &[("FORCE_COLOR", "3")], false),
+        color_test("does not add color when FORCE_COLOR is four", &[("FORCE_COLOR", "4")], true),
+        color_test("adds color when FORCE_COLOR is true and output is not a TTY", &[("FORCE_COLOR", "true")], false),
+        color_test("does not add color when FORCE_COLOR is false", &[("FORCE_COLOR", "false")], true),
+        color_test("does not add color when FORCE_COLOR is invalid", &[("FORCE_COLOR", "invalid")], true),
+        color_test("FORCE_COLOR overrides NO_COLOR", &[("NO_COLOR", "true"), ("FORCE_COLOR", "true")], false),
+        color_test("does not add color when TERM is dumb", &[("TERM", "dumb")], true),
+        color_test("FORCE_COLOR overrides dumb TERM", &[("TERM", "dumb"), ("FORCE_COLOR", "true")], false),
         TscInput {
             sub_scenario: "when build not first argument".into(),
             command_line_args: args!["--verbose", "--build"],

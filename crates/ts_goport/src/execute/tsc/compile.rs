@@ -89,7 +89,9 @@ pub type ErrorWriter = Arc<Mutex<dyn std::io::Write + Send>>;
 // `SystemTime` and `time.Duration` is `Duration`. Go `Spawn` returns an
 // `io.ReadWriteCloser`; here it is the content mapper's
 // `ProcessExitState` (an `ipc::ReadWriteCloser`, see there), and Go
-// `stderr` `io.Discard` is `None`, as in `contentmapper::Spawner`.
+// `stderr` `io.Discard` is `None`, as in `contentmapper::Spawner`. Go
+// `GetEnvironmentVariable` returns `(string, bool)` as `os.LookupEnv` does
+// (ts#63941): the bool says the variable is set, also when it is empty.
 pub trait System {
     fn writer(&self) -> Writer;
     fn error_writer(&self) -> ErrorWriter;
@@ -98,7 +100,7 @@ pub trait System {
     fn get_current_directory(&self) -> String;
     fn write_output_is_tty(&self) -> bool;
     fn get_width_of_terminal(&self) -> i32;
-    fn get_environment_variable(&self, name: &str) -> String;
+    fn get_environment_variable(&self, name: &str) -> (String, bool);
     fn spawn(
         &self,
         command: &[String],
@@ -114,10 +116,8 @@ pub trait System {
 // PORT: Go `mu` guards the writes; the `ErrorWriter` lock does that here.
 // Go `fmt.Fprintln(writer, message)` is one write of the line.
 pub(crate) fn new_content_mapper_logger(sys: &dyn System) -> Option<ContentMapperLogger> {
-    if sys
-        .get_environment_variable("TS_CONTENT_MAPPER_DEBUG")
-        .is_empty()
-    {
+    let (value, _) = sys.get_environment_variable("TS_CONTENT_MAPPER_DEBUG");
+    if value.is_empty() {
         return None;
     }
     let writer = sys.error_writer();
@@ -384,9 +384,14 @@ impl System for OsSystem {
     fn get_width_of_terminal(&self) -> i32 {
         0
     }
-    // Go: cmd/tsgo/sys.go:64 GetEnvironmentVariable
-    fn get_environment_variable(&self, name: &str) -> String {
-        std::env::var(name).unwrap_or_default()
+    // Go: cmd/tsc/sys.go:64 GetEnvironmentVariable (ts#63941)
+    // PORT: Go `os.LookupEnv`. A set variable whose value is not UTF-8 is
+    // set here too; its value is the lossy UTF-8 text (Go keeps the bytes).
+    fn get_environment_variable(&self, name: &str) -> (String, bool) {
+        match std::env::var_os(name) {
+            Some(value) => (value.to_string_lossy().into_owned(), true),
+            None => (String::new(), false),
+        }
     }
     // Go: cmd/tsgo/sys.go:68 Spawn (tsgo#4712)
     fn spawn(
@@ -1334,11 +1339,11 @@ mod tests {
         fn get_width_of_terminal(&self) -> i32 {
             0
         }
-        fn get_environment_variable(&self, name: &str) -> String {
+        fn get_environment_variable(&self, name: &str) -> (String, bool) {
             if name == "TS_CONTENT_MAPPER_DEBUG" && self.enabled.get() {
-                return "1".to_string();
+                return ("1".to_string(), true);
             }
-            String::new()
+            (String::new(), false)
         }
         fn spawn(
             &self,

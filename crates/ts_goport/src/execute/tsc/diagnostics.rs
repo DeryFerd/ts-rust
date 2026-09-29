@@ -74,13 +74,19 @@ pub fn create_diagnostic_reporter(
     })
 }
 
-// Go: execute/tsc/diagnostics.go:46 defaultIsPretty
+// Go: execute/tsc/diagnostics.go:46 defaultIsPretty (ts#63941)
 fn default_is_pretty(sys: &dyn System) -> bool {
-    if !sys.get_environment_variable("NO_COLOR").is_empty() {
+    let (force_color, ok) = sys.get_environment_variable("FORCE_COLOR");
+    if ok {
+        return matches!(force_color.as_str(), "" | "1" | "2" | "3" | "true");
+    }
+    let (no_color, _) = sys.get_environment_variable("NO_COLOR");
+    if !no_color.is_empty() {
         return false;
     }
-    if !sys.get_environment_variable("FORCE_COLOR").is_empty() {
-        return true;
+    let (term, _) = sys.get_environment_variable("TERM");
+    if term == "dumb" {
+        return false;
     }
     sys.write_output_is_tty()
 }
@@ -104,7 +110,7 @@ pub struct Colors {
     supports_richer_colors: bool,
 }
 
-// Go: execute/tsc/diagnostics.go:72 createColors
+// Go: execute/tsc/diagnostics.go:80 createColors (ts#63941)
 pub fn create_colors(sys: &dyn System) -> Colors {
     if !default_is_pretty(sys) {
         return Colors {
@@ -113,19 +119,19 @@ pub fn create_colors(sys: &dyn System) -> Colors {
         };
     }
 
-    let os = sys.get_environment_variable("OS");
+    let (os, _) = sys.get_environment_variable("OS");
     let is_windows = os.to_lowercase().contains("windows");
-    let is_windows_terminal = !sys.get_environment_variable("WT_SESSION").is_empty();
-    let is_vs_code = sys.get_environment_variable("TERM_PROGRAM") == "vscode";
-    let supports_richer_colors = sys.get_environment_variable("COLORTERM") == "truecolor"
-        || sys.get_environment_variable("TERM") == "xterm-256color";
+    let (wt_session, _) = sys.get_environment_variable("WT_SESSION");
+    let (term_program, _) = sys.get_environment_variable("TERM_PROGRAM");
+    let (color_term, _) = sys.get_environment_variable("COLORTERM");
+    let (term, _) = sys.get_environment_variable("TERM");
 
     Colors {
         show_colors: true,
         is_windows,
-        is_windows_terminal,
-        is_vs_code,
-        supports_richer_colors,
+        is_windows_terminal: !wt_session.is_empty(),
+        is_vs_code: term_program == "vscode",
+        supports_richer_colors: color_term == "truecolor" || term == "xterm-256color",
     }
 }
 

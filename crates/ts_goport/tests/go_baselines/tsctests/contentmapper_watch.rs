@@ -76,7 +76,7 @@ impl System for RecordingContentMapperSystem {
     fn get_width_of_terminal(&self) -> i32 {
         System::get_width_of_terminal(&*self.test_sys)
     }
-    fn get_environment_variable(&self, name: &str) -> String {
+    fn get_environment_variable(&self, name: &str) -> (String, bool) {
         System::get_environment_variable(&*self.test_sys, name)
     }
     // Go: contentmapper_watch_test.go:25 recordingContentMapperSystem.Spawn

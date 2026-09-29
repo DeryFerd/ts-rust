@@ -35,12 +35,8 @@ impl Orchestrator {
         self.wm.borrow().lock();
 
         if self.opts.testing.is_none() {
-            if !self
-                .opts
-                .sys
-                .get_environment_variable("TS_WATCH_DEBUG")
-                .is_empty()
-            {
+            let (value, _) = self.opts.sys.get_environment_variable("TS_WATCH_DEBUG");
+            if !value.is_empty() {
                 self.wm.borrow_mut().debug_log = Some(self.opts.sys.writer());
             }
             self.wm.borrow_mut().ensure_default_backend();

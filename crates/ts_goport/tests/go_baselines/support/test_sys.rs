@@ -414,6 +414,7 @@ pub struct TestSys {
     default_library_path: String,
     cwd: String,
     env: BTreeMap<String, String>,
+    output_is_tty: bool,
 
     // PORT: the child protocol (child.rs).
     mode: SysMode,
@@ -486,6 +487,9 @@ pub fn new_test_sys(tsc_input: &TscInput, for_incremental_correctness: bool) -> 
     let mut sys = new_tsc_system(tsc_input.files.clone(), !tsc_input.ignore_case, cwd);
     sys.default_library_path = lib_path;
     sys.env = tsc_input.env.clone();
+    if let Some(output_is_tty) = tsc_input.output_is_tty {
+        sys.output_is_tty = output_is_tty;
+    }
     sys.for_incremental_correctness = for_incremental_correctness;
     // PORT: `TestSys::new` makes the `mockWatchBackend`.
 
@@ -511,7 +515,8 @@ fn compare_paths_options(use_case_sensitive_file_names: bool, cwd: &str) -> Comp
 
 impl TestSys {
     /// The Go struct literal of `NewTscSystem` and `newTestSys`, and the
-    /// system that a child rebuilds (child.rs).
+    /// system that a child rebuilds (child.rs). Go `NewTscSystem` sets
+    /// `outputIsTTY: true` (ts#63941); `set_output_is_tty` changes it.
     pub fn new(
         shared: SharedFs,
         cwd: String,
@@ -560,6 +565,7 @@ impl TestSys {
             default_library_path,
             cwd,
             env,
+            output_is_tty: true,
             mode,
             child_serialized_mtimes: Arc::new(Mutex::new(None)),
         }
@@ -605,6 +611,12 @@ impl TestSys {
 
     pub fn for_incremental_correctness(&self) -> bool {
         self.for_incremental_correctness
+    }
+
+    /// Go `sys.outputIsTTY = ...` (ts#63941): a child sets the value of
+    /// the runner's system (child.rs).
+    pub fn set_output_is_tty(&mut self, output_is_tty: bool) {
+        self.output_is_tty = output_is_tty;
     }
 
     /// Go `sys.mockWatchBackend` (also Go `WatchBackend()`, sys.go:321).
@@ -949,13 +961,13 @@ impl System for TestSys {
     fn get_current_directory(&self) -> String {
         self.cwd.clone()
     }
-    // Go: sys.go:228 WriteOutputIsTTY
+    // Go: sys.go:233 WriteOutputIsTTY (ts#63941)
     fn write_output_is_tty(&self) -> bool {
-        true
+        self.output_is_tty
     }
-    // Go: sys.go:232 GetWidthOfTerminal
+    // Go: sys.go:237 GetWidthOfTerminal
     fn get_width_of_terminal(&self) -> i32 {
-        let width = self.get_environment_variable("TS_TEST_TERMINAL_WIDTH");
+        let (width, _) = self.get_environment_variable("TS_TEST_TERMINAL_WIDTH");
         if !width.is_empty() {
             // Go `core.Must(strconv.Atoi(widthStr))`
             return width
@@ -964,9 +976,12 @@ impl System for TestSys {
         }
         0
     }
-    // Go: sys.go:239 GetEnvironmentVariable
-    fn get_environment_variable(&self, name: &str) -> String {
-        self.env.get(name).cloned().unwrap_or_default()
+    // Go: sys.go:244 GetEnvironmentVariable (ts#63941)
+    fn get_environment_variable(&self, name: &str) -> (String, bool) {
+        match self.env.get(name) {
+            Some(value) => (value.clone(), true),
+            None => (String::new(), false),
+        }
     }
     // Go: sys.go:246 Spawn (tsgo#4712)
     // Spawn serves the fake content mappers in-process, selecting the implementation by the exec command the

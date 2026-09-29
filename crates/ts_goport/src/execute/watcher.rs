@@ -313,11 +313,8 @@ impl Watcher {
             self.config_file_paths = config_file_paths;
         }
 
-        if !self
-            .sys
-            .get_environment_variable("TS_WATCH_DEBUG")
-            .is_empty()
-        {
+        let (value, _) = self.sys.get_environment_variable("TS_WATCH_DEBUG");
+        if !value.is_empty() {
             self.wm.borrow_mut().debug_log = Some(self.sys.writer());
         }
 
