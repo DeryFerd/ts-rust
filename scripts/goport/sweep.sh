@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: sweep.sh <round>. Oracle (cached) vs goport on more real project configs.
-. "$(dirname "$(realpath "$0")")/exit-rule.sh"
+. "$(dirname "$(realpath "$0")")/exit-rule.sh" || exit 2
 cd /home/theo/Code/sandbox/ts-rust
 B=${GOPORT_BIN:-target/continuation-r97-goport/runtime/cargo-target/release/goport}
 P=target/project-inputs

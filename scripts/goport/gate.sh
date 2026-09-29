@@ -24,7 +24,8 @@
 #                 against Go in the same run. RSS, growth and answers limits are judged; latency is
 #                 reported only, because load changes it. Holds /tmp/goport-lsguard.lock.
 #   corpus-diag   (--full) corpus-p5 1,500-case shard through corpus-full/run_shard_parallel.py
-#   corpus-emit   (--full) emit-corpus/run_emit_shard2.py shard 0 + shard 1 --limit 502
+#   corpus-emit   (--full) emit-corpus/run_emit_shard2.py on the 1,501 case paths of gate-emit-sample.txt
+#                 (next to this script): the cases of each pin's corpus-full shards with those paths
 #
 # Output: target/continuation-r97-goport/compat/gate/<label>/ (never reused). It holds
 # runs/, logs/, items/ and manifest.json (binary hashes, commit, every result).
@@ -42,8 +43,9 @@ X=$REPO/target/project-inputs-extra
 HERE=$(cd "$(dirname "$0")" && pwd)
 SELF=$HERE/$(basename "$0")
 ALLOW=$HERE/gate-allow.txt
+EMIT_SAMPLE=$HERE/gate-emit-sample.txt
 # The exit rule of the measure, determinism and sweep stages: GOPORT_MAX_EXIT from the Go pin.
-. "$HERE/exit-rule.sh"
+. "$HERE/exit-rule.sh" || exit 2
 
 usage() { sed -n '2,/^set -uo/p' "$SELF" | sed '$d'; exit 2; }
 LABEL=${1:-}; [[ -n $LABEL && $LABEL != -* ]] || usage; shift
@@ -63,6 +65,7 @@ for b in goport goport_emit goport_typesyms goport_build tsgo; do
   [[ -x $BINS/$b ]] || { echo "missing binary $BINS/$b" >&2; exit 2; }
 done
 [[ -f $ALLOW ]] || { echo "missing allow-list $ALLOW" >&2; exit 2; }
+[[ -f $EMIT_SAMPLE ]] || { echo "missing corpus-emit sample $EMIT_SAMPLE" >&2; exit 2; }
 if [[ -z $COMMIT && -f $BINS/COMMIT ]]; then COMMIT=$(tr -d '[:space:]' < "$BINS/COMMIT"); fi
 COMMIT_FULL=unknown
 if [[ -n $COMMIT ]]; then
@@ -350,7 +353,12 @@ def cmd_corpus_diag(goport, commit, work, items_file):
     write_items(items_file, items, len(shard))
 
 
-def cmd_corpus_emit(goport_emit, commit, work, items_file):
+def cmd_corpus_emit(goport_emit, commit, work, items_file, sample_file):
+    """The cases whose case path is in sample_file (gate-emit-sample.txt), picked from the pin's corpus-full
+    shards: a pin that adds or renumbers cases keeps the same cases, under the pin's ids. The file holds
+    the 1,501 case paths of the sample at pin 52168999f3dc, shard 0 + the first 502 of shard 1, where the
+    runner gets the same arguments as before (no --ids). A path that the pin lacks gets no item, so the
+    stage has fewer items than expected and fails."""
     work = Path(work).resolve()
     work.mkdir(parents=True)
     sys.path.insert(0, str(R / 'emit-corpus'))
@@ -358,14 +366,22 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file):
     es.here = work  # results must stay under here; CORPUS already points at corpus-full.
     if os.environ.get('GOPORT_PIN_ACTIVE'):  # pin run: the runner asserts the pin oracle's hash
         es.ORACLE_SHA256 = os.environ['GOPORT_PIN_ORACLE_SHA256']
-    items, expected = [], 0
-    # Same 1,500 cases as emit-corpus results-int3/int4: shard 0 (998) + first 502 of shard 1.
-    for shard, limit in ((0, None), (1, 502)):
-        sys.argv = ['run_emit_shard2.py', str(shard), '--jobs', '8', '--results', str(work / 'results'),
-                    '--goport', goport_emit, '--goport-commit', commit] + (['--limit', str(limit)] if limit else [])
-        es.main()
+    sample = [l for l in Path(sample_file).read_text().splitlines() if l and not l.startswith('#')]
+    wanted, found, items = set(sample), set(), []
+    shards = json.loads((R / 'corpus-full/shards/shard-0.json').read_text())['of']
+    for shard in range(shards):
         cases = json.loads((R / f'corpus-full/shards/shard-{shard}.json').read_text())['cases']
-        expected += len(cases[:limit] if limit else cases)
+        picked = [c for c in cases if c['source'] in wanted]
+        if not picked:
+            continue
+        found.update(c['source'] for c in picked)
+        # A prefix of the shard runs with --limit (or all of it with neither), else with --ids.
+        prefix = picked == cases[:len(picked)]
+        pick = ([] if len(picked) == len(cases) else ['--limit', str(len(picked))]) if prefix \
+            else ['--ids', ','.join(c['id'] for c in picked)]
+        sys.argv = ['run_emit_shard2.py', str(shard), '--jobs', '8', '--results', str(work / 'results'),
+                    '--goport', goport_emit, '--goport-commit', commit] + pick
+        es.main()
         result = json.loads((work / f'results/shard-{shard}-result.json').read_text())
         for r in result['rows']:
             bad = r.get('inputsChanged') or r.get('caseDirChanged')
@@ -373,7 +389,9 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file):
             if r.get('firstDifference'):
                 detail += ' first=' + json.dumps(r['firstDifference'])[:200]
             items.append(item('corpus-emit', r['id'], r['class'] == 'MATCH' and not bad, detail + (' INPUTS-CHANGED' if bad else '')))
-    write_items(items_file, items, expected)
+    for source in sorted(wanted - found):
+        print(f'sample case path not in this pin\'s corpus: {source}', flush=True)
+    write_items(items_file, items, len(sample))
 
 
 # ---- allow-list ----
@@ -541,7 +559,7 @@ stage editor editor_bench
 py editor "$OUT/runs/editor/result.json" "$OUT/items/editor.jsonl" 8 >> "$OUT/logs/editor.log" 2>&1
 if [[ $MODE == full ]]; then
   stage corpus-diag py corpus-diag "$BINS/goport" "$COMMIT_FULL" "$OUT/runs/corpus-diag" "$OUT/items/corpus-diag.jsonl"
-  stage corpus-emit py corpus-emit "$BINS/goport_emit" "$COMMIT_FULL" "$OUT/runs/corpus-emit" "$OUT/items/corpus-emit.jsonl"
+  stage corpus-emit py corpus-emit "$BINS/goport_emit" "$COMMIT_FULL" "$OUT/runs/corpus-emit" "$OUT/items/corpus-emit.jsonl" "$EMIT_SAMPLE"
 fi
 
 META=$(python3 - "$LABEL" "$MODE" "$STARTED" "$COMMIT" "$COMMIT_FULL" "$BINS" "$SELF" "$ALLOW" <<'EOF'
@@ -562,7 +580,8 @@ scripts = [R / 'tools-port/measure.sh', R / 'tools-port/measure-extra.sh', Path(
            Path(gate).parent / 'sweep-extra2.sh', Path(gate).parent / 'sweep-wide.sh', Path(gate).parent / 'sweep-hono-runtime.sh',
            R / 'sample-f1/run-f1.py', R / 'emit/compare-emit.sh', R / 'typesyms/compare-int.py',
            R / 'build-mode/compare-build.sh', R / 'corpus-full/run_shard.py', R / 'corpus-full/run_shard_parallel.py',
-           R / 'emit-corpus/run_emit_shard2.py', Path(gate).parent / 'ls_edit_bench.py', Path(gate).parent / 'exit-rule.sh']
+           R / 'emit-corpus/run_emit_shard2.py', Path(gate).parent / 'ls_edit_bench.py', Path(gate).parent / 'exit-rule.sh',
+           Path(gate).parent / 'gate-emit-sample.txt']
 print(json.dumps({
     'label': label, 'mode': mode, 'startedUtc': started, 'commit': commit, 'commitInput': commit_in or None,
     'binsDir': bins,
@@ -585,7 +604,11 @@ print(json.dumps({
                          ('project-inputs-wide', R.parent / 'project-inputs-wide', '*/oracle/**/*'),   # sweep-wide
                          ('sample-f1', R.parent / 'continuation-r104-conformance-sample', 'results/*.oracle.out'),  # f1
                          ('sample-f1-lists', R.parent / 'continuation-r104-conformance-sample', '*.json'),        # f1 cases, classes
-                         ('emit-oracle', Path('/tmp/goport-emit-oracle'), '**/*'))}},  # emit
+                         ('emit-oracle', Path('/tmp/goport-emit-oracle'), '**/*'),       # emit
+                         # corpus-diag and corpus-emit: the case lists that give each id its case path.
+                         ('corpus-full-list', R / 'corpus-full', 'list.json'),
+                         ('corpus-full-shards', R / 'corpus-full/shards', '*.json'),
+                         ('corpus-int3-shards', R / 'corpus-int3/shards', '*.json'))}},
     **({'upstreamPin': os.environ['GOPORT_PIN_ACTIVE']} if os.environ.get('GOPORT_PIN_ACTIVE') else {}),
 }))
 EOF

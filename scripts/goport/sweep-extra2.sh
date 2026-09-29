@@ -5,7 +5,7 @@
 # Line format matches /tmp/port/sweep.sh and sweep-extra.sh.
 # Tracked copy of target/project-inputs-extra/sweep-extra2.sh, which stays unchanged (historical runner rule).
 # Only the exit rule below differs.
-. "$(dirname "$(realpath "$0")")/exit-rule.sh"
+. "$(dirname "$(realpath "$0")")/exit-rule.sh" || exit 2
 [ -n "$1" ] || { echo "usage: $0 <round>" >&2; exit 2; }
 X=/home/theo/Code/sandbox/ts-rust/target/project-inputs-extra
 B=${GOPORT_BIN:-/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/bin/goport-r107}

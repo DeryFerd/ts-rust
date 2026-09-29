@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -38,4 +38,21 @@ test("exit 2 is complete only at the pins in EXIT2_PINS; other pins keep the old
   // Bump B: exit 2 is complete, and a Go "panic: " line is not.
   assert.deepEqual(judge("16c25522e123", RUNS),
     [2, ["complete", "complete", "complete", "INCOMPLETE", "INCOMPLETE", "INCOMPLETE", "INCOMPLETE"]]);
+});
+
+test("a sweep copy without exit-rule.sh next to it stops before any run", () => {
+  // Without the rule, incomplete() would be "command not found" and the sweep would judge by the diff only.
+  const dir = mkdtempSync(join(tmpdir(), "exit-rule-sweep-"));
+  try {
+    for (const sweep of ["sweep.sh", "sweep-wide.sh", "sweep-extra2.sh", "sweep-hono-runtime.sh"]) {
+      copyFileSync(fileURLToPath(new URL(`./${sweep}`, import.meta.url)), join(dir, sweep));
+      const run = spawnSync("bash", [join(dir, sweep), "exit-rule-test"], {
+        env: { ...process.env, GOPORT_BIN: join(dir, "no-goport") }, encoding: "utf8", timeout: 10000 });
+      assert.equal(run.status, 2, `${sweep}: ${run.stderr}`);
+      assert.match(run.stderr, /exit-rule\.sh: No such file or directory/, sweep);
+      assert.equal(run.stdout, "", sweep);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

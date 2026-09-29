@@ -97,12 +97,12 @@ itself to 1.00, the lowest value of the gate's own limit (2 x Go + 1), once the 
 project is at or under 1.00: from then on its item must be MATCH with growth at or under 1.00. A MATCH
 at a higher growth does not lower it, because the gate's limit follows Go's slope and the same bins
 can then FAIL. A pin bump that renumbers the corpus cases names a gate id map in `batch.gateIdMap`
-(`path`, `sha256`; lines of old id, new id and case path, or old id, `-`, case path and the upstream
-commit that removed the case). It applies only when the two manifests are at different upstream pins:
-a mapped id is the same item, and a base allow entry moves only with its own case. A line's case path
-must equal the case path of the base item and of the new item. An unmapped base id of a mapped family,
-or a line that names another case, is a removed id (format and rules in the `gate-compare.py`
-docstring).
+(`path`, `sha256`; lines of old id, new id and case path). It applies only when the two manifests are
+at different upstream pins: a mapped id is the same item, and a base allow entry moves only with its
+own case. A line's case path must equal the case path of the base item and of the new item. The map
+cannot remove a case. An unmapped base id of a mapped family, or a line that names another case, is a
+removed id (format and rules in the `gate-compare.py` docstring). The corpus-emit stage runs the case
+paths of `gate-emit-sample.txt`, so a pin that adds cases keeps the same sample under new ids.
 
 `oracle-compare.py <base results dir> <new results dir>` compares two LSP or API oracle results per
 request: a base request that was `same` or `oracle_error_same` must stay so. It exits 1 on a lost,

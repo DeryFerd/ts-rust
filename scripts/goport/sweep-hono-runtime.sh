@@ -4,7 +4,7 @@
 # Oracle output is saved once under oracle-sweep/<label>.txt and never overwritten.
 # Tracked copy of target/continuation-r97-goport/tools-port/sweep-hono-runtime.sh, which stays unchanged (historical runner rule).
 # Only the exit rule below differs.
-. "$(dirname "$(realpath "$0")")/exit-rule.sh"
+. "$(dirname "$(realpath "$0")")/exit-rule.sh" || exit 2
 [ -n "$1" ] || { echo "usage: $0 <round>" >&2; exit 2; }
 cd /home/theo/Code/sandbox/ts-rust
 B=${GOPORT_BIN:-target/continuation-r97-goport/runtime/cargo-target/release/goport}

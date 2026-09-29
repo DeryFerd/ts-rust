@@ -980,37 +980,36 @@ test("the history row and both verdicts bind the gate id map (skeptic: unbound m
   stopped(f, /gate id map .* does not have the sha256/);
 });
 
-test("a removal line removes a case only at a pin change, with its case path and a cited commit", () => {
-  // Go removed a.ts between the pins: the new run has no a.ts item.
-  const removed = (f, pin) => {
+test("the map cannot remove a case, whatever commit a line cites (skeptic: made-up commit)", () => {
+  // The new run does not hold a.ts: Go removed it, or it left the gate sample. Either way its base id is a removed id.
+  const gone = (f, pin) => {
     renumbered(f, [], pin);
     f.gateNew.results = f.gateNew.results.filter(row => row.id !== "corpus-diag/00002");
   };
-  const line = "corpus-diag/00001\t-\ta.ts\tbbdf7a24b\n";
-  let f = goportFixture(); removed(f); withIdMap(f, line);
-  let result = check(f);
-  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
-  assert.deepEqual(result.gateIdMapRemoved, [{ id: "corpus-diag/00001", source: "a.ts", commit: "bbdf7a24b", line: 1, base: "MATCH" }]);
-  assert.deepEqual([result.counts.gate.baseItems, result.counts.gate.items, result.counts.gate.regressions], [5, 5, 0]);
-  // Without the line the id is a removed id.
-  f = goportFixture(); removed(f);
+  let f = goportFixture(); gone(f);
   assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)), [["corpus-diag/00001", "removed id"]]);
-  // At one Go pin the map has no effect, so the removal line cannot remove an id.
-  f = goportFixture(); removed(f, GO_PIN); withIdMap(f, line);
-  assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)), [["corpus-diag/00001", "removed id"]]);
-  // The new run still holds a.ts (as corpus-diag/00002): it is not removed.
-  f = goportFixture(); renumbered(f); withIdMap(f, line);
+  // A removal line is bad input at a pin change and at one pin: a made-up commit, the pin B commit, tsgo #4407.
+  const need = /line 1: need "<old id> TAB <new id> TAB <case path>" \(the map cannot remove a case\)/;
+  for (const pin of [NEW_PIN, GO_PIN]) {
+    for (const commit of ["deadbeef", "16c25522e123", "bbdf7a24b"]) {
+      f = goportFixture(); gone(f, pin); withIdMap(f, `corpus-diag/00001\t-\ta.ts\t${commit}\n`);
+      stopped(f, need);
+    }
+  }
+  // The skeptic's map: an honest line for each case the new run holds, then a removal line for a.ts.
+  f = goportFixture(); gone(f, NEW_PIN);
+  f.files["gate/r131/manifest.json"].value.results.push({ stage: "corpus-diag", id: "corpus-diag/00005", status: "MATCH", detail: "MATCH b.ts" });
+  f.gateNew.results.push({ stage: "corpus-diag", id: "corpus-diag/00006", status: "MATCH", detail: "MATCH b.ts" });
+  withIdMap(f, "corpus-diag/00005\tcorpus-diag/00006\tb.ts\n");
   assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)),
-    [["corpus-diag/00001", "removed id (id map line 1 removes the case a.ts, but the new run holds it)"]]);
-  // The line names another case path than the base item.
-  f = goportFixture(); removed(f); withIdMap(f, "corpus-diag/00001\t-\tc.ts\tbbdf7a24b\n");
-  assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)),
-    [["corpus-diag/00001", "removed id (id map line 1: c.ts is not the case path of corpus-diag/00001, a.ts)"]]);
-  // A removal cites a commit, and moves nothing.
-  for (const [text, why] of [["corpus-diag/00001\t-\ta.ts\tHEAD\n", /line 1: a removal cites the upstream commit/],
-    ["corpus-diag/00001\t-\ta.ts\n", /line 1: need/], ["corpus-diag/00001\tcorpus-diag/00002\ta.ts\tbbdf7a24b\n", /line 1: need/]]) {
-    f = goportFixture(); removed(f); withIdMap(f, text);
-    stopped(f, why);
+    [["corpus-diag/00001", "removed id (the id map has no line for it, and its family corpus-diag is mapped)"]]);
+  withIdMap(f, "corpus-diag/00005\tcorpus-diag/00006\tb.ts\ncorpus-diag/00001\t-\ta.ts\tdeadbeef\n");
+  stopped(f, /line 2: need/);
+  // Other forms: "-" in any cell, a fourth cell on a move, a missing case path.
+  for (const text of ["corpus-diag/00001\t-\ta.ts\n", "corpus-diag/00001\tcorpus-diag/00002\ta.ts\tdeadbeef\n",
+    "corpus-diag/00001\tcorpus-diag/00002\t-\n", "-\tcorpus-diag/00002\ta.ts\n"]) {
+    f = goportFixture(); gone(f); withIdMap(f, text);
+    stopped(f, need);
   }
 });
 

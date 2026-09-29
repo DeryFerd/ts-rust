@@ -732,7 +732,6 @@ function checkGoport(state, rule, readEvidence, tools) {
     knownOpenGateItems: gate.knownOpen,
     gateFlakes: gateRuns.flakes,
     nameMapRemoved: removed,
-    gateIdMapRemoved: gate.idMap?.removed ?? [],
     losses: { goportTests: [...lost, ...absent, ...unrun], gate: gate.regressions.map(item => ({ id: item.id, base: item.base, now: item.new, why: item.why })) } };
 }
 
@@ -910,19 +909,17 @@ tree, Cargo.toml and Cargo.lock), as candidate.sh reuses it by that key.
   ALLOWED needs allowedBy, no new FAIL, the open editor-long-growth noise rule)
   have one implementation. Its known-open items are in knownOpenGateItems.
 - gateIdMap {path, sha256} (optional): the gate id map of a pin bump, a TSV
-  of old id, new id and case path, or old id, "-", case path and the upstream
-  commit that removed the case (format in gate-compare.py). The file must have
-  that sha256, and the history row and both verdicts carry it as
-  gateIdMapSha256. The check passes it and batch.gateToolChanges to
-  gate-compare.py for the batch gate and each gateRuns run. gate-compare.py
-  uses it only when the base and new manifests are at different Go pins: a
-  mapped id is the same item, and a base allow entry moves only with its own
-  case. A line's case path must equal the case path of the base item and of
-  the new item. An unmapped base id of a mapped family, a missing new id and a
-  line that names two cases give a removed id. A removal line whose case the
-  new run does not hold removes its base id; the output lists those in
-  gateIdMapRemoved for the reviewer, who checks the commit. gateCompare.output
-  must name the same map sha256 in idMap (no idMap without a map).
+  of old id, new id and case path (format in gate-compare.py). It only moves
+  ids: no line can remove a case. The file must have that sha256, and the
+  history row and both verdicts carry it as gateIdMapSha256. The check passes
+  it and batch.gateToolChanges to gate-compare.py for the batch gate and each
+  gateRuns run. gate-compare.py uses it only when the base and new manifests
+  are at different Go pins: a mapped id is the same item, and a base allow
+  entry moves only with its own case. A line's case path must equal the case
+  path of the base item and of the new item. An unmapped base id of a mapped
+  family, a missing new id and a line that names two cases give a removed id.
+  gateCompare.output must name the same map sha256 in idMap (no idMap without
+  a map).
 - gateRuns [{label, manifest, sha256, compare {path, sha256}, regressions
   [{id, base, new, why, flake}]}]: every gate run of the source, oldest
   first, with batch.gate last (accept_revision.py). Each failed run that

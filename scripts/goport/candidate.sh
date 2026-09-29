@@ -612,9 +612,7 @@ if gc:
     m = gc.get('idMap')
     if m:
         ev.append(f"Gate id map {m['path']} sha256 {m['sha256']}: {m['lines']} lines, applied {m['applied']}, {m['mapped']} ids moved, "
-                  f"{len(m['broken'])} broken lines, {len(m['unused'])} unused lines, {len(m['removed'])} removal lines"
-                  + (': ' + '; '.join(f"{r['id']} {r['source']} (commit {r['commit']})" for r in m['removed'][:20]) if m['removed'] else '')
-                  + '. Check each removal commit at the Go pins.')
+                  f"{len(m['broken'])} broken lines, {len(m['unused'])} unused lines. Check that each line is one case at both pins.")
     if gc['regressions']:
         ev.append('Gate regressions: ' + '; '.join(f"{r['id']} {r['base']} -> {r['new']} ({r['why']})" for r in gc['regressions'][:20]) + '.')
         missing.append('gate compare without a regression')
