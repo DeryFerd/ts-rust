@@ -1838,11 +1838,11 @@ pub fn release_program(program: &'static GoProgram) {
 }
 
 /// `release_program` that frees the frontend program and the tables only
-/// when the result drops. Watch mode keeps the result until it reports the
-/// new build, so these frees are not in the rebuild time, and the language
-/// server until it has sent the answer (`ls_program::release_now`). The
-/// checker pool stops at once, as in `release_program`, so the old checkers
-/// do not add to the memory of the new build.
+/// when the result drops. The language server keeps the result until it
+/// has sent the answer (`ls_program::release_now`), so these frees are not
+/// in the answer time. The checker pool stops at once, as in
+/// `release_program`, so the old checkers do not add to the memory of the
+/// next program. Watch mode uses `release_program_in_background`.
 pub fn release_program_later(program: &'static GoProgram) -> ReleasedProgram {
     release_program_with(program, CheckerPool::shut_down)
 }
@@ -1860,8 +1860,8 @@ pub struct ReleasedProgram {
 /// `release_program` that does not wait for the checker workers: they free
 /// their checkers and synthetic nodes on their own threads while the caller
 /// goes on (Go frees a program in the background GC), and the program
-/// tables go when the last of them ends. `tsc -b` uses it, so the next
-/// project does not wait for the free.
+/// tables go when the last of them ends. `tsc -b` and watch mode use it,
+/// so the next project or rebuild does not wait for the free.
 pub fn release_program_in_background(program: &'static GoProgram) {
     drop(release_program_with(
         program,

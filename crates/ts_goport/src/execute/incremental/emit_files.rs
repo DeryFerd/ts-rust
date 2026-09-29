@@ -38,9 +38,9 @@ pub struct EmitUpdate {
 /// The Go `emitFilesHandler` SyncMaps that the `WriteFile` callback writes.
 #[derive(Debug, Default)]
 pub struct EmitFilesShared {
-    pub signatures: IndexMap<Path, String>,
-    pub emit_signatures: IndexMap<Path, EmitSignature>,
-    pub latest_changed_dts_files: IndexMap<Path, String>,
+    pub signatures: FxIndexMap<Path, String>,
+    pub emit_signatures: FxIndexMap<Path, EmitSignature>,
+    pub latest_changed_dts_files: FxIndexMap<Path, String>,
 }
 
 /// One file that `emit_files_incremental` emits: its path, its pending
@@ -52,8 +52,8 @@ pub struct EmitFilesHandler<'a> {
     program: &'a Program,
     is_for_dts_errors: bool,
     shared: Arc<Mutex<EmitFilesShared>>,
-    deleted_pending_kinds: IndexSet<Path>,
-    emit_updates: IndexMap<Path, EmitUpdate>,
+    deleted_pending_kinds: FxIndexSet<Path>,
+    emit_updates: FxIndexMap<Path, EmitUpdate>,
     has_emit_diagnostics: bool,
     /// PORT: not in Go (perf). Where the write callbacks of
     /// `get_emit_options` keep the writes of an early `tsc -b` emit
@@ -854,7 +854,7 @@ pub fn emit_files(program: &Program, options: EmitOptions, is_for_dts_errors: bo
 /// needs.
 pub(crate) struct StartedEmit {
     shared: Arc<Mutex<EmitFilesShared>>,
-    deleted_pending_kinds: IndexSet<Path>,
+    deleted_pending_kinds: FxIndexSet<Path>,
     queued: Vec<QueuedEmit>,
     batch: PendingEmitBatch,
     /// The `WriteFile` of the start. `finish_emit_files` must get the same.

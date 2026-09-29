@@ -362,7 +362,9 @@ pub fn emit_can_start_with_check() -> bool {
 /// `--singleThreaded`, a trace, `preserveSymlinks` (F4), `outFile`, and
 /// `GOPORT_EARLY_EMIT=0`. Then `tsc -p` keeps Go's order exactly: it does
 /// not start the check early either. `tsc -b` starts each check early in
-/// any case, and then emits in Go's order.
+/// any case. When these rules and `check_cannot_see_outputs` allow it, it
+/// also starts the emit behind the check and keeps the writes until the
+/// task finishes (`buffer_early_emit_writes`); else it emits in Go's order.
 #[must_use]
 pub fn early_emit_options_allow() -> bool {
     let options = options();
