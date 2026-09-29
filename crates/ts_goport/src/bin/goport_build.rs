@@ -35,7 +35,7 @@ const UNPORTED_PREFIX: &str = "unported Go code";
 /// jemalloc is the global allocator (default feature `jemalloc`). A build
 /// without the feature uses glibc malloc. See `goport.rs`
 /// `set_malloc_tunables`.
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

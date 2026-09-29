@@ -20,8 +20,11 @@ num-bigint = "=0.4.6"
 num-traits = "=0.2.19"
 ryu-js = "=1.0.2"
 rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "termios"] }
-# fswatch/unix.rs: fanotify_init/fanotify_mark and name_to_handle_at, which
-# rustix does not wrap (safe APIs; see the module comment).
+
+# fswatch/unix.rs (Linux only): fanotify_init/fanotify_mark and
+# name_to_handle_at, which rustix does not wrap (safe APIs; see the module
+# comment).
+[target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "=0.31.3", default-features = false, features = ["fanotify"] }
 name-to-handle-at = "=0.1.0"
 
