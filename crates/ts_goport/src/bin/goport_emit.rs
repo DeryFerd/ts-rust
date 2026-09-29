@@ -63,6 +63,7 @@ use ts_goport::execute::tsc::{
     EXIT_UNPORTED, ExitStatus, ProgramLike, System, Writer, new_os_system, write_go_output,
 };
 use ts_goport::frontend::tsoptions::ParsedCommandLine;
+use ts_goport::frontend::tspath;
 use ts_goport::gostd::context;
 use ts_goport::prelude::*;
 use ts_goport::scanner_util::go_string_bytes;
@@ -133,7 +134,7 @@ fn absolute(path: &str) -> String {
     let cwd = ts_goport::frontend::vfs::os_current_dir()
         .map(|d| d.replace('\\', "/"))
         .unwrap_or_default();
-    ts_path::normalize_path(&ts_path::resolve_path(&cwd, &[path]))
+    tspath::resolve_path(&cwd, &[path])
 }
 
 /// Whether `path` is `dir` or inside it (both absolute and normalized).
@@ -284,7 +285,7 @@ impl TscCompilationHooks for EmitBin {
         let project_dir = if config_file_name.is_empty() {
             sys.get_current_directory()
         } else {
-            ts_path::directory_path(config_file_name)
+            tspath::get_directory_path(config_file_name)
         };
         if self.check_out_dir.get() && is_inside(out_dir, &project_dir) {
             eprintln!(
@@ -305,10 +306,10 @@ impl TscCompilationHooks for EmitBin {
         let out_dir = self.out_dir.get().expect("prepare_compilation ran");
         let inputs: HashSet<String> = source_files()
             .into_iter()
-            .map(|file| ts_path::normalize_path(source_file_file_name(file)))
+            .map(|file| tspath::normalize_path(source_file_file_name(file)))
             .collect();
         for file in source_files() {
-            let dir = ts_path::directory_path(source_file_file_name(file));
+            let dir = tspath::get_directory_path(source_file_file_name(file));
             if self.check_out_dir.get()
                 && !source_file_info(file).is_declaration_file
                 && is_inside(out_dir, &dir)
@@ -344,7 +345,7 @@ fn new_write_file(
 ) -> WriteFile {
     Arc::new(
         move |file_name: &str, text: &str, _data: &mut WriteFileData| -> Result<(), String> {
-            let path = ts_path::normalize_path(file_name);
+            let path = tspath::normalize_path(file_name);
             if !is_inside(&path, &root)
                 || path == root.trim_end_matches('/')
                 || inputs.contains(&path)

@@ -202,7 +202,7 @@ impl Diagnostic {
 
     // Go: ast/diagnostic.go:56 Category
     #[must_use]
-    pub fn category(&self) -> ts_diagnostics::Category {
+    pub fn category(&self) -> crate::diagnostics::Category {
         self.category
     }
 
@@ -266,7 +266,7 @@ impl Diagnostic {
     }
 
     // Go: ast/diagnostic.go:68 SetCategory
-    pub fn set_category(&mut self, category: ts_diagnostics::Category) {
+    pub fn set_category(&mut self, category: crate::diagnostics::Category) {
         self.category = category;
     }
 
@@ -335,7 +335,7 @@ impl Diagnostic {
 // PORT: also Go `diagnostics.Localize` with the default locale; the port has
 // only the English messages. `Message::format` replaces the placeholders,
 // and Go panics on a bad placeholder.
-pub fn format_message(message: &'static ts_diagnostics::Message, args: &[String]) -> String {
+pub fn format_message(message: &'static crate::diagnostics::Message, args: &[String]) -> String {
     // Replace invalid UTF-8 with Unicode replacement character
     // PORT: each arg is the port form of a Go string (see
     // `scanner_util::GO_STRING_MARKER`), so only an arg with a marker can
@@ -366,7 +366,7 @@ pub fn new_diagnostic_from_serialized(
     file: Node,
     loc: TextRange,
     code: i32,
-    category: ts_diagnostics::Category,
+    category: crate::diagnostics::Category,
     message_key: &str,
     message_args: Vec<String>,
     message_chain: Vec<Diagnostic>,
@@ -375,7 +375,7 @@ pub fn new_diagnostic_from_serialized(
     reports_deprecated: bool,
     skipped_on_no_emit: bool,
 ) -> Diagnostic {
-    let message = match ts_diagnostics::message_by_key(message_key) {
+    let message = match crate::diagnostics::message_by_key(message_key) {
         Some(message) => message,
         None => panic!("Unknown diagnostic message: {message_key}"),
     };
@@ -401,7 +401,7 @@ pub fn new_diagnostic_from_serialized(
 pub fn new_diagnostic(
     file: Node,
     loc: TextRange,
-    message: &'static ts_diagnostics::Message,
+    message: &'static crate::diagnostics::Message,
     args: Vec<String>,
 ) -> Diagnostic {
     Diagnostic {
@@ -425,7 +425,7 @@ pub fn new_diagnostic(
 #[must_use]
 pub fn new_diagnostic_chain(
     chain: Option<Diagnostic>,
-    message: &'static ts_diagnostics::Message,
+    message: &'static crate::diagnostics::Message,
     args: Vec<String>,
 ) -> Diagnostic {
     if let Some(chain) = chain {
@@ -443,7 +443,7 @@ pub fn new_diagnostic_chain(
 // PORT: Go `core.UndefinedTextRange()` is `TextRange{-1, -1}`.
 #[must_use]
 pub fn new_compiler_diagnostic(
-    message: &'static ts_diagnostics::Message,
+    message: &'static crate::diagnostics::Message,
     args: Vec<String>,
 ) -> Diagnostic {
     new_diagnostic(Node::NIL, TextRange::new(-1, -1), message, args)

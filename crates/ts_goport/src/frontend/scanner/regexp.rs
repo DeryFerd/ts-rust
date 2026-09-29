@@ -204,7 +204,7 @@ impl<'a> RegExpParser<'a> {
     // Go: scanner/regexp.go:128 error
     fn error(
         &mut self,
-        msg: &'static ts_diagnostics::Message,
+        msg: &'static crate::diagnostics::Message,
         pos: i32,
         length: i32,
         args: Vec<String>,

@@ -582,7 +582,7 @@ fn stringify_json(value: &CompilerOptionsValue, out: &mut String) {
         CompilerOptionsValue::Nil => out.push_str("[]"),
         CompilerOptionsValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         CompilerOptionsValue::Int(i) => out.push_str(&i.to_string()),
-        CompilerOptionsValue::Number(n) => out.push_str(&ts_jsnum::Number(*n).to_string()),
+        CompilerOptionsValue::Number(n) => out.push_str(&crate::jsnum::Number(*n).to_string()),
         CompilerOptionsValue::String(s) => append_json_quote(out, s),
         CompilerOptionsValue::StringList(list) => {
             out.push('[');

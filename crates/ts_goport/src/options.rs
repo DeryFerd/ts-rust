@@ -6,6 +6,7 @@
 //! `ScriptKind`) are defined in `crate::flags` with the Go values. Their Go
 //! methods are added here as inherent impls.
 
+use crate::frontend::tspath;
 use crate::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -423,7 +424,7 @@ impl CompilerOptions {
         }
         let base_dir: String;
         if !self.config_file_path.is_empty() {
-            base_dir = tspath_get_directory_path(&self.config_file_path);
+            base_dir = tspath::get_directory_path(&self.config_file_path);
         } else {
             base_dir = current_directory.to_string();
             if base_dir.is_empty() {
@@ -437,7 +438,7 @@ impl CompilerOptions {
 
         let mut type_roots: Vec<String> = Vec::with_capacity(base_dir.matches('/').count());
         tspath_for_each_ancestor_directory(&base_dir, &mut |dir: &str| {
-            type_roots.push(ts_path::combine_paths(dir, &["node_modules", "@types"]));
+            type_roots.push(tspath::combine_paths(dir, &["node_modules", "@types"]));
             false
         });
         (type_roots, false)
@@ -747,56 +748,13 @@ impl std::fmt::Display for ScriptKind {
 
 // ---------------------------------------------------------------------------
 // tspath helpers used above. Private so they do not clash with a tspath port
-// elsewhere in the crate.
+// elsewhere in the crate. `GetDirectoryPath` and `GetBaseFileName` are the
+// `frontend::tspath` ports.
 // ---------------------------------------------------------------------------
-
-// Go: tspath/path.go:697 RemoveTrailingDirectorySeparator
-fn tspath_remove_trailing_directory_separator(path: &str) -> &str {
-    if path.ends_with('/') || path.ends_with('\\') {
-        return &path[..path.len() - 1];
-    }
-    path
-}
-
-// Go: tspath/path.go:250 GetDirectoryPath
-fn tspath_get_directory_path(path: &str) -> String {
-    let path = ts_path::normalize_slashes(path);
-
-    // If the path provided is itself a root, then return it.
-    let root_length = ts_path::root_length(&path);
-    if root_length == path.len() {
-        return path;
-    }
-
-    // return the leading portion of the path up to the last (non-terminal) directory separator
-    // but not including any trailing directory separator.
-    let path = tspath_remove_trailing_directory_separator(&path);
-    let last = path.rfind('/').map_or(-1, |i| i as i64);
-    let end = std::cmp::max(root_length as i64, last) as usize;
-    path[..end].to_string()
-}
-
-// Go: tspath/path.go:840 GetBaseFileName
-fn tspath_get_base_file_name(path: &str) -> String {
-    let path = ts_path::normalize_slashes(path);
-
-    // if the path provided is itself the root, then it has no file name.
-    let root_length = ts_path::root_length(&path);
-    if root_length == path.len() {
-        return String::new();
-    }
-
-    // return the trailing portion of the path starting after the last (non-terminal) directory
-    // separator but not including any trailing directory separator.
-    let path = tspath_remove_trailing_directory_separator(&path);
-    let after_sep = path.rfind('/').map_or(0, |i| i + 1);
-    let start = std::cmp::max(ts_path::root_length(path), after_sep);
-    path[start..].to_string()
-}
 
 // Go: tspath/extension.go:111 GetDeclarationFileExtension
 fn tspath_get_declaration_file_extension(file_name: &str) -> String {
-    let base = tspath_get_base_file_name(file_name);
+    let base = tspath::get_base_file_name(file_name);
     // Go: tspath.SupportedDeclarationExtensions
     for ext in [".d.ts", ".d.cts", ".d.mts"] {
         if base.ends_with(ext) {
@@ -828,7 +786,7 @@ fn tspath_for_each_ancestor_directory(
             return true;
         }
 
-        let parent_path = tspath_get_directory_path(&directory);
+        let parent_path = tspath::get_directory_path(&directory);
         if parent_path == directory {
             return false;
         }

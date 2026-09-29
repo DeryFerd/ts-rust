@@ -1455,7 +1455,7 @@ impl Checker {
             p1_add_length(b, go_len(&literal_text) + 2);
             expression =
                 self.nb_new_string_literal_ex(b, &literal_text, symbol_name.starts_with('\''));
-        } else if ts_jsnum::from_string(&symbol_name).to_string() == symbol_name {
+        } else if crate::jsnum::from_string(&symbol_name).to_string() == symbol_name {
             // TODO: the follwing in strada would assert if the number is negative, but no such assertion exists here
             // Moreover, what's even guaranteeing the name *isn't* -1 here anyway? Needs double-checking.
             p1_add_length(b, go_len(&symbol_name));

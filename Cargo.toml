@@ -1,11 +1,5 @@
 [workspace]
 members = [
-    "crates/ts_core",
-    "crates/ts_ast",
-    "crates/ts_path",
-    "crates/ts_jsnum",
-    "crates/ts_scanner",
-    "crates/ts_diagnostics",
     "crates/ts_goport",
     "crates/ts_goport/parts/goport_lsproto",
     "crates/ts_goport/parts/goport_util",

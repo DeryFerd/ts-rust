@@ -2,8 +2,8 @@
 //! control flow binding, narrowing predicates, declaration helpers and binder
 //! diagnostics.
 
+use crate::astdata::NodeData;
 use crate::prelude::*;
-use ts_ast::NodeData;
 
 // PORT: Binder storage used by this file. Go stores binder output on the AST
 // nodes and flow nodes directly. The Rust `Binder` (defined in binder_p1)
@@ -1311,7 +1311,7 @@ impl Binder {
     pub fn error_on_node(
         &mut self,
         node: Node,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
         args: Vec<String>,
     ) {
         let diagnostic = self.create_diagnostic_for_node(node, message, args);
@@ -1322,7 +1322,7 @@ impl Binder {
     pub fn error_on_first_token(
         &mut self,
         node: Node,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
         args: Vec<String>,
     ) {
         let span = get_range_of_token_at_position(self.file, node.pos());
@@ -1334,7 +1334,7 @@ impl Binder {
         &mut self,
         is_error: bool,
         node: Node,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
     ) {
         self.error_or_suggestion_on_range(is_error, node, node, message);
     }
@@ -1345,7 +1345,7 @@ impl Binder {
         is_error: bool,
         start_node: Node,
         end_node: Node,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
     ) {
         // PORT: Go `core.NewTextRange(pos, end)` -> `TextRange::new(pos, end)`.
         let text_range = TextRange::new(
@@ -1356,7 +1356,7 @@ impl Binder {
         if is_error {
             self.add_diagnostic(diagnostic);
         } else {
-            diagnostic.category = ts_diagnostics::Category::Suggestion;
+            diagnostic.category = crate::diagnostics::Category::Suggestion;
             self.file_bind.bind_suggestion_diagnostics.push(diagnostic);
         }
     }
@@ -1368,7 +1368,7 @@ impl Binder {
     pub fn create_diagnostic_for_node(
         &mut self,
         node: Node,
-        message: &'static ts_diagnostics::Message,
+        message: &'static crate::diagnostics::Message,
         args: Vec<String>,
     ) -> Diagnostic {
         new_diagnostic(

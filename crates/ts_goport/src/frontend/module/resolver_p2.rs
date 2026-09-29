@@ -1206,7 +1206,7 @@ impl ResolutionState<'_> {
     // PORT: the Go method value `r.tracer.write` is a closure over the shared tracer.
     pub fn get_trace_func(
         &self,
-    ) -> Option<Box<dyn Fn(&'static ts_diagnostics::Message, Vec<String>)>> {
+    ) -> Option<Box<dyn Fn(&'static crate::diagnostics::Message, Vec<String>)>> {
         if let Some(tracer) = &self.tracer {
             let tracer = tracer.clone();
             return Some(Box::new(move |m, args| tracer.borrow_mut().write(m, args)));

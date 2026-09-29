@@ -21,7 +21,7 @@ fn test_localize() {
     let und = Locale(language::Tag::UND);
     let tests: Vec<(
         &str,
-        &'static ts_diagnostics::Message,
+        &'static ts_goport::diagnostics::Message,
         Locale,
         Vec<&str>,
         &str,

@@ -3,8 +3,8 @@
 //! throw/try/catch) and class declaration checks (heritage, overrides,
 //! index constraints).
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
-use ts_diagnostics::Message;
 
 // PORT: Go `core.OrElse(node, fallback)` for node handles.
 fn or_else_node(node: Node, fallback: Node) -> Node {

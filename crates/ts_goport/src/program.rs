@@ -17,11 +17,11 @@
 //! checker pool of each version, by program id.
 
 use crate::execute::tsc::compile::CompileTimes;
+use crate::frontend::tspath;
 use crate::gostd::{Context, context};
 use crate::prelude::*;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use ts_path::CaseSensitivity;
 
 mod go_frontend;
 pub mod ls_program;
@@ -502,7 +502,7 @@ type JobResult<R> = std::thread::Result<R>;
 /// are in `VersionTables` (`with_tables`), which a release frees.
 pub(crate) struct ProgramState {
     cwd: String,
-    case_sensitivity: CaseSensitivity,
+    use_case_sensitive_file_names: bool,
     /// `get_resolved_modules`: an alias resolver program only (empty).
     resolved_modules:
         OnceLock<IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>>>,
@@ -862,11 +862,6 @@ pub fn new_alias_resolver_program(
     use_case_sensitive_file_names: bool,
     resolver: Rc<dyn AliasResolverProgram>,
 ) -> AliasResolverProgramScope {
-    let case_sensitivity = if use_case_sensitive_file_names {
-        CaseSensitivity::Sensitive
-    } else {
-        CaseSensitivity::Insensitive
-    };
     let file_by_path = files
         .iter()
         .map(|&file| (source_file_info(file).path.clone(), file.file_index()))
@@ -880,7 +875,7 @@ pub fn new_alias_resolver_program(
     }));
     let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
         cwd: current_directory.to_string(),
-        case_sensitivity,
+        use_case_sensitive_file_names,
         resolved_modules: OnceLock::from(IndexMap::new()),
         common_source_directory: OnceLock::new(),
         alias_resolver: true,
@@ -1634,7 +1629,7 @@ pub fn get_current_directory() -> &'static str {
 
 // Go: compiler/program.go:215 UseCaseSensitiveFileNames
 pub fn use_case_sensitive_file_names() -> bool {
-    state().case_sensitivity == CaseSensitivity::Sensitive
+    state().use_case_sensitive_file_names
 }
 
 // Go: compiler/program.go:219 UsesUriStyleNodeCoreModules
@@ -2060,114 +2055,6 @@ pub fn common_source_directory() -> &'static str {
         .expect("the Go frontend sets the common source directory")
 }
 
-// Go: outputpaths/commonsourcedirectory.go:59 GetCommonSourceDirectory
-// PORT: Go `checkSourceFilesBelongToPath` reports TS6059 (file not under
-// rootDir) as include processor diagnostics. It is not run here.
-fn get_common_source_directory(
-    options: &CompilerOptions,
-    files: impl FnOnce() -> Vec<String>,
-    current_directory: &str,
-    case_sensitivity: CaseSensitivity,
-) -> String {
-    let common_source_directory = if !options.root_dir.is_empty() {
-        // If a rootDir is specified use it as the commonSourceDirectory
-        options.root_dir.clone()
-    } else if !options.config_file_path.is_empty() {
-        // If the rootDir is not specified, then the common source directory is the directory of the config file.
-        ts_path::directory_path(&options.config_file_path)
-    } else {
-        compute_common_source_directory_of_filenames(&files(), current_directory, case_sensitivity)
-    };
-    if common_source_directory.is_empty() {
-        return common_source_directory;
-    }
-    // Make sure directory path ends with directory separator so this string can directly
-    // used to replace with "" to get the relative path of the source file and the relative path doesn't
-    // start with / making it rooted path
-    ts_path::ensure_trailing_directory_separator(&common_source_directory)
-}
-
-// Go: tspath GetNormalizedPathComponents (root first, then the parts)
-fn get_normalized_path_components(path: &str, current_directory: &str) -> Vec<String> {
-    let absolute = ts_path::resolve_path(current_directory, &[path]);
-    let root_len = if absolute.starts_with('/') {
-        1
-    } else if absolute.as_bytes().get(1) == Some(&b':') {
-        if absolute.as_bytes().get(2) == Some(&b'/') {
-            3
-        } else {
-            2
-        }
-    } else {
-        0
-    };
-    let mut components = vec![absolute[..root_len].to_string()];
-    components.extend(
-        absolute[root_len..]
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .map(str::to_string),
-    );
-    components
-}
-
-// Go: tspath GetPathFromPathComponents
-fn get_path_from_path_components(components: &[String]) -> String {
-    let Some((root, rest)) = components.split_first() else {
-        return String::new();
-    };
-    let root = if root.is_empty() {
-        String::new()
-    } else {
-        ts_path::ensure_trailing_directory_separator(root)
-    };
-    format!("{root}{}", rest.join("/"))
-}
-
-// Go: outputpaths/commonsourcedirectory.go:8 computeCommonSourceDirectoryOfFilenames
-fn compute_common_source_directory_of_filenames(
-    file_names: &[String],
-    current_directory: &str,
-    case_sensitivity: CaseSensitivity,
-) -> String {
-    let mut common_path_components: Option<Vec<String>> = None;
-    for source_file in file_names {
-        // Each file contributes into common source file path
-        let mut source_path_components =
-            get_normalized_path_components(source_file, current_directory);
-        // The base file name is not part of the common directory path
-        source_path_components.pop();
-        let Some(common) = common_path_components.as_mut() else {
-            // first file
-            common_path_components = Some(source_path_components);
-            continue;
-        };
-        let n = common.len().min(source_path_components.len());
-        for i in 0..n {
-            if ts_path::canonical_file_name(&common[i], case_sensitivity)
-                != ts_path::canonical_file_name(&source_path_components[i], case_sensitivity)
-            {
-                if i == 0 {
-                    // Failed to find any common path component
-                    return String::new();
-                }
-                // New common path found that is 0 -> i-1
-                common.truncate(i);
-                break;
-            }
-        }
-        // If the sourcePathComponents was shorter than the commonPathComponents, truncate to the sourcePathComponents
-        if source_path_components.len() < common.len() {
-            common.truncate(source_path_components.len());
-        }
-    }
-    match common_path_components {
-        Some(common) if !common.is_empty() => get_path_from_path_components(&common),
-        // Can happen when all input files are .d.ts files
-        _ => current_directory.to_string(),
-    }
-}
-
 // Go: compiler/program.go:1912 IsSourceFileFromExternalLibrary
 pub fn is_source_file_from_external_library(file: Node) -> bool {
     let path = &source_file_info(file).path;
@@ -2221,43 +2108,37 @@ fn source_file_may_be_emitted_worker(source_file: Node, force_dts_emit: bool) ->
     // Otherwise, if rootDir is specified or a config file exists, we know the common source directory and can check if the file would be emitted in the same location
     if !options.root_dir.is_empty() || !options.config_file_path.is_empty() {
         let cwd = get_current_directory();
-        let cs = state().case_sensitivity;
-        let common_dir = ts_path::resolve_path(
+        let case_sensitive = use_case_sensitive_file_names();
+        let common_dir = tspath::get_normalized_absolute_path(
+            &crate::frontend::outputpaths::get_common_source_directory(
+                options,
+                Vec::new,
+                cwd,
+                case_sensitive,
+                None,
+            ),
             cwd,
-            &[&get_common_source_directory(options, Vec::new, cwd, cs)],
         );
-        let output_path = get_source_file_path_in_new_dir_worker(
+        let output_path = crate::frontend::outputpaths::get_source_file_path_in_new_dir_worker(
             &info.file_name,
             &options.out_dir,
             cwd,
             &common_dir,
-            cs,
+            case_sensitive,
         );
-        if ts_path::canonicalize(&info.file_name, cwd, cs)
-            == ts_path::canonicalize(&output_path, cwd, cs)
+        if tspath::compare_paths(
+            &info.file_name,
+            &output_path,
+            &tspath::ComparePathsOptions {
+                use_case_sensitive_file_names: case_sensitive,
+                current_directory: cwd.to_string(),
+            },
+        ) == 0
         {
             return false;
         }
     }
     true
-}
-
-// Go: outputpaths/outputpaths.go GetSourceFilePathInNewDirWorker
-fn get_source_file_path_in_new_dir_worker(
-    file_name: &str,
-    new_dir_path: &str,
-    current_directory: &str,
-    common_source_directory: &str,
-    case_sensitivity: CaseSensitivity,
-) -> String {
-    let mut source_file_path = ts_path::resolve_path(current_directory, &[file_name]);
-    let common = ts_path::ensure_trailing_directory_separator(common_source_directory);
-    let is_in_common = ts_path::canonical_file_name(&source_file_path, case_sensitivity)
-        .starts_with(&ts_path::canonical_file_name(&common, case_sensitivity));
-    if is_in_common {
-        source_file_path = source_file_path[common.len().min(source_file_path.len())..].to_string();
-    }
-    ts_path::combine_paths(new_dir_path, &[&source_file_path])
 }
 
 // Go: compiler/program.go:1792 GetSourceFile
@@ -2266,8 +2147,12 @@ pub fn get_source_file(file_name: &str) -> Node {
     if let Some(resolver) = alias_resolver() {
         return resolver.source_file(file_name);
     }
-    let path = ts_path::canonicalize(file_name, get_current_directory(), state().case_sensitivity);
-    get_source_file_by_path(&path)
+    let path = tspath::to_path(
+        file_name,
+        get_current_directory(),
+        use_case_sensitive_file_names(),
+    );
+    get_source_file_by_path(path.as_str())
 }
 
 // Go: compiler/program.go:1812 GetSourceFileByPath
@@ -3642,7 +3527,7 @@ pub fn get_diagnostics_of_any_program(
 // PORT: built on each call from the generated message statics (a static set
 // cannot read them at compile time). It is only used for plain JS files.
 fn is_plain_js_error(code: i32) -> bool {
-    let messages: [&'static ts_diagnostics::Message; 91] = [
+    let messages: [&'static crate::diagnostics::Message; 91] = [
         // binder errors
         diag::Cannot_redeclare_block_scoped_variable_0,
         diag::A_module_cannot_have_multiple_default_exports,
@@ -3745,18 +3630,6 @@ fn is_plain_js_error(code: i32) -> bool {
 // Output (Go diagnosticwriter/diagnosticwriter.go, non-pretty)
 // ---------------------------------------------------------------------------
 
-// Go: tspath ConvertToRelativePath
-fn convert_to_relative_path(file_name: &str) -> String {
-    if !ts_path::is_rooted_disk_path(file_name) {
-        return file_name.to_string();
-    }
-    ts_path::relative_path_from_directory(
-        get_current_directory(),
-        file_name,
-        state().case_sensitivity,
-    )
-}
-
 // Go: diagnosticwriter/diagnosticwriter.go:467 WriteFormatDiagnostic
 // PORT: Go writes to an io.Writer; this returns the text.
 pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
@@ -3765,9 +3638,13 @@ pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
         let (line, character) =
             get_ecma_line_and_utf16_character_of_position(diagnostic.file, diagnostic.pos);
         let file_name = &source_file_info(diagnostic.file).file_name;
+        let compare_options = tspath::ComparePathsOptions {
+            use_case_sensitive_file_names: use_case_sensitive_file_names(),
+            current_directory: get_current_directory().to_string(),
+        };
         output.push_str(&format!(
             "{}({},{}): ",
-            convert_to_relative_path(file_name),
+            tspath::convert_to_relative_path(file_name, &compare_options),
             line + 1,
             character + 1
         ));

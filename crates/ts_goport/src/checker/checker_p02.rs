@@ -6,9 +6,9 @@
 //! `new_diagnostic_for_node`, finish it, then call `add_diagnostic`. That is
 //! exactly what Go `c.error` does, in the same order of effects.
 
+use crate::diagnostics::Message;
 use crate::prelude::*;
 use std::cell::Cell;
-use ts_diagnostics::Message;
 
 // Go: checker/checker.go:1116 createFileIndexMap
 pub fn create_file_index_map(files: &[Node]) -> FxHashMap<Node, i32> {

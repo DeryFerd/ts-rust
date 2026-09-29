@@ -28,7 +28,8 @@ go_flags!(EscapeSequenceScanningFlags, i32 {
 });
 
 /// Go `ErrorCallback func(diagnostic *diagnostics.Message, start, length int, args ...any)`.
-pub type ErrorCallback = Box<dyn FnMut(&'static ts_diagnostics::Message, i32, i32, Vec<String>)>;
+pub type ErrorCallback =
+    Box<dyn FnMut(&'static crate::diagnostics::Message, i32, i32, Vec<String>)>;
 
 // ---------------------------------------------------------------------------
 // Go `unicode/utf8` helpers.
@@ -349,7 +350,7 @@ pub(crate) static TEXT_TO_PUNCTUATION: &[(&str, SyntaxKind)] = &[
 // (`tests::text_to_keyword_matches_table` checks this). `crate::scanner_util`
 // uses it too.
 pub(crate) fn text_to_keyword(text: &str) -> SyntaxKind {
-    use ts_ast::SyntaxKind as K;
+    use crate::astdata::SyntaxKind as K;
     let b = text.as_bytes();
     match b.len() {
         2 => match b {
@@ -847,14 +848,14 @@ impl Scanner {
     }
 
     // Go: scanner/scanner.go:421 error
-    pub(crate) fn error(&mut self, diagnostic: &'static ts_diagnostics::Message) {
+    pub(crate) fn error(&mut self, diagnostic: &'static crate::diagnostics::Message) {
         self.error_at(diagnostic, self.scanner_state.pos, 0, Vec::new());
     }
 
     // Go: scanner/scanner.go:425 errorAt
     pub(crate) fn error_at(
         &mut self,
-        diagnostic: &'static ts_diagnostics::Message,
+        diagnostic: &'static crate::diagnostics::Message,
         pos: i32,
         length: i32,
         args: Vec<String>,
@@ -955,11 +956,12 @@ impl Scanner {
     pub(crate) fn scan_conflict_marker_trivia_at_pos(&mut self) -> i32 {
         let text: &str = &self.text;
         let on_error = &mut self.on_error;
-        let mut report = |diagnostic: &'static ts_diagnostics::Message, pos: i32, length: i32| {
-            if let Some(on_error) = on_error.as_mut() {
-                on_error(diagnostic, pos, length, Vec::new());
-            }
-        };
+        let mut report =
+            |diagnostic: &'static crate::diagnostics::Message, pos: i32, length: i32| {
+                if let Some(on_error) = on_error.as_mut() {
+                    on_error(diagnostic, pos, length, Vec::new());
+                }
+            };
         scan_conflict_marker_trivia(text, self.scanner_state.pos as usize, Some(&mut report)) as i32
     }
 

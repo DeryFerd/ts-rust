@@ -27,9 +27,9 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use ts_diagnostics::Message;
 use ts_goport::core::version;
 use ts_goport::diag;
+use ts_goport::diagnostics::Message;
 use ts_goport::diagnostics_loc::message_localize;
 use ts_goport::emitter::program_emit::EmitResult;
 use ts_goport::execute::incremental::build_info::BuildInfo;

@@ -766,10 +766,12 @@ impl JsxTransformer {
             // writes the flags without the `NewStringLiteral` mask.
             replace_node_data(
                 res,
-                ts_ast::NodeData::StringLiteral(Box::new(ts_ast::StringLiteralData {
-                    text: res.text().to_string(),
-                    token_flags: ts_ast::TokenFlags(node.token_flags().bits() as u32),
-                })),
+                crate::astdata::NodeData::StringLiteral(Box::new(
+                    crate::astdata::StringLiteralData {
+                        text: res.text().to_string(),
+                        token_flags: crate::astdata::TokenFlags(node.token_flags().bits() as u32),
+                    },
+                )),
             );
             return res;
         }

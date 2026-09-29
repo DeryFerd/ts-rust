@@ -1,12 +1,12 @@
 //! Go: `internal/jsnum/{jsnum,pseudobigint,string,ryu}_test.go`, run on the
-//! `ts_jsnum` crate (the Number type of the goport).
+//! `ts_goport::jsnum` module (the Number type of the goport).
 //!
 //! The `Node` subtests run the same inputs through Node.js, as Go does
 //! (`jstest.EvalNodeScript`), and are skipped when Node.js is not found.
 
 use std::path::Path;
 
-use ts_jsnum::{MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, Number, PseudoBigInt};
+use ts_goport::jsnum::{MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, Number, PseudoBigInt};
 
 use super::Failures;
 use crate::astnav_api::jstest;
@@ -512,7 +512,7 @@ fn test_parse_pseudo_big_int() {
             let lit = format!("{}{}n", "0".repeat(leading_zeros), test_number);
             failures.check_eq(
                 "strip base-10 strings",
-                ts_jsnum::parse_pseudo_big_int(&lit),
+                ts_goport::jsnum::parse_pseudo_big_int(&lit),
                 test_number.to_string(),
             );
         }
@@ -539,7 +539,7 @@ fn test_parse_pseudo_big_int() {
     for (lit, out) in cases {
         failures.check_eq(
             &format!("parse non-decimal bases {lit:?}"),
-            ts_jsnum::parse_pseudo_big_int(lit),
+            ts_goport::jsnum::parse_pseudo_big_int(lit),
             out.to_string(),
         );
     }
@@ -554,7 +554,7 @@ fn test_parse_pseudo_big_int() {
     ] {
         failures.check_eq(
             &format!("can parse large literals {lit}"),
-            ts_jsnum::parse_pseudo_big_int(lit),
+            ts_goport::jsnum::parse_pseudo_big_int(lit),
             want.to_string(),
         );
     }
@@ -889,23 +889,33 @@ fn test_from_string() {
     let mut failures = Failures::new("TestFromString");
     for (number, s) in string_tests() {
         let name = format!("stringTests/{s}");
-        check_number(&mut failures, &name, ts_jsnum::from_string(s).0, number);
         check_number(
             &mut failures,
             &name,
-            ts_jsnum::from_string(&format!("{s} ")).0,
+            ts_goport::jsnum::from_string(s).0,
             number,
         );
         check_number(
             &mut failures,
             &name,
-            ts_jsnum::from_string(&format!(" {s}")).0,
+            ts_goport::jsnum::from_string(&format!("{s} ")).0,
+            number,
+        );
+        check_number(
+            &mut failures,
+            &name,
+            ts_goport::jsnum::from_string(&format!(" {s}")).0,
             number,
         );
     }
     for (number, s) in from_string_tests() {
         let name = format!("fromStringTests/{s:?}");
-        check_number(&mut failures, &name, ts_jsnum::from_string(s).0, number);
+        check_number(
+            &mut failures,
+            &name,
+            ts_goport::jsnum::from_string(s).0,
+            number,
+        );
     }
     failures.finish();
 }
@@ -915,7 +925,11 @@ fn test_from_string() {
 fn test_string_roundtrip() {
     let mut failures = Failures::new("TestStringRoundtrip");
     for (_, s) in string_tests() {
-        failures.check_eq(s, ts_jsnum::from_string(s).to_string(), s.to_string());
+        failures.check_eq(
+            s,
+            ts_goport::jsnum::from_string(s).to_string(),
+            s.to_string(),
+        );
     }
     failures.finish();
 }

@@ -1,4 +1,5 @@
-//! JavaScript-compatible `Number` operations and pseudo-bigint handling.
+//! JavaScript-compatible `Number` operations and pseudo-bigint handling. This
+//! was the `ts_jsnum` crate.
 
 use std::{fmt, ops};
 

@@ -10,6 +10,7 @@ use crate::ast::store::{
     file_store_contains_non_ascii, file_store_file_name, file_store_parser_flags,
     publish_file_stores, unpublished_file_ids,
 };
+use crate::diagnostics::Message;
 use crate::frontend::bundled;
 use crate::frontend::compiler::{
     NewProgram, ProgramOptions, TraceFn, new_cached_fs_compiler_host, new_program,
@@ -19,11 +20,11 @@ use crate::frontend::parser::{ParsedSourceFile, SourceFileParseOptions};
 use crate::frontend::tsoptions::{
     ParseConfigHost, ParsedCommandLine, get_parsed_command_line_of_config_file,
 };
+use crate::frontend::tspath;
 use crate::frontend::tspath::Path as GoPath;
 use crate::frontend::vfs::{Fs, osvfs_fs};
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
-use ts_diagnostics::Message;
 
 /// Thread-safe copies of the Go frontend data that checker code reads.
 /// Built once on the loading thread, before any checker exists.
@@ -280,7 +281,8 @@ pub(super) fn unpublished_parsed_source_file(store: usize) -> Option<Rc<ParsedSo
 /// `publish_parsed_files` (program.rs).
 pub(super) fn publish_parsed_files(cwd: &str) {
     let parsed = FxHashMap::default();
-    let files = go_files_of_unpublished_stores(&parsed, cwd, case_sensitivity());
+    let files =
+        go_files_of_unpublished_stores(&parsed, cwd, osvfs_fs().use_case_sensitive_file_names());
     publish_file_stores(files);
 }
 
@@ -342,15 +344,6 @@ pub(super) fn file_exists(path: &str) -> bool {
     WORKER_FS.with(|fs| fs.file_exists(path))
 }
 
-/// The case sensitivity of the OS file system.
-fn case_sensitivity() -> CaseSensitivity {
-    if osvfs_fs().use_case_sensitive_file_names() {
-        CaseSensitivity::Sensitive
-    } else {
-        CaseSensitivity::Insensitive
-    }
-}
-
 /// The Go files of this thread's unpublished stores, in store id order
 /// (`publish_file_stores`). `parsed` holds the program files by store id.
 /// A store that is not a program file is a file that the language server
@@ -360,7 +353,7 @@ fn case_sensitivity() -> CaseSensitivity {
 fn go_files_of_unpublished_stores(
     parsed: &FxHashMap<usize, &Rc<ParsedSourceFile>>,
     cwd: &str,
-    case_sensitivity: CaseSensitivity,
+    use_case_sensitive_file_names: bool,
 ) -> Vec<GoFile> {
     let outside = PARSED_UNPUBLISHED.with(|outside| std::mem::take(&mut *outside.borrow_mut()));
     // `files[i]` is the GoFile of store `unpublished_file_ids().start + i`.
@@ -392,7 +385,7 @@ fn go_files_of_unpublished_stores(
             });
         let info = match file {
             Some(file) => program_file_info(store, file),
-            None => other_store_info(store, cwd, case_sensitivity),
+            None => other_store_info(store, cwd, use_case_sensitive_file_names),
         };
         // PORT: a store that is not a parsed source file (a config file) is
         // never bound or checked, so its root is not read.
@@ -412,7 +405,7 @@ fn go_files_of_unpublished_stores(
 /// The process current directory, normalized.
 fn current_directory() -> Result<String, String> {
     let cwd = crate::frontend::vfs::os_current_dir().map_err(|e| e.to_string())?;
-    Ok(ts_path::normalize_path(&cwd.replace('\\', "/")))
+    Ok(tspath::normalize_path(&cwd))
 }
 
 /// Go tsc config parsing and compiler host (tsc.go:213 and :293): the
@@ -425,10 +418,10 @@ fn load_config(
     let cwd = current_directory()?;
     // Go: sys.FS() is bundled.WrapFS(osvfs.FS()).
     let fs = bundled::wrap_fs(osvfs_fs());
-    let mut config_abs = ts_path::resolve_path(&cwd, &[config_path]);
+    let mut config_abs = tspath::resolve_path(&cwd, &[config_path]);
     // Go tsc `-p <dir>` reads `<dir>/tsconfig.json`.
     if fs.directory_exists(&config_abs) {
-        config_abs = ts_path::combine_paths(&config_abs, &["tsconfig.json"]);
+        config_abs = tspath::combine_paths(&config_abs, &["tsconfig.json"]);
     }
 
     // Go: tsc.go:213 GetParsedCommandLineOfConfigFile with the command line
@@ -521,7 +514,7 @@ fn build_program(
     cwd: String,
     previous: Option<&'static GoProgram>,
 ) -> &'static GoProgram {
-    let case_sensitivity = case_sensitivity();
+    let use_case_sensitive_file_names = osvfs_fs().use_case_sensitive_file_names();
     let options = np.options().clone();
 
     // PERF: the publish keeps the parse of each new file, so each
@@ -537,7 +530,7 @@ fn build_program(
         parsed.insert(file.store, file);
     }
 
-    let files = go_files_of_unpublished_stores(&parsed, &cwd, case_sensitivity);
+    let files = go_files_of_unpublished_stores(&parsed, &cwd, use_case_sensitive_file_names);
 
     // Program files in ascending store id, the insert order of the first
     // load, then the Go program fields of each.
@@ -634,7 +627,7 @@ fn build_program(
     };
     let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
         cwd,
-        case_sensitivity,
+        use_case_sensitive_file_names,
         resolved_modules: OnceLock::new(),
         common_source_directory: OnceLock::from(common_source_directory_of(np)),
         alias_resolver: false,
@@ -730,10 +723,14 @@ fn program_file_info(store: usize, file: &'static ParsedSourceFile) -> SourceFil
 /// `SourceFileInfo` of a store that is not a program file (a tsconfig or
 /// an extended config). Only the name and the text are read, for
 /// diagnostic locations.
-fn other_store_info(store: usize, cwd: &str, case_sensitivity: CaseSensitivity) -> SourceFileInfo {
+fn other_store_info(
+    store: usize,
+    cwd: &str,
+    use_case_sensitive_file_names: bool,
+) -> SourceFileInfo {
     let file_name = file_store_file_name(store).to_string();
     let info = SourceFileInfo {
-        path: ts_path::canonicalize(&file_name, cwd, case_sensitivity),
+        path: tspath::to_path(&file_name, cwd, use_case_sensitive_file_names).into_string(),
         file_name,
         is_declaration_file: false,
         language_variant: LanguageVariant::STANDARD,
