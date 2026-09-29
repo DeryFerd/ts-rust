@@ -275,6 +275,19 @@ methods reach the AST through it.
   shell has no link column, so `frozen_store_children` gives `None` and
   the caller reads the node data. Use `frozen_static!` only where `None`
   sends the caller to an exact path.
+- Node records (AST node records plan step 1, `ast/store.rs`). Each store
+  slot has one 32-byte `NodeRecord` (kind, bits, parser flags, loc, the
+  stored parent or the target of the nil slot or an alias slot, and a
+  binder word that is 0 until step 2) and one 16-byte `NodeKids` (the U4
+  and C2 child ids, and a word with the U1 name of an identifier or the
+  U1 (b) modifier bits of any other slot). They replace the header, kind,
+  name, modifier bit, child and resolved columns. The words are atomics
+  that the reads load with `Relaxed`; the parse writes them through
+  `get_mut`, and no code writes a published record yet. The kind is a
+  plain field: safe Rust has no inline u16 to `SyntaxKind` conversion, and
+  a slot kind never changes. A new per-slot field of the hot reads goes
+  into a record or kids word, not a new column. Debug builds check the
+  records and kids against the node data at freeze (`debug_check_kids`).
 
 ## Program (owned by program.rs)
 
@@ -346,9 +359,8 @@ The batch that adds it is not accepted until Theo approves.
   next program release (`release_file_version_pins`, run when a
   `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The
   registry keeps a `Weak`. At publish the version takes its `FileStore`
-  and its `GoFile` (M3b). Its header and child columns (headers, kinds,
-  names, modifier bits, children, resolved; 44 bytes per node) are leaked
-  in its node shell, the tier 1 publish of its id, so a header or child
+  and its `GoFile` (M3b). Its node records and kids (`NodeRecord`,
+  `NodeKids`; 48 bytes per node) are leaked in its node shell, the tier 1 publish of its id, so a header or child
   read of the edited file stays inline (a pinned read per node read made
   edits 3 to 4 ms slower); the child link column is dropped, and the
   binder's child walk reads the node data. With owned nodes (M3c; on by

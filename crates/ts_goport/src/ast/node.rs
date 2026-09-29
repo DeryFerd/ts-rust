@@ -324,7 +324,7 @@ macro_rules! match_data {
 /// evaluates `$e`. Other variants give `$def`.
 ///
 /// PERF: a tier 0 store node whose kind fits no listed variant gives `$def`
-/// from the packed kind table (`kind_lacks_data!`), without the pointer
+/// from its node record (`kind_lacks_data!`), without the pointer
 /// chase to its astdata node and data.
 macro_rules! by_data {
     ($n:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$file:ident, $d:ident| $e:expr),+ $(,)?) => {{
@@ -486,7 +486,7 @@ macro_rules! store_node_modifier_bits_fn {
         /// `node`, a store node of kind `kind`, as bits: the value
         /// `Node::modifiers().modifier_flags()` gives for it (store lists hold
         /// their Go flags). 0 when the node has no list. The kind test comes
-        /// first, so most nodes are not loaded (`FileStore::modifier_bits`).
+        /// first, so most nodes are not loaded (the `NodeKids` modifier word).
         pub(crate) fn store_node_modifier_bits(kind: SyntaxKind, node: &crate::astdata::Node) -> u32 {
             let mut has_list = false;
             $(has_list |= variant_has_kind!($v, kind);)+
@@ -2246,7 +2246,7 @@ thread_local! {
 }
 
 impl Node {
-    /// Go `node.Kind`. Tier 0 store nodes read a packed kind table inline;
+    /// Go `node.Kind`. Tier 0 store nodes read their node record inline;
     /// other nodes take `kind_slow`.
     #[inline]
     #[must_use]
@@ -2878,7 +2878,7 @@ impl Node {
     #[inline(never)]
     fn scoped_node_text(self) -> &'static str {
         // An Identifier or PrivateIdentifier of a published store has its
-        // text in the name column of its node shell (`name_node_text`), with
+        // text in the kids of its node shell (`name_node_text`), with
         // no data read.
         if let Some(name) = frozen_store_text_name(self) {
             return name.as_str();
@@ -2890,7 +2890,7 @@ impl Node {
         let file = self.file_index();
         let interned = |text: &str| -> &'static str { Name::from(text).as_str() };
         let text = read_scoped_ast_node(self, |node| match &node.data {
-            // A store Identifier keeps its text in its name column
+            // A store Identifier keeps its text in its name word
             // (`name_node_text`); a synthetic one in its data.
             NodeData::Identifier(d) => scoped_name_text(self, &d.text),
             NodeData::PrivateIdentifier(d) => scoped_name_text(self, &d.text),
@@ -2958,7 +2958,7 @@ impl Node {
     /// Go `scanner.GetIdentifierToken(node.Text()) != ast.KindIdentifier`:
     /// the text is a keyword.
     // PERF: U1 (a). A frozen Identifier or PrivateIdentifier store node reads
-    // a header bit set when its slot was made
+    // a record bit set when its slot was made
     // (`frozen_store_text_is_keyword`).
     #[inline]
     #[must_use]

@@ -151,7 +151,7 @@ impl Node {
         // After freeze, a store file resolves every child id with no store
         // borrow: an alias-free store gives the slot 0 value for id 0 and
         // the raw handle `(file << 32) | (id + 1)` for any other id, with no
-        // table load; a store with alias slots reads its resolved table.
+        // table load; a store with alias slots reads the record of the id.
         // The synthetic file has no store, so it takes the slow path.
         if let Some(n) = crate::ast::frozen_resolve_store_id(file, node) {
             return n;
