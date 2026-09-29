@@ -7,6 +7,7 @@
 # read-only inputs. GOPORT_BIN picks the binary (default: accepted R118 goport).
 # GOPORT_PIN=<key> runs this against that upstream pin (scripts/upstream/pin.py). Unset: no change.
 [[ -z ${GOPORT_PIN:-} || -n ${GOPORT_PIN_ACTIVE:-} ]] || exec python3 /home/theo/Code/sandbox/ts-rust/scripts/upstream/pin.py exec -- bash "$0" "$@"
+. "$(dirname "$(realpath "$0")")/exit-rule.sh" || exit 2
 [ -n "$1" ] || { echo "usage: $0 <round>" >&2; exit 2; }
 X=/home/theo/Code/sandbox/ts-rust/target/project-inputs-wide
 B=${GOPORT_BIN:-/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/runtime/cargo-r118/goport/goport}
@@ -14,6 +15,8 @@ B=${GOPORT_BIN:-/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/r
 # Same cwd and -p as the saved oracle run, so paths in output match.
 # Labels are <project>:<manifest label>. Variant labels are TS7-compatible configs outside src
 # (see each manifest.json).
+# A run is complete when incomplete() of exit-rule.sh is false: exit 0 or 1 and no "unported" line on
+# stderr, and at the Go pins in its EXIT2_PINS also exit 2 with no Go "panic: " line.
 for entry in \
  "ajv-validator-ajv:root|ajv-validator-ajv|src|tsconfig.json|oracle/root.txt" \
  "ajv-validator-ajv:variant-ts7|ajv-validator-ajv|variant-ts7|tsconfig.json|oracle/variant-ts7.txt" \
@@ -311,6 +314,6 @@ for entry in \
   OR=$X/$n/$of; O=$X/measure/$1; mkdir -p $O
   s=$(date +%s.%N); (cd $X/$n/$cwd && timeout 900 $B -p $c > $O/$l.out 2> $O/$l.err); e=$?
   t=$(python3 -c "import sys;print(round(float(sys.argv[2])-float(sys.argv[1]),1))" $s $(date +%s.%N))
-  if [ $e -gt 1 ] || grep -q "^unported" $O/$l.err; then m=INCOMPLETE; elif diff -q $OR $O/$l.out >/dev/null; then m=MATCH; else m="DIFF(+$(diff $OR $O/$l.out | grep -c '^>') -$(diff $OR $O/$l.out | grep -c '^<'))"; fi
+  if incomplete $e $O/$l.err; then m=INCOMPLETE; elif diff -q $OR $O/$l.out >/dev/null; then m=MATCH; else m="DIFF(+$(diff $OR $O/$l.out | grep -c '^>') -$(diff $OR $O/$l.out | grep -c '^<'))"; fi
   echo "$l exit=$e diags=$(grep -c 'error TS' $O/$l.out) oracle=$(grep -c 'error TS' $OR) $m ${t}s panics=$(grep -c 'panic' $O/$l.err) unported=$(grep -c '^unported' $O/$l.err)"
 done

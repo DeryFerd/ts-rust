@@ -73,20 +73,23 @@ retired. R132 is the last legacy revision.
    the evidence that the flake rule asks for.
 4. `candidate.sh verdict-request <rev>`: the texts for the auditor and the reviewer, with every
    failed gate run of the source and its flake notes, then the accept command. The texts ask for a
-   verdict that names the goport tests, gate manifest and name map sha256.
+   verdict that names the goport tests, gate manifest, name map and gate id map sha256.
 5. After two PASS verdicts: `accept_revision.py --revision <rev> --evidence <cache dir> --scope TEXT
    --outcome TEXT`. It refuses a failed gate run that has no flake note for an item. It records the
    evidence and the verdicts (the history row and both verdicts carry `goportTestsSha256`,
-   `gateSha256` and `nameMapSha256`), and every gate run of the source in `gateRuns` (each failed
+   `gateSha256`, `nameMapSha256` and `gateIdMapSha256`), and every gate run of the source in `gateRuns` (each failed
    run with its regressions and flake notes, then the batch gate). It runs
    `check-typechecker-batch.mjs`, and records the acceptance only when the check passes. The check
    also finds each kept `gate-compare-fail-<label>.json`, runs `gate-compare.py` on that run again
    and needs a flake note for each regressed item, so skipping the refusal does not pass.
 
 `gate-compare.py <base manifest> <new manifest>` compares the gate item by item: a base MATCH stays
-MATCH, or becomes ALLOWED only by an allow entry that the base allow list has too (the
-single-threaded-equal items change between MATCH and ALLOWED on the same bins). An ALLOWED item needs
-a verified allow condition, and a removed id or a new FAIL is a regression. The open editor
+MATCH, or becomes ALLOWED only by an allow entry (same id, condition and case path) that the base
+allow list has too (the single-threaded-equal items change between MATCH and ALLOWED on the same bins).
+An ALLOWED item needs a verified allow condition, and a removed id or a new FAIL is a regression. A
+corpus id names another case at another Go pin, so each `corpus-diag`, `corpus-emit` and `f1` entry of
+`gate-allow.txt` names its case path, and the gate applies it only to the item of that id with that
+case path. The open editor
 long-growth items (`editor/*/long`) may FAIL only while the batch has the open defect
 `editor-long-growth`, only on growth, and only up to a fixed cap per project: query-core 1.58 and
 hono 1.28 MiB/edit (`LONG_CAP` in `gate-compare.py`, the one place of the caps; the output lists them
@@ -96,7 +99,13 @@ so growth cannot add up over revisions. Caps only go down. A batch that fixes so
 itself to 1.00, the lowest value of the gate's own limit (2 x Go + 1), once the base Rust growth of that
 project is at or under 1.00: from then on its item must be MATCH with growth at or under 1.00. A MATCH
 at a higher growth does not lower it, because the gate's limit follows Go's slope and the same bins
-can then FAIL.
+can then FAIL. A pin bump that renumbers the corpus cases names a gate id map in `batch.gateIdMap`
+(`path`, `sha256`; lines of old id, new id and case path). It applies only when the two manifests are
+at different upstream pins: a mapped id is the same item, and a base allow entry moves only with its
+own case. A line's case path must equal the case path of the base item and of the new item. The map
+cannot remove a case. An unmapped base id of a mapped family, or a line that names another case, is a
+removed id (format and rules in the `gate-compare.py` docstring). The corpus-emit stage runs the case
+paths of `gate-emit-sample.txt`, so a pin that adds cases keeps the same sample under new ids.
 
 `oracle-compare.py <base results dir> <new results dir>` compares two LSP or API oracle results per
 request: a base request that was `same` or `oracle_error_same` must stay so. It exits 1 on a lost,

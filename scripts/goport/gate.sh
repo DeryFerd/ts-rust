@@ -10,7 +10,10 @@
 #   --commit SHA  commit the binaries were built from (else read DIR/COMMIT, else "unknown")
 #
 # Stages (serial, one gate run at a time through /tmp/goport-gate.lock):
-#   measure, measure-extra, sweep, sweep-extra2, sweep-hono-runtime   (existing scripts)
+#   measure, measure-extra, sweep, sweep-extra2, sweep-hono-runtime   (existing scripts; sweep, sweep-extra2
+#                 and sweep-hono-runtime run the tracked copies next to this script). measure, determinism
+#                 and the sweeps judge goport's exit with exit-rule.sh: exit 2 is complete only at the Go
+#                 pins in its EXIT2_PINS.
 #   sweep-wide    (--full) 292 configs of 51 more real projects (sweep-wide.sh)
 #   f1            sample-f1/run-f1.py (R104 conformance sample)
 #   emit          emit/compare-emit.sh
@@ -21,12 +24,15 @@
 #                 against Go in the same run. RSS, growth and answers limits are judged; latency is
 #                 reported only, because load changes it. Holds /tmp/goport-lsguard.lock.
 #   corpus-diag   (--full) corpus-p5 1,500-case shard through corpus-full/run_shard_parallel.py
-#   corpus-emit   (--full) emit-corpus/run_emit_shard2.py shard 0 + shard 1 --limit 502
+#   corpus-emit   (--full) emit-corpus/run_emit_shard2.py on the 1,501 case paths of gate-emit-sample.txt
+#                 (next to this script): the cases of each pin's corpus-full shards with those paths
 #
 # Output: target/continuation-r97-goport/compat/gate/<label>/ (never reused). It holds
 # runs/, logs/, items/ and manifest.json (binary hashes, commit, every result).
 # Exit 0 only when every result is MATCH, or ALLOWED by gate-allow.txt (next to this script).
-# An allow entry only applies when its condition verifies again in this run.
+# An allow entry only applies when its condition verifies again in this run. An entry of a corpus-diag,
+# corpus-emit or f1 id also names a case path, and applies only to the item of that id with that case path
+# (a corpus id names another case at another Go pin).
 # Project inputs and the existing scripts and oracle caches are only read.
 set -uo pipefail
 # GOPORT_PIN=<key> runs this against that upstream pin (scripts/upstream/pin.py). Unset: no change.
@@ -39,8 +45,11 @@ X=$REPO/target/project-inputs-extra
 HERE=$(cd "$(dirname "$0")" && pwd)
 SELF=$HERE/$(basename "$0")
 ALLOW=$HERE/gate-allow.txt
+EMIT_SAMPLE=$HERE/gate-emit-sample.txt
+# The exit rule of the measure, determinism and sweep stages: GOPORT_MAX_EXIT from the Go pin.
+. "$HERE/exit-rule.sh" || exit 2
 
-usage() { sed -n '2,28p' "$SELF"; exit 2; }
+usage() { sed -n '2,/^set -uo/p' "$SELF" | sed '$d'; exit 2; }
 LABEL=${1:-}; [[ -n $LABEL && $LABEL != -* ]] || usage; shift
 [[ $LABEL =~ ^[A-Za-z0-9._-]+$ ]] || { echo "label must match [A-Za-z0-9._-]+" >&2; exit 2; }
 BINS=$R/runtime/cargo-target/release; MODE=full; COMMIT=
@@ -58,6 +67,7 @@ for b in goport goport_emit goport_typesyms goport_build tsgo; do
   [[ -x $BINS/$b ]] || { echo "missing binary $BINS/$b" >&2; exit 2; }
 done
 [[ -f $ALLOW ]] || { echo "missing allow-list $ALLOW" >&2; exit 2; }
+[[ -f $EMIT_SAMPLE ]] || { echo "missing corpus-emit sample $EMIT_SAMPLE" >&2; exit 2; }
 if [[ -z $COMMIT && -f $BINS/COMMIT ]]; then COMMIT=$(tr -d '[:space:]' < "$BINS/COMMIT"); fi
 COMMIT_FULL=unknown
 if [[ -n $COMMIT ]]; then
@@ -115,12 +125,22 @@ def item(stage, name, ok, detail='', **ctx):
     return row
 
 
+# The exit rule of scripts/goport/exit-rule.sh, which gate.sh sources: a goport run of the measure and
+# determinism stages is complete with an exit up to GOPORT_MAX_EXIT and a clean stderr. GOPORT_MAX_EXIT is
+# 2 only at the Go pins in its EXIT2_PINS (tsgo exits 2 for diagnostics under --noEmit there, and goport
+# follows the pin), else 1, the old rule.
+MAX_EXIT = int(os.environ['GOPORT_MAX_EXIT'])
+COMPLETE_EXITS = tuple(range(MAX_EXIT + 1))
+
+
 def err_clean(path):
-    """True when a goport stderr file has no panic and no unported line."""
+    """True when a goport stderr file has no Rust panic and no unported line. Where exit 2 is complete
+    (MAX_EXIT 2), a kept Go "panic: " line is not clean either: goport exits 2 for one."""
     if not Path(path).exists():
         return True
     text = Path(path).read_text(errors='replace')
-    return 'panicked at' not in text and not any(l.startswith('unported') for l in text.splitlines())
+    bad = ('unported', 'panic: ') if MAX_EXIT == 2 else ('unported',)
+    return 'panicked at' not in text and not any(l.startswith(bad) for l in text.splitlines())
 
 
 # ---- log parsers for the existing bash scripts ----
@@ -149,7 +169,7 @@ def parse_measure(stage, log, runs):
         if m:
             out = Path(runs) / f'{m[1]}.out'
             ok = (out.exists() and out.read_bytes() == (R / 'oracle' / f'{m[1]}.txt').read_bytes()
-                  and m[2] in ('0', '1') and err_clean(Path(runs) / f'{m[1]}.err'))
+                  and m[2] in map(str, COMPLETE_EXITS) and err_clean(Path(runs) / f'{m[1]}.err'))
             items.append(item(stage, m[1], ok, line.strip() + ('' if ok else ' (vs oracle/%s.txt)' % m[1])))
         m = re.match(r'^([QH]-E\d+) (MATCH|DIFF)', line)
         if m:
@@ -308,7 +328,7 @@ def cmd_determinism(goport, out_dir, items_file):
         detail = (f"runs-identical={same} equal-oracle={equal_oracle} exits={exits} "
                   f"md5={hashlib.md5(outs[0]).hexdigest()[:8]} diags={outs[0].count(b'error TS')}")
         print(name, detail, flush=True)
-        items.append(item('determinism', name, same and equal_oracle and clean and exits[0] in (0, 1), detail))
+        items.append(item('determinism', name, same and equal_oracle and clean and exits[0] in COMPLETE_EXITS, detail))
     write_items(items_file, items, len(DETERMINISM))
 
 
@@ -335,7 +355,12 @@ def cmd_corpus_diag(goport, commit, work, items_file):
     write_items(items_file, items, len(shard))
 
 
-def cmd_corpus_emit(goport_emit, commit, work, items_file):
+def cmd_corpus_emit(goport_emit, commit, work, items_file, sample_file):
+    """The cases whose case path is in sample_file (gate-emit-sample.txt), picked from the pin's corpus-full
+    shards: a pin that adds or renumbers cases keeps the same cases, under the pin's ids. The file holds
+    the 1,501 case paths of the sample at pin 52168999f3dc, shard 0 + the first 502 of shard 1, where the
+    runner gets the same arguments as before (no --ids). A path that the pin lacks gets no item, so the
+    stage has fewer items than expected and fails."""
     work = Path(work).resolve()
     work.mkdir(parents=True)
     sys.path.insert(0, str(R / 'emit-corpus'))
@@ -343,14 +368,22 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file):
     es.here = work  # results must stay under here; CORPUS already points at corpus-full.
     if os.environ.get('GOPORT_PIN_ACTIVE'):  # pin run: the runner asserts the pin oracle's hash
         es.ORACLE_SHA256 = os.environ['GOPORT_PIN_ORACLE_SHA256']
-    items, expected = [], 0
-    # Same 1,500 cases as emit-corpus results-int3/int4: shard 0 (998) + first 502 of shard 1.
-    for shard, limit in ((0, None), (1, 502)):
-        sys.argv = ['run_emit_shard2.py', str(shard), '--jobs', '8', '--results', str(work / 'results'),
-                    '--goport', goport_emit, '--goport-commit', commit] + (['--limit', str(limit)] if limit else [])
-        es.main()
+    sample = [l for l in Path(sample_file).read_text().splitlines() if l and not l.startswith('#')]
+    wanted, found, items = set(sample), set(), []
+    shards = json.loads((R / 'corpus-full/shards/shard-0.json').read_text())['of']
+    for shard in range(shards):
         cases = json.loads((R / f'corpus-full/shards/shard-{shard}.json').read_text())['cases']
-        expected += len(cases[:limit] if limit else cases)
+        picked = [c for c in cases if c['source'] in wanted]
+        if not picked:
+            continue
+        found.update(c['source'] for c in picked)
+        # A prefix of the shard runs with --limit (or all of it with neither), else with --ids.
+        prefix = picked == cases[:len(picked)]
+        pick = ([] if len(picked) == len(cases) else ['--limit', str(len(picked))]) if prefix \
+            else ['--ids', ','.join(c['id'] for c in picked)]
+        sys.argv = ['run_emit_shard2.py', str(shard), '--jobs', '8', '--results', str(work / 'results'),
+                    '--goport', goport_emit, '--goport-commit', commit] + pick
+        es.main()
         result = json.loads((work / f'results/shard-{shard}-result.json').read_text())
         for r in result['rows']:
             bad = r.get('inputsChanged') or r.get('caseDirChanged')
@@ -358,22 +391,44 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file):
             if r.get('firstDifference'):
                 detail += ' first=' + json.dumps(r['firstDifference'])[:200]
             items.append(item('corpus-emit', r['id'], r['class'] == 'MATCH' and not bad, detail + (' INPUTS-CHANGED' if bad else '')))
-    write_items(items_file, items, expected)
+    for source in sorted(wanted - found):
+        print(f'sample case path not in this pin\'s corpus: {source}', flush=True)
+    write_items(items_file, items, len(sample))
 
 
 # ---- allow-list ----
 
+# The case path of an item whose detail names a Go test case, at its fixed place: "<class> <case path>"
+# (corpus-diag, f1) and "<class> exit <go>/<goport> <case path>" (corpus-emit). Notes can follow it.
+# gate-compare.py reads it the same way.
+CASE_PATH = {'corpus-diag': re.compile(r'^\S+ (\S+)(?: |$)'), 'corpus-emit': re.compile(r'^\S+ exit \S+/\S+ (\S+)(?: |$)'),
+             'f1': re.compile(r'^\S+ (\S+)(?: |$)')}
+
+
+def case_path(row):
+    """The case path of an item of a CASE_PATH family, else None."""
+    pattern = CASE_PATH.get(row['id'].split('/', 1)[0])
+    m = pattern.match(row['detail']) if pattern else None
+    return m[1] if m else None
+
+
 def load_allow(path):
-    """Lines: <result id> | <condition> | <reason>. '#' starts a comment."""
+    """Entries by (id, case path). Lines: <result id> | <condition> | <reason>, and for an id of a CASE_PATH family
+    <result id> | <case path> | <condition> | <reason>. '#' starts a comment."""
     entries = {}
     for n, line in enumerate(Path(path).read_text().splitlines(), 1):
         line = line.strip()
         if not line or line.startswith('#'):
             continue
-        parts = [p.strip() for p in line.split('|', 2)]
-        if len(parts) != 3 or not all(parts) or parts[1] not in CONDITIONS:
-            sys.exit(f'{path}:{n}: need "<id> | <{"|".join(CONDITIONS)}> | <reason>"')
-        entries[parts[0]] = {'id': parts[0], 'condition': parts[1], 'reason': parts[2], 'used': False}
+        has_case = line.split('|', 1)[0].strip().split('/', 1)[0] in CASE_PATH
+        parts = [p.strip() for p in line.split('|', 3 if has_case else 2)]
+        if len(parts) != (4 if has_case else 3) or not all(parts) or parts[-2] not in CONDITIONS:
+            sys.exit(f'{path}:{n}: need "<id> | {"<case path> | " if has_case else ""}<{"|".join(CONDITIONS)}> | <reason>"')
+        eid, case, condition, reason = parts if has_case else (parts[0], None, *parts[1:])
+        if (eid, case) in entries:
+            sys.exit(f'{path}:{n}: {eid} {case or ""} is in two lines')
+        entries[(eid, case)] = {'id': eid, **({'path': case} if case else {}), 'condition': condition, 'reason': reason,
+                                'used': False}
     return entries
 
 
@@ -403,7 +458,8 @@ CONDITIONS = {'single-threaded-equal': single_threaded_equal, 'same-chars': same
 
 
 def apply_allow(row, entries, evidence):
-    """Turns a FAIL row into ALLOWED when allow entries cover it and their conditions hold now."""
+    """Turns a FAIL row into ALLOWED when allow entries cover it and their conditions hold now. An entry of a
+    CASE_PATH family covers only the item of its id whose case path is the entry's path."""
     ctx = row.get('ctx', {})
     if row['stage'] == 'typesyms':
         if ctx.get('missing') or ctx.get('extra') or ctx.get('exits') != [0, 0] or not ctx.get('diffFiles'):
@@ -411,20 +467,25 @@ def apply_allow(row, entries, evidence):
         keys = [(f"{row['id']}/{f}", f) for f in ctx['diffFiles']]
     else:
         keys = [(row['id'], None)]
+    case = case_path(row)
+    if case is None and row['id'].split('/', 1)[0] in CASE_PATH:
+        return
     # An entry id may be a glob (fnmatch). An exact entry wins over a glob.
     def entry_for(k):
-        return k if k in entries else next((e for e in entries if '*' in e and fnmatch.fnmatchcase(k, e)), None)
+        return (k, case) if (k, case) in entries else next(
+            (e for e in entries if '*' in e[0] and e[1] == case and fnmatch.fnmatchcase(k, e[0])), None)
     matched = [(entry_for(k), f) for k, f in keys]
     if not all(e for e, _ in matched):
         return
     for e, f in matched:
         if not CONDITIONS[entries[e]['condition']](row, f, evidence):
-            row['detail'] += f' (allow entry {e} condition {entries[e]["condition"]} did not hold for {f})'
+            row['detail'] += f' (allow entry {e[0]} condition {entries[e]["condition"]} did not hold for {f})'
             return
     for e, _ in matched:
         entries[e]['used'] = True
     row['status'] = 'ALLOWED'
-    row['allowedBy'] = [{'id': e, 'file': f, 'condition': entries[e]['condition'], 'reason': entries[e]['reason']} for e, f in matched]
+    row['allowedBy'] = [{'id': e[0], **({'path': e[1]} if e[1] else {}), 'file': f, 'condition': entries[e]['condition'],
+                         'reason': entries[e]['reason']} for e, f in matched]
 
 
 def cmd_finish(out, meta_json):
@@ -450,7 +511,9 @@ def cmd_finish(out, meta_json):
         rows += got
     fails = sum(r['status'] == 'FAIL' for r in rows)
     meta.update(finishedUtc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), verdict='PASS' if fails == 0 else 'FAIL',
-                stages=stages, unusedAllowEntries=[k for k, e in entries.items() if not e['used']], results=rows)
+                stages=stages,
+                unusedAllowEntries=[e['id'] + (f" | {e['path']}" if 'path' in e else '') for e in entries.values() if not e['used']],
+                results=rows)
     meta['allowList']['entries'] = list(entries.values())
     (out / 'manifest.json').write_text(json.dumps(meta, indent=1) + '\n')
 
@@ -496,15 +559,15 @@ RUNS_REL=../compat/gate/$LABEL/runs
 cd "$REPO" || exit 2
 stage measure bash "$TP/measure.sh" "$RUNS_REL/measure"; parse measure "$OUT/runs/measure" 8
 stage measure-extra bash "$TP/measure-extra.sh" "$RUNS_REL/measure-extra"; parse measure-extra "$OUT/runs/measure-extra" 3
-stage sweep bash "$TP/sweep.sh" "$RUNS_REL/sweep"; parse sweep "$OUT/runs/sweep" 12
-stage sweep-extra2 bash "$X/sweep-extra2.sh" "../../continuation-r97-goport/compat/gate/$LABEL/runs/extra2"
+stage sweep bash "$HERE/sweep.sh" "$RUNS_REL/sweep"; parse sweep "$OUT/runs/sweep" 12
+stage sweep-extra2 bash "$HERE/sweep-extra2.sh" "../../continuation-r97-goport/compat/gate/$LABEL/runs/extra2"
 parse sweep-extra2 "$OUT/runs/extra2" 31
 # Wide real-world sweep (51 projects, 292 configs; target/project-inputs-wide), full mode only.
 if [[ $MODE == full ]]; then
   stage sweep-wide bash "$HERE/sweep-wide.sh" "../../continuation-r97-goport/compat/gate/$LABEL/runs/wide"
   parse sweep-wide "$OUT/runs/wide" 292
 fi
-stage sweep-hono-runtime bash "$TP/sweep-hono-runtime.sh" "$RUNS_REL/hono-rt"; parse sweep-hono-runtime "$OUT/runs/hono-rt" 7
+stage sweep-hono-runtime bash "$HERE/sweep-hono-runtime.sh" "$RUNS_REL/hono-rt"; parse sweep-hono-runtime "$OUT/runs/hono-rt" 7
 stage f1 python3 "$R/sample-f1/run-f1.py" "$BINS/goport" "$OUT/runs/f1"
 py f1 "$OUT/runs/f1/summary.json" "$OUT/items/f1.jsonl" >> "$OUT/logs/f1.log" 2>&1
 stage emit env JOBS=4 bash "$R/emit/compare-emit.sh" "$BINS/goport_emit" "gate-$LABEL"; parse emit "/tmp/goport-emit-gate-$LABEL" 45
@@ -526,7 +589,7 @@ stage editor editor_bench
 py editor "$OUT/runs/editor/result.json" "$OUT/items/editor.jsonl" 8 >> "$OUT/logs/editor.log" 2>&1
 if [[ $MODE == full ]]; then
   stage corpus-diag py corpus-diag "$BINS/goport" "$COMMIT_FULL" "$OUT/runs/corpus-diag" "$OUT/items/corpus-diag.jsonl"
-  stage corpus-emit py corpus-emit "$BINS/goport_emit" "$COMMIT_FULL" "$OUT/runs/corpus-emit" "$OUT/items/corpus-emit.jsonl"
+  stage corpus-emit py corpus-emit "$BINS/goport_emit" "$COMMIT_FULL" "$OUT/runs/corpus-emit" "$OUT/items/corpus-emit.jsonl" "$EMIT_SAMPLE"
 fi
 
 META=$(python3 - "$LABEL" "$MODE" "$STARTED" "$COMMIT" "$COMMIT_FULL" "$BINS" "$SELF" "$ALLOW" <<'EOF'
@@ -543,11 +606,12 @@ def family(root, pattern):
     for f in sorted(q for q in root.glob(pattern) if q.is_file()):
         h.update(f'{f.relative_to(root)}\0{sha(f)}\n'.encode())
     return h.hexdigest()
-scripts = [R / 'tools-port/measure.sh', R / 'tools-port/measure-extra.sh', R / 'tools-port/sweep.sh',
-           R.parent / 'project-inputs-extra/sweep-extra2.sh', Path(gate).parent / 'sweep-wide.sh', R / 'tools-port/sweep-hono-runtime.sh',
+scripts = [R / 'tools-port/measure.sh', R / 'tools-port/measure-extra.sh', Path(gate).parent / 'sweep.sh',
+           Path(gate).parent / 'sweep-extra2.sh', Path(gate).parent / 'sweep-wide.sh', Path(gate).parent / 'sweep-hono-runtime.sh',
            R / 'sample-f1/run-f1.py', R / 'emit/compare-emit.sh', R / 'typesyms/compare-int.py',
            R / 'build-mode/compare-build.sh', R / 'corpus-full/run_shard.py', R / 'corpus-full/run_shard_parallel.py',
-           R / 'emit-corpus/run_emit_shard2.py', Path(gate).parent / 'ls_edit_bench.py']
+           R / 'emit-corpus/run_emit_shard2.py', Path(gate).parent / 'ls_edit_bench.py', Path(gate).parent / 'exit-rule.sh',
+           Path(gate).parent / 'gate-emit-sample.txt']
 print(json.dumps({
     'label': label, 'mode': mode, 'startedUtc': started, 'commit': commit, 'commitInput': commit_in or None,
     'binsDir': bins,
@@ -564,11 +628,17 @@ print(json.dumps({
                      **{f'family:{name}': family(root, pattern) for name, root, pattern in (
                          ('errcopies-oracle', R / 'errcopies-oracle', '*.txt'),        # measure (Q-E1 to Q-E5, H-E1)
                          ('oracle', R / 'oracle', '*.txt'),                            # measure-extra
-                         ('project-inputs-extra', R.parent / 'project-inputs-extra', '*/oracle.txt'),  # sweep-extra2
+                         # sweep-extra2: every oracle file it reads (oracle.txt, oracle.variant.txt, variant/ and
+                         # variant-ts7/oracle.txt), not only the top-level oracle.txt.
+                         ('project-inputs-extra', R.parent / 'project-inputs-extra', '**/oracle*.txt'),
                          ('project-inputs-wide', R.parent / 'project-inputs-wide', '*/oracle/**/*'),   # sweep-wide
                          ('sample-f1', R.parent / 'continuation-r104-conformance-sample', 'results/*.oracle.out'),  # f1
                          ('sample-f1-lists', R.parent / 'continuation-r104-conformance-sample', '*.json'),        # f1 cases, classes
-                         ('emit-oracle', Path('/tmp/goport-emit-oracle'), '**/*'))}},  # emit
+                         ('emit-oracle', Path('/tmp/goport-emit-oracle'), '**/*'),       # emit
+                         # corpus-diag and corpus-emit: the case lists that give each id its case path.
+                         ('corpus-full-list', R / 'corpus-full', 'list.json'),
+                         ('corpus-full-shards', R / 'corpus-full/shards', '*.json'),
+                         ('corpus-int3-shards', R / 'corpus-int3/shards', '*.json'))}},
     **({'upstreamPin': os.environ['GOPORT_PIN_ACTIVE']} if os.environ.get('GOPORT_PIN_ACTIVE') else {}),
 }))
 EOF
