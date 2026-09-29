@@ -13,7 +13,8 @@ thread_local! {
     static NEXT_NODE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static NEXT_SYMBOL_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // Forgets the ids of dead file versions (`PerFileMap`, lsshells M3a).
-    // Their nodes are not read again, and an id is never given twice.
+    // Their nodes are not read again, and an id is never given twice: a
+    // node of a dead version that has no id here panics (`get_node_id`).
     static NODE_IDS: RefCell<PerFileMap<u64>> = const { RefCell::new(PerFileMap::new()) };
     // Dense: indexed by the lineage index of a binder symbol; 0 means no id
     // yet (Go ids start at 1). Binder symbols only: every arena gives an
@@ -171,6 +172,10 @@ pub fn get_node_id(node: Node) -> u64 {
         let mut ids = ids.borrow_mut();
         if let Some(id) = ids.get(&node) {
             return *id;
+        }
+        ids.write();
+        if ids.is_dead(node) {
+            crate::ast::file_version::released(node.file_index());
         }
         let id = NEXT_NODE_ID.with(|next| {
             let id = next.get() + 1;

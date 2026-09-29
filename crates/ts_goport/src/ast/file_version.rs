@@ -144,9 +144,14 @@ impl FileVersion {
 impl Drop for FileVersion {
     // The store and `GoFile` (`published`) are freed after this, with the
     // fields.
+    //
+    // This runs after the strong count is 0, so a reader on another thread
+    // can fail to upgrade the registry entry before the id is in
+    // `DEAD_FILES`. The reader does not ask `DEAD_FILES` then: a registry
+    // entry that does not upgrade is a dead version (`pin_file_version`).
+    // After the entry goes, `DEAD_FILES` has the id. So a read of this
+    // version panics (`released`) from the moment the count is 0.
     fn drop(&mut self) {
-        // The id is dead before the registry entry goes, so a reader that
-        // still finds the entry and cannot upgrade it panics (`released`).
         {
             let mut dead = lock(&DEAD_FILES);
             dead.push(self.file);
@@ -270,7 +275,7 @@ fn is_dead_file(file: usize) -> bool {
 /// Panics for a read of dead file version `file`.
 #[cold]
 #[inline(never)]
-fn released(file: usize) -> ! {
+pub(crate) fn released(file: usize) -> ! {
     panic!("file version {file} is released")
 }
 
@@ -380,11 +385,15 @@ pub(crate) fn pinned_file_version(file: usize) -> Option<VersionPin> {
 fn pin_file_version(file: usize) -> Option<VersionPin> {
     let weak = lock(&VERSIONS).get(&file).cloned();
     // Upgraded after the lock ends: the last drop of a version locks it.
-    let Some(version) = weak.and_then(|weak| weak.upgrade()) else {
-        if is_dead_file(file) {
-            released(file);
-        }
-        return None;
+    let version = match weak {
+        Some(weak) => match weak.upgrade() {
+            Some(version) => version,
+            // The strong count is 0: the version is dead, and its `Drop`
+            // may not have put its id in `DEAD_FILES` yet.
+            None => released(file),
+        },
+        None if is_dead_file(file) => released(file),
+        None => return None,
     };
     let version = Rc::new(version);
     let expired = PINS
@@ -587,6 +596,11 @@ pub(crate) struct PerFileMap<V> {
     /// `DEAD_COUNT` when the map last forgot dead entries.
     seen: usize,
     map: FxHashMap<Node, V>,
+    /// The ids of the dead file versions that the map knows of (the first
+    /// `seen` of `DEAD_FILES`), so a miss can tell a node of a dead version
+    /// (`is_dead`).
+    // PERF: one id per edit.
+    dead: FxHashSet<usize>,
 }
 
 impl<V> PerFileMap<V> {
@@ -594,7 +608,16 @@ impl<V> PerFileMap<V> {
         Self {
             seen: 0,
             map: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
+            dead: FxHashSet::with_hasher(rustc_hash::FxBuildHasher),
         }
+    }
+
+    /// True when `node` is a node of a dead file version. Call it after
+    /// `write`, which brings the dead ids up to date.
+    // PERF: no hash in a process that frees no file version.
+    #[inline]
+    pub(crate) fn is_dead(&self, node: Node) -> bool {
+        !self.dead.is_empty() && self.dead.contains(&node.file_index())
     }
 
     /// The map for a write, after it forgets the entries of the file
@@ -612,19 +635,19 @@ impl<V> PerFileMap<V> {
     #[cold]
     #[inline(never)]
     fn forget_dead(&mut self) {
-        if self.map.is_empty() {
-            self.seen = DEAD_COUNT.load(Ordering::Acquire);
-            return;
-        }
-        let dead: FxHashSet<usize> = {
+        let new: Vec<usize> = {
             let dead = lock(&DEAD_FILES);
-            let new = dead[self.seen..].iter().copied().collect();
+            let new = dead[self.seen.min(dead.len())..].to_vec();
             self.seen = dead.len();
             new
         };
+        self.dead.extend(new);
         // After the lock ends: a dropped entry can hold a file version.
-        self.map
-            .retain(|node, _| !dead.contains(&node.file_index()));
+        if !self.map.is_empty() {
+            let dead = &self.dead;
+            self.map
+                .retain(|node, _| !dead.contains(&node.file_index()));
+        }
     }
 }
 
@@ -670,5 +693,36 @@ mod tests {
         map.write();
         assert_eq!(map.get(&node(DYING)), None);
         assert_eq!(map.get(&node(OTHER)), Some(&2));
+    }
+
+    // A node of a dead version whose id the map forgot gets no new id: the
+    // id read panics (skeptic tripwire 1).
+    #[test]
+    #[should_panic(expected = "file version 4194301 is released")]
+    fn node_id_of_a_dead_file_version_panics() {
+        const DYING: usize = (1 << 22) - 3;
+        const OTHER: usize = DYING - 1;
+        let version = FileVersion::new(DYING);
+        let id = crate::ast::get_node_id(node(DYING));
+        drop(version);
+        // Before the next write the map still has the id.
+        assert_eq!(crate::ast::get_node_id(node(DYING)), id);
+        // This write forgets the ids of the dead version.
+        crate::ast::get_node_id(node(OTHER));
+        crate::ast::get_node_id(node(DYING));
+    }
+
+    // A reader that finds a registry entry that does not upgrade (the
+    // strong count is 0, but `Drop` has not put the id in `DEAD_FILES`
+    // yet) panics, and does not read the id as no version (skeptic
+    // tripwire 2).
+    #[test]
+    #[should_panic(expected = "file version 4194299 is released")]
+    fn a_dying_file_version_is_released() {
+        const DYING: usize = (1 << 22) - 5;
+        // The state between the last strong drop and `FileVersion::drop`.
+        lock(&VERSIONS).insert(DYING, Weak::new());
+        assert!(!is_dead_file(DYING));
+        with_file_version(DYING, |_| ());
     }
 }
