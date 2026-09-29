@@ -1,0 +1,28 @@
+# The bottom part of ts_goport: Go std pieces, tspath, vfs, json, fswatch,
+# jsonrpc, diag and locale. Its files stay in crates/ts_goport/src; the
+# crate root lists them.
+[package]
+name = "goport_util"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "../../src/goport_util_root.rs"
+
+[dependencies]
+ts_ast = { path = "../../../ts_ast" }
+ts_core = { path = "../../../ts_core" }
+ts_diagnostics = { path = "../../../ts_diagnostics" }
+rustc-hash = "=2.1.2"
+indexmap = "=2.14.0"
+memchr = "=2.8.2"
+rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "termios"] }
+# fswatch/unix.rs: fanotify_init/fanotify_mark and name_to_handle_at, which
+# rustix does not wrap (safe APIs; see the module comment).
+nix = { version = "=0.31.3", default-features = false, features = ["fanotify"] }
+name-to-handle-at = "=0.1.0"
+
+[lints]
+workspace = true
