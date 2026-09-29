@@ -61,12 +61,40 @@ fn path_of(file: Node) -> Path {
 }
 
 /// Go `err.Error()` of a file system error.
-// PORT: Go prints the `*os.PathError` as "op path: err".
+// PORT: Go prints the `*os.PathError` as "op path: err", where `err` is the
+// Go `syscall.Errno` text: on Linux the text of Go's errno table
+// (`pprof::path_error`). Elsewhere it is the OS text without Rust's
+// " (os error N)": Go's other unix tables are the C texts with a lowercase
+// first letter, and Go on Windows asks FormatMessage, as Rust does. The
+// other errors are the Go `io/fs` errors.
 pub(crate) fn fs_error_text(err: &FsError) -> String {
     match err {
-        FsError::Path { op, path, err } => format!("{op} {path}: {err}"),
+        #[cfg(target_os = "linux")]
+        FsError::Path { op, path, err } => crate::pprof::path_error(op, path, err).error(),
+        #[cfg(not(target_os = "linux"))]
+        FsError::Path { op, path, err } => {
+            let text = err.to_string();
+            let text = match err.raw_os_error() {
+                Some(code) => text
+                    .strip_suffix(&format!(" (os error {code})"))
+                    .unwrap_or(&text),
+                None => &text,
+            };
+            let mut chars = text.chars();
+            let text: String = match chars.next() {
+                Some(first) if cfg!(unix) => first.to_lowercase().chain(chars).collect(),
+                _ => text.to_string(),
+            };
+            format!("{op} {path}: {text}")
+        }
+        FsError::Invalid => "invalid argument".to_string(),
+        FsError::Permission => "permission denied".to_string(),
+        FsError::Exist => "file already exists".to_string(),
+        FsError::NotExist => "file does not exist".to_string(),
+        FsError::Closed => "file already closed".to_string(),
+        FsError::SkipAll => "skip everything and stop the walk".to_string(),
+        FsError::SkipDir => "skip this directory".to_string(),
         FsError::Other(message) => message.clone(),
-        other => format!("{other:?}"),
     }
 }
 
