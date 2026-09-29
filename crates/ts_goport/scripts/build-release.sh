@@ -132,6 +132,10 @@ glibc_floor="${RELEASE_GLIBC_FLOOR:-2.28}"
 bolt="${RELEASE_BOLT:-1}"
 corpus_step="${PGO_CORPUS_STEP:-60}"
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95.0}"
+# The training runs start no tsgo worker (bin/tsgo.rs `launch`): when the
+# launcher exits, the parent death signal can kill the worker before it has
+# written its profile.
+export GOPORT_LAUNCH=0
 shipped=(tsgo goport goport_emit goport_build goport_typesyms)
 mkdir -p "$out"
 out="$(cd -- "$out" && pwd)"
