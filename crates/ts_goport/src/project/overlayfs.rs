@@ -512,10 +512,9 @@ impl OverlayFS {
                 continue;
             }
 
-            if events.close_change.is_some() {
-                if o.is_none() {
-                    panic!("overlay not found for closed file: {}", uri.0);
-                }
+            // ts#64036: a close or change of a file with no overlay is
+            // ignored (stale document notifications), not a panic.
+            if events.close_change.is_some() && o.is_some() {
                 result.closed.insert(uri.clone());
                 new_overlays.shift_remove(&path);
                 o = None;
@@ -543,11 +542,8 @@ impl OverlayFS {
                 }
             }
 
-            if !events.changes.is_empty() {
+            if !events.changes.is_empty() && o.is_some() {
                 result.changed.insert(uri.clone());
-                if o.is_none() {
-                    panic!("overlay not found for changed file: {}", uri.0);
-                }
                 // PORT: the Go line map closure captures the variable `o`,
                 // which the loop below reassigns; `o_cell` is that variable.
                 let o_cell: Rc<RefCell<Option<Rc<Overlay>>>> = Rc::new(RefCell::new(o.clone()));

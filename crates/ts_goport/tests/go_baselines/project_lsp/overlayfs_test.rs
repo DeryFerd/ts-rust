@@ -237,6 +237,39 @@ fn save_without_overlay_should_not_panic() {
     assert!(result.changed.contains(&uri(TEST_URI1)));
 }
 
+// Go: overlayfs_test.go:268 TestProcessChanges/close and change without overlay should not panic (ts#64036)
+#[test]
+fn close_and_change_without_overlay_should_not_panic() {
+    let fs = create_overlay_fs();
+
+    fs.process_changes(&[open_change(
+        TEST_URI1,
+        1,
+        "const x = 1;",
+        lsproto::LanguageKind::TYPE_SCRIPT,
+    )]);
+    fs.process_changes(&[change(FileChangeKind::CLOSE, TEST_URI1)]);
+
+    let (result, _) = fs.process_changes(&[change(FileChangeKind::CLOSE, TEST_URI1)]);
+
+    assert!(result.is_empty());
+
+    let (result, _) = fs.process_changes(&[FileChange {
+        kind: FileChangeKind::CHANGE,
+        uri: uri(TEST_URI1),
+        version: 2,
+        changes: vec![lsproto::TextDocumentContentChangePartialOrWholeDocument {
+            partial: None,
+            whole_document: Some(lsproto::TextDocumentContentChangeWholeDocument {
+                text: "const x = 1;".to_string(),
+            }),
+        }],
+        ..Default::default()
+    }]);
+
+    assert!(result.is_empty());
+}
+
 // Go: overlayfs_test.go:238 TestProcessChanges/close then open in same batch marks as changed
 #[test]
 fn close_then_open_in_same_batch_marks_as_changed() {
