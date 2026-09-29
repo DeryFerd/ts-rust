@@ -17,7 +17,7 @@ bumpalo = "=3.20.3"
 xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 flate2 = "=1.1.10"
 jiff = { version = "=0.2.37", default-features = false, features = ["std"] }
-rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "termios"] }
+rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "stdio", "termios"] }
 # Go `os/signal` Notify for `signal.NotifyContext` in cmd/tsgo (--watch, --lsp).
 signal-hook = "=0.4.4"
 # fswatch/unix.rs: fanotify_init/fanotify_mark and name_to_handle_at, which

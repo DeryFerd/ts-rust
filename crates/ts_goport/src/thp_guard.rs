@@ -92,21 +92,29 @@ const PAGE_BYTES: u64 = 4096;
 ///
 /// A file that cannot be read keeps THP on and starts no watcher. The flag
 /// stays set for the whole process and its children.
-pub fn thp_guard() {
+///
+/// Returns false when the run will get 4 KiB pages: THP is off (the start
+/// check turned it off, or it was off already), THP is `never`, or the check
+/// kept THP on (its faults cannot wait for compaction) with less than the
+/// limit free in 2 MiB blocks. `bin/tsgo.rs` then runs the work in a worker
+/// process (`launch`). True otherwise, also when a file cannot be read.
+pub fn thp_guard() -> bool {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         use nix::sys::prctl::{get_thp_disable, set_thp_disable};
         let debug = std::env::var_os("GOPORT_THP_GUARD_DEBUG").is_some_and(|v| v != "0");
         let watcher = match std::env::var_os("GOPORT_THP_GUARD") {
             Some(mode) if mode == "0" => {
-                return say(debug, format_args!("THP kept (GOPORT_THP_GUARD=0)"));
+                say(debug, format_args!("THP kept (GOPORT_THP_GUARD=0)"));
+                return true;
             }
             Some(mode) if mode == "force" => {
                 let ok = set_thp_disable(true).is_ok();
-                return say(
+                say(
                     debug,
                     format_args!("THP off (GOPORT_THP_GUARD=force, prctl ok {ok})"),
                 );
+                return !ok;
             }
             Some(mode) => mode != "start",
             None => true,
@@ -115,7 +123,8 @@ pub fn thp_guard() {
             .and_then(|mib| mib.to_str()?.parse().ok())
             .unwrap_or(DEFAULT_MIN_FREE_MIB);
         if get_thp_disable().unwrap_or(true) {
-            return say(debug, format_args!("THP already off at start"));
+            say(debug, format_args!("THP already off at start"));
+            return false;
         }
         let mut enabled = [0; 128];
         let mut defrag = [0; 128];
@@ -125,16 +134,18 @@ pub fn thp_guard() {
             read_small("/sys/kernel/mm/transparent_hugepage/defrag", &mut defrag),
             read_small("/proc/buddyinfo", &mut buddyinfo),
         ) else {
-            return say(
+            say(
                 debug,
                 format_args!("THP kept (a THP file or /proc/buddyinfo cannot be read)"),
             );
+            return true;
         };
         let Some(free) = free_huge_bytes(buddyinfo) else {
-            return say(
+            say(
                 debug,
                 format_args!("THP kept (/proc/buddyinfo does not parse)"),
             );
+            return true;
         };
         let min_free = min_free_mib.saturating_mul(1 << 20);
         let step = start_step(enabled, defrag, free, min_free);
@@ -152,7 +163,14 @@ pub fn thp_guard() {
                 if watching { ", watcher started" } else { "" },
             ),
         );
+        match step {
+            Start::Off => failed,
+            Start::Watch => true,
+            Start::Keep => selected_mode(enabled) != Some("never") && free >= min_free,
+        }
     }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    true
 }
 
 /// Prints `args` as one `goport thp_guard:` line on stderr when `debug`.
