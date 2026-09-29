@@ -20,6 +20,7 @@
 
 use crate::api::prelude::*;
 
+use crate::execute::tsc::diagnostics as diagnosticwriter;
 use crate::frontend::json::{
     JsonDecoder, JsonError, JsonToken, MarshalerTo, UnmarshalerFrom, json_unmarshal_decode,
 };
@@ -1570,6 +1571,8 @@ proto_json!(both GetDefaultProjectForFileParams {
 pub struct ProjectResponse {
     pub id: ProjectID,
     pub config_file_name: String,
+    // ts#63935
+    pub current_directory: String,
     pub parsed_command_line: Option<ConfigFileResponse>,
     // Deprecated: Use parsedCommandLine.fileNames.
     pub root_files: Vec<String>,
@@ -1583,6 +1586,7 @@ impl MarshalerTo for ProjectResponse {
         let mut first = true;
         marshal_field(enc, &mut first, "id", &self.id)?;
         marshal_field(enc, &mut first, "configFileName", &self.config_file_name)?;
+        marshal_field(enc, &mut first, "currentDirectory", &self.current_directory)?;
         marshal_field(
             enc,
             &mut first,
@@ -1668,6 +1672,8 @@ pub fn new_project_response(p: &project::Project) -> ProjectResponse {
     ProjectResponse {
         id: project_handle(p),
         config_file_name: p.name(),
+        // PORT: Go `p.CurrentDirectory()` (ts#63935) returns this field.
+        current_directory: p.current_directory.clone(),
         parsed_command_line: new_config_file_response(Some(command_line)),
         root_files: command_line.file_names().to_vec(),
         compiler_options: Some((**command_line.compiler_options()).clone()),
@@ -3038,10 +3044,18 @@ pub struct DiagnosticResponse {
     pub pos: i32,
     // End is the end position of the diagnostic in the source file.
     pub end: i32,
+    // StartPosition is the zero-based line and UTF-16 character position of Pos.
+    pub start_position: Option<DiagnosticPositionResponse>,
+    // EndPosition is the zero-based line and UTF-16 character position of End.
+    pub end_position: Option<DiagnosticPositionResponse>,
+    // SourceLines contains the source lines needed to render this diagnostic with context.
+    pub source_lines: Vec<DiagnosticSourceLineResponse>,
     // Code is the diagnostic error code.
     pub code: i32,
     // Category is the diagnostic category (error, warning, suggestion, message).
     pub category: crate::diagnostics::Category,
+    // Source is a custom diagnostic-code prefix. An empty value uses the default "TS".
+    pub source: String,
     // Text is the localized diagnostic message text.
     pub text: String,
     // ReportsUnnecessary indicates this diagnostic highlights unnecessary code.
@@ -3061,9 +3075,13 @@ impl MarshalerTo for DiagnosticResponse {
         marshal_field_omitempty(enc, &mut first, "fileName", &self.file_name)?;
         marshal_field(enc, &mut first, "pos", &self.pos)?;
         marshal_field(enc, &mut first, "end", &self.end)?;
+        marshal_field_omitempty(enc, &mut first, "startPosition", &self.start_position)?;
+        marshal_field_omitempty(enc, &mut first, "endPosition", &self.end_position)?;
+        marshal_field_omitempty(enc, &mut first, "sourceLines", &self.source_lines)?;
         marshal_field(enc, &mut first, "code", &self.code)?;
         // PORT: `diagnostics.Category` is a Go int32 type; it writes as a number.
         marshal_field(enc, &mut first, "category", &(self.category as i32))?;
+        marshal_field_omitempty(enc, &mut first, "source", &self.source)?;
         marshal_field(enc, &mut first, "text", &self.text)?;
         marshal_field_omitzero(
             enc,
@@ -3089,51 +3107,159 @@ impl MarshalerTo for DiagnosticResponse {
     }
 }
 
+// Go: proto.go DiagnosticPositionResponse (ts#63935)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DiagnosticPositionResponse {
+    pub line: i32,
+    // PORT: Go `core.UTF16Offset`.
+    pub character: i32,
+}
+
+proto_json!(marshal DiagnosticPositionResponse {
+    line: "line" plain,
+    character: "character" plain,
+});
+
+// Go: proto.go DiagnosticSourceLineResponse (ts#63935)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DiagnosticSourceLineResponse {
+    pub line: i32,
+    pub text: String,
+}
+
+proto_json!(marshal DiagnosticSourceLineResponse {
+    line: "line" plain,
+    text: "text" plain,
+});
+
+// Go: proto.go diagnosticSourceLines (ts#63935)
+// PORT: Go returns nil for an empty line map; the field is `omitempty`, so
+// an empty `Vec` writes the same JSON.
+fn diagnostic_source_lines(
+    file: &diagnosticwriter::FileLike,
+    first_line: i32,
+    last_line: i32,
+) -> Vec<DiagnosticSourceLineResponse> {
+    let line_map = file.ecma_line_map();
+    if line_map.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines: Vec<i32> = Vec::with_capacity((last_line - first_line + 1).clamp(0, 4) as usize);
+    if last_line - first_line >= 4 {
+        lines.extend([first_line, first_line + 1, last_line - 1, last_line]);
+    } else {
+        for line in first_line..=last_line {
+            lines.push(line);
+        }
+    }
+
+    let text = file.text();
+    let mut result = Vec::with_capacity(lines.len());
+    for line in lines {
+        let start = line_map[line as usize] as usize;
+        let mut end = text.len();
+        if ((line + 1) as usize) < line_map.len() {
+            end = line_map[(line + 1) as usize] as usize;
+        }
+        result.push(DiagnosticSourceLineResponse {
+            line,
+            text: text[start..end].to_string(),
+        });
+    }
+    result
+}
+
 // Go: proto.go:1001 NewDiagnosticResponse
 // NewDiagnosticResponse converts an ast.Diagnostic to a DiagnosticResponse.
 pub fn new_diagnostic_response(d: &Diagnostic) -> DiagnosticResponse {
-    let mut pos = d.pos;
-    let mut end = d.end;
-    let file = d.file;
-    if file.is_some() {
-        let position_map = source_file_get_position_map(file);
-        pos = position_map.utf8_to_utf16(pos);
-        end = position_map.utf8_to_utf16(end);
+    new_diagnostic_response_wrapped(diagnosticwriter::wrap_ast_diagnostic(d))
+}
+
+// Go: proto.go newDiagnosticResponse (ts#63935)
+// PORT: Go names it `newDiagnosticResponse`, which snakes to the name of the
+// exported function; the wrapped form gets the `_wrapped` suffix.
+fn new_diagnostic_response_wrapped(d: diagnosticwriter::AstDiagnostic<'_>) -> DiagnosticResponse {
+    let file = d.file();
+    let (mut pos, mut end) = (d.pos(), d.end());
+    if let Some(file) = &file {
+        let text_len = file.text().len() as i32;
+        pos = 0.max(pos.min(text_len));
+        end = pos.max(end.min(text_len));
     }
     let mut resp = DiagnosticResponse {
         file_name: String::new(),
         pos,
         end,
-        code: d.code,
-        category: d.category,
-        text: d.localize(&crate::locale::DEFAULT),
-        reports_unnecessary: d.reports_unnecessary,
-        reports_deprecated: d.reports_deprecated,
+        start_position: None,
+        end_position: None,
+        source_lines: Vec::new(),
+        code: d.0.code,
+        category: d.0.category,
+        source: d.source().to_string(),
+        text: d.0.localize(&crate::locale::DEFAULT),
+        reports_unnecessary: d.0.reports_unnecessary,
+        reports_deprecated: d.0.reports_deprecated,
         message_chain: Vec::new(),
         related_information: Vec::new(),
     };
 
-    if file.is_some() {
-        resp.file_name = source_file_file_name(file).to_string();
+    if let Some(file) = &file {
+        resp.file_name = file.file_name().to_string();
+        if let diagnosticwriter::FileLike::Source(source_file) = file {
+            let position_map = source_file_get_position_map(*source_file);
+            resp.pos = position_map.utf8_to_utf16(pos);
+            resp.end = position_map.utf8_to_utf16(end);
+        } else {
+            resp.pos = utf16_len_of_prefix(file.text(), pos);
+            resp.end = utf16_len_of_prefix(file.text(), end);
+        }
+        let (start_line, start_character) =
+            diagnosticwriter::get_ecma_line_and_utf16_character_of_file_position(file, pos);
+        let (end_line, end_character) =
+            diagnosticwriter::get_ecma_line_and_utf16_character_of_file_position(file, end);
+        resp.start_position = Some(DiagnosticPositionResponse {
+            line: start_line,
+            character: start_character,
+        });
+        resp.end_position = Some(DiagnosticPositionResponse {
+            line: end_line,
+            character: end_character,
+        });
+        resp.source_lines = diagnostic_source_lines(file, start_line, end_line);
     }
 
-    let chain = &d.message_chain;
+    let chain = d.message_chain();
     if !chain.is_empty() {
         resp.message_chain = Vec::with_capacity(chain.len());
-        for c in chain {
-            resp.message_chain.push(new_diagnostic_response(c));
+        for c in &chain {
+            resp.message_chain.push(new_diagnostic_response_wrapped(
+                diagnosticwriter::wrap_ast_diagnostic(c),
+            ));
         }
     }
 
-    let related = &d.related_information;
+    let related: Vec<_> = d.related_information().collect();
     if !related.is_empty() {
         resp.related_information = Vec::with_capacity(related.len());
         for r in related {
-            resp.related_information.push(new_diagnostic_response(r));
+            resp.related_information
+                .push(new_diagnostic_response_wrapped(r));
         }
     }
 
     resp
+}
+
+/// Go `int(core.UTF16Len(text[:pos]))`. Go cuts the bytes at `pos`; a cut
+/// char reads as one RuneError per byte, one UTF-16 unit each.
+fn utf16_len_of_prefix(text: &str, pos: i32) -> i32 {
+    let end = pos as usize;
+    let mut boundary = end;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    utf16_len(&text[..boundary]) + (end - boundary) as i32
 }
 
 // Go: proto.go:1042 NewDiagnosticResponses

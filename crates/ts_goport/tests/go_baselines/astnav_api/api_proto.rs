@@ -1,7 +1,10 @@
 //! Port of internal/api/proto_test.go.
 
 use super::Subtests;
-use ts_goport::api::{DocumentIdentifier, new_diagnostic_response};
+use ts_goport::api::{
+    DiagnosticPositionResponse, DiagnosticSourceLineResponse, DocumentIdentifier,
+    new_diagnostic_response,
+};
 use ts_goport::ast::{TextRange, new_diagnostic, source_file_get_position_map};
 use ts_goport::diag;
 use ts_goport::flags::ScriptKind;
@@ -90,9 +93,10 @@ fn test_document_identifier_unmarshal_json() {
     t.finish();
 }
 
-// Go: api/proto_test.go:67 TestNewDiagnosticResponseUsesUTF16Offsets
+// Go: api/proto_test.go:67 TestNewDiagnosticResponseIncludesFormattingContext (ts#63935; was
+// TestNewDiagnosticResponseUsesUTF16Offsets)
 #[test]
-fn test_new_diagnostic_response_uses_utf16_offsets() {
+fn test_new_diagnostic_response_includes_formatting_context() {
     let text = "const 💩 = 1;";
     let file = parse_source_file(
         &SourceFileParseOptions {
@@ -119,11 +123,82 @@ fn test_new_diagnostic_response_uses_utf16_offsets() {
     assert_eq!(resp.pos, 9);
     assert_eq!(resp.end, 10);
     assert_eq!(
+        resp.start_position,
+        Some(DiagnosticPositionResponse {
+            line: 0,
+            character: 9
+        })
+    );
+    assert_eq!(
+        resp.end_position,
+        Some(DiagnosticPositionResponse {
+            line: 0,
+            character: 10
+        })
+    );
+    assert_eq!(
+        resp.source_lines,
+        vec![DiagnosticSourceLineResponse {
+            line: 0,
+            text: text.to_string()
+        }]
+    );
+    assert_eq!(
         resp.pos,
         source_file_get_position_map(file).utf8_to_utf16(pos)
     );
     assert_eq!(
         resp.end,
         source_file_get_position_map(file).utf8_to_utf16(end)
+    );
+}
+
+// Go: api/proto_test.go:88 TestNewDiagnosticResponseTruncatesLongFormattingContext (ts#63935)
+#[test]
+fn test_new_diagnostic_response_truncates_long_formatting_context() {
+    let text = "one\ntwo\nthree\nfour\nfive\nsix\nseven";
+    let file = parse_source_file(
+        &SourceFileParseOptions {
+            file_name: "/multiline.ts".to_string(),
+            ..Default::default()
+        },
+        text,
+        ScriptKind::TS,
+    )
+    .root;
+    let diag = new_diagnostic(
+        file,
+        TextRange::new(0, text.len() as i32),
+        diag::Expression_expected,
+        Vec::new(),
+    );
+    let resp = new_diagnostic_response(&diag);
+
+    assert_eq!(
+        resp.start_position,
+        Some(DiagnosticPositionResponse {
+            line: 0,
+            character: 0
+        })
+    );
+    assert_eq!(
+        resp.end_position,
+        Some(DiagnosticPositionResponse {
+            line: 6,
+            character: 5
+        })
+    );
+    let line = |line: i32, text: &str| DiagnosticSourceLineResponse {
+        line,
+        text: text.to_string(),
+    };
+    assert_eq!(
+        resp.source_lines,
+        vec![
+            line(0, "one\n"),
+            line(1, "two\n"),
+            line(5, "six\n"),
+            line(6, "seven"),
+        ]
     );
 }
