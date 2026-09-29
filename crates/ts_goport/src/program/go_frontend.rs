@@ -612,7 +612,6 @@ fn build_program(
         id,
         source_file_order,
         options,
-        bound_symbols: OnceLock::new(),
         state: OnceLock::new(),
     }));
     let one_program = match entry {

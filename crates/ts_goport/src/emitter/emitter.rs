@@ -690,8 +690,10 @@ pub fn js_emit_needs_checker(source_file: Node) -> bool {
 /// part on the checker thread. It is true for a file that is not bound.
 fn may_have_enum_declaration(source_file: Node) -> bool {
     let go_file = crate::ast::go_file(source_file.file_index());
-    let (Some(node_bind), Some(symbols)) = (go_file.node_bind.get(), prog().bound_symbols.get())
-    else {
+    let (Some(node_bind), Some(symbols)) = (
+        go_file.node_bind.get(),
+        crate::program::bound_symbols_of(prog()),
+    ) else {
         return true;
     };
     let is_enum = |symbol: SymbolId| {

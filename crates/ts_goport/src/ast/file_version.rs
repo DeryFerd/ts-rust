@@ -32,6 +32,10 @@
 //! of the file is a scoped read of the pinned version
 //! (`ast::with_scoped_store_node`), and a list of its node data is a handle
 //! (`ast::StoreList`) that is read at each use.
+//! M3d: the binder lineage binds the version into symbol and table chunks
+//! of its own. After the version dies, the next bind frees them
+//! (`program::Lineage`), and each program copy of the lineage lets go of
+//! them when its release frees its tables (M2c, `program::bound_symbols`).
 //! When the last holder lets go, the version is dead: its store and
 //! `GoFile` are freed, its id goes to `DEAD_FILES`, and each per-file
 //! thread-local map (`PerFileMap`) forgets the entries of that id when it
@@ -563,6 +567,14 @@ pub fn file_versions_made() -> usize {
 #[must_use]
 pub fn dead_file_versions() -> usize {
     DEAD_COUNT.load(Ordering::Acquire)
+}
+
+/// The ids of the file versions that died after the first `seen` dead ones,
+/// in the order they died, and the number of dead versions now. The binder
+/// lineage frees their symbol chunks (`program::Lineage`, lsshells M3d).
+pub(crate) fn dead_files_since(seen: usize) -> (Vec<usize>, usize) {
+    let dead = lock(&DEAD_FILES);
+    (dead[seen.min(dead.len())..].to_vec(), dead.len())
 }
 
 /// A thread-local map with per-file entries: each key is a node, and the

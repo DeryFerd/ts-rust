@@ -476,7 +476,7 @@ impl DeclarationTransformer {
         if is_external_or_common_js_module(node) {
             if is_in_js_file(node) {
                 let export_equals = {
-                    let symbols = prog().bound_symbols.get().expect("program not bound");
+                    let symbols = crate::program::bound_symbols();
                     symbols.get(
                         symbols.sym(node.symbol()).exports,
                         INTERNAL_SYMBOL_NAME_EXPORT_EQUALS,

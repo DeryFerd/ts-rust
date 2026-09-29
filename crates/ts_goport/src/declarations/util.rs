@@ -177,7 +177,8 @@ pub(crate) fn is_private_method_type_parameter(host: &dyn DeclarationEmitHost, n
 // Go: transformers/declarations/util.go:154 shouldEmitFunctionProperties
 // Returns true if expando properties should be emitted for this function.
 // Properties are emitted if any overload in the symbol has a body (implementation).
-// PORT: `input.Symbol.Declarations` is the binder symbol, read from `prog().bound_symbols`.
+// PORT: `input.Symbol.Declarations` is the binder symbol, read from the
+// program's binder symbols (`program::bound_symbols`).
 pub(crate) fn should_emit_function_properties(input: Node) -> bool {
     if input.body().is_some() {
         return true;

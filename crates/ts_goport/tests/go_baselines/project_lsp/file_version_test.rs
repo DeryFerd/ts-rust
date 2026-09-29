@@ -4,8 +4,9 @@
 //! `FileVersion` (lsshells M3a): the parse holds it, and so do the tables
 //! of each program version that has the file. It dies with its last holder,
 //! and its store and `GoFile` die with it (M3b), and so do its astdata
-//! nodes and lists (M3c); a later read of it panics. The first version of a
-//! file and every CLI publish stay static.
+//! nodes and lists (M3c) and its symbol chunks in the binder lineage (M3d);
+//! a later read of it panics. The first version of a file and every CLI
+//! publish stay static.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
@@ -33,12 +34,14 @@ const INDEX_URI: &str = "file:///home/projects/TS/p1/index.ts";
 const INDEX_FILE: &str = "/home/projects/TS/p1/index.ts";
 const INDEX_TEXT: &str = "import { a } from './a';\nexport const x = a + 1;";
 const A_FILE: &str = "/home/projects/TS/p1/a.ts";
+const A_URI: &str = "file:///home/projects/TS/p1/a.ts";
+const A_TEXT: &str = "export const a = 1;";
 
 fn p1_files() -> FileMap {
     files(&[
         (CONFIG, "{}"),
         (INDEX_FILE, INDEX_TEXT),
-        (A_FILE, "export const a = 1;"),
+        (A_FILE, A_TEXT),
         ("/home/projects/TS/p1/b.ts", "export const b = 1;"),
     ])
 }
@@ -144,6 +147,104 @@ child_test! {
         assert!(owned_node_count() > one_version, "the added import has nodes");
         assert_eq!(edited.statements().len(), 3);
         assert_eq!(sem_diag_count(&p5, INDEX_FILE), 0);
+    }
+}
+
+child_test! {
+    // Each edited version binds into binder lineage chunks of its own
+    // (lsshells M3d). After the version dies, the next bind frees them, so
+    // the live chunk count does not grow with body edits, and a program
+    // bound after that reads a symbol of the dead version as a hole (a
+    // panic). The symbols of a.ts, a static file, keep their ids.
+    fn edited_file_symbols_die_with_their_version() {
+        let session = open_p1();
+        let edit_and_bind = |version: i32, digit: &str| {
+            body_edit(&session, version, digit);
+            ls_program::bind_source_files(&program(&session, INDEX_URI));
+        };
+        edit_and_bind(2, "2");
+        let (a_symbol, second_symbol, second) = {
+            let p2 = program(&session, INDEX_URI);
+            let second = root(&p2, INDEX_FILE);
+            let probe = file_version_probe(second).expect("the edited version is freeable");
+            (root(&p2, A_FILE).symbol(), second.symbol(), probe)
+        };
+        assert!(a_symbol.is_some() && second_symbol.is_some(), "both files are modules");
+        let one_version = program::lineage_live_chunks();
+
+        edit_and_bind(3, "3");
+        assert!(second.is_freed(), "the version of the released program is not freed");
+        let third = file_version_probe(root(&program(&session, INDEX_URI), INDEX_FILE))
+            .expect("the edited version is freeable");
+        assert_eq!(
+            program::lineage_live_chunks(),
+            one_version,
+            "the lineage chunks of the dead version are not freed"
+        );
+        edit_and_bind(4, "4");
+        assert!(third.is_freed());
+        assert_eq!(program::lineage_live_chunks(), one_version);
+
+        let p4 = program(&session, INDEX_URI);
+        let a = root(&p4, A_FILE);
+        assert_eq!(a.symbol(), a_symbol, "a.ts keeps its symbol id");
+        {
+            let _program = ls_program::enter(&p4);
+            let symbols = program::bound_symbols();
+            assert_eq!(symbols.sym(a_symbol).declarations.first(), Some(&a));
+            let stale = panic_message(|| {
+                let _ = symbols.sym(second_symbol).flags;
+            });
+            assert!(stale.is_some(), "a symbol of a freed version still reads");
+        }
+        assert_eq!(sem_diag_count(&p4, INDEX_FILE), 0);
+    }
+}
+
+child_test! {
+    // Two freeable versions that one bind binds (on bind threads, when
+    // there are two) each join the lineage on chunks of their own: their
+    // answers are right, and when both die the next bind frees both.
+    fn freeable_versions_bound_together_get_chunks_of_their_own() {
+        let session = open_p1();
+        open(&session, A_URI, A_TEXT);
+        let _ = language_service(&session, A_URI);
+        // Each round edits both files, then binds the program that has both.
+        let edit_both = |version: i32, digit: &str| {
+            edit(&session, INDEX_URI, version, (1, 21), (1, 22), digit);
+            edit(&session, A_URI, version, (0, 17), (0, 18), digit);
+            let p = program(&session, INDEX_URI);
+            ls_program::bind_source_files(&p);
+            session.wait_for_background_tasks();
+            p
+        };
+        let probes = |p: &NewProgram| {
+            [INDEX_FILE, A_FILE]
+                .map(|name| file_version_probe(root(p, name)).expect("the edited version is freeable"))
+        };
+        let p2 = edit_both(2, "2");
+        let second = probes(&p2);
+        drop(p2);
+        let two_versions = program::lineage_live_chunks();
+
+        let p3 = edit_both(3, "3");
+        let third = probes(&p3);
+        drop(p3);
+        assert!(second.iter().all(|probe| probe.is_freed()));
+        let p4 = edit_both(4, "4");
+        assert!(third.iter().all(|probe| probe.is_freed()));
+        assert_eq!(program::lineage_live_chunks(), two_versions);
+        let a = root(&p4, A_FILE);
+        {
+            let _program = ls_program::enter(&p4);
+            let symbols = program::bound_symbols();
+            let exports = symbols.sym(a.symbol()).exports;
+            let a_const = symbols.get(exports, "a");
+            assert!(a_const.is_some(), "a.ts exports a");
+            assert_eq!(symbols.sym(a_const).name.as_str(), "a");
+        }
+        assert_eq!(sem_diag_count(&p4, INDEX_FILE), 0);
+        assert_eq!(sem_diag_count(&p4, A_FILE), 0);
     }
 }
 

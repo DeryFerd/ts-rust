@@ -182,10 +182,7 @@ fn live(out: &Path, projects: &[(Mode, String)]) {
         .iter()
         .zip(&checkers)
         .flat_map(|(live, pair)| {
-            let shared = live
-                .program
-                .bound_symbols
-                .get()
+            let shared = ts_goport::program::bound_symbols_of(live.program)
                 .expect("program bound")
                 .symbol_count();
             pair.iter().map(move |checker| (&checker.symbols, shared))

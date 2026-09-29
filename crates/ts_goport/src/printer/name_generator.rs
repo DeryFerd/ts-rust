@@ -657,7 +657,7 @@ fn next_container(node: Node) -> Node {
 // PORT: Go reads `local.Flags` from the symbol. Locals are binder symbols, so
 // this reads them from the program's bound symbol arena.
 fn is_unique_local_name(name: &str, container: Node) -> bool {
-    let symbols = prog().bound_symbols.get().expect("program is not bound");
+    let symbols = crate::program::bound_symbols();
     let mut node = container;
     while node.is_some() && is_node_descendant_of(node, container) && is_locals_container(node) {
         let locals = node.locals();

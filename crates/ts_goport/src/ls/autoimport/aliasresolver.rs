@@ -168,10 +168,8 @@ fn checker_arena_holds(program: &'static GoProgram, file: Node) -> bool {
         return false;
     }
     let symbol = file.symbol();
-    let count = program
-        .bound_symbols
-        .get()
-        .map_or(0, SymbolArena::symbol_count);
+    let count =
+        crate::program::bound_symbols_of(program).map_or(0, |symbols| symbols.symbol_count());
     symbol.is_nil() || symbol.index() < count
 }
 

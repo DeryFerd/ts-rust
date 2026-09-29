@@ -1888,7 +1888,6 @@ mod tests {
                 id: next_program_id(),
                 source_file_order: Vec::new(),
                 options: CompilerOptions::default(),
-                bound_symbols: std::sync::OnceLock::new(),
                 state: std::sync::OnceLock::new(),
             }));
             let f = NodeFactory::new();

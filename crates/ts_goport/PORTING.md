@@ -127,7 +127,8 @@ variant that embeds `X` (panic otherwise). Every other Go method on `*Type`
 
 `checker/checker_p01.rs` defines `pub struct Checker` with every Go
 `Checker` field (snake), and these arenas and accessors:
-- `symbols: SymbolArena` (starts as a clone of `prog().bound_symbols`).
+- `symbols: SymbolArena` (starts as a clone of the program's binder
+  symbols, `program::bound_symbols()`).
   Access: `self.symbols.sym(s)`, `self.symbols.sym_mut(s)`; shorthand
   methods `self.sym(s) -> &Symbol` and `self.sym_mut(s)`.
 - `types: Vec<Type>` -> `self.ty(t) -> &Type`, `self.ty_mut(t) -> &mut Type`.
@@ -336,7 +337,7 @@ The batch that adds it is not accepted until Theo approves.
   and the parse tasks of a load. The dispatch loop drops them after each
   message, while no message waits (`drop_garbage`); more than 16 are
   dropped even when messages wait. Other threads drop them at once.
-- Freeable file versions (lsshells M3a, M3b and M3c, `ast/file_version.rs`). In
+- Freeable file versions (lsshells M3a to M3d, `ast/file_version.rs`). In
   a language server or API process (`project::new_session`), a parse cache
   parse of a path that a publish on this thread published before gets a
   `FileVersion`. Its parse holds it (`ParsedSourceFile::version`), and so
@@ -366,9 +367,11 @@ The batch that adds it is not accepted until Theo approves.
   `GoFile` are freed, a later read of the id panics, and each per-file
   thread-local map (`PerFileMap`: `SOURCE_FILE_DATA`, `TOKEN_CACHES`,
   `TOKEN_FACTORIES`, `NODE_IDS`, `SUBTREE_FACTS`, `JOINED_TEXT`,
-  `DECORATORS`) forgets the entries of the file at its next write. The
-  header columns of the node shell and the text stay leaked for now. Tier
-  0, the first
+  `DECORATORS`) forgets the entries of the file at its next write. Its
+  symbols and tables in the binder lineage are whole chunks of its own
+  (M3d); after it dies, the next bind frees them, and a read of one of its
+  symbol or table ids panics (index out of bounds). The header columns of
+  the node shell and the text stay leaked for now. Tier 0, the first
   version of each file and every CLI publish never get one.
   `GOPORT_FREE_FILE_VERSIONS=0` turns this off, `=1` turns it on in any
   process; there `update_program_version` (`goport_multiprog`) also gives
@@ -439,7 +442,13 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
 - Files bind in parallel, each into its own arena, and join the binder
   lineage in file order (`program::bind_all`). The ids equal a serial bind.
   A file version binds once (Go `BindOnce`): a later program version binds
-  only its new file versions and adds them to the same lineage.
+  only its new file versions and adds them to the same lineage. The
+  program's binder symbols (`program::bound_symbols()`, a `BoundSymbols`
+  guard) are a copy of the lineage in its `VersionTables`, so a release
+  frees them (lsshells M2c). A freeable file version starts and ends on a
+  chunk start (`SymbolArena::end_chunk`), so its ids and the ids after it
+  skip to that start, and its chunks are freed when it dies (M3d). Ids are
+  never used again.
 - Each program has its own checker pool. Each checker is made on its own
   worker thread and stays there (Go `checkerPool`: 4 checkers, file `i`
   goes to checker `i % 4`). The loading thread sends jobs and merges the

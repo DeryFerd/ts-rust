@@ -1135,8 +1135,9 @@ impl Checker {
 // so `id = checker_index + 1`.
 // PORT: Go binds every file (`program.BindSourceFiles`) before it creates
 // checkers. Here the checker binds the program first if nothing has
-// (`program::bind_all`), then copies `prog().bound_symbols` as its own
-// symbol arena (`SymbolArena::for_checker`).
+// (`program::bind_all`), then copies the program's binder symbols
+// (`program::bound_symbols`) as its own symbol arena
+// (`SymbolArena::for_checker`).
 // PORT: the checker reads its program through `program` and
 // `compiler_options`, but the `program.rs` functions it calls read the
 // current program (`prog()`). A thread that holds checkers of several
@@ -1148,11 +1149,7 @@ impl Checker {
     pub fn new(checker_index: usize) -> Checker {
         let program = prog();
         bind_all();
-        let bound_symbols = program
-            .bound_symbols
-            .get()
-            .expect("program bound")
-            .for_checker();
+        let bound_symbols = crate::program::bound_symbols().for_checker();
         let compiler_options = &program.options;
         let files: Vec<Node> = program.source_files().map(|f| f.root).collect();
         let file_index_map = create_file_index_map(&files);
