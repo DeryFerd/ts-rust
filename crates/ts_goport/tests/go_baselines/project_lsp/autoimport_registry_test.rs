@@ -1071,11 +1071,6 @@ child_test! {
 child_test! {
     // Go: registry_test.go:958 TestContentMappedNodeModulesFileUsesProjectBucket
     // PORT: Go `bundled.Embedded` is always true in the port, so the skip is dropped.
-    // PORT-HOLD: the session does not have Go `SessionOptions.RunExternalCode`
-    // (session.go:79) or `SessionInit.Spawner` (session.go:92) yet. The server
-    // lane owns src/project/session.rs. When it adds them, restore the two
-    // commented lines below and remove the `#[ignore]`.
-    #[ignore = "port: needs SessionOptions.run_external_code and SessionInit.spawner (Go session.go:79, :92)"]
     fn content_mapped_node_modules_file_uses_project_bucket() {
         const MAIN_TEXT: &str = "profileTitle;";
         let mapper_package_json = contentmappertest::package_json(contentmappertest::COMPONENT_MAPPER);
@@ -1113,19 +1108,17 @@ import "profile-package/ordinary";"#,
         // PORT: the Go literal names 5 fields; the others are Go zero values
         // (`watch_enabled` and `logging_enabled` false). Go nil `tiOptions`
         // is the default `TypingsInstallerOptions`.
-        let (init, _) = projecttestutil::get_session_init_options(
+        let (mut init, _) = projecttestutil::get_session_init_options(
             files,
             Some(SessionOptions {
-                // PORT-HOLD: Go `RunExternalCode: true`.
-                // run_external_code: true,
+                run_external_code: true,
                 watch_enabled: false,
                 logging_enabled: false,
                 ..projecttestutil::session_options("/home/project")
             }),
             TypingsInstallerOptions::default(),
         );
-        // PORT-HOLD: Go `init.Spawner = contentmappertest.NewSpawner()`.
-        // init.spawner = Some(contentmappertest::new_spawner());
+        init.spawner = Some(contentmappertest::new_spawner());
         let session = project::new_session(&init);
 
         let main_uri = uri("file:///home/project/main.ts");

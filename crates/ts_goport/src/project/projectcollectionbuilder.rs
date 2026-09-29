@@ -1931,11 +1931,6 @@ impl ProjectCollectionBuilder {
                     // PORT: no mutable borrow is held while the program is
                     // built (the compiler host reads the project).
                     let result = project.borrow().create_program();
-                    // PORT: Go `result.Program.GetCheckerPool().(*checkerPool)`.
-                    // `ls_program::CheckerPool` has no `Any` view, so
-                    // CreateProgram returns the pool its CreateCheckerPool
-                    // closure made for this program (project.rs). `None` is
-                    // the failed Go type assertion.
                     // tsgo#4712
                     let (new_host, content_mappers) = {
                         let p = project.borrow();
@@ -1985,6 +1980,11 @@ impl ProjectCollectionBuilder {
                     for file_name in &watched_files {
                         content_mapper_watched_files.insert((self.to_path)(file_name));
                     }
+                    // PORT: Go `result.Program.GetCheckerPool().(*checkerPool)`.
+                    // `ls_program::CheckerPool` has no `Any` view, so
+                    // CreateProgram returns the pool its CreateCheckerPool
+                    // closure made for this program (project.rs). `None` is
+                    // the failed Go type assertion.
                     let checker_pool = result.checker_pool.clone().unwrap_or_else(|| {
                         panic!(
                             "interface conversion: compiler.CheckerPool is not *project.checkerPool"

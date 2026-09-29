@@ -13,11 +13,13 @@
 //! the `initialized` handler to its end before it reads the next message.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use ts_goport::contentmapper;
 use ts_goport::frontend::bundled;
 use ts_goport::frontend::json::UnmarshalerFrom;
 use ts_goport::frontend::json_ext::AnyValue;
@@ -88,6 +90,10 @@ pub struct ServerSetup {
     /// The map file system; the server gets `bundled.WrapFS` of it.
     pub files: MapFs,
     pub default_library_path: String,
+    /// Go `ServerOptions.Spawn` (tsgo#4712): `Some(contentmappertest::new_spawner)`
+    /// gives the server `contentmappertest.NewSpawner().Spawn`.
+    /// PORT: a spawner is `Rc`, so the server thread makes it.
+    pub spawner: Option<fn() -> Rc<dyn contentmapper::Spawner>>,
 }
 
 // Go: lspclient.go:66 LSPClient
@@ -109,6 +115,7 @@ pub fn server_setup(cwd: &str, files: FileMap) -> ServerSetup {
         cwd: cwd.to_string(),
         files: map,
         default_library_path: bundled::lib_path(),
+        spawner: None,
     }
 }
 
@@ -145,7 +152,7 @@ pub fn new_lsp_client(
                 typings_location: String::new(),
                 parse_cache: None,
                 npm_install: None,
-                spawn: None,
+                spawn: setup.spawner.map(spawn_fn),
                 progress_delay: Duration::ZERO,
                 set_parent_process_id: None,
             });
@@ -183,6 +190,16 @@ pub fn new_lsp_client(
         server: Some(server),
         router: Some(router),
     }
+}
+
+/// Go `spawner.Spawn` as a `ServerOptions.Spawn` function.
+fn spawn_fn(new_spawner: fn() -> Rc<dyn contentmapper::Spawner>) -> Rc<contentmapper::SpawnFn> {
+    let spawner = new_spawner();
+    Rc::new(
+        move |command: &[String], dir: &str, stderr: Option<Box<dyn std::io::Write + Send>>| {
+            contentmapper::Spawner::spawn(&*spawner, command, dir, stderr)
+        },
+    )
 }
 
 // Go: lspclient.go:137 MessageRouter

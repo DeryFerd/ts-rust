@@ -20,16 +20,6 @@ pub use session_p1::*;
 pub use session_p2::*;
 pub use stringer_generated::*;
 
-// PORT: bump B keeps these re-exports of the items that tsgo#4712 moved to
-// `crate::ipc`. The only callers are 3 calls in `lsp/server.rs` (server
-// lane): `api::new_pipe_transport`, `api::new_async_conn` and
-// `api::generate_pipe_path`. Go calls them through `ipc`. Remove this block
-// when `lsp/server.rs` names `crate::ipc`.
-pub use crate::ipc::{
-    AsyncConn, Conn, Handler, Message, Protocol, ReadWriteCloser, generate_pipe_path,
-    new_async_conn, new_async_conn_with_protocol, new_jsonrpc_protocol, new_pipe_transport,
-};
-
 /// Glob import for api files: `use crate::api::prelude::*;`.
 pub mod prelude {
     pub use super::{
