@@ -531,8 +531,8 @@ impl Checker {
         self.check_exports_on_merged_declarations(node);
 
         let type_node = node.type_();
-        let type_parameters = node.type_parameters().to_vec();
-        self.check_type_parameters(&type_parameters);
+        let type_parameters = node.type_parameters();
+        self.check_type_parameters(type_parameters);
         if type_node.is_some() && type_node.kind() == SyntaxKind::IntrinsicKeyword {
             let name_text = node.name().text();
             if !(type_parameters.is_empty() && name_text == "BuiltinIteratorReturn"
@@ -723,9 +723,11 @@ impl Checker {
     }
 
     // Go: checker/checker.go:6977 checkTypeParameters
-    pub fn check_type_parameters(&mut self, type_parameter_declarations: &[Node]) {
+    // PERF: takes the `NodeSlice` (program data), so callers do not copy the
+    // list into a `Vec`.
+    pub fn check_type_parameters(&mut self, type_parameter_declarations: NodeSlice) {
         let mut seen_default = false;
-        for (i, &node) in type_parameter_declarations.iter().enumerate() {
+        for (i, node) in type_parameter_declarations.iter().enumerate() {
             self.check_type_parameter(node);
             let default_type_node = node.default_type();
             if default_type_node.is_some() {
@@ -743,7 +745,7 @@ impl Checker {
                 );
             }
             for j in 0..i {
-                if type_parameter_declarations[j].symbol() == node.symbol() {
+                if type_parameter_declarations.get(j).symbol() == node.symbol() {
                     self.error(
                         node.name(),
                         diag::Duplicate_identifier_0,
@@ -759,15 +761,15 @@ impl Checker {
     pub fn check_type_parameters_not_referenced(
         &mut self,
         root: Node,
-        type_parameters: &[Node],
+        type_parameters: NodeSlice,
         index: i32,
     ) {
-        fn visit(c: &mut Checker, node: Node, type_parameters: &[Node], index: i32) -> bool {
+        fn visit(c: &mut Checker, node: Node, type_parameters: NodeSlice, index: i32) -> bool {
             if is_type_reference_node(node) {
                 let t = c.get_type_from_type_reference(node);
                 if c.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER) {
                     for i in (index as usize)..type_parameters.len() {
-                        let tp_symbol = c.get_symbol_of_declaration(type_parameters[i]);
+                        let tp_symbol = c.get_symbol_of_declaration(type_parameters.get(i));
                         if c.ty(t).symbol == tp_symbol {
                             c.error(
                                 node,
@@ -892,7 +894,7 @@ impl Checker {
 
     // Go: checker/checker.go:7090 checkUnusedClassMembers
     pub fn check_unused_class_members(&mut self, node: Node) {
-        for member in node.members().to_vec() {
+        for member in node.members() {
             match member.kind() {
                 SyntaxKind::MethodDeclaration
                 | SyntaxKind::PropertyDeclaration
@@ -925,7 +927,7 @@ impl Checker {
                     }
                 }
                 SyntaxKind::Constructor => {
-                    for parameter in member.parameters().to_vec() {
+                    for parameter in member.parameters() {
                         if !self.is_referenced(parameter.symbol())
                             && has_syntactic_modifier(parameter, ModifierFlags::PRIVATE)
                         {
@@ -1213,10 +1215,10 @@ impl Checker {
         if type_parameter_list.is_nil() {
             return;
         }
-        let type_parameters = type_parameter_list.nodes().to_vec();
+        let type_parameters = type_parameter_list.nodes();
         if type_parameters.len() > 1 && {
             let mut all = true;
-            for &tp in &type_parameters {
+            for tp in type_parameters {
                 if !self.is_unreferenced_type_parameter(tp) {
                     all = false;
                     break;

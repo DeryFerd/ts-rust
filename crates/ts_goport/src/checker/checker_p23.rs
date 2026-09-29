@@ -196,7 +196,7 @@ impl Checker {
         if !self.ty(return_type).flags.intersects(TypeFlags::BOOLEAN) {
             return TypePredicateId::NIL;
         }
-        for (i, param) in fn_.parameters().to_vec().into_iter().enumerate() {
+        for (i, param) in fn_.parameters().iter().enumerate() {
             let init_type = self.get_type_of_symbol(param.symbol());
             if init_type.is_nil()
                 || self.ty(init_type).flags.intersects(TypeFlags::BOOLEAN)
@@ -708,11 +708,7 @@ pub fn is_thisless_type(node: Node) -> bool {
         | SyntaxKind::NeverKeyword
         | SyntaxKind::LiteralType => true,
         SyntaxKind::ArrayType => is_thisless_type(node.element_type()),
-        SyntaxKind::TypeReference => node
-            .type_arguments()
-            .to_vec()
-            .into_iter()
-            .all(is_thisless_type),
+        SyntaxKind::TypeReference => node.type_arguments().iter().all(is_thisless_type),
         _ => false,
     }
 }
@@ -726,13 +722,11 @@ pub fn is_thisless_function_like_declaration(node: Node) -> bool {
     (is_constructor_declaration(node) || return_type.is_some() && is_thisless_type(return_type))
         && node
             .parameters()
-            .to_vec()
-            .into_iter()
+            .iter()
             .all(is_thisless_variable_like_declaration)
         && node
             .type_parameters()
-            .to_vec()
-            .into_iter()
+            .iter()
             .all(is_thisless_type_parameter)
 }
 

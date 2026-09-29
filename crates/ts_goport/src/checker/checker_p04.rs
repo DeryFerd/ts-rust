@@ -71,7 +71,7 @@ impl Checker {
                 }
             }
         }
-        self.check_source_elements(&node.type_arguments().to_vec());
+        self.check_source_elements(node.type_arguments());
         self.check_type_reference_or_import(node);
     }
 
@@ -220,7 +220,7 @@ impl Checker {
             } else if parameter_name.is_some() {
                 let mut has_reported_error = false;
                 let predicate_parameter_name = self.pred(type_predicate).parameter_name.clone();
-                for param in parent.parameters().to_vec() {
+                for param in parent.parameters() {
                     let name = param.name();
                     if is_binding_pattern(name)
                         && self.check_if_type_predicate_variable_is_declared_in_binding_pattern(
@@ -271,7 +271,7 @@ impl Checker {
         predicate_variable_node: Node,
         predicate_variable_name: &str,
     ) -> bool {
-        for element in pattern.elements().to_vec() {
+        for element in pattern.elements() {
             let name = element.name();
             if name.is_nil() {
                 continue;
@@ -304,7 +304,7 @@ impl Checker {
 
     // Go: checker/checker.go:3118 checkTypeLiteral
     pub fn check_type_literal(&mut self, node: Node) {
-        self.check_source_elements(&node.members().to_vec());
+        self.check_source_elements(node.members());
         let t = self.get_type_from_type_literal_or_function_or_constructor_type_node(node);
         let symbol = self.ty(t).symbol;
         self.check_index_constraints(t, symbol, false /*isStaticIndex*/);
@@ -359,9 +359,9 @@ impl Checker {
                 }
             }
         }
-        for member in node.members().to_vec() {
+        for member in node.members() {
             if is_constructor_declaration(member) {
-                for param in member.parameters().to_vec() {
+                for param in member.parameters() {
                     if is_parameter_property_declaration(param, member)
                         && !is_binding_pattern(param.name())
                     {
@@ -462,9 +462,9 @@ impl Checker {
         is_static_: bool,
         message: &'static Message,
     ) {
-        for member in node.members().to_vec() {
+        for member in node.members() {
             if is_constructor_declaration(member) {
-                for param in member.parameters().to_vec() {
+                for param in member.parameters() {
                     if is_parameter_property_declaration(param, member)
                         && !is_binding_pattern(param.name())
                     {
@@ -497,8 +497,8 @@ impl Checker {
     pub fn check_tuple_type(&mut self, node: Node) {
         let mut seen_optional_element = false;
         let mut seen_rest_element = false;
-        let elements = node.elements().to_vec();
-        for &e in &elements {
+        let elements = node.elements();
+        for e in elements {
             let mut flags = self.get_tuple_element_flags(e);
             if flags.intersects(ElementFlags::VARIADIC) {
                 let t = self.get_type_from_type_node(e.type_());
@@ -548,7 +548,7 @@ impl Checker {
                 break;
             }
         }
-        self.check_source_elements(&elements);
+        self.check_source_elements(elements);
         self.get_type_from_type_node(node);
     }
 
@@ -619,7 +619,7 @@ impl Checker {
 
     // Go: checker/checker.go:3299 checkTemplateLiteralType
     pub fn check_template_literal_type(&mut self, node: Node) {
-        for span in node.template_spans().nodes().to_vec() {
+        for span in node.template_spans().nodes() {
             self.check_source_element(span.type_());
             let t = self.get_type_from_type_node(span.type_());
             let template_constraint_type = self.template_constraint_type;
@@ -1391,10 +1391,10 @@ impl Checker {
         }
         if is_function_or_module_block(node) {
             let save_flow_analysis_disabled = self.flow_analysis_disabled;
-            self.check_source_elements(&node.statements().to_vec());
+            self.check_source_elements(node.statements());
             self.flow_analysis_disabled = save_flow_analysis_disabled;
         } else {
-            self.check_source_elements(&node.statements().to_vec());
+            self.check_source_elements(node.statements());
         }
         if self.symbols.len(node.locals()) != 0 {
             self.register_for_unused_identifiers_check(node);

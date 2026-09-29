@@ -754,7 +754,7 @@ impl Checker {
                 {
                     let mut evolved_type = flow_type.t;
                     if is_call_expression(node) {
-                        for arg in node.arguments().to_vec() {
+                        for arg in node.arguments() {
                             evolved_type = self.add_evolving_array_element_type(evolved_type, arg);
                         }
                     } else {

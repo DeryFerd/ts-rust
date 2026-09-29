@@ -1879,8 +1879,7 @@ impl Checker {
                                 let static_blocks: Vec<Node> = declaration
                                     .parent()
                                     .members()
-                                    .to_vec()
-                                    .into_iter()
+                                    .iter()
                                     .filter(|&m| is_class_static_block_declaration(m))
                                     .collect();
                                 if self.is_property_initialized_in_static_blocks(

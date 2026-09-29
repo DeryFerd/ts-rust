@@ -437,7 +437,7 @@ impl Checker {
         let jsx_namespace = self.get_jsx_namespace_at(node);
         let jsx_children_property_name = self.get_jsx_element_children_property_name(jsx_namespace);
         let mut discriminant_properties: Vec<Node> = Vec::new();
-        for p in node.properties().to_vec() {
+        for p in node.properties() {
             let symbol = p.symbol();
             let keep = if symbol.is_nil() || !is_jsx_attribute(p) {
                 false
@@ -496,7 +496,7 @@ impl Checker {
         mut diagnostic_output: Option<&mut Vec<Diagnostic>>,
     ) -> bool {
         let mut reported_error = false;
-        for prop in node.properties().to_vec() {
+        for prop in node.properties() {
             if !is_jsx_spread_attribute(prop) && !is_hyphenated_jsx_name(prop.name().text()) {
                 let name_type = self.get_string_literal_type(prop.name().text());
                 if name_type.is_some() && !self.ty(name_type).flags.intersects(TypeFlags::NEVER) {
@@ -1083,7 +1083,7 @@ impl Checker {
                 );
                 let type_arguments = node.type_arguments().to_vec();
                 if !type_arguments.is_empty() {
-                    self.check_source_elements(&type_arguments);
+                    self.check_source_elements(type_arguments.iter().copied());
                     let source_file = get_source_file_of_node(node);
                     let type_argument_list = node.type_argument_list();
                     let loc = TextRange::new(
@@ -1375,7 +1375,7 @@ impl Checker {
             // Create anonymous type from given attributes symbol table.
             // @param symbol a symbol of JsxAttributes containing attributes corresponding to attributesTable
             // @param attributesTable a symbol table of attributes property
-            for attribute_decl in attributes.properties().to_vec() {
+            for attribute_decl in attributes.properties() {
                 let member = attribute_decl.symbol();
                 if is_jsx_attribute(attribute_decl) {
                     let expr_type = self.check_jsx_attribute(attribute_decl, check_mode);
@@ -1651,7 +1651,7 @@ impl Checker {
     // Go: checker/jsx.go:881 checkJsxChildren
     pub fn check_jsx_children(&mut self, node: Node, check_mode: CheckMode) -> Vec<TypeId> {
         let mut child_types: Vec<TypeId> = Vec::new();
-        for child in node.children().nodes().to_vec() {
+        for child in node.children().nodes() {
             // In React, JSX text that contains only whitespaces will be ignored so we don't want to type-check that
             // because then type of children property will have constituent of string type.
             if is_jsx_text(child) {

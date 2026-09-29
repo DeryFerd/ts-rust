@@ -53,7 +53,7 @@ impl Checker {
                     }
                     let elements = pattern.elements();
                     let mut literal_members: Vec<Node> = Vec::with_capacity(elements.len());
-                    for element in elements.to_vec() {
+                    for element in elements {
                         if !has_dot_dot_dot_token(element) {
                             let name = element.property_name_or_name();
                             literal_members.push(name);
@@ -360,7 +360,7 @@ impl Checker {
         let mut string_index_info = IndexInfoId::NIL;
         let mut object_flags =
             ObjectFlags::OBJECT_LITERAL | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL;
-        for e in pattern.elements().to_vec() {
+        for e in pattern.elements() {
             let name = e.property_name_or_name();
             if has_dot_dot_dot_token(e) {
                 let (string_type, any_type) = (self.string_type, self.any_type);

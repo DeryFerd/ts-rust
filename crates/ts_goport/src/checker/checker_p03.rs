@@ -242,8 +242,7 @@ impl Checker {
             // Grammar checking
             self.check_grammar_source_file(source_file);
             self.renamed_binding_elements_in_types = Vec::new();
-            let statements = source_file.statements().to_vec();
-            self.check_source_elements(&statements);
+            self.check_source_elements(source_file.statements());
             self.check_deferred_nodes(source_file);
             if is_external_or_common_js_module(source_file) {
                 self.check_external_module_exports(source_file);
@@ -276,8 +275,10 @@ impl Checker {
     }
 
     // Go: checker/checker.go:2218 checkSourceElements
-    pub fn check_source_elements(&mut self, nodes: &[Node]) {
-        for &node in nodes {
+    // PERF: takes the nodes by value (a `NodeSlice` of program data, or
+    // copied ids), so callers do not copy a node list into a `Vec` first.
+    pub fn check_source_elements(&mut self, nodes: impl IntoIterator<Item = Node>) {
+        for node in nodes {
             if self.is_canceled() {
                 break;
             }
@@ -301,11 +302,11 @@ impl Checker {
 
     // Go: checker/checker.go:2240 checkSourceElementWorker
     pub fn check_source_element_worker(&mut self, node: Node) {
-        for jsdoc in node.eager_js_doc(Node::NIL).to_vec() {
+        for jsdoc in node.eager_js_doc(Node::NIL) {
             self.check_js_doc_comments(jsdoc);
             let tags = jsdoc.tags();
             if !tags.is_nil() {
-                for tag in tags.nodes().to_vec() {
+                for tag in tags.nodes() {
                     self.check_js_doc_comments(tag);
                 }
             }
@@ -690,7 +691,7 @@ impl Checker {
 
     // Go: checker/checker.go:2525 checkJSDocComments
     pub fn check_js_doc_comments(&mut self, node: Node) {
-        for comment in node.comments().to_vec() {
+        for comment in node.comments() {
             self.check_js_doc_comment(comment);
         }
     }
@@ -1062,9 +1063,9 @@ impl Checker {
                 self.check_external_emit_helpers(node, ExternalEmitHelpers::AWAITER);
             }
         }
-        self.check_type_parameters(&node.type_parameters().to_vec());
+        self.check_type_parameters(node.type_parameters());
         self.check_unmatched_js_doc_parameters(node);
-        self.check_source_elements(&node.parameters().to_vec());
+        self.check_source_elements(node.parameters());
         let return_type_node = node.type_();
         if return_type_node.is_some() {
             self.check_source_element(return_type_node);
@@ -1246,10 +1247,9 @@ impl Checker {
                 && (node
                     .parent()
                     .members()
-                    .to_vec()
-                    .into_iter()
+                    .iter()
                     .any(is_instance_property_with_initializer_or_private_identifier_property)
-                    || node.parameters().to_vec().into_iter().any(|p: Node| {
+                    || node.parameters().iter().any(|p: Node| {
                         has_syntactic_modifier(p, ModifierFlags::PARAMETER_PROPERTY_MODIFIER)
                     }));
             if super_call_should_be_root_level {
@@ -1263,7 +1263,7 @@ impl Checker {
                     );
                 } else {
                     let mut super_call_statement = Node::NIL;
-                    for statement in node.body().statements().to_vec() {
+                    for statement in node.body().statements() {
                         if is_expression_statement(statement)
                             && is_super_call(skip_outer_expressions(
                                 statement.expression(),
