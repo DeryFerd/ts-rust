@@ -98,7 +98,9 @@ function run({ edit, flags = [] } = {}) {
     const absent = readFileSync(join(dir, "absent.tsv"), "utf8").trim().split("\n").slice(1).map((l) => l.split("\t"));
     const cmp = spawnSync("python3", [COMPARE, join(dir, "base.json"), join(dir, "new.json"),
       "--name-map", join(dir, "map.tsv")], { encoding: "utf8" });
-    return { rc: 0, lines, absent, compare: { rc: cmp.status, out: JSON.parse(cmp.stdout) } };
+    const out = JSON.parse(cmp.stdout);
+    assert.deepEqual(out.mapUnused, []);
+    return { rc: 0, lines, absent, compare: { rc: cmp.status, out } };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

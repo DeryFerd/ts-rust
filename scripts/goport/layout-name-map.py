@@ -259,10 +259,11 @@ def main():
             lines[i] = (old_suite, old, None, None, f'{ev}; removed upstream: {reason}')
 
     with open(a.out, 'w', encoding='utf-8') as f:
+        # compare-tests.py skips the header only as the first line.
+        f.write('oldSuite\toldName\tnewSuite\tnewName\tevidence\n')
         f.write(f'# layout-name-map.py: base {a.base} (sha256 {base_sha}, pin {base["pin"]}), new {a.new} '
                 f'(sha256 {new_sha}, pin {new["pin"]}), collisions {collisions} (sha256 {col_sha})'
                 f'{", absent names removed" if a.remove_absent else ""}\n')
-        f.write('oldSuite\toldName\tnewSuite\tnewName\tevidence\n')
         for old_suite, old, suite, name, ev in lines:
             f.write(f'{old_suite}\t{old}\t{suite or "-"}\t{name or "-"}\t{ev}\n')
     if a.absent:
