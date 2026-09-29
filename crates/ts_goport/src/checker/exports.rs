@@ -434,6 +434,11 @@ impl Checker {
         self.get_apparent_type(t)
     }
 
+    // Go: checker/exports.go:297 GetReducedType
+    pub fn get_reduced_type_exported(&mut self, t: TypeId) -> TypeId {
+        self.get_reduced_type(t)
+    }
+
     // Go: checker/exports.go:299 GetFullyQualifiedName
     // GetFullyQualifiedName returns the fully qualified name of a symbol, walking up
     // its parent chain (e.g. `"/path/to/module".Namespace.Name`).
