@@ -85,8 +85,10 @@ type Pending = Arc<Mutex<HashMap<ID, SyncSender<lsproto::ResponseMessage>>>>;
 /// tests set (In, Out and Err are the harness's).
 pub struct ServerSetup {
     pub cwd: String,
-    /// The map file system; the server gets `bundled.WrapFS` of it.
-    pub files: MapFs,
+    /// The map file system; the server gets `bundled.WrapFS` of it. `None`
+    /// is the OS file system (Go `bundled.WrapFS(osvfs.FS())`), with the
+    /// global typings location and an `npm` runner (`os_server_setup`).
+    pub files: Option<MapFs>,
     pub default_library_path: String,
 }
 
@@ -107,7 +109,19 @@ pub fn server_setup(cwd: &str, files: FileMap) -> ServerSetup {
     let (map, _) = super::projecttestutil::wrapped_map_fs(files, false);
     ServerSetup {
         cwd: cwd.to_string(),
-        files: map,
+        files: Some(map),
+        default_library_path: bundled::lib_path(),
+    }
+}
+
+/// Go `lsp.ServerOptions{Cwd: cwd, FS: bundled.WrapFS(osvfs.FS()), DefaultLibraryPath:
+/// bundled.LibPath(), TypingsLocation: osvfs.GetGlobalTypingsCacheLocation(), NpmInstall: ...}`
+/// of lsp `TestReplay`. PORT: Go `Err` is `os.Stderr`; the harness drops
+/// server errors, as in `server_setup`.
+pub fn os_server_setup(cwd: &str) -> ServerSetup {
+    ServerSetup {
+        cwd: cwd.to_string(),
+        files: None,
         default_library_path: bundled::lib_path(),
     }
 }
@@ -132,7 +146,14 @@ pub fn new_lsp_client(
         .name("lsp-server".to_string())
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
-            let fs = bundled::wrap_fs(setup.files.fs());
+            let (fs, typings_location, npm_install) = match &setup.files {
+                Some(files) => (bundled::wrap_fs(files.fs()), String::new(), None),
+                None => (
+                    bundled::wrap_fs(ts_goport::frontend::vfs::osvfs::osvfs_fs()),
+                    ts_goport::cmd::tsgo::lsp::get_global_typings_cache_location(),
+                    Some(Box::new(npm_install) as NpmInstall),
+                ),
+            };
             let server = lsp::new_server(lsp::ServerOptions {
                 in_: Box::new(LspReader { c: input_reader }),
                 out: Box::new(LspWriter {
@@ -142,9 +163,9 @@ pub fn new_lsp_client(
                 cwd: setup.cwd,
                 fs,
                 default_library_path: setup.default_library_path,
-                typings_location: String::new(),
+                typings_location,
                 parse_cache: None,
-                npm_install: None,
+                npm_install,
                 progress_delay: Duration::ZERO,
                 set_parent_process_id: None,
             });
@@ -181,6 +202,28 @@ pub fn new_lsp_client(
         cancel: Some(cancel),
         server: Some(server),
         router: Some(router),
+    }
+}
+
+type NpmInstall = Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>)>;
+
+/// Go `exec.Command("npm", args...)` in `cwd`, `cmd.Output()` (the
+/// `NpmInstall` of lsp `TestReplay`). PORT: the error text is approximated.
+fn npm_install(cwd: &str, args: &[String]) -> (Vec<u8>, Option<GoError>) {
+    match std::process::Command::new("npm")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+    {
+        Ok(output) if output.status.success() => (output.stdout, None),
+        Ok(output) => (
+            output.stdout,
+            Some(errors::new(format!(
+                "exit status {:?}",
+                output.status.code()
+            ))),
+        ),
+        Err(err) => (Vec::new(), Some(errors::new(err.to_string()))),
     }
 }
 
@@ -320,6 +363,24 @@ impl LspClient {
             };
             (resp, typed)
         }
+    }
+
+    // Go: lspclient.go:282 SendRequestWorker
+    // SendRequestWorker sends a request message with the given ID and waits
+    // for its response. PORT: `None` is Go's `ok == false` (no response in
+    // the harness timeout).
+    pub fn send_request_worker(
+        &self,
+        req: lsproto::RequestMessage,
+        req_id: ID,
+    ) -> Option<lsproto::ResponseMessage> {
+        let (tx, rx) = sync_channel::<lsproto::ResponseMessage>(1);
+        self.pending_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(req_id, tx);
+        self.write_msg(req.message());
+        rx.recv_timeout(Duration::from_secs(120)).ok()
     }
 
     // Go: lspclient.go:312 SendNotification
