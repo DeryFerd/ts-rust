@@ -417,7 +417,18 @@ thread_local! {
     /// in `PINS`). The reads of that version test `is_hot` and read it with
     /// `with_hot`, with no pin lookup. It is borrowed only inside this
     /// module, never while other code runs.
-    static HOT: RefCell<Option<VersionPin>> = const { RefCell::new(None) };
+    static HOT: HotSlot = const { HotSlot(RefCell::new(None)) };
+}
+
+/// The value of `HOT`. Its thread-local destructor clears `HOT_KEY`, which
+/// has none, so a read during the thread's end does not see a hot version
+/// that is gone.
+struct HotSlot(RefCell<Option<VersionPin>>);
+
+impl Drop for HotSlot {
+    fn drop(&mut self) {
+        let _ = HOT_KEY.try_with(|key| key.set((usize::MAX, usize::MAX)));
+    }
 }
 
 /// True when published freeable version `file` is the hot version of this
@@ -446,7 +457,7 @@ pub(crate) fn is_hot(file: usize) -> bool {
 #[inline(always)]
 pub(crate) fn with_hot<R>(read: impl FnOnce(&VersionStore) -> R) -> R {
     let result = HOT.try_with(|hot| {
-        let hot = hot.borrow();
+        let hot = hot.0.borrow();
         hot.as_deref()
             .and_then(|version| version.published())
             .map(read)
@@ -460,7 +471,7 @@ pub(crate) fn with_hot<R>(read: impl FnOnce(&VersionStore) -> R) -> R {
 /// A clone of the pin of the hot version (`with_hot`), for a guard.
 #[inline(always)]
 pub(crate) fn hot_pin() -> VersionPin {
-    match HOT.try_with(|hot| hot.borrow().clone()) {
+    match HOT.try_with(|hot| hot.0.borrow().clone()) {
         Ok(Some(version)) => version,
         _ => no_hot_version(),
     }
@@ -489,7 +500,7 @@ fn make_hot_slow(version: &VersionPin) {
     }
     let previous = HOT
         .try_with(|hot| {
-            let mut hot = hot.try_borrow_mut().ok()?;
+            let mut hot = hot.0.try_borrow_mut().ok()?;
             let previous = hot.replace(Rc::clone(version));
             HOT_KEY.with(|key| key.set((version.file, PIN_EPOCH.load(Ordering::Relaxed))));
             Some(previous)
@@ -504,7 +515,7 @@ fn make_hot_slow(version: &VersionPin) {
 fn drop_hot() {
     let previous = HOT
         .try_with(|hot| {
-            let mut hot = hot.try_borrow_mut().ok()?;
+            let mut hot = hot.0.try_borrow_mut().ok()?;
             HOT_KEY.with(|key| key.set((usize::MAX, usize::MAX)));
             hot.take()
         })

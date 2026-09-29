@@ -1451,11 +1451,50 @@ fn file_list_node(file: usize, host: Node, i: usize) -> Node {
 /// (`SliceIds::Inline`).
 const INLINE_NODES: usize = 4;
 
+/// Entries of `HOT_LIST_NODES`.
+const HOT_LIST_NODE_SLOTS: usize = 256;
+
+thread_local! {
+    /// The first nodes of short lists of hot file versions
+    /// (`store_list_first_nodes`), by list handle, direct mapped (lsshells
+    /// M3f). A published list never changes, and a handle names its file
+    /// id, which is never reused; only a list of a hot version reads it.
+    // PERF: the checker loops over the same short lists of the edited file
+    // many times (parameters, type arguments).
+    static HOT_LIST_NODES: RefCell<[(Option<StoreList>, [Node; INLINE_NODES]); HOT_LIST_NODE_SLOTS]> =
+        const { RefCell::new([(None, [Node::NIL; INLINE_NODES]); HOT_LIST_NODE_SLOTS]) };
+}
+
 /// The first `INLINE_NODES` nodes of `SliceRepr::Store { list }` (nil after
 /// its end).
 #[cold]
 #[inline(never)]
 fn store_list_first_nodes(list: StoreList) -> [Node; INLINE_NODES] {
+    if !crate::ast::is_hot_file(list.file()) {
+        return read_store_list_first_nodes(list);
+    }
+    let slot = list.hash_slot(HOT_LIST_NODE_SLOTS);
+    let hit = HOT_LIST_NODES
+        .try_with(|lists| {
+            let (key, nodes) = lists.borrow()[slot];
+            (key == Some(list)).then_some(nodes)
+        })
+        .ok()
+        .flatten();
+    if let Some(nodes) = hit {
+        return nodes;
+    }
+    let nodes = read_store_list_first_nodes(list);
+    let _ = HOT_LIST_NODES.try_with(|lists| {
+        if let Ok(mut lists) = lists.try_borrow_mut() {
+            lists[slot] = (Some(list), nodes);
+        }
+    });
+    nodes
+}
+
+/// `store_list_first_nodes`, read from the store.
+fn read_store_list_first_nodes(list: StoreList) -> [Node; INLINE_NODES] {
     let file = list.file();
     let mut nodes = [Node::NIL; INLINE_NODES];
     with_store_list(list, |l| {

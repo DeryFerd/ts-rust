@@ -1835,6 +1835,15 @@ impl StoreList {
     pub fn is_empty(self) -> bool {
         self.sel >> Self::LEN_SHIFT == 0
     }
+
+    /// A slot of a direct-mapped cache of `slots` entries (a power of two)
+    /// for this handle.
+    #[inline]
+    #[must_use]
+    pub fn hash_slot(self, slots: usize) -> usize {
+        let key = (u64::from(self.file) << 32 | u64::from(self.key)) ^ u64::from(self.sel) << 20;
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize & (slots - 1)
+    }
 }
 
 /// A list of a store that owns its nodes, read in place
@@ -2264,6 +2273,49 @@ fn hot_list_of(
 #[inline]
 #[must_use]
 pub fn scoped_store_list_of(n: Node, sel_id: u32, sel: ListSel) -> Option<Option<ScopedList>> {
+    if super::file_version::is_hot(n.file_index()) {
+        let index = slot_index(n);
+        return hot_list_of(n, sel_id, || {
+            super::file_version::with_hot(|version| {
+                pick_store_list(&version.store, n, index, sel_id, sel)
+            })
+        });
+    }
+    scoped_store_list_cold(n, sel_id, sel)
+}
+
+/// The list field that `sel` (selector id `sel_id`) finds in the data of
+/// slot `index` (node `n`) of store `s` (`scoped_store_list_of`).
+#[inline(always)]
+fn pick_store_list(
+    s: &FileStore,
+    n: Node,
+    index: usize,
+    sel_id: u32,
+    sel: ListSel,
+) -> Option<Option<ScopedList>> {
+    match s.cell_of(index) {
+        NO_CELL => {
+            let node: &'static crate::astdata::Node = slot_node(s.nodes[index]);
+            sel(&node.data).map(|found| found.map(ScopedList::Static))
+        }
+        cell => sel(&s.owned_ref().node(cell).data).map(|found| {
+            found.map(|list| {
+                ScopedList::Store(StoreList::new(
+                    n.file_index(),
+                    cell,
+                    sel_id,
+                    StoreListView::Data(list),
+                ))
+            })
+        }),
+    }
+}
+
+/// `scoped_store_list_of` for a node that is not of the hot file version.
+#[cold]
+#[inline(never)]
+fn scoped_store_list_cold(n: Node, sel_id: u32, sel: ListSel) -> Option<Option<ScopedList>> {
     let (file, index) = (n.file_index(), slot_index(n));
     let pick = |s: &FileStore| match s.cell_of(index) {
         NO_CELL => {
@@ -2281,11 +2333,6 @@ pub fn scoped_store_list_of(n: Node, sel_id: u32, sel: ListSel) -> Option<Option
             })
         }),
     };
-    if super::file_version::is_hot(file) {
-        return hot_list_of(n, sel_id, || {
-            super::file_version::with_hot(|version| pick(&version.store))
-        });
-    }
     if let Some(found) = with_version_store(file, |version| pick(&version.store)) {
         return found;
     }

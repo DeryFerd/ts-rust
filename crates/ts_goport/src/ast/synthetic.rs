@@ -859,6 +859,15 @@ pub fn with_scoped_ast_node<R>(n: Node, f: impl FnOnce(&crate::astdata::Node) ->
     if crate::ast::store::is_hot_store_node(n) {
         return crate::ast::store::with_hot_store_node(n, f);
     }
+    with_held_ast_node(n, f)
+}
+
+/// `with_scoped_ast_node` for a node that is not of the hot file version.
+// PERF: lsshells M3f. Its own function, so the hot read above saves few
+// registers.
+#[cold]
+#[inline(never)]
+fn with_held_ast_node<R>(n: Node, f: impl FnOnce(&crate::astdata::Node) -> R) -> R {
     f(&scoped_ast_node(n))
 }
 
@@ -898,6 +907,19 @@ pub fn static_tier_ast_node(n: Node) -> Option<&'static crate::astdata::Node> {
 #[cold]
 #[inline(never)]
 pub fn read_ast_node_miss<R>(n: Node, read: impl FnOnce(&crate::astdata::Node) -> R) -> R {
+    // lsshells M3f: a node of the hot file version (a synthetic id never
+    // is), with the other misses out of line, so this path saves few
+    // registers.
+    if crate::ast::store::is_hot_store_node(n) {
+        return crate::ast::store::with_hot_store_node(n, read);
+    }
+    read_ast_node_cold(n, read)
+}
+
+/// `read_ast_node_miss` for a node that is not of the hot file version.
+#[cold]
+#[inline(never)]
+fn read_ast_node_cold<R>(n: Node, read: impl FnOnce(&crate::astdata::Node) -> R) -> R {
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return read(&synthetic_ast_node(n));
     }
