@@ -3,12 +3,13 @@ use crate::ls::prelude::*;
 // Go `internal/ls/selectionranges.go`: textDocument/selectionRange.
 
 use crate::frontend::scanner::get_trailing_comment_ranges;
+use crate::spanmap::Feature;
 use std::cell::Cell;
 
-// Go: ls/selectionranges.go:13 maxSelectionRangeDepth
+// Go: ls/selectionranges.go:15 maxSelectionRangeDepth
 const MAX_SELECTION_RANGE_DEPTH: usize = 1000;
 
-// Go: ls/selectionranges.go:15 selectionRangeBuilder
+// Go: ls/selectionranges.go:17 selectionRangeBuilder
 // PORT: Go reads the capacity with `cap(b.ranges)`. A Rust `Vec` can hold
 // more than it was asked for, so the capacity is a field.
 struct SelectionRangeBuilder {
@@ -17,7 +18,7 @@ struct SelectionRangeBuilder {
     capacity: usize,
 }
 
-// Go: ls/selectionranges.go:20 newSelectionRangeBuilder
+// Go: ls/selectionranges.go:22 newSelectionRangeBuilder
 fn new_selection_range_builder(capacity: usize) -> SelectionRangeBuilder {
     SelectionRangeBuilder {
         ranges: Vec::with_capacity(capacity),
@@ -27,7 +28,7 @@ fn new_selection_range_builder(capacity: usize) -> SelectionRangeBuilder {
 }
 
 impl SelectionRangeBuilder {
-    // Go: ls/selectionranges.go:26 push
+    // Go: ls/selectionranges.go:28 push
     fn push(&mut self, selection_range: lsproto::Range) {
         if self.ranges.len() < self.capacity {
             self.ranges.push(selection_range);
@@ -38,25 +39,24 @@ impl SelectionRangeBuilder {
         self.oldest_index = (self.oldest_index + 1) % self.ranges.len();
     }
 
-    // Go: ls/selectionranges.go:36 build
-    fn build(&self, parent_range: lsproto::Range) -> lsproto::SelectionRange {
-        let mut result = lsproto::SelectionRange {
-            range: parent_range,
-            parent: None,
-        };
+    // Go: ls/selectionranges.go:38 build
+    fn build(
+        &self,
+        mut result: Option<lsproto::SelectionRange>,
+    ) -> Option<lsproto::SelectionRange> {
         for i in 0..self.ranges.len() {
             let index = (self.oldest_index + i) % self.ranges.len();
-            result = lsproto::SelectionRange {
+            result = Some(lsproto::SelectionRange {
                 range: self.ranges[index],
-                parent: Some(Box::new(result)),
-            };
+                parent: result.map(Box::new),
+            });
         }
         result
     }
 }
 
 impl LanguageService {
-    // Go: ls/selectionranges.go:48 ProvideSelectionRanges
+    // Go: ls/selectionranges.go:49 ProvideSelectionRanges
     pub fn provide_selection_ranges(
         &self,
         ctx: &Context,
@@ -67,12 +67,19 @@ impl LanguageService {
             return Ok(lsproto::SelectionRangesOrNull::default());
         }
 
-        let mut results: Vec<lsproto::SelectionRange> = Vec::new();
+        let mut results: Vec<lsproto::SelectionRange> = Vec::with_capacity(params.positions.len());
         for position in &params.positions {
-            let pos = self
-                .converters
-                .line_and_character_to_position(&source_file, position);
-            let selection_range = get_smart_selection_range(self, source_file, pos);
+            let positions = lsconv::from_lsp_position_for_source_file(
+                &self.converters,
+                source_file,
+                *position,
+                Feature::SELECTION_RANGES,
+            );
+            if positions.len() != 1 || !positions[0].fidelity.is_single_segment() {
+                return Ok(lsproto::SelectionRangesOrNull::default());
+            }
+            let selection_range =
+                get_smart_selection_range(self, positions[0].script, positions[0].position);
             if let Some(selection_range) = selection_range {
                 results.push(selection_range);
             }
@@ -84,7 +91,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/selectionranges.go:66 getSelectionChildren
+// Go: ls/selectionranges.go:70 getSelectionChildren
 fn get_selection_children(factory: &NodeFactory, node: Node, source_file: Node) -> Vec<Node> {
     if !is_mapped_type_node(node) {
         return get_children_from_non_js_doc_node(node, source_file);
@@ -138,7 +145,7 @@ fn get_selection_children(factory: &NodeFactory, node: Node, source_file: Node) 
     ]
 }
 
-// Go: ls/selectionranges.go:111 groupChildren
+// Go: ls/selectionranges.go:115 groupChildren
 fn group_children(
     factory: &NodeFactory,
     children: &[Node],
@@ -163,7 +170,7 @@ fn group_children(
     result
 }
 
-// Go: ls/selectionranges.go:131 splitChildren
+// Go: ls/selectionranges.go:135 splitChildren
 fn split_children(
     factory: &NodeFactory,
     children: &[Node],
@@ -211,7 +218,7 @@ fn split_children(
     result
 }
 
-// Go: ls/selectionranges.go:176 createSyntaxList
+// Go: ls/selectionranges.go:180 createSyntaxList
 fn create_syntax_list(factory: &NodeFactory, children: &[Node]) -> Node {
     let list = factory.new_syntax_list(children);
     set_node_loc(
@@ -221,24 +228,32 @@ fn create_syntax_list(factory: &NodeFactory, children: &[Node]) -> Node {
     list
 }
 
-// Go: ls/selectionranges.go:182 getSmartSelectionRange
+// Go: ls/selectionranges.go:186 getSmartSelectionRange
 // PORT: Go builds the `*lsproto.SelectionRange` chain in `ranges.build`. The
 // closures share `ranges`, `last_range` and `next` through `RefCell` and
-// `Cell`, as Go closures share the locals. Go never returns nil here; the
-// `Option` keeps the caller's nil check.
+// `Cell`, as Go closures share the locals. Go returns nil for a
+// content-mapped file with no ranges; `None` is that nil.
 fn get_smart_selection_range(
     l: &LanguageService,
     source_file: Node,
     pos: i32,
 ) -> Option<lsproto::SelectionRange> {
     let factory = NodeFactory::default();
-    let full_range = l.converters.to_lsp_range(
-        &source_file,
-        TextRange::new(source_file.pos(), source_file.end()),
-    );
     // Traversal discovers ranges from broadest to most specific, so retain the newest ranges nearest to the cursor
     let ranges = RefCell::new(new_selection_range_builder(MAX_SELECTION_RANGE_DEPTH - 1));
-    let last_range = Cell::new(full_range);
+    let mut root: Option<lsproto::SelectionRange> = None;
+    let last_range = Cell::new(lsproto::Range::default());
+    if source_file_content_mapper(source_file).is_empty() {
+        let (full_range, _) = l.converters.to_lsp_range(
+            &source_file,
+            TextRange::new(source_file.pos(), source_file.end()),
+        );
+        root = Some(lsproto::SelectionRange {
+            range: full_range,
+            parent: None,
+        });
+        last_range.set(full_range);
+    }
 
     let node_contains_position = |node: Node| -> bool {
         if node.is_nil() {
@@ -269,9 +284,14 @@ fn get_smart_selection_range(
             return;
         }
 
-        let lsp_range = l
-            .converters
-            .to_lsp_range(&source_file, TextRange::new(start, end));
+        let (lsp_range, fidelity) = l.converters.to_lsp_range_for_feature(
+            &source_file,
+            TextRange::new(start, end),
+            Feature::SELECTION_RANGES,
+        );
+        if fidelity.is_none() {
+            return;
+        }
 
         if last_range.get() == lsp_range {
             return;
@@ -489,5 +509,5 @@ fn get_smart_selection_range(
         current.visit_each_child(&mut temp_visitor);
         current = next.get();
     }
-    Some(ranges.borrow().build(full_range))
+    ranges.borrow().build(root)
 }

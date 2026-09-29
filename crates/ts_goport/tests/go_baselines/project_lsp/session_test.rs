@@ -1428,6 +1428,7 @@ child_test! {
                 .expect("configured project")
                 .borrow()
                 .program
+                .clone()
                 .expect("program")
         };
         let initial_program = program_of(&session);
@@ -1437,13 +1438,13 @@ child_test! {
         session.configure(preferences.clone());
         let _ = language_service(&session, uri);
         let program_after_code_lens_change = program_of(&session);
-        assert!(std::ptr::eq(program_after_code_lens_change, initial_program));
+        assert!(Rc::ptr_eq(&program_after_code_lens_change, &initial_program));
 
         preferences.locale = "fr".to_string();
         session.configure(preferences);
         let _ = language_service(&session, uri);
         let program_after_locale_change = program_of(&session);
-        assert!(!std::ptr::eq(program_after_locale_change, initial_program));
+        assert!(!Rc::ptr_eq(&program_after_locale_change, &initial_program));
         // Go: defer session.Close()
         session.close();
     }

@@ -677,7 +677,7 @@ impl Session {
     pub fn handle_emit(&self, ctx: &Context, params: &EmitParams) -> Result<EmitResponse, GoError> {
         let (program, mut options) = self.get_emit_options(params)?;
         // Current for the whole handler (session_p1.rs header).
-        let _program = ls_program::enter(program);
+        let _program = ls_program::enter(&program);
         let writes: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
         let pending = Arc::clone(&writes);
         let write_file: WriteFile = Arc::new(
@@ -690,7 +690,7 @@ impl Session {
             },
         );
         options.write_file = Some(write_file);
-        let mut result = emit_program(ctx, program, options)?;
+        let mut result = emit_program(ctx, &program, options)?;
         let writes = std::mem::take(&mut *writes.lock().unwrap_or_else(PoisonError::into_inner));
         let fs = self.project_session.fs();
         for (file_name, text) in writes {
@@ -720,8 +720,8 @@ impl Session {
     ) -> Result<EmitOutputResponse, GoError> {
         let (program, options) = self.get_emit_options(params)?;
         // Current for the whole handler (session_p1.rs header).
-        let _program = ls_program::enter(program);
-        emit_to_output(ctx, program, options)
+        let _program = ls_program::enter(&program);
+        emit_to_output(ctx, &program, options)
     }
 
     // Go: api/session.go:2656 handleSelectedFilesEmit (tsgo#4699)
@@ -733,7 +733,7 @@ impl Session {
     ) -> Result<EmitOutputResponse, GoError> {
         let program = self.get_emit_program(params.snapshot, &params.project)?;
         // Current for the whole handler (session_p1.rs header).
-        let _program = ls_program::enter(program);
+        let _program = ls_program::enter(&program);
         let Some(files) = &params.files else {
             return Err(errors::errorf(
                 format!("{}: files is required", *ERR_CLIENT_ERROR),
@@ -742,12 +742,12 @@ impl Session {
         };
         let mut target_source_files = Vec::with_capacity(files.len());
         for file in files {
-            let source_file = self.resolve_optional_source_file(program, Some(file))?;
+            let source_file = self.resolve_optional_source_file(&program, Some(file))?;
             target_source_files.push(source_file);
         }
         emit_to_output(
             ctx,
-            program,
+            &program,
             EmitOptions {
                 target_source_files: Some(target_source_files),
                 emit_only,
@@ -763,7 +763,7 @@ impl Session {
 // in an `Arc<Mutex>` (Go `mu`). The caller keeps `program` current.
 fn emit_to_output(
     ctx: &Context,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     mut options: EmitOptions,
 ) -> Result<EmitOutputResponse, GoError> {
     let output_files: Arc<Mutex<Vec<EmitOutputFile>>> = Arc::default();
@@ -804,7 +804,7 @@ impl Session {
     pub fn get_emit_options(
         &self,
         params: &EmitParams,
-    ) -> Result<(&'static compiler::NewProgram, EmitOptions), GoError> {
+    ) -> Result<(Rc<compiler::NewProgram>, EmitOptions), GoError> {
         let program = self.get_emit_program(params.snapshot, &params.project)?;
         let emit_only = get_emit_only(params.emit_only)?;
         Ok((
@@ -821,7 +821,7 @@ impl Session {
         &self,
         snapshot: SnapshotID,
         project_id: &ProjectID,
-    ) -> Result<&'static compiler::NewProgram, GoError> {
+    ) -> Result<Rc<compiler::NewProgram>, GoError> {
         let sd = self.get_snapshot_data(snapshot)?;
         sd.get_program(project_id)
     }
@@ -854,7 +854,7 @@ fn get_emit_only(value: Option<u32>) -> Result<EmitOnly, GoError> {
 // Go's nil result branches (a canceled `ctx`) do not happen here.
 fn emit_program(
     _ctx: &Context,
-    program: &'static compiler::NewProgram,
+    program: &compiler::NewProgram,
     options: EmitOptions,
 ) -> Result<EmitResult, GoError> {
     let _program = ls_program::enter(program);
@@ -931,7 +931,7 @@ impl Session {
     ) -> Result<String, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let program = sd.get_program(&params.project)?;
+        let program = &sd.get_program(&params.project)?;
         // The formatter reads the target file (file header, "Current program").
         let _program = ls_program::enter(program);
 

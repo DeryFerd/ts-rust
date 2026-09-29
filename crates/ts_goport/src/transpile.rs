@@ -246,20 +246,18 @@ fn transpile_worker(
     });
     // PORT: Go `compiler.NewProgram`. The frontend program parses with no
     // current program and then becomes a program version.
-    let np: &'static NewProgram = {
+    let np: Rc<NewProgram> = {
         let _scope = enter_program(None);
-        Box::leak(Box::new(crate::frontend::compiler::new_program(
-            ProgramOptions {
-                host,
-                config,
-                use_source_of_project_reference: false,
-                single_threaded: Tristate::Unknown,
-                typings_location: String::new(),
-                project_name: String::new(),
-            },
-        )))
+        Rc::new(crate::frontend::compiler::new_program(ProgramOptions {
+            host,
+            config,
+            use_source_of_project_reference: false,
+            single_threaded: Tristate::Unknown,
+            typings_location: String::new(),
+            project_name: String::new(),
+        }))
     };
-    let version = program::new_program_version(np, None);
+    let version = program::new_program_version(&np, None);
 
     let output = {
         let _scope = enter_program(Some(version));

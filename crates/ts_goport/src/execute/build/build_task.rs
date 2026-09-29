@@ -545,7 +545,11 @@ impl BuildTask {
         }
         let compiler_host = Rc::new(BuildCompilerHost {
             host: host.clone(),
-            trace: get_trace_with_writer_from_sys(writer.clone(), command.locale(), testing.clone()),
+            trace: get_trace_with_writer_from_sys(
+                writer.clone(),
+                command.locale(),
+                testing.clone(),
+            ),
             content_mapper_project,
         });
         if !command.build_options.force.is_true() {

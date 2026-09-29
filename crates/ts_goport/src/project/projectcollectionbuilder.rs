@@ -547,7 +547,7 @@ impl ProjectCollectionBuilder {
         let (program, content_mapper_watched_files) = {
             let project = project.borrow();
             (
-                project.program,
+                project.program.clone(),
                 project.content_mapper_watched_files.clone(),
             )
         };

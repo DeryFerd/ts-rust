@@ -88,7 +88,7 @@ impl LanguageService {
     pub fn filter_content_mapped_auto_imports(
         &self,
         ctx: &Context,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         file: Node,
         list: Option<&mut lsproto::CompletionList>,
     ) {
@@ -96,7 +96,10 @@ impl LanguageService {
             return;
         };
         list.items.retain_mut(|item| {
-            let Some(auto_import) = item.data.as_ref().and_then(|data| data.auto_import.as_ref())
+            let Some(auto_import) = item
+                .data
+                .as_ref()
+                .and_then(|data| data.auto_import.as_ref())
             else {
                 return true;
             };

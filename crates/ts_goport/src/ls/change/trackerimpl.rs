@@ -110,7 +110,13 @@ impl Tracker {
             let projection = mapped.script;
             let pos = mapped.position;
             let format_node = |n: Node| -> String {
-                self.get_formatted_text_of_node(n, target_source_file, projection, pos, &change.options)
+                self.get_formatted_text_of_node(
+                    n,
+                    target_source_file,
+                    projection,
+                    pos,
+                    &change.options,
+                )
             };
 
             let text: String = match change.kind {

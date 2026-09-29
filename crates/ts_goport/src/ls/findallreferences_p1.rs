@@ -999,7 +999,7 @@ impl<P: ProgramView> LanguageService<P> {
     pub fn provide_symbols_and_entries_at_position(
         &self,
         ctx: &Context,
-        program: P,
+        program: &P,
         source_file: Node,
         position: i32,
         is_rename: bool,

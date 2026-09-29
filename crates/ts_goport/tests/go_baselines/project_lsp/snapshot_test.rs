@@ -243,7 +243,7 @@ child_test! {
         ]));
         let index_uri = "file:///home/projects/TS/p1/index.ts";
         let config_path = path("/home/projects/ts/p1/tsconfig.json");
-        let configured_program = |session: &Rc<Session>| -> &'static NewProgram {
+        let configured_program = |session: &Rc<Session>| -> Rc<NewProgram> {
             session
                 .snapshot()
                 .project_collection
@@ -251,6 +251,7 @@ child_test! {
                 .expect("configured project")
                 .borrow()
                 .program
+                .clone()
                 .expect("program")
         };
 
@@ -270,7 +271,7 @@ child_test! {
 
         let program_after = configured_program(&session);
         assert!(
-            same_program(program_before, program_after),
+            same_program(&program_before, &program_after),
             "no-op watch change should not rebuild the program"
         );
 
@@ -290,7 +291,7 @@ child_test! {
 
         let program_changed = configured_program(&session);
         assert!(
-            !same_program(program_before, program_changed),
+            !same_program(&program_before, &program_changed),
             "real watch change should rebuild the program"
         );
         session.close();

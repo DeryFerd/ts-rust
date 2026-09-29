@@ -543,7 +543,7 @@ fn new_content_mapper_program(
     transform: FakeTransform,
     files: &[(&str, &str)],
     root_files: &[&str],
-) -> &'static NewProgram {
+) -> Rc<NewProgram> {
     new_content_mapper_program_with_options(
         transform,
         files,
@@ -568,7 +568,7 @@ fn new_content_mapper_program_with_options(
     files: &[(&str, &str)],
     root_files: &[&str],
     options: CompilerOptions,
-) -> &'static NewProgram {
+) -> Rc<NewProgram> {
     let map_fs = MapFs::from_map(
         files
             .iter()
@@ -655,7 +655,7 @@ fn test_content_mapper_virtual_extension_sets_implied_node_format() {
                 },
             );
 
-            let file = source_file(program, "/src/Component.vue");
+            let file = source_file(&program, "/src/Component.vue");
             assert_eq!(
                 program
                     .get_source_file_meta_data(file.path())
@@ -718,7 +718,7 @@ fn test_content_mapper_invalid_mappings() {
                 ],
                 &["/src/app.ts"],
             );
-            let program_diagnostics = collect_content_mapper_diagnostics(program);
+            let program_diagnostics = collect_content_mapper_diagnostics(&program);
             let code = diag::The_content_mapper_0_produced_overlapping_or_out_of_order_position_mappings_near_virtual_offset_1.code() as i32;
             let found = program_diagnostics
                 .iter()
@@ -752,7 +752,7 @@ fn test_content_mapper_source_file_state() {
                     &[("/src/empty.vue", "")],
                     &["/src/empty.vue"],
                 );
-                let file = source_file(program, "/src/empty.vue");
+                let file = source_file(&program, "/src/empty.vue");
                 assert_eq!(file.original_text(), "");
                 assert_eq!(file.content_mapper(), "vue-mapper@1.0.0");
                 assert!(!file.is_content_mapper_failure_stub());
@@ -765,7 +765,7 @@ fn test_content_mapper_source_file_state() {
                     &[("/src/fail.vue", "original")],
                     &["/src/fail.vue"],
                 );
-                let file = source_file(program, "/src/fail.vue");
+                let file = source_file(&program, "/src/fail.vue");
                 assert_eq!(file.original_text(), "original");
                 assert_eq!(file.content_mapper(), "vue-mapper@1.0.0");
                 assert!(file.is_content_mapper_failure_stub());
@@ -789,7 +789,7 @@ fn test_content_mapper_source_file_state() {
                     &[("/src/fail.vue", "original")],
                     &["/src/fail.vue"],
                 );
-                let program_diagnostics = collect_content_mapper_diagnostics(program);
+                let program_diagnostics = collect_content_mapper_diagnostics(&program);
                 let code =
                     diag::The_content_mapper_returned_a_project_response_that_could_not_be_decoded
                         .code() as i32;

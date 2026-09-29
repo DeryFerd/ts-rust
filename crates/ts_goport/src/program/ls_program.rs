@@ -1042,7 +1042,7 @@ impl CompilerCheckerPool {
         }
 
         // #4313: balanced import affinity.
-        let associations = get_checker_associations(self.program, checker_count);
+        let associations = get_checker_associations(&self.program, checker_count);
         let mut file_associations = FxHashMap::default();
         for (i, file) in self.program.files.iter().enumerate() {
             file_associations.insert(file.root.file_index(), associations[i]);
@@ -1543,7 +1543,7 @@ fn new_emit_host(p: &NewProgram, ctx: &Context, file: Node) -> (Rc<EmitHost>, Re
 // order. A language service program has no Go `opts.Tracing`, so there is
 // no trace event. Go returns nil when `ctx` is done after
 // `HandleNoEmitOptions` gave nil; here that is `EmitResult::default()`.
-pub fn emit(p: &'static NewProgram, ctx: &Context, options: EmitOptions) -> EmitResult {
+pub fn emit(p: &NewProgram, ctx: &Context, options: EmitOptions) -> EmitResult {
     let _program = enter(p);
     if !options.force_emit && options.emit_only != EmitOnly::BuilderSignature {
         let result = handle_no_emit_options(p, ctx, options.target_source_files.as_deref());
@@ -1612,7 +1612,7 @@ pub fn emit(p: &'static NewProgram, ctx: &Context, options: EmitOptions) -> Emit
 // config, syntactic and program diagnostics of `get_diagnostics_of_any_program`
 // read the current program, which is `p`.
 fn handle_no_emit_options(
-    p: &'static NewProgram,
+    p: &NewProgram,
     ctx: &Context,
     files: Option<&[Node]>,
 ) -> Option<EmitResult> {

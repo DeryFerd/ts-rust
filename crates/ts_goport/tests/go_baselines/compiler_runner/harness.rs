@@ -1012,7 +1012,7 @@ impl CompilationResult {
         let _scope = self.enter_program_only();
         let program =
             tsprogram::go_frontend_program().expect("a harness program has a Go frontend");
-        ts_goport::frontend::outputpaths::change_to_declaration_extension(path, program)
+        ts_goport::frontend::outputpaths::change_to_declaration_extension(path, &*program)
     }
 
     /// Go `c.Program.GetSourceFile(fileName).ContentMapper()`, or `None`

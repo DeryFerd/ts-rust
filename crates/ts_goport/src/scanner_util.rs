@@ -12,6 +12,8 @@
 //! that hold WTF-8 lone-surrogate sentinels cannot exist in a Rust `&str`, so
 //! the surrogate helpers take `u32` code points.
 
+use std::borrow::Cow;
+
 use crate::frontend::scanner::scanner_ls::get_scanner_for_source_file;
 use crate::prelude::*;
 

@@ -50,7 +50,7 @@ impl LanguageService {
     pub fn provide_source_definition_at_position(
         &self,
         ctx: &Context,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         file: Node,
         text_pos: i32,
     ) -> Result<lsproto::DefinitionResponse, GoError> {

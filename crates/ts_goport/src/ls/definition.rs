@@ -60,7 +60,7 @@ impl LanguageService {
     pub fn provide_definition_at_position(
         &self,
         ctx: &Context,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         file: Node,
         text_pos: i32,
         client_supports_link: bool,
@@ -228,7 +228,7 @@ impl LanguageService {
     pub fn provide_type_definition_at_position(
         &self,
         ctx: &Context,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         file: Node,
         text_pos: i32,
         client_supports_link: bool,

@@ -464,13 +464,17 @@ impl<P: ProgramView> LanguageService<P> {
             + index_after_last_slash as i32;
         let length = specifier.text().len() as i32 - index_after_last_slash as i32;
 
+        let (trigger_span, fidelity) = self
+            .converters
+            .to_lsp_range(&source_file, TextRange::new(start, start + length));
+        if !fidelity.is_exact() {
+            return (RenameInfo::default(), false);
+        }
         (
             RenameInfo {
                 can_rename: true,
                 display_name: specifier.text()[index_after_last_slash..].to_string(),
-                trigger_span: self
-                    .converters
-                    .to_lsp_range(&source_file, TextRange::new(start, start + length)),
+                trigger_span,
                 file_to_rename: display_name,
                 new_file_name,
                 ..Default::default()
@@ -638,10 +642,18 @@ pub fn get_rename_info_success(
         start += 1;
         end -= 1;
     }
+    let (trigger_span, fidelity) =
+        converters.to_lsp_range(&source_file, TextRange::new(start, end));
+    if !fidelity.is_exact() {
+        return RenameInfo {
+            can_rename: false,
+            ..Default::default()
+        };
+    }
     RenameInfo {
         can_rename: true,
         display_name: display_name.to_string(),
-        trigger_span: converters.to_lsp_range(&source_file, TextRange::new(start, end)),
+        trigger_span,
         ..Default::default()
     }
 }

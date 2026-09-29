@@ -86,7 +86,7 @@ impl LanguageService {
         ctx: &Context,
         document_uri: &lsproto::DocumentUri,
         position: i32,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         source_file: Node,
         files_to_search: &[lsproto::DocumentUri],
     ) -> lsproto::MultiDocumentHighlightsOrNull {

@@ -558,8 +558,10 @@ impl crate::ipc::ReadWriteCloser for ChildProcess {
         match waited {
             Ok(status) => {
                 // Go `ProcessState.ExitCode()`: -1 for a signal.
-                *self.exit_code.lock().unwrap_or_else(PoisonError::into_inner) =
-                    Some(status.code().unwrap_or(-1));
+                *self
+                    .exit_code
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(status.code().unwrap_or(-1));
                 Ok(())
             }
             Err(err) => Err(crate::gostd::errors::new(format!(
@@ -573,7 +575,11 @@ impl crate::ipc::ReadWriteCloser for ChildProcess {
 impl ProcessExitState for ChildProcess {
     // Go: cmd/tsgo/sys.go:104 childProcess.ExitCode
     fn exit_code(&self) -> (i32, bool) {
-        match *self.exit_code.lock().unwrap_or_else(PoisonError::into_inner) {
+        match *self
+            .exit_code
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
             Some(code) => (code, true),
             None => (0, false),
         }
@@ -651,10 +657,7 @@ fn go_path_clean(path: &str) -> String {
             r += 1;
         } else if path[r] == b'.' && (r + 1 == n || path[r + 1] == b'/') {
             r += 1;
-        } else if path[r] == b'.'
-            && path[r + 1] == b'.'
-            && (r + 2 == n || path[r + 2] == b'/')
-        {
+        } else if path[r] == b'.' && path[r + 1] == b'.' && (r + 2 == n || path[r + 2] == b'/') {
             r += 2;
             if out.len() > dotdot {
                 // Go drops bytes up to and with the last '/'.
@@ -780,10 +783,7 @@ mod tests {
             }
         });
         let stderr = sys.stderr.lock().unwrap_or_else(PoisonError::into_inner);
-        assert_eq!(
-            String::from_utf8_lossy(&stderr),
-            "mapper log\n".repeat(10)
-        );
+        assert_eq!(String::from_utf8_lossy(&stderr), "mapper log\n".repeat(10));
     }
 
     // Go: cmd/tsgo/sys_unix_test.go:17 TestChildProcessCloseDoesNotWaitForLauncherDescendants (tsgo#4712)
@@ -798,8 +798,8 @@ mod tests {
             .iter()
             .map(|arg| (*arg).to_string())
             .collect();
-        let process = spawn_process(&command, "", Some(Box::new(Vec::<u8>::new())))
-            .expect("spawnProcess");
+        let process =
+            spawn_process(&command, "", Some(Box::new(Vec::<u8>::new()))).expect("spawnProcess");
         let mut pid_text = Vec::new();
         let mut byte = [0u8; 1];
         loop {
@@ -829,7 +829,11 @@ mod tests {
 
         let completed = match done.recv_timeout(Duration::from_secs(2)) {
             Ok(result) => {
-                assert!(result.is_ok(), "Close: {:?}", result.err().map(|e| e.error()));
+                assert!(
+                    result.is_ok(),
+                    "Close: {:?}",
+                    result.err().map(|e| e.error())
+                );
                 true
             }
             Err(_) => {

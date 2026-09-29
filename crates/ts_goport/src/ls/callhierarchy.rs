@@ -1445,7 +1445,7 @@ impl LanguageService {
         &self,
         file: Node,
         position: lsproto::Position,
-        program: &'static compiler::NewProgram,
+        program: &compiler::NewProgram,
         allow_source_file: bool,
     ) -> Vec<Node> {
         let positions = lsconv::from_lsp_position_for_source_file(

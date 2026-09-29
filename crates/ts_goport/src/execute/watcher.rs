@@ -492,7 +492,8 @@ impl Watcher {
                 self.evict_changed_source_files(&changed_paths);
                 let case_sensitive = self.sys.fs().use_case_sensitive_file_names();
                 let cwd = self.sys.get_current_directory();
-                let program_files = self.get_program().files_by_path();
+                let program = self.get_program();
+                let program_files = program.files_by_path();
                 let content_mapper_watched_files =
                     self.content_mapper_watched_paths(&cwd, case_sensitive);
                 let mut content_mapper_config_changed = false;
@@ -893,10 +894,8 @@ impl Watcher {
         // `update_program`.
         let (new_program, _, reused) = old_program.reuse_program(changed_path, host.clone());
         if reused {
-            let np: &'static NewProgram = Box::leak(Box::new(
-                new_program.expect("ReuseProgram returns the reused program"),
-            ));
-            let version = crate::program::new_program_version(np, Some(old_version));
+            let np = Rc::new(new_program.expect("ReuseProgram returns the reused program"));
+            let version = crate::program::new_program_version(&np, Some(old_version));
             let _program = crate::core::enter_program(Some(version));
             let mut program = incremental::program::new_program(
                 self.program.as_ref(),
@@ -932,7 +931,7 @@ impl Watcher {
     /// program's version.
     // PORT: Go `GetProgram` returns the `*compiler.Program`. Its frontend
     // part (`FilesByPath`, `ReuseProgram`) is the `NewProgram` of the version.
-    fn get_program(&self) -> &'static NewProgram {
+    fn get_program(&self) -> Rc<NewProgram> {
         let version = self.program.as_ref().and_then(|program| program.program);
         let _program = crate::core::enter_program(version);
         crate::program::go_frontend_program().expect("the watch build made a Go frontend program")

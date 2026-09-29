@@ -101,7 +101,7 @@ const value: Value = { mode: "require" };"#;
         ]));
         open(&session, SRC_INDEX, index);
         let p = program(&session, SRC_INDEX);
-        assert_eq!(sem_diag_count(p, "/src/index.ts"), 0);
+        assert_eq!(sem_diag_count(&p, "/src/index.ts"), 0);
 
         session.did_change_file(
             &bg(),
@@ -121,7 +121,7 @@ const value: Value = { mode: "require" };"#
             .get_source_file("/src/index.ts")
             .expect("no source file /src/index.ts");
         let diags = ls_program::get_semantic_diagnostics(
-            p,
+            &p,
             &projecttestutil::with_request_id(&bg()),
             file.root,
         );

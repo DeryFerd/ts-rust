@@ -7,7 +7,7 @@ use crate::cmd::tsgo::isprocessalive_other::{PROCESS_ALIVE_SUPPORTED, is_process
 #[cfg(unix)]
 use crate::cmd::tsgo::isprocessalive_unix::{PROCESS_ALIVE_SUPPORTED, is_process_alive};
 use crate::cmd::tsgo::main::{ErrorHandling, must_getwd, new_flag_set, notify_context};
-use crate::execute::tsc::compile::Writer;
+use crate::execute::tsc::compile::{Writer, spawn_process};
 use crate::frontend::bundled;
 use crate::frontend::tspath;
 use crate::frontend::vfs::osvfs;
@@ -91,6 +91,9 @@ pub fn run_lsp(args: &[String]) -> i32 {
                 Err(err) => (Vec::new(), Some(errors::new(err.to_string()))),
             }
         })),
+        // Go: Spawn: spawnProcess (tsgo#4712; Go cmd/tsgo/sys.go spawnProcess is
+        // ported in `execute::tsc::compile`).
+        spawn: Some(Rc::new(spawn_process)),
         progress_delay: Duration::from_millis(250),
         set_parent_process_id: new_parent_process_watchdog(&ctx, &stop, client_process_id.get()),
     });

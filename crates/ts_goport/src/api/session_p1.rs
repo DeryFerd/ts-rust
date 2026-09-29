@@ -2044,7 +2044,7 @@ impl Session {
 
         let program = sd.get_program(&params.project)?;
         // The encoder reads lazy JSDoc (file header, "Current program").
-        let _program = ls_program::enter(program);
+        let _program = ls_program::enter(&program);
 
         let command_line = program.command_line();
         let Some(root_config_source_file) = command_line
@@ -3050,18 +3050,18 @@ impl Session {
             return Ok(Some(Vec::new()));
         };
 
-        let (ch, _done) = ls_program::get_type_checker(program, ctx);
+        let (ch, _done) = ls_program::get_type_checker(&program, ctx);
 
         let view = autoimport::new_view(
             registry,
             source_file,
             project_path,
-            program,
+            program.clone(),
             user_preferences.module_specifier_preferences(),
         );
         let mut import_adder = autoimport::new_import_adder(
             ctx,
-            program,
+            &program,
             source_file,
             Rc::new(view),
             working_snapshot

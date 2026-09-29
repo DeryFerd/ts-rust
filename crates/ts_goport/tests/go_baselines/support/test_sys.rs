@@ -27,6 +27,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use ts_goport::contentmapper::ProcessExitState;
 use ts_goport::core::version;
 use ts_goport::diag;
 use ts_goport::diagnostics::Message;
@@ -35,7 +36,9 @@ use ts_goport::emitter::program_emit::EmitResult;
 use ts_goport::execute::incremental::build_info::BuildInfo;
 use ts_goport::execute::incremental::incremental::marshal_build_info;
 use ts_goport::execute::incremental::program::{Program, SignatureUpdateKind};
-use ts_goport::execute::tsc::compile::{CommandLineTesting, System, Writer, write_str};
+use ts_goport::execute::tsc::compile::{
+    CommandLineTesting, ErrorWriter, System, Writer, write_str,
+};
 use ts_goport::frontend::compiler::TraceFn;
 use ts_goport::frontend::json::json_unmarshal;
 use ts_goport::frontend::tsoptions::{
@@ -46,10 +49,12 @@ use ts_goport::frontend::tspath::{
     get_relative_path_from_directory, to_path,
 };
 use ts_goport::frontend::vfs::{Entries, FileInfo, Fs, FsError, WalkDirFunc};
+use ts_goport::gostd::GoError;
 use ts_goport::locale::{self, Locale};
 use ts_goport::scanner_util::{go_string_bytes, go_string_from_bytes};
 
 use crate::support::child;
+use crate::support::contentmappertest;
 use crate::support::fsbaselineutil::{FsDiffer, sanitize_internal_symbol_name};
 use crate::support::harnessutil::{FAKE_TS_VERSION, TracerForBaselining};
 use crate::support::mock_watch_backend::MockWatchBackend;
@@ -113,6 +118,25 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Go `TestSys.currentWrite` (`*strings.Builder`): the output buffer of
+/// both `Writer()` and `ErrorWriter()`.
+// PORT: `ErrorWriter` is `Send` (the content mapper logger writes to it
+// from a mapper's stderr thread), so the buffer is behind a `Mutex`, and
+// `Writer` is an `Rc<RefCell<CurrentWrite>>` over the same buffer.
+#[derive(Clone, Default)]
+struct CurrentWrite(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CurrentWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        lock(&self.0).extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Go `err.Error()` of a vfs error.
@@ -374,7 +398,7 @@ pub enum SysMode {
 
 // Go: sys.go:155 TestSys
 pub struct TestSys {
-    current_write: Rc<RefCell<Vec<u8>>>,
+    current_write: CurrentWrite,
     writer: Writer,
     program_baselines: RefCell<String>,
     program_include_baselines: RefCell<String>,
@@ -496,13 +520,16 @@ impl TestSys {
         for_incremental_correctness: bool,
         mode: SysMode,
     ) -> TestSys {
-        let current_write: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
-        let writer: Writer = current_write.clone();
+        let current_write = CurrentWrite::default();
+        let writer: Writer = Rc::new(RefCell::new(current_write.clone()));
         let use_case_sensitive_file_names = shared.map_fs.use_case_sensitive_file_names();
+        // PORT: the tracer gets no `builder_bytes`: the buffer is the
+        // `Mutex` of `CurrentWrite`, and the tsc runner never reads the
+        // tracer's `String()`.
         let tracer = TracerForBaselining::new(
             compare_paths_options(use_case_sensitive_file_names, &cwd),
             writer.clone(),
-            Some(current_write.clone()),
+            None,
         );
         let fs_differ = FsDiffer::new(
             shared.map_fs.clone(),
@@ -766,17 +793,17 @@ impl TestSys {
 
     /// The output buffer as text (Go `currentWrite.String()`).
     pub fn output_text(&self) -> String {
-        String::from_utf8_lossy(&self.current_write.borrow()).into_owned()
+        String::from_utf8_lossy(&lock(&self.current_write.0)).into_owned()
     }
 
     /// The output buffer bytes (child protocol).
     pub fn output_bytes(&self) -> Vec<u8> {
-        self.current_write.borrow().clone()
+        lock(&self.current_write.0).clone()
     }
 
     /// Replaces the output buffer (child protocol).
     pub fn set_output_bytes(&self, bytes: Vec<u8>) {
-        *self.current_write.borrow_mut() = bytes;
+        *lock(&self.current_write.0) = bytes;
     }
 
     // Go: sys.go:528 getOutput
@@ -794,7 +821,7 @@ impl TestSys {
 
     // Go: sys.go:538 clearOutput
     pub fn clear_output(&self) {
-        self.current_write.borrow_mut().clear();
+        lock(&self.current_write.0).clear();
         self.tracer.borrow_mut().reset();
     }
 
@@ -906,6 +933,10 @@ impl System for TestSys {
     fn writer(&self) -> Writer {
         self.writer.clone()
     }
+    // Go: sys.go:224 ErrorWriter (tsgo#4712)
+    fn error_writer(&self) -> ErrorWriter {
+        self.current_write.0.clone()
+    }
     // Go: sys.go:184 FS
     fn fs(&self) -> Rc<dyn Fs> {
         self.fs.clone()
@@ -936,6 +967,18 @@ impl System for TestSys {
     // Go: sys.go:233 GetEnvironmentVariable
     fn get_environment_variable(&self, name: &str) -> String {
         self.env.get(name).cloned().unwrap_or_default()
+    }
+    // Go: sys.go:246 Spawn (tsgo#4712)
+    // Spawn serves the fake content mappers in-process, selecting the implementation by the exec command the
+    // mapper package declares (see internal/testutil/contentmappertest), so tests exercise the full IPC stack
+    // without spawning a subprocess.
+    fn spawn(
+        &self,
+        command: &[String],
+        dir: &str,
+        stderr: Option<Box<dyn std::io::Write + Send>>,
+    ) -> Result<Arc<dyn ProcessExitState>, GoError> {
+        contentmappertest::new_spawner().spawn(command, dir, stderr)
     }
     // Go: sys.go:176 Now
     fn now(&self) -> SystemTime {

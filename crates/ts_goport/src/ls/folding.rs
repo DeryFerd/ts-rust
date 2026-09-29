@@ -1008,14 +1008,7 @@ fn span_for_node(
     let open_token = astnav::find_child_of_kind(node, open, source_file);
     let close_token = astnav::find_child_of_kind(node, close_brace, source_file);
     if open_token.is_some() && close_token.is_some() {
-        return range_between_tokens(
-            ctx,
-            open_token,
-            close_token,
-            source_file,
-            use_full_start,
-            l,
-        );
+        return range_between_tokens(ctx, open_token, close_token, source_file, use_full_start, l);
     }
     None
 }
@@ -1100,7 +1093,12 @@ fn create_folding_range_from_bounds(
     if fidelity.is_none() {
         return None;
     }
-    Some(create_folding_range(ctx, text_range, folding_range_kind, ""))
+    Some(create_folding_range(
+        ctx,
+        text_range,
+        folding_range_kind,
+        "",
+    ))
 }
 
 // Go: ls/folding.go:544 functionSpan

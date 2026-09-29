@@ -22,13 +22,13 @@ fn non_empty<T>(items: Vec<T>) -> Option<Vec<T>> {
 
 // Go: incremental/snapshottobuildinfo.go:18 snapshotToBuildInfo
 // PORT: Go `program.ContentMapperProject()` is the Go frontend program's
-// (none on the legacy path, which has no content mappers).
+// (none when no program is loaded).
 pub fn snapshot_to_build_info(
     snapshot: &Snapshot,
     build_info_file_name: &str,
 ) -> Result<BuildInfo, GoError> {
-    let content_mapper_project = crate::program::go_frontend_program()
-        .and_then(crate::frontend::compiler::NewProgram::content_mapper_project);
+    let content_mapper_project =
+        crate::program::go_frontend_program().and_then(|program| program.content_mapper_project());
     let content_mapper_identities = content_mapper_identities(content_mapper_project.as_deref())?;
     let build_info = BuildInfo {
         version: version().to_string(),

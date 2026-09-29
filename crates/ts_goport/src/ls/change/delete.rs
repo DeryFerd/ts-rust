@@ -234,11 +234,7 @@ fn delete_import_binding(t: &mut Tracker, source_file: Node, node: Node) {
         crate::go_assert!(previous_token.is_some(), "previousToken should not be nil");
         let start = astnav::get_start_of_node(previous_token, source_file, false);
         let range = t.to_lsp_edit_range(source_file, TextRange::new(start, node.end()));
-        t.replace_range_with_text(
-            source_file,
-            range,
-            "",
-        );
+        t.replace_range_with_text(source_file, range, "");
     } else {
         // Delete the entire import declaration
         // |import * as ns from './file'|
@@ -343,11 +339,7 @@ fn delete_node(
     let start_position = t.get_adjusted_start_position(source_file, node, leading_trivia, false);
     let end_position = t.get_adjusted_end_position(source_file, node, trailing_trivia);
     let range = t.to_lsp_edit_range(source_file, TextRange::new(start_position, end_position));
-    t.replace_range_with_text(
-        source_file,
-        range,
-        "",
-    );
+    t.replace_range_with_text(source_file, range, "");
 }
 
 // Go: ls/change/delete.go:195 deleteNodeInList
