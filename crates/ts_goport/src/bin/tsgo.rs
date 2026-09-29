@@ -64,6 +64,10 @@ const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
 #[cfg(target_os = "linux")]
 const WORKER_FD: &str = "GOPORT_WORKER_FD";
 
+/// Set in a worker (see `launch`): the process id of its launcher.
+#[cfg(target_os = "linux")]
+const LAUNCHER_PID: &str = "GOPORT_LAUNCHER_PID";
+
 // Go: cmd/tsgo/main.go:13 main
 fn main() {
     // First: it must run before the first heap allocation.
@@ -72,11 +76,9 @@ fn main() {
     if let Some(code) = launch(huge_pages) {
         std::process::exit(code);
     }
-    // A worker ends when its launcher is killed.
     #[cfg(target_os = "linux")]
     if std::env::var_os(WORKER_FD).is_some() {
-        let _ =
-            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL));
+        end_with_launcher();
     }
     // One budget sets the parse and bind threads and the malloc arenas.
     // tsgo has one more thread with an arena than goport: the
@@ -154,7 +156,9 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
 /// does. None when this process runs the work: it is a worker, no worker is
 /// wanted, `--lsp`, `--api` or watch mode (they end on their own), or the
 /// worker cannot start. The launcher sends SIGINT and SIGTERM on to the
-/// worker (`forward_signals`).
+/// worker (`forward_signals`). When a signal kills the worker, the launcher
+/// ends by the same signal, so the caller sees what a run without a worker
+/// would give.
 #[cfg(target_os = "linux")]
 fn launch(huge_pages: bool) -> Option<i32> {
     use std::io::Read;
@@ -189,6 +193,10 @@ fn launch(huge_pages: bool) -> Option<i32> {
         .arg0(program)
         .args(args)
         .env(WORKER_FD, write.as_raw_fd().to_string())
+        .env(
+            LAUNCHER_PID,
+            rustix::process::getpid().as_raw_pid().to_string(),
+        )
         .spawn()
         .ok()?;
     drop(write);
@@ -198,12 +206,47 @@ fn launch(huge_pages: bool) -> Option<i32> {
         return Some(i32::from_le_bytes(code));
     }
     // The worker ended without sending a code.
-    Some(match worker.wait() {
+    let status = worker.wait();
+    if let Some(signal) = status.as_ref().ok().and_then(ExitStatusExt::signal) {
+        // End by the same signal. This sets the default action of the
+        // signal (the launcher catches SIGINT and SIGTERM, and Rust ignores
+        // SIGPIPE) and raises it. It returns for a signal that is not in its
+        // table (SIGPWR, SIGSTKFLT) or that it takes as ignored (SIGIO).
+        let _ = signal_hook::low_level::emulate_default_handler(signal);
+        // Such a signal has its default action here, so sending it ends
+        // this process. A real-time signal has no rustix name and falls
+        // through to 128 + N.
+        if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
+            let _ = rustix::process::kill_process(rustix::process::getpid(), signal);
+        }
+    }
+    Some(match status {
         Ok(status) => status
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
         Err(_) => EXIT_UNPORTED,
     })
+}
+
+/// Makes a worker (see `launch`) end when its launcher ends: it sets a
+/// parent-death SIGKILL. std and rustix have no safe way to set it between
+/// fork and exec, so the launcher can die before this runs. Then no signal
+/// comes and this process already has a new parent, so it kills itself as
+/// the signal would have.
+#[cfg(target_os = "linux")]
+fn end_with_launcher() {
+    use rustix::process::{
+        Pid, Signal, getpid, getppid, kill_process, set_parent_process_death_signal,
+    };
+    let _ = set_parent_process_death_signal(Some(Signal::KILL));
+    let launcher = std::env::var(LAUNCHER_PID)
+        .ok()
+        .and_then(|pid| pid.parse().ok())
+        .and_then(Pid::from_raw);
+    if launcher.is_some() && getppid() != launcher {
+        let _ = kill_process(getpid(), Signal::KILL);
+        std::process::exit(EXIT_UNPORTED);
+    }
 }
 
 /// Sends each SIGINT and SIGTERM that the launcher gets on to `worker`, on
