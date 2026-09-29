@@ -96,7 +96,11 @@ so growth cannot add up over revisions. Caps only go down. A batch that fixes so
 itself to 1.00, the lowest value of the gate's own limit (2 x Go + 1), once the base Rust growth of that
 project is at or under 1.00: from then on its item must be MATCH with growth at or under 1.00. A MATCH
 at a higher growth does not lower it, because the gate's limit follows Go's slope and the same bins
-can then FAIL.
+can then FAIL. A pin bump that renumbers the corpus cases names a gate id map in `batch.gateIdMap`
+(`path`, `sha256`; lines of old id, new id and case source). It applies only when the two manifests
+are at different upstream pins: a mapped id is the same item and the base allow entries move with it.
+An unmapped base id of a mapped family, or a line whose case source is not in both item details, is a
+removed id (format and rules in the `gate-compare.py` docstring).
 
 `oracle-compare.py <base results dir> <new results dir>` compares two LSP or API oracle results per
 request: a base request that was `same` or `oracle_error_same` must stay so. It exits 1 on a lost,

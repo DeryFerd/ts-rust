@@ -49,6 +49,27 @@ tool is a regression unless the batch in --state lists that exact change in gate
 {"key": "<key as in toolChanges>", "from": "<base sha256>", "to": "<new sha256>", "reason": "..."}; the
 reviewer judges each listed change. A tool that the base run did not record is listed in newTools only.
 
+Id map (pin bumps). A new Go pin can renumber the corpus cases, so the same case has another id in the
+new run (corpus-diag/04640 at 52168999f3dc is corpus-diag/04704 at 16c25522e123). The batch in --state
+can name a map in gateIdMap {"path": "<TSV, relative to the repo root or absolute>", "sha256": "..."}.
+The file must have that sha256. It is used only when both manifests record an upstreamPin and the pins
+differ; at one pin it has no effect (idMap.applied false). Each line is "<old id> TAB <new id> TAB
+<case source>" ('#' lines, blank lines and the header line "oldId TAB newId TAB source" are skipped). Both ids
+are in one family (the part before the first '/'). Two lines with one old id or one new id are bad input.
+When the map is used:
+- A base id with a line is compared with the new item of its new id: the same item under another id.
+- The case source must be one word of the base item's detail and one word of the new item's detail
+  (the corpus details name it). Else the line is broken and its base id is a removed id, so a map
+  cannot pair two different cases.
+- A family with a line is a mapped family. A base id of a mapped family without a working line is a
+  removed id, never compared with the new item of the same id (that id can be another case now).
+  The ids of the other families are compared as before.
+- The base allow entries move to the new ids in the same way. An entry of a mapped family without a
+  line (an old pin's id, or a glob) gives no allowance.
+- A line whose old id is not a base id is unused (listed in idMap.unused).
+The output has idMap {path, sha256, lines, applied, mapped, broken, unused} only when the batch names a
+map, so the output without a map stays the same.
+
 Prints one JSON object, and writes it to --out when given. Exit 0: no regression.
 Exit 1: regressions. Exit 2: bad input.
 """
@@ -139,6 +160,48 @@ def open_defects(batch):
     return {d.get('id') for d in batch.get('openDefects') or [] if str(d.get('status', '')).startswith('open')}
 
 
+def family(i):
+    return i.split('/', 1)[0]
+
+
+def pins_differ(a, b):
+    """True when two upstream pins (hex, maybe abbreviated) are known and name other commits."""
+    pin = re.compile(r'^[0-9a-f]{7,64}$')
+    if not all(isinstance(p, str) and pin.match(p.lower()) for p in (a, b)):
+        return False
+    a, b = a.lower(), b.lower()
+    return not (a.startswith(b) or b.startswith(a))
+
+
+def load_id_map(ref):
+    """(lines {old id: (new id, source, line number)}, path, sha256) of batch.gateIdMap {path, sha256}."""
+    if not isinstance(ref, dict) or not isinstance(ref.get('path'), str) or not re.match(r'^[0-9a-f]{64}$', str(ref.get('sha256'))):
+        fail(f'gateIdMap needs a path and a sha256: {json.dumps(ref)}')
+    path = ref['path'] if os.path.isabs(ref['path']) else os.path.join(ROOT, ref['path'])
+    try:
+        data = open(path, 'rb').read()
+        text = data.decode()
+    except (OSError, UnicodeDecodeError) as e:
+        fail(f'cannot read the gate id map: {e}')
+    if hashlib.sha256(data).hexdigest() != ref['sha256']:
+        fail(f'gate id map {path} does not have the sha256 {ref["sha256"]} that gateIdMap names')
+    lines, targets = {}, set()
+    for n, line in enumerate(text.splitlines(), 1):
+        cells = line.split('\t')
+        if not line.strip() or line.startswith('#') or cells[0] == 'oldId':
+            continue
+        if len(cells) != 3 or not all(c.strip() == c and c for c in cells) or '-' in (cells[0], cells[1]):
+            fail(f'gate id map line {n}: need "<old id> TAB <new id> TAB <case source>"')
+        old, to, source = cells
+        if family(old) != family(to) or '/' not in old:
+            fail(f'gate id map line {n}: {old} and {to} are not ids of one family')
+        if old in lines or to in targets:
+            fail(f'gate id map line {n}: {old if old in lines else to} is in two lines')
+        lines[old] = (to, source, n)
+        targets.add(to)
+    return lines, path, ref['sha256']
+
+
 def tool_hashes(m):
     """key -> sha256 of every tool the manifest records."""
     h = {}
@@ -164,8 +227,37 @@ def main():
     nm, new, nhead = load(a.new)
     batch = read_batch(a.state)
     defects = open_defects(batch)
-    # Allow entries of the base allow list, by (entry id, condition).
-    base_allow = {(e['id'], e['condition']) for e in (bm.get('allowList') or {}).get('entries', [])}
+    # The id map of a pin bump (see the docstring): moved maps a base id to its new id; gone says why a
+    # base id of a mapped family has none.
+    lines, id_map, moved, gone = {}, None, {}, {}
+    if batch.get('gateIdMap') is not None:
+        lines, path, sha = load_id_map(batch['gateIdMap'])
+        id_map = {'path': path, 'sha256': sha, 'lines': len(lines), 'applied': pins_differ(bhead['upstreamPin'], nhead['upstreamPin']),
+                  'mapped': 0, 'broken': [], 'unused': []}
+        if not id_map['applied']:
+            lines = {}
+    mapped_families = {family(old) for old in lines}
+    for old, (to, source, n) in sorted(lines.items(), key=lambda e: e[1][2]):
+        b, t = base.get(old), new.get(to)
+        if b is None:
+            id_map['unused'].append(old)
+        elif t is None:
+            gone[old] = f'removed id (id map line {n}: its new id {to} is not in the new run)'
+        elif source not in (b.get('detail') or '').split() or source not in (t.get('detail') or '').split():
+            gone[old] = f'removed id (id map line {n}: {old} and {to} are not one case, {source} is not in both details)'
+            id_map['broken'].append(old)
+        else:
+            moved[old] = to
+    if id_map:
+        id_map['mapped'] = len(moved)
+
+    def new_id(i):
+        """The id of base id (or base allow entry id) i in the new run, or None when the map gives it none."""
+        return moved.get(i) if family(i) in mapped_families else i
+
+    # Allow entries of the base allow list, by (entry id at the new pin, condition).
+    base_allow = {(new_id(e['id']), e['condition']) for e in (bm.get('allowList') or {}).get('entries', [])
+                  if new_id(e['id']) is not None}
     regressions, fixed, known_open, reallowed = [], [], [], []
     # The cap of each project for this compare: LONG_CAP, or NORMAL_LIMIT once the base growth is at or under it.
     caps = {}
@@ -177,10 +269,12 @@ def main():
 
     def regress(i, b, n, why):
         regressions.append({'id': i, 'base': b['status'] if b else 'NEW', 'new': n['status'] if n else 'REMOVED', 'why': why,
-                            'detail': (n or b)['detail']})
+                            'detail': (n or b)['detail'], **({'baseId': b['id']} if b and b['id'] != i else {})})
 
+    # The base item of each new id (the same id, or the base id that the id map moves to it).
+    base_of = {new_id(i): i for i in base if new_id(i) is not None}
     for i, n in new.items():
-        b = base.get(i)
+        b = base.get(base_of.get(i))
         if n['status'] == 'ALLOWED':
             entries = n.get('allowedBy') or []
             fresh = [f"{e.get('id')} ({e.get('condition')})" for e in entries if (e.get('id'), e.get('condition')) not in base_allow]
@@ -221,7 +315,10 @@ def main():
         elif b is not None and b['status'] == 'FAIL':
             fixed.append(i)
     for i, b in base.items():
-        if i not in new:
+        t = new_id(i)
+        if t is None:
+            regress(i, b, None, gone.get(i) or f'removed id (the id map has no line for it, and its family {family(i)} is mapped)')
+        elif t not in new:
             regress(i, b, None, 'removed id')
     # A lowered cap stays lowered while the defect is open: a MATCH item of that project must keep its growth at
     # or under NORMAL_LIMIT, so the next compare, with this run as its base, lowers it again.
@@ -259,11 +356,12 @@ def main():
                       f'{NORMAL_LIMIT:.2f}, the lowest normal limit',
            'longCaps': caps,
            'pinChanged': bhead['upstreamPin'] != nhead['upstreamPin'], 'modeChanged': bhead['mode'] != nhead['mode'],
+           **({'idMap': id_map} if id_map else {}),
            'allowListChanged': (nm.get('allowList') or {}).get('sha256') != (bm.get('allowList') or {}).get('sha256'),
            'newAllowEntries': [{'id': i, 'condition': c} for i, c in sorted(used - base_allow)],
            'toolChanges': tool_changes, 'newTools': sorted(k for k in nt if k not in bt),
            'regressions': regressions, 'knownOpen': known_open, 'reallowed': reallowed, 'fixed': sorted(fixed),
-           'newIds': sorted(i for i in new if i not in base),
+           'newIds': sorted(i for i in new if i not in base_of),
            'counts': {'baseItems': len(base), 'items': len(new), 'regressions': len(regressions),
                       'knownOpen': len(known_open), 'reallowed': len(reallowed), 'fixed': len(fixed)}}
     text = json.dumps(out, indent=1)

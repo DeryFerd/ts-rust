@@ -43,9 +43,13 @@ EVIDENCE=${CANDIDATE_EVIDENCE:-$R/evidence-cache}  # tests point this at a copy
 TARGET=$R/runtime/cargo-target                     # one warm target for candidate bins (gate.sh's default)
 BINS=(goport goport_emit goport_typesyms goport_build tsgo)
 LSP_BATTERIES=b1-inline,b1-query-core,b2-query-core,b1-hono,b2-hono,fourslash
-# The API oracle batteries at pin 52168999f3dc (bumpA4 verify: 10 batteries). A pin that adds batteries
-# (bump B: qc-ext, hono-ext, zod-ext) adds them here.
+# The API oracle batteries: the 10 of pin 52168999f3dc (bumpA4 verify), and from pin 16c25522e123 (bump B)
+# also API_EXT_BATTERIES (api_oracle.py build --kind ext: the API methods that bump B adds or changes). The
+# oracles of the older pins have no ext goldens: API_NO_EXT_ORACLES are their sha256 prefixes (52168999f3dc:
+# d2dc9ff46ff5, dc37b5249ab6: 204f15c76702). A run at any other pin runs all 13; a missing golden fails it.
 API_BATTERIES=(effect hono hono-xchecker qc qc-callbacks qc-lsp qc-proto qc-xchecker tsp-lsp zod)
+API_EXT_BATTERIES=(hono-ext qc-ext zod-ext)
+API_NO_EXT_ORACLES=(d2dc9ff46ff5 204f15c76702)
 # The kept crates (not legacy): protected unit tests, and rustfmt and clippy in the quality step.
 KEPT_CRATES=(ts_scanner ts_ast ts_diagnostics ts_path ts_core ts_jsnum)
 CHECKER_PORT=$ROOT/target/worktrees/checker-port
@@ -482,8 +486,9 @@ PY
     oracle_json LSP "$R/ls-oracle/battery" "$ll" "$bl" lsp
   fi
 
-  # API oracle (api_oracle.py, the 10 batteries of the bumpA4 verify run): one check per battery. GOPORT_PIN
-  # selects the pin's traces (a pin cache); the goldens are golden/<oracle sha256 prefix>.
+  # API oracle (api_oracle.py, the batteries of API_BATTERIES, and API_EXT_BATTERIES unless the pin's oracle is
+  # in API_NO_EXT_ORACLES): one check per battery. GOPORT_PIN selects the pin's traces (a pin cache); the goldens
+  # are golden/<oracle sha256 prefix>.
   if [[ -f $C/api.json ]] && jq -e .compare "$C/api.json" > /dev/null; then say "reuse API oracle $(jq -r .label "$C/api.json")"
   elif [[ -f $C/api-run ]]; then say "reuse API run $(cat "$C/api-run")"; oracle_json API "$R/tests2/api" "$(cat "$C/api-run")" "$ba" api
   else
@@ -494,8 +499,10 @@ PY
       run_sh "scripts/goport/remote.sh push $host $R/tests2/api/golden/$(sha256sum "$oracle" | cut -c1-12) >> $C/sync.log 2>&1"
       [[ -n $pin ]] || run_sh "scripts/goport/remote.sh push $host $R/tests2/api/traces >> $C/sync.log 2>&1"
     fi
-    say "$(date -u +%FT%TZ) API oracle $al on $host"
-    l="set -e; for b in ${API_BATTERIES[*]}; do python3 scripts/goport/api_oracle.py check --battery \$b"
+    local -a batteries=("${API_BATTERIES[@]}")
+    [[ " ${API_NO_EXT_ORACLES[*]} " == *" $(sha256sum "$oracle" | cut -c1-12) "* ]] || batteries+=("${API_EXT_BATTERIES[@]}")
+    say "$(date -u +%FT%TZ) API oracle $al on $host: ${#batteries[@]} batteries"
+    l="set -e; for b in ${batteries[*]}; do python3 scripts/goport/api_oracle.py check --battery \$b"
     l+=" --goport $B/tsgo --oracle $oracle --label $al --jobs 12; done"
     on_host "$pin" "$l" "$C/api-$al.log" || rc=$?
     [[ $host == local ]] || run_sh "scripts/goport/remote.sh fetch $host $R/tests2/api/results/$al >> $C/sync.log 2>&1"
