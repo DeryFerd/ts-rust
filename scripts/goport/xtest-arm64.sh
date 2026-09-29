@@ -12,9 +12,10 @@
 #   byte for byte. Projects: query hono zod effect (default: query hono). The arm64 side runs under qemu.
 #   Writes <out-dir>/summary.txt, one line per project: EQUAL or DIFF(<what>), and the arm64 and x86_64 times.
 # build-tests: builds the test binaries fswatch_linux and go_baselines and the goport_util lib tests for
-#   <target> (default aarch64-unknown-linux-gnu) with cargo-zigbuild through run-cargo-capped.sh, in this
-#   checkout, and copies them to <out-testbin-dir> (must not exist) with SUITES ("<suite>\t<crate dir>")
-#   and COMMIT. The test binaries read their fixtures from this checkout (paths compiled in).
+#   <target> (default aarch64-unknown-linux-gnu) with `cargo test --no-run` through run-cargo-capped.sh and
+#   the GNU cross linker (XTEST_LINKER, default aarch64-linux-gnu-gcc), in this checkout, and copies them
+#   to <out-testbin-dir> (must not exist) with SUITES ("<suite>\t<crate dir>") and COMMIT. The test
+#   binaries read their fixtures from this checkout (paths compiled in).
 # tests: runs each <suite>:<filter> (a libtest name filter; default: the fswatch, vfs and execute modules,
 #   see DEFAULT_TESTS) with both test bin dirs and compares each test name: a name that passes on x86_64
 #   and not on arm64 is LOST. Each arm64 run is bounded (XTEST_TIMEOUT seconds, default 1800).
@@ -116,11 +117,17 @@ cmd_build_tests() {
   TB=$(realpath -m -- "$1")
   [[ ! -e $TB ]] || fail 2 "$TB exists"
   mkdir -p "$TB/logs"
-  local json=$TB/logs/build.json
-  (cd "$CO" && scripts/run-cargo-capped.sh zigbuild --release --locked --target "$target" \
-    -p ts_goport --test fswatch_linux --test go_baselines -p goport_util --lib --tests \
-    --message-format=json-render-diagnostics >"$json" 2>"$TB/logs/build.err") ||
-    { tail -20 "$TB/logs/build.err" >&2; fail 1 "build failed (log $TB/logs/build.err)"; }
+  local json=$TB/logs/build.json sel linker=${XTEST_LINKER:-aarch64-linux-gnu-gcc}
+  : >"$json"
+  # `cargo test --no-run` with the GNU cross linker (cargo-zigbuild has no test build through cargo).
+  # One cargo call per package, so each target selection applies to one package.
+  for sel in "-p ts_goport --test fswatch_linux --test go_baselines" "-p goport_util --lib"; do
+    # shellcheck disable=SC2086
+    (cd "$CO" && scripts/run-cargo-capped.sh test --no-run --release --locked --target "$target" \
+      --config "target.$target.linker=\"$linker\"" $sel \
+      --message-format=json-render-diagnostics >>"$json" 2>>"$TB/logs/build.err") ||
+      { tail -20 "$TB/logs/build.err" >&2; fail 1 "build failed: $sel (log $TB/logs/build.err)"; }
+  done
   # One executable per test target: <name> for [[test]] targets, <crate>_lib for lib tests.
   python3 - "$json" "$TB" "$CO" <<'EOF' || fail 1 "could not collect the test binaries"
 import json, os, shutil, sys

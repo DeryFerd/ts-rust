@@ -1,5 +1,7 @@
-//! Go: internal/vfs/osvfs/os.go (Linux only). The realpath and symlink
-//! helpers it calls are in `frontend::nativepath`.
+//! Go: internal/vfs/osvfs/os.go. The realpath and symlink helpers it calls
+//! are in `frontend::nativepath`. Off Linux: the Windows branches of os.go
+//! and the Windows `path/filepath` pieces (`FromSlash`, `Abs`, `Clean`) are
+//! ported; the other targets use the unix ones.
 //!
 //! The Go standard library pieces that osvfs reaches (`os.DirFS`,
 //! `os.RemoveAll`, `filepath.Abs`, `filepath.Clean`) are ported here too.
@@ -148,9 +150,8 @@ pub fn osvfs_fs() -> Rc<dyn Fs> {
 }
 
 // Go: os.go:174 isReparsePoint
-// PORT: `filepath.FromSlash` is the identity on Linux.
 fn is_reparse_point(path: &str) -> bool {
-    crate::frontend::nativepath::is_symlink_or_reparse_point(path)
+    crate::frontend::nativepath::is_symlink_or_reparse_point(&filepath_from_slash(path))
 }
 
 // Go: os.go:41 osFS
@@ -161,10 +162,15 @@ pub struct OsFs {
 // Go: os.go:46 isFileSystemCaseSensitive
 // We do this right at startup to minimize the chance that executable gets moved or deleted.
 // PORT: Go computes this in package init. The port computes it on first use.
-// The Windows and wasm branches do not apply to the Linux port.
+// The wasm branch does not apply to the port.
 fn is_file_system_case_sensitive() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
     *VALUE.get_or_init(|| {
+        // win32/win64 are case insensitive platforms
+        if cfg!(windows) {
+            return false;
+        }
+
         // As a proxy for case-insensitivity, we check if the current executable exists under a different case.
         // This is not entirely correct, since different OSs can have differing case sensitivity in different paths,
         // but this is largely good enough for our purposes (and what sys.ts used to do with __filename).
@@ -318,8 +324,8 @@ pub fn os_fs_realpath(path: &str) -> String {
     let _ = root_length(path); // Assert path is rooted
 
     let orig = path;
-    // PORT: `filepath.FromSlash` is the identity on Linux.
-    let path = match crate::frontend::nativepath::realpath(path) {
+    let path = filepath_from_slash(path);
+    let path = match crate::frontend::nativepath::realpath(&path) {
         Ok(path) => path,
         Err(_) => return orig.to_string(),
     };
@@ -552,8 +558,20 @@ fn ends_with_dot(path: &str) -> bool {
     b.len() >= 2 && b[b.len() - 1] == b'.' && b[b.len() - 2] == b'/'
 }
 
+// Go: path/filepath/path.go FromSlash
+/// FromSlash returns the result of replacing each slash ('/') character in
+/// path with a separator character. Multiple slashes are replaced by
+/// multiple separators. On unix it is the identity.
+pub fn filepath_from_slash(path: &str) -> Cow<'_, str> {
+    if cfg!(windows) && path.contains('/') {
+        return Cow::Owned(path.replace('/', "\\"));
+    }
+    Cow::Borrowed(path)
+}
+
 // Go: path/filepath/path.go Abs (unix)
 // PORT: Go standard library.
+#[cfg(not(windows))]
 fn filepath_abs(path: &str) -> Result<String, FsError> {
     if path.starts_with('/') {
         return Ok(filepath_clean(path));
@@ -566,8 +584,23 @@ fn filepath_abs(path: &str) -> Result<String, FsError> {
     Ok(filepath_clean(&format!("{wd}/{path}")))
 }
 
+// Go: path/filepath/path_windows.go abs
+// PORT: Go standard library. Go `syscall.FullPath` is GetFullPathNameW, which
+// `std::path::absolute` calls on Windows.
+#[cfg(windows)]
+fn filepath_abs(path: &str) -> Result<String, FsError> {
+    // syscall.FullPath returns an error on empty path, because it's not a valid path.
+    // To implement Abs behavior of returning working directory on empty string input,
+    // special-case empty path by changing it to "." path. See golang.org/issue/24441.
+    let path = if path.is_empty() { "." } else { path };
+    let full_path = std::path::absolute(os_path(path))
+        .map_err(|err| FsError::path("GetFullPathName", path, err))?;
+    Ok(filepath_clean(&go_string_from_os(full_path)))
+}
+
 // Go: path/filepath/path.go Clean (unix)
 // PORT: Go standard library. Lexical cleanup only.
+#[cfg(not(windows))]
 pub fn filepath_clean(path: &str) -> String {
     if path.is_empty() {
         return ".".to_string();
@@ -635,4 +668,245 @@ pub fn filepath_clean(path: &str) -> String {
     // The input is valid UTF-8 and the cuts are at ASCII '/' bytes.
     String::from_utf8(out)
         .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+}
+
+// Go: internal/filepathlite/path.go Clean (windows)
+// PORT: Go standard library (go1.27 internal/filepathlite, path_windows.go
+// for the volume name and postClean). Go's `lazybuf` is `out` plus
+// `changed` (Go's `buf != nil`: the output is no longer a prefix of the
+// input).
+#[cfg(windows)]
+pub fn filepath_clean(path: &str) -> String {
+    const SEPARATOR: u8 = b'\\';
+    let original_path = path;
+    let vol_len = win_volume_name_len(path.as_bytes());
+    let p = &path.as_bytes()[vol_len..];
+    if p.is_empty() {
+        let o = original_path.as_bytes();
+        if vol_len > 1 && win_is_path_separator(o[0]) && win_is_path_separator(o[1]) {
+            // should be UNC
+            return original_path.replace('/', "\\");
+        }
+        return format!("{original_path}.");
+    }
+    let rooted = win_is_path_separator(p[0]);
+
+    // Invariants:
+    //	reading from path; r is index of next byte to process.
+    //	writing to buf; w is index of next byte to write.
+    //	dotdot is index in buf where .. must stop, either because
+    //		it is the leading slash or it is a leading ../../.. prefix.
+    let n = p.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let mut changed = false;
+    let append = |out: &mut Vec<u8>, changed: &mut bool, c: u8| {
+        if !*changed && (out.len() >= n || p[out.len()] != c) {
+            *changed = true;
+        }
+        out.push(c);
+    };
+    let (mut r, mut dotdot) = (0usize, 0usize);
+    if rooted {
+        append(&mut out, &mut changed, SEPARATOR);
+        r = 1;
+        dotdot = 1;
+    }
+
+    while r < n {
+        if win_is_path_separator(p[r]) {
+            // empty path element
+            r += 1;
+        } else if p[r] == b'.' && (r + 1 == n || win_is_path_separator(p[r + 1])) {
+            // . element
+            r += 1;
+        } else if p[r] == b'.'
+            && p[r + 1] == b'.'
+            && (r + 2 == n || win_is_path_separator(p[r + 2]))
+        {
+            // .. element: remove to last separator
+            r += 2;
+            if out.len() > dotdot {
+                // can backtrack
+                let mut w = out.len() - 1;
+                while w > dotdot && !win_is_path_separator(out[w]) {
+                    w -= 1;
+                }
+                out.truncate(w);
+            } else if !rooted {
+                // cannot backtrack, but not rooted, so append .. element.
+                if !out.is_empty() {
+                    append(&mut out, &mut changed, SEPARATOR);
+                }
+                append(&mut out, &mut changed, b'.');
+                append(&mut out, &mut changed, b'.');
+                dotdot = out.len();
+            }
+        } else {
+            // real path element.
+            // add slash if needed
+            if (rooted && out.len() != 1) || (!rooted && !out.is_empty()) {
+                append(&mut out, &mut changed, SEPARATOR);
+            }
+            // copy element
+            while r < n && !win_is_path_separator(p[r]) {
+                append(&mut out, &mut changed, p[r]);
+                r += 1;
+            }
+        }
+    }
+
+    // Turn empty string into "."
+    if out.is_empty() {
+        append(&mut out, &mut changed, b'.');
+    }
+
+    // postClean: avoid creating absolute paths on Windows
+    if vol_len == 0 && changed {
+        // If a ':' appears in the path element at the start of a path,
+        // insert a .\ at the beginning to avoid converting relative paths
+        // like a/../c: into c:.
+        let first = out
+            .iter()
+            .position(|&c| win_is_path_separator(c))
+            .unwrap_or(out.len());
+        if out[..first].contains(&b':') {
+            out.splice(0..0, [b'.', SEPARATOR]);
+        } else if out.len() >= 3
+            && win_is_path_separator(out[0])
+            && out[1] == b'?'
+            && out[2] == b'?'
+        {
+            // If a path begins with \??\, insert a \. at the beginning
+            // to avoid converting paths like \a\..\??\c:\x into \??\c:\x
+            // (equivalent to c:\x).
+            out.splice(0..0, [SEPARATOR, b'.']);
+        }
+    }
+
+    let mut result = original_path.as_bytes()[..vol_len].to_vec();
+    result.extend_from_slice(&out);
+    // FromSlash. The cuts are at ASCII bytes, so the bytes stay UTF-8.
+    String::from_utf8(result)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+        .replace('/', "\\")
+}
+
+// Go: internal/filepathlite/path_windows.go IsPathSeparator
+#[cfg(windows)]
+fn win_is_path_separator(c: u8) -> bool {
+    c == b'\\' || c == b'/'
+}
+
+// Go: internal/filepathlite/path_windows.go volumeNameLen
+#[cfg(windows)]
+fn win_volume_name_len(path: &[u8]) -> usize {
+    if path.len() >= 2 && path[1] == b':' {
+        // Path starts with a drive letter.
+        //
+        // Not all Windows functions necessarily enforce the requirement that
+        // drive letters be in the set A-Z, and we don't try to here.
+        //
+        // We don't handle the case of a path starting with a non-ASCII character,
+        // in which case the "drive letter" might be multiple bytes long.
+        return 2;
+    }
+    if path.is_empty() || !win_is_path_separator(path[0]) {
+        // Path does not have a volume component.
+        return 0;
+    }
+    if win_path_has_prefix_fold(path, br"\\.")
+        || win_path_has_prefix_fold(path, br"\\?")
+        || win_path_has_prefix_fold(path, br"\??")
+    {
+        // Path starts with a device prefix: \\.\ for Local Device paths,
+        // or \\?\ or \??\ for Root Local Device paths.
+        if path.len() == 3 {
+            return 3; // exactly \\., \\?, or \??
+        }
+        if win_path_has_prefix_fold(&path[4..], b"UNC") {
+            // We're going to treat the UNC host and share as part of the volume
+            // prefix for historical reasons, but this isn't really principled;
+            // Windows's own GetFullPathName will happily remove the first
+            // component of the path in this space, converting
+            // \\.\unc\a\b\..\c into \\.\unc\a\c.
+            return win_valid_volume_name_len(path, win_unc_len(path, br"\\.\UNC\".len()));
+        }
+        // We treat the next component after the device prefix as
+        // part of the volume name, which means Clean(`\\?\c:\`)
+        // won't remove the trailing \. (See #64028.)
+        return match win_cut_path(&path[4..]) {
+            None => win_valid_volume_name_len(path, path.len()),
+            Some((_, rest)) => win_valid_volume_name_len(path, path.len() - rest.len() - 1),
+        };
+    }
+    if path.len() >= 2 && win_is_path_separator(path[1]) {
+        // Path starts with \\, and is a UNC path.
+        return win_valid_volume_name_len(path, win_unc_len(path, 2));
+    }
+    0
+}
+
+// Go: internal/filepathlite/path_windows.go validVolumeNameLen
+#[cfg(windows)]
+fn win_valid_volume_name_len(path: &[u8], n: usize) -> usize {
+    let mut p = &path[..n];
+    while !p.is_empty() {
+        let (part, rest) = win_cut_path(p).unwrap_or((p, &[]));
+        if part == b".." {
+            return 0;
+        }
+        p = rest;
+    }
+    n
+}
+
+// Go: internal/filepathlite/path_windows.go pathHasPrefixFold
+// pathHasPrefixFold tests whether the path s begins with prefix,
+// ignoring case and treating all path separators as equivalent.
+// If s is longer than prefix, then s[len(prefix)] must be a path separator.
+#[cfg(windows)]
+fn win_path_has_prefix_fold(s: &[u8], prefix: &[u8]) -> bool {
+    if s.len() < prefix.len() {
+        return false;
+    }
+    for i in 0..prefix.len() {
+        if win_is_path_separator(prefix[i]) {
+            if !win_is_path_separator(s[i]) {
+                return false;
+            }
+        } else if prefix[i].to_ascii_uppercase() != s[i].to_ascii_uppercase() {
+            return false;
+        }
+    }
+    if s.len() > prefix.len() && !win_is_path_separator(s[prefix.len()]) {
+        return false;
+    }
+    true
+}
+
+// Go: internal/filepathlite/path_windows.go uncLen
+// uncLen returns the length of the volume prefix of a UNC path.
+// prefixLen is the prefix prior to the start of the UNC host;
+// for example, for "//host/share", the prefixLen is len("//")==2.
+#[cfg(windows)]
+fn win_unc_len(path: &[u8], prefix_len: usize) -> usize {
+    let mut count = 0;
+    for (i, &c) in path.iter().enumerate().skip(prefix_len) {
+        if win_is_path_separator(c) {
+            count += 1;
+            if count == 2 {
+                return i;
+            }
+        }
+    }
+    path.len()
+}
+
+// Go: internal/filepathlite/path_windows.go cutPath
+// cutPath slices path around the first path separator.
+// PORT: Go's `found == false` is `None`.
+#[cfg(windows)]
+fn win_cut_path(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    let i = path.iter().position(|&c| win_is_path_separator(c))?;
+    Some((&path[..i], &path[i + 1..]))
 }
