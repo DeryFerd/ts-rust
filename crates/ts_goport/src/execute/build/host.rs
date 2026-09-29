@@ -538,6 +538,7 @@ impl ParseConfigHost for BuildHost {
                 options,
                 extra_extensions,
                 &*fs,
+                &self.cached_fs.stats,
             ),
             None => get_file_names_from_config_specs(
                 config_file_specs,

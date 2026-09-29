@@ -2403,6 +2403,15 @@ fn copy_stat<V: Clone>(
     lock(to).entry(path.to_string()).or_insert(value);
 }
 
+/// Stores each value of `from` in `to`, when `to` has none for its path.
+fn merge_stats<V>(from: &Mutex<FxHashMap<String, V>>, to: &Mutex<FxHashMap<String, V>>) {
+    let from = std::mem::take(&mut *lock(from));
+    let mut to = lock(to);
+    for (path, value) in from {
+        to.entry(path).or_insert(value);
+    }
+}
+
 impl StatCache {
     /// The cached `FileExists(path)`, or `load()` stored as it.
     pub fn file_exists(&self, path: &str, load: impl FnOnce() -> bool) -> bool {
@@ -2464,7 +2473,9 @@ impl StatCache {
 ///   orchestrator). A lookup that a worker of the load made already is
 ///   taken from `load` (the build writes nothing during a load);
 /// - the lookups of the worker answers that the loader takes
-///   (`SharedResolution::lookups`), which the load adds at its end.
+///   (`SharedResolution::lookups`), which the load adds at its end;
+/// - the lookups of the config matches that config threads made for the
+///   orchestrator (`add`).
 #[derive(Default)]
 pub struct BuildStatCache {
     /// Go `cachedvfs`: kept for the whole build.
@@ -2531,6 +2542,17 @@ impl BuildStatCache {
     /// The host's `GetAccessibleEntries(path)` (see `host_lookup`).
     pub fn entries(&self, path: &str, load: impl FnOnce() -> Entries) -> Entries {
         self.host_lookup(|c| &c.entries, path, load)
+    }
+
+    /// Moves the lookups in `lookups` that `cached` does not have into
+    /// `cached`: the lookups that another thread made for the host's file
+    /// system, when the host takes that thread's result
+    /// (config_prefetch.rs). `lookups` is empty after.
+    pub fn add(&self, lookups: &StatCache) {
+        merge_stats(&lookups.file_exists, &self.cached.file_exists);
+        merge_stats(&lookups.directory_exists, &self.cached.directory_exists);
+        merge_stats(&lookups.realpath, &self.cached.realpath);
+        merge_stats(&lookups.entries, &self.cached.entries);
     }
 
     /// Starts a program load whose parse workers use this cache.

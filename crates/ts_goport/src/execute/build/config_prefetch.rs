@@ -15,10 +15,15 @@
 //! thread has started yet is the orchestrator's own: it matches the specs
 //! itself and queues the references it finds.
 //!
-//! The orchestrator's cached file system does not get the directory
-//! lookups of a match that a thread made. Go caches them for the rest of
-//! the build (`cachedvfs`), but after the graph a build only lists a
-//! directory again in watch mode, and a watch build takes no prefetch.
+//!
+//! Go caches the lookups of each match (`GetAccessibleEntries`,
+//! `Realpath`) in the build host's `cachedvfs` for the rest of the build,
+//! and a later program reads them: for example the listing of a typeRoots
+//! directory for its automatic type directives, after the build wrote
+//! into that directory. So a thread records the lookups of its match, and
+//! when the orchestrator takes the match, they go into the host's cache
+//! (`BuildStatCache::add`), as if the orchestrator had made them. The
+//! thread made them before the build wrote anything, as Go does.
 
 use crate::execute::build::host::TscExtendedConfigCache;
 use crate::frontend::prelude::*;
@@ -73,6 +78,8 @@ struct MatchedFileNames {
     inputs: MatchInputs,
     file_names: Vec<String>,
     literal_file_names_len: i32,
+    /// The cached lookups that the match made (`RecordingFs`).
+    lookups: StatCache,
 }
 
 enum SlotState {
@@ -168,11 +175,11 @@ impl ConfigPrefetch {
         queue_configs(&self.shared, configs);
     }
 
-    /// The file names that a thread matched for the config at `path`, when
-    /// its inputs equal those of the orchestrator's match (`inputs`). Waits
-    /// for the thread that parses the config. A config that no thread has
-    /// started becomes the orchestrator's: None, and no thread starts it.
-    fn take(&self, path: &Path, inputs: &MatchInputs) -> Option<(Vec<String>, i32)> {
+    /// The match of a thread for the config at `path`, when its inputs
+    /// equal those of the orchestrator's match (`inputs`). Waits for the
+    /// thread that parses the config. A config that no thread has started
+    /// becomes the orchestrator's: None, and no thread starts it.
+    fn take(&self, path: &Path, inputs: &MatchInputs) -> Option<MatchedFileNames> {
         let slot = lock(&self.shared.slots).get(path).cloned()?;
         let mut state = lock(&slot.state);
         loop {
@@ -186,9 +193,7 @@ impl ConfigPrefetch {
                         .unwrap_or_else(PoisonError::into_inner);
                 }
                 SlotState::Done(matched) => {
-                    let matched = matched?;
-                    return (matched.inputs == *inputs)
-                        .then_some((matched.file_names, matched.literal_file_names_len));
+                    return matched.filter(|matched| matched.inputs == *inputs);
                 }
             }
         }
@@ -196,7 +201,9 @@ impl ConfigPrefetch {
 
     /// Go `getFileNamesFromConfigSpecs` for the orchestrator's parse of
     /// the config `config_file_name`: the file names that a thread
-    /// matched, or else its own match on `fs`.
+    /// matched, whose lookups go into `stats`, the cache of `fs`; or else
+    /// its own match on `fs`.
+    #[allow(clippy::too_many_arguments)]
     pub fn get_file_names_from_config_specs(
         &self,
         config_file_name: &str,
@@ -205,6 +212,7 @@ impl ConfigPrefetch {
         options: Option<&CompilerOptions>,
         extra_extensions: &[String],
         fs: &dyn Fs,
+        stats: &BuildStatCache,
     ) -> (Vec<String>, i32) {
         let path = to_path(
             config_file_name,
@@ -215,7 +223,8 @@ impl ConfigPrefetch {
             MatchInputs::of(config_file_specs, base_path, options, extra_extensions)
             && let Some(matched) = self.take(&path, &inputs)
         {
-            return matched;
+            stats.add(&matched.lookups);
+            return (matched.file_names, matched.literal_file_names_len);
         }
         get_file_names_from_config_specs(
             config_file_specs,
@@ -361,11 +370,15 @@ impl ParseConfigHost for ThreadConfigHost {
         options: Option<&CompilerOptions>,
         extra_extensions: &[String],
     ) -> (Vec<String>, i32) {
+        let recording = RecordingFs {
+            fs: &*self.fs,
+            lookups: StatCache::default(),
+        };
         let (file_names, literal_file_names_len) = get_file_names_from_config_specs(
             config_file_specs,
             base_path,
             options,
-            &*self.fs,
+            &recording,
             extra_extensions,
         );
         *self.matched.borrow_mut() =
@@ -377,10 +390,75 @@ impl ParseConfigHost for ThreadConfigHost {
                             inputs,
                             file_names: file_names.clone(),
                             literal_file_names_len,
+                            lookups: recording.lookups,
                         },
                     )
                 },
             );
         (file_names, literal_file_names_len)
+    }
+}
+
+/// The file system of a config thread's match: `fs`, with each cached
+/// lookup (Go `cachedvfs`: all but `Stat`) recorded in `lookups`.
+struct RecordingFs<'a> {
+    fs: &'a dyn Fs,
+    lookups: StatCache,
+}
+
+impl Fs for RecordingFs<'_> {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.fs.use_case_sensitive_file_names()
+    }
+
+    fn file_exists(&self, path: &str) -> bool {
+        self.lookups.file_exists(path, || self.fs.file_exists(path))
+    }
+
+    fn read_file(&self, path: &str) -> (String, bool) {
+        self.fs.read_file(path)
+    }
+
+    fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.write_file(path, data)
+    }
+
+    fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.append_file(path, data)
+    }
+
+    fn remove(&self, path: &str) -> Result<(), FsError> {
+        self.fs.remove(path)
+    }
+
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<std::time::SystemTime>,
+        m_time: Option<std::time::SystemTime>,
+    ) -> Result<(), FsError> {
+        self.fs.chtimes(path, a_time, m_time)
+    }
+
+    fn directory_exists(&self, path: &str) -> bool {
+        self.lookups
+            .directory_exists(path, || self.fs.directory_exists(path))
+    }
+
+    fn get_accessible_entries(&self, path: &str) -> Entries {
+        self.lookups
+            .entries(path, || self.fs.get_accessible_entries(path))
+    }
+
+    fn stat(&self, path: &str) -> Option<FileInfo> {
+        self.fs.stat(path)
+    }
+
+    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
+        self.fs.walk_dir(root, walk_fn)
+    }
+
+    fn realpath(&self, path: &str) -> String {
+        self.lookups.realpath(path, || self.fs.realpath(path))
     }
 }
