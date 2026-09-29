@@ -171,8 +171,9 @@ function goportRule(state) {
 }
 
 // goport is the goport-protected-set rule for a goport batch, else null. A goport batch has
-// no full result: its current history row and verdicts carry goportTestsSha256, gateSha256 and
-// nameMapSha256 (the goportTests name map sha256; absent or null when the batch has no map).
+// no full result: its current history row and verdicts carry goportTestsSha256, gateSha256,
+// nameMapSha256 (the goportTests name map sha256) and gateIdMapSha256 (the batch.gateIdMap
+// sha256); a map sha256 is absent or null when the batch has no such map.
 function validateBatch(state, goport = null) {
   requireValue(state?.schemaVersion === 1, "Unsupported state schema.");
   const continuation = state.phase === "recovery-continuation";
@@ -214,11 +215,13 @@ function validateBatch(state, goport = null) {
   }
   requireValue(hypotheses.size <= 2 && [...hypotheses.values()].every(value => value <= 2), "Limit: two hypotheses, two revisions per hypothesis.");
   const last = history.at(-1);
-  // A goport row and verdict bind to the goport test results, the gate manifest and the name map instead.
+  // A goport row and verdict bind to the goport test results, the gate manifest, the name map and the
+  // gate id map instead. checkGoport checks that the gate id map file has batch.gateIdMap.sha256.
   const evidence = item => goport ? item.goportTestsSha256 === batch.goportTests?.sha256 && item.gateSha256 === batch.gate?.sha256
     && (item.nameMapSha256 ?? null) === (batch.goportTests?.nameMap?.sha256 ?? null)
+    && (item.gateIdMapSha256 ?? null) === (batch.gateIdMap?.sha256 ?? null)
     : item.fullResultSha256 === batch.fullResult.sha256;
-  const bound = goport ? "goport test, gate and name map hashes" : "full result";
+  const bound = goport ? "goport test, gate, name map and gate id map hashes" : "full result";
   requireValue(last.hypothesis === batch.hypothesis && last.sourceFingerprint === batch.sourceFingerprint && evidence(last),
     `Current history row does not match the batch source, hypothesis, and ${bound}.`);
   const verdicts = [batch.auditor, batch.reviewer];
@@ -729,6 +732,7 @@ function checkGoport(state, rule, readEvidence, tools) {
     knownOpenGateItems: gate.knownOpen,
     gateFlakes: gateRuns.flakes,
     nameMapRemoved: removed,
+    gateIdMapRemoved: gate.idMap?.removed ?? [],
     losses: { goportTests: [...lost, ...absent, ...unrun], gate: gate.regressions.map(item => ({ id: item.id, base: item.base, now: item.new, why: item.why })) } };
 }
 
@@ -863,9 +867,10 @@ history rows that may keep a null source (as unbound-history-rows does, for
 every batch). The batch has no fullResult, corpus, roster baselines or
 rosterCarryForward. The history rules above still apply. The current history
 row and both verdicts (PASS, batchId, sourceFingerprint) carry
-goportTestsSha256 = goportTests.sha256, gateSha256 = gate.sha256 and
-nameMapSha256 = goportTests.nameMap.sha256 (absent or null without a map)
-instead of fullResultSha256.
+goportTestsSha256 = goportTests.sha256, gateSha256 = gate.sha256,
+nameMapSha256 = goportTests.nameMap.sha256 and gateIdMapSha256 =
+gateIdMap.sha256 (each map sha256 absent or null without that map) instead of
+fullResultSha256.
 
 The base is batch.previousBatch.archive {path, sha256}, the saved record of the
 last accepted batch: it must be the last batchRecords entry (open_revision.py
@@ -905,14 +910,19 @@ tree, Cargo.toml and Cargo.lock), as candidate.sh reuses it by that key.
   ALLOWED needs allowedBy, no new FAIL, the open editor-long-growth noise rule)
   have one implementation. Its known-open items are in knownOpenGateItems.
 - gateIdMap {path, sha256} (optional): the gate id map of a pin bump, a TSV
-  of old id, new id and case source (format in gate-compare.py). The file
-  must have that sha256. The check passes it and batch.gateToolChanges to
+  of old id, new id and case path, or old id, "-", case path and the upstream
+  commit that removed the case (format in gate-compare.py). The file must have
+  that sha256, and the history row and both verdicts carry it as
+  gateIdMapSha256. The check passes it and batch.gateToolChanges to
   gate-compare.py for the batch gate and each gateRuns run. gate-compare.py
   uses it only when the base and new manifests are at different Go pins: a
-  mapped id is the same item, the base allow entries move with it, and an
-  unmapped base id of a mapped family, a missing new id or a line whose case
-  source is not in both details is a removed id. gateCompare.output must name
-  the same map sha256 in idMap (no idMap without a map).
+  mapped id is the same item, and a base allow entry moves only with its own
+  case. A line's case path must equal the case path of the base item and of
+  the new item. An unmapped base id of a mapped family, a missing new id and a
+  line that names two cases give a removed id. A removal line whose case the
+  new run does not hold removes its base id; the output lists those in
+  gateIdMapRemoved for the reviewer, who checks the commit. gateCompare.output
+  must name the same map sha256 in idMap (no idMap without a map).
 - gateRuns [{label, manifest, sha256, compare {path, sha256}, regressions
   [{id, base, new, why, flake}]}]: every gate run of the source, oldest
   first, with batch.gate last (accept_revision.py). Each failed run that

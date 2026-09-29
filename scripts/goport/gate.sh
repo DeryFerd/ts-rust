@@ -11,7 +11,9 @@
 #
 # Stages (serial, one gate run at a time through /tmp/goport-gate.lock):
 #   measure, measure-extra, sweep, sweep-extra2, sweep-hono-runtime   (existing scripts; sweep, sweep-extra2
-#                 and sweep-hono-runtime run the tracked copies next to this script)
+#                 and sweep-hono-runtime run the tracked copies next to this script). measure, determinism
+#                 and the sweeps judge goport's exit with exit-rule.sh: exit 2 is complete only at the Go
+#                 pins in its EXIT2_PINS.
 #   sweep-wide    (--full) 292 configs of 51 more real projects (sweep-wide.sh)
 #   f1            sample-f1/run-f1.py (R104 conformance sample)
 #   emit          emit/compare-emit.sh
@@ -40,8 +42,10 @@ X=$REPO/target/project-inputs-extra
 HERE=$(cd "$(dirname "$0")" && pwd)
 SELF=$HERE/$(basename "$0")
 ALLOW=$HERE/gate-allow.txt
+# The exit rule of the measure, determinism and sweep stages: GOPORT_MAX_EXIT from the Go pin.
+. "$HERE/exit-rule.sh"
 
-usage() { sed -n '2,28p' "$SELF"; exit 2; }
+usage() { sed -n '2,/^set -uo/p' "$SELF" | sed '$d'; exit 2; }
 LABEL=${1:-}; [[ -n $LABEL && $LABEL != -* ]] || usage; shift
 [[ $LABEL =~ ^[A-Za-z0-9._-]+$ ]] || { echo "label must match [A-Za-z0-9._-]+" >&2; exit 2; }
 BINS=$R/runtime/cargo-target/release; MODE=full; COMMIT=
@@ -116,18 +120,22 @@ def item(stage, name, ok, detail='', **ctx):
     return row
 
 
-# A goport run is complete with exit 0, 1 or 2 and a clean stderr. tsgo exits 2 for diagnostics under
-# --noEmit since tsgo #4407 (Go pin 16c25522e123), and goport follows the pin. goport also exits 2 for
-# a kept Go panic, so err_clean looks for its "panic: " line. Exits over 2 are a crash.
-COMPLETE_EXITS = (0, 1, 2)
+# The exit rule of scripts/goport/exit-rule.sh, which gate.sh sources: a goport run of the measure and
+# determinism stages is complete with an exit up to GOPORT_MAX_EXIT and a clean stderr. GOPORT_MAX_EXIT is
+# 2 only at the Go pins in its EXIT2_PINS (tsgo exits 2 for diagnostics under --noEmit there, and goport
+# follows the pin), else 1, the old rule.
+MAX_EXIT = int(os.environ['GOPORT_MAX_EXIT'])
+COMPLETE_EXITS = tuple(range(MAX_EXIT + 1))
 
 
 def err_clean(path):
-    """True when a goport stderr file has no panic (Rust or kept Go) and no unported line."""
+    """True when a goport stderr file has no Rust panic and no unported line. Where exit 2 is complete
+    (MAX_EXIT 2), a kept Go "panic: " line is not clean either: goport exits 2 for one."""
     if not Path(path).exists():
         return True
     text = Path(path).read_text(errors='replace')
-    return 'panicked at' not in text and not any(l.startswith(('unported', 'panic: ')) for l in text.splitlines())
+    bad = ('unported', 'panic: ') if MAX_EXIT == 2 else ('unported',)
+    return 'panicked at' not in text and not any(l.startswith(bad) for l in text.splitlines())
 
 
 # ---- log parsers for the existing bash scripts ----
@@ -554,7 +562,7 @@ scripts = [R / 'tools-port/measure.sh', R / 'tools-port/measure-extra.sh', Path(
            Path(gate).parent / 'sweep-extra2.sh', Path(gate).parent / 'sweep-wide.sh', Path(gate).parent / 'sweep-hono-runtime.sh',
            R / 'sample-f1/run-f1.py', R / 'emit/compare-emit.sh', R / 'typesyms/compare-int.py',
            R / 'build-mode/compare-build.sh', R / 'corpus-full/run_shard.py', R / 'corpus-full/run_shard_parallel.py',
-           R / 'emit-corpus/run_emit_shard2.py', Path(gate).parent / 'ls_edit_bench.py']
+           R / 'emit-corpus/run_emit_shard2.py', Path(gate).parent / 'ls_edit_bench.py', Path(gate).parent / 'exit-rule.sh']
 print(json.dumps({
     'label': label, 'mode': mode, 'startedUtc': started, 'commit': commit, 'commitInput': commit_in or None,
     'binsDir': bins,

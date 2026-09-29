@@ -609,6 +609,12 @@ if gc:
               f"tool changes {[(t['key'], t['listed']) for t in gc.get('toolChanges', [])]}. "
               f"Cap rule: {gc['capRule']}. Caps now: " + ', '.join(f"{p} {c['cap']:.2f}{' (lowered)' if c['lowered'] else ''}" for p, c in gc['longCaps'].items())
               + '.' + (' Open-defect items: ' + '; '.join(f"{k['id']} growth {k['growth']:.2f} (cap {k['cap']:.2f}, base {k['baseGrowth']:.2f})" for k in gc['knownOpen']) + '.' if gc['knownOpen'] else ''))
+    m = gc.get('idMap')
+    if m:
+        ev.append(f"Gate id map {m['path']} sha256 {m['sha256']}: {m['lines']} lines, applied {m['applied']}, {m['mapped']} ids moved, "
+                  f"{len(m['broken'])} broken lines, {len(m['unused'])} unused lines, {len(m['removed'])} removal lines"
+                  + (': ' + '; '.join(f"{r['id']} {r['source']} (commit {r['commit']})" for r in m['removed'][:20]) if m['removed'] else '')
+                  + '. Check each removal commit at the Go pins.')
     if gc['regressions']:
         ev.append('Gate regressions: ' + '; '.join(f"{r['id']} {r['base']} -> {r['new']} ({r['why']})" for r in gc['regressions'][:20]) + '.')
         missing.append('gate compare without a regression')
@@ -654,7 +660,8 @@ head = (f"Batch {b['id']} (protected set goport), revision {rev}, source fingerp
         + (f' Go pin {pin} (GOPORT_PIN for every Go comparison).' if pin else ''))
 evidence = '\n'.join(f'- {e}' for e in ev)
 bind = (f"naming the batch, the source fingerprint, the goport tests sha256 {t['sha256'] if t else '<missing>'}, the gate manifest "
-        f"sha256 {gate['sha256'] if gate else '<missing>'} and the name map sha256 {((t or {}).get('nameMap') or {}).get('sha256', 'none')}")
+        f"sha256 {gate['sha256'] if gate else '<missing>'}, the name map sha256 {((t or {}).get('nameMap') or {}).get('sha256', 'none')} "
+        f"and the gate id map sha256 {(b.get('gateIdMap') or {}).get('sha256', 'none')}")
 prev = next((r.get('commit') for r in reversed(rows) if r.get('commit')), None)
 spec = ['--', '.', ':(exclude)docs/typechecker-state', ':(exclude)docs/typechecker-batches']
 diff = git('diff', '--shortstat', prev, 'HEAD', *spec) if prev else 'unknown'

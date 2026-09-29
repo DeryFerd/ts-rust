@@ -53,22 +53,32 @@ Id map (pin bumps). A new Go pin can renumber the corpus cases, so the same case
 new run (corpus-diag/04640 at 52168999f3dc is corpus-diag/04704 at 16c25522e123). The batch in --state
 can name a map in gateIdMap {"path": "<TSV, relative to the repo root or absolute>", "sha256": "..."}.
 The file must have that sha256. It is used only when both manifests record an upstreamPin and the pins
-differ; at one pin it has no effect (idMap.applied false). Each line is "<old id> TAB <new id> TAB
-<case source>" ('#' lines, blank lines and the header line "oldId TAB newId TAB source" are skipped). Both ids
-are in one family (the part before the first '/'). Two lines with one old id or one new id are bad input.
+differ; at one pin it has no effect (idMap.applied false), so it can neither move nor remove an id.
+'#' lines, blank lines and the header line "oldId TAB newId TAB source" are skipped. Each other line is
+- "<old id> TAB <new id> TAB <case path>": the case moved to a new id, or
+- "<old id> TAB - TAB <case path> TAB <upstream commit>": the removal form. Go removed the case between
+  the two pins, in the cited commit (7 to 40 hex digits). The reviewer checks the commit.
+Only the corpus families (CASE_PATH) can have lines, and both ids of a line are in one family (the part
+before the first '/'). The case path of a corpus item is the source word at its fixed place in the
+detail: "<class> <case path>" (corpus-diag) and "<class> exit <go>/<goport> <case path>" (corpus-emit);
+notes can follow it. Bad input (exit 2): two lines with one old id, one new id, or one case path in one
+family.
 When the map is used:
 - A base id with a line is compared with the new item of its new id: the same item under another id.
-- The case source must be one word of the base item's detail and one word of the new item's detail
-  (the corpus details name it). Else the line is broken and its base id is a removed id, so a map
-  cannot pair two different cases.
+- The line's case path must equal the case path of the base item and of the new item. Else the line is
+  broken and its base id is a removed id, so a map cannot pair two different cases.
+- A removal line needs the case path of the base item, and the new run must not hold that case path
+  in the family. Then its base id is not compared and is listed in idMap.removed. Else the line is
+  broken and its base id is a removed id.
 - A family with a line is a mapped family. A base id of a mapped family without a working line is a
   removed id, never compared with the new item of the same id (that id can be another case now).
   The ids of the other families are compared as before.
-- The base allow entries move to the new ids in the same way. An entry of a mapped family without a
-  line (an old pin's id, or a glob) gives no allowance.
+- A base allow entry moves only with its own case: an entry whose id is a base item that a working
+  line moves applies to the new id of that line. Any other entry of a mapped family (an old pin's id,
+  a removed case or a glob) gives no allowance.
 - A line whose old id is not a base id is unused (listed in idMap.unused).
-The output has idMap {path, sha256, lines, applied, mapped, broken, unused} only when the batch names a
-map, so the output without a map stays the same.
+The output has idMap {path, sha256, lines, applied, mapped, removed, broken, unused} only when the batch
+names a map, so the output without a map stays the same.
 
 Prints one JSON object, and writes it to --out when given. Exit 0: no regression.
 Exit 1: regressions. Exit 2: bad input.
@@ -164,6 +174,16 @@ def family(i):
     return i.split('/', 1)[0]
 
 
+# The case path of a corpus item (see the docstring): gate.sh cmd_corpus_diag and cmd_corpus_emit write it.
+CASE_PATH = {'corpus-diag': re.compile(r'^\S+ (\S+)(?: |$)'), 'corpus-emit': re.compile(r'^\S+ exit \S+/\S+ (\S+)(?: |$)')}
+
+
+def case_path(item):
+    """The case path of a corpus gate item, or None when its detail does not have one."""
+    m = CASE_PATH[family(item['id'])].match(item.get('detail') or '')
+    return m[1] if m else None
+
+
 def pins_differ(a, b):
     """True when two upstream pins (hex, maybe abbreviated) are known and name other commits."""
     pin = re.compile(r'^[0-9a-f]{7,64}$')
@@ -174,7 +194,8 @@ def pins_differ(a, b):
 
 
 def load_id_map(ref):
-    """(lines {old id: (new id, source, line number)}, path, sha256) of batch.gateIdMap {path, sha256}."""
+    """(lines {old id: (new id or None for a removal, case path, line number, commit or None)}, path, sha256) of
+    batch.gateIdMap {path, sha256}."""
     if not isinstance(ref, dict) or not isinstance(ref.get('path'), str) or not re.match(r'^[0-9a-f]{64}$', str(ref.get('sha256'))):
         fail(f'gateIdMap needs a path and a sha256: {json.dumps(ref)}')
     path = ref['path'] if os.path.isabs(ref['path']) else os.path.join(ROOT, ref['path'])
@@ -185,20 +206,27 @@ def load_id_map(ref):
         fail(f'cannot read the gate id map: {e}')
     if hashlib.sha256(data).hexdigest() != ref['sha256']:
         fail(f'gate id map {path} does not have the sha256 {ref["sha256"]} that gateIdMap names')
-    lines, targets = {}, set()
+    lines, targets, cases = {}, set(), set()
     for n, line in enumerate(text.splitlines(), 1):
         cells = line.split('\t')
         if not line.strip() or line.startswith('#') or cells[0] == 'oldId':
             continue
-        if len(cells) != 3 or not all(c.strip() == c and c for c in cells) or '-' in (cells[0], cells[1]):
-            fail(f'gate id map line {n}: need "<old id> TAB <new id> TAB <case source>"')
-        old, to, source = cells
-        if family(old) != family(to) or '/' not in old:
-            fail(f'gate id map line {n}: {old} and {to} are not ids of one family')
-        if old in lines or to in targets:
-            fail(f'gate id map line {n}: {old if old in lines else to} is in two lines')
-        lines[old] = (to, source, n)
-        targets.add(to)
+        removal = len(cells) == 4 and cells[1] == '-'
+        if not (len(cells) == 3 or removal) or not all(c.strip() == c and c for c in cells) or '-' in (cells[0], cells[2]) \
+                or (not removal and cells[1] == '-'):
+            fail(f'gate id map line {n}: need "<old id> TAB <new id> TAB <case path>" or "<old id> TAB - TAB <case path> TAB <commit>"')
+        old, to, source = cells[:3]
+        if removal and not re.match(r'^[0-9a-f]{7,40}$', cells[3]):
+            fail(f'gate id map line {n}: a removal cites the upstream commit that removed the case (7 to 40 hex digits), not {cells[3]}')
+        if '/' not in old or family(old) not in CASE_PATH or not (removal or ('/' in to and family(to) == family(old))):
+            fail(f'gate id map line {n}: {old} and {to} are not ids of one corpus family ({", ".join(CASE_PATH)})')
+        dup = old if old in lines else to if to in targets else source if (family(old), source) in cases else None
+        if dup:
+            fail(f'gate id map line {n}: {dup} is in two lines')
+        lines[old] = (None if removal else to, source, n, cells[3] if removal else None)
+        cases.add((family(old), source))
+        if not removal:
+            targets.add(to)
     return lines, path, ref['sha256']
 
 
@@ -227,24 +255,35 @@ def main():
     nm, new, nhead = load(a.new)
     batch = read_batch(a.state)
     defects = open_defects(batch)
-    # The id map of a pin bump (see the docstring): moved maps a base id to its new id; gone says why a
-    # base id of a mapped family has none.
-    lines, id_map, moved, gone = {}, None, {}, {}
+    # The id map of a pin bump (see the docstring): moved maps a base id to its new id, dropped holds the
+    # base ids that a removal line removes, and gone says why a base id of a mapped family has neither.
+    lines, id_map, moved, gone, dropped = {}, None, {}, {}, set()
     if batch.get('gateIdMap') is not None:
         lines, path, sha = load_id_map(batch['gateIdMap'])
         id_map = {'path': path, 'sha256': sha, 'lines': len(lines), 'applied': pins_differ(bhead['upstreamPin'], nhead['upstreamPin']),
-                  'mapped': 0, 'broken': [], 'unused': []}
+                  'mapped': 0, 'removed': [], 'broken': [], 'unused': []}
         if not id_map['applied']:
             lines = {}
     mapped_families = {family(old) for old in lines}
-    for old, (to, source, n) in sorted(lines.items(), key=lambda e: e[1][2]):
+    # The case paths of the new items of each mapped family: a removal line needs its case to be gone.
+    new_cases = {(family(i), case_path(r)) for i, r in new.items() if family(i) in mapped_families}
+    for old, (to, source, n, commit) in sorted(lines.items(), key=lambda e: e[1][2]):
         b, t = base.get(old), new.get(to)
         if b is None:
             id_map['unused'].append(old)
+        elif case_path(b) != source:
+            gone[old] = f'removed id (id map line {n}: {source} is not the case path of {old}, {case_path(b)})'
+            id_map['broken'].append(old)
+        elif to is None and (family(old), source) in new_cases:
+            gone[old] = f'removed id (id map line {n} removes the case {source}, but the new run holds it)'
+            id_map['broken'].append(old)
+        elif to is None:
+            dropped.add(old)
+            id_map['removed'].append({'id': old, 'source': source, 'commit': commit, 'line': n, 'base': b['status']})
         elif t is None:
             gone[old] = f'removed id (id map line {n}: its new id {to} is not in the new run)'
-        elif source not in (b.get('detail') or '').split() or source not in (t.get('detail') or '').split():
-            gone[old] = f'removed id (id map line {n}: {old} and {to} are not one case, {source} is not in both details)'
+        elif case_path(t) != source:
+            gone[old] = f'removed id (id map line {n}: {to} is the case {case_path(t)}, not {source})'
             id_map['broken'].append(old)
         else:
             moved[old] = to
@@ -252,7 +291,8 @@ def main():
         id_map['mapped'] = len(moved)
 
     def new_id(i):
-        """The id of base id (or base allow entry id) i in the new run, or None when the map gives it none."""
+        """The id of base id (or base allow entry id) i in the new run, or None when the map gives it none. In a
+        mapped family only a working line gives one, so an allow entry moves only with its own case."""
         return moved.get(i) if family(i) in mapped_families else i
 
     # Allow entries of the base allow list, by (entry id at the new pin, condition).
@@ -316,6 +356,8 @@ def main():
             fixed.append(i)
     for i, b in base.items():
         t = new_id(i)
+        if i in dropped:
+            continue  # removed by a removal line at a pin change: listed in idMap.removed for the reviewer
         if t is None:
             regress(i, b, None, gone.get(i) or f'removed id (the id map has no line for it, and its family {family(i)} is mapped)')
         elif t not in new:

@@ -641,7 +641,7 @@ function rebind(f) {
   const { batch } = f.state;
   for (const item of [batch.recoveryHistory.at(-1), batch.auditor, batch.reviewer]) {
     Object.assign(item, { goportTestsSha256: batch.goportTests.sha256, gateSha256: batch.gate.sha256,
-      nameMapSha256: batch.goportTests.nameMap?.sha256 ?? null });
+      nameMapSha256: batch.goportTests.nameMap?.sha256 ?? null, gateIdMapSha256: batch.gateIdMap?.sha256 ?? null });
   }
 }
 
@@ -829,12 +829,13 @@ function renumbered(f, extra = [], pin = NEW_PIN) {
   f.state.batch.upstreamPin = { from: GO_PIN, to: pin };
 }
 
-// The gate id map in batch.gateIdMap, with its real sha256 (gate-compare.py checks it), and in the
-// saved gate compare output.
-function withIdMap(f, text) {
+// The gate id map in batch.gateIdMap, with its real sha256 (gate-compare.py checks it), in the saved
+// gate compare output, and bound in the history row and both verdicts (bind false leaves them unbound).
+function withIdMap(f, text, { bind = true } = {}) {
   const sha256 = createHash("sha256").update(text).digest("hex");
   f.state.batch.gateIdMap = f.put("gate-id-map.tsv", sha256, text);
   f.gateOutput.idMap = { path: "gate-id-map.tsv", sha256 };
+  if (bind) rebind(f);
 }
 
 test("a gate id map moves a renumbered id at a pin bump: with it PASS, without it STOP", () => {
@@ -855,6 +856,7 @@ test("a gate id map moves a renumbered id at a pin bump: with it PASS, without i
   stopped(f, /gateCompare.output must be the gate-compare.py output/);
   f.gateOutput.idMap = { sha256: f.state.batch.gateIdMap.sha256 };
   f.state.batch.gateIdMap.sha256 = "e".repeat(64);
+  rebind(f);
   stopped(f, /hash mismatch: gate-id-map.tsv/);
   // At one Go pin the map has no effect.
   f = goportFixture(); renumbered(f, [], GO_PIN);
@@ -871,10 +873,10 @@ test("a gate id map cannot hide a real removal", () => {
     f.gateNew.results.find(row => row.id === "corpus-diag/00003").id = "corpus-diag/00002";
   };
   for (const [change, text, why] of [
-    // The map pairs a.ts with the new case: a.ts is not in the new detail.
-    [gone, "corpus-diag/00001\tcorpus-diag/00002\ta.ts\n", /id map line 1: corpus-diag\/00001 and corpus-diag\/00002 are not one case/],
-    // The map names the new case's source: it is not in the base detail.
-    [gone, "corpus-diag/00001\tcorpus-diag/00002\tc.ts\n", /are not one case, c.ts is not in both details/],
+    // The map pairs a.ts with the new case: the new item is the case c.ts.
+    [gone, "corpus-diag/00001\tcorpus-diag/00002\ta.ts\n", /id map line 1: corpus-diag\/00002 is the case c.ts, not a.ts/],
+    // The map names the new case's path: it is not the case path of the base item.
+    [gone, "corpus-diag/00001\tcorpus-diag/00002\tc.ts\n", /id map line 1: c.ts is not the case path of corpus-diag\/00001, a.ts/],
     // The map points at an id that is not in the new run.
     [f => renumbered(f), "corpus-diag/00001\tcorpus-diag/00007\ta.ts\n", /its new id corpus-diag\/00007 is not in the new run/],
     // A new case c.ts takes the old id, and the map has no line for it: never compared with c.ts.
@@ -890,9 +892,124 @@ test("a gate id map cannot hide a real removal", () => {
     ["corpus-diag/00001\tcorpus-diag/00002\ta.ts\ncorpus-diag/00009\tcorpus-diag/00002\ta.ts\n", /line 2: corpus-diag\/00002 is in two lines/],
     ["corpus-diag/00001\tcorpus-diag/00002\n", /line 1: need/],
     ["corpus-diag/00001\t-\ta.ts\n", /line 1: need/],
-    ["corpus-diag/00001\tcorpus-emit/00002\ta.ts\n", /are not ids of one family/],
+    ["corpus-diag/00001\tcorpus-emit/00002\ta.ts\n", /are not ids of one corpus family/],
   ]) {
     const f = goportFixture(); renumbered(f); withIdMap(f, text);
+    stopped(f, why);
+  }
+});
+
+// The removed-id regressions of a STOP result, as [id, why].
+const removedIds = result => result.losses.gate.filter(item => item.now === "REMOVED").map(({ id, why }) => [id, why]);
+
+test("a gate id map line must name the case path of both items, never a word they share (skeptic: generic word)", () => {
+  // a.ts is gone at the new pin, and a different case c.ts has corpus-diag/00002. Both details hold the word MATCH.
+  const gone = f => {
+    renumbered(f, [["corpus-diag/00003", "MATCH c.ts"]]);
+    f.gateNew.results = f.gateNew.results.filter(row => row.id !== "corpus-diag/00002");
+    f.gateNew.results.find(row => row.id === "corpus-diag/00003").id = "corpus-diag/00002";
+  };
+  let f = goportFixture(); gone(f); withIdMap(f, "corpus-diag/00001\tcorpus-diag/00002\tMATCH\n");
+  assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)),
+    [["corpus-diag/00001", "removed id (id map line 1: MATCH is not the case path of corpus-diag/00001, a.ts)"]]);
+  // A note after the case path (an allow condition that did not hold) does not change the case path.
+  f = goportFixture(); renumbered(f);
+  Object.assign(f.files["gate/r131/manifest.json"].value.results.find(row => row.id === "corpus-diag/00001"),
+    { status: "FAIL", detail: "MISMATCH a.ts (allow entry corpus-diag/00001 condition single-threaded-equal did not hold for None)" });
+  withIdMap(f, "corpus-diag/00001\tcorpus-diag/00002\ta.ts\n");
+  const result = check(f);
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+  assert.equal(result.counts.gate.regressions, 0);
+  // Only the corpus families have a case path, so no other family can have a line.
+  f = goportFixture(); renumbered(f); withIdMap(f, "measure/query\tmeasure/query2\tquery\n");
+  stopped(f, /line 1: measure\/query and measure\/query2 are not ids of one corpus family/);
+});
+
+// Base: corpus-diag/00001 MATCH a.ts and corpus-diag/00002 ALLOWED w.ts by the base allow entry corpus-diag/00002.
+// New pin: a.ts is corpus-diag/00011 and now ALLOWED by a new entry, w.ts is corpus-diag/00012 and MATCH.
+function swapped(f) {
+  const base = f.files["gate/r131/manifest.json"].value, st = "single-threaded-equal";
+  base.results.push({ stage: "corpus-diag", id: "corpus-diag/00002", status: "ALLOWED", detail: "MISMATCH w.ts",
+    allowedBy: [{ id: "corpus-diag/00002", condition: st }] });
+  base.allowList.entries.push({ id: "corpus-diag/00002", condition: st });
+  f.gateNew.results = f.gateNew.results.filter(row => row.id !== "corpus-diag/00001");
+  f.gateNew.results.push({ stage: "corpus-diag", id: "corpus-diag/00011", status: "ALLOWED", detail: "MISMATCH a.ts",
+    allowedBy: [{ id: "corpus-diag/00011", condition: st }] },
+  { stage: "corpus-diag", id: "corpus-diag/00012", status: "MATCH", detail: "MATCH w.ts" });
+  f.gateNew.upstreamPin = f.results.pin = NEW_PIN;
+  f.state.batch.upstreamPin = { from: GO_PIN, to: NEW_PIN };
+}
+
+test("a swapped gate id map cannot move an allow entry to another case (skeptic: swap)", () => {
+  // The skeptic's swap: each line names a word of both details and pairs a.ts with w.ts, so the base allow
+  // entry of w.ts would cover a.ts. Both lines are broken and both base ids are removed ids.
+  for (const text of ["corpus-diag/00001\tcorpus-diag/00012\tMATCH\ncorpus-diag/00002\tcorpus-diag/00011\tMISMATCH\n",
+    "corpus-diag/00001\tcorpus-diag/00012\ta.ts\ncorpus-diag/00002\tcorpus-diag/00011\tw.ts\n"]) {
+    const f = goportFixture(); swapped(f); withIdMap(f, text);
+    const result = stopped(f, /2 gate items regressed/);
+    assert.deepEqual(removedIds(result).map(([id]) => id), ["corpus-diag/00001", "corpus-diag/00002"]);
+  }
+  // The honest map moves the entry of w.ts with w.ts only: a.ts, MATCH in the base, is ALLOWED by an entry the base did not have.
+  const f = goportFixture(); swapped(f);
+  withIdMap(f, "corpus-diag/00001\tcorpus-diag/00011\ta.ts\ncorpus-diag/00002\tcorpus-diag/00012\tw.ts\n");
+  const result = stopped(f, /1 gate items regressed/);
+  assert.deepEqual(result.losses.gate.map(({ id, base, now, why }) => [id, base, now, why]), [["corpus-diag/00011", "MATCH", "ALLOWED",
+    "base MATCH is ALLOWED by an allow entry the base did not have: corpus-diag/00011 (single-threaded-equal)"]]);
+  // One case path in two lines of one family is bad input.
+  withIdMap(f, "corpus-diag/00001\tcorpus-diag/00011\ta.ts\ncorpus-diag/00002\tcorpus-diag/00012\ta.ts\n");
+  stopped(f, /line 2: a.ts is in two lines/);
+});
+
+test("the history row and both verdicts bind the gate id map (skeptic: unbound map)", () => {
+  const text = "corpus-diag/00001\tcorpus-diag/00002\ta.ts\n", sha = createHash("sha256").update(text).digest("hex");
+  const f = goportFixture(); renumbered(f); withIdMap(f, text, { bind: false });
+  const { batch } = f.state, row = batch.recoveryHistory.at(-1);
+  stopped(f, /Current history row does not match the batch source, hypothesis, and goport test, gate, name map and gate id map hashes/);
+  row.gateIdMapSha256 = sha;
+  stopped(f, /Verdict is not bound to this batch, source, and goport test, gate, name map and gate id map hashes/);
+  rebind(f);
+  assert.equal(check(f).verdict, "PASS");
+  // A bound sha256 that is not the batch map, and a bound map when the batch has none.
+  batch.reviewer.gateIdMapSha256 = "e".repeat(64);
+  stopped(f, /Verdict is not bound/);
+  const g = goportFixture(); g.state.batch.recoveryHistory.at(-1).gateIdMapSha256 = sha;
+  stopped(g, /Current history row does not match/);
+  // The bound sha256 is the batch map's, and the file must have it.
+  rebind(f);
+  f.files["gate-id-map.tsv"].value = "corpus-diag/00001\tcorpus-diag/00002\tb.ts\n";
+  stopped(f, /gate id map .* does not have the sha256/);
+});
+
+test("a removal line removes a case only at a pin change, with its case path and a cited commit", () => {
+  // Go removed a.ts between the pins: the new run has no a.ts item.
+  const removed = (f, pin) => {
+    renumbered(f, [], pin);
+    f.gateNew.results = f.gateNew.results.filter(row => row.id !== "corpus-diag/00002");
+  };
+  const line = "corpus-diag/00001\t-\ta.ts\tbbdf7a24b\n";
+  let f = goportFixture(); removed(f); withIdMap(f, line);
+  let result = check(f);
+  assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+  assert.deepEqual(result.gateIdMapRemoved, [{ id: "corpus-diag/00001", source: "a.ts", commit: "bbdf7a24b", line: 1, base: "MATCH" }]);
+  assert.deepEqual([result.counts.gate.baseItems, result.counts.gate.items, result.counts.gate.regressions], [5, 5, 0]);
+  // Without the line the id is a removed id.
+  f = goportFixture(); removed(f);
+  assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)), [["corpus-diag/00001", "removed id"]]);
+  // At one Go pin the map has no effect, so the removal line cannot remove an id.
+  f = goportFixture(); removed(f, GO_PIN); withIdMap(f, line);
+  assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)), [["corpus-diag/00001", "removed id"]]);
+  // The new run still holds a.ts (as corpus-diag/00002): it is not removed.
+  f = goportFixture(); renumbered(f); withIdMap(f, line);
+  assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)),
+    [["corpus-diag/00001", "removed id (id map line 1 removes the case a.ts, but the new run holds it)"]]);
+  // The line names another case path than the base item.
+  f = goportFixture(); removed(f); withIdMap(f, "corpus-diag/00001\t-\tc.ts\tbbdf7a24b\n");
+  assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)),
+    [["corpus-diag/00001", "removed id (id map line 1: c.ts is not the case path of corpus-diag/00001, a.ts)"]]);
+  // A removal cites a commit, and moves nothing.
+  for (const [text, why] of [["corpus-diag/00001\t-\ta.ts\tHEAD\n", /line 1: a removal cites the upstream commit/],
+    ["corpus-diag/00001\t-\ta.ts\n", /line 1: need/], ["corpus-diag/00001\tcorpus-diag/00002\ta.ts\tbbdf7a24b\n", /line 1: need/]]) {
+    f = goportFixture(); removed(f); withIdMap(f, text);
     stopped(f, why);
   }
 });
@@ -1148,9 +1265,9 @@ test("the history row and both verdicts bind the name map", () => {
   const suite = f.results.suites.go_baselines;
   suite["b::uno"] = suite["b::one"]; delete suite["b::one"];
   f.state.batch.goportTests.nameMap = f.put("map.tsv", "c", "go_baselines\tb::one\tgo_baselines\tb::uno\tmoved\n");
-  stopped(f, /Current history row does not match the batch source, hypothesis, and goport test, gate and name map hashes/);
+  stopped(f, /Current history row does not match the batch source, hypothesis, and goport test, gate, name map and gate id map hashes/);
   f.state.batch.recoveryHistory.at(-1).nameMapSha256 = "c".repeat(64);
-  stopped(f, /Verdict is not bound to this batch, source, and goport test, gate and name map hashes/);
+  stopped(f, /Verdict is not bound to this batch, source, and goport test, gate, name map and gate id map hashes/);
   rebind(f);
   assert.equal(check(f).verdict, "PASS");
 });
@@ -1223,9 +1340,9 @@ test("goport batch needs bound runs, quality and bound verdicts", () => {
     [f => { f.state.batch.auditor.batchId = "batch-0"; }, /Verdict is not bound/],
     [f => { f.state.batch.reviewer.agent = "writer"; }, /implementer/],
     [f => { f.state.batch.recoveryHistory.at(-1).sourceFingerprint = RESULT; }, /Current history row does not match/],
-    [f => { f.state.batch.recoveryHistory.at(-1).goportTestsSha256 = RESULT; }, /Current history row does not match .* goport test, gate and name map hashes/],
+    [f => { f.state.batch.recoveryHistory.at(-1).goportTestsSha256 = RESULT; }, /Current history row does not match .* goport test, gate, name map and gate id map hashes/],
     [f => { delete f.state.batch.recoveryHistory.at(-1).gateSha256; }, /Current history row does not match/],
-    [f => { f.state.batch.auditor.gateSha256 = RESULT; }, /Verdict is not bound to this batch, source, and goport test, gate and name map hashes/],
+    [f => { f.state.batch.auditor.gateSha256 = RESULT; }, /Verdict is not bound to this batch, source, and goport test, gate, name map and gate id map hashes/],
     [f => { delete f.state.batch.reviewer.goportTestsSha256; }, /Verdict is not bound/],
     [f => { f.state.batch.gateCompare.baseSha256 = RESULT; }, /gateCompare base must be/],
     [f => { f.state.batch.rosterCarryForward = { fromRevision: 6 }; }, /no roster carry-forward/],

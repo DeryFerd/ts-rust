@@ -73,11 +73,11 @@ retired. R132 is the last legacy revision.
    the evidence that the flake rule asks for.
 4. `candidate.sh verdict-request <rev>`: the texts for the auditor and the reviewer, with every
    failed gate run of the source and its flake notes, then the accept command. The texts ask for a
-   verdict that names the goport tests, gate manifest and name map sha256.
+   verdict that names the goport tests, gate manifest, name map and gate id map sha256.
 5. After two PASS verdicts: `accept_revision.py --revision <rev> --evidence <cache dir> --scope TEXT
    --outcome TEXT`. It refuses a failed gate run that has no flake note for an item. It records the
    evidence and the verdicts (the history row and both verdicts carry `goportTestsSha256`,
-   `gateSha256` and `nameMapSha256`), and every gate run of the source in `gateRuns` (each failed
+   `gateSha256`, `nameMapSha256` and `gateIdMapSha256`), and every gate run of the source in `gateRuns` (each failed
    run with its regressions and flake notes, then the batch gate). It runs
    `check-typechecker-batch.mjs`, and records the acceptance only when the check passes. The check
    also finds each kept `gate-compare-fail-<label>.json`, runs `gate-compare.py` on that run again
@@ -97,10 +97,12 @@ itself to 1.00, the lowest value of the gate's own limit (2 x Go + 1), once the 
 project is at or under 1.00: from then on its item must be MATCH with growth at or under 1.00. A MATCH
 at a higher growth does not lower it, because the gate's limit follows Go's slope and the same bins
 can then FAIL. A pin bump that renumbers the corpus cases names a gate id map in `batch.gateIdMap`
-(`path`, `sha256`; lines of old id, new id and case source). It applies only when the two manifests
-are at different upstream pins: a mapped id is the same item and the base allow entries move with it.
-An unmapped base id of a mapped family, or a line whose case source is not in both item details, is a
-removed id (format and rules in the `gate-compare.py` docstring).
+(`path`, `sha256`; lines of old id, new id and case path, or old id, `-`, case path and the upstream
+commit that removed the case). It applies only when the two manifests are at different upstream pins:
+a mapped id is the same item, and a base allow entry moves only with its own case. A line's case path
+must equal the case path of the base item and of the new item. An unmapped base id of a mapped family,
+or a line that names another case, is a removed id (format and rules in the `gate-compare.py`
+docstring).
 
 `oracle-compare.py <base results dir> <new results dir>` compares two LSP or API oracle results per
 request: a base request that was `same` or `oracle_error_same` must stay so. It exits 1 on a lost,

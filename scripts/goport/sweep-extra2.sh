@@ -5,16 +5,15 @@
 # Line format matches /tmp/port/sweep.sh and sweep-extra.sh.
 # Tracked copy of target/project-inputs-extra/sweep-extra2.sh, which stays unchanged (historical runner rule).
 # Only the exit rule below differs.
+. "$(dirname "$(realpath "$0")")/exit-rule.sh"
 [ -n "$1" ] || { echo "usage: $0 <round>" >&2; exit 2; }
 X=/home/theo/Code/sandbox/ts-rust/target/project-inputs-extra
 B=${GOPORT_BIN:-/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/bin/goport-r107}
 # label|project dir|cwd (relative to project dir)|config (relative to cwd)|oracle file (relative to project dir)
 # Same cwd and -p as the saved oracle run, so paths in output match.
 # "~variant" labels are separate TS7-compatible configs outside src (see each manifest.json "variant").
-# A run is complete with exit 0, 1 or 2 and no "unported" or Go "panic: " line on stderr. tsgo exits 2
-# for diagnostics under --noEmit since tsgo #4407 (Go pin 16c25522e123), and goport follows the pin.
-# goport also exits 2 for a kept Go panic, so that is judged by its stderr line. Exits over 2 are a crash
-# (70: unported code or a Rust panic; 124: timeout; 128+N: a signal).
+# A run is complete when incomplete() of exit-rule.sh is false: exit 0 or 1 and no "unported" line on
+# stderr, and at the Go pins in its EXIT2_PINS also exit 2 with no Go "panic: " line.
 for entry in \
  "tanstack-table-core|tanstack-table-core|src/packages/table-core|tsconfig.json|oracle.txt" \
  "tanstack-router-core|tanstack-router-core|src/packages/router-core|tsconfig.build.json|oracle.txt" \
@@ -51,6 +50,6 @@ for entry in \
   OR=$X/$n/$of; O=$X/measure/$1; mkdir -p $O
   s=$(date +%s.%N); (cd $X/$n/$cwd && timeout 900 $B -p $c > $O/$l.out 2> $O/$l.err); e=$?
   t=$(python3 -c "import sys;print(round(float(sys.argv[2])-float(sys.argv[1]),1))" $s $(date +%s.%N))
-  if [ $e -gt 2 ] || grep -q "^unported\|^panic: " $O/$l.err; then m=INCOMPLETE; elif diff -q $OR $O/$l.out >/dev/null; then m=MATCH; else m="DIFF(+$(diff $OR $O/$l.out | grep -c '^>') -$(diff $OR $O/$l.out | grep -c '^<'))"; fi
+  if incomplete $e $O/$l.err; then m=INCOMPLETE; elif diff -q $OR $O/$l.out >/dev/null; then m=MATCH; else m="DIFF(+$(diff $OR $O/$l.out | grep -c '^>') -$(diff $OR $O/$l.out | grep -c '^<'))"; fi
   echo "$l exit=$e diags=$(grep -c 'error TS' $O/$l.out) oracle=$(grep -c 'error TS' $OR) $m ${t}s panics=$(grep -c 'panic' $O/$l.err) unported=$(grep -c '^unported' $O/$l.err)"
 done
