@@ -72,7 +72,9 @@ impl Checker {
             }
         }
         self.check_source_elements(node.type_arguments());
-        self.check_type_reference_or_import(node);
+        if !(is_const_type_reference(node) && is_assertion_expression(node.parent())) {
+            self.check_type_reference_or_import(node);
+        }
     }
 
     // Go: checker/checker.go:2984 checkTypeReferenceOrImport
