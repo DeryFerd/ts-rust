@@ -161,7 +161,7 @@ pub fn get_comment_indent(
     crate::go_assert!(comment_start_line >= 0, "commentStartLine >= 0");
 
     if previous_line <= comment_start_line {
-        let line_starts = get_ecma_line_starts(source_file);
+        let line_starts = &*get_ecma_line_starts(source_file);
         return find_first_non_whitespace_column(
             line_starts[comment_start_line as usize],
             position,
@@ -170,7 +170,7 @@ pub fn get_comment_indent(
         );
     }
 
-    let line_starts = get_ecma_line_starts(source_file);
+    let line_starts = &*get_ecma_line_starts(source_file);
     let start_position_of_line = line_starts[previous_line as usize];
     let (character, column) = find_first_non_whitespace_character_and_column(
         start_position_of_line,

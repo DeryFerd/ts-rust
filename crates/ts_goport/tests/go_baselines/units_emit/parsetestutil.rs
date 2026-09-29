@@ -53,7 +53,7 @@ fn format_parse_diagnostics(file: Node) -> Option<String> {
         return None;
     }
     let mut b = String::new();
-    ts_goport::program::write_format_diagnostics(&mut b, diagnostics);
+    ts_goport::program::write_format_diagnostics(&mut b, &diagnostics);
     Some(b)
 }
 

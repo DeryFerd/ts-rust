@@ -1452,7 +1452,9 @@ impl Checker {
             }
             // For other files (not node16/nodenext with impliedNodeFormat), check if we can determine
             // the module format from project references
-            if target_mode == ModuleKind::NONE && source_file_info(file).is_declaration_file {
+            if target_mode == ModuleKind::NONE
+                && with_source_file_info(file, |info| info.is_declaration_file)
+            {
                 // Try to get the project reference - try both source file mapping and output file mapping
                 // since declaration files can be mapped either way depending on how they're resolved
                 // PORT: Go `c.program.GetRedirectForResolution(file)` and
@@ -1474,7 +1476,7 @@ impl Checker {
             }
         }
         // Declaration files (and ambient modules)
-        if file.is_nil() || source_file_info(file).is_declaration_file {
+        if file.is_nil() || with_source_file_info(file, |info| info.is_declaration_file) {
             // Definitely cannot have a synthetic default if they have a syntactic default member specified
             // PORT: Go passes `(moduleSymbol, Default, nil /*sourceNode*/, true /*dontResolveAlias*/)`
             // (its inline comments are misplaced); ported literally.
@@ -1519,7 +1521,8 @@ impl Checker {
         }
 
         // JS files have a synthetic default if they do not contain ES2015+ module syntax (export = is not valid in js) _and_ do not have an __esModule marker
-        let external_module_indicator = source_file_info(file).external_module_indicator;
+        let external_module_indicator =
+            with_source_file_info(file, |info| info.external_module_indicator);
         (external_module_indicator.is_nil() || external_module_indicator == file)
             && self
                 .resolve_export_by_name(

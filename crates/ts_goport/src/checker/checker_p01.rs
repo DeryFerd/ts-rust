@@ -1026,6 +1026,12 @@ pub struct Checker {
     pub type_to_string_nodebuilder: Option<Rc<RefCell<NodeBuilder>>>,
     /// PORT: not in Go. Reusable buffers of `get_named_members`.
     pub(crate) named_members_scratch: crate::checker::checker_p24::NamedMembersScratch,
+    /// PERF: not in Go. The `(symbol, enclosing declaration)` calls of
+    /// `get_alternative_containing_modules` whose import loop found nothing.
+    pub(crate) alternative_module_import_misses: FxHashSet<(SymbolId, Node)>,
+    /// PERF: not in Go. See `get_named_members_of_instantiation`.
+    pub(crate) named_members_orders:
+        FxHashMap<(SymbolTable, SymbolId), Option<crate::checker::checker_p24::NamedMembersOrder>>,
     /// PERF: not in Go. See `MatchingReferenceMemo`.
     pub(crate) matching_reference_memo: crate::checker::flow_p2::MatchingReferenceMemo,
     /// PERF: not in Go. Counts the merges (`merge_symbol` and
@@ -1141,8 +1147,9 @@ impl Checker {
 // so `id = checker_index + 1`.
 // PORT: Go binds every file (`program.BindSourceFiles`) before it creates
 // checkers. Here the checker binds the program first if nothing has
-// (`program::bind_all`), then copies `prog().bound_symbols` as its own
-// symbol arena (`SymbolArena::for_checker`).
+// (`program::bind_all`), then copies the program's binder symbols
+// (`program::bound_symbols`) as its own symbol arena
+// (`SymbolArena::for_checker`).
 // PORT: the checker reads its program through `program` and
 // `compiler_options`, but the `program.rs` functions it calls read the
 // current program (`prog()`). A thread that holds checkers of several
@@ -1154,11 +1161,7 @@ impl Checker {
     pub fn new(checker_index: usize) -> Checker {
         let program = prog();
         bind_all();
-        let bound_symbols = program
-            .bound_symbols
-            .get()
-            .expect("program bound")
-            .for_checker();
+        let bound_symbols = crate::program::bound_symbols().for_checker();
         let compiler_options = &program.options;
         let files: Vec<Node> = program.source_files().map(|f| f.root).collect();
         let file_index_map = create_file_index_map(&files);
@@ -1489,6 +1492,8 @@ impl Checker {
             deferred_diagnostic_callbacks: Vec::new(),
             type_to_string_nodebuilder: None,
             named_members_scratch: Default::default(),
+            named_members_orders: FxHashMap::default(),
+            alternative_module_import_misses: FxHashSet::default(),
             matching_reference_memo: Default::default(),
             merge_version: 0,
             symbols: bound_symbols,

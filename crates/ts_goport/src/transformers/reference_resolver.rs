@@ -25,7 +25,7 @@ use crate::binder::reference_resolver::{
 /// It has no checker: `hook_checker` panics. The resolver that uses it has
 /// no hooks, so it never asks.
 pub struct BinderSymbols {
-    bound: &'static SymbolArena,
+    bound: crate::program::BoundSymbols,
     copy: Option<SymbolArena>,
 }
 
@@ -34,7 +34,7 @@ impl BinderSymbols {
     #[must_use]
     pub fn of_program() -> Self {
         BinderSymbols {
-            bound: prog().bound_symbols.get().expect("program is not bound"),
+            bound: crate::program::bound_symbols(),
             copy: None,
         }
     }
@@ -42,11 +42,11 @@ impl BinderSymbols {
 
 impl NameResolverHost for BinderSymbols {
     fn symbol_arena(&self) -> &SymbolArena {
-        self.copy.as_ref().unwrap_or(self.bound)
+        self.copy.as_ref().unwrap_or(&*self.bound)
     }
 
     fn symbol_arena_mut(&mut self) -> &mut SymbolArena {
-        let bound = self.bound;
+        let bound = &self.bound;
         // `for_checker`: the symbols the copy adds get ids of their own
         // (`ast::get_symbol_id`), as a checker's do.
         self.copy.get_or_insert_with(|| bound.for_checker())

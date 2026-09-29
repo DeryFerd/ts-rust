@@ -79,7 +79,7 @@ fn binder_get_locals(b: &mut Binder, container: Node) -> SymbolTable {
 /// Go `ast.IsExternalOrCommonJSModule(b.file)` while binding: the CommonJS
 /// indicator is binder state until binding ends.
 fn binder_is_external_or_common_js_module(b: &Binder) -> bool {
-    source_file_info(b.file).external_module_indicator.is_some()
+    with_source_file_info(b.file, |info| info.external_module_indicator).is_some()
         || b.common_js_module_indicator.is_some()
 }
 
@@ -124,7 +124,7 @@ fn has_body_data(node: Node) -> bool {
 impl Binder {
     // Go: binder/binder.go:911 bindFunctionExpression
     pub fn bind_function_expression(&mut self, node: Node) {
-        if !source_file_info(self.file).is_declaration_file
+        if !with_source_file_info(self.file, |info| info.is_declaration_file)
             && !node_flags(self, node).intersects(NodeFlags::AMBIENT)
             && is_async_function(node)
         {
@@ -153,7 +153,8 @@ impl Binder {
 
     // Go: binder/binder.go:932 setCommonJSModuleIndicator
     pub fn set_common_js_module_indicator(&mut self, node: Node) -> bool {
-        let external_module_indicator = source_file_info(self.file).external_module_indicator;
+        let external_module_indicator =
+            with_source_file_info(self.file, |info| info.external_module_indicator);
         if external_module_indicator.is_some() && external_module_indicator != self.file {
             return false;
         }
@@ -217,11 +218,11 @@ impl Binder {
     pub fn bind_property_or_method_or_accessor(
         &mut self,
         node: Node,
-        d: &'static NodeData,
+        d: LoadedData,
         symbol_flags: SymbolFlags,
         symbol_excludes: SymbolFlags,
     ) {
-        if !source_file_info(self.file).is_declaration_file
+        if !with_source_file_info(self.file, |info| info.is_declaration_file)
             && !node_flags(self, node).intersects(NodeFlags::AMBIENT)
             && is_async_function(node)
         {
@@ -660,7 +661,7 @@ impl Binder {
 
     // Go: binder/binder.go:1217 bindFunctionDeclaration
     pub fn bind_function_declaration(&mut self, node: Node) {
-        if !source_file_info(self.file).is_declaration_file
+        if !with_source_file_info(self.file, |info| info.is_declaration_file)
             && !node_flags(self, node).intersects(NodeFlags::AMBIENT)
             && is_async_function(node)
         {
@@ -909,10 +910,7 @@ impl Binder {
         if get_containing_class(node).is_some() {
             return diag::Identifier_expected_0_is_a_reserved_word_in_strict_mode_Class_definitions_are_automatically_in_strict_mode;
         }
-        if source_file_info(self.file)
-            .external_module_indicator
-            .is_some()
-        {
+        if with_source_file_info(self.file, |info| info.external_module_indicator).is_some() {
             return diag::Identifier_expected_0_is_a_reserved_word_in_strict_mode_Modules_are_automatically_in_strict_mode;
         }
         diag::Identifier_expected_0_is_a_reserved_word_in_strict_mode
@@ -964,10 +962,7 @@ impl Binder {
         if get_containing_class(node).is_some() {
             return diag::Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5_Class_definitions_are_automatically_in_strict_mode;
         }
-        if source_file_info(self.file)
-            .external_module_indicator
-            .is_some()
-        {
+        if with_source_file_info(self.file, |info| info.external_module_indicator).is_some() {
             return diag::Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5_Modules_are_automatically_in_strict_mode;
         }
         diag::Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5
@@ -1082,10 +1077,7 @@ impl Binder {
         if get_containing_class(node).is_some() {
             return diag::Code_contained_in_a_class_is_evaluated_in_JavaScript_s_strict_mode_which_does_not_allow_this_use_of_0_For_more_information_see_https_Colon_Slash_Slashdeveloper_mozilla_org_Slashen_US_Slashdocs_SlashWeb_SlashJavaScript_SlashReference_SlashStrict_mode;
         }
-        if source_file_info(self.file)
-            .external_module_indicator
-            .is_some()
-        {
+        if with_source_file_info(self.file, |info| info.external_module_indicator).is_some() {
             return diag::Invalid_use_of_0_Modules_are_automatically_in_strict_mode;
         }
         diag::Invalid_use_of_0_in_strict_mode

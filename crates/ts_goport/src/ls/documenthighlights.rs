@@ -487,8 +487,8 @@ impl LanguageService {
                     if symbol.is_some() {
                         // PORT: Go reads the binder symbol through its pointer,
                         // without a checker. The binder symbols of the
-                        // current program live in `prog().bound_symbols`.
-                        let symbols = prog().bound_symbols.get().expect("program is not bound");
+                        // current program are `program::bound_symbols`.
+                        let symbols = crate::program::bound_symbols();
                         let declarations: Vec<Node> = symbols.sym(symbol).declarations.to_vec();
                         for d in declarations {
                             if node_test(d) {

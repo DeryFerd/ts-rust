@@ -182,7 +182,7 @@ impl SnapshotKey {
             sources: SOURCES_HASH,
             nodes: u32::try_from(go_file.parser_flags.len()).ok()?,
             text: text_hash(file),
-            parse: parse_hash(file, go_file)?,
+            parse: parse_hash(file, &go_file)?,
         })
     }
 
@@ -372,7 +372,8 @@ pub fn load(file: Node, symbols: &mut SymbolArena) -> Option<BoundFile> {
     if mode == Mode::Off || !symbols.is_new() {
         return None;
     }
-    let lib = bundled::bundled_lib_name(&source_file_info(file).file_name)?;
+    let info = source_file_info(file);
+    let lib = bundled::bundled_lib_name(&info.file_name)?;
     let entry = entries().iter().find(|entry| entry.name == lib)?;
     let start = (mode == Mode::Trace).then(std::time::Instant::now);
     let result = load_section(file, entry.section);
@@ -398,7 +399,7 @@ fn load_section(file: Node, section: &[u8]) -> Result<(BoundFile, SymbolArena), 
     let go_file = crate::ast::go_file(file.file_index());
     let mut r = SnapshotReader::new(section);
     let key = SnapshotKey::read(&mut r).ok_or("load")?;
-    key.check(file, go_file)?;
+    key.check(file, &go_file)?;
     decode(file, key.nodes, r).ok_or("load")
 }
 

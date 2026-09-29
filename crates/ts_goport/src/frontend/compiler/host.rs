@@ -227,6 +227,14 @@ impl CompilerHost for CompilerHostImpl {
                 Prefetched::Nothing => Box::leak(text.into_boxed_str()),
             }
         };
+        // Not in Go: with `GOPORT_FREE_FILE_VERSIONS=1`, a new parse of a
+        // path that this thread published keeps its nodes in its store
+        // (lsshells M3c), as the language server parse cache does;
+        // `program::update_program_version` gives it a `FileVersion`. A
+        // store that gets none is published static (its nodes are then
+        // leaked).
+        let _owned_nodes =
+            crate::ast::freeable_path(&opts.path.0).then(crate::ast::enter_freeable_parse);
         Some(Rc::new(parse_source_file(opts, text, script_kind)))
     }
 

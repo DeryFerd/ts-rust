@@ -2727,7 +2727,7 @@ mod module_p17 {
         };
 
         let need_allow_arbitrary_extensions = || -> Option<&'static Message> {
-            if source_file_info(file).is_declaration_file
+            if with_source_file_info(file, |info| info.is_declaration_file)
                 || options.allow_arbitrary_extensions.is_true()
             {
                 return None;

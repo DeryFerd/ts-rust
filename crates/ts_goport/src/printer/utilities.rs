@@ -514,7 +514,7 @@ pub fn get_lines_between_positions(source_file: Node, pos1: i32, pos2: i32) -> i
     if pos1 == pos2 {
         return 0;
     }
-    let line_starts = get_ecma_line_starts(source_file);
+    let line_starts = &*get_ecma_line_starts(source_file);
     let lower = if pos1 < pos2 { pos1 } else { pos2 };
     let is_negative = lower == pos2;
     let upper = if is_negative { pos1 } else { pos2 };
@@ -1187,7 +1187,7 @@ pub(crate) fn calculate_indent(text: &str, mut pos: i32, end: i32) -> i32 {
 //
 // Character offsets are measured in UTF-16 code units per the source map specification.
 pub(crate) struct LineCharacterCache {
-    line_map: &'static [i32],
+    line_map: FileRef<[i32]>,
     text: &'static str,
     cached_line: i32,
     cached_pos: i32,
@@ -1246,7 +1246,7 @@ impl LineCharacterCache {
     // before the binary search. Line starts strictly increase, so a line `l`
     // with `line_map[l] <= pos < line_map[l + 1]` is the binary search result.
     fn line_of_position(&self, pos: i32) -> i32 {
-        let map = self.line_map;
+        let map: &[i32] = &self.line_map;
         let holds = |l: usize| {
             map.get(l).is_some_and(|&start| start <= pos)
                 && map.get(l + 1).is_none_or(|&next| pos < next)

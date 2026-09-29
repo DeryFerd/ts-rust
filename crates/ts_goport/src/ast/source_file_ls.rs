@@ -10,6 +10,8 @@
 //! `source_file_get_declaration_map` in `ast/node.rs`. Created tokens are
 //! synthetic nodes, which are thread-local too. All language-service state
 //! runs on the LSP dispatch thread (PORTING "Language service", Threads).
+//! The maps are keyed first by the file, so they forget a dead file version
+//! with its entries (`PerFileMap`, lsshells M3a).
 
 use crate::prelude::*;
 use std::any::Any;
@@ -18,15 +20,15 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 thread_local! {
-    /// Go `SourceFile.data`, keyed by (file, data key).
-    static SOURCE_FILE_DATA: RefCell<FxHashMap<(Node, u64), Rc<dyn Any>>> =
-        RefCell::new(FxHashMap::default());
-    /// Go `SourceFile.tokenCache`, keyed by (file, token cache key).
-    static TOKEN_CACHES: RefCell<FxHashMap<(Node, TokenCacheKey), Node>> =
-        RefCell::new(FxHashMap::default());
+    /// Go `SourceFile.data`, keyed by file, then by data key.
+    static SOURCE_FILE_DATA: RefCell<PerFileMap<FxHashMap<u64, Rc<dyn Any>>>> =
+        const { RefCell::new(PerFileMap::new()) };
+    /// Go `SourceFile.tokenCache`, keyed by file, then by token cache key.
+    static TOKEN_CACHES: RefCell<PerFileMap<FxHashMap<TokenCacheKey, Node>>> =
+        const { RefCell::new(PerFileMap::new()) };
     /// Go `SourceFile.tokenFactory`, one per file.
-    static TOKEN_FACTORIES: RefCell<FxHashMap<Node, Rc<NodeFactory>>> =
-        RefCell::new(FxHashMap::default());
+    static TOKEN_FACTORIES: RefCell<PerFileMap<Rc<NodeFactory>>> =
+        const { RefCell::new(PerFileMap::new()) };
 }
 
 // Go: ast/ast.go:2407 SourceFileDataKey
@@ -102,7 +104,7 @@ fn get_source_file_data_cell<T: 'static>(
 
     SOURCE_FILE_DATA.with(|data| {
         let mut data = data.borrow_mut();
-        if let Some(cell) = data.get(&(file, key.key)) {
+        if let Some(cell) = data.get(&file).and_then(|cells| cells.get(&key.key)) {
             // PORT: Go type assertion `cell.(*sourceFileDataCell[T])`.
             return Rc::clone(cell)
                 .downcast::<SourceFileDataCell<T>>()
@@ -114,7 +116,10 @@ fn get_source_file_data_cell<T: 'static>(
             value: OnceCell::new(),
         });
         let any_cell: Rc<dyn Any> = cell.clone();
-        data.insert((file, key.key), any_cell);
+        data.write()
+            .entry(file)
+            .or_default()
+            .insert(key.key, any_cell);
         cell
     })
 }
@@ -141,7 +146,12 @@ pub fn source_file_get_or_create_token(
 ) -> Node {
     let loc = TextRange::new(pos, end);
     let key = TokenCacheKey { parent, loc };
-    if let Some(token) = TOKEN_CACHES.with(|c| c.borrow().get(&(file, key)).copied()) {
+    if let Some(token) = TOKEN_CACHES.with(|c| {
+        c.borrow()
+            .get(&file)
+            .and_then(|tokens| tokens.get(&key))
+            .copied()
+    }) {
         if token.kind() != kind {
             panic!("Token cache mismatch: {:?} != {:?}", token.kind(), kind);
         }
@@ -160,7 +170,13 @@ pub fn source_file_get_or_create_token(
     let token = create_token(kind, file, pos, end, flags);
     set_node_loc(token, loc);
     set_node_parent(token, parent);
-    TOKEN_CACHES.with(|c| c.borrow_mut().insert((file, key), token));
+    TOKEN_CACHES.with(|c| {
+        c.borrow_mut()
+            .write()
+            .entry(file)
+            .or_default()
+            .insert(key, token)
+    });
     token
 }
 
@@ -170,7 +186,7 @@ fn create_token(kind: SyntaxKind, file: Node, pos: i32, end: i32, flags: TokenFl
     // Go: if file.tokenFactory == nil { file.tokenFactory = NewNodeFactory(NodeFactoryHooks{}) }
     let token_factory =
         TOKEN_FACTORIES.with(|f| {
-            Rc::clone(f.borrow_mut().entry(file).or_insert_with(|| {
+            Rc::clone(f.borrow_mut().write().entry(file).or_insert_with(|| {
                 Rc::new(NodeFactory::new_with_hooks(NodeFactoryHooks::default()))
             }))
         });

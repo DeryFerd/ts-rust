@@ -49,15 +49,13 @@ pub fn build_info_to_snapshot(
         file_paths,
         file_path_set: Vec::new(),
     };
-    // PORT: the sets stay `IndexSet<Path>` (SipHash): `ReferenceMap` keeps
-    // that type (see `reference_map.rs`).
-    let file_path_set: Vec<Arc<IndexSet<Path>>> = build_info
+    let file_path_set: Vec<Arc<FxIndexSet<Path>>> = build_info
         .file_ids_list
         .iter()
         .flatten()
         .map(|file_id_list| {
             let mut file_set =
-                IndexSet::with_capacity_and_hasher(file_id_list.len(), Default::default());
+                FxIndexSet::with_capacity_and_hasher(file_id_list.len(), Default::default());
             for &file_id in file_id_list {
                 file_set.insert(to.to_file_path(file_id));
             }
@@ -95,7 +93,7 @@ struct ToSnapshot<'a> {
     file_paths: Vec<Path>,
     // PORT: Go `[]*collections.Set`. Each referenced map entry with the same
     // file id list shares the set, as the Go pointer does (`Arc`).
-    file_path_set: Vec<Arc<IndexSet<Path>>>,
+    file_path_set: Vec<Arc<FxIndexSet<Path>>>,
 }
 
 impl ToSnapshot<'_> {
@@ -110,7 +108,7 @@ impl ToSnapshot<'_> {
     }
 
     // Go: incremental/buildinfotosnapshot.go:66 toFilePathSet
-    fn to_file_path_set(&self, file_id_list_id: BuildInfoFileIdListId) -> Arc<IndexSet<Path>> {
+    fn to_file_path_set(&self, file_id_list_id: BuildInfoFileIdListId) -> Arc<FxIndexSet<Path>> {
         Arc::clone(&self.file_path_set[(file_id_list_id.0 - 1) as usize])
     }
 

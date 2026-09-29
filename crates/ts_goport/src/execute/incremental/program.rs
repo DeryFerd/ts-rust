@@ -452,8 +452,11 @@ impl Program {
     /// `tsc.EmitFilesAndReportErrors` without a wait: the second global
     /// diagnostics read and the emit of the affected files with `options`
     /// (`start_emit_files`). Else it does nothing. `start_check_and_emit`
-    /// (`tsc -p`) calls it, and `tsc -b` calls it when the task emits
-    /// (`BuildTask::compile_and_emit_finish`), right before
+    /// (`tsc -p`) calls it. `tsc -b` calls it right after `start_check` in
+    /// `BuildTask::compile_and_emit_start`, inside
+    /// `buffer_early_emit_writes`, so the writes wait for the task's
+    /// `compile_and_emit_finish`. In tests `tsc -b` calls it in
+    /// `BuildTask::compile_and_emit_finish`, right before
     /// `EmitAndReportStatistics`.
     pub fn start_emit(&self, options: EmitOptions) {
         debug_assert!(

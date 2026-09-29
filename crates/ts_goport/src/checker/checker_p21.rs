@@ -92,13 +92,22 @@ impl Checker {
     }
 
     // Go: checker/checker.go:18595 getCombinedNodeFlagsCached
+    // PORT: the result has no binder-added bit (`BINDER_ADDED_FLAGS`). Every
+    // caller (and `get_declaration_node_flags_from_symbol`) tests parser
+    // bits only: block scope, `CONSTANT`, `AMBIENT` and the deprecated tag.
+    // A caller that needs a binder bit uses `get_combined_node_flags`.
+    // PERF: lsshells M3 repair. The walk reads no binder data, which is a
+    // pinned read for the edited file in a language server; `narrow_type`
+    // and the discriminant checks made it one of the most frequent reads of
+    // that file.
     pub fn get_combined_node_flags_cached(&mut self, node: Node) -> NodeFlags {
         // we hold onto the last node and result to speed up repeated lookups against the same node.
         if self.last_get_combined_node_flags_node == node {
             return self.last_get_combined_node_flags_result;
         }
         self.last_get_combined_node_flags_node = node;
-        self.last_get_combined_node_flags_result = get_combined_node_flags(node);
+        self.last_get_combined_node_flags_result =
+            get_combined_parser_flags(node, PARSER_ONLY_FLAGS);
         self.last_get_combined_node_flags_result
     }
 
@@ -874,15 +883,24 @@ impl Checker {
                 self.instantiate_signatures(&declared_construct_signatures, mapper);
             index_infos = self.instantiate_index_infos(&declared_index_infos, mapper);
         }
+        // PERF: an instantiated table reuses the named members order of
+        // `declared_members` (`get_named_members_of_instantiation`) until
+        // inherited members are added to it.
+        let instantiated_from = if instantiated {
+            declared_members
+        } else {
+            SymbolTable::NIL
+        };
         let base_types = self.get_base_types_shared(source);
         if !base_types.is_empty() {
             if !instantiated {
                 // PORT: Go `maps.Clone(members)`; a nil map clones to nil.
                 members = self.symbols.clone_table(members);
             }
-            self.set_structured_type_members(
+            self.set_structured_type_members_ex(
                 t,
                 members,
+                instantiated_from,
                 &call_signatures,
                 &construct_signatures,
                 &index_infos,
@@ -930,10 +948,19 @@ impl Checker {
                     .without(ObjectFlags::UNRESOLVED_MEMBERS);
                 self.ty_mut(t).object_flags = object_flags;
             }
+            self.set_structured_type_members(
+                t,
+                members,
+                &call_signatures,
+                &construct_signatures,
+                &index_infos,
+            );
+            return;
         }
-        self.set_structured_type_members(
+        self.set_structured_type_members_ex(
             t,
             members,
+            instantiated_from,
             &call_signatures,
             &construct_signatures,
             &index_infos,

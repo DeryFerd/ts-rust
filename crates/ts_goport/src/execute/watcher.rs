@@ -780,16 +780,22 @@ impl Watcher {
         // PORT: Go passes a nil incremental host. The Rust `new_program`
         // takes a host, so the field is cleared after.
         program.host = None;
-        // PORT: Go drops the old program here. `release_program_later`
-        // stops its checker pool, which frees its checkers. Its frontend
-        // program and tables are freed after the status report below, so
-        // the free is not in the rebuild time. Its `GoProgram` and file
+        // PORT: Go drops the old program here, and its GC frees it later
+        // (watcher.go:482). `release_program_in_background` stops the old
+        // checker pool without a wait: the old checkers are freed on the
+        // pool threads while this build goes on, and the old tables with the
+        // last of them. The old frontend
+        // program is kept until after the status report below, so its free
+        // is not in the rebuild time either. Its `GoProgram` and file
         // versions stay leaked.
         let released = self
             .program
-            .replace(program)
+            .as_ref()
             .and_then(|old| old.program)
-            .map(crate::program::release_program_later);
+            .map(|_| self.get_program());
+        if let Some(old) = self.program.replace(program).and_then(|old| old.program) {
+            crate::program::release_program_in_background(old);
+        }
         self.program_ready = true;
         self.full_builds += 1;
 
@@ -905,8 +911,12 @@ impl Watcher {
             );
             // PORT: Go passes a nil incremental host (see `do_build`).
             program.host = None;
+            // PORT: Go replaces the program and its GC frees the old one
+            // later (watcher.go:567). The old checker pool stops without a
+            // wait, as in `do_build`, so the rebuild does not wait for the
+            // old checkers to be freed.
             if let Some(old) = self.program.replace(program).and_then(|old| old.program) {
-                crate::program::release_program(old);
+                crate::program::release_program_in_background(old);
             }
         }
         reused

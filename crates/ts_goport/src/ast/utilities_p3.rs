@@ -106,7 +106,7 @@ pub fn is_any_import_syntax(node: Node) -> bool {
 
 // Go: ast/utilities.go:1876 IsJsonSourceFile
 pub fn is_json_source_file(file: Node) -> bool {
-    source_file_info(file).script_kind == ScriptKind::JSON
+    with_source_file_info(file, |info| info.script_kind == ScriptKind::JSON)
 }
 
 // Go: ast/utilities.go:1880 IsInJsonFile

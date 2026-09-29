@@ -1121,7 +1121,7 @@ impl Printer {
             return false;
         }
         let line_map = self.current_line_map();
-        compute_line_of_position(line_map, pos) != compute_line_of_position(line_map, comment_pos)
+        compute_line_of_position(&line_map, pos) != compute_line_of_position(&line_map, comment_pos)
     }
 
     // Go: printer/printer.go:5562 emitLeadingCommentsOfPosition
@@ -1234,7 +1234,7 @@ impl Printer {
         }
 
         let text = source_file_text(self.current_source_file);
-        let line_map = self.current_line_map();
+        let line_map = &*self.current_line_map();
 
         let mut leading_comments: Vec<CommentRange> = Vec::new();
         if self.comments_disabled {

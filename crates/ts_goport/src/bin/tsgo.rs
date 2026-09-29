@@ -47,7 +47,7 @@ const UNPORTED_PREFIX: &str = "unported Go code";
 /// jemalloc is the global allocator (default feature `jemalloc`). A build
 /// without the feature uses glibc malloc. See `goport.rs`
 /// `set_malloc_tunables`.
-#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[cfg(all(feature = "jemalloc", not(windows)))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -83,6 +83,9 @@ fn main() {
     if let Some(code) = launch(huge_pages) {
         std::process::exit(code);
     }
+    // Unused off Linux (`launch` is Linux only).
+    #[cfg(not(target_os = "linux"))]
+    let _ = huge_pages;
     #[cfg(target_os = "linux")]
     if let Some(worker) = worker() {
         end_with_launcher(worker.launcher);
@@ -164,11 +167,11 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
 /// `thp_guard` says the run gets 4 KiB pages (`huge_pages` false).
 /// `GOPORT_LAUNCH=0` never starts a worker and `GOPORT_LAUNCH=1` always
 /// does. None when this process runs the work: it is a worker, no worker is
-/// wanted, `--lsp`, `--api` or watch mode (they end on their own), or the
-/// worker cannot start. The launcher sends SIGINT and SIGTERM on to the
-/// worker (`forward_signals`). When a signal kills the worker, the launcher
-/// ends by the same signal, so the caller sees what a run without a worker
-/// would give.
+/// wanted, `--lsp`, `--api` or watch mode (`long_running`: they end on
+/// their own), or the worker cannot start. The launcher sends SIGINT and
+/// SIGTERM on to the worker (`forward_signals`). When a signal kills the
+/// worker, the launcher ends by the same signal, so the caller sees what a
+/// run without a worker would give.
 #[cfg(target_os = "linux")]
 fn launch(huge_pages: bool) -> Option<i32> {
     use std::io::Read;
@@ -179,22 +182,12 @@ fn launch(huge_pages: bool) -> Option<i32> {
         Some(v) if v == "1" => true,
         _ => !huge_pages,
     };
-    if !wanted || worker().is_some() {
+    if !wanted || worker().is_some() || ts_goport::thp_guard::long_running() {
         return None;
     }
     let mut args = std::env::args_os();
     let program = args.next()?;
     let args: Vec<_> = args.collect();
-    // Go `getInputOptionName`: an option name has one or two leading '-'.
-    let watch = |a: &std::ffi::OsString| {
-        a.to_str()
-            .and_then(|a| a.strip_prefix('-'))
-            .map(|a| a.strip_prefix('-').unwrap_or(a))
-            .is_some_and(|a| a.eq_ignore_ascii_case("watch") || a.eq_ignore_ascii_case("w"))
-    };
-    if args.first().is_some_and(|a| a == "--lsp" || a == "--api") || args.iter().any(watch) {
-        return None;
-    }
     let exe = std::env::current_exe().ok()?;
     // `read` keeps its close-on-exec flag, so the worker gets only `write`,
     // at the same number. The worker's copy has no close-on-exec flag: it

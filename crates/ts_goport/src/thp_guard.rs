@@ -16,7 +16,11 @@
 //!   in 2 MiB blocks.
 //! - Else a watcher thread reads the free memory every `POLL` and turns THP
 //!   off the first time it drops below the limit. The huge pages that the
-//!   run faulted before stay. The flag changes only the later faults.
+//!   run faulted before stay. The flag changes only the later faults. A
+//!   process that lives on after its first build (`long_running`: watch
+//!   mode, `--lsp`, `--api`) starts no watcher. Its polls cost CPU on every
+//!   edit for up to `WATCH_FOR` (dropin1 diag: 9 to 22 ms per edit window),
+//!   and an LSP server builds nothing until a request comes.
 //!
 //! The limit is low (`DEFAULT_MIN_FREE_MIB`) because a run that finds
 //! enough free 2 MiB blocks is faster with THP. perf13 on dbook, with only
@@ -56,9 +60,8 @@ const DEFAULT_MIN_FREE_MIB: u64 = 64;
 /// fire that far above zero to beat the first compaction stall.
 const POLL: Duration = Duration::from_millis(5);
 
-/// The watcher stops after this time, so a long `--lsp` or `--watch`
-/// process does not read the memory for its whole life. The longest run of
-/// the perf13 grid took 1.2 s.
+/// The watcher stops after this time, so a long run does not read the
+/// memory for its whole life. The longest run of the perf13 grid took 1.2 s.
 const WATCH_FOR: Duration = Duration::from_secs(60);
 
 /// The buffer for `/proc/buddyinfo`: about 110 bytes per zone, so room for
@@ -76,8 +79,8 @@ const PAGE_BYTES: u64 = 4096;
 /// Call first in `main`, before the first heap allocation: jemalloc maps
 /// and touches its first memory at that allocation. The start check
 /// allocates nothing (stack buffers only). Setting a `GOPORT_THP_GUARD*`
-/// variable allocates its value first. The watcher thread start allocates,
-/// after the start check.
+/// variable allocates its value first. The `long_running` check and the
+/// watcher thread start allocate, after the start check.
 ///
 /// Checks, in order, and stops at the first that says to keep THP:
 /// 1. `GOPORT_THP_GUARD` (see the module comment).
@@ -88,7 +91,7 @@ const PAGE_BYTES: u64 = 4096;
 ///    (`start_step`).
 /// 4. `/proc/buddyinfo`: the free memory in blocks of 2 MiB or more, in
 ///    all nodes and zones, against the limit. Below it, THP goes off. Else
-///    the watcher starts (`watch`).
+///    the watcher starts (`watch`), unless the process is `long_running`.
 ///
 /// A file that cannot be read keeps THP on and starts no watcher. The flag
 /// stays set for the whole process and its children.
@@ -150,17 +153,24 @@ pub fn thp_guard() -> bool {
         let min_free = min_free_mib.saturating_mul(1 << 20);
         let step = start_step(enabled, defrag, free, min_free);
         let failed = step == Start::Off && set_thp_disable(true).is_err();
-        let watching = step == Start::Watch && watcher && start_watcher(min_free, debug);
+        let no_watcher = step == Start::Watch && watcher && long_running();
+        let watching =
+            step == Start::Watch && watcher && !no_watcher && start_watcher(min_free, debug);
         say(
             debug,
             format_args!(
-                "THP {} (enabled {}, defrag {}, {} MiB free in 2 MiB blocks, limit {min_free_mib} MiB{}{})",
+                "THP {} (enabled {}, defrag {}, {} MiB free in 2 MiB blocks, limit {min_free_mib} MiB{}{}{})",
                 if step == Start::Off { "off" } else { "kept" },
                 selected_mode(enabled).unwrap_or("?"),
                 selected_mode(defrag).unwrap_or("?"),
                 free >> 20,
                 if failed { ", prctl failed" } else { "" },
                 if watching { ", watcher started" } else { "" },
+                if no_watcher {
+                    ", no watcher: watch, LSP or API mode"
+                } else {
+                    ""
+                },
             ),
         );
         match step {
@@ -171,6 +181,27 @@ pub fn thp_guard() -> bool {
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     true
+}
+
+/// Whether this process lives on after its first build, so `thp_guard`
+/// starts no watcher and `bin/tsgo.rs` `launch` starts no worker: `--lsp` or
+/// `--api` as the first argument (Go cmd/tsgo `runMain`), or a watch option
+/// anywhere (`--watch` or `-w`; Go `getInputOptionName`: one or two leading
+/// '-', any case). It reads the process arguments, so it allocates.
+pub fn long_running() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    let watch = |a: &std::ffi::OsString| {
+        a.to_str()
+            .and_then(|a| a.strip_prefix('-'))
+            .map(|a| a.strip_prefix('-').unwrap_or(a))
+            .is_some_and(|a| a.eq_ignore_ascii_case("watch") || a.eq_ignore_ascii_case("w"))
+    };
+    match args.next() {
+        None => false,
+        Some(first) => {
+            first == "--lsp" || first == "--api" || watch(&first) || args.any(|a| watch(&a))
+        }
+    }
 }
 
 /// Prints `args` as one `goport thp_guard:` line on stderr when `debug`.

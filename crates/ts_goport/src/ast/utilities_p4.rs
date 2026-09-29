@@ -35,16 +35,16 @@ pub fn is_require_variable_statement(node: Node) -> bool {
 pub fn get_jsx_implicit_import_base(compiler_options: &CompilerOptions, file: Node) -> String {
     let jsx_import_source_pragma = get_pragma_from_source_file(file, "jsximportsource");
     let jsx_runtime_pragma = get_pragma_from_source_file(file, "jsxruntime");
-    if get_pragma_argument(jsx_runtime_pragma, "factory") == "classic" {
+    if get_pragma_argument(jsx_runtime_pragma.as_deref(), "factory") == "classic" {
         return String::new();
     }
     if compiler_options.jsx == JsxEmit::REACT_JSX
         || compiler_options.jsx == JsxEmit::REACT_JSX_DEV
         || !compiler_options.jsx_import_source.is_empty()
         || jsx_import_source_pragma.is_some()
-        || get_pragma_argument(jsx_runtime_pragma, "factory") == "automatic"
+        || get_pragma_argument(jsx_runtime_pragma.as_deref(), "factory") == "automatic"
     {
-        let mut result = get_pragma_argument(jsx_import_source_pragma, "factory");
+        let mut result = get_pragma_argument(jsx_import_source_pragma.as_deref(), "factory");
         if result.is_empty() {
             result = compiler_options.jsx_import_source.clone();
         }
@@ -73,19 +73,27 @@ pub fn get_jsx_runtime_import(base: &str, options: &CompilerOptions) -> String {
 }
 
 // Go: ast/utilities.go:2782 GetPragmaFromSourceFile
-// PORT: Go `*Pragma` (nil when absent) -> `Option<&'static Pragma>`, pointing
-// into `source_file_info(file).pragmas`.
-pub fn get_pragma_from_source_file(file: Node, name: &str) -> Option<&'static Pragma> {
-    let mut result: Option<&'static Pragma> = None;
-    if file.is_some() {
-        let pragmas: &'static [Pragma] = &source_file_info(file).pragmas;
-        for pragma in pragmas {
-            if pragma.name == name {
-                result = Some(pragma); // Last one wins
-            }
-        }
+// PORT: Go `*Pragma` (nil when absent) -> `Option<FileRef<Pragma>>`, a guard
+// on an entry of `source_file_info(file).pragmas`. Pass it to
+// `get_pragma_argument` with `as_deref()`.
+pub fn get_pragma_from_source_file(file: Node, name: &str) -> Option<FileRef<Pragma>> {
+    if file.is_nil() {
+        return None;
     }
-    result
+    let info = source_file_info(file);
+    // Last one wins.
+    let index = info
+        .pragmas
+        .iter()
+        .rposition(|pragma| pragma.name == name)?;
+    Some(match info {
+        FileRef::Static(info) => FileRef::Static(&info.pragmas[index]),
+        FileRef::Pinned { version, .. } => FileRef::Pinned {
+            version,
+            key: index,
+            get: |version, index| &version.go_file().info.pragmas[index],
+        },
+    })
 }
 
 // Go: ast/utilities.go:2794 GetPragmaArgument
@@ -183,8 +191,12 @@ pub fn is_module_exports_qualified_name(node: Node) -> bool {
 
 // Go: ast/utilities.go:2863 IsCheckJSEnabledForFile
 pub fn is_check_js_enabled_for_file(source_file: Node, compiler_options: &CompilerOptions) -> bool {
-    if let Some(directive) = &source_file_info(source_file).check_js_directive {
-        return directive.enabled;
+    if let Some(enabled) = with_source_file_info(source_file, |info| {
+        info.check_js_directive
+            .as_ref()
+            .map(|directive| directive.enabled)
+    }) {
+        return enabled;
     }
     compiler_options.check_js == Tristate::True
 }
@@ -192,9 +204,10 @@ pub fn is_check_js_enabled_for_file(source_file: Node, compiler_options: &Compil
 // Go: ast/utilities.go:2870 IsPlainJSFile
 pub fn is_plain_js_file(file: Node, check_js: Tristate) -> bool {
     file.is_some()
-        && (source_file_info(file).script_kind == ScriptKind::JS
-            || source_file_info(file).script_kind == ScriptKind::JSX)
-        && source_file_info(file).check_js_directive.is_none()
+        && with_source_file_info(file, |info| {
+            (info.script_kind == ScriptKind::JS || info.script_kind == ScriptKind::JSX)
+                && info.check_js_directive.is_none()
+        })
         && check_js == Tristate::Unknown
 }
 

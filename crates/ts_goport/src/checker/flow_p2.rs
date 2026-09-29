@@ -165,7 +165,7 @@ impl Checker {
     pub fn get_type_at_switch_clause(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow_node: &'static FlowNode,
+        flow_node: &FlowNode,
     ) -> FlowType {
         let data = flow_node.as_flow_switch_clause_data();
         let expr = skip_parentheses(data.switch_statement.expression());
@@ -482,7 +482,9 @@ impl Checker {
         let mut seen_incomplete = false;
         let mut bypass_flow = FlowNodeId::NIL;
         for &antecedent in antecedents {
-            let antecedent_node = antecedent.get_flow();
+            // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            let mut antecedent_node_guard = None;
+            let antecedent_node = antecedent.get_flow_in(&mut antecedent_node_guard);
             if bypass_flow.is_nil()
                 && antecedent_node.flags.intersects(FlowFlags::SWITCH_CLAUSE)
                 && antecedent_node.as_flow_switch_clause_data().is_empty()
@@ -609,7 +611,7 @@ impl Checker {
         &mut self,
         f: &Rc<RefCell<FlowState>>,
         flow: FlowNodeId,
-        flow_data: &'static FlowNode,
+        flow_data: &FlowNode,
     ) -> FlowType {
         if f.borrow().ref_key.is_zero() {
             let ref_key = self.get_flow_reference_key(f);
@@ -747,7 +749,7 @@ impl Checker {
     pub fn get_type_at_flow_array_mutation(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
-        flow_node: &'static FlowNode,
+        flow_node: &FlowNode,
     ) -> FlowType {
         let declared_type = f.borrow().declared_type;
         if declared_type == self.auto_type || declared_type == self.auto_array_type {
@@ -1150,7 +1152,26 @@ impl Checker {
                     || target_kind == SyntaxKind::BindingElement
                 {
                     let export_symbol = self.memo_export_symbol(source);
-                    return export_symbol == self.get_symbol_of_declaration(target);
+                    // PERF: Go `getSymbolOfDeclaration(target)` without its
+                    // `getLateBoundSymbol` step, which returns its argument
+                    // here: the binder symbol of a variable or binding
+                    // element has an identifier name, never the internal
+                    // computed name. So the symbol is not read.
+                    let symbol = target.symbol();
+                    debug_assert_eq!(
+                        symbol,
+                        if symbol.is_some() {
+                            self.get_late_bound_symbol(symbol)
+                        } else {
+                            symbol
+                        }
+                    );
+                    let declared = if symbol.is_some() {
+                        self.get_merged_symbol(symbol)
+                    } else {
+                        SymbolId::NIL
+                    };
+                    return export_symbol == declared;
                 }
                 return false;
             }

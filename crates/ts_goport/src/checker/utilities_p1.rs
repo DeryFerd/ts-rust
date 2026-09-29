@@ -741,14 +741,14 @@ pub(crate) struct SymbolSortKey {
     /// same sign: `file_index` difference for different files, `pos`
     /// difference in one file. Equal orders (same declaration, or the same
     /// position) fall through to the full comparator.
-    order: u64,
+    pub(crate) order: u64,
     /// Its text is read only when the declarations tie.
     name: Name,
 }
 
 /// `SymbolSortKey::order` when the packed order does not apply. A real
 /// order is below 2^63.
-const NO_SORT_ORDER: u64 = u64::MAX;
+pub(crate) const NO_SORT_ORDER: u64 = u64::MAX;
 
 // PORT: Go `strings.Compare` (byte order, returns -1/0/1). It compares the
 // Go bytes, so lone surrogates and the internal symbol name prefix sort as in
