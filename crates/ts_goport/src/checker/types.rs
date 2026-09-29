@@ -328,8 +328,9 @@ fn checker_arena() -> &'static bumpalo::Bump {
     CHECKER_ARENA.with(|arena| *arena)
 }
 
-// PORT: Go `TypeFormatFlagsNodeBuilderFlagsMask` is an untyped constant
-// outside the generated `TypeFormatFlags` block.
+// PORT: Go `TypeFormatFlagsNodeBuilderFlagsMask` is the last constant of the
+// `TypeFormatFlags` block (ts#63911). `flags.rs` has only the single-bit
+// values, so the mask stays here.
 impl TypeFormatFlags {
     pub const NODE_BUILDER_FLAGS_MASK: Self = Self(
         Self::NO_TRUNCATION.0
