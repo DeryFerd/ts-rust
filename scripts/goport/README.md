@@ -50,9 +50,11 @@ drive is retired.
    `target/worktrees/checker-port`. A goport batch may change every path except
    `docs/typechecker-state`, `docs/typechecker-batches`, `target/` and the protected paths
    (`open_revision.py --protected`: the tools, runners, oracles, baseline and rules that judge the
-   protected set, `remote.sh`, and every script that `gate.sh` and `bound2.sh` run from the
-   repository, which it reads from their text). The check fails when the branch changes a protected
-   path since its merge base with `main`, unless the batch lists that exact path (with Theo's approval).
+   protected set, `remote.sh`, `UPSTREAM.json` (the oracle and Go checkout of each pin),
+   `scripts/run-cargo-capped.sh` (it builds the test and release bins and runs clippy), and every
+   script that `gate.sh` and `bound2.sh` run from the repository, which it reads from their text).
+   The check fails when the branch changes a protected path since its merge base with `main`,
+   unless the batch lists that exact path (with Theo's approval).
 2. `candidate.sh open <rev> <branch> --hypothesis TEXT --change TEXT --new-batch <id> --origin TEXT`:
    applies the branch to the checkout in one commit and records the revision (`open_revision.py`,
    the only state write). Leave out `--new-batch` for a later revision of an open batch. Then commit

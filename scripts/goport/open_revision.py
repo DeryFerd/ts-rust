@@ -23,7 +23,7 @@ Usage:
 Writes through scripts/state (export, then import). --dry-run runs the checks and prints the new
 history row, but writes nothing. Run from the repository root.
 """
-import argparse, copy, datetime, hashlib, json, os, re, subprocess, sys
+import argparse, copy, datetime, hashlib, json, os, re, subprocess, sys, tempfile
 
 GOPORT_RULE = 'goport-protected-set'
 KEEP = ['checkout', 'writerOutputDirectory', 'phase', 'implementer', 'carryForward', 'openDefects']
@@ -46,7 +46,10 @@ def runner_scripts():
 
 # Paths that judge the protected set: the check and state tools, the pipeline, the runners, the
 # compare tools, the gate, its stage scripts and its allow list, remote.sh (it copies the scripts and
-# bins that the gate and the oracles run on a host), the oracles, the baseline and the rules. A candidate
+# bins that the gate and the oracles run on a host), the oracles, the baseline and the rules. Also
+# UPSTREAM.json (for each pin, the oracle binary and sha256 and the Go checkout that pin.py binds for
+# the gate, the oracles and the Go baselines of goport-tests.sh) and run-cargo-capped.sh (it builds the
+# test and release bins and runs clippy for the quality record). A candidate
 # that edits one would be judged by the edited copy after its merge, so a loss could pass in two steps.
 # candidate.sh check fails when the candidate branch changes one (git diff from its merge base with
 # main), unless the batch's allowedChangedFiles lists that exact path (a batch that must change a
@@ -54,6 +57,7 @@ def runner_scripts():
 PROTECTED = list(dict.fromkeys([
     'AGENTS.md', 'docs/typechecker-accountability.md', 'docs/goport-protected/**',
     'scripts/check-typechecker-batch.mjs', 'scripts/state.mjs', 'scripts/state', 'scripts/upstream/pin.py',
+    'UPSTREAM.json', 'scripts/run-cargo-capped.sh',
     *(f'scripts/goport/{f}' for f in ('candidate.sh', 'open_revision.py', 'accept_revision.py', 'fp.py',
                                       'build-goport-tests.sh', 'goport-tests.sh', 'compare-tests.py',
                                       'gate.sh', 'gate-allow.txt', 'gate-compare.py', 'ls_edit_bench.py',
@@ -231,10 +235,11 @@ def main():
     if record:
         with open(record, 'xb') as f:
             f.write(text)
-    tmp = f'/tmp/open-revision-{a.revision}.json'
-    with open(tmp, 'w') as f:
+    # A temp file of its own, so two runs at the same time do not write one file.
+    with tempfile.NamedTemporaryFile('w', prefix=f'open-revision-{a.revision}-', suffix='.json') as f:
         json.dump(s, f)
-    subprocess.check_call(['node', 'scripts/state.mjs', 'import', tmp])
+        f.flush()
+        subprocess.check_call(['node', 'scripts/state.mjs', 'import', f.name])
 
 
 if __name__ == '__main__':

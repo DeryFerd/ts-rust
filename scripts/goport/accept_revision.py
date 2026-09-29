@@ -18,7 +18,7 @@ Usage:
 Run from the repository root. --extra is a JSON object merged into the batch (e.g. cliAudit).
 --profile names the cargo profile of the bound runs (release for correctness evidence).
 """
-import argparse, datetime, glob, hashlib, json, os, re, subprocess, sys
+import argparse, datetime, glob, hashlib, json, os, re, subprocess, sys, tempfile
 
 ROOT = os.getcwd()  # the repository root (run from there)
 AUDITOR = 'aae6dbb734c07335a'
@@ -69,10 +69,12 @@ def export():
 
 
 def put(state, tag):
-    tmp = f'/tmp/accept-{tag}.json'
-    with open(tmp, 'w') as f:
+    """Imports state through scripts/state.mjs. Each call writes a temp file of its own, so two runs at
+    the same time (parallel sims) do not corrupt each other's import."""
+    with tempfile.NamedTemporaryFile('w', prefix=f'accept-{tag}-', suffix='.json') as f:
         json.dump(state, f)
-    subprocess.check_call(['node', 'scripts/state.mjs', 'import', tmp])
+        f.flush()
+        subprocess.check_call(['node', 'scripts/state.mjs', 'import', f.name])
 
 
 def main():
