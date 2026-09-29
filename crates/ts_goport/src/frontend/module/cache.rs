@@ -344,7 +344,7 @@ mod tests {
             module_resolution: ModuleResolutionKind::BUNDLER,
             ..Default::default()
         });
-        let mut resolver = new_resolver(host, options, "", "");
+        let mut resolver = new_resolver(host, options, "", "", Vec::new());
         resolver.caches.shared = shared;
         resolver
     }

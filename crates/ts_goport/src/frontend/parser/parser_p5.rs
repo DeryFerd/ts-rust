@@ -59,7 +59,7 @@ impl Parser {
                 {
                     self.re_scan_template_token(false /*isTaggedTemplate*/);
                 }
-                return self.parse_literal_expression(false /*intern*/);
+                return self.parse_literal_expression();
             }
             SyntaxKind::ThisKeyword
             | SyntaxKind::SuperKeyword
@@ -99,7 +99,7 @@ impl Parser {
             }
             SyntaxKind::SlashToken | SyntaxKind::SlashEqualsToken => {
                 if self.re_scan_slash_token() == SyntaxKind::RegularExpressionLiteral {
-                    return self.parse_literal_expression(false /*intern*/);
+                    return self.parse_literal_expression();
                 }
             }
             SyntaxKind::TemplateHead => {
@@ -449,8 +449,7 @@ impl Parser {
     }
 
     // Go: parser/parser.go:5790 parseLiteralExpression
-    // PORT: `intern` only calls `internIdentifier` in Go (not kept, see there).
-    pub fn parse_literal_expression(&mut self, _intern: bool) -> Node {
+    pub fn parse_literal_expression(&mut self) -> Node {
         let pos = self.node_pos();
         let text = self.scanner.token_value();
         let token_flags = self.scanner.token_flags();
@@ -605,13 +604,6 @@ impl Parser {
         }
         self.create_missing_identifier()
     }
-
-    // Go: parser/parser.go:5901 internIdentifier
-    // PORT: not ported. Go returns the interned string, which equals the
-    // text, and adds it to `p.identifiers` (`SourceFile.Identifiers`). Rust
-    // node data owns its text, and nothing reads the parser's set: the
-    // printer rebuilds `SourceFile.Identifiers` from the tree
-    // (`printer::utilities::source_file_identifiers`). Callers skip the call.
 
     // Go: parser/parser.go:5913 newNodeList
     // PORT: Go sets `list.Loc` after `NewNodeList`. Rust lists are immutable

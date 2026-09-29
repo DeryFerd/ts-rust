@@ -823,29 +823,37 @@ impl Checker {
         result
     }
 
-    // Go: checker/jsx.go:1453 getJsxNamespaceContainerForImplicitImport
+    // Go: checker/jsx.go:1454 getJsxNamespaceContainerForImplicitImport
     pub fn get_jsx_namespace_container_for_implicit_import(&mut self, location: Node) -> SymbolId {
-        // PORT: Go `links` is nil only when `location` or its file is nil.
-        let mut file = Node::NIL;
-        let mut has_links = false;
-        if location.is_some() {
-            file = get_source_file_of_node(location);
-            if file.is_some() {
-                has_links = true;
-            }
+        let file = get_source_file_of_node(location);
+        let container = self
+            .jsx_element_links
+            .get(file)
+            .jsx_implicit_import_container;
+        if container.is_some() {
+            return if container == self.unknown_symbol {
+                SymbolId::NIL
+            } else {
+                container
+            };
         }
-        if has_links {
-            let container = self
-                .jsx_element_links
-                .get(file)
-                .jsx_implicit_import_container;
-            if container.is_some() {
-                return if container == self.unknown_symbol {
-                    SymbolId::NIL
-                } else {
-                    container
-                };
+        let mut canonical_error_tag = self.jsx_element_links.get(file).first_jsx_tag_in_file;
+        if canonical_error_tag.is_nil() {
+            fn visit(node: Node, first_jsx_tag_in_file: &mut Node) -> bool {
+                if is_jsx_element(node) || is_jsx_self_closing_element(node) {
+                    *first_jsx_tag_in_file = node;
+                    return true;
+                }
+                if is_jsx_fragment(node) {
+                    *first_jsx_tag_in_file = node.opening_fragment(); // to match strada, fragments issue errors on the opening fragment instead of the whole tag
+                    return true;
+                }
+                node.for_each_child(|child| visit(child, first_jsx_tag_in_file))
             }
+            let mut first_jsx_tag_in_file = Node::NIL;
+            file.for_each_child(|child| visit(child, &mut first_jsx_tag_in_file));
+            self.jsx_element_links.get(file).first_jsx_tag_in_file = first_jsx_tag_in_file;
+            canonical_error_tag = first_jsx_tag_in_file;
         }
         let (module_reference, specifier) = self.get_jsx_runtime_import_specifier(file);
         if module_reference.is_empty() {
@@ -855,13 +863,13 @@ impl Checker {
         let module_location = if specifier.is_some() {
             specifier
         } else {
-            location
+            canonical_error_tag
         };
         let mod_ = self.resolve_external_module(
             module_location,
             &module_reference,
             Some(error_message),
-            location,
+            canonical_error_tag,
             false,
         );
         let mut result = SymbolId::NIL;
@@ -869,16 +877,14 @@ impl Checker {
             let resolved = self.resolve_symbol(mod_);
             result = self.get_merged_symbol(resolved);
         }
-        if has_links {
-            let container = if result.is_some() {
-                result
-            } else {
-                self.unknown_symbol
-            };
-            self.jsx_element_links
-                .get(file)
-                .jsx_implicit_import_container = container;
-        }
+        let container = if result.is_some() {
+            result
+        } else {
+            self.unknown_symbol
+        };
+        self.jsx_element_links
+            .get(file)
+            .jsx_implicit_import_container = container;
         result
     }
 

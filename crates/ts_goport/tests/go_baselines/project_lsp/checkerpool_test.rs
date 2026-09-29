@@ -69,7 +69,10 @@ fn setup_checker_pool_session(opts: CheckerPoolOptions) -> (Rc<Session>, Rc<Chec
         client: None,
         logger: Some(logger),
         npm_executor: None,
+        spawner: None,
+        content_mapper_logger: None,
         parse_cache: None,
+        content_mapped_parse_cache: None,
     });
     open(
         &session,

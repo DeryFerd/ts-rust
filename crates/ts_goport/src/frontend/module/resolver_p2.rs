@@ -94,6 +94,8 @@ impl ResolutionState<'_> {
             resolved_module.original_path = resolved.original_path;
             resolved_module.is_external_library_import = is_external_library_import;
             resolved_module.resolved_using_ts_extension = resolved.resolved_using_ts_extension;
+            resolved_module.resolved_using_extra_extensions =
+                resolved.resolved_using_extra_extensions;
             resolved_module.extension = resolved.extension;
             resolved_module.package_id = resolved.package_id;
         }
@@ -479,7 +481,12 @@ impl ResolutionState<'_> {
         let mut extensionless = remove_file_extension(candidate);
         if extensionless == candidate {
             // Once TS native extensions are handled, handle arbitrary extensions for declaration file mapping
-            extensionless = &candidate[..candidate.rfind('.').unwrap()];
+            let mut extension =
+                get_longest_extension_from_path(candidate, &self.resolver.extra_extensions, false);
+            if extension.is_empty() {
+                extension = candidate[candidate.rfind('.').unwrap()..].to_string();
+            }
+            extensionless = remove_extension(candidate, &extension);
         }
 
         let extension = &candidate[extensionless.len()..];
@@ -637,6 +644,19 @@ impl ResolutionState<'_> {
                 continue_searching()
             }
             _ => {
+                if self
+                    .resolver
+                    .extra_extensions
+                    .iter()
+                    .any(|e| e == original_extension)
+                {
+                    // A fully specified import of an extraExtension resolves directly to the file.
+                    let resolved = self.try_extension(original_extension, extensionless, false);
+                    if let Some(mut resolved) = resolved {
+                        resolved.resolved_using_extra_extensions = true;
+                        return Some(resolved);
+                    }
+                }
                 if extensions.intersects(Extensions::DECLARATION)
                     && !is_declaration_file_name(&format!("{extensionless}{original_extension}"))
                 {
@@ -1544,6 +1564,7 @@ pub fn resolve_config(
         }),
         "",
         "",
+        Vec::new(),
     );
     resolver.resolve_config(module_name, containing_file)
 }

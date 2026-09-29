@@ -6,6 +6,8 @@
 
 use crate::ls::prelude::*;
 
+use crate::spanmap::Feature;
+
 impl LanguageService {
     // Go: ls/documenthighlights.go:18 ProvideDocumentHighlights
     pub fn provide_document_highlights(
@@ -46,7 +48,7 @@ impl LanguageService {
         )
     }
 
-    // Go: ls/documenthighlights.go:39 provideDocumentHighlightsWorker
+    // Go: ls/documenthighlights.go:40 provideDocumentHighlightsWorker
     pub fn provide_document_highlights_worker(
         &self,
         ctx: &Context,
@@ -55,9 +57,39 @@ impl LanguageService {
         files_to_search: &[lsproto::DocumentUri],
     ) -> Result<lsproto::MultiDocumentHighlightsOrNull, GoError> {
         let (program, source_file) = self.get_program_and_file(document_uri);
-        let position = self
-            .converters
-            .line_and_character_to_position(&source_file, &document_position);
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            source_file,
+            document_position,
+            Feature::DOCUMENT_HIGHLIGHTS,
+        );
+        let mut results: Vec<lsproto::MultiDocumentHighlightsOrNull> =
+            Vec::with_capacity(positions.len());
+        for mapped in positions {
+            if mapped.fidelity.is_single_segment() {
+                results.push(self.provide_document_highlights_at_position(
+                    ctx,
+                    document_uri,
+                    mapped.position,
+                    program,
+                    mapped.script,
+                    files_to_search,
+                ));
+            }
+        }
+        Ok(combine_multi_document_highlights(results))
+    }
+
+    // Go: ls/documenthighlights.go:52 provideDocumentHighlightsAtPosition
+    pub fn provide_document_highlights_at_position(
+        &self,
+        ctx: &Context,
+        document_uri: &lsproto::DocumentUri,
+        position: i32,
+        program: &compiler::NewProgram,
+        source_file: Node,
+        files_to_search: &[lsproto::DocumentUri],
+    ) -> lsproto::MultiDocumentHighlightsOrNull {
         let node = astnav::get_touching_property_name(source_file, position);
 
         // Cheap JSX check before resolving files to search.
@@ -75,24 +107,38 @@ impl LanguageService {
             let mut highlights: Vec<lsproto::DocumentHighlight> = Vec::new();
             let kind = lsproto::DocumentHighlightKind::READ;
             if opening_element.is_some() {
-                highlights.push(lsproto::DocumentHighlight {
-                    range: self.create_lsp_range_from_node(opening_element, source_file),
-                    kind: Some(kind),
-                });
+                let (lsp_range, fidelity) = self.create_lsp_range_from_node_for_feature(
+                    opening_element,
+                    source_file,
+                    Feature::DOCUMENT_HIGHLIGHTS,
+                );
+                if !fidelity.is_none() {
+                    highlights.push(lsproto::DocumentHighlight {
+                        range: lsp_range,
+                        kind: Some(kind),
+                    });
+                }
             }
             if closing_element.is_some() {
-                highlights.push(lsproto::DocumentHighlight {
-                    range: self.create_lsp_range_from_node(closing_element, source_file),
-                    kind: Some(kind),
-                });
+                let (lsp_range, fidelity) = self.create_lsp_range_from_node_for_feature(
+                    closing_element,
+                    source_file,
+                    Feature::DOCUMENT_HIGHLIGHTS,
+                );
+                if !fidelity.is_none() {
+                    highlights.push(lsproto::DocumentHighlight {
+                        range: lsp_range,
+                        kind: Some(kind),
+                    });
+                }
             }
             let multi_highlights = vec![lsproto::MultiDocumentHighlight {
                 uri: document_uri.clone(),
                 highlights,
             }];
-            return Ok(lsproto::MultiDocumentHighlightsOrNull {
+            return lsproto::MultiDocumentHighlightsOrNull {
                 multi_document_highlights: Some(multi_highlights),
-            });
+            };
         }
 
         // Resolve the source files to search, deduplicating by file name.
@@ -126,12 +172,53 @@ impl LanguageService {
                 }];
             }
         }
-        Ok(lsproto::MultiDocumentHighlightsOrNull {
+        lsproto::MultiDocumentHighlightsOrNull {
             multi_document_highlights: Some(multi_highlights),
-        })
+        }
     }
+}
 
-    // Go: ls/documenthighlights.go:102 getSemanticDocumentHighlights
+// Go: ls/documenthighlights.go:111 combineMultiDocumentHighlights
+// PORT: Go keeps pointers to the combined documents in `byURI` and appends
+// through them; here `by_uri` holds the index into `combined_documents`.
+// Go map order is not used for output.
+pub fn combine_multi_document_highlights(
+    results: Vec<lsproto::MultiDocumentHighlightsOrNull>,
+) -> lsproto::MultiDocumentHighlightsOrNull {
+    let mut by_uri: FxHashMap<lsproto::DocumentUri, usize> = FxHashMap::default();
+    let mut seen: FxHashMap<lsproto::DocumentUri, FxHashSet<lsproto::Range>> = FxHashMap::default();
+    let mut combined_documents: Vec<lsproto::MultiDocumentHighlight> = Vec::new();
+    for result in results {
+        let Some(documents) = result.multi_document_highlights else {
+            continue;
+        };
+        for document in documents {
+            let index = match by_uri.get(&document.uri) {
+                Some(&index) => index,
+                None => {
+                    by_uri.insert(document.uri.clone(), combined_documents.len());
+                    combined_documents.push(lsproto::MultiDocumentHighlight {
+                        uri: document.uri.clone(),
+                        ..Default::default()
+                    });
+                    combined_documents.len() - 1
+                }
+            };
+            let ranges = seen.entry(document.uri.clone()).or_default();
+            for highlight in document.highlights {
+                if ranges.insert(highlight.range) {
+                    combined_documents[index].highlights.push(highlight);
+                }
+            }
+        }
+    }
+    lsproto::MultiDocumentHighlightsOrNull {
+        multi_document_highlights: Some(combined_documents),
+    }
+}
+
+impl LanguageService {
+    // Go: ls/documenthighlights.go:138 getSemanticDocumentHighlights
     pub fn get_semantic_document_highlights(
         &self,
         ctx: &Context,
@@ -165,6 +252,9 @@ impl LanguageService {
             let references = entry.borrow().references.clone();
             for ref_ in &references {
                 let (file_name, highlight) = self.to_document_highlight(ref_);
+                let Some(highlight) = highlight else {
+                    continue;
+                };
                 file_highlights
                     .entry(file_name)
                     .or_default()
@@ -174,9 +264,10 @@ impl LanguageService {
 
         let mut result: Vec<lsproto::MultiDocumentHighlight> = Vec::new();
         for &sf in source_files {
-            if let Some(highlights) = file_highlights.get(source_file_file_name(sf)) {
+            let file_name = source_file_original_file_name(sf);
+            if let Some(highlights) = file_highlights.get(file_name) {
                 result.push(lsproto::MultiDocumentHighlight {
-                    uri: lsconv::file_name_to_document_uri(source_file_file_name(sf)),
+                    uri: lsconv::file_name_to_document_uri(file_name),
                     highlights: highlights.clone(),
                 });
             }
@@ -184,27 +275,33 @@ impl LanguageService {
         result
     }
 
-    // Go: ls/documenthighlights.go:130 toDocumentHighlight
+    // Go: ls/documenthighlights.go:170 toDocumentHighlight
+    // PORT: Go returns `*lsproto.DocumentHighlight`; nil is `None`.
     pub fn to_document_highlight(
         &self,
         entry: &Rc<RefCell<ReferenceEntry>>,
-    ) -> (String, lsproto::DocumentHighlight) {
+    ) -> (String, Option<lsproto::DocumentHighlight>) {
         let entry = self.resolve_entry(entry);
+        let file_name = source_file_original_file_name(entry.borrow().source_file).to_string();
 
         let mut kind = lsproto::DocumentHighlightKind::READ;
-        // PORT: copy the fields out; `get_range_of_entry` borrows the entry.
+        let (lsp_range, ok) =
+            self.get_range_of_entry_for_feature(&entry, Feature::DOCUMENT_HIGHLIGHTS);
+        if !ok {
+            return (file_name, None);
+        }
+        // PORT: copy the fields out; the entry is borrowed only here.
         let (entry_kind, entry_node) = {
             let e = entry.borrow();
             (e.kind, e.node)
         };
         if entry_kind == EntryKind::RANGE {
-            let file_name = entry.borrow().file_name.clone();
             return (
                 file_name,
-                lsproto::DocumentHighlight {
-                    range: self.get_range_of_entry(&entry),
+                Some(lsproto::DocumentHighlight {
+                    range: lsp_range,
                     kind: Some(kind),
-                },
+                }),
             );
         }
 
@@ -214,12 +311,11 @@ impl LanguageService {
         }
 
         let dh = lsproto::DocumentHighlight {
-            range: self.get_range_of_entry(&entry),
+            range: lsp_range,
             kind: Some(kind),
         };
 
-        let file_name = entry.borrow().file_name.clone();
-        (file_name, dh)
+        (file_name, Some(dh))
     }
 
     // Go: ls/documenthighlights.go:154 getSyntacticDocumentHighlights
@@ -357,10 +453,17 @@ impl LanguageService {
         let kind = lsproto::DocumentHighlightKind::READ;
         for &node in nodes {
             if node.is_some() {
-                highlights.push(lsproto::DocumentHighlight {
-                    range: self.create_lsp_range_from_node(node, source_file),
-                    kind: Some(kind),
-                });
+                let (lsp_range, fidelity) = self.create_lsp_range_from_node_for_feature(
+                    node,
+                    source_file,
+                    Feature::DOCUMENT_HIGHLIGHTS,
+                );
+                if !fidelity.is_none() {
+                    highlights.push(lsproto::DocumentHighlight {
+                        range: lsp_range,
+                        kind: Some(kind),
+                    });
+                }
             }
         }
         highlights
@@ -443,24 +546,34 @@ impl LanguageService {
                     j -= 1;
                 }
                 if should_combine {
-                    highlights.push(lsproto::DocumentHighlight {
-                        range: self.create_lsp_range_from_bounds(
-                            skip_trivia(source_file_text(source_file), else_keyword.pos()),
-                            if_keyword.end(),
-                            source_file,
-                        ),
-                        kind: Some(kind),
-                    });
+                    let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(
+                        skip_trivia(source_file_text(source_file), else_keyword.pos()),
+                        if_keyword.end(),
+                        source_file,
+                    );
+                    if !fidelity.is_none() {
+                        highlights.push(lsproto::DocumentHighlight {
+                            range: lsp_range,
+                            kind: Some(kind),
+                        });
+                    }
                     i += 1; // skip the next keyword
                     i += 1;
                     continue;
                 }
             }
             // Ordinary case: just highlight the keyword.
-            highlights.push(lsproto::DocumentHighlight {
-                range: self.create_lsp_range_from_node(keywords[i], source_file),
-                kind: Some(kind),
-            });
+            let (lsp_range, fidelity) = self.create_lsp_range_from_node_for_feature(
+                keywords[i],
+                source_file,
+                Feature::DOCUMENT_HIGHLIGHTS,
+            );
+            if !fidelity.is_none() {
+                highlights.push(lsproto::DocumentHighlight {
+                    range: lsp_range,
+                    kind: Some(kind),
+                });
+            }
             i += 1;
         }
         highlights

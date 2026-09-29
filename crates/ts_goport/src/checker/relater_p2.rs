@@ -730,11 +730,12 @@ impl Checker {
     // returns an empty slice when invoked recursively for the given generic type.
     //
     // PORT: Go distinguishes a nil `links.variances` (not computed) from an
-    // empty slice (in progress, or no type parameters). `VarianceLinks` holds a
+    // empty slice (circular, or no type parameters). `VarianceLinks` holds a
     // `SharedList`, and `varianceLinks` is only used here, so "the link record
-    // exists" stands for "variances != nil": the record is created at the same
-    // point Go assigns the empty in-progress slice.
-    // Go: checker/relater.go:1341 getVariancesWorker
+    // exists" stands for "variances != nil": the record is created only where
+    // Go assigns `links.variances`. Go `len(links.variances)` is the length of
+    // the record's list, or 0 without a record.
+    // Go: checker/relater.go:1334 getVariancesWorker
     pub fn get_variances_worker(
         &mut self,
         symbol: SymbolId,
@@ -752,78 +753,127 @@ impl Checker {
                     true,
                 )
             });
-            let old_variance_computation = self.in_variance_computation;
-            let save_resolution_start = self.resolution_start;
-            if !self.in_variance_computation {
-                self.in_variance_computation = true;
-                self.resolution_start = self.type_resolutions.len() as i32;
-            }
-            self.variance_links.get(symbol).variances = SharedList::default();
-            let mut variances: Vec<VarianceFlags> =
-                vec![VarianceFlags::default(); type_parameters.len()];
-            for (i, &tp) in type_parameters.iter().enumerate() {
-                let modifiers = self.get_type_parameter_modifiers(tp);
-                let mut variance: VarianceFlags;
-                if modifiers.intersects(ModifierFlags::OUT) {
-                    if modifiers.intersects(ModifierFlags::IN) {
-                        variance = VarianceFlags::INVARIANT;
-                    } else {
-                        variance = VarianceFlags::COVARIANT;
+            if let Some(stack_index) = self.get_variance_stack_index(symbol) {
+                // We've detected a circularity. Since we may compute different variances depending on where
+                // we enter a circularity, we find the generic type with the "smallest" symbol in the circular
+                // region of the variance stack and restart the computation from there if necessary. This
+                // ensures stable results for circular generic types.
+                let mut min_index = stack_index;
+                for i in stack_index + 1..self.variance_stack.len() {
+                    let (s, min) = (
+                        self.variance_stack[i].symbol,
+                        self.variance_stack[min_index].symbol,
+                    );
+                    if self.compare_symbols(s, min) < 0 {
+                        min_index = i;
                     }
-                } else if modifiers.intersects(ModifierFlags::IN) {
-                    variance = VarianceFlags::CONTRAVARIANT;
-                } else {
-                    let save_reliability_flags = self.reliability_flags;
-                    self.reliability_flags = RelationComparisonResult::NONE;
-                    // We first compare instantiations where the type parameter is replaced with
-                    // marker types that have a known subtype relationship. From this we can infer
-                    // invariance, covariance, contravariance or bivariance.
-                    let marker_super_type = self.marker_super_type;
-                    let marker_sub_type = self.marker_sub_type;
-                    let type_with_super = self.create_marker_type(symbol, tp, marker_super_type);
-                    let type_with_sub = self.create_marker_type(symbol, tp, marker_sub_type);
-                    variance = (if self.is_type_assignable_to(type_with_sub, type_with_super) {
-                        VarianceFlags::COVARIANT
-                    } else {
-                        VarianceFlags::default()
-                    }) | (if self.is_type_assignable_to(type_with_super, type_with_sub) {
-                        VarianceFlags::CONTRAVARIANT
-                    } else {
-                        VarianceFlags::default()
-                    });
-                    // If the instantiations appear to be related bivariantly it may be because the
-                    // type parameter is independent (i.e. it isn't witnessed anywhere in the generic
-                    // type). To determine this we compare instantiations where the type parameter is
-                    // replaced with marker types that are known to be unrelated.
-                    if variance == VarianceFlags::BIVARIANT && {
-                        let marker_other_type = self.marker_other_type;
-                        let type_with_other =
-                            self.create_marker_type(symbol, tp, marker_other_type);
-                        self.is_type_assignable_to(type_with_other, type_with_super)
-                    } {
-                        variance = VarianceFlags::INDEPENDENT;
-                    }
-                    if self
-                        .reliability_flags
-                        .intersects(RelationComparisonResult::REPORTS_UNMEASURABLE)
-                    {
-                        variance |= VarianceFlags::UNMEASURABLE;
-                    }
-                    if self
-                        .reliability_flags
-                        .intersects(RelationComparisonResult::REPORTS_UNRELIABLE)
-                    {
-                        variance |= VarianceFlags::UNRELIABLE;
-                    }
-                    self.reliability_flags = save_reliability_flags;
                 }
-                variances[i] = variance;
+                if min_index > stack_index {
+                    let save_variance_stack = std::mem::take(&mut self.variance_stack);
+                    let entry = &save_variance_stack[min_index];
+                    let (min_symbol, min_type_parameters) =
+                        (entry.symbol, entry.type_parameters.clone());
+                    self.get_variances_worker(min_symbol, &min_type_parameters);
+                    self.variance_stack = save_variance_stack;
+                }
+                // Store an empty slice to mark that we can't compute variances for this type. We treat type
+                // parameters as co-variant in this case.
+                if !self.variance_links.has(symbol) {
+                    self.variance_links.get(symbol).variances = SharedList::default();
+                }
+            } else {
+                let save_resolution_start = self.resolution_start;
+                if self.variance_stack.is_empty() {
+                    self.resolution_start = self.type_resolutions.len() as i32;
+                }
+                self.variance_stack.push(VarianceStackEntry {
+                    symbol,
+                    type_parameters: type_parameters.to_vec(),
+                });
+                let mut variances: Vec<VarianceFlags> =
+                    vec![VarianceFlags::default(); type_parameters.len()];
+                for (i, &tp) in type_parameters.iter().enumerate() {
+                    let modifiers = self.get_type_parameter_modifiers(tp);
+                    let mut variance: VarianceFlags;
+                    if modifiers.intersects(ModifierFlags::OUT) {
+                        if modifiers.intersects(ModifierFlags::IN) {
+                            variance = VarianceFlags::INVARIANT;
+                        } else {
+                            variance = VarianceFlags::COVARIANT;
+                        }
+                    } else if modifiers.intersects(ModifierFlags::IN) {
+                        variance = VarianceFlags::CONTRAVARIANT;
+                    } else {
+                        let save_reliability_flags = self.reliability_flags;
+                        self.reliability_flags = RelationComparisonResult::NONE;
+                        // We first compare instantiations where the type parameter is replaced with
+                        // marker types that have a known subtype relationship. From this we can infer
+                        // invariance, covariance, contravariance or bivariance.
+                        let marker_super_type = self.marker_super_type;
+                        let marker_sub_type = self.marker_sub_type;
+                        let type_with_super =
+                            self.create_marker_type(symbol, tp, marker_super_type);
+                        let type_with_sub = self.create_marker_type(symbol, tp, marker_sub_type);
+                        variance =
+                            (if self.is_type_assignable_to(type_with_sub, type_with_super) {
+                                VarianceFlags::COVARIANT
+                            } else {
+                                VarianceFlags::default()
+                            }) | (if self.is_type_assignable_to(type_with_super, type_with_sub) {
+                                VarianceFlags::CONTRAVARIANT
+                            } else {
+                                VarianceFlags::default()
+                            });
+                        // If the instantiations appear to be related bivariantly it may be because the
+                        // type parameter is independent (i.e. it isn't witnessed anywhere in the generic
+                        // type). To determine this we compare instantiations where the type parameter is
+                        // replaced with marker types that are known to be unrelated.
+                        if variance == VarianceFlags::BIVARIANT && {
+                            let marker_other_type = self.marker_other_type;
+                            let type_with_other =
+                                self.create_marker_type(symbol, tp, marker_other_type);
+                            self.is_type_assignable_to(type_with_other, type_with_super)
+                        } {
+                            variance = VarianceFlags::INDEPENDENT;
+                        }
+                        if self
+                            .reliability_flags
+                            .intersects(RelationComparisonResult::REPORTS_UNMEASURABLE)
+                        {
+                            variance |= VarianceFlags::UNMEASURABLE;
+                        }
+                        if self
+                            .reliability_flags
+                            .intersects(RelationComparisonResult::REPORTS_UNRELIABLE)
+                        {
+                            variance |= VarianceFlags::UNRELIABLE;
+                        }
+                        self.reliability_flags = save_reliability_flags;
+                    }
+                    // If variance computation was restarted due to a circularity we may have already
+                    // computed variances for this generic type. If so, we exit early.
+                    if self
+                        .variance_links
+                        .try_get(symbol)
+                        .is_some_and(|links| !links.variances.is_empty())
+                    {
+                        break;
+                    }
+                    variances[i] = variance;
+                }
+                // Store the results unless a restarted computation has already stored them.
+                if self
+                    .variance_links
+                    .try_get(symbol)
+                    .is_none_or(|links| links.variances.is_empty())
+                {
+                    self.variance_links.get(symbol).variances = variances.into();
+                }
+                self.variance_stack.pop();
+                if self.variance_stack.is_empty() {
+                    self.resolution_start = save_resolution_start;
+                }
             }
-            if !old_variance_computation {
-                self.in_variance_computation = false;
-                self.resolution_start = save_resolution_start;
-            }
-            self.variance_links.get(symbol).variances = variances.into();
             if let Some(args) = trace.as_mut().and_then(crate::tracing::Pop::args_mut) {
                 let formatted: Vec<String> = self
                     .variance_links
@@ -837,6 +887,14 @@ impl Checker {
             drop(trace);
         }
         self.variance_links.get(symbol).variances.clone()
+    }
+
+    // PORT: Go returns -1 when the symbol is not on the stack; that is `None`.
+    // Go: checker/relater.go:1437 getVarianceStackIndex
+    pub fn get_variance_stack_index(&self, symbol: SymbolId) -> Option<usize> {
+        self.variance_stack
+            .iter()
+            .position(|entry| entry.symbol == symbol)
     }
 
     // Go: checker/relater.go:1412 createMarkerType

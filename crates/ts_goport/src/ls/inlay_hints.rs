@@ -3,6 +3,7 @@ use crate::ls::prelude::*;
 // Go `internal/ls/inlay_hints.go`: textDocument/inlayHint.
 
 use crate::frontend::stringutil_ls;
+use crate::spanmap::Feature;
 
 impl LanguageService {
     // Go: ls/inlay_hints.go:24 ProvideInlayHint
@@ -20,21 +21,37 @@ impl LanguageService {
         let (program, file) = self.get_program_and_file(&params.text_document.uri);
         let quote_preference = lsutil::get_quote_preference(file, &user_preferences);
 
-        let (checker, done) = ls_program::get_type_checker_for_file(program, ctx, file);
-        let c = &mut *checker.borrow_mut();
-        let mut inlay_hint_state = InlayHintState {
-            ctx,
-            span: self.converters.from_lsp_range(&file, &params.range),
-            preferences: inlay_hint_preferences,
-            quote_preference,
+        let mapped_ranges = lsconv::from_lsp_range_intersecting_for_source_file(
+            &self.converters,
             file,
-            checker: c,
-            converters: self.converters.clone(),
-            result: Vec::new(),
-        };
-        inlay_hint_state.visit(file);
+            params.range,
+            Feature::INLAY_HINTS,
+        );
+        let mut result: Vec<lsproto::InlayHint> = Vec::with_capacity(mapped_ranges.len());
+        // PORT: Go defers each `done()` to the end of the function; the
+        // guards are kept in `dones` until then. The checker borrow ends with
+        // each loop pass, because the projections can share one checker.
+        let mut dones = Vec::with_capacity(mapped_ranges.len());
+        for mapped in mapped_ranges {
+            let projection = mapped.script;
+            let (checker, done) = ls_program::get_type_checker_for_file(program, ctx, projection);
+            dones.push(done);
+            let c = &mut *checker.borrow_mut();
+            let mut inlay_hint_state = InlayHintState {
+                ctx,
+                span: mapped.span,
+                preferences: inlay_hint_preferences,
+                quote_preference,
+                file: projection,
+                checker: c,
+                converters: self.converters.clone(),
+                result: Vec::new(),
+            };
+            inlay_hint_state.visit(projection);
+            result.extend(inlay_hint_state.result);
+        }
         Ok(lsproto::InlayHintsOrNull {
-            inlay_hints: Some(inlay_hint_state.result),
+            inlay_hints: Some(result),
         })
     }
 }
@@ -446,6 +463,12 @@ impl InlayHintState<'_> {
 
     // Go: ls/inlay_hints.go:335 inlayHintState.addTypeHints
     fn add_type_hints(&mut self, hint: lsproto::StringOrInlayHintLabelParts, position: i32) {
+        let (lsp_position, fidelity) =
+            self.converters
+                .to_lsp_position_for_feature(&self.file, position, Feature::INLAY_HINTS);
+        if fidelity.is_none() {
+            return;
+        }
         let mut hint = hint;
         if hint.string.is_some() {
             hint.string = Some(format!(": {}", hint.string.as_ref().unwrap()));
@@ -460,9 +483,7 @@ impl InlayHintState<'_> {
         }
         self.result.push(lsproto::InlayHint {
             label: hint,
-            position: self
-                .converters
-                .position_to_line_and_character(&self.file, position),
+            position: lsp_position,
             kind: Some(lsproto::InlayHintKind::TYPE),
             padding_left: Some(true),
             ..Default::default()
@@ -471,14 +492,18 @@ impl InlayHintState<'_> {
 
     // Go: ls/inlay_hints.go:349 inlayHintState.addEnumMemberValueHints
     fn add_enum_member_value_hints(&mut self, text: &str, position: i32) {
+        let (lsp_position, fidelity) =
+            self.converters
+                .to_lsp_position_for_feature(&self.file, position, Feature::INLAY_HINTS);
+        if fidelity.is_none() {
+            return;
+        }
         self.result.push(lsproto::InlayHint {
             label: lsproto::StringOrInlayHintLabelParts {
                 string: Some(format!("= {text}")),
                 ..Default::default()
             },
-            position: self
-                .converters
-                .position_to_line_and_character(&self.file, position),
+            position: lsp_position,
             padding_left: Some(true),
             ..Default::default()
         });
@@ -492,6 +517,12 @@ impl InlayHintState<'_> {
         position: i32,
         is_first_variadic_argument: bool,
     ) {
+        let (lsp_position, fidelity) =
+            self.converters
+                .to_lsp_position_for_feature(&self.file, position, Feature::INLAY_HINTS);
+        if fidelity.is_none() {
+            return;
+        }
         let hint_text = format!(
             "{}{}",
             if is_first_variadic_argument {
@@ -515,9 +546,7 @@ impl InlayHintState<'_> {
 
         self.result.push(lsproto::InlayHint {
             label: label_parts,
-            position: self
-                .converters
-                .position_to_line_and_character(&self.file, position),
+            position: lsp_position,
             kind: Some(lsproto::InlayHintKind::PARAMETER),
             padding_right: Some(true),
             ..Default::default()
@@ -924,16 +953,25 @@ impl InlayHintState<'_> {
         let file = get_source_file_of_node(node);
         let pos = astnav::get_start_of_node(node, file, false /*includeJSDoc*/);
         let end = node.end();
-        lsproto::InlayHintLabelPart {
+        let mut part = lsproto::InlayHintLabelPart {
             value: text.to_string(),
-            location: Some(lsproto::Location {
-                uri: lsconv::file_name_to_document_uri(source_file_file_name(file)),
-                range: self
-                    .converters
-                    .to_lsp_range(&file, TextRange::new(pos, end)),
-            }),
             ..Default::default()
+        };
+        // The location is an optional go-to target for the name. Only attach it when the name maps back to a
+        // single concrete span in the original text; an approximate or synthesized mapping would point the
+        // user somewhere wrong, so it is better to omit the target than to fabricate one.
+        let (lsp_range, fidelity) = self.converters.to_lsp_range_for_feature(
+            &file,
+            TextRange::new(pos, end),
+            Feature::INLAY_HINTS,
+        );
+        if fidelity.is_single_segment() {
+            part.location = Some(lsproto::Location {
+                uri: lsconv::file_name_to_document_uri(source_file_original_file_name(file)),
+                range: lsp_range,
+            });
         }
+        part
     }
 
     // Go: ls/inlay_hints.go:781 inlayHintState.getLiteralText

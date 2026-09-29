@@ -145,7 +145,10 @@ struct RunNotes {
 impl TscInput {
     // Go: runner.go:44 executeCommand
     // PORT: the command runs in a child process. An `Err` is a child that
-    // ended without a result (see child.rs).
+    // ended without a result (see child.rs). Go passes the subtest context
+    // (`t.Context()`, tsgo#4712), whose end closes a content mapper host
+    // that the command made. Here the child ends with its process (a watch
+    // child when the input ends), and its mapper connections with it.
     fn execute_command(
         &self,
         sys: &TestSys,
@@ -329,7 +332,7 @@ impl TscInput {
         Ok(())
     }
 
-    // Go: runner.go:180 getBaselineSubFolder
+    // Go: runner.go:182 getBaselineSubFolder
     pub fn get_baseline_sub_folder(&self) -> String {
         let command_name = if self
             .command_line_args
@@ -358,7 +361,7 @@ impl TscInput {
     }
 }
 
-// Go: runner.go:146 getDiffForIncremental
+// Go: runner.go:148 getDiffForIncremental
 fn get_diff_for_incremental(incremental_sys: &TestSys, non_incremental_sys: &TestSys) -> String {
     let mut diff_builder = String::new();
 

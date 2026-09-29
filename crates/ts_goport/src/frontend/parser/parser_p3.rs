@@ -135,7 +135,7 @@ impl Parser {
         {
             self.parse_keyword_expression()
         } else {
-            self.parse_literal_expression(false /*intern*/)
+            self.parse_literal_expression()
         };
         if negative {
             let prefix = self
@@ -160,7 +160,11 @@ impl Parser {
 
     // Go: parser/parser.go:2903 parseEntityNameOfTypeReference
     pub fn parse_entity_name_of_type_reference(&mut self) -> Node {
-        self.parse_entity_name(true /*allowReservedWords*/, Some(diag::Type_expected))
+        self.parse_entity_name(
+            true,  /*allowReservedWords*/
+            false, /*allowPrivateName*/
+            Some(diag::Type_expected),
+        )
     }
 
     // Go: parser/parser.go:2907 parseEntityName
@@ -168,6 +172,7 @@ impl Parser {
     pub fn parse_entity_name(
         &mut self,
         allow_reserved_words: bool,
+        allow_private_name: bool,
         diagnostic_message: Option<&'static crate::diagnostics::Message>,
     ) -> Node {
         let pos = self.node_pos();
@@ -184,8 +189,8 @@ impl Parser {
             }
             let right = self.parse_right_side_of_dot(
                 allow_reserved_words,
-                false, /*allowPrivateIdentifiers*/
-                true,  /*allowUnicodeEscapeSequenceInIdentifierName*/
+                allow_private_name,
+                true, /*allowUnicodeEscapeSequenceInIdentifierName*/
             );
             let qualified = self.factory.new_qualified_name(entity, right);
             entity = self.finish_node(qualified, pos);
@@ -389,7 +394,7 @@ impl Parser {
         if token_is_identifier_or_keyword(self.token) {
             name = self.parse_identifier_name();
         } else if self.token == SyntaxKind::StringLiteral {
-            name = self.parse_literal_expression(false /*intern*/);
+            name = self.parse_literal_expression();
         }
         if name.is_some() {
             self.parse_expected(SyntaxKind::ColonToken);
@@ -432,7 +437,11 @@ impl Parser {
     pub fn parse_type_query(&mut self) -> Node {
         let pos = self.node_pos();
         self.parse_expected(SyntaxKind::TypeOfKeyword);
-        let entity_name = self.parse_entity_name(true /*allowReservedWords*/, None);
+        let entity_name = self.parse_entity_name(
+            true, /*allowReservedWords*/
+            true, /*allowPrivateName*/
+            None,
+        );
         // Make sure we perform ASI to prevent parsing the next line's type arguments as part of an instantiation expression
         let mut type_arguments = NodeList::NIL;
         if !self.has_preceding_line_break() {
@@ -931,8 +940,7 @@ impl Parser {
             || self.token == SyntaxKind::NumericLiteral
             || self.token == SyntaxKind::BigIntLiteral
         {
-            let literal = self.parse_literal_expression(true /*intern*/);
-            return literal;
+            return self.parse_literal_expression();
         }
         if allow_computed_property_names && self.token == SyntaxKind::OpenBracketToken {
             return self.parse_computed_property_name();

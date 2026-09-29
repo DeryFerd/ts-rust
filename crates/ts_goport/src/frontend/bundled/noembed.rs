@@ -19,8 +19,8 @@ pub fn wrap_fs(fs: Rc<dyn Fs>) -> Rc<dyn Fs> {
 
 // Go: noembed.go:22 executableDir
 fn executable_dir() -> String {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => go_string_from_os(exe),
+    let exe = match crate::frontend::osutil::executable() {
+        Ok(exe) => exe,
         Err(err) => panic!("bundled: failed to get executable path: {err}"),
     };
     let exe = normalize_slashes(&exe);

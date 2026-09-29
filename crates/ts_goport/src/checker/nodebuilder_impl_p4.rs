@@ -835,8 +835,14 @@ impl Checker {
             }
 
             let mut target_symbol = symbol;
-            if self.sym(symbol).flags.intersects(SymbolFlags::ALIAS) {
+            if self.sym(symbol).flags.intersects(SymbolFlags::ALIAS)
+                && !self.can_get_type_parameters_of_class_or_interface(symbol)
+            {
                 target_symbol = self.resolve_alias(symbol);
+            }
+
+            if !self.can_get_type_parameters_of_class_or_interface(target_symbol) {
+                return NodeList::NIL;
             }
 
             let mut params = self.get_type_parameters_of_class_or_interface(b, target_symbol);

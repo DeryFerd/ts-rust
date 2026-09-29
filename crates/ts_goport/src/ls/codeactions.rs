@@ -1,5 +1,7 @@
 use crate::ls::prelude::*;
 
+use crate::spanmap::Feature;
+
 // Port of Go `ls/codeactions.go`.
 //
 // PORT (whole file):
@@ -155,44 +157,45 @@ impl LanguageService {
                 };
 
                 for provider in code_fix_providers() {
-                    if !contains_error_code(&provider.error_codes, error_code) {
+                    if !code_fix_provider_matches_lsp_diagnostic(provider, diag) {
                         continue;
                     }
 
-                    let position = self
-                        .converters
-                        .line_and_character_to_position(&file, &diag.range.start);
-                    let end_position = self
-                        .converters
-                        .line_and_character_to_position(&file, &diag.range.end);
-                    let fix_context = CodeFixContext {
-                        source_file: file,
-                        span: TextRange::new(position, end_position),
-                        error_code,
-                        program,
-                        ls: self,
-                        diagnostic: Some(diag),
-                        params: Some(params),
-                    };
+                    for mapped in lsconv::from_lsp_range_for_source_file(
+                        &self.converters,
+                        file,
+                        diag.range,
+                        Feature::CODE_ACTIONS,
+                    ) {
+                        let fix_context = CodeFixContext {
+                            source_file: mapped.script,
+                            span: mapped.span,
+                            error_code,
+                            program,
+                            ls: self,
+                            diagnostic: Some(diag),
+                            params: Some(params),
+                        };
 
-                    let provider_actions = (provider.get_code_actions)(ctx, &fix_context)?;
-                    for action in provider_actions {
-                        let (i, found) = crate::gostd::slices::binary_search_func(
-                            &seen,
-                            &action,
-                            |a: &CodeAction, b: &&CodeAction| a.compare(b),
-                        );
-                        if found {
-                            continue;
-                        }
-                        seen.insert(i, action.clone());
-                        actions.push(convert_to_lsp_code_action(
-                            &action,
-                            diag,
-                            &params.text_document.uri,
-                        ));
-                        if !action.fix_id.is_empty() {
-                            fix_id_seen.insert(action.fix_id.clone(), provider);
+                        let provider_actions = (provider.get_code_actions)(ctx, &fix_context)?;
+                        for action in provider_actions {
+                            let (i, found) = crate::gostd::slices::binary_search_func(
+                                &seen,
+                                &action,
+                                |a: &CodeAction, b: &&CodeAction| a.compare(b),
+                            );
+                            if found {
+                                continue;
+                            }
+                            seen.insert(i, action.clone());
+                            actions.push(convert_to_lsp_code_action(
+                                &action,
+                                diag,
+                                &params.text_document.uri,
+                            ));
+                            if !action.fix_id.is_empty() {
+                                fix_id_seen.insert(action.fix_id.clone(), provider);
+                            }
                         }
                     }
                 }
@@ -295,7 +298,7 @@ fn has_multiple_fixable_diagnostics(
     let all_diags = get_all_diagnostics(ctx, program, file);
     let mut count = 0;
     for d in &all_diags {
-        if contains_error_code(error_codes, d.code()) {
+        if is_fixable_diagnostic(d, error_codes) {
             count += 1;
             if count >= 2 {
                 return true;
@@ -305,7 +308,31 @@ fn has_multiple_fixable_diagnostics(
     false
 }
 
-// Go: ls/codeactions.go:234 codeActionKindContains
+// Go: ls/codeactions.go:232 codeFixProviderMatchesLSPDiagnostic
+fn code_fix_provider_matches_lsp_diagnostic(
+    provider: &CodeFixProvider,
+    diagnostic: &lsproto::Diagnostic,
+) -> bool {
+    if diagnostic
+        .source
+        .as_deref()
+        .is_some_and(|source| source != "ts")
+    {
+        return false;
+    }
+    diagnostic
+        .code
+        .as_ref()
+        .and_then(|code| code.integer)
+        .is_some_and(|code| contains_error_code(&provider.error_codes, code))
+}
+
+// Go: ls/codeactions.go:239 isFixableDiagnostic
+pub fn is_fixable_diagnostic(diagnostic: &Diagnostic, error_codes: &[i32]) -> bool {
+    diagnostic.source().is_empty() && contains_error_code(error_codes, diagnostic.code())
+}
+
+// Go: ls/codeactions.go:246 codeActionKindContains
 // codeActionKindContains returns true if the requested kind equals or is a
 // hierarchical parent of actionKind, using '.' as the separator. This matches
 // the semantics of VS Code's HierarchicalKind.contains.

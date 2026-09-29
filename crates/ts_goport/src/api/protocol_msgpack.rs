@@ -8,11 +8,10 @@
 use crate::api::prelude::*;
 
 use crate::api::proto::ERR_INVALID_REQUEST;
-use crate::api::protocol::{Message, Protocol};
-use crate::api::transport::{ConnReader, ConnWriter, ReadWriteCloser};
 use crate::frontend::json::{JsonError, MarshalerTo, json_marshal};
 use crate::frontend::json_ext::{AnyValue, JsonValue};
 use crate::gostd::{GoError, errors};
+use crate::ipc::{ConnReader, ConnWriter, Message, Protocol, ReadWriteCloser};
 use crate::jsonrpc;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::Arc;

@@ -15,7 +15,7 @@ use crate::support::runner::{
     FileMap, TscEdit, TscInput, WatchFilter, edit, no_change, no_change_only_edit, run_tsc_inputs,
 };
 use crate::support::stringtestutil::{dedent, go_sprintf};
-use crate::support::test_sys::TSC_LIB_PATH;
+use crate::support::test_sys::{TSC_LIB_PATH, TestSys};
 use crate::support::vfstest::{self, MapFile, symlink};
 
 /// Go `FileMap{"path": value, ...}`. Each value goes through `MapFile::from`.
@@ -1340,8 +1340,68 @@ fn build_file_delete() {
 // TestBuildDependencyUpdate
 // ---------------------------------------------------------------------------
 
-// Go: tscbuild_test.go:972 TestBuildDependencyUpdate (added by tsgo#4301)
+// Go: tscbuild_test.go:1082 TestBuildDependencyUpdate (added by tsgo#4301)
 fn build_dependency_update_inputs() -> Vec<TscInput> {
+    // Project shape shared by the batched dependency update scenarios:
+    // src/consumer.ts depends on dep-a only through src/middle.ts, whose .d.ts
+    // signature does not change when dep-a's type gains a member. src/env.ts
+    // pulls in dep-b, whose .d.ts augments the global scope.
+    fn get_batch_dependency_update_files() -> FileMap {
+        files! {
+            "/home/src/workspaces/project/tsconfig.json" => dedent(r#"
+				{
+					"compilerOptions": {
+						"composite": true,
+						"outDir": "dist",
+						"strict": true
+					},
+					"include": ["src/**/*"]
+				}
+			"#),
+            "/home/src/workspaces/project/src/consumer.ts" => dedent(r#"
+				import type { Kind } from "./middle";
+				export function describe(kind: Kind): string {
+					switch (kind) {
+						case "a":
+							return "first";
+						case "b":
+							return "second";
+					}
+				}
+			"#),
+            "/home/src/workspaces/project/src/middle.ts" => r#"export type { Kind } from "dep-a";"#,
+            "/home/src/workspaces/project/src/env.ts" => r#"import "dep-b";"#,
+            "/home/src/workspaces/project/node_modules/dep-a/package.json" => dedent(r#"
+				{
+					"name": "dep-a",
+					"version": "1.0.0",
+					"types": "index.d.ts"
+				}
+			"#),
+            "/home/src/workspaces/project/node_modules/dep-a/index.d.ts" => r#"export type Kind = "a" | "b";"#,
+            "/home/src/workspaces/project/node_modules/dep-b/package.json" => dedent(r#"
+				{
+					"name": "dep-b",
+					"version": "1.0.0",
+					"types": "index.d.ts"
+				}
+			"#),
+            "/home/src/workspaces/project/node_modules/dep-b/index.d.ts" => dedent(r#"
+				declare global {
+					interface DepBGlobal {
+						marker: string;
+					}
+				}
+				export {};
+			"#),
+        }
+    }
+    fn update_dep_a_with_breaking_type_change(sys: &TestSys) {
+        sys.write_file_no_error(
+            "/home/src/workspaces/project/node_modules/dep-a/index.d.ts",
+            r#"export type Kind = "a" | "b" | "c";"#,
+        );
+    }
     vec![
         TscInput {
             // https://github.com/microsoft/typescript-go/issues/2666
@@ -1563,6 +1623,97 @@ fn build_dependency_update_inputs() -> Vec<TscInput> {
                     sys.write_file_no_error(
                         "D:/work/deps/dep.d.ts",
                         "export declare const myValue: number;",
+                    );
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        // Go: added by tsgo#4665
+        TscInput {
+            sub_scenario: "rebuilds transitive dependents when dependency update batch includes a global scope change".into(),
+            files: get_batch_dependency_update_files(),
+            cwd: "/home/src/workspaces/project".into(),
+            command_line_args: args(&["--b", "--verbose"]),
+            edits: vec![
+                TscEdit {
+                    caption: "update dep-a with a breaking type change and dep-b with a global scope change in one batch".into(),
+                    edit: edit(|sys| {
+                        update_dep_a_with_breaking_type_change(sys);
+                        sys.write_file_no_error(
+                            "/home/src/workspaces/project/node_modules/dep-b/index.d.ts",
+                            &dedent(r#"
+							declare global {
+								interface DepBGlobal {
+									marker: string;
+									extra: number;
+								}
+							}
+							export {};
+						"#),
+                        );
+                    }),
+                    ..Default::default()
+                },
+                no_change(),
+            ],
+            ..Default::default()
+        },
+        TscInput {
+            // Control for the batched scenario: the same dep-a break without dep-b's global scope change.
+            sub_scenario: "rebuilds transitive dependents when dependency update batch has no global scope change".into(),
+            files: get_batch_dependency_update_files(),
+            cwd: "/home/src/workspaces/project".into(),
+            command_line_args: args(&["--b", "--verbose"]),
+            edits: vec![TscEdit {
+                caption: "update dep-a with a breaking type change".into(),
+                edit: edit(update_dep_a_with_breaking_type_change),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: "rebuilds files using globals when global scope dependency is updated".into(),
+            files: files! {
+                "/home/src/workspaces/project/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"composite": true,
+							"outDir": "dist",
+							"strict": true
+						},
+						"include": ["src/**/*"]
+					}
+				"#),
+                "/home/src/workspaces/project/src/env.ts" => r#"import "dep-b";"#,
+                "/home/src/workspaces/project/src/user.ts" => "export const marker: string = globalMarker;",
+                "/home/src/workspaces/project/node_modules/dep-b/package.json" => dedent(r#"
+					{
+						"name": "dep-b",
+						"version": "1.0.0",
+						"types": "index.d.ts"
+					}
+				"#),
+                "/home/src/workspaces/project/node_modules/dep-b/index.d.ts" => dedent(r#"
+					declare global {
+						var globalMarker: string;
+					}
+					export {};
+				"#),
+            },
+            cwd: "/home/src/workspaces/project".into(),
+            command_line_args: args(&["--b", "--verbose"]),
+            edits: vec![TscEdit {
+                caption: "update dep-b changing the type of a global".into(),
+                edit: edit(|sys| {
+                    sys.write_file_no_error(
+                        "/home/src/workspaces/project/node_modules/dep-b/index.d.ts",
+                        &dedent(r#"
+							declare global {
+								var globalMarker: number;
+							}
+							export {};
+						"#),
                     );
                 }),
                 ..Default::default()

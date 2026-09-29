@@ -1,18 +1,19 @@
-//! Port of internal/api/transport_unix.go (`//go:build !windows`).
+//! Port of internal/ipc/transport_unix.go (`//go:build !windows`;
+//! internal/api/transport_unix.go before tsgo#4712).
 //!
 //! PORT: Go `net.Listen("unix", path)` and `net.UnixConn` are
 //! `std::os::unix::net`. Error texts are the `std::io::Error` texts, not the
 //! Go `*net.OpError` texts.
 
-use crate::api::prelude::*;
+use crate::ipc::prelude::*;
 
-use crate::api::transport::{NetListener, ReadWriteCloser};
 use crate::gostd::{GoError, errors};
+use crate::ipc::transport::{NetListener, ReadWriteCloser};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 
-// Go: transport_unix.go:11 newPipeListener
+// Go: ipc/transport_unix.go:12 newPipeListener
 // newPipeListener creates a Unix domain socket listener.
 pub fn new_pipe_listener(path: &str) -> Result<Box<dyn NetListener>, GoError> {
     // Remove any existing socket file
@@ -29,7 +30,7 @@ pub fn new_pipe_listener(path: &str) -> Result<Box<dyn NetListener>, GoError> {
     }
 }
 
-// Go: transport_unix.go:19 GeneratePipePath
+// Go: ipc/transport_unix.go:19 GeneratePipePath
 // GeneratePipePath returns a platform-appropriate pipe path for the given name.
 pub fn generate_pipe_path(name: &str) -> String {
     path_join(&os_temp_dir(), name)

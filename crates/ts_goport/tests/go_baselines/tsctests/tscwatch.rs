@@ -836,6 +836,28 @@ fn watch_watch() {
             })],
             ..Default::default()
         },
+        // Global (script) files: commenting out a global declaration in one
+        // file must surface the resulting error in another file that used it.
+        // Go: added by tsgo#4848
+        TscInput {
+            sub_scenario: "watch detects error across global script files when global decl removed"
+                .into(),
+            files: file_map([
+                ("/home/src/workspaces/project/a.ts", "console.log(a);".into()),
+                ("/home/src/workspaces/project/x.ts", "const a = 1;".into()),
+                ("/home/src/workspaces/project/tsconfig.json", "{}".into()),
+            ]),
+            command_line_args: args(["--watch"]),
+            edits: vec![
+                new_tsc_edit("comment out global declaration", |sys| {
+                    sys.write_file_no_error("/home/src/workspaces/project/x.ts", "// const a = 1;");
+                }),
+                new_tsc_edit("restore global declaration", |sys| {
+                    sys.write_file_no_error("/home/src/workspaces/project/x.ts", "const a = 1;");
+                }),
+            ],
+            ..Default::default()
+        },
         // Ancestor fallback: creating deeply nested directories that didn't
         // exist at initial build time should trigger a rebuild and re-watch.
         TscInput {

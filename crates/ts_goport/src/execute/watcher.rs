@@ -17,19 +17,20 @@
 //! are shared with the last version. The last version is released when the
 //! next build has read it (Go drops the old program there).
 
+use crate::contentmapper::{self, Mapper, SourceFiles};
 use crate::execute::build::host::TscExtendedConfigCache;
 use crate::execute::execute_tsc::{get_trace_from_sys, new_program_version, os_write_file};
 use crate::execute::incremental;
 use crate::execute::tsc::compile::{
     CommandLineTesting, CompileAndEmitResult, CompileTimes, System, SystemParseConfigHost,
-    write_str,
+    new_content_mapper_host, write_str,
 };
 use crate::execute::tsc::diagnostics::{
     DiagnosticReporter, DiagnosticsReporter, create_watch_status_reporter,
 };
 use crate::execute::tsc::emit::{EmitInput, emit_files_and_report_errors};
 use crate::execute::watchmanager::{
-    WatchBackend, WatchManager, can_watch_directory, is_dir_covered_by_watch, new_watch_manager,
+    WatchBackend, WatchManager, can_watch_directory, new_dir_watch_set, new_watch_manager,
 };
 use crate::frontend::prelude::*;
 use crate::frontend::vfs::trackingvfs;
@@ -101,6 +102,20 @@ impl CompilerHost for WatchCompilerHost {
         file
     }
 
+    // PORT: Go embeds the inner host, so these two go to it (tsgo#4712).
+    fn get_content_mapped_source_files(
+        &self,
+        parse_options: &SourceFileParseOptions,
+        mapper: &Rc<Mapper>,
+    ) -> Result<SourceFiles, GoError> {
+        self.compiler_host
+            .get_content_mapped_source_files(parse_options, mapper)
+    }
+
+    fn content_mapper_project(&self) -> Option<Rc<dyn contentmapper::Project>> {
+        self.compiler_host.content_mapper_project()
+    }
+
     fn get_resolved_project_reference(
         &self,
         file_name: &str,
@@ -121,7 +136,7 @@ impl CompilerHost for WatchCompilerHost {
     }
 }
 
-// Go: execute/watcher.go:57 Watcher
+// Go: execute/watcher.go:59 Watcher
 // PORT: Go `*tsoptions.ParsedCommandLine` is `Rc<ParsedCommandLine>`. Go
 // `*collections.OrderedMap[string, any]` is
 // `Option<IndexMap<String, CompilerOptionsValue>>` (as in build/host.rs).
@@ -140,6 +155,13 @@ pub struct Watcher {
     report_watch_status: DiagnosticReporter,
     testing: Option<Rc<dyn CommandLineTesting>>,
 
+    // contentMapperHost transforms content-mapped files; it is created once per watch session (when
+    // enabled) and reused across cycles. It closes itself when the session context is cancelled (see
+    // contentmapper.New).
+    // PORT: Go nil interfaces are `None`.
+    content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
+    content_mapper_project: Option<Rc<dyn contentmapper::Project>>,
+
     program: Option<incremental::program::Program>,
     extended_config_cache: Option<Rc<TscExtendedConfigCache>>,
     config_modified: bool,
@@ -151,12 +173,30 @@ pub struct Watcher {
     wm: Rc<RefCell<WatchManager>>,
     seen_files: FxHashSet<Path>, // all build dependencies (for event filtering)
     config_mtimes: FxHashMap<String, Option<SystemTime>>,
+    watch_set_dirty: bool,
+    // forceFullRebuild records a reason that requires a full NewProgram rebuild
+    // (e.g. an event overflow, a mid-cycle watch failure, a newly appeared
+    // project file, or a changed non-source dependency). Unlike watchSetDirty,
+    // which is only raised to recheck wildcard roots and may be cleared once the
+    // file set is confirmed unchanged, this flag is preserved until a full
+    // rebuild actually runs so the single-file fast path cannot silently reuse a
+    // stale program.
+    force_full_rebuild: bool,
+    program_ready: bool,
+
+    // Test-only observability of which build path was taken.
+    fast_path_builds: i32,
+    full_builds: i32,
 }
 
-// Go: execute/watcher.go:81 `var _ tsc.Watcher = (*Watcher)(nil)`
+// Go: execute/watcher.go:103 `var _ tsc.Watcher = (*Watcher)(nil)`
 impl crate::execute::tsc::Watcher for Watcher {
     fn do_cycle(&mut self) {
         Watcher::do_cycle(self);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -181,7 +221,7 @@ pub(crate) fn test_watch_backend() -> Option<Rc<dyn WatchBackend>> {
     TEST_WATCH_BACKEND.with(|slot| slot.borrow().clone())
 }
 
-// Go: execute/watcher.go:83 createWatcher
+// Go: execute/watcher.go:105 createWatcher
 pub fn create_watcher(
     sys: Rc<dyn System>,
     config_parse_result: Rc<ParsedCommandLine>,
@@ -216,6 +256,8 @@ pub fn create_watcher(
             testing.clone(),
         ),
         testing,
+        content_mapper_host: None,
+        content_mapper_project: None,
         program: None,
         extended_config_cache: None,
         config_modified: false,
@@ -225,6 +267,11 @@ pub fn create_watcher(
         wm: Rc::new(RefCell::new(wm)),
         seen_files: FxHashSet::default(),
         config_mtimes: FxHashMap::default(),
+        watch_set_dirty: false,
+        force_full_rebuild: false,
+        program_ready: false,
+        fast_path_builds: 0,
+        full_builds: 0,
     };
     if let Some(config_file) = &config_parse_result.config_file {
         w.config_file_name = source_file_file_name(config_file.source_file).to_string();
@@ -233,8 +280,12 @@ pub fn create_watcher(
 }
 
 impl Watcher {
-    // Go: execute/watcher.go:114 (*Watcher).start
+    // Go: execute/watcher.go:136 (*Watcher).start
     pub fn start(&mut self, ctx: &Context) {
+        self.content_mapper_host =
+            new_content_mapper_host(ctx, &self.sys, self.config.compiler_options());
+        let config = self.config.clone();
+        self.replace_content_mapper_project(&config);
         self.wm.borrow().lock();
         let extended_config_cache = Rc::new(TscExtendedConfigCache::default());
         self.extended_config_cache = Some(extended_config_cache.clone());
@@ -248,6 +299,7 @@ impl Watcher {
                 self.config.locale(),
                 self.testing.clone(),
             )),
+            self.content_mapper_project.clone(),
         );
         self.program = incremental::program::read_build_info_program(
             &self.config,
@@ -277,19 +329,76 @@ impl Watcher {
             diag::Starting_compilation_in_watch_mode,
             args![],
         ));
+        self.watch_set_dirty = true;
         if self.do_build().is_err() {
             self.wm.borrow().force_overflow();
         }
         self.wm.borrow().unlock();
 
         if self.testing.is_none() {
+            // The content mapper host closes itself when ctx is cancelled (see contentmapper.New).
             // PORT: Go passes the method value `w.DoCycle`.
             let wm = Rc::clone(&self.wm);
             wm.borrow().run_loop(ctx, &mut || self.do_cycle());
         }
+
+        // Go: if w.contentMapperHost != nil && w.testing == nil { defer w.contentMapperHost.Close() }
+        // PORT: `start` has no early return, so the deferred close runs here.
+        if self.testing.is_none() {
+            if let Some(host) = &self.content_mapper_host {
+                let _ = host.close();
+            }
+        }
     }
 
-    // Go: execute/watcher.go:143 (*Watcher).computeDesiredWatches
+    // Go: execute/watcher.go:172 (*Watcher).replaceContentMapperProject
+    fn replace_content_mapper_project(&mut self, config: &ParsedCommandLine) {
+        let Some(host) = &self.content_mapper_host else {
+            return;
+        };
+        let project = host.project(contentmapper::ProjectSpec {
+            config_file_name: config.config_name().to_string(),
+            mappers: config.content_mappers().to_vec(),
+            compiler_options: Some(config.compiler_options().clone()),
+        });
+        if let Some(old) = &self.content_mapper_project {
+            let _ = old.close();
+        }
+        self.content_mapper_project = project;
+    }
+
+    // Go: execute/watcher.go:187 (*Watcher).contentMapperWatchedFiles
+    fn content_mapper_watched_files(&self) -> Vec<String> {
+        let mut files = Vec::new();
+        for mapper in self.config.content_mappers() {
+            if !mapper.package_directory.is_empty() && mapper.contribution_id.is_empty() {
+                files.push(combine_paths(&mapper.package_directory, &["package.json"]));
+            }
+        }
+        if let Some(project) = &self.content_mapper_project {
+            match project.watched_files() {
+                Ok(dynamic_files) => files.extend(dynamic_files),
+                Err(err) => {
+                    (self.report_diagnostic)(&content_mapper_project_diagnostic(&err));
+                    return files;
+                }
+            }
+        }
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    /// The paths of `content_mapper_watched_files`, as a set (Go
+    /// `collections.NewSetFromItems(core.Map(..., tspath.ToPath))`).
+    fn content_mapper_watched_paths(&self, cwd: &str, case_sensitive: bool) -> FxHashSet<Path> {
+        self.content_mapper_watched_files()
+            .iter()
+            .map(|file_name| to_path(file_name, cwd, case_sensitive))
+            .collect()
+    }
+
+    // Go: execute/watcher.go:207 (*Watcher).computeDesiredWatches
     // PORT: Go ranges over `WildcardDirectories()` (a map, random order).
     pub fn compute_desired_watches(&self, seen_file_paths: &[String]) -> FxHashMap<String, bool> {
         let cwd = self.sys.get_current_directory();
@@ -333,18 +442,21 @@ impl Watcher {
 
         // Add parent directories for seen files not covered by existing dir watches.
         // Resolve ancestor fallbacks first so coverage checks use final dirs.
-        let mut resolved_dirs = self.wm.borrow().resolve_desired_dirs(&desired_dirs);
+        let resolved_dirs = self.wm.borrow().resolve_desired_dirs(&desired_dirs);
 
-        let opts = self.compare_paths_options();
+        let mut coverage = new_dir_watch_set(self.compare_paths_options());
+        for (dir, recursive) in &resolved_dirs {
+            coverage.set(dir, *recursive);
+        }
         for file_path in seen_file_paths {
             let dir = get_directory_path(file_path);
-            if !is_dir_covered_by_watch(&resolved_dirs, &dir, &opts) && can_watch_directory(&dir) {
-                resolved_dirs.insert(dir, false);
+            if !coverage.covered(&dir) && can_watch_directory(&dir) {
+                coverage.set(&dir, false);
             }
         }
 
         // Re-resolve in case newly added dirs don't exist
-        self.wm.borrow().resolve_desired_dirs(&resolved_dirs)
+        self.wm.borrow().resolve_desired_dirs(coverage.dirs())
     }
 
     // Go: execute/watcher.go:201 (*Watcher).reconcileWatches
@@ -361,7 +473,7 @@ impl Watcher {
         }
     }
 
-    // Go: execute/watcher.go:213 (*Watcher).DoCycle
+    // Go: execute/watcher.go:278 (*Watcher).DoCycle
     // PORT: Go unlocks with `defer`; the port unlocks before each return.
     pub fn do_cycle(&mut self) {
         self.wm.borrow().lock();
@@ -369,7 +481,7 @@ impl Watcher {
         let (changed_paths, overflow) = self.wm.borrow().drain_events();
         let has_events = !changed_paths.is_empty() || overflow;
 
-        if self.recheck_ts_config() {
+        if self.recheck_ts_config(self.content_mapper_manifest_changed(&changed_paths)) {
             self.wm.borrow().unlock();
             return;
         }
@@ -378,6 +490,67 @@ impl Watcher {
             // Filter fswatch events against known dependencies
             if self.is_relevant_change(&changed_paths) {
                 self.evict_changed_source_files(&changed_paths);
+                let case_sensitive = self.sys.fs().use_case_sensitive_file_names();
+                let cwd = self.sys.get_current_directory();
+                let program = self.get_program();
+                let program_files = program.files_by_path();
+                let content_mapper_watched_files =
+                    self.content_mapper_watched_paths(&cwd, case_sensitive);
+                let mut content_mapper_config_changed = false;
+                // PORT: Go ranges over a map (random order). Only flags are set.
+                for event_path in changed_paths.keys() {
+                    if self.sys.fs().directory_exists(event_path) {
+                        // A watched directory changed: the wildcard file set may have
+                        // changed, so reload file names on the next build.
+                        self.watch_set_dirty = true;
+                        continue;
+                    }
+                    let p = to_path(event_path, &cwd, case_sensitive);
+                    if content_mapper_watched_files.contains(&p) {
+                        content_mapper_config_changed = true;
+                        self.force_full_rebuild = true;
+                    }
+                    if self.config.config_file.is_some()
+                        && self.config.possibly_matches_file_name(event_path)
+                    {
+                        if !self.seen_files.contains(&p) {
+                            // A file that matches the project but was not previously
+                            // seen appeared: a structural change that requires a full
+                            // rebuild, not the single-file fast path.
+                            self.watch_set_dirty = true;
+                            self.force_full_rebuild = true;
+                            continue;
+                        }
+                    }
+                    if program_files
+                        .get(&p)
+                        .is_some_and(|source_file| !source_file.content_mapper().is_empty())
+                    {
+                        // Canonical mapped files must be transformed again, and supplemental paths are failed
+                        // physical lookups reserved for virtual files. Neither can use single-file AST reuse.
+                        self.force_full_rebuild = true;
+                    } else if !program_files.contains_key(&p) && self.seen_files.contains(&p) {
+                        // A non-source build dependency changed. Such dependencies
+                        // (e.g. package.json or a previously-missing module path) are
+                        // tracked in seenFiles but are not program source files, so a
+                        // missing sourceFileCache entry would not account for them.
+                        // Module resolution may now differ, so the single-file fast
+                        // path is unsafe; force a full rebuild.
+                        self.force_full_rebuild = true;
+                    }
+                }
+                if content_mapper_config_changed {
+                    if let Some(project) = &self.content_mapper_project {
+                        if project.refresh().is_err() {
+                            (self.report_diagnostic)(&new_compiler_diagnostic(
+                                diag::The_content_mapper_process_could_not_be_started_or_initialized,
+                                args![],
+                            ));
+                            self.wm.borrow().unlock();
+                            return;
+                        }
+                    }
+                }
             } else {
                 if let Some(debug_log) = &self.wm.borrow().debug_log {
                     write_str(
@@ -393,8 +566,14 @@ impl Watcher {
                 return;
             }
         } else if overflow {
-            // Overflow: evict the entire source file cache to force re-build
+            // Overflow: evict the entire source file cache and force a full rebuild.
+            // The fast path must not run here: after clearing the cache a one-file
+            // program would present exactly one cache miss and be misread as a
+            // single-file content edit, silently reusing a stale (e.g. unresolved
+            // import) program instead of rediscovering the file graph.
             self.source_file_cache = Rc::new(RefCell::new(FxHashMap::default()));
+            self.watch_set_dirty = true;
+            self.force_full_rebuild = true;
         } else if !has_events && !self.config_modified {
             // No events and no config change
             if let Some(debug_log) = &self.wm.borrow().debug_log {
@@ -416,7 +595,7 @@ impl Watcher {
         self.wm.borrow().unlock();
     }
 
-    // Go: execute/watcher.go:258 (*Watcher).isRelevantChange
+    // Go: execute/watcher.go:378 (*Watcher).isRelevantChange
     // PORT: Go map iteration order is random; `changed_paths` is an
     // `FxHashMap`. The result does not depend on the order.
     pub fn is_relevant_change(
@@ -426,8 +605,12 @@ impl Watcher {
         let case_sensitive = self.sys.fs().use_case_sensitive_file_names();
         let cwd = self.sys.get_current_directory();
         let opts = self.compare_paths_options();
+        let content_mapper_watched_files = self.content_mapper_watched_paths(&cwd, case_sensitive);
         for event_path in changed_paths.keys() {
             let p = to_path(event_path, &cwd, case_sensitive);
+            if content_mapper_watched_files.contains(&p) {
+                return true;
+            }
             if self.seen_files.contains(&p) {
                 return true;
             }
@@ -449,10 +632,94 @@ impl Watcher {
         false
     }
 
-    // Go: execute/watcher.go:282 (*Watcher).doBuild
+    // Go: execute/watcher.go:408 (*Watcher).doBuild
     pub fn do_build(&mut self) -> Result<(), GoError> {
         if self.config_modified {
             self.source_file_cache = Rc::new(RefCell::new(FxHashMap::default()));
+            self.watch_set_dirty = true;
+        }
+
+        let mut reloaded_file_names = false;
+        if self.watch_set_dirty {
+            if self.config.config_file.is_some() && !self.config.wildcard_directories().is_empty() {
+                let new_config = Rc::new(
+                    self.config
+                        .reload_file_names_of_parsed_command_line(&*self.sys.fs()),
+                );
+                reloaded_file_names = true;
+                if self.config.file_names() != new_config.file_names() {
+                    self.config = new_config;
+                } else {
+                    self.watch_set_dirty = false;
+                    self.config = new_config;
+                }
+            } else if !self.config_modified {
+                self.watch_set_dirty = false;
+            }
+        }
+
+        if self.program.is_some()
+            && self.program_ready
+            && !self.config_modified
+            && !self.watch_set_dirty
+            && !self.force_full_rebuild
+        {
+            let cached = cachedvfs_from(self.sys.fs());
+            let inner_host = new_compiler_host(
+                &self.sys.get_current_directory(),
+                cached.clone() as Rc<dyn Fs>,
+                &self.sys.default_library_path(),
+                self.extended_config_cache
+                    .clone()
+                    .map(|cache| cache as Rc<dyn ExtendedConfigCache>),
+                Some(get_trace_from_sys(
+                    &*self.sys,
+                    self.config.locale(),
+                    self.testing.clone(),
+                )),
+                self.content_mapper_project.clone(),
+            );
+            let host: Rc<dyn CompilerHost> = Rc::new(WatchCompilerHost {
+                compiler_host: inner_host,
+                cache: self.source_file_cache.clone(),
+            });
+
+            if self.try_update_program(&host) {
+                self.fast_path_builds += 1;
+                // PORT: the reused program's version is current for the build,
+                // as in the full build below.
+                let _program =
+                    crate::core::enter_program(self.program.as_ref().and_then(|p| p.program));
+                let result = self.compile_and_emit();
+                cached.disable_and_clear_cache();
+
+                self.config_mtimes = FxHashMap::with_capacity_and_hasher(
+                    self.config_file_paths.len(),
+                    Default::default(),
+                );
+                for cfg_path in &self.config_file_paths {
+                    if let Some(s) = self.sys.fs().stat(cfg_path) {
+                        self.config_mtimes.insert(cfg_path.clone(), s.mod_time());
+                    }
+                }
+                self.config_modified = false;
+
+                let error_count = result.diagnostics.len();
+                if error_count == 1 {
+                    (self.report_watch_status)(&new_compiler_diagnostic(
+                        diag::Found_1_error_Watching_for_file_changes,
+                        args![],
+                    ));
+                } else {
+                    (self.report_watch_status)(&new_compiler_diagnostic(
+                        diag::Found_0_errors_Watching_for_file_changes,
+                        args![error_count],
+                    ));
+                }
+                self.on_program();
+                return Ok(());
+            }
+            cached.disable_and_clear_cache();
         }
 
         let cached = cachedvfs_from(self.sys.fs());
@@ -472,6 +739,7 @@ impl Watcher {
                 self.config.locale(),
                 self.testing.clone(),
             )),
+            self.content_mapper_project.clone(),
         );
         let host: Rc<dyn CompilerHost> = Rc::new(WatchCompilerHost {
             compiler_host: inner_host,
@@ -479,11 +747,13 @@ impl Watcher {
         });
 
         if self.config.config_file.is_some() {
-            let wildcard_dirs = self.config.wildcard_directories().clone();
-            for dir in wildcard_dirs.keys() {
+            for dir in self.config.wildcard_directories().keys() {
                 tfs.seen_files.borrow_mut().insert(dir.clone());
             }
-            if !wildcard_dirs.is_empty() {
+            if !reloaded_file_names
+                && !self.watch_set_dirty
+                && !self.config.wildcard_directories().is_empty()
+            {
                 self.config = Rc::new(
                     self.config
                         .reload_file_names_of_parsed_command_line(&*self.sys.fs()),
@@ -493,6 +763,9 @@ impl Watcher {
         for path in &self.config_file_paths {
             tfs.seen_files.borrow_mut().insert(path.clone());
         }
+        for path in self.content_mapper_watched_files() {
+            tfs.seen_files.borrow_mut().insert(path);
+        }
 
         // Go: compiler.NewProgram(compiler.ProgramOptions{Config, Host})
         // PORT: a new program version, current for the rest of the build.
@@ -501,6 +774,7 @@ impl Watcher {
         let mut program = incremental::program::new_program(
             self.program.as_ref(),
             incremental::incremental::create_host(host),
+            Some(self.sys_now()),
             self.testing.is_some(),
         );
         // PORT: Go passes a nil incremental host. The Rust `new_program`
@@ -516,6 +790,8 @@ impl Watcher {
             .replace(program)
             .and_then(|old| old.program)
             .map(crate::program::release_program_later);
+        self.program_ready = true;
+        self.full_builds += 1;
 
         let result = self.compile_and_emit();
         cached.disable_and_clear_cache();
@@ -540,7 +816,9 @@ impl Watcher {
             write_str(&self.sys.writer(), &format!("{}\n", err.error()));
             return Err(err);
         }
+        self.watch_set_dirty = false;
         self.config_modified = false;
+        self.force_full_rebuild = false;
 
         // PORT: Go `w.program.GetProgram().FilesByPath()`. `FilesByPath` is on
         // the frontend program of the current program version.
@@ -569,6 +847,102 @@ impl Watcher {
         Ok(())
     }
 
+    // Go: execute/watcher.go:536 (*Watcher).tryUpdateProgram
+    // PORT: Go `w.program.GetProgram()` is `get_program`. The parses and the
+    // reuse run with no current program, as `program::update_program_version`
+    // does. A reused program gets a new program version that shares the
+    // unchanged frontend data of the old one; the old version is released as
+    // in `do_build`.
+    fn try_update_program(&mut self, host: &Rc<dyn CompilerHost>) -> bool {
+        let old_version = self
+            .program
+            .as_ref()
+            .and_then(|program| program.program)
+            .expect("the watch program has a program");
+        let old_program = self.get_program();
+
+        let mut changed_path: Option<&Path> = None;
+        let mut changed_count = 0;
+        // PORT: Go ranges over a map (random order); at most one path is kept.
+        for (path, file) in old_program.files_by_path() {
+            if !file.content_mapper().is_empty() {
+                continue;
+            }
+            if !self.source_file_cache.borrow().contains_key(path) {
+                changed_path = Some(path);
+                changed_count += 1;
+                if changed_count > 1 {
+                    return false;
+                }
+            }
+        }
+        let Some(changed_path) = changed_path else {
+            return false;
+        };
+
+        if let Some(old_file) = old_program.files_by_path().get(changed_path) {
+            if let Some(new_file) = host.get_source_file(old_file.parse_options()) {
+                if !equal_jsx_implicit_import(old_program.options(), old_file, &new_file) {
+                    return false;
+                }
+            }
+        }
+
+        // PORT: `reuse_program` is Go `Program.ReuseProgram` (tsgo#4399, the
+        // program part). The Rust frontend program has no checker pool, so
+        // Go's `createCheckerPool` argument (nil here) is dropped, as in
+        // `update_program`.
+        let (new_program, _, reused) = old_program.reuse_program(changed_path, host.clone());
+        if reused {
+            let np = Rc::new(new_program.expect("ReuseProgram returns the reused program"));
+            let version = crate::program::new_program_version(&np, Some(old_version));
+            let _program = crate::core::enter_program(Some(version));
+            let mut program = incremental::program::new_program(
+                self.program.as_ref(),
+                incremental::incremental::create_host(host.clone()),
+                Some(self.sys_now()),
+                self.testing.is_some(),
+            );
+            // PORT: Go passes a nil incremental host (see `do_build`).
+            program.host = None;
+            if let Some(old) = self.program.replace(program).and_then(|old| old.program) {
+                crate::program::release_program(old);
+            }
+        }
+        reused
+    }
+
+    // Go: execute/watcher.go:575 (*Watcher).FastPathBuilds
+    /// FastPathBuilds reports how many builds reused an existing program via the
+    /// UpdateProgram single-file fast path. It is intended for tests that need to
+    /// verify which build path was taken.
+    pub fn fast_path_builds(&self) -> i32 {
+        self.fast_path_builds
+    }
+
+    // Go: execute/watcher.go:579 (*Watcher).FullBuilds
+    /// FullBuilds reports how many builds constructed a full program via NewProgram.
+    /// It is intended for tests that need to verify which build path was taken.
+    pub fn full_builds(&self) -> i32 {
+        self.full_builds
+    }
+
+    /// Go `w.program.GetProgram()`: the frontend program of the watch
+    /// program's version.
+    // PORT: Go `GetProgram` returns the `*compiler.Program`. Its frontend
+    // part (`FilesByPath`, `ReuseProgram`) is the `NewProgram` of the version.
+    fn get_program(&self) -> Rc<NewProgram> {
+        let version = self.program.as_ref().and_then(|program| program.program);
+        let _program = crate::core::enter_program(version);
+        crate::program::go_frontend_program().expect("the watch build made a Go frontend program")
+    }
+
+    /// Go `w.sys.Now`, the method value.
+    fn sys_now(&self) -> incremental::program::NestedEmitNow {
+        let sys = self.sys.clone();
+        Rc::new(move || sys.now())
+    }
+
     /// Go `if w.testing != nil { w.testing.OnProgram(w.program) }`.
     // PORT: the test reads the program's files, so its version is current
     // for the call.
@@ -580,7 +954,7 @@ impl Watcher {
         testing.on_program(program);
     }
 
-    // Go: execute/watcher.go:356 (*Watcher).evictChangedSourceFiles
+    // Go: execute/watcher.go:593 (*Watcher).evictChangedSourceFiles
     pub fn evict_changed_source_files(
         &self,
         changed_paths: &FxHashMap<String, fswatch::EventKind>,
@@ -621,13 +995,35 @@ impl Watcher {
         })
     }
 
-    // Go: execute/watcher.go:384 (*Watcher).recheckTsConfig
-    pub fn recheck_ts_config(&mut self) -> bool {
+    // Go: execute/watcher.go:621 (*Watcher).contentMapperManifestChanged
+    // PORT: Go looks up the map by key; the order does not matter.
+    fn content_mapper_manifest_changed(
+        &self,
+        changed_paths: &FxHashMap<String, fswatch::EventKind>,
+    ) -> bool {
+        for mapper in self.config.content_mappers() {
+            if mapper.package_directory.is_empty() || !mapper.contribution_id.is_empty() {
+                continue;
+            }
+            if changed_paths.contains_key(
+                &self
+                    .sys
+                    .fs()
+                    .realpath(&combine_paths(&mapper.package_directory, &["package.json"])),
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    // Go: execute/watcher.go:633 (*Watcher).recheckTsConfig
+    pub fn recheck_ts_config(&mut self, force: bool) -> bool {
         if self.config_file_name.is_empty() {
             return false;
         }
 
-        if !self.config_has_errors && !self.config_file_paths.is_empty() {
+        if !force && !self.config_has_errors && !self.config_file_paths.is_empty() {
             let mut changed = false;
             for path in &self.config_file_paths {
                 let old_mtime = self.config_mtimes.get(path);
@@ -666,6 +1062,7 @@ impl Watcher {
         if self.config.parsed_config != config_parse_result.parsed_config {
             self.config_modified = true;
         }
+        self.replace_content_mapper_project(&config_parse_result);
         self.config = config_parse_result;
         false
     }
@@ -702,4 +1099,35 @@ impl Watcher {
         self.extended_config_cache = Some(extended_config_cache);
         config_parse_result.map(Rc::new)
     }
+}
+
+// Go: execute/watcher.go:581 equalJSXImplicitImport
+// PORT: the files are frontend `ParsedSourceFile`s (the new one is not
+// published), so the base comes from the file loader's
+// `get_jsx_implicit_import_base_of_file`, Go `ast.GetJSXImplicitImportBase`
+// on the parser's pragmas.
+fn equal_jsx_implicit_import(
+    options: &CompilerOptions,
+    old_file: &ParsedSourceFile,
+    new_file: &ParsedSourceFile,
+) -> bool {
+    let is_jsx = |file: &ParsedSourceFile| {
+        file.script_kind == ScriptKind::JSX || file.script_kind == ScriptKind::TSX
+    };
+    if !is_jsx(old_file) && !is_jsx(new_file) {
+        return true;
+    }
+    let old_import = crate::ast::get_jsx_runtime_import(
+        &crate::frontend::compiler::file_loader::get_jsx_implicit_import_base_of_file(
+            options, old_file,
+        ),
+        options,
+    );
+    let new_import = crate::ast::get_jsx_runtime_import(
+        &crate::frontend::compiler::file_loader::get_jsx_implicit_import_base_of_file(
+            options, new_file,
+        ),
+        options,
+    );
+    old_import == new_import
 }

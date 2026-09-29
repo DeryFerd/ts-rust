@@ -20,6 +20,30 @@ pub fn find_ancestor(mut node: Node, mut callback: impl FnMut(Node) -> bool) -> 
     Node::NIL
 }
 
+// Go: ast/utilities.go:921 FindManyAncestors
+/// Walks up the parents of `node` once. Slot `i` of the result is the nearest
+/// ancestor that `callbacks[i]` matches, or nil. A node fills at most one
+/// slot: the first callback that matches it and whose slot is still empty.
+#[must_use]
+pub fn find_many_ancestors(mut node: Node, callbacks: &[fn(Node) -> bool]) -> Vec<Node> {
+    let mut ancestors = vec![Node::NIL; callbacks.len()];
+    let mut found = 0;
+    while node.is_some() {
+        for (i, callback) in callbacks.iter().enumerate() {
+            if ancestors[i].is_nil() && callback(node) {
+                ancestors[i] = node;
+                found += 1;
+                if found == callbacks.len() {
+                    return ancestors;
+                }
+                break;
+            }
+        }
+        node = node.parent();
+    }
+    ancestors
+}
+
 /// `find_ancestor(node, |n| callback(n, n.kind()))`: the callback also gets
 /// the node's Go `Kind`.
 // PERF: U4 (CH7). The steps inside a tier 0 store read its kind and header
@@ -358,22 +382,20 @@ pub fn get_root_declaration(mut node: Node) -> Node {
     node
 }
 
-// Go: ast/utilities.go:1161 getCombinedFlags
+// Go: ast/utilities.go:1180 GetCombinedModifierFlags
 // PERF: `get_root_declaration` is inlined here and each node kind is read
 // once (it was read in `get_root_declaration` and again for the
 // VariableDeclaration test, each read with the store bounds checks). The
-// walk and the `get_flags` calls are the same as Go. A nil node fails the
-// Go `node != nil` tests, so it returns early.
-fn get_combined_flags<T: Copy + std::ops::BitOrAssign>(
-    mut node: Node,
-    get_flags: impl Fn(Node) -> T,
-) -> T {
+// walk and the flag reads are the same as Go. A nil node fails the Go
+// `node != nil` tests, so it returns early. The same holds for
+// `get_combined_node_flags` and `get_combined_parser_flags`.
+pub fn get_combined_modifier_flags(mut node: Node) -> ModifierFlags {
     let mut kind = node.kind();
     while kind == SyntaxKind::BindingElement {
         node = node.parent().parent();
         kind = node.kind();
     }
-    let mut flags = get_flags(node);
+    let mut flags = node.modifier_flags();
     if kind == SyntaxKind::VariableDeclaration {
         node = node.parent();
         if node.is_nil() {
@@ -382,7 +404,7 @@ fn get_combined_flags<T: Copy + std::ops::BitOrAssign>(
         kind = node.kind();
     }
     if kind == SyntaxKind::VariableDeclarationList {
-        flags |= get_flags(node);
+        flags |= node.modifier_flags();
         node = node.parent();
         if node.is_nil() {
             return flags;
@@ -390,24 +412,38 @@ fn get_combined_flags<T: Copy + std::ops::BitOrAssign>(
         kind = node.kind();
     }
     if kind == SyntaxKind::VariableStatement {
-        flags |= get_flags(node);
+        flags |= node.modifier_flags();
     }
     flags
 }
 
-// Go: ast/utilities.go:1177 GetCombinedModifierFlags
-pub fn get_combined_modifier_flags(node: Node) -> ModifierFlags {
-    get_combined_flags(node, |n: Node| n.modifier_flags())
-}
-
-// Go: ast/utilities.go:1181 GetCombinedNodeFlags
-pub fn get_combined_node_flags(node: Node) -> NodeFlags {
-    get_combined_flags(node, get_node_flags)
-}
-
-// Go: ast/utilities.go:1185 getNodeFlags
-fn get_node_flags(node: Node) -> NodeFlags {
-    node.flags()
+// Go: ast/utilities.go:1196 GetCombinedNodeFlags
+pub fn get_combined_node_flags(mut node: Node) -> NodeFlags {
+    let mut kind = node.kind();
+    while kind == SyntaxKind::BindingElement {
+        node = node.parent().parent();
+        kind = node.kind();
+    }
+    let mut flags = node.flags();
+    if kind == SyntaxKind::VariableDeclaration {
+        node = node.parent();
+        if node.is_nil() {
+            return flags;
+        }
+        kind = node.kind();
+    }
+    if kind == SyntaxKind::VariableDeclarationList {
+        flags |= node.flags();
+        node = node.parent();
+        if node.is_nil() {
+            return flags;
+        }
+        kind = node.kind();
+    }
+    if kind == SyntaxKind::VariableStatement {
+        flags |= node.flags();
+    }
+    flags
 }
 
 /// Go `GetCombinedNodeFlags(node) & mask` for a `mask` without a binder bit
@@ -415,8 +451,32 @@ fn get_node_flags(node: Node) -> NodeFlags {
 // PERF: U4 (CH7). The same walk as `get_combined_node_flags`, without the
 // binder data of each node. `(a | b | c) & mask` is
 // `(a & mask) | (b & mask) | (c & mask)`.
-fn get_combined_parser_flags(node: Node, mask: NodeFlags) -> NodeFlags {
-    get_combined_flags(node, |n: Node| n.parser_flags(mask))
+fn get_combined_parser_flags(mut node: Node, mask: NodeFlags) -> NodeFlags {
+    let mut kind = node.kind();
+    while kind == SyntaxKind::BindingElement {
+        node = node.parent().parent();
+        kind = node.kind();
+    }
+    let mut flags = node.parser_flags(mask);
+    if kind == SyntaxKind::VariableDeclaration {
+        node = node.parent();
+        if node.is_nil() {
+            return flags;
+        }
+        kind = node.kind();
+    }
+    if kind == SyntaxKind::VariableDeclarationList {
+        flags |= node.parser_flags(mask);
+        node = node.parent();
+        if node.is_nil() {
+            return flags;
+        }
+        kind = node.kind();
+    }
+    if kind == SyntaxKind::VariableStatement {
+        flags |= node.parser_flags(mask);
+    }
+    flags
 }
 
 // Go: ast/utilities.go:1190 IsVarAwaitUsing
@@ -739,26 +799,28 @@ pub fn is_expression_with_type_arguments_in_class_extends_clause(node: Node) -> 
 
 // Go: ast/utilities.go:1411 TryGetClassExtendingExpressionWithTypeArguments
 pub fn try_get_class_extending_expression_with_type_arguments(node: Node) -> Node {
+    if !is_expression_with_type_arguments(node) {
+        return Node::NIL;
+    }
     let (cls, is_implements) =
-        try_get_class_implementing_or_extending_expression_with_type_arguments(node);
+        try_get_class_implementing_or_extending_heritage_clause_element(node);
     if cls.is_some() && !is_implements {
         return cls;
     }
     Node::NIL
 }
 
-// Go: ast/utilities.go:1419 TryGetClassImplementingOrExtendingExpressionWithTypeArguments
+// Go: ast/utilities.go:1445 TryGetClassImplementingOrExtendingHeritageClauseElement
 /// Returns `(class, isImplements)`.
-pub fn try_get_class_implementing_or_extending_expression_with_type_arguments(
-    node: Node,
-) -> (Node, bool) {
-    if is_expression_with_type_arguments(node) {
-        if is_heritage_clause(node.parent()) && is_class_like(node.parent().parent()) {
-            return (
-                node.parent().parent(),
-                node.parent().token() == SyntaxKind::ImplementsKeyword,
-            );
-        }
+pub fn try_get_class_implementing_or_extending_heritage_clause_element(node: Node) -> (Node, bool) {
+    if (is_expression_with_type_arguments(node) || is_type_reference_node(node))
+        && is_heritage_clause(node.parent())
+        && is_class_like(node.parent().parent())
+    {
+        return (
+            node.parent().parent(),
+            node.parent().token() == SyntaxKind::ImplementsKeyword,
+        );
     }
     (Node::NIL, false)
 }
@@ -1115,15 +1177,6 @@ pub fn get_containing_class(node: Node) -> Node {
     find_ancestor(node.parent(), is_class_like)
 }
 
-// Go: ast/utilities.go:1697 GetExtendsHeritageClauseElement
-pub fn get_extends_heritage_clause_element(node: Node) -> Node {
-    // Go: core.FirstOrNil
-    get_extends_heritage_clause_elements(node)
-        .first()
-        .copied()
-        .unwrap_or(Node::NIL)
-}
-
 // Go: ast/utilities.go:1701 GetExtendsHeritageClauseElements
 pub fn get_extends_heritage_clause_elements(node: Node) -> Vec<Node> {
     get_heritage_elements(node, SyntaxKind::ExtendsKeyword)
@@ -1135,12 +1188,33 @@ pub fn get_implements_heritage_clause_elements(node: Node) -> Vec<Node> {
 }
 
 // Go: ast/utilities.go:1709 GetHeritageElements
+/// Go returns `[]*HeritageClauseElement`: ExpressionWithTypeArguments or
+/// TypeReference nodes (tsgo#4797).
 pub fn get_heritage_elements(node: Node, kind: SyntaxKind) -> Vec<Node> {
     let clause = get_heritage_clause(node, kind);
     if clause.is_some() {
         return clause.types().nodes().to_vec();
     }
     Vec::new()
+}
+
+// Go: ast/utilities.go:1739 GetHeritageClauseElementName
+/// GetHeritageClauseElementName returns the expression or type name of a heritage clause element.
+pub fn get_heritage_clause_element_name(node: Node) -> Node {
+    if is_type_reference_node(node) {
+        return node.type_name();
+    }
+    node.expression()
+}
+
+// Go: ast/utilities.go:1746 IsNameOfHeritageClauseTypeReference
+pub fn is_name_of_heritage_clause_type_reference(mut node: Node) -> bool {
+    while is_qualified_name(node.parent()) {
+        node = node.parent();
+    }
+    is_type_reference_node(node.parent())
+        && node.parent().type_name() == node
+        && is_heritage_clause(node.parent().parent())
 }
 
 // Go: ast/utilities.go:1717 GetHeritageClause

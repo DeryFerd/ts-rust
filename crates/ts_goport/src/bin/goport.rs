@@ -71,7 +71,8 @@ fn main() {
     // Go: `System.SinceStart` counts from the process start. The tunables
     // step above may exec the binary again, so the clock starts after it.
     let start = Instant::now();
-    let args: Vec<String> = ts_goport::frontend::vfs::os_args();
+    // #4734: Go `osutil.Args()[1:]`.
+    let args: Vec<String> = ts_goport::frontend::osutil::args()[1..].to_vec();
     install_panic_hook();
     // Go: cmd/tsgo/main.go runMain sends `--lsp` and `--api` to their own
     // entry points; everything else continues below. Nothing may write to
@@ -372,22 +373,18 @@ impl ProgramLike for GuardedProgram {
     fn get_declaration_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
         guard(|| get_declaration_diagnostics(file))
     }
-    /// Under noEmit, Go `emitDeclarationFile` still runs the declaration
-    /// transformer and reports its diagnostics before it checks `NoEmit`
-    /// (compiler/emitter.go:226). Each file is guarded on its own.
+    /// Each file is guarded on its own.
     fn emit(&self, emit_options: EmitOptions) -> EmitResult {
-        // Go: execute/tsc.go:244 an incremental program is an
+        // Go: execute/tsc.go:317 an incremental program is an
         // `incremental.Program`. Its Emit under noEmit
-        // (execute/incremental/program.go:205) skips the file emit and only
-        // writes the build info.
+        // (execute/incremental/program.go:243, #4407 `HandleNoEmitOptions`)
+        // emits no file and returns the result of the build info write, or
+        // an empty one: the emit is not skipped.
         // PORT: the build info is not written, so this adds no diagnostics
         // (see `perform_incremental_compilation` in
         // `execute::execute_tsc`).
         if options().is_incremental() {
-            return EmitResult {
-                emit_skipped: true,
-                ..EmitResult::default()
-            };
+            return EmitResult::default();
         }
         // PORT: tsc passes no `WriteFile` (`CheckBin::write_file`). Under
         // noEmit nothing is written.

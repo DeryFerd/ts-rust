@@ -6,7 +6,9 @@ use std::rc::{Rc, Weak};
 use ts_goport::frontend::compiler::{self, NewProgram};
 use ts_goport::lsp::lsproto;
 use ts_goport::program::ls_program;
-use ts_goport::project::{CompilerHost, FileSource, ProgramUpdateKind, Session};
+use ts_goport::project::{
+    CompilerHost, FileChange, FileChangeKind, FileSource, ProgramUpdateKind, Session, Snapshot,
+};
 
 use super::projecttestutil::{FileMap, files, with_request_id};
 use super::util::*;
@@ -199,6 +201,100 @@ child_test! {
 
         session.did_change_file(&bg(), &uri(other_uri), 2, &[whole("export const other = 2;")]);
         let _ = language_service(&session, other_uri);
+    }
+}
+
+child_test! {
+    // Go: snapshot_test.go:214 TestSnapshot/auto-import snapshot is adopted when session snapshot is unchanged
+    fn auto_import_snapshot_is_adopted_when_session_snapshot_is_unchanged() {
+        let index_text = "const value = foo;";
+        let session = setup(files(&[
+            ("/home/projects/TS/p1/tsconfig.json", "{}"),
+            ("/home/projects/TS/p1/index.ts", index_text),
+            ("/home/projects/TS/p1/foo.ts", "export const foo = 1;"),
+        ]));
+        let ctx = bg();
+        let index_uri = "file:///home/projects/TS/p1/index.ts";
+
+        open(&session, index_uri, index_text);
+        let _ = language_service(&session, index_uri);
+
+        let base_snapshot = session.snapshot();
+        let prepared_snapshot =
+            session.get_snapshot_with_auto_imports(&ctx, &base_snapshot, &uri(index_uri));
+
+        session.wait_for_background_tasks();
+        assert!(Rc::ptr_eq(&session.snapshot(), &prepared_snapshot));
+
+        // Go: defer preparedSnapshot.Deref(session); t.Cleanup(session.Close)
+        Snapshot::deref(&prepared_snapshot, &session);
+        session.close();
+    }
+}
+
+child_test! {
+    // Go: snapshot_test.go:238 TestSnapshot/no-op watch change does not rebuild program
+    fn no_op_watch_change_does_not_rebuild_program() {
+        let index_text = "import { a } from './a'; console.log(a);";
+        let session = setup(files(&[
+            ("/home/projects/TS/p1/tsconfig.json", "{}"),
+            ("/home/projects/TS/p1/index.ts", index_text),
+            ("/home/projects/TS/p1/a.ts", "export const a = 1;"),
+        ]));
+        let index_uri = "file:///home/projects/TS/p1/index.ts";
+        let config_path = path("/home/projects/ts/p1/tsconfig.json");
+        let configured_program = |session: &Rc<Session>| -> Rc<NewProgram> {
+            session
+                .snapshot()
+                .project_collection
+                .configured_project(&config_path)
+                .expect("configured project")
+                .borrow()
+                .program
+                .clone()
+                .expect("program")
+        };
+
+        open(&session, index_uri, index_text);
+        let _ = language_service(&session, index_uri);
+
+        let program_before = configured_program(&session);
+
+        // Send a watch change event for a project file whose content on disk is unchanged.
+        // This should not invalidate the program or trigger a recheck.
+        session.pending_file_changes.borrow_mut().push(FileChange {
+            kind: FileChangeKind::WATCH_CHANGE,
+            uri: uri("file:///home/projects/TS/p1/a.ts"),
+            ..Default::default()
+        });
+        let _ = language_service(&session, index_uri);
+
+        let program_after = configured_program(&session);
+        assert!(
+            same_program(&program_before, &program_after),
+            "no-op watch change should not rebuild the program"
+        );
+
+        // A watch change that reflects an actual content change on disk must still
+        // rebuild the program.
+        session
+            .fs
+            .fs
+            .write_file("/home/projects/TS/p1/a.ts", "export const a = 2;")
+            .unwrap();
+        session.pending_file_changes.borrow_mut().push(FileChange {
+            kind: FileChangeKind::WATCH_CHANGE,
+            uri: uri("file:///home/projects/TS/p1/a.ts"),
+            ..Default::default()
+        });
+        let _ = language_service(&session, index_uri);
+
+        let program_changed = configured_program(&session);
+        assert!(
+            !same_program(&program_before, &program_changed),
+            "real watch change should rebuild the program"
+        );
+        session.close();
     }
 }
 

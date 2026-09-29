@@ -74,11 +74,13 @@ impl Checker {
             name = name.parent();
         }
 
-        if is_in_name_of_expression_with_type_arguments(name) {
+        if is_in_name_of_expression_with_type_arguments_or_heritage_type_reference(name) {
             let mut meaning: SymbolFlags;
-            if name.parent().kind() == SyntaxKind::ExpressionWithTypeArguments {
-                // An 'ExpressionWithTypeArguments' may appear in type space (interface Foo extends Bar<T>),
-                // value space (return foo<T>), or both(class Foo extends Bar<T>); ensure the meaning matches.
+            if name.parent().kind() == SyntaxKind::ExpressionWithTypeArguments
+                || name.parent().kind() == SyntaxKind::TypeReference
+            {
+                // A heritage element name may appear in type space, value space, or both;
+                // ensure the meaning matches its context.
                 meaning = if is_part_of_type_node(name) {
                     SymbolFlags::TYPE
                 } else {
@@ -201,6 +203,9 @@ impl Checker {
             if symbol.is_some() && symbol != self.unknown_symbol {
                 return symbol;
             }
+            if is_name_of_heritage_clause_type_reference(name) {
+                return SymbolId::NIL;
+            }
             return self.get_unresolved_symbol_for_entity_name(name);
         }
 
@@ -253,7 +258,7 @@ impl Checker {
         }
 
         let (class_decl, is_implements) =
-            try_get_class_implementing_or_extending_expression_with_type_arguments(node);
+            try_get_class_implementing_or_extending_heritage_clause_element(node);
         let mut class_type = TypeId::NIL;
         if class_decl.is_some() {
             let class_symbol = self.get_symbol_of_declaration(class_decl);

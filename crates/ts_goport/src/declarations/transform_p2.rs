@@ -182,21 +182,27 @@ impl DeclarationTransformer {
         {
             return self.transform_cjs_require_variable_declaration(input);
         }
-        if is_binding_pattern(input.name()) {
+        if is_binding_pattern(input.name()) && has_any_binding_initializers(input.name()) {
             return self.recreate_binding_pattern(input.name());
         }
         // Variable declaration types also suppress new diagnostic contexts, provided the contexts wouldn't be made for binding pattern types
         self.suppress_new_diagnostic_contexts = true;
         let ec = self.emit_context.clone();
+        // PORT: Go `tx.bindingNameVisitor.VisitNode`; the visitor is built on
+        // demand with the `visitBindingName` callback (see `with_visitor`).
+        let name = {
+            let mut v = ec.new_node_visitor(
+                |node, v: &mut NodeVisitor<'_, &mut DeclarationTransformer>| {
+                    v.ctx.visit_binding_name(node)
+                },
+                &mut *self,
+            );
+            v.visit_node(input.name())
+        };
         let type_node = self.ensure_type(input, false);
         let initializer = self.ensure_no_initializer(input);
-        ec.factory().update_variable_declaration(
-            input,
-            input.name(),
-            Node::NIL,
-            type_node,
-            initializer,
-        )
+        ec.factory()
+            .update_variable_declaration(input, name, Node::NIL, type_node, initializer)
     }
 
     // Go: transformers/declarations/transform.go:851 DeclarationTransformer.transformCjsRequireVariableDeclaration
@@ -711,10 +717,12 @@ impl DeclarationTransformer {
             if self.needs_declare {
                 mods.push(f.new_modifier(SyntaxKind::DeclareKeyword));
             }
+            let full_signature_type = assignment.type_();
             let func_decl = self.transform_function_like_to_declaration(
                 unwrapped,
                 new_id,
                 f.new_modifier_list(&mods),
+                full_signature_type,
             );
             self.preserve_js_doc(func_decl, input);
             // Reuse the same name node for the export so unique names resolve consistently
@@ -764,23 +772,47 @@ impl DeclarationTransformer {
         unwrapped: Node,
         func_name: Node,
         mods: ModifierList,
+        full_signature_type: Node,
     ) -> Node {
         let ec = self.emit_context.clone();
+        let f = ec.factory();
         // PORT: Go reads `unwrapped.FunctionLikeData()`; these are the same fields.
-        let type_parameters = self.ensure_type_params(unwrapped, unwrapped.type_parameter_list());
-        let parameters = self.update_param_list(unwrapped, unwrapped.parameter_list());
-        let type_node = self.ensure_type(unwrapped, false);
-        let full_signature = self.with_visitor(|v| v.visit_node(unwrapped.full_signature()));
-        ec.factory().new_function_declaration(
-            mods,
-            Node::NIL,
-            func_name,
-            type_parameters,
-            parameters,
-            type_node,
-            full_signature,
-            Node::NIL,
-        )
+        let mut sig = unwrapped.full_signature();
+        if sig.is_nil() {
+            sig = full_signature_type;
+        }
+        if sig.is_nil() {
+            let type_parameters =
+                self.ensure_type_params(unwrapped, unwrapped.type_parameter_list());
+            let parameters = self.update_param_list(unwrapped, unwrapped.parameter_list());
+            let type_node = self.ensure_type(unwrapped, false);
+            let full_signature = self.with_visitor(|v| v.visit_node(sig));
+            f.new_function_declaration(
+                mods,
+                Node::NIL,
+                func_name,
+                type_parameters,
+                parameters,
+                type_node,
+                full_signature,
+                Node::NIL,
+            )
+        } else {
+            // If a full signature type node is present, emit as a variable statement to reuse it
+            let type_node = self.with_visitor(|v| v.visit_node(sig));
+            f.new_variable_statement(
+                mods,
+                f.new_variable_declaration_list(
+                    f.new_node_list(&[f.new_variable_declaration(
+                        func_name,
+                        Node::NIL,
+                        type_node,
+                        Node::NIL,
+                    )]),
+                    NodeFlags::CONST,
+                ),
+            )
+        }
     }
 
     // Go: transformers/declarations/transform.go:1276 DeclarationTransformer.transformBinaryExpressionToExportDeclaration
@@ -1062,4 +1094,23 @@ impl DeclarationTransformer {
         self.remove_all_comments(assignment);
         f.new_syntax_list(&[statement, assignment])
     }
+}
+
+// Go: transformers/declarations/transform.go:860 hasAnyBindingInitializers
+fn has_any_binding_initializers(binding_pattern: Node) -> bool {
+    for elem in binding_pattern.elements().iter() {
+        if !is_binding_element(elem) {
+            continue;
+        }
+        if elem.initializer().is_some() {
+            return true;
+        }
+        if elem.name().is_some()
+            && is_binding_pattern(elem.name())
+            && has_any_binding_initializers(elem.name())
+        {
+            return true;
+        }
+    }
+    false
 }

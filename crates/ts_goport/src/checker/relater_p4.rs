@@ -649,15 +649,13 @@ impl Checker {
                     & (RelationComparisonResult::REPORTS_UNMEASURABLE
                         | RelationComparisonResult::REPORTS_UNRELIABLE);
                 if report_errors && entry.intersects(RelationComparisonResult::OVERFLOW) {
-                    let message = if entry.intersects(RelationComparisonResult::COMPLEXITY_OVERFLOW)
-                    {
-                        diag::Excessive_complexity_comparing_types_0_and_1
-                    } else {
-                        diag::Excessive_stack_depth_comparing_types_0_and_1
-                    };
                     let source_string = self.type_to_string_exported(source);
                     let target_string = self.type_to_string_exported(target);
-                    self.report_error(r, message, args![source_string, target_string]);
+                    self.report_error(
+                        r,
+                        diag::Excessive_complexity_comparing_types_0_and_1,
+                        args![source_string, target_string],
+                    );
                 }
                 if entry.intersects(RelationComparisonResult::SUCCEEDED) {
                     return Ternary::TRUE;
@@ -698,8 +696,10 @@ impl Checker {
             // Reborrow so the stack and its ids can be borrowed apart.
             let rb = &mut *guard;
             if rb.source_stack.len() == 100 || rb.target_stack.len() == 100 {
-                rb.overflow = true;
-                return Ternary::FALSE;
+                // We stop relating if we reach 100 levels of nesting. This is a backstop to catch infinite recursion
+                // that wasn't caught by isDeeplyNestedType. It will also stop relating types that truly are over 100
+                // levels deep, but those are exceedingly rare.
+                return Ternary::MAYBE;
             }
             let maybe_start = rb.maybe_keys.len() as i32;
             rb.push_maybe_key(id);

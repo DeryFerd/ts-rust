@@ -945,7 +945,11 @@ impl crate::printer::EmitResolver for EmitResolver {
                 //           return a;
                 //       }
                 if signatures_of_symbol.len() == 1 {
-                    let declaration = c.sig(signatures_of_symbol[0]).declaration;
+                    let signature = signatures_of_symbol[0];
+                    if signature == c.get_signature_of_full_signature_type(node) {
+                        return false;
+                    }
+                    let declaration = c.sig(signature).declaration;
                     if declaration != node && !declaration.flags().intersects(NodeFlags::JS_DOC) {
                         return true;
                     }

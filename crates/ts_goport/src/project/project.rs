@@ -9,6 +9,7 @@
 
 use crate::project::prelude::*;
 
+use crate::contentmapper;
 use crate::frontend::compiler::CompilerHost as _;
 use crate::frontend::core_ext::TypeAcquisition;
 use crate::frontend::vfs::Fs as _;
@@ -95,6 +96,10 @@ pub struct Project {
 
     pub program_files_watch: Option<Rc<WatchedFiles<Option<Rc<RefCell<FxHashSet<tspath::Path>>>>>>>,
     pub typings_watch: Option<Rc<WatchedFiles<PatternsAndIgnored>>>,
+    // tsgo#4712. PORT: Go `*collections.Set[tspath.Path]` (nil until the
+    // first program) is `Option<Rc<FxHashSet<..>>>`.
+    pub content_mapper_watch: Option<Rc<WatchedFiles<Vec<String>>>>,
+    pub content_mapper_watched_files: Option<Rc<FxHashSet<tspath::Path>>>,
 
     pub checker_pool: Option<Rc<CheckerPool>>,
 
@@ -128,6 +133,7 @@ pub fn new_inferred_project(
     current_directory: &str,
     compiler_options: Option<Rc<CompilerOptions>>,
     root_file_names: &[String],
+    content_mappers: &[Rc<contentmapper::Mapper>],
     builder: &ProjectCollectionBuilder,
     logger: Option<Rc<logging::LogTree>>,
 ) -> Rc<RefCell<Project>> {
@@ -155,9 +161,10 @@ pub fn new_inferred_project(
             ..Default::default()
         }),
     };
-    let command_line = tsoptions::new_parsed_command_line(
+    let command_line = new_inferred_project_command_line(
         compiler_options,
         root_file_names.to_vec(),
+        content_mappers,
         tspath::ComparePathsOptions {
             use_case_sensitive_file_names: builder.fs.fs.use_case_sensitive_file_names(),
             current_directory: current_directory.to_string(),
@@ -165,6 +172,22 @@ pub fn new_inferred_project(
     );
     p.borrow_mut().command_line = Some(Rc::new(command_line));
     p
+}
+
+// Go: project/project.go:140 newInferredProjectCommandLine (tsgo#4712)
+pub fn new_inferred_project_command_line(
+    compiler_options: Rc<CompilerOptions>,
+    root_file_names: Vec<String>,
+    content_mappers: &[Rc<contentmapper::Mapper>],
+    compare_paths_options: tspath::ComparePathsOptions,
+) -> tsoptions::ParsedCommandLine {
+    let mut command_line = tsoptions::new_parsed_command_line(
+        compiler_options,
+        root_file_names,
+        compare_paths_options,
+    );
+    command_line.parsed_config.content_mappers = content_mappers.to_vec();
+    command_line
 }
 
 // Go: project/project.go:134 NewProject
@@ -232,6 +255,21 @@ pub fn new_project(
             identity,
         ));
     }
+    project.content_mapper_watch = Some(new_watched_files_for_paths(
+        &format!("content mapper configuration files for {config_file_name}"),
+        lsproto::WatchKind(
+            lsproto::WatchKind::CREATE.0
+                | lsproto::WatchKind::CHANGE.0
+                | lsproto::WatchKind::DELETE.0,
+        ),
+        lsproto::get_client_capabilities(&builder.ctx)
+            .workspace
+            .did_change_watched_files
+            .relative_pattern_support,
+        &builder.session_options.current_directory,
+        &builder.session_options.current_directory,
+        builder.fs.fs.use_case_sensitive_file_names(),
+    ));
     Rc::new(RefCell::new(project))
 }
 
@@ -356,6 +394,8 @@ impl Project {
 
             program_files_watch: self.program_files_watch.clone(),
             typings_watch: self.typings_watch.clone(),
+            content_mapper_watch: self.content_mapper_watch.clone(),
+            content_mapper_watched_files: self.content_mapper_watched_files.clone(),
 
             checker_pool: self.checker_pool.clone(),
 
@@ -410,19 +450,8 @@ impl Project {
             new_root_names.extend_from_slice(original_root_names);
             new_root_names.extend_from_slice(&self.typings_files);
 
-            // Create a new ParsedCommandLine with the augmented root file names
-            let host = self
-                .host
-                .as_ref()
-                .expect("invalid memory address or nil pointer dereference: Project.host");
-            let augmented = tsoptions::new_parsed_command_line(
-                command_line.compiler_options().clone(),
-                new_root_names,
-                tspath::ComparePathsOptions {
-                    use_case_sensitive_file_names: host.fs().use_case_sensitive_file_names(),
-                    current_directory: self.current_directory.clone(),
-                },
-            );
+            // tsgo#4712
+            let augmented = command_line.with_file_names(new_root_names);
             *self.command_line_with_typings_files.borrow_mut() = Some(Rc::new(augmented));
         }
         self.command_line_with_typings_files.borrow().clone()
@@ -542,34 +571,58 @@ impl Project {
                     let is_dirty_file = dirty_file
                         .as_ref()
                         .is_some_and(|dirty_file| Rc::ptr_eq(dirty_file, file));
-                    if !is_dirty_file {
+                    if !is_dirty_file
+                        && !file.is_content_mapper_failure_stub()
+                        && !file.is_content_mapper_supplemental()
+                    {
                         // UpdateProgram acquired the changed file only, so we need to ref everything else
-                        ref_program_file(
-                            &builder.parse_cache,
-                            file.parse_options(),
-                            file.text,
-                            file.script_kind,
-                        );
+                        if !file.content_mapper().is_empty() {
+                            builder
+                                .content_mapped_parse_cache
+                                .ref_(&content_mapped_parse_cache_key_for_file(file));
+                        } else {
+                            ref_program_file(
+                                &builder.parse_cache,
+                                file.parse_options(),
+                                file.text,
+                                file.script_kind,
+                            );
+                        }
                     }
                 }
                 for file in new_program.duplicate_source_files() {
-                    ref_program_file(
-                        &builder.parse_cache,
-                        &file.parse_options,
-                        file.text,
-                        file.script_kind,
-                    );
+                    if !file.is_content_mapper_failure_stub {
+                        if !file.content_mapper.is_empty() {
+                            builder
+                                .content_mapped_parse_cache
+                                .ref_(&content_mapped_parse_cache_key_for_duplicate(file));
+                        } else {
+                            ref_program_file(
+                                &builder.parse_cache,
+                                &file.parse_options,
+                                file.text,
+                                file.script_kind,
+                            );
+                        }
+                    }
                 }
             } else if let Some(dirty_file) = &dirty_file {
                 // UpdateProgram always acquires the dirty file before deciding whether it can
                 // reuse the old program. If it falls back to a full rebuild, release that
                 // speculative acquire so the rebuilt program is the only remaining owner.
-                deref_program_file(
-                    &builder().parse_cache,
-                    dirty_file.parse_options(),
-                    dirty_file.text,
-                    dirty_file.script_kind,
-                );
+                if !dirty_file.content_mapper().is_empty() {
+                    deref_content_mapped_file(
+                        &builder().content_mapped_parse_cache,
+                        &content_mapped_parse_cache_key_for_file(dirty_file),
+                    );
+                } else {
+                    deref_program_file(
+                        &builder().parse_cache,
+                        dirty_file.parse_options(),
+                        dirty_file.text,
+                        dirty_file.script_kind,
+                    );
+                }
             }
         } else {
             let mut typings_location = String::new();

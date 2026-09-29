@@ -134,6 +134,8 @@ impl ToSnapshot<'_> {
                     end: d.end,
                     code: d.code,
                     category: d.category,
+                    source: d.source.clone(),
+                    message_text: d.message_text.clone(),
                     message_key: d.message_key.clone(),
                     message_args: d.message_args.clone().unwrap_or_default(),
                     message_chain: self

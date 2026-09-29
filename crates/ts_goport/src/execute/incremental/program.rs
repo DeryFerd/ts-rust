@@ -21,12 +21,18 @@ use super::incremental::{BuildInfoReader, Host, marshal_build_info};
 use super::program_to_snapshot::program_to_snapshot;
 use super::snapshot::*;
 use super::snapshot_to_build_info::snapshot_to_build_info;
+use crate::emitter::emitter::EmitOnly;
 use crate::emitter::program_emit::{
     EmitOptions, EmitResult, WriteFileData, check_cannot_see_outputs, early_emit_options_allow,
 };
 use crate::execute::tsc::emit::ProgramLike;
 use crate::frontend::prelude::*;
+use std::cell::Cell;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+/// Go `func() time.Time`, the `nestedEmitNow` of `NewProgram` (`sys.Now`).
+pub type NestedEmitNow = Rc<dyn Fn() -> SystemTime>;
 
 // Go: incremental/program.go:20 SignatureUpdateKind
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -38,8 +44,11 @@ pub enum SignatureUpdateKind {
     UsedVersion = 2,
 }
 
-// Go: incremental/program.go:28 Program
-// PORT: Go `host` is nil for a program read from build info.
+// Go: incremental/program.go:31 Program
+// PORT: Go `host` is nil for a program read from build info. Go
+// `nestedEmitMu` guards the nested emit fields; the program is used on one
+// thread, so they are `Cell`s. Go `time.Time` is `Option<SystemTime>`
+// (`None` = zero).
 pub struct Program {
     pub(crate) snapshot: Rc<RefCell<Snapshot>>,
     pub(crate) program: Option<&'static GoProgram>,
@@ -48,8 +57,17 @@ pub struct Program {
     // Testing data
     pub(crate) testing_data: Option<RefCell<TestingData>>,
 
+    nested_emit_now: Option<NestedEmitNow>,
+    nested_emit_depth: Cell<i32>,
+    nested_emit_start: Cell<Option<SystemTime>>,
+    nested_emit_time: Cell<Duration>,
+
     // PORT: not in Go. What `start_check` read and started (see there).
     started: RefCell<StartedCheck>,
+    // PORT: not in Go. The time that `start_check` spent in the part of
+    // `GetSemanticDiagnostics` that it does before it sends the check (see
+    // `take_started_check_time`).
+    started_check_time: Cell<Duration>,
 }
 
 /// The work of `tsc.EmitFilesAndReportErrors` that `Program::start_check`
@@ -68,17 +86,27 @@ struct StartedCheck {
     emit: Option<StartedEmit>,
 }
 
-// Go: incremental/program.go:38 NewProgram
+// Go: incremental/program.go:48 NewProgram
 // PORT: Go `program` is the current program (`prog()`), so it is not a
 // parameter.
 #[must_use]
-pub fn new_program(old_program: Option<&Program>, host: Rc<dyn Host>, testing: bool) -> Program {
+pub fn new_program(
+    old_program: Option<&Program>,
+    host: Rc<dyn Host>,
+    nested_emit_now: Option<NestedEmitNow>,
+    testing: bool,
+) -> Program {
     let mut incremental_program = Program {
         snapshot: program_to_snapshot(old_program, testing),
         program: Some(prog()),
         host: Some(host),
         testing_data: None,
+        nested_emit_now,
+        nested_emit_depth: Cell::new(0),
+        nested_emit_start: Cell::new(None),
+        nested_emit_time: Cell::new(Duration::ZERO),
         started: RefCell::default(),
+        started_check_time: Cell::new(Duration::ZERO),
     };
 
     if testing {
@@ -102,7 +130,7 @@ pub fn new_program(old_program: Option<&Program>, host: Rc<dyn Host>, testing: b
     incremental_program
 }
 
-// Go: incremental/incremental.go:43 ReadBuildInfoProgram
+// Go: incremental/incremental.go:44 ReadBuildInfoProgram
 #[must_use]
 pub fn read_build_info_program(
     config: &ParsedCommandLine,
@@ -113,6 +141,13 @@ pub fn read_build_info_program(
     let build_info = reader.read_build_info(config)?;
     if !build_info.is_valid_version() || !build_info.is_incremental() {
         return None;
+    }
+    // If any configured content mapper's identity has changed, files it produced may be stale, so the
+    // old program cannot be reused.
+    let content_mapper_project = host.content_mapper_project();
+    match content_mapper_identities(content_mapper_project.as_deref()) {
+        Ok(identities) if build_info.content_mapper_identities_match(identities.as_deref()) => {}
+        _ => return None,
     }
 
     // Convert to information that can be used to create incremental program
@@ -125,7 +160,12 @@ pub fn read_build_info_program(
         program: None,
         host: None,
         testing_data: None,
+        nested_emit_now: None,
+        nested_emit_depth: Cell::new(0),
+        nested_emit_start: Cell::new(None),
+        nested_emit_time: Cell::new(Duration::ZERO),
         started: RefCell::default(),
+        started_check_time: Cell::new(Duration::ZERO),
     })
 }
 
@@ -149,10 +189,59 @@ pub struct TestingData {
 }
 
 impl Program {
-    // Go: incremental/program.go:64 GetTestingData
+    // Go: incremental/program.go:75 GetTestingData
     #[must_use]
     pub fn get_testing_data(&self) -> Option<std::cell::Ref<'_, TestingData>> {
         self.testing_data.as_ref().map(RefCell::borrow)
+    }
+
+    // Go: incremental/program.go:79 beginNestedEmit
+    // PORT: Go returns the `done` func for `defer`; the caller calls the
+    // returned closure when the nested emit ends. A negative Go duration
+    // (the clock went back) is zero here.
+    pub(crate) fn begin_nested_emit(&self) -> impl FnOnce() + '_ {
+        let now = self.nested_emit_now.clone();
+        if let Some(now) = &now {
+            if self.nested_emit_depth.get() == 0 {
+                self.nested_emit_start.set(Some(now()));
+            }
+            self.nested_emit_depth.set(self.nested_emit_depth.get() + 1);
+        }
+
+        move || {
+            let Some(now) = now else {
+                return;
+            };
+            self.nested_emit_depth.set(self.nested_emit_depth.get() - 1);
+            if self.nested_emit_depth.get() == 0 {
+                let start = self
+                    .nested_emit_start
+                    .get()
+                    .expect("beginNestedEmit set the start");
+                let elapsed = now().duration_since(start).unwrap_or_default();
+                self.nested_emit_time
+                    .set(self.nested_emit_time.get() + elapsed);
+            }
+        }
+    }
+
+    // Go: incremental/program.go:102 TakeNestedEmitTime
+    #[must_use]
+    pub fn take_nested_emit_time(&self) -> Duration {
+        self.nested_emit_time.replace(Duration::ZERO)
+    }
+
+    /// PORT: not in Go. The time that `start_check` spent on the affected
+    /// files (`collectAllAffectedFiles`, with the nested declaration emits
+    /// of their signatures) before it sent the check, by the
+    /// `nestedEmitNow` clock (Go `sys.Now`); zero when it did not run. Go
+    /// does that work inside the `GetSemanticDiagnostics` call that
+    /// `tsc.EmitFilesAndReportErrors` times as the check. That call adds
+    /// this time to its own, so the nested emit time that it then moves to
+    /// the emit time is inside the check time, as in Go.
+    #[must_use]
+    pub fn take_started_check_time(&self) -> Duration {
+        self.started_check_time.replace(Duration::ZERO)
     }
 
     // PORT: testing. Go `testingData.SemanticDiagnosticsPerFile.Load(path)`,
@@ -322,10 +411,15 @@ impl Program {
         if has_global_diagnostics {
             return;
         }
+        let check_start = self.nested_emit_now.as_ref().map(|now| now());
         if let Some(affected_files) = self.semantic_diagnostics_files_to_check(Node::NIL) {
             self.started.borrow_mut().check = Some(
                 start_semantic_diagnostics_without_no_emit_filtering(&affected_files),
             );
+        }
+        if let (Some(now), Some(check_start)) = (&self.nested_emit_now, check_start) {
+            self.started_check_time
+                .set(now().duration_since(check_start).unwrap_or_default());
         }
     }
 
@@ -437,7 +531,7 @@ impl Program {
         result
     }
 
-    // Go: incremental/program.go:183 GetDeclarationDiagnostics
+    // Go: incremental/program.go:225 GetDeclarationDiagnostics
     // GetDeclarationDiagnostics implements compiler.AnyProgram interface.
     #[must_use]
     pub fn get_declaration_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
@@ -445,7 +539,8 @@ impl Program {
         let result = emit_files(
             self,
             EmitOptions {
-                target_source_file: file,
+                // #4699: Go `core.SingleElementSlice(file)`: nil for a nil file.
+                target_source_files: file.is_some().then(|| vec![file]),
                 ..EmitOptions::default()
             },
             true,
@@ -461,7 +556,7 @@ impl Program {
         get_suggestion_diagnostics(file) // TODO: incremental suggestion diagnostics (only relevant in editor incremental builder?)
     }
 
-    // Go: incremental/program.go:202 Emit
+    // Go: incremental/program.go:243 Emit
     // GetModeForUsageLocation implements compiler.AnyProgram interface.
     // PORT: with an emit that `start_emit` sent, this waits for it
     // and finishes it. That emit started only without `noEmit` and
@@ -474,16 +569,19 @@ impl Program {
             return finish_emit_files(self, started, &options);
         }
 
-        let result = if self.snapshot.borrow().options.no_emit.is_true() {
-            Some(EmitResult {
-                emit_skipped: true,
-                ..EmitResult::default()
-            })
-        } else {
-            handle_no_emit_on_error(self, options.target_source_file)
-        };
+        let mut result = None;
+        // #4407: Go `HandleNoEmitOptions` with `emitBuildInfo` under noEmit.
+        if !options.force_emit && options.emit_only != EmitOnly::BuilderSignature {
+            let emit_build_info: &dyn Fn() -> Option<EmitResult> =
+                &|| self.emit_build_info(&options);
+            result = handle_no_emit_options(
+                self,
+                options.target_source_files.as_deref(),
+                self.options().no_emit.is_true().then_some(emit_build_info),
+            );
+        }
         if let Some(mut result) = result {
-            if options.target_source_file.is_some() {
+            if options.target_source_files.is_some() || self.options().no_emit.is_true() {
                 return result;
             }
 
@@ -635,7 +733,17 @@ impl Program {
         if !self.snapshot.borrow().build_info_emit_pending {
             return None;
         }
-        let build_info = snapshot_to_build_info(&self.snapshot.borrow(), &build_info_file_name);
+        let build_info =
+            match snapshot_to_build_info(&self.snapshot.borrow(), &build_info_file_name) {
+                Ok(build_info) => build_info,
+                Err(err) => {
+                    return Some(EmitResult {
+                        emit_skipped: true,
+                        diagnostics: vec![content_mapper_project_diagnostic(&err)],
+                        ..EmitResult::default()
+                    });
+                }
+            };
         let text = match marshal_build_info(&build_info) {
             Ok(text) => text,
             Err(err) => panic!("Failed to marshal build info: {err}"),
@@ -837,39 +945,62 @@ fn normalize_package_jsons(mut package_jsons: Vec<String>) -> Vec<String> {
     package_jsons
 }
 
-// Go: compiler/program.go:1728 HandleNoEmitOnError
-// PORT: `emitter::program_emit::handle_no_emit_on_error` reads the plain
-// program. Go passes the `ProgramLike`, whose bind and semantic
-// diagnostics are the incremental ones here, so this is the same body over
-// `ProgramLike`.
+// Go: compiler/program.go:1905 HandleNoEmitOptions
+// HandleNoEmitOptions mirrors tsc's handleNoEmitOptions.
+// PORT: #4407 replaced Go `HandleNoEmitOnError`.
+// `emitter::program_emit::handle_no_emit_options` is the plain program form
+// (nil `emitBuildInfo`). Go passes the `ProgramLike`, whose bind and
+// semantic diagnostics are the incremental ones here, so this is the same
+// body over `ProgramLike`. Go `files` nil is `None`.
 #[must_use]
-pub fn handle_no_emit_on_error(program: &dyn ProgramLike, file: Node) -> Option<EmitResult> {
-    if !program.options().no_emit_on_error.is_true() {
-        return None; // No emit on error is not set, so we can proceed with emitting
-    }
+pub fn handle_no_emit_options(
+    program: &dyn ProgramLike,
+    files: Option<&[Node]>,
+    emit_build_info: Option<&dyn Fn() -> Option<EmitResult>>,
+) -> Option<EmitResult> {
+    if !program.options().no_emit.is_true() {
+        if !program.options().no_emit_on_error.is_true() {
+            return None; // NoEmit is false and NoEmitOnError is also false, so we can proceed with normal emit
+        }
 
-    let diagnostics = get_diagnostics_of_any_program(
-        file,
-        true,
-        &mut |file| program.get_bind_diagnostics(file),
-        &mut |file| program.get_semantic_diagnostics(file),
-        &mut || program.get_global_diagnostics(),
-        &mut |file| program.get_declaration_diagnostics(file),
-    );
-    if diagnostics.is_empty() {
-        return None; // No diagnostics, so we can proceed with emitting
+        let diagnostics = get_diagnostics_of_any_program(
+            files,
+            true,
+            &mut |file| program.get_bind_diagnostics(file),
+            &mut |file| program.get_semantic_diagnostics(file),
+            &mut || program.get_global_diagnostics(),
+            &mut |file| program.get_declaration_diagnostics(file),
+        );
+        if diagnostics.is_empty() {
+            return None; // NoEmitOnError is enabled, but no diagnostics were found, so we can proceed with emitting
+        }
+        return Some(EmitResult {
+            diagnostics,
+            emit_skipped: true,
+            ..EmitResult::default()
+        });
     }
-    Some(EmitResult {
-        diagnostics,
-        emit_skipped: true,
-        ..EmitResult::default()
-    })
+    if files.is_some() {
+        return Some(EmitResult {
+            emit_skipped: true,
+            ..EmitResult::default()
+        });
+    }
+    if let Some(emit_build_info) = emit_build_info
+        && let Some(result) = emit_build_info()
+    {
+        return Some(result);
+    }
+    Some(EmitResult::default())
 }
 
 // Go: compiler/program.go:1710 ProgramLike (var _ compiler.ProgramLike = (*Program)(nil))
 impl ProgramLike for Program {
     fn options(&self) -> &'static CompilerOptions {
         Program::options(self)
+    }
+    fn as_incremental_program(&self) -> Option<&Program> {
+        Some(self)
     }
     fn get_bind_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
         Program::get_bind_diagnostics(self, file)

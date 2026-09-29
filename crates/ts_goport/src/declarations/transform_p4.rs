@@ -923,9 +923,18 @@ impl DeclarationTransformer {
             return;
         }
 
+        let host_id = self.get_expando_host_id(declaration);
+
         if is_declaration(declaration)
             && is_declaration_and_not_visible(&ec, &*self.resolver, declaration)
         {
+            // The host isn't visible (yet) - printing the type of a visible declaration may still
+            // late-mark it as visible (e.g. an exported variable whose type prints as `typeof host`),
+            // so defer the assignment to be processed if and when that happens.
+            self.deferred_expando_assignments
+                .entry(host_id)
+                .or_default()
+                .push(node);
             return;
         }
 
@@ -951,7 +960,6 @@ impl DeclarationTransformer {
             local_name = f.new_generated_name_for_node(node);
         }
 
-        let host_id = self.get_expando_host_id(declaration);
         let (_, cleanup) = self.setup_diagnostic_context(node);
 
         if is_identifier(node.right()) {
@@ -1187,6 +1195,14 @@ impl DeclarationTransformer {
 
     // Go: transformers/declarations/transform.go:2878 DeclarationTransformer.createFullExpandoBlock
     pub(crate) fn create_full_expando_block(&mut self, id: Node) -> Node {
+        // Process any expando assignments on this host that were skipped because it wasn't
+        // visible when they were collected - if it's still not visible, they simply get
+        // re-deferred, and are dropped if the host is never late-marked visible.
+        if let Some(deferred) = self.deferred_expando_assignments.remove(&id) {
+            for assignment in deferred {
+                self.transform_expando_assignment(assignment);
+            }
+        }
         let n = self.expando_hosts.get(&id).copied().unwrap_or(Node::NIL);
         if let Some(add_ons) = self.expando_members.get(&id).cloned() {
             let ec = self.emit_context.clone();

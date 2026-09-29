@@ -93,6 +93,8 @@ impl Checker {
     // reach the checker, so the callback records each report in order and the
     // same `lastError` logic runs on the recorded reports after the scan. No
     // other diagnostic is added during the scan, so the order is the same.
+    // Since #4825 Go `lastError` is the stored diagnostic that `addDiagnostic`
+    // returns, and a spelling suggestion goes on that stored diagnostic.
     pub fn check_grammar_regular_expression_literal(&mut self, node: Node) -> bool {
         let source_file = get_source_file_of_node(node);
         if !self.has_parse_diagnostics(source_file) {
@@ -116,19 +118,15 @@ impl Checker {
             reg_exp_scanner.set_on_error(None);
             debug_assert!(token_is_regular_expression_literal);
 
-            // Replay of the Go `SetOnError` callback. `lastError` is an index
-            // into `pending`; entries are added to the checker in order below.
-            let mut pending: Vec<Diagnostic> = Vec::new();
-            let mut last_error: Option<usize> = None;
+            // Replay of the Go `SetOnError` callback. `last_error` is Go
+            // `lastError`: its position, its length, and the stored diagnostic
+            // (`None` when `addDiagnostic` discarded it).
+            let mut last_error: Option<(i32, i32, Option<&mut Diagnostic>)> = None;
             for (message, start, length, args) in reports.take() {
-                let matches_last = last_error.is_some_and(|i| {
-                    let e = &pending[i];
-                    start == e.pos() && length == e.len()
-                });
-                if message.category() == crate::diagnostics::Category::Message
-                    && last_error.is_some()
-                    && matches_last
-                {
+                let matches_last = last_error
+                    .as_ref()
+                    .is_some_and(|&(pos, len, _)| start == pos && length == len);
+                if message.category() == crate::diagnostics::Category::Message && matches_last {
                     // For providing spelling suggestions.
                     let err = new_diagnostic(
                         Node::NIL,
@@ -136,23 +134,21 @@ impl Checker {
                         message,
                         args,
                     );
-                    let i = last_error.unwrap();
-                    pending[i].add_related_info(Some(err));
-                } else if last_error.is_none() || start != pending[last_error.unwrap()].pos() {
-                    pending.push(new_diagnostic(
+                    if let Some((_, _, Some(stored))) = &mut last_error {
+                        stored.add_related_info(Some(err));
+                    }
+                } else if last_error.as_ref().is_none_or(|&(pos, _, _)| start != pos) {
+                    let diagnostic = new_diagnostic(
                         source_file,
                         TextRange::new(start, start + length),
                         message,
                         args,
-                    ));
-                    last_error = Some(pending.len() - 1);
+                    );
+                    // Go (#4825): `lastError = c.addDiagnostic(lastError)`.
+                    last_error = Some((start, length, self.add_diagnostic(diagnostic)));
                 }
             }
-            let has_error = last_error.is_some();
-            for d in pending {
-                self.add_diagnostic(d);
-            }
-            return has_error;
+            return last_error.is_some();
         }
         false
     }
@@ -1476,9 +1472,9 @@ impl Checker {
         }
 
         let equals_greater_than_token = node.equals_greater_than_token();
-        let start_line = get_ecma_line_of_position(file, equals_greater_than_token.pos());
-        let end_line = get_ecma_line_of_position(file, equals_greater_than_token.end());
-        start_line != end_line
+        let arrow_full_text = &source_file_text(file)
+            [equals_greater_than_token.pos() as usize..equals_greater_than_token.end() as usize];
+        arrow_full_text.chars().any(is_line_break)
             && self.grammar_error_on_node(
                 equals_greater_than_token,
                 diag::Line_terminator_not_permitted_before_arrow,
@@ -1678,7 +1674,7 @@ impl Checker {
     pub fn check_grammar_class_declaration_heritage_clauses(
         &mut self,
         node: Node,
-        file: Node,
+        _file: Node,
     ) -> bool {
         let mut seen_extends_clause = false;
         let mut seen_implements_clause = false;
@@ -1716,40 +1712,6 @@ impl Checker {
                         );
                     }
 
-                    if type_nodes.len() > 0 {
-                        for j in node.eager_js_doc(file) {
-                            let tags = j.tags();
-                            if tags.is_nil() {
-                                continue;
-                            }
-                            for tag in tags.nodes() {
-                                if tag.kind() == SyntaxKind::JsDocAugmentsTag {
-                                    let target = type_nodes.get(0);
-                                    let source = tag.class_name();
-                                    let target_name = get_identifier_from_entity_name_expression(
-                                        target.expression(),
-                                    );
-                                    let source_name = get_identifier_from_entity_name_expression(
-                                        source.expression(),
-                                    );
-                                    if target_name.is_some()
-                                        && source_name.is_some()
-                                        && target_name.text() != source_name.text()
-                                    {
-                                        return self.grammar_error_on_node(
-                                            source_name,
-                                            diag::JSDoc_0_1_does_not_match_the_extends_2_clause,
-                                            args![
-                                                tag.tag_name().text(),
-                                                source_name.text(),
-                                                target_name.text()
-                                            ],
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
                     seen_extends_clause = true;
                 } else {
                     if heritage_clause.token() != SyntaxKind::ImplementsKeyword {

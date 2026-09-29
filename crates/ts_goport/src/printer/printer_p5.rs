@@ -20,6 +20,7 @@
 
 use crate::flags_macros::{go_enum, go_flags};
 use crate::prelude::*;
+use crate::printer::semicolon_writer::get_trailing_semicolon_deferring_writer;
 use crate::printer::*;
 
 thread_local! {
@@ -547,6 +548,10 @@ impl Printer {
         self.source_map_source_index = -1;
 
         self.set_source_file(source_file);
+        let mut writer = writer;
+        if self.options.omit_trailing_semicolon {
+            writer = get_trailing_semicolon_deferring_writer(writer);
+        }
         self.writer = Some(writer);
         self.writer_p5().clear();
         // PORT: Go grows the writer buffer to the source text length when the
@@ -1765,8 +1770,8 @@ impl Printer {
         _private_name: bool,
     ) -> bool {
         if self.current_source_file.is_some() {
-            is_file_level_unique_name(
-                identifiers_source_file(&self.emit_context, self.current_source_file),
+            self.emit_context.is_file_level_unique_name(
+                self.current_source_file,
                 name,
                 self.print_handlers.has_global_name.as_deref(),
             )

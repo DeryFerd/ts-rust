@@ -7,21 +7,57 @@
 
 use crate::ls::prelude::*;
 
+use crate::spanmap::Feature;
+
 impl LanguageService {
-    // Go: ls/sourcedefinition.go:24 ProvideSourceDefinition
+    // Go: ls/sourcedefinition.go:26 ProvideSourceDefinition
     pub fn provide_source_definition(
         &self,
         ctx: &Context,
         document_uri: &lsproto::DocumentUri,
         position: lsproto::Position,
     ) -> Result<lsproto::DefinitionResponse, GoError> {
+        let (program, file) = self.get_program_and_file(document_uri);
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            file,
+            position,
+            Feature::DEFINITION,
+        );
+        let mut results = Vec::with_capacity(positions.len());
+        for mapped in &positions {
+            if mapped.fidelity.is_single_segment() {
+                let result = self.provide_source_definition_at_position(
+                    ctx,
+                    program,
+                    mapped.script,
+                    mapped.position,
+                )?;
+                results.push(result);
+            }
+        }
+        Ok(combine_definition_responses(
+            results,
+            lsproto::get_client_capabilities(ctx)
+                .text_document
+                .definition
+                .link_support,
+        ))
+    }
+
+    // Go: ls/sourcedefinition.go:46 provideSourceDefinitionAtPosition
+    // PORT: Go `core.TextPos` is `i32`.
+    pub fn provide_source_definition_at_position(
+        &self,
+        ctx: &Context,
+        program: &compiler::NewProgram,
+        file: Node,
+        text_pos: i32,
+    ) -> Result<lsproto::DefinitionResponse, GoError> {
         let caps = lsproto::get_client_capabilities(ctx);
         let client_supports_link = caps.text_document.definition.link_support;
 
-        let (program, file) = self.get_program_and_file(document_uri);
-        let pos = self
-            .converters
-            .line_and_character_to_position(&file, &position);
+        let pos = text_pos;
         let mut resolver = self.new_source_def_resolver(program, source_file_file_name(file));
         let node = astnav::get_touching_property_name(file, pos);
 
@@ -33,19 +69,20 @@ impl LanguageService {
                 // PORT: Go reads `ref.Pos()` through the pointer; a nil
                 // pointer panics there.
                 let ref_ = ref_.expect("invalid memory address or nil pointer dereference");
-                let origin_selection_range =
+                let (origin_selection_range, _) =
                     self.create_lsp_range_from_bounds(ref_.range.pos(), ref_.range.end(), file);
                 return Ok(self.create_definition_locations(
                     origin_selection_range,
                     client_supports_link,
                     &declarations,
                     None, /*reference*/
+                    Feature::DEFINITION,
                 ));
             }
             return Ok(lsproto::LocationOrLocationsOrDefinitionLinksOrNull::default());
         }
 
-        let origin_selection_range = self.create_lsp_range_from_node(node, file);
+        let (origin_selection_range, _) = self.create_lsp_range_from_node(node, file);
 
         // If the cursor is directly on a module specifier string, resolve to the
         // implementation file's entry point.
@@ -66,10 +103,17 @@ impl LanguageService {
                         client_supports_link,
                         &get_source_definition_entry_declarations(source_file),
                         None,
+                        Feature::DEFINITION,
                     ));
                 }
             }
-            return self.provide_definition_worker(ctx, document_uri, position);
+            return Ok(self.provide_definition_at_position(
+                ctx,
+                program,
+                file,
+                text_pos,
+                client_supports_link,
+            ));
         }
 
         // Phase 1: Syntactic fast path — when the cursor is inside an
@@ -100,6 +144,7 @@ impl LanguageService {
                         client_supports_link,
                         &unique_declaration_nodes(&module_results),
                         None,
+                        Feature::DEFINITION,
                     ));
                 }
             }
@@ -136,16 +181,24 @@ impl LanguageService {
                         client_supports_link,
                         &get_source_definition_entry_declarations(source_file),
                         None,
+                        Feature::DEFINITION,
                     ));
                 }
             }
-            return self.provide_definition_worker(ctx, document_uri, position);
+            return Ok(self.provide_definition_at_position(
+                ctx,
+                program,
+                file,
+                text_pos,
+                client_supports_link,
+            ));
         }
         Ok(self.create_definition_locations(
             origin_selection_range,
             client_supports_link,
             &declarations,
             None, /*reference*/
+            Feature::DEFINITION,
         ))
     }
 }
@@ -202,6 +255,7 @@ impl LanguageService {
                 Rc::new(no_dts_options),
                 &program.get_global_typings_cache_location(),
                 "",
+                program.command_line().content_mapper_extensions(),
             ),
             parsed_files: None,
         }
@@ -606,7 +660,9 @@ impl SourceDefResolver<'_> {
                     ..Default::default()
                 },
                 text,
-                crate::frontend::core_ext::get_script_kind_from_file_name(file_name),
+                // A declaration map's `sources` entries are arbitrary strings, so the
+                // file name here may not have a recognized extension.
+                crate::frontend::core_ext::ensure_script_kind_from_file_name(file_name),
             ));
             crate::program::note_parsed_source_file(&file);
             crate::program::publish_parsed_files(&self.ls.program.get_current_directory());

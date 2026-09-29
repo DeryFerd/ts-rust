@@ -339,6 +339,14 @@ impl Checker {
 
     // Go: checker/checker.go:4070 checkReturnStatement
     pub fn check_return_statement(&mut self, node: Node) {
+        // Always check the return expression so its identifiers are resolved even when the
+        // return statement is misplaced (grammar error), keeping diagnostics stable
+        // regardless of traversal order.
+        let expr_node = node.expression();
+        let mut expr_type = self.undefined_type;
+        if expr_node.is_some() {
+            expr_type = self.check_expression_cached(expr_node);
+        }
         if self.check_grammar_statement_in_ambient_context(node) {
             return;
         }
@@ -362,15 +370,10 @@ impl Checker {
         let signature = self.get_signature_from_declaration(container);
         let return_type = self.get_return_type_of_signature(signature);
         let function_flags = get_function_flags(container);
-        let expr_node = node.expression();
         if self.strict_null_checks
             || expr_node.is_some()
             || self.ty(return_type).flags.intersects(TypeFlags::NEVER)
         {
-            let mut expr_type = self.undefined_type;
-            if expr_node.is_some() {
-                expr_type = self.check_expression_cached(expr_node);
-            }
             if is_set_accessor_declaration(container) {
                 if expr_node.is_some() {
                     self.error(node, diag::Setters_cannot_return_a_value, args![]);
@@ -722,12 +725,13 @@ impl Checker {
             self.check_class_for_static_property_name_conflicts(node);
         }
 
-        let base_type_node = get_extends_heritage_clause_element(node);
+        let base_type_node = get_class_extends_heritage_element(node);
         if base_type_node.is_some() {
             self.check_source_elements(base_type_node.type_arguments());
             let base_types = self.get_base_types(class_type);
             if !base_types.is_empty() {
                 let base_type = base_types[0];
+                self.check_js_doc_augments_tag_matches_extends(node, base_type_node, base_type);
                 let base_constructor_type = self.get_base_constructor_type_of_class(class_type);
                 let static_base_type = self.get_apparent_type(base_constructor_type);
                 self.check_base_type_accessibility(static_base_type, base_type_node);
@@ -838,13 +842,15 @@ impl Checker {
         self.check_members_for_override_modifier(node, class_type, type_with_this, static_type);
         let implemented_type_nodes = get_implements_heritage_clause_elements(node);
         for type_ref_node in implemented_type_nodes {
-            let expr = type_ref_node.expression();
-            if !is_entity_name_expression(expr) || is_optional_chain(expr) {
-                self.error(
-                    expr,
-                    diag::A_class_can_only_implement_an_identifier_Slashqualified_name_with_optional_type_arguments,
-                    args![],
-                );
+            if is_expression_with_type_arguments(type_ref_node) {
+                let expr = type_ref_node.expression();
+                if !is_entity_name_expression(expr) || is_optional_chain(expr) {
+                    self.error(
+                        expr,
+                        diag::A_class_can_only_implement_an_identifier_Slashqualified_name_with_optional_type_arguments,
+                        args![],
+                    );
+                }
             }
             self.check_type_reference_node(type_ref_node);
             let from_node = self.get_type_from_type_node(type_ref_node);
@@ -888,6 +894,50 @@ impl Checker {
         self.check_index_constraints(static_type, symbol, true /*isStaticIndex*/);
         self.check_class_or_interface_for_duplicate_index_signatures(node);
         self.check_property_initialization(node);
+    }
+
+    // Go: checker/checker.go:4404 checkJSDocAugmentsTagMatchesExtends
+    pub fn check_js_doc_augments_tag_matches_extends(
+        &mut self,
+        node: Node,
+        base_type_node: Node,
+        base_type: TypeId,
+    ) {
+        if !is_in_js_file(node) {
+            return;
+        }
+        let file = get_source_file_of_node(node);
+        for j in node.eager_js_doc(file).to_vec() {
+            let tags = j.tags();
+            if tags.is_nil() {
+                continue;
+            }
+            for tag in tags.nodes().to_vec() {
+                if tag.kind() != SyntaxKind::JsDocAugmentsTag {
+                    continue;
+                }
+                let source_type_node = tag.class_name();
+                let source_type = self.get_type_from_type_node(source_type_node);
+                if self.is_type_identical_to(source_type, base_type) {
+                    continue;
+                }
+                let target_name =
+                    get_identifier_from_entity_name_expression(base_type_node.expression());
+                let source_name =
+                    get_identifier_from_entity_name_expression(source_type_node.expression());
+                if target_name.is_some() && source_name.is_some() {
+                    self.error(
+                        source_name,
+                        diag::JSDoc_0_1_does_not_match_the_extends_2_clause,
+                        args![
+                            tag.tag_name().text(),
+                            source_name.text(),
+                            target_name.text()
+                        ],
+                    );
+                }
+            }
+        }
     }
 
     // Go: checker/checker.go:4374 checkClassForStaticPropertyNameConflicts
@@ -1439,7 +1489,7 @@ impl Checker {
         static_type: TypeId,
     ) {
         let mut base_with_this = TypeId::NIL;
-        let base_type_node = get_extends_heritage_clause_element(node);
+        let base_type_node = get_class_extends_heritage_element(node);
         if base_type_node.is_some() {
             let base_types = self.get_base_types(t);
             if !base_types.is_empty() {
@@ -1479,7 +1529,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4710 checkMemberForOverrideModifier
+    // Go: checker/checker.go:4738 checkMemberForOverrideModifier
     pub fn check_member_for_override_modifier(
         &mut self,
         node: Node,
@@ -1490,121 +1540,212 @@ impl Checker {
         type_with_this: TypeId,
         member: Node,
     ) {
+        let symbol = self.get_symbol_of_declaration(member);
+        if symbol.is_nil() {
+            return;
+        }
+
+        self.check_member_for_override_modifier_worker(
+            node,
+            static_type,
+            base_static_type,
+            base_with_this,
+            t,
+            type_with_this,
+            has_override_modifier(member),
+            has_abstract_modifier(member),
+            is_static(member),
+            is_parameter_declaration(member),
+            symbol,
+            member,
+        );
+    }
+
+    // Go: checker/checker.go:4747 getMemberOverrideModifierStatus
+    pub fn get_member_override_modifier_status(
+        &mut self,
+        node: Node,
+        member: Node,
+        member_symbol: SymbolId,
+    ) -> MemberOverrideStatus {
+        if member.name().is_nil() || member_symbol.is_nil() {
+            return MemberOverrideStatus::NONE;
+        }
+
+        let class_symbol = self.get_symbol_of_declaration(node);
+        if class_symbol.is_nil() {
+            return MemberOverrideStatus::NONE;
+        }
+
+        let t = self.get_declared_type_of_symbol(class_symbol);
+        let type_with_this = self.get_type_with_this_argument(t, TypeId::NIL, false);
+        let static_type = self.get_type_of_symbol(class_symbol);
+
+        let mut base_with_this = TypeId::NIL;
+        if get_class_extends_heritage_element(node).is_some() {
+            let base_types = self.get_base_types(t);
+            if !base_types.is_empty() {
+                let this_type = self.ty(t).as_interface_type().this_type;
+                base_with_this = self.get_type_with_this_argument(base_types[0], this_type, false);
+            }
+        }
+
+        let base_static_type = self.get_base_constructor_type_of_class(t);
+        self.check_member_for_override_modifier_worker(
+            node,
+            static_type,
+            base_static_type,
+            base_with_this,
+            t,
+            type_with_this,
+            has_syntactic_modifier(member, ModifierFlags::OVERRIDE),
+            has_abstract_modifier(member),
+            is_static(member),
+            false, /*memberIsParameterProperty*/
+            member_symbol,
+            Node::NIL, /*errorNode*/
+        )
+    }
+
+    // Go: checker/checker.go:4775 checkMemberForOverrideModifierWorker
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_member_for_override_modifier_worker(
+        &mut self,
+        node: Node,
+        static_type: TypeId,
+        base_static_type: TypeId,
+        base_with_this: TypeId,
+        t: TypeId,
+        type_with_this: TypeId,
+        member_has_override_modifier: bool,
+        member_has_abstract_modifier: bool,
+        member_is_static: bool,
+        member_is_parameter_property: bool,
+        member: SymbolId,
+        error_node: Node,
+    ) -> MemberOverrideStatus {
         let is_js = is_in_js_file(node);
-        let member_has_override_modifier = has_override_modifier(member);
-        if base_with_this.is_nil() {
-            if member_has_override_modifier {
+        let value_declaration = self.sym(member).value_declaration;
+        if member_has_override_modifier
+            && value_declaration.is_some()
+            && is_class_element(value_declaration)
+            && value_declaration.name().is_some()
+            && self.is_non_bindable_dynamic_name(value_declaration.name())
+        {
+            if error_node.is_some() {
+                let message = if is_js {
+                    diag::This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_its_name_is_dynamic
+                } else {
+                    diag::This_member_cannot_have_an_override_modifier_because_its_name_is_dynamic
+                };
+                self.error(error_node, message, args![]);
+            }
+            return MemberOverrideStatus::HAS_INVALID_OVERRIDE;
+        }
+
+        if base_with_this.is_some()
+            && (member_has_override_modifier
+                || self.compiler_options.no_implicit_override.is_true())
+        {
+            let this_type = if member_is_static {
+                static_type
+            } else {
+                type_with_this
+            };
+            let base_type = if member_is_static {
+                base_static_type
+            } else {
+                base_with_this
+            };
+            let member_name = self.sym(member).name.clone();
+            let prop = self.get_property_of_type(this_type, &member_name);
+            let base_prop = self.get_property_of_type(base_type, &member_name);
+
+            if prop.is_some() && base_prop.is_nil() && member_has_override_modifier {
+                if error_node.is_some() {
+                    let name = symbol_name(&self.symbols, member);
+                    let suggestion =
+                        self.get_suggested_symbol_for_nonexistent_class_member(&name, base_type);
+                    if suggestion.is_some() {
+                        let message = if is_js {
+                            diag::This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_it_is_not_declared_in_the_base_class_0_Did_you_mean_1
+                        } else {
+                            diag::This_member_cannot_have_an_override_modifier_because_it_is_not_declared_in_the_base_class_0_Did_you_mean_1
+                        };
+                        let base_string = self.type_to_string_exported(base_with_this);
+                        let suggestion_string = self.symbol_to_string(suggestion);
+                        self.error(error_node, message, args![base_string, suggestion_string]);
+                    } else {
+                        let message = if is_js {
+                            diag::This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_it_is_not_declared_in_the_base_class_0
+                        } else {
+                            diag::This_member_cannot_have_an_override_modifier_because_it_is_not_declared_in_the_base_class_0
+                        };
+                        let base_string = self.type_to_string_exported(base_with_this);
+                        self.error(error_node, message, args![base_string]);
+                    }
+                }
+                return MemberOverrideStatus::HAS_INVALID_OVERRIDE;
+            }
+
+            if prop.is_some()
+                && base_prop.is_some()
+                && !self.sym(base_prop).declarations.is_empty()
+                && self.compiler_options.no_implicit_override.is_true()
+                && !node.flags().intersects(NodeFlags::AMBIENT)
+            {
+                let base_has_abstract = self
+                    .sym(base_prop)
+                    .declarations
+                    .iter()
+                    .any(|&d| has_abstract_modifier(d));
+                if member_has_override_modifier {
+                    return MemberOverrideStatus::NONE;
+                }
+                if !base_has_abstract {
+                    if error_node.is_some() {
+                        let message = if member_is_parameter_property {
+                            if is_js {
+                                diag::This_parameter_property_must_have_a_JSDoc_comment_with_an_override_tag_because_it_overrides_a_member_in_the_base_class_0
+                            } else {
+                                diag::This_parameter_property_must_have_an_override_modifier_because_it_overrides_a_member_in_base_class_0
+                            }
+                        } else if is_js {
+                            diag::This_member_must_have_a_JSDoc_comment_with_an_override_tag_because_it_overrides_a_member_in_the_base_class_0
+                        } else {
+                            diag::This_member_must_have_an_override_modifier_because_it_overrides_a_member_in_the_base_class_0
+                        };
+                        let base_string = self.type_to_string_exported(base_with_this);
+                        self.error(error_node, message, args![base_string]);
+                    }
+                    return MemberOverrideStatus::NEEDS_OVERRIDE;
+                }
+                if member_has_abstract_modifier {
+                    if error_node.is_some() {
+                        let base_string = self.type_to_string_exported(base_with_this);
+                        self.error(
+                            error_node,
+                            diag::This_member_must_have_an_override_modifier_because_it_overrides_an_abstract_method_that_is_declared_in_the_base_class_0,
+                            args![base_string],
+                        );
+                    }
+                    return MemberOverrideStatus::NEEDS_OVERRIDE;
+                }
+            }
+        } else if member_has_override_modifier {
+            if error_node.is_some() {
                 let message = if is_js {
                     diag::This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_its_containing_class_0_does_not_extend_another_class
                 } else {
                     diag::This_member_cannot_have_an_override_modifier_because_its_containing_class_0_does_not_extend_another_class
                 };
                 let type_string = self.type_to_string_exported(t);
-                self.error(member, message, args![type_string]);
+                self.error(error_node, message, args![type_string]);
             }
-            return;
+            return MemberOverrideStatus::HAS_INVALID_OVERRIDE;
         }
-        let sym = member.symbol();
-        if member_has_override_modifier
-            && sym.is_some()
-            && self.sym(sym).value_declaration.is_some()
-            && is_class_element(member)
-            && member.name().is_some()
-            && self.is_non_bindable_dynamic_name(member.name())
-        {
-            let message = if is_js {
-                diag::This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_its_name_is_dynamic
-            } else {
-                diag::This_member_cannot_have_an_override_modifier_because_its_name_is_dynamic
-            };
-            self.error(member, message, args![]);
-            return;
-        }
-        if !member_has_override_modifier && !self.compiler_options.no_implicit_override.is_true() {
-            return;
-        }
-        // Here we have a base class and also an override modifier or no override modifier in noImplicitOverride mode
-        let symbol = self.get_symbol_of_declaration(member);
-        if symbol.is_nil() {
-            return;
-        }
-        let member_is_static = is_static(member);
-        let this_type = if member_is_static {
-            static_type
-        } else {
-            type_with_this
-        };
-        let symbol_name_str = self.sym(symbol).name.clone();
-        let prop = self.get_property_of_type(this_type, &symbol_name_str);
-        if prop.is_nil() {
-            return;
-        }
-        let base_type = if member_is_static {
-            base_static_type
-        } else {
-            base_with_this
-        };
-        let base_prop = self.get_property_of_type(base_type, &symbol_name_str);
-        if base_prop.is_nil() && member_has_override_modifier {
-            let name = symbol_name(&self.symbols, symbol);
-            let suggestion =
-                self.get_suggested_symbol_for_nonexistent_class_member(&name, base_type);
-            if suggestion.is_some() {
-                let message = if is_js {
-                    diag::This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_it_is_not_declared_in_the_base_class_0_Did_you_mean_1
-                } else {
-                    diag::This_member_cannot_have_an_override_modifier_because_it_is_not_declared_in_the_base_class_0_Did_you_mean_1
-                };
-                let base_string = self.type_to_string_exported(base_with_this);
-                let suggestion_string = self.symbol_to_string(suggestion);
-                self.error(member, message, args![base_string, suggestion_string]);
-                return;
-            }
-            let message = if is_js {
-                diag::This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_it_is_not_declared_in_the_base_class_0
-            } else {
-                diag::This_member_cannot_have_an_override_modifier_because_it_is_not_declared_in_the_base_class_0
-            };
-            let base_string = self.type_to_string_exported(base_with_this);
-            self.error(member, message, args![base_string]);
-            return;
-        }
-        if base_prop.is_some()
-            && !self.sym(base_prop).declarations.is_empty()
-            && !member_has_override_modifier
-            && self.compiler_options.no_implicit_override.is_true()
-            && !node.flags().intersects(NodeFlags::AMBIENT)
-        {
-            let base_has_abstract = self
-                .sym(base_prop)
-                .declarations
-                .iter()
-                .any(|&d| has_abstract_modifier(d));
-            if !base_has_abstract {
-                let message = if is_parameter_declaration(member) {
-                    if is_js {
-                        diag::This_parameter_property_must_have_a_JSDoc_comment_with_an_override_tag_because_it_overrides_a_member_in_the_base_class_0
-                    } else {
-                        diag::This_parameter_property_must_have_an_override_modifier_because_it_overrides_a_member_in_base_class_0
-                    }
-                } else if is_js {
-                    diag::This_member_must_have_a_JSDoc_comment_with_an_override_tag_because_it_overrides_a_member_in_the_base_class_0
-                } else {
-                    diag::This_member_must_have_an_override_modifier_because_it_overrides_a_member_in_the_base_class_0
-                };
-                let base_string = self.type_to_string_exported(base_with_this);
-                self.error(member, message, args![base_string]);
-                return;
-            }
-            if has_abstract_modifier(member) && base_has_abstract {
-                let base_string = self.type_to_string_exported(base_with_this);
-                self.error(
-                    member,
-                    diag::This_member_must_have_an_override_modifier_because_it_overrides_an_abstract_method_that_is_declared_in_the_base_class_0,
-                    args![base_string],
-                );
-            }
-        }
+
+        MemberOverrideStatus::NONE
     }
 
     // Go: checker/checker.go:4763 getSuggestedSymbolForNonexistentClassMember

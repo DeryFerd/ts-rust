@@ -182,24 +182,21 @@ impl LanguageService {
     // Go: ls/languageservice.go:95 getPreparedAutoImportView
     // getPreparedAutoImportView returns an auto-import view for the given file if the registry is prepared
     // to provide up-to-date auto-imports for it. If not, it returns ErrNeedsAutoImports.
-    // If auto-imports are disabled via user preferences, it returns (nil, nil).
     // PORT: Go `*autoimport.View` is shared as `Rc<autoimport::View>` (wave 3
     // notes); nil is `None`.
     pub fn get_prepared_auto_import_view(
         &self,
         from_file: Node,
     ) -> Result<Option<Rc<autoimport::View>>, GoError> {
-        if self
-            .user_preferences()
-            .include_completions_for_module_exports
-            .is_false()
-        {
-            return Ok(None);
-        }
         let registry = self.host.auto_import_registry();
+        let mut registry_file = from_file;
+        let canonical = source_file_canonical_source_file(from_file);
+        if canonical.is_some() {
+            registry_file = canonical;
+        }
         if !autoimport::Registry::is_prepared_for_importing_file(
             registry.as_deref(),
-            source_file_file_name(from_file),
+            source_file_file_name(registry_file),
             &self.project_path,
             &self.user_preferences(),
         ) {

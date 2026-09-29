@@ -22,6 +22,8 @@ pub mod baseline;
 pub mod binder;
 pub mod checker;
 pub mod cmd;
+// Go `internal/contentmapper` and `internal/spanmap` (tsgo#4712).
+pub mod contentmapper;
 pub mod core;
 pub mod declarations;
 pub use goport_util::diag;
@@ -36,10 +38,14 @@ mod flags_macros {
     pub(crate) use goport_util::{go_enum, go_flags};
 }
 pub mod frontend;
+// Go `internal/ipc` (tsgo#4712).
+pub mod ipc;
 pub use goport_util::jsnum;
 pub use goport_util::locale;
 pub mod modulespecifiers;
 pub mod options;
+// The JSON form of `core.CompilerOptions` (moved out of `api` in bump B wave 3).
+pub mod options_json;
 pub mod pprof;
 pub mod prelude;
 pub mod printer;
@@ -47,9 +53,11 @@ pub mod program;
 pub mod pseudochecker;
 pub mod scanner_util;
 pub mod sourcemap;
+pub mod spanmap;
 pub mod thp_guard;
 pub mod tracing;
 pub mod transformers;
+pub mod transpile;
 
 // Macros that goport_util exports. `crate::go_assert` and `crate::unported`
 // keep working.

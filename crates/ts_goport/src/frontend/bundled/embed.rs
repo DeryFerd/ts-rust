@@ -344,7 +344,7 @@ static EMBEDDED_CONTENTS: &[(&str, &str)] = &[
     bundled_lib!("lib.es2018.asynciterable.d.ts"),
     bundled_lib!("lib.es2018.d.ts"),
     bundled_lib!("lib.es2018.full.d.ts"),
-    bundled_lib!("lib.es2018.intl.d.ts"),
+    bundled_lib!(goport "lib.es2018.intl.d.ts"),
     bundled_lib!("lib.es2018.promise.d.ts"),
     bundled_lib!("lib.es2018.regexp.d.ts"),
     bundled_lib!("lib.es2019.array.d.ts"),

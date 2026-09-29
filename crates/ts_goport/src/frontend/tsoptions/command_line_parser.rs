@@ -45,6 +45,7 @@ pub struct CommandLineParser {
     pub options: IndexMap<String, CompilerOptionsValue>,
     pub file_names: Vec<String>,
     pub errors: Vec<Diagnostic>,
+    pub response_file_stack: FxHashSet<Path>,
 }
 
 // Go: tsoptions/commandlineparser.go:42 ParseCommandLine
@@ -66,7 +67,7 @@ pub fn parse_command_line(
         Some(&*fs),
         host.get_current_directory(),
     );
-    let options_with_absolute_paths = convert_to_options_with_absolute_paths(
+    let options = convert_to_options_with_absolute_paths(
         Some(parser.options.clone()),
         &COMMAND_LINE_COMPILER_OPTIONS_MAP,
         &host.get_current_directory(),
@@ -74,7 +75,7 @@ pub fn parse_command_line(
     .unwrap_or_default();
     let mut compiler_options = CompilerOptions::default();
     convert_map_to_options(
-        &options_with_absolute_paths,
+        &options,
         CompilerOptionsParser {
             compiler_options: &mut compiler_options,
         },
@@ -112,6 +113,7 @@ pub fn parse_command_line_worker(
         options: IndexMap::default(),
         errors: Vec::new(),
         options_map: NameMap::default(),
+        response_file_stack: FxHashSet::default(),
     };
     parser.options_map = get_name_map_from_list(parser.options_declarations());
     parser.parse_strings(command_line, fs);
@@ -181,9 +183,23 @@ pub fn get_input_option_name(input: &str) -> &str {
 }
 
 impl CommandLineParser {
-    // Go: tsoptions/commandlineparser.go:168 (*commandLineParser).parseResponseFile
+    // Go: tsoptions/commandlineparser.go:169 (*commandLineParser).parseResponseFile
+    // PORT: Go `defer p.responseFileStack.Delete(path)` is a `remove` before
+    // each return. Go calls `p.fs.UseCaseSensitiveFileNames()` on a nil `fs`
+    // and panics; so does this.
     pub fn parse_response_file(&mut self, file_name: &str, fs: Option<&dyn Fs>) {
         let file_name = get_normalized_absolute_path(file_name, &self.current_directory);
+        let path = to_path(
+            &file_name,
+            &self.current_directory,
+            fs.expect("nil pointer dereference: fs")
+                .use_case_sensitive_file_names(),
+        );
+        if self.response_file_stack.contains(&path) {
+            return;
+        }
+        self.response_file_stack.insert(path.clone());
+
         let (file_contents, errors) = try_read_file(
             &file_name,
             &mut |file_name: &str| {
@@ -197,6 +213,7 @@ impl CommandLineParser {
         self.errors = errors;
 
         if file_contents.is_empty() {
+            self.response_file_stack.remove(&path);
             return;
         }
 
@@ -227,16 +244,14 @@ impl CommandLineParser {
                     ));
                 }
             } else {
-                // PORT: Go indexes `text[pos]` with no bound check here and
-                // panics when an argument ends the file. The Rust index
-                // panics the same way.
-                while text[pos] > ' ' {
+                while pos < text_length && text[pos] > ' ' {
                     pos += 1;
                 }
                 args.push(text[start..pos].iter().collect());
             }
         }
         self.parse_strings(&args, fs);
+        self.response_file_stack.remove(&path);
     }
 }
 

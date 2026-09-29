@@ -929,6 +929,11 @@ impl Checker {
         meaning: SymbolFlags,
         name_not_found_message: &'static Message,
     ) {
+        // The `const` in a `const` assertion (`x as const`) is a syntactic marker, not a real
+        // type reference, and must never be resolved or reported as an unresolvable name.
+        if is_const_type_reference_name(error_location) {
+            return;
+        }
         if error_location.is_some()
             && (error_location.parent().kind() == SyntaxKind::JsDocLink
                 || self.check_and_report_error_for_missing_prefix(error_location, name)
@@ -1115,11 +1120,15 @@ impl Checker {
             );
             let symbol = self.resolve_symbol(resolved);
             if symbol.is_some() {
-                self.error(
-                    error_location,
-                    diag::Cannot_use_namespace_0_as_a_value,
-                    args![name],
-                );
+                // `export = ns` may legitimately reference a namespace; checkExportAssignment decides
+                // whether that is an error, so don't report "cannot use namespace as a value" here.
+                if !is_export_assignment_expression_name(error_location) {
+                    self.error(
+                        error_location,
+                        diag::Cannot_use_namespace_0_as_a_value,
+                        args![name],
+                    );
+                }
                 return true;
             }
         } else if meaning.intersects(SymbolFlags::TYPE.without(SymbolFlags::VALUE)) {
@@ -1210,6 +1219,11 @@ impl Checker {
             if symbol.is_some() {
                 let all_flags = self.get_symbol_flags(symbol);
                 if !all_flags.intersects(SymbolFlags::VALUE) {
+                    // `export = SomeType` may legitimately reference a type-only name; checkExportAssignment
+                    // decides whether that is an error, so don't report "used as a value" here.
+                    if is_export_assignment_expression_name(error_location) {
+                        return true;
+                    }
                     if is_es2015_or_later_constructor_name(name) {
                         self.error(
                             error_location,

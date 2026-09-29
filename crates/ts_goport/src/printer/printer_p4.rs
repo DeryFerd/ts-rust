@@ -657,6 +657,11 @@ impl Printer {
 
     // Go: printer.go:4140 emitStatement
     pub(crate) fn emit_statement(&mut self, node: Node) {
+        if let Some(snippet_element) = self.emit_context.snippet_element(node) {
+            self.emit_snippet_node(node, &snippet_element);
+            return;
+        }
+
         match node.kind() {
             // Statements
             SyntaxKind::Block => self.emit_block(node),
@@ -1028,12 +1033,25 @@ impl Printer {
         self.emit_token(node.token(), node.pos(), WriteKind::KEYWORD, node);
         self.write_space();
         self.emit_list(
-            Printer::emit_expression_with_type_arguments_node,
+            Printer::emit_heritage_clause_element,
             node,
             node.types(),
             ListFormat::HERITAGE_CLAUSE_TYPES,
         );
         self.exit_node(node, state);
+    }
+
+    // Go: printer.go:4500 emitHeritageClauseElement
+    /// Prints one element of a heritage clause: an ExpressionWithTypeArguments, or a
+    /// TypeReference in an interface `extends` or a class `implements` clause (tsgo#4797).
+    pub(crate) fn emit_heritage_clause_element(&mut self, node: Node) {
+        match node.kind() {
+            SyntaxKind::ExpressionWithTypeArguments => {
+                self.emit_expression_with_type_arguments(node)
+            }
+            SyntaxKind::TypeReference => self.emit_type_reference(node),
+            kind => panic!("unhandled HeritageClauseElement: {kind:?}"),
+        }
     }
 
     // Go: printer.go:4487 emitHeritageClauseNode
@@ -1207,7 +1225,7 @@ impl Printer {
                 && self.emit_context.has_recorded_external_helpers(source_file));
         let mut helpers = self.emit_context.get_emit_helpers(node).to_vec();
         if !helpers.is_empty() {
-            // Go: printer/printer.go:4610 slices.SortStableFunc(helpers, compareEmitHelpers)
+            // Go: printer/printer.go:4634 slices.SortStableFunc(helpers, compareEmitHelpers)
             crate::gostd::slices::sort_stable_func(&mut helpers, |x, y| compare_emit_helpers(x, y));
             for helper in &helpers {
                 if !helper.scoped {

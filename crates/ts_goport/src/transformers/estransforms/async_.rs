@@ -1056,7 +1056,10 @@ impl AsyncTransformer {
             );
 
             if capture_lexical_arguments && self.lexical_arguments.used {
-                let block = self.convert_to_function_block(r);
+                let block = ec.convert_to_function_block(r, true /*multiLine*/);
+                if !is_block(r) {
+                    ec.set_original(block.statements().get(0), r);
+                }
                 r = f.update_block(
                     block,
                     ec.merge_environment_list(
@@ -1102,22 +1105,6 @@ impl AsyncTransformer {
         let list = f.new_node_list_with_loc(&[ret], body.loc());
         let block = f.new_block(list, false /*multiLine*/);
         set_node_loc(block, body.loc());
-        block
-    }
-
-    // Go: transformers/estransforms/async.go:889 asyncTransformer.convertToFunctionBlock
-    fn convert_to_function_block(&self, node: Node) -> Node {
-        if is_block(node) {
-            return node;
-        }
-        let ec = &self.emit_context;
-        let f = ec.factory();
-        let ret = f.new_return_statement(node);
-        set_node_loc(ret, node.loc());
-        ec.set_original(ret, node);
-        let list = f.new_node_list_with_loc(&[ret], node.loc());
-        let block = f.new_block(list, true);
-        set_node_loc(block, node.loc());
         block
     }
 

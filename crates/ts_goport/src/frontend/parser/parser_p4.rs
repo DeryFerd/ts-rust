@@ -471,13 +471,12 @@ impl Parser {
                 return false;
             }
             // Check for un-parenthesized AsyncArrowFunction
-            let expr = self.parse_binary_expression_or_higher(OperatorPrecedence::LOWEST);
-            if !self.has_preceding_line_break()
-                && expr.kind() == SyntaxKind::Identifier
-                && self.token == SyntaxKind::EqualsGreaterThanToken
-            {
-                return true;
+            if !self.is_identifier() {
+                return false;
             }
+            self.next_token_without_check();
+            return !self.has_preceding_line_break()
+                && self.token == SyntaxKind::EqualsGreaterThanToken;
         }
         false
     }
@@ -602,12 +601,7 @@ impl Parser {
             //            ^^token; leftOperand = b. Return b ** c to the caller as a rightOperand
             //      a ** b - c
             //             ^token; leftOperand = b. Return b to the caller as a rightOperand
-            let consume_current_operator = if operator == SyntaxKind::AsteriskAsteriskToken {
-                new_precedence >= precedence
-            } else {
-                new_precedence > precedence
-            };
-            if !consume_current_operator {
+            if !should_consume_binary_operator(operator, new_precedence, precedence) {
                 break;
             }
             if operator == SyntaxKind::InKeyword && self.in_disallow_in_context() {
@@ -623,10 +617,9 @@ impl Parser {
                     break;
                 } else {
                     self.next_token();
-                    // When we have 'a ## b as SomeType' or 'a ## b satisfies SomeType', where ## is some binary
-                    // operator, we want to stop parsing on any following operator with a higher precedence than ##
-                    // because continuing would make it impossible to erase the `as` or `satisfies` without changing
-                    // the meaning of the expression. See https://github.com/microsoft/TypeScript/issues/63527.
+                    // When we have 'a ## b as SomeType $$ c' or 'a ## b satisfies SomeType $$ c', where ## and $$
+                    // are binary operators, we want to stop parsing when $$ would bind before ## after erasing the
+                    // assertion. See https://github.com/microsoft/TypeScript/issues/63527.
                     let mut last_precedence = OperatorPrecedence::HIGHEST;
                     if is_binary_expression(last_operand) {
                         last_precedence =
@@ -639,9 +632,14 @@ impl Parser {
                         let type_node = self.parse_type();
                         left_operand = self.make_as_expression(left_operand, type_node);
                     }
-                    // Stop if the precedence of the next operator is too high.
+                    // Stop if the next operator would bind before the last operator when the assertion is erased.
                     let next_operator = self.re_scan_greater_than_token();
-                    if get_binary_operator_precedence(next_operator) > last_precedence {
+                    let next_precedence = get_binary_operator_precedence(next_operator);
+                    if should_consume_binary_operator(
+                        next_operator,
+                        next_precedence,
+                        last_precedence,
+                    ) {
                         break;
                     }
                 }
@@ -1261,7 +1259,7 @@ impl Parser {
     pub fn parse_jsx_attribute_value(&mut self) -> Node {
         if self.token == SyntaxKind::EqualsToken {
             if self.scan_jsx_attribute_value() == SyntaxKind::StringLiteral {
-                return self.parse_literal_expression(false /*intern*/);
+                return self.parse_literal_expression();
             }
             if self.token == SyntaxKind::OpenBraceToken {
                 return self.parse_jsx_expression(true /*inExpressionContext*/);
@@ -1832,7 +1830,8 @@ impl Parser {
         expression: Node,
         question_dot_token: Node,
     ) -> Node {
-        let argument_expression = if self.token == SyntaxKind::CloseBracketToken {
+        let mut argument_expression = self.create_missing_identifier();
+        if self.token == SyntaxKind::CloseBracketToken {
             let node_pos = self.node_pos();
             self.parse_error_at(
                 node_pos,
@@ -1840,14 +1839,9 @@ impl Parser {
                 diag::An_element_access_expression_should_take_an_argument,
                 args![],
             );
-            self.create_missing_identifier()
         } else {
-            // PORT: Go also writes `Text = p.internIdentifier(Text)` for a
-            // string, template or numeric literal. The value does not change
-            // and the identifiers table is not kept (see `internIdentifier`
-            // in parser_p5.rs).
-            self.parse_expression_allow_in()
-        };
+            argument_expression = self.parse_expression_allow_in();
+        }
         self.parse_expected(SyntaxKind::CloseBracketToken);
         let is_optional_chain =
             question_dot_token.is_some() || self.try_reparse_optional_chain(expression);
@@ -1982,7 +1976,7 @@ impl Parser {
         let template;
         if self.token == SyntaxKind::NoSubstitutionTemplateLiteral {
             self.re_scan_template_token(true /*isTaggedTemplate*/);
-            template = self.parse_literal_expression(false /*intern*/);
+            template = self.parse_literal_expression();
         } else {
             template = self.parse_template_expression(true /*isTaggedTemplate*/);
         }
@@ -2016,4 +2010,19 @@ pub fn type_has_arrow_function_blocking_parse_error(node: Node) -> bool {
         SyntaxKind::ParenthesizedType => type_has_arrow_function_blocking_parse_error(node.type_()),
         _ => false,
     }
+}
+
+// Go: parser.go:4631 shouldConsumeBinaryOperator
+// shouldConsumeBinaryOperator reports whether an operator binds before the operator represented by currentPrecedence.
+// At equal precedence, only the right-associative exponentiation operator binds first.
+#[must_use]
+pub fn should_consume_binary_operator(
+    operator: SyntaxKind,
+    operator_precedence: OperatorPrecedence,
+    current_precedence: OperatorPrecedence,
+) -> bool {
+    if operator_precedence > current_precedence {
+        return true;
+    }
+    operator_precedence == current_precedence && operator == SyntaxKind::AsteriskAsteriskToken
 }
