@@ -351,15 +351,17 @@ The batch that adds it is not accepted until Theo approves.
   in its node shell, the tier 1 publish of its id, so a header or child
   read of the edited file stays inline (a pinned read per node read made
   edits 3 to 4 ms slower); the child link column is dropped, and the
-  binder's child walk reads the node data. With `GOPORT_OWNED_NODES=1` its
-  parse was a freeable parse (`enter_freeable_parse`, opened by the parse
-  cache, M3c), so its store
-  owns its astdata nodes, pending lists, JSDoc cache and parse diagnostics
+  binder's child walk reads the node data. With owned nodes (M3c; on by
+  default in a language server or API process since M3g,
+  `GOPORT_OWNED_NODES=0` turns them off) its parse was a freeable parse
+  (`enter_freeable_parse`, opened by the parse cache), so its store owns
+  its astdata nodes, pending lists, JSDoc cache and parse diagnostics
   (`OwnedAst`), and they are freed with the version; its node data reads
-  are pinned reads, and its lists are `StoreList` handles. A prefetched
-  parse keeps its nodes leaked (its node column is in the shell), and so
-  does every parse by default (owned nodes off: each pinned node data read
-  made edits 0.9 to 1.6 ms slower), as before M3c. Its
+  are pinned reads, and its lists are `StoreList` handles. Only with them
+  do 1000-edit sessions pass memory; they cost about +0.6 to +1.3 ms edit
+  median on query-core and effect (M3f). A prefetched parse keeps its
+  nodes leaked (its node column is in the shell), and so does every parse
+  with owned nodes off, as before M3c. Its
   `SourceFileInfo` owns copies of
   the parse lists (`KeptData::Owned`), so the publish keeps no parse, and
   its name table, position map, declaration map and identifier set are

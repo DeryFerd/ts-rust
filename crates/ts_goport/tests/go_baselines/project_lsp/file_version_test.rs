@@ -122,6 +122,19 @@ child_test! {
 }
 
 child_test! {
+    // Owned nodes are on by default in a session process (lsshells M3g):
+    // the edited version owns its nodes, and they die with it.
+    fn owned_nodes_are_on_by_default_in_a_session() {
+        let session = open_p1();
+        body_edit(&session, 2, "2");
+        let one_version = owned_node_count();
+        assert!(one_version > 0, "the edited version owns its nodes");
+        body_edit(&session, 3, "3");
+        assert_eq!(owned_node_count(), one_version);
+    }
+}
+
+child_test! {
     env OWNED_NODES;
     // The astdata nodes of each edited version belong to its store
     // (lsshells M3c, `GOPORT_OWNED_NODES=1`): a new version adds its nodes
@@ -606,16 +619,15 @@ fn flag_off_keeps_every_file_version_static() {
     );
 }
 
-/// Owned nodes off (the default; `GOPORT_OWNED_NODES` unset) in a session:
-/// an edited version is freeable (its store and `GoFile` go with it), but
-/// its parse is static, as before lsshells M3c: no store owns astdata
-/// nodes, and the node data of a dead version still reads, from its node
-/// shell.
+/// Owned nodes off (`GOPORT_OWNED_NODES=0`) in a session: an edited version
+/// is freeable (its store and `GoFile` go with it), but its parse is
+/// static, as before lsshells M3c: no store owns astdata nodes, and the
+/// node data of a dead version still reads, from its node shell.
 #[test]
 fn owned_nodes_off_keeps_node_data_leaked() {
     let path = concat!(module_path!(), "::owned_nodes_off_keeps_node_data_leaked");
     let test = path.split_once("::").map_or(path, |(_, rest)| rest);
-    crate::support::child::run_test_in_child(test, || {
+    crate::support::child::run_test_in_child_with_env(test, &[("GOPORT_OWNED_NODES", "0")], || {
         crate::project_lsp::projecttestutil::install_fs_override();
         let session = open_p1();
         body_edit(&session, 2, "2");

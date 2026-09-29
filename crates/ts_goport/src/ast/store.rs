@@ -57,13 +57,14 @@
 //! - A freeable file version (an edited file in a language server or API
 //!   process): its `FileVersion` owns its store and `GoFile`
 //!   (`VersionStore`), and its tier 1 slot names its node shell, a leaked
-//!   publish with only its node columns (`node_shell`). With
-//!   `GOPORT_OWNED_NODES=1` its parse is a freeable parse
-//!   (`enter_freeable_parse`, lsshells M3c), so its store also owns its
-//!   astdata nodes, its pending lists and its parse lists (`OwnedAst`): the
-//!   shell has no node column, and a node data read of the file is a scoped
-//!   read (`read_store_node_miss`). By default the parse is a static parse,
-//!   whose node column is in the shell, as before M3c.
+//!   publish with only its node columns (`node_shell`). With owned nodes on
+//!   (the default there, `owned_nodes_enabled`) its parse is a freeable
+//!   parse (`enter_freeable_parse`, lsshells M3c), so its store also owns
+//!   its astdata nodes, its pending lists and its parse lists (`OwnedAst`):
+//!   the shell has no node column, and a node data read of the file is a
+//!   scoped read (`read_store_node_miss`). With `GOPORT_OWNED_NODES=0` the
+//!   parse is a static parse, whose node column is in the shell, as before
+//!   M3c.
 //! - Every read of a published store goes through one inline lookup
 //!   (`frozen!`, `static_frozen_of`): tier 0 first, then the tier 1 slot of the
 //!   id, then the freeable version (its store and `GoFile`), in a cold
@@ -1434,7 +1435,7 @@ fn link_child(links: &mut [SlotLinks], parent: usize, last: &mut u32, child: usi
 
 thread_local! {
     /// Set while a freeable parse with owned nodes runs on this thread
-    /// (`enter_freeable_parse`, `GOPORT_OWNED_NODES=1`): `new_file_store`
+    /// (`enter_freeable_parse`, `owned_nodes_enabled`): `new_file_store`
     /// makes a store that owns its astdata nodes.
     static FREEABLE_PARSE: Cell<bool> = const { Cell::new(false) };
     /// Set while any freeable parse runs on this thread
@@ -1443,7 +1444,7 @@ thread_local! {
 }
 
 /// Starts a freeable parse on this thread (`is_freeable_parse`). With
-/// `GOPORT_OWNED_NODES=1` (`owned_nodes_enabled`) the stores that
+/// owned nodes on (`owned_nodes_enabled`) the stores that
 /// `new_file_store` makes until the scope ends own their astdata nodes,
 /// pending lists and parse lists (`OwnedAst`), so they are freed with the
 /// store, not leaked in the AST arena. The language server parse cache
@@ -1460,18 +1461,28 @@ pub fn enter_freeable_parse() -> FreeableParseScope {
     }
 }
 
-/// True when `GOPORT_OWNED_NODES=1`: a freeable parse owns its nodes
-/// (lsshells M3c). Otherwise it is a static parse (its nodes stay in the
-/// leaked AST arena, and its node shell has a node column), as before M3c.
-/// Read once.
-// PERF: off by default. With it on, the edits of query-core, hono and
-// effect freed 0.2 to 1.0 MiB more each, but their median was 0.9 to 1.6 ms
-// slower than with it off (ls_edit_bench long, mini-abf9, lsshells/m3/M3c
-// ab2), over the 0.5 ms line: every node data and list read of the edited
-// file is a pinned read (about 40,000 per edit on effect).
+/// True when a freeable parse owns its nodes (lsshells M3c). Off, it is a
+/// static parse (its nodes stay in the leaked AST arena, and its node shell
+/// has a node column), as before M3c. `GOPORT_OWNED_NODES` is read once:
+/// `0` is off, `1` is on; else it is on in a language server or API process
+/// only (`ast::set_editor_process`), where the freeable versions are. A CLI
+/// process makes freeable parses only with `GOPORT_FREE_FILE_VERSIONS=1`
+/// (`goport_multiprog`), and they stay static there by default.
+// PERF: on by default since lsshells M3g (root decision
+// m3-owned-default-2026-09-29). Only with it on do 1000-edit sessions pass
+// memory (M3f, mini-abf9: effect 0.46 MiB/edit and +480 MiB, off 1.23 and
+// +1216, limits 1.02 and 686). It costs edit time: every node data and list
+// read of the edited file is a pinned read (about 150,000 per edit on
+// effect), +0.6 to +1.3 ms edit median on query-core and effect against
+// off (M3f), +4.65% session instructions on effect.
 fn owned_nodes_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("GOPORT_OWNED_NODES").as_deref() == Ok("1"))
+    static FLAG: OnceLock<Option<bool>> = OnceLock::new();
+    let flag = *FLAG.get_or_init(|| match std::env::var("GOPORT_OWNED_NODES").as_deref() {
+        Ok("0") => Some(false),
+        Ok("1") => Some(true),
+        _ => None,
+    });
+    flag.unwrap_or_else(crate::ast::is_editor_process)
 }
 
 /// `enter_freeable_parse` with owned nodes on, whatever the flag, for the

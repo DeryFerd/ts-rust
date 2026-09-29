@@ -23,8 +23,8 @@
 //! modifier bits, children, resolved) are leaked in its node shell, the
 //! tier 1 publish of its id, so the header and child reads stay inline
 //! (`ast::store::node_shell`); the child link column is dropped.
-//! M3c (with `GOPORT_OWNED_NODES=1`; off by default, see
-//! `owned_nodes_enabled`): its parse was a freeable parse
+//! M3c (owned nodes; on by default in a language server or API process,
+//! see `owned_nodes_enabled`): its parse was a freeable parse
 //! (`ast::enter_freeable_parse`), so its store owns its astdata nodes (node
 //! structs and data boxes), its
 //! pending lists and its parse lists (`ast::store::OwnedAst`), and they go
@@ -320,9 +320,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Marks this process as a language server or API process, where
-/// `free_file_versions` is on by default. `project::new_session` calls it.
+/// `free_file_versions` and owned nodes are on by default.
+/// `project::new_session` calls it.
 pub fn set_editor_process() {
     EDITOR_PROCESS.store(true, Ordering::Relaxed);
+}
+
+/// True in a language server or API process (`set_editor_process`).
+pub(crate) fn is_editor_process() -> bool {
+    EDITOR_PROCESS.load(Ordering::Relaxed)
 }
 
 /// True when this process frees the file versions that the language server
@@ -337,7 +343,7 @@ pub fn free_file_versions() -> bool {
             _ => None,
         },
     );
-    flag.unwrap_or_else(|| EDITOR_PROCESS.load(Ordering::Relaxed))
+    flag.unwrap_or_else(is_editor_process)
 }
 
 thread_local! {
