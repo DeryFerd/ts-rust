@@ -1,6 +1,10 @@
 //! Go: internal/testrunner/transpile_runner.go and transpile_runner_test.go
 //! (#4849): the `transpileModule` and `transpileDeclaration` baselines of
-//! the TypeScript submodule's `tests/cases/transpile`.
+//! the transpile cases. At the typescript-go layout they are the TypeScript
+//! submodule's `tests/cases/transpile` and the baselines are in
+//! `submodule/transpile`; at the merged layout (5f647a841a, see
+//! `baseline::is_merged_layout`) they are `testdata/tests/cases/transpile`
+//! and `transpile`.
 //!
 //! PORT: Go runs each test configuration as a subtest of `TestTranspile`.
 //! Here each configuration runs in a child process, as in the compiler
@@ -48,16 +52,26 @@ fn transpile_vary_by() -> &'static HashSet<String> {
 }
 
 // Go: transpile_runner.go:31 TranspileBaselineRunner
+// PORT: `is_submodule` is the layout: true at the typescript-go layout,
+// where the cases and baselines are the submodule's.
 pub struct TranspileBaselineRunner {
+    is_submodule: bool,
     test_files: OnceLock<Vec<String>>,
     base_path: String,
 }
 
 // Go: transpile_runner.go:38 NewTranspileBaselineRunner
 pub fn new_transpile_baseline_runner() -> TranspileBaselineRunner {
+    let is_submodule = !baseline::is_merged_layout();
     TranspileBaselineRunner {
+        is_submodule,
         test_files: OnceLock::new(),
-        base_path: "../_submodules/TypeScript/tests/cases/transpile".to_string(),
+        base_path: if is_submodule {
+            "../_submodules/TypeScript/tests/cases/transpile"
+        } else {
+            "../testdata/tests/cases/transpile"
+        }
+        .to_string(),
     }
 }
 
@@ -145,7 +159,7 @@ fn enumerate_config_cases(runner: &TranspileBaselineRunner) -> (Vec<ConfigCase>,
         };
         for configuration in configurations {
             cases.push(ConfigCase {
-                is_submodule: true,
+                is_submodule: runner.is_submodule,
                 suite: TRANSPILE_SUITE,
                 filename: file_name.clone(),
                 test_name: transpile_configured_name(&just_name, &configuration.name),
@@ -204,6 +218,7 @@ pub fn run_single_config_test(case: &ConfigCase, report: Report<'_>) {
                 &options,
                 &harness_options,
                 false,
+                case.is_submodule,
             )
         });
     }
@@ -216,6 +231,7 @@ pub fn run_single_config_test(case: &ConfigCase, report: Report<'_>) {
                 &options,
                 &harness_options,
                 true,
+                case.is_submodule,
             )
         });
     }
@@ -223,7 +239,8 @@ pub fn run_single_config_test(case: &ConfigCase, report: Report<'_>) {
 
 // Go: transpile_runner.go:104 runKind
 // PORT: Go reports through `t`; this returns the messages of a failed
-// comparison or check (Go `t.Fatal` and `t.Errorf`).
+// comparison or check (Go `t.Fatal` and `t.Errorf`). `is_submodule` is the
+// runner's (the layout).
 fn run_kind(
     configured_name: &str,
     extension: &str,
@@ -231,6 +248,7 @@ fn run_kind(
     options: &CompilerOptions,
     harness_options: &HarnessOptions,
     declaration: bool,
+    is_submodule: bool,
 ) -> Result<(), String> {
     let mut result = String::new();
     for unit in units {
@@ -300,7 +318,7 @@ fn run_kind(
         &format!("transpile/{baseline_name}"),
         &result,
         &Options {
-            is_submodule: true,
+            is_submodule,
             ..Options::default()
         },
     );
@@ -320,12 +338,20 @@ fn append_transpile_section(result: &mut String, file_name: &str, content: &str)
 // PORT: Go always writes local baselines to `testdata/baselines/local`;
 // the port writes them only under `baseline::local_root()` (see
 // support/baseline.rs), so this cleans there, and nothing when it is off.
+// The merged layout has one folder: `transpile`.
 fn clean_transpile_baselines() {
     let Some(local_root) = baseline::local_root() else {
         return;
     };
-    for folder in ["submodule", "submoduleAccepted", "submoduleTriaged"] {
-        let dir = local_root.join(folder).join("transpile");
+    let dirs: Vec<std::path::PathBuf> = if baseline::is_merged_layout() {
+        vec![local_root.join("transpile")]
+    } else {
+        ["submodule", "submoduleAccepted", "submoduleTriaged"]
+            .iter()
+            .map(|folder| local_root.join(folder).join("transpile"))
+            .collect()
+    };
+    for dir in dirs {
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -335,8 +361,11 @@ fn clean_transpile_baselines() {
 }
 
 // Go: transpile_runner.go:187 RunTranspileTests
+// The merged layout has no submodule and no skip.
 pub fn run_transpile_tests() {
-    if crate::tsoptions::tsoptionstest::skip_if_no_type_script_submodule("TestTranspile") {
+    if !baseline::is_merged_layout()
+        && crate::tsoptions::tsoptionstest::skip_if_no_type_script_submodule("TestTranspile")
+    {
         return;
     }
     clean_transpile_baselines();

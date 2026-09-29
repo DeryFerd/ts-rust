@@ -27,7 +27,8 @@
 //! run of the default set writes the results of each runner to its own
 //! file:
 //! - `<P>_FILTER=<substring>`: runs the cases whose key
-//!   (`<local|submodule>/<suite>/<configured name>`) contains it.
+//!   (`<local|submodule>/<suite>/<configured name>`; only `local` at the
+//!   merged layout, see `baseline::is_merged_layout`) contains it.
 //! - `<P>_SHARD=<i>/<n>`: runs the test files whose index (in enumeration
 //!   order; for the compiler runner, both of its runners) is `i` modulo `n`.
 //! - `<P>_JOBS` (default 4): child processes at once.
@@ -434,7 +435,12 @@ fn shard(prefix: &str) -> Option<(usize, usize)> {
 }
 
 // Go: compiler_runner_test.go:20 runCompilerTests
+// At the merged layout Go has only `TestLocal`, which runs every case.
 pub fn run_compiler_tests(is_submodule: bool) {
+    if is_submodule && crate::support::baseline::is_merged_layout() {
+        eprintln!("TestSubmodule: skipped: the merged layout has no TestSubmodule");
+        return;
+    }
     if is_submodule
         && crate::tsoptions::tsoptionstest::skip_if_no_type_script_submodule("TestSubmodule")
     {

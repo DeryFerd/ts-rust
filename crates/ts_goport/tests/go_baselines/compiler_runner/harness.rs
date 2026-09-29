@@ -40,6 +40,7 @@ use ts_goport::frontend::vfs::{OsOverride, install_os_override};
 use ts_goport::gostd::context::background;
 use ts_goport::program as tsprogram;
 
+use crate::support::baseline::{is_merged_layout, test_data_path};
 use crate::support::contentmappertest;
 use crate::support::harnessutil::TracerForBaselining;
 use crate::support::vfstest::{self, MapFile, MapFs};
@@ -227,7 +228,11 @@ pub fn compile_files_ex(
         include_lib_dir = true;
     }
 
-    if include_lib_dir && !type_script_submodule_path().join("package.json").exists() {
+    // The merged layout has no submodule and no skip here.
+    if include_lib_dir
+        && !is_merged_layout()
+        && !type_script_submodule_path().join("package.json").exists()
+    {
         skip("TypeScript submodule does not exist".to_string());
     }
 
@@ -374,11 +379,19 @@ pub fn compile_files_ex(
 }
 
 // Go: harnessutil.go:241 testLibFolderMap
+// The lib dir is `testdata/tests/lib` at the merged layout, the submodule's
+// `tests/lib` before.
 fn test_lib_folder_map() -> &'static BTreeMap<String, MapFile> {
     static MAP: OnceLock<BTreeMap<String, MapFile>> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut testfs = BTreeMap::new();
-        let root = type_script_submodule_path().join("tests").join("lib");
+        let root = if is_merged_layout() {
+            test_data_path()
+        } else {
+            type_script_submodule_path()
+        }
+        .join("tests")
+        .join("lib");
         fn walk(dir: &std::path::Path, rel: &str, testfs: &mut BTreeMap<String, MapFile>) {
             let mut entries: Vec<_> = std::fs::read_dir(dir)
                 .unwrap_or_else(|err| panic!("Failed to read lib dir: {err}"))

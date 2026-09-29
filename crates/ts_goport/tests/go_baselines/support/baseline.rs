@@ -3,9 +3,11 @@
 //! typescript-go reference baseline.
 //!
 //! Environment:
-//! - `TS_GO_REPO`: the typescript-go checkout (default `DEFAULT_GO_REPO`).
-//!   The reference root is `testdata/baselines/reference`, the submodule
-//!   reference root is `_submodules/TypeScript/tests/baselines/reference`.
+//! - `TS_GO_REPO`: the Go checkout (default `DEFAULT_GO_REPO`), in either
+//!   layout (`is_merged_layout`). The reference root is
+//!   `testdata/baselines/reference`. At the typescript-go layout the
+//!   submodule reference root is
+//!   `_submodules/TypeScript/tests/baselines/reference`.
 //! - `TS_GOPORT_BASELINE_LOCAL`: unset (or empty) compares only. `1` writes
 //!   every generated baseline under `DEFAULT_LOCAL_ROOT` in the Go layout
 //!   (`<subfolder>/<name>`, the submodule diff files, `.delete` markers).
@@ -66,6 +68,27 @@ pub fn go_repo() -> PathBuf {
     }
 }
 
+/// Whether the Go checkout has the microsoft/TypeScript `tsc/` layout
+/// (5f647a841a, "Apply the TypeScript 7 repository layout"): no
+/// `_submodules/TypeScript`, `TestLocal` runs every case under
+/// `testdata/tests/cases`, the transpile cases are in
+/// `testdata/tests/cases/transpile`, the `submodule*` reference dirs are
+/// merged into `reference/<suite>` and there are no `.diff` files. Its
+/// `go.mod` module is `github.com/microsoft/TypeScript/tsc`. Any other
+/// checkout has the typescript-go layout (pin B and older).
+// PORT: no Go equivalent. Go has one layout per commit; the port runs at
+// pins of both layouts.
+pub fn is_merged_layout() -> bool {
+    static MERGED: OnceLock<bool> = OnceLock::new();
+    *MERGED.get_or_init(|| {
+        std::fs::read_to_string(go_repo().join("go.mod")).is_ok_and(|go_mod| {
+            go_mod
+                .lines()
+                .any(|line| line.trim() == "module github.com/microsoft/TypeScript/tsc")
+        })
+    })
+}
+
 // Go: internal/repo TestDataPath
 pub fn test_data_path() -> PathBuf {
     go_repo().join("testdata")
@@ -77,6 +100,7 @@ pub fn reference_root() -> PathBuf {
 }
 
 // Go: testutil/baseline/baseline.go:249 submoduleReferenceRoot
+// (typescript-go layout only)
 pub fn submodule_reference_root() -> PathBuf {
     go_repo()
         .join("_submodules")
@@ -114,6 +138,8 @@ fn join_rel(parts: &[&str]) -> String {
 }
 
 // Go: testutil/baseline/baseline.go:30 Run
+// At the merged layout Go `Options` has no `IsSubmodule*` fields and `Run`
+// is the first block only; the runners there never set `is_submodule`.
 pub fn run(file_name: &str, actual: &str, opts: &Options) -> Result<(), String> {
     let mut errors = Vec::new();
     let orig_subfolder = opts.subfolder.as_str();
@@ -411,6 +437,11 @@ pub fn run_against_submodule(file_name: &str, actual: &str, opts: &Options) -> R
 // PORT: `rel` is the path under the local root (Go passes the full local
 // path). With a local root, every generated baseline is written, not only a
 // changed one, and a stale `.delete` marker is removed too.
+// PORT: at the merged layout Go writes the `.delete` marker of a
+// `NoContent` result whose reference exists and reports nothing. The port
+// reports it at both layouts, as Go did at the typescript-go layout: the
+// reference is the Go output, so a baseline that the port does not make is
+// a port failure.
 fn write_comparison(
     errors: &mut Vec<String>,
     actual_content: &str,
@@ -615,8 +646,13 @@ mod tests {
     use super::*;
 
     // Go: testutil/baseline/baseline_test.go:9 TestSubmoduleAcceptedFilesExist
+    // (typescript-go layout; the merged layout has no such test)
     #[test]
     fn baseline_submodule_accepted_files_exist() {
+        if is_merged_layout() {
+            eprintln!("TestSubmoduleAcceptedFilesExist: skipped: not in the merged layout");
+            return;
+        }
         let mut errors = Vec::new();
         for name in submodule_accepted_file_names() {
             if !reference_root()
@@ -633,8 +669,13 @@ mod tests {
     }
 
     // Go: testutil/baseline/baseline_test.go:18 TestSubmoduleTriagedFilesExist
+    // (typescript-go layout; the merged layout has no such test)
     #[test]
     fn baseline_submodule_triaged_files_exist() {
+        if is_merged_layout() {
+            eprintln!("TestSubmoduleTriagedFilesExist: skipped: not in the merged layout");
+            return;
+        }
         let mut errors = Vec::new();
         for name in submodule_triaged_file_names() {
             if !reference_root()
