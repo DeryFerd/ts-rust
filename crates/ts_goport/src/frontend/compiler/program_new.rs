@@ -18,6 +18,9 @@ pub struct ProgramOptions {
     pub single_threaded: Tristate,
     pub typings_location: String,
     pub project_name: String,
+    // SkipModuleResolution avoids all module and type reference resolution while
+    // still collecting import metadata needed for emit.
+    pub skip_module_resolution: bool,
 }
 
 impl ProgramOptions {

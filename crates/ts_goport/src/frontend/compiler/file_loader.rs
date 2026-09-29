@@ -254,9 +254,12 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
     // answers. Only when every resolver sees the same files: the plain OS
     // file system (no project reference faking host) and no traced
     // resolution (Go then skips the cache too).
+    // PORT: with `skip_module_resolution` the loader resolves nothing
+    // (ts#64024), so the workers do not either.
     if !single_threaded
         && super::files_parser::parse_workers_enabled()
         && workers_resolve_imports(&compiler_options)
+        && !loader.opts.skip_module_resolution
         && loader.opts.host.is_plain_os_fs()
         && compiler_options.trace_resolution != Tristate::True
         && loader
@@ -319,7 +322,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         }
     }
 
-    if !root_files.is_empty() {
+    if !root_files.is_empty() && !loader.opts.skip_module_resolution {
         loader.add_automatic_type_directive_tasks();
     }
 
@@ -932,6 +935,13 @@ impl FileLoader {
 
     // Go: fileloader.go:341 (*fileLoader).loadSourceFileMetaData
     pub fn load_source_file_meta_data(&self, file_name: &str) -> SourceFileMetaData {
+        if self.opts.skip_module_resolution {
+            return SourceFileMetaData {
+                implied_node_format: get_implied_node_format_for_file(file_name, ""),
+                ..SourceFileMetaData::default()
+            };
+        }
+
         source_file_meta_data(
             self.resolver(),
             self.opts.config.compiler_options(),
@@ -1501,6 +1511,10 @@ impl FileLoader {
             // Do nothing if it's an Identifier; we don't need to do module resolution for `declare global`.
         }
 
+        if self.opts.skip_module_resolution {
+            return;
+        }
+
         if !module_names.is_empty() {
             let mut resolutions_in_file: ModeAwareCache<Arc<ResolvedModule>> =
                 ModeAwareCache::default();
@@ -1627,12 +1641,13 @@ impl FileLoader {
 
         let mut path = combine_paths(&self.default_library_path, &[name]);
         let mut replaced = false;
-        if self
-            .opts
-            .config
-            .compiler_options()
-            .lib_replacement
-            .is_true()
+        if !self.opts.skip_module_resolution
+            && self
+                .opts
+                .config
+                .compiler_options()
+                .lib_replacement
+                .is_true()
             && name != "lib.d.ts"
         {
             let library_name = get_library_name_from_lib_file_name(name);
@@ -2029,6 +2044,7 @@ mod tests {
                 single_threaded: Tristate::True,
                 typings_location: String::new(),
                 project_name: String::new(),
+                skip_module_resolution: false,
             },
             true,
         );

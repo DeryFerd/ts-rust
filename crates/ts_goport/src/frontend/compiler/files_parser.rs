@@ -154,7 +154,7 @@ impl ParseTask {
         );
 
         let compiler_options = loader.opts.config.compiler_options();
-        if !compiler_options.no_resolve.is_true() {
+        if !compiler_options.no_resolve.is_true() && !loader.opts.skip_module_resolution {
             for (index, ref_) in file.referenced_files.iter().enumerate() {
                 let (resolved_ref, processing_diagnostic) = loader
                     .resolve_tripleslash_path_reference(
@@ -175,7 +175,7 @@ impl ParseTask {
             loader.resolve_type_reference_directives(self);
         }
 
-        if compiler_options.no_lib != Tristate::True {
+        if compiler_options.no_lib != Tristate::True && !loader.opts.skip_module_resolution {
             for (index, lib) in file.lib_reference_directives.iter().enumerate() {
                 let include_reason = new_file_include_reason(
                     FileIncludeKind::LIB_REFERENCE_DIRECTIVE,
@@ -1448,7 +1448,10 @@ impl WorkerResolveConfig {
     /// The config of `loader`. `None` when workers do not resolve.
     fn of_loader(loader: &FileLoader) -> Option<Self> {
         let options = loader.opts.config.compiler_options();
-        if !super::file_loader::workers_resolve_imports(options) {
+        // PORT: see `skip_module_resolution` in `process_all_program_files`.
+        if !super::file_loader::workers_resolve_imports(options)
+            || loader.opts.skip_module_resolution
+        {
             return None;
         }
         Some(WorkerResolveConfig {

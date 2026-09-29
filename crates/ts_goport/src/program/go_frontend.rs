@@ -553,6 +553,7 @@ fn load_config(
         single_threaded: Tristate::Unknown,
         typings_location: String::new(),
         project_name: String::new(),
+        skip_module_resolution: false,
     })
 }
 
