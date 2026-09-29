@@ -10,7 +10,7 @@ use crate::prelude::*;
 // holds that output until `bind_source_file` fills the `GoFile` cells:
 // - `self.flow_nodes: Vec<FlowNode>`, indexed by `FlowNodeId::local_index()`.
 // - `self.node_bind: NodeBindBuilder`, indexed by `node.node_id().index()`.
-// - `self.file_bind: FileBindData` (bind and suggestion diagnostics).
+// - `self.file_bind: FileBindData` (bind diagnostics and the other file data).
 // - `self.symbols: SymbolArena` (Go `symbolArena`).
 // - `self.active_label_list: Option<Rc<RefCell<ActiveLabel>>>`.
 // All direct access goes through the `p3_*` helpers below so a storage

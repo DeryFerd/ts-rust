@@ -2477,8 +2477,6 @@ impl FileNodeBind {
 #[derive(Clone, Debug, Default)]
 pub struct FileBindData {
     pub bind_diagnostics: Vec<Diagnostic>,
-    pub bind_suggestion_diagnostics: Vec<Diagnostic>,
-    pub end_flow_node: FlowNodeId,
     pub symbol_count: i32,
     // PORT: Go also keeps `ClassifiableNames` here. Nothing reads it, so the
     // binder does not collect it.
