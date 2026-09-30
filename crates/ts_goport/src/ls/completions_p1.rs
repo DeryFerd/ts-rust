@@ -118,7 +118,8 @@ impl LanguageService {
             if !ok {
                 return false;
             }
-            item.additional_text_edits = Some(edits);
+            // Go `&edits`: a `[]*lsproto.TextEdit` of non-nil edits.
+            item.additional_text_edits = Some(edits.into_iter().map(Some).collect());
             item.detail = str_ptr_to(&description);
             true
         });

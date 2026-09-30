@@ -149,6 +149,10 @@ impl LanguageService {
             let mut seen: Vec<CodeAction> = Vec::new(); // sorted for binary search dedup, dedup across all diagnostics and providers so if multiple diags produce the same codefix, only one is returned
 
             for diag in &context.diagnostics {
+                // Go: diag.Code (a nil element panics)
+                let diag = diag
+                    .as_ref()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 let Some(code) = &diag.code else {
                     continue;
                 };
@@ -530,7 +534,7 @@ fn convert_to_lsp_code_action(
     let kind = lsproto::CodeActionKind::QUICK_FIX;
     let mut changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> = IndexMap::new();
     changes.insert(uri.clone(), action.changes.clone());
-    let diagnostics: Vec<lsproto::Diagnostic> = vec![diag.clone()];
+    let diagnostics: Vec<Option<lsproto::Diagnostic>> = vec![Some(diag.clone())];
 
     lsproto::CommandOrCodeAction {
         code_action: Some(lsproto::CodeAction {

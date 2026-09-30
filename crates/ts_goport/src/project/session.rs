@@ -576,7 +576,7 @@ impl Session {
     pub fn did_change_watched_files(
         self: &Rc<Self>,
         _ctx: &Context,
-        changes: &[lsproto::FileEvent],
+        changes: &[Option<lsproto::FileEvent>],
     ) {
         let mut file_changes: Vec<FileChange> = Vec::with_capacity(changes.len());
         let mut has_relevant_change = false;
@@ -590,6 +590,10 @@ impl Session {
             .map(String::as_str)
             .collect();
         for change in changes {
+            // Go: change.Type (a nil element panics)
+            let change = change
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             let kind = match change.type_ {
                 lsproto::FileChangeType::CREATED => FileChangeKind::WATCH_CREATE,
                 lsproto::FileChangeType::CHANGED => FileChangeKind::WATCH_CHANGE,
@@ -1161,28 +1165,31 @@ impl Session {
             let timer = gostd::local::after_func(
                 PERFORMANCE_TELEMETRY_INTERVAL,
                 Box::new(move || {
-                    // Go: case <-ctx.Done(): return (defer ticker.Stop())
-                    if ctx.err().is_some() {
-                        let stopped = tick_ticker.borrow_mut().take();
-                        if let Some(stopped) = stopped {
-                            stopped.stop();
+                    // Go: each tick runs in the same wg.Go goroutine.
+                    crate::core::go_wait_group_task(|| {
+                        // Go: case <-ctx.Done(): return (defer ticker.Stop())
+                        if ctx.err().is_some() {
+                            let stopped = tick_ticker.borrow_mut().take();
+                            if let Some(stopped) = stopped {
+                                stopped.stop();
+                            }
+                            return;
                         }
-                        return;
-                    }
-                    // Go: case <-ticker.C (the ticker sends the next tick after the interval)
-                    if let Some(t) = tick_ticker.borrow().as_ref() {
-                        t.reset(PERFORMANCE_TELEMETRY_INTERVAL);
-                    }
-                    if s.client.is_none()
-                        || !s
-                            .client
-                            .as_ref()
-                            .unwrap_or_else(|| crate::core::go_nil_dereference())
-                            .is_active()
-                    {
-                        return; // Go: continue
-                    }
-                    s.send_performance_telemetry(&ctx);
+                        // Go: case <-ticker.C (the ticker sends the next tick after the interval)
+                        if let Some(t) = tick_ticker.borrow().as_ref() {
+                            t.reset(PERFORMANCE_TELEMETRY_INTERVAL);
+                        }
+                        if s.client.is_none()
+                            || !s
+                                .client
+                                .as_ref()
+                                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                                .is_active()
+                        {
+                            return; // Go: continue
+                        }
+                        s.send_performance_telemetry(&ctx);
+                    })
                 }),
             );
             *ticker.borrow_mut() = Some(timer);
@@ -3500,7 +3507,10 @@ impl Session {
             }
             if !self.warm_auto_import_queued.replace(true) {
                 let s = self.clone();
-                gostd::local::go_idle(Box::new(move || s.run_pending_warm()));
+                // Go: the rest of the same wg.Go goroutine.
+                gostd::local::go_idle(Box::new(move || {
+                    crate::core::go_wait_group_task(|| s.run_pending_warm())
+                }));
             }
         }
     }

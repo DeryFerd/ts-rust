@@ -258,13 +258,13 @@ methods reach the AST through it.
   publish), in a
   static array for ids below 2^16 (`FILE_BLOCKS`, one cache line per
   entry) and in chunks made on demand above (`HIGH_BLOCKS`, read in a cold
-  block that calls the empty `high_block_path`). So the first program, a later program (`tsc -b`, watch,
-  an edited file) and the node shell of a freeable version read the same
-  way: a hot node read is two dependent loads, and has no call. The block
-  of a freeable version is its node shell (records and kids in a pooled
-  block, step 4; kinds and foreign parents leaked; no node column when its store
-  owns its nodes; no link column), so its header and child reads are block
-  reads, and its node
+  block that calls the empty `high_block_path`). So the first program, a
+  later program (`tsc -b`, watch, an edited file) and the node shell of a
+  freeable version read the same way: a hot node read is two dependent
+  loads, and has no call. The block of a freeable version is its node
+  shell (records and kids in a pooled block, step 4; kinds and foreign
+  parents leaked; no node column when its store owns its nodes; no link
+  column), so its header and child reads are block reads, and its node
   data reads read the pinned version (`static_store_node`,
   `with_scoped_store_node`). A read of the store or the `GoFile` of a
   node shell reads the pinned version out of line
@@ -513,6 +513,16 @@ that keep a run going pass it on (`core::resume_go_panic`), and the bins
 end the run as the Go runtime does. The output written so far stays,
 stderr gets `panic: <message>` (then the port site in place of the
 goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
+
+Go `sync.WaitGroup.Go(f)` recovers a panic in `f` and panics again, so the
+runtime line ends with ` [recovered, repanicked]`. Where the port runs
+such a goroutine on the dispatch thread (background queue tasks, their
+timer continuations, the telemetry ticker, the idle auto-import warm), it
+runs `f` under `core::go_wait_group_task`. Where the port runs it inline
+inside work that a Go `recover()` guards (the auto-import registry build
+under a request), it runs `f` under `core::go_wait_group_goroutine`: a Go
+panic ends the process there, because Go's recover sees only its own
+goroutine.
 
 ## Threads
 
@@ -987,7 +997,12 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   names keep the Go spelling (`HoverParams`, `URI`, `DocumentUri`); fields
   are snake case (`text_document`, `type_`); `*T` is `Option<T>`
   (`Option<Box<T>>` only on a type cycle); `*[]T` is `Option<Vec<T>>`;
-  `[]T` and `[]*T` are `Vec<T>`; `map[K]V` is `IndexMap<K, V>`; LSPAny is
+  `[]T` and `[]*T` are `Vec<T>`, except that `[]*T` is `Vec<Option<T>>`
+  in a type that the server decodes (client-to-server params,
+  server-to-client results, and the types they hold), so a JSON null
+  element is Go's nil element and a nil element encodes as null (the
+  generator's `decodedTypes`). Code that builds such a list wraps each
+  element in `Some`; `map[K]V` is `IndexMap<K, V>`; LSPAny is
   `LspAny`; a string enum is `pub struct MarkupKind(pub Cow<'static, str>)`
   with consts such as `MarkupKind::PLAIN_TEXT`; an int enum is
   `pub struct CompletionItemKind(pub i32)` with consts; method consts are

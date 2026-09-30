@@ -147,6 +147,8 @@ pub fn get_vs_hover_image_id(
 // declaration line, plus an optional colorized documentation block) matching the shape that
 // TypeScript-VS's legacy HoverService.cs builds from TSServer's quickinfo-full response
 // (ImageElement + ClassifiedTextElement wrapped in a ContainerElement).
+// PORT: Go's runs are `[]*lsproto.VSClassifiedTextRun`; the port's runs are
+// values, which are never nil.
 pub fn build_vs_hover_raw_content(
     image_id: lsproto::VSImageId,
     quick_info_runs: Vec<lsproto::VSClassifiedTextRun>,
@@ -168,7 +170,7 @@ pub fn build_vs_hover_raw_content(
             },
             lsproto::VSImageElementOrClassifiedTextElementOrContainerElement {
                 classified_text_element: Some(lsproto::VSClassifiedTextElement {
-                    runs: quick_info_runs,
+                    runs: quick_info_runs.into_iter().map(Some).collect(),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -190,7 +192,7 @@ pub fn build_vs_hover_raw_content(
             },
             lsproto::VSImageElementOrClassifiedTextElementOrContainerElement {
                 classified_text_element: Some(lsproto::VSClassifiedTextElement {
-                    runs: documentation_runs,
+                    runs: documentation_runs.into_iter().map(Some).collect(),
                     ..Default::default()
                 }),
                 ..Default::default()

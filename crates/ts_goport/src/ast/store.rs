@@ -70,13 +70,15 @@
 //!   parse is a static parse, whose node column is in the shell, as before
 //!   M3c.
 //! - Every read of a published store goes through one inline lookup
-//!   (`file_block`), with no call. So the hot node reads in `node.rs`, the
-//!   node records (`NodeRecord`, `NodeKids`) and the perf columns (links,
-//!   facts) answer for the nodes of every program, and return `None` on a
-//!   miss. A read of the store or the `GoFile` of a node shell reads the
-//!   freeable version, out of line and pinned while the read runs
-//!   (`with_published_store`, `try_with_go_file`); the accessors that
-//!   return a borrow return a `FileRef` guard.
+//!   (`file_block`). An id below `LOW_BLOCKS` reads with no call; a higher
+//!   id reads in a cold block that calls the empty `high_block_path`. So
+//!   the hot node reads in `node.rs`, the node records (`NodeRecord`,
+//!   `NodeKids`) and the perf columns (links, facts) answer for the nodes
+//!   of every program, and return `None` on a miss. A read of the store or
+//!   the `GoFile` of a node shell reads the freeable version, out of line
+//!   and pinned while the read runs (`with_published_store`,
+//!   `try_with_go_file`); the accessors that return a borrow return a
+//!   `FileRef` guard.
 //! - After a registry miss, a synthetic id has no store (a few compares, no
 //!   call). Any other id takes one cold call: the detached store, then the
 //!   build stores of this thread.

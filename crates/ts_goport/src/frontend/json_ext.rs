@@ -16,7 +16,9 @@
 //! Unmarshal errors of the arshalers here are Go v2 `SemanticError` texts
 //! (see `SemanticError`). The JSON pointer is added by `unmarshal_root`; an
 //! error that reaches the caller through `json.rs` `json_unmarshal` has no
-//! pointer. The `json.rs` impls keep their own texts.
+//! pointer. The `json.rs` impls keep their own texts, except that their kind
+//! errors (a string, a boolean or a number of the wrong kind) use
+//! `unmarshal_kind_error`.
 //!
 //! PORT: integer arshalers do not port the stringified form that v2 uses
 //! for integer map keys (no LSP type has integer keys).
@@ -423,11 +425,10 @@ fn truncate_pointer(s: &str, n: usize) -> String {
 /// the method gets the Go type of `T`. A `SemanticError` keeps its type, and
 /// other errors pass through.
 ///
-/// PORT: Go wraps at every type that has a method. The port wraps where the
-/// caller knows the type: `Option<T>`, `Vec<T>` and map values, the root
-/// value (`unmarshal_root`) and hand-written methods. A plain error from a
-/// struct-typed required field of a generated LSP type gets the type of the
-/// next such caller.
+/// PORT: Go wraps at every type that has a method. The port wraps at every
+/// `json_unmarshal_decode::<T>`, so the innermost type whose method made the
+/// error names it. Only method types make plain errors (`SemanticError::method`);
+/// the errors of the default arshalers have their type already.
 #[must_use]
 pub fn wrap_method_error<T: ?Sized>(err: JsonError) -> JsonError {
     match SemanticError::of(&err) {
@@ -446,10 +447,8 @@ pub fn wrap_method_error<T: ?Sized>(err: JsonError) -> JsonError {
 /// its byte offset).
 ///
 /// PORT: the Rust decoder keeps no object names, so the pointer is found
-/// again from `data` and the input offset where decoding stopped. A
-/// `json_unmarshal` of a raw sub-value inside a method (LSP unions) does not
-/// find pointers, so its errors get the pointer in `data`, where Go keeps
-/// the one in the sub-value.
+/// again from `data` and the input offset where decoding stopped. A method
+/// that unmarshals a raw sub-value (LSP unions) uses `unmarshal_read_value`.
 pub fn unmarshal_root<T: UnmarshalerFrom + ?Sized>(
     data: &[u8],
     v: &mut T,
@@ -457,7 +456,7 @@ pub fn unmarshal_root<T: UnmarshalerFrom + ?Sized>(
     let mut dec = JsonDecoder::new(data, JsonOptions::default());
     let err = match json_unmarshal_decode(&mut dec, v) {
         Ok(()) => return dec.check_eof(),
-        Err(err) => wrap_method_error::<T>(err),
+        Err(err) => err,
     };
     let Some(mut s) = SemanticError::of(&err) else {
         return Err(err);
@@ -482,6 +481,32 @@ pub fn unmarshal_root<T: UnmarshalerFrom + ?Sized>(
         ErrorPos::AfterEnd => end.saturating_sub(1),
     };
     Err(s.into_json_error())
+}
+
+/// Go `json.Unmarshal(data, v)` inside an `UnmarshalJSONFrom` method, where
+/// `data` is the value that the method read from its decoder (the LSP
+/// unions). An error keeps the JSON pointer inside `data` (Go does not add
+/// the pointer of `data` to it). An error at `data` itself has the empty
+/// pointer, which the caller's arshaler fills in with the pointer of the
+/// value the method read: here the error is given `ErrorPos::After` and no
+/// pointer, so `unmarshal_root` finds that value.
+pub fn unmarshal_read_value<T: UnmarshalerFrom + ?Sized>(
+    data: &[u8],
+    v: &mut T,
+) -> Result<(), JsonError> {
+    let err = match unmarshal_root(data, v) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    match SemanticError::of(&err) {
+        Some(mut s) if s.pointer.as_deref() == Some("") => {
+            s.pointer = None;
+            s.pos = ErrorPos::After;
+            s.byte_offset = 0;
+            Err(s.into_json_error())
+        }
+        _ => Err(err),
+    }
 }
 
 /// Go v2 `json.Unmarshal(data, &v)` for a type `T` with a v1 `UnmarshalJSON`
@@ -828,6 +853,18 @@ pub fn unmarshal_uint_as<U: TryFrom<u64>>(
     U::try_from(n).map_err(|_| unmarshal_kind_error(b'0', go_type))
 }
 
+/// Go v2 int arshaler for a Go named int type such as `lsproto.LogVerbosity`:
+/// errors name `go_type`. The Go size is the size of `I`.
+pub fn unmarshal_int_as<I: TryFrom<i64>>(
+    dec: &mut JsonDecoder<'_>,
+    go_type: &str,
+) -> Result<I, JsonError> {
+    let bits = u32::try_from(std::mem::size_of::<I>() * 8).unwrap_or(64);
+    let n = unmarshal_int(dec, bits, go_type)?;
+    // `unmarshal_int` checked the range.
+    I::try_from(n).map_err(|_| unmarshal_kind_error(b'0', go_type))
+}
+
 /// Go v2 string arshaler (arshal_default.go:257) for a Go named string type
 /// such as `lsproto.DocumentUri`: null sets "", a string sets the value, and
 /// any other kind is an error that names `go_type`.
@@ -971,8 +1008,7 @@ impl<T: MarshalerTo> MarshalerTo for Option<T> {
 
 // Go: arshal_default.go:1742 makePointerArshaler (unmarshal): null sets nil;
 // otherwise a nil pointer gets a new zero value and the value decodes into
-// the pointee (merging into an existing one). A plain error of the method of
-// `T` gets the Go type `T`.
+// the pointee (merging into an existing one).
 impl<T: UnmarshalerFrom + Default> UnmarshalerFrom for Option<T> {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         if dec.peek_kind() == b'n' {
@@ -981,7 +1017,7 @@ impl<T: UnmarshalerFrom + Default> UnmarshalerFrom for Option<T> {
             return Ok(());
         }
         let v = self.get_or_insert_with(T::default);
-        json_unmarshal_decode(dec, v).map_err(wrap_method_error::<T>)
+        json_unmarshal_decode(dec, v)
     }
 }
 
@@ -1000,8 +1036,7 @@ impl<T: UnmarshalerFrom + ?Sized> UnmarshalerFrom for Box<T> {
 }
 
 // Go: arshal_default.go:1528 makeSliceArshaler (unmarshal): null sets nil,
-// each element starts from its zero value, `[]` sets an empty slice. A plain
-// error of the method of `T` gets the Go type `T`.
+// each element starts from its zero value, `[]` sets an empty slice.
 // PORT: nil and empty are both an empty `Vec`.
 impl<T: UnmarshalerFrom + Default> UnmarshalerFrom for Vec<T> {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
@@ -1016,7 +1051,7 @@ impl<T: UnmarshalerFrom + Default> UnmarshalerFrom for Vec<T> {
                 while dec.peek_kind() != b']' {
                     self.push(T::default());
                     let v = self.last_mut().expect("element was just pushed");
-                    json_unmarshal_decode(dec, v).map_err(wrap_method_error::<T>)?;
+                    json_unmarshal_decode(dec, v)?;
                 }
                 dec.read_token()?;
                 Ok(())
