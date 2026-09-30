@@ -9,6 +9,7 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
+use crate::frontend::parser;
 use std::cell::Cell;
 
 // Go: project/snapshothost.go:19 SnapshotHost
@@ -33,6 +34,31 @@ pub struct SnapshotHost {
     pub auto_import_parse_keys: Rc<AutoImportParseKeys>,
 }
 
+// Go: project/snapshothost.go:34 SourceFileLease (ts#64434)
+// PORT: Go `releaseOnce sync.Once` is a `Cell<bool>` (one thread).
+pub struct SourceFileLease {
+    cache: Rc<ParseCache>,
+    key: ParseCacheKey,
+    source_file: Rc<parser::ParsedSourceFile>,
+    released: Cell<bool>,
+}
+
+impl SourceFileLease {
+    // Go: project/snapshothost.go:41 SourceFileLease.SourceFile
+    // PORT: Go returns the `*ast.SourceFile`; the port returns its root node,
+    // which the API encoder takes.
+    pub fn source_file(&self) -> Node {
+        self.source_file.root
+    }
+
+    // Go: project/snapshothost.go:45 SourceFileLease.Release
+    pub fn release(&self) {
+        if !self.released.replace(true) {
+            self.cache.deref(&self.key);
+        }
+    }
+}
+
 /// Go `logging.Logger` as the session logger argument of `Snapshot.Clone`,
 /// `cloneForProgram` and `CloneSnapshotWithAutoImports`.
 // PORT: Go passes the session's logger (a non-nil interface, also for the nop
@@ -42,12 +68,30 @@ pub struct SnapshotHost {
 pub type SessionLogger<'a> = Option<&'a Option<Rc<dyn logging::Logger>>>;
 
 impl SnapshotHost {
-    // Go: project/snapshothost.go:33 SnapshotHost.nextSnapshotID
+    // Go: project/snapshothost.go:51 SnapshotHost.nextSnapshotID
     pub fn next_snapshot_id(&self) -> u64 {
         // Go: s.snapshotID.Add(1)
         let id = self.snapshot_id.get() + 1;
         self.snapshot_id.set(id);
         id
+    }
+
+    // Go: project/snapshothost.go:55 SnapshotHost.AcquireSourceFile (ts#64434)
+    pub fn acquire_source_file(
+        &self,
+        options: parser::SourceFileParseOptions,
+        text: &str,
+        script_kind: ScriptKind,
+    ) -> Rc<SourceFileLease> {
+        let file_handle = new_cached_file_handle(&options.file_name, text.to_string());
+        let key = new_parse_cache_key(&options, file_handle.hash(), script_kind);
+        let source_file = self.parse_cache.acquire(key.clone(), file_handle).file;
+        Rc::new(SourceFileLease {
+            cache: self.parse_cache.clone(),
+            key,
+            source_file,
+            released: Cell::new(false),
+        })
     }
 }
 
