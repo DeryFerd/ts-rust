@@ -185,9 +185,15 @@ fn set_is_subset_of(s: Option<&FxHashSet<String>>, other: Option<&FxHashSet<Stri
 }
 
 /// Go copies `module.ResolverOptions` by value.
-// PORT: `module::ResolverOptions` is not `Clone`; this copies its one field.
+// PORT: the copy clones each field (the `Rc` values are shared, as Go
+// shares the pointers).
 fn copy_resolver_options(opts: &module::ResolverOptions) -> module::ResolverOptions {
     module::ResolverOptions {
+        host: opts.host.clone(),
+        compiler_options: opts.compiler_options.clone(),
+        typings_location: opts.typings_location.clone(),
+        project_name: opts.project_name.clone(),
+        extra_extensions: opts.extra_extensions.clone(),
         package_json_cache: opts.package_json_cache.clone(),
     }
 }
@@ -1672,13 +1678,10 @@ impl RegistryBuilder {
                 }
             }
             if !root_files.is_empty() {
-                let module_resolver = Rc::new(module::new_resolver_with_options(
-                    self.host.clone(),
-                    Rc::new(CompilerOptions::default()),
-                    "",
-                    "",
-                    copy_resolver_options(&self.resolver_options),
-                ));
+                let mut resolver_options = copy_resolver_options(&self.resolver_options);
+                resolver_options.host = Some(self.host.clone());
+                resolver_options.compiler_options = Some(Rc::new(CompilerOptions::default()));
+                let module_resolver = Rc::new(module::new_resolver(resolver_options));
                 let alias_resolver = new_alias_resolver(
                     root_files.values().copied().collect(),
                     FxHashMap::default(),
@@ -1909,13 +1912,10 @@ impl RegistryBuilder {
             .parsed_auto_import_file_exclude_patterns(
                 self.host.fs().use_case_sensitive_file_names(),
             );
-        let module_resolver = Rc::new(module::new_resolver_with_options(
-            self.host.clone(),
-            Rc::new(CompilerOptions::default()),
-            "",
-            "",
-            copy_resolver_options(&self.resolver_options),
-        ));
+        let mut resolver_options = copy_resolver_options(&self.resolver_options);
+        resolver_options.host = Some(self.host.clone());
+        resolver_options.compiler_options = Some(Rc::new(CompilerOptions::default()));
+        let module_resolver = Rc::new(module::new_resolver(resolver_options));
         let program = self
             .host
             .get_program_for_project(project_id)

@@ -494,13 +494,13 @@ impl module::ResolutionHost for ResolutionHost {
 
 // Go: ls/autoimport/util.go:317 getModuleResolver
 // PORT: Go `core.EmptyCompilerOptions` is shared; the resolver takes an `Rc`,
-// so it gets a new default `CompilerOptions`. Go `*module.Resolver` is
-// `Rc<module::Resolver>`.
+// so it gets a new default `CompilerOptions`. Go `*module.DefaultResolver` is
+// `Rc<module::DefaultResolver>`.
 pub fn get_module_resolver(
     host: &Rc<dyn RegistryCloneHost>,
     realpath: Rc<dyn Fn(&str) -> String>,
-    opts: module::ResolverOptions,
-) -> Rc<module::Resolver> {
+    mut opts: module::ResolverOptions,
+) -> Rc<module::DefaultResolver> {
     let rh: Rc<dyn module::ResolutionHost> = Rc::new(ResolutionHost {
         fs: vfs::wrapvfs_wrap(
             Rc::new(RegistryCloneHostFs { host: host.clone() }),
@@ -511,13 +511,9 @@ pub fn get_module_resolver(
         ),
         current_directory: host.get_current_directory().to_string(),
     });
-    Rc::new(module::new_resolver_with_options(
-        rh,
-        Rc::new(CompilerOptions::default()),
-        "",
-        "",
-        opts,
-    ))
+    opts.host = Some(rh);
+    opts.compiler_options = Some(Rc::new(CompilerOptions::default()));
+    Rc::new(module::new_resolver(opts))
 }
 
 /// The `vfs.FS` value of a registry host (Go `host.FS()` passed on).
