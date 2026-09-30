@@ -762,7 +762,7 @@ impl Checker {
                 );
                 let (members, index_infos) = {
                     let resolved = self.ty(t).as_structured_type();
-                    (resolved.members, resolved.index_infos.clone())
+                    (resolved.members, resolved.index_infos_list())
                 };
                 self.set_structured_type_members(
                     result,

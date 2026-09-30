@@ -1533,7 +1533,7 @@ impl Checker {
         self.ty(t).flags.intersects(TypeFlags::STRUCTURED_TYPE)
             && !self
                 .resolve_structured_type_members(t)
-                .signatures
+                .signatures()
                 .is_empty()
     }
 

@@ -1528,8 +1528,8 @@ impl Checker {
             // PORT: the resolved members are read in place, not copied.
             self.resolve_structured_type_members(t);
             let resolved = self.ty(t).as_structured_type();
-            return resolved.signatures.is_empty()
-                && resolved.index_infos.is_empty()
+            return resolved.signatures().is_empty()
+                && resolved.index_infos().is_empty()
                 && !resolved.properties.is_empty()
                 && resolved
                     .properties
