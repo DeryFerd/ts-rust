@@ -37,6 +37,7 @@ use crate::api::prelude::*;
 //   samples (see its module comment).
 
 use crate::api::encoder;
+use crate::api::proto;
 use crate::astnav;
 use crate::emitter::emitter::EmitOnly;
 use crate::frontend::compiler;
@@ -1084,6 +1085,22 @@ impl ipc::Handler for Session {
                 .map(to_any),
             m if m == Method::GET_SOURCE_FILE_METADATA.0 => self
                 .handle_get_source_file_metadata(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64247
+            m if m == Method::GET_RESOLVED_MODULE.0 => self
+                .handle_get_resolved_module(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_RESOLVED_MODULE_FROM_MODULE_SPECIFIER.0 => self
+                .handle_get_resolved_module_from_module_specifier(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_RESOLVED_TYPE_REFERENCE_DIRECTIVE.0 => self
+                .handle_get_resolved_type_reference_directive(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_RESOLVED_TYPE_REFERENCE_DIRECTIVE_FROM_REFERENCE.0 => self
+                .handle_get_resolved_type_reference_directive_from_reference(
+                    ctx,
+                    assert_params(&parsed),
+                )
                 .map(to_any),
             m if m == Method::GET_CONFIG_FILE_NAMES.0 => self
                 .handle_get_config_file_names(ctx, assert_params(&parsed))
@@ -2367,6 +2384,150 @@ impl Session {
             package_json_directory: meta_data.package_json_directory,
             implied_node_format: meta_data.implied_node_format.0,
         }))
+    }
+}
+
+// Go: api/session.go newResolvedModuleResponse (ts#64247)
+// PORT: Go `resolution.IsResolved()` is false for a nil resolution.
+pub fn new_resolved_module_response(
+    resolution: Option<&crate::program::ResolvedModule>,
+) -> Option<proto::ResolvedModule> {
+    let resolution = resolution.filter(|resolution| resolution.is_resolved())?;
+    Some(proto::ResolvedModule {
+        resolved_file_name: resolution.resolved_file_name.clone(),
+        original_path: resolution.original_path.clone(),
+        extension: resolution.extension.clone(),
+        resolved_using_ts_extension: resolution.resolved_using_ts_extension,
+        resolved_using_extra_extensions: resolution.resolved_using_extra_extensions,
+        package_id: new_package_id(&resolution.package_id),
+        is_external_library_import: resolution.is_external_library_import,
+        alternate_result: resolution.alternate_result.clone(),
+    })
+}
+
+// Go: api/session.go newResolvedTypeReferenceDirectiveResponse (ts#64247)
+pub fn new_resolved_type_reference_directive_response(
+    resolution: Option<&crate::frontend::module::ResolvedTypeReferenceDirective>,
+) -> Option<proto::ResolvedTypeReferenceDirective> {
+    let resolution = resolution.filter(|resolution| resolution.is_resolved())?;
+    Some(proto::ResolvedTypeReferenceDirective {
+        primary: resolution.primary,
+        resolved_file_name: resolution.resolved_file_name.clone(),
+        original_path: resolution.original_path.clone(),
+        package_id: new_package_id(&resolution.package_id),
+        is_external_library_import: resolution.is_external_library_import,
+    })
+}
+
+/// Go passes an `*ast.SourceFile` where a program method takes an
+/// `ast.HasFileName`; the Rust methods take `&dyn HasFileName`, which a file
+/// root `Node` does not implement, so its file name and path are copied.
+fn file_of(source_file: Node) -> HasFileNameImpl {
+    new_has_file_name(
+        source_file_file_name(source_file),
+        &source_file_info(source_file).path,
+    )
+}
+
+impl Session {
+    // Go: api/session.go handleGetResolvedModule (ts#64247)
+    pub fn handle_get_resolved_module(
+        &self,
+        _ctx: &Context,
+        params: &GetResolvedModuleParams,
+    ) -> Result<Option<proto::ResolvedModule>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let source_file = self.resolve_optional_source_file(program, Some(&params.file))?;
+        let resolution =
+            program.get_resolved_module(&file_of(source_file), &params.module_name, params.mode);
+        Ok(new_resolved_module_response(resolution.as_deref()))
+    }
+
+    // Go: api/session.go handleGetResolvedModuleFromModuleSpecifier (ts#64247)
+    pub fn handle_get_resolved_module_from_module_specifier(
+        &self,
+        _ctx: &Context,
+        params: &GetResolvedModuleFromModuleSpecifierParams,
+    ) -> Result<Option<proto::ResolvedModule>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let node = sd.resolve_node_handle(program, &params.module_specifier)?;
+        if !is_string_literal_like(node) {
+            return Err(errors::errorf(
+                format!(
+                    "{}: moduleSpecifier must be a StringLiteralLike node",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        let mut source_file = get_source_file_of_node(node);
+        if params.source_file.is_some() {
+            source_file =
+                self.resolve_optional_source_file(program, params.source_file.as_ref())?;
+        }
+        if source_file.is_nil() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: moduleSpecifier must have a SourceFile ancestor or sourceFile must be provided",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        let file = file_of(source_file);
+        let mode = program.get_mode_for_usage_location(&file, node);
+        let resolution = program.get_resolved_module(&file, node.text(), mode);
+        Ok(new_resolved_module_response(resolution.as_deref()))
+    }
+
+    // Go: api/session.go handleGetResolvedTypeReferenceDirective (ts#64247)
+    pub fn handle_get_resolved_type_reference_directive(
+        &self,
+        _ctx: &Context,
+        params: &GetResolvedTypeReferenceDirectiveParams,
+    ) -> Result<Option<proto::ResolvedTypeReferenceDirective>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let source_file = self.resolve_optional_source_file(program, Some(&params.file))?;
+        let resolution = program.get_resolved_type_reference_directive(
+            &file_of(source_file),
+            &params.type_directive_name,
+            params.mode,
+        );
+        Ok(new_resolved_type_reference_directive_response(
+            resolution.as_deref(),
+        ))
+    }
+
+    // Go: api/session.go handleGetResolvedTypeReferenceDirectiveFromReference (ts#64247)
+    pub fn handle_get_resolved_type_reference_directive_from_reference(
+        &self,
+        _ctx: &Context,
+        params: &GetResolvedTypeReferenceDirectiveFromReferenceParams,
+    ) -> Result<Option<proto::ResolvedTypeReferenceDirective>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let source_file = self.resolve_optional_source_file(program, Some(&params.source_file))?;
+        let file = file_of(source_file);
+        let mut mode = params.resolution_mode;
+        if mode == RESOLUTION_MODE_NONE {
+            mode = program.get_default_resolution_mode_for_file(&file);
+        }
+        let resolution =
+            program.get_resolved_type_reference_directive(&file, &params.type_directive_name, mode);
+        Ok(new_resolved_type_reference_directive_response(
+            resolution.as_deref(),
+        ))
     }
 
     // Go: api/session.go:804 handleGetSymbolAtPosition

@@ -267,6 +267,15 @@ impl Method {
     pub const GET_SOURCE_FILE: Method = Method(Cow::Borrowed("getSourceFile"));
     pub const GET_SOURCE_FILE_NAMES: Method = Method(Cow::Borrowed("getSourceFileNames"));
     pub const GET_SOURCE_FILE_METADATA: Method = Method(Cow::Borrowed("getSourceFileMetadata"));
+    // ts#64247
+    pub const GET_RESOLVED_MODULE: Method = Method(Cow::Borrowed("getResolvedModule"));
+    pub const GET_RESOLVED_MODULE_FROM_MODULE_SPECIFIER: Method =
+        Method(Cow::Borrowed("getResolvedModuleFromModuleSpecifier"));
+    pub const GET_RESOLVED_TYPE_REFERENCE_DIRECTIVE: Method =
+        Method(Cow::Borrowed("getResolvedTypeReferenceDirective"));
+    pub const GET_RESOLVED_TYPE_REFERENCE_DIRECTIVE_FROM_REFERENCE: Method = Method(Cow::Borrowed(
+        "getResolvedTypeReferenceDirectiveFromTypeReferenceDirective",
+    ));
     pub const GET_CONFIG_FILE_NAMES: Method = Method(Cow::Borrowed("getConfigFileNames"));
     pub const GET_CONFIG_SOURCE_FILE: Method = Method(Cow::Borrowed("getConfigSourceFile"));
     pub const RESOLVE_NAME: Method = Method(Cow::Borrowed("resolveName"));
@@ -852,6 +861,23 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     m.insert(
         Method::GET_SOURCE_FILE_METADATA,
         unmarshaller_for::<GetSourceFileParams>,
+    );
+    // ts#64247
+    m.insert(
+        Method::GET_RESOLVED_MODULE,
+        unmarshaller_for::<GetResolvedModuleParams>,
+    );
+    m.insert(
+        Method::GET_RESOLVED_MODULE_FROM_MODULE_SPECIFIER,
+        unmarshaller_for::<GetResolvedModuleFromModuleSpecifierParams>,
+    );
+    m.insert(
+        Method::GET_RESOLVED_TYPE_REFERENCE_DIRECTIVE,
+        unmarshaller_for::<GetResolvedTypeReferenceDirectiveParams>,
+    );
+    m.insert(
+        Method::GET_RESOLVED_TYPE_REFERENCE_DIRECTIVE_FROM_REFERENCE,
+        unmarshaller_for::<GetResolvedTypeReferenceDirectiveFromReferenceParams>,
     );
     m.insert(
         Method::GET_CONFIG_FILE_NAMES,
@@ -2253,6 +2279,180 @@ pub struct GetSourceFileNamesParams {
 proto_json!(both GetSourceFileNamesParams {
     snapshot: "snapshot" plain,
     project: "project" plain,
+});
+
+// PORT: Go `core.ModuleKind` (and its alias `core.ResolutionMode`) is a Go
+// int32 type with no JSON methods, so JSON uses the v2 int arshaler. The
+// params of ts#64247 and ts#64292 decode it. Errors name `core.ModuleKind`.
+impl MarshalerTo for ModuleKind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
+
+impl UnmarshalerFrom for ModuleKind {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        self.0
+            .unmarshal_json_from(dec)
+            .map_err(|err| match SemanticError::of(&err) {
+                Some(mut s) => {
+                    s.go_type = "core.ModuleKind".to_string();
+                    s.into_json_error()
+                }
+                None => err,
+            })
+    }
+}
+
+impl IsZero for ModuleKind {
+    fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+// Go: proto.go GetResolvedModuleParams (ts#64247)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetResolvedModuleParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub file: DocumentIdentifier,
+    pub module_name: String,
+    pub mode: ResolutionMode,
+}
+
+proto_json!(both GetResolvedModuleParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    file: "file" plain,
+    module_name: "moduleName" plain,
+    mode: "mode" plain,
+});
+
+// Go: proto.go GetResolvedModuleFromModuleSpecifierParams (ts#64247)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetResolvedModuleFromModuleSpecifierParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub module_specifier: NodeHandle,
+    pub source_file: Option<DocumentIdentifier>,
+}
+
+proto_json!(both GetResolvedModuleFromModuleSpecifierParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    module_specifier: "moduleSpecifier" plain,
+    source_file: "sourceFile" omitempty,
+});
+
+// Go: proto.go GetResolvedTypeReferenceDirectiveParams (ts#64247)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetResolvedTypeReferenceDirectiveParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub file: DocumentIdentifier,
+    pub type_directive_name: String,
+    pub mode: ResolutionMode,
+}
+
+proto_json!(both GetResolvedTypeReferenceDirectiveParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    file: "file" plain,
+    type_directive_name: "typeDirectiveName" plain,
+    mode: "mode" plain,
+});
+
+// Go: proto.go GetResolvedTypeReferenceDirectiveFromReferenceParams (ts#64247)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetResolvedTypeReferenceDirectiveFromReferenceParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub source_file: DocumentIdentifier,
+    pub type_directive_name: String,
+    pub resolution_mode: ResolutionMode,
+}
+
+proto_json!(both GetResolvedTypeReferenceDirectiveFromReferenceParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    source_file: "sourceFile" plain,
+    type_directive_name: "typeDirectiveName" plain,
+    resolution_mode: "resolutionMode" plain,
+});
+
+// Go: proto.go PackageId (ts#64247)
+// PORT: `crate::program::PackageId` is Go `module.PackageId`; code outside
+// this file names the api one `proto::PackageId`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PackageId {
+    pub name: String,
+    pub sub_module_name: String,
+    pub version: String,
+    pub peer_dependencies: String,
+}
+
+proto_json!(marshal PackageId {
+    name: "name" plain,
+    sub_module_name: "subModuleName" plain,
+    version: "version" plain,
+    peer_dependencies: "peerDependencies" plain,
+});
+
+// Go: proto.go NewPackageId (ts#64247)
+pub fn new_package_id(package_id: &crate::program::PackageId) -> Option<PackageId> {
+    if package_id.name.is_empty() {
+        return None;
+    }
+    Some(PackageId {
+        name: package_id.name.clone(),
+        sub_module_name: package_id.sub_module_name.clone(),
+        version: package_id.version.clone(),
+        peer_dependencies: package_id.peer_dependencies.clone(),
+    })
+}
+
+// Go: proto.go ResolvedModule (ts#64247)
+// PORT: `crate::program::ResolvedModule` is Go `module.ResolvedModule`; code
+// outside this file names the api one `proto::ResolvedModule`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResolvedModule {
+    pub resolved_file_name: String,
+    pub original_path: String,
+    pub extension: String,
+    pub resolved_using_ts_extension: bool,
+    pub resolved_using_extra_extensions: bool,
+    pub package_id: Option<PackageId>,
+    pub is_external_library_import: bool,
+    pub alternate_result: String,
+}
+
+proto_json!(marshal ResolvedModule {
+    resolved_file_name: "resolvedFileName" plain,
+    original_path: "originalPath" omitempty,
+    extension: "extension" plain,
+    resolved_using_ts_extension: "resolvedUsingTsExtension" omitempty,
+    resolved_using_extra_extensions: "resolvedUsingExtraExtensions" omitempty,
+    package_id: "packageId" omitempty,
+    is_external_library_import: "isExternalLibraryImport" omitempty,
+    alternate_result: "alternateResult" omitempty,
+});
+
+// Go: proto.go ResolvedTypeReferenceDirective (ts#64247)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResolvedTypeReferenceDirective {
+    pub primary: bool,
+    pub resolved_file_name: String,
+    pub original_path: String,
+    pub package_id: Option<PackageId>,
+    pub is_external_library_import: bool,
+}
+
+proto_json!(marshal ResolvedTypeReferenceDirective {
+    primary: "primary" plain,
+    resolved_file_name: "resolvedFileName" plain,
+    original_path: "originalPath" omitempty,
+    package_id: "packageId" omitempty,
+    is_external_library_import: "isExternalLibraryImport" omitempty,
 });
 
 // SourceFileMetadata carries program-stored metadata about a single source file.
