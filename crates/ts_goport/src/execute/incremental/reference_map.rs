@@ -36,6 +36,12 @@ impl ReferenceMap {
         self.references.get(path).map(|refs| &**refs)
     }
 
+    /// `get_references` that shares the stored set.
+    #[must_use]
+    pub fn get_references_arc(&self, path: &str) -> Option<Arc<FxIndexSet<Path>>> {
+        self.references.get(path).cloned()
+    }
+
     // Go: incremental/referencemap.go:27 getPathsWithReferences
     #[must_use]
     pub fn get_paths_with_references(&self) -> Vec<Path> {

@@ -209,27 +209,43 @@ impl Checker {
         construct_signatures: &[SignatureId],
         index_infos: &[IndexInfoId],
     ) {
+        let signatures = if construct_signatures.is_empty() {
+            call_signatures.into()
+        } else if call_signatures.is_empty() {
+            construct_signatures.into()
+        } else {
+            let mut signatures = call_signatures.to_vec();
+            signatures.extend_from_slice(construct_signatures);
+            signatures.into()
+        };
         self.set_structured_type_members_ex(
             t,
             members,
             SymbolTable::NIL,
-            call_signatures,
-            construct_signatures,
-            index_infos,
+            signatures,
+            call_signatures.len(),
+            index_infos.into(),
         );
     }
 
-    /// `set_structured_type_members`. When `declared` is not nil, `members`
-    /// is `instantiate_symbol_table(declared, ..)` and its properties come
-    /// from `get_named_members_of_instantiation` (the same list).
+    /// `set_structured_type_members` with the final lists: `signatures` is
+    /// the call signatures and then the construct signatures, and the first
+    /// `call_signature_count` of them are the call signatures. The lists are
+    /// stored without a copy. When `declared` is not nil, `members` is
+    /// `instantiate_symbol_table(declared, ..)` and its properties come from
+    /// `get_named_members_of_instantiation` (the same list).
+    ///
+    /// PERF: `resolve_object_type_members` passes the declared lists of a
+    /// type without instantiation, so the type shares them, as Go shares
+    /// its slices.
     pub(crate) fn set_structured_type_members_ex(
         &mut self,
         t: TypeId,
         members: SymbolTable,
         declared: SymbolTable,
-        call_signatures: &[SignatureId],
-        construct_signatures: &[SignatureId],
-        index_infos: &[IndexInfoId],
+        signatures: SharedList<SignatureId>,
+        call_signature_count: usize,
+        index_infos: SharedList<IndexInfoId>,
     ) {
         self.ty_mut(t).object_flags |= ObjectFlags::MEMBERS_RESOLVED;
         self.ty_mut(t).as_structured_type_mut().members = members;
@@ -243,24 +259,9 @@ impl Checker {
         };
         let data = self.ty_mut(t).as_structured_type_mut();
         data.properties = properties;
-        if !call_signatures.is_empty() {
-            if !construct_signatures.is_empty() {
-                let mut signatures = call_signatures.to_vec();
-                signatures.extend_from_slice(construct_signatures);
-                data.signatures = signatures.into();
-            } else {
-                data.signatures = call_signatures.into();
-            }
-            data.call_signature_count = call_signatures.len() as i32;
-        } else {
-            if !construct_signatures.is_empty() {
-                data.signatures = construct_signatures.into();
-            } else {
-                data.signatures = SharedList::default();
-            }
-            data.call_signature_count = 0;
-        }
-        data.index_infos = index_infos.into();
+        data.signatures = signatures;
+        data.call_signature_count = call_signature_count as i32;
+        data.index_infos = index_infos;
     }
 
     // Go: checker/checker.go:25070 newTypeParameter

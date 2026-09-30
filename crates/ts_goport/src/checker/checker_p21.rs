@@ -772,21 +772,25 @@ impl Checker {
     // checker methods copy what they need out of it first.
     // PORT: the resolved case is the common one, so it stays inline and the
     // dispatch below is out of line.
+    // PERF: the resolved path returns from inside the flags test, so the
+    // test and the cast read the same `&Type` (one arena lookup). With the
+    // cast after the `if`, the slow path joins the fast path before the cast
+    // and the arena was read again.
     #[inline]
     pub fn resolve_structured_type_members(&mut self, t: TypeId) -> &StructuredType {
-        if !self
+        if self
             .ty(t)
             .object_flags
             .intersects(ObjectFlags::MEMBERS_RESOLVED)
         {
-            self.resolve_structured_type_members_slow(t);
+            return self.ty(t).as_structured_type();
         }
-        self.ty(t).as_structured_type()
+        self.resolve_structured_type_members_slow(t)
     }
 
     /// The member resolution dispatch of `resolve_structured_type_members`.
     #[inline(never)]
-    fn resolve_structured_type_members_slow(&mut self, t: TypeId) {
+    fn resolve_structured_type_members_slow(&mut self, t: TypeId) -> &StructuredType {
         let flags = self.ty(t).flags;
         let object_flags = self.ty(t).object_flags;
         if flags.intersects(TypeFlags::OBJECT) {
@@ -810,6 +814,7 @@ impl Checker {
         } else {
             panic!("Unhandled case in resolveStructuredTypeMembers");
         }
+        self.ty(t).as_structured_type()
     }
 
     // Go: checker/checker.go:18990 resolveClassOrInterfaceMembers
@@ -841,6 +846,9 @@ impl Checker {
     }
 
     // Go: checker/checker.go:19005 resolveObjectTypeMembers
+    // PERF: the declared lists are `SharedList`s. A type without
+    // instantiation stores them without a copy, and an instantiated list
+    // that does not change is the declared list, as in Go.
     pub fn resolve_object_type_members(
         &mut self,
         t: TypeId,
@@ -850,18 +858,17 @@ impl Checker {
     ) {
         let mut mapper = MapperId::NIL;
         let mut members: SymbolTable;
-        let mut call_signatures: Vec<SignatureId>;
-        let mut construct_signatures: Vec<SignatureId>;
-        let mut index_infos: Vec<IndexInfoId>;
+        let mut call_signatures: SharedList<SignatureId>;
+        let mut construct_signatures: SharedList<SignatureId>;
+        let mut index_infos: SharedList<IndexInfoId>;
         let mut instantiated = false;
-        self.resolve_declared_members(source);
         let (
             declared_members,
             declared_call_signatures,
             declared_construct_signatures,
             declared_index_infos,
         ) = {
-            let resolved = self.ty(source).as_interface_type();
+            let resolved = self.resolve_declared_members(source);
             (
                 resolved.declared_members,
                 resolved.declared_call_signatures.clone(),
@@ -878,10 +885,21 @@ impl Checker {
             instantiated = true;
             mapper = self.new_type_mapper(type_parameters, type_arguments);
             members = self.instantiate_symbol_table(declared_members, mapper);
-            call_signatures = self.instantiate_signatures(&declared_call_signatures, mapper);
-            construct_signatures =
-                self.instantiate_signatures(&declared_construct_signatures, mapper);
-            index_infos = self.instantiate_index_infos(&declared_index_infos, mapper);
+            call_signatures = self.instantiate_shared_list(
+                declared_call_signatures,
+                mapper,
+                Checker::instantiate_signature,
+            );
+            construct_signatures = self.instantiate_shared_list(
+                declared_construct_signatures,
+                mapper,
+                Checker::instantiate_signature,
+            );
+            index_infos = self.instantiate_shared_list(
+                declared_index_infos,
+                mapper,
+                Checker::instantiate_index_info,
+            );
         }
         // PERF: an instantiated table reuses the named members order of
         // `declared_members` (`get_named_members_of_instantiation`) until
@@ -901,9 +919,9 @@ impl Checker {
                 t,
                 members,
                 instantiated_from,
-                &call_signatures,
-                &construct_signatures,
-                &index_infos,
+                SharedList::concat(call_signatures.clone(), construct_signatures.clone()),
+                call_signatures.len(),
+                index_infos.clone(),
             );
             let this_argument = type_arguments.last().copied().unwrap_or(TypeId::NIL);
             self.ty_mut(t).object_flags |= ObjectFlags::UNRESOLVED_MEMBERS;
@@ -919,27 +937,29 @@ impl Checker {
                 }
                 let base_properties = self.get_properties_of_type(instantiated_base_type);
                 members = self.add_inherited_members(members, &base_properties);
-                call_signatures.extend(
+                call_signatures = SharedList::concat(
+                    call_signatures,
                     self.get_signatures_of_type(instantiated_base_type, SignatureKind::CALL),
                 );
-                construct_signatures.extend(
+                construct_signatures = SharedList::concat(
+                    construct_signatures,
                     self.get_signatures_of_type(instantiated_base_type, SignatureKind::CONSTRUCT),
                 );
-                let inherited_index_infos: Vec<IndexInfoId> =
+                let inherited_index_infos: SharedList<IndexInfoId> =
                     if instantiated_base_type != self.any_type {
                         self.get_index_infos_of_type(instantiated_base_type)
-                            .to_vec()
                     } else {
-                        vec![self.any_base_type_index_info]
+                        SharedList::from(&[self.any_base_type_index_info][..])
                     };
                 let filtered: Vec<IndexInfoId> = inherited_index_infos
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .filter(|&info| {
                         let key_type = self.index_info(info).key_type;
                         self.find_index_info(&index_infos, key_type).is_nil()
                     })
                     .collect();
-                index_infos.extend(filtered);
+                index_infos = SharedList::concat(index_infos, SharedList::from(filtered));
             }
             {
                 let object_flags = self
@@ -948,23 +968,40 @@ impl Checker {
                     .without(ObjectFlags::UNRESOLVED_MEMBERS);
                 self.ty_mut(t).object_flags = object_flags;
             }
-            self.set_structured_type_members(
+            let call_signature_count = call_signatures.len();
+            self.set_structured_type_members_ex(
                 t,
                 members,
-                &call_signatures,
-                &construct_signatures,
-                &index_infos,
+                SymbolTable::NIL,
+                SharedList::concat(call_signatures, construct_signatures),
+                call_signature_count,
+                index_infos,
             );
             return;
         }
+        let call_signature_count = call_signatures.len();
         self.set_structured_type_members_ex(
             t,
             members,
             instantiated_from,
-            &call_signatures,
-            &construct_signatures,
-            &index_infos,
+            SharedList::concat(call_signatures, construct_signatures),
+            call_signature_count,
+            index_infos,
         );
+    }
+
+    /// Go `instantiateList` on a shared list. When no element changes, the
+    /// result is `values` itself, as Go returns the input slice.
+    fn instantiate_shared_list<T: Copy + Default + PartialEq>(
+        &mut self,
+        values: SharedList<T>,
+        m: MapperId,
+        instantiator: fn(&mut Checker, T, MapperId) -> T,
+    ) -> SharedList<T> {
+        match self.instantiate_list_if_changed(&values, m, instantiator) {
+            Some(list) => list.into(),
+            None => values,
+        }
     }
 }
 

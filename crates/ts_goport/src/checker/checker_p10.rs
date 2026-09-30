@@ -4,6 +4,7 @@
 //! applicability.
 
 use crate::prelude::*;
+use smallvec::SmallVec;
 
 // PORT: Go `*Relation` is shared and mutated across calls, so it is
 // `Rc<RefCell<Relation>>`; a `*Relation` param is `&Rc<RefCell<Relation>>`.
@@ -12,11 +13,15 @@ use crate::prelude::*;
 // PORT: a nullable Go `*diagnostics.Message` is `Option<&'static crate::diagnostics::Message>`.
 
 // Go: checker/checker.go:8804 CallState
+// PERF: callcopy1. `type_arguments` and `args` hold most lists inline, so a
+// call copies each list once and allocates only for a long one. Go shares
+// `node.TypeArguments()` and `node.Arguments()`; the port needs a `[Node]`
+// for the callees that take `&[Node]`.
 #[derive(Clone, Debug, Default)]
 pub struct CallState {
     pub node: Node,
-    pub type_arguments: Vec<Node>,
-    pub args: Vec<Node>,
+    pub type_arguments: SmallVec<[Node; 4]>,
+    pub args: SmallVec<[Node; 8]>,
     pub candidates: Vec<SignatureId>,
     pub arg_check_mode: CheckMode,
     pub is_single_non_generic_candidate: bool,
@@ -24,6 +29,14 @@ pub struct CallState {
     pub candidates_for_argument_error: Vec<SignatureId>,
     pub candidate_for_argument_arity_error: SignatureId,
     pub candidate_for_type_argument_error: SignatureId,
+}
+
+/// Go `*candidatesOutArray = s.candidates` in `resolveCall`, at a return:
+/// moves the final candidates to the caller's array.
+fn set_candidates_out(out: Option<&mut Vec<SignatureId>>, s: &mut CallState) {
+    if let Some(out) = out {
+        *out = std::mem::take(&mut s.candidates);
+    }
 }
 
 impl Checker {
@@ -678,7 +691,7 @@ impl Checker {
         &mut self,
         node: Node,
         signatures: &[SignatureId],
-        mut candidates_out_array: Option<&mut Vec<SignatureId>>,
+        candidates_out_array: Option<&mut Vec<SignatureId>>,
         check_mode: CheckMode,
         call_chain_flags: SignatureFlags,
         mut head_message: Option<&'static crate::diagnostics::Message>,
@@ -698,7 +711,7 @@ impl Checker {
             && !crate::ast::is_super_call(node)
             && !is_jsx_opening_fragment(node)
         {
-            s.type_arguments = node.type_arguments().to_vec();
+            s.type_arguments = node.type_arguments().iter().collect();
             // We already perform checking on the type arguments on the class declaration itself.
             if is_tagged_template
                 || is_jsx_opening_or_self_closing_element
@@ -710,18 +723,20 @@ impl Checker {
         s.candidates = self.reorder_candidates(signatures, call_chain_flags);
         // PORT: Go stores the same backing array in `*candidatesOutArray`, so
         // later writes to `s.candidates[i]` are visible to the caller. The
-        // port copies `s.candidates` back after each place it can change.
-        if let Some(out) = candidates_out_array.as_deref_mut() {
-            *out = s.candidates.clone();
-        }
+        // caller reads the array only after this returns, so the port moves
+        // `s.candidates` there at each return (`set_candidates_out`).
 
         if s.candidates.is_empty() {
             // In Strada we would error here, but no known repro doesn't have at least
             // one other error in this codepath. Just return instead. See #54442
+            set_candidates_out(candidates_out_array, &mut s);
             return self.unknown_signature;
         }
 
-        s.args = self.get_effective_call_arguments(node);
+        s.args = match self.get_effective_call_arguments(node) {
+            EffectiveArgs::Slice(args) => args.iter().collect(),
+            EffectiveArgs::Owned(args) => SmallVec::from_vec(args),
+        };
         // The excludeArgument array contains true for each context sensitive argument (an argument
         // is context sensitive it is susceptible to a one-time permanent contextual typing).
         //
@@ -738,7 +753,7 @@ impl Checker {
             s.candidates.len() == 1 && self.sig(s.candidates[0]).type_parameters.is_empty();
         let mut any_context_sensitive = false;
         if !is_decorator && !s.is_single_non_generic_candidate {
-            for arg in s.args.clone() {
+            for &arg in &s.args {
                 if self.is_context_sensitive(arg) {
                     any_context_sensitive = true;
                     break;
@@ -795,27 +810,22 @@ impl Checker {
             let relation = self.assignable_relation.clone();
             result = self.choose_overload(&mut s, &relation);
         }
-        if let Some(out) = candidates_out_array.as_deref_mut() {
-            *out = s.candidates.clone();
-        }
         if result.is_some() {
+            set_candidates_out(candidates_out_array, &mut s);
             return result;
         }
         // PORT: Go passes `s.candidates` by slice, so the callee's in-place edits are seen by
-        // `s.candidates` and by `*candidatesOutArray` (same backing array). Write them back to both.
-        let args = s.args.clone();
-        let mut candidates = std::mem::take(&mut s.candidates);
+        // `s.candidates` and by `*candidatesOutArray` (same backing array).
         result = self.get_candidate_for_overload_failure(
             s.node,
-            &mut candidates,
-            &args,
+            &mut s.candidates,
+            &s.args,
             has_candidates_out_array,
             check_mode,
         );
-        s.candidates = candidates;
-        if let Some(out) = candidates_out_array.as_deref_mut() {
-            *out = s.candidates.clone();
-        }
+        // With an out array `report_errors` is false, so nothing below reads
+        // `s.candidates`.
+        set_candidates_out(candidates_out_array, &mut s);
         // Preemptively cache the result; getResolvedSignature will do this after we return, but
         // we need to ensure that the result is present for the error checks below so that if
         // this signature is encountered again, we handle the circularity (rather than producing a
@@ -944,22 +954,17 @@ impl Checker {
         s.candidates_for_argument_error = Vec::new();
         s.candidate_for_argument_arity_error = SignatureId::NIL;
         s.candidate_for_type_argument_error = SignatureId::NIL;
-        let args = s.args.clone();
+        let args = &s.args;
         if s.is_single_non_generic_candidate {
             let candidate = s.candidates[0];
             if !s.type_arguments.is_empty()
-                || !self.has_correct_arity(
-                    s.node,
-                    &args,
-                    candidate,
-                    s.signature_help_trailing_comma,
-                )
+                || !self.has_correct_arity(s.node, args, candidate, s.signature_help_trailing_comma)
             {
                 return SignatureId::NIL;
             }
             if !self.is_signature_applicable(
                 s.node,
-                &args,
+                args,
                 candidate,
                 relation,
                 CheckMode::NORMAL,
@@ -971,16 +976,12 @@ impl Checker {
             }
             return candidate;
         }
-        let candidates = s.candidates.clone();
-        for (candidate_index, candidate) in candidates.into_iter().enumerate() {
-            let type_arguments = s.type_arguments.clone();
-            if !self.has_correct_type_argument_arity(candidate, &type_arguments)
-                || !self.has_correct_arity(
-                    s.node,
-                    &args,
-                    candidate,
-                    s.signature_help_trailing_comma,
-                )
+        // Nothing in the loop changes `s.candidates` before the return.
+        for candidate_index in 0..s.candidates.len() {
+            let candidate = s.candidates[candidate_index];
+            let type_arguments = &s.type_arguments;
+            if !self.has_correct_type_argument_arity(candidate, type_arguments)
+                || !self.has_correct_arity(s.node, args, candidate, s.signature_help_trailing_comma)
             {
                 continue;
             }
@@ -992,7 +993,7 @@ impl Checker {
                 if !s.type_arguments.is_empty() {
                     match self.check_type_arguments(
                         candidate,
-                        &type_arguments,
+                        type_arguments,
                         false, /*reportErrors*/
                         None,
                     ) {
@@ -1017,7 +1018,7 @@ impl Checker {
                     type_argument_types = self.infer_type_arguments(
                         s.node,
                         candidate,
-                        &args,
+                        args,
                         s.arg_check_mode | CheckMode::SKIP_GENERIC_FUNCTIONS,
                         inference_context,
                     );
@@ -1049,7 +1050,7 @@ impl Checker {
                 if self.get_non_array_rest_type(candidate).is_some()
                     && !self.has_correct_arity(
                         s.node,
-                        &args,
+                        args,
                         check_candidate,
                         s.signature_help_trailing_comma,
                     )
@@ -1062,7 +1063,7 @@ impl Checker {
             }
             if !self.is_signature_applicable(
                 s.node,
-                &args,
+                args,
                 check_candidate,
                 relation,
                 s.arg_check_mode,
@@ -1082,7 +1083,7 @@ impl Checker {
                     let type_argument_types = self.infer_type_arguments(
                         s.node,
                         candidate,
-                        &args,
+                        args,
                         s.arg_check_mode,
                         inference_context,
                     );
@@ -1102,7 +1103,7 @@ impl Checker {
                     if self.get_non_array_rest_type(candidate).is_some()
                         && !self.has_correct_arity(
                             s.node,
-                            &args,
+                            args,
                             check_candidate,
                             s.signature_help_trailing_comma,
                         )
@@ -1113,7 +1114,7 @@ impl Checker {
                 }
                 if !self.is_signature_applicable(
                     s.node,
-                    &args,
+                    args,
                     check_candidate,
                     relation,
                     s.arg_check_mode,
@@ -1277,11 +1278,17 @@ impl Checker {
     ) -> bool {
         // If the user supplied type arguments, but the number of type arguments does not match
         // the declared number of type parameters, the call has an incorrect arity.
+        let len = type_arguments.len() as i32;
+        // PERF: callcopy1. Go reads the minimum count first; it only reads
+        // declarations, so a call with no type arguments skips it and the
+        // list copy.
+        if len == 0 {
+            return true;
+        }
         let type_parameters = self.sig(signature).type_parameters.clone();
         let num_type_parameters = type_parameters.len() as i32;
         let min_type_argument_count = self.get_min_type_argument_count(&type_parameters);
-        let len = type_arguments.len() as i32;
-        len == 0 || len >= min_type_argument_count && len <= num_type_parameters
+        len >= min_type_argument_count && len <= num_type_parameters
     }
 
     // Go: checker/checker.go:9196 checkTypeArguments
