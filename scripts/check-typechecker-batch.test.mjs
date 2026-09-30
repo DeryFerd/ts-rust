@@ -1061,7 +1061,7 @@ test("the history row and both verdicts bind the gate id map (skeptic: unbound m
   stopped(f, /gate id map .* does not have the sha256/);
 });
 
-test("a removal line needs Go evidence at both pins, whatever commit a line cites (skeptic: made-up commit)", () => {
+test("a removal line needs Go evidence at both pins, whatever commit its note cites (skeptic: made-up commit)", () => {
   // The new run does not hold a.ts: Go removed it, or it left the gate sample. Either way its base id is a removed id.
   const gone = (f, pin) => {
     renumbered(f, [], pin);
@@ -1069,13 +1069,15 @@ test("a removal line needs Go evidence at both pins, whatever commit a line cite
   };
   let f = goportFixture(); gone(f);
   assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)), [["corpus-diag/00001", "removed id"]]);
-  // A line with a fourth cell is bad input at a pin change and at one pin: a made-up commit, the pin B commit, tsgo #4407.
-  const need = /line 1: need "<old id> TAB <new id> TAB <case path>" or "<old id> TAB - TAB <case path>"/;
-  for (const pin of [NEW_PIN, GO_PIN]) {
-    for (const commit of ["deadbeef", "16c25522e123", "bbdf7a24b"]) {
-      f = goportFixture(); gone(f, pin); withIdMap(f, `corpus-diag/00001\t-\ta.ts\t${commit}\n`);
-      stopped(f, need);
-    }
+  // A removal line needs a note that names the Go commit that deletes the case (bump C reviewer ruling 2 item 3), but
+  // the note is no evidence. With a made-up commit, the pin B commit or tsgo #4407 the removal check (Go at both pins)
+  // decides: a.ts is in no Go checkout, so it is a removed id. At one pin the map has no effect.
+  const noBase = /^removed id \(id map line \d removes it, but a\.ts is not in the base pin Go checkout /;
+  for (const commit of ["deadbeef", "16c25522e123", "bbdf7a24b"]) {
+    f = goportFixture(); gone(f, NEW_PIN); withIdMap(f, `corpus-diag/00001\t-\ta.ts\tdeleted by ${commit}\n`);
+    assert.match(removedIds(stopped(f, /1 gate items regressed/))[0][1], noBase);
+    f = goportFixture(); gone(f, GO_PIN); withIdMap(f, `corpus-diag/00001\t-\ta.ts\tdeleted by ${commit}\n`);
+    assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)), [["corpus-diag/00001", "removed id"]]);
   }
   // The skeptic's map: an honest line for each case the new run holds, then a removal line for a.ts.
   f = goportFixture(); gone(f, NEW_PIN);
@@ -1084,20 +1086,16 @@ test("a removal line needs Go evidence at both pins, whatever commit a line cite
   withIdMap(f, "corpus-diag/00005\tcorpus-diag/00006\tb.ts\n");
   assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)),
     [["corpus-diag/00001", "removed id (the id map has no line for it, and its family corpus-diag is mapped)"]]);
-  withIdMap(f, "corpus-diag/00005\tcorpus-diag/00006\tb.ts\ncorpus-diag/00001\t-\ta.ts\tdeadbeef\n");
-  stopped(f, /line 2: need/);
-  // Other forms: "-" as the old id or the case path, a fourth cell on a move.
-  for (const text of ["corpus-diag/00001\tcorpus-diag/00002\ta.ts\tdeadbeef\n",
-    "corpus-diag/00001\tcorpus-diag/00002\t-\n", "-\tcorpus-diag/00002\ta.ts\n"]) {
+  withIdMap(f, "corpus-diag/00005\tcorpus-diag/00006\tb.ts\ncorpus-diag/00001\t-\ta.ts\tdeleted by deadbeef\n");
+  assert.match(removedIds(stopped(f, /1 gate items regressed/))[0][1], noBase);
+  // Other forms are bad input: a removal line without a note or whose note names no commit, "-" as the old id or the
+  // case path, a fourth cell on a move.
+  const need = /line 1: need "<old id> TAB <new id> TAB <case path>" or "<old id> TAB - TAB <case path> TAB <note naming the Go commit that deletes the case>"/;
+  for (const text of ["corpus-diag/00001\t-\ta.ts\n", "corpus-diag/00001\t-\ta.ts\tts#64122\n",
+    "corpus-diag/00001\tcorpus-diag/00002\ta.ts\tdeadbeef\n", "corpus-diag/00001\tcorpus-diag/00002\t-\n", "-\tcorpus-diag/00002\ta.ts\n"]) {
     f = goportFixture(); gone(f); withIdMap(f, text);
     stopped(f, need);
   }
-  // A removal line of a case that the base pin's Go checkout does not have: a removed id. At one pin it has no effect.
-  f = goportFixture(); gone(f); withIdMap(f, "corpus-diag/00001\t-\ta.ts\n");
-  assert.match(removedIds(stopped(f, /1 gate items regressed/))[0][1],
-    /^removed id \(id map line 1 removes it, but a\.ts is not in the base pin Go checkout /);
-  f = goportFixture(); gone(f, GO_PIN); withIdMap(f, "corpus-diag/00001\t-\ta.ts\n");
-  assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)), [["corpus-diag/00001", "removed id"]]);
 });
 
 test("the saved gate compare must show no regression and name the pinned manifests", () => {

@@ -62,14 +62,16 @@ can name a map in gateIdMap {"path": "<TSV, relative to the repo root or absolut
 The file must have that sha256. It is used only when both manifests record an upstreamPin and the pins
 differ; at one pin it has no effect (idMap.applied false), so it cannot move an id.
 '#' lines, blank lines and the header line "oldId TAB newId TAB source" are skipped. Each other line is
-"<old id> TAB <new id> TAB <case path>": the case moved to a new id. A line "<old id> TAB - TAB <case path>"
-removes a case that Go removed (the removal check below). Without such a line, a base case that the new run
-does not hold is a removed id, also when Go removed it.
+"<old id> TAB <new id> TAB <case path>": the case moved to a new id. A line "<old id> TAB - TAB <case path>
+TAB <note>" removes a case that Go removed (the removal check below); the note names the Go commit that deletes
+the case file (a word of 7 to 40 hex digits; bump C reviewer ruling 2 item 3). Without such a line, a base case
+that the new run does not hold is a removed id, also when Go removed it.
 Only the corpus families (MAP_FAMILIES) can have lines, and both ids of a line are in one family (the part
 before the first '/'). The case path of a corpus item is the source word at its fixed place in the
 detail: "<class> <case path>" (corpus-diag, and f1) and "<class> exit <go>/<goport> <case path>"
 (corpus-emit); notes can follow it. Bad input (exit 2): a line of another form (also "-" as the old id or the
-case path), and two lines with one old id, one new id, or one case path in one family.
+case path, a move line with a note, and a removal line without a note that names a commit), and two lines with
+one old id, one new id, or one case path in one family.
 When the map is used:
 - A base id with a line is compared with the new item of its new id: the same item under another id.
 - The line's case path must equal the case path of the base item and of the new item. Else the line is
@@ -93,7 +95,8 @@ When the map is used:
   testdata/promotedTestCollisions.txt gives. A removal line that fails the check is broken, and its base id is a
   removed id.
 The output has idMap {path, sha256, lines, applied, mapped, broken, unused} only when the batch
-names a map, so the output without a map stays the same. A map with removal lines adds idMap.removed.
+names a map, so the output without a map stays the same. A map with removal lines adds idMap.removed
+[{id, path, note}] (the removed ids, a count of their own; a removed id is never a pass for another id).
 
 Prints one JSON object, and writes it to --out when given. Exit 0: no regression.
 Exit 1: regressions. Exit 2: bad input.
@@ -225,7 +228,7 @@ def pins_differ(a, b):
 
 
 def load_id_map(ref):
-    """(lines {old id: (new id, case path, line number)}, path, sha256) of batch.gateIdMap {path, sha256}."""
+    """(lines {old id: (new id, case path, line number, removal note or None)}, path, sha256) of batch.gateIdMap {path, sha256}."""
     if not isinstance(ref, dict) or not isinstance(ref.get('path'), str) or not re.match(r'^[0-9a-f]{64}$', str(ref.get('sha256'))):
         fail(f'gateIdMap needs a path and a sha256: {json.dumps(ref)}')
     path = ref['path'] if os.path.isabs(ref['path']) else os.path.join(ROOT, ref['path'])
@@ -241,21 +244,25 @@ def load_id_map(ref):
         cells = line.split('\t')
         if not line.strip() or line.startswith('#') or cells[0] == 'oldId':
             continue
-        if len(cells) != 3 or not all(c.strip() == c and c for c in cells) or '-' in (cells[0], cells[2]):
-            fail(f'gate id map line {n}: need "<old id> TAB <new id> TAB <case path>" or "<old id> TAB - TAB <case path>"')
-        old, to, source = cells
+        removal = len(cells) > 1 and cells[1] == '-'
+        if (len(cells) != (4 if removal else 3) or not all(c.strip() == c and c for c in cells) or '-' in (cells[0], cells[2])
+                or (removal and not GO_COMMIT.search(cells[3]))):
+            fail(f'gate id map line {n}: need "<old id> TAB <new id> TAB <case path>" or "<old id> TAB - TAB <case path> TAB '
+                 '<note naming the Go commit that deletes the case>"')
+        old, to, source = cells[:3]
         if not all('/' in i and family(i) in MAP_FAMILIES for i in (old, to) if i != '-') or (to != '-' and family(to) != family(old)):
             fail(f'gate id map line {n}: {old} and {to} are not ids of one corpus family ({", ".join(MAP_FAMILIES)})')
         dup = old if old in lines else to if to != '-' and to in targets else source if (family(old), source) in cases else None
         if dup:
             fail(f'gate id map line {n}: {dup} is in two lines')
-        lines[old] = (to, source, n)
+        lines[old] = (to, source, n, cells[3] if removal else None)
         cases.add((family(old), source))
         targets.add(to)
     return lines, path, ref['sha256']
 
 
 OLD_CASES = '_submodules/TypeScript/tests/cases/'
+GO_COMMIT = re.compile(r'(?<![0-9A-Za-z])[0-9a-f]{7,40}(?![0-9A-Za-z])')  # a commit id in a removal line's note
 
 
 def go_pin(pin):
@@ -341,7 +348,7 @@ def main():
         (_, (ngo, nlayout)) = pins()
         return moved_path(source, ngo, nlayout)
 
-    for old, (to, source, n) in sorted(lines.items(), key=lambda e: e[1][2]):
+    for old, (to, source, n, note) in sorted(lines.items(), key=lambda e: e[1][2]):
         b, t = base.get(old), new.get(to)
         if b is None:
             id_map['unused'].append(old)
@@ -351,7 +358,7 @@ def main():
                 gone[old] = f'removed id (id map line {n} removes it, but {why})'
                 id_map['broken'].append(old)
             else:
-                removed[old] = source
+                removed[old] = (source, note)
         elif case_path(b) != source:
             gone[old] = f'removed id (id map line {n}: {source} is not the case path of {old}, {case_path(b)})'
             id_map['broken'].append(old)
@@ -366,7 +373,7 @@ def main():
         id_map['mapped'] = len(moved)
 
     if removed:
-        id_map['removed'] = [{'id': i, 'path': p} for i, p in sorted(removed.items())]
+        id_map['removed'] = [{'id': i, 'path': p, 'note': note} for i, (p, note) in sorted(removed.items())]
 
     def new_id(i):
         """The id of base id (or base allow entry id) i in the new run, or None when the map gives it none. In a
