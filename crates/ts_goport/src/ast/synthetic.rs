@@ -54,6 +54,15 @@
 //!
 //! Code whose nodes a cache keeps across program versions (the token cache,
 //! lazy JSDoc, parses) opens a base scope.
+//!
+//! d.ts twins: a checker thread and the thread that prints its d.ts files
+//! (`program::send_dts_twin_job`) take new chunk numbers from one counter
+//! per table (`share_synthetic_chunks`), so a chunk number names a chunk of
+//! one of the two threads only. The twin starts with no entries
+//! (`install_twin_synthetic_arena`) and gets a copy of the checker entries
+//! that each tree it prints reaches, at their indexes (`print_pack`). A
+//! read of an entry that no pack copied panics (`Slot::Absent`).
+//!
 //! PORT: the Go GC frees request garbage at once and checker nodes with
 //! their checker. Here they stay until their program version is released.
 //!
@@ -65,8 +74,11 @@
 use crate::astdata::NodeData;
 use crate::prelude::*;
 use std::cell::{Cell, OnceCell};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+
+mod print_pack;
+pub use print_pack::{PrintPack, export_print_pack, install_print_pack};
 
 /// File index of synthetic nodes. `SYNTHETIC_FLOW_FILE` is `0xffff_ffff`.
 pub const SYNTHETIC_NODE_FILE: usize = 0xffff_fffe;
@@ -83,6 +95,9 @@ enum Slot {
     Alias(Node),
     /// A node the factory created.
     Node(SyntheticNode),
+    /// A slot of a checker thread that no print pack copied to its d.ts
+    /// twin (`print_pack`). A read panics.
+    Absent,
 }
 
 /// The mutable Go `NodeBase` fields of a factory node.
@@ -181,6 +196,23 @@ type DataChunk = Rc<[OnceCell<crate::astdata::Node>]>;
 /// The panic of a read of an entry whose owner was freed.
 const FREED: &str = "synthetic node of a released program version is read";
 
+/// The panic of a read on a d.ts twin of a checker entry that no print pack
+/// copied (`Slot::Absent`).
+const ABSENT: &str = "a d.ts twin reads a synthetic node that its print pack does not hold";
+
+/// The tables of `SyntheticArena` that have chunk numbers, as indexes of
+/// `SharedChunks::next`.
+const SLOT_TABLE: usize = 0;
+const DATA_TABLE: usize = 1;
+const LIST_TABLE: usize = 2;
+
+/// The next chunk number of each table (`SLOT_TABLE`, `DATA_TABLE`,
+/// `LIST_TABLE`), shared by a checker thread and its d.ts twin
+/// (`share_synthetic_chunks`).
+pub struct SharedChunks {
+    next: [AtomicU32; 3],
+}
+
 /// The owner of an arena chunk (see "Owners" in the module comment).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OwnerKey {
@@ -238,6 +270,10 @@ struct SyntheticArena {
     last: Option<(&'static GoProgram, OwnerKey)>,
     /// The number of slots made on this thread, freed or not.
     slots_made: usize,
+    /// Set on a checker thread that has a d.ts twin, and on the twin: new
+    /// chunks take their numbers from it, and a table has no chunk (`None`)
+    /// at the numbers of the other thread.
+    shared: Option<Arc<SharedChunks>>,
 }
 
 impl SyntheticArena {
@@ -253,6 +289,7 @@ impl SyntheticArena {
             owners: FxHashMap::default(),
             last: None,
             slots_made: 0,
+            shared: None,
         };
         let nil = arena.push_slot(OwnerKey::Base, Slot::Nil);
         debug_assert_eq!(nil, NIL_SLOT);
@@ -325,9 +362,12 @@ impl SyntheticArena {
         let c = match open {
             Some(c) => c,
             None => {
-                let c = new_chunk_number(self.slots.len(), SLOT_CHUNK);
-                self.slots.push(Some(Vec::with_capacity(SLOT_CHUNK)));
-                self.slot_owner.push(owner);
+                let c = self.new_chunk_number(SLOT_TABLE, self.slots.len(), SLOT_CHUNK);
+                set_chunk(&mut self.slots, c, Vec::with_capacity(SLOT_CHUNK));
+                if self.slot_owner.len() <= c as usize {
+                    self.slot_owner.resize(c as usize + 1, OwnerKey::Base);
+                }
+                self.slot_owner[c as usize] = owner;
                 self.chunks_mut(owner).slots.push(c);
                 c
             }
@@ -361,9 +401,8 @@ impl SyntheticArena {
         let (c, cell) = match open {
             Some(c) => (c, fill),
             None => {
-                let c = new_chunk_number(self.datas.len(), DATA_CHUNK);
-                self.datas
-                    .push(Some((0..DATA_CHUNK).map(|_| OnceCell::new()).collect()));
+                let c = self.new_chunk_number(DATA_TABLE, self.datas.len(), DATA_CHUNK);
+                set_chunk(&mut self.datas, c, empty_data_chunk());
                 self.chunks_mut(owner).datas.push(c);
                 (c, 0)
             }
@@ -396,8 +435,8 @@ impl SyntheticArena {
         let c = match open {
             Some(c) => c,
             None => {
-                let c = new_chunk_number(self.lists.len(), LIST_CHUNK);
-                self.lists.push(Some(Vec::with_capacity(LIST_CHUNK)));
+                let c = self.new_chunk_number(LIST_TABLE, self.lists.len(), LIST_CHUNK);
+                set_chunk(&mut self.lists, c, Vec::with_capacity(LIST_CHUNK));
                 self.chunks_mut(owner).lists.push(c);
                 c
             }
@@ -411,6 +450,7 @@ impl SyntheticArena {
     fn node(&self, n: Node) -> &SyntheticNode {
         match self.slot(slot_index(n)) {
             Slot::Node(s) => s,
+            Slot::Absent => panic!("{ABSENT}"),
             _ => panic!("synthetic handle does not name a node slot"),
         }
     }
@@ -421,6 +461,7 @@ impl SyntheticArena {
             Slot::Nil => Node::NIL,
             Slot::Alias(target) => *target,
             Slot::Node(_) => handle(index as u32),
+            Slot::Absent => panic!("{ABSENT}"),
         }
     }
 
@@ -434,17 +475,39 @@ impl SyntheticArena {
             SyntheticList::Slice { .. } => panic!("a node slice is not a NodeList"),
         }
     }
+
+    /// The number of a new chunk of `table`, which has `len` chunks with
+    /// `per_chunk` entries each: `len`, or the next number of the shared
+    /// counter (`SharedChunks`). Entry ids are `u32` and are not used again,
+    /// so a thread that makes about 4 billion entries of one kind runs out
+    /// of them.
+    fn new_chunk_number(&self, table: usize, len: usize, per_chunk: usize) -> u32 {
+        let c = match &self.shared {
+            None => len,
+            Some(shared) => shared.next[table].fetch_add(1, Ordering::Relaxed) as usize,
+        };
+        assert!(
+            (c + 1) * per_chunk < u32::MAX as usize,
+            "synthetic entry ids exhausted"
+        );
+        c as u32
+    }
 }
 
-/// The number of a new chunk in a table of `len` chunks with `per_chunk`
-/// entries each. Entry ids are `u32` and are not used again, so a thread
-/// that makes about 4 billion entries of one kind runs out of them.
-fn new_chunk_number(len: usize, per_chunk: usize) -> u32 {
-    assert!(
-        (len + 1) * per_chunk < u32::MAX as usize,
-        "synthetic entry ids exhausted"
-    );
-    len as u32
+/// Puts `chunk` at number `c` of a table, after `None` holes for the
+/// numbers that the other thread of a shared counter took.
+fn set_chunk<T>(table: &mut Vec<Option<T>>, c: u32, chunk: T) {
+    let c = c as usize;
+    if table.len() <= c {
+        table.resize_with(c + 1, || None);
+    }
+    debug_assert!(table[c].is_none(), "synthetic chunk number used twice");
+    table[c] = Some(chunk);
+}
+
+/// A chunk of `SyntheticArena::datas` with no filled cell.
+fn empty_data_chunk() -> DataChunk {
+    (0..DATA_CHUNK).map(|_| OnceCell::new()).collect()
 }
 
 static EMPTY_BIND: NodeBindData = NodeBindData {
@@ -625,6 +688,47 @@ pub fn install_synthetic_seed(seed: SyntheticSeed) {
         owners: FxHashMap::default(),
         last: None,
         slots_made: seed.slots_made,
+        shared: None,
+    };
+    ARENA.with(|a| *a.borrow_mut() = arena);
+}
+
+/// Makes the chunk counters of this thread's arena shared, for a d.ts twin
+/// (`install_twin_synthetic_arena`), and returns them. Each counter starts
+/// at the number of chunks that the table has. A second call returns the
+/// same counters.
+pub fn share_synthetic_chunks() -> Arc<SharedChunks> {
+    ARENA.with(|a| {
+        let mut a = a.borrow_mut();
+        let lens = [a.slots.len(), a.datas.len(), a.lists.len()];
+        Arc::clone(a.shared.get_or_insert_with(|| {
+            Arc::new(SharedChunks {
+                next: lens.map(|len| AtomicU32::new(len as u32)),
+            })
+        }))
+    })
+}
+
+/// Makes the arena of this thread the empty arena of a d.ts twin whose
+/// checker thread returned `shared` (`share_synthetic_chunks`). Its own
+/// entries take chunk numbers from `shared`, and the entries of its checker
+/// come in print packs (`install_print_pack`). Slot 0 (Go nil) is the
+/// checker's, so the twin gets it with no other slot of its chunk.
+pub fn install_twin_synthetic_arena(shared: Arc<SharedChunks>) {
+    let mut nil_chunk = vec![Slot::Absent; SLOT_CHUNK];
+    nil_chunk[NIL_SLOT as usize] = Slot::Nil;
+    let arena = SyntheticArena {
+        slots: vec![Some(nil_chunk)],
+        slot_owner: vec![OwnerKey::Base],
+        aliases: FxHashMap::default(),
+        datas: Vec::new(),
+        lists: Vec::new(),
+        slices: Vec::new(),
+        base: OwnerChunks::default(),
+        owners: FxHashMap::default(),
+        last: None,
+        slots_made: 0,
+        shared: Some(shared),
     };
     ARENA.with(|a| *a.borrow_mut() = arena);
 }
