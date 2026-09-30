@@ -286,14 +286,16 @@ impl TaskResult {
 /// stay published, so the diagnostics in `t.errors` can still be written.
 // PORT: Go frees the program in the background GC. The checker threads
 // free their checkers while the build goes on
-// (`program::release_program_in_background`).
-pub fn release_task_program(program: IncrementalProgram) {
+// (`program::release_program_in_background_later`). The frontend program
+// and the tables free when the result drops; the orchestrator drops it when
+// its thread would wait anyway (`Orchestrator::keep_released`).
+pub fn release_task_program(program: IncrementalProgram) -> crate::program::ReleasedProgram {
     let go_program = program.get_program();
     // PORT: perf. The snapshot's maps free on a thread (`drop_in_background`).
     if let Some(snapshot) = program.into_snapshot() {
         drop_in_background(snapshot);
     }
-    crate::program::release_program_in_background(go_program);
+    crate::program::release_program_in_background_later(go_program)
 }
 
 /// PORT: not in Go (perf). An optional value that frees on the thread of
@@ -611,6 +613,17 @@ impl BuildTask {
         }
         self.unblock_downstream();
         false
+    }
+
+    /// PORT: not in Go (perf). After `build_project_start` returned true:
+    /// sends values that `signal` makes behind the check and emit jobs that
+    /// the task's program started (`program::send_checker_barrier`), and
+    /// returns how many there are. When all have dropped, those jobs are
+    /// done. 0 when the program has no checker pool, so no job runs.
+    pub fn notify_when_compiled<T: Send + 'static>(&self, signal: impl Fn() -> T) -> usize {
+        let compile = self.compile.as_ref().expect("compile_and_emit_start ran");
+        let _scope = crate::core::enter_program(Some(compile.program));
+        crate::program::send_checker_barrier(signal)
     }
 
     // Go: build/buildtask.go:145 (*BuildTask).buildProject, from the emit
