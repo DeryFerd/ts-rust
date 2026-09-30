@@ -4,6 +4,7 @@
 use std::rc::{Rc, Weak};
 
 use ts_goport::frontend::compiler::{self, NewProgram};
+use ts_goport::frontend::vfs::Fs;
 use ts_goport::lsp::lsproto;
 use ts_goport::program::ls_program;
 use ts_goport::project::{
@@ -91,8 +92,8 @@ child_test! {
         let snapshot_before = session.snapshot();
 
         // a.ts and b.ts are cached
-        assert!(snapshot_before.fs.disk_files.contains_key(&path("/home/projects/ts/p1/a.ts")));
-        assert!(snapshot_before.fs.disk_files.contains_key(&path("/home/projects/ts/p2/b.ts")));
+        assert!(snapshot_before.fs.cache_files.contains_key(&path("/home/projects/ts/p1/a.ts")));
+        assert!(snapshot_before.fs.cache_files.contains_key(&path("/home/projects/ts/p2/b.ts")));
 
         // Close p1's only open file
         close(&session, "file:///home/projects/TS/p1/index.ts");
@@ -101,8 +102,8 @@ child_test! {
         let snapshot_after = session.snapshot();
 
         // a.ts is cleaned up, b.ts is still cached
-        assert!(!snapshot_after.fs.disk_files.contains_key(&path("/home/projects/ts/p1/a.ts")));
-        assert!(snapshot_after.fs.disk_files.contains_key(&path("/home/projects/ts/p2/b.ts")));
+        assert!(!snapshot_after.fs.cache_files.contains_key(&path("/home/projects/ts/p1/a.ts")));
+        assert!(snapshot_after.fs.cache_files.contains_key(&path("/home/projects/ts/p2/b.ts")));
     }
 }
 
@@ -207,11 +208,13 @@ child_test! {
         open(&session, other_uri, "export const other = 1;");
         let _ = language_service(&session, pkg_uri);
 
-        session
-            .fs
-            .fs
-            .write_file("/project/node_modules/pkg/package.json", r#"{ "type": "module" }"#)
-            .unwrap();
+        // ts#64291: Go `session.fs.WriteFile` (the overlay file system).
+        Fs::write_file(
+            &*session.fs,
+            "/project/node_modules/pkg/package.json",
+            r#"{ "type": "module" }"#,
+        )
+        .unwrap();
         session.did_change_file(
             &bg(),
             &uri(pkg_uri),
@@ -304,11 +307,7 @@ child_test! {
 
         // A watch change that reflects an actual content change on disk must still
         // rebuild the program.
-        session
-            .fs
-            .fs
-            .write_file("/home/projects/TS/p1/a.ts", "export const a = 2;")
-            .unwrap();
+        Fs::write_file(&*session.fs, "/home/projects/TS/p1/a.ts", "export const a = 2;").unwrap();
         session.pending_file_changes.borrow_mut().push(FileChange {
             kind: FileChangeKind::WATCH_CHANGE,
             uri: uri("file:///home/projects/TS/p1/a.ts"),

@@ -148,7 +148,7 @@ fn new_snapshot_with_host(
         config_file_registry: None,
         file_default_projects: FxHashMap::default(),
         configured_projects: FxHashMap::default(),
-        open_files: open_file_paths(&fs.overlays),
+        open_files: open_file_paths(&snapshot_overlays(&fs)),
         inferred_project: None,
         api_state: APIState::default(),
         open_configured_projects: std::cell::OnceCell::new(),
@@ -179,7 +179,30 @@ fn new_snapshot_with_host(
     })
 }
 
+// Go: project/snapshot.go:194 overlayFileHandles (ts#64291)
+// PORT: Go `map[tspath.Path]FileHandle` keeps the overlay map's order here.
+pub fn overlay_file_handles(
+    overlays: &IndexMap<tspath::Path, Rc<Overlay>>,
+) -> IndexMap<tspath::Path, Rc<dyn FileHandle>> {
+    let mut files: IndexMap<tspath::Path, Rc<dyn FileHandle>> =
+        IndexMap::with_capacity(overlays.len());
+    for (path, overlay) in overlays {
+        files.insert(path.clone(), overlay.clone());
+    }
+    files
+}
+
+// Go: project/snapshot.go:108 snapshotOverlays (ts#64291)
+pub fn snapshot_overlays(fs: &SnapshotFS) -> Rc<IndexMap<tspath::Path, Rc<Overlay>>> {
+    fs.fs.overlays()
+}
+
 impl Snapshot {
+    // Go: project/snapshot.go:112 overlays (ts#64291)
+    pub fn overlays(&self) -> Rc<IndexMap<tspath::Path, Rc<Overlay>>> {
+        snapshot_overlays(&self.fs)
+    }
+
     // Go: project/snapshot.go:103 cloneForProgram (ts#63950, ts#64163)
     // cloneForProgram clones a snapshot and creates a single synthetic inferred
     // project representing createProgram input.
@@ -268,23 +291,37 @@ impl Snapshot {
         let start = Instant::now();
         // ts#64115
         let file_system = file_system.unwrap_or_else(|| store.fs.clone());
-        let fs = new_snapshot_fs_builder(
+        // ts#64291
+        let previous_overlays = self.overlays();
+        let layered_fs = layer_overlay_file_system(
             file_system,
-            self.fs.overlays.clone(),
-            self.fs.overlays.clone(),
-            self.fs.disk_files.clone(),
-            self.fs.disk_directories.clone(),
-            self.fs.node_modules_realpath_aliases.clone(),
+            (*previous_overlays).clone(),
             store.options.position_encoding.clone(),
             store.to_path.clone(),
         );
-        let file_changes = self.process_file_changes(&fs, file_changes, &logger, None);
+        let overlays = layered_fs.overlays();
+        let fs = new_snapshot_fs_builder_from_source(
+            layered_fs,
+            self.fs.cache_files.clone(),
+            self.fs.cache_directories.clone(),
+            self.fs.node_modules_realpath_aliases.clone(),
+            store.to_path.clone(),
+        );
+        let file_changes = self.process_file_changes(
+            &fs,
+            file_changes,
+            &logger,
+            None,
+            &previous_overlays,
+            &overlays,
+        );
 
         let new_snapshot_id = store.next_snapshot_id();
         let project_collection_builder = new_project_collection_builder(
             ctx,
             new_snapshot_id,
             fs.clone(),
+            overlays.clone(),
             self.project_collection.clone(),
             self.config_file_registry.clone(),
             &APIState::default(),
@@ -332,7 +369,7 @@ impl Snapshot {
 
         let clean_files_start = Instant::now();
         let mut removed_files = 0;
-        fs.disk_files.range(&mut |entry| {
+        fs.cache_files.range(&mut |entry| {
             for project in new_project_collection.projects() {
                 let project = project.borrow();
                 if let Some(host) = &project.host {
@@ -423,7 +460,8 @@ impl Snapshot {
     ) -> Result<Rc<Snapshot>, GoError> {
         let path = uri.path(self.use_case_sensitive_file_names());
 
-        let mut overlays = self.fs.overlays.clone();
+        // ts#64291
+        let mut overlays: IndexMap<tspath::Path, Rc<Overlay>> = (*self.overlays()).clone();
         let mut version: i32 = 0;
         let mut file_changes = FileChangeSummary::default();
         let existing = overlays.get(&path).cloned();
@@ -453,7 +491,15 @@ impl Snapshot {
         );
 
         // ts#64115
-        let file_system = file_system.unwrap_or_else(|| self.fs.fs.clone());
+        let file_system: Rc<dyn vfs::Fs> =
+            file_system.unwrap_or_else(|| self.fs.fs.clone() as Rc<dyn vfs::Fs>);
+        // ts#64291
+        let file_system: Rc<dyn vfs::Fs> = new_overlay_fs(
+            file_system,
+            overlays.clone(),
+            self.host.options.position_encoding.clone(),
+            self.host.to_path.clone(),
+        );
 
         Ok(self.clone_(
             ctx,
@@ -472,15 +518,22 @@ impl Snapshot {
         ))
     }
 
-    // Go: project/snapshot.go:249 processFileChanges (ts#63950)
+    // Go: project/snapshot.go:139 processFileChanges (ts#63950, ts#64291)
     pub fn process_file_changes(
         &self,
         fs: &Rc<SnapshotFSBuilder>,
         file_changes: FileChangeSummary,
         logger: &Option<Rc<logging::LogTree>>,
         content_mapper_contributions: Option<&ContentMapperContributions>,
+        previous_overlays: &IndexMap<tspath::Path, Rc<Overlay>>,
+        overlays: &IndexMap<tspath::Path, Rc<Overlay>>,
     ) -> FileChangeSummary {
         let mut file_changes = file_changes;
+        if let Some(expander) = as_file_change_expander(&*fs.fs) {
+            file_changes = expander.expand_file_changes(file_changes);
+        }
+        let previous_open_files = overlay_file_handles(previous_overlays);
+        let open_files = overlay_file_handles(overlays);
         if file_changes.has_excessive_watch_events() {
             let invalidate_start = Instant::now();
             if file_changes.invalidate_all {
@@ -491,7 +544,11 @@ impl Snapshot {
                         invalidate_start.elapsed()
                     ));
                 }
-            } else if !fs.watch_changes_overlap_cache(&file_changes) {
+            } else if !fs.watch_changes_overlap_cache(
+                &file_changes,
+                &previous_open_files,
+                &open_files,
+            ) {
                 // All watch changes/deletes are files we haven't seen; should be irrelevant to us (probably an external tool's build or something)
                 file_changes.changed = FxHashSet::default();
                 file_changes.deleted = FxHashSet::default();
@@ -530,10 +587,21 @@ impl Snapshot {
                 file_changes,
                 &content_mapper_extensions,
                 Some(&*content_mapper_watched_files),
+                &previous_open_files,
+                &open_files,
             );
             file_changes = self.fs.expand_realpath_aliases(file_changes);
             file_changes = fs.mark_dirty_files(file_changes);
-            file_changes = fs.convert_open_and_close_to_changes(file_changes);
+            file_changes = fs.convert_open_and_close_to_changes(
+                file_changes,
+                &previous_open_files,
+                &open_files,
+            );
+        }
+        for path in open_files.keys() {
+            if let (Some(entry), true) = fs.cache_files.load(path) {
+                fs.delete_cache_entry(&entry);
+            }
         }
         file_changes
     }
@@ -607,6 +675,21 @@ impl Snapshot {
     // Go: project/snapshot.go:367 toPath (ts#64163)
     pub fn to_path(&self, file_name: &str) -> tspath::Path {
         (self.host.to_path)(file_name)
+    }
+
+    // Go: project/snapshot.go:257 isOpenFile (ts#64291)
+    pub fn is_open_file(&self, file_name: &str) -> bool {
+        self.overlays().contains_key(&self.to_path(file_name))
+    }
+
+    // Go: project/snapshot.go:262 hasOverlayWithin (ts#64291)
+    pub fn has_overlay_within(&self, path: &tspath::Path) -> bool {
+        for overlay_path in self.overlays().keys() {
+            if path.contains_path(overlay_path) {
+                return true;
+            }
+        }
+        false
     }
 
     // Go: project/snapshot.go:131 UseCaseSensitiveFileNames
@@ -847,8 +930,9 @@ pub struct SnapshotChange {
     pub api_request: Option<APISnapshotRequest>,
     // ts#64163. PORT: Go nil interface is `None`.
     pub client: Option<Rc<dyn Client>>,
-    // cleanDiskCache triggers cleaning of cached disk files not referenced by any open project.
-    pub clean_disk_cache: bool,
+    // cleanFileCache triggers cleaning of cached files not referenced by any open project.
+    // ts#64291: was cleanDiskCache.
+    pub clean_file_cache: bool,
 }
 
 // Go: project/snapshot.go:222 ATAStateChange
@@ -1027,14 +1111,19 @@ impl Snapshot {
         if change.replace_file_system || self.file_system_override && !change.file_system_override {
             change.file_changes.invalidate_all = true;
         }
-        let fs = new_snapshot_fs_builder(
+        // ts#64291
+        let layered_fs = layer_overlay_file_system(
             base_fs,
-            self.fs.overlays.clone(),
             overlays.clone(),
-            self.fs.disk_files.clone(),
-            self.fs.disk_directories.clone(),
-            self.fs.node_modules_realpath_aliases.clone(),
             store.options.position_encoding.clone(),
+            store.to_path.clone(),
+        );
+        let overlays = layered_fs.overlays();
+        let fs = new_snapshot_fs_builder_from_source(
+            layered_fs,
+            self.fs.cache_files.clone(),
+            self.fs.cache_directories.clone(),
+            self.fs.node_modules_realpath_aliases.clone(),
             store.to_path.clone(),
         );
         change.file_changes = self.process_file_changes(
@@ -1042,6 +1131,8 @@ impl Snapshot {
             std::mem::take(&mut change.file_changes),
             &logger,
             change.content_mapper_contributions.as_ref(),
+            &self.overlays(),
+            &overlays,
         );
 
         let mut compiler_options_for_inferred_projects =
@@ -1062,6 +1153,7 @@ impl Snapshot {
             ctx,
             new_snapshot_id,
             fs.clone(),
+            overlays.clone(),
             self.project_collection.clone(),
             self.config_file_registry.clone(),
             &self.project_collection.api_state,
@@ -1175,20 +1267,20 @@ impl Snapshot {
             }
         }
 
-        // Clean cached disk files not touched by any open project on file open, close, delete,
+        // Clean cached files not touched by any open project on file open, close, delete,
         // or when explicitly requested (e.g. by an idle timer).
-        let should_clean_disk_cache = change.clean_disk_cache
+        let should_clean_file_cache = change.clean_file_cache
             || !change.file_changes.opened.0.is_empty()
             || !change.file_changes.reopened.0.is_empty()
             || !change.file_changes.closed.is_empty()
             || !change.file_changes.deleted.is_empty();
-        if should_clean_disk_cache {
+        if should_clean_file_cache {
             // The set of seen files can change only if a program was constructed (not cloned) during this snapshot.
-            // When cleanDiskCache is explicitly set, always attempt cleaning.
-            if !projects_with_new_program_structure.is_empty() || change.clean_disk_cache {
+            // When cleanFileCache is explicitly set, always attempt cleaning.
+            if !projects_with_new_program_structure.is_empty() || change.clean_file_cache {
                 let clean_files_start = Instant::now();
                 let mut removed_files = 0;
-                fs.disk_files.range(&mut |entry| {
+                fs.cache_files.range(&mut |entry| {
                     for project in project_collection.projects() {
                         let project = project.borrow();
                         if let Some(host) = &project.host {
@@ -1226,7 +1318,7 @@ impl Snapshot {
         );
         let mut open_files: FxHashMap<tspath::Path, String> =
             FxHashMap::with_capacity_and_hasher(overlays.len(), Default::default());
-        for (path, overlay) in overlays {
+        for (path, overlay) in overlays.iter() {
             open_files.insert(path.clone(), overlay.file_name());
         }
         let mut prepare_auto_imports = tspath::Path::default();

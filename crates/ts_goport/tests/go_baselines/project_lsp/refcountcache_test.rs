@@ -590,7 +590,7 @@ child_test! {
                 },
                 ..Default::default()
             },
-            &base_snapshot.fs.overlays,
+            &base_snapshot.overlays(),
             None,
         );
 

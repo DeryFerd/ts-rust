@@ -53,6 +53,8 @@ pub struct ConfigFileRegistryBuilder {
 pub fn new_config_file_registry_builder(
     has_relative_pattern_capability: bool,
     fs: Rc<SnapshotFSBuilder>,
+    // ts#64291
+    is_open_file: Rc<dyn Fn(&tspath::Path) -> bool>,
     old_config_file_registry: Rc<ConfigFileRegistry>,
     extended_config_cache: Rc<ExtendedConfigCache>,
     snapshot_id: u64,
@@ -61,11 +63,6 @@ pub fn new_config_file_registry_builder(
     _logger: Option<Rc<logging::LogTree>>,
 ) -> Rc<ConfigFileRegistryBuilder> {
     let to_path = fs.to_path.clone();
-    // Go: fs.isOpenFile (a method value)
-    let is_open_file: Rc<dyn Fn(&tspath::Path) -> bool> = {
-        let fs = fs.clone();
-        Rc::new(move |path: &tspath::Path| fs.is_open_file(path))
-    };
     let custom_config_file_name_changed =
         custom_config_file_name != old_config_file_registry.custom_config_file_name;
     let all_configured_content_mappers = old_config_file_registry.content_mappers();

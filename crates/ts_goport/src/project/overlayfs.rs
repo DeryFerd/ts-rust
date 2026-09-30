@@ -3,7 +3,7 @@
 //! PORT: one thread (project/dirty/interfaces.rs). Go `sync.Once` + value is
 //! a `OnceCell`; `mu` is dropped. Go `xxh3.Uint128` is `u128`. A Go
 //! `FileHandle` is `Rc<dyn FileHandle>` (nil is `None`): an `*Overlay` is
-//! `Rc<Overlay>` and a `*diskFile` is `Rc<RefCell<DiskFile>>` (the dirty maps
+//! `Rc<Overlay>` and a `*cachedFile` is `Rc<RefCell<CachedFile>>` (the dirty maps
 //! change it after sharing). Go `string` results are owned `String`s.
 
 use crate::project::prelude::*;
@@ -80,57 +80,62 @@ impl FileBase {
     }
 }
 
-// Go: project/overlayfs.go:71 diskFile
+// Go: project/overlayfs.go:76 cachedFile (ts#64291: was diskFile)
 // PORT: Go embeds `fileBase`; here it is the field `file_base`.
 #[derive(Debug, Default)]
-pub struct DiskFile {
+pub struct CachedFile {
     pub file_base: FileBase,
     pub needs_reload: bool,
     pub realpath_path: tspath::Path,
 }
 
-// Go: project/overlayfs.go:77 newDiskFile
+// Go: project/overlayfs.go:82 newCachedFile
 // PORT: `content` is owned because the file keeps it.
-pub fn new_disk_file(file_name: &str, content: String) -> Rc<RefCell<DiskFile>> {
+pub fn new_cached_file(file_name: &str, content: String) -> Rc<RefCell<CachedFile>> {
     let hash = xxh3_128(content.as_bytes());
-    Rc::new(RefCell::new(DiskFile {
+    Rc::new(RefCell::new(CachedFile {
         file_base: FileBase {
             file_name: file_name.to_string(),
             content,
             hash: Cell::new(hash),
             ..FileBase::default()
         },
-        ..DiskFile::default()
+        ..CachedFile::default()
     }))
 }
 
-impl DiskFile {
-    // Go: project/overlayfs.go:89 diskFile.Version
+// Go: project/overlayfs.go:92 NewCachedFileHandle (ts#64291)
+pub fn new_cached_file_handle(file_name: &str, content: String) -> Rc<dyn FileHandle> {
+    new_cached_file(file_name, content)
+}
+
+impl CachedFile {
+    // Go: project/overlayfs.go:98 cachedFile.Version
     pub fn version(&self) -> i32 {
         0
     }
 
-    // Go: project/overlayfs.go:93 diskFile.MatchesDiskText
+    // Go: project/overlayfs.go:102 cachedFile.MatchesDiskText
     pub fn matches_disk_text(&self) -> bool {
         !self.needs_reload
     }
 
-    // Go: project/overlayfs.go:97 diskFile.IsOverlay
+    // Go: project/overlayfs.go:106 cachedFile.IsOverlay
     pub fn is_overlay(&self) -> bool {
         false
     }
 
-    // Go: project/overlayfs.go:101 diskFile.Kind
+    // Go: project/overlayfs.go:110 cachedFile.Kind
     // PORT: tsgo #4712 reverts #4628 here. An extensionless file keeps
     // `ScriptKind::UNKNOWN`; `new_parse_cache_key` picks TS for the parse.
     pub fn kind(&self) -> ScriptKind {
         get_script_kind_from_file_name(&self.file_base.file_name)
     }
 
-    // Go: project/overlayfs.go:105 diskFile.Clone
+    // Go: project/overlayfs.go:114 cachedFile.Clone
     // PORT: Go `Clone`; `clone_` keeps it apart from `std::clone::Clone`.
-    pub fn clone_(&self) -> Rc<RefCell<DiskFile>> {
-        Rc::new(RefCell::new(DiskFile {
+    pub fn clone_(&self) -> Rc<RefCell<CachedFile>> {
+        Rc::new(RefCell::new(CachedFile {
             realpath_path: self.realpath_path.clone(),
             file_base: FileBase {
                 file_name: self.file_base.file_name.clone(),
@@ -138,21 +143,21 @@ impl DiskFile {
                 hash: Cell::new(self.file_base.hash.get()),
                 ..FileBase::default()
             },
-            ..DiskFile::default()
+            ..CachedFile::default()
         }))
     }
 }
 
-// PORT: the dirty maps hold `*diskFile` and call its `Clone`.
-impl dirty::Cloneable for Rc<RefCell<DiskFile>> {
+// PORT: the dirty maps hold `*cachedFile` and call its `Clone`.
+impl dirty::Cloneable for Rc<RefCell<CachedFile>> {
     fn clone_(&self) -> Self {
         self.borrow().clone_()
     }
 }
 
-// Go: project/overlayfs.go:87 `var _ FileHandle = (*diskFile)(nil)`
+// Go: project/overlayfs.go:96 `var _ FileHandle = (*cachedFile)(nil)`
 // PORT: the methods of `fileBase` are promoted through the embedding.
-impl FileContent for RefCell<DiskFile> {
+impl FileContent for RefCell<CachedFile> {
     fn content(&self) -> String {
         self.borrow().file_base.content()
     }
@@ -162,7 +167,7 @@ impl FileContent for RefCell<DiskFile> {
     }
 }
 
-impl FileHandle for RefCell<DiskFile> {
+impl FileHandle for RefCell<CachedFile> {
     fn file_name(&self) -> String {
         self.borrow().file_base.file_name()
     }
@@ -323,56 +328,371 @@ impl lsconv::Script for Overlay {
     }
 }
 
-// Go: project/overlayfs.go:170 overlayFS
-// PORT: `mu` is dropped; `overlays` is replaced after sharing, so it is a
-// `RefCell`. Go `map[tspath.Path]*Overlay` is an `IndexMap` (insertion
-// order; PORT: Go map order is random), because the project collection
-// ranges over the overlays when it picks inferred project roots.
+// Go: project/overlayfs.go:188 overlayFS
+// PORT: `mu` is dropped; `overlays` and `overlayDirectories` are replaced
+// after sharing, so they are `RefCell`s. Go `map[tspath.Path]*Overlay` is an
+// `IndexMap` (insertion order; PORT: Go map order is random), because the
+// project collection ranges over the overlays when it picks inferred project
+// roots. Go shares the map (a reference), so it is an `Rc` map here.
 pub struct OverlayFS {
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
-    pub fs: Rc<dyn vfs::Fs>,
+    pub host: Rc<dyn vfs::Fs>,
     pub position_encoding: lsproto::PositionEncodingKind,
 
-    pub overlays: RefCell<IndexMap<tspath::Path, Rc<Overlay>>>,
+    pub overlays: RefCell<Rc<IndexMap<tspath::Path, Rc<Overlay>>>>,
+    pub overlay_directories: RefCell<Rc<OverlayDirectories>>,
 }
 
-// Go: project/overlayfs.go:179 newOverlayFS
+/// Go `map[tspath.Path]map[tspath.Path]string` of `overlayFS.overlayDirectories`.
+pub type OverlayDirectories = FxHashMap<tspath::Path, FxHashMap<tspath::Path, String>>;
+
+// Go: project/overlayfs.go:198 LayeredFileSystem (ts#64291)
+pub trait LayeredFileSystem: vfs::Fs + FileHandleSource {
+    fn overlays(&self) -> Rc<IndexMap<tspath::Path, Rc<Overlay>>>;
+}
+
+// Go: project/overlayfs.go:204 RebasableFileSystem (ts#64291)
+pub trait RebasableFileSystem: vfs::Fs {
+    fn base_file_system(&self) -> Rc<dyn vfs::Fs>;
+    fn with_base_file_system(&self, base: Rc<dyn vfs::Fs>) -> Rc<dyn LayeredFileSystem>;
+}
+
+/// PORT: the Go type assertions on a `vfs.FS` value that the file system
+/// layers use (ts#64291): `fs.(FileHandleSource)`, `fs.(LayeredFileSystem)`,
+/// `fs.(RebasableFileSystem)`, `fs.(FileChangeExpander)` and
+/// `fs.(*overlayFS)` (and, through `as_any`, the other packages' concrete
+/// layer types). `vfs::Fs::as_fs_layer` returns this view for a layer; each
+/// default is a failed assertion.
+pub trait FsLayer {
+    fn as_file_handle_source(&self) -> Option<&dyn FileHandleSource> {
+        None
+    }
+    fn as_layered_file_system(&self) -> Option<&dyn LayeredFileSystem> {
+        None
+    }
+    fn as_rebasable_file_system(&self) -> Option<&dyn RebasableFileSystem> {
+        None
+    }
+    fn as_file_change_expander(&self) -> Option<&dyn FileChangeExpander> {
+        None
+    }
+    fn as_overlay_fs(&self) -> Option<&OverlayFS> {
+        None
+    }
+    /// A concrete layer type (Go `fs.(*T)` in another package).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+}
+
+/// Go `fs.(FileHandleSource)` on a `vfs.FS`.
+pub fn as_file_handle_source(fs: &dyn vfs::Fs) -> Option<&dyn FileHandleSource> {
+    fs.as_fs_layer()?.as_file_handle_source()
+}
+
+/// Go `fs.(LayeredFileSystem)` on a `vfs.FS`.
+pub fn as_layered_file_system(fs: &dyn vfs::Fs) -> Option<&dyn LayeredFileSystem> {
+    fs.as_fs_layer()?.as_layered_file_system()
+}
+
+/// Go `fs.(RebasableFileSystem)` on a `vfs.FS`.
+pub fn as_rebasable_file_system(fs: &dyn vfs::Fs) -> Option<&dyn RebasableFileSystem> {
+    fs.as_fs_layer()?.as_rebasable_file_system()
+}
+
+/// Go `fs.(FileChangeExpander)` on a `vfs.FS`.
+pub fn as_file_change_expander(fs: &dyn vfs::Fs) -> Option<&dyn FileChangeExpander> {
+    fs.as_fs_layer()?.as_file_change_expander()
+}
+
+/// Go `fs.(*overlayFS)` on a `vfs.FS`.
+pub fn as_overlay_fs(fs: &dyn vfs::Fs) -> Option<&OverlayFS> {
+    fs.as_fs_layer()?.as_overlay_fs()
+}
+
+// Go: project/overlayfs.go:210 newOverlayFS
 pub fn new_overlay_fs(
     fs: Rc<dyn vfs::Fs>,
     overlays: IndexMap<tspath::Path, Rc<Overlay>>,
     position_encoding: lsproto::PositionEncodingKind,
     to_path: Rc<dyn Fn(&str) -> tspath::Path>,
 ) -> Rc<OverlayFS> {
+    let overlay_directories = create_overlay_directories(&overlays);
     Rc::new(OverlayFS {
-        fs,
+        host: fs,
         position_encoding,
-        overlays: RefCell::new(overlays),
+        overlays: RefCell::new(Rc::new(overlays)),
+        overlay_directories: RefCell::new(Rc::new(overlay_directories)),
         to_path,
     })
 }
 
 impl OverlayFS {
-    // Go: project/overlayfs.go:188 overlayFS.Overlays
-    // PORT: Go returns the shared map; the port returns a copy of it.
-    pub fn overlays(&self) -> IndexMap<tspath::Path, Rc<Overlay>> {
+    // Go: project/overlayfs.go:226 overlayFS.Overlays
+    pub fn overlays(&self) -> Rc<IndexMap<tspath::Path, Rc<Overlay>>> {
         self.overlays.borrow().clone()
     }
 
-    // Go: project/overlayfs.go:194 overlayFS.getFile
+    // Go: project/overlayfs.go:249 overlayFS.GetFile (ts#64291: was getFile)
     pub fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>> {
-        let path = (self.to_path)(file_name);
-        let overlay = self.overlays.borrow().get(&path).cloned();
+        self.get_file_by_path(file_name, &(self.to_path)(file_name))
+    }
+
+    // Go: project/overlayfs.go:253 overlayFS.GetFileByPath
+    pub fn get_file_by_path(
+        &self,
+        file_name: &str,
+        path: &tspath::Path,
+    ) -> Option<Rc<dyn FileHandle>> {
+        let overlay = self.overlays.borrow().get(path).cloned();
+        let directory = self.overlay_directories.borrow().contains_key(path);
         if let Some(overlay) = overlay {
             return Some(overlay);
         }
+        if directory {
+            return None;
+        }
 
-        let (content, ok) = self.fs.read_file(file_name);
+        if let Some(source) = as_file_handle_source(&*self.host) {
+            return source.get_file_by_path(file_name, path);
+        }
+        let (content, ok) = self.host.read_file(file_name);
         if !ok {
             return None;
         }
-        Some(new_disk_file(file_name, content))
+        Some(new_cached_file(file_name, content))
+    }
+}
+
+// Go: project/overlayfs.go:230 layerOverlayFileSystem (ts#64291)
+pub fn layer_overlay_file_system(
+    file_system: Rc<dyn vfs::Fs>,
+    overlays: IndexMap<tspath::Path, Rc<Overlay>>,
+    position_encoding: lsproto::PositionEncodingKind,
+    to_path: Rc<dyn Fn(&str) -> tspath::Path>,
+) -> Rc<dyn LayeredFileSystem> {
+    let mut base = file_system.clone();
+    let layer = as_rebasable_file_system(&*file_system);
+    if let Some(candidate) = layer {
+        base = candidate.base_file_system();
+    }
+    if let Some(previous) = as_overlay_fs(&*base) {
+        let host = previous.host.clone();
+        base = host;
+    }
+    let overlay = new_overlay_fs(base, overlays, position_encoding, to_path);
+    match layer {
+        None => overlay,
+        Some(layer) => layer.with_base_file_system(overlay),
+    }
+}
+
+// Go: project/overlayfs.go:218 `_ FileHandleSource = (*overlayFS)(nil)`
+impl FileHandleSource for OverlayFS {
+    fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>> {
+        OverlayFS::get_file(self, file_name)
     }
 
+    fn get_file_by_path(&self, file_name: &str, path: &tspath::Path) -> Option<Rc<dyn FileHandle>> {
+        OverlayFS::get_file_by_path(self, file_name, path)
+    }
+}
+
+// Go: project/overlayfs.go:219 `_ LayeredFileSystem = (*overlayFS)(nil)`
+impl LayeredFileSystem for OverlayFS {
+    fn overlays(&self) -> Rc<IndexMap<tspath::Path, Rc<Overlay>>> {
+        OverlayFS::overlays(self)
+    }
+}
+
+impl FsLayer for OverlayFS {
+    fn as_file_handle_source(&self) -> Option<&dyn FileHandleSource> {
+        Some(self)
+    }
+    fn as_layered_file_system(&self) -> Option<&dyn LayeredFileSystem> {
+        Some(self)
+    }
+    fn as_overlay_fs(&self) -> Option<&OverlayFS> {
+        Some(self)
+    }
+}
+
+// Go: project/overlayfs.go:217 `_ vfs.FS = (*overlayFS)(nil)`
+impl vfs::Fs for OverlayFS {
+    // Go: project/overlayfs.go:274 overlayFS.UseCaseSensitiveFileNames
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.host.use_case_sensitive_file_names()
+    }
+
+    // Go: project/overlayfs.go:276 overlayFS.FileExists
+    fn file_exists(&self, file_name: &str) -> bool {
+        let path = (self.to_path)(file_name);
+        let file = self.overlays.borrow().contains_key(&path);
+        let directory = self.overlay_directories.borrow().contains_key(&path);
+        file || !directory && self.host.file_exists(file_name)
+    }
+
+    // Go: project/overlayfs.go:285 overlayFS.ReadFile
+    fn read_file(&self, file_name: &str) -> (String, bool) {
+        if let Some(file) = OverlayFS::get_file(self, file_name) {
+            return (file.content(), true);
+        }
+        (String::new(), false)
+    }
+
+    // Go: project/overlayfs.go:292 overlayFS.WriteFile
+    fn write_file(&self, path: &str, data: &str) -> Result<(), vfs::FsError> {
+        self.host.write_file(path, data)
+    }
+
+    // Go: project/overlayfs.go:294 overlayFS.AppendFile
+    fn append_file(&self, path: &str, data: &str) -> Result<(), vfs::FsError> {
+        self.host.append_file(path, data)
+    }
+
+    // Go: project/overlayfs.go:297 overlayFS.Remove
+    fn remove(&self, path: &str) -> Result<(), vfs::FsError> {
+        self.host.remove(path)
+    }
+
+    // Go: project/overlayfs.go:298 overlayFS.Chtimes
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<std::time::SystemTime>,
+        m_time: Option<std::time::SystemTime>,
+    ) -> Result<(), vfs::FsError> {
+        self.host.chtimes(path, a_time, m_time)
+    }
+
+    // Go: project/overlayfs.go:302 overlayFS.DirectoryExists
+    fn directory_exists(&self, directory_name: &str) -> bool {
+        let path = (self.to_path)(directory_name);
+        let file = self.overlays.borrow().contains_key(&path);
+        let directory = self.overlay_directories.borrow().contains_key(&path);
+        directory || !file && self.host.directory_exists(directory_name)
+    }
+
+    // Go: project/overlayfs.go:311 overlayFS.GetAccessibleEntries
+    // PORT: Go ranges over the directory map (random order); FxHashMap order
+    // here.
+    fn get_accessible_entries(&self, directory_name: &str) -> vfs::Entries {
+        let path = (self.to_path)(directory_name);
+        let file = self.overlays.borrow().contains_key(&path);
+        let directory = self.overlay_directories.borrow().get(&path).cloned();
+        let overlays = self.overlays.borrow().clone();
+        if file {
+            return vfs::Entries::default();
+        }
+        let host_entries = self.host.get_accessible_entries(directory_name);
+        let mut entries = vfs::Entries {
+            files: host_entries.files.clone(),
+            directories: host_entries.directories.clone(),
+            symlinks: host_entries.symlinks.clone(),
+        };
+        let use_case_sensitive_file_names = vfs::Fs::use_case_sensitive_file_names(self);
+        let equal_name = |left: &str, right: &str| -> bool {
+            tspath::get_canonical_file_name(left, use_case_sensitive_file_names)
+                == tspath::get_canonical_file_name(right, use_case_sensitive_file_names)
+        };
+        for (child_path, child_name) in directory.iter().flatten() {
+            entries.files.retain(|name| !equal_name(name, child_name));
+            entries
+                .directories
+                .retain(|name| !equal_name(name, child_name));
+            if let Some(symlinks) = &mut entries.symlinks {
+                symlinks.retain(|name| !equal_name(name, child_name));
+            }
+            if overlays.contains_key(child_path) {
+                entries.files.push(child_name.clone());
+            } else {
+                entries.directories.push(child_name.clone());
+            }
+        }
+        entries
+    }
+
+    // Go: project/overlayfs.go:346 overlayFS.Stat
+    fn stat(&self, path: &str) -> Option<vfs::FileInfo> {
+        let canonical_path = (self.to_path)(path);
+        let overlay = self.overlays.borrow().get(&canonical_path).cloned();
+        let directory = self
+            .overlay_directories
+            .borrow()
+            .contains_key(&canonical_path);
+        if let Some(overlay) = overlay {
+            return Some(overlay_file_info(&overlay));
+        }
+        if directory {
+            return Some(overlay_directory_info(tspath::get_base_file_name(path)));
+        }
+        self.host.stat(path)
+    }
+
+    // Go: project/overlayfs.go:361 overlayFS.Realpath
+    fn realpath(&self, path: &str) -> String {
+        self.host.realpath(path)
+    }
+
+    fn as_fs_layer(&self) -> Option<&dyn FsLayer> {
+        Some(self)
+    }
+}
+
+// Go: project/overlayfs.go:363 overlayFileInfo (ts#64291)
+// PORT: Go `vfs.FileInfo` is the `vfs::FileInfo` value of the Go methods:
+// Name, Size, Mode 0o444, zero ModTime.
+pub fn overlay_file_info(overlay: &Overlay) -> vfs::FileInfo {
+    vfs::FileInfo {
+        name: tspath::get_base_file_name(&overlay.file_base.file_name),
+        size: overlay.file_base.content.len() as i64,
+        mode: vfs::FileMode(0o444),
+        mod_time: None,
+    }
+}
+
+// Go: project/overlayfs.go:374 overlayDirectoryInfo (ts#64291)
+// PORT: Mode is `ModeDir | 0o555`, zero ModTime.
+pub fn overlay_directory_info(name: String) -> vfs::FileInfo {
+    vfs::FileInfo {
+        name,
+        size: 0,
+        mode: vfs::FileMode(vfs::FileMode::DIR.0 | 0o555),
+        mod_time: None,
+    }
+}
+
+// Go: project/overlayfs.go:385 createOverlayDirectories (ts#64291)
+// PORT: Go ranges over the overlay map (random order); the IndexMap order
+// here. The result is a map, so the order does not matter.
+pub fn create_overlay_directories(
+    overlays: &IndexMap<tspath::Path, Rc<Overlay>>,
+) -> OverlayDirectories {
+    let mut overlay_directories: OverlayDirectories = FxHashMap::default();
+    for (path, overlay) in overlays {
+        let mut child_path = path.clone();
+        let mut child = overlay.file_base.file_name.clone();
+        loop {
+            let parent_path = child_path.get_directory_path();
+            let parent = tspath::get_directory_path(&child);
+            if child_path == parent_path {
+                break;
+            }
+            if let Some(directory) = overlay_directories.get_mut(&parent_path) {
+                directory.insert(child_path.clone(), tspath::get_base_file_name(&child));
+            } else {
+                let mut directory: FxHashMap<tspath::Path, String> = FxHashMap::default();
+                directory.insert(child_path.clone(), tspath::get_base_file_name(&child));
+                overlay_directories.insert(parent_path.clone(), directory);
+            }
+            child_path = parent_path;
+            child = parent;
+        }
+    }
+    overlay_directories
+}
+
+impl OverlayFS {
     // Go: project/overlayfs.go:211 overlayFS.processChanges
     // PORT: Go takes the slice; here a borrowed slice. The per-file events
     // keep references into it where Go keeps pointers to copies. Go ranges
@@ -383,7 +703,8 @@ impl OverlayFS {
         changes: &[FileChange],
     ) -> (FileChangeSummary, IndexMap<tspath::Path, Rc<Overlay>>) {
         let mut result = FileChangeSummary::default();
-        let mut new_overlays = self.overlays.borrow().clone();
+        let mut new_overlays: IndexMap<tspath::Path, Rc<Overlay>> =
+            (**self.overlays.borrow()).clone();
 
         // Reduced collection of changes that occurred on a single file
         #[derive(Default)]
@@ -479,7 +800,7 @@ impl OverlayFS {
 
         // Process deduplicated events per file
         for (uri, events) in &file_event_map {
-            let path = uri.path(self.fs.use_case_sensitive_file_names());
+            let path = uri.path(self.host.use_case_sensitive_file_names());
             let mut o: Option<Rc<Overlay>> = new_overlays.get(&path).cloned();
 
             if let Some(open_change) = events.open_change {
@@ -523,7 +844,7 @@ impl OverlayFS {
             if events.watch_changed {
                 if let Some(cur) = o.clone() {
                     if !events.saved {
-                        let (matches_disk_text, _) = cur.compute_matches_disk_text(&*self.fs);
+                        let (matches_disk_text, _) = cur.compute_matches_disk_text(&*self.host);
                         if matches_disk_text != cur.matches_disk_text.get() {
                             let next = new_overlay(
                                 &cur.file_base.file_name,
@@ -642,7 +963,8 @@ impl OverlayFS {
             }
         }
 
-        *self.overlays.borrow_mut() = new_overlays.clone();
+        *self.overlay_directories.borrow_mut() = Rc::new(create_overlay_directories(&new_overlays));
+        *self.overlays.borrow_mut() = Rc::new(new_overlays.clone());
         (result, new_overlays)
     }
 }

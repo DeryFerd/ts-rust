@@ -10,7 +10,12 @@ use crate::project::prelude::*;
 // Go: project/filechange.go:8 excessiveChangeThreshold
 pub const EXCESSIVE_CHANGE_THRESHOLD: i32 = 1000;
 
-// Go: project/filechange.go:10 FileChangeKind
+// Go: project/filechange.go:10 FileChangeExpander (ts#64291)
+pub trait FileChangeExpander {
+    fn expand_file_changes(&self, summary: FileChangeSummary) -> FileChangeSummary;
+}
+
+// Go: project/filechange.go:14 FileChangeKind
 // PORT: Go `type FileChangeKind int` with iota consts. Go
 // `FileChangeKindOpen` is `FileChangeKind::OPEN` (same values).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]

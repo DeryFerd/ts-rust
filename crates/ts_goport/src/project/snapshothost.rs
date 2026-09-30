@@ -135,7 +135,7 @@ impl SnapshotHost {
         base_snapshot: &Rc<Snapshot>,
         change: SnapshotChange,
     ) -> Rc<Snapshot> {
-        base_snapshot.clone_(ctx, change, &base_snapshot.fs.overlays, None)
+        base_snapshot.clone_(ctx, change, &base_snapshot.overlays(), None)
     }
 
     // Go: project/snapshothost.go:95 CloneSnapshotWithTemporaryFile
@@ -192,6 +192,9 @@ impl SnapshotHost {
     ) -> Rc<Snapshot> {
         let change = SnapshotChange {
             reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
+            // ts#64291
+            fs: Some(base_snapshot.fs.fs.clone() as Rc<dyn vfs::Fs>),
+            file_system_override: base_snapshot.file_system_override,
             resource_request: ResourceRequest {
                 documents: vec![uri.clone()],
                 auto_imports: uri.clone(),
@@ -199,7 +202,7 @@ impl SnapshotHost {
             },
             ..Default::default()
         };
-        base_snapshot.clone_(ctx, change, &base_snapshot.fs.overlays, logger)
+        base_snapshot.clone_(ctx, change, &base_snapshot.overlays(), logger)
     }
 
     // Go: project/snapshothost.go:141 SnapshotHost.newRootSnapshot
@@ -208,15 +211,20 @@ impl SnapshotHost {
         id: u64,
         relative_pattern_support: bool,
     ) -> Rc<Snapshot> {
+        // ts#64291
+        let file_system = new_overlay_fs(
+            self.fs.clone(),
+            IndexMap::default(),
+            self.options.position_encoding.clone(),
+            self.to_path.clone(),
+        );
         self.new_snapshot(
             id,
             Rc::new(SnapshotFS {
                 to_path: self.to_path.clone(),
-                fs: self.fs.clone(),
-                overlays: IndexMap::default(),
-                overlay_directories: FxHashMap::default(),
-                disk_files: Rc::new(FxHashMap::default()),
-                disk_directories: Rc::new(FxHashMap::default()),
+                fs: file_system,
+                cache_files: Rc::new(FxHashMap::default()),
+                cache_directories: Rc::new(FxHashMap::default()),
                 read_files: RefCell::new(FxHashMap::default()),
                 node_modules_realpath_aliases: Rc::new(FxHashMap::default()),
             }),

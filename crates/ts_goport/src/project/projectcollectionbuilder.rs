@@ -48,6 +48,8 @@ pub struct ProjectCollectionBuilder {
 
     pub ctx: Context,
     pub fs: Rc<SnapshotFSBuilder>,
+    // ts#64291
+    pub overlays: Rc<IndexMap<tspath::Path, Rc<Overlay>>>,
     pub base: Rc<ProjectCollection>,
     pub compiler_options_for_inferred_projects: Option<Rc<CompilerOptions>>,
     pub inferred_content_mappers: Vec<Rc<contentmapper::Mapper>>,
@@ -78,6 +80,7 @@ pub fn new_project_collection_builder(
     ctx: &Context,
     new_snapshot_id: u64,
     fs: Rc<SnapshotFSBuilder>,
+    overlays: Rc<IndexMap<tspath::Path, Rc<Overlay>>>,
     old_project_collection: Rc<ProjectCollection>,
     old_config_file_registry: Rc<ConfigFileRegistry>,
     old_api_state: &APIState,
@@ -92,12 +95,18 @@ pub fn new_project_collection_builder(
     content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
     client: Option<Rc<dyn Client>>,
 ) -> Rc<ProjectCollectionBuilder> {
+    let open_files = open_file_paths(&overlays);
+    let is_open_file: Rc<dyn Fn(&tspath::Path) -> bool> = {
+        let overlays = overlays.clone();
+        Rc::new(move |path: &tspath::Path| overlays.contains_key(path))
+    };
     let config_file_registry_builder = new_config_file_registry_builder(
         lsproto::get_client_capabilities(ctx)
             .workspace
             .did_change_watched_files
             .relative_pattern_support,
         fs.clone(),
+        is_open_file,
         old_config_file_registry,
         extended_config_cache.clone(),
         new_snapshot_id,
@@ -105,10 +114,12 @@ pub fn new_project_collection_builder(
         custom_config_file_name,
         None,
     );
+    let open_files_changed = open_files != old_project_collection.open_files;
     Rc::new(ProjectCollectionBuilder {
         ctx: ctx.clone(),
         to_path: fs.to_path.clone(),
         fs,
+        overlays,
         compiler_options_for_inferred_projects,
         inferred_content_mappers,
         inferred_content_mapper_extensions,
@@ -128,7 +139,7 @@ pub fn new_project_collection_builder(
         base: old_project_collection,
         program_structure_changed: Cell::new(false),
         default_projects_invalidated: Cell::new(false),
-        open_files_changed: Cell::new(false),
+        open_files_changed: Cell::new(open_files_changed),
         file_default_projects: RefCell::new(FxHashMap::default()),
     })
 }
@@ -151,6 +162,11 @@ fn ensure_cloned<'c>(
 }
 
 impl ProjectCollectionBuilder {
+    // Go: project/projectcollectionbuilder.go:109 isOpenFile (ts#64291)
+    pub fn is_open_file(&self, path: &tspath::Path) -> bool {
+        self.overlays.contains_key(path)
+    }
+
     // Go: project/projectcollectionbuilder.go:88 Finalize
     pub fn finalize(
         self: &Rc<Self>,
@@ -169,7 +185,7 @@ impl ProjectCollectionBuilder {
 
         if self.open_files_changed.get() {
             ensure_cloned(&mut new_project_collection, &self.base).open_files =
-                open_file_paths(&self.fs.overlays);
+                open_file_paths(&self.overlays);
         }
 
         if *self.file_default_projects.borrow() != self.base.file_default_projects {
@@ -328,7 +344,7 @@ impl ProjectCollectionBuilder {
             }
         }
 
-        for overlay in self.fs.overlays.values() {
+        for overlay in self.overlays.values() {
             let file_name = overlay.file_name();
             if let Some(entry) =
                 self.find_default_configured_project(&file_name, &(self.to_path)(&file_name))
@@ -358,7 +374,7 @@ impl ProjectCollectionBuilder {
         if api_request.open_files.is_some() || api_request.close_files.is_some() {
             let mut retain: FxHashSet<tspath::Path> = FxHashSet::default();
             for (path, file_name) in self.api_opened_files() {
-                if self.fs.is_open_file(&path) {
+                if self.is_open_file(&path) {
                     // Already an LSP overlay; its project membership is handled by the
                     // overlay pass in cleanupConfiguredProjects.
                     continue;
@@ -658,7 +674,7 @@ impl ProjectCollectionBuilder {
 
         let mut inferred_project_files: Vec<String> = Vec::new();
         // PORT: Go map order is random; the overlay map is an IndexMap.
-        for overlay in self.fs.overlays.values() {
+        for overlay in self.overlays.values() {
             let open_file = overlay.file_name();
             let open_file_path = (self.to_path)(&open_file);
             if let Some(p) = self.find_default_configured_project(&open_file, &open_file_path) {
@@ -674,7 +690,7 @@ impl ProjectCollectionBuilder {
         // Treat API-opened files like open files: retain their configured project (so
         // an LSP-driven open doesn't close it), or keep them as inferred project roots.
         for (path, file_name) in self.api_opened_files() {
-            if self.fs.is_open_file(&path) {
+            if self.is_open_file(&path) {
                 continue;
             }
             if let Some(p) = self.find_default_configured_project(&file_name, &path) {
@@ -729,7 +745,7 @@ impl ProjectCollectionBuilder {
     // Go: project/projectcollectionbuilder.go:420 collectInferredProjectRoots
     fn collect_inferred_project_roots(self: &Rc<Self>) -> Vec<String> {
         let mut inferred_project_files: Vec<String> = Vec::new();
-        for (path, overlay) in &self.fs.overlays {
+        for (path, overlay) in self.overlays.iter() {
             if self
                 .find_default_configured_project(&overlay.file_name(), path)
                 .is_none()
@@ -749,7 +765,7 @@ impl ProjectCollectionBuilder {
         mut inferred_project_files: Vec<String>,
     ) -> Vec<String> {
         for (path, file_name) in self.api_opened_files() {
-            if self.fs.is_open_file(&path) {
+            if self.is_open_file(&path) {
                 continue;
             }
             if self
@@ -813,11 +829,11 @@ impl ProjectCollectionBuilder {
                 &path,
                 logger.clone(),
             );
-            if !self.fs.is_open_file(&path) {
+            if !self.is_open_file(&path) {
                 return;
             }
         }
-        if self.fs.is_open_file(&path) {
+        if self.is_open_file(&path) {
             let mut has_changes = self.program_structure_changed.get();
 
             // See if we can find a default project without updating a bunch of stuff.
@@ -1218,7 +1234,11 @@ impl ProjectCollectionBuilder {
         // Recompute default projects for open files that now have different config file presence.
         let mut has_changes = false;
         for path in &config_change_result.affected_files {
-            let file_name = self.fs.overlays.get(path).expect(NIL_DEREF).file_name();
+            // ts#64291
+            let Some(overlay) = self.overlays.get(path) else {
+                continue;
+            };
+            let file_name = overlay.file_name();
             let _ = self.ensure_configured_project_and_ancestors_for_file(
                 &file_name,
                 path,
@@ -1326,7 +1346,7 @@ impl ProjectCollectionBuilder {
             ProjectLoadKind::CREATE,
             logger.clone(),
         );
-        if result.project.is_some() && self.fs.is_open_file(path) {
+        if result.project.is_some() && self.is_open_file(path) {
             self.create_ancestor_tree(file_name, path, &mut result, logger);
         }
         result

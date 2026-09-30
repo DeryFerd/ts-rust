@@ -335,9 +335,9 @@ impl std::ops::Deref for Session {
 // `module.ResolutionHost`, whose Rust form returns borrowed values. The
 // inherent methods keep the Go results for other callers (api session).
 impl crate::frontend::module::ResolutionHost for Session {
-    // Go: project/session.go:255 FS
+    // Go: project/session.go:251 FS (ts#64291: the overlay file system)
     fn fs(&self) -> &dyn vfs::Fs {
-        &*self.fs.fs
+        &*self.fs
     }
 
     // Go: project/session.go:260 GetCurrentDirectory
@@ -359,10 +359,10 @@ impl ata::NpmExecutor for Session {
 }
 
 impl Session {
-    // Go: project/session.go:255 FS
+    // Go: project/session.go:251 FS
     // FS implements module.ResolutionHost
     pub fn fs(&self) -> Rc<dyn vfs::Fs> {
-        self.fs.fs.clone()
+        self.fs.clone()
     }
 
     // Go: project/session.go:260 GetCurrentDirectory
@@ -618,10 +618,11 @@ impl Session {
                     // For creations/changes, we can check the file system.
                     // For deletions, consult the current snapshot cache to avoid treating extensionless file deletions as relevant.
                     if kind != FileChangeKind::WATCH_DELETE {
-                        has_relevant_change = self.fs.fs.directory_exists(&file_name);
+                        has_relevant_change = vfs::Fs::directory_exists(&*self.fs, &file_name);
                     } else {
                         let snapshot = self.snapshot.borrow().clone();
-                        if snapshot.fs.disk_directories.contains_key(&path)
+                        if snapshot.fs.cache_directories.contains_key(&path)
+                            || snapshot.has_overlay_within(&path)
                             || is_node_modules_path(&path)
                         {
                             has_relevant_change = true;
@@ -663,7 +664,7 @@ impl Session {
         *self.compiler_options_for_inferred_projects.borrow_mut() = options.clone();
         self.update_snapshot_exported(
             ctx,
-            self.fs.overlays(),
+            (*self.fs.overlays()).clone(),
             SnapshotChange {
                 reason: UpdateReason::DID_CHANGE_COMPILER_OPTIONS_FOR_INFERRED_PROJECTS,
                 compiler_options_for_inferred_projects: options,
@@ -982,7 +983,7 @@ impl Session {
                         file_changes,
                         ata_changes,
                         new_config,
-                        clean_disk_cache: true,
+                        clean_file_cache: true,
                         ..Default::default()
                     },
                 );
@@ -1228,11 +1229,11 @@ impl Session {
         metrics_read(&mut samples);
 
         let mut measurements = lsproto::PerformanceStatsTelemetryMeasurements {
-            open_file_count: snapshot.fs.overlays.len() as f64,
+            open_file_count: snapshot.overlays().len() as f64,
             uptime_seconds: self.start_time.elapsed().as_secs_f64(),
             project_count: snapshot.project_collection.projects().len() as f64,
             config_count: snapshot.config_file_registry.configs.len() as f64,
-            cached_disk_file_count: snapshot.fs.disk_files.len() as f64,
+            cached_disk_file_count: snapshot.fs.cache_files.len() as f64,
             ..Default::default()
         };
 
@@ -1636,7 +1637,7 @@ impl Session {
             }
             if update_reason == UpdateReason::UNKNOWN {
                 for document in &request.configured_project_documents {
-                    if snapshot.fs.is_open_file(&document.file_name()) {
+                    if snapshot.is_open_file(&document.file_name()) {
                         match snapshot.get_default_project(document) {
                             None => {
                                 update_reason =
@@ -2751,7 +2752,7 @@ impl Session {
         _ctx: &Context,
     ) -> (FileChangeSummary, IndexMap<tspath::Path, Rc<Overlay>>) {
         if self.pending_file_changes.borrow().is_empty() {
-            return (FileChangeSummary::default(), self.fs.overlays());
+            return (FileChangeSummary::default(), (*self.fs.overlays()).clone());
         }
 
         let start = Instant::now();
@@ -2828,11 +2829,11 @@ impl Session {
         self.logger.log("\n======== Cache Statistics ========");
         self.logger.logf(&format!(
             "Open file count:   {:6}",
-            snapshot.fs.overlays.len()
+            snapshot.overlays().len()
         ));
         self.logger.logf(&format!(
             "Cached disk files: {:6}",
-            snapshot.fs.disk_files.len()
+            snapshot.fs.cache_files.len()
         ));
         self.logger.logf(&format!(
             "Realpath aliases:  {:6}",
@@ -3267,7 +3268,7 @@ impl Session {
                             get_script_kind: Rc::new(|file_name: &str| {
                                 crate::frontend::core_ext::get_script_kind_from_file_name(file_name)
                             }),
-                            fs: s.fs.fs.clone(),
+                            fs: s.fs.clone(),
                             logger: log_tree.clone().map(|t| t as Rc<dyn logging::Logger>),
                         };
                         (
@@ -3352,7 +3353,7 @@ impl Session {
             for uri in &change.file_changes.changed {
                 changed_file = uri.clone();
             }
-            if !new_snapshot.fs.is_open_file(&changed_file.file_name()) {
+            if !new_snapshot.is_open_file(&changed_file.file_name()) {
                 return;
             }
             let prefs = new_snapshot.user_preferences();
@@ -3483,7 +3484,7 @@ impl Session {
         let cloned_snapshot = new_snapshot.clone_(
             &build_ctx,
             warm_change,
-            &new_snapshot.fs.overlays,
+            &new_snapshot.overlays(),
             Some(&self.logger),
         );
         self.snapshot_id.set(next_snapshot_id);

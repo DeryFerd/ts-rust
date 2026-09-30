@@ -14,15 +14,16 @@ use ts_goport::frontend::vfs::Fs;
 use ts_goport::lsp::lsproto;
 use ts_goport::project::dirty::CloneableMap;
 use ts_goport::project::{
-    AutoImportBuilderFS, DiskFile, FileBase, FileChangeSummary, FileContent, FileSource, Overlay,
-    RealpathAliasSet, SnapshotFS, SnapshotFSBuilder, new_disk_file, new_snapshot_fs_builder,
-    new_source_fs,
+    AutoImportBuilderFS, CachedFile, FileBase, FileChangeSummary, FileContent, FileHandle,
+    FileHandleSource, FileSource, LayeredFileSystem, Overlay, RealpathAliasSet, SnapshotFS,
+    SnapshotFSBuilder, layer_overlay_file_system, new_cached_file, new_cached_file_handle,
+    new_overlay_fs, new_snapshot_fs_builder_from_source, new_source_fs,
 };
 
 use super::util::uri;
 use crate::support::vfstest::{self, MapFile};
 
-type DiskFiles = FxHashMap<Path, Rc<RefCell<DiskFile>>>;
+type CacheFiles = FxHashMap<Path, Rc<RefCell<CachedFile>>>;
 type Dirs = FxHashMap<Path, CloneableMap<Path, String>>;
 type Aliases = FxHashMap<Path, Rc<RefCell<RealpathAliasSet>>>;
 type Overlays = IndexMap<Path, Rc<Overlay>>;
@@ -48,32 +49,148 @@ fn text(s: &str) -> MapFile {
     MapFile::from(s)
 }
 
-/// Go `newSnapshotFSBuilder(fs, prevOverlays{}, overlays, diskFiles, diskDirectories, aliases, UTF16, toPath)`.
-/// The maps are new (owned) or shared with a previous snapshot (`Rc`).
+// Go: snapshotfs_test.go:17 newSnapshotFSBuilder (ts#64291: a test helper)
+/// Go `newSnapshotFSBuilder(fs, prevOverlays{}, overlays, cacheFiles, cacheDirectories, aliases, UTF16, toPath)`:
+/// layers the overlays over `fs`. The maps are new (owned) or shared with a
+/// previous snapshot (`Rc`).
 fn builder(
     fs: Rc<dyn Fs>,
     overlays: Overlays,
-    disk_files: impl Into<Rc<DiskFiles>>,
+    cache_files: impl Into<Rc<CacheFiles>>,
     dirs: impl Into<Rc<Dirs>>,
     aliases: impl Into<Rc<Aliases>>,
 ) -> Rc<SnapshotFSBuilder> {
-    new_snapshot_fs_builder(
+    let layered_fs = layer_overlay_file_system(
         fs,
-        IndexMap::default(), // prevOverlays
         overlays,
-        disk_files.into(),
+        lsproto::PositionEncodingKind::UTF16,
+        to_path(),
+    );
+    new_snapshot_fs_builder_from_source(
+        layered_fs,
+        cache_files.into(),
         dirs.into(),
         aliases.into(),
+        to_path(),
+    )
+}
+
+// Go: snapshotfs_test.go:32 newTestLayeredFileSystem (ts#64291)
+fn new_test_layered_file_system(fs: Rc<dyn Fs>) -> Rc<dyn LayeredFileSystem> {
+    new_overlay_fs(
+        fs,
+        IndexMap::default(),
         lsproto::PositionEncodingKind::UTF16,
         to_path(),
     )
+}
+
+// Go: snapshotfs_test.go:36 countingHandleFileSystem (ts#64291)
+// PORT: Go embeds the `LayeredFileSystem`; the other methods forward to
+// `inner`. The counters are `Cell`s.
+struct CountingHandleFileSystem {
+    inner: Rc<dyn LayeredFileSystem>,
+    content: String,
+    get_file_by_path_calls: Cell<i32>,
+    read_file_calls: Cell<i32>,
+}
+
+impl FileHandleSource for CountingHandleFileSystem {
+    // Go: snapshotfs_test.go:43 countingHandleFileSystem.GetFile
+    fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>> {
+        self.get_file_by_path(file_name, &p(file_name))
+    }
+
+    // Go: snapshotfs_test.go:47 countingHandleFileSystem.GetFileByPath
+    fn get_file_by_path(&self, file_name: &str, _path: &Path) -> Option<Rc<dyn FileHandle>> {
+        self.get_file_by_path_calls
+            .set(self.get_file_by_path_calls.get() + 1);
+        Some(new_cached_file_handle(file_name, self.content.clone()))
+    }
+}
+
+impl LayeredFileSystem for CountingHandleFileSystem {
+    fn overlays(&self) -> Rc<IndexMap<Path, Rc<Overlay>>> {
+        self.inner.overlays()
+    }
+}
+
+impl Fs for CountingHandleFileSystem {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.inner.use_case_sensitive_file_names()
+    }
+    fn file_exists(&self, path: &str) -> bool {
+        self.inner.file_exists(path)
+    }
+    // Go: snapshotfs_test.go:52 countingHandleFileSystem.ReadFile
+    fn read_file(&self, _path: &str) -> (String, bool) {
+        self.read_file_calls.set(self.read_file_calls.get() + 1);
+        (self.content.clone(), true)
+    }
+    fn write_file(&self, path: &str, data: &str) -> Result<(), ts_goport::frontend::vfs::FsError> {
+        self.inner.write_file(path, data)
+    }
+    fn append_file(&self, path: &str, data: &str) -> Result<(), ts_goport::frontend::vfs::FsError> {
+        self.inner.append_file(path, data)
+    }
+    fn remove(&self, path: &str) -> Result<(), ts_goport::frontend::vfs::FsError> {
+        self.inner.remove(path)
+    }
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<std::time::SystemTime>,
+        m_time: Option<std::time::SystemTime>,
+    ) -> Result<(), ts_goport::frontend::vfs::FsError> {
+        self.inner.chtimes(path, a_time, m_time)
+    }
+    fn directory_exists(&self, path: &str) -> bool {
+        self.inner.directory_exists(path)
+    }
+    fn get_accessible_entries(&self, path: &str) -> ts_goport::frontend::vfs::Entries {
+        self.inner.get_accessible_entries(path)
+    }
+    fn stat(&self, path: &str) -> Option<ts_goport::frontend::vfs::FileInfo> {
+        self.inner.stat(path)
+    }
+    fn realpath(&self, path: &str) -> String {
+        self.inner.realpath(path)
+    }
+}
+
+// Go: snapshotfs_test.go:57 TestSnapshotFSBuilderCachesReturnedSourceHandle (ts#64291)
+#[test]
+fn snapshot_fs_builder_caches_returned_source_handle() {
+    let file_system = Rc::new(CountingHandleFileSystem {
+        inner: new_test_layered_file_system(text_fs(&[], true)),
+        content: "export const value = 1;".to_string(),
+        get_file_by_path_calls: Cell::new(0),
+        read_file_calls: Cell::new(0),
+    });
+    let b = new_snapshot_fs_builder_from_source(
+        file_system.clone(),
+        Rc::new(CacheFiles::default()),
+        Rc::new(Dirs::default()),
+        Rc::new(Aliases::default()),
+        to_path(),
+    );
+
+    let file = b.get_file("/src/index.ts").expect("file");
+    assert_eq!(file.content(), file_system.content);
+    let again = b.get_file("/src/index.ts").expect("file");
+    assert!(std::ptr::eq(
+        Rc::as_ptr(&again) as *const u8,
+        Rc::as_ptr(&file) as *const u8
+    ));
+    assert_eq!(file_system.get_file_by_path_calls.get(), 1);
+    assert_eq!(file_system.read_file_calls.get(), 0);
 }
 
 fn empty_builder(fs: Rc<dyn Fs>) -> Rc<SnapshotFSBuilder> {
     builder(
         fs,
         Overlays::default(),
-        DiskFiles::default(),
+        CacheFiles::default(),
         Dirs::default(),
         Aliases::default(),
     )
@@ -93,11 +210,11 @@ fn dirs(entries: &[(&str, &[(&str, &str)])]) -> Dirs {
         .collect()
 }
 
-/// Go `map[tspath.Path]*diskFile{path: newDiskFile(path, content), ...}`.
-fn disk_files(entries: &[(&str, &str)]) -> DiskFiles {
+/// Go `map[tspath.Path]*cachedFile{path: newCachedFile(path, content), ...}`.
+fn cache_files(entries: &[(&str, &str)]) -> CacheFiles {
     entries
         .iter()
-        .map(|(name, content)| (p(name), new_disk_file(name, content.to_string())))
+        .map(|(name, content)| (p(name), new_cached_file(name, content.to_string())))
         .collect()
 }
 
@@ -122,15 +239,15 @@ fn overlays(entries: &[(&str, &str)]) -> Overlays {
         .collect()
 }
 
-/// Go `snapshot.diskDirectories[dir][child]` presence.
+/// Go `snapshot.cacheDirectories[dir][child]` presence.
 fn dir_has(dirs: &Dirs, dir: &str, child: &str) -> bool {
     dirs.get(&p(dir))
         .is_some_and(|d| d.0.borrow().contains_key(&p(child)))
 }
 
-/// Go `builder.diskFiles.Load(path)` then `entry.Delete()`.
-fn delete_disk_file(b: &SnapshotFSBuilder, path: &str) {
-    if let (Some(entry), true) = b.disk_files.load(&p(path)) {
+/// Go `builder.cacheFiles.Load(path)` then `entry.Delete()`.
+fn delete_cache_file(b: &SnapshotFSBuilder, path: &str) {
+    if let (Some(entry), true) = b.cache_files.load(&p(path)) {
         entry.delete();
     }
 }
@@ -154,7 +271,7 @@ fn alias_has(aliases: &Aliases, realpath: &str, symlink: &str) -> bool {
 fn builder_builds_directory_tree_on_file_add() {
     let b = empty_builder(text_fs(&[("/src/foo.ts", "const foo = 1;")], false));
 
-    // Read the file to add it to the diskFiles
+    // Read the file to add it to the cacheFiles
     assert_eq!(file_content(b.get_file("/src/foo.ts")), "const foo = 1;");
 
     // Finalize and check directories
@@ -163,21 +280,21 @@ fn builder_builds_directory_tree_on_file_add() {
 
     // /src should contain /src/foo.ts
     assert!(
-        snapshot.disk_directories.contains_key(&p("/src")),
+        snapshot.cache_directories.contains_key(&p("/src")),
         "/src directory should exist"
     );
     assert!(
-        dir_has(&snapshot.disk_directories, "/src", "/src/foo.ts"),
+        dir_has(&snapshot.cache_directories, "/src", "/src/foo.ts"),
         "/src should contain /src/foo.ts"
     );
 
     // / should contain /src
     assert!(
-        snapshot.disk_directories.contains_key(&p("/")),
+        snapshot.cache_directories.contains_key(&p("/")),
         "/ directory should exist"
     );
     assert!(
-        dir_has(&snapshot.disk_directories, "/", "/src"),
+        dir_has(&snapshot.cache_directories, "/", "/src"),
         "/ should contain /src"
     );
 }
@@ -199,7 +316,7 @@ fn builder_builds_nested_directory_tree() {
     assert!(changed, "should have changed");
 
     // Check the complete directory tree
-    let d = &snapshot.disk_directories;
+    let d = &snapshot.cache_directories;
     assert!(dir_has(d, "/src/nested/deep", "/src/nested/deep/file.ts"));
     assert!(dir_has(d, "/src/nested", "/src/nested/deep"));
     assert!(dir_has(d, "/src", "/src/nested"));
@@ -212,7 +329,7 @@ fn builder_removes_directory_entries_on_file_delete() {
     let b = builder(
         text_fs(&[("/src/foo.ts", "const foo = 1;")], false),
         Overlays::default(),
-        disk_files(&[("/src/foo.ts", "const foo = 1;")]),
+        cache_files(&[("/src/foo.ts", "const foo = 1;")]),
         dirs(&[
             ("/", &[("/src", "src")]),
             ("/src", &[("/src/foo.ts", "foo.ts")]),
@@ -221,24 +338,24 @@ fn builder_removes_directory_entries_on_file_delete() {
     );
 
     // Mark the file for deletion by loading and deleting
-    delete_disk_file(&b, "/src/foo.ts");
+    delete_cache_file(&b, "/src/foo.ts");
 
     let (snapshot, changed) = b.finalize();
     assert!(changed, "should have changed");
 
     // File should be deleted
     assert!(
-        !snapshot.disk_files.contains_key(&p("/src/foo.ts")),
+        !snapshot.cache_files.contains_key(&p("/src/foo.ts")),
         "file should be deleted"
     );
 
     // Directory tree should be cleaned up
     assert!(
-        !snapshot.disk_directories.contains_key(&p("/src")),
+        !snapshot.cache_directories.contains_key(&p("/src")),
         "/src directory should be removed"
     );
     assert!(
-        !snapshot.disk_directories.contains_key(&p("/")),
+        !snapshot.cache_directories.contains_key(&p("/")),
         "root directory should be removed"
     );
 }
@@ -255,7 +372,7 @@ fn builder_removes_only_empty_directories_on_file_delete() {
             false,
         ),
         Overlays::default(),
-        disk_files(&[
+        cache_files(&[
             ("/src/foo.ts", "const foo = 1;"),
             ("/src/bar.ts", "const bar = 2;"),
         ]),
@@ -270,41 +387,41 @@ fn builder_removes_only_empty_directories_on_file_delete() {
     );
 
     // Delete only foo.ts
-    delete_disk_file(&b, "/src/foo.ts");
+    delete_cache_file(&b, "/src/foo.ts");
 
     let (snapshot, changed) = b.finalize();
     assert!(changed, "should have changed");
 
     assert!(
-        !snapshot.disk_files.contains_key(&p("/src/foo.ts")),
+        !snapshot.cache_files.contains_key(&p("/src/foo.ts")),
         "foo.ts should be deleted"
     );
     assert!(
-        snapshot.disk_files.contains_key(&p("/src/bar.ts")),
+        snapshot.cache_files.contains_key(&p("/src/bar.ts")),
         "bar.ts should still exist"
     );
 
     // /src directory should still exist with bar.ts
     assert!(
-        snapshot.disk_directories.contains_key(&p("/src")),
+        snapshot.cache_directories.contains_key(&p("/src")),
         "/src directory should still exist"
     );
     assert!(
-        !dir_has(&snapshot.disk_directories, "/src", "/src/foo.ts"),
+        !dir_has(&snapshot.cache_directories, "/src", "/src/foo.ts"),
         "/src should not contain foo.ts"
     );
     assert!(
-        dir_has(&snapshot.disk_directories, "/src", "/src/bar.ts"),
+        dir_has(&snapshot.cache_directories, "/src", "/src/bar.ts"),
         "/src should contain bar.ts"
     );
 
     // root should still contain /src
     assert!(
-        snapshot.disk_directories.contains_key(&p("/")),
+        snapshot.cache_directories.contains_key(&p("/")),
         "root directory should still exist"
     );
     assert!(
-        dir_has(&snapshot.disk_directories, "/", "/src"),
+        dir_has(&snapshot.cache_directories, "/", "/src"),
         "root should contain /src"
     );
 }
@@ -321,7 +438,7 @@ fn builder_adds_file_to_existing_directory() {
             false,
         ),
         Overlays::default(),
-        disk_files(&[("/src/foo.ts", "const foo = 1;")]),
+        cache_files(&[("/src/foo.ts", "const foo = 1;")]),
         dirs(&[
             ("/", &[("/src", "src")]),
             ("/src", &[("/src/foo.ts", "foo.ts")]),
@@ -337,11 +454,11 @@ fn builder_adds_file_to_existing_directory() {
 
     // /src should contain both files
     assert!(
-        dir_has(&snapshot.disk_directories, "/src", "/src/foo.ts"),
+        dir_has(&snapshot.cache_directories, "/src", "/src/foo.ts"),
         "/src should contain foo.ts"
     );
     assert!(
-        dir_has(&snapshot.disk_directories, "/src", "/src/bar.ts"),
+        dir_has(&snapshot.cache_directories, "/src", "/src/bar.ts"),
         "/src should contain bar.ts"
     );
 }
@@ -352,7 +469,7 @@ fn builder_no_change_when_no_files_added_or_deleted() {
     let b = builder(
         text_fs(&[("/src/foo.ts", "const foo = 1;")], false),
         Overlays::default(),
-        disk_files(&[("/src/foo.ts", "const foo = 1;")]),
+        cache_files(&[("/src/foo.ts", "const foo = 1;")]),
         dirs(&[
             ("/", &[("/src", "src")]),
             ("/src", &[("/src/foo.ts", "foo.ts")]),
@@ -365,16 +482,16 @@ fn builder_no_change_when_no_files_added_or_deleted() {
     assert!(!changed, "should not have changed");
 
     // Directories should remain the same
-    assert!(dir_has(&snapshot.disk_directories, "/src", "/src/foo.ts"));
+    assert!(dir_has(&snapshot.cache_directories, "/src", "/src/foo.ts"));
 }
 
 // Go: snapshotfs_test.go:296 TestSnapshotFSBuilder/overlay files are returned over disk files
 #[test]
-fn builder_overlay_files_are_returned_over_disk_files() {
+fn builder_overlay_files_are_returned_over_cache_files() {
     let b = builder(
         text_fs(&[("/src/foo.ts", "const foo = 1;")], false),
         overlays(&[("/src/foo.ts", "const foo = 999;")]),
-        DiskFiles::default(),
+        CacheFiles::default(),
         Dirs::default(),
         Aliases::default(),
     );
@@ -398,7 +515,7 @@ fn builder_multiple_files_added_and_deleted_in_single_cycle() {
             false,
         ),
         Overlays::default(),
-        disk_files(&[
+        cache_files(&[
             ("/src/a.ts", "const a = 1;"),
             ("/other/single.ts", "const single = 1;"),
         ]),
@@ -416,37 +533,37 @@ fn builder_multiple_files_added_and_deleted_in_single_cycle() {
     assert!(b.get_file("/lib/helpers.ts").is_some());
 
     // Delete existing files
-    delete_disk_file(&b, "/src/a.ts");
-    delete_disk_file(&b, "/other/single.ts");
+    delete_cache_file(&b, "/src/a.ts");
+    delete_cache_file(&b, "/other/single.ts");
 
     let (snapshot, changed) = b.finalize();
     assert!(changed, "should have changed");
 
     // Verify deleted files are gone
     assert!(
-        !snapshot.disk_files.contains_key(&p("/src/a.ts")),
+        !snapshot.cache_files.contains_key(&p("/src/a.ts")),
         "/src/a.ts should be deleted"
     );
     assert!(
-        !snapshot.disk_files.contains_key(&p("/other/single.ts")),
+        !snapshot.cache_files.contains_key(&p("/other/single.ts")),
         "/other/single.ts should be deleted"
     );
 
     // Verify added files exist
     assert!(
-        snapshot.disk_files.contains_key(&p("/src/b.ts")),
+        snapshot.cache_files.contains_key(&p("/src/b.ts")),
         "/src/b.ts should exist"
     );
     assert!(
-        snapshot.disk_files.contains_key(&p("/lib/utils.ts")),
+        snapshot.cache_files.contains_key(&p("/lib/utils.ts")),
         "/lib/utils.ts should exist"
     );
     assert!(
-        snapshot.disk_files.contains_key(&p("/lib/helpers.ts")),
+        snapshot.cache_files.contains_key(&p("/lib/helpers.ts")),
         "/lib/helpers.ts should exist"
     );
 
-    let d = &snapshot.disk_directories;
+    let d = &snapshot.cache_directories;
     // Verify /other directory is cleaned up (was only entry deleted)
     assert!(
         !d.contains_key(&p("/other")),
@@ -478,7 +595,7 @@ fn builder_multiple_files_added_and_deleted_in_single_cycle() {
     assert!(!dir_has(d, "/", "/other"), "root should not contain /other");
 }
 
-// Go: snapshotfs_test.go:427 TestSnapshotFSBuilder/overlay directories are computed from overlays
+// Go: snapshotfs_test.go:484 TestSnapshotFSBuilder/overlay directories are computed from overlays
 #[test]
 fn builder_overlay_directories_are_computed_from_overlays() {
     let b = builder(
@@ -487,34 +604,33 @@ fn builder_overlay_directories_are_computed_from_overlays() {
             ("/src/overlay.ts", "const x = 1;"),
             ("/src/nested/deep.ts", "const y = 2;"),
         ]),
-        DiskFiles::default(),
+        CacheFiles::default(),
         Dirs::default(),
         Aliases::default(),
     );
 
-    let od = &b.overlay_directories;
-    let has = |dir: &str, child: &str| od.get(&p(dir)).is_some_and(|d| d.contains_key(&p(child)));
+    // ts#64291
+    let src_entries = b.get_accessible_entries("/src");
     assert!(
-        od.contains_key(&p("/src")),
-        "/src overlay directory should exist"
-    );
-    assert!(
-        has("/src", "/src/overlay.ts"),
+        src_entries.files.iter().any(|f| f == "overlay.ts"),
         "/src should contain overlay.ts"
     );
-    assert!(has("/src", "/src/nested"), "/src should contain nested/");
-
     assert!(
-        od.contains_key(&p("/src/nested")),
-        "/src/nested overlay directory should exist"
+        src_entries.directories.iter().any(|d| d == "nested"),
+        "/src should contain nested/"
     );
+
+    let nested_entries = b.get_accessible_entries("/src/nested");
     assert!(
-        has("/src/nested", "/src/nested/deep.ts"),
+        nested_entries.files.iter().any(|f| f == "deep.ts"),
         "/src/nested should contain deep.ts"
     );
 
-    assert!(od.contains_key(&p("/")), "/ overlay directory should exist");
-    assert!(has("/", "/src"), "/ should contain /src");
+    let root_entries = b.get_accessible_entries("/");
+    assert!(
+        root_entries.directories.iter().any(|d| d == "src"),
+        "/ should contain /src"
+    );
 }
 
 // Go: snapshotfs_test.go:470 TestSnapshotFSBuilder/GetAccessibleEntries combines disk and overlay
@@ -523,7 +639,7 @@ fn builder_get_accessible_entries_combines_disk_and_overlay() {
     let b = builder(
         text_fs(&[("/src/disk.ts", "const disk = 1;")], false),
         overlays(&[("/src/overlay.ts", "const overlay = 1;")]),
-        DiskFiles::default(),
+        CacheFiles::default(),
         Dirs::default(),
         Aliases::default(),
     );
@@ -545,21 +661,24 @@ fn builder_get_accessible_entries_combines_disk_and_overlay() {
 // TestSnapshotFS
 // ---------------------------------------------------------------------------
 
-/// Go `&SnapshotFS{toPath, fs, overlays, overlayDirectories, diskFiles, diskDirectories}`.
+/// Go `&SnapshotFS{toPath, fs: newOverlayFS(testFS, overlays, UTF16, toPath), cacheFiles, cacheDirectories}`
+/// (ts#64291; with no overlays it is Go `newTestLayeredFileSystem(testFS, toPath)`).
 fn snapshot_fs(
     fs: Rc<dyn Fs>,
     overlays: Overlays,
-    overlay_directories: FxHashMap<Path, FxHashMap<Path, String>>,
-    disk_files: DiskFiles,
-    disk_directories: Dirs,
+    cache_files: CacheFiles,
+    cache_directories: Dirs,
 ) -> Rc<SnapshotFS> {
     Rc::new(SnapshotFS {
         to_path: to_path(),
-        fs,
-        overlays,
-        overlay_directories,
-        disk_files: Rc::new(disk_files),
-        disk_directories: Rc::new(disk_directories),
+        fs: new_overlay_fs(
+            fs,
+            overlays,
+            lsproto::PositionEncodingKind::UTF16,
+            to_path(),
+        ),
+        cache_files: Rc::new(cache_files),
+        cache_directories: Rc::new(cache_directories),
         read_files: RefCell::default(),
         node_modules_realpath_aliases: Rc::new(Aliases::default()),
     })
@@ -571,8 +690,7 @@ fn snapshot_fs_get_file_returns_overlay_file() {
     let s = snapshot_fs(
         text_fs(&[("/src/foo.ts", "disk content")], false),
         overlays(&[("/src/foo.ts", "overlay content")]),
-        FxHashMap::default(),
-        DiskFiles::default(),
+        CacheFiles::default(),
         Dirs::default(),
     );
     assert_eq!(file_content(s.get_file("/src/foo.ts")), "overlay content");
@@ -584,8 +702,7 @@ fn snapshot_fs_get_file_returns_disk_file_when_not_in_overlay() {
     let s = snapshot_fs(
         text_fs(&[("/src/foo.ts", "disk content")], false),
         Overlays::default(),
-        FxHashMap::default(),
-        disk_files(&[("/src/foo.ts", "disk content")]),
+        cache_files(&[("/src/foo.ts", "disk content")]),
         Dirs::default(),
     );
     assert_eq!(file_content(s.get_file("/src/foo.ts")), "disk content");
@@ -597,8 +714,7 @@ fn snapshot_fs_get_file_reads_from_fs_when_not_cached() {
     let s = snapshot_fs(
         text_fs(&[("/src/foo.ts", "fs content")], false),
         Overlays::default(),
-        FxHashMap::default(),
-        DiskFiles::default(),
+        CacheFiles::default(),
         Dirs::default(),
     );
     assert_eq!(file_content(s.get_file("/src/foo.ts")), "fs content");
@@ -610,8 +726,7 @@ fn snapshot_fs_get_file_returns_nil_for_non_existent_file() {
     let s = snapshot_fs(
         text_fs(&[], false),
         Overlays::default(),
-        FxHashMap::default(),
-        DiskFiles::default(),
+        CacheFiles::default(),
         Dirs::default(),
     );
     assert!(
@@ -620,19 +735,25 @@ fn snapshot_fs_get_file_returns_nil_for_non_existent_file() {
     );
 }
 
-// Go: snapshotfs_test.go:595 TestSnapshotFS/isOpenFile returns true for overlays
+// Go: snapshotfs_test.go:685 TestSnapshotFS/isOpenFile returns true for overlays
 #[test]
 fn snapshot_fs_is_open_file_returns_true_for_overlays() {
-    let s = snapshot_fs(
+    // ts#64291: the overlay file system answers it.
+    let overlay_fs = new_overlay_fs(
         text_fs(&[], false),
         overlays(&[("/src/foo.ts", "overlay content")]),
-        FxHashMap::default(),
-        DiskFiles::default(),
-        Dirs::default(),
+        lsproto::PositionEncodingKind::UTF16,
+        to_path(),
     );
-    assert!(s.is_open_file("/src/foo.ts"), "overlay file should be open");
     assert!(
-        !s.is_open_file("/src/bar.ts"),
+        overlay_fs
+            .get_file("/src/foo.ts")
+            .expect("overlay file")
+            .is_overlay(),
+        "overlay file should be open"
+    );
+    assert!(
+        overlay_fs.get_file("/src/bar.ts").is_none(),
         "non-overlay file should not be open"
     );
 }
@@ -643,8 +764,7 @@ fn snapshot_fs_get_file_by_path_uses_provided_path() {
     let s = snapshot_fs(
         text_fs(&[("/src/foo.ts", "disk content")], false),
         overlays(&[("/src/foo.ts", "overlay content")]),
-        FxHashMap::default(),
-        DiskFiles::default(),
+        CacheFiles::default(),
         Dirs::default(),
     );
     // GetFileByPath should use the provided path directly
@@ -654,25 +774,13 @@ fn snapshot_fs_get_file_by_path_uses_provided_path() {
     );
 }
 
-// Go: snapshotfs_test.go:645 TestSnapshotFS/GetAccessibleEntries combines disk and overlay directories
+// Go: snapshotfs_test.go:724 TestSnapshotFS/GetAccessibleEntries combines disk and overlay directories
 #[test]
 fn snapshot_fs_get_accessible_entries_combines_disk_and_overlay_directories() {
-    let mut overlay_directories: FxHashMap<Path, FxHashMap<Path, String>> = FxHashMap::default();
-    overlay_directories.insert(
-        p("/"),
-        [(p("/src"), "src".to_string())].into_iter().collect(),
-    );
-    overlay_directories.insert(
-        p("/src"),
-        [(p("/src/overlay.ts"), "overlay.ts".to_string())]
-            .into_iter()
-            .collect(),
-    );
     let s = snapshot_fs(
         text_fs(&[], false),
         overlays(&[("/src/overlay.ts", "overlay content")]),
-        overlay_directories,
-        disk_files(&[("/src/disk.ts", "disk content")]),
+        cache_files(&[("/src/disk.ts", "disk content")]),
         dirs(&[
             ("/", &[("/src", "src")]),
             ("/src", &[("/src/disk.ts", "disk.ts")]),
@@ -700,8 +808,7 @@ fn plain_snapshot(entries: &[(&str, &str)]) -> Rc<SnapshotFS> {
     snapshot_fs(
         text_fs(entries, false),
         Overlays::default(),
-        FxHashMap::default(),
-        DiskFiles::default(),
+        CacheFiles::default(),
         Dirs::default(),
     )
 }
@@ -925,13 +1032,13 @@ fn mylib_fs(extra: Vec<(&'static str, MapFile)>) -> Rc<dyn Fs> {
     any_fs(entries, false)
 }
 
-/// Go `newSnapshotFSBuilder(fs, {}, {}, prev.diskFiles, prev.diskDirectories, prev.nodeModulesRealpathAliases, ...)`.
+/// Go `newSnapshotFSBuilder(fs, {}, {}, prev.cacheFiles, prev.cacheDirectories, prev.nodeModulesRealpathAliases, ...)`.
 fn next_builder(fs: Rc<dyn Fs>, prev: &SnapshotFS) -> Rc<SnapshotFSBuilder> {
     builder(
         fs,
         Overlays::default(),
-        prev.disk_files.clone(),
-        prev.disk_directories.clone(),
+        prev.cache_files.clone(),
+        prev.cache_directories.clone(),
         prev.node_modules_realpath_aliases.clone(),
     )
 }
@@ -994,7 +1101,7 @@ fn alias_pruned_when_symlinked_file_is_deleted() {
     let builder2 = next_builder(test_fs, &snapshot1);
 
     // Simulate deletion of index.d.ts from the disk file cache.
-    delete_disk_file(&builder2, "/project/node_modules/mylib/index.d.ts");
+    delete_cache_file(&builder2, "/project/node_modules/mylib/index.d.ts");
 
     let (snapshot2, _) = builder2.finalize();
 
@@ -1074,7 +1181,7 @@ fn multiple_symlinks_pruned_individually() {
 
     // Build second snapshot – delete ONE of the symlink disk entries.
     let builder2 = next_builder(test_fs, &snapshot1);
-    delete_disk_file(&builder2, "/project/node_modules/alias/package.json");
+    delete_cache_file(&builder2, "/project/node_modules/alias/package.json");
     let (snapshot2, _) = builder2.finalize();
 
     // The realpath alias set should still exist, but only contain the surviving symlink.
@@ -1222,9 +1329,9 @@ fn mark_dirty_files_invalidates_symlinked_file_via_realpath_event() {
 
     // The file should have been reloaded with new content.
     let file = snapshot2
-        .disk_files
+        .cache_files
         .get(&p("/project/node_modules/mylib/package.json"))
-        .expect("file should still be in diskFiles");
+        .expect("file should still be in cacheFiles");
     assert_eq!(
         file.content(),
         r#"{"name": "mylib"}"#,
@@ -1360,7 +1467,8 @@ fn preserves_node_modules_directory_deletion_even_when_untracked() {
     let mut change = FileChangeSummary::default();
     change.deleted.insert(uri("file:///project/node_modules"));
 
-    let expanded = b.expand_and_filter_watch_events(change, &[], None);
+    let expanded =
+        b.expand_and_filter_watch_events(change, &[], None, &IndexMap::new(), &IndexMap::new());
     assert!(
         expanded
             .deleted
@@ -1382,7 +1490,8 @@ fn preserves_deletion_of_a_package_directory_inside_node_modules() {
         .deleted
         .insert(uri("file:///project/node_modules/@scope/pkg"));
 
-    let expanded = b.expand_and_filter_watch_events(change, &[], None);
+    let expanded =
+        b.expand_and_filter_watch_events(change, &[], None, &IndexMap::new(), &IndexMap::new());
     assert!(
         expanded
             .deleted
@@ -1402,7 +1511,8 @@ fn drops_irrelevant_untracked_deletion_outside_node_modules() {
     let mut change = FileChangeSummary::default();
     change.deleted.insert(uri("file:///project/build"));
 
-    let expanded = b.expand_and_filter_watch_events(change, &[], None);
+    let expanded =
+        b.expand_and_filter_watch_events(change, &[], None, &IndexMap::new(), &IndexMap::new());
     assert_eq!(
         expanded.deleted.len(),
         0,
@@ -1422,7 +1532,13 @@ fn preserves_exact_content_mapper_dependencies() {
     change.changed.insert(uri("file:///project/mapper.config"));
     change.deleted.insert(uri("file:///project/mapper.config"));
 
-    let expanded = b.expand_and_filter_watch_events(change, &[], Some(&watched));
+    let expanded = b.expand_and_filter_watch_events(
+        change,
+        &[],
+        Some(&watched),
+        &IndexMap::new(),
+        &IndexMap::new(),
+    );
     assert!(
         expanded
             .changed
@@ -1441,7 +1557,7 @@ fn expands_tracked_directory_deletion_into_file_deletions() {
     let b = builder(
         text_fs(&[("/src/foo.ts", "const foo = 1;")], false),
         Overlays::default(),
-        disk_files(&[("/src/foo.ts", "const foo = 1;")]),
+        cache_files(&[("/src/foo.ts", "const foo = 1;")]),
         dirs(&[
             ("/", &[("/src", "src")]),
             ("/src", &[("/src/foo.ts", "foo.ts")]),
@@ -1452,7 +1568,8 @@ fn expands_tracked_directory_deletion_into_file_deletions() {
     let mut change = FileChangeSummary::default();
     change.deleted.insert(uri("file:///src"));
 
-    let expanded = b.expand_and_filter_watch_events(change, &[], None);
+    let expanded =
+        b.expand_and_filter_watch_events(change, &[], None, &IndexMap::new(), &IndexMap::new());
     assert!(
         expanded.deleted.contains(&uri("file:///src/foo.ts")),
         "tracked directory deletion should expand to contained file deletions"

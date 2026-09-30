@@ -14,11 +14,15 @@ use std::cell::{Cell, OnceCell};
 use std::time::SystemTime;
 use xxhash_rust::xxh3::xxh3_128;
 
-// Go: project/snapshotfs.go:19 FileSource
-pub trait FileSource {
-    fn fs(&self) -> Rc<dyn vfs::Fs>;
+// Go: project/snapshotfs.go:21 FileHandleSource (ts#64291)
+pub trait FileHandleSource {
     fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>>;
     fn get_file_by_path(&self, file_name: &str, path: &tspath::Path) -> Option<Rc<dyn FileHandle>>;
+}
+
+// Go: project/snapshotfs.go:26 FileSource
+pub trait FileSource: FileHandleSource {
+    fn fs(&self) -> Rc<dyn vfs::Fs>;
     fn file_exists(&self, file_name: &str, path: &tspath::Path) -> bool;
     fn get_accessible_entries(&self, path: &str) -> vfs::Entries;
 
@@ -27,6 +31,110 @@ pub trait FileSource {
     // PORT: not in Go.
     fn use_case_sensitive_file_names(&self) -> bool {
         self.fs().use_case_sensitive_file_names()
+    }
+}
+
+// Go: project/snapshotfs.go:33 cachedLayeredFileSystem (ts#64291)
+// PORT: Go embeds `*cachedvfs.FS`; here it is the field `fs`, and the
+// `vfs.FS` methods forward to it.
+pub struct CachedLayeredFileSystem {
+    pub fs: Rc<vfs::CachedFs>,
+    pub layered: Rc<dyn LayeredFileSystem>,
+}
+
+// Go: project/snapshotfs.go:38 newCachedLayeredFileSystem
+pub fn new_cached_layered_file_system(
+    file_system: Rc<dyn LayeredFileSystem>,
+) -> Rc<dyn LayeredFileSystem> {
+    Rc::new(CachedLayeredFileSystem {
+        fs: vfs::cachedvfs_from(file_system.clone()),
+        layered: file_system,
+    })
+}
+
+impl FileHandleSource for CachedLayeredFileSystem {
+    // Go: project/snapshotfs.go:45 cachedLayeredFileSystem.GetFile
+    fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>> {
+        self.layered.get_file(file_name)
+    }
+
+    // Go: project/snapshotfs.go:49 cachedLayeredFileSystem.GetFileByPath
+    fn get_file_by_path(&self, file_name: &str, path: &tspath::Path) -> Option<Rc<dyn FileHandle>> {
+        self.layered.get_file_by_path(file_name, path)
+    }
+}
+
+impl LayeredFileSystem for CachedLayeredFileSystem {
+    // Go: project/snapshotfs.go:53 cachedLayeredFileSystem.Overlays
+    fn overlays(&self) -> Rc<IndexMap<tspath::Path, Rc<Overlay>>> {
+        self.layered.overlays()
+    }
+}
+
+impl FileChangeExpander for CachedLayeredFileSystem {
+    // Go: project/snapshotfs.go:57 cachedLayeredFileSystem.ExpandFileChanges
+    fn expand_file_changes(&self, change: FileChangeSummary) -> FileChangeSummary {
+        if let Some(expander) = as_file_change_expander(&*self.layered) {
+            return expander.expand_file_changes(change);
+        }
+        change
+    }
+}
+
+impl FsLayer for CachedLayeredFileSystem {
+    fn as_file_handle_source(&self) -> Option<&dyn FileHandleSource> {
+        Some(self)
+    }
+    fn as_layered_file_system(&self) -> Option<&dyn LayeredFileSystem> {
+        Some(self)
+    }
+    fn as_file_change_expander(&self) -> Option<&dyn FileChangeExpander> {
+        Some(self)
+    }
+}
+
+// PORT: the promoted `*cachedvfs.FS` methods.
+impl vfs::Fs for CachedLayeredFileSystem {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.fs.use_case_sensitive_file_names()
+    }
+    fn file_exists(&self, path: &str) -> bool {
+        self.fs.file_exists(path)
+    }
+    fn read_file(&self, path: &str) -> (String, bool) {
+        self.fs.read_file(path)
+    }
+    fn write_file(&self, path: &str, data: &str) -> Result<(), vfs::FsError> {
+        self.fs.write_file(path, data)
+    }
+    fn append_file(&self, path: &str, data: &str) -> Result<(), vfs::FsError> {
+        self.fs.append_file(path, data)
+    }
+    fn remove(&self, path: &str) -> Result<(), vfs::FsError> {
+        self.fs.remove(path)
+    }
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<SystemTime>,
+        m_time: Option<SystemTime>,
+    ) -> Result<(), vfs::FsError> {
+        self.fs.chtimes(path, a_time, m_time)
+    }
+    fn directory_exists(&self, path: &str) -> bool {
+        self.fs.directory_exists(path)
+    }
+    fn get_accessible_entries(&self, path: &str) -> vfs::Entries {
+        self.fs.get_accessible_entries(path)
+    }
+    fn stat(&self, path: &str) -> Option<vfs::FileInfo> {
+        self.fs.stat(path)
+    }
+    fn realpath(&self, path: &str) -> String {
+        self.fs.realpath(path)
+    }
+    fn as_fs_layer(&self) -> Option<&dyn FsLayer> {
+        Some(self)
     }
 }
 
@@ -62,49 +170,30 @@ impl dirty::Cloneable for Rc<RefCell<RealpathAliasSet>> {
     }
 }
 
-// Go: project/snapshotfs.go:55 SnapshotFS
-// PORT: Go shares `diskFiles`, `diskDirectories` and
+// Go: project/snapshotfs.go:92 SnapshotFS
+// PORT: Go shares `cacheFiles`, `cacheDirectories` and
 // `nodeModulesRealpathAliases` between snapshots until one of them changes
 // (a Go map is a reference). They are `Rc` maps here, so a snapshot clone
-// with no disk change copies no map, and dropping an old snapshot frees
+// with no cache change copies no map, and dropping an old snapshot frees
 // nothing that the next one still uses.
 pub struct SnapshotFS {
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
-    pub fs: Rc<dyn vfs::Fs>,
-    pub overlays: IndexMap<tspath::Path, Rc<Overlay>>,
-    pub overlay_directories: FxHashMap<tspath::Path, FxHashMap<tspath::Path, String>>,
-    pub disk_files: Rc<FxHashMap<tspath::Path, Rc<RefCell<DiskFile>>>>,
-    pub disk_directories: Rc<FxHashMap<tspath::Path, dirty::CloneableMap<tspath::Path, String>>>,
-    pub read_files: RefCell<FxHashMap<tspath::Path, MemoizedDiskFile>>,
+    pub fs: Rc<dyn LayeredFileSystem>,
+    pub cache_files: Rc<FxHashMap<tspath::Path, Rc<RefCell<CachedFile>>>>,
+    pub cache_directories: Rc<FxHashMap<tspath::Path, dirty::CloneableMap<tspath::Path, String>>>,
+    pub read_files: RefCell<FxHashMap<tspath::Path, MemoizedCachedFile>>,
     // nodeModulesRealpathAliases maps realpath-based keys to sets of symlink-based keys,
     // for files inside node_modules that are accessed through directory symlinks.
     // This allows watch events (which use realpaths) to invalidate files cached under symlink paths.
     pub node_modules_realpath_aliases: Rc<FxHashMap<tspath::Path, Rc<RefCell<RealpathAliasSet>>>>,
 }
 
-// Go: project/snapshotfs.go:69 memoizedDiskFile
+// Go: project/snapshotfs.go:104 memoizedCachedFile
 // PORT: Go `func() FileHandle` made by `sync.OnceValue`; the closure keeps
 // its value in a `OnceCell`.
-pub type MemoizedDiskFile = Rc<dyn Fn() -> Option<Rc<dyn FileHandle>>>;
+pub type MemoizedCachedFile = Rc<dyn Fn() -> Option<Rc<dyn FileHandle>>>;
 
 impl SnapshotFS {
-    // Go: project/snapshotfs.go:118 SnapshotFS.isOpenFile
-    pub fn is_open_file(&self, file_name: &str) -> bool {
-        let path = (self.to_path)(file_name);
-        self.overlays.contains_key(&path)
-    }
-
-    // Go: project/snapshotfs.go:124 SnapshotFS.isFile
-    pub fn is_file(&self, path: &tspath::Path) -> bool {
-        if self.disk_files.contains_key(path) {
-            return true;
-        }
-        if self.overlays.contains_key(path) {
-            return true;
-        }
-        false
-    }
-
     // Go: project/snapshotfs.go:489 SnapshotFS.expandRealpathAliases
     // expandRealpathAliases adds synthetic URIs to the Changed and Deleted sets for
     // files that were accessed through node_modules symlinks. When a watch event arrives
@@ -145,38 +234,25 @@ impl SnapshotFS {
     }
 }
 
-// Go: project/snapshotfs.go:29 `_ FileSource = (*SnapshotFS)(nil)`
-impl FileSource for SnapshotFS {
-    // Go: project/snapshotfs.go:71 SnapshotFS.FS
-    fn fs(&self) -> Rc<dyn vfs::Fs> {
-        self.fs.clone()
-    }
-
-    // Go: project/snapshotfs.go:75 SnapshotFS.GetFile
+// Go: project/snapshotfs.go:66 `_ FileSource = (*SnapshotFS)(nil)`
+impl FileHandleSource for SnapshotFS {
+    // Go: project/snapshotfs.go:110 SnapshotFS.GetFile
     fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>> {
         self.get_file_by_path(file_name, &(self.to_path)(file_name))
     }
 
-    // Go: project/snapshotfs.go:89 SnapshotFS.GetFileByPath
+    // Go: project/snapshotfs.go:121 SnapshotFS.GetFileByPath
     fn get_file_by_path(&self, file_name: &str, path: &tspath::Path) -> Option<Rc<dyn FileHandle>> {
-        if let Some(file) = self.overlays.get(path) {
-            return Some(file.clone());
-        }
-        if let Some(file) = self.disk_files.get(path) {
+        if let Some(file) = self.cache_files.get(path) {
             return Some(file.clone());
         }
         let fs = self.fs.clone();
         let file_name = file_name.to_string();
+        let file_path = path.clone();
         let value: OnceCell<Option<Rc<dyn FileHandle>>> = OnceCell::new();
-        let new_entry: MemoizedDiskFile = Rc::new(move || {
+        let new_entry: MemoizedCachedFile = Rc::new(move || {
             value
-                .get_or_init(|| -> Option<Rc<dyn FileHandle>> {
-                    let (contents, ok) = fs.read_file(&file_name);
-                    if ok {
-                        return Some(new_disk_file(&file_name, contents));
-                    }
-                    None
-                })
+                .get_or_init(|| fs.get_file_by_path(&file_name, &file_path))
                 .clone()
         });
         // Go: s.readFiles.LoadOrStore(path, newEntry)
@@ -188,115 +264,125 @@ impl FileSource for SnapshotFS {
             .clone();
         entry()
     }
+}
 
-    // Go: project/snapshotfs.go:79 SnapshotFS.FileExists
+impl FileSource for SnapshotFS {
+    // Go: project/snapshotfs.go:106 SnapshotFS.FS
+    fn fs(&self) -> Rc<dyn vfs::Fs> {
+        self.fs.clone()
+    }
+
+    // Go: project/snapshotfs.go:114 SnapshotFS.FileExists
     fn file_exists(&self, file_name: &str, path: &tspath::Path) -> bool {
-        if self.overlays.contains_key(path) {
-            return true;
-        }
-        if self.disk_files.contains_key(path) {
+        if self.cache_files.contains_key(path) {
             return true;
         }
         self.fs.file_exists(file_name)
     }
 
-    // Go: project/snapshotfs.go:106 SnapshotFS.GetAccessibleEntries
+    // Go: project/snapshotfs.go:132 SnapshotFS.GetAccessibleEntries
     fn get_accessible_entries(&self, directory_name: &str) -> vfs::Entries {
-        let mut entries = vfs::Entries::default();
-        let path = (self.to_path)(directory_name);
-        if let Some(disk_directories) = self.disk_directories.get(&path) {
-            read_directory_into_entries(
-                &disk_directories.borrow(),
-                &|p: &tspath::Path| self.is_file(p),
-                &mut entries,
-            );
-        }
-        if let Some(overlay_directories) = self.overlay_directories.get(&path) {
-            read_directory_into_entries(
-                overlay_directories,
-                &|p: &tspath::Path| self.is_file(p),
-                &mut entries,
-            );
-        }
-        entries
+        let lower_entries = self.fs.get_accessible_entries(directory_name);
+        let Some(directory) = self.cache_directories.get(&(self.to_path)(directory_name)) else {
+            return lower_entries;
+        };
+        merge_cached_directory_entries(
+            lower_entries,
+            &directory.borrow(),
+            &|path: &tspath::Path| {
+                let cached = self.cache_files.contains_key(path);
+                cached || self.fs.file_exists(path.as_str())
+            },
+            self.fs.use_case_sensitive_file_names(),
+        )
     }
 }
 
-// Go: project/snapshotfs.go:134 snapshotFSBuilder
+// Go: project/snapshotfs.go:143 mergeCachedDirectoryEntries (ts#64291)
+// PORT: Go ranges over the cached entries map (random order); FxHashMap
+// order here.
+pub fn merge_cached_directory_entries(
+    directory_entries: vfs::Entries,
+    cached_entries: &FxHashMap<tspath::Path, String>,
+    is_cached_file: &dyn Fn(&tspath::Path) -> bool,
+    use_case_sensitive_file_names: bool,
+) -> vfs::Entries {
+    let mut entries = vfs::Entries {
+        symlinks: directory_entries.symlinks.clone(),
+        ..Default::default()
+    };
+    let equal_name = |left: &str, right: &str| -> bool {
+        tspath::get_canonical_file_name(left, use_case_sensitive_file_names)
+            == tspath::get_canonical_file_name(right, use_case_sensitive_file_names)
+    };
+    let has_name = |names: &[String], name: &str| -> bool {
+        names.iter().any(|candidate| equal_name(candidate, name))
+    };
+    for (child_path, child_name) in cached_entries {
+        if let Some(symlinks) = &mut entries.symlinks {
+            symlinks.retain(|name| !equal_name(name, child_name));
+        }
+        if is_cached_file(child_path) {
+            entries.files.push(child_name.clone());
+        } else {
+            entries.directories.push(child_name.clone());
+        }
+    }
+    for file_name in &directory_entries.files {
+        if !has_name(&entries.files, file_name) && !has_name(&entries.directories, file_name) {
+            entries.files.push(file_name.clone());
+        }
+    }
+    for directory_name in &directory_entries.directories {
+        if !has_name(&entries.files, directory_name)
+            && !has_name(&entries.directories, directory_name)
+        {
+            entries.directories.push(directory_name.clone());
+        }
+    }
+    entries
+}
+
+// Go: project/snapshotfs.go:177 snapshotFSBuilder
 pub struct SnapshotFSBuilder {
-    pub fs: Rc<dyn vfs::Fs>,
-    pub prev_overlays: IndexMap<tspath::Path, Rc<Overlay>>,
-    pub overlays: IndexMap<tspath::Path, Rc<Overlay>>,
-    pub overlay_directories: FxHashMap<tspath::Path, FxHashMap<tspath::Path, String>>,
-    pub disk_files: Rc<dirty::SyncMap<tspath::Path, Rc<RefCell<DiskFile>>>>,
-    pub disk_directories: Rc<dirty::Map<tspath::Path, dirty::CloneableMap<tspath::Path, String>>>,
+    pub fs: Rc<dyn LayeredFileSystem>,
+    pub cache_files: Rc<dirty::SyncMap<tspath::Path, Rc<RefCell<CachedFile>>>>,
+    pub cache_directories: Rc<dirty::Map<tspath::Path, dirty::CloneableMap<tspath::Path, String>>>,
+    pub source_backed_replacements: RefCell<FxHashSet<tspath::Path>>,
     pub node_modules_realpath_aliases:
         Rc<dirty::SyncMap<tspath::Path, Rc<RefCell<RealpathAliasSet>>>>,
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
-    pub accessible_entries: RefCell<FxHashMap<tspath::Path, vfs::Entries>>,
 }
 
-// Go: project/snapshotfs.go:145 newSnapshotFSBuilder
+// Go: project/snapshotfs.go:186 newSnapshotFSBuilderFromSource (ts#64291)
 // PORT: the base maps are shared `Rc` maps, as Go shares its maps (no
-// copy). `position_encoding` is unused, as in Go.
-#[allow(clippy::too_many_arguments)]
-pub fn new_snapshot_fs_builder(
-    fs: Rc<dyn vfs::Fs>,
-    prev_overlays: IndexMap<tspath::Path, Rc<Overlay>>,
-    overlays: IndexMap<tspath::Path, Rc<Overlay>>,
-    disk_files: Rc<FxHashMap<tspath::Path, Rc<RefCell<DiskFile>>>>,
-    disk_directories: Rc<FxHashMap<tspath::Path, dirty::CloneableMap<tspath::Path, String>>>,
+// copy).
+pub fn new_snapshot_fs_builder_from_source(
+    fs: Rc<dyn LayeredFileSystem>,
+    cache_files: Rc<FxHashMap<tspath::Path, Rc<RefCell<CachedFile>>>>,
+    cache_directories: Rc<FxHashMap<tspath::Path, dirty::CloneableMap<tspath::Path, String>>>,
     node_modules_realpath_aliases: Rc<FxHashMap<tspath::Path, Rc<RefCell<RealpathAliasSet>>>>,
-    _position_encoding: lsproto::PositionEncodingKind,
     to_path: Rc<dyn Fn(&str) -> tspath::Path>,
 ) -> Rc<SnapshotFSBuilder> {
-    let cached_fs = vfs::cachedvfs_from(fs);
-    cached_fs.enable();
-
-    let mut overlay_directories: FxHashMap<tspath::Path, FxHashMap<tspath::Path, String>> =
-        FxHashMap::default();
-    for (path, overlay) in &overlays {
-        let mut child_path = path.clone();
-        let mut child = overlay.file_base.file_name.clone();
-        loop {
-            let parent_path = child_path.get_directory_path();
-            let parent = tspath::get_directory_path(&child);
-            if child_path == parent_path {
-                break; // reached root
-            }
-            let base_name = tspath::get_base_file_name(&child);
-            if let Some(dir) = overlay_directories.get_mut(&parent_path) {
-                dir.insert(child_path.clone(), base_name);
-            } else {
-                let mut dir: FxHashMap<tspath::Path, String> = FxHashMap::default();
-                dir.insert(child_path.clone(), base_name);
-                overlay_directories.insert(parent_path.clone(), dir);
-            }
-            child_path = parent_path;
-            child = parent;
-        }
-    }
+    let fs = new_cached_layered_file_system(fs);
 
     Rc::new(SnapshotFSBuilder {
-        fs: cached_fs,
-        prev_overlays,
-        overlays,
-        overlay_directories,
-        disk_files: dirty::new_sync_map_shared(disk_files),
-        disk_directories: dirty::new_map_shared(disk_directories),
+        fs,
+        cache_files: dirty::new_sync_map_shared(cache_files),
+        cache_directories: dirty::new_map_shared(cache_directories),
+        source_backed_replacements: RefCell::new(FxHashSet::default()),
         node_modules_realpath_aliases: dirty::new_sync_map_shared(node_modules_realpath_aliases),
         to_path,
-        accessible_entries: RefCell::default(),
     })
 }
 
 // Go: project/snapshotfs.go:227 onDeletedFileOrDirectory (a closure in Finalize)
 // PORT: the recursive Go closure is a nested function over the map it reads.
 fn on_deleted_file_or_directory(
-    disk_directories: &dirty::Map<tspath::Path, dirty::CloneableMap<tspath::Path, String>>,
+    cache_directories: &dirty::Map<tspath::Path, dirty::CloneableMap<tspath::Path, String>>,
     path: &tspath::Path,
 ) {
-    let (dir_entry, ok) = disk_directories.get(&path.get_directory_path());
+    let (dir_entry, ok) = cache_directories.get(&path.get_directory_path());
     if !ok {
         return;
     }
@@ -306,7 +392,7 @@ fn on_deleted_file_or_directory(
         dir.borrow_mut().remove(path);
         if dir.borrow().is_empty() {
             entry.delete();
-            on_deleted_file_or_directory(disk_directories, &entry.key());
+            on_deleted_file_or_directory(cache_directories, &entry.key());
         }
     });
 }
@@ -314,8 +400,8 @@ fn on_deleted_file_or_directory(
 impl SnapshotFSBuilder {
     // Go: project/snapshotfs.go:197 snapshotFSBuilder.Finalize
     pub fn finalize(&self) -> (Rc<SnapshotFS>, bool) {
-        // Synchronize directory structure based on added and deleted files (including overlays)
-        let mut deleted: Option<FxHashMap<tspath::Path, Option<Rc<RefCell<DiskFile>>>>> = None;
+        // Synchronize directory structure based on added and deleted cache entries.
+        let mut deleted: Option<FxHashMap<tspath::Path, Option<Rc<RefCell<CachedFile>>>>> = None;
 
         let on_added_file = |path: &tspath::Path, file_name: &str| {
             let mut child_path = path.clone();
@@ -327,7 +413,7 @@ impl SnapshotFSBuilder {
                     break; // reached root
                 }
                 let base_name = tspath::get_base_file_name(&child);
-                if let (Some(dir_entry), true) = self.disk_directories.get(&parent_path) {
+                if let (Some(dir_entry), true) = self.cache_directories.get(&parent_path) {
                     dir_entry.change(&mut |dir: &dirty::CloneableMap<tspath::Path, String>| {
                         dir.borrow_mut()
                             .insert(child_path.clone(), base_name.clone());
@@ -337,19 +423,24 @@ impl SnapshotFSBuilder {
                     let dir: dirty::CloneableMap<tspath::Path, String> =
                         dirty::CloneableMap::default();
                     dir.borrow_mut().insert(child_path.clone(), base_name);
-                    self.disk_directories.add(parent_path.clone(), dir);
+                    self.cache_directories.add(parent_path.clone(), dir);
                 }
                 child_path = parent_path;
                 child = parent;
             }
         };
 
-        let mut on_delete = |key: &tspath::Path, value: Option<&Rc<RefCell<DiskFile>>>| {
+        let source_backed_replacements = self.source_backed_replacements.borrow().clone();
+        let mut on_delete = |key: &tspath::Path, value: Option<&Rc<RefCell<CachedFile>>>| {
+            // ts#64291
+            if source_backed_replacements.contains(key) {
+                return;
+            }
             deleted
                 .get_or_insert_with(FxHashMap::default)
                 .insert(key.clone(), value.cloned());
         };
-        let mut on_add = |key: &tspath::Path, value: Option<&Rc<RefCell<DiskFile>>>| {
+        let mut on_add = |key: &tspath::Path, value: Option<&Rc<RefCell<CachedFile>>>| {
             let file_name = value
                 .expect("invalid memory address or nil pointer dereference")
                 .borrow()
@@ -357,8 +448,8 @@ impl SnapshotFSBuilder {
                 .file_name();
             on_added_file(key, &file_name);
         };
-        // Go: s.diskFiles.FinalizeWith(...) (PORT: the shared form)
-        let (disk_files, changed) = self.disk_files.finalize_shared(dirty::FinalizationHooks {
+        // Go: s.cacheFiles.FinalizeWith(...) (PORT: the shared form)
+        let (cache_files, changed) = self.cache_files.finalize_shared(dirty::FinalizationHooks {
             on_delete: Some(&mut on_delete),
             on_change: None,
             on_add: Some(&mut on_add),
@@ -367,7 +458,7 @@ impl SnapshotFSBuilder {
         // PORT: Go ranges over the `deleted` map (random order); the result
         // does not depend on the order.
         for path in deleted.iter().flat_map(|d| d.keys()) {
-            on_deleted_file_or_directory(&self.disk_directories, path);
+            on_deleted_file_or_directory(&self.cache_directories, path);
         }
 
         // Prune deleted symlink paths from realpath alias sets before finalizing,
@@ -408,11 +499,9 @@ impl SnapshotFSBuilder {
         (
             Rc::new(SnapshotFS {
                 fs: self.fs.clone(),
-                overlays: self.overlays.clone(),
-                overlay_directories: self.overlay_directories.clone(),
-                disk_files,
-                // Go: core.FirstResult(s.diskDirectories.Finalize())
-                disk_directories: self.disk_directories.finalize_shared().0,
+                cache_files,
+                // Go: core.FirstResult(s.cacheDirectories.Finalize())
+                cache_directories: self.cache_directories.finalize_shared().0,
                 read_files: RefCell::new(FxHashMap::default()),
                 node_modules_realpath_aliases,
                 to_path: self.to_path.clone(),
@@ -421,27 +510,54 @@ impl SnapshotFSBuilder {
         )
     }
 
-    // Go: project/snapshotfs.go:288 snapshotFSBuilder.isOpenFile
-    pub fn is_open_file(&self, path: &tspath::Path) -> bool {
-        self.overlays.contains_key(path)
+    // Go: project/snapshotfs.go:306 snapshotFSBuilder.deleteCacheEntry (ts#64291)
+    pub fn delete_cache_entry(
+        &self,
+        entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>>,
+    ) {
+        if let Some(file) = entry.value()
+            && self.fs.file_exists(&file.borrow().file_base.file_name)
+        {
+            self.source_backed_replacements
+                .borrow_mut()
+                .insert(entry.key());
+        }
+        entry.delete();
     }
 
-    // Go: project/snapshotfs.go:332 snapshotFSBuilder.getDiskFile
-    pub fn get_disk_file(
+    // Go: project/snapshotfs.go:345 snapshotFSBuilder.cacheSourceFile (ts#64291)
+    pub fn cache_source_file(
+        &self,
+        file_name: &str,
+        path: &tspath::Path,
+        source: &Rc<dyn FileHandle>,
+    ) -> Option<Rc<dyn FileHandle>> {
+        let file = new_cached_file(file_name, source.content());
+        file.borrow().file_base.hash.set(source.hash());
+        let (entry, loaded) = self.cache_files.load_or_store(path.clone(), file);
+        let entry = entry?;
+        if !loaded && path.0.contains("/node_modules/") {
+            self.record_realpath_alias(&entry, file_name, path);
+        }
+        self.reload_entry_if_needed(&entry)
+    }
+
+    // Go: project/snapshotfs.go:359 snapshotFSBuilder.getCachedFile (ts#64291: was getDiskFile)
+    pub fn get_cached_file(
         &self,
         file_name: &str,
         path: &tspath::Path,
         force_reload: bool,
     ) -> Option<Rc<dyn FileHandle>> {
-        let (entry, loaded) = self.disk_files.load_or_store(
+        let (entry, loaded) = self.cache_files.load_or_store(
             path.clone(),
-            Rc::new(RefCell::new(DiskFile {
+            Rc::new(RefCell::new(CachedFile {
                 file_base: FileBase {
                     file_name: file_name.to_string(),
                     ..FileBase::default()
                 },
                 needs_reload: true,
-                ..DiskFile::default()
+                ..CachedFile::default()
             })),
         );
         if let Some(entry) = entry {
@@ -462,14 +578,14 @@ impl SnapshotFSBuilder {
     // This is only called for files inside node_modules where symlinks are common.
     pub fn record_realpath_alias(
         &self,
-        disk_file_entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<DiskFile>>>>,
+        cached_file_entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>>,
         symlink_file_name: &str,
         symlink_path: &tspath::Path,
     ) {
         let realpath = self.fs.realpath(symlink_file_name);
         let realpath_path = (self.to_path)(&realpath);
         if realpath_path != *symlink_path {
-            disk_file_entry.change(&mut |file: &Rc<RefCell<DiskFile>>| {
+            cached_file_entry.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                 file.borrow_mut().realpath_path = realpath_path.clone();
             });
             let (entry, _) = self.node_modules_realpath_aliases.load_or_store(
@@ -487,10 +603,10 @@ impl SnapshotFSBuilder {
     // Go: project/snapshotfs.go:363 snapshotFSBuilder.reloadEntry
     pub fn reload_entry(
         &self,
-        entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<DiskFile>>>>,
+        entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>>,
     ) -> Option<Rc<dyn FileHandle>> {
         let mut file_name = String::new();
-        entry.locked(&mut |e: &dyn dirty::Value<Rc<RefCell<DiskFile>>>| {
+        entry.locked(&mut |e: &dyn dirty::Value<Rc<RefCell<CachedFile>>>| {
             if let Some(value) = e.value() {
                 file_name = value.borrow().file_base.file_name.clone();
             }
@@ -500,12 +616,12 @@ impl SnapshotFSBuilder {
         }
         // Read file outside the lock to avoid blocking other goroutines.
         let (content, ok) = self.fs.read_file(&file_name);
-        entry.locked(&mut |e: &dyn dirty::Value<Rc<RefCell<DiskFile>>>| {
+        entry.locked(&mut |e: &dyn dirty::Value<Rc<RefCell<CachedFile>>>| {
             if e.value().is_none() {
                 return;
             }
             if ok {
-                e.change(&mut |file: &Rc<RefCell<DiskFile>>| {
+                e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                     let mut file = file.borrow_mut();
                     file.file_base.content = content.clone();
                     file.file_base.hash.set(xxh3_128(content.as_bytes()));
@@ -522,10 +638,10 @@ impl SnapshotFSBuilder {
     // Go: project/snapshotfs.go:395 snapshotFSBuilder.reloadEntryIfNeeded
     pub fn reload_entry_if_needed(
         &self,
-        entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<DiskFile>>>>,
+        entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>>,
     ) -> Option<Rc<dyn FileHandle>> {
         let mut file_name = String::new();
-        entry.locked(&mut |e: &dyn dirty::Value<Rc<RefCell<DiskFile>>>| {
+        entry.locked(&mut |e: &dyn dirty::Value<Rc<RefCell<CachedFile>>>| {
             if let Some(value) = e.value() {
                 let value = value.borrow();
                 if !value.matches_disk_text() {
@@ -536,14 +652,14 @@ impl SnapshotFSBuilder {
         if !file_name.is_empty() {
             // Read file outside the lock to avoid blocking other goroutines.
             let (content, ok) = self.fs.read_file(&file_name);
-            entry.locked(&mut |e: &dyn dirty::Value<Rc<RefCell<DiskFile>>>| {
+            entry.locked(&mut |e: &dyn dirty::Value<Rc<RefCell<CachedFile>>>| {
                 match e.value() {
                     None => return, // another goroutine already reloaded it
                     Some(value) if value.borrow().matches_disk_text() => return,
                     Some(_) => {}
                 }
                 if ok {
-                    e.change(&mut |file: &Rc<RefCell<DiskFile>>| {
+                    e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                         let mut file = file.borrow_mut();
                         file.file_base.content = content.clone();
                         file.file_base.hash.set(xxh3_128(content.as_bytes()));
@@ -558,12 +674,20 @@ impl SnapshotFSBuilder {
         Some(value)
     }
 
-    // Go: project/snapshotfs.go:426 snapshotFSBuilder.watchChangesOverlapCache
+    // Go: project/snapshotfs.go:455 snapshotFSBuilder.watchChangesOverlapCache
     // PORT: Go passes the summary by value; here by reference.
-    pub fn watch_changes_overlap_cache(&self, change: &FileChangeSummary) -> bool {
+    pub fn watch_changes_overlap_cache(
+        &self,
+        change: &FileChangeSummary,
+        previous_open_files: &IndexMap<tspath::Path, Rc<dyn FileHandle>>,
+        open_files: &IndexMap<tspath::Path, Rc<dyn FileHandle>>,
+    ) -> bool {
         for uri in &change.changed {
             let path = (self.to_path)(&uri.file_name());
-            if let (_, true) = self.disk_files.load(&path) {
+            if previous_open_files.contains_key(&path) || open_files.contains_key(&path) {
+                return true;
+            }
+            if let (_, true) = self.cache_files.load(&path) {
                 return true;
             }
             if let (_, true) = self.node_modules_realpath_aliases.load(&path) {
@@ -572,7 +696,10 @@ impl SnapshotFSBuilder {
         }
         for uri in &change.deleted {
             let path = (self.to_path)(&uri.file_name());
-            if let (_, true) = self.disk_files.load(&path) {
+            if previous_open_files.contains_key(&path) || open_files.contains_key(&path) {
+                return true;
+            }
+            if let (_, true) = self.cache_files.load(&path) {
                 return true;
             }
             if let (_, true) = self.node_modules_realpath_aliases.load(&path) {
@@ -584,10 +711,10 @@ impl SnapshotFSBuilder {
 
     // Go: project/snapshotfs.go:448 snapshotFSBuilder.invalidateCache
     pub fn invalidate_cache(&self) {
-        self.disk_files.range(&mut |entry: &Rc<
-            dirty::SyncMapEntry<tspath::Path, Rc<RefCell<DiskFile>>>,
+        self.cache_files.range(&mut |entry: &Rc<
+            dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>,
         >| {
-            entry.change(&mut |file: &Rc<RefCell<DiskFile>>| {
+            entry.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                 file.borrow_mut().needs_reload = true;
             });
             true
@@ -596,11 +723,11 @@ impl SnapshotFSBuilder {
 
     // Go: project/snapshotfs.go:457 snapshotFSBuilder.invalidateNodeModulesCache
     pub fn invalidate_node_modules_cache(&self) {
-        self.disk_files.range(&mut |entry: &Rc<
-            dirty::SyncMapEntry<tspath::Path, Rc<RefCell<DiskFile>>>,
+        self.cache_files.range(&mut |entry: &Rc<
+            dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>,
         >| {
             if entry.key().0.contains("/node_modules/") {
-                entry.change(&mut |file: &Rc<RefCell<DiskFile>>| {
+                entry.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                     file.borrow_mut().needs_reload = true;
                 });
             }
@@ -617,11 +744,13 @@ impl SnapshotFSBuilder {
             let mut filtered_changed: FxHashSet<lsproto::DocumentUri> = FxHashSet::default();
             for uri in &change.changed {
                 let path = (self.to_path)(&uri.file_name());
-                if self.overlays.contains_key(&path) {
+                if let Some(file) = self.fs.get_file_by_path(&uri.file_name(), &path)
+                    && file.is_overlay()
+                {
                     filtered_changed.insert(uri.clone());
                     continue;
                 }
-                let (Some(entry), true) = self.disk_files.load(&path) else {
+                let (Some(entry), true) = self.cache_files.load(&path) else {
                     filtered_changed.insert(uri.clone());
                     continue;
                 };
@@ -633,8 +762,8 @@ impl SnapshotFSBuilder {
         }
         for uri in &change.deleted {
             let path = (self.to_path)(&uri.file_name());
-            if let (Some(entry), true) = self.disk_files.load(&path) {
-                entry.delete();
+            if let (Some(entry), true) = self.cache_files.load(&path) {
+                self.delete_cache_entry(&entry);
             }
         }
         change
@@ -644,7 +773,7 @@ impl SnapshotFSBuilder {
     // PORT: Go named result `(changed bool)`.
     pub fn reload_entry_if_content_changed(
         &self,
-        entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<DiskFile>>>>,
+        entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>>,
     ) -> bool {
         let Some(file) = entry.value() else {
             return true;
@@ -652,7 +781,7 @@ impl SnapshotFSBuilder {
         let file_name = file.borrow().file_base.file_name.clone();
         let (content, ok) = self.fs.read_file(&file_name);
         let mut changed = true;
-        entry.locked(&mut |e: &dyn dirty::Value<Rc<RefCell<DiskFile>>>| {
+        entry.locked(&mut |e: &dyn dirty::Value<Rc<RefCell<CachedFile>>>| {
             let Some(cur) = e.value() else {
                 return;
             };
@@ -663,13 +792,13 @@ impl SnapshotFSBuilder {
             if content == cur.borrow().file_base.content {
                 changed = false;
                 if !cur.borrow().matches_disk_text() {
-                    e.change(&mut |file: &Rc<RefCell<DiskFile>>| {
+                    e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                         file.borrow_mut().needs_reload = false;
                     });
                 }
                 return;
             }
-            e.change(&mut |file: &Rc<RefCell<DiskFile>>| {
+            e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                 let mut file = file.borrow_mut();
                 file.file_base.content = content.clone();
                 file.file_base.hash.set(xxh3_128(content.as_bytes()));
@@ -679,10 +808,10 @@ impl SnapshotFSBuilder {
         changed
     }
 
-    // Go: project/snapshotfs.go:592 snapshotFSBuilder.isRelevantFileName
+    // Go: project/snapshotfs.go:615 snapshotFSBuilder.isRelevantFileName
     // isRelevantFileName returns true if the given URI refers to a file that
     // could affect the project: it has a TypeScript-relevant or configured content-mapper extension,
-    // is a dynamic (e.g. untitled) file, or is currently open as an overlay.
+    // is dynamic (e.g. untitled), or is present in the supplied open-file state.
     // PORT: tsgo#4712 adds the content mapper arguments. Go nil
     // `*collections.Set` is `None`.
     pub fn is_relevant_file_name(
@@ -690,6 +819,7 @@ impl SnapshotFSBuilder {
         uri: &lsproto::DocumentUri,
         content_mapper_extensions: &[String],
         content_mapper_watched_files: Option<&FxHashSet<tspath::Path>>,
+        open_files: &IndexMap<tspath::Path, Rc<dyn FileHandle>>,
     ) -> bool {
         let file_name = uri.file_name();
         if let Some(content_mapper_watched_files) = content_mapper_watched_files
@@ -708,7 +838,7 @@ impl SnapshotFSBuilder {
             return true;
         }
         let path = (self.to_path)(&file_name);
-        if self.overlays.contains_key(&path) {
+        if open_files.contains_key(&path) {
             return true;
         }
         let Some(i) = path.0.rfind('.') else {
@@ -717,7 +847,7 @@ impl SnapshotFSBuilder {
         is_relevant_extension(&path.0[i..])
     }
 
-    // Go: project/snapshotfs.go:550 snapshotFSBuilder.expandAndFilterWatchEvents
+    // Go: project/snapshotfs.go:651 snapshotFSBuilder.expandAndFilterWatchEvents
     // expandAndFilterWatchEvents expands directory deletion URIs into individual
     // file deletion URIs using the cached directory structure, and filters out
     // watch events for paths that are neither known directories nor have relevant
@@ -727,21 +857,30 @@ impl SnapshotFSBuilder {
         mut change: FileChangeSummary,
         content_mapper_extensions: &[String],
         content_mapper_watched_files: Option<&FxHashSet<tspath::Path>>,
+        previous_open_files: &IndexMap<tspath::Path, Rc<dyn FileHandle>>,
+        open_files: &IndexMap<tspath::Path, Rc<dyn FileHandle>>,
     ) -> FileChangeSummary {
         if !change.deleted.is_empty() {
             let mut filtered_deleted: FxHashSet<lsproto::DocumentUri> = FxHashSet::default();
             for uri in &change.deleted {
                 let path = (self.to_path)(&uri.file_name());
-                if let (_, true) = self.disk_directories.get(&path) {
-                    self.collect_files_recursive(&path, &mut filtered_deleted);
+                let (_, ok) = self.cache_directories.get(&path);
+                if ok || has_open_file_within(&path, previous_open_files, open_files) {
+                    self.collect_files_recursive(
+                        &path,
+                        &mut filtered_deleted,
+                        previous_open_files,
+                        open_files,
+                    );
                 } else if self.is_relevant_file_name(
                     uri,
                     content_mapper_extensions,
                     content_mapper_watched_files,
+                    open_files,
                 ) || is_node_modules_path(&path)
                 {
                     // node_modules deletions must always be preserved for auto-import registry change handlers.
-                    // They won't be in diskDirectories since the registry doesn't use the snapshotFSBuilder for
+                    // They won't be in cacheDirectories since the registry doesn't use the snapshotFSBuilder for
                     // its file system, since we don't want to retain files read there.
                     filtered_deleted.insert(uri.clone());
                 }
@@ -756,6 +895,7 @@ impl SnapshotFSBuilder {
                     uri,
                     content_mapper_extensions,
                     content_mapper_watched_files,
+                    open_files,
                 ) {
                     filtered_changed.insert(uri.clone());
                 }
@@ -770,15 +910,27 @@ impl SnapshotFSBuilder {
         change
     }
 
-    // Go: project/snapshotfs.go:594 snapshotFSBuilder.collectFilesRecursive
+    // Go: project/snapshotfs.go:709 snapshotFSBuilder.collectFilesRecursive
     // collectFilesRecursive recursively collects all cached file URIs under the
-    // given directory path using the diskDirectories and diskFiles maps.
+    // given directory path using the cacheDirectories and cacheFiles maps.
     pub fn collect_files_recursive(
         &self,
         dir_path: &tspath::Path,
         files: &mut FxHashSet<lsproto::DocumentUri>,
+        previous_open_files: &IndexMap<tspath::Path, Rc<dyn FileHandle>>,
+        open_files: &IndexMap<tspath::Path, Rc<dyn FileHandle>>,
     ) {
-        let (dir_entry, ok) = self.disk_directories.get(dir_path);
+        for (path, file) in open_files {
+            if dir_path.contains_path(path) {
+                files.insert(lsconv::file_name_to_document_uri(&file.file_name()));
+            }
+        }
+        for (path, file) in previous_open_files {
+            if dir_path.contains_path(path) {
+                files.insert(lsconv::file_name_to_document_uri(&file.file_name()));
+            }
+        }
+        let (dir_entry, ok) = self.cache_directories.get(dir_path);
         if !ok {
             return;
         }
@@ -790,39 +942,42 @@ impl SnapshotFSBuilder {
             None => Vec::new(),
         };
         for child_path in &child_paths {
-            if let (Some(entry), true) = self.disk_files.load(child_path) {
+            if let (Some(entry), true) = self.cache_files.load(child_path) {
                 if let Some(file) = entry.value() {
                     files.insert(lsconv::file_name_to_document_uri(
                         &file.borrow().file_base.file_name(),
                     ));
                 }
             }
-            self.collect_files_recursive(child_path, files);
+            self.collect_files_recursive(child_path, files, previous_open_files, open_files);
         }
     }
 
-    // Go: project/snapshotfs.go:609 snapshotFSBuilder.convertOpenAndCloseToChanges
+    // Go: project/snapshotfs.go:735 snapshotFSBuilder.convertOpenAndCloseToChanges
     pub fn convert_open_and_close_to_changes(
         &self,
         mut change: FileChangeSummary,
+        previous_open_files: &IndexMap<tspath::Path, Rc<dyn FileHandle>>,
+        open_files: &IndexMap<tspath::Path, Rc<dyn FileHandle>>,
     ) -> FileChangeSummary {
         if !change.opened.0.is_empty() && !tspath::is_dynamic_file_name(&change.opened.file_name())
         {
             let path = (self.to_path)(&change.opened.file_name());
-            let (entry, ok) = self.disk_files.load(&path);
+            let (entry, ok) = self.cache_files.load(&path);
             let original = entry.as_ref().and_then(|entry| entry.original());
             if !ok || original.is_none() {
                 change.created.insert(change.opened.clone());
-            } else if let Some(overlay) = self.overlays.get(&path) {
-                // The file already exists in the program, but the overlay content from
-                // didOpen may differ from what was originally read from disk (e.g. the
-                // editor normalizes line endings, or the file changed on disk since the
+            } else if let Some(open_file) = open_files.get(&path) {
+                // The file already exists in the program, but the open-file content from
+                // didOpen may differ from what was originally read from the source (e.g. the
+                // editor normalizes line endings, or the source file changed since the
                 // project was loaded). Mark it as Changed so the project rebuilds.
-                if let Some(disk_file) = original {
-                    if overlay.file_base.hash() != disk_file.borrow().file_base.hash() {
+                if let Some(cached_file) = original {
+                    if open_file.hash() != cached_file.borrow().file_base.hash() {
                         change.changed.insert(change.opened.clone());
                     }
                 }
+                self.delete_cache_entry(entry.as_ref().expect("loaded above"));
             }
         }
         for uri in &change.closed {
@@ -832,14 +987,10 @@ impl SnapshotFSBuilder {
             }
             let path = (self.to_path)(&file_name);
             // We may have ignored watcher events while the file was open, so force a reload.
-            if let Some(fh) = self.get_disk_file(&file_name, &path, true /*forceReload*/) {
-                let prev_hash = self
-                    .prev_overlays
-                    .get(&path)
-                    .expect("invalid memory address or nil pointer dereference")
-                    .file_base
-                    .hash();
-                if fh.hash() != prev_hash {
+            if let Some(fh) = self.get_cached_file(&file_name, &path, true /*forceReload*/) {
+                if let Some(previous_open_file) = previous_open_files.get(&path)
+                    && fh.hash() != previous_open_file.hash()
+                {
                     change.changed.insert(uri.clone());
                 }
                 continue;
@@ -850,67 +1001,68 @@ impl SnapshotFSBuilder {
     }
 }
 
-// Go: project/snapshotfs.go:28 `_ FileSource = (*snapshotFSBuilder)(nil)`
-impl FileSource for SnapshotFSBuilder {
-    // Go: project/snapshotfs.go:193 snapshotFSBuilder.FS
-    fn fs(&self) -> Rc<dyn vfs::Fs> {
-        self.fs.clone()
-    }
-
-    // Go: project/snapshotfs.go:293 snapshotFSBuilder.GetFile
+// Go: project/snapshotfs.go:65 `_ FileSource = (*snapshotFSBuilder)(nil)`
+impl FileHandleSource for SnapshotFSBuilder {
+    // Go: project/snapshotfs.go:301 snapshotFSBuilder.GetFile
     fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>> {
         let path = (self.to_path)(file_name);
         self.get_file_by_path(file_name, &path)
     }
 
-    // Go: project/snapshotfs.go:314 snapshotFSBuilder.GetFileByPath
+    // Go: project/snapshotfs.go:326 snapshotFSBuilder.GetFileByPath
     fn get_file_by_path(&self, file_name: &str, path: &tspath::Path) -> Option<Rc<dyn FileHandle>> {
-        if let Some(file) = self.overlays.get(path) {
-            return Some(file.clone());
+        if let (Some(entry), true) = self.cache_files.load(path) {
+            return self.reload_entry_if_needed(&entry);
         }
-        self.get_disk_file(file_name, path, false)
+        let file = self.fs.get_file_by_path(file_name, path)?;
+        if file.is_overlay() {
+            return Some(file);
+        }
+        self.cache_source_file(file_name, path, &file)
+    }
+}
+
+impl FileSource for SnapshotFSBuilder {
+    // Go: project/snapshotfs.go:204 snapshotFSBuilder.FS
+    fn fs(&self) -> Rc<dyn vfs::Fs> {
+        self.fs.clone()
     }
 
-    // Go: project/snapshotfs.go:298 snapshotFSBuilder.FileExists
+    // Go: project/snapshotfs.go:313 snapshotFSBuilder.FileExists
     fn file_exists(&self, file_name: &str, path: &tspath::Path) -> bool {
-        if self.overlays.contains_key(path) {
-            return true;
-        }
-        if let (Some(entry), true) = self.disk_files.load(path) {
+        if let (Some(entry), true) = self.cache_files.load(path) {
             let val = entry.value();
             if val.is_none() {
                 return false;
             }
-            // Entry may be dirty - reload to check current state on disk.
+            // Entry may be dirty - reload to check current state in the source filesystem.
             return self.reload_entry_if_needed(&entry).is_some();
         }
-        // Path never loaded into diskFiles - use cached stat (no file read).
+        // Path never loaded into cacheFiles - use cached stat (no file read).
         self.fs.file_exists(file_name)
     }
 
-    // Go: project/snapshotfs.go:321 snapshotFSBuilder.GetAccessibleEntries
+    // Go: project/snapshotfs.go:337 snapshotFSBuilder.GetAccessibleEntries
     fn get_accessible_entries(&self, path: &str) -> vfs::Entries {
-        let entries = self.fs.get_accessible_entries(path);
-        let p = (self.to_path)(path);
-        let Some(overlay_directories) = self.overlay_directories.get(&p) else {
-            return entries;
-        };
-
-        if let Some(merged) = self.accessible_entries.borrow().get(&p) {
-            return merged.clone();
+        let lower_entries = self.fs.get_accessible_entries(path);
+        let (directory, ok) = self.cache_directories.get(&(self.to_path)(path));
+        if !ok {
+            return lower_entries;
         }
-        let mut merged = entries;
-        read_directory_into_entries(
-            overlay_directories,
-            &|p: &tspath::Path| self.is_open_file(p),
-            &mut merged,
-        );
-        // Go: LoadOrStore
-        self.accessible_entries
-            .borrow_mut()
-            .entry(p)
-            .or_insert(merged)
-            .clone()
+        let directory = directory
+            .and_then(|directory| directory.value())
+            .map(|directory| directory.borrow().clone())
+            .unwrap_or_default();
+        merge_cached_directory_entries(
+            lower_entries,
+            &directory,
+            &|path: &tspath::Path| {
+                let (entry, cached) = self.cache_files.load(path);
+                cached && entry.is_some_and(|entry| entry.value().is_some())
+                    || self.fs.file_exists(path.as_str())
+            },
+            self.fs.use_case_sensitive_file_names(),
+        )
     }
 }
 
@@ -927,10 +1079,29 @@ pub fn is_relevant_extension(ext: &str) -> bool {
 // Go: project/snapshotfs.go:665 isNodeModulesPath
 // isNodeModulesPath reports whether path is a node_modules directory itself or
 // lives inside one. Used to preserve node_modules watch deletions, whose package
-// files are read transiently and therefore never tracked in diskDirectories.
+// files are read transiently and therefore never tracked in cacheDirectories.
 pub fn is_node_modules_path(path: &tspath::Path) -> bool {
     let s = path.as_str();
     s.ends_with("/node_modules") || s.contains("/node_modules/")
+}
+
+// Go: project/snapshotfs.go:693 hasOpenFileWithin (ts#64291)
+pub fn has_open_file_within(
+    path: &tspath::Path,
+    previous_open_files: &IndexMap<tspath::Path, Rc<dyn FileHandle>>,
+    open_files: &IndexMap<tspath::Path, Rc<dyn FileHandle>>,
+) -> bool {
+    for open_file_path in open_files.keys() {
+        if path.contains_path(open_file_path) {
+            return true;
+        }
+    }
+    for open_file_path in previous_open_files.keys() {
+        if path.contains_path(open_file_path) {
+            return true;
+        }
+    }
+    false
 }
 
 // Go: project/snapshotfs.go:643 sourceFS
@@ -1081,11 +1252,7 @@ fn released_file_source_used() -> ! {
     panic!("the file system of a released program's compiler host was used");
 }
 
-impl FileSource for ReleasedFileSource {
-    fn fs(&self) -> Rc<dyn vfs::Fs> {
-        released_file_source_used()
-    }
-
+impl FileHandleSource for ReleasedFileSource {
     fn get_file(&self, _file_name: &str) -> Option<Rc<dyn FileHandle>> {
         released_file_source_used()
     }
@@ -1095,6 +1262,12 @@ impl FileSource for ReleasedFileSource {
         _file_name: &str,
         _path: &tspath::Path,
     ) -> Option<Rc<dyn FileHandle>> {
+        released_file_source_used()
+    }
+}
+
+impl FileSource for ReleasedFileSource {
+    fn fs(&self) -> Rc<dyn vfs::Fs> {
         released_file_source_used()
     }
 
@@ -1196,23 +1369,5 @@ impl vfs::Fs for SourceFS {
     // Realpath implements vfs.FS.
     fn realpath(&self, path: &str) -> String {
         self.source().fs().realpath(path)
-    }
-}
-
-// Go: project/snapshotfs.go:782 readDirectoryIntoEntries
-// PORT: Go is generic over `~map[tspath.Path]string`; both maps are
-// `FxHashMap` here (a `dirty::CloneableMap` is borrowed). Go ranges over the
-// map (random order).
-pub fn read_directory_into_entries(
-    directories: &FxHashMap<tspath::Path, String>,
-    is_file: &dyn Fn(&tspath::Path) -> bool,
-    entries: &mut vfs::Entries,
-) {
-    for (child_path, child_name) in directories {
-        if is_file(child_path) {
-            entries.files.push(child_name.clone());
-        } else {
-            entries.directories.push(child_name.clone());
-        }
     }
 }
