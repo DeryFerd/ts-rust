@@ -505,6 +505,17 @@ impl ProjectCollectionBuilder {
         *self.created_programs.borrow_mut() = created_programs;
         for uri in api_request.ensure_files.iter().flatten() {
             self.did_request_file(uri, false /*configuredProjectsOnly*/, logger.clone());
+            // ts#64374
+            let file_name = uri.file_name();
+            if self
+                .find_default_project(&file_name, &(self.to_path)(&file_name))
+                .is_none()
+            {
+                return Err(gostd::errors::errorf(
+                    format!("no project found for opened file: {}", file_name),
+                    vec![],
+                ));
+            }
         }
         for project_id in api_request.ensure_programs.iter().flatten() {
             self.did_request_project(project_id, logger.clone());
