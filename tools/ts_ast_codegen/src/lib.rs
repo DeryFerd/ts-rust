@@ -422,7 +422,22 @@ impl<'a> Generator<'a> {
         writeln!(output, "impl TryFrom<u16> for SyntaxKind {{").unwrap();
         writeln!(output, "    type Error = (); ").unwrap();
         writeln!(output).unwrap();
-        writeln!(output, "    #[inline]").unwrap();
+        writeln!(
+            output,
+            "    // PERF: always inline. The match compiles to a range check, but only"
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "    // after the inliner ran: with `#[inline]` LLVM saw a 351-case switch and"
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "    // left thousands of calls out of line (AST node records, step 4)."
+        )
+        .unwrap();
+        writeln!(output, "    #[inline(always)]").unwrap();
         writeln!(output, "    #[allow(clippy::too_many_lines)]").unwrap();
         writeln!(
             output,

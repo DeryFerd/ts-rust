@@ -482,8 +482,9 @@ impl SlotChildren {
 // are, so a pooled block (`BlockPool`) can take the records of another file
 // through a shared borrow, with no `unsafe`. The kind of a slot never
 // changes after the slot is made (`replace_store_node_data` keeps it).
-// PERF: `SyntaxKind::try_from` is `#[inline]`; its match of the 351 kinds
-// compiles to a range check (`cmp; cmov`), with no table and no branch.
+// PERF: `SyntaxKind::try_from` is `#[inline(always)]`; its match of the
+// 351 kinds compiles to a range check (`cmp; cmov`), with no table and no
+// branch.
 #[repr(C)]
 #[derive(Debug)]
 pub struct NodeRecord {

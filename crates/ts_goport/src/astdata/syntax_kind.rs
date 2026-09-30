@@ -1293,7 +1293,10 @@ impl SyntaxKind {
 impl TryFrom<u16> for SyntaxKind {
     type Error = ();
 
-    #[inline]
+    // PERF: always inline. The match compiles to a range check, but only
+    // after the inliner ran: with `#[inline]` LLVM saw a 351-case switch and
+    // left thousands of calls out of line (AST node records, step 4).
+    #[inline(always)]
     #[allow(clippy::too_many_lines)]
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
