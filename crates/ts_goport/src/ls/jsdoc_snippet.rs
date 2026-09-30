@@ -216,8 +216,10 @@ fn get_doc_comment_template_at_position(
             )
             .into_boxed_str(),
         );
+        // PORT: a port-only lookup (Go reads the file itself), so a miss is
+        // a port panic, not a Go nil read.
         let parsed = ls_program::parsed_source_file(source_file)
-            .unwrap_or_else(|| crate::core::go_nil_dereference());
+            .expect("invalid memory address or nil pointer dereference");
         let reparse = Rc::new(crate::frontend::parser::parse_source_file(
             parsed.parse_options(),
             reparse_text,
@@ -303,8 +305,10 @@ fn is_template_source_file_js(source_file: Node) -> bool {
     if !is_file_store_before_program(source_file.file_index()) {
         return is_source_file_js(source_file);
     }
+    // PORT: a port-only lookup (Go reads `sourceFile.ScriptKind`), so a miss
+    // is a port panic, not a Go nil read.
     let script_kind = ls_program::parsed_source_file(source_file)
-        .unwrap_or_else(|| crate::core::go_nil_dereference())
+        .expect("invalid memory address or nil pointer dereference")
         .script_kind;
     script_kind == ScriptKind::JS || script_kind == ScriptKind::JSX
 }

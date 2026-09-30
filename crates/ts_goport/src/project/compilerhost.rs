@@ -125,14 +125,16 @@ impl CompilerHost {
             .borrow()
             .clone()
             .unwrap_or_else(|| crate::core::go_nil_dereference());
-        let command_line = project
-            .borrow()
-            .get_command_line_with_typings_files()
-            .unwrap_or_else(|| crate::core::go_nil_dereference());
+        let command_line = project.borrow().get_command_line_with_typings_files();
+        // Go `ConfigName`, `ContentMappers` and `CompilerOptions` are
+        // nil-safe: a nil command line gives "", nil and nil.
+        let command_line = command_line.as_deref();
         let content_mapper_project = content_mapper_host.project(contentmapper::ProjectSpec {
-            config_file_name: command_line.config_name().to_string(),
-            mappers: command_line.content_mappers().to_vec(),
-            compiler_options: Some(command_line.compiler_options().clone()),
+            config_file_name: command_line
+                .map_or("", tsoptions::ParsedCommandLine::config_name)
+                .to_string(),
+            mappers: command_line.map_or_else(Vec::new, |c| c.content_mappers().to_vec()),
+            compiler_options: command_line.map(|c| c.compiler_options().clone()),
         });
         *self.content_mapper_project.borrow_mut() = content_mapper_project;
     }

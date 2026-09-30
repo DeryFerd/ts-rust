@@ -489,10 +489,12 @@ impl ProjectCollectionBuilder {
                         let path = (self.to_path)(&file_name);
                         if root_files_map.contains_key(&path) {
                             // Go: slices.Delete(newRootFiles, slices.Index(newRootFiles, fileName), slices.Index(newRootFiles, fileName)+1)
+                            // A missing file is index -1. The bound check is the
+                            // 3-index `s[i:j:len(s)]`, so the runtime text is `[-1::]`.
                             let Some(index) = new_root_files.iter().position(|f| *f == file_name)
                             else {
                                 crate::core::go_panic(
-                                    "runtime error: slice bounds out of range [-1:]".to_string(),
+                                    "runtime error: slice bounds out of range [-1::]".to_string(),
                                 );
                             };
                             new_root_files.remove(index);
@@ -1789,6 +1791,7 @@ impl ProjectCollectionBuilder {
                 logger,
             ));
         } else {
+            // Go `CompilerOptions` is nil-safe: a nil command line gives nil.
             let mut new_compiler_options = self
                 .inferred_project
                 .value()
@@ -1796,12 +1799,15 @@ impl ProjectCollectionBuilder {
                 .borrow()
                 .command_line
                 .as_ref()
-                .unwrap_or_else(|| crate::core::go_nil_dereference())
-                .compiler_options()
-                .clone();
+                .map(|command_line| command_line.compiler_options().clone());
             if let Some(compiler_options) = &self.compiler_options_for_inferred_projects {
-                new_compiler_options = compiler_options.clone();
+                new_compiler_options = Some(compiler_options.clone());
             }
+            // PORT: the port command line cannot hold nil options. An
+            // inferred project always has a command line, so this is a port
+            // assert, not a Go panic.
+            let new_compiler_options =
+                new_compiler_options.expect("port: an inferred project has a command line");
             let new_command_line = Rc::new(new_inferred_project_command_line(
                 new_compiler_options,
                 root_file_names.clone(),
@@ -1974,11 +1980,11 @@ impl ProjectCollectionBuilder {
                             p.host
                                 .clone()
                                 .unwrap_or_else(|| crate::core::go_nil_dereference()),
+                            // Go `ContentMappers` is nil-safe: a nil command
+                            // line has none.
                             p.command_line
                                 .as_ref()
-                                .unwrap_or_else(|| crate::core::go_nil_dereference())
-                                .content_mappers()
-                                .to_vec(),
+                                .map_or_else(Vec::new, |c| c.content_mappers().to_vec()),
                         )
                     };
                     let mut watched_files: Vec<String> = Vec::new();

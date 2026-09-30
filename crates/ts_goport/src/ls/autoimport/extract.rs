@@ -357,9 +357,11 @@ impl SymbolExtractor<'_> {
                         .map_or(-1, |i| i as i32);
                     if idx >= 0 || should_ignore_symbol(&self.checker.symbols, named_export) {
                         // Go: slices.Delete(allExports, idx, idx+1) panics on idx -1.
+                        // Its bound check is the 3-index `s[i:j:len(s)]`, so the
+                        // runtime text is `[-1::]`.
                         if idx < 0 {
                             crate::core::go_panic(
-                                "runtime error: slice bounds out of range [-1:]".to_string(),
+                                "runtime error: slice bounds out of range [-1::]".to_string(),
                             );
                         }
                         all_exports.remove(idx as usize);

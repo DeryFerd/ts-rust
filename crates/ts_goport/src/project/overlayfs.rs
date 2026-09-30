@@ -516,7 +516,11 @@ impl OverlayFS {
 
             if events.close_change.is_some() {
                 if o.is_none() {
-                    crate::core::go_panic(format!("overlay not found for closed file: {}", uri.0));
+                    // Go: "..." + uri is a lsproto.DocumentUri value.
+                    crate::core::go_panic_typed(
+                        "lsproto.DocumentUri",
+                        format!("overlay not found for closed file: {}", uri.0),
+                    );
                 }
                 result.closed.insert(uri.clone());
                 new_overlays.shift_remove(&path);
@@ -548,7 +552,11 @@ impl OverlayFS {
             if !events.changes.is_empty() {
                 result.changed.insert(uri.clone());
                 if o.is_none() {
-                    crate::core::go_panic(format!("overlay not found for changed file: {}", uri.0));
+                    // Go: "..." + uri is a lsproto.DocumentUri value.
+                    crate::core::go_panic_typed(
+                        "lsproto.DocumentUri",
+                        format!("overlay not found for changed file: {}", uri.0),
+                    );
                 }
                 // PORT: the Go line map closure captures the variable `o`,
                 // which the loop below reassigns; `o_cell` is that variable.

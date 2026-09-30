@@ -41,7 +41,8 @@ impl Drop for WaitGroupDone {
 /// PORT: the rest of a running task that goes on later on the dispatch
 /// thread (Go: the same goroutine after a sleep). A task takes it with
 /// `Queue::hold` and moves it into the timer function; the task counts as
-/// running until the hold is dropped.
+/// running until the hold is dropped. The timer function runs the rest
+/// under `core::go_wait_group_task`, as `Enqueue` runs the task.
 pub struct TaskHold {
     _done: WaitGroupDone,
 }
@@ -68,7 +69,8 @@ impl Queue {
             if ctx.err().is_some() {
                 return;
             }
-            fn_(&ctx);
+            // Go: the wg.Go goroutine recovers a panic and raises it again.
+            crate::core::go_wait_group_task(|| fn_(&ctx));
         }));
     }
 

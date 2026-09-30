@@ -450,7 +450,8 @@ impl Snapshot {
     // Go: project/snapshot.go:233 Clone
     // PORT: Go `Clone` is `clone_` (Rust `Clone::clone` copies a value).
     // The deferred `recover()` is `catch_unwind` around the body
-    // (`clone_body`); the panic is logged and raised again, as in Go.
+    // (`clone_body`); the panic is logged and raised again, as in Go
+    // (`go_repanic`: the runtime line ends with `[recovered, repanicked]`).
     pub fn clone_(
         &self,
         ctx: &Context,
@@ -469,7 +470,7 @@ impl Snapshot {
                 Ok(new_snapshot) => new_snapshot,
                 Err(r) => {
                     session.logger.log(&logger.string());
-                    std::panic::resume_unwind(r)
+                    crate::core::go_repanic(r)
                 }
             };
         }

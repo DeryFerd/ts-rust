@@ -808,7 +808,8 @@ impl Session {
                         }
                     }
                 };
-                run();
+                // Go: the rest of the same wg.Go goroutine (`TaskHold`).
+                crate::core::go_wait_group_task(run);
                 // Go: defer cancel()
                 cancel();
                 drop(hold);
@@ -905,7 +906,8 @@ impl Session {
                         },
                     );
                 };
-                run();
+                // Go: the rest of the same wg.Go goroutine (`TaskHold`).
+                crate::core::go_wait_group_task(run);
                 // Go: defer cancel()
                 cancel();
                 drop(hold);
@@ -1460,13 +1462,12 @@ impl Session {
     // PORT: Go `map[string]string` and `map[string]any` are `IndexMap`s in
     // insertion order (PORT: Go map order is random, also in its JSON).
     pub fn collect_project_info_telemetry(&self, project: &Project) -> lsproto::TelemetryEvent {
-        let command_line = project
-            .command_line
-            .as_ref()
-            .unwrap_or_else(|| crate::core::go_nil_dereference());
-        // PORT: Go replaces a nil `CompilerOptions()` with an empty
-        // `core.CompilerOptions`; the Rust command line always has options.
-        let opts = command_line.compiler_options().clone();
+        // Go `CompilerOptions` is nil-safe, and a nil result becomes an empty
+        // `core.CompilerOptions`.
+        let opts = project.command_line.as_ref().map_or_else(
+            || Rc::new(CompilerOptions::default()),
+            |command_line| command_line.compiler_options().clone(),
+        );
 
         let mut config_file_name = "other".to_string();
         if project.kind == Kind::CONFIGURED {
@@ -1564,7 +1565,12 @@ impl Session {
 
         // Config file shape
         // PORT: Go `Raw.(*collections.OrderedMap[string, any])` is the
-        // `CompilerOptionsValue::Map` form of `raw`.
+        // `CompilerOptionsValue::Map` form of `raw`. Go reads the field of a
+        // nil command line here.
+        let command_line = project
+            .command_line
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         if let tsoptions::CompilerOptionsValue::Map(raw) = &command_line.raw {
             props.insert(
                 "extends".to_string(),
@@ -3366,13 +3372,12 @@ impl Session {
                                 .map(|file| file.file_name().to_string())
                                 .collect(),
                             project_root_path: p.current_directory.clone(),
-                            compiler_options: Some(
-                                p.command_line
-                                    .as_ref()
-                                    .unwrap_or_else(|| crate::core::go_nil_dereference())
-                                    .compiler_options()
-                                    .clone(),
-                            ),
+                            // Go `CompilerOptions` is nil-safe: a nil
+                            // command line gives nil.
+                            compiler_options: p
+                                .command_line
+                                .as_ref()
+                                .map(|c| c.compiler_options().clone()),
                             current_directory: s.options.current_directory.clone(),
                             get_script_kind: Rc::new(|file_name: &str| {
                                 crate::frontend::core_ext::get_script_kind_from_file_name(file_name)
