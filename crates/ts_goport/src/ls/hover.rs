@@ -854,6 +854,43 @@ impl QuickInfoWriter<'_> {
         self.dpw.borrow_mut().write_symbol(&text, symbol);
     }
 
+    // Go: ls/hover.go:515 writeModuleImportAttributes (closure)
+    fn write_module_import_attributes(&mut self, symbol: SymbolId) {
+        let declaration = self
+            .c
+            .sym(symbol)
+            .declarations
+            .iter()
+            .copied()
+            .find(|&declaration| {
+                is_module_declaration(declaration) && declaration.attributes().is_some()
+            })
+            .unwrap_or(Node::NIL);
+        if declaration.is_nil() {
+            return;
+        }
+        let attributes = declaration.attributes();
+        let emit_context = new_emit_context();
+        emit_context.set_emit_flags(attributes, EmitFlags::SINGLE_LINE);
+        let mut p = new_printer(
+            PrinterOptions {
+                new_line: NewLineKind::LF,
+                ..Default::default()
+            },
+            PrintHandlers::default(),
+            Some(emit_context),
+        );
+        let temp_dpw = new_display_parts_writer(self.vs_capability);
+        p.write_exported(
+            attributes,
+            get_source_file_of_node(declaration),
+            temp_dpw.clone(),
+            None,
+        );
+        self.dpw.borrow_mut().write_keyword(" with ");
+        self.dpw.borrow_mut().write_from(&temp_dpw.borrow());
+    }
+
     // Go: ls/hover.go:378 setDeclaration (closure)
     fn set_declaration(&mut self, declaration: Node) {
         if self.first_declaration.is_nil() {
@@ -1370,6 +1407,7 @@ impl QuickInfoWriter<'_> {
                     SymbolFlags::NONE,
                     SYMBOL_FORMAT_FLAGS,
                 );
+                self.write_module_import_attributes(symbol);
             }
             let declaration = self
                 .c

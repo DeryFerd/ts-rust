@@ -152,10 +152,12 @@ pub fn module_symbol_to_valid_identifier(
     module_symbol: SymbolId,
     force_capitalize: bool,
 ) -> String {
-    module_specifier_to_valid_identifier(
-        &strip_quotes(symbols.sym(module_symbol).name.as_str()),
-        force_capitalize,
-    )
+    let mut module_name = symbols.sym(module_symbol).name.as_str().to_string();
+    let (ambient_module_name, ok) = try_get_ambient_module_name_from_symbol_name(&module_name);
+    if ok {
+        module_name = ambient_module_name.to_string();
+    }
+    module_specifier_to_valid_identifier(&module_name, force_capitalize)
 }
 
 // Go: ls/lsutil/utilities.go:120 ModuleSpecifierToValidIdentifier

@@ -1427,7 +1427,10 @@ impl View {
                     module_specifier.kind()
                 );
             } else if is_variable_declaration_initialized_to_require(node.parent()) {
-                let module_symbol = ch.resolve_external_module_name_exported(module_specifier);
+                let module_symbol = ch.resolve_external_module_name_exported(
+                    module_specifier,
+                    TypeId::NIL, /*importAttributesType*/
+                );
                 if module_symbol.is_some() {
                     let (module_id, _, ok) = try_get_module_id_and_file_name_of_module_symbol(
                         &ch.symbols,
