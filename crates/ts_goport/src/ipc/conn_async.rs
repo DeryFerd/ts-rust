@@ -20,7 +20,7 @@
 use crate::ipc::prelude::*;
 
 use crate::frontend::json_ext::{AnyValue, JsonValue};
-use crate::gostd::{Context, GoError, errors};
+use crate::gostd::{Context, GoError, context, errors};
 use crate::ipc::conn::{Conn, ERR_CONN_CLOSED, Handler, recovered_value};
 use crate::ipc::protocol::{Message, Protocol};
 use crate::ipc::protocol_jsonrpc::new_jsonrpc_protocol;
@@ -113,12 +113,16 @@ impl AsyncConn {
     // Run starts processing messages on the connection.
     // It blocks until the context is cancelled or an error occurs.
     pub fn run(&self, ctx: &Context) -> Result<(), GoError> {
+        // Go: ipc/conn_async.go:69
+        let (handler_ctx, cancel_handlers) = context::with_cancel(ctx);
         // Go: defer func() { c.closePendingCalls(err); cancelHandlers(); c.handlers.Wait(); ... }()
         // PORT: the handlers run inline (file header), so when the loop ends
-        // no handler is active: the Go `handlerCtx` cancel and the
-        // `handlers.Wait()` (ts#64163) have nothing to do.
-        let mut result = self.run_loop(ctx);
+        // no handler is active and `handlers.Wait()` (ts#64163) has nothing
+        // to wait for. The cancel still reaches a context that a handler
+        // kept.
+        let mut result = self.run_loop(ctx, &handler_ctx);
         self.close_pending_calls(result.as_ref().err());
+        cancel_handlers();
         let request_err = self.request_errors.borrow_mut().take();
         if let Some(request_err) = request_err {
             result = Err(errors::join([result.err(), Some(request_err)])
@@ -127,8 +131,9 @@ impl AsyncConn {
         result
     }
 
-    /// The loop of Go `Run`, without its deferred function.
-    fn run_loop(&self, ctx: &Context) -> Result<(), GoError> {
+    /// The loop of Go `Run`, without its deferred function. Requests and
+    /// notifications get `handler_ctx` (Go `handlerCtx`).
+    fn run_loop(&self, ctx: &Context, handler_ctx: &Context) -> Result<(), GoError> {
         loop {
             if let Some(err) = ctx.err() {
                 return Err(err);
@@ -145,7 +150,7 @@ impl AsyncConn {
                 Err(err) => return read_loop_result(err),
             };
 
-            self.dispatch(ctx, msg);
+            self.dispatch(handler_ctx, msg);
         }
     }
 
