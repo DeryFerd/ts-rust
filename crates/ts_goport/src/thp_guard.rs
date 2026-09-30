@@ -1,8 +1,8 @@
 //! The THP guard: turns transparent huge pages off for this process when
 //! the kernel has little free memory in 2 MiB blocks. Not a Go port.
 //!
-//! jemalloc runs with `thp:always,metadata_thp:always` (see `bin/goport.rs`
-//! `set_malloc_tunables`), so it marks its memory `MADV_HUGEPAGE`. On clean
+//! jemalloc runs with `thp:always` (see `bin/goport.rs`
+//! `set_malloc_tunables`), so it marks its data `MADV_HUGEPAGE`. On clean
 //! memory that is 7% to 22% faster than 4 KiB pages (perf12 THP grid). When
 //! the free memory is in small blocks (for example after a file walk or a
 //! build fills the dentry and inode slab), each huge page fault of that
