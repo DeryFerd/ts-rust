@@ -166,9 +166,10 @@ impl Checker {
 
     // Go: checker/checker.go:30717 getInferenceContext
     pub fn get_inference_context(&self, node: Node) -> InferenceContextId {
-        for i in (0..self.inference_context_infos.len()).rev() {
-            if is_node_descendant_of(node, self.inference_context_infos[i].node) {
-                return self.inference_context_infos[i].context;
+        // Go: `slices.Backward` (ts#63902).
+        for v in self.inference_context_infos.iter().rev() {
+            if is_node_descendant_of(node, v.node) {
+                return v.context;
             }
         }
         InferenceContextId::NIL
