@@ -777,7 +777,7 @@ fn decode(file: Node, nodes: u32, r: SnapshotReader<'_>) -> Option<(BoundFile, S
     for _ in 0..entry_count {
         node_entries.push(d.node_bind_data()?);
     }
-    let node_bind = FileNodeBind::from_parts(slots, bases, node_entries)?;
+    let node_bind = NodeBindParts::from_parts(slots, bases, node_entries)?;
 
     let file_bind = d.file_bind()?;
     if d.r.remaining() != 0 {
@@ -786,7 +786,7 @@ fn decode(file: Node, nodes: u32, r: SnapshotReader<'_>) -> Option<(BoundFile, S
     Some((
         BoundFile {
             file,
-            node_bind,
+            node_bind: BoundNodes::Parts(node_bind),
             flow_nodes,
             file_bind,
         },
@@ -1078,7 +1078,8 @@ fn encode(
     for flow in &bound.flow_nodes {
         e.flow_node(flow)?;
     }
-    let (slots, bases, entries) = bound.node_bind.parts();
+    let compact = bound.node_bind.compact();
+    let (slots, bases, entries) = compact.parts();
     e.count(slots.len())?;
     e.body.extend_from_slice(slots);
     e.count(bases.len())?;
@@ -1346,7 +1347,7 @@ mod tests {
             "{lib}: private names"
         );
         assert!(
-            file.node_bind.parts() == live_file.node_bind.parts(),
+            file.node_bind.compact().parts() == live_file.node_bind.compact().parts(),
             "{lib}: node data"
         );
         assert_eq!(

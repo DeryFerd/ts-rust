@@ -152,7 +152,7 @@ impl NodeFactory {
     /// `new_text_node` for an Identifier or PrivateIdentifier with Go text
     /// `text`. `data` makes the node data from the text it holds.
     // PERF: U1 (d). A store node gets an empty data text, which needs no
-    // allocation. The store keeps `text` in the name column of the slot,
+    // allocation. The store keeps `text` in the name word of the slot,
     // and `Node::text` reads it there. A synthetic node keeps the text in
     // its data.
     // PERF: S1. With an empty text the store payload is always the same

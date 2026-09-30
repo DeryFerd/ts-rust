@@ -1213,6 +1213,29 @@ pub fn parse_config_file_text_to_json(
 pub trait ParseConfigHost {
     fn fs(&self) -> Rc<dyn Fs>;
     fn get_current_directory(&self) -> String;
+
+    /// Go `getFileNamesFromConfigSpecs` on `FS()` for the config
+    /// `config_file_name`: its file names, and how many of them are
+    /// literal files.
+    // PORT: not in Go. The `tsc -b` host can give the file names that a
+    // thread matched ahead of it (execute/build/config_prefetch.rs), as
+    // Go parses the configs of a build in parallel.
+    fn get_file_names_from_config_specs(
+        &self,
+        _config_file_name: &str,
+        config_file_specs: &ConfigFileSpecs,
+        base_path: &str,
+        options: Option<&CompilerOptions>,
+        extra_extensions: &[String],
+    ) -> (Vec<String>, i32) {
+        get_file_names_from_config_specs(
+            config_file_specs,
+            base_path,
+            options,
+            &*self.fs(),
+            extra_extensions,
+        )
+    }
 }
 
 // Go: tsoptions/tsconfigparsing.go:720 resolverHost

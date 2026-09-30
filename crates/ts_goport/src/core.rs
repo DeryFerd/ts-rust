@@ -151,7 +151,7 @@ impl Node {
         // After freeze, a store file resolves every child id with no store
         // borrow: an alias-free store gives the slot 0 value for id 0 and
         // the raw handle `(file << 32) | (id + 1)` for any other id, with no
-        // table load; a store with alias slots reads its resolved table.
+        // table load; a store with alias slots reads the record of the id.
         // The synthetic file has no store, so it takes the slow path.
         if let Some(n) = crate::ast::frozen_resolve_store_id(file, node) {
             return n;
@@ -238,6 +238,21 @@ impl Name {
     #[must_use]
     pub fn from_stable_id(id: u32) -> Option<Name> {
         intern::stable(id)
+    }
+
+    /// The 4-byte id, for a packed node column (`ast::store::NodeKids`).
+    /// It is valid only in this process.
+    #[inline]
+    #[must_use]
+    pub(crate) fn id(&self) -> u32 {
+        self.0
+    }
+
+    /// The name whose `Name::id` in this process is `id`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_id(id: u32) -> Name {
+        Name(id)
     }
 }
 
@@ -2545,12 +2560,85 @@ pub struct NodeBindData {
     pub added_flags: NodeFlags,
 }
 
-/// Binder data of every node of one bound file, stored compactly. Most
-/// nodes have no data, or the same data as the node before them (a run of
-/// identifiers in one flow region), so they share one entry. Each node keeps
-/// one byte: the offset of its entry from the first entry of its block.
+/// AST node records, step 2: the binder fields of one node that are not in
+/// its `NodeRecord` (`ast/store.rs`, which holds the symbol, the flow node
+/// and the added flags). Most nodes have none of them: only locals
+/// containers, exported declarations and function-like nodes do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeBindExtra {
+    pub local_symbol: SymbolId,
+    pub locals: SymbolTable,
+    pub next_container: Node,
+    pub end_flow_node: FlowNodeId,
+    pub return_flow_node: FlowNodeId,
+}
+
+impl NodeBindExtra {
+    /// The fields of `data` that are not in the record.
+    #[inline]
+    #[must_use]
+    pub fn of(data: &NodeBindData) -> Self {
+        NodeBindExtra {
+            local_symbol: data.local_symbol,
+            locals: data.locals,
+            next_container: data.next_container,
+            end_flow_node: data.end_flow_node,
+            return_flow_node: data.return_flow_node,
+        }
+    }
+
+    /// The empty fields: a node with no extras entry.
+    pub const NONE: Self = NodeBindExtra {
+        local_symbol: SymbolId::NIL,
+        locals: SymbolTable::NIL,
+        next_container: Node::NIL,
+        end_flow_node: FlowNodeId::NIL,
+        return_flow_node: FlowNodeId::NIL,
+    };
+}
+
+/// AST node records, step 2: the binder fields of the nodes of one bound
+/// file that are not in their records (`NodeBindExtra`). The `bind` word of
+/// a record holds the index + 1 of its entry, or 0 (`FileNodeBind::extra`).
+/// `BoundFile::install` makes it (`ast::bind_store_records`).
 #[derive(Debug, Default)]
 pub struct FileNodeBind {
+    extras: Box<[NodeBindExtra]>,
+}
+
+impl FileNodeBind {
+    /// The extras entries that the install made.
+    #[must_use]
+    pub fn new(extras: Vec<NodeBindExtra>) -> Self {
+        FileNodeBind {
+            extras: extras.into_boxed_slice(),
+        }
+    }
+
+    /// The extras entry whose index + 1 is `extra` (the high half of the
+    /// `bind` word of a record, not 0).
+    #[inline]
+    #[must_use]
+    pub fn extra(&self, extra: u32) -> &NodeBindExtra {
+        &self.extras[extra as usize - 1]
+    }
+
+    /// The extras entries.
+    #[must_use]
+    pub fn extras(&self) -> &[NodeBindExtra] {
+        &self.extras
+    }
+}
+
+/// The binder data of every node of one file, stored compactly, as the lib
+/// bind snapshot keeps it (`parts`, `binder::BoundNodes`). Most nodes have
+/// no data, or the same data as the node before them (a run of identifiers
+/// in one flow region), so they share one entry. Each node keeps one byte:
+/// the offset of its entry from the first entry of its block. The install
+/// writes it into the node records and a `FileNodeBind`
+/// (`ast::bind_store_records`).
+#[derive(Clone, Debug, Default)]
+pub struct NodeBindParts {
     /// Per node, by `NodeId::index()`: entry offset in its block, or
     /// `NO_NODE_BIND` for the empty data.
     slots: Vec<u8>,
@@ -2575,7 +2663,7 @@ static EMPTY_NODE_BIND: NodeBindData = NodeBindData {
     added_flags: NodeFlags::NONE,
 };
 
-impl FileNodeBind {
+impl NodeBindParts {
     /// Compacts the per-node data of a bound file, given in node order.
     /// `None` is a node with no data. At most `max_entries` items are
     /// `Some`.
@@ -2610,11 +2698,25 @@ impl FileNodeBind {
             slots[index] = u8::try_from(entries.len() - 1 - block_start).expect("block offset");
         }
         entries.shrink_to_fit();
-        FileNodeBind {
+        NodeBindParts {
             slots,
             bases,
             entries,
         }
+    }
+
+    /// Each node that has data, in node order: its `NodeId::index()`, the
+    /// index of its entry (nodes that share an entry give the same index)
+    /// and the data.
+    pub fn nodes(&self) -> impl Iterator<Item = (usize, usize, &NodeBindData)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|&(_, &offset)| offset != NO_NODE_BIND)
+            .map(|(index, &offset)| {
+                let entry = self.bases[index >> NODE_BIND_BLOCK_BITS] as usize + offset as usize;
+                (index, entry, &self.entries[entry])
+            })
     }
 
     /// The distinct data entries, for remapping ids in place. Non-empty data
@@ -2653,22 +2755,11 @@ impl FileNodeBind {
                 return None;
             }
         }
-        Some(FileNodeBind {
+        Some(NodeBindParts {
             slots,
             bases,
             entries,
         })
-    }
-
-    /// The data of node `index` (`NodeId::index()`).
-    #[inline]
-    #[must_use]
-    pub fn get(&self, index: usize) -> &NodeBindData {
-        let offset = self.slots[index];
-        if offset == NO_NODE_BIND {
-            return &EMPTY_NODE_BIND;
-        }
-        &self.entries[self.bases[index >> NODE_BIND_BLOCK_BITS] as usize + offset as usize]
     }
 }
 
@@ -3082,7 +3173,8 @@ pub struct GoFile {
     pub parser_flags: Vec<NodeFlags>,
     /// Go `ast.SourceFile` fields that the parser and program set.
     pub info: crate::program::SourceFileInfo,
-    /// Binder data per node, indexed by `NodeId::index()`.
+    /// The binder fields of the nodes that are not in their node records
+    /// (`ast/store.rs`, `NodeRecord`): set by the install with the records.
     pub node_bind: std::sync::OnceLock<FileNodeBind>,
     pub file_bind: std::sync::OnceLock<FileBindData>,
     pub flow_nodes: std::sync::OnceLock<Vec<FlowNode>>,

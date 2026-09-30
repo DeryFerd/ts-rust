@@ -229,8 +229,9 @@ pub fn get_exports(symbols: &mut SymbolArena, symbol: SymbolId) -> SymbolTable {
 
 // Go: ast/utilities.go:61 GetLocals
 // PORT: Go writes `container.LocalsContainerData().Locals`. Installed binder
-// data (`n.bind()`) is immutable, so the binder passes the mutable per-node
-// bind data of the file it is binding, indexed by `NodeId::index()`.
+// data (`Node::locals`) is not written again, so the binder passes the
+// mutable per-node bind data of the file it is binding, indexed by
+// `NodeId::index()`.
 pub fn get_locals(
     symbols: &mut SymbolArena,
     node_bind: &mut [NodeBindData],
