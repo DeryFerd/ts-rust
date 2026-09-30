@@ -5,9 +5,11 @@ use crate::ls::autoimport::prelude::*;
 // PORT (whole file):
 // - Concurrency. `sync.WaitGroup` / `wg.Go` run each task at its start
 //   point, serially in Go start order (map-project decision 1); the
-//   `ctx.Err()` checks stay. A build that the caller drops on cancel has
-//   more stop points (`should_stop_build`). Mutexes are dropped.
-//   `atomic.Int32` is `Cell`.
+//   `ctx.Err()` checks stay. Each task runs under
+//   `core::go_wait_group_goroutine`, so a Go panic in it ends the process
+//   as Go's goroutine does, and the request's recover does not catch it. A
+//   build that the caller drops on cancel has more stop points
+//   (`should_stop_build`). Mutexes are dropped. `atomic.Int32` is `Cell`.
 // - Go map iteration that feeds the index (`exports` maps, the second-pass
 //   root files and lookup sources) uses `IndexMap` / `IndexSet` in insertion
 //   order. PORT: Go map order is random. Index order decides ties in the
@@ -32,6 +34,7 @@ use crate::ls::autoimport::prelude::*;
 //   where only `FileName()` and `Path()` are read, and `file.root` where a
 //   node is needed.
 
+use crate::core::go_wait_group_goroutine;
 use crate::flags_macros::go_enum;
 use crate::frontend::compiler;
 use crate::frontend::core_ext::HasFileName;
@@ -1369,25 +1372,27 @@ impl RegistryBuilder {
         let discovery_start = Instant::now();
         for task in node_modules_tasks.iter_mut() {
             // Go: wg.Go(func() {...})
-            if task.is_update {
-                task.package_names = task.dirty_packages.clone();
-            } else {
-                task.directory_package_names = Some(get_package_names_in_node_modules(
-                    &tspath::combine_paths(&task.dir_name, &["node_modules"]),
-                    self.host.fs(),
-                ));
-                // Go: core.Coalesce(task.dependencyNames, task.directoryPackageNames)
-                task.package_names = task
-                    .dependency_names
-                    .clone()
-                    .or_else(|| task.directory_package_names.clone());
-            }
-            task.discovered = self.discover_bucket_packages(
-                ctx,
-                task.package_names.as_ref(),
-                &task.dir_name,
-                &task.dir_path,
-            );
+            go_wait_group_goroutine(|| {
+                if task.is_update {
+                    task.package_names = task.dirty_packages.clone();
+                } else {
+                    task.directory_package_names = Some(get_package_names_in_node_modules(
+                        &tspath::combine_paths(&task.dir_name, &["node_modules"]),
+                        self.host.fs(),
+                    ));
+                    // Go: core.Coalesce(task.dependencyNames, task.directoryPackageNames)
+                    task.package_names = task
+                        .dependency_names
+                        .clone()
+                        .or_else(|| task.directory_package_names.clone());
+                }
+                task.discovered = self.discover_bucket_packages(
+                    ctx,
+                    task.package_names.as_ref(),
+                    &task.dir_name,
+                    &task.dir_path,
+                );
+            });
         }
         // Go: wg.Wait()
         // PORT: the stop points marked `should_stop_build` are the port's
@@ -1433,19 +1438,21 @@ impl RegistryBuilder {
                                 .insert(pkg.package_name.clone());
                         }
                         // Go: wg.Go(func() {...})
-                        if ctx.err().is_none() {
-                            let result = self.extract_package(
-                                ctx,
-                                &pkg.package_json,
-                                &pkg.package_name,
-                                &project_reference_outputs,
-                                file_exclude_patterns.as_ref(),
-                                enable_dir_search,
-                            );
-                            if let Some(result) = result {
-                                extraction_cache.insert(pkg.realpath.clone(), result);
+                        go_wait_group_goroutine(|| {
+                            if ctx.err().is_none() {
+                                let result = self.extract_package(
+                                    ctx,
+                                    &pkg.package_json,
+                                    &pkg.package_name,
+                                    &project_reference_outputs,
+                                    file_exclude_patterns.as_ref(),
+                                    enable_dir_search,
+                                );
+                                if let Some(result) = result {
+                                    extraction_cache.insert(pkg.realpath.clone(), result);
+                                }
                             }
-                        }
+                        });
                     }
                     if !pkg.types_realpath.is_empty() {
                         types_fallback_candidates.push(pkg.clone());
@@ -1459,19 +1466,21 @@ impl RegistryBuilder {
                             target_recursive_packages.insert(pkg.package_name.clone());
                         }
                         // Go: wg.Go(func() {...})
-                        if ctx.err().is_none() {
-                            let result = self.extract_package(
-                                ctx,
-                                &pkg.types_package_json,
-                                &pkg.package_name,
-                                &project_reference_outputs,
-                                file_exclude_patterns.as_ref(),
-                                true, /*enableDirectorySearch*/
-                            );
-                            if let Some(result) = result {
-                                extraction_cache.insert(pkg.types_realpath.clone(), result);
+                        go_wait_group_goroutine(|| {
+                            if ctx.err().is_none() {
+                                let result = self.extract_package(
+                                    ctx,
+                                    &pkg.types_package_json,
+                                    &pkg.package_name,
+                                    &project_reference_outputs,
+                                    file_exclude_patterns.as_ref(),
+                                    true, /*enableDirectorySearch*/
+                                );
+                                if let Some(result) = result {
+                                    extraction_cache.insert(pkg.types_realpath.clone(), result);
+                                }
                             }
-                        }
+                        });
                     }
                 }
             }
@@ -1492,19 +1501,21 @@ impl RegistryBuilder {
                 target_recursive_packages.insert(pkg.package_name.clone());
             }
             // Go: wg.Go(func() {...})
-            if ctx.err().is_none() {
-                let result = self.extract_package(
-                    ctx,
-                    &pkg.types_package_json,
-                    &pkg.package_name,
-                    &project_reference_outputs,
-                    file_exclude_patterns.as_ref(),
-                    true, /*enableDirectorySearch*/
-                );
-                if let Some(result) = result {
-                    extraction_cache.insert(pkg.types_realpath.clone(), result);
+            go_wait_group_goroutine(|| {
+                if ctx.err().is_none() {
+                    let result = self.extract_package(
+                        ctx,
+                        &pkg.types_package_json,
+                        &pkg.package_name,
+                        &project_reference_outputs,
+                        file_exclude_patterns.as_ref(),
+                        true, /*enableDirectorySearch*/
+                    );
+                    if let Some(result) = result {
+                        extraction_cache.insert(pkg.types_realpath.clone(), result);
+                    }
                 }
-            }
+            });
         }
         // Go: wg.Wait()
         if node_modules_logger.is_some() {
@@ -1528,32 +1539,34 @@ impl RegistryBuilder {
         for task in &node_modules_tasks {
             let mut br = new_bucket_build_result(task.entry.clone());
             // Go: wg.Go(func() {...})
-            if task.is_update {
-                self.update_node_modules_bucket(
-                    ctx,
-                    &mut br,
-                    task.existing_bucket
-                        .as_ref()
-                        .unwrap_or_else(|| crate::core::go_nil_dereference()),
-                    task.dirty_packages.as_ref(),
-                    &task.discovered,
-                    &extraction_cache,
-                    target_recursive_packages.as_ref(),
-                    node_modules_logger.fork(&task.dir_name),
-                );
-            } else {
-                self.build_node_modules_bucket(
-                    ctx,
-                    &mut br,
-                    task.dependency_names.clone(),
-                    &task.dir_path,
-                    &task.discovered,
-                    task.directory_package_names.as_ref(),
-                    &extraction_cache,
-                    target_recursive_packages.as_ref(),
-                    node_modules_logger.fork(&task.dir_name),
-                );
-            }
+            go_wait_group_goroutine(|| {
+                if task.is_update {
+                    self.update_node_modules_bucket(
+                        ctx,
+                        &mut br,
+                        task.existing_bucket
+                            .as_ref()
+                            .unwrap_or_else(|| crate::core::go_nil_dereference()),
+                        task.dirty_packages.as_ref(),
+                        &task.discovered,
+                        &extraction_cache,
+                        target_recursive_packages.as_ref(),
+                        node_modules_logger.fork(&task.dir_name),
+                    );
+                } else {
+                    self.build_node_modules_bucket(
+                        ctx,
+                        &mut br,
+                        task.dependency_names.clone(),
+                        &task.dir_path,
+                        &task.discovered,
+                        task.directory_package_names.as_ref(),
+                        &extraction_cache,
+                        target_recursive_packages.as_ref(),
+                        node_modules_logger.fork(&task.dir_name),
+                    );
+                }
+            });
             all_results.push(br);
         }
 
@@ -1587,13 +1600,15 @@ impl RegistryBuilder {
             if should_rebuild {
                 let mut br = new_bucket_build_result(project.clone());
                 // Go: wg.Go(func() {...})
-                self.build_project_bucket(
-                    ctx,
-                    &mut br,
-                    &project_path,
-                    resolved_package_names,
-                    logger.fork(&format!("Building project bucket {project_path}")),
-                );
+                go_wait_group_goroutine(|| {
+                    self.build_project_bucket(
+                        ctx,
+                        &mut br,
+                        &project_path,
+                        resolved_package_names,
+                        logger.fork(&format!("Building project bucket {project_path}")),
+                    );
+                });
                 all_results.push(br);
             }
         }
@@ -1937,29 +1952,31 @@ impl RegistryBuilder {
                 continue;
             }
             // Go: wg.Go(func() {...})
-            if ctx.err().is_none() {
-                let (checker, done) = get_checker();
-                {
-                    let mut checker_ref = checker.borrow_mut();
-                    let mut extractor = self.new_export_extractor(
-                        "",
-                        &mut checker_ref,
-                        module_resolver.clone(),
-                        None,
-                    );
-                    let file_exports = extractor.extract_from_file(file.root);
-                    exports.insert(file.path().clone(), file_exports);
-                    let stats = extractor.stats();
-                    combined_stats
-                        .exports
-                        .set(combined_stats.exports.get() + stats.exports.get());
-                    combined_stats
-                        .used_checker
-                        .set(combined_stats.used_checker.get() + stats.used_checker.get());
+            go_wait_group_goroutine(|| {
+                if ctx.err().is_none() {
+                    let (checker, done) = get_checker();
+                    {
+                        let mut checker_ref = checker.borrow_mut();
+                        let mut extractor = self.new_export_extractor(
+                            "",
+                            &mut checker_ref,
+                            module_resolver.clone(),
+                            None,
+                        );
+                        let file_exports = extractor.extract_from_file(file.root);
+                        exports.insert(file.path().clone(), file_exports);
+                        let stats = extractor.stats();
+                        combined_stats
+                            .exports
+                            .set(combined_stats.exports.get() + stats.exports.get());
+                        combined_stats
+                            .used_checker
+                            .set(combined_stats.used_checker.get() + stats.used_checker.get());
+                    }
+                    // Go: defer done()
+                    done.call();
                 }
-                // Go: defer done()
-                done.call();
-            }
+            });
         }
 
         // Go: wg.Wait()
@@ -2307,13 +2324,15 @@ impl RegistryBuilder {
                 return None;
             }
             // Go: wg.Go(func() {...})
-            let file = self
-                .host
-                .get_source_file(&realpath_file_name, &realpath_path);
-            if file.is_some() {
-                bind_alias_resolver_source_file(self.host.get_current_directory(), file);
-            }
-            root_files[i] = file;
+            go_wait_group_goroutine(|| {
+                let file = self
+                    .host
+                    .get_source_file(&realpath_file_name, &realpath_path);
+                if file.is_some() {
+                    bind_alias_resolver_source_file(self.host.get_current_directory(), file);
+                }
+                root_files[i] = file;
+            });
         }
         // Go: wg.Wait()
         root_files.retain(|f| f.is_some());

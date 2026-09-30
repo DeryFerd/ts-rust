@@ -3402,6 +3402,9 @@ impl Server {
                 Box::new(move |changes: Vec<lsproto::FileEvent>| {
                     let session = s.session.borrow().clone();
                     if let Some(session) = session {
+                        // PORT: the watcher gives values; Go's are `*lsproto.FileEvent`.
+                        let changes: Vec<Option<lsproto::FileEvent>> =
+                            changes.into_iter().map(Some).collect();
                         session.did_change_watched_files(&s.shared.background_ctx(), &changes);
                     }
                 }),
@@ -3425,7 +3428,10 @@ impl Server {
             None => None,
         };
         if client_capabilities.workspace.workspace_folders && single_workspace_folder.is_some() {
-            let folder = single_workspace_folder.expect("checked above");
+            let folder = single_workspace_folder
+                .expect("checked above")
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             cwd = lsproto::DocumentUri(folder.uri.0.clone()).file_name();
         } else if let Some(root_uri) = &initialize_params.root_uri.document_uri {
             cwd = root_uri.file_name();
@@ -3852,10 +3858,10 @@ impl Server {
                 });
             }
             let rename_files_params = lsproto::RenameFilesParams {
-                files: vec![lsproto::FileRename {
+                files: vec![Some(lsproto::FileRename {
                     old_uri: lsconv::file_name_to_document_uri(&info.file_to_rename).0,
                     new_uri: lsconv::file_name_to_document_uri(&info.new_file_name).0,
-                }],
+                })],
             };
             return self.handle_will_rename_files_worker(
                 ctx,
@@ -3900,6 +3906,10 @@ impl Server {
 
         let mut uris: Vec<lsproto::DocumentUri> = Vec::with_capacity(params.files.len());
         for file in &params.files {
+            // Go: file.OldUri (a nil element panics)
+            let file = file
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             uris.push(lsproto::DocumentUri(file.old_uri.clone()));
         }
 
@@ -3924,6 +3934,9 @@ impl Server {
             // current while it runs (ls::LanguageService::enter_program).
             let _program = language_service.enter_program();
             for file in &params.files {
+                let file = file
+                    .as_ref()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 let changes = language_service.get_edits_for_file_rename(
                     ctx,
                     &lsproto::DocumentUri(file.old_uri.clone()),
@@ -3971,6 +3984,9 @@ impl Server {
 
         if send_rename_file {
             for file in &params.files {
+                let file = file
+                    .as_ref()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 document_changes.push(
                     lsproto::TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile {
                         rename_file: Some(lsproto::RenameFile {
@@ -4204,14 +4220,19 @@ impl Server {
         let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         let mut resp = lsproto::WorkspaceSymbolResponse::default();
         let mut ls_err: Option<GoError> = None;
+        // PORT: Go maps the projects to their programs before this call (a
+        // nil program stays nil) and reads a nil program in
+        // `ProvideWorkspaceSymbols`, under the recover. A port program is
+        // never nil, so `programs` reads each project's program inside the
+        // recover, where the port's nil read panics.
         let mut provide_symbols =
-            |snapshot: &Rc<Snapshot>, programs: Vec<Rc<compiler::NewProgram>>| {
+            |snapshot: &Rc<Snapshot>, programs: &dyn Fn() -> Vec<Rc<compiler::NewProgram>>| {
                 self.recover_guard(
                     req_msg,
                     || (),
                     || match ls::provide_workspace_symbols(
                         ctx,
-                        &programs,
+                        &programs(),
                         &snapshot.converters(),
                         &snapshot.user_preferences(),
                         &params.query,
@@ -4235,29 +4256,27 @@ impl Server {
             let uri = &text_document.uri;
             session.with_snapshot_for_document(ctx, uri, &mut |snapshot: &Rc<Snapshot>| {
                 // Go: core.Map(snapshot.GetProjectsContainingFile(uri), ls.Project.GetProgram)
-                let programs: Vec<Rc<compiler::NewProgram>> = snapshot
-                    .get_projects_containing_file(uri)
-                    .iter()
-                    .map(|p| p.get_program())
-                    .collect();
-                provide_symbols(snapshot, programs);
+                let projects = snapshot.get_projects_containing_file(uri);
+                provide_symbols(snapshot, &|| {
+                    projects.iter().map(|p| p.get_program()).collect()
+                });
             });
         } else {
             session.with_snapshot_loading_project_tree(ctx, None, &mut |snapshot: &Rc<
                 Snapshot,
             >| {
                 // Go: core.Map(snapshot.ProjectCollection.Projects(), (*project.Project).GetProgram)
-                let programs: Vec<Rc<compiler::NewProgram>> = snapshot
-                    .project_collection
-                    .projects()
-                    .iter()
-                    .map(|p| {
-                        p.borrow()
-                            .get_program()
-                            .unwrap_or_else(|| crate::core::go_nil_dereference())
-                    })
-                    .collect();
-                provide_symbols(snapshot, programs);
+                let projects = snapshot.project_collection.projects();
+                provide_symbols(snapshot, &|| {
+                    projects
+                        .iter()
+                        .map(|p| {
+                            p.borrow()
+                                .get_program()
+                                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                        })
+                        .collect()
+                });
             });
         }
         match ls_err {
@@ -4756,21 +4775,22 @@ impl Server {
 }
 
 // Go: server.go:2464 parseContentMapperContributions (tsgo#4712)
-// PORT: Go `[]*lsproto.ContentMapperContribution` may hold nil entries; the
-// Rust list cannot, so only the empty `contributorId` check remains. Go
-// `json.Marshal` of the options map (`LSPObject`) writes the keys in Go map
+// PORT: Go `json.Marshal` of the options map (`LSPObject`) writes the keys in Go map
 // order (random); `IndexMap` writes them in the order the client sent them.
 pub fn parse_content_mapper_contributions(
-    values: &[lsproto::ContentMapperContribution],
+    values: &[Option<lsproto::ContentMapperContribution>],
 ) -> Result<project::ContentMapperContributions, GoError> {
     let mut result = project::ContentMapperContributions::default();
     let mut claimed_extensions: FxHashSet<String> = FxHashSet::default();
     for (index, value) in values.iter().enumerate() {
-        if value.contributor_id.is_empty() {
+        let Some(value) = value
+            .as_ref()
+            .filter(|value| !value.contributor_id.is_empty())
+        else {
             return Err(errors::new(
                 "content mapper contribution requires a contributorId",
             ));
-        }
+        };
         let identity = format!("{}[{}]", value.contributor_id, index);
         let mut valid_extensions: Vec<String> = Vec::with_capacity(value.extensions.len());
         for extension in &value.extensions {

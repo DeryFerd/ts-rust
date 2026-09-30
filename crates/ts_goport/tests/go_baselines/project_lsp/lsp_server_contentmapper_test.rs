@@ -299,10 +299,10 @@ child_test! {
         client.send_notification(
             &lsproto::WORKSPACE_DID_CHANGE_WATCHED_FILES_INFO,
             lsproto::DidChangeWatchedFilesParams {
-                changes: vec![lsproto::FileEvent {
+                changes: vec![Some(lsproto::FileEvent {
                     uri: uri("file:///home/project/tsconfig.json"),
                     type_: lsproto::FileChangeType::CHANGED,
-                }],
+                })],
             },
         );
         let (hover_msg, hover) = client.send_request(

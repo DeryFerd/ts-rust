@@ -4286,7 +4286,7 @@ pub struct CodeActionContext {
     // errors are currently presented to the user for the given range. There is no guarantee
     // that these accurately reflect the error state of the resource. The primary parameter
     // to compute code actions is the provided range.
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<Option<Diagnostic>>,
 
     // Requested kind of actions to return.
     //

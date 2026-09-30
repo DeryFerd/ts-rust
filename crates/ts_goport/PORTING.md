@@ -257,15 +257,15 @@ methods reach the AST through it.
   parents, links, and the store and `GoFile` of a static publish), in a
   static array for ids below 2^16 (`FILE_BLOCKS`, one cache line per
   entry) and in chunks made on demand above (`HIGH_BLOCKS`, read in a cold
-  block that calls the empty `high_block_path`). So the first program, a later program (`tsc -b`, watch,
-  an edited file) and the node shell of a freeable version read the same
-  way: a hot node read is two dependent loads, and has no call. The block
-  of a freeable version is its node shell (records, kids and foreign
-  parents leaked; no node column when its store owns its nodes; no link
-  column), so its header and child reads are block reads, and its node
-  data reads read the pinned version (`static_store_node`,
-  `with_scoped_store_node`). A read of the store or the `GoFile` of a
-  node shell reads the pinned version out of line
+  block that calls the empty `high_block_path`). So the first program, a
+  later program (`tsc -b`, watch, an edited file) and the node shell of a
+  freeable version read the same way: a hot node read is two dependent
+  loads, and has no call. The block of a freeable version is its node
+  shell (records, kids and foreign parents leaked; no node column when
+  its store owns its nodes; no link column), so its header and child
+  reads are block reads, and its node data reads read the pinned version
+  (`static_store_node`, `with_scoped_store_node`). A read of the store or
+  the `GoFile` of a node shell reads the pinned version out of line
   (`with_published_store`, `try_with_go_file`); `static_go_file` gives
   `None` there. A new per-slot column goes into a record or kids word; a
   new per-file table goes into `BlockFile`. Keep the fast paths free of
@@ -943,7 +943,11 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   names keep the Go spelling (`HoverParams`, `URI`, `DocumentUri`); fields
   are snake case (`text_document`, `type_`); `*T` is `Option<T>`
   (`Option<Box<T>>` only on a type cycle); `*[]T` is `Option<Vec<T>>`;
-  `[]T` and `[]*T` are `Vec<T>`; `map[K]V` is `IndexMap<K, V>`; LSPAny is
+  `[]T` and `[]*T` are `Vec<T>`, except that `[]*T` is `Vec<Option<T>>`
+  in a type that the server only decodes (client-to-server params,
+  server-to-client results, and the types they hold that the server never
+  encodes), so a JSON null element is Go's nil element (the generator's
+  `decodeOnlyTypes`); `map[K]V` is `IndexMap<K, V>`; LSPAny is
   `LspAny`; a string enum is `pub struct MarkupKind(pub Cow<'static, str>)`
   with consts such as `MarkupKind::PLAIN_TEXT`; an int enum is
   `pub struct CompletionItemKind(pub i32)` with consts; method consts are

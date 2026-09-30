@@ -1158,7 +1158,9 @@ impl WatcherBase {
                 Ok(Err(err)) => self_impl.base().handle_start_error(err),
                 Err(r) => {
                     // Go: err, ok := r.(error); if !ok { err = fmt.Errorf("%v", r) }
-                    let text = if let Some(s) = r.downcast_ref::<&str>() {
+                    let text = if let Some(panic) = r.downcast_ref::<crate::core::GoPanic>() {
+                        panic.message.clone()
+                    } else if let Some(s) = r.downcast_ref::<&str>() {
                         (*s).to_string()
                     } else if let Some(s) = r.downcast_ref::<String>() {
                         s.clone()

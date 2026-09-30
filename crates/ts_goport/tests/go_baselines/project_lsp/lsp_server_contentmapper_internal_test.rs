@@ -107,7 +107,7 @@ child_test! {
         let mut options: IndexMap<String, LspAny> = IndexMap::new();
         options.insert("mode".to_string(), LspAny::String("embedded".to_string()));
         let contributions = lsp::parse_content_mapper_contributions(&[
-            lsproto::ContentMapperContribution {
+            Some(lsproto::ContentMapperContribution {
                 contributor_id: "publisher.extension".to_string(),
                 extensions: vec![".vue".to_string()],
                 inferred_project_contribution: Some(lsproto::InferredProjectContentMapperContribution {
@@ -121,12 +121,12 @@ child_test! {
                         dynamic_config: None,
                     }),
                 }),
-            },
-            lsproto::ContentMapperContribution {
+            }),
+            Some(lsproto::ContentMapperContribution {
                 contributor_id: "publisher.extension".to_string(),
                 extensions: vec![".svelte".to_string()],
                 inferred_project_contribution: None,
-            },
+            }),
         ])
         .unwrap_or_else(|err| panic!("parseContentMapperContributions: {}", err.error()));
         assert_eq!(contributions.mappers.len(), 1);
@@ -149,16 +149,16 @@ child_test! {
             manifest: Some(manifest(name, &[name])),
         };
         let result = lsp::parse_content_mapper_contributions(&[
-            lsproto::ContentMapperContribution {
+            Some(lsproto::ContentMapperContribution {
                 contributor_id: "first".to_string(),
                 extensions: vec![".vue".to_string()],
                 inferred_project_contribution: Some(inferred_project_contribution("first")),
-            },
-            lsproto::ContentMapperContribution {
+            }),
+            Some(lsproto::ContentMapperContribution {
                 contributor_id: "second".to_string(),
                 extensions: vec![".vue".to_string()],
                 inferred_project_contribution: Some(inferred_project_contribution("second")),
-            },
+            }),
         ]);
         match result {
             Ok(_) => panic!("expected an error"),
@@ -174,14 +174,14 @@ child_test! {
 child_test! {
     // Go: server_contentmapper_internal_test.go:75 TestParseContentMapperContributionsDefaultsOptionsToObject
     fn parse_content_mapper_contributions_defaults_options_to_object() {
-        let contributions = lsp::parse_content_mapper_contributions(&[lsproto::ContentMapperContribution {
+        let contributions = lsp::parse_content_mapper_contributions(&[Some(lsproto::ContentMapperContribution {
             contributor_id: "publisher.extension".to_string(),
             extensions: vec![".vue".to_string()],
             inferred_project_contribution: Some(lsproto::InferredProjectContentMapperContribution {
                 options: None,
                 manifest: Some(manifest("mapper", &["mapper"])),
             }),
-        }])
+        })])
         .unwrap_or_else(|err| panic!("parseContentMapperContributions: {}", err.error()));
         assert_eq!(
             String::from_utf8_lossy(&contributions.mappers[0].definition.options.0),

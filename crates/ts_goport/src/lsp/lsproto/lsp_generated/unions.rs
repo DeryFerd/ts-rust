@@ -694,7 +694,7 @@ impl IsZero for InitializationOptionsOrNull {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WorkspaceFoldersOrNull {
-    pub workspace_folders: Option<Vec<WorkspaceFolder>>,
+    pub workspace_folders: Option<Vec<Option<WorkspaceFolder>>>,
 }
 
 impl MarshalerTo for WorkspaceFoldersOrNull {

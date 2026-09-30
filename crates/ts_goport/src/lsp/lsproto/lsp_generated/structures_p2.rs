@@ -6647,10 +6647,10 @@ impl IsZero for TypeDefinitionOptions {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WorkspaceFoldersChangeEvent {
     // The array of added workspace folders
-    pub added: Vec<WorkspaceFolder>,
+    pub added: Vec<Option<WorkspaceFolder>>,
 
     // The array of the removed workspace folders
-    pub removed: Vec<WorkspaceFolder>,
+    pub removed: Vec<Option<WorkspaceFolder>>,
 }
 
 impl UnmarshalerFrom for WorkspaceFoldersChangeEvent {

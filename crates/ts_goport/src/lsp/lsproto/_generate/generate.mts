@@ -2264,7 +2264,8 @@ const goIdentifier = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /**
  * goTypeToRust converts a Go type string from resolveType (or a field type
  * built from it) to the Rust type (map-lsproto.md section 3, PORTING.md
- * "Protocol types"). `*T` is Option<T>, `[]T` and `[]*T` are Vec<T>,
+ * "Protocol types"). `*T` is Option<T>, `[]T` and `[]*T` are Vec<T>
+ * (`[]*T` is Vec<Option<T>> in a decode-only type: fieldGoTypeToRust),
  * `map[K]V` and `map[K]*V` are IndexMap<K, V>, `any` is LspAny, `struct{}`
  * is EmptyObject and `[2]uint32` is [u32; 2]. Named types keep their name.
  * Box for type cycles is added per field by the caller (see boxedEdges).
@@ -2513,6 +2514,68 @@ function generateCode(): Map<string, string> {
         typeFields.set(`Resolved${structure.name}`, resolvedGoFields(structure));
     }
 
+    // ------------------------------------------------------------------
+    // Nil list elements. Go decodes a JSON null element of a `[]*T` as a
+    // nil pointer, and code that reads it panics. The port keeps `[]*T` as
+    // `Vec<T>`, because it never builds a nil element, except in the types
+    // that the server only decodes: the params of client-to-server methods
+    // and the results of server-to-client requests, with the types they
+    // hold, less every type that the server also encodes. There a `[]*T` is
+    // `Vec<Option<T>>`, so a null element decodes as Go's nil. A list that
+    // holds no null encodes and decodes as before (PORTING.md "Protocol
+    // types").
+    // ------------------------------------------------------------------
+    function namedGoTypes(goType: string): string[] {
+        if (goType.startsWith("*")) return namedGoTypes(goType.slice(1));
+        if (goType.startsWith("[]")) return namedGoTypes(goType.slice(2));
+        if (goType.startsWith("map[")) {
+            const [key, value] = splitGoMapType(goType);
+            return [...namedGoTypes(key), ...namedGoTypes(value)];
+        }
+        return typeFields.has(goType) ? [goType] : [];
+    }
+
+    function typeClosure(roots: Iterable<string>): Set<string> {
+        const seen = new Set<string>();
+        const todo = [...roots];
+        while (todo.length > 0) {
+            const name = todo.pop()!;
+            if (seen.has(name)) continue;
+            seen.add(name);
+            for (const field of typeFields.get(name)!) {
+                todo.push(...namedGoTypes(field.goType));
+            }
+        }
+        return seen;
+    }
+
+    const decodeOnlyTypes = (() => {
+        const decoded: string[] = [];
+        const encoded: string[] = [];
+        for (const method of requestsAndNotifications) {
+            const toServer = method.messageDirection !== "serverToClient";
+            const toClient = method.messageDirection !== "clientToServer";
+            const params = method.params && !Array.isArray(method.params) ? namedGoTypes(resolveType(method.params).name) : [];
+            const result = "result" in method ? namedGoTypes(resolveType(method.result).name) : [];
+            if (toServer) decoded.push(...params), encoded.push(...result);
+            if (toClient) encoded.push(...params), decoded.push(...result);
+            if (method.registrationOptions) {
+                encoded.push(...namedGoTypes(resolveType(method.registrationOptions).name));
+            }
+        }
+        const encodedClosure = typeClosure(encoded);
+        return new Set([...typeClosure(decoded)].filter(name => !encodedClosure.has(name)));
+    })();
+
+    // fieldGoTypeToRust is goTypeToRust for a field of `owner`, with the
+    // nil elements of a decode-only type.
+    function fieldGoTypeToRust(owner: string, goType: string): string {
+        const list = /^(\*?)\[\]\*(.*)$/.exec(goType);
+        if (!list || !decodeOnlyTypes.has(owner)) return goTypeToRust(goType);
+        const vec = `Vec<Option<${goTypeToRust(list[2])}>>`;
+        return list[1] ? `Option<${vec}>` : vec;
+    }
+
     const enumKinds = new Map(model.enumerations.map(e => [e.name, e.type.name === "string" ? "string" : "int"]));
     const literalNames = new Set(typeInfo.literalTypes.values());
 
@@ -2554,7 +2617,7 @@ function generateCode(): Map<string, string> {
     }
 
     function rustFieldType(owner: string, field: GoField): string {
-        const rust = goTypeToRust(field.goType);
+        const rust = fieldGoTypeToRust(owner, field.goType);
         if (!isBoxed(owner, field)) return rust;
         if (field.goType.startsWith("*")) return `Option<Box<${goTypeToRust(field.goType.slice(1))}>>`;
         return `Box<${rust}>`;
@@ -2949,7 +3012,7 @@ function generateCode(): Map<string, string> {
     // Go: var vX T; if err := json.Unmarshal(data, &vX); err == nil { o.X = &vX; return nil }
     function writeTryEach(entry: UnionEntry, indent: string) {
         const field = rustFieldName(entry.fieldName);
-        const rustType = goTypeToRust(entry.typeName);
+        const rustType = fieldGoTypeToRust(currentUnion, entry.typeName);
         writeLine(`${indent}let mut v_${field}: ${rustType} = Default::default();`);
         writeLine(`${indent}if json_unmarshal(data, &mut v_${field}, &[]).is_ok() {`);
         writeLine(`${indent}    self.${field} = Some(${entryIsBoxed(entry) ? `Box::new(v_${field})` : `v_${field}`});`);

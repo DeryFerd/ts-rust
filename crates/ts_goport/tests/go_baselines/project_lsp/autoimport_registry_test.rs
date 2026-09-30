@@ -274,10 +274,10 @@ child_test! {
             session_utils.fs().write_file(package_json.file_name(), content).unwrap();
             session.did_change_watched_files(
                 &bg(),
-                &[lsproto::FileEvent {
+                &[Some(lsproto::FileEvent {
                     type_: CHANGED,
                     uri: package_json.uri(),
-                }],
+                })],
             );
         };
 
@@ -368,10 +368,10 @@ child_test! {
         session_utils.fs().remove(&node_modules_dir).unwrap();
         session.did_change_watched_files(
             &bg(),
-            &[lsproto::FileEvent {
+            &[Some(lsproto::FileEvent {
                 type_: DELETED,
                 uri: lsconv::file_name_to_document_uri(&node_modules_dir),
-            }],
+            })],
         );
 
         // Re-preparing auto-imports must succeed and leave the registry prepared.
@@ -415,14 +415,14 @@ child_test! {
         session.did_change_watched_files(
             &bg(),
             &[
-                lsproto::FileEvent {
+                Some(lsproto::FileEvent {
                     type_: CHANGED,
                     uri: package_json.uri(),
-                },
-                lsproto::FileEvent {
+                }),
+                Some(lsproto::FileEvent {
                     type_: DELETED,
                     uri: lsconv::file_name_to_document_uri(&node_modules_dir),
-                },
+                }),
             ],
         );
 
@@ -451,10 +451,10 @@ child_test! {
         session_utils.fs().remove(&node_package.directory).unwrap();
         session.did_change_watched_files(
             &bg(),
-            &[lsproto::FileEvent {
+            &[Some(lsproto::FileEvent {
                 type_: DELETED,
                 uri: lsconv::file_name_to_document_uri(&node_package.directory),
-            }],
+            })],
         );
 
         with_auto_imports(session, &main_file.uri());
