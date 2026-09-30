@@ -20,36 +20,6 @@ fn element_or_nil_p04(nodes: &[Node], i: usize) -> Node {
     if i < nodes.len() { nodes[i] } else { Node::NIL }
 }
 
-// PORT: Go reads the `Attributes` field of ImportTypeNode. In Rust
-// `node.attributes()` is the Go `Node.Attributes()` method (JSX only), and
-// fields.rs does not generate a clashing field accessor. The `Attributes`
-// field is the only child of kind `ImportAttributes` on an ImportTypeNode, so
-// we find it with `for_each_child` (same approach as ast/utilities_p4.rs).
-fn import_type_node_attributes_p04(node: Node) -> Node {
-    let mut attributes = Node::NIL;
-    node.for_each_child(&mut |child: Node| {
-        if child.kind() == SyntaxKind::ImportAttributes {
-            attributes = child;
-            return true;
-        }
-        false
-    });
-    attributes
-}
-
-// PORT: Go `node.AsImportAttributes().Attributes.Nodes`. The field clashes
-// with the Go `Node.Attributes()` method, so it is not generated in
-// fields.rs. The children of an ImportAttributes node are exactly the
-// elements of that list, in order.
-fn import_attributes_elements_p04(node: Node) -> Vec<Node> {
-    let mut elements = Vec::new();
-    node.for_each_child(&mut |child: Node| {
-        elements.push(child);
-        false
-    });
-    elements
-}
-
 impl Checker {
     // Go: checker/checker.go:2968 checkTypeReferenceNode
     pub fn check_type_reference_node(&mut self, node: Node) {
@@ -72,7 +42,9 @@ impl Checker {
             }
         }
         self.check_source_elements(node.type_arguments());
-        self.check_type_reference_or_import(node);
+        if !(is_const_type_reference(node) && is_assertion_expression(node.parent())) {
+            self.check_type_reference_or_import(node);
+        }
     }
 
     // Go: checker/checker.go:2984 checkTypeReferenceOrImport
@@ -630,65 +602,37 @@ impl Checker {
         self.get_type_from_type_node(node);
     }
 
-    // Go: checker/checker.go:3308 checkImportType
+    // Go: checker/checker.go:3368 checkImportType
     pub fn check_import_type(&mut self, node: Node) {
         self.check_source_element(node.argument());
-        let attributes = import_type_node_attributes_p04(node);
+        let attributes = node.attributes();
         if attributes.is_some() {
-            self.get_resolution_mode_override(attributes, true /*reportErrors*/);
+            let import_attributes = attributes;
+            self.check_grammar_import_attribute_values(import_attributes);
+            self.get_resolution_mode_override(import_attributes, true /*reportErrors*/);
         }
         self.check_type_reference_or_import(node);
+        self.check_import_attributes(node);
     }
 
-    // Go: checker/checker.go:3316 getResolutionModeOverride
+    // Go: checker/checker.go:3377 getResolutionModeOverride
+    // PORT: Go passes `c.grammarErrorOnNode` as the callback, or nil.
     pub fn get_resolution_mode_override(
         &mut self,
         node: Node,
         report_errors: bool,
     ) -> ResolutionMode {
-        let attributes = import_attributes_elements_p04(node);
-        if attributes.len() != 1 {
-            if report_errors {
-                self.grammar_error_on_node(
-                    node,
-                    diag::Type_import_attributes_should_have_exactly_one_key_resolution_mode_with_value_import_or_require,
-                    args![],
-                );
-            }
-            return RESOLUTION_MODE_NONE;
-        }
-        let elem = attributes[0];
-        if !is_string_literal_like(elem.name()) {
-            return RESOLUTION_MODE_NONE;
-        }
-        if elem.name().text() != "resolution-mode" {
-            if report_errors {
-                self.grammar_error_on_node(
-                    elem.name(),
-                    diag::X_resolution_mode_is_the_only_valid_key_for_type_import_attributes,
-                    args![],
-                );
-            }
-            return RESOLUTION_MODE_NONE;
-        }
-        let value = elem.value();
-        if !is_string_literal_like(value) {
-            return RESOLUTION_MODE_NONE;
-        }
-        if value.text() != "import" && value.text() != "require" {
-            if report_errors {
-                self.grammar_error_on_node(
-                    value,
-                    diag::X_resolution_mode_should_be_either_require_or_import,
-                    args![],
-                );
-            }
-            return RESOLUTION_MODE_NONE;
-        }
-        if value.text() == "import" {
-            return RESOLUTION_MODE_ESM;
-        }
-        RESOLUTION_MODE_COMMON_JS
+        let (mode, _) = if report_errors {
+            node.get_resolution_mode_override(Some(&mut |n: Node,
+                                                         message: &'static Message,
+                                                         args: Vec<String>|
+             -> bool {
+                self.grammar_error_on_node(n, message, args)
+            }))
+        } else {
+            node.get_resolution_mode_override(None)
+        };
+        mode
     }
 
     // Go: checker/checker.go:3349 checkNamedTupleMember
@@ -801,6 +745,7 @@ impl Checker {
         // reaches here embeds FunctionLikeBase, which `full_signature()` covers.
         let full_signature = node.full_signature();
         if full_signature.is_some() {
+            self.check_source_element(full_signature);
             let full_signature_type = self.get_type_from_type_node(full_signature);
             if self
                 .get_contextual_call_signature(full_signature_type, node)

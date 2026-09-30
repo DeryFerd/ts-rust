@@ -25,6 +25,8 @@ pub mod inotify_linux;
     target_os = "dragonfly"
 ))]
 pub mod kqueue;
+pub mod pathcompare;
+pub mod pathkey;
 pub mod syscall;
 #[cfg(target_os = "linux")]
 pub mod unix;

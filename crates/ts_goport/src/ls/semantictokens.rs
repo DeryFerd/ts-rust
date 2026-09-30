@@ -359,7 +359,7 @@ impl SemanticTokenCollector<'_> {
             self.in_jsx_element = false;
         }
 
-        if is_identifier(node)
+        if (is_identifier(node) || is_private_identifier(node))
             && !node.text().is_empty()
             && !self.in_jsx_element
             && !is_in_import_clause(node)

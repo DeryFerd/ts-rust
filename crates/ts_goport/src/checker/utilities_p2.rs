@@ -657,6 +657,9 @@ pub fn get_feature_map() -> &'static FxHashMap<&'static str, Vec<FeatureMapEntry
                 ],
             ),
             ("Iterator", vec![entry("es2015", &[])]),
+            ("IteratorConstructor", vec![entry("es2026", &["concat"])]),
+            ("RawJSON", vec![entry("es2026", &[])]),
+            ("JSON", vec![entry("es2026", &["isRawJSON", "rawJSON"])]),
             ("AsyncIterator", vec![entry("es2015", &[])]),
             (
                 "ArrayBuffer",
@@ -740,7 +743,7 @@ pub fn get_feature_map() -> &'static FxHashMap<&'static str, Vec<FeatureMapEntry
                 "ArrayConstructor",
                 vec![
                     entry("es2015", &["from", "of"]),
-                    entry("esnext", &["fromAsync"]),
+                    entry("es2026", &["fromAsync"]),
                 ],
             ),
             (
@@ -791,13 +794,14 @@ pub fn get_feature_map() -> &'static FxHashMap<&'static str, Vec<FeatureMapEntry
                         ],
                     ),
                     entry("es2025", &["f16round"]),
+                    entry("es2026", &["sumPrecise"]),
                 ],
             ),
             (
                 "Map",
                 vec![
                     entry("es2015", &["entries", "keys", "values"]),
-                    entry("esnext", &["getOrInsert", "getOrInsertComputed"]),
+                    entry("es2026", &["getOrInsert", "getOrInsertComputed"]),
                 ],
             ),
             ("MapConstructor", vec![entry("es2024", &["groupBy"])]),
@@ -840,7 +844,7 @@ pub fn get_feature_map() -> &'static FxHashMap<&'static str, Vec<FeatureMapEntry
                 "WeakMap",
                 vec![
                     entry("es2015", &[]),
-                    entry("esnext", &["getOrInsert", "getOrInsertComputed"]),
+                    entry("es2026", &["getOrInsert", "getOrInsertComputed"]),
                 ],
             ),
             ("WeakSet", vec![entry("es2015", &[])]),
@@ -957,6 +961,10 @@ pub fn get_feature_map() -> &'static FxHashMap<&'static str, Vec<FeatureMapEntry
                             "toSpliced",
                             "with",
                         ],
+                    ),
+                    entry(
+                        "es2026",
+                        &["toBase64", "setFromBase64", "toHex", "setFromHex"],
                     ),
                 ],
             ),
@@ -1117,10 +1125,10 @@ pub fn get_feature_map() -> &'static FxHashMap<&'static str, Vec<FeatureMapEntry
                 ],
             ),
             ("Error", vec![entry("es2022", &["cause"])]),
-            ("ErrorConstructor", vec![entry("esnext", &["isError"])]),
+            ("ErrorConstructor", vec![entry("es2026", &["isError"])]),
             (
                 "Uint8ArrayConstructor",
-                vec![entry("esnext", &["fromBase64", "fromHex"])],
+                vec![entry("es2026", &["fromBase64", "fromHex"])],
             ),
             ("DisposableStack", vec![entry("esnext", &[])]),
             ("AsyncDisposableStack", vec![entry("esnext", &[])]),
@@ -1259,8 +1267,7 @@ impl Checker {
     // Go: checker/utilities.go:1630 IsExternalModuleSymbol
     // True if the symbol is for an external module, as opposed to a namespace.
     pub fn is_external_module_symbol(&self, module_symbol: SymbolId) -> bool {
-        let s = self.sym(module_symbol);
-        s.flags.intersects(SymbolFlags::MODULE) && s.name.starts_with('"')
+        self.sym(module_symbol).is_external_module()
     }
 
     // Go: checker/utilities.go:1635 isCanceled

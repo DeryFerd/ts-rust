@@ -1,0 +1,281 @@
+//! Go `internal/project/snapshothost.go` (ts#64163).
+//!
+//! PORT: one thread (project/dirty/interfaces.rs). Go `*SnapshotHost` is
+//! `Rc<SnapshotHost>`: every snapshot keeps its host so `Deref` can release
+//! the host's caches. The Go `atomic.Uint64` snapshot id is a `Cell`. Go
+//! `Session` embeds `*SnapshotHost`; the Rust `Session` holds it in
+//! `snapshot_host` and derefs to it (session.rs).
+
+use crate::project::prelude::*;
+
+use crate::contentmapper;
+use crate::frontend::parser;
+use std::cell::Cell;
+
+// Go: project/snapshothost.go:19 SnapshotHost
+// SnapshotHost owns the services shared by a collection of immutable snapshots.
+pub struct SnapshotHost {
+    pub options: Rc<SessionOptions>,
+    pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
+    pub fs: Rc<dyn vfs::Fs>,
+
+    pub parse_cache: Rc<ParseCache>,
+    pub content_mapped_parse_cache: Rc<ContentMappedParseCache>,
+    pub extended_config_cache: Rc<ExtendedConfigCache>,
+    pub program_counter: Rc<ProgramCounter>,
+    pub content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
+
+    pub snapshot_id: Cell<u64>,
+
+    // PORT: the parse cache references that auto-import registry clones
+    // keep after the clone, one per path (see
+    // `AutoImportRegistryCloneHost::dispose`). No Go counterpart. It moved
+    // from `Session` with the caches it belongs to.
+    pub auto_import_parse_keys: Rc<AutoImportParseKeys>,
+}
+
+// Go: project/snapshothost.go:34 SourceFileLease (ts#64434)
+// PORT: Go `releaseOnce sync.Once` is a `Cell<bool>` (one thread).
+pub struct SourceFileLease {
+    cache: Rc<ParseCache>,
+    key: ParseCacheKey,
+    source_file: Rc<parser::ParsedSourceFile>,
+    released: Cell<bool>,
+}
+
+impl SourceFileLease {
+    // Go: project/snapshothost.go:41 SourceFileLease.SourceFile
+    // PORT: Go returns the `*ast.SourceFile`; the port returns its root node,
+    // which the API encoder takes.
+    pub fn source_file(&self) -> Node {
+        self.source_file.root
+    }
+
+    // Go: project/snapshothost.go:45 SourceFileLease.Release
+    pub fn release(&self) {
+        if !self.released.replace(true) {
+            self.cache.deref(&self.key);
+        }
+    }
+}
+
+/// Go `logging.Logger` as the session logger argument of `Snapshot.Clone`,
+/// `cloneForProgram` and `CloneSnapshotWithAutoImports`.
+// PORT: Go passes the session's logger (a non-nil interface, also for the nop
+// logger) or nil. `None` is the Go nil interface; `Some(logger)` is the
+// session logger, which is itself `None` for the nop logger (see
+// `logging::new_nop_logger`).
+pub type SessionLogger<'a> = Option<&'a Option<Rc<dyn logging::Logger>>>;
+
+impl SnapshotHost {
+    // Go: project/snapshothost.go:51 SnapshotHost.nextSnapshotID
+    pub fn next_snapshot_id(&self) -> u64 {
+        // Go: s.snapshotID.Add(1)
+        let id = self.snapshot_id.get() + 1;
+        self.snapshot_id.set(id);
+        id
+    }
+
+    // Go: project/snapshothost.go:55 SnapshotHost.AcquireSourceFile (ts#64434)
+    pub fn acquire_source_file(
+        &self,
+        options: parser::SourceFileParseOptions,
+        text: &str,
+        script_kind: ScriptKind,
+    ) -> Rc<SourceFileLease> {
+        let file_handle = new_cached_file_handle(&options.file_name, text.to_string());
+        let key = new_parse_cache_key(&options, file_handle.hash(), script_kind);
+        let source_file = self.parse_cache.acquire(key.clone(), file_handle).file;
+        Rc::new(SourceFileLease {
+            cache: self.parse_cache.clone(),
+            key,
+            source_file,
+            released: Cell::new(false),
+        })
+    }
+}
+
+// Go: project/snapshothost.go:37 NewSnapshotHost
+pub fn new_snapshot_host(init: &SessionInit) -> Rc<SnapshotHost> {
+    let current_directory = init.options.current_directory.clone();
+    let use_case_sensitive_file_names = init.fs.use_case_sensitive_file_names();
+    let to_path: Rc<dyn Fn(&str) -> tspath::Path> = Rc::new(move |file_name: &str| {
+        tspath::to_path(file_name, &current_directory, use_case_sensitive_file_names)
+    });
+    let mut parse_cache = init.parse_cache.clone();
+    if parse_cache.is_none() {
+        parse_cache = Some(new_parse_cache(RefCountCacheOptions::default()));
+    }
+    let mut content_mapped_parse_cache = init.content_mapped_parse_cache.clone();
+    if content_mapped_parse_cache.is_none() {
+        content_mapped_parse_cache = Some(new_content_mapped_parse_cache(
+            RefCountCacheOptions::default(),
+        ));
+    }
+
+    Rc::new(SnapshotHost {
+        options: init.options.clone(),
+        to_path,
+        fs: init.fs.clone(),
+        parse_cache: parse_cache.expect("parse cache is set above"),
+        content_mapped_parse_cache: content_mapped_parse_cache
+            .expect("content mapped parse cache is set above"),
+        extended_config_cache: new_extended_config_cache(),
+        program_counter: Rc::new(ProgramCounter::default()),
+        content_mapper_host: new_content_mapper_host(init),
+        snapshot_id: Cell::new(0),
+        auto_import_parse_keys: Rc::new(RefCell::new(FxHashMap::default())),
+    })
+}
+
+impl SnapshotHost {
+    // Go: project/snapshothost.go:62 NewRootSnapshot (ts#64204: was NewStandaloneRootSnapshot)
+    // NewRootSnapshot creates an independent root snapshot.
+    // PORT: `_exported`, because Go also has `newRootSnapshot` (PORTING "Names").
+    pub fn new_root_snapshot_exported(self: &Rc<Self>) -> Rc<Snapshot> {
+        self.new_root_snapshot(0, false)
+    }
+
+    // Go: project/snapshothost.go:69 RetainSnapshot
+    // RetainSnapshot adds a reference to a snapshot owned by this host.
+    pub fn retain_snapshot(&self, snapshot: &Snapshot) {
+        snapshot.ref_();
+    }
+
+    // Go: project/snapshothost.go:75 CloneSnapshot
+    // CloneSnapshot derives a snapshot from baseSnapshot without adopting it as any
+    // canonical session state or performing session side effects.
+    // PORT: Go returns `(*Snapshot, error)` and returns the snapshot also with
+    // an error; the port returns both values. Go `*APISnapshotRequest` is
+    // `Option<&APISnapshotRequest>`; the snapshot change holds a copy.
+    pub fn clone_snapshot(
+        &self,
+        ctx: &Context,
+        base_snapshot: &Rc<Snapshot>,
+        file_changes: FileChangeSummary,
+        api_request: Option<&APISnapshotRequest>,
+    ) -> (Rc<Snapshot>, Option<GoError>) {
+        let mut change = SnapshotChange {
+            api_request: api_request.cloned(),
+            file_changes,
+            ..Default::default()
+        };
+        // ts#64115
+        if let Some(api_request) = api_request {
+            change.fs = api_request.file_system.clone();
+            change.file_system_override = api_request.file_system.is_some();
+            change.replace_file_system = api_request.replace_file_system;
+        }
+        let snapshot = self.update(ctx, base_snapshot, change);
+        let api_error = snapshot.api_error.clone();
+        (snapshot, api_error)
+    }
+
+    // Go: project/snapshothost.go:90 SnapshotHost.update
+    // update derives a snapshot from baseSnapshot without adopting it as any
+    // canonical session state or performing session side effects.
+    pub fn update(
+        &self,
+        ctx: &Context,
+        base_snapshot: &Rc<Snapshot>,
+        change: SnapshotChange,
+    ) -> Rc<Snapshot> {
+        base_snapshot.clone_(ctx, change, &base_snapshot.overlays(), None, None)
+    }
+
+    // Go: project/snapshothost.go:130 CloneSnapshotWithAutoImports
+    // CloneSnapshotWithAutoImports derives a snapshot with auto-import preparation without
+    // adopting the clone in the background.
+    pub fn clone_snapshot_with_auto_imports(
+        &self,
+        ctx: &Context,
+        base_snapshot: &Rc<Snapshot>,
+        uri: &lsproto::DocumentUri,
+        logger: SessionLogger<'_>,
+    ) -> Rc<Snapshot> {
+        let mut change = SnapshotChange {
+            reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
+            // ts#64291
+            fs: Some(base_snapshot.fs.fs.clone() as Rc<dyn vfs::Fs>),
+            file_system_override: base_snapshot.file_system_override,
+            // ts#64204
+            resource_request: base_snapshot.resource_request_for_document(uri),
+            ..Default::default()
+        };
+        change.resource_request.auto_imports = uri.clone();
+        base_snapshot.clone_(ctx, change, &base_snapshot.overlays(), logger, None)
+    }
+
+    // Go: project/snapshothost.go:141 SnapshotHost.newRootSnapshot
+    pub fn new_root_snapshot(
+        self: &Rc<Self>,
+        id: u64,
+        relative_pattern_support: bool,
+    ) -> Rc<Snapshot> {
+        // ts#64291
+        let file_system = new_overlay_fs(
+            self.fs.clone(),
+            IndexMap::default(),
+            self.options.position_encoding.clone(),
+            self.to_path.clone(),
+        );
+        self.new_snapshot(
+            id,
+            Rc::new(SnapshotFS {
+                to_path: self.to_path.clone(),
+                fs: file_system,
+                cache_files: Rc::new(FxHashMap::default()),
+                cache_directories: Rc::new(FxHashMap::default()),
+                read_files: RefCell::new(FxHashMap::default()),
+                node_modules_realpath_aliases: Rc::new(FxHashMap::default()),
+            }),
+            Rc::new(ConfigFileRegistry::default()),
+            None,
+            lsutil::new_default_user_preferences(),
+            None,
+            Some(new_watched_files::<FxHashMap<tspath::Path, String>>(
+                "auto-import",
+                lsproto::WatchKind(
+                    lsproto::WatchKind::CREATE.0
+                        | lsproto::WatchKind::CHANGE.0
+                        | lsproto::WatchKind::DELETE.0,
+                ),
+                relative_pattern_support,
+                Rc::new(|node_modules_dirs: &FxHashMap<tspath::Path, String>| {
+                    let mut patterns: Vec<String> = Vec::with_capacity(node_modules_dirs.len());
+                    // PORT: Go map order is random; the patterns are sorted below.
+                    for dir in node_modules_dirs.values() {
+                        patterns.push(get_recursive_glob_pattern(dir));
+                    }
+                    patterns.sort();
+                    PatternsAndIgnored {
+                        patterns_inside_workspace: patterns,
+                        ..Default::default()
+                    }
+                }),
+            )),
+        )
+    }
+
+    // Go: project/snapshothost.go:170 SnapshotHost.FS
+    pub fn fs(&self) -> Rc<dyn vfs::Fs> {
+        self.fs.clone()
+    }
+
+    // Go: project/snapshothost.go:174 SnapshotHost.GetCurrentDirectory
+    pub fn get_current_directory(&self) -> String {
+        self.options.current_directory.clone()
+    }
+
+    // Go: project/snapshothost.go:180 SnapshotHost.DefaultLibraryPath (ts#64158)
+    pub fn default_library_path(&self) -> String {
+        self.options.default_library_path.clone()
+    }
+
+    // Go: project/snapshothost.go:178 SnapshotHost.Close
+    pub fn close(&self) {
+        if let Some(content_mapper_host) = &self.content_mapper_host {
+            let _ = content_mapper_host.close();
+        }
+    }
+}

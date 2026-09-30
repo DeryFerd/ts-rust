@@ -86,14 +86,14 @@ impl Hash for SourceFileCacheKey {
 }
 
 // Go: vfs/cachedvfs/cachedvfs.go FS, the file system of the build host
-// (`cachedvfs.From(sys.FS())`, orchestrator.go:764).
+// (`cachedvfs.From(sys.FS())`, orchestrator.go:1004).
 // PORT: the same cache as `CachedFs` (always enabled: the build host
 // never disables it), but the `FileExists`, `DirectoryExists`,
 // `Realpath` and `GetAccessibleEntries` lookups live in a
 // `BuildStatCache` that the parse workers of each program load read too
 // (`CompilerHost::stat_cache`), as Go parse tasks share the host's
 // cachedvfs. This cache lasts for the whole build, and a write does not
-// update it (cachedvfs.go:148), so a later program can find a lookup here
+// update it (cachedvfs.go:144), so a later program can find a lookup here
 // that an earlier program made before the build wrote that path. It holds
 // only the lookups that Go makes: the workers' own lookups stay out of it
 // unless the loader uses them (see `BuildStatCache`).
@@ -175,10 +175,6 @@ impl Fs for BuildCachedFs {
         ret
     }
 
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        self.fs.walk_dir(root, walk_fn)
-    }
-
     fn realpath(&self, path: &str) -> String {
         self.stats.realpath(path, || self.fs.realpath(path))
     }
@@ -222,7 +218,7 @@ pub struct BuildHost {
 
 impl BuildHost {
     // PORT: Go builds the host inline in `NewOrchestrator`
-    // (orchestrator.go:764): `compiler.NewCachedFSCompilerHost(cwd, sys.FS(),
+    // (orchestrator.go:1004): `compiler.NewCachedFSCompilerHost(cwd, sys.FS(),
     // sys.DefaultLibraryPath(), nil, nil, nil)` and an empty mTimes map.
     // `NewCachedFSCompilerHost` is written out (compiler/host.go:44) to keep
     // the cached file system.
@@ -276,7 +272,7 @@ impl BuildHost {
         }
     }
 
-    // Go: orchestrator.go:91 (*Orchestrator).toPath, as the host reaches it.
+    // Go: orchestrator.go:97 (*Orchestrator).toPath, as the host reaches it.
     pub fn to_path(&self, file_name: &str) -> Path {
         to_path(
             file_name,

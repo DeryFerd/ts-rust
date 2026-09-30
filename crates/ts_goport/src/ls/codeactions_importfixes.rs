@@ -132,6 +132,12 @@ fn get_all_import_code_actions(
         return Ok(None);
     }
 
+    // PORT: Go passes `ch` to the views and to `NewImportAdder`, which the
+    // pinned Rust view and adder do not take. The lease is held to the end
+    // of the function (Go `defer done()`) but not borrowed, because
+    // `getFixInfos` below leases and borrows the same checker.
+    let (_ch, _done) = ls_program::get_type_checker(fix_context.program, ctx);
+
     let mut view = fix_context
         .ls
         .get_prepared_auto_import_view(fix_context.source_file)?;
@@ -143,12 +149,6 @@ fn get_all_import_code_actions(
         );
     }
     let view = view.unwrap_or_else(|| crate::core::go_nil_dereference());
-
-    // PORT: Go passes `ch` to `NewImportAdder`, which the pinned Rust adder
-    // does not take. The lease is held to the end of the function (Go
-    // `defer done()`) but not borrowed, because `getFixInfos` below leases
-    // and borrows the same checker.
-    let (_ch, _done) = ls_program::get_type_checker(fix_context.program, ctx);
 
     let mut import_adder = autoimport::new_import_adder(
         ctx,
@@ -216,6 +216,17 @@ fn get_fix_infos(
     }
 
     let symbol_token = astnav::get_token_at_position(fix_context.source_file, pos);
+    if error_code
+        != diag::X_0_refers_to_a_UMD_global_but_the_current_file_is_a_module_Consider_adding_an_import_instead
+            .code() as i32
+        && !is_identifier(symbol_token)
+    {
+        return Ok(Vec::new());
+    }
+
+    // Go: defer done(). `_done` releases the checker when it drops at the end of scope.
+    let (ch, _done) = ls_program::get_type_checker(fix_context.program, ctx);
+    let ch = &mut *ch.borrow_mut();
 
     let view: Option<Rc<autoimport::View>>;
     let mut info: Vec<FixInfo> = Vec::new();
@@ -227,16 +238,12 @@ fn get_fix_infos(
         let current_view = fix_context
             .ls
             .get_current_auto_import_view(fix_context.source_file);
-        info = get_fixes_info_for_umd_import(ctx, fix_context, symbol_token, &current_view);
+        info = get_fixes_info_for_umd_import(symbol_token, &current_view, ch);
         view = Some(current_view);
-    } else if !is_identifier(symbol_token) {
-        return Ok(Vec::new());
     } else if error_code
         == diag::X_0_cannot_be_used_as_a_value_because_it_was_imported_using_import_type.code()
             as i32
     {
-        let (ch, _done) = ls_program::get_type_checker(fix_context.program, ctx);
-        let ch = &mut *ch.borrow_mut();
         let compiler_options = fix_context.program.options();
         let symbol_names =
             get_symbol_names_to_import(fix_context.source_file, ch, symbol_token, compiler_options);
@@ -246,14 +253,8 @@ fn get_fix_infos(
             if !sn.is_type_only {
                 continue;
             }
-            let fix = get_type_only_promotion_fix(
-                ctx,
-                ch,
-                fix_context.source_file,
-                symbol_token,
-                &sn.name,
-                fix_context.program,
-            );
+            let fix =
+                get_type_only_promotion_fix(fix_context.source_file, symbol_token, &sn.name, ch);
             if let Some(fix) = fix {
                 all_type_only_fixes.push(FixInfo {
                     fix,
@@ -289,7 +290,7 @@ fn get_fix_infos(
             .ls
             .get_prepared_auto_import_view(fix_context.source_file)?;
         if let Some(prepared_view) = &view {
-            info = get_fixes_info_for_non_umd_import(ctx, fix_context, symbol_token, prepared_view);
+            info = get_fixes_info_for_non_umd_import(fix_context, symbol_token, prepared_view, ch);
         }
     }
 
@@ -305,14 +306,10 @@ fn get_fix_infos(
 
 // Go: ls/codeactions_importfixes.go:241 getFixesInfoForUMDImport
 fn get_fixes_info_for_umd_import(
-    ctx: &Context,
-    fix_context: &CodeFixContext<'_>,
     token: Node,
     view: &autoimport::View,
+    ch: &mut Checker,
 ) -> Vec<FixInfo> {
-    let (ch, _done) = ls_program::get_type_checker(fix_context.program, ctx);
-    let ch = &mut *ch.borrow_mut();
-
     let umd_symbol = get_umd_symbol(token, ch);
     if umd_symbol.is_nil() {
         return Vec::new();
@@ -326,7 +323,7 @@ fn get_fixes_info_for_umd_import(
     let export = export.unwrap_or_else(|| crate::core::go_nil_dereference());
 
     let mut result: Vec<FixInfo> = Vec::new();
-    for fix in view.get_fixes(ctx, ch, &export, false, is_valid_type_only_use_site, None) {
+    for fix in view.get_fixes(ch, &export, false, is_valid_type_only_use_site, None) {
         let mut error_identifier_text = String::new();
         if is_identifier(token) {
             error_identifier_text = token.text().to_string();
@@ -387,13 +384,11 @@ fn is_umd_export_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
 
 // Go: ls/codeactions_importfixes.go:303 getFixesInfoForNonUMDImport
 fn get_fixes_info_for_non_umd_import(
-    ctx: &Context,
     fix_context: &CodeFixContext<'_>,
     symbol_token: Node,
     view: &autoimport::View,
+    ch: &mut Checker,
 ) -> Vec<FixInfo> {
-    let (ch, _done) = ls_program::get_type_checker(fix_context.program, ctx);
-    let ch = &mut *ch.borrow_mut();
     let compiler_options = fix_context.program.options();
 
     let is_valid_type_only_use_site = is_valid_type_only_alias_use_site(symbol_token);
@@ -435,7 +430,6 @@ fn get_fixes_info_for_non_umd_import(
             }
 
             let fixes = view.get_fixes(
-                ctx,
                 ch,
                 export,
                 is_jsx_tag_name,
@@ -456,17 +450,12 @@ fn get_fixes_info_for_non_umd_import(
     all_info
 }
 
-// Go: ls/codeactions_importfixes.go:353 getTypeOnlyPromotionFix
-// PORT: Go leases `program.GetTypeChecker(ctx)` here; the pool returns the
-// checker that the caller (`getFixInfos`) already holds, so the caller passes
-// it as `ch`.
+// Go: ls/codeactions_importfixes.go:354 getTypeOnlyPromotionFix
 fn get_type_only_promotion_fix(
-    ctx: &Context,
-    ch: &mut Checker,
     source_file: Node,
     symbol_token: Node,
     symbol_name: &str,
-    program: &compiler::NewProgram,
+    ch: &mut Checker,
 ) -> Option<Rc<autoimport::Fix>> {
     // Get the symbol at the token location
     let symbol = ch.resolve_name_exported(

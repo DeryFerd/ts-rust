@@ -1,13 +1,17 @@
 //! Port of Go `internal/api/session_completion_test.go`
 //! (`TestCompletionSymbolTypeIsResolvable`, `TestCompletionOnInferredProject`).
+//! Bump C: the two tests use the N session API (ts#64163, ts#64204). The N
+//! tests `TestCompletionRetriesWithAutoImports` (ts#64133) and
+//! `TestCompletionWithSymbolsAndExistingImportDoesNotDeadlock` (ts#64178)
+//! are not ported yet.
 //!
 //! PORT: the tests are in `project_lsp` because they use `projecttestutil`
 //! and `child_test!`. Go `bundled.Embedded` is always true in the port, so
 //! the skip is dropped.
 
 use ts_goport::api::{
-    self, DocumentIdentifier, GetCompletionsAtPositionParams, GetDefaultProjectForFileParams,
-    GetTypeOfSymbolParams, UpdateSnapshotParams,
+    self, CreateSnapshotParams, DocumentIdentifier, GetCompletionsAtPositionParams,
+    GetDefaultProjectForFileParams, GetTypeOfSymbolParams, SnapshotRequestChangesParams,
 };
 use ts_goport::gostd::GoError;
 
@@ -53,14 +57,19 @@ child_test! {
             ),
             (FILE_NAME, CONTENT),
         ]));
-        let session = api::new_session(project_session.clone(), None);
+        // ts#64163: NewLSPSession.
+        let session = api::new_lsp_session(project_session.clone(), None);
 
         let ctx = bg();
 
-        let snapshot_resp = nil_error(session.handle_update_snapshot(
+        // ts#64204: createSnapshot replaces updateSnapshot.
+        let snapshot_resp = nil_error(session.handle_create_snapshot(
             &ctx,
-            &UpdateSnapshotParams {
-                open_files: vec![doc(FILE_NAME)],
+            &CreateSnapshotParams {
+                snapshot_request_changes_params: SnapshotRequestChangesParams {
+                    open_files: Some(vec![doc(FILE_NAME)]),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         ));
@@ -137,14 +146,19 @@ child_test! {
         const CONTENT: &str = "declare const people: string[];\npeople.";
 
         let (project_session, _) = projecttestutil::setup(files(&[(FILE_NAME, CONTENT)]));
-        let session = api::new_session(project_session.clone(), None);
+        // ts#64163: NewLSPSession.
+        let session = api::new_lsp_session(project_session.clone(), None);
 
         let ctx = bg();
 
-        let snapshot_resp = nil_error(session.handle_update_snapshot(
+        // ts#64204: createSnapshot replaces updateSnapshot.
+        let snapshot_resp = nil_error(session.handle_create_snapshot(
             &ctx,
-            &UpdateSnapshotParams {
-                open_files: vec![doc(FILE_NAME)],
+            &CreateSnapshotParams {
+                snapshot_request_changes_params: SnapshotRequestChangesParams {
+                    open_files: Some(vec![doc(FILE_NAME)]),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         ));

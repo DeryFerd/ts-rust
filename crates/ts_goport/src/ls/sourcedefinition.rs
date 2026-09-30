@@ -218,7 +218,7 @@ pub struct SourceDefResolver<'a> {
     pub options: &'a CompilerOptions,
     pub get_source_file: Box<dyn Fn(&str) -> Node + 'a>,
     pub resolve_from: String,
-    pub resolver: module::Resolver,
+    pub resolver: module::DefaultResolver,
     pub parsed_files: Option<FxHashMap<String, Node>>,
 }
 
@@ -250,13 +250,13 @@ impl LanguageService {
                     .map_or(Node::NIL, |source_file| source_file.root)
             }),
             resolve_from: resolve_from.to_string(),
-            resolver: module::new_resolver(
-                resolution_host,
-                Rc::new(no_dts_options),
-                &program.get_global_typings_cache_location(),
-                "",
-                program.command_line().content_mapper_extensions(),
-            ),
+            resolver: module::new_resolver(module::ResolverOptions {
+                host: Some(resolution_host),
+                compiler_options: Some(Rc::new(no_dts_options)),
+                typings_location: program.get_global_typings_cache_location(),
+                extra_extensions: program.command_line().content_mapper_extensions(),
+                ..Default::default()
+            }),
             parsed_files: None,
         }
     }
@@ -620,7 +620,7 @@ impl SourceDefResolver<'_> {
         for mode in modes {
             // PORT: Go `resolved != nil` always holds; the resolver returns an
             // `Arc<ResolvedModule>`.
-            let (resolved, _) =
+            let (resolved, _, _) =
                 self.resolver
                     .resolve_module_name(module_name, resolve_from_file, mode, None);
             if resolved.is_resolved()

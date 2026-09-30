@@ -65,9 +65,9 @@ impl DocumentUri {
 // Go: lsp.go:57 fixWindowsURIPath
 pub fn fix_windows_uri_path(path: &str) -> String {
     if let Some(rest) = path.strip_prefix('/') {
-        let (volume, rest, ok) = tspath::split_volume_path(rest);
-        if ok {
-            return volume + rest;
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2 && tspath::is_volume_character(bytes[0]) && bytes[1] == b':' {
+            return rest.to_string();
         }
     }
     path.to_string()
@@ -421,6 +421,129 @@ pub fn json_object_raw_field(data: &[u8], field: &str) -> JsonValue {
     JsonValue::default()
 }
 
+// Go: structcodec.go:172 discriminatedStructDecoder
+/// The state of [`scan_discriminated_struct`]: the discriminator value and
+/// the object members that come before it.
+///
+/// PORT: Go keeps each earlier member as its name and raw value
+/// (`deferredStructField`); here each is the raw name (with quotes) and the
+/// raw value.
+#[derive(Debug, Default)]
+pub struct DiscriminatedStructDecoder {
+    type_name: &'static str,
+    discriminator: &'static str,
+    pub discriminator_value: Vec<u8>,
+    has_discriminator: bool,
+    deferred: Vec<(Vec<u8>, Vec<u8>)>,
+    closed: bool,
+}
+
+// Go: structcodec.go:184 scanDiscriminatedStruct
+// scanDiscriminatedStruct advances through an object until it finds the
+// discriminator. Only fields preceding the discriminator are retained.
+pub fn scan_discriminated_struct(
+    dec: &mut JsonDecoder<'_>,
+    type_name: &'static str,
+    discriminator: &'static str,
+) -> Result<DiscriminatedStructDecoder, JsonError> {
+    let k = dec.peek_kind();
+    if k != b'{' {
+        return Err(err_not_object(k));
+    }
+    dec.read_token()?;
+
+    let mut state = DiscriminatedStructDecoder {
+        type_name,
+        discriminator,
+        ..Default::default()
+    };
+    while dec.peek_kind() != b'}' {
+        let raw_name = dec.read_value()?.to_vec();
+        if json_key_check(&raw_name, discriminator) {
+            state.discriminator_value = dec.read_value()?.to_vec();
+            state.has_discriminator = true;
+            return Ok(state);
+        }
+
+        let value = dec.read_value()?.to_vec();
+        state.deferred.push((raw_name, value));
+    }
+    dec.read_token()?;
+    state.closed = true;
+    Ok(state)
+}
+
+impl DiscriminatedStructDecoder {
+    // Go: structcodec.go:226 (discriminatedStructDecoder).invalidDiscriminator
+    // PORT: with no discriminator the scan read the closing `}`; else it
+    // stopped just after the discriminator value.
+    #[must_use]
+    pub fn invalid_discriminator(&self) -> JsonError {
+        if !self.has_discriminator {
+            return SemanticError::method(
+                ErrorPos::AfterEnd,
+                format!(
+                    "invalid {}: missing discriminator {}",
+                    self.type_name,
+                    gostd::strconv::quote(self.discriminator)
+                ),
+            );
+        }
+        SemanticError::method(
+            ErrorPos::After,
+            format!(
+                "invalid {} discriminator {}: {}",
+                self.type_name,
+                gostd::strconv::quote(self.discriminator),
+                String::from_utf8_lossy(&self.discriminator_value)
+            ),
+        )
+    }
+}
+
+// Go: structcodec.go:235 unmarshalDiscriminatedArm
+// unmarshalDiscriminatedArm decodes the retained and remaining object fields
+// into a concrete union arm, assigning it only after the full object succeeds.
+// PORT: Go feeds the discriminator, the retained fields and then the rest of
+// the object to one reflective struct decoder. Rust has no reflection: the
+// members are joined, in that order, into one object that the arm's
+// generated decoder reads. The caller assigns the arm.
+pub fn unmarshal_discriminated_arm<T: UnmarshalerFrom + Default>(
+    state: &DiscriminatedStructDecoder,
+    dec: &mut JsonDecoder<'_>,
+) -> Result<T, JsonError> {
+    let mut object = vec![b'{'];
+    let mut push = |name: &[u8], value: &[u8]| {
+        if object.len() > 1 {
+            object.push(b',');
+        }
+        object.extend_from_slice(name);
+        object.push(b':');
+        object.extend_from_slice(value);
+    };
+    if state.has_discriminator {
+        push(
+            format!("\"{}\"", state.discriminator).as_bytes(),
+            &state.discriminator_value,
+        );
+    }
+    for (name, value) in &state.deferred {
+        push(name, value);
+    }
+    if !state.closed {
+        while dec.peek_kind() != b'}' {
+            let name = dec.read_value()?.to_vec();
+            let value = dec.read_value()?;
+            push(&name, value);
+        }
+        dec.read_token()?;
+    }
+    object.push(b'}');
+    let mut target = T::default();
+    json_unmarshal(&object, &mut target, &[])?;
+    Ok(target)
+}
+
 // Go: lsp.go:199 jsonObjectHasKey
 // jsonObjectHasKey scans the top-level keys of a JSON object looking for any of the
 // given keys. Returns the index of the first key found, or -1 if none match.
@@ -714,12 +837,33 @@ pub fn preferred_markup_kind(formats: &[MarkupKind]) -> MarkupKind {
     MarkupKind::PLAIN_TEXT
 }
 
-// Go: lsp.go:312
 impl CodeActionKind {
-    pub const SOURCE_REMOVE_UNUSED_IMPORTS: CodeActionKind =
-        CodeActionKind(Cow::Borrowed("source.removeUnusedImports"));
-    pub const SOURCE_SORT_IMPORTS: CodeActionKind =
-        CodeActionKind(Cow::Borrowed("source.sortImports"));
+    // Go: lsp.go:310 (CodeActionKind).Contains
+    // Contains reports whether other is this code action kind or one of its children.
+    #[must_use]
+    pub fn contains(&self, other: &CodeActionKind) -> bool {
+        *self == *other
+            || *self == CodeActionKind::EMPTY
+            || other
+                .0
+                .strip_prefix(self.0.as_ref())
+                .is_some_and(|rest| rest.starts_with('.'))
+    }
+}
+
+// Go: lsp.go:316
+impl CodeActionKind {
+    // Go: CodeActionKindSourceFixAll + ".ts"
+    pub const SOURCE_FIX_ALL_TS: CodeActionKind = CodeActionKind(Cow::Borrowed("source.fixAll.ts"));
+    // Go: CodeActionKindSourceOrganizeImports + ".ts"
+    pub const SOURCE_ORGANIZE_IMPORTS_TS: CodeActionKind =
+        CodeActionKind(Cow::Borrowed("source.organizeImports.ts"));
+    // Go: CodeActionKindSource + ".removeUnusedImports.ts"
+    pub const SOURCE_REMOVE_UNUSED_IMPORTS_TS: CodeActionKind =
+        CodeActionKind(Cow::Borrowed("source.removeUnusedImports.ts"));
+    // Go: CodeActionKindSource + ".sortImports.ts"
+    pub const SOURCE_SORT_IMPORTS_TS: CodeActionKind =
+        CodeActionKind(Cow::Borrowed("source.sortImports.ts"));
 }
 
 #[cfg(test)]

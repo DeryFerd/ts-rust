@@ -208,6 +208,12 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
             // auto-import entrypoint) must still publish its parser fields,
             // so a later version can share the file.
             crate::program::note_parsed_source_file(&file);
+            // Go: binder.BindSourceFile(file) (ts#63952). PORT: the Rust
+            // binder binds each program version into one arena on the
+            // dispatch thread (`program::bind_all`), not a parse on its own,
+            // so the Go race (two programs binding one shared file at once)
+            // does not exist here. Binding is idempotent in Go, so binding at
+            // program load gives the same result.
             HashedSourceFile { file, hash }
         },
     )

@@ -85,6 +85,7 @@ impl Checker {
                 module_name,
                 module_name,
                 false, /*ignoreErrors*/
+                TypeId::NIL,
             );
             if module_sym.is_some() {
                 let resolved_module_symbol = self
@@ -663,10 +664,13 @@ impl Checker {
                         node.kind()
                     ));
                 }
+                let import_attributes_type =
+                    self.get_type_from_import_attributes(get_import_attributes(node));
                 let resolved_module = self.resolve_external_module_name(
                     node,
                     node.module_specifier(),
                     false, /*ignoreErrors*/
+                    import_attributes_type,
                 );
                 let exported_symbols = self.get_exports_of_module_worker_visit(
                     state,

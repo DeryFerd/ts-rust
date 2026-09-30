@@ -1553,7 +1553,7 @@ fn write_json_float(out: &mut String, value: f64) {
     let _ = write!(out, "{value}");
 }
 
-// Go: `tr.fs.WriteFile`, where `tr.fs` is `sys.FS()`: vfs/osvfs/os.go:205
+// Go: `tr.fs.WriteFile`, where `tr.fs` is `sys.FS()`: vfs/osvfs/os.go:174
 // WriteFile, or the test file system in a test process.
 // PORT: `osvfs_fs()` is the file system of the calling thread: the OS one,
 // or the test one when a test process installs an OS override
@@ -1564,7 +1564,7 @@ fn write_file(path: &str, content: &str) -> Result<(), String> {
         .map_err(|err| fs_error_text(&err))
 }
 
-// Go: `tr.fs.AppendFile` (vfs/osvfs/os.go:209 AppendFile); see
+// Go: `tr.fs.AppendFile` (vfs/osvfs/os.go:178 AppendFile); see
 // `write_file`.
 fn append_file(path: &str, content: &str) -> Result<(), String> {
     crate::frontend::vfs::osvfs_fs()

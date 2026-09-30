@@ -357,7 +357,9 @@ impl<'t> FormattingScanner<'t> {
                 self.last_scan_action = ScanAction::ACTION_RESCAN_JSX_ATTRIBUTE_VALUE;
                 return self.s.re_scan_jsx_attribute_value();
             }
-            ScanAction::ACTION_SCAN => {}
+            ScanAction::ACTION_SCAN => {
+                // no rescan needed; the token was already produced by the normal scan
+            }
             _ => crate::gostd::debug::assert_never(
                 &expected_scan_action.0.to_string(),
                 Some("unhandled scan action kind"),

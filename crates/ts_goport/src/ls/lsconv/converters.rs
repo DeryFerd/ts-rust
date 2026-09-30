@@ -302,7 +302,10 @@ impl Converters {
     }
 }
 
-// Go: ls/lsconv/converters.go:127 FromLSPRange
+// Go: ls/lsconv/converters.go:127 (*Converters).FromLSPRange
+// PORT: Go 1.27 makes this a (generic) method of `*Converters` (ts#63902).
+// The Rust function keeps `c` as its first parameter, so callers in other
+// lanes' files do not change.
 // FromLSPRange converts an lsproto.Range to offsets in one Script. For a content-mapped script, results
 // include each virtual projection covered by segments that participate in feature; it returns no
 // results when no projection qualifies. Normal scripts return one exact span.
@@ -316,7 +319,10 @@ pub fn from_lsp_range<T: Script + Clone>(
     lsp_range_to_virtual(c, &[script], text_range, feature)
 }
 
-// Go: ls/lsconv/converters.go:134 FromLSPRangeForSourceFile
+// Go: ls/lsconv/converters.go:134 (*Converters).FromLSPRangeForSourceFile
+// PORT: Go 1.27 makes this a (generic) method of `*Converters` (ts#63902).
+// The Rust function keeps `c` as its first parameter, so callers in other
+// lanes' files do not change.
 // FromLSPRangeForSourceFile converts an lsproto.Range to offsets in a SourceFile. When the file has
 // supplemental content-mapper outputs, results include every qualifying virtual projection across the
 // canonical and supplemental files. Projections not participating in feature are omitted.
@@ -331,7 +337,10 @@ pub fn from_lsp_range_for_source_file(
     lsp_range_to_virtual(c, &files, text_range, feature)
 }
 
-// Go: ls/lsconv/converters.go:149 FromLSPRangeIntersectingForSourceFile
+// Go: ls/lsconv/converters.go:149 (*Converters).FromLSPRangeIntersectingForSourceFile
+// PORT: Go 1.27 makes this a (generic) method of `*Converters` (ts#63902).
+// The Rust function keeps `c` as its first parameter, so callers in other
+// lanes' files do not change.
 // FromLSPRangeIntersectingForSourceFile projects every feature-enabled intersection with textRange
 // across the canonical and supplemental virtual files. Unlike FromLSPRangeForSourceFile, the original
 // range endpoints need not be mapped. This is intended for read-only range requests such as semantic
@@ -385,7 +394,10 @@ pub fn from_lsp_range_intersecting_for_source_file(
     result
 }
 
-// Go: ls/lsconv/converters.go:179 lspRangeToVirtual
+// Go: ls/lsconv/converters.go:177 (*Converters).lspRangeToVirtualForScripts
+// PORT: Go 1.27 makes this a (generic) method of `*Converters` (ts#63902).
+// The Rust function keeps `c` as its first parameter, so callers in other
+// lanes' files do not change.
 fn lsp_range_to_virtual<T: Script + Clone>(
     c: &Converters,
     scripts: &[T],
@@ -435,7 +447,10 @@ impl Converters {
     }
 }
 
-// Go: ls/lsconv/converters.go:213 FromLSPPosition
+// Go: ls/lsconv/converters.go:211 (*Converters).FromLSPPosition
+// PORT: Go 1.27 makes this a (generic) method of `*Converters` (ts#63902).
+// The Rust function keeps `c` as its first parameter, so callers in other
+// lanes' files do not change.
 // FromLSPPosition converts an lsproto.Position to offsets in one Script. For a content-mapped script,
 // results include each virtual projection whose segment participates in feature; it returns no results
 // when no projection qualifies. Normal scripts return one exact position.
@@ -449,7 +464,10 @@ pub fn from_lsp_position<T: Script + Clone>(
     lsp_position_to_virtual(c, &[script], position, feature)
 }
 
-// Go: ls/lsconv/converters.go:220 FromLSPPositionForSourceFile
+// Go: ls/lsconv/converters.go:218 (*Converters).FromLSPPositionForSourceFile
+// PORT: Go 1.27 makes this a (generic) method of `*Converters` (ts#63902).
+// The Rust function keeps `c` as its first parameter, so callers in other
+// lanes' files do not change.
 // FromLSPPositionForSourceFile converts an lsproto.Position to offsets in a SourceFile. When the file has
 // supplemental content-mapper outputs, results include every qualifying virtual projection across the
 // canonical and supplemental files. Projections not participating in feature are omitted.
@@ -464,6 +482,28 @@ pub fn from_lsp_position_for_source_file(
     lsp_position_to_virtual(c, &files, position, feature)
 }
 
+// Go: ls/lsconv/converters.go:224 (*Converters).FromLSPRangeToOriginal
+// PORT: Go 1.27 makes this a (generic) method of `*Converters` (ts#63902).
+// The Rust function keeps `c` as its first parameter, so callers in other
+// lanes' files do not change.
+// FromLSPRangeToOriginal converts an LSP range in a content-mapped document directly to original-text offsets.
+// PORT: Go takes the `Script` interface value; here `&dyn Script`.
+#[must_use]
+pub fn from_lsp_range_to_original(
+    c: &Converters,
+    script: &dyn Script,
+    text_range: lsproto::Range,
+) -> TextRange {
+    let original = OriginalTextScript {
+        file_name: script.original_file_name(),
+        text: script.original_text(),
+    };
+    TextRange::new(
+        c.line_and_character_to_position(&original, &text_range.start),
+        c.line_and_character_to_position(&original, &text_range.end),
+    )
+}
+
 // Go: ls/lsconv/converters.go:225 sourceFileProjections
 fn source_file_projections(file: Node) -> Vec<Node> {
     let supplemental = source_file_supplemental_source_files(file);
@@ -473,7 +513,10 @@ fn source_file_projections(file: Node) -> Vec<Node> {
     files
 }
 
-// Go: ls/lsconv/converters.go:232 lspPositionToVirtual
+// Go: ls/lsconv/converters.go:239 (*Converters).lspPositionToVirtualForScripts
+// PORT: Go 1.27 makes this a (generic) method of `*Converters` (ts#63902).
+// The Rust function keeps `c` as its first parameter, so callers in other
+// lanes' files do not change.
 fn lsp_position_to_virtual<T: Script + Clone>(
     c: &Converters,
     scripts: &[T],

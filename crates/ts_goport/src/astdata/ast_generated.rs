@@ -1242,6 +1242,7 @@ pub struct ModuleBlockData {
 #[derive(Clone, Debug)]
 pub struct ModuleDeclarationData {
     pub asterisk_token: Option<NodeId>,
+    pub attributes: Option<NodeId>,
     pub body: Option<NodeId>,
     pub end_flow_node: Option<FlowNodeId>,
     pub flow_node: Option<FlowNodeId>,
@@ -2634,6 +2635,7 @@ impl NodeData {
             Self::ModuleDeclaration(node) => {
                 visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
                 visitor(node.name)?;
+                visit_optional_child(visitor, node.attributes)?;
                 visit_optional_child(visitor, node.body)
             }
             Self::NamedExports(node) => visit_node_list(visitor, &node.elements),

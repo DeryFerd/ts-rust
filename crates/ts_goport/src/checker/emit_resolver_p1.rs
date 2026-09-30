@@ -703,11 +703,6 @@ impl crate::printer::EmitResolver for EmitResolver {
         EmitResolver::get_effective_declaration_flags(self, node, flags)
     }
 
-    // Go: checker/emitresolver.go:1143 EmitResolver.GetResolutionModeOverride
-    fn get_resolution_mode_override(&self, node: Node) -> ResolutionMode {
-        EmitResolver::get_resolution_mode_override(self, node)
-    }
-
     // Go: checker/emitresolver.go:1157 EmitResolver.GetTypeReferenceSerializationKind
     fn get_type_reference_serialization_kind(
         &self,

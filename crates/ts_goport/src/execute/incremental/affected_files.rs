@@ -143,7 +143,7 @@ impl<'a> AffectedFilesHandler<'a> {
         result
     }
 
-    // Go: incremental/affectedfileshandler.go:85 updateShapeSignature
+    // Go: incremental/affectedfileshandler.go:85 updateShapeSignature (ts#64026)
     fn update_shape_signature(&mut self, file: Node, use_file_version_as_signature: bool) -> bool {
         let path = path_of(file);
         // If we have cached the result for this file, that means hence forth we should assume file shape is uptodate
@@ -162,7 +162,12 @@ impl<'a> AffectedFilesHandler<'a> {
             (info.signature.clone(), info.version.clone())
         };
         let mut update = UpdatedSignature::default();
-        if !source_file_info(file).is_declaration_file && !use_file_version_as_signature {
+        // JSON files have no declaration output from which to compute a shape
+        // signature, so use the file version to conservatively invalidate dependents.
+        if !source_file_info(file).is_declaration_file
+            && !is_json_source_file(file)
+            && !use_file_version_as_signature
+        {
             update.signature = self.compute_dts_signature(file);
         }
         // Default is to use file version as signature

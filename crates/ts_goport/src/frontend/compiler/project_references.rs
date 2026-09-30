@@ -139,13 +139,9 @@ impl<'a> ProjectReferenceParser<'a> {
         }
         let config_path = self
             .loader
-            .opts
-            .config
-            .config_file
-            .as_ref()
-            .expect("project references without a config file")
-            .path
-            .clone();
+            .project_reference_file_mapper
+            .borrow()
+            .root_config_path();
         let mut seen = FxHashSet::default();
         let references = self.init_mapper_worker(tasks, &mut seen);
         self.loader
@@ -334,13 +330,12 @@ impl ProjectReferenceFileMapper {
         }
     }
 
-    /// The root config file path (Go `opts.Config.ConfigFile.SourceFile.Path()`).
-    fn root_config_path(&self) -> Option<Path> {
-        self.opts
-            .config
-            .config_file
-            .as_ref()
-            .map(|c| c.path.clone())
+    // Go: projectreferencefilemapper.go:28 (*projectReferenceFileMapper).rootConfigPath
+    pub(crate) fn root_config_path(&self) -> Path {
+        match self.opts.config.config_file.as_ref() {
+            None => Path::default(),
+            Some(config_file) => config_file.path.clone(),
+        }
     }
 
     // Go: projectreferencefilemapper.go:28 (*projectReferenceFileMapper).getParseFileRedirect
@@ -370,11 +365,8 @@ impl ProjectReferenceFileMapper {
     // Go: projectreferencefilemapper.go:48 (*projectReferenceFileMapper).getResolvedProjectReferences
     #[must_use]
     pub fn get_resolved_project_references(&self) -> Vec<Option<Rc<ParsedCommandLine>>> {
-        let Some(root) = self.root_config_path() else {
-            return Vec::new();
-        };
         let mut result = Vec::new();
-        if let Some(refs) = self.references_in_config_file.get(&root) {
+        if let Some(refs) = self.references_in_config_file.get(&self.root_config_path()) {
             result.reserve(refs.len());
             for ref_path in refs {
                 let ref_config = self
@@ -484,17 +476,18 @@ impl ProjectReferenceFileMapper {
             usize,
         ) -> bool,
     ) -> bool {
-        let Some(root) = self.root_config_path() else {
+        if self.opts.config.project_references().is_empty() {
             return false;
-        };
+        }
         let mut seen_ref = FxHashSet::with_capacity_and_hasher(
             self.references_in_config_file.len(),
             Default::default(),
         );
-        seen_ref.insert(root.clone());
+        let root_config_path = self.root_config_path();
+        seen_ref.insert(root_config_path.clone());
         let refs = self
             .references_in_config_file
-            .get(&root)
+            .get(&root_config_path)
             .cloned()
             .unwrap_or_default();
         self.range_resolved_reference_worker(&refs, &mut f, Some(&self.opts.config), &mut seen_ref)
@@ -879,14 +872,8 @@ impl ProjectReferenceDtsFakingVfs {
     // depend on the order.
     fn directory_exists_if_project_reference_decl_dir(&self, dir: &str) -> Tristate {
         let dir_path = self.to_path(dir);
-        let dir_path_with_trailing_directory_separator = format!("{}/", dir_path.as_str());
         for decl_dir_path in &self.dts_directories {
-            if dir_path == *decl_dir_path
-                // Any parent directory of declaration dir
-                || decl_dir_path.starts_with(&dir_path_with_trailing_directory_separator)
-                // Any directory inside declaration dir
-                || dir_path.starts_with(&format!("{}/", decl_dir_path.as_str()))
-            {
+            if dir_path.contains_path(decl_dir_path) || decl_dir_path.contains_path(&dir_path) {
                 return Tristate::True;
             }
         }
@@ -959,11 +946,6 @@ impl Fs for ProjectReferenceDtsFakingVfs {
 
     // Go: projectreferencedtsfakinghost.go:113 (*projectReferenceDtsFakingVfs).Stat
     fn stat(&self, _path: &str) -> Option<FileInfo> {
-        panic!("should not be called by resolver")
-    }
-
-    // Go: projectreferencedtsfakinghost.go:118 (*projectReferenceDtsFakingVfs).WalkDir
-    fn walk_dir(&self, _root: &str, _walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
         panic!("should not be called by resolver")
     }
 

@@ -5,4 +5,5 @@
 # crash; for the transpile runner: options, js, dts, test, crash.
 # key: <local|submodule>/<compiler|conformance>/<configured name>, or
 # submodule/transpile/<name(configuration).ts> for the transpile runner.
+# At the merged layout (microsoft/TypeScript tsc/) every key starts with local/.
 # Bug ids are in target/continuation-r97-goport/tests2/bugs/S1.md.

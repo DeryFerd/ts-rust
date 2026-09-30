@@ -31,7 +31,7 @@ pub fn delete_declaration(
                     LeadingTriviaOption::INCLUDE_ALL,
                     TrailingTriviaOption::INCLUDE,
                 );
-                t.replace_range_with_text(source_file, range, "()");
+                t.replace_text_range_with_text(source_file, range, "()");
             } else {
                 delete_node_in_list(t, deleted_nodes_in_lists, source_file, node);
             }
@@ -209,8 +209,7 @@ fn delete_default_import(t: &mut Tracker, source_file: Node, import_clause: Node
                     ..SkipTriviaOptions::default()
                 }),
             );
-            let range = t.to_lsp_edit_range(source_file, TextRange::new(start, end));
-            t.replace_range_with_text(source_file, range, "");
+            t.replace_text_range_with_text(source_file, TextRange::new(start, end), "");
         } else {
             delete_node(
                 t,
@@ -233,8 +232,7 @@ fn delete_import_binding(t: &mut Tracker, source_file: Node, node: Node) {
         let previous_token = astnav::get_token_at_position(source_file, node.pos() - 1);
         crate::go_assert!(previous_token.is_some(), "previousToken should not be nil");
         let start = astnav::get_start_of_node(previous_token, source_file, false);
-        let range = t.to_lsp_edit_range(source_file, TextRange::new(start, node.end()));
-        t.replace_range_with_text(source_file, range, "");
+        t.replace_text_range_with_text(source_file, TextRange::new(start, node.end()), "");
     } else {
         // Delete the entire import declaration
         // |import * as ns from './file'|
@@ -338,8 +336,11 @@ fn delete_node(
 ) {
     let start_position = t.get_adjusted_start_position(source_file, node, leading_trivia, false);
     let end_position = t.get_adjusted_end_position(source_file, node, trailing_trivia);
-    let range = t.to_lsp_edit_range(source_file, TextRange::new(start_position, end_position));
-    t.replace_range_with_text(source_file, range, "");
+    t.replace_text_range_with_text(
+        source_file,
+        TextRange::new(start_position, end_position),
+        "",
+    );
 }
 
 // Go: ls/change/delete.go:195 deleteNodeInList
@@ -397,8 +398,7 @@ fn delete_node_in_list(
         );
     }
 
-    let range = t.to_lsp_edit_range(source_file, TextRange::new(start_pos, end_pos));
-    t.replace_range_with_text(source_file, range, "");
+    t.replace_text_range_with_text(source_file, TextRange::new(start_pos, end_pos), "");
 }
 
 impl Tracker {

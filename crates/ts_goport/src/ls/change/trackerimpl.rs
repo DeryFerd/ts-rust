@@ -6,53 +6,64 @@ use crate::frontend::core_textchange::apply_bulk_edits;
 use crate::frontend::parser::utilities::get_js_doc_comment_ranges;
 use crate::frontend::scanner::scanner_p1::{rune_to_char, utf8_decode_rune_in_string};
 use crate::frontend::scanner::{get_leading_comment_ranges, get_trailing_comment_ranges};
-use crate::spanmap::Feature;
+use crate::spanmap::{Feature, SpanMap};
+
+// Go: ls/change/trackerimpl.go:89 dedupeIdenticalEdits
+/// dedupeIdenticalEdits drops exact duplicates from a sorted slice of edits. When a mapper copies one span
+/// of the original into more than one projection, an edit computed against each projection describes the
+/// same change to the same original range; emitting it once per projection would apply it repeatedly.
+// PORT: Go returns the shortened slice; the Vec is shortened in place.
+fn dedupe_identical_edits(edits: &mut Vec<lsproto::TextEdit>) {
+    edits.dedup_by(|edit, last| edit.range == last.range && edit.new_text == last.new_text);
+}
+
+// Go: ls/change/trackerimpl.go:100 textEditsConflict
+fn text_edits_conflict(
+    a: &lsproto::TextEdit,
+    b: &lsproto::TextEdit,
+    multiple_projections: bool,
+) -> bool {
+    if lsproto::compare_positions(a.range.end, b.range.start) > 0 {
+        return true;
+    }
+    // Different insertions at the same position are ambiguous when they may come from different projections.
+    multiple_projections
+        && a.range.start == a.range.end
+        && a.range == b.range
+        && a.new_text != b.new_text
+}
+
+// Go: ls/change/trackerimpl.go:198 leadingIndentation
+// PORT: Go slices the string by bytes; this takes and returns bytes.
+fn leading_indentation(text: &[u8]) -> &[u8] {
+    let mut end = 0;
+    while end < text.len() && (text[end] == b' ' || text[end] == b'\t') {
+        end += 1;
+    }
+    &text[..end]
+}
 
 impl Tracker {
-    // Go: ls/change/trackerimpl.go:23 getTextChangesFromChanges
-    // PORT: Go ranges over the MultiMap's Go map (random order) and sorts
-    // each file's slice in place. The IndexMap walks files in insertion
-    // order; the map is taken out for the loop (the edits are mutated) and
-    // put back, so the tracker keeps the sorted edits as in Go.
+    // Go: ls/change/trackerimpl.go:22 getTextChangesFromChanges
+    // PORT: Go ranges over the MultiMap's Go map (random order), then over
+    // the result map (random order). The IndexMaps walk files in insertion
+    // order. The change map is taken out for the loop (`to_lsp_edit_range`
+    // and `compute_new_text` take `&mut self`) and put back.
     pub fn get_text_changes_from_changes(&mut self) -> IndexMap<String, Vec<lsproto::TextEdit>> {
         let mut changes: IndexMap<String, Vec<lsproto::TextEdit>> = IndexMap::new();
-        let mut tracker_changes = std::mem::take(&mut self.changes);
-        for (&source_file, changes_in_file) in tracker_changes.iter_mut() {
-            if self
-                .unmappable_files
-                .contains(source_file_original_file_name(source_file))
-            {
+        // A content-mapped file can have several projections, each keyed separately in t.changes but
+        // all sharing one original file. Their edits are collected together before being ordered and checked,
+        // so duplicate edits are emitted once and conflicting edits are rejected regardless of map iteration
+        // order.
+        let mut projections: FxHashMap<String, i32> = FxHashMap::default();
+        let tracker_changes = std::mem::take(&mut self.changes);
+        for (&source_file, changes_in_file) in tracker_changes.iter() {
+            let file_name = source_file_original_file_name(source_file);
+            if self.unmappable_files.contains(file_name) {
                 continue;
             }
-            // order changes by start position
-            // If the start position is the same, put the shorter range first, since an empty range (x, x) may precede (x, y) but not vice-versa.
-            // Go: ls/change/trackerimpl.go:31 slices.SortStableFunc(changesInFile, lsproto.CompareRanges on the ranges)
-            crate::gostd::slices::sort_stable_func(changes_in_file, |a, b| {
-                lsproto::compare_ranges(a.range, b.range)
-            });
-            // verify that change intervals do not overlap, except possibly at end points.
-            for i in 0..(changes_in_file.len() as i32 - 1).max(0) as usize {
-                if lsproto::compare_positions(
-                    changes_in_file[i].range.end,
-                    changes_in_file[i + 1].range.start,
-                ) > 0
-                {
-                    // assert change[i].End <= change[i + 1].Start
-                    // PORT: Go `%v` of a Range prints `{{l c} {l c}}`.
-                    let go_range = |r: &lsproto::Range| {
-                        format!(
-                            "{{{{{} {}}} {{{} {}}}}}",
-                            r.start.line, r.start.character, r.end.line, r.end.character
-                        )
-                    };
-                    crate::core::go_panic(format!(
-                        "changes overlap: {} and {}",
-                        go_range(&changes_in_file[i].range),
-                        go_range(&changes_in_file[i + 1].range)
-                    ));
-                }
-            }
-
+            // For a content-mapped file, a mapper may reorder source text relative to the original document.
+            // Convert first, then sort and check for overlap in the space where edits are actually applied.
             // PORT: Go `core.MapNonNil`; the callback never returns nil.
             let text_changes: Vec<lsproto::TextEdit> = changes_in_file
                 .iter()
@@ -67,27 +78,67 @@ impl Tracker {
 
                     lsproto::TextEdit {
                         new_text,
-                        range: change.range,
+                        range: self.to_lsp_edit_range(source_file, change.text_range),
                     }
                 })
                 .collect();
 
             if !text_changes.is_empty() {
-                let file_name = source_file_original_file_name(source_file);
-                if self.unmappable_files.contains(file_name) {
-                    continue;
-                }
                 changes
                     .entry(file_name.to_string())
                     .or_default()
                     .extend(text_changes);
+                *projections.entry(file_name.to_string()).or_default() += 1;
             }
         }
         self.changes = tracker_changes;
+
+        for (file_name, text_changes) in changes.iter_mut() {
+            // Converting the edits above may have found that this file cannot be represented in its original
+            // text. GetChanges drops it, so its order does not matter, and the best-effort ranges left behind
+            // may overlap in ways the check below would refuse.
+            if self.unmappable_files.contains(file_name) {
+                continue;
+            }
+            let multiple_projections = projections.get(file_name).copied().unwrap_or(0) > 1;
+            // order changes by start position
+            // If the start position is the same, put the shorter range first, since an empty range (x, x) may precede (x, y) but not vice-versa.
+            crate::gostd::slices::sort_stable_func(text_changes, |a, b| {
+                lsproto::compare_ranges(a.range, b.range)
+            });
+            if multiple_projections {
+                dedupe_identical_edits(text_changes);
+            }
+            // verify that change intervals do not overlap, except possibly at end points.
+            for i in 0..(text_changes.len() as i32 - 1).max(0) as usize {
+                if text_edits_conflict(&text_changes[i], &text_changes[i + 1], multiple_projections)
+                {
+                    if multiple_projections {
+                        // Projections of one original range disagree about how to edit it. That is a property of
+                        // the mapper's output rather than a bug here, so drop the file instead of failing.
+                        self.unmappable_files.insert(file_name.clone());
+                        break;
+                    }
+                    // assert change[i].End <= change[i + 1].Start
+                    // PORT: Go `%v` of a Range prints `{{l c} {l c}}`.
+                    let go_range = |r: &lsproto::Range| {
+                        format!(
+                            "{{{{{} {}}} {{{} {}}}}}",
+                            r.start.line, r.start.character, r.end.line, r.end.character
+                        )
+                    };
+                    crate::core::go_panic(format!(
+                        "changes overlap: {} and {}",
+                        go_range(&text_changes[i].range),
+                        go_range(&text_changes[i + 1].range)
+                    ));
+                }
+            }
+        }
         changes
     }
 
-    // Go: ls/change/trackerimpl.go:66 computeNewText
+    // Go: ls/change/trackerimpl.go:113 computeNewText
     // PORT: Go takes `change *trackerEdit` and only reads it.
     fn compute_new_text(
         &mut self,
@@ -101,10 +152,11 @@ impl Tracker {
             _ => {}
         }
 
+        let start = self.to_lsp_edit_range(source_file, change.text_range).start;
         let positions = lsconv::from_lsp_position_for_source_file(
             &self.converters,
             source_file,
-            change.range.start,
+            start,
             Feature::ALL,
         );
         let mut result = String::new();
@@ -182,7 +234,76 @@ impl Tracker {
             self.unmappable_files
                 .insert(source_file_original_file_name(source_file).to_string());
         }
-        result
+        self.reindent_inserted_lines(source_file, change, result)
+    }
+
+    // Go: ls/change/trackerimpl.go:161 reindentInsertedLines
+    /// reindentInsertedLines fixes the indentation of a line an insertion introduces into the document the
+    /// edit is applied to. The inserted text forms its own line when it ends in a newline, and that line has to
+    /// pick up the indentation of the line it is being spliced into. Where the indentation goes depends on
+    /// which side of the insertion point it already sits on:
+    ///
+    ///   - Inserting after a line's indentation (`\t\tfoo` with the point before `foo`) leaves the inserted text
+    ///     indented but pushes the rest of the line down bare, so the indentation is repeated after the text.
+    ///   - Inserting at the very start of a line leaves the existing text indented but puts the inserted text at
+    ///     column zero, so the indentation is emitted before the text.
+    ///
+    /// The indentation is read from the original text at the edit's original position, so it holds for a
+    /// content-mapped file whose projection is indented differently from the document the edit is applied to.
+    /// Edits carrying an explicit indentation option are left alone.
+    fn reindent_inserted_lines(
+        &self,
+        source_file: Node,
+        change: &TrackerEdit,
+        text: String,
+    ) -> String {
+        if text.is_empty()
+            || change.text_range.pos() != change.text_range.end()
+            || change.options.indentation.is_some()
+        {
+            return text;
+        }
+        if !text.ends_with(self.new_line.as_str()) {
+            return text;
+        }
+        let original = source_file_original_text(source_file);
+        let mut pos = change.text_range.pos();
+        if let Some(spans) = source_file_span_map(source_file) {
+            let (mapped, fidelity) = SpanMap::virtual_to_original_position(Some(spans), pos);
+            if !fidelity.is_exact() {
+                return text;
+            }
+            pos = mapped;
+        }
+        if pos < 0 || pos as usize > original.len() {
+            return text;
+        }
+        // PORT: Go slices the string by bytes; `pos` is a byte offset.
+        let original_bytes = original.as_bytes();
+        let pos = pos as usize;
+        // Go: strings.LastIndexAny(original[:pos], "\r\n") + 1
+        let line_start = original_bytes[..pos]
+            .iter()
+            .rposition(|&b| b == b'\r' || b == b'\n')
+            .map_or(0, |i| i + 1);
+        let before_point = &original_bytes[line_start..pos];
+        if before_point.is_empty() {
+            // At the start of a line: the existing text keeps its indentation, and the inserted line needs it —
+            // but only when the formatter left the text at column zero. Where the formatter already indented it
+            // (inserting into a multi-line list, say), that indentation is the correct one.
+            if !leading_indentation(text.as_bytes()).is_empty() {
+                return text;
+            }
+            let indentation = leading_indentation(&original_bytes[line_start..]);
+            // PORT: the indentation is ASCII spaces and tabs.
+            return String::from_utf8_lossy(indentation).into_owned() + &text;
+        }
+        if leading_indentation(before_point) != before_point {
+            return text;
+        }
+        // Just past the indentation: the inserted line already has it, the text pushed down needs it back.
+        // PORT: `before_point` is all ASCII spaces and tabs here.
+        text + &*String::from_utf8_lossy(before_point)
     }
 
     // Go: ls/change/trackerimpl.go:122 getFormattedTextOfNode
@@ -280,22 +401,21 @@ impl Tracker {
         (text, source_file_like)
     }
 
-    // Go: ls/change/trackerimpl.go:167 GetAdjustedRange
+    // Go: ls/change/trackerimpl.go:250 GetAdjustedRange
     // method on the changeTracker because use of converters
     /// GetAdjustedRange computes the adjusted range for a node in a source file, accounting for trivia.
     pub fn get_adjusted_range(
-        &mut self,
+        &self,
         source_file: Node,
         start_node: Node,
         end_node: Node,
         leading_option: LeadingTriviaOption,
         trailing_option: TrailingTriviaOption,
-    ) -> lsproto::Range {
-        let text_range = TextRange::new(
+    ) -> TextRange {
+        TextRange::new(
             self.get_adjusted_start_position(source_file, start_node, leading_option, false),
             self.get_adjusted_end_position(source_file, end_node, trailing_option),
-        );
-        self.to_lsp_edit_range(source_file, text_range)
+        )
     }
 
     // Go: ls/change/trackerimpl.go:172 getAdjustedStartPosition
@@ -633,5 +753,43 @@ impl Tracker {
             advance_past_line_break(&mut position, &text);
         }
         position
+    }
+}
+
+// Go: ls/change/trackerimpl_test.go
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go: ls/change/trackerimpl_test.go:9 TestTextEditsConflictAtSameInsertionPointAcrossProjections
+    #[test]
+    fn test_text_edits_conflict_at_same_insertion_point_across_projections() {
+        let position = lsproto::Position {
+            line: 1,
+            character: 2,
+        };
+        let a = lsproto::TextEdit {
+            range: lsproto::Range {
+                start: position,
+                end: position,
+            },
+            new_text: "a".to_string(),
+        };
+        let b = lsproto::TextEdit {
+            range: lsproto::Range {
+                start: position,
+                end: position,
+            },
+            new_text: "b".to_string(),
+        };
+
+        assert!(
+            text_edits_conflict(&a, &b, true),
+            "different insertions at the same position across projections should conflict"
+        );
+        assert!(
+            !text_edits_conflict(&a, &b, false),
+            "insertions at the same position within one projection should retain their existing ordering"
+        );
     }
 }

@@ -51,13 +51,13 @@ impl Checker {
     pub fn pad_object_literal_type(&mut self, t: TypeId, pattern: Node) -> TypeId {
         let mut missing_elements: Vec<Node> = Vec::new();
         for e in pattern.elements().iter() {
-            if e.initializer().is_some() {
-                let name = self.get_property_name_from_binding_element(e);
-                if name != INTERNAL_SYMBOL_NAME_MISSING
-                    && self.get_property_of_type(t, &name).is_nil()
-                {
-                    missing_elements.push(e);
-                }
+            if has_dot_dot_dot_token(e) {
+                continue;
+            }
+            let name = self.get_property_name_from_binding_element(e);
+            if name != INTERNAL_SYMBOL_NAME_MISSING && self.get_property_of_type(t, &name).is_nil()
+            {
+                missing_elements.push(e);
             }
         }
         if missing_elements.is_empty() {
@@ -74,7 +74,7 @@ impl Checker {
             let symbol = self.new_symbol(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL, &name);
             let resolved_type = self.get_type_from_binding_element(
                 e, false, /*includePatternInType*/
-                false, /*reportErrors*/
+                true,  /*reportErrors*/
             );
             self.value_symbol_links.get(symbol).resolved_type = resolved_type;
             let symbol_name = self.sym(symbol).name.clone();

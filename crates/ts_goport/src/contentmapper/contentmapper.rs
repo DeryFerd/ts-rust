@@ -111,6 +111,7 @@ pub struct Mapper {
     pub definition: Definition,
     // json:"-"
     pub manifest: Manifest,
+    // PackageDirectory is the real path directory returned by package resolution for package-based mappers.
     // json:"-"
     pub package_directory: String,
     // ContributionID is provided by an LSP client extension for inferred project content mappers.
@@ -142,7 +143,7 @@ impl UnmarshalerFrom for Mapper {
     }
 }
 
-// Go: contentmapper/contentmapper.go:57 supportedVirtualExtensions
+// Go: contentmapper/contentmapper.go:58 supportedVirtualExtensions
 static SUPPORTED_VIRTUAL_EXTENSIONS: LazyLock<FxHashSet<&'static str>> = LazyLock::new(|| {
     [
         ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".json",
@@ -151,14 +152,14 @@ static SUPPORTED_VIRTUAL_EXTENSIONS: LazyLock<FxHashSet<&'static str>> = LazyLoc
     .collect()
 });
 
-// Go: contentmapper/contentmapper.go:61 IsSupportedVirtualExtension
+// Go: contentmapper/contentmapper.go:62 IsSupportedVirtualExtension
 #[must_use]
 pub fn is_supported_virtual_extension(extension: &str) -> bool {
     SUPPORTED_VIRTUAL_EXTENSIONS.contains(extension)
 }
 
 impl Mapper {
-    // Go: contentmapper/contentmapper.go:66 Mapper.DiagnosticName
+    // Go: contentmapper/contentmapper.go:67 Mapper.DiagnosticName
     // DiagnosticName returns the best available user-facing name, including when manifest resolution failed.
     #[must_use]
     pub fn diagnostic_name(&self) -> String {
@@ -171,7 +172,7 @@ impl Mapper {
         }
     }
 
-    // Go: contentmapper/contentmapper.go:79 Mapper.Identity
+    // Go: contentmapper/contentmapper.go:80 Mapper.Identity
     // Identity returns the mapper's "name@version" identity, or just the name when it declares no version,
     // or an empty string when the mapper has not been resolved to a name.
     #[must_use]
@@ -182,7 +183,7 @@ impl Mapper {
         self.manifest_identity()
     }
 
-    // Go: contentmapper/contentmapper.go:86 Mapper.manifestIdentity
+    // Go: contentmapper/contentmapper.go:87 Mapper.manifestIdentity
     fn manifest_identity(&self) -> String {
         if self.manifest.name.is_empty() {
             String::new()
@@ -193,7 +194,7 @@ impl Mapper {
         }
     }
 
-    // Go: contentmapper/contentmapper.go:103 Mapper.TransformIdentity
+    // Go: contentmapper/contentmapper.go:104 Mapper.TransformIdentity
     // TransformIdentity returns a fingerprint of everything besides a file's content that determines the
     // output of transforming it with this mapper under the given options: the mapper's identity and the
     // values of the compiler options it declared it depends on. Folding it into a cache key means a change to
@@ -221,7 +222,7 @@ impl Mapper {
         xxhash_rust::xxh3::xxh3_128(&buf)
     }
 
-    // Go: contentmapper/contentmapper.go:118 Mapper.MarshalDeclaredOptions
+    // Go: contentmapper/contentmapper.go:119 Mapper.MarshalDeclaredOptions
     // MarshalDeclaredOptions marshals just the compiler options this mapper declared it depends on, in the
     // declared order, skipping any that are unset. Marshaling only the declared fields avoids serializing the
     // whole CompilerOptions when a mapper depends on few options (or none).
@@ -253,7 +254,7 @@ impl Mapper {
     }
 }
 
-// Go: contentmapper/contentmapper.go:144 compilerOptionFields
+// Go: contentmapper/contentmapper.go:145 compilerOptionFields
 // compilerOptionFields maps each CompilerOptions option name (its json tag) to its struct field index.
 // PORT: Go reads the `json` tags by reflection and marshals each set field
 // by itself. The port has no reflection: it marshals the whole options with

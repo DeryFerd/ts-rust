@@ -1,9 +1,10 @@
 //! Go: internal/vfs/vfs.go and internal/vfs/internal/internal.go.
 //!
 //! The Go standard library types that `vfs.FS` uses (`io/fs.FileInfo`,
-//! `io/fs.DirEntry`, `io/fs.FileMode`, the `io/fs` error values and the
-//! `fs.Stat`, `fs.ReadDir`, `fs.ReadFile` and `fs.WalkDir` helpers) are
-//! ported here too, because Rust has no equivalent with the same behavior.
+//! `io/fs.DirEntry`, `io/fs.FileMode`, `io/fs.WalkDirFunc`, the `io/fs`
+//! error values and the `fs.Stat`, `fs.ReadDir` and `fs.ReadFile` helpers)
+//! are ported here too, because Rust has no equivalent with the same
+//! behavior.
 
 use crate::frontend::prelude::*;
 use std::io;
@@ -53,13 +54,23 @@ pub trait Fs {
     // read; that is `None`.
     fn stat(&self, path: &str) -> Option<FileInfo>;
 
-    // WalkDir walks the file tree rooted at root, calling walkFn for each file or directory in the tree.
-    // It is has the same behavior as [fs.WalkDir], but with paths as [string].
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError>;
-
     // Realpath returns the "real path" of the specified path,
     // following symlinks and correcting filename casing.
     fn realpath(&self, path: &str) -> String;
+
+    /// PORT: Go type assertions of a `vfs.FS` value to the language service
+    /// file system layers (ts#64291): the project package's
+    /// `FileHandleSource`, `LayeredFileSystem`, `RebasableFileSystem`,
+    /// `FileChangeExpander` and `*overlayFS`, and the api's
+    /// `*requestFileSystem`. This crate (`goport_util`) cannot name those
+    /// types, so a layer returns itself as `Any` and
+    /// `project::as_fs_layer` downcasts it to its concrete type. Every other
+    /// file system keeps this default (the assertion fails). Wrappers that
+    /// forward to another `Fs` (`CachedFs`, `TrackingFs`, `wrapvfs`) must not
+    /// forward it: Go asserts on the wrapper's own type.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 // Go: vfs.go:52 Entries
@@ -180,10 +191,13 @@ impl FileInfo {
 // PORT: where `DirEntry.Info()` gets its data. Entries from `os.ReadDir`
 // call `lstat` on the full path; entries made from a `FileInfo`
 // (`fs.FileInfoToDirEntry`, the bundled file system) return that value.
+// `NotExist` is a `vfs.WalkDir` entry whose `Stat` found nothing (Go
+// `walkDirEntry.Info` returns `ErrNotExist`, ts#64277).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirEntryInfo {
     Known(FileInfo),
     Lstat(String),
+    NotExist,
 }
 
 // Go: vfs.go:65 DirEntry (= io/fs.DirEntry)
@@ -214,6 +228,7 @@ impl DirEntry {
                 Ok(md) => Ok(file_info_from_metadata(basename(full_path), &md)),
                 Err(err) => Err(FsError::path("lstat", full_path, err)),
             },
+            DirEntryInfo::NotExist => Err(FsError::NotExist),
         }
     }
 }
@@ -229,7 +244,7 @@ pub fn file_info_to_dir_entry(info: FileInfo) -> DirEntry {
 }
 
 // Go: vfs.go:71 ErrInvalid, ErrPermission, ErrExist, ErrNotExist, ErrClosed,
-// vfs.go:82 SkipAll, SkipDir
+// io/fs SkipAll, SkipDir (Go vfs.SkipAll and vfs.SkipDir until ts#64277)
 // PORT: Go `error` values become one enum. `Path` is `*os.PathError`
 // (the OS error is shared so the value can be cloned). `Other` is an
 // `errors.New` message.
@@ -269,7 +284,7 @@ impl FsError {
     }
 }
 
-// Go: vfs.go:80 WalkDirFunc (= io/fs.WalkDirFunc)
+// Go: io/fs/walk.go WalkDirFunc (Go vfs.WalkDirFunc until ts#64277)
 // PORT: Go passes a nil `DirEntry` and a nil `error` as `None`.
 pub type WalkDirFunc<'a> =
     dyn FnMut(&str, Option<&DirEntry>, Option<FsError>) -> Result<(), FsError> + 'a;
@@ -417,22 +432,6 @@ impl Common {
         }
     }
 
-    // Go: internal.go:131 WalkDir
-    pub fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        let (fsys, root_name, rest) = self.root_and_path(root);
-        let Some(fsys) = fsys else {
-            return Ok(());
-        };
-        io_fs_walk_dir(
-            fsys.as_ref(),
-            &rest,
-            &mut |path: &str, d: Option<&DirEntry>, err: Option<FsError>| {
-                let path = if path == "." { "" } else { path };
-                walk_fn(&format!("{root_name}{path}"), d, err)
-            },
-        )
-    }
-
     // Go: internal.go:144 ReadFile
     pub fn read_file(&self, path: &str) -> (String, bool) {
         let (fsys, _, rest) = self.root_and_path(path);
@@ -507,73 +506,6 @@ fn decode_utf16(s: &[u8], big_endian: bool) -> String {
         })
         .collect();
     String::from_utf16_lossy(&ints)
-}
-
-// Go: io/fs/walk.go WalkDir
-// PORT: Go standard library. `fs.Stat` calls the `StatFS` method directly.
-pub fn io_fs_walk_dir(
-    fsys: &dyn IoFs,
-    root: &str,
-    walk_fn: &mut WalkDirFunc<'_>,
-) -> Result<(), FsError> {
-    let result = match fsys.stat(root) {
-        Err(err) => walk_fn(root, None, Some(err)),
-        Ok(info) => io_fs_walk_dir_inner(fsys, root, &file_info_to_dir_entry(info), walk_fn),
-    };
-    match result {
-        Err(FsError::SkipDir) | Err(FsError::SkipAll) => Ok(()),
-        other => other,
-    }
-}
-
-// Go: io/fs/walk.go walkDir
-fn io_fs_walk_dir_inner(
-    fsys: &dyn IoFs,
-    name: &str,
-    d: &DirEntry,
-    walk_dir_fn: &mut WalkDirFunc<'_>,
-) -> Result<(), FsError> {
-    let first = walk_dir_fn(name, Some(d), None);
-    if first.is_err() || !d.is_dir() {
-        if matches!(first, Err(FsError::SkipDir)) && d.is_dir() {
-            return Ok(());
-        }
-        return first;
-    }
-
-    let dirs = match fsys.read_dir(name) {
-        Ok(dirs) => dirs,
-        Err(err) => {
-            // Second call, to report ReadDir error.
-            let second = walk_dir_fn(name, Some(d), Some(err));
-            if let Err(err) = second {
-                if err.is_skip_dir() && d.is_dir() {
-                    return Ok(());
-                }
-                return Err(err);
-            }
-            // PORT: Go keeps the entries that `ReadDir` returned before the
-            // error. The `ReadDirFS` port returns none on error.
-            Vec::new()
-        }
-    };
-
-    for d1 in &dirs {
-        // PORT: Go `path.Join(name, d1.Name())`. `name` is already clean and
-        // an entry name has no '/', so Join only drops a leading ".".
-        let name1 = if name == "." {
-            d1.name().to_string()
-        } else {
-            format!("{}/{}", name, d1.name())
-        };
-        if let Err(err) = io_fs_walk_dir_inner(fsys, &name1, d1, walk_dir_fn) {
-            if err.is_skip_dir() {
-                break;
-            }
-            return Err(err);
-        }
-    }
-    Ok(())
 }
 
 // Go: io/fs/fs.go ValidPath

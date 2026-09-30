@@ -2063,10 +2063,16 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:8246 (node *ModuleDeclaration) Clone
+    // Go: ast/ast_generated.go:8077 (node *ModuleDeclaration) Clone
     fn clone_module_declaration(&self, node: Node) -> Node {
         clone_node_from(
-            self.new_module_declaration(node.modifiers(), node.keyword(), node.name(), node.body()),
+            self.new_module_declaration(
+                node.modifiers(),
+                node.keyword(),
+                node.name(),
+                node.attributes(),
+                node.body(),
+            ),
             node,
             self.hooks(),
         )

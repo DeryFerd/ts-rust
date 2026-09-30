@@ -1139,7 +1139,12 @@ impl<'c, P: ProgramView> RefState<'c, P> {
                     s = symbol;
                 }
             }
-            text = strip_quotes(&symbol_name(&self.checker.symbols, s));
+            let symbol_name = symbol_name(&self.checker.symbols, s);
+            if let Some(module_name) = try_get_ambient_module_name_from_symbol_name(&symbol_name) {
+                text = module_name.to_string();
+            } else {
+                text = symbol_name.to_string();
+            }
         }
         let mut all_search_symbols = all_search_symbols;
         if all_search_symbols.is_empty() {

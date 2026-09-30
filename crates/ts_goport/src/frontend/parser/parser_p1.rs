@@ -1990,15 +1990,14 @@ impl<'a> Parser<'a> {
             {
                 initializer = self.parse_variable_declaration_list(true /*inForStatementInitializer*/);
             } else {
-                initializer = do_in_context(self, NodeFlags::DISALLOW_IN_CONTEXT, true, Parser::parse_expression);
+                initializer = self.do_in_context(NodeFlags::DISALLOW_IN_CONTEXT, true, Parser::parse_expression);
             }
         }
         let result;
         if await_token.is_some() && self.parse_expected(SyntaxKind::OfKeyword)
             || await_token.is_nil() && self.parse_optional(SyntaxKind::OfKeyword)
         {
-            let expression = do_in_context(
-                self,
+            let expression = self.do_in_context(
                 NodeFlags::DISALLOW_IN_CONTEXT,
                 false,
                 Parser::parse_assignment_expression_or_higher,
@@ -2110,12 +2109,8 @@ impl<'a> Parser<'a> {
             open_paren_parsed,
             open_paren_position,
         );
-        let statement = do_in_context(
-            self,
-            NodeFlags::IN_WITH_STATEMENT,
-            true,
-            Parser::parse_statement,
-        );
+        let statement =
+            self.do_in_context(NodeFlags::IN_WITH_STATEMENT, true, Parser::parse_statement);
         let node = self.factory.new_with_statement(expression, statement);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);

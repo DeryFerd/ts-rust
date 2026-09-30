@@ -150,7 +150,18 @@ pub fn get_external_module_name(node: Node) -> Node {
     panic!("Unhandled case in getExternalModuleName")
 }
 
-// Go: ast/utilities.go:1906 GetImportAttributes
+// Go: ast/utilities.go:1964 HasImportAttributes (ts#63931)
+pub fn has_import_attributes(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        SyntaxKind::ImportDeclaration
+            | SyntaxKind::JsImportDeclaration
+            | SyntaxKind::ExportDeclaration
+            | SyntaxKind::ImportType
+    )
+}
+
+// Go: ast/utilities.go:1972 GetImportAttributes
 pub fn get_import_attributes(node: Node) -> Node {
     match node.kind() {
         SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration => {
@@ -159,9 +170,12 @@ pub fn get_import_attributes(node: Node) -> Node {
         SyntaxKind::ExportDeclaration => {
             return node.attributes();
         }
+        SyntaxKind::ImportType => {
+            return node.attributes();
+        }
         _ => {}
     }
-    panic!("Unhandled case in getImportAttributes")
+    panic!("Unhandled case in getImportAttributes: {:?}", node.kind())
 }
 
 // Go: ast/utilities.go:1916 getImportTypeNodeLiteral

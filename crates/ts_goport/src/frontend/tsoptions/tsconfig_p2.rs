@@ -936,6 +936,9 @@ pub fn parse_json_config_file_content_worker(
         .iter()
         .flat_map(|group| group.iter().copied())
         .collect();
+    let canonical_extension = |extension: &str| -> String {
+        get_canonical_file_name(extension, host.fs().use_case_sensitive_file_names())
+    };
     for (j, mapper) in content_mappers.iter_mut().enumerate() {
         let mut valid_extensions: Vec<String> =
             Vec::with_capacity(mapper.definition.extensions.len());
@@ -945,6 +948,7 @@ pub fn parse_json_config_file_content_worker(
                 content_mapper_indices[j],
                 ext,
             );
+            let canonical_ext = canonical_extension(ext);
             if !ext.starts_with('.') {
                 errors.push(set_content_mapper_diagnostic_location(
                     new_compiler_diagnostic(
@@ -954,7 +958,12 @@ pub fn parse_json_config_file_content_worker(
                     content_mapper_source_file,
                     ext_node,
                 ));
-            } else if native_extensions.contains(&ext.as_str()) {
+            } else if native_extensions.iter().any(|native_extension| {
+                crate::frontend::vfs::vfsmatch::equal_fold(
+                    native_extension.as_bytes(),
+                    ext.as_bytes(),
+                )
+            }) {
                 errors.push(set_content_mapper_diagnostic_location(
                     new_compiler_diagnostic(
                         diag::Content_mapper_file_extension_0_is_a_built_in_extension_and_cannot_be_registered_by_a_content_mapper,
@@ -963,7 +972,7 @@ pub fn parse_json_config_file_content_worker(
                     content_mapper_source_file,
                     ext_node,
                 ));
-            } else if seen_content_mapper_extensions.contains(ext) {
+            } else if seen_content_mapper_extensions.contains(&canonical_ext) {
                 errors.push(set_content_mapper_diagnostic_location(
                     new_compiler_diagnostic(
                         diag::Content_mapper_file_extension_0_is_registered_by_more_than_one_content_mapper,
@@ -973,7 +982,7 @@ pub fn parse_json_config_file_content_worker(
                     ext_node,
                 ));
             } else {
-                seen_content_mapper_extensions.insert(ext.clone());
+                seen_content_mapper_extensions.insert(canonical_ext);
                 content_mapper_extensions.push(ext.clone());
                 valid_extensions.push(ext.clone());
             }
@@ -1302,7 +1311,7 @@ pub fn create_diagnostic_at_reference_syntax(
     })
 }
 
-// Go: tsoptions/tsconfigparsing.go:1636 createDiagnosticAtProjectReferenceProperty
+// Go: tsoptions/tsconfigparsing.go:1642 createDiagnosticAtProjectReferenceProperty
 // PORT: Go `*TsConfigSourceFile` is `Option<&TsConfigSourceFile>`; the Go
 // variadic `args` is a `Vec`.
 fn create_diagnostic_at_project_reference_property(
@@ -1373,7 +1382,7 @@ pub fn get_options_syntax_by_array_element_value(
     .unwrap_or(Node::NIL)
 }
 
-// Go: tsoptions/tsconfigparsing.go:1676 getContentMapperSyntax (tsgo#4712)
+// Go: tsoptions/tsconfigparsing.go:1682 getContentMapperSyntax (tsgo#4712)
 // getContentMapperSyntax returns the tsconfig JSON node to attribute a diagnostic about the content
 // mapper at index to: the value of subKey within that mapper's object (when subKey is non-empty),
 // falling back to the mapper element, then to the "contentMappers" array. An index outside the array
@@ -1410,7 +1419,7 @@ fn get_content_mapper_syntax(source_file: Node, index: i32, sub_key: &str) -> No
     .unwrap_or(Node::NIL)
 }
 
-// Go: tsoptions/tsconfigparsing.go:1700 GetContentMapperOptionDiagnosticLocation (tsgo#4712)
+// Go: tsoptions/tsconfigparsing.go:1706 GetContentMapperOptionDiagnosticLocation (tsgo#4712)
 // PORT: Go returns `(*ast.SourceFile, core.TextRange)`; the file is a
 // `Node` (`Node::NIL` for nil). Go `slices.Index` compares the mapper
 // pointers (`Rc::ptr_eq`). Go indexes the array with a negative
@@ -1469,7 +1478,7 @@ pub fn get_content_mapper_option_diagnostic_location(
     )
 }
 
-// Go: tsoptions/tsconfigparsing.go:1737 getContentMappersKeySyntax (tsgo#4712)
+// Go: tsoptions/tsconfigparsing.go:1743 getContentMappersKeySyntax (tsgo#4712)
 // getContentMappersKeySyntax returns the "contentMappers" property key node, used to attribute a
 // diagnostic about the setting as a whole rather than a specific mapper.
 fn get_content_mappers_key_syntax(source_file: Node) -> Node {
@@ -1482,7 +1491,7 @@ fn get_content_mappers_key_syntax(source_file: Node) -> Node {
     .unwrap_or(Node::NIL)
 }
 
-// Go: tsoptions/tsconfigparsing.go:1748 getContentMapperExtensionSyntax (tsgo#4712)
+// Go: tsoptions/tsconfigparsing.go:1754 getContentMapperExtensionSyntax (tsgo#4712)
 // getContentMapperExtensionSyntax returns the node for a specific extension string within the content
 // mapper at index, falling back to the "extensions" array or the mapper element.
 fn get_content_mapper_extension_syntax(source_file: Node, index: i32, ext: &str) -> Node {
@@ -1499,7 +1508,7 @@ fn get_content_mapper_extension_syntax(source_file: Node, index: i32, ext: &str)
     node
 }
 
-// Go: tsoptions/tsconfigparsing.go:1763 setContentMapperDiagnosticLocation (tsgo#4712)
+// Go: tsoptions/tsconfigparsing.go:1769 setContentMapperDiagnosticLocation (tsgo#4712)
 // setContentMapperDiagnosticLocation attaches a source location to a content mapper diagnostic when a
 // tsconfig source file and node are available (the jsonSourceFile API), leaving it as a location-less
 // compiler diagnostic otherwise (the JSON API).

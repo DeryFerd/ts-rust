@@ -1387,6 +1387,10 @@ impl Checker {
         check_mode: CheckMode,
     ) -> TypeId {
         self.check_node_deferred(node);
+        let full_signature = node.full_signature();
+        if full_signature.is_some() {
+            self.check_source_element(full_signature);
+        }
         if is_function_expression(node) {
             self.check_collisions_for_declaration_name(node, node.name());
         }
@@ -1545,7 +1549,12 @@ impl Checker {
                     && self.get_return_type_from_annotation(node).is_nil()
                     && self.sig(signature).resolved_return_type.is_nil()
                 {
-                    let return_type = self.get_return_type_from_body(node, check_mode);
+                    // resolvedReturnType is cached indefinitely, so the return type here has to be computed without CheckModeSkipContextSensitive;
+                    // otherwise anyFunctionType could leak as part of the computed (and cached) return type.
+                    let return_type = self.get_return_type_from_body(
+                        node,
+                        check_mode.without(CheckMode::SKIP_CONTEXT_SENSITIVE),
+                    );
                     if self.sig(signature).resolved_return_type.is_nil() {
                         self.sig_mut(signature).resolved_return_type = return_type;
                     }

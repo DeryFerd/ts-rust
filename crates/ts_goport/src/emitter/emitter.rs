@@ -362,13 +362,9 @@ impl Emitter {
         {
             return None;
         }
-        // #4712
-        // Declaration files for content-mapped files don't get source maps because the mapped positions would point into
-        // transformed TS content that exists only in-memory during the build. As a future improvement, it may be possible
-        // to double-map the positions using the content-mapped file's spanmap.
-        let emit_declaration_map = self.emit_only != EmitOnly::BuilderSignature
-            && options.declaration_map.is_true()
-            && source_file_content_mapper(source_file).is_empty();
+        let emit_declaration_map =
+            self.emit_only != EmitOnly::BuilderSignature && options.declaration_map.is_true();
+        let content_mapped_source = source_file;
 
         let trace = crate::tracing::get().map(|tr| {
             tr.push(
@@ -457,14 +453,32 @@ impl Emitter {
         };
 
         // create a printer to print the nodes
-        let mut printer = new_printer(
-            printer_options,
-            PrintHandlers {
-                // !!!
-                ..PrintHandlers::default()
-            },
-            Some(emit_context.clone()),
-        );
+        let mut print_handlers = PrintHandlers::default();
+        if let Some(span_map) = source_file_span_map(content_mapped_source)
+            && emit_declaration_map
+        {
+            let original_source: Rc<dyn crate::sourcemap::source::Source> =
+                Rc::new(new_declaration_map_source(content_mapped_source));
+            let content_mapped_file_name = source_file_file_name(content_mapped_source);
+            // PORT: Go takes and returns a `sourcemap.Source`. The printer's
+            // source is a source file node; `None` in the result is the
+            // source that Go returns unchanged, and a `None` result is Go
+            // `ok == false`.
+            print_handlers.map_source_position = Some(Rc::new(move |source: Node, pos: i32| {
+                if source_file_file_name(source) != content_mapped_file_name {
+                    return Some((None, pos));
+                }
+                let (mapped, ok) = crate::spanmap::SpanMap::virtual_to_original_position_exact(
+                    Some(span_map),
+                    pos,
+                );
+                if !ok {
+                    return None;
+                }
+                Some((Some(original_source.clone()), mapped))
+            }));
+        }
+        let mut printer = new_printer(printer_options, print_handlers, Some(emit_context.clone()));
 
         let declaration_map_options = CompilerOptions {
             source_map: if emit_declaration_map {
@@ -497,7 +511,7 @@ impl Emitter {
         emit_context.reset();
     }
 
-    // Go: compiler/emitter.go:289 emitter.printSourceFile
+    // Go: compiler/emitter.go:314 emitter.printSourceFile
     fn print_source_file(
         &mut self,
         js_file_path: &str,
@@ -750,6 +764,38 @@ impl Emitter {
             }
         }
         encode_uri(&source_map_file)
+    }
+}
+
+// Go: compiler/emitter.go:295 declarationMapSource
+struct DeclarationMapSource {
+    file_name: &'static str,
+    text: FileText,
+    line_map: Vec<i32>,
+}
+
+// Go: compiler/emitter.go:301 newDeclarationMapSource
+fn new_declaration_map_source(source_file: Node) -> DeclarationMapSource {
+    let text = source_file_original_text(source_file);
+    DeclarationMapSource {
+        file_name: source_file_original_file_name(source_file),
+        line_map: compute_ecma_line_starts(&text),
+        text,
+    }
+}
+
+// Go: compiler/emitter.go:310 declarationMapSource.FileName, Text, ECMALineMap
+impl crate::sourcemap::source::Source for DeclarationMapSource {
+    fn text(&self) -> &str {
+        &self.text
+    }
+
+    fn file_name(&self) -> &str {
+        self.file_name
+    }
+
+    fn ecma_line_map(&self) -> &[i32] {
+        &self.line_map
     }
 }
 

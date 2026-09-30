@@ -172,7 +172,51 @@ child_test! {
 }
 
 child_test! {
-    // Go: server_contentmapper_internal_test.go:75 TestParseContentMapperContributionsDefaultsOptionsToObject
+    // Go: server_contentmapper_internal_test.go:71 TestParseContentMapperContributionsUsesCaseInsensitiveExtensions (ts#63936)
+    fn parse_content_mapper_contributions_uses_case_insensitive_extensions() {
+        let inferred_project_contribution = |name: &str| lsproto::InferredProjectContentMapperContribution {
+            options: None,
+            manifest: Some(manifest(name, &[name])),
+        };
+        let result = lsp::parse_content_mapper_contributions(&[
+            lsproto::ContentMapperContribution {
+                contributor_id: "first".to_string(),
+                extensions: vec![".vue".to_string()],
+                inferred_project_contribution: Some(inferred_project_contribution("first")),
+            },
+            lsproto::ContentMapperContribution {
+                contributor_id: "second".to_string(),
+                extensions: vec![".VUE".to_string()],
+                inferred_project_contribution: Some(inferred_project_contribution("second")),
+            },
+        ]);
+        match result {
+            Ok(_) => panic!("expected an error"),
+            Err(err) => assert!(
+                err.error().contains(r#"both claim extension ".VUE""#),
+                "{}",
+                err.error()
+            ),
+        }
+
+        let result = lsp::parse_content_mapper_contributions(&[lsproto::ContentMapperContribution {
+            contributor_id: "built-in".to_string(),
+            extensions: vec![".TS".to_string()],
+            inferred_project_contribution: None,
+        }]);
+        match result {
+            Ok(_) => panic!("expected an error"),
+            Err(err) => assert!(
+                err.error().contains(r#"invalid extension ".TS""#),
+                "{}",
+                err.error()
+            ),
+        }
+    }
+}
+
+child_test! {
+    // Go: server_contentmapper_internal_test.go:89 TestParseContentMapperContributionsDefaultsOptionsToObject
     fn parse_content_mapper_contributions_defaults_options_to_object() {
         let contributions = lsp::parse_content_mapper_contributions(&[lsproto::ContentMapperContribution {
             contributor_id: "publisher.extension".to_string(),

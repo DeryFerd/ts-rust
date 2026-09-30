@@ -581,7 +581,7 @@ fn compute_position_of_line_and_utf16_character(
 }
 
 impl CompilationResult {
-    // Go: harnessutil.go:870 GetSourceMapRecord
+    // Go: harnessutil.go:915 GetSourceMapRecord
     pub fn get_source_map_record(&self) -> String {
         if self.result.source_maps.is_empty() {
             return String::new();
@@ -609,18 +609,19 @@ impl CompilationResult {
             );
             let mut mapper = decode_mappings(&source_map_data.source_map.mappings);
             for decoded_source_mapping in mapper.values() {
-                let mut current_source_file: Option<String> = None;
-                if decoded_source_mapping.is_source_mapping() {
-                    let name = &source_map_data.input_source_file_names
-                        [decoded_source_mapping.source_index as usize];
-                    // Go compares `*ast.SourceFile` pointers; the file name
-                    // identifies the file.
-                    current_source_file = self.source_file_name(name);
+                if !decoded_source_mapping.is_source_mapping() {
+                    source_map_span_writer.record_source_map_span(decoded_source_mapping);
+                    continue;
                 }
+                let name = &source_map_data.input_source_file_names
+                    [decoded_source_mapping.source_index as usize];
+                // Go compares `*ast.SourceFile` pointers; the file name
+                // identifies the file.
+                let current_source_file = self.source_file_name(name);
                 if current_source_file != prev_source_file {
                     if let Some(name) = &current_source_file {
                         let text = self
-                            .source_file_text(name)
+                            .source_file_original_text(name)
                             .expect("the program has the source file");
                         source_map_span_writer
                             .record_new_source_file_span(decoded_source_mapping, &text);

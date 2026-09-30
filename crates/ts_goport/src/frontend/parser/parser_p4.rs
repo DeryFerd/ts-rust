@@ -1265,11 +1265,13 @@ impl<'a> Parser<'a> {
                 return self.parse_jsx_expression(true /*inExpressionContext*/);
             }
             if self.token == SyntaxKind::LessThanToken {
+                // An attribute value must be a single JsxAttributeValue, so don't allow the sibling-element
+                // recovery to wrap it in a synthetic binary expression.
                 return self.parse_jsx_element_or_self_closing_element_or_fragment(
-                    true, /*inExpressionContext*/
-                    -1,
-                    Node::NIL,
-                    false,
+                    true,      /*inExpressionContext*/
+                    -1,        /*topInvalidNodePosition*/
+                    Node::NIL, /*openingTag*/
+                    true,      /*mustBeUnary*/
                 );
             }
             self.parse_error_at_current_token(diag::X_or_JSX_element_expected, args![]);
@@ -1935,8 +1937,7 @@ impl<'a> Parser<'a> {
 
     // Go: parser.go:5501 parseArgumentExpression
     pub fn parse_argument_expression(&mut self) -> Node {
-        do_in_context(
-            self,
+        self.do_in_context(
             NodeFlags::DISALLOW_IN_CONTEXT | NodeFlags::DECORATOR_CONTEXT,
             false,
             Parser::parse_argument_or_array_literal_element,

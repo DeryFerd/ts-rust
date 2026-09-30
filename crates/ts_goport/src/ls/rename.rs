@@ -94,6 +94,7 @@ impl LanguageService {
             true,  /*isRename*/
             false, /*implementations*/
             SymbolEntryTransformOptions::default(),
+            None, /*defaultProjectData*/
         )
     }
 

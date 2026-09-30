@@ -16,7 +16,8 @@ The script mirrors these Go files (pinned dc37b5249, /home/theo/.explore/repos/m
 Upstream pins (UPSTREAM.json, scripts/upstream/pin.py): with GOPORT_PIN=<key> the tool runs itself
 again under `pin.py exec`, so the default oracle, Go checkout and traces/ show that pin's files (traces/
 is a pin cache; golden/ is keyed by the oracle anyway). The O pin dc37b5249ab6 speaks protocol 1, the
-bump A pin 52168999f3dc protocol 2, every later pin protocol 3. Protocol 2 (Go changed the API in bump A):
+bump A pin 52168999f3dc protocol 2, the bump B pin 16c25522e123 protocol 3, every later pin protocol 4.
+Protocol 2 (Go changed the API in bump A):
   - updateSnapshot takes openProjects: [config] (tsgo#4402), not openProject;
   - the type, symbol and signature property requests (objectId) need a project (tsgo#4341:
     GetTypePropertyParams, GetSymbolPropertyParams, GetSignaturePropertyParams);
@@ -30,8 +31,24 @@ Protocol 3 (bump B, 16c25522e123) adds to protocol 2:
   The other API changes up to 16c25522e123 keep the requests of `build`: new methods only (transpile*
   tsgo#4849, emit, getSymbolsInScope, ...), the language service methods keep their wire names (tsgo#4893
   moves them only in the TS client), and tsgo#4915 adds only generator comments and tags.
-  `build --kind ext` (protocol 3 only) sends the methods that B adds or changes and that the other kinds do
+  `build --kind ext` (protocol 3 or later) sends the methods that B adds or changes and that the other kinds do
   not send: design in target/continuation-r97-goport/upstream/bumpB/api-battery/design.md.
+Protocol 4 (every pin after 16c25522e123; bump C N = microsoft/TypeScript 673a5f17d713, study in
+target/continuation-r97-goport/studies/api-oracle-N.md) changes only the snapshot requests:
+  - updateSnapshot takes {snapshot: base, changes?} and clones that base; the flat fields are gone.
+    createSnapshot takes the flat changes and starts from a fresh root; getCurrentLanguageServerSnapshot
+    {baseSnapshot?, changes?} (LSP sessions only) takes the old path through the LS state;
+  - fileChanges is changes.fileNotifications. A file change leaves a program dirty unless ensurePrograms asks
+    for it, so file-change updates send ensurePrograms: true (the B behavior);
+  - updateTemporarySnapshot is gone: an updateSnapshot with a layer fileSystem {kind: "layer", files: {file:
+    text}} and ensurePrograms: true replaces it (the TS client's runWithTemporaryFileUpdate);
+  - with a base, the answer lists only the added or replaced projects, and changes.removedProjects the removed
+    ones. The run merges them into the project list of the base.
+  `build` writes each protocol 3 snapshot event as exactly one protocol 4 event (TraceBuilder.snap and .temp),
+  so the event keys match the B traces. A layer event has "track": false: it does not move @SNAPSHOT@.
+  `check --wire 3` sends the snapshot events of protocol 4 traces in their protocol 3 form (wire3), for a
+  ruling 10 rebase run of base bins that speak protocol 3. It needs a reviewer ruling before its results are
+  used; the result meta and manifest record "wire": 3.
 `build` writes traces of the run's protocol. Normalization reads the escaped names from protocol 2 on.
 Build the traces at each pin: they hold positions from the pin's encoded AST (UTF-16 offsets after the
 O pin, UTF-8 at O; they differ in files with non-ASCII text). With GOPORT_PIN unset the run uses the
@@ -41,7 +58,7 @@ Commands:
   build     --preset P --battery B [--kind files|proto|callbacks|lsp|xchecker|ext] [--oracle BIN] [--limit N]
   record    --battery B [--oracle BIN] [--jobs N] [--force] [--only S]
   selfcheck --battery B [--oracle BIN] [--jobs N] [--runs N] [--only S]
-  check     --battery B --goport BIN --label L [--jobs N] [--only S]
+  check     --battery B --goport BIN --label L [--jobs N] [--only S] [--wire 3]
   summary   --label L [--baseline L0]
   show      --label L --battery B --trace T --event K
 
@@ -65,16 +82,19 @@ Trace format goport-api-trace/1 (JSONL). Line 1 is the header:
   sorted by path. An `emit` request is sent only with that callback, a fixture and a project
   config under the run dir (else not_run), so no run writes into a project input.
 Each later line is one event, numbered from 0:
-  {"kind": "request", "method": M, "params": P, "paramsFrom": F}   F optional
+  {"kind": "request", "method": M, "params": P, "paramsFrom": F}   F optional; "track": false
+                                                                     (protocol 4 layer events) keeps
+                                                                     @SNAPSHOT@ and the projects
   {"kind": "overlay", "path": ABS, "content": TEXT | null}           callback FS overlay
                                                                      (null: file deleted;
                                                                      {"drop": true}: overlay removed)
 Placeholders (expanded in params before paramsFrom):
-  "@SNAPSHOT@"          snapshot of the latest successful updateSnapshot answer
+  "@SNAPSHOT@"          snapshot of the latest successful updateSnapshot answer (protocol 4: of any
+                        snapshot method)
   "@PROJECT@"           id of the project whose configFileName is the header tsconfig
   "@PROJECT:<rel>@"     id of the project whose config is <project dir>/<rel> (<rel> may start
                         with @RUN_DIR@ for a fixture config)
-  "@PROJECT_DIR@", "@RUN_DIR@" inside strings
+  "@PROJECT_DIR@", "@RUN_DIR@" inside strings and object keys
 paramsFrom: one spec or a list of specs, applied in order. A spec takes a value from
 the raw answer of an earlier event of the same server run (handles differ between
 servers and between Go runs, so they are never copied from the golden):
@@ -135,6 +155,7 @@ REPO = "/home/theo/Code/sandbox/ts-rust"
 PIN_TOOL = REPO + "/scripts/upstream/pin.py"
 O_PIN = "dc37b5249ab6"  # the last pin with API protocol 1
 A_PIN = "52168999f3dc"  # the last pin with API protocol 2
+B_PIN = "16c25522e123"  # the last pin with API protocol 3
 
 
 def run_pin():
@@ -150,7 +171,7 @@ def run_pin():
 
 
 PIN = run_pin()
-PROTOCOL = 1 if PIN == O_PIN else 2 if PIN == A_PIN else 3
+PROTOCOL = 1 if PIN == O_PIN else 2 if PIN == A_PIN else 3 if PIN == B_PIN else 4
 PROTOCOL2 = PROTOCOL >= 2
 DEFAULT_OUT_ROOT = REPO + "/target/continuation-r97-goport/tests2/api"
 DEFAULT_ORACLE = os.path.expanduser("~/.local/bin/tsgo-oracle")
@@ -423,7 +444,10 @@ SYM = {"id": "sym", "parent": "sym", "exportSymbol": "sym", "name": "symname"}
 TYPE = {"id": "type", "symbol": "sym", "aliasSymbol": "sym", "aliasTypeArguments": ["type"], "target": "type",
         "typeParameters": ["type"], "outerTypeParameters": ["type"], "localTypeParameters": ["type"],
         "objectType": "type", "indexType": "type", "checkType": "type", "extendsType": "type", "baseType": "type",
-        "substConstraint": "type", "freshType": "type", "regularType": "type"}
+        "substConstraint": "type", "freshType": "type", "regularType": "type",
+        # protocol 4 (TypeResponse at N); B answers never have these keys
+        "typeParameter": "type", "constraintType": "type", "nameType": "type", "templateType": "type",
+        "thisType": "type"}
 SIG = {"id": "sig", "typeParameters": ["type"], "parameters": ["sym"], "thisParameter": "sym", "target": "sig"}
 INDEX_INFO = {"keyType": TYPE, "valueType": TYPE}
 PREDICATE = {"type": TYPE}
@@ -465,6 +489,8 @@ SHAPES.update({"getSymbolOfSourceFile": SYM, "getSymbolsOfSourceFiles": [SYM], "
 # Lists that come from Go map iteration (random order). Sorted before renumbering.
 UNORDERED = {"getMembersOfSymbol": "", "getExportsOfSymbol": "", "getCompletionsAtPosition": "/entries",
              "getSymbolsInScope": ""}
+# Methods that answer {snapshot, projects, changes?}: protocol 3 sends the last two, protocol 4 the first three.
+SNAPSHOT_METHODS = ("createSnapshot", "updateSnapshot", "getCurrentLanguageServerSnapshot", "updateTemporarySnapshot")
 # Methods whose msgpack answer is raw bytes (Go: RawBinary in session.go).
 BINARY_METHODS = {"getSourceFile", "typeToTypeNode", "signatureToSignatureDeclaration", "echo", "getConfigSourceFile"}
 # tsgo#4699 emit methods: files emit in parallel, so these lists come in any order.
@@ -575,7 +601,7 @@ class Normalizer:
         if method == "getFullyQualifiedName" and isinstance(v, str):
             v = _FQN_AT.sub(lambda m: m.group(1) + "⟨#⟩", v)
             v = _FQN_PRIVATE.sub(lambda m: m.group(1) + "⟨#⟩@", v)
-        if method in ("updateSnapshot", "updateTemporarySnapshot") and isinstance(v, dict) \
+        if method in SNAPSHOT_METHODS and isinstance(v, dict) \
                 and isinstance(v.get("changes"), dict):
             ch = v["changes"]
             for proj in (ch.get("changedProjects") or {}).values():
@@ -1180,16 +1206,48 @@ def expand(v, ctx):
     if isinstance(v, list):
         return [expand(e, ctx) for e in v]
     if isinstance(v, dict):
-        return {k: expand(e, ctx) for k, e in v.items()}
+        return {expand(k, ctx): expand(e, ctx) for k, e in v.items()}  # keys: the files of a layer
     return v
+
+
+def wire3(method, params):
+    """(method, params) of a protocol 4 snapshot event in its protocol 3 form: the inverse of TraceBuilder.snap
+    and TraceBuilder.temp. Other events come back unchanged. Used by `check --wire 3` (base bins that speak
+    protocol 3) and to compare N traces with B traces."""
+    if method not in SNAPSHOT_METHODS[:3]:
+        return method, params
+    p = params or {}
+    changes = p if method == "createSnapshot" else p.get("changes") or {}
+    fs = changes.get("fileSystem")
+    if method == "updateSnapshot" and isinstance(fs, dict) and fs.get("kind") == "layer":
+        (file, text), = fs["files"].items()
+        return "updateTemporarySnapshot", {**({"snapshot": p["snapshot"]} if "snapshot" in p else {}),
+                                           "file": file, "newText": text}
+    b = {k: v for k, v in changes.items() if k not in ("fileNotifications", "ensurePrograms")}
+    if "fileNotifications" in changes:
+        b["fileChanges"] = changes["fileNotifications"]
+    return "updateSnapshot", b
+
+
+def wire3_event(ev):
+    """The event with wire3 applied (and no "track" key); overlays and other requests unchanged."""
+    if ev.get("kind") != "request" or ev["method"] not in SNAPSHOT_METHODS[:3]:
+        return ev
+    method, params = wire3(ev["method"], ev.get("params"))
+    out = {k: v for k, v in ev.items() if k != "track"}
+    out.update(method=method, params=params)
+    return out
 
 
 class SessionRun:
     """Runs one trace against one server. mode "record" keeps every answer; mode "check"
     follows the golden's skip decisions."""
 
-    def __init__(self, header, events, binary, role, tmp_root, golden=None, timeout=None, keep=False):
+    def __init__(self, header, events, binary, role, tmp_root, golden=None, timeout=None, keep=False, wire=None):
         self.header, self.events, self.binary, self.role = header, events, binary, role
+        self.wire = wire  # 3: send the snapshot events of protocol 4 traces in their protocol 3 form
+        if wire == 3:
+            self.events = [wire3_event(ev) for ev in events]
         self.golden = golden  # event -> golden record (check mode)
         self.timeout = timeout or REQUEST_TIMEOUT[role]
         self.tmp_root, self.keep = tmp_root, keep
@@ -1255,7 +1313,7 @@ class SessionRun:
                     rec["epoch"] = restarts
                 if status == "ok":
                     raw[k] = ans
-                    self._track(method, ans)
+                    self._track(ev, params, ans)
                     rec["_ref"] = (len(epochs) - 1, len(epochs[-1]))
                     epochs[-1].append((method, ans))
                 elif status == "error":
@@ -1312,10 +1370,30 @@ class SessionRun:
         meta = {"exitCodes": exit_codes, "restarts": restarts, "seconds": round(time.time() - t_start, 1)}
         return records, meta
 
-    def _track(self, method, ans):
-        if method == "updateSnapshot" and isinstance(ans, dict):
-            self.ctx["snapshot"] = ans.get("snapshot")
-            self.ctx["projects"] = ans.get("projects") or []
+    def _track(self, ev, params, ans):
+        """@SNAPSHOT@ and the project list from a snapshot answer. Protocol 3 (and --wire 3): each updateSnapshot
+        answer replaces both. Protocol 4: a snapshot method answer, except a "track": false event. With a base
+        (updateSnapshot, or getCurrentLanguageServerSnapshot with baseSnapshot) the answer has only the added
+        or replaced projects: they replace the projects of the same id, and changes.removedProjects go. The
+        base of every tracked update in the traces is @SNAPSHOT@, so the current list is the base's list."""
+        method = ev["method"]
+        if not isinstance(ans, dict) or ev.get("track") is False:
+            return
+        if PROTOCOL < 4 or self.wire == 3:
+            if method == "updateSnapshot":
+                self.ctx["snapshot"] = ans.get("snapshot")
+                self.ctx["projects"] = ans.get("projects") or []
+            return
+        if method not in SNAPSHOT_METHODS:
+            return
+        projects = ans.get("projects") or []
+        if method == "updateSnapshot" or (isinstance(params, dict) and params.get("baseSnapshot")):
+            removed = set((ans.get("changes") or {}).get("removedProjects") or [])
+            new = {p.get("id"): p for p in projects}
+            projects = [new.pop(p.get("id"), p) for p in self.ctx["projects"] if p.get("id") not in removed]
+            projects += new.values()
+        self.ctx["snapshot"] = ans.get("snapshot")
+        self.ctx["projects"] = projects
 
     def _emit_guard(self, method, params, run_dir):
         """None when the request may be sent. tsgo#4699 `emit` writes through the session FS (the real disk
@@ -1371,7 +1449,7 @@ class SessionRun:
             st, ans = server.api.request(j + 1, ev["method"], params, self.timeout)
             if st == "ok":
                 raw[j] = ans
-                self._track(ev["method"], ans)
+                self._track(ev, params, ans)
                 epoch.append((ev["method"], ans))
             elif st in ("crash", "timeout"):
                 crashed.add(j)
@@ -1665,6 +1743,8 @@ def cmd_selfcheck(args):
 
 
 def cmd_check(args):
+    if args.wire and PROTOCOL < 4:
+        raise UsageError(f"--wire {args.wire} needs protocol 4 traces (pin {PIN} has protocol {PROTOCOL})")
     oracle_sha = args.oracle_sha or sha256_file(args.oracle)
     traces = list_traces(args.out_root, args.battery, args.only)
     gdir = golden_dir(args.out_root, oracle_sha, args.battery)
@@ -1688,7 +1768,9 @@ def cmd_check(args):
         pdir, rels = trace_inputs(header, events)
         fp0 = input_fingerprint(pdir, rels)
         recs, meta = SessionRun(header, events, args.goport, "goport", tmp_root, golden=gmap,
-                                timeout=args.request_timeout, keep=args.keep_temp).run()
+                                timeout=args.request_timeout, keep=args.keep_temp, wire=args.wire).run()
+        if args.wire:
+            meta["wire"] = args.wire
         if input_fingerprint(pdir, rels) != fp0:
             raise InputChanged(f"{pdir} changed while checking {name}")
         rmap = records_by_event(recs)
@@ -1726,6 +1808,8 @@ def cmd_check(args):
                                            "traces": len(traces), "date": time.strftime("%Y-%m-%d %H:%M:%S"),
                                            "script": os.path.abspath(__file__),
                                            "scriptSha": sha256_file(os.path.abspath(__file__))}
+    if args.wire:
+        manifest["batteries"][args.battery]["wire"] = args.wire
     write_json(manifest_path, manifest)
     s = build_summary(args.out_root, args.label, None)
     print(summary_markdown(s))
@@ -2030,6 +2114,7 @@ class TraceBuilder:
 
     def __init__(self):
         self.events = []
+        self.snaps = 0  # snapshot events so far (snap)
 
     def req(self, method, params=None, pf=None):
         if PROTOCOL >= 3 and method in OBJECT_ID_METHODS and isinstance(pf, dict) \
@@ -2042,6 +2127,35 @@ class TraceBuilder:
             ev["paramsFrom"] = pf
         self.events.append(ev)
         return len(self.events) - 1
+
+    def snap(self, b, lsp=False):
+        """One snapshot event from its protocol 3 params `b` ({}, {openProjects} or {fileChanges}). Protocol 4
+        (study api-oracle-N.md section 2): the first stdio event is createSnapshot, a later one updateSnapshot
+        {snapshot: @SNAPSHOT@, changes?}; an LSP session uses getCurrentLanguageServerSnapshot {baseSnapshot?
+        (not on the first), changes?}. fileChanges become fileNotifications with ensurePrograms: true."""
+        self.snaps += 1
+        if PROTOCOL < 4:
+            return self.req("updateSnapshot", b)
+        changes = {k: v for k, v in b.items() if k != "fileChanges"}
+        if "fileChanges" in b:
+            changes.update(fileNotifications=b["fileChanges"], ensurePrograms=True)
+        if lsp:
+            base = {"baseSnapshot": "@SNAPSHOT@"} if self.snaps > 1 else {}
+            return self.req("getCurrentLanguageServerSnapshot", {**base, **({"changes": changes} if changes else {})})
+        if self.snaps == 1:
+            return self.req("createSnapshot", changes)
+        return self.req("updateSnapshot", {"snapshot": "@SNAPSHOT@", **({"changes": changes} if changes else {})})
+
+    def temp(self, b, pf):
+        """updateTemporarySnapshot {file, newText[, snapshot]} with paramsFrom pf. Protocol 4: updateSnapshot with
+        a layer that holds the file, ensurePrograms: true and "track": false (the base comes from snapshot or pf)."""
+        if PROTOCOL < 4:
+            return self.req("updateTemporarySnapshot", b, pf)
+        changes = {"fileSystem": {"kind": "layer", "files": {b["file"]: b["newText"]}}, "ensurePrograms": True}
+        ev = self.req("updateSnapshot", {**({"snapshot": b["snapshot"]} if "snapshot" in b else {}),
+                                         "changes": changes}, pf)
+        self.events[ev]["track"] = False
+        return ev
 
     @staticmethod
     def ck(**kw):
@@ -2178,9 +2292,10 @@ def oracle_session(oracle, pdir, tsconfig, files, tmp_root, project_out=None):
     srv.start()
     try:
         st, _ = srv.api.request(1, "initialize", None, START_TIMEOUT)
-        st, snap = srv.api.request(2, "updateSnapshot", open_params(os.path.join(pdir, tsconfig)), START_TIMEOUT * 4)
+        method = "createSnapshot" if PROTOCOL >= 4 else "updateSnapshot"
+        st, snap = srv.api.request(2, method, open_params(os.path.join(pdir, tsconfig)), START_TIMEOUT * 4)
         if st != "ok":
-            raise HarnessError(f"updateSnapshot: {snap}")
+            raise HarnessError(f"{method}: {snap}")
         want = os.path.join(pdir, tsconfig)
         proj = next((p for p in snap["projects"] if p["configFileName"] == want), snap["projects"][0])
         if project_out is not None:
@@ -2258,15 +2373,15 @@ def trace_header(name, battery, preset, **extra):
 
 
 def open_params(config):
-    """updateSnapshot params that open one project."""
+    """Protocol 3 updateSnapshot params (protocol 4: createSnapshot params) that open one project."""
     return {"openProjects": [config]} if PROTOCOL2 else {"openProject": config}
 
 
 def open_session(tb, preset, extra_projects=()):
     tb.req("initialize")
-    snap = tb.req("updateSnapshot", open_params("@PROJECT_DIR@/" + preset["tsconfig"]))
+    snap = tb.snap(open_params("@PROJECT_DIR@/" + preset["tsconfig"]))
     for rel in extra_projects:
-        snap = tb.req("updateSnapshot", open_params("@PROJECT_DIR@/" + rel))
+        snap = tb.snap(open_params("@PROJECT_DIR@/" + rel))
     return snap
 
 
@@ -2376,11 +2491,11 @@ def misc_trace(preset, files):
     tb.req("printNode", {"data": "not base64!"})
     tb.req("release", {"snapshot": 0})
     # snapshots
-    s2 = tb.req("updateSnapshot", {})
-    s3 = tb.req("updateSnapshot", {"fileChanges": {"changed": [first]}})
-    s4 = tb.req("updateSnapshot", {"fileChanges": {"invalidateAll": True}})
+    s2 = tb.snap({})
+    s3 = tb.snap({"fileChanges": {"changed": [first]}})
+    s4 = tb.snap({"fileChanges": {"invalidateAll": True}})
     tb.req("getSymbolAtPosition", ck(file=first, position=0))
-    s5 = tb.req("updateSnapshot", open_params("@PROJECT_DIR@/" + preset["tsconfig"]))
+    s5 = tb.snap(open_params("@PROJECT_DIR@/" + preset["tsconfig"]))
     for ev in (snap, s2, s3, s4, s5):
         tb.req("release", {}, {"event": ev, "pointer": "/snapshot", "into": "/snapshot"})
     tb.req("release", {}, {"event": snap, "pointer": "/snapshot", "into": "/snapshot"})
@@ -2498,20 +2613,20 @@ def changes_trace(preset, battery, files):
     probe(path, pos)
     tb.events.append({"kind": "overlay", "path": path,
                       "content": text + "\nexport const __apiOracleProbe: number = \"x\" as any as 5;\n"})
-    tb.req("updateSnapshot", {"fileChanges": {"changed": [path]}})
+    tb.snap({"fileChanges": {"changed": [path]}})
     probe(path, pos)
     tb.events.append({"kind": "overlay", "path": new_path,
                       "content": "export const created = [1, 2] as const;\nexport type C = typeof created;\n"})
-    tb.req("updateSnapshot", {"fileChanges": {"created": [new_path]}})
+    tb.snap({"fileChanges": {"created": [new_path]}})
     tb.req("getDefaultProjectForFile", {"snapshot": "@SNAPSHOT@", "file": new_path})
     probe(new_path, 14)
     tb.events.append({"kind": "overlay", "path": new_path, "content": None})
-    tb.req("updateSnapshot", {"fileChanges": {"deleted": [new_path]}})
+    tb.snap({"fileChanges": {"deleted": [new_path]}})
     tb.req("getSourceFile", ck(file=new_path))
     tb.events.append({"kind": "overlay", "path": path, "content": {"drop": True}})
-    tb.req("updateSnapshot", {"fileChanges": {"changed": [path]}})
+    tb.snap({"fileChanges": {"changed": [path]}})
     probe(path, pos)
-    tb.req("updateSnapshot", {"fileChanges": {"invalidateAll": True}})
+    tb.snap({"fileChanges": {"invalidateAll": True}})
     probe(path, 0)
     header = trace_header("_changes", battery, preset, callbacks=["readFile", "fileExists", "directoryExists",
                                                                    "getAccessibleEntries"], callbackMode="fallback")
@@ -2523,8 +2638,8 @@ def lsp_trace(preset, battery, files, samples):
     s = samples[rel]
     tb = TraceBuilder()
     tb.req("initialize")
-    tb.req("updateSnapshot", {})  # adopt the LSP state (Go answers a nil-pointer panic here)
-    tb.req("updateSnapshot", open_params("@PROJECT_DIR@/" + preset["tsconfig"]))
+    tb.snap({}, lsp=True)  # adopt the LSP state (Go answers a nil-pointer panic here at B)
+    tb.snap(open_params("@PROJECT_DIR@/" + preset["tsconfig"]), lsp=True)
     file = "@PROJECT_DIR@/" + rel
     ck = tb.ck
     tb.req("getDefaultProjectForFile", {"snapshot": "@SNAPSHOT@", "file": file})
@@ -2535,7 +2650,7 @@ def lsp_trace(preset, battery, files, samples):
         tb.req("getTypeOfSymbol", ck(), {"event": a, "pointer": "/id", "into": "/symbol"})
         b = tb.req("getTypeAtPosition", ck(file=file, position=pos))
         tb.type_chain(b, "", depth=1)
-    tb.req("updateSnapshot", {})
+    tb.snap({}, lsp=True)
     tb.req("getSymbolAtPosition", ck(file=file, position=s.ids[0][1] if s.ids else 0))
     tb.req("release", {"snapshot": "@SNAPSHOT@"})
     header = trace_header("_lsp", battery, preset, transport="lsp", lspOpen=[rel])
@@ -2887,8 +3002,8 @@ def ext_temp_trace(ext):
     for t, imp in ext.temp:
         text, file = ext.text[t], pdir_file(t)
         tb.req("getSemanticDiagnostics", pr(files=[file]), snap(s1))
-        tb.req("updateSnapshot", {})  # a newer snapshot stays the latest
-        x = tb.req("updateTemporarySnapshot", {"file": file, "newText": text + TEMP_SUFFIX}, snap(s1))
+        tb.snap({})  # a newer snapshot stays the latest
+        x = tb.temp({"file": file, "newText": text + TEMP_SUFFIX}, snap(s1))
         first_x = first_x if first_x is not None else x
         tb.req("getSemanticDiagnostics", pr(files=[file]), snap(x))
         tb.req("getSyntacticDiagnostics", pr(files=[file]), snap(x))
@@ -2896,7 +3011,7 @@ def ext_temp_trace(ext):
         tb.req("typeToString", pr(), [snap(x), at(ty, "/id", "/type")])
         tb.req("getSourceFile", pr(file=file), snap(x))
         tb.req("getSemanticDiagnostics", pr(files=[pdir_file(imp)]), snap(x))
-        y = tb.req("updateTemporarySnapshot", {"file": file, "newText": text}, snap(x))  # temporary on temporary
+        y = tb.temp({"file": file, "newText": text}, snap(x))  # temporary on temporary
         tb.req("getSemanticDiagnostics", pr(files=[file]), snap(y))
         tb.req("release", {}, snap(y))
         tb.req("release", {}, snap(x))
@@ -2904,16 +3019,16 @@ def ext_temp_trace(ext):
         tb.req("getSourceFile", pr(file=file), snap(s1))
         z_file = pdir_file(os.path.join(os.path.dirname(t), "__api_oracle_temp.ts"))  # not on disk
         z_text = f"import * as m from \"./{os.path.splitext(os.path.basename(t))[0]}\";\nexport const probe = m;\n"
-        z = tb.req("updateTemporarySnapshot", {"file": z_file, "newText": z_text}, snap(s1))
+        z = tb.temp({"file": z_file, "newText": z_text}, snap(s1))
         tb.req("getDefaultProjectForFile", {"file": z_file}, snap(z))
         tb.req("getSemanticDiagnostics", pr(files=[z_file]), snap(z))
         tb.req("getTypeAtPosition", pr(file=z_file, position=z_text.index("probe")), snap(z))
         tb.req("release", {}, snap(z))
     t0 = pdir_file(ext.temp[0][0])
-    tb.req("updateTemporarySnapshot", {"file": pdir_file("notes.txt"), "newText": "x"}, snap(s1))
-    tb.req("updateTemporarySnapshot", {"file": t0, "newText": "x"}, snap(first_x))  # released
-    tb.req("updateTemporarySnapshot", {"snapshot": 999, "file": t0, "newText": "x"})
-    tb.req("updateSnapshot", {})
+    tb.temp({"file": pdir_file("notes.txt"), "newText": "x"}, snap(s1))
+    tb.temp({"file": t0, "newText": "x"}, snap(first_x))  # released
+    tb.temp({"snapshot": 999, "file": t0, "newText": "x"}, None)
+    tb.snap({})
     tb.req("getSemanticDiagnostics", tb.diag(t0))
     return tb.events
 
@@ -2962,15 +3077,15 @@ def ext_emit_fixture_trace(ext):
     ck = lambda name, **kw: {"snapshot": "@SNAPSHOT@", "project": "@PROJECT:" + cfg(name) + "@", **kw}  # noqa: E731
     tb = TraceBuilder()
     tb.req("initialize")
-    tb.req("updateSnapshot", open_params(cfg("tsconfig.json")))
+    tb.snap(open_params(cfg("tsconfig.json")))
     tb.req("emit", ck("tsconfig.json"))
     for emit_only in (1, 2, 3):
         tb.req("emit", ck("tsconfig.json", emitOnly=emit_only))
     tb.req("emitToString", ck("tsconfig.json"))
-    tb.req("updateSnapshot", open_params(cfg("tsconfig.noemit.json")))
+    tb.snap(open_params(cfg("tsconfig.noemit.json")))
     tb.req("emit", ck("tsconfig.noemit.json"))  # skipped: noEmit
     tb.req("getJavaScriptEmit", ck("tsconfig.noemit.json", files=[cfg(names[0])]))  # forced
-    tb.req("updateSnapshot", open_params(cfg("tsconfig.errors.json")))
+    tb.snap(open_params(cfg("tsconfig.errors.json")))
     tb.req("emit", ck("tsconfig.errors.json"))  # skipped: noEmitOnError and TS2322
     tb.req("emitToString", ck("tsconfig.errors.json"))
     tb.req("readConfigFile", {"file": cfg("bad.json")})
@@ -3097,6 +3212,8 @@ def main(argv=None):
     p.add_argument("--goport", required=True)
     p.add_argument("--label", required=True)
     p.add_argument("--oracle-sha", help="golden set (default: hash of --oracle)")
+    p.add_argument("--wire", type=int, choices=[3], help="send the snapshot events of protocol 4 traces in "
+                   "their protocol 3 form (a ruling 10 rebase run of base bins; needs a reviewer ruling)")
     p = sub.add_parser("summary")
     p.add_argument("--out-root", default=DEFAULT_OUT_ROOT)
     p.add_argument("--label", required=True)

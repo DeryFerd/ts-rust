@@ -457,29 +457,31 @@ impl Checker {
                 && target_flags.intersects(SymbolFlags::CONST_ENUM)
             {
                 let const_enum_declaration = self.sym(target).value_declaration;
-                // PORT: Go `c.program.GetProjectReferenceFromOutputDts(file.Path())` is a
-                // Program method, ported as a free function; `Path()` reads the
-                // `SourceFileInfo.path` field.
-                let redirect = get_project_reference_from_output_dts(
-                    &source_file_info(get_source_file_of_node(const_enum_declaration)).path,
-                );
-                if const_enum_declaration
-                    .flags()
-                    .intersects(NodeFlags::AMBIENT)
-                    && (match &redirect {
+                if const_enum_declaration.is_some()
+                    && const_enum_declaration
+                        .flags()
+                        .intersects(NodeFlags::AMBIENT)
+                {
+                    // PORT: Go `c.program.GetProjectReferenceFromOutputDts(file.Path())` is a
+                    // Program method, ported as a free function; `Path()` reads the
+                    // `SourceFileInfo.path` field.
+                    let redirect = get_project_reference_from_output_dts(
+                        &source_file_info(get_source_file_of_node(const_enum_declaration)).path,
+                    );
+                    if match &redirect {
                         None => true,
                         Some(redirect) => !redirect
                             .resolved
                             .compiler_options()
                             .should_preserve_const_enums(),
-                    })
-                {
-                    let flag_name = self.get_isolated_modules_like_flag_name();
-                    self.error(
-                        node,
-                        diag::Cannot_access_ambient_const_enums_when_0_is_enabled,
-                        args![flag_name],
-                    );
+                    } {
+                        let flag_name = self.get_isolated_modules_like_flag_name();
+                        self.error(
+                            node,
+                            diag::Cannot_access_ambient_const_enums_when_0_is_enabled,
+                            args![flag_name],
+                        );
+                    }
                 }
             }
         }
@@ -809,7 +811,8 @@ impl Checker {
                 | SyntaxKind::CaseBlock
                 | SyntaxKind::ForStatement
                 | SyntaxKind::ForInStatement
-                | SyntaxKind::ForOfStatement => {
+                | SyntaxKind::ForOfStatement
+                | SyntaxKind::ClassStaticBlockDeclaration => {
                     self.check_unused_locals_and_parameters(node);
                 }
                 SyntaxKind::Constructor

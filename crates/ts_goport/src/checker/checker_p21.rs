@@ -915,16 +915,7 @@ impl Checker {
                 // PORT: Go `maps.Clone(members)`; a nil map clones to nil.
                 members = self.symbols.clone_table(members);
             }
-            self.set_structured_type_members_ex(
-                t,
-                members,
-                instantiated_from,
-                SharedList::concat(call_signatures.clone(), construct_signatures.clone()),
-                call_signatures.len(),
-                index_infos.clone(),
-            );
             let this_argument = type_arguments.last().copied().unwrap_or(TypeId::NIL);
-            self.ty_mut(t).object_flags |= ObjectFlags::UNRESOLVED_MEMBERS;
             for base_type in base_types {
                 let mut instantiated_base_type = base_type;
                 if this_argument.is_some() {
@@ -960,13 +951,6 @@ impl Checker {
                     })
                     .collect();
                 index_infos = SharedList::concat(index_infos, SharedList::from(filtered));
-            }
-            {
-                let object_flags = self
-                    .ty(t)
-                    .object_flags
-                    .without(ObjectFlags::UNRESOLVED_MEMBERS);
-                self.ty_mut(t).object_flags = object_flags;
             }
             let call_signature_count = call_signatures.len();
             self.set_structured_type_members_ex(

@@ -649,7 +649,7 @@ pub(crate) fn get_containing_node_array(node: Node) -> NodeList {
             {
                 return parent.type_parameter_list();
             } else if is_infer_type_node(parent) {
-                // Go `break`: fall through to the parent kind switch.
+                // infer type nodes have no associated type parameter list
             } else {
                 panic!("Unexpected TypeParameter parent: {:?}", parent.kind());
             }
@@ -1188,22 +1188,37 @@ pub(crate) fn calculate_indent(text: &str, mut pos: i32, end: i32) -> i32 {
 //
 // Character offsets are measured in UTF-16 code units per the source map specification.
 pub(crate) struct LineCharacterCache {
-    line_map: FileRef<[i32]>,
-    text: FileText,
+    source: LineCharacterSource,
     cached_line: i32,
     cached_pos: i32,
     cached_char: i32,
     has_cached: bool,
 }
 
+/// Go `source.ECMALineMap()` and `source.Text()` of a `lineCharacterCache`.
+// PORT: a source file node keeps its frozen line map and text. Another
+// `sourcemap.Source` (ts#63936) keeps the source and reads both from it.
+enum LineCharacterSource {
+    File {
+        line_map: FileRef<[i32]>,
+        text: FileText,
+    },
+    Other(Rc<dyn crate::sourcemap::source::Source>),
+}
+
 // Go: printer/utilities.go:912 newLineCharacterCache
-// PORT: Go takes a `sourcemap.Source` (ECMALineMap and Text). Source map emit
-// is not ported; the source here is a source file node, which is the Go
-// implementation of that interface.
-pub(crate) fn new_line_character_cache(source: Node) -> LineCharacterCache {
+// PORT: a node source must be a parsed source file; the printer passes the
+// original file of a transformed one (see `set_source_map_source`).
+pub(crate) fn new_line_character_cache(source: &SourceMapSource) -> LineCharacterCache {
+    let source = match source {
+        SourceMapSource::Node(node) => LineCharacterSource::File {
+            line_map: get_ecma_line_starts(*node),
+            text: source_file_text(*node),
+        },
+        SourceMapSource::Other(source) => LineCharacterSource::Other(source.clone()),
+    };
     LineCharacterCache {
-        line_map: get_ecma_line_starts(source),
-        text: source_file_text(source),
+        source,
         cached_line: 0,
         cached_pos: 0,
         cached_char: 0,
@@ -1216,22 +1231,26 @@ impl LineCharacterCache {
     // getLineAndCharacter returns the 0-based line number and UTF-16 code unit
     // offset from the start of that line for the given byte position.
     pub(crate) fn get_line_and_character(&mut self, pos: i32) -> (i32, i32) {
-        let line = self.line_of_position(pos);
-        let line_start = self.line_map[line as usize];
+        let (line_map, text): (&[i32], &str) = match &self.source {
+            LineCharacterSource::File { line_map, text } => (&**line_map, &**text),
+            LineCharacterSource::Other(source) => (source.ecma_line_map(), source.text()),
+        };
+        let line = Self::line_of_position(line_map, self.cached_line, pos);
+        let line_start = line_map[line as usize];
         // When pos is beyond the source text (e.g., for error-recovery tokens like
         // missing closing braces), we can't slice past the text end. Compute the
         // UTF-16 length up to EOF and add the remaining byte offset arithmetically,
         // matching TypeScript's computeLineAndCharacterOfPosition which uses
         // arithmetic (position - lineStarts[lineNumber]) and handles this implicitly.
-        let end_pos = std::cmp::min(pos, self.text.len() as i32);
+        let end_pos = std::cmp::min(pos, text.len() as i32);
         let mut character;
         if self.has_cached && line == self.cached_line && end_pos >= self.cached_pos {
             // Incremental: only count UTF-16 code units from the last cached position.
             character = self.cached_char
-                + ascii_or_utf16_len(&self.text[self.cached_pos as usize..end_pos as usize]);
+                + ascii_or_utf16_len(&text[self.cached_pos as usize..end_pos as usize]);
         } else {
             // Full computation from line start.
-            character = ascii_or_utf16_len(&self.text[line_start as usize..end_pos as usize]);
+            character = ascii_or_utf16_len(&text[line_start as usize..end_pos as usize]);
         }
         let cached_char = character;
         character += pos - end_pos;
@@ -1246,13 +1265,12 @@ impl LineCharacterCache {
     // on the cached line or move to the next one, so test those two lines
     // before the binary search. Line starts strictly increase, so a line `l`
     // with `line_map[l] <= pos < line_map[l + 1]` is the binary search result.
-    fn line_of_position(&self, pos: i32) -> i32 {
-        let map: &[i32] = &self.line_map;
+    fn line_of_position(map: &[i32], cached_line: i32, pos: i32) -> i32 {
         let holds = |l: usize| {
             map.get(l).is_some_and(|&start| start <= pos)
                 && map.get(l + 1).is_none_or(|&next| pos < next)
         };
-        let cached = self.cached_line as usize;
+        let cached = cached_line as usize;
         let line = if holds(cached) {
             cached as i32
         } else if holds(cached + 1) {

@@ -104,40 +104,6 @@ impl CompilerHost {
             );
         }
     }
-
-    // Go: project/compilerhost.go:153 compilerHost.ensureContentMapperProject (tsgo#4712)
-    pub fn ensure_content_mapper_project(&self) {
-        if self.content_mapper_once.replace(true) {
-            return;
-        }
-        let content_mapper_host = self
-            .builder
-            .borrow()
-            .as_ref()
-            .unwrap_or_else(|| crate::core::go_nil_dereference())
-            .content_mapper_host
-            .clone();
-        let Some(content_mapper_host) = content_mapper_host else {
-            return;
-        };
-        let project = self
-            .project
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| crate::core::go_nil_dereference());
-        let command_line = project.borrow().get_command_line_with_typings_files();
-        // Go `ConfigName`, `ContentMappers` and `CompilerOptions` are
-        // nil-safe: a nil command line gives "", nil and nil.
-        let command_line = command_line.as_deref();
-        let content_mapper_project = content_mapper_host.project(contentmapper::ProjectSpec {
-            config_file_name: command_line
-                .map_or("", tsoptions::ParsedCommandLine::config_name)
-                .to_string(),
-            mappers: command_line.map_or_else(Vec::new, |c| c.content_mappers().to_vec()),
-            compiler_options: command_line.map(|c| c.compiler_options().clone()),
-        });
-        *self.content_mapper_project.borrow_mut() = content_mapper_project;
-    }
 }
 
 // Go: project/compilerhost.go:14 `var _ compiler.CompilerHost = (*compilerHost)(nil)`
@@ -235,12 +201,10 @@ impl compiler::CompilerHost for CompilerHost {
             .borrow()
             .clone()
             .unwrap_or_else(|| crate::core::go_nil_dereference());
-        let mut diagnostic_locale = locale::DEFAULT;
-        if let Some(client) = &builder.client {
-            diagnostic_locale = client.get_locale();
-        }
-        self.ensure_content_mapper_project();
-        let Some(project) = self.content_mapper_project.borrow().clone() else {
+        // ts#64163: the locale comes from the builder context.
+        let diagnostic_locale = locale::from_context(&builder.ctx);
+        // ts#64221
+        let Some(project) = compiler::CompilerHost::content_mapper_project(self) else {
             return Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone());
         };
         let identity = match project.identity(mapper) {
@@ -269,6 +233,10 @@ impl compiler::CompilerHost for CompilerHost {
                     mapper,
                     &*project,
                 )?;
+                // Go: binder.BindSourceFile on the canonical file and on each
+                // supplemental file (ts#63952). PORT: not ported; the Rust
+                // binder binds each program version in one arena
+                // (`program::bind_all`), see `new_parse_cache`.
                 if let Some(canonical) = &files.canonical {
                     set_source_file_hash(canonical, key.hash);
                 }
@@ -289,8 +257,38 @@ impl compiler::CompilerHost for CompilerHost {
         Ok(files)
     }
 
-    // Go: project/compilerhost.go:167 compilerHost.ContentMapperProject (tsgo#4712)
+    // Go: project/compilerhost.go:153 compilerHost.ContentMapperProject (tsgo#4712, ts#64221)
+    // PORT: the body of Go `ensureContentMapperProject` moved here in ts#64221
+    // (Go `contentMapperOnce.Do`).
     fn content_mapper_project(&self) -> Option<Rc<dyn contentmapper::Project>> {
+        if !self.content_mapper_once.replace(true) {
+            let content_mapper_host = self
+                .builder
+                .borrow()
+                .as_ref()
+                .and_then(|builder| builder.content_mapper_host.clone());
+            if let Some(content_mapper_host) = content_mapper_host {
+                let project = self
+                    .project
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
+                let command_line = project.borrow().get_command_line_with_typings_files();
+                // Go `ContentMappers` is nil-safe: a nil command line has
+                // none, so it returns before the other getters.
+                if let Some(command_line) =
+                    command_line.filter(|command_line| !command_line.content_mappers().is_empty())
+                {
+                    let content_mapper_project =
+                        content_mapper_host.project(contentmapper::ProjectSpec {
+                            config_file_name: command_line.config_name().to_string(),
+                            mappers: command_line.content_mappers().to_vec(),
+                            compiler_options: Some(command_line.compiler_options().clone()),
+                        });
+                    *self.content_mapper_project.borrow_mut() = content_mapper_project;
+                }
+            }
+        }
         self.content_mapper_project.borrow().clone()
     }
 

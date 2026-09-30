@@ -110,8 +110,11 @@ fn test_dir_watch_set_canonical_dedup() {
         1,
         "differently-cased dirs must collapse to one entry"
     );
-    let canonical = dirs.contains_key("/repo/node_modules/pkgname");
-    assert!(canonical, "Dirs must be keyed by the canonicalized path");
+    let original = dirs.contains_key("/repo/Node_Modules/PkgName");
+    assert!(
+        original,
+        "Dirs must retain the original spelling used for registration"
+    );
 
     let mut sensitive = new_dir_watch_set(case_sensitive_opts());
     sensitive.set("/repo/Node_Modules/PkgName", false);

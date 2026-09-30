@@ -129,6 +129,15 @@ impl Checker {
         }
         if is_binding_element(node) {
             let prop_name = node.property_name();
+
+            if prop_name.is_some() && is_private_identifier(prop_name) {
+                self.grammar_error_on_node(
+                    prop_name,
+                    diag::Private_identifiers_cannot_be_used_in_destructuring_patterns,
+                    args![],
+                );
+            }
+
             if prop_name.is_some()
                 && is_identifier(node.name())
                 && is_part_of_parameter_declaration(node)
@@ -1550,10 +1559,10 @@ impl Checker {
                 let mapper = self.ty(method_type).mapper();
                 let mut next_type = TypeId::NIL;
                 if method_name == "next" {
-                    next_type = self.mapper_map(mapper, type_parameters[2]);
+                    next_type = self.get_mapped_type(type_parameters[2], mapper);
                 }
-                let yield_type = self.mapper_map(mapper, type_parameters[0]);
-                let return_type = self.mapper_map(mapper, type_parameters[1]);
+                let yield_type = self.get_mapped_type(type_parameters[0], mapper);
+                let return_type = self.get_mapped_type(type_parameters[1], mapper);
                 return IterationTypes {
                     yield_type,
                     return_type,

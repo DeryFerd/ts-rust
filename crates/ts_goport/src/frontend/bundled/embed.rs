@@ -150,20 +150,6 @@ impl Fs for WrappedFs {
         self.fs.stat(path)
     }
 
-    // Go: embed.go:102 WalkDir
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        if let Some(rest) = split_path(root) {
-            if let Err(err) = self.walk_dir_inner(rest, walk_fn) {
-                if err.is_skip_all() {
-                    return Ok(());
-                }
-                return Err(err);
-            }
-            return Ok(());
-        }
-        self.fs.walk_dir(root, walk_fn)
-    }
-
     // Go: embed.go:148 Realpath
     fn realpath(&self, path: &str) -> String {
         if split_path(path).is_some() {
@@ -210,48 +196,6 @@ impl Fs for WrappedFs {
     }
 }
 
-impl WrappedFs {
-    // Go: embed.go:115 walkDir
-    // PORT: named `walk_dir_inner`; the Go names `WalkDir` and `walkDir`
-    // share a snake name.
-    fn walk_dir_inner(&self, rest: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        let entries = match rest {
-            "" => root_entries(),
-            "libs" => libs_entries(),
-            _ => return Ok(()),
-        };
-
-        for entry in &entries {
-            let name = format!("{}/{}", rest, entry.name());
-
-            if let Err(err) = walk_fn(&format!("{SCHEME}{name}"), Some(entry), None) {
-                if err.is_skip_all() {
-                    return Err(FsError::SkipAll);
-                }
-                if err.is_skip_dir() {
-                    continue;
-                }
-                return Err(err);
-            }
-            if entry.is_dir() {
-                self.walk_dir_inner(name.strip_prefix('/').unwrap_or(&name), walk_fn)?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-// Go: embed.go:84 rootEntries
-// PORT: Go builds this slice once at package init; the port builds it per call.
-fn root_entries() -> Vec<DirEntry> {
-    vec![file_info_to_dir_entry(new_file_info(
-        "libs",
-        FileMode::DIR,
-        0,
-    ))]
-}
-
 // Go: embed.go:183 fileInfo
 // PORT: the Go `fileInfo` type is the shared `FileInfo` value. Its
 // `ModTime` is the Go zero time (`None`) and `Info()` returns itself
@@ -263,18 +207,6 @@ fn new_file_info(name: &str, mode: FileMode, size: i64) -> FileInfo {
         mode,
         mod_time: None,
     }
-}
-
-// Go: embed_generated.go:343 libsEntries
-// PORT: Go builds this slice at package init, in `LibNames` order.
-fn libs_entries() -> Vec<DirEntry> {
-    LIB_NAMES
-        .iter()
-        .map(|name| {
-            let size = embedded_contents(&format!("libs/{name}")).map_or(0, |lib| lib.len() as i64);
-            file_info_to_dir_entry(new_file_info(name, FileMode(0), size))
-        })
-        .collect()
 }
 
 // Go: embed_generated.go:232 embeddedContents
@@ -391,20 +323,25 @@ static EMBEDDED_CONTENTS: &[(&str, &str)] = &[
     bundled_lib!("lib.es2025.iterator.d.ts"),
     bundled_lib!("lib.es2025.promise.d.ts"),
     bundled_lib!("lib.es2025.regexp.d.ts"),
+    bundled_lib!("lib.es2026.array.d.ts"),
+    bundled_lib!("lib.es2026.collection.d.ts"),
+    bundled_lib!("lib.es2026.d.ts"),
+    bundled_lib!("lib.es2026.error.d.ts"),
+    bundled_lib!("lib.es2026.full.d.ts"),
+    bundled_lib!("lib.es2026.iterator.d.ts"),
+    bundled_lib!("lib.es2026.json.d.ts"),
+    bundled_lib!("lib.es2026.math.d.ts"),
+    bundled_lib!("lib.es2026.typedarrays.d.ts"),
     bundled_lib!("lib.es5.d.ts"),
     bundled_lib!("lib.es6.d.ts"),
-    bundled_lib!("lib.esnext.array.d.ts"),
-    bundled_lib!("lib.esnext.collection.d.ts"),
     bundled_lib!("lib.esnext.d.ts"),
     bundled_lib!("lib.esnext.date.d.ts"),
     bundled_lib!("lib.esnext.decorators.d.ts"),
     bundled_lib!("lib.esnext.disposable.d.ts"),
-    bundled_lib!("lib.esnext.error.d.ts"),
     bundled_lib!("lib.esnext.full.d.ts"),
     bundled_lib!("lib.esnext.intl.d.ts"),
     bundled_lib!("lib.esnext.sharedmemory.d.ts"),
     bundled_lib!("lib.esnext.temporal.d.ts"),
-    bundled_lib!("lib.esnext.typedarrays.d.ts"),
     bundled_lib!("lib.scripthost.d.ts"),
     bundled_lib!("lib.webworker.asynciterable.d.ts"),
     bundled_lib!("lib.webworker.d.ts"),

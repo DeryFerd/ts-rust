@@ -585,7 +585,7 @@ impl DeclarationTransformer {
         if decl.import_clause().is_nil() {
             // import "mod" - possibly needed for side effects? (global interface patches, module augmentations, etc)
             let module_specifier = self.rewrite_module_specifier(decl, decl.module_specifier());
-            let attributes = self.try_get_resolution_mode_override(decl.attributes());
+            let attributes = decl.attributes();
             return f.update_import_declaration(
                 decl,
                 decl.modifiers(),
@@ -618,7 +618,7 @@ impl DeclarationTransformer {
                 Node::NIL, /*namedBindings*/
             );
             let module_specifier = self.rewrite_module_specifier(decl, decl.module_specifier());
-            let attributes = self.try_get_resolution_mode_override(decl.attributes());
+            let attributes = decl.attributes();
             return f.update_import_declaration(
                 decl,
                 decl.modifiers(),
@@ -646,7 +646,7 @@ impl DeclarationTransformer {
                 named_bindings,
             );
             let module_specifier = self.rewrite_module_specifier(decl, decl.module_specifier());
-            let attributes = self.try_get_resolution_mode_override(decl.attributes());
+            let attributes = decl.attributes();
             return f.update_import_declaration(
                 decl,
                 decl.modifiers(),
@@ -678,7 +678,7 @@ impl DeclarationTransformer {
                 named_imports,
             );
             let module_specifier = self.rewrite_module_specifier(decl, decl.module_specifier());
-            let attributes = self.try_get_resolution_mode_override(decl.attributes());
+            let attributes = decl.attributes();
             return f.update_import_declaration(
                 decl,
                 decl.modifiers(),
@@ -698,7 +698,7 @@ impl DeclarationTransformer {
                 ));
             }
             let module_specifier = self.rewrite_module_specifier(decl, decl.module_specifier());
-            let attributes = self.try_get_resolution_mode_override(decl.attributes());
+            let attributes = decl.attributes();
             return f.update_import_declaration(
                 decl,
                 decl.modifiers(),
@@ -988,6 +988,7 @@ impl DeclarationTransformer {
             ModifierList::NIL, /*modifiers*/
             SyntaxKind::NamespaceKeyword,
             name,
+            Node::NIL,
             f.new_module_block(f.new_node_list(&[])),
         );
         set_node_parent(synthesized_namespace, self.enclosing_declaration);
@@ -1232,6 +1233,7 @@ impl DeclarationTransformer {
                     modifiers,
                     SyntaxKind::NamespaceKeyword,
                     name,
+                    Node::NIL,
                     f.new_module_block(f.new_node_list(&add_ons)),
                 );
                 let mut members = host;

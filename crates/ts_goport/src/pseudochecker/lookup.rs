@@ -911,12 +911,12 @@ fn is_optional_initialized_or_rest_parameter(node: Node) -> bool {
 /// (equivalently, `i < lastRequired-1`) in O(1).
 // PORT: takes a `NodeSlice` (Go `[]*ast.Node` from a NodeList) to avoid a copy.
 fn last_required_param_index(params: NodeSlice) -> i32 {
-    let mut i = params.len() as i32 - 1;
-    while i >= 0 {
-        if !is_optional_initialized_or_rest_parameter(params.get(i as usize)) {
-            return i + 1;
+    // Go: `slices.Backward` (ts#63902).
+    for i in (0..params.len()).rev() {
+        let param = params.get(i);
+        if !is_optional_initialized_or_rest_parameter(param) {
+            return i as i32 + 1;
         }
-        i -= 1;
     }
     0
 }

@@ -72,10 +72,6 @@ impl crate::printer::EmitResolver for NoCheckerEmitResolver {
         no_checker("get_effective_declaration_flags")
     }
 
-    fn get_resolution_mode_override(&self, _node: Node) -> ResolutionMode {
-        no_checker("get_resolution_mode_override")
-    }
-
     fn get_type_reference_serialization_kind(
         &self,
         _name: Node,

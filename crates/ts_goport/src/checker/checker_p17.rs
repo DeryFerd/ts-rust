@@ -154,8 +154,14 @@ impl Checker {
         if module_export_name_is_default(name) {
             let specifier = self.get_module_specifier_for_import_or_export(node);
             if specifier.is_some() {
-                let module_symbol =
-                    self.resolve_external_module_name(node, specifier, false /*ignoreErrors*/);
+                let import_attributes_type = self
+                    .get_type_from_import_attributes(get_import_attributes(node.parent().parent()));
+                let module_symbol = self.resolve_external_module_name(
+                    node,
+                    specifier,
+                    false, /*ignoreErrors*/
+                    import_attributes_type,
+                );
                 if module_symbol.is_some() {
                     return self.get_target_of_module_default(
                         module_symbol,
@@ -288,7 +294,10 @@ pub fn get_module_specifier_from_node(node: Node) -> Node {
         SyntaxKind::ExportDeclaration => return node.module_specifier(),
         _ => {}
     }
-    panic!("Unhandled case in getModuleSpecifierFromNode");
+    panic!(
+        "Unhandled case in getModuleSpecifierFromNode: {:?}",
+        node.kind()
+    );
 }
 
 impl Checker {
@@ -333,6 +342,7 @@ impl Checker {
         location: Node,
         module_reference_expression: Node,
         ignore_errors: bool,
+        import_attributes_type: TypeId,
     ) -> SymbolId {
         let mut error_message = self
             .get_cannot_resolve_module_name_error_for_specific_module(module_reference_expression);
@@ -346,6 +356,7 @@ impl Checker {
             if ignore_errors { None } else { error_message },
             ignore_errors,
             false, /*isForAugmentation*/
+            import_attributes_type,
         )
     }
 
@@ -375,6 +386,7 @@ impl Checker {
         module_not_found_error: Option<&'static Message>,
         ignore_errors: bool,
         is_for_augmentation: bool,
+        import_attributes_type: TypeId,
     ) -> SymbolId {
         if is_string_literal_like(module_reference_expression) {
             return self.resolve_external_module(
@@ -387,6 +399,7 @@ impl Checker {
                     Node::NIL
                 },
                 is_for_augmentation,
+                import_attributes_type,
             );
         }
         SymbolId::NIL
@@ -402,9 +415,18 @@ impl Checker {
         } else {
             specifier = get_external_module_name(declaration);
         }
+        let mut import_attributes_type = TypeId::NIL;
+        if has_import_attributes(declaration) {
+            import_attributes_type =
+                self.get_type_from_import_attributes(get_import_attributes(declaration));
+        }
         let module_symbol = self.resolve_external_module_name_worker(
-            specifier, specifier, None, /*moduleNotFoundError*/
-            false, false,
+            specifier,
+            specifier,
+            None, /*moduleNotFoundError*/
+            false,
+            false,
+            import_attributes_type,
         ); // TODO: GH#18217
         if module_symbol.is_nil() {
             return Node::NIL;
@@ -424,6 +446,7 @@ impl Checker {
         module_not_found_error: Option<&'static Message>,
         error_node: Node,
         is_for_augmentation: bool,
+        import_attributes_type: TypeId,
     ) -> SymbolId {
         if error_node.is_some() && module_reference.starts_with("@types/") {
             let without_at_type_prefix = &module_reference["@types/".len()..];
@@ -433,10 +456,20 @@ impl Checker {
                 args![without_at_type_prefix, module_reference],
             );
         }
+        let import_attributes_type = if import_attributes_type.is_nil() {
+            self.empty_object_type
+        } else {
+            import_attributes_type
+        };
+
         let ambient_module =
             self.try_find_ambient_module(module_reference, true /*withAugmentations*/);
         if ambient_module.is_some() {
-            return ambient_module;
+            return self.try_resolve_pattern_ambient_module(
+                ambient_module,
+                module_reference,
+                import_attributes_type,
+            );
         }
 
         let importing_source_file = get_source_file_of_node(location);
@@ -739,7 +772,20 @@ impl Checker {
                         }
                     }
                 }
-                return self.get_merged_symbol(source_file_symbol);
+                let merged = self.get_merged_symbol(source_file_symbol);
+                return self.try_resolve_pattern_ambient_module(
+                    merged,
+                    module_reference,
+                    import_attributes_type,
+                );
+            }
+            let pattern_ambient_module = self.try_resolve_pattern_ambient_module(
+                SymbolId::NIL, /*resolvedSymbol*/
+                module_reference,
+                import_attributes_type,
+            );
+            if pattern_ambient_module.is_some() {
+                return pattern_ambient_module;
             }
             if error_node.is_some()
                 && module_not_found_error.is_some()
@@ -754,18 +800,13 @@ impl Checker {
             return SymbolId::NIL;
         }
 
-        if !self.pattern_ambient_modules.is_empty() {
-            let pattern =
-                core_p17::find_best_pattern_match(&self.pattern_ambient_modules, module_reference);
-            if let Some(pattern_symbol) = pattern.map(|p| p.symbol) {
-                let augmentation = self
-                    .symbols
-                    .get(self.pattern_ambient_module_augmentations, module_reference);
-                if augmentation.is_some() {
-                    return self.get_merged_symbol(augmentation);
-                }
-                return self.get_merged_symbol(pattern_symbol);
-            }
+        let pattern_ambient_module = self.try_resolve_pattern_ambient_module(
+            SymbolId::NIL, /*resolvedSymbol*/
+            module_reference,
+            import_attributes_type,
+        );
+        if pattern_ambient_module.is_some() {
+            return pattern_ambient_module;
         }
 
         if error_node.is_nil() {
@@ -888,6 +929,84 @@ impl Checker {
         }
 
         SymbolId::NIL
+    }
+
+    // Go: checker/checker.go:15653 tryResolvePatternAmbientModule
+    // Resolves the module reference to a pattern ambient module, if one exists.
+    // If a resolved symbol from regular module resolution exists and we have an empty import attributes type,
+    // we prefer the resolved symbol.
+    pub fn try_resolve_pattern_ambient_module(
+        &mut self,
+        resolved_symbol: SymbolId,
+        module_reference: &str,
+        import_attributes_type: TypeId,
+    ) -> SymbolId {
+        if self.is_empty_object_type(import_attributes_type) && resolved_symbol.is_some() {
+            return resolved_symbol;
+        }
+        if !self.pattern_ambient_modules.is_empty() {
+            let pattern_ambient_modules = self.pattern_ambient_modules.clone();
+            let mut candidates: Vec<PatternAmbientModule> = Vec::new();
+            for v in pattern_ambient_modules {
+                let module_attributes_type = self.get_type_of_module_import_attributes(v.symbol);
+                if core_p17::pattern_matches(&v, module_reference)
+                    && self.is_type_assignable_to(import_attributes_type, module_attributes_type)
+                {
+                    candidates.push(v);
+                }
+            }
+
+            if !candidates.is_empty() {
+                let augmentation = self
+                    .symbols
+                    .get(self.pattern_ambient_module_augmentations, module_reference);
+                let augmentation_target = self.symbols.get(
+                    self.pattern_ambient_module_augmentation_targets,
+                    module_reference,
+                );
+
+                if candidates.len() == 1 {
+                    let merged_candidate = self.get_merged_symbol(candidates[0].symbol);
+                    if augmentation.is_some() && augmentation_target == merged_candidate {
+                        return self.get_merged_symbol(augmentation);
+                    }
+                    return merged_candidate;
+                }
+
+                let mut best_type_candidates: Vec<PatternAmbientModule> = Vec::new();
+                'outer: for (i, candidate) in candidates.iter().enumerate() {
+                    let candidate_type =
+                        self.get_type_of_module_import_attributes(candidate.symbol);
+                    for (j, other) in candidates.iter().enumerate() {
+                        let other_type = self.get_type_of_module_import_attributes(other.symbol);
+                        if i != j
+                            && self.is_type_strict_subtype_of(other_type, candidate_type)
+                            && !self.is_type_identical_to(other_type, candidate_type)
+                        {
+                            continue 'outer;
+                        }
+                    }
+                    best_type_candidates.push(candidate.clone());
+                }
+                if best_type_candidates.len() == 1 {
+                    let merged_candidate = self.get_merged_symbol(best_type_candidates[0].symbol);
+                    if augmentation.is_some() && augmentation_target == merged_candidate {
+                        return self.get_merged_symbol(augmentation);
+                    }
+                    return merged_candidate;
+                }
+                let pattern_symbol =
+                    core_p17::find_best_pattern_match(&best_type_candidates, module_reference)
+                        .map(|p| p.symbol)
+                        .unwrap_or(SymbolId::NIL);
+                let merged_candidate = self.get_merged_symbol(pattern_symbol);
+                if augmentation.is_some() && augmentation_target == merged_candidate {
+                    return self.get_merged_symbol(augmentation);
+                }
+                return merged_candidate;
+            }
+        }
+        resolved_symbol
     }
 }
 
@@ -1083,9 +1202,17 @@ impl Checker {
     pub fn get_ambient_modules(&mut self) -> Vec<SymbolId> {
         if !self.ambient_modules_once {
             self.ambient_modules_once = true;
+            let mut seen: FxHashSet<SymbolId> = FxHashSet::default();
             for (sym, global) in self.symbols.iter(self.globals) {
-                if sym.starts_with('"') && sym.ends_with('"') {
+                if is_ambient_module_symbol_name(sym) {
                     self.ambient_modules.push(global);
+                    seen.insert(global);
+                }
+            }
+            for i in 0..self.pattern_ambient_modules.len() {
+                let symbol = self.get_merged_symbol(self.pattern_ambient_modules[i].symbol);
+                if seen.insert(symbol) {
+                    self.ambient_modules.push(symbol);
                 }
             }
         }
@@ -1146,11 +1273,14 @@ impl Checker {
                     reference_parent.module_specifier()
                 };
                 let typ = self.get_type_of_symbol(symbol);
+                let import_attributes_type =
+                    self.get_import_attributes_type_for_module_specifier(reference);
                 let default_only_type = self.get_type_with_synthetic_default_only(
                     typ,
                     symbol,
                     module_symbol,
                     reference,
+                    import_attributes_type,
                 );
                 if default_only_type.is_some() {
                     return self.clone_type_as_module_type(
@@ -1259,8 +1389,13 @@ impl Checker {
         symbol: SymbolId,
         original_symbol: SymbolId,
         module_specifier: Node,
+        import_attributes_type: TypeId,
     ) -> TypeId {
-        let has_default_only = self.is_only_importable_as_default(module_specifier, SymbolId::NIL);
+        let has_default_only = self.is_only_importable_as_default(
+            module_specifier,
+            SymbolId::NIL,
+            import_attributes_type,
+        );
         if has_default_only && t.is_some() && !self.is_error_type(t) {
             let key = CachedTypeKey {
                 kind: CachedTypeKind::DEFAULT_ONLY_TYPE,
@@ -2675,16 +2810,22 @@ mod core_p17 {
         // compares their Go bytes (see `scanner_util::GO_STRING_MARKER`).
         for value in values {
             let star_index = go_len(&value.pattern_prefix) as isize;
-            let matches = go_len(candidate)
-                >= go_len(&value.pattern_prefix) + go_len(&value.pattern_suffix)
-                && go_has_prefix(candidate, &value.pattern_prefix)
-                && go_has_suffix(candidate, &value.pattern_suffix);
+            let matches = pattern_matches(value, candidate);
             if star_index > longest_match_prefix_length && matches {
                 best_pattern = Some(value);
                 longest_match_prefix_length = star_index;
             }
         }
         best_pattern
+    }
+
+    // Go: core/pattern.go:23 Pattern.Matches
+    // PORT: for `ast.PatternAmbientModule.Pattern`, which always has a star
+    // (see `find_best_pattern_match`).
+    pub fn pattern_matches(value: &PatternAmbientModule, candidate: &str) -> bool {
+        go_len(candidate) >= go_len(&value.pattern_prefix) + go_len(&value.pattern_suffix)
+            && go_has_prefix(candidate, &value.pattern_prefix)
+            && go_has_suffix(candidate, &value.pattern_suffix)
     }
 }
 

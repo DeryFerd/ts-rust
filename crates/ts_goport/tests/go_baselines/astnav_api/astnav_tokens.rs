@@ -35,7 +35,7 @@ use ts_goport::scanner_util::{go_string_bytes, go_string_from_bytes};
 
 // Go: astnav/tokens_test.go:22 testFiles
 fn test_files() -> Vec<PathBuf> {
-    vec![repo::type_script_submodule_path().join("src/services/mapCode.ts")]
+    vec![repo::test_data_path().join("fixtures/services/mapCode.ts")]
 }
 
 /// Go `filepath.Base(fileName)`.
@@ -73,7 +73,7 @@ fn read_file_text(file_name: &std::path::Path) -> &'static str {
 #[test]
 fn test_get_token_at_position() {
     const TEST: &str = "TestGetTokenAtPosition";
-    if repo::skip_if_no_type_script_submodule(TEST) || jstest::skip_if_no_node_js(TEST) {
+    if jstest::skip_if_no_node_js(TEST) {
         return;
     }
     let mut t = Subtests::new(TEST);
@@ -155,11 +155,11 @@ fn test_get_token_at_position() {
     t.finish();
 }
 
-// Go: astnav/tokens_test.go:114 TestGetTouchingPropertyName
+// Go: astnav/tokens_test.go:113 TestGetTouchingPropertyName
 #[test]
 fn test_get_touching_property_name() {
     const TEST: &str = "TestGetTouchingPropertyName";
-    if jstest::skip_if_no_node_js(TEST) || repo::skip_if_no_type_script_submodule(TEST) {
+    if jstest::skip_if_no_node_js(TEST) {
         return;
     }
     let mut t = Subtests::new(TEST);
@@ -184,7 +184,7 @@ fn test_get_touching_property_name() {
     t.finish();
 }
 
-// Go: astnav/tokens_test.go:139 baselineTokens
+// Go: astnav/tokens_test.go:137 baselineTokens
 // PORT: Go `t` is the subtest collector plus the name prefix of the Go
 // subtest that calls this function ("" when the test calls it directly).
 fn baseline_tokens(
@@ -257,7 +257,7 @@ fn baseline_tokens(
     }
 }
 
-// Go: astnav/tokens_test.go:190 tokenRun
+// Go: astnav/tokens_test.go:188 tokenRun
 #[derive(Clone, Debug)]
 struct TokenRun {
     start_pos: i32,
@@ -282,7 +282,7 @@ impl MarshalerTo for TokenRun {
     }
 }
 
-// Go: astnav/tokens_test.go:198 baselineGoTokensJSON
+// Go: astnav/tokens_test.go:196 baselineGoTokensJSON
 fn baseline_go_tokens_json(
     t: &mut Subtests,
     prefix: &str,
@@ -344,14 +344,14 @@ fn baseline_go_tokens_json(
     }
 }
 
-// Go: astnav/tokens_test.go:253 tokenDiff
+// Go: astnav/tokens_test.go:251 tokenDiff
 #[derive(Clone, Debug, Default)]
 struct TokenDiff {
     go_token: Option<TokenInfo>,
     ts_token: Option<TokenInfo>,
 }
 
-// Go: astnav/tokens_test.go:258 tokenInfo
+// Go: astnav/tokens_test.go:256 tokenInfo
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TokenInfo {
     kind: String,
@@ -379,7 +379,7 @@ impl UnmarshalerFrom for TokenInfo {
     }
 }
 
-// Go: astnav/tokens_test.go:264 toTokenInfo
+// Go: astnav/tokens_test.go:262 toTokenInfo
 fn to_token_info(node: Node) -> Option<TokenInfo> {
     if node.is_nil() {
         return None;
@@ -397,12 +397,12 @@ fn to_token_info(node: Node) -> Option<TokenInfo> {
     })
 }
 
-// Go: astnav/tokens_test.go:280 diffEqual
+// Go: astnav/tokens_test.go:278 diffEqual
 fn diff_equal(a: &TokenDiff, b: &TokenDiff) -> bool {
     tokens_equal(&a.go_token, &b.go_token) && tokens_equal(&a.ts_token, &b.ts_token)
 }
 
-// Go: astnav/tokens_test.go:284 tokensEqual
+// Go: astnav/tokens_test.go:282 tokensEqual
 fn tokens_equal(t1: &Option<TokenInfo>, t2: &Option<TokenInfo>) -> bool {
     t1 == t2
 }
@@ -424,7 +424,7 @@ fn eval_ts_tokens(file_text: &str, positions: &[i32], script: &str) -> Vec<Optio
         .unwrap_or_else(|err| panic!("assertion failed: error is not nil: {err}"))
 }
 
-// Go: astnav/tokens_test.go:291 tsGetTokensAtPositions
+// Go: astnav/tokens_test.go:289 tsGetTokensAtPositions
 fn ts_get_tokens_at_positions(file_text: &str, positions: &[i32]) -> Vec<Option<TokenInfo>> {
     let script = r#"
 		import fs from "fs";
@@ -452,7 +452,7 @@ fn ts_get_tokens_at_positions(file_text: &str, positions: &[i32]) -> Vec<Option<
     eval_ts_tokens(file_text, positions, script)
 }
 
-// Go: astnav/tokens_test.go:328 tsGetTouchingPropertyName
+// Go: astnav/tokens_test.go:326 tsGetTouchingPropertyName
 fn ts_get_touching_property_name(file_text: &str, positions: &[i32]) -> Vec<Option<TokenInfo>> {
     let script = r#"
 		import fs from "fs";
@@ -480,7 +480,7 @@ fn ts_get_touching_property_name(file_text: &str, positions: &[i32]) -> Vec<Opti
     eval_ts_tokens(file_text, positions, script)
 }
 
-// Go: core/core.go:474 PositionToLineAndByteOffset
+// Go: core/core.go:472 PositionToLineAndByteOffset
 fn position_to_line_and_byte_offset(position: i32, line_starts: &[i32]) -> (i32, i32) {
     let line = line_starts
         .partition_point(|&start| start <= position)
@@ -488,7 +488,7 @@ fn position_to_line_and_byte_offset(position: i32, line_starts: &[i32]) -> (i32,
     (line as i32, position - line_starts[line])
 }
 
-// Go: astnav/tokens_test.go:365 writeRangeDiff
+// Go: astnav/tokens_test.go:363 writeRangeDiff
 fn write_range_diff(
     output: &mut Vec<u8>,
     file: Node,
@@ -615,11 +615,11 @@ fn write_range_diff(
     }
 }
 
-// Go: astnav/tokens_test.go:460 TestFindPrecedingToken
+// Go: astnav/tokens_test.go:458 TestFindPrecedingToken
 #[test]
 fn test_find_preceding_token() {
     const TEST: &str = "TestFindPrecedingToken";
-    if repo::skip_if_no_type_script_submodule(TEST) || jstest::skip_if_no_node_js(TEST) {
+    if jstest::skip_if_no_node_js(TEST) {
         return;
     }
     let mut t = Subtests::new(TEST);
@@ -645,13 +645,10 @@ fn test_find_preceding_token() {
     t.finish();
 }
 
-// Go: astnav/tokens_test.go:488 TestFindNextToken
+// Go: astnav/tokens_test.go:485 TestFindNextToken
 #[test]
 fn test_find_next_token() {
     const TEST: &str = "TestFindNextToken";
-    if repo::skip_if_no_type_script_submodule(TEST) {
-        return;
-    }
     let mut t = Subtests::new(TEST);
 
     // t.Run("go baseline json", ...)
@@ -701,7 +698,7 @@ fn recover_quietly<T>(f: impl FnOnce() -> T) -> Option<T> {
     result.ok()
 }
 
-// Go: astnav/tokens_test.go:510 TestUnitFindPrecedingToken
+// Go: astnav/tokens_test.go:506 TestUnitFindPrecedingToken
 #[test]
 fn test_unit_find_preceding_token() {
     struct TestCase {
@@ -781,7 +778,7 @@ export function isAnyDirectorySeparator(charCode: number): boolean {
     t.finish();
 }
 
-// Go: astnav/tokens_test.go:589 tsFindPrecedingTokens
+// Go: astnav/tokens_test.go:585 tsFindPrecedingTokens
 fn ts_find_preceding_tokens(file_text: &str, positions: &[i32]) -> Vec<Option<TokenInfo>> {
     let script = r#"
 		import fs from "fs";

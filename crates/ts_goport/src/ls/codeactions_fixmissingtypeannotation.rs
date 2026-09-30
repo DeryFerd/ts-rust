@@ -387,6 +387,7 @@ impl<'a> IsolatedDeclarationsFixer<'a> {
             factory.new_modifier_list(&modifiers),
             SyntaxKind::NamespaceKeyword,
             factory.new_identifier(func_decl.name().text()),
+            Node::NIL, /*attributes*/
             factory.new_module_block(factory.new_node_list(&new_properties)),
         );
         // Set the flags for namespace

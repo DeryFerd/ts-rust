@@ -6,12 +6,15 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use ts_goport::diag;
+use ts_goport::frontend::core_context::{self, CheckerLifetime};
 use ts_goport::lsp::lsproto;
+use ts_goport::options::{CompilerOptions, Tristate};
 use ts_goport::program::ls_program;
 use ts_goport::project::{ProgramUpdateKind, Session};
 
 use super::projecttestutil::{self, ProgressCall, TypingsInstallerOptions, files};
 use super::util::*;
+use crate::support::baseline;
 
 // Go: project_test.go:24 filterDiagnosticsByURI
 // filterDiagnosticsByURI returns all PublishDiagnostics calls matching the given URI,
@@ -69,7 +72,56 @@ child_test! {
 }
 
 child_test! {
-    // Go: project_test.go:83 TestProjectProgramUpdateKind/NewFiles when import resolution mode changes
+    // Go: project_test.go:83 TestProjectProgramUpdateKind/compiler options update inferred project (ts#63950)
+    fn program_update_kind_compiler_options_update_inferred_project() {
+        const FILE_NAME: &str = "/src/index.ts";
+        let (session, _) = projecttestutil::setup(files(&[(FILE_NAME, "export const x = 1;")]));
+        let u = format!("file://{FILE_NAME}");
+        open(&session, &u, "export const x = 1;");
+        let old_project = session
+            .snapshot()
+            .project_collection
+            .inferred_project()
+            .expect("inferred project");
+        let old_program = old_project.borrow().program.clone().expect("program");
+        assert_eq!(old_program.options().strict, Tristate::Unknown);
+
+        session.did_change_compiler_options_for_inferred_projects(
+            &bg(),
+            Some(Rc::new(CompilerOptions {
+                no_lib: Tristate::True,
+                strict: Tristate::True,
+                ..Default::default()
+            })),
+        );
+        session
+            .get_language_service(&bg(), &uri(&u))
+            .unwrap_or_else(|err| panic!("GetLanguageService: {}", err.error()));
+
+        let updated_project = session
+            .snapshot()
+            .project_collection
+            .inferred_project()
+            .expect("inferred project");
+        let updated_project = updated_project.borrow();
+        assert_eq!(
+            updated_project
+                .command_line
+                .as_ref()
+                .expect("command line")
+                .compiler_options()
+                .strict,
+            Tristate::True
+        );
+        let updated_program = updated_project.program.clone().expect("program");
+        assert!(!Rc::ptr_eq(&updated_program, &old_program));
+        assert_eq!(updated_program.options().strict, Tristate::True);
+        assert_eq!(old_program.options().strict, Tristate::Unknown);
+    }
+}
+
+child_test! {
+    // Go: project_test.go:111 TestProjectProgramUpdateKind/NewFiles when import resolution mode changes
     // #4792
     fn program_update_kind_new_files_when_import_resolution_mode_changes() {
         let index = r#"import type { Value } from "pkg" with { "resolution-mode": "require" };
@@ -450,7 +502,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: project_test.go:399 TestPushDiagnostics/publishes global diagnostics after checking
+    // Go: project_test.go:605 TestPushDiagnostics/publishes global diagnostics after checking (ts#64452)
     fn push_diagnostics_publishes_global_diagnostics_after_checking() {
         let index = "export function f() {\n\t\t\t\tusing x = { [Symbol.dispose]() {} };\n\t\t\t}";
         let (session, utils) = projecttestutil::setup(files(&[
@@ -474,8 +526,40 @@ child_test! {
         // before triggering global diagnostics, to avoid racing with publishGlobalDiagnostics.
         session.wait_for_background_tasks();
 
-        ls.provide_diagnostics(&projecttestutil::with_request_id(&bg()), &uri(SRC_INDEX))
-            .unwrap_or_else(|err| panic!("{}", err.error()));
+        // ts#64452
+        let diagnostics_ctx = || {
+            core_context::with_checker_lifetime(
+                &projecttestutil::with_request_id(&bg()),
+                CheckerLifetime::DIAGNOSTICS,
+            )
+        };
+        for _ in 0..2 {
+            let program = ls.get_program();
+            let file = program.get_source_file("/src/index.ts").expect("source file").root;
+            let diags = ls_program::get_semantic_diagnostics(program, &diagnostics_ctx(), file);
+            assert!(!diags.is_empty());
+            for diag in &diags {
+                assert_eq!(diag.file(), file);
+            }
+
+            let report = ls
+                .provide_diagnostics(&diagnostics_ctx(), &uri(SRC_INDEX))
+                .unwrap_or_else(|err| panic!("{}", err.error()));
+            let report = report
+                .full_document_diagnostic_report
+                .expect("full document diagnostic report");
+            let mut has_source_diag = false;
+            for diag in &report.items {
+                assert!(
+                    !diag.message.as_string().contains("Cannot find global"),
+                    "global diagnostic should only be published on tsconfig.json"
+                );
+                if diag.code.as_ref().and_then(|code| code.integer) == Some(2550) {
+                    has_source_diag = true;
+                }
+            }
+            assert!(has_source_diag, "expected the source diagnostic about Symbol.dispose");
+        }
         // Enqueue global diagnostics publishing (normally done by the LSP server after each request).
         session.enqueue_publish_global_diagnostics();
         session.wait_for_background_tasks();
@@ -495,6 +579,107 @@ child_test! {
             "expected a 'Cannot find global' diagnostic on tsconfig.json, got: {:?}",
             last_tsconfig_call.diagnostics
         );
+    }
+}
+
+/// Go `TestPushDiagnostics/query globals {before,after} semantic checking`
+/// (project_test.go:678, ts#64452): the loop body for one `checkFirst`.
+fn push_diagnostics_query_globals(check_first: bool) {
+    let name = if check_first {
+        "query globals after semantic checking"
+    } else {
+        "query globals before semantic checking"
+    };
+    const URI: &str = "file:///src/repro.ts";
+    const SOURCE: &str = "type Json = string | Json[];
+type Parsed<T> = T extends object ? { [K in keyof T]: Parsed<T[K]> } : T;
+declare function wrap<T>(value: T): Parsed<T>;
+export const value = wrap({ items: [] as Json[] });";
+    let ctx = bg();
+    let (session, utils) = projecttestutil::setup(files(&[
+        (
+            "/src/tsconfig.json",
+            r#"{"compilerOptions":{"strict":true,"noEmit":true}}"#,
+        ),
+        ("/src/repro.ts", SOURCE),
+    ]));
+    open(&session, URI, SOURCE);
+    let service = session
+        .get_language_service(&projecttestutil::with_request_id(&ctx), &uri(URI))
+        .unwrap_or_else(|err| panic!("{}", err.error()));
+    session.wait_for_background_tasks();
+
+    let mut output = String::new();
+    let mut record = |caption: &str, data: String| {
+        output.push_str(&format!("// {caption}\n{data}\n\n"));
+    };
+    let marshal = |value: &dyn ts_goport::frontend::json::MarshalerTo| -> String {
+        ts_goport::frontend::json::json_marshal_indent(value, "", "  ")
+            .unwrap_or_else(|err| panic!("{err:?}"))
+    };
+    let check = |record: &mut dyn FnMut(&str, String)| {
+        let report = service
+            .provide_diagnostics(
+                &core_context::with_checker_lifetime(
+                    &projecttestutil::with_request_id(&ctx),
+                    CheckerLifetime::DIAGNOSTICS,
+                ),
+                &uri(URI),
+            )
+            .unwrap_or_else(|err| panic!("{}", err.error()));
+        record(
+            "Document diagnostics",
+            marshal(&report.full_document_diagnostic_report),
+        );
+    };
+    if check_first {
+        check(&mut record);
+    }
+    for _ in 0..2 {
+        let before = utils.client().publish_diagnostics_calls().len();
+        let hover = service
+            .provide_hover(
+                &projecttestutil::with_request_id(&ctx),
+                &lsproto::HoverParams {
+                    text_document: lsproto::TextDocumentIdentifier { uri: uri(URI) },
+                    position: lsproto::Position {
+                        line: 3,
+                        character: 14,
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|err| panic!("{}", err.error()));
+        record("Hover on value", marshal(&hover.hover));
+        session.enqueue_publish_global_diagnostics();
+        session.wait_for_background_tasks();
+        let published: Vec<lsproto::PublishDiagnosticsParams> =
+            utils.client().publish_diagnostics_calls()[before..].to_vec();
+        record("Published after hover", marshal(&published));
+    }
+    check(&mut record);
+    baseline::run(
+        &format!("{}.jsonc", name.replace(' ', "-")),
+        &output,
+        &baseline::Options {
+            subfolder: "project".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|err| panic!("{err}"));
+}
+
+child_test! {
+    // Go: project_test.go:680 TestPushDiagnostics/query globals before semantic checking (ts#64452)
+    fn push_diagnostics_query_globals_before_semantic_checking() {
+        push_diagnostics_query_globals(false);
+    }
+}
+
+child_test! {
+    // Go: project_test.go:680 TestPushDiagnostics/query globals after semantic checking (ts#64452)
+    fn push_diagnostics_query_globals_after_semantic_checking() {
+        push_diagnostics_query_globals(true);
     }
 }
 
@@ -601,6 +786,25 @@ child_test! {
             .configured_project(&path("/home/projects/sub/tsconfig.json"))
             .expect("configured project");
         assert_eq!(configured.borrow().display_name("/home/projects"), "sub/tsconfig.json");
+    }
+}
+
+child_test! {
+    // Go: project_test.go:819 TestDisplayName/configured project preserves config path casing (ts#64319)
+    fn display_name_configured_project_preserves_config_path_casing() {
+        let (session, _) = projecttestutil::setup(files(&[
+            ("/home/projects/Project/tsconfig.json", "{}"),
+            ("/home/projects/Project/index.ts", "export const x = 1;"),
+        ]));
+        open(&session, "file:///home/projects/Project/index.ts", "export const x = 1;");
+        let _ = language_service(&session, "file:///home/projects/Project/index.ts");
+
+        let configured = session
+            .snapshot()
+            .project_collection
+            .configured_project(&path("/home/projects/project/tsconfig.json"))
+            .expect("configured project");
+        assert_eq!(configured.borrow().display_name("/home/projects"), "Project/tsconfig.json");
     }
 }
 

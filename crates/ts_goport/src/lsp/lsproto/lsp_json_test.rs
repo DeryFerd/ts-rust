@@ -750,6 +750,47 @@ fn test_unmarshal_discriminator_union_invalid_discriminator() {
     assert!(err.is_err());
 }
 
+// Go: lsp_json_test.go:638 TestUnmarshalDiscriminatorUnion, "discriminator after variant fields"
+#[test]
+fn test_unmarshal_discriminator_union_discriminator_after_variant_fields() {
+    let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
+    let err = json_unmarshal(
+        br#"{"title": "Indexing", "percentage": 25, "kind": "begin"}"#,
+        &mut v,
+        &[],
+    );
+    assert_nil_error("discriminator after variant fields", &err);
+    let begin = v.begin.as_ref().expect("begin");
+    assert_eq!(begin.title, "Indexing");
+    assert_eq!(begin.percentage, Some(25));
+}
+
+// PORT: Go lsp_json_test.go:649 TestUnmarshalDiscriminatorUnion, "optional
+// discriminator is preserved", decodes a test-only struct by reflection
+// (`optionalDiscriminatorArm`). Rust arms decode with generated code only, so
+// it is not ported; the generated arms keep the discriminator (the tests
+// above read the arm that it picks).
+
+// Go: lsp_json_test.go:668 TestUnmarshalDiscriminatorUnion, "non-string discriminator"
+#[test]
+fn test_unmarshal_discriminator_union_non_string_discriminator() {
+    let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
+    let err = json_unmarshal(br#"{"kind": null}"#, &mut v, &[]);
+    assert!(err.is_err());
+}
+
+// Go: lsp_json_test.go:675 TestUnmarshalDiscriminatorUnion, "missing discriminator"
+#[test]
+fn test_unmarshal_discriminator_union_missing_discriminator() {
+    let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
+    let err = json_unmarshal(br#"{"message": "missing kind"}"#, &mut v, &[]);
+    assert_error_contains(
+        "missing discriminator",
+        &err,
+        r#"missing discriminator "kind""#,
+    );
+}
+
 // Go: lsp_json_test.go:640 TestUnmarshalPresenceDiscriminatorUnion, "TextEdit via range field"
 #[test]
 fn test_unmarshal_presence_discriminator_union_text_edit_via_range_field() {
@@ -833,6 +874,26 @@ fn test_unmarshal_document_edit_union_text_document_edit_without_kind() {
     assert!(v.delete_file.is_none());
 }
 
+// Go: lsp_json_test.go:756 TestUnmarshalDocumentEditUnion, "TextDocumentEdit with non-string kind"
+#[test]
+fn test_unmarshal_document_edit_union_text_document_edit_with_non_string_kind() {
+    let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
+    let err = json_unmarshal(
+        br#"{
+			"kind": null,
+			"textDocument": {"uri": "file:///a.ts", "version": 1},
+			"edits": []
+		}"#,
+        &mut v,
+        &[],
+    );
+    assert_nil_error("TextDocumentEdit with non-string kind", &err);
+    assert!(v.text_document_edit.is_some());
+    assert!(v.create_file.is_none());
+    assert!(v.rename_file.is_none());
+    assert!(v.delete_file.is_none());
+}
+
 // Go: lsp_json_test.go:696 TestUnmarshalDocumentEditUnion, "CreateFile with kind create"
 #[test]
 fn test_unmarshal_document_edit_union_create_file_with_kind_create() {
@@ -844,6 +905,23 @@ fn test_unmarshal_document_edit_union_create_file_with_kind_create() {
     );
     assert_nil_error("CreateFile with kind create", &err);
     assert!(v.text_document_edit.is_none());
+    assert!(v.create_file.is_some());
+    assert_eq!(
+        v.create_file.as_ref().unwrap().uri,
+        DocumentUri("file:///new.ts".to_string())
+    );
+}
+
+// Go: lsp_json_test.go:781 TestUnmarshalDocumentEditUnion, "CreateFile with kind after fields"
+#[test]
+fn test_unmarshal_document_edit_union_create_file_with_kind_after_fields() {
+    let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
+    let err = json_unmarshal(
+        br#"{"uri": "file:///new.ts", "kind": "create"}"#,
+        &mut v,
+        &[],
+    );
+    assert_nil_error("CreateFile with kind after fields", &err);
     assert!(v.create_file.is_some());
     assert_eq!(
         v.create_file.as_ref().unwrap().uri,

@@ -90,9 +90,6 @@ impl ts_goport::printer::EmitResolver for NilResolver {
     fn get_effective_declaration_flags(&self, node: Node, flags: ModifierFlags) -> ModifierFlags {
         nil_emit_resolver()
     }
-    fn get_resolution_mode_override(&self, node: Node) -> ResolutionMode {
-        nil_emit_resolver()
-    }
     fn get_type_reference_serialization_kind(
         &self,
         name: Node,

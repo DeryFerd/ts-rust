@@ -712,7 +712,7 @@ fn simple_fold_key(c: char) -> char {
 // PORT: Go `strings.EqualFold` on byte strings. Runes are decoded like Go
 // (see `decode_rune`). Each rune pair must be equal, ASCII case equal, or
 // in the same simple fold orbit (see `simple_fold_key`).
-fn equal_fold(a: &[u8], b: &[u8]) -> bool {
+pub fn equal_fold(a: &[u8], b: &[u8]) -> bool {
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         let (sr, sn) = decode_rune(&a[i..]);

@@ -1244,14 +1244,6 @@ impl Checker {
 
     // Go: checker/flow.go:2644 ensureAssignmentsMarked
     pub fn ensure_assignments_marked(&mut self, symbol: SymbolId) {
-        if self
-            .marked_assignment_symbol_links
-            .get(symbol)
-            .last_assignment_pos
-            != 0
-        {
-            return;
-        }
         let parent = find_ancestor(
             self.sym(symbol).value_declaration,
             is_function_or_source_file,

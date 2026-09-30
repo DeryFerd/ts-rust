@@ -275,6 +275,8 @@ impl Checker {
                 let modifiers;
                 if prop.is_some() {
                     modifiers = self.get_declaration_modifier_flags_from_symbol(prop);
+                    let write_modifiers = self
+                        .get_declaration_modifier_flags_from_symbol_ex(prop, true /*isWrite*/);
                     let prop_symbol_flags = self.sym(prop).flags;
                     if prop_symbol_flags.intersects(SymbolFlags::CLASS_MEMBER) {
                         if is_union {
@@ -343,14 +345,27 @@ impl Checker {
                     } else if !is_union && !self.is_readonly_symbol(prop) {
                         check_flags = check_flags.without(CheckFlags::READONLY);
                     }
-                    if !modifiers.intersects(ModifierFlags::NON_PUBLIC_ACCESSIBILITY_MODIFIER) {
+                    if modifiers.intersects(ModifierFlags::PROTECTED)
+                        && !modifiers.intersects(ModifierFlags::PUBLIC)
+                    {
+                        check_flags |= CheckFlags::CONTAINS_PROTECTED;
+                    } else if modifiers.intersects(ModifierFlags::PRIVATE)
+                        && !modifiers.intersects(ModifierFlags::PUBLIC)
+                    {
+                        check_flags |= CheckFlags::CONTAINS_PRIVATE;
+                    } else {
                         check_flags |= CheckFlags::CONTAINS_PUBLIC;
                     }
-                    if modifiers.intersects(ModifierFlags::PROTECTED) {
-                        check_flags |= CheckFlags::CONTAINS_PROTECTED;
-                    }
-                    if modifiers.intersects(ModifierFlags::PRIVATE) {
-                        check_flags |= CheckFlags::CONTAINS_PRIVATE;
+                    if write_modifiers.intersects(ModifierFlags::PROTECTED)
+                        && !write_modifiers.intersects(ModifierFlags::PUBLIC)
+                    {
+                        check_flags |= CheckFlags::CONTAINS_WRITE_PROTECTED;
+                    } else if write_modifiers.intersects(ModifierFlags::PRIVATE)
+                        && !write_modifiers.intersects(ModifierFlags::PUBLIC)
+                    {
+                        check_flags |= CheckFlags::CONTAINS_WRITE_PRIVATE;
+                    } else {
+                        check_flags |= CheckFlags::CONTAINS_WRITE_PUBLIC;
                     }
                     if modifiers.intersects(ModifierFlags::STATIC) {
                         check_flags |= CheckFlags::CONTAINS_STATIC;
@@ -395,16 +410,36 @@ impl Checker {
                 }
             }
         }
-        if single_prop.is_nil()
-            || is_union
-                && (!prop_set.is_empty() || check_flags.intersects(CheckFlags::PARTIAL))
-                && check_flags
-                    .intersects(CheckFlags::CONTAINS_PRIVATE | CheckFlags::CONTAINS_PROTECTED)
-                && !(!prop_set.is_empty() && self.has_common_declaration(&prop_set))
-        {
-            // No property was found, or, in a union, a property has a private or protected declaration in one
-            // constituent, but is missing or has a different declaration in another constituent.
+        if single_prop.is_nil() {
+            // No property was found
             return SymbolId::NIL;
+        }
+        if is_union
+            && (!prop_set.is_empty() || check_flags.intersects(CheckFlags::PARTIAL))
+            && check_flags.intersects(
+                CheckFlags::CONTAINS_PRIVATE
+                    | CheckFlags::CONTAINS_PROTECTED
+                    | CheckFlags::CONTAINS_WRITE_PRIVATE
+                    | CheckFlags::CONTAINS_WRITE_PROTECTED,
+            )
+            && !(!prop_set.is_empty() && self.has_common_declaration(&prop_set))
+        {
+            // A property in a union has a private or protected declaration in one constituent, but is missing
+            // or has a different declaration in another constituent. If the private or protected declaration is
+            // for reading, we don't create a property.
+            if check_flags.intersects(CheckFlags::CONTAINS_PRIVATE | CheckFlags::CONTAINS_PROTECTED)
+            {
+                return SymbolId::NIL;
+            }
+            // Otherwise, if the private or protected declaration is for writing, reduce accessibility to that of
+            // the most restricted constituent.
+            if check_flags.intersects(CheckFlags::CONTAINS_WRITE_PRIVATE) {
+                check_flags = check_flags.without(
+                    CheckFlags::CONTAINS_WRITE_PUBLIC | CheckFlags::CONTAINS_WRITE_PROTECTED,
+                );
+            } else if check_flags.intersects(CheckFlags::CONTAINS_WRITE_PROTECTED) {
+                check_flags = check_flags.without(CheckFlags::CONTAINS_WRITE_PUBLIC);
+            }
         }
         if prop_set.is_empty()
             && !check_flags.intersects(CheckFlags::READ_PARTIAL)
@@ -468,7 +503,12 @@ impl Checker {
             {
                 has_non_uniform_value_declaration = true;
             }
-            declarations.extend(self.sym(prop).declarations.iter().copied());
+            for &declaration in self.sym(prop).declarations.iter() {
+                // Go: core.AppendIfUnique
+                if !declarations.contains(&declaration) {
+                    declarations.push(declaration);
+                }
+            }
             let t = self.get_type_of_symbol(prop);
             if first_type.is_nil() {
                 first_type = t;
@@ -549,7 +589,6 @@ impl Checker {
     pub fn get_target_symbol(&mut self, s: SymbolId) -> SymbolId {
         // if symbol is instantiated its flags are not copied from the 'target'
         // so we'll need to get back original 'target' symbol to work with correct set of flags
-        // NOTE: cast to TransientSymbol should be safe because only TransientSymbols have CheckFlags.Instantiated
         if s.is_some() && self.sym(s).check_flags.intersects(CheckFlags::INSTANTIATED) {
             return self.value_symbol_links.get(s).target;
         }
@@ -831,17 +870,10 @@ impl Checker {
                 .intersects(ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED)
             {
                 self.ty_mut(t).object_flags |= ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED;
-                let props = self
-                    .get_properties_of_union_or_intersection_type(t)
-                    .to_vec();
-                let mut some = false;
-                for prop in props {
-                    if self.is_never_reduced_property(prop) {
-                        some = true;
-                        break;
-                    }
-                }
-                if some {
+                let types = self.ty(t).types().to_vec();
+                if !self.is_mapping_of_same_object_type(&types)
+                    && self.some_property_reduces_to_never(t)
+                {
                     self.ty_mut(t).object_flags |= ObjectFlags::IS_NEVER_INTERSECTION;
                 }
             }
@@ -854,6 +886,59 @@ impl Checker {
             }
         }
         t
+    }
+
+    // Go: checker/checker.go:22206 isMappingOfSameObjectType
+    pub fn is_mapping_of_same_object_type(&mut self, types: &[TypeId]) -> bool {
+        if !types.is_empty()
+            && self
+                .ty(types[0])
+                .object_flags
+                .intersects(ObjectFlags::MAPPED)
+        {
+            let first_type = self.get_modifiers_type_from_mapped_type(types[0]);
+            if self.ty(first_type).flags.intersects(TypeFlags::OBJECT) {
+                for &t in &types[1..] {
+                    if !self.ty(t).object_flags.intersects(ObjectFlags::MAPPED)
+                        || self.get_modifiers_type_from_mapped_type(t) != first_type
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    // Go: checker/checker.go:22220 somePropertyReducesToNever
+    // PORT: Go ranges over a map, so its order is random. Here the counts keep
+    // the order in which each name is first seen (constituent order, then
+    // property order), so the result and the types it makes are deterministic.
+    pub fn some_property_reduces_to_never(&mut self, t: TypeId) -> bool {
+        // Collect declaration counts for each property across all constituent types of the intersection.
+        let mut counts: IndexMap<Name, i32> = IndexMap::new();
+        let types = self.ty(t).types().to_vec();
+        for u in types {
+            let props = self.get_properties_of_type(u);
+            for &prop in props.iter() {
+                *counts.entry(self.sym(prop).name.clone()).or_insert(0) += 1;
+            }
+        }
+        // Check if any property appears in more than one constituent type and reduces to 'never'.
+        for (prop_name, count) in counts {
+            if count > 1 {
+                let prop = self.get_property_of_union_or_intersection_type(
+                    t,
+                    prop_name.as_str(),
+                    true, /*skipObjectFunctionPropertyAugment*/
+                );
+                if prop.is_some() && self.is_never_reduced_property(prop) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     // Go: checker/checker.go:21743 getReducedUnionType
@@ -1637,7 +1722,7 @@ impl Checker {
         if !could_contain {
             return t;
         }
-        if self.instantiation_depth == 100 || self.instantiation_count >= 5_000_000 {
+        if self.instantiation_stack.len() == 100 || self.instantiation_count >= 5_000_000 {
             // We have reached 100 recursive type instantiations, or 5M type instantiations caused by the same statement
             // or expression. There is a very high likelihood we're dealing with a combination of infinite generic types
             // that perpetually generate new type identities, so we stop the recursion here by yielding the error type.
@@ -1647,17 +1732,35 @@ impl Checker {
                     "instantiateType_DepthLimit",
                     vec![
                         ("typeId", t.into()),
-                        ("instantiationDepth", self.instantiation_depth.into()),
+                        (
+                            "instantiationDepth",
+                            (self.instantiation_stack.len() as u32).into(),
+                        ),
                         ("instantiationCount", self.instantiation_count.into()),
                     ],
                 );
             }
+            let circular_type_names = self.get_circular_type_names();
             let current_node = self.current_node;
-            self.error(
-                current_node,
-                diag::Type_instantiation_is_excessively_deep_and_possibly_infinite,
-                args![],
-            );
+            if circular_type_names.len() == 1 {
+                self.error(
+                    current_node,
+                    diag::Instantiations_of_type_0_appear_infinitely_circular,
+                    args![circular_type_names[0].clone()],
+                );
+            } else if circular_type_names.len() > 1 {
+                self.error(
+                    current_node,
+                    diag::Instantiations_of_the_following_types_appear_infinitely_circular_Colon_0,
+                    args![quoted_and_comma_separated(&circular_type_names)],
+                );
+            } else {
+                self.error(
+                    current_node,
+                    diag::Type_instantiation_is_excessively_deep_and_possibly_infinite,
+                    args![],
+                );
+            }
             return self.error_type;
         }
         let index = self.find_active_mapper(m);
@@ -1685,12 +1788,9 @@ impl Checker {
         if let Some(&cached_type) = cached {
             return cached_type;
         }
-        // PORT: `instantiation_depth` goes first (perf experiment K). The
-        // limit checks above do not change and no call runs between the
-        // three increments, so only the store order differs.
-        self.instantiation_depth += 1;
         self.total_instantiation_count += 1;
         self.instantiation_count += 1;
+        self.instantiation_stack.push(t);
         let result = self.instantiate_type_worker(t, m, alias);
         if index == -1 {
             self.pop_active_mapper();
@@ -1703,8 +1803,35 @@ impl Checker {
                 }
             }
         }
-        self.instantiation_depth -= 1;
+        self.instantiation_stack.pop();
         result
+    }
+
+    // Go: checker/checker.go:22546 getCircularTypeNames
+    pub fn get_circular_type_names(&mut self) -> Vec<String> {
+        let mut type_counts: FxHashMap<TypeId, i32> = FxHashMap::default();
+        let mut circular_type_names: Vec<String> = Vec::new();
+        let instantiation_stack = self.instantiation_stack.clone();
+        for t in instantiation_stack {
+            let count = type_counts.entry(t).or_insert(0);
+            *count += 1;
+            if *count == 3 {
+                let mut symbol = self.ty(t).symbol;
+                if let Some(alias) = &self.ty(t).alias {
+                    symbol = alias.symbol;
+                }
+                if symbol.is_some() && {
+                    let name = &self.sym(symbol).name;
+                    !name.is_empty() && !name.starts_with(INTERNAL_SYMBOL_NAME_PREFIX)
+                } {
+                    let name = self.symbol_to_string_exported(symbol);
+                    if !circular_type_names.contains(&name) {
+                        circular_type_names.push(name);
+                    }
+                }
+            }
+        }
+        circular_type_names
     }
 
     // Go: checker/checker.go:22045 pushActiveMapper
@@ -1866,7 +1993,7 @@ impl Checker {
         let mut alias = alias;
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::TYPE_PARAMETER) {
-            return self.mapper_map(m, t);
+            return self.get_mapped_type(t, m);
         } else if flags.intersects(TypeFlags::OBJECT) {
             let object_flags = self.ty(t).object_flags;
             if object_flags

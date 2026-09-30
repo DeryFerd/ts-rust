@@ -9,10 +9,10 @@ use crate::ls::autoimport::prelude::*;
 // - Go `*newImportBinding` values are never changed after they are made, so
 //   they are `NewImportBinding` values (`Option` where Go can pass nil).
 // - `(*View).GetFixes` and the methods it calls take the request checker
-//   `ch`. Go leases it again with `program.GetTypeChecker(ctx)` in
-//   `getExistingImports`, which returns the checker that the request already
-//   holds; a second `RefCell` borrow would panic, so the caller passes it
-//   (as the pinned ImportAdder decision does for the adder).
+//   `ch`. Go stores it in the view (`v.checker`, `NewView`'s `typeChecker`,
+//   ts#64178); the Rust checker is a `RefCell` that the caller already
+//   borrows, so the caller passes it to each method that reads it (as the
+//   pinned ImportAdder decision does for the adder).
 // - Go passes `*ast.SourceFile` to program methods that take an
 //   `ast.HasFileName`: `source_file_has_file_name(file)` (view.rs).
 // - The change tracker's embedded Go `NodeFactory` is `ct.node_factory()`.
@@ -983,7 +983,6 @@ impl View {
     // `usagePosition *lsproto.Position` is `Option<lsproto::Position>`.
     pub fn get_fixes(
         &self,
-        ctx: &Context,
         ch: &mut Checker,
         export: &Export,
         for_jsx: bool,
@@ -992,13 +991,12 @@ impl View {
     ) -> Vec<Rc<Fix>> {
         let mut fixes: Vec<Rc<Fix>> = Vec::new();
         if let Some(namespace_fix) =
-            self.try_use_existing_namespace_import(ctx, ch, export, usage_position)
+            self.try_use_existing_namespace_import(ch, export, usage_position)
         {
             fixes.push(namespace_fix);
         }
 
-        if let Some(fix) =
-            self.try_add_to_existing_import(ctx, ch, export, is_valid_type_only_use_site)
+        if let Some(fix) = self.try_add_to_existing_import(ch, export, is_valid_type_only_use_site)
         {
             fixes.push(fix);
             return fixes;
@@ -1106,7 +1104,6 @@ impl View {
     // Go: ls/autoimport/fix.go:619 tryUseExistingNamespaceImport
     pub fn try_use_existing_namespace_import(
         &self,
-        ctx: &Context,
         ch: &mut Checker,
         export: &Export,
         usage_position: Option<lsproto::Position>,
@@ -1125,7 +1122,7 @@ impl View {
             return None;
         }
 
-        let existing_imports = self.get_existing_imports(ctx, ch);
+        let existing_imports = self.get_existing_imports(ch);
         let matching_declarations = existing_imports
             .get(&export.module_id)
             .cloned()
@@ -1184,12 +1181,11 @@ impl View {
     // Go: ls/autoimport/fix.go:673 tryAddToExistingImport
     pub fn try_add_to_existing_import(
         &self,
-        ctx: &Context,
         ch: &mut Checker,
         export: &Export,
         is_valid_type_only_use_site: bool,
     ) -> Option<Rc<Fix>> {
-        let existing_imports = self.get_existing_imports(ctx, ch);
+        let existing_imports = self.get_existing_imports(ch);
         let matching_declarations = existing_imports
             .get(&export.module_id)
             .cloned()
@@ -1414,12 +1410,11 @@ pub struct ExistingImport {
 
 impl View {
     // Go: ls/autoimport/fix.go:826 getExistingImports
-    // PORT: Go leases `program.GetTypeChecker(ctx)` here; `ch` is that
-    // checker, passed by the caller (see the file header). Go
-    // `collections.MultiMap` is `IndexMap<ModuleID, Vec<ExistingImport>>`.
+    // PORT: `ch` is Go `v.checker`, passed by the caller (see the file
+    // header). Go `collections.MultiMap` is
+    // `IndexMap<ModuleID, Vec<ExistingImport>>`.
     pub fn get_existing_imports(
         &self,
-        _ctx: &Context,
         ch: &mut Checker,
     ) -> Rc<IndexMap<ModuleID, Vec<ExistingImport>>> {
         if let Some(existing_imports) = self.existing_imports.borrow().as_ref() {
@@ -1438,7 +1433,10 @@ impl View {
                     crate::gostd::debug::kind_string(module_specifier.kind())
                 ));
             } else if is_variable_declaration_initialized_to_require(node.parent()) {
-                let module_symbol = ch.resolve_external_module_name_exported(module_specifier);
+                let module_symbol = ch.resolve_external_module_name_exported(
+                    module_specifier,
+                    TypeId::NIL, /*importAttributesType*/
+                );
                 if module_symbol.is_some() {
                     let (module_id, _, ok) = try_get_module_id_and_file_name_of_module_symbol(
                         &ch.symbols,
@@ -1775,7 +1773,8 @@ impl View {
 fn is_fix_possibly_re_exporting_importing_file(fix: &Fix, importing_file_name: &str) -> bool {
     if fix.is_re_export && is_index_file_name(&fix.module_file_name) {
         let re_export_dir = tspath::get_directory_path(&fix.module_file_name);
-        return importing_file_name.starts_with(re_export_dir.as_str());
+        return importing_file_name
+            .starts_with(tspath::ensure_trailing_directory_separator(&re_export_dir).as_str());
     }
     false
 }

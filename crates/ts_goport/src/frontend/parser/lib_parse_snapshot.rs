@@ -1204,9 +1204,9 @@ payload_codec! {
     }
     118 ModuleBlock(ModuleBlockData) { flow_node: oflow, statements: list, facts: num }
     119 ModuleDeclaration(ModuleDeclarationData) {
-        asterisk_token: oid, body: oid, end_flow_node: oflow, flow_node: oflow, keyword: kind,
-        local_symbol: osym, locals: table, next_container: oid, symbol: osym, facts: num,
-        modifiers: mods, name: id,
+        asterisk_token: oid, attributes: oid, body: oid, end_flow_node: oflow, flow_node: oflow,
+        keyword: kind, local_symbol: osym, locals: table, next_container: oid, symbol: osym,
+        facts: num, modifiers: mods, name: id,
     }
     120 NamedExports(NamedExportsData) { elements: list, facts: num }
     121 NamedImports(NamedImportsData) { elements: list, facts: num }

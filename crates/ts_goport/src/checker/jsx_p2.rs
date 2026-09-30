@@ -872,6 +872,7 @@ impl Checker {
             Some(error_message),
             canonical_error_tag,
             false,
+            TypeId::NIL, /*importAttributesType*/
         );
         let mut result = SymbolId::NIL;
         if mod_.is_some() && mod_ != self.unknown_symbol {

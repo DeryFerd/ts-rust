@@ -86,7 +86,18 @@ impl Checker {
 
         let mut location = location;
         let mut populate_symbols = |c: &mut Checker| {
+            let mut last_location = Node::NIL;
             while location.is_some() {
+                if is_module_declaration(location)
+                    && location.attributes().is_some()
+                    && last_location == location.attributes()
+                {
+                    // Module declaration is not in scope inside its attributes.
+                    last_location = location;
+                    location = location.parent();
+                    continue;
+                }
+
                 if can_have_locals(location)
                     && location.locals().is_some()
                     && !is_global_source_file(location)
@@ -151,6 +162,7 @@ impl Checker {
                 }
 
                 is_static_symbol = is_static(location);
+                last_location = location;
                 location = location.parent();
             }
 

@@ -821,8 +821,7 @@ impl<'a> Parser<'a> {
     // Go: parser/parser.go:3387 parseReturnType
     pub fn parse_return_type(&mut self, return_token: SyntaxKind, is_type: bool) -> Node {
         if self.should_parse_return_type(return_token, is_type) {
-            return do_in_context(
-                self,
+            return self.do_in_context(
                 NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT,
                 false,
                 &mut Self::parse_type_or_type_predicate,
@@ -1567,8 +1566,7 @@ impl<'a> Parser<'a> {
     pub fn parse_decorator(&mut self) -> Node {
         let pos = self.node_pos();
         self.parse_expected(SyntaxKind::AtToken);
-        let expression = do_in_context(
-            self,
+        let expression = self.do_in_context(
             NodeFlags::DECORATOR_CONTEXT,
             true,
             &mut Self::parse_decorator_expression,
@@ -1796,8 +1794,7 @@ impl<'a> Parser<'a> {
 
     // Go: parser/parser.go:4080 parseExpressionAllowIn
     pub fn parse_expression_allow_in(&mut self) -> Node {
-        do_in_context(
-            self,
+        self.do_in_context(
             NodeFlags::DISALLOW_IN_CONTEXT,
             false,
             &mut Self::parse_expression,

@@ -2192,13 +2192,14 @@ fn visit_each_child_js_doc_name_reference<C>(node: Node, v: &mut NodeVisitor<'_,
     v.factory().update_js_doc_name_reference(node, name)
 }
 
-// Go: ast/ast_generated.go:8242 (node *ModuleDeclaration) VisitEachChild
+// Go: ast/ast_generated.go:8073 (node *ModuleDeclaration) VisitEachChild
 fn visit_each_child_module_declaration<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> Node {
     let modifiers = v.visit_modifiers_hooked(node.modifiers());
     let name = v.visit_node_hooked(node.name());
+    let attributes = v.visit_node_hooked(node.attributes());
     let body = v.visit_node_hooked(node.body());
     v.factory()
-        .update_module_declaration(node, modifiers, node.keyword(), name, body)
+        .update_module_declaration(node, modifiers, node.keyword(), name, attributes, body)
 }
 
 // Go: ast/ast_generated.go:8293 (node *ImportEqualsDeclaration) VisitEachChild

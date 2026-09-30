@@ -3,9 +3,11 @@
 //! typescript-go reference baseline.
 //!
 //! Environment:
-//! - `TS_GO_REPO`: the typescript-go checkout (default `DEFAULT_GO_REPO`).
-//!   The reference root is `testdata/baselines/reference`, the submodule
-//!   reference root is `_submodules/TypeScript/tests/baselines/reference`.
+//! - `TS_GO_REPO`: the Go checkout (default `DEFAULT_GO_REPO`), in either
+//!   layout (`is_merged_layout`). The reference root is
+//!   `testdata/baselines/reference`. At the typescript-go layout the
+//!   submodule reference root is
+//!   `_submodules/TypeScript/tests/baselines/reference`.
 //! - `TS_GOPORT_BASELINE_LOCAL`: unset (or empty) compares only. `1` writes
 //!   every generated baseline under `DEFAULT_LOCAL_ROOT` in the Go layout
 //!   (`<subfolder>/<name>`, the submodule diff files, `.delete` markers).
@@ -13,9 +15,8 @@
 //! - `TS_GOPORT_BASELINE_TRACK=<file>`: appends `<subfolder>/<name>` of each
 //!   compared baseline to the file (Go `baseline.Track`).
 //!
-//! PORT: Go reports through `t.Errorf` and `t.Fatalf`. `run` and
-//! `run_against_submodule` return every message, joined by newlines, as the
-//! `Err`. A mismatch message names the file and shows the first differing
+//! PORT: Go reports through `t.Errorf` and `t.Fatalf`. `run` returns every
+//! message, joined by newlines, as the `Err`. A mismatch message names the file and shows the first differing
 //! line, never the whole file.
 //!
 //! PORT: the generated text is a port form string (see
@@ -43,7 +44,7 @@ pub const TRACK_ENV: &str = "TS_GOPORT_BASELINE_TRACK";
 /// A Go `func(string) string` diff fixup.
 pub type DiffFixup = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
-// Go: testutil/baseline/baseline.go:18 Options
+// Go: testutil/baseline/baseline.go:14 Options
 #[derive(Clone, Default)]
 pub struct Options {
     pub subfolder: String,
@@ -55,7 +56,7 @@ pub struct Options {
     pub skip_diff_with_old: bool,
 }
 
-// Go: testutil/baseline/baseline.go:28 NoContent
+// Go: testutil/baseline/baseline.go:21 NoContent
 pub const NO_CONTENT: &str = "<no content>";
 
 /// The typescript-go checkout: `TS_GO_REPO`, or `DEFAULT_GO_REPO`.
@@ -64,6 +65,27 @@ pub fn go_repo() -> PathBuf {
         Some(repo) if !repo.is_empty() => PathBuf::from(repo),
         _ => PathBuf::from(DEFAULT_GO_REPO),
     }
+}
+
+/// Whether the Go checkout has the microsoft/TypeScript `tsc/` layout
+/// (5f647a841a, "Apply the TypeScript 7 repository layout"): no
+/// `_submodules/TypeScript`, `TestLocal` runs every case under
+/// `testdata/tests/cases`, the transpile cases are in
+/// `testdata/tests/cases/transpile`, the `submodule*` reference dirs are
+/// merged into `reference/<suite>` and there are no `.diff` files. Its
+/// `go.mod` module is `github.com/microsoft/TypeScript/tsc`. Any other
+/// checkout has the typescript-go layout (pin B and older).
+// PORT: no Go equivalent. Go has one layout per commit; the port runs at
+// pins of both layouts.
+pub fn is_merged_layout() -> bool {
+    static MERGED: OnceLock<bool> = OnceLock::new();
+    *MERGED.get_or_init(|| {
+        std::fs::read_to_string(go_repo().join("go.mod")).is_ok_and(|go_mod| {
+            go_mod
+                .lines()
+                .any(|line| line.trim() == "module github.com/microsoft/TypeScript/tsc")
+        })
+    })
 }
 
 // Go: internal/repo TestDataPath
@@ -77,6 +99,7 @@ pub fn reference_root() -> PathBuf {
 }
 
 // Go: testutil/baseline/baseline.go:249 submoduleReferenceRoot
+// (typescript-go layout only)
 pub fn submodule_reference_root() -> PathBuf {
     go_repo()
         .join("_submodules")
@@ -113,7 +136,9 @@ fn join_rel(parts: &[&str]) -> String {
         .join("/")
 }
 
-// Go: testutil/baseline/baseline.go:30 Run
+// Go: testutil/baseline/baseline.go:23 Run
+// At the merged layout Go `Options` has no `IsSubmodule*` fields and `Run`
+// is the first block only; the runners there never set `is_submodule`.
 pub fn run(file_name: &str, actual: &str, opts: &Options) -> Result<(), String> {
     let mut errors = Vec::new();
     let orig_subfolder = opts.subfolder.as_str();
@@ -130,13 +155,7 @@ pub fn run(file_name: &str, actual: &str, opts: &Options) -> Result<(), String> 
         // Record this baseline for tracking unused baselines
         record_baseline(&rel);
 
-        write_comparison(
-            &mut errors,
-            actual,
-            &rel,
-            &reference_root().join(&rel),
-            false,
-        );
+        write_comparison(&mut errors, actual, &rel, &reference_root().join(&rel));
     }
 
     if !opts.is_submodule || opts.skip_diff_with_old {
@@ -195,9 +214,9 @@ pub fn run(file_name: &str, actual: &str, opts: &Options) -> Result<(), String> 
 
         let reference = reference_root().join(&rel);
         if root == out_root {
-            write_comparison(&mut errors, &diff, &rel, &reference, false);
+            write_comparison(&mut errors, &diff, &rel, &reference);
         } else {
-            write_comparison(&mut errors, NO_CONTENT, &rel, &reference, false);
+            write_comparison(&mut errors, NO_CONTENT, &rel, &reference);
         }
     }
 
@@ -254,7 +273,7 @@ fn read_file_or_no_content(file_name: &Path) -> String {
     }
 }
 
-// Go: testutil/baseline/baseline.go:134 DiffText
+// Go: testutil/baseline/baseline.go:31 DiffText
 pub fn diff_text(old_name: &str, new_name: &str, expected: &str, actual: &str) -> String {
     let expected_lines = patience::split_lines(expected);
     let actual_lines = patience::split_lines(actual);
@@ -394,30 +413,19 @@ fn parse_unified_diff_header(s: &str) -> Option<([i64; 4], usize)> {
     Some((numbers, i))
 }
 
-// Go: testutil/baseline/baseline.go:186 RunAgainstSubmodule
-pub fn run_against_submodule(file_name: &str, actual: &str, opts: &Options) -> Result<(), String> {
-    let mut errors = Vec::new();
-    let rel = join_rel(&[opts.subfolder.as_str(), file_name]);
+// Go `RunAgainstSubmodule` (typescript-go baseline.go:186) has no callers
+// since microsoft/TypeScript 5f647a841a and is not ported.
 
-    // Record this baseline for tracking unused baselines
-    record_baseline(&rel);
-
-    let reference = submodule_reference_root().join(&rel);
-    write_comparison(&mut errors, actual, &rel, &reference, true);
-    finish(errors)
-}
-
-// Go: testutil/baseline/baseline.go:195 writeComparison
+// Go: testutil/baseline/baseline.go:41 writeComparison
 // PORT: `rel` is the path under the local root (Go passes the full local
 // path). With a local root, every generated baseline is written, not only a
 // changed one, and a stale `.delete` marker is removed too.
-fn write_comparison(
-    errors: &mut Vec<String>,
-    actual_content: &str,
-    rel: &str,
-    reference: &Path,
-    comparing_against_submodule: bool,
-) {
+// PORT: at the merged layout Go writes the `.delete` marker of a
+// `NoContent` result whose reference exists and reports nothing. The port
+// reports it at both layouts, as Go did at the typescript-go layout: the
+// reference is the Go output, so a baseline that the port does not make is
+// a port failure.
+fn write_comparison(errors: &mut Vec<String>, actual_content: &str, rel: &str, reference: &Path) {
     assert!(
         !actual_content.is_empty(),
         "the generated content was \"\". Return 'baseline.NoContent' if no baselining is required."
@@ -483,12 +491,7 @@ fn write_comparison(
     }
 
     if !found_expected {
-        if comparing_against_submodule {
-            errors.push(format!(
-                "the baseline file {} does not exist in the TypeScript submodule",
-                reference.display()
-            ));
-        } else if let Some(local) = &local {
+        if let Some(local) = &local {
             errors.push(format!("new baseline created at {}.", local.display()));
         } else {
             // PORT: nothing is written without a local root.
@@ -497,12 +500,6 @@ fn write_comparison(
                 reference.display()
             ));
         }
-    } else if comparing_against_submodule {
-        errors.push(format!(
-            "the baseline file {} does not match the reference in the TypeScript submodule\n{}",
-            reference.display(),
-            first_difference(&expected, &actual)
-        ));
     } else {
         // PORT: the Go hint to run `hereby baseline-accept` is left out.
         errors.push(format!(
@@ -613,42 +610,6 @@ fn record_baseline(relative_path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Go: testutil/baseline/baseline_test.go:9 TestSubmoduleAcceptedFilesExist
-    #[test]
-    fn baseline_submodule_accepted_files_exist() {
-        let mut errors = Vec::new();
-        for name in submodule_accepted_file_names() {
-            if !reference_root()
-                .join("submoduleAccepted")
-                .join(name)
-                .exists()
-            {
-                errors.push(format!(
-                    "submoduleAccepted.txt references {name:?}, but the baseline file does not exist"
-                ));
-            }
-        }
-        assert!(errors.is_empty(), "{}", errors.join("\n"));
-    }
-
-    // Go: testutil/baseline/baseline_test.go:18 TestSubmoduleTriagedFilesExist
-    #[test]
-    fn baseline_submodule_triaged_files_exist() {
-        let mut errors = Vec::new();
-        for name in submodule_triaged_file_names() {
-            if !reference_root()
-                .join("submoduleTriaged")
-                .join(name)
-                .exists()
-            {
-                errors.push(format!(
-                    "submoduleTriaged.txt references {name:?}, but the baseline file does not exist"
-                ));
-            }
-        }
-        assert!(errors.is_empty(), "{}", errors.join("\n"));
-    }
 
     #[test]
     fn baseline_diff_text_and_header_rewrite() {

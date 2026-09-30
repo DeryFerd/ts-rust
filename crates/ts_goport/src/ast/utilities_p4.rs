@@ -660,11 +660,6 @@ pub fn is_part_of_type_only_import_or_export_declaration(node: Node) -> bool {
     find_ancestor(node, &mut is_type_only_import_or_export_declaration).is_some()
 }
 
-// Go: ast/utilities.go:3167 IsPartOfExclusivelyTypeOnlyImportOrExportDeclaration
-pub fn is_part_of_exclusively_type_only_import_or_export_declaration(node: Node) -> bool {
-    find_ancestor(node, &mut is_exclusively_type_only_import_or_export).is_some()
-}
-
 // Go: ast/utilities.go:3171 IsEmittableImport
 pub fn is_emittable_import(node: Node) -> bool {
     match node.kind() {
@@ -727,7 +722,7 @@ pub fn has_resolution_mode_override(node: Node) -> bool {
         _ => {}
     }
     if attributes.is_some() {
-        let (_, ok) = attributes.get_resolution_mode_override();
+        let (_, ok) = attributes.get_resolution_mode_override(None);
         return ok;
     }
     false
@@ -1041,6 +1036,7 @@ pub fn replace_modifiers(factory: &NodeFactory, node: Node, modifier_array: Modi
                 modifier_array,
                 node.keyword(),
                 node.name(),
+                node.attributes(),
                 node.body(),
             );
         }

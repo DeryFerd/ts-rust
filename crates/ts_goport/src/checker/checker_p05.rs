@@ -1071,21 +1071,16 @@ impl Checker {
     // Go: checker/checker.go:4462 checkBaseTypeAccessibility
     pub fn check_base_type_accessibility(&mut self, t: TypeId, node: Node) {
         let signatures = self.get_signatures_of_type(t, SignatureKind::CONSTRUCT);
-        if !signatures.is_empty() {
-            let declaration = self.sig(signatures[0]).declaration;
-            if declaration.is_some() && has_modifier(declaration, ModifierFlags::PRIVATE) {
-                let t_symbol = self.ty(t).symbol;
-                let type_class_declaration =
-                    get_class_like_declaration_of_symbol(&self.symbols, t_symbol);
-                if !self.is_node_within_class(node, type_class_declaration) {
-                    let name = self.get_fully_qualified_name(t_symbol, Node::NIL);
-                    self.error(
-                        node,
-                        diag::Cannot_extend_a_class_0_Class_constructor_is_marked_as_private,
-                        args![name],
-                    );
-                }
-            }
+        let accessibility_error =
+            self.get_constructor_accessibility_error(node, &signatures, ModifierFlags::PRIVATE);
+        if let Some(accessibility_error) = accessibility_error {
+            let declaring_class_symbol = self.ty(accessibility_error.declaring_class).symbol;
+            let name = self.get_fully_qualified_name(declaring_class_symbol, Node::NIL);
+            self.error(
+                node,
+                diag::Cannot_extend_a_class_0_Class_constructor_is_marked_as_private,
+                args![name],
+            );
         }
     }
 
@@ -1407,11 +1402,8 @@ impl Checker {
                     );
                 }
             } else if count > 5 {
-                let missed_properties = member_info.missed_properties[..4]
-                    .iter()
-                    .map(|prop| format!("'{prop}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let missed_properties =
+                    quoted_and_comma_separated(&member_info.missed_properties[..4]);
                 let remaining_missed_properties = count as i32 - 4;
                 if is_class_expression(error_node) {
                     self.error(
@@ -1427,12 +1419,7 @@ impl Checker {
                     );
                 }
             } else {
-                let missed_properties = member_info
-                    .missed_properties
-                    .iter()
-                    .map(|prop| format!("'{prop}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let missed_properties = quoted_and_comma_separated(&member_info.missed_properties);
                 if is_class_expression(error_node) {
                     self.error(
                         error_node,

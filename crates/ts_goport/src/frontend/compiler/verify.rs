@@ -473,9 +473,14 @@ impl NewProgram {
             // loop over `self.files` does not overlap the mutable borrow.
             let mut not_listed: Vec<Rc<ProcessingDiagnostic>> = Vec::new();
             for file in &self.files {
+                // ts#64407
+                let root_path = match file.canonical_source_file() {
+                    Some(canonical) => canonical.path().clone(),
+                    None => file.path().clone(),
+                };
                 // #4699: Go `sourceFileMayBeEmitted(file, p, false, false)`.
                 if source_file_may_be_emitted(file, self, false, false)
-                    && !root_paths.contains(file.path())
+                    && !root_paths.contains(&root_path)
                 {
                     not_listed.push(Rc::new(ProcessingDiagnostic {
                         kind: ProcessingDiagnosticKind::EXPLAINING_FILE_INCLUDE,

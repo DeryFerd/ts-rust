@@ -90,6 +90,8 @@ pub struct SysState {
     pub default_library_path: String,
     pub use_case_sensitive_file_names: bool,
     pub for_incremental_correctness: bool,
+    /// Go `TestSys.outputIsTTY` (ts#63941).
+    pub output_is_tty: bool,
     pub clock: ClockState,
     pub map_fs: MapFsState,
     pub written_files: Vec<String>,
@@ -126,6 +128,7 @@ fn export_state(sys: &TestSys) -> SysState {
         default_library_path: sys.default_library_path(),
         use_case_sensitive_file_names: shared.map_fs.use_case_sensitive_file_names(),
         for_incremental_correctness: sys.for_incremental_correctness(),
+        output_is_tty: sys.write_output_is_tty(),
         clock: shared.clock.state(),
         map_fs: shared.map_fs.export_state(),
         written_files,
@@ -191,7 +194,7 @@ fn sys_from_state(state: SysState, mode: SysMode) -> TestSys {
         )),
         written_files: Arc::new(Mutex::new(state.written_files.into_iter().collect())),
     };
-    let sys = TestSys::new(
+    let mut sys = TestSys::new(
         shared,
         state.cwd,
         state.default_library_path,
@@ -199,6 +202,7 @@ fn sys_from_state(state: SysState, mode: SysMode) -> TestSys {
         state.for_incremental_correctness,
         mode,
     );
+    sys.set_output_is_tty(state.output_is_tty);
     sys.set_output_bytes(state.output);
     sys.set_program_baseline_texts(state.program_baselines, state.program_include_baselines);
     sys.set_child_serialized_mtimes(
@@ -320,6 +324,7 @@ impl Enc {
         self.str(&state.default_library_path);
         self.bool(state.use_case_sensitive_file_names);
         self.bool(state.for_incremental_correctness);
+        self.bool(state.output_is_tty);
         self.time(state.clock.start);
         self.opt_time(state.clock.now);
         self.map_fs(&state.map_fs);
@@ -484,6 +489,7 @@ impl<'a> Dec<'a> {
         let default_library_path = self.str()?;
         let use_case_sensitive_file_names = self.bool()?;
         let for_incremental_correctness = self.bool()?;
+        let output_is_tty = self.bool()?;
         let clock = ClockState {
             start: self.time()?,
             now: self.opt_time()?,
@@ -514,6 +520,7 @@ impl<'a> Dec<'a> {
             default_library_path,
             use_case_sensitive_file_names,
             for_incremental_correctness,
+            output_is_tty,
             clock,
             map_fs,
             written_files,

@@ -3358,7 +3358,7 @@ impl Node {
         })
     }
 
-    // Go: ast.go:954 Attributes
+    // Go: ast.go:966 Attributes
     // PORT: also covers the `Attributes` fields of ImportDeclaration,
     // ExportDeclaration, ImportTypeNode and JSDocImportTag, which have no
     // generated accessor.
@@ -3369,6 +3369,7 @@ impl Node {
             Node::NIL,
             [JsxOpeningElement, JsxSelfClosingElement] => |f, d| req(f, d.attributes),
             [
+                ModuleDeclaration,
                 ImportDeclaration,
                 ExportDeclaration,
                 ImportTypeNode,
@@ -3635,7 +3636,7 @@ impl Node {
         for_each_child_dyn(self, &mut v)
     }
 
-    // Go: ast.go:195 IterChildren
+    // Go: ast.go:196 IterChildren
     /// The children that `for_each_child` visits, in the same order.
     #[must_use]
     pub fn iter_children(self) -> std::vec::IntoIter<Node> {
@@ -4316,7 +4317,9 @@ fn walk_children<'d>(data: &'d NodeData, w: &mut impl ChildVisit<'d>) -> bool {
                 || (!d.is_name_first && (o!(d.type_expression) || n!(d.name)))
                 || ol!(d.comment)
         }
-        NodeData::ModuleDeclaration(d) => m!(d.modifiers) || n!(d.name) || o!(d.body),
+        NodeData::ModuleDeclaration(d) => {
+            m!(d.modifiers) || n!(d.name) || o!(d.attributes) || o!(d.body)
+        }
         NodeData::ImportEqualsDeclaration(d) => {
             m!(d.modifiers) || n!(d.name) || n!(d.module_reference)
         }
@@ -5430,6 +5433,7 @@ pub fn is_declaration_node(node: Node) -> bool {
             | NodeData::JsDocTypeLiteral(_)
             | NodeData::JsxAttribute(_)
             | NodeData::JsxAttributes(_)
+            | NodeData::JsxSpreadAttribute(_)
             | NodeData::MappedTypeNode(_)
             | NodeData::MethodDeclaration(_)
             | NodeData::MethodSignatureDeclaration(_)
@@ -5440,6 +5444,7 @@ pub fn is_declaration_node(node: Node) -> bool {
             | NodeData::NamespaceExportDeclaration(_)
             | NodeData::NamespaceImport(_)
             | NodeData::NoSubstitutionTemplateLiteral(_)
+            | NodeData::NotEmittedTypeElement(_)
             | NodeData::ObjectLiteralExpression(_)
             | NodeData::ParameterDeclaration(_)
             | NodeData::PropertyAssignment(_)
@@ -5582,11 +5587,17 @@ pub fn is_any_export_assignment(node: Node) -> bool {
 }
 
 impl Node {
-    // Go: ast.go:2218 (*ImportAttributesNode).GetResolutionModeOverride
+    // Go: ast.go:2217 (*ImportAttributesNode).GetResolutionModeOverride
     /// The `resolution-mode` from an import attributes node, and whether
     /// one was given. The node can be nil.
+    // PORT: Go `grammarErrorOnNode` is a nil-able func; `None` is Go nil.
     #[must_use]
-    pub fn get_resolution_mode_override(self) -> (ResolutionMode, bool) {
+    pub fn get_resolution_mode_override(
+        self,
+        grammar_error_on_node: Option<
+            &mut dyn FnMut(Node, &'static crate::diagnostics::Message, Vec<String>) -> bool,
+        >,
+    ) -> (ResolutionMode, bool) {
         if self.is_nil() {
             return (RESOLUTION_MODE_NONE, false);
         }
@@ -5596,21 +5607,24 @@ impl Node {
         })
         .unwrap_or_else(|| panic!("AsImportAttributes called on {:?}", self.kind()))
         .nodes();
-        if attributes.len() != 1 {
+        let attribute = attributes
+            .iter()
+            .find(|attribute| attribute.name().text() == "resolution-mode");
+        let Some(elem) = attribute else {
             return (RESOLUTION_MODE_NONE, false);
-        }
-        let elem = attributes.get(0);
-        if !is_string_literal_like(elem.name()) {
-            return (RESOLUTION_MODE_NONE, false);
-        }
-        if elem.name().text() != "resolution-mode" {
-            return (RESOLUTION_MODE_NONE, false);
-        }
+        };
         let value = elem.value();
         if !is_string_literal_like(value) {
             return (RESOLUTION_MODE_NONE, false);
         }
         if value.text() != "import" && value.text() != "require" {
+            if let Some(grammar_error_on_node) = grammar_error_on_node {
+                grammar_error_on_node(
+                    value,
+                    diag::X_resolution_mode_should_be_either_require_or_import,
+                    Vec::new(),
+                );
+            }
             return (RESOLUTION_MODE_NONE, false);
         }
         if value.text() == "import" {
@@ -5674,13 +5688,13 @@ pub fn source_file_text(file: Node) -> FileText {
 // Content mapper info of a SourceFile (tsgo#4712)
 // ---------------------------------------------------------------------------
 
-// Go: ast/ast.go:2615 MappedDiagnosticDirectivePolicy
+// Go: ast/ast.go:2602 MappedDiagnosticDirectivePolicy
 crate::flags_macros::go_enum!(MappedDiagnosticDirectivePolicy, u8 {
     IGNORE = 0; // MappedDiagnosticDirectivePolicyIgnore
     EXPECT = 1; // MappedDiagnosticDirectivePolicyExpect
 });
 
-// Go: ast/ast.go:2622 MappedDiagnosticDirective
+// Go: ast/ast.go:2609 MappedDiagnosticDirective
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MappedDiagnosticDirective {
     pub original_range: TextRange,
@@ -5691,7 +5705,7 @@ pub struct MappedDiagnosticDirective {
     pub source: String,
 }
 
-// Go: ast/ast.go:2631 ContentMapperSourceFileInfo
+// Go: ast/ast.go:2618 ContentMapperSourceFileInfo
 // PORT: Go `*SourceFile` is `Rc<ParsedSourceFile>` (the compiler host
 // type), and Go `*spanmap.SpanMap` is `Option<Arc<SpanMap>>`. Pass it to
 // `ParsedSourceFile::set_content_mapper_info`, which keeps it in two parts:
@@ -5771,7 +5785,7 @@ static EMPTY_PARSE_OPTIONS: crate::frontend::parser::SourceFileParseOptions =
             },
     };
 
-// Go: ast/ast.go:2652 (*SourceFile).SetContentMapperInfo, for the node side.
+// Go: ast/ast.go:2639 (*SourceFile).SetContentMapperInfo, for the node side.
 /// Stores the content mapper info of the parsed SourceFile `file`.
 /// `ParsedSourceFile::set_content_mapper_info` calls it.
 // PORT: panics when the info is already set, as Go does.
@@ -5808,7 +5822,7 @@ pub fn source_file_content_mapper_info(file: Node) -> Option<&'static ContentMap
         .copied()
 }
 
-// Go: ast/ast.go:2561 (*SourceFile).OriginalText
+// Go: ast/ast.go:2548 (*SourceFile).OriginalText
 // OriginalText returns the untransformed source text for content-mapped files, or Text() otherwise.
 #[must_use]
 pub fn source_file_original_text(file: Node) -> FileText {
@@ -5818,7 +5832,7 @@ pub fn source_file_original_text(file: Node) -> FileText {
     }
 }
 
-// Go: ast/ast.go:2569 (*SourceFile).OriginalFileName
+// Go: ast/ast.go:2556 (*SourceFile).OriginalFileName
 // OriginalFileName returns the canonical filename associated with a supplemental source file, or FileName() otherwise.
 #[must_use]
 pub fn source_file_original_file_name(file: Node) -> &'static str {
@@ -5829,7 +5843,7 @@ pub fn source_file_original_file_name(file: Node) -> &'static str {
     source_file_file_name(file)
 }
 
-// Go: ast/ast.go:2579 (*SourceFile).SpanMap
+// Go: ast/ast.go:2566 (*SourceFile).SpanMap
 // SpanMap returns the span map that maps positions in this file's transformed Text() back to its
 // original, untransformed content, or nil if the file is not content-mapped (or is a failure stub).
 // The returned map is nil-safe: a nil map maps positions identically.
@@ -5839,7 +5853,7 @@ pub fn source_file_span_map(file: Node) -> Option<&'static crate::spanmap::SpanM
     source_file_content_mapper_info(file)?.span_map.as_deref()
 }
 
-// Go: ast/ast.go:2588 (*SourceFile).ContentMapper
+// Go: ast/ast.go:2575 (*SourceFile).ContentMapper
 // ContentMapper returns the identity of the content mapper that produced this file, or "" if the file
 // was not produced by a content mapper (or the mapper did not identify itself).
 #[must_use]
@@ -5847,7 +5861,7 @@ pub fn source_file_content_mapper(file: Node) -> &'static str {
     source_file_content_mapper_info(file).map_or("", |info| &info.content_mapper)
 }
 
-// Go: ast/ast.go:2597 (*SourceFile).IsContentMapperFailureStub
+// Go: ast/ast.go:2584 (*SourceFile).IsContentMapperFailureStub
 // IsContentMapperFailureStub reports whether this file is the empty placeholder produced when a content
 // mapper's transform failed.
 #[must_use]
@@ -5855,19 +5869,19 @@ pub fn source_file_is_content_mapper_failure_stub(file: Node) -> bool {
     !source_file_content_mapper(file).is_empty() && source_file_span_map(file).is_none()
 }
 
-// Go: ast/ast.go:2601 (*SourceFile).ContentMapperTransformIdentity
+// Go: ast/ast.go:2588 (*SourceFile).ContentMapperTransformIdentity
 #[must_use]
 pub fn source_file_content_mapper_transform_identity(file: Node) -> &'static str {
     source_file_content_mapper_info(file).map_or("", |info| &info.transform_identity)
 }
 
-// Go: ast/ast.go:2608 (*SourceFile).VirtualFileName
+// Go: ast/ast.go:2595 (*SourceFile).VirtualFileName
 #[must_use]
 pub fn source_file_virtual_file_name(file: Node) -> &'static str {
     source_file_content_mapper_info(file).map_or("", |info| &info.virtual_file_name)
 }
 
-// Go: ast/ast.go:2644 (*SourceFile).ContentMapperParseOptions
+// Go: ast/ast.go:2631 (*SourceFile).ContentMapperParseOptions
 // ContentMapperParseOptions returns the parse options used to acquire this file from the mapped parse cache.
 // PORT: returns a reference; the zero value is `EMPTY_PARSE_OPTIONS`.
 #[must_use]
@@ -5877,7 +5891,7 @@ pub fn source_file_content_mapper_parse_options(
     source_file_content_mapper_info(file).map_or(&EMPTY_PARSE_OPTIONS, |info| &info.parse_options)
 }
 
-// Go: ast/ast.go:2659 (*SourceFile).DiagnosticDirectives
+// Go: ast/ast.go:2646 (*SourceFile).DiagnosticDirectives
 #[must_use]
 pub fn source_file_diagnostic_directives(file: Node) -> &'static [MappedDiagnosticDirective] {
     match source_file_content_mapper_info(file) {
@@ -5886,7 +5900,7 @@ pub fn source_file_diagnostic_directives(file: Node) -> &'static [MappedDiagnost
     }
 }
 
-// Go: ast/ast.go:2667 (*SourceFile).SupplementalSourceFiles
+// Go: ast/ast.go:2654 (*SourceFile).SupplementalSourceFiles
 // SupplementalSourceFiles returns the additional outputs produced from this canonical source file.
 // PORT: the files are their SourceFile nodes. `ParsedSourceFile` has the
 // `Rc` form.
@@ -5898,7 +5912,7 @@ pub fn source_file_supplemental_source_files(file: Node) -> &'static [Node] {
     }
 }
 
-// Go: ast/ast.go:2675 (*SourceFile).CanonicalSourceFile
+// Go: ast/ast.go:2662 (*SourceFile).CanonicalSourceFile
 // CanonicalSourceFile returns the canonical output associated with this supplemental source file.
 // PORT: the file is its SourceFile node, or `Node::NIL`. `ParsedSourceFile`
 // has the `Rc` form.
@@ -5907,14 +5921,14 @@ pub fn source_file_canonical_source_file(file: Node) -> Node {
     source_file_content_mapper_info(file).map_or(Node::NIL, |info| info.canonical_source_file)
 }
 
-// Go: ast/ast.go:2683 (*SourceFile).IsContentMapperSupplemental
+// Go: ast/ast.go:2670 (*SourceFile).IsContentMapperSupplemental
 // IsContentMapperSupplemental reports whether this is an unnamed supplemental mapper output.
 #[must_use]
 pub fn source_file_is_content_mapper_supplemental(file: Node) -> bool {
     source_file_canonical_source_file(file).is_some()
 }
 
-// Go: ast.go:2687 (*SourceFile).HasIdentifier
+// Go: ast.go:2674 (*SourceFile).HasIdentifier
 // PORT: Go `identifiersOnce` is a per-thread cache (`IDENTIFIER_SETS`) for a
 // parsed file, whose id is never reused. A freeable file version keeps its
 // set, which is freed with it (lsshells M3). A factory SourceFile collects
@@ -5940,7 +5954,7 @@ pub fn source_file_has_identifier(file: Node, name: &str) -> bool {
     identifiers.contains(name)
 }
 
-// Go: ast.go:2694 collectIdentifiersForSourceFile
+// Go: ast.go:2681 collectIdentifiersForSourceFile
 fn collect_identifiers_for_source_file(source_file: Node) -> FxHashSet<&'static str> {
     fn collect(node: Node, identifiers: &mut FxHashSet<&'static str>) -> bool {
         match node.kind() {

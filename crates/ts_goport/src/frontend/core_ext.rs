@@ -24,15 +24,22 @@ pub struct ProjectReference {
 
 // Go: core/projectreference.go:5 ProjectReference (JSON v2 struct marshaler)
 // PORT: Go marshals the struct by reflection in field order with the tags
-// `json:"path"`, `json:"originalPath"` and `json:"circular"` (tsgo#4627).
+// `json:"path"`, `json:"originalPath,omitempty"` and
+// `json:"circular,omitempty"` (tsgo#4627, ts#64326). v2 `omitempty` drops an
+// empty string but writes `false`.
 impl MarshalerTo for ProjectReference {
     fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
         enc.push_str("{\"path\":");
         self.path.marshal_json_to(enc)?;
-        enc.push_str(",\"originalPath\":");
-        self.original_path.marshal_json_to(enc)?;
-        enc.push_str(",\"circular\":");
-        self.circular.marshal_json_to(enc)?;
+        // `path` is written, so each later member needs a comma.
+        let mut first = false;
+        crate::options_json::marshal_field_omitempty(
+            enc,
+            &mut first,
+            "originalPath",
+            &self.original_path,
+        )?;
+        crate::options_json::marshal_field_omitempty(enc, &mut first, "circular", &self.circular)?;
         enc.push('}');
         Ok(())
     }

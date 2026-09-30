@@ -14,8 +14,8 @@ use std::borrow::Cow;
 use crate::scanner_util::push_js_string_rune;
 
 use super::scanner_p1::{
-    EscapeSequenceScanningFlags, RUNE_SELF, Scanner, intern_token_value, rune_to_char,
-    rune_to_string, utf8_decode_last_rune_in_string, utf8_decode_rune_in_string,
+    EscapeSequenceScanningFlags, IdentifierVariant, RUNE_SELF, Scanner, intern_token_value,
+    rune_to_char, rune_to_string, utf8_decode_last_rune_in_string, utf8_decode_rune_in_string,
 };
 
 /// Go `strconv.ParseInt(s, base, bitSize)` with the error ignored, as the
@@ -224,25 +224,10 @@ impl<'a> Scanner<'a> {
             // everything after it to the token
             // Do note that this means that `scanJsxIdentifier` effectively _mutates_ the visible token without advancing to a new token
             // Any caller should be expecting this behavior and should only read the pos or token value after calling it.
-            loop {
-                let ch = self.char();
-                if ch < 0 {
-                    break;
-                }
-                if ch == '-' as i32 {
-                    let value = format!("{}-", self.scanner_state.token_value);
-                    self.set_token_value(&value);
-                    self.scanner_state.pos += 1;
-                    continue;
-                }
-                let old_pos = self.scanner_state.pos;
-                let parts = self.scan_identifier_parts(); // reuse `scanIdentifierParts` so unicode escapes are handled
-                let value = format!("{}{}", self.scanner_state.token_value, parts);
-                self.set_token_value(&value);
-                if self.scanner_state.pos == old_pos {
-                    break;
-                }
-            }
+            // Here scanIdentifierParts is reused to ensure Unicode escapes are handled.
+            let parts = self.scan_identifier_parts(IdentifierVariant::JSX);
+            let value = format!("{}{}", self.scanner_state.token_value, parts);
+            self.set_token_value(&value);
             self.scanner_state.token = get_identifier_token(self.scanner_state.token_value);
         }
         self.scanner_state.token
@@ -431,61 +416,33 @@ impl<'a> Scanner<'a> {
                 self.scanner_state.token = SyntaxKind::HashToken;
                 return self.scanner_state.token;
             }
-            '\\' => {
-                self.scanner_state.pos -= 1;
-                let cp = self.peek_unicode_escape();
-                if cp >= 0 && is_identifier_start(rune_to_char(cp)) {
-                    let escaped = self.scan_unicode_escape(true);
-                    let parts = self.scan_identifier_parts();
-                    let value = rune_to_string(escaped) + &parts;
-                    self.set_token_value(&value);
-                    self.scanner_state.token = get_identifier_token(self.scanner_state.token_value);
-                } else {
-                    self.scanner_state.pos += 1;
-                    self.scanner_state.token = SyntaxKind::Unknown;
-                }
-                return self.scanner_state.token;
-            }
             _ => {}
         }
 
-        if is_identifier_start(ch) {
-            // PORT: Go `char` holds the rune (i32 here); `rune_to_char` feeds the predicate.
-            let mut char_ = ch as i32;
-            loop {
-                if self.scanner_state.pos >= self.text.len() as i32 {
-                    break;
-                }
-                let size;
-                (char_, size) = self.char_and_size();
-                if !is_identifier_part(rune_to_char(char_)) && char_ != '-' as i32 {
-                    break;
-                }
-                self.scanner_state.pos += size;
-            }
-            let mut value = self.text
-                [self.scanner_state.token_start as usize..self.scanner_state.pos as usize]
-                .to_string();
-            if char_ == '\\' as i32 {
-                let parts = self.scan_identifier_parts();
-                value.push_str(&parts);
-            }
-            self.set_token_value(&value);
+        self.scanner_state.pos = self.scanner_state.token_start;
+        if self.scan_identifier(0, IdentifierVariant::JSX) {
             self.scanner_state.token = get_identifier_token(self.scanner_state.token_value);
-            self.scanner_state.token
-        } else {
-            self.scanner_state.token = SyntaxKind::Unknown;
-            self.scanner_state.token
+            return self.scanner_state.token;
         }
+        self.scanner_state.pos = self.scanner_state.token_start + size;
+        self.scanner_state.token = SyntaxKind::Unknown;
+        self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:1539 scanIdentifier
-    pub(crate) fn scan_identifier(&mut self, prefix_length: i32) -> bool {
+    // Go: scanner/scanner.go:1484 scanIdentifier
+    pub(crate) fn scan_identifier(
+        &mut self,
+        prefix_length: i32,
+        variant: IdentifierVariant,
+    ) -> bool {
         let start = self.scanner_state.pos;
         self.scanner_state.pos += prefix_length;
+        let identifier_start = self.scanner_state.pos;
         let ch = self.char();
         // Fast path for simple ASCII identifiers
-        if is_ascii_letter(rune_to_char(ch)) || ch == '_' as i32 || ch == '$' as i32 {
+        if variant != IdentifierVariant::JSX
+            && (is_ascii_letter(rune_to_char(ch)) || ch == '_' as i32 || ch == '$' as i32)
+        {
             self.scanner_state.pos += 1;
             let rest = &self.text.as_bytes()[self.scanner_state.pos as usize..self.end as usize];
             let len = rest
@@ -499,44 +456,67 @@ impl<'a> Scanner<'a> {
                     self.text_token_value(start as usize, self.scanner_state.pos as usize);
                 return true;
             }
-            self.scanner_state.pos = start + prefix_length;
+            self.scanner_state.pos = identifier_start;
         }
         let (mut ch, mut size) = self.char_and_size();
         if is_identifier_start(rune_to_char(ch)) {
+            let mut language_variant = LanguageVariant::STANDARD;
+            if variant == IdentifierVariant::JSX {
+                language_variant = LanguageVariant::JSX;
+            }
             loop {
                 self.scanner_state.pos += size;
                 (ch, size) = self.char_and_size();
-                if !is_identifier_part(rune_to_char(ch)) {
+                if !is_identifier_part_ex(rune_to_char(ch), language_variant) {
                     break;
                 }
             }
             let mut value = self.text[start as usize..self.scanner_state.pos as usize].to_string();
             if ch == '\\' as i32 {
-                let parts = self.scan_identifier_parts();
+                let parts = self.scan_identifier_parts(variant);
                 value.push_str(&parts);
             }
+            self.set_token_value(&value);
+            return true;
+        }
+        if ch == '\\' as i32
+            && let Some(escaped) = self.scan_identifier_escape(
+                |ch| is_identifier_start(rune_to_char(ch)),
+                variant == IdentifierVariant::REG_EXP_GROUP_NAME,
+            )
+        {
+            let mut value = self.text[start as usize..identifier_start as usize].to_string();
+            value.push_str(&rune_to_string(escaped));
+            let parts = self.scan_identifier_parts(variant);
+            value.push_str(&parts);
             self.set_token_value(&value);
             return true;
         }
         false
     }
 
-    // Go: scanner/scanner.go:1574 scanIdentifierParts
-    pub(crate) fn scan_identifier_parts(&mut self) -> String {
+    // Go: scanner/scanner.go:1530 scanIdentifierParts
+    pub(crate) fn scan_identifier_parts(&mut self, variant: IdentifierVariant) -> String {
         let mut sb = String::new();
         let mut start = self.scanner_state.pos;
+        let mut language_variant = LanguageVariant::STANDARD;
+        if variant == IdentifierVariant::JSX {
+            language_variant = LanguageVariant::JSX;
+        }
         loop {
             let (ch, size) = self.char_and_size();
-            if is_identifier_part(rune_to_char(ch)) {
+            if is_identifier_part_ex(rune_to_char(ch), language_variant) {
                 self.scanner_state.pos += size;
                 continue;
             }
             if ch == '\\' as i32 {
-                let escaped = self.peek_unicode_escape();
-                if escaped >= 0 && is_identifier_part(rune_to_char(escaped)) {
-                    sb.push_str(&self.text[start as usize..self.scanner_state.pos as usize]);
-                    let r = self.scan_unicode_escape(true);
-                    sb.push_str(&rune_to_string(r));
+                let escape_start = self.scanner_state.pos;
+                if let Some(escaped) = self.scan_identifier_escape(
+                    |ch| is_identifier_part_ex(rune_to_char(ch), language_variant),
+                    variant == IdentifierVariant::REG_EXP_GROUP_NAME,
+                ) {
+                    sb.push_str(&self.text[start as usize..escape_start as usize]);
+                    sb.push_str(&rune_to_string(escaped));
                     start = self.scanner_state.pos;
                     continue;
                 }
@@ -545,6 +525,41 @@ impl<'a> Scanner<'a> {
         }
         sb.push_str(&self.text[start as usize..self.scanner_state.pos as usize]);
         sb
+    }
+
+    // Go: scanner/scanner.go:1560 scanIdentifierEscape (ts#63996)
+    // PORT: `(rune, bool)` returns `Option<i32>`.
+    fn scan_identifier_escape(
+        &mut self,
+        is_valid: impl Fn(i32) -> bool,
+        allow_surrogate_pair_escape: bool,
+    ) -> Option<i32> {
+        let escaped = self.peek_unicode_escape();
+        if escaped >= 0 && is_valid(escaped) {
+            return Some(self.scan_unicode_escape(true));
+        }
+        if allow_surrogate_pair_escape
+            && self.char_at(2) != '{' as i32
+            && is_high_surrogate(escaped as u32)
+        {
+            // Unlike normal identifiers, group names in regular expressions, whether in Unicode mode or not,
+            // accept \u HexLeadSurrogate \u HexTrailSurrogate as part of RegExpIdentifierName.
+            // See https://github.com/tc39/ecma262/pull/1869 for the change.
+            let saved_pos = self.scanner_state.pos;
+            let saved_token_flags = self.scanner_state.token_flags;
+            self.scan_unicode_escape(false);
+            // scanLowSurrogateEscape also accepts the braced form used in string literals,
+            // but RegExpIdentifierName does not allow it.
+            if self.char_at(2) != '{' as i32
+                && let Some(code_point) = self.scan_low_surrogate_escape(escaped)
+                && is_valid(code_point)
+            {
+                return Some(code_point);
+            }
+            self.scanner_state.pos = saved_pos;
+            self.scanner_state.token_flags = saved_token_flags;
+        }
+        None
     }
 
     // Go: scanner/scanner.go:1598 scanString
@@ -1180,7 +1195,7 @@ impl<'a> Scanner<'a> {
         let (ch, _) = self.char_and_size();
         if is_identifier_start(rune_to_char(ch)) {
             let id_start = self.scanner_state.pos;
-            let id = self.scan_identifier_parts();
+            let id = self.scan_identifier_parts(IdentifierVariant::STANDARD);
             if result != SyntaxKind::BigIntLiteral
                 && id.len() == 1
                 && self.text.as_bytes()[id_start as usize] == b'n'

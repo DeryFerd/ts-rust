@@ -74,13 +74,19 @@ pub fn create_diagnostic_reporter(
     })
 }
 
-// Go: execute/tsc/diagnostics.go:46 defaultIsPretty
+// Go: execute/tsc/diagnostics.go:46 defaultIsPretty (ts#63941)
 fn default_is_pretty(sys: &dyn System) -> bool {
-    if !sys.get_environment_variable("NO_COLOR").is_empty() {
+    let (force_color, ok) = sys.get_environment_variable("FORCE_COLOR");
+    if ok {
+        return matches!(force_color.as_str(), "" | "1" | "2" | "3" | "true");
+    }
+    let (no_color, _) = sys.get_environment_variable("NO_COLOR");
+    if !no_color.is_empty() {
         return false;
     }
-    if !sys.get_environment_variable("FORCE_COLOR").is_empty() {
-        return true;
+    let (term, _) = sys.get_environment_variable("TERM");
+    if term == "dumb" {
+        return false;
     }
     sys.write_output_is_tty()
 }
@@ -104,7 +110,7 @@ pub struct Colors {
     supports_richer_colors: bool,
 }
 
-// Go: execute/tsc/diagnostics.go:72 createColors
+// Go: execute/tsc/diagnostics.go:80 createColors (ts#63941)
 pub fn create_colors(sys: &dyn System) -> Colors {
     if !default_is_pretty(sys) {
         return Colors {
@@ -113,19 +119,19 @@ pub fn create_colors(sys: &dyn System) -> Colors {
         };
     }
 
-    let os = sys.get_environment_variable("OS");
+    let (os, _) = sys.get_environment_variable("OS");
     let is_windows = os.to_lowercase().contains("windows");
-    let is_windows_terminal = !sys.get_environment_variable("WT_SESSION").is_empty();
-    let is_vs_code = sys.get_environment_variable("TERM_PROGRAM") == "vscode";
-    let supports_richer_colors = sys.get_environment_variable("COLORTERM") == "truecolor"
-        || sys.get_environment_variable("TERM") == "xterm-256color";
+    let (wt_session, _) = sys.get_environment_variable("WT_SESSION");
+    let (term_program, _) = sys.get_environment_variable("TERM_PROGRAM");
+    let (color_term, _) = sys.get_environment_variable("COLORTERM");
+    let (term, _) = sys.get_environment_variable("TERM");
 
     Colors {
         show_colors: true,
         is_windows,
-        is_windows_terminal,
-        is_vs_code,
-        supports_richer_colors,
+        is_windows_terminal: !wt_session.is_empty(),
+        is_vs_code: term_program == "vscode",
+        supports_richer_colors: color_term == "truecolor" || term == "xterm-256color",
     }
 }
 
@@ -427,15 +433,16 @@ fn read_file(name: &[u8]) -> Option<Vec<u8>> {
 // Go: diagnosticwriter/diagnosticwriter.go:21 FileLike
 /// Go `diagnosticwriter.FileLike`: the file whose text a diagnostic is shown
 /// against.
-// PORT: the Go interface has two implementations here: the
-// `*ast.SourceFile` (a source file node) and the `originalTextFile` of a
-// content-mapped file (tsgo#4712). Go compares the interface values as
-// pointers, so two values are equal when they are the same node or the same
-// `Rc`.
+// PORT: the Go interface has three implementations here: the
+// `*ast.SourceFile` (a source file node), the `originalTextFile` of a
+// content-mapped file (tsgo#4712) and the `renamedFile` of a supplemental
+// file (ts#63936). Go compares the interface values as pointers, so two
+// values are equal when they are the same node or the same `Rc`.
 #[derive(Clone)]
 pub enum FileLike {
     Source(Node),
     Original(Rc<OriginalTextFile>),
+    Renamed(Rc<RenamedFile>),
 }
 
 impl FileLike {
@@ -445,6 +452,7 @@ impl FileLike {
         match self {
             FileLike::Source(file) => source_file_file_name(*file),
             FileLike::Original(file) => file.file_name,
+            FileLike::Renamed(file) => file.file_name,
         }
     }
 
@@ -454,6 +462,7 @@ impl FileLike {
         match self {
             FileLike::Source(file) => source_file_text(*file),
             FileLike::Original(file) => file.text.clone(),
+            FileLike::Renamed(file) => source_file_text(file.file),
         }
     }
 
@@ -463,6 +472,7 @@ impl FileLike {
         match self {
             FileLike::Source(file) => LineMapRef::File(get_ecma_line_starts(*file)),
             FileLike::Original(file) => LineMapRef::Original(&file.line_map),
+            FileLike::Renamed(file) => LineMapRef::File(get_ecma_line_starts(file.file)),
         }
     }
 }
@@ -496,6 +506,7 @@ impl PartialEq for FileLike {
         match (self, other) {
             (FileLike::Source(a), FileLike::Source(b)) => a == b,
             (FileLike::Original(a), FileLike::Original(b)) => Rc::ptr_eq(a, b),
+            (FileLike::Renamed(a), FileLike::Renamed(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -508,6 +519,7 @@ impl Hash for FileLike {
         match self {
             FileLike::Source(file) => file.hash(state),
             FileLike::Original(file) => Rc::as_ptr(file).hash(state),
+            FileLike::Renamed(file) => Rc::as_ptr(file).hash(state),
         }
     }
 }
@@ -515,42 +527,56 @@ impl Hash for FileLike {
 // Go: diagnosticwriter/diagnosticwriter.go:44 ASTDiagnostic
 // ASTDiagnostic wraps ast.Diagnostic to implement the Diagnostic interface
 // PORT: Go reads `Code`, `Category` and `Localize` through the embedded
-// `*ast.Diagnostic`; the port reads them from `.0`.
+// `*ast.Diagnostic`; the port reads them from `.0`. The api lane calls it
+// (ts#63935 `NewDiagnosticResponse`).
 #[derive(Clone, Copy)]
-struct AstDiagnostic<'a>(&'a Diagnostic);
+pub struct AstDiagnostic<'a>(pub &'a Diagnostic);
 
 impl<'a> AstDiagnostic<'a> {
     // Go: diagnosticwriter/diagnosticwriter.go:48 (*ASTDiagnostic).RelatedInformation
-    fn related_information(self) -> impl Iterator<Item = AstDiagnostic<'a>> {
+    pub fn related_information(self) -> impl Iterator<Item = AstDiagnostic<'a>> {
         self.0.related_information.iter().map(AstDiagnostic)
     }
 
-    // Go: diagnosticwriter/diagnosticwriter.go:57 (*ASTDiagnostic).File (tsgo#4712)
-    fn file(self) -> Option<FileLike> {
+    // Go: diagnosticwriter/diagnosticwriter.go:57 (*ASTDiagnostic).File (tsgo#4712, ts#63936)
+    pub fn file(self) -> Option<FileLike> {
         let file = self.0.file;
         if file.is_nil() {
             return None;
+        }
+        let mut file_name = source_file_file_name(file);
+        let canonical = source_file_canonical_source_file(file);
+        if canonical.is_some() {
+            file_name = source_file_file_name(canonical);
         }
         if self.resolve().use_original {
             // The mapper's own diagnostics (Source != "") already carry original ranges; compiler
             // diagnostics have their transformed ranges mapped back. Both render against the original,
             // untransformed text. Diagnostics in synthesized code (see resolve) keep the virtual text.
-            return Some(FileLike::Original(new_original_text_file(file)));
+            return Some(FileLike::Original(new_original_text_file(file, file_name)));
+        }
+        if file_name != source_file_file_name(file) {
+            return Some(FileLike::Renamed(Rc::new(RenamedFile { file, file_name })));
         }
         Some(FileLike::Source(file))
     }
 
     // Go: diagnosticwriter/diagnosticwriter.go:71 (*ASTDiagnostic).Source (tsgo#4712)
-    fn source(self) -> &'a str {
+    pub fn source(self) -> &'a str {
         self.0.source()
     }
 
-    // Go: diagnosticwriter/diagnosticwriter.go:75 (*ASTDiagnostic).Pos (tsgo#4712)
-    fn pos(self) -> i32 {
+    // Go: diagnosticwriter/diagnosticwriter.go:82 (*ASTDiagnostic).Pos (tsgo#4712)
+    pub fn pos(self) -> i32 {
         self.resolve().loc.pos()
     }
 
-    // Go: diagnosticwriter/diagnosticwriter.go:77 (*ASTDiagnostic).Len (tsgo#4712)
+    // Go: diagnosticwriter/diagnosticwriter.go:83 (*ASTDiagnostic).End (ts#63935)
+    pub fn end(self) -> i32 {
+        self.resolve().loc.end()
+    }
+
+    // Go: diagnosticwriter/diagnosticwriter.go:84 (*ASTDiagnostic).Len (tsgo#4712)
     fn len(self) -> i32 {
         self.resolve().loc.len()
     }
@@ -599,7 +625,7 @@ impl<'a> AstDiagnostic<'a> {
 
     // Go: diagnosticwriter/diagnosticwriter.go:130 (*ASTDiagnostic).MessageChain (tsgo#4712)
     // PORT: the chain entries are borrowed; the note is a new diagnostic.
-    fn message_chain(self) -> Vec<Cow<'a, Diagnostic>> {
+    pub fn message_chain(self) -> Vec<Cow<'a, Diagnostic>> {
         let mut result: Vec<Cow<'a, Diagnostic>> =
             self.0.message_chain.iter().map(Cow::Borrowed).collect();
         if self.resolve().synthesized {
@@ -613,6 +639,11 @@ impl<'a> AstDiagnostic<'a> {
         }
         result
     }
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:164 WrapASTDiagnostic (ts#63935)
+pub fn wrap_ast_diagnostic(d: &Diagnostic) -> AstDiagnostic<'_> {
+    AstDiagnostic(d)
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:80 resolvedLocation (tsgo#4712)
@@ -634,14 +665,22 @@ pub struct OriginalTextFile {
     line_map: Vec<i32>,
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:117 newOriginalTextFile (tsgo#4712)
-fn new_original_text_file(file: Node) -> Rc<OriginalTextFile> {
+// Go: diagnosticwriter/diagnosticwriter.go:124 newOriginalTextFile (tsgo#4712, ts#63936)
+fn new_original_text_file(file: Node, file_name: &'static str) -> Rc<OriginalTextFile> {
     let text = source_file_original_text(file);
     Rc::new(OriginalTextFile {
-        file_name: source_file_file_name(file),
+        file_name,
         line_map: compute_ecma_line_starts(&text),
         text,
     })
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:137 renamedFile (ts#63936)
+/// Go `renamedFile`: a source file shown under another name (the name of
+/// its canonical source file); its text and line map are the file's own.
+pub struct RenamedFile {
+    file: Node,
+    file_name: &'static str,
 }
 
 // Go: scanner/scanner.go:2677 GetECMALineOfPosition
@@ -655,7 +694,7 @@ fn get_ecma_line_of_file_position(file: &FileLike, pos: i32) -> i32 {
 // PORT: Go takes an `ast.SourceFileLike`. This is the code of the Rust
 // scanner function (which takes a file node) on a `FileLike`. See that
 // function for a `pos` inside a char.
-fn get_ecma_line_and_utf16_character_of_file_position(file: &FileLike, pos: i32) -> (i32, i32) {
+pub fn get_ecma_line_and_utf16_character_of_file_position(file: &FileLike, pos: i32) -> (i32, i32) {
     let line_map = file.ecma_line_map();
     let line = compute_line_of_position(&line_map, pos);
     let text = file.text();

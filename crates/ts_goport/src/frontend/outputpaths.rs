@@ -112,7 +112,8 @@ pub fn get_output_paths_for_file(
         ) == 0;
     let mut paths = OutputPaths::default();
     // #4699: `force.js`, `force.dts` and `force.declaration_map` (Go `ForceEmitPaths`).
-    // #4712: a content-mapped file gets no JS output and no declaration map.
+    // #4712: a content-mapped file gets no JS output. ts#63936: it keeps its
+    // declaration map.
     if content_mapper.is_empty()
         && (force.js || options.emit_declaration_only != Tristate::True)
         && !is_json_emitted_to_same_location
@@ -125,9 +126,8 @@ pub fn get_output_paths_for_file(
     if force.dts || options.get_emit_declarations() && !is_json_file {
         paths.declaration_file_path =
             get_declaration_emit_output_file_path(file_name, options, host);
-        if content_mapper.is_empty()
-            && (options.get_are_declaration_maps_enabled()
-                || force.declaration_map && options.declaration_map.is_true())
+        if options.get_are_declaration_maps_enabled()
+            || force.declaration_map && options.declaration_map.is_true()
         {
             paths.declaration_map_path = format!("{}.map", paths.declaration_file_path);
         }

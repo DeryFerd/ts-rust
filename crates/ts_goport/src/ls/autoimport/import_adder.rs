@@ -145,7 +145,6 @@ impl ImportAdder for ImportAdderImpl {
         let fix = self.get_import_fix_for_symbol(
             type_checker,
             &view,
-            view.importing_file,
             &export_infos,
             is_valid_type_only_use_site,
         );
@@ -722,13 +721,12 @@ fn replace_first_identifier_of_entity_name(
 
 impl ImportAdderImpl {
     // Go: ls/autoimport/import_adder.go:490 getImportFixForSymbol
-    // PORT: `ch` is the Go `adder.checker` that `View.GetFixes` reaches
-    // (pinned decision). Go does not read `file`.
+    // PORT: `ch` is the Go `adder.checker` (Go `view.checker`, the same
+    // checker) that `View.GetFixes` reads (pinned decision).
     pub fn get_import_fix_for_symbol(
         &self,
         ch: &mut Checker,
         view: &View,
-        _file: Node,
         exports: &[Rc<Export>],
         is_valid_type_only_use_site: bool,
     ) -> Option<Rc<Fix>> {
@@ -736,7 +734,6 @@ impl ImportAdderImpl {
         let mut fixes: Vec<Rc<Fix>> = Vec::new();
         for export in exports {
             fixes.extend(view.get_fixes(
-                &self.ctx,
                 ch,
                 export,
                 false, /*forJSX*/
