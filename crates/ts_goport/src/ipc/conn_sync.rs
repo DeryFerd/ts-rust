@@ -80,7 +80,8 @@ impl SyncConn {
             };
 
             if msg.is_request() {
-                self.handle_request(ctx, msg);
+                // ts#64142
+                self.handle_request(ctx, msg)?;
             } else if msg.is_notification() {
                 self.handle_notification(ctx, msg);
             } else {
@@ -97,7 +98,8 @@ impl SyncConn {
     // PORT: Go recovers panics in a deferred function; `catch_unwind` covers
     // the same body (the handler call and the response write). Go
     // `debug.Stack()` is the backtrace at the recover point.
-    fn handle_request(&self, ctx: &Context, msg: Message) {
+    // ts#64142: write failures are returned, not panics.
+    fn handle_request(&self, ctx: &Context, msg: Message) -> Result<(), GoError> {
         // Intercept the meta-requests for collected server timing before dispatching
         // to the handler, so they are answered directly and not themselves recorded.
         if msg.method == METHOD_GET_SERVER_TIMING {
@@ -107,12 +109,15 @@ impl SyncConn {
                 .borrow_mut()
                 .write_response(msg.id.as_ref(), Some(Box::new(snapshot)));
             if let Err(write_err) = write_err {
-                panic!(
-                    "ipc: failed to write server timing response: {}",
-                    write_err.error()
-                );
+                return Err(errors::errorf(
+                    format!(
+                        "ipc: failed to write server timing response: {}",
+                        write_err.error()
+                    ),
+                    vec![write_err],
+                ));
             }
-            return;
+            return Ok(());
         }
         if msg.method == METHOD_RESET_SERVER_TIMING {
             if let Some(timing) = self.timing.borrow_mut().as_mut() {
@@ -123,12 +128,15 @@ impl SyncConn {
                 .borrow_mut()
                 .write_response(msg.id.as_ref(), None);
             if let Err(write_err) = write_err {
-                panic!(
-                    "ipc: failed to write reset server timing response: {}",
-                    write_err.error()
-                );
+                return Err(errors::errorf(
+                    format!(
+                        "ipc: failed to write reset server timing response: {}",
+                        write_err.error()
+                    ),
+                    vec![write_err],
+                ));
             }
-            return;
+            return Ok(());
         }
 
         let id = msg.id.clone();
@@ -136,7 +144,7 @@ impl SyncConn {
         let start = Instant::now();
 
         // Recover from panics and convert to error response with stack trace
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), GoError> {
             let (result, err) = match self.handler.handle_request(ctx, &msg.method, msg.params) {
                 Ok(result) => (result, None),
                 Err(err) => (None, Some(err)),
@@ -162,11 +170,19 @@ impl SyncConn {
             };
 
             if let Err(write_err) = write_err {
-                panic!("ipc: failed to write response: {}", write_err.error());
+                return Err(errors::errorf(
+                    format!("ipc: failed to write response: {}", write_err.error()),
+                    vec![write_err],
+                ));
             }
+            Ok(())
         }));
 
-        if let Err(r) = outcome {
+        let r = match outcome {
+            Ok(result) => return result,
+            Err(r) => r,
+        };
+        {
             let r = recovered_value(r.as_ref());
             let stack = std::backtrace::Backtrace::force_capture().to_string();
             let err = errors::new(format!("panic: {r}\n{stack}"));
@@ -181,12 +197,16 @@ impl SyncConn {
             );
 
             if let Err(write_err) = write_err {
-                panic!(
-                    "ipc: failed to write panic error response: {} (original panic: {r})",
-                    write_err.error()
-                );
+                return Err(errors::errorf(
+                    format!(
+                        "ipc: failed to write panic error response: {} (original panic: {r})",
+                        write_err.error()
+                    ),
+                    vec![write_err],
+                ));
             }
         }
+        Ok(())
     }
 
     // Go: ipc/conn_sync.go:161 handleNotification
