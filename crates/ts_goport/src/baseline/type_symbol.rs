@@ -273,7 +273,7 @@ impl TypeWriterWalker {
                 self.panic_count += 1;
                 let file = self.current_source_file;
                 let (line, source_text) = catch_unwind(AssertUnwindSafe(|| {
-                    let actual_pos = skip_trivia(source_file_text(file), node.pos());
+                    let actual_pos = skip_trivia(&source_file_text(file), node.pos());
                     (
                         get_ecma_line_of_position(file, actual_pos),
                         get_source_text_of_node_from_source_file(file, node, false),
@@ -299,7 +299,7 @@ impl TypeWriterWalker {
         is_symbol_walk: bool,
     ) -> Option<TypeWriterResult> {
         let current_source_file = self.current_source_file;
-        let actual_pos = skip_trivia(source_file_text(current_source_file), node.pos());
+        let actual_pos = skip_trivia(&source_file_text(current_source_file), node.pos());
         let line = get_ecma_line_of_position(current_source_file, actual_pos);
         let source_text = get_source_text_of_node_from_source_file(
             current_source_file,

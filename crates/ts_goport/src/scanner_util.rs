@@ -1174,13 +1174,15 @@ pub fn get_shebang(text: &str) -> String {
 
 // Go: scanner/scanner.go:2529 ScanTokenAtPosition
 pub fn scan_token_at_position(source_file: Node, pos: i32) -> SyntaxKind {
-    let s = get_scanner_for_source_file(source_file, pos);
+    let sf_text = source_file_text(source_file);
+    let s = get_scanner_for_source_file(source_file, &sf_text, pos);
     s.token()
 }
 
 // Go: scanner/scanner.go:2534 GetRangeOfTokenAtPosition
 pub fn get_range_of_token_at_position(source_file: Node, pos: i32) -> TextRange {
-    let s = get_scanner_for_source_file(source_file, pos);
+    let sf_text = source_file_text(source_file);
+    let s = get_scanner_for_source_file(source_file, &sf_text, pos);
     TextRange::new(s.token_start(), s.token_end())
 }
 
@@ -1194,7 +1196,7 @@ pub fn get_token_pos_of_node(node: Node, source_file: Node, include_js_doc: bool
     if is_js_doc_node(node) || node.kind() == SyntaxKind::JsxText {
         // JsxText cannot actually contain comments, even though the scanner will think it sees comments
         return skip_trivia_ex(
-            source_file_text(source_file),
+            &source_file_text(source_file),
             node.pos(),
             Some(&SkipTriviaOptions {
                 stop_at_comments: true,
@@ -1210,7 +1212,7 @@ pub fn get_token_pos_of_node(node: Node, source_file: Node, include_js_doc: bool
         );
     }
     skip_trivia_ex(
-        source_file_text(source_file),
+        &source_file_text(source_file),
         node.pos(),
         Some(&SkipTriviaOptions {
             in_js_doc: node.flags().intersects(NodeFlags::JS_DOC),
@@ -1221,7 +1223,7 @@ pub fn get_token_pos_of_node(node: Node, source_file: Node, include_js_doc: bool
 
 // Go: scanner/scanner.go:2555 getErrorRangeForArrowFunction
 fn get_error_range_for_arrow_function(source_file: Node, node: Node) -> TextRange {
-    let pos = skip_trivia(source_file_text(source_file), node.pos());
+    let pos = skip_trivia(&source_file_text(source_file), node.pos());
     let body = node.body();
     if body.is_some() && body.kind() == SyntaxKind::Block {
         let start_line = get_ecma_line_of_position(source_file, body.pos());
@@ -1284,7 +1286,7 @@ pub fn get_error_range_for_node(source_file: Node, node: Node) -> TextRange {
     let mut use_declaration_name = false;
     match node.kind() {
         SyntaxKind::SourceFile => {
-            let pos = skip_trivia(source_file_text(source_file), 0);
+            let pos = skip_trivia(&source_file_text(source_file), 0);
             if pos as usize == source_file_text(source_file).len() {
                 return TextRange::new(0, 0);
             }
@@ -1322,7 +1324,7 @@ pub fn get_error_range_for_node(source_file: Node, node: Node) -> TextRange {
             return get_error_range_for_arrow_function(source_file, node);
         }
         SyntaxKind::CaseClause | SyntaxKind::DefaultClause => {
-            let start = skip_trivia(source_file_text(source_file), node.pos());
+            let start = skip_trivia(&source_file_text(source_file), node.pos());
             let mut end = node.end();
             let statements = node.statements();
             if !statements.is_empty() {
@@ -1331,26 +1333,27 @@ pub fn get_error_range_for_node(source_file: Node, node: Node) -> TextRange {
             return TextRange::new(start, end);
         }
         SyntaxKind::ReturnStatement | SyntaxKind::YieldExpression => {
-            let pos = skip_trivia(source_file_text(source_file), node.pos());
+            let pos = skip_trivia(&source_file_text(source_file), node.pos());
             return get_range_of_token_at_position(source_file, pos);
         }
         SyntaxKind::SatisfiesExpression => {
             let js_doc_satisfies_tag = find_originating_js_doc_satisfies_tag(source_file, node);
             if js_doc_satisfies_tag.is_some() {
                 let pos = skip_trivia(
-                    source_file_text(source_file),
+                    &source_file_text(source_file),
                     js_doc_satisfies_tag.tag_name().pos(),
                 );
                 return get_range_of_token_at_position(source_file, pos);
             }
-            let pos = skip_trivia(source_file_text(source_file), node.expression().end());
+            let pos = skip_trivia(&source_file_text(source_file), node.expression().end());
             return get_range_of_token_at_position(source_file, pos);
         }
         SyntaxKind::Constructor => {
             if node.flags().intersects(NodeFlags::REPARSED) {
                 error_node = node;
             } else {
-                let mut scanner = get_scanner_for_source_file(source_file, node.pos());
+                let sf_text = source_file_text(source_file);
+                let mut scanner = get_scanner_for_source_file(source_file, &sf_text, node.pos());
                 let start = scanner.token_start();
                 while scanner.token() != SyntaxKind::ConstructorKeyword
                     && scanner.token() != SyntaxKind::StringLiteral
@@ -1373,7 +1376,7 @@ pub fn get_error_range_for_node(source_file: Node, node: Node) -> TextRange {
     }
     let mut pos = error_node.pos();
     if !node_is_missing(error_node) && !is_jsx_text(error_node) {
-        pos = skip_trivia(source_file_text(source_file), pos);
+        pos = skip_trivia(&source_file_text(source_file), pos);
     }
     TextRange::new(pos, error_node.end())
 }
@@ -1420,7 +1423,7 @@ pub fn get_ecma_line_starts(source_file: Node) -> FileRef<[i32]> {
             return FileRef::Static(line_map);
         }
         let line_map: &'static [i32] =
-            Vec::leak(compute_ecma_line_starts(source_file_text(source_file)));
+            Vec::leak(compute_ecma_line_starts(&source_file_text(source_file)));
         SYNTHETIC_ECMA_LINE_MAPS.with(|maps| maps.borrow_mut().insert(source_file, line_map));
         return FileRef::Static(line_map);
     }
@@ -1432,7 +1435,7 @@ pub fn get_ecma_line_starts(source_file: Node) -> FileRef<[i32]> {
         return FileRef::Static(line_map);
     }
     let line_map: &'static [i32] =
-        Vec::leak(compute_ecma_line_starts(source_file_text(source_file)));
+        Vec::leak(compute_ecma_line_starts(&source_file_text(source_file)));
     ECMA_LINE_MAPS.with(|maps| maps.borrow_mut().insert(file_index, line_map));
     FileRef::Static(line_map)
 }
@@ -1502,7 +1505,7 @@ pub fn get_ecma_end_line_position(source_file: Node, line: i32) -> i32 {
     let text = source_file_text(source_file);
     let mut pos = get_ecma_line_starts(source_file)[line as usize] as usize;
     loop {
-        let (ch, size) = decode_rune_at(text, pos);
+        let (ch, size) = decode_rune_at(&text, pos);
         if size == 0 || is_line_break(ch) {
             return pos as i32 - 1;
         }
@@ -1549,7 +1552,7 @@ pub fn get_source_text_of_node_from_source_file(
     node: Node,
     include_trivia: bool,
 ) -> String {
-    get_text_of_node_from_source_text(source_file_text(source_file), node, include_trivia)
+    get_text_of_node_from_source_text(&source_file_text(source_file), node, include_trivia)
 }
 
 // Go: scanner/utilities.go:26 isJSDocTypeExpressionOrChild

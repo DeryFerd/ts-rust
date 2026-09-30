@@ -127,10 +127,12 @@ impl ProjectReferenceCopies {
     }
 }
 
-/// What `parse_js_doc_for_node` needs from a parsed file.
+/// What `parse_js_doc_for_node` needs from a parsed file. It shares the
+/// file text (`FileText`), so it keeps the text of a freeable file version
+/// while it lives.
 struct LazyJsDocInput {
     parse_options: SourceFileParseOptions,
-    text: &'static str,
+    text: FileText,
     script_kind: ScriptKind,
 }
 
@@ -340,7 +342,7 @@ fn parse_lazy_js_doc(input: &LazyJsDocInput, node: Node) -> &'static [Node] {
     let jsdocs: &'static [Node] = Box::leak(
         crate::frontend::parser::parse_js_doc_for_node(
             &input.parse_options,
-            input.text,
+            &input.text,
             input.script_kind,
             node,
         )
@@ -371,7 +373,7 @@ pub(super) fn resolve_js_doc_outside_program(file: Node, node: Node) -> Option<&
                     .filter(|parsed| parsed.store == store)?;
                 Some(Arc::new(LazyJsDocInput {
                     parse_options: parsed.parse_options.clone(),
-                    text: parsed.text,
+                    text: parsed.text.clone(),
                     script_kind: parsed.script_kind,
                 }))
             })
@@ -411,7 +413,7 @@ fn go_files_of_unpublished_stores(
         {
             let input = Arc::new(LazyJsDocInput {
                 parse_options: file.parse_options.clone(),
-                text: file.text,
+                text: file.text.clone(),
                 script_kind: file.script_kind,
             });
             OUTSIDE_PARSE_INPUTS.with(|inputs| inputs.borrow_mut().insert(store, input));
@@ -993,7 +995,7 @@ impl GoSharedState {
                     || {
                         Arc::new(LazyJsDocInput {
                             parse_options: file.parse_options.clone(),
-                            text: file.text,
+                            text: file.text.clone(),
                             script_kind: file.script_kind,
                         })
                     },

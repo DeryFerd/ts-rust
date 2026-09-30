@@ -149,7 +149,7 @@ fn set_function_full_signature(f: &NodeFactory, fun: Node, t: Node) {
     );
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: parser/reparser.go:13 finishReparsedNode
     fn finish_reparsed_node(&mut self, node: Node, location_node: Node) {
         set_node_flags(node, self.context_flags | NodeFlags::REPARSED);

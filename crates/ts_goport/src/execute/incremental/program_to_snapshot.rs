@@ -351,7 +351,13 @@ fn start_text_hashes(files: &[Node], hash_with_text: bool) -> std::sync::mpsc::R
             // content-mapped file's version text is its original text and
             // its transform identity.
             if source_file_content_mapper(file).is_empty() {
-                std::borrow::Cow::Borrowed(source_file_text(file))
+                // A freeable file version's text is not `'static`
+                // (`FileText`), so it is copied.
+                let text = source_file_text(file);
+                match text.as_static() {
+                    Some(text) => std::borrow::Cow::Borrowed(text),
+                    None => std::borrow::Cow::Owned(text.to_string()),
+                }
             } else {
                 std::borrow::Cow::Owned(format!(
                     "{}\x00{}",

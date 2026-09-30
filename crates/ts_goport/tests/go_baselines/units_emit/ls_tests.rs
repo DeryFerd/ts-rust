@@ -20,8 +20,8 @@ use ts_goport::frontend::tspath::Path;
 use ts_goport::gostd::context;
 use ts_goport::ls::is_in_comment;
 use ts_goport::ls::lsconv::{
-    Converters, Script, compute_lsp_line_starts, file_name_to_document_uri, from_lsp_position,
-    new_converters,
+    Converters, Script, ScriptText, compute_lsp_line_starts, file_name_to_document_uri,
+    from_lsp_position, new_converters,
 };
 use ts_goport::ls::lsutil::{
     self, EditorSettings, FormatCodeSettings, IncludeInlayParameterNameHints, IndentStyle,
@@ -280,8 +280,8 @@ impl Script for TestScript {
     fn file_name(&self) -> &str {
         &self.name
     }
-    fn text(&self) -> &str {
-        &self.text
+    fn text(&self) -> ScriptText<'_> {
+        ScriptText::Borrowed(&self.text)
     }
 }
 

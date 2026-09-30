@@ -66,7 +66,7 @@ pub fn reg_exp_flag_to_first_available_language_version(
     }
 }
 
-impl Scanner {
+impl<'a> Scanner<'a> {
     // Go: scanner/regexp.go:50 checkRegularExpressionFlagAvailability
     pub fn check_regular_expression_flag_availability(
         &mut self,
@@ -111,8 +111,8 @@ pub struct DecimalEscapeValue {
 }
 
 // Go: scanner/regexp.go:77 regExpParser
-pub struct RegExpParser<'a> {
-    pub scanner: &'a mut Scanner,
+pub struct RegExpParser<'a, 't> {
+    pub scanner: &'a mut Scanner<'t>,
     pub end: i32,
     pub reg_exp_flags: RegularExpressionFlags,
     pub any_unicode_mode: bool,
@@ -145,15 +145,15 @@ pub struct RegExpParser<'a> {
 // PORT: Go builds `regExpParser` with a struct literal in
 // `Scanner.ReScanSlashToken` (scanner.go:1210). This constructor takes the
 // same fields and gives the other fields their Go zero values.
-pub fn new_reg_exp_parser(
-    scanner: &mut Scanner,
+pub fn new_reg_exp_parser<'a, 't>(
+    scanner: &'a mut Scanner<'t>,
     end: i32,
     reg_exp_flags: RegularExpressionFlags,
     any_unicode_mode: bool,
     unicode_sets_mode: bool,
     annex_b: bool,
     named_capture_groups: bool,
-) -> RegExpParser<'_> {
+) -> RegExpParser<'a, 't> {
     RegExpParser {
         scanner,
         end,
@@ -173,7 +173,7 @@ pub fn new_reg_exp_parser(
     }
 }
 
-impl<'a> RegExpParser<'a> {
+impl<'a, 't> RegExpParser<'a, 't> {
     // Go: scanner/regexp.go:108 pos
     fn pos(&self) -> i32 {
         self.scanner.scanner_state.pos
@@ -253,7 +253,7 @@ pub fn compare_decimal_strings(a: &str, b: &str) -> i32 {
     }
 }
 
-impl<'a> RegExpParser<'a> {
+impl<'a, 't> RegExpParser<'a, 't> {
     // Go: scanner/regexp.go:155 scanDisjunction
     // Disjunction ::= Alternative ('|' Alternative)*
     fn scan_disjunction(&mut self, is_in_group: bool) {

@@ -277,7 +277,7 @@ impl Checker {
                 self.add_diagnostic(new_diagnostic(
                     sf,
                     TextRange::new(
-                        skip_trivia(source_file_text(sf), node.pos()),
+                        skip_trivia(&source_file_text(sf), node.pos()),
                         node.expression().pos(),
                     ),
                     diag::This_syntax_is_not_allowed_when_erasableSyntaxOnly_is_enabled,
@@ -738,7 +738,7 @@ impl Checker {
                     && !self.is_indirect_call(left.parent())
                 {
                     let sf = get_source_file_of_node(left);
-                    let start = skip_trivia(source_file_text(sf), left.pos());
+                    let start = skip_trivia(&source_file_text(sf), left.pos());
                     // PORT: Go `sf.Diagnostics()` is the parser diagnostics
                     // field, read here from `source_file_info(sf).diagnostics`.
                     let is_in_diag2657 = source_file_info(sf).diagnostics.iter().any(|d| {

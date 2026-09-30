@@ -78,8 +78,9 @@ pub fn parse_result(
     if is_module_virtual_extension(&virtual_extension) {
         parse_options.external_module_indicator_options.force = true;
     }
-    // PORT: the parser keeps `&'static str` text; the compiler host leaks
-    // each file text the same way.
+    // PORT: a content-mapped parse never gets a `FileVersion`, so its store
+    // is published static and its text is leaked, as the compiler host
+    // leaks a static file text (`FileText::new`).
     let text: &'static str = Box::leak(result.text.clone().into_boxed_str());
     let mut source_file = parse_source_file(
         &parse_options,

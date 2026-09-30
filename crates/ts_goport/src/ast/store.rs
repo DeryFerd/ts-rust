@@ -143,7 +143,9 @@ impl NodeHeader {
 #[derive(Default)]
 struct FileStore {
     file_name: &'static str,
-    text: &'static str,
+    /// The file text. A freeable file version shares it (`FileText::Shared`)
+    /// with its parse and program inputs, and it goes with them.
+    text: FileText,
     /// AST node records, step 1: the `NodeRecord` of every slot, pushed when
     /// the slot is made and written by the parse (`get_mut`). The publish
     /// reads them in place (`FileBlock::records`).
@@ -1780,8 +1782,8 @@ fn build_store_cell(store: FileStore) -> StoreCell {
 /// follow parse order (see `BuildStores`). The store becomes the active
 /// store of this thread. Inside a freeable parse scope
 /// (`enter_freeable_parse`) the store owns its astdata nodes (`OwnedAst`).
-pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
-    let mut new = FileStore::new(file_name, text);
+pub fn new_file_store(file_name: &'static str, text: impl Into<FileText>) -> usize {
+    let mut new = FileStore::new(file_name, text.into());
     if FREEABLE_PARSE.get() {
         new.owned = Some(Box::new(OwnedAst::new(new.records.capacity())));
     }
@@ -1806,7 +1808,7 @@ pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
 const STORE_TEXT_BYTES_PER_SLOT: usize = 12;
 
 impl FileStore {
-    fn new(file_name: &'static str, text: &'static str) -> Self {
+    fn new(file_name: &'static str, text: FileText) -> Self {
         let slots = text.len() / STORE_TEXT_BYTES_PER_SLOT + 1;
         let mut records = Vec::with_capacity(slots);
         records.push(NodeRecord::target(Node::NIL));
@@ -3085,7 +3087,11 @@ impl DetachedStore {
 /// Makes the detached store of this thread with provisional id
 /// `DETACHED_STORE_BASE + job` and returns that id. A parse worker parses
 /// one file at a time; the store stays until `take_detached_file_store`.
-pub fn new_detached_file_store(job: usize, file_name: &'static str, text: &'static str) -> usize {
+pub fn new_detached_file_store(
+    job: usize,
+    file_name: &'static str,
+    text: impl Into<FileText>,
+) -> usize {
     assert!(job < DETACHED_STORE_LIMIT, "too many detached stores");
     let id = DETACHED_STORE_BASE + job;
     assert!(
@@ -3095,7 +3101,7 @@ pub fn new_detached_file_store(job: usize, file_name: &'static str, text: &'stat
     let store = SPARE_CELL
         .take()
         .unwrap_or_else(|| leak_in_ast_arena(RefCell::default()));
-    *store.borrow_mut() = FileStore::new(file_name, text);
+    *store.borrow_mut() = FileStore::new(file_name, text.into());
     DETACHED.set(Some((id, store)));
     ACTIVE.set(Some((id, store)));
     id
@@ -3301,8 +3307,8 @@ pub fn file_store_file_name(file: usize) -> &'static str {
 
 /// Go `file.Text()` of a store file.
 #[must_use]
-pub fn file_store_text(file: usize) -> &'static str {
-    with_store(file, |s| s.text)
+pub fn file_store_text(file: usize) -> FileText {
+    with_store(file, |s| s.text.clone())
 }
 
 /// Go `result.jsdocCache = p.createJSDocCache()` in `finishSourceFile`.
@@ -3431,10 +3437,10 @@ pub fn resolve_file_store_js_doc(file: usize, node: Node) -> Option<NodeSlice> {
     let (parse_options, script_kind, text) = with_store(file, |s| {
         s.lazy_js_doc
             .clone()
-            .map(|(parse_options, script_kind)| (parse_options, script_kind, s.text))
+            .map(|(parse_options, script_kind)| (parse_options, script_kind, s.text.clone()))
     })?;
     let jsdocs =
-        crate::frontend::parser::parse_js_doc_for_node(&parse_options, text, script_kind, node);
+        crate::frontend::parser::parse_js_doc_for_node(&parse_options, &text, script_kind, node);
     let leaked = with_store_mut(file, |s| match s.owned.as_deref_mut() {
         Some(owned) => {
             owned.jsdoc.insert(node, jsdocs.into_boxed_slice());
@@ -4479,7 +4485,7 @@ pub fn frozen_file_ecma_line_starts(file: usize) -> Option<FileRef<[i32]>> {
 /// `frozen_file_ecma_line_starts`), made once.
 fn line_starts(store: &FileStore) -> &[i32] {
     store.ecma_line_starts.get_or_init(|| {
-        crate::scanner_util::compute_ecma_line_starts(store.text).into_boxed_slice()
+        crate::scanner_util::compute_ecma_line_starts(&store.text).into_boxed_slice()
     })
 }
 
@@ -5318,7 +5324,7 @@ pub(crate) fn reset_file_store(file: usize) {
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot reset a finished store");
         let owns_nodes = s.owned.is_some();
-        *s = FileStore::new(s.file_name, s.text);
+        *s = FileStore::new(s.file_name, s.text.clone());
         if owns_nodes {
             s.owned = Some(Box::new(OwnedAst::new(s.records.capacity())));
         }
@@ -6792,6 +6798,30 @@ mod tests {
     // new owner's data (the kind column is not pooled; shells with equal
     // kinds share one). It publishes, so no other test may build or publish
     // stores while it runs (the runner uses one thread).
+    // textleak1 A1: a publish keeps the emptied cells of its build stores,
+    // and the next build store of the thread reuses one, so a language
+    // server edit leaks no store cell in the AST arena.
+    #[test]
+    fn next_build_stores_reuse_published_cells() {
+        std::thread::spawn(|| {
+            let a = new_file_store("/cells/a.ts", "a;");
+            let a_cell = active_store(a).expect("a is the active store");
+            NodeFactory::for_file(a).new_identifier("a");
+            freeze_file_store(a);
+            crate::program::publish_parsed_files("/");
+            let b = new_file_store("/cells/b.ts", "b;");
+            let b_cell = active_store(b).expect("b is the active store");
+            assert!(
+                std::ptr::eq(a_cell, b_cell),
+                "b does not reuse the cell of a"
+            );
+            assert_eq!(file_store_text(b), "b;");
+            assert_eq!(file_store_text(a), "a;");
+        })
+        .join()
+        .unwrap();
+    }
+
     #[test]
     fn pooled_node_blocks_wait_two_releases_and_check_their_owner() {
         use super::super::file_version::{FileVersion, release_file_version_pins};

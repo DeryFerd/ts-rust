@@ -119,7 +119,7 @@ pub struct SyntheticSourceFileData {
     // Fields set by NewSourceFile
     pub file_name: &'static str,
     pub path: String,
-    pub text: &'static str,
+    pub text: FileText,
 
     // Fields set by copyFrom (Go "fields set by parser") and later writes
     pub language_variant: LanguageVariant,
@@ -1637,8 +1637,8 @@ pub fn update_synthetic_source_file<R>(
 
 /// Go `file.Text()` of a factory SourceFile.
 #[must_use]
-pub fn synthetic_source_file_text(n: Node) -> &'static str {
-    with_synthetic_source_file(n, |d| d.text)
+pub fn synthetic_source_file_text(n: Node) -> FileText {
+    with_synthetic_source_file(n, |d| d.text.clone())
 }
 
 /// Go `file.FileName()` of a factory SourceFile.

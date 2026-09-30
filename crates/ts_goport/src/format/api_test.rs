@@ -88,7 +88,7 @@ fn test_format_format_checker_ts() {
         panic!("expected no error, got {err}");
     }
     // PORT: Go `string(fileContent)` keeps any bytes; checker.ts is UTF-8.
-    // The parser takes `&'static str`, so the text is leaked.
+    // The text is leaked, so the parse keeps it as a static `FileText`.
     let text: &'static str = String::from_utf8(file_content.unwrap())
         .expect("checker.ts is not UTF-8")
         .leak();

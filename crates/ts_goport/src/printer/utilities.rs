@@ -495,7 +495,7 @@ pub(crate) fn get_start_position_of_range(
         return -1;
     }
     skip_trivia_ex(
-        source_file_text(source_file),
+        &source_file_text(source_file),
         r.pos(),
         Some(&SkipTriviaOptions {
             stop_at_comments: include_comments,
@@ -548,7 +548,7 @@ pub(crate) fn get_lines_between_position_and_preceding_non_whitespace_character(
     include_comments: bool,
 ) -> i32 {
     let start_pos = skip_trivia_ex(
-        source_file_text(source_file),
+        &source_file_text(source_file),
         pos,
         Some(&SkipTriviaOptions {
             stop_at_comments: include_comments,
@@ -571,7 +571,7 @@ pub(crate) fn get_lines_between_position_and_next_non_whitespace_character(
     include_comments: bool,
 ) -> i32 {
     let next_pos = skip_trivia_ex(
-        source_file_text(source_file),
+        &source_file_text(source_file),
         pos,
         Some(&SkipTriviaOptions {
             stop_at_comments: include_comments,
@@ -591,7 +591,8 @@ pub(crate) fn get_lines_between_position_and_next_non_whitespace_character(
 
 // Go: printer/utilities.go:413 getPreviousNonWhitespacePosition
 fn get_previous_non_whitespace_position(mut pos: i32, stop_pos: i32, source_file: Node) -> i32 {
-    let text = source_file_text(source_file).as_bytes();
+    let text_text = source_file_text(source_file);
+    let text = text_text.as_bytes();
     while pos >= stop_pos {
         // PORT: Go `rune(text[pos])` converts one byte, like `char::from(u8)`.
         if !is_white_space_like(char::from(text[pos as usize])) {
@@ -1188,7 +1189,7 @@ pub(crate) fn calculate_indent(text: &str, mut pos: i32, end: i32) -> i32 {
 // Character offsets are measured in UTF-16 code units per the source map specification.
 pub(crate) struct LineCharacterCache {
     line_map: FileRef<[i32]>,
-    text: &'static str,
+    text: FileText,
     cached_line: i32,
     cached_pos: i32,
     cached_char: i32,

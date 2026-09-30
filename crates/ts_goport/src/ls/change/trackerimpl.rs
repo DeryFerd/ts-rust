@@ -310,7 +310,7 @@ impl Tracker {
         let text = source_file_text(source_file);
         if leading_option == LeadingTriviaOption::JS_DOC {
             let js_doc_comments =
-                get_js_doc_comment_ranges(self.node_factory(), Vec::new(), node, text);
+                get_js_doc_comment_ranges(self.node_factory(), Vec::new(), node, &text);
             if !js_doc_comments.is_empty() {
                 return format::get_line_start_position_for_position(
                     js_doc_comments[0].pos(),
@@ -358,13 +358,13 @@ impl Tracker {
         if has_trailing_comment {
             // Check first for leading comments as if the node is the first import, we want to exclude the trivia;
             // otherwise we get the trailing comments.
-            let mut comments = get_leading_comment_ranges(self.node_factory(), text, full_start);
+            let mut comments = get_leading_comment_ranges(self.node_factory(), &text, full_start);
             if comments.is_empty() {
-                comments = get_trailing_comment_ranges(self.node_factory(), text, full_start);
+                comments = get_trailing_comment_ranges(self.node_factory(), &text, full_start);
             }
             if !comments.is_empty() {
                 return skip_trivia_ex(
-                    text,
+                    &text,
                     comments[0].end(),
                     Some(&SkipTriviaOptions {
                         stop_after_line_break: true,
@@ -382,7 +382,7 @@ impl Tracker {
             line_starts[(full_start_line_index + next_line_start) as usize];
         // skip whitespaces/newlines
         adjusted_start_position = skip_trivia_ex(
-            text,
+            &text,
             adjusted_start_position,
             Some(&SkipTriviaOptions {
                 stop_at_comments: true,
@@ -407,7 +407,7 @@ impl Tracker {
             let line_starts = &*get_ecma_line_starts(source_file);
             let node_end_line = compute_line_of_position(line_starts, node.end());
             let text = source_file_text(source_file);
-            for comment in get_trailing_comment_ranges(self.node_factory(), text, node.end()) {
+            for comment in get_trailing_comment_ranges(self.node_factory(), &text, node.end()) {
                 // Single line can break the loop as trivia will only be this line.
                 // Comments on subsequent lines are also ignored.
                 if comment.kind == SyntaxKind::SingleLineCommentTrivia
@@ -422,7 +422,7 @@ impl Tracker {
                 let comment_end_line = compute_line_of_position(line_starts, comment.end());
                 if comment_end_line > node_end_line {
                     return skip_trivia_ex(
-                        text,
+                        &text,
                         comment.end(),
                         Some(&SkipTriviaOptions {
                             stop_after_line_break: true,
@@ -450,10 +450,10 @@ impl Tracker {
         }
         let text = source_file_text(source_file);
         if trailing_trivia_option == TrailingTriviaOption::EXCLUDE_WHITESPACE {
-            let mut comments = get_trailing_comment_ranges(self.node_factory(), text, node.end());
+            let mut comments = get_trailing_comment_ranges(self.node_factory(), &text, node.end());
             comments.extend(get_leading_comment_ranges(
                 self.node_factory(),
-                text,
+                &text,
                 node.end(),
             ));
             if !comments.is_empty() {
@@ -475,7 +475,7 @@ impl Tracker {
         }
 
         let new_end = skip_trivia_ex(
-            text,
+            &text,
             node.end(),
             Some(&SkipTriviaOptions {
                 stop_after_line_break: true,
@@ -559,17 +559,17 @@ impl Tracker {
         }
         if last_prologue.is_some() {
             position = last_prologue.end();
-            advance_past_line_break(&mut position, text);
+            advance_past_line_break(&mut position, &text);
             return position;
         }
 
-        let shebang = get_shebang(text);
+        let shebang = get_shebang(&text);
         if !shebang.is_empty() {
             position = shebang.len() as i32;
-            advance_past_line_break(&mut position, text);
+            advance_past_line_break(&mut position, &text);
         }
 
-        let ranges = get_leading_comment_ranges(self.node_factory(), text, position);
+        let ranges = get_leading_comment_ranges(self.node_factory(), &text, position);
         if ranges.is_empty() {
             return position;
         }
@@ -582,12 +582,12 @@ impl Tracker {
         let line_map = &*get_ecma_line_starts(source_file);
         for r in ranges {
             if r.kind == SyntaxKind::MultiLineCommentTrivia {
-                if is_pinned_comment(text, r) {
+                if is_pinned_comment(&text, r) {
                     last_comment = Some(r);
                     pinned_or_triple_slash = true;
                     continue;
                 }
-            } else if is_recognized_triple_slash_comment(text, r) {
+            } else if is_recognized_triple_slash_comment(&text, r) {
                 last_comment = Some(r);
                 pinned_or_triple_slash = true;
                 continue;
@@ -630,7 +630,7 @@ impl Tracker {
 
         if let Some(last_comment) = last_comment {
             position = last_comment.end();
-            advance_past_line_break(&mut position, text);
+            advance_past_line_break(&mut position, &text);
         }
         position
     }

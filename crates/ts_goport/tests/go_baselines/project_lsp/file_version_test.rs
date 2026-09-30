@@ -16,7 +16,7 @@ use ts_goport::ast::{
     dead_file_versions, file_version_probe, file_versions_made, free_file_versions,
     node_block_addr, node_block_is_owned, owned_node_count, source_file_ecma_line_map,
     source_file_get_declaration_map, source_file_get_name_table, source_file_imports,
-    source_file_info,
+    source_file_info, source_file_text,
 };
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::core::Node;
@@ -118,6 +118,48 @@ child_test! {
 
         assert_eq!(sem_diag_count(&p4, INDEX_FILE), 0);
         assert_eq!(source_file_info(first).file_name, INDEX_FILE);
+    }
+}
+
+child_test! {
+    // textleak1: the text of an edited version is shared by its parse and
+    // its store (`FileText::Shared`), and it goes with the version. The
+    // parse keeps the Go `Hash` that the parse cache set. The first version
+    // of index.ts keeps its static text.
+    fn edited_file_texts_die_with_their_version() {
+        let session = open_p1();
+        let first = root(&program(&session, INDEX_URI), INDEX_FILE);
+        assert!(source_file_text(first).weak().is_none(), "the first version is static");
+
+        body_edit(&session, 2, "2");
+        let (second_text, second) = {
+            let p2 = program(&session, INDEX_URI);
+            let parsed = p2
+                .get_source_file(INDEX_FILE)
+                .expect("index.ts is in the program");
+            assert_eq!(&*parsed.text, "import { a } from './a';\nexport const x = a + 2;");
+            assert_eq!(
+                parsed.hash.get(),
+                Some(xxhash_rust::xxh3::xxh3_128(parsed.text.as_bytes())),
+                "the parse cache sets Go Hash"
+            );
+            let weak = parsed.text.weak().expect("the edited version's text is shared");
+            assert!(
+                source_file_text(parsed.root)
+                    .weak()
+                    .is_some_and(|store_text| store_text.ptr_eq(&weak)),
+                "the store shares the text of the parse"
+            );
+            let probe = file_version_probe(parsed.root).expect("the edited version is freeable");
+            (weak, probe)
+        };
+        body_edit(&session, 3, "3");
+        assert!(second.is_freed(), "the version of a released program is not freed");
+        assert!(
+            second_text.upgrade().is_none(),
+            "the text of the dead version is not freed"
+        );
+        assert_eq!(&*source_file_text(first), INDEX_TEXT);
     }
 }
 

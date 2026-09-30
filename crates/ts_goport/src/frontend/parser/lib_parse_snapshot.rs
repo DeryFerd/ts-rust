@@ -847,8 +847,9 @@ impl<'a> Decoder<'a> {
             store: self.store,
             root: self.node()?,
             parse_options: opts.clone(),
-            text,
+            text: FileText::Static(text),
             end_of_file_token: self.node()?,
+            hash: std::cell::Cell::new(None),
             diagnostics: self.diagnostics()?,
             js_diagnostics: self.diagnostics()?,
             jsdoc_diagnostics: self.diagnostics()?,
@@ -1608,6 +1609,7 @@ impl Encoder {
             parse_options: _,
             text: _,
             end_of_file_token,
+            hash: _,
             diagnostics,
             js_diagnostics,
             jsdoc_diagnostics,
@@ -1906,7 +1908,10 @@ mod tests {
     ) {
         assert_eq!(loaded.file.parse_options, live.file.parse_options, "{lib}");
         assert!(
-            std::ptr::eq(loaded.file.text, live.file.text),
+            std::ptr::eq(
+                loaded.file.text.as_static().expect("a lib text is static"),
+                live.file.text.as_static().expect("a lib text is static")
+            ),
             "{lib}: text"
         );
         assert!(

@@ -28,7 +28,7 @@ use crate::frontend::prelude::*;
 // ported.
 pub fn parse_js_doc_for_node(
     opts: &SourceFileParseOptions,
-    source_text: &'static str,
+    source_text: &str,
     script_kind: ScriptKind,
     node: Node,
 ) -> Vec<Node> {
@@ -80,7 +80,7 @@ fn byte_suffix(s: &str, i: usize) -> String {
     }
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: jsdoc.go:56 withJSDoc
     pub(crate) fn with_js_doc(&mut self, node: Node, info: JsdocScannerInfo) -> Vec<Node> {
         if info & JSDOC_SCANNER_INFO_HAS_JS_DOC == 0 {
@@ -954,7 +954,8 @@ impl Parser {
         let (name, is_bracketed) = self.parse_bracket_name_in_property_and_param_tag(target);
         let indent_text = self.skip_whitespace_or_asterisk();
 
-        if is_name_first && self.look_ahead(|p: &mut Parser| p.parse_js_doc_link_prefix().is_none())
+        if is_name_first
+            && self.look_ahead(|p: &mut Parser<'a>| p.parse_js_doc_link_prefix().is_none())
         {
             type_expression = self.try_parse_type_expression();
         }

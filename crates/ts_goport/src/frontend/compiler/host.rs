@@ -222,26 +222,27 @@ impl CompilerHost for CompilerHostImpl {
 
     // Go: host.go:78 (*compilerHost).GetSourceFile
     // PORT: a parse worker may have parsed the file already (`FilesParser`
-    // prefetch, `take_prefetched`). The parser takes `&'static str` (node
-    // data points into the text), so a file text is leaked for the program
-    // lifetime.
+    // prefetch, `take_prefetched`). A file text is leaked for the program
+    // lifetime, except the text of a freeable file version (`FileText::new`),
+    // which goes with the version.
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
         let script_kind = ensure_script_kind_from_file_name(&opts.file_name);
-        let text: &'static str = if self.plain_os_fs {
+        let freeable = crate::ast::freeable_path(&opts.path.0);
+        let text: FileText = if self.plain_os_fs {
             // PERF: on the plain OS file system a worker read the same
             // bytes, so the file is read once, as in Go. A bundled lib is
             // its embedded text (what `WrappedFs::read_file` copies).
             match take_prefetched(opts, script_kind, None) {
                 Prefetched::Parse(file) => return Some(Rc::new(file)),
-                Prefetched::Text(text) => text,
+                Prefetched::Text(text) => text.into(),
                 Prefetched::Nothing => match bundled_text(&opts.file_name) {
-                    Some(text) => text,
+                    Some(text) => text.into(),
                     None => {
                         let (text, ok) = self.fs.read_file(&opts.file_name);
                         if !ok {
                             return None;
                         }
-                        Box::leak(text.into_boxed_str())
+                        FileText::new(text, freeable)
                     }
                 },
             }
@@ -255,8 +256,8 @@ impl CompilerHost for CompilerHostImpl {
             // text.
             match take_prefetched(opts, script_kind, Some(text.as_str())) {
                 Prefetched::Parse(file) => return Some(Rc::new(file)),
-                Prefetched::Text(worker_text) => worker_text,
-                Prefetched::Nothing => Box::leak(text.into_boxed_str()),
+                Prefetched::Text(worker_text) => worker_text.into(),
+                Prefetched::Nothing => FileText::new(text, freeable),
             }
         };
         // Not in Go: with `GOPORT_FREE_FILE_VERSIONS=1`, a new parse of a
@@ -265,8 +266,7 @@ impl CompilerHost for CompilerHostImpl {
         // `program::update_program_version` gives it a `FileVersion`. A
         // store that gets none is published static (its nodes are then
         // leaked).
-        let _owned_nodes =
-            crate::ast::freeable_path(&opts.path.0).then(crate::ast::enter_freeable_parse);
+        let _owned_nodes = freeable.then(crate::ast::enter_freeable_parse);
         Some(Rc::new(parse_source_file(opts, text, script_kind)))
     }
 

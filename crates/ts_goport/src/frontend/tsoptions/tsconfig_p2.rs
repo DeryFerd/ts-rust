@@ -145,7 +145,7 @@ fn read_json_config_file(
                 path,
                 ..Default::default()
             },
-            Box::leak(text.into_boxed_str()),
+            FileText::Static(Box::leak(text.into_boxed_str())),
             ScriptKind::JSON,
         );
         (
@@ -1465,7 +1465,7 @@ pub fn get_content_mapper_option_diagnostic_location(
     let file = config_file.source_file;
     (
         file,
-        TextRange::new(skip_trivia(source_file_text(file), node.pos()), node.end()),
+        TextRange::new(skip_trivia(&source_file_text(file), node.pos()), node.end()),
     )
 }
 
@@ -1511,7 +1511,7 @@ fn set_content_mapper_diagnostic_location(
     if source_file.is_some() && node.is_some() {
         diagnostic.set_file(source_file);
         diagnostic.set_location(TextRange::new(
-            skip_trivia(source_file_text(source_file), node.pos()),
+            skip_trivia(&source_file_text(source_file), node.pos()),
             node.end(),
         ));
     }

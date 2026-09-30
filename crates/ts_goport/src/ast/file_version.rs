@@ -678,6 +678,117 @@ macro_rules! go_file_ref {
 }
 pub(crate) use go_file_ref;
 
+/// The text of one file (Go `SourceFile.text`). It derefs to `str`.
+/// - `Static`: a file that is never freed (every CLI file, a lib, the first
+///   version of an edited file, a synthetic file): the leaked text, as
+///   before textleak1.
+/// - `Shared`: a freeable file version (lsshells M3a). Its store, its parse
+///   and its program inputs share the text, and it goes with the last of
+///   them.
+///
+/// A parse borrows the text (`Parser<'a>`, `Scanner<'a>`), and a reader
+/// holds a clone only as long as it reads: a kept clone keeps the text of a
+/// dead version alive, but never reads freed memory.
+// PORT: Go strings are GC values. No node data points into the text: the
+// node texts are owned copies or interned names.
+#[derive(Clone)]
+pub enum FileText {
+    Static(&'static str),
+    Shared(Arc<str>),
+}
+
+impl FileText {
+    /// The text of a new parse: `Shared` for a parse of a freeable file
+    /// version (`freeable`, see `freeable_path`), else leaked (`Static`),
+    /// as every CLI text is.
+    #[must_use]
+    pub fn new(text: String, freeable: bool) -> Self {
+        if freeable {
+            FileText::Shared(Arc::from(text))
+        } else {
+            FileText::Static(Box::leak(text.into_boxed_str()))
+        }
+    }
+
+    /// The `'static` text of a static file, or `None` for a shared text.
+    #[inline]
+    #[must_use]
+    pub fn as_static(&self) -> Option<&'static str> {
+        match self {
+            FileText::Static(text) => Some(text),
+            FileText::Shared(_) => None,
+        }
+    }
+
+    /// A weak handle to a shared text, or `None` for a static text. Tests
+    /// use it to see that a text goes with its file version.
+    #[must_use]
+    pub fn weak(&self) -> Option<Weak<str>> {
+        match self {
+            FileText::Static(_) => None,
+            FileText::Shared(text) => Some(Arc::downgrade(text)),
+        }
+    }
+}
+
+impl Default for FileText {
+    /// The empty static text.
+    fn default() -> Self {
+        FileText::Static("")
+    }
+}
+
+impl Deref for FileText {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        match self {
+            FileText::Static(text) => text,
+            FileText::Shared(text) => text,
+        }
+    }
+}
+
+impl From<&'static str> for FileText {
+    #[inline]
+    fn from(text: &'static str) -> Self {
+        FileText::Static(text)
+    }
+}
+
+impl std::fmt::Debug for FileText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl std::fmt::Display for FileText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl PartialEq for FileText {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for FileText {}
+
+impl PartialEq<str> for FileText {
+    fn eq(&self, other: &str) -> bool {
+        &**self == other
+    }
+}
+
+impl PartialEq<&str> for FileText {
+    fn eq(&self, other: &&str) -> bool {
+        &**self == *other
+    }
+}
+
 /// A weak handle to a file version. Tests use it to see when the version
 /// dies.
 pub struct FileVersionProbe(Weak<FileVersion>);

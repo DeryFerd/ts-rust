@@ -3837,7 +3837,7 @@ fn get_diagnostics_with_preceding_directives(
                 break;
             }
             // Stop searching backwards when we encounter a line that isn't blank or a comment.
-            if !is_comment_or_blank_line(text, line_starts[line as usize] as usize) {
+            if !is_comment_or_blank_line(&text, line_starts[line as usize] as usize) {
                 break;
             }
             line -= 1;
@@ -4173,7 +4173,7 @@ pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
         let (line, character) = if resolved.use_original {
             // Go `newOriginalTextFile`: the position is in the original text.
             ecma_line_and_utf16_character_of_text_position(
-                source_file_original_text(diagnostic.file),
+                &source_file_original_text(diagnostic.file),
                 resolved.loc.pos(),
             )
         } else {

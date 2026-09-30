@@ -642,7 +642,7 @@ impl ConfigFileRegistryBuilder {
                     let file_name = entry.borrow().file_name.clone();
                     let (text, ok) = self.fs().read_file(&file_name);
                     // Go: entry.commandLine.ConfigFile.SourceFile.Text()
-                    let config_text = || -> &'static str {
+                    let config_text = || -> FileText {
                         let entry = entry.borrow();
                         let command_line = entry
                             .command_line
@@ -656,7 +656,7 @@ impl ConfigFileRegistryBuilder {
                     };
                     if !ok
                         || entry.borrow().command_line.is_none()
-                        || text.as_str() != config_text()
+                        || text.as_str() != &*config_text()
                     {
                         entry.borrow_mut().pending_reload = PendingReload::FULL;
                     } else {
