@@ -1246,19 +1246,24 @@ impl<T: Clone + Default> CowChunks<T> {
     }
 
     /// Makes room for `additional` more values, so the pushes that follow
-    /// do not grow step by step: in `small` while the array has no chunk
-    /// (all of them, so a file arena stays one `Vec`), else in the chunk
-    /// list. Capacity only.
+    /// do not grow step by step: in `small` up to one chunk while the array
+    /// has no chunk, and in the chunk list when the values need more than
+    /// one chunk. Capacity only.
     // PERF: bind D. A file arena started with a one-value first chunk,
-    // which `push` grew by doubling for every bound file.
+    // which `push` grew by doubling for every bound file. `small` gets at
+    // most one chunk of room: the chunks after it free one by one in
+    // `into_aligned`, so a large file arena (a lib snapshot load) does not
+    // hold its whole buffer while its values move.
     pub fn reserve(&mut self, additional: usize) {
         if self.chunks.is_empty() {
-            self.small.reserve_exact(additional);
-            return;
+            let room = COW_CHUNK_LEN.saturating_sub(self.small.len());
+            self.small.reserve_exact(additional.min(room));
         }
-        let chunks = (self.len + additional).div_ceil(COW_CHUNK_LEN);
-        self.chunks
-            .reserve(chunks.saturating_sub(self.chunks.len()));
+        if self.len + additional > COW_CHUNK_LEN {
+            let chunks = (self.len + additional).div_ceil(COW_CHUNK_LEN);
+            self.chunks
+                .reserve(chunks.saturating_sub(self.chunks.len()));
+        }
     }
 
     #[inline(always)]
