@@ -46,7 +46,7 @@ struct RenameEditKey {
 // `changes` map of `symbolAndEntriesToRename` did.
 fn deduplicate_rename_edits(
     mapped_edits: Vec<MappedRenameEdit>,
-) -> Option<IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>>> {
+) -> Option<IndexMap<lsproto::DocumentUri, Vec<Option<lsproto::TextEdit>>>> {
     let mut edit_texts: FxHashMap<RenameEditKey, String> = FxHashMap::default();
     let mut unique_edits: Vec<MappedRenameEdit> = Vec::with_capacity(mapped_edits.len());
     for mapped_edit in mapped_edits {
@@ -63,12 +63,13 @@ fn deduplicate_rename_edits(
         edit_texts.insert(key, mapped_edit.edit.new_text.clone());
         unique_edits.push(mapped_edit);
     }
-    let mut changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> = IndexMap::new();
+    let mut changes: IndexMap<lsproto::DocumentUri, Vec<Option<lsproto::TextEdit>>> =
+        IndexMap::new();
     for mapped_edit in unique_edits {
         changes
             .entry(mapped_edit.uri)
             .or_default()
-            .push(mapped_edit.edit);
+            .push(Some(mapped_edit.edit));
     }
     Some(changes)
 }

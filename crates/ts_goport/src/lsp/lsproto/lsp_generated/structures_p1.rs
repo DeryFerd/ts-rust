@@ -4163,7 +4163,7 @@ impl IsZero for CreateFilesParams {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorkspaceEdit {
     // Holds changes to existing resources.
-    pub changes: Option<IndexMap<DocumentUri, Vec<TextEdit>>>,
+    pub changes: Option<IndexMap<DocumentUri, Vec<Option<TextEdit>>>>,
 
     // Depending on the client capability `workspace.workspaceEdit.resourceOperations` document changes
     // are either an array of `TextDocumentEdit`s to express changes to n different text documents

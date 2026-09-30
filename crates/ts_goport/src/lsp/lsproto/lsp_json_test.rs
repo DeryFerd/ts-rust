@@ -1372,3 +1372,22 @@ fn test_unmarshal_params_requires_params() {
         }
     }
 }
+
+// PORT: no Go counterpart. Go `WorkspaceEdit.Changes` is
+// `*map[DocumentUri][]*TextEdit`: a null element decodes as a nil edit, a nil
+// edit encodes as null, and a value that is not an array names the Go type.
+#[test]
+fn workspace_edit_changes_hold_nil_edits() {
+    let input = r#"{"changes":{"file:///a.ts":[null,{"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":2}},"newText":"x"}]}}"#;
+    let mut edit = WorkspaceEdit::default();
+    let err = json_unmarshal(input.as_bytes(), &mut edit, &[]);
+    assert_nil_error("decode", &err);
+    let edits = &edit.changes.as_ref().unwrap()[&DocumentUri("file:///a.ts".to_string())];
+    assert!(edits[0].is_none(), "a null element is a nil edit");
+    assert_eq!(edits[1].as_ref().unwrap().new_text, "x");
+    assert_eq!(json_marshal(&edit, &[]).unwrap(), input);
+
+    let mut edit = WorkspaceEdit::default();
+    let err = json_unmarshal(br#"{"changes":{"file:///a.ts":1}}"#, &mut edit, &[]);
+    assert_error_contains("non-array", &err, "[]*lsproto.TextEdit");
+}
