@@ -5,14 +5,17 @@
 
 pub mod callbackfs;
 pub mod encoder;
+pub mod module_resolution;
 pub mod proto;
 pub mod protocol_msgpack;
+pub mod requestfilesystem;
 pub mod server;
 pub mod session_p1;
 pub mod session_p2;
 pub mod stringer_generated;
 
 pub use callbackfs::*;
+pub use module_resolution::*;
 pub use proto::*;
 pub use protocol_msgpack::*;
 pub use server::*;
@@ -23,8 +26,8 @@ pub use stringer_generated::*;
 /// Glob import for api files: `use crate::api::prelude::*;`.
 pub mod prelude {
     pub use super::{
-        callbackfs::*, proto::*, protocol_msgpack::*, server::*, session_p1::*, session_p2::*,
-        stringer_generated::*,
+        callbackfs::*, module_resolution::*, proto::*, protocol_msgpack::*, server::*,
+        session_p1::*, session_p2::*, stringer_generated::*,
     };
     pub use crate::api::encoder;
     pub use crate::astnav;

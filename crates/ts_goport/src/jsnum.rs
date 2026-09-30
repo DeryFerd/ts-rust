@@ -376,6 +376,25 @@ impl PseudoBigInt {
         }
     }
 
+    // Go: jsnum/pseudobigint.go:41 PseudoBigInt.Compare (ts#64280)
+    /// Compares two bigints by value: -1, 0 or 1.
+    #[must_use]
+    pub fn compare(&self, other: &PseudoBigInt) -> i32 {
+        let c = self.sign().cmp(&other.sign()) as i32;
+        if c != 0 {
+            return c;
+        }
+        // PORT: Go `len` is the byte length; the value is ASCII digits.
+        let mut c = self.base10_value.len().cmp(&other.base10_value.len()) as i32;
+        if c == 0 {
+            c = self.base10_value.as_str().cmp(other.base10_value.as_str()) as i32;
+        }
+        if self.negative {
+            c = -c;
+        }
+        c
+    }
+
     /// Parses a scanner-validated signed bigint literal.
     #[must_use]
     pub fn parse_valid(text: &str) -> Self {

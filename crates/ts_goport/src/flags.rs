@@ -16,19 +16,22 @@ go_flags!(CheckFlags, u32 {
     CONTAINS_PUBLIC = 0x100; // CheckFlagsContainsPublic
     CONTAINS_PROTECTED = 0x200; // CheckFlagsContainsProtected
     CONTAINS_PRIVATE = 0x400; // CheckFlagsContainsPrivate
-    CONTAINS_STATIC = 0x800; // CheckFlagsContainsStatic
-    LATE = 0x1000; // CheckFlagsLate
-    REVERSE_MAPPED = 0x2000; // CheckFlagsReverseMapped
-    OPTIONAL_PARAMETER = 0x4000; // CheckFlagsOptionalParameter
-    REST_PARAMETER = 0x8000; // CheckFlagsRestParameter
-    DEFERRED_TYPE = 0x10000; // CheckFlagsDeferredType
-    HAS_NEVER_TYPE = 0x20000; // CheckFlagsHasNeverType
-    MAPPED = 0x40000; // CheckFlagsMapped
-    STRIP_OPTIONAL = 0x80000; // CheckFlagsStripOptional
-    UNRESOLVED = 0x100000; // CheckFlagsUnresolved
-    IS_DISCRIMINANT_COMPUTED = 0x200000; // CheckFlagsIsDiscriminantComputed
-    IS_DISCRIMINANT = 0x400000; // CheckFlagsIsDiscriminant
-    INDEX_SYMBOL = 0x800000; // CheckFlagsIndexSymbol
+    CONTAINS_WRITE_PUBLIC = 0x800; // CheckFlagsContainsWritePublic
+    CONTAINS_WRITE_PROTECTED = 0x1000; // CheckFlagsContainsWriteProtected
+    CONTAINS_WRITE_PRIVATE = 0x2000; // CheckFlagsContainsWritePrivate
+    CONTAINS_STATIC = 0x4000; // CheckFlagsContainsStatic
+    LATE = 0x8000; // CheckFlagsLate
+    REVERSE_MAPPED = 0x10000; // CheckFlagsReverseMapped
+    OPTIONAL_PARAMETER = 0x20000; // CheckFlagsOptionalParameter
+    REST_PARAMETER = 0x40000; // CheckFlagsRestParameter
+    DEFERRED_TYPE = 0x80000; // CheckFlagsDeferredType
+    HAS_NEVER_TYPE = 0x100000; // CheckFlagsHasNeverType
+    MAPPED = 0x200000; // CheckFlagsMapped
+    STRIP_OPTIONAL = 0x400000; // CheckFlagsStripOptional
+    UNRESOLVED = 0x800000; // CheckFlagsUnresolved
+    IS_DISCRIMINANT_COMPUTED = 0x1000000; // CheckFlagsIsDiscriminantComputed
+    IS_DISCRIMINANT = 0x2000000; // CheckFlagsIsDiscriminant
+    INDEX_SYMBOL = 0x4000000; // CheckFlagsIndexSymbol
     SYNTHETIC = 6; // CheckFlagsSynthetic
     NON_UNIFORM_AND_LITERAL = 0xc0; // CheckFlagsNonUniformAndLiteral
     PARTIAL = 0x30; // CheckFlagsPartial
@@ -457,6 +460,7 @@ go_flags!(InferenceFlags, u32 {
     NO_DEFAULT = 1; // InferenceFlagsNoDefault
     ANY_DEFAULT = 2; // InferenceFlagsAnyDefault
     SKIPPED_GENERIC_FUNCTION = 4; // InferenceFlagsSkippedGenericFunction
+    NO_CONSTRAINT_CHECKS = 8; // InferenceFlagsNoConstraintChecks
 });
 
 go_flags!(InferencePriority, i32 {
@@ -915,8 +919,7 @@ go_flags!(ObjectFlags, u32 {
     IS_CLASS_INSTANCE_CLONE = 0x4000000; // ObjectFlagsIsClassInstanceClone
     IDENTICAL_BASE_TYPE_CALCULATED = 0x8000000; // ObjectFlagsIdenticalBaseTypeCalculated
     IDENTICAL_BASE_TYPE_EXISTS = 0x10000000; // ObjectFlagsIdenticalBaseTypeExists
-    UNRESOLVED_MEMBERS = 0x20000000; // ObjectFlagsUnresolvedMembers
-    FROM_TYPE_NODE = 0x40000000; // ObjectFlagsFromTypeNode
+    FROM_TYPE_NODE = 0x20000000; // ObjectFlagsFromTypeNode
     IS_GENERIC_TYPE_COMPUTED = 0x400000; // ObjectFlagsIsGenericTypeComputed
     IS_GENERIC_OBJECT_TYPE = 0x800000; // ObjectFlagsIsGenericObjectType
     IS_GENERIC_INDEX_TYPE = 0x1000000; // ObjectFlagsIsGenericIndexType
@@ -1111,17 +1114,18 @@ go_enum!(ScriptTarget, i32 {
     ES2023 = 10; // ScriptTargetES2023
     ES2024 = 11; // ScriptTargetES2024
     ES2025 = 12; // ScriptTargetES2025
+    ES2026 = 13; // ScriptTargetES2026
     ES_NEXT = 99; // ScriptTargetESNext
     JSON = 100; // ScriptTargetJSON
     LATEST = 99; // ScriptTargetLatest
-    LATEST_STANDARD = 12; // ScriptTargetLatestStandard
+    LATEST_STANDARD = 13; // ScriptTargetLatestStandard
 });
 
 go_enum!(JsxEmit, i32 {
     NONE = 0; // JsxEmitNone
     PRESERVE = 1; // JsxEmitPreserve
-    REACT_NATIVE = 2; // JsxEmitReactNative
-    REACT = 3; // JsxEmitReact
+    REACT = 2; // JsxEmitReact
+    REACT_NATIVE = 3; // JsxEmitReactNative
     REACT_JSX = 4; // JsxEmitReactJSX
     REACT_JSX_DEV = 5; // JsxEmitReactJSXDev
 });

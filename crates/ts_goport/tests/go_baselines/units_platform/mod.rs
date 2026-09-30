@@ -22,6 +22,7 @@ mod collections;
 mod core;
 mod debug;
 mod diagnostics;
+mod diagnostics_locale;
 mod fswatch_eventlist;
 mod fswatch_fallback;
 mod fswatch_n;
