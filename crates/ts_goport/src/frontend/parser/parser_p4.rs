@@ -1935,8 +1935,7 @@ impl Parser {
 
     // Go: parser.go:5501 parseArgumentExpression
     pub fn parse_argument_expression(&mut self) -> Node {
-        do_in_context(
-            self,
+        self.do_in_context(
             NodeFlags::DISALLOW_IN_CONTEXT | NodeFlags::DECORATOR_CONTEXT,
             false,
             Parser::parse_argument_or_array_literal_element,

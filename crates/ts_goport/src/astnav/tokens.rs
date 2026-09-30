@@ -214,10 +214,10 @@ fn get_token_at_position_unexported(
             if node_list.end() == position && include_preceding_token_at_end_position.is_some() {
                 left.set(node_list.end());
                 node_after_left.set(Node::NIL);
-                let list_nodes = node_list.nodes();
-                for i in (0..list_nodes.len()).rev() {
-                    if !list_nodes.get(i).flags().intersects(NodeFlags::REPARSED) {
-                        prev_subtree.set(list_nodes.get(i));
+                // Go: `for _, v := range slices.Backward(nodeList.Nodes)` (ts#63902).
+                for v in node_list.nodes().iter().rev() {
+                    if !v.flags().intersects(NodeFlags::REPARSED) {
+                        prev_subtree.set(v);
                         break;
                     }
                 }
@@ -565,9 +565,10 @@ pub fn find_preceding_token_ex(
                     // Find jsdoc preceding the foundChild.
                     let mut js_doc = Node::NIL;
                     let node_js_doc = n.js_doc(source_file);
-                    for i in (0..node_js_doc.len()).rev() {
-                        if node_js_doc.get(i).pos() >= found_child.pos() {
-                            js_doc = node_js_doc.get(i);
+                    // Go: `for _, n := range slices.Backward(nodeJSDoc)` (ts#63902).
+                    for n in node_js_doc.iter().rev() {
+                        if n.pos() >= found_child.pos() {
+                            js_doc = n;
                             break;
                         }
                     }
