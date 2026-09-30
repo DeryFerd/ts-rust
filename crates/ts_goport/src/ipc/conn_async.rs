@@ -53,6 +53,8 @@ pub struct AsyncConn {
     seq: Cell<i64>,
     pending: RefCell<FxHashMap<jsonrpc::ID, ResponseChan>>,
     terminal: RefCell<Option<GoError>>,
+    // ts#64142
+    has_cause: Cell<bool>,
 
     // PORT: requests and notifications that `call` read while it waited for
     // its response. `run` handles them before it reads more.
@@ -85,6 +87,7 @@ pub fn new_async_conn_with_protocol(
         seq: Cell::new(0),
         pending: RefCell::new(FxHashMap::default()),
         terminal: RefCell::new(None),
+        has_cause: Cell::new(false),
         deferred: RefCell::new(VecDeque::new()),
         read_loop_end: RefCell::new(None),
     })
@@ -109,14 +112,28 @@ impl AsyncConn {
     // Run starts processing messages on the connection.
     // It blocks until the context is cancelled or an error occurs.
     pub fn run(&self, ctx: &Context) -> Result<(), GoError> {
-        // Go: defer func() { c.closePendingCalls(err) }()
-        let result = self.run_loop(ctx);
+        // ts#64142: Go `requestErrors := make(chan error, 1)`.
+        let request_errors: RefCell<Option<GoError>> = RefCell::new(None);
+        // Go: defer func() { c.closePendingCalls(err); cancelHandlers(); c.handlers.Wait(); ... }()
+        // PORT: the handlers run inline (file header), so when the loop ends
+        // no handler is active: the Go `handlerCtx` cancel and the
+        // `handlers.Wait()` (ts#64163) have nothing to do.
+        let mut result = self.run_loop(ctx, &request_errors);
         self.close_pending_calls(result.as_ref().err());
+        let request_err = request_errors.borrow_mut().take();
+        if let Some(request_err) = request_err {
+            result = Err(errors::join([result.err(), Some(request_err)])
+                .expect("the request error is non-nil"));
+        }
         result
     }
 
-    /// The loop of Go `Run`, without its deferred `closePendingCalls`.
-    fn run_loop(&self, ctx: &Context) -> Result<(), GoError> {
+    /// The loop of Go `Run`, without its deferred function.
+    fn run_loop(
+        &self,
+        ctx: &Context,
+        request_errors: &RefCell<Option<GoError>>,
+    ) -> Result<(), GoError> {
         loop {
             if let Some(err) = ctx.err() {
                 return Err(err);
@@ -142,10 +159,16 @@ impl AsyncConn {
             if msg.is_response() {
                 self.handle_response(msg);
             } else if msg.is_request() {
-                // PORT: Go `go c.handleRequest(ctx, msg)`; handled inline.
-                self.handle_request(ctx, msg);
+                // PORT: Go `c.handlers.Go(...)` (ts#64163); handled inline.
+                if let Err(request_err) = self.handle_request(ctx, msg)
+                    && self.record_request_error(request_err, request_errors)
+                {
+                    // PORT: Go checks `c.rwc != nil`; the Rust transport is
+                    // always set.
+                    let _ = self.rwc.close();
+                }
             } else if msg.is_notification() {
-                // PORT: Go `go c.handleNotification(ctx, msg)`; handled inline.
+                // PORT: Go `c.handlers.Go(...)` (ts#64163); handled inline.
                 self.handle_notification(ctx, msg);
             }
         }
@@ -157,14 +180,55 @@ impl AsyncConn {
     // waits on it returns `terminal`. Here the only call that can wait is the
     // one whose read ended the loop, and it returns `terminal` itself.
     fn close_pending_calls(&self, run_err: Option<&GoError>) {
+        self.record_terminal_error_locked(run_err);
+        self.close_pending_calls_locked();
+    }
+
+    // Go: ipc/conn_async.go recordRequestError (ts#64142)
+    // PORT: Go sends to the `requestErrors` channel (capacity 1); here the
+    // slot is an `Option`. Only the first cause returns true, so one error is
+    // stored at most.
+    fn record_request_error(
+        &self,
+        request_err: GoError,
+        request_errors: &RefCell<Option<GoError>>,
+    ) -> bool {
+        if !self.record_terminal_error_locked(Some(&request_err)) {
+            return false;
+        }
+        *request_errors.borrow_mut() = Some(request_err);
+        self.close_pending_calls_locked();
+        true
+    }
+
+    // Go: ipc/conn_async.go recordTerminalErrorLocked (ts#64142)
+    fn record_terminal_error_locked(&self, terminal_err: Option<&GoError>) -> bool {
         let mut terminal = self.terminal.borrow_mut();
         if terminal.is_none() {
-            let mut err = ERR_CONN_CLOSED.clone();
-            if let Some(run_err) = run_err {
-                err = errors::join([err, run_err.clone()]).expect("both errors are non-nil");
+            let err = ERR_CONN_CLOSED.clone();
+            if let Some(terminal_err) = terminal_err {
+                *terminal = Some(
+                    errors::join([err, terminal_err.clone()]).expect("both errors are non-nil"),
+                );
+                self.has_cause.set(true);
+                return true;
             }
             *terminal = Some(err);
+        } else if !self.has_cause.get()
+            && let Some(terminal_err) = terminal_err
+        {
+            let current = terminal.take().expect("terminal is set");
+            *terminal = Some(
+                errors::join([current, terminal_err.clone()]).expect("both errors are non-nil"),
+            );
+            self.has_cause.set(true);
+            return true;
         }
+        false
+    }
+
+    // Go: ipc/conn_async.go closePendingCallsLocked (ts#64142)
+    fn close_pending_calls_locked(&self) {
         self.pending.borrow_mut().clear();
     }
 
@@ -187,7 +251,8 @@ impl AsyncConn {
     // PORT: Go recovers panics in a deferred function; `catch_unwind` covers
     // the same body (the handler call and the response write). Go
     // `debug.Stack()` is the backtrace at the recover point.
-    fn handle_request(&self, ctx: &Context, msg: Message) {
+    // ts#64142: write failures are returned, not panics.
+    fn handle_request(&self, ctx: &Context, msg: Message) -> Result<(), GoError> {
         // Intercept the meta-requests for collected server timing before dispatching
         // to the handler, so they are answered directly and not themselves recorded.
         if msg.method == METHOD_GET_SERVER_TIMING {
@@ -197,12 +262,15 @@ impl AsyncConn {
                 .borrow_mut()
                 .write_response(msg.id.as_ref(), Some(Box::new(snapshot)));
             if let Err(write_err) = write_err {
-                panic!(
-                    "ipc: failed to write server timing response: {}",
-                    write_err.error()
-                );
+                return Err(errors::errorf(
+                    format!(
+                        "ipc: failed to write server timing response: {}",
+                        write_err.error()
+                    ),
+                    vec![write_err],
+                ));
             }
-            return;
+            return Ok(());
         }
         if msg.method == METHOD_RESET_SERVER_TIMING {
             if let Some(timing) = self.timing.borrow_mut().as_mut() {
@@ -213,12 +281,15 @@ impl AsyncConn {
                 .borrow_mut()
                 .write_response(msg.id.as_ref(), None);
             if let Err(write_err) = write_err {
-                panic!(
-                    "ipc: failed to write reset server timing response: {}",
-                    write_err.error()
-                );
+                return Err(errors::errorf(
+                    format!(
+                        "ipc: failed to write reset server timing response: {}",
+                        write_err.error()
+                    ),
+                    vec![write_err],
+                ));
             }
-            return;
+            return Ok(());
         }
 
         let id = msg.id.clone();
@@ -226,7 +297,7 @@ impl AsyncConn {
         let start = Instant::now();
 
         // Recover from panics and convert to error response with stack trace
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), GoError> {
             let (result, err) = match self.handler.handle_request(ctx, &msg.method, msg.params) {
                 Ok(result) => (result, None),
                 Err(err) => (None, Some(err)),
@@ -252,11 +323,19 @@ impl AsyncConn {
             };
 
             if let Err(write_err) = write_err {
-                panic!("ipc: failed to write response: {}", write_err.error());
+                return Err(errors::errorf(
+                    format!("ipc: failed to write response: {}", write_err.error()),
+                    vec![write_err],
+                ));
             }
+            Ok(())
         }));
 
-        if let Err(r) = outcome {
+        let r = match outcome {
+            Ok(result) => return result,
+            Err(r) => r,
+        };
+        {
             let r = recovered_value(r.as_ref());
             let stack = std::backtrace::Backtrace::force_capture().to_string();
             let err = errors::new(format!("panic: {r}\n{stack}"));
@@ -271,12 +350,16 @@ impl AsyncConn {
             );
 
             if let Err(write_err) = write_err {
-                panic!(
-                    "ipc: failed to write panic error response: {} (original panic: {r})",
-                    write_err.error()
-                );
+                return Err(errors::errorf(
+                    format!(
+                        "ipc: failed to write panic error response: {} (original panic: {r})",
+                        write_err.error()
+                    ),
+                    vec![write_err],
+                ));
             }
         }
+        Ok(())
     }
 
     // Go: ipc/conn_async.go:200 handleNotification

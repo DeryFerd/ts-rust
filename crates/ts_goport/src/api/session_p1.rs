@@ -37,6 +37,8 @@ use crate::api::prelude::*;
 //   samples (see its module comment).
 
 use crate::api::encoder;
+use crate::api::proto;
+use crate::api::requestfilesystem;
 use crate::astnav;
 use crate::emitter::emitter::EmitOnly;
 use crate::frontend::compiler;
@@ -66,7 +68,14 @@ pub static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 // PORT: registry values keep the checker that owns the handle (file header).
 pub struct SnapshotData {
     pub snapshot: Rc<project::Snapshot>,
+    // ts#64115: the request file system the snapshot was made with (Go nil
+    // is `None`).
+    pub file_system: Option<Rc<dyn vfs::Fs>>,
     pub ref_count: Cell<i32>,
+
+    // ts#64204
+    pub open_projects: FxHashSet<tspath::Path>,
+    pub open_files: FxHashSet<tspath::Path>,
 
     // Symbol IDs come from ast.GetSymbolId, a global atomic counter, so the same
     // *ast.Symbol pointer always has the same unique ID across all projects in the
@@ -80,9 +89,9 @@ pub struct SnapshotData {
     // a project context (e.g. member/export ordering, node handle resolution) but don't
     // receive one from the caller default to this canonical project. First-writer wins so
     // the choice is stable. Guarded by symbolRegistryMu.
-    pub symbol_canonical_projects: RefCell<FxHashMap<SymbolID, ProjectID>>,
+    pub symbol_canonical_projects: RefCell<FxHashMap<SymbolID, project::ID>>,
 
-    pub project_registries: RefCell<FxHashMap<ProjectID, Rc<ProjectRegistryData>>>,
+    pub project_registries: RefCell<FxHashMap<project::ID, Rc<ProjectRegistryData>>>,
 }
 
 // Go: api/session.go:64 projectRegistryData
@@ -101,7 +110,7 @@ impl SnapshotData {
     // getProgram looks up a program from a project handle within this snapshot.
     pub fn get_program(
         &self,
-        project_handle: &ProjectID,
+        project_handle: &project::ID,
     ) -> Result<Rc<compiler::NewProgram>, GoError> {
         let proj = self.get_project(project_handle)?;
 
@@ -118,21 +127,17 @@ impl SnapshotData {
 
     // Go: api/session.go:88 getProject
     // getProject looks up a project from a project handle within this snapshot.
+    // ts#64319: looked up by project ID.
     pub fn get_project(
         &self,
-        project_handle: &ProjectID,
+        project_handle: &project::ID,
     ) -> Result<Rc<RefCell<project::Project>>, GoError> {
-        let project_name = parse_project_handle(project_handle);
-        let proj = self
-            .snapshot
-            .project_collection
-            .get_project_by_path(&project_name);
+        let proj = self.snapshot.project_collection.get_project(project_handle);
         let Some(proj) = proj else {
             return Err(errors::errorf(
                 format!(
                     "{}: project {} not found",
-                    *ERR_CLIENT_ERROR,
-                    project_name.as_str()
+                    *ERR_CLIENT_ERROR, project_handle.0
                 ),
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
@@ -155,7 +160,7 @@ impl SnapshotData {
     // getOrCreateProjectRegistry returns the registry for the given project, creating it if needed.
     pub fn get_or_create_project_registry(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
     ) -> Rc<ProjectRegistryData> {
         if project_id.0.is_empty() {
             panic!("getOrCreateProjectRegistry: empty project ID");
@@ -182,7 +187,7 @@ impl SnapshotData {
         &self,
         checker: &Rc<RefCell<Checker>>,
         symbol: SymbolId,
-        canonical_project: &ProjectID,
+        canonical_project: &project::ID,
     ) -> Option<SymbolResponse> {
         if symbol.is_nil() {
             return None;
@@ -235,10 +240,10 @@ impl SnapshotData {
         &self,
         checker: &Rc<RefCell<Checker>>,
         symbol: SymbolId,
-        canonical_project: &ProjectID,
-    ) -> (SymbolID, ProjectID) {
+        canonical_project: &project::ID,
+    ) -> (SymbolID, project::ID) {
         if symbol.is_nil() {
-            return (SymbolID(0), ProjectID::default());
+            return (SymbolID(0), project::ID::default());
         }
         if canonical_project.0.is_empty() {
             panic!("registerSymbol requires a non-empty canonical project");
@@ -273,7 +278,7 @@ impl SnapshotData {
     // newTypeResponse registers a type in the project's registry and returns the response.
     pub fn new_type_response(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         checker: &Rc<RefCell<Checker>>,
         t: TypeId,
     ) -> Option<TypeResponse> {
@@ -281,13 +286,73 @@ impl SnapshotData {
             return None;
         }
         let id = self.register_type(project_id, checker, t);
-        Some(new_type_response(&checker.borrow(), t, id))
+        let mut resp = new_type_response(&checker.borrow(), t, id);
+        // ts#64397
+        let is_mapped = checker
+            .borrow()
+            .ty(t)
+            .object_flags()
+            .intersects(ObjectFlags::MAPPED);
+        if is_mapped {
+            // Go `mapped.ResolveComponents(c, t)` (checker/types.go).
+            {
+                let mut c = checker.borrow_mut();
+                c.get_type_parameter_from_mapped_type(t);
+                c.get_constraint_type_from_mapped_type(t);
+                c.get_name_type_from_mapped_type(t);
+                c.get_template_type_from_mapped_type(t);
+            }
+            let (type_parameter, constraint_type, name_type, template_type) = {
+                let c = checker.borrow();
+                let mapped = c.ty(t).as_mapped_type();
+                (
+                    mapped.type_parameter,
+                    mapped.constraint_type,
+                    mapped.name_type,
+                    mapped.template_type,
+                )
+            };
+            resp.type_parameter = self.register_type(project_id, checker, type_parameter);
+            resp.constraint_type = self.register_type(project_id, checker, constraint_type);
+            resp.name_type = self.register_type(project_id, checker, name_type);
+            resp.template_type = self.register_type(project_id, checker, template_type);
+        }
+        // ts#64109
+        // PORT: the labeled declarations are copied out of the checker arena
+        // before the node handles are built.
+        let labeled_declarations: Option<Vec<Node>> = {
+            let c = checker.borrow();
+            if c.is_tuple_type_target(t) {
+                Some(
+                    c.ty(t)
+                        .as_tuple_type()
+                        .element_infos()
+                        .iter()
+                        .map(|info| info.labeled_declaration())
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        };
+        if let Some(element_infos) = labeled_declarations {
+            for (i, &declaration) in element_infos.iter().enumerate() {
+                if declaration.is_some() {
+                    if resp.labeled_element_declarations.is_empty() {
+                        resp.labeled_element_declarations =
+                            vec![NodeHandle::default(); element_infos.len()];
+                    }
+                    resp.labeled_element_declarations[i] = self.node_handle_from(declaration);
+                }
+            }
+        }
+        Some(resp)
     }
 
     // Go: api/session.go:136 registerType
     pub fn register_type(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         checker: &Rc<RefCell<Checker>>,
         t: TypeId,
     ) -> TypeID {
@@ -345,7 +410,7 @@ impl SnapshotData {
     // PORT: returns the checker that owns the type with it (file header).
     pub fn resolve_type_handle(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         handle: TypeID,
     ) -> Result<(Rc<RefCell<Checker>>, TypeId), GoError> {
         if handle.0 == 0 {
@@ -396,7 +461,7 @@ impl SnapshotData {
     // PORT: returns the checker that owns the signature with it (file header).
     pub fn resolve_signature_handle(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         handle: SignatureID,
     ) -> Result<(Rc<RefCell<Checker>>, SignatureId), GoError> {
         if handle.0 == 0 {
@@ -446,7 +511,7 @@ impl SnapshotData {
     // newSignatureResponse registers a signature in the project's registry and returns the response.
     pub fn new_signature_response(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         checker: &Rc<RefCell<Checker>>,
         sig: SignatureId,
     ) -> Option<SignatureResponse> {
@@ -487,7 +552,7 @@ impl SnapshotData {
     // Go: api/session.go:240 registerSignature
     pub fn register_signature(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         checker: &Rc<RefCell<Checker>>,
         sig: SignatureId,
     ) -> SignatureID {
@@ -636,31 +701,69 @@ pub fn checker_signature(
 // It implements the Handler interface to process incoming API requests.
 // The session supports multiple active snapshots, each with their own
 // symbol and type registries for maintaining object identity.
+// PORT: ts#64163 gives the session a snapshot host, and a project session
+// only in LSP mode (Go nil is `None`).
 pub struct Session {
     pub id: String,
-    pub project_session: Rc<project::Session>,
+    pub snapshot_host: Rc<project::SnapshotHost>,
+    pub owns_snapshot_host: bool,
+    // PORT: Go `withLocale func(context.Context) context.Context`.
+    pub with_locale: Rc<dyn Fn(&Context) -> Context>,
+    pub project_session: Option<Rc<project::Session>>,
+
+    // PORT: Go `closeOnce sync.Once`.
+    pub close_once: Cell<bool>,
 
     // This is set to true when using MessagePackProtocol.
     pub use_binary_responses: bool,
+    // ts#64061
+    // PORT: Go `sync.Map` and `atomic.Uint64`; one thread.
+    pub batch_response_pages: RefCell<FxHashMap<String, BatchResponsePage>>,
+    pub next_batch_response_page_id: Cell<u64>,
 
     // snapshots maps snapshot handles to their data. Each snapshot has its own
     // symbol/type registries.
-    // PORT: the port is one thread, so the Go `snapshotsMu` and `updateMu`
-    // locks are not ported.
+    // PORT: the port is one thread, so the Go `snapshotsMu` lock is not
+    // ported.
     pub snapshots: RefCell<FxHashMap<SnapshotID, Rc<SnapshotData>>>,
 
-    // latestSnapshot tracks the most recently created snapshot, used as the diff base
-    // for the next update.
-    pub latest_snapshot: Cell<SnapshotID>,
-
-    // openProjects and openFiles track the projects and files this session
-    // currently holds open in the project session's API state. The session holds
-    // at most one ref per project/file (opens are idempotent), so it can release
-    // exactly those refs on Close and never send a close for a ref it doesn't hold.
+    // openProjects, openFiles, and createdPrograms are the canonical LSP-state resources
+    // owned by this API client. Guarded by languageServerUpdateMu.
+    // PORT: `languageServerUpdateMu` is not ported (one thread).
     pub open_projects: RefCell<FxHashSet<tspath::Path>>,
     pub open_files: RefCell<FxHashSet<tspath::Path>>,
+    pub created_programs: RefCell<FxHashSet<project::SyntheticProjectID>>,
+
+    // ts#64299
+    // PORT: Go `atomic.Uint64` and the mutexes are not ported (one thread).
+    // The program resolution contexts are shared with the resolver factories
+    // (module_resolution.rs header).
+    pub next_module_resolver_id: Cell<u64>,
+    pub module_resolvers: RefCell<FxHashMap<ModuleResolverID, Rc<ModuleResolverRegistration>>>,
+    pub program_resolution_contexts: Rc<ProgramResolutionContexts>,
+    pub conn: RefCell<Option<Rc<dyn ipc::Conn>>>,
+    // ts#64158
+    // PORT: the Go `buildMu` lock is not ported (one thread).
+    // PORT: the orchestrator methods take `&mut self`, so each is in a
+    // `RefCell`.
+    pub build_orchestrators: RefCell<
+        FxHashMap<
+            BuildOrchestratorID,
+            Rc<RefCell<crate::execute::build::orchestrator::Orchestrator>>,
+        >,
+    >,
+    // ts#64434
+    // PORT: the Go `sourceFileLeasesMu` lock is not ported (one thread).
+    pub source_file_leases: RefCell<FxHashMap<SourceFileLeaseID, Rc<project::SourceFileLease>>>,
+    pub next_source_file_lease_id: Cell<u64>,
 
     pub cpu_profiler: crate::pprof::CpuProfiler,
+}
+
+// Go: api/session.go batchResponsePage (ts#64061)
+#[derive(Debug, Default)]
+pub struct BatchResponsePage {
+    pub encoded_responses: Vec<JsonValue>,
 }
 
 // Go: api/session.go:284 `var _ Handler = (*Session)(nil)`
@@ -675,40 +778,126 @@ pub struct SessionOptions {
     pub use_binary_responses: bool,
 }
 
-// Go: api/session.go:293 NewSession
-// NewSession creates a new API session with the given project session.
-pub fn new_session(
+// Go: api/session.go DefaultMaxResponseBytesPerPage (ts#64061)
+// DefaultMaxResponseBytesPerPage leaves room for base64 expansion beneath V8's
+// maximum string length while rounding down to an even decimal value.
+pub const DEFAULT_MAX_RESPONSE_BYTES_PER_PAGE: i32 = 300_000_000;
+
+// Go: api/session.go NewLSPSession (ts#64163)
+// NewLSPSession creates a new API session with the given project session.
+pub fn new_lsp_session(
     project_session: Rc<project::Session>,
     options: Option<&SessionOptions>,
 ) -> Rc<Session> {
+    let with_locale_session = project_session.clone();
+    let mut s = new_session(
+        project_session.snapshot_host.clone(),
+        Some(Rc::new(move |ctx: &Context| {
+            with_locale_session.with_current_locale(ctx)
+        })),
+        options,
+    );
+    s.project_session = Some(project_session);
+    Rc::new(s)
+}
+
+// Go: api/session.go NewStandaloneSession (ts#64163)
+// NewStandaloneSession creates an API session with an independently owned snapshot host.
+pub fn new_standalone_session(
+    init: &project::SessionInit,
+    options: Option<&SessionOptions>,
+) -> Rc<Session> {
+    let snapshot_host = project::new_snapshot_host(init);
+    let mut s = new_session(snapshot_host, None, options);
+    s.owns_snapshot_host = true;
+    Rc::new(s)
+}
+
+// Go: api/session.go newSession (ts#64163)
+// PORT: returns the session by value so the two constructors can set their
+// fields before it is shared.
+pub fn new_session(
+    snapshot_host: Rc<project::SnapshotHost>,
+    with_locale: Option<Rc<dyn Fn(&Context) -> Context>>,
+    options: Option<&SessionOptions>,
+) -> Session {
     let id = SESSION_ID_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+    let with_locale = with_locale.unwrap_or_else(|| Rc::new(|ctx: &Context| ctx.clone()));
     let mut s = Session {
         id: format_session_id(id),
-        project_session,
+        snapshot_host,
+        owns_snapshot_host: false,
+        with_locale,
+        project_session: None,
+        close_once: Cell::new(false),
         use_binary_responses: false,
+        batch_response_pages: RefCell::new(FxHashMap::default()),
+        next_batch_response_page_id: Cell::new(0),
         snapshots: RefCell::new(FxHashMap::default()),
-        latest_snapshot: Cell::new(SnapshotID(0)),
         open_projects: RefCell::new(FxHashSet::default()),
         open_files: RefCell::new(FxHashSet::default()),
+        created_programs: RefCell::new(FxHashSet::default()),
+        next_module_resolver_id: Cell::new(0),
+        module_resolvers: RefCell::new(FxHashMap::default()),
+        program_resolution_contexts: Rc::new(ProgramResolutionContexts::default()),
+        conn: RefCell::new(None),
+        build_orchestrators: RefCell::new(FxHashMap::default()),
+        source_file_leases: RefCell::new(FxHashMap::default()),
+        next_source_file_lease_id: Cell::new(0),
         cpu_profiler: crate::pprof::CpuProfiler::default(),
     };
     if let Some(options) = options {
         s.use_binary_responses = options.use_binary_responses;
     }
-    Rc::new(s)
+    s
 }
 
-// PORT: Go `project.Session` satisfies `tsoptions.ParseConfigHost` through
-// its `FS` and `GetCurrentDirectory` methods (handleParseConfigFile passes
-// it). Rust needs the impl; it forwards to the inherent methods.
-impl tsoptions::ParseConfigHost for project::Session {
+// PORT: Go `project.SnapshotHost` satisfies `tsoptions.ParseConfigHost`
+// through its `FS` and `GetCurrentDirectory` methods; the config handlers
+// pass it (ts#64163). Rust needs the impl; it forwards to the inherent
+// methods.
+impl tsoptions::ParseConfigHost for project::SnapshotHost {
     fn fs(&self) -> Rc<dyn vfs::Fs> {
-        project::Session::fs(self)
+        project::SnapshotHost::fs(self)
     }
 
     fn get_current_directory(&self) -> String {
-        project::Session::get_current_directory(self)
+        project::SnapshotHost::get_current_directory(self)
     }
+}
+
+// Go: api/session.go languageServerSnapshotUpdate (ts#64204)
+pub struct LanguageServerSnapshotUpdate {
+    pub request: project::APISnapshotRequest,
+    pub open_state: SnapshotOpenState,
+}
+
+impl LanguageServerSnapshotUpdate {
+    // Go: api/session.go languageServerSnapshotUpdate.commit (ts#64204)
+    pub fn commit(&self, s: &Session, snapshot: &project::Snapshot) {
+        *s.open_projects.borrow_mut() = self.open_state.open_projects.clone();
+        *s.open_files.borrow_mut() = self.open_state.open_files.clone();
+        if let Some(remove_programs) = &self.request.remove_programs {
+            for program_id in remove_programs {
+                s.created_programs.borrow_mut().remove(program_id);
+            }
+        }
+        for program in snapshot.created_programs() {
+            let id = program.borrow().id();
+            let (program_id, ok) = id.synthetic();
+            if !ok {
+                panic!("created program has non-synthetic project ID: {}", id.0);
+            }
+            s.created_programs.borrow_mut().insert(program_id);
+        }
+    }
+}
+
+// Go: api/session.go snapshotOpenState (ts#64204)
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotOpenState {
+    pub open_projects: FxHashSet<tspath::Path>,
+    pub open_files: FxHashSet<tspath::Path>,
 }
 
 // Go: api/session.go:317 snapshotHandle
@@ -725,15 +914,12 @@ pub struct CheckerSetup {
     pub program: Rc<compiler::NewProgram>,
     pub checker: Rc<RefCell<Checker>>,
     pub done: ls_program::Release,
-    pub project_id: ProjectID,
+    pub project_id: project::ID,
 }
 
 impl CheckerSetup {
-    // Go: api/session.go:464 checkerSetup.newTypeResponse
-    pub fn new_type_response(&self, t: TypeId) -> Option<TypeResponse> {
-        self.sd
-            .new_type_response(&self.project_id, &self.checker, t)
-    }
+    // ts#64397: Go `checkerSetup.newTypeResponse` is gone; callers use
+    // `setup.sd.new_type_response(&setup.project_id, &setup.checker, t)`.
 
     // Go: api/session.go:468 checkerSetup.newSymbolResponse
     pub fn new_symbol_response(&self, sym: SymbolId) -> Option<SymbolResponse> {
@@ -745,6 +931,41 @@ impl CheckerSetup {
     pub fn new_signature_response(&self, sig: SignatureId) -> Option<SignatureResponse> {
         self.sd
             .new_signature_response(&self.project_id, &self.checker, sig)
+    }
+
+    // Go: api/session.go checkerSetup.newIndexInfoResponse (ts#64264)
+    // PORT: Go dereferences the `*TypeResponse` (`*setup.newTypeResponse(..)`),
+    // which panics on nil.
+    pub fn new_index_info_response(&self, info: IndexInfoId) -> Option<IndexInfoResponse> {
+        if info.is_nil() {
+            return None;
+        }
+        let (key_type, value_type, is_readonly, declaration) = {
+            let c = self.checker.borrow();
+            let info = c.index_info(info);
+            (
+                info.key_type(),
+                info.value_type(),
+                info.is_readonly(),
+                info.declaration(),
+            )
+        };
+        let mut result = IndexInfoResponse {
+            key_type: self
+                .sd
+                .new_type_response(&self.project_id, &self.checker, key_type)
+                .expect("invalid memory address or nil pointer dereference"),
+            value_type: self
+                .sd
+                .new_type_response(&self.project_id, &self.checker, value_type)
+                .expect("invalid memory address or nil pointer dereference"),
+            is_readonly,
+            ..Default::default()
+        };
+        if declaration.is_some() {
+            result.declaration = self.sd.node_handle_from(declaration);
+        }
+        Some(result)
     }
 
     // Go: api/session.go:476 checkerSetup.resolveTypeHandle
@@ -833,10 +1054,35 @@ impl Session {
         self.id.clone()
     }
 
-    // Go: api/session.go:312 ProjectSession
-    // ProjectSession returns the underlying project session.
-    pub fn project_session(&self) -> Rc<project::Session> {
-        self.project_session.clone()
+    // Go: api/session.go SetConnection (ts#64299)
+    pub fn set_connection(&self, conn: Rc<dyn ipc::Conn>) {
+        *self.conn.borrow_mut() = Some(conn);
+    }
+
+    // Go: api/session.go GetCurrentDirectory (ts#64163)
+    pub fn get_current_directory(&self) -> String {
+        self.snapshot_host.get_current_directory()
+    }
+
+    // Go: api/session.go FS (ts#64163)
+    pub fn fs(&self) -> Rc<dyn vfs::Fs> {
+        if let Some(project_session) = &self.project_session {
+            return project_session.fs();
+        }
+        self.snapshot_host.fs()
+    }
+
+    // Go: api/session.go DefaultLibraryPath (ts#64158)
+    pub fn default_library_path(&self) -> String {
+        if let Some(project_session) = &self.project_session {
+            return project_session.default_library_path();
+        }
+        self.snapshot_host.default_library_path()
+    }
+
+    // Go: api/session.go useCaseSensitiveFileNames (ts#64163)
+    pub fn use_case_sensitive_file_names(&self) -> bool {
+        self.snapshot_host.fs().use_case_sensitive_file_names()
     }
 
     // Go: api/session.go:322 getSnapshotData
@@ -878,7 +1124,8 @@ impl Session {
         sd.ref_count.set(sd.ref_count.get() - 1);
         if sd.ref_count.get() <= 0 {
             self.snapshots.borrow_mut().remove(&handle);
-            project::Snapshot::deref(&sd.snapshot, &self.project_session);
+            // ts#64163: the snapshot derefs without the project session.
+            project::Snapshot::deref(&sd.snapshot);
         }
         Ok(())
     }
@@ -890,7 +1137,7 @@ impl Session {
         &self,
         ctx: &Context,
         snapshot: SnapshotID,
-        project_handle: &ProjectID,
+        project_handle: &project::ID,
     ) -> Result<CheckerSetup, GoError> {
         let sd = self.get_snapshot_data(snapshot)?;
 
@@ -921,30 +1168,29 @@ impl Session {
     // are produced on the persistent API checker and stay resolvable. Only safe when the
     // LS operation acquires a checker exactly once; nested acquisitions (e.g. find-all-
     // references) would deadlock on the single-slot persistent checker.
+    // ts#64133: takes the snapshot, not the snapshot data.
     pub fn setup_language_service(
         &self,
-        sd: &SnapshotData,
+        snapshot: &Rc<project::Snapshot>,
         program: Rc<compiler::NewProgram>,
-        project_handle: &ProjectID,
+        project_handle: &project::ID,
         active_file: &str,
     ) -> Result<ls::LanguageService, GoError> {
-        let project_name = parse_project_handle(project_handle);
-        let proj = sd
-            .snapshot
-            .project_collection
-            .get_project_by_path(&project_name);
+        // ts#64319: looked up by project ID.
+        let proj = snapshot.project_collection.get_project(project_handle);
         let Some(proj) = proj else {
             return Err(errors::errorf(
                 format!(
                     "{}: project {} not found",
-                    *ERR_CLIENT_ERROR,
-                    project_name.as_str()
+                    *ERR_CLIENT_ERROR, project_handle.0
                 ),
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
         };
-        let project_id = proj.borrow().id();
-        let host: Rc<dyn ls::Host> = sd.snapshot.clone();
+        // ts#64319: Go passes `proj.ID()` as the `autoimport.ProjectID`
+        // interface value; the Rust type is `autoimport::ProjectID`.
+        let project_id = autoimport::ProjectID(proj.borrow().id().0);
+        let host: Rc<dyn ls::Host> = snapshot.clone();
         Ok(ls::new_language_service(
             project_id,
             program,
@@ -963,6 +1209,8 @@ impl ipc::Handler for Session {
         method: &str,
         params: JsonValue,
     ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        // ts#64163
+        let ctx = &(self.with_locale)(ctx);
         // Handle simple methods that don't need param parsing
         match method {
             "echo" => {
@@ -989,13 +1237,52 @@ impl ipc::Handler for Session {
         };
 
         match method {
+            // ts#63937
+            m if m == Method::BATCH_REQUESTS.0 => self
+                .handle_batch_requests(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::RELEASE.0 => self.handle_release(ctx, Some(assert_params(&parsed))),
+            // ts#64434
+            m if m == Method::RELEASE_SOURCE_FILE.0 => {
+                self.handle_release_source_file(Some(assert_params(&parsed)))
+            }
             m if m == Method::INITIALIZE.0 => self.handle_initialize(ctx).map(to_any),
+            // ts#64204
+            m if m == Method::CREATE_SNAPSHOT.0 => self
+                .handle_create_snapshot(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::UPDATE_SNAPSHOT.0 => self
                 .handle_update_snapshot(ctx, assert_params(&parsed))
                 .map(to_any),
-            m if m == Method::UPDATE_TEMPORARY_SNAPSHOT.0 => self
-                .handle_update_temporary_snapshot(ctx, assert_params(&parsed))
+            m if m == Method::GET_CURRENT_LANGUAGE_SERVER_SNAPSHOT.0 => self
+                .handle_get_current_language_server_snapshot(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64299
+            m if m == Method::CREATE_MODULE_RESOLVER.0 => self
+                .handle_create_module_resolver(assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::RELEASE_MODULE_RESOLVER.0 => {
+                self.handle_release_module_resolver(assert_params(&parsed))
+            }
+            m if m == Method::RESOLVE_MODULE_NAME.0 => self
+                .handle_resolve_module_name(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64158
+            m if m == Method::CREATE_BUILD_ORCHESTRATOR.0 => self
+                .handle_create_build_orchestrator(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::DISPOSE_BUILD_ORCHESTRATOR.0 => {
+                self.handle_dispose_build_orchestrator(ctx, assert_params(&parsed))
+            }
+            m if m == Method::BUILD.0 => self.handle_build(ctx, assert_params(&parsed)).map(to_any),
+            m if m == Method::BUILD_REFERENCES.0 => self
+                .handle_build_references(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::CLEAN_BUILD.0 => self
+                .handle_clean_build(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::CLEAN_REFERENCES.0 => self
+                .handle_clean_references(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::PARSE_COMMAND_LINE.0 => self
                 .handle_parse_command_line(ctx, assert_params(&parsed))
@@ -1009,6 +1296,13 @@ impl ipc::Handler for Session {
             m if m == Method::PARSE_CONFIG_FILE.0 => self
                 .handle_parse_config_file(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#64216
+            m if m == Method::CREATE_SOURCE_FILE.0 => {
+                self.handle_create_source_file(ctx, assert_params(&parsed))
+            }
+            m if m == Method::CREATE_SOURCE_FILE_FROM_FILE.0 => {
+                self.handle_create_source_file_from_file(ctx, assert_params(&parsed))
+            }
             // tsgo#4849
             m if m == Method::TRANSPILE_MODULE.0 => self
                 .handle_transpile(ctx, assert_params(&parsed), false)
@@ -1033,6 +1327,29 @@ impl ipc::Handler for Session {
                 .map(to_any),
             m if m == Method::GET_SOURCE_FILE_METADATA.0 => self
                 .handle_get_source_file_metadata(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64292
+            m if m == Method::GET_MODE_FOR_USAGE_LOCATION.0 => self
+                .handle_get_mode_for_usage_location(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_MODE_FOR_RESOLUTION_AT_INDEX.0 => self
+                .handle_get_mode_for_resolution_at_index(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64247
+            m if m == Method::GET_RESOLVED_MODULE.0 => self
+                .handle_get_resolved_module(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_RESOLVED_MODULE_FROM_MODULE_SPECIFIER.0 => self
+                .handle_get_resolved_module_from_module_specifier(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_RESOLVED_TYPE_REFERENCE_DIRECTIVE.0 => self
+                .handle_get_resolved_type_reference_directive(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_RESOLVED_TYPE_REFERENCE_DIRECTIVE_FROM_REFERENCE.0 => self
+                .handle_get_resolved_type_reference_directive_from_reference(
+                    ctx,
+                    assert_params(&parsed),
+                )
                 .map(to_any),
             m if m == Method::GET_CONFIG_FILE_NAMES.0 => self
                 .handle_get_config_file_names(ctx, assert_params(&parsed))
@@ -1066,6 +1383,10 @@ impl ipc::Handler for Session {
                 .map(to_any),
             m if m == Method::GET_DECLARED_TYPE_OF_SYMBOL.0 => self
                 .handle_get_declared_type_of_symbol(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#63956
+            m if m == Method::GET_NON_MISSING_TYPE_OF_SYMBOL.0 => self
+                .handle_get_non_missing_type_of_symbol(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::RESOLVE_NAME.0 => self
                 .handle_resolve_name(ctx, assert_params(&parsed))
@@ -1127,6 +1448,10 @@ impl ipc::Handler for Session {
             m if m == Method::GET_LOCAL_TYPE_PARAMETERS_OF_TYPE.0 => self
                 .handle_get_local_type_parameters_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#64264
+            m if m == Method::GET_THIS_TYPE_OF_TYPE.0 => self
+                .handle_get_this_type_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_ALIAS_TYPE_ARGUMENTS_OF_TYPE.0 => self
                 .handle_get_alias_type_arguments_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1151,6 +1476,19 @@ impl ipc::Handler for Session {
             m if m == Method::GET_CONSTRAINT_OF_TYPE.0 => self
                 .handle_get_constraint_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#64397
+            m if m == Method::GET_TYPE_PARAMETER_OF_MAPPED_TYPE.0 => self
+                .handle_get_type_parameter_of_mapped_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_CONSTRAINT_TYPE_OF_MAPPED_TYPE.0 => self
+                .handle_get_constraint_type_of_mapped_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_NAME_TYPE_OF_MAPPED_TYPE.0 => self
+                .handle_get_name_type_of_mapped_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_TEMPLATE_TYPE_OF_MAPPED_TYPE.0 => self
+                .handle_get_template_type_of_mapped_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_TRUE_TYPE_OF_CONDITIONAL_TYPE.0 => self
                 .handle_get_true_type_of_conditional_type(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1171,6 +1509,13 @@ impl ipc::Handler for Session {
                 .map(to_any),
             m if m == Method::GET_CONTEXTUAL_TYPE.0 => self
                 .handle_get_contextual_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64264
+            m if m == Method::GET_CONTEXTUAL_TYPE_FOR_ARGUMENT.0 => self
+                .handle_get_contextual_type_for_argument(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_AWAITED_TYPE.0 => self
+                .handle_get_awaited_type(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_BASE_TYPE_OF_LITERAL_TYPE.0 => self
                 .handle_get_base_type_of_literal_type(ctx, assert_params(&parsed))
@@ -1252,8 +1597,19 @@ impl ipc::Handler for Session {
             m if m == Method::GET_APPARENT_TYPE.0 => self
                 .handle_get_apparent_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#63899
+            m if m == Method::GET_REDUCED_TYPE.0 => self
+                .handle_get_reduced_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_PROPERTY_OF_TYPE.0 => self
                 .handle_get_property_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64264
+            m if m == Method::GET_TYPE_OF_PROPERTY_OF_TYPE.0 => self
+                .handle_get_type_of_property_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_INDEX_INFO_OF_TYPE.0 => self
+                .handle_get_index_info_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_INDEX_INFOS_OF_TYPE.0 => self
                 .handle_get_index_infos_of_type(ctx, assert_params(&parsed))
@@ -1273,9 +1629,9 @@ impl ipc::Handler for Session {
             m if m == Method::GET_IMPORT_ADDER_EDITS.0 => self
                 .handle_get_import_adder_edits(ctx, assert_params(&parsed))
                 .map(to_any),
-            m if m == Method::GET_CONSTANT_VALUE.0 => {
-                self.handle_get_constant_value(ctx, assert_params(&parsed))
-            }
+            m if m == Method::GET_CONSTANT_VALUE.0 => self
+                .handle_get_constant_value(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_SIGNATURE_FROM_DECLARATION.0 => self
                 .handle_get_signature_from_declaration(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1287,6 +1643,14 @@ impl ipc::Handler for Session {
                 .map(to_any),
             m if m == Method::GET_IMMEDIATE_ALIASED_SYMBOL.0 => self
                 .handle_get_immediate_aliased_symbol(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#63945
+            m if m == Method::GET_TARGET_SYMBOL.0 => self
+                .handle_method_get_target_symbol(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64264
+            m if m == Method::GET_EXPORT_SYMBOL_OF_SYMBOL_FOR_CHECKER.0 => self
+                .handle_get_export_symbol_of_symbol_for_checker(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_FULLY_QUALIFIED_NAME.0 => self
                 .handle_get_fully_qualified_name(ctx, assert_params(&parsed))
@@ -1306,8 +1670,9 @@ impl ipc::Handler for Session {
             m if m == Method::IS_ARRAY_TYPE.0 => self
                 .handle_is_array_type(ctx, assert_params(&parsed))
                 .map(to_any),
-            m if m == Method::IS_TUPLE_TYPE.0 => self
-                .handle_is_tuple_type(ctx, assert_params(&parsed))
+            // ts#63943
+            m if m == Method::IS_READONLY_SYMBOL.0 => self
+                .handle_is_readonly_symbol(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_ANY_TYPE.0 => self
                 .handle_get_intrinsic_type(ctx, assert_params(&parsed), Checker::get_any_type)
@@ -1416,6 +1781,171 @@ impl ipc::Handler for Session {
 }
 
 impl Session {
+    // Go: api/session.go handleBatchRequests (ts#63937)
+    // PORT: Go returns the unpaginated response for a nil session (a test
+    // path); a Rust session is never nil.
+    pub fn handle_batch_requests(
+        &self,
+        ctx: &Context,
+        params: &BatchRequestsParams,
+    ) -> Result<BatchRequestsResponse, GoError> {
+        if !params.continuation_token.is_empty() {
+            let page = self
+                .batch_response_pages
+                .borrow_mut()
+                .remove(&params.continuation_token);
+            let Some(page) = page else {
+                return Err(errors::errorf(
+                    format!("{}: invalid batch continuation token", *ERR_CLIENT_ERROR),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            return self.paginate_batch_responses(page, None, params.max_response_bytes_per_page);
+        }
+
+        let mut responses = Vec::with_capacity(params.requests.len());
+        for request in &params.requests {
+            responses.push(self.handle_batch_request(ctx, request));
+        }
+        let page = new_batch_response_page(&responses)?;
+        self.paginate_batch_responses(page, Some(responses), params.max_response_bytes_per_page)
+    }
+
+    // Go: api/session.go paginateBatchResponses (ts#64061)
+    // PORT: Go `responses` nil is `None`.
+    pub fn paginate_batch_responses(
+        &self,
+        page: BatchResponsePage,
+        responses: Option<Vec<BatchResponse>>,
+        mut max_response_bytes_per_page: i32,
+    ) -> Result<BatchRequestsResponse, GoError> {
+        if max_response_bytes_per_page <= 0 {
+            max_response_bytes_per_page = DEFAULT_MAX_RESPONSE_BYTES_PER_PAGE;
+        }
+        let max_response_bytes_per_page = max_response_bytes_per_page as usize;
+        let mut encoded_length = r#"{"responses":[]}"#.len();
+        let mut page_length = 0usize;
+        for encoded in &page.encoded_responses {
+            let mut additional_length = encoded.0.len();
+            if page_length > 0 {
+                additional_length += 1;
+            }
+            if page_length > 0 && encoded_length + additional_length > max_response_bytes_per_page {
+                break;
+            }
+            encoded_length += additional_length;
+            page_length += 1;
+        }
+
+        if page_length == page.encoded_responses.len() {
+            return Ok(BatchRequestsResponse {
+                responses: responses.unwrap_or_default(),
+                continuation_token: String::new(),
+                encoded_responses: Some(page.encoded_responses),
+            });
+        }
+        self.next_batch_response_page_id
+            .set(self.next_batch_response_page_id.get() + 1);
+        let continuation_token = format!("{}-{}", self.id, self.next_batch_response_page_id.get());
+        let continuation_length = r#","continuationToken":"""#.len() + continuation_token.len();
+        while page_length > 1 && encoded_length + continuation_length > max_response_bytes_per_page
+        {
+            encoded_length -= page.encoded_responses[page_length - 1].0.len() + 1;
+            page_length -= 1;
+        }
+        let mut current_responses = page.encoded_responses;
+        let remaining_responses = current_responses.split_off(page_length);
+        let mut response = BatchRequestsResponse {
+            responses: Vec::new(),
+            continuation_token: continuation_token.clone(),
+            encoded_responses: Some(current_responses),
+        };
+        if let Some(mut responses) = responses {
+            responses.truncate(page_length);
+            response.responses = responses;
+        }
+        self.batch_response_pages.borrow_mut().insert(
+            continuation_token,
+            BatchResponsePage {
+                encoded_responses: remaining_responses,
+            },
+        );
+        Ok(response)
+    }
+
+    // Go: api/session.go handleBatchRequest (ts#63937)
+    // PORT: Go recovers a panic in a deferred function; `catch_unwind` covers
+    // the same call. Go `debug.Stack()` is the backtrace at the recover point.
+    pub fn handle_batch_request(&self, ctx: &Context, request: &BatchRequest) -> BatchResponse {
+        let mut response = BatchResponse {
+            method: request.method.clone(),
+            ..Default::default()
+        };
+        // ts#64061
+        if request.method == Method::BATCH_REQUESTS {
+            response.error = format!("{}: batchRequests cannot be nested", *ERR_INVALID_REQUEST);
+            return response;
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ipc::Handler::handle_request(self, ctx, &request.method.0, request.params.clone())
+        }));
+        match outcome {
+            Ok(Ok(result)) => response.result = result,
+            Ok(Err(err)) => response.error = err.error(),
+            Err(recovered) => {
+                response.result = None;
+                response.error = format!(
+                    "panic: {}\n{}",
+                    ipc::conn::recovered_value(recovered.as_ref()),
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
+        // ts#64216
+        // PORT: Go `RawBinary(nil)` is an empty `RawBinary` (an encoded file
+        // is never empty).
+        if is_source_file_response_method(&request.method)
+            && let Some(data) = response
+                .result
+                .as_deref()
+                .and_then(|result| result.downcast_ref::<RawBinary>())
+        {
+            if data.0.is_empty() {
+                response.result = None;
+            } else {
+                response.result = to_any(SourceFileResponse {
+                    data: base64_std_encoding_encode_to_string(&data.0),
+                });
+            }
+        }
+        response
+    }
+}
+
+// Go: api/session.go isSourceFileResponseMethod (ts#64216)
+pub fn is_source_file_response_method(method: &Method) -> bool {
+    *method == Method::CREATE_SOURCE_FILE
+        || *method == Method::CREATE_SOURCE_FILE_FROM_FILE
+        || *method == Method::GET_SOURCE_FILE
+        || *method == Method::GET_CONFIG_SOURCE_FILE
+        || *method == Method::TYPE_TO_TYPE_NODE
+        || *method == Method::SIGNATURE_TO_SIGNATURE_DECLARATION
+}
+
+// Go: api/session.go newBatchResponsePage (ts#64061)
+pub fn new_batch_response_page(responses: &[BatchResponse]) -> Result<BatchResponsePage, GoError> {
+    let mut encoded_responses = Vec::with_capacity(responses.len());
+    for response in responses {
+        let encoded = match crate::frontend::json::json_marshal(response, &[]) {
+            Ok(encoded) => encoded,
+            Err(err) => return Err(errors::from_value(err)),
+        };
+        encoded_responses.push(JsonValue(encoded.into_bytes()));
+    }
+    Ok(BatchResponsePage { encoded_responses })
+}
+
+impl Session {
     // Go: api/session.go:579 handleStartCPUProfile
     pub fn handle_start_cpu_profile(
         &self,
@@ -1478,143 +2008,466 @@ impl Session {
     // Go: api/session.go:614 handleInitialize
     pub fn handle_initialize(&self, _ctx: &Context) -> Result<InitializeResponse, GoError> {
         Ok(InitializeResponse {
-            use_case_sensitive_file_names: self
-                .project_session
-                .fs()
-                .use_case_sensitive_file_names(),
-            current_directory: self.project_session.get_current_directory(),
+            use_case_sensitive_file_names: self.use_case_sensitive_file_names(),
+            current_directory: self.get_current_directory(),
         })
     }
 
-    // Go: api/session.go:827 handleUpdateSnapshot
-    // handleUpdateSnapshot creates a new snapshot, optionally opening or closing
-    // projects and files. With no args, it adopts the latest LSP state. Opens and
-    // closes are ref-counted per session: the session holds at most one ref per
-    // project/file, so repeated opens are idempotent and a close only releases a ref
-    // the session is actually holding.
-    // PORT: the Go `updateMu` lock is not ported (one thread).
+    // Go: api/session.go handleCreateSnapshot (ts#64204)
+    // handleCreateSnapshot creates a new independent snapshot.
+    pub fn handle_create_snapshot(
+        &self,
+        ctx: &Context,
+        params: &CreateSnapshotParams,
+    ) -> Result<CreateSnapshotResponse, GoError> {
+        let mut api_request =
+            self.to_api_snapshot_request(ctx, &params.snapshot_request_changes_params)?;
+
+        let open_state =
+            self.reconcile_snapshot_opens(&mut api_request, SnapshotOpenState::default());
+        let mut file_changes = self.to_file_change_summary(params.file_notifications.as_ref());
+        let mut snapshot_file_system: Option<Rc<dyn vfs::Fs>> = None;
+        if let Some(request_file_system) = &params.file_system {
+            let file_system = match requestfilesystem::new_for_update(
+                Some(request_file_system),
+                self.fs(),
+                &self.get_current_directory(),
+                &mut file_changes,
+            ) {
+                Ok(file_system) => file_system,
+                Err(file_system_err) => {
+                    return Err(errors::errorf(
+                        format!("{}: {}", *ERR_CLIENT_ERROR, file_system_err),
+                        vec![ERR_CLIENT_ERROR.clone(), file_system_err],
+                    ));
+                }
+            };
+            snapshot_file_system = Some(file_system.clone());
+            api_request.file_system = Some(file_system);
+            api_request.replace_file_system =
+                request_file_system.kind == requestfilesystem::Kind::FULL;
+        }
+        let root = self.snapshot_host.new_root_snapshot_exported();
+        let (snapshot, err) =
+            self.snapshot_host
+                .clone_snapshot(ctx, &root, file_changes, Some(&api_request));
+        project::Snapshot::deref(&root);
+        if let Some(err) = err {
+            project::Snapshot::deref(&snapshot);
+            return Err(errors::errorf(
+                format!("{}: failed to create snapshot: {}", *ERR_CLIENT_ERROR, err),
+                vec![ERR_CLIENT_ERROR.clone(), err],
+            ));
+        }
+        // ts#64299
+        if let Some(err) = module_resolution_error(&snapshot) {
+            project::Snapshot::deref(&snapshot);
+            return Err(err);
+        }
+
+        let response = self.create_snapshot_response(
+            &snapshot,
+            None,
+            Some(&params.snapshot_request_changes_params),
+        );
+        self.register_snapshot(snapshot, open_state, snapshot_file_system);
+        Ok(response)
+    }
+
+    // Go: api/session.go handleUpdateSnapshot (ts#64204)
+    // PORT: Go `defer func() { _ = s.releaseSnapshot(params.Snapshot) }()`: the
+    // body runs in a closure, and the release runs after it on every path.
     pub fn handle_update_snapshot(
         &self,
         ctx: &Context,
         params: &UpdateSnapshotParams,
-    ) -> Result<UpdateSnapshotResponse, GoError> {
-        let file_changes = self.to_file_change_summary(params.file_changes.as_ref());
-
-        let mut api_request = project::APISnapshotRequest::default();
-        let cwd = self.project_session.get_current_directory();
-
-        // Open projects: only take a new ref for projects we aren't already holding open.
-        let mut opened_projects: Vec<tspath::Path> = Vec::new();
-        for p in &params.open_projects {
-            let config_file_name = p.to_absolute_file_name(&cwd);
-            let config_path = self.to_path(&config_file_name);
-            if self.open_projects.borrow().contains(&config_path) {
-                continue;
+    ) -> Result<CreateSnapshotResponse, GoError> {
+        let base_sd = self.retain_snapshot_data(params.snapshot)?;
+        let result = (|| {
+            let default_changes = CreateSnapshotParams::default();
+            let changes = params.changes.as_ref().unwrap_or(&default_changes);
+            let mut api_request =
+                self.to_api_snapshot_request(ctx, &changes.snapshot_request_changes_params)?;
+            let open_state = self.reconcile_snapshot_opens(
+                &mut api_request,
+                SnapshotOpenState {
+                    open_projects: base_sd.open_projects.clone(),
+                    open_files: base_sd.open_files.clone(),
+                },
+            );
+            let mut file_changes = self.to_file_change_summary(changes.file_notifications.as_ref());
+            let mut snapshot_file_system = base_sd.file_system.clone();
+            if let Some(request_file_system) = &changes.file_system {
+                let base_file_system = snapshot_file_system.clone().unwrap_or_else(|| self.fs());
+                let file_system = match requestfilesystem::new_for_update(
+                    Some(request_file_system),
+                    base_file_system,
+                    &self.get_current_directory(),
+                    &mut file_changes,
+                ) {
+                    Ok(file_system) => file_system,
+                    Err(file_system_err) => {
+                        return Err(errors::errorf(
+                            format!("{}: {}", *ERR_CLIENT_ERROR, file_system_err),
+                            vec![ERR_CLIENT_ERROR.clone(), file_system_err],
+                        ));
+                    }
+                };
+                snapshot_file_system = Some(file_system);
             }
+            if let Some(snapshot_file_system) = &snapshot_file_system {
+                api_request.file_system = Some(snapshot_file_system.clone());
+                api_request.replace_file_system = changes
+                    .file_system
+                    .as_ref()
+                    .is_some_and(|file_system| file_system.kind == requestfilesystem::Kind::FULL);
+            }
+            let (snapshot, err) = self.snapshot_host.clone_snapshot(
+                ctx,
+                &base_sd.snapshot,
+                file_changes,
+                Some(&api_request),
+            );
+            if let Some(err) = err {
+                project::Snapshot::deref(&snapshot);
+                return Err(errors::errorf(
+                    format!("{}: failed to update snapshot: {}", *ERR_CLIENT_ERROR, err),
+                    vec![ERR_CLIENT_ERROR.clone(), err],
+                ));
+            }
+            // ts#64299
+            if let Some(err) = module_resolution_error(&snapshot) {
+                project::Snapshot::deref(&snapshot);
+                return Err(err);
+            }
+
+            let response = self.create_snapshot_response(
+                &snapshot,
+                Some(&base_sd.snapshot),
+                Some(&changes.snapshot_request_changes_params),
+            );
+            self.register_snapshot(snapshot, open_state, snapshot_file_system);
+            Ok(response)
+        })();
+        let _ = self.release_snapshot(params.snapshot);
+        result
+    }
+
+    // Go: api/session.go toAPISnapshotRequest (ts#64204, ts#64319, ts#64324, ts#64391)
+    pub fn to_api_snapshot_request(
+        &self,
+        ctx: &Context,
+        changes: &SnapshotRequestChangesParams,
+    ) -> Result<project::APISnapshotRequest, GoError> {
+        let mut api_request = project::APISnapshotRequest::default();
+        let cwd = self.get_current_directory();
+
+        for p in &changes.open_projects {
+            let config_file_name = p.to_absolute_file_name(&cwd);
+            let (configured_project_id, ok) =
+                project::parse_configured_project_id(&self.to_path(&config_file_name));
+            if !ok {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: invalid configured project ID: {}",
+                        *ERR_CLIENT_ERROR, config_file_name
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            api_request
+                .ensure_programs
+                .get_or_insert_with(|| {
+                    FxHashSet::with_capacity_and_hasher(
+                        changes.open_projects.len(),
+                        Default::default(),
+                    )
+                })
+                .insert(configured_project_id.as_id());
             api_request
                 .open_projects
                 .get_or_insert_with(|| {
                     FxHashSet::with_capacity_and_hasher(
-                        params.open_projects.len(),
+                        changes.open_projects.len(),
                         Default::default(),
                     )
                 })
                 .insert(config_file_name);
-            opened_projects.push(config_path);
         }
 
-        // Close projects: only release a ref we currently hold.
-        let mut closed_projects: Vec<tspath::Path> = Vec::new();
-        for p in &params.close_projects {
+        for p in &changes.close_projects {
             let config_path = self.to_path(&p.to_absolute_file_name(&cwd));
-            if !self.open_projects.borrow().contains(&config_path) {
-                continue;
-            }
             api_request
                 .close_projects
                 .get_or_insert_with(|| {
                     FxHashSet::with_capacity_and_hasher(
-                        params.close_projects.len(),
+                        changes.close_projects.len(),
                         Default::default(),
                     )
                 })
-                .insert(config_path.clone());
-            closed_projects.push(config_path);
+                .insert(config_path);
         }
 
-        // Open files: only open files we aren't already holding open, so each file is
-        // held by at most one API ref from this session.
-        let mut opened_files: Vec<tspath::Path> = Vec::new();
-        for f in &params.open_files {
-            let uri = f.to_uri(&cwd);
-            let path = self.to_path(&uri.file_name());
-            if self.open_files.borrow().contains(&path) {
-                continue;
+        if let Some(open_files) = &changes.open_files {
+            for f in open_files {
+                let file_name = f.to_absolute_file_name(&cwd);
+                let path = self.to_path(&file_name);
+                if api_request.open_files.is_none() {
+                    api_request.open_files = Some(IndexMap::with_capacity(open_files.len()));
+                    api_request.ensure_files = Some(IndexMap::with_capacity(open_files.len()));
+                }
+                let request_open_files = api_request.open_files.as_mut().expect("set above");
+                if !request_open_files.contains_key(&path) {
+                    request_open_files.insert(path.clone(), file_name.clone());
+                    api_request
+                        .ensure_files
+                        .as_mut()
+                        .expect("set above")
+                        .insert(path, file_name);
+                }
             }
-            api_request
-                .open_files
-                .get_or_insert_with(|| IndexSet::with_capacity(params.open_files.len()))
-                .insert(uri);
-            opened_files.push(path);
         }
 
-        // Close files: only release a ref we currently hold.
-        let mut closed_files: Vec<tspath::Path> = Vec::new();
-        for f in &params.close_files {
+        for f in &changes.close_files {
             let path = self.to_path(&f.to_uri(&cwd).file_name());
-            if !self.open_files.borrow().contains(&path) {
-                continue;
-            }
             api_request
                 .close_files
                 .get_or_insert_with(|| {
                     FxHashSet::with_capacity_and_hasher(
-                        params.close_files.len(),
+                        changes.close_files.len(),
                         Default::default(),
                     )
                 })
-                .insert(path.clone());
-            closed_files.push(path);
+                .insert(path);
         }
 
-        // Even when nothing is opened or closed, APIUpdate ensures all projects and
-        // files opened by the API are up to date. For an API connected to an LSP server,
-        // this brings the API state up to date with the LSP state and ensures projects
-        // the API cares about are ready to be queried.
-        let (snapshot, err) = self
-            .project_session
-            .api_update(ctx, &file_changes, api_request);
-        if let Some(err) = err {
-            // APIUpdate returns a ref'd snapshot even on error; release it.
-            project::Snapshot::deref(&snapshot, &self.project_session);
-            return Err(errors::errorf(
-                format!("{}: failed to update snapshot: {}", *ERR_CLIENT_ERROR, err),
-                vec![ERR_CLIENT_ERROR.clone(), err],
+        let create_programs: &[Option<CreateSnapshotProgramParams>] =
+            changes.create_programs.as_deref().unwrap_or(&[]);
+        api_request.create_programs = Vec::with_capacity(create_programs.len());
+        for (i, program_params) in create_programs.iter().enumerate() {
+            let Some(program_params) = program_params else {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: createPrograms[{i}] must not be null",
+                        *ERR_CLIENT_ERROR
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            let root_file_names: Vec<String> = program_params
+                .root_files
+                .iter()
+                .map(|root_file| root_file.to_absolute_file_name(&cwd))
+                .collect();
+            let mut request = project::APICreateProgramRequest {
+                root_file_names,
+                compiler_options: Rc::new(program_params.compiler_options.clone()),
+                ..Default::default()
+            };
+            if let Some(options) = &program_params.options {
+                request.project_references = options.project_references.clone();
+                request.config_file_parsing_diagnostics = options
+                    .config_file_parsing_diagnostics
+                    .iter()
+                    .map(DiagnosticResponse::to_diagnostic)
+                    .collect();
+                // ts#64299
+                request.module_resolver_factory = self.module_resolver_factory(ctx, options)?;
+                request.module_resolver_id = options.module_resolver.0;
+            }
+            api_request.create_programs.push(request);
+        }
+        api_request.reconfigure_programs = Vec::with_capacity(changes.reconfigure_programs.len());
+        let mut reconfigured_program_ids: FxHashSet<project::SyntheticProjectID> =
+            FxHashSet::default();
+        for (i, program_params) in changes.reconfigure_programs.iter().enumerate() {
+            let Some(program_params) = program_params else {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: reconfigurePrograms[{i}] must not be null",
+                        *ERR_CLIENT_ERROR
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            let (program_id, ok) = project::parse_synthetic_project_id(&program_params.id.0);
+            if !ok {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: invalid synthetic project handle: {}",
+                        *ERR_CLIENT_ERROR, program_params.id.0
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            if reconfigured_program_ids.contains(&program_id) {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: synthetic program reconfigured more than once: {}",
+                        *ERR_CLIENT_ERROR, program_id.0
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            reconfigured_program_ids.insert(program_id.clone());
+            let root_file_names: Vec<String> = program_params
+                .root_files
+                .iter()
+                .map(|root_file| root_file.to_absolute_file_name(&cwd))
+                .collect();
+            let mut request = project::APIReconfigureProgramRequest {
+                program_id,
+                api_create_program_request: project::APICreateProgramRequest {
+                    root_file_names,
+                    compiler_options: Rc::new(program_params.compiler_options.clone()),
+                    ..Default::default()
+                },
+            };
+            if let Some(options) = &program_params.options {
+                request.api_create_program_request.project_references =
+                    options.project_references.clone();
+                request
+                    .api_create_program_request
+                    .config_file_parsing_diagnostics = options
+                    .config_file_parsing_diagnostics
+                    .iter()
+                    .map(DiagnosticResponse::to_diagnostic)
+                    .collect();
+                // ts#64299
+                request.api_create_program_request.module_resolver_factory =
+                    self.module_resolver_factory(ctx, options)?;
+                request.api_create_program_request.module_resolver_id = options.module_resolver.0;
+            }
+            api_request.reconfigure_programs.push(request);
+        }
+        if !changes.remove_programs.is_empty() {
+            api_request.remove_programs = Some(FxHashSet::with_capacity_and_hasher(
+                changes.remove_programs.len(),
+                Default::default(),
             ));
         }
-
-        // Commit ref tracking now that the update succeeded.
-        {
-            let mut open_projects = self.open_projects.borrow_mut();
-            for config_path in opened_projects {
-                open_projects.insert(config_path);
+        for program_id in &changes.remove_programs {
+            if reconfigured_program_ids.contains(program_id) {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: synthetic program cannot be reconfigured and removed: {}",
+                        *ERR_CLIENT_ERROR, program_id.0
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
             }
-            for config_path in &closed_projects {
-                open_projects.remove(config_path);
+            api_request
+                .remove_programs
+                .as_mut()
+                .expect("set above")
+                .insert(program_id.clone());
+        }
+        if let Some(ensure_programs) = &changes.ensure_programs {
+            api_request.ensure_all_programs = ensure_programs.all;
+            if !ensure_programs.projects.is_empty() && api_request.ensure_programs.is_none() {
+                api_request.ensure_programs = Some(FxHashSet::with_capacity_and_hasher(
+                    ensure_programs.projects.len(),
+                    Default::default(),
+                ));
+            }
+            for program in &ensure_programs.projects {
+                api_request
+                    .ensure_programs
+                    .as_mut()
+                    .expect("set above")
+                    .insert(program.clone());
             }
         }
-        {
-            let mut open_files = self.open_files.borrow_mut();
-            for path in opened_files {
-                open_files.insert(path);
-            }
-            for path in &closed_files {
-                open_files.remove(path);
+        Ok(api_request)
+    }
+
+    // Go: api/session.go toLanguageServerSnapshotUpdate (ts#64204)
+    pub fn to_language_server_snapshot_update(
+        &self,
+        ctx: &Context,
+        changes: &SnapshotRequestChangesParams,
+    ) -> Result<LanguageServerSnapshotUpdate, GoError> {
+        let mut api_request = self.to_api_snapshot_request(ctx, changes)?;
+        let open_state = self.reconcile_snapshot_opens(
+            &mut api_request,
+            SnapshotOpenState {
+                open_projects: self.open_projects.borrow().clone(),
+                open_files: self.open_files.borrow().clone(),
+            },
+        );
+
+        if let Some(remove_programs) = &mut api_request.remove_programs {
+            let created_programs = self.created_programs.borrow();
+            remove_programs.retain(|program_id| created_programs.contains(program_id));
+        }
+        for reconfigure in &api_request.reconfigure_programs {
+            if !self
+                .created_programs
+                .borrow()
+                .contains(&reconfigure.program_id)
+            {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: synthetic program is not owned by this API session: {}",
+                        *ERR_CLIENT_ERROR, reconfigure.program_id.0
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
             }
         }
+        Ok(LanguageServerSnapshotUpdate {
+            request: api_request,
+            open_state,
+        })
+    }
 
-        // Create or ref-count snapshot data, then atomically read the previous latest
-        // snapshot (the diff base) and advance latestSnapshot to the new handle.
+    // Go: api/session.go reconcileSnapshotOpens (ts#64204)
+    pub fn reconcile_snapshot_opens(
+        &self,
+        api_request: &mut project::APISnapshotRequest,
+        base: SnapshotOpenState,
+    ) -> SnapshotOpenState {
+        let mut state = SnapshotOpenState {
+            open_projects: base.open_projects.clone(),
+            open_files: base.open_files.clone(),
+        };
+        if let Some(close_projects) = &mut api_request.close_projects {
+            close_projects.retain(|path| state.open_projects.remove(path));
+        }
+        if let Some(open_projects) = &mut api_request.open_projects {
+            open_projects.retain(|config_file_name| {
+                let path = self.to_path(config_file_name);
+                if state.open_projects.contains(&path) {
+                    false
+                } else {
+                    state.open_projects.insert(path);
+                    true
+                }
+            });
+        }
+        if let Some(close_files) = &mut api_request.close_files {
+            close_files.retain(|path| state.open_files.remove(path));
+        }
+        if let Some(open_files) = &mut api_request.open_files {
+            open_files.retain(|path, _| {
+                if state.open_files.contains(path) {
+                    false
+                } else {
+                    state.open_files.insert(path.clone());
+                    true
+                }
+            });
+        }
+        state
+    }
+
+    // Go: api/session.go registerSnapshot (ts#64204)
+    pub fn register_snapshot(
+        &self,
+        snapshot: Rc<project::Snapshot>,
+        open_state: SnapshotOpenState,
+        file_system: Option<Rc<dyn vfs::Fs>>,
+    ) {
         // If the same snapshot ID is returned (no changes), we increment the ref count
         // so each client-side Snapshot can be disposed independently.
         let handle = snapshot_handle(&snapshot);
@@ -1622,76 +2475,63 @@ impl Session {
         if let Some(sd) = existing {
             // Same snapshot already stored — release the caller's ref since
             // the stored snapshot already has one, and bump the API refcount.
-            project::Snapshot::deref(&snapshot, &self.project_session);
+            project::Snapshot::deref(&snapshot);
             sd.ref_count.set(sd.ref_count.get() + 1);
         } else {
             let sd = Rc::new(SnapshotData {
-                snapshot: snapshot.clone(),
+                snapshot,
+                file_system,
                 ref_count: Cell::new(1),
+                open_projects: open_state.open_projects.clone(),
+                open_files: open_state.open_files.clone(),
                 symbol_registry: RefCell::new(FxHashMap::default()),
                 symbol_canonical_projects: RefCell::new(FxHashMap::default()),
                 project_registries: RefCell::new(FxHashMap::default()),
             });
             self.snapshots.borrow_mut().insert(handle, sd);
         }
-        let prev_sd = self
-            .snapshots
-            .borrow()
-            .get(&self.latest_snapshot.get())
-            .cloned();
-        self.latest_snapshot.set(handle);
-
-        // Build projects list
-        let projects = snapshot.project_collection.projects();
-        let mut project_responses = Vec::with_capacity(projects.len());
-        for proj in &projects {
-            if proj.borrow().command_line.is_none() {
-                continue;
-            }
-            project_responses.push(new_project_response(&proj.borrow()));
-        }
-
-        // Compute changes from the previous latest snapshot
-        let mut changes: Option<SnapshotChanges> = None;
-        if let Some(prev_sd) = prev_sd {
-            changes = Some(compute_snapshot_changes(&prev_sd.snapshot, &snapshot));
-        }
-
-        Ok(UpdateSnapshotResponse {
-            snapshot: handle,
-            projects: project_responses,
-            changes,
-        })
     }
 
-    // Go: api/session.go:1076 handleUpdateTemporarySnapshot (tsgo#4642)
-    // handleUpdateTemporarySnapshot creates a temporary snapshot that overrides the
-    // content of a single file, without opening/closing any projects or files and
-    // without advancing the session's latest snapshot.
-    // PORT: Go `defer func() { _ = s.releaseSnapshot(params.Snapshot) }()`: the
-    // body runs in a closure, and the release runs after it on every path.
-    pub fn handle_update_temporary_snapshot(
+    // Go: api/session.go handleGetCurrentLanguageServerSnapshot (ts#64204)
+    // PORT: Go `defer func() { _ = s.releaseSnapshot(params.BaseSnapshot) }()`:
+    // the body runs in a closure, and the release runs after it.
+    pub fn handle_get_current_language_server_snapshot(
         &self,
         ctx: &Context,
-        params: &UpdateTemporarySnapshotParams,
-    ) -> Result<UpdateSnapshotResponse, GoError> {
-        let base_sd = self.retain_snapshot_data(params.snapshot)?;
+        params: &GetCurrentLanguageServerSnapshotParams,
+    ) -> Result<CreateSnapshotResponse, GoError> {
+        let Some(project_session) = self.project_session.clone() else {
+            return Err(errors::errorf(
+                format!(
+                    "{}: getCurrentLanguageServerSnapshot requires an LSP-connected API session",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        let mut base_snapshot: Option<Rc<project::Snapshot>> = None;
+        if params.base_snapshot.0 != 0 {
+            let base_sd = self.retain_snapshot_data(params.base_snapshot)?;
+            base_snapshot = Some(base_sd.snapshot.clone());
+        }
         let result = (|| {
-            let uri = params
-                .file
-                .to_uri(&self.project_session.get_current_directory());
-
-            let snapshot = match self.project_session.api_update_temporary(
+            let default_changes = LanguageServerSnapshotChanges::default();
+            let changes = params.changes.as_ref().unwrap_or(&default_changes);
+            let update = self.to_language_server_snapshot_update(
                 ctx,
-                &base_sd.snapshot,
-                &uri,
-                params.new_text.clone(),
+                &changes.snapshot_request_changes_params,
+            )?;
+
+            let snapshot = match project_session.api_update(
+                ctx,
+                project::FileChangeSummary::default(),
+                Some(&update.request),
             ) {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     return Err(errors::errorf(
                         format!(
-                            "{}: failed to update temporary snapshot: {}",
+                            "{}: failed to update language server snapshot: {}",
                             *ERR_CLIENT_ERROR, err
                         ),
                         vec![ERR_CLIENT_ERROR.clone(), err],
@@ -1699,44 +2539,183 @@ impl Session {
                 }
             };
 
-            let handle = snapshot_handle(&snapshot);
-            let existing = self.snapshots.borrow().get(&handle).cloned();
-            if let Some(sd) = existing {
-                project::Snapshot::deref(&snapshot, &self.project_session);
-                sd.ref_count.set(sd.ref_count.get() + 1);
-            } else {
-                let sd = Rc::new(SnapshotData {
-                    snapshot: snapshot.clone(),
-                    ref_count: Cell::new(1),
-                    symbol_registry: RefCell::new(FxHashMap::default()),
-                    symbol_canonical_projects: RefCell::new(FxHashMap::default()),
-                    project_registries: RefCell::new(FxHashMap::default()),
-                });
-                self.snapshots.borrow_mut().insert(handle, sd);
-            }
-
-            // Build projects list
-            let projects = snapshot.project_collection.projects();
-            let mut project_responses = Vec::with_capacity(projects.len());
-            for proj in &projects {
-                if proj.borrow().command_line.is_none() {
-                    continue;
-                }
-                project_responses.push(new_project_response(&proj.borrow()));
-            }
-
-            // Compute changes from the requested base snapshot so the client can retain
-            // cached source files for unchanged files.
-            let changes = compute_snapshot_changes(&base_sd.snapshot, &snapshot);
-
-            Ok(UpdateSnapshotResponse {
-                snapshot: handle,
-                projects: project_responses,
-                changes: Some(changes),
-            })
+            update.commit(self, &snapshot);
+            let response = self.create_snapshot_response(
+                &snapshot,
+                base_snapshot.as_ref(),
+                Some(&changes.snapshot_request_changes_params),
+            );
+            self.register_snapshot(
+                snapshot,
+                SnapshotOpenState {
+                    open_projects: self.open_projects.borrow().clone(),
+                    open_files: self.open_files.borrow().clone(),
+                },
+                None,
+            );
+            Ok(response)
         })();
-        let _ = self.release_snapshot(params.snapshot);
+        if params.base_snapshot.0 != 0 {
+            let _ = self.release_snapshot(params.base_snapshot);
+        }
         result
+    }
+
+    // Go: api/session.go handleCreateBuildOrchestrator (ts#64158)
+    pub fn handle_create_build_orchestrator(
+        &self,
+        _ctx: &Context,
+        params: &CreateBuildOrchestratorParams,
+    ) -> Result<CreateBuildOrchestratorResponse, GoError> {
+        let build_sys = self.get_build_sys(params);
+        let mut command =
+            crate::execute::build::parse_build_command_line(&params.root_names, &*build_sys);
+        let mut created_orchestrator_response = CreateBuildOrchestratorResponse::default();
+        if let Some(compiler_options) = &params.compiler_options {
+            command.compiler_options = Rc::new(compiler_options.clone());
+        }
+        if let Some(build_options) = &params.build_options {
+            command.build_options = build_options.clone();
+        }
+        let orchestrator = crate::execute::build::orchestrator::new_orchestrator(
+            crate::execute::build::orchestrator::Options {
+                sys: build_sys,
+                command: Rc::new(command),
+                testing: None,
+            },
+        );
+        created_orchestrator_response.build_orchestrator_id = new_build_orchestrator_id();
+        self.build_orchestrators.borrow_mut().insert(
+            created_orchestrator_response.build_orchestrator_id,
+            Rc::new(RefCell::new(orchestrator)),
+        );
+        Ok(created_orchestrator_response)
+    }
+
+    // Go: api/session.go handleDisposeBuildOrchestrator (ts#64158)
+    pub fn handle_dispose_build_orchestrator(
+        &self,
+        _ctx: &Context,
+        params: &DisposeBuildOrchestratorParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let removed = self
+            .build_orchestrators
+            .borrow_mut()
+            .remove(&params.build_orchestrator_id);
+        if removed.is_none() {
+            return Err(errors::new("build orchestrator not found while disposing"));
+        }
+        Ok(to_any(true))
+    }
+
+    /// The orchestrator for an ID. The map borrow ends before the build runs.
+    fn build_orchestrator(
+        &self,
+        id: BuildOrchestratorID,
+    ) -> Option<Rc<RefCell<crate::execute::build::orchestrator::Orchestrator>>> {
+        self.build_orchestrators.borrow().get(&id).cloned()
+    }
+
+    // Go: api/session.go handleBuild (ts#64158)
+    pub fn handle_build(
+        &self,
+        ctx: &Context,
+        params: &BuildParams,
+    ) -> Result<BuildResponse, GoError> {
+        let Some(orchestrator) = self.build_orchestrator(params.build_orchestrator_id) else {
+            return Err(errors::new(format!(
+                "build orchestrator not found while building {}",
+                params.project
+            )));
+        };
+        let result = orchestrator.borrow_mut().build(ctx, &params.project);
+
+        Ok(BuildResponse {
+            status: result.result.status,
+            diagnostics: new_diagnostic_responses(&result.errors),
+            statistics: result.statistics.clone(),
+        })
+    }
+
+    // Go: api/session.go handleBuildReferences (ts#64158)
+    pub fn handle_build_references(
+        &self,
+        ctx: &Context,
+        params: &BuildParams,
+    ) -> Result<BuildResponse, GoError> {
+        let Some(orchestrator) = self.build_orchestrator(params.build_orchestrator_id) else {
+            return Err(errors::new(format!(
+                "build orchestrator not found for building references for {}",
+                params.project
+            )));
+        };
+        let result = orchestrator
+            .borrow_mut()
+            .build_references(ctx, &params.project);
+
+        Ok(BuildResponse {
+            status: result.result.status,
+            diagnostics: new_diagnostic_responses(&result.errors),
+            statistics: result.statistics.clone(),
+        })
+    }
+
+    // Go: api/session.go handleCleanBuild (ts#64158)
+    pub fn handle_clean_build(
+        &self,
+        _ctx: &Context,
+        params: &CleanBuildParams,
+    ) -> Result<CleanBuildResponse, GoError> {
+        let Some(orchestrator) = self.build_orchestrator(params.build_orchestrator_id) else {
+            return Err(errors::new(format!(
+                "build orchestrator not found while cleaning {}",
+                params.project
+            )));
+        };
+        // PORT: Go `Clean` is `clean_exported` (the build lane names it so;
+        // Go also has `clean`).
+        let result = orchestrator.borrow_mut().clean_exported(&params.project);
+        Ok(CleanBuildResponse {
+            status: result.result.status,
+            diagnostics: new_diagnostic_responses(&result.errors),
+            statistics: result.statistics.clone(),
+            files_deleted: result.files_to_delete.clone(),
+        })
+    }
+
+    // Go: api/session.go handleCleanReferences (ts#64158)
+    pub fn handle_clean_references(
+        &self,
+        _ctx: &Context,
+        params: &CleanBuildParams,
+    ) -> Result<CleanBuildResponse, GoError> {
+        let Some(orchestrator) = self.build_orchestrator(params.build_orchestrator_id) else {
+            return Err(errors::new(format!(
+                "build orchestrator not found while cleaning references for {}",
+                params.project
+            )));
+        };
+        let result = orchestrator.borrow_mut().clean_references(&params.project);
+        Ok(CleanBuildResponse {
+            status: result.result.status,
+            diagnostics: new_diagnostic_responses(&result.errors),
+            statistics: result.statistics.clone(),
+            files_deleted: result.files_to_delete.clone(),
+        })
+    }
+
+    // Go: api/session.go getBuildSys (ts#64158)
+    pub fn get_build_sys(&self, params: &CreateBuildOrchestratorParams) -> Rc<ApiBuildSystem> {
+        let mut current_directory = params.cwd.clone();
+        if current_directory.is_empty() {
+            current_directory = self.get_current_directory();
+        }
+        Rc::new(ApiBuildSystem {
+            snapshot_host: self.snapshot_host.clone(),
+            project_session: self.project_session.clone(),
+            current_directory,
+            start: std::time::Instant::now(),
+        })
     }
 
     // Go: api/session.go:699 handleRelease
@@ -1768,9 +2747,7 @@ impl Session {
     ) -> Result<Option<ProjectResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let uri = params
-            .file
-            .to_uri(&self.project_session.get_current_directory());
+        let uri = params.file.to_uri(&self.get_current_directory());
         let proj = sd.snapshot.get_default_project(&uri);
         let Some(proj) = proj else {
             return Ok(None);
@@ -1787,7 +2764,7 @@ impl Session {
         params: &ParseCommandLineParams,
     ) -> Result<Option<ConfigFileResponse>, GoError> {
         Ok(new_config_file_response(Some(
-            &tsoptions::parse_command_line(&params.command_line, &*self.project_session),
+            &tsoptions::parse_command_line(&params.command_line, &*self.snapshot_host),
         )))
     }
 
@@ -1800,8 +2777,8 @@ impl Session {
     ) -> Result<ReadConfigFileResponse, GoError> {
         let config_file_name = params
             .file
-            .to_absolute_file_name(&self.project_session.get_current_directory());
-        let (config_file_content, ok) = self.project_session.fs().read_file(&config_file_name);
+            .to_absolute_file_name(&self.get_current_directory());
+        let (config_file_content, ok) = self.snapshot_host.fs().read_file(&config_file_name);
         if !ok {
             return Ok(ReadConfigFileResponse {
                 config: tsoptions::CompilerOptionsValue::Map(IndexMap::new()),
@@ -1849,20 +2826,20 @@ impl Session {
         if let Some(config_directory) = &params.config_directory {
             base_path = tspath::get_normalized_absolute_path(
                 config_directory,
-                &self.project_session.get_current_directory(),
+                &self.get_current_directory(),
             );
         } else {
             config_file_name = params
                 .config_file_name
                 .as_ref()
                 .expect("configFileName is set")
-                .to_absolute_file_name(&self.project_session.get_current_directory());
+                .to_absolute_file_name(&self.get_current_directory());
             base_path = tspath::get_directory_path(&config_file_name);
         }
 
         let parsed_command_line = tsoptions::parse_json_config_file_content(
             &json_value_to_any(&params.json),
-            &*self.project_session,
+            &*self.snapshot_host,
             &base_path,
             None, /*existingOptions*/
             &config_file_name,
@@ -1881,8 +2858,8 @@ impl Session {
     ) -> Result<ConfigFileResponse, GoError> {
         let config_file_name = params
             .file
-            .to_absolute_file_name(&self.project_session.get_current_directory());
-        let (config_file_content, ok) = self.project_session.fs().read_file(&config_file_name);
+            .to_absolute_file_name(&self.get_current_directory());
+        let (config_file_content, ok) = self.snapshot_host.fs().read_file(&config_file_name);
         if !ok {
             return Err(errors::errorf(
                 format!(
@@ -1902,7 +2879,7 @@ impl Session {
         );
         let parsed_command_line = tsoptions::parse_json_source_file_config_file_content(
             ts_config_source_file,
-            &*self.project_session,
+            &*self.snapshot_host,
             &config_dir,
             None, /*existingOptions*/
             None, /*existingOptionsRaw*/
@@ -1914,6 +2891,151 @@ impl Session {
         // PORT: Go returns a `*ConfigFileResponse` that is never nil here.
         Ok(new_config_file_response(Some(&parsed_command_line))
             .expect("NewConfigFileResponse of a parsed command line"))
+    }
+
+    // Go: api/session.go handleCreateSourceFile (ts#64216, ts#64434)
+    pub fn handle_create_source_file(
+        &self,
+        _ctx: &Context,
+        params: &CreateSourceFileParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let lease =
+            self.create_source_file(&params.file_name, &params.source_text, &params.options)?;
+        self.encode_leased_source_file(lease)
+    }
+
+    // Go: api/session.go handleCreateSourceFileFromFile (ts#64216, ts#64434)
+    pub fn handle_create_source_file_from_file(
+        &self,
+        _ctx: &Context,
+        params: &CreateSourceFileFromFileParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let file_name =
+            tspath::get_normalized_absolute_path(&params.file_name, &self.get_current_directory());
+        let (source_text, ok) = self.snapshot_host.fs().read_file(&file_name);
+        if !ok {
+            return Err(errors::errorf(
+                format!(
+                    "{}: could not read file {}",
+                    *ERR_CLIENT_ERROR,
+                    gostd::strconv::quote(&file_name)
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        let lease = self.create_source_file(&file_name, &source_text, &params.options)?;
+        self.encode_leased_source_file(lease)
+    }
+
+    // Go: api/session.go createSourceFile (ts#64216, ts#64434)
+    pub fn create_source_file(
+        &self,
+        file_name: &str,
+        source_text: &str,
+        options: &CreateSourceFileOptions,
+    ) -> Result<Rc<project::SourceFileLease>, GoError> {
+        let mut script_kind = options.script_kind;
+        if script_kind == ScriptKind::UNKNOWN {
+            script_kind = crate::frontend::core_ext::ensure_script_kind_from_file_name(file_name);
+        }
+        if !is_valid_create_source_file_script_kind(script_kind) {
+            return Err(errors::errorf(
+                format!(
+                    "{}: invalid scriptKind {}",
+                    *ERR_CLIENT_ERROR, script_kind.0
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        let file_name =
+            tspath::get_normalized_absolute_path(file_name, &self.get_current_directory());
+        let path = self.to_path(&file_name);
+        Ok(self.acquire_source_file(
+            crate::frontend::parser::SourceFileParseOptions {
+                file_name,
+                path,
+                ..Default::default()
+            },
+            source_text,
+            script_kind,
+        ))
+    }
+
+    // Go: api/session.go acquireSourceFile (ts#64434)
+    pub fn acquire_source_file(
+        &self,
+        options: crate::frontend::parser::SourceFileParseOptions,
+        source_text: &str,
+        script_kind: ScriptKind,
+    ) -> Rc<project::SourceFileLease> {
+        self.snapshot_host
+            .acquire_source_file(options, source_text, script_kind)
+    }
+
+    // Go: api/session.go encodeLeasedSourceFile (ts#64434)
+    pub fn encode_leased_source_file(
+        &self,
+        lease: Rc<project::SourceFileLease>,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let mut data = match encoder::encode_source_file(lease.source_file()) {
+            Ok((data, _)) => data,
+            Err(err) => {
+                lease.release();
+                return Err(errors::errorf(
+                    format!("failed to encode source file: {err}"),
+                    vec![err],
+                ));
+            }
+        };
+        self.next_source_file_lease_id
+            .set(self.next_source_file_lease_id.get() + 1);
+        let id = SourceFileLeaseID(self.next_source_file_lease_id.get());
+        encoder::set_source_file_lease(&mut data, id.0);
+        self.source_file_leases.borrow_mut().insert(id, lease);
+        if self.use_binary_responses {
+            return Ok(to_any(RawBinary(data)));
+        }
+        Ok(to_any(SourceFileResponse {
+            data: base64_std_encoding_encode_to_string(&data),
+        }))
+    }
+
+    // Go: api/session.go handleReleaseSourceFile (ts#64434)
+    pub fn handle_release_source_file(
+        &self,
+        params: Option<&ReleaseSourceFileParams>,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let Some(params) = params.filter(|params| params.lease.0 != 0) else {
+            return Err(errors::errorf(
+                format!("{}: empty source file lease", *ERR_CLIENT_ERROR),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        let lease = self.source_file_leases.borrow_mut().remove(&params.lease);
+        let Some(lease) = lease else {
+            return Err(errors::errorf(
+                format!(
+                    "{}: source file lease {} not found",
+                    *ERR_CLIENT_ERROR, params.lease.0
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        lease.release();
+        Ok(to_any(true))
+    }
+
+    // Go: api/session.go releaseSourceFileLeases (ts#64434)
+    pub fn release_source_file_leases(&self) {
+        let leases: Vec<Rc<project::SourceFileLease>> = self
+            .source_file_leases
+            .borrow_mut()
+            .drain()
+            .map(|(_, lease)| lease)
+            .collect();
+        for lease in leases {
+            lease.release();
+        }
     }
 
     // Go: api/session.go:1242 handleTranspile (tsgo#4849)
@@ -1933,11 +3055,9 @@ impl Session {
         params: &TranspileFromFileParams,
         declaration: bool,
     ) -> Result<TranspileOutputResponse, GoError> {
-        let file_name = tspath::get_normalized_absolute_path(
-            &params.file_name,
-            &self.project_session.get_current_directory(),
-        );
-        let (input, ok) = self.project_session.fs().read_file(&file_name);
+        let file_name =
+            tspath::get_normalized_absolute_path(&params.file_name, &self.get_current_directory());
+        let (input, ok) = self.snapshot_host.fs().read_file(&file_name);
         if !ok {
             return Err(errors::errorf(
                 format!(
@@ -1951,6 +3071,84 @@ impl Session {
         let mut options = params.options.clone();
         options.file_name = file_name;
         transpile_output(ctx, &input, &options, declaration)
+    }
+}
+
+// Go: api/session.go isValidCreateSourceFileScriptKind (ts#64216)
+pub fn is_valid_create_source_file_script_kind(script_kind: ScriptKind) -> bool {
+    matches!(
+        script_kind,
+        ScriptKind::JS | ScriptKind::JSX | ScriptKind::TS | ScriptKind::TSX | ScriptKind::JSON
+    )
+}
+
+// Go: api/session.go apiBuildSystem (ts#64158)
+// Wrapper for the API session for build orchestrator
+// PORT: Go keeps the session; the system needs its snapshot host and project
+// session (Go `session.snapshotHost.FS()` and `session.DefaultLibraryPath()`).
+pub struct ApiBuildSystem {
+    snapshot_host: Rc<project::SnapshotHost>,
+    project_session: Option<Rc<project::Session>>,
+    current_directory: String,
+    start: std::time::Instant,
+}
+
+impl crate::execute::tsc::System for ApiBuildSystem {
+    fn writer(&self) -> crate::execute::tsc::Writer {
+        Rc::new(RefCell::new(std::io::sink()))
+    }
+    fn error_writer(&self) -> crate::execute::tsc::ErrorWriter {
+        std::sync::Arc::new(std::sync::Mutex::new(std::io::sink()))
+    }
+    fn fs(&self) -> Rc<dyn vfs::Fs> {
+        self.snapshot_host.fs()
+    }
+    // PORT: Go `s.session.DefaultLibraryPath()`.
+    fn default_library_path(&self) -> String {
+        if let Some(project_session) = &self.project_session {
+            return project_session.default_library_path();
+        }
+        self.snapshot_host.default_library_path()
+    }
+    fn get_current_directory(&self) -> String {
+        self.current_directory.clone()
+    }
+    fn write_output_is_tty(&self) -> bool {
+        false
+    }
+    fn get_width_of_terminal(&self) -> i32 {
+        0
+    }
+    fn get_environment_variable(&self, _name: &str) -> (String, bool) {
+        (String::new(), false)
+    }
+    fn spawn(
+        &self,
+        _command: &[String],
+        _dir: &str,
+        _stderr: Option<Box<dyn std::io::Write + Send>>,
+    ) -> Result<std::sync::Arc<dyn crate::contentmapper::hostimpl::ProcessExitState>, GoError> {
+        Err(errors::new(
+            "spawning processes is not supported by the API build orchestrator",
+        ))
+    }
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now()
+    }
+    fn since_start(&self) -> std::time::Duration {
+        self.start.elapsed()
+    }
+}
+
+// PORT: Go passes the `tsc.System` as the `tsoptions.ParseConfigHost` of
+// `ParseBuildCommandLine`; Rust needs the impl.
+impl tsoptions::ParseConfigHost for ApiBuildSystem {
+    fn fs(&self) -> Rc<dyn vfs::Fs> {
+        crate::execute::tsc::System::fs(self)
+    }
+
+    fn get_current_directory(&self) -> String {
+        self.current_directory.clone()
     }
 }
 
@@ -2165,6 +3363,204 @@ impl Session {
             package_json_directory: meta_data.package_json_directory,
             implied_node_format: meta_data.implied_node_format.0,
         }))
+    }
+}
+
+// Go: api/session.go newResolvedModuleResponse (ts#64247)
+// PORT: Go `resolution.IsResolved()` is false for a nil resolution.
+pub fn new_resolved_module_response(
+    resolution: Option<&crate::program::ResolvedModule>,
+) -> Option<proto::ResolvedModule> {
+    let resolution = resolution.filter(|resolution| resolution.is_resolved())?;
+    Some(proto::ResolvedModule {
+        resolved_file_name: resolution.resolved_file_name.clone(),
+        original_path: resolution.original_path.clone(),
+        extension: resolution.extension.clone(),
+        resolved_using_ts_extension: resolution.resolved_using_ts_extension,
+        resolved_using_extra_extensions: resolution.resolved_using_extra_extensions,
+        package_id: new_package_id(&resolution.package_id),
+        is_external_library_import: resolution.is_external_library_import,
+        alternate_result: resolution.alternate_result.clone(),
+    })
+}
+
+// Go: api/session.go newResolvedTypeReferenceDirectiveResponse (ts#64247)
+pub fn new_resolved_type_reference_directive_response(
+    resolution: Option<&crate::frontend::module::ResolvedTypeReferenceDirective>,
+) -> Option<proto::ResolvedTypeReferenceDirective> {
+    let resolution = resolution.filter(|resolution| resolution.is_resolved())?;
+    Some(proto::ResolvedTypeReferenceDirective {
+        primary: resolution.primary,
+        resolved_file_name: resolution.resolved_file_name.clone(),
+        original_path: resolution.original_path.clone(),
+        package_id: new_package_id(&resolution.package_id),
+        is_external_library_import: resolution.is_external_library_import,
+    })
+}
+
+/// Go passes an `*ast.SourceFile` where a program method takes an
+/// `ast.HasFileName`; the Rust methods take `&dyn HasFileName`, which a file
+/// root `Node` does not implement, so its file name and path are copied.
+fn file_of(source_file: Node) -> HasFileNameImpl {
+    new_has_file_name(
+        source_file_file_name(source_file),
+        &source_file_info(source_file).path,
+    )
+}
+
+impl Session {
+    // Go: api/session.go handleGetModeForUsageLocation (ts#64292)
+    pub fn handle_get_mode_for_usage_location(
+        &self,
+        _ctx: &Context,
+        params: &GetModeForUsageLocationParams,
+    ) -> Result<ModuleKind, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let source_file = self.resolve_optional_source_file(program, Some(&params.file))?;
+        let usage = sd.resolve_node_handle(program, &params.usage)?;
+        if !is_string_literal_like(usage) {
+            return Err(errors::errorf(
+                format!(
+                    "{}: usage must be a StringLiteralLike node",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        Ok(program.get_mode_for_usage_location(&file_of(source_file), usage))
+    }
+
+    // Go: api/session.go handleGetModeForResolutionAtIndex (ts#64292)
+    pub fn handle_get_mode_for_resolution_at_index(
+        &self,
+        _ctx: &Context,
+        params: &GetModeForResolutionAtIndexParams,
+    ) -> Result<ModuleKind, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let source_file = self.resolve_optional_source_file(program, Some(&params.file))?;
+        let resolution_count = {
+            let fields = source_file_fields(source_file);
+            let mut resolution_count = fields.imports().len() as i32;
+            for &augmentation in fields.module_augmentations() {
+                if augmentation.kind() == SyntaxKind::StringLiteral {
+                    resolution_count += 1;
+                }
+            }
+            resolution_count
+        };
+        if params.index < 0 || params.index >= resolution_count {
+            return Err(errors::errorf(
+                format!("{}: invalid resolution index", *ERR_CLIENT_ERROR),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        Ok(program.get_mode_for_resolution_at_index(source_file, params.index))
+    }
+
+    // Go: api/session.go handleGetResolvedModule (ts#64247)
+    pub fn handle_get_resolved_module(
+        &self,
+        _ctx: &Context,
+        params: &GetResolvedModuleParams,
+    ) -> Result<Option<proto::ResolvedModule>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let source_file = self.resolve_optional_source_file(program, Some(&params.file))?;
+        let resolution =
+            program.get_resolved_module(&file_of(source_file), &params.module_name, params.mode);
+        Ok(new_resolved_module_response(resolution.as_deref()))
+    }
+
+    // Go: api/session.go handleGetResolvedModuleFromModuleSpecifier (ts#64247)
+    pub fn handle_get_resolved_module_from_module_specifier(
+        &self,
+        _ctx: &Context,
+        params: &GetResolvedModuleFromModuleSpecifierParams,
+    ) -> Result<Option<proto::ResolvedModule>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let node = sd.resolve_node_handle(program, &params.module_specifier)?;
+        if !is_string_literal_like(node) {
+            return Err(errors::errorf(
+                format!(
+                    "{}: moduleSpecifier must be a StringLiteralLike node",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        let mut source_file = get_source_file_of_node(node);
+        if params.source_file.is_some() {
+            source_file =
+                self.resolve_optional_source_file(program, params.source_file.as_ref())?;
+        }
+        if source_file.is_nil() {
+            return Err(errors::errorf(
+                format!(
+                    "{}: moduleSpecifier must have a SourceFile ancestor or sourceFile must be provided",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        let file = file_of(source_file);
+        let mode = program.get_mode_for_usage_location(&file, node);
+        let resolution = program.get_resolved_module(&file, node.text(), mode);
+        Ok(new_resolved_module_response(resolution.as_deref()))
+    }
+
+    // Go: api/session.go handleGetResolvedTypeReferenceDirective (ts#64247)
+    pub fn handle_get_resolved_type_reference_directive(
+        &self,
+        _ctx: &Context,
+        params: &GetResolvedTypeReferenceDirectiveParams,
+    ) -> Result<Option<proto::ResolvedTypeReferenceDirective>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let source_file = self.resolve_optional_source_file(program, Some(&params.file))?;
+        let resolution = program.get_resolved_type_reference_directive(
+            &file_of(source_file),
+            &params.type_directive_name,
+            params.mode,
+        );
+        Ok(new_resolved_type_reference_directive_response(
+            resolution.as_deref(),
+        ))
+    }
+
+    // Go: api/session.go handleGetResolvedTypeReferenceDirectiveFromReference (ts#64247)
+    pub fn handle_get_resolved_type_reference_directive_from_reference(
+        &self,
+        _ctx: &Context,
+        params: &GetResolvedTypeReferenceDirectiveFromReferenceParams,
+    ) -> Result<Option<proto::ResolvedTypeReferenceDirective>, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let source_file = self.resolve_optional_source_file(program, Some(&params.source_file))?;
+        let file = file_of(source_file);
+        let mut mode = params.resolution_mode;
+        if mode == RESOLUTION_MODE_NONE {
+            mode = program.get_default_resolution_mode_for_file(&file);
+        }
+        let resolution =
+            program.get_resolved_type_reference_directive(&file, &params.type_directive_name, mode);
+        Ok(new_resolved_type_reference_directive_response(
+            resolution.as_deref(),
+        ))
     }
 
     // Go: api/session.go:804 handleGetSymbolAtPosition
@@ -2401,7 +3797,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_type_of_symbol_exported(symbol);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:934 handleGetTypesOfSymbols
@@ -2424,7 +3822,9 @@ impl Session {
                 .checker
                 .borrow_mut()
                 .get_type_of_symbol_exported(symbol);
-            results[i] = setup.new_type_response(t);
+            results[i] = setup
+                .sd
+                .new_type_response(&setup.project_id, &setup.checker, t);
         }
 
         Ok(results)
@@ -2446,7 +3846,30 @@ impl Session {
             .checker
             .borrow_mut()
             .get_declared_type_of_symbol_exported(symbol);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
+    }
+
+    // Go: api/session.go handleGetNonMissingTypeOfSymbol (ts#63956)
+    // handleGetNonMissingTypeOfSymbol returns the type of a symbol, excluding the missing type.
+    pub fn handle_get_non_missing_type_of_symbol(
+        &self,
+        ctx: &Context,
+        params: &GetTypeOfSymbolParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+
+        let t = setup
+            .checker
+            .borrow_mut()
+            .get_non_missing_type_of_symbol_exported(symbol);
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:984 handleResolveName
@@ -2568,7 +3991,9 @@ impl Session {
             .resolve_node_handle(&setup.program, &params.location)?;
 
         let t = setup.checker.borrow_mut().get_type_at_location(node);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:1081 handleGetTypeAtLocations
@@ -2587,7 +4012,9 @@ impl Session {
             // resolveNodeHandle errors on an unresolvable handle and GetTypeAtLocation
             // never returns nil, so every element resolves to a type (error type at worst).
             let t = setup.checker.borrow_mut().get_type_at_location(node);
-            results[i] = setup.new_type_response(t);
+            results[i] = setup
+                .sd
+                .new_type_response(&setup.project_id, &setup.checker, t);
         }
 
         Ok(results)
@@ -2631,7 +4058,9 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:1134 handleGetTypesAtPositions
@@ -2671,7 +4100,9 @@ impl Session {
             }
             let t = setup.checker.borrow_mut().get_type_at_location(node);
             if t.is_some() {
-                results[i] = setup.new_type_response(t);
+                results[i] = setup
+                    .sd
+                    .new_type_response(&setup.project_id, &setup.checker, t);
             }
         }
 
@@ -2738,19 +4169,19 @@ impl Session {
     // Go: api/session.go:1186 handleGetTargetOfType
     pub fn handle_get_target_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| c.ty(t).target())
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| c.ty(t).target())
     }
 
     // Go: api/session.go:1190 handleGetFreshTypeOfType
     pub fn handle_get_fresh_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_literal_type().fresh_type()
         })
     }
@@ -2758,10 +4189,10 @@ impl Session {
     // Go: api/session.go:1194 handleGetRegularTypeOfType
     pub fn handle_get_regular_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_literal_type().regular_type()
         })
     }
@@ -2769,10 +4200,10 @@ impl Session {
     // Go: api/session.go:1198 handleGetTypesOfType
     pub fn handle_get_types_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_array_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).types().to_vec()
         })
     }
@@ -2780,10 +4211,10 @@ impl Session {
     // Go: api/session.go:1202 handleGetTypeParametersOfType
     pub fn handle_get_type_parameters_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_array_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_interface_type().type_parameters().to_vec()
         })
     }
@@ -2791,10 +4222,10 @@ impl Session {
     // Go: api/session.go:1206 handleGetOuterTypeParametersOfType
     pub fn handle_get_outer_type_parameters_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_array_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_interface_type().outer_type_parameters().to_vec()
         })
     }
@@ -2802,21 +4233,33 @@ impl Session {
     // Go: api/session.go:1210 handleGetLocalTypeParametersOfType
     pub fn handle_get_local_type_parameters_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_array_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_interface_type().local_type_parameters().to_vec()
+        })
+    }
+
+    // Go: api/session.go handleGetThisTypeOfType (ts#64264)
+    // PORT: Go `t.AsInterfaceType().ThisType()` returns this field.
+    pub fn handle_get_this_type_of_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
+            c.ty(t).as_interface_type().this_type
         })
     }
 
     // Go: api/session.go:1214 handleGetAliasTypeArgumentsOfType
     pub fn handle_get_alias_type_arguments_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_array_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             let Some(alias) = c.ty(t).alias() else {
                 return Vec::new();
             };
@@ -2841,10 +4284,10 @@ impl Session {
     // Go: api/session.go:1232 handleGetObjectTypeOfType
     pub fn handle_get_object_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_indexed_access_type().object_type()
         })
     }
@@ -2852,10 +4295,10 @@ impl Session {
     // Go: api/session.go:1236 handleGetIndexTypeOfType
     pub fn handle_get_index_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_indexed_access_type().index_type()
         })
     }
@@ -2863,10 +4306,10 @@ impl Session {
     // Go: api/session.go:1240 handleGetCheckTypeOfType
     pub fn handle_get_check_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_conditional_type().check_type()
         })
     }
@@ -2874,10 +4317,10 @@ impl Session {
     // Go: api/session.go:1244 handleGetExtendsTypeOfType
     pub fn handle_get_extends_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_conditional_type().extends_type()
         })
     }
@@ -2885,10 +4328,10 @@ impl Session {
     // Go: api/session.go:1248 handleGetBaseTypeOfType
     pub fn handle_get_base_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_substitution_type().base_type()
         })
     }
@@ -2898,23 +4341,70 @@ impl Session {
     // Type parameter constraints are handled by handleGetConstraintOfTypeParameter.
     pub fn handle_get_constraint_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_substitution_type().subst_constraint()
+        })
+    }
+
+    // Go: api/session.go handleGetTypeParameterOfMappedType (ts#64397)
+    // PORT: Go `t.AsMappedType().TypeParameter()` returns this field.
+    pub fn handle_get_type_parameter_of_mapped_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
+            c.ty(t).as_mapped_type().type_parameter
+        })
+    }
+
+    // Go: api/session.go handleGetConstraintTypeOfMappedType (ts#64397)
+    pub fn handle_get_constraint_type_of_mapped_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
+            c.ty(t).as_mapped_type().constraint_type
+        })
+    }
+
+    // Go: api/session.go handleGetNameTypeOfMappedType (ts#64397)
+    pub fn handle_get_name_type_of_mapped_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
+            c.ty(t).as_mapped_type().name_type
+        })
+    }
+
+    // Go: api/session.go handleGetTemplateTypeOfMappedType (ts#64397)
+    pub fn handle_get_template_type_of_mapped_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
+            c.ty(t).as_mapped_type().template_type
         })
     }
 
     // Go: api/session.go:1256 handleGetTypeParametersOfSignature
     pub fn handle_get_type_parameters_of_signature(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetSignaturePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_signature(params, &|c: &Checker, sig: SignatureId| {
-            c.sig(sig).type_parameters().to_vec()
-        })
+        self.resolve_type_array_property_of_signature(
+            ctx,
+            params,
+            &|c: &Checker, sig: SignatureId| c.sig(sig).type_parameters().to_vec(),
+        )
     }
 
     // Go: api/session.go:1260 handleGetParametersOfSignature
@@ -2967,7 +4457,8 @@ impl Session {
     ) -> Result<Option<Vec<TextEdit>>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let project_path = parse_project_handle(&params.project);
+        // ts#64319: the project ID is used as is.
+        let project_id = params.project.clone();
         let mut working_snapshot = sd.snapshot.clone();
         let mut program = sd.get_program(&params.project)?;
         let mut source_file = program
@@ -2991,33 +4482,31 @@ impl Session {
             || !autoimport::Registry::is_prepared_for_importing_file(
                 registry.as_deref(),
                 source_file_file_name(source_file),
-                &project_path,
+                &autoimport::ProjectID(project_id.0.clone()),
                 &user_preferences,
             )
         {
-            let prepared_snapshot = self.project_session.get_snapshot_with_auto_imports(
+            // ts#64163
+            let prepared_snapshot = self.snapshot_host.clone_snapshot_with_auto_imports(
                 ctx,
                 &working_snapshot,
-                &params
-                    .file
-                    .to_uri(&self.project_session.get_current_directory()),
+                &params.file.to_uri(&self.get_current_directory()),
+                None,
             );
+            if let Some(project_session) = &self.project_session {
+                project_session
+                    .try_adopt_snapshot_in_background(&working_snapshot, &prepared_snapshot);
+            }
             _deref_prepared = {
-                let (snapshot, session) = (prepared_snapshot.clone(), self.project_session.clone());
-                ls_program::Release::new(move || project::Snapshot::deref(&snapshot, &session))
+                let snapshot = prepared_snapshot.clone();
+                ls_program::Release::new(move || project::Snapshot::deref(&snapshot))
             };
 
             working_snapshot = prepared_snapshot;
-            let proj = working_snapshot
-                .project_collection
-                .get_project_by_path(&project_path);
+            let proj = working_snapshot.project_collection.get_project(&project_id);
             let Some(proj) = proj else {
                 return Err(errors::errorf(
-                    format!(
-                        "{}: project {} not found",
-                        *ERR_CLIENT_ERROR,
-                        project_path.as_str()
-                    ),
+                    format!("{}: project {} not found", *ERR_CLIENT_ERROR, project_id.0),
                     vec![ERR_CLIENT_ERROR.clone()],
                 ));
             };
@@ -3052,10 +4541,12 @@ impl Session {
 
         let (ch, _done) = ls_program::get_type_checker(&program, ctx);
 
+        // ts#64178: Go passes `ch` to NewView; the Rust view keeps no
+        // checker (its methods take the checker from their callers).
         let view = autoimport::new_view(
             registry,
             source_file,
-            project_path,
+            autoimport::ProjectID(project_id.0.clone()),
             program.clone(),
             user_preferences.module_specifier_preferences(),
         );
