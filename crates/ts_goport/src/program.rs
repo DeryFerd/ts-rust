@@ -2749,7 +2749,7 @@ pub(crate) struct WorkerSeed {
     tables: Option<(u32, Arc<VersionTables>)>,
     synthetic: SyntheticSeed,
     ids: IdSeed,
-    lazy_jsdoc: FxHashMap<Node, &'static [Node]>,
+    lazy_jsdoc: PerFileMap<&'static [Node]>,
 }
 
 impl WorkerSeed {
