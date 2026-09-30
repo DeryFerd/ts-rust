@@ -1406,7 +1406,19 @@ pub fn for_each_ancestor_directory<T: Default>(
     }
 }
 
+impl Path {
+    // Go: tspath/path.go:1133 (Path).ForEachAncestorDirectory (ts#63902)
+    pub fn for_each_ancestor_directory<T: Default>(
+        &self,
+        mut callback: impl FnMut(Path) -> (T, bool),
+    ) -> (T, bool) {
+        for_each_ancestor_directory(&self.0, |directory| callback(Path(directory.to_string())))
+    }
+}
+
 // Go: tspath/path.go:1083 ForEachAncestorDirectoryPath
+// PORT: Go N replaces it with the `Path` method above (ts#63902). It stays
+// until its callers in `ls/autoimport` move to the method.
 pub fn for_each_ancestor_directory_path<T: Default>(
     directory: &Path,
     mut callback: impl FnMut(Path) -> (T, bool),
