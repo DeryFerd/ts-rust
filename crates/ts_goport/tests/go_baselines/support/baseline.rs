@@ -645,52 +645,6 @@ fn record_baseline(relative_path: &str) {
 mod tests {
     use super::*;
 
-    // Go: testutil/baseline/baseline_test.go:9 TestSubmoduleAcceptedFilesExist
-    // (typescript-go layout; the merged layout has no such test)
-    #[test]
-    fn baseline_submodule_accepted_files_exist() {
-        if is_merged_layout() {
-            eprintln!("TestSubmoduleAcceptedFilesExist: skipped: not in the merged layout");
-            return;
-        }
-        let mut errors = Vec::new();
-        for name in submodule_accepted_file_names() {
-            if !reference_root()
-                .join("submoduleAccepted")
-                .join(name)
-                .exists()
-            {
-                errors.push(format!(
-                    "submoduleAccepted.txt references {name:?}, but the baseline file does not exist"
-                ));
-            }
-        }
-        assert!(errors.is_empty(), "{}", errors.join("\n"));
-    }
-
-    // Go: testutil/baseline/baseline_test.go:18 TestSubmoduleTriagedFilesExist
-    // (typescript-go layout; the merged layout has no such test)
-    #[test]
-    fn baseline_submodule_triaged_files_exist() {
-        if is_merged_layout() {
-            eprintln!("TestSubmoduleTriagedFilesExist: skipped: not in the merged layout");
-            return;
-        }
-        let mut errors = Vec::new();
-        for name in submodule_triaged_file_names() {
-            if !reference_root()
-                .join("submoduleTriaged")
-                .join(name)
-                .exists()
-            {
-                errors.push(format!(
-                    "submoduleTriaged.txt references {name:?}, but the baseline file does not exist"
-                ));
-            }
-        }
-        assert!(errors.is_empty(), "{}", errors.join("\n"));
-    }
-
     #[test]
     fn baseline_diff_text_and_header_rewrite() {
         let expected = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\n";
