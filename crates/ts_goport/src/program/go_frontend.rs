@@ -141,15 +141,22 @@ thread_local! {
     /// thread. PORT: the parsed file is shared and read only, so the lazy
     /// entries live here. The slices are leaked to give `NodeSlice` a static
     /// borrow. The parsed nodes are synthetic nodes of this thread, so each
-    /// thread keeps its own entries (see `WorkerSeed`).
-    static LAZY_JSDOC: RefCell<FxHashMap<Node, &'static [Node]>> = RefCell::new(FxHashMap::default());
+    /// thread keeps its own entries (see `WorkerSeed`). The entries of a
+    /// dead file version go, and so do its JSDoc nodes (a file scope,
+    /// `parse_lazy_js_doc`).
+    static LAZY_JSDOC: RefCell<PerFileMap<&'static [Node]>> = const { RefCell::new(PerFileMap::new()) };
     /// The file system of a checker worker thread (Go `host.FS()`, without the cache).
     static WORKER_FS: Rc<dyn Fs> = bundled::wrap_fs(osvfs_fs());
 }
 
 /// The lazy JSDoc entries of this thread, to seed a checker worker.
-pub(super) fn lazy_jsdoc_seed() -> FxHashMap<Node, &'static [Node]> {
-    LAZY_JSDOC.with(|cache| cache.borrow().clone())
+pub(super) fn lazy_jsdoc_seed() -> PerFileMap<&'static [Node]> {
+    LAZY_JSDOC.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        // The copy has no entries of dead file versions.
+        cache.write();
+        cache.clone()
+    })
 }
 
 /// The number of lazy JSDoc entries on this thread.
@@ -158,7 +165,7 @@ pub(super) fn lazy_jsdoc_count() -> usize {
 }
 
 /// Installs the entries of `lazy_jsdoc_seed` on a new checker worker.
-pub(super) fn install_lazy_jsdoc_seed(seed: FxHashMap<Node, &'static [Node]>) {
+pub(super) fn install_lazy_jsdoc_seed(seed: PerFileMap<&'static [Node]>) {
     LAZY_JSDOC.with(|cache| *cache.borrow_mut() = seed);
 }
 
@@ -337,8 +344,9 @@ pub(super) fn publish_parsed_files(cwd: &str) {
 /// Go `parseJSDocForNode` for a lazy JSDoc read of `node` (ast/ast.go:2614
 /// `resolveJSDoc`). The result is cached in `LAZY_JSDOC`.
 fn parse_lazy_js_doc(input: &LazyJsDocInput, node: Node) -> &'static [Node] {
-    // The cache outlives program versions, so the nodes belong to the thread.
-    let _base = crate::ast::enter_base_synthetic_owner();
+    // The cache outlives program versions and keeps the nodes as long as
+    // `node` lives: they belong to its file version, or to the thread.
+    let _file = crate::ast::enter_file_synthetic_owner(node);
     let jsdocs: &'static [Node] = Box::leak(
         crate::frontend::parser::parse_js_doc_for_node(
             &input.parse_options,
@@ -348,7 +356,7 @@ fn parse_lazy_js_doc(input: &LazyJsDocInput, node: Node) -> &'static [Node] {
         )
         .into_boxed_slice(),
     );
-    LAZY_JSDOC.with(|cache| cache.borrow_mut().insert(node, jsdocs));
+    LAZY_JSDOC.with(|cache| cache.borrow_mut().write().insert(node, jsdocs));
     jsdocs
 }
 

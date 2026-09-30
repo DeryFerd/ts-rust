@@ -53,13 +53,17 @@
 //! - an alias slot goes to the file version of its parsed node when that is
 //!   a freeable version (`ast/file_version.rs`), else to the base owner. An
 //!   alias lives as long as the node it names: after the version dies, the
-//!   next new alias frees the alias slots of that version
-//!   (`free_dead_aliases`). A read of such a slot panics, as a read of the
-//!   parsed node does;
+//!   next new alias or file scope frees the entries of that version
+//!   (`free_dead_aliases`). A read of such an entry panics, as a read of
+//!   the parsed node does;
+//! - in a file scope (`enter_file_synthetic_owner`), a new node, factory
+//!   list or list copy goes to the file version of a parsed node in the
+//!   same way. Lazy JSDoc opens one: its cache keeps the JSDoc nodes of a
+//!   parsed node for as long as that node lives;
 //! - node slices always go to the base owner.
 //!
 //! Code whose nodes a cache keeps across program versions (the token cache,
-//! lazy JSDoc, parses) opens a base scope.
+//! parses) opens a base scope.
 //! PORT: the Go GC frees request garbage at once and checker nodes with
 //! their checker. Here they stay until their program version is released.
 //!
@@ -195,7 +199,7 @@ enum OwnerKey {
     /// A language server program version (`GoProgram::id`).
     Program(u32),
     /// The alias slots of the nodes of a freeable file version (its file
-    /// id), in chunks of their own.
+    /// id) and the entries made in its file scopes, in chunks of their own.
     File(u32),
 }
 
@@ -243,7 +247,8 @@ struct SyntheticArena {
     /// The chunks of each program version that is an owner on this thread,
     /// by `GoProgram::id`.
     owners: FxHashMap<u32, OwnerChunks>,
-    /// The alias slot chunks of each freeable file version, by file id.
+    /// The chunks of each freeable file version (`OwnerKey::File`), by
+    /// file id.
     alias_files: FxHashMap<u32, OwnerChunks>,
     /// The number of dead file versions when `free_dead_aliases` last ran
     /// (`ast::dead_file_versions`).
@@ -275,13 +280,17 @@ impl SyntheticArena {
         arena
     }
 
-    /// The owner of a new node, factory list or list copy: the current
-    /// program version when it is an owner on this thread and no base scope
-    /// is open, else the thread.
+    /// The owner of a new node, factory list or list copy: the owner of the
+    /// innermost open scope, else the current program version when it is
+    /// an owner on this thread, else the thread. A thread with no program
+    /// owner gives every entry to the thread.
     #[inline]
     fn current_owner(&mut self) -> OwnerKey {
-        if self.owners.is_empty() || BASE_SCOPES.with(Cell::get) > 0 {
+        if self.owners.is_empty() {
             return OwnerKey::Base;
+        }
+        if let Some(owner) = SCOPE_OWNER.with(Cell::get) {
+            return owner;
         }
         let Some(program) = crate::core::try_prog() else {
             return OwnerKey::Base;
@@ -328,9 +337,10 @@ impl SyntheticArena {
         }
     }
 
-    /// The owner of a new alias slot for parsed node `n`: its file version
-    /// when that is a live freeable version, else the thread. It frees the
-    /// aliases of the versions that died since the last call first.
+    /// The owner of a new alias slot for parsed node `n`, or of a file
+    /// scope (`enter_file_synthetic_owner`): its file version when that is
+    /// a live freeable version, else the thread. It frees the entries of the
+    /// versions that died since the last call first.
     fn alias_owner(&mut self, n: Node) -> OwnerKey {
         // PERF: two atomic loads in a process that frees no file version
         // (the CLI).
@@ -350,8 +360,8 @@ impl SyntheticArena {
         OwnerKey::File(file)
     }
 
-    /// Frees the alias slots of the file versions that died since the last
-    /// call, and forgets their `aliases` entries.
+    /// Frees the entries of the file versions that died since the last
+    /// call (`OwnerKey::File`), and forgets their `aliases` entries.
     #[cold]
     #[inline(never)]
     fn free_dead_aliases(&mut self) {
@@ -364,6 +374,12 @@ impl SyntheticArena {
             if let Some(chunks) = self.alias_files.remove(&(file as u32)) {
                 for c in chunks.slots {
                     self.slots[c as usize] = None;
+                }
+                for c in chunks.datas {
+                    self.datas[c as usize] = None;
+                }
+                for c in chunks.lists {
+                    self.lists[c as usize] = None;
                 }
             }
         }
@@ -528,9 +544,9 @@ static EMPTY_BIND: NodeBindData = NodeBindData {
 
 thread_local! {
     static ARENA: RefCell<SyntheticArena> = RefCell::new(SyntheticArena::new());
-    /// The number of open base scopes on this thread
-    /// (`enter_base_synthetic_owner`).
-    static BASE_SCOPES: Cell<u32> = const { Cell::new(0) };
+    /// The owner of the innermost open scope on this thread
+    /// (`enter_base_synthetic_owner`, `enter_file_synthetic_owner`).
+    static SCOPE_OWNER: Cell<Option<OwnerKey>> = const { Cell::new(None) };
 }
 
 /// False when `GOPORT_SYNTHETIC_OWNERS=0`: then no program version becomes
@@ -593,24 +609,49 @@ pub fn free_synthetic_owner(id: u32) {
 /// New synthetic entries of this thread belong to the thread (the base
 /// owner) while the scope lives, whatever program is current. Open it
 /// around code whose nodes a cache keeps across program versions: the token
-/// cache, lazy JSDoc and parses.
+/// cache and parses.
 #[must_use = "new entries go to the thread only while the scope lives"]
-pub fn enter_base_synthetic_owner() -> BaseOwnerScope {
-    BASE_SCOPES.with(|scopes| scopes.set(scopes.get() + 1));
-    BaseOwnerScope {
+pub fn enter_base_synthetic_owner() -> SyntheticOwnerScope {
+    enter_owner_scope(OwnerKey::Base)
+}
+
+/// New synthetic entries of this thread belong to the file version of
+/// parsed node `n` while the scope lives, when that is a live freeable
+/// version and this thread has program owners; else to the thread, as in a
+/// base scope. After the version dies, they go with its alias slots
+/// (`free_dead_aliases`). Open it around code whose nodes a cache keeps for
+/// as long as `n` lives: lazy JSDoc.
+#[must_use = "new entries go to the file version only while the scope lives"]
+pub fn enter_file_synthetic_owner(n: Node) -> SyntheticOwnerScope {
+    let owner = ARENA.with(|a| {
+        let mut a = a.borrow_mut();
+        if a.owners.is_empty() {
+            OwnerKey::Base
+        } else {
+            a.alias_owner(n)
+        }
+    });
+    enter_owner_scope(owner)
+}
+
+fn enter_owner_scope(owner: OwnerKey) -> SyntheticOwnerScope {
+    SyntheticOwnerScope {
+        outer: SCOPE_OWNER.with(|scope| scope.replace(Some(owner))),
         _not_send: std::marker::PhantomData,
     }
 }
 
-/// From `enter_base_synthetic_owner`. It is `!Send`, so it drops on the
-/// thread that made it.
-pub struct BaseOwnerScope {
+/// From `enter_base_synthetic_owner` or `enter_file_synthetic_owner`. It
+/// is `!Send`, so it drops on the thread that made it.
+pub struct SyntheticOwnerScope {
+    /// The owner of the scope that was open around this one.
+    outer: Option<OwnerKey>,
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
-impl Drop for BaseOwnerScope {
+impl Drop for SyntheticOwnerScope {
     fn drop(&mut self) {
-        BASE_SCOPES.with(|scopes| scopes.set(scopes.get() - 1));
+        SCOPE_OWNER.with(|scope| scope.set(self.outer));
     }
 }
 
