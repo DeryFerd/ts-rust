@@ -328,6 +328,14 @@ fn checker_arena() -> &'static bumpalo::Bump {
     CHECKER_ARENA.with(|arena| *arena)
 }
 
+// Go: checker/types.go:37 IndexKind
+// PORT: `flags.rs` was generated at an older pin, so this enum (ts#64264) is
+// declared here.
+crate::flags_macros::go_enum!(IndexKind, i32 {
+    STRING = 0; // IndexKindString
+    NUMBER = 1; // IndexKindNumber
+});
+
 // PORT: Go `TypeFormatFlagsNodeBuilderFlagsMask` is the last constant of the
 // `TypeFormatFlags` block (ts#63911). `flags.rs` has only the single-bit
 // values, so the mask stays here.
@@ -1873,6 +1881,11 @@ pub struct InterfaceType {
 }
 
 impl InterfaceType {
+    // Go: checker/types.go:1055 InterfaceType.ThisType
+    pub fn this_type(&self) -> TypeId {
+        self.this_type
+    }
+
     // Go: checker/types.go:1013 InterfaceType.OuterTypeParameters
     pub fn outer_type_parameters(&self) -> &[TypeId] {
         if self.all_type_parameters.is_empty() {

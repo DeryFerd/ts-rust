@@ -400,6 +400,11 @@ impl Checker {
         self.get_contextual_type_for_argument_at_index(node, arg_index)
     }
 
+    // Go: checker/exports.go:272 GetAwaitedType
+    pub fn get_awaited_type_exported(&mut self, t: TypeId) -> TypeId {
+        self.get_awaited_type(t)
+    }
+
     // Go: checker/exports.go:233 GetIndexSignaturesAtLocation
     pub fn get_index_signatures_at_location_exported(&mut self, node: Node) -> Vec<Node> {
         self.get_index_signatures_at_location(node)
@@ -492,6 +497,11 @@ impl Checker {
     // Go: checker/exports.go:281 GetIndexInfoOfType
     pub fn get_index_info_of_type_exported(&mut self, t: TypeId, key_type: TypeId) -> IndexInfoId {
         self.get_index_info_of_type(t, key_type)
+    }
+
+    // Go: checker/exports.go:342 GetIndexTypeOfType
+    pub fn get_index_type_of_type_exported(&mut self, t: TypeId, key_type: TypeId) -> TypeId {
+        self.get_index_type_of_type(t, key_type)
     }
 
     // Go: checker/exports.go:285 GetIndexInfosOfType
