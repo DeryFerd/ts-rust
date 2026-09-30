@@ -131,6 +131,36 @@ impl MarshalerTo for PathsJSON<'_> {
     }
 }
 
+// Go: core/compileroptions.go:14 PluginImport (ts#64397), tag `json:"name"`.
+// PORT: Go marshals and unmarshals it by reflection (the v2 default struct
+// arshalers).
+impl MarshalerTo for PluginImport {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        let first = &mut true;
+        write_object_start(enc);
+        marshal_field(enc, first, "name", &self.name)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+impl UnmarshalerFrom for PluginImport {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let p = &mut *self;
+        let is_object = unmarshal_struct_fields(dec, "core.PluginImport", |name, dec| {
+            match name {
+                "name" => json_unmarshal_decode(dec, &mut p.name)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = PluginImport::default();
+        }
+        Ok(())
+    }
+}
+
 impl MarshalerTo for CompilerOptionsJSON<'_> {
     fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
         let o = self.0;
@@ -283,6 +313,8 @@ impl MarshalerTo for CompilerOptionsJSON<'_> {
         )?;
         marshal_field_omitzero(enc, first, "outDir", &o.out_dir)?;
         marshal_opt_field(enc, first, "paths", &o.paths.as_ref().map(PathsJSON))?;
+        // ts#64397: `plugins,omitzero` (a nil slice is omitted).
+        marshal_opt_field(enc, first, "plugins", &o.plugins)?;
         marshal_tristate_omitzero(enc, first, "preserveConstEnums", o.preserve_const_enums)?;
         marshal_tristate_omitzero(enc, first, "preserveSymlinks", o.preserve_symlinks)?;
         marshal_field_omitzero(enc, first, "project", &o.project)?;
@@ -521,6 +553,8 @@ impl UnmarshalerFrom for CompilerOptions {
                 }
                 "outDir" => json_unmarshal_decode(dec, &mut o.out_dir)?,
                 "paths" => json_unmarshal_decode(dec, &mut o.paths)?,
+                // ts#64397: `null` leaves a nil slice.
+                "plugins" => json_unmarshal_decode(dec, &mut o.plugins)?,
                 "preserveConstEnums" => unmarshal_tristate(dec, &mut o.preserve_const_enums)?,
                 "preserveSymlinks" => unmarshal_tristate(dec, &mut o.preserve_symlinks)?,
                 "project" => json_unmarshal_decode(dec, &mut o.project)?,

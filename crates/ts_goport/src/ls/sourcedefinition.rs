@@ -620,7 +620,7 @@ impl SourceDefResolver<'_> {
         for mode in modes {
             // PORT: Go `resolved != nil` always holds; the resolver returns an
             // `Arc<ResolvedModule>`.
-            let (resolved, _) =
+            let (resolved, _, _) =
                 self.resolver
                     .resolve_module_name(module_name, resolve_from_file, mode, None);
             if resolved.is_resolved()

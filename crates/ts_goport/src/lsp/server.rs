@@ -4679,7 +4679,7 @@ impl Server {
         let mut config_file_path = String::new();
         let default_project = default_project.borrow();
         if default_project.kind == project::Kind::CONFIGURED {
-            config_file_path = default_project.name();
+            config_file_path = default_project.config_file_name();
         }
         Ok(Some(lsproto::ProjectInfoResult { config_file_path }))
     }

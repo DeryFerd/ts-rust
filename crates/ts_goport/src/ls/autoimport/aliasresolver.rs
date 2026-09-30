@@ -279,7 +279,7 @@ impl AliasResolver {
         if let Some(resolved) = cached {
             return resolved;
         }
-        let (resolved, _) = self.module_resolver.resolve_module_name(
+        let (resolved, _, _) = self.module_resolver.resolve_module_name(
             module_reference,
             &info.file_name,
             ModuleKind::ES_NEXT,

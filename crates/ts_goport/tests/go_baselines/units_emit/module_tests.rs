@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use ts_goport::frontend::module::{
-    ResolutionHost, Resolver, new_resolver, parse_node_module_from_path,
+    DefaultResolver, ResolutionHost, ResolverOptions, new_resolver, parse_node_module_from_path,
 };
 use ts_goport::frontend::tspath::{self, Path};
 use ts_goport::frontend::vfs::{Fs, Replacements, wrapvfs_wrap};
@@ -55,19 +55,24 @@ fn bundler_options() -> Rc<CompilerOptions> {
     })
 }
 
-/// Go `module.NewResolver(host, opts, "", "", nil)` over `fs` with cwd `/repo`.
-fn new_repo_resolver(fs: Rc<dyn Fs>) -> Resolver {
+/// Go `module.NewResolver(module.ResolverOptions{Host: host, CompilerOptions:
+/// opts})` over `fs` with cwd `/repo` (ts#64299).
+fn new_repo_resolver(fs: Rc<dyn Fs>) -> DefaultResolver {
     let host: Rc<dyn ResolutionHost> = Rc::new(ResolutionHostStub {
         fs,
         cwd: "/repo".to_string(),
     });
-    new_resolver(host, bundler_options(), "", "", Vec::new())
+    new_resolver(ResolverOptions {
+        host: Some(host),
+        compiler_options: Some(bundler_options()),
+        ..Default::default()
+    })
 }
 
-/// Go `r, _ := resolver.ResolveModuleName(name, containingFile,
+/// Go `r, _, _ := resolver.ResolveModuleName(name, containingFile,
 /// core.ModuleKindESNext, nil); r.IsResolved()`.
-fn resolves(resolver: &Resolver, name: &str, containing_file: &str) -> bool {
-    let (r, _) = resolver.resolve_module_name(name, containing_file, ModuleKind::ES_NEXT, None);
+fn resolves(resolver: &DefaultResolver, name: &str, containing_file: &str) -> bool {
+    let (r, _, _) = resolver.resolve_module_name(name, containing_file, ModuleKind::ES_NEXT, None);
     r.is_resolved()
 }
 
@@ -173,7 +178,7 @@ fn test_resolve_module_name_trailing_slash_race() {
 
     let second: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
     {
-        let resolver: Weak<Resolver> = Rc::downgrade(&resolver);
+        let resolver: Weak<DefaultResolver> = Rc::downgrade(&resolver);
         let second = Rc::clone(&second);
         *nested.borrow_mut() = Some(Box::new(move || {
             let resolver = resolver.upgrade().expect("resolver");
@@ -262,7 +267,7 @@ fn test_resolve_subpath_nil_contents_race() {
 
     let first: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
     {
-        let resolver: Weak<Resolver> = Rc::downgrade(&resolver);
+        let resolver: Weak<DefaultResolver> = Rc::downgrade(&resolver);
         let first = Rc::clone(&first);
         *nested.borrow_mut() = Some(Box::new(move || {
             let resolver = resolver.upgrade().expect("resolver");
@@ -434,7 +439,7 @@ fn test_resolve_peer_dependency_nil_contents_race() {
 
     let first: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
     {
-        let resolver: Weak<Resolver> = Rc::downgrade(&resolver);
+        let resolver: Weak<DefaultResolver> = Rc::downgrade(&resolver);
         let first = Rc::clone(&first);
         *nested.borrow_mut() = Some(Box::new(move || {
             let resolver = resolver.upgrade().expect("resolver");

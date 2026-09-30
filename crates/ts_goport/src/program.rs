@@ -3207,15 +3207,17 @@ pub fn get_semantic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
     })
 }
 
-// Go: compiler/program.go:658 GetSemanticDiagnosticsWithoutNoEmitFiltering
-pub fn get_semantic_diagnostics_without_no_emit_filtering(
+// Go: compiler/program.go:804 GetSemanticDiagnosticsForIncremental
+// GetSemanticDiagnosticsForIncremental includes newly discovered globals in each
+// file's cached diagnostics and leaves noEmit filtering to the builder.
+pub fn get_semantic_diagnostics_for_incremental(
     source_files: &[Node],
 ) -> FxHashMap<Node, Vec<Diagnostic>> {
-    start_semantic_diagnostics_without_no_emit_filtering(source_files).wait()
+    start_semantic_diagnostics_for_incremental(source_files).wait()
 }
 
-/// A `get_semantic_diagnostics_without_no_emit_filtering` check that runs
-/// on the checker threads while the caller goes on.
+/// A `get_semantic_diagnostics_for_incremental` check that runs on the
+/// checker threads while the caller goes on.
 pub struct PendingSemanticDiagnostics(PendingCheckerGroup);
 
 impl PendingSemanticDiagnostics {
@@ -3226,7 +3228,7 @@ impl PendingSemanticDiagnostics {
     }
 
     /// Waits for the check. Same result as
-    /// `get_semantic_diagnostics_without_no_emit_filtering`.
+    /// `get_semantic_diagnostics_for_incremental`.
     #[must_use]
     pub fn wait(self) -> FxHashMap<Node, Vec<Diagnostic>> {
         let files = Arc::clone(&self.0.files);
@@ -3239,15 +3241,20 @@ impl PendingSemanticDiagnostics {
     }
 }
 
-/// Sends the `get_semantic_diagnostics_without_no_emit_filtering` check of
+/// Sends the `get_semantic_diagnostics_for_incremental` check of
 /// `source_files` to the checkers of the current program and returns
 /// without waiting (Go `collectCheckerDiagnosticsFromFiles` with
-/// `getBindAndCheckDiagnosticsForFile`).
-pub fn start_semantic_diagnostics_without_no_emit_filtering(
+/// `getBindAndCheckDiagnosticsWithChecker(.., true /*includeDeferredGlobals*/)`).
+pub fn start_semantic_diagnostics_for_incremental(
     source_files: &[Node],
 ) -> PendingSemanticDiagnostics {
     PendingSemanticDiagnostics(start_checker_group_do(source_files, |c, f| {
-        get_bind_and_check_diagnostics_with_checker(&context::background(), c, f)
+        get_bind_and_check_diagnostics_with_checker(
+            &context::background(),
+            c,
+            f,
+            true, /*includeDeferredGlobals*/
+        )
     }))
 }
 
@@ -3647,34 +3654,70 @@ pub fn filter_no_emit_semantic_diagnostics(
     diagnostics
 }
 
-// Go: compiler/program.go:1315 getSemanticDiagnosticsWithChecker
+// Go: compiler/program.go:1480 getSemanticDiagnosticsWithChecker
 pub fn get_semantic_diagnostics_with_checker(
     ctx: &Context,
     c: &mut Checker,
     source_file: Node,
 ) -> Vec<Diagnostic> {
     let mut diags = filter_no_emit_semantic_diagnostics(
-        get_bind_and_check_diagnostics_with_checker(ctx, c, source_file),
+        get_bind_and_check_diagnostics_with_checker(
+            ctx,
+            c,
+            source_file,
+            false, /*includeDeferredGlobals*/
+        ),
         &prog().options,
     );
     diags.extend(get_include_processor_diagnostics(source_file));
     diags
 }
 
-// Go: compiler/program.go:1325 getBindAndCheckDiagnosticsWithChecker
+// Go: compiler/program.go:1490 getBindAndCheckDiagnosticsWithChecker
+// getBindAndCheckDiagnosticsWithChecker gets semantic diagnostics for a single file using a
+// caller-provided checker, including bind diagnostics, checker diagnostics, and handling
+// of @ts-ignore/@ts-expect-error directives.
 pub fn get_bind_and_check_diagnostics_with_checker(
     ctx: &Context,
     file_checker: &mut Checker,
     source_file: Node,
+    include_deferred_globals: bool,
 ) -> Vec<Diagnostic> {
     let compiler_options = &prog().options;
     if skip_type_checking(source_file, false) {
         return Vec::new();
     }
+    let previous_globals = if include_deferred_globals {
+        file_checker.get_global_diagnostics()
+    } else {
+        Vec::new()
+    };
+
     // Checker creation forces binding, so bind diagnostics will be populated.
     bind_all();
     let mut diags = file_bind_data(source_file).bind_diagnostics.clone();
     diags.extend(file_checker.get_diagnostics_exported(ctx, source_file));
+
+    if include_deferred_globals {
+        if file_checker.was_canceled() {
+            return Vec::new();
+        }
+        let current_globals = file_checker.get_global_diagnostics();
+        if current_globals.len() > previous_globals.len() {
+            for diagnostic in current_globals {
+                let (_, found) = crate::gostd::slices::binary_search_func(
+                    &previous_globals,
+                    &diagnostic,
+                    |previous: &Diagnostic, diagnostic: &&Diagnostic| {
+                        compare_diagnostics(previous, diagnostic)
+                    },
+                );
+                if !found {
+                    diags.push(diagnostic);
+                }
+            }
+        }
+    }
 
     let is_plain_js = is_plain_js_file(source_file, compiler_options.check_js);
     if is_plain_js {
@@ -3707,7 +3750,7 @@ pub fn get_bind_and_check_diagnostics_with_checker(
     apply_content_mapper_diagnostic_directives(source_file, filtered)
 }
 
-// Go: compiler/program.go:1493 applyContentMapperDiagnosticDirectives (#4712)
+// Go: compiler/program.go:1543 applyContentMapperDiagnosticDirectives (#4712)
 fn apply_content_mapper_diagnostic_directives(
     source_file: Node,
     diags: Vec<Diagnostic>,
@@ -3718,7 +3761,7 @@ fn apply_content_mapper_diagnostic_directives(
     }
     let mut used = vec![false; directives.len()];
     let mut mark_used = |diag: &Diagnostic| -> bool {
-        if !diag.source().is_empty() {
+        if diag.file != source_file || !diag.source().is_empty() {
             return false;
         }
         for (i, directive) in directives.iter().enumerate() {
@@ -3746,7 +3789,7 @@ fn apply_content_mapper_diagnostic_directives(
     filtered
 }
 
-// Go: compiler/program.go:1359 getDiagnosticsWithPrecedingDirectives
+// Go: compiler/program.go:1579 getDiagnosticsWithPrecedingDirectives
 // PORT: Go returns a map by line; its iteration order is random and the
 // caller sorts the result later. A BTreeMap gives a fixed order.
 fn get_diagnostics_with_preceding_directives(
@@ -3771,6 +3814,10 @@ fn get_diagnostics_with_preceding_directives(
     let mut filtered = Vec::with_capacity(diags.len());
     for diagnostic in diags {
         let mut ignore_diagnostic = false;
+        if diagnostic.file != source_file {
+            filtered.push(diagnostic);
+            continue;
+        }
         let mut line = compute_line_of_position(line_starts, diagnostic.pos) - 1;
         while line >= 0 {
             // If line contains a @ts-ignore or @ts-expect-error directive, ignore this diagnostic and change
@@ -3916,11 +3963,13 @@ pub fn instantiation_count() -> i32 {
     val as i32
 }
 
-// Go: compiler/program.go:1750 GetDiagnosticsOfAnyProgram
+// Go: compiler/program.go:2010 GetDiagnosticsOfAnyProgram
 // PORT: Go calls `program.GetGlobalDiagnostics` and
 // `program.GetDeclarationDiagnostics` directly. They are callbacks here so a
 // caller can guard them the same way as the bind and semantic callbacks.
-// Go nil `files` is `None` (#4699).
+// Go nil `files` is `None` (#4699). `is_compiler_program` is the Go type
+// assertion `program.(*Program)`: true for a plain program, false for an
+// incremental one.
 pub fn get_diagnostics_of_any_program(
     files: Option<&[Node]>,
     skip_no_emit_check_for_dts_diagnostics: bool,
@@ -3928,6 +3977,7 @@ pub fn get_diagnostics_of_any_program(
     get_semantic_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
     get_global_diagnostics: &mut dyn FnMut() -> Vec<Diagnostic>,
     get_declaration_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
+    is_compiler_program: bool,
 ) -> Vec<Diagnostic> {
     // Go `appendDiagnosticsForAllFiles` (a closure over `files`).
     fn append_diagnostics_for_all_files(
@@ -3980,8 +4030,11 @@ pub fn get_diagnostics_of_any_program(
                     &mut all_diagnostics,
                     get_semantic_diagnostics,
                 );
-                // Ask for the global diagnostics again (they were empty above); we may have found new during checking, e.g. missing globals.
-                all_diagnostics.extend(get_global_diagnostics());
+                if is_compiler_program {
+                    // Incremental programs cache checking globals with file diagnostics;
+                    // a late sweep would also collect incidental signature-generation globals.
+                    all_diagnostics.extend(get_global_diagnostics());
+                }
             }
 
             if (skip_no_emit_check_for_dts_diagnostics || options.no_emit.is_true())

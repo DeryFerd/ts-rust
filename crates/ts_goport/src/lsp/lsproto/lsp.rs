@@ -864,13 +864,6 @@ impl CodeActionKind {
     // Go: CodeActionKindSource + ".sortImports.ts"
     pub const SOURCE_SORT_IMPORTS_TS: CodeActionKind =
         CodeActionKind(Cow::Borrowed("source.sortImports.ts"));
-
-    // PORT: Go removed these two with #63951. The ls and server lanes still
-    // use them until they port #63951; remove them with their last user.
-    pub const SOURCE_REMOVE_UNUSED_IMPORTS: CodeActionKind =
-        CodeActionKind(Cow::Borrowed("source.removeUnusedImports"));
-    pub const SOURCE_SORT_IMPORTS: CodeActionKind =
-        CodeActionKind(Cow::Borrowed("source.sortImports"));
 }
 
 #[cfg(test)]

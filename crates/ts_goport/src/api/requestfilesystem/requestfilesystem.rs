@@ -8,8 +8,8 @@
 //!
 //! PORT: Go type assertions on a `vfs.FS` (`fs.(*requestFileSystem)`,
 //! `fs.(project.LayeredFileSystem)`, `fs.(project.FileHandleSource)`) use
-//! `vfs::Fs::as_fs_layer` and the `project::FsLayer` queries (the server
-//! lane design).
+//! `vfs::Fs::as_any` (a downcast to the concrete type) and the
+//! `project::FsLayer` queries (the server lane design).
 
 use crate::prelude::*;
 
@@ -202,7 +202,6 @@ struct RequestPathLookup {
 // (the fields are shared handles).
 pub fn get_request_file_system(file_system: &dyn vfs::Fs) -> Option<RequestFileSystemImpl> {
     file_system
-        .as_fs_layer()?
         .as_any()?
         .downcast_ref::<RequestFileSystemImpl>()
         .cloned()
@@ -906,7 +905,7 @@ impl vfs::Fs for RequestFileSystemImpl {
     }
 
     // PORT: Go type assertions (see the file header).
-    fn as_fs_layer(&self) -> Option<&dyn project::FsLayer> {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
 }

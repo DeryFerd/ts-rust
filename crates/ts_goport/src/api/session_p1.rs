@@ -3460,7 +3460,8 @@ impl Session {
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
         }
-        Ok(program.get_mode_for_resolution_at_index(source_file, params.index))
+        // The check above makes the index non-negative.
+        Ok(program.get_mode_for_resolution_at_index(source_file, params.index as usize))
     }
 
     // Go: api/session.go handleGetResolvedModule (ts#64247)

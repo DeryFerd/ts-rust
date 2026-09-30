@@ -599,6 +599,8 @@ fn cached_resolutions(p: &NewProgram) -> usize {
     p.resolver
         .as_ref()
         .expect("program resolver")
+        .as_default_resolver()
+        .expect("a default resolver")
         .caches
         .module_resolution_cache
         .cache

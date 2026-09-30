@@ -432,8 +432,7 @@ impl Checker {
                     import_attributes_type,
                 };
             }
-            let (specifier, ok) = try_get_ambient_module_name_from_symbol_name(&symbol_name);
-            if ok {
+            if let Some(specifier) = try_get_ambient_module_name_from_symbol_name(&symbol_name) {
                 return ModuleSpecifierResult {
                     specifier: specifier.to_string(),
                     import_attributes_type: TypeId::NIL,
@@ -442,8 +441,7 @@ impl Checker {
         }
         let enclosing_file = nb_enclosing_file(b);
         if enclosing_file.is_nil() {
-            let (specifier, ok) = try_get_ambient_module_name_from_symbol_name(&symbol_name);
-            if ok {
+            if let Some(specifier) = try_get_ambient_module_name_from_symbol_name(&symbol_name) {
                 return ModuleSpecifierResult {
                     specifier: specifier.to_string(),
                     import_attributes_type: TypeId::NIL,

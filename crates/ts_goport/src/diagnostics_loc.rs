@@ -158,7 +158,10 @@ static LOCALIZED_MESSAGES_CACHE: LazyLock<
 > = LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 // Go: diagnostics/diagnostics.go:91 getLocalizedMessages
-fn get_localized_messages(loc: &language::Tag) -> Option<&'static LocaleMessages> {
+/// PORT: `pub` for the TestLocaleFiles port
+/// (tests/go_baselines/units_platform/diagnostics_locale.rs); Go tests it
+/// from inside the package.
+pub fn get_localized_messages(loc: &language::Tag) -> Option<&'static LocaleMessages> {
     if *loc == language::Tag::UND {
         return None;
     }

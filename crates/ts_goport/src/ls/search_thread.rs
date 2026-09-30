@@ -64,7 +64,7 @@ pub struct SearchItem {
 struct SearchJob<Req> {
     item: SearchItem,
     params: Req,
-    project_path: tspath::Path,
+    project_id: crate::ls::autoimport::ProjectID,
     preferences: lsutil::UserPreferences,
     use_case_sensitive_file_names: bool,
     position_encoding: lsproto::PositionEncodingKind,
@@ -224,7 +224,7 @@ pub fn start_search<K: CrossProjectSearch>(
     let job = SearchJob {
         item: search,
         params: params.clone(),
-        project_path: ls.project_path.clone(),
+        project_id: ls.project_id.clone(),
         preferences: ls.active_config.clone(),
         use_case_sensitive_file_names: ls.use_case_sensitive_file_names(),
         position_encoding: ls.converters.position_encoding(),
@@ -402,7 +402,7 @@ fn run_search<K: CrossProjectSearch>(
     let searched = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let host: Rc<dyn Host> = Rc::new(WorkerHost::new(view, &job));
         let ls = new_language_service_for_view(
-            job.project_path.clone(),
+            job.project_id.clone(),
             Rc::clone(view),
             host,
             job.preferences.clone(),

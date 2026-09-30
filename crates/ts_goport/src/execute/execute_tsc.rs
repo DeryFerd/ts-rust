@@ -545,6 +545,8 @@ fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) ->
         single_threaded: Tristate::Unknown,
         typings_location: String::new(),
         project_name: String::new(),
+        // ts#64299: Go leaves `CreateModuleResolver` nil here.
+        create_module_resolver: None,
         // ts#64024: Go leaves `SkipModuleResolution` false here.
         skip_module_resolution: false,
     }

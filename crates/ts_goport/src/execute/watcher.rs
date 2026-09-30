@@ -896,7 +896,7 @@ impl Watcher {
         // Go's `createCheckerPool` argument (nil here) is dropped, as in
         // `update_program`. Go also passes a nil `createModuleResolver`
         // (ts#64299), so the program keeps its own resolver.
-        let (new_program, _, reused) = old_program.reuse_program(changed_path, host.clone());
+        let (new_program, _, reused) = old_program.reuse_program(changed_path, host.clone(), None);
         if reused {
             let np = Rc::new(new_program.expect("ReuseProgram returns the reused program"));
             let version = crate::program::new_program_version(&np, Some(old_version));

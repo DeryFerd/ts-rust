@@ -57,6 +57,20 @@ pub trait Fs {
     // Realpath returns the "real path" of the specified path,
     // following symlinks and correcting filename casing.
     fn realpath(&self, path: &str) -> String;
+
+    /// PORT: Go type assertions of a `vfs.FS` value to the language service
+    /// file system layers (ts#64291): the project package's
+    /// `FileHandleSource`, `LayeredFileSystem`, `RebasableFileSystem`,
+    /// `FileChangeExpander` and `*overlayFS`, and the api's
+    /// `*requestFileSystem`. This crate (`goport_util`) cannot name those
+    /// types, so a layer returns itself as `Any` and
+    /// `project::as_fs_layer` downcasts it to its concrete type. Every other
+    /// file system keeps this default (the assertion fails). Wrappers that
+    /// forward to another `Fs` (`CachedFs`, `TrackingFs`, `wrapvfs`) must not
+    /// forward it: Go asserts on the wrapper's own type.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 // Go: vfs.go:52 Entries

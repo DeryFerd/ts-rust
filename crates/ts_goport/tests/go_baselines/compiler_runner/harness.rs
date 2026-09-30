@@ -1210,6 +1210,8 @@ fn create_program(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) -> 
         use_source_of_project_reference: false,
         typings_location: String::new(),
         project_name: String::new(),
+        create_module_resolver: None,
+        skip_module_resolution: false,
     };
     // PORT: the frontend parses with no current program; the result is a
     // program version (see the module comment).

@@ -19,7 +19,7 @@ use crate::emitter::program_emit::{self, EmitOptions, WriteFile, WriteFileData};
 use crate::frontend::compiler::{NewProgram, ProgramOptions, new_compiler_host};
 use crate::frontend::tsoptions::{ParsedCommandLine, ParsedOptions, get_default_lib_file_name};
 use crate::frontend::tspath::{combine_paths, get_normalized_absolute_path};
-use crate::frontend::vfs::{Entries, FileInfo, Fs, FsError, WalkDirFunc};
+use crate::frontend::vfs::{Entries, FileInfo, Fs, FsError};
 use crate::gostd::Context;
 use crate::gostd::strconv::quote;
 use crate::program;
@@ -254,6 +254,7 @@ fn transpile_worker(
             single_threaded: Tristate::Unknown,
             typings_location: String::new(),
             project_name: String::new(),
+            create_module_resolver: None,
             skip_module_resolution: true,
         }))
     };
@@ -403,10 +404,6 @@ impl Fs for TranspileFs {
     }
 
     fn stat(&self, _path: &str) -> Option<FileInfo> {
-        go_nil_dereference()
-    }
-
-    fn walk_dir(&self, _root: &str, _walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
         go_nil_dereference()
     }
 

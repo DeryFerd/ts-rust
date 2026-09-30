@@ -18,7 +18,6 @@ use crate::frontend::core_ls_ext::{first_non_zero, min_all_func};
 use crate::frontend::core_nodemodules::UNPREFIXED_NODE_CORE_MODULES;
 use crate::frontend::module;
 use crate::frontend::tspath;
-use crate::gostd::Context;
 use crate::ls::lsutil;
 use crate::lsp::lsproto;
 use crate::modulespecifiers;
@@ -286,11 +285,9 @@ fn unicode_is_upper(c: char) -> bool {
 }
 
 impl View {
-    // Go: ls/autoimport/view.go:172 GetCompletions
+    // Go: ls/autoimport/view.go:180 GetCompletions
     // PORT: `ch` is the request checker, Go `v.checker` (ts#64178); the
-    // caller passes it (as the pinned ImportAdder decision does). Go dropped
-    // the `ctx` parameter in ts#64178; `_ctx` stays until its caller in
-    // `completions_p1.rs` (no wave-2 owner) drops the argument.
+    // caller passes it (as the pinned ImportAdder decision does).
     // Go `grouped` is a map: `IndexMap` in insertion order.
     // PORT: Go map order is random. It changes values, not only the order of
     // ties, through the per-file specifier cache (`specifiers.rs`): the cache
@@ -305,7 +302,6 @@ impl View {
     // insertion order, so the sort input and its ties do not change.
     pub fn get_completions(
         &self,
-        _ctx: &Context,
         ch: &mut Checker,
         prefix: &str,
         position: lsproto::Position,

@@ -271,6 +271,8 @@ impl LanguageService {
         for (index, &symbol) in data.symbols.iter().enumerate() {
             let origin = data.symbol_to_origin_info_map.get(&(index as i32));
             let (display_name, _) = get_completion_entry_display_name_for_symbol(
+                file,
+                &preferences,
                 &ch.symbols,
                 symbol,
                 origin,

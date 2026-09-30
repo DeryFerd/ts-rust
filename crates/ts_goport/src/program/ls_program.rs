@@ -43,6 +43,7 @@ use super::*;
 use crate::emitter::emitter::{EmitOnly, Emitter};
 use crate::emitter::program_emit::{EmitOptions, EmitResult, combine_emit_results};
 use crate::frontend::compiler::{CompilerHost, NewProgram, ProgramOptions};
+use crate::frontend::module;
 use crate::frontend::outputpaths::ForceEmitPaths;
 use crate::frontend::parser::ParsedSourceFile;
 use crate::frontend::tspath;
@@ -395,11 +396,14 @@ pub fn new_program(
 // becomes a program version that shares the unchanged file versions of
 // `p`, and gets its checker pool here. `create_checker_pool`, when set,
 // overrides the one of `p` (Go `newOpts.CreateCheckerPool`).
+// `create_module_resolver` goes to `NewProgram::update_program`; a Go nil
+// `createModuleResolver` is `None` (ts#64299).
 pub fn update_program(
     p: &NewProgram,
     changed_file_path: &tspath::Path,
     new_host: Rc<dyn CompilerHost>,
     create_checker_pool: Option<CreateCheckerPool>,
+    create_module_resolver: Option<Rc<dyn Fn(module::ResolverOptions) -> Rc<dyn module::Resolver>>>,
 ) -> (Rc<NewProgram>, Option<Rc<ParsedSourceFile>>, bool) {
     let old = PROGRAM_CHECKERS.with(|programs| programs.borrow().get(&program_key(p)).cloned());
     let create_checker_pool = create_checker_pool.or_else(|| {
@@ -410,7 +414,7 @@ pub fn update_program(
     });
     let (result, new_file, reused) = {
         let _scope = crate::core::enter_program(None);
-        p.update_program(changed_file_path, new_host)
+        p.update_program(changed_file_path, new_host, create_module_resolver)
     };
     let result = Rc::new(result);
     // A clone shares the old program's processed files (Go `UpdateProgram`),
@@ -727,7 +731,9 @@ pub fn get_checker_associations_in_order(
             }
             let old_weight = checker_weight as f64;
             let new_weight = (checker_weight + file_weights[file_index]) as f64;
-            let penalty = alpha * (new_weight * new_weight.sqrt() - old_weight * old_weight.sqrt());
+            let new_penalty = new_weight * new_weight.sqrt();
+            let old_penalty = old_weight * old_weight.sqrt();
+            let penalty = alpha * (new_penalty - old_penalty);
             let score = neighbor_counts[checker_index] as f64 - penalty;
             if score > best_score
                 || score == best_score
@@ -1355,8 +1361,10 @@ pub fn get_semantic_diagnostics(
     })
 }
 
-// Go: compiler/program.go:658 GetSemanticDiagnosticsWithoutNoEmitFiltering
-pub fn get_semantic_diagnostics_without_no_emit_filtering(
+// Go: compiler/program.go:804 GetSemanticDiagnosticsForIncremental
+// GetSemanticDiagnosticsForIncremental includes newly discovered globals in each
+// file's cached diagnostics and leaves noEmit filtering to the builder.
+pub fn get_semantic_diagnostics_for_incremental(
     p: &NewProgram,
     ctx: &Context,
     source_files: &[Node],
@@ -1364,7 +1372,9 @@ pub fn get_semantic_diagnostics_without_no_emit_filtering(
     let _program = enter(p);
     let all_diags =
         collect_checker_diagnostics_from_files(p, ctx, source_files, &mut |ctx, c, file| {
-            get_bind_and_check_diagnostics_with_checker(ctx, c, file)
+            get_bind_and_check_diagnostics_with_checker(
+                ctx, c, file, true, /*includeDeferredGlobals*/
+            )
         });
     let mut result = FxHashMap::default();
     for (i, diags) in all_diags.into_iter().enumerate() {
@@ -1628,6 +1638,7 @@ fn handle_no_emit_options(
             &mut |file: Node| get_semantic_diagnostics(p, ctx, file),
             &mut || get_global_diagnostics(p, ctx),
             &mut |file: Node| get_declaration_diagnostics(p, ctx, file),
+            true, // a `*compiler.Program`
         );
         if diagnostics.is_empty() {
             return None; // NoEmitOnError is enabled, but no diagnostics were found, so we can proceed with emitting

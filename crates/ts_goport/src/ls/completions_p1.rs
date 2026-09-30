@@ -1901,6 +1901,8 @@ impl GetCompletionDataState<'_> {
                         .is_true()
                 {
                     let (display_name, _) = get_completion_entry_display_name_for_symbol(
+                        self.file,
+                        self.preferences,
                         &self.type_checker.symbols,
                         member,
                         None, /*origin*/
@@ -2007,7 +2009,6 @@ impl GetCompletionDataState<'_> {
         };
 
         self.auto_imports = view.get_completions(
-            self.ctx,
             self.type_checker,
             &lower_case_token_text,
             usage_position,

@@ -806,22 +806,26 @@ impl NewProgram {
         )
     }
 
-    // Go: program.go:1708 (*Program).GetModeForResolutionAtIndex (ts#64292)
-    // PORT: Go `index int` is `usize`.
+    // Go: program.go:1759 (*Program).GetModeForResolutionAtIndex (ts#64292)
+    // PORT: Go `*ast.SourceFile` is the file root `Node` (the api passes a
+    // file of this program); its `ast.HasFileName` view copies the file name
+    // and path. Go `index int` is `usize`.
     pub fn get_mode_for_resolution_at_index(
         &self,
-        source_file: &ParsedSourceFile,
+        source_file: Node,
         index: usize,
     ) -> ResolutionMode {
-        let imports = &source_file.imports;
+        let info = source_file_info(source_file);
+        let file = new_has_file_name(source_file_file_name(source_file), &info.path);
+        let imports = &info.imports;
         if index < imports.len() {
-            return self.get_mode_for_usage_location(source_file, imports[index]);
+            return self.get_mode_for_usage_location(&file, imports[index]);
         }
         let mut index = index - imports.len();
-        for augmentation in &source_file.module_augmentations {
+        for &augmentation in &info.module_augmentations {
             if augmentation.kind() == SyntaxKind::StringLiteral {
                 if index == 0 {
-                    return self.get_mode_for_usage_location(source_file, *augmentation);
+                    return self.get_mode_for_usage_location(&file, augmentation);
                 }
                 index -= 1;
             }

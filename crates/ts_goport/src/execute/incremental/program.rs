@@ -949,6 +949,9 @@ pub fn handle_no_emit_options(
             &mut |file| program.get_semantic_diagnostics(file),
             &mut || program.get_global_diagnostics(),
             &mut |file| program.get_declaration_diagnostics(file),
+            // ts#64452: the only caller passes the incremental program (Go
+            // `program.(*Program)` fails).
+            false,
         );
         if diagnostics.is_empty() {
             return None; // NoEmitOnError is enabled, but no diagnostics were found, so we can proceed with emitting

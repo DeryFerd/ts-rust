@@ -1,6 +1,6 @@
 //! Port of Go `ast/ast.go` parts that the language service needs:
 //! lines 2405-2450 (`SourceFileDataKey`, `NewSourceFileDataKey`,
-//! `GetOrComputeSourceFileData`, `getSourceFileDataCell`), 2462-2465
+//! `(*SourceFile).GetOrComputeData`, `(*SourceFile).getDataCell`), 2462-2465
 //! (`TokenCacheKey`) and 2776-2838 (`(*SourceFile).GetOrCreateToken`,
 //! `createToken`).
 //!
@@ -90,18 +90,6 @@ pub fn source_file_get_or_compute_data<T: Clone + 'static>(
 ) -> T {
     let cell = source_file_get_data_cell(file, key);
     cell.value.get_or_init(|| compute(file)).clone()
-}
-
-/// Go `GetOrComputeSourceFileData`, which ts#63902 replaced with
-/// `(*SourceFile).GetOrComputeData` (`source_file_get_or_compute_data`).
-// PORT: kept until its last user (`api/encoder/encoder.rs`, lane api) takes
-// the new name; then remove it.
-pub fn get_or_compute_source_file_data<T: Clone + 'static>(
-    file: Node,
-    key: &SourceFileDataKey<T>,
-    compute: impl FnOnce(Node) -> T,
-) -> T {
-    source_file_get_or_compute_data(file, key, compute)
 }
 
 // Go: ast/ast.go:2412 (*SourceFile).getDataCell (ts#63902)

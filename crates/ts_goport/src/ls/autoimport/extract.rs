@@ -277,7 +277,7 @@ impl ExportExtractor<'_> {
             let mut module_id = ModuleID(name.clone());
             let mut module_file_name = String::new();
             if tspath::is_external_module_name_relative(&name) {
-                let (resolved, _) = self.module_resolver.resolve_module_name(
+                let (resolved, _, _) = self.module_resolver.resolve_module_name(
                     &name,
                     source_file_file_name(file),
                     ModuleKind::COMMON_JS,
