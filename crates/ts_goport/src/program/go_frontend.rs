@@ -598,7 +598,9 @@ enum Entry {
 /// earlier version published keep their `GoFile`. `cwd` is the current
 /// directory of the process. `previous` is the version that `np` was
 /// updated from, if it is still loaded; the new state shares its copies of
-/// unchanged frontend data (`GoSharedState::new`).
+/// unchanged frontend data (`GoSharedState::new`). When `np` replaced files
+/// of `previous` in place (Go `ReuseProgram`), the new tables start from
+/// its tables (`reused_tables`).
 fn build_program(
     np: &Rc<NewProgram>,
     entry: Entry,
@@ -607,51 +609,39 @@ fn build_program(
 ) -> &'static GoProgram {
     let use_case_sensitive_file_names = osvfs_fs().use_case_sensitive_file_names();
     let options = crate::program::intern_compiler_options(np.options());
+    let files = np.source_files();
+    let previous = previous.and_then(previous_version);
+    let replaced = previous
+        .as_ref()
+        .and_then(|old| replaced_files(np, &old.np, &old.tables));
+    let check = check_version_tables() && replaced.is_some();
 
     // PERF: the publish keeps the parse of each new file, so each
     // `SourceFileInfo` can borrow its fields instead of copying them
-    // (`go_files_of_unpublished_stores`). The maps are sized up front: this
-    // is serial work before the bind.
-    let file_count = np.source_files().len();
-    let mut parsed: FxHashMap<usize, &Rc<ParsedSourceFile>> =
-        FxHashMap::with_capacity_and_hasher(file_count, Default::default());
-    let mut source_file_order = Vec::with_capacity(file_count);
-    for file in np.source_files() {
-        source_file_order.push(file.store);
-        parsed.insert(file.store, file);
+    // (`go_files_of_unpublished_stores`). Only a program file that no
+    // publish has seen is new. The old version published every file it
+    // shares, so with replaced files only those can be new.
+    fn new_files<'a>(
+        files: impl Iterator<Item = &'a Rc<ParsedSourceFile>>,
+    ) -> FxHashMap<usize, &'a Rc<ParsedSourceFile>> {
+        let unpublished = unpublished_file_ids();
+        files
+            .filter(|file| unpublished.contains(&file.store))
+            .map(|file| (file.store, file))
+            .collect()
     }
-
-    let files = go_files_of_unpublished_stores(&parsed, &cwd, use_case_sensitive_file_names);
-
-    // Program files in ascending store id, the insert order of the first
-    // load, then the Go program fields of each.
-    let mut stores: Vec<usize> = parsed.keys().copied().collect();
-    stores.sort_unstable();
-    // Every program file path is in `files_by_path` too.
-    let mut file_by_path = FxHashMap::with_capacity_and_hasher(
-        np.files_by_path().len().max(file_count),
-        Default::default(),
-    );
-    let mut file_meta = FxHashMap::with_capacity_and_hasher(file_count, Default::default());
-    for store in stores {
-        let path = parsed[&store].path();
-        file_by_path.insert(path.0.clone(), store);
-        let meta = FileProgramMeta {
-            meta_data: np.get_source_file_meta_data(path),
-            is_default_library: np.is_source_file_default_library(path),
-        };
-        file_meta.insert(store, meta);
+    let parsed = match &replaced {
+        Some(replaced) => new_files(replaced.iter().map(|r| r.file)),
+        None => new_files(files.iter()),
+    };
+    if check {
+        let all = new_files(files.iter());
+        assert!(
+            all.keys().all(|store| parsed.contains_key(store)),
+            "a program file that no publish has seen was not replaced"
+        );
     }
-    // Go: filesparser.go:425 `filesByPath[task.path] = packageIdFile`. A
-    // package dedup redirect path maps to the first file with the same
-    // package id, so `GetSourceFileByPath` finds that file.
-    // PERF: copies the path only when it adds an entry (`entry` needs an
-    // owned key even when the path is already there).
-    for (path, file) in np.files_by_path() {
-        if !file_by_path.contains_key(&path.0) {
-            file_by_path.insert(path.0.clone(), file.store);
-        }
-    }
+    let go_files = go_files_of_unpublished_stores(&parsed, &cwd, use_case_sensitive_file_names);
 
     let id = next_program_id();
     FRONTENDS.with(|frontends| {
@@ -661,16 +651,22 @@ fn build_program(
         );
     });
     // The stores become read-only here, before the program is installed.
-    publish_file_stores(files);
+    publish_file_stores(go_files);
     // A program file must be published as a source file. A parse that an
     // earlier publish did not know (see `note_parsed_source_file`) became a
     // store with no root there, and its bind would fail far from the cause.
-    for &store in &source_file_order {
+    // The build of the old version checked the files that a new version
+    // shares with it.
+    let assert_published = |file: &Rc<ParsedSourceFile>| {
         assert!(
-            crate::ast::go_file(store).root.is_some(),
+            crate::ast::go_file(file.store).root.is_some(),
             "program file {} was published as a store that is not a source file",
-            parsed[&store].file_name()
+            file.file_name()
         );
+    };
+    match &replaced {
+        Some(replaced) if !check => replaced.iter().for_each(|r| assert_published(r.file)),
+        _ => files.iter().for_each(assert_published),
     }
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
         id,
@@ -687,46 +683,277 @@ fn build_program(
             false
         }
     };
+    // The tables are built with the program current, like the lazy Go
+    // reads they replace.
     let _scope = (!one_program).then(|| crate::core::enter_program(Some(program)));
-    // With the program current, like the lazy Go reads it replaces. The old
-    // version is still loaded, so its tables are in its slot.
-    let previous = previous.and_then(|old| {
-        let old_np = FRONTENDS.with(|frontends| frontends.borrow().get(&old.id).cloned())?;
-        let TablesSlot::Version(slot) = &old.state.get()?.tables else {
-            return None;
-        };
-        let old_tables = slot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()?;
-        old_tables.go.is_some().then_some((old_np, old_tables))
-    });
-    let shared = GoSharedState::new(
-        np,
-        &parsed,
-        previous
-            .as_ref()
-            .and_then(|(old_np, old)| Some((&**old_np, old.go.as_ref()?))),
-    );
-    drop(previous);
-    let tables = VersionTables {
-        file_meta,
-        go: Some(shared),
-        file_versions: parsed
-            .values()
-            .filter_map(|file| file.version.get().cloned())
-            .collect(),
-        ..VersionTables::new(source_file_order, file_by_path)
+    let previous_shared = previous
+        .as_ref()
+        .and_then(|old| Some((&*old.np, old.tables.go.as_ref()?)));
+    let (tables, common_source_directory) = match (&previous, &replaced) {
+        (Some(old), Some(replaced)) => {
+            let tables = reused_tables(np, old, replaced);
+            // Go computes it from the file names and the options, which a
+            // program that replaces files in place keeps.
+            let common_source_directory = old.common_source_directory;
+            if check {
+                let full = full_tables(np, previous_shared);
+                assert_same_tables(&tables, &full);
+                assert_eq!(
+                    common_source_directory,
+                    common_source_directory_of(np),
+                    "common source directory"
+                );
+            }
+            (tables, common_source_directory)
+        }
+        _ => {
+            let tables = full_tables(np, previous_shared);
+            let common_source_directory = intern_program_str(&common_source_directory_of(np));
+            (tables, common_source_directory)
+        }
     };
+    if check_version_tables() {
+        tables
+            .go
+            .as_ref()
+            .expect("a Go frontend program has shared state")
+            .assert_include_diagnostics(np);
+    }
+    drop(replaced);
+    drop(previous);
     let program_state = ProgramState {
         cwd: intern_program_str(&cwd),
         use_case_sensitive_file_names,
-        common_source_directory: Some(intern_program_str(&common_source_directory_of(np))),
+        common_source_directory: Some(common_source_directory),
         alias_resolver: false,
         tables: TablesSlot::new(tables, one_program),
     };
     assert!(program.state.set(program_state).is_ok());
     program
+}
+
+/// True in debug builds, or when `GOPORT_CHECK_VERSION_TABLES=1`:
+/// `build_program` builds the tables of a version that starts from the
+/// tables of an older one (`reused_tables`) again from its files alone
+/// (`full_tables`), and panics when they differ. Read once.
+fn check_version_tables() -> bool {
+    static CHECK: OnceLock<bool> = OnceLock::new();
+    *CHECK.get_or_init(|| {
+        cfg!(debug_assertions)
+            || std::env::var("GOPORT_CHECK_VERSION_TABLES").is_ok_and(|v| v == "1")
+    })
+}
+
+/// The version that a new program version was updated from, while it is
+/// loaded on this thread (`previous_version`).
+struct PreviousVersion {
+    np: Rc<NewProgram>,
+    tables: Arc<VersionTables>,
+    common_source_directory: &'static str,
+}
+
+/// `old` as a `PreviousVersion`, or None when it is not a Go frontend
+/// program version that this thread loaded, or when it is released.
+fn previous_version(old: &'static GoProgram) -> Option<PreviousVersion> {
+    let np = FRONTENDS.with(|frontends| frontends.borrow().get(&old.id).cloned())?;
+    let state = old.state.get()?;
+    let TablesSlot::Version(slot) = &state.tables else {
+        return None;
+    };
+    let tables = slot
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()?;
+    tables.go.as_ref()?;
+    Some(PreviousVersion {
+        np,
+        tables,
+        common_source_directory: state.common_source_directory?,
+    })
+}
+
+/// A program file that a new program version put in the slot of a file of
+/// the version it was updated from (Go `ReuseProgram`).
+struct Replaced<'a> {
+    slot: usize,
+    old: &'a Rc<ParsedSourceFile>,
+    file: &'a Rc<ParsedSourceFile>,
+}
+
+/// The files of `np` that are not those of `old_np`, when `np` replaced
+/// them in place (Go `ReuseProgram`): the same number of files at the same
+/// paths in the same order, and the same resolutions. `old` holds the tables
+/// of `old_np`. None when `np` is not such a program.
+fn replaced_files<'a>(
+    np: &'a NewProgram,
+    old_np: &'a NewProgram,
+    old: &VersionTables,
+) -> Option<Vec<Replaced<'a>>> {
+    let (files, old_files) = (np.source_files(), old_np.source_files());
+    let reused = Arc::ptr_eq(
+        &np.processed_files.resolved_modules,
+        &old_np.processed_files.resolved_modules,
+    ) && files.len() == old_files.len()
+        && old.source_file_order.len() == files.len()
+        && np.files_by_path().len() == old_np.files_by_path().len();
+    if !reused {
+        return None;
+    }
+    let mut replaced = Vec::new();
+    for (slot, (file, old_file)) in files.iter().zip(old_files).enumerate() {
+        if Rc::ptr_eq(file, old_file) {
+            continue;
+        }
+        if file.path() != old_file.path() {
+            return None;
+        }
+        replaced.push(Replaced {
+            slot,
+            old: old_file,
+            file,
+        });
+    }
+    Some(replaced)
+}
+
+/// The tables of `np` built from its files alone. `previous` is the
+/// frontend program and shared state of the version that `np` was updated
+/// from (`GoSharedState::new`).
+fn full_tables(np: &NewProgram, previous: Option<(&NewProgram, &GoSharedState)>) -> VersionTables {
+    let files = np.source_files();
+    let source_file_order: Vec<usize> = files.iter().map(|file| file.store).collect();
+    let mut slots = SlotsBuilder::new(&source_file_order);
+    // Every program file path is in `files_by_path` too.
+    let mut file_by_path = FxHashMap::with_capacity_and_hasher(
+        np.files_by_path().len().max(files.len()),
+        Default::default(),
+    );
+    for (slot, file) in files.iter().enumerate() {
+        file_by_path.insert(file.path().0.clone(), slot);
+    }
+    // Go: filesparser.go:425 `filesByPath[task.path] = packageIdFile`. A
+    // package dedup redirect path maps to the first file with the same
+    // package id, so `GetSourceFileByPath` finds that file.
+    // PERF: copies the path only when it adds an entry (`entry` needs an
+    // owned key even when the path is already there).
+    for (path, file) in np.files_by_path() {
+        if !file_by_path.contains_key(&path.0) {
+            file_by_path.insert(path.0.clone(), slots.slot_of(file.store));
+        }
+    }
+    let other_files = slots.other_files;
+    let file_meta = files
+        .iter()
+        .map(|file| file_program_meta(np, file))
+        .collect();
+    let go = GoSharedState::new(np, previous, None, &file_by_path);
+    VersionTables {
+        go: Some(go),
+        file_versions: files
+            .iter()
+            .filter_map(|file| file.version.get().cloned())
+            .collect(),
+        ..VersionTables::from_parts(
+            source_file_order,
+            other_files,
+            Arc::new(file_by_path),
+            Arc::new(file_meta),
+        )
+    }
+}
+
+/// The tables of `np`, which replaced the files `replaced` of version `old`
+/// in place (Go `ReuseProgram`): the old tables with the entries of the
+/// replaced files changed. The files keep their paths and slots, so the new
+/// tables share the paths and, while they are equal, the program-set
+/// fields. They equal `full_tables` of `np` (`check_version_tables`).
+// PERF: Go `ReuseProgram` copies the old program's maps. This copies only
+// lists of ids and `Arc`s, not paths (editfast1).
+fn reused_tables(np: &NewProgram, old: &PreviousVersion, replaced: &[Replaced]) -> VersionTables {
+    let (old_np, old) = (&*old.np, &*old.tables);
+    let old_shared = old.go.as_ref().expect("checked by previous_version");
+    let mut source_file_order = old.source_file_order.clone();
+    let mut file_meta = Arc::clone(&old.file_meta);
+    for r in replaced {
+        source_file_order[r.slot] = r.file.store;
+        let meta = file_program_meta(np, r.file);
+        if file_meta[r.slot] != meta {
+            Arc::make_mut(&mut file_meta)[r.slot] = meta;
+        }
+    }
+    let dropped: Vec<&Arc<crate::ast::FileVersion>> = replaced
+        .iter()
+        .filter_map(|r| r.old.version.get())
+        .collect();
+    let file_versions = old
+        .file_versions
+        .iter()
+        .filter(|version| !dropped.iter().any(|dropped| Arc::ptr_eq(version, dropped)))
+        .cloned()
+        .chain(
+            replaced
+                .iter()
+                .filter_map(|r| r.file.version.get().cloned()),
+        )
+        .collect();
+    let go = GoSharedState::new(
+        np,
+        Some((old_np, old_shared)),
+        Some(replaced),
+        &old.file_by_path,
+    );
+    VersionTables {
+        go: Some(go),
+        file_versions,
+        ..VersionTables::from_parts(
+            source_file_order,
+            old.other_files.clone(),
+            Arc::clone(&old.file_by_path),
+            file_meta,
+        )
+    }
+}
+
+/// Go `SourceFile.Metadata` and `IsDefaultLibrary` of program file `file`.
+fn file_program_meta(np: &NewProgram, file: &ParsedSourceFile) -> FileProgramMeta {
+    let path = file.path();
+    FileProgramMeta {
+        meta_data: np.get_source_file_meta_data(path),
+        is_default_library: np.is_source_file_default_library(path),
+    }
+}
+
+/// Panics when `tables`, which `reused_tables` made, differ from `full`,
+/// which `full_tables` made for the same program.
+fn assert_same_tables(tables: &VersionTables, full: &VersionTables) {
+    assert_eq!(
+        tables.source_file_order, full.source_file_order,
+        "source file order"
+    );
+    assert_eq!(tables.file_by_path.len(), full.file_by_path.len(), "paths");
+    for (path, &slot) in full.file_by_path.iter() {
+        assert_eq!(
+            tables.file_at_path(path),
+            Some(full.file_at_slot(slot)),
+            "file at {path}"
+        );
+        assert_eq!(
+            tables.file_meta_by_path(path),
+            full.file_meta_by_path(path),
+            "program fields of {path}"
+        );
+    }
+    let versions = |tables: &VersionTables| {
+        let mut versions: Vec<*const crate::ast::FileVersion> =
+            tables.file_versions.iter().map(Arc::as_ptr).collect();
+        versions.sort_unstable();
+        versions
+    };
+    assert_eq!(versions(tables), versions(full), "file versions");
+    let (Some(go), Some(full_go)) = (&tables.go, &full.go) else {
+        panic!("a Go frontend program has shared state");
+    };
+    go.assert_same(full_go);
 }
 
 // Go: compiler/program.go:1562 CommonSourceDirectory.
@@ -935,12 +1162,21 @@ impl GoSharedState {
     /// is the frontend program and shared state of the version that `p` was
     /// updated from. Its copies are shared where `p` shares the frontend
     /// data they were copied from, so a new version copies only what
-    /// changed, and the versions that are alive keep one copy.
+    /// changed, and the versions that are alive keep one copy. `replaced`
+    /// is set when `p` replaced these files of `previous` in place
+    /// (`replaced_files`): then the copies by file id start from those of
+    /// `previous`. `file_by_path` holds the slots of the program files
+    /// (`VersionTables::file_by_path`).
     fn new(
         p: &NewProgram,
-        parsed: &FxHashMap<usize, &Rc<ParsedSourceFile>>,
         previous: Option<(&NewProgram, &GoSharedState)>,
+        replaced: Option<&[Replaced]>,
+        file_by_path: &FxHashMap<String, usize>,
     ) -> Self {
+        let program_files = p.source_files();
+        // The old version when `p` replaced files of it in place.
+        let reused = previous.filter(|_| replaced.is_some());
+        let replaced = replaced.unwrap_or_default();
         let files = &p.processed_files;
         // Go `UpdateProgram` shares the resolutions and the project
         // references with the old program and keeps every file path, so
@@ -985,35 +1221,40 @@ impl GoSharedState {
             .flat_map(|map| map.iter())
             .map(|(path, &specifier)| (path.0.clone(), specifier))
             .collect();
-        let include_diagnostics = parsed
-            .iter()
-            .map(|(&store, file)| {
-                // #4825: keyed by the source file, not its name.
-                let diagnostics = p
-                    .include_processor
-                    .get_diagnostics(p)
-                    .borrow_mut()
-                    .get_diagnostics_for_file(file.root);
-                (store, diagnostics)
-            })
-            .collect();
-        let parse_inputs = parsed
-            .iter()
-            .map(|(&store, file)| {
-                let shared = previous.and_then(|(_, old)| old.parse_inputs.get(&store));
-                let input = shared.map_or_else(
-                    || {
-                        Arc::new(LazyJsDocInput {
-                            parse_options: file.parse_options.clone(),
-                            text: file.text.clone(),
-                            script_kind: file.script_kind,
-                        })
-                    },
-                    Arc::clone,
-                );
-                (store, input)
-            })
-            .collect();
+        let include_diagnostics = include_diagnostics_of(p, file_by_path);
+        // A file id is one parse, so a version shares the input of each
+        // file that `previous` has.
+        let parse_input = |file: &ParsedSourceFile| {
+            let shared = previous.and_then(|(_, old)| old.parse_inputs.get(&file.store));
+            shared.map_or_else(
+                || {
+                    Arc::new(LazyJsDocInput {
+                        parse_options: file.parse_options.clone(),
+                        text: file.text.clone(),
+                        script_kind: file.script_kind,
+                    })
+                },
+                Arc::clone,
+            )
+        };
+        let parse_inputs = match reused {
+            Some((_, old)) => {
+                let added: Vec<_> = replaced
+                    .iter()
+                    .map(|r| (r.file.store, parse_input(r.file)))
+                    .collect();
+                let mut inputs = old.parse_inputs.clone();
+                for r in replaced {
+                    inputs.remove(&r.old.store);
+                }
+                inputs.extend(added);
+                inputs
+            }
+            None => program_files
+                .iter()
+                .map(|file| (file.store, parse_input(file)))
+                .collect(),
+        };
         // Go reads these lazily from the program. The only file names the
         // checker asks about are resolved module names.
         let parse_file_redirects = match same_resolutions {
@@ -1039,21 +1280,32 @@ impl GoSharedState {
             .map(|(path, targets)| (path.0.clone(), targets.clone()))
             .collect();
         // Go: the declaration transformer asks only for preserved references
-        // (transformers/declarations/transform.go:469).
-        let references = parsed
-            .iter()
-            .flat_map(|(&store, file)| {
-                file.referenced_files
-                    .iter()
-                    .filter(|r| r.preserve)
-                    .map(move |r| {
-                        let target = p
-                            .get_source_file_from_reference(file, r)
-                            .map_or(Node::NIL, |target| target.root);
-                        ((store, r.file_name.clone()), target)
-                    })
-            })
-            .collect();
+        // (transformers/declarations/transform.go:469). A reference can
+        // name a replaced file, so the map is built again unless no file
+        // has one.
+        let has_preserved =
+            |file: &ParsedSourceFile| file.referenced_files.iter().any(|r| r.preserve);
+        let references = match reused {
+            Some((_, old))
+                if old.references.is_empty() && !replaced.iter().any(|r| has_preserved(r.file)) =>
+            {
+                FxHashMap::default()
+            }
+            _ => program_files
+                .iter()
+                .flat_map(|file| {
+                    file.referenced_files
+                        .iter()
+                        .filter(|r| r.preserve)
+                        .map(move |r| {
+                            let target = p
+                                .get_source_file_from_reference(file, r)
+                                .map_or(Node::NIL, |target| target.root);
+                            ((file.store, r.file_name.clone()), target)
+                        })
+                })
+                .collect(),
+        };
         let output_file_to_project_reference_source = files
             .output_file_to_project_reference_source
             .iter()
@@ -1071,14 +1323,27 @@ impl GoSharedState {
         let output_dts_to_project_reference = copy_map(&mapper.output_dts_to_project_reference);
         let can_use_project_reference_source = mapper.opts.can_use_project_reference_source();
         drop(mapper);
-        // Go asks for the redirect of checker files only, which are program files.
-        let redirects_for_resolution = parsed
-            .iter()
-            .filter_map(|(&store, file)| {
-                let redirect = p.get_redirect_for_resolution(&***file)?;
-                Some((store, project_references.resolved(&redirect)))
-            })
-            .collect();
+        // Go asks for the redirect of checker files only, which are program
+        // files. A redirect comes from the path and the project references,
+        // so with the same references a file that `p` shares keeps its
+        // redirect. The map is built again unless no file has one.
+        let redirects_for_resolution = match (reused, same_resolutions) {
+            (Some((_, old)), Some(_))
+                if old.redirects_for_resolution.is_empty()
+                    && replaced
+                        .iter()
+                        .all(|r| p.get_redirect_for_resolution(&**r.file).is_none()) =>
+            {
+                FxHashMap::default()
+            }
+            _ => program_files
+                .iter()
+                .filter_map(|file| {
+                    let redirect = p.get_redirect_for_resolution(&**file)?;
+                    Some((file.store, project_references.resolved(&redirect)))
+                })
+                .collect(),
+        };
         let resolved_project_references = p
             .get_resolved_project_references()
             .iter()
@@ -1306,4 +1571,101 @@ impl GoSharedState {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Panics when the copies by file id differ from those of `full`, which
+    /// `GoSharedState::new` made for the same program with no replaced
+    /// files (`assert_same_tables`). The other copies are made the same way
+    /// for both.
+    fn assert_same(&self, full: &GoSharedState) {
+        assert_same_include_diagnostics(&self.include_diagnostics, &full.include_diagnostics);
+        let mut inputs: Vec<_> = self.parse_inputs.keys().collect();
+        let mut full_inputs: Vec<_> = full.parse_inputs.keys().collect();
+        inputs.sort_unstable();
+        full_inputs.sort_unstable();
+        assert_eq!(inputs, full_inputs, "files with parse inputs");
+        for (store, input) in &self.parse_inputs {
+            let full = &full.parse_inputs[store];
+            assert!(
+                Arc::ptr_eq(input, full)
+                    || (input.parse_options == full.parse_options
+                        && input.script_kind == full.script_kind
+                        && *input.text == *full.text),
+                "parse inputs of file {store}"
+            );
+        }
+        assert_eq!(self.references, full.references, "preserved references");
+        let mut redirects: Vec<_> = self.redirects_for_resolution.keys().collect();
+        let mut full_redirects: Vec<_> = full.redirects_for_resolution.keys().collect();
+        redirects.sort_unstable();
+        full_redirects.sort_unstable();
+        assert_eq!(redirects, full_redirects, "files with a redirect");
+        for (store, redirect) in &self.redirects_for_resolution {
+            let full = &full.redirects_for_resolution[store];
+            assert!(
+                redirect.compiler_options.deep_equal(&full.compiler_options)
+                    && redirect.common_source_directory == full.common_source_directory,
+                "redirect of file {store}"
+            );
+        }
+    }
+
+    /// Panics when the include processor diagnostics differ from those that
+    /// Go `GetIncludeProcessorDiagnostics` reads for each program file of
+    /// `p` (`include_diagnostics_of`).
+    fn assert_include_diagnostics(&self, p: &NewProgram) {
+        let collection = p.include_processor.get_diagnostics(p);
+        let each_file: FxHashMap<usize, Vec<Diagnostic>> = p
+            .source_files()
+            .iter()
+            .filter_map(|file| {
+                let diagnostics = collection.borrow_mut().get_diagnostics_for_file(file.root);
+                (!diagnostics.is_empty()).then_some((file.store, diagnostics))
+            })
+            .collect();
+        assert_same_include_diagnostics(&self.include_diagnostics, &each_file);
+    }
+}
+
+/// Go `GetIncludeProcessorDiagnostics` (the include processor part) of each
+/// program file of `p` that has any, by file id. `file_by_path` holds the
+/// slots of the program files (`VersionTables::file_by_path`).
+// PERF: reads the files that the collection has diagnostics for, not every
+// program file (editfast1). The collection keys its lists by file name, and
+// one program has one file name per path.
+fn include_diagnostics_of(
+    p: &NewProgram,
+    file_by_path: &FxHashMap<String, usize>,
+) -> FxHashMap<usize, Vec<Diagnostic>> {
+    let files = p.source_files();
+    let mut collection = p.include_processor.get_diagnostics(p).borrow_mut();
+    let names: Vec<&'static str> = collection.file_names().collect();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let file = files.get(*file_by_path.get(&p.to_path(name).0)?)?;
+            (file.file_name() == name)
+                .then(|| (file.store, collection.get_diagnostics_for_file_name(name)))
+        })
+        .collect()
+}
+
+/// Panics when two maps of include processor diagnostics by file id differ.
+// PORT: `Diagnostic` has no `==`; the debug text holds every field.
+fn assert_same_include_diagnostics(
+    diagnostics: &FxHashMap<usize, Vec<Diagnostic>>,
+    expected: &FxHashMap<usize, Vec<Diagnostic>>,
+) {
+    let text = |map: &FxHashMap<usize, Vec<Diagnostic>>| {
+        let mut entries: Vec<_> = map
+            .iter()
+            .map(|(store, list)| (*store, format!("{list:?}")))
+            .collect();
+        entries.sort_unstable();
+        entries
+    };
+    assert_eq!(
+        text(diagnostics),
+        text(expected),
+        "include processor diagnostics"
+    );
 }
