@@ -2275,7 +2275,19 @@ pub fn type_handles(types: &[TypeId]) -> Vec<TypeID> {
 pub fn literal_value_to_json(value: Option<&LiteralValue>) -> LspAny {
     match value {
         Some(LiteralValue::String(v)) => LspAny::String(v.clone()),
-        Some(LiteralValue::Number(v)) => LspAny::Number(v.0),
+        Some(LiteralValue::Number(v)) => {
+            // ts#64241
+            if v.is_infinite() {
+                if v.0 > 0.0 {
+                    return LspAny::String("+Infinity".to_string());
+                }
+                return LspAny::String("-Infinity".to_string());
+            }
+            if v.is_nan() {
+                return LspAny::String("NaN".to_string());
+            }
+            LspAny::Number(v.0)
+        }
         Some(LiteralValue::Bool(v)) => LspAny::Bool(*v),
         // Encode bigint literals as a signed decimal string (e.g. "-123"); the
         // API client decodes this back into a real bigint. JSON has no bigint.
@@ -2283,6 +2295,19 @@ pub fn literal_value_to_json(value: Option<&LiteralValue>) -> LspAny {
         None => LspAny::Null,
     }
 }
+
+// Go: proto.go ConstantValueResponse (ts#64241)
+// PORT: Go `Value any` holds a JSON primitive (`literalValueToJSON`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConstantValueResponse {
+    pub is_number: bool,
+    pub value: LspAny,
+}
+
+proto_json!(marshal ConstantValueResponse {
+    is_number: "isNumber" plain,
+    value: "value" plain,
+});
 
 // Go: proto.go:674 SignatureResponse
 #[derive(Clone, Debug, Default, PartialEq)]

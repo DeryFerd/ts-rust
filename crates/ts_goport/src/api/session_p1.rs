@@ -1400,9 +1400,9 @@ impl ipc::Handler for Session {
             m if m == Method::GET_IMPORT_ADDER_EDITS.0 => self
                 .handle_get_import_adder_edits(ctx, assert_params(&parsed))
                 .map(to_any),
-            m if m == Method::GET_CONSTANT_VALUE.0 => {
-                self.handle_get_constant_value(ctx, assert_params(&parsed))
-            }
+            m if m == Method::GET_CONSTANT_VALUE.0 => self
+                .handle_get_constant_value(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_SIGNATURE_FROM_DECLARATION.0 => self
                 .handle_get_signature_from_declaration(ctx, assert_params(&parsed))
                 .map(to_any),

@@ -1515,12 +1515,11 @@ impl Session {
 
     // Go: api/session.go:2323 handleGetConstantValue
     // handleGetConstantValue returns the constant value of an enum member or const enum access.
-    // PORT: Go returns `any`; a nil `any` (no node, or no constant value) is `None`.
     pub fn handle_get_constant_value(
         &self,
         ctx: &Context,
         params: &CheckerNodeParams,
-    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+    ) -> Result<Option<ConstantValueResponse>, GoError> {
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
         let node = setup
@@ -1530,11 +1529,13 @@ impl Session {
             return Ok(None);
         }
 
+        // ts#64241
         let value = setup.checker.borrow_mut().get_constant_value(node);
-        match literal_value_to_json(value.as_ref()) {
-            LspAny::Null => Ok(None),
-            value => Ok(to_any(value)),
-        }
+        let result = ConstantValueResponse {
+            is_number: matches!(value, Some(LiteralValue::Number(_))),
+            value: literal_value_to_json(value.as_ref()),
+        };
+        Ok(Some(result))
     }
 
     // Go: api/session.go:2342 handleGetSignatureFromDeclaration
