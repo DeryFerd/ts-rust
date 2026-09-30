@@ -101,6 +101,12 @@ pub struct StatusPrefetch {
     /// `GetNormalizedAbsolutePath(buildInfoFileName, buildInfoDirectory)`
     /// and its `toPath`, for each build info file name, in order.
     pub file_names: Vec<(String, Path)>,
+    /// The set of `input_paths`: the check's `seenRoots` after its loop
+    /// over the root files.
+    pub input_path_set: FxHashSet<Path>,
+    /// The check's `resolvedRoots`: the resolved path of each root of the
+    /// root info reader.
+    pub resolved_roots: FxHashSet<Path>,
     /// Go `buildInfo.GetPackageJsons(buildInfoDirectory)` and
     /// `GetMissingPackageJsons`, collected. The check takes them.
     pub package_jsons: Vec<String>,
@@ -186,7 +192,15 @@ impl StatusPrefetch {
         ));
         let root_info_reader = build_info
             .get_build_info_root_info_reader(&build_info_directory, compare_paths_options);
-        let input_paths = input_files.iter().map(|file| to_path_fn(file)).collect();
+        let input_paths: Vec<Path> = input_files.iter().map(|file| to_path_fn(file)).collect();
+        let input_path_set = input_paths.iter().cloned().collect();
+        let resolved_roots = root_info_reader
+            .roots()
+            .filter_map(|root| {
+                let (_, resolved) = root_info_reader.get_build_info_file_info(root);
+                (!resolved.as_str().is_empty()).then_some(resolved)
+            })
+            .collect();
         let file_names = build_info
             .file_names
             .iter()
@@ -208,6 +222,8 @@ impl StatusPrefetch {
             root_info_reader,
             input_paths,
             file_names,
+            input_path_set,
+            resolved_roots,
             package_jsons,
             missing_package_jsons,
         }
@@ -1250,8 +1266,9 @@ impl BuildTask {
             time: build_info_time,
         };
         let mut newest_input_file_and_time = FileAndTime::default();
-        let mut seen_roots: FxHashSet<Path> =
-            FxHashSet::with_capacity_and_hasher(resolved.file_names().len(), Default::default());
+        // PORT: perf. With a prefetch, the build info thread made the set
+        // (`StatusPrefetch::input_path_set`).
+        let mut own_seen_roots: FxHashSet<Path> = FxHashSet::default();
         // Go `getBuildInfoRootInfoReader`, made once.
         let mut owned_reader = None;
         let make_reader = |owned_reader: &mut Option<BuildInfoRootInfoReader>| {
@@ -1265,11 +1282,15 @@ impl BuildTask {
         for (index, input_file) in resolved.file_names().iter().enumerate() {
             // PORT: perf. `toPath` first, so the mtime lookup does not
             // compute it again (`get_m_time_of_path`).
+            let owned_path;
             let input_path = match &*prefetched {
-                Some(prefetched) => prefetched.input_paths[index].clone(),
-                None => orchestrator.to_path(input_file),
+                Some(prefetched) => &prefetched.input_paths[index],
+                None => {
+                    owned_path = orchestrator.to_path(input_file);
+                    &owned_path
+                }
             };
-            let input_time = orchestrator.get_m_time_of_path(input_file, &input_path);
+            let input_time = orchestrator.get_m_time_of_path(input_file, input_path);
             if input_time.is_none() {
                 return UpToDateStatus::with_data(
                     UpToDateStatusType::InputFileMissing,
@@ -1283,7 +1304,7 @@ impl BuildTask {
                     make_reader(&mut owned_reader);
                     let reader = reader_of(&prefetched, &owned_reader);
                     let (build_info_file_info, resolved_input_path) =
-                        reader.get_build_info_file_info(&input_path);
+                        reader.get_build_info_file_info(input_path);
                     if let Some(file_info) = build_info_file_info.map(|b| b.get_file_info()) {
                         if !file_info.version().is_empty() {
                             version = file_info.version().to_string();
@@ -1316,8 +1337,14 @@ impl BuildTask {
                     time: input_time,
                 };
             }
-            seen_roots.insert(input_path);
+            if prefetched.is_none() {
+                own_seen_roots.insert(input_path.clone());
+            }
         }
+        let seen_roots = match &*prefetched {
+            Some(prefetched) => &prefetched.input_path_set,
+            None => &own_seen_roots,
+        };
 
         make_reader(&mut owned_reader);
         let reader = reader_of(&prefetched, &owned_reader);
@@ -1336,13 +1363,21 @@ impl BuildTask {
         }
 
         if build_info.is_incremental() {
-            let mut resolved_roots: FxHashSet<Path> = FxHashSet::default();
-            for root in reader.roots() {
-                let (_, resolved) = reader.get_build_info_file_info(root);
-                if !resolved.as_str().is_empty() {
-                    resolved_roots.insert(resolved);
+            let own_resolved_roots: FxHashSet<Path>;
+            let resolved_roots = match &*prefetched {
+                Some(prefetched) => &prefetched.resolved_roots,
+                None => {
+                    let mut resolved_roots = FxHashSet::default();
+                    for root in reader.roots() {
+                        let (_, resolved) = reader.get_build_info_file_info(root);
+                        if !resolved.as_str().is_empty() {
+                            resolved_roots.insert(resolved);
+                        }
+                    }
+                    own_resolved_roots = resolved_roots;
+                    &own_resolved_roots
                 }
-            }
+            };
             let file_names = build_info.file_names.as_deref().unwrap_or_default();
             for (index, build_info_file_info) in build_info.file_infos.iter().flatten().enumerate()
             {
@@ -1352,40 +1387,45 @@ impl BuildTask {
                 if is_build_info_file_name_default_library(build_info_file_name) {
                     continue;
                 }
+                let owned: (String, Path);
                 let (input_file, input_path) = match &*prefetched {
-                    Some(prefetched) => prefetched.file_names[index].clone(),
+                    Some(prefetched) => {
+                        let (file, path) = &prefetched.file_names[index];
+                        (file, path)
+                    }
                     None => {
                         let input_file = get_normalized_absolute_path(
                             build_info_file_name,
                             &build_info_directory,
                         );
                         let input_path = orchestrator.to_path(&input_file);
-                        (input_file, input_path)
+                        owned = (input_file, input_path);
+                        (&owned.0, &owned.1)
                     }
                 };
                 // Root files are already checked
-                if seen_roots.contains(&input_path) || resolved_roots.contains(&input_path) {
+                if seen_roots.contains(input_path) || resolved_roots.contains(input_path) {
                     continue;
                 }
                 // ts#63936: a supplemental file that exists is an input like any other.
-                if is_content_mapper_supplemental_build_info_path(&input_path, reader.roots())
-                    && !orchestrator.fs().file_exists(&input_file)
+                if is_content_mapper_supplemental_build_info_path(input_path, reader.roots())
+                    && !orchestrator.fs().file_exists(input_file)
                 {
                     continue;
                 }
-                let input_time = orchestrator.get_m_time_of_path(&input_file, &input_path);
+                let input_time = orchestrator.get_m_time_of_path(input_file, input_path);
                 if input_time.is_none() {
                     // Input file that was part of the program is missing (eg: dependency was removed)
                     return UpToDateStatus::with_data(
                         UpToDateStatusType::InputFileMissing,
-                        UpToDateStatusData::String(input_file),
+                        UpToDateStatusData::String(input_file.clone()),
                     );
                 }
                 if input_time > oldest_output_file_and_time.time {
                     let mut current_version = String::new();
                     let version = build_info_file_info.get_file_info().version().to_string();
                     if !version.is_empty() {
-                        let (text, ok) = orchestrator.fs().read_file(&input_file);
+                        let (text, ok) = orchestrator.fs().read_file(input_file);
                         if ok {
                             current_version = compute_hash(&text, orchestrator.testing().is_some());
                         }
@@ -1394,7 +1434,7 @@ impl BuildTask {
                         return UpToDateStatus::with_data(
                             UpToDateStatusType::InputFileNewer,
                             UpToDateStatusData::InputOutputName(InputOutputName {
-                                input: input_file,
+                                input: input_file.clone(),
                                 output: build_info_path,
                             }),
                         );

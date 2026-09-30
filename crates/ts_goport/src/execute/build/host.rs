@@ -317,15 +317,12 @@ impl BuildHost {
         store: bool,
     ) -> Option<SystemTime> {
         // PORT: Go `Load`, then `LoadOrStore` below. The lock is not held
-        // while `get_m_time` reads the file system.
-        let existing = self
-            .m_times
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&path)
-            .copied();
-        if let Some(existing) = existing {
-            return existing;
+        // while `get_m_time` reads the file system; else it is held from
+        // the load to the store.
+        let lock = || self.m_times.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut m_times = lock();
+        if let Some(existing) = m_times.get(&path) {
+            return *existing;
         }
         let mut found = false;
         let mut m_time = None;
@@ -345,16 +342,16 @@ impl BuildHost {
             });
             m_time = match prefetched {
                 Some(m_time) => m_time,
-                None => incremental::get_m_time(&*self.host, file),
+                None => {
+                    drop(m_times);
+                    let m_time = incremental::get_m_time(&*self.host, file);
+                    m_times = lock();
+                    m_time
+                }
             };
         }
         if store {
-            m_time = *self
-                .m_times
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .entry(path)
-                .or_insert(m_time);
+            m_time = *m_times.entry(path).or_insert(m_time);
         }
         m_time
     }
