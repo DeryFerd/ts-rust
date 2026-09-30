@@ -192,7 +192,7 @@ pub fn unmarshal_kind_error(k: u8, go_type: &str) -> JsonError {
 
 // Go `newUnmarshalErrorAfterWithValue(dec, t, err)`: Go keeps the value of a
 // string or a number, and the text shows it when it is shorter than 100 bytes.
-fn unmarshal_value_error(val: &[u8], go_type: &str, detail: &str) -> JsonError {
+pub(crate) fn unmarshal_value_error(val: &[u8], go_type: &str, detail: &str) -> JsonError {
     let k = val.first().map_or(0, |&c| normalize_kind(c));
     let val = if k == b'"' || k == b'0' {
         String::from_utf8_lossy(val).into_owned()
@@ -353,31 +353,8 @@ impl std::fmt::Display for SemanticError {
     }
 }
 
-/// Go `(*jsontext.SyntacticError).Error()` (jsontext/errors.go:120) for the
-/// error `err` at the token that starts at `pos` in `data`, the input of the
-/// decoder: the JSON pointer of that token (Go `where` = +1) and its offset.
-///
-/// PORT: the decoder keeps no object names, so the pointer is found again
-/// from `data`, as in `unmarshal_root`. Only the max depth error uses it.
-#[cold]
-pub fn syntactic_error_text(data: &[u8], pos: usize, err: &str) -> String {
-    let mut b = format!("jsontext: {err}");
-    let pointer = stack_pointer(&stack_at(data, pos), ErrorPos::Before);
-    if !pointer.is_empty() {
-        b.push_str(" within ");
-        b.push_str(&crate::gostd::strconv::quote(&truncate_pointer(
-            &pointer, 100,
-        )));
-    }
-    if pos > 0 {
-        b.push_str(" after offset ");
-        b.push_str(&pos.to_string());
-    }
-    b
-}
-
 // Go: internal/jsonwire/wire.go:165 TruncatePointer
-fn truncate_pointer(s: &str, n: usize) -> String {
+pub(crate) fn truncate_pointer(s: &str, n: usize) -> String {
     if s.len() <= n {
         return s.to_string();
     }
@@ -418,6 +395,21 @@ fn truncate_pointer(s: &str, n: usize) -> String {
     format!("{}{middle}{}", &s[..i], &s[j..])
 }
 
+/// Go `newUnmarshalErrorAfter(dec, t, err)` and `collapseSemanticErrors`
+/// for the error `message` of a v1 `UnmarshalJSON` method of the Go type
+/// `go_type`, which got the raw value `val`: a plain error gets the JSON kind
+/// and the Go type; a `SemanticError` that the method returned stays as it
+/// is, and `unmarshal_root` gives it the pointer.
+#[must_use]
+pub fn unmarshal_json_method_error(val: &[u8], go_type: &str, message: String) -> JsonError {
+    let err = JsonError { message };
+    if SemanticError::of(&err).is_some() {
+        return err;
+    }
+    let k = val.first().map_or(0, |&c| normalize_kind(c));
+    SemanticError::after(k, "", go_type, &err.message).into_json_error()
+}
+
 /// Go `newSemanticErrorWithPosition` for the type `T` of an
 /// `UnmarshalJSONFrom` method (arshal_methods.go:343): a plain error from
 /// the method gets the Go type of `T`. A `SemanticError` keeps its type, and
@@ -445,8 +437,8 @@ pub fn wrap_method_error<T: ?Sized>(err: JsonError) -> JsonError {
 /// `SemanticError` gets its JSON pointer in `data` (or, for the root value,
 /// its byte offset).
 ///
-/// PORT: the Rust decoder keeps no object names, so the pointer is found
-/// again from `data` and the input offset where decoding stopped. A
+/// PORT: the pointer is found again from `data` and the decoder's input
+/// offset where decoding stopped (Go `InputOffset`). A
 /// `json_unmarshal` of a raw sub-value inside a method (LSP unions) does not
 /// find pointers, so its errors get the pointer in `data`, where Go keeps
 /// the one in the sub-value.
@@ -465,7 +457,7 @@ pub fn unmarshal_root<T: UnmarshalerFrom + ?Sized>(
     if !s.wrapped || s.pointer.is_some() {
         return Err(err);
     }
-    let end = error_end(&mut dec, data);
+    let end = dec.input_offset();
     s.pointer = Some(stack_pointer(&stack_at(data, end), s.pos));
     s.byte_offset = match s.pos {
         // Go `CountNextDelimWhitespace`: the next token.
@@ -514,43 +506,6 @@ pub fn unmarshal_json_method<T: ?Sized>(
         return Err(crate::gostd::errors::errorf(s.to_string(), vec![err]));
     }
     dec.check_eof().map_err(crate::gostd::errors::from_value)
-}
-
-// The input offset where decoding stopped at an error (Go `prevEnd`, the
-// end of the last token read). The decoder does not show it, so read on to
-// the next value, whose offset `read_value` gives, and walk back over the
-// delimiter and the closing tokens before it. The input up to the error was
-// valid; the rest of a request is valid JSON too.
-fn error_end(dec: &mut JsonDecoder<'_>, data: &[u8]) -> usize {
-    let mut closes = 0;
-    let mut next = data.len();
-    loop {
-        match dec.peek_kind() {
-            b'}' | b']' => {
-                if dec.read_token().is_err() {
-                    break;
-                }
-                closes += 1;
-            }
-            0 => break,
-            _ => {
-                if let Ok(v) = dec.read_value() {
-                    next = v.as_ptr().addr() - data.as_ptr().addr();
-                }
-                break;
-            }
-        }
-    }
-    let mut p = skip_ws_back(data, next);
-    if p > 0 && (data[p - 1] == b',' || (closes == 0 && data[p - 1] == b':')) {
-        p = skip_ws_back(data, p - 1);
-    }
-    for _ in 0..closes {
-        if p > 0 && matches!(data[p - 1], b'}' | b']') {
-            p = skip_ws_back(data, p - 1);
-        }
-    }
-    p
 }
 
 // One open object or array of the Go decoder state (jsontext `stateEntry`,
@@ -718,21 +673,6 @@ fn split_type_args(s: &str) -> Vec<&str> {
     }
     out.push(s[start..].trim());
     out
-}
-
-// Go `newUnmarshalErrorAfterWithSkipping`: after the first token of a value
-// of the wrong kind was read, skip the rest of that value.
-fn skip_rest_of_value(dec: &mut JsonDecoder<'_>, tok: &JsonToken) -> Result<(), JsonError> {
-    let end = match tok {
-        JsonToken::BeginObject => b'}',
-        JsonToken::BeginArray => b']',
-        _ => return Ok(()),
-    };
-    while dec.peek_kind() != end {
-        dec.skip_value()?;
-    }
-    dec.read_token()?;
-    Ok(())
 }
 
 // Go: jsonwire/decode.go:593 ParseUint
@@ -1021,10 +961,9 @@ impl<T: UnmarshalerFrom + Default> UnmarshalerFrom for Vec<T> {
                 dec.read_token()?;
                 Ok(())
             }
-            _ => {
-                skip_rest_of_value(dec, &tok)?;
-                Err(unmarshal_kind_error(tok.kind(), &go_type_name::<Self>()))
-            }
+            // Go `newUnmarshalErrorAfterWithSkipping` skips the rest of the
+            // value only with legacy semantics.
+            _ => Err(unmarshal_kind_error(tok.kind(), &go_type_name::<Self>())),
         }
     }
 }
@@ -1076,10 +1015,9 @@ impl UnmarshalerFrom for [u32; 2] {
                 }
                 Ok(())
             }
-            _ => {
-                skip_rest_of_value(dec, &tok)?;
-                Err(unmarshal_kind_error(tok.kind(), "[2]uint32"))
-            }
+            // Go `newUnmarshalErrorAfterWithSkipping` skips the rest of the
+            // value only with legacy semantics.
+            _ => Err(unmarshal_kind_error(tok.kind(), "[2]uint32")),
         }
     }
 }
@@ -1156,6 +1094,13 @@ pub fn unmarshal_value_any(dec: &mut JsonDecoder<'_>) -> Result<LspAny, JsonErro
     match dec.peek_kind() {
         b'{' => unmarshal_object_any(dec).map(LspAny::Object),
         b'[' => unmarshal_array_any(dec).map(LspAny::Array),
+        // Go reads any other value with `ReadValue`, which fails at a `}` or
+        // `]` with its own error. For the other kinds `read_token` is the
+        // same read.
+        b'}' | b']' => {
+            dec.read_value()?;
+            unreachable!("a value cannot start with '}}' or ']'")
+        }
         _ => match dec.read_token()? {
             JsonToken::Null => Ok(LspAny::Null),
             JsonToken::False => Ok(LspAny::Bool(false)),
@@ -1200,9 +1145,7 @@ fn unmarshal_object_any(dec: &mut JsonDecoder<'_>) -> Result<IndexMap<String, Ls
 
         // Manually check for duplicate names.
         if obj.contains_key(&name) {
-            return Err(JsonError {
-                message: format!("duplicate object member name {name:?}"),
-            });
+            return Err(dec.duplicate_name_error());
         }
 
         let val = unmarshal_value_any(dec)?;
@@ -1506,7 +1449,7 @@ pub fn marshal_opt_field<T: MarshalerTo>(
 /// the caller sets the zero value. An object calls `field` for each member
 /// name in input order; `field` decodes the value and returns `true`, or
 /// returns `false` for an unknown name, which is then skipped. Names match
-/// exactly. Any other kind is an error after the value is skipped.
+/// exactly. Any other kind is an error after its first token.
 pub fn unmarshal_struct_fields(
     dec: &mut JsonDecoder<'_>,
     go_type: &str,
@@ -1527,10 +1470,9 @@ pub fn unmarshal_struct_fields(
             dec.read_token()?;
             Ok(true)
         }
-        _ => {
-            skip_rest_of_value(dec, &tok)?;
-            Err(unmarshal_kind_error(tok.kind(), go_type))
-        }
+        // Go `newUnmarshalErrorAfterWithSkipping` skips the rest of the
+        // value only with legacy semantics.
+        _ => Err(unmarshal_kind_error(tok.kind(), go_type)),
     }
 }
 

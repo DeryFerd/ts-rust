@@ -3,12 +3,15 @@
 
 use crate::ipc::prelude::*;
 
-use crate::frontend::json::{json_marshal, json_unmarshal};
+use crate::frontend::json::json_marshal;
 use crate::frontend::json_ext::{AnyValue, JsonValue};
 use crate::gostd::{GoError, errors};
 use crate::ipc::protocol::{Message, Protocol};
 use crate::ipc::transport::{ConnReader, ConnWriter, ReadWriteCloser};
 use crate::jsonrpc;
+// PORT: the marshaled text is in the port form (see
+// `scanner_util::GO_STRING_MARKER`); the connection gets its Go bytes.
+use crate::scanner_util::go_string_bytes;
 use std::io::BufReader;
 use std::sync::Arc;
 
@@ -45,7 +48,8 @@ impl Protocol for JSONRPCProtocol {
         let data = self.reader.read()?;
 
         let mut msg = Message::default();
-        if let Err(err) = json_unmarshal(&data, &mut msg, &[]) {
+        // Go `json.Unmarshal(data, &msg)`, with the v2 error texts.
+        if let Err(err) = crate::frontend::json_ext::unmarshal_root(&data, &mut msg) {
             return Err(errors::from_value(err));
         }
 
@@ -70,7 +74,7 @@ impl Protocol for JSONRPCProtocol {
             Ok(data) => data,
             Err(err) => return Err(errors::from_value(err)),
         };
-        self.writer.write(data.as_bytes())
+        self.writer.write(&go_string_bytes(&data))
     }
 
     // Go: ipc/protocol_jsonrpc.go:57 WriteNotification
@@ -89,7 +93,7 @@ impl Protocol for JSONRPCProtocol {
             Ok(data) => data,
             Err(err) => return Err(errors::from_value(err)),
         };
-        self.writer.write(data.as_bytes())
+        self.writer.write(&go_string_bytes(&data))
     }
 
     // Go: ipc/protocol_jsonrpc.go:70 WriteResponse
@@ -112,7 +116,7 @@ impl Protocol for JSONRPCProtocol {
             Ok(data) => data,
             Err(err) => return Err(errors::from_value(err)),
         };
-        self.writer.write(data.as_bytes())
+        self.writer.write(&go_string_bytes(&data))
     }
 
     // Go: ipc/protocol_jsonrpc.go:86 WriteError
@@ -131,6 +135,6 @@ impl Protocol for JSONRPCProtocol {
             Ok(data) => data,
             Err(err) => return Err(errors::from_value(err)),
         };
-        self.writer.write(data.as_bytes())
+        self.writer.write(&go_string_bytes(&data))
     }
 }

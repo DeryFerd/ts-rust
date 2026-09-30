@@ -236,9 +236,7 @@ impl JsonMapKey for DocumentUri {
                     let mut v = V::default();
                     if let Some(existing) = map.get(&k) {
                         if !allow_dup && seen.as_ref().is_none_or(|s| s.contains_key(&k)) {
-                            return Err(JsonError {
-                                message: format!("duplicate object member name {:?}", k.0),
-                            });
+                            return Err(dec.duplicate_name_error());
                         }
                         v = existing.clone();
                     }
@@ -252,19 +250,12 @@ impl JsonMapKey for DocumentUri {
                 dec.read_token()?;
                 Ok(())
             }
-            _ => {
-                if tok == JsonToken::BeginArray {
-                    // Go `newUnmarshalErrorAfterWithSkipping`.
-                    while dec.peek_kind() != b']' {
-                        dec.skip_value()?;
-                    }
-                    dec.read_token()?;
-                }
-                Err(unmarshal_kind_error(
-                    tok.kind(),
-                    &go_type_name::<IndexMap<Self, V>>(),
-                ))
-            }
+            // Go `newUnmarshalErrorAfterWithSkipping` skips the rest of the
+            // value only with legacy semantics.
+            _ => Err(unmarshal_kind_error(
+                tok.kind(),
+                &go_type_name::<IndexMap<Self, V>>(),
+            )),
         }
     }
 }
