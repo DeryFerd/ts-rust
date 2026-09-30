@@ -192,7 +192,7 @@ impl SnapshotKey {
         if self.nodes as usize != go_file.parser_flags.len() {
             return Err("nodes");
         }
-        if !text_matches(self.text, self.text_const, source_file_text(file)) {
+        if !text_matches(self.text, self.text_const, &source_file_text(file)) {
             return Err("text");
         }
         if Some(self.parse) != parse_hash(file, go_file) {

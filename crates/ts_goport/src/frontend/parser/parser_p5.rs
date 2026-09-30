@@ -1318,7 +1318,7 @@ impl<'a> Parser<'a> {
         &mut self,
         flags: NodeFlags,
         value: bool,
-        f: impl FnOnce(&mut Parser) -> T,
+        f: impl FnOnce(&mut Self) -> T,
     ) -> T {
         let save_context_flags = self.context_flags;
         self.set_context_flags(flags, value);

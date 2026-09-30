@@ -92,10 +92,16 @@ impl SourceMapSource {
     }
 
     /// Go `source.Text()`.
-    pub fn text(&self) -> &str {
+    // PORT: the text of a freeable file version is not `'static`
+    // (`FileText`, textleak1), so it is copied. Only `inlineSources` reads
+    // it.
+    pub fn text(&self) -> Cow<'_, str> {
         match self {
-            SourceMapSource::Node(node) => source_file_text(*node),
-            SourceMapSource::Other(source) => source.text(),
+            SourceMapSource::Node(node) => match source_file_text(*node) {
+                FileText::Static(text) => Cow::Borrowed(text),
+                text @ FileText::Shared(_) => Cow::Owned(text.to_string()),
+            },
+            SourceMapSource::Other(source) => Cow::Borrowed(source.text()),
         }
     }
 }

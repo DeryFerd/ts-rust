@@ -1201,7 +1201,7 @@ pub(crate) struct LineCharacterCache {
 enum LineCharacterSource {
     File {
         line_map: FileRef<[i32]>,
-        text: &'static str,
+        text: FileText,
     },
     Other(Rc<dyn crate::sourcemap::source::Source>),
 }
@@ -1232,7 +1232,7 @@ impl LineCharacterCache {
     // offset from the start of that line for the given byte position.
     pub(crate) fn get_line_and_character(&mut self, pos: i32) -> (i32, i32) {
         let (line_map, text): (&[i32], &str) = match &self.source {
-            LineCharacterSource::File { line_map, text } => (&**line_map, *text),
+            LineCharacterSource::File { line_map, text } => (&**line_map, &**text),
             LineCharacterSource::Other(source) => (source.ecma_line_map(), source.text()),
         };
         let line = Self::line_of_position(line_map, self.cached_line, pos);
