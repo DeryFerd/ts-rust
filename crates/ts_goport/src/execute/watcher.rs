@@ -15,7 +15,8 @@
 //! program version (`execute_tsc::new_program_version`) and runs with it
 //! current (`core::enter_program`). Files that the source file cache keeps
 //! are shared with the last version. The last version is released when the
-//! next build has read it (Go drops the old program there).
+//! next build has read it (Go drops the old program there). The rest of the
+//! old program is freed after the next build has reported its status.
 
 use crate::contentmapper::{self, Mapper, SourceFiles};
 use crate::execute::build::host::TscExtendedConfigCache;
@@ -163,6 +164,11 @@ pub struct Watcher {
     content_mapper_project: Option<Rc<dyn contentmapper::Project>>,
 
     program: Option<incremental::program::Program>,
+    /// PORT: not in Go. The program that the last build replaced, without
+    /// its program version (released at once, see `retire_program`). Go
+    /// drops it and its GC frees it later; here its snapshot is freed after
+    /// the build reports its status (`do_build`), not before the check.
+    retired_program: Option<incremental::program::Program>,
     extended_config_cache: Option<Rc<TscExtendedConfigCache>>,
     config_modified: bool,
     config_has_errors: bool,
@@ -259,6 +265,7 @@ pub fn create_watcher(
         content_mapper_host: None,
         content_mapper_project: None,
         program: None,
+        retired_program: None,
         extended_config_cache: None,
         config_modified: false,
         config_has_errors: false,
@@ -717,6 +724,9 @@ impl Watcher {
                     ));
                 }
                 self.on_program();
+                // PORT: the replaced program is freed after the status
+                // report (see `retired_program`).
+                self.free_retired_program();
                 return Ok(());
             }
             cached.disable_and_clear_cache();
@@ -781,21 +791,19 @@ impl Watcher {
         // takes a host, so the field is cleared after.
         program.host = None;
         // PORT: Go drops the old program here, and its GC frees it later
-        // (watcher.go:482). `release_program_in_background` stops the old
-        // checker pool without a wait: the old checkers are freed on the
-        // pool threads while this build goes on, and the old tables with the
-        // last of them. The old frontend
-        // program is kept until after the status report below, so its free
-        // is not in the rebuild time either. Its `GoProgram` and file
-        // versions stay leaked.
+        // (watcher.go:482). The old checker pool stops without a wait
+        // (`release_program_in_background`): the old checkers are freed on
+        // the pool threads while this build goes on, and the old tables
+        // with the last of them. The rest of the old program
+        // (`retire_program`) and the old frontend program are kept until
+        // after the status report below, so their free is not in the
+        // rebuild time. Its `GoProgram` and file versions stay leaked.
         let released = self
             .program
             .as_ref()
             .and_then(|old| old.program)
             .map(|_| self.get_program());
-        if let Some(old) = self.program.replace(program).and_then(|old| old.program) {
-            crate::program::release_program_in_background(old);
-        }
+        self.retire_program(program);
         self.program_ready = true;
         self.full_builds += 1;
 
@@ -850,7 +858,38 @@ impl Watcher {
         drop(released);
 
         self.on_program();
+        self.free_retired_program();
         Ok(())
+    }
+
+    /// Makes `program` the watch program. The old checker pool stops now,
+    /// without a wait (`release_program_in_background`): the old checkers
+    /// are freed on the pool threads while the build goes on, and the old
+    /// tables with the last of them. The rest of the old program (its
+    /// snapshot) is kept in `retired_program` until the build reports its
+    /// status (`free_retired_program`).
+    // PORT: Go replaces the program and its GC frees the old one later
+    // (watcher.go:482, :567). Stopping the old pool after the status report
+    // too saved about 0.7 ms more on a Hono body edit, but the old and the
+    // new checkers then live together for the whole rebuild: the watch
+    // peak RSS on Hono went from 308 to 397 MiB.
+    fn retire_program(&mut self, program: incremental::program::Program) {
+        // A build that failed after its program was made did not free the
+        // program before it.
+        self.free_retired_program();
+        if let Some(mut old) = self.program.replace(program) {
+            if let Some(version) = old.program.take() {
+                crate::program::release_program_in_background(version);
+            }
+            self.retired_program = Some(old);
+        }
+    }
+
+    /// Frees the snapshot of the program that the last build replaced,
+    /// after the build reported its status, so the free is not in the
+    /// rebuild time.
+    fn free_retired_program(&mut self) {
+        self.retired_program = None;
     }
 
     // Go: execute/watcher.go:536 (*Watcher).tryUpdateProgram
@@ -913,11 +952,9 @@ impl Watcher {
             program.host = None;
             // PORT: Go replaces the program and its GC frees the old one
             // later (watcher.go:567). The old checker pool stops without a
-            // wait, as in `do_build`, so the rebuild does not wait for the
-            // old checkers to be freed.
-            if let Some(old) = self.program.replace(program).and_then(|old| old.program) {
-                crate::program::release_program_in_background(old);
-            }
+            // wait, as in `do_build`, and the old snapshot is freed after
+            // the status report (`retire_program`).
+            self.retire_program(program);
         }
         reused
     }
