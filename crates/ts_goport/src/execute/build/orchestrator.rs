@@ -22,9 +22,11 @@
 //! its check on the program's checker threads, so the checkers of the
 //! started tasks work at the same time, as the Go goroutines do. Each
 //! checker emits when its check ends, and the emit keeps its writes in
-//! memory. The started tasks write their outputs one at a time, the first
-//! taken first (`build_project_finish`). So a task that runs beside others
-//! in Go reads the file system before they write their outputs. Every task
+//! memory. The started tasks write their outputs one at a time
+//! (`build_project_finish`), in the order their check and emit end, as each
+//! Go builder writes when its own task ends. Tasks start before a started
+//! task writes, so a task that runs beside others in Go reads the file
+//! system before they write their outputs. Every task
 //! uses `o.host` and its caches (parsed `.d.ts` and
 //! `.json` files, configs, the cached file system, the mtimes), as in Go.
 //! Outside tests each program is released when its task is built, as Go
@@ -63,6 +65,7 @@ use crate::frontend::prelude::*;
 use crate::gostd::Context;
 // PORT: testing
 use crate::execute::tsc::compile::CommandLineTesting;
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::SystemTime;
 
@@ -186,7 +189,7 @@ pub struct Orchestrator {
     // first. Go's GC frees them in the background. Their `Rc` data frees on
     // this thread: when it would wait for a task (`build_all_tasks`), or
     // when more than `MAX_KEPT_RELEASED` wait.
-    released: RefCell<std::collections::VecDeque<crate::program::ReleasedProgram>>,
+    released: RefCell<VecDeque<crate::program::ReleasedProgram>>,
     // PORT: not in Go (perf). True when the process ends after this `tsc -b`
     // build (`start_exported`, not in watch mode or a test), so what the
     // build keeps is not freed.
@@ -855,9 +858,19 @@ impl Orchestrator {
         // PORT: perf. Each checker thread of a compiling task's program
         // drops a `ReadySignal` of the task when the check and emit that it
         // started are done (`BuildTask::notify_when_compiled`); `signals`
-        // counts the signals that each task still waits for.
+        // counts the signals that each task still waits for. `compiled`
+        // holds the compiling tasks whose signals have all arrived, in the
+        // order their last signal arrived: the order in which their checks
+        // and emits ended.
         let (ready, ready_calls) = std::sync::mpsc::channel::<usize>();
         let mut signals = vec![0usize; paths.len()];
+        let mut compiled = VecDeque::new();
+        fn signal_arrived(signals: &mut [usize], compiled: &mut VecDeque<usize>, index: usize) {
+            signals[index] -= 1;
+            if signals[index] == 0 {
+                compiled.push_back(index);
+            }
+        }
         // Tasks taken (Go `currentTaskIndex`), taken and not built, and
         // reported. The tasks before `next_report` are built.
         let mut next_take = 0;
@@ -909,6 +922,9 @@ impl Orchestrator {
                         index,
                         ready: ready.clone(),
                     });
+                    if signals[index] == 0 {
+                        compiled.push_back(index);
+                    }
                     State::Compiling
                 };
                 if states[index] == State::Done {
@@ -929,23 +945,22 @@ impl Orchestrator {
             }
             // No task can start or report, so a taken task compiles (the
             // first taken task that is not built has its upstream tasks
-            // done). As a Go builder goes on when its own task is built, the
-            // first taken task whose started check and emit are done
-            // finishes now: it writes its outputs, and its builder takes
-            // the next task. When none is done yet, this waits for a
-            // signal, and frees a kept released program first.
+            // done). A Go builder writes the outputs of its task when the
+            // task's check ends, and then takes the next task. So the task
+            // whose started check and emit ended first finishes now: it
+            // writes its outputs, and its builder takes the next task. When
+            // none has ended yet, this waits for a signal, and frees a kept
+            // released program first.
             let index = loop {
                 while let Ok(index) = ready_calls.try_recv() {
-                    signals[index] -= 1;
+                    signal_arrived(&mut signals, &mut compiled, index);
                 }
-                if let Some(index) = (next_report..next_take)
-                    .find(|&index| states[index] == State::Compiling && signals[index] == 0)
-                {
+                if let Some(index) = compiled.pop_front() {
                     break index;
                 }
                 if !self.free_released() {
                     let index = ready_calls.recv().expect("this thread keeps a sender");
-                    signals[index] -= 1;
+                    signal_arrived(&mut signals, &mut compiled, index);
                 }
             };
             let task = self.get_task(&paths[index]);
