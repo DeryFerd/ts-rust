@@ -12,6 +12,8 @@
 
 use crate::contentmapper::{self, Mapper, Project, SourceFiles};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
+use crate::execute::build::config_prefetch::ConfigPrefetch;
+use crate::execute::build::orchestrator::MTimePrefetch;
 use crate::execute::build::parse_cache::ParseCache;
 use crate::execute::incremental::incremental;
 use crate::execute::tsc::compile::System;
@@ -83,6 +85,105 @@ impl Hash for SourceFileCacheKey {
     }
 }
 
+// Go: vfs/cachedvfs/cachedvfs.go FS, the file system of the build host
+// (`cachedvfs.From(sys.FS())`, orchestrator.go:764).
+// PORT: the same cache as `CachedFs` (always enabled: the build host
+// never disables it), but the `FileExists`, `DirectoryExists`,
+// `Realpath` and `GetAccessibleEntries` lookups live in a
+// `BuildStatCache` that the parse workers of each program load read too
+// (`CompilerHost::stat_cache`), as Go parse tasks share the host's
+// cachedvfs. This cache lasts for the whole build, and a write does not
+// update it (cachedvfs.go:148), so a later program can find a lookup here
+// that an earlier program made before the build wrote that path. It holds
+// only the lookups that Go makes: the workers' own lookups stay out of it
+// unless the loader uses them (see `BuildStatCache`).
+pub struct BuildCachedFs {
+    fs: Rc<dyn Fs>,
+    stats: Arc<BuildStatCache>,
+    stat_cache: RefCell<FxHashMap<String, Option<FileInfo>>>,
+}
+
+impl BuildCachedFs {
+    // Go: cachedvfs.go:24 From
+    fn new(fs: Rc<dyn Fs>) -> BuildCachedFs {
+        BuildCachedFs {
+            fs,
+            stats: Arc::default(),
+            stat_cache: RefCell::default(),
+        }
+    }
+
+    // Go: cachedvfs.go:40 ClearCache
+    pub fn clear_cache(&self) {
+        self.stats.clear();
+        self.stat_cache.borrow_mut().clear();
+    }
+}
+
+impl Fs for BuildCachedFs {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.fs.use_case_sensitive_file_names()
+    }
+
+    fn file_exists(&self, path: &str) -> bool {
+        self.stats.file_exists(path, || self.fs.file_exists(path))
+    }
+
+    fn read_file(&self, path: &str) -> (String, bool) {
+        self.fs.read_file(path)
+    }
+
+    fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.write_file(path, data)
+    }
+
+    fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.append_file(path, data)
+    }
+
+    fn remove(&self, path: &str) -> Result<(), FsError> {
+        self.fs.remove(path)
+    }
+
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<SystemTime>,
+        m_time: Option<SystemTime>,
+    ) -> Result<(), FsError> {
+        self.fs.chtimes(path, a_time, m_time)
+    }
+
+    fn directory_exists(&self, path: &str) -> bool {
+        self.stats
+            .directory_exists(path, || self.fs.directory_exists(path))
+    }
+
+    fn get_accessible_entries(&self, path: &str) -> Entries {
+        self.stats
+            .entries(path, || self.fs.get_accessible_entries(path))
+    }
+
+    fn stat(&self, path: &str) -> Option<FileInfo> {
+        if let Some(ret) = self.stat_cache.borrow().get(path) {
+            return ret.clone();
+        }
+        let ret = self.fs.stat(path);
+        self.stat_cache
+            .borrow_mut()
+            .insert(path.to_string(), ret.clone());
+        ret
+    }
+
+    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
+        self.fs.walk_dir(root, walk_fn)
+    }
+
+    fn realpath(&self, path: &str) -> String {
+        self.stats.realpath(path, || self.fs.realpath(path))
+    }
+}
+
 // Go: build/host.go:18 host
 pub struct BuildHost {
     // PORT: in place of Go `orchestrator *Orchestrator` (see top).
@@ -93,18 +194,30 @@ pub struct BuildHost {
     host: Rc<dyn CompilerHost>,
     // PORT: the `*cachedvfs.FS` of `host`, kept for `resetCaches`. Go
     // reaches it as `o.host.host.FS().(*cachedvfs.FS)` (orchestrator.go:272).
-    pub cached_fs: Rc<CachedFs>,
+    pub cached_fs: Rc<BuildCachedFs>,
 
     // Caches that last only for build cycle and then cleared out
     pub extended_config_cache: TscExtendedConfigCache,
     pub source_files: ParseCache<SourceFileCacheKey, Rc<ParsedSourceFile>>,
+    // PORT: not in Go. The references of each parse in `source_files`, by
+    // file name, made when a program load first needs them
+    // (`cached_source_file_refs`).
+    cached_refs: RefCell<FxHashMap<String, (std::rc::Weak<ParsedSourceFile>, Arc<FileRefs>)>>,
     pub config_times: RefCell<FxHashMap<Path, Duration>>,
 
     // caches that stay as long as they are needed
     pub resolved_references: ParseCache<Path, Rc<ParsedCommandLine>>,
+    // PORT: not in Go (perf). The threads that parse the configs of the
+    // graph ahead of `get_resolved_project_reference` (config_prefetch.rs).
+    pub config_prefetch: RefCell<Option<ConfigPrefetch>>,
     // PORT: Go `*collections.SyncMap`. The task `writeFile` stores into it
     // from the checker threads.
     pub m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
+    // PORT: not in Go (perf). The mtimes that the build info threads read
+    // for the up-to-date checks of this build cycle (orchestrator.rs
+    // `BuildInfoPrefetch`). `load_or_store_m_time` takes one where it would
+    // read the file system.
+    pub m_time_prefetch: RefCell<Option<MTimePrefetch>>,
 }
 
 impl BuildHost {
@@ -118,14 +231,16 @@ impl BuildHost {
         command: Rc<ParsedBuildCommandLine>,
         compare_paths_options: ComparePathsOptions,
     ) -> BuildHost {
-        let cached_fs = cachedvfs_from(sys.fs());
-        let host = new_compiler_host(
+        let base = sys.fs();
+        let cached_fs = Rc::new(BuildCachedFs::new(base.clone()));
+        // PORT: Go `NewCompilerHost`. The host sees through the cache to
+        // `sys.FS()`, so on the OS file system the parse workers read and
+        // resolve for it (`CompilerHost::is_plain_os_fs`), as for `tsc -p`.
+        let host = new_compiler_host_over(
             &sys.get_current_directory(),
             cached_fs.clone(),
+            &base,
             &sys.default_library_path(),
-            None,
-            None,
-            None,
         );
         BuildHost {
             sys,
@@ -135,9 +250,29 @@ impl BuildHost {
             cached_fs,
             extended_config_cache: TscExtendedConfigCache::default(),
             source_files: ParseCache::default(),
+            cached_refs: RefCell::default(),
             config_times: RefCell::new(FxHashMap::default()),
             resolved_references: ParseCache::default(),
+            config_prefetch: RefCell::new(None),
             m_times: Arc::default(),
+            m_time_prefetch: RefCell::new(None),
+        }
+    }
+
+    // Go: build/host.go:72, the raw command line options of
+    // `GetResolvedProjectReference`: wrapped in a "compilerOptions" key to
+    // match the tsconfig.json structure.
+    pub fn command_line_raw(&self) -> Option<IndexMap<String, CompilerOptionsValue>> {
+        match &self.command.raw {
+            CompilerOptionsValue::Map(raw) => {
+                let mut wrapped = IndexMap::default();
+                wrapped.insert(
+                    "compilerOptions".to_string(),
+                    CompilerOptionsValue::Map(raw.clone()),
+                );
+                Some(wrapped)
+            }
+            _ => None,
         }
     }
 
@@ -188,7 +323,17 @@ impl BuildHost {
             }
         }
         if !found {
-            m_time = incremental::get_m_time(&*self.host, file);
+            // PORT: perf. An mtime that a build info thread read.
+            let prefetched = self.m_time_prefetch.borrow().as_ref().and_then(|m_times| {
+                m_times
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&path)
+            });
+            m_time = match prefetched {
+                Some(m_time) => m_time,
+                None => incremental::get_m_time(&*self.host, file),
+            };
         }
         if store {
             m_time = *self
@@ -299,14 +444,33 @@ impl CompilerHost for BuildHost {
         );
     }
 
-    // PORT: not in Go (see `CompilerHost::cached_source_file_names`). The
-    // `.d.ts` and `.json` files that `get_source_file` keeps.
-    fn cached_source_file_names(&self) -> FxHashSet<String> {
-        let mut names = FxHashSet::default();
-        self.source_files.for_each_stored(|key| {
-            names.insert(key.0.file_name.clone());
+    // PORT: not in Go (see `CompilerHost::is_plain_os_fs`).
+    fn is_plain_os_fs(&self) -> bool {
+        self.host.is_plain_os_fs()
+    }
+
+    // PORT: not in Go (see `CompilerHost::stat_cache`).
+    fn stat_cache(&self) -> Option<Arc<BuildStatCache>> {
+        Some(self.cached_fs.stats.clone())
+    }
+
+    // PORT: not in Go (see `CompilerHost::cached_source_file_refs`). The
+    // `.d.ts` and `.json` files that `get_source_file` keeps. The
+    // references of each parse are made once (`cached_refs`).
+    fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<FileRefs>> {
+        let mut refs = FxHashMap::default();
+        let mut memo = self.cached_refs.borrow_mut();
+        self.source_files.for_each_stored(|key, file| {
+            let (parse, file_refs) = memo
+                .entry(key.0.file_name.clone())
+                .or_insert_with(|| (Rc::downgrade(file), Arc::new(FileRefs::of_file(file))));
+            if !parse.ptr_eq(&Rc::downgrade(file)) {
+                *parse = Rc::downgrade(file);
+                *file_refs = Arc::new(FileRefs::of_file(file));
+            }
+            refs.insert(key.0.file_name.clone(), file_refs.clone());
         });
-        names
+        refs
     }
 
     // Go: build/host.go:70 (*host).GetResolvedProjectReference
@@ -320,17 +484,7 @@ impl CompilerHost for BuildHost {
             |path| {
                 let config_start = self.sys.now();
                 // Wrap command line options in "compilerOptions" key to match tsconfig.json structure
-                let command_line_raw = match &self.command.raw {
-                    CompilerOptionsValue::Map(raw) => {
-                        let mut wrapped = IndexMap::default();
-                        wrapped.insert(
-                            "compilerOptions".to_string(),
-                            CompilerOptionsValue::Map(raw.clone()),
-                        );
-                        Some(wrapped)
-                    }
-                    _ => None,
-                };
+                let command_line_raw = self.command_line_raw();
                 let (command_line, _) = get_parsed_command_line_of_config_file_path(
                     file_name,
                     path.clone(),
@@ -363,6 +517,37 @@ impl ParseConfigHost for BuildHost {
 
     fn get_current_directory(&self) -> String {
         self.host.get_current_directory()
+    }
+
+    // PORT: not in Go (perf). The file names that a config thread matched
+    // (config_prefetch.rs), else Go `getFileNamesFromConfigSpecs`.
+    fn get_file_names_from_config_specs(
+        &self,
+        config_file_name: &str,
+        config_file_specs: &ConfigFileSpecs,
+        base_path: &str,
+        options: Option<&CompilerOptions>,
+        extra_extensions: &[String],
+    ) -> (Vec<String>, i32) {
+        let fs = ParseConfigHost::fs(self);
+        match &*self.config_prefetch.borrow() {
+            Some(prefetch) => prefetch.get_file_names_from_config_specs(
+                config_file_name,
+                config_file_specs,
+                base_path,
+                options,
+                extra_extensions,
+                &*fs,
+                &self.cached_fs.stats,
+            ),
+            None => get_file_names_from_config_specs(
+                config_file_specs,
+                base_path,
+                options,
+                &*fs,
+                extra_extensions,
+            ),
+        }
     }
 }
 
@@ -454,8 +639,18 @@ impl CompilerHost for BuildCompilerHost {
         self.host.get_resolved_project_reference(file_name, path)
     }
 
-    // PORT: not in Go (see `CompilerHost::cached_source_file_names`).
-    fn cached_source_file_names(&self) -> FxHashSet<String> {
-        self.host.cached_source_file_names()
+    // PORT: not in Go (see `CompilerHost::is_plain_os_fs`).
+    fn is_plain_os_fs(&self) -> bool {
+        self.host.is_plain_os_fs()
+    }
+
+    // PORT: not in Go (see `CompilerHost::stat_cache`).
+    fn stat_cache(&self) -> Option<Arc<BuildStatCache>> {
+        self.host.stat_cache()
+    }
+
+    // PORT: not in Go (see `CompilerHost::cached_source_file_refs`).
+    fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<FileRefs>> {
+        self.host.cached_source_file_refs()
     }
 }

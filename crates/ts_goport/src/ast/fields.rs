@@ -16,8 +16,8 @@
 //!   `Type`, `Expression`, `Text`, `Arguments`, ...) are not generated here.
 //!   The `node.rs` method wins.
 //! - Binder fields (`Symbol`, `LocalSymbol`, `Locals`, `NextContainer`,
-//!   `FlowNode`, `EndFlowNode`, `ReturnFlowNode`) come from `NodeBindData`
-//!   through `node.rs`. `SourceFile` fields other than `EndOfFileToken` come
+//!   `FlowNode`, `EndFlowNode`, `ReturnFlowNode`) come from the node records
+//!   and `NodeBindExtra` through `node.rs`. `SourceFile` fields other than `EndOfFileToken` come
 //!   from `source_file_info` / `file_bind_data`.
 //! - Unexported Go fields (`name`, `modifiers`, `facts`, `text`) are only
 //!   reachable through Go `*Node` methods, so they are not generated.

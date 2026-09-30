@@ -1146,10 +1146,12 @@ impl WatcherBase {
     // Go: watcher.go:438 watcherBase.run
     // PORT: the goroutine is a `std::thread`; Go's `recover()` is
     // `catch_unwind`, so an `unported!` panic in `start` becomes the start
-    // error, as a Go panic does.
+    // error, as a Go panic does. The thread gets the Go stack size: an
+    // event for a new directory walks it (`walk_dir`), one call per level.
     pub fn run(&self) -> Result<(), GoError> {
         let self_impl = self.self_impl();
-        std::thread::spawn(move || {
+        let thread = std::thread::Builder::new().stack_size(crate::gostd::stack::max_stack_size());
+        let spawned = thread.spawn(move || {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| self_impl.start()));
             match result {
                 Ok(Ok(())) => {}
@@ -1169,6 +1171,7 @@ impl WatcherBase {
                 }
             }
         });
+        spawned.expect("fswatch: failed to start the watcher goroutine");
         self.started.wait();
         let b = self.mu.lock().unwrap();
         match &b.start_err {

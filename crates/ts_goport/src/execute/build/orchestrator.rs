@@ -24,7 +24,11 @@
 //! `o.host` and its caches (parsed `.d.ts` and
 //! `.json` files, configs, the cached file system, the mtimes), as in Go.
 //! Each program is released when its task reports; its checker threads
-//! free it in the background.
+//! free it in the background. Where Go does task work on its goroutines
+//! that needs no task state, threads do it ahead of this thread: the file
+//! name match of each config (config_prefetch.rs), and the build info
+//! read, its check parts and the source mtimes of each task
+//! (`BuildInfoPrefetch`).
 //!
 //! PORT: the task keeps its project statistics (see build_task.rs), and
 //! `report_task` adds them to the aggregate `--diagnostics` and
@@ -37,6 +41,7 @@
 use crate::contentmapper;
 use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::ParsedBuildCommandLine;
+use crate::execute::build::config_prefetch::ConfigPrefetch;
 use crate::execute::build::host::BuildHost;
 use crate::execute::incremental::build_info::{BuildInfo, is_build_info_file_name_default_library};
 use crate::execute::incremental::incremental::{new_build_info_reader, parse_build_info};
@@ -152,6 +157,9 @@ pub struct Orchestrator {
     // PORT: not in Go (perf). The build info files that threads read ahead
     // of the up-to-date checks of this build cycle (`BuildInfoPrefetch`).
     build_info_prefetch: RefCell<Option<BuildInfoPrefetch>>,
+    // PORT: not in Go (perf). The check parts that a thread made from the
+    // build info that `read_build_info_file` gave last, and its file name.
+    status_prefetch: RefCell<Option<(String, StatusPrefetch)>>,
 }
 
 impl Orchestrator {
@@ -219,7 +227,8 @@ impl Orchestrator {
     // PORT: Go parses the configs in parallel on a work group; here they
     // parse depth first on one thread. The task map and each task's
     // `resolved` are the same, because a path is taken by the first
-    // `LoadOrStore` in both.
+    // `LoadOrStore` in both. Threads match the file names of the configs
+    // ahead of this thread (`start_config_prefetch`).
     fn create_build_tasks(
         &mut self,
         old_tasks: Option<&FxHashMap<Path, Rc<RefCell<BuildTask>>>>,
@@ -259,9 +268,43 @@ impl Orchestrator {
             }
             if let Some(resolved) = resolved {
                 let references = resolved.resolved_project_reference_paths().to_vec();
+                if old_tasks.is_none() {
+                    self.start_config_prefetch(&references);
+                }
                 self.create_build_tasks(old_tasks, &references);
             }
         }
+    }
+
+    /// PORT: not in Go (perf). Queues the parses of `references` on the
+    /// config threads (config_prefetch.rs), and starts the threads when
+    /// there are two references or more. Go parses the configs on a work
+    /// group that is parallel unless `--singleThreaded`. Only for the first
+    /// graph of a build that is not a watch (a watch parses changed configs
+    /// again), and only on the OS file system (not in tests).
+    fn start_config_prefetch(&self, references: &[String]) {
+        if let Some(prefetch) = &*self.host.config_prefetch.borrow() {
+            prefetch.queue(references);
+            return;
+        }
+        let options = &self.opts.command.compiler_options;
+        if references.len() < 2
+            || options.watch.is_true()
+            || options.single_threaded.is_true()
+            || self.opts.testing.is_some()
+            || !is_wrapped_os_fs(&self.opts.sys.fs())
+        {
+            return;
+        }
+        let prefetch = ConfigPrefetch::start(
+            (**options).clone(),
+            self.host.command_line_raw(),
+            &self.compare_paths_options,
+        );
+        if let Some(prefetch) = &prefetch {
+            prefetch.queue(references);
+        }
+        *self.host.config_prefetch.borrow_mut() = prefetch;
     }
 
     // Go: build/orchestrator.go:166 (*Orchestrator).setupBuildTask
@@ -335,6 +378,8 @@ impl Orchestrator {
         let projects = self.opts.command.resolved_project_paths().to_vec();
         // Parse all config files in parallel
         self.create_build_tasks(old_tasks, &projects);
+        // The config threads stop after the config they parse.
+        self.host.config_prefetch.borrow_mut().take();
 
         // Generate the graph
         let mut completed = FxHashSet::default();
@@ -542,6 +587,8 @@ impl Orchestrator {
         }
         // A task that did not read its build info leaves its read unused.
         self.build_info_prefetch.borrow_mut().take();
+        self.status_prefetch.borrow_mut().take();
+        self.host.m_time_prefetch.borrow_mut().take();
     }
 
     /// PORT: not in Go (perf). Starts reading the build info files that the
@@ -555,6 +602,9 @@ impl Orchestrator {
     /// that keeps the build info of an earlier cycle (watch) read nothing.
     /// A build info file that two tasks name (by path) is left out, so no
     /// task of the build writes a prefetched file before its task reads it.
+    /// The threads also make the check parts of each build info
+    /// (`StatusPrefetch`) and read the mtimes of its task's TypeScript
+    /// sources (`BuildHost::m_time_prefetch`).
     fn start_build_info_prefetch(&self, paths: &[Path]) -> Option<BuildInfoPrefetch> {
         let num_routines = usize::try_from(self.num_routines()).unwrap_or(0);
         if num_routines < 2
@@ -564,7 +614,7 @@ impl Orchestrator {
             return None;
         }
         let mut named: FxHashMap<Path, usize> = FxHashMap::default();
-        let mut reads: Vec<(Path, String)> = Vec::new();
+        let mut reads: Vec<(Path, BuildInfoRead)> = Vec::new();
         for path in paths {
             let task = self.get_task(path);
             let task = task.borrow();
@@ -583,17 +633,31 @@ impl Orchestrator {
                 .as_ref()
                 .is_some_and(|entry| entry.path == build_info_path);
             if !solution && !keeps {
-                reads.push((build_info_path, name));
+                reads.push((
+                    build_info_path,
+                    BuildInfoRead {
+                        name,
+                        input_files: resolved.file_names().to_vec(),
+                    },
+                ));
             }
         }
-        let names: Vec<String> = reads
+        let reads: Vec<BuildInfoRead> = reads
             .into_iter()
-            .filter_map(|(path, name)| (named[&path] == 1).then_some(name))
+            .filter_map(|(path, read)| (named[&path] == 1).then_some(read))
             .collect();
-        if names.len() < 2 {
+        if reads.len() < 2 {
             return None;
         }
-        BuildInfoPrefetch::start(names, num_routines)
+        let m_times: MTimePrefetch = Arc::default();
+        let prefetch = BuildInfoPrefetch::start(
+            reads,
+            num_routines,
+            self.compare_paths_options.clone(),
+            m_times.clone(),
+        )?;
+        *self.host.m_time_prefetch.borrow_mut() = Some(m_times);
+        Some(prefetch)
     }
 
     // Go: build/buildtask.go:120 (*BuildTask).report, the orchestrator part
@@ -736,17 +800,24 @@ impl BuildTaskOrchestrator for Orchestrator {
     }
 
     fn read_build_info_file(&self, config: &ParsedCommandLine) -> Option<Rc<BuildInfo>> {
+        let name = config.get_build_info_file_name();
         let prefetched = self
             .build_info_prefetch
             .borrow_mut()
             .as_mut()
-            .and_then(|prefetch| prefetch.take(&config.get_build_info_file_name()));
-        if let Some(build_info) = prefetched {
+            .and_then(|prefetch| prefetch.take(&name));
+        if let Some((build_info, status_prefetch)) = prefetched {
+            *self.status_prefetch.borrow_mut() = status_prefetch.map(|status| (name, status));
             return build_info.map(Rc::new);
         }
         new_build_info_reader(self.host.clone() as Rc<dyn CompilerHost>)
             .read_build_info(config)
             .map(Rc::new)
+    }
+
+    fn take_status_prefetch(&self, build_info_file_name: &str) -> Option<StatusPrefetch> {
+        let (name, status_prefetch) = self.status_prefetch.borrow_mut().take()?;
+        (name == build_info_file_name).then_some(status_prefetch)
     }
 
     fn sys(&self) -> Rc<dyn System> {
@@ -775,32 +846,77 @@ impl BuildTaskOrchestrator for Orchestrator {
 /// of its file (`take`), waiting for it when a thread has not finished
 /// it. A thread reads with the OS file system of its thread, as the host
 /// does (`ReadBuildInfo`: read the file, then `parse_build_info`).
+///
+/// After the parse, the thread does the other parts of the check that need
+/// no task state: the root info reader and the paths of the file names
+/// (`StatusPrefetch`), and the mtimes of the task's TypeScript sources
+/// that are not declaration files, the root files and the files of the
+/// build info (`MTimePrefetch`). No task of a build writes such a file, so
+/// the mtime is the one that the check would read later.
 struct BuildInfoPrefetch {
     slots: FxHashMap<String, Arc<BuildInfoSlot>>,
 }
 
-/// The build info of one file: `None` until a thread has read it, then
-/// `Some(None)` when the read panicked, else `Some(Some(result))` with Go
-/// `ReadBuildInfo`'s result (`None` when the file cannot be read or
-/// parsed).
+/// One build info file that the threads read, and the root files of its
+/// task (`resolved.FileNames()`).
+struct BuildInfoRead {
+    name: String,
+    input_files: Vec<String>,
+}
+
+/// The mtimes that the build info threads read ahead of the checks, by
+/// path. `BuildHost::load_or_store_m_time` takes an mtime from here where it
+/// would read it from the file system.
+pub(crate) type MTimePrefetch = Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>;
+
+/// What a thread made for one build info file: Go `ReadBuildInfo`'s result
+/// (`None` when the file cannot be read or parsed) and the check parts of
+/// a parsed build info.
+type BuildInfoResult = (Option<BuildInfo>, Option<StatusPrefetch>);
+
+/// The result for one file: `None` until a thread has read it, then
+/// `Some(None)` when the thread panicked, else `Some(Some(result))`.
 #[derive(Default)]
 struct BuildInfoSlot {
-    result: Mutex<Option<Option<Option<BuildInfo>>>>,
+    result: Mutex<Option<Option<BuildInfoResult>>>,
     done: Condvar,
+}
+
+/// True for a TypeScript file that is not a declaration file. A build
+/// never writes one (its outputs are JavaScript, declaration, map, JSON
+/// and build info files).
+fn is_typescript_source(file_name: &str) -> bool {
+    file_extension_is_one_of(
+        file_name,
+        &[EXTENSION_TS, EXTENSION_TSX, EXTENSION_MTS, EXTENSION_CTS],
+    ) && !is_declaration_file_name(file_name)
 }
 
 /// The most threads that read build info files.
 const MAX_BUILD_INFO_THREADS: usize = 8;
 
 impl BuildInfoPrefetch {
-    /// Starts the threads that read and parse `names`, in order, at most
-    /// `num_routines` (Go `numRoutines`). None when no thread starts.
-    fn start(names: Vec<String>, num_routines: usize) -> Option<Self> {
-        let slots: Vec<(String, Arc<BuildInfoSlot>)> = names
-            .into_iter()
-            .map(|name| (name, Arc::default()))
+    /// Starts the threads that read and parse the files of `reads`, in
+    /// order, at most `num_routines` (Go `numRoutines`), and put the
+    /// mtimes they read into `m_times`. None when no thread starts.
+    fn start(
+        reads: Vec<BuildInfoRead>,
+        num_routines: usize,
+        compare_paths_options: ComparePathsOptions,
+        m_times: MTimePrefetch,
+    ) -> Option<Self> {
+        let slots: Vec<(String, Arc<BuildInfoSlot>)> = reads
+            .iter()
+            .map(|read| (read.name.clone(), Arc::default()))
             .collect();
-        let queue = Arc::new(Mutex::new(slots.clone().into_iter()));
+        let queue = Arc::new(Mutex::new(
+            reads
+                .into_iter()
+                .zip(slots.iter().map(|(_, slot)| slot.clone()))
+                .collect::<Vec<_>>()
+                .into_iter(),
+        ));
+        let compare_paths_options = Arc::new(compare_paths_options);
         let threads = MAX_BUILD_INFO_THREADS
             .min(num_routines)
             .min(crate::program::available_cores())
@@ -808,24 +924,40 @@ impl BuildInfoPrefetch {
         let mut started = 0;
         for _ in 0..threads {
             let queue = queue.clone();
+            let compare_paths_options = compare_paths_options.clone();
+            let m_times = m_times.clone();
             // A thread that cannot start leaves its files to the others.
+            // The JSON parse of a build info file is recursive, so the
+            // thread gets the Go stack size.
             let spawned = std::thread::Builder::new()
                 .name("goport-buildinfo".to_string())
+                .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
                     let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
                     loop {
                         let next = queue.lock().unwrap_or_else(PoisonError::into_inner).next();
-                        let Some((name, slot)) = next else {
+                        let Some((read, slot)) = next else {
                             break;
                         };
                         // A read that panics is left to the task, which
                         // panics on it too.
-                        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let (data, ok) = fs.read_file(&name);
-                            if ok { parse_build_info(&data) } else { None }
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let (data, ok) = fs.read_file(&read.name);
+                            let build_info = if ok { parse_build_info(&data) } else { None };
+                            let status = build_info.as_ref().map(|build_info| {
+                                let status = StatusPrefetch::new(
+                                    build_info,
+                                    &read.name,
+                                    &read.input_files,
+                                    &compare_paths_options,
+                                );
+                                prefetch_m_times(&*fs, &read, &status, &m_times);
+                                status
+                            });
+                            (build_info, status)
                         }));
                         *slot.result.lock().unwrap_or_else(PoisonError::into_inner) =
-                            Some(read.ok());
+                            Some(result.ok());
                         slot.done.notify_all();
                     }
                 });
@@ -836,10 +968,11 @@ impl BuildInfoPrefetch {
         })
     }
 
-    /// The build info of `name` that a thread read, once: `None` when it is
-    /// not prefetched, was taken, or its read panicked; then the caller
-    /// reads it. Waits for the thread that reads it.
-    fn take(&mut self, name: &str) -> Option<Option<BuildInfo>> {
+    /// The build info of `name` that a thread read, and its check parts,
+    /// once: `None` when it is not prefetched, was taken, or its read
+    /// panicked; then the caller reads it. Waits for the thread that reads
+    /// it.
+    fn take(&mut self, name: &str) -> Option<BuildInfoResult> {
         let slot = self.slots.remove(name)?;
         let mut result = slot.result.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
@@ -851,6 +984,28 @@ impl BuildInfoPrefetch {
                 .wait(result)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+    }
+}
+
+/// Reads the mtimes of the TypeScript sources (`is_typescript_source`) of
+/// `read` (its root files and the files of its build info, `status`) into
+/// `m_times`, as `BuildHost::get_m_time` reads them (`incremental.GetMTime`).
+fn prefetch_m_times(
+    fs: &dyn Fs,
+    read: &BuildInfoRead,
+    status: &StatusPrefetch,
+    m_times: &MTimePrefetch,
+) {
+    let roots = read.input_files.iter().zip(&status.input_paths);
+    let files = status.file_names.iter().map(|(file, path)| (file, path));
+    let read: Vec<(Path, Option<SystemTime>)> = roots
+        .chain(files)
+        .filter(|(file, _)| is_typescript_source(file))
+        .map(|(file, path)| (path.clone(), fs.stat(file).and_then(|stat| stat.mod_time())))
+        .collect();
+    let mut m_times = m_times.lock().unwrap_or_else(PoisonError::into_inner);
+    for (path, m_time) in read {
+        m_times.entry(path).or_insert(m_time);
     }
 }
 
@@ -884,6 +1039,7 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
         watch_status_reporter: None,
         wm: Rc::new(RefCell::new(wm)),
         build_info_prefetch: RefCell::new(None),
+        status_prefetch: RefCell::new(None),
     };
     if orchestrator.opts.command.compiler_options.watch.is_true() {
         orchestrator.watch_status_reporter = Some(create_watch_status_reporter(
