@@ -129,6 +129,8 @@ pub struct PluginImport {
 // `"types": []` overrides the parent), and some readers test `!= nil`.
 // Go `*collections.OrderedMap` is `Option<IndexMap>` and Go `*int` is
 // `Option<i32>`.
+// PORT: the derived `==` ignores the `paths` key order, because `IndexMap`
+// equality does. Go `reflect.DeepEqual` sees it: use `deep_equal` for that.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompilerOptions {
     pub allow_js: Tristate,
@@ -295,6 +297,16 @@ impl CompilerOptions {
     // PORT: Go copies every exported field by reflection. The derived
     // `Clone::clone` copies every field, which is the same set, so Go
     // `options.Clone()` ports to `options.clone()` with no inherent method.
+
+    /// Go `reflect.DeepEqual` of two option sets: `==`, and the same `paths`
+    /// key order. Go `OrderedMap` keeps its keys in a slice, and module
+    /// resolution and module specifiers try the `paths` patterns in order.
+    #[must_use]
+    pub fn deep_equal(&self, other: &Self) -> bool {
+        self == other
+            && self.paths.as_ref().map(IndexMap::as_slice)
+                == other.paths.as_ref().map(IndexMap::as_slice)
+    }
 
     // Go: core/compileroptions.go:193 GetEmitScriptTarget
     #[must_use]

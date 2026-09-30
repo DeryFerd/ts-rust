@@ -542,13 +542,14 @@ fn get_import_attributes_key(attributes: Node) -> String {
 // Go: ls/organizeimports.go:385 groupByNewlineContiguous
 // groupByNewlineContiguous groups declarations by blank lines between them.
 fn group_by_newline_contiguous(source_file: Node, decls: &[Node]) -> Vec<Vec<Node>> {
+    let text = source_file_text(source_file);
     let mut s = new_scanner();
     s.set_skip_trivia(false); // Must not skip trivia to detect newlines
     let mut groups: Vec<Vec<Node>> = Vec::new();
     let mut current_group: Vec<Node> = Vec::new();
 
     for &decl in decls {
-        if !current_group.is_empty() && is_new_group(source_file, decl, &mut s) {
+        if !current_group.is_empty() && is_new_group(&text, decl, &mut s) {
             groups.push(current_group);
             current_group = Vec::new();
         }
@@ -563,13 +564,14 @@ fn group_by_newline_contiguous(source_file: Node, decls: &[Node]) -> Vec<Vec<Nod
 }
 
 // Go: ls/organizeimports.go:406 isNewGroup
-fn is_new_group(source_file: Node, decl: Node, s: &mut Scanner) -> bool {
+// PORT: Go takes the source file; the caller passes its text, which the
+// scanner borrows.
+fn is_new_group<'a>(text: &'a str, decl: Node, s: &mut Scanner<'a>) -> bool {
     let full_start = decl.pos();
     if full_start < 0 {
         return false;
     }
 
-    let text = source_file_text(source_file);
     let text_len = text.len() as i32;
 
     if full_start >= text_len {

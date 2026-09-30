@@ -831,7 +831,7 @@ impl Project {
                             ref_program_file(
                                 &builder.parse_cache,
                                 file.parse_options(),
-                                file.text,
+                                file.source_hash(),
                                 file.script_kind,
                             );
                         }
@@ -847,7 +847,7 @@ impl Project {
                             ref_program_file(
                                 &builder.parse_cache,
                                 &file.parse_options,
-                                file.text,
+                                file.source_hash(),
                                 file.script_kind,
                             );
                         }
@@ -866,7 +866,7 @@ impl Project {
                     deref_program_file(
                         &builder().parse_cache,
                         dirty_file.parse_options(),
-                        dirty_file.text,
+                        dirty_file.source_hash(),
                         dirty_file.script_kind,
                     );
                 }

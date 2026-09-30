@@ -58,6 +58,14 @@ pub fn bundled_text(_path: &str) -> Option<&'static str> {
     None
 }
 
+/// Always `None`: nothing is embedded, so the lib snapshots hash the text
+/// they read (see embed.rs).
+// PORT: not in Go.
+#[must_use]
+pub fn embedded_text_hash(_text: &str) -> Option<u64> {
+    None
+}
+
 // Go: noembed.go:46 IsBundled
 pub fn is_bundled(_path: &str) -> bool {
     false

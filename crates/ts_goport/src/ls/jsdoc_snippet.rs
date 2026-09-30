@@ -96,14 +96,14 @@ impl LanguageService {
     ) -> Option<lsproto::TextEditOrInsertReplaceEdit> {
         let text = source_file_text(file);
         let line_start = crate::format::get_line_start_position_for_position(position, file);
-        let prefix = go_text_slice(text, line_start, position);
+        let prefix = go_text_slice(&text, line_start, position);
         let mut start = position;
         if let Some(prefix_start) = get_js_doc_snippet_prefix_start(prefix) {
             start = line_start + prefix_start as i32;
         }
 
         let line_end = get_line_end_of_position(file, position);
-        let suffix = go_text_slice(text, position, line_end);
+        let suffix = go_text_slice(&text, position, line_end);
         let mut end = position;
         if let Some(suffix_end) = get_js_doc_snippet_suffix_end(suffix) {
             end += suffix_end as i32;
@@ -137,13 +137,13 @@ impl LanguageService {
 pub fn is_potentially_valid_js_doc_snippet_completion_position(file: Node, position: i32) -> bool {
     let text = source_file_text(file);
     let line_start = crate::format::get_line_start_position_for_position(position, file);
-    let prefix = go_text_slice(text, line_start, position);
+    let prefix = go_text_slice(&text, line_start, position);
     if !is_js_doc_snippet_prefix(prefix) {
         return false;
     }
 
     let line_end = get_line_end_of_position(file, position);
-    let suffix = go_text_slice(text, position, line_end);
+    let suffix = go_text_slice(&text, position, line_end);
     is_js_doc_snippet_suffix(suffix)
 }
 
@@ -206,8 +206,8 @@ fn get_doc_comment_template_at_position(
         // The reparse is published for good (and its lazy JSDoc is cached
         // before that), so its nodes belong to the thread.
         let _base = crate::ast::enter_base_synthetic_owner();
-        // PORT: the parser takes `&'static str` (node data points into the
-        // text), so the text is leaked.
+        // PORT: the reparse is published static (never freed), so its text is
+        // leaked with its store.
         let reparse_text: &'static str = Box::leak(
             format!(
                 "{} */{}",
@@ -242,7 +242,7 @@ fn get_doc_comment_template_at_position(
     if existing_doc_comment.is_nil() && has_doc_comment_at_position {
         token_at_pos = astnav::get_token_at_position(
             source_file,
-            skip_whitespace(source_file_text(source_file), doc_comment_end),
+            skip_whitespace(&source_file_text(source_file), doc_comment_end),
         );
         if token_at_pos.is_nil() {
             return None;
@@ -271,7 +271,7 @@ fn get_doc_comment_template_at_position(
         return None;
     }
 
-    let indentation = get_indentation_string_at_position(source_file, position);
+    let indentation = &*get_indentation_string_at_position(source_file, position);
     let mut tags = parameter_doc_comments(
         &comment_owner_info.parameters,
         is_template_source_file_js(source_file),
@@ -318,8 +318,8 @@ fn get_doc_comment_end_at_position(file: Node, position: i32) -> (i32, bool, boo
     let text = source_file_text(file);
     let line_start = crate::format::get_line_start_position_for_position(position, file);
     let line_end = get_line_end_of_position(file, position);
-    let prefix = go_text_slice(text, line_start, position);
-    let suffix = go_text_slice(text, position, line_end);
+    let prefix = go_text_slice(&text, line_start, position);
+    let suffix = go_text_slice(&text, position, line_end);
     if !trim_right_single_line_whitespace(prefix).ends_with("/**") {
         return (0, false, false);
     }
@@ -525,7 +525,7 @@ fn returns_doc_comment(indentation: &str, new_line: &str) -> String {
 }
 
 // Go: ls/jsdoc_snippet.go:329 getIndentationStringAtPosition
-fn get_indentation_string_at_position(source_file: Node, position: i32) -> &'static str {
+fn get_indentation_string_at_position(source_file: Node, position: i32) -> String {
     let text = source_file_text(source_file);
     let line_start = crate::format::get_line_start_position_for_position(position, source_file);
     let mut pos = line_start;
@@ -539,7 +539,7 @@ fn get_indentation_string_at_position(source_file: Node, position: i32) -> &'sta
         }
         pos += size;
     }
-    &text[line_start as usize..pos as usize]
+    text[line_start as usize..pos as usize].to_string()
 }
 
 // Go: ls/jsdoc_snippet.go:346 isNonEmptyJSDoc

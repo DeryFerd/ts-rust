@@ -529,10 +529,10 @@ fn get_content_mapper_baseline(program: &CompilationResult, diagnostics: &[Diagn
         );
         b.push_str("--- Original ---\n");
         b.push_str(&ensure_trailing_newline(
-            ts_goport::ast::source_file_original_text(*file),
+            &ts_goport::ast::source_file_original_text(*file),
         ));
         b.push_str("--- Transformed ---\n");
-        b.push_str(&ensure_trailing_newline(source_file_text(*file)));
+        b.push_str(&ensure_trailing_newline(&source_file_text(*file)));
         b.push('\n');
     }
 
@@ -629,7 +629,7 @@ pub fn do_js_emit_baseline(
                     path: Path(file.unit_name.clone()),
                     ..SourceFileParseOptions::default()
                 },
-                Box::leak(file.content.clone().into_boxed_str()),
+                &*Box::leak(file.content.clone().into_boxed_str()),
                 ScriptKind::JSON,
             );
             if !file_parse_result.diagnostics.is_empty() {

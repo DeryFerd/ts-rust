@@ -1925,8 +1925,12 @@ fn promote_from_type_only(
             // Remove the 'type' keyword (which is the second token: 'import' 'type' name '=' ...)
             let import_eq_decl = alias_declaration;
             // The type keyword is after 'import' and before the name
-            let mut scan =
-                scanner_ls::get_scanner_for_source_file(source_file, import_eq_decl.pos());
+            let sf_text = source_file_text(source_file);
+            let mut scan = scanner_ls::get_scanner_for_source_file(
+                source_file,
+                &sf_text,
+                import_eq_decl.pos(),
+            );
             // Skip 'import' keyword to get to 'type'
             scan.scan();
             delete_type_keyword(changes, source_file, scan.token_start());
@@ -2035,14 +2039,16 @@ fn promote_import_clause(
 // deleteTypeKeyword deletes the 'type' keyword token starting at the given position,
 // including any trailing whitespace.
 fn delete_type_keyword(changes: &mut change::Tracker, source_file: Node, start_pos: i32) {
-    let scan = scanner_ls::get_scanner_for_source_file(source_file, start_pos);
+    let sf_text = source_file_text(source_file);
+    let scan = scanner_ls::get_scanner_for_source_file(source_file, &sf_text, start_pos);
     if scan.token() != SyntaxKind::TypeKeyword {
         return;
     }
     let type_start = scan.token_start();
     let mut type_end = scan.token_end();
     // Skip trailing whitespace
-    let text = source_file_text(source_file).as_bytes();
+    let text_text = source_file_text(source_file);
+    let text = text_text.as_bytes();
     while (type_end as usize) < text.len()
         && (text[type_end as usize] == b' ' || text[type_end as usize] == b'\t')
     {

@@ -145,7 +145,7 @@ fn read_json_config_file(
                 path,
                 ..Default::default()
             },
-            Box::leak(text.into_boxed_str()),
+            FileText::Static(Box::leak(text.into_boxed_str())),
             ScriptKind::JSON,
         );
         (
@@ -562,6 +562,14 @@ fn get_prop_from_raw(
                     wrong_value: "",
                 };
             }
+            // A nil `[]any` (an array of nulls): Go `core.Every` of no
+            // elements is true, and the nil `sliceValue` keeps no wrong value.
+            CompilerOptionsValue::NilList => {
+                return PropOfRaw {
+                    slice_value: None,
+                    wrong_value: "",
+                };
+            }
             CompilerOptionsValue::StringList(_) => {
                 panic!("interface conversion: raw value is []string, not []interface {{}}");
             }
@@ -611,7 +619,7 @@ fn spec_list_value(specs: &Option<Vec<CompilerOptionsValue>>) -> CompilerOptions
 // PORT: only the value kinds that JSON conversion makes are handled.
 pub(crate) fn stringify_json(value: &CompilerOptionsValue, out: &mut String) {
     match value {
-        CompilerOptionsValue::Nil => out.push_str("[]"),
+        CompilerOptionsValue::Nil | CompilerOptionsValue::NilList => out.push_str("[]"),
         CompilerOptionsValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         CompilerOptionsValue::Int(i) => out.push_str(&i.to_string()),
         CompilerOptionsValue::Number(n) => out.push_str(&crate::jsnum::Number(*n).to_string()),
@@ -1474,7 +1482,7 @@ pub fn get_content_mapper_option_diagnostic_location(
     let file = config_file.source_file;
     (
         file,
-        TextRange::new(skip_trivia(source_file_text(file), node.pos()), node.end()),
+        TextRange::new(skip_trivia(&source_file_text(file), node.pos()), node.end()),
     )
 }
 
@@ -1520,7 +1528,7 @@ fn set_content_mapper_diagnostic_location(
     if source_file.is_some() && node.is_some() {
         diagnostic.set_file(source_file);
         diagnostic.set_location(TextRange::new(
-            skip_trivia(source_file_text(source_file), node.pos()),
+            skip_trivia(&source_file_text(source_file), node.pos()),
             node.end(),
         ));
     }

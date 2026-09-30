@@ -12,7 +12,7 @@ impl Checker {
                 pos = range_.pos();
             } else {
                 pos = skip_trivia(
-                    source_file_text(get_source_file_of_node(node)),
+                    &source_file_text(get_source_file_of_node(node)),
                     range_.pos(),
                 );
             }

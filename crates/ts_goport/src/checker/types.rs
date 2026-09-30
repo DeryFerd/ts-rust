@@ -16,6 +16,7 @@
 //! write them like Go code in the same package does.
 
 use crate::jsnum::{Number, PseudoBigInt};
+use crate::leak_arena::LeakArena;
 use crate::prelude::*;
 
 /// An immutable list. It works like a Go slice over an array that is never
@@ -321,9 +322,9 @@ thread_local! {
     /// process. They live as long as the checker, which is never dropped
     /// there (`program.rs` forgets it at thread exit), so each one costs a
     /// pointer bump, not a malloc. The arena is leaked and never frees, like
-    /// the AST arena in `ast/store.rs`.
-    static CHECKER_ARENA: &'static bumpalo::Bump =
-        Box::leak(Box::new(bumpalo::Bump::with_capacity(1 << 20)));
+    /// the AST arena in `ast/store.rs`. rss2: it grows in fixed-size chunks
+    /// (`LeakArena`).
+    static CHECKER_ARENA: &'static LeakArena = LeakArena::leak();
 }
 
 /// Whether new checker data goes in this thread's `CHECKER_ARENA`: only in
@@ -339,7 +340,7 @@ fn use_checker_arena() -> bool {
 /// This thread's leaked checker arena. The `&'static Bump` is taken out of
 /// the thread local first, so the allocation runs outside `with`.
 #[inline]
-fn checker_arena() -> &'static bumpalo::Bump {
+fn checker_arena() -> &'static LeakArena {
     CHECKER_ARENA.with(|arena| *arena)
 }
 
@@ -809,7 +810,8 @@ impl TypeAliasExt for Option<Rc<TypeAlias>> {
 // PORT: layout only. `repr(C)` keeps the hot header (flags, ids, alias) in
 // front of `data`, and `align(64)` starts each arena type on a cache line, so
 // a flags test and the `TypeData` tag read share one line. The header is 24
-// bytes and `TypeData` 168, so the size stays 192 (3 lines).
+// bytes and `TypeData` 104 (`TypeReference` is the largest kind), so the size
+// is 128 (2 lines).
 // Go: checker/types.go:666 Type
 #[derive(Clone, Default)]
 #[repr(C, align(64))]
@@ -822,8 +824,15 @@ pub struct Type {
     pub data: TypeData, // Type specific data
 }
 
-// The alignment must not grow a type past 3 cache lines.
-const _: () = assert!(std::mem::size_of::<Type>() <= 192);
+// A type must stay 2 cache lines. A rare or large field of a common kind
+// goes out of line (see `ObjectType` and `StructuredType`).
+const _: () = assert!(std::mem::size_of::<Type>() <= 128);
+// The first line holds the header and the first 40 bytes of `TypeData`: for
+// a type reference, the memo (the `TypeData` tag), the type arguments, the
+// target and the mapper (see `TypeReference`).
+const _: () = assert!(std::mem::offset_of!(Type, data) == 24);
+const _: () = assert!(std::mem::offset_of!(TypeReference, object.mapper) + 4 <= 40);
+const _: () = assert!(std::mem::size_of::<TypeData>() == std::mem::size_of::<TypeReference>());
 
 #[cold]
 #[inline(never)]
@@ -1782,28 +1791,139 @@ pub struct ConstrainedType {
 
 // StructuredType (base of all types with members)
 
+// PORT: layout only. Go `signatures`, `callSignatureCount`, `indexInfos` and
+// `objectTypeWithoutAbstractConstructSignatures` are in `StructuredSignatures`,
+// out of line, so `Type` fits in 2 cache lines (see `Type`). Most type
+// references have none of them (effect: 8.5% have signatures and 16% index
+// infos), and the lists are 24 bytes each. Read them with the methods below
+// and write them with `set_signatures` and
+// `set_object_type_without_abstract_construct_signatures`.
+// PORT: layout only. `repr(C)` keeps this field order (see `ObjectType`).
 // Go: checker/types.go:917 StructuredType
 #[derive(Clone, Debug, Default)]
+#[repr(C)]
 pub struct StructuredType {
     pub constrained: ConstrainedType,
     pub members: SymbolTable,
+    /// `None` is empty lists, a zero count and a nil
+    /// `object_type_without_abstract_construct_signatures`.
+    pub signatures_data: Option<ArenaBox<StructuredSignatures>>,
     pub properties: SharedList<SymbolId>,
-    pub signatures: SharedList<SignatureId>, // Signatures (call + construct)
-    pub call_signature_count: i32,           // Count of call signatures
-    pub index_infos: SharedList<IndexInfoId>,
-
-    pub object_type_without_abstract_construct_signatures: TypeId,
 }
 
+/// The out-of-line fields of `StructuredType`.
+///
+/// PERF: `align(64)`, so a record never spans 2 cache lines. `repr(C)` puts
+/// the signatures and their count first.
+// Go: checker/types.go:917 StructuredType
+#[derive(Clone, Debug, Default)]
+#[repr(C, align(64))]
+pub struct StructuredSignatures {
+    pub signatures: SharedList<SignatureId>, // Signatures (call + construct)
+    pub call_signature_count: i32,           // Count of call signatures
+    pub object_type_without_abstract_construct_signatures: TypeId,
+    pub index_infos: SharedList<IndexInfoId>,
+}
+
+const _: () = assert!(std::mem::size_of::<StructuredSignatures>() == 64);
+
 impl StructuredType {
+    /// Go `signatures`: the call signatures, then the construct signatures.
+    #[inline]
+    pub fn signatures(&self) -> &[SignatureId] {
+        match &self.signatures_data {
+            Some(d) => &d.signatures,
+            None => &[],
+        }
+    }
+
+    /// Go `signatures` as a shared list (a copy of no elements).
+    pub fn signatures_list(&self) -> SharedList<SignatureId> {
+        match &self.signatures_data {
+            Some(d) => d.signatures.clone(),
+            None => SharedList::default(),
+        }
+    }
+
+    /// Go `callSignatureCount`.
+    #[inline]
+    pub fn call_signature_count(&self) -> i32 {
+        self.signatures_data
+            .as_ref()
+            .map_or(0, |d| d.call_signature_count)
+    }
+
+    /// Go `indexInfos`.
+    #[inline]
+    pub fn index_infos(&self) -> &[IndexInfoId] {
+        match &self.signatures_data {
+            Some(d) => &d.index_infos,
+            None => &[],
+        }
+    }
+
+    /// Go `indexInfos` as a shared list (a copy of no elements).
+    pub fn index_infos_list(&self) -> SharedList<IndexInfoId> {
+        match &self.signatures_data {
+            Some(d) => d.index_infos.clone(),
+            None => SharedList::default(),
+        }
+    }
+
+    /// Go `objectTypeWithoutAbstractConstructSignatures`.
+    pub fn object_type_without_abstract_construct_signatures(&self) -> TypeId {
+        self.signatures_data.as_ref().map_or(TypeId::NIL, |d| {
+            d.object_type_without_abstract_construct_signatures
+        })
+    }
+
+    /// Sets Go `signatures`, `callSignatureCount` and `indexInfos`. Empty
+    /// lists on a type with no `signatures_data` make none.
+    pub fn set_signatures(
+        &mut self,
+        signatures: SharedList<SignatureId>,
+        call_signature_count: i32,
+        index_infos: SharedList<IndexInfoId>,
+    ) {
+        match &mut self.signatures_data {
+            Some(d) => {
+                d.signatures = signatures;
+                d.call_signature_count = call_signature_count;
+                d.index_infos = index_infos;
+            }
+            None if signatures.is_empty() && index_infos.is_empty() => {}
+            None => {
+                self.signatures_data = Some(ArenaBox::new(StructuredSignatures {
+                    signatures,
+                    call_signature_count,
+                    object_type_without_abstract_construct_signatures: TypeId::NIL,
+                    index_infos,
+                }));
+            }
+        }
+    }
+
+    /// Sets Go `objectTypeWithoutAbstractConstructSignatures`.
+    pub fn set_object_type_without_abstract_construct_signatures(&mut self, t: TypeId) {
+        self.signatures_data
+            .get_or_insert_with(|| ArenaBox::new(StructuredSignatures::default()))
+            .object_type_without_abstract_construct_signatures = t;
+    }
+
     // Go: checker/types.go:930 StructuredType.CallSignatures
     pub fn call_signatures(&self) -> &[SignatureId] {
-        &self.signatures[..self.call_signature_count as usize]
+        match &self.signatures_data {
+            Some(d) => &d.signatures[..d.call_signature_count as usize],
+            None => &[],
+        }
     }
 
     // Go: checker/types.go:934 StructuredType.ConstructSignatures
     pub fn construct_signatures(&self) -> &[SignatureId] {
-        &self.signatures[self.call_signature_count as usize..]
+        match &self.signatures_data {
+            Some(d) => &d.signatures[d.call_signature_count as usize..],
+            None => &[],
+        }
     }
 
     // Go: checker/types.go:938 StructuredType.Properties
@@ -1855,35 +1975,67 @@ impl StructuredType {
 /// change it to `CacheKeyMap<TypeId>`.
 pub type InstantiationMap = FlatMap<CacheHashKey, TypeId>;
 
+// PORT: Go `instantiations` (the map of type instantiations) is not here.
+// Few object types have one (effect: 7.6k anonymous object types of 129k,
+// 95 type references of 165k), so the 32-byte map would grow every `Type`.
+// An interface or tuple keeps it in `InterfaceType`; any other object type
+// has it in `Checker::object_type_instantiations`, at the index in
+// `instantiations`. Read and write it with `Checker::object_instantiations`
+// and `object_instantiations_mut`.
+// PORT: layout only. `repr(C)` keeps `target` and `mapper` first. An
+// anonymous object type then has them, its members table and its
+// signatures on the first cache line of its `Type` (see `TypeReference`).
 // Go: checker/types.go:975 ObjectType
 #[derive(Clone, Default)]
+#[repr(C)]
 pub struct ObjectType {
-    pub structured: StructuredType,
     pub target: TypeId,   // Target of instantiated type
     pub mapper: MapperId, // Type mapper for instantiated type
-    // PORT: Go nil map is `None`; Go creates it lazily.
-    pub instantiations: Option<InstantiationMap>, // Map of type instantiations
+    pub structured: StructuredType,
+    pub instantiations: InstantiationMapId, // Map of type instantiations
+}
+
+/// The index of an object type's instantiation map in
+/// `Checker::object_type_instantiations`. `NIL` is a Go nil map, and it is
+/// always `NIL` on an interface or tuple (see `ObjectType`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InstantiationMapId(pub u32);
+
+impl InstantiationMapId {
+    pub const NIL: Self = Self(0);
 }
 
 // TypeReference (instantiation of an InterfaceType)
 
+// PORT: layout only. `repr(C)` keeps this field order, so the first cache
+// line of a type reference's `Type` holds the `TypeData` tag (the memo, see
+// `GenericArgumentsMemo`), the type arguments, the target and the mapper.
+// The resolved members and `node` are on the second line.
 // Go: checker/types.go:986 TypeReference
 #[derive(Clone, Default)]
+#[repr(C)]
 pub struct TypeReference {
-    pub object: ObjectType,
-    pub node: Node, // TypeReferenceNode | ArrayTypeNode | TupleTypeNode when deferred, else nil
-    pub resolved_type_arguments: SharedList<TypeId>,
     // PORT: no Go field. Memo of `is_type_reference_with_generic_arguments`
     // for a non-deferred reference with a non-empty resolved list.
     pub generic_arguments_memo: GenericArgumentsMemo,
+    pub resolved_type_arguments: SharedList<TypeId>,
+    pub object: ObjectType,
+    pub node: Node, // TypeReferenceNode | ArrayTypeNode | TupleTypeNode when deferred, else nil
 }
 
 /// Memo state of `Checker::is_type_reference_with_generic_arguments`.
 ///
-/// PORT: layout only. An enum (not a `u8`) leaves invalid values that
-/// `TypeData` uses for its tag, so the byte does not grow `Type`.
+/// PORT: layout only. An enum (not an integer) leaves invalid values that
+/// `TypeData` uses for its tag, so the tag does not grow `Type`. It is
+/// `u64`: the tags of `SharedList` and `Option<ArenaBox>` are 8 bytes wide
+/// too, and of fields with the same number of invalid values the compiler
+/// takes the first one. So the `TypeData` tag is this field, on the first
+/// cache line, and the other kinds fit after it (with a `u32` memo the
+/// compiler took a list tag on the second line, and `TypeData` grew by an
+/// 8-byte tag). The field has 8 bytes of room anyway: the list after it is
+/// 8-byte aligned.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
+#[repr(u64)]
 pub enum GenericArgumentsMemo {
     #[default]
     Unknown = 0,
@@ -1912,6 +2064,10 @@ pub struct InterfaceType {
     pub declared_call_signatures: SharedList<SignatureId>, // Declared call signatures
     pub declared_construct_signatures: SharedList<SignatureId>, // Declared construct signatures
     pub declared_index_infos: SharedList<IndexInfoId>,     // Declared index signatures
+    // PORT: Go `ObjectType.instantiations` of an interface or tuple (see
+    // `ObjectType`): the type references of a generic target, keyed by
+    // their type list. Go nil map is `None`.
+    pub instantiations: Option<InstantiationMap>,
 }
 
 impl InterfaceType {
@@ -2548,8 +2704,18 @@ pub type StringLiteralType = Type;
 // PORT: no Go counterpart. Go allocates each `Type` and `TypeMapper` on its
 // own; the port keeps them in index arenas. A plain `Vec` arena doubles and
 // copies every entry when it grows, and keeps up to half its capacity unused.
-// `ChunkedArena` stores entries in fixed-size chunks, so growing it never
-// moves an entry. Index 0 is the nil dummy, like the other arenas.
+// `ChunkedArena` stores entries in chunks of `ARENA_CHUNK_LEN`, so growing it
+// never moves an entry of a later chunk. Index 0 is the nil dummy, like the
+// other arenas.
+//
+// PERF (rss2): the first chunk starts at `ARENA_FIRST_CAPACITY` entries. It
+// doubles up to `ARENA_CHUNK_STEP` entries, then grows in steps of as many
+// until it is full. A first chunk made at full size was mostly allocated but
+// never written in a small program (query: about 5,300 of 8,192 `Type` slots
+// in each checker), and jemalloc gives the heap huge pages, which make such
+// memory resident. Later chunks are made at full size: a program that fills
+// the first chunk is large, and growing each chunk too cost about 1.5% of
+// check time on hono, zod and effect (rss2 grid: copies and page faults).
 pub struct ChunkedArena<T> {
     chunks: Vec<Vec<T>>,
     len: usize,
@@ -2558,12 +2724,16 @@ pub struct ChunkedArena<T> {
 // PERF: 8,192 entries a chunk. Every `ty(t)` reads the chunk table before the
 // entry, so a smaller table stays in L1 more (elysia: 720 chunks, 17 KB, was
 // 1,440). One chunk of each element type stays under 2 MiB, so a small project
-// does not get a 2 MiB huge page for each arena. `Type` is 192 bytes, so 13 is
+// does not get a 2 MiB huge page for each arena. `Type` is 128 bytes, so 13 is
 // the largest shift under that limit.
 const ARENA_CHUNK_SHIFT: usize = 13;
 const ARENA_CHUNK_LEN: usize = 1 << ARENA_CHUNK_SHIFT;
 const ARENA_CHUNK_MASK: usize = ARENA_CHUNK_LEN - 1;
 const ARENA_CHUNK_MAX_BYTES: usize = 2 << 20;
+/// Each step of the first chunk after it has this many entries adds as many.
+const ARENA_CHUNK_STEP: usize = ARENA_CHUNK_LEN / 4;
+/// The room of the first chunk when the arena is made.
+const ARENA_FIRST_CAPACITY: usize = 64;
 const _: () = assert!(std::mem::size_of::<Type>() * ARENA_CHUNK_LEN < ARENA_CHUNK_MAX_BYTES);
 const _: () = assert!(std::mem::size_of::<TypeMapper>() * ARENA_CHUNK_LEN < ARENA_CHUNK_MAX_BYTES);
 
@@ -2571,10 +2741,10 @@ impl<T> ChunkedArena<T> {
     /// Creates an arena that holds only `nil`, the dummy entry at index 0.
     pub fn with_nil(nil: T) -> Self {
         let mut arena = ChunkedArena {
-            chunks: Vec::new(),
-            len: 0,
+            chunks: vec![Vec::with_capacity(ARENA_FIRST_CAPACITY)],
+            len: 1,
         };
-        arena.push(nil);
+        arena.chunks[0].push(nil);
         arena
     }
 
@@ -2602,16 +2772,22 @@ impl<T> ChunkedArena<T> {
     /// PERF: with `push(make())` the value is built first, and the grow
     /// branch of `Vec::push` then sits between building and storing, so the
     /// value goes to the stack and is copied with `memcpy`. Here the room
-    /// test comes first. It never fails: a chunk is made with room for
-    /// `ARENA_CHUNK_LEN` entries and the entry after a full chunk gets a new
+    /// tests come first. The second one never fails: a full first chunk gets
+    /// its next step (`grow_chunk`), a later chunk is made with room for
+    /// `ARENA_CHUNK_LEN` entries, and the entry after a full chunk gets a new
     /// chunk. When `make` makes no call, LLVM knows the chunk did not change
-    /// and drops the grow branch of the `Vec::push` below.
+    /// after the second test and drops the grow branch of the `Vec::push`
+    /// below. When the first test fails (no step), the second one is known to
+    /// fail too, so the hot path makes one test, as before.
     #[inline(always)]
     pub fn push_with(&mut self, make: impl FnOnce() -> T) {
         if self.len & ARENA_CHUNK_MASK == 0 {
             self.add_chunk();
         }
         let chunk = self.chunks.last_mut().expect("arena chunk");
+        if chunk.len() == chunk.capacity() {
+            grow_chunk(chunk);
+        }
         if chunk.len() == chunk.capacity() {
             arena_chunk_full();
         }
@@ -2627,7 +2803,17 @@ impl<T> ChunkedArena<T> {
     }
 }
 
-/// The last arena chunk has no room. `push_with` never gets here.
+/// Gives the full first chunk room for its next `ARENA_CHUNK_STEP` entries,
+/// or doubles it while it is smaller than that. Later chunks are made full
+/// size and never get here.
+#[cold]
+#[inline(never)]
+fn grow_chunk<T>(chunk: &mut Vec<T>) {
+    chunk.reserve_exact(chunk.len().min(ARENA_CHUNK_STEP));
+}
+
+/// The last arena chunk has no room after `grow_chunk`. `push_with` never
+/// gets here.
 #[cold]
 #[inline(never)]
 fn arena_chunk_full() -> ! {

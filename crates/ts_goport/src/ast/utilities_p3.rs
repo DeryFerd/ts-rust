@@ -1303,7 +1303,7 @@ pub fn for_each_dynamic_import_or_require_call(
 ) -> bool {
     let is_java_script_file = is_in_js_file(file);
     let text = source_file_text(file);
-    let (mut last_index, mut size) = find_import_or_require(text, 0);
+    let (mut last_index, mut size) = find_import_or_require(&text, 0);
     while last_index >= 0 {
         let node = get_node_at_position(
             file,
@@ -1329,7 +1329,7 @@ pub fn for_each_dynamic_import_or_require_call(
         }
         // skip past import/require
         last_index += size;
-        (last_index, size) = find_import_or_require(text, last_index);
+        (last_index, size) = find_import_or_require(&text, last_index);
     }
     false
 }

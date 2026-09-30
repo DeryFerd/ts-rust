@@ -188,11 +188,11 @@ child_test! {
             &lsproto::CUSTOM_SET_CONTENT_MAPPER_CONTRIBUTIONS_INFO,
             lsproto::SetContentMapperContributionsParams {
                 open_documents: vec![document(&u)],
-                contributions: vec![lsproto::ContentMapperContribution {
+                contributions: vec![Some(lsproto::ContentMapperContribution {
                     contributor_id: "test".to_string(),
                     extensions: vec![".vue".to_string(), ".svelte".to_string()],
                     inferred_project_contribution: None,
-                }],
+                })],
             },
         );
         assert!(result.is_some() && msg.error.is_none());
@@ -311,10 +311,10 @@ child_test! {
         client.send_notification(
             &lsproto::WORKSPACE_DID_CHANGE_WATCHED_FILES_INFO,
             lsproto::DidChangeWatchedFilesParams {
-                changes: vec![lsproto::FileEvent {
+                changes: vec![Some(lsproto::FileEvent {
                     uri: uri("file:///home/project/tsconfig.json"),
                     type_: lsproto::FileChangeType::CHANGED,
-                }],
+                })],
             },
         );
         let (hover_msg, hover) = client.send_request(

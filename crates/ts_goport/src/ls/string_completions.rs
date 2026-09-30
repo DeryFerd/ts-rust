@@ -2904,7 +2904,7 @@ impl LanguageService {
         let token = astnav::get_token_at_position(file, position);
         let comment_ranges = get_leading_comment_ranges(
             &NodeFactory::default(),
-            source_file_text(file),
+            &source_file_text(file),
             token.pos(),
         );
 

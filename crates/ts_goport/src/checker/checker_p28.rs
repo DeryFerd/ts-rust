@@ -111,13 +111,7 @@ impl Checker {
         object_flags: ObjectFlags,
     ) -> TypeId {
         let id = self.get_type_list_key(type_arguments);
-        if let Some(instantiations) = &self
-            .ty(target)
-            .as_interface_type()
-            .reference
-            .object
-            .instantiations
-        {
+        if let Some(instantiations) = &self.ty(target).as_interface_type().instantiations {
             if let Some(&t) = instantiations.get(&id) {
                 return t;
             }
@@ -137,8 +131,6 @@ impl Checker {
         // panics when the map is nil. The same happens here.
         self.ty_mut(target)
             .as_interface_type_mut()
-            .reference
-            .object
             .instantiations
             .as_mut()
             .expect("assignment to entry in nil map")
@@ -259,9 +251,7 @@ impl Checker {
         };
         let data = self.ty_mut(t).as_structured_type_mut();
         data.properties = properties;
-        data.signatures = signatures;
-        data.call_signature_count = call_signature_count as i32;
-        data.index_infos = index_infos;
+        data.set_signatures(signatures, call_signature_count as i32, index_infos);
     }
 
     // Go: checker/checker.go:25070 newTypeParameter

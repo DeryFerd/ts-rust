@@ -112,6 +112,29 @@ pub fn go_wait_group_task<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// Runs `f` as the goroutine of Go `sync.WaitGroup.Go(f)` where the port
+/// runs it inline, inside work that a caller's `recover()` guards (the
+/// autoimport registry build under a request). A Go `recover()` sees only
+/// its own goroutine, so in Go a panic in `f` ends the process whatever the
+/// caller recovers: the runtime prints the value with
+/// ` [recovered, repanicked]` (see `go_wait_group_task`) and exits
+/// `EXIT_GO_PANIC`. The port does the same for a `go_panic` value. Any
+/// other payload is a port gap and continues as it is, so the caller's
+/// guard still catches it.
+pub fn go_wait_group_goroutine<R>(f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(mut payload) => {
+            let Some(panic) = payload.downcast_mut::<GoPanic>() else {
+                std::panic::resume_unwind(payload)
+            };
+            panic.repanicked = true;
+            print_go_panic(payload.as_ref());
+            std::process::exit(EXIT_GO_PANIC)
+        }
+    }
+}
+
 /// `go_panic` with the Go runtime text for a nil pointer dereference, at a
 /// site where the pinned Go dereferences nil on the same input. It is cold
 /// and out of line, so the nil check at a hot site is one compare.

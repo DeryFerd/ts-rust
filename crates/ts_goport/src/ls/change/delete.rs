@@ -201,7 +201,7 @@ fn delete_default_import(t: &mut Tracker, source_file: Node, import_clause: Node
         if next_token.is_some() && next_token.kind() == SyntaxKind::CommaToken {
             // shift first non-whitespace position after comma to the start position of the node
             let end = skip_trivia_ex(
-                source_file_text(source_file),
+                &source_file_text(source_file),
                 next_token.end(),
                 Some(&SkipTriviaOptions {
                     stop_after_line_break: false,
@@ -412,7 +412,7 @@ impl Tracker {
             false,
         );
         skip_trivia_ex(
-            source_file_text(source_file),
+            &source_file_text(source_file),
             start,
             Some(&SkipTriviaOptions {
                 stop_after_line_break: false,
@@ -452,7 +452,7 @@ impl Tracker {
             if is_separator(prev_node, prev_token) {
                 let text = source_file_text(source_file);
                 let pos = skip_trivia_ex(
-                    text,
+                    &text,
                     token.end(),
                     Some(&SkipTriviaOptions {
                         stop_after_line_break: true,

@@ -31,11 +31,12 @@ impl CommandLineOptionKind {
 // Go: tsoptions/commandlineoption.go:200 CompilerOptionsValue
 // PORT: Go `any` becomes a closed enum with one variant per dynamic type
 // that tsoptions stores in an `any`. `Nil` is Go untyped nil. `Int` is a Go
-// `int`, `Number` a JSON `float64`. `List` is `[]any` and `Map` is
-// `*collections.OrderedMap[string, any]`. `StringList`, `Paths` and
-// `IntPtr` are the typed `[]string`, `*OrderedMap[string, []string]` and
-// `*int` values of `core.CompilerOptions` fields (a typed nil pointer is not
-// Go untyped nil, so these keep their own `None`).
+// `int`, `Number` a JSON `float64`. `List` is a non-nil `[]any`, `NilList`
+// a nil `[]any`, and `Map` is `*collections.OrderedMap[string, any]`.
+// `StringList`, `Paths` and `IntPtr` are the typed `[]string`,
+// `*OrderedMap[string, []string]` and `*int` values of `core.CompilerOptions`
+// fields (a typed nil pointer is not Go untyped nil, so these keep their own
+// `None`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum CompilerOptionsValue {
     #[default]
@@ -56,6 +57,14 @@ pub enum CompilerOptionsValue {
     WatchDirectoryKind(WatchDirectoryKind),
     PollingKind(PollingKind),
     List(Vec<CompilerOptionsValue>),
+    /// Go `[]any(nil)` in an `any`, which is not Go nil. It is a slice to
+    /// `reflect` and `.([]any)` with no elements, and it stays nil through
+    /// `core.MapIndex`, `core.Filter`, `core.Map` and `ParseStringArray`, so
+    /// the option is unset. JSON conversion makes it for an array whose
+    /// elements are all null, `convertJsonOptionOfListType` for a value that
+    /// is not an array, and `ParseListTypeOption` for a list that filters to
+    /// nothing.
+    NilList,
     Map(IndexMap<String, CompilerOptionsValue>),
     StringList(Vec<String>),
     Paths(Option<IndexMap<String, Option<Vec<String>>>>),
@@ -69,6 +78,16 @@ impl CompilerOptionsValue {
     #[must_use]
     pub fn is_nil(&self) -> bool {
         matches!(self, CompilerOptionsValue::Nil)
+    }
+
+    /// Go `value.([]any)`: the elements of a `List` or a `NilList`.
+    #[must_use]
+    pub fn as_any_slice(&self) -> Option<&[CompilerOptionsValue]> {
+        match self {
+            CompilerOptionsValue::List(list) => Some(list),
+            CompilerOptionsValue::NilList => Some(&[]),
+            _ => None,
+        }
     }
 }
 

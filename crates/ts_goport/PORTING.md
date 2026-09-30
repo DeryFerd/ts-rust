@@ -252,29 +252,33 @@ methods reach the AST through it.
   off.
 - Store columns and the other registry tables of a published file are read
   through one file lookup, `file_block` in `ast/store.rs` (AST node records
-  step 3). Each published file id has one block (`FileBlock`: records,
-  kids, node column and a `BlockFile` with the facts, root, foreign
-  parents, links, and the store and `GoFile` of a static publish), in a
+  step 3). Each published file id has one block (`FileBlock`: kinds,
+  records, kids and a `BlockFile` with the node column, facts, root,
+  foreign parents, links, and the store and `GoFile` of a static
+  publish), in a
   static array for ids below 2^16 (`FILE_BLOCKS`, one cache line per
   entry) and in chunks made on demand above (`HIGH_BLOCKS`, read in a cold
-  block that calls the empty `high_block_path`). So the first program, a later program (`tsc -b`, watch,
-  an edited file) and the node shell of a freeable version read the same
-  way: a hot node read is two dependent loads, and has no call. The block
-  of a freeable version is its node shell (records, kids and foreign
+  block that calls the empty `high_block_path`). So the first program, a
+  later program (`tsc -b`, watch, an edited file) and the node shell of a
+  freeable version read the same way: a hot node read is two dependent
+  loads, and has no call. The block of a freeable version is its node
+  shell (records and kids in a pooled block, step 4; kinds and foreign
   parents leaked; no node column when its store owns its nodes; no link
   column), so its header and child reads are block reads, and its node
   data reads read the pinned version (`static_store_node`,
   `with_scoped_store_node`). A read of the store or the `GoFile` of a
   node shell reads the pinned version out of line
   (`with_published_store`, `try_with_go_file`); `static_go_file` gives
-  `None` there. A new per-slot column goes into a record or kids word; a
-  new per-file table goes into `BlockFile`. Keep the fast paths free of
+  `None` there. A new per-slot column goes into a record or kids word (the
+  kind column is the one exception, see "Node records"); a new per-file
+  table goes into `BlockFile`. Keep the fast paths free of
   calls: a call there made `Node::parent` go out of line (AST node records
   step 2b). A node shell has no link column, so `frozen_store_children`
   gives `None` and the caller reads the node data.
-- Node records (AST node records plan steps 1 to 3, `ast/store.rs`).
-  Each store slot has one 32-byte `NodeRecord` (kind, bits, flags, loc,
-  `up` and `bind`) and one 16-byte `NodeKids` (the U4 and C2 child ids,
+- Node records (AST node records plan steps 1 to 4, `ast/store.rs`).
+  Each store slot has one 32-byte `NodeRecord` (bits, flags, loc,
+  `up` and `bind`), a `SyntaxKind` in the kind column (`FileStore::kinds`)
+  and one 16-byte `NodeKids` (the U4 and C2 child ids,
   and a word with the U1 name of an identifier or the U1 (b) modifier
   bits of any other slot). They replace the header, kind, name, modifier
   bit, child and resolved columns. `up` of a node slot holds the parent
@@ -297,13 +301,51 @@ methods reach the AST through it.
   the halves of one word. A live bind hands its builder
   (`NodeBindBuilder`) to the install; a lib bind snapshot load hands the
   compact form (`NodeBindParts`), which the lib bind blob keeps.
-  A record read of a node of a dead freeable version (its node shell is
-  leaked) gives the values of that node; its extras read still panics. The
-  kind is a plain field: safe Rust has no inline u16 to `SyntaxKind`
-  conversion, and a slot kind never changes. A new per-slot field of the
-  hot reads goes into a record or kids word, not a new column. Debug builds
-  check the records and kids against the node data at freeze
-  (`debug_check_kids`), and each parent write against its stored form.
+  The kind is a plain `SyntaxKind` column, not a record word (step 4): a
+  pooled block takes another file's records through a shared ref, so a
+  record word must be an atomic, and safe Rust has no cheap `u16` to
+  `SyntaxKind`. An `AtomicU16` kind read through a 512-entry table cost
+  `goport -p` +1.3% to +2.1% instructions against step 7, and a
+  `transmute` of the atomic load (not allowed here) still +0.6% to
+  +1.1%; `SyntaxKind::try_from` is a 351-case switch until late in LLVM's
+  pipeline, so the inliner left it or `frozen_store_kind` out of line at
+  thousands of call sites (+3% to +7.6%). The column costs 2 bytes per
+  slot, and a node shell leaks its column unless one of the last 4 shells
+  had the same kinds (`shell_kinds`). A new per-slot field of the hot reads goes into a record or kids
+  word, not a new column. Debug builds check the records and kids against
+  the node data at freeze (`debug_check_kids`), and each parent write
+  against its stored form.
+- Pooled node blocks and the owner check (AST node records step 4,
+  `BlockPool` in `ast/store.rs`). The node shell of a freeable version
+  copies its records and kids into a pooled block (a leaked block of
+  records and kids, 48 bytes per slot, with room for about 1/8 more slots
+  and 64 more). The version gives the block back when it dies; it waits
+  in a quarantine until 2 more program releases (`pin_epoch`), then a
+  later node shell of a size it fits (`len` to `2 * len + 64` slots) takes
+  it. In a language server the version that dies in the release of edit N
+  gives its block to the version of edit N + 3. `bind` of the nil slot
+  holds the owner (file id + 1), written at the publish. With debug
+  assertions every `file_block` read checks it and panics with "file
+  version N is released", as a read of a dead version's store does. A
+  release build checks it only in `bind_store_records`, the one writer of
+  a published record; its hot header and kids reads are not checked (a
+  check is a load, a compare and a branch on reads of about 6
+  instructions). So a stale header or child read of a dead version
+  (parent, loc, flags, symbol, flow node, child ids, name) gives the
+  values of that node while its block waits, and the new owner's data
+  after a reuse, never undefined behavior. Its kind column is never
+  reused, so a stale kind read gives the old kind. Its store, `GoFile`, extras,
+  flow, node data and list reads still panic. Every holder of a node of a
+  version holds the version, so a correct reader never sees a reuse; the
+  debug-assertion runs (protected tests, the corpus, and the editor and
+  oracle runs) find a missed holder. This is the owner check that the R141
+  reviewer asked for before any step that reuses records: it replaces step
+  2's tripwire (`freeable_version_owns_its_lists_and_a_stale_read_panics`
+  reads the old values inside the quarantine), and
+  `edited_file_blocks_wait_two_releases_then_get_reused` and
+  `pooled_node_blocks_wait_two_releases_and_check_their_owner` check the
+  panic after a reuse. The extras and flow nodes of a node shell stay in
+  its `GoFile` (step 6 moves them into pooled blocks).
 
 ## Program (owned by program.rs)
 
@@ -377,7 +419,8 @@ The batch that adds it is not accepted until Theo approves.
   `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The
   registry keeps a `Weak`. At publish the version takes its `FileStore`
   and its `GoFile` (M3b). Its node records and kids (`NodeRecord`,
-  `NodeKids`; 48 bytes per node) are leaked in its node shell, the registry block of its id, so a header or child
+  `NodeKids`; 48 bytes per node, and 2 in the kind column) are in its node shell, the registry
+  block of its id (a pooled block, AST node records step 4), so a header or child
   read of the edited file stays inline (a pinned read per node read made
   edits 3 to 4 ms slower); the child link column is dropped, and the
   binder's child walk reads the node data. With owned nodes (M3c; on by
@@ -409,8 +452,9 @@ The batch that adds it is not accepted until Theo approves.
   `DECORATORS`) forgets the entries of the file at its next write. Its
   symbols and tables in the binder lineage are whole chunks of its own
   (M3d); after it dies, the next bind frees them, and a read of one of its
-  symbol or table ids panics (index out of bounds). The header columns of
-  the node shell and the text stay leaked for now. The first publish, the
+  symbol or table ids panics (index out of bounds). Its pooled block goes
+  back to the pool (see "Pooled node blocks" above); its small `BlockFile`,
+  its foreign parents and its text stay leaked for now. The first publish, the
   first version of each file and every CLI publish never get one.
   `GOPORT_FREE_FILE_VERSIONS=0` turns this off, `=1` turns it on in any
   process; there `update_program_version` (`goport_multiprog`) also gives
@@ -469,6 +513,16 @@ that keep a run going pass it on (`core::resume_go_panic`), and the bins
 end the run as the Go runtime does. The output written so far stays,
 stderr gets `panic: <message>` (then the port site in place of the
 goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
+
+Go `sync.WaitGroup.Go(f)` recovers a panic in `f` and panics again, so the
+runtime line ends with ` [recovered, repanicked]`. Where the port runs
+such a goroutine on the dispatch thread (background queue tasks, their
+timer continuations, the telemetry ticker, the idle auto-import warm), it
+runs `f` under `core::go_wait_group_task`. Where the port runs it inline
+inside work that a Go `recover()` guards (the auto-import registry build
+under a request), it runs `f` under `core::go_wait_group_goroutine`: a Go
+panic ends the process there, because Go's recover sees only its own
+goroutine.
 
 ## Threads
 
@@ -943,7 +997,12 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   names keep the Go spelling (`HoverParams`, `URI`, `DocumentUri`); fields
   are snake case (`text_document`, `type_`); `*T` is `Option<T>`
   (`Option<Box<T>>` only on a type cycle); `*[]T` is `Option<Vec<T>>`;
-  `[]T` and `[]*T` are `Vec<T>`; `map[K]V` is `IndexMap<K, V>`; LSPAny is
+  `[]T` and `[]*T` are `Vec<T>`, except that `[]*T` is `Vec<Option<T>>`
+  in a type that the server decodes (client-to-server params,
+  server-to-client results, and the types they hold), so a JSON null
+  element is Go's nil element and a nil element encodes as null (the
+  generator's `decodedTypes`). Code that builds such a list wraps each
+  element in `Some`; `map[K]V` is `IndexMap<K, V>`; LSPAny is
   `LspAny`; a string enum is `pub struct MarkupKind(pub Cow<'static, str>)`
   with consts such as `MarkupKind::PLAIN_TEXT`; an int enum is
   `pub struct CompletionItemKind(pub i32)` with consts; method consts are

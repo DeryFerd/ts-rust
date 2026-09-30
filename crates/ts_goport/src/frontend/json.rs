@@ -19,9 +19,14 @@
 //! PORT: without legacy flags every v2 unmarshal error is fatal
 //! (`isFatalError`), so every impl returns the first error. The decoder's
 //! errors are Go's `jsontext.SyntacticError` texts (prefix, JSON pointer and
-//! offset), which the LSP and the API show (`SyntaxErr`). The unmarshal
-//! errors of the impls in this file are not the v2 texts; `json_ext` has the
-//! v2 `SemanticError` texts for the LSP and API types.
+//! offset), which the LSP and the API show (`SyntaxErr`). Most unmarshal
+//! errors of the impls in this file are not the v2 texts; no caller shows
+//! them. The exceptions are the ones the LSP and the API show: a kind
+//! mismatch of a string, a boolean or a number is a v2 `SemanticError`
+//! (`json_ext::unmarshal_kind_error`), and `json_unmarshal_decode` gives a
+//! method's plain error the Go type (as the v2 arshaler of a type with a
+//! method does). `json_ext` has the v2 `SemanticError` texts for the LSP and
+//! API types.
 
 use crate::frontend::prelude::*;
 use std::borrow::Cow;
@@ -2055,8 +2060,9 @@ pub fn json_unmarshal<T: UnmarshalerFrom + ?Sized>(
 // PORT: Go merges `opts` into the decoder options; callers here pass none,
 // so the decoder options apply. The v2 method arshaler is kept: a plain
 // error of the `UnmarshalerFrom` of `T` gets the Go type of `T`
-// (`json_ext::wrap_method_error`), and the method must read exactly one
-// value.
+// (`json_ext::wrap_method_error`), as the v2 arshaler of a type with an
+// `UnmarshalJSONFrom` method does, and an error that already has its type
+// keeps it. The method must read exactly one value.
 pub fn json_unmarshal_decode<T: UnmarshalerFrom + ?Sized>(
     dec: &mut JsonDecoder<'_>,
     out: &mut T,

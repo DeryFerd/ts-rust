@@ -25,8 +25,8 @@ pub fn parse_tristate(value: &CompilerOptionsValue) -> Tristate {
 }
 
 // Go: tsoptions/parsinghelpers.go:28 ParseStringArray
-// PORT: Go returns a nil slice (`None`) when the value is not `[]any`.
-// Go `[]any(nil)` has no `List` form, so `Some` is always a real slice.
+// PORT: Go returns a nil slice (`None`) when the value is not `[]any` and
+// for a nil `[]any` (`NilList`). A `List` gives a non-nil slice.
 pub fn parse_string_array(value: &CompilerOptionsValue) -> Option<Vec<String>> {
     if let CompilerOptionsValue::List(arr) = value {
         let mut result = Vec::with_capacity(arr.len());
@@ -176,7 +176,7 @@ pub fn parse_content_mapper(value: &CompilerOptionsValue) -> (Option<Mapper>, Ve
 // elements are all strings. A missing element or wrong element type yields false.
 // PORT: Go `([]string, bool)` is `Option<Vec<String>>`.
 pub fn parse_string_array_strict(value: &CompilerOptionsValue) -> Option<Vec<String>> {
-    let CompilerOptionsValue::List(arr) = value else {
+    let Some(arr) = value.as_any_slice() else {
         return None;
     };
     let mut result = Vec::with_capacity(arr.len());
@@ -453,7 +453,10 @@ fn parse_compiler_options_worker(
         "paths" => all_options.paths = parse_string_map(value),
         "plugins" => {
             // Native TypeScript does not load plugins; retain them only so tools can report the incompatibility.
-            if let CompilerOptionsValue::List(plugins) = value {
+            // PORT: Go `core.Map` keeps a nil `[]any` (`NilList`) nil.
+            if let CompilerOptionsValue::NilList = value {
+                all_options.plugins = None;
+            } else if let CompilerOptionsValue::List(plugins) = value {
                 all_options.plugins = Some(
                     plugins
                         .iter()
@@ -902,6 +905,10 @@ pub fn convert_option_to_absolute_path(
                     true,
                 );
             }
+            // Go `core.Map` keeps a nil `[]any` nil.
+            if let CompilerOptionsValue::NilList = v {
+                return (CompilerOptionsValue::NilList, true);
+            }
         }
     } else if option.is_file_path {
         if let CompilerOptionsValue::String(value) = v {
@@ -935,5 +942,52 @@ mod tests {
         assert_eq!(target.custom_conditions, Some(Vec::new()));
         assert_eq!(target.types, Some(Vec::new()));
         assert_eq!(target.root_dirs, None);
+    }
+
+    // Go keeps a nil `[]any` nil. An array of nulls and a null list option
+    // leave the option unset, so the extended config keeps its value.
+    #[test]
+    fn nil_list_leaves_list_options_unset() {
+        use crate::frontend::tsoptions::{
+            COMPILER_NAME_MAP, convert_json_option_of_list_type, parse_config_file_text_to_json,
+        };
+        let (json, errors) = parse_config_file_text_to_json(
+            "/tsconfig.json",
+            Path("/tsconfig.json".to_string()),
+            r#"{"types": [null, null], "lib": []}"#,
+        );
+        assert!(errors.is_empty());
+        let CompilerOptionsValue::Map(json) = json else {
+            panic!("tsconfig JSON is an object");
+        };
+        assert_eq!(json["types"], CompilerOptionsValue::NilList);
+        assert_eq!(json["lib"], CompilerOptionsValue::List(Vec::new()));
+
+        let plugins = COMPILER_NAME_MAP.get("plugins").expect("plugins option");
+        let (null_plugins, errors) = convert_json_option_of_list_type(
+            plugins,
+            CompilerOptionsValue::Nil,
+            "/",
+            Node::NIL,
+            Node::NIL,
+            Node::NIL,
+        );
+        assert!(errors.is_empty());
+        assert_eq!(null_plugins, CompilerOptionsValue::NilList);
+
+        let mut source = CompilerOptions::default();
+        parse_compiler_options_worker("types", &json["types"], &mut source);
+        parse_compiler_options_worker("lib", &json["lib"], &mut source);
+        parse_compiler_options_worker("plugins", &null_plugins, &mut source);
+        assert_eq!(source.types, None);
+        assert_eq!(source.lib, Some(Vec::new()));
+        assert_eq!(source.plugins, None);
+
+        let mut target = CompilerOptions {
+            types: Some(vec!["node".to_string()]),
+            ..Default::default()
+        };
+        merge_compiler_options(&mut target, Some(&source), None);
+        assert_eq!(target.types, Some(vec!["node".to_string()]));
     }
 }

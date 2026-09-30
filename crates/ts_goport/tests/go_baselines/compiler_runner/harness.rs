@@ -541,7 +541,7 @@ fn parse_harness_option(
         "includeBuiltFile" => harness_options.include_built_file = as_string(&value),
         "fileName" => harness_options.file_name = as_string(&value),
         "libFiles" => {
-            let CompilerOptionsValue::List(list) = value else {
+            let Some(list) = value.as_any_slice() else {
                 panic!("interface conversion: interface {{}} is not []interface {{}}");
             };
             harness_options.lib_files = list.iter().map(as_string).collect();
@@ -604,9 +604,12 @@ fn get_option_value(
                 .elements()
                 .is_some_and(|elements| elements.is_file_path)
             {
+                // Go `core.Map` keeps a nil list nil.
+                let CompilerOptionsValue::List(list) = list_val else {
+                    return list_val;
+                };
                 return CompilerOptionsValue::List(
-                    list_val
-                        .into_iter()
+                    list.into_iter()
                         .map(|item| {
                             let CompilerOptionsValue::String(item) = item else {
                                 panic!("interface conversion: interface {{}} is not string");
@@ -622,7 +625,7 @@ fn get_option_value(
                     option.name
                 ));
             }
-            CompilerOptionsValue::List(list_val)
+            list_val
         }
         CommandLineOptionKind::OBJECT => fatal(format!(
             "Object type options like '{}' are not supported",

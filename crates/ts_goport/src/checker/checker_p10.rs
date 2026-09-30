@@ -167,7 +167,7 @@ impl Checker {
                         stop_after_line_break: true,
                         ..Default::default()
                     };
-                    let pos = skip_trivia_ex(text, node.expression().end(), Some(&options));
+                    let pos = skip_trivia_ex(&text, node.expression().end(), Some(&options));
                     if is_line_break(text.as_bytes()[(pos - 1) as usize] as char) {
                         related_information = Some(create_diagnostic_for_node(
                             node.expression(),

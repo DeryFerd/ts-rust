@@ -117,7 +117,8 @@ impl LanguageService {
                 &self.converters,
                 &self.user_preferences(),
             );
-            item.additional_text_edits = Some(edits);
+            // Go `&edits`: a `[]*lsproto.TextEdit` of non-nil edits.
+            item.additional_text_edits = Some(edits.into_iter().map(Some).collect());
             item.detail = str_ptr_to(&description);
             return item;
         }
@@ -1550,11 +1551,11 @@ impl LanguageService {
             let first_clause = printer.print_unescaped_node(new_clauses[0]);
             let name = first_clause + " ...";
 
-            let mut additional_text_edits: Option<Vec<lsproto::TextEdit>> = None;
+            let mut additional_text_edits: Option<Vec<Option<lsproto::TextEdit>>> = None;
             if let Some(import_adder) = import_adder.as_mut() {
                 let edits = import_adder.edits();
                 if !edits.is_empty() {
-                    additional_text_edits = Some(edits);
+                    additional_text_edits = Some(edits.into_iter().map(Some).collect());
                 }
             }
 
@@ -1775,7 +1776,7 @@ impl SnippetPrinter {
             });
         }
 
-        apply_bulk_edits(source_file_text(synthetic_file), &all_changes)
+        apply_bulk_edits(&source_file_text(synthetic_file), &all_changes)
     }
 }
 

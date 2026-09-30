@@ -12,6 +12,42 @@ use smallvec::SmallVec;
 //   `get_conditional_type` takes it by value (a cloned `Rc`).
 
 impl Checker {
+    /// Go `t.AsObjectType().instantiations` (nil is `None`). An interface or
+    /// tuple keeps the map in `InterfaceType`, any other object type in
+    /// `object_type_instantiations` (see `ObjectType`).
+    pub fn object_instantiations(&self, t: TypeId) -> Option<&InstantiationMap> {
+        let data = &self.ty(t).data;
+        if let Some(d) = data.as_interface_type() {
+            return d.instantiations.as_ref();
+        }
+        match data.as_object_type()?.instantiations {
+            InstantiationMapId::NIL => None,
+            id => Some(&self.object_type_instantiations[id.0 as usize]),
+        }
+    }
+
+    /// Go `t.AsObjectType().instantiations`, made first when it is nil.
+    pub fn object_instantiations_mut(&mut self, t: TypeId) -> &mut InstantiationMap {
+        if self.ty(t).data.as_interface_type().is_some() {
+            return self
+                .ty_mut(t)
+                .as_interface_type_mut()
+                .instantiations
+                .get_or_insert_with(InstantiationMap::default);
+        }
+        let mut id = self.ty(t).as_object_type().instantiations;
+        if id == InstantiationMapId::NIL {
+            id = InstantiationMapId(
+                u32::try_from(self.object_type_instantiations.len())
+                    .expect("instantiation map overflow"),
+            );
+            self.object_type_instantiations
+                .push(InstantiationMap::default());
+            self.ty_mut(t).as_object_type_mut().instantiations = id;
+        }
+        &mut self.object_type_instantiations[id.0 as usize]
+    }
+
     // Go: checker/checker.go:22203 getObjectTypeInstantiation
     pub fn get_object_type_instantiation(
         &mut self,
@@ -133,27 +169,21 @@ impl Checker {
             key_alias,
             t_object_flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE),
         );
-        if self.ty(target).as_object_type().instantiations.is_none() {
-            let target_alias = self.ty(target).alias.clone();
-            let mut instantiations = InstantiationMap::default();
-            instantiations.insert(
-                get_type_instantiation_key(
+        let mut result = match self.object_instantiations(target) {
+            Some(instantiations) => instantiations.get(&key).copied().unwrap_or_default(),
+            None => {
+                let target_alias = self.ty(target).alias.clone();
+                let target_key = get_type_instantiation_key(
                     &self.symbols,
                     &outer_type_parameters,
                     target_alias.as_deref(),
                     false,
-                ),
-                target,
-            );
-            self.ty_mut(target).as_object_type_mut().instantiations = Some(instantiations);
-        }
-        let mut result = self
-            .ty(target)
-            .as_object_type()
-            .instantiations
-            .as_ref()
-            .and_then(|instantiations| instantiations.get(&key).copied())
-            .unwrap_or_default();
+                );
+                let instantiations = self.object_instantiations_mut(target);
+                instantiations.insert(target_key, target);
+                instantiations.get(&key).copied().unwrap_or_default()
+            }
+        };
         if result.is_nil() {
             let new_alias = alias.or_else(|| {
                 instantiated_alias_symbol.map(|symbol| {
@@ -180,11 +210,7 @@ impl Checker {
             } else {
                 result = self.instantiate_anonymous_type(target, new_mapper, new_alias);
             }
-            self.ty_mut(target)
-                .as_object_type_mut()
-                .instantiations
-                .get_or_insert_with(InstantiationMap::default)
-                .insert(key, result);
+            self.object_instantiations_mut(target).insert(key, result);
             if self
                 .ty(result)
                 .flags

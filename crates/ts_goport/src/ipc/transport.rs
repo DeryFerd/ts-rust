@@ -143,8 +143,8 @@ impl StdioTransport {
         }
         self.used = true;
         Ok(Arc::new(StdioConn {
-            stdin: Mutex::new(self.stdin.take()),
-            stdout: Mutex::new(self.stdout.take()),
+            stdin: Mutex::new(StdioFile::new(self.stdin.take())),
+            stdout: Mutex::new(StdioFile::new(self.stdout.take())),
         }))
     }
 
@@ -169,40 +169,84 @@ impl Transport for StdioTransport {
 // PORT: Go embeds the reader and writer; here each sits behind a mutex so
 // the connection can be shared (`ReadWriteCloser` takes `&self`).
 struct StdioConn {
-    stdin: Mutex<Option<Box<dyn Read + Send>>>,
-    stdout: Mutex<Option<Box<dyn Write + Send>>>,
+    stdin: Mutex<StdioFile<Box<dyn Read + Send>>>,
+    stdout: Mutex<StdioFile<Box<dyn Write + Send>>>,
+}
+
+/// One file of a `StdioConn`: Go's nil interface, an open file, or a file
+/// after `Close`. Go reads, writes or closes a nil one and panics with a nil
+/// dereference; a closed `*os.File` gives an error.
+/// PORT: the error texts name the files that cmd/tsgo passes (`os.Stdin`
+/// and `os.Stdout`); the port's handles carry no name.
+enum StdioFile<T> {
+    Nil,
+    Open(T),
+    Closed,
+}
+
+impl<T> StdioFile<T> {
+    fn new(file: Option<T>) -> StdioFile<T> {
+        file.map_or(StdioFile::Nil, StdioFile::Open)
+    }
+
+    // The file for Go `f.Read` / `f.Write`: `op` is "read" or "write"
+    // (the text of os.File `wrapErr(op, ErrClosed)`).
+    fn file(&mut self, op: &str, name: &str) -> std::io::Result<&mut T> {
+        match self {
+            StdioFile::Nil => crate::core::go_nil_dereference(),
+            StdioFile::Open(file) => Ok(file),
+            StdioFile::Closed => Err(std::io::Error::other(format!(
+                "{op} {name}: file already closed"
+            ))),
+        }
+    }
+
+    // Go `f.Close()`. The port drops the handle; dropping `std::io::Stdin`
+    // or `Stdout` leaves the process stream open and reports no error.
+    fn close(&mut self, name: &str) -> Result<(), GoError> {
+        match self {
+            StdioFile::Nil => crate::core::go_nil_dereference(),
+            StdioFile::Open(_) => {
+                *self = StdioFile::Closed;
+                Ok(())
+            }
+            StdioFile::Closed => Err(errors::new(format!("close {name}: file already closed"))),
+        }
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-// Go reads or writes through a nil io.Reader / io.Writer and panics.
-const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
+const STDIN_NAME: &str = "/dev/stdin";
+const STDOUT_NAME: &str = "/dev/stdout";
 
 impl ReadWriteCloser for StdioConn {
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        lock(&self.stdin).as_mut().expect(NIL_DEREF).read(buf)
+        lock(&self.stdin).file("read", STDIN_NAME)?.read(buf)
     }
 
     fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
-        lock(&self.stdout).as_mut().expect(NIL_DEREF).write(buf)
+        lock(&self.stdout).file("write", STDOUT_NAME)?.write(buf)
     }
 
+    // PORT: Go's `stdioConn` has no flush; its files have no buffer. The
+    // port's protocol writer flushes after each message, so a nil or closed
+    // stdout flushes nothing (the write before it reports the error).
     fn flush(&self) -> std::io::Result<()> {
-        lock(&self.stdout).as_mut().expect(NIL_DEREF).flush()
+        match &mut *lock(&self.stdout) {
+            StdioFile::Open(stdout) => stdout.flush(),
+            StdioFile::Nil | StdioFile::Closed => Ok(()),
+        }
     }
 
     // Go: ipc/transport.go:88 Close
-    // PORT: Go closes both files. The port drops both handles; dropping
-    // `std::io::Stdin` / `Stdout` leaves the process streams open, and a
-    // drop reports no error.
     fn close(&self) -> Result<(), GoError> {
-        let stdin = lock(&self.stdin).take();
-        let stdout = lock(&self.stdout).take();
-        drop(stdin);
-        drop(stdout);
-        Ok(())
+        let err1 = lock(&self.stdin).close(STDIN_NAME);
+        let err2 = lock(&self.stdout).close(STDOUT_NAME);
+        err1?;
+        err2
     }
 }
 
@@ -382,4 +426,44 @@ impl ReadWriteCloser for WindowsPipeConn {
 #[cfg(windows)]
 pub fn generate_pipe_path(name: &str) -> String {
     format!(r"\\.\pipe\{name}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // PORT: no Go test. It checks what Go-B's `stdioConn` does (a Go test
+    // run against pin 16c25522e123): a nil file panics with a nil
+    // dereference, and after Close, `os.Stdin` and `os.Stdout` give "file
+    // already closed".
+    #[test]
+    fn stdio_conn_nil_and_closed_files() {
+        let nil_text = |f: &dyn Fn()| {
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+                .expect_err("a nil file panics");
+            payload
+                .downcast_ref::<crate::core::GoPanic>()
+                .map(|panic| panic.message.clone())
+        };
+        let nil_deref =
+            Some("runtime error: invalid memory address or nil pointer dereference".to_string());
+        let conn = new_stdio_transport(None, None).accept().expect("accept");
+        assert_eq!(nil_text(&|| drop(conn.read(&mut [0; 8]))), nil_deref);
+        assert_eq!(nil_text(&|| drop(conn.write(b"x"))), nil_deref);
+        assert_eq!(nil_text(&|| drop(conn.close())), nil_deref);
+
+        let conn = new_stdio_transport(
+            Some(Box::new(std::io::empty())),
+            Some(Box::new(std::io::sink())),
+        )
+        .accept()
+        .expect("accept");
+        assert!(conn.close().is_ok());
+        let err = conn.read(&mut [0; 8]).expect_err("read after close");
+        assert_eq!(err.to_string(), "read /dev/stdin: file already closed");
+        let err = conn.write(b"x").expect_err("write after close");
+        assert_eq!(err.to_string(), "write /dev/stdout: file already closed");
+        let err = conn.close().expect_err("close again");
+        assert_eq!(err.error(), "close /dev/stdin: file already closed");
+    }
 }

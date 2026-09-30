@@ -15,8 +15,9 @@
 //! The key of a lib file (`ParseKey`) is a compile-time hash of the
 //! parser, scanner, factory, store and node sources, astdata and this file
 //! (`SOURCES_HASH`), a hash of the parse options that the parse reads (file
-//! name, script kind, module indicator options) and the xxh3 hash of the
-//! text. Any mismatch or load error parses the file live, so a stale blob
+//! name, script kind, module indicator options) and two hashes of the text
+//! (xxh3, and `const_hash`, which the embed build has from compile time;
+//! see `lib_snapshot::text_matches`). Any mismatch or load error parses the file live, so a stale blob
 //! costs time, not output. A lib file is found by its base name
 //! (`bundled_lib_name`), so the embed and noembed builds share the blob.
 //!
@@ -39,7 +40,7 @@
 //! stderr.
 //!
 //! Blob layout: `MAGIC`, then the sections as `lib_snapshot::write_blob`
-//! writes them. A section is the key (three u64, little-endian), one byte
+//! writes them. A section is the key (four u64, little-endian), one byte
 //! for `read_module_indicator_options`, then LEB128 varints ("zz" is the
 //! zigzag form of a signed value):
 //! - the slot count (slots after slot 0);
@@ -61,6 +62,7 @@ use crate::ast::store::{lib_parse_slot_views, lib_parse_store_dump};
 use crate::astdata::NodeData;
 use crate::binder::lib_snapshot::{
     MIN_TEXT_LEN, Mode, SnapshotEntry, SnapshotReader, TEXT_BIT, const_hash, mix, read_entries,
+    text_matches,
 };
 use crate::frontend::prelude::*;
 use std::sync::OnceLock;
@@ -162,6 +164,8 @@ struct ParseKey {
     options: u64,
     /// xxh3 of the file text.
     text: u64,
+    /// `const_hash` of the file text (`text_matches`).
+    text_const: u64,
 }
 
 impl ParseKey {
@@ -170,6 +174,7 @@ impl ParseKey {
             sources: SOURCES_HASH,
             options: options_hash(opts, script_kind),
             text: xxh3_64(text.as_bytes()),
+            text_const: const_hash(text.as_bytes()),
         }
     }
 
@@ -177,6 +182,7 @@ impl ParseKey {
         out.extend_from_slice(&self.sources.to_le_bytes());
         out.extend_from_slice(&self.options.to_le_bytes());
         out.extend_from_slice(&self.text.to_le_bytes());
+        out.extend_from_slice(&self.text_const.to_le_bytes());
     }
 
     fn read(r: &mut SnapshotReader<'_>) -> Option<Self> {
@@ -184,6 +190,7 @@ impl ParseKey {
             sources: r.u64()?,
             options: r.u64()?,
             text: r.u64()?,
+            text_const: r.u64()?,
         })
     }
 
@@ -202,7 +209,7 @@ impl ParseKey {
         if self.options != options_hash(opts, script_kind) {
             return Err("options");
         }
-        if self.text != xxh3_64(text.as_bytes()) {
+        if !text_matches(self.text, self.text_const, text) {
             return Err("text");
         }
         Ok(())
@@ -847,8 +854,9 @@ impl<'a> Decoder<'a> {
             store: self.store,
             root: self.node()?,
             parse_options: opts.clone(),
-            text,
+            text: FileText::Static(text),
             end_of_file_token: self.node()?,
+            hash: std::cell::Cell::new(None),
             diagnostics: self.diagnostics()?,
             js_diagnostics: self.diagnostics()?,
             jsdoc_diagnostics: self.diagnostics()?,
@@ -1608,6 +1616,7 @@ impl Encoder {
             parse_options: _,
             text: _,
             end_of_file_token,
+            hash: _,
             diagnostics,
             js_diagnostics,
             jsdoc_diagnostics,
@@ -1906,7 +1915,10 @@ mod tests {
     ) {
         assert_eq!(loaded.file.parse_options, live.file.parse_options, "{lib}");
         assert!(
-            std::ptr::eq(loaded.file.text, live.file.text),
+            std::ptr::eq(
+                loaded.file.text.as_static().expect("a lib text is static"),
+                live.file.text.as_static().expect("a lib text is static")
+            ),
             "{lib}: text"
         );
         assert!(

@@ -333,11 +333,12 @@ fn get_name_of_compiler_option_value(
 }
 
 /// Go `reflect.Value.IsZero` on one `core.CompilerOptions` field.
-// PORT: all six Go `[]string` fields are `Option<Vec<String>>` in Rust, and
+// PORT: all six Go `[]string` fields and the Go `[]PluginImport` field
+// (ts#64397) are `Option<Vec<_>>` in Rust, and
 // `compiler_options_field_values` lists `None` as an empty list. The shared
-// helper reads `Lib` and `TypeRoots` from the struct; the other four are
-// read here, so a Go non-nil empty slice (for example `"types": []`) is not
-// zero and is shown, as in Go.
+// helper reads `Lib` and `TypeRoots` from the struct; the other five are
+// read here, so a Go non-nil empty slice (for example `"types": []` or
+// `"plugins": []`) is not zero and is shown, as in Go.
 fn is_zero_show_config_field(
     field_name: &str,
     value: &CompilerOptionsValue,
@@ -348,6 +349,7 @@ fn is_zero_show_config_field(
         "ModuleSuffixes" => options.module_suffixes.is_none(),
         "RootDirs" => options.root_dirs.is_none(),
         "Types" => options.types.is_none(),
+        "Plugins" => options.plugins.is_none(),
         _ => is_zero_compiler_option_value(field_name, value, options),
     }
 }
@@ -674,5 +676,25 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "{\n    \"compilerOptions\": {},\n    \"references\": [\n        {\n            \"path\": \"./packages/a\"\n        },\n        {\n            \"path\": \"./packages/b/tsconfig.json\",\n            \"circular\": true\n        }\n    ]\n}"
         );
+    }
+
+    // ts#64397: Go `reflect.Value.IsZero` of `Plugins` is false for a
+    // non-nil empty slice, so tsgo `--showConfig` prints `"plugins": []`
+    // for a config that sets it, and nothing for a config that does not.
+    #[test]
+    fn show_config_keeps_an_empty_plugins_list() {
+        let compare = ComparePathsOptions::default();
+        let shown = |plugins: Option<Vec<crate::options::PluginImport>>| {
+            let options = CompilerOptions {
+                plugins,
+                ..CompilerOptions::default()
+            };
+            serialize_compiler_options(&options, "/project/tsconfig.json", &compare)
+        };
+        assert_eq!(
+            shown(Some(Vec::new())).get("plugins"),
+            Some(&CompilerOptionsValue::List(Vec::new()))
+        );
+        assert_eq!(shown(None).get("plugins"), None);
     }
 }

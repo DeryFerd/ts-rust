@@ -486,7 +486,7 @@ impl LanguageService {
     ) -> Option<DocSymbol> {
         let mut name = name;
         let file = get_source_file_of_node(node);
-        let node_start_pos = skip_trivia(source_file_text(file), node.pos());
+        let node_start_pos = skip_trivia(&source_file_text(file), node.pos());
         if name.is_nil() {
             name = get_name_of_declaration(node);
         }
@@ -495,12 +495,12 @@ impl LanguageService {
         let name_end_pos: i32;
         if is_module_declaration(node) && !is_ambient_module(node) {
             text = get_module_name(node);
-            name_start_pos = skip_trivia(source_file_text(file), name.pos());
+            name_start_pos = skip_trivia(&source_file_text(file), name.pos());
             name_end_pos = get_interior_module(node).name().end();
         } else if is_any_export_assignment(node) && node.is_export_equals() {
             text = "export=".to_string();
             if !node_is_missing(name) {
-                name_start_pos = skip_trivia(source_file_text(file), name.pos());
+                name_start_pos = skip_trivia(&source_file_text(file), name.pos());
                 name_end_pos = name.end();
             } else {
                 name_start_pos = node_start_pos;
@@ -509,7 +509,7 @@ impl LanguageService {
         } else if name.is_some() {
             text = get_text_of_name(name);
             name_start_pos = i32::max(
-                skip_trivia(source_file_text(file), name.pos()),
+                skip_trivia(&source_file_text(file), name.pos()),
                 node_start_pos,
             );
             name_end_pos = i32::max(name.end(), node_start_pos);

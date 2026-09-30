@@ -504,6 +504,7 @@ impl Printer {
         // PERF: clear the one-entry caches of the current file (printer_p1).
         self.current_original_cache.take();
         self.current_line_map_cache.take();
+        self.current_text_cache.take();
         self.unique_helper_names = None;
         self.external_helpers_module_name = Node::NIL;
         if source_file.is_some() {
@@ -771,14 +772,14 @@ impl Printer {
             // Still skip trivia so that the returned pos correctly identifies the token position.
             // This is needed for trailing source map positions (writeTokenText advances pos by token length).
             if self.current_source_file.is_some() && !position_is_synthesized(pos) {
-                pos = skip_trivia(source_file_text(self.current_source_file), pos);
+                pos = skip_trivia(&self.current_source_file_text(), pos);
             }
             return (None, pos);
         }
 
         let start_pos = pos;
         if self.current_source_file.is_some() {
-            pos = skip_trivia(source_file_text(self.current_source_file), start_pos);
+            pos = skip_trivia(&self.current_source_file_text(), start_pos);
         }
 
         let node = self.emit_context.parse_node(context_node);
@@ -1081,7 +1082,7 @@ impl Printer {
         }
 
         let mut comments: Vec<CommentRange> = Vec::new();
-        for comment in get_leading_comment_ranges(source_file_text(self.current_source_file), pos) {
+        for comment in get_leading_comment_ranges(&self.current_source_file_text(), pos) {
             if self.should_write_comment(comment)
                 && self.should_emit_comment_if_triple_slash(comment, triple_slash)
             {
@@ -1150,8 +1151,7 @@ impl Printer {
         }
 
         let mut comments: Vec<CommentRange> = Vec::new();
-        for comment in get_trailing_comment_ranges(source_file_text(self.current_source_file), pos)
-        {
+        for comment in get_trailing_comment_ranges(&self.current_source_file_text(), pos) {
             if self.should_write_comment(comment) {
                 comments.push(comment);
             }
@@ -1177,7 +1177,7 @@ impl Printer {
             return;
         }
 
-        let comments = get_trailing_comment_ranges(source_file_text(self.current_source_file), pos);
+        let comments = get_trailing_comment_ranges(&self.current_source_file_text(), pos);
         if comments.is_empty() {
             return;
         }
@@ -1235,7 +1235,7 @@ impl Printer {
             return None;
         }
 
-        let text = source_file_text(self.current_source_file);
+        let text = self.current_source_file_text();
         let line_map = &*self.current_line_map();
 
         let mut leading_comments: Vec<CommentRange> = Vec::new();
@@ -1246,15 +1246,15 @@ impl Printer {
             //
             //      var x = 10;
             if text_range.pos() == 0 {
-                for comment in get_leading_comment_ranges(text, text_range.pos()) {
-                    if is_pinned_comment(text, comment) {
+                for comment in get_leading_comment_ranges(&text, text_range.pos()) {
+                    if is_pinned_comment(&text, comment) {
                         leading_comments.push(comment);
                     }
                 }
             }
         } else {
             // removeComments is false, just get detached as normal and bypass the process to filter comment
-            leading_comments = get_leading_comment_ranges(text, text_range.pos());
+            leading_comments = get_leading_comment_ranges(&text, text_range.pos());
         }
 
         let mut result = None;
@@ -1288,7 +1288,7 @@ impl Printer {
                 let last_detached_end = detached_comments.last().expect("detached comment").end();
                 let last_comment_line = compute_line_of_position(line_map, last_detached_end);
                 let node_line =
-                    compute_line_of_position(line_map, skip_trivia(text, text_range.pos()));
+                    compute_line_of_position(line_map, skip_trivia(&text, text_range.pos()));
                 if node_line >= last_comment_line + 2 {
                     // Valid detachedComments
 
@@ -1369,10 +1369,7 @@ impl Printer {
     // Go: printer/printer.go:5769 isTripleSlashComment
     pub(crate) fn is_triple_slash_comment(&self, comment: CommentRange) -> bool {
         self.current_source_file.is_some()
-            && is_recognized_triple_slash_comment(
-                source_file_text(self.current_source_file),
-                comment,
-            )
+            && is_recognized_triple_slash_comment(&self.current_source_file_text(), comment)
     }
 
     //
@@ -1417,7 +1414,7 @@ impl Printer {
         if self.options.inline_sources {
             if let Err(err) = generator
                 .borrow_mut()
-                .set_source_content(self.source_map_source_index, source.text())
+                .set_source_content(self.source_map_source_index, &source.text())
             {
                 panic!("{err}");
             }
@@ -1602,7 +1599,7 @@ impl Printer {
             pos = loc.pos();
         }
         if pos >= 0 && self.current_source_file.is_some() {
-            pos = skip_trivia(source_file_text(self.current_source_file), pos);
+            pos = skip_trivia(&self.current_source_file_text(), pos);
         }
         if !emit_flags.intersects(EmitFlags::NO_TOKEN_LEADING_SOURCE_MAPS) && pos >= 0 {
             self.emit_source_pos(self.source_map_source.clone(), pos);

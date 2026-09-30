@@ -43,7 +43,7 @@ pub fn probably_uses_semicolons(file: Node) -> bool {
                 );
                 let next_token_line = get_ecma_line_of_position(
                     file,
-                    skip_trivia(source_file_text(file), last_token.end()),
+                    skip_trivia(&source_file_text(file), last_token.end()),
                 );
                 // Avoid counting missing semicolon in single-line objects:
                 // `function f(p: { x: string /*no semicolon here is insignificant*/ }) {`

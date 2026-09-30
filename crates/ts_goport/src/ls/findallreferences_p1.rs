@@ -1468,13 +1468,13 @@ impl LanguageService {
                     node,
                     location: loc,
                     display_text: Some(lsproto::VSClassifiedTextElement {
-                        runs: vec![lsproto::VSClassifiedTextRun {
+                        runs: vec![Some(lsproto::VSClassifiedTextRun {
                             text: node.text().to_string(),
                             classification_type_name: lsproto::ClassificationTypeName::TEXT
                                 .0
                                 .to_string(),
                             ..Default::default()
-                        }],
+                        })],
                         ..Default::default()
                     }),
                 })
@@ -1501,13 +1501,13 @@ impl LanguageService {
                     node,
                     location: loc,
                     display_text: Some(lsproto::VSClassifiedTextElement {
-                        runs: vec![lsproto::VSClassifiedTextRun {
+                        runs: vec![Some(lsproto::VSClassifiedTextRun {
                             text: name.to_string(),
                             classification_type_name: lsproto::ClassificationTypeName::KEYWORD
                                 .0
                                 .to_string(),
                             ..Default::default()
-                        }],
+                        })],
                         ..Default::default()
                     }),
                 })
@@ -1562,13 +1562,13 @@ impl LanguageService {
                     node,
                     location: loc,
                     display_text: Some(lsproto::VSClassifiedTextElement {
-                        runs: vec![lsproto::VSClassifiedTextRun {
+                        runs: vec![Some(lsproto::VSClassifiedTextRun {
                             text: node.text().to_string(),
                             classification_type_name: lsproto::ClassificationTypeName::STRING
                                 .0
                                 .to_string(),
                             ..Default::default()
-                        }],
+                        })],
                         ..Default::default()
                     }),
                 })
@@ -1602,13 +1602,13 @@ impl LanguageService {
                     node,
                     location: loc,
                     display_text: Some(lsproto::VSClassifiedTextElement {
-                        runs: vec![lsproto::VSClassifiedTextRun {
+                        runs: vec![Some(lsproto::VSClassifiedTextRun {
                             text: format!("\"{reference_file_name}\""),
                             classification_type_name: lsproto::ClassificationTypeName::STRING
                                 .0
                                 .to_string(),
                             ..Default::default()
-                        }],
+                        })],
                         ..Default::default()
                     }),
                 })
@@ -1651,18 +1651,24 @@ impl LanguageService {
 
         if vs_capability {
             return lsproto::VSClassifiedTextElement {
-                runs: info.display_parts.borrow().get_runs(c),
+                runs: info
+                    .display_parts
+                    .borrow()
+                    .get_runs(c)
+                    .into_iter()
+                    .map(Some)
+                    .collect(),
                 ..Default::default()
             };
         }
         // Fallback: single unclassified run with the full text
         let text = info.display_parts.borrow().string();
         lsproto::VSClassifiedTextElement {
-            runs: vec![lsproto::VSClassifiedTextRun {
+            runs: vec![Some(lsproto::VSClassifiedTextRun {
                 text,
                 classification_type_name: lsproto::ClassificationTypeName::TEXT.0.to_string(),
                 ..Default::default()
-            }],
+            })],
             ..Default::default()
         }
     }

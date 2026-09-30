@@ -863,7 +863,8 @@ impl FilesParser {
                                     content_mapper_parse_options: file
                                         .content_mapper_parse_options()
                                         .clone(),
-                                    text: file.text,
+                                    text: file.text.clone(),
+                                    hash: file.hash.get(),
                                     script_kind: file.script_kind,
                                     content_mapper: file.content_mapper().to_string(),
                                     is_content_mapper_failure_stub: file
@@ -957,7 +958,8 @@ impl FilesParser {
                                         content_mapper_parse_options: file
                                             .content_mapper_parse_options()
                                             .clone(),
-                                        text: file.text,
+                                        text: file.text.clone(),
+                                        hash: file.hash.get(),
                                         script_kind: file.script_kind,
                                         content_mapper: file.content_mapper().to_string(),
                                         is_content_mapper_failure_stub: file

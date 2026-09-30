@@ -210,7 +210,7 @@ impl NodeFactory {
         &self,
         file_name: &'static str,
         path: &str,
-        text: &'static str,
+        text: impl Into<FileText>,
         statements: NodeList,
         end_of_file_token: Node,
     ) -> Node {
@@ -236,7 +236,7 @@ impl NodeFactory {
                 SyntheticSourceFileData {
                     file_name,
                     path: path.to_string(),
-                    text,
+                    text: text.into(),
                     ..Default::default()
                 },
             );
@@ -255,7 +255,7 @@ impl NodeFactory {
         end_of_file_token: Node,
     ) -> Node {
         let (file_name, path, text) = if is_synthetic_node(node) {
-            with_synthetic_source_file(node, |d| (d.file_name, d.path.clone(), d.text))
+            with_synthetic_source_file(node, |d| (d.file_name, d.path.clone(), d.text.clone()))
         } else {
             (
                 source_file_file_name(node),

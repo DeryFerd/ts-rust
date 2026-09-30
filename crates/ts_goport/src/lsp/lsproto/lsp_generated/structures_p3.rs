@@ -2602,7 +2602,7 @@ pub struct Diagnostic {
 
     // An array of related diagnostic information, e.g. when symbol-names within
     // a scope collide all definitions can be marked via this property.
-    pub related_information: Option<Vec<DiagnosticRelatedInformation>>,
+    pub related_information: Option<Vec<Option<DiagnosticRelatedInformation>>>,
 
     // A data entry field that is preserved between a `textDocument/publishDiagnostics`
     // notification and `textDocument/codeAction` request.
@@ -3539,7 +3539,7 @@ pub struct SignatureInformation {
     pub documentation: Option<StringOrMarkupContent>,
 
     // The parameters of this signature.
-    pub parameters: Option<Vec<ParameterInformation>>,
+    pub parameters: Option<Vec<Option<ParameterInformation>>>,
 
     // The index of the active parameter.
     //
@@ -4180,7 +4180,7 @@ pub struct CodeActionContext {
     // errors are currently presented to the user for the given range. There is no guarantee
     // that these accurately reflect the error state of the resource. The primary parameter
     // to compute code actions is the provided range.
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<Option<Diagnostic>>,
 
     // Requested kind of actions to return.
     //
