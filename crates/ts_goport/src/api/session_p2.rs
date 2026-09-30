@@ -2967,3 +2967,43 @@ fn strconv_parse_uint(s: &str, base: u32, bit_size: u32) -> Result<u64, GoError>
 
     Ok(n)
 }
+
+// Go: api/session.go:3543 decodePrintNode (ts#64320)
+pub fn decode_print_node(encoded: &str) -> Result<Node, GoError> {
+    let data = match base64_std_encoding_decode_string(encoded) {
+        Ok(data) => data,
+        Err(err) => {
+            return Err(errors::errorf(
+                format!("{}: invalid base64 data: {}", *ERR_CLIENT_ERROR, err),
+                vec![ERR_CLIENT_ERROR.clone(), err],
+            ));
+        }
+    };
+
+    let node = match encoder::decode_nodes(&data) {
+        Ok(node) => node,
+        Err(err) => {
+            return Err(errors::errorf(
+                format!("{}: failed to decode AST: {}", *ERR_CLIENT_ERROR, err),
+                vec![ERR_CLIENT_ERROR.clone(), err],
+            ));
+        }
+    };
+    Ok(node)
+}
+
+// Go: api/session.go:3556 newPrinter (ts#64320)
+// PORT: private, so it does not collide with `printer::new_printer` in the
+// api prelude; it calls that one by path.
+fn new_printer(params: &PrintNodeParams) -> crate::printer::Printer {
+    crate::printer::new_printer(
+        PrinterOptions {
+            preserve_source_newlines: params.preserve_source_newlines,
+            never_ascii_escape: params.never_ascii_escape,
+            terminate_unterminated_literals: params.terminate_unterminated_literals,
+            ..Default::default()
+        },
+        PrintHandlers::default(),
+        None,
+    )
+}

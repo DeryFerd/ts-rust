@@ -22,6 +22,7 @@ use crate::api::prelude::*;
 
 use crate::api::requestfilesystem;
 use crate::execute::tsc::diagnostics as diagnosticwriter;
+use crate::frontend::core_ext::ProjectReference;
 use crate::frontend::json::{
     JsonDecoder, JsonError, JsonToken, MarshalerTo, UnmarshalerFrom, json_unmarshal_decode,
 };
@@ -213,9 +214,9 @@ pub fn new_build_orchestrator_id() -> BuildOrchestratorID {
 }
 handle_json!(string: NodeHandle);
 
-// PORT: Go `project.ID` and `project.Syntheticproject::ID` (ts#64319) are Go
+// PORT: Go `project.ID` and `project.SyntheticProjectID` (ts#64319) are Go
 // string types: JSON uses the v2 string arshaler, except the Go
-// `Syntheticproject::ID.UnmarshalJSONFrom`, ported here. The project package
+// `SyntheticProjectID.UnmarshalJSONFrom`, ported here. The project package
 // has no JSON code for them, so their trait impls live with the protocol.
 impl MarshalerTo for project::ID {
     fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
@@ -235,14 +236,14 @@ impl IsZero for project::ID {
     }
 }
 
-impl MarshalerTo for project::Syntheticproject::ID {
+impl MarshalerTo for project::SyntheticProjectID {
     fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
         self.0.marshal_json_to(enc)
     }
 }
 
-// Go: project/project.go Syntheticproject::ID.UnmarshalJSONFrom (ts#64319)
-impl UnmarshalerFrom for project::Syntheticproject::ID {
+// Go: project/project.go SyntheticProjectID.UnmarshalJSONFrom (ts#64319)
+impl UnmarshalerFrom for project::SyntheticProjectID {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut value = String::new();
         json_unmarshal_decode(dec, &mut value)?;
@@ -258,7 +259,7 @@ impl UnmarshalerFrom for project::Syntheticproject::ID {
     }
 }
 
-impl IsZero for project::Syntheticproject::ID {
+impl IsZero for project::SyntheticProjectID {
     fn is_zero(&self) -> bool {
         self.0.is_empty()
     }
@@ -780,7 +781,7 @@ pub struct SnapshotRequestChangesParams {
     // ReconfigurePrograms replaces the configuration of existing synthetic programs.
     pub reconfigure_programs: Vec<Option<ReconfigureSnapshotProgramParams>>,
     // RemovePrograms lists synthetic project handles to remove from the snapshot.
-    pub remove_programs: Vec<project::Syntheticproject::ID>,
+    pub remove_programs: Vec<project::SyntheticProjectID>,
     // EnsurePrograms identifies projects whose programs should be updated if dirty,
     // or all contained projects when true.
     pub ensure_programs: Option<EnsurePrograms>,
@@ -913,7 +914,7 @@ impl UnmarshalerFrom for CreateSnapshotProgramParams {
 // Go: proto.go ReconfigureSnapshotProgramParams (ts#64204, ts#64319, ts#64324)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReconfigureSnapshotProgramParams {
-    pub id: project::Syntheticproject::ID,
+    pub id: project::SyntheticProjectID,
     pub root_files: Vec<DocumentIdentifier>,
     pub compiler_options: CompilerOptions,
     pub options: Option<CreateProgramOptions>,
@@ -1376,7 +1377,7 @@ proto_json!(marshal CreateSnapshotResponse {
 // `Some(vec![])` writes `[]`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SnapshotOperationResponse {
-    pub created_programs: Option<Vec<project::Syntheticproject::ID>>,
+    pub created_programs: Option<Vec<project::SyntheticProjectID>>,
     pub opened_files: Option<Vec<OpenedFileOperationResult>>,
 }
 

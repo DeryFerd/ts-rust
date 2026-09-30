@@ -361,7 +361,7 @@ pub trait RebasableFileSystem: vfs::Fs {
 /// layers use (ts#64291): `fs.(FileHandleSource)`, `fs.(LayeredFileSystem)`,
 /// `fs.(RebasableFileSystem)`, `fs.(FileChangeExpander)` and
 /// `fs.(*overlayFS)` (and, through `as_any`, the other packages' concrete
-/// layer types). `vfs::Fs::as_fs_layer` returns this view for a layer; each
+/// layer types). `as_fs_layer` returns this view for a layer; each
 /// default is a failed assertion.
 pub trait FsLayer {
     fn as_file_handle_source(&self) -> Option<&dyn FileHandleSource> {
@@ -385,29 +385,48 @@ pub trait FsLayer {
     }
 }
 
+/// PORT: Go type assertions on a `vfs.FS` value (ts#64291). `vfs::Fs` is in
+/// `goport_util`, which cannot name the layer types, so a layer returns itself
+/// from `vfs::Fs::as_any` and this downcasts it to each concrete layer type.
+/// Wrappers (`CachedFs`, `TrackingFs`, `wrapvfs`) keep the `None` default, as
+/// Go asserts on the wrapper's own type.
+pub fn as_fs_layer(fs: &dyn vfs::Fs) -> Option<&dyn FsLayer> {
+    let fs = fs.as_any()?;
+    if let Some(fs) = fs.downcast_ref::<OverlayFS>() {
+        return Some(fs);
+    }
+    if let Some(fs) = fs.downcast_ref::<CachedLayeredFileSystem>() {
+        return Some(fs);
+    }
+    if let Some(fs) = fs.downcast_ref::<crate::api::requestfilesystem::RequestFileSystemImpl>() {
+        return Some(fs);
+    }
+    None
+}
+
 /// Go `fs.(FileHandleSource)` on a `vfs.FS`.
 pub fn as_file_handle_source(fs: &dyn vfs::Fs) -> Option<&dyn FileHandleSource> {
-    fs.as_fs_layer()?.as_file_handle_source()
+    as_fs_layer(fs)?.as_file_handle_source()
 }
 
 /// Go `fs.(LayeredFileSystem)` on a `vfs.FS`.
 pub fn as_layered_file_system(fs: &dyn vfs::Fs) -> Option<&dyn LayeredFileSystem> {
-    fs.as_fs_layer()?.as_layered_file_system()
+    as_fs_layer(fs)?.as_layered_file_system()
 }
 
 /// Go `fs.(RebasableFileSystem)` on a `vfs.FS`.
 pub fn as_rebasable_file_system(fs: &dyn vfs::Fs) -> Option<&dyn RebasableFileSystem> {
-    fs.as_fs_layer()?.as_rebasable_file_system()
+    as_fs_layer(fs)?.as_rebasable_file_system()
 }
 
 /// Go `fs.(FileChangeExpander)` on a `vfs.FS`.
 pub fn as_file_change_expander(fs: &dyn vfs::Fs) -> Option<&dyn FileChangeExpander> {
-    fs.as_fs_layer()?.as_file_change_expander()
+    as_fs_layer(fs)?.as_file_change_expander()
 }
 
 /// Go `fs.(*overlayFS)` on a `vfs.FS`.
 pub fn as_overlay_fs(fs: &dyn vfs::Fs) -> Option<&OverlayFS> {
-    fs.as_fs_layer()?.as_overlay_fs()
+    as_fs_layer(fs)?.as_overlay_fs()
 }
 
 // Go: project/overlayfs.go:210 newOverlayFS
@@ -634,7 +653,8 @@ impl vfs::Fs for OverlayFS {
         self.host.realpath(path)
     }
 
-    fn as_fs_layer(&self) -> Option<&dyn FsLayer> {
+    // PORT: Go type assertions on a `vfs.FS` (see `as_fs_layer`).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
 }

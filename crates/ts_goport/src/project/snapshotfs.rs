@@ -133,7 +133,8 @@ impl vfs::Fs for CachedLayeredFileSystem {
     fn realpath(&self, path: &str) -> String {
         self.fs.realpath(path)
     }
-    fn as_fs_layer(&self) -> Option<&dyn FsLayer> {
+    // PORT: Go type assertions on a `vfs.FS` (see `project::as_fs_layer`).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
 }

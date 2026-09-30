@@ -16,6 +16,7 @@ use crate::api::prelude::*;
 
 use crate::api::proto;
 use crate::frontend::json::json_unmarshal;
+use crate::frontend::json_ext::AnyValue;
 use crate::frontend::module;
 use crate::gostd::errors;
 use crate::program::PackageId as ModulePackageId;
