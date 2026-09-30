@@ -470,6 +470,16 @@ end the run as the Go runtime does. The output written so far stays,
 stderr gets `panic: <message>` (then the port site in place of the
 goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
 
+Go `sync.WaitGroup.Go(f)` recovers a panic in `f` and panics again, so the
+runtime line ends with ` [recovered, repanicked]`. Where the port runs
+such a goroutine on the dispatch thread (background queue tasks, their
+timer continuations, the telemetry ticker, the idle auto-import warm), it
+runs `f` under `core::go_wait_group_task`. Where the port runs it inline
+inside work that a Go `recover()` guards (the auto-import registry build
+under a request), it runs `f` under `core::go_wait_group_goroutine`: a Go
+panic ends the process there, because Go's recover sees only its own
+goroutine.
+
 ## Threads
 
 - `prog()` is the current program of the thread. A one-program process
