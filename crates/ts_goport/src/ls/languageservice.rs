@@ -14,7 +14,7 @@ use crate::ls::prelude::*;
 // LanguageService<P>` blocks; all other methods are for the default `P`
 // only.
 pub struct LanguageService<P = compiler::NewProgram> {
-    pub project_path: tspath::Path,
+    pub project_id: autoimport::ProjectID,
     pub host: Rc<dyn Host>,
     pub active_config: lsutil::UserPreferences,
     pub program: Rc<P>,
@@ -37,7 +37,7 @@ pub struct LanguageService<P = compiler::NewProgram> {
 // Go: ls/languageservice.go:24 NewLanguageService
 // PORT: Go returns `*LanguageService`; the caller owns the value here.
 pub fn new_language_service(
-    project_path: tspath::Path,
+    project_id: autoimport::ProjectID,
     program: Rc<compiler::NewProgram>,
     host: Rc<dyn Host>,
     active_file: &str,
@@ -48,7 +48,7 @@ pub fn new_language_service(
     let active_config = host.get_preferences(active_file);
     let program_guard = ls_program::enter(&program);
     LanguageService {
-        project_path,
+        project_id,
         host,
         program,
         converters,
@@ -62,7 +62,7 @@ pub fn new_language_service(
 /// search thread, see `search_thread.rs`). `program_guard` makes the
 /// view's program version current (`ls_program::enter_version`).
 pub fn new_language_service_for_view<P: ProgramView>(
-    project_path: tspath::Path,
+    project_id: autoimport::ProjectID,
     program: Rc<P>,
     host: Rc<dyn Host>,
     active_config: lsutil::UserPreferences,
@@ -70,7 +70,7 @@ pub fn new_language_service_for_view<P: ProgramView>(
 ) -> LanguageService<P> {
     let converters = host.converters();
     LanguageService {
-        project_path,
+        project_id,
         host,
         program,
         converters,
@@ -183,7 +183,9 @@ impl LanguageService {
     // getPreparedAutoImportView returns an auto-import view for the given file if the registry is prepared
     // to provide up-to-date auto-imports for it. If not, it returns ErrNeedsAutoImports.
     // PORT: Go `*autoimport.View` is shared as `Rc<autoimport::View>` (wave 3
-    // notes); nil is `None`.
+    // notes); nil is `None`. Go also takes `typeChecker` for the view
+    // (ts#64178); the Rust view does not keep a checker (see
+    // `autoimport::new_view`), so there is no parameter.
     pub fn get_prepared_auto_import_view(
         &self,
         from_file: Node,
@@ -197,7 +199,7 @@ impl LanguageService {
         if !autoimport::Registry::is_prepared_for_importing_file(
             registry.as_deref(),
             source_file_file_name(registry_file),
-            &self.project_path,
+            &self.project_id,
             &self.user_preferences(),
         ) {
             return Err((*ERR_NEEDS_AUTO_IMPORTS).clone());
@@ -208,7 +210,7 @@ impl LanguageService {
         let view = autoimport::new_view(
             registry,
             from_file,
-            self.project_path.clone(),
+            self.project_id.clone(),
             Rc::clone(&self.program),
             self.user_preferences().module_specifier_preferences(),
         );
@@ -220,7 +222,9 @@ impl LanguageService {
     // of the auto-import registry, which may or may not be up-to-date.
     // PORT: Go builds a view with a nil registry and panics only when a view
     // method reads it. `autoimport::new_view` takes a non-nil registry, so a
-    // nil registry panics here, earlier than in Go.
+    // nil registry panics here, earlier than in Go. Go also takes
+    // `typeChecker` for the view (ts#64178); see
+    // `get_prepared_auto_import_view`.
     pub fn get_current_auto_import_view(&self, from_file: Node) -> Rc<autoimport::View> {
         let registry = self
             .host
@@ -229,7 +233,7 @@ impl LanguageService {
         Rc::new(autoimport::new_view(
             registry,
             from_file,
-            self.project_path.clone(),
+            self.project_id.clone(),
             Rc::clone(&self.program),
             self.user_preferences().module_specifier_preferences(),
         ))

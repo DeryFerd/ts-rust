@@ -40,7 +40,7 @@ pub struct PathAndFileName {
 pub struct AliasResolver {
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     pub host: Rc<dyn RegistryCloneHost>,
-    pub module_resolver: Rc<module::Resolver>,
+    pub module_resolver: Rc<module::DefaultResolver>,
 
     pub root_files: Vec<Node>,
     // symlinks maps from realpath to symlinked path and file name
@@ -65,7 +65,7 @@ pub fn new_alias_resolver(
     root_files: Vec<Node>,
     symlinks: FxHashMap<tspath::Path, PathAndFileName>,
     host: Rc<dyn RegistryCloneHost>,
-    module_resolver: Rc<module::Resolver>,
+    module_resolver: Rc<module::DefaultResolver>,
     to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     on_failed_ambient_module_lookup: Rc<dyn Fn(&dyn HasFileName, &str)>,
 ) -> Rc<AliasResolver> {
@@ -505,10 +505,10 @@ impl AliasResolver {
         go_panic("unimplemented".to_string())
     }
 
-    // Go: ls/autoimport/aliasresolver.go:173 GetJSXRuntimeImportSpecifier
+    // Go: ls/autoimport/aliasresolver.go:178 GetJSXRuntimeImportSpecifier
     // GetJSXRuntimeImportSpecifier implements checker.Program.
     pub fn get_jsx_runtime_import_specifier(&self, path: &tspath::Path) -> (String, Node) {
-        go_panic("unimplemented".to_string())
+        (String::new(), Node::NIL)
     }
 
     // Go: ls/autoimport/aliasresolver.go:178 GetNearestAncestorDirectoryWithPackageJson

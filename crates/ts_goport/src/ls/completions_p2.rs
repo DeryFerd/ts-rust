@@ -250,6 +250,8 @@ impl LanguageService {
             let origin = data.symbol_to_origin_info_map.get(&(index as i32));
             let (name, needs_convert_property_access) =
                 get_completion_entry_display_name_for_symbol(
+                    file,
+                    &preferences,
                     &type_checker.symbols,
                     symbol,
                     origin,
@@ -361,7 +363,9 @@ impl LanguageService {
                         &preferences,
                         is_snippet,
                     );
-                filter_text = auto_import.fix.name.clone();
+                // The edit range covers the whole import statement typed so far, and clients match that text against the
+                // filter text, so it has to be the statement being inserted (as in Strada), not just the bare name.
+                filter_text = insert_text.clone();
                 sort_text = SORT_TEXT_LOCATION_PRIORITY.to_string();
             }
 
@@ -1147,12 +1151,15 @@ impl LanguageService {
             return Vec::new();
         }
 
+        let preferences = self.user_preferences();
         let mut methods: Vec<ObjectLiteralMethodSymbol> = Vec::new();
         for &member in members {
             if !is_object_literal_method_symbol(&type_checker.symbols, member) {
                 continue;
             }
             let (display_name, _) = get_completion_entry_display_name_for_symbol(
+                file,
+                &preferences,
                 &type_checker.symbols,
                 member,
                 None, /*origin*/
@@ -1982,6 +1989,8 @@ pub fn should_include_symbol(
 // PORT: `checker.IsKnownSymbol(symbol)` is `isLateBoundName(symbol.Name)`;
 // it reads the arena directly (the port has it as a `Checker` method).
 pub fn get_completion_entry_display_name_for_symbol(
+    file: Node,
+    preferences: &lsutil::UserPreferences,
     symbols: &SymbolArena,
     symbol: SymbolId,
     origin: Option<&SymbolOriginInfo>,
@@ -2033,12 +2042,7 @@ pub fn get_completion_entry_display_name_for_symbol(
             }
             (String::new(), false)
         }
-        CompletionKind::OBJECT_PROPERTY_DECLARATION => {
-            // TODO: microsoft/TypeScript#18169
-            // Go: `core.StringifyJson(name, "", "")`; the error is ignored.
-            let escaped_name = json_ext::marshal_indent(name.as_str(), "", "").unwrap_or_default();
-            (escaped_name, false)
-        }
+        CompletionKind::OBJECT_PROPERTY_DECLARATION => (quote(file, preferences, &name), false),
         CompletionKind::PROPERTY_ACCESS | CompletionKind::GLOBAL => {
             // For a 'this.' completion it will be in a global context, but may have a non-identifier name.
             // Don't add a completion for a name starting with a space. See https://github.com/Microsoft/TypeScript/pull/20547
@@ -2275,6 +2279,9 @@ pub fn is_context_token_type_location(context_token: Node) -> bool {
             }
             SyntaxKind::SatisfiesKeyword => {
                 return parent_kind == SyntaxKind::SatisfiesExpression;
+            }
+            SyntaxKind::OpenBracketToken | SyntaxKind::CommaToken => {
+                return parent_kind == SyntaxKind::TupleType;
             }
             _ => {}
         }

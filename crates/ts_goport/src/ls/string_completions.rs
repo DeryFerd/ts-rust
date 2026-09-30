@@ -1270,7 +1270,7 @@ fn get_ambient_module_completions(
     let ambient_modules = type_checker.get_ambient_modules();
     let mut non_relative_module_names = Vec::new();
     for sym in ambient_modules {
-        let module_name = strip_quotes(type_checker.sym(sym).name.as_str());
+        let module_name = get_ambient_module_name(&type_checker.symbols, sym);
         if module_name.starts_with(fragment) && !module_name.contains('*') {
             non_relative_module_names.push(module_name);
         }
@@ -1286,6 +1286,17 @@ fn get_ambient_module_completions(
         }
     }
     non_relative_module_names
+}
+
+// Go: ls/string_completions.go:923 getAmbientModuleName
+// PORT: reading the symbol takes the symbol arena (as for Go `ast`
+// functions that take a symbol).
+fn get_ambient_module_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
+    let declaration = get_non_augmentation_declaration(symbols, symbol);
+    if declaration.is_some() && is_module_with_string_literal_name(declaration) {
+        return declaration.name().text().to_string();
+    }
+    strip_quotes(symbols.sym(symbol).name.as_str())
 }
 
 impl LanguageService {
@@ -1479,7 +1490,7 @@ fn get_supported_extensions_for_module_resolution(
     if let Some(checker) = checker {
         let ambient_modules = checker.get_ambient_modules();
         for module in ambient_modules {
-            let name = strip_quotes(checker.sym(module).name.as_str());
+            let name = get_ambient_module_name(&checker.symbols, module);
             if !name.starts_with("*.") || name.contains('/') {
                 continue;
             }

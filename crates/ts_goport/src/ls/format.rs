@@ -8,7 +8,8 @@ use crate::ls::prelude::*;
 
 use crate::frontend::core_textchange::TextChange;
 use crate::frontend::scanner::get_trailing_comment_ranges;
-use crate::spanmap::Feature;
+use crate::spanmap;
+use crate::spanmap::{Feature, SpanMap};
 
 impl LanguageService {
     // Go: ls/format.go:18 toLSProtoTextEdits
@@ -44,16 +45,160 @@ impl LanguageService {
         }
         let (_, file) = self.get_program_and_file(document_uri);
         let format_opts = lsutil::from_ls_format_options(&self.format_options(), options);
-        let edits = self.to_ls_proto_text_edits(
-            file,
-            &self.get_formatting_edits_for_document(ctx, file, &format_opts),
-        );
+        let edits = if source_file_content_mapper(file).is_empty() {
+            self.to_ls_proto_text_edits(
+                file,
+                &self.get_formatting_edits_for_document(ctx, file, &format_opts),
+            )
+        } else {
+            self.get_formatting_edits_for_mapped_range(
+                ctx,
+                file,
+                &format_opts,
+                TextRange::new(0, source_file_original_text(file).len() as i32),
+            )
+        };
         Ok(lsproto::TextEditsOrNull {
             text_edits: Some(edits),
         })
     }
 
-    // Go: ls/format.go:42 ProvideFormatDocumentRange
+    // Go: ls/format.go:54 getFormattingEditsForMappedRange
+    // getFormattingEditsForMappedRange formats each formatting-enabled verbatim intersection with originalRange.
+    // Duplicate formatting projections are unsupported. If mappings overlap anyway, each original-text position
+    // is formatted only once, preferring the earliest and then longest applicable mapping.
+    fn get_formatting_edits_for_mapped_range(
+        &self,
+        ctx: &Context,
+        file: Node,
+        options: &lsutil::FormatCodeSettings,
+        original_range: TextRange,
+    ) -> Vec<lsproto::TextEdit> {
+        let mut projections = vec![file];
+        projections.extend_from_slice(source_file_supplemental_source_files(file));
+        let mut candidates: Vec<MappedFormattingRange> = Vec::new();
+        for projection in projections {
+            let Some(span_map) = source_file_span_map(projection) else {
+                continue;
+            };
+            for segment in SpanMap::segments(Some(span_map)) {
+                if segment.kind != spanmap::Kind::VERBATIM
+                    || !segment.features.intersects(Feature::FORMATTING)
+                {
+                    continue;
+                }
+                let original_start = original_range.pos().max(segment.original_start);
+                let original_end = original_range.end().min(segment.original_end);
+                if original_start >= original_end {
+                    continue;
+                }
+                candidates.push(MappedFormattingRange {
+                    projection,
+                    segment,
+                    original_range: TextRange::new(original_start, original_end),
+                });
+            }
+        }
+
+        let mut edits: Vec<lsproto::TextEdit> = Vec::new();
+        for candidate in non_overlapping_formatting_ranges(&candidates) {
+            let virtual_range = TextRange::new(
+                candidate.segment.virtual_start + candidate.original_range.pos()
+                    - candidate.segment.original_start,
+                candidate.segment.virtual_start + candidate.original_range.end()
+                    - candidate.segment.original_start,
+            );
+            for change in self.get_formatting_edits_for_range(
+                ctx,
+                candidate.projection,
+                options,
+                virtual_range,
+            ) {
+                if change.pos() < virtual_range.pos() || change.end() > virtual_range.end() {
+                    continue;
+                }
+                let (lsp_range, fidelity) = self.converters.to_lsp_range_for_feature(
+                    &candidate.projection,
+                    TextRange::new(change.pos(), change.end()),
+                    Feature::FORMATTING,
+                );
+                if !fidelity.is_exact() {
+                    continue;
+                }
+                edits.push(lsproto::TextEdit {
+                    range: lsp_range,
+                    new_text: change.new_text,
+                });
+            }
+        }
+        crate::gostd::slices::sort_stable_func(&mut edits, |a, b| {
+            let c = lsproto::compare_ranges(a.range, b.range);
+            if c != 0 {
+                return c;
+            }
+            a.new_text.cmp(&b.new_text) as i32
+        });
+        edits
+    }
+}
+
+// Go: ls/format.go:106 mappedFormattingRange
+#[derive(Clone, Debug)]
+struct MappedFormattingRange {
+    projection: Node,
+    segment: spanmap::Segment,
+    original_range: TextRange,
+}
+
+// Go: ls/format.go:130 nonOverlappingFormattingRanges
+// nonOverlappingFormattingRanges chooses at most one formatting projection for each original-text position.
+// Candidates are ordered by original start and then descending end, so a longer mapping wins when several
+// mappings start together:
+//
+//	candidates:  [---------- A ----------)
+//	             [---- B ----)
+//	result:      [---------- A ----------)
+//
+// Since starts are ordered, a candidate can only overlap the end of the last accepted range. Its start is
+// trimmed to that end, preserving any uncovered suffix:
+//
+//	candidates:  [------- A -------)
+//	                    [------- B ----------)
+//	result:      [------- A -------)[-- B' --)
+//
+// Fully covered candidates have no suffix and are discarded. The segment itself is retained so callers can
+// translate a trimmed original range to the corresponding offset in its virtual projection.
+fn non_overlapping_formatting_ranges(
+    candidates: &[MappedFormattingRange],
+) -> Vec<MappedFormattingRange> {
+    let mut candidates = candidates.to_vec();
+    crate::gostd::slices::sort_stable_func(&mut candidates, |a, b| {
+        let c = a.original_range.pos().cmp(&b.original_range.pos()) as i32;
+        if c != 0 {
+            return c;
+        }
+        b.original_range.end().cmp(&a.original_range.end()) as i32
+    });
+
+    let mut result: Vec<MappedFormattingRange> = Vec::with_capacity(candidates.len());
+    for mut candidate in candidates {
+        if let Some(last) = result.last() {
+            candidate.original_range = candidate.original_range.with_pos(
+                candidate
+                    .original_range
+                    .pos()
+                    .max(last.original_range.end()),
+            );
+        }
+        if candidate.original_range.len() > 0 {
+            result.push(candidate);
+        }
+    }
+    result
+}
+
+impl LanguageService {
+    // Go: ls/format.go:152 ProvideFormatDocumentRange
     pub fn provide_format_document_range(
         &self,
         ctx: &Context,
@@ -66,6 +211,17 @@ impl LanguageService {
         }
         let (_, file) = self.get_program_and_file(document_uri);
         let format_opts = lsutil::from_ls_format_options(&self.format_options(), options);
+        if !source_file_content_mapper(file).is_empty() {
+            let edits = self.get_formatting_edits_for_mapped_range(
+                ctx,
+                file,
+                &format_opts,
+                lsconv::from_lsp_range_to_original(&self.converters, &file, r),
+            );
+            return Ok(lsproto::TextEditsOrNull {
+                text_edits: Some(edits),
+            });
+        }
         let ranges =
             lsconv::from_lsp_range_for_source_file(&self.converters, file, r, Feature::FORMATTING);
         if ranges.len() != 1 || !ranges[0].fidelity.is_exact() {
@@ -244,4 +400,52 @@ pub fn get_range_of_enclosing_comment(
         }
     }
     None
+}
+
+// Go: ls/format_test.go
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go: ls/format_test.go:15 TestNonOverlappingFormattingRanges
+    #[test]
+    fn test_non_overlapping_formatting_ranges() {
+        let tests: &[(&str, &[TextRange], &[TextRange])] = &[
+            (
+                "sorts disjoint ranges",
+                &[TextRange::new(10, 15), TextRange::new(0, 5)],
+                &[TextRange::new(0, 5), TextRange::new(10, 15)],
+            ),
+            (
+                "prefers longest range with same start",
+                &[TextRange::new(0, 10), TextRange::new(0, 20)],
+                &[TextRange::new(0, 20)],
+            ),
+            (
+                "discards fully covered range",
+                &[TextRange::new(5, 15), TextRange::new(0, 20)],
+                &[TextRange::new(0, 20)],
+            ),
+            (
+                "trims overlapping prefix",
+                &[TextRange::new(5, 15), TextRange::new(0, 10)],
+                &[TextRange::new(0, 10), TextRange::new(10, 15)],
+            ),
+        ];
+        for (name, candidates, want) in tests {
+            let candidates: Vec<MappedFormattingRange> = candidates
+                .iter()
+                .map(|&r| MappedFormattingRange {
+                    projection: Node::NIL,
+                    segment: spanmap::Segment::default(),
+                    original_range: r,
+                })
+                .collect();
+            let result: Vec<TextRange> = non_overlapping_formatting_ranges(&candidates)
+                .into_iter()
+                .map(|r| r.original_range)
+                .collect();
+            assert_eq!(&result, want, "{name}");
+        }
+    }
 }

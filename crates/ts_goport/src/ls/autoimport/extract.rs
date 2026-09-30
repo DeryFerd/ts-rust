@@ -36,7 +36,7 @@ pub struct SymbolExtractor<'c> {
 // field, and `Deref` promotes its fields and methods as Go does.
 pub struct ExportExtractor<'c> {
     pub symbol_extractor: SymbolExtractor<'c>,
-    pub module_resolver: Rc<module::Resolver>,
+    pub module_resolver: Rc<module::DefaultResolver>,
 }
 
 impl<'c> std::ops::Deref for ExportExtractor<'c> {
@@ -144,7 +144,7 @@ impl RegistryBuilder {
         &self,
         package_name: &str,
         checker: &'c mut Checker,
-        module_resolver: Rc<module::Resolver>,
+        module_resolver: Rc<module::DefaultResolver>,
         realpath: Option<Rc<dyn Fn(&str) -> String>>,
     ) -> ExportExtractor<'c> {
         ExportExtractor {

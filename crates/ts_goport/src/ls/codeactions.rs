@@ -332,23 +332,10 @@ pub fn is_fixable_diagnostic(diagnostic: &Diagnostic, error_codes: &[i32]) -> bo
     diagnostic.source().is_empty() && contains_error_code(error_codes, diagnostic.code())
 }
 
-// Go: ls/codeactions.go:246 codeActionKindContains
-// codeActionKindContains returns true if the requested kind equals or is a
-// hierarchical parent of actionKind, using '.' as the separator. This matches
-// the semantics of VS Code's HierarchicalKind.contains.
-fn code_action_kind_contains(
-    requested_kind: &lsproto::CodeActionKind,
-    action_kind: &lsproto::CodeActionKind,
-) -> bool {
-    *requested_kind == *action_kind
-        || requested_kind.0.is_empty()
-        || action_kind.0.starts_with(&format!("{}.", requested_kind.0))
-}
-
 // Go: ls/codeactions.go:241 isFixAllKind
 // isFixAllKind returns true if the requested kind matches source.fixAll
 fn is_fix_all_kind(kind: &lsproto::CodeActionKind) -> bool {
-    code_action_kind_contains(kind, &lsproto::CodeActionKind::SOURCE_FIX_ALL)
+    kind.contains(&lsproto::CodeActionKind::SOURCE_FIX_ALL_TS)
 }
 
 // Go: ls/codeactions.go:247 wantsQuickFixes
@@ -363,7 +350,7 @@ fn wants_quick_fixes(only: Option<&[lsproto::CodeActionKind]>) -> bool {
         return true;
     }
     for kind in only {
-        if code_action_kind_contains(kind, &lsproto::CodeActionKind::QUICK_FIX) {
+        if kind.contains(&lsproto::CodeActionKind::QUICK_FIX) {
             return true;
         }
     }
@@ -382,7 +369,7 @@ impl LanguageService {
         file: Node,
         uri: &lsproto::DocumentUri,
     ) -> Result<Option<lsproto::CommandOrCodeAction>, GoError> {
-        let kind = lsproto::CodeActionKind::SOURCE_FIX_ALL;
+        let kind = lsproto::CodeActionKind::SOURCE_FIX_ALL_TS;
         let mut lsp_changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> =
             IndexMap::new();
 
@@ -439,9 +426,9 @@ impl LanguageService {
 // getOrganizeImportsActionTitle returns the appropriate title for the given organize imports kind
 fn get_organize_imports_action_title(ctx: &Context, kind: &lsproto::CodeActionKind) -> String {
     let loc = locale::from_context(ctx);
-    if *kind == lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS {
+    if *kind == lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS_TS {
         crate::diagnostics_loc::message_localize(diag::Remove_Unused_Imports, &loc, &args![])
-    } else if *kind == lsproto::CodeActionKind::SOURCE_SORT_IMPORTS {
+    } else if *kind == lsproto::CodeActionKind::SOURCE_SORT_IMPORTS_TS {
         crate::diagnostics_loc::message_localize(diag::Sort_Imports, &loc, &args![])
     } else {
         crate::diagnostics_loc::message_localize(diag::Organize_Imports, &loc, &args![])
@@ -455,14 +442,14 @@ fn get_organize_imports_actions_for_kind(
     requested_kind: &lsproto::CodeActionKind,
 ) -> Vec<lsproto::CodeActionKind> {
     let organize_imports_kinds = [
-        lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-        lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS,
-        lsproto::CodeActionKind::SOURCE_SORT_IMPORTS,
+        lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS_TS,
+        lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS_TS,
+        lsproto::CodeActionKind::SOURCE_SORT_IMPORTS_TS,
     ];
 
     let mut result: Vec<lsproto::CodeActionKind> = Vec::new();
     for organize_kind in organize_imports_kinds {
-        if code_action_kind_contains(requested_kind, &organize_kind) {
+        if requested_kind.contains(&organize_kind) {
             result.push(organize_kind);
         }
     }

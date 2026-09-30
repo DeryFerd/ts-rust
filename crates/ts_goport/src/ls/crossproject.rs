@@ -2,7 +2,7 @@
 //!
 //! PORT notes for the whole file:
 //! - Go runs the per-project searches on a parallel `core.WorkGroup` and
-//!   shares `results`, `defaultDefinition`, `err` and `panicsOccured` under
+//!   shares `results`, `defaultDefinition`, `err` and `panicsOccurred` under
 //!   mutexes. The shared locals are `RefCell` fields of one
 //!   `CrossProjectState` value on the dispatch thread. The Go closures
 //!   `canSearchProject`, `enqueueItem` and the queued function are its
@@ -54,7 +54,7 @@ const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer de
 // PORT: plan contract C4. Go `*compiler.Program` is
 // `Rc<compiler::NewProgram>`, which is never nil.
 pub trait Project {
-    fn id(&self) -> tspath::Path;
+    fn id(&self) -> String;
     fn get_program(&self) -> Rc<compiler::NewProgram>;
     fn has_file(&self, file_name: &str) -> bool;
 }
@@ -68,6 +68,10 @@ pub struct ProjectAndTextDocumentPosition<'l> {
     pub ls: Option<&'l LanguageService>,
     pub uri: lsproto::DocumentUri,
     pub position: lsproto::Position,
+    /// Go `symbolData *SymbolAndEntriesData`; nil is `None`. Only the
+    /// default project's item (item 0, which runs on the dispatch thread)
+    /// can carry it.
+    pub symbol_data: Option<SymbolAndEntriesData>,
     pub for_original_location: bool,
 }
 
@@ -132,7 +136,10 @@ pub trait CrossProjectSearch: 'static {
     ) -> Result<Self::Resp, GoError>;
 }
 
-// Go: ls/crossproject.go:45 handleCrossProject
+// Go: ls/crossproject.go:46 (*LanguageService).handleCrossProject
+// PORT: Go 1.27 makes this a generic method of the default language
+// service (ts#63902); here it stays a function whose first parameter is
+// `default_ls`.
 // PORT: Go `params Req` is a pointer type: `&Req`. Go `orchestrator` can be
 // nil: `Option<&dyn CrossProjectOrchestrator>`. Go
 // `combineResults func(iter.Seq[Resp]) Resp` takes the yielded values as a
@@ -151,6 +158,7 @@ pub fn handle_cross_project<Req, Resp>(
     is_rename: bool,
     implementations: bool,
     options: SymbolEntryTransformOptions,
+    default_project_data: Option<SymbolAndEntriesData>,
 ) -> Result<Resp, GoError>
 where
     Req: HasTextDocumentPosition,
@@ -160,13 +168,20 @@ where
 
     // Single project
     let Some(orchestrator) = orchestrator else {
-        let (data, _) = default_ls.provide_symbols_and_entries(
-            ctx,
-            &params.text_document_uri(),
-            params.text_document_position(),
-            is_rename,
-            implementations,
-        );
+        let data = match default_project_data {
+            Some(default_project_data) => default_project_data,
+            None => {
+                default_ls
+                    .provide_symbols_and_entries(
+                        ctx,
+                        &params.text_document_uri(),
+                        params.text_document_position(),
+                        is_rename,
+                        implementations,
+                    )
+                    .0
+            }
+        };
         return symbol_and_entries_to_resp(default_ls, ctx, params, data, options);
     };
 
@@ -187,17 +202,20 @@ where
         default_definition: RefCell::new(None),
         wg: RefCell::new(VecDeque::new()),
         err: RefCell::new(None),
-        panics_occured: RefCell::new(None),
+        panics_occurred: RefCell::new(None),
     };
 
     // Initial set of projects and locations in the queue, starting with default project
-    state.enqueue_item(ProjectAndTextDocumentPosition {
+    let mut initial_item = ProjectAndTextDocumentPosition {
         project: Rc::clone(&state.default_project),
         ls: Some(default_ls),
         uri: params.text_document_uri(),
         position: params.text_document_position(),
+        symbol_data: None,
         for_original_location: false,
-    });
+    };
+    initial_item.symbol_data = default_project_data;
+    state.enqueue_item(initial_item);
     for project in &state.all_projects {
         if !Rc::ptr_eq(project, &state.default_project) {
             state.enqueue_item(ProjectAndTextDocumentPosition {
@@ -206,6 +224,7 @@ where
                 // TODO!! symlinks need to change the URI
                 uri: params.text_document_uri(),
                 position: params.text_document_position(),
+                symbol_data: None,
                 for_original_location: false,
             });
         }
@@ -216,11 +235,11 @@ where
         // Process existing known projects first
         state.run_and_wait();
         // No need to use mu here since we are not in parallel at this point
-        if let Some(panics_occured) = state.panics_occured.borrow().as_ref() {
+        if let Some(panics_occurred) = state.panics_occurred.borrow().as_ref() {
             // PORT: Go `%v` of a `[]string`.
             panic!(
                 "Panics occurred during cross-project handling: [{}]",
-                panics_occured.join(" ")
+                panics_occurred.join(" ")
             );
         }
         if let Some(err) = ctx.err() {
@@ -237,7 +256,7 @@ where
             let mut requested_project_trees: FxHashSet<tspath::Path> = FxHashSet::default();
             for (key, response) in state.results.borrow().iter() {
                 if response.borrow().complete {
-                    requested_project_trees.insert(key.clone());
+                    requested_project_trees.insert(tspath::Path(key.clone()));
                 }
             }
 
@@ -273,6 +292,7 @@ where
                             ls: None,
                             uri: default_definition.text_document_uri(),
                             position: default_definition.text_document_position(),
+                            symbol_data: None,
                             for_original_location: false,
                         });
                         has_more_work = true;
@@ -284,6 +304,7 @@ where
                             ls: None,
                             uri: source_pos.text_document_uri(),
                             position: source_pos.text_document_position(),
+                            symbol_data: None,
                             for_original_location: false,
                         });
                         has_more_work = true;
@@ -296,6 +317,7 @@ where
                             ls: None,
                             uri: generated_pos.text_document_uri(),
                             position: generated_pos.text_document_position(),
+                            symbol_data: None,
                             for_original_location: false,
                         });
                         has_more_work = true;
@@ -351,7 +373,50 @@ pub fn search_item<P: ProgramView, Req, Resp>(
     on_entry: &mut dyn FnMut(&Rc<RefCell<SymbolAndEntries>>),
     locations: &mut Vec<(lsproto::DocumentUri, lsproto::Position)>,
 ) -> Option<Result<Resp, GoError>> {
-    let (data, ok) = ls.provide_symbols_and_entries(ctx, uri, position, is_rename, implementations);
+    search_item_with_data(
+        ls,
+        ctx,
+        params,
+        uri,
+        position,
+        is_rename,
+        implementations,
+        options,
+        None, /*symbolData*/
+        to_resp,
+        on_entry,
+        locations,
+    )
+}
+
+// Go: ls/crossproject.go:96 steps 3 to 5 of the queued function
+// PORT: `search_item` for an item that can carry Go `item.symbolData`
+// (`symbol_data`; only item 0, on the dispatch thread).
+#[allow(clippy::too_many_arguments)]
+pub fn search_item_with_data<P: ProgramView, Req, Resp>(
+    ls: &LanguageService<P>,
+    ctx: &Context,
+    params: &Req,
+    uri: &lsproto::DocumentUri,
+    position: lsproto::Position,
+    is_rename: bool,
+    implementations: bool,
+    options: SymbolEntryTransformOptions,
+    symbol_data: Option<SymbolAndEntriesData>,
+    to_resp: impl FnOnce(
+        &LanguageService<P>,
+        &Context,
+        &Req,
+        SymbolAndEntriesData,
+        SymbolEntryTransformOptions,
+    ) -> Result<Resp, GoError>,
+    on_entry: &mut dyn FnMut(&Rc<RefCell<SymbolAndEntries>>),
+    locations: &mut Vec<(lsproto::DocumentUri, lsproto::Position)>,
+) -> Option<Result<Resp, GoError>> {
+    let (data, ok) = match symbol_data {
+        Some(symbol_data) => (symbol_data, true),
+        None => ls.provide_symbols_and_entries(ctx, uri, position, is_rename, implementations),
+    };
     if ctx.err().is_some() {
         return None;
     }
@@ -367,7 +432,9 @@ pub fn search_item<P: ProgramView, Req, Resp>(
 }
 
 /// Go `fmt.Sprintf("panic handling request: %v\n%s", r, debug.Stack())`, the
-/// text that the deferred recover of the queued function keeps.
+/// text that the deferred recover of the queued function keeps (Go
+/// `panicOccurred`). The name keeps the old spelling because
+/// `search_thread.rs` calls it.
 pub fn panic_occured_text(payload: Box<dyn std::any::Any + Send>) -> String {
     let text = panic_payload_text(&*payload);
     // PORT: Go `debug.Stack()`; the text is only logged.
@@ -400,8 +467,8 @@ struct CrossProjectState<'a, Req, Resp> {
     options: SymbolEntryTransformOptions,
     default_project: Rc<dyn Project>,
     all_projects: Vec<Rc<dyn Project>>,
-    /// Go `results collections.SyncMap[tspath.Path, *response[Resp]]`.
-    results: RefCell<IndexMap<tspath::Path, Rc<RefCell<Response<Resp>>>>>,
+    /// Go `results collections.SyncMap[string, *response[Resp]]`.
+    results: RefCell<IndexMap<String, Rc<RefCell<Response<Resp>>>>>,
     /// Go `defaultDefinition *nonLocalDefinition`.
     default_definition: RefCell<Option<NonLocalDefinition<'a>>>,
     /// Go `wg`: the queued items with the response each one fills.
@@ -413,8 +480,8 @@ struct CrossProjectState<'a, Req, Resp> {
     >,
     /// Go `err` (under `errMu`).
     err: RefCell<Option<GoError>>,
-    /// Go `panicsOccured` (under `panicMu`); `None` is Go's nil slice.
-    panics_occured: RefCell<Option<Vec<String>>>,
+    /// Go `panicsOccurred` (under `panicMu`); `None` is Go's nil slice.
+    panics_occurred: RefCell<Option<Vec<String>>>,
 }
 
 /// The language service of an item: the caller's for item 0, or the one
@@ -677,7 +744,7 @@ where
                 // PORT: other language services can be alive (the items that
                 // run on search threads); make this one's program current.
                 let _program = ls.enter_program();
-                search_item(
+                search_item_with_data(
                     ls,
                     ctx,
                     self.params,
@@ -686,6 +753,7 @@ where
                     self.is_rename,
                     self.implementations,
                     self.options,
+                    item.symbol_data.clone(),
                     |ls, ctx, params, data, options| {
                         (self.symbol_and_entries_to_resp)(ls, ctx, params, data, options)
                     },
@@ -761,21 +829,22 @@ where
                             ls: None,
                             uri: uri.clone(),
                             position,
+                            symbol_data: None,
                             for_original_location: true,
                         });
                     }
                 }
             }
         }));
-        let panic_occured = match committed {
+        let panic_occurred = match committed {
             Err(payload) => Some(panic_occured_text(payload)),
             Ok(()) => panic,
         };
-        if let Some(panic_occured) = panic_occured {
-            self.panics_occured
+        if let Some(panic_occurred) = panic_occurred {
+            self.panics_occurred
                 .borrow_mut()
                 .get_or_insert_with(Vec::new)
-                .push(panic_occured);
+                .push(panic_occurred);
             return;
         }
         match result {
@@ -800,7 +869,7 @@ where
     fn get_results_iterator(&self) -> Vec<Resp> {
         let mut yielded: Vec<Resp> = Vec::new();
         let results = self.results.borrow();
-        let mut seen_projects: FxHashSet<tspath::Path> = FxHashSet::default();
+        let mut seen_projects: FxHashSet<String> = FxHashSet::default();
         if let Some(response) = results.get(&self.default_project.id()) {
             let response = response.borrow();
             if response.complete {

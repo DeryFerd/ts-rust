@@ -28,6 +28,8 @@ use std::cell::Cell;
 const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
 
 // Go: ls/autoimport/view.go:21 View
+// PORT: Go `checker *checker.Checker` (ts#64178) is not a field; see
+// `new_view`.
 // PORT: Go `*collections.Set[string]` `conditions` is never nil after
 // `NewView`, so it is a plain set. Go `*collections.MultiMap` is
 // `IndexMap<K, Vec<V>>` behind an `Rc` (Go returns the pointer). The lazy
@@ -39,7 +41,7 @@ pub struct View {
     pub importing_file_path: tspath::Path,
     pub program: Rc<compiler::NewProgram>,
     pub preferences: modulespecifiers::UserPreferences,
-    pub project_key: tspath::Path,
+    pub project_id: ProjectID,
 
     pub allowed_endings: RefCell<Option<Vec<modulespecifiers::ModuleSpecifierEnding>>>,
     pub conditions: FxHashSet<String>,
@@ -57,11 +59,15 @@ pub fn source_file_has_file_name(file: Node) -> HasFileNameImpl {
     new_has_file_name(source_file_file_name(file), &source_file_info(file).path)
 }
 
-// Go: ls/autoimport/view.go:35 NewView
+// Go: ls/autoimport/view.go:37 NewView
+// PORT: Go takes `typeChecker` and stores it in the view (ts#64178). The
+// Rust checker is a `RefCell` that the caller already borrows, so the view
+// does not keep it: the methods that read Go `v.checker` take `ch` (see
+// `fix.rs`).
 pub fn new_view(
     registry: Rc<Registry>,
     importing_file: Node,
-    project_key: tspath::Path,
+    project_id: ProjectID,
     program: Rc<compiler::NewProgram>,
     preferences: modulespecifiers::UserPreferences,
 ) -> View {
@@ -87,7 +93,7 @@ pub fn new_view(
         importing_file,
         importing_file_path,
         program,
-        project_key,
+        project_id,
         preferences,
         conditions,
         should_use_uri_style_node_core_modules,
@@ -174,7 +180,7 @@ impl View {
         let mut results: Vec<Rc<Export>> = Vec::new();
         let importing_file_path = tspath::Path(source_file_info(self.importing_file).path.clone());
 
-        if let Some(bucket) = self.registry.projects.get(&self.project_key) {
+        if let Some(bucket) = self.registry.projects.get(&self.project_id) {
             let exports = search_fn(&**bucket);
             results.reserve(exports.len());
             for e in exports {
@@ -191,9 +197,9 @@ impl View {
         // plus packages that are directly imported by the project's program files.
         // If no package.json is found, allowedPackages remains nil and all packages are allowed.
         let mut allowed_packages: Option<FxHashSet<String>> = None;
-        tspath::for_each_ancestor_directory_path(
-            &importing_file_path.get_directory_path(),
-            |dir_path: tspath::Path| -> ((), bool) {
+        importing_file_path
+            .get_directory_path()
+            .for_each_ancestor_directory(|dir_path: tspath::Path| -> ((), bool) {
                 if let Some(dir) = self.registry.directories.get(&dir_path) {
                     let dir = dir.borrow();
                     if let Some(pj) = dir.package_json.as_ref().filter(|pj| pj.exists())
@@ -210,11 +216,10 @@ impl View {
                     }
                 }
                 ((), false)
-            },
-        );
+            });
         // If we found at least one package.json, also include packages directly imported by the project
         if let Some(allowed) = &allowed_packages {
-            if let Some(bucket) = self.registry.projects.get(&self.project_key) {
+            if let Some(bucket) = self.registry.projects.get(&self.project_id) {
                 // Go: allowedPackages.UnionedWith(bucket.ResolvedPackageNames)
                 let mut result = allowed.clone();
                 if let Some(other) = &bucket.resolved_package_names {
@@ -225,9 +230,9 @@ impl View {
         }
 
         let mut exclude_packages: FxHashSet<String> = FxHashSet::default();
-        tspath::for_each_ancestor_directory_path(
-            &importing_file_path.get_directory_path(),
-            |dir_path: tspath::Path| -> ((), bool) {
+        importing_file_path
+            .get_directory_path()
+            .for_each_ancestor_directory(|dir_path: tspath::Path| -> ((), bool) {
                 if let Some(node_modules_bucket) = self.registry.node_modules.get(&dir_path) {
                     let exports = search_fn(&**node_modules_bucket);
                     results.reserve(exports.len());
@@ -254,8 +259,7 @@ impl View {
                     }
                 }
                 ((), false)
-            },
-        );
+            });
         results
     }
 }
@@ -283,10 +287,10 @@ fn unicode_is_upper(c: char) -> bool {
 
 impl View {
     // Go: ls/autoimport/view.go:172 GetCompletions
-    // PORT: `ch` is the request checker. Go `GetFixes` leases it again with
-    // `program.GetTypeChecker(ctx)`, which returns the checker that the
-    // request already holds; a second `RefCell` borrow would panic, so the
-    // caller passes it (as the pinned ImportAdder decision does).
+    // PORT: `ch` is the request checker, Go `v.checker` (ts#64178); the
+    // caller passes it (as the pinned ImportAdder decision does). Go dropped
+    // the `ctx` parameter in ts#64178; `_ctx` stays until its caller in
+    // `completions_p1.rs` (no wave-2 owner) drops the argument.
     // Go `grouped` is a map: `IndexMap` in insertion order.
     // PORT: Go map order is random. It changes values, not only the order of
     // ties, through the per-file specifier cache (`specifiers.rs`): the cache
@@ -301,7 +305,7 @@ impl View {
     // insertion order, so the sort input and its ties do not change.
     pub fn get_completions(
         &self,
-        ctx: &Context,
+        _ctx: &Context,
         ch: &mut Checker,
         prefix: &str,
         position: lsproto::Position,
@@ -394,9 +398,7 @@ impl View {
             let exps = groups[i];
             let mut fixes_for_group: Vec<FixAndExport> = Vec::with_capacity(exps.len());
             for e in exps {
-                for fix in
-                    self.get_fixes(ctx, ch, e, for_jsx, is_type_only_location, Some(position))
-                {
+                for fix in self.get_fixes(ch, e, for_jsx, is_type_only_location, Some(position)) {
                     fixes_for_group.push(FixAndExport {
                         fix,
                         export: e.clone(),

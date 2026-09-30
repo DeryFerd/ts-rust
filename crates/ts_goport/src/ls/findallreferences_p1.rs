@@ -248,19 +248,6 @@ impl<P: ProgramView> LanguageService<P> {
             .clone()
     }
 
-    // Go: ls/findallreferences.go:182 getLocationOfEntry
-    pub fn get_location_of_entry(
-        &self,
-        entry: &Rc<RefCell<ReferenceEntry>>,
-    ) -> (lsproto::Location, bool) {
-        let resolved = self.resolve_entry(entry);
-        let resolved = resolved.borrow();
-        (
-            resolved.lsp_range.clone().expect(NIL_DEREF),
-            !resolved.unmappable,
-        )
-    }
-
     // Go: ls/findallreferences.go:187 getLocationOfEntryForFeature
     pub fn get_location_of_entry_for_feature(
         &self,
@@ -1196,6 +1183,30 @@ impl LanguageService {
             false, /*isRename*/
             false, /*implementations*/
             SymbolEntryTransformOptions::default(),
+            None, /*defaultProjectData*/
+        )
+    }
+
+    // Go: ls/findallreferences.go:765 provideReferencesFromData
+    pub fn provide_references_from_data(
+        &self,
+        ctx: &Context,
+        params: &lsproto::ReferenceParams,
+        orchestrator: Option<&dyn CrossProjectOrchestrator>,
+        data: SymbolAndEntriesData,
+    ) -> Result<lsproto::ReferencesResponse, GoError> {
+        handle_cross_project(
+            self,
+            ctx,
+            params,
+            orchestrator,
+            LanguageService::symbol_and_entries_to_references,
+            Some(start_search::<ReferencesSearch>),
+            combine_references,
+            false, /*isRename*/
+            false, /*implementations*/
+            SymbolEntryTransformOptions::default(),
+            Some(data),
         )
     }
 
@@ -1217,6 +1228,7 @@ impl LanguageService {
             false, /*isRename*/
             false, /*implementations*/
             SymbolEntryTransformOptions::default(),
+            None, /*defaultProjectData*/
         )
     }
 }
@@ -1265,7 +1277,7 @@ impl LanguageService {
         let vs_capability = caps.vs_supports_visual_studio_extensions;
         let mut items: Vec<lsproto::VSReferenceItem> = Vec::new();
         let mut id: i32 = 0;
-        let project_name = self.project_path.as_str().to_string();
+        let project_name = self.project_id.string();
 
         for s in &data.symbols_and_entries {
             let (definition, references) = {
@@ -1282,6 +1294,7 @@ impl LanguageService {
                 &definition,
                 data.original_node,
                 vs_capability,
+                Feature::REFERENCES,
             );
             let Some(def_info) = def_info else {
                 continue;
@@ -1322,7 +1335,8 @@ impl LanguageService {
                     continue;
                 }
 
-                let (ref_location, ok) = self.get_location_of_entry(ref_);
+                let (ref_location, ok) =
+                    self.get_location_of_entry_for_feature(ref_, Feature::REFERENCES);
                 if !ok {
                     continue;
                 }
@@ -1373,6 +1387,7 @@ impl LanguageService {
         def: &Definition,
         original_node: Node,
         vs_capability: bool,
+        feature: Feature,
     ) -> Option<ReferencedSymbolDefinitionInfo> {
         match def.kind {
             DefinitionKind::SYMBOL => {
@@ -1403,12 +1418,14 @@ impl LanguageService {
                     original_node
                 };
 
-                let (loc, ok) =
-                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                let (loc, ok) = self.get_location_of_entry_for_feature(
+                    &Rc::new(RefCell::new(ReferenceEntry {
                         kind: EntryKind::NODE,
                         node,
                         ..Default::default()
-                    })));
+                    })),
+                    feature,
+                );
                 if !ok {
                     return None;
                 }
@@ -1424,12 +1441,14 @@ impl LanguageService {
                 if node.is_nil() {
                     return None;
                 }
-                let (loc, ok) =
-                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                let (loc, ok) = self.get_location_of_entry_for_feature(
+                    &Rc::new(RefCell::new(ReferenceEntry {
                         kind: EntryKind::NODE,
                         node,
                         ..Default::default()
-                    })));
+                    })),
+                    feature,
+                );
                 if !ok {
                     return None;
                 }
@@ -1455,12 +1474,14 @@ impl LanguageService {
                     return None;
                 }
                 let name = token_to_string(node.kind());
-                let (loc, ok) =
-                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                let (loc, ok) = self.get_location_of_entry_for_feature(
+                    &Rc::new(RefCell::new(ReferenceEntry {
                         kind: EntryKind::NODE,
                         node,
                         ..Default::default()
-                    })));
+                    })),
+                    feature,
+                );
                 if !ok {
                     return None;
                 }
@@ -1491,12 +1512,14 @@ impl LanguageService {
                 }
                 let element =
                     self.get_definition_kind_and_display_parts(ctx, symbol, node, vs_capability);
-                let (loc, ok) =
-                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                let (loc, ok) = self.get_location_of_entry_for_feature(
+                    &Rc::new(RefCell::new(ReferenceEntry {
                         kind: EntryKind::NODE,
                         node,
                         ..Default::default()
-                    })));
+                    })),
+                    feature,
+                );
                 if !ok {
                     return None;
                 }
@@ -1512,12 +1535,14 @@ impl LanguageService {
                 if node.is_nil() {
                     return None;
                 }
-                let (loc, ok) =
-                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                let (loc, ok) = self.get_location_of_entry_for_feature(
+                    &Rc::new(RefCell::new(ReferenceEntry {
                         kind: EntryKind::NODE,
                         node,
                         ..Default::default()
-                    })));
+                    })),
+                    feature,
+                );
                 if !ok {
                     return None;
                 }
@@ -1545,12 +1570,14 @@ impl LanguageService {
                     return None;
                 }
                 let node = triple_slash_file_ref.file;
-                let (loc, ok) =
-                    self.get_location_of_entry(&Rc::new(RefCell::new(ReferenceEntry {
+                let (loc, ok) = self.get_location_of_entry_for_feature(
+                    &Rc::new(RefCell::new(ReferenceEntry {
                         kind: EntryKind::NODE,
                         node,
                         ..Default::default()
-                    })));
+                    })),
+                    feature,
+                );
                 if !ok {
                     return None;
                 }
@@ -1662,6 +1689,31 @@ impl LanguageService {
             false, /*isRename*/
             true,  /*implementations*/
             options,
+            None, /*defaultProjectData*/
+        )
+    }
+
+    // Go: ls/findallreferences.go:1041 provideImplementationsFromData
+    pub fn provide_implementations_from_data(
+        &self,
+        ctx: &Context,
+        params: &lsproto::ImplementationParams,
+        options: SymbolEntryTransformOptions,
+        orchestrator: Option<&dyn CrossProjectOrchestrator>,
+        data: SymbolAndEntriesData,
+    ) -> Result<lsproto::ImplementationResponse, GoError> {
+        handle_cross_project(
+            self,
+            ctx,
+            params,
+            orchestrator,
+            LanguageService::symbol_and_entries_to_implementations,
+            Some(start_search::<ImplementationsSearch>),
+            combine_implementations,
+            false, /*isRename*/
+            true,  /*implementations*/
+            options,
+            Some(data),
         )
     }
 }
@@ -1702,12 +1754,7 @@ impl<P: ProgramView> LanguageService<P> {
                 ..Default::default()
             });
         }
-        let locations = self.convert_entries_to_locations(
-            ctx,
-            &entries,
-            SymbolId::NIL, /*definitionSymbol*/
-            Feature::IMPLEMENTATION,
-        );
+        let locations = self.convert_entries_to_locations(&entries, Feature::IMPLEMENTATION);
         Ok(lsproto::LocationOrLocationsOrDefinitionLinksOrNull {
             locations: Some(locations),
             ..Default::default()
@@ -1739,11 +1786,7 @@ impl<P: ProgramView> LanguageService<P> {
             });
         }
 
-        let mut definition_symbol = SymbolId::NIL;
-        if include_declarations && let Some(definition) = &definition {
-            definition_symbol = definition.symbol;
-        }
-        self.convert_entries_to_locations(ctx, &references, definition_symbol, feature)
+        self.convert_entries_to_locations(&references, feature)
     }
 }
 
@@ -1782,48 +1825,16 @@ pub fn is_declaration_of_symbol(symbols: &SymbolArena, node: Node, target: Symbo
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:1089 convertEntriesToLocations
-    // PORT: Go `definitionSymbol *ast.Symbol`; nil is `SymbolId::NIL`.
-    // `isDeclarationOfSymbol` reads the symbol through the request checker
-    // (see the file header), so this takes `ctx`. Go's check returns false
-    // for a nil symbol, so the checker is taken only for a set symbol.
+    // Go: ls/findallreferences.go:1113 convertEntriesToLocations
     pub fn convert_entries_to_locations(
         &self,
-        ctx: &Context,
         entries: &[Rc<RefCell<ReferenceEntry>>],
-        definition_symbol: SymbolId,
         feature: Feature,
     ) -> Vec<lsproto::Location> {
-        // A synthesized declaration has no source span, but it still represents the symbol's definition in
-        // that file. Mirror go-to-definition's file-level fallback while continuing to omit synthesized uses.
-        let mut concrete_files: FxHashSet<lsproto::DocumentUri> = FxHashSet::default();
+        let mut locations = Vec::with_capacity(entries.len());
         for entry in entries {
             let (location, ok) = self.get_location_of_entry_for_feature(entry, feature);
             if ok {
-                concrete_files.insert(location.uri);
-            }
-        }
-
-        let mut locations = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let (mut location, ok) = self.get_location_of_entry_for_feature(entry, feature);
-            if ok {
-                locations.push(location);
-            } else if definition_symbol.is_some()
-                && {
-                    let entry_node = entry.borrow().node;
-                    let (checker, _done) = self.get_program().get_type_checker(ctx);
-                    let is_declaration = is_declaration_of_symbol(
-                        &checker.borrow().symbols,
-                        entry_node,
-                        definition_symbol,
-                    );
-                    is_declaration
-                }
-                && !concrete_files.contains(&location.uri)
-            {
-                location.range = lsproto::Range::default();
-                concrete_files.insert(location.uri.clone());
                 locations.push(location);
             }
         }
