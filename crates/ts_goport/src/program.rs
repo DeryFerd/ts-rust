@@ -477,9 +477,10 @@ impl<R> EmitPoolJob<R> {
 /// prints the d.ts parts whose declaration transforms ran on the checker
 /// (`program_emit`), so the checker can go on with its next file. The
 /// transforms call the emit resolver, so they stay on the checker, and each
-/// checker's d.ts text depends on its own check. The print needs no checker
-/// (Go `emitDeclarationFile` passes empty `PrintHandlers`). Go runs each
-/// file's emit on its own goroutine and locks the checker only for each
+/// checker's d.ts text depends on its own check. The print needs no checker:
+/// the only print handler of Go `emitDeclarationFile` maps declaration map
+/// positions through the span map of a content-mapped source file. Go runs
+/// each file's emit on its own goroutine and locks the checker only for each
 /// resolver call.
 ///
 /// The twin shares the checker's synthetic chunk numbers

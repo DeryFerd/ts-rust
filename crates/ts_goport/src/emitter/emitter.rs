@@ -65,6 +65,9 @@ pub struct Emitter {
 pub struct DeclarationPrint {
     /// The transformed SourceFile.
     pub source_file: Node,
+    /// Go `contentMappedSource`: the SourceFile before the transforms. The
+    /// print reads its span map for the declaration map.
+    pub content_mapped_source: Node,
     pub emit_declaration_map: bool,
     pub emit_context: Rc<EmitContext>,
     /// The Go `emitDeclarationFileOrBundle` trace event, which ends after
@@ -77,11 +80,13 @@ impl DeclarationPrint {
     #[must_use]
     pub fn new(
         source_file: Node,
+        content_mapped_source: Node,
         emit_declaration_map: bool,
         emit_context: Rc<EmitContext>,
     ) -> Self {
         Self {
             source_file,
+            content_mapped_source,
             emit_declaration_map,
             emit_context,
             trace: None,
@@ -414,6 +419,7 @@ impl Emitter {
 
         Some(DeclarationPrint {
             source_file,
+            content_mapped_source,
             emit_declaration_map,
             emit_context,
             trace,
@@ -431,6 +437,7 @@ impl Emitter {
         let options = options();
         let DeclarationPrint {
             source_file,
+            content_mapped_source,
             emit_declaration_map,
             emit_context,
             trace: _trace,

@@ -856,6 +856,9 @@ struct TwinPrint {
     write_file: Option<WriteFile>,
     /// The transformed SourceFile.
     root: Node,
+    /// `DeclarationPrint::content_mapped_source`: a parsed SourceFile, which
+    /// every thread reads.
+    content_mapped_source: Node,
     emit_declaration_map: bool,
     tables: PrintTables,
     pack: PrintPack,
@@ -870,13 +873,15 @@ impl TwinPrint {
     /// writes, without writing.
     fn new(emitter: Emitter, print: DeclarationPrint, check: bool) -> Self {
         let root = print.source_file;
+        let content_mapped_source = print.content_mapped_source;
         let emit_declaration_map = print.emit_declaration_map;
         let tables = if check {
             print.emit_context.clone_print_tables()
         } else {
             print.emit_context.take_print_tables()
         };
-        let mut roots = vec![root];
+        // The walk skips a parsed `content_mapped_source`.
+        let mut roots = vec![root, content_mapped_source];
         tables.for_each_value_node(|n| roots.push(n));
         let pack = export_print_pack(&roots, |n, more| {
             tables.for_each_emit_node_value(n, |n| more.push(n));
@@ -901,6 +906,7 @@ impl TwinPrint {
             force_emit,
             write_file,
             root,
+            content_mapped_source,
             emit_declaration_map,
             tables,
             pack,
@@ -937,6 +943,7 @@ impl TwinPrint {
         install_print_pack(self.pack);
         let print = DeclarationPrint::new(
             self.root,
+            self.content_mapped_source,
             self.emit_declaration_map,
             crate::printer::emit_context::EmitContext::from_print_tables(self.tables),
         );
