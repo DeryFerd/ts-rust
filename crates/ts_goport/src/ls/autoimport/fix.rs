@@ -1764,7 +1764,8 @@ impl View {
 fn is_fix_possibly_re_exporting_importing_file(fix: &Fix, importing_file_name: &str) -> bool {
     if fix.is_re_export && is_index_file_name(&fix.module_file_name) {
         let re_export_dir = tspath::get_directory_path(&fix.module_file_name);
-        return importing_file_name.starts_with(re_export_dir.as_str());
+        return importing_file_name
+            .starts_with(tspath::ensure_trailing_directory_separator(&re_export_dir).as_str());
     }
     false
 }
