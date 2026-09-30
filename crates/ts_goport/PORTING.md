@@ -260,9 +260,10 @@ methods reach the AST through it.
   with no call). So the first program, a later program (`tsc -b`, watch,
   an edited file) and the node shell of a freeable version read the same
   way: a hot node read is two dependent loads, and has no call. The block
-  of a freeable version is its node shell (records, kids and foreign
-  parents leaked; no node column when its store owns its nodes; no link
-  column), so its header and child reads are block reads, and its node
+  of a freeable version is its node shell (records and kids in a pooled
+  block, step 4; foreign parents leaked; no node column when its store
+  owns its nodes; no link column), so its header and child reads are block
+  reads, and its node
   data reads read the pinned version (`static_store_node`,
   `with_scoped_store_node`). A read of the store or the `GoFile` of a
   node shell reads the pinned version out of line
@@ -272,7 +273,7 @@ methods reach the AST through it.
   calls: a call there made `Node::parent` go out of line (AST node records
   step 2b). A node shell has no link column, so `frozen_store_children`
   gives `None` and the caller reads the node data.
-- Node records (AST node records plan steps 1 to 3, `ast/store.rs`).
+- Node records (AST node records plan steps 1 to 4, `ast/store.rs`).
   Each store slot has one 32-byte `NodeRecord` (kind, bits, flags, loc,
   `up` and `bind`) and one 16-byte `NodeKids` (the U4 and C2 child ids,
   and a word with the U1 name of an identifier or the U1 (b) modifier
@@ -297,13 +298,43 @@ methods reach the AST through it.
   the halves of one word. A live bind hands its builder
   (`NodeBindBuilder`) to the install; a lib bind snapshot load hands the
   compact form (`NodeBindParts`), which the lib bind blob keeps.
-  A record read of a node of a dead freeable version (its node shell is
-  leaked) gives the values of that node; its extras read still panics. The
-  kind is a plain field: safe Rust has no inline u16 to `SyntaxKind`
-  conversion, and a slot kind never changes. A new per-slot field of the
-  hot reads goes into a record or kids word, not a new column. Debug builds
-  check the records and kids against the node data at freeze
-  (`debug_check_kids`), and each parent write against its stored form.
+  The kind is an `AtomicU16` too (step 4), so a pooled block can take
+  another file's records through a shared ref with no `unsafe`; the
+  generated `SyntaxKind::try_from` is `#[inline]` and compiles to a range
+  check. A new per-slot field of the hot reads goes into a record or kids
+  word, not a new column. Debug builds check the records and kids against
+  the node data at freeze (`debug_check_kids`), and each parent write
+  against its stored form.
+- Pooled node blocks and the owner check (AST node records step 4,
+  `BlockPool` in `ast/store.rs`). The node shell of a freeable version
+  copies its records and kids into a pooled block (a leaked block of
+  records and kids, 48 bytes per slot, with room for about 1/8 more slots
+  and 64 more). The version gives the block back when it dies; it waits
+  in a quarantine until 2 more program releases (`pin_epoch`), then a
+  later node shell of a size it fits (`len` to `2 * len + 64` slots) takes
+  it. In a language server the version that dies in the release of edit N
+  gives its block to the version of edit N + 3. `bind` of the nil slot
+  holds the owner (file id + 1), written at the publish. With debug
+  assertions every `file_block` read checks it and panics with "file
+  version N is released", as a read of a dead version's store does. A
+  release build checks it only in `bind_store_records`, the one writer of
+  a published record; its hot header and kids reads are not checked (a
+  check is a load, a compare and a branch on reads of about 6
+  instructions). So a stale header or child read of a dead version
+  (kind, parent, loc, flags, symbol, flow node, child ids, name) gives the
+  values of that node while its block waits, and the new owner's data
+  after a reuse, never undefined behavior. Its store, `GoFile`, extras,
+  flow, node data and list reads still panic. Every holder of a node of a
+  version holds the version, so a correct reader never sees a reuse; the
+  debug-assertion runs (protected tests, the corpus, and the editor and
+  oracle runs) find a missed holder. This is the owner check that the R141
+  reviewer asked for before any step that reuses records: it replaces step
+  2's tripwire (`freeable_version_owns_its_lists_and_a_stale_read_panics`
+  reads the old values inside the quarantine), and
+  `edited_file_blocks_wait_two_releases_then_get_reused` and
+  `pooled_node_blocks_wait_two_releases_and_check_their_owner` check the
+  panic after a reuse. The extras and flow nodes of a node shell stay in
+  its `GoFile` (step 6 moves them into pooled blocks).
 
 ## Program (owned by program.rs)
 
@@ -376,7 +407,8 @@ The batch that adds it is not accepted until Theo approves.
   `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The
   registry keeps a `Weak`. At publish the version takes its `FileStore`
   and its `GoFile` (M3b). Its node records and kids (`NodeRecord`,
-  `NodeKids`; 48 bytes per node) are leaked in its node shell, the registry block of its id, so a header or child
+  `NodeKids`; 48 bytes per node) are in its node shell, the registry
+  block of its id (a pooled block, AST node records step 4), so a header or child
   read of the edited file stays inline (a pinned read per node read made
   edits 3 to 4 ms slower); the child link column is dropped, and the
   binder's child walk reads the node data. With owned nodes (M3c; on by
@@ -408,8 +440,9 @@ The batch that adds it is not accepted until Theo approves.
   `DECORATORS`) forgets the entries of the file at its next write. Its
   symbols and tables in the binder lineage are whole chunks of its own
   (M3d); after it dies, the next bind frees them, and a read of one of its
-  symbol or table ids panics (index out of bounds). The header columns of
-  the node shell and the text stay leaked for now. The first publish, the
+  symbol or table ids panics (index out of bounds). Its pooled block goes
+  back to the pool (see "Pooled node blocks" above); its small `BlockFile`,
+  its foreign parents and its text stay leaked for now. The first publish, the
   first version of each file and every CLI publish never get one.
   `GOPORT_FREE_FILE_VERSIONS=0` turns this off, `=1` turns it on in any
   process; there `update_program_version` (`goport_multiprog`) also gives

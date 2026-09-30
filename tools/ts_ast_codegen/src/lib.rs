@@ -422,6 +422,7 @@ impl<'a> Generator<'a> {
         writeln!(output, "impl TryFrom<u16> for SyntaxKind {{").unwrap();
         writeln!(output, "    type Error = (); ").unwrap();
         writeln!(output).unwrap();
+        writeln!(output, "    #[inline]").unwrap();
         writeln!(output, "    #[allow(clippy::too_many_lines)]").unwrap();
         writeln!(
             output,

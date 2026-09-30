@@ -19,10 +19,13 @@
 //!
 //! M3b: at publish the version takes its `FileStore` and its `GoFile`
 //! (info, `node_bind`, `file_bind`, `flow_nodes`)
-//! (`ast::store::VersionStore`). Its node records and kids (and its
-//! foreign parents) are leaked in its node shell, the registry block of its
-//! id, so the header and child reads stay inline
-//! (`ast::store::node_shell`); the child link column is dropped.
+//! (`ast::store::VersionStore`). Its node records and kids are in its node
+//! shell, the registry block of its id, so the header and child reads stay
+//! inline (`ast::store::node_shell`); its foreign parents are leaked there,
+//! and the child link column is dropped. AST node records, step 4: the
+//! records and kids are in a pooled block that the version gives back when
+//! it dies; after two more program releases (`pin_epoch`) a later node
+//! shell can take it (`ast::store::BlockPool`).
 //! M3c (owned nodes; on by default in a language server or API process,
 //! see `owned_nodes_enabled`): its parse was a freeable parse
 //! (`ast::enter_freeable_parse`), so its store owns its astdata nodes (node
@@ -39,9 +42,13 @@
 //! When the last holder lets go, the version is dead: its store and
 //! `GoFile` are freed, its id goes to `DEAD_FILES`, and each per-file
 //! thread-local map (`PerFileMap`) forgets the entries of that id when it
-//! is next written. A later read of the id panics with "file version N is
-//! released": ids are never reused, so a missed holder panics and never
-//! reads another file.
+//! is next written. A later read of its store, `GoFile` or node data panics
+//! with "file version N is released": ids are never reused, so a missed
+//! holder panics there and never reads another file. A header or child
+//! read of its node shell reads its pooled block: the data of that node
+//! until another version takes the block, then that version's data. With
+//! debug assertions that read panics with the same message (the owner
+//! check, `ast::store::file_block`).
 //!
 //! Freeable rule (`free_file_versions`, `freeable_path`): only a parse of
 //! the language server parse cache (project/parsecache.rs), in a language
@@ -279,6 +286,14 @@ pub(crate) fn any_freeable_published() -> bool {
 // PERF: a scan, on the path of a read that found no live version only.
 fn is_dead_file(file: usize) -> bool {
     lock(&DEAD_FILES).contains(&file)
+}
+
+/// The pin epoch: the number of program releases so far
+/// (`release_file_version_pins`). A pooled node block given back at epoch
+/// `e` is free from epoch `e + 2` (`ast::store::BlockPool`).
+#[inline]
+pub(crate) fn pin_epoch() -> usize {
+    PIN_EPOCH.load(Ordering::Acquire)
 }
 
 /// Panics for a read of dead file version `file`.

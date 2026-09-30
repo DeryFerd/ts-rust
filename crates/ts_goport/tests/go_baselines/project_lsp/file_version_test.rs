@@ -14,8 +14,9 @@ use std::sync::mpsc;
 
 use ts_goport::ast::{
     dead_file_versions, file_version_probe, file_versions_made, free_file_versions,
-    owned_node_count, source_file_ecma_line_map, source_file_get_declaration_map,
-    source_file_get_name_table, source_file_imports, source_file_info,
+    node_block_addr, node_block_is_owned, owned_node_count, source_file_ecma_line_map,
+    source_file_get_declaration_map, source_file_get_name_table, source_file_imports,
+    source_file_info,
 };
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::core::Node;
@@ -319,9 +320,12 @@ child_test! {
     // parse diagnostics and the JSDoc cache, and its JSDoc slice reads the
     // cache at each use. When the version dies they go with it, and a read
     // of its store, its `GoFile` or its node data panics (a stale read never
-    // reads other data). Its header columns are leaked in its node shell
-    // (lsshells M3 repair), so a stale header read gives the data of that
-    // node; with owned nodes (M3c) its node data and lists are freed with it.
+    // reads other data). Its header columns are in its node shell (lsshells
+    // M3 repair), whose pooled block waits in the pool quarantine for 2
+    // program releases (AST node records, step 4), so a stale header read
+    // here, 1 release later, gives the data of that node; after a reuse the
+    // owner check takes over (`edited_file_blocks_wait_two_releases_then_get_reused`).
+    // With owned nodes (M3c) its node data and lists are freed with it.
     fn freeable_version_owns_its_lists_and_a_stale_read_panics() {
         let session = bare_session(files(&[
             (
@@ -370,8 +374,8 @@ child_test! {
         });
         assert_eq!(info.as_deref(), Some(stale.as_str()), "a GoFile read of a dead version");
         // AST node records, step 2: the flags (with the binder bits), the
-        // symbol and the flow node are in the node record, in the leaked node
-        // shell as the kind is. The other binder fields are in the `GoFile`.
+        // symbol and the flow node are in the node record, in the node shell
+        // as the kind is. The other binder fields are in the `GoFile`.
         let locals = panic_message(|| {
             let _ = edited.locals();
         });
@@ -388,6 +392,51 @@ child_test! {
         assert_eq!(list.as_deref(), Some(stale.as_str()), "a list read of a dead version");
         assert_eq!(diagnostics(root(&live, JS_FILE)), static_diagnostics);
         assert_eq!(diagnostics(first), static_diagnostics, "the first version is static");
+    }
+}
+
+child_test! {
+    env OWNED_NODES;
+    // AST node records, step 4: the node shell of each edited version is in
+    // a pooled block. A dead version gives it back, and it waits for two
+    // more program releases (one per edit here): the version that dies in
+    // the release of edit 3 gives its block to the version of edit 6. A read
+    // of the dead version after that fails the owner check: with debug
+    // assertions it panics, without them it reads the new version.
+    fn edited_file_blocks_wait_two_releases_then_get_reused() {
+        let session = open_p1();
+        let edit_block = |version: i32, digit: &str| {
+            body_edit(&session, version, digit);
+            let root = root(&program(&session, INDEX_URI), INDEX_FILE);
+            (root, node_block_addr(root).expect("the edited version is published"))
+        };
+        let (second, second_block) = edit_block(2, "2");
+        let (third, third_block) = edit_block(3, "3");
+        let probe = file_version_probe(third).expect("the edited version is freeable");
+        assert!(node_block_is_owned(second), "the block of the dead version waits");
+        assert_eq!(second.kind(), SyntaxKind::SourceFile);
+        let (_, fourth_block) = edit_block(4, "4");
+        let (_, fifth_block) = edit_block(5, "5");
+        assert!(![third_block, fourth_block, fifth_block].contains(&second_block));
+        let (sixth, sixth_block) = edit_block(6, "6");
+        assert!(probe.is_freed());
+        assert_eq!(sixth_block, second_block, "the block of version 2 is not reused");
+        assert!(node_block_is_owned(sixth));
+        assert!(!node_block_is_owned(second), "the block has a new owner");
+        let stale = panic_message(|| {
+            let _ = second.kind();
+        });
+        if cfg!(debug_assertions) {
+            let released = format!("file version {} is released", second.file_index());
+            assert_eq!(stale.as_deref(), Some(released.as_str()), "a stale read of a reused block");
+        } else {
+            assert_eq!(stale, None);
+        }
+        let (_, seventh_block) = edit_block(7, "7");
+        assert_eq!(seventh_block, third_block);
+        let p7 = program(&session, INDEX_URI);
+        assert_eq!(text(&p7, INDEX_FILE), "import { a } from './a';\nexport const x = a + 7;");
+        assert_eq!(sem_diag_count(&p7, INDEX_FILE), 0);
     }
 }
 

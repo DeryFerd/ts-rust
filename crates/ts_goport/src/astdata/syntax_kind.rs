@@ -1293,6 +1293,7 @@ impl SyntaxKind {
 impl TryFrom<u16> for SyntaxKind {
     type Error = ();
 
+    #[inline]
     #[allow(clippy::too_many_lines)]
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
