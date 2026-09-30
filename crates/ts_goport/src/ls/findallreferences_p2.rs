@@ -1141,8 +1141,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
                 }
             }
             let symbol_name = symbol_name(&self.checker.symbols, s);
-            let (module_name, ok) = try_get_ambient_module_name_from_symbol_name(&symbol_name);
-            if ok {
+            if let Some(module_name) = try_get_ambient_module_name_from_symbol_name(&symbol_name) {
                 text = module_name.to_string();
             } else {
                 text = symbol_name.to_string();

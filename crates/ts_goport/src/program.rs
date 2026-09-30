@@ -1787,14 +1787,17 @@ fn get_mode_for_usage_location_worker(
     {
         let is_type_only = is_exclusively_type_only_import_or_export(parent);
         if is_type_only {
-            let (override_, ok) = parent.attributes().get_resolution_mode_override();
+            let (override_, ok) = parent.attributes().get_resolution_mode_override(None);
             if ok {
                 return override_;
             }
         }
     }
     if is_literal_type_node(parent) && is_import_type_node(parent.parent()) {
-        let (override_, ok) = parent.parent().attributes().get_resolution_mode_override();
+        let (override_, ok) = parent
+            .parent()
+            .attributes()
+            .get_resolution_mode_override(None);
         if ok {
             return override_;
         }
@@ -3560,11 +3563,6 @@ impl crate::declarations::DeclarationEmitHost for EmitHost {
     // Go: compiler/emitHost.go:99 emitHost.SourceFileMayBeEmitted (#4712)
     fn source_file_may_be_emitted(&self, file: Node, force_dts_emit: bool) -> bool {
         source_file_may_be_emitted_worker(file, force_dts_emit, false)
-    }
-
-    // Go: compiler/emitHost.go:103 emitHost.GetResolutionModeOverride
-    fn get_resolution_mode_override(&self, node: Node) -> ResolutionMode {
-        self.emit_resolver.get_resolution_mode_override(node)
     }
 
     // Go: compiler/emitHost.go:90 emitHost.GetEffectiveDeclarationFlags

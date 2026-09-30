@@ -153,8 +153,7 @@ pub fn module_symbol_to_valid_identifier(
     force_capitalize: bool,
 ) -> String {
     let mut module_name = symbols.sym(module_symbol).name.as_str().to_string();
-    let (ambient_module_name, ok) = try_get_ambient_module_name_from_symbol_name(&module_name);
-    if ok {
+    if let Some(ambient_module_name) = try_get_ambient_module_name_from_symbol_name(&module_name) {
         module_name = ambient_module_name.to_string();
     }
     module_specifier_to_valid_identifier(&module_name, force_capitalize)
