@@ -208,13 +208,27 @@ impl NewProgram {
         type_ref: &FileReference,
         source_file: &ParsedSourceFile,
     ) -> Option<Rc<ResolvedTypeReferenceDirective>> {
+        self.get_resolved_type_reference_directive(
+            source_file,
+            &type_ref.file_name,
+            self.get_mode_for_type_reference_directive_in_file(type_ref, source_file),
+        )
+    }
+
+    // Go: program.go:2104 (*Program).GetResolvedTypeReferenceDirective (ts#64247)
+    pub fn get_resolved_type_reference_directive(
+        &self,
+        file: &dyn HasFileName,
+        type_directive_name: &str,
+        mode: ResolutionMode,
+    ) -> Option<Rc<ResolvedTypeReferenceDirective>> {
         let resolutions = self
             .processed_files
             .type_resolutions_in_file
-            .get(source_file.path())?;
+            .get(&file.path())?;
         let key = ModeAwareCacheKey {
-            name: type_ref.file_name.clone(),
-            mode: self.get_mode_for_type_reference_directive_in_file(type_ref, source_file),
+            name: type_directive_name.to_string(),
+            mode,
         };
         resolutions.get(&key).cloned()
     }
