@@ -29,3 +29,12 @@ scripts/goport/perf-npm.sh <label> <out>/test-rs/proj <out>/test-go/proj   # on 
 
 A shipped build uses `RELEASE_VERSION=<v> crates/ts_goport/scripts/build-release.sh` (noembed,
 PGO and BOLT) in place of the cargo line.
+
+## Linux libc
+
+The platform package has no `libc` field, as Go's has none, so npm installs it on glibc and musl
+systems alike. Go's tsc is static and starts on both. The default release tsc needs glibc 2.28 or
+later: on Alpine, or on a distro with an older glibc, it does not start, and the JS launcher fails
+too. `RELEASE_LIBC=musl RELEASE_PIE=0` in front of the build-release.sh line builds a static tsc
+that starts on any x86-64 Linux. It is 1.0 to 1.4% slower (see the build-release.sh header), so it
+is not the default.
