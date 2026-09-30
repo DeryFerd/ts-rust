@@ -1354,6 +1354,9 @@ impl<T: Clone> CowChunks<T> {
             from & COW_CHUNK_MASK == 0 && to & COW_CHUNK_MASK == 0,
             "freed indexes {from}..{to} are not whole chunks"
         );
+        // A tail that pushes filled to a chunk end (`end_chunk` does
+        // nothing there) is a chunk that the range can hold.
+        self.seal_full_tail();
         let end = (to >> COW_CHUNK_SHIFT).min(self.chunks.len());
         let first = from.div_ceil(COW_CHUNK_LEN).min(end);
         for chunk in &mut self.chunks[first..end] {
@@ -1517,6 +1520,30 @@ mod hole_tests {
         assert_eq!(values.live_chunks(), 3, "a freed chunk stays empty");
         values.push(end + 10);
         assert_eq!((values.len(), *values.get(end + 10)), (end + 11, end + 10));
+    }
+
+    // A range that pushes filled to its last index is freed too: there
+    // `end_chunk` does nothing, so the range's last chunk is still the tail
+    // when no `share_from` came between (gaps147 skeptic, cowfuzz latent2).
+    #[test]
+    fn a_full_tail_in_the_range_is_freed() {
+        let mut values = CowChunks::new();
+        push_to(&mut values, 300);
+        values.end_chunk();
+        let start = values.len();
+        push_to(&mut values, start + COW_CHUNK_LEN);
+        values.end_chunk();
+        let end = values.len();
+        assert_eq!((start, end), (2 * COW_CHUNK_LEN, 3 * COW_CHUNK_LEN));
+        assert_eq!(values.live_chunks(), 3);
+
+        values.free_chunks(start, end);
+        assert_eq!(values.live_chunks(), 2);
+        let read = |index: usize| std::panic::catch_unwind(|| *values.get(index)).is_err();
+        assert!(read(start + 5), "a read of a freed index panics");
+        assert_eq!(*values.get(299), 299);
+        values.push(end);
+        assert_eq!((values.len(), *values.get(end)), (end + 1, end));
     }
 
     // A read at or above the length panics, as a `Vec` read does: in the
