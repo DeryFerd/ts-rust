@@ -870,17 +870,7 @@ impl Checker {
                 .intersects(ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED)
             {
                 self.ty_mut(t).object_flags |= ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED;
-                let props = self
-                    .get_properties_of_union_or_intersection_type(t)
-                    .to_vec();
-                let mut some = false;
-                for prop in props {
-                    if self.is_never_reduced_property(prop) {
-                        some = true;
-                        break;
-                    }
-                }
-                if some {
+                if self.some_property_reduces_to_never(t) {
                     self.ty_mut(t).object_flags |= ObjectFlags::IS_NEVER_INTERSECTION;
                 }
             }
@@ -893,6 +883,36 @@ impl Checker {
             }
         }
         t
+    }
+
+    // Go: checker/checker.go:22203 somePropertyReducesToNever
+    // PORT: Go ranges over a map, so its order is random. Here the counts keep
+    // the order in which each name is first seen (constituent order, then
+    // property order), so the result and the types it makes are deterministic.
+    pub fn some_property_reduces_to_never(&mut self, t: TypeId) -> bool {
+        // Collect declaration counts for each property across all constituent types of the intersection.
+        let mut counts: IndexMap<Name, i32> = IndexMap::new();
+        let types = self.ty(t).types().to_vec();
+        for u in types {
+            let props = self.get_properties_of_type(u);
+            for &prop in props.iter() {
+                *counts.entry(self.sym(prop).name.clone()).or_insert(0) += 1;
+            }
+        }
+        // Check if any property appears in more than one constituent type and reduces to 'never'.
+        for (prop_name, count) in counts {
+            if count > 1 {
+                let prop = self.get_property_of_union_or_intersection_type(
+                    t,
+                    prop_name.as_str(),
+                    true, /*skipObjectFunctionPropertyAugment*/
+                );
+                if prop.is_some() && self.is_never_reduced_property(prop) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     // Go: checker/checker.go:21743 getReducedUnionType
