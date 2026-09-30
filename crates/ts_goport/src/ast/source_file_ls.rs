@@ -78,23 +78,35 @@ pub fn new_source_file_data_key<T>() -> SourceFileDataKey<T> {
     }
 }
 
-// Go: ast/ast.go:2425 GetOrComputeSourceFileData
+// Go: ast/ast.go:2404 (*SourceFile).GetOrComputeData (ts#63902)
 // PORT: Go `compute func(*SourceFile) T` is `FnOnce(Node) -> T`; the value
 // is returned by clone (Go copies `T`; callers use `Rc` or `Copy` values).
 // `compute` runs without any thread-local borrow held, so it can read other
 // data keys of the same file.
+pub fn source_file_get_or_compute_data<T: Clone + 'static>(
+    file: Node,
+    key: &SourceFileDataKey<T>,
+    compute: impl FnOnce(Node) -> T,
+) -> T {
+    let cell = source_file_get_data_cell(file, key);
+    cell.value.get_or_init(|| compute(file)).clone()
+}
+
+/// Go `GetOrComputeSourceFileData`, which ts#63902 replaced with
+/// `(*SourceFile).GetOrComputeData` (`source_file_get_or_compute_data`).
+// PORT: kept until its last user (`api/encoder/encoder.rs`, lane api) takes
+// the new name; then remove it.
 pub fn get_or_compute_source_file_data<T: Clone + 'static>(
     file: Node,
     key: &SourceFileDataKey<T>,
     compute: impl FnOnce(Node) -> T,
 ) -> T {
-    let cell = get_source_file_data_cell(file, key);
-    cell.value.get_or_init(|| compute(file)).clone()
+    source_file_get_or_compute_data(file, key, compute)
 }
 
-// Go: ast/ast.go:2433 getSourceFileDataCell
+// Go: ast/ast.go:2412 (*SourceFile).getDataCell (ts#63902)
 // PORT: a Rust reference cannot be nil, so only `key.key == 0` is checked.
-fn get_source_file_data_cell<T: 'static>(
+fn source_file_get_data_cell<T: 'static>(
     file: Node,
     key: &SourceFileDataKey<T>,
 ) -> Rc<SourceFileDataCell<T>> {

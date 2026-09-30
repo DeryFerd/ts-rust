@@ -961,8 +961,7 @@ impl Parser {
             postfix_token = self.parse_optional_token(SyntaxKind::ExclamationToken);
         }
         let type_node = self.parse_type_annotation();
-        let initializer = do_in_context(
-            self,
+        let initializer = self.do_in_context(
             NodeFlags::YIELD_CONTEXT | NodeFlags::AWAIT_CONTEXT | NodeFlags::DISALLOW_IN_CONTEXT,
             false,
             Parser::parse_initializer,
@@ -1234,8 +1233,7 @@ impl Parser {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
         let name = self.parse_property_name();
-        let initializer = do_in_context(
-            self,
+        let initializer = self.do_in_context(
             NodeFlags::DISALLOW_IN_CONTEXT,
             false,
             Parser::parse_initializer,
@@ -1300,7 +1298,7 @@ impl Parser {
         )
     }
 
-    // Go: parser/parser.go:2174 parseAmbientExternalModuleDeclaration
+    // Go: parser/parser.go:2218 parseAmbientExternalModuleDeclaration
     pub fn parse_ambient_external_module_declaration(
         &mut self,
         pos: i32,
@@ -1318,6 +1316,10 @@ impl Parser {
             // parse string literal
             name = self.parse_literal_expression();
         }
+        let mut attributes = Node::NIL;
+        if keyword == SyntaxKind::ModuleKeyword && self.parse_optional(SyntaxKind::WithKeyword) {
+            attributes = self.parse_type_literal();
+        }
         let mut body = Node::NIL;
         if self.token == SyntaxKind::OpenBraceToken {
             body = self.parse_module_block();
@@ -1326,7 +1328,7 @@ impl Parser {
         }
         let node = self
             .factory
-            .new_module_declaration(modifiers, keyword, name, body);
+            .new_module_declaration(modifiers, keyword, name, attributes, body);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.statement_has_await_identifier = save_has_await_identifier;
@@ -1384,7 +1386,7 @@ impl Parser {
         }
         let node = self
             .factory
-            .new_module_declaration(modifiers, keyword, name, body);
+            .new_module_declaration(modifiers, keyword, name, Node::NIL, body);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
@@ -1950,22 +1952,19 @@ impl Parser {
                 && self.parse_optional(SyntaxKind::ExtendsKeyword)
             {
                 // The type following 'extends' is not permitted to be another conditional type
-                let extends_type = do_in_context(
-                    self,
+                let extends_type = self.do_in_context(
                     NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT,
                     true,
                     Parser::parse_type,
                 );
                 self.parse_expected(SyntaxKind::QuestionToken);
-                let true_type = do_in_context(
-                    self,
+                let true_type = self.do_in_context(
                     NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT,
                     false,
                     Parser::parse_type,
                 );
                 self.parse_expected(SyntaxKind::ColonToken);
-                let false_type = do_in_context(
-                    self,
+                let false_type = self.do_in_context(
                     NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT,
                     false,
                     Parser::parse_type,
@@ -2058,8 +2057,7 @@ impl Parser {
             }
             _ => {}
         }
-        do_in_context(
-            self,
+        self.do_in_context(
             NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT,
             false,
             Parser::parse_postfix_type_or_higher,
@@ -2103,8 +2101,7 @@ impl Parser {
     pub fn try_parse_constraint_of_infer_type(&mut self) -> Node {
         let state = self.mark();
         if self.parse_optional(SyntaxKind::ExtendsKeyword) {
-            let constraint = do_in_context(
-                self,
+            let constraint = self.do_in_context(
                 NodeFlags::DISALLOW_CONDITIONAL_TYPES_CONTEXT,
                 true,
                 Parser::parse_type,

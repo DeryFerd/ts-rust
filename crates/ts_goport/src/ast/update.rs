@@ -2781,22 +2781,24 @@ impl NodeFactory {
         node
     }
 
-    // Go: ast/ast_generated.go:8231 UpdateModuleDeclaration
+    // Go: ast/ast_generated.go:8059 UpdateModuleDeclaration
     pub fn update_module_declaration(
         &self,
         node: Node,
         modifiers: ModifierList,
         keyword: SyntaxKind,
         name: Node,
+        attributes: Node,
         body: Node,
     ) -> Node {
         if modifiers != node.modifiers()
             || keyword != node.keyword()
             || name != node.name()
+            || attributes != node.attributes()
             || body != node.body()
         {
             return update_node(
-                self.new_module_declaration(modifiers, keyword, name, body),
+                self.new_module_declaration(modifiers, keyword, name, attributes, body),
                 node,
                 self.hooks(),
             );

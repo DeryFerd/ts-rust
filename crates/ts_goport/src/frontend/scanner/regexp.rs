@@ -19,7 +19,8 @@ use crate::flags_macros::{go_enum, go_flags};
 use crate::frontend::prelude::*;
 
 use super::scanner_p1::{
-    EscapeSequenceScanningFlags, RUNE_ERROR, Scanner, rune_to_string, utf8_decode_rune_in_string,
+    EscapeSequenceScanningFlags, IdentifierVariant, RUNE_ERROR, Scanner, rune_to_string,
+    utf8_decode_rune_in_string,
 };
 use super::unicode_properties::*;
 
@@ -739,9 +740,11 @@ impl<'a> RegExpParser<'a> {
     fn scan_group_name(&mut self, is_reference: bool) {
         debug_assert!(self.pos() > 0 && self.text().as_bytes()[self.pos() as usize - 1] == b'<');
         self.scanner.scanner_state.token_start = self.pos();
-        self.scanner.scan_identifier(0);
+        let scanned = self
+            .scanner
+            .scan_identifier(0, IdentifierVariant::REG_EXP_GROUP_NAME);
         let token_start = self.scanner.scanner_state.token_start;
-        if self.pos() == token_start {
+        if !scanned {
             let pos = self.pos();
             self.error(diag::Expected_a_capturing_group_name, pos, 0, vec![]);
         } else if is_reference {
