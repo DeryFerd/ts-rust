@@ -340,14 +340,28 @@ struct Uint128 {
 // So the test is "a program made here has this file"
 // (`program_parsed_source_file`), not "some parse of this file exists"
 // (`parsed_source_file_of`, which also finds that root config).
+// At pin N a file of no program can also come from the parse cache:
+// api/session.go createSourceFile (ts#64434) takes its file from the
+// snapshot host's parse cache, so its Go `Hash` is `fh.Hash()`, and a
+// program that has the same file shares it (the client keeps one object per
+// content hash). Such a file keeps the hash that the parse cache recorded
+// for its text (`recorded_source_file_hash`); the root config has none.
 fn source_file_content_hash(source_file: Node) -> Uint128 {
     if source_file.is_nil() || is_synthetic_node(source_file) {
         return Uint128::default();
     }
-    let Some(parsed) = crate::program::ls_program::program_parsed_source_file(source_file) else {
-        return Uint128::default();
+    let h = match crate::program::ls_program::program_parsed_source_file(source_file) {
+        Some(parsed) => crate::project::parsecache::source_file_hash(parsed.text),
+        None => {
+            let recorded = parsed_source_file_of(source_file).and_then(|parsed| {
+                crate::project::parsecache::recorded_source_file_hash(parsed.text)
+            });
+            let Some(h) = recorded else {
+                return Uint128::default();
+            };
+            h
+        }
     };
-    let h = crate::project::parsecache::source_file_hash(parsed.text);
     Uint128 {
         hi: (h >> 64) as u64,
         lo: h as u64,

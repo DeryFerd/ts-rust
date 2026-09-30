@@ -1864,9 +1864,12 @@ fn get_emit_syntax_for_usage_location_worker(
 
 /// Lazy JSDoc of `node` in `file` (Go `SourceFile.resolveJSDoc`).
 // PORT: the files of an alias resolver program are in no program, or in
-// another program version; `go_frontend` keeps their parser inputs.
+// another program version; `go_frontend` keeps their parser inputs. So
+// does a read with no current program: the api encodes a leased source
+// file (api/session.go encodeLeasedSourceFile, ts#64434) outside any
+// program, and Go's `SourceFile` resolves its JSDoc by itself.
 pub fn resolve_lazy_js_doc(file: Node, node: Node) -> Option<&'static [Node]> {
-    if state().alias_resolver {
+    if crate::core::try_prog().is_none() || state().alias_resolver {
         return go_frontend::resolve_js_doc_outside_program(file, node);
     }
     Some(with_go(|go| go.resolve_js_doc(file, node)))

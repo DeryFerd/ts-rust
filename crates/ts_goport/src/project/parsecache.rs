@@ -272,6 +272,15 @@ pub fn source_file_hash(text: &'static str) -> u128 {
         .unwrap_or_else(|| xxh3_128(text.as_bytes()))
 }
 
+/// Go `file.Hash` of a file that the parse cache or the content-mapped
+/// parse cache made on this thread, or `None` for a text that neither
+/// recorded (a parse whose Go `Hash` stays 0).
+// PORT: for the api encoder: a file of no program that a parse cache made
+// (api/session.go createSourceFile, ts#64434) has a Go `Hash`.
+pub fn recorded_source_file_hash(text: &'static str) -> Option<u128> {
+    TEXT_HASHES.with_borrow(|hashes| hashes.get(&text_id(text)).copied())
+}
+
 /// Go `contentMappedParseCache.Deref(key)` for a program file or a
 /// duplicate source file. When the bundle entry is gone, the hashes of its
 /// files are forgotten too.
