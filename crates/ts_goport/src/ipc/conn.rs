@@ -7,7 +7,7 @@
 
 use crate::ipc::prelude::*;
 
-use crate::frontend::json::{UnmarshalerFrom, json_unmarshal};
+use crate::frontend::json::UnmarshalerFrom;
 use crate::frontend::json_ext::{AnyValue, JsonValue};
 use crate::gostd::{Context, GoError, errors};
 use std::sync::LazyLock;
@@ -72,7 +72,8 @@ pub fn unmarshal_params<T: UnmarshalerFrom + Default>(
         return Ok(None);
     }
     let mut v = T::default();
-    if let Err(err) = json_unmarshal(params, &mut v, &[]) {
+    // Go `json.Unmarshal(params, &v)`, with the v2 error texts.
+    if let Err(err) = crate::frontend::json_ext::unmarshal_root(params, &mut v) {
         return Err(errors::from_value(err));
     }
     Ok(Some(v))

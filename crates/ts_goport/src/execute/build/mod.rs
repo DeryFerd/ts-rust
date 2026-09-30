@@ -7,6 +7,7 @@ pub mod host;
 pub mod orchestrator;
 pub mod orchestrator_watch;
 pub mod parse_cache;
+pub mod shared_outputs;
 pub mod up_to_date_status;
 
 pub use build_task::*;

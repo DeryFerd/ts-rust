@@ -129,7 +129,13 @@ impl Protocol for MessagePackProtocol {
             Ok(payload) => payload,
             Err(err) => return Err(errors::from_value(err)),
         };
-        self.write_tuple(MessageType::CALL, method, payload.as_bytes())
+        // PORT: the text is in the port form; the connection gets its Go
+        // bytes.
+        self.write_tuple(
+            MessageType::CALL,
+            method,
+            &crate::scanner_util::go_string_bytes(&payload),
+        )
     }
 
     // Go: protocol_msgpack.go:193 WriteNotification
@@ -164,8 +170,10 @@ impl Protocol for MessagePackProtocol {
         {
             payload = raw.0.clone();
         } else {
+            // PORT: the text is in the port form; the connection gets its
+            // Go bytes.
             payload = match json_marshal(&result, &[]) {
-                Ok(payload) => payload.into_bytes(),
+                Ok(payload) => crate::scanner_util::go_string_bytes(&payload).into_owned(),
                 Err(err) => return Err(errors::from_value(err)),
             };
         }

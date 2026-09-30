@@ -2302,6 +2302,17 @@ pub fn release_program_in_background(program: &'static GoProgram) {
     ));
 }
 
+/// `release_program_in_background` that frees the frontend program only
+/// when the result drops. The tables go at once, as in
+/// `release_program_in_background`: the checker threads keep them until
+/// they end, so the last of them frees them in the background. `tsc -b`
+/// drops the result when its orchestrator thread would wait anyway.
+pub fn release_program_in_background_later(program: &'static GoProgram) -> ReleasedProgram {
+    let mut released = release_program_with(program, CheckerPool::shut_down_in_background);
+    drop(released.tables.take());
+    released
+}
+
 /// `release_program` with the pool stop that `shut_down` names. The caller
 /// picks when the result drops.
 fn release_program_with(
@@ -2995,6 +3006,31 @@ fn create_checkers() -> CheckerPool {
         threads,
         emit: None,
     }
+}
+
+/// PORT: not in Go (perf). Sends each checker thread of the current
+/// program a job that borrows no checker and drops a value that `signal`
+/// makes. It runs after the jobs sent to that thread before, so when every
+/// value has dropped, those jobs are done; a value also drops when its job
+/// can no longer run (the thread ended). Returns how many it sent: 0 when
+/// the program has no checker pool on this thread. `tsc -b` learns this way
+/// that the check and emit that a task started are done
+/// (build/orchestrator.rs `build_all_tasks`).
+pub fn send_checker_barrier<T: Send + 'static>(signal: impl Fn() -> T) -> usize {
+    let id = prog().id;
+    POOLS.with(|pools| {
+        let pools = pools.borrow();
+        let Some(pool) = pools.get(&id) else {
+            return 0;
+        };
+        for worker in &pool.workers {
+            let value = signal();
+            worker
+                .send(Box::new(move || drop(value)))
+                .expect("checker thread stopped");
+        }
+        pool.workers.len()
+    })
 }
 
 /// Starts `f` with checker `index` on its thread and returns where the

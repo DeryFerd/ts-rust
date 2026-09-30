@@ -17,15 +17,19 @@
 //!   the compiler marshals (strings, booleans, slices and ordered maps).
 //!
 //! PORT: without legacy flags every v2 unmarshal error is fatal
-//! (`isFatalError`), so every impl returns the first error. Most error
-//! messages are not the v2 texts; no caller shows them. The exceptions are
-//! the ones the LSP and the API show: a kind mismatch of a string, a boolean
-//! or a number is a v2 `SemanticError` (`json_ext::unmarshal_kind_error`),
-//! `json_unmarshal_decode` gives a method's plain error the Go type (as the
-//! v2 arshaler of a type with a method does), and the max depth error of the
-//! decoder has the Go `jsontext` text (`json_ext::syntactic_error_text`).
+//! (`isFatalError`), so every impl returns the first error. The decoder's
+//! errors are Go's `jsontext.SyntacticError` texts (prefix, JSON pointer and
+//! offset), which the LSP and the API show (`SyntaxErr`). Most unmarshal
+//! errors of the impls in this file are not the v2 texts; no caller shows
+//! them. The exceptions are the ones the LSP and the API show: a kind
+//! mismatch of a string, a boolean or a number is a v2 `SemanticError`
+//! (`json_ext::unmarshal_kind_error`), and `json_unmarshal_decode` gives a
+//! method's plain error the Go type (as the v2 arshaler of a type with a
+//! method does). `json_ext` has the v2 `SemanticError` texts for the LSP and
+//! API types.
 
 use crate::frontend::prelude::*;
+use std::borrow::Cow;
 
 /// Go JSON v2 `*json.SemanticError` / `*jsontext.SyntacticError`.
 /// PORT: one error type with a message.
@@ -121,11 +125,49 @@ const MAX_NESTING_DEPTH: usize = 10000;
 
 // One open JSON object or array (Go jsontext `stateEntry` plus the
 // namespace of seen object names).
-struct Frame {
+struct Frame<'a> {
     is_object: bool,
     len: usize,
     // `None` when duplicate names are allowed or the namespace is disabled.
-    names: Option<FxHashSet<String>>,
+    // PERF: a name is its unquoted text before the port form conversion
+    // (`scan_string`), which is one to one, so equal names are still equal.
+    // A name with no escape borrows the input.
+    names: Option<FxHashSet<Cow<'a, str>>>,
+    // The offset of the opening quote of the last object name read in this
+    // object (Go `objectNameStack`). Only the error texts read it.
+    name: usize,
+}
+
+/// PORT: not in Go (perf). A `JsonToken` whose text borrows the input
+/// where it can (`JsonDecoder::read_token_ref`): a string with no escape
+/// and no port form change, and each number.
+#[derive(Clone, Debug, PartialEq)]
+pub enum JsonTokenRef<'a> {
+    Null,
+    False,
+    True,
+    String(Cow<'a, str>),
+    /// The raw number text.
+    Number(&'a str),
+    BeginObject,
+    EndObject,
+    BeginArray,
+    EndArray,
+}
+
+/// A token of `JsonDecoder::next_token`: a `JsonToken` whose string is the
+/// unquoted text before the port form conversion, and whose number is the
+/// raw text, both borrowed from the input when they can be.
+enum RawToken<'a> {
+    Null,
+    False,
+    True,
+    String(Cow<'a, str>),
+    Number(&'a str),
+    BeginObject,
+    EndObject,
+    BeginArray,
+    EndArray,
 }
 
 /// Go `jsontext.Decoder` over a complete input buffer.
@@ -134,9 +176,11 @@ pub struct JsonDecoder<'a> {
     // Go `prevEnd`: the end of the last read token or value.
     pos: usize,
     // Open containers. The top-level virtual array is `top_len`.
-    stack: Vec<Frame>,
+    stack: Vec<Frame<'a>>,
     top_len: usize,
     pub options: JsonOptions,
+    // PERF: the name sets of closed objects, empty, for the next objects.
+    spare_names: Vec<FxHashSet<Cow<'a, str>>>,
 }
 
 fn is_ws(c: u8) -> bool {
@@ -182,6 +226,7 @@ impl<'a> JsonDecoder<'a> {
             stack: Vec::new(),
             top_len: 0,
             options,
+            spare_names: Vec::new(),
         }
     }
 
@@ -228,10 +273,12 @@ impl<'a> JsonDecoder<'a> {
 
     // Go jsontext `decoderState.PeekKind` without the cache: the position and
     // normalized kind of the next token, after whitespace and one delimiter.
+    // The errors are Go's (the decoder reads a complete buffer, so Go's
+    // `fetch` fails at its end with `io.ErrUnexpectedEOF`).
     fn peek_pos(&self) -> Result<(usize, u8), JsonError> {
         let mut p = self.skip_ws(self.pos);
         if p >= self.buf.len() {
-            return Err(JsonError::new("unexpected EOF"));
+            return Err(self.eof_before_token(p));
         }
         let mut delim = 0;
         let c = self.buf[p];
@@ -239,15 +286,12 @@ impl<'a> JsonDecoder<'a> {
             delim = c;
             p = self.skip_ws(p + 1);
             if p >= self.buf.len() {
-                return Err(JsonError::new("unexpected EOF"));
+                return Err(self.eof_after_delim(delim, p));
             }
         }
         let next = normalize_kind(self.buf[p]);
         if self.need_delim(next) != delim {
-            return Err(JsonError::new(format!(
-                "invalid character {:?} at offset {p}",
-                char::from(self.buf[p])
-            )));
+            return Err(self.check_delim(delim, next));
         }
         Ok((p, next))
     }
@@ -258,13 +302,26 @@ impl<'a> JsonDecoder<'a> {
         self.peek_pos().map_or(0, |(_, k)| k)
     }
 
+    /// Go `jsontext.Decoder.InputOffset`: the end of the last token or value
+    /// read.
+    #[must_use]
+    pub fn input_offset(&self) -> usize {
+        self.pos
+    }
+
     /// Go `jsontext.Decoder.DisableNamespace` (the export helper
     /// `Tokens.Last.DisableNamespace`): stop duplicate-name checks for the
     /// innermost open object.
     pub fn disable_namespace(&mut self) {
-        if let Some(f) = self.stack.last_mut() {
-            f.names = None;
+        if let Some(names) = self.stack.last_mut().and_then(|f| f.names.take()) {
+            self.keep_names(names);
         }
+    }
+
+    /// Keeps the emptied name set `names` for a later object.
+    fn keep_names(&mut self, mut names: FxHashSet<Cow<'a, str>>) {
+        names.clear();
+        self.spare_names.push(names);
     }
 
     /// Go `jsontext.Decoder.StackDepth` plus the length of the innermost
@@ -273,9 +330,11 @@ impl<'a> JsonDecoder<'a> {
         (self.stack.len(), self.last_len())
     }
 
-    fn append_value(&mut self) -> Result<(), JsonError> {
+    // Go `stateMachine.appendLiteral` / `appendNumber` for the token that
+    // starts at `start`.
+    fn append_value(&mut self, start: usize) -> Result<(), JsonError> {
         if self.need_object_name() {
-            return Err(JsonError::new("object member name must be a string"));
+            return Err(self.syntactic_error(SyntaxErr::NonStringName, start, 1, &[]));
         }
         self.increment();
         Ok(())
@@ -283,63 +342,104 @@ impl<'a> JsonDecoder<'a> {
 
     /// Go `jsontext.Decoder.ReadToken`.
     pub fn read_token(&mut self) -> Result<JsonToken, JsonError> {
+        Ok(match self.next_token()? {
+            RawToken::Null => JsonToken::Null,
+            RawToken::False => JsonToken::False,
+            RawToken::True => JsonToken::True,
+            RawToken::String(s) => JsonToken::String(self.string_value(s)),
+            RawToken::Number(raw) => JsonToken::Number(raw.to_string()),
+            RawToken::BeginObject => JsonToken::BeginObject,
+            RawToken::EndObject => JsonToken::EndObject,
+            RawToken::BeginArray => JsonToken::BeginArray,
+            RawToken::EndArray => JsonToken::EndArray,
+        })
+    }
+
+    /// PORT: not in Go (perf). `read_token` as a `JsonTokenRef`: the same
+    /// token, checks and errors, without a copy of text that it can borrow.
+    pub fn read_token_ref(&mut self) -> Result<JsonTokenRef<'a>, JsonError> {
+        Ok(match self.next_token()? {
+            RawToken::Null => JsonTokenRef::Null,
+            RawToken::False => JsonTokenRef::False,
+            RawToken::True => JsonTokenRef::True,
+            RawToken::String(s) => JsonTokenRef::String(
+                if self.options.port_form || !crate::scanner_util::contains_go_string_marker(&s) {
+                    s
+                } else {
+                    Cow::Owned(self.string_value(s))
+                },
+            ),
+            RawToken::Number(raw) => JsonTokenRef::Number(raw),
+            RawToken::BeginObject => JsonTokenRef::BeginObject,
+            RawToken::EndObject => JsonTokenRef::EndObject,
+            RawToken::BeginArray => JsonTokenRef::BeginArray,
+            RawToken::EndArray => JsonTokenRef::EndArray,
+        })
+    }
+
+    /// The string of a `JsonToken`: the unquoted text `s` in the port form.
+    fn string_value(&self, s: Cow<'a, str>) -> String {
+        if self.options.port_form {
+            return s.into_owned();
+        }
+        crate::scanner_util::go_string_from_utf8(s.into_owned())
+    }
+
+    /// `read_token` without the `JsonToken` copies of the text
+    /// (`RawToken`): the same checks, state changes and errors.
+    fn next_token(&mut self) -> Result<RawToken<'a>, JsonError> {
         let (p, _) = self.peek_pos()?;
         let c = self.buf[p];
         match c {
             b'n' | b't' | b'f' => {
-                let (lit, tok): (&[u8], JsonToken) = match c {
-                    b'n' => (b"null", JsonToken::Null),
-                    b't' => (b"true", JsonToken::True),
-                    _ => (b"false", JsonToken::False),
+                let (lit, tok): (&[u8], RawToken<'a>) = match c {
+                    b'n' => (b"null", RawToken::Null),
+                    b't' => (b"true", RawToken::True),
+                    _ => (b"false", RawToken::False),
                 };
                 if !self.buf[p..].starts_with(lit) {
-                    return Err(JsonError::new(format!("invalid literal at offset {p}")));
+                    let (pos, err) = consume_literal_error(self.buf, p, lit);
+                    return Err(self.syntactic_error(err, pos, 1, &[]));
                 }
-                self.append_value()?;
+                self.append_value(p)?;
                 self.pos = p + lit.len();
                 Ok(tok)
             }
             b'"' => {
-                let (end, s) = self.consume_string(p)?;
+                let (end, s) = self.scan_string(p)?;
                 if self.need_object_name() {
                     let dup = match &mut self.stack.last_mut().expect("object frame").names {
                         Some(names) => !names.insert(s.clone()),
                         None => false,
                     };
                     if dup {
-                        return Err(JsonError::new(format!(
-                            "duplicate object member name {s:?}"
-                        )));
+                        let name = pointer_token_of_name(&self.buf[p..end]);
+                        return Err(self.syntactic_error(SyntaxErr::DuplicateName, p, 1, &[name]));
                     }
+                    self.stack.last_mut().expect("object frame").name = p;
                 }
                 self.increment();
                 self.pos = end;
-                Ok(JsonToken::String(s))
+                Ok(RawToken::String(s))
             }
             b'-' | b'0'..=b'9' => {
                 let end = self.consume_number(p)?;
-                self.append_value()?;
+                self.append_value(p)?;
                 self.pos = end;
                 let raw = std::str::from_utf8(&self.buf[p..end]).expect("number is ASCII");
-                Ok(JsonToken::Number(raw.to_string()))
+                Ok(RawToken::Number(raw))
             }
             b'{' | b'[' => {
                 if self.need_object_name() {
-                    return Err(JsonError::new("object member name must be a string"));
+                    return Err(self.syntactic_error(SyntaxErr::NonStringName, p, 1, &[]));
                 }
                 if self.stack.len() == MAX_NESTING_DEPTH {
-                    return Err(JsonError::new(
-                        crate::frontend::json_ext::syntactic_error_text(
-                            self.buf,
-                            p,
-                            "exceeded max depth",
-                        ),
-                    ));
+                    return Err(self.syntactic_error(SyntaxErr::MaxDepth, p, 1, &[]));
                 }
                 self.increment();
                 let is_object = c == b'{';
                 let names = if is_object && !self.options.allow_duplicate_names {
-                    Some(FxHashSet::default())
+                    Some(self.spare_names.pop().unwrap_or_default())
                 } else {
                     None
                 };
@@ -347,57 +447,88 @@ impl<'a> JsonDecoder<'a> {
                     is_object,
                     len: 0,
                     names,
+                    name: 0,
                 });
                 self.pos = p + 1;
                 Ok(if is_object {
-                    JsonToken::BeginObject
+                    RawToken::BeginObject
                 } else {
-                    JsonToken::BeginArray
+                    RawToken::BeginArray
                 })
             }
             b'}' => {
                 if !self.last_is_object() {
-                    return Err(JsonError::new("mismatching structural token for object"));
+                    return Err(self.syntactic_error(SyntaxErr::MismatchDelim, p, 1, &[]));
                 }
                 if self.need_object_value() {
-                    return Err(JsonError::new("missing value after object name"));
+                    return Err(self.syntactic_error(SyntaxErr::MissingValue, p, 1, &[]));
                 }
-                self.stack.pop();
+                if let Some(names) = self.stack.pop().and_then(|f| f.names) {
+                    self.keep_names(names);
+                }
                 self.pos = p + 1;
-                Ok(JsonToken::EndObject)
+                Ok(RawToken::EndObject)
             }
             b']' => {
                 if self.stack.is_empty() || self.last_is_object() {
-                    return Err(JsonError::new("mismatching structural token for array"));
+                    return Err(self.syntactic_error(SyntaxErr::MismatchDelim, p, 1, &[]));
                 }
                 self.stack.pop();
                 self.pos = p + 1;
-                Ok(JsonToken::EndArray)
+                Ok(RawToken::EndArray)
             }
-            _ => Err(JsonError::new(format!(
-                "invalid character {:?} at offset {p}",
-                char::from(c)
-            ))),
+            _ => Err(self.syntactic_error(
+                invalid_character(self.buf, p, "at start of value"),
+                p,
+                1,
+                &[],
+            )),
         }
     }
 
     /// Go `jsontext.Decoder.ReadValue`: the raw bytes of the next complete
     /// value (or object name).
+    // PORT: the value is read token by token. On an error the state goes
+    // back to where it was before the value, as in Go, and the error is the
+    // one that Go's `consumeValue` finds (`read_value_error`).
     pub fn read_value(&mut self) -> Result<&'a [u8], JsonError> {
         let (start, _) = self.peek_pos()?;
         let depth = self.stack.len();
-        let tok = self.read_token()?;
-        if matches!(tok, JsonToken::BeginObject | JsonToken::BeginArray) {
-            while self.stack.len() > depth {
-                self.read_token()?;
+        let before = (
+            self.pos,
+            self.last_len(),
+            self.stack.last().map_or(0, |f| f.name),
+        );
+        let result = (|| {
+            let tok = self.next_token()?;
+            if matches!(tok, RawToken::BeginObject | RawToken::BeginArray) {
+                while self.stack.len() > depth {
+                    self.next_token()?;
+                }
             }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(&self.buf[start..self.pos]),
+            Err(err) => Err(self.read_value_error(start, depth, before, err)),
         }
-        Ok(&self.buf[start..self.pos])
     }
 
-    /// Go `jsontext.Decoder.SkipValue`.
+    /// Go `jsontext.Decoder.SkipValue`: an object or array is read token by
+    /// token, any other value with `read_value`.
     pub fn skip_value(&mut self) -> Result<(), JsonError> {
-        self.read_value().map(|_| ())
+        match self.peek_kind() {
+            b'{' | b'[' => {
+                let depth = self.stack.len();
+                loop {
+                    self.next_token()?;
+                    if self.stack.len() <= depth {
+                        return Ok(());
+                    }
+                }
+            }
+            _ => self.read_value().map(|_| ()),
+        }
     }
 
     /// Go `jsontext` `decoderState.CheckEOF`: only whitespace may follow the
@@ -405,40 +536,74 @@ impl<'a> JsonDecoder<'a> {
     pub fn check_eof(&self) -> Result<(), JsonError> {
         let p = self.skip_ws(self.pos);
         if p < self.buf.len() {
-            return Err(JsonError::new(format!(
-                "invalid character {:?} after top-level value",
-                char::from(self.buf[p])
-            )));
+            return Err(self.syntactic_error(
+                invalid_character(self.buf, p, "after top-level value"),
+                p,
+                0,
+                &[],
+            ));
         }
         Ok(())
     }
 
     // Go `jsonwire.ConsumeString` plus unquoting. Returns the end offset and
-    // the unquoted text.
-    // PORT: the text is in the port form (see `JsonOptions::port_form`).
-    fn consume_string(&self, p: usize) -> Result<(usize, String), JsonError> {
-        let (end, out) = self.consume_string_chars(p)?;
-        if self.options.port_form {
-            return Ok((end, out));
+    // the unquoted text, before the port form conversion (`string_value`).
+    // PERF: a string with no escape and no control character whose bytes
+    // are valid UTF-8 is its own unquoted text, so it is borrowed. Any
+    // other string, and each error, goes through `consume_string_chars`.
+    fn scan_string(&self, p: usize) -> Result<(usize, Cow<'a, str>), JsonError> {
+        let b = self.buf;
+        let start = p + 1;
+        let mut i = start;
+        while let Some(&c) = b.get(i) {
+            if c == b'"' {
+                if let Ok(text) = std::str::from_utf8(&b[start..i]) {
+                    return Ok((i + 1, Cow::Borrowed(text)));
+                }
+                break;
+            }
+            if c == b'\\' || c < 0x20 {
+                break;
+            }
+            i += 1;
         }
-        Ok((end, crate::scanner_util::go_string_from_utf8(out)))
+        let (end, out) = self.consume_string_chars(p)?;
+        Ok((end, Cow::Owned(out)))
     }
 
     fn consume_string_chars(&self, p: usize) -> Result<(usize, String), JsonError> {
+        self.consume_string_raw(p)
+            .map_err(|(pos, err)| self.syntactic_error(err, pos, 1, &[]))
+    }
+
+    // Go `jsonwire.ConsumeStringResumable` (with `validateUTF8` unless
+    // `allow_invalid_utf8`) plus unquoting. An error is Go's error and its
+    // offset (`consumeString`: at the start of a cut escape, and at the end
+    // of the input when the string is cut).
+    fn consume_string_raw(&self, p: usize) -> Result<(usize, String), (usize, SyntaxErr)> {
         let b = self.buf;
+        let validate = !self.options.allow_invalid_utf8;
+        if b.get(p) != Some(&b'"') {
+            if p >= b.len() {
+                return Err((p, SyntaxErr::UnexpectedEof));
+            }
+            return Err((
+                p,
+                invalid_character(b, p, "at start of string (expecting '\"')"),
+            ));
+        }
         let mut out = String::new();
         let mut i = p + 1;
         loop {
             let Some(&c) = b.get(i) else {
-                return Err(JsonError::new("unexpected EOF within string"));
+                return Err((b.len(), SyntaxErr::UnexpectedEof));
             };
             match c {
                 b'"' => return Ok((i + 1, out)),
                 b'\\' => {
                     let Some(&e) = b.get(i + 1) else {
-                        return Err(JsonError::new("unexpected EOF within string"));
+                        return Err((i, SyntaxErr::UnexpectedEof));
                     };
-                    i += 2;
                     match e {
                         b'"' => out.push('"'),
                         b'\\' => out.push('\\'),
@@ -449,112 +614,780 @@ impl<'a> JsonDecoder<'a> {
                         b'r' => out.push('\r'),
                         b't' => out.push('\t'),
                         b'u' => {
-                            let v1 = self.parse_hex4(i)?;
-                            i += 4;
-                            if (0xD800..0xE000).contains(&v1) {
-                                // A surrogate must be a high surrogate followed by
-                                // an escaped low surrogate.
-                                let mut decoded = None;
-                                if v1 < 0xDC00
-                                    && b.get(i) == Some(&b'\\')
-                                    && b.get(i + 1) == Some(&b'u')
-                                {
-                                    let v2 = self.parse_hex4(i + 2)?;
-                                    if (0xDC00..0xE000).contains(&v2) {
-                                        decoded = char::from_u32(
-                                            0x10000 + ((v1 - 0xD800) << 10) + (v2 - 0xDC00),
-                                        );
-                                        if decoded.is_some() {
-                                            i += 6;
-                                        }
-                                    }
+                            let escape = i;
+                            if b.len() < i + 6 {
+                                if has_escaped_utf16_prefix(&b[i..], false) {
+                                    return Err((escape, SyntaxErr::UnexpectedEof));
                                 }
+                                return Err((i, invalid_escape(&b[i..])));
+                            }
+                            let Some(v1) = parse_hex4(&b[i + 2..i + 6]) else {
+                                return Err((i, invalid_escape(&b[i..i + 6])));
+                            };
+                            i += 6;
+                            if (0xD800..0xE000).contains(&v1) {
+                                // Go checks the pair only with `validateUTF8`.
+                                let v2 = if b.len() < i + 6 {
+                                    if validate && has_escaped_utf16_prefix(&b[i..], true) {
+                                        return Err((escape, SyntaxErr::UnexpectedEof));
+                                    }
+                                    None
+                                } else if b[i] == b'\\' && b[i + 1] == b'u' {
+                                    parse_hex4(&b[i + 2..i + 6])
+                                } else {
+                                    None
+                                };
+                                let decoded = v2.and_then(|v2| {
+                                    ((0xD800..0xDC00).contains(&v1)
+                                        && (0xDC00..0xE000).contains(&v2))
+                                    .then(|| {
+                                        char::from_u32(
+                                            0x10000 + ((v1 - 0xD800) << 10) + (v2 - 0xDC00),
+                                        )
+                                    })
+                                    .flatten()
+                                });
                                 match decoded {
-                                    Some(ch) => out.push(ch),
-                                    None if self.options.allow_invalid_utf8 => out.push('\u{FFFD}'),
+                                    Some(ch) => {
+                                        out.push(ch);
+                                        i += 6;
+                                    }
+                                    None if !validate => out.push('\u{FFFD}'),
                                     None => {
-                                        return Err(JsonError::new(
-                                            "invalid surrogate in string escape",
-                                        ));
+                                        let what = &b[escape..(escape + 12).min(b.len())];
+                                        return Err((escape, invalid_escape(what)));
                                     }
                                 }
                             } else {
                                 out.push(char::from_u32(v1).expect("non-surrogate BMP code point"));
                             }
+                            continue;
                         }
-                        _ => return Err(JsonError::new("invalid escape sequence in string")),
+                        _ => return Err((i, invalid_escape(&b[i..i + 2]))),
                     }
+                    i += 2;
                 }
-                0x00..=0x1F => return Err(JsonError::new("invalid control character in string")),
+                0x00..=0x1F => {
+                    return Err((
+                        i,
+                        invalid_character(b, i, "in string (expecting non-control character)"),
+                    ));
+                }
                 0x20..=0x7F => {
-                    out.push(char::from(c));
+                    // PERF: the run of plain ASCII bytes up to the next quote,
+                    // backslash, control or non-ASCII byte in one copy.
+                    let start = i;
                     i += 1;
+                    while let Some(&c) = b.get(i) {
+                        if c == b'"' || c == b'\\' || c < 0x20 || c >= 0x80 {
+                            break;
+                        }
+                        i += 1;
+                    }
+                    out.push_str(std::str::from_utf8(&b[start..i]).expect("ASCII run"));
                 }
                 _ => match decode_utf8(&b[i..]) {
                     Some((ch, n)) => {
                         out.push(ch);
                         i += n;
                     }
-                    None if self.options.allow_invalid_utf8 => {
+                    None if !go_full_rune(&b[i..]) => {
+                        return Err((i, SyntaxErr::UnexpectedEof));
+                    }
+                    None if !validate => {
                         out.push('\u{FFFD}');
                         i += 1;
                     }
-                    None => return Err(JsonError::new("invalid UTF-8 within string")),
+                    None => return Err((i, SyntaxErr::InvalidUtf8)),
                 },
             }
         }
     }
 
-    fn parse_hex4(&self, i: usize) -> Result<u32, JsonError> {
-        let mut v = 0;
-        for k in 0..4 {
-            let Some(d) = self.buf.get(i + k).copied().and_then(hex_val) else {
-                return Err(JsonError::new("invalid escape sequence in string"));
-            };
-            v = v * 16 + d;
-        }
-        Ok(v)
-    }
-
     // Go `jsonwire.ConsumeNumber`: `-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?`.
     fn consume_number(&self, p: usize) -> Result<usize, JsonError> {
-        let b = self.buf;
-        let digits = |mut i: usize| {
-            let s = i;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
+        consume_number_raw(self.buf, p).map_err(|(pos, err)| self.syntactic_error(err, pos, 1, &[]))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Go jsontext syntactic errors
+// ---------------------------------------------------------------------------
+
+/// The `Err` of a Go `jsontext.SyntacticError` that the decoder makes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SyntaxErr {
+    /// Go `jsonwire.InvalidTextError`: its `Label`, `What` (the raw input
+    /// text) and `Where`.
+    InvalidText {
+        label: &'static str,
+        what: Vec<u8>,
+        at: String,
+    },
+    /// Go `io.ErrUnexpectedEOF`.
+    UnexpectedEof,
+    /// Go `jsonwire.ErrInvalidUTF8`.
+    InvalidUtf8,
+    /// Go `jsontext.ErrDuplicateName`.
+    DuplicateName,
+    /// Go `jsontext.ErrNonStringName`.
+    NonStringName,
+    /// Go jsontext `errMissingValue`.
+    MissingValue,
+    /// Go jsontext `errMismatchDelim`.
+    MismatchDelim,
+    /// Go jsontext `errMaxDepth`.
+    MaxDepth,
+}
+
+/// A `SyntaxErr` of Go's `consumeValue`, its offset, and the pointer
+/// tokens (outermost first) that Go's `pointerSuffixError` adds.
+type ConsumeError = (usize, SyntaxErr, Vec<String>);
+
+impl SyntaxErr {
+    // Go `err.Error()`.
+    fn text(&self) -> String {
+        match self {
+            SyntaxErr::InvalidText { label, what, at } => invalid_text_error(label, what, at),
+            SyntaxErr::UnexpectedEof => "unexpected EOF".to_string(),
+            SyntaxErr::InvalidUtf8 => "invalid UTF-8".to_string(),
+            SyntaxErr::DuplicateName => "duplicate object member name".to_string(),
+            SyntaxErr::NonStringName => "object member name must be a string".to_string(),
+            SyntaxErr::MissingValue => "missing value after object name".to_string(),
+            SyntaxErr::MismatchDelim => {
+                "mismatching structural token for object or array".to_string()
             }
-            (i, i - s)
+            SyntaxErr::MaxDepth => "exceeded max depth".to_string(),
+        }
+    }
+}
+
+// Go: jsonwire/wire.go:129 NewInvalidCharacterError: the first rune of
+// `buf[pos..]` (one byte when it is not valid UTF-8).
+fn invalid_character(buf: &[u8], pos: usize, at: impl Into<String>) -> SyntaxErr {
+    let rest = &buf[pos.min(buf.len())..];
+    SyntaxErr::InvalidText {
+        label: "character",
+        what: rest[..go_decode_rune_len(rest)].to_vec(),
+        at: at.into(),
+    }
+}
+
+// Go: jsonwire/wire.go:134 NewInvalidEscapeSequenceError
+fn invalid_escape(what: &[u8]) -> SyntaxErr {
+    SyntaxErr::InvalidText {
+        label: if what.len() > 6 {
+            "surrogate pair"
+        } else {
+            "escape sequence"
+        },
+        what: what.to_vec(),
+        at: "in string".to_string(),
+    }
+}
+
+// Go: jsonwire/wire.go:146 (*InvalidTextError).Error
+fn invalid_text_error(label: &str, what: &[u8], at: &str) -> String {
+    let mut runes = 0;
+    let mut need_escape = false;
+    let mut i = 0;
+    while i < what.len() {
+        let n = go_decode_rune_len(&what[i..]);
+        match decode_utf8(&what[i..]) {
+            Some((c, _)) => {
+                need_escape |= c == '`'
+                    || c == '\u{FFFD}'
+                    || c.is_whitespace()
+                    || !crate::gostd::strconv::is_print(c);
+            }
+            None => need_escape = true,
+        }
+        runes += 1;
+        i += n;
+    }
+    let quoted = if runes == 1 {
+        go_quote_rune_bytes(what)
+    } else if need_escape {
+        go_quote_bytes(what)
+    } else {
+        format!("`{}`", String::from_utf8_lossy(what))
+    };
+    let text = format!("invalid {label} {quoted} {at}");
+    match text.strip_suffix(' ') {
+        Some(t) => t.to_string(),
+        None => text,
+    }
+}
+
+// Go `utf8.DecodeRune(b)` size: 0 for no input, 1 for a byte that does not
+// start a valid rune.
+fn go_decode_rune_len(b: &[u8]) -> usize {
+    if b.is_empty() {
+        return 0;
+    }
+    decode_utf8(b).map_or(1, |(_, n)| n)
+}
+
+// Go: utf8.FullRune
+fn go_full_rune(b: &[u8]) -> bool {
+    let Some(&c) = b.first() else {
+        return false;
+    };
+    let (need, lo, hi) = match c {
+        0xC2..=0xDF => (2, 0x80, 0xBF),
+        0xE0 => (3, 0xA0, 0xBF),
+        0xE1..=0xEC | 0xEE..=0xEF => (3, 0x80, 0xBF),
+        0xED => (3, 0x80, 0x9F),
+        0xF0 => (4, 0x90, 0xBF),
+        0xF1..=0xF3 => (4, 0x80, 0xBF),
+        0xF4 => (4, 0x80, 0x8F),
+        // ASCII, or a byte that cannot start a rune.
+        _ => return true,
+    };
+    if b.len() >= need {
+        return true;
+    }
+    // Short or invalid.
+    (b.len() > 1 && !(lo..=hi).contains(&b[1])) || (b.len() > 2 && !(0x80..=0xBF).contains(&b[2]))
+}
+
+// Go: jsonwire/wire.go:62 QuoteRune
+fn go_quote_rune_bytes(b: &[u8]) -> String {
+    match decode_utf8(b) {
+        Some((c, _)) => crate::gostd::strconv::quote_rune(c),
+        None if b.is_empty() => crate::gostd::strconv::quote_rune('\u{FFFD}'),
+        None => format!("'\\x{:x}'", b[0]),
+    }
+}
+
+// Go `strconv.Quote` of a byte string: a byte that is not valid UTF-8 is
+// `\x` and two hex digits.
+fn go_quote_bytes(b: &[u8]) -> String {
+    let mut out = String::from("\"");
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        while let Some((_, n)) = decode_utf8(&b[i..]) {
+            i += n;
+        }
+        if i > start {
+            let run = std::str::from_utf8(&b[start..i]).expect("valid UTF-8 run");
+            let quoted = crate::gostd::strconv::quote(run);
+            out.push_str(&quoted[1..quoted.len() - 1]);
+        }
+        if i < b.len() {
+            out.push_str(&format!("\\x{:02x}", b[i]));
+            i += 1;
+        }
+    }
+    out.push('"');
+    out
+}
+
+// Go: jsonwire/decode.go:299 hasEscapedUTF16Prefix
+fn has_escaped_utf16_prefix(b: &[u8], lower_surrogate_half: bool) -> bool {
+    for (i, &c) in b.iter().enumerate() {
+        let ok = match i {
+            0 => c == b'\\',
+            1 => c == b'u',
+            2 if lower_surrogate_half => c == b'd' || c == b'D',
+            3 if lower_surrogate_half => matches!(c, b'c'..=b'f' | b'C'..=b'F'),
+            _ => true,
         };
-        let invalid = || JsonError::new(format!("invalid number at offset {p}"));
-        let mut i = p;
-        if b.get(i) == Some(&b'-') {
+        if !ok || ((2..6).contains(&i) && hex_val(c).is_none()) {
+            return false;
+        }
+    }
+    true
+}
+
+// Go: jsonwire parseHexUint16
+fn parse_hex4(b: &[u8]) -> Option<u32> {
+    b.iter().try_fold(0, |v, &c| hex_val(c).map(|d| v * 16 + d))
+}
+
+// Go `ConsumeLiteral` of the literal `lit` at `p`, which is not all there:
+// the offset and error of `consumeLiteral`.
+fn consume_literal_error(b: &[u8], p: usize, lit: &[u8]) -> (usize, SyntaxErr) {
+    let rest = &b[p..];
+    for i in 0..rest.len().min(lit.len()) {
+        if rest[i] != lit[i] {
+            let at = format!(
+                "in literal {} (expecting {})",
+                std::str::from_utf8(lit).expect("ASCII literal"),
+                crate::gostd::strconv::quote_rune(char::from(lit[i]))
+            );
+            return (p + i, invalid_character(b, p + i, at));
+        }
+    }
+    (b.len(), SyntaxErr::UnexpectedEof)
+}
+
+// Go `jsonwire.ConsumeNumberResumable` through `consumeNumber`: the end
+// offset, or the offset and error. A number that the input cuts short is
+// `io.ErrUnexpectedEOF` at the start of the number.
+fn consume_number_raw(b: &[u8], p: usize) -> Result<usize, (usize, SyntaxErr)> {
+    fn digits(b: &[u8], mut i: usize) -> usize {
+        while i < b.len() && b[i].is_ascii_digit() {
             i += 1;
         }
+        i
+    }
+    fn expect_digit(b: &[u8], p: usize, i: usize) -> Result<usize, (usize, SyntaxErr)> {
         match b.get(i) {
-            Some(b'0') => i += 1,
-            Some(b'1'..=b'9') => i = digits(i).0,
-            _ => return Err(invalid()),
+            None => Err((p, SyntaxErr::UnexpectedEof)),
+            Some(c) if c.is_ascii_digit() => Ok(digits(b, i + 1)),
+            Some(_) => Err((i, invalid_character(b, i, "in number (expecting digit)"))),
         }
-        if b.get(i) == Some(&b'.') {
-            let (j, n) = digits(i + 1);
-            if n == 0 {
-                return Err(invalid());
-            }
-            i = j;
-        }
-        if matches!(b.get(i), Some(b'e' | b'E')) {
+    }
+    let mut i = p;
+    if b.get(i) == Some(&b'-') {
+        i += 1;
+    }
+    i = if b.get(i) == Some(&b'0') {
+        i + 1
+    } else {
+        expect_digit(b, p, i)?
+    };
+    if b.get(i) == Some(&b'.') {
+        i = expect_digit(b, p, i + 1)?;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
             i += 1;
-            if matches!(b.get(i), Some(b'+' | b'-')) {
-                i += 1;
-            }
-            let (j, n) = digits(i);
-            if n == 0 {
-                return Err(invalid());
-            }
-            i = j;
         }
-        Ok(i)
+        i = expect_digit(b, p, i)?;
+    }
+    Ok(i)
+}
+
+// Go `appendEscapePointerName`: a JSON pointer token for an object name.
+fn escape_pointer_token(name: &str) -> String {
+    let mut b = String::with_capacity(name.len());
+    for c in name.chars() {
+        // Per RFC 6901, section 3, escape '~' and '/' characters.
+        match c {
+            '~' => b.push_str("~0"),
+            '/' => b.push_str("~1"),
+            c => b.push(c),
+        }
+    }
+    b
+}
+
+// The pointer token of the object name `quoted` (a JSON string with its
+// quotes), unquoted as Go `jsonwire.UnquoteMayCopy` does (invalid UTF-8
+// becomes U+FFFD).
+fn pointer_token_of_name(quoted: &[u8]) -> String {
+    let dec = JsonDecoder::new(
+        quoted,
+        JsonOptions {
+            allow_invalid_utf8: true,
+            ..JsonOptions::default()
+        },
+    );
+    escape_pointer_token(
+        &dec.consume_string_raw(0)
+            .map(|(_, s)| s)
+            .unwrap_or_default(),
+    )
+}
+
+// Go: jsontext/errors.go:120 (*SyntacticError).Error
+fn syntactic_error_text(err: &SyntaxErr, mut pointer: String, mut offset: usize) -> String {
+    use crate::gostd::strconv::quote;
+    let mut b = String::from("jsontext: ");
+    b.push_str(&err.text());
+    if *err == SyntaxErr::DuplicateName {
+        // Go `Pointer.LastToken` and `Pointer.Parent`.
+        let slash = pointer.rfind('/').unwrap_or(0);
+        let last = pointer[slash..]
+            .strip_prefix('/')
+            .unwrap_or(&pointer[slash..]);
+        let last = last.replace("~1", "/").replace("~0", "~");
+        b.push(' ');
+        b.push_str(&quote(&last));
+        pointer.truncate(slash);
+        offset = 0; // not useful to print offset for duplicate names
+    }
+    if !pointer.is_empty() {
+        b.push_str(" within ");
+        b.push_str(&quote(&crate::frontend::json_ext::truncate_pointer(
+            &pointer, 100,
+        )));
+    }
+    if offset > 0 {
+        b.push_str(" after offset ");
+        b.push_str(&offset.to_string());
+    }
+    b
+}
+
+impl JsonDecoder<'_> {
+    // Go: jsontext/state.go:180 appendStackPointer
+    fn stack_pointer(&self, at: i32) -> String {
+        let mut b = String::new();
+        let n = self.stack.len();
+        for (i, f) in self.stack.iter().enumerate() {
+            // By default point to the previous array element.
+            let mut index = f.len.wrapping_sub(1);
+            if i + 1 == n {
+                let need_value = f.is_object && f.len % 2 == 1;
+                let need_name = f.is_object && f.len.is_multiple_of(2);
+                if (at < 0 && f.len == 0) || (at == 0 && !need_value) || (at > 0 && need_name) {
+                    return b;
+                }
+                if at > 0 && !f.is_object {
+                    // Point to the next array element.
+                    index = f.len;
+                }
+            }
+            b.push('/');
+            if f.is_object {
+                b.push_str(&pointer_token_of_name(self.quoted_name_at(f.name)));
+            } else {
+                b.push_str(&index.to_string());
+            }
+        }
+        b
+    }
+
+    // The JSON string (with its quotes) that starts at `p`.
+    fn quoted_name_at(&self, p: usize) -> &[u8] {
+        let end = JsonDecoder::new(
+            &self.buf[p..],
+            JsonOptions {
+                allow_invalid_utf8: true,
+                ..JsonOptions::default()
+            },
+        )
+        .consume_string_raw(0)
+        .map_or(self.buf.len() - p, |(end, _)| end);
+        &self.buf[p..p + end]
+    }
+
+    /// Go `wrapSyntacticError(d, err, pos, where)` and the text of the
+    /// `SyntacticError`: `suffix` holds the pointer tokens (outermost first)
+    /// that a `pointerSuffixError` adds to the stack pointer.
+    #[cold]
+    #[inline(never)]
+    fn syntactic_error(&self, err: SyntaxErr, pos: usize, at: i32, suffix: &[String]) -> JsonError {
+        let mut pointer = self.stack_pointer(at);
+        for token in suffix {
+            pointer.push('/');
+            pointer.push_str(token);
+        }
+        let mut err = err;
+        if err == SyntaxErr::MismatchDelim {
+            let mut place = "at start of value";
+            if !self.stack.is_empty() && self.last_len() > 0 {
+                place = if self.last_is_object() {
+                    "after object value (expecting ',' or '}')"
+                } else {
+                    "after array element (expecting ',' or ']')"
+                };
+                // The problem is with the parent object or array.
+                pointer.truncate(pointer.rfind('/').unwrap_or(0));
+            }
+            err = invalid_character(self.buf, pos, place);
+        }
+        JsonError::new(syntactic_error_text(&err, pointer, pos))
+    }
+
+    /// Go `errNonSingularValue` of an `UnmarshalJSONFrom` method of the Go
+    /// type of `T` that did not read exactly one value, wrapped by
+    /// `newSemanticErrorWithPosition`: the pointer points to the next value
+    /// when the method read nothing (`read_nothing`), else to the parent
+    /// (Go `where` 0).
+    #[cold]
+    fn non_singular_value_error<T: ?Sized>(&self, read_nothing: bool) -> JsonError {
+        let at = if read_nothing { 1 } else { 0 };
+        crate::frontend::json_ext::SemanticError {
+            wrapped: true,
+            json_kind: 0,
+            json_value: String::new(),
+            go_type: crate::frontend::json_ext::go_type_name::<T>(),
+            pointer: Some(self.stack_pointer(at)),
+            byte_offset: self.skip_ws(self.pos),
+            pos: crate::frontend::json_ext::ErrorPos::Before,
+            err: "must read or write exactly one value".to_string(),
+        }
+        .into_json_error()
+    }
+
+    /// Go `newDuplicateNameError(dec.StackPointer(), nil, offset)` of a map
+    /// or `any` unmarshaler that finds a duplicate name after it read it
+    /// (the namespace is disabled): the text shows the name and the pointer
+    /// of its object.
+    #[cold]
+    #[must_use]
+    pub fn duplicate_name_error(&self) -> JsonError {
+        JsonError::new(syntactic_error_text(
+            &SyntaxErr::DuplicateName,
+            self.stack_pointer(-1),
+            0,
+        ))
+    }
+
+    // Go `ReadToken`/`ReadValue`/`PeekKind` when the input ends before the
+    // next token. At the top level Go returns `io.EOF`, which
+    // `json.Unmarshal` (`unmarshalFull`) turns into a `SyntacticError` of
+    // `io.ErrUnexpectedEOF` at the end of the input, with no pointer.
+    #[cold]
+    fn eof_before_token(&self, p: usize) -> JsonError {
+        if self.stack.is_empty() {
+            return JsonError::new(syntactic_error_text(
+                &SyntaxErr::UnexpectedEof,
+                String::new(),
+                self.buf.len(),
+            ));
+        }
+        self.syntactic_error(SyntaxErr::UnexpectedEof, p, 0, &[])
+    }
+
+    // Go `checkDelimBeforeIOError`: the input ends after `delim`. A string
+    // can always come next, so `delim` is checked against one.
+    #[cold]
+    fn eof_after_delim(&self, delim: u8, p: usize) -> JsonError {
+        if self.need_delim(b'"') != delim {
+            return self.check_delim(delim, b'"');
+        }
+        self.syntactic_error(SyntaxErr::UnexpectedEof, p, 0, &[])
+    }
+
+    // Go: jsontext/decode.go:391 checkDelim, for a `delim` that `next` does
+    // not allow. The error is at the delimiter (or `next` when there is
+    // none).
+    #[cold]
+    fn check_delim(&self, delim: u8, next: u8) -> JsonError {
+        let place = match self.need_delim(next) {
+            b':' if delim != b':' => "after object name (expecting ':')",
+            b',' if delim != b',' => {
+                if self.last_is_object() {
+                    "after object value (expecting ',' or '}')"
+                } else {
+                    "after array element (expecting ',' or ']')"
+                }
+            }
+            _ => "at start of value",
+        };
+        let pos = self.skip_ws(self.pos);
+        self.syntactic_error(invalid_character(self.buf, pos, place), pos, 0, &[])
+    }
+
+    // The Go error of a `ReadValue` of the value at `start`, which failed
+    // in the port with `err`. The state goes back to `before` (the offset,
+    // the length and the last name of the innermost container at `depth`).
+    // An object or array is checked again as Go's `consumeValue` does, which
+    // reads it whole before the state check; a `}` or `]` is Go's
+    // `consumeValue` error; any other value fails as it does in
+    // `ReadToken`, so `err` is Go's.
+    #[cold]
+    #[inline(never)]
+    fn read_value_error(
+        &mut self,
+        start: usize,
+        depth: usize,
+        before: (usize, usize, usize),
+        err: JsonError,
+    ) -> JsonError {
+        while self.stack.len() > depth {
+            if let Some(names) = self.stack.pop().and_then(|f| f.names) {
+                self.keep_names(names);
+            }
+        }
+        self.pos = before.0;
+        match self.stack.last_mut() {
+            Some(f) => {
+                f.len = before.1;
+                f.name = before.2;
+            }
+            None => self.top_len = before.1,
+        }
+        match self.buf[start] {
+            b'{' | b'[' | b'}' | b']' => match self.go_consume_value(start, depth + 1) {
+                Err((pos, e, suffix)) => self.syntactic_error(e, pos, 1, &suffix),
+                // Go `pushObject` / `pushArray`.
+                Ok(_) if self.need_object_name() => {
+                    self.syntactic_error(SyntaxErr::NonStringName, start, 1, &[])
+                }
+                Ok(_) if self.stack.len() == MAX_NESTING_DEPTH => {
+                    self.syntactic_error(SyntaxErr::MaxDepth, start, 1, &[])
+                }
+                Ok(_) => err,
+            },
+            _ => err,
+        }
+    }
+
+    // Go: jsontext/decode.go:857 consumeValue with consumeObject and
+    // consumeArray, for the value at `start`, whose `depth` is Go's (the
+    // stack depth plus one). Gives the end of the value, or Go's error, its
+    // offset and pointer suffix.
+    // PORT: Go recurses; this keeps its own stack of open containers.
+    fn go_consume_value(&self, start: usize, depth: usize) -> Result<usize, ConsumeError> {
+        struct Open {
+            is_object: bool,
+            // The pointer token of the member being read (name or index).
+            member: String,
+            index: usize,
+            names: Option<FxHashSet<String>>,
+        }
+        // An error at `pos`: each open container but the innermost adds its
+        // member; the innermost adds it when `wrap`.
+        fn fail(open: &[Open], pos: usize, err: SyntaxErr, wrap: bool) -> ConsumeError {
+            let n = open.len() - usize::from(!wrap && !open.is_empty());
+            let suffix = open[..n].iter().map(|o| o.member.clone()).collect();
+            (pos, err, suffix)
+        }
+        enum Step {
+            Value,
+            AfterValue,
+            BeforeName,
+        }
+        let b = self.buf;
+        let mut open: Vec<Open> = Vec::new();
+        let mut p = start;
+        let mut step = Step::Value;
+        loop {
+            match step {
+                Step::Value => {
+                    let c = b[p];
+                    match normalize_kind(c) {
+                        b'n' | b't' | b'f' => {
+                            let lit: &[u8] = match c {
+                                b'n' => b"null",
+                                b't' => b"true",
+                                _ => b"false",
+                            };
+                            if !b[p..].starts_with(lit) {
+                                let (pos, err) = consume_literal_error(b, p, lit);
+                                return Err(fail(&open, pos, err, true));
+                            }
+                            p += lit.len();
+                        }
+                        b'"' => match self.consume_string_raw(p) {
+                            Ok((end, _)) => p = end,
+                            Err((pos, err)) => return Err(fail(&open, pos, err, true)),
+                        },
+                        b'0' => match consume_number_raw(b, p) {
+                            Ok(end) => p = end,
+                            Err((pos, err)) => return Err(fail(&open, pos, err, true)),
+                        },
+                        b'{' | b'[' => {
+                            if depth + open.len() == MAX_NESTING_DEPTH + 1 {
+                                return Err(fail(&open, p, SyntaxErr::MaxDepth, true));
+                            }
+                            let is_object = c == b'{';
+                            open.push(Open {
+                                is_object,
+                                member: "0".to_string(),
+                                index: 0,
+                                names: (is_object && !self.options.allow_duplicate_names)
+                                    .then(FxHashSet::default),
+                            });
+                            p = self.skip_ws(p + 1);
+                            if p >= b.len() {
+                                return Err(fail(&open, p, SyntaxErr::UnexpectedEof, false));
+                            }
+                            if b[p] == if is_object { b'}' } else { b']' } {
+                                open.pop();
+                                p += 1;
+                            } else {
+                                step = if is_object {
+                                    Step::BeforeName
+                                } else {
+                                    Step::Value
+                                };
+                                continue;
+                            }
+                        }
+                        next => {
+                            let last_is_object = self.last_is_object();
+                            let err = if (last_is_object && next == b']')
+                                || (!last_is_object && next == b'}')
+                            {
+                                SyntaxErr::MismatchDelim
+                            } else {
+                                invalid_character(b, p, "at start of value")
+                            };
+                            return Err(fail(&open, p, err, true));
+                        }
+                    }
+                    step = Step::AfterValue;
+                }
+                Step::BeforeName => {
+                    p = self.skip_ws(p);
+                    if p >= b.len() {
+                        return Err(fail(&open, p, SyntaxErr::UnexpectedEof, false));
+                    }
+                    let name_start = p;
+                    let (end, name) = self
+                        .consume_string_raw(p)
+                        .map_err(|(pos, err)| fail(&open, pos, err, false))?;
+                    let top = open.last_mut().expect("open object");
+                    top.member = escape_pointer_token(&name);
+                    if let Some(names) = &mut top.names
+                        && !names.insert(name)
+                    {
+                        return Err(fail(&open, name_start, SyntaxErr::DuplicateName, true));
+                    }
+                    p = self.skip_ws(end);
+                    if p >= b.len() {
+                        return Err(fail(&open, p, SyntaxErr::UnexpectedEof, true));
+                    }
+                    if b[p] != b':' {
+                        let err = invalid_character(b, p, "after object name (expecting ':')");
+                        return Err(fail(&open, p, err, true));
+                    }
+                    p = self.skip_ws(p + 1);
+                    if p >= b.len() {
+                        return Err(fail(&open, p, SyntaxErr::UnexpectedEof, true));
+                    }
+                    step = Step::Value;
+                }
+                Step::AfterValue => {
+                    let Some(top) = open.last_mut() else {
+                        return Ok(p);
+                    };
+                    p = self.skip_ws(p);
+                    if p >= b.len() {
+                        return Err(fail(&open, p, SyntaxErr::UnexpectedEof, false));
+                    }
+                    let is_object = top.is_object;
+                    match b[p] {
+                        b',' => {
+                            p += 1;
+                            if is_object {
+                                step = Step::BeforeName;
+                            } else {
+                                top.index += 1;
+                                top.member = top.index.to_string();
+                                p = self.skip_ws(p);
+                                if p >= b.len() {
+                                    return Err(fail(&open, p, SyntaxErr::UnexpectedEof, false));
+                                }
+                                step = Step::Value;
+                            }
+                        }
+                        c if c == if is_object { b'}' } else { b']' } => {
+                            open.pop();
+                            p += 1;
+                        }
+                        _ => {
+                            let place = if is_object {
+                                "after object value (expecting ',' or '}')"
+                            } else {
+                                "after array element (expecting ',' or ']')"
+                            };
+                            let err = invalid_character(b, p, place);
+                            return Err(fail(&open, p, err, false));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -586,9 +1419,14 @@ impl UnmarshalerFrom for String {
                 *self = s;
                 Ok(())
             }
-            k => {
-                dec.skip_value()?;
-                Err(crate::frontend::json_ext::unmarshal_kind_error(k, "string"))
+            _ => {
+                // Go reads the value with `ReadValue`, so its syntax error
+                // comes first.
+                let val = dec.read_value()?;
+                Err(crate::frontend::json_ext::unmarshal_kind_error(
+                    normalize_kind(val[0]),
+                    "string",
+                ))
             }
         }
     }
@@ -602,8 +1440,10 @@ impl UnmarshalerFrom for bool {
                 *self = dec.read_token()? == JsonToken::True;
                 Ok(())
             }
+            // Go reads one token; it skips the rest of the value only with
+            // legacy semantics.
             k => {
-                dec.skip_value()?;
+                dec.read_token()?;
                 Err(crate::frontend::json_ext::unmarshal_kind_error(k, "bool"))
             }
         }
@@ -629,16 +1469,21 @@ impl UnmarshalerFrom for f64 {
                 let v: f64 = raw.parse().map_err(|_| JsonError::new("invalid number"))?;
                 *self = v;
                 if v.is_infinite() {
-                    return Err(JsonError::new(format!(
-                        "cannot unmarshal JSON number {raw} into Go float64: value out of range"
-                    )));
+                    return Err(crate::frontend::json_ext::unmarshal_value_error(
+                        raw.as_bytes(),
+                        "float64",
+                        "value out of range",
+                    ));
                 }
                 Ok(())
             }
-            k => {
-                dec.skip_value()?;
+            _ => {
+                // Go reads the value with `ReadValue`, so its syntax error
+                // comes first.
+                let val = dec.read_value()?;
                 Err(crate::frontend::json_ext::unmarshal_kind_error(
-                    k, "float64",
+                    normalize_kind(val[0]),
+                    "float64",
                 ))
             }
         }
@@ -675,9 +1520,7 @@ impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for FxHashMap<String,
                     let mut v = V::default();
                     if let Some(existing) = self.get(&k) {
                         if !allow_dup && seen.as_ref().is_none_or(|s| s.contains(&k)) {
-                            return Err(JsonError::new(format!(
-                                "duplicate object member name {k:?}"
-                            )));
+                            return Err(dec.duplicate_name_error());
                         }
                         v = existing.clone();
                     }
@@ -691,16 +1534,12 @@ impl<V: UnmarshalerFrom + Default + Clone> UnmarshalerFrom for FxHashMap<String,
                 dec.read_token()?;
                 Ok(())
             }
-            _ => {
-                if tok == JsonToken::BeginArray {
-                    // Go `newUnmarshalErrorAfterWithSkipping`.
-                    while dec.peek_kind() != b']' {
-                        dec.skip_value()?;
-                    }
-                    dec.read_token()?;
-                }
-                Err(JsonError::new("cannot unmarshal JSON value into Go map"))
-            }
+            // Go `newUnmarshalErrorAfterWithSkipping` skips the rest of the
+            // value only with legacy semantics.
+            _ => Err(crate::frontend::json_ext::unmarshal_kind_error(
+                tok.kind(),
+                &crate::frontend::json_ext::go_type_name::<Self>(),
+            )),
         }
     }
 }
@@ -1219,11 +2058,11 @@ pub fn json_unmarshal<T: UnmarshalerFrom + ?Sized>(
 
 // Go: json/json.go:61 UnmarshalDecode
 // PORT: Go merges `opts` into the decoder options; callers here pass none,
-// so the decoder options apply. The v2 check that an `UnmarshalerFrom`
-// reads exactly one value is kept. A plain error of the method of `T` gets
-// the Go type `T` (`json_ext::wrap_method_error`), as the v2 arshaler of a
-// type with an `UnmarshalJSONFrom` method does; an error that already has
-// its type keeps it.
+// so the decoder options apply. The v2 method arshaler is kept: a plain
+// error of the `UnmarshalerFrom` of `T` gets the Go type of `T`
+// (`json_ext::wrap_method_error`), as the v2 arshaler of a type with an
+// `UnmarshalJSONFrom` method does, and an error that already has its type
+// keeps it. The method must read exactly one value.
 pub fn json_unmarshal_decode<T: UnmarshalerFrom + ?Sized>(
     dec: &mut JsonDecoder<'_>,
     out: &mut T,
@@ -1233,7 +2072,9 @@ pub fn json_unmarshal_decode<T: UnmarshalerFrom + ?Sized>(
         .map_err(crate::frontend::json_ext::wrap_method_error::<T>)?;
     let (curr_depth, curr_len) = dec.depth_length();
     if prev_depth != curr_depth || prev_len + 1 != curr_len {
-        return Err(JsonError::new("must read exactly one JSON value"));
+        return Err(
+            dec.non_singular_value_error::<T>(prev_depth == curr_depth && prev_len == curr_len)
+        );
     }
     Ok(())
 }
@@ -1331,6 +2172,114 @@ mod marshal_depth_tests {
 }
 
 #[cfg(test)]
+mod syntax_error_tests {
+    use super::*;
+
+    // Go N texts (encoding/json/v2 of Go 1.27, tsgo pin 673a5f17d713):
+    // `json.Unmarshal` into a `jsontext.Value` (Go `ReadValue`, then the end
+    // of input check) and `jsontext.Decoder.SkipValue` (Go `ReadToken` for
+    // an object or array). `None` is the same text as `ReadValue`.
+    #[test]
+    fn syntax_errors_match_go() {
+        let cases: [(&[u8], &str, Option<&str>); 18] = [
+            (
+                b"nulx",
+                "jsontext: invalid character 'x' in literal null (expecting 'l') after offset 3",
+                None,
+            ),
+            (
+                b"1.x",
+                "jsontext: invalid character 'x' in number (expecting digit) after offset 2",
+                None,
+            ),
+            (b"-", "jsontext: unexpected EOF", None),
+            (
+                br#""a\u12x4""#,
+                "jsontext: invalid escape sequence `\\u12x4` in string after offset 2",
+                None,
+            ),
+            (
+                br#""\ud800\u0041""#,
+                "jsontext: invalid surrogate pair `\\ud800\\u0041` in string after offset 1",
+                None,
+            ),
+            (
+                b"\"a\x01\"",
+                "jsontext: invalid character '\\x01' in string (expecting non-control character) after offset 2",
+                None,
+            ),
+            (b"\"\xff\"", "jsontext: invalid UTF-8 after offset 1", None),
+            (
+                br#"{"a":1,}"#,
+                "jsontext: invalid character '}' at start of string (expecting '\"') after offset 7",
+                Some("jsontext: invalid character ',' at start of value after offset 6"),
+            ),
+            (
+                br#"{"a" 1}"#,
+                "jsontext: invalid character '1' after object name (expecting ':') within \"/a\" after offset 5",
+                None,
+            ),
+            (
+                br#"{"a":1:2}"#,
+                "jsontext: invalid character ':' after object value (expecting ',' or '}') after offset 6",
+                None,
+            ),
+            (
+                b"[1,]",
+                "jsontext: invalid character ']' at start of value within \"/1\" after offset 3",
+                Some("jsontext: invalid character ',' at start of value after offset 2"),
+            ),
+            (
+                br#"{"a":[}"#,
+                "jsontext: invalid character '}' at start of value within \"/a/0\" after offset 6",
+                None,
+            ),
+            (
+                br#"{1:2}"#,
+                "jsontext: invalid character '1' at start of string (expecting '\"') after offset 1",
+                Some("jsontext: object member name must be a string after offset 1"),
+            ),
+            (
+                br#"{"a":}"#,
+                "jsontext: invalid character '}' at start of value within \"/a\" after offset 5",
+                Some("jsontext: missing value after object name within \"/a\" after offset 5"),
+            ),
+            (
+                br#"{"a":1} x"#,
+                "jsontext: invalid character 'x' after top-level value after offset 8",
+                None,
+            ),
+            (b" ", "jsontext: unexpected EOF after offset 1", None),
+            (
+                br#"{"a/b~c":{"d":[1,2,x]}}"#,
+                "jsontext: invalid character 'x' at start of value within \"/a~1b~0c/d/2\" after offset 19",
+                None,
+            ),
+            (
+                b"[1,\xe2\x82",
+                "jsontext: invalid character '\\xe2' at start of value within \"/1\" after offset 3",
+                None,
+            ),
+        ];
+        for (input, value, tokens) in cases {
+            let mut dec = JsonDecoder::new(input, JsonOptions::default());
+            let err = dec.read_value().and_then(|_| dec.check_eof()).unwrap_err();
+            assert_eq!(err.message, value, "ReadValue of {input:?}");
+            if input.ends_with(b" x") {
+                continue;
+            }
+            let mut dec = JsonDecoder::new(input, JsonOptions::default());
+            let err = dec.skip_value().unwrap_err();
+            assert_eq!(
+                err.message,
+                tokens.unwrap_or(value),
+                "SkipValue of {input:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod marshal_indent_tests {
     use super::*;
 
@@ -1348,5 +2297,123 @@ mod marshal_indent_tests {
             "{\n \t\"a\": [\n \t\t\"x\",\n \t\t\"y:{\"\n \t],\n \t\"b\": [],\n \t\"c\": [\n \t\t[\n \t\t\ttrue\n \t\t],\n \t\t[]\n \t]\n }"
         );
         assert_eq!(json_marshal_indent("s", "", "  ").unwrap(), "\"s\"");
+    }
+}
+
+#[cfg(test)]
+mod decode_string_tests {
+    use super::*;
+
+    fn token_ref_of(token: &JsonToken) -> JsonTokenRef<'static> {
+        match token {
+            JsonToken::Null => JsonTokenRef::Null,
+            JsonToken::False => JsonTokenRef::False,
+            JsonToken::True => JsonTokenRef::True,
+            JsonToken::BeginObject => JsonTokenRef::BeginObject,
+            JsonToken::EndObject => JsonTokenRef::EndObject,
+            JsonToken::BeginArray => JsonTokenRef::BeginArray,
+            JsonToken::EndArray => JsonTokenRef::EndArray,
+            JsonToken::String(_) | JsonToken::Number(_) => unreachable!("compared by text"),
+        }
+    }
+
+    // `scan_string` borrows only where `consume_string_chars` gives the
+    // same text, and gives its end offset and errors everywhere.
+    #[test]
+    fn scan_string_matches_consume_string_chars() {
+        let bodies: [&[u8]; 16] = [
+            b"",
+            b"plain ascii",
+            b"tab\there",
+            b"quote \\\" and \\\\ and \\/",
+            b"\\u0041\\u00e9\\ud83d\\ude00",
+            b"\\ud800 lone",
+            "caf\u{e9} \u{1f600} \u{fdd0}".as_bytes(),
+            b"bad \xff byte",
+            b"overlong \xc0\x80",
+            b"surrogate \xed\xa0\x80",
+            b"cut \xe2\x82",
+            b"ctl \x01",
+            b"del \x7f",
+            b"\\x bad escape",
+            b"\\u12 short",
+            b"unterminated",
+        ];
+        for allow_invalid_utf8 in [false, true] {
+            let options = JsonOptions {
+                allow_invalid_utf8,
+                ..JsonOptions::default()
+            };
+            for body in bodies {
+                for terminated in [true, false] {
+                    let mut input = vec![b'"'];
+                    input.extend_from_slice(body);
+                    if terminated {
+                        input.extend_from_slice(b"\" ,");
+                    }
+                    let dec = JsonDecoder::new(&input, options);
+                    let fast = dec.scan_string(0).map(|(end, s)| (end, s.into_owned()));
+                    let slow = dec.consume_string_chars(0);
+                    assert_eq!(
+                        fast, slow,
+                        "{input:?} allow_invalid_utf8={allow_invalid_utf8}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Names with and without escapes share one namespace per object, and a
+    // later object starts with an empty one.
+    #[test]
+    fn duplicate_names() {
+        let read_all = |text: &str| {
+            let mut dec = JsonDecoder::new(text.as_bytes(), JsonOptions::default());
+            dec.skip_value().and_then(|()| dec.check_eof())
+        };
+        // Go N (encoding/json/v2 of Go 1.27, tsgo pin 673a5f17d713) texts.
+        assert_eq!(
+            read_all(r#"{"a":1,"a":2}"#).unwrap_err().message,
+            r#"jsontext: duplicate object member name "a""#
+        );
+        assert_eq!(
+            read_all(r#"{"x":{"é":1,"é":2}}"#).unwrap_err().message,
+            r#"jsontext: duplicate object member name "é" within "/x""#
+        );
+        assert!(read_all(r#"[{"a":1,"b":{"a":2}},{"a":3,"b":4}]"#).is_ok());
+        let mut dec = JsonDecoder::new(br#"{"k":"v","n":1}"#, JsonOptions::default());
+        let tokens: Vec<JsonToken> = std::iter::from_fn(|| dec.read_token().ok()).collect();
+        let mut dec = JsonDecoder::new(
+            "{\"k\\n\":\"\u{fdd0}\",\"n\":-1.5e3}".as_bytes(),
+            JsonOptions::default(),
+        );
+        let refs: Vec<JsonTokenRef<'_>> =
+            std::iter::from_fn(|| dec.read_token_ref().ok()).collect();
+        let mut dec = JsonDecoder::new(
+            "{\"k\\n\":\"\u{fdd0}\",\"n\":-1.5e3}".as_bytes(),
+            JsonOptions::default(),
+        );
+        let owned: Vec<JsonToken> = std::iter::from_fn(|| dec.read_token().ok()).collect();
+        assert_eq!(refs.len(), owned.len());
+        for (token_ref, token) in refs.iter().zip(&owned) {
+            match (token_ref, token) {
+                (JsonTokenRef::String(a), JsonToken::String(b)) => assert_eq!(a, b),
+                (JsonTokenRef::Number(a), JsonToken::Number(b)) => assert_eq!(a, b),
+                (a, b) => assert_eq!(a.clone(), token_ref_of(b)),
+            }
+        }
+        assert!(matches!(&refs[2], JsonTokenRef::String(Cow::Owned(_))));
+        assert!(matches!(&refs[3], JsonTokenRef::String(Cow::Borrowed("n"))));
+        assert_eq!(
+            tokens,
+            [
+                JsonToken::BeginObject,
+                JsonToken::String("k".into()),
+                JsonToken::String("v".into()),
+                JsonToken::String("n".into()),
+                JsonToken::Number("1".into()),
+                JsonToken::EndObject,
+            ]
+        );
     }
 }

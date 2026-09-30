@@ -137,6 +137,19 @@ pub fn read_build_info_program(
 ) -> Option<Program> {
     // Read buildInfo file
     let build_info = reader.read_build_info(config)?;
+    build_info_program(config, &build_info, host)
+}
+
+/// `read_build_info_program` after the read: the program of `build_info`.
+// PORT: not in Go. The `tsc -b` task holds its build info
+// (`loadOrStoreBuildInfo`), and gives it here without the copy that a
+// `BuildInfoReader` returns.
+#[must_use]
+pub fn build_info_program(
+    config: &ParsedCommandLine,
+    build_info: &BuildInfo,
+    host: &dyn CompilerHost,
+) -> Option<Program> {
     if !build_info.is_valid_version() || !build_info.is_incremental() {
         return None;
     }
@@ -151,9 +164,7 @@ pub fn read_build_info_program(
     // Convert to information that can be used to create incremental program
     Some(Program {
         snapshot: Rc::new(RefCell::new(build_info_to_snapshot(
-            &build_info,
-            config,
-            host,
+            build_info, config, host,
         ))),
         program: None,
         host: None,
@@ -265,6 +276,14 @@ impl Program {
     pub fn get_program(&self) -> &'static GoProgram {
         self.panic_if_no_program("GetProgram");
         self.program.expect("program")
+    }
+
+    /// PORT: not in Go. Drops this program and returns its snapshot when
+    /// nothing else holds it, so the caller can free it elsewhere.
+    #[must_use]
+    pub fn into_snapshot(self) -> Option<Snapshot> {
+        let Program { snapshot, .. } = self;
+        Rc::try_unwrap(snapshot).ok().map(RefCell::into_inner)
     }
 
     // Go: incremental/program.go:79 HasChangedDtsFile
@@ -875,11 +894,11 @@ impl Program {
         let config = get_directory_path(command_line().config_name());
         if !config.is_empty() {
             package_json_cache_entries(|_key, value| {
-                let mut package_json = combine_paths(&value.package_directory, &["package.json"]);
-                if value.exists() || value.directory_exists {
+                let mut package_json = combine_paths(value.package_directory, &["package.json"]);
+                if value.exists || value.directory_exists {
                     package_json = host().fs().realpath(&package_json);
                 }
-                if value.exists() {
+                if value.exists {
                     package_jsons.push(package_json);
                 } else if package_json.contains("/node_modules/") {
                     missing_package_jsons.push(package_json);
@@ -902,8 +921,8 @@ impl Program {
 
         let mut package_jsons = Vec::new();
         package_json_cache_entries(|_key, value| {
-            let mut package_json = combine_paths(&value.package_directory, &["package.json"]);
-            if value.exists() || value.directory_exists {
+            let mut package_json = combine_paths(value.package_directory, &["package.json"]);
+            if value.exists || value.directory_exists {
                 package_json = host().fs().realpath(&package_json);
             }
             package_jsons.push(package_json);

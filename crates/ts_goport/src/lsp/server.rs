@@ -353,7 +353,9 @@ impl Writer for LspWriter {
                 return Err(new_message_marshal_error(errors::from_value(err)));
             }
         };
-        self.w.write(data.as_bytes())
+        // PORT: the text is in the port form (see
+        // `scanner_util::GO_STRING_MARKER`); the client gets its Go bytes.
+        self.w.write(&crate::scanner_util::go_string_bytes(&data))
     }
 }
 

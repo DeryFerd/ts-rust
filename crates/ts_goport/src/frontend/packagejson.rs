@@ -1133,6 +1133,23 @@ impl InfoCache {
         self.cache.borrow().get(&key).cloned()
     }
 
+    /// PORT: not in Go. The key of `package_json_path` (the `toPath` of
+    /// `get` and `set`).
+    #[must_use]
+    pub fn key(&self, package_json_path: &str) -> Path {
+        to_path(
+            package_json_path,
+            &self.current_directory,
+            self.use_case_sensitive_file_names,
+        )
+    }
+
+    /// PORT: not in Go. True when the cache has an entry for `key`.
+    #[must_use]
+    pub fn contains_key(&self, key: &Path) -> bool {
+        self.cache.borrow().contains_key(key)
+    }
+
     // Go: cache.go:190 Set
     // PORT: Go `LoadOrStore`: the first stored entry wins and is returned.
     pub fn set(&self, package_json_path: &str, info: Rc<InfoCacheEntry>) -> Rc<InfoCacheEntry> {

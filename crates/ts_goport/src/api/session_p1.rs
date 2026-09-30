@@ -1940,7 +1940,10 @@ pub fn new_batch_response_page(responses: &[BatchResponse]) -> Result<BatchRespo
             Ok(encoded) => encoded,
             Err(err) => return Err(errors::from_value(err)),
         };
-        encoded_responses.push(JsonValue(encoded.into_bytes()));
+        // PORT: a `json.Value` holds Go bytes; the text is in the port form.
+        encoded_responses.push(JsonValue(
+            crate::scanner_util::go_string_bytes(&encoded).into_owned(),
+        ));
     }
     Ok(BatchResponsePage { encoded_responses })
 }

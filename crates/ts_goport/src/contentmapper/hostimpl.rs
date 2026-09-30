@@ -1579,7 +1579,11 @@ impl HostImpl {
                 config_file_name,
                 project_handle,
                 options: mapper.definition.options.clone(),
-                compiler_options: JsonValue(compiler_options.into_bytes()),
+                // PORT: a `json.Value` holds Go bytes; the text is in the
+                // port form.
+                compiler_options: JsonValue(
+                    crate::scanner_util::go_string_bytes(&compiler_options).into_owned(),
+                ),
             })),
         );
         mapper_timing.finish_request(&mapper_timing.open_project, start);

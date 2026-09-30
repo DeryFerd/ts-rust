@@ -3,7 +3,7 @@
 use crate::api::prelude::*;
 
 use crate::frontend::json::{
-    JsonDecoder, JsonError, MarshalerTo, UnmarshalerFrom, json_unmarshal, json_unmarshal_decode,
+    JsonDecoder, JsonError, MarshalerTo, UnmarshalerFrom, json_unmarshal_decode,
 };
 use crate::frontend::json_ext::{
     AnyValue, marshal_field, unmarshal_struct_fields, write_object_end, write_object_start,
@@ -79,7 +79,8 @@ pub fn new_callback_fs(base: Rc<dyn Fs>, callbacks: &[String]) -> Rc<CallbackFS>
     })
 }
 
-// Go: the anonymous `struct { Content *string }` in ReadFile.
+// Go: the anonymous `struct { Content *string `json:"content"` }` in
+// ReadFile. Its Go type string holds the tag.
 #[derive(Default)]
 struct ReadFileWrapper {
     content: Option<String>,
@@ -87,13 +88,17 @@ struct ReadFileWrapper {
 
 impl UnmarshalerFrom for ReadFileWrapper {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        let is_object = unmarshal_struct_fields(dec, "struct { Content *string }", |name, dec| {
-            match name {
-                "content" => json_unmarshal_decode(dec, &mut self.content)?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        })?;
+        let is_object = unmarshal_struct_fields(
+            dec,
+            r#"struct { Content *string "json:\"content\"" }"#,
+            |name, dec| {
+                match name {
+                    "content" => json_unmarshal_decode(dec, &mut self.content)?,
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            },
+        )?;
         if !is_object {
             *self = ReadFileWrapper::default();
         }
@@ -101,8 +106,8 @@ impl UnmarshalerFrom for ReadFileWrapper {
     }
 }
 
-// Go: the anonymous `struct { Files []string; Directories []string }` in
-// GetAccessibleEntries.
+// Go: the anonymous `struct { Files []string; Directories []string }` (with
+// JSON tags) in GetAccessibleEntries. Its Go type string holds the tags.
 #[derive(Default)]
 struct RawEntries {
     files: Vec<String>,
@@ -113,7 +118,7 @@ impl UnmarshalerFrom for RawEntries {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let is_object = unmarshal_struct_fields(
             dec,
-            "struct { Files []string; Directories []string }",
+            r#"struct { Files []string "json:\"files\""; Directories []string "json:\"directories\"" }"#,
             |name, dec| {
                 match name {
                     "files" => json_unmarshal_decode(dec, &mut self.files)?,
@@ -215,7 +220,7 @@ impl Fs for CallbackFS {
             };
             if !result.is_empty() && result != b"null" {
                 let mut wrapper = ReadFileWrapper::default();
-                if let Err(err) = json_unmarshal(&result, &mut wrapper, &[]) {
+                if let Err(err) = crate::frontend::json_ext::unmarshal_root(&result, &mut wrapper) {
                     panic_error(&errors::from_value(err));
                 }
                 let Some(content) = wrapper.content else {
@@ -267,7 +272,9 @@ impl Fs for CallbackFS {
             };
             if !result.is_empty() {
                 let mut raw_entries: Option<RawEntries> = None;
-                if let Err(err) = json_unmarshal(&result, &mut raw_entries, &[]) {
+                if let Err(err) =
+                    crate::frontend::json_ext::unmarshal_root(&result, &mut raw_entries)
+                {
                     panic_error(&errors::from_value(err));
                 }
                 if let Some(raw_entries) = raw_entries {
@@ -292,7 +299,8 @@ impl Fs for CallbackFS {
             };
             if !result.is_empty() && result != b"null" {
                 let mut realpath = String::new();
-                if let Err(err) = json_unmarshal(&result, &mut realpath, &[]) {
+                if let Err(err) = crate::frontend::json_ext::unmarshal_root(&result, &mut realpath)
+                {
                     panic_error(&errors::from_value(err));
                 }
                 return realpath;
