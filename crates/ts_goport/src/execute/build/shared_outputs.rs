@@ -22,31 +22,68 @@ use crate::frontend::prelude::*;
 
 /// True when the output area of one task of `configs` (the configs of the
 /// tasks of a build; None when a config did not parse) overlaps the output
-/// area or a root file directory of another. `to_path` is the
-/// orchestrator's `to_path`.
+/// area or a root file directory of another. `fs` is the file system of
+/// the build without its cache (`sys.FS()`), and `compare` the
+/// orchestrator's path options.
 ///
 /// The output area of a task is where it can write: its output directories
 /// and everything under them (`outDir`, `declarationDir`, or the directories
 /// of its root files when its outputs go next to them) and its build info
-/// file. Two directories overlap when one holds the other. The areas come
-/// from the configs, so they are known before a task starts, and the same in
+/// file. Two directories overlap when one holds the other. Each path is
+/// compared by its real path (`real_path`), so two names of one place
+/// through a symbolic link overlap. The areas come from the configs and the
+/// links on disk, so they are known before a task starts, and the same in
 /// every run. A task can also emit a file that is not a root file; when that
 /// file is outside the directories above, its outputs are not in the area.
 pub(crate) fn outputs_overlap(
     configs: &[Option<Rc<ParsedCommandLine>>],
-    to_path: impl Fn(&str) -> Path,
+    fs: &dyn Fs,
+    compare: &ComparePathsOptions,
 ) -> bool {
+    let key = |file: &str| {
+        let path = get_normalized_absolute_path(file, &compare.current_directory);
+        to_path(
+            &real_path(fs, &path),
+            "",
+            compare.use_case_sensitive_file_names,
+        )
+        .0
+    };
     let areas: Vec<Area> = configs
         .iter()
         .flatten()
-        .map(|config| Area::of(config, &to_path))
+        .map(|config| Area::of(config, &key))
         .collect();
     areas_overlap(&areas)
 }
 
+/// The real path (Go `vfs.FS.Realpath`) of the absolute path `path`, found
+/// through its longest prefix that exists. So a directory or file that the
+/// build has not written yet gets the place where it will be written. The
+/// file system must not cache lookups for the build: a directory that does
+/// not exist yet is looked up here.
+fn real_path(fs: &dyn Fs, path: &str) -> String {
+    let root = get_root_length(path);
+    let mut end = path.len();
+    loop {
+        let prefix = &path[..end];
+        if fs.stat(prefix).is_some() {
+            let real = fs.realpath(prefix);
+            if end == path.len() {
+                return real;
+            }
+            return format!("{}{}", real.trim_end_matches('/'), &path[end..]);
+        }
+        match prefix.rfind('/') {
+            Some(i) if i >= root => end = i,
+            _ => return path.to_string(),
+        }
+    }
+}
+
 /// The output area and the root file directories of one task, as path
-/// keys (`to_path`). A directory key ends with '/', so a directory holds
-/// each key that starts with its key.
+/// keys (`to_path` of the real path). A directory key ends with '/', so a
+/// directory holds each key that starts with its key.
 struct Area {
     output_dirs: Vec<String>,
     build_info: Option<String>,
@@ -54,9 +91,10 @@ struct Area {
 }
 
 impl Area {
-    fn of(config: &ParsedCommandLine, to_path: &impl Fn(&str) -> Path) -> Area {
+    /// `key` gives the path key of a file or directory name.
+    fn of(config: &ParsedCommandLine, key: &impl Fn(&str) -> String) -> Area {
         let dir_key = |dir: &str| {
-            let mut key = to_path(dir).0;
+            let mut key = key(dir);
             if !key.ends_with('/') {
                 key.push('/');
             }
@@ -93,7 +131,7 @@ impl Area {
         let build_info = config.get_build_info_file_name();
         Area {
             output_dirs,
-            build_info: (!build_info.is_empty()).then(|| to_path(&build_info).0),
+            build_info: (!build_info.is_empty()).then(|| key(&build_info)),
             root_dirs,
         }
     }
@@ -148,6 +186,8 @@ fn areas_overlap(areas: &[Area]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::frontend::vfs::osvfs_fs;
 
     fn area(output_dirs: &[&str], build_info: &str, root_dirs: &[&str]) -> Area {
         let keys = |keys: &[&str]| keys.iter().map(|key| key.to_string()).collect();
@@ -216,5 +256,97 @@ mod tests {
         for (a, b) in pairs {
             assert!(!areas_overlap(&[a, b]));
         }
+    }
+
+    #[cfg(unix)]
+    struct System {
+        fs: Rc<dyn Fs>,
+        current_directory: String,
+    }
+
+    #[cfg(unix)]
+    impl ParseConfigHost for System {
+        fn fs(&self) -> Rc<dyn Fs> {
+            self.fs.clone()
+        }
+        fn get_current_directory(&self) -> String {
+            self.current_directory.clone()
+        }
+    }
+
+    /// Writes the projects pX and pY (with `py_options`) and the links
+    /// `lnk -> .` and `lnkx -> pX` in a new temporary directory, and returns
+    /// whether their outputs overlap. No output is written.
+    #[cfg(unix)]
+    fn overlap_on_disk(label: &str, py_options: &str) -> bool {
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_shared_outputs_{label}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (project, options) in [
+            (
+                "pX",
+                r#""outDir": "dist", "tsBuildInfoFile": "../shared.tsbuildinfo""#,
+            ),
+            ("pY", py_options),
+        ] {
+            std::fs::create_dir_all(dir.join(project).join("src")).unwrap();
+            std::fs::write(dir.join(project).join("src/m.ts"), "export const m = 1;\n").unwrap();
+            std::fs::write(
+                dir.join(project).join("tsconfig.json"),
+                format!(r#"{{ "compilerOptions": {{ "composite": true, {options} }} }}"#),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(".", dir.join("lnk")).unwrap();
+        std::os::unix::fs::symlink("pX", dir.join("lnkx")).unwrap();
+        let cwd = dir.to_string_lossy().replace('\\', "/");
+        let sys = System {
+            fs: osvfs_fs(),
+            current_directory: cwd.clone(),
+        };
+        let configs: Vec<_> = ["pX", "pY"]
+            .iter()
+            .map(|project| {
+                let (config, errors) = get_parsed_command_line_of_config_file(
+                    &format!("{cwd}/{project}/tsconfig.json"),
+                    None,
+                    None,
+                    &sys,
+                    None,
+                );
+                assert!(errors.is_empty());
+                Some(Rc::new(config.unwrap()))
+            })
+            .collect();
+        let compare = ComparePathsOptions {
+            current_directory: cwd,
+            use_case_sensitive_file_names: true,
+        };
+        let overlap = outputs_overlap(&configs, &*sys.fs, &compare);
+        std::fs::remove_dir_all(&dir).unwrap();
+        overlap
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outputs_overlap_through_symbolic_links() {
+        // The skeptic's bi2link: one build info, named through a link to
+        // the root by pY. It does not exist yet.
+        assert!(overlap_on_disk(
+            "bi2link",
+            r#""outDir": "dist", "tsBuildInfoFile": "../lnk/shared.tsbuildinfo""#,
+        ));
+        // pY writes to pX's outDir through a link to pX.
+        assert!(overlap_on_disk(
+            "outdir",
+            r#""outDir": "../lnkx/dist", "tsBuildInfoFile": "../y.tsbuildinfo""#,
+        ));
+        // Separate outputs, each named through a link, do not overlap.
+        assert!(!overlap_on_disk(
+            "separate",
+            r#""outDir": "../lnk/pY/dist", "tsBuildInfoFile": "../lnk/y.tsbuildinfo""#,
+        ));
     }
 }
