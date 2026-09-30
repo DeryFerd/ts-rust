@@ -99,6 +99,7 @@ fn get_output_file_names_excludes_mapper_owned_outputs() {
             ..Default::default()
         }),
         vec!["/src/Component.vue".to_string()],
+        None,
         ComparePathsOptions {
             current_directory: "/".to_string(),
             use_case_sensitive_file_names: true,

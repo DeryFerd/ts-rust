@@ -218,6 +218,12 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
             TEXT_HASHES.with_borrow_mut(|hashes| {
                 hashes.insert(text_id(file.text), hash);
             });
+            // Go: binder.BindSourceFile(file) (ts#63952). PORT: the Rust
+            // binder binds each program version into one arena on the
+            // dispatch thread (`program::bind_all`), not a parse on its own,
+            // so the Go race (two programs binding one shared file at once)
+            // does not exist here. Binding is idempotent in Go, so binding at
+            // program load gives the same result.
             HashedSourceFile { file, hash }
         },
     )
@@ -264,6 +270,15 @@ pub fn source_file_hash(text: &'static str) -> u128 {
     TEXT_HASHES
         .with_borrow(|hashes| hashes.get(&text_id(text)).copied())
         .unwrap_or_else(|| xxh3_128(text.as_bytes()))
+}
+
+/// Go `file.Hash` of a file that the parse cache or the content-mapped
+/// parse cache made on this thread, or `None` for a text that neither
+/// recorded (a parse whose Go `Hash` stays 0).
+// PORT: for the api encoder: a file of no program that a parse cache made
+// (api/session.go createSourceFile, ts#64434) has a Go `Hash`.
+pub fn recorded_source_file_hash(text: &'static str) -> Option<u128> {
+    TEXT_HASHES.with_borrow(|hashes| hashes.get(&text_id(text)).copied())
 }
 
 /// Go `contentMappedParseCache.Deref(key)` for a program file or a

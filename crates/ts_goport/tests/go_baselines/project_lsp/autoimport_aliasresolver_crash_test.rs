@@ -16,7 +16,7 @@ use ts_goport::gostd::context;
 use ts_goport::ls::autoimport::aliasresolver::{
     AliasResolver, bind_alias_resolver_source_file, new_alias_resolver,
 };
-use ts_goport::ls::autoimport::registry::{DISCARD_ON_CANCEL_KEY, RegistryCloneHost};
+use ts_goport::ls::autoimport::registry::{DISCARD_ON_CANCEL_KEY, ProjectID, RegistryCloneHost};
 use ts_goport::options::CompilerOptions;
 
 use super::projecttestutil::{self, files};
@@ -37,10 +37,10 @@ impl module::ResolutionHost for FakeCloneHost {
 }
 
 impl RegistryCloneHost for FakeCloneHost {
-    fn get_default_project(&self, _path: &Path) -> (Path, Option<Rc<NewProgram>>) {
-        (Path(String::new()), None)
+    fn get_default_project(&self, _path: &Path) -> (Option<ProjectID>, Option<Rc<NewProgram>>) {
+        (None, None)
     }
-    fn get_program_for_project(&self, _project_path: &Path) -> Option<Rc<NewProgram>> {
+    fn get_program_for_project(&self, _project_id: &ProjectID) -> Option<Rc<NewProgram>> {
         None
     }
     fn get_package_json(&self, _file_name: &str) -> Option<Rc<InfoCacheEntry>> {
@@ -82,14 +82,12 @@ fn alias_resolver_with_type_error() -> (Rc<AliasResolver>, Node) {
     bind_alias_resolver_source_file("/", root);
 
     let resolution_host: Rc<dyn module::ResolutionHost> = host.clone();
-    // Go: module.NewResolver(host, core.EmptyCompilerOptions, "", "", nil)
-    let resolver = module::new_resolver(
-        resolution_host,
-        Rc::new(CompilerOptions::default()),
-        "",
-        "",
-        Vec::new(),
-    );
+    // Go: module.NewResolver(module.ResolverOptions{Host: host, CompilerOptions: core.EmptyCompilerOptions})
+    let resolver = module::new_resolver(module::ResolverOptions {
+        host: Some(resolution_host),
+        compiler_options: Some(Rc::new(CompilerOptions::default())),
+        ..Default::default()
+    });
     let r = new_alias_resolver(
         vec![root],
         FxHashMap::default(),

@@ -529,7 +529,7 @@ impl Checker {
                     self.new_type_mapper_shared(outer_type_parameters, type_arguments.into());
                 let mut new_check_type = TypeId::NIL;
                 if is_distributive {
-                    new_check_type = self.mapper_map(new_root_mapper, root_check_type);
+                    new_check_type = self.get_mapped_type(root_check_type, new_root_mapper);
                 }
                 if new_check_type.is_nil()
                     || new_check_type == root_check_type
@@ -758,10 +758,13 @@ impl Checker {
                 SymbolFlags::TYPE
             };
             // Go comment: Future work: support unions/generics/whatever via a deferred import-type
+            let import_attributes_type =
+                self.get_type_from_import_attributes(get_import_attributes(node));
             let inner_module_symbol = self.resolve_external_module_name(
                 node,
                 n.argument().literal(),
                 false, /*ignoreErrors*/
+                import_attributes_type,
             );
             if inner_module_symbol.is_nil() {
                 let unknown_symbol = self.unknown_symbol;

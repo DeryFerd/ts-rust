@@ -936,12 +936,6 @@ impl EmitResolver {
         self.with_checker(|c| c.get_effective_declaration_flags(node, flags))
     }
 
-    // Go: checker/emitresolver.go:1143 GetResolutionModeOverride
-    pub fn get_resolution_mode_override(&self, node: Node) -> ResolutionMode {
-        // node = emitContext.ParseNode(node)
-        self.with_checker(|c| c.get_resolution_mode_override(node, false))
-    }
-
     // Go: checker/emitresolver.go:1150 GetConstantValue
     pub fn get_constant_value(&self, node: Node) -> Option<LiteralValue> {
         // node = emitContext.ParseNode(node)

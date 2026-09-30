@@ -79,10 +79,8 @@ struct StartedCheck {
     global_diagnostics: Option<Vec<Diagnostic>>,
     /// The check of the affected files. `get_semantic_diagnostics` takes it.
     check: Option<PendingSemanticDiagnostics>,
-    /// The second `GetGlobalDiagnostics` read, sent behind the check. The
-    /// `get_global_diagnostics` call after the check takes it.
-    global_after_check: Option<PendingGlobalDiagnostics>,
-    /// The emit of the affected files, sent behind that. `emit` takes it.
+    /// The emit of the affected files, sent behind the check. `emit` takes
+    /// it.
     emit: Option<StartedEmit>,
 }
 
@@ -354,28 +352,18 @@ impl Program {
     }
 
     // Go: incremental/program.go:141 GetGlobalDiagnostics
-    // PORT: the first call returns what `start_check` read, if it ran. The
-    // call after the check waits for the read that `start_emit` sent
-    // behind the check, if it did.
+    // PORT: the first call returns what `start_check` read, if it ran.
+    // Since ts#64452 Go `GetDiagnosticsOfAnyProgram` does not ask an
+    // incremental program for them again after the check: each file's
+    // cached diagnostics hold the globals that its check found
+    // (`GetSemanticDiagnosticsForIncremental`).
     #[must_use]
     pub fn get_global_diagnostics(&self) -> Vec<Diagnostic> {
         self.panic_if_no_program("GetGlobalDiagnostics");
-        let pending = {
-            let mut started = self.started.borrow_mut();
-            if let Some(diagnostics) = started.global_diagnostics.take() {
-                return diagnostics;
-            }
-            let pending = started.global_after_check.take();
-            debug_assert!(
-                pending.is_none() || started.check.is_none(),
-                "the global diagnostics after the check are read before the check"
-            );
-            pending
-        };
-        match pending {
-            Some(pending) => pending.wait(),
-            None => get_global_diagnostics(),
+        if let Some(diagnostics) = self.started.borrow_mut().global_diagnostics.take() {
+            return diagnostics;
         }
+        get_global_diagnostics()
     }
 
     /// PORT: not in Go. Starts the semantic check that
@@ -413,9 +401,8 @@ impl Program {
         }
         let check_start = self.nested_emit_now.as_ref().map(|now| now());
         if let Some(affected_files) = self.semantic_diagnostics_files_to_check(Node::NIL) {
-            self.started.borrow_mut().check = Some(
-                start_semantic_diagnostics_without_no_emit_filtering(&affected_files),
-            );
+            self.started.borrow_mut().check =
+                Some(start_semantic_diagnostics_for_incremental(&affected_files));
         }
         if let (Some(now), Some(check_start)) = (&self.nested_emit_now, check_start) {
             self.started_check_time
@@ -429,12 +416,10 @@ impl Program {
     /// (`perform_incremental_compilation`). When the options do not allow
     /// it, it does nothing, and the calls run in Go's order.
     ///
-    /// Go waits for the whole check, then reads the global diagnostics
-    /// again, then emits. Here each checker thread gets the same jobs in the
-    /// same order (check, global diagnostics, emit), and runs its emit when
-    /// its own check ends. The emit pool runs the JS parts during the check.
-    /// The next `get_global_diagnostics` call after the check waits for the
-    /// read sent here, and `emit` waits for the emit. `options` must be the
+    /// Go waits for the whole check, then emits. Here each checker thread
+    /// gets the same jobs in the same order (check, emit), and runs its emit
+    /// when its own check ends. The emit pool runs the JS parts during the
+    /// check. `emit` waits for the emit. `options` must be the
     /// options of that `emit` call: no target file, `EmitOnly::All` and the
     /// same `WriteFile`.
     pub fn start_check_and_emit(&self, options: EmitOptions) {
@@ -449,9 +434,10 @@ impl Program {
     /// an early emit (`early_emit_options_allow`), `start_check` sent a
     /// check and the check cannot see the outputs
     /// (`check_cannot_see_outputs`), sends the rest of the checker work of
-    /// `tsc.EmitFilesAndReportErrors` without a wait: the second global
-    /// diagnostics read and the emit of the affected files with `options`
-    /// (`start_emit_files`). Else it does nothing. `start_check_and_emit`
+    /// `tsc.EmitFilesAndReportErrors` without a wait: the emit of the
+    /// affected files with `options` (`start_emit_files`; since ts#64452 Go
+    /// reads no global diagnostics after the check of an incremental
+    /// program). Else it does nothing. `start_check_and_emit`
     /// (`tsc -p`) calls it. `tsc -b` calls it right after `start_check` in
     /// `BuildTask::compile_and_emit_start`, inside
     /// `buffer_early_emit_writes`, so the writes wait for the task's
@@ -472,14 +458,8 @@ impl Program {
         {
             return;
         }
-        // Go `GetDiagnosticsOfAnyProgram` asks for the global diagnostics
-        // again after the check; they can change during the check. Each
-        // checker reads its own after its check job and before its emit.
-        let global_after_check = start_global_diagnostics();
         let emit = start_emit_files(self, options);
-        let mut started = self.started.borrow_mut();
-        started.global_after_check = Some(global_after_check);
-        started.emit = Some(emit);
+        self.started.borrow_mut().emit = Some(emit);
     }
 
     /// PORT: not in Go. True when the caller used everything that
@@ -489,10 +469,7 @@ impl Program {
     #[must_use]
     pub fn start_check_used(&self) -> bool {
         let started = self.started.borrow();
-        started.global_diagnostics.is_none()
-            && started.check.is_none()
-            && started.global_after_check.is_none()
-            && started.emit.is_none()
+        started.global_diagnostics.is_none() && started.check.is_none() && started.emit.is_none()
     }
 
     // Go: incremental/program.go:147 GetSemanticDiagnostics
@@ -598,7 +575,7 @@ impl Program {
         emit_files(self, options, false)
     }
 
-    // Go: incremental/program.go:229 collectSemanticDiagnosticsOfAffectedFiles
+    // Go: incremental/program.go:229 collectSemanticDiagnosticsOfAffectedFiles (ts#64452)
     // Handle affected files and cache the semantic diagnostics for all of them or the file asked for
     // PORT: split in two (`semantic_diagnostics_files_to_check` and
     // `commit_semantic_diagnostics`), so `start_check` can send the check
@@ -617,8 +594,7 @@ impl Program {
         };
 
         // Get their diagnostics and cache them
-        let diagnostics_per_file =
-            get_semantic_diagnostics_without_no_emit_filtering(&affected_files);
+        let diagnostics_per_file = get_semantic_diagnostics_for_incremental(&affected_files);
         self.commit_semantic_diagnostics(&affected_files, diagnostics_per_file);
     }
 
@@ -973,6 +949,9 @@ pub fn handle_no_emit_options(
             &mut |file| program.get_semantic_diagnostics(file),
             &mut || program.get_global_diagnostics(),
             &mut |file| program.get_declaration_diagnostics(file),
+            // ts#64452: the only caller passes the incremental program (Go
+            // `program.(*Program)` fails).
+            false,
         );
         if diagnostics.is_empty() {
             return None; // NoEmitOnError is enabled, but no diagnostics were found, so we can proceed with emitting

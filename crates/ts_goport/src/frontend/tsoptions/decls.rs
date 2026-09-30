@@ -1511,6 +1511,24 @@ pub fn compiler_options_field_values(
         ),
         ("OutDir", V::String(o.out_dir.clone())),
         ("Paths", V::Paths(o.paths.clone())),
+        // ts#64397: Go `[]PluginImport`. Each element is its JSON form, a
+        // map with "name" (Go `reflect.DeepEqual` compares the names). A
+        // `None` is listed as empty, like the `[]string` fields.
+        (
+            "Plugins",
+            V::List(
+                o.plugins
+                    .iter()
+                    .flatten()
+                    .map(|plugin| {
+                        V::Map(IndexMap::from_iter([(
+                            "name".to_string(),
+                            V::String(plugin.name.clone()),
+                        )]))
+                    })
+                    .collect(),
+            ),
+        ),
         ("PreserveConstEnums", V::Tristate(o.preserve_const_enums)),
         ("PreserveSymlinks", V::Tristate(o.preserve_symlinks)),
         ("Project", V::String(o.project.clone())),

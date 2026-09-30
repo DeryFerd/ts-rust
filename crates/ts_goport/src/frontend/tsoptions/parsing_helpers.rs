@@ -448,6 +448,28 @@ fn parse_compiler_options_worker(
         "outFile" => all_options.out_file = parse_string(value),
         "noResolve" => all_options.no_resolve = parse_tristate(value),
         "paths" => all_options.paths = parse_string_map(value),
+        "plugins" => {
+            // Native TypeScript does not load plugins; retain them only so tools can report the incompatibility.
+            if let CompilerOptionsValue::List(plugins) = value {
+                all_options.plugins = Some(
+                    plugins
+                        .iter()
+                        .map(|plugin| {
+                            if let CompilerOptionsValue::Map(plugin_map) = plugin {
+                                return PluginImport {
+                                    name: parse_string(
+                                        plugin_map
+                                            .get("name")
+                                            .unwrap_or(&CompilerOptionsValue::Nil),
+                                    ),
+                                };
+                            }
+                            PluginImport::default()
+                        })
+                        .collect(),
+                );
+            }
+        }
         "preserveWatchOutput" => all_options.preserve_watch_output = parse_tristate(value),
         "preserveConstEnums" => all_options.preserve_const_enums = parse_tristate(value),
         "preserveSymlinks" => all_options.preserve_symlinks = parse_tristate(value),
@@ -743,6 +765,7 @@ pub fn merge_compiler_options<'a>(
         no_unchecked_side_effect_imports => "noUncheckedSideEffectImports",
         out_dir => "outDir",
         paths => "paths",
+        plugins => "plugins",
         preserve_const_enums => "preserveConstEnums",
         preserve_symlinks => "preserveSymlinks",
         project => "project",

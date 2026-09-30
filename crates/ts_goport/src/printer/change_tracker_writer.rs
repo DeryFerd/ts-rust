@@ -73,8 +73,9 @@ pub fn new_change_tracker_writer(newline: &str, indent_size: i32) -> ChangeTrack
         indent_size = get_default_indent_size();
     }
     let mut ctw = ChangeTrackerWriter {
-        // PORT: Go struct literal `textWriter{newLine, indentSize}`. It keeps
-        // an indent size of 0; `new_text_writer` would turn 0 into 4.
+        // PORT: Go sets only the promoted `newLine` and `indentSize` fields of
+        // the embedded `textWriter` (ts#63902 dropped the nested literal). It
+        // keeps an indent size of 0; `new_text_writer` would turn 0 into 4.
         text_writer: new_text_writer_literal(newline, indent_size),
         positions: Rc::new(RefCell::new(TriviaPositions {
             last_non_trivia_position: 0,
@@ -226,9 +227,12 @@ impl ChangeTrackerWriter {
             return node;
         }
         let visited = node.visit_each_child(v);
-        // create proxy node for non synthesized nodes
+        // Assigning positions must not mutate the caller's node: it may be printed again (a change in a
+        // content-mapped file is formatted once per virtual projection of its insertion point), and a node
+        // that has acquired positions is printed by reading text back out of the source file. VisitEachChild
+        // returns a fresh node only when a child changed, so clone whenever it hands back the input.
         let mut new_node = visited;
-        if !node_is_synthesized(visited) {
+        if visited == node {
             new_node = v.factory().clone_node(visited);
         }
         // Go returns true from this callback, which stops ForEachChild after

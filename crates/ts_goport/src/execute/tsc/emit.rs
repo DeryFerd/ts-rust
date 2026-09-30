@@ -228,6 +228,8 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
         },
         &mut || program_like.get_global_diagnostics(),
         &mut |file| program_like.get_declaration_diagnostics(file),
+        // ts#64452: Go `program.(*compiler.Program)`.
+        program_like.as_incremental_program().is_none(),
     );
 
     let mut emit_result = EmitResult {

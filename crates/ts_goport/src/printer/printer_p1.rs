@@ -39,6 +39,16 @@ pub struct PrintHandlers {
     /// A hook used by the Printer when generating unique names to avoid collisions with
     /// globally defined names that exist outside of the current source file.
     pub has_global_name: Option<Rc<dyn Fn(&str) -> bool>>,
+    /// MapSourcePosition composes source-map positions before they reach the generator.
+    /// Returning ok=false emits a generated-only mapping.
+    // PORT: Go takes and returns a `sourcemap.Source`. The printer's source is
+    // a source file node when `emit_pos` calls the hook, so the hook gets that
+    // node. It returns `None` for Go `ok == false`, `Some((None, pos))` when Go
+    // returns the same source, and `Some((Some(source), pos))` when Go returns
+    // another source.
+    pub map_source_position: Option<
+        Rc<dyn Fn(Node, i32) -> Option<(Option<Rc<dyn crate::sourcemap::source::Source>>, i32)>>,
+    >,
 
     pub on_before_emit_node: Option<Rc<dyn Fn(Node)>>,
     pub on_after_emit_node: Option<Rc<dyn Fn(Node)>>,
@@ -46,6 +56,61 @@ pub struct PrintHandlers {
     pub on_after_emit_node_list: Option<Rc<dyn Fn(NodeList)>>,
     pub on_before_emit_token: Option<Rc<dyn Fn(Node)>>,
     pub on_after_emit_token: Option<Rc<dyn Fn(Node)>>,
+}
+
+// Go: sourcemap/source.go:5 Source
+/// Go `sourcemap.Source` as the printer holds it. Go `*ast.SourceFile`
+/// implements the interface, and the port keeps that source file as its
+/// `Node` (nil is `SourceMapSource::NIL`). ts#63936:
+/// `PrintHandlers.map_source_position` can return a source that is not a
+/// node (Go `compiler.declarationMapSource` in `emitter.rs`).
+#[derive(Clone)]
+pub enum SourceMapSource {
+    Node(Node),
+    Other(Rc<dyn crate::sourcemap::source::Source>),
+}
+
+impl SourceMapSource {
+    pub const NIL: SourceMapSource = SourceMapSource::Node(Node::NIL);
+
+    /// Go `source == nil`.
+    pub fn is_nil(&self) -> bool {
+        matches!(self, SourceMapSource::Node(node) if node.is_nil())
+    }
+
+    /// Go `source != nil`.
+    pub fn is_some(&self) -> bool {
+        !self.is_nil()
+    }
+
+    /// Go `source.FileName()`.
+    pub fn file_name(&self) -> &str {
+        match self {
+            SourceMapSource::Node(node) => source_file_file_name(*node),
+            SourceMapSource::Other(source) => source.file_name(),
+        }
+    }
+
+    /// Go `source.Text()`.
+    pub fn text(&self) -> &str {
+        match self {
+            SourceMapSource::Node(node) => source_file_text(*node),
+            SourceMapSource::Other(source) => source.text(),
+        }
+    }
+}
+
+/// Go interface equality: the same source file node, or the same pointer.
+impl PartialEq for SourceMapSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SourceMapSource::Node(a), SourceMapSource::Node(b)) => a == b,
+            (SourceMapSource::Other(a), SourceMapSource::Other(b)) => {
+                std::ptr::addr_eq(Rc::as_ptr(a), Rc::as_ptr(b))
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Go `*sourcemap.Generator`.
@@ -91,14 +156,13 @@ pub struct Printer {
     pub(crate) write_kind: WriteKind,
     pub(crate) source_maps_disabled: bool,
     pub(crate) source_map_generator: Option<Rc<RefCell<SourceMapGenerator>>>,
-    // PORT: Go `sourcemap.Source` is an interface. In scope it is only ever
-    // a source file, so it is a `Node` (nil is `Node::NIL`).
-    pub(crate) source_map_source: Node,
+    // PORT: Go `sourcemap.Source` is an interface; see `SourceMapSource`.
+    pub(crate) source_map_source: SourceMapSource,
     pub(crate) source_map_source_index: SourceIndex,
     pub(crate) source_map_source_is_json: bool,
     // PORT: Go `*lineCharacterCache`; nil is `None`.
     pub(crate) source_map_line_char_cache: Option<LineCharacterCache>,
-    pub(crate) most_recent_source_map_source: Node,
+    pub(crate) most_recent_source_map_source: SourceMapSource,
     pub(crate) most_recent_source_map_source_index: SourceIndex,
     pub(crate) container_pos: i32,
     pub(crate) container_end: i32,
@@ -230,11 +294,11 @@ pub fn new_printer(
         write_kind: WriteKind::NONE,
         source_maps_disabled: false,
         source_map_generator: None,
-        source_map_source: Node::NIL,
+        source_map_source: SourceMapSource::NIL,
         source_map_source_index: 0,
         source_map_source_is_json: false,
         source_map_line_char_cache: None,
-        most_recent_source_map_source: Node::NIL,
+        most_recent_source_map_source: SourceMapSource::NIL,
         most_recent_source_map_source_index: 0,
         container_pos: 0,
         container_end: 0,

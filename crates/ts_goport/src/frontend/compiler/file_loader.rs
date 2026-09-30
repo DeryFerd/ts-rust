@@ -5,8 +5,8 @@
 //! (`crate::tracing::get`).
 
 use crate::contentmapper::{
-    self, DiagnosticDirectiveError, DiagnosticDirectiveErrorKind, InitializeError,
-    InitializeErrorKind, InvalidVirtualExtensionError, Mapper, ProjectError, ProjectErrorKind,
+    DiagnosticDirectiveError, DiagnosticDirectiveErrorKind, InitializeError, InitializeErrorKind,
+    InvalidVirtualExtensionError, Mapper, ProjectError, ProjectErrorKind,
     SupplementalFileCollisionError, TransformError, TransformErrorKind,
 };
 use crate::frontend::prelude::*;
@@ -48,7 +48,7 @@ pub struct SourceFileFromReferenceDiagnostic {
 // `process_all_program_files` sets it, as in Go.
 pub struct FileLoader {
     pub opts: ProgramOptions,
-    pub resolver: Option<Rc<Resolver>>,
+    pub resolver: Option<Rc<dyn Resolver>>,
     pub default_library_path: String,
     pub compare_paths_options: ComparePathsOptions,
     pub supported_extensions: Vec<Vec<String>>,
@@ -82,6 +82,9 @@ pub struct FileLoader {
     pub content_mapper_failures: RefCell<FxHashMap<*const Mapper, i32>>,
     pub content_mapper_init_failed: RefCell<FxHashSet<*const Mapper>>,
     pub content_mapper_diagnostics: RefCell<Vec<Diagnostic>>,
+    // ts#64299. PORT: Go `moduleResolutionErrorOnce` plus the error is an
+    // `Option` that keeps the first error.
+    pub module_resolution_error: RefCell<Option<GoError>>,
 }
 
 // Go: fileloader.go:62 redirectsFile
@@ -139,7 +142,7 @@ impl RedirectsFile {
 // (`GoSharedState`) with no copy.
 #[derive(Clone)]
 pub struct ProcessedFiles {
-    pub resolver: Option<Rc<Resolver>>,
+    pub resolver: Option<Rc<dyn Resolver>>,
     pub files: Vec<Rc<ParsedSourceFile>>,
     // duplicateSourceFiles tracks parsed files loaded during program construction
     // that were later dropped from the final program, such as losing filename
@@ -170,6 +173,8 @@ pub struct ProcessedFiles {
     // Program-level diagnostics reported when a content mapper fails fatally (reported once per mapper).
     // tsgo#4712
     pub content_mapper_diagnostics: Vec<Diagnostic>,
+    // ts#64299
+    pub module_resolution_error: Option<GoError>,
     pub finished_processing: bool,
 }
 
@@ -233,6 +238,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         content_mapper_failures: RefCell::new(FxHashMap::default()),
         content_mapper_init_failed: RefCell::new(FxHashSet::default()),
         content_mapper_diagnostics: RefCell::new(Vec::new()),
+        module_resolution_error: RefCell::new(None),
         opts,
     };
     loader.add_project_reference_tasks(single_threaded);
@@ -242,44 +248,55 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         .host
         .clone()
         .expect("projectReferenceFileMapper.host is set until processing ends");
-    let mut resolver = new_resolver(
-        resolver_host,
-        compiler_options.clone(),
-        &loader.opts.typings_location,
-        &loader.opts.project_name,
-        loader.opts.config.content_mapper_extensions(),
-    );
-    // PERF: Go resolves in all parse tasks with one shared cache. Here the
-    // parse workers resolve ahead of the loader, and the loader reads their
-    // answers. Only when every resolver sees the same files: the plain OS
-    // file system (for `tsc -b`, the workers read the host's cache,
-    // `BuildStatCache`), no project reference faking host (only a
-    // program that uses the sources of its references has one) and no
-    // traced resolution (Go then skips the cache too). A worker resolves
-    // the output `.d.ts` file of a project reference with its redirect, as
-    // the loader does; the redirect is part of the cache key. A program
-    // with project references shares answers only in `tsc -b`.
-    if !single_threaded
-        && super::files_parser::parse_workers_enabled()
-        && workers_resolve_imports(&compiler_options)
-        && loader.opts.host.is_plain_os_fs()
-        && compiler_options.trace_resolution != Tristate::True
-        && (loader
-            .opts
-            .config
-            .resolved_project_reference_paths()
-            .is_empty()
-            || loader.opts.host.stat_cache().is_some())
-        && !loader.opts.can_use_project_reference_source()
-    {
-        let shared = Arc::new(SharedResolutionCache::default());
-        resolver.caches.shared = Some(SharedResolutionLink {
-            cache: shared.clone(),
-            publish: false,
-        });
-        loader.shared_resolution = Some(shared);
+    let resolver_options = ResolverOptions {
+        host: Some(resolver_host),
+        compiler_options: Some(compiler_options.clone()),
+        typings_location: loader.opts.typings_location.clone(),
+        project_name: loader.opts.project_name.clone(),
+        extra_extensions: loader.opts.config.content_mapper_extensions(),
+        package_json_cache: None,
+    };
+    if let Some(create_module_resolver) = loader.opts.create_module_resolver.clone() {
+        loader.resolver = Some(create_module_resolver(resolver_options));
+    } else {
+        let mut resolver = new_resolver(resolver_options);
+        // PERF: Go resolves in all parse tasks with one shared cache. Here the
+        // parse workers resolve ahead of the loader, and the loader reads their
+        // answers. Only when every resolver sees the same files: the plain OS
+        // file system (for `tsc -b`, the workers read the host's cache,
+        // `BuildStatCache`), no project reference faking host (only a
+        // program that uses the sources of its references has one) and no
+        // traced resolution (Go then skips the cache too). A worker resolves
+        // the output `.d.ts` file of a project reference with its redirect, as
+        // the loader does; the redirect is part of the cache key. A program
+        // with project references shares answers only in `tsc -b`. Only for
+        // the default resolver: a parse worker cannot run a
+        // `create_module_resolver` one.
+        // PORT: with `skip_module_resolution` the loader resolves nothing
+        // (ts#64024), so the workers do not either.
+        if !single_threaded
+            && super::files_parser::parse_workers_enabled()
+            && workers_resolve_imports(&compiler_options)
+            && !loader.opts.skip_module_resolution
+            && loader.opts.host.is_plain_os_fs()
+            && compiler_options.trace_resolution != Tristate::True
+            && (loader
+                .opts
+                .config
+                .resolved_project_reference_paths()
+                .is_empty()
+                || loader.opts.host.stat_cache().is_some())
+            && !loader.opts.can_use_project_reference_source()
+        {
+            let shared = Arc::new(SharedResolutionCache::default());
+            resolver.caches.shared = Some(SharedResolutionLink {
+                cache: shared.clone(),
+                publish: false,
+            });
+            loader.shared_resolution = Some(shared);
+        }
+        loader.resolver = Some(Rc::new(resolver));
     }
-    loader.resolver = Some(Rc::new(resolver));
     let _trace = crate::tracing::get().map(|tr| {
         tr.push(
             crate::tracing::Phase::Program,
@@ -326,7 +343,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         }
     }
 
-    if !root_files.is_empty() {
+    if !root_files.is_empty() && !loader.opts.skip_module_resolution {
         loader.add_automatic_type_directive_tasks();
     }
 
@@ -335,11 +352,13 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
     // The parse workers have ended. The `tsc -b` host's cache keeps the
     // lookups of the worker answers that the loader took, as Go's cache
     // keeps the lookups of its parse tasks, and drops the other worker
-    // lookups (`BuildStatCache`).
+    // lookups (`BuildStatCache`). Only the default resolver takes worker
+    // answers.
     if let Some(stats) = loader.opts.host.stat_cache() {
         let taken = loader
             .resolver
             .as_ref()
+            .and_then(|resolver| resolver.as_default_resolver())
             .map(|resolver| resolver.take_worker_lookups())
             .unwrap_or_default();
         stats.end_load(&taken);
@@ -384,7 +403,7 @@ pub fn with_loader_state_forgotten<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-// Go: fileloader.go:447 contentMapperTransformDiagnostic (tsgo#4712)
+// Go: fileloader.go:467 contentMapperTransformDiagnostic (tsgo#4712)
 // PORT: Go `*ast.SourceFile` is the file's SourceFile node. Go
 // `errors.AsType` on a found `*TransformError` searches that error and the
 // errors it wraps (`TransformError::to_go_error`).
@@ -403,14 +422,6 @@ fn content_mapper_transform_diagnostic(file: Node, label: &str, err: &GoError) -
             TransformErrorKind::INITIALIZE => {
                 if let Some(initialize_error) = errors::as_type::<InitializeError>(&transform_err) {
                     match initialize_error.kind {
-                        InitializeErrorKind::PROTOCOL_VERSION => {
-                            return content_mapper_transform_diagnostic_chain(
-                                file,
-                                label,
-                                diag::The_content_mapper_uses_unsupported_protocol_version_0_expected_version_1,
-                                args![initialize_error.protocol_version, contentmapper::PROTOCOL_VERSION],
-                            );
-                        }
                         InitializeErrorKind::POSITION_ENCODING => {
                             return content_mapper_transform_diagnostic_chain(
                                 file,
@@ -541,7 +552,7 @@ fn content_mapper_transform_diagnostic(file: Node, label: &str, err: &GoError) -
     )
 }
 
-// Go: fileloader.go:505 ContentMapperProjectErrorDiagnostic (tsgo#4712)
+// Go: fileloader.go:523 ContentMapperProjectErrorDiagnostic (tsgo#4712)
 // ContentMapperProjectErrorDiagnostic returns the localized diagnostic message for a project setup error.
 pub fn content_mapper_project_error_diagnostic(err: &GoError) -> &'static Message {
     if let Some(project_error) = errors::as_type::<ProjectError>(err) {
@@ -567,7 +578,7 @@ pub fn content_mapper_project_error_diagnostic(err: &GoError) -> &'static Messag
     diag::The_content_mapper_process_failed_while_handling_the_project_request
 }
 
-// Go: fileloader.go:523 contentMapperTransformDiagnosticChain (tsgo#4712)
+// Go: fileloader.go:541 contentMapperTransformDiagnosticChain (tsgo#4712)
 fn content_mapper_transform_diagnostic_chain(
     file: Node,
     label: &str,
@@ -581,7 +592,7 @@ fn content_mapper_transform_diagnostic_chain(
     )
 }
 
-// Go: fileloader.go:527 contentMapperTransformDiagnosticWithDetail (tsgo#4712)
+// Go: fileloader.go:545 contentMapperTransformDiagnosticWithDetail (tsgo#4712)
 fn content_mapper_transform_diagnostic_with_detail(
     file: Node,
     label: &str,
@@ -597,7 +608,7 @@ fn content_mapper_transform_diagnostic_with_detail(
     diagnostic
 }
 
-// Go: fileloader.go:538 contentMapperMappingDiagnostic (tsgo#4712)
+// Go: fileloader.go:556 contentMapperMappingDiagnostic (tsgo#4712)
 // contentMapperMappingDiagnostic builds the diagnostic reported against a mapper that produced an
 // invalid span map, including the offsets involved so the mapper's author can locate the problem.
 fn content_mapper_mapping_diagnostic(
@@ -631,12 +642,6 @@ fn content_mapper_mapping_diagnostic(
             diag::The_content_mapper_0_produced_a_position_mapping_with_an_invalid_kind_near_virtual_offset_1,
             args![label, problem.virtual_pos],
         ),
-        MappingErrorKind::ORIGINAL_OVERLAP => new_diagnostic(
-            file,
-            loc,
-            diag::The_content_mapper_0_produced_overlapping_original_position_mappings_that_are_not_identical_near_original_offset_1,
-            args![label, problem.original_pos],
-        ),
         MappingErrorKind::FEATURE => new_diagnostic(
             file,
             loc,
@@ -652,7 +657,7 @@ fn content_mapper_mapping_diagnostic(
     }
 }
 
-// Go: fileloader.go:585 ContentMapperInitializationDiagnostic (tsgo#4712)
+// Go: fileloader.go:601 ContentMapperInitializationDiagnostic (tsgo#4712)
 // ContentMapperInitializationDiagnostic returns a fileless diagnostic for a mapper initialization failure.
 pub fn content_mapper_initialization_diagnostic(label: &str, err: &GoError) -> Diagnostic {
     let initialize_error = errors::as_type::<InitializeError>(err);
@@ -685,10 +690,6 @@ pub fn content_mapper_initialization_diagnostic(label: &str, err: &GoError) -> D
             diag::The_content_mapper_s_initialize_request_failed_Colon_0,
             args![initialize_error.detail],
         )),
-        InitializeErrorKind::PROTOCOL_VERSION => Some(new_compiler_diagnostic(
-            diag::The_content_mapper_uses_unsupported_protocol_version_0_expected_version_1,
-            args![initialize_error.protocol_version, contentmapper::PROTOCOL_VERSION],
-        )),
         InitializeErrorKind::POSITION_ENCODING => Some(new_compiler_diagnostic(
             diag::The_content_mapper_selected_unsupported_position_encoding_0,
             args![initialize_error.position_encoding.0],
@@ -713,7 +714,7 @@ pub fn content_mapper_initialization_diagnostic(label: &str, err: &GoError) -> D
     diagnostic
 }
 
-// Go: fileloader.go:616 ContentMapperProjectDiagnostic (tsgo#4712)
+// Go: fileloader.go:630 ContentMapperProjectDiagnostic (tsgo#4712)
 // ContentMapperProjectDiagnostic returns a fileless diagnostic for project setup or mapper initialization.
 pub fn content_mapper_project_diagnostic(err: &GoError) -> Diagnostic {
     if errors::as_type::<InitializeError>(err).is_some() {
@@ -969,6 +970,13 @@ impl FileLoader {
 
     // Go: fileloader.go:341 (*fileLoader).loadSourceFileMetaData
     pub fn load_source_file_meta_data(&self, file_name: &str) -> SourceFileMetaData {
+        if self.opts.skip_module_resolution {
+            return SourceFileMetaData {
+                implied_node_format: get_implied_node_format_for_file(file_name, ""),
+                ..SourceFileMetaData::default()
+            };
+        }
+
         source_file_meta_data(
             self.resolver(),
             self.opts.config.compiler_options(),
@@ -1018,7 +1026,7 @@ impl FileLoader {
         self.opts.host.get_source_file(&parse_options)
     }
 
-    // Go: fileloader.go:418 (*fileLoader).parseContentMappedFile (tsgo#4712)
+    // Go: fileloader.go:438 (*fileLoader).parseContentMappedFile (tsgo#4712)
     // parseContentMappedFile produces a content-mapped virtual source file via the host's content
     // mapper, preserving the original file name and retaining the untransformed text on the
     // source file. Content mapper extensions only reach the parser when content mappers are configured.
@@ -1092,7 +1100,7 @@ impl FileLoader {
         }
     }
 
-    // Go: fileloader.go:562 (*fileLoader).getContentMapperTransformIdentity (tsgo#4712)
+    // Go: fileloader.go:578 (*fileLoader).getContentMapperTransformIdentity (tsgo#4712)
     // PORT: Go `fmt.Sprintf("%x", u.Bytes())` of the `xxh3.Uint128` is the
     // 32 hex digits of the `u128`.
     fn get_content_mapper_transform_identity(&self, mapper: &Rc<Mapper>) -> String {
@@ -1107,7 +1115,7 @@ impl FileLoader {
         )
     }
 
-    // Go: fileloader.go:571 (*fileLoader).emptyContentMappedFile (tsgo#4712)
+    // Go: fileloader.go:587 (*fileLoader).emptyContentMappedFile (tsgo#4712)
     // emptyContentMappedFile produces an empty TypeScript source file for a content-mapped file whose
     // transform could not be used, retaining the original content for diagnostics. Importers see it as an
     // empty module rather than triggering a "cannot find module" error. It is still marked as content-mapped
@@ -1137,7 +1145,7 @@ impl FileLoader {
         source_file
     }
 
-    // Go: fileloader.go:624 (*fileLoader).contentMapperUnavailable (tsgo#4712)
+    // Go: fileloader.go:638 (*fileLoader).contentMapperUnavailable (tsgo#4712)
     // contentMapperUnavailable reports whether mapper failed initialization or exceeded its failure budget.
     fn content_mapper_unavailable(&self, mapper: Option<&Rc<Mapper>>) -> bool {
         let Some(mapper) = mapper else {
@@ -1154,7 +1162,7 @@ impl FileLoader {
                 >= MAX_CONTENT_MAPPER_FAILURES
     }
 
-    // Go: fileloader.go:633 (*fileLoader).recordContentMapperInitializationFailure (tsgo#4712)
+    // Go: fileloader.go:647 (*fileLoader).recordContentMapperInitializationFailure (tsgo#4712)
     fn record_content_mapper_initialization_failure(
         &self,
         mapper: &Rc<Mapper>,
@@ -1173,7 +1181,7 @@ impl FileLoader {
             .push(content_mapper_initialization_diagnostic(label, err));
     }
 
-    // Go: fileloader.go:646 (*fileLoader).recordContentMapperFailure (tsgo#4712)
+    // Go: fileloader.go:660 (*fileLoader).recordContentMapperFailure (tsgo#4712)
     // recordContentMapperFailure counts a transform failure for mapper. It returns whether the failure
     // should be reported for this file (false once the mapper is already disabled). On the failure that
     // reaches maxContentMapperFailures it appends a single program diagnostic disabling the mapper.
@@ -1538,6 +1546,10 @@ impl FileLoader {
             // Do nothing if it's an Identifier; we don't need to do module resolution for `declare global`.
         }
 
+        if self.opts.skip_module_resolution {
+            return;
+        }
+
         if !module_names.is_empty() {
             let mut resolutions_in_file: ModeAwareCache<Arc<ResolvedModule>> =
                 ModeAwareCache::default();
@@ -1556,12 +1568,17 @@ impl FileLoader {
                     entry,
                     Some(&options_for_file),
                 );
-                let (resolved_module, trace) = self.resolver().resolve_module_name(
+                let (resolved_module, trace, err) = self.resolver().resolve_module_name(
                     module_name,
                     &file_name,
                     mode,
                     redirect_ref,
                 );
+                if let Some(err) = err {
+                    self.note_module_resolution_error(err);
+                }
+                let resolved_module =
+                    resolved_module.unwrap_or_else(|| Arc::new(ResolvedModule::default()));
                 resolutions_in_file.insert(
                     ModeAwareCacheKey {
                         name: module_name.to_string(),
@@ -1664,12 +1681,13 @@ impl FileLoader {
 
         let mut path = combine_paths(&self.default_library_path, &[name]);
         let mut replaced = false;
-        if self
-            .opts
-            .config
-            .compiler_options()
-            .lib_replacement
-            .is_true()
+        if !self.opts.skip_module_resolution
+            && self
+                .opts
+                .config
+                .compiler_options()
+                .lib_replacement
+                .is_true()
             && name != "lib.d.ts"
         {
             let library_name = get_library_name_from_lib_file_name(name);
@@ -1722,14 +1740,37 @@ impl FileLoader {
                 false,
             )
         });
-        self.resolver()
-            .resolve_module_name(library_name, resolve_from, ModuleKind::COMMON_JS, None)
+        let (resolved, trace, err) = self.resolver().resolve_module_name(
+            library_name,
+            resolve_from,
+            ModuleKind::COMMON_JS,
+            None,
+        );
+        if let Some(err) = err {
+            self.note_module_resolution_error(err);
+        }
+        // PORT: Go returns a nil result from a `create_module_resolver`
+        // resolver as is; its callers only ask `IsResolved`, which is false
+        // for nil, as for an empty result.
+        (
+            resolved.unwrap_or_else(|| Arc::new(ResolvedModule::default())),
+            trace,
+        )
+    }
+
+    /// Go `p.moduleResolutionErrorOnce.Do(func() { p.moduleResolutionError = err })`
+    /// (ts#64299): keeps the first error.
+    fn note_module_resolution_error(&self, err: GoError) {
+        let mut module_resolution_error = self.module_resolution_error.borrow_mut();
+        if module_resolution_error.is_none() {
+            *module_resolution_error = Some(err);
+        }
     }
 
     /// Go `p.resolver`. It is set before any file is loaded.
-    fn resolver(&self) -> &Resolver {
+    fn resolver(&self) -> &dyn Resolver {
         self.resolver
-            .as_ref()
+            .as_deref()
             .expect("fileLoader.resolver is set before loading")
     }
 }
@@ -1739,7 +1780,7 @@ impl FileLoader {
 /// its own resolver (`files_parser.rs`).
 // Go: fileloader.go:341 (*fileLoader).loadSourceFileMetaData
 pub(crate) fn source_file_meta_data(
-    resolver: &Resolver,
+    resolver: &dyn Resolver,
     options: &CompilerOptions,
     file_name: &str,
 ) -> SourceFileMetaData {
@@ -1880,7 +1921,9 @@ pub(crate) fn get_mode_for_usage_location(
                 SyntaxKind::ImportDeclaration
                 | SyntaxKind::JsImportDeclaration
                 | SyntaxKind::ExportDeclaration
-                | SyntaxKind::JsDocImportTag => parent.attributes().get_resolution_mode_override(),
+                | SyntaxKind::JsDocImportTag => {
+                    parent.attributes().get_resolution_mode_override(None)
+                }
                 _ => (RESOLUTION_MODE_NONE, false),
             };
             if ok {
@@ -1889,7 +1932,10 @@ pub(crate) fn get_mode_for_usage_location(
         }
     }
     if is_literal_type_node(parent) && is_import_type_node(parent.parent()) {
-        let (override_, ok) = parent.parent().attributes().get_resolution_mode_override();
+        let (override_, ok) = parent
+            .parent()
+            .attributes()
+            .get_resolution_mode_override(None);
         if ok {
             return override_;
         }
@@ -2066,6 +2112,8 @@ mod tests {
                 single_threaded: Tristate::True,
                 typings_location: String::new(),
                 project_name: String::new(),
+                create_module_resolver: None,
+                skip_module_resolution: false,
             },
             true,
         );

@@ -234,6 +234,136 @@ const BOX_PATH: &str = "/home/project/app.box";
 const BOX_TEXT: &str = "export const version = #{target};\n";
 
 // ---------------------------------------------------------------------------
+// TestContentMapperProjectWithoutMappedFiles, TestContentMapperParallelFileLoading (ts#64221)
+// ---------------------------------------------------------------------------
+
+/// Go `&project.SessionOptions{CurrentDirectory: "/home/project",
+/// DefaultLibraryPath: bundled.LibPath(), PositionEncoding:
+/// lsproto.PositionEncodingKindUTF8, RunExternalCode: true}` (no typings
+/// location).
+fn race_options() -> SessionOptions {
+    SessionOptions {
+        typings_location: String::new(),
+        ..options("/home/project", true)
+    }
+}
+
+// Go: contentmapper_test.go:53 TestContentMapperProjectWithoutMappedFiles
+fn content_mapper_project_without_mapped_files(has_mapper: bool) {
+    let mut config = r#"{"compilerOptions": {"noLib": true}}"#;
+    if has_mapper {
+        config = r#"{
+					"compilerOptions": { "noLib": true },
+					"contentMappers": [ { "package": "mapper", "extensions": [".box"] } ]
+				}"#;
+    }
+    let mapper = contentmappertest::package_json(contentmappertest::TRANSFORMING_MAPPER);
+    let file_map = files(&[
+        ("/home/project/tsconfig.json", config),
+        (
+            "/home/project/node_modules/mapper/package.json",
+            mapper.as_str(),
+        ),
+        ("/home/project/main.ts", "export {};"),
+    ]);
+    let (mut init, _utils) = init_options(file_map, race_options());
+    let spawner = RecordingContentMapperSpawner::new(contentmappertest::new_spawner());
+    let spawner_for_init: Rc<dyn contentmapper::Spawner> = spawner.clone();
+    init.spawner = Some(spawner_for_init);
+    let session = project::new_session(&init);
+
+    let ctx = bg();
+    session.did_open_file(
+        &ctx,
+        &uri(MAIN_URI),
+        1,
+        "export {};",
+        &lsproto::LanguageKind::TYPE_SCRIPT,
+    );
+    let language_service = session
+        .get_language_service(&ctx, &uri(MAIN_URI))
+        .unwrap_or_else(|err| panic!("GetLanguageService: {}", err.error()));
+    // Access after freezing must not try to initialize using the cleared builder.
+    let program = language_service.get_program();
+    let mapper_project = program.content_mapper_project();
+    assert_eq!(mapper_project.is_some(), has_mapper);
+    let again = program.content_mapper_project();
+    assert_eq!(
+        again.as_ref().map(|p| Rc::as_ptr(p) as *const u8),
+        mapper_project.as_ref().map(|p| Rc::as_ptr(p) as *const u8)
+    );
+    assert_eq!(spawner.spawns(), 0);
+    session.close();
+}
+
+child_test! {
+    // Go: contentmapper_test.go:56 TestContentMapperProjectWithoutMappedFiles/hasMapper=false
+    fn content_mapper_project_without_mapped_files_has_mapper_false() {
+        content_mapper_project_without_mapped_files(false);
+    }
+}
+
+child_test! {
+    // Go: contentmapper_test.go:56 TestContentMapperProjectWithoutMappedFiles/hasMapper=true
+    fn content_mapper_project_without_mapped_files_has_mapper_true() {
+        content_mapper_project_without_mapped_files(true);
+    }
+}
+
+child_test! {
+    // Go: contentmapper_test.go:95 TestContentMapperParallelFileLoading
+    fn content_mapper_parallel_file_loading() {
+        let mapper = contentmappertest::package_json(contentmappertest::TRANSFORMING_MAPPER);
+        let mut entries: Vec<(String, String)> = vec![
+            (
+                "/home/project/tsconfig.json".to_string(),
+                r#"{
+			"compilerOptions": { "target": "es2020", "noLib": true },
+			"contentMappers": [ { "package": "mapper", "extensions": [".box"] } ]
+		}"#
+                .to_string(),
+            ),
+            ("/home/project/node_modules/mapper/package.json".to_string(), mapper.clone()),
+            ("/home/project/main.ts".to_string(), "export {};".to_string()),
+        ];
+        // Parallel parsing reads the mapper project identity while another file initializes it.
+        const FILE_COUNT: usize = 32;
+        for i in 0..FILE_COUNT {
+            entries.push((
+                format!("/home/project/file{i}.box"),
+                "export const version = #{target};\n".to_string(),
+            ));
+        }
+        let borrowed: Vec<(&str, &str)> =
+            entries.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (mut init, _utils) = init_options(files(&borrowed), race_options());
+        init.spawner = Some(contentmappertest::new_spawner());
+        let session = project::new_session(&init);
+
+        let ctx = bg();
+        session.did_open_file(&ctx, &uri(MAIN_URI), 1, "export {};", &lsproto::LanguageKind::TYPE_SCRIPT);
+        let language_service = session
+            .get_language_service(&ctx, &uri(MAIN_URI))
+            .unwrap_or_else(|err| panic!("GetLanguageService: {}", err.error()));
+        let program = language_service.get_program();
+        let mapper_project = program.content_mapper_project().expect("mapper project");
+        let again = program.content_mapper_project().expect("mapper project");
+        assert!(Rc::ptr_eq(&again, &mapper_project));
+        for i in 0..FILE_COUNT {
+            let file_name = format!("/home/project/file{i}.box");
+            let file = program
+                .get_source_file(&file_name)
+                .unwrap_or_else(|| panic!("expected {file_name} to be loaded"));
+            assert_eq!(
+                file.text,
+                "const __VERSION = \"1.0.0\";\nexport const version = 7;\n"
+            );
+        }
+        session.close();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TestContentMapperInProject
 // ---------------------------------------------------------------------------
 
@@ -295,13 +425,7 @@ child_test! {
         let calls = utils.client().register_content_mapper_extensions_calls();
         assert!(!calls.is_empty(), "expected RegisterContentMapperExtensions to be called");
         assert_eq!(calls.last().cloned(), Some(vec![".box".to_string()]));
-        let logs = utils.logs();
-        assert!(
-            logs.contains("Content mapper timings since previous snapshot adoption:"),
-            "{logs}"
-        );
-        assert!(logs.contains("mapper@1.0.0:"), "{logs}");
-        assert!(logs.contains("Transforms: 1 ("), "{logs}");
+        // ts#64015 removed the log assertions here.
         session.close();
     }
 }
@@ -762,8 +886,15 @@ child_test! {
         }));
 
         let session = project::new_session(&init);
-        open(&session, MAIN_URI, MAIN_TEXT);
-        program(&session, MAIN_URI);
+        // ts#64163
+        let ctx = locale::with_locale(&bg(), locale::DEFAULT);
+        let locale_reads = utils.client().get_locale_calls();
+        session.did_open_file(&ctx, &uri(MAIN_URI), 1, MAIN_TEXT, &lsproto::LanguageKind::TYPE_SCRIPT);
+        session
+            .get_language_service(&ctx, &uri(MAIN_URI))
+            .unwrap_or_else(|err| panic!("GetLanguageService: {}", err.error()));
+        // Snapshot adoption reads the current locale for its background work; project construction should not.
+        assert_eq!(utils.client().get_locale_calls(), locale_reads + 1);
         assert_eq!(spawner.spawns(), 1);
 
         let mut preferences = session.config();
@@ -970,7 +1101,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: contentmapper_test.go:638 TestContentMapperOpenFileExcludedByConfigChange
+    // Go: contentmapper_test.go:720 TestContentMapperOpenFileExcludedByConfigChange (ts#64137)
     fn content_mapper_open_file_excluded_by_config_change() {
         const SRC_BOX_URI: &str = "file:///home/project/src/app.box";
         const SRC_BOX_PATH: &str = "/home/project/src/app.box";
@@ -1012,6 +1143,18 @@ child_test! {
 	}"#,
         );
         watch(&session, &[(CHANGED, "file:///home/project/tsconfig.json")]);
+        session.wait_for_background_tasks();
+
+        // The background update removes app.box from the configured project, but inferred
+        // project cleanup is deferred until the next file open.
+        assert!(
+            session
+                .snapshot()
+                .get_default_project(&uri(SRC_BOX_URI))
+                .is_none()
+        );
+        let main_uri = "file:///home/project/src/main.ts";
+        open(&session, main_uri, "export const main = true;\n");
 
         let box_program = program(&session, SRC_BOX_URI);
         let default_project = default_project(&session, SRC_BOX_URI);

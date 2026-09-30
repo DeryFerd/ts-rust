@@ -4,10 +4,10 @@ use crate::frontend::prelude::*;
 use std::cell::Cell;
 use std::sync::Arc;
 
-// Go: module/cache.go:11 ModeAwareCache
+// Go: module/cache.go:9 ModeAwareCache
 pub type ModeAwareCache<T> = FxHashMap<ModeAwareCacheKey, T>;
 
-// Go: module/cache.go:13 moduleResolutionCacheKey
+// Go: module/cache.go:11 moduleResolutionCacheKey
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ModuleResolutionCacheKey {
     pub containing_directory: String,
@@ -16,9 +16,9 @@ pub struct ModuleResolutionCacheKey {
     pub redirect_config_name: String,
 }
 
-// Go: module/cache.go:20 moduleResolutionCache
+// Go: module/cache.go:18 moduleResolutionCache
 // PORT: Go `collections.SyncMap` is a plain map behind a `RefCell`, so the
-// `Resolver` methods can take `&self`. Cached Go pointers are `Arc`: parse
+// `DefaultResolver` methods can take `&self`. Cached Go pointers are `Arc`: parse
 // workers share them (`SharedResolutionCache`), and checker threads read
 // the program's resolutions with no copy (`GoSharedState`).
 #[derive(Default)]
@@ -27,20 +27,20 @@ pub struct ModuleResolutionCache {
 }
 
 impl ModuleResolutionCache {
-    // Go: module/cache.go:24 moduleResolutionCache.Get
+    // Go: module/cache.go:22 moduleResolutionCache.Get
     #[must_use]
     pub fn get(&self, key: &ModuleResolutionCacheKey) -> Option<Arc<ResolvedModule>> {
         self.cache.borrow().get(key).cloned()
     }
 
-    // Go: module/cache.go:28 moduleResolutionCache.Set
+    // Go: module/cache.go:26 moduleResolutionCache.Set
     // PORT: Go `LoadOrStore`: the first stored value wins.
     pub fn set(&self, key: ModuleResolutionCacheKey, value: Arc<ResolvedModule>) {
         self.cache.borrow_mut().entry(key).or_insert(value);
     }
 }
 
-// Go: module/cache.go:32 typeRefDirectiveResolutionCacheKey
+// Go: module/cache.go:30 typeRefDirectiveResolutionCacheKey
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TypeRefDirectiveResolutionCacheKey {
     pub containing_directory: String,
@@ -50,7 +50,7 @@ pub struct TypeRefDirectiveResolutionCacheKey {
     pub from_inferred_types_containing_file: bool,
 }
 
-// Go: module/cache.go:40 typeRefDirectiveResolutionCache
+// Go: module/cache.go:38 typeRefDirectiveResolutionCache
 // PORT: see `ModuleResolutionCache`.
 #[derive(Default)]
 pub struct TypeRefDirectiveResolutionCache {
@@ -59,7 +59,7 @@ pub struct TypeRefDirectiveResolutionCache {
 }
 
 impl TypeRefDirectiveResolutionCache {
-    // Go: module/cache.go:44 typeRefDirectiveResolutionCache.Get
+    // Go: module/cache.go:42 typeRefDirectiveResolutionCache.Get
     #[must_use]
     pub fn get(
         &self,
@@ -68,7 +68,7 @@ impl TypeRefDirectiveResolutionCache {
         self.cache.borrow().get(key).cloned()
     }
 
-    // Go: module/cache.go:48 typeRefDirectiveResolutionCache.Set
+    // Go: module/cache.go:46 typeRefDirectiveResolutionCache.Set
     // PORT: Go `Store`: the last stored value wins.
     pub fn set(
         &self,
@@ -79,20 +79,59 @@ impl TypeRefDirectiveResolutionCache {
     }
 }
 
-// Go: module/cache.go:52 caches
+// Go: module/cache.go:50 parsedPatternsCache
+// PORT: Go keys the `SyncMap` by the `*OrderedMap` of `paths`, and the key
+// keeps that map alive. The Rust `paths` map is a field of the
+// `CompilerOptions`, so the key is the address of that field (0 for a nil
+// map), and the entry holds the options `Rc` that owns it.
+#[derive(Default)]
+pub struct ParsedPatternsCache {
+    cache: RefCell<FxHashMap<usize, (Rc<CompilerOptions>, Rc<ParsedPatterns>)>>,
+}
+
+impl ParsedPatternsCache {
+    // Go: module/cache.go:54 parsedPatternsCache.Get
+    // PORT: Go takes `compilerOptions.Paths`; this takes the options that
+    // own it (see the type).
+    pub fn get(&self, compiler_options: &Rc<CompilerOptions>) -> Rc<ParsedPatterns> {
+        let path_mappings = compiler_options.paths.as_ref();
+        let key = path_mappings.map_or(0, |path_mappings| {
+            std::ptr::from_ref(path_mappings) as usize
+        });
+        if let Some((_, patterns)) = self.cache.borrow().get(&key) {
+            return patterns.clone();
+        }
+        let patterns = Rc::new(try_parse_patterns(path_mappings));
+        self.cache
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| (compiler_options.clone(), patterns))
+            .1
+            .clone()
+    }
+
+    /// Drops the entries (`Caches::release`).
+    // PORT: not in Go.
+    fn clear(&self) {
+        let entries = std::mem::take(&mut *self.cache.borrow_mut());
+        drop(entries);
+    }
+}
+
+// Go: module/cache.go:62 caches
 // PORT: Go `*packagejson.InfoCache` is shared between resolvers
 // (`ResolverOptions.PackageJsonCache`), so it is `Rc<InfoCache>`. `InfoCache`
-// has interior mutability, like the Go `SyncMap`. Go `sync.Once` plus the
-// pointer field is a `RefCell<Option<..>>`, filled on first use.
+// has interior mutability, like the Go `SyncMap`.
 pub struct Caches {
     pub package_json_info_cache: Rc<InfoCache>,
 
     pub module_resolution_cache: ModuleResolutionCache,
     pub type_ref_directive_resolution_cache: TypeRefDirectiveResolutionCache,
 
-    // Cached representation for `core.CompilerOptions.paths`.
-    // Doesn't handle other path patterns like in `typesVersions`.
-    pub parsed_patterns_for_paths: RefCell<Option<Rc<ParsedPatterns>>>,
+    // Cached representations for `core.CompilerOptions.paths`, keyed by the
+    // path mappings themselves. This does not handle other path patterns such
+    // as `typesVersions`.
+    pub parsed_patterns_for_paths: ParsedPatternsCache,
 
     /// The resolution caches that this resolver shares with the other
     /// resolvers of one program load (see `SharedResolutionCache`). `None`
@@ -106,26 +145,26 @@ pub struct Caches {
     /// The loader's resolver: the package.json lookups of the worker
     /// answers that it took from `shared`. They go into
     /// `package_json_info_cache` before a read of all its entries
-    /// (`Resolver::package_json_cache_entries`).
+    /// (`DefaultResolver::package_json_cache_entries`).
     pub worker_package_jsons: RefCell<Vec<Arc<[PackageJsonLookup]>>>,
 
     /// The loader's resolver in `tsc -b`: the file system lookups of the
     /// worker answers that it took from `shared` (`SharedResolution::lookups`).
     /// The load adds them to the build host's cache at its end
-    /// (`Resolver::take_worker_lookups`, `BuildStatCache::end_load`).
+    /// (`DefaultResolver::take_worker_lookups`, `BuildStatCache::end_load`).
     pub worker_lookups: RefCell<Vec<Arc<[StatLookup]>>>,
 }
 
 impl Caches {
     // PORT: Go zero `caches` with only `packageJsonInfoCache` set
-    // (`NewResolverWithOptions` with a shared cache).
+    // (`NewResolver` with a shared `PackageJsonCache`).
     #[must_use]
     pub fn with_package_json_info_cache(package_json_info_cache: Rc<InfoCache>) -> Caches {
         Caches {
             package_json_info_cache,
             module_resolution_cache: ModuleResolutionCache::default(),
             type_ref_directive_resolution_cache: TypeRefDirectiveResolutionCache::default(),
-            parsed_patterns_for_paths: RefCell::new(None),
+            parsed_patterns_for_paths: ParsedPatternsCache::default(),
             shared: None,
             package_json_log: RefCell::new(Vec::new()),
             worker_package_jsons: RefCell::new(Vec::new()),
@@ -142,13 +181,12 @@ impl Caches {
         let modules = std::mem::take(&mut *self.module_resolution_cache.cache.borrow_mut());
         let type_ref_directives =
             std::mem::take(&mut *self.type_ref_directive_resolution_cache.cache.borrow_mut());
-        let patterns = self.parsed_patterns_for_paths.borrow_mut().take();
+        self.parsed_patterns_for_paths.clear();
         let worker_package_jsons = std::mem::take(&mut *self.worker_package_jsons.borrow_mut());
         let worker_lookups = std::mem::take(&mut *self.worker_lookups.borrow_mut());
         drop((
             modules,
             type_ref_directives,
-            patterns,
             worker_package_jsons,
             worker_lookups,
         ));
@@ -158,7 +196,7 @@ impl Caches {
     }
 }
 
-// Go: module/cache.go:20 moduleResolutionCache and :40
+// Go: module/cache.go:18 moduleResolutionCache and :40
 // typeRefDirectiveResolutionCache, the `SyncMap`s themselves.
 // PORT: Go shares one resolver, and so these maps, between all parse tasks
 // of a program. The Rust loader resolves on one thread with `Rc` values
@@ -394,7 +432,7 @@ impl Caches {
     }
 }
 
-// Go: module/cache.go:64 newCaches
+// Go: module/cache.go:74 newCaches
 #[must_use]
 pub fn new_caches(
     current_directory: &str,
@@ -407,7 +445,7 @@ pub fn new_caches(
     )))
 }
 
-// Go: module/cache.go:74 getRedirectConfigName
+// Go: module/cache.go:84 getRedirectConfigName
 #[must_use]
 pub fn get_redirect_config_name(redirect: Option<&dyn ModuleResolvedProjectReference>) -> String {
     match redirect {
@@ -438,7 +476,7 @@ mod tests {
 
     /// A bundler resolver on the OS file system of this thread, linked to
     /// `shared` when given.
-    fn test_resolver(dir: &str, shared: Option<SharedResolutionLink>) -> Resolver {
+    fn test_resolver(dir: &str, shared: Option<SharedResolutionLink>) -> DefaultResolver {
         let host: Rc<dyn ResolutionHost> = Rc::new(TestHost {
             fs: osvfs_fs(),
             current_directory: dir.to_string(),
@@ -448,7 +486,11 @@ mod tests {
             module_resolution: ModuleResolutionKind::BUNDLER,
             ..Default::default()
         });
-        let mut resolver = new_resolver(host, options, "", "", Vec::new());
+        let mut resolver = new_resolver(ResolverOptions {
+            host: Some(host),
+            compiler_options: Some(options),
+            ..Default::default()
+        });
         resolver.caches.shared = shared;
         resolver
     }
@@ -465,7 +507,7 @@ mod tests {
         "@types/node",
     ];
 
-    fn resolve(resolver: &Resolver, dir: &str, names: &[&str]) {
+    fn resolve(resolver: &DefaultResolver, dir: &str, names: &[&str]) {
         let containing_file = format!("{dir}/src/deep/index.ts");
         for name in names {
             if let Some(type_reference) = name.strip_prefix("@types/") {
@@ -483,7 +525,7 @@ mod tests {
     }
 
     /// The package.json cache entries that the build info reads, sorted.
-    fn package_json_entries(resolver: &Resolver) -> Vec<(String, String, bool, bool)> {
+    fn package_json_entries(resolver: &DefaultResolver) -> Vec<(String, String, bool, bool)> {
         let mut entries = Vec::new();
         resolver.package_json_cache_entries(|key, entry| {
             entries.push((

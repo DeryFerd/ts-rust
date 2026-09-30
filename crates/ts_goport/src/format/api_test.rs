@@ -36,25 +36,17 @@ pub(super) fn apply_bulk_edits(text: &str, edits: &[TextChange]) -> String {
     String::from_utf8(b).expect("edits split a UTF-8 character")
 }
 
-// Go: repo/paths.go TypeScriptSubmodulePath
-// PORT: Go finds the repo root from the test source path. The port reads
-// the TypeScript submodule of the pinned typescript-go checkout.
-fn type_script_submodule_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::Path::new(&home)
-        .join(".explore/repos/microsoft__typescript-go")
-        .join("_submodules")
-        .join("TypeScript")
-}
-
-// Go: repo/paths.go typeScriptSubmoduleExists
-fn type_script_submodule_exists() -> bool {
-    let p = type_script_submodule_path().join("package.json");
-    match std::fs::metadata(&p) {
-        Ok(_) => true,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-        Err(err) => panic!("{err}"),
-    }
+// Go: repo/paths.go TestDataPath
+// PORT: Go finds the repo root (`tsc/`) from the test source path. The port
+// reads the pinned Go checkout: `TS_GO_REPO` (set by goport-tests.sh), or
+// the default checkout path that `pin.py exec` binds.
+fn test_data_path() -> std::path::PathBuf {
+    let repo = match std::env::var_os("TS_GO_REPO") {
+        Some(repo) if !repo.is_empty() => std::path::PathBuf::from(repo),
+        _ => std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+            .join(".explore/repos/microsoft__typescript-go"),
+    };
+    repo.join("testdata")
 }
 
 // Go: format/api_test.go:37 TestFormat, "format checker.ts"
@@ -77,12 +69,7 @@ fn test_format_format_checker_ts() {
         },
         "\n",
     );
-    // Go: repo.SkipIfNoTypeScriptSubmodule(t)
-    if !type_script_submodule_exists() {
-        println!("SKIP test_format_format_checker_ts: TypeScript submodule does not exist");
-        return;
-    }
-    let file_path = type_script_submodule_path().join("src/compiler/checker.ts");
+    let file_path = test_data_path().join("fixtures/compiler/checker.ts");
     let file_content = std::fs::read(&file_path);
     if let Err(err) = &file_content {
         panic!("expected no error, got {err}");
@@ -108,5 +95,5 @@ fn test_format_format_checker_ts() {
     assert!(text != new_text);
 }
 
-// Go: format/api_test.go:70 BenchmarkFormat
+// Go: format/api_test.go:67 BenchmarkFormat
 // PORT: not ported (benchmark).

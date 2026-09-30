@@ -436,7 +436,7 @@ impl Checker {
                 let is_distributive = root.borrow().is_distributive;
                 let mut distribution_type = TypeId::NIL;
                 if is_distributive {
-                    let mapped = self.mapper_map(new_mapper, check_type);
+                    let mapped = self.get_mapped_type(check_type, new_mapper);
                     distribution_type = self.get_reduced_type(mapped);
                 }
                 // Distributive conditional types are distributed over union types. For example, when the
@@ -1261,13 +1261,61 @@ impl Checker {
                         t
                     } else {
                         let symbol = self.get_symbol_from_type_reference(node);
-                        self.get_type_reference_type(node, symbol)
+                        let t = self.get_type_reference_type(node, symbol);
+                        self.get_distributed_type_parameter(node, t)
                     }
                 };
             self.type_node_links.get(node).resolved_type = resolved;
             return resolved;
         }
         cached
+    }
+
+    // Go: checker/checker.go:23363 getDistributedTypeParameter
+    pub fn get_distributed_type_parameter(&mut self, node: Node, t: TypeId) -> TypeId {
+        if self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER)
+            && !self.ty(t).as_type_parameter().is_distributed
+        {
+            let mut n = node.parent();
+            while n.is_some() && !is_statement(n) {
+                if is_conditional_type_node(n) {
+                    let check_type_node = n.check_type();
+                    if is_simple_identifier_type_reference(check_type_node)
+                        && self.get_symbol_from_type_reference(check_type_node) == self.ty(t).symbol
+                    {
+                        // If node is contained in a distributive conditional type for the given type parameter,
+                        // return the distributed form of the type parameter.
+                        return self.get_distributed_type_from_type_parameter(t);
+                    }
+                }
+                n = n.parent();
+            }
+        }
+        t
+    }
+
+    // Go: checker/checker.go:23378 getDistributedTypeFromTypeParameter
+    pub fn get_distributed_type_from_type_parameter(&mut self, t: TypeId) -> TypeId {
+        if self.ty(t).as_type_parameter().distributed_type.is_nil() {
+            let symbol = self.ty(t).symbol;
+            let distributed_type = self.new_type_parameter(symbol);
+            self.ty_mut(t).as_type_parameter_mut().distributed_type = distributed_type;
+            let tp = self.ty_mut(distributed_type).as_type_parameter_mut();
+            tp.is_distributed = true;
+            tp.constraint = t;
+        }
+        self.ty(t).as_type_parameter().distributed_type
+    }
+
+    // Go: checker/checker.go:23388 getNonDistributedTypeParameter
+    // PORT: a Go package function; a `Checker` method here because it reads
+    // the type arena.
+    pub fn get_non_distributed_type_parameter(&self, t: TypeId) -> TypeId {
+        let ty = self.ty(t);
+        if ty.flags.intersects(TypeFlags::TYPE_PARAMETER) && ty.as_type_parameter().is_distributed {
+            return ty.as_type_parameter().constraint;
+        }
+        t
     }
 
     // Go: checker/checker.go:22920 getIntendedTypeFromJSDocTypeReference
@@ -1558,4 +1606,11 @@ impl Checker {
         }
         self.error_type
     }
+}
+
+// Go: checker/checker.go:23395 isSimpleIdentifierTypeReference
+pub fn is_simple_identifier_type_reference(node: Node) -> bool {
+    is_type_reference_node(node)
+        && is_identifier(node.type_name())
+        && node.type_argument_list().is_nil()
 }

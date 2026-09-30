@@ -8,7 +8,18 @@ use super::lsptestutil::{self, LspClient, result_response};
 use super::projecttestutil::files;
 use super::util::uri;
 
-// Go: server_projectinfo_test.go:16 initProjectInfoClient
+// Go: server_projectinfo_test.go:16 expectedCodeActionKinds (ts#63951)
+pub(super) fn expected_code_action_kinds() -> Vec<lsproto::CodeActionKind> {
+    vec![
+        lsproto::CodeActionKind::QUICK_FIX,
+        lsproto::CodeActionKind("source.organizeImports.ts".into()),
+        lsproto::CodeActionKind("source.removeUnusedImports.ts".into()),
+        lsproto::CodeActionKind("source.sortImports.ts".into()),
+        lsproto::CodeActionKind("source.fixAll.ts".into()),
+    ]
+}
+
+// Go: server_projectinfo_test.go:26 initProjectInfoClient
 pub(super) fn init_project_info_client(entries: &[(&str, &str)]) -> LspClient {
     let on_server_request: lsptestutil::ServerRequestHandler = Arc::new(|req| {
         if req.method == lsproto::Method::CLIENT_REGISTER_CAPABILITY
@@ -40,6 +51,35 @@ pub(super) fn init_project_info_client(entries: &[(&str, &str)]) -> LspClient {
     );
 
     client
+}
+
+child_test! {
+    // Go: server_projectinfo_test.go:62 TestInitializeCodeActionKinds (ts#63951)
+    fn initialize_code_action_kinds() {
+        let client = lsptestutil::new_lsp_client(
+            lsptestutil::server_setup("/home/projects", files(&[])),
+            None,
+            None,
+        );
+
+        let (message, result) = client.send_request(
+            &lsproto::INITIALIZE_INFO,
+            lsproto::InitializeParams {
+                capabilities: Some(lsproto::ClientCapabilities::default()),
+                ..Default::default()
+            },
+        );
+        assert!(message.error.is_none(), "Initialize failed");
+        // Go dereferences the `*InitializeResult`.
+        let result = result.flatten().expect("Initialize failed");
+        let kinds = result
+            .capabilities
+            .and_then(|capabilities| capabilities.code_action_provider)
+            .and_then(|provider| provider.code_action_options)
+            .and_then(|options| options.code_action_kinds)
+            .expect("expected code action kinds");
+        assert_eq!(kinds, expected_code_action_kinds());
+    }
 }
 
 fn open_and_project_info(client: &LspClient, text: &str) -> lsproto::ProjectInfoResult {

@@ -702,7 +702,7 @@ test("goport batch passes on its own tests, gate and oracles, without roster evi
   assert.equal(result.protectedSet, "goport");
   assert.equal(result.rule, GOPORT_RULE);
   assert.deepEqual(result.counts, {
-    goportTests: { baseOk: 4, retained: 4, recovered: 1, removedByMap: 0, newNames: 1, lost: 0, absent: 0, unrun: 0 },
+    goportTests: { baseOk: 4, retained: 4, recovered: 1, removedByMap: 0, removedIgnored: 0, newNames: 1, lost: 0, absent: 0, unrun: 0 },
     gate: { baseItems: 5, items: 6, regressions: 0, knownOpen: 2, runs: 1, flakes: 0 } });
   assert.deepEqual(result.gateFlakes, []);
   assert.deepEqual(result.base, { batch: "batch-0", tests: BASELINE_PATH, gate: "gate/r131/manifest.json" });
@@ -948,11 +948,11 @@ test("a gate id map cannot hide a real removal", () => {
     assert.deepEqual(result.losses.gate.map(({ id, now }) => [id, now]), [["corpus-diag/00001", "REMOVED"]]);
     assert.match(result.losses.gate[0].why, why);
   }
-  // Malformed maps are bad input: two old ids for one new id, a missing source, a removal line.
+  // Malformed maps are bad input: two old ids for one new id, a missing source, "-" as the case path.
   for (const [text, why] of [
     ["corpus-diag/00001\tcorpus-diag/00002\ta.ts\ncorpus-diag/00009\tcorpus-diag/00002\ta.ts\n", /line 2: corpus-diag\/00002 is in two lines/],
     ["corpus-diag/00001\tcorpus-diag/00002\n", /line 1: need/],
-    ["corpus-diag/00001\t-\ta.ts\n", /line 1: need/],
+    ["corpus-diag/00001\tcorpus-diag/00002\t-\n", /line 1: need/],
     ["corpus-diag/00001\tcorpus-emit/00002\ta.ts\n", /are not ids of one corpus family/],
   ]) {
     const f = goportFixture(); renumbered(f); withIdMap(f, text);
@@ -1061,7 +1061,7 @@ test("the history row and both verdicts bind the gate id map (skeptic: unbound m
   stopped(f, /gate id map .* does not have the sha256/);
 });
 
-test("the map cannot remove a case, whatever commit a line cites (skeptic: made-up commit)", () => {
+test("a removal line needs Go evidence at both pins, whatever commit its note cites (skeptic: made-up commit)", () => {
   // The new run does not hold a.ts: Go removed it, or it left the gate sample. Either way its base id is a removed id.
   const gone = (f, pin) => {
     renumbered(f, [], pin);
@@ -1069,13 +1069,15 @@ test("the map cannot remove a case, whatever commit a line cites (skeptic: made-
   };
   let f = goportFixture(); gone(f);
   assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)), [["corpus-diag/00001", "removed id"]]);
-  // A removal line is bad input at a pin change and at one pin: a made-up commit, the pin B commit, tsgo #4407.
-  const need = /line 1: need "<old id> TAB <new id> TAB <case path>" \(the map cannot remove a case\)/;
-  for (const pin of [NEW_PIN, GO_PIN]) {
-    for (const commit of ["deadbeef", "16c25522e123", "bbdf7a24b"]) {
-      f = goportFixture(); gone(f, pin); withIdMap(f, `corpus-diag/00001\t-\ta.ts\t${commit}\n`);
-      stopped(f, need);
-    }
+  // A removal line needs a note that names the Go commit that deletes the case (bump C reviewer ruling 2 item 3), but
+  // the note is no evidence. With a made-up commit, the pin B commit or tsgo #4407 the removal check (Go at both pins)
+  // decides: a.ts is in no Go checkout, so it is a removed id. At one pin the map has no effect.
+  const noBase = /^removed id \(id map line \d removes it, but a\.ts is not in the base pin Go checkout /;
+  for (const commit of ["deadbeef", "16c25522e123", "bbdf7a24b"]) {
+    f = goportFixture(); gone(f, NEW_PIN); withIdMap(f, `corpus-diag/00001\t-\ta.ts\tdeleted by ${commit}\n`);
+    assert.match(removedIds(stopped(f, /1 gate items regressed/))[0][1], noBase);
+    f = goportFixture(); gone(f, GO_PIN); withIdMap(f, `corpus-diag/00001\t-\ta.ts\tdeleted by ${commit}\n`);
+    assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)), [["corpus-diag/00001", "removed id"]]);
   }
   // The skeptic's map: an honest line for each case the new run holds, then a removal line for a.ts.
   f = goportFixture(); gone(f, NEW_PIN);
@@ -1084,11 +1086,13 @@ test("the map cannot remove a case, whatever commit a line cites (skeptic: made-
   withIdMap(f, "corpus-diag/00005\tcorpus-diag/00006\tb.ts\n");
   assert.deepEqual(removedIds(stopped(f, /1 gate items regressed/)),
     [["corpus-diag/00001", "removed id (the id map has no line for it, and its family corpus-diag is mapped)"]]);
-  withIdMap(f, "corpus-diag/00005\tcorpus-diag/00006\tb.ts\ncorpus-diag/00001\t-\ta.ts\tdeadbeef\n");
-  stopped(f, /line 2: need/);
-  // Other forms: "-" in any cell, a fourth cell on a move, a missing case path.
-  for (const text of ["corpus-diag/00001\t-\ta.ts\n", "corpus-diag/00001\tcorpus-diag/00002\ta.ts\tdeadbeef\n",
-    "corpus-diag/00001\tcorpus-diag/00002\t-\n", "-\tcorpus-diag/00002\ta.ts\n"]) {
+  withIdMap(f, "corpus-diag/00005\tcorpus-diag/00006\tb.ts\ncorpus-diag/00001\t-\ta.ts\tdeleted by deadbeef\n");
+  assert.match(removedIds(stopped(f, /1 gate items regressed/))[0][1], noBase);
+  // Other forms are bad input: a removal line without a note or whose note names no commit, "-" as the old id or the
+  // case path, a fourth cell on a move.
+  const need = /line 1: need "<old id> TAB <new id> TAB <case path>" or "<old id> TAB - TAB <case path> TAB <note naming the Go commit that deletes the case>"/;
+  for (const text of ["corpus-diag/00001\t-\ta.ts\n", "corpus-diag/00001\t-\ta.ts\tts#64122\n",
+    "corpus-diag/00001\tcorpus-diag/00002\ta.ts\tdeadbeef\n", "corpus-diag/00001\tcorpus-diag/00002\t-\n", "-\tcorpus-diag/00002\ta.ts\n"]) {
     f = goportFixture(); gone(f); withIdMap(f, text);
     stopped(f, need);
   }
@@ -1332,6 +1336,28 @@ test("a removal needs a Go pin change or a kept-crate suite, and is listed for t
   assert.equal(result.verdict, "PASS", result.reasons.join(" "));
   assert.equal(result.counts.goportTests.removedByMap, 1);
   assert.deepEqual(result.nameMapRemoved, [{ suite: "go_baselines", name: "b::one", evidence: "removed at 16c25522e123: go/testdata/x.ts deleted" }]);
+  // A removal line may keep a go_baselines_reference name that is ignored in the new results (bump C ruling 1
+  // item 5), not an ok or failed one, and not an ignored name of another suite (a libtest #[ignore]).
+  const REF = "tsc/commandLine/adds-color.js";
+  for (const [suite, name, status, pass] of [["go_baselines_reference", REF, "ignored", true], ["go_baselines_reference", REF, "ok", false],
+    ["go_baselines_reference", REF, "failed", false], ["go_baselines", "b::one", "ignored", false]]) {
+    f = goportFixture();
+    f.files[BASELINE_PATH].value.suites.go_baselines_reference = { [REF]: "ok" };
+    f.results.suites.go_baselines_reference = { [REF]: "ok" };
+    f.results.suites[suite][name] = status;
+    f.results.pin = NEW_PIN;
+    f.gateNew.upstreamPin = NEW_PIN;
+    f.state.batch.upstreamPin = { from: GO_PIN, to: NEW_PIN };
+    withMap(f, `${suite}\t${name}\t-\t-\tGo test removed at 16c25522e123, its baseline file left behind\n`);
+    if (pass) {
+      result = check(f);
+      assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+      assert.deepEqual([result.counts.goportTests.removedByMap, result.counts.goportTests.removedIgnored], [1, 1]);
+      assert.deepEqual(result.nameMapRemovedIgnored.map(r => r.name), [REF]);
+    } else {
+      stopped(f, new RegExp(`Name map line 1: ${suite} ${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} is still in the new results`));
+    }
+  }
   f = goportFixture();
   delete f.results.suites.ts_scanner_lib["scan::a"];
   withMap(f, "ts_scanner_lib\tscan::a\t-\t-\tstage 5: goport's scanner replaces ts_scanner\n");
@@ -1459,7 +1485,7 @@ test("goport unbound history rows come from the standing rule list, never the cu
 
 // Oracle answer sets and rebase runs (reviewer ruling 10, r139-diag/reviewer-ruling.md). GOLDEN_A and GOLDEN_B
 // are the oracles of GO_PIN and NEW_PIN; BASE_TSGO is the tsgo of the base batch's gate (batch-0).
-const [GOLDEN_A, GOLDEN_B, BASE_TSGO] = ["a1".repeat(32), "b2".repeat(32), "b".repeat(64)];
+const [GOLDEN_A, GOLDEN_B, BASE_TSGO, API_TOOL] = ["a1".repeat(32), "b2".repeat(32), "b".repeat(64), "c3".repeat(32)];
 
 // An answer set file (goport-oracle-answers/1) in dir, named in the fixture by its absolute path: each request key
 // gets its Go answers, each from one Go golden at the set's oracle. The answers are JSON objects with one key, so
@@ -1581,10 +1607,11 @@ function withRebase(f, { lsp = [["same", "flaky_oracle", "not_run"]], knownDiffs
     return { label: basename(dir), dir };
   });
   f.oracle["api/api-r131-atB"] = [trace("qc", "a1", ["same", "goport_error"])];
-  f.put("api/api-r131-atB/manifest.json", "0", { batteries: { qc: { goportSha: BASE_TSGO, oracleSha: GOLDEN_B, traces: 1 } } });
+  f.put("api/api-r131-atB/manifest.json", "0", { batteries: { qc: { goportSha: BASE_TSGO, oracleSha: GOLDEN_B, traces: 1, wire: 3, scriptSha: API_TOOL } } });
   f.state.batch.oracleRebase = {
     lsp: { runs: lspRuns, binsSha256: BASE_TSGO, oracleSha256: GOLDEN_B },
-    api: { runs: [{ label: "api-r131-atB", dir: "api/api-r131-atB" }], binsSha256: BASE_TSGO, oracleSha256: GOLDEN_B, knownDiffs } };
+    api: { runs: [{ label: "api-r131-atB", dir: "api/api-r131-atB" }], binsSha256: BASE_TSGO, oracleSha256: GOLDEN_B, wire: 3, toolSha256: API_TOOL,
+      knownDiffs } };
   f.state.batch.oracleAnswers = answers;
   resultsShas(f);
 }
@@ -1628,6 +1655,13 @@ test("the oracle base of a pin bump is the base bins measured again at the new p
     [g => { g.files["api/api-r131-atB/manifest.json"].value.batteries.qc.oracleSha = GOLDEN_A; resultsShas(g); }, /rebase run api-r131-atB used the oracle a1a1.*, not the batch pin's/],
     [g => { g.state.batch.oracleRebase.lsp.runs[0].resultsSha256 = "e".repeat(64); rebind(g); }, /rebase run lsp-r131-atB \(lsp\/lsp-r131-atB\) has resultsSha256 /],
     [g => { g.state.batch.oracleRebase.lsp.knownDiffs = [{ key: "b1/t1#1", reason: "r" }]; rebind(g); }, /knownDiffs must list each \{key, reason\} once; the LSP has none/],
+    // bump C ruling 1 item 1: the API rebase runs are --wire 3 runs of one API tool, and the entry says so.
+    [g => { delete g.state.batch.oracleRebase.api.wire; rebind(g); }, /batch.oracleRebase.api needs "wire": 3 and toolSha256, the api_oracle.py sha256 of its runs/],
+    [g => { g.state.batch.oracleRebase.api.toolSha256 = "c3"; rebind(g); }, /batch.oracleRebase.api needs "wire": 3 and toolSha256/],
+    [g => { delete g.files["api/api-r131-atB/manifest.json"].value.batteries.qc.wire; resultsShas(g); },
+      /rebase run api-r131-atB \(api\/api-r131-atB\) has batteries without "wire": 3 or api_oracle.py c3c3.*: qc/],
+    [g => { g.files["api/api-r131-atB/manifest.json"].value.batteries.qc.scriptSha = "d".repeat(64); resultsShas(g); },
+      /rebase run api-r131-atB .* has batteries without "wire": 3 or api_oracle.py c3c3.*: qc/],
     [g => { g.state.batch.auditor.oracleRebaseSha256 = null; }, /Verdict is not bound to this batch/],
     [g => { g.state.batch.languageServerOracle.bases = g.state.batch.languageServerOracle.bases.slice(0, 0); },
       /languageServerOracle needs its results dir and the base run lsp\/lsp-r131-atB/]]) {

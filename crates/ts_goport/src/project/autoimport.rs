@@ -27,6 +27,20 @@ impl FileSource for AutoImportBuilderFS {
         self.snapshot_fs_builder.fs.clone()
     }
 
+    // Go: project/autoimport.go:63 FileExists
+    // FileExists implements FileSource.
+    fn file_exists(&self, file_name: &str, path: &tspath::Path) -> bool {
+        self.snapshot_fs_builder.file_exists(file_name, path)
+    }
+
+    // Go: project/autoimport.go:58 GetAccessibleEntries
+    // PORT: after FileExists because the Rust trait lists it last.
+    fn get_accessible_entries(&self, path: &str) -> vfs::Entries {
+        self.snapshot_fs_builder.get_accessible_entries(path)
+    }
+}
+
+impl FileHandleSource for AutoImportBuilderFS {
     // Go: project/autoimport.go:28 GetFile
     // GetFile implements FileSource.
     fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>> {
@@ -39,23 +53,22 @@ impl FileSource for AutoImportBuilderFS {
     fn get_file_by_path(&self, file_name: &str, path: &tspath::Path) -> Option<Rc<dyn FileHandle>> {
         // We want to avoid long-term caching of files referenced only by auto-imports, so we
         // override GetFileByPath to avoid collecting more files into the snapshotFSBuilder's
-        // diskFiles. (Note the reason we can't just use the finalized SnapshotFS is that changed
+        // cacheFiles. (Note the reason we can't just use the finalized SnapshotFS is that changed
         // files not read during other parts of the snapshot clone will be marked as dirty, but
-        // not yet refreshed from disk.)
-        if let Some(overlay) = self.snapshot_fs_builder.overlays.get(path) {
-            return Some(overlay.clone() as Rc<dyn FileHandle>);
-        }
-        if let (Some(disk_file), true) = self.snapshot_fs_builder.disk_files.load(path) {
-            return self.snapshot_fs_builder.reload_entry_if_needed(&disk_file);
+        // not yet refreshed from the source filesystem.)
+        if let (Some(cached_file), true) = self.snapshot_fs_builder.cache_files.load(path) {
+            return self
+                .snapshot_fs_builder
+                .reload_entry_if_needed(&cached_file);
         }
         if let Some(fh) = self.untracked_files.borrow().get(path) {
             return fh.clone();
         }
-        let mut fh: Option<Rc<dyn FileHandle>> = None;
-        let (content, ok) = self.snapshot_fs_builder.fs.read_file(file_name);
-        if ok {
-            fh = Some(new_disk_file(file_name, content) as Rc<dyn FileHandle>);
-        }
+        // ts#64291
+        let fh = self
+            .snapshot_fs_builder
+            .fs
+            .get_file_by_path(file_name, path);
         // Go: fh, _ = a.untrackedFiles.LoadOrStore(path, fh)
         let fh = self
             .untracked_files
@@ -64,18 +77,6 @@ impl FileSource for AutoImportBuilderFS {
             .or_insert(fh)
             .clone();
         fh
-    }
-
-    // Go: project/autoimport.go:63 FileExists
-    // FileExists implements FileSource.
-    fn file_exists(&self, file_name: &str, path: &tspath::Path) -> bool {
-        self.snapshot_fs_builder.file_exists(file_name, path)
-    }
-
-    // Go: project/autoimport.go:58 GetAccessibleEntries
-    // PORT: after FileExists because the Rust trait lists it last.
-    fn get_accessible_entries(&self, path: &str) -> vfs::Entries {
-        self.snapshot_fs_builder.get_accessible_entries(path)
     }
 }
 
@@ -146,25 +147,35 @@ impl module::ResolutionHost for AutoImportRegistryCloneHost {
 impl autoimport::RegistryCloneHost for AutoImportRegistryCloneHost {
     // Go: project/autoimport.go:105 GetDefaultProject
     // GetDefaultProject implements autoimport.RegistryCloneHost.
+    // ts#64319: the project ID (Go nil is `None`).
     fn get_default_project(
         &self,
         path: &tspath::Path,
-    ) -> (tspath::Path, Option<Rc<compiler::NewProgram>>) {
+    ) -> (
+        Option<autoimport::ProjectID>,
+        Option<Rc<compiler::NewProgram>>,
+    ) {
         let Some(project) = self.project_collection.get_default_project(path) else {
-            return (tspath::Path::default(), None);
+            return (None, None);
         };
         let project = project.borrow();
         // PORT: Go `project.GetProgram()` is the field read.
-        (project.config_file_path.clone(), project.program.clone())
+        (
+            Some(project.id().as_auto_import_project_id()),
+            project.program.clone(),
+        )
     }
 
     // Go: project/autoimport.go:145 GetProgramForProject
     // GetProgramForProject implements autoimport.RegistryCloneHost.
+    // ts#64319: Go asserts the `autoimport.ProjectID` to a project `ID`; every
+    // Rust `ProjectID` holds an ID string.
     fn get_program_for_project(
         &self,
-        project_path: &tspath::Path,
+        project_id: &autoimport::ProjectID,
     ) -> Option<Rc<compiler::NewProgram>> {
-        let project = self.project_collection.get_project_by_path(project_path)?;
+        let id = ID(project_id.0.clone());
+        let project = self.project_collection.get_project(&id)?;
         // PORT: Go `project.GetProgram()` is the field read.
         let program = project.borrow().program.clone();
         program

@@ -175,14 +175,25 @@ pub fn language_service(session: &Rc<Session>, u: &str) -> ts_goport::ls::Langua
         .unwrap_or_else(|err| panic!("GetLanguageService({u}): {}", err.error()))
 }
 
-/// Go `session.Snapshot().GetDefaultProject(uri).Name()`.
-pub fn default_project_name(session: &Rc<Session>, u: &str) -> String {
+/// Go `session.Snapshot().GetDefaultProject(uri).ConfigFileName()` (ts#64319:
+/// was `Name()`).
+pub fn default_project_config_file_name(session: &Rc<Session>, u: &str) -> String {
     session
         .snapshot()
         .get_default_project(&uri(u))
         .unwrap_or_else(|| panic!("no default project for {u}"))
         .borrow()
-        .name()
+        .config_file_name()
+}
+
+/// Go `session.Snapshot().GetDefaultProject(uri).ID()` (ts#64319).
+pub fn default_project_id(session: &Rc<Session>, u: &str) -> ts_goport::project::ID {
+    session
+        .snapshot()
+        .get_default_project(&uri(u))
+        .unwrap_or_else(|| panic!("no default project for {u}"))
+        .borrow()
+        .id()
 }
 
 /// Go `lsutil.ParseUserPreferences(map[string]any{...})` input: a JSON

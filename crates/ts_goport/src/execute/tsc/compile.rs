@@ -90,7 +90,9 @@ pub type ErrorWriter = Arc<Mutex<dyn std::io::Write + Send>>;
 // `SystemTime` and `time.Duration` is `Duration`. Go `Spawn` returns an
 // `io.ReadWriteCloser`; here it is the content mapper's
 // `ProcessExitState` (an `ipc::ReadWriteCloser`, see there), and Go
-// `stderr` `io.Discard` is `None`, as in `contentmapper::Spawner`.
+// `stderr` `io.Discard` is `None`, as in `contentmapper::Spawner`. Go
+// `GetEnvironmentVariable` returns `(string, bool)` as `os.LookupEnv` does
+// (ts#63941): the bool says the variable is set, also when it is empty.
 pub trait System {
     fn writer(&self) -> Writer;
     fn error_writer(&self) -> ErrorWriter;
@@ -99,7 +101,7 @@ pub trait System {
     fn get_current_directory(&self) -> String;
     fn write_output_is_tty(&self) -> bool;
     fn get_width_of_terminal(&self) -> i32;
-    fn get_environment_variable(&self, name: &str) -> String;
+    fn get_environment_variable(&self, name: &str) -> (String, bool);
     fn spawn(
         &self,
         command: &[String],
@@ -109,16 +111,23 @@ pub trait System {
 
     fn now(&self) -> SystemTime;
     fn since_start(&self) -> Duration;
+
+    /// PORT: not in Go. True when a write through the osvfs of any thread
+    /// (`osvfs_fs()`) reaches `fs()`, so the emit of `tsc -b` can write from
+    /// the checker threads (build/build_task.rs `new_task_write_file`): the
+    /// OS system, and a test system, whose tests install their file system
+    /// as the osvfs. False when only this thread can reach `fs()`.
+    fn emit_writes_through_osvfs(&self) -> bool {
+        true
+    }
 }
 
 // Go: execute/tsc/compile.go:37 newContentMapperLogger
 // PORT: Go `mu` guards the writes; the `ErrorWriter` lock does that here.
 // Go `fmt.Fprintln(writer, message)` is one write of the line.
 pub(crate) fn new_content_mapper_logger(sys: &dyn System) -> Option<ContentMapperLogger> {
-    if sys
-        .get_environment_variable("TS_CONTENT_MAPPER_DEBUG")
-        .is_empty()
-    {
+    let (value, _) = sys.get_environment_variable("TS_CONTENT_MAPPER_DEBUG");
+    if value.is_empty() {
         return None;
     }
     let writer = sys.error_writer();
@@ -388,9 +397,14 @@ impl System for OsSystem {
     fn get_width_of_terminal(&self) -> i32 {
         0
     }
-    // Go: cmd/tsgo/sys.go:64 GetEnvironmentVariable
-    fn get_environment_variable(&self, name: &str) -> String {
-        std::env::var(name).unwrap_or_default()
+    // Go: cmd/tsc/sys.go:64 GetEnvironmentVariable (ts#63941)
+    // PORT: Go `os.LookupEnv`. A set variable whose value is not UTF-8 is
+    // set here too; its value is the lossy UTF-8 text (Go keeps the bytes).
+    fn get_environment_variable(&self, name: &str) -> (String, bool) {
+        match std::env::var_os(name) {
+            Some(value) => (value.to_string_lossy().into_owned(), true),
+            None => (String::new(), false),
+        }
     }
     // Go: cmd/tsgo/sys.go:68 Spawn (tsgo#4712)
     fn spawn(
@@ -1286,11 +1300,11 @@ mod tests {
         fn get_width_of_terminal(&self) -> i32 {
             0
         }
-        fn get_environment_variable(&self, name: &str) -> String {
+        fn get_environment_variable(&self, name: &str) -> (String, bool) {
             if name == "TS_CONTENT_MAPPER_DEBUG" && self.enabled.get() {
-                return "1".to_string();
+                return ("1".to_string(), true);
             }
-            String::new()
+            (String::new(), false)
         }
         fn spawn(
             &self,
@@ -1330,9 +1344,14 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&stderr), "mapper log\n".repeat(10));
     }
 
-    // Go: cmd/tsgo/sys_unix_test.go:17 TestChildProcessCloseDoesNotWaitForLauncherDescendants (tsgo#4712)
+    // Go: cmd/tsc/sys_unix_test.go:20 TestChildProcessCloseDoesNotWaitForLauncherDescendants (tsgo#4712, ts#64082)
     // PORT: Go reads the first line with `bufio.Reader`; this reads bytes
     // up to the newline. Go `syscall.Kill` is rustix `kill_process`.
+    // PORT: Go N (ts#64082) runs the test binary itself as the launcher and
+    // the descendant, so that `go test` needs no shell. libtest prints its
+    // own lines on stdout before a test body runs, so the pid would not be
+    // the first line; the port keeps the `sh -c "nohup sleep 60 & echo $!;
+    // wait"` launcher of the older Go test. The checks are the same.
     #[cfg(unix)]
     #[test]
     fn test_child_process_close_does_not_wait_for_launcher_descendants() {

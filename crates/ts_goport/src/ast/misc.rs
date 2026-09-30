@@ -14,9 +14,7 @@ impl Symbol {
     // Go: ast/symbol.go:23 IsExternalModule
     #[must_use]
     pub fn is_external_module(&self) -> bool {
-        self.flags.intersects(SymbolFlags::MODULE)
-            && !self.name.is_empty()
-            && self.name.as_bytes()[0] == b'"'
+        self.flags.intersects(SymbolFlags::MODULE) && is_ambient_module_symbol_name(&self.name)
     }
 
     // Go: ast/symbol.go:27 IsStatic
@@ -510,6 +508,75 @@ pub fn new_diagnostic_from_serialized(
         skipped_on_no_emit,
         repopulate_info: None,
     }
+}
+
+// Go: ast/diagnostic.go:194 NewDiagnosticFromText (ts#63950)
+// PORT: Go `file *SourceFile` is the SourceFile node (nil is `Node::NIL`).
+// Go sets `message` to `diagnostics.NewAdHocMessage(text)` and leaves
+// `messageKey` empty. The port reads the key from the message
+// (`message_key`), so the ad hoc message has the key "" here, not the Go
+// "-1": `MessageKey()` is "" as in Go, and no locale has either key. The
+// message code is 0, not the Go -1 (`Message` codes are `u32`); the
+// diagnostic keeps its own code, and nothing reads the message code.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn new_diagnostic_from_text(
+    file: Node,
+    loc: TextRange,
+    code: i32,
+    category: crate::diagnostics::Category,
+    text: &str,
+    message_chain: Vec<Diagnostic>,
+    related_information: Vec<Diagnostic>,
+    reports_unnecessary: bool,
+    reports_deprecated: bool,
+) -> Diagnostic {
+    Diagnostic {
+        file,
+        pos: loc.pos(),
+        end: loc.end(),
+        code,
+        category,
+        source: String::new(),
+        message: new_ad_hoc_message(text),
+        message_text: String::new(),
+        message_args: Vec::new(),
+        message_chain,
+        related_information,
+        reports_unnecessary,
+        reports_deprecated,
+        skipped_on_no_emit: false,
+        repopulate_info: None,
+    }
+}
+
+// Go: diagnostics/diagnostics.go:164 NewAdHocMessage
+// PORT: a diagnostic holds a `&'static Message`, so each distinct text is
+// leaked once and shared (Go allocates a new message per call). The key is
+// "" (see `new_diagnostic_from_text`, the only user).
+fn new_ad_hoc_message(message: &str) -> &'static crate::diagnostics::Message {
+    static AD_HOC_MESSAGES: std::sync::LazyLock<
+        std::sync::Mutex<FxHashMap<String, &'static crate::diagnostics::Message>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
+    let mut messages = AD_HOC_MESSAGES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = messages.get(message) {
+        return *existing;
+    }
+    let text: &'static str = Box::leak(message.to_string().into_boxed_str());
+    let leaked: &'static crate::diagnostics::Message =
+        Box::leak(Box::new(crate::diagnostics::Message::new(
+            0,
+            crate::diagnostics::Category::Error,
+            "",
+            text,
+            false,
+            false,
+            false,
+        )));
+    messages.insert(message.to_string(), leaked);
+    leaked
 }
 
 // Go: ast/diagnostic.go:138 NewDiagnostic

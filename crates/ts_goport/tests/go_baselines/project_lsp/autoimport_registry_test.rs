@@ -5,7 +5,7 @@
 use std::rc::Rc;
 
 use ts_goport::frontend::tspath;
-use ts_goport::ls::autoimport::registry::{BucketStats, CacheStats, Registry};
+use ts_goport::ls::autoimport::registry::{BucketStats, CacheStats, ProjectID, Registry};
 use ts_goport::ls::lsconv;
 use ts_goport::ls::lsutil;
 use ts_goport::lsp::lsproto;
@@ -100,22 +100,21 @@ fn import_preferences() -> lsutil::UserPreferences {
     preferences
 }
 
-/// Go `snapshot.GetDefaultProject(uri).ConfigFilePath()`.
-fn default_project_config_path(session: &Rc<Session>, u: &lsproto::DocumentUri) -> tspath::Path {
-    session
+/// Go `snapshot.GetDefaultProject(uri).ID()` as an `autoimport.ProjectID`.
+fn default_project_id(session: &Rc<Session>, u: &lsproto::DocumentUri) -> ProjectID {
+    let project = session
         .snapshot()
         .get_default_project(u)
-        .expect("default project")
-        .borrow()
-        .config_file_path
-        .clone()
+        .expect("default project");
+    let id = project.borrow().id().to_string();
+    ProjectID(id)
 }
 
-/// Go `snapshot.AutoImportRegistry().IsPreparedForImportingFile(fileName, projectPath, preferences)`.
+/// Go `snapshot.AutoImportRegistry().IsPreparedForImportingFile(fileName, projectID, preferences)`.
 fn is_prepared(
     session: &Rc<Session>,
     file_name: &str,
-    project_path: &tspath::Path,
+    project_id: &ProjectID,
     preferences: &lsutil::UserPreferences,
 ) -> bool {
     let snapshot = session.snapshot();
@@ -123,7 +122,7 @@ fn is_prepared(
     Registry::is_prepared_for_importing_file(
         registry.as_deref(),
         file_name,
-        project_path,
+        project_id,
         preferences,
     )
 }
@@ -359,8 +358,8 @@ child_test! {
         open_uri(session, &main_file.uri(), main_file.content(), lsproto::LanguageKind::TYPE_SCRIPT);
         with_auto_imports(session, &main_file.uri());
 
-        let project_path = default_project_config_path(session, &main_file.uri());
-        assert!(is_prepared(session, main_file.file_name(), &project_path, &preferences));
+        let project_id = default_project_id(session, &main_file.uri());
+        assert!(is_prepared(session, main_file.file_name(), &project_id, &preferences));
         assert_eq!(auto_import_stats(session).node_modules_buckets.len(), 1);
 
         // Simulate the user deleting node_modules.
@@ -378,7 +377,7 @@ child_test! {
         with_auto_imports(session, &main_file.uri());
 
         assert!(
-            is_prepared(session, main_file.file_name(), &project_path, &preferences),
+            is_prepared(session, main_file.file_name(), &project_id, &preferences),
             "registry should be prepared after node_modules is deleted"
         );
         // The node_modules bucket should be removed entirely, not left behind as an
@@ -402,7 +401,7 @@ child_test! {
         open_uri(session, &main_file.uri(), main_file.content(), lsproto::LanguageKind::TYPE_SCRIPT);
         with_auto_imports(session, &main_file.uri());
 
-        let project_path = default_project_config_path(session, &main_file.uri());
+        let project_id = default_project_id(session, &main_file.uri());
         assert_eq!(auto_import_stats(session).node_modules_buckets.len(), 1);
 
         // In a single changeset, edit package.json AND delete node_modules.
@@ -428,7 +427,7 @@ child_test! {
 
         with_auto_imports(session, &main_file.uri());
 
-        assert!(is_prepared(session, main_file.file_name(), &project_path, &preferences));
+        assert!(is_prepared(session, main_file.file_name(), &project_id, &preferences));
         assert_eq!(auto_import_stats(session).node_modules_buckets.len(), 0);
     }
 }
@@ -960,9 +959,9 @@ child_test! {
         assert!(!single_bucket(&stats.node_modules_buckets).state.dirty());
 
         // IsPreparedForImportingFile should return true with no exclude patterns
-        let project_path = default_project_config_path(session, &main_file.uri());
+        let project_id = default_project_id(session, &main_file.uri());
         let preferences = import_preferences();
-        assert!(is_prepared(session, main_file.file_name(), &project_path, &preferences));
+        assert!(is_prepared(session, main_file.file_name(), &project_id, &preferences));
 
         // Change the file exclude patterns preference
         let mut new_preferences = import_preferences();
@@ -970,14 +969,14 @@ child_test! {
         session.configure(new_preferences.clone());
 
         // IsPreparedForImportingFile should return false since exclude patterns changed
-        assert!(!is_prepared(session, main_file.file_name(), &project_path, &new_preferences));
+        assert!(!is_prepared(session, main_file.file_name(), &project_id, &new_preferences));
 
         // After GetCurrentLanguageServiceWithAutoImports, buckets should be rebuilt
         with_auto_imports(session, &main_file.uri());
 
         // IsPreparedForImportingFile should return true now that buckets are rebuilt
         assert!(
-            is_prepared(session, main_file.file_name(), &project_path, &new_preferences),
+            is_prepared(session, main_file.file_name(), &project_id, &new_preferences),
             "IsPreparedForImportingFile should return true after bucket rebuild with new fileExcludePatterns"
         );
     }
@@ -1359,9 +1358,9 @@ child_test! {
         session.configure(prefs.clone());
 
         // Registry should report not prepared (preference changed)
-        let project_path = default_project_config_path(&session, &index_uri);
+        let project_id = default_project_id(&session, &index_uri);
         assert!(
-            !is_prepared(&session, &format!("{ENTRYPOINT_ROOT}/index.ts"), &project_path, &prefs),
+            !is_prepared(&session, &format!("{ENTRYPOINT_ROOT}/index.ts"), &project_id, &prefs),
             "registry should not be prepared after preference change"
         );
 

@@ -204,6 +204,12 @@ impl Printer {
             self.emit_nested_module_name(module.name());
             body = module.body();
         }
+        if node.attributes().is_some() {
+            self.write_space();
+            self.write_keyword("with");
+            self.write_space();
+            self.emit_type_node(node.attributes(), TypePrecedence::NON_ARRAY);
+        }
         if body == Node::NIL {
             self.write_trailing_semicolon();
         } else {
@@ -696,7 +702,9 @@ impl Printer {
             }
             SyntaxKind::EnumDeclaration => self.emit_enum_declaration(node),
             SyntaxKind::ModuleDeclaration => self.emit_module_declaration(node),
-            SyntaxKind::MissingDeclaration => {}
+            SyntaxKind::MissingDeclaration => {
+                // Missing declarations do not emit a statement.
+            }
 
             // Import/Export Statements
             SyntaxKind::NamespaceExportDeclaration => self.emit_namespace_export_declaration(node),

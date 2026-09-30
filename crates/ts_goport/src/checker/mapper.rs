@@ -260,6 +260,12 @@ impl Checker {
         id
     }
 
+    // Go: checker/mapper.go:40 getMappedType
+    pub fn get_mapped_type(&mut self, t: TypeId, mapper: MapperId) -> TypeId {
+        let t = self.get_non_distributed_type_parameter(t);
+        self.mapper_map(mapper, t)
+    }
+
     // Go: checker/mapper.go:27 (*TypeMapper).Map
     // Dispatches to the Go `Map` method of each mapper kind.
     pub fn mapper_map(&mut self, m: MapperId, t: TypeId) -> TypeId {
@@ -381,13 +387,13 @@ impl Checker {
         m2: MapperId,
     ) -> TypeId {
         if m1.is_nil() {
-            return self.mapper_map(m2, t);
+            return self.get_mapped_type(t, m2);
         }
-        let t1 = self.mapper_map(m1, t);
+        let t1 = self.get_mapped_type(t, m1);
         if t1 != t {
             return self.instantiate_type(t1, m2);
         }
-        self.mapper_map(m2, t)
+        self.get_mapped_type(t, m2)
     }
 
     // Go: checker/mapper.go:55 mergeTypeMappers
@@ -406,8 +412,10 @@ impl Checker {
         mapper: MapperId,
     ) -> MapperId {
         if mapper.is_nil() {
+            let source = self.get_non_distributed_type_parameter(source);
             return self.new_simple_type_mapper(source, target);
         }
+        let source = self.get_non_distributed_type_parameter(source);
         let simple = self.new_simple_type_mapper(source, target);
         self.new_merged_type_mapper(simple, mapper)
     }
@@ -420,8 +428,10 @@ impl Checker {
         target: TypeId,
     ) -> MapperId {
         if mapper.is_nil() {
+            let source = self.get_non_distributed_type_parameter(source);
             return self.new_simple_type_mapper(source, target);
         }
+        let source = self.get_non_distributed_type_parameter(source);
         let simple = self.new_simple_type_mapper(source, target);
         self.new_merged_type_mapper(mapper, simple)
     }

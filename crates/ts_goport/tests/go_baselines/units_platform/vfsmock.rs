@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::SystemTime;
 
-use ts_goport::frontend::vfs::{Entries, FileInfo, Fs, FsError, WalkDirFunc};
+use ts_goport::frontend::vfs::{Entries, FileInfo, Fs, FsError};
 
 /// Go `FSMock.WriteFileCalls()` element.
 #[derive(Clone, Debug)]
@@ -33,7 +33,6 @@ pub(crate) struct Calls {
     pub(crate) directory_exists: Vec<String>,
     pub(crate) get_accessible_entries: Vec<String>,
     pub(crate) stat: Vec<String>,
-    pub(crate) walk_dir: Vec<String>,
     pub(crate) realpath: Vec<String>,
 }
 
@@ -119,11 +118,6 @@ impl Fs for FsMock {
         self.inner.stat(path)
     }
 
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        self.calls.borrow_mut().walk_dir.push(root.to_string());
-        self.inner.walk_dir(root, walk_fn)
-    }
-
     fn realpath(&self, path: &str) -> String {
         self.calls.borrow_mut().realpath.push(path.to_string());
         self.inner.realpath(path)
@@ -155,14 +149,6 @@ fn test_wrap() {
         inner.stat("/a/b.txt").map(|i| i.size())
     );
     assert_eq!(wrapper.realpath("/a/b.txt"), inner.realpath("/a/b.txt"));
-    let mut seen = Vec::new();
-    wrapper
-        .walk_dir("/a", &mut |path, _, _| {
-            seen.push(path.to_string());
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(seen, vec!["/a", "/a/b.txt"]);
     wrapper.write_file("/a/c.txt", "x").unwrap();
     wrapper.append_file("/a/c.txt", "y").unwrap();
     assert_eq!(inner.read_file("/a/c.txt"), ("xy".to_string(), true));
@@ -182,7 +168,6 @@ fn test_wrap() {
         ("DirectoryExists", calls.directory_exists.len()),
         ("GetAccessibleEntries", calls.get_accessible_entries.len()),
         ("Stat", calls.stat.len()),
-        ("WalkDir", calls.walk_dir.len()),
         ("Realpath", calls.realpath.len()),
     ] {
         assert_eq!(n, 1, "field {name}Func should not be zero; update Wrap");

@@ -151,6 +151,7 @@ fn collect_all_diagnostics() -> Vec<Diagnostic> {
         &mut |file| collect_checker_diagnostics_with(file, check_file_guarded),
         &mut || guard(get_global_diagnostics),
         &mut |file| guard(|| get_declaration_diagnostics(file)),
+        true, // #64452: Go `program.(*Program)` ok
     )
 }
 

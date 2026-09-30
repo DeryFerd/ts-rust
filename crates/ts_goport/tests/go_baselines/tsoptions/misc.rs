@@ -162,6 +162,11 @@ fn non_zero_value_like(zero: &CompilerOptionsValue) -> CompilerOptionsValue {
             paths.insert("x".to_string(), V::List(vec![V::String("y".to_string())]));
             V::Map(paths)
         }
+        // ts#64397: `Plugins []PluginImport`, read from `[{"name": "x"}]`.
+        V::List(_) => V::List(vec![V::Map(IndexMap::from_iter([(
+            "name".to_string(),
+            V::String("x".to_string()),
+        )]))]),
         V::ScriptTarget(_)
         | V::ModuleKind(_)
         | V::ModuleResolutionKind(_)

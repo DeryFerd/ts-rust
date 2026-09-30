@@ -68,13 +68,12 @@ pub fn unexpected_method(method: &str) -> GoError {
 // Go: protocol.go:20 initializeResult
 pub fn initialize_result(source: &str) -> InitializeResult {
     InitializeResult {
-        protocol_version: contentmapper::PROTOCOL_VERSION,
         position_encoding: PositionEncoding::UTF8,
         diagnostic_source: source.to_string(),
     }
 }
 
-// Go: protocol.go:28 identityMappedOutput
+// Go: protocol.go:27 identityMappedOutput
 pub fn identity_mapped_output(content: &str) -> Result<MappedOutput, GoError> {
     let length = content.len() as i32;
     let mappings = spanmap::new(&[Segment {
@@ -93,19 +92,19 @@ pub fn identity_mapped_output(content: &str) -> Result<MappedOutput, GoError> {
     })
 }
 
-// Go: protocol.go:41 staticProjectHandler
+// Go: protocol.go:40 staticProjectHandler
 pub(super) struct StaticProjectHandler {
     pub handler: Box<dyn MapperHandler>,
 }
 
-// Go: protocol.go:43 projectLifecycleHandler
+// Go: protocol.go:42 projectLifecycleHandler
 pub trait ProjectLifecycleHandler {
     fn open_project(&self, params: &OpenProjectParams) -> Result<(), GoError>;
     fn close_project(&self, params: &CloseProjectParams);
 }
 
 impl MapperHandler for StaticProjectHandler {
-    // Go: protocol.go:48 staticProjectHandler.HandleRequest
+    // Go: protocol.go:47 staticProjectHandler.HandleRequest
     fn handle_request(&self, ctx: &Context, method: &str, params: JsonValue) -> HandlerResult {
         match method {
             contentmapper::METHOD_OPEN_PROJECT => {

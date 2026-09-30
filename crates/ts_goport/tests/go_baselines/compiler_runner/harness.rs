@@ -40,6 +40,7 @@ use ts_goport::frontend::vfs::{OsOverride, install_os_override};
 use ts_goport::gostd::context::background;
 use ts_goport::program as tsprogram;
 
+use crate::support::baseline::{is_merged_layout, test_data_path};
 use crate::support::contentmappertest;
 use crate::support::harnessutil::TracerForBaselining;
 use crate::support::vfstest::{self, MapFile, MapFs};
@@ -227,7 +228,11 @@ pub fn compile_files_ex(
         include_lib_dir = true;
     }
 
-    if include_lib_dir && !type_script_submodule_path().join("package.json").exists() {
+    // The merged layout has no submodule and no skip here.
+    if include_lib_dir
+        && !is_merged_layout()
+        && !type_script_submodule_path().join("package.json").exists()
+    {
         skip("TypeScript submodule does not exist".to_string());
     }
 
@@ -374,11 +379,19 @@ pub fn compile_files_ex(
 }
 
 // Go: harnessutil.go:241 testLibFolderMap
+// The lib dir is `testdata/tests/lib` at the merged layout, the submodule's
+// `tests/lib` before.
 fn test_lib_folder_map() -> &'static BTreeMap<String, MapFile> {
     static MAP: OnceLock<BTreeMap<String, MapFile>> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut testfs = BTreeMap::new();
-        let root = type_script_submodule_path().join("tests").join("lib");
+        let root = if is_merged_layout() {
+            test_data_path()
+        } else {
+            type_script_submodule_path()
+        }
+        .join("tests")
+        .join("lib");
         fn walk(dir: &std::path::Path, rel: &str, testfs: &mut BTreeMap<String, MapFile>) {
             let mut entries: Vec<_> = std::fs::read_dir(dir)
                 .unwrap_or_else(|err| panic!("Failed to read lib dir: {err}"))
@@ -1109,6 +1122,15 @@ impl CompilationResult {
         file.is_some().then(|| source_file_text(file).to_string())
     }
 
+    /// Go `Program.GetSourceFile(fileName).OriginalText()`, or `None`
+    /// (ts#63936).
+    pub fn source_file_original_text(&self, file_name: &str) -> Option<String> {
+        let _scope = self.enter_program_only();
+        let file = tsprogram::get_source_file(file_name);
+        file.is_some()
+            .then(|| ts_goport::ast::source_file_original_text(file).to_string())
+    }
+
     /// Go `result.Repeat(testConfig)`.
     pub fn repeat(&self, test_config: &TestConfiguration) -> CompilationResult {
         let inputs = self
@@ -1188,6 +1210,8 @@ fn create_program(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) -> 
         use_source_of_project_reference: false,
         typings_location: String::new(),
         project_name: String::new(),
+        create_module_resolver: None,
+        skip_module_resolution: false,
     };
     // PORT: the frontend parses with no current program; the result is a
     // program version (see the module comment).
@@ -1499,41 +1523,62 @@ pub fn get_config_name_from_file_name(filename: &str) -> String {
     String::new()
 }
 
-// Go: harnessutil.go:1190 SkipUnsupportedCompilerOptions
-// PORT: returns the Go `t.Skipf` message instead of skipping.
-pub fn skip_unsupported_compiler_options(options: &CompilerOptions) -> Option<String> {
-    if matches!(
-        options.module,
-        ModuleKind::AMD | ModuleKind::UMD | ModuleKind::SYSTEM
-    ) {
-        return Some(format!("unsupported module kind {}", options.module));
+/// A configuration that Go `SkipUnsupportedCompilerOptions` does not
+/// accept, with the Go message.
+pub enum UnsupportedCompilerOptions {
+    /// Go `t.Fatalf` of `failOnUnsupportedCompilerOptions` (ts#64122).
+    Fail(String),
+    /// Go `t.Skipf`.
+    Skip(String),
+}
+
+// Go: harnessutil.go:1236 SkipUnsupportedCompilerOptions
+// PORT: returns the Go `t.Fatalf` or `t.Skipf` message instead of failing
+// or skipping.
+pub fn skip_unsupported_compiler_options(
+    options: &CompilerOptions,
+) -> Option<UnsupportedCompilerOptions> {
+    if let Some(message) = fail_on_unsupported_compiler_options(options) {
+        return Some(UnsupportedCompilerOptions::Fail(message));
+    }
+    let skip = |message: String| Some(UnsupportedCompilerOptions::Skip(message));
+    if matches!(options.module, ModuleKind::UMD | ModuleKind::SYSTEM) {
+        return skip(format!("unsupported module kind {}", options.module));
     }
     if matches!(
         options.module_resolution,
         ModuleResolutionKind::NODE10 | ModuleResolutionKind::CLASSIC
     ) {
-        return Some(format!(
+        return skip(format!(
             "unsupported module resolution kind {}",
             options.module_resolution.0
         ));
     }
     if options.es_module_interop.is_false() {
-        return Some("esModuleInterop=false is unsupported".to_string());
+        return skip("esModuleInterop=false is unsupported".to_string());
     }
     if options.allow_synthetic_default_imports.is_false() {
-        return Some("allowSyntheticDefaultImports=false is unsupported".to_string());
+        return skip("allowSyntheticDefaultImports=false is unsupported".to_string());
     }
     if !options.base_url.is_empty() {
-        return Some(format!("unsupported baseUrl {}", options.base_url));
+        return skip(format!("unsupported baseUrl {}", options.base_url));
+    }
+    if options.target == ScriptTarget::ES5 {
+        return skip(format!("unsupported target {}", options.target.string()));
+    }
+    if options.always_strict.is_false() {
+        return skip("alwaysStrict=false is unsupported".to_string());
+    }
+    None
+}
+
+// Go: harnessutil.go:1265 failOnUnsupportedCompilerOptions (ts#64122)
+fn fail_on_unsupported_compiler_options(options: &CompilerOptions) -> Option<String> {
+    if options.module == ModuleKind::AMD {
+        return Some(format!("unsupported module kind {}", options.module));
     }
     if !options.out_file.is_empty() {
         return Some(format!("unsupported outFile {}", options.out_file));
-    }
-    if options.target == ScriptTarget::ES5 {
-        return Some(format!("unsupported target {}", options.target.string()));
-    }
-    if options.always_strict.is_false() {
-        return Some("alwaysStrict=false is unsupported".to_string());
     }
     None
 }

@@ -38,14 +38,14 @@ child_test! {
         open(&session, URI, "export const x = 1;");
         let p = program(&session, URI);
 
-        assert_eq!(default_project_name(&session, URI), "/src/tsconfig.json");
+        assert_eq!(default_project_config_file_name(&session, URI), "/src/tsconfig.json");
         assert_eq!(p.options().strict, Tristate::False);
 
         session.configure(prefs_with_custom_config("tsconfig.all.json"));
 
         let p = program(&session, URI);
 
-        assert_eq!(default_project_name(&session, URI), "/src/tsconfig.all.json");
+        assert_eq!(default_project_config_file_name(&session, URI), "/src/tsconfig.all.json");
         assert_eq!(p.options().strict, Tristate::True);
     }
 }
@@ -63,7 +63,7 @@ child_test! {
         open(&session, URI, "export const x = 1;");
         let _ = language_service(&session, URI);
 
-        assert_eq!(default_project_name(&session, URI), "/src/tsconfig.json");
+        assert_eq!(default_project_config_file_name(&session, URI), "/src/tsconfig.json");
     }
 }
 
@@ -77,7 +77,7 @@ child_test! {
         open(&session, URI, "export const x = 1;");
         let _ = language_service(&session, URI);
 
-        assert_eq!(default_project_name(&session, URI), "/src/tsconfig.json");
+        assert_eq!(default_project_config_file_name(&session, URI), "/src/tsconfig.json");
     }
 }
 
@@ -90,7 +90,7 @@ child_test! {
         open(&session, URI, "export const x = 1;");
         let p = program(&session, URI);
 
-        assert_eq!(default_project_name(&session, URI), "/src/tsconfig.json");
+        assert_eq!(default_project_config_file_name(&session, URI), "/src/tsconfig.json");
         assert_eq!(p.options().strict, Tristate::False);
 
         // Step 2: Switch to custom config (strict: true)
@@ -98,7 +98,7 @@ child_test! {
 
         let p = program(&session, URI);
 
-        assert_eq!(default_project_name(&session, URI), "/src/tsconfig.all.json");
+        assert_eq!(default_project_config_file_name(&session, URI), "/src/tsconfig.all.json");
         assert_eq!(p.options().strict, Tristate::True);
 
         // Step 3: Clear custom config preference, should revert to tsconfig.json (strict: false)
@@ -106,7 +106,7 @@ child_test! {
 
         let p = program(&session, URI);
 
-        assert_eq!(default_project_name(&session, URI), "/src/tsconfig.json");
+        assert_eq!(default_project_config_file_name(&session, URI), "/src/tsconfig.json");
         assert_eq!(p.options().strict, Tristate::False);
     }
 }
@@ -205,8 +205,11 @@ child_test! {
         let _ = language_service(&session, URI);
 
         // Without any config, the file should be in the inferred project only.
-        assert_eq!(default_project_name(&session, URI), "/dev/null/inferred");
-        let projects = session.snapshot().get_projects_containing_file(&uri(URI));
+        assert_eq!(
+            default_project_id(&session, URI),
+            ts_goport::project::ID("/dev/null/inferred".to_string())
+        );
+        let projects = session.snapshot().get_language_service_projects_containing_file(&uri(URI));
         assert_eq!(
             projects.len(),
             1,
@@ -220,8 +223,8 @@ child_test! {
         let _ = language_service(&session, URI);
 
         // File should now be in the configured project only, not duplicated in inferred.
-        assert_eq!(default_project_name(&session, URI), "/src/tsconfig.all.json");
-        let projects = session.snapshot().get_projects_containing_file(&uri(URI));
+        assert_eq!(default_project_config_file_name(&session, URI), "/src/tsconfig.all.json");
+        let projects = session.snapshot().get_language_service_projects_containing_file(&uri(URI));
         assert_eq!(
             projects.len(),
             1,

@@ -10,13 +10,14 @@ use crate::project::prelude::*;
 const _: () = {
     assert!(Kind::INFERRED.0 == 0);
     assert!(Kind::CONFIGURED.0 == 1);
+    assert!(Kind::SYNTHETIC.0 == 2);
 };
 
-// Go: project/project_stringer_generated.go:15 _Kind_name
-const _KIND_NAME: &str = "InferredConfigured";
+// Go: project/project_stringer_generated.go:16 _Kind_name
+const _KIND_NAME: &str = "InferredConfiguredSynthetic";
 
-// Go: project/project_stringer_generated.go:17 _Kind_index
-const _KIND_INDEX: [u8; 3] = [0, 8, 18];
+// Go: project/project_stringer_generated.go:18 _Kind_index
+const _KIND_INDEX: [u8; 4] = [0, 8, 18, 27];
 
 impl Kind {
     // Go: project/project_stringer_generated.go:19 Kind.String

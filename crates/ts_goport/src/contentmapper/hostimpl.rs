@@ -38,28 +38,23 @@ fn lock<T: ?Sized>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-// Go: contentmapper/hostimpl.go:31 ProtocolVersion
-// ProtocolVersion is the content mapper protocol version this host speaks.
-pub const PROTOCOL_VERSION: i32 = 1;
-
-// Go: contentmapper/hostimpl.go:33 initializeTimeoutSeconds
+// Go: contentmapper/hostimpl.go:30 initializeTimeoutSeconds
 const INITIALIZE_TIMEOUT_SECONDS: i32 = 5;
 
-// Go: contentmapper/hostimpl.go:35 initializeTimeout
+// Go: contentmapper/hostimpl.go:32 initializeTimeout
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(INITIALIZE_TIMEOUT_SECONDS as u64);
 
-// Go: contentmapper/hostimpl.go:38
+// Go: contentmapper/hostimpl.go:35
 // Content mapper protocol method names.
 pub const METHOD_INITIALIZE: &str = "initialize";
 pub const METHOD_OPEN_PROJECT: &str = "openProject";
 pub const METHOD_CLOSE_PROJECT: &str = "closeProject";
 pub const METHOD_TRANSFORM: &str = "transform";
 
-// Go: contentmapper/hostimpl.go:46 InitializeParams
+// Go: contentmapper/hostimpl.go:43 InitializeParams
 // InitializeParams is the parameter object for the initialize request.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InitializeParams {
-    pub protocol_version: i32,
     // Locale is the BCP 47 locale to use for mapper-authored diagnostic messages, when configured.
     pub locale: String,
     // PositionEncodings lists the coordinate spaces the host accepts.
@@ -70,7 +65,6 @@ impl MarshalerTo for InitializeParams {
     fn marshal_json_to(&self, enc: &mut String) -> std::result::Result<(), JsonError> {
         let first = &mut true;
         write_object_start(enc);
-        marshal_field(enc, first, "protocolVersion", &self.protocol_version)?;
         marshal_field_omitempty(enc, first, "locale", &self.locale)?;
         marshal_field(enc, first, "positionEncodings", &self.position_encodings)?;
         write_object_end(enc);
@@ -86,7 +80,6 @@ impl UnmarshalerFrom for InitializeParams {
         let is_object =
             unmarshal_struct_fields(dec, "contentmapper.InitializeParams", |name, dec| {
                 match name {
-                    "protocolVersion" => json_unmarshal_decode(dec, &mut self.protocol_version)?,
                     "locale" => json_unmarshal_decode(dec, &mut self.locale)?,
                     "positionEncodings" => {
                         json_unmarshal_decode(dec, &mut self.position_encodings)?;
@@ -102,11 +95,10 @@ impl UnmarshalerFrom for InitializeParams {
     }
 }
 
-// Go: contentmapper/hostimpl.go:55 InitializeResult
+// Go: contentmapper/hostimpl.go:51 InitializeResult
 // InitializeResult is the mapper's response to the initialize request.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InitializeResult {
-    pub protocol_version: i32,
     // PositionEncoding selects the coordinate space for all mappings and diagnostics.
     pub position_encoding: PositionEncoding,
     // DiagnosticSource is the prefix used for every mapper-authored diagnostic code.
@@ -117,7 +109,6 @@ impl MarshalerTo for InitializeResult {
     fn marshal_json_to(&self, enc: &mut String) -> std::result::Result<(), JsonError> {
         let first = &mut true;
         write_object_start(enc);
-        marshal_field(enc, first, "protocolVersion", &self.protocol_version)?;
         marshal_field(enc, first, "positionEncoding", &self.position_encoding)?;
         marshal_field(enc, first, "diagnosticSource", &self.diagnostic_source)?;
         write_object_end(enc);
@@ -133,7 +124,6 @@ impl UnmarshalerFrom for InitializeResult {
         let is_object =
             unmarshal_struct_fields(dec, "contentmapper.InitializeResult", |name, dec| {
                 match name {
-                    "protocolVersion" => json_unmarshal_decode(dec, &mut self.protocol_version)?,
                     "positionEncoding" => json_unmarshal_decode(dec, &mut self.position_encoding)?,
                     "diagnosticSource" => json_unmarshal_decode(dec, &mut self.diagnostic_source)?,
                     _ => return Ok(false),
@@ -147,7 +137,7 @@ impl UnmarshalerFrom for InitializeResult {
     }
 }
 
-// Go: contentmapper/hostimpl.go:64 OpenProjectParams
+// Go: contentmapper/hostimpl.go:59 OpenProjectParams
 // OpenProjectParams is the parameter object for the openProject request.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OpenProjectParams {
@@ -197,7 +187,7 @@ impl UnmarshalerFrom for OpenProjectParams {
     }
 }
 
-// Go: contentmapper/hostimpl.go:77 OpenProjectResult
+// Go: contentmapper/hostimpl.go:72 OpenProjectResult
 // OpenProjectResult is the mapper's response to an openProject request. ConfigIdentity and WatchedFiles
 // may only be returned by mappers that declare dynamicConfig.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -246,7 +236,7 @@ impl UnmarshalerFrom for OpenProjectResult {
     }
 }
 
-// Go: contentmapper/hostimpl.go:86 OptionDiagnosticResult
+// Go: contentmapper/hostimpl.go:81 OptionDiagnosticResult
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OptionDiagnosticResult {
     pub path: Vec<JsonValue>,
@@ -260,8 +250,7 @@ impl MarshalerTo for OptionDiagnosticResult {
         write_object_start(enc);
         marshal_field(enc, first, "path", &self.path)?;
         marshal_field(enc, first, "messageText", &self.message_text)?;
-        // PORT: Go v2 `omitempty` writes a 0 (only null, "", {} and [] are omitted).
-        marshal_field_omitempty(enc, first, "code", &self.code)?;
+        marshal_field(enc, first, "code", &self.code)?;
         write_object_end(enc);
         Ok(())
     }
@@ -289,7 +278,7 @@ impl UnmarshalerFrom for OptionDiagnosticResult {
     }
 }
 
-// Go: contentmapper/hostimpl.go:93 CloseProjectParams
+// Go: contentmapper/hostimpl.go:88 CloseProjectParams
 // CloseProjectParams is the parameter object for the closeProject request.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CloseProjectParams {
@@ -326,13 +315,13 @@ impl UnmarshalerFrom for CloseProjectParams {
     }
 }
 
-// Go: contentmapper/hostimpl.go:98 PositionEncoding
+// Go: contentmapper/hostimpl.go:93 PositionEncoding
 // PositionEncoding is the coordinate space a mapper uses for mappings and diagnostics.
 // PORT: a Go string type, like the lsproto string enums.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PositionEncoding(pub Cow<'static, str>);
 
-// Go: contentmapper/hostimpl.go:100
+// Go: contentmapper/hostimpl.go:95
 impl PositionEncoding {
     pub const UTF8: PositionEncoding = PositionEncoding(Cow::Borrowed("utf-8"));
     pub const UTF16: PositionEncoding = PositionEncoding(Cow::Borrowed("utf-16"));
@@ -356,7 +345,7 @@ impl UnmarshalerFrom for PositionEncoding {
     }
 }
 
-// Go: contentmapper/hostimpl.go:106 TransformParams
+// Go: contentmapper/hostimpl.go:101 TransformParams
 // TransformParams is the parameter object for the transform request.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TransformParams {
@@ -402,7 +391,7 @@ impl UnmarshalerFrom for TransformParams {
     }
 }
 
-// Go: contentmapper/hostimpl.go:116 MappedOutput
+// Go: contentmapper/hostimpl.go:111 MappedOutput
 // MappedOutput is virtual source text and its mapping to an original input.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MappedOutput {
@@ -480,7 +469,7 @@ impl UnmarshalerFrom for MappedOutput {
     }
 }
 
-// Go: contentmapper/hostimpl.go:130 DiagnosticDirectivePolicy
+// Go: contentmapper/hostimpl.go:125 DiagnosticDirectivePolicy
 // DiagnosticDirectivePolicy is the numeric policy stored in a mapped diagnostic directive tuple.
 go_enum!(DiagnosticDirectivePolicy, u8 {
     IGNORE = 0;
@@ -503,7 +492,7 @@ impl UnmarshalerFrom for DiagnosticDirectivePolicy {
     }
 }
 
-// Go: contentmapper/hostimpl.go:137 UnusedExpectDirectiveDiagnostic
+// Go: contentmapper/hostimpl.go:132 UnusedExpectDirectiveDiagnostic
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UnusedExpectDirectiveDiagnostic {
     pub code: i32,
@@ -545,7 +534,7 @@ impl UnmarshalerFrom for UnusedExpectDirectiveDiagnostic {
     }
 }
 
-// Go: contentmapper/hostimpl.go:143 DiagnosticDirectives
+// Go: contentmapper/hostimpl.go:138 DiagnosticDirectives
 // DiagnosticDirectives shares unused-expect diagnostics across compact directive tuples.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DiagnosticDirectives {
@@ -592,7 +581,7 @@ impl UnmarshalerFrom for DiagnosticDirectives {
     }
 }
 
-// Go: contentmapper/hostimpl.go:151 MappedDiagnosticDirective
+// Go: contentmapper/hostimpl.go:146 MappedDiagnosticDirective
 // MappedDiagnosticDirective is encoded as
 // [originalStart, originalLength, virtualStart, virtualEnd, policy, unusedExpectDirectiveIndex?].
 // An omitted index selects the only unused-expect diagnostic and is invalid when there is not exactly one.
@@ -607,7 +596,7 @@ pub struct MappedDiagnosticDirective {
     pub unused_expect_directive_index: Option<i32>,
 }
 
-// Go: contentmapper/hostimpl.go:165 MappedDiagnosticDirective.MarshalJSONTo
+// Go: contentmapper/hostimpl.go:160 MappedDiagnosticDirective.MarshalJSONTo
 impl MarshalerTo for MappedDiagnosticDirective {
     fn marshal_json_to(&self, enc: &mut String) -> std::result::Result<(), JsonError> {
         let mut tuple: Vec<i32> = vec![
@@ -624,7 +613,7 @@ impl MarshalerTo for MappedDiagnosticDirective {
     }
 }
 
-// Go: contentmapper/hostimpl.go:173 MappedDiagnosticDirective.UnmarshalJSONFrom
+// Go: contentmapper/hostimpl.go:168 MappedDiagnosticDirective.UnmarshalJSONFrom
 // PORT: Go returns plain `fmt.Errorf` errors from the method; here they are
 // `JsonError`s with the same text (the JSON layer wraps method errors).
 impl UnmarshalerFrom for MappedDiagnosticDirective {
@@ -664,7 +653,7 @@ impl UnmarshalerFrom for MappedDiagnosticDirective {
     }
 }
 
-// Go: contentmapper/hostimpl.go:198 SupplementalOutput
+// Go: contentmapper/hostimpl.go:193 SupplementalOutput
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SupplementalOutput {
     pub mapped_output: MappedOutput,
@@ -692,7 +681,7 @@ impl UnmarshalerFrom for SupplementalOutput {
     }
 }
 
-// Go: contentmapper/hostimpl.go:203 TransformResult
+// Go: contentmapper/hostimpl.go:198 TransformResult
 // TransformResult is the canonical output for one input file.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TransformResult {
@@ -736,7 +725,7 @@ impl UnmarshalerFrom for TransformResult {
     }
 }
 
-// Go: contentmapper/hostimpl.go:212 Diagnostic
+// Go: contentmapper/hostimpl.go:207 Diagnostic
 // Diagnostic is an error reported by a mapper in original-source coordinates.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Diagnostic {
@@ -755,7 +744,7 @@ impl MarshalerTo for Diagnostic {
         marshal_field(enc, first, "messageText", &self.message_text)?;
         marshal_field(enc, first, "start", &self.start)?;
         marshal_field(enc, first, "length", &self.length)?;
-        marshal_field_omitempty(enc, first, "code", &self.code)?;
+        marshal_field(enc, first, "code", &self.code)?;
         write_object_end(enc);
         Ok(())
     }
@@ -783,7 +772,7 @@ impl UnmarshalerFrom for Diagnostic {
     }
 }
 
-// Go: contentmapper/hostimpl.go:223 dialFunc
+// Go: contentmapper/hostimpl.go:218 dialFunc
 // dialFunc establishes a running connection to a mapper. In production it spawns the mapper's process;
 // tests substitute an in-memory connection. It returns the connection and a closer that tears it down.
 // PORT: Go's `io.Closer` is the spawned process connection.
@@ -803,7 +792,7 @@ type DialFunc = Rc<
     >,
 >;
 
-// Go: contentmapper/hostimpl.go:226 host
+// Go: contentmapper/hostimpl.go:221 host
 // host manages one child process per mapper identity. It is the production implementation of Host.
 // PORT: Go unexported `host`; other packages see it through the `Host`
 // interface, so the Rust name is `HostImpl` (as `CompilerHostImpl`). Go nil
@@ -830,7 +819,7 @@ pub struct HostImpl {
     this: Weak<HostImpl>,
 }
 
-// Go: contentmapper/hostimpl.go:243 projectEntry
+// Go: contentmapper/hostimpl.go:238 projectEntry
 struct ProjectEntry {
     mapper: Rc<Mapper>,
     spec: ProjectSpec,
@@ -841,7 +830,7 @@ struct ProjectEntry {
     option_diagnostics: Vec<OptionDiagnostic>,
 }
 
-// Go: contentmapper/hostimpl.go:253 mapperConn
+// Go: contentmapper/hostimpl.go:248 mapperConn
 #[derive(Default)]
 struct MapperConn {
     conn: Option<Rc<dyn ipc::Conn>>,
@@ -855,7 +844,7 @@ struct MapperConn {
     refs: i32,
 }
 
-// Go: contentmapper/hostimpl.go:265 operationTiming
+// Go: contentmapper/hostimpl.go:260 operationTiming
 // PORT: Go `operationTiming` and `OperationTiming` (host.go) are both
 // `OperationTiming` in Rust; the unexported one is `OperationTimingImpl`.
 // Go's atomics are cells (dispatch thread).
@@ -866,13 +855,13 @@ struct OperationTimingImpl {
 }
 
 impl OperationTimingImpl {
-    // Go: contentmapper/hostimpl.go:270 operationTiming.record
+    // Go: contentmapper/hostimpl.go:265 operationTiming.record
     fn record(&self, start: Instant) {
         self.count.set(self.count.get() + 1);
         self.duration.set(self.duration.get() + start.elapsed());
     }
 
-    // Go: contentmapper/hostimpl.go:275 operationTiming.snapshot
+    // Go: contentmapper/hostimpl.go:270 operationTiming.snapshot
     fn snapshot(&self) -> OperationTiming {
         OperationTiming {
             count: self.count.get(),
@@ -881,7 +870,7 @@ impl OperationTimingImpl {
     }
 }
 
-// Go: contentmapper/hostimpl.go:279 timingCollector
+// Go: contentmapper/hostimpl.go:274 timingCollector
 struct TimingCollector {
     mappers: RefCell<IndexMap<String, Rc<MapperTimingCollector>>>,
     active_requests: Cell<u64>,
@@ -889,7 +878,7 @@ struct TimingCollector {
     request_wait_elapsed: Cell<Duration>,
 }
 
-// Go: contentmapper/hostimpl.go:287 mapperTimingCollector
+// Go: contentmapper/hostimpl.go:282 mapperTimingCollector
 // PORT: Go's `owner` pointer is a `Weak`, so the collector and its mapper
 // entries do not keep each other alive.
 #[derive(Default)]
@@ -913,7 +902,7 @@ impl TimingCollector {
         }
     }
 
-    // Go: contentmapper/hostimpl.go:296 timingCollector.mapper
+    // Go: contentmapper/hostimpl.go:291 timingCollector.mapper
     fn mapper(self: &Rc<Self>, identity: &str) -> Rc<MapperTimingCollector> {
         if let Some(timing) = self.mappers.borrow().get(identity) {
             return timing.clone();
@@ -928,7 +917,7 @@ impl TimingCollector {
         timing
     }
 
-    // Go: contentmapper/hostimpl.go:307 timingCollector.snapshot
+    // Go: contentmapper/hostimpl.go:302 timingCollector.snapshot
     fn snapshot(&self) -> Timings {
         let mut request_wait = self.request_wait_elapsed.get();
         if self.active_requests.get() != 0 {
@@ -967,7 +956,7 @@ impl MapperTimingCollector {
             .expect("content mapper timing collector outlives its host")
     }
 
-    // Go: contentmapper/hostimpl.go:329 mapperTimingCollector.startRequest
+    // Go: contentmapper/hostimpl.go:324 mapperTimingCollector.startRequest
     fn start_request(&self) -> Instant {
         let owner = self.owner();
         if owner.active_requests.get() == 0 {
@@ -977,7 +966,7 @@ impl MapperTimingCollector {
         Instant::now()
     }
 
-    // Go: contentmapper/hostimpl.go:339 mapperTimingCollector.finishRequest
+    // Go: contentmapper/hostimpl.go:334 mapperTimingCollector.finishRequest
     fn finish_request(&self, operation: &OperationTimingImpl, start: Instant) {
         operation.record(start);
         let owner = self.owner();
@@ -990,7 +979,7 @@ impl MapperTimingCollector {
     }
 }
 
-// Go: contentmapper/hostimpl.go:354 Spawner
+// Go: contentmapper/hostimpl.go:349 Spawner
 // Spawner starts a child process, returning its stdio as an io.ReadWriteCloser (Read is the
 // process's stdout, Write is its stdin) whose Close tears the process down. This seam keeps os/exec out
 // of this package: production hosts spawn a real process, tests supply an in-process pipe.
@@ -1005,7 +994,7 @@ pub trait Spawner {
     ) -> std::result::Result<Arc<dyn ProcessExitState>, GoError>;
 }
 
-// Go: contentmapper/hostimpl.go:358 processExitState
+// Go: contentmapper/hostimpl.go:353 processExitState
 // PORT: Go type-asserts the spawned `io.ReadWriteCloser` for
 // `ExitCode() (int, bool)`. Rust has no dynamic interface check, so a
 // spawned process is this trait: an `ipc::ReadWriteCloser` whose
@@ -1024,12 +1013,12 @@ pub type SpawnFn = dyn Fn(
     Option<Box<dyn Write + Send>>,
 ) -> std::result::Result<Arc<dyn ProcessExitState>, GoError>;
 
-// Go: contentmapper/hostimpl.go:363 SpawnerFunc
+// Go: contentmapper/hostimpl.go:358 SpawnerFunc
 // SpawnerFunc adapts a spawn function to the Spawner interface.
 pub struct SpawnerFunc(pub Box<SpawnFn>);
 
 impl Spawner for SpawnerFunc {
-    // Go: contentmapper/hostimpl.go:365 SpawnerFunc.Spawn
+    // Go: contentmapper/hostimpl.go:360 SpawnerFunc.Spawn
     fn spawn(
         &self,
         command: &[String],
@@ -1040,12 +1029,12 @@ impl Spawner for SpawnerFunc {
     }
 }
 
-// Go: contentmapper/hostimpl.go:370 Logger
+// Go: contentmapper/hostimpl.go:365 Logger
 // Logger receives content mapper protocol and process output as complete log lines.
 // PORT: the stderr lines come from the spawner's thread, so it is `Send + Sync`.
 pub type Logger = Arc<dyn Fn(&str) + Send + Sync>;
 
-// Go: contentmapper/hostimpl.go:373 HostOptions
+// Go: contentmapper/hostimpl.go:368 HostOptions
 // HostOptions configures optional content mapper process logging.
 // PORT: Go nil `Logger` is `None`.
 #[derive(Clone, Default)]
@@ -1053,7 +1042,7 @@ pub struct HostOptions {
     pub logger: Option<Logger>,
 }
 
-// Go: contentmapper/hostimpl.go:377 loggingProtocol
+// Go: contentmapper/hostimpl.go:372 loggingProtocol
 // PORT: Go embeds `ipc.Protocol`; the methods below forward to `protocol`.
 struct LoggingProtocol {
     protocol: Box<dyn ipc::Protocol>,
@@ -1062,7 +1051,7 @@ struct LoggingProtocol {
 }
 
 impl LoggingProtocol {
-    // Go: contentmapper/hostimpl.go:383 loggingProtocol.log
+    // Go: contentmapper/hostimpl.go:378 loggingProtocol.log
     fn log(&self, direction: &str, message: &dyn MarshalerTo) {
         match json_marshal(message, &[]) {
             Err(err) => (self.logger)(&format!(
@@ -1078,7 +1067,7 @@ impl LoggingProtocol {
 }
 
 impl ipc::Protocol for LoggingProtocol {
-    // Go: contentmapper/hostimpl.go:392 loggingProtocol.ReadMessage
+    // Go: contentmapper/hostimpl.go:387 loggingProtocol.ReadMessage
     fn read_message(&mut self) -> std::result::Result<ipc::Message, GoError> {
         let message = self.protocol.read_message();
         if let Ok(message) = &message {
@@ -1087,7 +1076,7 @@ impl ipc::Protocol for LoggingProtocol {
         message
     }
 
-    // Go: contentmapper/hostimpl.go:400 loggingProtocol.WriteRequest
+    // Go: contentmapper/hostimpl.go:395 loggingProtocol.WriteRequest
     // PORT: Go logs a message that shares `params` with the write. The Rust
     // params are owned, so the message is logged first and the params move
     // on to the write.
@@ -1108,7 +1097,7 @@ impl ipc::Protocol for LoggingProtocol {
         self.protocol.write_request(id, method, params)
     }
 
-    // Go: contentmapper/hostimpl.go:406 loggingProtocol.WriteNotification
+    // Go: contentmapper/hostimpl.go:401 loggingProtocol.WriteNotification
     fn write_notification(
         &mut self,
         method: &str,
@@ -1124,7 +1113,7 @@ impl ipc::Protocol for LoggingProtocol {
         self.protocol.write_notification(method, params)
     }
 
-    // Go: contentmapper/hostimpl.go:412 loggingProtocol.WriteResponse
+    // Go: contentmapper/hostimpl.go:407 loggingProtocol.WriteResponse
     fn write_response(
         &mut self,
         id: Option<&jsonrpc::ID>,
@@ -1140,7 +1129,7 @@ impl ipc::Protocol for LoggingProtocol {
         self.protocol.write_response(id, result)
     }
 
-    // Go: contentmapper/hostimpl.go:418 loggingProtocol.WriteError
+    // Go: contentmapper/hostimpl.go:413 loggingProtocol.WriteError
     fn write_error(
         &mut self,
         id: Option<&jsonrpc::ID>,
@@ -1156,7 +1145,7 @@ impl ipc::Protocol for LoggingProtocol {
     }
 }
 
-// Go: contentmapper/hostimpl.go:424 stderrLogger
+// Go: contentmapper/hostimpl.go:419 stderrLogger
 // PORT: Go keeps `pending` as a string of raw bytes. Here it is bytes too,
 // so a character split between two writes stays whole; each complete line
 // goes to the logger as text (invalid UTF-8 becomes U+FFFD).
@@ -1167,7 +1156,7 @@ struct StderrLogger {
 }
 
 impl StderrLogger {
-    // Go: contentmapper/hostimpl.go:431 stderrLogger.Write
+    // Go: contentmapper/hostimpl.go:426 stderrLogger.Write
     fn write(&self, data: &[u8]) -> usize {
         let mut pending = lock(&self.pending);
         pending.extend_from_slice(data);
@@ -1182,7 +1171,7 @@ impl StderrLogger {
         data.len()
     }
 
-    // Go: contentmapper/hostimpl.go:446 stderrLogger.flush
+    // Go: contentmapper/hostimpl.go:441 stderrLogger.flush
     fn flush(&self) {
         let mut pending = lock(&self.pending);
         if !pending.is_empty() {
@@ -1191,7 +1180,7 @@ impl StderrLogger {
         }
     }
 
-    // Go: contentmapper/hostimpl.go:455 stderrLogger.log
+    // Go: contentmapper/hostimpl.go:450 stderrLogger.log
     fn log(&self, message: &[u8]) {
         (self.logger)(&format!(
             "[content mapper: {}] stderr: {}",
@@ -1216,7 +1205,7 @@ impl Write for StderrLoggerWriter {
     }
 }
 
-// Go: contentmapper/hostimpl.go:459 loggedProcess
+// Go: contentmapper/hostimpl.go:454 loggedProcess
 // PORT: Go embeds `io.ReadWriteCloser`, which does not promote the spawned
 // value's `ExitCode` method, so a logged process reports no exit state
 // (`exit_code` keeps the default).
@@ -1238,7 +1227,7 @@ impl ipc::ReadWriteCloser for LoggedProcess {
         self.inner.flush()
     }
 
-    // Go: contentmapper/hostimpl.go:464 loggedProcess.Close
+    // Go: contentmapper/hostimpl.go:459 loggedProcess.Close
     fn close(&self) -> std::result::Result<(), GoError> {
         let err = self.inner.close();
         self.stderr.flush();
@@ -1248,7 +1237,7 @@ impl ipc::ReadWriteCloser for LoggedProcess {
 
 impl ProcessExitState for LoggedProcess {}
 
-// Go: contentmapper/hostimpl.go:470 closeOnceReadWriteCloser
+// Go: contentmapper/hostimpl.go:465 closeOnceReadWriteCloser
 struct CloseOnceReadWriteCloser {
     inner: Arc<dyn ProcessExitState>,
     // Go `once` and `err`.
@@ -1268,14 +1257,14 @@ impl ipc::ReadWriteCloser for CloseOnceReadWriteCloser {
         self.inner.flush()
     }
 
-    // Go: contentmapper/hostimpl.go:476 closeOnceReadWriteCloser.Close
+    // Go: contentmapper/hostimpl.go:471 closeOnceReadWriteCloser.Close
     fn close(&self) -> std::result::Result<(), GoError> {
         self.once.get_or_init(|| self.inner.close()).clone()
     }
 }
 
 impl ProcessExitState for CloseOnceReadWriteCloser {
-    // Go: contentmapper/hostimpl.go:481 closeOnceReadWriteCloser.ExitCode
+    // Go: contentmapper/hostimpl.go:476 closeOnceReadWriteCloser.ExitCode
     fn exit_code(&self) -> (i32, bool) {
         self.inner.exit_code()
     }
@@ -1339,7 +1328,7 @@ impl ipc::Conn for ProcessConn {
     }
 }
 
-// Go: contentmapper/hostimpl.go:492 NewHost
+// Go: contentmapper/hostimpl.go:487 NewHost
 // NewHost creates a Host that spawns each mapper's process via the given spawner and drives it over a
 // JSON-RPC connection. The host's lifetime is bound to ctx: cancelling it (e.g. the CLI's signal context
 // on SIGINT, or a build/watch session ending) tears every mapper process down, so owners of a session
@@ -1352,7 +1341,7 @@ pub fn new_host(
     new_host_with_options(ctx, spawner, diagnostic_locale, HostOptions::default())
 }
 
-// Go: contentmapper/hostimpl.go:497 NewHostWithOptions
+// Go: contentmapper/hostimpl.go:492 NewHostWithOptions
 // NewHostWithOptions creates a Host with optional protocol and process logging.
 pub fn new_host_with_options(
     ctx: &Context,
@@ -1507,7 +1496,7 @@ pub fn new_host_with_options(
     new_with_dial(ctx, diagnostic_locale, timing, dial)
 }
 
-// Go: contentmapper/hostimpl.go:560 newWithDial
+// Go: contentmapper/hostimpl.go:555 newWithDial
 // PORT: Go's `AfterFunc(ctx, func() { _ = h.Close() })` would close the
 // host from another goroutine. The host is dispatch-thread state, so the
 // callback closes the spawned processes (the part of Close that other
@@ -1555,7 +1544,7 @@ impl HostImpl {
         self.this.upgrade().expect("content mapper host is alive")
     }
 
-    // Go: contentmapper/hostimpl.go:655 host.openProjectLocked
+    // Go: contentmapper/hostimpl.go:650 host.openProjectLocked
     fn open_project_locked(
         &self,
         ctx: &Context,
@@ -1670,7 +1659,7 @@ impl HostImpl {
         Ok(())
     }
 
-    // Go: contentmapper/hostimpl.go:733 host.closeProject
+    // Go: contentmapper/hostimpl.go:728 host.closeProject
     fn close_project(
         &self,
         mapper: &Mapper,
@@ -1690,7 +1679,7 @@ impl HostImpl {
         result.map(|_| ())
     }
 
-    // Go: contentmapper/hostimpl.go:775 host.transformLocked
+    // Go: contentmapper/hostimpl.go:770 host.transformLocked
     fn transform_locked(
         &self,
         mapper: &Rc<Mapper>,
@@ -1741,7 +1730,7 @@ impl HostImpl {
         }
     }
 
-    // Go: contentmapper/hostimpl.go:830 host.connFor
+    // Go: contentmapper/hostimpl.go:825 host.connFor
     // connFor returns the connection for a mapper's identity, spawning its process on first use. Mappers
     // sharing an identity share a single process.
     fn conn_for(
@@ -1751,7 +1740,7 @@ impl HostImpl {
         self.conn_for_locked(mapper)
     }
 
-    // Go: contentmapper/hostimpl.go:836 host.connForLocked
+    // Go: contentmapper/hostimpl.go:831 host.connForLocked
     fn conn_for_locked(
         &self,
         mapper: &Rc<Mapper>,
@@ -1804,7 +1793,7 @@ impl HostImpl {
         }
     }
 
-    // Go: contentmapper/hostimpl.go:1072 host.release
+    // Go: contentmapper/hostimpl.go:1067 host.release
     fn release(&self, identities: &[String]) {
         let mut closers: Vec<Arc<dyn ProcessExitState>> = Vec::new();
         {
@@ -1846,12 +1835,12 @@ impl HostImpl {
 }
 
 impl Host for HostImpl {
-    // Go: contentmapper/hostimpl.go:567 host.Timings
+    // Go: contentmapper/hostimpl.go:562 host.Timings
     fn timings(&self) -> Timings {
         self.timing.snapshot()
     }
 
-    // Go: contentmapper/hostimpl.go:571 host.SetLocale
+    // Go: contentmapper/hostimpl.go:566 host.SetLocale
     fn set_locale(&self, diagnostic_locale: Locale) {
         if self.diagnostic_locale.borrow().string() == diagnostic_locale.string() {
             return;
@@ -1881,7 +1870,7 @@ impl Host for HostImpl {
         }
     }
 
-    // Go: contentmapper/hostimpl.go:600 host.Project
+    // Go: contentmapper/hostimpl.go:595 host.Project
     fn project(&self, spec: ProjectSpec) -> Option<Rc<dyn Project>> {
         let key = project_spec_key(&spec);
         if self.projects.borrow().is_none() {
@@ -1939,7 +1928,7 @@ impl Host for HostImpl {
         Some(lease)
     }
 
-    // Go: contentmapper/hostimpl.go:741 host.Acquire
+    // Go: contentmapper/hostimpl.go:736 host.Acquire
     fn acquire(&self, mappers: &[Rc<Mapper>]) -> Rc<dyn Fn()> {
         let mut seen: FxHashSet<String> = FxHashSet::default();
         let mut identities: Vec<String> = Vec::with_capacity(mappers.len());
@@ -1968,7 +1957,7 @@ impl Host for HostImpl {
         })
     }
 
-    // Go: contentmapper/hostimpl.go:766 host.Transform
+    // Go: contentmapper/hostimpl.go:761 host.Transform
     // Transform sends the file's content to the mapper's process and decodes the transformed result.
     fn transform(
         &self,
@@ -1990,7 +1979,7 @@ impl Host for HostImpl {
         result
     }
 
-    // Go: contentmapper/hostimpl.go:803 host.Close
+    // Go: contentmapper/hostimpl.go:798 host.Close
     // Close shuts down every mapper process. It is safe to call more than once and is invoked automatically
     // when the context passed to New is cancelled.
     fn close(&self) -> std::result::Result<(), GoError> {
@@ -2021,7 +2010,7 @@ impl Host for HostImpl {
     }
 }
 
-// Go: contentmapper/hostimpl.go:632 projectSpecKey
+// Go: contentmapper/hostimpl.go:627 projectSpecKey
 // PORT: Go `%p` of a nil pointer prints `0x0`, as Rust `{:p}` of a null pointer.
 fn project_spec_key(spec: &ProjectSpec) -> String {
     let compiler_options: *const CompilerOptions = spec
@@ -2035,7 +2024,7 @@ fn project_spec_key(spec: &ProjectSpec) -> String {
     key
 }
 
-// Go: contentmapper/hostimpl.go:641 combinedIdentity
+// Go: contentmapper/hostimpl.go:636 combinedIdentity
 // PORT: Go `hex.EncodeToString` of the big-endian `Bytes()` of an
 // `xxh3.Uint128` is `{:032x}` of the `u128`.
 fn combined_identity(
@@ -2082,7 +2071,7 @@ fn json_value_kind(value: &JsonValue) -> u8 {
     }
 }
 
-// Go: contentmapper/hostimpl.go:858 projectLease
+// Go: contentmapper/hostimpl.go:853 projectLease
 // PORT: Go `map[*Mapper]string` is an `IndexMap` keyed by the mapper's `Rc`
 // pointer, in insertion order. `refs` and `once` are cells (dispatch thread).
 struct ProjectLease {
@@ -2094,7 +2083,7 @@ struct ProjectLease {
     once: Cell<bool>,
 }
 
-// Go: contentmapper/hostimpl.go:867 retainedProject
+// Go: contentmapper/hostimpl.go:862 retainedProject
 // PORT: Go embeds `*projectLease`; every method but Close forwards to it.
 struct RetainedProject {
     project_lease: Rc<ProjectLease>,
@@ -2102,7 +2091,7 @@ struct RetainedProject {
 }
 
 impl ProjectLease {
-    // Go: contentmapper/hostimpl.go:872 projectLease.retainLocked
+    // Go: contentmapper/hostimpl.go:867 projectLease.retainLocked
     fn retain_locked(self: &Rc<Self>) -> Rc<dyn Project> {
         self.refs.set(self.refs.get() + 1);
         Rc::new(RetainedProject {
@@ -2116,7 +2105,7 @@ impl ProjectLease {
         self.entries.get(&Rc::as_ptr(mapper))
     }
 
-    // Go: contentmapper/hostimpl.go:1034 projectLease.release
+    // Go: contentmapper/hostimpl.go:1029 projectLease.release
     fn release(&self) -> std::result::Result<(), GoError> {
         let host = &self.host;
         let mut result: Option<GoError> = None;
@@ -2173,7 +2162,7 @@ impl ProjectLease {
 }
 
 impl Project for ProjectLease {
-    // Go: contentmapper/hostimpl.go:882 projectLease.Refresh
+    // Go: contentmapper/hostimpl.go:877 projectLease.Refresh
     fn refresh(&self) -> std::result::Result<(), GoError> {
         let host = &self.host;
         if host.projects.borrow().is_none() {
@@ -2209,7 +2198,7 @@ impl Project for ProjectLease {
         }
     }
 
-    // Go: contentmapper/hostimpl.go:904 projectLease.Identities
+    // Go: contentmapper/hostimpl.go:899 projectLease.Identities
     fn identities(&self) -> std::result::Result<Vec<String>, GoError> {
         let host = &self.host;
         if host.projects.borrow().is_none() {
@@ -2237,7 +2226,7 @@ impl Project for ProjectLease {
         Ok(identities)
     }
 
-    // Go: contentmapper/hostimpl.go:932 projectLease.Identity
+    // Go: contentmapper/hostimpl.go:927 projectLease.Identity
     fn identity(&self, mapper: &Rc<Mapper>) -> std::result::Result<String, GoError> {
         let host = &self.host;
         if host.projects.borrow().is_none() {
@@ -2262,7 +2251,7 @@ impl Project for ProjectLease {
         Ok(static_identity(mapper, compiler_options.as_deref()))
     }
 
-    // Go: contentmapper/hostimpl.go:958 projectLease.WatchedFiles
+    // Go: contentmapper/hostimpl.go:953 projectLease.WatchedFiles
     fn watched_files(&self) -> std::result::Result<Vec<String>, GoError> {
         let host = &self.host;
         if host.projects.borrow().is_none() {
@@ -2283,7 +2272,7 @@ impl Project for ProjectLease {
         Ok(files)
     }
 
-    // Go: contentmapper/hostimpl.go:983 projectLease.Diagnostics
+    // Go: contentmapper/hostimpl.go:978 projectLease.Diagnostics
     fn diagnostics(&self) -> Vec<OptionDiagnostic> {
         let host = &self.host;
         if host.projects.borrow().is_none() {
@@ -2304,7 +2293,7 @@ impl Project for ProjectLease {
         diagnostics
     }
 
-    // Go: contentmapper/hostimpl.go:1005 projectLease.Transform
+    // Go: contentmapper/hostimpl.go:1000 projectLease.Transform
     fn transform(
         &self,
         mapper: &Rc<Mapper>,
@@ -2327,7 +2316,7 @@ impl Project for ProjectLease {
         host.transform_locked(mapper, request, &handle)
     }
 
-    // Go: contentmapper/hostimpl.go:1026 projectLease.Close
+    // Go: contentmapper/hostimpl.go:1021 projectLease.Close
     fn close(&self) -> std::result::Result<(), GoError> {
         if self.once.replace(true) {
             return Ok(());
@@ -2365,7 +2354,7 @@ impl Project for RetainedProject {
         Project::transform(&*self.project_lease, mapper, request)
     }
 
-    // Go: contentmapper/hostimpl.go:877 retainedProject.Close
+    // Go: contentmapper/hostimpl.go:872 retainedProject.Close
     fn close(&self) -> std::result::Result<(), GoError> {
         if self.once.replace(true) {
             return Ok(());
@@ -2374,7 +2363,7 @@ impl Project for RetainedProject {
     }
 }
 
-// Go: contentmapper/hostimpl.go:1096 handshake
+// Go: contentmapper/hostimpl.go:1091 handshake
 fn handshake(
     ctx: &Context,
     conn: &Rc<dyn ipc::Conn>,
@@ -2384,7 +2373,6 @@ fn handshake(
         ctx,
         METHOD_INITIALIZE,
         Some(Box::new(InitializeParams {
-            protocol_version: PROTOCOL_VERSION,
             locale: diagnostic_locale.string(),
             position_encodings: vec![PositionEncoding::UTF8, PositionEncoding::UTF16],
         })),
@@ -2394,14 +2382,6 @@ fn handshake(
         return Err(InitializeError {
             kind: InitializeErrorKind::INVALID_RESPONSE,
             detail: err.to_string(),
-            ..Default::default()
-        }
-        .to_go_error());
-    }
-    if res.protocol_version != PROTOCOL_VERSION {
-        return Err(InitializeError {
-            kind: InitializeErrorKind::PROTOCOL_VERSION,
-            protocol_version: res.protocol_version,
             ..Default::default()
         }
         .to_go_error());
@@ -2454,7 +2434,7 @@ fn handshake(
     Ok((res.position_encoding, res.diagnostic_source))
 }
 
-// Go: contentmapper/hostimpl.go:1130 decodeTransformResult
+// Go: contentmapper/hostimpl.go:1121 decodeTransformResult
 fn decode_transform_result(
     raw: &JsonValue,
     original_text: &str,
@@ -2532,7 +2512,7 @@ fn decode_transform_result(
     Ok(result)
 }
 
-// Go: contentmapper/hostimpl.go:1179 decodeMappedOutput
+// Go: contentmapper/hostimpl.go:1170 decodeMappedOutput
 fn decode_mapped_output<'a>(
     output: &'a MappedOutput,
     original_text: &'a str,
@@ -2574,7 +2554,7 @@ fn decode_mapped_output<'a>(
     Ok((result, original_positions))
 }
 
-// Go: contentmapper/hostimpl.go:1217 normalizeDiagnosticDirectives
+// Go: contentmapper/hostimpl.go:1208 normalizeDiagnosticDirectives
 fn normalize_diagnostic_directives(
     diagnostic_directives: Option<&DiagnosticDirectives>,
     virtual_positions: &PositionNormalizer<'_>,
@@ -2696,7 +2676,7 @@ fn normalize_diagnostic_directives(
     Ok(result)
 }
 
-// Go: contentmapper/hostimpl.go:1300 normalizeMappings
+// Go: contentmapper/hostimpl.go:1291 normalizeMappings
 fn normalize_mappings(
     mappings: &spanmap::SpanMap,
     virtual_positions: &PositionNormalizer<'_>,
@@ -2742,7 +2722,7 @@ fn normalize_mappings(
     Ok(spanmap::new(&segments))
 }
 
-// Go: contentmapper/hostimpl.go:1325 positionNormalizer
+// Go: contentmapper/hostimpl.go:1316 positionNormalizer
 struct PositionNormalizer<'a> {
     text: &'a str,
     encoding: PositionEncoding,
@@ -2750,7 +2730,7 @@ struct PositionNormalizer<'a> {
     length: i32,
 }
 
-// Go: contentmapper/hostimpl.go:1332 newPositionNormalizer
+// Go: contentmapper/hostimpl.go:1323 newPositionNormalizer
 fn new_position_normalizer<'a>(
     text: &'a str,
     encoding: &PositionEncoding,
@@ -2777,12 +2757,12 @@ fn new_position_normalizer<'a>(
 }
 
 impl PositionNormalizer<'_> {
-    // Go: contentmapper/hostimpl.go:1346 positionNormalizer.normalizeTextPos
+    // Go: contentmapper/hostimpl.go:1337 positionNormalizer.normalizeTextPos
     fn normalize_text_pos(&self, position: i32) -> std::result::Result<i32, GoError> {
         self.normalize(position)
     }
 
-    // Go: contentmapper/hostimpl.go:1351 positionNormalizer.normalize
+    // Go: contentmapper/hostimpl.go:1342 positionNormalizer.normalize
     fn normalize(&self, position: i32) -> std::result::Result<i32, GoError> {
         if position < 0 {
             return Err(errors::new(format!("position {position} is negative")));
@@ -2815,13 +2795,13 @@ impl PositionNormalizer<'_> {
     }
 }
 
-// Go: contentmapper/hostimpl.go:1373 rejectHandler
+// Go: contentmapper/hostimpl.go:1364 rejectHandler
 // rejectHandler rejects any request initiated by the mapper. The content mapper protocol is currently
 // parent-driven only; a request from the child is a protocol violation.
 struct RejectHandler;
 
 impl ipc::Handler for RejectHandler {
-    // Go: contentmapper/hostimpl.go:1375 rejectHandler.HandleRequest
+    // Go: contentmapper/hostimpl.go:1366 rejectHandler.HandleRequest
     fn handle_request(
         &self,
         ctx: &Context,
@@ -2833,7 +2813,7 @@ impl ipc::Handler for RejectHandler {
         )))
     }
 
-    // Go: contentmapper/hostimpl.go:1379 rejectHandler.HandleNotification
+    // Go: contentmapper/hostimpl.go:1370 rejectHandler.HandleNotification
     fn handle_notification(
         &self,
         ctx: &Context,
@@ -2956,7 +2936,6 @@ mod tests {
 
     fn initialize_result(source: &str) -> Box<dyn AnyValue> {
         Box::new(InitializeResult {
-            protocol_version: PROTOCOL_VERSION,
             position_encoding: PositionEncoding::UTF8,
             diagnostic_source: source.to_string(),
         })
@@ -3078,7 +3057,6 @@ mod tests {
                     }
                     let source = self.source.clone().unwrap_or_else(|| "mapper".to_string());
                     Ok(Some(Box::new(InitializeResult {
-                        protocol_version: PROTOCOL_VERSION,
                         position_encoding: self.encoding.clone(),
                         diagnostic_source: source,
                     })))
@@ -3135,7 +3113,7 @@ mod tests {
                             message_text: "after non-ASCII character".to_string(),
                             start: emoji_length,
                             length: text_length - emoji_length,
-                            code: 0,
+                            code: 1001,
                         }],
                         ..Default::default()
                     })))
@@ -3159,7 +3137,6 @@ mod tests {
         ) -> std::result::Result<Option<Box<dyn AnyValue>>, GoError> {
             match method {
                 METHOD_INITIALIZE => Ok(Some(Box::new(InitializeResult {
-                    protocol_version: PROTOCOL_VERSION,
                     position_encoding: self.encoding.clone(),
                     diagnostic_source: "mapper".to_string(),
                 }))),
@@ -3171,6 +3148,7 @@ mod tests {
                     diagnostics: vec![Diagnostic {
                         message_text: "invalid boundary".to_string(),
                         start: 1,
+                        code: 1002,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -4785,7 +4763,7 @@ mod tests {
             option_diagnostics: vec![OptionDiagnosticResult {
                 path: vec![JsonValue(b"null".to_vec())],
                 message_text: "Invalid option.".to_string(),
-                code: 0,
+                code: 123,
             }],
             ..Default::default()
         });

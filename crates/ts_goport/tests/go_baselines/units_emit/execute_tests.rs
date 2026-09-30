@@ -24,6 +24,8 @@ struct BuildOrderTestCase {
     name: &'static str,
     projects: &'static [&'static str],
     expected: &'static [&'static str],
+    // ts#64220
+    expected_schedule: &'static [&'static str],
     circular: bool,
 }
 
@@ -32,15 +34,15 @@ struct BuildOrderTestCase {
 fn test_build_order_generator() {
     #[rustfmt::skip]
     let test_cases = [
-        BuildOrderTestCase { name: "specify two roots", projects: &["A", "G"], expected: &["D", "E", "C", "B", "A", "G"], circular: false },
-        BuildOrderTestCase { name: "multiple parts of the same graph in various orders", projects: &["A"], expected: &["D", "E", "C", "B", "A"], circular: false },
-        BuildOrderTestCase { name: "multiple parts of the same graph in various orders", projects: &["A", "C", "D"], expected: &["D", "E", "C", "B", "A"], circular: false },
-        BuildOrderTestCase { name: "multiple parts of the same graph in various orders", projects: &["D", "C", "A"], expected: &["D", "E", "C", "B", "A"], circular: false },
-        BuildOrderTestCase { name: "other orderings", projects: &["F"], expected: &["E", "F"], circular: false },
-        BuildOrderTestCase { name: "other orderings", projects: &["E"], expected: &["E"], circular: false },
-        BuildOrderTestCase { name: "other orderings", projects: &["F", "C", "A"], expected: &["E", "F", "D", "C", "B", "A"], circular: false },
-        BuildOrderTestCase { name: "returns circular order", projects: &["H"], expected: &["E", "J", "I", "H"], circular: true },
-        BuildOrderTestCase { name: "returns circular order", projects: &["A", "H"], expected: &["D", "E", "C", "B", "A", "J", "I", "H"], circular: true },
+        BuildOrderTestCase { name: "specify two roots", projects: &["A", "G"], expected: &["D", "E", "C", "B", "A", "G"], expected_schedule: &["D", "E", "G", "C", "B", "A"], circular: false },
+        BuildOrderTestCase { name: "multiple parts of the same graph in various orders", projects: &["A"], expected: &["D", "E", "C", "B", "A"], expected_schedule: &["D", "E", "C", "B", "A"], circular: false },
+        BuildOrderTestCase { name: "multiple parts of the same graph in various orders", projects: &["A", "C", "D"], expected: &["D", "E", "C", "B", "A"], expected_schedule: &["D", "E", "C", "B", "A"], circular: false },
+        BuildOrderTestCase { name: "multiple parts of the same graph in various orders", projects: &["D", "C", "A"], expected: &["D", "E", "C", "B", "A"], expected_schedule: &["D", "E", "C", "B", "A"], circular: false },
+        BuildOrderTestCase { name: "other orderings", projects: &["F"], expected: &["E", "F"], expected_schedule: &["E", "F"], circular: false },
+        BuildOrderTestCase { name: "other orderings", projects: &["E"], expected: &["E"], expected_schedule: &["E"], circular: false },
+        BuildOrderTestCase { name: "other orderings", projects: &["F", "C", "A"], expected: &["E", "F", "D", "C", "B", "A"], expected_schedule: &["E", "D", "F", "C", "B", "A"], circular: false },
+        BuildOrderTestCase { name: "returns circular order", projects: &["H"], expected: &["E", "J", "I", "H"], expected_schedule: &["E", "J", "I", "H"], circular: true },
+        BuildOrderTestCase { name: "returns circular order", projects: &["A", "H"], expected: &["D", "E", "C", "B", "A", "J", "I", "H"], expected_schedule: &["D", "E", "C", "J", "B", "I", "A", "H"], circular: true },
     ];
     let mut t = Subtests::new("TestBuildOrderGenerator");
     for testcase in &test_cases {
@@ -220,6 +222,19 @@ impl BuildOrderTestCase {
             ));
         }
         verify_deps(&orchestrator, &build_order, false)?;
+        // Go: graph_test.go:123-125 (ts#64220)
+        let schedule_order: Vec<String> = orchestrator
+            .schedule_order()
+            .iter()
+            .map(|c| Self::project_name(c))
+            .collect();
+        if schedule_order != self.expected_schedule {
+            return Err(format!(
+                "assert.DeepEqual(scheduleOrder, b.expectedSchedule) failed: got {schedule_order:?}, want {:?}",
+                self.expected_schedule
+            ));
+        }
+        verify_deps(&orchestrator, &schedule_order, false)?;
 
         if !self.circular {
             for (project, project_deps) in deps {

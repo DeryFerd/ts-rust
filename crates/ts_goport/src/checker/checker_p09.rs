@@ -1244,6 +1244,7 @@ impl Checker {
                 args![type_string],
             );
         }
+        let mut import_attributes_type = TypeId::NIL;
         if options_type.is_some() {
             let import_call_options_type = self.get_global_import_call_options_type_checked();
             if import_call_options_type != self.empty_object_type {
@@ -1266,10 +1267,15 @@ impl Checker {
                     }
                 }
             }
+            import_attributes_type = self.get_type_of_property_of_type(options_type, "with");
         }
         // resolveExternalModuleName will return undefined if the moduleReferenceExpression is not a string literal
-        let module_symbol =
-            self.resolve_external_module_name(node, specifier, false /*ignoreErrors*/);
+        let module_symbol = self.resolve_external_module_name(
+            node,
+            specifier,
+            false, /*ignoreErrors*/
+            import_attributes_type,
+        );
         if module_symbol.is_some() {
             let es_module_symbol =
                 self.resolve_external_module_symbol(module_symbol, true /*dontResolveAlias*/);
@@ -1280,6 +1286,7 @@ impl Checker {
                     es_module_symbol,
                     module_symbol,
                     specifier,
+                    import_attributes_type,
                 );
                 if synthetic_type.is_nil() {
                     let es_module_type = self.get_type_of_symbol(es_module_symbol);

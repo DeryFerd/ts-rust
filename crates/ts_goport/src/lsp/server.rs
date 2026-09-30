@@ -596,6 +596,17 @@ const CONTENT_MAPPER_LINKED_EDITING_REGISTRATION_ID: &str = "content-mapper-link
 const CONTENT_MAPPER_CALL_HIERARCHY_REGISTRATION_ID: &str = "content-mapper-call-hierarchy";
 const CONTENT_MAPPER_WILL_RENAME_FILES_REGISTRATION_ID: &str = "content-mapper-will-rename-files";
 
+// Go: server.go:352 supportedCodeActionKinds (ts#63951)
+pub fn supported_code_action_kinds() -> Vec<lsproto::CodeActionKind> {
+    vec![
+        lsproto::CodeActionKind::QUICK_FIX,
+        lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS_TS,
+        lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS_TS,
+        lsproto::CodeActionKind::SOURCE_SORT_IMPORTS_TS,
+        lsproto::CodeActionKind::SOURCE_FIX_ALL_TS,
+    ]
+}
+
 impl Server {
     // Go: server.go:351 supportsContentMapperRegistration (tsgo#4712)
     pub fn supports_content_mapper_registration(&self, id: &str) -> bool {
@@ -1198,13 +1209,7 @@ impl project::Client for Server {
                 register_options: Some(lsproto::RegisterOptions {
                     text_document_code_action: Some(lsproto::CodeActionRegistrationOptions {
                         document_selector: selector.clone(),
-                        code_action_kinds: Some(vec![
-                            lsproto::CodeActionKind::QUICK_FIX,
-                            lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_SORT_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_FIX_ALL,
-                        ]),
+                        code_action_kinds: Some(supported_code_action_kinds()),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1440,13 +1445,13 @@ impl project::Client for Server {
         }
     }
 
-    // Go: server.go:776 GetLocale
+    // Go: server.go:780 GetLocale
     // GetLocale implements project.Client.
     fn get_locale(&self) -> locale::Locale {
         self.shared.locale()
     }
 
-    // Go: server.go:783 SetLocale
+    // Go: server.go:787 SetLocale
     // SetLocale implements project.Client.
     fn set_locale(&self, locale_string: &str) {
         let mut new_locale = self.shared.init_locale();
@@ -1461,7 +1466,7 @@ impl project::Client for Server {
     }
 }
 
-// Go: server.go:1900 generateDiagnosticDiffString
+// Go: server.go:1896 generateDiagnosticDiffString
 // PORT: Go `[]*lsproto.Diagnostic` are the borrowed results of
 // `lsproto::compare_diagnostics`.
 fn generate_diagnostic_diff_string(
@@ -1883,7 +1888,7 @@ impl ServerShared {
 }
 
 impl Server {
-    // Go: server.go:964 dispatchLoop
+    // Go: server.go:968 dispatchLoop
     pub fn dispatch_loop(self: &Rc<Self>, ctx: &Context) -> Result<(), GoError> {
         let (ctx, lsp_exit) = context::with_cancel_cause(ctx);
         // Go: defer lspExit(nil)
@@ -2025,7 +2030,7 @@ impl Server {
 pub const IDLE_QUIET_PERIOD: Duration = Duration::from_millis(50);
 
 impl ServerShared {
-    // Go: server.go:1025 writeLoop
+    // Go: server.go:1029 writeLoop
     // PORT: `w` is the writer, which this thread owns.
     pub fn write_loop(&self, ctx: &Context, w: &mut dyn Writer) -> Result<(), GoError> {
         loop {
@@ -2313,7 +2318,7 @@ impl Server {
     }
 }
 
-// Go: server.go:1194 contentMapperFallbackResponse (tsgo#4712)
+// Go: server.go:1198 contentMapperFallbackResponse (tsgo#4712)
 // contentMapperFallbackResponse returns an empty response for requests made for
 // unknown file types not handled by any content mapper. This typically serves a
 // short window in time between when the server has unregistered content mapper
@@ -2970,7 +2975,8 @@ impl ls::CrossProjectOrchestrator for CrossProjectOrchestrator {
                 ctx,
                 Some(requested_project_trees),
                 &mut |snapshot: &Rc<Snapshot>| {
-                    for p in snapshot.project_collection.projects() {
+                    // ts#64204
+                    for p in snapshot.project_collection.language_service_projects() {
                         if !yield_(p) {
                             return;
                         }
@@ -3076,7 +3082,7 @@ impl Server {
 }
 
 impl ServerShared {
-    // Go: server.go:1499 handleInitialize
+    // Go: server.go:1501 handleInitialize
     pub fn handle_initialize(
         self: &Arc<Self>,
         _ctx: &Context,
@@ -3155,7 +3161,8 @@ impl ServerShared {
 
         let response = lsproto::InitializeResult {
             server_info: Some(lsproto::ServerInfo {
-                name: "typescript-go".to_string(),
+                // microsoft/TypeScript 5f647a841a (the TS 7 migration)
+                name: "typescript".to_string(),
                 version: Some(crate::core::version().to_string()),
             }),
             capabilities: Some(lsproto::ServerCapabilities {
@@ -3299,13 +3306,7 @@ impl ServerShared {
                 }),
                 code_action_provider: Some(lsproto::BooleanOrCodeActionOptions {
                     code_action_options: Some(lsproto::CodeActionOptions {
-                        code_action_kinds: Some(vec![
-                            lsproto::CodeActionKind::QUICK_FIX,
-                            lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_SORT_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_FIX_ALL,
-                        ]),
+                        code_action_kinds: Some(supported_code_action_kinds()),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -3359,7 +3360,7 @@ impl ServerShared {
 }
 
 impl Server {
-    // Go: server.go:1681 handleInitialized
+    // Go: server.go:1677 handleInitialized
     pub fn handle_initialized(
         self: &Rc<Self>,
         ctx: &Context,
@@ -3680,7 +3681,7 @@ impl Server {
         Ok(())
     }
 
-    // Go: server.go:1853 handleDocumentDiagnostic
+    // Go: server.go:1849 handleDocumentDiagnostic
     pub fn handle_document_diagnostic(
         self: &Rc<Self>,
         ctx: &Context,
@@ -3853,8 +3854,8 @@ impl Server {
             }
             let rename_files_params = lsproto::RenameFilesParams {
                 files: vec![lsproto::FileRename {
-                    old_uri: lsconv::file_name_to_document_uri(&info.file_to_rename).0,
-                    new_uri: lsconv::file_name_to_document_uri(&info.new_file_name).0,
+                    old_uri: lsconv::file_name_to_document_uri(&info.file_to_rename),
+                    new_uri: lsconv::file_name_to_document_uri(&info.new_file_name),
                 }],
             };
             return self.handle_will_rename_files_worker(
@@ -3883,7 +3884,7 @@ impl Server {
         )
     }
 
-    // Go: server.go:1972 handleWillRenameFilesWorker
+    // Go: server.go:1968 handleWillRenameFilesWorker
     // If `sendRenameFile` is true, the original `willRenameFiles` request is being handled as part of a rename operation
     // where the client doesn't support `willRenameFiles`,
     // so we should include the file rename in the edits we return
@@ -3900,7 +3901,7 @@ impl Server {
 
         let mut uris: Vec<lsproto::DocumentUri> = Vec::with_capacity(params.files.len());
         for file in &params.files {
-            uris.push(lsproto::DocumentUri(file.old_uri.clone()));
+            uris.push(file.old_uri.clone());
         }
 
         if uris.is_empty() {
@@ -3924,11 +3925,8 @@ impl Server {
             // current while it runs (ls::LanguageService::enter_program).
             let _program = language_service.enter_program();
             for file in &params.files {
-                let changes = language_service.get_edits_for_file_rename(
-                    ctx,
-                    &lsproto::DocumentUri(file.old_uri.clone()),
-                    &lsproto::DocumentUri(file.new_uri.clone()),
-                );
+                let changes =
+                    language_service.get_edits_for_file_rename(ctx, &file.old_uri, &file.new_uri);
                 for change in changes {
                     if let Some(rename_file) = &change.rename_file {
                         if !seen_renames.contains(&rename_file.old_uri) {
@@ -3975,8 +3973,8 @@ impl Server {
                     lsproto::TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile {
                         rename_file: Some(lsproto::RenameFile {
                             kind: lsproto::StringLiteralRename,
-                            old_uri: lsproto::DocumentUri(file.old_uri.clone()),
-                            new_uri: lsproto::DocumentUri(file.new_uri.clone()),
+                            old_uri: file.old_uri.clone(),
+                            new_uri: file.new_uri.clone(),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -4115,7 +4113,7 @@ impl Server {
         )
     }
 
-    // Go: server.go:2120 handleCompletionItemResolve
+    // Go: server.go:2116 handleCompletionItemResolve
     pub fn handle_completion_item_resolve(
         self: &Rc<Self>,
         ctx: &Context,
@@ -4194,7 +4192,7 @@ impl Server {
         )
     }
 
-    // Go: server.go:2160 handleWorkspaceSymbol
+    // Go: server.go:2156 handleWorkspaceSymbol
     pub fn handle_workspace_symbol(
         self: &Rc<Self>,
         ctx: &Context,
@@ -4234,9 +4232,9 @@ impl Server {
         {
             let uri = &text_document.uri;
             session.with_snapshot_for_document(ctx, uri, &mut |snapshot: &Rc<Snapshot>| {
-                // Go: core.Map(snapshot.GetProjectsContainingFile(uri), ls.Project.GetProgram)
+                // Go: core.Map(snapshot.GetLanguageServiceProjectsContainingFile(uri), ls.Project.GetProgram) (ts#64204)
                 let programs: Vec<Rc<compiler::NewProgram>> = snapshot
-                    .get_projects_containing_file(uri)
+                    .get_language_service_projects_containing_file(uri)
                     .iter()
                     .map(|p| p.get_program())
                     .collect();
@@ -4246,10 +4244,10 @@ impl Server {
             session.with_snapshot_loading_project_tree(ctx, None, &mut |snapshot: &Rc<
                 Snapshot,
             >| {
-                // Go: core.Map(snapshot.ProjectCollection.Projects(), (*project.Project).GetProgram)
+                // Go: core.Map(snapshot.ProjectCollection.LanguageServiceProjects(), (*project.Project).GetProgram) (ts#64204)
                 let programs: Vec<Rc<compiler::NewProgram>> = snapshot
                     .project_collection
-                    .projects()
+                    .language_service_projects()
                     .iter()
                     .map(|p| {
                         p.borrow()
@@ -4473,7 +4471,8 @@ impl Server {
             *self.api_sessions.borrow_mut() = Some(FxHashMap::default());
         }
 
-        let api_session = api::new_session(self.session_ref(), None);
+        // ts#64163
+        let api_session = api::new_lsp_session(self.session_ref(), None);
 
         // Use provided pipe path or generate a unique one
         let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
@@ -4520,6 +4519,8 @@ impl Server {
                         // Run the connection with panic recovery
                         let result = catch_unwind(AssertUnwindSafe(|| {
                             let conn = ipc::new_async_conn(rwc.clone(), api_session.clone());
+                            // ts#64299
+                            api_session.set_connection(conn.clone());
                             if let Err(api_err) = conn.run(&api_ctx) {
                                 s.logger.errorf(&format!(
                                     "API session {}: {}",
@@ -4612,7 +4613,7 @@ impl ata::NpmExecutor for Server {
 }
 
 impl Server {
-    // Go: server.go:2380 contentMapperSpawner (tsgo#4712)
+    // Go: server.go:2377 contentMapperSpawner (tsgo#4712)
     // contentMapperSpawner adapts the server's spawn callback to a content mapper spawner, or returns nil when
     // the server cannot spawn processes.
     pub fn content_mapper_spawner(&self) -> Option<Rc<dyn contentmapper::Spawner>> {
@@ -4624,7 +4625,7 @@ impl Server {
         ))))
     }
 
-    // Go: server.go:2387 contentMapperLogger (tsgo#4712)
+    // Go: server.go:2384 contentMapperLogger (tsgo#4712)
     pub fn content_mapper_logger(&self) -> contentmapper::Logger {
         let logger = self.logger.clone();
         Arc::new(move |message: &str| {
@@ -4730,12 +4731,12 @@ impl Server {
         let mut config_file_path = String::new();
         let default_project = default_project.borrow();
         if default_project.kind == project::Kind::CONFIGURED {
-            config_file_path = default_project.name();
+            config_file_path = default_project.config_file_name();
         }
         Ok(Some(lsproto::ProjectInfoResult { config_file_path }))
     }
 
-    // Go: server.go:2454 handleSetContentMapperContributions (tsgo#4712)
+    // Go: server.go:2451 handleSetContentMapperContributions (tsgo#4712)
     pub fn handle_set_content_mapper_contributions(
         self: &Rc<Self>,
         ctx: &Context,
@@ -4755,7 +4756,7 @@ impl Server {
     }
 }
 
-// Go: server.go:2464 parseContentMapperContributions (tsgo#4712)
+// Go: server.go:2461 parseContentMapperContributions (tsgo#4712)
 // PORT: Go `[]*lsproto.ContentMapperContribution` may hold nil entries; the
 // Rust list cannot, so only the empty `contributorId` check remains. Go
 // `json.Marshal` of the options map (`LSPObject`) writes the keys in Go map
@@ -4809,7 +4810,12 @@ pub fn parse_content_mapper_contributions(
             }
         }
         for extension in &valid_extensions {
-            if !claimed_extensions.insert(extension.clone()) {
+            // ts#63936: Go `strings.ToLower` (rune by rune).
+            let lowered: String = extension
+                .chars()
+                .map(crate::gostd::unicode::to_lower)
+                .collect();
+            if !claimed_extensions.insert(lowered) {
                 return Err(errors::new(format!(
                     "content mapper contributions both claim extension {}",
                     gostd::strconv::quote(extension)
@@ -4868,8 +4874,14 @@ pub fn is_valid_contributed_content_mapper_extension(extension: &str) -> bool {
     {
         return false;
     }
+    // ts#63936: Go `strings.EqualFold`.
     !tspath::ALL_SUPPORTED_EXTENSIONS_WITH_JSON
         .iter()
         .flat_map(|group| group.iter())
-        .any(|supported| *supported == extension)
+        .any(|native_extension| {
+            crate::frontend::stringutil_ls::equate_string_case_insensitive(
+                native_extension,
+                extension,
+            )
+        })
 }

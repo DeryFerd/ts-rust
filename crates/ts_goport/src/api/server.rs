@@ -118,7 +118,8 @@ impl StdioServer {
             callback_fs = Some(cfs);
         }
 
-        let project_session = project::new_session(&project::SessionInit {
+        // ts#64163
+        let session_init = project::SessionInit {
             background_ctx: ctx.clone(),
             logger: None, // TODO: Add logging support
             fs,
@@ -143,10 +144,10 @@ impl StdioServer {
             content_mapper_logger: None,
             parse_cache: None,
             content_mapped_parse_cache: None,
-        });
+        };
 
-        let session = new_session(
-            project_session,
+        let session = new_standalone_session(
+            &session_init,
             Some(&SessionOptions {
                 use_binary_responses: !self.options.async_, // Only msgpack uses binary responses
             }),
@@ -187,7 +188,18 @@ impl StdioServer {
         if let Some(callback_fs) = &callback_fs {
             callback_fs.set_connection(ctx, conn.clone());
         }
+        // ts#64299
+        session.set_connection(conn.clone());
 
-        conn.run(ctx)
+        // ts#64276
+        server_run_error(ctx, conn.run(ctx))
     }
+}
+
+// Go: server.go serverRunError (ts#64276)
+fn server_run_error(ctx: &Context, err: Result<(), GoError>) -> Result<(), GoError> {
+    if ctx.err().is_some() {
+        return Ok(());
+    }
+    err
 }

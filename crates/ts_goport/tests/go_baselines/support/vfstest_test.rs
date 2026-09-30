@@ -648,15 +648,7 @@ fn test_stress() {
             fs.realpath("/foo/bar/baz.txt");
         },
         |fs: &IoVfs| {
-            let _ = fs.walk_dir(
-                "/",
-                &mut |_path: &str, d: Option<&DirEntry>, err: Option<FsError>| {
-                    if let Some(err) = err {
-                        return Err(err);
-                    }
-                    d.expect("walk entry").info().map(|_| ())
-                },
-            );
+            fs.stat("/foo/bar/baz.txt");
         },
     ];
 
@@ -1214,63 +1206,6 @@ fn test_iofs() {
         let entries = fs.get_accessible_entries("/");
         assert_eq!(entries.directories, ["dir1", "dir2"]);
         assert_eq!(entries.files, ["foo.ts"]);
-    }
-
-    // t.Run("WalkDir")
-    {
-        let mut files: Vec<String> = Vec::new();
-        let result = fs.walk_dir(
-            "/",
-            &mut |path: &str, d: Option<&DirEntry>, err: Option<FsError>| {
-                if let Some(err) = err {
-                    return Err(err);
-                }
-                if !d.expect("walk entry").is_dir() {
-                    files.push(path.to_string());
-                }
-                Ok(())
-            },
-        );
-        assert_nil_error(result);
-
-        files.sort();
-
-        assert_eq!(
-            files,
-            [
-                "/dir1/file1.ts",
-                "/dir1/file2.ts",
-                "/dir2/file1.ts",
-                "/foo.ts"
-            ]
-        );
-    }
-
-    // t.Run("WalkDirSkip")
-    {
-        let mut files: Vec<String> = Vec::new();
-        let result = fs.walk_dir(
-            "/",
-            &mut |path: &str, d: Option<&DirEntry>, err: Option<FsError>| {
-                if let Some(err) = err {
-                    return Err(err);
-                }
-                if !d.expect("walk entry").is_dir() {
-                    files.push(path.to_string());
-                }
-
-                if path == "/" {
-                    return Ok(());
-                }
-
-                Err(FsError::SkipDir)
-            },
-        );
-        assert_nil_error(result);
-
-        files.sort();
-
-        assert_eq!(files, ["/foo.ts"]);
     }
 
     // t.Run("Realpath")

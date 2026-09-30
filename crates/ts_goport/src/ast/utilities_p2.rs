@@ -1097,9 +1097,31 @@ pub fn is_ambient_module(node: Node) -> bool {
         && (node.name().kind() == SyntaxKind::StringLiteral || is_global_scope_augmentation(node))
 }
 
-// Go: ast/utilities.go:1637 IsAmbientModuleSymbolName
+// Go: ast/utilities.go:1662 IsAmbientModuleSymbolName
 pub fn is_ambient_module_symbol_name(s: &str) -> bool {
-    s.starts_with('"') && s.ends_with('"')
+    try_get_ambient_module_name_from_symbol_name(s).is_some()
+}
+
+// Go: ast/utilities.go:1669 TryGetAmbientModuleNameFromSymbolName (ts#63931)
+// Ambient module symbols are either of the form `"modulename"` or `InternalSymbolNamePrefix + "\"modulename\"pattern@nodeId"`;
+// see `getDeclarationName`.
+// PORT: `(string, bool)` returns `Option<&str>`. `s` is the port form of the
+// Go name (see `INTERNAL_SYMBOL_NAME_PREFIX`); the marker index is only
+// compared with 1, and the part before it is empty in both forms together.
+pub fn try_get_ambient_module_name_from_symbol_name(s: &str) -> Option<&str> {
+    if s.starts_with('"') && s.ends_with('"') {
+        return Some(&s[1..s.len() - 1]);
+    }
+
+    // patternPrefix := InternalSymbolNamePrefix + "\""
+    let rest = s
+        .strip_prefix(INTERNAL_SYMBOL_NAME_PREFIX)?
+        .strip_prefix('"')?;
+    let marker_index = rest.rfind("\"pattern@")?;
+    if marker_index < 1 {
+        return None;
+    }
+    Some(&rest[..marker_index])
 }
 
 // Go: ast/utilities.go:1641 IsExternalModule
@@ -1199,7 +1221,7 @@ pub fn get_heritage_elements(node: Node, kind: SyntaxKind) -> Vec<Node> {
     Vec::new()
 }
 
-// Go: ast/utilities.go:1739 GetHeritageClauseElementName
+// Go: ast/utilities.go:1759 GetHeritageClauseElementName
 /// GetHeritageClauseElementName returns the expression or type name of a heritage clause element.
 pub fn get_heritage_clause_element_name(node: Node) -> Node {
     if is_type_reference_node(node) {
@@ -1208,7 +1230,7 @@ pub fn get_heritage_clause_element_name(node: Node) -> Node {
     node.expression()
 }
 
-// Go: ast/utilities.go:1746 IsNameOfHeritageClauseTypeReference
+// Go: ast/utilities.go:1766 IsNameOfHeritageClauseTypeReference
 pub fn is_name_of_heritage_clause_type_reference(mut node: Node) -> bool {
     while is_qualified_name(node.parent()) {
         node = node.parent();

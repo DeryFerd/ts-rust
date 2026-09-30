@@ -16,9 +16,7 @@
 
 use crate::api::encoder::prelude::*;
 
-use crate::ast::source_file_ls::{
-    SourceFileDataKey, get_or_compute_source_file_data, new_source_file_data_key,
-};
+use crate::ast::source_file_ls::{SourceFileDataKey, new_source_file_data_key};
 use crate::frontend::core_binarysearch::binary_search_unique_func;
 use crate::frontend::parser::{ExternalModuleIndicatorOptions, ParsedSourceFile};
 use std::borrow::Cow;
@@ -68,10 +66,16 @@ pub const HEADER_OFFSET_STRING_DATA: usize = 28;
 pub const HEADER_OFFSET_EXTENDED_DATA: usize = 32;
 pub const HEADER_OFFSET_STRUCTURED_DATA: usize = 36;
 pub const HEADER_OFFSET_NODES: usize = 40;
-pub const HEADER_SIZE: usize = 44;
+// ts#64434: source file ID and lease ID (uint64 each) and the binder data
+// offset.
+pub const HEADER_OFFSET_SOURCE_FILE_ID: usize = 44;
+pub const HEADER_OFFSET_SOURCE_FILE_LEASE: usize = 52;
+pub const HEADER_OFFSET_BINDER_DATA: usize = 60;
+pub const HEADER_SIZE: usize = 64;
 
 // Go: api/encoder/encoder.go:66 ProtocolVersion
-pub const PROTOCOL_VERSION: u8 = 7;
+// ts#63957: 7 -> 8. ts#64434: 8 -> 9.
+pub const PROTOCOL_VERSION: u8 = 9;
 
 // Source File Binary Format
 // =========================
@@ -86,14 +90,14 @@ pub const PROTOCOL_VERSION: u8 = 7;
 //
 // | Section            | Length             | Description                                                                                     |
 // | ------------------ | ------------------ | ----------------------------------------------------------------------------------------------- |
-// | Header             | 44 bytes           | Contains the content hash, parse options, flags, and byte offsets to the start of each section. |
+// | Header             | 64 bytes           | Contains the content hash, parse options, flags, file metadata, and byte offsets to the start of each section. |
 // | String offsets     | 8 bytes per string | Pairs of starting byte offsets and ending byte offsets into the **string data** section.        |
 // | String data        | variable           | UTF-8 encoded string data.                                                                      |
 // | Extended node data | variable           | Extra data for some kinds of nodes.                                                             |
 // | Structured data    | variable           | Msgpack-encoded metadata blobs (e.g. file references).                                         |
 // | Nodes              | 28 bytes per node  | Defines the AST structure of the file, with references to strings and extended data.            |
 //
-// Header (44 bytes)
+// Header (64 bytes)
 // -----------------
 //
 // The header contains the following fields:
@@ -109,6 +113,9 @@ pub const PROTOCOL_VERSION: u8 = 7;
 // | 32-35       | uint32    | Byte offset to extended node data section         |
 // | 36-39       | uint32    | Byte offset to structured data section            |
 // | 40-43       | uint32    | Byte offset to nodes section                      |
+// | 44-51       | uint64    | Source file ID (0 = none)                          |
+// | 52-59       | uint64    | Source file lease ID (0 = none)                    |
+// | 60-63       | uint32    | Byte offset to binder data (0 = none)              |
 //
 // String offsets (8 bytes per string)
 // -----------------------------------
@@ -209,7 +216,8 @@ pub const PROTOCOL_VERSION: u8 = 7;
 // NodeLists are represented as normal nodes with the special `kind` value `0xff_ff_ff_ff`. They are considered the parent
 // of their contents in the encoded format. A client reconstructing an AST similar to TypeScript's internal representation
 // should instead set the `parent` pointers of a NodeList's children to the NodeList's parent. A NodeList's `data` field
-// is the uint32 length of the list, and does not use one of the data types described below.
+// is the uint32 length of the list, and does not use one of the data types described below. A NodeList's `flags` field
+// is not used for AST node flags (NodeLists have none); bit 0 instead encodes `HasTrailingComma`.
 //
 // For node types other than NodeList, the node data field encodes one of the following, determined by the first 2 bits of
 // the field:
@@ -332,14 +340,28 @@ struct Uint128 {
 // So the test is "a program made here has this file"
 // (`program_parsed_source_file`), not "some parse of this file exists"
 // (`parsed_source_file_of`, which also finds that root config).
+// At pin N a file of no program can also come from the parse cache:
+// api/session.go createSourceFile (ts#64434) takes its file from the
+// snapshot host's parse cache, so its Go `Hash` is `fh.Hash()`, and a
+// program that has the same file shares it (the client keeps one object per
+// content hash). Such a file keeps the hash that the parse cache recorded
+// for its text (`recorded_source_file_hash`); the root config has none.
 fn source_file_content_hash(source_file: Node) -> Uint128 {
     if source_file.is_nil() || is_synthetic_node(source_file) {
         return Uint128::default();
     }
-    let Some(parsed) = crate::program::ls_program::program_parsed_source_file(source_file) else {
-        return Uint128::default();
+    let h = match crate::program::ls_program::program_parsed_source_file(source_file) {
+        Some(parsed) => crate::project::parsecache::source_file_hash(parsed.text),
+        None => {
+            let recorded = parsed_source_file_of(source_file).and_then(|parsed| {
+                crate::project::parsecache::recorded_source_file_hash(parsed.text)
+            });
+            let Some(h) = recorded else {
+                return Uint128::default();
+            };
+            h
+        }
     };
-    let h = crate::project::parsecache::source_file_hash(parsed.text);
     Uint128 {
         hi: (h >> 64) as u64,
         lo: h as u64,
@@ -621,7 +643,11 @@ pub fn build_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
 
 // Go: api/encoder/encoder.go:390 GetNodeIndexTable
 pub fn get_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
-    get_or_compute_source_file_data(source_file, &*NODE_INDEX_TABLE_KEY, build_node_index_table)
+    crate::ast::source_file_ls::source_file_get_or_compute_data(
+        source_file,
+        &*NODE_INDEX_TABLE_KEY,
+        build_node_index_table,
+    )
 }
 
 // Go: api/encoder/encoder.go:396 EncodeSourceFile
@@ -629,9 +655,19 @@ pub fn get_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
 /// Returns the encoded bytes and a NodeIndexTable mapping encoder indices to AST nodes.
 pub fn encode_source_file(source_file: Node) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
     let (data, node_table) = encode_tree(source_file, source_file)?;
-    let node_table =
-        get_or_compute_source_file_data(source_file, &*NODE_INDEX_TABLE_KEY, |_: Node| node_table);
+    let node_table = crate::ast::source_file_ls::source_file_get_or_compute_data(
+        source_file,
+        &*NODE_INDEX_TABLE_KEY,
+        |_: Node| node_table,
+    );
     Ok((data, node_table))
+}
+
+// Go: api/encoder/encoder.go SetSourceFileLease (ts#64434)
+/// SetSourceFileLease sets the session-scoped lease ID in an encoded source file.
+pub fn set_source_file_lease(data: &mut [u8], lease: u64) {
+    data[HEADER_OFFSET_SOURCE_FILE_LEASE..HEADER_OFFSET_SOURCE_FILE_LEASE + 8]
+        .copy_from_slice(&lease.to_le_bytes());
 }
 
 // Go: api/encoder/encoder.go:411 EncodeNode
@@ -778,7 +814,8 @@ fn encode_tree(
                     0,
                     st.parent_index,
                     node_list.nodes().len() as u32,
-                    0,
+                    // ts#63957
+                    u32::from(bool_to_byte(node_list.has_trailing_comma())),
                 ];
                 append_uint32s(&mut st.nodes, &values);
 
@@ -996,7 +1033,7 @@ fn encode_tree(
     let offset_structured_data = offset_extended_data + extended_data.len();
     let offset_nodes = offset_structured_data + structured_data.len();
 
-    let header: [u32; 11] = [
+    let header: [u32; 16] = [
         metadata,
         hash.lo as u32,
         (hash.lo >> 32) as u32,
@@ -1008,6 +1045,12 @@ fn encode_tree(
         offset_extended_data as u32,
         offset_structured_data as u32,
         offset_nodes as u32,
+        // ts#64434
+        0,
+        0, // source file ID
+        0,
+        0, // source file lease ID
+        0, // binder data offset
     ];
 
     let mut header_bytes: Vec<u8> = Vec::new();

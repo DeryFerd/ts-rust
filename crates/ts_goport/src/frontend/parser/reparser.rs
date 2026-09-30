@@ -187,6 +187,10 @@ impl Parser {
 
     // Go: parser/reparser.go:41 checkNonIdentifierName
     fn check_non_identifier_name(&mut self, name: Node) -> Node {
+        // Handles the case of anonymous functions
+        if name.is_nil() {
+            return Node::NIL;
+        }
         if is_identifier(name) && !is_valid_identifier(name.text()) {
             let mut err_loc = name.loc();
             if err_loc.len() == 0 {
@@ -1154,6 +1158,7 @@ impl Parser {
             modifiers,
             SyntaxKind::NamespaceKeyword,
             name,
+            Node::NIL,
             block,
         );
         self.finish_reparsed_node(result, full_name);

@@ -16,15 +16,18 @@ pub struct ProjectCollection {
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     // PORT: nil in the collection that NewSnapshot makes.
     pub config_file_registry: Option<Rc<ConfigFileRegistry>>,
-    // fileDefaultProjects is a map of file paths to the config file path (the key
-    // into `configuredProjects`) of the default project for that file. If the file
-    // belongs to the inferred project, the value is `inferredProjectName`. This map
+    // fileDefaultProjects is a map of file paths to the ID of the default project
+    // for that file. This map
     // contains quick lookups for only the associations discovered during the latest
     // snapshot update.
-    pub file_default_projects: FxHashMap<tspath::Path, tspath::Path>,
+    // ts#64319: the values are project IDs.
+    pub file_default_projects: FxHashMap<tspath::Path, ID>,
     // configuredProjects is the set of loaded projects associated with a tsconfig
     // file, keyed by the config file path.
-    pub configured_projects: FxHashMap<tspath::Path, Rc<RefCell<Project>>>,
+    pub configured_projects: FxHashMap<ConfiguredProjectID, Rc<RefCell<Project>>>,
+    // syntheticProjects contains synthetic projects created explicitly through the API.
+    // ts#64204
+    pub synthetic_projects: FxHashMap<SyntheticProjectID, Rc<RefCell<Project>>>,
     // openFiles is the set of open file paths associated with the snapshot that owns
     // this project collection.
     pub open_files: FxHashSet<tspath::Path>,
@@ -37,7 +40,7 @@ pub struct ProjectCollection {
 
     // PORT: Go `openConfiguredProjectsOnce sync.Once` and
     // `openConfiguredProjects *collections.Set[tspath.Path]` are one `OnceCell`.
-    pub open_configured_projects: OnceCell<Rc<FxHashSet<tspath::Path>>>,
+    pub open_configured_projects: OnceCell<Rc<FxHashSet<ConfiguredProjectID>>>,
 }
 
 // Go: project/projectcollection.go:44 APIState
@@ -51,8 +54,7 @@ pub struct ProjectCollection {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct APIState {
     // openProjects is the ref-counted set of projects to keep open for API
-    // clients, keyed by config file path. The value is the number of outstanding
-    // API opens.
+    // clients, keyed by config file path.
     pub open_projects: IndexMap<tspath::Path, i32>,
     // openFiles is the ref-counted set of files to keep open for API clients,
     // keyed by file path. Files with no configured project are loaded into the
@@ -68,11 +70,6 @@ pub struct APIOpenedFile {
     pub ref_count: i32,
 }
 
-/// Go `tspath.Path(inferredProjectName)`.
-fn inferred_project_path() -> tspath::Path {
-    tspath::Path(INFERRED_PROJECT_NAME.to_string())
-}
-
 impl ProjectCollection {
     // Go: project/projectcollection.go:40 ConfigFileRegistry
     pub fn config_file_registry(&self) -> Option<Rc<ConfigFileRegistry>> {
@@ -81,19 +78,24 @@ impl ProjectCollection {
 
     // Go: project/projectcollection.go:42 ConfiguredProject
     pub fn configured_project(&self, path: &tspath::Path) -> Option<Rc<RefCell<Project>>> {
-        self.configured_projects.get(path).cloned()
+        self.configured_projects
+            .get(&ConfiguredProjectID(path.clone()))
+            .cloned()
     }
 
-    // Go: project/projectcollection.go:46 GetProjectByPath
-    pub fn get_project_by_path(&self, project_path: &tspath::Path) -> Option<Rc<RefCell<Project>>> {
-        if let Some(project) = self.configured_projects.get(project_path) {
-            return Some(project.clone());
-        }
-
-        if project_path.as_str() == INFERRED_PROJECT_NAME {
+    // Go: project/projectcollection.go:78 GetProject (ts#64319: was GetProjectByPath)
+    pub fn get_project(&self, id: &ID) -> Option<Rc<RefCell<Project>>> {
+        if id.inferred().1 {
             return self.inferred_project.clone();
         }
-
+        let (synthetic_id, ok) = id.synthetic();
+        if ok {
+            return self.synthetic_projects.get(&synthetic_id).cloned();
+        }
+        let (configured_id, ok) = id.configured();
+        if ok {
+            return self.configured_projects.get(&configured_id).cloned();
+        }
         None
     }
 
@@ -111,43 +113,78 @@ impl ProjectCollection {
             projects.push(p.clone());
         }
         gostd::slices::sort_func(projects, |a, b| {
-            // Go: cmp.Compare(a.Name(), b.Name())
-            a.borrow().name().cmp(&b.borrow().name()) as i32
+            // Go: cmp.Compare(a.ID(), b.ID()) (ts#64319)
+            a.borrow().id().cmp(&b.borrow().id()) as i32
         });
     }
 
-    // Go: project/projectcollection.go:76 ProjectsByPath
-    // ProjectsByPath returns an ordered map of configured projects keyed by their config file path,
-    // plus the inferred project, if it exists, with the key `inferredProjectName`.
+    // Go: project/projectcollection.go:111 SyntheticProjects (ts#64204)
+    // SyntheticProjects returns all synthetic projects in a stable order.
+    pub fn synthetic_projects(&self) -> Vec<Rc<RefCell<Project>>> {
+        let mut projects: Vec<Rc<RefCell<Project>>> =
+            Vec::with_capacity(self.synthetic_projects.len());
+        for project in self.synthetic_projects.values() {
+            projects.push(project.clone());
+        }
+        gostd::slices::sort_func(&mut projects, |a, b| {
+            // Go: cmp.Compare(a.ID(), b.ID()) (ts#64319)
+            a.borrow().id().cmp(&b.borrow().id()) as i32
+        });
+        projects
+    }
+
+    // Go: project/projectcollection.go:119 ProjectsByID (ts#64319: was ProjectsByPath)
+    // ProjectsByID returns all projects keyed by project ID in stable order.
     // PORT: Go `*collections.OrderedMap` is an owned `IndexMap`.
-    pub fn projects_by_path(&self) -> IndexMap<tspath::Path, Rc<RefCell<Project>>> {
-        let mut projects: IndexMap<tspath::Path, Rc<RefCell<Project>>> = IndexMap::with_capacity(
+    pub fn projects_by_id(&self) -> IndexMap<ID, Rc<RefCell<Project>>> {
+        let mut projects: IndexMap<ID, Rc<RefCell<Project>>> = IndexMap::with_capacity(
             self.configured_projects.len()
-                + if self.inferred_project.is_some() {
-                    1
-                } else {
-                    0
-                },
+                + self.synthetic_projects.len()
+                + usize::from(self.inferred_project.is_some()),
         );
         for project in self.configured_projects() {
-            let config_file_path = project.borrow().config_file_path.clone();
-            projects.insert(config_file_path, project);
+            let id = project.borrow().id();
+            projects.insert(id, project);
+        }
+        for project in self.synthetic_projects() {
+            let id = project.borrow().id();
+            projects.insert(id, project);
         }
         if let Some(inferred_project) = &self.inferred_project {
-            projects.insert(inferred_project_path(), inferred_project.clone());
+            let id = inferred_project.borrow().id();
+            projects.insert(id, inferred_project.clone());
         }
         projects
     }
 
-    // Go: project/projectcollection.go:90 Projects
-    // Projects returns all projects, including the inferred project if it exists, in a stable order.
+    // Go: project/projectcollection.go:141 Projects
+    // Projects returns all configured, synthetic, and inferred projects in a stable order.
     pub fn projects(&self) -> Vec<Rc<RefCell<Project>>> {
-        let Some(inferred_project) = &self.inferred_project else {
-            return self.configured_projects();
-        };
-        let mut projects = Vec::with_capacity(self.configured_projects.len() + 1);
+        let mut projects = Vec::with_capacity(
+            self.configured_projects.len()
+                + self.synthetic_projects.len()
+                + usize::from(self.inferred_project.is_some()),
+        );
         self.fill_configured_projects(&mut projects);
-        projects.push(inferred_project.clone());
+        projects.extend(self.synthetic_projects());
+        if let Some(inferred_project) = &self.inferred_project {
+            projects.push(inferred_project.clone());
+        }
+        projects
+    }
+
+    // Go: project/projectcollection.go:151 LanguageServiceProjects (ts#64204)
+    // LanguageServiceProjects returns configured and inferred projects in stable order.
+    // Synthetic projects are accessed explicitly through the API and do not participate
+    // in cross-project language service operations.
+    pub fn language_service_projects(&self) -> Vec<Rc<RefCell<Project>>> {
+        let mut projects = Vec::with_capacity(
+            self.configured_projects.len() + usize::from(self.inferred_project.is_some()),
+        );
+        self.fill_configured_projects(&mut projects);
+        if let Some(inferred_project) = &self.inferred_project {
+            projects.push(inferred_project.clone());
+        }
         projects
     }
 
@@ -156,11 +193,17 @@ impl ProjectCollection {
         self.inferred_project.clone()
     }
 
-    // Go: project/projectcollection.go:104 GetProjectsContainingFile
+    // Go: project/projectcollection.go:167 GetLanguageServiceProjectsContainingFile
+    // GetLanguageServiceProjectsContainingFile does not consider synthetic projects
+    // (ones created by API via createProgram)
     // PORT: Go `ls.Project` values are `Rc<dyn ls::Project>`; the project
     // handle `Rc<RefCell<Project>>` coerces (project.rs implements
     // `ls::Project` for `RefCell<Project>`). A Go nil slice is empty.
-    pub fn get_projects_containing_file(&self, path: &tspath::Path) -> Vec<Rc<dyn ls::Project>> {
+    // ts#64204: was GetProjectsContainingFile.
+    pub fn get_language_service_projects_containing_file(
+        &self,
+        path: &tspath::Path,
+    ) -> Vec<Rc<dyn ls::Project>> {
         let mut projects: Vec<Rc<dyn ls::Project>> = Vec::new();
         for project in self.configured_projects() {
             if project.borrow().contains_file(path) {
@@ -177,10 +220,11 @@ impl ProjectCollection {
 
     // Go: project/projectcollection.go:118 GetOpenConfiguredProjects
     // GetOpenConfiguredProjects returns configured projects containing at least one open file.
-    pub fn get_open_configured_projects(&self) -> Rc<FxHashSet<tspath::Path>> {
+    // ts#64319: configured project IDs.
+    pub fn get_open_configured_projects(&self) -> Rc<FxHashSet<ConfiguredProjectID>> {
         self.open_configured_projects
             .get_or_init(|| {
-                let mut open_projects: FxHashSet<tspath::Path> =
+                let mut open_projects: FxHashSet<ConfiguredProjectID> =
                     FxHashSet::with_capacity_and_hasher(
                         self.configured_projects.len(),
                         Default::default(),
@@ -188,11 +232,10 @@ impl ProjectCollection {
                 // PORT: Go map order is random; FxHashSet order here. The
                 // result is a set, so the order does not show.
                 for path in &self.open_files {
-                    if let Some(project_path) = self.file_default_projects.get(path) {
-                        if project_path.as_str() != INFERRED_PROJECT_NAME
-                            && self.configured_projects.contains_key(project_path)
-                        {
-                            open_projects.insert(project_path.clone());
+                    if let Some(project_id) = self.file_default_projects.get(path) {
+                        let (configured_id, ok) = project_id.configured();
+                        if ok && self.configured_projects.contains_key(&configured_id) {
+                            open_projects.insert(configured_id);
                             continue;
                         }
                     }
@@ -200,7 +243,8 @@ impl ProjectCollection {
                     for project in self.configured_projects.values() {
                         let project = project.borrow();
                         if project.contains_file(path) {
-                            open_projects.insert(project.config_file_path.clone());
+                            let (configured_id, _) = project.id().configured();
+                            open_projects.insert(configured_id);
                         }
                     }
                 }
@@ -213,10 +257,11 @@ impl ProjectCollection {
     // !!! result could be cached
     pub fn get_default_project(&self, path: &tspath::Path) -> Option<Rc<RefCell<Project>>> {
         if let Some(result) = self.file_default_projects.get(path) {
-            if result.as_str() == INFERRED_PROJECT_NAME {
+            if result.inferred().1 {
                 return self.inferred_project.clone();
             }
-            return self.configured_projects.get(result).cloned();
+            let (configured_id, _) = result.configured();
+            return self.configured_projects.get(&configured_id).cloned();
         }
 
         let mut containing_projects: Vec<Rc<RefCell<Project>>> = Vec::new();
@@ -298,7 +343,10 @@ impl ProjectCollection {
     ) -> Option<Rc<RefCell<Project>>> {
         let mut fallback = fallback;
         let config_file_path = (self.to_path)(config_file_name);
-        let project = self.configured_projects.get(&config_file_path).cloned()?;
+        let project = self
+            .configured_projects
+            .get(&ConfiguredProjectID(config_file_path))
+            .cloned()?;
         let new_visited: RefCell<FxHashSet<usize>>;
         let visited = match visited {
             Some(visited) => visited,
@@ -321,7 +369,7 @@ impl ProjectCollection {
                     command_line.resolved_project_reference_paths(),
                     |config_file_name: &String| {
                         self.configured_projects
-                            .get(&(self.to_path)(config_file_name))
+                            .get(&ConfiguredProjectID((self.to_path)(config_file_name)))
                             .cloned()
                     },
                 )
@@ -391,6 +439,7 @@ impl ProjectCollection {
             to_path: self.to_path.clone(),
             config_file_registry: self.config_file_registry.clone(),
             configured_projects: self.configured_projects.clone(),
+            synthetic_projects: self.synthetic_projects.clone(),
             open_files: self.open_files.clone(),
             inferred_project: self.inferred_project.clone(),
             file_default_projects: self.file_default_projects.clone(),

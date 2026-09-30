@@ -6,6 +6,13 @@ use crate::prelude::*;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 
+// Go: checker/checker.go:29571 maxTemplateLiteralTypeLength, maxTemplateLiteralTypeSpans
+// Limits on the size of a template literal type produced by getTemplateLiteralType. Recursive instantiations
+// such as `Recur<any, `${S}_${S}`>` double the text (or the number of placeholders) on every iteration and
+// exhaust memory long before the tail recursion limit in getConditionalType is reached (see #63271).
+const MAX_TEMPLATE_LITERAL_TYPE_LENGTH: usize = 50_000_000;
+const MAX_TEMPLATE_LITERAL_TYPE_SPANS: usize = 100_000;
+
 impl Checker {
     // Go: checker/checker.go:28753 getTypeOfFirstParameterOfSignature
     pub fn get_type_of_first_parameter_of_signature(&mut self, signature: SignatureId) -> TypeId {
@@ -214,7 +221,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:28897 getTemplateLiteralType
+    // Go: checker/checker.go:29579 getTemplateLiteralType
     pub fn get_template_literal_type(&mut self, texts: &[String], types: &[TypeId]) -> TypeId {
         let union_index = types
             .iter()
@@ -250,8 +257,12 @@ impl Checker {
         let mut ends: SmallVec<[usize; 5]> = SmallVec::new();
         let mut buf = String::new();
         buf.push_str(&texts[0]);
+        let mut text_length = 0usize; // combined length of the segments already moved into newTexts
+        let mut too_large = false;
         // PORT: Go uses a recursive closure `addSpans` that captures `sb`,
-        // `newTypes` and `newTexts`. Here the captured state is passed explicitly.
+        // `newTypes`, `newTexts`, `textLength` and `tooLarge`. Here the
+        // captured state is passed explicitly. `text_length` is in Go bytes.
+        #[allow(clippy::too_many_arguments)]
         fn add_spans(
             c: &mut Checker,
             texts: &[String],
@@ -259,6 +270,8 @@ impl Checker {
             buf: &mut String,
             ends: &mut SmallVec<[usize; 5]>,
             new_types: &mut SmallVec<[TypeId; 4]>,
+            text_length: &mut usize,
+            too_large: &mut bool,
         ) -> bool {
             for (i, &t) in types.iter().enumerate() {
                 let flags = c.ty(t).flags;
@@ -271,21 +284,63 @@ impl Checker {
                         (tl.texts.clone(), tl.types.clone())
                     };
                     buf.push_str(&inner_texts[0]);
-                    if !add_spans(c, &inner_texts, &inner_types, buf, ends, new_types) {
+                    if !add_spans(
+                        c,
+                        &inner_texts,
+                        &inner_types,
+                        buf,
+                        ends,
+                        new_types,
+                        text_length,
+                        too_large,
+                    ) {
                         return false;
                     }
                     buf.push_str(&texts[i + 1]);
                 } else if c.is_generic_index_type(t) || c.is_pattern_literal_placeholder_type(t) {
                     new_types.push(t);
+                    // Go: `textLength += sb.Len()`, the Go bytes of the segment
+                    // before `CombineSurrogatePairs`.
+                    let sb_start = ends.last().copied().unwrap_or(0);
+                    *text_length += go_len(&buf[sb_start..]);
                     end_template_text(buf, ends);
                     buf.push_str(&texts[i + 1]);
                 } else {
                     return false;
                 }
+                // PORT: Go `sb.Len()` is the Go bytes of the tail of `buf`. The
+                // port form is never shorter than its Go bytes, so the exact
+                // count is only needed when the port form is over the limit.
+                let sb_start = ends.last().copied().unwrap_or(0);
+                if (*text_length + (buf.len() - sb_start) > MAX_TEMPLATE_LITERAL_TYPE_LENGTH
+                    && *text_length + go_len(&buf[sb_start..]) > MAX_TEMPLATE_LITERAL_TYPE_LENGTH)
+                    || new_types.len() > MAX_TEMPLATE_LITERAL_TYPE_SPANS
+                {
+                    *too_large = true;
+                    return false;
+                }
             }
             true
         }
-        if !add_spans(self, texts, types, &mut buf, &mut ends, &mut new_types) {
+        if !add_spans(
+            self,
+            texts,
+            types,
+            &mut buf,
+            &mut ends,
+            &mut new_types,
+            &mut text_length,
+            &mut too_large,
+        ) {
+            if too_large {
+                let current_node = self.current_node;
+                self.error(
+                    current_node,
+                    diag::Type_instantiation_is_excessively_deep_and_possibly_infinite,
+                    args![],
+                );
+                return self.error_type;
+            }
             return self.string_type;
         }
         // PORT: Go joins the texts by bytes. `go_value` gives the port form

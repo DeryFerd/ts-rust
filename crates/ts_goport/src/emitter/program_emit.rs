@@ -816,6 +816,8 @@ pub fn handle_no_emit_options(files: Option<&[Node]>) -> Option<EmitResult> {
             &mut get_semantic_diagnostics,
             &mut get_global_diagnostics,
             &mut get_declaration_diagnostics,
+            // ts#64452: Go `program.(*Program)` holds for the plain program.
+            true,
         );
         if diagnostics.is_empty() {
             return None; // NoEmitOnError is enabled, but no diagnostics were found, so we can proceed with emitting

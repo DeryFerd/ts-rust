@@ -33,9 +33,9 @@ use std::time::SystemTime;
 // PORT: concurrency. `ParsedCommandLine` and the frontend program are not
 // `Send`, so tasks are `Rc<RefCell<BuildTask>>` and run on one thread, the
 // orchestrator thread. It is the loading thread of every program of the
-// build. Go `done` and `reportDone` channels, `prevReporter`, and the
-// mutexes are dropped. `buildProject` is split where `compileAndEmit` has
-// made the program (`build_project_start`) and the rest
+// build. Go `done` and `built` channels and the mutexes are dropped.
+// `buildProject` is split where `compileAndEmit` has made the program
+// (`build_project_start`) and the rest
 // (`build_project_finish`). The orchestrator starts a task after its
 // upstream tasks are done, finishes it later, and calls `report` in
 // `order` (see orchestrator.rs). The work that Go does on the task
@@ -145,7 +145,7 @@ impl StatusPrefetch {
     }
 }
 
-// Go: tsc/diagnostics.go:26 DiagnosticReporter, bound to the task's writer.
+// Go: tsc/diagnostics.go:23 DiagnosticReporter, bound to the task's writer.
 // PORT: Go reporters capture `&t.result.builder` as their `io.Writer`. A
 // Rust closure cannot hold that borrow while the task also writes to the
 // builder, so the reporter takes the writer as its first argument. The
@@ -154,11 +154,13 @@ impl StatusPrefetch {
 pub type TaskDiagnosticReporter = Box<dyn Fn(&mut String, &Diagnostic)>;
 
 // Go: build/buildtask.go:44 taskResult
-// PORT: Go `program *incremental.Program` is `program` (`None` = nil). The
-// task keeps it until it reports, for `Testing.OnProgram`, and the
-// orchestrator releases it there (`release_task_program`), where Go drops
-// `t.result`. `has_changed_dts_file` is its `HasChangedDtsFile()` after the
-// emit, which `updateDownstream` reads. Go `*tsc.Statistics` is an `Option`
+// PORT: Go `program *incremental.Program` is `program` (`None` = nil). In
+// tests the task keeps it until it reports, for `Testing.OnProgram`, and
+// the orchestrator releases it there (`release_task_program`), where Go
+// drops `t.result`. Outside tests the orchestrator releases it when the
+// task is built, where Go sets it to nil (ts#64220).
+// `has_changed_dts_file` is its `HasChangedDtsFile()` after the emit,
+// which `updateDownstream` reads. Go `*tsc.Statistics` is an `Option`
 // (nil = `None`).
 pub struct TaskResult {
     pub builder: String,
@@ -193,7 +195,8 @@ impl TaskResult {
     }
 }
 
-/// Go drops `t.result` after `report`, and with it the task's program.
+/// Go drops the task's program when the task is built (outside tests) or
+/// `t.result` after `report`.
 /// This frees the checker pool and the frontend of the program. Its files
 /// stay published, so the diagnostics in `t.errors` can still be written.
 // PORT: Go frees the program in the background GC. The checker threads
@@ -212,9 +215,9 @@ pub trait BuildTaskOrchestrator {
     fn command(&self) -> &ParsedBuildCommandLine;
     // Go: `o.comparePathsOptions`
     fn compare_paths_options(&self) -> &ComparePathsOptions;
-    // Go: orchestrator.go:87 (*Orchestrator).relativeFileName
+    // Go: orchestrator.go:93 (*Orchestrator).relativeFileName
     fn relative_file_name(&self, file_name: &str) -> String;
-    // Go: orchestrator.go:91 (*Orchestrator).toPath
+    // Go: orchestrator.go:97 (*Orchestrator).toPath
     fn to_path(&self, file_name: &str) -> Path;
     // Go: `o.opts.Sys.Now()`
     fn now(&self) -> SystemTime;
@@ -298,6 +301,8 @@ struct PendingCompile {
     // Go `t.writeFile`, and the build info that it wrote.
     write_file: WriteFile,
     written_build_info: WrittenBuildInfo,
+    // The writes that wait for the orchestrator thread (`DeferredWrites`).
+    deferred_writes: Option<DeferredWrites>,
     // `incremental_program.start_emit` ran (see `compile_and_emit_start`).
     emit_started: bool,
 }
@@ -326,7 +331,7 @@ impl BuildTask {
         }
     }
 
-    // Go: build/buildtask.go:83 (*BuildTask).getContentMapperProject (tsgo#4712)
+    // Go: build/buildtask.go:82 (*BuildTask).getContentMapperProject (tsgo#4712)
     pub(crate) fn get_content_mapper_project(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
@@ -350,7 +355,7 @@ impl BuildTask {
         )
     }
 
-    // Go: build/buildtask.go:97 (*BuildTask).refreshContentMapperProject (tsgo#4712)
+    // Go: build/buildtask.go:96 (*BuildTask).refreshContentMapperProject (tsgo#4712)
     pub(crate) fn refresh_content_mapper_project(&mut self) {
         if let Some(project) = &self.content_mapper_project {
             self.content_mapper_project_err = project.refresh().err();
@@ -375,41 +380,43 @@ impl BuildTask {
         (result.report_status)(&mut result.builder, &diagnostic);
     }
 
-    // Go: build/buildtask.go:103 (*BuildTask).waitOnUpstream
+    // Go: build/buildtask.go:102 (*BuildTask).waitOnUpstream
     // PORT: no-op. The orchestrator starts a task only when its upstream
     // tasks are done (see top).
     pub fn wait_on_upstream(&self) {}
 
-    // Go: build/buildtask.go:109 (*BuildTask).unblockDownstream
+    // Go: build/buildtask.go:108 (*BuildTask).unblockDownstream
     pub fn unblock_downstream(&mut self) {
         self.pending = false;
         self.is_initial_cycle = false;
     }
 
-    // Go: build/buildtask.go:115 (*BuildTask).reportDiagnostic
+    // Go: build/buildtask.go:114 (*BuildTask).reportDiagnostic
     pub fn report_diagnostic(&mut self, err: Diagnostic) {
         self.errors.push(err.clone());
         let result = self.result_mut();
         (result.diagnostic_reporter)(&mut result.builder, &err);
     }
 
-    // Go: build/buildtask.go:120 (*BuildTask).report
-    // PORT: Go writes the buffered output to `Sys.Writer()` and merges into
-    // the orchestrator's `orchestratorResult`. That type belongs to the
+    // Go: build/buildtask.go:119 (*BuildTask).report
+    // PORT: the orchestrator calls it in `order` when the task is built
+    // (ts#64220: Go no longer waits for the previous task here). Go writes
+    // the buffered output to `Sys.Writer()` and merges into the
+    // orchestrator's `OrchestratorResult` (ts#64158). That type belongs to the
     // orchestrator, so this takes the task result and errors and returns
     // them; the orchestrator must, in build order:
-    //   - append `errors` to `buildResult.errors` when not empty,
+    //   - append `errors` to `buildResult.Errors` when not empty,
     //   - write `result.builder` to the writer,
-    //   - raise `buildResult.result.Status` to `result.exit_status` if higher,
-    //   - aggregate `result.statistics` into `buildResult.statistics` when set,
+    //   - raise `buildResult.Result.Status` to `result.exit_status` if higher,
+    //   - aggregate `result.statistics` into `buildResult.Statistics` when set,
     //   - count `result.build_kind` (ProjectsBuilt / TimestampUpdates),
-    //   - append `result.files_to_delete` to `buildResult.filesToDelete`.
+    //   - append `result.files_to_delete` to `buildResult.FilesToDelete`.
     pub fn report(&mut self) -> (TaskResult, Vec<Diagnostic>) {
         let result = self.result.take().expect("task result is set");
         (result, self.errors.clone())
     }
 
-    // Go: build/buildtask.go:150 (*BuildTask).buildProject, up to the
+    // Go: build/buildtask.go:145 (*BuildTask).buildProject, up to the
     // program that `compileAndEmit` makes (`compile_and_emit_start`).
     // PORT: Go runs up to `numRoutines` tasks at the same time, and a task
     // that runs beside others makes its program before they write their
@@ -457,7 +464,7 @@ impl BuildTask {
         false
     }
 
-    // Go: build/buildtask.go:150 (*BuildTask).buildProject, from the emit
+    // Go: build/buildtask.go:145 (*BuildTask).buildProject, from the emit
     // of `compileAndEmit` on (see `build_project_start`).
     pub fn build_project_finish(&mut self, orchestrator: &dyn BuildTaskOrchestrator, path: &Path) {
         self.compile_and_emit_finish(orchestrator);
@@ -465,7 +472,7 @@ impl BuildTask {
         self.unblock_downstream();
     }
 
-    // Go: build/buildtask.go:181 (*BuildTask).updateDownstream
+    // Go: build/buildtask.go:176 (*BuildTask).updateDownstream
     pub fn update_downstream(&mut self, orchestrator: &dyn BuildTaskOrchestrator, path: &Path) {
         if self.is_initial_cycle {
             return;
@@ -535,7 +542,7 @@ impl BuildTask {
         }
     }
 
-    // Go: build/buildtask.go:226 (*BuildTask).compileAndEmit, up to
+    // Go: build/buildtask.go:221 (*BuildTask).compileAndEmit, up to
     // `incremental.NewProgram` (see `build_project_start`). It returns
     // false when Go returns before the program (the content mapper project
     // failed): then there is nothing for `compile_and_emit_finish`.
@@ -570,7 +577,7 @@ impl BuildTask {
         let resolved = self.resolved().clone();
         let builder: Rc<RefCell<Vec<u8>>> = Rc::default();
         let writer: Writer = builder.clone();
-        // Go: build/buildtask.go:115 (*BuildTask).reportDiagnostic. The
+        // Go: build/buildtask.go:114 (*BuildTask).reportDiagnostic. The
         // diagnostics go to `t.errors` in `compile_and_emit_finish`.
         let errors: Rc<RefCell<Vec<Diagnostic>>> = Rc::default();
         let report_diagnostic: DiagnosticReporter = {
@@ -647,8 +654,10 @@ impl BuildTask {
         let program = crate::execute::execute_tsc::new_program_version(compiler_host, resolved);
         compile_times.borrow_mut().parse_time = elapsed(&*sys, parse_start);
         let written_build_info: WrittenBuildInfo = Arc::default();
+        let deferred_writes = (!sys.emit_writes_through_osvfs()).then(DeferredWrites::default);
         let write_file = new_task_write_file(
             written_build_info.clone(),
+            deferred_writes.clone(),
             self.store_output_time_stamp(orchestrator),
             host.m_times.clone(),
             orchestrator.compare_paths_options().clone(),
@@ -705,12 +714,13 @@ impl BuildTask {
             compile_times,
             write_file,
             written_build_info,
+            deferred_writes,
             emit_started,
         });
         true
     }
 
-    // Go: build/buildtask.go:226 (*BuildTask).compileAndEmit, from
+    // Go: build/buildtask.go:221 (*BuildTask).compileAndEmit, from
     // `EmitAndReportStatistics` on (see `compile_and_emit_start`).
     pub fn compile_and_emit_finish(&mut self, orchestrator: &dyn BuildTaskOrchestrator) {
         let PendingCompile {
@@ -723,12 +733,13 @@ impl BuildTask {
             compile_times,
             write_file,
             written_build_info,
+            deferred_writes,
             emit_started,
         } = self.compile.take().expect("compile_and_emit_start ran");
         let sys = orchestrator.sys();
         let host = orchestrator.host();
         let resolved = self.resolved().clone();
-        let (result, statistics) = {
+        let (mut result, statistics) = {
             let _scope = crate::core::enter_program(Some(program));
             WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = Some(sys.clone()));
             // PORT: perf. Each checker emits when its own check ends, as in
@@ -755,6 +766,9 @@ impl BuildTask {
                 testing: orchestrator.testing(),
                 testing_m_times_cache: Some(&*host.m_times),
             });
+            if let Some(deferred_writes) = &deferred_writes {
+                write_deferred(deferred_writes, &*sys.fs());
+            }
             WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = None);
             emitted
         };
@@ -774,7 +788,26 @@ impl BuildTask {
             task_result.has_changed_dts_file = has_changed_dts_file;
             task_result.program = Some(incremental_program);
         }
-        // Go: build/buildtask.go:910 (*BuildTask).writeFile, the build info
+        // PORT: see `DeferredWrites`. Go's emitter reports a failed write as
+        // TS5033; here the waiting writes fail after the emit.
+        let failed = deferred_writes.map_or_else(Vec::new, |deferred| {
+            std::mem::take(
+                &mut deferred
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .failed,
+            )
+        });
+        for (file_name, err) in failed {
+            self.report_diagnostic(new_compiler_diagnostic(
+                diag::Could_not_write_file_0_Colon_1,
+                args![file_name, err],
+            ));
+            if result.status == ExitStatus::Success {
+                result.status = ExitStatus::DiagnosticsPresentOutputsGenerated;
+            }
+        }
+        // Go: build/buildtask.go:906 (*BuildTask).writeFile, the build info
         // part (`onBuildInfoEmit`), with the time of the write.
         // PORT: it runs when the emit is done (see `new_task_write_file`).
         // The build info is the last file that the emit writes, so
@@ -840,7 +873,7 @@ impl BuildTask {
         }
     }
 
-    // Go: build/buildtask.go:301 (*BuildTask).handleStatusThatDoesntRequireBuild
+    // Go: build/buildtask.go:296 (*BuildTask).handleStatusThatDoesntRequireBuild
     pub fn handle_status_that_doesnt_require_build(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
@@ -925,7 +958,7 @@ impl BuildTask {
         false
     }
 
-    // Go: build/buildtask.go:351 (*BuildTask).getUpToDateStatus
+    // Go: build/buildtask.go:346 (*BuildTask).getUpToDateStatus
     pub fn get_up_to_date_status(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
@@ -1197,7 +1230,10 @@ impl BuildTask {
                 if seen_roots.contains(&input_path) || resolved_roots.contains(&input_path) {
                     continue;
                 }
-                if is_content_mapper_supplemental_build_info_path(&input_path, reader.roots()) {
+                // ts#63936: a supplemental file that exists is an input like any other.
+                if is_content_mapper_supplemental_build_info_path(&input_path, reader.roots())
+                    && !orchestrator.fs().file_exists(&input_file)
+                {
                     continue;
                 }
                 let input_time = orchestrator.get_m_time(&input_file);
@@ -1402,7 +1438,7 @@ impl BuildTask {
         )
     }
 
-    // Go: build/buildtask.go:642 (*BuildTask).reportUpToDateStatus
+    // Go: build/buildtask.go:638 (*BuildTask).reportUpToDateStatus
     pub fn report_up_to_date_status(&mut self, orchestrator: &dyn BuildTaskOrchestrator) {
         if !orchestrator.command().build_options.verbose.is_true() {
             return;
@@ -1511,13 +1547,13 @@ impl BuildTask {
         self.report_status(diagnostic);
     }
 
-    // Go: build/buildtask.go:754 (*BuildTask).canUpdateJsDtsOutputTimestamps
+    // Go: build/buildtask.go:750 (*BuildTask).canUpdateJsDtsOutputTimestamps
     pub fn can_update_js_dts_output_timestamps(&self) -> bool {
         let options = self.resolved().compiler_options();
         !options.no_emit.is_true() && !options.is_incremental()
     }
 
-    // Go: build/buildtask.go:758 (*BuildTask).updateTimeStamps
+    // Go: build/buildtask.go:754 (*BuildTask).updateTimeStamps
     pub fn update_time_stamps(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
@@ -1558,7 +1594,7 @@ impl BuildTask {
         update_time_stamp(self, &build_info_file_name);
     }
 
-    // Go: build/buildtask.go:793 (*BuildTask).cleanProject
+    // Go: build/buildtask.go:789 (*BuildTask).cleanProject
     pub fn clean_project(&mut self, orchestrator: &dyn BuildTaskOrchestrator, path: &Path) {
         let Some(resolved) = self.resolved.clone() else {
             let config = self.config.clone();
@@ -1581,7 +1617,7 @@ impl BuildTask {
         self.clean_project_output(orchestrator, &resolved.get_build_info_file_name(), &inputs);
     }
 
-    // Go: build/buildtask.go:807 (*BuildTask).cleanProjectOutput
+    // Go: build/buildtask.go:803 (*BuildTask).cleanProjectOutput
     pub fn clean_project_output(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
@@ -1611,20 +1647,20 @@ impl BuildTask {
         }
     }
 
-    // Go: build/buildtask.go:825 (*BuildTask).updateWatch
+    // Go: build/buildtask.go:821 (*BuildTask).updateWatch
     // PORT: in orchestrator_watch.rs.
 
-    // Go: build/buildtask.go:835 (*BuildTask).resetStatus
+    // Go: build/buildtask.go:831 (*BuildTask).resetStatus
     pub fn reset_status(&mut self) {
         self.status = None;
         self.pending = true;
         self.errors = Vec::new();
     }
 
-    // Go: build/buildtask.go:841 (*BuildTask).resetConfig
+    // Go: build/buildtask.go:837 (*BuildTask).resetConfig
     // PORT: in orchestrator_watch.rs.
 
-    // Go: build/buildtask.go:846 (*BuildTask).loadOrStoreBuildInfo
+    // Go: build/buildtask.go:842 (*BuildTask).loadOrStoreBuildInfo
     pub fn load_or_store_build_info(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
@@ -1655,7 +1691,7 @@ impl BuildTask {
         (build_info, m_time)
     }
 
-    // Go: build/buildtask.go:865 (*BuildTask).onBuildInfoEmit
+    // Go: build/buildtask.go:861 (*BuildTask).onBuildInfoEmit
     // PORT: Go takes `mTime := orchestrator.opts.Sys.Now()` here, in the
     // `writeFile` call of the build info, before the test `OnEmittedFiles`
     // stamps the emitted files. `new_task_write_file` takes the time at
@@ -1684,7 +1720,7 @@ impl BuildTask {
         });
     }
 
-    // Go: build/buildtask.go:883 (*BuildTask).hasConflictingBuildInfo
+    // Go: build/buildtask.go:879 (*BuildTask).hasConflictingBuildInfo
     pub fn has_conflicting_build_info(
         &self,
         orchestrator: &dyn BuildTaskOrchestrator,
@@ -1698,7 +1734,7 @@ impl BuildTask {
         false
     }
 
-    // Go: build/buildtask.go:890 (*BuildTask).getLatestChangedDtsMTime
+    // Go: build/buildtask.go:886 (*BuildTask).getLatestChangedDtsMTime
     pub fn get_latest_changed_dts_m_time(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
@@ -1721,13 +1757,13 @@ impl BuildTask {
         dts_time
     }
 
-    // Go: build/buildtask.go:906 (*BuildTask).storeOutputTimeStamp
+    // Go: build/buildtask.go:902 (*BuildTask).storeOutputTimeStamp
     pub fn store_output_time_stamp(&self, orchestrator: &dyn BuildTaskOrchestrator) -> bool {
         orchestrator.command().compiler_options.watch.is_true()
             && !self.resolved().compiler_options().is_incremental()
     }
 
-    // Go: build/buildtask.go:910 (*BuildTask).writeFile
+    // Go: build/buildtask.go:906 (*BuildTask).writeFile
     // PORT: see `new_task_write_file`.
 }
 
@@ -1743,7 +1779,7 @@ fn reader_of<'a>(
     }
 }
 
-// Go: build/buildtask.go:625 isContentMapperSupplementalBuildInfoPath (tsgo#4712)
+// Go: build/buildtask.go:621 isContentMapperSupplementalBuildInfoPath (tsgo#4712)
 // PORT: Go `strconv.Atoi(index) == nil` is `index.parse::<i64>().is_ok()`:
 // both take an optional sign and decimal digits, and fail on an empty
 // text and on overflow of a 64-bit int.
@@ -1779,27 +1815,33 @@ fn is_content_mapper_supplemental_build_info_path<'a>(
 /// taken at the write.
 type WrittenBuildInfo = Arc<Mutex<Option<(String, Arc<BuildInfo>, SystemTime)>>>;
 
-// Go: build/buildtask.go:910 (*BuildTask).writeFile
+// Go: build/buildtask.go:906 (*BuildTask).writeFile
 // PORT: emit writes the source outputs on the checker threads, so the
 // callback is `Send` and cannot hold the task, the `Rc` system or the `Rc`
 // file system. Go writes through `orchestrator.host.FS()` (cachedvfs over
 // bundled over osvfs); both wrappers pass a write of a real path to osvfs
-// (cachedvfs.go:148 WriteFile), so this writes with the osvfs of the
+// (cachedvfs.go:144 WriteFile), so this writes with the osvfs of the
 // calling thread. The build info branch keeps what `onBuildInfoEmit` needs
 // in `written`, and `compile_and_emit_finish` calls it after the emit. The
 // watch-only `storeMTime` branch stores into the build host `m_times` at
 // once (Go `SyncMap`), before the test `OnEmittedFiles` reads it.
+// With `deferred` (`System::emit_writes_through_osvfs` is false) it writes
+// through the system file system instead (see `DeferredWrites`).
 fn new_task_write_file(
     written: WrittenBuildInfo,
+    deferred: Option<DeferredWrites>,
     store_output_time_stamp: bool,
     m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
     compare_paths_options: ComparePathsOptions,
 ) -> WriteFile {
     Arc::new(
         move |file_name: &str, text: &str, data: &mut WriteFileData| -> Result<(), String> {
-            osvfs_fs()
-                .write_file(file_name, text)
-                .map_err(|err| fs_error_text(&err))?;
+            match &deferred {
+                None => osvfs_fs()
+                    .write_file(file_name, text)
+                    .map_err(|err| fs_error_text(&err))?,
+                Some(deferred) => write_or_defer(deferred, file_name, text)?,
+            }
             if let Some(build_info) = &data.build_info {
                 *written.lock().unwrap_or_else(PoisonError::into_inner) = Some((
                     file_name.to_string(),
@@ -1823,6 +1865,64 @@ fn new_task_write_file(
             Ok(())
         },
     )
+}
+
+/// PORT: not in Go. The emit writes of a task whose system file system only
+/// the orchestrator thread can reach (`System::emit_writes_through_osvfs`,
+/// the API build orchestrator). Go's `writeFile` writes through
+/// `orchestrator.host.FS()` from the emit goroutines. Here a write on the
+/// orchestrator thread (the build info, and the early emit's writes that
+/// `finish_emit_files` flushes there) goes to that file system at once, after
+/// the waiting ones. A write on another thread (a checker thread) waits in
+/// `writes`, and the next write on the orchestrator thread, or the end of the
+/// task's emit, makes it. A waiting write that fails is kept in `failed` for
+/// Go's TS5033 after the emit (`compile_and_emit_finish`).
+#[derive(Default)]
+struct PendingWrites {
+    writes: Vec<(String, String)>,
+    failed: Vec<(String, String)>,
+}
+
+type DeferredWrites = Arc<Mutex<PendingWrites>>;
+
+/// The `DeferredWrites` part of the task `writeFile`: writes through the
+/// orchestrator system on the orchestrator thread, else keeps the write.
+fn write_or_defer(deferred: &DeferredWrites, file_name: &str, text: &str) -> Result<(), String> {
+    let fs = WRITE_FILE_SYS.with(|sys| sys.borrow().as_ref().map(|sys| sys.fs()));
+    match fs {
+        Some(fs) => {
+            write_deferred(deferred, &*fs);
+            fs.write_file(file_name, text)
+                .map_err(|err| fs_error_text(&err))
+        }
+        None => {
+            deferred
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .writes
+                .push((file_name.to_string(), text.to_string()));
+            Ok(())
+        }
+    }
+}
+
+/// Makes the waiting writes of `deferred` through `fs`, in order.
+fn write_deferred(deferred: &DeferredWrites, fs: &dyn Fs) {
+    let writes = std::mem::take(
+        &mut deferred
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .writes,
+    );
+    for (file_name, text) in writes {
+        if let Err(err) = fs.write_file(&file_name, &text) {
+            deferred
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .failed
+                .push((file_name, fs_error_text(&err)));
+        }
+    }
 }
 
 thread_local! {

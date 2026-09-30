@@ -1806,7 +1806,18 @@ impl Checker {
             && target != self.marker_sub_type_for_check
         {
             let constraint = self.get_base_constraint_of_type(target);
-            if constraint.is_some() && self.is_type_assignable_to(generalized_source, constraint) {
+            if self.is_distributed_type_parameter(target) && {
+                let target_constraint = self.ty(target).as_type_parameter().constraint;
+                self.is_type_assignable_to(generalized_source, target_constraint)
+            } {
+                self.report_error(
+                    r,
+                    diag::X_0_is_only_assignable_to_the_non_distributed_1_but_1_has_been_distributed_here,
+                    args![generalized_source_type.clone(), target_type.clone()],
+                );
+            } else if constraint.is_some()
+                && self.is_type_assignable_to(generalized_source, constraint)
+            {
                 let constraint_str = self.type_to_string_exported(constraint);
                 self.report_error(
                     r,

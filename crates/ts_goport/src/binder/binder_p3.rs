@@ -230,10 +230,20 @@ impl Binder {
 
     // Go: binder/binder.go:1904 bindForInOrForOfStatement
     pub fn bind_for_in_or_for_of_statement(&mut self, node: Node) {
+        self.bind(node.expression());
+        if self.current_flow == self.unreachable_flow {
+            // Like the for-loop initializer, the for-in/for-of expression is bound before the loop's
+            // flow graph is constructed. If it makes flow unreachable (e.g. a throwing IIFE), addAntecedent
+            // will filter out the unreachable entry to preLoopLabel, leaving only the back-edge from the
+            // loop body. This creates a cycle with no exit that crashes isReachableFlowNodeWorker.
+            // Bail out early and just bind the remaining children with unreachable flow.
+            self.bind(node.initializer());
+            self.bind(node.statement());
+            return;
+        }
         let loop_label = self.create_loop_label();
         let pre_loop_label = self.set_continue_target(node, loop_label);
         let post_loop_label = self.create_branch_label();
-        self.bind(node.expression());
         self.add_antecedent(pre_loop_label, self.current_flow);
         self.current_flow = pre_loop_label;
         if node.kind() == SyntaxKind::ForOfStatement {

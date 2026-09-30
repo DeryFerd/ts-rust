@@ -1,5 +1,6 @@
-//! Go: internal/fswatch/canonicalize_darwin.go, and `isASCII` and
-//! `normalizeNFC` of fsevents_darwin_ffi.go.
+//! Go: internal/fswatch/canonicalize_darwin.go, and `isASCII`,
+//! `normalizeNFC`, `nativePathFolding` and `foldNativePath` of
+//! fsevents_darwin_ffi.go.
 //!
 //! PORT: Go builds these files on darwin (amd64 and arm64) only, and
 //! `normalizeNFC` calls CoreFoundation (CFStringNormalize with
@@ -15,22 +16,73 @@ use crate::fswatch::prelude::*;
 #[cfg(any(target_vendor = "apple", test))]
 use unicode_normalization::UnicodeNormalization;
 
-// Go: canonicalize_darwin.go:14 canonicalizePath
-/// canonicalizePath returns the path in the form the library uses for
-/// internal bookkeeping and event delivery. On macOS, paths from FSEvents
-/// arrive using whatever Unicode normalization form is stored on disk;
-/// usually NFC, but sometimes NFD (e.g. files created on legacy HFS+
-/// volumes or copied from systems that use NFD). APFS resolves either form
-/// to the same inode, but raw string comparisons against caller-supplied
-/// paths (typically NFC) silently break. Normalizing every path the
-/// library ingests to NFC keeps watch keys, dirWatch lookups, WatchFile
-/// filters, and event paths all in one consistent form.
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use crate::fswatch::{pathcompare::PathComparer, pathkey::PathComparerExported};
+
+// Go: canonicalize_darwin.go:15 canonicalizePath
+/// canonicalizePath normalizes watch keys, subscribed filenames, and incoming
+/// FSEvents paths to NFC. kqueue retains on-disk child spellings for its fd
+/// bookkeeping and directory events; on case-insensitive volumes, the native
+/// path comparer handles normalization differences when filtering WatchFile.
 #[cfg(all(
     any(target_os = "macos", target_os = "ios"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub fn canonicalize_path(p: &str) -> String {
     normalize_nfc(p)
+}
+
+// Go: canonicalize_darwin.go:17 watcher.pathComparer (ts#64210)
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl WatcherStruct {
+    pub fn path_comparer(&self, dir: &str) -> Result<PathComparer, GoError> {
+        if self.name != "fsevents" && self.name != "kqueue" {
+            return Ok(PathComparer::default());
+        }
+        let c = path_comparer_for_path(dir)?;
+        Ok(c.comparer)
+    }
+}
+
+// Go: canonicalize_darwin.go:27 PathComparerForPath (ts#64210)
+/// PathComparerForPath queries an existing path's volume. Errors are returned to
+/// the caller; a failed query must not silently enable or disable native folding.
+// PORT: Go reads `unix.Pathconf(path, _PC_CASE_SENSITIVE)` and ignores case
+// on a volume that reports 0. The port has no safe `pathconf` (D-W1: no
+// `libc` or `unsafe`, and rustix has none), so it returns exact comparison,
+// the behavior before ts#64210.
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn path_comparer_for_path(_path: &str) -> Result<PathComparerExported, GoError> {
+    Ok(PathComparerExported::default())
+}
+
+// Go: fsevents_darwin_ffi.go:195 nativePathFolding (ts#64210)
+// PORT: Go folds with CoreFoundation `CFStringFold`. The port calls no
+// CoreFoundation (D-W1), so it has no native fold and takes Go's non-native
+// branches (the simple Unicode fold of pathSuffixFoldUnicode).
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub const NATIVE_PATH_FOLDING: bool = false;
+
+// Go: fsevents_darwin_ffi.go:200 foldNativePath (ts#64210)
+// PORT: not reached, because `NATIVE_PATH_FOLDING` is false (see there).
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn fold_native_path(_: &str) -> String {
+    panic!("fswatch: native path folding is not ported (CoreFoundation)");
 }
 
 // Go: fsevents_darwin_ffi.go:217 isASCII

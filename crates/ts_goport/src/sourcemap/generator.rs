@@ -450,6 +450,8 @@ impl Generator {
             NOT_SET_UTF16, /*sourceCharacter*/
             NAME_INDEX_NOT_SET,
         );
+        self.has_pending_source = false;
+        self.has_pending_name = false;
         Ok(())
     }
 
@@ -477,6 +479,12 @@ impl Generator {
         }
         if source_character < 0 {
             return Err("sourceCharacter cannot be negative".to_string());
+        }
+        if self.has_pending
+            && !self.is_new_generated_position(generated_line, generated_character)
+            && !self.has_pending_source
+        {
+            return Ok(());
         }
         self.add_mapping(
             generated_line,
@@ -517,6 +525,12 @@ impl Generator {
         }
         if name_index < 0 || name_index as usize >= self.names.len() {
             return Err("nameIndex is out of range".to_string());
+        }
+        if self.has_pending
+            && !self.is_new_generated_position(generated_line, generated_character)
+            && !self.has_pending_source
+        {
+            return Ok(());
         }
         self.add_mapping(
             generated_line,

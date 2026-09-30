@@ -496,6 +496,15 @@ impl<'a> OmitZeroWriter<'a> {
         Ok(())
     }
 
+    // Go slice of structs (`[]PluginImport`): only a nil slice is zero.
+    fn opt<T: MarshalerTo>(&mut self, name: &str, v: Option<&T>) -> Result<(), JsonError> {
+        let Some(v) = v else {
+            return Ok(());
+        };
+        self.name(name)?;
+        v.marshal_json_to(self.enc)
+    }
+
     // Go `*collections.OrderedMap[string, []string]`: only nil is zero.
     fn paths(
         &mut self,
@@ -604,6 +613,7 @@ pub const COMPILER_OPTIONS_JSON_FIELDS: &[(&str, &str)] = &[
     ),
     ("OutDir", "outDir"),
     ("Paths", "paths"),
+    ("Plugins", "plugins"),
     ("PreserveConstEnums", "preserveConstEnums"),
     ("PreserveSymlinks", "preserveSymlinks"),
     ("Project", "project"),
@@ -783,6 +793,7 @@ impl MarshalerTo for CompilerOptionsJson<'_> {
         )?;
         w.string("outDir", &o.out_dir)?;
         w.paths("paths", &o.paths)?;
+        w.opt("plugins", o.plugins.as_ref())?;
         w.tristate("preserveConstEnums", o.preserve_const_enums)?;
         w.tristate("preserveSymlinks", o.preserve_symlinks)?;
         w.string("project", &o.project)?;

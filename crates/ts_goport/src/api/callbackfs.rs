@@ -8,7 +8,7 @@ use crate::frontend::json::{
 use crate::frontend::json_ext::{
     AnyValue, marshal_field, unmarshal_struct_fields, write_object_end, write_object_start,
 };
-use crate::frontend::vfs::{Entries, FileInfo, Fs, FsError, WalkDirFunc};
+use crate::frontend::vfs::{Entries, FileInfo, Fs, FsError};
 use crate::gostd::{Context, GoError, errors};
 use crate::ipc::Conn;
 use std::time::SystemTime;
@@ -41,6 +41,8 @@ const CALLBACK_GET_ACCESSIBLE_ENTRIES: &str = "getAccessibleEntries";
 const CALLBACK_REALPATH: &str = "realpath";
 // tsgo#4699
 const CALLBACK_WRITE_FILE: &str = "writeFile";
+// ts#64158
+const CALLBACK_REMOVE_FILE: &str = "removeFile";
 
 // Go: callbackfs.go:37 isCallbackName
 fn is_callback_name(name: &str) -> bool {
@@ -52,6 +54,7 @@ fn is_callback_name(name: &str) -> bool {
             | CALLBACK_GET_ACCESSIBLE_ENTRIES
             | CALLBACK_REALPATH
             | CALLBACK_WRITE_FILE
+            | CALLBACK_REMOVE_FILE
     )
 }
 
@@ -326,8 +329,17 @@ impl Fs for CallbackFS {
     }
 
     // Go: callbackfs.go:209 Remove
-    // Remove implements vfs.FS - always delegates to base (no callback support).
+    // Remove implements vfs.FS.
+    // PORT: Go returns the callback error; it is `FsError::Other` with its
+    // text (as in `write_file`).
     fn remove(&self, path: &str) -> Result<(), FsError> {
+        // ts#64158
+        if self.is_enabled(CALLBACK_REMOVE_FILE) {
+            if let Err(err) = self.call(CALLBACK_REMOVE_FILE, path.to_string()) {
+                return Err(FsError::Other(err.error()));
+            }
+            return Ok(());
+        }
         self.base.remove(path)
     }
 
@@ -348,9 +360,6 @@ impl Fs for CallbackFS {
         self.base.stat(path)
     }
 
-    // Go: callbackfs.go:224 WalkDir
-    // WalkDir implements vfs.FS - always delegates to base (no callback support).
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        self.base.walk_dir(root, walk_fn)
-    }
+    // ts#64277: callbackFS.WalkDir is gone with vfs.FS.WalkDir (the program
+    // lane removes `Fs::walk_dir`).
 }

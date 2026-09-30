@@ -2,11 +2,11 @@
 
 // Usage: node --experimental-strip-types fetchModel.mts
 
-// PORT: port of typescript-go internal/lsp/lsproto/_generate/fetchModel.mts
-// (pinned dc37b5249). Go reads the vscode-languageclient version from the
+// PORT: port of microsoft/TypeScript tsc/internal/lsp/lsproto/_generate/fetchModel.mts
+// (pinned 673a5f17d713). Go reads the vscode-languageclient version from the
 // repository package-lock.json. This crate has no package-lock, so the ref is
-// fixed to the version that the pinned Go lock file names (10.0.1 since
-// tsgo#4454). Both downloads are checked against their pinned sha256 values
+// fixed to the version that the pinned Go lock file names (10.1.1 at
+// 673a5f17d713). Both downloads are checked against their pinned sha256 values
 // before use.
 
 import crypto from "node:crypto";
@@ -21,10 +21,10 @@ const metaModelPath = path.join(__dirname, "metaModel.json");
 const metaModelSchemaPath = path.join(__dirname, "metaModelSchema.mts");
 
 // PORT: fixed version (Go: package-lock.json "node_modules/vscode-languageclient").
-const clientVersion = "10.0.1";
+const clientVersion = "10.1.1";
 
 // Pinned sha256 of the two downloads at this ref.
-const metaModelSha256 = "cbc9ac05fc7fcdf7e3d83845a5dcff8cf94cbf71fee99f5a8e25a790b6f6fd12";
+const metaModelSha256 = "caae8df639a4248520a3f589fd72945365e9d8ebca5baf564161a515430d9d41";
 const metaModelSchemaSha256 = "34adc4972d75a29af15992a95157add17eb6a4c8820fbc2a47850fb84f3170ae";
 
 const ref = `release/client/${clientVersion}`;

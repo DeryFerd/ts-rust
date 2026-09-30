@@ -387,8 +387,6 @@ impl LanguageService {
     ) -> lsproto::DefinitionResponse {
         let mut locations: Vec<lsproto::LocationLink> = Vec::new();
         let mut location_ranges: FxHashSet<FileRange> = FxHashSet::default();
-        let mut concrete_targets: FxHashSet<lsproto::DocumentUri> = FxHashSet::default();
-        let mut file_fallbacks: Vec<lsproto::LocationLink> = Vec::new();
 
         if let Some(reference) = reference {
             let target_range = lsproto::Range {
@@ -443,13 +441,6 @@ impl LanguageService {
                 let (target_selection_loc, selection_fidelity) =
                     self.source_file_range_to_lsp_location_for_feature(file, name_range, feature);
                 if !selection_fidelity.is_single_segment() {
-                    let zero_range = lsproto::Range::default();
-                    file_fallbacks.push(lsproto::LocationLink {
-                        origin_selection_range: Some(origin_selection_range),
-                        target_selection_range: zero_range,
-                        target_uri: target_selection_loc.uri,
-                        target_range: zero_range,
-                    });
                     continue;
                 }
                 let (mut target_loc, context_fidelity) =
@@ -460,19 +451,12 @@ impl LanguageService {
                 {
                     target_loc = target_selection_loc.clone();
                 }
-                concrete_targets.insert(target_selection_loc.uri.clone());
                 locations.push(lsproto::LocationLink {
                     origin_selection_range: Some(origin_selection_range),
                     target_selection_range: target_selection_loc.range,
                     target_uri: target_loc.uri,
                     target_range: target_loc.range,
                 });
-            }
-        }
-        for fallback in file_fallbacks {
-            if !concrete_targets.contains(&fallback.target_uri) {
-                concrete_targets.insert(fallback.target_uri.clone());
-                locations.push(fallback);
             }
         }
 

@@ -11,7 +11,7 @@
 //! `assert.Check` failures (the error baseline counts) are collected in
 //! `checks` and fail the subtest after the comparison, as in Go.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -26,7 +26,6 @@ use ts_goport::frontend::json::json_unmarshal;
 use ts_goport::frontend::parser::{SourceFileParseOptions, parse_source_file};
 use ts_goport::frontend::prelude::*;
 use ts_goport::sourcemap::generator::RawSourceMap;
-use ts_goport::spanmap::SpanMap;
 
 use super::go_regex;
 use super::harness::{CompilationResult, HarnessOptions, TestConfiguration, compile_files_ex};
@@ -167,12 +166,37 @@ fn format_location(file: Node, pos: i32, format_opts: &FormattingOptions) -> Str
     capture_writer(|w| write_location(w, file, pos, Some(format_opts), write_plain))
 }
 
-/// Go `diag.File().FileName()` for a diagnostic with a file.
+/// Go `diag.File().FileName()` for an `*ast.Diagnostic` with a file: the
+/// file's own name (a supplemental mapper output keeps its own name). The
+/// compiler runner, the content mapper baseline and the transpile runner read
+/// it.
 pub fn diagnostic_file_name(diagnostic: &Diagnostic) -> Option<String> {
     diagnostic
         .file
         .is_some()
         .then(|| source_file_file_name(diagnostic.file).to_string())
+}
+
+/// Go `diag.File().FileName()` for a wrapped `*diagnosticwriter.ASTDiagnostic`
+/// with a file (the error baseline, ts#63936).
+fn wrapped_diagnostic_file_name(diagnostic: &Diagnostic) -> Option<&'static str> {
+    diagnostic
+        .file
+        .is_some()
+        .then(|| ast_diagnostic_file_name(diagnostic.file))
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:57 ASTDiagnostic.File (ts#63936)
+// The file name of `File()`: the canonical source file's name for a
+// supplemental mapper output, else the file's own name.
+// PORT: the port writes diagnostics without the wrapper, so this is the part
+// of `File()` that `FileName()` reads.
+fn ast_diagnostic_file_name(file: Node) -> &'static str {
+    let canonical = ts_goport::ast::source_file_canonical_source_file(file);
+    if canonical.is_some() {
+        return source_file_file_name(canonical);
+    }
+    source_file_file_name(file)
 }
 
 /// The Go `newLine` closure of `iterateErrorBaseline`.
@@ -235,7 +259,8 @@ fn iterate_error_baseline(
                 location = format!(" {}", format_location(info.file, info.pos, &format_opts()));
             }
             location = remove_test_path_prefixes(&location, false);
-            if !location.is_empty() && is_default_library_file(source_file_file_name(info.file)) {
+            if !location.is_empty() && is_default_library_file(ast_diagnostic_file_name(info.file))
+            {
                 location = go_regex::replace_diagnostics_location_pattern(&location);
             }
             err_lines.push(format!(
@@ -258,10 +283,10 @@ fn iterate_error_baseline(
         // Similarly for tsconfig, which may be in the input files and contain errors.
         // 'totalErrorsReportedInNonLibraryNonTsconfigFiles + numLibraryDiagnostics + numTsconfigDiagnostics, diagnostics.length
 
-        match diagnostic_file_name(diag) {
+        match wrapped_diagnostic_file_name(diag) {
             None => *total += 1,
             Some(name) => {
-                if !is_default_library_file(&name) && !is_ts_config_file(&name) {
+                if !is_default_library_file(name) && !is_ts_config_file(name) {
                     *total += 1;
                 }
             }
@@ -302,7 +327,7 @@ fn iterate_error_baseline(
             .filter(|e| {
                 e.file.is_some()
                     && compare_paths(
-                        &remove_test_path_prefixes(source_file_file_name(e.file), false),
+                        &remove_test_path_prefixes(ast_diagnostic_file_name(e.file), false),
                         &unit_name,
                         &ComparePathsOptions::default(),
                     ) == 0
@@ -411,29 +436,21 @@ fn iterate_error_baseline(
     let num_library_diagnostics = diagnostics
         .iter()
         .filter(|d| {
-            diagnostic_file_name(d)
-                .is_some_and(|name| is_default_library_file(&name) || is_built_file(&name))
+            wrapped_diagnostic_file_name(d)
+                .is_some_and(|name| is_default_library_file(name) || is_built_file(name))
         })
         .count() as i64;
     let num_tsconfig_diagnostics = diagnostics
         .iter()
-        .filter(|d| diagnostic_file_name(d).is_some_and(|name| is_ts_config_file(&name)))
+        .filter(|d| wrapped_diagnostic_file_name(d).is_some_and(is_ts_config_file))
         .count() as i64;
-    // Go: error_baseline.go:255 (tsgo#4712)
-    let mut content_mapper_supplemental_file_names: HashSet<String> = HashSet::new();
-    for diagnostic in &diagnostics {
-        if diagnostic_file_is_source_file(diagnostic)
-            && ts_goport::ast::source_file_is_content_mapper_supplemental(diagnostic.file)
-        {
-            content_mapper_supplemental_file_names
-                .insert(source_file_file_name(diagnostic.file).to_string());
-        }
-    }
+    // Go: error_baseline.go:255 (tsgo#4712, ts#63936)
+    // PORT: the diagnostics are Go `*diagnosticwriter.ASTDiagnostic`, so this
+    // is the first branch: the file of the wrapped `ast.Diagnostic`.
     let num_content_mapper_supplemental_diagnostics = diagnostics
         .iter()
         .filter(|d| {
-            diagnostic_file_name(d)
-                .is_some_and(|name| content_mapper_supplemental_file_names.contains(&name))
+            d.file.is_some() && ts_goport::ast::source_file_is_content_mapper_supplemental(d.file)
         })
         .count() as i64;
     // Verify we didn't miss any errors in total
@@ -449,34 +466,6 @@ fn iterate_error_baseline(
     }
 
     result
-}
-
-/// Go `diagnostic.File().(*ast.SourceFile)` is ok for the wrapped
-/// diagnostic (`diagnosticwriter.WrapASTDiagnostics`, tsgo#4712).
-// Go: diagnosticwriter/diagnosticwriter.go:57 ASTDiagnostic.File and :90
-// ASTDiagnostic.resolve. `File()` is the `*ast.SourceFile` unless the
-// location renders against the original text (`useOriginal`): a diagnostic
-// with a source (a mapper's own), or one whose location a span map maps
-// back. A location in synthesized code (`FidelityNone`) keeps the file.
-// PORT: the port writes diagnostics without the wrapper, so this is the
-// part of `resolve` that the Go type assertion reads.
-fn diagnostic_file_is_source_file(diagnostic: &Diagnostic) -> bool {
-    if !diagnostic.file.is_some() {
-        return false;
-    }
-    if !diagnostic.source().is_empty() {
-        return false;
-    }
-    match ts_goport::ast::source_file_span_map(diagnostic.file) {
-        Some(span_map) => {
-            let (_, fidelity) = SpanMap::virtual_to_original_span(
-                Some(span_map),
-                TextRange::new(diagnostic.pos, diagnostic.end),
-            );
-            fidelity.is_none()
-        }
-        None => true,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -969,7 +958,7 @@ pub fn do_sourcemap_baseline(
             expected_map_count += result.get_number_of_js_files(false /*includeJSON*/);
         }
         if decl_maps {
-            expected_map_count += result.get_number_of_js_files(true /*includeJSON*/);
+            expected_map_count += result.dts.len();
         }
         if result.maps.len() != expected_map_count {
             return Err("Number of sourcemap files should be same as js files.".into());
@@ -1027,14 +1016,27 @@ fn create_source_map_preview_link(source_map: &TestFile, result: &CompilationRes
     // !!! Strada uses a fallible approach to associating inputs and outputs derived from a source map output. The
     // !!! commented logic below should be used after the Strada migration is complete:
 
-    let source_tds: Vec<Option<&TestFile>> = sourcemap_json
+    let source_tds: Vec<Option<TestFile>> = sourcemap_json
         .sources
         .iter()
         .map(|s| {
-            result
+            let source_file = result
                 .inputs()
                 .iter()
-                .find(|td| td.unit_name.ends_with(s.as_str()))
+                .find(|td| td.unit_name.ends_with(s.as_str()));
+            if let Some(source_file) = source_file {
+                // Go: `result.Program.GetSourceFile(sourceFile.UnitName)` (ts#63936)
+                let _scope = ts_goport::core::enter_program(Some(result.program));
+                let program_source = ts_goport::program::get_source_file(&source_file.unit_name);
+                if program_source.is_some() {
+                    return Some(TestFile {
+                        unit_name: source_file.unit_name.clone(),
+                        content: ts_goport::ast::source_file_original_text(program_source)
+                            .to_string(),
+                    });
+                }
+            }
+            source_file.cloned()
         })
         .collect();
     if source_tds.iter().any(Option::is_none) {

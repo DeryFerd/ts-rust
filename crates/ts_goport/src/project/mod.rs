@@ -25,6 +25,7 @@ pub mod refcountcache;
 pub mod session;
 pub mod snapshot;
 pub mod snapshotfs;
+pub mod snapshothost;
 pub mod watch;
 
 pub use self::api::*;
@@ -48,6 +49,7 @@ pub use self::refcountcache::*;
 pub use self::session::*;
 pub use self::snapshot::*;
 pub use self::snapshotfs::*;
+pub use self::snapshothost::*;
 pub use self::watch::*;
 
 /// Glob import for project files: `use crate::project::prelude::*;`.
@@ -58,7 +60,7 @@ pub mod prelude {
         configfileregistrybuilder::*, extendedconfigcache::*, filechange::*, overlayfs::*,
         ownercache::*, parsecache::*, programcounter::*, project::*, project_stringer_generated::*,
         projectcollection::*, projectcollectionbuilder::*, refcountcache::*, session::*,
-        snapshot::*, snapshotfs::*, watch::*,
+        snapshot::*, snapshotfs::*, snapshothost::*, watch::*,
     };
     pub use crate::frontend::json_ext::{self, LspAny};
     pub use crate::frontend::{compiler, packagejson, tsoptions, tspath, vfs};

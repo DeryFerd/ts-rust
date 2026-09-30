@@ -808,7 +808,12 @@ impl Checker {
                 let non_fixing_mapper = self.inference_context(n).non_fixing_mapper;
                 let instantiated_constraint = self.instantiate_type(constraint, non_fixing_mapper);
                 let compare_types = self.inference_context(n).compare_types.clone();
-                if inferred_type.is_some() {
+                if inferred_type.is_some()
+                    && !self
+                        .inference_context(n)
+                        .flags
+                        .intersects(InferenceFlags::NO_CONSTRAINT_CHECKS)
+                {
                     let constraint_with_this = self.get_type_with_this_argument(
                         instantiated_constraint,
                         inferred_type,
@@ -1099,6 +1104,7 @@ impl Checker {
     // Go: checker/inference.go:1462 getInferenceInfoForType
     pub fn get_inference_info_for_type(&self, n: &InferenceState, t: TypeId) -> Option<usize> {
         if self.ty(t).flags.intersects(TypeFlags::TYPE_VARIABLE) {
+            let t = self.get_non_distributed_type_parameter(t);
             for (i, inference) in self
                 .inference_context(n.inferences)
                 .inferences
