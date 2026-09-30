@@ -20,7 +20,11 @@ which must not be empty). "-" as the new suite and name means the test was remov
 removedByMap and does not block. Blank lines, lines that start with # and a first line whose first cell
 is "oldSuite" (a header) are skipped. Two base names may not map to one new name (exit 2). A map line
 that is not an identity is rejected (mapRejected, exit 1) when:
-  - its old name is still in the new results (a moved or removed test leaves no copy behind),
+  - its old name is still in the new results (a moved or removed test leaves no copy behind), except a
+    removal line whose old name is "ignored" in the same suite of the new results: a stale Go file that
+    no Go test at the new pin writes, which the reference walk lists as ignored (bump C reviewer ruling 1
+    item 5). Such lines are counted on their own in mapRemovedIgnored, and the reviewer checks the Go
+    evidence of each. A removal line of a name that is ok or failed in the new results is rejected,
   - its new name is a base name (so a map cannot swap a lost name for a passing one, or chain), or
   - it removes a name, the Go pin did not change and the suite is not a kept-crate suite.
 The reviewer checks each entry against its evidence. check-typechecker-batch.mjs applies the same
@@ -31,7 +35,8 @@ Output: JSON with "base", "new" and "nameMap" (path, sha256), then per suite and
   lost, absent, unrun: lists (in "total" each entry is "<suite>: <name>")
   removedByMap: base ok names that the map removes; list per suite, count in total
   recoveredNames, newFailed: lists per suite (newFailed: new names that fail), counts in total
-and "mapRejected" ("line <n>: <reason>"), "mapUnused" (map lines whose old name is not in base) and
+and "mapRejected" ("line <n>: <reason>"), "mapRemovedIgnored" ("<suite>: <name>" of the removal lines
+above), "mapUnused" (map lines whose old name is not in base) and
 "verdict" (PASS or FAIL). With --out the JSON goes to FILE and stdout gets one summary line. Exit 1 when
 any protected name is lost, absent or unrun or a map line is rejected; exit 2 on bad input.
 """
@@ -98,21 +103,24 @@ def same_hash(a, b):
 
 
 def rejected_map_lines(base, new, name_map):
-    """The map lines that could hide a lost name, as "line <n>: <reason>"."""
+    """The map lines that could hide a lost name, as "line <n>: <reason>", and the removal lines of names that
+    are "ignored" in the new results, as "<suite>: <name>"."""
     before, after = base['suites'], new['suites']
     pin_changed = not same_hash(base['pin'], new['pin'])  # load() checked that both pins are hashes
-    out = []
+    out, ignored = [], []
     for (suite, name), (line, to) in sorted(name_map.items(), key=lambda e: e[1][0]):
         if to == (suite, name):
             continue
-        if name in after.get(suite, {}):
+        if to is None and after.get(suite, {}).get(name) == 'ignored':
+            ignored.append(f'{suite}: {name}')
+        elif name in after.get(suite, {}):
             out.append(f'line {line}: {suite} {name} is still in the new results')
         if to and to[1] in before.get(to[0], {}):
             out.append(f'line {line}: the new name {to[0]} {to[1]} is a base name')
         if to is None and not pin_changed and not KEPT_CRATE_SUITE.match(suite):
             out.append(f'line {line}: removes {suite} {name}, but the Go pin did not change and {suite} '
                        'is not a kept-crate suite')
-    return out
+    return out, ignored
 
 
 def compare(base, new, name_map):
@@ -178,7 +186,7 @@ def main():
     new, new_sha = load(a.new)
     name_map, map_sha = load_map(a.name_map) if a.name_map else ({}, None)
     suites, total, unused = compare(base, new, name_map)
-    rejected = rejected_map_lines(base, new, name_map)
+    rejected, removed_ignored = rejected_map_lines(base, new, name_map)
     bad = sum(len(total[k]) for k in LISTS) + len(rejected)
     doc = {
         'base': {'path': a.base, 'sha256': base_sha, 'source': base.get('source'), 'pin': base.get('pin')},
@@ -188,6 +196,7 @@ def main():
         'suites': suites,
         'total': total,
         'mapRejected': rejected,
+        'mapRemovedIgnored': removed_ignored,
         'mapUnused': unused,
         'verdict': 'FAIL' if bad else 'PASS',
     }
@@ -199,7 +208,7 @@ def main():
         print(f"{doc['verdict']}: retained {t['retained']}, recovered {t['recovered']}, lost {len(t['lost'])}, "
               f"absent {len(t['absent'])}, unrun {len(t['unrun'])}, removedByMap {t['removedByMap']}, "
               f"new names {t['newNames']} ({t['newFailed']} failed), map rejected {len(rejected)}, "
-              f"map unused {len(unused)} ({a.out})")
+              f"map removed ignored {len(removed_ignored)}, map unused {len(unused)} ({a.out})")
     else:
         sys.stdout.write(text)
     sys.exit(1 if bad else 0)

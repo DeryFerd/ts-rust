@@ -389,21 +389,26 @@ function testSuites(results, label) {
 // moves or removes a name needs the old name gone from the new results, and a new name that is
 // not a base name (so a map cannot swap a lost name for a passing one). A removal needs a Go
 // pin change (pinChanged: the base batch pin differs from batch.upstreamPin.to), or a kept-crate suite.
+// A removal line may keep its old name in the new results only when that name is "ignored" there (a stale
+// Go file that no Go test at the new pin writes; bump C reviewer ruling 1 item 5): removedIgnored lists it.
 function compareTests(baseResults, newResults, map, pinChanged) {
   const before = testSuites(baseResults, "Base goport results"), after = testSuites(newResults, "goportTests results");
   requireValue(newResults.incomplete === undefined || (Array.isArray(newResults.incomplete) && newResults.incomplete.every(text)),
     "goportTests results: incomplete must be a list of suites.");
   const incomplete = new Set(newResults.incomplete ?? []);
   const has = (suites, suite, name) => Object.hasOwn(suites, suite) && Object.hasOwn(suites[suite], name);
-  for (const [id, { line, to }] of map ?? []) {
+  const removedIgnored = [];
+  for (const [id, { line, to, evidence }] of map ?? []) {
     const [suite, name] = JSON.parse(id);
     if (to && to[0] === suite && to[1] === name) continue;
-    requireValue(!has(after, suite, name), `Name map line ${line}: ${suite} ${name} is still in the new results.`);
+    const ignored = !to && has(after, suite, name) && after[suite][name] === "ignored";
+    if (ignored) removedIgnored.push({ suite, name, evidence });
+    requireValue(ignored || !has(after, suite, name), `Name map line ${line}: ${suite} ${name} is still in the new results.`);
     requireValue(!to || !has(before, ...to), `Name map line ${line}: the new name ${to?.[0]} ${to?.[1]} is a base name.`);
     requireValue(to || pinChanged || KEPT_CRATE_SUITE.test(suite),
       `Name map line ${line} removes ${suite} ${name}, but the Go pin did not change and ${suite} is not a kept-crate suite.`);
   }
-  const result = { baseOk: 0, retained: 0, recovered: 0, newNames: 0, removed: [], lost: [], absent: [], unrun: [] };
+  const result = { baseOk: 0, retained: 0, recovered: 0, newNames: 0, removed: [], removedIgnored, lost: [], absent: [], unrun: [] };
   const targets = new Set();
   for (const [suite, names] of Object.entries(before)) {
     for (const [name, status] of Object.entries(names)) {
@@ -864,16 +869,18 @@ function checkGoport(state, rule, readEvidence, tools) {
   checkLspClean(batch.languageServerOracle, lsp, newGate, readEvidence, reasons);
   const api = checkOracle("apiOracle", "api", batch.apiOracle, apiRuns, ofKind("api"), rebase?.api ?? null, pin, tools, readEvidence, reasons);
   checkApiRun(batch.apiOracle, apiRuns, newGate, readEvidence, reasons);
-  const { lost, absent, unrun, removed, ...counts } = compared;
+  const { lost, absent, unrun, removed, removedIgnored, ...counts } = compared;
   return { verdict: reasons.length ? "STOP" : "PASS", scope: GOPORT_SCOPE, protectedSet: "goport", rule: GOPORT_RULE, reasons,
     base: { batch: previous.id, tests: baseRef.path, gate: previous.gate.manifest },
-    counts: { goportTests: { ...counts, removedByMap: removed.length, lost: lost.length, absent: absent.length, unrun: unrun.length },
+    counts: { goportTests: { ...counts, removedByMap: removed.length, removedIgnored: removedIgnored.length, lost: lost.length,
+      absent: absent.length, unrun: unrun.length },
       gate: { baseItems: gate.counts?.baseItems, items: gate.counts?.items, regressions: gate.regressions.length, knownOpen: gate.knownOpen.length,
         runs: gateRuns.runs, flakes: gateRuns.flakes.length } },
     oracles: { lsp, api },
     knownOpenGateItems: gate.knownOpen,
     gateFlakes: gateRuns.flakes,
     nameMapRemoved: removed,
+    nameMapRemovedIgnored: removedIgnored,
     losses: { goportTests: [...lost, ...absent, ...unrun], gate: gate.regressions.map(item => ({ id: item.id, base: item.base, now: item.new, why: item.why })) } };
 }
 
@@ -1039,6 +1046,9 @@ tree, Cargo.toml and Cargo.lock), as candidate.sh reuses it by that key.
 - nameMap {path, sha256}: a TSV of oldSuite, oldName, newSuite, newName and a
   non-empty evidence cell, for pin bumps and moved tests. A mapped old name
   must be gone from the new results, and a new name must not be a base name.
+  A removal line may keep an old name that is "ignored" in the new results (a
+  stale Go file that no Go test at the new pin writes); nameMapRemovedIgnored
+  lists those lines with their evidence for the reviewer.
   "-" "-" removes a name: only when the base pin and batch.upstreamPin.to
   differ (the pins in the results files do not count), or for a kept-crate
   suite (ts_scanner, ts_ast, ts_diagnostics, ts_path, ts_core, ts_jsnum). The

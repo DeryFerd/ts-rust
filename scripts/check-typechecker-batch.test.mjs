@@ -702,7 +702,7 @@ test("goport batch passes on its own tests, gate and oracles, without roster evi
   assert.equal(result.protectedSet, "goport");
   assert.equal(result.rule, GOPORT_RULE);
   assert.deepEqual(result.counts, {
-    goportTests: { baseOk: 4, retained: 4, recovered: 1, removedByMap: 0, newNames: 1, lost: 0, absent: 0, unrun: 0 },
+    goportTests: { baseOk: 4, retained: 4, recovered: 1, removedByMap: 0, removedIgnored: 0, newNames: 1, lost: 0, absent: 0, unrun: 0 },
     gate: { baseItems: 5, items: 6, regressions: 0, knownOpen: 2, runs: 1, flakes: 0 } });
   assert.deepEqual(result.gateFlakes, []);
   assert.deepEqual(result.base, { batch: "batch-0", tests: BASELINE_PATH, gate: "gate/r131/manifest.json" });
@@ -1338,6 +1338,24 @@ test("a removal needs a Go pin change or a kept-crate suite, and is listed for t
   assert.equal(result.verdict, "PASS", result.reasons.join(" "));
   assert.equal(result.counts.goportTests.removedByMap, 1);
   assert.deepEqual(result.nameMapRemoved, [{ suite: "go_baselines", name: "b::one", evidence: "removed at 16c25522e123: go/testdata/x.ts deleted" }]);
+  // A removal line may keep an old name that is ignored in the new results (bump C ruling 1 item 5), not an ok or
+  // failed one.
+  for (const [status, pass] of [["ignored", true], ["ok", false], ["failed", false]]) {
+    f = goportFixture();
+    f.results.suites.go_baselines["b::one"] = status;
+    f.results.pin = NEW_PIN;
+    f.gateNew.upstreamPin = NEW_PIN;
+    f.state.batch.upstreamPin = { from: GO_PIN, to: NEW_PIN };
+    withMap(f, "go_baselines\tb::one\t-\t-\tGo test removed at 16c25522e123, its baseline file left behind\n");
+    if (pass) {
+      result = check(f);
+      assert.equal(result.verdict, "PASS", result.reasons.join(" "));
+      assert.deepEqual([result.counts.goportTests.removedByMap, result.counts.goportTests.removedIgnored], [1, 1]);
+      assert.deepEqual(result.nameMapRemovedIgnored.map(r => r.name), ["b::one"]);
+    } else {
+      stopped(f, /Name map line 1: go_baselines b::one is still in the new results/);
+    }
+  }
   f = goportFixture();
   delete f.results.suites.ts_scanner_lib["scan::a"];
   withMap(f, "ts_scanner_lib\tscan::a\t-\t-\tstage 5: goport's scanner replaces ts_scanner\n");

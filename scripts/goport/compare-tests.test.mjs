@@ -82,6 +82,25 @@ test("a map line whose old name is still in the new results fails", () => {
   assert.equal(renamed.rc, 1);
 });
 
+test("a removal line of a name that is ignored in the new results passes on its own count (bump C ruling 1 item 5)", () => {
+  // A stale Go reference file: ok at the base pin, still in the Go tree at the new pin, but no Go test writes it.
+  const line = [["ts_goport_lib", "a::ok", "-", "-", "Go test removed, baseline file left behind"]];
+  const stale = compare(next => { next.pin = "16c25522e"; lib(next)["a::ok"] = "ignored"; }, line);
+  assert.equal(stale.rc, 0);
+  assert.deepEqual([stale.out.mapRejected, stale.out.mapRemovedIgnored, stale.out.total.removedByMap], [[], ["ts_goport_lib: a::ok"], 1]);
+  // Still rejected when the name is ok or failed in the new results.
+  for (const status of ["ok", "failed"]) {
+    const kept = compare(next => { next.pin = "16c25522e"; lib(next)["a::ok"] = status; }, line);
+    assert.equal(kept.rc, 1);
+    assert.deepEqual(kept.out.mapRemovedIgnored, []);
+    assert.match(kept.out.mapRejected[0], /a::ok is still in the new results/);
+  }
+  // A move (not a removal) of an ignored name is still rejected.
+  const moved = compare(next => { lib(next)["a::ok"] = "ignored"; lib(next)["fresh::ok"] = "ok"; },
+    [["ts_goport_lib", "a::ok", "ts_goport_lib", "fresh::ok", "renamed"]]);
+  assert.equal(moved.rc, 1);
+});
+
 test("a swap with a base name fails", () => {
   const { rc, out } = compare(next => {
     const sub = next.suites.go_baselines_submodule;
