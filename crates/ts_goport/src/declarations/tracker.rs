@@ -72,18 +72,23 @@ impl SymbolTrackerImpl {
         if !(is_expando_property_declaration(node) && is_property_access_expression(node.left())) {
             return false;
         }
-        let left = get_leftmost_expression(node.left(), true);
+        // Match transformExpandoAssignment: only an assignment rooted at an identifier (`f.x = ...`) can bind an expando
+        // property; `this.x = ...`, `super.x = ...`, `f().x = ...` and the like have no referenced declaration.
+        let ns = get_leftmost_access_expression(node.left());
+        if !is_identifier(ns) {
+            return false;
+        }
         match c {
             Some(c) => {
                 let resolver = c.get_emit_resolver();
-                let r#ref = resolver.get_referenced_value_declaration_unsafe_worker(c, left);
+                let r#ref = resolver.get_referenced_value_declaration_unsafe_worker(c, ns);
                 if r#ref.is_nil() {
                     return false;
                 }
                 resolver.is_expando_function_declaration_unsafe_worker(c, r#ref)
             }
             None => {
-                let r#ref = self.resolver.get_referenced_value_declaration_unsafe(left);
+                let r#ref = self.resolver.get_referenced_value_declaration_unsafe(ns);
                 if r#ref.is_nil() {
                     return false;
                 }
