@@ -1,0 +1,31 @@
+# npm packages
+
+Local npm packages for the port, in the layout of the Go packages at the pin. Nothing here publishes.
+
+- `typescript`: Go's JS launcher (`bin/tsc`, `lib/tsc.js`, `lib/getExePath.js`) and JS API (`dist`).
+- `@typescript/typescript-linux-x64`: `lib/tsc` (a noembed build) and the lib files next to it.
+
+The port adds one file to Go's layout: `install.js`, the postinstall (`lib/install.js`). On POSIX it
+replaces `bin/tsc` with a relative symlink to the platform package's `lib/tsc`. Then `tsc` runs
+without Node, which saves about 20 ms on every run. A symlink keeps the real path of the binary
+in the platform package, where it reads the lib files. When the swap cannot happen, `bin/tsc`
+stays Go's JS launcher, which still works.
+
+Files:
+
+- `pack.mjs` writes the two package dirs. It follows the Go checkout's `Herebyfile.mjs`
+  (`buildNativePreviewPackages`, release profile `typescript`).
+- `install.js` is the postinstall.
+
+Build, test and time (see the header of each script):
+
+```sh
+GOPORT_BUILD_VERSION=7.1.0-dev.goport.1 scripts/run-cargo-capped.sh build --release -p ts_goport --bin tsgo --features noembed
+GOPORT_PIN=<pin> scripts/goport/npm-pack.sh <out>/rs target/release/tsgo
+GOPORT_PIN=<pin> scripts/goport/npm-pack.sh --go 7.1.0-dev.goport.1 <out>/go
+scripts/goport/npm-test.sh <out>/rs <out>/test-rs
+scripts/goport/perf-npm.sh <label> <out>/test-rs/proj <out>/test-go/proj   # on a quiet host
+```
+
+A shipped build uses `RELEASE_VERSION=<v> crates/ts_goport/scripts/build-release.sh` (noembed,
+PGO and BOLT) in place of the cargo line.
