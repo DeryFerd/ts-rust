@@ -1507,10 +1507,15 @@ proto_json!(marshal TranspileOutputResponse {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BatchRequestsParams {
     pub requests: Vec<BatchRequest>,
+    // ts#64061
+    pub continuation_token: String,
+    pub max_response_bytes_per_page: i32,
 }
 
 proto_json!(both BatchRequestsParams {
     requests: "requests" plain,
+    continuation_token: "continuationToken" omitempty,
+    max_response_bytes_per_page: "maxResponseBytesPerPage" omitempty,
 });
 
 // Go: proto.go BatchRequest (ts#63937)
@@ -1525,15 +1530,44 @@ proto_json!(both BatchRequest {
     params: "params" omitempty,
 });
 
-// Go: proto.go BatchRequestsResponse (ts#63937)
+// Go: proto.go BatchRequestsResponse (ts#63937, ts#64061)
+// PORT: Go `encodedResponses []json.Value` is `Option`: `None` is nil.
 #[derive(Debug, Default)]
 pub struct BatchRequestsResponse {
     pub responses: Vec<BatchResponse>,
+    pub continuation_token: String,
+    pub encoded_responses: Option<Vec<JsonValue>>,
 }
 
-proto_json!(marshal BatchRequestsResponse {
-    responses: "responses" plain,
-});
+// Go: proto.go BatchRequestsResponse.MarshalJSONTo (ts#64061)
+impl MarshalerTo for BatchRequestsResponse {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        enc.push_str("\"responses\":[");
+        if let Some(encoded_responses) = &self.encoded_responses {
+            for (i, response) in encoded_responses.iter().enumerate() {
+                if i > 0 {
+                    enc.push(',');
+                }
+                json_ext::write_value(enc, &response.0)?;
+            }
+        } else {
+            for (i, response) in self.responses.iter().enumerate() {
+                if i > 0 {
+                    enc.push(',');
+                }
+                response.marshal_json_to(enc)?;
+            }
+        }
+        enc.push(']');
+        if !self.continuation_token.is_empty() {
+            enc.push_str(",\"continuationToken\":");
+            self.continuation_token.marshal_json_to(enc)?;
+        }
+        write_object_end(enc);
+        Ok(())
+    }
+}
 
 // Go: proto.go BatchResponse (ts#63937)
 // PORT: Go `Result any` is the handler result (`None` is a nil `any`).

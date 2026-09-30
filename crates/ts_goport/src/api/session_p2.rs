@@ -1942,6 +1942,9 @@ impl Session {
         for (_, sd) in snapshots.drain() {
             project::Snapshot::deref(&sd.snapshot, &self.project_session);
         }
+        drop(snapshots);
+        // ts#64061
+        self.batch_response_pages.borrow_mut().clear();
     }
 
     // Go: api/session.go:2871 releaseOpenRefs

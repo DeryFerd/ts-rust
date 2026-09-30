@@ -672,6 +672,10 @@ pub struct Session {
 
     // This is set to true when using MessagePackProtocol.
     pub use_binary_responses: bool,
+    // ts#64061
+    // PORT: Go `sync.Map` and `atomic.Uint64`; one thread.
+    pub batch_response_pages: RefCell<FxHashMap<String, BatchResponsePage>>,
+    pub next_batch_response_page_id: Cell<u64>,
 
     // snapshots maps snapshot handles to their data. Each snapshot has its own
     // symbol/type registries.
@@ -693,6 +697,12 @@ pub struct Session {
     pub cpu_profiler: crate::pprof::CpuProfiler,
 }
 
+// Go: api/session.go batchResponsePage (ts#64061)
+#[derive(Debug, Default)]
+pub struct BatchResponsePage {
+    pub encoded_responses: Vec<JsonValue>,
+}
+
 // Go: api/session.go:284 `var _ Handler = (*Session)(nil)`
 // Ensure Session implements Handler
 // PORT: the `impl Handler for Session` below.
@@ -705,6 +715,11 @@ pub struct SessionOptions {
     pub use_binary_responses: bool,
 }
 
+// Go: api/session.go DefaultMaxResponseBytesPerPage (ts#64061)
+// DefaultMaxResponseBytesPerPage leaves room for base64 expansion beneath V8's
+// maximum string length while rounding down to an even decimal value.
+pub const DEFAULT_MAX_RESPONSE_BYTES_PER_PAGE: i32 = 300_000_000;
+
 // Go: api/session.go:293 NewSession
 // NewSession creates a new API session with the given project session.
 pub fn new_session(
@@ -716,6 +731,8 @@ pub fn new_session(
         id: format_session_id(id),
         project_session,
         use_binary_responses: false,
+        batch_response_pages: RefCell::new(FxHashMap::default()),
+        next_batch_response_page_id: Cell::new(0),
         snapshots: RefCell::new(FxHashMap::default()),
         latest_snapshot: Cell::new(SnapshotID(0)),
         open_projects: RefCell::new(FxHashSet::default()),
@@ -1464,16 +1481,95 @@ impl ipc::Handler for Session {
 
 impl Session {
     // Go: api/session.go handleBatchRequests (ts#63937)
+    // PORT: Go returns the unpaginated response for a nil session (a test
+    // path); a Rust session is never nil.
     pub fn handle_batch_requests(
         &self,
         ctx: &Context,
         params: &BatchRequestsParams,
     ) -> Result<BatchRequestsResponse, GoError> {
+        if !params.continuation_token.is_empty() {
+            let page = self
+                .batch_response_pages
+                .borrow_mut()
+                .remove(&params.continuation_token);
+            let Some(page) = page else {
+                return Err(errors::errorf(
+                    format!("{}: invalid batch continuation token", *ERR_CLIENT_ERROR),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            return self.paginate_batch_responses(page, None, params.max_response_bytes_per_page);
+        }
+
         let mut responses = Vec::with_capacity(params.requests.len());
         for request in &params.requests {
             responses.push(self.handle_batch_request(ctx, request));
         }
-        Ok(BatchRequestsResponse { responses })
+        let page = new_batch_response_page(&responses)?;
+        self.paginate_batch_responses(page, Some(responses), params.max_response_bytes_per_page)
+    }
+
+    // Go: api/session.go paginateBatchResponses (ts#64061)
+    // PORT: Go `responses` nil is `None`.
+    pub fn paginate_batch_responses(
+        &self,
+        page: BatchResponsePage,
+        responses: Option<Vec<BatchResponse>>,
+        mut max_response_bytes_per_page: i32,
+    ) -> Result<BatchRequestsResponse, GoError> {
+        if max_response_bytes_per_page <= 0 {
+            max_response_bytes_per_page = DEFAULT_MAX_RESPONSE_BYTES_PER_PAGE;
+        }
+        let max_response_bytes_per_page = max_response_bytes_per_page as usize;
+        let mut encoded_length = r#"{"responses":[]}"#.len();
+        let mut page_length = 0usize;
+        for encoded in &page.encoded_responses {
+            let mut additional_length = encoded.0.len();
+            if page_length > 0 {
+                additional_length += 1;
+            }
+            if page_length > 0 && encoded_length + additional_length > max_response_bytes_per_page {
+                break;
+            }
+            encoded_length += additional_length;
+            page_length += 1;
+        }
+
+        if page_length == page.encoded_responses.len() {
+            return Ok(BatchRequestsResponse {
+                responses: responses.unwrap_or_default(),
+                continuation_token: String::new(),
+                encoded_responses: Some(page.encoded_responses),
+            });
+        }
+        self.next_batch_response_page_id
+            .set(self.next_batch_response_page_id.get() + 1);
+        let continuation_token = format!("{}-{}", self.id, self.next_batch_response_page_id.get());
+        let continuation_length = r#","continuationToken":"""#.len() + continuation_token.len();
+        while page_length > 1 && encoded_length + continuation_length > max_response_bytes_per_page
+        {
+            encoded_length -= page.encoded_responses[page_length - 1].0.len() + 1;
+            page_length -= 1;
+        }
+        let mut current_responses = page.encoded_responses;
+        let remaining_responses = current_responses.split_off(page_length);
+        let mut response = BatchRequestsResponse {
+            responses: Vec::new(),
+            continuation_token: continuation_token.clone(),
+            encoded_responses: Some(current_responses),
+        };
+        if let Some(mut responses) = responses {
+            responses.truncate(page_length);
+            response.responses = responses;
+        }
+        self.batch_response_pages.borrow_mut().insert(
+            continuation_token,
+            BatchResponsePage {
+                encoded_responses: remaining_responses,
+            },
+        );
+        Ok(response)
     }
 
     // Go: api/session.go handleBatchRequest (ts#63937)
@@ -1484,6 +1580,11 @@ impl Session {
             method: request.method.clone(),
             ..Default::default()
         };
+        // ts#64061
+        if request.method == Method::BATCH_REQUESTS {
+            response.error = format!("{}: batchRequests cannot be nested", *ERR_INVALID_REQUEST);
+            return response;
+        }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ipc::Handler::handle_request(self, ctx, &request.method.0, request.params.clone())
         }));
@@ -1501,6 +1602,19 @@ impl Session {
         }
         response
     }
+}
+
+// Go: api/session.go newBatchResponsePage (ts#64061)
+pub fn new_batch_response_page(responses: &[BatchResponse]) -> Result<BatchResponsePage, GoError> {
+    let mut encoded_responses = Vec::with_capacity(responses.len());
+    for response in responses {
+        let encoded = match crate::frontend::json::json_marshal(response, &[]) {
+            Ok(encoded) => encoded,
+            Err(err) => return Err(errors::from_value(err)),
+        };
+        encoded_responses.push(JsonValue(encoded.into_bytes()));
+    }
+    Ok(BatchResponsePage { encoded_responses })
 }
 
 impl Session {
