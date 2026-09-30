@@ -1383,9 +1383,14 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&stderr), "mapper log\n".repeat(10));
     }
 
-    // Go: cmd/tsgo/sys_unix_test.go:17 TestChildProcessCloseDoesNotWaitForLauncherDescendants (tsgo#4712)
+    // Go: cmd/tsc/sys_unix_test.go:20 TestChildProcessCloseDoesNotWaitForLauncherDescendants (tsgo#4712, ts#64082)
     // PORT: Go reads the first line with `bufio.Reader`; this reads bytes
     // up to the newline. Go `syscall.Kill` is rustix `kill_process`.
+    // PORT: Go N (ts#64082) runs the test binary itself as the launcher and
+    // the descendant, so that `go test` needs no shell. libtest prints its
+    // own lines on stdout before a test body runs, so the pid would not be
+    // the first line; the port keeps the `sh -c "nohup sleep 60 & echo $!;
+    // wait"` launcher of the older Go test. The checks are the same.
     #[cfg(unix)]
     #[test]
     fn test_child_process_close_does_not_wait_for_launcher_descendants() {
