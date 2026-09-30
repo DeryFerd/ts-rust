@@ -811,7 +811,8 @@ impl Checker {
                 | SyntaxKind::CaseBlock
                 | SyntaxKind::ForStatement
                 | SyntaxKind::ForInStatement
-                | SyntaxKind::ForOfStatement => {
+                | SyntaxKind::ForOfStatement
+                | SyntaxKind::ClassStaticBlockDeclaration => {
                     self.check_unused_locals_and_parameters(node);
                 }
                 SyntaxKind::Constructor
