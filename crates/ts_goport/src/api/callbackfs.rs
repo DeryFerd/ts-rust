@@ -8,7 +8,7 @@ use crate::frontend::json::{
 use crate::frontend::json_ext::{
     AnyValue, marshal_field, unmarshal_struct_fields, write_object_end, write_object_start,
 };
-use crate::frontend::vfs::{Entries, FileInfo, Fs, FsError, WalkDirFunc};
+use crate::frontend::vfs::{Entries, FileInfo, Fs, FsError};
 use crate::gostd::{Context, GoError, errors};
 use crate::ipc::Conn;
 use std::time::SystemTime;
@@ -348,9 +348,6 @@ impl Fs for CallbackFS {
         self.base.stat(path)
     }
 
-    // Go: callbackfs.go:224 WalkDir
-    // WalkDir implements vfs.FS - always delegates to base (no callback support).
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        self.base.walk_dir(root, walk_fn)
-    }
+    // ts#64277: callbackFS.WalkDir is gone with vfs.FS.WalkDir (the program
+    // lane removes `Fs::walk_dir`).
 }
