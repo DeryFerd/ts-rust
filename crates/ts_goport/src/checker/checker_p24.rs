@@ -870,7 +870,10 @@ impl Checker {
                 .intersects(ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED)
             {
                 self.ty_mut(t).object_flags |= ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED;
-                if self.some_property_reduces_to_never(t) {
+                let types = self.ty(t).types().to_vec();
+                if !self.is_mapping_of_same_object_type(&types)
+                    && self.some_property_reduces_to_never(t)
+                {
                     self.ty_mut(t).object_flags |= ObjectFlags::IS_NEVER_INTERSECTION;
                 }
             }
@@ -885,7 +888,30 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:22203 somePropertyReducesToNever
+    // Go: checker/checker.go:22206 isMappingOfSameObjectType
+    pub fn is_mapping_of_same_object_type(&mut self, types: &[TypeId]) -> bool {
+        if !types.is_empty()
+            && self
+                .ty(types[0])
+                .object_flags
+                .intersects(ObjectFlags::MAPPED)
+        {
+            let first_type = self.get_modifiers_type_from_mapped_type(types[0]);
+            if self.ty(first_type).flags.intersects(TypeFlags::OBJECT) {
+                for &t in &types[1..] {
+                    if !self.ty(t).object_flags.intersects(ObjectFlags::MAPPED)
+                        || self.get_modifiers_type_from_mapped_type(t) != first_type
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    // Go: checker/checker.go:22220 somePropertyReducesToNever
     // PORT: Go ranges over a map, so its order is random. Here the counts keep
     // the order in which each name is first seen (constituent order, then
     // property order), so the result and the types it makes are deterministic.
