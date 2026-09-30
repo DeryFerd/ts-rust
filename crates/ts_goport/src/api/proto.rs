@@ -441,7 +441,7 @@ impl Method {
     pub const GET_CONFIG_FILE_PARSING_DIAGNOSTICS: Method =
         Method(Cow::Borrowed("getConfigFileParsingDiagnostics"));
 
-    // Emitter methods
+    // Printer methods
     pub const PRINT_NODE: Method = Method(Cow::Borrowed("printNode"));
     pub const FORMAT_NODE_FOR_INSERTION: Method = Method(Cow::Borrowed("formatNodeForInsertion"));
     // tsgo#4699

@@ -238,6 +238,12 @@ impl AstDecoder<'_> {
             };
             set_node_loc(node, TextRange::new(pos as i32, end as i32));
             set_node_flags(node, NodeFlags(self.node_field(i, NODE_OFFSET_FLAGS)));
+            // ts#64320
+            if kind == SyntaxKind::SourceFile as u32 {
+                let is_declaration_file =
+                    NodeFlags(self.node_field(i, NODE_OFFSET_FLAGS)).intersects(NodeFlags::AMBIENT);
+                update_synthetic_source_file(node, |d| d.is_declaration_file = is_declaration_file);
+            }
             self.nodes[i as usize] = node;
             i -= 1;
         }
@@ -384,6 +390,9 @@ impl AstDecoder<'_> {
         let text_idx = read_le32(self.raw, ext_off);
         let file_name_idx = read_le32(self.raw, ext_off + 4);
         let path_idx = read_le32(self.raw, ext_off + 8);
+        // ts#64320
+        let language_variant = LanguageVariant(read_le32(self.raw, ext_off + 12) as i32);
+        let script_kind = ScriptKind(read_le32(self.raw, ext_off + 16) as i32);
         let text = self.get_string(text_idx);
         let file_name = self.get_string(file_name_idx);
         let path = self.get_string(path_idx);
@@ -429,9 +438,15 @@ impl AstDecoder<'_> {
         // name and text. Go keeps both alive with the node; here they leak.
         let file_name: &'static str = Box::leak(opts.file_name.clone().into_boxed_str());
         let text: &'static str = Box::leak(text.into_boxed_str());
-        Ok(self
+        let node = self
             .factory
-            .new_source_file(file_name, &opts.path.0, text, stmts, end_of_file))
+            .new_source_file(file_name, &opts.path.0, text, stmts, end_of_file);
+        // ts#64320
+        update_synthetic_source_file(node, |source_file| {
+            source_file.language_variant = language_variant;
+            source_file.script_kind = script_kind;
+        });
+        Ok(node)
     }
 
     // Go: api/encoder/decoder.go:293 (*astDecoder).decodeExtendedData_TemplateHead

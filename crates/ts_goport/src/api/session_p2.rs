@@ -668,37 +668,14 @@ impl Session {
         _ctx: &Context,
         params: &PrintNodeParams,
     ) -> Result<String, GoError> {
-        let data = match base64_std_encoding_decode_string(&params.data) {
-            Ok(data) => data,
-            Err(err) => {
-                return Err(errors::errorf(
-                    format!("{}: invalid base64 data: {}", *ERR_CLIENT_ERROR, err),
-                    vec![ERR_CLIENT_ERROR.clone(), err],
-                ));
-            }
-        };
+        // ts#64320
+        let node = decode_print_node(&params.data)?;
 
-        let node = match encoder::decode_nodes(&data) {
-            Ok(node) => node,
-            Err(err) => {
-                return Err(errors::errorf(
-                    format!("{}: failed to decode AST: {}", *ERR_CLIENT_ERROR, err),
-                    vec![ERR_CLIENT_ERROR.clone(), err],
-                ));
-            }
-        };
-
-        let mut p = new_printer(
-            PrinterOptions {
-                preserve_source_newlines: params.preserve_source_newlines,
-                never_ascii_escape: params.never_ascii_escape,
-                terminate_unterminated_literals: params.terminate_unterminated_literals,
-                ..Default::default()
-            },
-            PrintHandlers::default(),
-            None,
-        );
-        Ok(p.emit(node, Node::NIL))
+        let mut source_file = Node::NIL;
+        if is_source_file(node) {
+            source_file = node;
+        }
+        Ok(new_printer(params).emit(node, source_file))
     }
 
     // Go: api/session.go:2625 handleEmit (tsgo#4699)
@@ -2797,4 +2774,44 @@ impl Drop for SnapshotDerefGuard {
     fn drop(&mut self) {
         project::Snapshot::deref(&self.snapshot, &self.session);
     }
+}
+
+// Go: api/session.go decodePrintNode (ts#64320)
+pub fn decode_print_node(encoded: &str) -> Result<Node, GoError> {
+    let data = match base64_std_encoding_decode_string(encoded) {
+        Ok(data) => data,
+        Err(err) => {
+            return Err(errors::errorf(
+                format!("{}: invalid base64 data: {}", *ERR_CLIENT_ERROR, err),
+                vec![ERR_CLIENT_ERROR.clone(), err],
+            ));
+        }
+    };
+
+    let node = match encoder::decode_nodes(&data) {
+        Ok(node) => node,
+        Err(err) => {
+            return Err(errors::errorf(
+                format!("{}: failed to decode AST: {}", *ERR_CLIENT_ERROR, err),
+                vec![ERR_CLIENT_ERROR.clone(), err],
+            ));
+        }
+    };
+    Ok(node)
+}
+
+// Go: api/session.go newPrinter (ts#64320)
+// PORT: private, so it does not collide with `printer::new_printer` in the
+// api prelude; it calls that one by path.
+fn new_printer(params: &PrintNodeParams) -> Printer {
+    crate::printer::new_printer(
+        PrinterOptions {
+            preserve_source_newlines: params.preserve_source_newlines,
+            never_ascii_escape: params.never_ascii_escape,
+            terminate_unterminated_literals: params.terminate_unterminated_literals,
+            ..Default::default()
+        },
+        PrintHandlers::default(),
+        None,
+    )
 }
