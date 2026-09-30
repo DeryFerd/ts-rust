@@ -26,7 +26,7 @@ child_test! {
         let base_snapshot = session.snapshot();
         let u = uri("file:///temporary.ts");
         let snapshot = session
-            .clone_snapshot_with_temporary_file(&bg(), &base_snapshot, &u, "export const value = 1;".to_string())
+            .clone_snapshot_with_temporary_file(&bg(), &base_snapshot, None, &u, "export const value = 1;".to_string())
             .unwrap_or_else(|err| panic!("CloneSnapshotWithTemporaryFile: {}", err.error()));
 
         assert_eq!(

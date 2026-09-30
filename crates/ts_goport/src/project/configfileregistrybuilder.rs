@@ -710,6 +710,10 @@ impl ConfigFileRegistryBuilder {
         summary: &FileChangeSummary,
         logger: Option<Rc<logging::LogTree>>,
     ) -> ChangeFileResult {
+        // ts#64115
+        if summary.invalidate_all {
+            return self.invalidate_cache(logger);
+        }
         let mut affected_projects: Option<FxHashSet<tspath::Path>> = None;
         let mut affected_files: Option<FxHashSet<tspath::Path>> = None;
         let mut should_invalidate_cache = false;

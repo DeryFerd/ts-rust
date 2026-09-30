@@ -46,6 +46,10 @@ pub struct Snapshot {
 
     pub builder_logs: Option<Rc<logging::LogTree>>,
     pub api_error: Option<GoError>,
+    // fileSystemOverride indicates that this snapshot was built from a filesystem
+    // supplied by an API update rather than the session host filesystem.
+    // ts#64115
+    pub file_system_override: bool,
 }
 
 impl Snapshot {
@@ -171,6 +175,7 @@ fn new_snapshot_with_host(
 
         builder_logs: None,
         api_error: None,
+        file_system_override: false,
     })
 }
 
@@ -184,6 +189,7 @@ impl Snapshot {
     pub fn clone_for_program(
         &self,
         ctx: &Context,
+        file_system: Option<Rc<dyn vfs::Fs>>,
         root_file_names: &[String],
         compiler_options: Option<Rc<CompilerOptions>>,
         project_references: Option<Vec<ProjectReference>>,
@@ -201,6 +207,7 @@ impl Snapshot {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 self.clone_for_program_body(
                     ctx,
+                    file_system.clone(),
                     root_file_names,
                     compiler_options.clone(),
                     project_references.clone(),
@@ -222,6 +229,7 @@ impl Snapshot {
 
         self.clone_for_program_body(
             ctx,
+            file_system,
             root_file_names,
             compiler_options,
             project_references,
@@ -240,6 +248,7 @@ impl Snapshot {
     fn clone_for_program_body(
         &self,
         ctx: &Context,
+        file_system: Option<Rc<dyn vfs::Fs>>,
         root_file_names: &[String],
         compiler_options: Option<Rc<CompilerOptions>>,
         project_references: Option<Vec<ProjectReference>>,
@@ -257,8 +266,10 @@ impl Snapshot {
         let logger = logger_out.clone();
 
         let start = Instant::now();
+        // ts#64115
+        let file_system = file_system.unwrap_or_else(|| store.fs.clone());
         let fs = new_snapshot_fs_builder(
-            store.fs.clone(),
+            file_system,
             self.fs.overlays.clone(),
             self.fs.overlays.clone(),
             self.fs.disk_files.clone(),
@@ -406,6 +417,7 @@ impl Snapshot {
     pub fn clone_with_temporary_file(
         &self,
         ctx: &Context,
+        file_system: Option<Rc<dyn vfs::Fs>>,
         uri: &lsproto::DocumentUri,
         new_text: String,
     ) -> Result<Rc<Snapshot>, GoError> {
@@ -440,9 +452,14 @@ impl Snapshot {
             )),
         );
 
+        // ts#64115
+        let file_system = file_system.unwrap_or_else(|| self.fs.fs.clone());
+
         Ok(self.clone_(
             ctx,
             SnapshotChange {
+                fs: Some(file_system),
+                file_system_override: self.file_system_override,
                 file_changes,
                 resource_request: ResourceRequest {
                     documents: vec![uri.clone()],
@@ -597,6 +614,19 @@ impl Snapshot {
         self.fs.fs.use_case_sensitive_file_names()
     }
 
+    // Go: project/snapshot.go:390 FileSystem (ts#64115)
+    // FileSystem returns the filesystem backing this snapshot.
+    pub fn file_system(&self) -> Rc<dyn vfs::Fs> {
+        self.fs.fs.clone()
+    }
+
+    // Go: project/snapshot.go:396 HasFileSystemOverride (ts#64115)
+    // HasFileSystemOverride reports whether this snapshot uses an API-supplied
+    // filesystem instead of the session host filesystem.
+    pub fn has_file_system_override(&self) -> bool {
+        self.file_system_override
+    }
+
     // Go: project/snapshot.go:135 ReadFile
     pub fn read_file(&self, file_name: &str) -> (String, bool) {
         let Some(handle) = self.get_file(file_name) else {
@@ -706,12 +736,31 @@ impl ls::Host for Snapshot {
 // PORT: Go `*collections.Set[T]` is `Option<FxHashSet<T>>` (nil is `None`).
 // `open_files` is an `IndexSet`, so API-opened files enter the API state in
 // request order (Go map order is random).
-#[derive(Clone, Debug, Default)]
+// PORT: Go nil `vfs.FS` is `None`. `Debug` skips the file system.
+#[derive(Clone, Default)]
 pub struct APISnapshotRequest {
     pub open_projects: Option<FxHashSet<String>>,
     pub close_projects: Option<FxHashSet<tspath::Path>>,
     pub open_files: Option<IndexSet<lsproto::DocumentUri>>,
     pub close_files: Option<FxHashSet<tspath::Path>>,
+    // ts#64115
+    pub file_system: Option<Rc<dyn vfs::Fs>>,
+    // ReplaceFileSystem indicates a total filesystem replacement. Layers use
+    // per-path file changes instead of invalidating all inherited state.
+    pub replace_file_system: bool,
+}
+
+impl std::fmt::Debug for APISnapshotRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("APISnapshotRequest")
+            .field("open_projects", &self.open_projects)
+            .field("close_projects", &self.close_projects)
+            .field("open_files", &self.open_files)
+            .field("close_files", &self.close_files)
+            .field("file_system", &self.file_system.is_some())
+            .field("replace_file_system", &self.replace_file_system)
+            .finish()
+    }
 }
 
 // Go: project/snapshot.go:164 ProjectTreeRequest
@@ -778,6 +827,12 @@ pub struct ResourceRequest {
 pub struct SnapshotChange {
     pub resource_request: ResourceRequest,
     pub reason: UpdateReason,
+    // fs overrides the session filesystem for this snapshot. It is used by API
+    // snapshots that supply their own memory or cache filesystem.
+    // ts#64115. PORT: Go nil `vfs.FS` is `None`.
+    pub fs: Option<Rc<dyn vfs::Fs>>,
+    pub file_system_override: bool,
+    pub replace_file_system: bool,
     // fileChanges are the changes that have occurred since the last snapshot.
     pub file_changes: FileChangeSummary,
     // compilerOptionsForInferredProjects is the compiler options to use for inferred projects.
@@ -962,8 +1017,18 @@ impl Snapshot {
             inferred_content_mappers = contributions.mappers.clone();
             inferred_content_mapper_extensions = contributions.extensions.clone();
         }
+        let mut base_fs = store.fs.clone();
+        if let Some(change_fs) = &change.fs {
+            base_fs = change_fs.clone();
+        }
+        // Total replacements and returning to the session host must not retain files
+        // from the previous filesystem. Layers invalidate only their per-path changes,
+        // including the first layer over a host-backed snapshot.
+        if change.replace_file_system || self.file_system_override && !change.file_system_override {
+            change.file_changes.invalidate_all = true;
+        }
         let fs = new_snapshot_fs_builder(
-            store.fs.clone(),
+            base_fs,
             self.fs.overlays.clone(),
             overlays.clone(),
             self.fs.disk_files.clone(),
@@ -1229,6 +1294,7 @@ impl Snapshot {
             s.inferred_project_content_mapper_extensions = inferred_content_mapper_extensions;
             s.builder_logs = logger.clone();
             s.api_error = api_error;
+            s.file_system_override = change.file_system_override;
         }
 
         for project in new_snapshot.project_collection.projects() {

@@ -110,15 +110,18 @@ impl SnapshotHost {
         file_changes: FileChangeSummary,
         api_request: Option<APISnapshotRequest>,
     ) -> (Rc<Snapshot>, Option<GoError>) {
-        let snapshot = self.update(
-            ctx,
-            base_snapshot,
-            SnapshotChange {
-                api_request,
-                file_changes,
-                ..Default::default()
-            },
-        );
+        let mut change = SnapshotChange {
+            api_request: api_request.clone(),
+            file_changes,
+            ..Default::default()
+        };
+        // ts#64115
+        if let Some(api_request) = &api_request {
+            change.fs = api_request.file_system.clone();
+            change.file_system_override = api_request.file_system.is_some();
+            change.replace_file_system = api_request.replace_file_system;
+        }
+        let snapshot = self.update(ctx, base_snapshot, change);
         let api_error = snapshot.api_error.clone();
         (snapshot, api_error)
     }
@@ -141,10 +144,11 @@ impl SnapshotHost {
         &self,
         ctx: &Context,
         base_snapshot: &Rc<Snapshot>,
+        file_system: Option<Rc<dyn vfs::Fs>>,
         uri: &lsproto::DocumentUri,
         new_text: String,
     ) -> Result<Rc<Snapshot>, GoError> {
-        base_snapshot.clone_with_temporary_file(ctx, uri, new_text)
+        base_snapshot.clone_with_temporary_file(ctx, file_system, uri, new_text)
     }
 
     // Go: project/snapshothost.go:106 CloneSnapshotForProgram
@@ -155,6 +159,7 @@ impl SnapshotHost {
         &self,
         ctx: &Context,
         base_snapshot: &Rc<Snapshot>,
+        file_system: Option<Rc<dyn vfs::Fs>>,
         root_file_names: &[String],
         options: Option<Rc<CompilerOptions>>,
         project_references: Option<Vec<ProjectReference>>,
@@ -164,6 +169,7 @@ impl SnapshotHost {
     ) -> Rc<Snapshot> {
         base_snapshot.clone_for_program(
             ctx,
+            file_system,
             root_file_names,
             options,
             project_references,

@@ -29,12 +29,22 @@ impl Session {
 
         let (mut file_changes, overlays, ata_changes, _) = self.flush_changes(ctx);
         merge_file_change_summary(&mut file_changes, api_file_changes);
+        // ts#64115
+        let mut fs: Option<Rc<dyn vfs::Fs>> = None;
+        let mut replace_file_system = false;
+        if let Some(api_request) = &api_request {
+            fs = api_request.file_system.clone();
+            replace_file_system = api_request.replace_file_system;
+        }
 
         let new_snapshot = self.update_snapshot_ref(
             ctx,
             overlays,
             SnapshotChange {
                 api_request,
+                file_system_override: fs.is_some(),
+                fs,
+                replace_file_system,
                 file_changes,
                 ata_changes,
                 ..Default::default()
