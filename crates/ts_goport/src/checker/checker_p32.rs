@@ -765,12 +765,12 @@ impl Checker {
             let args = self.get_effective_call_arguments(iife);
             let index_of_parameter = fn_
                 .parameters()
-                .to_vec()
                 .iter()
-                .position(|&p| p == parameter)
+                .position(|p| p == parameter)
                 .map_or(-1, |i| i as i32);
             if has_dot_dot_dot_token(parameter) {
                 let any_type = self.any_type;
+                let args: Vec<Node> = args.iter().collect();
                 return self.get_spread_argument_type(
                     &args,
                     index_of_parameter,
@@ -785,7 +785,7 @@ impl Checker {
             self.signature_links.get(iife).resolved_signature = any_signature;
             let t;
             if index_of_parameter < args.len() as i32 {
-                let arg_type = self.check_expression(args[index_of_parameter as usize]);
+                let arg_type = self.check_expression(args.get(index_of_parameter as usize));
                 t = self.get_widened_literal_type(arg_type);
             } else if parameter.initializer().is_some() {
                 t = TypeId::NIL;
@@ -1342,7 +1342,7 @@ impl Checker {
     // In a typed function call, an argument or substitution expression is contextually typed by the type of the corresponding parameter.
     pub fn get_contextual_type_for_argument(&mut self, call_target: Node, arg: Node) -> TypeId {
         let args = self.get_effective_call_arguments(call_target);
-        let arg_index = args.iter().position(|&a| a == arg).map_or(-1, |i| i as i32);
+        let arg_index = args.iter().position(|a| a == arg).map_or(-1, |i| i as i32);
         // -1 for e.g. the expression of a CallExpression, or the tag of a TaggedTemplateExpression
         if arg_index == -1 {
             return TypeId::NIL;

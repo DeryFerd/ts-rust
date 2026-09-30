@@ -6,6 +6,78 @@
 use crate::jsnum::Number;
 use crate::prelude::*;
 
+/// The result of `get_effective_call_arguments`: Go `[]*ast.Node`.
+// PERF: callcopy1. Go returns the call's own argument list without a copy.
+// `Slice` is that list; it is `Copy`, so a caller that needs only a length
+// or a position reads it in place. The other cases build a new list.
+#[derive(Debug)]
+pub enum EffectiveArgs {
+    /// The call's arguments, with no spread (`node.arguments()`).
+    Slice(NodeSlice),
+    /// Synthetic arguments: spreads of tuple types, tagged templates, JSX,
+    /// decorators and `instanceof`.
+    Owned(Vec<Node>),
+}
+
+impl EffectiveArgs {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Slice(args) => args.len(),
+            Self::Owned(args) => args.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Go `args[i]`. Panics when `i` is out of range, like Go.
+    #[must_use]
+    pub fn get(&self, i: usize) -> Node {
+        match self {
+            Self::Slice(args) => args.get(i),
+            Self::Owned(args) => args[i],
+        }
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> EffectiveArgsIter<'_> {
+        match self {
+            Self::Slice(args) => EffectiveArgsIter::Slice(args.iter()),
+            Self::Owned(args) => EffectiveArgsIter::Owned(args.iter()),
+        }
+    }
+}
+
+/// Iterator over `EffectiveArgs`. Yields `Node` by value.
+pub enum EffectiveArgsIter<'a> {
+    Slice(NodeSliceIter),
+    Owned(std::slice::Iter<'a, Node>),
+}
+
+impl Iterator for EffectiveArgsIter<'_> {
+    type Item = Node;
+
+    #[inline]
+    fn next(&mut self) -> Option<Node> {
+        match self {
+            Self::Slice(iter) => iter.next(),
+            Self::Owned(iter) => iter.next().copied(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Slice(iter) => iter.size_hint(),
+            Self::Owned(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for EffectiveArgsIter<'_> {}
+
 impl Checker {
     // Go: checker/checker.go:29672 getContextualTypeForObjectLiteralElement
     pub fn get_contextual_type_for_object_literal_element(
@@ -201,16 +273,16 @@ impl Checker {
 
     // Returns the effective arguments for an expression that works like a function invocation.
     // Go: checker/checker.go:29794 getEffectiveCallArguments
-    pub fn get_effective_call_arguments(&mut self, node: Node) -> Vec<Node> {
+    pub fn get_effective_call_arguments(&mut self, node: Node) -> EffectiveArgs {
         if is_jsx_opening_fragment(node) {
             // This attributes Type does not include a children property yet, the same way a fragment created with <React.Fragment> does not at this stage
             let empty_fresh_jsx_object_type = self.empty_fresh_jsx_object_type;
-            return vec![self.create_synthetic_expression(
+            return EffectiveArgs::Owned(vec![self.create_synthetic_expression(
                 node,
                 empty_fresh_jsx_object_type,
                 false,
                 Node::NIL,
-            )];
+            )]);
         } else if is_tagged_template_expression(node) {
             let template = node.template();
             let get_global_template_strings_array_type =
@@ -223,7 +295,7 @@ impl Checker {
                 Node::NIL,
             );
             if !is_template_expression(template) {
-                return vec![first_arg];
+                return EffectiveArgs::Owned(vec![first_arg]);
             }
             let spans = template.template_spans().nodes();
             let mut args = Vec::with_capacity(spans.len() + 1);
@@ -231,23 +303,24 @@ impl Checker {
             for span in spans.iter() {
                 args.push(span.expression());
             }
-            return args;
+            return EffectiveArgs::Owned(args);
         } else if is_decorator(node) {
-            return self.get_effective_decorator_arguments(node);
+            return EffectiveArgs::Owned(self.get_effective_decorator_arguments(node));
         } else if is_binary_expression(node) {
             // Handles instanceof operator
-            return vec![node.left()];
+            return EffectiveArgs::Owned(vec![node.left()]);
         } else if is_jsx_opening_like_element(node) {
             if node.attributes().properties().len() != 0
                 || (is_jsx_opening_element(node) && node.parent().children().nodes().len() != 0)
             {
-                return vec![node.attributes()];
+                return EffectiveArgs::Owned(vec![node.attributes()]);
             }
-            return Vec::new();
+            return EffectiveArgs::Owned(Vec::new());
         }
-        // PERF: read the arguments in place (`NodeSlice` is program data) and
-        // copy them only into the result. This is `get_spread_argument_index`
-        // on the slice.
+        // PERF: callcopy1. Without a spread the result is the argument list
+        // itself (`NodeSlice` is program data), like Go, which returns
+        // `node.Arguments()` without a copy. The spread search is
+        // `get_spread_argument_index` on the slice.
         let args = node.arguments();
         if let Some(spread_index) = args.iter().position(is_spread_argument) {
             // Create synthetic arguments from spreads of tuple types.
@@ -285,9 +358,9 @@ impl Checker {
                     effective_args.push(arg);
                 }
             }
-            return effective_args;
+            return EffectiveArgs::Owned(effective_args);
         }
-        args.to_vec()
+        EffectiveArgs::Slice(args)
     }
 
     // Go: checker/checker.go:29860 getSpreadArgumentIndex
