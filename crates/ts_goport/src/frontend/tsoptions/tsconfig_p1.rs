@@ -536,7 +536,9 @@ pub fn convert_config_file_to_object(
 fn is_slice_value(value: &CompilerOptionsValue) -> bool {
     matches!(
         value,
-        CompilerOptionsValue::List(_) | CompilerOptionsValue::StringList(_)
+        CompilerOptionsValue::List(_)
+            | CompilerOptionsValue::NilList
+            | CompilerOptionsValue::StringList(_)
     )
 }
 
@@ -639,10 +641,12 @@ pub fn validate_json_option_value(
 }
 
 // Go: tsoptions/tsconfigparsing.go:398 convertJsonOptionOfListType
-// PORT: Go returns a `[]any` that callers store in an `any`. A typed nil
-// slice is not Go nil, so every return is a `List` (a nil slice is an empty
-// `List`). Go filters with `v != 0`, which never matches a JSON `float64`,
-// so `Number(0.0)` is kept.
+// PORT: Go returns a `[]any` that callers store in an `any`, where a nil
+// slice is not Go nil. A non-nil input stays a non-nil `List` through
+// `core.MapIndex` and `core.Filter`. A `NilList` input (an array of nulls)
+// and a value that is not an array give a `NilList`, so the option stays
+// unset. Go filters with `v != 0`, which never matches a JSON `float64`, so
+// `Number(0.0)` is kept.
 pub fn convert_json_option_of_list_type(
     option: &CommandLineOption,
     values: CompilerOptionsValue,
@@ -685,7 +689,7 @@ pub fn convert_json_option_of_list_type(
         }
         return (CompilerOptionsValue::List(filtered_values), errors);
     }
-    (CompilerOptionsValue::List(Vec::new()), errors)
+    (CompilerOptionsValue::NilList, errors)
 }
 
 // Go: tsoptions/tsconfigparsing.go:428 configDirTemplate
@@ -872,8 +876,8 @@ pub fn get_extends_config_path_or_array(
     let mut errors: Vec<Diagnostic> = Vec::new();
     if is_slice_value(value) {
         // PORT: Go `value.([]any)` panics for a `[]string`. Config JSON
-        // values are `List`, so only `List` gets here.
-        let CompilerOptionsValue::List(values) = value else {
+        // values are `List` or `NilList`, so only those get here.
+        let Some(values) = value.as_any_slice() else {
             panic!("interface conversion: value is {value:?}, not []any");
         };
         for (index, file_name) in values.iter().enumerate() {
@@ -1128,8 +1132,7 @@ pub fn convert_options_from_json<O: OptionParser>(
 
 // Go: tsoptions/tsconfigparsing.go:664 convertArrayLiteralExpressionToJson
 // PORT: A Go nil `[]any` (every element converted to nil) is still a
-// non-nil `any`. It becomes an empty `List`, so a reader cannot tell it
-// from `[]`.
+// non-nil `any`. It is a `NilList`, so readers can tell it from `[]`.
 pub fn convert_array_literal_expression_to_json(
     source_file: Node,
     elements: NodeSlice,
@@ -1168,6 +1171,9 @@ pub fn convert_array_literal_expression_to_json(
         if !converted_value.is_nil() {
             value.push(converted_value);
         }
+    }
+    if value.is_empty() {
+        return (CompilerOptionsValue::NilList, errors);
     }
     (CompilerOptionsValue::List(value), errors)
 }
@@ -1550,6 +1556,8 @@ fn normalize_json_value(value: CompilerOptionsValue) -> CompilerOptionsValue {
         CompilerOptionsValue::List(value) => {
             CompilerOptionsValue::List(value.into_iter().map(normalize_json_value).collect())
         }
+        // Go `case []any` makes a non-nil slice of the same length.
+        CompilerOptionsValue::NilList => CompilerOptionsValue::List(Vec::new()),
         CompilerOptionsValue::StringList(value) => CompilerOptionsValue::List(
             value
                 .into_iter()

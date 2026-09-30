@@ -3068,6 +3068,8 @@ pub fn to_protocol_json_value(
             }
             CompilerOptionsValue::List(result)
         }
+        // Go `case []any` makes a non-nil slice, also for a nil `[]any`.
+        CompilerOptionsValue::NilList => CompilerOptionsValue::List(Vec::new()),
         value => value.clone(),
     }
 }

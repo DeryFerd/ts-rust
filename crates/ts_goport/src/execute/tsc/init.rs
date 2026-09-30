@@ -353,9 +353,9 @@ fn format_single_value(
 
 // Go: execute/tsc/init.go:76 formatValueOrArray
 // PORT: Go tests `reflect.Kind() == reflect.Slice`. The slice values here
-// are `List` (Go `[]any`: a parsed list option or the `types` default) and
-// `StringList` (Go `[]string`: the parser's value for a list option with no
-// argument).
+// are `List` and `NilList` (Go `[]any`: a parsed list option or the `types`
+// default) and `StringList` (Go `[]string`: the parser's value for a list
+// option with no argument).
 fn format_value_or_array(setting_name: &str, value: &CompilerOptionsValue) -> String {
     // PORT: the Go loop has no break, so the last declaration with the name
     // wins.
@@ -371,6 +371,7 @@ fn format_value_or_array(setting_name: &str, value: &CompilerOptionsValue) -> St
 
     let elems: Vec<CompilerOptionsValue> = match value {
         CompilerOptionsValue::List(values) => values.clone(),
+        CompilerOptionsValue::NilList => Vec::new(),
         CompilerOptionsValue::StringList(values) => values
             .iter()
             .map(|value| CompilerOptionsValue::String(value.clone()))

@@ -357,6 +357,8 @@ pub fn marshal_any(enc: &mut String, v: &CompilerOptionsValue) -> Result<(), Jso
             enc.push('}');
         }
         CompilerOptionsValue::StringList(list) => list.marshal_json_to(enc)?,
+        // Go v2 writes a nil slice as `[]`.
+        CompilerOptionsValue::NilList => enc.push_str("[]"),
         // Go `*collections.OrderedMap[string, []string]`: nil is null, and a
         // nil `[]string` value is `[]`.
         CompilerOptionsValue::Paths(None) => enc.push_str("null"),

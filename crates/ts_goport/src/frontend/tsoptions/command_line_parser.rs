@@ -410,9 +410,11 @@ impl CommandLineParser {
                     }
                     CommandLineOptionKind::LIST => {
                         let (result, err) = self.parse_list_type_option(opt, &args[i]);
-                        let consumed = !result.is_empty() || !err.is_empty();
-                        self.options
-                            .insert(opt.name.to_string(), CompilerOptionsValue::List(result));
+                        let consumed = result
+                            .as_any_slice()
+                            .is_some_and(|result| !result.is_empty())
+                            || !err.is_empty();
+                        self.options.insert(opt.name.to_string(), result);
                         self.errors.extend(err);
                         if consumed {
                             i += 1;
@@ -448,21 +450,22 @@ impl CommandLineParser {
         &self,
         opt: &'static CommandLineOption,
         value: &str,
-    ) -> (Vec<CompilerOptionsValue>, Vec<Diagnostic>) {
+    ) -> (CompilerOptionsValue, Vec<Diagnostic>) {
         parse_list_type_option(opt, value)
     }
 }
 
 // Go: tsoptions/commandlineparser.go:339 ParseListTypeOption
-// PORT: Go returns `[]any`; the elements are `CompilerOptionsValue`.
+// PORT: Go returns `[]any`: a `List`, or a `NilList` when `core.MapFiltered`
+// keeps no element (for example `--types ,`), so the option stays unset.
 pub fn parse_list_type_option(
     opt: &'static CommandLineOption,
     value: &str,
-) -> (Vec<CompilerOptionsValue>, Vec<Diagnostic>) {
+) -> (CompilerOptionsValue, Vec<Diagnostic>) {
     let value = value.trim();
     let mut errors: Vec<Diagnostic> = Vec::new();
     if value.starts_with('-') {
-        return (Vec::new(), errors);
+        return (CompilerOptionsValue::List(Vec::new()), errors);
     }
     if opt.kind == CommandLineOptionKind::LIST_OR_ELEMENT && !value.contains(',') {
         let (val, err) = validate_json_option_value(
@@ -472,16 +475,19 @@ pub fn parse_list_type_option(
             Node::NIL,
         );
         if !err.is_empty() {
-            return (Vec::new(), err);
+            return (CompilerOptionsValue::List(Vec::new()), err);
         }
         // PORT: Go `val.(string)` panics when the value is not a string.
         let CompilerOptionsValue::String(s) = val else {
             panic!("interface conversion: interface {{}} is not string");
         };
-        return (vec![CompilerOptionsValue::String(s)], errors);
+        return (
+            CompilerOptionsValue::List(vec![CompilerOptionsValue::String(s)]),
+            errors,
+        );
     }
     if value.is_empty() {
-        return (Vec::new(), errors);
+        return (CompilerOptionsValue::List(Vec::new()), errors);
     }
     let values: Vec<&str> = value.split(',').collect();
     // PORT: Go `opt.Elements()` is non-nil for list options; a nil value
@@ -506,7 +512,7 @@ pub fn parse_list_type_option(
                 }
                 errors.extend(err);
             }
-            (elements, errors)
+            (map_filtered_list(elements), errors)
         }
         CommandLineOptionKind::BOOLEAN
         | CommandLineOptionKind::OBJECT
@@ -533,8 +539,17 @@ pub fn parse_list_type_option(
                 }
                 errors.extend(err);
             }
-            (result, errors)
+            (map_filtered_list(result), errors)
         }
+    }
+}
+
+/// Go `core.MapFiltered` returns a nil slice when it keeps no element.
+fn map_filtered_list(values: Vec<CompilerOptionsValue>) -> CompilerOptionsValue {
+    if values.is_empty() {
+        CompilerOptionsValue::NilList
+    } else {
+        CompilerOptionsValue::List(values)
     }
 }
 

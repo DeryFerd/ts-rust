@@ -664,6 +664,7 @@ pub fn is_zero_compiler_option_value(
         V::WatchDirectoryKind(v) => *v == Default::default(),
         V::PollingKind(v) => *v == Default::default(),
         V::List(v) => v.is_empty(),
+        V::NilList => true,
         V::Map(v) => v.is_empty(),
         V::StringList(v) => v.is_empty(),
         V::Paths(v) => v.is_none(),
