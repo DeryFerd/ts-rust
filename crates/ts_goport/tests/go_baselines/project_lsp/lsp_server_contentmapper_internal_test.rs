@@ -179,16 +179,16 @@ child_test! {
             manifest: Some(manifest(name, &[name])),
         };
         let result = lsp::parse_content_mapper_contributions(&[
-            lsproto::ContentMapperContribution {
+            Some(lsproto::ContentMapperContribution {
                 contributor_id: "first".to_string(),
                 extensions: vec![".vue".to_string()],
                 inferred_project_contribution: Some(inferred_project_contribution("first")),
-            },
-            lsproto::ContentMapperContribution {
+            }),
+            Some(lsproto::ContentMapperContribution {
                 contributor_id: "second".to_string(),
                 extensions: vec![".VUE".to_string()],
                 inferred_project_contribution: Some(inferred_project_contribution("second")),
-            },
+            }),
         ]);
         match result {
             Ok(_) => panic!("expected an error"),
@@ -199,11 +199,11 @@ child_test! {
             ),
         }
 
-        let result = lsp::parse_content_mapper_contributions(&[lsproto::ContentMapperContribution {
+        let result = lsp::parse_content_mapper_contributions(&[Some(lsproto::ContentMapperContribution {
             contributor_id: "built-in".to_string(),
             extensions: vec![".TS".to_string()],
             inferred_project_contribution: None,
-        }]);
+        })]);
         match result {
             Ok(_) => panic!("expected an error"),
             Err(err) => assert!(

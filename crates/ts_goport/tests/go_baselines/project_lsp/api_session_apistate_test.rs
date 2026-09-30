@@ -75,10 +75,10 @@ fn doc_uri(project_session: &Rc<project::Session>, name: &str) -> lsproto::Docum
 fn changed_watched_file(project_session: &Rc<project::Session>, name: &str) {
     project_session.did_change_watched_files(
         &bg(),
-        &[lsproto::FileEvent {
+        &[Some(lsproto::FileEvent {
             uri: doc_uri(project_session, name),
             type_: CHANGED,
-        }],
+        })],
     );
 }
 
