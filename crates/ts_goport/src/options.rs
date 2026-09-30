@@ -672,6 +672,7 @@ impl ScriptTarget {
             10 => "ES2023",
             11 => "ES2024",
             12 => "ES2025",
+            13 => "ES2026",
             99 => "ESNext",
             100 => "JSON",
             _ => return format!("ScriptTarget({})", self.0),
