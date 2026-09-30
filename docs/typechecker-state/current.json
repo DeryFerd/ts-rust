@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "status": "active",
-  "decision": "REVIEW",
+  "decision": "STOP",
   "updated": "2026-09-30T00:03:31.631027+00:00",
-  "reason": "Batch recovery-continuation-go-checker-port-26 accepted at R140. Batch recovery-continuation-go-checker-port-27 opened at R141.",
+  "reason": "R141 stopped by the independent reviewer (goport-config thread stack); repair as R142.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -695,7 +695,14 @@
     "runtimeAuthorized": true,
     "expectedCompilerRecoveries": [],
     "expectationUpdates": [],
-    "verdictHistory": [],
+    "verdictHistory": [
+      {
+        "revision": 141,
+        "reviewer": "STOP",
+        "auditor": "PASS",
+        "note": "r141-stop-2026-09-30"
+      }
+    ],
     "focusedResults": [],
     "runtimeToolHandles": [],
     "commands": [],
@@ -730,14 +737,19 @@
     "auditor": {
       "role": "audit_accepted_roster",
       "agent": "aae6dbb734c07335a",
-      "verdict": "PENDING"
+      "verdict": "PASS",
+      "revision": 141,
+      "sourceFingerprint": "1e54b1f619a0d77e7cfbb5b456cb13f26c3ce6dee439b50aa4818bc07e68ce30"
     },
     "reviewer": {
       "role": "independent_reviewer",
       "agent": "a0bc38f3370585da3",
-      "verdict": "PENDING"
+      "verdict": "STOP",
+      "revision": 141,
+      "sourceFingerprint": "1e54b1f619a0d77e7cfbb5b456cb13f26c3ce6dee439b50aa4818bc07e68ce30",
+      "reason": "goport-config threads use the default 2 MiB stack; deep tsconfig nesting aborts tsc -b (exit 134) where R140 and Go build; note r141-stop-2026-09-30"
     },
-    "nextPermittedAction": "Run the R141 pipeline (candidate.sh side)."
+    "nextPermittedAction": "Repair R141 as R142 in this batch: goport-config and build info prefetch thread stacks, the reviewer repro, doc fixes; no new feature work until the repair is accepted."
   },
   "parallelModelPreference": {
     "model": "GPT-6 Astra",
