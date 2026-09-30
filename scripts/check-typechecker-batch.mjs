@@ -1090,11 +1090,13 @@ tree, Cargo.toml and Cargo.lock), as candidate.sh reuses it by that key.
 - gateIdMap {path, sha256} (optional): the gate id map of a pin bump, a TSV
   of old id, new id and case path (format in gate-compare.py). A line moves
   an id. A removal line (new id "-", and a note that names the Go commit that
-  deletes the case) removes a case only when gate-compare.py checks the
+  deletes the case; gate-compare.py checks only that the note has a word of
+  7 to 40 hex digits) removes a case only when gate-compare.py checks the
   removal against Go at both pins (accountability rules, "Pin bumps"): the
   line's case path is the base item's, the case file is in the base pin's Go
-  checkout, and neither the new pin's Go checkout nor the new run has the
-  case at its path or its moved path. Else its base id is a removed id.
+  checkout, the new pin's Go checkout has neither that path nor its moved
+  path, and no new run item of the line's family has either path. Else its
+  base id is a removed id.
   gate-compare.py lists the removed cases in idMap.removed. The file must
   have that sha256, and the history row and both verdicts carry it as
   gateIdMapSha256. The check passes it and batch.gateToolChanges to
