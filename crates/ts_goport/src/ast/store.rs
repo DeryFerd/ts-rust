@@ -1943,12 +1943,6 @@ impl FileStore {
     fn slot_text_name_of(&self, index: usize) -> Name {
         self.kids[index].text_name(self.kinds[index])
     }
-
-    /// `mark_source_file_roots`: the root bit of slot `index`.
-    #[inline]
-    fn set_source_file_root(&mut self, index: usize, root: bool) {
-        self.records[index].set_bit(NodeRecord::SOURCE_FILE_ROOT, root);
-    }
 }
 
 /// `FileStore::unlink_children` on the link column `links`.
@@ -3926,36 +3920,49 @@ fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
 /// the store (a synthetic or foreign parent) stays unmarked and is walked
 /// at read time.
 fn mark_source_file_roots(store: &mut FileStore) {
+    // PERF: step 4b. The walk reads the record and kind columns out of the
+    // store, cut to one length, so it has no bounds checks for them.
+    let mut records = std::mem::take(&mut store.records);
+    let kinds = std::mem::take(&mut store.kinds);
+    let slots = records.len();
+    store.root_slot = mark_roots(&mut records, &kinds[..slots]);
+    store.records = records;
+    store.kinds = kinds;
+}
+
+/// `mark_source_file_roots` on the columns of a store: the root slot (0 for
+/// none).
+fn mark_roots(records: &mut [NodeRecord], kinds: &[SyntaxKind]) -> u32 {
+    assert_eq!(records.len(), kinds.len(), "one kind per record");
     // PORT: the parser makes the SourceFile node last, so the root is the
     // last SourceFile slot. Any other SourceFile node stays unmarked.
-    let Some(root) = (0..store.records.len())
+    let Some(root) = (0..records.len())
         .rev()
-        .find(|&i| store.records[i].is_node() && store.kinds[i] == SyntaxKind::SourceFile)
+        .find(|&i| records[i].is_node() && kinds[i] == SyntaxKind::SourceFile)
     else {
-        return;
+        return 0;
     };
-    store.root_slot = root as u32;
 
     const UNSEEN: u8 = 0;
     const ON_PATH: u8 = 1;
     const ROOT: u8 = 2;
     const NOT_ROOT: u8 = 3;
-    let mut state = vec![UNSEEN; store.records.len()];
+    let mut state = vec![UNSEEN; records.len()];
     let mut path = Vec::new();
     // The parser makes a parent after its children, so most parents have a
     // higher slot. Walking the slots down finds them already marked.
-    for start in (1..store.records.len()).rev() {
-        let record = &store.records[start];
+    for start in (1..records.len()).rev() {
+        let record = &records[start];
         if !record.is_node() {
             continue;
         }
-        if store.kinds[start] != SyntaxKind::SourceFile
+        if kinds[start] != SyntaxKind::SourceFile
             && let Some(parent) = record.local_parent()
             && matches!(state[parent], ROOT | NOT_ROOT)
         {
             let result = state[parent];
             state[start] = result;
-            store.set_source_file_root(start, result == ROOT);
+            records[start].set_bit(NodeRecord::SOURCE_FILE_ROOT, result == ROOT);
             continue;
         }
         let mut cur = start;
@@ -3968,19 +3975,20 @@ fn mark_source_file_roots(store: &mut FileStore) {
             }
             state[cur] = ON_PATH;
             path.push(cur);
-            if store.kinds[cur] == SyntaxKind::SourceFile {
+            if kinds[cur] == SyntaxKind::SourceFile {
                 break if cur == root { ROOT } else { NOT_ROOT };
             }
-            let Some(parent) = store.records[cur].local_parent() else {
+            let Some(parent) = records[cur].local_parent() else {
                 break NOT_ROOT;
             };
             cur = parent;
         };
         for i in path.drain(..) {
             state[i] = result;
-            store.set_source_file_root(i, result == ROOT);
+            records[i].set_bit(NodeRecord::SOURCE_FILE_ROOT, result == ROOT);
         }
     }
+    root as u32
 }
 
 // ──────────────────────────────────────────────────────────────────────
