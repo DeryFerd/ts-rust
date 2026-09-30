@@ -742,6 +742,10 @@ pub struct Session {
     pub module_resolvers: RefCell<FxHashMap<ModuleResolverID, Rc<ModuleResolverRegistration>>>,
     pub program_resolution_contexts: Rc<ProgramResolutionContexts>,
     pub conn: RefCell<Option<Rc<dyn ipc::Conn>>>,
+    // ts#64434
+    // PORT: the Go `sourceFileLeasesMu` lock is not ported (one thread).
+    pub source_file_leases: RefCell<FxHashMap<SourceFileLeaseID, Rc<project::SourceFileLease>>>,
+    pub next_source_file_lease_id: Cell<u64>,
 
     pub cpu_profiler: crate::pprof::CpuProfiler,
 }
@@ -827,6 +831,8 @@ pub fn new_session(
         module_resolvers: RefCell::new(FxHashMap::default()),
         program_resolution_contexts: Rc::new(ProgramResolutionContexts::default()),
         conn: RefCell::new(None),
+        source_file_leases: RefCell::new(FxHashMap::default()),
+        next_source_file_lease_id: Cell::new(0),
         cpu_profiler: crate::pprof::CpuProfiler::default(),
     };
     if let Some(options) = options {
@@ -1223,6 +1229,10 @@ impl ipc::Handler for Session {
                 .handle_batch_requests(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::RELEASE.0 => self.handle_release(ctx, Some(assert_params(&parsed))),
+            // ts#64434
+            m if m == Method::RELEASE_SOURCE_FILE.0 => {
+                self.handle_release_source_file(Some(assert_params(&parsed)))
+            }
             m if m == Method::INITIALIZE.0 => self.handle_initialize(ctx).map(to_any),
             // ts#64204
             m if m == Method::CREATE_SNAPSHOT.0 => self
@@ -2696,18 +2706,18 @@ impl Session {
             .expect("NewConfigFileResponse of a parsed command line"))
     }
 
-    // Go: api/session.go handleCreateSourceFile (ts#64216)
+    // Go: api/session.go handleCreateSourceFile (ts#64216, ts#64434)
     pub fn handle_create_source_file(
         &self,
         _ctx: &Context,
         params: &CreateSourceFileParams,
     ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
-        let source_file =
+        let lease =
             self.create_source_file(&params.file_name, &params.source_text, &params.options)?;
-        self.encode_source_file_response(source_file.root)
+        self.encode_leased_source_file(lease)
     }
 
-    // Go: api/session.go handleCreateSourceFileFromFile (ts#64216)
+    // Go: api/session.go handleCreateSourceFileFromFile (ts#64216, ts#64434)
     pub fn handle_create_source_file_from_file(
         &self,
         _ctx: &Context,
@@ -2726,19 +2736,17 @@ impl Session {
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
         }
-        let source_file = self.create_source_file(&file_name, &source_text, &params.options)?;
-        self.encode_source_file_response(source_file.root)
+        let lease = self.create_source_file(&file_name, &source_text, &params.options)?;
+        self.encode_leased_source_file(lease)
     }
 
-    // Go: api/session.go createSourceFile (ts#64216)
-    // PORT: returns the parsed file, which keeps the file's nodes alive while
-    // the caller encodes them.
+    // Go: api/session.go createSourceFile (ts#64216, ts#64434)
     pub fn create_source_file(
         &self,
         file_name: &str,
         source_text: &str,
         options: &CreateSourceFileOptions,
-    ) -> Result<Rc<crate::frontend::parser::ParsedSourceFile>, GoError> {
+    ) -> Result<Rc<project::SourceFileLease>, GoError> {
         let mut script_kind = options.script_kind;
         if script_kind == ScriptKind::UNKNOWN {
             script_kind = crate::frontend::core_ext::ensure_script_kind_from_file_name(file_name);
@@ -2755,15 +2763,92 @@ impl Session {
         let file_name =
             tspath::get_normalized_absolute_path(file_name, &self.get_current_directory());
         let path = self.to_path(&file_name);
-        Ok(Rc::new(crate::frontend::parser::parse_source_file(
-            &crate::frontend::parser::SourceFileParseOptions {
+        Ok(self.acquire_source_file(
+            crate::frontend::parser::SourceFileParseOptions {
                 file_name,
                 path,
                 ..Default::default()
             },
             source_text,
             script_kind,
-        )))
+        ))
+    }
+
+    // Go: api/session.go acquireSourceFile (ts#64434)
+    pub fn acquire_source_file(
+        &self,
+        options: crate::frontend::parser::SourceFileParseOptions,
+        source_text: &str,
+        script_kind: ScriptKind,
+    ) -> Rc<project::SourceFileLease> {
+        self.snapshot_host
+            .acquire_source_file(options, source_text, script_kind)
+    }
+
+    // Go: api/session.go encodeLeasedSourceFile (ts#64434)
+    pub fn encode_leased_source_file(
+        &self,
+        lease: Rc<project::SourceFileLease>,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let mut data = match encoder::encode_source_file(lease.source_file()) {
+            Ok((data, _)) => data,
+            Err(err) => {
+                lease.release();
+                return Err(errors::errorf(
+                    format!("failed to encode source file: {err}"),
+                    vec![err],
+                ));
+            }
+        };
+        self.next_source_file_lease_id
+            .set(self.next_source_file_lease_id.get() + 1);
+        let id = SourceFileLeaseID(self.next_source_file_lease_id.get());
+        encoder::set_source_file_lease(&mut data, id.0);
+        self.source_file_leases.borrow_mut().insert(id, lease);
+        if self.use_binary_responses {
+            return Ok(to_any(RawBinary(data)));
+        }
+        Ok(to_any(SourceFileResponse {
+            data: base64_std_encoding_encode_to_string(&data),
+        }))
+    }
+
+    // Go: api/session.go handleReleaseSourceFile (ts#64434)
+    pub fn handle_release_source_file(
+        &self,
+        params: Option<&ReleaseSourceFileParams>,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let Some(params) = params.filter(|params| params.lease.0 != 0) else {
+            return Err(errors::errorf(
+                format!("{}: empty source file lease", *ERR_CLIENT_ERROR),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        let lease = self.source_file_leases.borrow_mut().remove(&params.lease);
+        let Some(lease) = lease else {
+            return Err(errors::errorf(
+                format!(
+                    "{}: source file lease {} not found",
+                    *ERR_CLIENT_ERROR, params.lease.0
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        lease.release();
+        Ok(to_any(true))
+    }
+
+    // Go: api/session.go releaseSourceFileLeases (ts#64434)
+    pub fn release_source_file_leases(&self) {
+        let leases: Vec<Rc<project::SourceFileLease>> = self
+            .source_file_leases
+            .borrow_mut()
+            .drain()
+            .map(|(_, lease)| lease)
+            .collect();
+        for lease in leases {
+            lease.release();
+        }
     }
 
     // Go: api/session.go:1242 handleTranspile (tsgo#4849)

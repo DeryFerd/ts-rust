@@ -138,6 +138,9 @@ pub struct SnapshotID(pub u64);
 // ts#64299
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ModuleResolverID(pub u64);
+// ts#64434
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SourceFileLeaseID(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SymbolID(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -185,7 +188,7 @@ macro_rules! handle_json {
     )*};
 }
 
-handle_json!(uint: SnapshotID, ModuleResolverID, SymbolID, TypeID, SignatureID);
+handle_json!(uint: SnapshotID, ModuleResolverID, SourceFileLeaseID, SymbolID, TypeID, SignatureID);
 handle_json!(string: NodeHandle);
 
 // PORT: Go `project.ID` and `project.Syntheticproject::ID` (ts#64319) are Go
@@ -274,6 +277,8 @@ pub fn signature_handle(sig: SignatureId) -> SignatureID {
 // Go: proto.go:56
 impl Method {
     pub const RELEASE: Method = Method(Cow::Borrowed("release"));
+    // ts#64434
+    pub const RELEASE_SOURCE_FILE: Method = Method(Cow::Borrowed("releaseSourceFile"));
 
     // ts#63937
     pub const BATCH_REQUESTS: Method = Method(Cow::Borrowed("batchRequests"));
@@ -1378,6 +1383,11 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<BatchRequestsParams>,
     );
     m.insert(Method::RELEASE, unmarshaller_for::<ReleaseParams>);
+    // ts#64434
+    m.insert(
+        Method::RELEASE_SOURCE_FILE,
+        unmarshaller_for::<ReleaseSourceFileParams>,
+    );
     m.insert(Method::INITIALIZE, no_params);
     // ts#64204
     m.insert(
@@ -2310,6 +2320,16 @@ pub struct ReleaseParams {
 
 proto_json!(both ReleaseParams {
     snapshot: "snapshot" plain,
+});
+
+// Go: proto.go ReleaseSourceFileParams (ts#64434)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReleaseSourceFileParams {
+    pub lease: SourceFileLeaseID,
+}
+
+proto_json!(both ReleaseSourceFileParams {
+    lease: "lease" plain,
 });
 
 // Go: proto.go:414 ProfileParams

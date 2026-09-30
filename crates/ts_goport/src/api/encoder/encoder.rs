@@ -68,11 +68,16 @@ pub const HEADER_OFFSET_STRING_DATA: usize = 28;
 pub const HEADER_OFFSET_EXTENDED_DATA: usize = 32;
 pub const HEADER_OFFSET_STRUCTURED_DATA: usize = 36;
 pub const HEADER_OFFSET_NODES: usize = 40;
-pub const HEADER_SIZE: usize = 44;
+// ts#64434: source file ID and lease ID (uint64 each) and the binder data
+// offset.
+pub const HEADER_OFFSET_SOURCE_FILE_ID: usize = 44;
+pub const HEADER_OFFSET_SOURCE_FILE_LEASE: usize = 52;
+pub const HEADER_OFFSET_BINDER_DATA: usize = 60;
+pub const HEADER_SIZE: usize = 64;
 
 // Go: api/encoder/encoder.go:66 ProtocolVersion
-// ts#63957: 7 -> 8.
-pub const PROTOCOL_VERSION: u8 = 8;
+// ts#63957: 7 -> 8. ts#64434: 8 -> 9.
+pub const PROTOCOL_VERSION: u8 = 9;
 
 // Source File Binary Format
 // =========================
@@ -87,14 +92,14 @@ pub const PROTOCOL_VERSION: u8 = 8;
 //
 // | Section            | Length             | Description                                                                                     |
 // | ------------------ | ------------------ | ----------------------------------------------------------------------------------------------- |
-// | Header             | 44 bytes           | Contains the content hash, parse options, flags, and byte offsets to the start of each section. |
+// | Header             | 64 bytes           | Contains the content hash, parse options, flags, file metadata, and byte offsets to the start of each section. |
 // | String offsets     | 8 bytes per string | Pairs of starting byte offsets and ending byte offsets into the **string data** section.        |
 // | String data        | variable           | UTF-8 encoded string data.                                                                      |
 // | Extended node data | variable           | Extra data for some kinds of nodes.                                                             |
 // | Structured data    | variable           | Msgpack-encoded metadata blobs (e.g. file references).                                         |
 // | Nodes              | 28 bytes per node  | Defines the AST structure of the file, with references to strings and extended data.            |
 //
-// Header (44 bytes)
+// Header (64 bytes)
 // -----------------
 //
 // The header contains the following fields:
@@ -110,6 +115,9 @@ pub const PROTOCOL_VERSION: u8 = 8;
 // | 32-35       | uint32    | Byte offset to extended node data section         |
 // | 36-39       | uint32    | Byte offset to structured data section            |
 // | 40-43       | uint32    | Byte offset to nodes section                      |
+// | 44-51       | uint64    | Source file ID (0 = none)                          |
+// | 52-59       | uint64    | Source file lease ID (0 = none)                    |
+// | 60-63       | uint32    | Byte offset to binder data (0 = none)              |
 //
 // String offsets (8 bytes per string)
 // -----------------------------------
@@ -636,6 +644,13 @@ pub fn encode_source_file(source_file: Node) -> Result<(Vec<u8>, Rc<NodeIndexTab
     Ok((data, node_table))
 }
 
+// Go: api/encoder/encoder.go SetSourceFileLease (ts#64434)
+/// SetSourceFileLease sets the session-scoped lease ID in an encoded source file.
+pub fn set_source_file_lease(data: &mut [u8], lease: u64) {
+    data[HEADER_OFFSET_SOURCE_FILE_LEASE..HEADER_OFFSET_SOURCE_FILE_LEASE + 8]
+        .copy_from_slice(&lease.to_le_bytes());
+}
+
 // Go: api/encoder/encoder.go:411 EncodeNode
 /// EncodeNode encodes an arbitrary AST node and its descendants into the binary format.
 /// The sourceFile is needed to provide the source text for efficient string encoding.
@@ -999,7 +1014,7 @@ fn encode_tree(
     let offset_structured_data = offset_extended_data + extended_data.len();
     let offset_nodes = offset_structured_data + structured_data.len();
 
-    let header: [u32; 11] = [
+    let header: [u32; 16] = [
         metadata,
         hash.lo as u32,
         (hash.lo >> 32) as u32,
@@ -1011,6 +1026,12 @@ fn encode_tree(
         offset_extended_data as u32,
         offset_structured_data as u32,
         offset_nodes as u32,
+        // ts#64434
+        0,
+        0, // source file ID
+        0,
+        0, // source file lease ID
+        0, // binder data offset
     ];
 
     let mut header_bytes: Vec<u8> = Vec::new();

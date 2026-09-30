@@ -2192,6 +2192,8 @@ impl Session {
             return;
         }
         self.release_language_server_refs();
+        // ts#64434
+        self.release_source_file_leases();
 
         let snapshots: Vec<Rc<project::Snapshot>> = self
             .snapshots
