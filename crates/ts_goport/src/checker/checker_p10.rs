@@ -26,6 +26,13 @@ pub struct CallState {
     pub candidate_for_type_argument_error: SignatureId,
 }
 
+// Go: checker/checker.go:8822 constructorAccessibilityError
+#[derive(Clone, Copy, Debug)]
+pub struct ConstructorAccessibilityError {
+    pub kind: ModifierFlags,
+    pub declaring_class: TypeId,
+}
+
 impl Checker {
     // Go: checker/checker.go:8445 resolveCallExpression
     pub fn resolve_call_expression(
@@ -242,7 +249,31 @@ impl Checker {
         let construct_signatures =
             self.get_signatures_of_type(expression_type, SignatureKind::CONSTRUCT);
         if !construct_signatures.is_empty() {
-            if !self.is_constructor_accessible(node, construct_signatures[0]) {
+            let accessibility_error = self.get_constructor_accessibility_error(
+                node,
+                &construct_signatures,
+                ModifierFlags::NON_PUBLIC_ACCESSIBILITY_MODIFIER,
+            );
+            if let Some(accessibility_error) = accessibility_error {
+                if accessibility_error.kind.intersects(ModifierFlags::PRIVATE) {
+                    let class_str = self.type_to_string(accessibility_error.declaring_class);
+                    self.error(
+                        node,
+                        diag::Constructor_of_class_0_is_private_and_only_accessible_within_the_class_declaration,
+                        args![class_str],
+                    );
+                }
+                if accessibility_error
+                    .kind
+                    .intersects(ModifierFlags::PROTECTED)
+                {
+                    let class_str = self.type_to_string(accessibility_error.declaring_class);
+                    self.error(
+                        node,
+                        diag::Constructor_of_class_0_is_protected_and_only_accessible_within_the_class_declaration,
+                        args![class_str],
+                    );
+                }
                 return self.resolve_error_call(node);
             }
             // If the expression is a class of abstract type, or an abstract construct signature,
@@ -327,54 +358,47 @@ impl Checker {
         self.resolve_error_call(node)
     }
 
-    // Go: checker/checker.go:8622 isConstructorAccessible
-    pub fn is_constructor_accessible(&mut self, node: Node, signature: SignatureId) -> bool {
-        if signature.is_nil() || self.sig(signature).declaration.is_nil() {
-            return true;
-        }
-        let declaration = self.sig(signature).declaration;
-        let modifiers = get_selected_modifier_flags(
-            declaration,
-            ModifierFlags::NON_PUBLIC_ACCESSIBILITY_MODIFIER,
-        );
-        // (1) Public constructors and (2) constructor functions are always accessible.
-        if modifiers.0 == 0 || !is_constructor_declaration(declaration) {
-            return true;
-        }
-        let declaring_class_declaration =
-            get_class_like_declaration_of_symbol(&self.symbols, declaration.parent().symbol());
-        let declaring_class = self.get_declared_type_of_symbol(declaration.parent().symbol());
-        // A private or protected constructor can only be instantiated within its own class (or a subclass, for protected)
-        if !self.is_node_within_class(node, declaring_class_declaration) {
-            let containing_class = get_containing_class(node);
-            if containing_class.is_some() && modifiers.intersects(ModifierFlags::PROTECTED) {
-                let containing_type = self.get_declared_type_of_symbol(containing_class.symbol());
-                if self.type_has_protected_accessible_base(
-                    declaration.parent().symbol(),
-                    containing_type,
-                ) {
-                    return true;
+    // Go: checker/checker.go:8827 getConstructorAccessibilityError
+    // PORT: Go returns a nil `*constructorAccessibilityError` for no error; here `None`.
+    pub fn get_constructor_accessibility_error(
+        &mut self,
+        node: Node,
+        signatures: &[SignatureId],
+        modifiers_mask: ModifierFlags,
+    ) -> Option<ConstructorAccessibilityError> {
+        for &signature in signatures {
+            if self.sig(signature).declaration.is_nil() {
+                continue;
+            }
+            let declaration = self.sig(signature).declaration;
+            let modifiers = get_selected_modifier_flags(declaration, modifiers_mask);
+            // (1) Public constructors and (2) constructor functions are always accessible.
+            if modifiers.0 == 0 || !is_constructor_declaration(declaration) {
+                continue;
+            }
+            let declaring_class_declaration =
+                get_class_like_declaration_of_symbol(&self.symbols, declaration.parent().symbol());
+            // A private or protected constructor can only be instantiated within its own class (or a subclass, for protected)
+            if !self.is_node_within_class(node, declaring_class_declaration) {
+                let containing_class = get_containing_class(node);
+                if containing_class.is_some() && modifiers.intersects(ModifierFlags::PROTECTED) {
+                    let containing_type = self.get_type_of_node(containing_class);
+                    if self.type_has_protected_accessible_base(
+                        declaration.parent().symbol(),
+                        containing_type,
+                    ) {
+                        continue;
+                    }
                 }
+                let declaring_class =
+                    self.get_declared_type_of_symbol(declaration.parent().symbol());
+                return Some(ConstructorAccessibilityError {
+                    kind: modifiers,
+                    declaring_class,
+                });
             }
-            if modifiers.intersects(ModifierFlags::PRIVATE) {
-                let class_str = self.type_to_string(declaring_class);
-                self.error(
-                    node,
-                    diag::Constructor_of_class_0_is_private_and_only_accessible_within_the_class_declaration,
-                    args![class_str],
-                );
-            }
-            if modifiers.intersects(ModifierFlags::PROTECTED) {
-                let class_str = self.type_to_string(declaring_class);
-                self.error(
-                    node,
-                    diag::Constructor_of_class_0_is_protected_and_only_accessible_within_the_class_declaration,
-                    args![class_str],
-                );
-            }
-            return false;
         }
-        true
+        None
     }
 
     // Go: checker/checker.go:8654 typeHasProtectedAccessibleBase
