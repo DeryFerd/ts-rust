@@ -183,7 +183,9 @@ impl LanguageService {
     // getPreparedAutoImportView returns an auto-import view for the given file if the registry is prepared
     // to provide up-to-date auto-imports for it. If not, it returns ErrNeedsAutoImports.
     // PORT: Go `*autoimport.View` is shared as `Rc<autoimport::View>` (wave 3
-    // notes); nil is `None`.
+    // notes); nil is `None`. Go also takes `typeChecker` for the view
+    // (ts#64178); the Rust view does not keep a checker (see
+    // `autoimport::new_view`), so there is no parameter.
     pub fn get_prepared_auto_import_view(
         &self,
         from_file: Node,
@@ -220,7 +222,9 @@ impl LanguageService {
     // of the auto-import registry, which may or may not be up-to-date.
     // PORT: Go builds a view with a nil registry and panics only when a view
     // method reads it. `autoimport::new_view` takes a non-nil registry, so a
-    // nil registry panics here, earlier than in Go.
+    // nil registry panics here, earlier than in Go. Go also takes
+    // `typeChecker` for the view (ts#64178); see
+    // `get_prepared_auto_import_view`.
     pub fn get_current_auto_import_view(&self, from_file: Node) -> Rc<autoimport::View> {
         let registry = self
             .host

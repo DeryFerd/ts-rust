@@ -28,6 +28,8 @@ use std::cell::Cell;
 const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
 
 // Go: ls/autoimport/view.go:21 View
+// PORT: Go `checker *checker.Checker` (ts#64178) is not a field; see
+// `new_view`.
 // PORT: Go `*collections.Set[string]` `conditions` is never nil after
 // `NewView`, so it is a plain set. Go `*collections.MultiMap` is
 // `IndexMap<K, Vec<V>>` behind an `Rc` (Go returns the pointer). The lazy
@@ -57,7 +59,11 @@ pub fn source_file_has_file_name(file: Node) -> HasFileNameImpl {
     new_has_file_name(source_file_file_name(file), &source_file_info(file).path)
 }
 
-// Go: ls/autoimport/view.go:35 NewView
+// Go: ls/autoimport/view.go:37 NewView
+// PORT: Go takes `typeChecker` and stores it in the view (ts#64178). The
+// Rust checker is a `RefCell` that the caller already borrows, so the view
+// does not keep it: the methods that read Go `v.checker` take `ch` (see
+// `fix.rs`).
 pub fn new_view(
     registry: Rc<Registry>,
     importing_file: Node,
@@ -283,10 +289,10 @@ fn unicode_is_upper(c: char) -> bool {
 
 impl View {
     // Go: ls/autoimport/view.go:172 GetCompletions
-    // PORT: `ch` is the request checker. Go `GetFixes` leases it again with
-    // `program.GetTypeChecker(ctx)`, which returns the checker that the
-    // request already holds; a second `RefCell` borrow would panic, so the
-    // caller passes it (as the pinned ImportAdder decision does).
+    // PORT: `ch` is the request checker, Go `v.checker` (ts#64178); the
+    // caller passes it (as the pinned ImportAdder decision does). Go dropped
+    // the `ctx` parameter in ts#64178; `_ctx` stays until its caller in
+    // `completions_p1.rs` (no wave-2 owner) drops the argument.
     // Go `grouped` is a map: `IndexMap` in insertion order.
     // PORT: Go map order is random. It changes values, not only the order of
     // ties, through the per-file specifier cache (`specifiers.rs`): the cache
@@ -301,7 +307,7 @@ impl View {
     // insertion order, so the sort input and its ties do not change.
     pub fn get_completions(
         &self,
-        ctx: &Context,
+        _ctx: &Context,
         ch: &mut Checker,
         prefix: &str,
         position: lsproto::Position,
@@ -394,9 +400,7 @@ impl View {
             let exps = groups[i];
             let mut fixes_for_group: Vec<FixAndExport> = Vec::with_capacity(exps.len());
             for e in exps {
-                for fix in
-                    self.get_fixes(ctx, ch, e, for_jsx, is_type_only_location, Some(position))
-                {
+                for fix in self.get_fixes(ch, e, for_jsx, is_type_only_location, Some(position)) {
                     fixes_for_group.push(FixAndExport {
                         fix,
                         export: e.clone(),
