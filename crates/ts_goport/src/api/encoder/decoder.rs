@@ -387,6 +387,15 @@ impl AstDecoder<'_> {
         let text = self.get_string(text_idx);
         let file_name = self.get_string(file_name_idx);
         let path = self.get_string(path_idx);
+        // ts#64216
+        if crate::frontend::tspath::get_encoded_root_length(&file_name) == 0
+            || file_name != crate::frontend::tspath::normalize_path(&file_name)
+        {
+            return Err(errors::new(format!(
+                "invalid source file name {}",
+                crate::gostd::strconv::quote(&file_name)
+            )));
+        }
 
         // Recover parse options from header.
         let parse_opts = read_le32(self.raw, HEADER_OFFSET_PARSE_OPTIONS as i64);

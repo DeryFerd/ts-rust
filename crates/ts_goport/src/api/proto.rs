@@ -242,6 +242,10 @@ impl Method {
     pub const READ_CONFIG_FILE: Method = Method(Cow::Borrowed("readConfigFile"));
     pub const PARSE_JSON_CONFIG_FILE: Method = Method(Cow::Borrowed("parseJsonConfigFileContent"));
     pub const PARSE_CONFIG_FILE: Method = Method(Cow::Borrowed("parseConfigFile"));
+    // ts#64216
+    pub const CREATE_SOURCE_FILE: Method = Method(Cow::Borrowed("createSourceFile"));
+    pub const CREATE_SOURCE_FILE_FROM_FILE: Method =
+        Method(Cow::Borrowed("createSourceFileFromFile"));
     // tsgo#4849
     pub const TRANSPILE_MODULE: Method = Method(Cow::Borrowed("transpileModule"));
     pub const TRANSPILE_MODULE_FROM_FILE: Method = Method(Cow::Borrowed("transpileModuleFromFile"));
@@ -847,6 +851,15 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     m.insert(
         Method::PARSE_CONFIG_FILE,
         unmarshaller_for::<ParseConfigFileParams>,
+    );
+    // ts#64216
+    m.insert(
+        Method::CREATE_SOURCE_FILE,
+        unmarshaller_for::<CreateSourceFileParams>,
+    );
+    m.insert(
+        Method::CREATE_SOURCE_FILE_FROM_FILE,
+        unmarshaller_for::<CreateSourceFileFromFileParams>,
     );
     // tsgo#4849
     m.insert(
@@ -1546,6 +1559,42 @@ impl UnmarshalerFrom for TranspileOptions {
         Ok(())
     }
 }
+
+// Go: proto.go CreateSourceFileOptions (ts#64216)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CreateSourceFileOptions {
+    pub script_kind: ScriptKind,
+}
+
+proto_json!(both CreateSourceFileOptions {
+    script_kind: "scriptKind" omitempty,
+});
+
+// Go: proto.go CreateSourceFileParams (ts#64216)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CreateSourceFileParams {
+    pub file_name: String,
+    pub source_text: String,
+    pub options: CreateSourceFileOptions,
+}
+
+proto_json!(both CreateSourceFileParams {
+    file_name: "fileName" plain,
+    source_text: "sourceText" plain,
+    options: "options" plain,
+});
+
+// Go: proto.go CreateSourceFileFromFileParams (ts#64216)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CreateSourceFileFromFileParams {
+    pub file_name: String,
+    pub options: CreateSourceFileOptions,
+}
+
+proto_json!(both CreateSourceFileFromFileParams {
+    file_name: "fileName" plain,
+    options: "options" plain,
+});
 
 // Go: proto.go:595 TranspileParams (tsgo#4849)
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2371,34 +2420,41 @@ proto_json!(both GetSourceFileNamesParams {
     project: "project" plain,
 });
 
-// PORT: Go `core.ModuleKind` (and its alias `core.ResolutionMode`) is a Go
-// int32 type with no JSON methods, so JSON uses the v2 int arshaler. The
-// params of ts#64247 and ts#64292 decode it. Errors name `core.ModuleKind`.
-impl MarshalerTo for ModuleKind {
-    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
-        self.0.marshal_json_to(enc)
-    }
+// PORT: Go `core.ModuleKind` (and its alias `core.ResolutionMode`) and
+// `core.ScriptKind` are Go int32 types with no JSON methods, so JSON uses the
+// v2 int arshaler. The params of ts#64247, ts#64292 and ts#64216 decode
+// them. Errors name the Go type.
+macro_rules! core_int_json {
+    ($($ty:ident: $go:literal),* $(,)?) => {$(
+        impl MarshalerTo for $ty {
+            fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+                self.0.marshal_json_to(enc)
+            }
+        }
+
+        impl UnmarshalerFrom for $ty {
+            fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+                self.0
+                    .unmarshal_json_from(dec)
+                    .map_err(|err| match SemanticError::of(&err) {
+                        Some(mut s) => {
+                            s.go_type = $go.to_string();
+                            s.into_json_error()
+                        }
+                        None => err,
+                    })
+            }
+        }
+
+        impl IsZero for $ty {
+            fn is_zero(&self) -> bool {
+                self.0 == 0
+            }
+        }
+    )*};
 }
 
-impl UnmarshalerFrom for ModuleKind {
-    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0
-            .unmarshal_json_from(dec)
-            .map_err(|err| match SemanticError::of(&err) {
-                Some(mut s) => {
-                    s.go_type = "core.ModuleKind".to_string();
-                    s.into_json_error()
-                }
-                None => err,
-            })
-    }
-}
-
-impl IsZero for ModuleKind {
-    fn is_zero(&self) -> bool {
-        self.0 == 0
-    }
-}
+core_int_json!(ModuleKind: "core.ModuleKind", ScriptKind: "core.ScriptKind");
 
 // Go: proto.go GetModeForUsageLocationParams (ts#64292)
 #[derive(Clone, Debug, Default, PartialEq)]

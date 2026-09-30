@@ -1094,6 +1094,13 @@ impl ipc::Handler for Session {
             m if m == Method::PARSE_CONFIG_FILE.0 => self
                 .handle_parse_config_file(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#64216
+            m if m == Method::CREATE_SOURCE_FILE.0 => {
+                self.handle_create_source_file(ctx, assert_params(&parsed))
+            }
+            m if m == Method::CREATE_SOURCE_FILE_FROM_FILE.0 => {
+                self.handle_create_source_file_from_file(ctx, assert_params(&parsed))
+            }
             // tsgo#4849
             m if m == Method::TRANSPILE_MODULE.0 => self
                 .handle_transpile(ctx, assert_params(&parsed), false)
@@ -1679,8 +1686,35 @@ impl Session {
                 );
             }
         }
+        // ts#64216
+        // PORT: Go `RawBinary(nil)` is an empty `RawBinary` (an encoded file
+        // is never empty).
+        if is_source_file_response_method(&request.method)
+            && let Some(data) = response
+                .result
+                .as_deref()
+                .and_then(|result| result.downcast_ref::<RawBinary>())
+        {
+            if data.0.is_empty() {
+                response.result = None;
+            } else {
+                response.result = to_any(SourceFileResponse {
+                    data: base64_std_encoding_encode_to_string(&data.0),
+                });
+            }
+        }
         response
     }
+}
+
+// Go: api/session.go isSourceFileResponseMethod (ts#64216)
+pub fn is_source_file_response_method(method: &Method) -> bool {
+    *method == Method::CREATE_SOURCE_FILE
+        || *method == Method::CREATE_SOURCE_FILE_FROM_FILE
+        || *method == Method::GET_SOURCE_FILE
+        || *method == Method::GET_CONFIG_SOURCE_FILE
+        || *method == Method::TYPE_TO_TYPE_NODE
+        || *method == Method::SIGNATURE_TO_SIGNATURE_DECLARATION
 }
 
 // Go: api/session.go newBatchResponsePage (ts#64061)
@@ -2197,6 +2231,80 @@ impl Session {
             .expect("NewConfigFileResponse of a parsed command line"))
     }
 
+    // Go: api/session.go handleCreateSourceFile (ts#64216)
+    pub fn handle_create_source_file(
+        &self,
+        _ctx: &Context,
+        params: &CreateSourceFileParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let source_file =
+            self.create_source_file(&params.file_name, &params.source_text, &params.options)?;
+        self.encode_source_file_response(source_file.root)
+    }
+
+    // Go: api/session.go handleCreateSourceFileFromFile (ts#64216)
+    pub fn handle_create_source_file_from_file(
+        &self,
+        _ctx: &Context,
+        params: &CreateSourceFileFromFileParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let file_name = tspath::get_normalized_absolute_path(
+            &params.file_name,
+            &self.project_session.get_current_directory(),
+        );
+        let (source_text, ok) = self.project_session.fs().read_file(&file_name);
+        if !ok {
+            return Err(errors::errorf(
+                format!(
+                    "{}: could not read file {}",
+                    *ERR_CLIENT_ERROR,
+                    gostd::strconv::quote(&file_name)
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        let source_file = self.create_source_file(&file_name, &source_text, &params.options)?;
+        self.encode_source_file_response(source_file.root)
+    }
+
+    // Go: api/session.go createSourceFile (ts#64216)
+    // PORT: returns the parsed file, which keeps the file's nodes alive while
+    // the caller encodes them.
+    pub fn create_source_file(
+        &self,
+        file_name: &str,
+        source_text: &str,
+        options: &CreateSourceFileOptions,
+    ) -> Result<Rc<crate::frontend::parser::ParsedSourceFile>, GoError> {
+        let mut script_kind = options.script_kind;
+        if script_kind == ScriptKind::UNKNOWN {
+            script_kind = crate::frontend::core_ext::ensure_script_kind_from_file_name(file_name);
+        }
+        if !is_valid_create_source_file_script_kind(script_kind) {
+            return Err(errors::errorf(
+                format!(
+                    "{}: invalid scriptKind {}",
+                    *ERR_CLIENT_ERROR, script_kind.0
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        let file_name = tspath::get_normalized_absolute_path(
+            file_name,
+            &self.project_session.get_current_directory(),
+        );
+        let path = self.to_path(&file_name);
+        Ok(Rc::new(crate::frontend::parser::parse_source_file(
+            &crate::frontend::parser::SourceFileParseOptions {
+                file_name,
+                path,
+                ..Default::default()
+            },
+            source_text,
+            script_kind,
+        )))
+    }
+
     // Go: api/session.go:1242 handleTranspile (tsgo#4849)
     pub fn handle_transpile(
         &self,
@@ -2233,6 +2341,14 @@ impl Session {
         options.file_name = file_name;
         transpile_output(ctx, &input, &options, declaration)
     }
+}
+
+// Go: api/session.go isValidCreateSourceFileScriptKind (ts#64216)
+pub fn is_valid_create_source_file_script_kind(script_kind: ScriptKind) -> bool {
+    matches!(
+        script_kind,
+        ScriptKind::JS | ScriptKind::JSX | ScriptKind::TS | ScriptKind::TSX | ScriptKind::JSON
+    )
 }
 
 // Go: api/session.go:1257 transpileOutput (tsgo#4849)
