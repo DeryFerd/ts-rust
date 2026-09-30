@@ -962,6 +962,8 @@ impl TwinPrint {
         };
         emitter.finish_declaration_part(print);
         emitter.writer = None;
+        // The twin keeps the nodes of one print at a time.
+        release_print_packs();
         if let Some(expected) = expected {
             let rest: Vec<String> = expected
                 .lock()

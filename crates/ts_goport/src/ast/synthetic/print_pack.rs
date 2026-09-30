@@ -101,6 +101,9 @@ thread_local! {
     /// is kept between walks, with every bit clear.
     // PERF: a hash set cost about a third of the walk on effect.
     static SEEN: Cell<Vec<u64>> = const { Cell::new(Vec::new()) };
+    /// The slot and data chunks that `install_print_pack` made on this
+    /// thread since the last `release_print_packs`.
+    static INSTALLED: RefCell<(Vec<u32>, Vec<u32>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
 /// Puts the entries of `pack` in this thread's arena, each at its index:
@@ -109,26 +112,60 @@ thread_local! {
 /// be the d.ts twin of the pack's thread (`install_twin_synthetic_arena`):
 /// the chunks of the pack's entries are then never chunks of its own.
 pub fn install_print_pack(pack: PrintPack) {
+    INSTALLED.with_borrow_mut(|(slot_chunks, data_chunks)| {
+        ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            debug_assert!(a.shared.is_some(), "a print pack goes to a d.ts twin");
+            for (index, slot) in pack.slots {
+                let (c, i) = (index as usize / SLOT_CHUNK, index as usize % SLOT_CHUNK);
+                if a.slots.get(c).is_none_or(Option::is_none) {
+                    set_chunk(&mut a.slots, c as u32, vec![Slot::Absent; SLOT_CHUNK]);
+                    if a.slot_owner.len() <= c {
+                        a.slot_owner.resize(c + 1, OwnerKey::Base);
+                    }
+                    slot_chunks.push(c as u32);
+                } else if c == NIL_SLOT as usize && slot_chunks.first() != Some(&NIL_SLOT) {
+                    // Chunk 0 has the nil slot: `release_print_packs` resets it.
+                    slot_chunks.insert(0, NIL_SLOT);
+                }
+                a.slots[c].as_mut().expect(FREED)[i] = slot;
+            }
+            for (index, node) in pack.datas {
+                let (c, i) = (index as usize / DATA_CHUNK, index as usize % DATA_CHUNK);
+                if a.datas.get(c).is_none_or(Option::is_none) {
+                    set_chunk(&mut a.datas, c as u32, empty_data_chunk());
+                    data_chunks.push(c as u32);
+                }
+                // A filled cell holds this same node.
+                let _ = a.datas[c].as_ref().expect(FREED)[i].set(node);
+            }
+        });
+    });
+}
+
+/// Frees the entries that `install_print_pack` put in this thread's arena
+/// since the last call: a read of one of them panics again, until a pack
+/// brings it back. The d.ts twin calls it after each print, so it keeps the
+/// nodes of one print at a time. The entries that this thread made stay.
+pub fn release_print_packs() {
+    let (slot_chunks, data_chunks) = INSTALLED.take();
+    // Dropped after the arena borrow ends.
+    let mut freed = Vec::with_capacity(slot_chunks.len());
+    let mut freed_data = Vec::with_capacity(data_chunks.len());
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
-        debug_assert!(a.shared.is_some(), "a print pack goes to a d.ts twin");
-        for (index, slot) in pack.slots {
-            let (c, i) = (index as usize / SLOT_CHUNK, index as usize % SLOT_CHUNK);
-            if a.slots.get(c).is_none_or(Option::is_none) {
-                set_chunk(&mut a.slots, c as u32, vec![Slot::Absent; SLOT_CHUNK]);
-                if a.slot_owner.len() <= c {
-                    a.slot_owner.resize(c + 1, OwnerKey::Base);
-                }
-            }
-            a.slots[c].as_mut().expect(FREED)[i] = slot;
+        for c in slot_chunks {
+            let chunk = if c == NIL_SLOT {
+                let mut nil_chunk = vec![Slot::Absent; SLOT_CHUNK];
+                nil_chunk[NIL_SLOT as usize] = Slot::Nil;
+                Some(nil_chunk)
+            } else {
+                None
+            };
+            freed.push(std::mem::replace(&mut a.slots[c as usize], chunk));
         }
-        for (index, node) in pack.datas {
-            let (c, i) = (index as usize / DATA_CHUNK, index as usize % DATA_CHUNK);
-            if a.datas.get(c).is_none_or(Option::is_none) {
-                set_chunk(&mut a.datas, c as u32, empty_data_chunk());
-            }
-            // A filled cell holds this same node.
-            let _ = a.datas[c].as_ref().expect(FREED)[i].set(node);
+        for c in data_chunks {
+            freed_data.push(a.datas[c as usize].take());
         }
     });
 }
@@ -165,6 +202,11 @@ mod tests {
                 assert!(std::panic::catch_unwind(|| outside.kind()).is_err());
                 let own = NodeFactory::new().new_identifier("own");
                 assert!(own != a && own != b && own != block && own != outside);
+                assert_eq!(own.text(), "own");
+
+                // A release frees the copies and keeps the twin's own nodes.
+                release_print_packs();
+                assert!(std::panic::catch_unwind(|| a.kind()).is_err());
                 assert_eq!(own.text(), "own");
             })
             .join()

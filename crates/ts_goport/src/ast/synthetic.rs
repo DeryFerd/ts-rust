@@ -78,7 +78,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 mod print_pack;
-pub use print_pack::{PrintPack, export_print_pack, install_print_pack};
+pub use print_pack::{PrintPack, export_print_pack, install_print_pack, release_print_packs};
 
 /// File index of synthetic nodes. `SYNTHETIC_FLOW_FILE` is `0xffff_ffff`.
 pub const SYNTHETIC_NODE_FILE: usize = 0xffff_fffe;
