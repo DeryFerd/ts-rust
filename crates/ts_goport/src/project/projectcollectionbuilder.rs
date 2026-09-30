@@ -461,6 +461,9 @@ impl ProjectCollectionBuilder {
                 (!request.project_references.is_empty())
                     .then(|| request.project_references.clone()),
                 request.config_file_parsing_diagnostics.clone(),
+                // ts#64299
+                request.module_resolver_factory.clone(),
+                request.module_resolver_id,
                 self.inferred_content_mappers.clone(),
                 logger.clone(),
             );
@@ -479,6 +482,9 @@ impl ProjectCollectionBuilder {
                     (!create_request.project_references.is_empty())
                         .then(|| create_request.project_references.clone()),
                     create_request.config_file_parsing_diagnostics.clone(),
+                    // ts#64299
+                    create_request.module_resolver_factory.clone(),
+                    create_request.module_resolver_id,
                     self.inferred_content_mappers.clone(),
                     logger.clone(),
                 ),
@@ -527,7 +533,21 @@ impl ProjectCollectionBuilder {
                 },
             );
         }
-        Ok(())
+        // ts#64299
+        let mut module_resolution_error: Option<GoError> = None;
+        self.for_each_project(
+            &mut |entry: &dyn dirty::Value<Rc<RefCell<Project>>>| -> bool {
+                let project = entry.value().expect(NIL_DEREF);
+                if let Some(program) = &project.borrow().program {
+                    module_resolution_error = program.module_resolution_error();
+                }
+                module_resolution_error.is_none()
+            },
+        );
+        match module_resolution_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     // Go: project/projectcollectionbuilder.go:381 nextSyntheticProjectID (ts#64319: was nextSyntheticProjectName)
@@ -2008,9 +2028,10 @@ impl ProjectCollectionBuilder {
         )
     }
 
-    // Go: project/projectcollectionbuilder.go:1253 updateOrCreateSyntheticProject (ts#64204)
+    // Go: project/projectcollectionbuilder.go:1286 updateOrCreateSyntheticProject (ts#64204)
     #[allow(clippy::too_many_arguments)]
-    // ts#64319: keyed by SyntheticProjectID.
+    // ts#64319: keyed by SyntheticProjectID. ts#64299: the module resolver
+    // factory and its ID.
     pub fn update_or_create_synthetic_project(
         self: &Rc<Self>,
         project_id: SyntheticProjectID,
@@ -2018,6 +2039,8 @@ impl ProjectCollectionBuilder {
         compiler_options: Option<Rc<CompilerOptions>>,
         project_references: Option<Vec<ProjectReference>>,
         config_file_parsing_diagnostics: Vec<Diagnostic>,
+        module_resolver_factory: Option<Rc<dyn ModuleResolverFactory>>,
+        module_resolver_id: u64,
         content_mappers: Vec<Rc<contentmapper::Mapper>>,
         logger: Option<Rc<logging::LogTree>>,
     ) -> Rc<dirty::SyncMapEntry<SyntheticProjectID, Rc<RefCell<Project>>>> {
@@ -2039,6 +2062,9 @@ impl ProjectCollectionBuilder {
                 Rc::get_mut(p.command_line.as_mut().expect(NIL_DEREF))
                     .expect("the new command line is not shared yet")
                     .errors = config_file_parsing_diagnostics;
+                // ts#64299
+                p.module_resolver_factory = module_resolver_factory;
+                p.module_resolver_id = module_resolver_id;
             }
             let (project, _) = self
                 .synthetic_projects
@@ -2085,6 +2111,8 @@ impl ProjectCollectionBuilder {
                     )
                     || !diagnostics_deep_equal(&command_line.errors, &config_file_parsing_diagnostics)
                     || !mappers_equal(command_line.content_mappers(), new_command_line.content_mappers())
+                    // ts#64299
+                    || p.module_resolver_id != module_resolver_id
             },
             &mut |p: &Rc<RefCell<Project>>| {
                 if logger.is_some() {
@@ -2093,8 +2121,11 @@ impl ProjectCollectionBuilder {
                         root_file_names.len()
                     ));
                 }
-                p.borrow_mut()
-                    .set_command_line(Some(new_command_line.clone()));
+                let mut p = p.borrow_mut();
+                p.set_command_line(Some(new_command_line.clone()));
+                // ts#64299
+                p.module_resolver_factory = module_resolver_factory.clone();
+                p.module_resolver_id = module_resolver_id;
             },
         );
         project

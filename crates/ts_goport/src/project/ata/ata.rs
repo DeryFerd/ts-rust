@@ -295,16 +295,15 @@ impl TypingsInstaller {
             logger.log(&format!("ATA:: Installed typings {package_names:?}"));
             let mut installed_typing_files: Vec<String> = Vec::new();
             let host: Rc<dyn module::ResolutionHost> = self.host.clone();
-            let resolver = module::new_resolver(
-                host,
-                Rc::new(CompilerOptions {
+            // ts#64299
+            let resolver = module::new_resolver(module::ResolverOptions {
+                host: Some(host),
+                compiler_options: Some(Rc::new(CompilerOptions {
                     module_resolution: ModuleResolutionKind::NODE_NEXT,
                     ..CompilerOptions::default()
-                }),
-                "",
-                "",
-                Vec::new(),
-            );
+                })),
+                ..Default::default()
+            });
             for package_name in filtered_typings {
                 let typing_file = self.typing_to_file_name(&resolver, package_name);
                 if typing_file.is_empty() {
@@ -716,16 +715,15 @@ impl TypingsInstaller {
 
             // !!! sheetal strada uses Node10
             let host: Rc<dyn module::ResolutionHost> = self.host.clone();
-            let resolver = module::new_resolver(
-                host,
-                Rc::new(CompilerOptions {
+            // ts#64299
+            let resolver = module::new_resolver(module::ResolverOptions {
+                host: Some(host),
+                compiler_options: Some(Rc::new(CompilerOptions {
                     module_resolution: ModuleResolutionKind::NODE_NEXT,
                     ..CompilerOptions::default()
-                }),
-                "",
-                "",
-                Vec::new(),
-            );
+                })),
+                ..Default::default()
+            });
             if let Some(dev_dependencies) = &npm_config.dev_dependencies
                 && (npm_lock.packages.is_some() || npm_lock.dependencies.is_some())
             {
@@ -830,9 +828,13 @@ impl TypingsInstaller {
         }
     }
 
-    // Go: project/ata/ata.go:479 typingToFileName
-    pub fn typing_to_file_name(&self, resolver: &module::Resolver, package_name: &str) -> String {
-        let (result, _) = resolver.resolve_module_name(
+    // Go: project/ata/ata.go:485 typingToFileName (ts#64299: `*module.DefaultResolver`)
+    pub fn typing_to_file_name(
+        &self,
+        resolver: &module::DefaultResolver,
+        package_name: &str,
+    ) -> String {
+        let (result, _, _) = resolver.resolve_module_name(
             package_name,
             &tspath::combine_paths(&self.typings_location, &["index.d.ts"]),
             ModuleKind::NONE,

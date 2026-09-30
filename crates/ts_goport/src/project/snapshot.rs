@@ -472,6 +472,23 @@ impl Snapshot {
             depth,
         )
     }
+
+    // Go: project/snapshot.go:309 Snapshot.FS (ts#64299)
+    // PORT: the field `fs` is Go's `s.fs`; this method is Go `FS()`.
+    pub fn fs(&self) -> Rc<dyn vfs::Fs> {
+        new_source_fs(false, self.fs.clone(), self.host.to_path.clone())
+    }
+
+    // Go: project/snapshot.go:313 Snapshot.GetCurrentDirectory (ts#64299)
+    pub fn get_current_directory(&self) -> String {
+        self.host.get_current_directory()
+    }
+
+    // Go: project/snapshot.go:317 Snapshot.ContentMapperExtensions (ts#64299)
+    pub fn content_mapper_extensions(&self) -> Vec<String> {
+        let (extensions, _) = self.content_mapper_watch_state();
+        extensions
+    }
 }
 
 // Go: project/snapshot.go:13 (import of ls; Snapshot is the ls.Host of a
@@ -544,6 +561,18 @@ pub struct APICreateProgramRequest {
     pub compiler_options: Rc<CompilerOptions>,
     pub project_references: Vec<ProjectReference>,
     pub config_file_parsing_diagnostics: Vec<Diagnostic>,
+    // ts#64299. PORT: a Go nil factory is `None`.
+    pub module_resolver_factory: Option<Rc<dyn ModuleResolverFactory>>,
+    pub module_resolver_id: u64,
+}
+
+// Go: project/snapshot.go:331 ModuleResolverFactory (ts#64299)
+pub trait ModuleResolverFactory {
+    // Go: NewResolver(options module.ResolverOptions) (module.Resolver, func())
+    fn new_resolver(
+        &self,
+        options: crate::frontend::module::ResolverOptions,
+    ) -> (Rc<dyn crate::frontend::module::Resolver>, Box<dyn FnOnce()>);
 }
 
 // Go: project/snapshot.go:315 APIReconfigureProgramRequest (ts#64204)

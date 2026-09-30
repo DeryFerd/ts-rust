@@ -12,6 +12,7 @@ use crate::project::prelude::*;
 use crate::contentmapper;
 use crate::frontend::compiler::CompilerHost as _;
 use crate::frontend::core_ext::{ProjectReference, TypeAcquisition};
+use crate::frontend::module;
 use crate::frontend::vfs::Fs as _;
 use crate::program::ls_program;
 use std::cell::Cell;
@@ -256,6 +257,10 @@ pub struct Project {
     pub content_mapper_watched_files: Option<Rc<FxHashSet<tspath::Path>>>,
 
     pub checker_pool: Option<Rc<CheckerPool>>,
+
+    // ts#64299. PORT: a Go nil factory is `None`.
+    pub module_resolver_factory: Option<Rc<dyn ModuleResolverFactory>>,
+    pub module_resolver_id: u64,
 
     // installedTypingsInfo is the value of `project.ComputeTypingsInfo()` that was
     // used during the most recently completed typings installation.
@@ -614,6 +619,9 @@ impl Project {
 
             checker_pool: self.checker_pool.clone(),
 
+            module_resolver_factory: self.module_resolver_factory.clone(),
+            module_resolver_id: self.module_resolver_id,
+
             installed_typings_info: self.installed_typings_info.clone(),
             typings_files: self.typings_files.clone(),
         }))
@@ -704,7 +712,7 @@ impl Project {
         false
     }
 
-    // Go: project/project.go:349 Project.CreateProgram
+    // Go: project/project.go:499 Project.CreateProgram
     // PORT: Go `compiler.NewProgram(opts)` is `ls_program::new_program(opts,
     // create_checker_pool)` and `p.Program.UpdateProgram(..)` is
     // `ls_program::update_program(p.Program, ..)` (contract C3). Go
@@ -753,6 +761,28 @@ impl Project {
             )
         };
 
+        // ts#64299
+        // PORT: Go always passes `createModuleResolver`; without a factory it
+        // returns `module.NewResolver(options)`, which is the loader's own
+        // default. The port passes `None` then, so the loader keeps its
+        // default resolver and its parse-worker resolution (PERF, see
+        // `file_loader.rs`). Go `cleanupModuleResolver` is the shared cell;
+        // Go's `defer` runs it at the end of this function.
+        let cleanup_module_resolver: Rc<RefCell<Option<Box<dyn FnOnce()>>>> =
+            Rc::new(RefCell::new(None));
+        let create_module_resolver: Option<
+            Rc<dyn Fn(module::ResolverOptions) -> Rc<dyn module::Resolver>>,
+        > = self.module_resolver_factory.clone().map(|factory| {
+            let cleanup_module_resolver = cleanup_module_resolver.clone();
+            let create: Rc<dyn Fn(module::ResolverOptions) -> Rc<dyn module::Resolver>> =
+                Rc::new(move |options: module::ResolverOptions| {
+                    let (resolver, cleanup) = factory.new_resolver(options);
+                    *cleanup_module_resolver.borrow_mut() = Some(cleanup);
+                    resolver
+                });
+            create
+        });
+
         // Create the command line, potentially augmented with typing files
         let command_line = self.get_command_line_with_typings_files();
 
@@ -768,6 +798,7 @@ impl Project {
                 &self.dirty_file_path,
                 host_rc,
                 Some(create_checker_pool.clone()),
+                create_module_resolver.clone(),
             );
             new_program = updated_program;
             program_cloned = cloned;
@@ -858,6 +889,8 @@ impl Project {
                     single_threaded: Tristate::Unknown,
                     typings_location,
                     project_name: String::new(),
+                    // ts#64299
+                    create_module_resolver: create_module_resolver.clone(),
                     // ts#64024: Go leaves `SkipModuleResolution` zero here.
                     skip_module_resolution: false,
                 },
@@ -875,6 +908,12 @@ impl Project {
         }
 
         ls_program::bind_source_files(&new_program);
+
+        // Go: defer cleanupModuleResolver() (ts#64299)
+        let cleanup = cleanup_module_resolver.borrow_mut().take();
+        if let Some(cleanup) = cleanup {
+            cleanup();
+        }
 
         let checker_pool = created_checker_pool.borrow().clone();
         CreateProgramResult {
