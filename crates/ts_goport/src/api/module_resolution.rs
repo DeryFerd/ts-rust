@@ -74,7 +74,7 @@ impl project::ModuleResolverFactory for ModuleResolverFactoryImpl {
         &self,
         mut options: module::ResolverOptions,
     ) -> (Rc<dyn module::Resolver>, Box<dyn FnOnce()>) {
-        options.compiler_options = self.registration.compiler_options.clone();
+        options.compiler_options = Some(self.registration.compiler_options.clone());
         let mut fallback: Rc<dyn module::Resolver> = Rc::new(module::new_resolver(options.clone()));
         if self.registration.resolve_module_name_callback.is_empty() {
             if let Some(resolutions) = &self.registration.resolutions {
@@ -116,7 +116,11 @@ impl module::Resolver for CallbackModuleResolver {
         containing_file: &str,
         resolution_mode: ModuleKind,
         redirected_reference: Option<&dyn module::ModuleResolvedProjectReference>,
-    ) -> Result<(Option<Arc<ResolvedModule>>, Vec<module::DiagAndArgs>), GoError> {
+    ) -> (
+        Option<Arc<ResolvedModule>>,
+        Vec<module::DiagAndArgs>,
+        Option<GoError>,
+    ) {
         self.resolve_module_name_worker(
             module_name,
             containing_file,
@@ -132,7 +136,11 @@ impl module::Resolver for CallbackModuleResolver {
         module_name: &str,
         containing_directory: &str,
         resolution_mode: ModuleKind,
-    ) -> Result<(Option<Arc<ResolvedModule>>, Vec<module::DiagAndArgs>), GoError> {
+    ) -> (
+        Option<Arc<ResolvedModule>>,
+        Vec<module::DiagAndArgs>,
+        Option<GoError>,
+    ) {
         self.resolve_module_name_worker(
             module_name,
             containing_directory,
@@ -192,6 +200,12 @@ impl module::Resolver for CallbackModuleResolver {
             redirected_reference,
         )
     }
+
+    // PORT: the Rust-only `release_caches` of `module::Resolver` (program
+    // lane): a wrapper forwards it.
+    fn release_caches(&self) {
+        self.fallback_resolver.release_caches();
+    }
 }
 
 impl CallbackModuleResolver {
@@ -204,7 +218,11 @@ impl CallbackModuleResolver {
         containing_directory: &str,
         resolution_mode: ModuleKind,
         _redirected_reference: Option<&dyn module::ModuleResolvedProjectReference>,
-    ) -> Result<(Option<Arc<ResolvedModule>>, Vec<module::DiagAndArgs>), GoError> {
+    ) -> (
+        Option<Arc<ResolvedModule>>,
+        Vec<module::DiagAndArgs>,
+        Option<GoError>,
+    ) {
         let mut params = ResolveModuleNameCallbackParams {
             module_name: module_name.to_string(),
             containing_directory: containing_directory.to_string(),
@@ -230,32 +248,41 @@ impl CallbackModuleResolver {
         ) {
             Ok(result) => result,
             Err(err) => {
-                return Err(errors::errorf(
-                    format!("resolveModuleName callback failed: {}", err.error()),
-                    vec![err],
-                ));
+                return (
+                    None,
+                    Vec::new(),
+                    Some(errors::errorf(
+                        format!("resolveModuleName callback failed: {}", err.error()),
+                        vec![err],
+                    )),
+                );
             }
         };
 
         if callback_result.0.is_empty() || callback_result.0 == b"null" {
-            return Ok((None, Vec::new()));
+            return (None, Vec::new(), None);
         }
         let mut static_resolution = StaticModuleResolution::default();
         if let Err(err) = json_unmarshal(&callback_result.0, &mut static_resolution) {
             let err = errors::from_value(err);
-            return Err(errors::errorf(
-                format!("invalid resolveModuleName callback result: {}", err.error()),
-                vec![err],
-            ));
+            return (
+                None,
+                Vec::new(),
+                Some(errors::errorf(
+                    format!("invalid resolveModuleName callback result: {}", err.error()),
+                    vec![err],
+                )),
+            );
         }
-        Ok((
+        (
             static_module_resolution_to_resolved_module(
                 Some(&static_resolution),
                 &self.current_directory,
             )
             .map(Arc::new),
             Vec::new(),
-        ))
+            None,
+        )
     }
 }
 
@@ -343,12 +370,12 @@ pub fn compile_module_resolution_spec(
     }
 
     match module::new_static_resolutions(
-        entries,
+        &entries,
         fallback_to_resolution,
         current_directory,
         use_case_sensitive,
     ) {
-        Ok(resolutions) => Ok(Some(resolutions)),
+        Ok(resolutions) => Ok(Some(Rc::new(resolutions))),
         Err(err) => Err(errors::errorf(
             format!("{}: {}", *ERR_CLIENT_ERROR, err.error()),
             vec![ERR_CLIENT_ERROR.clone(), err],
@@ -484,7 +511,7 @@ impl ProgramResolutionContext {
             return resolver.clone();
         }
         let mut options = self.options.clone();
-        options.compiler_options = registration.compiler_options.clone();
+        options.compiler_options = Some(registration.compiler_options.clone());
         let resolver: Rc<dyn module::Resolver> = Rc::new(module::new_resolver(options));
         self.resolvers
             .borrow_mut()
@@ -655,7 +682,7 @@ impl Session {
                     fs: sd.snapshot.fs(),
                     current_directory: sd.snapshot.get_current_directory(),
                 })),
-                compiler_options: data.compiler_options.clone(),
+                compiler_options: Some(data.compiler_options.clone()),
                 extra_extensions: sd.snapshot.content_mapper_extensions(),
                 ..Default::default()
             }));
@@ -665,7 +692,7 @@ impl Session {
                     fs: self.fs(),
                     current_directory: cwd.clone(),
                 })),
-                compiler_options: data.compiler_options.clone(),
+                compiler_options: Some(data.compiler_options.clone()),
                 ..Default::default()
             }));
         }
@@ -683,11 +710,14 @@ impl Session {
         if let Some(resolutions) = &data.resolutions {
             resolver = Rc::new(module::new_static_resolver(resolver, resolutions.clone()));
         }
-        let (result, trace) = resolver.resolve_module_name_from_directory(
+        let (result, trace, err) = resolver.resolve_module_name_from_directory(
             &params.module_name,
             &containing_directory,
             mode,
-        )?;
+        );
+        if let Some(err) = err {
+            return Err(err);
+        }
         Ok(ResolveModuleNameResult {
             resolved_module: new_resolved_module_response(result.as_deref()),
             trace: module_resolution_trace_to_strings(&trace),

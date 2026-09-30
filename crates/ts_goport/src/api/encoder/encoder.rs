@@ -16,9 +16,7 @@
 
 use crate::api::encoder::prelude::*;
 
-use crate::ast::source_file_ls::{
-    SourceFileDataKey, get_or_compute_source_file_data, new_source_file_data_key,
-};
+use crate::ast::source_file_ls::{SourceFileDataKey, new_source_file_data_key};
 use crate::frontend::core_binarysearch::binary_search_unique_func;
 use crate::frontend::parser::{ExternalModuleIndicatorOptions, ParsedSourceFile};
 use std::borrow::Cow;
@@ -631,7 +629,11 @@ pub fn build_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
 
 // Go: api/encoder/encoder.go:390 GetNodeIndexTable
 pub fn get_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
-    get_or_compute_source_file_data(source_file, &*NODE_INDEX_TABLE_KEY, build_node_index_table)
+    crate::ast::source_file_ls::source_file_get_or_compute_data(
+        source_file,
+        &*NODE_INDEX_TABLE_KEY,
+        build_node_index_table,
+    )
 }
 
 // Go: api/encoder/encoder.go:396 EncodeSourceFile
@@ -639,8 +641,11 @@ pub fn get_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
 /// Returns the encoded bytes and a NodeIndexTable mapping encoder indices to AST nodes.
 pub fn encode_source_file(source_file: Node) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
     let (data, node_table) = encode_tree(source_file, source_file)?;
-    let node_table =
-        get_or_compute_source_file_data(source_file, &*NODE_INDEX_TABLE_KEY, |_: Node| node_table);
+    let node_table = crate::ast::source_file_ls::source_file_get_or_compute_data(
+        source_file,
+        &*NODE_INDEX_TABLE_KEY,
+        |_: Node| node_table,
+    );
     Ok((data, node_table))
 }
 
