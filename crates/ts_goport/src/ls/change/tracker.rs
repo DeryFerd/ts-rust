@@ -3,7 +3,7 @@
 use crate::ls::change::prelude::*;
 
 use crate::flags_macros::go_enum;
-use crate::spanmap::{self, SpanMap};
+use crate::spanmap::{self, Feature, SpanMap};
 
 // Go: ls/change/tracker.go:21 NodeOptions
 // PORT: Go `indentation *int` and `delta *int` are `Option<i32>`. The
@@ -55,13 +55,13 @@ go_enum!(TrackerEditKind, i32 {
 });
 
 // Go: ls/change/tracker.go:67 trackerEdit
-// PORT: Go embeds `lsproto.Range` and `*ast.Node`; they are the fields
-// `range` and `node`. Go stores `*trackerEdit` in the change map; here the
-// map owns the edits.
+// PORT: Go embeds `core.TextRange` and `*ast.Node`; they are the fields
+// `text_range` and `node`. Go stores `*trackerEdit` in the change map; here
+// the map owns the edits.
 #[derive(Clone, Debug, Default)]
 pub struct TrackerEdit {
     pub kind: TrackerEditKind,
-    pub range: lsproto::Range,
+    pub text_range: TextRange,
 
     pub new_text: String, // kind == text
 
@@ -187,11 +187,39 @@ impl Tracker {
         (changes, unmappable)
     }
 
-    // Go: ls/change/tracker.go:155 toLSPEditRange
-    /// toLSPEditRange converts a transformed-text range to an LSP range for an edit, mapping through the
-    /// content mapper's span map when the file is content-mapped. If the range does not fall entirely within a
-    /// single verbatim span the edit cannot be represented safely in the original text: the file is recorded so
-    /// GetChanges drops its edits, and a best-effort range is returned so the accumulated edits stay well-formed.
+    // Go: ls/change/tracker.go:154 fromLSPEditRange
+    /// fromLSPEditRange converts an LSP range to a source file range. For a content-mapped file, an original
+    /// range may have several projections; this selects the one belonging to sourceFile. A range with no exact
+    /// projection cannot be written back and marks the file unmappable.
+    pub(crate) fn from_lsp_edit_range(
+        &mut self,
+        source_file: Node,
+        lsproto_range: lsproto::Range,
+    ) -> TextRange {
+        let spans = lsconv::from_lsp_range_for_source_file(
+            &self.converters,
+            source_file,
+            lsproto_range,
+            Feature::ALL,
+        );
+        for span in &spans {
+            if span.fidelity.is_exact() && span.script == source_file {
+                return span.span;
+            }
+        }
+        self.unmappable_files
+            .insert(lsconv::Script::original_file_name(&source_file).to_string());
+        if !spans.is_empty() {
+            return spans[0].span;
+        }
+        TextRange::new(0, 0)
+    }
+
+    // Go: ls/change/tracker.go:172 toLSPEditRange
+    /// toLSPEditRange converts a source file range to an LSP range. For a content-mapped file, the range is
+    /// mapped back to the original document. If it does not fall entirely within a single verbatim span, the
+    /// edit cannot be represented safely: the file is recorded so GetChanges drops its edits, and a best-effort
+    /// range is returned so the accumulated edits stay well-formed.
     pub(crate) fn to_lsp_edit_range(
         &mut self,
         source_file: Node,
@@ -206,14 +234,6 @@ impl Tracker {
                 .insert(lsconv::Script::original_file_name(&source_file).to_string());
         }
         r
-    }
-
-    // Go: ls/change/tracker.go:168 toLSPEditPos
-    /// toLSPEditPos converts a transformed-text offset to an LSP position for a zero-length edit (an insertion),
-    /// applying the same content-mapping safety check as toLSPEditRange.
-    pub(crate) fn to_lsp_edit_pos(&mut self, source_file: Node, pos: i32) -> lsproto::Position {
-        self.to_lsp_edit_range(source_file, TextRange::new(pos, pos))
-            .start
     }
 
     // Go: ls/change/tracker.go:172 ReplaceNode
@@ -272,11 +292,12 @@ impl Tracker {
         self.replace_range_with_nodes(source_file, range, new_nodes, options);
     }
 
-    // Go: ls/change/tracker.go:193 ReplaceRange
+    // Go: ls/change/tracker.go:205 ReplaceRange
+    /// ReplaceRange replaces textRange in sourceFile with newNode.
     pub fn replace_range(
         &mut self,
         source_file: Node,
-        lsproto_range: lsproto::Range,
+        text_range: TextRange,
         new_node: Node,
         options: NodeOptions,
     ) {
@@ -285,18 +306,33 @@ impl Tracker {
             .or_default()
             .push(TrackerEdit {
                 kind: TrackerEditKind::REPLACE_WITH_SINGLE_NODE,
-                range: lsproto_range,
+                text_range,
                 options,
                 node: new_node,
                 ..TrackerEdit::default()
             });
     }
 
-    // Go: ls/change/tracker.go:197 ReplaceRangeWithText
+    // Go: ls/change/tracker.go:211 ReplaceRangeWithText
+    /// ReplaceRangeWithText replaces an LSP range with text. For a content-mapped file, the LSP range is in the
+    /// original document; text may be placed at any exact projection because it does not need formatting context.
     pub fn replace_range_with_text(
         &mut self,
         source_file: Node,
         lsproto_range: lsproto::Range,
+        text: &str,
+    ) {
+        let text_range = self.from_lsp_edit_range(source_file, lsproto_range);
+        self.replace_text_range_with_text(source_file, text_range, text);
+    }
+
+    // Go: ls/change/tracker.go:217 ReplaceTextRangeWithText
+    /// ReplaceTextRangeWithText replaces textRange in sourceFile with text. For a content-mapped file, GetChanges
+    /// maps the range back to the original document and drops the file if the edit cannot be represented there.
+    pub fn replace_text_range_with_text(
+        &mut self,
+        source_file: Node,
+        text_range: TextRange,
         text: &str,
     ) {
         self.changes
@@ -304,36 +340,23 @@ impl Tracker {
             .or_default()
             .push(TrackerEdit {
                 kind: TrackerEditKind::TEXT,
-                range: lsproto_range,
+                text_range,
                 new_text: text.to_string(),
                 ..TrackerEdit::default()
             });
     }
 
-    // Go: ls/change/tracker.go:204 ReplaceTextRangeWithText
-    /// ReplaceTextRangeWithText replaces textRange (in transformed-text coordinates) with text, mapping the
-    /// range through the content-mapping guard so an edit that cannot be represented in the original text marks
-    /// the file unmappable and is dropped by GetChanges.
-    pub fn replace_text_range_with_text(
-        &mut self,
-        source_file: Node,
-        text_range: TextRange,
-        text: &str,
-    ) {
-        let range = self.to_lsp_edit_range(source_file, text_range);
-        self.replace_range_with_text(source_file, range, text);
-    }
-
-    // Go: ls/change/tracker.go:208 ReplaceRangeWithNodes
+    // Go: ls/change/tracker.go:222 ReplaceRangeWithNodes
+    /// ReplaceRangeWithNodes replaces textRange in sourceFile with newNodes.
     pub fn replace_range_with_nodes(
         &mut self,
         source_file: Node,
-        lsproto_range: lsproto::Range,
+        text_range: TextRange,
         new_nodes: &[Node],
         options: NodeOptions,
     ) {
         if new_nodes.len() == 1 {
-            self.replace_range(source_file, lsproto_range, new_nodes[0], options);
+            self.replace_range(source_file, text_range, new_nodes[0], options);
             return;
         }
         self.changes
@@ -341,14 +364,21 @@ impl Tracker {
             .or_default()
             .push(TrackerEdit {
                 kind: TrackerEditKind::REPLACE_WITH_MULTIPLE_NODES,
-                range: lsproto_range,
+                text_range,
                 nodes: new_nodes.to_vec(),
                 options,
                 ..TrackerEdit::default()
             });
     }
 
-    // Go: ls/change/tracker.go:216 InsertText
+    // Go: ls/change/tracker.go:231 insertTextAt
+    /// insertTextAt inserts text at an offset in sourceFile.
+    pub(crate) fn insert_text_at(&mut self, source_file: Node, pos: i32, text: &str) {
+        self.replace_text_range_with_text(source_file, TextRange::new(pos, pos), text);
+    }
+
+    // Go: ls/change/tracker.go:236 InsertText
+    /// InsertText inserts text at an LSP position.
     pub fn insert_text(&mut self, source_file: Node, pos: lsproto::Position, text: &str) {
         self.replace_range_with_text(
             source_file,
@@ -360,7 +390,7 @@ impl Tracker {
         );
     }
 
-    // Go: ls/change/tracker.go:220 InsertNodeAt
+    // Go: ls/change/tracker.go:240 InsertNodeAt
     pub fn insert_node_at(
         &mut self,
         source_file: Node,
@@ -368,19 +398,10 @@ impl Tracker {
         new_node: Node,
         options: NodeOptions,
     ) {
-        let ls_pos = self.to_lsp_edit_pos(source_file, pos);
-        self.replace_range(
-            source_file,
-            lsproto::Range {
-                start: ls_pos,
-                end: ls_pos,
-            },
-            new_node,
-            options,
-        );
+        self.replace_range(source_file, TextRange::new(pos, pos), new_node, options);
     }
 
-    // Go: ls/change/tracker.go:225 InsertNodesAt
+    // Go: ls/change/tracker.go:244 InsertNodesAt
     pub fn insert_nodes_at(
         &mut self,
         source_file: Node,
@@ -388,16 +409,7 @@ impl Tracker {
         new_nodes: &[Node],
         options: NodeOptions,
     ) {
-        let ls_pos = self.to_lsp_edit_pos(source_file, pos);
-        self.replace_range_with_nodes(
-            source_file,
-            lsproto::Range {
-                start: ls_pos,
-                end: ls_pos,
-            },
-            new_nodes,
-            options,
-        );
+        self.replace_range_with_nodes(source_file, TextRange::new(pos, pos), new_nodes, options);
     }
 
     // Go: ls/change/tracker.go:230 InsertNodeAfter
@@ -504,10 +516,8 @@ impl Tracker {
         let first_param = params.get(0);
         let last_param = params.get(params.len() - 1);
         let start_pos = astnav::get_start_of_node(first_param, source_file, false);
-        let open_pos = self.to_lsp_edit_pos(source_file, start_pos);
-        self.insert_text(source_file, open_pos, "(");
-        let close_pos = self.to_lsp_edit_pos(source_file, last_param.end());
-        self.insert_text(source_file, close_pos, ")");
+        self.insert_text_at(source_file, start_pos, "(");
+        self.insert_text_at(source_file, last_param.end(), ")");
     }
 
     // Go: ls/change/tracker.go:302 InsertModifierBefore
@@ -543,8 +553,7 @@ impl Tracker {
     // Go: ls/change/tracker.go:317 DeleteRange
     /// DeleteRange deletes a text range from the source file.
     pub fn delete_range(&mut self, source_file: Node, text_range: TextRange) {
-        let lsp_range = self.to_lsp_edit_range(source_file, text_range);
-        self.replace_range_with_text(source_file, lsp_range, "");
+        self.replace_text_range_with_text(source_file, text_range, "");
     }
 
     // Go: ls/change/tracker.go:324 DeleteNode
@@ -558,7 +567,7 @@ impl Tracker {
         trailing_trivia: TrailingTriviaOption,
     ) {
         let rng = self.get_adjusted_range(source_file, node, node, leading_trivia, trailing_trivia);
-        self.replace_range_with_text(source_file, rng, "");
+        self.replace_text_range_with_text(source_file, rng, "");
     }
 
     // Go: ls/change/tracker.go:330 DeleteNodeRange
@@ -574,9 +583,11 @@ impl Tracker {
         let start_position =
             self.get_adjusted_start_position(source_file, start_node, leading_trivia, false);
         let end_position = self.get_adjusted_end_position(source_file, end_node, trailing_trivia);
-        let range =
-            self.to_lsp_edit_range(source_file, TextRange::new(start_position, end_position));
-        self.replace_range_with_text(source_file, range, "");
+        self.replace_text_range_with_text(
+            source_file,
+            TextRange::new(start_position, end_position),
+            "",
+        );
     }
 
     // Go: ls/change/tracker.go:337 finishDeleteDeclarations
@@ -638,8 +649,7 @@ impl Tracker {
                     source_file,
                     list_nodes.get((last_non_deleted_index + 1) as usize),
                 );
-                let range = self.to_lsp_edit_range(source_file, TextRange::new(start, end));
-                self.replace_range_with_text(source_file, range, "");
+                self.replace_text_range_with_text(source_file, TextRange::new(start, end), "");
             }
         }
     }
@@ -657,16 +667,13 @@ impl Tracker {
         {
             // check if previous statement ends with semicolon
             // if not - insert semicolon to preserve the code from changing the meaning due to ASI
-            let end_pos = self.to_lsp_edit_pos(source_file, after.end());
+            let end_pos = after.end();
             let semicolon = self.node_factory().new_token(SyntaxKind::SemicolonToken);
             set_node_loc(semicolon, TextRange::new(after.end(), after.end()));
             set_node_parent(semicolon, after.parent());
             self.replace_range(
                 source_file,
-                lsproto::Range {
-                    start: end_pos,
-                    end: end_pos,
-                },
+                TextRange::new(end_pos, end_pos),
                 semicolon,
                 NodeOptions::default(),
             );
@@ -812,13 +819,10 @@ impl Tracker {
                 TextRange::new(end, end + separator_string.len() as i32),
             );
             set_node_parent(separator_token, after.parent());
-            let end_pos = self.to_lsp_edit_pos(source_file, end);
+            let end_pos = end;
             self.replace_range(
                 source_file,
-                lsproto::Range {
-                    start: end_pos,
-                    end: end_pos,
-                },
+                TextRange::new(end_pos, end_pos),
                 separator_token,
                 NodeOptions::default(),
             );
@@ -846,14 +850,11 @@ impl Tracker {
             {
                 insert_pos -= 1;
             }
-            let insert_ls_pos = self.to_lsp_edit_pos(source_file, insert_pos);
+            let insert_ls_pos = insert_pos;
             let prefix = self.new_line.clone();
             self.replace_range(
                 source_file,
-                lsproto::Range {
-                    start: insert_ls_pos,
-                    end: insert_ls_pos,
-                },
+                TextRange::new(insert_ls_pos, insert_ls_pos),
                 new_node,
                 NodeOptions {
                     indentation: Some(indentation),
@@ -863,13 +864,10 @@ impl Tracker {
             );
         } else {
             let separator_string = token_to_string(separator);
-            let end_pos = self.to_lsp_edit_pos(source_file, end);
+            let end_pos = end;
             self.replace_range(
                 source_file,
-                lsproto::Range {
-                    start: end_pos,
-                    end: end_pos,
-                },
+                TextRange::new(end_pos, end_pos),
                 new_node,
                 NodeOptions {
                     prefix: separator_string.to_string() + " ",
@@ -1268,9 +1266,8 @@ impl Tracker {
             }
 
             if is_single_line {
-                let pos = self.to_lsp_edit_pos(state.source_file, close_brace.end() - 1);
                 let new_line = self.new_line.clone();
-                self.insert_text(state.source_file, pos, &new_line);
+                self.insert_text_at(state.source_file, close_brace.end() - 1, &new_line);
             }
         }
     }
