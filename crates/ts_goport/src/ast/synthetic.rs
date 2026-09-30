@@ -50,7 +50,13 @@
 //!   (`enter_base_synthetic_owner`) is open, else to the base owner;
 //! - a data write (`replace_node_data`, `set_node_kind`) goes to the owner
 //!   of the node, so a base node never points into a program version;
-//! - alias slots and node slices always go to the base owner.
+//! - an alias slot goes to the file version of its parsed node when that is
+//!   a freeable version (`ast/file_version.rs`), else to the base owner. An
+//!   alias lives as long as the node it names: after the version dies, the
+//!   next new alias frees the alias slots of that version
+//!   (`free_dead_aliases`). A read of such a slot panics, as a read of the
+//!   parsed node does;
+//! - node slices always go to the base owner.
 //!
 //! Code whose nodes a cache keeps across program versions (the token cache,
 //! lazy JSDoc, parses) opens a base scope.
@@ -179,7 +185,7 @@ const LIST_CHUNK: usize = CHUNK_BYTES / size_of::<OwnList>();
 type DataChunk = Rc<[OnceCell<crate::astdata::Node>]>;
 
 /// The panic of a read of an entry whose owner was freed.
-const FREED: &str = "synthetic node of a released program version is read";
+const FREED: &str = "synthetic entry of a released program or file version is read";
 
 /// The owner of an arena chunk (see "Owners" in the module comment).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +194,9 @@ enum OwnerKey {
     Base,
     /// A language server program version (`GoProgram::id`).
     Program(u32),
+    /// The alias slots of the nodes of a freeable file version (its file
+    /// id), in chunks of their own.
+    File(u32),
 }
 
 /// The chunk numbers of one owner, oldest first. New entries of the owner
@@ -234,6 +243,11 @@ struct SyntheticArena {
     /// The chunks of each program version that is an owner on this thread,
     /// by `GoProgram::id`.
     owners: FxHashMap<u32, OwnerChunks>,
+    /// The alias slot chunks of each freeable file version, by file id.
+    alias_files: FxHashMap<u32, OwnerChunks>,
+    /// The number of dead file versions when `free_dead_aliases` last ran
+    /// (`ast::dead_file_versions`).
+    dead_seen: usize,
     /// The last program that `current_owner` looked up, and its owner.
     last: Option<(&'static GoProgram, OwnerKey)>,
     /// The number of slots made on this thread, freed or not.
@@ -251,6 +265,8 @@ impl SyntheticArena {
             slices: Vec::new(),
             base: OwnerChunks::default(),
             owners: FxHashMap::default(),
+            alias_files: FxHashMap::default(),
+            dead_seen: 0,
             last: None,
             slots_made: 0,
         };
@@ -284,11 +300,16 @@ impl SyntheticArena {
         owner
     }
 
-    /// The chunks of `owner`, which must be open.
+    /// The chunks of `owner`, which must be open (a file owner opens with
+    /// `alias_owner`).
     fn chunks(&self, owner: OwnerKey) -> &OwnerChunks {
         match owner {
             OwnerKey::Base => &self.base,
             OwnerKey::Program(id) => self.owners.get(&id).expect("synthetic owner is not open"),
+            OwnerKey::File(file) => self
+                .alias_files
+                .get(&file)
+                .expect("synthetic owner is not open"),
         }
     }
 
@@ -300,7 +321,54 @@ impl SyntheticArena {
                 .owners
                 .get_mut(&id)
                 .expect("synthetic owner is not open"),
+            OwnerKey::File(file) => self
+                .alias_files
+                .get_mut(&file)
+                .expect("synthetic owner is not open"),
         }
+    }
+
+    /// The owner of a new alias slot for parsed node `n`: its file version
+    /// when that is a live freeable version, else the thread. It frees the
+    /// aliases of the versions that died since the last call first.
+    fn alias_owner(&mut self, n: Node) -> OwnerKey {
+        // PERF: two atomic loads in a process that frees no file version
+        // (the CLI).
+        if !super::file_version::any_freeable_published() || !owners_enabled() {
+            return OwnerKey::Base;
+        }
+        if self.dead_seen != super::file_version::dead_file_versions() {
+            self.free_dead_aliases();
+        }
+        let file = n.file_index() as u32;
+        if !self.alias_files.contains_key(&file) {
+            if super::file_version::file_version_probe(n).is_none() {
+                return OwnerKey::Base;
+            }
+            self.alias_files.insert(file, OwnerChunks::default());
+        }
+        OwnerKey::File(file)
+    }
+
+    /// Frees the alias slots of the file versions that died since the last
+    /// call, and forgets their `aliases` entries.
+    #[cold]
+    #[inline(never)]
+    fn free_dead_aliases(&mut self) {
+        let (dead, count) = super::file_version::dead_files_since(self.dead_seen);
+        self.dead_seen = count;
+        if dead.is_empty() {
+            return;
+        }
+        for &file in &dead {
+            if let Some(chunks) = self.alias_files.remove(&(file as u32)) {
+                for c in chunks.slots {
+                    self.slots[c as usize] = None;
+                }
+            }
+        }
+        let dead: FxHashSet<usize> = dead.into_iter().collect();
+        self.aliases.retain(|n, _| !dead.contains(&n.file_index()));
     }
 
     /// Slot `index`. Panics when its owner was freed.
@@ -623,6 +691,8 @@ pub fn install_synthetic_seed(seed: SyntheticSeed) {
         slices: seed.slices,
         base: OwnerChunks::default(),
         owners: FxHashMap::default(),
+        alias_files: FxHashMap::default(),
+        dead_seen: 0,
         last: None,
         slots_made: seed.slots_made,
     };
@@ -1715,7 +1785,7 @@ pub fn source_file_copy_from(node: Node, other: Node) {
 
 /// The synthetic-space id that stands for `n` inside synthetic `NodeData`.
 /// Nil maps to the nil slot. A parsed node gets (or reuses) an alias slot,
-/// which belongs to the thread.
+/// which belongs to its file version or to the thread (`alias_owner`).
 #[must_use]
 pub fn synthetic_child_id(n: Node) -> crate::astdata::NodeId {
     if n.is_nil() {
@@ -1729,7 +1799,8 @@ pub fn synthetic_child_id(n: Node) -> crate::astdata::NodeId {
         if let Some(&index) = a.aliases.get(&n) {
             return crate::astdata::NodeId::new(index);
         }
-        let index = a.push_slot(OwnerKey::Base, Slot::Alias(n));
+        let owner = a.alias_owner(n);
+        let index = a.push_slot(owner, Slot::Alias(n));
         a.aliases.insert(n, index);
         crate::astdata::NodeId::new(index)
     })
