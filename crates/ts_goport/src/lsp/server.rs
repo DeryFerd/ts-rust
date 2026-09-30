@@ -4480,6 +4480,8 @@ impl Server {
                         // Run the connection with panic recovery
                         let result = catch_unwind(AssertUnwindSafe(|| {
                             let conn = ipc::new_async_conn(rwc.clone(), api_session.clone());
+                            // ts#64299
+                            api_session.set_connection(conn.clone());
                             if let Err(api_err) = conn.run(&api_ctx) {
                                 s.logger.errorf(&format!(
                                     "API session {}: {}",
