@@ -1396,7 +1396,7 @@ pub struct ParsedPatterns {
     patterns: Vec<Pattern>,
 }
 
-impl Resolver {
+impl DefaultResolver {
     // Go: module/resolver.go:1991 getParsedPatternsForPaths
     pub fn get_parsed_patterns_for_paths(
         &self,
@@ -1547,16 +1547,14 @@ pub fn resolve_config(
     containing_file: &str,
     host: Rc<dyn ResolutionHost>,
 ) -> ResolvedModule {
-    let resolver = new_resolver(
-        host,
-        Rc::new(CompilerOptions {
+    let resolver = new_resolver(ResolverOptions {
+        host: Some(host),
+        compiler_options: Some(Rc::new(CompilerOptions {
             module_resolution: ModuleResolutionKind::NODE_NEXT,
             ..Default::default()
-        }),
-        "",
-        "",
-        Vec::new(),
-    );
+        })),
+        ..Default::default()
+    });
     resolver.resolve_config(module_name, containing_file)
 }
 

@@ -59,7 +59,7 @@ impl ResolvedEntrypoint {
     }
 }
 
-impl Resolver {
+impl DefaultResolver {
     // Go: module/resolver.go:2157 GetEntrypointsFromPackageJsonInfo
     // PORT: Go returns a nil slice for no entrypoints; that is an empty `Vec`.
     // Go `&resolutionState{resolver: r, extensions: ..., features: ...,

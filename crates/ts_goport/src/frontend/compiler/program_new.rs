@@ -18,6 +18,8 @@ pub struct ProgramOptions {
     pub single_threaded: Tristate,
     pub typings_location: String,
     pub project_name: String,
+    // ts#64299. PORT: a nil Go func is `None`.
+    pub create_module_resolver: Option<Rc<dyn Fn(ResolverOptions) -> Rc<dyn Resolver>>>,
     // SkipModuleResolution avoids all module and type reference resolution while
     // still collecting import metadata needed for emit.
     pub skip_module_resolution: bool,
@@ -122,7 +124,7 @@ impl NewProgram {
     // PORT: Go `p.resolver` and `p.projectReferenceFileMapper` are set by
     // `processAllProgramFiles`. `ProcessedFiles` holds them as `Option`, so
     // these read them and panic on the Go nil.
-    fn resolver_ref(&self) -> &Rc<Resolver> {
+    fn resolver_ref(&self) -> &Rc<dyn Resolver> {
         self.resolver.as_ref().expect("program resolver is not set")
     }
 
@@ -179,8 +181,11 @@ impl NewProgram {
 
     // Go: program.go:156 (*Program).PackageJsonCacheEntries (tsgo#4301)
     // PackageJsonCacheEntries iterates on all package json cache entries.
-    pub fn package_json_cache_entries(&self, f: impl FnMut(&Path, &Rc<InfoCacheEntry>) -> bool) {
-        self.resolver_ref().package_json_cache_entries(f);
+    pub fn package_json_cache_entries(
+        &self,
+        mut f: impl FnMut(&Path, &Rc<InfoCacheEntry>) -> bool,
+    ) {
+        self.resolver_ref().package_json_cache_entries(&mut f);
     }
 
     // Go: program.go:157 (*Program).GetRedirectTargets
@@ -404,16 +409,25 @@ impl NewProgram {
     // The returned source file is the changed file as acquired through newHost; it is None
     // only if the host cannot locate the file (e.g. it was deleted).
     // PORT: the `createCheckerPool` parameter is dropped with the option.
+    // PORT: a nil `createModuleResolver` is `None` (ts#64299).
     pub fn update_program(
         &self,
         changed_file_path: &Path,
         new_host: Rc<dyn CompilerHost>,
+        create_module_resolver: Option<Rc<dyn Fn(ResolverOptions) -> Rc<dyn Resolver>>>,
     ) -> (NewProgram, Option<Rc<ParsedSourceFile>>, bool) {
-        match self.reuse_program(changed_file_path, new_host.clone()) {
+        match self.reuse_program(
+            changed_file_path,
+            new_host.clone(),
+            create_module_resolver.clone(),
+        ) {
             (Some(result), new_file, true) => (result, new_file, true),
             (_, new_file, _) => {
                 let mut new_opts = self.opts.clone();
                 new_opts.host = new_host;
+                if create_module_resolver.is_some() {
+                    new_opts.create_module_resolver = create_module_resolver;
+                }
                 (new_program(new_opts), new_file, false)
             }
         }
@@ -435,9 +449,13 @@ impl NewProgram {
         &self,
         changed_file_path: &Path,
         new_host: Rc<dyn CompilerHost>,
+        create_module_resolver: Option<Rc<dyn Fn(ResolverOptions) -> Rc<dyn Resolver>>>,
     ) -> (Option<NewProgram>, Option<Rc<ParsedSourceFile>>, bool) {
         let mut new_opts = self.opts.clone();
         new_opts.host = new_host.clone();
+        if create_module_resolver.is_some() {
+            new_opts.create_module_resolver = create_module_resolver;
+        }
 
         // PORT: Go dereferences a nil old file and panics; so does this.
         let old_file = self
@@ -808,7 +826,7 @@ impl NewProgram {
     // port keeps the program shell (multiprog M2).
     pub fn release_resolver_caches(&self) {
         if let Some(resolver) = &self.resolver {
-            resolver.caches.release();
+            resolver.release_caches();
         }
     }
 

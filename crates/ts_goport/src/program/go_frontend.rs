@@ -241,7 +241,7 @@ pub(super) fn update_program_version(
         &host_cwd,
         old_np.use_case_sensitive_file_names(),
     );
-    let (np, _, reused) = old_np.update_program(&changed_path, host);
+    let (np, _, reused) = old_np.update_program(&changed_path, host, None);
     mark_freeable_parses(&np);
     let np = Rc::new(np);
     (build_program(&np, Entry::Version, cwd, Some(old)), reused)
@@ -553,6 +553,7 @@ fn load_config(
         single_threaded: Tristate::Unknown,
         typings_location: String::new(),
         project_name: String::new(),
+        create_module_resolver: None,
         skip_module_resolution: false,
     })
 }

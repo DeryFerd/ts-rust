@@ -17,6 +17,7 @@
 //!   hold them as `Rc`.
 
 use crate::frontend::prelude::*;
+use crate::gostd::GoError;
 use std::sync::Arc;
 
 /// Go `if r.tracer != nil { r.tracer.write(diag, args...) }`.
@@ -117,7 +118,7 @@ fn traces_of(tracer: &Option<Rc<RefCell<Tracer>>>) -> Vec<DiagAndArgs> {
 
 // Go: module/resolver.go:68 resolutionState
 pub struct ResolutionState<'a> {
-    pub resolver: &'a Resolver,
+    pub resolver: &'a DefaultResolver,
     pub tracer: Option<Rc<RefCell<Tracer>>>,
 
     // request fields
@@ -144,7 +145,10 @@ pub struct ResolutionState<'a> {
 impl<'a> ResolutionState<'a> {
     // PORT: Go `&resolutionState{compilerOptions: ..., resolver: r}` and the
     // zero fields of the other composite literals.
-    fn zero(resolver: &'a Resolver, compiler_options: Rc<CompilerOptions>) -> ResolutionState<'a> {
+    fn zero(
+        resolver: &'a DefaultResolver,
+        compiler_options: Rc<CompilerOptions>,
+    ) -> ResolutionState<'a> {
         ResolutionState {
             resolver,
             tracer: None,
@@ -174,7 +178,7 @@ pub fn new_resolution_state<'a>(
     resolution_mode: ResolutionMode,
     compiler_options: &Rc<CompilerOptions>,
     redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
-    resolver: &'a Resolver,
+    resolver: &'a DefaultResolver,
     trace_builder: Option<Rc<RefCell<Tracer>>>,
 ) -> ResolutionState<'a> {
     let mut state = ResolutionState::zero(
@@ -229,9 +233,9 @@ pub fn get_compiler_options_with_redirect(
     compiler_options.clone()
 }
 
-// Go: module/resolver.go:155 Resolver
+// Go: module/resolver.go:148 DefaultResolver
 // PORT: Go embeds `caches`; here it is the `caches` field.
-pub struct Resolver {
+pub struct DefaultResolver {
     pub caches: Caches,
     pub host: Rc<dyn ResolutionHost>,
     pub compiler_options: Rc<CompilerOptions>,
@@ -242,45 +246,28 @@ pub struct Resolver {
     // reportDiagnostic: DiagnosticReporter
 }
 
-// Go: module/resolver.go:164 ResolverOptions
-#[derive(Default)]
+// Go: module/resolver.go:158 ResolverOptions
+// PORT: the Go nil `Host` and `CompilerOptions` are `None`. Go copies the
+// struct by value; this is `Clone`.
+#[derive(Clone, Default)]
 pub struct ResolverOptions {
+    pub host: Option<Rc<dyn ResolutionHost>>,
+    pub compiler_options: Option<Rc<CompilerOptions>>,
+    pub typings_location: String,
+    pub project_name: String,
+    pub extra_extensions: Vec<String>,
     pub package_json_cache: Option<Rc<InfoCache>>,
 }
 
-// Go: module/resolver.go:168 NewResolver
+// Go: module/resolver.go:167 NewResolver
+// PORT: Go keeps a nil `Host` or `CompilerOptions` and panics at the first
+// use; `DefaultResolver` has no nil for them, so this panics now.
 #[must_use]
-pub fn new_resolver(
-    host: Rc<dyn ResolutionHost>,
-    options: Rc<CompilerOptions>,
-    typings_location: &str,
-    project_name: &str,
-    extra_extensions: Vec<String>,
-) -> Resolver {
-    let caches = new_caches(
-        host.get_current_directory(),
-        host.fs().use_case_sensitive_file_names(),
-        &options,
-    );
-    Resolver {
-        host,
-        caches,
-        compiler_options: options,
-        typings_location: typings_location.to_string(),
-        project_name: project_name.to_string(),
-        extra_extensions,
-    }
-}
-
-// Go: module/resolver.go:183 NewResolverWithOptions
-#[must_use]
-pub fn new_resolver_with_options(
-    host: Rc<dyn ResolutionHost>,
-    compiler_options: Rc<CompilerOptions>,
-    typings_location: &str,
-    project_name: &str,
-    opts: ResolverOptions,
-) -> Resolver {
+pub fn new_resolver(opts: ResolverOptions) -> DefaultResolver {
+    let host = opts.host.expect("module.NewResolver: nil Host");
+    let compiler_options = opts
+        .compiler_options
+        .expect("module.NewResolver: nil CompilerOptions");
     // PORT: Go sets the fields one by one on a zero `caches`.
     let caches = match opts.package_json_cache {
         Some(package_json_cache) => Caches::with_package_json_info_cache(package_json_cache),
@@ -290,18 +277,39 @@ pub fn new_resolver_with_options(
             &compiler_options,
         ),
     };
-    Resolver {
-        caches,
+    DefaultResolver {
         host,
         compiler_options,
-        typings_location: typings_location.to_string(),
-        project_name: project_name.to_string(),
-        extra_extensions: Vec::new(),
+        typings_location: opts.typings_location,
+        project_name: opts.project_name,
+        extra_extensions: opts.extra_extensions,
+        caches,
     }
 }
 
-impl Resolver {
-    // Go: module/resolver.go:204 newTraceBuilder
+// Go: module/resolver.go NewResolverWithOptions (removed upstream in ts#64299)
+// PORT: Go N builds this with `NewResolver(ResolverOptions{...})`. It stays
+// until its callers in `ls/autoimport` move to `new_resolver`.
+#[must_use]
+pub fn new_resolver_with_options(
+    host: Rc<dyn ResolutionHost>,
+    compiler_options: Rc<CompilerOptions>,
+    typings_location: &str,
+    project_name: &str,
+    opts: ResolverOptions,
+) -> DefaultResolver {
+    new_resolver(ResolverOptions {
+        host: Some(host),
+        compiler_options: Some(compiler_options),
+        typings_location: typings_location.to_string(),
+        project_name: project_name.to_string(),
+        extra_extensions: Vec::new(),
+        package_json_cache: opts.package_json_cache,
+    })
+}
+
+impl DefaultResolver {
+    // Go: module/resolver.go:182 newTraceBuilder
     #[must_use]
     pub fn new_trace_builder(&self) -> Option<Rc<RefCell<Tracer>>> {
         if self.compiler_options.trace_resolution == Tristate::True {
@@ -379,8 +387,8 @@ impl Tracer {
     }
 }
 
-impl Resolver {
-    // Go: module/resolver.go:221 ResolveTypeReferenceDirective
+impl DefaultResolver {
+    // Go: module/resolver.go:204 ResolveTypeReferenceDirective
     pub fn resolve_type_reference_directive(
         &self,
         type_reference_directive_name: &str,
@@ -482,15 +490,57 @@ impl Resolver {
         (result, traces_of(&trace_builder))
     }
 
-    // Go: module/resolver.go:266 ResolveModuleName
+    // Go: module/resolver.go:249 ResolveModuleName
+    // PORT: the `module.Resolver` form is `Resolver::resolve_module_name`,
+    // whose result can be nil. This one is never nil and never fails (Go
+    // returns a nil error).
     pub fn resolve_module_name(
         &self,
         module_name: &str,
         containing_file: &str,
         resolution_mode: ResolutionMode,
         redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
+    ) -> (Arc<ResolvedModule>, Vec<DiagAndArgs>, Option<GoError>) {
+        let (result, trace) = self.resolve_module_name_worker(
+            module_name,
+            containing_file,
+            &get_directory_path(containing_file),
+            resolution_mode,
+            redirected_reference,
+        );
+        (result, trace, None)
+    }
+
+    // Go: module/resolver.go:254 ResolveModuleNameFromDirectory (ts#64299)
+    // PORT: see `resolve_module_name`.
+    pub fn resolve_module_name_from_directory(
+        &self,
+        module_name: &str,
+        containing_directory: &str,
+        resolution_mode: ResolutionMode,
+    ) -> (Arc<ResolvedModule>, Vec<DiagAndArgs>, Option<GoError>) {
+        let (result, trace) = self.resolve_module_name_worker(
+            module_name,
+            containing_directory,
+            containing_directory,
+            resolution_mode,
+            None,
+        );
+        (result, trace, None)
+    }
+
+    // Go: module/resolver.go:259 resolveModuleName
+    // PORT: named `resolve_module_name_worker`; the Go names
+    // `ResolveModuleName` and `resolveModuleName` share a snake name.
+    fn resolve_module_name_worker(
+        &self,
+        module_name: &str,
+        containing_file: &str,
+        containing_directory: &str,
+        resolution_mode: ResolutionMode,
+        redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
     ) -> (Arc<ResolvedModule>, Vec<DiagAndArgs>) {
-        let containing_directory = get_directory_path(containing_file);
+        let containing_directory = containing_directory.to_string();
         let trace_builder = self.new_trace_builder();
 
         let cache_key = ModuleResolutionCacheKey {
@@ -608,7 +658,7 @@ impl Resolver {
         (final_result, traces_of(&trace_builder))
     }
 
-    // Go: module/resolver.go:327 ResolvePackageDirectory
+    // Go: module/resolver.go:318 ResolvePackageDirectory
     // PORT: a Go nil `*ResolvedModule` is `None`.
     pub fn resolve_package_directory(
         &self,
@@ -639,7 +689,7 @@ impl Resolver {
         None
     }
 
-    // Go: module/resolver.go:338 tryResolveFromTypingsLocation
+    // Go: module/resolver.go:329 tryResolveFromTypingsLocation
     // PORT: takes the original result by value and returns it or a new one.
     pub fn try_resolve_from_typings_location(
         &self,
@@ -690,7 +740,7 @@ impl Resolver {
         result
     }
 
-    // Go: module/resolver.go:367 resolveConfig
+    // Go: module/resolver.go:358 resolveConfig
     pub fn resolve_config(&self, module_name: &str, containing_file: &str) -> ResolvedModule {
         let containing_directory = get_directory_path(containing_file);
         let mut state = new_resolution_state(

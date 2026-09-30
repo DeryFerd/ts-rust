@@ -1,6 +1,7 @@
 //! Port of module/types.go.
 
 use crate::frontend::prelude::*;
+use std::sync::Arc;
 
 // Go: module/types.go:14 ResolutionHost
 // PORT: Go interface. `FS()` returns a borrowed trait object; the host
@@ -8,6 +9,144 @@ use crate::frontend::prelude::*;
 pub trait ResolutionHost {
     fn fs(&self) -> &dyn Fs;
     fn get_current_directory(&self) -> &str;
+}
+
+// Go: module/types.go:20 Resolver (ts#64299)
+// PORT: Go interface. A nil `*ResolvedModule` is `None`; a nil `error` is
+// `None`. `PackageJsonCacheEntries` takes a `dyn FnMut`, because a trait
+// object has no generic methods.
+pub trait Resolver {
+    fn resolve_module_name(
+        &self,
+        module_name: &str,
+        containing_file: &str,
+        resolution_mode: ResolutionMode,
+        redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
+    ) -> (
+        Option<Arc<ResolvedModule>>,
+        Vec<DiagAndArgs>,
+        Option<crate::gostd::GoError>,
+    );
+    fn resolve_module_name_from_directory(
+        &self,
+        module_name: &str,
+        containing_directory: &str,
+        resolution_mode: ResolutionMode,
+    ) -> (
+        Option<Arc<ResolvedModule>>,
+        Vec<DiagAndArgs>,
+        Option<crate::gostd::GoError>,
+    );
+    fn resolve_type_reference_directive(
+        &self,
+        type_reference_directive_name: &str,
+        containing_file: &str,
+        resolution_mode: ResolutionMode,
+        redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
+    ) -> (Rc<ResolvedTypeReferenceDirective>, Vec<DiagAndArgs>);
+    fn get_package_scope_for_path(&self, directory: &str) -> Option<Rc<InfoCacheEntry>>;
+    fn package_json_cache_entries(&self, f: &mut dyn FnMut(&Path, &Rc<InfoCacheEntry>) -> bool);
+    fn resolve_package_directory(
+        &self,
+        module_name: &str,
+        containing_file: &str,
+        resolution_mode: ResolutionMode,
+        redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
+    ) -> Option<ResolvedModule>;
+
+    /// Empties the resolution caches when no program uses this resolver any
+    /// more (`NewProgram::release_resolver_caches`).
+    // PORT: not in Go (Go's GC frees the resolver). Only `DefaultResolver`
+    // has caches to release.
+    fn release_caches(&self) {}
+}
+
+// Go: module/resolver.go:148 DefaultResolver as a module.Resolver
+// PORT: each method is the `DefaultResolver` method of the same Go name.
+impl Resolver for DefaultResolver {
+    fn resolve_module_name(
+        &self,
+        module_name: &str,
+        containing_file: &str,
+        resolution_mode: ResolutionMode,
+        redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
+    ) -> (
+        Option<Arc<ResolvedModule>>,
+        Vec<DiagAndArgs>,
+        Option<crate::gostd::GoError>,
+    ) {
+        let (result, trace, err) = DefaultResolver::resolve_module_name(
+            self,
+            module_name,
+            containing_file,
+            resolution_mode,
+            redirected_reference,
+        );
+        (Some(result), trace, err)
+    }
+
+    fn resolve_module_name_from_directory(
+        &self,
+        module_name: &str,
+        containing_directory: &str,
+        resolution_mode: ResolutionMode,
+    ) -> (
+        Option<Arc<ResolvedModule>>,
+        Vec<DiagAndArgs>,
+        Option<crate::gostd::GoError>,
+    ) {
+        let (result, trace, err) = DefaultResolver::resolve_module_name_from_directory(
+            self,
+            module_name,
+            containing_directory,
+            resolution_mode,
+        );
+        (Some(result), trace, err)
+    }
+
+    fn resolve_type_reference_directive(
+        &self,
+        type_reference_directive_name: &str,
+        containing_file: &str,
+        resolution_mode: ResolutionMode,
+        redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
+    ) -> (Rc<ResolvedTypeReferenceDirective>, Vec<DiagAndArgs>) {
+        DefaultResolver::resolve_type_reference_directive(
+            self,
+            type_reference_directive_name,
+            containing_file,
+            resolution_mode,
+            redirected_reference,
+        )
+    }
+
+    fn get_package_scope_for_path(&self, directory: &str) -> Option<Rc<InfoCacheEntry>> {
+        DefaultResolver::get_package_scope_for_path(self, directory)
+    }
+
+    fn package_json_cache_entries(&self, f: &mut dyn FnMut(&Path, &Rc<InfoCacheEntry>) -> bool) {
+        DefaultResolver::package_json_cache_entries(self, f);
+    }
+
+    fn resolve_package_directory(
+        &self,
+        module_name: &str,
+        containing_file: &str,
+        resolution_mode: ResolutionMode,
+        redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
+    ) -> Option<ResolvedModule> {
+        DefaultResolver::resolve_package_directory(
+            self,
+            module_name,
+            containing_file,
+            resolution_mode,
+            redirected_reference,
+        )
+    }
+
+    fn release_caches(&self) {
+        self.caches.release();
+    }
 }
 
 // Go: module/types.go:19 ModeAwareCacheKey

@@ -1148,6 +1148,7 @@ impl FilesParser {
             redirect_files_by_path: redirect_files_by_path.map(Rc::new),
             // tsgo#4712
             content_mapper_diagnostics: loader.content_mapper_diagnostics.borrow().clone(),
+            module_resolution_error: loader.module_resolution_error.borrow().clone(),
         }
     }
 
@@ -1448,9 +1449,11 @@ impl WorkerResolveConfig {
     /// The config of `loader`. `None` when workers do not resolve.
     fn of_loader(loader: &FileLoader) -> Option<Self> {
         let options = loader.opts.config.compiler_options();
-        // PORT: see `skip_module_resolution` in `process_all_program_files`.
+        // PORT: see `skip_module_resolution` and `create_module_resolver` in
+        // `process_all_program_files`.
         if !super::file_loader::workers_resolve_imports(options)
             || loader.opts.skip_module_resolution
+            || loader.opts.create_module_resolver.is_some()
         {
             return None;
         }
@@ -2060,7 +2063,7 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
 /// A parse worker's resolver: the program resolver of a Go parse task,
 /// on the worker's file system.
 struct WorkerResolver {
-    resolver: Resolver,
+    resolver: DefaultResolver,
     options: Rc<CompilerOptions>,
 }
 
@@ -2090,13 +2093,14 @@ impl WorkerResolver {
             fs,
             current_directory: current_directory.to_string(),
         });
-        let mut resolver = new_resolver(
-            host,
-            options.clone(),
-            &config.typings_location,
-            &config.project_name,
-            config.extra_extensions.clone(),
-        );
+        let mut resolver = new_resolver(ResolverOptions {
+            host: Some(host),
+            compiler_options: Some(options.clone()),
+            typings_location: config.typings_location.clone(),
+            project_name: config.project_name.clone(),
+            extra_extensions: config.extra_extensions.clone(),
+            package_json_cache: None,
+        });
         resolver.caches.shared = config.shared.clone().map(|cache| SharedResolutionLink {
             cache,
             publish: true,
@@ -2144,7 +2148,7 @@ impl WorkerResolver {
             if specifier.is_empty() {
                 continue;
             }
-            let (resolved, _) = self
+            let (resolved, _, _) = self
                 .resolver
                 .resolve_module_name(specifier, file_name, mode, None);
             if !resolved.is_resolved() {

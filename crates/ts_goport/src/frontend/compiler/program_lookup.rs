@@ -522,21 +522,10 @@ impl NewProgram {
             .clone()
     }
 
-    // Go: program.go:2072 (*Program).ResolveModuleName
-    pub fn resolve_module_name(
-        &self,
-        module_name: &str,
-        containing_file: &str,
-        resolution_mode: ResolutionMode,
-    ) -> Arc<ResolvedModule> {
-        let resolver = self
-            .processed_files
-            .resolver
-            .as_ref()
-            .expect("program has a resolver");
-        let (resolved, _) =
-            resolver.resolve_module_name(module_name, containing_file, resolution_mode, None);
-        resolved
+    // Go: program.go:644 (*Program).ModuleResolutionError (ts#64299)
+    // PORT: a nil Go `error` is `None`.
+    pub fn module_resolution_error(&self) -> Option<crate::gostd::GoError> {
+        self.processed_files.module_resolution_error.clone()
     }
 
     // Go: program.go:2077 (*Program).ForEachResolvedModule

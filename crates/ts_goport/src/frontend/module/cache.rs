@@ -17,7 +17,7 @@ pub struct ModuleResolutionCacheKey {
 
 // Go: module/cache.go:20 moduleResolutionCache
 // PORT: Go `collections.SyncMap` is a plain map behind a `RefCell`, so the
-// `Resolver` methods can take `&self`. Cached Go pointers are `Arc`: parse
+// `DefaultResolver` methods can take `&self`. Cached Go pointers are `Arc`: parse
 // workers share them (`SharedResolutionCache`), and checker threads read
 // the program's resolutions with no copy (`GoSharedState`).
 #[derive(Default)]
@@ -144,13 +144,13 @@ pub struct Caches {
     /// The loader's resolver: the package.json lookups of the worker
     /// answers that it took from `shared`. They go into
     /// `package_json_info_cache` before a read of all its entries
-    /// (`Resolver::package_json_cache_entries`).
+    /// (`DefaultResolver::package_json_cache_entries`).
     pub worker_package_jsons: RefCell<Vec<Arc<[PackageJsonLookup]>>>,
 }
 
 impl Caches {
     // PORT: Go zero `caches` with only `packageJsonInfoCache` set
-    // (`NewResolverWithOptions` with a shared cache).
+    // (`NewResolver` with a shared `PackageJsonCache`).
     #[must_use]
     pub fn with_package_json_info_cache(package_json_info_cache: Rc<InfoCache>) -> Caches {
         Caches {
@@ -373,7 +373,7 @@ mod tests {
 
     /// A bundler resolver on the OS file system of this thread, linked to
     /// `shared` when given.
-    fn test_resolver(dir: &str, shared: Option<SharedResolutionLink>) -> Resolver {
+    fn test_resolver(dir: &str, shared: Option<SharedResolutionLink>) -> DefaultResolver {
         let host: Rc<dyn ResolutionHost> = Rc::new(TestHost {
             fs: osvfs_fs(),
             current_directory: dir.to_string(),
@@ -383,7 +383,11 @@ mod tests {
             module_resolution: ModuleResolutionKind::BUNDLER,
             ..Default::default()
         });
-        let mut resolver = new_resolver(host, options, "", "", Vec::new());
+        let mut resolver = new_resolver(ResolverOptions {
+            host: Some(host),
+            compiler_options: Some(options),
+            ..Default::default()
+        });
         resolver.caches.shared = shared;
         resolver
     }
@@ -400,7 +404,7 @@ mod tests {
         "@types/node",
     ];
 
-    fn resolve(resolver: &Resolver, dir: &str, names: &[&str]) {
+    fn resolve(resolver: &DefaultResolver, dir: &str, names: &[&str]) {
         let containing_file = format!("{dir}/src/deep/index.ts");
         for name in names {
             if let Some(type_reference) = name.strip_prefix("@types/") {
@@ -418,7 +422,7 @@ mod tests {
     }
 
     /// The package.json cache entries that the build info reads, sorted.
-    fn package_json_entries(resolver: &Resolver) -> Vec<(String, String, bool, bool)> {
+    fn package_json_entries(resolver: &DefaultResolver) -> Vec<(String, String, bool, bool)> {
         let mut entries = Vec::new();
         resolver.package_json_cache_entries(|key, entry| {
             entries.push((

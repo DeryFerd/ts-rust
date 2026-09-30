@@ -48,7 +48,7 @@ pub struct SourceFileFromReferenceDiagnostic {
 // `process_all_program_files` sets it, as in Go.
 pub struct FileLoader {
     pub opts: ProgramOptions,
-    pub resolver: Option<Rc<Resolver>>,
+    pub resolver: Option<Rc<dyn Resolver>>,
     pub default_library_path: String,
     pub compare_paths_options: ComparePathsOptions,
     pub supported_extensions: Vec<Vec<String>>,
@@ -82,6 +82,9 @@ pub struct FileLoader {
     pub content_mapper_failures: RefCell<FxHashMap<*const Mapper, i32>>,
     pub content_mapper_init_failed: RefCell<FxHashSet<*const Mapper>>,
     pub content_mapper_diagnostics: RefCell<Vec<Diagnostic>>,
+    // ts#64299. PORT: Go `moduleResolutionErrorOnce` plus the error is an
+    // `Option` that keeps the first error.
+    pub module_resolution_error: RefCell<Option<GoError>>,
 }
 
 // Go: fileloader.go:62 redirectsFile
@@ -139,7 +142,7 @@ impl RedirectsFile {
 // (`GoSharedState`) with no copy.
 #[derive(Clone)]
 pub struct ProcessedFiles {
-    pub resolver: Option<Rc<Resolver>>,
+    pub resolver: Option<Rc<dyn Resolver>>,
     pub files: Vec<Rc<ParsedSourceFile>>,
     // duplicateSourceFiles tracks parsed files loaded during program construction
     // that were later dropped from the final program, such as losing filename
@@ -170,6 +173,8 @@ pub struct ProcessedFiles {
     // Program-level diagnostics reported when a content mapper fails fatally (reported once per mapper).
     // tsgo#4712
     pub content_mapper_diagnostics: Vec<Diagnostic>,
+    // ts#64299
+    pub module_resolution_error: Option<GoError>,
     pub finished_processing: bool,
 }
 
@@ -233,6 +238,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         content_mapper_failures: RefCell::new(FxHashMap::default()),
         content_mapper_init_failed: RefCell::new(FxHashSet::default()),
         content_mapper_diagnostics: RefCell::new(Vec::new()),
+        module_resolution_error: RefCell::new(None),
         opts,
     };
     loader.add_project_reference_tasks(single_threaded);
@@ -242,40 +248,47 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         .host
         .clone()
         .expect("projectReferenceFileMapper.host is set until processing ends");
-    let mut resolver = new_resolver(
-        resolver_host,
-        compiler_options.clone(),
-        &loader.opts.typings_location,
-        &loader.opts.project_name,
-        loader.opts.config.content_mapper_extensions(),
-    );
-    // PERF: Go resolves in all parse tasks with one shared cache. Here the
-    // parse workers resolve ahead of the loader, and the loader reads their
-    // answers. Only when every resolver sees the same files: the plain OS
-    // file system (no project reference faking host) and no traced
-    // resolution (Go then skips the cache too).
-    // PORT: with `skip_module_resolution` the loader resolves nothing
-    // (ts#64024), so the workers do not either.
-    if !single_threaded
-        && super::files_parser::parse_workers_enabled()
-        && workers_resolve_imports(&compiler_options)
-        && !loader.opts.skip_module_resolution
-        && loader.opts.host.is_plain_os_fs()
-        && compiler_options.trace_resolution != Tristate::True
-        && loader
-            .opts
-            .config
-            .resolved_project_reference_paths()
-            .is_empty()
-    {
-        let shared = Arc::new(SharedResolutionCache::default());
-        resolver.caches.shared = Some(SharedResolutionLink {
-            cache: shared.clone(),
-            publish: false,
-        });
-        loader.shared_resolution = Some(shared);
+    let resolver_options = ResolverOptions {
+        host: Some(resolver_host),
+        compiler_options: Some(compiler_options.clone()),
+        typings_location: loader.opts.typings_location.clone(),
+        project_name: loader.opts.project_name.clone(),
+        extra_extensions: loader.opts.config.content_mapper_extensions(),
+        package_json_cache: None,
+    };
+    if let Some(create_module_resolver) = loader.opts.create_module_resolver.clone() {
+        loader.resolver = Some(create_module_resolver(resolver_options));
+    } else {
+        let mut resolver = new_resolver(resolver_options);
+        // PERF: Go resolves in all parse tasks with one shared cache. Here the
+        // parse workers resolve ahead of the loader, and the loader reads their
+        // answers. Only when every resolver sees the same files: the plain OS
+        // file system (no project reference faking host) and no traced
+        // resolution (Go then skips the cache too). Only for the default
+        // resolver: a parse worker cannot run a `create_module_resolver` one.
+        // PORT: with `skip_module_resolution` the loader resolves nothing
+        // (ts#64024), so the workers do not either.
+        if !single_threaded
+            && super::files_parser::parse_workers_enabled()
+            && workers_resolve_imports(&compiler_options)
+            && !loader.opts.skip_module_resolution
+            && loader.opts.host.is_plain_os_fs()
+            && compiler_options.trace_resolution != Tristate::True
+            && loader
+                .opts
+                .config
+                .resolved_project_reference_paths()
+                .is_empty()
+        {
+            let shared = Arc::new(SharedResolutionCache::default());
+            resolver.caches.shared = Some(SharedResolutionLink {
+                cache: shared.clone(),
+                publish: false,
+            });
+            loader.shared_resolution = Some(shared);
+        }
+        loader.resolver = Some(Rc::new(resolver));
     }
-    loader.resolver = Some(Rc::new(resolver));
     let _trace = crate::tracing::get().map(|tr| {
         tr.push(
             crate::tracing::Phase::Program,
@@ -1533,12 +1546,17 @@ impl FileLoader {
                     entry,
                     Some(&options_for_file),
                 );
-                let (resolved_module, trace) = self.resolver().resolve_module_name(
+                let (resolved_module, trace, err) = self.resolver().resolve_module_name(
                     module_name,
                     &file_name,
                     mode,
                     redirect_ref,
                 );
+                if let Some(err) = err {
+                    self.note_module_resolution_error(err);
+                }
+                let resolved_module =
+                    resolved_module.unwrap_or_else(|| Arc::new(ResolvedModule::default()));
                 resolutions_in_file.insert(
                     ModeAwareCacheKey {
                         name: module_name.to_string(),
@@ -1700,14 +1718,37 @@ impl FileLoader {
                 false,
             )
         });
-        self.resolver()
-            .resolve_module_name(library_name, resolve_from, ModuleKind::COMMON_JS, None)
+        let (resolved, trace, err) = self.resolver().resolve_module_name(
+            library_name,
+            resolve_from,
+            ModuleKind::COMMON_JS,
+            None,
+        );
+        if let Some(err) = err {
+            self.note_module_resolution_error(err);
+        }
+        // PORT: Go returns a nil result from a `create_module_resolver`
+        // resolver as is; its callers only ask `IsResolved`, which is false
+        // for nil, as for an empty result.
+        (
+            resolved.unwrap_or_else(|| Arc::new(ResolvedModule::default())),
+            trace,
+        )
+    }
+
+    /// Go `p.moduleResolutionErrorOnce.Do(func() { p.moduleResolutionError = err })`
+    /// (ts#64299): keeps the first error.
+    fn note_module_resolution_error(&self, err: GoError) {
+        let mut module_resolution_error = self.module_resolution_error.borrow_mut();
+        if module_resolution_error.is_none() {
+            *module_resolution_error = Some(err);
+        }
     }
 
     /// Go `p.resolver`. It is set before any file is loaded.
-    fn resolver(&self) -> &Resolver {
+    fn resolver(&self) -> &dyn Resolver {
         self.resolver
-            .as_ref()
+            .as_deref()
             .expect("fileLoader.resolver is set before loading")
     }
 }
@@ -1717,7 +1758,7 @@ impl FileLoader {
 /// its own resolver (`files_parser.rs`).
 // Go: fileloader.go:341 (*fileLoader).loadSourceFileMetaData
 pub(crate) fn source_file_meta_data(
-    resolver: &Resolver,
+    resolver: &dyn Resolver,
     options: &CompilerOptions,
     file_name: &str,
 ) -> SourceFileMetaData {
@@ -2049,6 +2090,7 @@ mod tests {
                 single_threaded: Tristate::True,
                 typings_location: String::new(),
                 project_name: String::new(),
+                create_module_resolver: None,
                 skip_module_resolution: false,
             },
             true,

@@ -20,16 +20,14 @@ pub fn resolve_content_mapper_manifest(
         fs: host.fs(),
         current_directory: host.get_current_directory(),
     });
-    let resolver = new_resolver(
-        resolver_host,
-        Rc::new(CompilerOptions {
+    let resolver = new_resolver(ResolverOptions {
+        host: Some(resolver_host),
+        compiler_options: Some(Rc::new(CompilerOptions {
             module_resolution: ModuleResolutionKind::BUNDLER,
             ..Default::default()
-        }),
-        "",
-        "",
-        Vec::new(),
-    );
+        })),
+        ..Default::default()
+    });
     let resolved = resolver.resolve_package_directory(
         package_name,
         containing_file,
