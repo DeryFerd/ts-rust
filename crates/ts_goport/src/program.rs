@@ -526,17 +526,15 @@ type JobResult<R> = std::thread::Result<R>;
 
 /// Program-level state that `GoProgram` does not hold. One per program
 /// version, in `GoProgram::state`; read it with `state()`. It is leaked with
-/// its `GoProgram`, so it holds only small values. The per-version tables
-/// are in `VersionTables` (`with_tables`), which a release frees.
+/// its `GoProgram`, so it holds only small values: its strings are interned
+/// (`Name`), one copy per distinct value. The per-version tables are in
+/// `VersionTables` (`with_tables`), which a release frees.
 pub(crate) struct ProgramState {
-    cwd: String,
+    cwd: &'static str,
     use_case_sensitive_file_names: bool,
-    /// `get_resolved_modules`: an alias resolver program only (empty).
-    resolved_modules:
-        OnceLock<IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>>>,
     /// Go `Program.CommonSourceDirectory`. The Go frontend sets it when it
-    /// builds the program.
-    common_source_directory: OnceLock<String>,
+    /// builds the program; an alias resolver program has none.
+    common_source_directory: Option<&'static str>,
     /// True for the program of an autoimport alias resolver
     /// (`new_alias_resolver_program`). Its resolver is in `ALIAS_RESOLVERS`.
     alias_resolver: bool,
@@ -549,6 +547,9 @@ pub(crate) struct ProgramState {
 // stay leaked (checker code holds `&'static` borrows of them), so the
 // tables are behind an `Arc` that `release_program` drops.
 pub(crate) struct VersionTables {
+    /// File ids in Go `Program.SourceFiles()` order
+    /// (`GoProgram::source_file_order`).
+    source_file_order: Vec<usize>,
     file_by_path: FxHashMap<String, usize>,
     /// The Go `SourceFile` fields that the program sets, by file id, for
     /// each program file.
@@ -575,9 +576,10 @@ pub(crate) struct VersionTables {
 }
 
 impl VersionTables {
-    /// Tables with only the files by path set.
-    fn new(file_by_path: FxHashMap<String, usize>) -> Self {
+    /// Tables with only the file order and the files by path set.
+    fn new(source_file_order: Vec<usize>, file_by_path: FxHashMap<String, usize>) -> Self {
         VersionTables {
+            source_file_order,
             file_by_path,
             file_meta: FxHashMap::default(),
             file_associations: OnceLock::new(),
@@ -716,6 +718,60 @@ fn held_tables(program: &'static GoProgram) -> HeldTables {
     HeldTables::Version(cached.unwrap_or_else(|| slot_tables(program.id, slot)))
 }
 
+impl GoProgram {
+    /// Go `Program.SourceFiles()`: the program files in Go order. Each guard
+    /// pins a freeable file version while it lives (see `ast::go_file`).
+    /// The iterator holds the program tables (`source_file_order`).
+    pub fn source_files(&'static self) -> impl Iterator<Item = crate::ast::FileRef<GoFile>> {
+        let order = self.source_file_order();
+        (0..order.len()).map(move |i| crate::ast::go_file(order[i]))
+    }
+
+    /// The file ids of the program in Go `Program.SourceFiles()` order. They
+    /// are in the program tables, which a release frees (lsshells M2c), so
+    /// this panics when the program is released and this thread holds no
+    /// copy of its tables, as `with_tables`.
+    #[must_use]
+    pub fn source_file_order(&'static self) -> SourceFileOrder {
+        SourceFileOrder(held_tables(self))
+    }
+}
+
+/// The file ids of a program in Go order (`GoProgram::source_file_order`).
+/// The guard holds the program tables while it lives.
+pub struct SourceFileOrder(HeldTables);
+
+impl Deref for SourceFileOrder {
+    type Target = [usize];
+
+    #[inline]
+    fn deref(&self) -> &[usize] {
+        &self.0.source_file_order
+    }
+}
+
+/// The leaked copy of `options` that `GoProgram::options` keeps: one per
+/// distinct value in the process, so the program versions of a language
+/// server session share one copy.
+// PERF: a linear search with `==`, once per program. A process has one
+// options value per project config.
+pub(crate) fn intern_compiler_options(options: &CompilerOptions) -> &'static CompilerOptions {
+    static INTERNED: Mutex<Vec<&'static CompilerOptions>> = Mutex::new(Vec::new());
+    let mut interned = INTERNED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(&found) = interned.iter().find(|&&found| found == options) {
+        return found;
+    }
+    let leaked: &'static CompilerOptions = Box::leak(Box::new(options.clone()));
+    interned.push(leaked);
+    leaked
+}
+
+/// `text` interned (`Name`): a program string that is leaked with the
+/// program shell, once per distinct value.
+fn intern_program_str(text: &str) -> &'static str {
+    crate::core::Name::from(text).as_str()
+}
+
 /// The binder symbols of a program version (Go: the symbols that the bound
 /// files of the program point to): a copy of the binder lineage after the
 /// program files are bound (`bind_all`). It derefs to the arena.
@@ -839,7 +895,7 @@ fn state() -> &'static ProgramState {
 
 /// The state of `program`.
 fn state_of(program: &'static GoProgram) -> &'static ProgramState {
-    program.state.get().copied().expect("program not loaded")
+    program.state.get().expect("program not loaded")
 }
 
 /// The Go frontend program, or None for an alias resolver program. Panics
@@ -968,17 +1024,16 @@ pub fn new_alias_resolver_program(
         .iter()
         .map(|&file| (source_file_info(file).path.clone(), file.file_index()))
         .collect();
+    let source_file_order = root_files.iter().map(|file| file.file_index()).collect();
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
         id: next_program_id(),
-        source_file_order: root_files.iter().map(|file| file.file_index()).collect(),
-        options,
+        options: intern_compiler_options(&options),
         state: OnceLock::new(),
     }));
-    let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
-        cwd: current_directory.to_string(),
+    let program_state = ProgramState {
+        cwd: intern_program_str(current_directory),
         use_case_sensitive_file_names,
-        resolved_modules: OnceLock::from(IndexMap::new()),
-        common_source_directory: OnceLock::new(),
+        common_source_directory: None,
         alias_resolver: true,
         // The files stay alive while the alias resolver program reads them.
         tables: TablesSlot::new(
@@ -986,11 +1041,11 @@ pub fn new_alias_resolver_program(
                 file_versions: crate::ast::live_file_versions(
                     files.iter().map(|file| file.file_index()),
                 ),
-                ..VersionTables::new(file_by_path)
+                ..VersionTables::new(source_file_order, file_by_path)
             },
             false,
         ),
-    }));
+    };
     assert!(program.state.set(program_state).is_ok());
     register_program_version(program);
     let bound_symbols = with_lineage(|lineage| {
@@ -1878,7 +1933,7 @@ pub fn file_exists(path: &str) -> bool {
 
 // Go: compiler/program.go:127 GetCurrentDirectory
 pub fn get_current_directory() -> &'static str {
-    &state().cwd
+    state().cwd
 }
 
 // Go: compiler/program.go:215 UseCaseSensitiveFileNames
@@ -1947,7 +2002,7 @@ fn with_file_options_and_meta<R>(
             .go
             .as_ref()
             .and_then(|go| go.get_redirect_for_resolution(file))
-            .map_or(&prog().options, |redirect| redirect.compiler_options());
+            .map_or(prog().options, |redirect| redirect.compiler_options());
         let meta = tables
             .file_meta_by_path(path)
             .map_or(&*MISSING, |meta| &meta.meta_data);
@@ -2257,10 +2312,13 @@ pub fn get_resolved_module_from_module_specifier(
 // Go frontend program keeps its map in `GoSharedState` (`get_packages_map`).
 pub fn get_resolved_modules()
 -> &'static IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>> {
-    state()
-        .resolved_modules
-        .get()
-        .expect("resolved modules of a program that is not an alias resolver")
+    static EMPTY: OnceLock<IndexMap<String, IndexMap<(String, ResolutionMode), ResolvedModule>>> =
+        OnceLock::new();
+    assert!(
+        state().alias_resolver,
+        "resolved modules of a program that is not an alias resolver"
+    );
+    EMPTY.get_or_init(IndexMap::new)
 }
 
 // Go: compiler/program.go:1519 GetSourceFileMetaData
@@ -2356,7 +2414,6 @@ pub fn common_source_directory() -> &'static str {
     alias_resolver_unimplemented();
     state()
         .common_source_directory
-        .get()
         .expect("the Go frontend sets the common source directory")
 }
 
@@ -2737,7 +2794,7 @@ fn checker_count() -> usize {
         checker_count = i64::from(count);
     }
     checker_count
-        .min(program.source_file_order.len() as i64)
+        .min(program.source_file_order().len() as i64)
         .min(256)
         .max(1) as usize
 }
@@ -2753,22 +2810,18 @@ fn create_checkers() -> CheckerPool {
     bind_all();
     let count = checker_count();
     let program = prog();
+    let source_file_order = program.source_file_order();
     let associations = match go_frontend_program() {
         Some(np) => ls_program::get_checker_associations(&np, count),
-        None => (0..program.source_file_order.len())
-            .map(|i| i % count)
-            .collect(),
+        None => (0..source_file_order.len()).map(|i| i % count).collect(),
     };
     // One entry per file id up to the last program file.
-    let len = program
-        .source_file_order
-        .iter()
-        .max()
-        .map_or(0, |&last| last + 1);
+    let len = source_file_order.iter().max().map_or(0, |&last| last + 1);
     let mut file_associations = vec![0; len];
-    for (i, &file_index) in program.source_file_order.iter().enumerate() {
+    for (i, &file_index) in source_file_order.iter().enumerate() {
         file_associations[file_index] = associations[i];
     }
+    drop(source_file_order);
     assert!(
         with_tables(|tables| tables.file_associations.set(file_associations).is_ok()),
         "checker pool made twice"
@@ -3332,7 +3385,7 @@ pub fn get_global_diagnostics() -> Vec<Diagnostic> {
 /// sent to it before, so the read sees what those jobs added. Loading
 /// thread only.
 pub fn start_global_diagnostics() -> PendingGlobalDiagnostics {
-    if prog().source_file_order.is_empty() {
+    if prog().source_file_order().is_empty() {
         return PendingGlobalDiagnostics(Vec::new());
     }
     pool_start_global_diagnostics()

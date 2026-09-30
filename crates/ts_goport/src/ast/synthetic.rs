@@ -1926,8 +1926,7 @@ mod tests {
         std::thread::spawn(|| {
             let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
                 id: next_program_id(),
-                source_file_order: Vec::new(),
-                options: CompilerOptions::default(),
+                options: Box::leak(Box::default()),
                 state: std::sync::OnceLock::new(),
             }));
             let f = NodeFactory::new();

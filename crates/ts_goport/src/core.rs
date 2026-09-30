@@ -3142,24 +3142,19 @@ pub struct GoProgram {
     /// Unique in the process, from `next_program_id`. It keys the checker
     /// pool and the frontend of the program on the loading thread.
     pub id: u32,
-    /// File ids in Go `Program.SourceFiles()` order.
-    pub source_file_order: Vec<usize>,
-    pub options: crate::options::CompilerOptions,
-    // The binder symbols of the program are in its tables
-    // (`program::bound_symbols`, lsshells M2c), so a release frees them.
+    /// One leaked copy per distinct options value
+    /// (`program::intern_compiler_options`), so program versions with the
+    /// same options share it.
+    pub options: &'static crate::options::CompilerOptions,
+    // The binder symbols of the program and its file order
+    // (`source_file_order`) are in its tables (`program::bound_symbols`,
+    // lsshells M2c), so a release frees them.
     /// Program state (`program::state()`). Set once, after the files are
     /// published.
-    pub(crate) state: std::sync::OnceLock<&'static crate::program::ProgramState>,
-}
-
-impl GoProgram {
-    /// Go `Program.SourceFiles()`: the program files in Go order. Each guard
-    /// pins a freeable file version while it lives (see `ast::go_file`).
-    pub fn source_files(&self) -> impl Iterator<Item = crate::ast::FileRef<GoFile>> {
-        self.source_file_order
-            .iter()
-            .map(|&index| crate::ast::go_file(index))
-    }
+    // PORT: the shell (this struct with its state) stays leaked, because
+    // checker code keeps `&'static GoProgram` borrows. It holds only small
+    // values; the per-version data is in the tables.
+    pub(crate) state: std::sync::OnceLock<crate::program::ProgramState>,
 }
 
 static NEXT_PROGRAM_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);

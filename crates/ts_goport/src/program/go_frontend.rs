@@ -220,7 +220,7 @@ pub(super) fn update_program_version(
     let old_np = FRONTENDS
         .with(|frontends| frontends.borrow().get(&old.id).cloned())
         .expect("the old program version has no frontend on this thread");
-    let cwd = state_of(old).cwd.clone();
+    let cwd = state_of(old).cwd.to_string();
     // A new version parses with no current program, like the first load.
     let _scope = crate::core::enter_program(None);
     // PORT: Go watch gives `UpdateProgram` a host whose cache no longer has
@@ -594,7 +594,7 @@ fn build_program(
     previous: Option<&'static GoProgram>,
 ) -> &'static GoProgram {
     let use_case_sensitive_file_names = osvfs_fs().use_case_sensitive_file_names();
-    let options = np.options().clone();
+    let options = crate::program::intern_compiler_options(np.options());
 
     // PERF: the publish keeps the parse of each new file, so each
     // `SourceFileInfo` can borrow its fields instead of copying them
@@ -662,7 +662,6 @@ fn build_program(
     }
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
         id,
-        source_file_order,
         options,
         state: OnceLock::new(),
     }));
@@ -705,16 +704,15 @@ fn build_program(
             .values()
             .filter_map(|file| file.version.get().cloned())
             .collect(),
-        ..VersionTables::new(file_by_path)
+        ..VersionTables::new(source_file_order, file_by_path)
     };
-    let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
-        cwd,
+    let program_state = ProgramState {
+        cwd: intern_program_str(&cwd),
         use_case_sensitive_file_names,
-        resolved_modules: OnceLock::new(),
-        common_source_directory: OnceLock::from(common_source_directory_of(np)),
+        common_source_directory: Some(intern_program_str(&common_source_directory_of(np))),
         alias_resolver: false,
         tables: TablesSlot::new(tables, one_program),
-    }));
+    };
     assert!(program.state.set(program_state).is_ok());
     program
 }

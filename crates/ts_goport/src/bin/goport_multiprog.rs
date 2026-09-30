@@ -145,8 +145,8 @@ fn pair(config: &str, changed: &str, new_text_file: &str, out: &Path, first: Opt
 /// reused B shares every other file version of A in the same order, and the
 /// new version is freeable only when the flag turns freeing on.
 fn check_versions(
-    a: &GoProgram,
-    b: &GoProgram,
+    a: &'static GoProgram,
+    b: &'static GoProgram,
     reused: bool,
     changed: &str,
     old_text: &str,
@@ -154,12 +154,12 @@ fn check_versions(
 ) {
     let a_changed = file_id(a, changed);
     let b_changed = file_id(b, changed);
-    let a_max = a.source_file_order.iter().copied().max().unwrap_or(0);
+    let a_max = a.source_file_order().iter().copied().max().unwrap_or(0);
     assert!(
         b_changed > a_max,
         "the changed file has id {b_changed} in B, not above every A id (max {a_max})"
     );
-    for &id in a.source_file_order.iter().chain(&b.source_file_order) {
+    for &id in a.source_file_order().iter().chain(&*b.source_file_order()) {
         assert!(is_published(id), "file {id} is not published");
     }
     assert!(
@@ -173,16 +173,16 @@ fn check_versions(
     if reused {
         // Go `UpdateProgram` replaces the changed file in place.
         let expected: Vec<usize> = a
-            .source_file_order
+            .source_file_order()
             .iter()
             .map(|&id| if id == a_changed { b_changed } else { id })
             .collect();
         assert!(
-            b.source_file_order == expected,
+            *b.source_file_order() == *expected,
             "B does not keep the file ids and order of A"
         );
         let pairs = a.source_files().zip(b.source_files());
-        for ((a_file, b_file), &id) in pairs.zip(&b.source_file_order) {
+        for ((a_file, b_file), &id) in pairs.zip(b.source_file_order().iter()) {
             assert!(
                 id == b_changed || std::ptr::eq(&raw const *a_file, &raw const *b_file),
                 "B does not share the GoFile of {}",
@@ -297,8 +297,8 @@ fn report(p: &'static GoProgram) -> (Vec<u8>, i32) {
 }
 
 /// The id of the file of `p` named `file_name`.
-fn file_id(p: &GoProgram, file_name: &str) -> usize {
-    p.source_file_order
+fn file_id(p: &'static GoProgram, file_name: &str) -> usize {
+    p.source_file_order()
         .iter()
         .copied()
         .find(|&id| go_file(id).info.file_name == file_name)

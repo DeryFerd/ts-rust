@@ -1103,6 +1103,11 @@ thread_local! {
     /// The emptied cell of the last detached store of this thread. The next
     /// detached store reuses it.
     static SPARE_CELL: Cell<Option<StoreCell>> = const { Cell::new(None) };
+    /// The cells of the build stores that `publish_file_stores` emptied on
+    /// this thread. `new_file_store` and `adopt_detached_store` reuse them
+    /// (`build_store_cell`), so an edit parse in a language server does not
+    /// leak a new cell in the AST arena.
+    static SPARE_BUILD_CELLS: RefCell<Vec<StoreCell>> = const { RefCell::new(Vec::new()) };
     /// The store this thread made or adopted last, and its id: during a
     /// parse, the store of the file the parser reads and writes. It is also
     /// in `BUILD` or `DETACHED`, so clearing it is always safe.
@@ -1758,6 +1763,19 @@ fn with_slot_mut<R>(n: Node, f: impl FnOnce(&mut FileStore, usize) -> R) -> R {
 // Stores
 // ──────────────────────────────────────────────────────────────────────
 
+/// A cell for build store `store`: an emptied cell of an earlier publish on
+/// this thread (`SPARE_BUILD_CELLS`), else a new one in the AST arena.
+fn build_store_cell(store: FileStore) -> StoreCell {
+    match SPARE_BUILD_CELLS.with(|cells| cells.borrow_mut().pop()) {
+        Some(cell) => {
+            let old = cell.replace(store);
+            debug_assert!(old.records.is_empty(), "a spare store cell is not empty");
+            cell
+        }
+        None => leak_in_ast_arena(RefCell::new(store)),
+    }
+}
+
 /// Makes the store of the next parsed file and returns its file id. Ids
 /// follow parse order (see `BuildStores`). The store becomes the active
 /// store of this thread. Inside a freeable parse scope
@@ -1767,7 +1785,7 @@ pub fn new_file_store(file_name: &'static str, text: &'static str) -> usize {
     if FREEABLE_PARSE.get() {
         new.owned = Some(Box::new(OwnedAst::new(new.records.capacity())));
     }
-    let store: StoreCell = leak_in_ast_arena(RefCell::new(new));
+    let store: StoreCell = build_store_cell(new);
     let id = BUILD.with(|b| {
         let mut b = b.borrow_mut();
         let id = b.next_id();
@@ -3154,7 +3172,7 @@ pub fn adopt_detached_store(detached: DetachedStore) -> StoreRemap {
         // The records, kids and R2-5 links are slot-indexed and hold no
         // store id (a parent in the store is a `LOCAL_STORE` handle, and a
         // self-contained store has no alias slot), so they stay.
-        let cell: StoreCell = leak_in_ast_arena(RefCell::new(store));
+        let cell: StoreCell = build_store_cell(store);
         b.stores.push(cell);
         (remap, cell)
     });
@@ -3709,7 +3727,8 @@ pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
 // PORT: Go needs no publish; its nodes are heap objects. The publish also
 // computes `NodeHeader::source_file_is_root` for `get_source_file_of_node`.
 pub fn publish_file_stores(go_files: Vec<GoFile>) {
-    // The cells stay leaked and empty. Nothing reads them after this.
+    // The cells stay leaked and empty. Nothing reads them after this, and
+    // the next build stores of this thread reuse them (`build_store_cell`).
     ACTIVE.set(None);
     let BuildStores {
         base,
@@ -3739,6 +3758,7 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
         );
     }
     let mut stores: Vec<FileStore> = cells.iter().map(|cell| cell.take()).collect();
+    SPARE_BUILD_CELLS.with(|spare| spare.borrow_mut().extend(cells));
     publish_stores(&mut stores, base);
     // lsshells M3b: a freeable file version (a live `FileVersion` of the
     // id, made by the language server parse cache) takes its store and
