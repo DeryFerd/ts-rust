@@ -72,7 +72,9 @@ pub(crate) fn eval_node_script_with_ts<T: UnmarshalerFrom + Default>(
             temp_dir.path()
         }
     };
-    let ts_src_path = repo::root_path().join("node_modules/typescript/lib/typescript.js");
+    // Go N (microsoft/TypeScript layout): `node_modules` is in the repo root,
+    // the parent of `tsc/`.
+    let ts_src_path = repo::root_path().join("../node_modules/typescript/lib/typescript.js");
     let mut ts_src = tspath::normalize_path(&ts_src_path.to_string_lossy());
     if ts_src.starts_with('/') {
         ts_src = format!("file://{ts_src}");

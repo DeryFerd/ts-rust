@@ -15,9 +15,8 @@
 //! - `TS_GOPORT_BASELINE_TRACK=<file>`: appends `<subfolder>/<name>` of each
 //!   compared baseline to the file (Go `baseline.Track`).
 //!
-//! PORT: Go reports through `t.Errorf` and `t.Fatalf`. `run` and
-//! `run_against_submodule` return every message, joined by newlines, as the
-//! `Err`. A mismatch message names the file and shows the first differing
+//! PORT: Go reports through `t.Errorf` and `t.Fatalf`. `run` returns every
+//! message, joined by newlines, as the `Err`. A mismatch message names the file and shows the first differing
 //! line, never the whole file.
 //!
 //! PORT: the generated text is a port form string (see
@@ -156,13 +155,7 @@ pub fn run(file_name: &str, actual: &str, opts: &Options) -> Result<(), String> 
         // Record this baseline for tracking unused baselines
         record_baseline(&rel);
 
-        write_comparison(
-            &mut errors,
-            actual,
-            &rel,
-            &reference_root().join(&rel),
-            false,
-        );
+        write_comparison(&mut errors, actual, &rel, &reference_root().join(&rel));
     }
 
     if !opts.is_submodule || opts.skip_diff_with_old {
@@ -221,9 +214,9 @@ pub fn run(file_name: &str, actual: &str, opts: &Options) -> Result<(), String> 
 
         let reference = reference_root().join(&rel);
         if root == out_root {
-            write_comparison(&mut errors, &diff, &rel, &reference, false);
+            write_comparison(&mut errors, &diff, &rel, &reference);
         } else {
-            write_comparison(&mut errors, NO_CONTENT, &rel, &reference, false);
+            write_comparison(&mut errors, NO_CONTENT, &rel, &reference);
         }
     }
 
@@ -420,18 +413,8 @@ fn parse_unified_diff_header(s: &str) -> Option<([i64; 4], usize)> {
     Some((numbers, i))
 }
 
-// Go: testutil/baseline/baseline.go:186 RunAgainstSubmodule
-pub fn run_against_submodule(file_name: &str, actual: &str, opts: &Options) -> Result<(), String> {
-    let mut errors = Vec::new();
-    let rel = join_rel(&[opts.subfolder.as_str(), file_name]);
-
-    // Record this baseline for tracking unused baselines
-    record_baseline(&rel);
-
-    let reference = submodule_reference_root().join(&rel);
-    write_comparison(&mut errors, actual, &rel, &reference, true);
-    finish(errors)
-}
+// Go `RunAgainstSubmodule` (typescript-go baseline.go:186) has no callers
+// since microsoft/TypeScript 5f647a841a and is not ported.
 
 // Go: testutil/baseline/baseline.go:195 writeComparison
 // PORT: `rel` is the path under the local root (Go passes the full local
@@ -442,13 +425,7 @@ pub fn run_against_submodule(file_name: &str, actual: &str, opts: &Options) -> R
 // reports it at both layouts, as Go did at the typescript-go layout: the
 // reference is the Go output, so a baseline that the port does not make is
 // a port failure.
-fn write_comparison(
-    errors: &mut Vec<String>,
-    actual_content: &str,
-    rel: &str,
-    reference: &Path,
-    comparing_against_submodule: bool,
-) {
+fn write_comparison(errors: &mut Vec<String>, actual_content: &str, rel: &str, reference: &Path) {
     assert!(
         !actual_content.is_empty(),
         "the generated content was \"\". Return 'baseline.NoContent' if no baselining is required."
@@ -514,12 +491,7 @@ fn write_comparison(
     }
 
     if !found_expected {
-        if comparing_against_submodule {
-            errors.push(format!(
-                "the baseline file {} does not exist in the TypeScript submodule",
-                reference.display()
-            ));
-        } else if let Some(local) = &local {
+        if let Some(local) = &local {
             errors.push(format!("new baseline created at {}.", local.display()));
         } else {
             // PORT: nothing is written without a local root.
@@ -528,12 +500,6 @@ fn write_comparison(
                 reference.display()
             ));
         }
-    } else if comparing_against_submodule {
-        errors.push(format!(
-            "the baseline file {} does not match the reference in the TypeScript submodule\n{}",
-            reference.display(),
-            first_difference(&expected, &actual)
-        ));
     } else {
         // PORT: the Go hint to run `hereby baseline-accept` is left out.
         errors.push(format!(

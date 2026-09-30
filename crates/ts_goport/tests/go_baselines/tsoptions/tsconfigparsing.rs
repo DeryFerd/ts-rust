@@ -1,7 +1,6 @@
 //! Rust port of `internal/tsoptions/tsconfigparsing_test.go`.
 //!
-//! Baselines: `config/tsconfigParsing` (`baseline.Run`) and the TypeScript
-//! submodule `config/tsconfigParsing` (`baseline.RunAgainstSubmodule`).
+//! Baselines: `config/tsconfigParsing` (`baseline.Run`).
 //!
 //! PORT: Go runs the subtests in parallel (`t.Parallel`); here they run in
 //! order. `BenchmarkParseSrcCompiler` is a benchmark, not a test, and is not
@@ -21,7 +20,7 @@ use ts_goport::scanner_util::get_ecma_line_and_utf16_character_of_position;
 use super::tsoptionstest::{
     AnyJson, CompilerOptionsJson, Subtests, TypeAcquisitionJson, VfsParseConfigHost, file_map,
     format_diagnostics_with_color_and_context, formatting_options, get_parsed_command_line,
-    marshal_indent_write, new_vfs_parse_config_host, skip_if_no_type_script_submodule,
+    marshal_indent_write, new_vfs_parse_config_host,
 };
 use crate::support::baseline;
 
@@ -45,9 +44,6 @@ struct ParseConfigFileTextToJsonTest {
 // Go: tsconfigparsing_test.go:128 TestParseConfigFileTextToJson
 #[test]
 fn parse_config_file_text_to_json() {
-    if skip_if_no_type_script_submodule("TestParseConfigFileTextToJson") {
-        return;
-    }
     let mut t = Subtests::new("TestParseConfigFileTextToJson");
     for rec in parse_config_file_text_to_json_tests() {
         t.run(rec.title, || {
@@ -78,7 +74,7 @@ fn parse_config_file_text_to_json() {
                     baseline_content.push('\n');
                 }
             }
-            baseline::run_against_submodule(
+            baseline::run(
                 &format!("{} jsonParse.js", rec.title),
                 &baseline_content,
                 &baseline::Options {
@@ -91,29 +87,26 @@ fn parse_config_file_text_to_json() {
     t.finish();
 }
 
-// Go: tsconfigparsing_test.go:161 parseJsonConfigTestCase
+// Go: tsconfigparsing_test.go:155 parseJsonConfigTestCase
 struct ParseJsonConfigTestCase {
     title: &'static str,
-    no_submodule_baseline: bool,
+    include_compiler_options: bool,
     input: Vec<TestConfig>,
 }
 
 /// Go `func(config testConfig, host tsoptions.ParseConfigHost, basePath string) *tsoptions.ParsedCommandLine`.
 type GetParsed = fn(&TestConfig, &dyn ParseConfigHost, &str) -> ParsedCommandLine;
 
-// Go: tsconfigparsing_test.go:807 TestParseJsonConfigFileContent
+// Go: tsconfigparsing_test.go:816 TestParseJsonConfigFileContent
 #[test]
 fn parse_json_config_file_content() {
-    if skip_if_no_type_script_submodule("TestParseJsonConfigFileContent") {
-        return;
-    }
     let mut t = Subtests::new("TestParseJsonConfigFileContent");
     for rec in parse_json_config_file_tests() {
         let name = format!("{} with json api", rec.title);
         t.run(&name, || {
             baseline_parse_config_with(
                 &format!("{} with json api.js", rec.title),
-                rec.no_submodule_baseline,
+                rec.include_compiler_options,
                 &rec.input,
                 get_parsed_with_json_api,
             )
@@ -332,19 +325,16 @@ fn get_parsed_with_json_api(
     )
 }
 
-// Go: tsconfigparsing_test.go:834 TestParseJsonSourceFileConfigFileContent
+// Go: tsconfigparsing_test.go:962 TestParseJsonSourceFileConfigFileContent
 #[test]
 fn parse_json_source_file_config_file_content() {
-    if skip_if_no_type_script_submodule("TestParseJsonSourceFileConfigFileContent") {
-        return;
-    }
     let mut t = Subtests::new("TestParseJsonSourceFileConfigFileContent");
     for rec in parse_json_config_file_tests() {
         let name = format!("{} with jsonSourceFile api", rec.title);
         t.run(&name, || {
             baseline_parse_config_with(
                 &format!("{} with jsonSourceFile api.js", rec.title),
-                rec.no_submodule_baseline,
+                rec.include_compiler_options,
                 &rec.input,
                 get_parsed_with_json_source_file_api,
             )
@@ -1071,17 +1061,15 @@ fn ts_config_source_file(parsed: &ParsedSourceFile) -> TsConfigSourceFile {
     }
 }
 
-// Go: tsconfigparsing_test.go:1032 baselineParseConfigWith
+// Go: tsconfigparsing_test.go:1500 baselineParseConfigWith
 // PORT: Go `t.Fatal` and the fatal `assert.NilError` are panics; the
 // `baseline.Run` result (Go `t.Errorf`) is the returned `Err`.
 fn baseline_parse_config_with(
     baseline_file_name: &str,
-    no_submodule_baseline: bool,
+    include_compiler_options: bool,
     input: &[TestConfig],
     get_parsed: GetParsed,
 ) -> Result<(), String> {
-    let _ = no_submodule_baseline;
-    let no_submodule_baseline = true;
     let mut baseline_content = String::new();
     for (i, config) in input.iter().enumerate() {
         let mut base_path = config.base_path.to_string();
@@ -1107,7 +1095,7 @@ fn baseline_parse_config_with(
         baseline_content.push_str("configFileName:: ");
         baseline_content.push_str(config.config_file_name);
         baseline_content.push('\n');
-        if no_submodule_baseline {
+        if include_compiler_options {
             baseline_content.push_str("CompilerOptions::\n");
             if let Err(err) = marshal_indent_write(
                 &mut baseline_content,
@@ -1155,15 +1143,14 @@ fn baseline_parse_config_with(
             baseline_content.push('\n');
         }
     }
-    let opts = baseline::Options {
-        subfolder: "config/tsconfigParsing".into(),
-        ..Default::default()
-    };
-    if no_submodule_baseline {
-        baseline::run(baseline_file_name, &baseline_content, &opts)
-    } else {
-        baseline::run_against_submodule(baseline_file_name, &baseline_content, &opts)
-    }
+    baseline::run(
+        baseline_file_name,
+        &baseline_content,
+        &baseline::Options {
+            subfolder: "config/tsconfigParsing".into(),
+            ..Default::default()
+        },
+    )
 }
 
 // Go: tsconfigparsing_test.go:1091 writeJsonReadableText
@@ -1184,7 +1171,6 @@ struct TypeAcquisitionCase {
 // Go: tsconfigparsing_test.go:1095 TestParseTypeAcquisition
 #[test]
 fn parse_type_acquisition() {
-    // repo.SkipIfNoTypeScriptSubmodule(t)
     let mut t = Subtests::new("TestParseTypeAcquisition");
     for test in type_acquisition_cases() {
         let with_json_api_name = format!("{} with json api", test.title);
@@ -1575,7 +1561,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
     vec![
         ParseJsonConfigTestCase {
             title: "ignore dotted files and folders",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r"{}",
                 config_file_name: "tsconfig.json",
@@ -1591,7 +1577,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "allow dotted files and folders when explicitly requested",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
                     "files": ["/apath/.git/a.ts", "/apath/.b.ts", "/apath/..c.ts"]
@@ -1609,7 +1595,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "implicitly exclude common package folders",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r"{}",
                 config_file_name: "tsconfig.json",
@@ -1626,7 +1612,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "generates errors for empty files list",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
                 "files": []
@@ -1639,7 +1625,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "generates errors for empty files list when no references are provided",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
                 "files": [],
@@ -1653,7 +1639,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "generates errors for directory with no .ts files",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r"{
             }",
@@ -1665,7 +1651,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "generates errors for empty include",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
                 "include": []
@@ -1678,7 +1664,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "generates errors for include with parent directory after recursive wildcard",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
                 "include": ["**/../*.ts"]
@@ -1691,7 +1677,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "parses tsconfig with compilerOptions, files, include, and exclude",
-            no_submodule_baseline: true,
+            include_compiler_options: true,
             input: vec![TestConfig {
                 json_text: r#"{
   "compilerOptions": {
@@ -1725,7 +1711,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "generates errors when commandline option is in tsconfig",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
   "compilerOptions": {
@@ -1740,7 +1726,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "does not generate errors for empty files list when one or more references are provided",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
                 "files": [],
@@ -1754,7 +1740,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "exclude outDir unless overridden",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![
                 TestConfig {
                     json_text: r#"{
@@ -1783,7 +1769,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "exclude declarationDir unless overridden",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![
                 TestConfig {
                     json_text: r#"{
@@ -1812,7 +1798,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "generates errors for empty directory",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
                 "compilerOptions": {
@@ -1827,7 +1813,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "generates errors for includes with outDir",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
                 "compilerOptions": {
@@ -1843,7 +1829,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "generates errors when include is not string",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
   "include": [
@@ -1860,7 +1846,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "generates errors when files is not string",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
   "files": [
@@ -1880,7 +1866,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "with outDir from base tsconfig",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![
                 TestConfig {
                     json_text: r#"{
@@ -1915,7 +1901,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "returns error when tsconfig have excludes",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
                     "compilerOptions": {
@@ -1933,7 +1919,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "parses tsconfig with extends, files, include and other options",
-            no_submodule_baseline: true,
+            include_compiler_options: true,
             input: vec![TestConfig {
                 json_text: r#"{
 				"extends": "./tsconfigWithExtends.json",
@@ -1958,7 +1944,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "parses tsconfig with extends and configDir",
-            no_submodule_baseline: true,
+            include_compiler_options: true,
             input: vec![TestConfig {
                 json_text: r#"{
 				"extends": "./tsconfig.base.json"
@@ -1977,7 +1963,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "reports error for an unknown option",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
 			    "compilerOptions": {
@@ -1992,7 +1978,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "reports spelling suggestion for an unknown option",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
 			    "compilerOptions": {
@@ -2007,7 +1993,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "reports errors for wrong type option and invalid enum value",
-            no_submodule_baseline: false,
+            include_compiler_options: false,
             input: vec![TestConfig {
                 json_text: r#"{
 			    "compilerOptions": {
@@ -2024,7 +2010,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "reports errors for incorrectly cased option names",
-            no_submodule_baseline: true,
+            include_compiler_options: true,
             input: vec![TestConfig {
                 json_text: r#"{
 			    "compilerOptions": {
@@ -2048,7 +2034,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "handles empty types array",
-            no_submodule_baseline: true,
+            include_compiler_options: true,
             input: vec![TestConfig {
                 json_text: r#"{
 			    "compilerOptions": {
@@ -2063,7 +2049,7 @@ fn parse_json_config_file_tests() -> Vec<ParseJsonConfigTestCase> {
         },
         ParseJsonConfigTestCase {
             title: "issue 1267 scenario - extended files not picked up",
-            no_submodule_baseline: true,
+            include_compiler_options: true,
             input: vec![TestConfig {
                 json_text: r#"{
   "extends": "./tsconfig-base/backend.json",
@@ -2143,7 +2129,7 @@ export {}",
         },
         ParseJsonConfigTestCase {
             title: "null overrides in extended tsconfig - array fields",
-            no_submodule_baseline: true,
+            include_compiler_options: true,
             input: vec![TestConfig {
                 json_text: r#"{
   "extends": "./tsconfig-base.json",
@@ -2173,7 +2159,7 @@ export {}",
         },
         ParseJsonConfigTestCase {
             title: "null overrides in extended tsconfig - string fields",
-            no_submodule_baseline: true,
+            include_compiler_options: true,
             input: vec![TestConfig {
                 json_text: r#"{
   "extends": "./tsconfig-base.json",
@@ -2203,7 +2189,7 @@ export {}",
         },
         ParseJsonConfigTestCase {
             title: "null overrides in extended tsconfig - mixed field types",
-            no_submodule_baseline: true,
+            include_compiler_options: true,
             input: vec![TestConfig {
                 json_text: r#"{
   "extends": "./tsconfig-base.json",
@@ -2238,7 +2224,7 @@ export {}",
         },
         ParseJsonConfigTestCase {
             title: "null overrides with multiple extends levels",
-            no_submodule_baseline: true,
+            include_compiler_options: true,
             input: vec![TestConfig {
                 json_text: r#"{
   "extends": "./tsconfig-middle.json",
@@ -2278,7 +2264,7 @@ export {}",
         },
         ParseJsonConfigTestCase {
             title: "null overrides in middle level of extends chain",
-            no_submodule_baseline: true,
+            include_compiler_options: true,
             input: vec![TestConfig {
                 json_text: r#"{
   "extends": "./tsconfig-middle.json",

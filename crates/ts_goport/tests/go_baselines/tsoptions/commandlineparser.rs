@@ -1,8 +1,9 @@
 //! Rust port of `internal/tsoptions/commandlineparser_test.go`.
 //!
 //! Baselines: `tsoptions/commandLineParsing/{parseCommandLine,parseBuildOptions}`.
-//! The TypeScript submodule baselines under
-//! `tests/baselines/reference/config/commandLineParsing` are test input.
+//! The TypeScript baselines under
+//! `testdata/fixtures/typescript/tests/baselines/reference/config/commandLineParsing`
+//! are test input (the submodule copy before microsoft/TypeScript 5f647a841a).
 //!
 //! PORT: Go `json.Unmarshal` of the options JSON into `core.CompilerOptions`,
 //! `core.BuildOptions` and `core.WatchOptions`, and the `assert.DeepEqual`
@@ -19,18 +20,14 @@ use ts_goport::frontend::prelude::*;
 
 use super::tsoptionstest::{
     BuildOptionsJson, CompilerOptionsJson, OptionsMapJson, Subtests, TempDir, VfsParseConfigHost,
-    file_map, marshal_or_empty, new_vfs_parse_config_host, parse_command_line_test_worker,
-    skip_if_no_type_script_submodule, strs, type_script_submodule_path, write_format_diagnostics,
+    file_map, marshal_or_empty, new_vfs_parse_config_host, parse_command_line_test_worker, strs,
+    write_format_diagnostics,
 };
 use crate::support::baseline;
 
 // Go: commandlineparser_test.go:25 TestCommandLineParseResult
 #[test]
 fn command_line_parse_result() {
-    if skip_if_no_type_script_submodule("TestCommandLineParseResult") {
-        return;
-    }
-
     let parse_command_line_sub_scenarios: Vec<SubScenarioInput> = vec![
         // --lib es6 0.ts
         SubScenarioInput::new(
@@ -345,12 +342,9 @@ fn custom_conditions_null_override() {
     );
 }
 
-// Go: commandlineparser_test.go:170 TestParseCommandLineVerifyNull
+// Go: commandlineparser_test.go:196 TestParseCommandLineVerifyNull
 #[test]
 fn parse_command_line_verify_null() {
-    if skip_if_no_type_script_submodule("TestParseCommandLineVerifyNull") {
-        return;
-    }
     let mut t = Subtests::new("TestParseCommandLineVerifyNull");
 
     // run test for boolean
@@ -616,7 +610,7 @@ impl CommandLineSubScenario {
         self.assert_build_parse_result_with_ts_baseline(t, Some(&get_ts_baseline));
     }
 
-    // Go: commandlineparser_test.go:346 (commandLineSubScenario).assertBuildParseResultWithTsBaseline
+    // Go: commandlineparser_test.go:371 (commandLineSubScenario).assertBuildParseResultWithTsBaseline
     fn assert_build_parse_result_with_ts_baseline(
         &self,
         t: &mut Subtests,
@@ -634,7 +628,7 @@ impl CommandLineSubScenario {
                 &VfsParseConfigHost {
                     vfs: osvfs_fs(),
                     current_directory: normalize_slashes(
-                        &type_script_submodule_path().to_string_lossy(),
+                        &baseline::test_data_path().to_string_lossy(),
                     ),
                 },
             );
@@ -748,7 +742,7 @@ fn format_new_baseline_build(
     formatted
 }
 
-// Go: commandlineparser_test.go:463 createSubScenario
+// Go: commandlineparser_test.go:488 createSubScenario
 // PORT: the Go variadic `opts ...[]*CommandLineOption` is an `Option`; nil
 // and an empty list are the empty slice.
 fn create_sub_scenario(
@@ -764,7 +758,10 @@ fn create_sub_scenario(
     CommandLineSubScenario {
         baseline: FileFixture::from_file(
             &sub_scenario_name,
-            type_script_submodule_path().join(baseline_file_name),
+            baseline::test_data_path()
+                .join("fixtures")
+                .join("typescript")
+                .join(baseline_file_name),
         ),
         test_name: sub_scenario_name,
         command_line: commandline,
@@ -862,13 +859,9 @@ struct TestCommandLineParserBuild {
     errors: String,
 }
 
-// Go: commandlineparser_test.go:515 TestParseBuildCommandLine
+// Go: commandlineparser_test.go:540 TestParseBuildCommandLine
 #[test]
 fn parse_build_command_line() {
-    if skip_if_no_type_script_submodule("TestParseBuildCommandLine") {
-        return;
-    }
-
     let parse_command_line_sub_scenarios: Vec<SubScenarioInput> = vec![
         SubScenarioInput::new("parse build without any options ", &[]),
         SubScenarioInput::new("Parse multiple options", &["--verbose", "--force", "tests"]),

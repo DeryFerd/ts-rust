@@ -35,7 +35,7 @@ use ts_goport::scanner_util::{go_string_bytes, go_string_from_bytes};
 
 // Go: astnav/tokens_test.go:22 testFiles
 fn test_files() -> Vec<PathBuf> {
-    vec![repo::type_script_submodule_path().join("src/services/mapCode.ts")]
+    vec![repo::test_data_path().join("fixtures/services/mapCode.ts")]
 }
 
 /// Go `filepath.Base(fileName)`.
@@ -73,7 +73,7 @@ fn read_file_text(file_name: &std::path::Path) -> &'static str {
 #[test]
 fn test_get_token_at_position() {
     const TEST: &str = "TestGetTokenAtPosition";
-    if repo::skip_if_no_type_script_submodule(TEST) || jstest::skip_if_no_node_js(TEST) {
+    if jstest::skip_if_no_node_js(TEST) {
         return;
     }
     let mut t = Subtests::new(TEST);
@@ -155,11 +155,11 @@ fn test_get_token_at_position() {
     t.finish();
 }
 
-// Go: astnav/tokens_test.go:114 TestGetTouchingPropertyName
+// Go: astnav/tokens_test.go:113 TestGetTouchingPropertyName
 #[test]
 fn test_get_touching_property_name() {
     const TEST: &str = "TestGetTouchingPropertyName";
-    if jstest::skip_if_no_node_js(TEST) || repo::skip_if_no_type_script_submodule(TEST) {
+    if jstest::skip_if_no_node_js(TEST) {
         return;
     }
     let mut t = Subtests::new(TEST);
@@ -614,11 +614,11 @@ fn write_range_diff(
     }
 }
 
-// Go: astnav/tokens_test.go:460 TestFindPrecedingToken
+// Go: astnav/tokens_test.go:458 TestFindPrecedingToken
 #[test]
 fn test_find_preceding_token() {
     const TEST: &str = "TestFindPrecedingToken";
-    if repo::skip_if_no_type_script_submodule(TEST) || jstest::skip_if_no_node_js(TEST) {
+    if jstest::skip_if_no_node_js(TEST) {
         return;
     }
     let mut t = Subtests::new(TEST);
@@ -644,13 +644,10 @@ fn test_find_preceding_token() {
     t.finish();
 }
 
-// Go: astnav/tokens_test.go:488 TestFindNextToken
+// Go: astnav/tokens_test.go:485 TestFindNextToken
 #[test]
 fn test_find_next_token() {
     const TEST: &str = "TestFindNextToken";
-    if repo::skip_if_no_type_script_submodule(TEST) {
-        return;
-    }
     let mut t = Subtests::new(TEST);
 
     // t.Run("go baseline json", ...)
