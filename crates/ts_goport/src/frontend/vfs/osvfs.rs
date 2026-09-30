@@ -77,11 +77,50 @@ pub fn os_args() -> Vec<String> {
 
 /// The current directory in the port form (Go `os.Getwd`, see `os_path`).
 /// With an OS override installed, the override's directory.
+/// `getwd_error_text` gives the Go text of an error.
+// Go: os/getwd.go:26 Getwd (go1.26.4)
+// PORT: on unix, `$PWD` when it is absolute and names the same file as "."
+// (Go `SameFile`: the same device and inode), so a directory reached
+// through a symlink keeps the link path. Else `syscall.Getwd` is
+// `std::env::current_dir` (getcwd). Go's own walk up the parents, for a
+// getcwd that fails with ENAMETOOLONG, is not ported: glibc's getcwd makes
+// the same walk. On Windows Go calls `syscall.Getwd` only.
 pub fn os_current_dir() -> io::Result<String> {
     if let Some(o) = OS_OVERRIDE.get() {
         return Ok(o.current_directory.clone());
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Clumsy but widespread kludge:
+        // if $PWD is set and matches ".", use it.
+        if let Some(dir) = std::env::var_os("PWD")
+            && dir.as_bytes().first() == Some(&b'/')
+        {
+            // Go returns the `*PathError` of this stat as it is.
+            let dot = std::fs::metadata(".").map_err(|err| {
+                let text = format!("stat .: {}", crate::fswatch::syscall::io_error_text(&err));
+                io::Error::new(err.kind(), text)
+            })?;
+            if let Ok(d) = std::fs::metadata(&dir)
+                && d.dev() == dot.dev()
+                && d.ino() == dot.ino()
+            {
+                return Ok(go_string_from_os(dir));
+            }
+        }
+    }
     std::env::current_dir().map(go_string_from_os)
+}
+
+/// Go `err.Error()` of an `os_current_dir` error: "getwd: <errno text>"
+/// (`*os.SyscallError`) when getcwd failed, or "stat .: <errno text>"
+/// (`*os.PathError`) when the stat of "." failed.
+pub fn getwd_error_text(err: &io::Error) -> String {
+    match err.raw_os_error() {
+        Some(_) => format!("getwd: {}", crate::fswatch::syscall::io_error_text(err)),
+        None => err.to_string(),
+    }
 }
 
 // PORT: Go reads files and the current directory through `sys.FS()` and
