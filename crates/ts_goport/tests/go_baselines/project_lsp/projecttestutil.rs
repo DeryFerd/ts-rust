@@ -17,9 +17,7 @@ use std::time::{Duration, SystemTime};
 use ts_goport::frontend::bundled;
 use ts_goport::frontend::tsoptions::parsed_command_line::glob_parse;
 use ts_goport::frontend::tspath;
-use ts_goport::frontend::vfs::{
-    Entries, FileInfo, Fs, FsError, OsOverride, WalkDirFunc, install_os_override,
-};
+use ts_goport::frontend::vfs::{Entries, FileInfo, Fs, FsError, OsOverride, install_os_override};
 use ts_goport::gostd::{self, Context, GoError, context};
 use ts_goport::lsp::lsproto;
 use ts_goport::project::{
@@ -104,9 +102,6 @@ impl Fs for SwitchFs {
     }
     fn stat(&self, path: &str) -> Option<FileInfo> {
         current_fs().stat(path)
-    }
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        current_fs().walk_dir(root, walk_fn)
     }
     fn realpath(&self, path: &str) -> String {
         current_fs().realpath(path)

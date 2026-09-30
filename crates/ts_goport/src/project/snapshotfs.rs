@@ -1192,12 +1192,6 @@ impl vfs::Fs for SourceFS {
         self.source().fs().stat(path)
     }
 
-    // Go: project/snapshotfs.go:758 sourceFS.WalkDir
-    // WalkDir implements vfs.FS.
-    fn walk_dir(&self, root: &str, walk_fn: &mut vfs::WalkDirFunc<'_>) -> Result<(), vfs::FsError> {
-        self.source().fs().walk_dir(root, walk_fn)
-    }
-
     // Go: project/snapshotfs.go:743 sourceFS.Realpath
     // Realpath implements vfs.FS.
     fn realpath(&self, path: &str) -> String {
