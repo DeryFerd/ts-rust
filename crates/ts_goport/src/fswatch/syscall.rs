@@ -4,7 +4,7 @@
 //! `golang.org/x/sys/unix` names `syscall.Errno`.
 //!
 //! The rest of the port prints the Go text of an OS error with
-//! `io_error_text` (osvfs, pprof, tracing, ipc).
+//! `io_error_text` (osvfs, getwd, pprof, tracing, ipc, the tsgo spawn).
 //!
 //! PORT: on Linux (and Windows, see below) the values and the texts are
 //! Linux's (go1.26 syscall/zerrors_linux_amd64.go; Linux arm64 has the same

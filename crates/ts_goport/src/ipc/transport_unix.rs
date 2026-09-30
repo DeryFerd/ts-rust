@@ -22,7 +22,7 @@ pub fn new_pipe_listener(path: &str) -> Result<Box<dyn NetListener>, GoError> {
     if std::fs::remove_file(path).is_err() {
         let _ = std::fs::remove_dir(path);
     }
-    match UnixListener::bind(path) {
+    match listen_unix(path) {
         Ok(listener) => Ok(Box::new(UnixPipeListener {
             listener: Mutex::new(Some(listener)),
             path: path.to_string(),
@@ -42,6 +42,21 @@ pub fn new_pipe_listener(path: &str) -> Result<Box<dyn NetListener>, GoError> {
             Err(errors::new(format!("listen unix {path}: bind: {text}")))
         }
     }
+}
+
+/// Go `net.Listen("unix", path)`. On Linux a name that starts with '@' is
+/// an abstract name, with no file (go1.26.4 syscall/syscall_linux.go
+/// `SockaddrUnix.sockaddr`: the '@' becomes a NUL, and the address has no
+/// trailing NUL). `from_abstract_name` makes the same address, and fails
+/// with no errno where Go's name is longer than 108 bytes (EINVAL).
+fn listen_unix(path: &str) -> std::io::Result<UnixListener> {
+    #[cfg(target_os = "linux")]
+    if let Some(name) = path.strip_prefix('@') {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+        return UnixListener::bind_addr(&addr);
+    }
+    UnixListener::bind(path)
 }
 
 // Go: ipc/transport_unix.go:19 GeneratePipePath
