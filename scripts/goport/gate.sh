@@ -103,6 +103,8 @@ REPO = Path('/home/theo/Code/sandbox/ts-rust')
 R = REPO / 'target/continuation-r97-goport'
 X = REPO / 'target/project-inputs-extra'
 ORACLE = Path.home() / '.local/bin/tsgo-oracle'
+# The Go checkout of the run's pin (pin.py exec shows the pin's goCheckout here).
+GO = Path.home() / '.explore/repos/microsoft__typescript-go'
 GO_DUMPER = R / 'typesyms/typesymdump-go'
 RSS_LIMIT = 40 * 2**30
 
@@ -360,7 +362,12 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file, sample_file):
     shards: a pin that adds or renumbers cases keeps the same cases, under the pin's ids. The file holds
     the 1,501 case paths of the sample at pin 52168999f3dc, shard 0 + the first 502 of shard 1, where the
     runner gets the same arguments as before (no --ids). A path that the pin lacks gets no item, so the
-    stage has fewer items than expected and fails."""
+    stage has fewer items than expected and fails.
+    A microsoft/TypeScript pin (layout "typescript": its Go checkout has testdata/promotedTestCollisions.txt) has no
+    TypeScript submodule. There a sample path _submodules/TypeScript/tests/cases/<p> is testdata/tests/cases/<p>, or
+    the new name that the collisions file gives (as scripts/upstream/record.py corpus maps the corpus-int3 sample),
+    and a sample case whose file is not in the pin's Go checkout (Go deleted it) is not expected. The log lists it.
+    At the other pins nothing changes."""
     work = Path(work).resolve()
     work.mkdir(parents=True)
     sys.path.insert(0, str(R / 'emit-corpus'))
@@ -369,6 +376,14 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file, sample_file):
     if os.environ.get('GOPORT_PIN_ACTIVE'):  # pin run: the runner asserts the pin oracle's hash
         es.ORACLE_SHA256 = os.environ['GOPORT_PIN_ORACLE_SHA256']
     sample = [l for l in Path(sample_file).read_text().splitlines() if l and not l.startswith('#')]
+    collisions, gone = GO / 'testdata/promotedTestCollisions.txt', []
+    if collisions.is_file():
+        old = '_submodules/TypeScript/tests/cases/'
+        renamed = dict(re.findall(r'^renamed-promoted\S* (\S+) -> (\S+)$', collisions.read_text(), re.M))
+        sample = [f"testdata/tests/cases/{renamed.get(s[len(old):], s[len(old):])}" if s.startswith(old) else s for s in sample]
+        gone = [s for s in sample if not (GO / s).is_file()]
+        for source in gone:
+            print(f'sample case path not in this pin\'s Go checkout (not expected): {source}', flush=True)
     wanted, found, items = set(sample), set(), []
     shards = json.loads((R / 'corpus-full/shards/shard-0.json').read_text())['of']
     for shard in range(shards):
@@ -393,7 +408,7 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file, sample_file):
             items.append(item('corpus-emit', r['id'], r['class'] == 'MATCH' and not bad, detail + (' INPUTS-CHANGED' if bad else '')))
     for source in sorted(wanted - found):
         print(f'sample case path not in this pin\'s corpus: {source}', flush=True)
-    write_items(items_file, items, len(sample))
+    write_items(items_file, items, len(set(sample)) - len(set(gone)))
 
 
 # ---- allow-list ----
