@@ -6957,22 +6957,22 @@ mod tests {
         };
         let binder_reads: [(&str, &dyn Fn()); 6] = [
             ("symbol", &|| {
-                cy.symbol();
+                let _ = cy.symbol();
             }),
             ("flags", &|| {
-                cy.flags();
+                let _ = cy.flags();
             }),
             ("parser flags", &|| {
-                cy.parser_flags(NodeFlags::AMBIENT);
+                let _ = cy.parser_flags(NodeFlags::AMBIENT);
             }),
             ("flow node", &|| {
-                cy.flow_node();
+                let _ = cy.flow_node();
             }),
             ("extras", &|| {
-                cy.local_symbol();
+                let _ = cy.local_symbol();
             }),
             ("any symbol", &|| {
-                frozen_store_any_symbol(c_file, |_| false);
+                let _ = frozen_store_any_symbol(c_file, |_| false);
             }),
         ];
         for (name, read) in binder_reads {
@@ -6983,7 +6983,7 @@ mod tests {
             );
         }
         let kind = panic_message(&|| {
-            cy.kind();
+            let _ = cy.kind();
         });
         if cfg!(debug_assertions) {
             assert_eq!(kind.as_deref(), Some(released.as_str()));
