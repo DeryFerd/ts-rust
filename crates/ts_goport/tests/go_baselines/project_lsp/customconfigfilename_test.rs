@@ -206,7 +206,7 @@ child_test! {
 
         // Without any config, the file should be in the inferred project only.
         assert_eq!(default_project_name(&session, URI), "/dev/null/inferred");
-        let projects = session.snapshot().get_projects_containing_file(&uri(URI));
+        let projects = session.snapshot().get_language_service_projects_containing_file(&uri(URI));
         assert_eq!(
             projects.len(),
             1,
@@ -221,7 +221,7 @@ child_test! {
 
         // File should now be in the configured project only, not duplicated in inferred.
         assert_eq!(default_project_name(&session, URI), "/src/tsconfig.all.json");
-        let projects = session.snapshot().get_projects_containing_file(&uri(URI));
+        let projects = session.snapshot().get_language_service_projects_containing_file(&uri(URI));
         assert_eq!(
             projects.len(),
             1,

@@ -592,6 +592,7 @@ child_test! {
             },
             &base_snapshot.overlays(),
             None,
+            None,
         );
 
         let project = clone.get_default_project(&u).expect("default project");

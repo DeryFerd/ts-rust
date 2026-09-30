@@ -16,10 +16,30 @@ use crate::frontend::vfs::Fs as _;
 use crate::program::ls_program;
 use std::cell::Cell;
 
-// Go: project/project.go:22 inferredProjectName
+// Go: project/project.go:25 inferredProjectName
 pub const INFERRED_PROJECT_NAME: &str = "/dev/null/inferred"; // lowercase so toPath is a no-op regardless of settings
-// Go: project/project.go:23 hr
+// Go: project/project.go:26 syntheticProjectPrefix (ts#64204)
+pub const SYNTHETIC_PROJECT_PREFIX: &str = "/dev/null/synthetic/";
+// Go: project/project.go:27 hr
 pub const HR: &str = "-----------------------------------------------";
+
+// Go: project/project.go:30 syntheticProjectName (ts#64204)
+pub fn synthetic_project_name(id: i32) -> String {
+    format!("{SYNTHETIC_PROJECT_PREFIX}{id}")
+}
+
+// Go: project/project.go:34 SyntheticProgramID (ts#64204)
+// PORT: Go `strconv.Atoi` accepts a leading sign; `str::parse::<i32>` does
+// too.
+pub fn synthetic_program_id(path: &tspath::Path) -> (i32, bool) {
+    let Some(value) = path.as_str().strip_prefix(SYNTHETIC_PROJECT_PREFIX) else {
+        return (0, false);
+    };
+    match value.parse::<i32>() {
+        Ok(id) => (id, id > 0),
+        Err(_) => (0, false),
+    }
+}
 
 // Go: project/project.go:29 Kind
 // PORT: Go `type Kind int` with iota consts.
@@ -31,6 +51,8 @@ impl Kind {
     pub const INFERRED: Kind = Kind(0);
     // Go: project/project.go:33 KindConfigured
     pub const CONFIGURED: Kind = Kind(1);
+    // Go: project/project.go:51 KindSynthetic (ts#64204)
+    pub const SYNTHETIC: Kind = Kind(2);
 }
 
 // Go: project/project.go:36 ProgramUpdateKind
@@ -179,6 +201,35 @@ pub fn new_inferred_project(
     p
 }
 
+// Go: project/project.go:158 newSyntheticProject (ts#64204)
+// PORT: Go `*core.CompilerOptions` can be nil; the Rust command line needs a
+// value, so a nil one is the zero options.
+#[allow(clippy::too_many_arguments)]
+pub fn new_synthetic_project(
+    name: &str,
+    current_directory: &str,
+    compiler_options: Option<Rc<CompilerOptions>>,
+    root_file_names: Vec<String>,
+    project_references: Option<Vec<ProjectReference>>,
+    content_mappers: &[Rc<contentmapper::Mapper>],
+    builder: &ProjectCollectionBuilder,
+    logger: Option<Rc<logging::LogTree>>,
+) -> Rc<RefCell<Project>> {
+    let project = new_project(name, Kind::SYNTHETIC, current_directory, builder, logger);
+    let command_line = new_inferred_project_command_line(
+        compiler_options.unwrap_or_default(),
+        root_file_names,
+        project_references,
+        content_mappers,
+        tspath::ComparePathsOptions {
+            use_case_sensitive_file_names: builder.fs.fs.use_case_sensitive_file_names(),
+            current_directory: current_directory.to_string(),
+        },
+    );
+    project.borrow_mut().command_line = Some(Rc::new(command_line));
+    project
+}
+
 // Go: project/project.go:140 newInferredProjectCommandLine (tsgo#4712)
 pub fn new_inferred_project_command_line(
     compiler_options: Rc<CompilerOptions>,
@@ -195,38 +246,6 @@ pub fn new_inferred_project_command_line(
     );
     command_line.parsed_config.content_mappers = content_mappers.to_vec();
     command_line
-}
-
-// Go: project/project.go:156 newInferredProjectFromProject (ts#63950)
-// newInferredProjectFromProject creates an isolated synthetic project seeded
-// from an existing project's compiler state.
-pub fn new_inferred_project_from_project(
-    project: &Project,
-    builder: &ProjectCollectionBuilder,
-    logger: Option<Rc<logging::LogTree>>,
-) -> Rc<RefCell<Project>> {
-    let inferred = new_project(
-        INFERRED_PROJECT_NAME,
-        Kind::INFERRED,
-        &project.current_directory,
-        builder,
-        logger,
-    );
-    {
-        let mut p = inferred.borrow_mut();
-        let program = project
-            .program
-            .as_ref()
-            .expect("invalid memory address or nil pointer dereference: Project.Program");
-        p.command_line = Some(program.command_line().clone());
-        p.program = project.program.clone();
-        p.program_last_update = project.program_last_update;
-        p.host = project.host.clone();
-        p.checker_pool = project.checker_pool.clone();
-        p.content_mapper_watched_files = project.content_mapper_watched_files.clone();
-        p.dirty = false;
-    }
-    inferred
 }
 
 // Go: project/project.go:134 NewProject
@@ -371,6 +390,11 @@ impl Project {
     // (which returns a program handle) panics on it.
     pub fn get_program(&self) -> Option<Rc<compiler::NewProgram>> {
         self.program.clone()
+    }
+
+    // Go: project/project.go:286 Project.IsDirty (ts#64204)
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     // Go: project/project.go:217 Project.GetProjectDiagnostics
@@ -778,8 +802,8 @@ impl Project {
     // PORT: Go returns a pointer (nil-able); the command line's value is
     // copied into a new `Rc`.
     pub fn get_type_acquisition(&self) -> Option<Rc<TypeAcquisition>> {
-        if self.kind == Kind::INFERRED {
-            // For inferred projects, use default settings
+        if self.kind == Kind::INFERRED || self.kind == Kind::SYNTHETIC {
+            // For inferred and synthetic projects, use default settings.
             return Some(Rc::new(TypeAcquisition {
                 enable: Tristate::True,
                 include: Vec::new(),

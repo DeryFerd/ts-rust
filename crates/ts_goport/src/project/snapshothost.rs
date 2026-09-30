@@ -9,7 +9,6 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
-use crate::frontend::core_ext::ProjectReference;
 use std::cell::Cell;
 
 // Go: project/snapshothost.go:19 SnapshotHost
@@ -86,9 +85,10 @@ pub fn new_snapshot_host(init: &SessionInit) -> Rc<SnapshotHost> {
 }
 
 impl SnapshotHost {
-    // Go: project/snapshothost.go:64 NewStandaloneRootSnapshot
-    // NewStandaloneRootSnapshot creates the compatibility root for a standalone API session.
-    pub fn new_standalone_root_snapshot(self: &Rc<Self>) -> Rc<Snapshot> {
+    // Go: project/snapshothost.go:62 NewRootSnapshot (ts#64204: was NewStandaloneRootSnapshot)
+    // NewRootSnapshot creates an independent root snapshot.
+    // PORT: `_exported`, because Go also has `newRootSnapshot` (PORTING "Names").
+    pub fn new_root_snapshot_exported(self: &Rc<Self>) -> Rc<Snapshot> {
         self.new_root_snapshot(0, false)
     }
 
@@ -135,49 +135,7 @@ impl SnapshotHost {
         base_snapshot: &Rc<Snapshot>,
         change: SnapshotChange,
     ) -> Rc<Snapshot> {
-        base_snapshot.clone_(ctx, change, &base_snapshot.overlays(), None)
-    }
-
-    // Go: project/snapshothost.go:95 CloneSnapshotWithTemporaryFile
-    // CloneSnapshotWithTemporaryFile derives a snapshot with a temporary file content override.
-    pub fn clone_snapshot_with_temporary_file(
-        &self,
-        ctx: &Context,
-        base_snapshot: &Rc<Snapshot>,
-        file_system: Option<Rc<dyn vfs::Fs>>,
-        uri: &lsproto::DocumentUri,
-        new_text: String,
-    ) -> Result<Rc<Snapshot>, GoError> {
-        base_snapshot.clone_with_temporary_file(ctx, file_system, uri, new_text)
-    }
-
-    // Go: project/snapshothost.go:106 CloneSnapshotForProgram
-    // CloneSnapshotForProgram derives an isolated snapshot containing one synthetic
-    // project. The base snapshot is not adopted as canonical state.
-    #[allow(clippy::too_many_arguments)]
-    pub fn clone_snapshot_for_program(
-        &self,
-        ctx: &Context,
-        base_snapshot: &Rc<Snapshot>,
-        file_system: Option<Rc<dyn vfs::Fs>>,
-        root_file_names: &[String],
-        options: Option<Rc<CompilerOptions>>,
-        project_references: Option<Vec<ProjectReference>>,
-        config_file_parsing_diagnostics: Vec<Diagnostic>,
-        old_project: Option<&Rc<RefCell<Project>>>,
-        file_changes: FileChangeSummary,
-    ) -> Rc<Snapshot> {
-        base_snapshot.clone_for_program(
-            ctx,
-            file_system,
-            root_file_names,
-            options,
-            project_references,
-            config_file_parsing_diagnostics,
-            old_project,
-            file_changes,
-            None,
-        )
+        base_snapshot.clone_(ctx, change, &base_snapshot.overlays(), None, None)
     }
 
     // Go: project/snapshothost.go:130 CloneSnapshotWithAutoImports
@@ -190,19 +148,17 @@ impl SnapshotHost {
         uri: &lsproto::DocumentUri,
         logger: SessionLogger<'_>,
     ) -> Rc<Snapshot> {
-        let change = SnapshotChange {
+        let mut change = SnapshotChange {
             reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
             // ts#64291
             fs: Some(base_snapshot.fs.fs.clone() as Rc<dyn vfs::Fs>),
             file_system_override: base_snapshot.file_system_override,
-            resource_request: ResourceRequest {
-                documents: vec![uri.clone()],
-                auto_imports: uri.clone(),
-                ..Default::default()
-            },
+            // ts#64204
+            resource_request: base_snapshot.resource_request_for_document(uri),
             ..Default::default()
         };
-        base_snapshot.clone_(ctx, change, &base_snapshot.overlays(), logger)
+        change.resource_request.auto_imports = uri.clone();
+        base_snapshot.clone_(ctx, change, &base_snapshot.overlays(), logger, None)
     }
 
     // Go: project/snapshothost.go:141 SnapshotHost.newRootSnapshot

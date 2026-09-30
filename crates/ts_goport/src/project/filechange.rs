@@ -50,7 +50,9 @@ pub struct FileChange {
 }
 
 // Go: project/filechange.go:35 FileChangeSummary
-// PORT: an empty `DocumentUri` is Go's "" (no file).
+// PORT: an empty `DocumentUri` is Go's "" (no file). Go `Clone`
+// (filechange.go:58, ts#64204) copies the four sets; the derived `Clone`
+// does the same.
 #[derive(Clone, Debug, Default)]
 pub struct FileChangeSummary {
     // Only one file can be opened at a time per request

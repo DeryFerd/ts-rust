@@ -19,26 +19,8 @@ fn setup(files: FileMap) -> Rc<Session> {
     bare_session(files)
 }
 
-child_test! {
-    // Go: snapshot_test.go:38 TestSnapshot/temporary file can be added to an empty root snapshot (ts#64163)
-    fn temporary_file_can_be_added_to_an_empty_root_snapshot() {
-        let session = setup(files(&[]));
-
-        let base_snapshot = session.snapshot();
-        let u = uri("file:///temporary.ts");
-        let snapshot = session
-            .clone_snapshot_with_temporary_file(&bg(), &base_snapshot, None, &u, "export const value = 1;".to_string())
-            .unwrap_or_else(|err| panic!("CloneSnapshotWithTemporaryFile: {}", err.error()));
-
-        assert_eq!(
-            snapshot.get_file(&u.file_name()).expect("temporary file").content(),
-            "export const value = 1;"
-        );
-        // Go: defer snapshot.Deref(); defer session.Close()
-        snapshot.deref();
-        session.close();
-    }
-}
+// ts#64204 removed TestSnapshot/temporary file can be added to an empty root snapshot;
+// the synthetic program tests that replace it are ported in their ts#64319 form.
 
 child_test! {
     // Go: snapshot_test.go:52 TestSnapshot/compilerHost gets frozen with snapshot's FS only once

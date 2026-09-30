@@ -1599,19 +1599,22 @@ impl Session {
         if update_snapshot {
             // If there are pending file changes, we need to update the snapshot.
             // Sending the requested URI ensures that the project for this URI is loaded.
-            return self.update_snapshot(
-                ctx,
-                overlays,
-                SnapshotChange {
-                    reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_PENDING_CHANGES,
-                    file_changes,
-                    ata_changes,
-                    new_config,
-                    resource_request: request,
-                    ..Default::default()
-                },
-                caller_ref,
-            );
+            return self
+                .update_snapshot(
+                    ctx,
+                    overlays,
+                    SnapshotChange {
+                        reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_PENDING_CHANGES,
+                        file_changes,
+                        ata_changes,
+                        new_config,
+                        resource_request: request,
+                        ..Default::default()
+                    },
+                    caller_ref,
+                )
+                // PORT: no API request here, so the result is never nil (ts#64204).
+                .expect("updateSnapshot without an API request returns the snapshot");
         }
         // If there are no pending file changes, we can try to use the current snapshot.
         let snapshot = self.snapshot.borrow().clone();
@@ -1673,6 +1676,8 @@ impl Session {
             },
             caller_ref,
         )
+        // PORT: no API request here, so the result is never nil (ts#64204).
+        .expect("updateSnapshot without an API request returns the snapshot")
     }
 
     // Go: project/session.go:975 getSnapshotAndDefaultProject
@@ -1755,7 +1760,7 @@ impl Session {
         let (snapshot, project, default_ls) =
             self.get_snapshot_and_default_project(ctx, uri, false /*callerRef*/)?;
         // !!! TODO: sheetal:  Get other projects that contain the file with symlink
-        let all_projects = snapshot.get_projects_containing_file(uri);
+        let all_projects = snapshot.get_language_service_projects_containing_file(uri);
         Ok((project, default_ls, all_projects))
     }
 
@@ -1775,7 +1780,7 @@ impl Session {
         );
 
         // !!! TODO: sheetal:  Get other projects that contain the file with symlink
-        let all_projects = snapshot.get_projects_containing_file(uri);
+        let all_projects = snapshot.get_language_service_projects_containing_file(uri);
         Ok(all_projects)
     }
 
@@ -1805,7 +1810,7 @@ impl Session {
             active_file = uris[0].file_name();
         }
 
-        let projects = snapshot.project_collection.projects();
+        let projects = snapshot.project_collection.language_service_projects();
         let mut services: Vec<ls::LanguageService> = Vec::with_capacity(projects.len());
         for project in &projects {
             let project = project.borrow();
@@ -2115,19 +2120,22 @@ impl Session {
         overlays: IndexMap<tspath::Path, Rc<Overlay>>,
         change: SnapshotChange,
     ) -> Rc<Snapshot> {
+        // PORT: with `callerRef` Go always returns the snapshot (ts#64204).
         self.update_snapshot(ctx, overlays, change, true)
+            .expect("updateSnapshot with callerRef returns the snapshot")
     }
 
-    // Go: project/session.go:1202 updateSnapshot
+    // Go: project/session.go:1356 updateSnapshot
     // PORT: Go passes `change` by value to `Clone` and keeps its own copy
-    // for the background task, so the port clones it.
+    // for the background task, so the port clones it. A Go nil result (an
+    // API error without `callerRef`, ts#64204) is `None`.
     pub fn update_snapshot(
         self: &Rc<Self>,
         ctx: &Context,
         overlays: IndexMap<tspath::Path, Rc<Overlay>>,
         change: SnapshotChange,
         caller_ref: bool,
-    ) -> Rc<Snapshot> {
+    ) -> Option<Rc<Snapshot>> {
         let old_snapshot = self.snapshot.borrow().clone();
         // ts#64163
         let locale_ctx;
@@ -2136,9 +2144,24 @@ impl Session {
             locale_ctx = self.with_current_locale(ctx);
             ctx = &locale_ctx;
         }
-        let mut change = change;
-        change.client = self.client.clone();
-        let new_snapshot = old_snapshot.clone_(ctx, change.clone(), &overlays, Some(&self.logger));
+        let new_snapshot = old_snapshot.clone_(
+            ctx,
+            change.clone(),
+            &overlays,
+            Some(&self.logger),
+            self.client.clone(),
+        );
+        // A failed API request may have mutated only a prefix of its clone. Such a
+        // snapshot is returned to the caller for inspection and cleanup, but must
+        // never become canonical session state or trigger adoption side effects.
+        // ts#64204
+        if new_snapshot.api_error.is_some() {
+            if caller_ref {
+                return Some(new_snapshot);
+            }
+            new_snapshot.deref();
+            return None;
+        }
         *self.snapshot.borrow_mut() = new_snapshot.clone();
         if caller_ref {
             new_snapshot.ref_();
@@ -2192,7 +2215,7 @@ impl Session {
                 s.warm_auto_import_cache(ctx, &change, old_snapshot, new_snapshot);
             });
 
-        new_snapshot
+        Some(new_snapshot)
     }
 
     // Go: project/session.go:1489 takeContentMapperTimingDelta (tsgo#4712)
@@ -3461,7 +3484,6 @@ impl Session {
 
         let warm_change = SnapshotChange {
             reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
-            client: self.client.clone(),
             resource_request: ResourceRequest {
                 documents: vec![changed_file.clone()],
                 auto_imports: changed_file,
@@ -3486,6 +3508,7 @@ impl Session {
             warm_change,
             &new_snapshot.overlays(),
             Some(&self.logger),
+            self.client.clone(),
         );
         self.snapshot_id.set(next_snapshot_id);
 
