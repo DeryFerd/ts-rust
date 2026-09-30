@@ -1402,11 +1402,8 @@ impl Checker {
                     );
                 }
             } else if count > 5 {
-                let missed_properties = member_info.missed_properties[..4]
-                    .iter()
-                    .map(|prop| format!("'{prop}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let missed_properties =
+                    quoted_and_comma_separated(&member_info.missed_properties[..4]);
                 let remaining_missed_properties = count as i32 - 4;
                 if is_class_expression(error_node) {
                     self.error(
@@ -1422,12 +1419,7 @@ impl Checker {
                     );
                 }
             } else {
-                let missed_properties = member_info
-                    .missed_properties
-                    .iter()
-                    .map(|prop| format!("'{prop}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let missed_properties = quoted_and_comma_separated(&member_info.missed_properties);
                 if is_class_expression(error_node) {
                     self.error(
                         error_node,

@@ -1722,7 +1722,7 @@ impl Checker {
         if !could_contain {
             return t;
         }
-        if self.instantiation_depth == 100 || self.instantiation_count >= 5_000_000 {
+        if self.instantiation_stack.len() == 100 || self.instantiation_count >= 5_000_000 {
             // We have reached 100 recursive type instantiations, or 5M type instantiations caused by the same statement
             // or expression. There is a very high likelihood we're dealing with a combination of infinite generic types
             // that perpetually generate new type identities, so we stop the recursion here by yielding the error type.
@@ -1732,17 +1732,35 @@ impl Checker {
                     "instantiateType_DepthLimit",
                     vec![
                         ("typeId", t.into()),
-                        ("instantiationDepth", self.instantiation_depth.into()),
+                        (
+                            "instantiationDepth",
+                            (self.instantiation_stack.len() as u32).into(),
+                        ),
                         ("instantiationCount", self.instantiation_count.into()),
                     ],
                 );
             }
+            let circular_type_names = self.get_circular_type_names();
             let current_node = self.current_node;
-            self.error(
-                current_node,
-                diag::Type_instantiation_is_excessively_deep_and_possibly_infinite,
-                args![],
-            );
+            if circular_type_names.len() == 1 {
+                self.error(
+                    current_node,
+                    diag::Instantiations_of_type_0_appear_infinitely_circular,
+                    args![circular_type_names[0].clone()],
+                );
+            } else if circular_type_names.len() > 1 {
+                self.error(
+                    current_node,
+                    diag::Instantiations_of_the_following_types_appear_infinitely_circular_Colon_0,
+                    args![quoted_and_comma_separated(&circular_type_names)],
+                );
+            } else {
+                self.error(
+                    current_node,
+                    diag::Type_instantiation_is_excessively_deep_and_possibly_infinite,
+                    args![],
+                );
+            }
             return self.error_type;
         }
         let index = self.find_active_mapper(m);
@@ -1770,12 +1788,9 @@ impl Checker {
         if let Some(&cached_type) = cached {
             return cached_type;
         }
-        // PORT: `instantiation_depth` goes first (perf experiment K). The
-        // limit checks above do not change and no call runs between the
-        // three increments, so only the store order differs.
-        self.instantiation_depth += 1;
         self.total_instantiation_count += 1;
         self.instantiation_count += 1;
+        self.instantiation_stack.push(t);
         let result = self.instantiate_type_worker(t, m, alias);
         if index == -1 {
             self.pop_active_mapper();
@@ -1788,8 +1803,35 @@ impl Checker {
                 }
             }
         }
-        self.instantiation_depth -= 1;
+        self.instantiation_stack.pop();
         result
+    }
+
+    // Go: checker/checker.go:22546 getCircularTypeNames
+    pub fn get_circular_type_names(&mut self) -> Vec<String> {
+        let mut type_counts: FxHashMap<TypeId, i32> = FxHashMap::default();
+        let mut circular_type_names: Vec<String> = Vec::new();
+        let instantiation_stack = self.instantiation_stack.clone();
+        for t in instantiation_stack {
+            let count = type_counts.entry(t).or_insert(0);
+            *count += 1;
+            if *count == 3 {
+                let mut symbol = self.ty(t).symbol;
+                if let Some(alias) = &self.ty(t).alias {
+                    symbol = alias.symbol;
+                }
+                if symbol.is_some() && {
+                    let name = &self.sym(symbol).name;
+                    !name.is_empty() && !name.starts_with(INTERNAL_SYMBOL_NAME_PREFIX)
+                } {
+                    let name = self.symbol_to_string_exported(symbol);
+                    if !circular_type_names.contains(&name) {
+                        circular_type_names.push(name);
+                    }
+                }
+            }
+        }
+        circular_type_names
     }
 
     // Go: checker/checker.go:22045 pushActiveMapper

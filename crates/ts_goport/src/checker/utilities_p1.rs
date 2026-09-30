@@ -1421,6 +1421,15 @@ impl Checker {
 // `is_binary_operator` (Go `ast.IsXxxOperator`, generated from the same kind
 // sets), so the unprefixed names would be ambiguous through the prelude.
 
+// Go: checker/utilities.go:1923 quotedAndCommaSeparated
+pub fn quoted_and_comma_separated(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| format!("'{item}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 // Go: checker/utilities.go:730 isExponentiationOperator
 pub fn checker_is_exponentiation_operator(kind: SyntaxKind) -> bool {
     kind == SyntaxKind::AsteriskAsteriskToken

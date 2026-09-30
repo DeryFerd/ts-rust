@@ -264,7 +264,6 @@ pub struct PropertiesTypesKey {
     pub type_id: TypeId,
     pub include: TypeFlags,
     pub include_origin: bool,
-    pub unresolved_members: bool,
 }
 
 // NonExistentPropertyKey
@@ -715,7 +714,7 @@ pub struct Checker {
     pub class_type_parameters_origins: FxHashMap<TypeId, u32>,
     pub total_instantiation_count: u32,
     pub instantiation_count: u32,
-    pub instantiation_depth: u32,
+    pub instantiation_stack: Vec<TypeId>,
     pub conditional_constraint_depth: u32,
     pub inline_level: i32,
     pub serialization_level: i32,
@@ -1183,7 +1182,7 @@ impl Checker {
             class_type_parameters_origins: FxHashMap::default(),
             total_instantiation_count: 0,
             instantiation_count: 0,
-            instantiation_depth: 0,
+            instantiation_stack: Vec::new(),
             conditional_constraint_depth: 0,
             inline_level: 0,
             serialization_level: 0,
