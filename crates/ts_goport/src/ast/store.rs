@@ -91,7 +91,7 @@ use crate::frontend::parser::SourceFileParseOptions;
 use crate::prelude::*;
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// Slot 0: Go `nil` stored in a astdata field that has no `Option`.
@@ -137,8 +137,8 @@ impl NodeHeader {
     }
 }
 
-/// The Go nodes of one parsed file. Slot `i` is `records[i]`, `kids[i]` and
-/// `nodes[i]`.
+/// The Go nodes of one parsed file. Slot `i` is `kinds[i]`, `records[i]`,
+/// `kids[i]` and `nodes[i]`.
 /// The default value is an empty placeholder with no slots.
 #[derive(Default)]
 struct FileStore {
@@ -148,6 +148,10 @@ struct FileStore {
     /// the slot is made and written by the parse (`get_mut`). The publish
     /// reads them in place (`FileBlock::records`).
     records: Vec<NodeRecord>,
+    /// AST node records, step 4: the Go `node.Kind` of every slot
+    /// (`Unknown` for the nil slot and alias slots), pushed with its record.
+    /// The publish reads it in place (`FileBlock::kinds`).
+    kinds: Vec<SyntaxKind>,
     /// AST node records, step 2: the parents in another store of node
     /// slots (`ParentCode`), in the order the parse wrote them. The publish
     /// reads them in place (`BlockFile::foreign`).
@@ -267,7 +271,7 @@ impl StoreFacts {
 
     /// Adds the slot of `record`, after slot 0.
     #[inline]
-    fn add(&mut self, record: &NodeRecord) {
+    fn add(&mut self, record: &NodeRecord, kind: SyntaxKind) {
         if !record.is_node() {
             self.alias_free = false;
             return;
@@ -281,7 +285,7 @@ impl StoreFacts {
         {
             self.has_deprecated_tag = true;
         }
-        match record.kind() {
+        match kind {
             SyntaxKind::ExportAssignment | SyntaxKind::ExportSpecifier => {
                 self.has_export_alias_kind = true;
             }
@@ -454,7 +458,8 @@ impl SlotChildren {
 /// aarch64). The parse writes them through `get_mut`; the binder writes its
 /// fields into the published record (`bind_store_records`).
 ///
-/// - `kind`: Go `node.Kind`; `Unknown` for the nil slot and alias slots.
+/// - The Go `node.Kind` of the slot is not in its record but in the kind
+///   column (`FileStore::kinds`, `FileBlock::kinds`).
 /// - `bits`: `SOURCE_FILE_ROOT`, `TEXT_IS_KEYWORD` and `NO_NODE`.
 /// - `flags`: Go `node.Flags`: the parser flags, and after the bind also
 ///   the bits the binder added (`BINDER_ADDED_FLAGS` in node.rs).
@@ -478,15 +483,19 @@ impl SlotChildren {
 /// file ends before any reader of its binder fields starts: the checker
 /// threads start after the bind, or get their work through a lock or a
 /// channel, which orders the writes before their reads.
-// PORT: AST node records, step 4: `kind` is an atomic, as the other words
-// are, so a pooled block (`BlockPool`) can take the records of another file
-// through a shared borrow, with no `unsafe`. The kind of a slot never
-// changes after the slot is made (`replace_store_node_data` keeps it). A
-// read converts it with a table (`KIND_OF_RAW`).
+// PORT: AST node records, step 4: every word is an atomic, so a pooled
+// block (`BlockPool`) can take the records of another file through a shared
+// borrow, with no `unsafe`. The kind of a slot never changes after the slot
+// is made (`replace_store_node_data` keeps it), so it is in a plain column
+// of its own (`FileStore::kinds`), which a pooled block does not hold.
+// PERF: step 4 first had an `AtomicU16` kind in the record, read through a
+// 512-entry table (safe Rust has no cheaper `u16` to `SyntaxKind`):
+// `goport -p` +1.3% to +2.1% instructions against step 7, and a plain
+// `transmute` of the atomic load still +0.6% to +1.1%
+// (ast-design/step4b). The column adds 2 bytes per slot.
 #[repr(C)]
 #[derive(Debug)]
 pub struct NodeRecord {
-    kind: AtomicU16,
     bits: AtomicU8,
     flags: AtomicU32,
     loc: AtomicU64,
@@ -495,31 +504,6 @@ pub struct NodeRecord {
 }
 
 const _: () = assert!(std::mem::size_of::<NodeRecord>() == 32);
-// `NodeRecord::kind`: every raw kind below `COUNT` is a kind.
-const _: () = assert!(SyntaxKind::NotEmittedTypeElement as usize + 1 == SyntaxKind::COUNT);
-
-/// AST node records, step 4: the `SyntaxKind` of each 9-bit raw record kind
-/// (`NodeRecord::kind`): `SyntaxKind::ALL`, then `Unknown`.
-// PERF: a read masks the raw kind and loads the entry, with no bounds
-// check: about 3 instructions more than the plain field of step 7
-// (`goport -p` +1.3% to +2.1%). A `const`, so the table address is a
-// `lea`, not a load from the GOT (a `static` ran the same instruction
-// count; a 64K-entry `static` with no mask saved 0% to 0.5% for 128 KiB).
-// `SyntaxKind::try_from` (a match of the 351 kinds) is a range check only
-// after LLVM's late simplification. Before it the inliner saw a 351-case
-// switch: with `#[inline]` about 3,900 `try_from` calls stayed out of
-// line, and with `#[inline(always)]` `frozen_store_kind` did at about 7,700
-// call sites (+3% to +7.6%).
-const KIND_OF_RAW: [SyntaxKind; 512] = {
-    let mut kinds = [SyntaxKind::Unknown; 512];
-    let mut raw = 0;
-    while raw < SyntaxKind::COUNT {
-        assert!(SyntaxKind::ALL[raw] as usize == raw);
-        kinds[raw] = SyntaxKind::ALL[raw];
-        raw += 1;
-    }
-    kinds
-};
 
 /// AST node records, step 2: the low half of `NodeRecord::up` of a node
 /// slot. 0 is a nil parent. `1..FOREIGN_PARENT` is a parent in the same
@@ -544,12 +528,11 @@ impl NodeRecord {
     /// in `up`.
     const NO_NODE: u8 = 4;
 
-    /// A new node slot of kind `kind`: Go `newNode` (undefined loc, nil
+    /// The record of a new node slot: Go `newNode` (undefined loc, nil
     /// parent, no flags).
     #[inline]
-    fn node(kind: SyntaxKind, text_is_keyword: bool) -> Self {
+    fn node(text_is_keyword: bool) -> Self {
         Self::new(
-            kind,
             if text_is_keyword {
                 Self::TEXT_IS_KEYWORD
             } else {
@@ -565,7 +548,6 @@ impl NodeRecord {
     #[inline]
     fn target(target: Node) -> Self {
         Self::new(
-            SyntaxKind::Unknown,
             Self::NO_NODE,
             NodeFlags::NONE,
             TextRange::undefined(),
@@ -575,9 +557,8 @@ impl NodeRecord {
 
     /// A slot with word `up` (see `NodeRecord`) and no binder fields.
     #[inline]
-    fn new(kind: SyntaxKind, bits: u8, flags: NodeFlags, loc: TextRange, up: u64) -> Self {
+    fn new(bits: u8, flags: NodeFlags, loc: TextRange, up: u64) -> Self {
         Self {
-            kind: AtomicU16::new(kind as u16),
             bits: AtomicU8::new(bits),
             flags: AtomicU32::new(flags.0),
             loc: AtomicU64::new(Self::loc_word(loc)),
@@ -594,20 +575,12 @@ impl NodeRecord {
     /// A record of a fresh pool block (`BlockPool`): all words 0.
     fn zero() -> Self {
         Self {
-            kind: AtomicU16::new(0),
             bits: AtomicU8::new(0),
             flags: AtomicU32::new(0),
             loc: AtomicU64::new(0),
             up: AtomicU64::new(0),
             bind: AtomicU64::new(0),
         }
-    }
-
-    #[inline]
-    fn kind(&self) -> SyntaxKind {
-        let raw = usize::from(self.kind.load(Ordering::Relaxed));
-        debug_assert!(raw < SyntaxKind::COUNT, "record kind {raw}");
-        KIND_OF_RAW[raw & (KIND_OF_RAW.len() - 1)]
     }
 
     #[inline]
@@ -663,11 +636,11 @@ impl NodeRecord {
         self.parent_code() & FOREIGN_PARENT != 0
     }
 
-    /// The header of this slot of store `file`, whose foreign parents are
-    /// `foreign`, as the node reads see it. The parent of the nil slot or an
-    /// alias slot is its target.
+    /// The header of this slot of store `file`, whose kind is `kind` and
+    /// whose foreign parents are `foreign`, as the node reads see it. The
+    /// parent of the nil slot or an alias slot is its target.
     #[inline]
-    fn header(&self, file: usize, foreign: &[Node]) -> NodeHeader {
+    fn header(&self, kind: SyntaxKind, file: usize, foreign: &[Node]) -> NodeHeader {
         let bits = self.bits();
         let up = self.up.load(Ordering::Relaxed);
         let code = up as ParentCode;
@@ -685,7 +658,7 @@ impl NodeRecord {
             },
             loc: self.loc(),
             flags: self.flags(),
-            kind: self.kind(),
+            kind,
             source_file_is_root: bits & Self::SOURCE_FILE_ROOT != 0,
             text_is_keyword: bits & Self::TEXT_IS_KEYWORD != 0,
         }
@@ -711,7 +684,6 @@ impl NodeRecord {
     #[inline]
     fn store_from(&self, from: &NodeRecord) {
         let relaxed = Ordering::Relaxed;
-        self.kind.store(from.kind.load(relaxed), relaxed);
         self.bits.store(from.bits.load(relaxed), relaxed);
         self.flags.store(from.flags.load(relaxed), relaxed);
         self.loc.store(from.loc.load(relaxed), relaxed);
@@ -1220,23 +1192,30 @@ fn is_storeless_id(file: usize) -> bool {
 // one per later publish in a two-level table (tier 1). A tier 0 read loaded
 // the table of the publish, then the slice of the file, then the slot; a
 // tier 1 read two loads more. 56 bytes, so an entry and its `OnceLock`
-// state fill one cache line (`BlockEntry`).
+// state fill one cache line (`BlockEntry`). Step 4 added `kinds` and moved
+// the node column into `BlockFile`: a 72-byte entry took two cache lines
+// and 4 MiB more `.data`, and cost 0.1% fewer `goport -p` instructions.
 struct FileBlock {
+    /// AST node records, step 4: `FileStore::kinds`. A `Node::kind` read
+    /// reads only this.
+    kinds: &'static [SyntaxKind],
     /// `FileStore::records`. The header reads (`Node::kind`, `parent`,
     /// `loc`, `flags`) and the binder fields in the records read only
     /// this.
     records: &'static [NodeRecord],
     /// `FileStore::kids`.
     kids: &'static [NodeKids],
-    /// `FileStore::nodes`. Empty in the node shell of a store that owns its
-    /// astdata nodes (`FileBlock::node_column`).
-    nodes: &'static [Option<&'static crate::astdata::Node>],
     file: &'static BlockFile,
 }
 
 /// The rest of a `FileBlock`: per-file facts and tables, and the store and
 /// `GoFile` of a static publish.
 struct BlockFile {
+    /// `FileStore::nodes`. Empty in the node shell of a store that owns its
+    /// astdata nodes (`FileBlock::node_column`). Here and not in the
+    /// `FileBlock` since step 4 (see there): a node data read loads one
+    /// word more.
+    nodes: &'static [Option<&'static crate::astdata::Node>],
     /// `FileStore::facts`. The child reads load it next to the kids
     /// (`block_resolve_slot`).
     facts: StoreFacts,
@@ -1263,7 +1242,8 @@ impl FileBlock {
     /// slot, so every other column has an entry.
     #[inline]
     fn node_column(&self) -> Option<&'static [Option<&'static crate::astdata::Node>]> {
-        (!self.nodes.is_empty()).then_some(self.nodes)
+        let nodes = self.file.nodes;
+        (!nodes.is_empty()).then_some(nodes)
     }
 }
 
@@ -1314,16 +1294,28 @@ fn high_block_path() {}
 // version N is released"). A release build does not check the hot reads
 // (PORTING.md, "AST": a stale read after a reuse gives the new owner's
 // data).
+// PERF: step 4b. The release body is the one of step 3, with no call to
+// `registry_block`: in that form (and a `cfg!` check) LLVM made the entry
+// address after the `OnceLock` state test, one more instruction in every
+// hot read (`goport -p` about +0.3%).
 #[inline]
 fn file_block(file: usize) -> Option<&'static FileBlock> {
-    let block = registry_block(file);
-    if cfg!(debug_assertions)
-        && let Some(b) = block
+    #[cfg(debug_assertions)]
+    if let Some(b) = registry_block(file)
         && !block_is_owned(b, file)
     {
         super::file_version::released(file);
     }
-    block
+    if let Some(entry) = FILE_BLOCKS.get(file) {
+        return entry.0.get();
+    }
+    // A synthetic or provisional id is in no publish. It leaves here,
+    // outside the cold block.
+    if file >= FILE_ID_LIMIT {
+        return None;
+    }
+    high_block_path();
+    high_file_block(file)
 }
 
 /// AST node records, step 4: true when block `b` of file `file` still
@@ -1338,19 +1330,14 @@ fn block_is_owned(b: &FileBlock, file: usize) -> bool {
         .is_some_and(|r| r.is_owned_by(file))
 }
 
-/// `file_block` with no owner check: the registry entry of `file`.
-#[inline(always)]
+/// `file_block` with no owner check: the registry entry of `file`, for the
+/// owner check and the test hooks.
 fn registry_block(file: usize) -> Option<&'static FileBlock> {
-    if let Some(entry) = FILE_BLOCKS.get(file) {
-        return entry.0.get();
+    match FILE_BLOCKS.get(file) {
+        Some(entry) => entry.0.get(),
+        None if file >= FILE_ID_LIMIT => None,
+        None => high_file_block(file),
     }
-    // A synthetic or provisional id is in no publish. It leaves here,
-    // outside the cold block.
-    if file >= FILE_ID_LIMIT {
-        return None;
-    }
-    high_block_path();
-    high_file_block(file)
 }
 
 /// `file_block` for an id from `LOW_BLOCKS` to `FILE_ID_LIMIT`.
@@ -1488,6 +1475,9 @@ struct BlockPool {
     /// The given-back blocks with the pin epoch from which they are free,
     /// in the order they came back (the epochs only grow).
     quarantine: VecDeque<(usize, PoolBlock)>,
+    /// The kind columns of the last `RECENT_KINDS` node shells, newest
+    /// first (`shell_kinds`).
+    recent_kinds: VecDeque<&'static [SyntaxKind]>,
 }
 
 /// The number of program releases a given-back block waits
@@ -1500,7 +1490,31 @@ const QUARANTINE_RELEASES: usize = 2;
 static POOL: Mutex<BlockPool> = Mutex::new(BlockPool {
     free: Vec::new(),
     quarantine: VecDeque::new(),
+    recent_kinds: VecDeque::new(),
 });
+
+/// The number of kind columns `shell_kinds` compares.
+const RECENT_KINDS: usize = 4;
+
+/// The kind column of a node shell whose store has kinds `kinds`: a column
+/// of one of the last `RECENT_KINDS` shells when it is equal (a column
+/// never changes, so shells can share it), else `kinds`, leaked. An edit
+/// inside a token or a literal keeps every kind of the file, so its shell
+/// leaks no column. A column is 2 bytes per slot; a pooled block cannot
+/// hold it (`NodeRecord`).
+fn shell_kinds(kinds: Vec<SyntaxKind>) -> &'static [SyntaxKind] {
+    let mut pool = lock_pool();
+    let recent = &mut pool.recent_kinds;
+    if let Some(i) = recent.iter().position(|column| **column == *kinds) {
+        let column = recent.remove(i).expect("a recent kind column");
+        recent.push_front(column);
+        return column;
+    }
+    let column: &'static [SyntaxKind] = Vec::leak(kinds);
+    recent.push_front(column);
+    recent.truncate(RECENT_KINDS);
+    column
+}
 
 fn lock_pool() -> std::sync::MutexGuard<'static, BlockPool> {
     POOL.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1516,7 +1530,9 @@ fn pool_class(cap: usize) -> usize {
 fn take_pool_block(len: usize) -> PoolBlock {
     let most = 2 * len + 64;
     let mut pool = lock_pool();
-    let BlockPool { free, quarantine } = &mut *pool;
+    let BlockPool {
+        free, quarantine, ..
+    } = &mut *pool;
     let epoch = super::file_version::pin_epoch();
     let ready = quarantine
         .iter()
@@ -1561,6 +1577,7 @@ fn clear_block_pool() {
     let mut pool = lock_pool();
     pool.free.clear();
     pool.quarantine.clear();
+    pool.recent_kinds.clear();
 }
 
 /// Test hook (AST node records, step 4): the address of the records of the
@@ -1773,6 +1790,8 @@ impl FileStore {
         let slots = text.len() / STORE_TEXT_BYTES_PER_SLOT + 1;
         let mut records = Vec::with_capacity(slots);
         records.push(NodeRecord::target(Node::NIL));
+        let mut kinds = Vec::with_capacity(slots);
+        kinds.push(SyntaxKind::Unknown);
         let mut kids = Vec::with_capacity(slots);
         kids.push(NodeKids::unknown());
         let mut nodes = Vec::with_capacity(slots);
@@ -1786,6 +1805,7 @@ impl FileStore {
             file_name,
             text,
             records,
+            kinds,
             kids,
             nodes,
             build_links,
@@ -1823,10 +1843,11 @@ impl FileStore {
         entry
     }
 
-    /// The record, kids and link vectors have one entry per slot.
+    /// The record, kind, kids and link vectors have one entry per slot.
     #[inline]
     fn debug_assert_build_columns(&self) {
         let slots = self.records.len();
+        debug_assert_eq!(self.kinds.len(), slots);
         debug_assert_eq!(self.kids.len(), slots);
         debug_assert_eq!(self.nodes.len(), slots);
         debug_assert_eq!(self.build_links.len(), slots);
@@ -1908,7 +1929,7 @@ impl FileStore {
     /// node reads see it.
     #[inline]
     fn slot_header(&self, file: usize, index: usize) -> NodeHeader {
-        self.records[index].header(file, &self.foreign_parents)
+        self.records[index].header(self.kinds[index], file, &self.foreign_parents)
     }
 
     /// `record_resolve` of slot `index` of this store, which has id `file`.
@@ -1920,7 +1941,7 @@ impl FileStore {
     /// U1 (a) (d): the name of slot `index` (`store_identifier_name`).
     #[inline]
     fn slot_text_name_of(&self, index: usize) -> Name {
-        self.kids[index].text_name(self.records[index].kind())
+        self.kids[index].text_name(self.kinds[index])
     }
 
     /// `mark_source_file_roots`: the root bit of slot `index`.
@@ -3452,11 +3473,11 @@ impl FileStore {
     fn make_facts(&mut self, mut each: impl FnMut(&NodeRecord)) {
         let mut facts = StoreFacts::ONLY_NIL_SLOT;
         let mut counts = BindCounts::default();
-        for (i, record) in self.records.iter().enumerate() {
+        for (i, (record, &kind)) in self.records.iter().zip(&self.kinds).enumerate() {
             each(record);
-            counts.add(record.kind());
+            counts.add(kind);
             if i != NIL_SLOT as usize {
-                facts.add(record);
+                facts.add(record, kind);
             }
         }
         self.facts = facts;
@@ -3492,8 +3513,13 @@ impl FileStore {
     /// - U1 (b): the modifier bits equal the flags of the node's own list.
     /// - The kind and the `NO_NODE` bit agree with the node column.
     fn debug_check_kids(&self) {
-        for (i, (record, kids)) in self.records.iter().zip(&self.kids).enumerate() {
-            let kind = record.kind();
+        for (i, ((record, kids), &kind)) in self
+            .records
+            .iter()
+            .zip(&self.kids)
+            .zip(&self.kinds)
+            .enumerate()
+        {
             let keyword = record.has_bit(NodeRecord::TEXT_IS_KEYWORD);
             let node = self.nodes[i].map(|_| self.slot_ast_node(i));
             assert_eq!(record.is_node(), node.is_some(), "node bit of slot {i}");
@@ -3540,6 +3566,7 @@ impl FileStore {
     fn end_parse(&mut self) {
         self.frozen = true;
         self.records.shrink_to_fit();
+        self.kinds.shrink_to_fit();
         self.kids.shrink_to_fit();
         self.nodes.shrink_to_fit();
         if let Some(owned) = self.owned.as_deref_mut() {
@@ -3780,6 +3807,7 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
             .iter()
             .zip(go_files)
             .map(|(s, go_file)| BlockFile {
+                nodes: &s.nodes,
                 facts: s.facts,
                 root: s.root,
                 foreign: &s.foreign_parents,
@@ -3797,9 +3825,9 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
         set_file_block(
             base + i,
             FileBlock {
+                kinds: &s.kinds,
                 records: &s.records,
                 kids: &s.kids,
-                nodes: &s.nodes,
                 file,
             },
         );
@@ -3809,8 +3837,8 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
 /// The node shell of freeable file version `file`, whose store is `store`:
 /// the block of its id, with the node columns of the store: its records and
 /// kids, copied into a pooled block (`BlockPool`, AST node records, step
-/// 4), which the caller gives to the version, and its foreign parents,
-/// moved out of `store` and leaked. Its
+/// 4), which the caller gives to the version, its kinds (`shell_kinds`),
+/// and its foreign parents, moved out of `store` and leaked. Its
 /// `BlockFile` has no store, no `GoFile` and no child link column. A store
 /// that owns its astdata nodes (lsshells M3c) keeps its node column and its
 /// nodes, and the shell has none (`FileBlock::node_column`), so a node data
@@ -3827,8 +3855,8 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
 // and 1.5 to 2 ms with only the kind column static
 // (lsshells/m3/repair/prof): an edit reads the nodes of the edited file
 // about 400,000 times. The node columns that the header and child reads
-// need (48 bytes per node, 32 + 16 with the node records) are leaked and
-// read inline, as a static file.
+// need (50 bytes per node: 32 + 16 + 2 with the node records and the kind
+// column) are leaked and read inline, as a static file.
 // Without the children and modifier columns, the child reads of the edited
 // file read the node data, and edits were about 0.3 ms slower
 // (lsshells/m3/repair/r4). The store maps and lists, the node column, the
@@ -3872,13 +3900,15 @@ fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
     }
     store.records = Vec::new();
     store.kids = Vec::new();
+    let kinds = shell_kinds(std::mem::take(&mut store.kinds));
     let foreign: &'static [Node] = Vec::leak(std::mem::take(&mut store.foreign_parents));
     store.links = Box::default();
     let shell = FileBlock {
+        kinds,
         records,
         kids,
-        nodes,
         file: Box::leak(Box::new(BlockFile {
+            nodes,
             facts: store.facts,
             root: store.root,
             foreign,
@@ -3900,7 +3930,7 @@ fn mark_source_file_roots(store: &mut FileStore) {
     // last SourceFile slot. Any other SourceFile node stays unmarked.
     let Some(root) = (0..store.records.len())
         .rev()
-        .find(|&i| store.records[i].is_node() && store.records[i].kind() == SyntaxKind::SourceFile)
+        .find(|&i| store.records[i].is_node() && store.kinds[i] == SyntaxKind::SourceFile)
     else {
         return;
     };
@@ -3919,7 +3949,7 @@ fn mark_source_file_roots(store: &mut FileStore) {
         if !record.is_node() {
             continue;
         }
-        if record.kind() != SyntaxKind::SourceFile
+        if store.kinds[start] != SyntaxKind::SourceFile
             && let Some(parent) = record.local_parent()
             && matches!(state[parent], ROOT | NOT_ROOT)
         {
@@ -3938,11 +3968,10 @@ fn mark_source_file_roots(store: &mut FileStore) {
             }
             state[cur] = ON_PATH;
             path.push(cur);
-            let record = &store.records[cur];
-            if record.kind() == SyntaxKind::SourceFile {
+            if store.kinds[cur] == SyntaxKind::SourceFile {
                 break if cur == root { ROOT } else { NOT_ROOT };
             }
-            let Some(parent) = record.local_parent() else {
+            let Some(parent) = store.records[cur].local_parent() else {
                 break NOT_ROOT;
             };
             cur = parent;
@@ -4001,7 +4030,7 @@ pub fn store_header(n: Node) -> NodeHeader {
     if let Some(b) = file_block(file) {
         let record = &b.records[index];
         debug_assert!(record.is_node(), "store handle does not name a node slot");
-        return record.header(file, b.file.foreign);
+        return record.header(b.kinds[index], file, b.file.foreign);
     }
     with_store(file, |s| {
         debug_assert!(
@@ -4035,7 +4064,7 @@ pub fn try_store_header(n: Node) -> Option<NodeHeader> {
 #[inline(never)]
 fn try_store_header_slow(file: usize, index: usize) -> Option<NodeHeader> {
     if let Some(b) = file_block(file) {
-        return Some(b.records[index].header(file, b.file.foreign));
+        return Some(b.records[index].header(b.kinds[index], file, b.file.foreign));
     }
     unpublished_store(file).map(|store| store.borrow().slot_header(file, index))
 }
@@ -4060,7 +4089,10 @@ pub fn active_store_header(n: Node) -> Option<NodeHeader> {
 #[inline]
 #[must_use]
 pub fn frozen_store_kind(n: Node) -> Option<SyntaxKind> {
-    frozen_record(n).map(NodeRecord::kind)
+    if n.is_nil() {
+        return None;
+    }
+    file_block(n.file_index()).map(|b| b.kinds[slot_index(n)])
 }
 
 /// The record of a published store node, by reference, so a read of one
@@ -4338,7 +4370,7 @@ pub fn store_identifier_name(n: Node) -> Option<Name> {
 /// is `b`.
 #[inline]
 fn block_text_name_of(b: &FileBlock, index: usize) -> Name {
-    b.kids[index].text_name(b.records[index].kind())
+    b.kids[index].text_name(b.kinds[index])
 }
 
 /// `store_identifier_name` for a node that is not published: an
@@ -4458,7 +4490,7 @@ pub fn frozen_store_text_name(n: Node) -> Option<Name> {
     }
     let index = slot_index(n);
     let b = file_block(n.file_index())?;
-    is_name_kind(b.records[index].kind()).then(|| Name::from_id(b.kids[index].word()))
+    is_name_kind(b.kinds[index]).then(|| Name::from_id(b.kids[index].word()))
 }
 
 /// U1 (a): Go `scanner.GetIdentifierToken(node.Text()) != KindIdentifier` of
@@ -4467,8 +4499,12 @@ pub fn frozen_store_text_name(n: Node) -> Option<Name> {
 #[inline]
 #[must_use]
 pub fn frozen_store_text_is_keyword(n: Node) -> Option<bool> {
-    let r = frozen_record(n)?;
-    is_name_kind(r.kind()).then(|| r.has_bit(NodeRecord::TEXT_IS_KEYWORD))
+    if n.is_nil() {
+        return None;
+    }
+    let index = slot_index(n);
+    let b = file_block(n.file_index())?;
+    is_name_kind(b.kinds[index]).then(|| b.records[index].has_bit(NodeRecord::TEXT_IS_KEYWORD))
 }
 
 /// U1 (b): Go `node.ModifierFlags()` (the flags of the node's own modifier
@@ -4483,9 +4519,7 @@ pub fn frozen_store_modifier_flags(n: Node) -> Option<ModifierFlags> {
     }
     let index = slot_index(n);
     let b = file_block(n.file_index())?;
-    Some(ModifierFlags(
-        b.kids[index].modifier_bits(b.records[index].kind()),
-    ))
+    Some(ModifierFlags(b.kids[index].modifier_bits(b.kinds[index])))
 }
 
 /// U4 (CH6, bind A): Go `n.Name()`, `n.Expression()`, `n.PostfixToken()` or
@@ -4665,24 +4699,29 @@ pub fn frozen_find_ancestor(
     Some(store_find_ancestor(
         file,
         b.records,
+        b.kinds,
         slot_index(n),
         callback,
     ))
 }
 
-/// `frozen_find_ancestor` in store `file`, whose records are `records`,
-/// from slot `index`.
+/// `frozen_find_ancestor` in store `file`, whose records are `records` and
+/// kinds `kinds`, from slot `index`.
 #[inline]
 fn store_find_ancestor(
     file: usize,
     records: &[NodeRecord],
+    kinds: &[SyntaxKind],
     mut index: usize,
     mut callback: impl FnMut(Node, SyntaxKind) -> bool,
 ) -> AncestorWalk {
+    // The columns have one entry per slot. The same length lets LLVM drop
+    // the bounds check of `kinds` in the loop.
+    let kinds = &kinds[..records.len()];
     loop {
         let node = handle(file, index as u32);
         let record = &records[index];
-        if callback(node, record.kind()) {
+        if callback(node, kinds[index]) {
             return AncestorWalk::Found(node);
         }
         // The parent code (`ParentCode`): a node of this store, nil or a
@@ -4712,10 +4751,10 @@ pub fn frozen_store_parent_kind(n: Node) -> Option<(Node, SyntaxKind)> {
         return None;
     }
     let file = n.file_index();
-    let records = file_block(file)?.records;
-    records[slot_index(n)]
+    let b = file_block(file)?;
+    b.records[slot_index(n)]
         .local_parent()
-        .map(|index| (handle(file, index as u32), records[index].kind()))
+        .map(|index| (handle(file, index as u32), b.kinds[index]))
 }
 
 /// U4 (CH7): true when `n` is a published store node and no node of its store
@@ -4961,7 +5000,7 @@ pub fn set_parent_in_store_children(parent: Node) -> bool {
     if s.cell_of(index) != NO_CELL {
         return set_parent_in_owned_store_children(s, index);
     }
-    let kind = s.records[index].kind();
+    let kind = s.kinds[index];
     // `NodeHeader::stored_parent` of a child in the store of `parent`.
     let stored = handle(LOCAL_STORE, index as u32);
     // `StoreChildLinks::new`.
@@ -4993,13 +5032,14 @@ fn set_parent_in_owned_store_children(s: &mut FileStore, index: usize) -> bool {
     let FileStore {
         nodes,
         records,
+        kinds,
         build_links,
         owned,
         ..
     } = s;
     let owned = owned.as_deref().expect("a store that owns its nodes");
     let node = owned.node(owned.cell_of[index]);
-    let kind = records[index].kind();
+    let kind = kinds[index];
     let code = local_parent_code(handle(LOCAL_STORE, index as u32));
     unlink_children(build_links, index);
     build_links[index].first_child = LINK_END;
@@ -5086,9 +5126,9 @@ pub fn replace_store_node_data(n: Node, data: NodeData) {
             "{old_kind:?} does not fit its NodeData"
         );
         let node = ast_node(old_kind, data);
-        // The same code as `alloc_store_node`, on the record kind (the kind
+        // The same code as `alloc_store_node`, on the slot kind (the kind
         // `debug_check_kids` reads).
-        let kind = s.records[index].kind();
+        let kind = s.kinds[index];
         // PORT: U1 (d). Data cloned from a store identifier has an empty text
         // (`alloc_store_name_node`, `alloc_store_shared_name_node`), so an
         // empty text keeps the slot name. A new text replaces it. Go writes
@@ -5174,6 +5214,7 @@ pub(crate) fn load_lib_parse_slots(
             "a lib parse snapshot loads into a new store"
         );
         s.records.reserve_exact(count);
+        s.kinds.reserve_exact(count);
         s.kids.reserve_exact(count);
         s.nodes.reserve_exact(count);
         s.build_links.reserve_exact(count);
@@ -5224,7 +5265,8 @@ impl FileStore {
             0
         };
         self.records
-            .push(NodeRecord::new(kind, bits, flags, loc, u64::from(parent)));
+            .push(NodeRecord::new(bits, flags, loc, u64::from(parent)));
+        self.kinds.push(kind);
         self.nodes.push(Some(node));
         let modifier_bits = super::node::store_node_modifier_bits(kind, node);
         let children = super::node::store_node_children(kind, node);
@@ -5290,7 +5332,7 @@ pub(crate) fn lib_parse_slot_views(file: usize) -> Result<Vec<LibParseSlotView>,
         let mut views = Vec::with_capacity(s.records.len());
         for index in 1..s.records.len() {
             let record = &s.records[index];
-            let kind = record.kind();
+            let kind = s.kinds[index];
             let node = s.nodes[index].ok_or_else(|| format!("slot {index} is not a node slot"))?;
             if node.kind != kind
                 || node.flags != base.flags
@@ -5410,19 +5452,20 @@ pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
                 ) && std::ptr::eq(node, shared_name_node(node.kind))
             });
             let record = &s.records[index];
+            let kind = s.kinds[index];
             let kids = &s.kids[index];
             lines.push(format!(
                 "{index}: record {:?} {} {:?} {:?} {} bind {} node {} shared {shared} kids {:?} {:?} {} links {:?}",
-                record.kind(),
+                kind,
                 record.bits(),
                 record.flags(),
                 record.loc(),
-                local(record.header(file, &s.foreign_parents).parent),
+                local(record.header(kind, file, &s.foreign_parents).parent),
                 record.bind.load(Ordering::Relaxed),
                 s.nodes[index].is_some(),
                 kids.children(),
-                kids.text_name(record.kind()).as_str(),
-                kids.modifier_bits(record.kind()),
+                kids.text_name(kind).as_str(),
+                kids.modifier_bits(kind),
                 s.links.get(index),
             ));
         }
@@ -5639,7 +5682,8 @@ impl FileStore {
     /// The record of a new node slot (`alloc_store_slot_node`).
     #[inline]
     fn push_node_header(&mut self, kind: SyntaxKind, text_is_keyword: bool) {
-        self.records.push(NodeRecord::node(kind, text_is_keyword));
+        self.records.push(NodeRecord::node(text_is_keyword));
+        self.kinds.push(kind);
     }
 
     /// The kids (U1, U4) and link entries of a new node slot of kind
@@ -5688,6 +5732,7 @@ fn store_alias_id(file: usize, n: Node) -> crate::astdata::NodeId {
         }
         let index = s.records.len() as u32;
         s.records.push(NodeRecord::target(n));
+        s.kinds.push(SyntaxKind::Unknown);
         s.kids.push(NodeKids::unknown());
         s.nodes.push(None);
         s.push_no_cell();
@@ -5999,7 +6044,7 @@ mod tests {
             assert!(!is_keyword(private));
             let bits = |n: Node| {
                 let i = slot_index(n);
-                s.kids[i].modifier_bits(s.records[i].kind())
+                s.kids[i].modifier_bits(s.kinds[i])
             };
             assert_eq!(
                 bits(statement),
@@ -6672,19 +6717,17 @@ mod tests {
     #[test]
     fn high_file_ids_read_their_block_from_a_chunk() {
         let file = FILE_ID_LIMIT - 1;
-        let mut records = vec![
-            NodeRecord::target(Node::NIL),
-            NodeRecord::node(SyntaxKind::Identifier, false),
-        ];
+        let mut records = vec![NodeRecord::target(Node::NIL), NodeRecord::node(false)];
         records[1].set_flags(NodeFlags::AMBIENT);
         records[1].set_loc(TextRange::new(3, 7));
         // AST node records, step 4: the owner word (`block_is_owned`).
         *records[0].bind.get_mut() = NodeRecord::owner_word(file);
         let block = FileBlock {
+            kinds: Vec::leak(vec![SyntaxKind::Unknown, SyntaxKind::Identifier]),
             records: Vec::leak(records),
             kids: Vec::leak(vec![NodeKids::unknown(), NodeKids::unknown()]),
-            nodes: &[],
             file: Box::leak(Box::new(BlockFile {
+                nodes: &[],
                 facts: StoreFacts::ONLY_NIL_SLOT,
                 root: Node::NIL,
                 foreign: &[],
@@ -6715,8 +6758,9 @@ mod tests {
     // back, the block waits for two program releases, and then the next
     // node shell that fits it takes it. A stale read of the dead version
     // then fails the owner check: with debug assertions it panics as a read
-    // of a dead version's store does, without them it gives the new
-    // owner's data. It publishes, so no other test may build or publish
+    // of a dead version's store does, without them a record read gives the
+    // new owner's data (the kind column is not pooled; shells with equal
+    // kinds share one). It publishes, so no other test may build or publish
     // stores while it runs (the runner uses one thread).
     #[test]
     fn pooled_node_blocks_wait_two_releases_and_check_their_owner() {
@@ -6755,6 +6799,14 @@ mod tests {
         // Its block waits for two program releases.
         let (d, d_nodes) = identifiers("/pool/d.ts", &["z", "w"]);
         assert_ne!(addr(d_nodes[0]), c_block, "no release yet");
+        // Shells with equal kinds share one kind column (`shell_kinds`).
+        let kinds_of = |n: Node| {
+            registry_block(n.file_index())
+                .expect("a published store node")
+                .kinds
+                .as_ptr()
+        };
+        assert_eq!(kinds_of(d_nodes[0]), kinds_of(cy), "one kind column");
         release_file_version_pins();
         let (d1, d1_nodes) = identifiers("/pool/d1.ts", &["u", "t"]);
         assert_ne!(addr(d1_nodes[0]), c_block, "one release");
@@ -6783,8 +6835,10 @@ mod tests {
         );
         assert_eq!(frozen_store_bind_word(statement), Some(0), "not bound");
 
+        assert_ne!(kinds_of(statement), kinds_of(cy), "other kinds");
+
         // A stale read of c.
-        let stale = catch_unwind(AssertUnwindSafe(|| cy.kind()));
+        let stale = catch_unwind(AssertUnwindSafe(|| (cy.kind(), frozen_store_symbol(cy))));
         if cfg!(debug_assertions) {
             let message = stale.expect_err("a stale read of a reused block panics");
             let message = message
@@ -6793,7 +6847,12 @@ mod tests {
                 .unwrap_or_default();
             assert_eq!(message, format!("file version {c_file} is released"));
         } else {
-            assert_eq!(stale.ok(), Some(SyntaxKind::ExpressionStatement));
+            // The kind column is not pooled, so the kind is c's. The record
+            // is the one of e's statement.
+            assert_eq!(
+                stale.ok(),
+                Some((SyntaxKind::Identifier, Some(SymbolId::NIL)))
+            );
         }
 
         // A version with more slots than a free block has gets a fresh

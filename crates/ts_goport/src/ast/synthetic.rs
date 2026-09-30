@@ -737,7 +737,10 @@ fn synthetic_ast_node(n: Node) -> HeldNode {
 // index is never a store id, so checking the store tables first gives the
 // same result as the order that `static_ast_node_slow` keeps (synthetic,
 // store).
-#[inline]
+// PERF: step 4b. `inline(always)`: the node column read (`BlockFile`) is one
+// load longer since step 4, and LLVM then left it out of line at about 60
+// call sites, the binder's child walks among them.
+#[inline(always)]
 #[must_use]
 pub fn static_ast_node(n: Node) -> Option<&'static crate::astdata::Node> {
     assert!(n.is_some(), "nil node dereference");

@@ -252,30 +252,33 @@ methods reach the AST through it.
   off.
 - Store columns and the other registry tables of a published file are read
   through one file lookup, `file_block` in `ast/store.rs` (AST node records
-  step 3). Each published file id has one block (`FileBlock`: records,
-  kids, node column and a `BlockFile` with the facts, root, foreign
-  parents, links, and the store and `GoFile` of a static publish), in a
+  step 3). Each published file id has one block (`FileBlock`: kinds,
+  records, kids and a `BlockFile` with the node column, facts, root,
+  foreign parents, links, and the store and `GoFile` of a static
+  publish), in a
   static array for ids below 2^16 (`FILE_BLOCKS`, one cache line per
   entry) and in chunks made on demand above (`HIGH_BLOCKS`, a cold block
   with no call). So the first program, a later program (`tsc -b`, watch,
   an edited file) and the node shell of a freeable version read the same
   way: a hot node read is two dependent loads, and has no call. The block
   of a freeable version is its node shell (records and kids in a pooled
-  block, step 4; foreign parents leaked; no node column when its store
+  block, step 4; kinds and foreign parents leaked; no node column when its store
   owns its nodes; no link column), so its header and child reads are block
   reads, and its node
   data reads read the pinned version (`static_store_node`,
   `with_scoped_store_node`). A read of the store or the `GoFile` of a
   node shell reads the pinned version out of line
   (`with_published_store`, `try_with_go_file`); `static_go_file` gives
-  `None` there. A new per-slot column goes into a record or kids word; a
-  new per-file table goes into `BlockFile`. Keep the fast paths free of
+  `None` there. A new per-slot column goes into a record or kids word (the
+  kind column is the one exception, see "Node records"); a new per-file
+  table goes into `BlockFile`. Keep the fast paths free of
   calls: a call there made `Node::parent` go out of line (AST node records
   step 2b). A node shell has no link column, so `frozen_store_children`
   gives `None` and the caller reads the node data.
 - Node records (AST node records plan steps 1 to 4, `ast/store.rs`).
-  Each store slot has one 32-byte `NodeRecord` (kind, bits, flags, loc,
-  `up` and `bind`) and one 16-byte `NodeKids` (the U4 and C2 child ids,
+  Each store slot has one 32-byte `NodeRecord` (bits, flags, loc,
+  `up` and `bind`), a `SyntaxKind` in the kind column (`FileStore::kinds`)
+  and one 16-byte `NodeKids` (the U4 and C2 child ids,
   and a word with the U1 name of an identifier or the U1 (b) modifier
   bits of any other slot). They replace the header, kind, name, modifier
   bit, child and resolved columns. `up` of a node slot holds the parent
@@ -298,15 +301,17 @@ methods reach the AST through it.
   the halves of one word. A live bind hands its builder
   (`NodeBindBuilder`) to the install; a lib bind snapshot load hands the
   compact form (`NodeBindParts`), which the lib bind blob keeps.
-  The kind is an `AtomicU16` too (step 4), so a pooled block can take
-  another file's records through a shared ref with no `unsafe`; a read
-  converts it with a 512-entry table (`KIND_OF_RAW`, from the generated
-  `SyntaxKind::ALL`), about 3 instructions more than a plain field
-  (`goport -p` +1.3% to +2.1% instructions against step 7).
-  `SyntaxKind::try_from` is a 351-case switch until late in LLVM's
-  pipeline, so the inliner left it (with `#[inline]`) or
-  `frozen_store_kind` (with `#[inline(always)]`) out of line at thousands
-  of call sites (+3% to +7.6%). A new per-slot field of the hot reads goes into a record or kids
+  The kind is a plain `SyntaxKind` column, not a record word (step 4): a
+  pooled block takes another file's records through a shared ref, so a
+  record word must be an atomic, and safe Rust has no cheap `u16` to
+  `SyntaxKind`. An `AtomicU16` kind read through a 512-entry table cost
+  `goport -p` +1.3% to +2.1% instructions against step 7, and a
+  `transmute` of the atomic load (not allowed here) still +0.6% to
+  +1.1%; `SyntaxKind::try_from` is a 351-case switch until late in LLVM's
+  pipeline, so the inliner left it or `frozen_store_kind` out of line at
+  thousands of call sites (+3% to +7.6%). The column costs 2 bytes per
+  slot, and a node shell leaks its column unless one of the last 4 shells
+  had the same kinds (`shell_kinds`). A new per-slot field of the hot reads goes into a record or kids
   word, not a new column. Debug builds check the records and kids against
   the node data at freeze (`debug_check_kids`), and each parent write
   against its stored form.
@@ -326,9 +331,10 @@ methods reach the AST through it.
   a published record; its hot header and kids reads are not checked (a
   check is a load, a compare and a branch on reads of about 6
   instructions). So a stale header or child read of a dead version
-  (kind, parent, loc, flags, symbol, flow node, child ids, name) gives the
+  (parent, loc, flags, symbol, flow node, child ids, name) gives the
   values of that node while its block waits, and the new owner's data
-  after a reuse, never undefined behavior. Its store, `GoFile`, extras,
+  after a reuse, never undefined behavior. Its kind column is never
+  reused, so a stale kind read gives the old kind. Its store, `GoFile`, extras,
   flow, node data and list reads still panic. Every holder of a node of a
   version holds the version, so a correct reader never sees a reuse; the
   debug-assertion runs (protected tests, the corpus, and the editor and
@@ -413,7 +419,7 @@ The batch that adds it is not accepted until Theo approves.
   `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The
   registry keeps a `Weak`. At publish the version takes its `FileStore`
   and its `GoFile` (M3b). Its node records and kids (`NodeRecord`,
-  `NodeKids`; 48 bytes per node) are in its node shell, the registry
+  `NodeKids`; 48 bytes per node, and 2 in the kind column) are in its node shell, the registry
   block of its id (a pooled block, AST node records step 4), so a header or child
   read of the edited file stays inline (a pinned read per node read made
   edits 3 to 4 ms slower); the child link column is dropped, and the

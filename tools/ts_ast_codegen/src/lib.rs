@@ -355,16 +355,6 @@ impl<'a> Generator<'a> {
         writeln!(output).unwrap();
         writeln!(output, "impl SyntaxKind {{").unwrap();
         writeln!(output, "    pub const COUNT: usize = {};", self.kinds.len()).unwrap();
-        writeln!(
-            output,
-            "    /// Every kind, in value order: `ALL[kind as usize] == kind`."
-        )
-        .unwrap();
-        writeln!(output, "    pub const ALL: [Self; Self::COUNT] = [").unwrap();
-        for kind in &self.kinds {
-            writeln!(output, "        Self::{},", kind.rust_name).unwrap();
-        }
-        writeln!(output, "    ];").unwrap();
         for marker in &self.schema.kinds.markers {
             writeln!(
                 output,
