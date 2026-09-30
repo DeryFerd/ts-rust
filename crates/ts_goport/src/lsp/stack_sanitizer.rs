@@ -121,7 +121,8 @@ pub fn sanitize_stack_trace(stack: &str) -> String {
 
         let line = &line[i..];
 
-        if let Some(our_module_index) = line.find("typescript-go/internal") {
+        // Go N (migration 5f647a841a): the module path is "TypeScript/tsc/".
+        if let Some(our_module_index) = line.find("TypeScript/tsc/") {
             let line = &line[our_module_index..];
             write_sanitized_module_or_path(line, &mut result);
         } else {

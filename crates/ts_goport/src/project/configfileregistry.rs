@@ -59,7 +59,8 @@ pub struct ConfigFileEntry {
     // without releasing it. A config file entry may be acquired by a project
     // either because it is the config for that project or because it is the
     // config for a referenced project.
-    pub retaining_projects: FxHashSet<tspath::Path>,
+    // ts#64319: keyed by project ID.
+    pub retaining_projects: FxHashSet<ID>,
     // retainingOpenFiles is the set of open files that caused this config to
     // load during project collection building. This config file may or may not
     // end up being the config for the default project for these files, but
@@ -307,7 +308,7 @@ impl ConfigFileRegistry {
 #[derive(Clone, Debug, Default)]
 pub struct TestConfigEntry {
     pub file_name: String,
-    pub retaining_projects: Vec<tspath::Path>,
+    pub retaining_projects: Vec<ID>,
     pub retaining_open_files: Vec<tspath::Path>,
     pub retaining_configs: Vec<tspath::Path>,
 }

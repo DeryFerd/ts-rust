@@ -223,7 +223,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: projectlifetime_test.go:277 TestProjectLifetime/tsconfig move from subdirectory to parent via didChangeWatchedFiles
+    // Go: projectlifetime_test.go:356 TestProjectLifetime/tsconfig move from subdirectory to parent via didChangeWatchedFiles (ts#64081)
     fn tsconfig_move_from_subdirectory_to_parent_via_did_change_watched_files() {
         let tsconfig_content = r#"{
 				"compilerOptions": {
@@ -234,6 +234,7 @@ child_test! {
         let files = files(&[
             ("/home/projects/TS/p1/src/tsconfig.json", tsconfig_content),
             ("/home/projects/TS/p1/src/index.ts", "export const x = 1;"),
+            ("/home/projects/TS/p1/src/other.ts", "export const y = 2;"),
         ]);
         let (session, utils) = projecttestutil::setup(files);
 
@@ -262,9 +263,20 @@ child_test! {
                 (DELETED, "file:///home/projects/TS/p1/src/tsconfig.json"),
             ],
         );
+        session.wait_for_background_tasks();
 
-        // Should now have one configured project only (tsconfig.json now includes src/index.ts)
+        // The background update should route index.ts to the new configured project,
+        // but project cleanup is deferred until the next file open.
         let _ = language_service(&session, index_uri);
+        assert_eq!(projects_len(&session), 2);
+        assert!(has_inferred_project(&session));
+        assert_eq!(
+            default_project_config_file_name(&session, index_uri),
+            "/home/projects/TS/p1/tsconfig.json"
+        );
+
+        let other_uri = "file:///home/projects/TS/p1/src/other.ts";
+        open(&session, other_uri, "export const y = 2;");
         assert_eq!(projects_len(&session), 1);
         assert!(!has_inferred_project(&session));
         assert!(has_configured_project(&session, "/home/projects/ts/p1/tsconfig.json"));

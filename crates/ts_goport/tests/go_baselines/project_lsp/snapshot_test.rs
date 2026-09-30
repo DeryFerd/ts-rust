@@ -3,11 +3,18 @@
 
 use std::rc::{Rc, Weak};
 
+use indexmap::IndexMap;
+use rustc_hash::FxHashSet;
 use ts_goport::frontend::compiler::{self, NewProgram};
+use ts_goport::frontend::tspath::Path;
+use ts_goport::frontend::vfs::Fs;
 use ts_goport::lsp::lsproto;
+use ts_goport::options::{CompilerOptions, Tristate};
 use ts_goport::program::ls_program;
 use ts_goport::project::{
-    CompilerHost, FileChange, FileChangeKind, FileSource, ProgramUpdateKind, Session, Snapshot,
+    APICreateProgramRequest, APISnapshotRequest, CompilerHost, ConfiguredProjectID, FileChange,
+    FileChangeKind, FileChangeSummary, FileSource, ID, INFERRED_PROJECT_NAME, ProgramUpdateKind,
+    Session, Snapshot, inferred_project_id, new_synthetic_project_id, parse_configured_project_id,
 };
 
 use super::projecttestutil::{FileMap, files, with_request_id};
@@ -18,8 +25,260 @@ fn setup(files: FileMap) -> Rc<Session> {
     bare_session(files)
 }
 
+// ts#64204 removed TestSnapshot/temporary file can be added to an empty root snapshot;
+// the synthetic program tests that replace it are ported in their ts#64319 form.
+
 child_test! {
-    // Go: snapshot_test.go:38 TestSnapshot/compilerHost gets frozen with snapshot's FS only once
+    // Go: snapshot_test.go:40 TestSnapshot/creates and removes synthetic programs (ts#64204, ts#64319, ts#64391)
+    fn creates_and_removes_synthetic_programs() {
+        let session = setup(files(&[
+            ("/a.ts", "export const a = 1;"),
+            ("/b.ts", "export const b = 1;"),
+        ]));
+
+        let ctx = bg();
+        let options = Rc::new(CompilerOptions {
+            no_lib: Tristate::True,
+            ..Default::default()
+        });
+        let create_request = APISnapshotRequest {
+            create_programs: vec![
+                APICreateProgramRequest {
+                    root_file_names: vec!["/a.ts".to_string()],
+                    compiler_options: options.clone(),
+                    ..Default::default()
+                },
+                APICreateProgramRequest {
+                    root_file_names: vec!["/b.ts".to_string()],
+                    compiler_options: options.clone(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let (created_snapshot, err) = session.clone_snapshot(
+            &ctx,
+            &session.snapshot(),
+            FileChangeSummary::default(),
+            Some(&create_request),
+        );
+        assert!(err.is_none());
+        let created_programs = created_snapshot.created_programs();
+        assert_eq!(created_programs.len(), 2);
+        let first_project = created_programs[0].clone();
+        let second_project = created_programs[1].clone();
+        assert_eq!(first_project.borrow().config_file_path, Path::default());
+        assert_eq!(second_project.borrow().config_file_path, Path::default());
+
+        let (first_program_id, ok) = first_project.borrow().id().synthetic();
+        assert!(ok);
+        assert_eq!(first_program_id.0, "/dev/null/synthetic/1");
+        let remove_request = APISnapshotRequest {
+            remove_programs: Some(FxHashSet::from_iter([first_program_id])),
+            ..Default::default()
+        };
+        let (removed_snapshot, err) = session.clone_snapshot(
+            &ctx,
+            &created_snapshot,
+            FileChangeSummary::default(),
+            Some(&remove_request),
+        );
+        assert!(err.is_none());
+
+        let first_id = first_project.borrow().id();
+        let second_id = second_project.borrow().id();
+        assert_ne!(first_id, second_id);
+        assert_eq!(
+            first_project.borrow().command_line.as_ref().expect("command line").file_names(),
+            ["/a.ts"]
+        );
+        assert_eq!(
+            second_project.borrow().command_line.as_ref().expect("command line").file_names(),
+            ["/b.ts"]
+        );
+        assert!(created_snapshot.project_collection.inferred_project().is_none());
+        assert_eq!(created_snapshot.project_collection.synthetic_projects().len(), 2);
+        assert_eq!(created_snapshot.project_collection.language_service_projects().len(), 0);
+        assert_eq!(
+            created_snapshot
+                .get_language_service_projects_containing_file(&uri("file:///a.ts"))
+                .len(),
+            0
+        );
+        assert!(created_snapshot
+            .project_collection
+            .get_default_project(&created_snapshot.to_path("/a.ts"))
+            .is_none());
+        assert!(Rc::ptr_eq(
+            &created_snapshot.project_collection.get_project(&first_id).expect("first project"),
+            &first_project
+        ));
+
+        let (opened_snapshot, err) = session.clone_snapshot(
+            &ctx,
+            &created_snapshot,
+            FileChangeSummary::default(),
+            Some(&APISnapshotRequest {
+                open_files: Some(IndexMap::from_iter([(
+                    created_snapshot.to_path("/a.ts"),
+                    "/a.ts".to_string(),
+                )])),
+                ..Default::default()
+            }),
+        );
+        assert!(err.is_none());
+        let inferred_project = opened_snapshot
+            .project_collection
+            .inferred_project()
+            .expect("inferred project");
+        let (_, ok) = inferred_project.borrow().id().inferred();
+        assert!(ok);
+        assert_eq!(inferred_project.borrow().config_file_path, Path::default());
+        assert_eq!(opened_snapshot.project_collection.language_service_projects().len(), 1);
+        assert_eq!(
+            opened_snapshot
+                .get_language_service_projects_containing_file(&uri("file:///a.ts"))
+                .len(),
+            1
+        );
+        assert!(Rc::ptr_eq(
+            &opened_snapshot
+                .project_collection
+                .get_default_project(&opened_snapshot.to_path("/a.ts"))
+                .expect("default project"),
+            &inferred_project
+        ));
+        assert!(Rc::ptr_eq(
+            &opened_snapshot.project_collection.get_project(&first_id).expect("first project"),
+            &first_project
+        ));
+
+        assert!(removed_snapshot.project_collection.get_project(&first_id).is_none());
+        assert!(Rc::ptr_eq(
+            &removed_snapshot.project_collection.get_project(&second_id).expect("second project"),
+            &second_project
+        ));
+        assert_eq!(removed_snapshot.project_collection.synthetic_projects().len(), 1);
+
+        // Go: defer openedSnapshot.Deref(); defer removedSnapshot.Deref();
+        // defer createdSnapshot.Deref(); defer session.Close()
+        opened_snapshot.deref();
+        removed_snapshot.deref();
+        created_snapshot.deref();
+        session.close();
+    }
+}
+
+child_test! {
+    // Go: snapshot_test.go:123 TestSnapshot/failed API update is not adopted (ts#64204, ts#64319)
+    fn failed_api_update_is_not_adopted() {
+        let session = setup(files(&[("/a.ts", "export const a = 1;")]));
+
+        let base_snapshot = session.snapshot();
+        let (failed_snapshot, err) = session.clone_snapshot(
+            &bg(),
+            &base_snapshot,
+            FileChangeSummary::default(),
+            Some(&APISnapshotRequest {
+                remove_programs: Some(FxHashSet::from_iter([new_synthetic_project_id(1)])),
+                ..Default::default()
+            }),
+        );
+
+        let err = err.expect("error");
+        assert!(err.error().contains("synthetic program not found for removal"), "{}", err.error());
+        assert!(Rc::ptr_eq(&session.snapshot(), &base_snapshot));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = session.clone_snapshot(
+                &bg(),
+                &failed_snapshot,
+                FileChangeSummary::default(),
+                None,
+            );
+        }))
+        .is_err();
+        assert!(panicked);
+
+        // Go: defer failedSnapshot.Deref(); defer session.Close()
+        failed_snapshot.deref();
+        session.close();
+    }
+}
+
+child_test! {
+    // Go: snapshot_test.go:152 TestSnapshot/failed API update preserves flushed host changes (ts#64204, ts#64319)
+    fn failed_api_update_preserves_flushed_host_changes() {
+        let session = setup(files(&[("/a.ts", "export const a = 1;")]));
+
+        let base_snapshot = session.snapshot();
+        session.pending_file_changes.borrow_mut().push(FileChange {
+            kind: FileChangeKind::WATCH_CHANGE,
+            uri: uri("file:///a.ts"),
+            ..Default::default()
+        });
+        let result = session.api_update(
+            &bg(),
+            FileChangeSummary::default(),
+            Some(&APISnapshotRequest {
+                remove_programs: Some(FxHashSet::from_iter([new_synthetic_project_id(1)])),
+                ..Default::default()
+            }),
+        );
+
+        // Go: failedSnapshot == nil (an error result has no snapshot)
+        let Err(err) = result else {
+            panic!("expected an error");
+        };
+        assert!(err.error().contains("synthetic program not found for removal"), "{}", err.error());
+        assert!(!Rc::ptr_eq(&session.snapshot(), &base_snapshot));
+        session.close();
+    }
+}
+
+// Go: snapshot_test.go:429 TestProjectIDNarrowing (ts#64319)
+#[test]
+fn test_project_id_narrowing() {
+    let configured = ID("/project/tsconfig.json".to_string());
+    let (configured_id, ok) = configured.configured();
+    assert!(ok);
+    assert_eq!(
+        configured_id,
+        ConfiguredProjectID(Path("/project/tsconfig.json".to_string()))
+    );
+    let (_, ok) = configured.inferred();
+    assert!(!ok);
+    let (_, ok) = configured.synthetic();
+    assert!(!ok);
+
+    let inferred = inferred_project_id().as_id();
+    let (inferred_id, ok) = inferred.inferred();
+    assert!(ok);
+    assert_eq!(inferred_id, inferred_project_id());
+    let (_, ok) = inferred.configured();
+    assert!(!ok);
+
+    let synthetic = new_synthetic_project_id(1).as_id();
+    let (synthetic_id, ok) = synthetic.synthetic();
+    assert!(ok);
+    assert_eq!(synthetic_id, new_synthetic_project_id(1));
+    let (_, ok) = synthetic.configured();
+    assert!(!ok);
+
+    let (canonical_synthetic_id, ok) = ID("/dev/null/synthetic/01".to_string()).synthetic();
+    assert!(ok);
+    assert_eq!(canonical_synthetic_id, new_synthetic_project_id(1));
+
+    let (_, ok) = ID("/dev/null/synthetic/invalid".to_string()).configured();
+    assert!(ok);
+
+    let (_, ok) = parse_configured_project_id(&Path(INFERRED_PROJECT_NAME.to_string()));
+    assert!(!ok);
+    let (_, ok) = parse_configured_project_id(&Path(new_synthetic_project_id(1).0));
+    assert!(!ok);
+}
+
+child_test! {
+    // Go: snapshot_test.go:52 TestSnapshot/compilerHost gets frozen with snapshot's FS only once
     fn compiler_host_gets_frozen_with_snapshots_fs_only_once() {
         let session = setup(files(&[
             ("/home/projects/TS/p1/tsconfig.json", "{}"),
@@ -70,8 +329,8 @@ child_test! {
         let snapshot_before = session.snapshot();
 
         // a.ts and b.ts are cached
-        assert!(snapshot_before.fs.disk_files.contains_key(&path("/home/projects/ts/p1/a.ts")));
-        assert!(snapshot_before.fs.disk_files.contains_key(&path("/home/projects/ts/p2/b.ts")));
+        assert!(snapshot_before.fs.cache_files.contains_key(&path("/home/projects/ts/p1/a.ts")));
+        assert!(snapshot_before.fs.cache_files.contains_key(&path("/home/projects/ts/p2/b.ts")));
 
         // Close p1's only open file
         close(&session, "file:///home/projects/TS/p1/index.ts");
@@ -80,8 +339,8 @@ child_test! {
         let snapshot_after = session.snapshot();
 
         // a.ts is cleaned up, b.ts is still cached
-        assert!(!snapshot_after.fs.disk_files.contains_key(&path("/home/projects/ts/p1/a.ts")));
-        assert!(snapshot_after.fs.disk_files.contains_key(&path("/home/projects/ts/p2/b.ts")));
+        assert!(!snapshot_after.fs.cache_files.contains_key(&path("/home/projects/ts/p1/a.ts")));
+        assert!(snapshot_after.fs.cache_files.contains_key(&path("/home/projects/ts/p2/b.ts")));
     }
 }
 
@@ -186,11 +445,13 @@ child_test! {
         open(&session, other_uri, "export const other = 1;");
         let _ = language_service(&session, pkg_uri);
 
-        session
-            .fs
-            .fs
-            .write_file("/project/node_modules/pkg/package.json", r#"{ "type": "module" }"#)
-            .unwrap();
+        // ts#64291: Go `session.fs.WriteFile` (the overlay file system).
+        Fs::write_file(
+            &*session.fs,
+            "/project/node_modules/pkg/package.json",
+            r#"{ "type": "module" }"#,
+        )
+        .unwrap();
         session.did_change_file(
             &bg(),
             &uri(pkg_uri),
@@ -220,14 +481,20 @@ child_test! {
         let _ = language_service(&session, index_uri);
 
         let base_snapshot = session.snapshot();
-        let prepared_snapshot =
-            session.get_snapshot_with_auto_imports(&ctx, &base_snapshot, &uri(index_uri));
+        // ts#64163
+        let prepared_snapshot = session.snapshot_host.clone_snapshot_with_auto_imports(
+            &ctx,
+            &base_snapshot,
+            &uri(index_uri),
+            None,
+        );
+        session.try_adopt_snapshot_in_background(&base_snapshot, &prepared_snapshot);
 
         session.wait_for_background_tasks();
         assert!(Rc::ptr_eq(&session.snapshot(), &prepared_snapshot));
 
-        // Go: defer preparedSnapshot.Deref(session); t.Cleanup(session.Close)
-        Snapshot::deref(&prepared_snapshot, &session);
+        // Go: defer preparedSnapshot.Deref(); t.Cleanup(session.Close)
+        prepared_snapshot.deref();
         session.close();
     }
 }
@@ -277,11 +544,7 @@ child_test! {
 
         // A watch change that reflects an actual content change on disk must still
         // rebuild the program.
-        session
-            .fs
-            .fs
-            .write_file("/home/projects/TS/p1/a.ts", "export const a = 2;")
-            .unwrap();
+        Fs::write_file(&*session.fs, "/home/projects/TS/p1/a.ts", "export const a = 2;").unwrap();
         session.pending_file_changes.borrow_mut().push(FileChange {
             kind: FileChangeKind::WATCH_CHANGE,
             uri: uri("file:///home/projects/TS/p1/a.ts"),

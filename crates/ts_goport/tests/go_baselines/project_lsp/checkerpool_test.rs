@@ -685,7 +685,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: checkerpool_test.go:1158 TestCheckerPoolTakeNewGlobalDiagnostics
+    // Go: checkerpool_test.go:1151 TestCheckerPoolTakeNewGlobalDiagnostics (ts#64452: the diagnostics checker)
     fn take_new_global_diagnostics() {
         let (_session, pool) = setup_checker_pool_session(opts(4, 10));
 
@@ -693,7 +693,7 @@ child_test! {
         assert!(!pool.take_new_global_diagnostics(), "should report no new globals initially");
 
         // Use a checker and trigger diagnostics, then release to run the merge.
-        let ctx = req(&bg(), "global-diag-req", CheckerLifetime::TEMPORARY);
+        let ctx = req(&bg(), "global-diag-req", CheckerLifetime::DIAGNOSTICS);
         let source_file = pool.program.get_source_file("/src/index.ts").expect("source file").root;
         {
             let _guard = ts_goport::program::ls_program::enter(&pool.program);
@@ -702,7 +702,11 @@ child_test! {
             release.call();
         }
 
-        let _first_take = pool.take_new_global_diagnostics();
+        assert!(
+            pool.take_new_global_diagnostics(),
+            "diagnostics checker should publish missing-lib globals"
+        );
+
         // After taking, a second call should always return false (flag is reset).
         assert!(
             !pool.take_new_global_diagnostics(),
@@ -710,7 +714,7 @@ child_test! {
         );
 
         // Releasing the same checker again with the same state should not set the flag.
-        let ctx2 = req(&bg(), "global-diag-req-2", CheckerLifetime::TEMPORARY);
+        let ctx2 = req(&bg(), "global-diag-req-2", CheckerLifetime::DIAGNOSTICS);
         {
             let _guard = ts_goport::program::ls_program::enter(&pool.program);
             let (c2, release2) = pool.get_checker(&ctx2, source_file);

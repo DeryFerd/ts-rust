@@ -122,22 +122,23 @@ pub struct SessionInit {
 // `scheduledSnapshotUpdateMu`, `userConfigRWMu`, `pendingFileChangesMu`,
 // `pendingATAChangesMu`, `diagnosticsRefreshMu`, `warmAutoImportMu`,
 // `idleCacheCleanMu`) are dropped. Go `atomic.*` fields are `Cell`.
+// PORT: Go embeds `*SnapshotHost` (ts#64163); here it is the field
+// `snapshot_host`, and `Session` derefs to it, so the host's fields and
+// methods are promoted as in Go. A `Session` method with the same name
+// (`fs`, `get_current_directory`, `close`) wins, as in Go.
 pub struct Session {
-    pub background_ctx: Context,
+    pub snapshot_host: Rc<SnapshotHost>,
     pub options: Rc<SessionOptions>,
-    pub start_time: Instant,
+    pub logger: Option<Rc<dyn logging::Logger>>,
+    pub background_ctx: Context,
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     pub client: Option<Rc<dyn Client>>,
-    pub logger: Option<Rc<dyn logging::Logger>>,
+    pub start_time: Instant,
     pub npm_executor: Option<Rc<dyn ata::NpmExecutor>>,
-    // contentMapperHost drives configured content mappers for all projects in the session. It is nil unless
-    // the workspace is trusted (RunExternalCode) and a spawner is available. It is shared so
-    // projects that use the same mapper share a single process, and is closed when the session ends.
-    pub content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
+    pub fs: Rc<OverlayFS>,
     // contentMapperTimings is the cumulative host snapshot at the most recent session snapshot adoption.
     // PORT: `contentMapperTimingsMu` is dropped (one thread).
     pub content_mapper_timings: RefCell<contentmapper::Timings>,
-    pub fs: Rc<OverlayFS>,
 
     // registeredContentMapperSnapshotID is the ID of the newest snapshot whose registration has been
     // applied. Registration runs from background tasks that may finish out of order, so
@@ -146,22 +147,6 @@ pub struct Session {
     // PORT: `contentMapperRegistrationMu` is dropped (one thread).
     pub registered_content_mapper_extensions: RefCell<Vec<String>>,
     pub registered_content_mapper_snapshot_id: Cell<u64>,
-
-    // parseCache is the ref-counted cache of source files used when
-    // creating programs during snapshot cloning.
-    pub parse_cache: Rc<ParseCache>,
-    pub content_mapped_parse_cache: Rc<ContentMappedParseCache>,
-    // PORT: the parse cache references that auto-import registry clones
-    // keep after the clone, one per path (see
-    // `AutoImportRegistryCloneHost::dispose`). No Go counterpart.
-    pub auto_import_parse_keys: Rc<AutoImportParseKeys>,
-    // extendedConfigCache is the ref-counted cache of tsconfig ASTs
-    // that are used in the "extends" of another tsconfig.
-    pub extended_config_cache: Rc<ExtendedConfigCache>,
-    // programCounter counts how many snapshots reference a program.
-    // When a program is no longer referenced, its source files are
-    // released from the parseCache.
-    pub program_counter: Rc<ProgramCounter>,
 
     // read-only after initialization
     pub initial_user_preferences: RefCell<lsutil::UserPreferences>,
@@ -173,11 +158,6 @@ pub struct Session {
     // so the pair is a reference cycle that lives as long as the process.
     pub typings_installer: RefCell<Option<Rc<ata::TypingsInstaller>>>,
     pub background_queue: Rc<background::Queue>,
-
-    // snapshotID is the counter for snapshot IDs. It does not necessarily
-    // equal the `snapshot.ID`. It is stored on Session instead of globally
-    // so IDs are predictable in tests.
-    pub snapshot_id: Cell<u64>,
 
     // snapshot is the current immutable state of all projects.
     pub snapshot: RefCell<Rc<Snapshot>>,
@@ -196,7 +176,7 @@ pub struct Session {
 
     // pendingATAChanges are produced by Automatic Type Acquisition (ATA)
     // installations and applied to the next snapshot update.
-    pub pending_ata_changes: RefCell<FxHashMap<tspath::Path, Rc<ATAStateChange>>>,
+    pub pending_ata_changes: RefCell<FxHashMap<ID, Rc<ATAStateChange>>>,
 
     // diagnosticsRefreshCancel is the cancelation function for a scheduled
     // diagnostics refresh. Diagnostics refreshes are scheduled and debounced
@@ -229,7 +209,7 @@ pub struct Session {
     pub performance_telemetry_cancel: RefCell<Option<gostd::context::CancelFunc>>,
 
     // seenProjects tracks projects that have already had telemetry sent.
-    pub seen_projects: RefCell<FxHashSet<tspath::Path>>,
+    pub seen_projects: RefCell<FxHashSet<ID>>,
 
     // watches tracks the current watch globs and how many individual WatchedFiles
     // are using each glob.
@@ -264,106 +244,49 @@ pub fn new_content_mapper_host(init: &SessionInit) -> Option<Rc<dyn contentmappe
     ))
 }
 
-// Go: project/session.go:180 NewSession
+// Go: project/session.go:210 NewSession
 pub fn new_session(init: &SessionInit) -> Rc<Session> {
     // Not in Go: a process with a session is a language server or API
     // process, which frees the file versions it publishes again
     // (`ast::free_file_versions`).
     crate::ast::set_editor_process();
-    let current_directory = init.options.current_directory.clone();
-    let use_case_sensitive_file_names = init.fs.use_case_sensitive_file_names();
-    let to_path: Rc<dyn Fn(&str) -> tspath::Path> = Rc::new(move |file_name: &str| {
-        tspath::to_path(file_name, &current_directory, use_case_sensitive_file_names)
-    });
-    let overlay_fs = new_overlay_fs(
-        init.fs.clone(),
-        IndexMap::default(),
-        init.options.position_encoding.clone(),
-        to_path.clone(),
-    );
-    let mut parse_cache = init.parse_cache.clone();
-    if parse_cache.is_none() {
-        parse_cache = Some(new_parse_cache(RefCountCacheOptions::default()));
-    }
-    let mut content_mapped_parse_cache = init.content_mapped_parse_cache.clone();
-    if content_mapped_parse_cache.is_none() {
-        content_mapped_parse_cache = Some(new_content_mapped_parse_cache(
-            RefCountCacheOptions::default(),
-        ));
-    }
-    let extended_config_cache = new_extended_config_cache();
-
+    let snapshot_host = new_snapshot_host(init);
     let mut session_logger = init.logger.clone();
     if session_logger.is_none() {
         session_logger = logging::new_nop_logger();
     }
     let session = Rc::new(Session {
-        background_ctx: init.background_ctx.clone(),
+        snapshot_host: snapshot_host.clone(),
         options: init.options.clone(),
-        to_path: to_path.clone(),
-        client: init.client.clone(),
         logger: session_logger,
+        background_ctx: init.background_ctx.clone(),
+        to_path: snapshot_host.to_path.clone(),
+        client: init.client.clone(),
         npm_executor: init.npm_executor.clone(),
-        content_mapper_host: new_content_mapper_host(init),
+        fs: new_overlay_fs(
+            snapshot_host.fs.clone(),
+            IndexMap::default(),
+            init.options.position_encoding.clone(),
+            snapshot_host.to_path.clone(),
+        ),
         content_mapper_timings: RefCell::new(contentmapper::Timings::default()),
-        fs: overlay_fs,
         registered_content_mapper_extensions: RefCell::new(Vec::new()),
         registered_content_mapper_snapshot_id: Cell::new(0),
-        parse_cache: parse_cache.expect(NIL_DEREF),
-        content_mapped_parse_cache: content_mapped_parse_cache.expect(NIL_DEREF),
-        auto_import_parse_keys: Rc::new(RefCell::new(FxHashMap::default())),
-        extended_config_cache,
-        program_counter: Rc::new(ProgramCounter::default()),
         background_queue: background::new_queue(),
         start_time: Instant::now(),
-        snapshot: RefCell::new(new_snapshot(
-            0_u64,
-            Rc::new(SnapshotFS {
-                to_path: to_path.clone(),
-                fs: init.fs.clone(),
-                overlays: IndexMap::default(),
-                overlay_directories: FxHashMap::default(),
-                disk_files: Rc::new(FxHashMap::default()),
-                disk_directories: Rc::new(FxHashMap::default()),
-                read_files: RefCell::new(FxHashMap::default()),
-                node_modules_realpath_aliases: Rc::new(FxHashMap::default()),
-            }),
-            init.options.clone(),
-            Rc::new(ConfigFileRegistry::default()),
-            None,
-            lsutil::new_default_user_preferences(),
-            None,
-            Some(new_watched_files::<FxHashMap<tspath::Path, String>>(
-                "auto-import",
-                lsproto::WatchKind(
-                    lsproto::WatchKind::CREATE.0
-                        | lsproto::WatchKind::CHANGE.0
-                        | lsproto::WatchKind::DELETE.0,
-                ),
+        snapshot: RefCell::new(
+            snapshot_host.new_root_snapshot(
+                0,
                 lsproto::get_client_capabilities(&init.background_ctx)
                     .workspace
                     .did_change_watched_files
                     .relative_pattern_support,
-                Rc::new(|node_modules_dirs: &FxHashMap<tspath::Path, String>| {
-                    let mut patterns: Vec<String> = Vec::with_capacity(node_modules_dirs.len());
-                    // PORT: Go map order is random; the patterns are sorted below.
-                    for dir in node_modules_dirs.values() {
-                        patterns.push(get_recursive_glob_pattern(dir));
-                    }
-                    patterns.sort();
-                    PatternsAndIgnored {
-                        patterns_inside_workspace: patterns,
-                        ..Default::default()
-                    }
-                }),
-            )),
-            to_path,
-        )),
+            ),
+        ),
         initial_user_preferences: RefCell::new(lsutil::new_default_user_preferences()),
         workspace_user_preferences: RefCell::new(lsutil::new_default_user_preferences()),
         compiler_options_for_inferred_projects: RefCell::new(None),
         typings_installer: RefCell::new(None),
-        snapshot_id: Cell::new(0),
         scheduled_snapshot_update_cancel: RefCell::new(None),
         scheduled_snapshot_update_generation: Cell::new(0),
         pending_user_config_changes: Cell::new(false),
@@ -392,20 +315,29 @@ pub fn new_session(init: &SessionInit) -> Rc<Session> {
         );
         *session.typings_installer.borrow_mut() = Some(typings_installer);
     }
-    if let Some(content_mapper_host) = &session.content_mapper_host {
+    if let Some(content_mapper_host) = &snapshot_host.content_mapper_host {
         *session.content_mapper_timings.borrow_mut() = content_mapper_host.timings();
     }
 
     session
 }
 
+// PORT: Go `Session` embeds `*SnapshotHost` (ts#64163).
+impl std::ops::Deref for Session {
+    type Target = SnapshotHost;
+
+    fn deref(&self) -> &SnapshotHost {
+        &self.snapshot_host
+    }
+}
+
 // PORT: Go `FS()` and `GetCurrentDirectory()` implement
 // `module.ResolutionHost`, whose Rust form returns borrowed values. The
 // inherent methods keep the Go results for other callers (api session).
 impl crate::frontend::module::ResolutionHost for Session {
-    // Go: project/session.go:255 FS
+    // Go: project/session.go:251 FS (ts#64291: the overlay file system)
     fn fs(&self) -> &dyn vfs::Fs {
-        &*self.fs.fs
+        &*self.fs
     }
 
     // Go: project/session.go:260 GetCurrentDirectory
@@ -427,10 +359,10 @@ impl ata::NpmExecutor for Session {
 }
 
 impl Session {
-    // Go: project/session.go:255 FS
+    // Go: project/session.go:251 FS
     // FS implements module.ResolutionHost
     pub fn fs(&self) -> Rc<dyn vfs::Fs> {
-        self.fs.fs.clone()
+        self.fs.clone()
     }
 
     // Go: project/session.go:260 GetCurrentDirectory
@@ -439,19 +371,24 @@ impl Session {
         self.options.current_directory.clone()
     }
 
+    // Go: project/session.go:260 DefaultLibraryPath (ts#64158)
+    pub fn default_library_path(&self) -> String {
+        self.options.default_library_path.clone()
+    }
+
     // Go: project/session.go:265 Config
     // Gets copy of current configuration
     pub fn config(&self) -> lsutil::UserPreferences {
         self.workspace_user_preferences.borrow().clone()
     }
 
-    // Go: project/session.go:330 backgroundContext
+    // Go: project/session.go:267 backgroundContext
     fn background_context(&self) -> Context {
         self.with_current_locale(&self.background_ctx)
     }
 
-    // Go: project/session.go:334 withCurrentLocale
-    fn with_current_locale(&self, ctx: &Context) -> Context {
+    // Go: project/session.go:271 WithCurrentLocale (exported by ts#64163)
+    pub fn with_current_locale(&self, ctx: &Context) -> Context {
         let Some(client) = &self.client else {
             return ctx.clone();
         };
@@ -686,10 +623,11 @@ impl Session {
                     // For creations/changes, we can check the file system.
                     // For deletions, consult the current snapshot cache to avoid treating extensionless file deletions as relevant.
                     if kind != FileChangeKind::WATCH_DELETE {
-                        has_relevant_change = self.fs.fs.directory_exists(&file_name);
+                        has_relevant_change = vfs::Fs::directory_exists(&*self.fs, &file_name);
                     } else {
                         let snapshot = self.snapshot.borrow().clone();
-                        if snapshot.fs.disk_directories.contains_key(&path)
+                        if snapshot.fs.cache_directories.contains_key(&path)
+                            || snapshot.has_overlay_within(&path)
                             || is_node_modules_path(&path)
                         {
                             has_relevant_change = true;
@@ -731,7 +669,7 @@ impl Session {
         *self.compiler_options_for_inferred_projects.borrow_mut() = options.clone();
         self.update_snapshot_exported(
             ctx,
-            self.fs.overlays(),
+            (*self.fs.overlays()).clone(),
             SnapshotChange {
                 reason: UpdateReason::DID_CHANGE_COMPILER_OPTIONS_FOR_INFERRED_PROJECTS,
                 compiler_options_for_inferred_projects: options,
@@ -1050,7 +988,7 @@ impl Session {
                         file_changes,
                         ata_changes,
                         new_config,
-                        clean_disk_cache: true,
+                        clean_file_cache: true,
                         ..Default::default()
                     },
                 );
@@ -1296,11 +1234,11 @@ impl Session {
         metrics_read(&mut samples);
 
         let mut measurements = lsproto::PerformanceStatsTelemetryMeasurements {
-            open_file_count: snapshot.fs.overlays.len() as f64,
+            open_file_count: snapshot.overlays().len() as f64,
             uptime_seconds: self.start_time.elapsed().as_secs_f64(),
             project_count: snapshot.project_collection.projects().len() as f64,
             config_count: snapshot.config_file_registry.configs.len() as f64,
-            cached_disk_file_count: snapshot.fs.disk_files.len() as f64,
+            cached_disk_file_count: snapshot.fs.cache_files.len() as f64,
             ..Default::default()
         };
 
@@ -1396,13 +1334,13 @@ impl Session {
         }
         let ctx = self.background_context();
         crate::frontend::core_ls_ext::diff_ordered_maps(
-            &old_snapshot.project_collection.projects_by_path(),
-            &new_snapshot.project_collection.projects_by_path(),
-            |_: &tspath::Path, added_project| {
+            &old_snapshot.project_collection.projects_by_id(),
+            &new_snapshot.project_collection.projects_by_id(),
+            |_: &ID, added_project| {
                 self.send_project_info_telemetry(&ctx, added_project);
             },
-            |_: &tspath::Path, _| {},
-            |_: &tspath::Path, _, _| {},
+            |_: &ID, _| {},
+            |_: &ID, _, _| {},
         );
     }
 
@@ -1412,11 +1350,7 @@ impl Session {
             return;
         }
         let project = project.borrow();
-        if self
-            .seen_projects
-            .borrow()
-            .contains(&project.config_file_path)
-        {
+        if self.seen_projects.borrow().contains(&project.id()) {
             return;
         }
 
@@ -1440,9 +1374,7 @@ impl Session {
             return;
         }
 
-        self.seen_projects
-            .borrow_mut()
-            .insert(project.config_file_path.clone());
+        self.seen_projects.borrow_mut().insert(project.id());
     }
 
     // Go: project/session.go:774 collectProjectInfoTelemetry
@@ -1456,7 +1388,7 @@ impl Session {
 
         let mut config_file_name = "other".to_string();
         if project.kind == Kind::CONFIGURED {
-            let base_name = tspath::get_base_file_name(&project.config_file_name);
+            let base_name = tspath::get_base_file_name(&project.config_file_name());
             if base_name == "tsconfig.json" || base_name == "jsconfig.json" {
                 config_file_name = base_name;
             }
@@ -1666,19 +1598,22 @@ impl Session {
         if update_snapshot {
             // If there are pending file changes, we need to update the snapshot.
             // Sending the requested URI ensures that the project for this URI is loaded.
-            return self.update_snapshot(
-                ctx,
-                overlays,
-                SnapshotChange {
-                    reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_PENDING_CHANGES,
-                    file_changes,
-                    ata_changes,
-                    new_config,
-                    resource_request: request,
-                    ..Default::default()
-                },
-                caller_ref,
-            );
+            return self
+                .update_snapshot(
+                    ctx,
+                    overlays,
+                    SnapshotChange {
+                        reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_PENDING_CHANGES,
+                        file_changes,
+                        ata_changes,
+                        new_config,
+                        resource_request: request,
+                        ..Default::default()
+                    },
+                    caller_ref,
+                )
+                // PORT: no API request here, so the result is never nil (ts#64204).
+                .expect("updateSnapshot without an API request returns the snapshot");
         }
         // If there are no pending file changes, we can try to use the current snapshot.
         let snapshot = self.snapshot.borrow().clone();
@@ -1704,7 +1639,7 @@ impl Session {
             }
             if update_reason == UpdateReason::UNKNOWN {
                 for document in &request.configured_project_documents {
-                    if snapshot.fs.is_open_file(&document.file_name()) {
+                    if snapshot.is_open_file(&document.file_name()) {
                         match snapshot.get_default_project(document) {
                             None => {
                                 update_reason =
@@ -1740,6 +1675,8 @@ impl Session {
             },
             caller_ref,
         )
+        // PORT: no API request here, so the result is never nil (ts#64204).
+        .expect("updateSnapshot without an API request returns the snapshot")
     }
 
     // Go: project/session.go:975 getSnapshotAndDefaultProject
@@ -1763,7 +1700,7 @@ impl Session {
         let Some(project) = snapshot.get_default_project(uri) else {
             // tsgo#4712
             if caller_ref {
-                Snapshot::deref(&snapshot, self);
+                snapshot.deref();
             }
             if let Some(file) = snapshot.get_file(&uri.file_name())
                 && file.kind() == ScriptKind::UNKNOWN
@@ -1785,7 +1722,7 @@ impl Session {
         let language_service = {
             let p = project.borrow();
             ls::new_language_service(
-                p.config_file_path.clone(),
+                p.id().as_auto_import_project_id(),
                 p.program.clone().expect(NIL_DEREF),
                 snapshot.clone(),
                 &uri.file_name(),
@@ -1822,7 +1759,7 @@ impl Session {
         let (snapshot, project, default_ls) =
             self.get_snapshot_and_default_project(ctx, uri, false /*callerRef*/)?;
         // !!! TODO: sheetal:  Get other projects that contain the file with symlink
-        let all_projects = snapshot.get_projects_containing_file(uri);
+        let all_projects = snapshot.get_language_service_projects_containing_file(uri);
         Ok((project, default_ls, all_projects))
     }
 
@@ -1842,7 +1779,7 @@ impl Session {
         );
 
         // !!! TODO: sheetal:  Get other projects that contain the file with symlink
-        let all_projects = snapshot.get_projects_containing_file(uri);
+        let all_projects = snapshot.get_language_service_projects_containing_file(uri);
         Ok(all_projects)
     }
 
@@ -1872,7 +1809,7 @@ impl Session {
             active_file = uris[0].file_name();
         }
 
-        let projects = snapshot.project_collection.projects();
+        let projects = snapshot.project_collection.language_service_projects();
         let mut services: Vec<ls::LanguageService> = Vec::with_capacity(projects.len());
         for project in &projects {
             let project = project.borrow();
@@ -1881,7 +1818,7 @@ impl Session {
             };
 
             services.push(ls::new_language_service(
-                project.config_file_path.clone(),
+                project.id().as_auto_import_project_id(),
                 program,
                 snapshot.clone(),
                 &active_file,
@@ -1903,22 +1840,20 @@ impl Session {
         let snapshot = self.get_snapshot(
             ctx,
             ResourceRequest {
-                projects: vec![project.id()],
+                projects: vec![ID(project.id())],
                 ..Default::default()
             },
             false, /*callerRef*/
         );
         // Ensure we have updated project
-        let project = snapshot
-            .project_collection
-            .get_project_by_path(&project.id())?;
+        let project = snapshot.project_collection.get_project(&ID(project.id()))?;
         let project = project.borrow();
         // if program doesnt contain this file any more ignore it
         if !project.has_file(&uri.file_name()) {
             return None;
         }
         Some(ls::new_language_service(
-            project.config_file_path.clone(),
+            project.id().as_auto_import_project_id(),
             project.program.clone().expect(NIL_DEREF),
             snapshot.clone(),
             &uri.file_name(),
@@ -1948,8 +1883,8 @@ impl Session {
             true, /*callerRef*/
         );
         fn_(&snapshot);
-        // Go: defer snapshot.Deref(s)
-        Snapshot::deref(&snapshot, self);
+        // Go: defer snapshot.Deref()
+        snapshot.deref();
     }
 
     // Go: project/session.go:1279 WithSnapshotForDocument
@@ -1968,8 +1903,8 @@ impl Session {
             true, /*callerRef*/
         );
         fn_(&snapshot);
-        // Go: defer snapshot.Deref(s)
-        Snapshot::deref(&snapshot, self);
+        // Go: defer snapshot.Deref()
+        snapshot.deref();
     }
 
     // Go: project/session.go:1083 GetCurrentLanguageServiceWithAutoImports
@@ -2000,7 +1935,7 @@ impl Session {
         };
         let project = project.borrow();
         Ok(ls::new_language_service(
-            project.config_file_path.clone(),
+            project.id().as_auto_import_project_id(),
             project.program.clone().expect(NIL_DEREF),
             snapshot.clone(),
             &uri.file_name(),
@@ -2036,24 +1971,23 @@ impl Session {
         let async_work = match async_work {
             Ok(Some(async_work)) => async_work,
             Ok(None) => {
-                Snapshot::deref(&snapshot, self);
+                snapshot.deref();
                 return Ok(None);
             }
             Err(err) => {
-                Snapshot::deref(&snapshot, self);
+                snapshot.deref();
                 return Err(err);
             }
         };
-        let s = self.clone();
         Ok(Some(Box::new(move || {
             let result = async_work();
-            // Go: defer snapshot.Deref(s)
-            Snapshot::deref(&snapshot, &s);
+            // Go: defer snapshot.Deref()
+            snapshot.deref();
             result
         })))
     }
 
-    // Go: project/session.go:1344 GetLanguageServiceWithAutoImports
+    // Go: project/session.go:1281 GetLanguageServiceWithAutoImports
     // GetLanguageServiceWithAutoImports clones the given snapshot with auto-import
     // preparation for the given URI, without flushing pending file changes.
     // The cloned snapshot will be adopted as the session's current snapshot in the background
@@ -2065,72 +1999,30 @@ impl Session {
         uri: &lsproto::DocumentUri,
     ) -> Result<ls::LanguageService, GoError> {
         let new_snapshot =
-            self.clone_with_auto_imports(ctx, base_snapshot, uri, false /*callerRef*/);
+            self.clone_snapshot_with_auto_imports(ctx, base_snapshot, uri, Some(&self.logger));
         let Some(project) = new_snapshot.get_default_project(uri) else {
             // Clone's initial ref (1) is released since we won't use this snapshot.
-            Snapshot::deref(&new_snapshot, self);
+            new_snapshot.deref();
             return Err(gostd::errors::errorf(
                 format!("no project found for URI {}", uri),
                 vec![],
             ));
         };
 
-        self.adopt_snapshot_change_in_background(base_snapshot, &new_snapshot);
+        self.try_adopt_snapshot_change_in_background(base_snapshot, &new_snapshot);
 
         let project = project.borrow();
         Ok(ls::new_language_service(
-            project.config_file_path.clone(),
+            project.id().as_auto_import_project_id(),
             project.program.clone().expect(NIL_DEREF),
             new_snapshot.clone(),
             &uri.file_name(),
         ))
     }
 
-    // Go: project/session.go:1363 GetSnapshotWithAutoImports
-    // GetSnapshotWithAutoImports clones the given snapshot with auto-import
-    // preparation for the given URI, without flushing pending file changes.
-    // The returned snapshot is ref'd for the caller, which must call Deref when done.
-    // The cloned snapshot will also be adopted as the session's current snapshot in
-    // the background if other changes haven't been adopted in the meantime.
-    pub fn get_snapshot_with_auto_imports(
-        self: &Rc<Self>,
-        ctx: &Context,
-        base_snapshot: &Rc<Snapshot>,
-        uri: &lsproto::DocumentUri,
-    ) -> Rc<Snapshot> {
-        let new_snapshot =
-            self.clone_with_auto_imports(ctx, base_snapshot, uri, true /*callerRef*/);
-        self.adopt_snapshot_change_in_background(base_snapshot, &new_snapshot);
-        new_snapshot
-    }
-
-    // Go: project/session.go:1369 cloneWithAutoImports
-    fn clone_with_auto_imports(
-        self: &Rc<Self>,
-        ctx: &Context,
-        base_snapshot: &Rc<Snapshot>,
-        uri: &lsproto::DocumentUri,
-        caller_ref: bool,
-    ) -> Rc<Snapshot> {
-        let change = SnapshotChange {
-            reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
-            resource_request: ResourceRequest {
-                documents: vec![uri.clone()],
-                auto_imports: uri.clone(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let new_snapshot =
-            Snapshot::clone_(base_snapshot, ctx, change, &base_snapshot.fs.overlays, self);
-        if caller_ref {
-            new_snapshot.ref_();
-        }
-        new_snapshot
-    }
-
-    // Go: project/session.go:1384 adoptSnapshotChangeInBackground
-    fn adopt_snapshot_change_in_background(
+    // Go: project/session.go:1295 tryAdoptSnapshotChangeInBackground
+    // PORT: renamed from `adoptSnapshotChangeInBackground` by ts#64163.
+    pub fn try_adopt_snapshot_change_in_background(
         self: &Rc<Self>,
         base_snapshot: &Rc<Snapshot>,
         new_snapshot: &Rc<Snapshot>,
@@ -2162,14 +2054,16 @@ impl Session {
             // Session hasn't moved on; adopt the new snapshot. The clone's initial
             // ref is transferred to become the session's ref for its current snapshot.
             *self.snapshot.borrow_mut() = new_snapshot.clone();
-            Snapshot::deref(&old_snapshot, self);
+            old_snapshot.deref();
             let content_mapper_timings = self.take_content_mapper_timing_delta();
             if self.options.logging_enabled {
                 self.logger.logf(&format!(
                     "Adopted snapshot {} (parent {}) as current session snapshot (replacing {})",
                     new_snapshot.id, new_snapshot.parent_id, old_snapshot.id
                 ));
-                self.logger.log(&new_snapshot.builder_logs.string());
+                if new_snapshot.builder_logs.is_some() {
+                    self.logger.log(&new_snapshot.builder_logs.string());
+                }
                 self.log_content_mapper_timings(&content_mapper_timings);
             }
         } else {
@@ -2181,20 +2075,22 @@ impl Session {
                     "Discarded snapshot {} (parent {}); session has moved on to snapshot {}",
                     new_snapshot.id, new_snapshot.parent_id, old_snapshot.id
                 ));
-                let logs = new_snapshot.builder_logs.string();
-                if !logs.is_empty() {
-                    self.logger.logf(&format!(
-                        "--- Discarded snapshot {} builder logs (NOT adopted) ---",
-                        new_snapshot.id
-                    ));
-                    self.logger.log(&logs);
-                    self.logger.logf(&format!(
-                        "--- End discarded snapshot {} builder logs ---",
-                        new_snapshot.id
-                    ));
+                if new_snapshot.builder_logs.is_some() {
+                    let logs = new_snapshot.builder_logs.string();
+                    if !logs.is_empty() {
+                        self.logger.logf(&format!(
+                            "--- Discarded snapshot {} builder logs (NOT adopted) ---",
+                            new_snapshot.id
+                        ));
+                        self.logger.log(&logs);
+                        self.logger.logf(&format!(
+                            "--- End discarded snapshot {} builder logs ---",
+                            new_snapshot.id
+                        ));
+                    }
                 }
             }
-            Snapshot::deref(new_snapshot, self);
+            new_snapshot.deref();
         }
     }
 
@@ -2214,28 +2110,55 @@ impl Session {
     // updateSnapshotRef is like UpdateSnapshot but returns the created snapshot
     // with an extra reference for the caller. The ref is taken atomically with
     // the snapshot assignment under snapshotMu, so the snapshot is guaranteed
-    // to be alive when returned. The caller must call snapshot.Deref(s) when done.
+    // to be alive when returned. The caller must call snapshot.Deref() when done.
     pub fn update_snapshot_ref(
         self: &Rc<Self>,
         ctx: &Context,
         overlays: IndexMap<tspath::Path, Rc<Overlay>>,
         change: SnapshotChange,
     ) -> Rc<Snapshot> {
+        // PORT: with `callerRef` Go always returns the snapshot (ts#64204).
         self.update_snapshot(ctx, overlays, change, true)
+            .expect("updateSnapshot with callerRef returns the snapshot")
     }
 
-    // Go: project/session.go:1202 updateSnapshot
+    // Go: project/session.go:1356 updateSnapshot
     // PORT: Go passes `change` by value to `Clone` and keeps its own copy
-    // for the background task, so the port clones it.
+    // for the background task, so the port clones it. A Go nil result (an
+    // API error without `callerRef`, ts#64204) is `None`.
     pub fn update_snapshot(
         self: &Rc<Self>,
         ctx: &Context,
         overlays: IndexMap<tspath::Path, Rc<Overlay>>,
         change: SnapshotChange,
         caller_ref: bool,
-    ) -> Rc<Snapshot> {
+    ) -> Option<Rc<Snapshot>> {
         let old_snapshot = self.snapshot.borrow().clone();
-        let new_snapshot = Snapshot::clone_(&old_snapshot, ctx, change.clone(), &overlays, self);
+        // ts#64163
+        let locale_ctx;
+        let mut ctx = ctx;
+        if !locale::has_locale(ctx) {
+            locale_ctx = self.with_current_locale(ctx);
+            ctx = &locale_ctx;
+        }
+        let new_snapshot = old_snapshot.clone_(
+            ctx,
+            change.clone(),
+            &overlays,
+            Some(&self.logger),
+            self.client.clone(),
+        );
+        // A failed API request may have mutated only a prefix of its clone. Such a
+        // snapshot is returned to the caller for inspection and cleanup, but must
+        // never become canonical session state or trigger adoption side effects.
+        // ts#64204
+        if new_snapshot.api_error.is_some() {
+            if caller_ref {
+                return Some(new_snapshot);
+            }
+            new_snapshot.deref();
+            return None;
+        }
         *self.snapshot.borrow_mut() = new_snapshot.clone();
         if caller_ref {
             new_snapshot.ref_();
@@ -2246,7 +2169,7 @@ impl Session {
             // clone ref (1) is transferred to become the session's ref for its current
             // snapshot. Other holders (e.g. active handlers) keep the old snapshot alive
             // via their own refs until they complete.
-            Snapshot::deref(&old_snapshot, self);
+            old_snapshot.deref();
             content_mapper_timings = self.take_content_mapper_timing_delta();
         }
 
@@ -2269,7 +2192,9 @@ impl Session {
                         "Adopted snapshot {} (parent {}) as current session snapshot (replacing {})",
                         new_snapshot.id, new_snapshot.parent_id, old_snapshot.id
                     ));
-                    s.logger.log(&new_snapshot.builder_logs.string());
+                    if new_snapshot.builder_logs.is_some() {
+                        s.logger.log(&new_snapshot.builder_logs.string());
+                    }
                     s.log_project_changes(old_snapshot, new_snapshot);
                     s.log_content_mapper_timings(&content_mapper_timings);
                     s.logger.log("");
@@ -2287,7 +2212,7 @@ impl Session {
                 s.warm_auto_import_cache(ctx, &change, old_snapshot, new_snapshot);
             });
 
-        new_snapshot
+        Some(new_snapshot)
     }
 
     // Go: project/session.go:1489 takeContentMapperTimingDelta (tsgo#4712)
@@ -2305,7 +2230,8 @@ impl Session {
     // PORT: Go `%v` of a `time.Duration` is `{:?}` (log only), as in the
     // other session logs. Go sorts the map keys.
     pub fn log_content_mapper_timings(&self, timings: &contentmapper::Timings) {
-        if timings.request_wait.is_zero() {
+        if timings.request_wait.is_zero() && !has_content_mapper_operation_timings(&timings.mappers)
+        {
             return;
         }
         self.logger
@@ -2318,11 +2244,7 @@ impl Session {
         identities.sort();
         for identity in identities {
             let mapper = &timings.mappers[identity];
-            if mapper.spawn.count == 0
-                && mapper.open_project.count == 0
-                && mapper.close_project.count == 0
-                && mapper.transform.count == 0
-            {
+            if !has_content_mapper_operation_timing(mapper) {
                 continue;
             }
             self.logger.logf(&format!("  {identity}:"));
@@ -2369,6 +2291,27 @@ impl Session {
             self.background_queue.wait();
         }
     }
+}
+
+// Go: project/session.go:1461 hasContentMapperOperationTimings (ts#64015)
+// PORT: Go map order is random; the result does not depend on it.
+pub fn has_content_mapper_operation_timings(
+    timings: &IndexMap<String, contentmapper::MapperTimings>,
+) -> bool {
+    for timing in timings.values() {
+        if has_content_mapper_operation_timing(timing) {
+            return true;
+        }
+    }
+    false
+}
+
+// Go: project/session.go:1470 hasContentMapperOperationTiming (ts#64015)
+pub fn has_content_mapper_operation_timing(timing: &contentmapper::MapperTimings) -> bool {
+    timing.spawn.count != 0
+        || timing.open_project.count != 0
+        || timing.close_project.count != 0
+        || timing.transform.count != 0
 }
 
 // Go: project/session.go:1254 updateWatch
@@ -2612,9 +2555,9 @@ impl Session {
         }
 
         crate::frontend::core_ls_ext::diff_ordered_maps(
-            &old_snapshot.project_collection.projects_by_path(),
-            &new_snapshot.project_collection.projects_by_path(),
-            |_: &tspath::Path, added_project| {
+            &old_snapshot.project_collection.projects_by_id(),
+            &new_snapshot.project_collection.projects_by_id(),
+            |_: &ID, added_project| {
                 let added_project = added_project.borrow();
                 let program_files = update_watch(
                     &ctx,
@@ -2641,7 +2584,7 @@ impl Session {
                 );
                 errors.borrow_mut().extend(content_mapper);
             },
-            |_: &tspath::Path, removed_project| {
+            |_: &ID, removed_project| {
                 let removed_project = removed_project.borrow();
                 let program_files = update_watch(
                     &ctx,
@@ -2668,7 +2611,7 @@ impl Session {
                 );
                 errors.borrow_mut().extend(content_mapper);
             },
-            |_: &tspath::Path, old_project, new_project| {
+            |_: &ID, old_project, new_project| {
                 let old_project = old_project.borrow();
                 let new_project = new_project.borrow();
                 if WatchedFiles::id(old_project.program_files_watch.as_deref())
@@ -2797,9 +2740,7 @@ impl Session {
         // Cancel periodic performance telemetry
         self.stop_performance_telemetry();
         self.background_queue.close();
-        if let Some(content_mapper_host) = &self.content_mapper_host {
-            let _ = content_mapper_host.close();
-        }
+        self.snapshot_host.close();
     }
 
     // Go: project/session.go:1424 flushChanges
@@ -2810,7 +2751,7 @@ impl Session {
     ) -> (
         FileChangeSummary,
         IndexMap<tspath::Path, Rc<Overlay>>,
-        FxHashMap<tspath::Path, Rc<ATAStateChange>>,
+        FxHashMap<ID, Rc<ATAStateChange>>,
         Option<lsutil::UserPreferences>,
     ) {
         let pending_ata_changes = std::mem::take(&mut *self.pending_ata_changes.borrow_mut());
@@ -2831,7 +2772,7 @@ impl Session {
         _ctx: &Context,
     ) -> (FileChangeSummary, IndexMap<tspath::Path, Rc<Overlay>>) {
         if self.pending_file_changes.borrow().is_empty() {
-            return (FileChangeSummary::default(), self.fs.overlays());
+            return (FileChangeSummary::default(), (*self.fs.overlays()).clone());
         }
 
         let start = Instant::now();
@@ -2864,21 +2805,21 @@ impl Session {
             logged_project_changes.set(true);
         };
         crate::frontend::core_ls_ext::diff_ordered_maps(
-            &old_snapshot.project_collection.projects_by_path(),
-            &new_snapshot.project_collection.projects_by_path(),
-            |_path: &tspath::Path, added_project| {
+            &old_snapshot.project_collection.projects_by_id(),
+            &new_snapshot.project_collection.projects_by_id(),
+            |_: &ID, added_project| {
                 // New project added
                 log_project(added_project);
             },
-            |_path: &tspath::Path, removed_project| {
+            |_: &ID, removed_project| {
                 // Project removed
                 self.logger.logf(&format!(
                     "\nProject '{}' removed\n{}",
-                    removed_project.borrow().name(),
+                    removed_project.borrow().id(),
                     HR
                 ));
             },
-            |_path: &tspath::Path, _old_project, new_project| {
+            |_: &ID, _old_project, new_project| {
                 // Project updated
                 if new_project.borrow().program_update_kind == ProgramUpdateKind::NEW_FILES {
                     log_project(new_project);
@@ -2908,11 +2849,11 @@ impl Session {
         self.logger.log("\n======== Cache Statistics ========");
         self.logger.logf(&format!(
             "Open file count:   {:6}",
-            snapshot.fs.overlays.len()
+            snapshot.overlays().len()
         ));
         self.logger.logf(&format!(
             "Cached disk files: {:6}",
-            snapshot.fs.disk_files.len()
+            snapshot.fs.cache_files.len()
         ));
         self.logger.logf(&format!(
             "Realpath aliases:  {:6}",
@@ -2954,7 +2895,7 @@ impl Session {
                 for bucket in &auto_import_stats.project_buckets {
                     self.logger.logf(&format!(
                         "\t\t{}{}:",
-                        bucket.path,
+                        bucket.name,
                         if bucket.state.dirty() { " (dirty)" } else { "" }
                     ));
                     self.logger
@@ -2968,7 +2909,7 @@ impl Session {
                 for bucket in &auto_import_stats.node_modules_buckets {
                     self.logger.logf(&format!(
                         "\t\t{}{}:",
-                        bucket.path,
+                        bucket.name,
                         if bucket.state.dirty() { " (dirty)" } else { "" }
                     ));
                     // PORT: Go map order is random (log text only).
@@ -3101,15 +3042,13 @@ impl Session {
             let old_open_projects = old_snapshot
                 .project_collection
                 .get_open_configured_projects();
-            for (config_file_path, old_project) in
-                &old_snapshot.project_collection.projects_by_path()
-            {
-                if old_project.borrow().kind == Kind::CONFIGURED
-                    && old_open_projects.contains(config_file_path)
-                {
+            for old_project in old_snapshot.project_collection.projects_by_id().values() {
+                let (configured_id, configured) = old_project.borrow().id().configured();
+                if configured && old_open_projects.contains(&configured_id) {
+                    let config_file_path = old_project.borrow().config_file_path();
                     self.publish_project_diagnostics(
                         &self.background_context(),
-                        config_file_path,
+                        &config_file_path,
                         &[],
                         &old_snapshot.converters,
                     );
@@ -3119,8 +3058,8 @@ impl Session {
         }
 
         let ctx = self.background_context();
-        let old_projects = old_snapshot.project_collection.projects_by_path();
-        let new_projects = new_snapshot.project_collection.projects_by_path();
+        let old_projects = old_snapshot.project_collection.projects_by_id();
+        let new_projects = new_snapshot.project_collection.projects_by_id();
         let old_open_projects = old_snapshot
             .project_collection
             .get_open_configured_projects();
@@ -3130,57 +3069,66 @@ impl Session {
         crate::frontend::core_ls_ext::diff_ordered_maps(
             &old_projects,
             &new_projects,
-            |config_file_path: &tspath::Path, added_project| {
+            |_: &ID, added_project| {
+                let (configured_id, configured) = added_project.borrow().id().configured();
                 if !should_publish_program_diagnostics(&added_project.borrow(), new_snapshot.id())
-                    || !new_open_projects.contains(config_file_path)
+                    || !configured
+                    || !new_open_projects.contains(&configured_id)
                 {
                     return;
                 }
+                let config_file_path = added_project.borrow().config_file_path();
                 let diagnostics = added_project.borrow().get_project_diagnostics(&ctx);
                 self.publish_project_diagnostics(
                     &ctx,
-                    config_file_path,
+                    &config_file_path,
                     &diagnostics,
                     &new_snapshot.converters,
                 );
             },
-            |config_file_path: &tspath::Path, removed_project| {
+            |_: &ID, removed_project| {
                 if removed_project.borrow().kind != Kind::CONFIGURED {
                     return;
                 }
+                let config_file_path = removed_project.borrow().config_file_path();
                 self.publish_project_diagnostics(
                     &ctx,
-                    config_file_path,
+                    &config_file_path,
                     &[],
                     &old_snapshot.converters,
                 );
             },
-            |config_file_path: &tspath::Path, _old_project, new_project| {
+            |_: &ID, _old_project, new_project| {
+                let (configured_id, configured) = new_project.borrow().id().configured();
                 if !should_publish_program_diagnostics(&new_project.borrow(), new_snapshot.id())
-                    || !new_open_projects.contains(config_file_path)
+                    || !configured
+                    || !new_open_projects.contains(&configured_id)
                 {
                     return;
                 }
+                let config_file_path = new_project.borrow().config_file_path();
                 let diagnostics = new_project.borrow().get_project_diagnostics(&ctx);
                 self.publish_project_diagnostics(
                     &ctx,
-                    config_file_path,
+                    &config_file_path,
                     &diagnostics,
                     &new_snapshot.converters,
                 );
             },
         );
         // Sync diagnostics for projects whose open-file state changed without a program update.
-        for (config_file_path, new_project) in &new_projects {
+        for (project_id, new_project) in &new_projects {
             if new_project.borrow().kind != Kind::CONFIGURED {
                 continue;
             }
-            if !old_projects.contains_key(config_file_path) {
+            if !old_projects.contains_key(project_id) {
                 continue; // Handled by added project case above
             }
-            let old_project = old_projects.get(config_file_path);
-            let new_has_open_files = new_open_projects.contains(config_file_path);
-            let old_has_open_files = old_open_projects.contains(config_file_path);
+            let (configured_id, _) = new_project.borrow().id().configured();
+            let config_file_path = new_project.borrow().config_file_path();
+            let old_project = old_projects.get(project_id);
+            let new_has_open_files = new_open_projects.contains(&configured_id);
+            let old_has_open_files = old_open_projects.contains(&configured_id);
             if new_has_open_files
                 && !old_has_open_files
                 && (old_project.is_some_and(|old_project| Rc::ptr_eq(new_project, old_project))
@@ -3193,7 +3141,7 @@ impl Session {
                 let diagnostics = new_project.borrow().get_project_diagnostics(&ctx);
                 self.publish_project_diagnostics(
                     &ctx,
-                    config_file_path,
+                    &config_file_path,
                     &diagnostics,
                     &new_snapshot.converters,
                 );
@@ -3201,7 +3149,7 @@ impl Session {
                 // Project closed
                 self.publish_project_diagnostics(
                     &ctx,
-                    config_file_path,
+                    &config_file_path,
                     &[],
                     &new_snapshot.converters,
                 );
@@ -3299,8 +3247,8 @@ impl Session {
             }
         }
 
-        // Go: defer snapshot.Deref(s); defer s.globalDiagPublishPending.Store(false)
-        Snapshot::deref(&snapshot, self);
+        // Go: defer snapshot.Deref(); defer s.globalDiagPublishPending.Store(false)
+        snapshot.deref();
         self.global_diag_publish_pending.set(false);
     }
 
@@ -3317,15 +3265,15 @@ impl Session {
                     if s.options.logging_enabled {
                         log_tree = logging::new_log_tree(&format!(
                             "Triggering ATA for project {}",
-                            project.borrow().name()
+                            project.borrow().id().string()
                         ));
                     }
 
                     let typings_info = Rc::new(project.borrow().compute_typings_info());
-                    let (request, project_name, project_display_name, config_file_path) = {
+                    let (request, project_id, project_display_name) = {
                         let p = project.borrow();
                         let request = ata::TypingsInstallRequest {
-                            project_id: p.config_file_path.clone(),
+                            project_id: Rc::new(p.id()),
                             typings_info: typings_info.clone(),
                             file_names: p
                                 .program
@@ -3347,14 +3295,13 @@ impl Session {
                             get_script_kind: Rc::new(|file_name: &str| {
                                 crate::frontend::core_ext::get_script_kind_from_file_name(file_name)
                             }),
-                            fs: s.fs.fs.clone(),
+                            fs: s.fs.clone(),
                             logger: log_tree.clone().map(|t| t as Rc<dyn logging::Logger>),
                         };
                         (
                             request,
-                            p.name(),
+                            p.id(),
                             p.display_name(&s.options.current_directory),
-                            p.config_file_path.clone(),
                         )
                     };
 
@@ -3377,7 +3324,7 @@ impl Session {
                             if log_tree.is_some() {
                                 s.logger.log(&format!(
                                     "ATA installation failed for project {}: {}",
-                                    project_name,
+                                    project_id,
                                     err.error()
                                 ));
                                 s.logger.log(&log_tree.string());
@@ -3386,9 +3333,8 @@ impl Session {
                         Ok(result) => {
                             if result.typings_files != project.borrow().typings_files {
                                 s.pending_ata_changes.borrow_mut().insert(
-                                    config_file_path,
+                                    project_id,
                                     Rc::new(ATAStateChange {
-                                        project_id: tspath::Path::default(),
                                         typings_info: Some(typings_info),
                                         typings_files: result.typings_files,
                                         typings_files_to_watch: result.files_to_watch,
@@ -3432,7 +3378,7 @@ impl Session {
             for uri in &change.file_changes.changed {
                 changed_file = uri.clone();
             }
-            if !new_snapshot.fs.is_open_file(&changed_file.file_name()) {
+            if !new_snapshot.is_open_file(&changed_file.file_name()) {
                 return;
             }
             let prefs = new_snapshot.user_preferences();
@@ -3445,7 +3391,7 @@ impl Session {
             if crate::ls::autoimport::Registry::is_prepared_for_importing_file(
                 new_snapshot.auto_imports.as_deref(),
                 &changed_file.file_name(),
-                &project.borrow().config_file_path,
+                &project.borrow().id().as_auto_import_project_id(),
                 &prefs,
             ) {
                 return;
@@ -3559,19 +3505,19 @@ impl Session {
         );
         // PORT: the clone takes the id kept for it when the warm started.
         let next_snapshot_id = self.snapshot_id.replace(snapshot_id - 1);
-        let cloned_snapshot = Snapshot::clone_(
-            &new_snapshot,
+        let cloned_snapshot = new_snapshot.clone_(
             &build_ctx,
             warm_change,
-            &new_snapshot.fs.overlays,
-            self,
+            &new_snapshot.overlays(),
+            Some(&self.logger),
+            self.client.clone(),
         );
         self.snapshot_id.set(next_snapshot_id);
 
         // If cancelled during clone, discard the incomplete result.
         if warm_ctx.err().is_some() {
-            Snapshot::deref(&cloned_snapshot, self);
-            Snapshot::deref(&new_snapshot, self);
+            cloned_snapshot.deref();
+            new_snapshot.deref();
             cancel();
             return;
         }
@@ -3579,14 +3525,14 @@ impl Session {
         // Conditionally adopt: if the session hasn't moved past newSnapshot,
         // promote the clone so future requests benefit from the warmed cache.
         self.adopt_snapshot_change(&new_snapshot, &cloned_snapshot);
-        Snapshot::deref(&new_snapshot, self);
+        new_snapshot.deref();
         cancel();
     }
 
     /// PORT: Go's deferred `newSnapshot.Deref(s)` and `cancel()` for a
     /// pending warm that ends without its clone.
     fn end_pending_warm(&self, warm: PendingWarm) {
-        Snapshot::deref(&warm.new_snapshot, self);
+        warm.new_snapshot.deref();
         (warm.cancel)();
     }
 }

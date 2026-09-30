@@ -6,16 +6,20 @@
 
 use std::rc::Rc;
 
+use rustc_hash::FxHashSet;
 use ts_goport::ast::ContentMapperSourceFileInfo;
 use ts_goport::contentmapper::SourceFiles;
 use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::compiler::DuplicateSourceFile;
 use ts_goport::frontend::parser::{self, ParsedSourceFile, SourceFileParseOptions};
 use ts_goport::frontend::tspath::Path;
+use ts_goport::frontend::vfs::Fs;
 use ts_goport::gostd::GoError;
 use ts_goport::lsp::lsproto;
+use ts_goport::options::Tristate;
 use ts_goport::project::{
-    ContentMappedParseCache, ContentMappedParseCacheKey, HashedSourceFile, ParseCacheKey,
+    APICreateProgramRequest, APISnapshotRequest, ConfiguredProjectID, ContentMappedParseCache,
+    ContentMappedParseCacheKey, FileChangeSummary, HashedSourceFile, ParseCacheKey,
     ProgramUpdateKind, RefCountCacheEntry, RefCountCacheOptions, ResourceRequest, Session,
     SnapshotChange, UpdateReason, content_mapped_parse_cache_key_for_duplicate,
     content_mapped_parse_cache_key_for_file, new_content_mapped_parse_cache, new_parse_cache_key,
@@ -128,6 +132,12 @@ fn test_content_mapped_parse_cache_key_reconstruction() {
         expected
     );
 }
+
+// Go: refcountcache_test.go:72 TestParseCacheBindsBeforePublishing (ts#63952)
+// PORT: not ported. Go binds a parse in the parse cache so programs that share
+// it do not race to bind it. The Rust binder binds each program version into
+// one arena on the dispatch thread (`program::bind_all`); a parse on its own
+// has no bound state (`IsBound`) or `CommonJSModuleIndicator` to check.
 
 // Go: refcountcache_test.go:23 setup
 fn setup(files: FileMap) -> Rc<Session> {
@@ -584,8 +594,9 @@ child_test! {
                 },
                 ..Default::default()
             },
-            &base_snapshot.fs.overlays,
-            &session,
+            &base_snapshot.overlays(),
+            None,
+            None,
         );
 
         let project = clone.get_default_project(&u).expect("default project");
@@ -598,10 +609,137 @@ child_test! {
 
         assert_eq!(extended_owners(&session, extended_config_path), Some(1));
 
-        clone.deref(&session);
+        clone.deref();
 
         assert!(load(&session, &main_key).is_none());
 
         assert_eq!(extended_owners(&session, extended_config_path), None);
+    }
+}
+
+child_test! {
+    // Go: refcountcache_test.go:494 TestRefCountingCaches/extendedConfigCache/createProgram retains and reloads extended configs from referenced projects (ts#63950, ts#64319)
+    fn extended_config_cache_create_program_retains_and_reloads_extended_configs_from_referenced_projects() {
+        const APP_CONFIG_PATH: &str = "/user/username/projects/app/tsconfig.json";
+        const APP_FILE_PATH: &str = "/user/username/projects/app/index.ts";
+        const LIB_CONFIG_PATH: &str = "/user/username/projects/lib/tsconfig.json";
+        const LIB_BASE_CONFIG_PATH: &str = "/user/username/projects/lib/tsconfig.base.json";
+        const LIB_FILE_PATH: &str = "/user/username/projects/lib/index.ts";
+        let session = setup(files(&[
+            (
+                APP_CONFIG_PATH,
+                r#"{"compilerOptions":{"noLib":true},"files":["index.ts"],"references":[{"path":"../lib"}]}"#,
+            ),
+            (APP_FILE_PATH, "export const app = 1;"),
+            (LIB_CONFIG_PATH, r#"{"extends":"./tsconfig.base.json","files":["index.ts"]}"#),
+            (LIB_BASE_CONFIG_PATH, r#"{"compilerOptions":{"composite":true,"noLib":true}}"#),
+            (LIB_FILE_PATH, "export const lib = 1;"),
+        ]));
+        let ctx = bg();
+
+        let base_snapshot = session
+            .api_update(
+                &ctx,
+                FileChangeSummary::default(),
+                Some(&APISnapshotRequest {
+                    open_projects: Some(FxHashSet::from_iter([APP_CONFIG_PATH.to_string()])),
+                    ..Default::default()
+                }),
+            )
+            .unwrap_or_else(|err| panic!("APIUpdate: {}", err.error()));
+        let app_project = base_snapshot
+            .project_collection
+            .get_project(&ConfiguredProjectID(base_snapshot.to_path(APP_CONFIG_PATH)).as_id())
+            .expect("app project");
+
+        let create_request = {
+            let app_project = app_project.borrow();
+            let command_line = app_project.command_line.as_ref().expect("command line");
+            APISnapshotRequest {
+                create_programs: vec![APICreateProgramRequest {
+                    root_file_names: command_line.file_names().to_vec(),
+                    compiler_options: command_line.compiler_options().clone(),
+                    project_references: command_line.project_references().to_vec(),
+                    config_file_parsing_diagnostics: command_line.errors.clone(),
+                }],
+                ..Default::default()
+            }
+        };
+        let (program_snapshot, err) = session.clone_snapshot(
+            &ctx,
+            &base_snapshot,
+            FileChangeSummary::default(),
+            Some(&create_request),
+        );
+        assert!(err.is_none(), "CloneSnapshot: {:?}", err.map(|err| err.error()));
+        let program_project = program_snapshot.created_programs()[0].clone();
+        assert!(!Rc::ptr_eq(
+            program_project.borrow().program.as_ref().expect("program"),
+            app_project.borrow().program.as_ref().expect("app program"),
+        ));
+
+        let extended_config_entry = session
+            .extended_config_cache
+            .entries
+            .borrow()
+            .get(&path(LIB_BASE_CONFIG_PATH))
+            .cloned()
+            .expect("extended config entry");
+        let (owned_by_base_snapshot, owned_by_program_snapshot, owner_count) = {
+            let owners = extended_config_entry.owners.borrow();
+            (
+                owners.contains(&base_snapshot.id),
+                owners.contains(&program_snapshot.id),
+                owners.len(),
+            )
+        };
+        assert!(owned_by_base_snapshot);
+        assert!(owned_by_program_snapshot);
+        assert_eq!(owner_count, 2);
+
+        Fs::write_file(
+            &*session.fs,
+            LIB_BASE_CONFIG_PATH,
+            r#"{"compilerOptions":{"composite":true,"noLib":true,"strict":true}}"#,
+        )
+        .unwrap();
+        let mut file_changes = FileChangeSummary::default();
+        file_changes
+            .changed
+            .insert(uri(&format!("file://{LIB_BASE_CONFIG_PATH}")));
+        let program_project_id = program_project.borrow().id();
+        let update_request = APISnapshotRequest {
+            ensure_programs: Some(FxHashSet::from_iter([program_project_id.clone()])),
+            ..Default::default()
+        };
+        let (updated_program_snapshot, err) = session.clone_snapshot(
+            &ctx,
+            &program_snapshot,
+            file_changes,
+            Some(&update_request),
+        );
+        assert!(err.is_none(), "CloneSnapshot: {:?}", err.map(|err| err.error()));
+        let updated_program_project = updated_program_snapshot
+            .project_collection
+            .get_project(&program_project_id)
+            .expect("updated program project");
+        let updated_program = updated_program_project.borrow().program.clone().expect("program");
+        assert!(!Rc::ptr_eq(
+            &updated_program,
+            program_project.borrow().program.as_ref().expect("program"),
+        ));
+        let updated_references = updated_program.get_resolved_project_references();
+        assert_eq!(updated_references.len(), 1);
+        assert_eq!(
+            updated_references[0].as_ref().expect("reference").compiler_options().strict,
+            Tristate::True
+        );
+
+        // Go: defer updatedProgramSnapshot.Deref(); defer programSnapshot.Deref();
+        // defer baseSnapshot.Deref(); defer session.Close()
+        updated_program_snapshot.deref();
+        program_snapshot.deref();
+        base_snapshot.deref();
+        session.close();
     }
 }

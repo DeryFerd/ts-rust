@@ -132,11 +132,17 @@ pub fn new_typings_installer(
     })
 }
 
+// Go: project/ata/ata.go:75 ProjectID (ts#64319)
+// PORT: Go `interface { fmt.Stringer }`.
+pub trait ProjectID {
+    fn string(&self) -> String;
+}
+
 impl TypingsInstaller {
-    // Go: project/ata/ata.go:75 IsKnownTypesPackageName
+    // Go: project/ata/ata.go:79 IsKnownTypesPackageName
     pub fn is_known_types_package_name(
         &self,
-        project_id: &tspath::Path,
+        project_id: &dyn ProjectID,
         name: &str,
         fs: &dyn vfs::Fs,
         logger: &dyn logging::Logger,
@@ -147,7 +153,7 @@ impl TypingsInstaller {
             return false;
         }
         // Strada did this lazily - is that needed here to not waiting on and returning false on first request
-        self.init(project_id.as_str(), fs, logger);
+        self.init(&project_id.string(), fs, logger);
         self.types_registry.borrow().contains_key(name)
     }
 }
@@ -161,7 +167,8 @@ pub const TS_VERSION_TO_USE: &str = "latest";
 // address of a local), so it is an `Rc`. `GetScriptKind` is a stored func.
 #[derive(Clone)]
 pub struct TypingsInstallRequest {
-    pub project_id: tspath::Path,
+    // ts#64319. PORT: Go `ProjectID` interface value.
+    pub project_id: Rc<dyn ProjectID>,
     pub typings_info: Rc<TypingsInfo>,
     pub file_names: Vec<String>,
     pub project_root_path: String,
@@ -195,7 +202,7 @@ impl TypingsInstaller {
             result.files_to_watch.sort();
             request.logger.log(&format!(
                 "ATA:: Got install request for: {}",
-                request.project_id.as_str()
+                request.project_id.string()
             ));
         }
         result
@@ -206,7 +213,7 @@ impl TypingsInstaller {
         &self,
         request: &TypingsInstallRequest,
     ) -> Result<TypingsInstallResult, GoError> {
-        self.init(request.project_id.as_str(), &*request.fs, &request.logger);
+        self.init(&request.project_id.string(), &*request.fs, &request.logger);
 
         let (cached_typing_paths, new_typing_names, files_to_watch) = discover_typings(
             &*request.fs,
@@ -222,12 +229,9 @@ impl TypingsInstaller {
         self.install_run_count.set(request_id);
         // install typings
         if !new_typing_names.is_empty() {
-            let filtered_typings =
-                self.filter_typings(&request.project_id, &request.logger, &new_typing_names);
+            let filtered_typings = self.filter_typings(&request.logger, &new_typing_names);
             if !filtered_typings.is_empty() {
                 let typings_files = self.install_typings(
-                    &request.project_id,
-                    &request.typings_info,
                     request_id,
                     &cached_typing_paths,
                     &filtered_typings,
@@ -256,17 +260,14 @@ impl TypingsInstaller {
     }
 
     // Go: project/ata/ata.go:157 installTypings
+    // ts#64319: no project ID or typings info parameters.
     pub fn install_typings(
         &self,
-        project_id: &tspath::Path,
-        typings_info: &TypingsInfo,
         request_id: i32,
         currently_cached_typings: &[String],
         filtered_typings: &[String],
         logger: &dyn logging::Logger,
     ) -> Result<Vec<String>, GoError> {
-        // Go does not read `typingsInfo`.
-        let _ = typings_info;
         // !!! sheetal events to send
         // send progress event
         // this.sendResponse({
@@ -288,23 +289,21 @@ impl TypingsInstaller {
             scoped_typings[i] = format!("@types/{package_name}@{TS_VERSION_TO_USE}"); // @tscore.VersionMajorMinor) // This is normally @tsVersionMajorMinor but for now lets use latest
         }
 
-        let (package_names, ok) =
-            self.install_worker(project_id, request_id, &scoped_typings, logger);
+        let (package_names, ok) = self.install_worker(request_id, &scoped_typings, logger);
         if ok {
             // PORT: Go `%v` of a slice; log text is not compared.
             logger.log(&format!("ATA:: Installed typings {package_names:?}"));
             let mut installed_typing_files: Vec<String> = Vec::new();
             let host: Rc<dyn module::ResolutionHost> = self.host.clone();
-            let resolver = module::new_resolver(
-                host,
-                Rc::new(CompilerOptions {
+            // ts#64299
+            let resolver = module::new_resolver(module::ResolverOptions {
+                host: Some(host),
+                compiler_options: Some(Rc::new(CompilerOptions {
                     module_resolution: ModuleResolutionKind::NODE_NEXT,
                     ..CompilerOptions::default()
-                }),
-                "",
-                "",
-                Vec::new(),
-            );
+                })),
+                ..Default::default()
+            });
             for package_name in filtered_typings {
                 let typing_file = self.typing_to_file_name(&resolver, package_name);
                 if typing_file.is_empty() {
@@ -400,15 +399,13 @@ impl TypingsInstaller {
     }
 
     // Go: project/ata/ata.go:256 installWorker
+    // ts#64319: no project ID parameter.
     pub fn install_worker(
         &self,
-        project_id: &tspath::Path,
         request_id: i32,
         package_names: &[String],
         logger: &dyn logging::Logger,
     ) -> (Vec<String>, bool) {
-        // Go does not read `projectID`.
-        let _ = project_id;
         // PORT: Go `%v` of a slice; log text is not compared.
         logger.log(&format!(
             "ATA:: #{request_id} with cwd: {} arguments: {package_names:?}",
@@ -483,14 +480,12 @@ pub fn install_npm_packages(
 
 impl TypingsInstaller {
     // Go: project/ata/ata.go:318 filterTypings
+    // ts#64319: no project ID parameter.
     pub fn filter_typings(
         &self,
-        project_id: &tspath::Path,
         logger: &dyn logging::Logger,
         typings_to_install: &[String],
     ) -> Vec<String> {
-        // Go does not read `projectID`.
-        let _ = project_id;
         let mut result: Vec<String> = Vec::new();
         for typing in typings_to_install {
             let typing_key = module::mangle_scoped_package_name(typing);
@@ -720,16 +715,15 @@ impl TypingsInstaller {
 
             // !!! sheetal strada uses Node10
             let host: Rc<dyn module::ResolutionHost> = self.host.clone();
-            let resolver = module::new_resolver(
-                host,
-                Rc::new(CompilerOptions {
+            // ts#64299
+            let resolver = module::new_resolver(module::ResolverOptions {
+                host: Some(host),
+                compiler_options: Some(Rc::new(CompilerOptions {
                     module_resolution: ModuleResolutionKind::NODE_NEXT,
                     ..CompilerOptions::default()
-                }),
-                "",
-                "",
-                Vec::new(),
-            );
+                })),
+                ..Default::default()
+            });
             if let Some(dev_dependencies) = &npm_config.dev_dependencies
                 && (npm_lock.packages.is_some() || npm_lock.dependencies.is_some())
             {
@@ -834,9 +828,13 @@ impl TypingsInstaller {
         }
     }
 
-    // Go: project/ata/ata.go:479 typingToFileName
-    pub fn typing_to_file_name(&self, resolver: &module::Resolver, package_name: &str) -> String {
-        let (result, _) = resolver.resolve_module_name(
+    // Go: project/ata/ata.go:485 typingToFileName (ts#64299: `*module.DefaultResolver`)
+    pub fn typing_to_file_name(
+        &self,
+        resolver: &module::DefaultResolver,
+        package_name: &str,
+    ) -> String {
+        let (result, _, _) = resolver.resolve_module_name(
             package_name,
             &tspath::combine_paths(&self.typings_location, &["index.d.ts"]),
             ModuleKind::NONE,
