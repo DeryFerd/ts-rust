@@ -141,6 +141,9 @@ pub struct ModuleResolverID(pub u64);
 // ts#64434
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceFileLeaseID(pub u64);
+// ts#64158
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BuildOrchestratorID(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SymbolID(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -188,7 +191,26 @@ macro_rules! handle_json {
     )*};
 }
 
-handle_json!(uint: SnapshotID, ModuleResolverID, SourceFileLeaseID, SymbolID, TypeID, SignatureID);
+handle_json!(
+    uint: SnapshotID,
+    ModuleResolverID,
+    SourceFileLeaseID,
+    BuildOrchestratorID,
+    SymbolID,
+    TypeID,
+    SignatureID
+);
+
+// Go: proto.go nextBuildOrchestratorId (ts#64158)
+static NEXT_BUILD_ORCHESTRATOR_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// Go: proto.go NewBuildOrchestratorID (ts#64158)
+pub fn new_build_orchestrator_id() -> BuildOrchestratorID {
+    BuildOrchestratorID(
+        NEXT_BUILD_ORCHESTRATOR_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
+    )
+}
 handle_json!(string: NodeHandle);
 
 // PORT: Go `project.ID` and `project.Syntheticproject::ID` (ts#64319) are Go
@@ -282,6 +304,14 @@ impl Method {
 
     // ts#63937
     pub const BATCH_REQUESTS: Method = Method(Cow::Borrowed("batchRequests"));
+    // ts#64158
+    pub const CREATE_BUILD_ORCHESTRATOR: Method = Method(Cow::Borrowed("createBuildOrchestrator"));
+    pub const DISPOSE_BUILD_ORCHESTRATOR: Method =
+        Method(Cow::Borrowed("disposeBuildOrchestrator"));
+    pub const BUILD: Method = Method(Cow::Borrowed("build"));
+    pub const BUILD_REFERENCES: Method = Method(Cow::Borrowed("buildReferences"));
+    pub const CLEAN_BUILD: Method = Method(Cow::Borrowed("cleanBuild"));
+    pub const CLEAN_REFERENCES: Method = Method(Cow::Borrowed("cleanReferences"));
 
     // tsgo#4915: MethodGetServerTiming and MethodResetServerTiming are gone;
     // the connection answers them (`ipc::timing`).
@@ -1383,6 +1413,22 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         unmarshaller_for::<BatchRequestsParams>,
     );
     m.insert(Method::RELEASE, unmarshaller_for::<ReleaseParams>);
+    // ts#64158
+    m.insert(
+        Method::CREATE_BUILD_ORCHESTRATOR,
+        unmarshaller_for::<CreateBuildOrchestratorParams>,
+    );
+    m.insert(
+        Method::DISPOSE_BUILD_ORCHESTRATOR,
+        unmarshaller_for::<DisposeBuildOrchestratorParams>,
+    );
+    m.insert(Method::BUILD, unmarshaller_for::<BuildParams>);
+    m.insert(Method::BUILD_REFERENCES, unmarshaller_for::<BuildParams>);
+    m.insert(Method::CLEAN_BUILD, unmarshaller_for::<CleanBuildParams>);
+    m.insert(
+        Method::CLEAN_REFERENCES,
+        unmarshaller_for::<CleanBuildParams>,
+    );
     // ts#64434
     m.insert(
         Method::RELEASE_SOURCE_FILE,
@@ -2321,6 +2367,193 @@ pub struct ReleaseParams {
 proto_json!(both ReleaseParams {
     snapshot: "snapshot" plain,
 });
+
+// Go: proto.go CreateBuildOrchestratorParams (ts#64158)
+// PORT: Go embeds `*core.BuildOptions` and `*core.CompilerOptions` with
+// JSON names; they decode as the members `buildOptions` and
+// `compilerOptions`.
+#[derive(Clone, Debug, Default)]
+pub struct CreateBuildOrchestratorParams {
+    pub root_names: Vec<String>,
+    pub cwd: String,
+    // Only a subset of these options are exposed  the API
+    pub build_options: Option<crate::execute::build::BuildOptions>,
+    pub compiler_options: Option<CompilerOptions>,
+}
+
+impl UnmarshalerFrom for CreateBuildOrchestratorParams {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object =
+            unmarshal_struct_fields(dec, "api.CreateBuildOrchestratorParams", |name, dec| {
+                match name {
+                    "rootNames" => json_unmarshal_decode(dec, &mut self.root_names)?,
+                    "cwd" => json_unmarshal_decode(dec, &mut self.cwd)?,
+                    "buildOptions" => {
+                        if dec.peek_kind() == b'n' {
+                            dec.read_token()?;
+                            self.build_options = None;
+                        } else {
+                            let build_options =
+                                self.build_options.get_or_insert_with(Default::default);
+                            unmarshal_build_options(dec, build_options)?;
+                        }
+                    }
+                    "compilerOptions" => json_unmarshal_decode(dec, &mut self.compiler_options)?,
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            })?;
+        if !is_object {
+            *self = CreateBuildOrchestratorParams::default();
+        }
+        Ok(())
+    }
+}
+
+// PORT: the Go v2 struct decode of `core.BuildOptions` (the tags
+// `dry`, `force`, `verbose`, `builders`, `stopBuildOnErrors`, `clean`).
+// `core.Tristate` decodes through its legacy `UnmarshalJSON` (raw value).
+fn unmarshal_build_options(
+    dec: &mut JsonDecoder<'_>,
+    o: &mut crate::execute::build::BuildOptions,
+) -> Result<(), JsonError> {
+    unmarshal_struct_fields(dec, "core.BuildOptions", |name, dec| {
+        match name {
+            "dry" => o.dry.unmarshal_json(dec.read_value()?),
+            "force" => o.force.unmarshal_json(dec.read_value()?),
+            "verbose" => o.verbose.unmarshal_json(dec.read_value()?),
+            "builders" => json_unmarshal_decode(dec, &mut o.builders)?,
+            "stopBuildOnErrors" => o.stop_build_on_errors.unmarshal_json(dec.read_value()?),
+            "clean" => o.clean.unmarshal_json(dec.read_value()?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    Ok(())
+}
+
+// Go: proto.go CreateBuildOrchestratorResponse (ts#64158)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CreateBuildOrchestratorResponse {
+    pub build_orchestrator_id: BuildOrchestratorID,
+}
+
+proto_json!(marshal CreateBuildOrchestratorResponse {
+    build_orchestrator_id: "buildOrchestratorID" plain,
+});
+
+// Go: proto.go DisposeBuildOrchestratorParams (ts#64158)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DisposeBuildOrchestratorParams {
+    pub build_orchestrator_id: BuildOrchestratorID,
+}
+
+proto_json!(both DisposeBuildOrchestratorParams {
+    build_orchestrator_id: "buildOrchestratorID" plain,
+});
+
+// Go: proto.go BuildParams (ts#64158)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BuildParams {
+    pub build_orchestrator_id: BuildOrchestratorID,
+    pub project: String,
+}
+
+proto_json!(both BuildParams {
+    build_orchestrator_id: "buildOrchestratorID" plain,
+    project: "project" omitempty,
+});
+
+/// Go v2 marshal of `tsc.Statistics` (by reflection: the exported fields
+/// `Projects`, `ProjectsBuilt` and `TimestampUpdates`, with their Go names).
+pub struct StatisticsJSON<'a>(pub &'a crate::execute::tsc::statistics::Statistics);
+
+impl MarshalerTo for StatisticsJSON<'_> {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "Projects", &self.0.projects)?;
+        marshal_field(enc, &mut first, "ProjectsBuilt", &self.0.projects_built)?;
+        marshal_field(
+            enc,
+            &mut first,
+            "TimestampUpdates",
+            &self.0.timestamp_updates,
+        )?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+// Go: proto.go BuildResponse (ts#64158)
+// PORT: Go `tsc.ExitStatus` is a Go int type; it writes as a number.
+#[derive(Clone, Debug, Default)]
+pub struct BuildResponse {
+    pub status: crate::execute::tsc::ExitStatus,
+    pub diagnostics: Vec<DiagnosticResponse>,
+    pub statistics: crate::execute::tsc::statistics::Statistics,
+}
+
+impl MarshalerTo for BuildResponse {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "status", &(self.status as i32))?;
+        marshal_field_omitempty(enc, &mut first, "diagnostics", &self.diagnostics)?;
+        marshal_field(
+            enc,
+            &mut first,
+            "statistics",
+            &StatisticsJSON(&self.statistics),
+        )?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+// Go: proto.go CleanBuildParams (ts#64158)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CleanBuildParams {
+    pub build_orchestrator_id: BuildOrchestratorID,
+    pub project: String,
+}
+
+proto_json!(both CleanBuildParams {
+    build_orchestrator_id: "buildOrchestratorID" plain,
+    project: "project" omitempty,
+});
+
+// Go: proto.go CleanBuildResponse (ts#64158)
+#[derive(Clone, Debug, Default)]
+pub struct CleanBuildResponse {
+    pub status: crate::execute::tsc::ExitStatus,
+    pub diagnostics: Vec<DiagnosticResponse>,
+    pub statistics: crate::execute::tsc::statistics::Statistics,
+    pub files_deleted: Vec<String>,
+}
+
+impl MarshalerTo for CleanBuildResponse {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "status", &(self.status as i32))?;
+        marshal_field_omitempty(enc, &mut first, "diagnostics", &self.diagnostics)?;
+        marshal_field(
+            enc,
+            &mut first,
+            "statistics",
+            &StatisticsJSON(&self.statistics),
+        )?;
+        marshal_field_omitempty(enc, &mut first, "filesDeleted", &self.files_deleted)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+// PORT: Go `BuildOrchestrator` (a struct of three func fields, ts#64158)
+// is not used by any Go code; it is not ported. Go
+// `ConfigFileResponse.BuildOptions` (ts#64158) is never set, so it is
+// always omitted and not ported.
 
 // Go: proto.go ReleaseSourceFileParams (ts#64434)
 #[derive(Clone, Debug, Default, PartialEq)]

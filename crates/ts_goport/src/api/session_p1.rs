@@ -742,6 +742,11 @@ pub struct Session {
     pub module_resolvers: RefCell<FxHashMap<ModuleResolverID, Rc<ModuleResolverRegistration>>>,
     pub program_resolution_contexts: Rc<ProgramResolutionContexts>,
     pub conn: RefCell<Option<Rc<dyn ipc::Conn>>>,
+    // ts#64158
+    // PORT: the Go `buildMu` lock is not ported (one thread).
+    pub build_orchestrators: RefCell<
+        FxHashMap<BuildOrchestratorID, Rc<crate::execute::build::orchestrator::Orchestrator>>,
+    >,
     // ts#64434
     // PORT: the Go `sourceFileLeasesMu` lock is not ported (one thread).
     pub source_file_leases: RefCell<FxHashMap<SourceFileLeaseID, Rc<project::SourceFileLease>>>,
@@ -831,6 +836,7 @@ pub fn new_session(
         module_resolvers: RefCell::new(FxHashMap::default()),
         program_resolution_contexts: Rc::new(ProgramResolutionContexts::default()),
         conn: RefCell::new(None),
+        build_orchestrators: RefCell::new(FxHashMap::default()),
         source_file_leases: RefCell::new(FxHashMap::default()),
         next_source_file_lease_id: Cell::new(0),
         cpu_profiler: crate::pprof::CpuProfiler::default(),
@@ -1253,6 +1259,23 @@ impl ipc::Handler for Session {
             }
             m if m == Method::RESOLVE_MODULE_NAME.0 => self
                 .handle_resolve_module_name(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64158
+            m if m == Method::CREATE_BUILD_ORCHESTRATOR.0 => self
+                .handle_create_build_orchestrator(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::DISPOSE_BUILD_ORCHESTRATOR.0 => {
+                self.handle_dispose_build_orchestrator(ctx, assert_params(&parsed))
+            }
+            m if m == Method::BUILD.0 => self.handle_build(ctx, assert_params(&parsed)).map(to_any),
+            m if m == Method::BUILD_REFERENCES.0 => self
+                .handle_build_references(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::CLEAN_BUILD.0 => self
+                .handle_clean_build(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::CLEAN_REFERENCES.0 => self
+                .handle_clean_references(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::PARSE_COMMAND_LINE.0 => self
                 .handle_parse_command_line(ctx, assert_params(&parsed))
@@ -2531,6 +2554,159 @@ impl Session {
         result
     }
 
+    // Go: api/session.go handleCreateBuildOrchestrator (ts#64158)
+    pub fn handle_create_build_orchestrator(
+        &self,
+        _ctx: &Context,
+        params: &CreateBuildOrchestratorParams,
+    ) -> Result<CreateBuildOrchestratorResponse, GoError> {
+        let build_sys = self.get_build_sys(params);
+        let mut command =
+            crate::execute::build::parse_build_command_line(&params.root_names, &*build_sys);
+        let mut created_orchestrator_response = CreateBuildOrchestratorResponse::default();
+        if let Some(compiler_options) = &params.compiler_options {
+            command.compiler_options = Rc::new(compiler_options.clone());
+        }
+        if let Some(build_options) = &params.build_options {
+            command.build_options = build_options.clone();
+        }
+        let orchestrator = crate::execute::build::orchestrator::new_orchestrator(
+            crate::execute::build::orchestrator::Options {
+                sys: build_sys,
+                command: Rc::new(command),
+                testing: None,
+            },
+        );
+        created_orchestrator_response.build_orchestrator_id = new_build_orchestrator_id();
+        self.build_orchestrators.borrow_mut().insert(
+            created_orchestrator_response.build_orchestrator_id,
+            Rc::new(orchestrator),
+        );
+        Ok(created_orchestrator_response)
+    }
+
+    // Go: api/session.go handleDisposeBuildOrchestrator (ts#64158)
+    pub fn handle_dispose_build_orchestrator(
+        &self,
+        _ctx: &Context,
+        params: &DisposeBuildOrchestratorParams,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let removed = self
+            .build_orchestrators
+            .borrow_mut()
+            .remove(&params.build_orchestrator_id);
+        if removed.is_none() {
+            return Err(errors::new("build orchestrator not found while disposing"));
+        }
+        Ok(to_any(true))
+    }
+
+    /// The orchestrator for an ID. The map borrow ends before the build runs.
+    fn build_orchestrator(
+        &self,
+        id: BuildOrchestratorID,
+    ) -> Option<Rc<crate::execute::build::orchestrator::Orchestrator>> {
+        self.build_orchestrators.borrow().get(&id).cloned()
+    }
+
+    // Go: api/session.go handleBuild (ts#64158)
+    pub fn handle_build(
+        &self,
+        ctx: &Context,
+        params: &BuildParams,
+    ) -> Result<BuildResponse, GoError> {
+        let Some(orchestrator) = self.build_orchestrator(params.build_orchestrator_id) else {
+            return Err(errors::new(format!(
+                "build orchestrator not found while building {}",
+                params.project
+            )));
+        };
+        let result = orchestrator.build(ctx, &params.project);
+
+        Ok(BuildResponse {
+            status: result.result.status,
+            diagnostics: new_diagnostic_responses(&result.errors),
+            statistics: result.statistics.clone(),
+        })
+    }
+
+    // Go: api/session.go handleBuildReferences (ts#64158)
+    pub fn handle_build_references(
+        &self,
+        ctx: &Context,
+        params: &BuildParams,
+    ) -> Result<BuildResponse, GoError> {
+        let Some(orchestrator) = self.build_orchestrator(params.build_orchestrator_id) else {
+            return Err(errors::new(format!(
+                "build orchestrator not found for building references for {}",
+                params.project
+            )));
+        };
+        let result = orchestrator.build_references(ctx, &params.project);
+
+        Ok(BuildResponse {
+            status: result.result.status,
+            diagnostics: new_diagnostic_responses(&result.errors),
+            statistics: result.statistics.clone(),
+        })
+    }
+
+    // Go: api/session.go handleCleanBuild (ts#64158)
+    pub fn handle_clean_build(
+        &self,
+        _ctx: &Context,
+        params: &CleanBuildParams,
+    ) -> Result<CleanBuildResponse, GoError> {
+        let Some(orchestrator) = self.build_orchestrator(params.build_orchestrator_id) else {
+            return Err(errors::new(format!(
+                "build orchestrator not found while cleaning {}",
+                params.project
+            )));
+        };
+        let result = orchestrator.clean(&params.project);
+        Ok(CleanBuildResponse {
+            status: result.result.status,
+            diagnostics: new_diagnostic_responses(&result.errors),
+            statistics: result.statistics.clone(),
+            files_deleted: result.files_to_delete.clone(),
+        })
+    }
+
+    // Go: api/session.go handleCleanReferences (ts#64158)
+    pub fn handle_clean_references(
+        &self,
+        _ctx: &Context,
+        params: &CleanBuildParams,
+    ) -> Result<CleanBuildResponse, GoError> {
+        let Some(orchestrator) = self.build_orchestrator(params.build_orchestrator_id) else {
+            return Err(errors::new(format!(
+                "build orchestrator not found while cleaning references for {}",
+                params.project
+            )));
+        };
+        let result = orchestrator.clean_references(&params.project);
+        Ok(CleanBuildResponse {
+            status: result.result.status,
+            diagnostics: new_diagnostic_responses(&result.errors),
+            statistics: result.statistics.clone(),
+            files_deleted: result.files_to_delete.clone(),
+        })
+    }
+
+    // Go: api/session.go getBuildSys (ts#64158)
+    pub fn get_build_sys(&self, params: &CreateBuildOrchestratorParams) -> Rc<ApiBuildSystem> {
+        let mut current_directory = params.cwd.clone();
+        if current_directory.is_empty() {
+            current_directory = self.get_current_directory();
+        }
+        Rc::new(ApiBuildSystem {
+            snapshot_host: self.snapshot_host.clone(),
+            project_session: self.project_session.clone(),
+            current_directory,
+            start: std::time::Instant::now(),
+        })
+    }
+
     // Go: api/session.go:699 handleRelease
     // handleRelease decrements the ref count for a snapshot.
     // The snapshot and its registries are only cleaned up when the ref count reaches zero.
@@ -2893,6 +3069,76 @@ pub fn is_valid_create_source_file_script_kind(script_kind: ScriptKind) -> bool 
         script_kind,
         ScriptKind::JS | ScriptKind::JSX | ScriptKind::TS | ScriptKind::TSX | ScriptKind::JSON
     )
+}
+
+// Go: api/session.go apiBuildSystem (ts#64158)
+// Wrapper for the API session for build orchestrator
+// PORT: Go keeps the session; the system needs its snapshot host and project
+// session (Go `session.snapshotHost.FS()` and `session.DefaultLibraryPath()`).
+pub struct ApiBuildSystem {
+    snapshot_host: Rc<project::SnapshotHost>,
+    project_session: Option<Rc<project::Session>>,
+    current_directory: String,
+    start: std::time::Instant,
+}
+
+impl crate::execute::tsc::System for ApiBuildSystem {
+    fn writer(&self) -> crate::execute::tsc::Writer {
+        Rc::new(RefCell::new(std::io::sink()))
+    }
+    fn error_writer(&self) -> crate::execute::tsc::ErrorWriter {
+        std::sync::Arc::new(std::sync::Mutex::new(std::io::sink()))
+    }
+    fn fs(&self) -> Rc<dyn vfs::Fs> {
+        self.snapshot_host.fs()
+    }
+    // PORT: Go `s.session.DefaultLibraryPath()`.
+    fn default_library_path(&self) -> String {
+        if let Some(project_session) = &self.project_session {
+            return project_session.default_library_path();
+        }
+        self.snapshot_host.default_library_path()
+    }
+    fn get_current_directory(&self) -> String {
+        self.current_directory.clone()
+    }
+    fn write_output_is_tty(&self) -> bool {
+        false
+    }
+    fn get_width_of_terminal(&self) -> i32 {
+        0
+    }
+    fn get_environment_variable(&self, _name: &str) -> String {
+        String::new()
+    }
+    fn spawn(
+        &self,
+        _command: &[String],
+        _dir: &str,
+        _stderr: Option<Box<dyn std::io::Write + Send>>,
+    ) -> Result<std::sync::Arc<dyn crate::contentmapper::hostimpl::ProcessExitState>, GoError> {
+        Err(errors::new(
+            "spawning processes is not supported by the API build orchestrator",
+        ))
+    }
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now()
+    }
+    fn since_start(&self) -> std::time::Duration {
+        self.start.elapsed()
+    }
+}
+
+// PORT: Go passes the `tsc.System` as the `tsoptions.ParseConfigHost` of
+// `ParseBuildCommandLine`; Rust needs the impl.
+impl tsoptions::ParseConfigHost for ApiBuildSystem {
+    fn fs(&self) -> Rc<dyn vfs::Fs> {
+        crate::execute::tsc::System::fs(self)
+    }
+
+    fn get_current_directory(&self) -> String {
+        self.current_directory.clone()
+    }
 }
 
 // Go: api/session.go:1257 transpileOutput (tsgo#4849)
