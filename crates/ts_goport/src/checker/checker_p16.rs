@@ -244,7 +244,8 @@ impl Checker {
         merged_parent: SymbolId,
     ) {
         for (id, source_symbol) in self.symbols.entries(source) {
-            let target_symbol = self.symbols.get(target, &id);
+            // PERF: by name id (`get_name`), not by text.
+            let target_symbol = self.symbols.get_name(target, &id);
             let merged = if target_symbol.is_some() {
                 self.merge_symbol(target_symbol, source_symbol, unidirectional)
             } else {
