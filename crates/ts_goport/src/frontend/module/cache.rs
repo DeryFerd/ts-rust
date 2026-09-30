@@ -1,6 +1,7 @@
 //! Port of module/cache.go.
 
 use crate::frontend::prelude::*;
+use std::cell::Cell;
 use std::sync::Arc;
 
 // Go: module/cache.go:11 ModeAwareCache
@@ -107,6 +108,12 @@ pub struct Caches {
     /// `package_json_info_cache` before a read of all its entries
     /// (`Resolver::package_json_cache_entries`).
     pub worker_package_jsons: RefCell<Vec<Arc<[PackageJsonLookup]>>>,
+
+    /// The loader's resolver in `tsc -b`: the file system lookups of the
+    /// worker answers that it took from `shared` (`SharedResolution::lookups`).
+    /// The load adds them to the build host's cache at its end
+    /// (`Resolver::take_worker_lookups`, `BuildStatCache::end_load`).
+    pub worker_lookups: RefCell<Vec<Arc<[StatLookup]>>>,
 }
 
 impl Caches {
@@ -122,6 +129,7 @@ impl Caches {
             shared: None,
             package_json_log: RefCell::new(Vec::new()),
             worker_package_jsons: RefCell::new(Vec::new()),
+            worker_lookups: RefCell::new(Vec::new()),
         }
     }
 
@@ -136,7 +144,14 @@ impl Caches {
             std::mem::take(&mut *self.type_ref_directive_resolution_cache.cache.borrow_mut());
         let patterns = self.parsed_patterns_for_paths.borrow_mut().take();
         let worker_package_jsons = std::mem::take(&mut *self.worker_package_jsons.borrow_mut());
-        drop((modules, type_ref_directives, patterns, worker_package_jsons));
+        let worker_lookups = std::mem::take(&mut *self.worker_lookups.borrow_mut());
+        drop((
+            modules,
+            type_ref_directives,
+            patterns,
+            worker_package_jsons,
+            worker_lookups,
+        ));
         if Rc::strong_count(&self.package_json_info_cache) == 1 {
             self.package_json_info_cache.clear();
         }
@@ -178,6 +193,60 @@ pub struct SharedResolution<T> {
     pub value: T,
     /// The package.json lookups of the resolution (`package_json_log`).
     pub package_jsons: Arc<[PackageJsonLookup]>,
+    /// The file system lookups of the resolution that the `tsc -b` host's
+    /// cache did not have (`note_worker_lookup`). `None` when the worker
+    /// does not log them (no `tsc -b` host).
+    pub lookups: Option<Arc<[StatLookup]>>,
+}
+
+/// A lookup that Go `cachedvfs` caches (all but `Stat`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatKind {
+    FileExists,
+    DirectoryExists,
+    Realpath,
+    Entries,
+}
+
+/// One cached lookup of a parse worker's resolution, without its value.
+/// The value is in the worker cache of the program load
+/// (`BuildStatCache`).
+#[derive(Clone, Debug)]
+pub struct StatLookup {
+    pub kind: StatKind,
+    pub path: String,
+}
+
+thread_local! {
+    /// True on a parse worker thread whose file system reads the `tsc -b`
+    /// host's cache (`set_worker_lookup_log`).
+    static WORKER_LOOKUP_LOG: Cell<bool> = const { Cell::new(false) };
+    /// The lookups of the parse worker resolution that runs on this thread
+    /// now (`Caches::start_package_json_log` to `take_package_json_log`).
+    static WORKER_LOOKUPS: RefCell<Option<Vec<StatLookup>>> = const { RefCell::new(None) };
+}
+
+/// Makes the resolutions of this parse worker thread log their file system
+/// lookups (`note_worker_lookup`) or not.
+// PORT: not in Go. Go parse tasks share the host's cachedvfs, so the
+// lookups of each resolution are in it. A `tsc -b` parse worker keeps its
+// lookups out of the host's cache, and the loader adds the lookups of the
+// answers it takes (`BuildStatCache`).
+pub fn set_worker_lookup_log(on: bool) {
+    WORKER_LOOKUP_LOG.with(|log| log.set(on));
+}
+
+/// Records a lookup of the parse worker resolution that runs on this
+/// thread, if one runs and this thread logs lookups.
+pub fn note_worker_lookup(kind: StatKind, path: &str) {
+    WORKER_LOOKUPS.with(|log| {
+        if let Some(log) = log.borrow_mut().as_mut() {
+            log.push(StatLookup {
+                kind,
+                path: path.to_string(),
+            });
+        }
+    });
 }
 
 /// One Go `getPackageJsonInfo` call of a parse worker's resolution: the
@@ -255,6 +324,11 @@ impl Caches {
     /// Records a package.json lookup of a parse worker's resolution
     /// (`publishes`). `entry` is the package.json cache entry that the
     /// lookup read or stored.
+    ///
+    /// The file system lookups of Go `getPackageJsonInfo` for the entry go
+    /// into the resolution's lookup log too: an earlier resolution of the
+    /// worker made them, but Go makes them in whichever resolution of the
+    /// load reads the entry first, so each one that reads it lists them.
     pub fn log_package_json(&self, entry: &InfoCacheEntry) {
         if self.publishes() {
             self.package_json_log.borrow_mut().push(PackageJsonLookup {
@@ -262,21 +336,43 @@ impl Caches {
                 directory_exists: entry.directory_exists,
                 exists: entry.exists(),
             });
+            if WORKER_LOOKUPS.with(|log| log.borrow().is_some()) {
+                note_worker_lookup(StatKind::DirectoryExists, &entry.package_directory);
+                if entry.directory_exists {
+                    note_worker_lookup(
+                        StatKind::FileExists,
+                        &combine_paths(&entry.package_directory, &["package.json"]),
+                    );
+                }
+            }
         }
     }
 
     /// Starts the package.json log of a parse worker's resolution. The
     /// lookups before it (such as `source_file_meta_data`) are not part of
-    /// a resolution; the loader makes them itself.
+    /// a resolution; the loader makes them itself. It starts the file
+    /// system lookup log too, on a thread that logs them
+    /// (`set_worker_lookup_log`).
     pub fn start_package_json_log(&self) {
         if self.publishes() {
             self.package_json_log.borrow_mut().clear();
+            if WORKER_LOOKUP_LOG.with(Cell::get) {
+                WORKER_LOOKUPS.with(|log| *log.borrow_mut() = Some(Vec::new()));
+            }
         }
     }
 
     /// Takes the package.json lookups of the resolution that just ended.
     pub fn take_package_json_log(&self) -> Arc<[PackageJsonLookup]> {
         std::mem::take(&mut *self.package_json_log.borrow_mut()).into()
+    }
+
+    /// Takes the file system lookups of the resolution that just ended
+    /// (`note_worker_lookup`), and stops the log.
+    pub fn take_worker_lookup_log(&self) -> Option<Arc<[StatLookup]>> {
+        WORKER_LOOKUPS
+            .with(|log| log.borrow_mut().take())
+            .map(Into::into)
     }
 
     /// Keeps the package.json lookups of a worker answer that the loader's
@@ -286,6 +382,14 @@ impl Caches {
             self.worker_package_jsons
                 .borrow_mut()
                 .push(package_jsons.clone());
+        }
+    }
+
+    /// Keeps the file system lookups of a worker answer that the loader's
+    /// resolver took (`worker_lookups`).
+    pub fn note_worker_lookups(&self, lookups: &Option<Arc<[StatLookup]>>) {
+        if let Some(lookups) = lookups.as_ref().filter(|lookups| !lookups.is_empty()) {
+            self.worker_lookups.borrow_mut().push(lookups.clone());
         }
     }
 }

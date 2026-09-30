@@ -382,9 +382,10 @@ The batch that adds it is not accepted until Theo approves.
   runs and a field fallback). The `GoProgram` shell and the static file
   versions stay leaked for now. A one-program process forgets its checkers and the
   synthetic nodes of both pools at the end, like Go. Watch mode uses
-  `program::release_program_later`: the old checker pool stops before the
-  new build, but the frontend and the tables are freed after the status
-  report, so the free is not in the rebuild time.
+  `program::release_program_in_background`: the old checker pool stops
+  without a wait, and the old checkers are freed on the pool threads while
+  the new build runs. A full build keeps the old frontend program until
+  after the status report, so its free is not in the rebuild time.
 - The parse tasks of a load go with the loader. Go's garbage collector
   frees them. Here the `sub_tasks` and `loaded_task` links make an `Rc`
   cycle when files import each other, so the `FilesParser` drop takes
@@ -463,9 +464,12 @@ The batch that adds it is not accepted until Theo approves.
   the program is made (`incremental::Program::start_check`), and a
   released pool frees its checkers in the background
   (`program::release_program_in_background`). So the pools of up to 4
-  started projects work at the same time, like Go's goroutines. The
-  started projects still emit one at a time in build order, and a
-  project's emit runs on its own checker threads and its own emit pool
+  started projects work at the same time, like Go's goroutines. A
+  project's emit starts behind its check when `Program::start_emit`
+  allows it, and its writes wait in a buffer
+  (`buffer_early_emit_writes`) until the task finishes, so the projects
+  still write in build order. A project's emit runs on its own checker
+  threads and its own emit pool
   (see Threads): the emit resolver needs the file's checker, which lives
   on its worker thread, and synthetic nodes are thread-local
   (`ast/synthetic.rs`).
@@ -564,15 +568,17 @@ goroutine trace), and the exit code is 2 (`core::EXIT_GO_PANIC`).
   With `noEmit` or `emitDeclarationOnly` no JS part moves. An emit that
   moves no JS part runs as with the pool off and makes no pool. The
   language server does not emit through `program_emit`.
-- A thread that runs Go code (the work thread of a binary, and the parse,
-  bind, checker, emit, search and goroutine threads) gets the stack size of
-  `gostd::stack::max_stack_size`: 1 GiB, the Go maximum goroutine stack. A
-  Rust stack does not grow, so it is reserved at the start. Under an address
-  space or data limit (`ulimit -v`, `ulimit -d`), the size is 1/64 of the
-  limit and glibc malloc gets one arena (`ThreadBudget::glibc_tunables`),
-  so the threads start and the heap keeps room. The 1/64 share does not
-  count the threads, so with many checkers a run under a low limit can
-  still fail where Go runs (see `gostd/stack.rs`).
+- A thread that runs Go code (the work thread of a binary, the parse,
+  bind, checker, emit, search and goroutine threads, the `tsc -b` config
+  and build info threads, the file watcher thread and the LSP read thread)
+  gets the stack size of `gostd::stack::max_stack_size`: 1 GiB, the Go
+  maximum goroutine stack. A Rust stack does not grow, so it is reserved
+  at the start. Under an address space or data limit (`ulimit -v`,
+  `ulimit -d`), the size is 1/64 of the limit and glibc malloc gets one
+  arena (`ThreadBudget::glibc_tunables`), so the threads start and the
+  heap keeps room. The 1/64 share does not count the threads, so with many
+  checkers a run under a low limit can still fail where Go runs (see
+  `gostd/stack.rs`).
 - `tsc -p` with an incremental program starts its emit with the check (not
   in Go; `incremental::Program::start_check_and_emit`). Go waits for the
   whole check, reads the global diagnostics again, then emits. Here the
@@ -1038,4 +1044,6 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 - API handles across checkers: a type, signature or checker-made symbol of
   one project sent with another project of the same snapshot stays
   `unported!` (a Rust id indexes one checker's arena).
-- Windows named pipes (`--api --pipe` on Windows) return an error.
+- Windows named pipes (`--api --pipe` on Windows) use miow's safe
+  `NamedPipe` (D-W1), not winio's overlapped I/O: `Close` does not end an
+  `Accept` that waits on another thread (see `ipc/transport.rs`).

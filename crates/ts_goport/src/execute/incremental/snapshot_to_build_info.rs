@@ -45,7 +45,7 @@ pub fn snapshot_to_build_info(
         },
         file_name_to_file_id: FxHashMap::default(),
         file_names_to_file_id_list_id: FxHashMap::default(),
-        roots: IndexMap::default(),
+        roots: FxIndexMap::default(),
     };
 
     if snapshot.options.is_incremental() {
@@ -73,7 +73,7 @@ pub fn snapshot_to_build_info(
 }
 
 // Go: incremental/snapshottobuildinfo.go:57 toBuildInfo
-// PORT: Go `roots map[*ast.SourceFile]tspath.Path` is an `IndexMap`; Go
+// PORT: Go `roots map[*ast.SourceFile]tspath.Path` is an `FxIndexMap`; Go
 // sorts its keys before use.
 struct ToBuildInfo<'a> {
     snapshot: &'a Snapshot,
@@ -84,7 +84,7 @@ struct ToBuildInfo<'a> {
     // PORT: Go keys this map by the ids joined with ","; the sorted id list
     // is the same key without the text.
     file_names_to_file_id_list_id: FxHashMap<Vec<BuildInfoFileId>, BuildInfoFileIdListId>,
-    roots: IndexMap<Node, Path>,
+    roots: FxIndexMap<Node, Path>,
 }
 
 impl ToBuildInfo<'_> {
@@ -118,7 +118,7 @@ impl ToBuildInfo<'_> {
     }
 
     // Go: incremental/snapshottobuildinfo.go:86 toFileIdListId
-    fn to_file_id_list_id(&mut self, set: &IndexSet<Path>) -> BuildInfoFileIdListId {
+    fn to_file_id_list_id(&mut self, set: &FxIndexSet<Path>) -> BuildInfoFileIdListId {
         let mut file_ids: Vec<BuildInfoFileId> =
             set.iter().map(|path| self.to_file_id(path)).collect();
         file_ids.sort();

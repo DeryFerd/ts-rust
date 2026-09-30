@@ -452,7 +452,7 @@ fn add_referenced_files_from_import_literal(
 // are the same.
 #[derive(Default)]
 struct ReferencedFileSet {
-    paths: IndexSet<Path>,
+    paths: FxIndexSet<Path>,
     /// The files that `add_file` added.
     files: FxHashSet<Node>,
 }
@@ -494,13 +494,13 @@ fn add_referenced_file_from_file_name(
 // Go: incremental/programtosnapshot.go:258 getReferencedFiles
 // Gets the referenced files for a file from the program with values for the keys as referenced file's path to be true
 #[must_use]
-pub fn get_referenced_files(file: Node) -> Option<IndexSet<Path>> {
+pub fn get_referenced_files(file: Node) -> Option<FxIndexSet<Path>> {
     start_referenced_files_job(file).wait()
 }
 
 /// The result of `get_referenced_files`, computed on the file's checker
 /// thread.
-pub type ReferencedFilesJob = CheckerJob<Option<IndexSet<Path>>>;
+pub type ReferencedFilesJob = CheckerJob<Option<FxIndexSet<Path>>>;
 
 /// Sends `get_referenced_files` for `file` to its checker thread without
 /// waiting (see `compute_program_file_changes`).

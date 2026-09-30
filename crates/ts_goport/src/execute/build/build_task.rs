@@ -4,9 +4,9 @@ use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::host::{BuildCompilerHost, BuildHost};
 use crate::execute::build::up_to_date_status::*;
 use crate::execute::incremental::build_info::{
-    content_mapper_identities, is_build_info_file_name_default_library,
+    BuildInfoRootInfoReader, content_mapper_identities, is_build_info_file_name_default_library,
 };
-use crate::execute::incremental::emit_files::fs_error_text;
+use crate::execute::incremental::emit_files::{buffer_early_emit_writes, fs_error_text};
 use crate::execute::incremental::incremental::{BuildInfoReader, Host as IncrementalHost};
 use crate::execute::incremental::program::{
     NestedEmitNow, Program as IncrementalProgram, new_program as new_incremental_program,
@@ -41,7 +41,8 @@ use std::time::SystemTime;
 // `order` (see orchestrator.rs). The work that Go does on the task
 // goroutines still runs at the same time: each program checks on its own
 // checker threads from `build_project_start` on (`start_check`), emits on
-// them, and frees them in the background (`release_task_program`).
+// them when the check ends (the writes wait for `build_project_finish`),
+// and frees them in the background (`release_task_program`).
 //
 // PORT: the watch-only `updateWatch` and `resetConfig` are in
 // orchestrator_watch.rs, with the orchestrator watch code.
@@ -79,6 +80,69 @@ pub struct BuildInfoEntry {
     pub path: Path,
     pub m_time: Option<SystemTime>,
     pub dts_time: Option<Option<SystemTime>>,
+    // PORT: not in Go (perf). What a build info thread made from
+    // `build_info` for the up-to-date check (`StatusPrefetch`), until the
+    // check takes it.
+    pub status_prefetch: Option<Rc<StatusPrefetch>>,
+}
+
+/// PORT: not in Go (perf). The parts of `getUpToDateStatus` that a build
+/// info thread computes from the build info it read, ahead of the check
+/// (see `BuildInfoPrefetch` in orchestrator.rs). Go computes them in the
+/// check, on the task's builder goroutine. The check uses them only when
+/// they were made for its build info directory and file lists.
+pub struct StatusPrefetch {
+    /// The build info directory that the other fields are for.
+    pub build_info_directory: String,
+    /// Go `getBuildInfoRootInfoReader()`.
+    pub root_info_reader: BuildInfoRootInfoReader,
+    /// `toPath` of each root file (`resolved.FileNames()`), in order.
+    pub input_paths: Vec<Path>,
+    /// `GetNormalizedAbsolutePath(buildInfoFileName, buildInfoDirectory)`
+    /// and its `toPath`, for each build info file name, in order.
+    pub file_names: Vec<(String, Path)>,
+}
+
+impl StatusPrefetch {
+    /// The check parts of `build_info`, read from `build_info_file_name`
+    /// for a task with the root files `input_files`.
+    pub fn new(
+        build_info: &BuildInfo,
+        build_info_file_name: &str,
+        input_files: &[String],
+        compare_paths_options: &ComparePathsOptions,
+    ) -> Self {
+        let to_path_fn = |file_name: &str| {
+            to_path(
+                file_name,
+                &compare_paths_options.current_directory,
+                compare_paths_options.use_case_sensitive_file_names,
+            )
+        };
+        let build_info_directory = get_directory_path(&get_normalized_absolute_path(
+            build_info_file_name,
+            &compare_paths_options.current_directory,
+        ));
+        let root_info_reader = build_info
+            .get_build_info_root_info_reader(&build_info_directory, compare_paths_options);
+        let input_paths = input_files.iter().map(|file| to_path_fn(file)).collect();
+        let file_names = build_info
+            .file_names
+            .iter()
+            .flatten()
+            .map(|name| {
+                let file = get_normalized_absolute_path(name, &build_info_directory);
+                let path = to_path_fn(&file);
+                (file, path)
+            })
+            .collect();
+        StatusPrefetch {
+            build_info_directory,
+            root_info_reader,
+            input_paths,
+            file_names,
+        }
+    }
 }
 
 // Go: tsc/diagnostics.go:26 DiagnosticReporter, bound to the task's writer.
@@ -165,6 +229,13 @@ pub trait BuildTaskOrchestrator {
     // Go: `incremental.NewBuildInfoReader(o.host).ReadBuildInfo(config)`
     // (uncached read from disk).
     fn read_build_info_file(&self, config: &ParsedCommandLine) -> Option<Rc<BuildInfo>>;
+
+    /// PORT: not in Go (perf). What a build info thread made for the check
+    /// from the build info that `read_build_info_file` just gave for
+    /// `build_info_file_name` (`StatusPrefetch`).
+    fn take_status_prefetch(&self, _build_info_file_name: &str) -> Option<StatusPrefetch> {
+        None
+    }
     // Go: `o.opts.Sys`
     fn sys(&self) -> Rc<dyn System>;
     // Go: `o.host`
@@ -224,6 +295,11 @@ struct PendingCompile {
     report_diagnostic: DiagnosticReporter,
     errors: Rc<RefCell<Vec<Diagnostic>>>,
     compile_times: Rc<RefCell<CompileTimes>>,
+    // Go `t.writeFile`, and the build info that it wrote.
+    write_file: WriteFile,
+    written_build_info: WrittenBuildInfo,
+    // `incremental_program.start_emit` ran (see `compile_and_emit_start`).
+    emit_started: bool,
 }
 
 impl BuildTask {
@@ -529,7 +605,7 @@ impl BuildTask {
         // from that cache, and the workers would parse them for nothing.
         let mut host_has_parses = false;
         host.source_files
-            .for_each_stored(|_| host_has_parses = true);
+            .for_each_stored(|_, _| host_has_parses = true);
         if !host_has_parses {
             crate::execute::execute_tsc::start_lib_prefetch(&*sys, &resolved, testing.is_some());
         }
@@ -570,6 +646,14 @@ impl BuildTask {
         // Go: compiler.NewProgram(compiler.ProgramOptions{Config, Host})
         let program = crate::execute::execute_tsc::new_program_version(compiler_host, resolved);
         compile_times.borrow_mut().parse_time = elapsed(&*sys, parse_start);
+        let written_build_info: WrittenBuildInfo = Arc::default();
+        let write_file = new_task_write_file(
+            written_build_info.clone(),
+            self.store_output_time_stamp(orchestrator),
+            host.m_times.clone(),
+            orchestrator.compare_paths_options().clone(),
+        );
+        let emit_started = testing.is_none();
         let changes_compute_start = sys.now();
         let incremental_program = {
             let _scope = crate::core::enter_program(Some(program));
@@ -585,14 +669,30 @@ impl BuildTask {
                 testing.is_some(),
             );
             compile_times.borrow_mut().changes_compute_time = elapsed(&*sys, changes_compute_start);
-            // PORT: Go checks this project on its goroutine while other
-            // tasks make their programs and emit. Here the check starts on
-            // this program's checker threads now, and the emit
-            // (`compile_and_emit_finish`) waits for it. The statistics'
-            // check time is the time of that wait plus the time that
+            // PORT: Go checks and emits this project on its goroutine
+            // while other tasks make their programs and emit. Here the
+            // check starts on this program's checker threads now, and so
+            // does the emit, behind the check, as in `tsc -p` (when the
+            // rules of `Program::start_emit` allow it; else the emit runs
+            // in `compile_and_emit_finish`). The emit keeps its writes
+            // until `compile_and_emit_finish`, which writes them first
+            // (`buffer_early_emit_writes`): the tasks still write in build
+            // order, and a task that runs beside others reads the file
+            // system before they write. The statistics' check time is the
+            // time of the wait for the check plus the time that
             // `start_check` spent on the affected files
             // (`Program::take_started_check_time`).
+            // PORT: testing. A test finishes the task at once, and its emit
+            // starts there, as without the early start.
             incremental_program.start_check();
+            if emit_started {
+                buffer_early_emit_writes(|| {
+                    incremental_program.start_emit(EmitOptions {
+                        write_file: Some(write_file.clone()),
+                        ..EmitOptions::default()
+                    });
+                });
+            }
             incremental_program
         };
         self.compile = Some(PendingCompile {
@@ -603,6 +703,9 @@ impl BuildTask {
             report_diagnostic,
             errors,
             compile_times,
+            write_file,
+            written_build_info,
+            emit_started,
         });
         true
     }
@@ -618,17 +721,13 @@ impl BuildTask {
             report_diagnostic,
             errors,
             compile_times,
+            write_file,
+            written_build_info,
+            emit_started,
         } = self.compile.take().expect("compile_and_emit_start ran");
         let sys = orchestrator.sys();
         let host = orchestrator.host();
         let resolved = self.resolved().clone();
-        let written_build_info: WrittenBuildInfo = Arc::default();
-        let write_file = new_task_write_file(
-            written_build_info.clone(),
-            self.store_output_time_stamp(orchestrator),
-            host.m_times.clone(),
-            orchestrator.compare_paths_options().clone(),
-        );
         let (result, statistics) = {
             let _scope = crate::core::enter_program(Some(program));
             WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = Some(sys.clone()));
@@ -636,11 +735,14 @@ impl BuildTask {
             // `tsc -p` (`Program::start_check_and_emit`), with the options of
             // the emit call in `EmitFilesAndReportErrors` (the same
             // `WriteFile`). `EmitAndReportStatistics` makes the same calls
-            // as in Go and waits for that work.
-            incremental_program.start_emit(EmitOptions {
-                write_file: Some(write_file.clone()),
-                ..EmitOptions::default()
-            });
+            // as in Go and waits for that work. Outside tests the emit
+            // started with the program (`compile_and_emit_start`).
+            if !emit_started {
+                incremental_program.start_emit(EmitOptions {
+                    write_file: Some(write_file.clone()),
+                    ..EmitOptions::default()
+                });
+            }
             let emitted = emit_and_report_statistics(&EmitInput {
                 sys: &*sys,
                 program_like: &incremental_program,
@@ -921,6 +1023,18 @@ impl BuildTask {
             &build_info_path,
             &orchestrator.compare_paths_options().current_directory,
         ));
+        // PORT: perf. The parts that a build info thread computed, when
+        // they are for this directory and these file lists.
+        let prefetched = self
+            .build_info_entry
+            .as_mut()
+            .and_then(|entry| entry.status_prefetch.take())
+            .filter(|prefetched| {
+                prefetched.build_info_directory == build_info_directory
+                    && prefetched.input_paths.len() == resolved.file_names().len()
+                    && prefetched.file_names.len()
+                        == build_info.file_names.as_ref().map_or(0, Vec::len)
+            });
         if options.is_incremental() {
             if !build_info.is_incremental() {
                 // Program options out of date
@@ -970,8 +1084,17 @@ impl BuildTask {
         };
         let mut newest_input_file_and_time = FileAndTime::default();
         let mut seen_roots: FxHashSet<Path> = FxHashSet::default();
-        let mut build_info_root_info_reader = None;
-        for input_file in resolved.file_names() {
+        // Go `getBuildInfoRootInfoReader`, made once.
+        let mut owned_reader = None;
+        let make_reader = |owned_reader: &mut Option<BuildInfoRootInfoReader>| {
+            if prefetched.is_none() && owned_reader.is_none() {
+                *owned_reader = Some(build_info.get_build_info_root_info_reader(
+                    &build_info_directory,
+                    orchestrator.compare_paths_options(),
+                ));
+            }
+        };
+        for (index, input_file) in resolved.file_names().iter().enumerate() {
             let input_time = orchestrator.get_m_time(input_file);
             if input_time.is_none() {
                 return UpToDateStatus::with_data(
@@ -979,17 +1102,16 @@ impl BuildTask {
                     UpToDateStatusData::String(input_file.clone()),
                 );
             }
-            let input_path = orchestrator.to_path(input_file);
+            let input_path = match &prefetched {
+                Some(prefetched) => prefetched.input_paths[index].clone(),
+                None => orchestrator.to_path(input_file),
+            };
             if input_time > oldest_output_file_and_time.time {
                 let mut version = String::new();
                 let mut current_version = String::new();
                 if build_info.is_incremental() {
-                    let reader = build_info_root_info_reader.get_or_insert_with(|| {
-                        build_info.get_build_info_root_info_reader(
-                            &build_info_directory,
-                            orchestrator.compare_paths_options(),
-                        )
-                    });
+                    make_reader(&mut owned_reader);
+                    let reader = reader_of(&prefetched, &owned_reader);
                     let (build_info_file_info, resolved_input_path) =
                         reader.get_build_info_file_info(&input_path);
                     if let Some(file_info) = build_info_file_info.map(|b| b.get_file_info()) {
@@ -1027,12 +1149,8 @@ impl BuildTask {
             seen_roots.insert(input_path);
         }
 
-        let reader = build_info_root_info_reader.get_or_insert_with(|| {
-            build_info.get_build_info_root_info_reader(
-                &build_info_directory,
-                orchestrator.compare_paths_options(),
-            )
-        });
+        make_reader(&mut owned_reader);
+        let reader = reader_of(&prefetched, &owned_reader);
         for root in reader.roots() {
             let root: &Path = &root;
             if !seen_roots.contains(root) {
@@ -1064,9 +1182,17 @@ impl BuildTask {
                 if is_build_info_file_name_default_library(build_info_file_name) {
                     continue;
                 }
-                let input_file =
-                    get_normalized_absolute_path(build_info_file_name, &build_info_directory);
-                let input_path = orchestrator.to_path(&input_file);
+                let (input_file, input_path) = match &prefetched {
+                    Some(prefetched) => prefetched.file_names[index].clone(),
+                    None => {
+                        let input_file = get_normalized_absolute_path(
+                            build_info_file_name,
+                            &build_info_directory,
+                        );
+                        let input_path = orchestrator.to_path(&input_file);
+                        (input_file, input_path)
+                    }
+                };
                 // Root files are already checked
                 if seen_roots.contains(&input_path) || resolved_roots.contains(&input_path) {
                     continue;
@@ -1512,6 +1638,9 @@ impl BuildTask {
             }
         }
         let build_info = orchestrator.read_build_info_file(self.resolved());
+        let status_prefetch = orchestrator
+            .take_status_prefetch(build_info_file_name)
+            .map(Rc::new);
         let mut m_time = None;
         if build_info.is_some() {
             m_time = orchestrator.get_m_time(build_info_file_name);
@@ -1521,6 +1650,7 @@ impl BuildTask {
             path,
             m_time,
             dts_time: None,
+            status_prefetch,
         });
         (build_info, m_time)
     }
@@ -1550,6 +1680,7 @@ impl BuildTask {
             path: orchestrator.to_path(build_info_file_name),
             m_time: Some(m_time),
             dts_time,
+            status_prefetch: None,
         });
     }
 
@@ -1598,6 +1729,18 @@ impl BuildTask {
 
     // Go: build/buildtask.go:910 (*BuildTask).writeFile
     // PORT: see `new_task_write_file`.
+}
+
+/// The root info reader of an up-to-date check: the prefetched one, or the
+/// one that the check made.
+fn reader_of<'a>(
+    prefetched: &'a Option<Rc<StatusPrefetch>>,
+    owned: &'a Option<BuildInfoRootInfoReader>,
+) -> &'a BuildInfoRootInfoReader {
+    match prefetched {
+        Some(prefetched) => &prefetched.root_info_reader,
+        None => owned.as_ref().expect("the check made its root info reader"),
+    }
 }
 
 // Go: build/buildtask.go:625 isContentMapperSupplementalBuildInfoPath (tsgo#4712)

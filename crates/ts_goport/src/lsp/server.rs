@@ -1661,8 +1661,11 @@ impl Server {
         {
             let shared = self.shared.clone();
             let ctx = ctx.clone();
+            // The Go stack size: the read loop decodes the initialize
+            // params, whose `LSPAny` values decode one call per level.
             std::thread::Builder::new()
                 .name("lsp-reader".to_string())
+                .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
                     match catch_unwind(AssertUnwindSafe(|| shared.read_loop(&ctx, &mut *r))) {
                         Ok(err) => {

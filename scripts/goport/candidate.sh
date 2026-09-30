@@ -21,7 +21,15 @@
 #                          base results (oracle-compare.py); rustfmt and clippy on ts_goport and the kept
 #                          crates. The gate and the oracles run on --gate-host (default dbook-lan). The base
 #                          is the last accepted revision (open_revision.py --base). Each step is cached by
-#                          source under evidence-cache/<key>/ and reused.
+#                          source under evidence-cache/<key>/ and reused. The oracle compares use the answer
+#                          sets of the base (protectedBase.oracleAnswers) and of the batch (batch.oracleAnswers)
+#                          with --answers. With batch.oracleRebase (a pin bump, reviewer ruling 10) their base
+#                          is its runs of each kind, with --parity, the API knownDiffs and --identity. A passing
+#                          compare is reused only when it used the same base runs, answer sets and rebase
+#                          record. To redo only the compares (for example after root sets batch.oracleRebase),
+#                          move the old <kind>.json, <kind>-fail.json and <kind>-compare.json aside and run side
+#                          with a new label: the oracle runs stay in lsp-run and api-run, so no oracle runs
+#                          again. Check first with --dry-run that every other step says "reuse".
 #   verdict-request <rev>  The request text for the auditor and the reviewer, then the accept command.
 # --dry-run prints each command that writes and runs only the read-only checks.
 # The state, target/ and the host commands (gate.sh, lsp_oracle.py, api_oracle.py, which remote.sh sync-scripts
@@ -99,6 +107,38 @@ in_scope() {
   for pat in "$@"; do if [[ $path == $pat ]]; then return 0; fi; done
   return 1
 }
+# oracle_setup <base json>: the base results dirs and extra arguments of oracle-compare.py per kind (lsp, api).
+# OBASE[kind]: the base dirs, protectedBase's run (the <base json> .lsp.dir or .api.dir) or the runs of
+# batch.oracleRebase. OARGS[kind]: --answers for each answer set of the base (protectedBase.oracleAnswers) and of
+# the batch (batch.oracleAnswers) of that kind, each once, and with oracleRebase --parity, --known-diff for each
+# key of its knownDiffs and --identity; then --kind. Each answer set file must have its sha256. OKEY[kind] names
+# the base dirs, the arguments and the rebase record: a passing compare is reused only with the same key.
+# OREBASE[kind] is the rebase record of the kind (JSON) or empty.
+declare -A OBASE=([lsp]='' [api]='') OARGS=([lsp]='' [api]='') OKEY=([lsp]='' [api]='') OREBASE=([lsp]='' [api]='')
+oracle_setup() {
+  local base=$1 cfg kind path hash dir
+  cfg=$(node scripts/state.mjs export | jq -c --argjson base "$base" '{rebase: .batch.oracleRebase,
+    sets: ([($base.oracleAnswers // [])[], (.batch.oracleAnswers // [])[]] | unique_by([.kind, .sha256]) | sort_by(.sha256))}')
+  for kind in lsp api; do
+    OARGS[$kind]='' OREBASE[$kind]=$(jq -c --arg k "$kind" '.rebase[$k] // empty' <<< "$cfg")
+    while IFS=$'\t' read -r path hash; do
+      [[ $path == /* ]] || path=$ROOT/$path
+      [[ -f $path && $(sha "$path") == "$hash" ]] || die "answer set $path does not have the sha256 $hash"
+      OARGS[$kind]+="--answers $path@$hash "
+    done < <(jq -r --arg k "$kind" '.sets[] | select(.kind == $k) | [.path, .sha256] | @tsv' <<< "$cfg")
+    if [[ -n ${OREBASE[$kind]} ]]; then
+      OBASE[$kind]=''
+      while IFS= read -r dir; do OBASE[$kind]+="${OBASE[$kind]:+ }$dir"; done < <(jq -r '.runs[].dir' <<< "${OREBASE[$kind]}")
+      OARGS[$kind]+="--parity --identity $(jq -r '(.knownDiffs // [])[] | "--known-diff " + (.key | @sh) + " "' <<< "${OREBASE[$kind]}" | tr -d '\n')"
+    else
+      OBASE[$kind]=$(jq -r --arg k "$kind" '.[$k].dir // empty' <<< "$base")
+    fi
+    [[ -z ${OARGS[$kind]} ]] || OARGS[$kind]+="--kind $kind "
+    OKEY[$kind]="${OBASE[$kind]}${OARGS[$kind]:+ ${OARGS[$kind]% }}"
+    [[ -z ${OREBASE[$kind]} ]] || OKEY[$kind]+=" rebase=$(jq -cS . <<< "${OREBASE[$kind]}" | sha256sum | cut -c1-16)"
+  done
+}
+
 # pathspecs: git pathspecs of POS minus NEG.
 pathspecs() {
   local p
@@ -429,11 +469,13 @@ side_unit() {
     fi
   fi
 
-  # oracle_json <kind> <out-root> <label> <base results dir> <record>: compares the results of <label> with the
-  # base per request (oracle-compare.py) and writes <record>.json, or <record>-fail.json on a loss or without a
-  # base. The finished run's label stays in <record>-run, so a rerun only compares again.
+  # oracle_json <kind> <out-root> <label> <base results dirs> <record>: compares the results of <label> with the
+  # base per request (oracle-compare.py with OARGS, see oracle_setup) and writes <record>.json, or
+  # <record>-fail.json on a loss, a parity problem, a rebase run that is not the base bins at the batch pin, or
+  # without a base; the other one goes, as it is not the last compare. Exit 2 (bad input or a refused answer set)
+  # stops the side run. The finished run's label stays in <record>-run, so a rerun only compares again.
   oracle_json() {
-    local kind=$1 root=$2 lab=$3 base=$4 rec=$5 rc=0 out
+    local kind=$1 root=$2 lab=$3 base=$4 rec=$5 rc=0 prc=0 out
     [[ $DRY == 1 ]] || echo "$lab" > "$C/$rec-run"
     if [[ -z $base ]]; then
       # The other steps still run. The first goport batch needs the rule's apiBaseline (an API run of the R131 bins).
@@ -441,16 +483,31 @@ side_unit() {
       fails+="${fails:+; }$kind oracle: no base results ($lab ran; a rerun compares it once the base exists)"
       return 0
     fi
-    say "$(date -u +%FT%TZ) $kind compare with the base $base"
-    run_sh "python3 $G/oracle-compare.py $base $root/results/$lab --out $C/$rec-compare.json > /dev/null" || rc=$?
+    say "$(date -u +%FT%TZ) $kind compare with the base $base${OARGS[$rec]:+ (${OARGS[$rec]% })}"
+    run_sh "python3 $G/oracle-compare.py $base $root/results/$lab ${OARGS[$rec]}--out $C/$rec-compare.new.json > /dev/null" || rc=$?
     [[ $DRY == 0 ]] || return 0
-    [[ -f $C/$rec-compare.json ]] || die "$kind compare rc $rc and no $C/$rec-compare.json"
+    ((rc < 2)) && [[ -f $C/$rec-compare.new.json ]] || die "$kind compare rc $rc: bad input or a refused answer set (see this log)"
+    mv "$C/$rec-compare.new.json" "$C/$rec-compare.json"
     out=$C/$rec.json
     ((rc == 0)) || { out=$C/$rec-fail.json; fails+="${fails:+; }$kind oracle: oracle-compare.py rc $rc ($C/$rec-compare.json)"; }
-    python3 - "$kind" "$root/results/$lab" "$lab" "$host" "$base" "$C/$rec-compare.json" > "$out" <<'PY'
+    python3 - "$kind" "$root/results/$lab" "$lab" "$host" "${OKEY[$rec]}" "$C/$rec-compare.json" "${OREBASE[$rec]:-null}" "$bg" > "$C/$rec.new.json" <<'PY' || prc=$?
 import collections, json, sys
-kind, rdir, label, host, base, cmp_path = sys.argv[1:]
-s, c = json.load(open(f'{rdir}/summary.json')), json.load(open(cmp_path))
+kind, rdir, label, host, key, cmp_path, rebase, gate = sys.argv[1:]
+s, c, rebase = json.load(open(f'{rdir}/summary.json')), json.load(open(cmp_path)), json.loads(rebase)
+# With batch.oracleRebase (ruling 10 condition 1): each base run has its resultsSha256, the base gate's tsgo and the
+# batch pin's oracle, and the new run that oracle. The check and accept_revision.py refuse the same.
+problems, heads = [], c.get('bases') or [c['base']]
+if rebase:
+    tsgo = ((json.load(open(gate)).get('binaries') or {}).get('tsgo') or {}).get('sha256')
+    if rebase.get('binsSha256') != tsgo:
+        problems.append(f"binsSha256 {rebase.get('binsSha256')} is not the base gate tsgo {tsgo}")
+    for run, h in zip(rebase['runs'], heads):
+        if h.get('resultsSha256') != run.get('resultsSha256'):
+            problems.append(f"{run['dir']} has resultsSha256 {h.get('resultsSha256')}, batch.oracleRebase says {run.get('resultsSha256')}")
+        if h.get('goportSha256') != [rebase.get('binsSha256')] or h.get('oracleSha256') != [rebase.get('oracleSha256')]:
+            problems.append(f"{run['dir']} ran tsgo {h.get('goportSha256')} with the oracle {h.get('oracleSha256')}")
+    if c['new'].get('oracleSha256') != [rebase.get('oracleSha256')]:
+        problems.append(f"the new run used the oracle {c['new'].get('oracleSha256')}")
 classes = collections.Counter()
 if kind == 'LSP':
     for x in s['batteries'].values():
@@ -462,15 +519,34 @@ else:
     requests, crash = sum(classes.values()), classes['crash']
 print(json.dumps({'label': label, 'host': host, 'resultsDir': rdir, 'summary': f'{rdir}/summary.md', 'requests': requests,
                   'same': classes['same'], 'diff': classes['diff'], 'goportError': classes['goport_error'], 'crash': crash,
-                  'timeout': classes['timeout'], 'classes': dict(classes), 'base': {'label': c['base']['label'], 'dir': base},
-                  'compareOutput': cmp_path, 'compare': c['total']}))
+                  'timeout': classes['timeout'], 'classes': dict(classes), 'base': {'label': heads[0]['label'], 'dir': heads[0]['dir']},
+                  'bases': [{'label': h['label'], 'dir': h['dir']} for h in heads], 'compareKey': key, 'compareOutput': cmp_path,
+                  'compare': c['total'], 'answers': sorted(a['sha256'] for a in c.get('answers') or []),
+                  **({'parity': {k: v for k, v in c['parity'].items() if k != 'badFirst'}} if c.get('parity') else {}),
+                  **({'rebaseProblems': problems} if problems else {})}))
+sys.exit(3 if problems else 0)
 PY
-    ((rc)) || rm -f "$C/$rec-fail.json"
+    if ((prc == 3)); then out=$C/$rec-fail.json; fails+="${fails:+; }$kind oracle: the rebase runs are not the base bins at the batch pin ($C/$rec-fail.json)"
+    elif ((prc)); then die "$kind oracle record rc $prc"; fi
+    mv "$C/$rec.new.json" "$out"
+    if [[ $out == "$C/$rec.json" ]]; then rm -f "$C/$rec-fail.json"; else rm -f "$C/$rec.json"; fi
   }
+  # oracle_done <record>: true when <record>.json is a passing compare with the current OKEY (an older record without
+  # compareKey was a compare with its base dir alone).
+  oracle_done() {
+    [[ -f $C/$1.json ]] && jq -e .compare "$C/$1.json" > /dev/null && [[ $(jq -r '.compareKey // .base.dir' "$C/$1.json") == "${OKEY[$1]}" ]]
+  }
+  if [[ -n $base ]]; then
+    oracle_setup "$base"
+    local la=${OARGS[lsp]% } aa=${OARGS[api]% }
+    say "oracle bases: LSP ${OBASE[lsp]:-none}, API ${OBASE[api]:-none}; extra compare arguments: LSP ${la:-none}; API ${aa:-none}"
+  else
+    OBASE=([lsp]="$bl" [api]="$ba")
+  fi
 
   # LSP oracle (the batteries of the R121 to R125 side scripts).
-  if [[ -f $C/lsp.json ]] && jq -e .compare "$C/lsp.json" > /dev/null; then say "reuse LSP oracle $(jq -r .label "$C/lsp.json")"
-  elif [[ -f $C/lsp-run ]]; then say "reuse LSP run $(cat "$C/lsp-run")"; oracle_json LSP "$R/ls-oracle/battery" "$(cat "$C/lsp-run")" "$bl" lsp
+  if oracle_done lsp; then say "reuse LSP oracle $(jq -r .label "$C/lsp.json")"
+  elif [[ -f $C/lsp-run ]]; then say "reuse LSP run $(cat "$C/lsp-run")"; oracle_json LSP "$R/ls-oracle/battery" "$(cat "$C/lsp-run")" "${OBASE[lsp]}" lsp
   else
     ll=$(free_name "$R/ls-oracle/battery/results" "lsp-$label") rc=0
     oracle=$(python3 scripts/upstream/pin.py path oracle ${pin:+"$pin"})
@@ -483,14 +559,14 @@ PY
     on_host "" "$l" "$C/lsp-$ll.log" || rc=$?  # the oracle path carries the pin
     [[ $host == local ]] || run_sh "scripts/goport/remote.sh fetch $host $R/ls-oracle/battery/results/$ll >> $C/sync.log 2>&1"
     [[ $DRY == 1 || $rc == 0 ]] || die "LSP oracle $ll rc $rc (log $C/lsp-$ll.log)"
-    oracle_json LSP "$R/ls-oracle/battery" "$ll" "$bl" lsp
+    oracle_json LSP "$R/ls-oracle/battery" "$ll" "${OBASE[lsp]}" lsp
   fi
 
   # API oracle (api_oracle.py, the batteries of API_BATTERIES, and API_EXT_BATTERIES unless the pin's oracle is
   # in API_NO_EXT_ORACLES): one check per battery. GOPORT_PIN selects the pin's traces (a pin cache); the goldens
   # are golden/<oracle sha256 prefix>.
-  if [[ -f $C/api.json ]] && jq -e .compare "$C/api.json" > /dev/null; then say "reuse API oracle $(jq -r .label "$C/api.json")"
-  elif [[ -f $C/api-run ]]; then say "reuse API run $(cat "$C/api-run")"; oracle_json API "$R/tests2/api" "$(cat "$C/api-run")" "$ba" api
+  if oracle_done api; then say "reuse API oracle $(jq -r .label "$C/api.json")"
+  elif [[ -f $C/api-run ]]; then say "reuse API run $(cat "$C/api-run")"; oracle_json API "$R/tests2/api" "$(cat "$C/api-run")" "${OBASE[api]}" api
   else
     al=$(free_name "$R/tests2/api/results" "api-$label") rc=0
     oracle=$(python3 scripts/upstream/pin.py path oracle ${pin:+"$pin"})
@@ -507,7 +583,7 @@ PY
     on_host "$pin" "$l" "$C/api-$al.log" || rc=$?
     [[ $host == local ]] || run_sh "scripts/goport/remote.sh fetch $host $R/tests2/api/results/$al >> $C/sync.log 2>&1"
     [[ $DRY == 1 || $rc == 0 ]] || die "API oracle $al rc $rc (log $C/api-$al.log)"
-    oracle_json API "$R/tests2/api" "$al" "$ba" api
+    oracle_json API "$R/tests2/api" "$al" "${OBASE[api]}" api
   fi
 
   # Quality on the checkout: rustfmt and clippy (R114 and R124 were refused for quality alone).
@@ -631,16 +707,50 @@ if fruns:
         missing.append('a flake note for each item of a failed gate run: ' + ', '.join(nf[:10]))
 else:
     ev.append('Failed gate runs of this source: none.')
+# The oracle base (batch.oracleRebase runs at a pin bump, else protectedBase) and the answer sets of the base and the
+# batch: each compare must have used them (accept_revision.py and the check refuse otherwise).
+rebase = b.get('oracleRebase')
+sets = {(r['kind'], r['sha256']): r for r in (base.get('oracleAnswers') or []) + (b.get('oracleAnswers') or [])}
+# The answer sets that accept_revision.py keeps in batch.oracleAnswers: the base's at the batch pin and the batch's own.
+pin_to = ((b.get('upstreamPin') or {}).get('to') or '').lower()
+bound_sets = [r for r in base.get('oracleAnswers') or [] if pin_to and (r['pin'].startswith(pin_to) or pin_to.startswith(r['pin']))] \
+    + (b.get('oracleAnswers') or [])
+canon_sha = lambda v: __import__('hashlib').sha256(json.dumps(v, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+if rebase:
+    ev.append(f"Oracle rebase (reviewer ruling 10), batch.oracleRebase sha256 {canon_sha(rebase)}: the base is the base batch's bins "
+              f"(tsgo {rebase['lsp']['binsSha256']}) measured again with the batch pin's oracle ({rebase['lsp']['oracleSha256'][:12]}): "
+              + '; '.join(f"{k.upper()} runs " + ', '.join(f"{r['label']} ({rel(r['dir'])}, resultsSha256 {r['resultsSha256']})" for r in rebase[k]['runs'])
+                          for k in ('lsp', 'api'))
+              + '. API known diffs: ' + ('; '.join(f"{d['key']}: {d['reason']}" for d in rebase['api'].get('knownDiffs') or []) or 'none')
+              + '. Check the runs against the base batch record and each known diff against Go at the batch pin.')
+if sets:
+    ev.append('Oracle answer sets (protectedBase.oracleAnswers and batch.oracleAnswers): ' + '; '.join(
+        f"{r['kind']} {rel(r['path'])} sha256 {r['sha256']} (pin {r['pin']})" for r in sorted(sets.values(), key=lambda r: (r['kind'], r['path']))) + '.')
 for name, k in (('LSP', 'lsp'), ('API', 'api')):
     x = load(k) or load(f'{k}-fail')
     if not x:
         missing.append(f'{name} oracle compared with the base (candidate.sh side)')
         continue
     c = x['compare']
+    want = [rel(r['dir']) for r in rebase[k]['runs']] if rebase else [rel((base.get(k) or {}).get('dir') or '')]
+    got = [rel(r['dir']) for r in x.get('bases') or [x['base']]]
     ev.append(f"{name} oracle {x['label']}{' FAILED' if not load(k) else ''} ({rel(x['summary'])}, {x['host']}): {x['requests']:,} requests, "
               f"{x['same']:,} same, {x['diff']} diff, {x['goportError']} goport_error, {x['crash']} crash, {x['timeout']} timeout. "
-              f"Per request against base {x['base']['label']} ({rel(x['base']['dir'])}): retained {c['retained']:,}, recovered {c['recovered']}, "
-              f"lost {c['lost']}, unrun {c['unrun']}, absent {c['absent']}, new {c['newRequests']} ({rel(x['compareOutput'])}).")
+              f"Per request against base {', '.join(r['label'] for r in x.get('bases') or [x['base']])} ({', '.join(got)}): "
+              f"retained {c['retained']:,}, recovered {c['recovered']}, lost {c['lost']}, unrun {c['unrun']}, absent {c['absent']}, "
+              f"new {c['newRequests']}" + (f", retained by answer sets {c['retainedByAnswers']}" if 'retainedByAnswers' in c else '')
+              + f" ({rel(x['compareOutput'])}).")
+    par = x.get('parity')
+    if par:
+        ev.append(f"{name} parity at the batch pin (ruling 10 condition 3): {par['bad']} problems, {par['answerRequests']} answer set requests "
+                  f"({par['allowedByAnswers']} allowed by their set), {par['knownDiffsUsed']} of {par['knownDiffs']} known diffs, "
+                  f"crash exits {par['crashExits']}.")
+    for problem in x.get('rebaseProblems') or []:
+        ev.append(f"{name} rebase problem: {problem}.")
+    if [os.path.realpath(d) for d in got] != [os.path.realpath(d) for d in want] or bool(par) != bool(rebase) \
+            or x.get('answers', []) != sorted(sh for kind, sh in sets if kind == k):
+        missing.append(f"an {name} compare with the base runs {', '.join(want)}, the answer sets of the base and the batch"
+                       f"{' and parity' if rebase else ''} (run side again with a new label)")
     if not load(k):
         first = json.load(open(x['compareOutput']))['lostFirst'][:10]
         ev.append(f'{name} losses: ' + '; '.join(f"{f['battery']}/{f['trace']}#{f['event']} {f['method']} {f['base']} -> {f['new']}" for f in first) + '.')
@@ -658,8 +768,10 @@ head = (f"Batch {b['id']} (protected set goport), revision {rev}, source fingerp
         + (f' Go pin {pin} (GOPORT_PIN for every Go comparison).' if pin else ''))
 evidence = '\n'.join(f'- {e}' for e in ev)
 bind = (f"naming the batch, the source fingerprint, the goport tests sha256 {t['sha256'] if t else '<missing>'}, the gate manifest "
-        f"sha256 {gate['sha256'] if gate else '<missing>'}, the name map sha256 {((t or {}).get('nameMap') or {}).get('sha256', 'none')} "
-        f"and the gate id map sha256 {(b.get('gateIdMap') or {}).get('sha256', 'none')}")
+        f"sha256 {gate['sha256'] if gate else '<missing>'}, the name map sha256 {((t or {}).get('nameMap') or {}).get('sha256', 'none')}, "
+        f"the gate id map sha256 {(b.get('gateIdMap') or {}).get('sha256', 'none')}, the oracle rebase sha256 "
+        f"{canon_sha(rebase) if rebase else 'none'} and the oracle answer set sha256 values "
+        f"{', '.join(sorted({r['sha256'] for r in bound_sets})) or 'none'}")
 prev = next((r.get('commit') for r in reversed(rows) if r.get('commit')), None)
 spec = ['--', '.', ':(exclude)docs/typechecker-state', ':(exclude)docs/typechecker-batches']
 diff = git('diff', '--shortstat', prev, 'HEAD', *spec) if prev else 'unknown'

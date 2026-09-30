@@ -1152,7 +1152,26 @@ impl Checker {
                     || target_kind == SyntaxKind::BindingElement
                 {
                     let export_symbol = self.memo_export_symbol(source);
-                    return export_symbol == self.get_symbol_of_declaration(target);
+                    // PERF: Go `getSymbolOfDeclaration(target)` without its
+                    // `getLateBoundSymbol` step, which returns its argument
+                    // here: the binder symbol of a variable or binding
+                    // element has an identifier name, never the internal
+                    // computed name. So the symbol is not read.
+                    let symbol = target.symbol();
+                    debug_assert_eq!(
+                        symbol,
+                        if symbol.is_some() {
+                            self.get_late_bound_symbol(symbol)
+                        } else {
+                            symbol
+                        }
+                    );
+                    let declared = if symbol.is_some() {
+                        self.get_merged_symbol(symbol)
+                    } else {
+                        SymbolId::NIL
+                    };
+                    return export_symbol == declared;
                 }
                 return false;
             }

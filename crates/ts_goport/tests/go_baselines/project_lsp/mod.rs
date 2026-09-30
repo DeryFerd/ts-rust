@@ -76,6 +76,7 @@ mod file_version_test;
 mod logging_logtree_test;
 mod lsp_dynamic_queue_test;
 mod lsp_progress_test;
+mod lsp_replay_test;
 mod lsp_server_completion_test;
 mod lsp_server_contentmapper_internal_test;
 mod lsp_server_contentmapper_test;

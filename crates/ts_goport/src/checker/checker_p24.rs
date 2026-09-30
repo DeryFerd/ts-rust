@@ -2,7 +2,7 @@
 //! intersection properties, apparent and reduced types, type arguments and
 //! defaults, named members, and the core of type instantiation.
 
-use crate::checker::utilities_p1::SymbolSortKey;
+use crate::checker::utilities_p1::{NO_SORT_ORDER, SymbolSortKey};
 use crate::prelude::*;
 use smallvec::SmallVec;
 
@@ -19,6 +19,18 @@ pub(crate) struct NamedMembersScratch {
     other_keys: Vec<SymbolSortKey>,
     /// Ranges of the container's declarations, read once per call.
     container_ranges: Vec<TextRange>,
+}
+
+/// The `get_named_members` order of the member tables that
+/// `instantiate_symbol_table` makes from one declared member table, for one
+/// container (the `Checker` field `named_members_orders`, see
+/// `get_named_members_of_instantiation`).
+#[derive(Clone)]
+pub(crate) struct NamedMembersOrder {
+    /// Entry count of such a table.
+    len: u32,
+    /// Table positions of the result, in result order.
+    positions: Rc<[u32]>,
 }
 
 /// `is_reserved_member_name` of a symbol table key.
@@ -1411,6 +1423,128 @@ impl Checker {
         let result = SharedList::from(candidates.as_slice());
         self.named_members_scratch = scratch;
         result
+    }
+
+    /// `get_named_members(members, container)` for a table `members` that
+    /// `instantiate_symbol_table` made from the declared member table
+    /// `declared` (Go `resolveObjectTypeMembers`).
+    // PERF: not in Go. Such a table holds, in the order of `declared`, the
+    // named members of `declared` or their instantiations. An instantiation
+    // keeps the flags, name, declarations and value declaration of its
+    // member, so each position of every such table has the same
+    // `get_named_members` inputs, except the symbol id. When no member is an
+    // alias (then `symbol_is_value` reads only the flags) and each sorted part
+    // is in strictly increasing packed order (then the sort compares only
+    // those orders: no name text and no `get_symbol_id`), every such table
+    // gives the same result positions. The first table runs
+    // `get_named_members` and keeps its positions for `(declared,
+    // container)`. Later tables read their result at those positions: the
+    // same list, with none of the reads and no sort. Debug builds compare
+    // it with `get_named_members`.
+    pub(crate) fn get_named_members_of_instantiation(
+        &mut self,
+        members: SymbolTable,
+        declared: SymbolTable,
+        container: SymbolId,
+    ) -> SharedList<SymbolId> {
+        let key = (declared, container);
+        match self.named_members_orders.get(&key) {
+            Some(Some(order)) if order.len as usize == self.symbols.len(members) => {
+                let positions = Rc::clone(&order.positions);
+                let values: SmallVec<[SymbolId; 32]> = self
+                    .symbols
+                    .iter_names(members)
+                    .map(|(_, symbol)| symbol)
+                    .collect();
+                let mut scratch = std::mem::take(&mut self.named_members_scratch);
+                scratch.symbols.clear();
+                scratch
+                    .symbols
+                    .extend(positions.iter().map(|&position| values[position as usize]));
+                let result = SharedList::from(scratch.symbols.as_slice());
+                self.named_members_scratch = scratch;
+                debug_assert_eq!(
+                    &result[..],
+                    &self.get_named_members(members, container)[..],
+                    "named members order of an instantiated table"
+                );
+                result
+            }
+            Some(_) => self.get_named_members(members, container),
+            None => {
+                let result = self.get_named_members(members, container);
+                let order = self.named_members_order(members, container, &result);
+                self.named_members_orders.insert(key, order);
+                result
+            }
+        }
+    }
+
+    /// The table positions of `result`, the `get_named_members(members,
+    /// container)` of an instantiated table, when every table instantiated
+    /// from the same declared table gives the same positions (see
+    /// `get_named_members_of_instantiation`); `None` otherwise.
+    fn named_members_order(
+        &self,
+        members: SymbolTable,
+        container: SymbolId,
+        result: &[SymbolId],
+    ) -> Option<NamedMembersOrder> {
+        let len = self.symbols.len(members);
+        let mut positions_of: FxHashMap<SymbolId, u32> = FxHashMap::default();
+        for (position, (_, symbol)) in self.symbols.iter_names(members).enumerate() {
+            if self.sym(symbol).flags.intersects(SymbolFlags::ALIAS)
+                || positions_of
+                    .insert(symbol, u32::try_from(position).ok()?)
+                    .is_some()
+            {
+                return None;
+            }
+        }
+        let is_class_or_interface_container = container.is_some()
+            && self
+                .sym(container)
+                .flags
+                .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE);
+        let container_ranges: Vec<TextRange> = if is_class_or_interface_container {
+            self.sym(container)
+                .declarations
+                .iter()
+                .map(|d| d.loc())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut last_file = (Node::NIL, 0);
+        let mut previous: Option<(bool, u64)> = None;
+        let mut positions = Vec::with_capacity(result.len());
+        for &symbol in result {
+            let contained = !is_class_or_interface_container
+                || self.is_declaration_contained_in(symbol, &container_ranges);
+            let order = self.symbol_sort_key(symbol, &mut last_file).order;
+            if order == NO_SORT_ORDER {
+                return None;
+            }
+            match previous {
+                // A new part starts where the contained members end.
+                Some((was_contained, previous_order)) => {
+                    if was_contained == contained {
+                        if previous_order >= order {
+                            return None;
+                        }
+                    } else if !(was_contained && !contained) {
+                        return None;
+                    }
+                }
+                None => {}
+            }
+            previous = Some((contained, order));
+            positions.push(*positions_of.get(&symbol)?);
+        }
+        Some(NamedMembersOrder {
+            len: u32::try_from(len).ok()?,
+            positions: positions.into(),
+        })
     }
 
     // Go: checker/checker.go:21975 isDeclarationContainedBy

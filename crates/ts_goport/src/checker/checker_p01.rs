@@ -1026,6 +1026,12 @@ pub struct Checker {
     pub type_to_string_nodebuilder: Option<Rc<RefCell<NodeBuilder>>>,
     /// PORT: not in Go. Reusable buffers of `get_named_members`.
     pub(crate) named_members_scratch: crate::checker::checker_p24::NamedMembersScratch,
+    /// PERF: not in Go. The `(symbol, enclosing declaration)` calls of
+    /// `get_alternative_containing_modules` whose import loop found nothing.
+    pub(crate) alternative_module_import_misses: FxHashSet<(SymbolId, Node)>,
+    /// PERF: not in Go. See `get_named_members_of_instantiation`.
+    pub(crate) named_members_orders:
+        FxHashMap<(SymbolTable, SymbolId), Option<crate::checker::checker_p24::NamedMembersOrder>>,
     /// PERF: not in Go. See `MatchingReferenceMemo`.
     pub(crate) matching_reference_memo: crate::checker::flow_p2::MatchingReferenceMemo,
     /// PERF: not in Go. Counts the merges (`merge_symbol` and
@@ -1486,6 +1492,8 @@ impl Checker {
             deferred_diagnostic_callbacks: Vec::new(),
             type_to_string_nodebuilder: None,
             named_members_scratch: Default::default(),
+            named_members_orders: FxHashMap::default(),
+            alternative_module_import_misses: FxHashSet::default(),
             matching_reference_memo: Default::default(),
             merge_version: 0,
             symbols: bound_symbols,

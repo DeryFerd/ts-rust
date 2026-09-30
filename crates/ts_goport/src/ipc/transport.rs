@@ -1,5 +1,5 @@
 //! Port of internal/ipc/transport.go, with internal/ipc/transport_windows.go
-//! as a `cfg(windows)` stub at the end (internal/api before tsgo#4712).
+//! as its `cfg(windows)` part at the end (internal/api before tsgo#4712).
 //!
 //! PORT: Go `io.ReadWriteCloser` (what `Transport.Accept` returns) is the
 //! trait `ReadWriteCloser`. Go hands the same value to the protocol reader,
@@ -215,15 +215,166 @@ use crate::ipc::transport_unix::new_pipe_listener;
 
 // Go: ipc/transport_windows.go:12 newPipeListener
 // newPipeListener creates a Windows named pipe listener.
-// PORT: Go uses `winio.ListenPipe`, which is not ported (Windows only). The
-// port fails the way `ListenPipe` fails when named pipes are unavailable:
-// it returns an error, and `runAPI` prints it and exits 1. The text is Go
-// `errors.ErrUnsupported`, wrapped like a Go `net.OpError`.
+// PORT: Go `winio.ListenPipe(path, nil)` makes a first pipe handle that
+// reserves the name and a new pipe instance for each `Accept`. The port uses
+// miow's safe `NamedPipe` (no `unsafe`, D-W1): the listener keeps the pipe
+// instance that the next `Accept` connects, and makes the next one after a
+// client connects. Both reject remote clients and allow any number of
+// instances. The failure text is winio's `open <path>: <system message>`.
+// PORT divergence: winio's buffer sizes are 0; these are miow's 64 KiB,
+// because the port reads and writes a connection on one thread (Go uses
+// overlapped I/O on goroutines). `Close` does not end an `Accept` that
+// waits on another thread (the port's callers close after `Accept`).
 #[cfg(windows)]
 pub fn new_pipe_listener(path: &str) -> Result<Box<dyn NetListener>, GoError> {
-    Err(errors::new(format!(
-        "listen pipe {path}: unsupported operation"
-    )))
+    let first = new_pipe_instance(path, true)
+        .map_err(|err| errors::new(format!("open {path}: {}", windows_error_text(&err))))?;
+    Ok(Box::new(WindowsPipeListener {
+        state: Mutex::new(WindowsPipeListenerState {
+            closed: false,
+            waiting: Some(first),
+        }),
+        path: path.to_string(),
+    }))
+}
+
+/// One server instance of the named pipe `path`: duplex, byte mode, local
+/// clients only. `first` fails when the name exists.
+#[cfg(windows)]
+fn new_pipe_instance(path: &str, first: bool) -> std::io::Result<miow::pipe::NamedPipe> {
+    miow::pipe::NamedPipeBuilder::new(path)
+        .first(first)
+        .inbound(true)
+        .outbound(true)
+        .accept_remote(false)
+        .max_instances(255)
+        .create()
+}
+
+/// Go `windows.Errno.Error()`: the system message, which is Rust's text
+/// without its " (os error N)".
+#[cfg(windows)]
+fn windows_error_text(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match err.raw_os_error() {
+        Some(code) => text
+            .strip_suffix(&format!(" (os error {code})"))
+            .unwrap_or(&text)
+            .to_string(),
+        None => text,
+    }
+}
+
+/// Go winio `ErrPipeListenerClosed` (`net.ErrClosed`).
+#[cfg(windows)]
+const ERR_PIPE_LISTENER_CLOSED: &str = "use of closed network connection";
+
+/// Go winio `*win32PipeListener`.
+#[cfg(windows)]
+struct WindowsPipeListener {
+    state: Mutex<WindowsPipeListenerState>,
+    path: String,
+}
+
+#[cfg(windows)]
+struct WindowsPipeListenerState {
+    closed: bool,
+    /// The instance that the next `Accept` connects.
+    waiting: Option<miow::pipe::NamedPipe>,
+}
+
+#[cfg(windows)]
+impl NetListener for WindowsPipeListener {
+    // Go winio win32PipeListener.Accept
+    // PORT: winio makes the instance and waits for a client on its listener
+    // goroutine; a client that connected and closed at once
+    // (`ERROR_NO_DATA`) is skipped. Here the waiting instance is taken, so
+    // the lock is not held while it waits.
+    fn accept(&self) -> Result<Arc<dyn ReadWriteCloser>, GoError> {
+        const ERROR_NO_DATA: i32 = 232;
+        let pipe = {
+            let mut state = lock(&self.state);
+            if state.closed {
+                return Err(errors::new(ERR_PIPE_LISTENER_CLOSED));
+            }
+            match state.waiting.take() {
+                Some(pipe) => pipe,
+                None => new_pipe_instance(&self.path, false)
+                    .map_err(|err| errors::new(windows_error_text(&err)))?,
+            }
+        };
+        loop {
+            match pipe.connect() {
+                Ok(()) => break,
+                Err(err) if err.raw_os_error() == Some(ERROR_NO_DATA) => {
+                    let _ = pipe.disconnect();
+                }
+                Err(err) => return Err(errors::new(windows_error_text(&err))),
+            }
+        }
+        let mut state = lock(&self.state);
+        if !state.closed {
+            state.waiting = new_pipe_instance(&self.path, false).ok();
+        }
+        Ok(Arc::new(WindowsPipeConn {
+            pipe: Mutex::new(Some(Arc::new(pipe))),
+        }))
+    }
+
+    // Go winio win32PipeListener.Close: never fails, also when called again.
+    fn close(&self) -> Result<(), GoError> {
+        let mut state = lock(&self.state);
+        state.closed = true;
+        state.waiting = None;
+        Ok(())
+    }
+
+    // Go `l.Addr().String()`: the pipe path.
+    fn addr(&self) -> String {
+        self.path.clone()
+    }
+}
+
+/// Go winio `*win32Pipe`, a connected server instance.
+/// PORT: `pipe` is `None` after `Close`, which closes the handle once a read
+/// or write that runs on another thread ends (that call keeps its own
+/// reference). As on Unix (`transport_unix.rs`), a read after `Close` is the
+/// end of the stream and a write fails.
+#[cfg(windows)]
+struct WindowsPipeConn {
+    pipe: Mutex<Option<Arc<miow::pipe::NamedPipe>>>,
+}
+
+#[cfg(windows)]
+impl ReadWriteCloser for WindowsPipeConn {
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(pipe) = lock(&self.pipe).clone() else {
+            return Ok(0);
+        };
+        match (&*pipe).read(buf) {
+            // The client closed its end: Go's winio reads `io.EOF`.
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+            result => result,
+        }
+    }
+
+    fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+        let Some(pipe) = lock(&self.pipe).clone() else {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        };
+        (&*pipe).write(buf)
+    }
+
+    // PORT: Go's pipe has no buffer to flush. miow's `flush`
+    // (FlushFileBuffers) would wait until the client reads everything.
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), GoError> {
+        drop(lock(&self.pipe).take());
+        Ok(())
+    }
 }
 
 // Go: ipc/transport_windows.go:17 GeneratePipePath

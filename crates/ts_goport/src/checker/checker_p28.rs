@@ -209,12 +209,38 @@ impl Checker {
         construct_signatures: &[SignatureId],
         index_infos: &[IndexInfoId],
     ) {
+        self.set_structured_type_members_ex(
+            t,
+            members,
+            SymbolTable::NIL,
+            call_signatures,
+            construct_signatures,
+            index_infos,
+        );
+    }
+
+    /// `set_structured_type_members`. When `declared` is not nil, `members`
+    /// is `instantiate_symbol_table(declared, ..)` and its properties come
+    /// from `get_named_members_of_instantiation` (the same list).
+    pub(crate) fn set_structured_type_members_ex(
+        &mut self,
+        t: TypeId,
+        members: SymbolTable,
+        declared: SymbolTable,
+        call_signatures: &[SignatureId],
+        construct_signatures: &[SignatureId],
+        index_infos: &[IndexInfoId],
+    ) {
         self.ty_mut(t).object_flags |= ObjectFlags::MEMBERS_RESOLVED;
         self.ty_mut(t).as_structured_type_mut().members = members;
         let t_symbol = self.ty(t).symbol;
         // `get_named_members` returns the final list (one exact-size
         // allocation), so it is stored without a copy.
-        let properties = self.get_named_members(members, t_symbol);
+        let properties = if declared.is_some() {
+            self.get_named_members_of_instantiation(members, declared, t_symbol)
+        } else {
+            self.get_named_members(members, t_symbol)
+        };
         let data = self.ty_mut(t).as_structured_type_mut();
         data.properties = properties;
         if !call_signatures.is_empty() {
