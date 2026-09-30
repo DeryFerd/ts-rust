@@ -755,6 +755,12 @@ impl Checker {
 
     // Go: checker/checker.go:23580 tryGetDeclaredTypeOfSymbol
     pub fn try_get_declared_type_of_symbol(&mut self, symbol: SymbolId) -> TypeId {
+        if symbol.is_nil() {
+            // Go reads `symbol.Flags` of a nil symbol: `getTypeOfNode` on a
+            // type parameter that the binder skips (a JSDoc `@template` in
+            // a TS file) passes nil here.
+            go_nil_dereference();
+        }
         let flags = self.sym(symbol).flags;
         if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
             return self.get_declared_type_of_class_or_interface(symbol);
