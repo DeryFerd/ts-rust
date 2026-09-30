@@ -1122,6 +1122,15 @@ impl CompilationResult {
         file.is_some().then(|| source_file_text(file).to_string())
     }
 
+    /// Go `Program.GetSourceFile(fileName).OriginalText()`, or `None`
+    /// (ts#63936).
+    pub fn source_file_original_text(&self, file_name: &str) -> Option<String> {
+        let _scope = self.enter_program_only();
+        let file = tsprogram::get_source_file(file_name);
+        file.is_some()
+            .then(|| ts_goport::ast::source_file_original_text(file).to_string())
+    }
+
     /// Go `result.Repeat(testConfig)`.
     pub fn repeat(&self, test_config: &TestConfiguration) -> CompilationResult {
         let inputs = self
