@@ -779,7 +779,8 @@ impl Checker {
             let immediate = self.resolve_external_module_name(
                 node,
                 module_reference,
-                false, /*ignoreErrors*/
+                false,       /*ignoreErrors*/
+                TypeId::NIL, /*importAttributesType*/
             );
             let resolved =
                 self.resolve_external_module_symbol(immediate, true /*dontResolveAlias*/);
@@ -808,7 +809,12 @@ impl Checker {
 
     // Go: checker/checker.go:14382 resolveExternalModuleTypeByLiteral
     pub fn resolve_external_module_type_by_literal(&mut self, name: Node) -> TypeId {
-        let module_sym = self.resolve_external_module_name(name, name, false /*ignoreErrors*/);
+        let module_sym = self.resolve_external_module_name(
+            name,
+            name,
+            false,       /*ignoreErrors*/
+            TypeId::NIL, /*importAttributesType*/
+        );
         if module_sym.is_some() {
             let resolved_module_symbol =
                 self.resolve_external_module_symbol(module_sym, false /*dontResolveAlias*/);
@@ -925,10 +931,14 @@ impl Checker {
 
     // Go: checker/checker.go:14448 getTargetOfImportClause
     pub fn get_target_of_import_clause(&mut self, node: Node) -> SymbolId {
+        let module_specifier = get_module_specifier_from_node(node.parent());
+        let import_attributes_type =
+            self.get_type_from_import_attributes(get_import_attributes(node.parent()));
         let module_symbol = self.resolve_external_module_name(
             node,
-            get_module_specifier_from_node(node.parent()),
+            module_specifier,
             false, /*ignoreErrors*/
+            import_attributes_type,
         );
         if module_symbol.is_some() {
             return self.get_target_of_module_default(
@@ -994,7 +1004,18 @@ impl Checker {
         if specifier.is_nil() {
             return export_default_symbol;
         }
-        let has_default_only = self.is_only_importable_as_default(specifier, module_symbol);
+        // node is ImportClause | ImportSpecifier | ExportSpecifier
+        let mut attributes = Node::NIL;
+        if is_import_clause(node) {
+            attributes = get_import_attributes(node.parent());
+        } else if is_import_specifier(node) {
+            attributes = get_import_attributes(node.parent().parent().parent());
+        } else if is_export_specifier(node) {
+            attributes = get_import_attributes(node.parent().parent());
+        }
+        let import_attributes_type = self.get_type_from_import_attributes(attributes);
+        let has_default_only =
+            self.is_only_importable_as_default(specifier, module_symbol, import_attributes_type);
         let has_synthetic_default =
             self.can_have_synthetic_default(file, module_symbol, dont_resolve_alias, specifier);
         if export_default_symbol.is_nil() && !has_synthetic_default && !has_default_only {
@@ -1057,10 +1078,13 @@ impl Checker {
                     {
                         false
                     } else {
+                        let import_attributes_type =
+                            self.get_type_from_import_attributes(get_import_attributes(decl));
                         let resolved_external_module_name = self.resolve_external_module_name(
                             decl,
                             decl.module_specifier(),
                             false, /*ignoreErrors*/
+                            import_attributes_type,
                         );
                         resolved_external_module_name.is_some() && {
                             let resolved_exports = self.sym(resolved_external_module_name).exports;
@@ -1115,8 +1139,14 @@ impl Checker {
     // Go: checker/checker.go:14548 getTargetOfNamespaceImport
     pub fn get_target_of_namespace_import(&mut self, node: Node) -> SymbolId {
         let module_specifier = self.get_module_specifier_for_import_or_export(node);
-        let immediate =
-            self.resolve_external_module_name(node, module_specifier, false /*ignoreErrors*/);
+        let import_attributes_type =
+            self.get_type_from_import_attributes(get_import_attributes(node.parent().parent()));
+        let immediate = self.resolve_external_module_name(
+            node,
+            module_specifier,
+            false, /*ignoreErrors*/
+            import_attributes_type,
+        );
         let resolved = self.resolve_es_module_symbol(immediate, node, module_specifier);
         self.mark_symbol_of_alias_declaration_if_type_only(node, Node::NIL);
         resolved
@@ -1126,10 +1156,13 @@ impl Checker {
     pub fn get_target_of_namespace_export(&mut self, node: Node) -> SymbolId {
         let module_specifier = self.get_module_specifier_for_import_or_export(node);
         if module_specifier.is_some() {
+            let import_attributes_type =
+                self.get_type_from_import_attributes(get_import_attributes(node.parent()));
             let immediate = self.resolve_external_module_name(
                 node,
                 module_specifier,
                 false, /*ignoreErrors*/
+                import_attributes_type,
             );
             let resolved = self.resolve_es_module_symbol(immediate, node, module_specifier);
             self.mark_symbol_of_alias_declaration_if_type_only(node, Node::NIL);
@@ -1144,8 +1177,15 @@ impl Checker {
         if is_import_specifier(node) && module_export_name_is_default(name) {
             let specifier = self.get_module_specifier_for_import_or_export(node);
             if specifier.is_some() {
-                let module_symbol =
-                    self.resolve_external_module_name(node, specifier, false /*ignoreErrors*/);
+                let import_attributes_type = self.get_type_from_import_attributes(
+                    get_import_attributes(node.parent().parent().parent()),
+                );
+                let module_symbol = self.resolve_external_module_name(
+                    node,
+                    specifier,
+                    false, /*ignoreErrors*/
+                    import_attributes_type,
+                );
                 if module_symbol.is_some() {
                     return self.get_target_of_module_default(
                         module_symbol,
@@ -1177,8 +1217,17 @@ impl Checker {
         if module_specifier.is_nil() {
             module_specifier = get_external_module_name(node);
         }
-        let module_symbol =
-            self.resolve_external_module_name(node, module_specifier, false /*ignoreErrors*/);
+        let mut attributes = Node::NIL;
+        if has_import_attributes(node) {
+            attributes = get_import_attributes(node);
+        }
+        let import_attributes_type = self.get_type_from_import_attributes(attributes);
+        let module_symbol = self.resolve_external_module_name(
+            node,
+            module_specifier,
+            false, /*ignoreErrors*/
+            import_attributes_type,
+        );
         let name = if !is_property_access_expression(specifier) {
             specifier.property_name_or_name()
         } else {
@@ -1247,14 +1296,16 @@ impl Checker {
                         .copied()
                         .find(|&d| is_source_file(d))
                         .unwrap_or(Node::NIL);
-                    if self.is_only_importable_as_default(module_specifier, module_symbol)
-                        || self.can_have_synthetic_default(
-                            file,
-                            module_symbol,
-                            dont_resolve_alias,
-                            module_specifier,
-                        )
-                    {
+                    if self.is_only_importable_as_default(
+                        module_specifier,
+                        module_symbol,
+                        import_attributes_type,
+                    ) || self.can_have_synthetic_default(
+                        file,
+                        module_symbol,
+                        dont_resolve_alias,
+                        module_specifier,
+                    ) {
                         symbol_from_module =
                             self.resolve_external_module_symbol(module_symbol, dont_resolve_alias);
                         if symbol_from_module.is_nil() {
@@ -1274,7 +1325,11 @@ impl Checker {
                     }
                 }
                 if is_import_or_export_specifier(specifier)
-                    && self.is_only_importable_as_default(module_specifier, module_symbol)
+                    && self.is_only_importable_as_default(
+                        module_specifier,
+                        module_symbol,
+                        import_attributes_type,
+                    )
                     && name_text != INTERNAL_SYMBOL_NAME_DEFAULT
                 {
                     let module_kind_string = self.module_kind.string();
@@ -1400,14 +1455,19 @@ impl Checker {
         &mut self,
         usage: Node,
         mut resolved_module: SymbolId,
+        import_attributes_type: TypeId,
     ) -> bool {
         // In Node.js, JSON modules don't get named exports
         if ModuleKind::NODE16 <= self.module_kind && self.module_kind <= ModuleKind::NODE_NEXT {
             let usage_mode = self.get_emit_syntax_for_module_specifier_expression(usage);
             if usage_mode == ModuleKind::ES_NEXT {
                 if resolved_module.is_nil() {
-                    resolved_module =
-                        self.resolve_external_module_name(usage, usage, true /*ignoreErrors*/);
+                    resolved_module = self.resolve_external_module_name(
+                        usage,
+                        usage,
+                        true, /*ignoreErrors*/
+                        import_attributes_type,
+                    );
                 }
                 let mut target_file = Node::NIL;
                 if resolved_module.is_some() {

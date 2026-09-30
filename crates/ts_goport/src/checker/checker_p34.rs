@@ -166,9 +166,10 @@ impl Checker {
 
     // Go: checker/checker.go:30717 getInferenceContext
     pub fn get_inference_context(&self, node: Node) -> InferenceContextId {
-        for i in (0..self.inference_context_infos.len()).rev() {
-            if is_node_descendant_of(node, self.inference_context_infos[i].node) {
-                return self.inference_context_infos[i].context;
+        // Go: `slices.Backward` (ts#63902).
+        for v in self.inference_context_infos.iter().rev() {
+            if is_node_descendant_of(node, v.node) {
+                return v.context;
             }
         }
         InferenceContextId::NIL
@@ -1022,23 +1023,15 @@ impl Checker {
             return self.get_actual_type_variable(base_type);
         }
         if flags.intersects(TypeFlags::INDEXED_ACCESS) {
-            let object_type = self.ty(t).as_indexed_access_type().object_type;
-            let index_type = self.ty(t).as_indexed_access_type().index_type;
-            if self
-                .ty(object_type)
-                .flags
-                .intersects(TypeFlags::SUBSTITUTION)
-                || self
-                    .ty(index_type)
-                    .flags
-                    .intersects(TypeFlags::SUBSTITUTION)
-            {
-                let object_actual = self.get_actual_type_variable(object_type);
-                let index_actual = self.get_actual_type_variable(index_type);
-                return self.get_indexed_access_type(object_actual, index_actual);
+            let t_object_type = self.ty(t).as_indexed_access_type().object_type;
+            let t_index_type = self.ty(t).as_indexed_access_type().index_type;
+            let object_type = self.get_actual_type_variable(t_object_type);
+            let index_type = self.get_actual_type_variable(t_index_type);
+            if object_type != t_object_type || index_type != t_index_type {
+                return self.get_indexed_access_type(object_type, index_type);
             }
         }
-        t
+        self.get_non_distributed_type_parameter(t)
     }
 
     // Go: checker/checker.go:31333 GetSymbolAtLocation
@@ -1199,7 +1192,14 @@ impl Checker {
                             && is_literal_import_type_node(grand_parent)
                             && grand_parent.argument() == parent)
                     {
-                        return self.resolve_external_module_name(node, node, ignore_errors);
+                        let import_attributes_type =
+                            self.get_import_attributes_type_for_module_specifier(node);
+                        return self.resolve_external_module_name(
+                            node,
+                            node,
+                            ignore_errors,
+                            import_attributes_type,
+                        );
                     }
                     if is_call_expression(parent)
                         && is_bindable_object_define_property_call(parent)

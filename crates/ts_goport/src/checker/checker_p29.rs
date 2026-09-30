@@ -1122,10 +1122,6 @@ impl Checker {
             type_id: t,
             include,
             include_origin,
-            unresolved_members: self
-                .ty(t)
-                .object_flags
-                .intersects(ObjectFlags::UNRESOLVED_MEMBERS),
         };
         if let Some(&cached) = self.properties_types.get(&key) {
             return cached;

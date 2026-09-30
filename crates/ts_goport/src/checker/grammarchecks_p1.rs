@@ -1750,3 +1750,100 @@ fn file_extension_is_one_of_gc1(path: &str, extensions: &[&str]) -> bool {
     }
     false
 }
+
+impl Checker {
+    // Go: checker/grammarchecks.go:2123 checkGrammarImportAttributeValues
+    // PORT: in Go this follows checkGrammarImportClause (grammarchecks_p3.rs);
+    // it is here because the checker lane owns this file. The children of an
+    // ImportAttributes node are its `Attributes` list.
+    pub fn check_grammar_import_attribute_values(&mut self, node: Node) -> bool {
+        let mut has_error = false;
+        let mut attributes = Vec::new();
+        node.for_each_child(&mut |child: Node| {
+            if child.kind() == SyntaxKind::ImportAttribute {
+                attributes.push(child);
+            }
+            false
+        });
+        for attribute in attributes {
+            let value = attribute.value();
+            if is_string_literal(value) {
+                continue;
+            }
+            has_error = true;
+            self.error(
+                value,
+                diag::Import_attribute_values_must_be_string_literal_expressions,
+                args![],
+            );
+        }
+        has_error
+    }
+
+    // Go: checker/grammarchecks.go:2200 checkGrammarImportAttributesType
+    // PORT: the Go function is last in grammarchecks.go (grammarchecks_p3.rs);
+    // it is here because the checker lane owns this file.
+    pub fn check_grammar_import_attributes_type(&mut self, attributes: Node) -> bool {
+        let members = attributes.members();
+        for member in members {
+            if member.kind() != SyntaxKind::PropertySignature {
+                return self.grammar_error_on_node(
+                    member,
+                    diag::An_import_attributes_type_may_only_contain_property_signatures,
+                    args![],
+                );
+            }
+            let modifiers = member.modifiers();
+            if modifiers.is_some() {
+                for modifier in modifiers.nodes() {
+                    if modifier.kind() == SyntaxKind::ReadonlyKeyword {
+                        return self.grammar_error_on_node(
+                            modifier,
+                            diag::An_import_attributes_property_cannot_have_a_readonly_modifier,
+                            args![],
+                        );
+                    }
+                }
+            }
+            if member.type_().is_nil() {
+                return self.grammar_error_on_node(
+                    member,
+                    diag::An_import_attributes_property_must_have_a_type_annotation,
+                    args![],
+                );
+            }
+            if member.question_token().is_some() {
+                return self.grammar_error_on_node(
+                    member,
+                    diag::An_import_attributes_property_cannot_be_optional,
+                    args![],
+                );
+            }
+            let name = member.name();
+            if !(is_string_literal_like(name) || is_identifier(name)) {
+                return self.grammar_error_on_node(
+                    name,
+                    diag::An_import_attributes_property_must_have_a_string_literal_or_identifier_name,
+                    args![],
+                );
+            }
+            if name.text() == "resolution-mode" {
+                return self.grammar_error_on_node(
+                    name,
+                    diag::X_0_is_not_a_valid_key_for_an_import_attributes_type,
+                    args![name.text()],
+                );
+            }
+
+            let type_node = member.type_();
+            if !is_string_literal_like_type(type_node) {
+                return self.grammar_error_on_node(
+                    type_node,
+                    diag::An_import_attributes_property_must_have_a_string_literal_type_annotation,
+                    args![],
+                );
+            }
+        }
+        false
+    }
+}

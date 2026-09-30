@@ -285,6 +285,7 @@ impl Checker {
                         .flags
                         .intersects(TypeFlags::TYPE_PARAMETER)
                 {
+                    let constraint = self.get_non_distributed_type_parameter(constraint);
                     extended_constraint = self.get_constraint_of_type_parameter(constraint);
                 }
                 if extended_constraint.is_some()
@@ -1059,7 +1060,8 @@ impl Checker {
                 EXTERNAL_HELPERS_MODULE_NAME_TEXT,
                 Some(diag::This_syntax_requires_an_imported_helper_but_module_0_cannot_be_found),
                 error_node,
-                false, /*isForAugmentation*/
+                false,       /*isForAugmentation*/
+                TypeId::NIL, /*importAttributesType*/
             );
             if helpers_module.is_nil() {
                 helpers_module = self.unknown_symbol;

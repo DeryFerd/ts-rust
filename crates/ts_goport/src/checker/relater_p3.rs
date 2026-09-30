@@ -851,7 +851,8 @@ impl Checker {
         target: &TemplateLiteralType,
         compare_types: &mut dyn FnMut(&mut Checker, TypeId, TypeId, bool) -> Ternary,
     ) -> bool {
-        let inferences = self.infer_types_from_template_literal_type(source, target);
+        let inferences =
+            self.infer_types_from_template_literal_type(source, target, &mut *compare_types);
         // PORT: Go checks `inferences != nil`. A non-nil result is never empty, so
         // an empty Vec stands for nil.
         if !inferences.is_empty() {
@@ -876,6 +877,7 @@ impl Checker {
         &mut self,
         source: TypeId,
         target: &TemplateLiteralType,
+        compare_types: &mut dyn FnMut(&mut Checker, TypeId, TypeId, bool) -> Ternary,
     ) -> TemplateLiteralInferences {
         let flags = self.ty(source).flags;
         if flags.intersects(TypeFlags::STRING_LITERAL) {
@@ -927,7 +929,13 @@ impl Checker {
                 for (i, &s) in source_types.iter().enumerate() {
                     let source_constraint = self.get_base_constraint_or_type(s);
                     let target_constraint = self.get_base_constraint_or_type(target.types[i]);
-                    if self.is_type_assignable_to(source_constraint, target_constraint) {
+                    if compare_types(
+                        self,
+                        source_constraint,
+                        target_constraint,
+                        false, /*partialMatch*/
+                    ) != Ternary::FALSE
+                    {
                         result.push(s);
                     } else {
                         result.push(self.get_string_like_type_for_type(s));

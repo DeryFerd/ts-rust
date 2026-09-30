@@ -111,13 +111,10 @@ impl Checker {
 
     // Go: checker/exports.go:69 GetNameTypeOfSymbol
     pub fn get_name_type_of_symbol(&self, symbol: SymbolId) -> TypeId {
-        if !self.value_symbol_links.has(symbol) {
-            return TypeId::NIL;
+        if let Some(links) = self.value_symbol_links.try_get(symbol) {
+            return links.name_type;
         }
-        self.value_symbol_links
-            .try_get(symbol)
-            .expect("value symbol links exist")
-            .name_type
+        TypeId::NIL
     }
 
     // Go: checker/exports.go:76 IsTypeUsableAsPropertyName
@@ -155,17 +152,27 @@ impl Checker {
         self.get_immediate_aliased_symbol(symbol)
     }
 
+    // Go: checker/exports.go:116 GetTargetSymbol
+    pub fn get_target_symbol_exported(&mut self, symbol: SymbolId) -> SymbolId {
+        self.get_target_symbol(symbol)
+    }
+
     // Go: checker/exports.go:100 GetTypeOnlyAliasDeclaration
     pub fn get_type_only_alias_declaration_exported(&mut self, symbol: SymbolId) -> Node {
         self.get_type_only_alias_declaration(symbol)
     }
 
-    // Go: checker/exports.go:104 ResolveExternalModuleName
-    pub fn resolve_external_module_name_exported(&mut self, module_specifier: Node) -> SymbolId {
+    // Go: checker/exports.go:123 ResolveExternalModuleName
+    pub fn resolve_external_module_name_exported(
+        &mut self,
+        module_specifier: Node,
+        import_attributes_type: TypeId,
+    ) -> SymbolId {
         self.resolve_external_module_name(
             module_specifier,
             module_specifier,
             true, /*ignoreErrors*/
+            import_attributes_type,
         )
     }
 
@@ -260,6 +267,11 @@ impl Checker {
         self.get_type_of_symbol(symbol)
     }
 
+    // Go: checker/exports.go:188 GetNonMissingTypeOfSymbol
+    pub fn get_non_missing_type_of_symbol_exported(&mut self, symbol: SymbolId) -> TypeId {
+        self.get_non_missing_type_of_symbol(symbol)
+    }
+
     // Go: checker/exports.go:168 GetConstraintOfTypeParameter
     pub fn get_constraint_of_type_parameter_exported(&mut self, type_parameter: TypeId) -> TypeId {
         self.get_constraint_of_type_parameter(type_parameter)
@@ -278,15 +290,6 @@ impl Checker {
     // Go: checker/exports.go:172 GetDefaultFromTypeParameter
     pub fn get_default_from_type_parameter_exported(&mut self, type_parameter: TypeId) -> TypeId {
         self.get_default_from_type_parameter(type_parameter)
-    }
-
-    // Go: checker/exports.go:176 GetResolutionModeOverride
-    pub fn get_resolution_mode_override_exported(
-        &mut self,
-        node: Node,
-        report_errors: bool,
-    ) -> ResolutionMode {
-        self.get_resolution_mode_override(node, report_errors)
     }
 
     // Go: checker/exports.go:180 GetEffectiveDeclarationFlags
@@ -316,9 +319,21 @@ impl Checker {
         self.is_tuple_type(t)
     }
 
+    // Go: checker/exports.go:228 IsTupleTypeTarget
+    // PORT: a Go package function; a `Checker` method here because it reads
+    // the type arena.
+    pub fn is_tuple_type_target(&self, t: TypeId) -> bool {
+        self.is_tuple_type(t) && self.ty(t).target() == t
+    }
+
     // Go: checker/exports.go:196 IsArrayType
     pub fn is_array_type_exported(&self, t: TypeId) -> bool {
         self.is_array_type(t)
+    }
+
+    // Go: checker/exports.go:228 IsReadonlySymbol
+    pub fn is_readonly_symbol_exported(&mut self, symbol: SymbolId) -> bool {
+        self.is_readonly_symbol(symbol)
     }
 
     // Go: checker/exports.go:196 GetReturnTypeOfSignature
@@ -382,6 +397,11 @@ impl Checker {
         self.get_contextual_type_for_argument_at_index(node, arg_index)
     }
 
+    // Go: checker/exports.go:272 GetAwaitedType
+    pub fn get_awaited_type_exported(&mut self, t: TypeId) -> TypeId {
+        self.get_awaited_type(t)
+    }
+
     // Go: checker/exports.go:233 GetIndexSignaturesAtLocation
     pub fn get_index_signatures_at_location_exported(&mut self, node: Node) -> Vec<Node> {
         self.get_index_signatures_at_location(node)
@@ -434,6 +454,11 @@ impl Checker {
         self.get_apparent_type(t)
     }
 
+    // Go: checker/exports.go:297 GetReducedType
+    pub fn get_reduced_type_exported(&mut self, t: TypeId) -> TypeId {
+        self.get_reduced_type(t)
+    }
+
     // Go: checker/exports.go:299 GetFullyQualifiedName
     // GetFullyQualifiedName returns the fully qualified name of a symbol, walking up
     // its parent chain (e.g. `"/path/to/module".Namespace.Name`).
@@ -469,6 +494,11 @@ impl Checker {
     // Go: checker/exports.go:281 GetIndexInfoOfType
     pub fn get_index_info_of_type_exported(&mut self, t: TypeId, key_type: TypeId) -> IndexInfoId {
         self.get_index_info_of_type(t, key_type)
+    }
+
+    // Go: checker/exports.go:342 GetIndexTypeOfType
+    pub fn get_index_type_of_type_exported(&mut self, t: TypeId, key_type: TypeId) -> TypeId {
+        self.get_index_type_of_type(t, key_type)
     }
 
     // Go: checker/exports.go:285 GetIndexInfosOfType
@@ -560,5 +590,13 @@ impl Checker {
     // Go: checker/exports.go:353 CompareSymbols
     pub fn compare_symbols_exported(&mut self, s1: SymbolId, s2: SymbolId) -> i32 {
         self.compare_symbols(s1, s2)
+    }
+
+    // Go: checker/exports.go:398 IsDistributedTypeParameter
+    // PORT: a Go package function; a `Checker` method here because it reads
+    // the type arena.
+    pub fn is_distributed_type_parameter(&self, t: TypeId) -> bool {
+        let ty = self.ty(t);
+        ty.flags.intersects(TypeFlags::TYPE_PARAMETER) && ty.as_type_parameter().is_distributed
     }
 }

@@ -836,10 +836,41 @@ impl Checker {
         ) {
             // Only distinguished by type IDs, handled below.
         } else if ty1.flags.intersects(TypeFlags::OBJECT) {
-            // Order unnamed or identically named object types by symbol.
-            let c = self.compare_symbols_worker(ty1.symbol, ty2.symbol);
-            if c != 0 {
-                return c;
+            // Order instantiation expression types without relying on lazy symbol IDs.
+            // Order other unnamed or identically named object types by symbol.
+            if ty1
+                .object_flags
+                .intersects(ObjectFlags::INSTANTIATION_EXPRESSION_TYPE)
+                && ty2
+                    .object_flags
+                    .intersects(ObjectFlags::INSTANTIATION_EXPRESSION_TYPE)
+            {
+                let mut declaration1 = Node::NIL;
+                let mut declaration2 = Node::NIL;
+                if ty1.symbol.is_some() && !self.sym(ty1.symbol).declarations.is_empty() {
+                    declaration1 = self.sym(ty1.symbol).declarations[0];
+                }
+                if ty2.symbol.is_some() && !self.sym(ty2.symbol).declarations.is_empty() {
+                    declaration2 = self.sym(ty2.symbol).declarations[0];
+                }
+                // A single instantiation expression can produce multiple types for union constituents,
+                // so compare their source declarations before comparing the shared expression node.
+                let c = self.compare_nodes(declaration1, declaration2);
+                if c != 0 {
+                    return c;
+                }
+                let c = self.compare_nodes(
+                    ty1.as_instantiation_expression_type().node,
+                    ty2.as_instantiation_expression_type().node,
+                );
+                if c != 0 {
+                    return c;
+                }
+            } else {
+                let c = self.compare_symbols_worker(ty1.symbol, ty2.symbol);
+                if c != 0 {
+                    return c;
+                }
             }
             // When object types have the same or no symbol, order by kind. We order type references before other kinds.
             if ty1.object_flags.intersects(ObjectFlags::REFERENCE)
@@ -898,17 +929,47 @@ impl Checker {
             } else if ty2.object_flags.intersects(ObjectFlags::REFERENCE) {
                 return 1;
             } else {
-                // Order unnamed non-reference object types by kind associated type mappers. Reverse mapped types have
-                // neither symbols nor mappers so they're ultimately ordered by unstable type IDs, but given their rarity
-                // this should be fine.
+                // Order unnamed non-reference object types by kind and instantiation data.
                 let k1 = i64::from((ty1.object_flags & ObjectFlags::OBJECT_TYPE_KIND_MASK).0);
                 let k2 = i64::from((ty2.object_flags & ObjectFlags::OBJECT_TYPE_KIND_MASK).0);
                 let c = clamp_compare(k1 - k2);
                 if c != 0 {
                     return c;
                 }
-                let c = self
-                    .compare_type_mappers(ty1.as_object_type().mapper, ty2.as_object_type().mapper);
+                if ty1.object_flags.intersects(ObjectFlags::REVERSE_MAPPED) {
+                    let r1 = ty1.as_reverse_mapped_type();
+                    let r2 = ty2.as_reverse_mapped_type();
+                    let c = self.compare_types(r1.source, r2.source);
+                    if c != 0 {
+                        return c;
+                    }
+                    let c = self.compare_types(r1.mapped_type, r2.mapped_type);
+                    if c != 0 {
+                        return c;
+                    }
+                    let c = self.compare_types(r1.constraint_type, r2.constraint_type);
+                    if c != 0 {
+                        return c;
+                    }
+                }
+                let mut m1 = ty1.as_object_type().mapper;
+                let mut m2 = ty2.as_object_type().mapper;
+                if ty1.object_flags.intersects(ObjectFlags::MAPPED) {
+                    // instantiateAnonymousType prepends a fresh type parameter mapping.
+                    // Compare the effective instantiation, not the identity of that fresh parameter.
+                    // PORT: Go `m.data.(*CompositeTypeMapper).m2` panics for any other mapper.
+                    let composite_m2 = |m: MapperId| match self.mapper(m) {
+                        TypeMapper::Composite(d) => d.m2,
+                        _ => panic!("interface conversion: not *checker.CompositeTypeMapper"),
+                    };
+                    if m1.is_some() {
+                        m1 = composite_m2(m1);
+                    }
+                    if m2.is_some() {
+                        m2 = composite_m2(m2);
+                    }
+                }
+                let c = self.compare_type_mappers(m1, m2);
                 if c != 0 {
                     return c;
                 }
@@ -956,6 +1017,13 @@ impl Checker {
         } else if ty1.flags.intersects(TypeFlags::NUMBER_LITERAL) {
             // Numeric literal types are ordered by their values.
             let c = compare_numbers(literal_number_value(ty1), literal_number_value(ty2));
+            if c != 0 {
+                return c;
+            }
+        } else if ty1.flags.intersects(TypeFlags::BIG_INT_LITERAL) {
+            let c = self
+                .get_big_int_literal_value(t1)
+                .compare(&self.get_big_int_literal_value(t2));
             if c != 0 {
                 return c;
             }
@@ -1119,13 +1187,10 @@ impl Checker {
         let s1 = self.get_type_name_symbol(t1);
         let s2 = self.get_type_name_symbol(t2);
         if s1 == s2 {
-            if let Some(alias1) = &self.ty(t1).alias {
-                // PORT: Go reads `t2.alias.typeArguments`; a nil `t2.alias` would
-                // panic in Go, so it panics here too.
-                let alias2 = self.ty(t2).alias.as_ref().expect("nil pointer dereference");
-                return self.compare_type_lists(&alias1.type_arguments, &alias2.type_arguments);
-            }
-            return 0;
+            return self.compare_type_lists(
+                self.ty(t1).alias.type_arguments(),
+                self.ty(t2).alias.type_arguments(),
+            );
         }
         if s1.is_nil() {
             return 1;
@@ -1135,10 +1200,15 @@ impl Checker {
         }
         let (name1, name2) = (&self.sym(s1).name, &self.sym(s2).name);
         // Equal name ids are equal texts, which compare as 0.
-        if name1 == name2 {
-            return 0;
+        if name1 != name2 {
+            let c = compare_strings(name1, name2);
+            if c != 0 {
+                return c;
+            }
         }
-        compare_strings(name1, name2)
+        // Keep distinct same-named declarations together before comparing alias arguments or structure.
+        // PORT: Go `t1.checker.compareSymbols` is always the worker (see `compare_types`).
+        self.compare_symbols_worker(s1, s2)
     }
 
     // Go: checker/utilities.go:582 getTypeNameSymbol
@@ -1291,6 +1361,27 @@ impl Checker {
         is_write: bool,
     ) -> ModifierFlags {
         let sym = self.sym(s);
+        if sym.check_flags.intersects(CheckFlags::SYNTHETIC) {
+            let check_flags = sym.check_flags;
+            let mut access_modifier = ModifierFlags::NONE;
+            if !is_write && check_flags.intersects(CheckFlags::CONTAINS_PUBLIC)
+                || is_write && check_flags.intersects(CheckFlags::CONTAINS_WRITE_PUBLIC)
+            {
+                access_modifier = ModifierFlags::PUBLIC;
+            } else if !is_write && check_flags.intersects(CheckFlags::CONTAINS_PROTECTED)
+                || is_write && check_flags.intersects(CheckFlags::CONTAINS_WRITE_PROTECTED)
+            {
+                access_modifier = ModifierFlags::PROTECTED;
+            } else if !is_write && check_flags.intersects(CheckFlags::CONTAINS_PRIVATE)
+                || is_write && check_flags.intersects(CheckFlags::CONTAINS_WRITE_PRIVATE)
+            {
+                access_modifier = ModifierFlags::PRIVATE;
+            }
+            if check_flags.intersects(CheckFlags::CONTAINS_STATIC) {
+                return access_modifier | ModifierFlags::STATIC;
+            }
+            return access_modifier;
+        }
         if sym.value_declaration.is_some() {
             let mut declaration = Node::NIL;
             if is_write {
@@ -1318,20 +1409,6 @@ impl Checker {
             }
             return flags.without(ModifierFlags::ACCESSIBILITY_MODIFIER);
         }
-        if sym.check_flags.intersects(CheckFlags::SYNTHETIC) {
-            let access_modifier = if sym.check_flags.intersects(CheckFlags::CONTAINS_PRIVATE) {
-                ModifierFlags::PRIVATE
-            } else if sym.check_flags.intersects(CheckFlags::CONTAINS_PUBLIC) {
-                ModifierFlags::PUBLIC
-            } else {
-                ModifierFlags::PROTECTED
-            };
-            let mut static_modifier = ModifierFlags::NONE;
-            if sym.check_flags.intersects(CheckFlags::CONTAINS_STATIC) {
-                static_modifier = ModifierFlags::STATIC;
-            }
-            return access_modifier | static_modifier;
-        }
         if sym.flags.intersects(SymbolFlags::PROTOTYPE) {
             return ModifierFlags::PUBLIC | ModifierFlags::STATIC;
         }
@@ -1343,6 +1420,15 @@ impl Checker {
 // `ast/fields.rs` already exports `is_exponentiation_operator`, ...,
 // `is_binary_operator` (Go `ast.IsXxxOperator`, generated from the same kind
 // sets), so the unprefixed names would be ambiguous through the prelude.
+
+// Go: checker/utilities.go:1923 quotedAndCommaSeparated
+pub fn quoted_and_comma_separated(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| format!("'{item}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 // Go: checker/utilities.go:730 isExponentiationOperator
 pub fn checker_is_exponentiation_operator(kind: SyntaxKind) -> bool {

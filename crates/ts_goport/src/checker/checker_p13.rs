@@ -1241,14 +1241,22 @@ impl Checker {
         // Property is known to be private or protected at this point
         // Private property is accessible if the property is within the declaring class
         if flags.intersects(ModifierFlags::PRIVATE) {
-            let parent_of_prop = self.get_parent_of_symbol(prop);
-            let declaring_class_declaration =
-                get_class_like_declaration_of_symbol(&self.symbols, parent_of_prop);
-            if !self.is_node_within_class(location, declaring_class_declaration) {
+            let mut declaring_class_declaration = Node::NIL;
+            let parent = self.get_parent_of_symbol(prop);
+            if parent.is_some() {
+                declaring_class_declaration =
+                    get_class_like_declaration_of_symbol(&self.symbols, parent);
+            }
+            if declaring_class_declaration.is_nil()
+                || !self.is_node_within_class(location, declaring_class_declaration)
+            {
                 if error_node.is_some() {
+                    let mut class = self.get_declaring_class(prop);
+                    if class.is_nil() {
+                        class = containing_type;
+                    }
                     let prop_string = self.symbol_to_string(prop);
-                    let declaring_class = self.get_declaring_class(prop);
-                    let class_string = self.type_to_string(declaring_class);
+                    let class_string = self.type_to_string(class);
                     self.error(
                         error_node,
                         diag::Property_0_is_private_and_only_accessible_within_class_1,

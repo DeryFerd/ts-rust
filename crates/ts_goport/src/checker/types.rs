@@ -328,8 +328,17 @@ fn checker_arena() -> &'static bumpalo::Bump {
     CHECKER_ARENA.with(|arena| *arena)
 }
 
-// PORT: Go `TypeFormatFlagsNodeBuilderFlagsMask` is an untyped constant
-// outside the generated `TypeFormatFlags` block.
+// Go: checker/types.go:37 IndexKind
+// PORT: `flags.rs` was generated at an older pin, so this enum (ts#64264) is
+// declared here.
+crate::flags_macros::go_enum!(IndexKind, i32 {
+    STRING = 0; // IndexKindString
+    NUMBER = 1; // IndexKindNumber
+});
+
+// PORT: Go `TypeFormatFlagsNodeBuilderFlagsMask` is the last constant of the
+// `TypeFormatFlags` block (ts#63911). `flags.rs` has only the single-bit
+// values, so the mask stays here.
 impl TypeFormatFlags {
     pub const NODE_BUILDER_FLAGS_MASK: Self = Self(
         Self::NO_TRUNCATION.0
@@ -1872,6 +1881,11 @@ pub struct InterfaceType {
 }
 
 impl InterfaceType {
+    // Go: checker/types.go:1055 InterfaceType.ThisType
+    pub fn this_type(&self) -> TypeId {
+        self.this_type
+    }
+
     // Go: checker/types.go:1013 InterfaceType.OuterTypeParameters
     pub fn outer_type_parameters(&self) -> &[TypeId] {
         if self.all_type_parameters.is_empty() {
@@ -1981,6 +1995,38 @@ pub struct MappedType {
     pub contains_error: bool,
 }
 
+impl MappedType {
+    // Go: checker/types.go:1123 MappedType.TypeParameter
+    pub fn type_parameter(&self) -> TypeId {
+        self.type_parameter
+    }
+
+    // Go: checker/types.go:1124 MappedType.ConstraintType
+    pub fn constraint_type(&self) -> TypeId {
+        self.constraint_type
+    }
+
+    // Go: checker/types.go:1125 MappedType.NameType
+    pub fn name_type(&self) -> TypeId {
+        self.name_type
+    }
+
+    // Go: checker/types.go:1126 MappedType.TemplateType
+    pub fn template_type(&self) -> TypeId {
+        self.template_type
+    }
+
+    // Go: checker/types.go:1127 MappedType.ResolveComponents
+    // PORT: the Go receiver is unused; the mapped type lives in the checker's
+    // arena, so this takes the checker and the type and no `self`.
+    pub fn resolve_components(c: &mut Checker, typ: TypeId) {
+        c.get_type_parameter_from_mapped_type(typ);
+        c.get_constraint_type_from_mapped_type(typ);
+        c.get_name_type_from_mapped_type(typ);
+        c.get_template_type_from_mapped_type(typ);
+    }
+}
+
 // ReverseMappedType
 
 // Go: checker/types.go:1101 ReverseMappedType
@@ -2055,7 +2101,9 @@ pub struct TypeParameter {
     pub target: TypeId,
     pub mapper: MapperId,
     pub is_this_type: bool,
+    pub is_distributed: bool,
     pub resolved_default_type: TypeId,
+    pub distributed_type: TypeId,
 }
 
 impl TypeParameter {

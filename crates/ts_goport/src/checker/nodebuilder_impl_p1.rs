@@ -59,11 +59,19 @@ pub struct NodeBuilderLinks {
 }
 
 // Go: checker/nodebuilderimpl.go:54 NodeBuilderSymbolLinks
-// PORT: Go `module.ModeAwareCache[string]` is a map keyed by
+// PORT: Go `module.ModeAwareCache[moduleSpecifierResult]` is a map keyed by
 // `(path, resolution mode)`. `None` is the nil cache.
 #[derive(Clone, Debug, Default)]
 pub struct NodeBuilderSymbolLinks {
-    pub specifier_cache: Option<FxHashMap<(String, ResolutionMode), String>>,
+    pub specifier_cache: Option<FxHashMap<(String, ResolutionMode), ModuleSpecifierResult>>,
+}
+
+// Go: checker/nodebuilderimpl.go:58 moduleSpecifierResult
+// PORT: a nil `importAttributesType` is `TypeId::NIL`.
+#[derive(Clone, Debug, Default)]
+pub struct ModuleSpecifierResult {
+    pub specifier: String,
+    pub import_attributes_type: TypeId,
 }
 
 // Go: checker/nodebuilderimpl.go:57 NodeBuilderContext
@@ -976,7 +984,7 @@ impl Checker {
                     let old_enclosing = ctx.borrow().enclosing_declaration;
                     ctx.borrow_mut().enclosing_declaration =
                         self.sym(name_type_symbol).value_declaration;
-                    let expression = self.symbol_to_expression(b, name_type_symbol, meaning);
+                    let expression = self.symbol_to_expression_worker(b, name_type_symbol, meaning);
                     let result = p1_e(b).factory().new_computed_property_name(expression);
                     ctx.borrow_mut().enclosing_declaration = old_enclosing;
                     return result;
@@ -1105,8 +1113,8 @@ impl Checker {
             let enclosing_declaration = ctx.borrow().enclosing_declaration;
             let context_file = get_source_file_of_node(e.most_original(enclosing_declaration)); // TODO: Just use b.ctx.enclosingFile ? Or is the delayed lookup important for context moves?
             let target_file = get_source_file_of_module(&self.symbols, chain[0]);
-            let mut specifier = String::new();
-            let mut attributes = Node::NIL;
+            let mut specifier_result = ModuleSpecifierResult::default();
+            let mut import_mode_override = ResolutionMode::NONE;
             let resolution_kind = self.compiler_options.get_module_resolution_kind();
             if resolution_kind == ModuleResolutionKind::NODE16
                 || resolution_kind == ModuleResolutionKind::NODE_NEXT
@@ -1118,24 +1126,19 @@ impl Checker {
                     && get_emit_module_format_of_file(target_file)
                         != get_emit_module_format_of_file(context_file)
                 {
-                    specifier =
+                    specifier_result =
                         self.get_specifier_for_module_symbol(b, chain[0], ModuleKind::ES_NEXT);
-                    let name = self.nb_new_string_literal(b, "resolution-mode");
-                    let value = self.nb_new_string_literal(b, "import");
-                    attributes = f.new_import_attributes(
-                        SyntaxKind::WithKeyword,
-                        f.new_node_list(&[f.new_import_attribute(name, value)]),
-                        false,
-                    );
+                    import_mode_override = ModuleKind::ES_NEXT;
                 }
             }
-            if specifier.is_empty() {
-                specifier = self.get_specifier_for_module_symbol(b, chain[0], ResolutionMode::NONE);
+            if specifier_result.specifier.is_empty() {
+                specifier_result =
+                    self.get_specifier_for_module_symbol(b, chain[0], ResolutionMode::NONE);
             }
             if !p1_flags(b).intersects(NodeBuilderFlags::ALLOW_NODE_MODULES_RELATIVE_PATHS) /* && b.ch.compilerOptions.GetModuleResolutionKind() != core.ModuleResolutionKindClassic */
-                && specifier.contains("/node_modules/")
+                && specifier_result.specifier.contains("/node_modules/")
             {
-                let old_specifier = specifier.clone();
+                let old_specifier_result = specifier_result.clone();
 
                 if resolution_kind == ModuleResolutionKind::NODE16
                     || resolution_kind == ModuleResolutionKind::NODE_NEXT
@@ -1145,28 +1148,18 @@ impl Checker {
                     if get_emit_module_format_of_file(context_file) == ModuleKind::ES_NEXT {
                         swapped_mode = ModuleKind::COMMON_JS;
                     }
-                    specifier = self.get_specifier_for_module_symbol(b, chain[0], swapped_mode);
+                    specifier_result =
+                        self.get_specifier_for_module_symbol(b, chain[0], swapped_mode);
 
-                    if specifier.contains("/node_modules/") {
+                    if specifier_result.specifier.contains("/node_modules/") {
                         // Still unreachable :(
-                        specifier = old_specifier.clone();
+                        specifier_result = old_specifier_result.clone();
                     } else {
-                        let mode_str = if swapped_mode == ModuleKind::ES_NEXT {
-                            "import"
-                        } else {
-                            "require"
-                        };
-                        let name = self.nb_new_string_literal(b, "resolution-mode");
-                        let value = self.nb_new_string_literal(b, mode_str);
-                        attributes = f.new_import_attributes(
-                            SyntaxKind::WithKeyword,
-                            f.new_node_list(&[f.new_import_attribute(name, value)]),
-                            false,
-                        );
+                        import_mode_override = swapped_mode;
                     }
                 }
 
-                if attributes.is_nil() {
+                if import_mode_override == ResolutionMode::NONE {
                     // If ultimately we can only name the symbol with a reference that dives into a `node_modules` folder, we should error
                     // since declaration files with these kinds of references are liable to fail when published :(
                     ctx.borrow_mut().encountered_error = true;
@@ -1174,14 +1167,20 @@ impl Checker {
                     let symbol_name = self.sym(symbol).name.clone();
                     tracker.report_likely_unsafe_import_required_error(
                         self,
-                        &old_specifier,
+                        &old_specifier_result.specifier,
                         &symbol_name,
                     );
                 }
             }
 
-            let lit = f.new_literal_type_node(self.nb_new_string_literal(b, &specifier));
-            p1_add_length(b, go_len(&specifier) + 10); // specifier + import("")
+            let attributes = self.create_import_attributes_for_module_specifier(
+                b,
+                &specifier_result,
+                import_mode_override,
+            );
+            let lit =
+                f.new_literal_type_node(self.nb_new_string_literal(b, &specifier_result.specifier));
+            p1_add_length(b, go_len(&specifier_result.specifier) + 10); // specifier + import("")
             if non_root_parts.is_nil() || is_entity_name(non_root_parts) {
                 // !!! TODO: smuggle type arguments out
                 // const lastId = isIdentifier(nonRootParts) ? nonRootParts : nonRootParts.right;
@@ -1395,7 +1394,23 @@ impl Checker {
         symbol: SymbolId,
         mask: SymbolFlags,
     ) -> Node {
-        let chain = self.lookup_symbol_chain(b, symbol, mask, false);
+        let (tracker, enclosing_declaration) = {
+            let ctx = p1_ctx(b);
+            let ctx = ctx.borrow();
+            (ctx.tracker.clone(), ctx.enclosing_declaration)
+        };
+        tracker.track_symbol(self, symbol, enclosing_declaration, mask);
+        self.symbol_to_expression_worker(b, symbol, mask)
+    }
+
+    // Go: checker/nodebuilderimpl.go:853 symbolToExpressionWorker
+    pub fn symbol_to_expression_worker(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        symbol: SymbolId,
+        mask: SymbolFlags,
+    ) -> Node {
+        let chain = self.lookup_symbol_chain_worker(b, symbol, mask, false);
         // PORT: see `symbol_to_name` for the empty chain case.
         self.create_expression_from_symbol_chain(b, &chain, chain.len() - 1)
     }
@@ -1431,9 +1446,10 @@ impl Checker {
                 .iter()
                 .any(|&d| has_non_global_augmentation_external_module_symbol(d))
         {
-            let specifier = self.get_specifier_for_module_symbol(b, symbol, ResolutionMode::NONE);
-            p1_add_length(b, 2 + go_len(&specifier));
-            return self.nb_new_string_literal(b, &specifier);
+            let specifier_result =
+                self.get_specifier_for_module_symbol(b, symbol, ResolutionMode::NONE);
+            p1_add_length(b, 2 + go_len(&specifier_result.specifier));
+            return self.nb_new_string_literal(b, &specifier_result.specifier);
         }
 
         if index == 0 || can_use_property_access(&symbol_name) {

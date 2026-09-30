@@ -21,9 +21,17 @@ pub struct CallState {
     pub arg_check_mode: CheckMode,
     pub is_single_non_generic_candidate: bool,
     pub signature_help_trailing_comma: bool,
+    pub recursive_resolution: bool,
     pub candidates_for_argument_error: Vec<SignatureId>,
     pub candidate_for_argument_arity_error: SignatureId,
     pub candidate_for_type_argument_error: SignatureId,
+}
+
+// Go: checker/checker.go:8822 constructorAccessibilityError
+#[derive(Clone, Copy, Debug)]
+pub struct ConstructorAccessibilityError {
+    pub kind: ModifierFlags,
+    pub declaring_class: TypeId,
 }
 
 impl Checker {
@@ -242,7 +250,31 @@ impl Checker {
         let construct_signatures =
             self.get_signatures_of_type(expression_type, SignatureKind::CONSTRUCT);
         if !construct_signatures.is_empty() {
-            if !self.is_constructor_accessible(node, construct_signatures[0]) {
+            let accessibility_error = self.get_constructor_accessibility_error(
+                node,
+                &construct_signatures,
+                ModifierFlags::NON_PUBLIC_ACCESSIBILITY_MODIFIER,
+            );
+            if let Some(accessibility_error) = accessibility_error {
+                if accessibility_error.kind.intersects(ModifierFlags::PRIVATE) {
+                    let class_str = self.type_to_string(accessibility_error.declaring_class);
+                    self.error(
+                        node,
+                        diag::Constructor_of_class_0_is_private_and_only_accessible_within_the_class_declaration,
+                        args![class_str],
+                    );
+                }
+                if accessibility_error
+                    .kind
+                    .intersects(ModifierFlags::PROTECTED)
+                {
+                    let class_str = self.type_to_string(accessibility_error.declaring_class);
+                    self.error(
+                        node,
+                        diag::Constructor_of_class_0_is_protected_and_only_accessible_within_the_class_declaration,
+                        args![class_str],
+                    );
+                }
                 return self.resolve_error_call(node);
             }
             // If the expression is a class of abstract type, or an abstract construct signature,
@@ -327,54 +359,47 @@ impl Checker {
         self.resolve_error_call(node)
     }
 
-    // Go: checker/checker.go:8622 isConstructorAccessible
-    pub fn is_constructor_accessible(&mut self, node: Node, signature: SignatureId) -> bool {
-        if signature.is_nil() || self.sig(signature).declaration.is_nil() {
-            return true;
-        }
-        let declaration = self.sig(signature).declaration;
-        let modifiers = get_selected_modifier_flags(
-            declaration,
-            ModifierFlags::NON_PUBLIC_ACCESSIBILITY_MODIFIER,
-        );
-        // (1) Public constructors and (2) constructor functions are always accessible.
-        if modifiers.0 == 0 || !is_constructor_declaration(declaration) {
-            return true;
-        }
-        let declaring_class_declaration =
-            get_class_like_declaration_of_symbol(&self.symbols, declaration.parent().symbol());
-        let declaring_class = self.get_declared_type_of_symbol(declaration.parent().symbol());
-        // A private or protected constructor can only be instantiated within its own class (or a subclass, for protected)
-        if !self.is_node_within_class(node, declaring_class_declaration) {
-            let containing_class = get_containing_class(node);
-            if containing_class.is_some() && modifiers.intersects(ModifierFlags::PROTECTED) {
-                let containing_type = self.get_declared_type_of_symbol(containing_class.symbol());
-                if self.type_has_protected_accessible_base(
-                    declaration.parent().symbol(),
-                    containing_type,
-                ) {
-                    return true;
+    // Go: checker/checker.go:8827 getConstructorAccessibilityError
+    // PORT: Go returns a nil `*constructorAccessibilityError` for no error; here `None`.
+    pub fn get_constructor_accessibility_error(
+        &mut self,
+        node: Node,
+        signatures: &[SignatureId],
+        modifiers_mask: ModifierFlags,
+    ) -> Option<ConstructorAccessibilityError> {
+        for &signature in signatures {
+            if self.sig(signature).declaration.is_nil() {
+                continue;
+            }
+            let declaration = self.sig(signature).declaration;
+            let modifiers = get_selected_modifier_flags(declaration, modifiers_mask);
+            // (1) Public constructors and (2) constructor functions are always accessible.
+            if modifiers.0 == 0 || !is_constructor_declaration(declaration) {
+                continue;
+            }
+            let declaring_class_declaration =
+                get_class_like_declaration_of_symbol(&self.symbols, declaration.parent().symbol());
+            // A private or protected constructor can only be instantiated within its own class (or a subclass, for protected)
+            if !self.is_node_within_class(node, declaring_class_declaration) {
+                let containing_class = get_containing_class(node);
+                if containing_class.is_some() && modifiers.intersects(ModifierFlags::PROTECTED) {
+                    let containing_type = self.get_type_of_node(containing_class);
+                    if self.type_has_protected_accessible_base(
+                        declaration.parent().symbol(),
+                        containing_type,
+                    ) {
+                        continue;
+                    }
                 }
+                let declaring_class =
+                    self.get_declared_type_of_symbol(declaration.parent().symbol());
+                return Some(ConstructorAccessibilityError {
+                    kind: modifiers,
+                    declaring_class,
+                });
             }
-            if modifiers.intersects(ModifierFlags::PRIVATE) {
-                let class_str = self.type_to_string(declaring_class);
-                self.error(
-                    node,
-                    diag::Constructor_of_class_0_is_private_and_only_accessible_within_the_class_declaration,
-                    args![class_str],
-                );
-            }
-            if modifiers.intersects(ModifierFlags::PROTECTED) {
-                let class_str = self.type_to_string(declaring_class);
-                self.error(
-                    node,
-                    diag::Constructor_of_class_0_is_protected_and_only_accessible_within_the_class_declaration,
-                    args![class_str],
-                );
-            }
-            return false;
         }
-        true
+        None
     }
 
     // Go: checker/checker.go:8654 typeHasProtectedAccessibleBase
@@ -787,6 +812,8 @@ impl Checker {
         // is just important for choosing the best signature. So in the case where there is only one
         // signature, the subtype pass is useless. So skipping it is an optimization.
         let mut result = SignatureId::NIL;
+        s.recursive_resolution = self.call_resolution_stack.contains(&s.node);
+        self.call_resolution_stack.push(s.node);
         if s.candidates.len() > 1 {
             let relation = self.subtype_relation.clone();
             result = self.choose_overload(&mut s, &relation);
@@ -795,6 +822,7 @@ impl Checker {
             let relation = self.assignable_relation.clone();
             result = self.choose_overload(&mut s, &relation);
         }
+        self.call_resolution_stack.pop();
         if let Some(out) = candidates_out_array.as_deref_mut() {
             *out = s.candidates.clone();
         }
@@ -1003,11 +1031,15 @@ impl Checker {
                         }
                     }
                 } else {
-                    let flags = if is_in_js_file(s.node) {
-                        InferenceFlags::ANY_DEFAULT
-                    } else {
-                        InferenceFlags::NONE
-                    };
+                    // When we are recursively resolving a call with a single candidate, we skip constraints checks during
+                    // type inference to avoid circularity errors. For example, see #64192.
+                    let mut flags = InferenceFlags::NONE;
+                    if s.recursive_resolution && s.candidates.len() == 1 {
+                        flags |= InferenceFlags::NO_CONSTRAINT_CHECKS;
+                    }
+                    if is_in_js_file(s.node) {
+                        flags |= InferenceFlags::ANY_DEFAULT;
+                    }
                     inference_context = self.new_inference_context(
                         &candidate_type_parameters,
                         candidate,
@@ -1259,7 +1291,7 @@ impl Checker {
             }
             SyntaxKind::MethodDeclaration | SyntaxKind::GetAccessor | SyntaxKind::SetAccessor => {
                 // For decorators with only two parameters we supply only two arguments
-                if self.sig(signature).parameters.len() <= 2 {
+                if self.get_parameter_count(signature) <= 2 {
                     return 2;
                 }
                 3

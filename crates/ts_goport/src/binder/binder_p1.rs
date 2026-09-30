@@ -800,6 +800,16 @@ impl Binder {
                 if is_global_scope_augmentation(node) {
                     return Name::from(INTERNAL_SYMBOL_NAME_GLOBAL);
                 }
+                let pattern = try_parse_pattern(module_name);
+                if pattern.is_valid() && pattern.star_index >= 0 {
+                    let attributes = node.attributes();
+                    if attributes.is_some() {
+                        return Name::from(format!(
+                            "{INTERNAL_SYMBOL_NAME_PREFIX}\"{module_name}\"pattern@{}",
+                            get_node_id(attributes)
+                        ));
+                    }
+                }
                 return Name::from(format!("\"{module_name}\""));
             }
             if is_private_identifier(name) {
@@ -1767,6 +1777,7 @@ impl Binder {
                 );
 
                 if is_string_literal(name) {
+                    let attributes = node.attributes();
                     let pattern = try_parse_pattern(name.text());
                     if !pattern.is_valid() {
                         // An invalid pattern - must have multiple wildcards.
@@ -1784,6 +1795,12 @@ impl Binder {
                                 pattern_suffix: pattern.text[star + 1..].to_string(),
                                 symbol,
                             });
+                    } else if attributes.is_some() {
+                        self.error_on_node(
+                            name,
+                            diag::An_ambient_module_declaration_with_import_attributes_must_use_a_pattern_name_with_an_Asterisk_character,
+                            args![],
+                        );
                     }
                 }
             }

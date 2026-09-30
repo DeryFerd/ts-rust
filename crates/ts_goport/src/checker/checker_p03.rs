@@ -1211,6 +1211,9 @@ impl Checker {
         // Grammar checking
         self.check_grammar_modifiers(node);
         node.for_each_child(&mut |child: Node| self.check_source_element(child));
+        if self.symbols.len(node.locals()) != 0 {
+            self.register_for_unused_identifiers_check(node);
+        }
     }
 
     // Go: checker/checker.go:2810 checkConstructorDeclaration
