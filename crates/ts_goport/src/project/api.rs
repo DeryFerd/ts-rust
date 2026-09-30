@@ -4,7 +4,7 @@
 //! methods are on `Session` (see session.rs) and take `self: &Rc<Self>`
 //! because snapshot updates queue work that captures the session.
 
-use crate::frontend::core_ext::get_script_kind_from_file_name;
+use crate::frontend::core_ext::{ProjectReference, get_script_kind_from_file_name};
 use crate::project::prelude::*;
 
 impl Session {
@@ -18,11 +18,13 @@ impl Session {
     // encountered while applying the request, e.g. failing to load a project to open.
     // PORT: Go returns `(*Snapshot, error)` and returns the ref'd snapshot also
     // with an error, so the caller can Deref it. The port returns both values.
+    // Go `*APISnapshotRequest` is `Option<APISnapshotRequest>` (nil is `None`,
+    // since ts#63950 passes nil).
     pub fn api_update(
         self: &Rc<Self>,
         ctx: &Context,
         api_file_changes: &FileChangeSummary,
-        api_request: APISnapshotRequest,
+        api_request: Option<APISnapshotRequest>,
     ) -> (Rc<Snapshot>, Option<GoError>) {
         self.cancel_scheduled_snapshot_update();
 
@@ -33,7 +35,7 @@ impl Session {
             ctx,
             overlays,
             SnapshotChange {
-                api_request: Some(api_request),
+                api_request,
                 file_changes,
                 ata_changes,
                 ..Default::default()
@@ -103,5 +105,50 @@ impl Session {
             self,
         );
         Ok(new_snapshot)
+    }
+
+    // Go: project/api.go:75 APICreateProgram (ts#63950)
+    // APICreateProgram creates an isolated snapshot containing one synthetic project.
+    // Without an old snapshot it starts from the underlying filesystem; otherwise it
+    // derives from oldSnapshot and applies fileChanges.
+    #[allow(clippy::too_many_arguments)]
+    pub fn api_create_program(
+        self: &Rc<Self>,
+        ctx: &Context,
+        root_file_names: &[String],
+        options: Option<Rc<CompilerOptions>>,
+        project_references: Option<Vec<ProjectReference>>,
+        config_file_parsing_diagnostics: Vec<Diagnostic>,
+        old_snapshot: Option<&Rc<Snapshot>>,
+        old_project: Option<&Rc<RefCell<Project>>>,
+        file_changes: FileChangeSummary,
+    ) -> Rc<Snapshot> {
+        if let Some(old_snapshot) = old_snapshot {
+            return old_snapshot.clone_for_program(
+                ctx,
+                root_file_names,
+                options,
+                project_references,
+                config_file_parsing_diagnostics,
+                old_project,
+                file_changes,
+                self,
+            );
+        }
+
+        let (snapshot, _) = self.api_update(ctx, &file_changes, None);
+        let new_snapshot = snapshot.clone_for_program(
+            ctx,
+            root_file_names,
+            options,
+            project_references,
+            config_file_parsing_diagnostics,
+            None,
+            file_changes,
+            self,
+        );
+        // Go: defer snapshot.Deref(s)
+        snapshot.deref(self);
+        new_snapshot
     }
 }

@@ -11,7 +11,7 @@ use crate::project::prelude::*;
 
 use crate::contentmapper;
 use crate::frontend::compiler::CompilerHost as _;
-use crate::frontend::core_ext::TypeAcquisition;
+use crate::frontend::core_ext::{ProjectReference, TypeAcquisition};
 use crate::frontend::vfs::Fs as _;
 use crate::program::ls_program;
 use std::cell::Cell;
@@ -129,10 +129,14 @@ pub fn new_configured_project(
 
 // Go: project/project.go:100 NewInferredProject
 // PORT: Go `*core.CompilerOptions` (nil-able) is `Option<Rc<CompilerOptions>>`.
+// PORT: Go `[]*core.ProjectReference` is `Option<Vec<ProjectReference>>`
+// (the `ParsedOptions` field type; nil is `None`).
+#[allow(clippy::too_many_arguments)]
 pub fn new_inferred_project(
     current_directory: &str,
     compiler_options: Option<Rc<CompilerOptions>>,
     root_file_names: &[String],
+    project_references: Option<Vec<ProjectReference>>,
     content_mappers: &[Rc<contentmapper::Mapper>],
     builder: &ProjectCollectionBuilder,
     logger: Option<Rc<logging::LogTree>>,
@@ -164,6 +168,7 @@ pub fn new_inferred_project(
     let command_line = new_inferred_project_command_line(
         compiler_options,
         root_file_names.to_vec(),
+        project_references,
         content_mappers,
         tspath::ComparePathsOptions {
             use_case_sensitive_file_names: builder.fs.fs.use_case_sensitive_file_names(),
@@ -178,16 +183,50 @@ pub fn new_inferred_project(
 pub fn new_inferred_project_command_line(
     compiler_options: Rc<CompilerOptions>,
     root_file_names: Vec<String>,
+    project_references: Option<Vec<ProjectReference>>,
     content_mappers: &[Rc<contentmapper::Mapper>],
     compare_paths_options: tspath::ComparePathsOptions,
 ) -> tsoptions::ParsedCommandLine {
     let mut command_line = tsoptions::new_parsed_command_line(
         compiler_options,
         root_file_names,
+        project_references,
         compare_paths_options,
     );
     command_line.parsed_config.content_mappers = content_mappers.to_vec();
     command_line
+}
+
+// Go: project/project.go:156 newInferredProjectFromProject (ts#63950)
+// newInferredProjectFromProject creates an isolated synthetic project seeded
+// from an existing project's compiler state.
+pub fn new_inferred_project_from_project(
+    project: &Project,
+    builder: &ProjectCollectionBuilder,
+    logger: Option<Rc<logging::LogTree>>,
+) -> Rc<RefCell<Project>> {
+    let inferred = new_project(
+        INFERRED_PROJECT_NAME,
+        Kind::INFERRED,
+        &project.current_directory,
+        builder,
+        logger,
+    );
+    {
+        let mut p = inferred.borrow_mut();
+        let program = project
+            .program
+            .as_ref()
+            .expect("invalid memory address or nil pointer dereference: Project.Program");
+        p.command_line = Some(program.command_line().clone());
+        p.program = project.program.clone();
+        p.program_last_update = project.program_last_update;
+        p.host = project.host.clone();
+        p.checker_pool = project.checker_pool.clone();
+        p.content_mapper_watched_files = project.content_mapper_watched_files.clone();
+        p.dirty = false;
+    }
+    inferred
 }
 
 // Go: project/project.go:134 NewProject

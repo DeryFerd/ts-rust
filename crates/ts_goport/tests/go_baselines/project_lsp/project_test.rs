@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use ts_goport::diag;
 use ts_goport::lsp::lsproto;
+use ts_goport::options::{CompilerOptions, Tristate};
 use ts_goport::program::ls_program;
 use ts_goport::project::{ProgramUpdateKind, Session};
 
@@ -69,7 +70,56 @@ child_test! {
 }
 
 child_test! {
-    // Go: project_test.go:83 TestProjectProgramUpdateKind/NewFiles when import resolution mode changes
+    // Go: project_test.go:83 TestProjectProgramUpdateKind/compiler options update inferred project (ts#63950)
+    fn program_update_kind_compiler_options_update_inferred_project() {
+        const FILE_NAME: &str = "/src/index.ts";
+        let (session, _) = projecttestutil::setup(files(&[(FILE_NAME, "export const x = 1;")]));
+        let u = format!("file://{FILE_NAME}");
+        open(&session, &u, "export const x = 1;");
+        let old_project = session
+            .snapshot()
+            .project_collection
+            .inferred_project()
+            .expect("inferred project");
+        let old_program = old_project.borrow().program.clone().expect("program");
+        assert_eq!(old_program.options().strict, Tristate::Unknown);
+
+        session.did_change_compiler_options_for_inferred_projects(
+            &bg(),
+            Some(Rc::new(CompilerOptions {
+                no_lib: Tristate::True,
+                strict: Tristate::True,
+                ..Default::default()
+            })),
+        );
+        session
+            .get_language_service(&bg(), &uri(&u))
+            .unwrap_or_else(|err| panic!("GetLanguageService: {}", err.error()));
+
+        let updated_project = session
+            .snapshot()
+            .project_collection
+            .inferred_project()
+            .expect("inferred project");
+        let updated_project = updated_project.borrow();
+        assert_eq!(
+            updated_project
+                .command_line
+                .as_ref()
+                .expect("command line")
+                .compiler_options()
+                .strict,
+            Tristate::True
+        );
+        let updated_program = updated_project.program.clone().expect("program");
+        assert!(!Rc::ptr_eq(&updated_program, &old_program));
+        assert_eq!(updated_program.options().strict, Tristate::True);
+        assert_eq!(old_program.options().strict, Tristate::Unknown);
+    }
+}
+
+child_test! {
+    // Go: project_test.go:111 TestProjectProgramUpdateKind/NewFiles when import resolution mode changes
     // #4792
     fn program_update_kind_new_files_when_import_resolution_mode_changes() {
         let index = r#"import type { Value } from "pkg" with { "resolution-mode": "require" };

@@ -10,6 +10,7 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
+use crate::frontend::core_ext::ProjectReference;
 use std::cell::{Cell, OnceCell};
 use std::panic::AssertUnwindSafe;
 use std::time::Instant;
@@ -153,6 +154,296 @@ pub fn new_snapshot(
 }
 
 impl Snapshot {
+    // Go: project/snapshot.go:112 cloneForProgram (ts#63950)
+    // cloneForProgram clones a snapshot and creates a single synthetic inferred
+    // project representing createProgram input.
+    // PORT: the deferred `recover()` is `catch_unwind` around the body, as in
+    // `clone_`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_for_program(
+        &self,
+        ctx: &Context,
+        root_file_names: &[String],
+        compiler_options: Option<Rc<CompilerOptions>>,
+        project_references: Option<Vec<ProjectReference>>,
+        config_file_parsing_diagnostics: Vec<Diagnostic>,
+        old_project: Option<&Rc<RefCell<Project>>>,
+        file_changes: FileChangeSummary,
+        session: &Session,
+    ) -> Rc<Snapshot> {
+        let mut logger: Option<Rc<logging::LogTree>> = None;
+
+        if session.options.logging_enabled {
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                self.clone_for_program_body(
+                    ctx,
+                    root_file_names,
+                    compiler_options.clone(),
+                    project_references.clone(),
+                    config_file_parsing_diagnostics.clone(),
+                    old_project,
+                    file_changes.clone(),
+                    session,
+                    &mut logger,
+                )
+            }));
+            return match result {
+                Ok(new_snapshot) => new_snapshot,
+                Err(r) => {
+                    session.logger.log(&logger.string());
+                    std::panic::resume_unwind(r)
+                }
+            };
+        }
+
+        self.clone_for_program_body(
+            ctx,
+            root_file_names,
+            compiler_options,
+            project_references,
+            config_file_parsing_diagnostics,
+            old_project,
+            file_changes,
+            session,
+            &mut logger,
+        )
+    }
+
+    // Go: project/snapshot.go:112 cloneForProgram (the body after the deferred recover)
+    #[allow(clippy::too_many_arguments)]
+    fn clone_for_program_body(
+        &self,
+        ctx: &Context,
+        root_file_names: &[String],
+        compiler_options: Option<Rc<CompilerOptions>>,
+        project_references: Option<Vec<ProjectReference>>,
+        config_file_parsing_diagnostics: Vec<Diagnostic>,
+        old_project: Option<&Rc<RefCell<Project>>>,
+        file_changes: FileChangeSummary,
+        session: &Session,
+        logger_out: &mut Option<Rc<logging::LogTree>>,
+    ) -> Rc<Snapshot> {
+        if session.options.logging_enabled {
+            *logger_out =
+                logging::new_log_tree(&format!("Cloning snapshot {} for program", self.id));
+        }
+        let logger = logger_out.clone();
+
+        let start = Instant::now();
+        let fs = new_snapshot_fs_builder(
+            session.fs.fs.clone(),
+            self.fs.overlays.clone(),
+            self.fs.overlays.clone(),
+            self.fs.disk_files.clone(),
+            self.fs.disk_directories.clone(),
+            self.fs.node_modules_realpath_aliases.clone(),
+            session.options.position_encoding.clone(),
+            self.to_path.clone(),
+        );
+        let file_changes = self.process_file_changes(&fs, file_changes, &logger, None);
+
+        // Go: session.snapshotID.Add(1)
+        let new_snapshot_id = session.snapshot_id.get() + 1;
+        session.snapshot_id.set(new_snapshot_id);
+        let project_collection_builder = new_project_collection_builder(
+            ctx,
+            new_snapshot_id,
+            fs.clone(),
+            self.project_collection.clone(),
+            self.config_file_registry.clone(),
+            &APIState::default(),
+            compiler_options.clone(),
+            self.inferred_project_content_mappers.clone(),
+            self.inferred_project_content_mapper_extensions.clone(),
+            self.session_options.clone(),
+            &self.config_file_registry.custom_config_file_name,
+            session.parse_cache.clone(),
+            session.content_mapped_parse_cache.clone(),
+            session.extended_config_cache.clone(),
+            session.content_mapper_host.clone(),
+            session.client.clone(),
+        );
+
+        project_collection_builder.seed_inferred_project_for_program(old_project, logger.clone());
+        if !file_changes.is_empty() {
+            let change_logger = logger.fork("DidChangeFiles");
+            project_collection_builder.did_change_files(&file_changes, change_logger);
+        }
+        let update_logger = logger.fork("UpdateProgramConfig");
+        project_collection_builder.update_or_create_inferred_project(
+            root_file_names.to_vec(),
+            compiler_options.clone(),
+            project_references,
+            config_file_parsing_diagnostics,
+            self.inferred_project_content_mappers.clone(),
+            update_logger,
+        );
+        let inferred_dirty = project_collection_builder
+            .inferred_project
+            .value()
+            .expect(NIL_DEREF)
+            .borrow()
+            .dirty;
+        if inferred_dirty {
+            let create_logger = logger.fork("CreateProgram");
+            project_collection_builder
+                .update_program(&*project_collection_builder.inferred_project, create_logger);
+        }
+        project_collection_builder
+            .cleanup_all_configured_projects(logger.fork("cleanupAllConfiguredProjects"));
+        let (new_project_collection, new_config_file_registry) =
+            project_collection_builder.finalize(logger.clone());
+
+        let clean_files_start = Instant::now();
+        let mut removed_files = 0;
+        fs.disk_files.range(&mut |entry| {
+            for project in new_project_collection.projects() {
+                let project = project.borrow();
+                if let Some(host) = &project.host {
+                    if host.source_fs.seen_file(&entry.key()) {
+                        return true;
+                    }
+                }
+            }
+            entry.delete();
+            removed_files += 1;
+            true
+        });
+        if session.options.logging_enabled {
+            logger.logf(&format!(
+                "Removed {} cached file(s) in {:?}",
+                removed_files,
+                clean_files_start.elapsed()
+            ));
+        }
+
+        let (snapshot_fs, _) = fs.finalize();
+        let mut new_snapshot = new_snapshot(
+            new_snapshot_id,
+            snapshot_fs.clone(),
+            self.session_options.clone(),
+            new_config_file_registry.clone(),
+            compiler_options,
+            self.user_preferences.clone(),
+            None,
+            None,
+            self.to_path.clone(),
+        );
+        {
+            let s = Rc::get_mut(&mut new_snapshot).expect("new snapshot is not shared yet");
+            s.parent_id = self.id;
+            s.project_collection = new_project_collection;
+            s.config_file_registry = new_config_file_registry;
+            s.inferred_project_content_mappers = self.inferred_project_content_mappers.clone();
+            s.inferred_project_content_mapper_extensions =
+                self.inferred_project_content_mapper_extensions.clone();
+            s.builder_logs = logger.clone();
+        }
+
+        for project in new_snapshot.project_collection.projects() {
+            let project = project.borrow();
+            if let Some(program) = &project.program {
+                session.program_counter.ref_(program);
+                if project.program_last_update == new_snapshot_id {
+                    project.host.as_ref().expect(NIL_DEREF).freeze(
+                        snapshot_fs.clone(),
+                        new_snapshot.config_file_registry.clone(),
+                    );
+                }
+            }
+        }
+
+        // PORT: Go map order is random; the registry map's order here.
+        for config in new_snapshot.config_file_registry.configs.values() {
+            let config = config.borrow();
+            if let Some(command_line) = &config.command_line {
+                if let Some(config_file) = &command_line.config_file {
+                    for file in &config_file.extended_source_files {
+                        session
+                            .extended_config_cache
+                            .add_owner(&(new_snapshot.to_path)(file), new_snapshot.id);
+                    }
+                }
+            }
+        }
+
+        if logger.is_some() {
+            logger.logf(&format!(
+                "Finished cloning snapshot {} into snapshot {} for program in {:?}",
+                self.id,
+                new_snapshot.id,
+                start.elapsed()
+            ));
+        }
+        new_snapshot
+    }
+
+    // Go: project/snapshot.go:249 processFileChanges (ts#63950)
+    pub fn process_file_changes(
+        &self,
+        fs: &Rc<SnapshotFSBuilder>,
+        file_changes: FileChangeSummary,
+        logger: &Option<Rc<logging::LogTree>>,
+        content_mapper_contributions: Option<&ContentMapperContributions>,
+    ) -> FileChangeSummary {
+        let mut file_changes = file_changes;
+        if file_changes.has_excessive_watch_events() {
+            let invalidate_start = Instant::now();
+            if file_changes.invalidate_all {
+                fs.invalidate_cache();
+                if logger.is_some() {
+                    logger.logf(&format!(
+                        "InvalidateAll: invalidated file cache in {:?}",
+                        invalidate_start.elapsed()
+                    ));
+                }
+            } else if !fs.watch_changes_overlap_cache(&file_changes) {
+                // All watch changes/deletes are files we haven't seen; should be irrelevant to us (probably an external tool's build or something)
+                file_changes.changed = FxHashSet::default();
+                file_changes.deleted = FxHashSet::default();
+            } else if file_changes.includes_watch_change_outside_node_modules {
+                fs.invalidate_cache();
+                if logger.is_some() {
+                    logger.logf(&format!(
+                        "Excessive watch changes detected, invalidated file cache in {:?}",
+                        invalidate_start.elapsed()
+                    ));
+                }
+            } else {
+                fs.invalidate_node_modules_cache();
+                if logger.is_some() {
+                    logger.logf(&format!(
+                        "npm install detected, invalidated node_modules cache in {:?}",
+                        invalidate_start.elapsed()
+                    ));
+                }
+            }
+        } else {
+            let content_mapper_extensions = match content_mapper_contributions {
+                None => self.content_mapper_watch_state().0,
+                Some(contributions) => {
+                    let mut content_mapper_extensions = self
+                        .config_file_registry
+                        .content_mappers()
+                        .extensions
+                        .clone();
+                    content_mapper_extensions.extend(contributions.extensions.iter().cloned());
+                    content_mapper_extensions
+                }
+            };
+            let (_, content_mapper_watched_files) = self.content_mapper_watch_state();
+            file_changes = fs.expand_and_filter_watch_events(
+                file_changes,
+                &content_mapper_extensions,
+                Some(&*content_mapper_watched_files),
+            );
+            file_changes = self.fs.expand_realpath_aliases(file_changes);
+            file_changes = fs.mark_dirty_files(file_changes);
+            file_changes = fs.convert_open_and_close_to_changes(file_changes);
+        }
+        file_changes
+    }
+
     // Go: project/snapshot.go:82 GetDefaultProject
     pub fn get_default_project(&self, uri: &lsproto::DocumentUri) -> Option<Rc<RefCell<Project>>> {
         self.project_collection
@@ -575,7 +866,6 @@ impl Snapshot {
         let logger = logger_out.clone();
 
         let start = Instant::now();
-        let configured_content_mappers = self.config_file_registry.content_mappers();
         let mut inferred_content_mappers = self.inferred_project_content_mappers.clone();
         let mut inferred_content_mapper_extensions =
             self.inferred_project_content_mapper_extensions.clone();
@@ -593,58 +883,16 @@ impl Snapshot {
             session.options.position_encoding.clone(),
             self.to_path.clone(),
         );
-        if change.file_changes.has_excessive_watch_events() {
-            let invalidate_start = Instant::now();
-            if change.file_changes.invalidate_all {
-                fs.invalidate_cache();
-                logger.logf(&format!(
-                    "InvalidateAll: invalidated file cache in {:?}",
-                    invalidate_start.elapsed()
-                ));
-            } else if !fs.watch_changes_overlap_cache(&change.file_changes) {
-                // All watch changes/deletes are files we haven't seen; should be irrelevant to us (probably an external tool's build or something)
-                change.file_changes.changed = FxHashSet::default();
-                change.file_changes.deleted = FxHashSet::default();
-            } else if change
-                .file_changes
-                .includes_watch_change_outside_node_modules
-            {
-                fs.invalidate_cache();
-                logger.logf(&format!(
-                    "Excessive watch changes detected, invalidated file cache in {:?}",
-                    invalidate_start.elapsed()
-                ));
-            } else {
-                fs.invalidate_node_modules_cache();
-                logger.logf(&format!(
-                    "npm install detected, invalidated node_modules cache in {:?}",
-                    invalidate_start.elapsed()
-                ));
-            }
-        } else {
-            let content_mapper_extensions = if change.content_mapper_contributions.is_none() {
-                self.content_mapper_watch_state().0
-            } else {
-                let mut content_mapper_extensions = configured_content_mappers.extensions.clone();
-                content_mapper_extensions
-                    .extend(inferred_content_mapper_extensions.iter().cloned());
-                content_mapper_extensions
-            };
-            let (_, content_mapper_watched_files) = self.content_mapper_watch_state();
-            change.file_changes = fs.expand_and_filter_watch_events(
-                change.file_changes,
-                &content_mapper_extensions,
-                Some(&*content_mapper_watched_files),
-            );
-            change.file_changes = self.fs.expand_realpath_aliases(change.file_changes);
-            change.file_changes = fs.mark_dirty_files(change.file_changes);
-            change.file_changes = fs.convert_open_and_close_to_changes(change.file_changes);
-        }
+        change.file_changes = self.process_file_changes(
+            &fs,
+            std::mem::take(&mut change.file_changes),
+            &logger,
+            change.content_mapper_contributions.as_ref(),
+        );
 
         let mut compiler_options_for_inferred_projects =
             self.compiler_options_for_inferred_projects.clone();
         if change.compiler_options_for_inferred_projects.is_some() {
-            // !!! mark inferred projects as dirty?
             compiler_options_for_inferred_projects =
                 change.compiler_options_for_inferred_projects.clone();
         }
@@ -684,6 +932,29 @@ impl Snapshot {
 
         project_collection_builder
             .did_change_custom_config_file_name(logger.fork("DidChangeCustomConfigFileName"));
+        // ts#63950
+        if let Some(compiler_options) = &change.compiler_options_for_inferred_projects
+            && let Some(inferred_project) = project_collection_builder.inferred_project.value()
+        {
+            let (file_names, project_references, errors, content_mappers) = {
+                let inferred_project = inferred_project.borrow();
+                let command_line = inferred_project.command_line.as_ref().expect(NIL_DEREF);
+                (
+                    command_line.file_names().to_vec(),
+                    command_line.parsed_config.project_references.clone(),
+                    command_line.errors.clone(),
+                    command_line.content_mappers().to_vec(),
+                )
+            };
+            project_collection_builder.update_inferred_project(
+                file_names,
+                Some(compiler_options.clone()),
+                project_references,
+                errors,
+                content_mappers,
+                logger.fork("DidChangeCompilerOptionsForInferredProjects"),
+            );
+        }
         if change.content_mapper_contributions.is_some() {
             project_collection_builder.did_change_content_mapper_contributions(
                 logger.fork("DidChangeContentMapperContributions"),

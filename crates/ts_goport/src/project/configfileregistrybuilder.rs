@@ -574,6 +574,31 @@ impl ConfigFileRegistryBuilder {
         }
     }
 
+    // Go: project/configfileregistrybuilder.go:356 configFileRegistryBuilder.retainConfigForProject (ts#63950)
+    // PORT: a Go nil `retainingProjects` map is the empty set here, so the
+    // Go `make` before the write is not needed.
+    pub fn retain_config_for_project(
+        &self,
+        config_file_path: &tspath::Path,
+        project_path: &tspath::Path,
+    ) {
+        if let (Some(entry), true) = self.configs.load(config_file_path) {
+            entry.change_if(
+                &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
+                    let config = config.expect("invalid memory address or nil pointer dereference");
+                    let exists = config.borrow().retaining_projects.contains(project_path);
+                    !exists
+                },
+                &mut |config: &Rc<RefCell<ConfigFileEntry>>| {
+                    config
+                        .borrow_mut()
+                        .retaining_projects
+                        .insert(project_path.clone());
+                },
+            );
+        }
+    }
+
     // Go: project/configfileregistrybuilder.go:316 configFileRegistryBuilder.didCloseFile
     // didCloseFile removes the open file from the config entry. Once no projects
     // or files are associated with the config entry, it will be removed on the next call to `cleanup`.

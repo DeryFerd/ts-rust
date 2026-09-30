@@ -14,7 +14,7 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
-use crate::frontend::core_ext::get_script_kind_from_file_name;
+use crate::frontend::core_ext::{ProjectReference, get_script_kind_from_file_name};
 use crate::frontend::{core_bfs, core_ls_ext, core_workgroup};
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -708,6 +708,24 @@ impl ProjectCollectionBuilder {
         self.config_file_registry_builder.cleanup();
     }
 
+    // Go: project/projectcollectionbuilder.go:453 cleanupAllConfiguredProjects (ts#63950)
+    // cleanupAllConfiguredProjects removes all configured projects unconditionally.
+    // PORT: Go deletes entries inside `Range`; the port copies the keys first
+    // and loads each one again, as Go does.
+    pub fn cleanup_all_configured_projects(self: &Rc<Self>, logger: Option<Rc<logging::LogTree>>) {
+        let mut keys: Vec<tspath::Path> = Vec::new();
+        self.configured_projects.range(&mut |entry| {
+            keys.push(entry.key());
+            true
+        });
+        for key in &keys {
+            if let (Some(p), true) = self.configured_projects.load(key) {
+                self.delete_configured_project(&*p, logger.clone());
+            }
+        }
+        self.config_file_registry_builder.cleanup();
+    }
+
     // Go: project/projectcollectionbuilder.go:420 collectInferredProjectRoots
     fn collect_inferred_project_roots(self: &Rc<Self>) -> Vec<String> {
         let mut inferred_project_files: Vec<String> = Vec::new();
@@ -1159,14 +1177,25 @@ impl ProjectCollectionBuilder {
     ) -> bool {
         // PORT: Go map order is random; FxHashSet order here.
         for project_path in &config_change_result.affected_projects {
-            let (project, ok) = self.configured_projects.load(project_path);
-            if !ok {
+            // ts#63950: the inferred project can retain a config (a program
+            // made by createProgram with project references).
+            let project: Option<Rc<dyn dirty::Value<Rc<RefCell<Project>>>>> = if project_path
+                .as_str()
+                == INFERRED_PROJECT_NAME
+            {
+                Some(self.inferred_project.clone() as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>)
+            } else {
+                self.configured_projects
+                    .load(project_path)
+                    .0
+                    .map(|entry| entry as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>)
+            };
+            let Some(project) = project.filter(|project| project.value().is_some()) else {
                 panic!(
                     "project {} affected by config change not found",
                     project_path
                 );
-            }
-            let project = project.expect(NIL_DEREF);
+            };
             project.change_if(
                 &mut |p: Option<&Rc<RefCell<Project>>>| -> bool {
                     let p = p.expect(NIL_DEREF).borrow();
@@ -1723,18 +1752,74 @@ impl ProjectCollectionBuilder {
         entry
     }
 
-    // Go: project/projectcollectionbuilder.go:966 updateInferredProjectRoots
-    // PORT: Go sorts the caller's slice in place; the callers never read it
-    // again, so the port takes the `Vec` by value.
+    // Go: project/projectcollectionbuilder.go:1123 updateInferredProjectRoots
+    // PORT: Go filters into a new slice; the port takes the `Vec` by value.
     pub fn update_inferred_project_roots(
         self: &Rc<Self>,
         root_file_names: Vec<String>,
         logger: Option<Rc<logging::LogTree>>,
     ) -> bool {
-        let mut root_file_names: Vec<String> = root_file_names
+        let root_file_names: Vec<String> = root_file_names
             .into_iter()
             .filter(|file_name| self.is_supported_in_inferred_project(file_name))
             .collect();
+        let mut project_references: Option<Vec<ProjectReference>> = None;
+        let mut config_file_parsing_diagnostics: Vec<Diagnostic> = Vec::new();
+        if let Some(project) = self.inferred_project.value() {
+            let project = project.borrow();
+            let command_line = project.command_line.as_ref().expect(NIL_DEREF);
+            // PORT: Go `CommandLine.ProjectReferences()` keeps nil apart
+            // from an empty list; that is the `ParsedOptions` field here.
+            project_references = command_line.parsed_config.project_references.clone();
+            config_file_parsing_diagnostics = command_line.errors.clone();
+        }
+        self.update_inferred_project(
+            root_file_names,
+            self.compiler_options_for_inferred_projects.clone(),
+            project_references,
+            config_file_parsing_diagnostics,
+            self.inferred_content_mappers.clone(),
+            logger,
+        )
+    }
+
+    // Go: project/projectcollectionbuilder.go:1134 seedInferredProjectForProgram (ts#63950)
+    // seedInferredProjectForProgram copies the specified project into the synthetic inferred project used by createProgram.
+    pub fn seed_inferred_project_for_program(
+        self: &Rc<Self>,
+        project: Option<&Rc<RefCell<Project>>>,
+        logger: Option<Rc<logging::LogTree>>,
+    ) {
+        let Some(project) = project else {
+            return;
+        };
+        let Some(program) = project.borrow().program.clone() else {
+            return;
+        };
+        let inferred_project = new_inferred_project_from_project(&project.borrow(), self, logger);
+        let inferred_config_file_path = inferred_project.borrow().config_file_path.clone();
+        program.range_resolved_project_reference(
+            |reference_path: &tspath::Path, _, _, _| -> bool {
+                self.config_file_registry_builder
+                    .retain_config_for_project(reference_path, &inferred_config_file_path);
+                true
+            },
+        );
+        self.inferred_project.set(inferred_project);
+    }
+
+    // Go: project/projectcollectionbuilder.go:1147 updateInferredProject (ts#63950)
+    // updateInferredProject preserves the current command line when roots/options are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_inferred_project(
+        self: &Rc<Self>,
+        root_file_names: Vec<String>,
+        compiler_options: Option<Rc<CompilerOptions>>,
+        project_references: Option<Vec<ProjectReference>>,
+        config_file_parsing_diagnostics: Vec<Diagnostic>,
+        content_mappers: Vec<Rc<contentmapper::Mapper>>,
+        logger: Option<Rc<logging::LogTree>>,
+    ) -> bool {
         if root_file_names.is_empty() {
             if self.inferred_project.value().is_some() {
                 if logger.is_some() {
@@ -1745,70 +1830,107 @@ impl ProjectCollectionBuilder {
             }
             return false;
         }
-
+        // Go: slices.Clone, then slices.Sort (the port owns the Vec).
+        let mut root_file_names = root_file_names;
         root_file_names.sort();
-        let content_mappers = &self.inferred_content_mappers;
-        if self.inferred_project.value().is_none() {
-            self.inferred_project.set(new_inferred_project(
+        self.update_or_create_inferred_project(
+            root_file_names,
+            compiler_options,
+            project_references,
+            config_file_parsing_diagnostics,
+            content_mappers,
+            logger,
+        )
+    }
+
+    // Go: project/projectcollectionbuilder.go:1171 updateOrCreateInferredProject (ts#63950)
+    // updateOrCreateInferredProject always retains an inferred project, including when rootFileNames is empty.
+    // The caller transfers ownership of rootFileNames.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_or_create_inferred_project(
+        self: &Rc<Self>,
+        root_file_names: Vec<String>,
+        compiler_options: Option<Rc<CompilerOptions>>,
+        project_references: Option<Vec<ProjectReference>>,
+        config_file_parsing_diagnostics: Vec<Diagnostic>,
+        content_mappers: Vec<Rc<contentmapper::Mapper>>,
+        logger: Option<Rc<logging::LogTree>>,
+    ) -> bool {
+        let Some(project) = self.inferred_project.value() else {
+            let project = new_inferred_project(
                 &self.session_options.current_directory,
-                self.compiler_options_for_inferred_projects.clone(),
+                compiler_options,
                 &root_file_names,
-                content_mappers,
+                project_references,
+                &content_mappers,
                 self,
                 logger,
-            ));
-        } else {
-            let mut new_compiler_options = self
-                .inferred_project
-                .value()
-                .expect(NIL_DEREF)
-                .borrow()
-                .command_line
-                .as_ref()
-                .expect(NIL_DEREF)
-                .compiler_options()
-                .clone();
-            if let Some(compiler_options) = &self.compiler_options_for_inferred_projects {
-                new_compiler_options = compiler_options.clone();
+            );
+            {
+                let mut p = project.borrow_mut();
+                // Go: project.CommandLine.Errors = configFileParsingDiagnostics
+                Rc::get_mut(p.command_line.as_mut().expect(NIL_DEREF))
+                    .expect("the new command line is not shared yet")
+                    .errors = config_file_parsing_diagnostics;
             }
-            let new_command_line = Rc::new(new_inferred_project_command_line(
-                new_compiler_options,
-                root_file_names.clone(),
-                content_mappers,
-                tspath::ComparePathsOptions {
-                    use_case_sensitive_file_names: self.fs.fs.use_case_sensitive_file_names(),
-                    current_directory: self.session_options.current_directory.clone(),
-                },
-            ));
-            let changed = self.inferred_project.change_if(
-                &mut |p: Option<&Rc<RefCell<Project>>>| -> bool {
-                    let p = p.expect(NIL_DEREF).borrow();
-                    let command_line = p.command_line.as_ref().expect(NIL_DEREF);
+            self.inferred_project.set(project);
+            return true;
+        };
+
+        let (compiler_options, current_directory) = {
+            let project = project.borrow();
+            let compiler_options = match compiler_options {
+                Some(compiler_options) => compiler_options,
+                None => project
+                    .command_line
+                    .as_ref()
+                    .expect(NIL_DEREF)
+                    .compiler_options()
+                    .clone(),
+            };
+            (compiler_options, project.current_directory.clone())
+        };
+        let mut new_command_line = new_inferred_project_command_line(
+            compiler_options.clone(),
+            root_file_names.clone(),
+            project_references.clone(),
+            &content_mappers,
+            tspath::ComparePathsOptions {
+                use_case_sensitive_file_names: self.fs.fs.use_case_sensitive_file_names(),
+                current_directory,
+            },
+        );
+        new_command_line.errors = config_file_parsing_diagnostics.clone();
+        let new_command_line = Rc::new(new_command_line);
+        let changed = self.inferred_project.change_if(
+            &mut |p: Option<&Rc<RefCell<Project>>>| -> bool {
+                let p = p.expect(NIL_DEREF).borrow();
+                let command_line = p.command_line.as_ref().expect(NIL_DEREF);
+                command_line.file_names() != new_command_line.file_names()
+                    // Go: !reflect.DeepEqual(p.CommandLine.CompilerOptions(), compilerOptions)
+                    || **command_line.compiler_options() != *compiler_options
+                    || !project_references_equal(
+                        command_line.project_references(),
+                        project_references.as_deref().unwrap_or_default(),
+                    )
+                    || !diagnostics_deep_equal(&command_line.errors, &config_file_parsing_diagnostics)
                     // PORT: Go `slices.Equal` on `[]*contentmapper.Mapper`
                     // compares the pointers.
-                    command_line.file_names_by_path() != new_command_line.file_names_by_path()
-                        || command_line.content_mappers().len()
-                            != new_command_line.content_mappers().len()
-                        || command_line
-                            .content_mappers()
-                            .iter()
-                            .zip(new_command_line.content_mappers())
-                            .any(|(a, b)| !Rc::ptr_eq(a, b))
-                },
-                &mut |p: &Rc<RefCell<Project>>| {
-                    if logger.is_some() {
-                        logger.log(&format!(
-                            "Updating inferred project config with {} root files",
-                            root_file_names.len()
-                        ));
-                    }
-                    p.borrow_mut()
-                        .set_command_line(Some(new_command_line.clone()));
-                },
-            );
-            if !changed {
-                return false;
-            }
+                    || !mappers_equal(command_line.content_mappers(), new_command_line.content_mappers())
+            },
+            &mut |p: &Rc<RefCell<Project>>| {
+                if logger.is_some() {
+                    logger.log(&format!(
+                        "Updating inferred project config with {} root files",
+                        root_file_names.len()
+                    ));
+                }
+                p.borrow_mut()
+                    .set_command_line(Some(new_command_line.clone()));
+            },
+        );
+        if !changed {
+            return false;
         }
         true
     }
@@ -2194,6 +2316,51 @@ impl ProjectCollectionBuilder {
             },
         );
     }
+}
+
+// Go: project/projectcollectionbuilder.go:1225 projectReferencesEqual (ts#63950)
+// PORT: Go `[]*core.ProjectReference` elements are never nil here.
+pub fn project_references_equal(a: &[ProjectReference], b: &[ProjectReference]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| a.path == b.path && a.circular == b.circular)
+}
+
+/// Go `slices.Equal` on `[]*contentmapper.Mapper` (pointer compare).
+fn mappers_equal(a: &[Rc<contentmapper::Mapper>], b: &[Rc<contentmapper::Mapper>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| Rc::ptr_eq(a, b))
+}
+
+/// Go `reflect.DeepEqual` on two `[]*ast.Diagnostic` (ts#63950).
+// PORT: Go also tells a nil slice from an empty one; the port's
+// `ParsedCommandLine.errors` is a `Vec`, so both are empty. The source file
+// and the message are compared by identity (Go compares the pointees, which
+// are equal only for the same file and message in practice), and
+// `repopulateInfo` by pointer.
+pub fn diagnostics_deep_equal(a: &[Diagnostic], b: &[Diagnostic]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            a.file == b.file
+                && a.pos == b.pos
+                && a.end == b.end
+                && a.code == b.code
+                && a.category == b.category
+                && a.source == b.source
+                && std::ptr::eq(a.message, b.message)
+                && a.message_text == b.message_text
+                && a.message_args == b.message_args
+                && diagnostics_deep_equal(&a.message_chain, &b.message_chain)
+                && diagnostics_deep_equal(&a.related_information, &b.related_information)
+                && a.reports_unnecessary == b.reports_unnecessary
+                && a.reports_deprecated == b.reports_deprecated
+                && a.skipped_on_no_emit == b.skipped_on_no_emit
+                && match (&a.repopulate_info, &b.repopulate_info) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                    _ => false,
+                }
+        })
 }
 
 // Go: project/projectcollectionbuilder.go:271 isReferencedBy (closure in DidChangeFiles)
