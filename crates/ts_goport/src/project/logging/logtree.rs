@@ -152,7 +152,9 @@ impl LogTree {
     // Go: project/logging/logtree.go:119 Embed
     // PORT: `logs` is a Go `*LogTree`; Go dereferences it without a nil check.
     pub fn embed(&self, logs: &Option<Rc<LogTree>>) {
-        let logs = logs.as_ref().expect("nil pointer dereference: LogTree");
+        let logs = logs
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let count = logs.counts.count.get();
         self.root.string_length.set(
             self.root.string_length.get().wrapping_add(
@@ -187,13 +189,13 @@ impl LogTree {
     // Go: project/logging/logtree.go:140 String
     pub fn string(&self) -> String {
         if !Rc::ptr_eq(&self.root, &self.counts) {
-            panic!("can only call String on root LogTree");
+            crate::core::go_panic("can only call String on root LogTree".to_string());
         }
         let header = format!("======== {} ========\n", self.name);
         // Go: builder.Grow(int(c.stringLength.Load()) + len(header))
         let grow = self.counts.string_length.get() as i64 + header.len() as i64;
         if grow < 0 {
-            panic!("strings.Builder.Grow: negative count");
+            crate::core::go_panic("strings.Builder.Grow: negative count".to_string());
         }
         let mut builder = String::with_capacity(grow as usize);
         builder.push_str(&header);
@@ -320,7 +322,7 @@ impl Logger for Option<Rc<LogTree>> {
 
     fn is_verbose(&self) -> bool {
         self.as_ref()
-            .expect("nil pointer dereference: LogTree")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .is_verbose()
     }
 
@@ -360,7 +362,7 @@ impl LogTreeMethods for Option<Rc<LogTree>> {
     // Go: project/logging/logtree.go:140 String (no nil check in Go)
     fn string(&self) -> String {
         self.as_ref()
-            .expect("nil pointer dereference: LogTree")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .string()
     }
 }

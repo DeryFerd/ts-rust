@@ -130,7 +130,7 @@ impl<P: ProgramView> LanguageService<P> {
         let file_name = document_uri.file_name();
         let (program, file) = self.try_get_program_and_file(&file_name);
         if file.is_nil() {
-            panic!("file not found: {file_name}");
+            crate::core::go_panic(format!("file not found: {file_name}"));
         }
         (program, file)
     }
@@ -204,7 +204,7 @@ impl LanguageService {
         }
 
         // PORT: a nil registry is never prepared, so it is set here.
-        let registry = registry.expect("invalid memory address or nil pointer dereference");
+        let registry = registry.unwrap_or_else(|| crate::core::go_nil_dereference());
         let view = autoimport::new_view(
             registry,
             from_file,
@@ -225,7 +225,7 @@ impl LanguageService {
         let registry = self
             .host
             .auto_import_registry()
-            .expect("invalid memory address or nil pointer dereference");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         Rc::new(autoimport::new_view(
             registry,
             from_file,

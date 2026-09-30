@@ -122,7 +122,7 @@ impl<K: Eq + Hash + Clone, V: Clone, AcquireArgs> RefCountCache<K, V, AcquireArg
     pub fn ref_(&self, identity: &K) {
         let entry = self.entries.borrow().get(identity).cloned();
         let Some(entry) = entry else {
-            panic!("cache entry not found");
+            crate::core::go_panic("cache entry not found".to_string());
         };
         if entry.ref_count.get() <= 0 && !self.options.disable_deletion {
             // Entry was deleted while we were acquiring the lock

@@ -1457,8 +1457,11 @@ impl CaseClauseTracker for CaseClauseTrackerState {
             LiteralValue::Number(v) => {
                 self.existing_numbers.insert(NumberKey::from(*v));
             }
-            // PORT: Go prints `%T`; the text is only for the panic.
-            v => panic!("Unsupported type: {v:?}"),
+            // PORT: Go `%T` of the value.
+            LiteralValue::PseudoBigInt(_) => {
+                crate::core::go_panic("Unsupported type: jsnum.PseudoBigInt".to_string())
+            }
+            LiteralValue::Bool(_) => crate::core::go_panic("Unsupported type: bool".to_string()),
         }
     }
 
@@ -1473,8 +1476,8 @@ impl CaseClauseTracker for CaseClauseTrackerState {
             LiteralValue::PseudoBigInt(v) => {
                 self.existing_big_ints.contains(&PseudoBigIntKey::from(v))
             }
-            // PORT: Go prints `%T`; the text is only for the panic.
-            v => panic!("Unsupported type: {v:?}"),
+            // PORT: Go `%T` of the value.
+            LiteralValue::Bool(_) => crate::core::go_panic("Unsupported type: bool".to_string()),
         }
     }
 }
@@ -1818,7 +1821,7 @@ pub fn to_context_range(
     // !!! isContextWithStartAndEndNode
     let context_range = get_range_of_node(context, context_file, Node::NIL /*endNode*/);
     // PORT: Go dereferences `textRange` here.
-    let text_range = text_range.expect("invalid memory address or nil pointer dereference");
+    let text_range = text_range.unwrap_or_else(|| crate::core::go_nil_dereference());
     if context_range.pos() != text_range.pos() || context_range.end() != text_range.end() {
         return Some(context_range);
     }

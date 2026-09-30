@@ -31,7 +31,11 @@ fn assert_panics(f: impl FnOnce(), expected: &str) {
         Ok(()) => panic!("expected a panic with {expected:?}"),
         Err(payload) => payload,
     };
-    let got = if let Some(message) = payload.downcast_ref::<String>() {
+    // Go `recover()` gives the panic value; a Go panic of the port
+    // (`core::go_panic`) carries it as its message.
+    let got = if let Some(panic) = payload.downcast_ref::<ts_goport::core::GoPanic>() {
+        panic.message.clone()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
         message.clone()
     } else if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()

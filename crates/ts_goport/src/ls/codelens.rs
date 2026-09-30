@@ -113,7 +113,7 @@ impl LanguageService {
         let data = code_lens
             .data
             .clone()
-            .expect("invalid memory address or nil pointer dereference");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let uri = data.uri.clone();
         let text_doc = lsproto::TextDocumentIdentifier { uri: uri.clone() };
         let locale = locale::from_context(ctx);

@@ -233,7 +233,7 @@ impl<P: ProgramView> LanguageService<P> {
                 e.node,
                 e.source_file,
                 e.text_range
-                    .expect("runtime error: invalid memory address or nil pointer dereference"),
+                    .unwrap_or_else(|| crate::core::go_nil_dereference()),
             )
         };
         if node.is_nil() {

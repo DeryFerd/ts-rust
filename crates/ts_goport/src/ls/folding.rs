@@ -29,9 +29,14 @@ impl LanguageService {
                 return c;
             }
             // PORT: Go dereferences `*a.StartCharacter`; a nil pointer panics
-            // there as `unwrap` panics here. Every range made in this file
-            // sets it.
-            a.start_character.unwrap().cmp(&b.start_character.unwrap()) as i32
+            // there. Every range made in this file sets it.
+            let a_start = a
+                .start_character
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
+            let b_start = b
+                .start_character
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
+            a_start.cmp(&b_start) as i32
         });
         Ok(lsproto::FoldingRangesOrNull {
             folding_ranges: Some(res),

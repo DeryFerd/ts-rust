@@ -116,7 +116,7 @@ impl ProgramView for compiler::NewProgram {
             ))
             .filter(|parsed| parsed.root == referencing_file)
             .or_else(|| ls_program::parsed_source_file(referencing_file))
-            .expect("invalid memory address or nil pointer dereference");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
 
         // Check <reference path> directives
         for ref_ in &referencing_parsed_file.referenced_files {

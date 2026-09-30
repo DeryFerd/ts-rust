@@ -211,7 +211,9 @@ pub fn supplemental_file_index(file: Node) -> Option<i32> {
             return Some(i as i32);
         }
     }
-    panic!("supplemental source file is not linked from its canonical source file");
+    crate::core::go_panic(
+        "supplemental source file is not linked from its canonical source file".to_string(),
+    );
 }
 
 // Go: ls/completions.go:153 sourceFileForSupplementalFileIndex
@@ -352,10 +354,10 @@ pub fn keyword_filters_from_syntax_kind(
 ) -> KeywordCompletionFilters {
     match keyword_completion {
         SyntaxKind::TypeKeyword => KeywordCompletionFilters::TYPE_KEYWORD,
-        _ => panic!(
-            "Unknown mapping from ast.Kind `Kind{:?}` to KeywordCompletionFilters",
-            keyword_completion
-        ),
+        _ => crate::core::go_panic(format!(
+            "Unknown mapping from ast.Kind `{}` to KeywordCompletionFilters",
+            crate::gostd::debug::kind_string(keyword_completion)
+        )),
     }
 }
 
@@ -469,10 +471,10 @@ impl SymbolOriginInfo {
     pub fn symbol_name(&self) -> String {
         match &self.data {
             SymbolOriginInfoData::ComputedPropertyName(data) => data.symbol_name.clone(),
-            _ => panic!(
+            _ => crate::core::go_panic(format!(
                 "symbolOriginInfo: unknown data type for symbolName(): {}",
                 self.data.go_type_name()
-            ),
+            )),
         }
     }
 
@@ -481,10 +483,10 @@ impl SymbolOriginInfo {
     pub fn as_object_literal_method(&self) -> &SymbolOriginInfoObjectLiteralMethod {
         match &self.data {
             SymbolOriginInfoData::ObjectLiteralMethod(data) => data,
-            _ => panic!(
+            _ => crate::core::go_panic(format!(
                 "interface conversion: interface {{}} is {}, not *ls.symbolOriginInfoObjectLiteralMethod",
                 self.data.go_type_name()
-            ),
+            )),
         }
     }
 }
@@ -982,8 +984,10 @@ impl LanguageService {
                         if node.kind() != SyntaxKind::ImportKeyword
                             && node.kind() != SyntaxKind::NewKeyword
                         {
-                            // PORT: Go `Kind.String()` is "Kind" + the kind name.
-                            panic!("Unexpected token kind: Kind{:?}", node.kind());
+                            crate::core::go_panic(format!(
+                                "Unexpected token kind: {}",
+                                crate::gostd::debug::kind_string(node.kind())
+                            ));
                         }
                     }
                     _ => {
@@ -1149,7 +1153,9 @@ impl LanguageService {
             // Go: core.CheckEachDefined
             for &symbol in &s.symbols {
                 if symbol.is_nil() {
-                    panic!("GetJsxIntrinsicTagNamesAt() should all be defined");
+                    crate::core::go_panic(
+                        "GetJsxIntrinsicTagNamesAt() should all be defined".to_string(),
+                    );
                 }
             }
             s.try_get_global_symbols()?;
@@ -1547,7 +1553,9 @@ impl GetCompletionDataState<'_> {
                     let exported_symbols = self.type_checker.get_exports_of_module_exported(symbol);
                     for exported_symbol in exported_symbols {
                         if exported_symbol.is_nil() {
-                            panic!("getExporsOfModule() should all be defined");
+                            crate::core::go_panic(
+                                "getExporsOfModule() should all be defined".to_string(),
+                            );
                         }
                         let is_valid_value_access = |c: &mut Checker, s: SymbolId| -> bool {
                             let name = c.sym(s).name.as_str();
@@ -1792,7 +1800,9 @@ impl GetCompletionDataState<'_> {
             }
         } else {
             if object_like_container.kind() != SyntaxKind::ObjectBindingPattern {
-                panic!("Expected 'objectLikeContainer' to be an object binding pattern.");
+                crate::core::go_panic(
+                    "Expected 'objectLikeContainer' to be an object binding pattern.".to_string(),
+                );
             }
             // We are *only* completing on properties from the type being destructured.
             self.is_new_identifier_location = false;
@@ -1800,7 +1810,7 @@ impl GetCompletionDataState<'_> {
             // PORT: Go `ast.IsVariableLike`, named in full because ls
             // callhierarchy.go has its own `isVariableLike`.
             if !crate::ast::is_variable_like(root_declaration) {
-                panic!("Root declaration is not variable-like.");
+                crate::core::go_panic("Root declaration is not variable-like.".to_string());
             }
 
             // We don't want to complete using the type acquired by the shape
@@ -1861,7 +1871,9 @@ impl GetCompletionDataState<'_> {
             // Go: core.CheckEachDefined
             for member in &existing_members {
                 if member.is_nil() {
-                    panic!("object like properties or elements should all be defined");
+                    crate::core::go_panic(
+                        "object like properties or elements should all be defined".to_string(),
+                    );
                 }
             }
             // Add filtered items to the completion list.
@@ -2447,8 +2459,9 @@ impl GetCompletionDataState<'_> {
 
         if self.previous_token != self.context_token {
             if self.previous_token.is_nil() {
-                panic!(
+                crate::core::go_panic(
                     "Expected 'contextToken' to be defined when different from 'previousToken'."
+                        .to_string(),
                 );
             }
         }
@@ -2507,7 +2520,7 @@ impl GetCompletionDataState<'_> {
         // Go: core.CheckEachDefined
         for &symbol in &self.symbols {
             if symbol.is_nil() {
-                panic!("getSymbolsInScope() should all be defined");
+                crate::core::go_panic("getSymbolsInScope() should all be defined".to_string());
             }
         }
         // PORT: Go `range` reads the slice once; iterate a copy.

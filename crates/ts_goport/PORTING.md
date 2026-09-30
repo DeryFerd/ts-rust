@@ -257,8 +257,8 @@ methods reach the AST through it.
   foreign parents, links, and the store and `GoFile` of a static
   publish), in a
   static array for ids below 2^16 (`FILE_BLOCKS`, one cache line per
-  entry) and in chunks made on demand above (`HIGH_BLOCKS`, a cold block
-  with no call). So the first program, a later program (`tsc -b`, watch,
+  entry) and in chunks made on demand above (`HIGH_BLOCKS`, read in a cold
+  block that calls the empty `high_block_path`). So the first program, a later program (`tsc -b`, watch,
   an edited file) and the node shell of a freeable version read the same
   way: a hot node read is two dependent loads, and has no call. The block
   of a freeable version is its node shell (records and kids in a pooled

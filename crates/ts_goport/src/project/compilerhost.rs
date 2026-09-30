@@ -81,7 +81,7 @@ impl CompilerHost {
         config_file_registry: Rc<ConfigFileRegistry>,
     ) {
         if self.builder.borrow().is_none() {
-            panic!("freeze can only be called once");
+            crate::core::go_panic("freeze can only be called once".to_string());
         }
         *self.source_fs.source.borrow_mut() = snapshot_fs;
         self.source_fs.disable_tracking();
@@ -99,7 +99,9 @@ impl CompilerHost {
     // Go: project/compilerhost.go:62 compilerHost.ensureAlive
     pub fn ensure_alive(&self) {
         if self.builder.borrow().is_none() || self.project.borrow().is_none() {
-            panic!("method must not be called after snapshot initialization");
+            crate::core::go_panic(
+                "method must not be called after snapshot initialization".to_string(),
+            );
         }
     }
 
@@ -112,7 +114,7 @@ impl CompilerHost {
             .builder
             .borrow()
             .as_ref()
-            .expect("invalid memory address or nil pointer dereference: compilerHost.builder")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .content_mapper_host
             .clone();
         let Some(content_mapper_host) = content_mapper_host else {
@@ -122,14 +124,17 @@ impl CompilerHost {
             .project
             .borrow()
             .clone()
-            .expect("invalid memory address or nil pointer dereference: compilerHost.project");
-        let command_line = project.borrow().get_command_line_with_typings_files().expect(
-            "invalid memory address or nil pointer dereference: project.getCommandLineWithTypingsFiles",
-        );
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
+        let command_line = project.borrow().get_command_line_with_typings_files();
+        // Go `ConfigName`, `ContentMappers` and `CompilerOptions` are
+        // nil-safe: a nil command line gives "", nil and nil.
+        let command_line = command_line.as_deref();
         let content_mapper_project = content_mapper_host.project(contentmapper::ProjectSpec {
-            config_file_name: command_line.config_name().to_string(),
-            mappers: command_line.content_mappers().to_vec(),
-            compiler_options: Some(command_line.compiler_options().clone()),
+            config_file_name: command_line
+                .map_or("", tsoptions::ParsedCommandLine::config_name)
+                .to_string(),
+            mappers: command_line.map_or_else(Vec::new, |c| c.content_mappers().to_vec()),
+            compiler_options: command_line.map(|c| c.compiler_options().clone()),
         });
         *self.content_mapper_project.borrow_mut() = content_mapper_project;
     }
@@ -168,7 +173,7 @@ impl compiler::CompilerHost for CompilerHost {
                 .config_file_registry
                 .borrow()
                 .as_ref()
-                .expect("invalid memory address or nil pointer dereference: compilerHost.configFileRegistry")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .get_config(path),
             Some(builder) => {
                 // acquireConfigForProject will bypass sourceFS, so track the file here.
@@ -177,7 +182,7 @@ impl compiler::CompilerHost for CompilerHost {
                     .project
                     .borrow()
                     .clone()
-                    .expect("invalid memory address or nil pointer dereference: compilerHost.project");
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 let logger = self.logger.borrow().clone();
                 builder
                     .config_file_registry_builder
@@ -198,10 +203,11 @@ impl compiler::CompilerHost for CompilerHost {
         self.ensure_alive();
         if let Some(fh) = self.source_fs.get_file_by_path(&opts.file_name, &opts.path) {
             let key = new_parse_cache_key(opts, fh.hash(), fh.kind());
-            let builder =
-                self.builder.borrow().clone().expect(
-                    "invalid memory address or nil pointer dereference: compilerHost.builder",
-                );
+            let builder = self
+                .builder
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             return Some(builder.parse_cache.acquire(key, fh).file);
         }
         None
@@ -228,7 +234,7 @@ impl compiler::CompilerHost for CompilerHost {
             .builder
             .borrow()
             .clone()
-            .expect("invalid memory address or nil pointer dereference: compilerHost.builder");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let mut diagnostic_locale = locale::DEFAULT;
         if let Some(client) = &builder.client {
             diagnostic_locale = client.get_locale();

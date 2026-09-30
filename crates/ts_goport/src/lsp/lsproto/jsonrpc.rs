@@ -32,7 +32,7 @@ pub fn new_id(raw_value: &IntegerOrString) -> crate::jsonrpc::ID {
     crate::jsonrpc::new_id_int(
         raw_value
             .integer
-            .expect("invalid memory address or nil pointer dereference"),
+            .unwrap_or_else(|| crate::core::go_nil_dereference()),
     )
 }
 
@@ -43,41 +43,52 @@ pub struct Message {
     msg: Option<Box<dyn AnyValue>>,
 }
 
+/// The Go runtime panic of a failed type assertion `m.msg.(want)`. The
+/// message holds nil, a `*RequestMessage` or a `*ResponseMessage`.
+#[cold]
+#[track_caller]
+fn interface_conversion_panic(msg: Option<&dyn AnyValue>, want: &str) -> ! {
+    let have = match msg {
+        None => "nil",
+        Some(m) if m.downcast_ref::<RequestMessage>().is_some() => "*lsproto.RequestMessage",
+        Some(_) => "*lsproto.ResponseMessage",
+    };
+    crate::core::go_panic(format!(
+        "interface conversion: interface {{}} is {have}, not {want}"
+    ))
+}
+
 impl Message {
     // Go: jsonrpc.go:24 AsRequest
     pub fn as_request(&self) -> &RequestMessage {
-        self.msg
-            .as_deref()
-            .and_then(|m| m.downcast_ref::<RequestMessage>())
-            .expect("interface conversion: interface {} is not *lsproto.RequestMessage")
+        let msg = self.msg.as_deref();
+        msg.and_then(|m| m.downcast_ref::<RequestMessage>())
+            .unwrap_or_else(|| interface_conversion_panic(msg, "*lsproto.RequestMessage"))
     }
 
     // Go: jsonrpc.go:28 AsResponse
     pub fn as_response(&self) -> &ResponseMessage {
-        self.msg
-            .as_deref()
-            .and_then(|m| m.downcast_ref::<ResponseMessage>())
-            .expect("interface conversion: interface {} is not *lsproto.ResponseMessage")
+        let msg = self.msg.as_deref();
+        msg.and_then(|m| m.downcast_ref::<ResponseMessage>())
+            .unwrap_or_else(|| interface_conversion_panic(msg, "*lsproto.ResponseMessage"))
     }
 
     // PORT: Go shares the `*RequestMessage` pointer after `AsRequest`; Rust
-    // moves the message out.
+    // moves the message out. It panics where `AsRequest` panics.
     pub fn into_request(self) -> RequestMessage {
-        let msg: Box<dyn std::any::Any> = self
-            .msg
-            .expect("interface conversion: interface is nil, not *lsproto.RequestMessage");
+        self.as_request();
+        let msg: Box<dyn std::any::Any> = self.msg.expect("as_request checked it");
         *msg.downcast::<RequestMessage>()
-            .expect("interface conversion: interface {} is not *lsproto.RequestMessage")
+            .expect("as_request checked it")
     }
 
     // PORT: Go shares the `*ResponseMessage` pointer after `AsResponse`;
-    // Rust moves the message out.
+    // Rust moves the message out. It panics where `AsResponse` panics.
     pub fn into_response(self) -> ResponseMessage {
-        let msg: Box<dyn std::any::Any> = self
-            .msg
-            .expect("interface conversion: interface is nil, not *lsproto.ResponseMessage");
+        self.as_response();
+        let msg: Box<dyn std::any::Any> = self.msg.expect("as_response checked it");
         *msg.downcast::<ResponseMessage>()
-            .expect("interface conversion: interface {} is not *lsproto.ResponseMessage")
+            .expect("as_response checked it")
     }
 
     // Go: jsonrpc.go:32 UnmarshalJSON
