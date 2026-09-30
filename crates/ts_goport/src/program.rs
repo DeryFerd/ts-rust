@@ -1931,7 +1931,7 @@ pub fn get_redirect_for_resolution(file: Node) -> Option<Arc<ResolvedProjectRefe
     with_go(|go| go.get_redirect_for_resolution(file).cloned())
 }
 
-// Go: compiler/projectreferencefilemapper.go:76 getCompilerOptionsForFile
+// Go: compiler/projectreferencefilemapper.go:80 getCompilerOptionsForFile
 // Go: module/resolver.go:145 GetCompilerOptionsWithRedirect
 // Go: compiler/program.go:1519 GetSourceFileMetaData
 // Runs `f` with the options of the project reference that owns the file
@@ -2171,7 +2171,7 @@ pub fn options() -> &'static CompilerOptions {
     &prog().options
 }
 
-// Go: compiler/program.go:508 ContentMapperExtensions (#4712)
+// Go: compiler/program.go:528 ContentMapperExtensions (#4712)
 // PORT: the Go frontend program copies the extensions of its command line
 // (`GoSharedState`), so checker threads can read them. An alias resolver
 // program has none.
@@ -2374,14 +2374,14 @@ pub fn is_emit_blocked(emit_file_name: &str) -> bool {
     with_go(|go| go.is_emit_blocked(emit_file_name))
 }
 
-// Go: compiler/program.go:2132 SourceFileMayBeEmitted
+// Go: compiler/program.go:2210 SourceFileMayBeEmitted
 pub fn source_file_may_be_emitted(source_file: Node, force_dts_emit: bool) -> bool {
     // Go: ls/autoimport/aliasresolver.go:228 (unimplemented)
     alias_resolver_unimplemented();
     source_file_may_be_emitted_worker(source_file, force_dts_emit, false)
 }
 
-// Go: compiler/emitter.go:464 sourceFileMayBeEmitted
+// Go: compiler/emitter.go:493 sourceFileMayBeEmitted
 fn source_file_may_be_emitted_worker(
     source_file: Node,
     force_dts_emit: bool,
@@ -3092,7 +3092,7 @@ pub fn collect_checker_diagnostics_with(
     filter_and_sort_diagnostics(diagnostics.into_iter().flatten().collect())
 }
 
-// Go: compiler/program.go:684 filterAndSortDiagnostics (#4712)
+// Go: compiler/program.go:708 filterAndSortDiagnostics (#4712)
 fn filter_and_sort_diagnostics(mut diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
     diags.retain(|diag| {
         let file = diag.file;
@@ -3494,7 +3494,7 @@ impl crate::frontend::outputpaths::OutputPathsHost for EmitHost {
         common_source_directory().to_string()
     }
 
-    // Go: compiler/emitHost.go:116 emitHost.ContentMapperExtensions (#4712)
+    // Go: compiler/emitHost.go:112 emitHost.ContentMapperExtensions (#4712)
     fn content_mapper_extensions(&self) -> Vec<String> {
         content_mapper_extensions()
     }
@@ -4141,7 +4141,7 @@ fn is_plain_js_error(code: i32) -> bool {
 // Output (Go diagnosticwriter/diagnosticwriter.go, non-pretty)
 // ---------------------------------------------------------------------------
 
-// Go: diagnosticwriter/diagnosticwriter.go:555 WriteFormatDiagnostic
+// Go: diagnosticwriter/diagnosticwriter.go:571 WriteFormatDiagnostic
 // PORT: Go writes to an io.Writer; this returns the text.
 // PORT: Go wraps the diagnostic in `ASTDiagnostic`, whose `File` and `Pos`
 // go through `resolve` (#4712): see `resolve_diagnostic_location`.
@@ -4189,7 +4189,7 @@ struct ResolvedLocation {
     synthesized: bool,  // the range is in virtual code with no corresponding original location
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:90 (*ASTDiagnostic).resolve (#4712)
+// Go: diagnosticwriter/diagnosticwriter.go:97 (*ASTDiagnostic).resolve (#4712)
 // resolve determines where and against which text a diagnostic should be reported. A content mapper's
 // own diagnostics already carry original ranges. A compiler diagnostic on a content-mapped file has its
 // virtual range mapped back to the original; if it falls entirely within synthesized code, there is no
@@ -4238,7 +4238,7 @@ fn ecma_line_and_utf16_character_of_text_position(text: &str, pos: i32) -> (i32,
     (line, character)
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:364 diagnosticPrefix (#4712)
+// Go: diagnosticwriter/diagnosticwriter.go:380 diagnosticPrefix (#4712)
 // diagnosticPrefix returns the prefix shown before a diagnostic's code, e.g. "TS" for compiler
 // diagnostics or a content mapper's custom source for its diagnostics.
 fn diagnostic_prefix(diagnostic: &Diagnostic) -> &str {
@@ -4249,14 +4249,14 @@ fn diagnostic_prefix(diagnostic: &Diagnostic) -> &str {
     "TS"
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:549 WriteFormatDiagnostics
+// Go: diagnosticwriter/diagnosticwriter.go:565 WriteFormatDiagnostics
 pub fn write_format_diagnostics(output: &mut String, diagnostics: &[Diagnostic]) {
     for diagnostic in diagnostics {
         output.push_str(&format_diagnostic(diagnostic));
     }
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:342 WriteFlattenedDiagnosticMessage
+// Go: diagnosticwriter/diagnosticwriter.go:358 WriteFlattenedDiagnosticMessage
 // PORT: this writer has no Go `FormattingOptions`, so the locale is
 // Go `locale.Default` and the text is English (see execute/tsc/diagnostics.rs
 // `write_format_diagnostic`).
@@ -4267,7 +4267,7 @@ fn write_flattened_diagnostic_message(writer: &mut String, diagnostic: &Diagnost
     }
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:130 (*ASTDiagnostic).MessageChain
+// Go: diagnosticwriter/diagnosticwriter.go:146 (*ASTDiagnostic).MessageChain
 // PORT: Go wraps each chain entry in `ASTDiagnostic`; the entries are the
 // diagnostics themselves here.
 fn ast_diagnostic_message_chain(d: &Diagnostic) -> Cow<'_, [Diagnostic]> {
@@ -4286,7 +4286,7 @@ fn ast_diagnostic_message_chain(d: &Diagnostic) -> Cow<'_, [Diagnostic]> {
     Cow::Owned(result)
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:350 flattenDiagnosticMessageChain
+// Go: diagnosticwriter/diagnosticwriter.go:366 flattenDiagnosticMessageChain
 fn flatten_diagnostic_message_chain(
     writer: &mut String,
     chain: &Diagnostic,

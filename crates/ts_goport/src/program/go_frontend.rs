@@ -748,10 +748,10 @@ fn common_source_directory_of(p: &NewProgram) -> String {
     )
 }
 
-// Go: compiler/program.go:800 collectContentMapperOptionDiagnostics (#4712)
+// Go: compiler/program.go:828 collectContentMapperOptionDiagnostics (#4712)
 // PORT: returns the list; Go sets `p.contentMapperOptionDiagnostics`.
 fn collect_content_mapper_option_diagnostics(p: &NewProgram) -> Vec<Diagnostic> {
-    // Go: compiler/program.go:134 ContentMapperProject
+    // Go: compiler/program.go:138 ContentMapperProject
     let Some(project) = p.host().content_mapper_project() else {
         return Vec::new();
     };
@@ -1135,7 +1135,7 @@ impl GoSharedState {
         }
     }
 
-    // Go: compiler/program.go:508 ContentMapperExtensions (#4712)
+    // Go: compiler/program.go:528 ContentMapperExtensions (#4712)
     pub(super) fn content_mapper_extensions(&self) -> &[String] {
         &self.content_mapper_extensions
     }
@@ -1156,7 +1156,7 @@ impl GoSharedState {
             .map(String::as_str)
     }
 
-    // Go: compiler/projectreferencefilemapper.go:64 getProjectReferenceFromSource
+    // Go: compiler/projectreferencefilemapper.go:68 getProjectReferenceFromSource
     pub(super) fn get_project_reference_from_source(
         &self,
         path: &str,
@@ -1164,7 +1164,7 @@ impl GoSharedState {
         self.source_to_project_reference.get(path).cloned()
     }
 
-    // Go: compiler/projectreferencefilemapper.go:68 getProjectReferenceFromOutputDts
+    // Go: compiler/projectreferencefilemapper.go:72 getProjectReferenceFromOutputDts
     pub(super) fn get_project_reference_from_output_dts(
         &self,
         path: &str,
@@ -1172,7 +1172,7 @@ impl GoSharedState {
         self.output_dts_to_project_reference.get(path).cloned()
     }
 
-    // Go: compiler/projectreferencefilemapper.go:72 isSourceFromProjectReference
+    // Go: compiler/projectreferencefilemapper.go:76 isSourceFromProjectReference
     pub(super) fn is_source_from_project_reference(&self, path: &str) -> bool {
         self.can_use_project_reference_source && self.source_to_project_reference.contains_key(path)
     }

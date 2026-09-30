@@ -139,7 +139,7 @@ fn parse_project_json(json: &CompilerOptionsValue, host: &VfsParseConfigHost) ->
     )
 }
 
-// Go: tsconfigparsing_test.go:835 TestParseJsonConfigFileContentAcceptsJsonRepresentations
+// Go: tsconfigparsing_test.go:828 TestParseJsonConfigFileContentAcceptsJsonRepresentations
 // PORT: `CompilerOptionsValue` has no form for a Go `map[string]any`, so the
 // "plain map" and "typed slices" cases are ordered maps in the sorted key
 // order that Go `normalizeJsonValue` gives them, and a Go `[]string` is
@@ -211,7 +211,7 @@ fn parse_json_config_file_content_accepts_json_representations() {
     t.finish();
 }
 
-// Go: tsconfigparsing_test.go:884 TestParseJsonConfigFileContentPreservesRaw
+// Go: tsconfigparsing_test.go:877 TestParseJsonConfigFileContentPreservesRaw
 // PORT: the Go `map[string]any` input is an ordered map in its sorted key
 // order (see above).
 #[test]
@@ -252,7 +252,7 @@ fn parse_json_config_file_content_preserves_raw() {
     assert!(raw.contains_key("customSetting"));
 }
 
-// Go: tsconfigparsing_test.go:913 TestParseJsonConfigFileContentHandlesNullArrayElements
+// Go: tsconfigparsing_test.go:906 TestParseJsonConfigFileContentHandlesNullArrayElements
 #[test]
 fn parse_json_config_file_content_handles_null_array_elements() {
     let host = new_vfs_parse_config_host(
@@ -281,7 +281,7 @@ fn parse_json_config_file_content_handles_null_array_elements() {
     t.finish();
 }
 
-// Go: tsconfigparsing_test.go:937 TestParseJsonConfigFileContentDefaultsCompileOnSaveToFalse
+// Go: tsconfigparsing_test.go:930 TestParseJsonConfigFileContentDefaultsCompileOnSaveToFalse
 #[test]
 fn parse_json_config_file_content_defaults_compile_on_save_to_false() {
     let host = new_vfs_parse_config_host(
@@ -551,7 +551,7 @@ fn run_external_code_options() -> Option<CompilerOptions> {
     })
 }
 
-// Go: tsconfigparsing_test.go:1144 TestContentMappers (tsgo#4712)
+// Go: tsconfigparsing_test.go:1136 TestContentMappers (tsgo#4712)
 #[test]
 fn content_mappers() {
     let config = TestConfig {
@@ -621,7 +621,7 @@ fn content_mappers() {
     t.finish();
 }
 
-// Go: tsconfigparsing_test.go:1199 TestContentMapperOptionDiagnosticLocation (tsgo#4712)
+// Go: tsconfigparsing_test.go:1191 TestContentMapperOptionDiagnosticLocation (tsgo#4712)
 #[test]
 fn content_mapper_option_diagnostic_location() {
     let config = TestConfig {
@@ -668,7 +668,7 @@ fn content_mapper_option_diagnostic_location() {
     );
 }
 
-// Go: tsconfigparsing_test.go:1227 TestContentMappersAreInheritedFromExtendedConfig (tsgo#4712)
+// Go: tsconfigparsing_test.go:1219 TestContentMappersAreInheritedFromExtendedConfig (tsgo#4712)
 #[test]
 fn content_mappers_are_inherited_from_extended_config() {
     let config = TestConfig {
@@ -713,7 +713,7 @@ fn content_mappers_are_inherited_from_extended_config() {
     t.finish();
 }
 
-// Go: tsconfigparsing_test.go:1258 TestContentMappersRequireFlag (tsgo#4712)
+// Go: tsconfigparsing_test.go:1250 TestContentMappersRequireFlag (tsgo#4712)
 #[test]
 fn content_mappers_require_flag() {
     let config = TestConfig {
@@ -750,7 +750,7 @@ fn content_mappers_require_flag() {
     t.finish();
 }
 
-// Go: tsconfigparsing_test.go:1287 TestUnresolvedContentMapperDoesNotRegisterExtensions (tsgo#4712)
+// Go: tsconfigparsing_test.go:1279 TestUnresolvedContentMapperDoesNotRegisterExtensions (tsgo#4712)
 #[test]
 fn unresolved_content_mapper_does_not_register_extensions() {
     let config = TestConfig {
@@ -783,7 +783,7 @@ fn unresolved_content_mapper_does_not_register_extensions() {
     t.finish();
 }
 
-// Go: tsconfigparsing_test.go:1314 TestContentMappersValidation (tsgo#4712)
+// Go: tsconfigparsing_test.go:1306 TestContentMappersValidation (tsgo#4712)
 #[test]
 fn content_mappers_validation() {
     struct ValidationTest {

@@ -1221,7 +1221,7 @@ pub fn get_heritage_elements(node: Node, kind: SyntaxKind) -> Vec<Node> {
     Vec::new()
 }
 
-// Go: ast/utilities.go:1739 GetHeritageClauseElementName
+// Go: ast/utilities.go:1759 GetHeritageClauseElementName
 /// GetHeritageClauseElementName returns the expression or type name of a heritage clause element.
 pub fn get_heritage_clause_element_name(node: Node) -> Node {
     if is_type_reference_node(node) {
@@ -1230,7 +1230,7 @@ pub fn get_heritage_clause_element_name(node: Node) -> Node {
     node.expression()
 }
 
-// Go: ast/utilities.go:1746 IsNameOfHeritageClauseTypeReference
+// Go: ast/utilities.go:1766 IsNameOfHeritageClauseTypeReference
 pub fn is_name_of_heritage_clause_type_reference(mut node: Node) -> bool {
     while is_qualified_name(node.parent()) {
         node = node.parent();

@@ -186,12 +186,12 @@ impl Fs for CachedFs {
         self.fs.use_case_sensitive_file_names()
     }
 
-    // Go: cachedvfs.go:148 WriteFile
+    // Go: cachedvfs.go:144 WriteFile
     fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         self.fs.write_file(path, data)
     }
 
-    // Go: cachedvfs.go:152 AppendFile
+    // Go: cachedvfs.go:148 AppendFile
     fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         self.fs.append_file(path, data)
     }

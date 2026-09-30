@@ -301,12 +301,12 @@ impl Fs for OsFs {
         os_fs_realpath(path)
     }
 
-    // Go: os.go:205 WriteFile
+    // Go: os.go:174 WriteFile
     fn write_file(&self, path: &str, content: &str) -> Result<(), FsError> {
         self.write_file_ensuring_dir(path, content, WriteFlag::Truncate)
     }
 
-    // Go: os.go:209 AppendFile
+    // Go: os.go:178 AppendFile
     fn append_file(&self, path: &str, content: &str) -> Result<(), FsError> {
         self.write_file_ensuring_dir(path, content, WriteFlag::Append)
     }

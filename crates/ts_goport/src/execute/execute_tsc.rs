@@ -794,7 +794,7 @@ fn show_config(sys: &dyn System, config: &ParsedCommandLine, config_file_name: &
 // write without a callback (program.rs emitHost `write_file`), and emit
 // runs on the checker threads, so the callback must be `Send` and cannot
 // hold the `Rc` file system. Both wrappers pass a write of a real path to
-// osvfs (cachedvfs.go:148 WriteFile), so this writes with the osvfs of the
+// osvfs (cachedvfs.go:144 WriteFile), so this writes with the osvfs of the
 // calling thread, like `new_task_write_file` in build/build_task.rs without
 // the build info tracking. There is no outDir or input guard: tsgo writes
 // next to the sources or into outDir, as Go does.

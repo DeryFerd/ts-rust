@@ -1,6 +1,6 @@
 //! PORT: not in Go (perf). Go parses the configs of a build in parallel:
 //! `createBuildTasks` queues the parse of each config and of its
-//! references on a work group (orchestrator.go:130). Here the configs parse
+//! references on a work group (orchestrator.go:174). Here the configs parse
 //! on the orchestrator thread, because `ParsedCommandLine` is not `Send`.
 //! Most of a parse is the match of the `include` specs against the file
 //! system (Go `getFileNamesFromConfigSpecs`). So threads parse the configs

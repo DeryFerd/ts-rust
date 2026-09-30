@@ -148,7 +148,7 @@ impl OrchestratorResult {
     }
 }
 
-// Go: build/orchestrator.go:63 Orchestrator
+// Go: build/orchestrator.go:66 Orchestrator
 // PORT: Go `*SyncMap` of tasks is a plain map; tasks are
 // `Rc<RefCell<BuildTask>>`. Go `wm *watchmanager.WatchManager` is
 // `Rc<RefCell<WatchManager>>`, so the watch loop can run while `DoCycle`
@@ -187,12 +187,12 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
-    // Go: build/orchestrator.go:87 (*Orchestrator).relativeFileName
+    // Go: build/orchestrator.go:93 (*Orchestrator).relativeFileName
     pub fn relative_file_name(&self, file_name: &str) -> String {
         convert_to_relative_path(file_name, &self.compare_paths_options)
     }
 
-    // Go: build/orchestrator.go:91 (*Orchestrator).toPath
+    // Go: build/orchestrator.go:97 (*Orchestrator).toPath
     pub fn to_path(&self, file_name: &str) -> Path {
         to_path(
             file_name,
@@ -201,7 +201,7 @@ impl Orchestrator {
         )
     }
 
-    // Go: build/orchestrator.go:95 (*Orchestrator).resolveBuildInfoFileName
+    // Go: build/orchestrator.go:101 (*Orchestrator).resolveBuildInfoFileName
     pub fn resolve_build_info_file_name(&self, file_name: &str, build_info_dir: &str) -> String {
         if is_build_info_file_name_default_library(file_name) {
             return combine_paths(
@@ -212,7 +212,7 @@ impl Orchestrator {
         get_normalized_absolute_path(file_name, build_info_dir)
     }
 
-    // Go: build/orchestrator.go:102 (*Orchestrator).Order
+    // Go: build/orchestrator.go:108 (*Orchestrator).Order
     pub fn order(&self) -> &[String] {
         &self.order
     }
@@ -264,7 +264,7 @@ impl Orchestrator {
         entries.into_iter().map(|entry| entry.config).collect()
     }
 
-    // Go: build/orchestrator.go:106 (*Orchestrator).Upstream
+    // Go: build/orchestrator.go:150 (*Orchestrator).Upstream
     pub fn upstream(&self, config_name: &str) -> Vec<String> {
         let path = self.to_path(config_name);
         let task = self.get_task(&path);
@@ -275,7 +275,7 @@ impl Orchestrator {
             .collect()
     }
 
-    // Go: build/orchestrator.go:114 (*Orchestrator).Downstream
+    // Go: build/orchestrator.go:158 (*Orchestrator).Downstream
     pub fn downstream(&self, config_name: &str) -> Vec<String> {
         let path = self.to_path(config_name);
         let task = self.get_task(&path);
@@ -286,7 +286,7 @@ impl Orchestrator {
             .collect()
     }
 
-    // Go: build/orchestrator.go:122 (*Orchestrator).getTask
+    // Go: build/orchestrator.go:166 (*Orchestrator).getTask
     pub fn get_task(&self, path: &Path) -> Rc<RefCell<BuildTask>> {
         match self.tasks.get(path) {
             Some(task) => task.clone(),
@@ -294,7 +294,7 @@ impl Orchestrator {
         }
     }
 
-    // Go: build/orchestrator.go:130 (*Orchestrator).createBuildTasks
+    // Go: build/orchestrator.go:174 (*Orchestrator).createBuildTasks
     // PORT: Go parses the configs in parallel on a work group; here they
     // parse depth first on one thread. The task map and each task's
     // `resolved` are the same, because a path is taken by the first
@@ -435,7 +435,7 @@ impl Orchestrator {
         Some(task)
     }
 
-    // Go: build/orchestrator.go:212 (*Orchestrator).GenerateGraphReusingOldTasks
+    // Go: build/orchestrator.go:252 (*Orchestrator).GenerateGraphReusingOldTasks
     pub fn generate_graph_reusing_old_tasks(&mut self) {
         let tasks = std::mem::take(&mut self.tasks);
         self.order = Vec::new();
@@ -1003,7 +1003,7 @@ impl Orchestrator {
         Some(prefetch)
     }
 
-    // Go: build/buildtask.go:120 (*BuildTask).report, the orchestrator part
+    // Go: build/buildtask.go:119 (*BuildTask).report, the orchestrator part
     // (see `BuildTask::report`).
     fn report_task(&self, task: &mut BuildTask, build_result: &mut OrchestratorResult) {
         let (result, errors) = task.report();
@@ -1039,12 +1039,12 @@ impl Orchestrator {
         }
     }
 
-    // Go: build/orchestrator.go:736 (*Orchestrator).getWriter with a nil task
+    // Go: build/orchestrator.go:976 (*Orchestrator).getWriter with a nil task
     fn writer(&self) -> Writer {
         self.opts.sys.writer()
     }
 
-    // Go: build/orchestrator.go:743 (*Orchestrator).createBuilderStatusReporter(nil)
+    // Go: build/orchestrator.go:983 (*Orchestrator).createBuilderStatusReporter(nil)
     fn create_builder_status_reporter(&self) -> DiagnosticReporter {
         create_builder_status_reporter(
             self.opts.sys.clone(),
@@ -1055,7 +1055,7 @@ impl Orchestrator {
         )
     }
 
-    // Go: build/orchestrator.go:747 (*Orchestrator).createDiagnosticReporter(nil)
+    // Go: build/orchestrator.go:987 (*Orchestrator).createDiagnosticReporter(nil)
     fn create_diagnostic_reporter(&self) -> DiagnosticReporter {
         create_diagnostic_reporter(
             &*self.opts.sys,
@@ -1065,7 +1065,7 @@ impl Orchestrator {
         )
     }
 
-    // Go: build/orchestrator.go:743 (*Orchestrator).createBuilderStatusReporter(task)
+    // Go: build/orchestrator.go:983 (*Orchestrator).createBuilderStatusReporter(task)
     fn create_task_builder_status_reporter(&self) -> TaskDiagnosticReporter {
         task_reporter(|w| {
             create_builder_status_reporter(
@@ -1078,7 +1078,7 @@ impl Orchestrator {
         })
     }
 
-    // Go: build/orchestrator.go:747 (*Orchestrator).createDiagnosticReporter(task)
+    // Go: build/orchestrator.go:987 (*Orchestrator).createDiagnosticReporter(task)
     fn create_task_diagnostic_reporter(&self) -> TaskDiagnosticReporter {
         task_reporter(|w| {
             create_diagnostic_reporter(
@@ -1352,7 +1352,7 @@ fn prefetch_m_times(
     }
 }
 
-// Go: build/orchestrator.go:751 NewOrchestrator
+// Go: build/orchestrator.go:991 NewOrchestrator
 pub fn new_orchestrator(opts: Options) -> Orchestrator {
     // PORT: Go passes the method value `opts.Sys.FS().DirectoryExists`.
     let fs = opts.sys.fs();

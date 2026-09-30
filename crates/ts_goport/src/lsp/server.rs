@@ -1438,13 +1438,13 @@ impl project::Client for Server {
         }
     }
 
-    // Go: server.go:776 GetLocale
+    // Go: server.go:780 GetLocale
     // GetLocale implements project.Client.
     fn get_locale(&self) -> locale::Locale {
         self.shared.locale()
     }
 
-    // Go: server.go:783 SetLocale
+    // Go: server.go:787 SetLocale
     // SetLocale implements project.Client.
     fn set_locale(&self, locale_string: &str) {
         let mut new_locale = self.shared.init_locale();
@@ -1459,7 +1459,7 @@ impl project::Client for Server {
     }
 }
 
-// Go: server.go:1900 generateDiagnosticDiffString
+// Go: server.go:1896 generateDiagnosticDiffString
 // PORT: Go `[]*lsproto.Diagnostic` are the borrowed results of
 // `lsproto::compare_diagnostics`.
 fn generate_diagnostic_diff_string(
@@ -1878,7 +1878,7 @@ impl ServerShared {
 }
 
 impl Server {
-    // Go: server.go:964 dispatchLoop
+    // Go: server.go:968 dispatchLoop
     pub fn dispatch_loop(self: &Rc<Self>, ctx: &Context) -> Result<(), GoError> {
         let (ctx, lsp_exit) = context::with_cancel_cause(ctx);
         // Go: defer lspExit(nil)
@@ -2020,7 +2020,7 @@ impl Server {
 pub const IDLE_QUIET_PERIOD: Duration = Duration::from_millis(50);
 
 impl ServerShared {
-    // Go: server.go:1025 writeLoop
+    // Go: server.go:1029 writeLoop
     // PORT: `w` is the writer, which this thread owns.
     pub fn write_loop(&self, ctx: &Context, w: &mut dyn Writer) -> Result<(), GoError> {
         loop {
@@ -2308,7 +2308,7 @@ impl Server {
     }
 }
 
-// Go: server.go:1194 contentMapperFallbackResponse (tsgo#4712)
+// Go: server.go:1198 contentMapperFallbackResponse (tsgo#4712)
 // contentMapperFallbackResponse returns an empty response for requests made for
 // unknown file types not handled by any content mapper. This typically serves a
 // short window in time between when the server has unregistered content mapper
@@ -3072,7 +3072,7 @@ impl Server {
 }
 
 impl ServerShared {
-    // Go: server.go:1499 handleInitialize
+    // Go: server.go:1501 handleInitialize
     pub fn handle_initialize(
         self: &Arc<Self>,
         _ctx: &Context,
@@ -3350,7 +3350,7 @@ impl ServerShared {
 }
 
 impl Server {
-    // Go: server.go:1681 handleInitialized
+    // Go: server.go:1677 handleInitialized
     pub fn handle_initialized(
         self: &Rc<Self>,
         ctx: &Context,
@@ -3671,7 +3671,7 @@ impl Server {
         Ok(())
     }
 
-    // Go: server.go:1853 handleDocumentDiagnostic
+    // Go: server.go:1849 handleDocumentDiagnostic
     pub fn handle_document_diagnostic(
         self: &Rc<Self>,
         ctx: &Context,
@@ -3874,7 +3874,7 @@ impl Server {
         )
     }
 
-    // Go: server.go:1972 handleWillRenameFilesWorker
+    // Go: server.go:1968 handleWillRenameFilesWorker
     // If `sendRenameFile` is true, the original `willRenameFiles` request is being handled as part of a rename operation
     // where the client doesn't support `willRenameFiles`,
     // so we should include the file rename in the edits we return
@@ -4103,7 +4103,7 @@ impl Server {
         )
     }
 
-    // Go: server.go:2120 handleCompletionItemResolve
+    // Go: server.go:2116 handleCompletionItemResolve
     pub fn handle_completion_item_resolve(
         self: &Rc<Self>,
         ctx: &Context,
@@ -4173,7 +4173,7 @@ impl Server {
         )
     }
 
-    // Go: server.go:2160 handleWorkspaceSymbol
+    // Go: server.go:2156 handleWorkspaceSymbol
     pub fn handle_workspace_symbol(
         self: &Rc<Self>,
         ctx: &Context,
@@ -4575,7 +4575,7 @@ impl ata::NpmExecutor for Server {
 }
 
 impl Server {
-    // Go: server.go:2380 contentMapperSpawner (tsgo#4712)
+    // Go: server.go:2377 contentMapperSpawner (tsgo#4712)
     // contentMapperSpawner adapts the server's spawn callback to a content mapper spawner, or returns nil when
     // the server cannot spawn processes.
     pub fn content_mapper_spawner(&self) -> Option<Rc<dyn contentmapper::Spawner>> {
@@ -4587,7 +4587,7 @@ impl Server {
         ))))
     }
 
-    // Go: server.go:2387 contentMapperLogger (tsgo#4712)
+    // Go: server.go:2384 contentMapperLogger (tsgo#4712)
     pub fn content_mapper_logger(&self) -> contentmapper::Logger {
         let logger = self.logger.clone();
         Arc::new(move |message: &str| {
@@ -4687,7 +4687,7 @@ impl Server {
         Ok(Some(lsproto::ProjectInfoResult { config_file_path }))
     }
 
-    // Go: server.go:2454 handleSetContentMapperContributions (tsgo#4712)
+    // Go: server.go:2451 handleSetContentMapperContributions (tsgo#4712)
     pub fn handle_set_content_mapper_contributions(
         self: &Rc<Self>,
         ctx: &Context,
@@ -4707,7 +4707,7 @@ impl Server {
     }
 }
 
-// Go: server.go:2464 parseContentMapperContributions (tsgo#4712)
+// Go: server.go:2461 parseContentMapperContributions (tsgo#4712)
 // PORT: Go `[]*lsproto.ContentMapperContribution` may hold nil entries; the
 // Rust list cannot, so only the empty `contributorId` check remains. Go
 // `json.Marshal` of the options map (`LSPObject`) writes the keys in Go map

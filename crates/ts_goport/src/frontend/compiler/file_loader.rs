@@ -403,7 +403,7 @@ pub fn with_loader_state_forgotten<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-// Go: fileloader.go:447 contentMapperTransformDiagnostic (tsgo#4712)
+// Go: fileloader.go:467 contentMapperTransformDiagnostic (tsgo#4712)
 // PORT: Go `*ast.SourceFile` is the file's SourceFile node. Go
 // `errors.AsType` on a found `*TransformError` searches that error and the
 // errors it wraps (`TransformError::to_go_error`).
@@ -552,7 +552,7 @@ fn content_mapper_transform_diagnostic(file: Node, label: &str, err: &GoError) -
     )
 }
 
-// Go: fileloader.go:505 ContentMapperProjectErrorDiagnostic (tsgo#4712)
+// Go: fileloader.go:523 ContentMapperProjectErrorDiagnostic (tsgo#4712)
 // ContentMapperProjectErrorDiagnostic returns the localized diagnostic message for a project setup error.
 pub fn content_mapper_project_error_diagnostic(err: &GoError) -> &'static Message {
     if let Some(project_error) = errors::as_type::<ProjectError>(err) {
@@ -578,7 +578,7 @@ pub fn content_mapper_project_error_diagnostic(err: &GoError) -> &'static Messag
     diag::The_content_mapper_process_failed_while_handling_the_project_request
 }
 
-// Go: fileloader.go:523 contentMapperTransformDiagnosticChain (tsgo#4712)
+// Go: fileloader.go:541 contentMapperTransformDiagnosticChain (tsgo#4712)
 fn content_mapper_transform_diagnostic_chain(
     file: Node,
     label: &str,
@@ -592,7 +592,7 @@ fn content_mapper_transform_diagnostic_chain(
     )
 }
 
-// Go: fileloader.go:527 contentMapperTransformDiagnosticWithDetail (tsgo#4712)
+// Go: fileloader.go:545 contentMapperTransformDiagnosticWithDetail (tsgo#4712)
 fn content_mapper_transform_diagnostic_with_detail(
     file: Node,
     label: &str,
@@ -608,7 +608,7 @@ fn content_mapper_transform_diagnostic_with_detail(
     diagnostic
 }
 
-// Go: fileloader.go:538 contentMapperMappingDiagnostic (tsgo#4712)
+// Go: fileloader.go:556 contentMapperMappingDiagnostic (tsgo#4712)
 // contentMapperMappingDiagnostic builds the diagnostic reported against a mapper that produced an
 // invalid span map, including the offsets involved so the mapper's author can locate the problem.
 fn content_mapper_mapping_diagnostic(
@@ -657,7 +657,7 @@ fn content_mapper_mapping_diagnostic(
     }
 }
 
-// Go: fileloader.go:585 ContentMapperInitializationDiagnostic (tsgo#4712)
+// Go: fileloader.go:601 ContentMapperInitializationDiagnostic (tsgo#4712)
 // ContentMapperInitializationDiagnostic returns a fileless diagnostic for a mapper initialization failure.
 pub fn content_mapper_initialization_diagnostic(label: &str, err: &GoError) -> Diagnostic {
     let initialize_error = errors::as_type::<InitializeError>(err);
@@ -714,7 +714,7 @@ pub fn content_mapper_initialization_diagnostic(label: &str, err: &GoError) -> D
     diagnostic
 }
 
-// Go: fileloader.go:616 ContentMapperProjectDiagnostic (tsgo#4712)
+// Go: fileloader.go:630 ContentMapperProjectDiagnostic (tsgo#4712)
 // ContentMapperProjectDiagnostic returns a fileless diagnostic for project setup or mapper initialization.
 pub fn content_mapper_project_diagnostic(err: &GoError) -> Diagnostic {
     if errors::as_type::<InitializeError>(err).is_some() {
@@ -1026,7 +1026,7 @@ impl FileLoader {
         self.opts.host.get_source_file(&parse_options)
     }
 
-    // Go: fileloader.go:418 (*fileLoader).parseContentMappedFile (tsgo#4712)
+    // Go: fileloader.go:438 (*fileLoader).parseContentMappedFile (tsgo#4712)
     // parseContentMappedFile produces a content-mapped virtual source file via the host's content
     // mapper, preserving the original file name and retaining the untransformed text on the
     // source file. Content mapper extensions only reach the parser when content mappers are configured.
@@ -1100,7 +1100,7 @@ impl FileLoader {
         }
     }
 
-    // Go: fileloader.go:562 (*fileLoader).getContentMapperTransformIdentity (tsgo#4712)
+    // Go: fileloader.go:578 (*fileLoader).getContentMapperTransformIdentity (tsgo#4712)
     // PORT: Go `fmt.Sprintf("%x", u.Bytes())` of the `xxh3.Uint128` is the
     // 32 hex digits of the `u128`.
     fn get_content_mapper_transform_identity(&self, mapper: &Rc<Mapper>) -> String {
@@ -1115,7 +1115,7 @@ impl FileLoader {
         )
     }
 
-    // Go: fileloader.go:571 (*fileLoader).emptyContentMappedFile (tsgo#4712)
+    // Go: fileloader.go:587 (*fileLoader).emptyContentMappedFile (tsgo#4712)
     // emptyContentMappedFile produces an empty TypeScript source file for a content-mapped file whose
     // transform could not be used, retaining the original content for diagnostics. Importers see it as an
     // empty module rather than triggering a "cannot find module" error. It is still marked as content-mapped
@@ -1145,7 +1145,7 @@ impl FileLoader {
         source_file
     }
 
-    // Go: fileloader.go:624 (*fileLoader).contentMapperUnavailable (tsgo#4712)
+    // Go: fileloader.go:638 (*fileLoader).contentMapperUnavailable (tsgo#4712)
     // contentMapperUnavailable reports whether mapper failed initialization or exceeded its failure budget.
     fn content_mapper_unavailable(&self, mapper: Option<&Rc<Mapper>>) -> bool {
         let Some(mapper) = mapper else {
@@ -1162,7 +1162,7 @@ impl FileLoader {
                 >= MAX_CONTENT_MAPPER_FAILURES
     }
 
-    // Go: fileloader.go:633 (*fileLoader).recordContentMapperInitializationFailure (tsgo#4712)
+    // Go: fileloader.go:647 (*fileLoader).recordContentMapperInitializationFailure (tsgo#4712)
     fn record_content_mapper_initialization_failure(
         &self,
         mapper: &Rc<Mapper>,
@@ -1181,7 +1181,7 @@ impl FileLoader {
             .push(content_mapper_initialization_diagnostic(label, err));
     }
 
-    // Go: fileloader.go:646 (*fileLoader).recordContentMapperFailure (tsgo#4712)
+    // Go: fileloader.go:660 (*fileLoader).recordContentMapperFailure (tsgo#4712)
     // recordContentMapperFailure counts a transform failure for mapper. It returns whether the failure
     // should be reported for this file (false once the mapper is already disabled). On the failure that
     // reaches maxContentMapperFailures it appends a single program diagnostic disabling the mapper.

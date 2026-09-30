@@ -188,7 +188,7 @@ fn command_line_parse_result() {
     t.finish();
 }
 
-// Go: commandlineparser_test.go:90 TestResponseFileDoesNotPanic
+// Go: commandlineparser_test.go:89 TestResponseFileDoesNotPanic
 #[test]
 fn response_file_does_not_panic() {
     // Passing `@` with an empty or relative filename should not panic.
@@ -216,7 +216,7 @@ fn response_file_does_not_panic() {
     t.finish();
 }
 
-// Go: commandlineparser_test.go:109 TestResponseFileParsing
+// Go: commandlineparser_test.go:108 TestResponseFileParsing
 #[test]
 fn response_file_parsing() {
     let mut t = Subtests::new("TestResponseFileParsing");
@@ -251,7 +251,7 @@ fn response_file_parsing() {
     t.finish();
 }
 
-// Go: commandlineparser_test.go:136 TestParseCommandLineTypeRootsRelativePath
+// Go: commandlineparser_test.go:135 TestParseCommandLineTypeRootsRelativePath
 #[test]
 fn parse_command_line_type_roots_relative_path() {
     let host = new_vfs_parse_config_host(

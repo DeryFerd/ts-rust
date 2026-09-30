@@ -323,7 +323,7 @@ pub fn new_watcher(name: &str, init: impl FnOnce(&mut WatcherStruct)) -> Arc<Wat
     })
 }
 
-// Go: watcher.go:192 AllWatchers
+// Go: watcher.go:203 AllWatchers
 /// AllWatchers returns a fresh slice listing every watcher backend the package
 /// knows about. Use [Watcher.Available] to check which ones work on the current
 /// OS.
@@ -342,7 +342,7 @@ pub fn all_watchers() -> Vec<Arc<dyn Watcher>> {
     ]
 }
 
-// Go: watcher.go:203 Inotify
+// Go: watcher.go:214 Inotify
 /// Inotify returns the inotify watcher (Linux and Android).
 pub fn inotify() -> Arc<dyn Watcher> {
     INOTIFY_WATCHER.clone()
@@ -366,14 +366,14 @@ pub fn windows() -> Arc<dyn Watcher> {
     WINDOWS_WATCHER.clone()
 }
 
-// Go: watcher.go:216 Fanotify
+// Go: watcher.go:227 Fanotify
 /// Fanotify returns the fanotify watcher (Linux, kernel ≥ 5.13). Directories on
 /// filesystems that don't support fanotify watches automatically use inotify instead.
 pub fn fanotify() -> Arc<dyn Watcher> {
     FANOTIFY_FALLBACK_WATCHER.clone()
 }
 
-// Go: watcher.go:219 Default
+// Go: watcher.go:230 Default
 /// Default returns the recommended watcher for the current OS.
 ///
 /// PORT: Go `runtime.GOOS` is `std::env::consts::OS` ("macos" for Go
@@ -401,7 +401,7 @@ pub fn default() -> Arc<dyn Watcher> {
     }
 }
 
-// Go: watcher.go:244 fallbackWatcher
+// Go: watcher.go:255 fallbackWatcher
 /// fallbackWatcher keeps the primary backend for supported filesystems while
 /// routing individual unsupported watches to the secondary backend.
 pub struct FallbackWatcher {
@@ -410,22 +410,22 @@ pub struct FallbackWatcher {
 }
 
 impl Watcher for FallbackWatcher {
-    // Go: watcher.go:249 fallbackWatcher.Name
+    // Go: watcher.go:260 fallbackWatcher.Name
     fn name(&self) -> String {
         self.primary.name()
     }
 
-    // Go: watcher.go:250 fallbackWatcher.Available
+    // Go: watcher.go:261 fallbackWatcher.Available
     fn available(&self) -> bool {
         self.primary.available()
     }
 
-    // Go: watcher.go:251 fallbackWatcher.HasFastRecursiveBackend
+    // Go: watcher.go:262 fallbackWatcher.HasFastRecursiveBackend
     fn has_fast_recursive_backend(&self) -> bool {
         self.primary.has_fast_recursive_backend()
     }
 
-    // Go: watcher.go:253 fallbackWatcher.WatchDirectory
+    // Go: watcher.go:264 fallbackWatcher.WatchDirectory
     fn watch_directory(
         &self,
         dir: &str,
@@ -443,7 +443,7 @@ impl Watcher for FallbackWatcher {
             .expect("WatchDirectories returns one watch per request"))
     }
 
-    // Go: watcher.go:265 fallbackWatcher.WatchDirectories
+    // Go: watcher.go:276 fallbackWatcher.WatchDirectories
     fn watch_directories(
         &self,
         requests: &[WatchDirectoryRequest<'_>],
@@ -495,7 +495,7 @@ impl Watcher for FallbackWatcher {
         Ok(watches)
     }
 
-    // Go: watcher.go:291 fallbackWatcher.WatchFile
+    // Go: watcher.go:302 fallbackWatcher.WatchFile
     fn watch_file(&self, path: &str, fn_: WatchCallback) -> Result<Box<dyn Watch>, GoError> {
         let result = self.primary.watch_file(path, fn_.clone());
         if let Err(err) = &result {
@@ -506,7 +506,7 @@ impl Watcher for FallbackWatcher {
         result
     }
 
-    // Go: watcher.go:299 fallbackWatcher.unexported
+    // Go: watcher.go:310 fallbackWatcher.unexported
     fn unexported(&self) {}
 }
 

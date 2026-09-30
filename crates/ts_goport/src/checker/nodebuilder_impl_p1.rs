@@ -74,7 +74,7 @@ pub struct ModuleSpecifierResult {
     pub import_attributes_type: TypeId,
 }
 
-// Go: checker/nodebuilderimpl.go:57 NodeBuilderContext
+// Go: checker/nodebuilderimpl.go:63 NodeBuilderContext
 // PORT: symbol keyed maps use `SymbolId` for Go `ast.SymbolId`. A symbol id
 // is the same for the same symbol, so the maps behave the same. Go
 // `*ast.SourceFile` is the `SourceFile` node. Go `Host` is the program.
@@ -174,7 +174,7 @@ pub fn nil_context(host: &'static GoProgram) -> Rc<RefCell<NodeBuilderContext>> 
     Rc::new(RefCell::new(NodeBuilderContext::new(host)))
 }
 
-// Go: checker/nodebuilderimpl.go:91 NodeBuilderImpl
+// Go: checker/nodebuilderimpl.go:97 NodeBuilderImpl
 // PORT: Go `ch *Checker` is dropped. Every method is a Checker method and
 // gets the checker as `self`. Go `f` is the method `f()`, which returns the
 // emit context factory. Go `cloneBindingNameVisitor` is dropped: nothing in
@@ -209,7 +209,7 @@ pub const NO_TRUNCATION_MAXIMUM_TRUNCATION_LENGTH: i32 = 1_000_000;
 
 // Node builder utility functions
 
-// Go: checker/nodebuilderimpl.go:119 newNodeBuilderImpl
+// Go: checker/nodebuilderimpl.go:125 newNodeBuilderImpl
 #[must_use]
 pub fn new_node_builder_impl(
     ch: &Checker,
@@ -316,7 +316,7 @@ fn is_default_binding_context(location: Node) -> bool {
 }
 
 impl Checker {
-    // Go: checker/nodebuilderimpl.go:128 saveRestoreFlags
+    // Go: checker/nodebuilderimpl.go:134 saveRestoreFlags
     // PORT: the restore closure keeps its own handle to the context.
     pub fn save_restore_flags(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>) -> Box<dyn FnOnce()> {
         let ctx = p1_ctx(b);
@@ -333,7 +333,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/nodebuilderimpl.go:140 checkTruncationLength
+    // Go: checker/nodebuilderimpl.go:146 checkTruncationLength
     pub fn check_truncation_length(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>) -> bool {
         let ctx = p1_ctx(b);
         let mut c = ctx.borrow_mut();
@@ -351,7 +351,7 @@ impl Checker {
         c.truncating
     }
 
-    // Go: checker/nodebuilderimpl.go:158 checkTruncationLengthIfExpanding
+    // Go: checker/nodebuilderimpl.go:164 checkTruncationLengthIfExpanding
     // checkTruncationLengthIfExpanding returns true if maxExpansionDepth >= 0 and truncation length exceeded.
     // When expanding, we need to mark the output as truncated so we know not to offer further expansion.
     pub fn check_truncation_length_if_expanding(
@@ -367,7 +367,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/nodebuilderimpl.go:169 isExpandableType
+    // Go: checker/nodebuilderimpl.go:175 isExpandableType
     // isExpandableType reports whether t has a named representation that could be inlined
     // as its structural form during hover expansion. Filters out lib types.
     // When isAlias is true, checks whether t's alias symbol is from user code (not lib).
@@ -406,7 +406,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/nodebuilderimpl.go:191 isTypeOnStack
+    // Go: checker/nodebuilderimpl.go:197 isTypeOnStack
     // isTypeOnStack reports whether t is already being processed in the current expansion,
     // excluding the last element (which is the type currently being serialized by typeToTypeNode).
     pub fn is_type_on_stack(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, t: TypeId) -> bool {
@@ -416,7 +416,7 @@ impl Checker {
         c.type_stack[..n].iter().any(|&s| s == t)
     }
 
-    // Go: checker/nodebuilderimpl.go:206 shouldExpandType
+    // Go: checker/nodebuilderimpl.go:212 shouldExpandType
     // shouldExpandType decides whether to expand this type at the current depth.
     // Returns true when depth < maxExpansionDepth (expand now).
     // At the boundary (depth == maxExpansionDepth), sets canIncreaseExpansionDepth
@@ -447,7 +447,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/nodebuilderimpl.go:225 isActivelyExpanding
+    // Go: checker/nodebuilderimpl.go:231 isActivelyExpanding
     // isActivelyExpanding reports whether the current depth is below maxExpansionDepth,
     // meaning type-node reuse should be skipped so typeToTypeNode can expand named types.
     pub fn is_actively_expanding(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>) -> bool {
@@ -456,7 +456,7 @@ impl Checker {
         c.max_expansion_depth > 0 && c.depth < c.max_expansion_depth
     }
 
-    // Go: checker/nodebuilderimpl.go:233 checkTypeExpandability
+    // Go: checker/nodebuilderimpl.go:239 checkTypeExpandability
     // checkTypeExpandability probes whether a type (or its type arguments) could be expanded,
     // for use after type-node reuse where shouldExpandType was never called.
     // Delegates to shouldExpandType for the actual check, then recurses into type arguments

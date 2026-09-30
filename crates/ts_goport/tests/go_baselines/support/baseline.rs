@@ -44,7 +44,7 @@ pub const TRACK_ENV: &str = "TS_GOPORT_BASELINE_TRACK";
 /// A Go `func(string) string` diff fixup.
 pub type DiffFixup = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
-// Go: testutil/baseline/baseline.go:18 Options
+// Go: testutil/baseline/baseline.go:14 Options
 #[derive(Clone, Default)]
 pub struct Options {
     pub subfolder: String,
@@ -56,7 +56,7 @@ pub struct Options {
     pub skip_diff_with_old: bool,
 }
 
-// Go: testutil/baseline/baseline.go:28 NoContent
+// Go: testutil/baseline/baseline.go:21 NoContent
 pub const NO_CONTENT: &str = "<no content>";
 
 /// The typescript-go checkout: `TS_GO_REPO`, or `DEFAULT_GO_REPO`.
@@ -136,7 +136,7 @@ fn join_rel(parts: &[&str]) -> String {
         .join("/")
 }
 
-// Go: testutil/baseline/baseline.go:30 Run
+// Go: testutil/baseline/baseline.go:23 Run
 // At the merged layout Go `Options` has no `IsSubmodule*` fields and `Run`
 // is the first block only; the runners there never set `is_submodule`.
 pub fn run(file_name: &str, actual: &str, opts: &Options) -> Result<(), String> {
@@ -273,7 +273,7 @@ fn read_file_or_no_content(file_name: &Path) -> String {
     }
 }
 
-// Go: testutil/baseline/baseline.go:134 DiffText
+// Go: testutil/baseline/baseline.go:31 DiffText
 pub fn diff_text(old_name: &str, new_name: &str, expected: &str, actual: &str) -> String {
     let expected_lines = patience::split_lines(expected);
     let actual_lines = patience::split_lines(actual);
@@ -416,7 +416,7 @@ fn parse_unified_diff_header(s: &str) -> Option<([i64; 4], usize)> {
 // Go `RunAgainstSubmodule` (typescript-go baseline.go:186) has no callers
 // since microsoft/TypeScript 5f647a841a and is not ported.
 
-// Go: testutil/baseline/baseline.go:195 writeComparison
+// Go: testutil/baseline/baseline.go:41 writeComparison
 // PORT: `rel` is the path under the local root (Go passes the full local
 // path). With a local root, every generated baseline is written, not only a
 // changed one, and a stale `.delete` marker is removed too.

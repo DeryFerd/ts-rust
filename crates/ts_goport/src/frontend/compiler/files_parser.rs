@@ -2468,7 +2468,7 @@ impl StatCache {
 /// program loads.
 ///
 /// PORT: Go parse tasks share the host's cachedvfs, which lasts for the
-/// whole build, and a write does not update it (cachedvfs.go:148). So each
+/// whole build, and a write does not update it (cachedvfs.go:144). So each
 /// lookup that a program makes before the build writes that path stays
 /// for the later programs. The parse workers here also resolve guesses:
 /// imports with a guessed resolution mode, files that the loader may not

@@ -39,7 +39,7 @@ fn entry_exists(info: &Option<Rc<InfoCacheEntry>>) -> bool {
     info.as_ref().is_some_and(|p| p.exists())
 }
 
-// Go: module/resolver.go:20 resolved
+// Go: module/resolver.go:19 resolved
 #[derive(Clone, Debug, Default)]
 pub struct Resolved {
     pub path: String,

@@ -158,11 +158,11 @@ impl TypingsInstaller {
     }
 }
 
-// Go: project/ata/ata.go:88 tsVersionToUse
+// Go: project/ata/ata.go:92 tsVersionToUse
 // !!! sheetal currently we use latest instead of core.VersionMajorMinor()
 pub const TS_VERSION_TO_USE: &str = "latest";
 
-// Go: project/ata/ata.go:90 TypingsInstallRequest
+// Go: project/ata/ata.go:94 TypingsInstallRequest
 // PORT: Go `TypingsInfo *TypingsInfo` is never nil (the session passes the
 // address of a local), so it is an `Rc`. `GetScriptKind` is a stored func.
 #[derive(Clone)]
@@ -179,7 +179,7 @@ pub struct TypingsInstallRequest {
     pub logger: Option<Rc<dyn logging::Logger>>,
 }
 
-// Go: project/ata/ata.go:102 TypingsInstallResult
+// Go: project/ata/ata.go:106 TypingsInstallResult
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TypingsInstallResult {
     pub typings_files: Vec<String>,
@@ -187,7 +187,7 @@ pub struct TypingsInstallResult {
 }
 
 impl TypingsInstaller {
-    // Go: project/ata/ata.go:107 InstallTypings
+    // Go: project/ata/ata.go:111 InstallTypings
     // PORT: Go also has the unexported `installTypings` on this type, so the
     // exported Go `InstallTypings` is `install_typings_exported` (PORTING
     // "Names"). Go returns `(*TypingsInstallResult, error)` with a nil
@@ -208,7 +208,7 @@ impl TypingsInstaller {
         result
     }
 
-    // Go: project/ata/ata.go:117 discoverAndInstallTypings
+    // Go: project/ata/ata.go:121 discoverAndInstallTypings
     pub fn discover_and_install_typings(
         &self,
         request: &TypingsInstallRequest,
@@ -259,7 +259,7 @@ impl TypingsInstaller {
         // this.event(response, "setTypings");
     }
 
-    // Go: project/ata/ata.go:157 installTypings
+    // Go: project/ata/ata.go:161 installTypings
     // ts#64319: no project ID or typings info parameters.
     pub fn install_typings(
         &self,
@@ -398,7 +398,7 @@ impl TypingsInstaller {
         // this.event(body, eventName);
     }
 
-    // Go: project/ata/ata.go:256 installWorker
+    // Go: project/ata/ata.go:261 installWorker
     // ts#64319: no project ID parameter.
     pub fn install_worker(
         &self,
@@ -441,7 +441,7 @@ impl TypingsInstaller {
     }
 }
 
-// Go: project/ata/ata.go:280 installNpmPackages
+// Go: project/ata/ata.go:284 installNpmPackages
 // PORT: Go `concurrencySemaphore chan struct{}` is the `sync_channel` pair.
 // `ThrottleGroup::go` runs each body at once, in call order.
 pub fn install_npm_packages(
@@ -479,7 +479,7 @@ pub fn install_npm_packages(
 }
 
 impl TypingsInstaller {
-    // Go: project/ata/ata.go:318 filterTypings
+    // Go: project/ata/ata.go:322 filterTypings
     // ts#64319: no project ID parameter.
     pub fn filter_typings(
         &self,
@@ -537,7 +537,7 @@ impl TypingsInstaller {
         result
     }
 
-    // Go: project/ata/ata.go:351 init
+    // Go: project/ata/ata.go:354 init
     // PORT: `initOnce.Do` is a `Cell<bool>` guard, set before the body runs
     // (Go marks the Once done even if the body panics).
     pub fn init(&self, project_id: &str, fs: &dyn vfs::Fs, logger: &dyn logging::Logger) {
@@ -602,7 +602,7 @@ impl TypingsInstaller {
     }
 }
 
-// Go: project/ata/ata.go:392 npmConfig
+// Go: project/ata/ata.go:395 npmConfig
 // PORT: Go `map[string]any` is `IndexMap<String, LspAny>` (PORTING "JSON");
 // nil is `None`. processCacheLocation ranges over it: insertion order, where
 // Go map order is random.
@@ -611,13 +611,13 @@ pub struct NpmConfig {
     pub dev_dependencies: Option<IndexMap<String, LspAny>>,
 }
 
-// Go: project/ata/ata.go:396 npmDependecyEntry
+// Go: project/ata/ata.go:399 npmDependecyEntry
 #[derive(Clone, Debug, Default)]
 pub struct NpmDependecyEntry {
     pub version: String,
 }
 
-// Go: project/ata/ata.go:399 npmLock
+// Go: project/ata/ata.go:402 npmLock
 // PORT: nil maps are `None` (processCacheLocation tests them for nil).
 #[derive(Clone, Debug, Default)]
 pub struct NpmLock {
@@ -681,7 +681,7 @@ impl UnmarshalerFrom for NpmLock {
 }
 
 impl TypingsInstaller {
-    // Go: project/ata/ata.go:404 processCacheLocation
+    // Go: project/ata/ata.go:407 processCacheLocation
     pub fn process_cache_location(
         &self,
         project_id: &str,
@@ -793,7 +793,7 @@ impl TypingsInstaller {
     }
 }
 
-// Go: project/ata/ata.go:460 parseNpmConfigOrLock
+// Go: project/ata/ata.go:466 parseNpmConfigOrLock
 // PORT: Go `[T npmConfig | npmLock]` is any `UnmarshalerFrom`. Like Go, a
 // read or decode error is ignored and a partly decoded `config` is kept.
 pub fn parse_npm_config_or_lock<T: UnmarshalerFrom>(
@@ -810,7 +810,7 @@ pub fn parse_npm_config_or_lock<T: UnmarshalerFrom>(
 }
 
 impl TypingsInstaller {
-    // Go: project/ata/ata.go:466 ensureTypingsLocationExists
+    // Go: project/ata/ata.go:472 ensureTypingsLocationExists
     pub fn ensure_typings_location_exists(&self, fs: &dyn vfs::Fs, logger: &dyn logging::Logger) {
         let npm_config_path = tspath::combine_paths(&self.typings_location, &["package.json"]);
         logger.log(&format!("ATA:: Npm config file: {npm_config_path}"));
@@ -844,7 +844,7 @@ impl TypingsInstaller {
         result.resolved_file_name.clone()
     }
 
-    // Go: project/ata/ata.go:484 loadTypesRegistryFile
+    // Go: project/ata/ata.go:490 loadTypesRegistryFile
     pub fn load_types_registry_file(
         &self,
         fs: &dyn vfs::Fs,
