@@ -836,10 +836,41 @@ impl Checker {
         ) {
             // Only distinguished by type IDs, handled below.
         } else if ty1.flags.intersects(TypeFlags::OBJECT) {
-            // Order unnamed or identically named object types by symbol.
-            let c = self.compare_symbols_worker(ty1.symbol, ty2.symbol);
-            if c != 0 {
-                return c;
+            // Order instantiation expression types without relying on lazy symbol IDs.
+            // Order other unnamed or identically named object types by symbol.
+            if ty1
+                .object_flags
+                .intersects(ObjectFlags::INSTANTIATION_EXPRESSION_TYPE)
+                && ty2
+                    .object_flags
+                    .intersects(ObjectFlags::INSTANTIATION_EXPRESSION_TYPE)
+            {
+                let mut declaration1 = Node::NIL;
+                let mut declaration2 = Node::NIL;
+                if ty1.symbol.is_some() && !self.sym(ty1.symbol).declarations.is_empty() {
+                    declaration1 = self.sym(ty1.symbol).declarations[0];
+                }
+                if ty2.symbol.is_some() && !self.sym(ty2.symbol).declarations.is_empty() {
+                    declaration2 = self.sym(ty2.symbol).declarations[0];
+                }
+                // A single instantiation expression can produce multiple types for union constituents,
+                // so compare their source declarations before comparing the shared expression node.
+                let c = self.compare_nodes(declaration1, declaration2);
+                if c != 0 {
+                    return c;
+                }
+                let c = self.compare_nodes(
+                    ty1.as_instantiation_expression_type().node,
+                    ty2.as_instantiation_expression_type().node,
+                );
+                if c != 0 {
+                    return c;
+                }
+            } else {
+                let c = self.compare_symbols_worker(ty1.symbol, ty2.symbol);
+                if c != 0 {
+                    return c;
+                }
             }
             // When object types have the same or no symbol, order by kind. We order type references before other kinds.
             if ty1.object_flags.intersects(ObjectFlags::REFERENCE)
