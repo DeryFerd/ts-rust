@@ -18,8 +18,8 @@ use crate::ls::autoimport::prelude::*;
 // - The change tracker's embedded Go `NodeFactory` is `ct.node_factory()`.
 //   Nodes are made into locals first, in Go argument order, before the
 //   tracker call that takes `&mut ct`.
-// - Go `panic` text that prints a `Kind` (`KindString()`, `%v`) prints the
-//   Rust `SyntaxKind` name (`{:?}`).
+// - Go `panic` text that prints a `Kind` (`KindString()`, `%v`) prints
+//   `debug::kind_string` ("KindX").
 
 use crate::frontend::compiler;
 use crate::frontend::core_ls_ext::compare_booleans;
@@ -32,9 +32,6 @@ use crate::lsp::lsproto;
 use crate::modulespecifiers;
 
 use crate::flags_macros::go_enum;
-
-/// Go runtime panic text for a nil pointer dereference.
-const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
 
 // Go: ls/autoimport/fix.go:30 newImportBinding
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -108,7 +105,7 @@ impl Fix {
             }
             lsproto::AutoImportFixKind::ADD_TO_EXISTING => {
                 if (source_file_imports(file).len() as i32) <= f.import_index {
-                    panic!("import index out of range");
+                    crate::core::go_panic("import index out of range".to_string());
                 }
                 let existing_fix = get_add_to_existing_import_fix(file, f);
                 // Go: core.SingleElementSlice(existingFix.namedImport)
@@ -252,7 +249,7 @@ impl Fix {
                 let (edits, safe) = file_edits(&mut tracker, file);
                 (edits, description, safe)
             }
-            _ => panic!("unimplemented fix edit"),
+            _ => crate::core::go_panic("unimplemented fix edit".to_string()),
         }
     }
 }
@@ -280,7 +277,7 @@ pub fn add_import_type(
     locale: &locale::Locale,
 ) -> String {
     let Some(usage_position) = f.usage_position else {
-        panic!("UsagePosition must be set for JSDoc type import fix");
+        crate::core::go_panic("UsagePosition must be set for JSDoc type import fix".to_string());
     };
     let quote_preference = lsutil::get_quote_preference(file, preferences);
     let mut quote_char = "\"";
@@ -307,7 +304,7 @@ pub fn add_namespace_qualifier(
     locale: &locale::Locale,
 ) -> String {
     if f.usage_position.is_none() || f.namespace_prefix.is_empty() {
-        panic!("namespace fix requires usage position and prefix");
+        crate::core::go_panic("namespace fix requires usage position and prefix".to_string());
     }
     let usage_position = f.usage_position.expect("checked above");
     let qualified = format!("{}.{}", f.namespace_prefix, f.name);
@@ -318,33 +315,39 @@ pub fn add_namespace_qualifier(
 // Go: ls/autoimport/fix.go:144 getAddToExistingImportFix
 pub fn get_add_to_existing_import_fix(file: Node, fix: &Fix) -> AddToExistingImportFix {
     if fix.kind != lsproto::AutoImportFixKind::ADD_TO_EXISTING {
-        panic!("expected add to existing import fix");
+        crate::core::go_panic("expected add to existing import fix".to_string());
     }
     let module_specifier = source_file_imports(file).get(fix.import_index as usize);
     let import_node = try_get_import_from_module_specifier(module_specifier);
     if import_node.is_nil() {
-        panic!("expected import declaration");
+        crate::core::go_panic("expected import declaration".to_string());
     }
     let import_clause_or_binding_pattern;
     match import_node.kind() {
         SyntaxKind::ImportDeclaration => {
             import_clause_or_binding_pattern = import_node.import_clause();
             if import_clause_or_binding_pattern.is_nil() {
-                panic!("expected import clause");
+                crate::core::go_panic("expected import clause".to_string());
             }
         }
         SyntaxKind::CallExpression => {
             if !is_variable_declaration_initialized_to_require(import_node.parent()) {
-                panic!("expected require call expression to be in variable declaration");
+                crate::core::go_panic(
+                    "expected require call expression to be in variable declaration".to_string(),
+                );
             }
             import_clause_or_binding_pattern = import_node.parent().name();
             if import_clause_or_binding_pattern.is_nil()
                 || !is_object_binding_pattern(import_clause_or_binding_pattern)
             {
-                panic!("expected object binding pattern in variable declaration");
+                crate::core::go_panic(
+                    "expected object binding pattern in variable declaration".to_string(),
+                );
             }
         }
-        _ => panic!("expected import declaration or require call expression"),
+        _ => crate::core::go_panic(
+            "expected import declaration or require call expression".to_string(),
+        ),
     }
 
     let default_import = if fix.import_kind == lsproto::ImportKind::DEFAULT {
@@ -523,8 +526,9 @@ pub fn add_to_existing_import(
                         ct.replace_node(file, import_clause.named_bindings(), named_imports, None);
                     } else {
                         if import_clause.name().is_nil() {
-                            panic!(
+                            crate::core::go_panic(
                                 "Import clause must have either named imports or a default import"
+                                    .to_string(),
                             );
                         }
                         ct.insert_node_after(file, import_clause.name(), named_imports);
@@ -549,10 +553,10 @@ pub fn add_to_existing_import(
                 }
             }
         }
-        kind => panic!(
-            "Unsupported clause kind: {:?} for addToExistingImport",
-            kind
-        ),
+        kind => crate::core::go_panic(format!(
+            "Unsupported clause kind: {} for addToExistingImport",
+            crate::gostd::debug::kind_string(kind)
+        )),
     }
 }
 
@@ -724,7 +728,7 @@ pub fn get_new_imports(
         statements.push(declaration);
     }
     if statements.is_empty() {
-        panic!("No statements to insert for new imports");
+        crate::core::go_panic("No statements to insert for new imports".to_string());
     }
     statements
 }
@@ -867,7 +871,11 @@ pub fn insert_imports(
         &existing_import_statements,
         preferences,
     );
-    let comparer = |a: &str, b: &str| -> i32 { (comparer.as_ref().expect(NIL_DEREF))(a, b) };
+    let comparer = |a: &str, b: &str| -> i32 {
+        (comparer
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference()))(a, b)
+    };
     let mut sorted_new_imports: Vec<Node> = imports.to_vec();
     gostd::slices::sort_func(&mut sorted_new_imports, |a, b| {
         lsutil::compare_imports_or_require_statements(*a, *b, &comparer)
@@ -1389,7 +1397,10 @@ fn get_import_kind(
             }
             lsproto::ImportKind::COMMON_JS
         }
-        _ => panic!("unhandled export syntax kind: {}", export.syntax.string()),
+        _ => crate::core::go_panic(format!(
+            "unhandled export syntax kind: {}",
+            export.syntax.string()
+        )),
     }
 }
 
@@ -1422,10 +1433,10 @@ impl View {
         for (i, module_specifier) in imports.iter().enumerate() {
             let node = try_get_import_from_module_specifier(module_specifier);
             if node.is_nil() {
-                panic!(
-                    "error: did not expect node kind {:?}",
-                    module_specifier.kind()
-                );
+                crate::core::go_panic(format!(
+                    "error: did not expect node kind {}",
+                    crate::gostd::debug::kind_string(module_specifier.kind())
+                ));
             } else if is_variable_declaration_initialized_to_require(node.parent()) {
                 let module_symbol = ch.resolve_external_module_name_exported(module_specifier);
                 if module_symbol.is_some() {
@@ -1857,12 +1868,14 @@ fn promote_from_type_only(
             } else {
                 // The parent import clause is type-only
                 if spec.parent().is_nil() || spec.parent().kind() != SyntaxKind::NamedImports {
-                    panic!("ImportSpecifier parent must be NamedImports");
+                    crate::core::go_panic(
+                        "ImportSpecifier parent must be NamedImports".to_string(),
+                    );
                 }
                 if spec.parent().parent().is_nil()
                     || spec.parent().parent().kind() != SyntaxKind::ImportClause
                 {
-                    panic!("NamedImports parent must be ImportClause");
+                    crate::core::go_panic("NamedImports parent must be ImportClause".to_string());
                 }
                 promote_import_clause(
                     changes,
@@ -1895,7 +1908,7 @@ fn promote_from_type_only(
             if alias_declaration.parent().is_nil()
                 || alias_declaration.parent().kind() != SyntaxKind::ImportClause
             {
-                panic!("NamespaceImport parent must be ImportClause");
+                crate::core::go_panic("NamespaceImport parent must be ImportClause".to_string());
             }
             promote_import_clause(
                 changes,
@@ -1920,7 +1933,10 @@ fn promote_from_type_only(
             delete_type_keyword(changes, source_file, scan.token_start());
             alias_declaration
         }
-        kind => panic!("Unexpected alias declaration kind: {:?}", kind),
+        kind => crate::core::go_panic(format!(
+            "Unexpected alias declaration kind: {}",
+            crate::gostd::debug::kind_string(kind)
+        )),
     }
 }
 

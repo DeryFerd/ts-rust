@@ -489,7 +489,7 @@ impl MarshalerTo for Registration {
     // Go: (s *Registration) MarshalJSONTo
     fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
         let Some(register_options) = &self.register_options else {
-            panic!("RegisterOptions must be set");
+            crate::core::go_panic("RegisterOptions must be set".to_string());
         };
         assert_only_one(
             "exactly one element of RegisterOptions should be set",

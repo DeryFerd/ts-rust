@@ -375,14 +375,14 @@ pub fn err_literal_mismatch(type_name: &str, expected: &str, got: impl AsRef<[u8
 // Go: lsp.go:149 assertOnlyOne
 pub fn assert_only_one(message: &str, count: i32) {
     if count != 1 {
-        panic!("{message}");
+        crate::core::go_panic(message.to_string());
     }
 }
 
 // Go: lsp.go:155 assertAtMostOne
 pub fn assert_at_most_one(message: &str, count: i32) {
     if count > 1 {
-        panic!("{message}");
+        crate::core::go_panic(message.to_string());
     }
 }
 

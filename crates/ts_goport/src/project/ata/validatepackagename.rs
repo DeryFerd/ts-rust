@@ -108,7 +108,7 @@ pub fn render_package_name_validation_failure(
         NAME_CONTAINS_NON_URI_SAFE_CHARACTERS => {
             format!("'{typing}':: {kind} name '{name}' contains non URI safe characters")
         }
-        NAME_OK => panic!("Unexpected Ok result"),
-        _ => panic!("Unknown package name validation result"),
+        NAME_OK => crate::core::go_panic("Unexpected Ok result".to_string()),
+        _ => crate::core::go_panic("Unknown package name validation result".to_string()),
     }
 }

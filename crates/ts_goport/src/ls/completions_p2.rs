@@ -415,7 +415,7 @@ impl LanguageService {
             entry
                 .data
                 .as_mut()
-                .expect("invalid memory address or nil pointer dereference")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .is_import_statement_completion = data.import_statement_completion.is_some();
 
             let is_shadowed = uniques.get(&auto_import.fix.name).copied().unwrap_or(false);
@@ -451,7 +451,9 @@ pub fn completion_name_for_literal(
             json_ext::marshal_indent(&literal.0, "" /*prefix*/, "" /*suffix*/).unwrap_or_default()
         }
         LiteralValue::PseudoBigInt(literal) => format!("{literal}n"),
-        LiteralValue::Bool(_) => panic!("Unhandled literal value: {literal:?}"),
+        LiteralValue::Bool(literal) => {
+            crate::core::go_panic(format!("Unhandled literal value: {literal}"))
+        }
     }
 }
 
@@ -509,7 +511,7 @@ pub fn get_insert_text_and_replacement_span_for_import_completion(
                 replacement_span,
             )
         }
-        _ => panic!("unhandled import kind: {}", import_kind.string()),
+        _ => crate::core::go_panic(format!("unhandled import kind: {}", import_kind.string())),
     }
 }
 
@@ -775,16 +777,16 @@ impl LanguageService {
             label_details = origin.as_object_literal_method().label_details.clone();
             if !client_supports_item_label_details(ctx) {
                 // PORT: Go dereferences `labelDetails.Detail`; a nil pointer
-                // panics there, as the unwraps do here.
+                // panics there.
                 name = name
                     + origin
                         .as_object_literal_method()
                         .label_details
                         .as_ref()
-                        .unwrap()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
                         .detail
                         .as_ref()
-                        .unwrap();
+                        .unwrap_or_else(|| crate::core::go_nil_dereference());
                 label_details = None;
             }
             source = COMPLETION_SOURCE_OBJECT_LITERAL_METHOD_SNIPPET.to_string();
@@ -2049,7 +2051,7 @@ pub fn get_completion_entry_display_name_for_symbol(
             (name, true)
         }
         CompletionKind::NONE | CompletionKind::STRING => (name, false),
-        _ => panic!("Unexpected completion kind: {}", completion_kind.0),
+        _ => crate::core::go_panic(format!("Unexpected completion kind: {}", completion_kind.0)),
     }
 }
 
@@ -2190,7 +2192,7 @@ pub fn is_valid_trigger(
                 && context_token.parent().kind() == SyntaxKind::SourceFile
         }
         "*" => is_potentially_valid_js_doc_snippet_completion_position(file, position),
-        _ => panic!("Unknown trigger character: {trigger_character}"),
+        _ => crate::core::go_panic(format!("Unknown trigger character: {trigger_character}")),
     }
 }
 
@@ -2349,7 +2351,7 @@ pub fn non_alias_can_be_referenced_at_type_location(
 fn check_each_defined(s: Vec<SymbolId>, msg: &str) -> Vec<SymbolId> {
     for value in &s {
         if value.is_nil() {
-            panic!("{}", msg);
+            crate::core::go_panic(msg.to_string());
         }
     }
     s
@@ -2950,13 +2952,16 @@ pub fn get_completions_symbol_kind(kind: lsutil::ScriptElementKind) -> lsproto::
 // So, it's important that we sort those ties in the order we want them displayed if it matters. We don't
 // strictly need to sort by name or SortText here since clients are going to do it anyway, but we have to
 // do the work of comparing them so we can sort those ties appropriately.
-// PORT: Go dereferences `SortText`; a nil pointer panics there, as the
-// unwraps do here.
+// PORT: Go dereferences `SortText`; a nil pointer panics there.
 pub fn compare_completion_entries(a: &lsproto::CompletionItem, b: &lsproto::CompletionItem) -> i32 {
     let compare_strings = stringutil_ls::compare_strings_case_insensitive_then_sensitive;
     let mut result = compare_strings(
-        a.sort_text.as_deref().unwrap(),
-        b.sort_text.as_deref().unwrap(),
+        a.sort_text
+            .as_deref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference()),
+        b.sort_text
+            .as_deref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference()),
     );
     if result == stringutil_ls::COMPARISON_EQUAL {
         result = compare_strings(&a.label, &b.label);
@@ -3076,7 +3081,7 @@ pub fn get_typescript_keyword_completions(
                 }
                 KeywordCompletionFilters::TYPE_KEYWORDS => is_type_keyword(kind),
                 KeywordCompletionFilters::TYPE_KEYWORD => kind == SyntaxKind::TypeKeyword,
-                _ => panic!("Unknown keyword filter: {}", keyword_filter.0),
+                _ => crate::core::go_panic(format!("Unknown keyword filter: {}", keyword_filter.0)),
             }
         })
         .collect();
