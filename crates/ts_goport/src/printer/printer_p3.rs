@@ -1101,7 +1101,9 @@ impl Printer {
             SyntaxKind::SyntheticExpression => {
                 panic!("SyntheticExpression should never be printed.")
             }
-            SyntaxKind::MissingDeclaration => {}
+            SyntaxKind::MissingDeclaration => {
+                // Missing declarations do not emit an expression.
+            }
 
             // JSX
             SyntaxKind::JsxElement => self.emit_jsx_element(node),

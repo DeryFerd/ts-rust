@@ -500,14 +500,26 @@ impl DeclarationTransformer {
             }
         }
         let ec = self.emit_context.clone();
-        let modifiers = self.ensure_modifiers(input);
-        let result = ec.factory().new_property_declaration(
-            modifiers,
-            input.name(),
-            Node::NIL,
-            Node::NIL,
-            Node::NIL,
-        );
+        let result;
+        if is_method_signature_declaration(input) {
+            let modifiers = self.ensure_modifiers(input);
+            result = ec.factory().new_property_signature_declaration(
+                modifiers,
+                input.name(),
+                Node::NIL, /*postfixToken*/
+                Node::NIL, /*typeNode*/
+                Node::NIL, /*initializer*/
+            );
+        } else {
+            let modifiers = self.ensure_modifiers(input);
+            result = ec.factory().new_property_declaration(
+                modifiers,
+                input.name(),
+                Node::NIL, /*postfixToken*/
+                Node::NIL, /*typeNode*/
+                Node::NIL, /*initializer*/
+            );
+        }
         self.preserve_js_doc(result, input);
         result
     }
@@ -586,14 +598,13 @@ impl DeclarationTransformer {
                 let ec = self.emit_context.clone();
                 let module_specifier =
                     self.rewrite_module_specifier(input, input.module_specifier());
-                let attributes = self.try_get_resolution_mode_override(input.attributes());
                 ec.factory().update_export_declaration(
                     input,
                     input.modifiers(),
                     input.is_type_only(),
                     input.export_clause(),
                     module_specifier,
-                    attributes,
+                    input.attributes(),
                 )
             }
             SyntaxKind::ExportAssignment => self.transform_export_assignment(
@@ -927,6 +938,7 @@ impl DeclarationTransformer {
                             f.new_modifier_list(&ns_mods),
                             SyntaxKind::NamespaceKeyword,
                             ns_name,
+                            Node::NIL,
                             f.new_module_block(f.new_node_list(&[class_decl])),
                         );
 

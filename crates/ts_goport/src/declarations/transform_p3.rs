@@ -89,6 +89,7 @@ impl DeclarationTransformer {
             f.new_modifier_list(&ns_mods),
             SyntaxKind::NamespaceKeyword,
             ns_name,
+            Node::NIL,
             f.new_module_block(f.new_node_list(&members)),
         )
     }
@@ -139,18 +140,6 @@ impl DeclarationTransformer {
             || (parent.kind() != SyntaxKind::ModuleDeclaration
                 && parent.kind() != SyntaxKind::ImportType);
         input
-    }
-
-    // Go: transformers/declarations/transform.go:1559 DeclarationTransformer.tryGetResolutionModeOverride
-    pub(crate) fn try_get_resolution_mode_override(&mut self, node: Node) -> Node {
-        if node.is_nil() {
-            return node;
-        }
-        let mode = self.host.get_resolution_mode_override(node);
-        if mode != ResolutionMode::NONE {
-            return node;
-        }
-        Node::NIL
     }
 
     // Go: transformers/declarations/transform.go:1570 DeclarationTransformer.preserveJsDoc
@@ -504,6 +493,7 @@ impl DeclarationTransformer {
         {
             keyword = SyntaxKind::NamespaceKeyword;
         }
+        let attributes = self.visit(input.attributes());
         let ec = self.emit_context.clone();
 
         if inner.is_some() && inner.kind() == SyntaxKind::ModuleBlock {
@@ -556,6 +546,7 @@ impl DeclarationTransformer {
                 mods,
                 keyword,
                 input.name(),
+                attributes,
                 body,
             );
         }
@@ -574,11 +565,18 @@ impl DeclarationTransformer {
                 mods,
                 keyword,
                 input.name(),
+                attributes,
                 body,
             );
         }
-        ec.factory()
-            .update_module_declaration(input, mods, keyword, input.name(), Node::NIL)
+        ec.factory().update_module_declaration(
+            input,
+            mods,
+            keyword,
+            input.name(),
+            attributes,
+            Node::NIL,
+        )
     }
 
     // Go: transformers/declarations/transform.go:1862 DeclarationTransformer.stripExportModifiers

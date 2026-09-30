@@ -155,7 +155,33 @@ fn source_map_generator_add_generated_mapping() {
     assert_eq!(source_map, raw("main.js", "/", &[], "A", &[], None));
 }
 
-// Go: sourcemap/generator_test.go:141 TestSourceMapGenerator_AddGeneratedMapping_OnSecondLineOnly
+// Go: sourcemap/generator_test.go:141 TestSourceMapGenerator_AddGeneratedMapping_ReplacesPendingSourceMapping
+#[test]
+fn source_map_generator_add_generated_mapping_replaces_pending_source_mapping() {
+    let mut generator = new_generator("main.js", "/", "/", ComparePathsOptions::default());
+    let source_index = generator.add_source("/main.ts");
+    generator
+        .add_source_mapping(0, 0, source_index, 0, 0)
+        .unwrap();
+    generator.add_generated_mapping(0, 0).unwrap();
+    let source_map = generator.raw_source_map();
+    assert_eq!(source_map.mappings, "A");
+}
+
+// Go: sourcemap/generator_test.go:151 TestSourceMapGenerator_AddGeneratedMapping_IsNotReplacedBySourceMapping
+#[test]
+fn source_map_generator_add_generated_mapping_is_not_replaced_by_source_mapping() {
+    let mut generator = new_generator("main.js", "/", "/", ComparePathsOptions::default());
+    let source_index = generator.add_source("/main.ts");
+    generator.add_generated_mapping(0, 0).unwrap();
+    generator
+        .add_source_mapping(0, 0, source_index, 0, 0)
+        .unwrap();
+    let source_map = generator.raw_source_map();
+    assert_eq!(source_map.mappings, "A");
+}
+
+// Go: sourcemap/generator_test.go:161 TestSourceMapGenerator_AddGeneratedMapping_OnSecondLineOnly
 #[test]
 fn source_map_generator_add_generated_mapping_on_second_line_only() {
     let mut generator = new_generator("main.js", "/", "/", ComparePathsOptions::default());
