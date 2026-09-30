@@ -1262,7 +1262,10 @@ impl Checker {
     ) -> (bool, SymbolId) {
         let declarations = self.sym(symbol).declarations.clone();
         let mut is_static_method_symbol = false;
-        if self.sym(symbol).flags.intersects(SymbolFlags::METHOD) {
+        // `typeof C.name` can only be written when the member name is a valid identifier
+        if self.sym(symbol).flags.intersects(SymbolFlags::METHOD)
+            && is_identifier_text(&self.sym(symbol).name, LanguageVariant::STANDARD)
+        {
             for &declaration in &declarations {
                 if is_static(declaration)
                     && !self.is_late_bindable_index_signature(get_name_of_declaration(declaration))
