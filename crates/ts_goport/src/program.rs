@@ -2973,29 +2973,12 @@ pub fn for_each_checker_parallel<R: Send + 'static>(cb: fn(usize, &mut Checker) 
     wait_jobs(receivers)
 }
 
-// Go: compiler/checkerpool.go:136 GetGlobalDiagnostics
-// PORT: split in a send half (this: the `forEachCheckerParallel` jobs) and
-// a wait half (`PendingGlobalDiagnostics::wait`), so that the early emit
-// can send the read behind the check and wait for it later
-// (`start_global_diagnostics`).
-fn pool_start_global_diagnostics() -> PendingGlobalDiagnostics {
-    PendingGlobalDiagnostics(
-        (0..checker_count())
-            .map(|index| send_job(index, |checker| checker.get_global_diagnostics()))
-            .collect(),
-    )
-}
-
-/// A `get_global_diagnostics` read whose checker jobs are sent and not
-/// waited for yet (`start_global_diagnostics`).
-pub struct PendingGlobalDiagnostics(Vec<std::sync::mpsc::Receiver<JobResult<Vec<Diagnostic>>>>);
-
-impl PendingGlobalDiagnostics {
-    /// Waits for every checker. Same result as `get_global_diagnostics`.
-    #[must_use]
-    pub fn wait(self) -> Vec<Diagnostic> {
-        sort_and_deduplicate_diagnostics(wait_jobs(self.0).into_iter().flatten().collect())
-    }
+// Go: compiler/checkerpool.go:462 GetGlobalDiagnostics
+fn pool_get_global_diagnostics() -> Vec<Diagnostic> {
+    let receivers = (0..checker_count())
+        .map(|index| send_job(index, |checker| checker.get_global_diagnostics()))
+        .collect();
+    sort_and_deduplicate_diagnostics(wait_jobs(receivers).into_iter().flatten().collect())
 }
 
 // Go: compiler/checkerpool.go:148 forEachCheckerGroupDo
@@ -3331,20 +3314,15 @@ fn can_include_bind_and_check_diagnostics(source_file: Node) -> bool {
     is_plain_js || is_check_js
 }
 
-// Go: compiler/program.go:1290 GetGlobalDiagnostics
+// Go: compiler/program.go:1455 GetGlobalDiagnostics
+/// Sends one job to each checker of the current program and waits for them.
+/// Each checker runs it after the jobs sent to it before, so the read sees
+/// what those jobs added. Loading thread only.
 pub fn get_global_diagnostics() -> Vec<Diagnostic> {
-    start_global_diagnostics().wait()
-}
-
-/// `get_global_diagnostics` without the wait: sends one job to each checker
-/// of the current program and returns. Each checker runs it after the jobs
-/// sent to it before, so the read sees what those jobs added. Loading
-/// thread only.
-pub fn start_global_diagnostics() -> PendingGlobalDiagnostics {
     if prog().source_file_order.is_empty() {
-        return PendingGlobalDiagnostics(Vec::new());
+        return Vec::new();
     }
-    pool_start_global_diagnostics()
+    pool_get_global_diagnostics()
 }
 
 // Go: compiler/program.go:1302 GetDeclarationDiagnostics

@@ -1416,18 +1416,6 @@ impl Path {
     }
 }
 
-// Go: tspath/path.go:1083 ForEachAncestorDirectoryPath
-// PORT: Go N replaces it with the `Path` method above (ts#63902). It stays
-// until its callers in `ls/autoimport` move to the method.
-pub fn for_each_ancestor_directory_path<T: Default>(
-    directory: &Path,
-    mut callback: impl FnMut(Path) -> (T, bool),
-) -> (T, bool) {
-    for_each_ancestor_directory(&directory.0, |directory| {
-        callback(Path(directory.to_string()))
-    })
-}
-
 // Go: tspath/path.go:1089 HasExtension
 pub fn has_extension(file_name: &str) -> bool {
     get_base_file_name(file_name).contains('.')

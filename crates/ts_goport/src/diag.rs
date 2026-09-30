@@ -3,7 +3,7 @@
 //! Go `diagnostics.Name` messages. Use them as `diag::Name`.
 #![allow(non_upper_case_globals)]
 
-use crate::diagnostics::{CATALOG, Category, Message};
+use crate::diagnostics::{CATALOG, Message};
 
 pub static Unterminated_string_literal: &Message = &CATALOG[0];
 pub static Identifier_expected: &Message = &CATALOG[1];
@@ -2743,43 +2743,9 @@ pub static Remove_Unused_Imports: &Message = &CATALOG[2212];
 pub static Sort_Imports: &Message = &CATALOG[2213];
 pub static JSDoc_comment: &Message = &CATALOG[2214];
 
-// PORT: messages that Go removed at the pin. Rust code in lanes that have not ported
-// the removing change yet still uses them. Remove each one from the --removed file
-// with its last Rust user.
-pub static Type_import_attributes_should_have_exactly_one_key_resolution_mode_with_value_import_or_require: &Message = &Message::new(1_464, Category::Error, "Type_import_attributes_should_have_exactly_one_key_resolution_mode_with_value_import_or_require_1464", "Type import attributes should have exactly one key - 'resolution-mode' - with value 'import' or 'require'.", false, false, false);
-pub static X_resolution_mode_is_the_only_valid_key_for_type_import_attributes: &Message =
-    &Message::new(
-        1_463,
-        Category::Error,
-        "resolution_mode_is_the_only_valid_key_for_type_import_attributes_1463",
-        "'resolution-mode' is the only valid key for type import attributes.",
-        false,
-        false,
-        false,
-    );
-pub static The_content_mapper_0_produced_overlapping_original_position_mappings_that_are_not_identical_near_original_offset_1: &Message = &Message::new(100_038, Category::Error, "The_content_mapper_0_produced_overlapping_original_position_mappings_that_are_not_identical_near_ori_100038", "The content mapper '{0}' produced overlapping original position mappings that are not identical (near original offset {1}).", false, false, false);
-pub static The_content_mapper_uses_unsupported_protocol_version_0_expected_version_1: &Message =
-    &Message::new(
-        100_044,
-        Category::Message,
-        "The_content_mapper_uses_unsupported_protocol_version_0_expected_version_1_100044",
-        "The content mapper uses unsupported protocol version {0}; expected version {1}.",
-        false,
-        false,
-        false,
-    );
-
 // Go: diagnostics/diagnostics.go keyToMessage
 /// PORT: Go builds a lazy map from `allMessages`. `CATALOG` holds the same messages.
-/// The removed messages above match first: unported code still reports them, and a
-/// serialized diagnostic must read back (Go at the previous pin knew their keys).
 #[must_use]
 pub fn key_to_message(key: &str) -> Option<&'static Message> {
-    match key {
-        "Type_import_attributes_should_have_exactly_one_key_resolution_mode_with_value_import_or_require_1464" => Some(Type_import_attributes_should_have_exactly_one_key_resolution_mode_with_value_import_or_require),
-        "resolution_mode_is_the_only_valid_key_for_type_import_attributes_1463" => Some(X_resolution_mode_is_the_only_valid_key_for_type_import_attributes),
-        "The_content_mapper_0_produced_overlapping_original_position_mappings_that_are_not_identical_near_ori_100038" => Some(The_content_mapper_0_produced_overlapping_original_position_mappings_that_are_not_identical_near_original_offset_1),
-        "The_content_mapper_uses_unsupported_protocol_version_0_expected_version_1_100044" => Some(The_content_mapper_uses_unsupported_protocol_version_0_expected_version_1),
-        _ => crate::diagnostics::message_by_key(key),
-    }
+    crate::diagnostics::message_by_key(key)
 }

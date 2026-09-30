@@ -4,11 +4,3 @@
 # message line is copied from diagnostics_generated.go at the previous pin
 # (typescript-go 16c25522e). Remove a line with its last Rust user, then
 # generate again. An empty file (only comments) gives the plain Go catalog.
-
-# #63931 (checker lane): src/checker/checker_p04.rs
-var Type_import_attributes_should_have_exactly_one_key_resolution_mode_with_value_import_or_require = &Message{code: 1464, category: CategoryError, key: "Type_import_attributes_should_have_exactly_one_key_resolution_mode_with_value_import_or_require_1464", text: "Type import attributes should have exactly one key - 'resolution-mode' - with value 'import' or 'require'."}
-var X_resolution_mode_is_the_only_valid_key_for_type_import_attributes = &Message{code: 1463, category: CategoryError, key: "resolution_mode_is_the_only_valid_key_for_type_import_attributes_1463", text: "'resolution-mode' is the only valid key for type import attributes."}
-
-# #63936 (program lane, content mappers): src/frontend/compiler/file_loader.rs
-var The_content_mapper_0_produced_overlapping_original_position_mappings_that_are_not_identical_near_original_offset_1 = &Message{code: 100038, category: CategoryError, key: "The_content_mapper_0_produced_overlapping_original_position_mappings_that_are_not_identical_near_ori_100038", text: "The content mapper '{0}' produced overlapping original position mappings that are not identical (near original offset {1})."}
-var The_content_mapper_uses_unsupported_protocol_version_0_expected_version_1 = &Message{code: 100044, category: CategoryMessage, key: "The_content_mapper_uses_unsupported_protocol_version_0_expected_version_1_100044", text: "The content mapper uses unsupported protocol version {0}; expected version {1}."}

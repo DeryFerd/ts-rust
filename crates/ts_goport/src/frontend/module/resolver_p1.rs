@@ -287,27 +287,6 @@ pub fn new_resolver(opts: ResolverOptions) -> DefaultResolver {
     }
 }
 
-// Go: module/resolver.go NewResolverWithOptions (removed upstream in ts#64299)
-// PORT: Go N builds this with `NewResolver(ResolverOptions{...})`. It stays
-// until its callers in `ls/autoimport` move to `new_resolver`.
-#[must_use]
-pub fn new_resolver_with_options(
-    host: Rc<dyn ResolutionHost>,
-    compiler_options: Rc<CompilerOptions>,
-    typings_location: &str,
-    project_name: &str,
-    opts: ResolverOptions,
-) -> DefaultResolver {
-    new_resolver(ResolverOptions {
-        host: Some(host),
-        compiler_options: Some(compiler_options),
-        typings_location: typings_location.to_string(),
-        project_name: project_name.to_string(),
-        extra_extensions: Vec::new(),
-        package_json_cache: opts.package_json_cache,
-    })
-}
-
 impl DefaultResolver {
     // Go: module/resolver.go:182 newTraceBuilder
     #[must_use]

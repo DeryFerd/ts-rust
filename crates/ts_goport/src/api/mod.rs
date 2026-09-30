@@ -42,6 +42,10 @@ pub mod prelude {
     pub use crate::ls::{self, lsconv};
     pub use crate::lsp::lsproto;
     pub use crate::prelude::*;
+    // `crate::prelude` also has these names (Go `core.ResolutionMode`,
+    // `module.PackageId` and `module.ResolvedModule`). In the api package
+    // they are the api types, as in Go.
+    pub use super::proto::{PackageId, ResolutionMode, ResolvedModule};
     pub use crate::program::ls_program;
     pub use crate::project;
 }
