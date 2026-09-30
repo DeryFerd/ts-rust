@@ -142,7 +142,9 @@ Each arena has a dummy entry at index 0. New entries are pushed; ids are
 `newIndexInfo`, `newTypePredicate`, mapper constructors push into these.
 Go `t.id` equals the arena index, so Go's per-checker `TypeId` counter order
 is kept. Link stores: `value_symbol_links: LinkStore<SymbolId, ValueSymbolLinks>`
-etc. with the Go field names.
+etc. with the Go field names. A store keeps its values in 64-key pages, so a
+value over 32 bytes (a compile-time check in `LinkStore`), or one that few
+keys have, goes in a `Box` (`type_node_links: LinkStore<Node, Box<TypeNodeLinks>>`).
 
 `checker/mapper.rs` defines `TypeMapper` (an enum over the Go mapper kinds)
 and its constructors. Go `m.Map(t)` -> `self.mapper_map(m, t)`,
@@ -179,7 +181,7 @@ methods reach the AST through it.
   derefs to the data; `as_static()` gives the `&'static` borrow of a static
   file. A guard keeps its file version alive, so read the fields you need
   and let it go; copy or clone to keep a value. Hot readers use a closure
-  (`ast::with_go_file(id, |g| ..)`, the `frozen!` reads in `ast/store.rs`),
+  (`ast::with_go_file(id, |g| ..)`, `with_published_store` in `ast/store.rs`),
   which pins the version for the read only. A slice of a freeable file's
   data is a handle that reads at each use (`NodeSlice::from_file_imports`,
   `from_file_js_doc`). A read of a dead file version panics ("file version
@@ -249,34 +251,28 @@ methods reach the AST through it.
   so they belong to the thread. `GOPORT_SYNTHETIC_OWNERS=0` turns owners
   off.
 - Store columns and the other registry tables of a published file are read
-  through one file lookup (the `frozen!` macro and `static_frozen_of` in
-  `ast/store.rs`), not `FROZEN.get()` directly. It checks tier 0 (the
-  first publish), then, inline, tier 1 (every later publish), then a
-  freeable file version (its store and `GoFile`; out of line, pinned while
-  the read runs), so the nodes of a later program (`tsc -b`, an edited
-  file) read the same columns as the nodes of the first program. The tier
-  1 slot of a freeable version names its node shell (its header and child
-  columns, leaked; no node column when its store owns its nodes), so its
-  header and child reads are tier 1 reads, and its node data reads miss
-  the static tiers and read the pinned version (`static_store_node`,
-  `with_scoped_store_node`). The tier 1 and freeable parts
-  are a cold block, so they add no code to the hot path of a one-program
-  process; keep new tier 1 work after `later_publish_path()`, and keep one
-  inline copy of the read (after the static tiers join). A read gets
-  a borrow for its closure only, so it copies its result out. A new column
-  gets a `Frozen` table and a reader that calls `frozen!` with that table.
-  A reader that must return a `&'static` slice of a table uses the static
-  tiers only (`static_frozen`), which have the node shell tables of a
-  freeable version but not its store or `GoFile`. The inline fast paths
-  of the node reads (`kind`, `parent`, `flags`, `loc`, children,
-  `Node::new`, the binder fields in the records) use `frozen_static!`
-  (static tiers, no call), as a one-program process needs; the binder
-  extras of a freeable version are read out of line with one pinned read
-  (`Node::bind_extra`). A node
-  shell has no link column, so `frozen_store_children` gives `None` and
-  the caller reads the node data. Use `frozen_static!` only where `None`
-  sends the caller to an exact path.
-- Node records (AST node records plan steps 1 and 2, `ast/store.rs`).
+  through one file lookup, `file_block` in `ast/store.rs` (AST node records
+  step 3). Each published file id has one block (`FileBlock`: records,
+  kids, node column and a `BlockFile` with the facts, root, foreign
+  parents, links, and the store and `GoFile` of a static publish), in a
+  static array for ids below 2^16 (`FILE_BLOCKS`, one cache line per
+  entry) and in chunks made on demand above (`HIGH_BLOCKS`, a cold block
+  with no call). So the first program, a later program (`tsc -b`, watch,
+  an edited file) and the node shell of a freeable version read the same
+  way: a hot node read is two dependent loads, and has no call. The block
+  of a freeable version is its node shell (records, kids and foreign
+  parents leaked; no node column when its store owns its nodes; no link
+  column), so its header and child reads are block reads, and its node
+  data reads read the pinned version (`static_store_node`,
+  `with_scoped_store_node`). A read of the store or the `GoFile` of a
+  node shell reads the pinned version out of line
+  (`with_published_store`, `try_with_go_file`); `static_go_file` gives
+  `None` there. A new per-slot column goes into a record or kids word; a
+  new per-file table goes into `BlockFile`. Keep the fast paths free of
+  calls: a call there made `Node::parent` go out of line (AST node records
+  step 2b). A node shell has no link column, so `frozen_store_children`
+  gives `None` and the caller reads the node data.
+- Node records (AST node records plan steps 1 to 3, `ast/store.rs`).
   Each store slot has one 32-byte `NodeRecord` (kind, bits, flags, loc,
   `up` and `bind`) and one 16-byte `NodeKids` (the U4 and C2 child ids,
   and a word with the U1 name of an identifier or the U1 (b) modifier
@@ -381,7 +377,7 @@ The batch that adds it is not accepted until Theo approves.
   `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The
   registry keeps a `Weak`. At publish the version takes its `FileStore`
   and its `GoFile` (M3b). Its node records and kids (`NodeRecord`,
-  `NodeKids`; 48 bytes per node) are leaked in its node shell, the tier 1 publish of its id, so a header or child
+  `NodeKids`; 48 bytes per node) are leaked in its node shell, the registry block of its id, so a header or child
   read of the edited file stays inline (a pinned read per node read made
   edits 3 to 4 ms slower); the child link column is dropped, and the
   binder's child walk reads the node data. With owned nodes (M3c; on by
@@ -414,8 +410,8 @@ The batch that adds it is not accepted until Theo approves.
   symbols and tables in the binder lineage are whole chunks of its own
   (M3d); after it dies, the next bind frees them, and a read of one of its
   symbol or table ids panics (index out of bounds). The header columns of
-  the node shell and the text stay leaked for now. Tier 0, the first
-  version of each file and every CLI publish never get one.
+  the node shell and the text stay leaked for now. The first publish, the
+  first version of each file and every CLI publish never get one.
   `GOPORT_FREE_FILE_VERSIONS=0` turns this off, `=1` turns it on in any
   process; there `update_program_version` (`goport_multiprog`) also gives
   each new parse of a published path a version, so a leak record can
