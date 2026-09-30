@@ -188,6 +188,15 @@ impl StdioServer {
             callback_fs.set_connection(ctx, conn.clone());
         }
 
-        conn.run(ctx)
+        // ts#64276
+        server_run_error(ctx, conn.run(ctx))
     }
+}
+
+// Go: server.go serverRunError (ts#64276)
+fn server_run_error(ctx: &Context, err: Result<(), GoError>) -> Result<(), GoError> {
+    if ctx.err().is_some() {
+        return Ok(());
+    }
+    err
 }
