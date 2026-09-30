@@ -3278,6 +3278,8 @@ impl Session {
             source_file,
             project_path,
             program.clone(),
+            // ts#64178
+            ch.clone(),
             user_preferences.module_specifier_preferences(),
         );
         let mut import_adder = autoimport::new_import_adder(
