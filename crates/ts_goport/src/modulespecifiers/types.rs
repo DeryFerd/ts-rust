@@ -77,7 +77,15 @@ pub enum ResultKind {
     Ambient,
 }
 
-// Go: modulespecifiers/types.go:36 ModulePath
+// Go: modulespecifiers/types.go:36 ModuleSpecifiersResult (ts#63931)
+#[derive(Clone, Debug, Default)]
+pub struct ModuleSpecifiersResult {
+    pub specifiers: Vec<String>,
+    pub kind: ResultKind,
+    pub ambient_module_symbol: SymbolId, // used to construct an import attributes node, if one is needed
+}
+
+// Go: modulespecifiers/types.go:42 ModulePath
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModulePath {
     pub file_name: String,

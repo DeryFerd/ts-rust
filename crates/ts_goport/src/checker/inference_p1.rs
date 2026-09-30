@@ -1214,12 +1214,16 @@ impl Checker {
                 let c = self.ty(target).as_conditional_type();
                 (c.check_type, c.extends_type)
             };
+            let s_check = self.get_non_distributed_type_parameter(s_check);
             self.infer_from_types(n, s_check, t_check);
+            let s_extends = self.get_non_distributed_type_parameter(s_extends);
             self.infer_from_types(n, s_extends, t_extends);
             let s_true = self.get_true_type_from_conditional_type(source);
+            let s_true = self.get_non_distributed_type_parameter(s_true);
             let t_true = self.get_true_type_from_conditional_type(target);
             self.infer_from_types(n, s_true, t_true);
             let s_false = self.get_false_type_from_conditional_type(source);
+            let s_false = self.get_non_distributed_type_parameter(s_false);
             let t_false = self.get_false_type_from_conditional_type(target);
             self.infer_from_types(n, s_false, t_false);
         } else {
@@ -1250,7 +1254,12 @@ impl Checker {
         source: TypeId,
         target: &TemplateLiteralType,
     ) {
-        let matches = self.infer_types_from_template_literal_type(source, target);
+        let comparer = self.compare_types_assignable.clone();
+        let matches = self.infer_types_from_template_literal_type(
+            source,
+            target,
+            &mut |c: &mut Checker, s: TypeId, t: TypeId, r: bool| comparer(c, s, t, r),
+        );
         let types = target.types.clone();
         // When the target template literal contains only placeholders (meaning that inference is intended to extract
         // single characters and remainder strings) and inference fails to produce matches, we want to infer 'never' for

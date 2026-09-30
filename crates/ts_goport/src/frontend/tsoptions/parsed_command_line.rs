@@ -459,16 +459,19 @@ pub struct ParsedCommandLine {
 }
 
 // Go: tsoptions/parsedcommandline.go:60 NewParsedCommandLine
-// PORT: Go returns a new pointer; this returns the value.
+// PORT: Go returns a new pointer; this returns the value. A nil
+// `projectReferences` slice is `None`.
 pub fn new_parsed_command_line(
     compiler_options: Rc<CompilerOptions>,
     root_file_names: Vec<String>,
+    project_references: Option<Vec<ProjectReference>>,
     compare_paths_options: ComparePathsOptions,
 ) -> ParsedCommandLine {
     ParsedCommandLine {
         parsed_config: ParsedOptions {
             compiler_options,
             file_names: root_file_names,
+            project_references,
             ..Default::default()
         },
         compare_paths_options,

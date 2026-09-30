@@ -442,7 +442,7 @@ impl Checker {
         if enclosing_file != get_source_file_of_node(lit) {
             let mut mode = ResolutionMode::NONE;
             if parent.attributes().is_some() {
-                mode = self.get_resolution_mode_override(parent.attributes(), false);
+                (mode, _) = parent.attributes().get_resolution_mode_override(None);
             }
             let mut name = lit.text().to_string();
             let original_name = name.clone();
@@ -461,11 +461,15 @@ impl Checker {
                 parent_symbol = self.lookup_symbol_chain(b, node_symbol, meaning, true)[0];
             }
             if parent_symbol.is_some() && self.is_external_module_symbol(parent_symbol) {
-                name = self.get_specifier_for_module_symbol(b, parent_symbol, mode);
+                name = self
+                    .get_specifier_for_module_symbol(b, parent_symbol, mode)
+                    .specifier;
             } else {
                 let target_file = self.get_external_module_file_from_declaration(parent);
                 if target_file.is_some() {
-                    name = self.get_specifier_for_module_symbol(b, target_file.symbol(), mode);
+                    name = self
+                        .get_specifier_for_module_symbol(b, target_file.symbol(), mode)
+                        .specifier;
                 }
             }
             if !name.is_empty() && name.contains("/node_modules/") {
@@ -908,7 +912,9 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         {
             let declared_type = self.ctx.c.get_declared_type_of_symbol(s);
             let mapper = nb_ctx(self.ctx.b).borrow().mapper;
-            if mapper.is_some() && self.ctx.c.mapper_map(mapper, declared_type) != declared_type {
+            if mapper.is_some()
+                && self.ctx.c.get_mapped_type(declared_type, mapper) != declared_type
+            {
                 return Node::NIL; // refers to type parameter remapped by context (TODO improvement: just return the remapped param name?)
             }
         }

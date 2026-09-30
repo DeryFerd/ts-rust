@@ -76,11 +76,13 @@ pub fn try_get_module_specifier_from_declaration(node: Node) -> Node {
 fn try_get_module_specifier_from_declaration_worker(node: Node) -> Node {
     match node.kind() {
         SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement => {
-            let require_call = find_ancestor(node.initializer(), |n| is_require_call(n, true));
-            if require_call.is_nil() {
+            let module_call = find_ancestor(node.initializer(), |n| {
+                is_require_call(n, true /*requireStringLiteralLikeArgument*/) || is_import_call(n)
+            });
+            if module_call.is_nil() {
                 return Node::NIL;
             }
-            require_call.arguments().get(0)
+            module_call.arguments().get(0)
         }
         SyntaxKind::ImportDeclaration
         | SyntaxKind::ExportDeclaration

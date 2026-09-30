@@ -54,7 +54,31 @@ use crate::project::{dirty, logging};
 use std::sync::LazyLock;
 use std::time::Instant;
 
-// Go: ls/autoimport/registry.go:31 knownRecursiveSearchPackages
+// Go: ls/autoimport/registry.go:32 ProjectID
+// PORT: Go `ProjectID` is an interface (`fmt.Stringer`) that the project
+// package fills with its string type `project.ID`; interface map keys compare
+// by that value. Every value is a `project.ID`, so the Rust type holds its
+// string: the project package passes `ProjectID(id.to_string())`. A Go nil
+// `ProjectID` is `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProjectID(pub String);
+
+impl ProjectID {
+    /// Go `fmt.Stringer.String`.
+    #[must_use]
+    pub fn string(&self) -> String {
+        self.0.clone()
+    }
+}
+
+/// Go `%s` / `%v` of a `ProjectID` is its `String()`.
+impl std::fmt::Display for ProjectID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// Go: ls/autoimport/registry.go:36 knownRecursiveSearchPackages
 pub static KNOWN_RECURSIVE_SEARCH_PACKAGES: LazyLock<FxHashSet<&'static str>> =
     LazyLock::new(|| {
         [
@@ -158,9 +182,15 @@ fn set_is_subset_of(s: Option<&FxHashSet<String>>, other: Option<&FxHashSet<Stri
 }
 
 /// Go copies `module.ResolverOptions` by value.
-// PORT: `module::ResolverOptions` is not `Clone`; this copies its one field.
+// PORT: the copy clones each field (the `Rc` values are shared, as Go
+// shares the pointers).
 fn copy_resolver_options(opts: &module::ResolverOptions) -> module::ResolverOptions {
     module::ResolverOptions {
+        host: opts.host.clone(),
+        compiler_options: opts.compiler_options.clone(),
+        typings_location: opts.typings_location.clone(),
+        project_name: opts.project_name.clone(),
+        extra_extensions: opts.extra_extensions.clone(),
         package_json_cache: opts.package_json_cache.clone(),
     }
 }
@@ -486,7 +516,7 @@ pub struct Registry {
     pub directories: FxHashMap<tspath::Path, Rc<RefCell<Directory>>>,
 
     pub node_modules: FxHashMap<tspath::Path, Rc<RegistryBucket>>,
-    pub projects: FxHashMap<tspath::Path, Rc<RegistryBucket>>,
+    pub projects: FxHashMap<ProjectID, Rc<RegistryBucket>>,
     pub unique_package_count: i32,
 
     // entrypoints maps from file path to the resolved entrypoints for that file, shared across all node_modules buckets.
@@ -521,13 +551,13 @@ impl Registry {
     pub fn is_prepared_for_importing_file(
         r: Option<&Registry>,
         file_name: &str,
-        project_path: &tspath::Path,
+        project_id: &ProjectID,
         preferences: &lsutil::UserPreferences,
     ) -> bool {
         let Some(r) = r else {
             return false;
         };
-        let Some(project_bucket) = r.projects.get(project_path) else {
+        let Some(project_bucket) = r.projects.get(project_id) else {
             return false;
         };
         let path = (r.to_path)(file_name);
@@ -619,7 +649,7 @@ impl Registry {
 // Go: ls/autoimport/registry.go:412 BucketStats
 #[derive(Clone, Debug, Default)]
 pub struct BucketStats {
-    pub path: tspath::Path,
+    pub name: String,
     pub export_count: i32,
     pub file_count: i32,
     pub state: BucketState,
@@ -644,13 +674,13 @@ impl Registry {
             ..Default::default()
         };
 
-        for (path, bucket) in &self.projects {
+        for (project_id, bucket) in &self.projects {
             let mut export_count = 0;
             if let Some(index) = &bucket.index {
                 export_count = index.borrow().entries.len() as i32;
             }
             stats.project_buckets.push(BucketStats {
-                path: path.clone(),
+                name: project_id.string(),
                 export_count,
                 file_count: bucket.paths.len() as i32,
                 state: bucket.state.borrow().clone(),
@@ -677,7 +707,7 @@ impl Registry {
                 package_names = Some(names);
             }
             stats.node_modules_buckets.push(BucketStats {
-                path: path.clone(),
+                name: path.as_str().to_string(),
                 export_count,
                 file_count,
                 state: bucket.state.borrow().clone(),
@@ -686,9 +716,9 @@ impl Registry {
             });
         }
 
-        // Go: cmp.Compare(a.Path, b.Path)
+        // Go: cmp.Compare(a.Name, b.Name)
         let compare_paths = |a: &BucketStats, b: &BucketStats| -> i32 {
-            match a.path.cmp(&b.path) {
+            match a.name.cmp(&b.name) {
                 std::cmp::Ordering::Less => -1,
                 std::cmp::Ordering::Equal => 0,
                 std::cmp::Ordering::Greater => 1,
@@ -711,10 +741,10 @@ pub struct RegistryChange {
     pub changed: FxHashSet<lsproto::DocumentUri>,
     pub created: FxHashSet<lsproto::DocumentUri>,
     pub deleted: FxHashSet<lsproto::DocumentUri>,
-    // RebuiltPrograms maps from project path to:
+    // RebuiltPrograms maps from project ID to:
     //   - true: the program was rebuilt with a different set of file names
     //   - false: the program was rebuilt but the set of file names is unchanged
-    pub rebuilt_programs: FxHashMap<tspath::Path, bool>,
+    pub rebuilt_programs: FxHashMap<ProjectID, bool>,
     pub user_preferences: Option<lsutil::UserPreferences>,
 }
 
@@ -742,15 +772,13 @@ pub fn should_stop_build(ctx: &Context) -> bool {
 // `*packagejson.InfoCacheEntry` is `Option<Rc<..>>`, and Go `*ast.SourceFile`
 // is `Node` (`Node::NIL` for nil). The project area implements it
 // (`autoImportRegistryCloneHost`).
+// Go nil `ProjectID` is `None`.
 pub trait RegistryCloneHost: module::ResolutionHost {
     fn get_default_project(
         &self,
         path: &tspath::Path,
-    ) -> (tspath::Path, Option<Rc<compiler::NewProgram>>);
-    fn get_program_for_project(
-        &self,
-        project_path: &tspath::Path,
-    ) -> Option<Rc<compiler::NewProgram>>;
+    ) -> (Option<ProjectID>, Option<Rc<compiler::NewProgram>>);
+    fn get_program_for_project(&self, project_id: &ProjectID) -> Option<Rc<compiler::NewProgram>>;
     fn get_package_json(&self, file_name: &str) -> Option<Rc<packagejson::InfoCacheEntry>>;
     fn get_source_file(&self, file_name: &str, path: &tspath::Path) -> Node;
     fn dispose(&self);
@@ -766,7 +794,7 @@ pub struct RegistryBuilder {
     pub user_preferences: lsutil::UserPreferences,
     pub directories: Rc<dirty::Map<tspath::Path, Rc<RefCell<Directory>>>>,
     pub node_modules: Rc<dirty::Map<tspath::Path, Rc<RegistryBucket>>>,
-    pub projects: Rc<dirty::Map<tspath::Path, Rc<RegistryBucket>>>,
+    pub projects: Rc<dirty::Map<ProjectID, Rc<RegistryBucket>>>,
     pub specifier_cache: Rc<
         dirty::MapBuilder<
             tspath::Path,
@@ -837,10 +865,12 @@ impl RegistryBuilder {
         logger: &Option<Rc<logging::LogTree>>,
     ) {
         let start = Instant::now();
-        let mut needed_projects: FxHashMap<tspath::Path, ()> = FxHashMap::default();
+        let mut needed_projects: FxHashMap<ProjectID, ()> = FxHashMap::default();
         let mut needed_directories: FxHashMap<tspath::Path, String> = FxHashMap::default();
         for (path, file_name) in &change.open_files {
-            needed_projects.insert(self.host.get_default_project(path).0, ());
+            if let (Some(project_id), _) = self.host.get_default_project(path) {
+                needed_projects.insert(project_id, ());
+            }
             if tspath::is_dynamic_file_name(file_name) {
                 continue;
             }
@@ -866,7 +896,9 @@ impl RegistryBuilder {
         }
 
         if !change.requested_file.is_empty() {
-            needed_projects.insert(self.host.get_default_project(&change.requested_file).0, ());
+            if let (Some(project_id), _) = self.host.get_default_project(&change.requested_file) {
+                needed_projects.insert(project_id, ());
+            }
             if !self.specifier_cache.has(&change.requested_file) {
                 self.specifier_cache.set(
                     change.requested_file.clone(),
@@ -881,21 +913,20 @@ impl RegistryBuilder {
             }
         }
 
-        let mut added_projects: Vec<tspath::Path> = Vec::new();
-        let mut removed_projects: Vec<tspath::Path> = Vec::new();
+        let mut added_projects: Vec<ProjectID> = Vec::new();
+        let mut removed_projects: Vec<ProjectID> = Vec::new();
         {
-            let on_added: &mut dyn FnMut(&tspath::Path, &()) =
-                &mut |project_path: &tspath::Path, _: &()| {
+            let on_added: &mut dyn FnMut(&ProjectID, &()) =
+                &mut |project_id: &ProjectID, _: &()| {
                     // Need and don't have
-                    self.projects
-                        .add(project_path.clone(), new_registry_bucket());
-                    added_projects.push(project_path.clone());
+                    self.projects.add(project_id.clone(), new_registry_bucket());
+                    added_projects.push(project_id.clone());
                 };
-            let on_removed: &mut dyn FnMut(&tspath::Path, &Rc<RegistryBucket>) =
-                &mut |project_path: &tspath::Path, _: &Rc<RegistryBucket>| {
+            let on_removed: &mut dyn FnMut(&ProjectID, &Rc<RegistryBucket>) =
+                &mut |project_id: &ProjectID, _: &Rc<RegistryBucket>| {
                     // Have and don't need
-                    self.projects.delete(project_path);
-                    removed_projects.push(project_path.clone());
+                    self.projects.delete(project_id);
+                    removed_projects.push(project_id.clone());
                 };
             diff_maps_func(
                 &self.base.projects,
@@ -909,11 +940,11 @@ impl RegistryBuilder {
             );
         }
         if logger.is_some() {
-            for project_path in &added_projects {
-                logger.logf(&format!("Added project: {project_path}"));
+            for project_id in &added_projects {
+                logger.logf(&format!("Added project: {project_id}"));
             }
-            for project_path in &removed_projects {
-                logger.logf(&format!("Removed project: {project_path}"));
+            for project_id in &removed_projects {
+                logger.logf(&format!("Removed project: {project_id}"));
             }
         }
 
@@ -1047,8 +1078,8 @@ impl RegistryBuilder {
         logger: &Option<Rc<logging::LogTree>>,
     ) {
         // Mark new program structures
-        for (project_path, new_file_names) in &change.rebuilt_programs {
-            if let (Some(bucket), true) = self.projects.get(project_path) {
+        for (project_id, new_file_names) in &change.rebuilt_programs {
+            if let (Some(bucket), true) = self.projects.get(project_id) {
                 let new_file_names = *new_file_names;
                 bucket.change(&mut |bucket: &Rc<RegistryBucket>| {
                     bucket.state.borrow_mut().new_program_structure = if new_file_names {
@@ -1062,7 +1093,7 @@ impl RegistryBuilder {
 
         // Mark files dirty, bailing out if all buckets already have multiple files dirty
         let mut clean_node_modules_buckets: FxHashSet<tspath::Path> = FxHashSet::default();
-        let mut clean_project_buckets: FxHashSet<tspath::Path> = FxHashSet::default();
+        let mut clean_project_buckets: FxHashSet<ProjectID> = FxHashSet::default();
         self.node_modules.range(&mut |entry: &Rc<
             dirty::MapEntry<tspath::Path, Rc<RegistryBucket>>,
         >| {
@@ -1077,20 +1108,20 @@ impl RegistryBuilder {
             }
             true
         });
-        self.projects.range(&mut |entry: &Rc<
-            dirty::MapEntry<tspath::Path, Rc<RegistryBucket>>,
-        >| {
-            if !entry
-                .value()
-                .unwrap_or_else(|| crate::core::go_nil_dereference())
-                .state
-                .borrow()
-                .multiple_files_dirty
-            {
-                clean_project_buckets.insert(entry.key());
-            }
-            true
-        });
+        self.projects.range(
+            &mut |entry: &Rc<dirty::MapEntry<ProjectID, Rc<RegistryBucket>>>| {
+                if !entry
+                    .value()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
+                    .state
+                    .borrow()
+                    .multiple_files_dirty
+                {
+                    clean_project_buckets.insert(entry.key());
+                }
+                true
+            },
+        );
 
         let mut mark_files_dirty = |uris: &FxHashSet<lsproto::DocumentUri>| {
             if clean_node_modules_buckets.is_empty() && clean_project_buckets.is_empty() {
@@ -1171,7 +1202,7 @@ impl RegistryBuilder {
                 // For projects, mark the bucket dirty if the bucket contains the file directly.
                 // Any other significant change, like a created failed lookup location, is
                 // handled by newProgramStructure.
-                let project_dir_paths: Vec<tspath::Path> =
+                let project_dir_paths: Vec<ProjectID> =
                     clean_project_buckets.iter().cloned().collect();
                 for project_dir_path in project_dir_paths {
                     let (entry, _) = self.projects.get(&project_dir_path);
@@ -1230,10 +1261,10 @@ impl RegistryBuilder {
             discovered: Vec<Rc<DiscoveredPackage>>,
         }
 
-        let (project_path, _) = self.host.get_default_project(&change.requested_file);
-        if project_path.is_empty() {
+        let (project_id, _) = self.host.get_default_project(&change.requested_file);
+        let Some(project_id) = project_id else {
             return;
-        }
+        };
 
         // Go: var wg sync.WaitGroup (PORT: serial, see the file header)
 
@@ -1243,29 +1274,29 @@ impl RegistryBuilder {
         // Project reference output mappings are needed to redirect extraction from output .d.ts files
         // to source files for packages that are project references.
         // We need all projects because a node_modules directory can be used by multiple projects.
-        let mut all_resolved_package_names: FxHashMap<tspath::Path, Rc<FxHashSet<String>>> =
+        let mut all_resolved_package_names: FxHashMap<ProjectID, Rc<FxHashSet<String>>> =
             FxHashMap::default();
         let mut project_reference_outputs: FxHashMap<tspath::Path, String> = FxHashMap::default();
         // Compute which packages have implicit deep imports (subpath imports in packages
         // without exports). These packages need recursive directory search to discover
         // all auto-importable files, even when the preference is disabled.
         let mut all_deep_import_packages: FxHashSet<String> = FxHashSet::default();
-        self.projects.range(&mut |entry: &Rc<
-            dirty::MapEntry<tspath::Path, Rc<RegistryBucket>>,
-        >| {
-            let program = self.host.get_program_for_project(&entry.key());
-            if let Some(program) = program.as_deref() {
-                all_resolved_package_names.insert(
-                    entry.key(),
-                    Rc::new(get_resolved_package_names(ctx, program)),
-                );
-                add_project_reference_output_mappings(program, &mut project_reference_outputs);
-                for name in program.deep_import_package_names() {
-                    all_deep_import_packages.insert(name.clone());
+        self.projects.range(
+            &mut |entry: &Rc<dirty::MapEntry<ProjectID, Rc<RegistryBucket>>>| {
+                let program = self.host.get_program_for_project(&entry.key());
+                if let Some(program) = program.as_deref() {
+                    all_resolved_package_names.insert(
+                        entry.key(),
+                        Rc::new(get_resolved_package_names(ctx, program)),
+                    );
+                    add_project_reference_output_mappings(program, &mut project_reference_outputs);
+                    for name in program.deep_import_package_names() {
+                        all_deep_import_packages.insert(name.clone());
+                    }
                 }
-            }
-            true
-        });
+                true
+            },
+        );
 
         let file_exclude_patterns = self
             .user_preferences
@@ -1286,9 +1317,9 @@ impl RegistryBuilder {
 
         // --- Collect node_modules tasks ---
         let mut node_modules_tasks: Vec<NodeModulesBucketTask> = Vec::new();
-        tspath::for_each_ancestor_directory_path(
-            &change.requested_file,
-            |dir_path: tspath::Path| -> ((), bool) {
+        change
+            .requested_file
+            .for_each_ancestor_directory(|dir_path: tspath::Path| -> ((), bool) {
                 if let (Some(node_modules_bucket), true) = self.node_modules.get(&dir_path) {
                     let dir_name = self
                         .directories
@@ -1356,8 +1387,7 @@ impl RegistryBuilder {
                     }
                 }
                 ((), false)
-            },
-        );
+            });
 
         let mut node_modules_logger: Option<Rc<logging::LogTree>> = None;
         if logger.is_some() && !node_modules_tasks.is_empty() {
@@ -1526,7 +1556,11 @@ impl RegistryBuilder {
         let mut all_results: Vec<BucketBuildResult> = Vec::new();
 
         for task in &node_modules_tasks {
-            let mut br = new_bucket_build_result(task.entry.clone());
+            let entry = task.entry.clone();
+            let mut br = new_bucket_build_result(
+                Box::new(move |bucket: Rc<RegistryBucket>| entry.replace(bucket)),
+                task.entry.key(),
+            );
             // Go: wg.Go(func() {...})
             if task.is_update {
                 self.update_node_modules_bucket(
@@ -1558,9 +1592,9 @@ impl RegistryBuilder {
         }
 
         // Project bucket (not part of the three-phase pipeline — no cross-bucket dedup needed).
-        if let (Some(project), true) = self.projects.get(&project_path) {
-            let program = self.host.get_program_for_project(&project_path);
-            let resolved_package_names = all_resolved_package_names.get(&project_path).cloned();
+        if let (Some(project), true) = self.projects.get(&project_id) {
+            let program = self.host.get_program_for_project(&project_id);
+            let resolved_package_names = all_resolved_package_names.get(&project_id).cloned();
             let project_value = project
                 .value()
                 .unwrap_or_else(|| crate::core::go_nil_dereference());
@@ -1585,14 +1619,23 @@ impl RegistryBuilder {
                 }
             }
             if should_rebuild {
-                let mut br = new_bucket_build_result(project.clone());
+                let entry = project.clone();
+                let mut br = new_bucket_build_result(
+                    Box::new(move |bucket: Rc<RegistryBucket>| entry.replace(bucket)),
+                    (self.base.to_path)(
+                        &program
+                            .as_deref()
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
+                            .get_current_directory(),
+                    ),
+                );
                 // Go: wg.Go(func() {...})
                 self.build_project_bucket(
                     ctx,
                     &mut br,
-                    &project_path,
+                    &project_id,
                     resolved_package_names,
-                    logger.fork(&format!("Building project bucket {project_path}")),
+                    logger.fork(&format!("Building project bucket {}", project_id.string())),
                 );
                 all_results.push(br);
             }
@@ -1613,7 +1656,7 @@ impl RegistryBuilder {
             for (path, entries) in &br.entrypoints {
                 self.entrypoints.set(path.clone(), entries.clone());
             }
-            br.entry.replace(
+            (br.replace_bucket)(
                 br.bucket
                     .clone()
                     .unwrap_or_else(|| crate::core::go_nil_dereference()),
@@ -1649,7 +1692,7 @@ impl RegistryBuilder {
             // order); insertion order here.
             let mut root_files: IndexMap<String, Node> = IndexMap::new();
             for target in targets {
-                for file_name in self.resolve_ambient_module_name(target, &br.entry.key()) {
+                for file_name in self.resolve_ambient_module_name(target, &br.resolution_path) {
                     if should_stop_build(ctx) {
                         return;
                     }
@@ -1664,13 +1707,10 @@ impl RegistryBuilder {
                 }
             }
             if !root_files.is_empty() {
-                let module_resolver = Rc::new(module::new_resolver_with_options(
-                    self.host.clone(),
-                    Rc::new(CompilerOptions::default()),
-                    "",
-                    "",
-                    copy_resolver_options(&self.resolver_options),
-                ));
+                let mut resolver_options = copy_resolver_options(&self.resolver_options);
+                resolver_options.host = Some(self.host.clone());
+                resolver_options.compiler_options = Some(Rc::new(CompilerOptions::default()));
+                let module_resolver = Rc::new(module::new_resolver(resolver_options));
                 let alias_resolver = new_alias_resolver(
                     root_files.values().copied().collect(),
                     FxHashMap::default(),
@@ -1751,7 +1791,10 @@ pub fn has_new_non_node_modules_files(
     }
     let program = program.unwrap_or_else(|| crate::core::go_nil_dereference());
     for file in program.get_source_files() {
-        if file.file_name().contains("/node_modules/") || is_ignored_file(program, file) {
+        if file.is_content_mapper_supplemental()
+            || file.file_name().contains("/node_modules/")
+            || is_ignored_file(program, file)
+        {
             continue;
         }
         if !bucket.paths.contains_key(file.path()) {
@@ -1807,7 +1850,7 @@ pub fn has_symlink_to_node_modules(
     // Fall back to checking ancestor directories
     let directories_by_realpath = symlink_cache.directories_by_realpath();
     let mut found = false;
-    tspath::for_each_ancestor_directory_path(file_path, |dir_path: tspath::Path| -> ((), bool) {
+    file_path.for_each_ancestor_directory(|dir_path: tspath::Path| -> ((), bool) {
         let Some(symlink_paths) =
             directories_by_realpath.get(&dir_path.ensure_trailing_directory_separator())
         else {
@@ -1837,7 +1880,9 @@ pub struct FailedAmbientModuleLookupSource {
 // PORT: Go `error` is `Option<GoError>`; Go nil sync maps and sets are
 // `None`.
 pub struct BucketBuildResult {
-    pub entry: Rc<dirty::MapEntry<tspath::Path, Rc<RegistryBucket>>>,
+    /// Go `replaceBucket func(*RegistryBucket)`.
+    pub replace_bucket: Box<dyn Fn(Rc<RegistryBucket>)>,
+    pub resolution_path: tspath::Path,
     pub err: Option<GoError>,
 
     pub bucket: Option<Rc<RegistryBucket>>,
@@ -1854,12 +1899,14 @@ pub struct BucketBuildResult {
     pub possible_failed_ambient_module_lookup_targets: Option<IndexSet<String>>,
 }
 
-/// Go `&bucketBuildResult{entry: entry}`.
+/// Go `&bucketBuildResult{replaceBucket: .., resolutionPath: ..}`.
 fn new_bucket_build_result(
-    entry: Rc<dirty::MapEntry<tspath::Path, Rc<RegistryBucket>>>,
+    replace_bucket: Box<dyn Fn(Rc<RegistryBucket>)>,
+    resolution_path: tspath::Path,
 ) -> BucketBuildResult {
     BucketBuildResult {
-        entry,
+        replace_bucket,
+        resolution_path,
         err: None,
         bucket: None,
         entrypoints: FxHashMap::default(),
@@ -1878,7 +1925,7 @@ impl RegistryBuilder {
         &self,
         ctx: &Context,
         result: &mut BucketBuildResult,
-        project_path: &tspath::Path,
+        project_id: &ProjectID,
         resolved_package_names: Option<Rc<FxHashSet<String>>>,
         logger: Option<Rc<logging::LogTree>>,
     ) {
@@ -1894,16 +1941,13 @@ impl RegistryBuilder {
             .parsed_auto_import_file_exclude_patterns(
                 self.host.fs().use_case_sensitive_file_names(),
             );
-        let module_resolver = Rc::new(module::new_resolver_with_options(
-            self.host.clone(),
-            Rc::new(CompilerOptions::default()),
-            "",
-            "",
-            copy_resolver_options(&self.resolver_options),
-        ));
+        let mut resolver_options = copy_resolver_options(&self.resolver_options);
+        resolver_options.host = Some(self.host.clone());
+        resolver_options.compiler_options = Some(Rc::new(CompilerOptions::default()));
+        let module_resolver = Rc::new(module::new_resolver(resolver_options));
         let program = self
             .host
-            .get_program_for_project(project_path)
+            .get_program_for_project(project_id)
             .unwrap_or_else(|| crate::core::go_nil_dereference());
         let program = &*program;
         let project_root_path = (self.base.to_path)(&program.get_current_directory());
@@ -1915,7 +1959,7 @@ impl RegistryBuilder {
         let combined_stats = ExtractorStats::default();
 
         for file in program.get_source_files() {
-            if is_ignored_file(program, file) {
+            if file.is_content_mapper_supplemental() || is_ignored_file(program, file) {
                 continue;
             }
             if let Some(file_exclude_patterns) = &file_exclude_patterns {
@@ -2014,7 +2058,7 @@ impl RegistryBuilder {
     pub fn compute_dependencies_for_node_modules_directory(
         &self,
         change: &RegistryChange,
-        all_resolved_package_names: &FxHashMap<tspath::Path, Rc<FxHashSet<String>>>,
+        all_resolved_package_names: &FxHashMap<ProjectID, Rc<FxHashSet<String>>>,
         dir_name: &str,
         dir_path: &tspath::Path,
     ) -> Option<FxHashSet<String>> {
@@ -2830,26 +2874,27 @@ impl RegistryBuilder {
         &self,
         file_path: &tspath::Path,
     ) -> Option<Rc<RefCell<Directory>>> {
-        tspath::for_each_ancestor_directory_path(
-            &file_path.get_directory_path(),
-            |dir_path: tspath::Path| -> (Option<Rc<RefCell<Directory>>>, bool) {
-                if let (Some(dir_entry), true) = self.directories.get(&dir_path) {
-                    let value = dir_entry
-                        .value()
-                        .unwrap_or_else(|| crate::core::go_nil_dereference());
-                    if value
-                        .borrow()
-                        .package_json
-                        .as_ref()
-                        .is_some_and(|p| p.exists())
-                    {
-                        return (Some(value), true);
+        file_path
+            .get_directory_path()
+            .for_each_ancestor_directory(
+                |dir_path: tspath::Path| -> (Option<Rc<RefCell<Directory>>>, bool) {
+                    if let (Some(dir_entry), true) = self.directories.get(&dir_path) {
+                        let value = dir_entry
+                            .value()
+                            .unwrap_or_else(|| crate::core::go_nil_dereference());
+                        if value
+                            .borrow()
+                            .package_json
+                            .as_ref()
+                            .is_some_and(|p| p.exists())
+                        {
+                            return (Some(value), true);
+                        }
                     }
-                }
-                (None, false)
-            },
-        )
-        .0
+                    (None, false)
+                },
+            )
+            .0
     }
 
     // Go: ls/autoimport/registry.go:1819 resolveAmbientModuleName
@@ -2858,9 +2903,8 @@ impl RegistryBuilder {
         module_name: &str,
         from_path: &tspath::Path,
     ) -> Vec<String> {
-        tspath::for_each_ancestor_directory_path(
-            from_path,
-            |dir_path: tspath::Path| -> (Vec<String>, bool) {
+        from_path
+            .for_each_ancestor_directory(|dir_path: tspath::Path| -> (Vec<String>, bool) {
                 if let (Some(bucket), true) = self.node_modules.get(&dir_path) {
                     if let Some(file_names) = bucket
                         .value()
@@ -2872,8 +2916,7 @@ impl RegistryBuilder {
                     }
                 }
                 (Vec::new(), false)
-            },
-        )
-        .0
+            })
+            .0
     }
 }

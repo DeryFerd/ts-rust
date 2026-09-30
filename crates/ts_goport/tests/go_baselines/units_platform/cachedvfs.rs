@@ -248,36 +248,6 @@ fn test_use_case_sensitive_file_names() {
     assert_eq!(7, underlying.calls.borrow().use_case_sensitive_file_names);
 }
 
-// Go: cachedvfs_test.go:251 TestWalkDir
-#[test]
-fn test_walk_dir() {
-    let (underlying, cached) = setup();
-
-    let _ = cached.walk_dir("/some/path", &mut |_, _, _| Ok(()));
-    assert_eq!(1, underlying.calls.borrow().walk_dir.len());
-
-    let _ = cached.walk_dir("/some/path", &mut |_, _, _| Ok(()));
-    assert_eq!(2, underlying.calls.borrow().walk_dir.len());
-
-    cached.clear_cache();
-    let _ = cached.walk_dir("/some/path", &mut |_, _, _| Ok(()));
-    assert_eq!(3, underlying.calls.borrow().walk_dir.len());
-
-    cached.disable_and_clear_cache();
-    let _ = cached.walk_dir("/some/path", &mut |_, _, _| Ok(()));
-    assert_eq!(4, underlying.calls.borrow().walk_dir.len());
-
-    let _ = cached.walk_dir("/some/path", &mut |_, _, _| Ok(()));
-    assert_eq!(5, underlying.calls.borrow().walk_dir.len());
-
-    cached.enable();
-    let _ = cached.walk_dir("/some/path", &mut |_, _, _| Ok(()));
-    assert_eq!(6, underlying.calls.borrow().walk_dir.len());
-
-    let _ = cached.walk_dir("/some/path", &mut |_, _, _| Ok(()));
-    assert_eq!(7, underlying.calls.borrow().walk_dir.len());
-}
-
 // Go: cachedvfs_test.go:286 TestRemove
 #[test]
 fn test_remove() {

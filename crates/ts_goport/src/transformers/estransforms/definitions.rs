@@ -38,6 +38,7 @@ pub fn new_es_next_transformer(opts: &TransformOptions) -> Option<TransformerBox
     )
 }
 
+// 2026: no new downlevel syntax
 // 2025: only module system syntax (import attributes, json modules), untransformed regex modifiers
 // 2024: no new downlevel syntax
 // 2023: no new downlevel syntax
@@ -105,7 +106,8 @@ pub fn get_es_transformer(opts: &TransformOptions) -> Option<TransformerBox> {
     let options = opts.compiler_options;
     match options.get_emit_script_target() {
         ScriptTarget::ES_NEXT => es_decorator_and_class_fields(opts),
-        ScriptTarget::ES2025
+        ScriptTarget::ES2026
+        | ScriptTarget::ES2025
         | ScriptTarget::ES2024
         | ScriptTarget::ES2023
         | ScriptTarget::ES2022

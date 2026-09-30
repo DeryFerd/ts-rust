@@ -1787,14 +1787,17 @@ fn get_mode_for_usage_location_worker(
     {
         let is_type_only = is_exclusively_type_only_import_or_export(parent);
         if is_type_only {
-            let (override_, ok) = parent.attributes().get_resolution_mode_override();
+            let (override_, ok) = parent.attributes().get_resolution_mode_override(None);
             if ok {
                 return override_;
             }
         }
     }
     if is_literal_type_node(parent) && is_import_type_node(parent.parent()) {
-        let (override_, ok) = parent.parent().attributes().get_resolution_mode_override();
+        let (override_, ok) = parent
+            .parent()
+            .attributes()
+            .get_resolution_mode_override(None);
         if ok {
             return override_;
         }
@@ -1861,9 +1864,12 @@ fn get_emit_syntax_for_usage_location_worker(
 
 /// Lazy JSDoc of `node` in `file` (Go `SourceFile.resolveJSDoc`).
 // PORT: the files of an alias resolver program are in no program, or in
-// another program version; `go_frontend` keeps their parser inputs.
+// another program version; `go_frontend` keeps their parser inputs. So
+// does a read with no current program: the api encodes a leased source
+// file (api/session.go encodeLeasedSourceFile, ts#64434) outside any
+// program, and Go's `SourceFile` resolves its JSDoc by itself.
 pub fn resolve_lazy_js_doc(file: Node, node: Node) -> Option<&'static [Node]> {
-    if state().alias_resolver {
+    if crate::core::try_prog().is_none() || state().alias_resolver {
         return go_frontend::resolve_js_doc_outside_program(file, node);
     }
     Some(with_go(|go| go.resolve_js_doc(file, node)))
@@ -1928,7 +1934,7 @@ pub fn get_redirect_for_resolution(file: Node) -> Option<Arc<ResolvedProjectRefe
     with_go(|go| go.get_redirect_for_resolution(file).cloned())
 }
 
-// Go: compiler/projectreferencefilemapper.go:76 getCompilerOptionsForFile
+// Go: compiler/projectreferencefilemapper.go:80 getCompilerOptionsForFile
 // Go: module/resolver.go:145 GetCompilerOptionsWithRedirect
 // Go: compiler/program.go:1519 GetSourceFileMetaData
 // Runs `f` with the options of the project reference that owns the file
@@ -2168,7 +2174,7 @@ pub fn options() -> &'static CompilerOptions {
     &prog().options
 }
 
-// Go: compiler/program.go:508 ContentMapperExtensions (#4712)
+// Go: compiler/program.go:528 ContentMapperExtensions (#4712)
 // PORT: the Go frontend program copies the extensions of its command line
 // (`GoSharedState`), so checker threads can read them. An alias resolver
 // program has none.
@@ -2371,14 +2377,14 @@ pub fn is_emit_blocked(emit_file_name: &str) -> bool {
     with_go(|go| go.is_emit_blocked(emit_file_name))
 }
 
-// Go: compiler/program.go:2132 SourceFileMayBeEmitted
+// Go: compiler/program.go:2210 SourceFileMayBeEmitted
 pub fn source_file_may_be_emitted(source_file: Node, force_dts_emit: bool) -> bool {
     // Go: ls/autoimport/aliasresolver.go:228 (unimplemented)
     alias_resolver_unimplemented();
     source_file_may_be_emitted_worker(source_file, force_dts_emit, false)
 }
 
-// Go: compiler/emitter.go:464 sourceFileMayBeEmitted
+// Go: compiler/emitter.go:493 sourceFileMayBeEmitted
 fn source_file_may_be_emitted_worker(
     source_file: Node,
     force_dts_emit: bool,
@@ -2602,8 +2608,11 @@ pub fn get_output_paths_for_source_file(
 // PORT: the Go frontend loader records the value and its synthetic import
 // (Go `createSyntheticImport`).
 pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
-    // Go: ls/autoimport/aliasresolver.go:173 (unimplemented)
-    alias_resolver_unimplemented();
+    // Go: ls/autoimport/aliasresolver.go:178 GetJSXRuntimeImportSpecifier
+    // (no specifier, ts#64417)
+    if state().alias_resolver {
+        return (String::new(), Node::NIL);
+    }
     with_go(|go| go.get_jsx_runtime_import_specifier(path))
 }
 
@@ -2971,29 +2980,12 @@ pub fn for_each_checker_parallel<R: Send + 'static>(cb: fn(usize, &mut Checker) 
     wait_jobs(receivers)
 }
 
-// Go: compiler/checkerpool.go:136 GetGlobalDiagnostics
-// PORT: split in a send half (this: the `forEachCheckerParallel` jobs) and
-// a wait half (`PendingGlobalDiagnostics::wait`), so that the early emit
-// can send the read behind the check and wait for it later
-// (`start_global_diagnostics`).
-fn pool_start_global_diagnostics() -> PendingGlobalDiagnostics {
-    PendingGlobalDiagnostics(
-        (0..checker_count())
-            .map(|index| send_job(index, |checker| checker.get_global_diagnostics()))
-            .collect(),
-    )
-}
-
-/// A `get_global_diagnostics` read whose checker jobs are sent and not
-/// waited for yet (`start_global_diagnostics`).
-pub struct PendingGlobalDiagnostics(Vec<std::sync::mpsc::Receiver<JobResult<Vec<Diagnostic>>>>);
-
-impl PendingGlobalDiagnostics {
-    /// Waits for every checker. Same result as `get_global_diagnostics`.
-    #[must_use]
-    pub fn wait(self) -> Vec<Diagnostic> {
-        sort_and_deduplicate_diagnostics(wait_jobs(self.0).into_iter().flatten().collect())
-    }
+// Go: compiler/checkerpool.go:462 GetGlobalDiagnostics
+fn pool_get_global_diagnostics() -> Vec<Diagnostic> {
+    let receivers = (0..checker_count())
+        .map(|index| send_job(index, |checker| checker.get_global_diagnostics()))
+        .collect();
+    sort_and_deduplicate_diagnostics(wait_jobs(receivers).into_iter().flatten().collect())
 }
 
 // Go: compiler/checkerpool.go:148 forEachCheckerGroupDo
@@ -3103,7 +3095,7 @@ pub fn collect_checker_diagnostics_with(
     filter_and_sort_diagnostics(diagnostics.into_iter().flatten().collect())
 }
 
-// Go: compiler/program.go:684 filterAndSortDiagnostics (#4712)
+// Go: compiler/program.go:708 filterAndSortDiagnostics (#4712)
 fn filter_and_sort_diagnostics(mut diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
     diags.retain(|diag| {
         let file = diag.file;
@@ -3205,15 +3197,17 @@ pub fn get_semantic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
     })
 }
 
-// Go: compiler/program.go:658 GetSemanticDiagnosticsWithoutNoEmitFiltering
-pub fn get_semantic_diagnostics_without_no_emit_filtering(
+// Go: compiler/program.go:804 GetSemanticDiagnosticsForIncremental
+// GetSemanticDiagnosticsForIncremental includes newly discovered globals in each
+// file's cached diagnostics and leaves noEmit filtering to the builder.
+pub fn get_semantic_diagnostics_for_incremental(
     source_files: &[Node],
 ) -> FxHashMap<Node, Vec<Diagnostic>> {
-    start_semantic_diagnostics_without_no_emit_filtering(source_files).wait()
+    start_semantic_diagnostics_for_incremental(source_files).wait()
 }
 
-/// A `get_semantic_diagnostics_without_no_emit_filtering` check that runs
-/// on the checker threads while the caller goes on.
+/// A `get_semantic_diagnostics_for_incremental` check that runs on the
+/// checker threads while the caller goes on.
 pub struct PendingSemanticDiagnostics(PendingCheckerGroup);
 
 impl PendingSemanticDiagnostics {
@@ -3224,7 +3218,7 @@ impl PendingSemanticDiagnostics {
     }
 
     /// Waits for the check. Same result as
-    /// `get_semantic_diagnostics_without_no_emit_filtering`.
+    /// `get_semantic_diagnostics_for_incremental`.
     #[must_use]
     pub fn wait(self) -> FxHashMap<Node, Vec<Diagnostic>> {
         let files = Arc::clone(&self.0.files);
@@ -3237,15 +3231,20 @@ impl PendingSemanticDiagnostics {
     }
 }
 
-/// Sends the `get_semantic_diagnostics_without_no_emit_filtering` check of
+/// Sends the `get_semantic_diagnostics_for_incremental` check of
 /// `source_files` to the checkers of the current program and returns
 /// without waiting (Go `collectCheckerDiagnosticsFromFiles` with
-/// `getBindAndCheckDiagnosticsForFile`).
-pub fn start_semantic_diagnostics_without_no_emit_filtering(
+/// `getBindAndCheckDiagnosticsWithChecker(.., true /*includeDeferredGlobals*/)`).
+pub fn start_semantic_diagnostics_for_incremental(
     source_files: &[Node],
 ) -> PendingSemanticDiagnostics {
     PendingSemanticDiagnostics(start_checker_group_do(source_files, |c, f| {
-        get_bind_and_check_diagnostics_with_checker(&context::background(), c, f)
+        get_bind_and_check_diagnostics_with_checker(
+            &context::background(),
+            c,
+            f,
+            true, /*includeDeferredGlobals*/
+        )
     }))
 }
 
@@ -3322,20 +3321,15 @@ fn can_include_bind_and_check_diagnostics(source_file: Node) -> bool {
     is_plain_js || is_check_js
 }
 
-// Go: compiler/program.go:1290 GetGlobalDiagnostics
+// Go: compiler/program.go:1455 GetGlobalDiagnostics
+/// Sends one job to each checker of the current program and waits for them.
+/// Each checker runs it after the jobs sent to it before, so the read sees
+/// what those jobs added. Loading thread only.
 pub fn get_global_diagnostics() -> Vec<Diagnostic> {
-    start_global_diagnostics().wait()
-}
-
-/// `get_global_diagnostics` without the wait: sends one job to each checker
-/// of the current program and returns. Each checker runs it after the jobs
-/// sent to it before, so the read sees what those jobs added. Loading
-/// thread only.
-pub fn start_global_diagnostics() -> PendingGlobalDiagnostics {
     if prog().source_file_order.is_empty() {
-        return PendingGlobalDiagnostics(Vec::new());
+        return Vec::new();
     }
-    pool_start_global_diagnostics()
+    pool_get_global_diagnostics()
 }
 
 // Go: compiler/program.go:1302 GetDeclarationDiagnostics
@@ -3503,7 +3497,7 @@ impl crate::frontend::outputpaths::OutputPathsHost for EmitHost {
         common_source_directory().to_string()
     }
 
-    // Go: compiler/emitHost.go:116 emitHost.ContentMapperExtensions (#4712)
+    // Go: compiler/emitHost.go:112 emitHost.ContentMapperExtensions (#4712)
     fn content_mapper_extensions(&self) -> Vec<String> {
         content_mapper_extensions()
     }
@@ -3564,11 +3558,6 @@ impl crate::declarations::DeclarationEmitHost for EmitHost {
     // Go: compiler/emitHost.go:99 emitHost.SourceFileMayBeEmitted (#4712)
     fn source_file_may_be_emitted(&self, file: Node, force_dts_emit: bool) -> bool {
         source_file_may_be_emitted_worker(file, force_dts_emit, false)
-    }
-
-    // Go: compiler/emitHost.go:103 emitHost.GetResolutionModeOverride
-    fn get_resolution_mode_override(&self, node: Node) -> ResolutionMode {
-        self.emit_resolver.get_resolution_mode_override(node)
     }
 
     // Go: compiler/emitHost.go:90 emitHost.GetEffectiveDeclarationFlags
@@ -3650,34 +3639,70 @@ pub fn filter_no_emit_semantic_diagnostics(
     diagnostics
 }
 
-// Go: compiler/program.go:1315 getSemanticDiagnosticsWithChecker
+// Go: compiler/program.go:1480 getSemanticDiagnosticsWithChecker
 pub fn get_semantic_diagnostics_with_checker(
     ctx: &Context,
     c: &mut Checker,
     source_file: Node,
 ) -> Vec<Diagnostic> {
     let mut diags = filter_no_emit_semantic_diagnostics(
-        get_bind_and_check_diagnostics_with_checker(ctx, c, source_file),
+        get_bind_and_check_diagnostics_with_checker(
+            ctx,
+            c,
+            source_file,
+            false, /*includeDeferredGlobals*/
+        ),
         &prog().options,
     );
     diags.extend(get_include_processor_diagnostics(source_file));
     diags
 }
 
-// Go: compiler/program.go:1325 getBindAndCheckDiagnosticsWithChecker
+// Go: compiler/program.go:1490 getBindAndCheckDiagnosticsWithChecker
+// getBindAndCheckDiagnosticsWithChecker gets semantic diagnostics for a single file using a
+// caller-provided checker, including bind diagnostics, checker diagnostics, and handling
+// of @ts-ignore/@ts-expect-error directives.
 pub fn get_bind_and_check_diagnostics_with_checker(
     ctx: &Context,
     file_checker: &mut Checker,
     source_file: Node,
+    include_deferred_globals: bool,
 ) -> Vec<Diagnostic> {
     let compiler_options = &prog().options;
     if skip_type_checking(source_file, false) {
         return Vec::new();
     }
+    let previous_globals = if include_deferred_globals {
+        file_checker.get_global_diagnostics()
+    } else {
+        Vec::new()
+    };
+
     // Checker creation forces binding, so bind diagnostics will be populated.
     bind_all();
     let mut diags = file_bind_data(source_file).bind_diagnostics.clone();
     diags.extend(file_checker.get_diagnostics_exported(ctx, source_file));
+
+    if include_deferred_globals {
+        if file_checker.was_canceled() {
+            return Vec::new();
+        }
+        let current_globals = file_checker.get_global_diagnostics();
+        if current_globals.len() > previous_globals.len() {
+            for diagnostic in current_globals {
+                let (_, found) = crate::gostd::slices::binary_search_func(
+                    &previous_globals,
+                    &diagnostic,
+                    |previous: &Diagnostic, diagnostic: &&Diagnostic| {
+                        compare_diagnostics(previous, diagnostic)
+                    },
+                );
+                if !found {
+                    diags.push(diagnostic);
+                }
+            }
+        }
+    }
 
     let is_plain_js = is_plain_js_file(source_file, compiler_options.check_js);
     if is_plain_js {
@@ -3710,7 +3735,7 @@ pub fn get_bind_and_check_diagnostics_with_checker(
     apply_content_mapper_diagnostic_directives(source_file, filtered)
 }
 
-// Go: compiler/program.go:1493 applyContentMapperDiagnosticDirectives (#4712)
+// Go: compiler/program.go:1543 applyContentMapperDiagnosticDirectives (#4712)
 fn apply_content_mapper_diagnostic_directives(
     source_file: Node,
     diags: Vec<Diagnostic>,
@@ -3721,7 +3746,7 @@ fn apply_content_mapper_diagnostic_directives(
     }
     let mut used = vec![false; directives.len()];
     let mut mark_used = |diag: &Diagnostic| -> bool {
-        if !diag.source().is_empty() {
+        if diag.file != source_file || !diag.source().is_empty() {
             return false;
         }
         for (i, directive) in directives.iter().enumerate() {
@@ -3749,7 +3774,7 @@ fn apply_content_mapper_diagnostic_directives(
     filtered
 }
 
-// Go: compiler/program.go:1359 getDiagnosticsWithPrecedingDirectives
+// Go: compiler/program.go:1579 getDiagnosticsWithPrecedingDirectives
 // PORT: Go returns a map by line; its iteration order is random and the
 // caller sorts the result later. A BTreeMap gives a fixed order.
 fn get_diagnostics_with_preceding_directives(
@@ -3774,6 +3799,10 @@ fn get_diagnostics_with_preceding_directives(
     let mut filtered = Vec::with_capacity(diags.len());
     for diagnostic in diags {
         let mut ignore_diagnostic = false;
+        if diagnostic.file != source_file {
+            filtered.push(diagnostic);
+            continue;
+        }
         let mut line = compute_line_of_position(line_starts, diagnostic.pos) - 1;
         while line >= 0 {
             // If line contains a @ts-ignore or @ts-expect-error directive, ignore this diagnostic and change
@@ -3919,11 +3948,13 @@ pub fn instantiation_count() -> i32 {
     val as i32
 }
 
-// Go: compiler/program.go:1750 GetDiagnosticsOfAnyProgram
+// Go: compiler/program.go:2010 GetDiagnosticsOfAnyProgram
 // PORT: Go calls `program.GetGlobalDiagnostics` and
 // `program.GetDeclarationDiagnostics` directly. They are callbacks here so a
 // caller can guard them the same way as the bind and semantic callbacks.
-// Go nil `files` is `None` (#4699).
+// Go nil `files` is `None` (#4699). `is_compiler_program` is the Go type
+// assertion `program.(*Program)`: true for a plain program, false for an
+// incremental one.
 pub fn get_diagnostics_of_any_program(
     files: Option<&[Node]>,
     skip_no_emit_check_for_dts_diagnostics: bool,
@@ -3931,6 +3962,7 @@ pub fn get_diagnostics_of_any_program(
     get_semantic_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
     get_global_diagnostics: &mut dyn FnMut() -> Vec<Diagnostic>,
     get_declaration_diagnostics: &mut dyn FnMut(Node) -> Vec<Diagnostic>,
+    is_compiler_program: bool,
 ) -> Vec<Diagnostic> {
     // Go `appendDiagnosticsForAllFiles` (a closure over `files`).
     fn append_diagnostics_for_all_files(
@@ -3983,8 +4015,11 @@ pub fn get_diagnostics_of_any_program(
                     &mut all_diagnostics,
                     get_semantic_diagnostics,
                 );
-                // Ask for the global diagnostics again (they were empty above); we may have found new during checking, e.g. missing globals.
-                all_diagnostics.extend(get_global_diagnostics());
+                if is_compiler_program {
+                    // Incremental programs cache checking globals with file diagnostics;
+                    // a late sweep would also collect incidental signature-generation globals.
+                    all_diagnostics.extend(get_global_diagnostics());
+                }
             }
 
             if (skip_no_emit_check_for_dts_diagnostics || options.no_emit.is_true())
@@ -4109,7 +4144,7 @@ fn is_plain_js_error(code: i32) -> bool {
 // Output (Go diagnosticwriter/diagnosticwriter.go, non-pretty)
 // ---------------------------------------------------------------------------
 
-// Go: diagnosticwriter/diagnosticwriter.go:555 WriteFormatDiagnostic
+// Go: diagnosticwriter/diagnosticwriter.go:571 WriteFormatDiagnostic
 // PORT: Go writes to an io.Writer; this returns the text.
 // PORT: Go wraps the diagnostic in `ASTDiagnostic`, whose `File` and `Pos`
 // go through `resolve` (#4712): see `resolve_diagnostic_location`.
@@ -4157,7 +4192,7 @@ struct ResolvedLocation {
     synthesized: bool,  // the range is in virtual code with no corresponding original location
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:90 (*ASTDiagnostic).resolve (#4712)
+// Go: diagnosticwriter/diagnosticwriter.go:97 (*ASTDiagnostic).resolve (#4712)
 // resolve determines where and against which text a diagnostic should be reported. A content mapper's
 // own diagnostics already carry original ranges. A compiler diagnostic on a content-mapped file has its
 // virtual range mapped back to the original; if it falls entirely within synthesized code, there is no
@@ -4206,7 +4241,7 @@ fn ecma_line_and_utf16_character_of_text_position(text: &str, pos: i32) -> (i32,
     (line, character)
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:364 diagnosticPrefix (#4712)
+// Go: diagnosticwriter/diagnosticwriter.go:380 diagnosticPrefix (#4712)
 // diagnosticPrefix returns the prefix shown before a diagnostic's code, e.g. "TS" for compiler
 // diagnostics or a content mapper's custom source for its diagnostics.
 fn diagnostic_prefix(diagnostic: &Diagnostic) -> &str {
@@ -4217,14 +4252,14 @@ fn diagnostic_prefix(diagnostic: &Diagnostic) -> &str {
     "TS"
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:549 WriteFormatDiagnostics
+// Go: diagnosticwriter/diagnosticwriter.go:565 WriteFormatDiagnostics
 pub fn write_format_diagnostics(output: &mut String, diagnostics: &[Diagnostic]) {
     for diagnostic in diagnostics {
         output.push_str(&format_diagnostic(diagnostic));
     }
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:342 WriteFlattenedDiagnosticMessage
+// Go: diagnosticwriter/diagnosticwriter.go:358 WriteFlattenedDiagnosticMessage
 // PORT: this writer has no Go `FormattingOptions`, so the locale is
 // Go `locale.Default` and the text is English (see execute/tsc/diagnostics.rs
 // `write_format_diagnostic`).
@@ -4235,7 +4270,7 @@ fn write_flattened_diagnostic_message(writer: &mut String, diagnostic: &Diagnost
     }
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:130 (*ASTDiagnostic).MessageChain
+// Go: diagnosticwriter/diagnosticwriter.go:146 (*ASTDiagnostic).MessageChain
 // PORT: Go wraps each chain entry in `ASTDiagnostic`; the entries are the
 // diagnostics themselves here.
 fn ast_diagnostic_message_chain(d: &Diagnostic) -> Cow<'_, [Diagnostic]> {
@@ -4254,7 +4289,7 @@ fn ast_diagnostic_message_chain(d: &Diagnostic) -> Cow<'_, [Diagnostic]> {
     Cow::Owned(result)
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:350 flattenDiagnosticMessageChain
+// Go: diagnosticwriter/diagnosticwriter.go:366 flattenDiagnosticMessageChain
 fn flatten_diagnostic_message_chain(
     writer: &mut String,
     chain: &Diagnostic,

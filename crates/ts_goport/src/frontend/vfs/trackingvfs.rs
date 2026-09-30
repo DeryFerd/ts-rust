@@ -83,18 +83,6 @@ impl Fs for FS {
         self.inner.stat(path)
     }
 
-    // Go: trackingvfs.go:65 (*FS).WalkDir
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        self.seen_files.borrow_mut().insert(root.to_string());
-        self.inner.walk_dir(
-            root,
-            &mut |path: &str, d: Option<&DirEntry>, err: Option<FsError>| {
-                self.seen_files.borrow_mut().insert(path.to_string());
-                walk_fn(path, d, err)
-            },
-        )
-    }
-
     // Go: trackingvfs.go:73 (*FS).Realpath
     fn realpath(&self, path: &str) -> String {
         self.seen_files.borrow_mut().insert(path.to_string());

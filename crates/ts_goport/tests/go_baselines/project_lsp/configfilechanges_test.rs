@@ -141,7 +141,7 @@ child_test! {
         let _ = language_service(&session, "file:///src/subfolder/foo.ts");
         assert_eq!(projects_len(&session), 2);
         assert_eq!(
-            default_project_name(&session, "file:///src/subfolder/foo.ts"),
+            default_project_config_file_name(&session, "file:///src/subfolder/foo.ts"),
             "/src/subfolder/tsconfig.json"
         );
 
@@ -150,7 +150,7 @@ child_test! {
 
         let _ = language_service(&session, "file:///src/subfolder/foo.ts");
         assert_eq!(
-            default_project_name(&session, "file:///src/subfolder/foo.ts"),
+            default_project_config_file_name(&session, "file:///src/subfolder/foo.ts"),
             "/src/tsconfig.json"
         );
         assert_eq!(projects_len(&session), 2); // Old project will be cleaned up on next file open

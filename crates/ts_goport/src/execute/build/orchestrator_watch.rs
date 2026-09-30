@@ -10,13 +10,13 @@
 //! the loop keeps a shared borrow while `do_cycle` borrows the orchestrator
 //! mutably, and `do_cycle` only takes shared borrows of the manager.
 //!
-//! PORT: Go `task.reportDone` and `task.done` channels are dropped (see
+//! PORT: Go `task.built` and `task.done` channels are dropped (see
 //! build_task.rs), so the lines that make new ones are left out. Go
 //! `atomic.Bool` flags on one goroutine are plain `bool`s.
 //!
 //! PORT: each project compiles in this process (build_task.rs). A watch
 //! cycle makes new program versions, and each is released when its task
-//! reports. The old program is read from build info, as Go does in build
+//! is built (orchestrator.rs). The old program is read from build info, as Go does in build
 //! mode (buildtask.go:251).
 
 use crate::execute::build::build_task::BuildTask;
@@ -35,12 +35,8 @@ impl Orchestrator {
         self.wm.borrow().lock();
 
         if self.opts.testing.is_none() {
-            if !self
-                .opts
-                .sys
-                .get_environment_variable("TS_WATCH_DEBUG")
-                .is_empty()
-            {
+            let (value, _) = self.opts.sys.get_environment_variable("TS_WATCH_DEBUG");
+            if !value.is_empty() {
                 self.wm.borrow_mut().debug_log = Some(self.opts.sys.writer());
             }
             self.wm.borrow_mut().ensure_default_backend();
@@ -238,7 +234,7 @@ impl Orchestrator {
                 }
             }
 
-            // PORT: Go makes new `task.reportDone` and `task.done` channels
+            // PORT: Go makes new `task.built` and `task.done` channels
             // here (see top).
 
             let new_config = Rc::new(
@@ -263,8 +259,8 @@ impl Orchestrator {
                 {
                     self.range_task(&mut |_path: &Path, task: &Rc<RefCell<BuildTask>>| {
                         task.borrow_mut().reset_status();
-                        // PORT: Go makes new `task.reportDone` and
-                        // `task.done` channels here (see top).
+                        // PORT: Go makes new `task.built` and `task.done`
+                        // channels here (see top).
                     });
                     *needs_update = true;
                     break;
@@ -348,8 +344,8 @@ impl Orchestrator {
                     if mapper.package_directory.is_empty() || !mapper.contribution_id.is_empty() {
                         continue;
                     }
-                    let manifest_path =
-                        fs.realpath(&combine_paths(&mapper.package_directory, &["package.json"]));
+                    // ts#63936: `package_directory` is already a real path.
+                    let manifest_path = combine_paths(&mapper.package_directory, &["package.json"]);
                     let dir = get_directory_path(&manifest_path);
                     if !desired_dirs.covered(&dir) && can_watch_directory(&dir) {
                         desired_dirs.set(&dir, false);
@@ -412,7 +408,7 @@ impl Orchestrator {
             }
         }
 
-        self.wm.borrow().resolve_desired_dirs(desired_dirs.dirs())
+        self.wm.borrow().resolve_desired_dirs(&desired_dirs.dirs())
     }
 
     // Go: build/orchestrator.go:572 (*Orchestrator).addWatchDir
@@ -478,7 +474,7 @@ impl Orchestrator {
             let this: &Orchestrator = self;
             this.range_task(&mut |path: &Path, task: &Rc<RefCell<BuildTask>>| {
                 task.borrow_mut().reset_config(this, path);
-                // PORT: Go makes new `task.reportDone` and `task.done`
+                // PORT: Go makes new `task.built` and `task.done`
                 // channels here (see top).
             });
             needs_config_update = true;
@@ -523,17 +519,26 @@ impl Orchestrator {
         self.wm.borrow().unlock();
     }
 
-    // Go: build/orchestrator.go:688 (*Orchestrator).rangeTask
+    // Go: build/orchestrator.go:919 (*Orchestrator).rangeTask
+    pub(crate) fn range_task(&self, f: &mut dyn FnMut(&Path, &Rc<RefCell<BuildTask>>)) {
+        self.range_tasks(&self.order, f);
+    }
+
+    // Go: build/orchestrator.go:923 (*Orchestrator).rangeTasks (ts#64158)
     // PORT: the build itself uses `build_all_tasks` (orchestrator.rs). The
-    // watch callers pass an `f` that touches only its own task and the host
+    // other callers pass an `f` that touches only its own task and the host
     // caches, so the tasks run one at a time in `order`, the order in which
     // Go's goroutines take them. With `numRoutines <= 0` Go starts no
     // goroutine and runs no task; that is kept.
-    pub(crate) fn range_task(&self, f: &mut dyn FnMut(&Path, &Rc<RefCell<BuildTask>>)) {
+    pub(crate) fn range_tasks(
+        &self,
+        order: &[String],
+        f: &mut dyn FnMut(&Path, &Rc<RefCell<BuildTask>>),
+    ) {
         if self.num_routines() <= 0 {
             return;
         }
-        for config in &self.order {
+        for config in order {
             let path = self.to_path(config);
             let task = self.get_task(&path);
             f(&path, &task);

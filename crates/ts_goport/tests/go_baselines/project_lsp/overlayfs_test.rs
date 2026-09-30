@@ -7,8 +7,11 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::tspath;
+use ts_goport::frontend::vfs::Fs;
 use ts_goport::lsp::lsproto;
-use ts_goport::project::{FileChange, FileChangeKind, FileHandle, OverlayFS, new_overlay_fs};
+use ts_goport::project::{
+    FileChange, FileChangeKind, FileHandle, Overlay, OverlayFS, new_overlay, new_overlay_fs,
+};
 
 use super::util::uri;
 use crate::support::vfstest;
@@ -237,6 +240,39 @@ fn save_without_overlay_should_not_panic() {
     assert!(result.changed.contains(&uri(TEST_URI1)));
 }
 
+// Go: overlayfs_test.go:268 TestProcessChanges/close and change without overlay should not panic (ts#64036)
+#[test]
+fn close_and_change_without_overlay_should_not_panic() {
+    let fs = create_overlay_fs();
+
+    fs.process_changes(&[open_change(
+        TEST_URI1,
+        1,
+        "const x = 1;",
+        lsproto::LanguageKind::TYPE_SCRIPT,
+    )]);
+    fs.process_changes(&[change(FileChangeKind::CLOSE, TEST_URI1)]);
+
+    let (result, _) = fs.process_changes(&[change(FileChangeKind::CLOSE, TEST_URI1)]);
+
+    assert!(result.is_empty());
+
+    let (result, _) = fs.process_changes(&[FileChange {
+        kind: FileChangeKind::CHANGE,
+        uri: uri(TEST_URI1),
+        version: 2,
+        changes: vec![lsproto::TextDocumentContentChangePartialOrWholeDocument {
+            partial: None,
+            whole_document: Some(lsproto::TextDocumentContentChangeWholeDocument {
+                text: "const x = 1;".to_string(),
+            }),
+        }],
+        ..Default::default()
+    }]);
+
+    assert!(result.is_empty());
+}
+
 // Go: overlayfs_test.go:238 TestProcessChanges/close then open in same batch marks as changed
 #[test]
 fn close_then_open_in_same_batch_marks_as_changed() {
@@ -274,4 +310,40 @@ fn close_then_open_in_same_batch_marks_as_changed() {
     // Should have the new content
     let fh = file(&fs, TEST_URI1);
     assert_eq!(fh.content(), "const x = 2;");
+}
+
+// Go: overlayfs_test.go:356 TestOverlayFSFileSystem (ts#64291)
+#[test]
+fn overlay_fs_file_system() {
+    let host = vfstest::from_map(
+        [("/virtual", "host file")],
+        false, /* useCaseSensitiveFileNames */
+    );
+    let mut overlays: IndexMap<tspath::Path, Rc<Overlay>> = IndexMap::default();
+    overlays.insert(
+        tspath::Path("/virtual/nested/file.ts".to_string()),
+        Rc::new(new_overlay(
+            "/virtual/nested/file.ts",
+            "overlay".to_string(),
+            1,
+            ScriptKind::TS,
+        )),
+    );
+    let file_system = new_overlay_fs(
+        host,
+        overlays,
+        lsproto::PositionEncodingKind::UTF16,
+        Rc::new(|file_name: &str| tspath::Path(file_name.to_string())),
+    );
+
+    assert!(Fs::directory_exists(&*file_system, "/virtual"));
+    assert!(!Fs::file_exists(&*file_system, "/virtual"));
+    assert!(Fs::stat(&*file_system, "/virtual").expect("stat").is_dir());
+    let (content, ok) = Fs::read_file(&*file_system, "/virtual/nested/file.ts");
+    assert!(ok);
+    assert_eq!(content, "overlay");
+
+    let root_entries = Fs::get_accessible_entries(&*file_system, "/");
+    assert!(root_entries.directories.contains(&"virtual".to_string()));
+    assert!(!root_entries.files.contains(&"virtual".to_string()));
 }

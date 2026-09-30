@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn generated_catalog_is_complete_and_sorted() {
-        assert_eq!(CATALOG.len(), 2_206);
+        assert_eq!(CATALOG.len(), 2_215);
         assert!(
             CATALOG
                 .windows(2)
@@ -273,9 +273,11 @@ mod tests {
         assert_eq!(deprecated.category(), Category::Suggestion);
         assert!(deprecated.reports_deprecated());
 
-        let native = message_by_code(100_000).unwrap();
+        // Go #63987 moved the native-only messages from 100000 to TS codes.
+        let native = message_by_code(6933).unwrap();
         assert_eq!(native.category(), Category::Message);
         assert_eq!(native.text(), "Do not print diagnostics.");
+        assert!(message_by_code(100_000).is_none());
     }
 
     #[test]

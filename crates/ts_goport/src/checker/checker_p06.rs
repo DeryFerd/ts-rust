@@ -740,6 +740,10 @@ impl Checker {
                 args![],
             );
         }
+        let attributes = node.attributes();
+        if attributes.is_some() {
+            self.check_import_attributes_type(attributes);
+        }
         let is_ambient_external_module = is_ambient_module(node);
         let context_error_message = if is_ambient_external_module {
             diag::An_ambient_module_declaration_is_only_allowed_at_the_top_level_in_a_file
@@ -839,6 +843,13 @@ impl Checker {
         }
         if is_ambient_external_module {
             if is_external_module_augmentation(node) {
+                if attributes.is_some() {
+                    self.error(
+                        attributes,
+                        diag::Import_attributes_are_not_allowed_on_a_module_augmentation,
+                        args![],
+                    );
+                }
                 // body of the augmentation should be checked for consistency only if augmentation was applied to its target (either global scope or module)
                 // otherwise we'll be swamped in cascading errors.
                 // We can detect if augmentation was applied using following rules:
@@ -885,6 +896,54 @@ impl Checker {
                 }
             }
         }
+    }
+
+    // Go: checker/checker.go:5318 checkImportAttributesType
+    pub fn check_import_attributes_type(&mut self, attributes: Node) {
+        self.check_grammar_import_attributes_type(attributes);
+        self.check_source_element(attributes);
+        let import_attributes_type = self.get_global_import_attributes_type_checked();
+        let module_attributes_type =
+            self.get_type_of_module_declaration_import_attributes(attributes);
+        if import_attributes_type != self.empty_object_type {
+            self.check_type_assignable_to(
+                module_attributes_type,
+                import_attributes_type,
+                attributes,
+                None,
+            );
+        }
+    }
+
+    // Go: checker/checker.go:5328 getTypeOfModuleDeclarationImportAttributes
+    pub fn get_type_of_module_declaration_import_attributes(&mut self, attributes: Node) -> TypeId {
+        if attributes.is_nil() {
+            return self.empty_object_type;
+        }
+        self.get_type_from_type_node(attributes)
+    }
+
+    // Go: checker/checker.go:5335 getTypeOfModuleImportAttributes
+    pub fn get_type_of_module_import_attributes(&mut self, symbol: SymbolId) -> TypeId {
+        if let Some(&t) = self.module_import_attributes_types.get(&symbol) {
+            return t;
+        }
+        let result;
+        let module_decl = self
+            .sym(symbol)
+            .declarations
+            .iter()
+            .copied()
+            .find(|&d| is_module_with_string_literal_name(d))
+            .unwrap_or(Node::NIL);
+        if module_decl.is_nil() {
+            result = self.empty_object_type;
+        } else {
+            result =
+                self.get_type_of_module_declaration_import_attributes(module_decl.attributes());
+        }
+        self.module_import_attributes_types.insert(symbol, result);
+        result
     }
 }
 
@@ -979,6 +1038,7 @@ impl Checker {
             );
         }
         if self.check_external_import_or_export_declaration(node) {
+            let attributes = get_import_attributes(node);
             let mut resolved_module = SymbolId::NIL;
             let import_clause = node.import_clause();
             let module_specifier = node.module_specifier();
@@ -1002,8 +1062,14 @@ impl Checker {
                             );
                         }
                     } else {
-                        resolved_module =
-                            self.resolve_external_module_name(node, node.module_specifier(), false);
+                        let import_attributes_type =
+                            self.get_type_from_import_attributes(attributes);
+                        resolved_module = self.resolve_external_module_name(
+                            node,
+                            node.module_specifier(),
+                            false,
+                            import_attributes_type,
+                        );
                         if resolved_module.is_some() {
                             for binding in named_bindings.elements() {
                                 self.check_import_binding(binding);
@@ -1023,7 +1089,15 @@ impl Checker {
                 if !import_clause.is_type_only()
                     && ModuleKind::NODE18 <= self.module_kind
                     && self.module_kind <= ModuleKind::NODE_NEXT
-                    && self.is_only_importable_as_default(module_specifier, resolved_module)
+                    && {
+                        let import_attributes_type =
+                            self.get_type_from_import_attributes(attributes);
+                        self.is_only_importable_as_default(
+                            module_specifier,
+                            resolved_module,
+                            import_attributes_type,
+                        )
+                    }
                     && !has_type_json_import_attribute(node)
                 {
                     let module_kind = self.module_kind.string();
@@ -1046,12 +1120,14 @@ impl Checker {
                         diag::Cannot_find_module_or_type_declarations_for_side_effect_import_of_0,
                     );
                 }
+                let import_attributes_type = self.get_type_from_import_attributes(attributes);
                 self.resolve_external_module_name_worker(
                     node,
                     module_specifier,
                     error_message,
                     ignore_errors,
                     false, /*isForAugmentation*/
+                    import_attributes_type,
                 );
             }
         }
@@ -1102,18 +1178,9 @@ impl Checker {
         if !is_import_equals_declaration(node) {
             let attributes = get_import_attributes(node);
             if attributes.is_some() {
-                let mut has_error = false;
-                for attr in import_attributes_list_p06(attributes) {
-                    if !is_string_literal(attr.value()) {
-                        has_error = true;
-                        self.error(
-                            attr.value(),
-                            diag::Import_attribute_values_must_be_string_literal_expressions,
-                            args![],
-                        );
-                    }
+                if self.check_grammar_import_attribute_values(attributes) {
+                    return false;
                 }
-                return !has_error;
             }
         }
         true
@@ -1183,10 +1250,11 @@ impl Checker {
             let target = self.get_nullable_type(import_attributes_type, TypeFlags::UNDEFINED);
             self.check_type_assignable_to(source, target, node, None);
         }
-        let is_type_only = is_exclusively_type_only_import_or_export(declaration);
+        let is_type_only = is_exclusively_type_only_import_or_export(declaration)
+            || is_import_type_node(declaration);
         let override_ = self.get_resolution_mode_override(node, is_type_only);
-        if is_type_only && override_ != RESOLUTION_MODE_NONE {
-            return; // Other grammar checks do not apply to type-only imports with resolution mode attributes
+        if is_type_only {
+            return; // Other grammar checks do not apply to type-only imports with import attributes
         }
 
         if !self.module_kind.supports_import_attributes() {
@@ -1198,7 +1266,7 @@ impl Checker {
             return;
         }
 
-        let module_specifier = get_module_specifier_from_node(declaration);
+        let module_specifier = get_external_module_name(declaration);
         if module_specifier.is_some() {
             if self.get_emit_syntax_for_module_specifier_expression(module_specifier)
                 == ModuleKind::COMMON_JS
@@ -1212,14 +1280,6 @@ impl Checker {
             }
         }
 
-        if is_type_only {
-            self.grammar_error_on_node(
-                node,
-                diag::Import_attributes_cannot_be_used_with_type_only_imports_or_exports,
-                args![],
-            );
-            return;
-        }
         if override_ != RESOLUTION_MODE_NONE {
             self.grammar_error_on_node(
                 node,
@@ -1229,17 +1289,28 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5425 getTypeFromImportAttributes
+    // Go: checker/checker.go:5575 getTypeFromImportAttributes
     pub fn get_type_from_import_attributes(&mut self, node: Node) -> TypeId {
+        if node.is_nil() {
+            return TypeId::NIL;
+        }
+        if is_import_attributes(node) {
+            return self.check_import_attributes_expression(node);
+        }
+        self.check_expression_cached(node)
+    }
+
+    // Go: checker/checker.go:5585 checkImportAttributesExpression
+    pub fn check_import_attributes_expression(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let symbol = self.new_symbol(
                 SymbolFlags::OBJECT_LITERAL,
                 INTERNAL_SYMBOL_NAME_IMPORT_ATTRIBUTES,
             );
             let members = self.symbols.new_table();
-            for attr in import_attributes_list_p06(node) {
-                let member = self.new_symbol(SymbolFlags::PROPERTY, attr.name().text());
-                let value_type = self.check_expression(attr.value());
+            for attribute in import_attributes_list_p06(node) {
+                let member = self.new_symbol(SymbolFlags::PROPERTY, attribute.name().text());
+                let value_type = self.check_expression_cached(attribute.value());
                 let resolved_type = self.get_regular_type_of_literal_type(value_type);
                 self.value_symbol_links.get(member).resolved_type = resolved_type;
                 let member_name = self.sym(member).name.clone();
@@ -1251,6 +1322,26 @@ impl Checker {
             self.type_node_links.get(node).resolved_type = t;
         }
         self.type_node_links.get(node).resolved_type
+    }
+
+    // Go: checker/checker.go:5599 getImportAttributesTypeForModuleSpecifier
+    pub fn get_import_attributes_type_for_module_specifier(
+        &mut self,
+        module_specifier: Node,
+    ) -> TypeId {
+        let parent = module_specifier.parent();
+        if is_import_declaration_or_js_import_declaration(parent) || is_export_declaration(parent) {
+            return self.get_type_from_import_attributes(get_import_attributes(parent));
+        }
+        if is_literal_type_node(parent) && is_literal_import_type_node(parent.parent()) {
+            return self.get_type_from_import_attributes(get_import_attributes(parent.parent()));
+        }
+        if is_import_call(parent) && parent.arguments().len() > 1 {
+            let options = parent.arguments().get(1);
+            let options_type = self.check_expression_cached(options);
+            return self.get_type_of_property_of_type(options_type, "with");
+        }
+        TypeId::NIL
     }
 
     // Go: checker/checker.go:5442 checkImportEqualsDeclaration
@@ -1384,8 +1475,14 @@ impl Checker {
             } else {
                 // export * from "foo"
                 // export * as ns from "foo";
-                let module_symbol =
-                    self.resolve_external_module_name(node, module_specifier, false);
+                let import_attributes_type =
+                    self.get_type_from_import_attributes(get_import_attributes(node));
+                let module_symbol = self.resolve_external_module_name(
+                    node,
+                    module_specifier,
+                    false,
+                    import_attributes_type,
+                );
                 if module_symbol.is_some() && self.has_export_assignment_symbol(module_symbol) {
                     let s = self.symbol_to_string(module_symbol);
                     self.error(
@@ -1426,7 +1523,12 @@ impl Checker {
         }
         let module_name = get_external_module_name(node);
         if module_name.is_some() {
-            self.resolve_external_module_name(node, module_name, false);
+            let mut attributes = Node::NIL;
+            if has_import_attributes(node) {
+                attributes = get_import_attributes(node);
+            }
+            let import_attributes_type = self.get_type_from_import_attributes(attributes);
+            self.resolve_external_module_name(node, module_name, false, import_attributes_type);
         }
     }
 

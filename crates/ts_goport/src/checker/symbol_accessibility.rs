@@ -286,8 +286,16 @@ impl Checker {
                     // Synthetic names can't be resolved by `resolveExternalModuleName` - they'll cause a debug assert if they error
                     continue;
                 }
-                let resolved_module =
-                    self.resolve_external_module_name(enclosing_declaration, import_ref, true);
+                let resolved_module = {
+                    let import_attributes_type =
+                        self.get_import_attributes_type_for_module_specifier(import_ref);
+                    self.resolve_external_module_name(
+                        enclosing_declaration,
+                        import_ref, /*ignoreErrors*/
+                        true,
+                        import_attributes_type,
+                    )
+                };
                 if resolved_module.is_nil() {
                     continue;
                 }

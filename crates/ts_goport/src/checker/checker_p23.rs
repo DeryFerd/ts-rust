@@ -1228,7 +1228,7 @@ impl Checker {
                 c.global_array_type
             };
             let type_parameter = c.ty(array_type).as_interface_type().type_parameters()[0];
-            c.mapper_map(u_mapper, type_parameter)
+            c.get_mapped_type(type_parameter, u_mapper)
         });
         let readonly = self.some_type(t, &mut |c: &mut Checker, u: TypeId| {
             let u_parent = c.sym(c.ty(u).symbol).parent;

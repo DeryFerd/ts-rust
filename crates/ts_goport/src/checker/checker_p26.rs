@@ -494,14 +494,14 @@ impl Checker {
     // Go: checker/checker.go:23428 isMutableArrayLikeType
     pub fn is_mutable_array_like_type(&mut self, t: TypeId) -> bool {
         // A type is mutable-array-like if it is a reference to the global Array type, or if it is not the
-        // any, undefined or null type and if it is assignable to Array<any>
+        // any, undefined, null or never type and if it is assignable to Array<any>
         if self.is_mutable_array_or_tuple(t) {
             return true;
         }
         if self
             .ty(t)
             .flags
-            .intersects(TypeFlags::ANY | TypeFlags::NULLABLE)
+            .intersects(TypeFlags::ANY | TypeFlags::NULLABLE | TypeFlags::NEVER)
         {
             return false;
         }

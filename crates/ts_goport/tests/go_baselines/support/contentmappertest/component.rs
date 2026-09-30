@@ -55,6 +55,20 @@ impl ComponentWriter {
             features: Feature::ALL,
         });
     }
+
+    // Go: component.go:55 writeAnchored
+    fn write_anchored(&mut self, text: &str, original_position: usize, features: Feature) {
+        let virtual_start = self.virtual_.len() as i32;
+        self.virtual_.push_str(text);
+        self.segments.push(Segment {
+            virtual_start,
+            virtual_end: self.virtual_.len() as i32,
+            original_start: original_position as i32,
+            original_end: original_position as i32,
+            kind: Kind::ATOM,
+            features,
+        });
+    }
 }
 
 // Go: component.go:36 transformComponent
@@ -125,13 +139,17 @@ fn transform_component(content: &str) -> Result<(String, JsonValue), GoError> {
         );
         w.write_synthesized(" {}\n");
     }
-    w.write_synthesized("export default {};\n");
+    w.write_anchored(
+        "export default {};\n",
+        0,
+        Feature::DEFINITION | Feature::REFERENCES,
+    );
 
     let mappings = spanmap::new(&w.segments).marshal()?;
     Ok((w.virtual_, JsonValue(mappings)))
 }
 
-// Go: component.go:115 componentNameRange
+// Go: component.go:127 componentNameRange
 fn component_name_range(content: &str) -> Option<(usize, usize)> {
     let component_start = content.find("<component")?;
     let tag_end_rel = content[component_start..].find('>')?;
@@ -142,12 +160,12 @@ fn component_name_range(content: &str) -> Option<(usize, usize)> {
     Some((start, start + end_rel))
 }
 
-// Go: component.go:137 isIdentifierStart
+// Go: component.go:149 isIdentifierStart
 fn is_identifier_start(ch: u8) -> bool {
     ch == b'_' || ch == b'$' || ch.is_ascii_uppercase() || ch.is_ascii_lowercase()
 }
 
-// Go: component.go:141 isIdentifierPart
+// Go: component.go:153 isIdentifierPart
 fn is_identifier_part(ch: u8) -> bool {
     is_identifier_start(ch) || ch.is_ascii_digit()
 }

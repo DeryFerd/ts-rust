@@ -1,6 +1,6 @@
 //! Port of Go `ast/ast.go` parts that the language service needs:
 //! lines 2405-2450 (`SourceFileDataKey`, `NewSourceFileDataKey`,
-//! `GetOrComputeSourceFileData`, `getSourceFileDataCell`), 2462-2465
+//! `(*SourceFile).GetOrComputeData`, `(*SourceFile).getDataCell`), 2462-2465
 //! (`TokenCacheKey`) and 2776-2838 (`(*SourceFile).GetOrCreateToken`,
 //! `createToken`).
 //!
@@ -78,23 +78,23 @@ pub fn new_source_file_data_key<T>() -> SourceFileDataKey<T> {
     }
 }
 
-// Go: ast/ast.go:2425 GetOrComputeSourceFileData
+// Go: ast/ast.go:2404 (*SourceFile).GetOrComputeData (ts#63902)
 // PORT: Go `compute func(*SourceFile) T` is `FnOnce(Node) -> T`; the value
 // is returned by clone (Go copies `T`; callers use `Rc` or `Copy` values).
 // `compute` runs without any thread-local borrow held, so it can read other
 // data keys of the same file.
-pub fn get_or_compute_source_file_data<T: Clone + 'static>(
+pub fn source_file_get_or_compute_data<T: Clone + 'static>(
     file: Node,
     key: &SourceFileDataKey<T>,
     compute: impl FnOnce(Node) -> T,
 ) -> T {
-    let cell = get_source_file_data_cell(file, key);
+    let cell = source_file_get_data_cell(file, key);
     cell.value.get_or_init(|| compute(file)).clone()
 }
 
-// Go: ast/ast.go:2433 getSourceFileDataCell
+// Go: ast/ast.go:2412 (*SourceFile).getDataCell (ts#63902)
 // PORT: a Rust reference cannot be nil, so only `key.key == 0` is checked.
-fn get_source_file_data_cell<T: 'static>(
+fn source_file_get_data_cell<T: 'static>(
     file: Node,
     key: &SourceFileDataKey<T>,
 ) -> Rc<SourceFileDataCell<T>> {

@@ -255,8 +255,9 @@ impl Checker {
                         .iter()
                         .any(|&d| has_non_global_augmentation_external_module_symbol(d))
                     {
-                        let name =
-                            self.get_specifier_for_module_symbol(b, parent, ResolutionMode::NONE);
+                        let name = self
+                            .get_specifier_for_module_symbol(b, parent, ResolutionMode::NONE)
+                            .specifier;
                         parent_specifiers.push(SortedSymbolNamePair { sym: parent, name });
                     } else {
                         parent_specifiers.push(SortedSymbolNamePair {
@@ -359,7 +360,7 @@ impl Checker {
         self.compare_symbols(a.sym, b.sym) // must sort symbols for stable ordering
     }
 
-    // Go: checker/nodebuilderimpl.go:1232 getSpecifierForModuleSymbol
+    // Go: checker/nodebuilderimpl.go:1244 getSpecifierForModuleSymbol
     // PORT: the specifier cache key is `(path, mode)` for Go
     // `module.ModeAwareCacheKey{Name, Mode}`.
     pub fn get_specifier_for_module_symbol(
@@ -367,7 +368,20 @@ impl Checker {
         b: &Nb,
         symbol: SymbolId,
         override_import_mode: ResolutionMode,
-    ) -> String {
+    ) -> ModuleSpecifierResult {
+        let e = nb_e(b);
+        let enclosing_declaration = e.most_original(nb_enclosing_declaration(b));
+        let mut original_module_specifier = Node::NIL;
+        if can_have_module_specifier(enclosing_declaration) {
+            original_module_specifier =
+                try_get_module_specifier_from_declaration(enclosing_declaration);
+        }
+        let mut original_import_attributes_type = TypeId::NIL;
+        if original_module_specifier.is_some() {
+            original_import_attributes_type =
+                self.get_import_attributes_type_for_module_specifier(original_module_specifier);
+        }
+
         let mut file = get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::SourceFile);
         if file.is_nil() {
             let declarations = self.sym(symbol).declarations.clone();
@@ -389,25 +403,57 @@ impl Checker {
         }
 
         let symbol_name = self.sym(symbol).name.clone();
-        if file.is_nil() && is_ambient_module_symbol_name(&symbol_name) {
-            return strip_quotes(&symbol_name);
+        if file.is_nil() {
+            let declaration = self
+                .sym(symbol)
+                .declarations
+                .iter()
+                .copied()
+                .find(|&d| is_module_with_string_literal_name(d))
+                .unwrap_or(Node::NIL);
+            if declaration.is_some() {
+                let specifier = declaration.name().text().to_string();
+                if original_import_attributes_type.is_some()
+                    && self.module_specifier_resolves_to_symbol(
+                        b,
+                        &specifier,
+                        original_import_attributes_type,
+                        symbol,
+                    )
+                {
+                    return ModuleSpecifierResult {
+                        specifier,
+                        import_attributes_type: original_import_attributes_type,
+                    };
+                }
+                let import_attributes_type = self.get_type_of_module_import_attributes(symbol);
+                return ModuleSpecifierResult {
+                    specifier,
+                    import_attributes_type,
+                };
+            }
+            if let Some(specifier) = try_get_ambient_module_name_from_symbol_name(&symbol_name) {
+                return ModuleSpecifierResult {
+                    specifier: specifier.to_string(),
+                    import_attributes_type: TypeId::NIL,
+                };
+            }
         }
         let enclosing_file = nb_enclosing_file(b);
         if enclosing_file.is_nil() {
-            if is_ambient_module_symbol_name(&symbol_name) {
-                return strip_quotes(&symbol_name);
+            if let Some(specifier) = try_get_ambient_module_name_from_symbol_name(&symbol_name) {
+                return ModuleSpecifierResult {
+                    specifier: specifier.to_string(),
+                    import_attributes_type: TypeId::NIL,
+                };
             }
-            return source_file_file_name(get_source_file_of_module(&self.symbols, symbol))
-                .to_string();
+            return ModuleSpecifierResult {
+                specifier: source_file_file_name(get_source_file_of_module(&self.symbols, symbol))
+                    .to_string(),
+                import_attributes_type: TypeId::NIL,
+            };
         }
 
-        let e = nb_e(b);
-        let enclosing_declaration = e.most_original(nb_enclosing_declaration(b));
-        let mut original_module_specifier = Node::NIL;
-        if can_have_module_specifier(enclosing_declaration) {
-            original_module_specifier =
-                try_get_module_specifier_from_declaration(enclosing_declaration);
-        }
         let context_file = enclosing_file;
         let mut resolution_mode = override_import_mode;
         if resolution_mode == ResolutionMode::NONE && original_module_specifier.is_some() {
@@ -416,13 +462,19 @@ impl Checker {
             resolution_mode = get_default_resolution_mode_for_file(context_file);
         }
         let cache_key = (source_file_info(context_file).path.clone(), resolution_mode);
-        {
+        let cached = {
             let mut nb = b.borrow_mut();
             let links = nb.symbol_links.get(symbol);
             let cache = links.specifier_cache.get_or_insert_with(FxHashMap::default);
-            if let Some(result) = cache.get(&cache_key) {
-                return result.clone();
-            }
+            cache.get(&cache_key).cloned()
+        };
+        if let Some(result) = cached {
+            return self.module_specifier_result_for_symbol(
+                b,
+                result,
+                original_import_attributes_type,
+                symbol,
+            );
         }
         // For declaration bundles, we need to generate absolute paths relative to the common source dir for imports,
         // just like how the declaration emitter does for the ambient module declarations - we can easily accomplish this
@@ -430,7 +482,7 @@ impl Checker {
         // specifier preference
         // PORT: Go uses `b.ctx.host`, which is the program. The program state
         // is global here, so `ProgramHost` has no fields.
-        let all_specifiers: Vec<String> = {
+        let module_specifiers_result = {
             use crate::modulespecifiers as ms;
             let host = ms::ProgramHost;
             let specifier_compiler_options = self.compiler_options;
@@ -456,19 +508,139 @@ impl Checker {
                 false, /*forAutoImports*/
             )
         };
-        let mut nb = b.borrow_mut();
-        let cache = nb
+        debug_assert!(!module_specifiers_result.specifiers.is_empty());
+        let mut result = ModuleSpecifierResult {
+            specifier: module_specifiers_result.specifiers[0].clone(),
+            import_attributes_type: TypeId::NIL,
+        };
+        if module_specifiers_result.ambient_module_symbol.is_some() {
+            result.import_attributes_type = self.get_type_of_module_import_attributes(
+                module_specifiers_result.ambient_module_symbol,
+            );
+        }
+        b.borrow_mut()
             .symbol_links
             .get(symbol)
             .specifier_cache
-            .get_or_insert_with(FxHashMap::default);
-        if all_specifiers.is_empty() {
-            cache.insert(cache_key, String::new());
-            return String::new();
+            .get_or_insert_with(FxHashMap::default)
+            .insert(cache_key, result.clone());
+        self.module_specifier_result_for_symbol(b, result, original_import_attributes_type, symbol)
+    }
+
+    // Go: checker/nodebuilderimpl.go:1336 moduleSpecifierResultForSymbol
+    pub fn module_specifier_result_for_symbol(
+        &mut self,
+        b: &Nb,
+        mut result: ModuleSpecifierResult,
+        import_attributes_type: TypeId,
+        symbol: SymbolId,
+    ) -> ModuleSpecifierResult {
+        if import_attributes_type.is_some()
+            && self.module_specifier_resolves_to_symbol(
+                b,
+                &result.specifier,
+                import_attributes_type,
+                symbol,
+            )
+        {
+            result.import_attributes_type = import_attributes_type;
         }
-        let specifier = all_specifiers[0].clone();
-        cache.insert(cache_key, specifier.clone());
-        specifier
+        result
+    }
+
+    // Go: checker/nodebuilderimpl.go:1343 moduleSpecifierResolvesToSymbol
+    pub fn module_specifier_resolves_to_symbol(
+        &mut self,
+        b: &Nb,
+        specifier: &str,
+        import_attributes_type: TypeId,
+        symbol: SymbolId,
+    ) -> bool {
+        let mut location = nb_enclosing_declaration(b);
+        let enclosing_file = nb_enclosing_file(b);
+        if location.is_nil() && enclosing_file.is_some() {
+            location = enclosing_file;
+        }
+        if location.is_nil() {
+            return false;
+        }
+        let resolved = self.resolve_external_module(
+            location,
+            specifier,
+            None,
+            Node::NIL,
+            false, /*isForAugmentation*/
+            import_attributes_type,
+        );
+        resolved.is_some() && self.get_merged_symbol(resolved) == self.get_merged_symbol(symbol)
+    }
+
+    // Go: checker/nodebuilderimpl.go:1355 createImportAttributesForModuleSpecifier
+    pub fn create_import_attributes_for_module_specifier(
+        &mut self,
+        b: &Nb,
+        result: &ModuleSpecifierResult,
+        import_mode_override: ResolutionMode,
+    ) -> Node {
+        let is_empty_attributes_type = result.import_attributes_type.is_nil()
+            || self.is_empty_object_type(result.import_attributes_type);
+        if is_empty_attributes_type && import_mode_override == ResolutionMode::NONE {
+            return Node::NIL;
+        }
+
+        let mut properties: Vec<SymbolId> = Vec::new();
+        if !is_empty_attributes_type {
+            properties = self
+                .get_properties_of_type(result.import_attributes_type)
+                .to_vec();
+        }
+        // PORT: Go `strings.Compare` on the names; the port form compares the
+        // same way for these names.
+        properties.sort_by(|&x, &y| self.sym(x).name.as_str().cmp(self.sym(y).name.as_str()));
+        let e = nb_e(b);
+        let f = &e.factory;
+        let mut attributes: Vec<Node> = Vec::with_capacity(properties.len() + 1);
+        if import_mode_override != ResolutionMode::NONE {
+            let resolution_mode = if import_mode_override == ResolutionMode::ESM {
+                "import"
+            } else {
+                "require"
+            };
+            let name = self.nb_new_string_literal(b, "resolution-mode");
+            let value = self.nb_new_string_literal(b, resolution_mode);
+            attributes.push(f.new_import_attribute(name, value));
+            nb_add_approximate_length(
+                b,
+                (go_len("resolution-mode") + go_len(resolution_mode) + 6) as i32,
+            ); // `"resolution-mode": "value"`
+        }
+        for property in properties {
+            let name = self.sym(property).name.as_str().to_string();
+            let property_type = self.get_type_of_symbol(property);
+            if !self
+                .ty(property_type)
+                .flags
+                .intersects(TypeFlags::STRING_LITERAL)
+            {
+                continue;
+            }
+            let value = self.get_string_literal_value(property_type);
+            let name_node;
+            if is_identifier_text(&name, LanguageVariant::STANDARD) {
+                name_node = f.new_identifier(&name);
+            } else {
+                name_node = self.nb_new_string_literal(b, &name);
+                nb_add_approximate_length(b, 2);
+            }
+            let value_node = self.nb_new_string_literal(b, &value);
+            attributes.push(f.new_import_attribute(name_node, value_node));
+            nb_add_approximate_length(b, (go_len(&name) + go_len(&value) + 4) as i32); // `name: "value"`
+        }
+        if attributes.is_empty() {
+            return Node::NIL;
+        }
+        nb_add_approximate_length(b, 16 + 2 * (attributes.len() as i32 - 1)); // `, { with: { , ... , } }`
+        f.new_import_attributes(SyntaxKind::WithKeyword, f.new_node_list(&attributes), false)
     }
 
     // Go: checker/nodebuilderimpl.go:1312 typeParameterToDeclarationWithConstraint

@@ -852,6 +852,15 @@ impl Checker {
         let property = properties.get(property_index as usize);
         if is_property_assignment(property) || is_shorthand_property_assignment(property) {
             let name = property.name();
+
+            if name.is_some() && is_private_identifier(name) {
+                self.grammar_error_on_node(
+                    name,
+                    diag::Private_identifiers_cannot_be_used_in_destructuring_patterns,
+                    args![],
+                );
+            }
+
             let expr_type = self.get_literal_type_from_property_name(name);
             if self.is_type_usable_as_property_name(expr_type) {
                 let text = self.get_property_name_from_type(expr_type);

@@ -64,15 +64,24 @@ impl LanguageService {
             position,
             Feature::SIGNATURE_HELP,
         );
-        if positions.is_empty() || !positions[0].fidelity.is_single_segment() {
-            return Ok(lsproto::SignatureHelpOrNull::default());
+        for projection in &positions {
+            if !projection.fidelity.is_single_segment() {
+                continue;
+            }
+            let items = self.get_signature_help_items(
+                ctx,
+                projection.position,
+                program,
+                projection.script,
+                context,
+            );
+            if items.is_some() {
+                return Ok(lsproto::SignatureHelpOrNull {
+                    signature_help: items,
+                });
+            }
         }
-        let source_file = positions[0].script;
-        let pos = positions[0].position;
-        let items = self.get_signature_help_items(ctx, pos, program, source_file, context);
-        Ok(lsproto::SignatureHelpOrNull {
-            signature_help: items,
-        })
+        Ok(lsproto::SignatureHelpOrNull::default())
     }
 
     // Go: ls/signaturehelp.go:57 GetSignatureHelpItems

@@ -79,6 +79,8 @@ pub(crate) fn new_program_with_config(
             single_threaded: Tristate::Unknown,
             typings_location: String::new(),
             project_name: String::new(),
+            create_module_resolver: None,
+            skip_module_resolution: false,
         },
         None,
     )

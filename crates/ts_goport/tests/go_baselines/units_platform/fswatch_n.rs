@@ -14,6 +14,13 @@
 //! the tests read the watch's dirWatch from the watcher's `dir_watches`.
 //! The two FSEvents tests of #4495 (`fsevents_darwin_shared_test.go`) are
 //! darwin only and are not ported.
+//!
+//! ts#64210 adds the path comparer tests of `watcher_test.go`
+//! (`TestPathComparer`, `TestPathComparerUnicodeAlignment`,
+//! `TestFileCallbackCaseSensitivity`, `TestPathComparerExactKeys`). Its
+//! darwin tests (`fsevents_darwin_nfd_test.go`,
+//! `fsevents_darwin_shared_test.go`) need CoreFoundation folding and a
+//! volume query, which the port does not have, and are not ported.
 #![cfg(target_os = "linux")]
 
 use std::cell::RefCell;
@@ -23,14 +30,17 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use ts_goport::fswatch::fanotify_linux::{fanotify_available, new_fanotify_backend};
+use ts_goport::fswatch::pathcompare::{ComparisonPath, PathComparer, equal_fold};
+use ts_goport::fswatch::pathkey::PathComparerExported;
 use ts_goport::fswatch::walkdir_unix::walk_dir;
 use ts_goport::fswatch::{
-    self, Callback, DirWatch, Event, EventKind, EventList, MAX_WAIT_TIME,
+    self, Callback, DirWatch, Event, EventKind, EventList, MAX_WAIT_TIME, NATIVE_PATH_FOLDING,
     RECURSIVE_CONSOLIDATE_THRESHOLD, Watch, WatchCallback, Watcher, WatcherBase, WatcherImpl,
-    WatcherStruct, is_in_directory_or_self, new_debounce, new_dir_watch, new_watcher,
-    physical_dir_for, rebase_path, walk_dir_generic, with_recursive,
+    WatcherStruct, is_in_directory_or_self, join_path_suffix, new_debounce, new_dir_watch,
+    new_watcher, physical_dir_for, rebase_path, walk_dir_generic, with_recursive,
 };
 use ts_goport::gostd::{GoError, errors};
+use ts_goport::scanner_util::go_string_from_bytes;
 
 use super::Failures;
 use super::fswatch_watcher::{TmpDir, new_tmp_dir};
@@ -110,7 +120,13 @@ impl Drop for Direct {
 // PORT: Go sets `physicalDir` after `newDirWatch` in one test; the Rust
 // field is set at creation, so it is a parameter here.
 fn new_direct_watcher(dir: &str, physical_dir: &str) -> Direct {
-    Direct(new_dir_watch(dir, physical_dir, new_debounce(), true))
+    Direct(new_dir_watch(
+        dir,
+        physical_dir,
+        new_debounce(),
+        true,
+        PathComparer::default(),
+    ))
 }
 
 /// A callback that keeps its events and errors (the test callbacks of the
@@ -361,6 +377,187 @@ fn test_event_list_drain_for_sequences() {
 }
 
 // ----- watcher_test.go: path helpers -------------------------------------
+
+// Go: watcher_test.go:578 TestPathComparer (ts#64210)
+#[test]
+fn test_path_comparer() {
+    // (root, path, suffix, exact, ignoreCase)
+    let tests: [(&str, &str, &str, bool, bool); 30] = [
+        ("/root", "/root", "", true, true),
+        ("/root", "/root/file.ts", "/file.ts", true, true),
+        ("/root", "/ROOT", "", false, true),
+        ("/root", "/ROOT/File.ts", "/File.ts", false, true),
+        (
+            "/root",
+            "/ROOT/Nested/File.ts",
+            "/Nested/File.ts",
+            false,
+            true,
+        ),
+        ("/root", "/ROOT2/File.ts", "", false, false),
+        ("/root", "/roo", "", false, false),
+        ("/root/sub", "/ROOT", "", false, false),
+        ("/root", "/other/File.ts", "", false, false),
+        ("/root", "/ROOTish/File.ts", "", false, false),
+        ("/root/sub", "/ROOT/SUB", "", false, true),
+        ("/root/sub", "/ROOT/su", "", false, false),
+        ("/root/[", "/ROOT/{/File.ts", "", false, false),
+        ("/root/@", "/ROOT/`/File.ts", "", false, false),
+        ("/", "/File.ts", "File.ts", true, true),
+        ("/", "/", "", true, true),
+        ("", "", "", false, false),
+        ("", "/File.ts", "", false, false),
+        (
+            "/caf\u{00e9}",
+            "/CAF\u{00c9}/File.ts",
+            "/File.ts",
+            false,
+            true,
+        ),
+        ("/s", "/\u{017f}/File.ts", "/File.ts", false, true),
+        ("/\u{017f}", "/S/File.ts", "/File.ts", false, true),
+        ("/s/sub", "/\u{017f}/SUB/File.ts", "/File.ts", false, true),
+        ("/\u{017f}/sub", "/S/SUB/File.ts", "/File.ts", false, true),
+        ("/s", "/\u{017f}oo/File.ts", "", false, false),
+        ("/k", "/\u{212a}/File.ts", "/File.ts", false, true),
+        ("/\u{03c3}", "/\u{03c2}/File.ts", "/File.ts", false, true),
+        ("/\u{00e9}", "/\u{00c8}/File.ts", "", false, false),
+        (
+            "/\u{00df}",
+            "/SS/File.ts",
+            "/File.ts",
+            false,
+            NATIVE_PATH_FOLDING,
+        ),
+        ("/root/s", "/ROOT/\u{017f}/File.ts", "/File.ts", false, true),
+        ("/root/\u{017f}", "/ROOT/S", "", false, true),
+    ];
+    let mut failures = Failures::new("TestPathComparer");
+    for (root, path, want_suffix, exact, ignore_case_want) in tests {
+        for ignore_case in [false, true] {
+            let comparer = PathComparer { ignore_case };
+            let want = if ignore_case { ignore_case_want } else { exact };
+            let name = format!("({root:?}, {path:?}), ignoreCase={ignore_case}");
+            let (suffix, ok) = comparer.suffix(root, path);
+            if ok != want || ok && suffix != want_suffix {
+                failures.fail(
+                    &format!("suffix{name}"),
+                    format!("got ({suffix:?}, {ok}), want ({want_suffix:?}, {want})"),
+                );
+            }
+            if comparer.contains(root, path) != want {
+                failures.fail(&format!("contains{name}"), format!("want {want}"));
+            }
+            for to in ["/display", "/"] {
+                let (rebased, ok) = comparer.rebase(path, root, to);
+                if ok != want || ok && rebased != join_path_suffix(to, want_suffix) {
+                    failures.fail(
+                        &format!("rebase{name} to {to:?}"),
+                        format!("got ({rebased:?}, {ok})"),
+                    );
+                }
+            }
+        }
+    }
+    failures.finish();
+}
+
+// Go: watcher_test.go:642 TestPathComparerUnicodeAlignment (ts#64210)
+// PORT: the malformed parts ("\xff", "\xfe", "\xc3") are Go strings in the
+// port form (`go_string_from_bytes`), and `strings.EqualFold` is
+// `pathcompare::equal_fold`.
+#[test]
+fn test_path_comparer_unicode_alignment() {
+    let mut parts: Vec<String> = [
+        "s",
+        "S",
+        "\u{017f}",
+        "k",
+        "K",
+        "\u{212a}",
+        "\u{03c3}",
+        "\u{03c2}",
+        "\u{00e9}",
+        "\u{00c9}",
+        "\u{00c8}",
+        "\u{10400}",
+        "\u{10428}",
+    ]
+    .iter()
+    .map(|part| part.to_string())
+    .collect();
+    for byte in [0xffu8, 0xfe, 0xc3] {
+        parts.push(go_string_from_bytes(vec![byte]));
+    }
+    let comparer = PathComparer { ignore_case: true };
+    for padding in 0..16 {
+        let prefix = format!("/{}", "a".repeat(padding));
+        for a in &parts {
+            for b in &parts {
+                for child in ["", "/child"] {
+                    let root = format!("{prefix}{a}{child}");
+                    let path = format!("{prefix}{b}{}/File.ts", child.to_uppercase());
+                    let want = equal_fold(a, b);
+                    let (suffix, ok) = comparer.suffix(&root, &path);
+                    assert!(
+                        ok == want && (!ok || suffix == "/File.ts"),
+                        "suffix({root:?}, {path:?}): got ({suffix:?}, {ok}), want match={want}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// Go: watcher_test.go:664 TestFileCallbackCaseSensitivity (ts#64210)
+// PORT: Go calls `dw.setComparer` on a direct dirWatch; the port passes the
+// comparer to `new_dir_watch`.
+#[test]
+fn test_file_callback_case_sensitivity() {
+    for ignore_case in [false, true] {
+        let dw = Direct(new_dir_watch(
+            "/root",
+            "/root",
+            new_debounce(),
+            true,
+            PathComparer { ignore_case },
+        ));
+        let (cb, got) = collecting_callback();
+        dw.0.add_callback("/root", "/root", false, cb, None, "/root/file.ts");
+        dw.0.events.update("/root/FILE.ts");
+        dw.0.events.update("/root/other.ts");
+        dw.0.trigger_callbacks();
+        let got = collected(&got);
+        if ignore_case {
+            assert!(
+                got.len() == 1 && got[0].path == "/root/file.ts",
+                "case-insensitive callback: got {got:?}"
+            );
+        } else {
+            assert!(got.is_empty(), "case-sensitive callback: got {got:?}");
+        }
+    }
+}
+
+// Go: watcher_test.go:686 TestPathComparerExactKeys (ts#64210)
+#[test]
+fn test_path_comparer_exact_keys() {
+    let c = PathComparerExported::default();
+    let paths = [
+        "/A/File.ts".to_string(),
+        "/stra\u{00df}e/\u{0130}.ts".to_string(),
+        "/cafe\u{0301}.ts".to_string(),
+        go_string_from_bytes(b"/bad\xff.ts".to_vec()),
+    ];
+    for path in &paths {
+        let got = c.key(path);
+        assert_eq!(&got, path, "Key({path:?}) = {got:?}");
+    }
+    let (_, ok) = c.rebase("/A/file.ts", "/a", "/target");
+    assert!(!ok, "zero comparer must use exact matching");
+    let (got, ok) = c.rebase("/a/file.ts", "/a", "/target");
+    assert!(ok && got == "/target/file.ts", "Rebase = {got:?}, {ok}");
+}
 
 // Go: watcher_test.go:578 TestRebasePath
 // PORT: Go builds the paths with `filepath.Join` on the volume root; on
@@ -693,6 +890,10 @@ fn test_consolidated_symlink_child_maps_shared_logical_path() {
         since_seq: 0,
         terminal: None,
         delivered: false,
+        comparer: PathComparer::default(),
+        dir_comparison: ComparisonPath::default(),
+        physical_comparison: ComparisonPath::default(),
+        file_comparison: ComparisonPath::default(),
     };
     let event = Event {
         kind: EventKind::Update,

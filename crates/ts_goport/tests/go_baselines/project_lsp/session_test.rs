@@ -1621,7 +1621,7 @@ child_test! {
         let default_project = session.snapshot().get_default_project(&uri(&p1_uri("app.js")));
         let default_project = default_project.expect("JS file should have a default project");
         assert_eq!(
-            default_project.borrow().name(),
+            default_project.borrow().config_file_name(),
             "/home/projects/TS/p1/jsconfig.json",
             "JS file should belong to jsconfig.json project, not tsconfig.json"
         );
@@ -1632,7 +1632,7 @@ child_test! {
         let default_ts_project = session.snapshot().get_default_project(&uri(&p1_uri("index.ts")));
         let default_ts_project = default_ts_project.expect("TS file should have a default project");
         assert_eq!(
-            default_ts_project.borrow().name(),
+            default_ts_project.borrow().config_file_name(),
             "/home/projects/TS/p1/tsconfig.json",
             "TS file should belong to tsconfig.json project"
         );

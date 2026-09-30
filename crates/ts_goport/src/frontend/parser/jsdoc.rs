@@ -1303,6 +1303,7 @@ impl Parser {
                 ModifierList::NIL,            /*modifiers*/
                 SyntaxKind::NamespaceKeyword, /*keyword*/
                 type_name_or_namespace_name,
+                Node::NIL, /*attributes*/
                 body,
             );
             if nested {

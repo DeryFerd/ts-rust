@@ -669,7 +669,9 @@ impl Checker {
         {
             // PORT: Go `nameType.AsUniqueESSymbolType().symbol` is the embedded `Type.symbol`.
             let unique_symbol = self.ty(name_type).symbol;
-            let expression = self.symbol_to_expression(b, unique_symbol, SymbolFlags::VALUE);
+            // The reference was tracked in the destination scope by trackComputedName.
+            // Reconstructing its spelling in the source scope must not paint that scope's declarations visible.
+            let expression = self.symbol_to_expression_worker(b, unique_symbol, SymbolFlags::VALUE);
             return f.new_computed_property_name(expression);
         }
         Node::NIL
@@ -1262,7 +1264,10 @@ impl Checker {
     ) -> (bool, SymbolId) {
         let declarations = self.sym(symbol).declarations.clone();
         let mut is_static_method_symbol = false;
-        if self.sym(symbol).flags.intersects(SymbolFlags::METHOD) {
+        // `typeof C.name` can only be written when the member name is a valid identifier
+        if self.sym(symbol).flags.intersects(SymbolFlags::METHOD)
+            && is_identifier_text(&self.sym(symbol).name, LanguageVariant::STANDARD)
+        {
             for &declaration in &declarations {
                 if is_static(declaration)
                     && !self.is_late_bindable_index_signature(get_name_of_declaration(declaration))

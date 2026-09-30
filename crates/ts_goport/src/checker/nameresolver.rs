@@ -224,6 +224,11 @@ impl NameResolver {
                 location = location.parent();
                 kind = location.kind();
             }
+            // PORT: `is_module_declaration(location)` with the kind read.
+            let is_module_attributes = kind == SyntaxKind::ModuleDeclaration && {
+                let attributes = location.attributes();
+                attributes.is_some() && last_location == attributes
+            };
             let locals = location.locals();
             // Locals of a source file are not in scope (because they get merged into the global symbol table)
             // PORT: `!is_global_source_file(location)` with the kind read.
@@ -234,7 +239,9 @@ impl NameResolver {
                 if result.is_some() {
                     let mut use_result = true;
                     // PORT: `is_function_like(location)`; `location` is not nil.
-                    if is_function_like_kind(kind)
+                    if is_module_attributes {
+                        use_result = false;
+                    } else if is_function_like_kind(kind)
                         && last_location.is_some()
                         && last_location != location.body()
                     {
@@ -306,6 +313,9 @@ impl NameResolver {
                         if kind == SyntaxKind::SourceFile
                             && !is_external_or_common_js_module(location)
                         {
+                            break 'switch_;
+                        }
+                        if is_module_attributes {
                             break 'switch_;
                         }
                         let module_symbol = self.get_symbol_of_declaration(c, location);

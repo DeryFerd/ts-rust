@@ -1051,9 +1051,11 @@ impl Printer {
                 self.write_punctuation("?");
             }
         }
-        self.write_punctuation(":");
-        self.write_space();
-        self.emit_type_node_outside_extends(node.type_());
+        if node.type_().is_some() {
+            self.write_punctuation(":");
+            self.write_space();
+            self.emit_type_node_outside_extends(node.type_());
+        }
         self.write_trailing_semicolon();
         let members = node.member_list();
         if members.is_some() && !members.nodes().is_empty() {

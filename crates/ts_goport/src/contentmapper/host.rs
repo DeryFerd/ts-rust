@@ -205,13 +205,12 @@ go_enum!(InitializeErrorKind, u8 {
     NO_RESPONSE = 2;
     INVALID_RESPONSE = 3;
     REQUEST = 4;
-    PROTOCOL_VERSION = 5;
-    POSITION_ENCODING = 6;
-    EMPTY_DIAGNOSTIC_SOURCE = 7;
-    RESERVED_DIAGNOSTIC_SOURCE = 8;
+    POSITION_ENCODING = 5;
+    EMPTY_DIAGNOSTIC_SOURCE = 6;
+    RESERVED_DIAGNOSTIC_SOURCE = 7;
 });
 
-// Go: contentmapper/host.go:123 InitializeError
+// Go: contentmapper/host.go:122 InitializeError
 // InitializeError reports an invalid or unsupported mapper initialize response.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InitializeError {
@@ -221,12 +220,11 @@ pub struct InitializeError {
     pub detail: String,
     pub exit_code: i32,
     pub timeout_seconds: i32,
-    pub protocol_version: i32,
     pub position_encoding: PositionEncoding,
     pub diagnostic_source: String,
 }
 
-// Go: contentmapper/host.go:136 SupplementalFileCollisionError
+// Go: contentmapper/host.go:134 SupplementalFileCollisionError
 // SupplementalFileCollisionError reports a compiler-assigned supplemental filename that already exists.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SupplementalFileCollisionError {
@@ -234,7 +232,7 @@ pub struct SupplementalFileCollisionError {
 }
 
 impl SupplementalFileCollisionError {
-    // Go: contentmapper/host.go:140 SupplementalFileCollisionError.Error
+    // Go: contentmapper/host.go:138 SupplementalFileCollisionError.Error
     #[must_use]
     pub fn error(&self) -> String {
         format!(
@@ -257,7 +255,7 @@ impl std::fmt::Display for SupplementalFileCollisionError {
 }
 
 impl InitializeError {
-    // Go: contentmapper/host.go:144 InitializeError.Error
+    // Go: contentmapper/host.go:142 InitializeError.Error
     #[must_use]
     pub fn error(&self) -> String {
         match self.kind {
@@ -280,10 +278,6 @@ impl InitializeError {
             InitializeErrorKind::REQUEST => {
                 format!("content mapper initialize request failed: {}", self.detail)
             }
-            InitializeErrorKind::PROTOCOL_VERSION => format!(
-                "unsupported protocol version {} (expected {})",
-                self.protocol_version, PROTOCOL_VERSION
-            ),
             InitializeErrorKind::POSITION_ENCODING => format!(
                 "unsupported position encoding {}",
                 gostd::strconv::quote(&self.position_encoding.0)
@@ -312,7 +306,7 @@ impl std::fmt::Display for InitializeError {
     }
 }
 
-// Go: contentmapper/host.go:170 Result
+// Go: contentmapper/host.go:166 Result
 // Result is the outcome of transforming a content-mapped source file into virtual TypeScript.
 // PORT: the name shadows `std::result::Result` in this package; package
 // files write `std::result::Result` in full. Go `*spanmap.SpanMap` is
@@ -336,7 +330,7 @@ pub struct Result {
     pub supplemental: Vec<MappedResult>,
 }
 
-// Go: contentmapper/host.go:188 MappedResult
+// Go: contentmapper/host.go:184 MappedResult
 // MappedResult is one virtual source file and its mapping to the original input.
 #[derive(Clone, Default)]
 pub struct MappedResult {
@@ -346,7 +340,7 @@ pub struct MappedResult {
     pub diagnostic_directives: Vec<ast::MappedDiagnosticDirective>,
 }
 
-// Go: contentmapper/host.go:196 Request
+// Go: contentmapper/host.go:192 Request
 // Request carries the inputs for transforming one content-mapped source file.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Request {
@@ -356,7 +350,7 @@ pub struct Request {
     pub content: String,
 }
 
-// Go: contentmapper/host.go:204 ProjectSpec
+// Go: contentmapper/host.go:200 ProjectSpec
 // ProjectSpec describes the project configuration visible to its content mappers.
 // PORT: Go `*core.CompilerOptions` is `Option<Rc<CompilerOptions>>` (nil is
 // `None`); the host keys projects by its pointer, as Go does.
@@ -370,7 +364,7 @@ pub struct ProjectSpec {
     pub compiler_options: Option<Rc<CompilerOptions>>,
 }
 
-// Go: contentmapper/host.go:213 OptionPathSegment
+// Go: contentmapper/host.go:209 OptionPathSegment
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OptionPathSegment {
     pub property: String,
@@ -378,7 +372,7 @@ pub struct OptionPathSegment {
     pub is_index: bool,
 }
 
-// Go: contentmapper/host.go:219 OptionDiagnostic
+// Go: contentmapper/host.go:215 OptionDiagnostic
 #[derive(Clone, Debug)]
 pub struct OptionDiagnostic {
     pub mapper: Rc<Mapper>,
@@ -388,7 +382,7 @@ pub struct OptionDiagnostic {
     pub message_text: String,
 }
 
-// Go: contentmapper/host.go:228 OperationTiming
+// Go: contentmapper/host.go:224 OperationTiming
 // OperationTiming is the cumulative wall time and invocation count for one mapper operation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OperationTiming {
@@ -396,7 +390,7 @@ pub struct OperationTiming {
     pub duration: Duration,
 }
 
-// Go: contentmapper/host.go:234 MapperTimings
+// Go: contentmapper/host.go:230 MapperTimings
 // MapperTimings is cumulative process and protocol activity for one resolved mapper identity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MapperTimings {
@@ -407,7 +401,7 @@ pub struct MapperTimings {
     pub transform: OperationTiming,
 }
 
-// Go: contentmapper/host.go:243 Timings
+// Go: contentmapper/host.go:239 Timings
 // Timings is a cumulative snapshot of content mapper process and protocol activity.
 // PORT: Go `map[string]MapperTimings` is an `IndexMap` (Go map order is
 // random; readers sort or look up by identity).
@@ -418,7 +412,7 @@ pub struct Timings {
 }
 
 impl Timings {
-    // Go: contentmapper/host.go:249 Timings.Since
+    // Go: contentmapper/host.go:245 Timings.Since
     // Since returns the non-negative operation delta since previous.
     #[must_use]
     pub fn since(&self, previous: &Timings) -> Timings {
@@ -447,7 +441,7 @@ impl Timings {
     }
 }
 
-// Go: contentmapper/host.go:267 operationTimingSince
+// Go: contentmapper/host.go:263 operationTimingSince
 fn operation_timing_since(current: OperationTiming, previous: OperationTiming) -> OperationTiming {
     OperationTiming {
         count: current.count - current.count.min(previous.count),
@@ -455,7 +449,7 @@ fn operation_timing_since(current: OperationTiming, previous: OperationTiming) -
     }
 }
 
-// Go: contentmapper/host.go:277 Project
+// Go: contentmapper/host.go:273 Project
 // Project is the project-scoped view of a Host. It owns mapper configuration handles and provides the
 // identities and watch dependencies needed for caching and incremental builds. Mapper projects are opened
 // lazily when a transform is requested, or earlier when dynamic configuration is needed.
@@ -483,7 +477,7 @@ pub trait Project {
     fn close(&self) -> std::result::Result<(), GoError>;
 }
 
-// Go: contentmapper/host.go:299 Host
+// Go: contentmapper/host.go:295 Host
 // Host transforms otherwise unsupported file content into virtual TypeScript during program construction, by driving the
 // configured content mappers. Create one with NewHost; Close tears down every mapper it spawned.
 pub trait Host {

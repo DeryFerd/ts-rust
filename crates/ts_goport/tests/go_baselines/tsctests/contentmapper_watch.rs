@@ -32,7 +32,7 @@ use crate::support::child::{ChildHooks, new_in_process_test_sys, run_test_in_chi
 use crate::support::contentmappertest::{self, ProjectLifecycle};
 use crate::support::runner::{FileMap, TscInput};
 use crate::support::test_sys::TestSys;
-use crate::support::vfstest::MapFile;
+use crate::support::vfstest::{MapFile, symlink};
 
 /// How long a test waits for a mapper process close that Go waits for
 /// with `<-closed`.
@@ -76,7 +76,7 @@ impl System for RecordingContentMapperSystem {
     fn get_width_of_terminal(&self) -> i32 {
         System::get_width_of_terminal(&*self.test_sys)
     }
-    fn get_environment_variable(&self, name: &str) -> String {
+    fn get_environment_variable(&self, name: &str) -> (String, bool) {
         System::get_environment_variable(&*self.test_sys, name)
     }
     // Go: contentmapper_watch_test.go:25 recordingContentMapperSystem.Spawn
@@ -276,6 +276,114 @@ fn content_mapper_build_lifecycle() {
             assert!(result.watcher.is_none());
             assert_eq!(sys.spawner.spawns(), 1);
             assert_eq!(sys.spawner.closes(), 1);
+        },
+    );
+}
+
+// Go: contentmapper_watch_test.go:85 TestContentMapperSupplementalDiagnosticUsesOriginalFileName (ts#63936)
+#[test]
+fn content_mapper_supplemental_diagnostic_uses_original_file_name() {
+    run_test_in_child(
+        "tsctests::contentmapper_watch::content_mapper_supplemental_diagnostic_uses_original_file_name",
+        || {
+            let input = TscInput {
+                files: file_map([
+                    (
+                        "/home/src/workspaces/project/tsconfig.json",
+                        r#"{
+			"compilerOptions": { "noEmit": true },
+			"contentMappers": [{ "package": "mapper", "extensions": [".astro"] }]
+		}"#
+                        .into(),
+                    ),
+                    (
+                        "/home/src/workspaces/project/app.astro",
+                        "const value: string = 1;".into(),
+                    ),
+                    (
+                        "/home/src/workspaces/project/node_modules/mapper/package.json",
+                        contentmappertest::package_json(
+                            contentmappertest::SUPPLEMENTAL_DIAGNOSTICS_MAPPER,
+                        )
+                        .into(),
+                    ),
+                ]),
+                ..Default::default()
+            };
+            let (test_sys, sys) =
+                new_recording_system(&input, contentmappertest::new_spawner(), None);
+
+            let result = command_line_with(
+                &context::background(),
+                &sys,
+                &["--pretty", "false", "--runExternalCode"],
+            );
+            assert_eq!(
+                result.status,
+                ExitStatus::DiagnosticsPresentOutputsGenerated
+            );
+            let output = test_sys.output_text();
+            assert!(output.contains("app.astro(1,1): error TS2304"), "{output}");
+            assert!(output.contains("app.astro(1,7): error TS2322"), "{output}");
+            assert!(!output.contains("app.astro.0.ts"), "{output}");
+        },
+    );
+}
+
+// Go: contentmapper_watch_test.go:109 TestContentMapperBuildDetectsNewPhysicalSupplementalFile (ts#63936)
+#[test]
+fn content_mapper_build_detects_new_physical_supplemental_file() {
+    run_test_in_child(
+        "tsctests::contentmapper_watch::content_mapper_build_detects_new_physical_supplemental_file",
+        || {
+            const SUPPLEMENTAL_FILE_NAME: &str = "/home/src/workspaces/project/app.vue.0.ts";
+            let input = TscInput {
+                files: file_map([
+                    (
+                        "/home/src/workspaces/project/tsconfig.json",
+                        r#"{
+			"compilerOptions": { "incremental": true },
+			"files": ["app.vue"],
+			"contentMappers": [{ "package": "mapper", "extensions": [".vue"] }]
+		}"#
+                        .into(),
+                    ),
+                    (
+                        "/home/src/workspaces/project/app.vue",
+                        "declare const value: number;".into(),
+                    ),
+                    (
+                        "/home/src/workspaces/project/node_modules/mapper/package.json",
+                        contentmappertest::package_json(contentmappertest::SUPPLEMENTAL_MAPPER)
+                            .into(),
+                    ),
+                ]),
+                ..Default::default()
+            };
+            let (test_sys, sys) =
+                new_recording_system(&input, contentmappertest::new_spawner(), None);
+            let args = ["--build", "--pretty", "false", "--runExternalCode"];
+            let result = command_line_with(&context::background(), &sys, &args);
+            assert_eq!(
+                result.status,
+                ExitStatus::Success,
+                "{}",
+                test_sys.output_text()
+            );
+
+            test_sys.clear_output();
+            test_sys.write_file_no_error(SUPPLEMENTAL_FILE_NAME, "export {};\n");
+            let result = command_line_with(&context::background(), &sys, &args);
+            assert_eq!(
+                result.status,
+                ExitStatus::DiagnosticsPresentOutputsGenerated
+            );
+            let output = test_sys.output_text();
+            assert!(output.contains("TS18069"), "{output}");
+            assert!(
+                output.contains("conflicts with an existing file"),
+                "{output}"
+            );
         },
     );
 }
@@ -687,6 +795,128 @@ fn dynamic_content_mapper_build_watch_dependency() {
             assert_eq!(lifecycle.closes.load(Ordering::SeqCst), 1);
             assert_eq!(sys.spawner.spawns(), 1);
             assert_eq!(sys.spawner.closes(), 0);
+            cancel();
+        },
+    );
+}
+
+// Go: contentmapper_watch_test.go:380 TestContentMapperBuildWatchSymlinkedManifestChange (ts#63936)
+#[test]
+fn content_mapper_build_watch_symlinked_manifest_change() {
+    run_test_in_child(
+        "tsctests::contentmapper_watch::content_mapper_build_watch_symlinked_manifest_change",
+        || {
+            const MANIFEST_TARGET: &str = "/home/src/workspaces/mapper/package.json";
+            let input = TscInput {
+                files: file_map([
+                    (
+                        "/home/src/workspaces/project/tsconfig.json",
+                        r#"{
+			"compilerOptions": { "composite": true },
+			"contentMappers": [{ "package": "mapper", "extensions": [".vue"] }]
+		}"#
+                        .into(),
+                    ),
+                    (
+                        "/home/src/workspaces/project/app.vue",
+                        "export const app = 1;".into(),
+                    ),
+                    (
+                        "/home/src/workspaces/project/node_modules/mapper",
+                        symlink("/home/src/workspaces/mapper"),
+                    ),
+                    (
+                        MANIFEST_TARGET,
+                        contentmappertest::package_json(contentmappertest::VERBATIM_MAPPER).into(),
+                    ),
+                ]),
+                ..Default::default()
+            };
+            let (test_sys, sys) =
+                new_recording_system(&input, contentmappertest::new_spawner(), None);
+            let (ctx, cancel) = context::with_cancel(&context::background());
+
+            let result =
+                command_line_with(&ctx, &sys, &["--build", "--watch", "--runExternalCode"]);
+            assert_eq!(sys.spawner.spawns(), 1);
+            assert_eq!(sys.spawner.closes(), 0);
+
+            let updated_manifest = contentmappertest::package_json(
+                contentmappertest::VERBATIM_MAPPER,
+            )
+            .replacen(r#""version": "1.0.0""#, r#""version": "2.0.0""#, 1);
+            test_sys.write_file_no_error(MANIFEST_TARGET, &updated_manifest);
+            send_updates(&test_sys, &[MANIFEST_TARGET]);
+            let mut w = result.watcher.expect("result.Watcher");
+            w.do_cycle();
+
+            assert_eq!(sys.spawner.spawns(), 2);
+            assert_eq!(sys.spawner.closes(), 1);
+            cancel();
+        },
+    );
+}
+
+// Go: contentmapper_watch_test.go:411 TestContentMapperBuildWatchSymlinkedManifestDelete (ts#63936)
+#[test]
+fn content_mapper_build_watch_symlinked_manifest_delete() {
+    run_test_in_child(
+        "tsctests::contentmapper_watch::content_mapper_build_watch_symlinked_manifest_delete",
+        || {
+            const MANIFEST_TARGET: &str = "/home/src/workspaces/mapper/package.json";
+            let input = TscInput {
+                files: file_map([
+                    (
+                        "/home/src/workspaces/project/tsconfig.json",
+                        r#"{
+			"compilerOptions": { "composite": true },
+			"contentMappers": [{ "package": "mapper", "extensions": [".vue"] }]
+		}"#
+                        .into(),
+                    ),
+                    (
+                        "/home/src/workspaces/project/app.vue",
+                        "export const app = 1;".into(),
+                    ),
+                    (
+                        "/home/src/workspaces/project/node_modules/mapper",
+                        symlink("/home/src/workspaces/mapper"),
+                    ),
+                    (
+                        MANIFEST_TARGET,
+                        contentmappertest::package_json(contentmappertest::VERBATIM_MAPPER).into(),
+                    ),
+                ]),
+                ..Default::default()
+            };
+            let (test_sys, sys) =
+                new_recording_system(&input, contentmappertest::new_spawner(), None);
+            let (ctx, cancel) = context::with_cancel(&context::background());
+
+            let result =
+                command_line_with(&ctx, &sys, &["--build", "--watch", "--runExternalCode"]);
+            assert_eq!(sys.spawner.spawns(), 1);
+            assert_eq!(sys.spawner.closes(), 0);
+
+            test_sys.clear_output();
+            assert!(
+                test_sys.fs_from_file_map().remove(MANIFEST_TARGET).is_ok(),
+                "Remove({MANIFEST_TARGET})"
+            );
+            test_sys.mock_watch_backend().send_events(vec![Event {
+                kind: EventKind::Delete,
+                path: MANIFEST_TARGET.to_string(),
+            }]);
+            let mut w = result.watcher.expect("result.Watcher");
+            w.do_cycle();
+
+            assert_eq!(sys.spawner.spawns(), 1);
+            assert_eq!(sys.spawner.closes(), 1);
+            let output = test_sys.output_text();
+            assert!(
+                output.contains("The content mapper package 'mapper' could not be resolved."),
+                "{output}"
+            );
             cancel();
         },
     );

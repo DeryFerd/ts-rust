@@ -37,116 +37,196 @@ impl LanguageService {
             params.position,
             Feature::HOVER,
         );
-        if positions.is_empty() || !positions[0].fidelity.is_single_segment() {
-            return Ok(lsproto::HoverOrNull::default());
-        }
-        let file = positions[0].script;
-        let position = positions[0].position;
-        let node = astnav::get_touching_property_name(file, position);
-        if is_source_file(node)
-            || is_property_access_or_qualified_name(node)
-                && is_in_comment(file, position, node).is_none()
-        {
-            // Avoid giving quickInfo for the sourceFile as a whole or inside the comment of a/**/.b
-            return Ok(lsproto::HoverOrNull::default());
-        }
-        // Go: defer done(). `done` releases the checker when it drops at the end of scope.
-        let (checker, done) = ls_program::get_type_checker_for_file(program, ctx, file);
-        let c = &mut *checker.borrow_mut();
-        let range_node = get_node_for_quick_info(node);
-        let symbol = get_symbol_at_location_for_quick_info(c, range_node);
+        let mut hovers: Vec<lsproto::Hover> = Vec::new();
+        for projection in &positions {
+            if !projection.fidelity.is_single_segment() {
+                continue;
+            }
+            let file = projection.script;
+            let position = projection.position;
+            let node = astnav::get_touching_property_name(file, position);
+            if is_source_file(node)
+                || is_property_access_or_qualified_name(node)
+                    && is_in_comment(file, position, node).is_none()
+            {
+                // Avoid giving quickInfo for the sourceFile as a whole or inside the comment of a/**/.b
+                continue;
+            }
+            // PORT: Go calls `done()` before each `continue` and at the end of
+            // the iteration. `done` releases the checker when it drops at the
+            // end of the iteration.
+            let (checker, done) = ls_program::get_type_checker_for_file(program, ctx, file);
+            let c = &mut *checker.borrow_mut();
+            let range_node = get_node_for_quick_info(node);
+            let symbol = get_symbol_at_location_for_quick_info(c, range_node);
 
-        // Always create VerbosityContext for hover so that canExpandSymbol can signal
-        // canIncreaseVerbosity even at Level 0. The nodebuilder also detects expandable
-        // types at Level 0 via shouldExpandType (maxExpansionDepth = 0).
-        let mut max_trunc_len = self.user_preferences().maximum_hover_length;
-        if max_trunc_len <= 0 {
-            max_trunc_len = 500;
-        }
-        let vc = VerbosityContext {
-            level: verbosity_level,
-            max_truncation_length: max_trunc_len,
-            ..Default::default()
-        };
-
-        let vs_capability = caps.vs_supports_visual_studio_extensions;
-        let (quick_info, documentation, vs_documentation, quick_info_runs) = self
-            .get_quick_info_and_documentation_for_symbol(
-                c,
-                symbol,
-                range_node,
-                content_format.clone(),
-                Some(&vc),
-                vs_capability,
-            );
-        if quick_info.is_empty() {
-            return Ok(lsproto::HoverOrNull::default());
-        }
-        let range_file = get_source_file_of_node(range_node);
-        let text_range = get_range_of_node(range_node, range_file, Node::NIL /*endNode*/);
-        let (hover_range, hover_fidelity) =
-            self.converters
-                .to_lsp_range_for_feature(&range_file, text_range, Feature::HOVER);
-
-        let content = if content_format == lsproto::MarkupKind::MARKDOWN {
-            format_quick_info(&quick_info) + &documentation
-        } else {
-            quick_info + &documentation
-        };
-
-        let mut hover = lsproto::Hover {
-            contents: lsproto::MarkupContentOrStringOrMarkedStringWithLanguageOrMarkedStrings {
-                markup_content: Some(lsproto::MarkupContent {
-                    kind: content_format,
-                    value: content,
-                }),
+            // Always create VerbosityContext for hover so that canExpandSymbol can signal
+            // canIncreaseVerbosity even at Level 0. The nodebuilder also detects expandable
+            // types at Level 0 via shouldExpandType (maxExpansionDepth = 0).
+            let mut max_trunc_len = self.user_preferences().maximum_hover_length;
+            if max_trunc_len <= 0 {
+                max_trunc_len = 500;
+            }
+            let vc = VerbosityContext {
+                level: verbosity_level,
+                max_truncation_length: max_trunc_len,
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        if hover_fidelity.is_single_segment() {
-            hover.range = Some(hover_range);
-        }
+            };
 
-        if caps.experimental.hover_verbosity_level {
-            hover.can_increase_verbosity = vc.can_increase_verbosity.get() && !vc.truncated.get();
-        }
-
-        // Clients that support Visual Studio extensions (e.g. VS itself, when Corsa/Native TS Preview is
-        // enabled) render `_vs_rawContent` in place of `contents`. Without it, VS shows plain markdown
-        // with no symbol icon and no syntax coloring, unlike the legacy TSServer-backed hover path.
-        if vs_capability && !quick_info_runs.is_empty() {
-            let mut kind = lsutil::ScriptElementKind::KEYWORD;
-            let mut modifiers = lsutil::ScriptElementKindModifier::NONE;
-            if symbol.is_some() {
-                // Resolve aliases to their target before computing the icon kind, so e.g. `import { x }`
-                // shows the icon for whatever `x` actually is (const, function, ...) rather than a
-                // generic alias icon. GetSymbolModifiers already accounts for the alias target itself.
-                let mut icon_symbol = symbol;
-                if c.sym(symbol).flags.intersects(SymbolFlags::ALIAS) {
-                    let resolved = c.get_aliased_symbol(symbol);
-                    if resolved.is_some() && resolved != symbol {
-                        icon_symbol = resolved;
-                    }
-                }
-                kind = lsutil::get_symbol_kind(Some(&mut *c), icon_symbol, range_node);
-                modifiers = lsutil::get_symbol_modifiers(Some(&mut *c), symbol);
+            let vs_capability = caps.vs_supports_visual_studio_extensions;
+            let (quick_info, documentation, vs_documentation, quick_info_runs) = self
+                .get_quick_info_and_documentation_for_symbol(
+                    c,
+                    symbol,
+                    range_node,
+                    content_format.clone(),
+                    Some(&vc),
+                    vs_capability,
+                );
+            if quick_info.is_empty() {
+                continue;
             }
-            let image_id = get_vs_hover_image_id(kind, modifiers);
-            let mut documentation_runs: Vec<lsproto::VSClassifiedTextRun> = Vec::new();
-            let doc_text = vs_documentation.trim_start_matches('\n');
-            if !doc_text.is_empty() {
-                documentation_runs = vec![lsproto::VSClassifiedTextRun {
-                    classification_type_name: lsproto::ClassificationTypeName::TEXT.0.to_string(),
-                    text: doc_text.to_string(),
+            let range_file = get_source_file_of_node(range_node);
+            let text_range = get_range_of_node(range_node, range_file, Node::NIL /*endNode*/);
+            let (hover_range, hover_fidelity) =
+                self.converters
+                    .to_lsp_range_for_feature(&range_file, text_range, Feature::HOVER);
+
+            let content = if content_format == lsproto::MarkupKind::MARKDOWN {
+                format_quick_info(&quick_info) + &documentation
+            } else {
+                quick_info + &documentation
+            };
+
+            let mut hover = lsproto::Hover {
+                contents: lsproto::MarkupContentOrStringOrMarkedStringWithLanguageOrMarkedStrings {
+                    markup_content: Some(lsproto::MarkupContent {
+                        kind: content_format.clone(),
+                        value: content,
+                    }),
                     ..Default::default()
-                }];
+                },
+                ..Default::default()
+            };
+            if hover_fidelity.is_single_segment() {
+                hover.range = Some(hover_range);
             }
-            hover.vs_raw_content =
-                build_vs_hover_raw_content(image_id, quick_info_runs, documentation_runs);
+
+            if caps.experimental.hover_verbosity_level {
+                hover.can_increase_verbosity =
+                    vc.can_increase_verbosity.get() && !vc.truncated.get();
+            }
+
+            // Clients that support Visual Studio extensions (e.g. VS itself, when Corsa/Native TS Preview is
+            // enabled) render `_vs_rawContent` in place of `contents`. Without it, VS shows plain markdown
+            // with no symbol icon and no syntax coloring, unlike the legacy TSServer-backed hover path.
+            if vs_capability && !quick_info_runs.is_empty() {
+                let mut kind = lsutil::ScriptElementKind::KEYWORD;
+                let mut modifiers = lsutil::ScriptElementKindModifier::NONE;
+                if symbol.is_some() {
+                    // Resolve aliases to their target before computing the icon kind, so e.g. `import { x }`
+                    // shows the icon for whatever `x` actually is (const, function, ...) rather than a
+                    // generic alias icon. GetSymbolModifiers already accounts for the alias target itself.
+                    let mut icon_symbol = symbol;
+                    if c.sym(symbol).flags.intersects(SymbolFlags::ALIAS) {
+                        let resolved = c.get_aliased_symbol(symbol);
+                        if resolved.is_some() && resolved != symbol {
+                            icon_symbol = resolved;
+                        }
+                    }
+                    kind = lsutil::get_symbol_kind(Some(&mut *c), icon_symbol, range_node);
+                    modifiers = lsutil::get_symbol_modifiers(Some(&mut *c), symbol);
+                }
+                let image_id = get_vs_hover_image_id(kind, modifiers);
+                let mut documentation_runs: Vec<lsproto::VSClassifiedTextRun> = Vec::new();
+                let doc_text = vs_documentation.trim_start_matches('\n');
+                if !doc_text.is_empty() {
+                    documentation_runs = vec![lsproto::VSClassifiedTextRun {
+                        classification_type_name: lsproto::ClassificationTypeName::TEXT
+                            .0
+                            .to_string(),
+                        text: doc_text.to_string(),
+                        ..Default::default()
+                    }];
+                }
+                hover.vs_raw_content =
+                    build_vs_hover_raw_content(image_id, quick_info_runs, documentation_runs);
+            }
+
+            hovers.push(hover);
+        }
+        if hovers.is_empty() {
+            return Ok(lsproto::HoverOrNull::default());
+        }
+        if hovers.len() == 1 {
+            return Ok(lsproto::HoverOrNull {
+                hover: hovers.pop(),
+            });
         }
 
-        Ok(lsproto::HoverOrNull { hover: Some(hover) })
+        let mut contents: Vec<String> = Vec::with_capacity(hovers.len());
+        let mut seen_contents: FxHashSet<String> = FxHashSet::default();
+        let mut raw_contents: Vec<
+            lsproto::VSImageElementOrClassifiedTextElementOrContainerElement,
+        > = Vec::new();
+        let mut can_increase_verbosity = hovers[0].can_increase_verbosity;
+        let mut common_range = hovers[0].range;
+        for hover in &hovers {
+            // PORT: Go dereferences `hover.Contents.MarkupContent`; every hover
+            // made above sets it.
+            let content = hover
+                .contents
+                .markup_content
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                .value
+                .trim_end_matches('\n')
+                .to_string();
+            if seen_contents.insert(content.clone()) {
+                contents.push(content);
+                if let Some(vs_raw_content) = &hover.vs_raw_content {
+                    raw_contents.push(
+                        lsproto::VSImageElementOrClassifiedTextElementOrContainerElement {
+                            container_element: Some(vs_raw_content.clone()),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            can_increase_verbosity = can_increase_verbosity || hover.can_increase_verbosity;
+            if common_range.is_none() || hover.range.is_none() || common_range != hover.range {
+                common_range = None;
+            }
+        }
+        // PORT: Go `combined := hovers[0]` is a pointer; the fields it sets
+        // above and below are set on the first hover here.
+        let mut combined = hovers.swap_remove(0);
+        combined.can_increase_verbosity = can_increase_verbosity;
+        let mut separator = "\n\n";
+        if content_format == lsproto::MarkupKind::MARKDOWN {
+            separator = "\n\n---\n\n";
+        }
+        combined
+            .contents
+            .markup_content
+            .as_mut()
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .value = contents.join(separator);
+        combined.range = common_range;
+        match raw_contents.len() {
+            0 => combined.vs_raw_content = None,
+            1 => combined.vs_raw_content = raw_contents.pop().unwrap().container_element,
+            _ => {
+                combined.vs_raw_content = Some(lsproto::VSContainerElement {
+                    style: lsproto::VSContainerElementStyle::STACKED,
+                    elements: raw_contents,
+                    ..Default::default()
+                });
+            }
+        }
+        Ok(lsproto::HoverOrNull {
+            hover: Some(combined),
+        })
     }
 
     // Go: ls/hover.go:128 getQuickInfoAndDocumentationForSymbol
@@ -774,6 +854,43 @@ impl QuickInfoWriter<'_> {
         self.dpw.borrow_mut().write_symbol(&text, symbol);
     }
 
+    // Go: ls/hover.go:515 writeModuleImportAttributes (closure)
+    fn write_module_import_attributes(&mut self, symbol: SymbolId) {
+        let declaration = self
+            .c
+            .sym(symbol)
+            .declarations
+            .iter()
+            .copied()
+            .find(|&declaration| {
+                is_module_declaration(declaration) && declaration.attributes().is_some()
+            })
+            .unwrap_or(Node::NIL);
+        if declaration.is_nil() {
+            return;
+        }
+        let attributes = declaration.attributes();
+        let emit_context = new_emit_context();
+        emit_context.set_emit_flags(attributes, EmitFlags::SINGLE_LINE);
+        let mut p = new_printer(
+            PrinterOptions {
+                new_line: NewLineKind::LF,
+                ..Default::default()
+            },
+            PrintHandlers::default(),
+            Some(emit_context),
+        );
+        let temp_dpw = new_display_parts_writer(self.vs_capability);
+        p.write_exported(
+            attributes,
+            get_source_file_of_node(declaration),
+            temp_dpw.clone(),
+            None,
+        );
+        self.dpw.borrow_mut().write_keyword(" with ");
+        self.dpw.borrow_mut().write_from(&temp_dpw.borrow());
+    }
+
     // Go: ls/hover.go:378 setDeclaration (closure)
     fn set_declaration(&mut self, declaration: Node) {
         if self.first_declaration.is_nil() {
@@ -1290,6 +1407,7 @@ impl QuickInfoWriter<'_> {
                     SymbolFlags::NONE,
                     SYMBOL_FORMAT_FLAGS,
                 );
+                self.write_module_import_attributes(symbol);
             }
             let declaration = self
                 .c
@@ -1306,6 +1424,14 @@ impl QuickInfoWriter<'_> {
             self.dpw.borrow_mut().write_punctuation("(");
             self.dpw.borrow_mut().write("type parameter");
             self.dpw.borrow_mut().write_punctuation(") ");
+            if is_identifier(node) && is_type_reference_node(node.parent()) && {
+                let t = self.c.get_type_at_location(node.parent());
+                self.c.is_distributed_type_parameter(t)
+            } {
+                self.dpw.borrow_mut().write_punctuation("(");
+                self.dpw.borrow_mut().write("distributed");
+                self.dpw.borrow_mut().write_punctuation(") ");
+            }
             let tp = self.c.get_declared_type_of_symbol_exported(symbol);
             self.write_symbol_classified(symbol, container, SymbolFlags::NONE, SYMBOL_FORMAT_FLAGS);
             let cons = self.c.get_constraint_of_type_parameter_exported(tp);

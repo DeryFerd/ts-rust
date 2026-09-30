@@ -104,6 +104,8 @@ pub struct TscInput {
     pub cwd: String,
     pub edits: Vec<TscEdit>,
     pub env: BTreeMap<String, String>,
+    /// Go `outputIsTTY *bool` (ts#63941): `None` is nil.
+    pub output_is_tty: Option<bool>,
     pub ignore_case: bool,
     pub windows_style_root: String,
 }

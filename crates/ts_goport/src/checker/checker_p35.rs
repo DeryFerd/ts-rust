@@ -370,7 +370,7 @@ impl Checker {
         }
 
         if is_import_attributes(node) {
-            return (self.get_global_import_attributes_type.clone())(self);
+            return self.check_import_attributes_expression(node);
         }
 
         self.error_type

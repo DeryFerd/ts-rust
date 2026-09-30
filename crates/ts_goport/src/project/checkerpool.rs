@@ -527,7 +527,11 @@ impl CheckerPool {
                 ));
                 p.dispose_checker_locked(index, &c);
             } else {
-                p.merge_global_diagnostics_from_checker_locked(index, &c);
+                // Query checkers can produce incidental errors while serializing types.
+                // ts#64452
+                if index == 0 {
+                    p.merge_global_diagnostics_from_checker_locked(index, &c);
+                }
                 p.held_by.borrow_mut()[index as usize] = String::new();
                 p.last_released.borrow_mut()[index as usize] = Some(Instant::now());
                 if !p.discarded.get() {
@@ -714,8 +718,8 @@ impl CheckerPool {
     }
 
     // Go: project/checkerpool.go:496 checkerPool.GetGlobalDiagnostics
-    // GetGlobalDiagnostics returns the accumulated global diagnostics collected from
-    // all checkers that have been used so far in this pool's lifetime.
+    // GetGlobalDiagnostics returns the global diagnostics accumulated from the dedicated
+    // diagnostics checker across its instances during this pool's lifetime.
     pub fn get_global_diagnostics(&self) -> Vec<Diagnostic> {
         self.mu_lock();
         self.global_diag_accumulated.borrow().clone()

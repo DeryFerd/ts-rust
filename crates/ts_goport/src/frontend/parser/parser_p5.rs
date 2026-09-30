@@ -239,8 +239,7 @@ impl Parser {
             let equals_token = self.parse_optional_token(SyntaxKind::EqualsToken);
             let mut initializer = Node::NIL;
             if equals_token.is_some() {
-                initializer = do_in_context(
-                    self,
+                initializer = self.do_in_context(
                     NodeFlags::DISALLOW_IN_CONTEXT,
                     false,
                     Parser::parse_assignment_expression_or_higher,
@@ -256,8 +255,7 @@ impl Parser {
             );
         } else {
             self.parse_expected(SyntaxKind::ColonToken);
-            let initializer = do_in_context(
-                self,
+            let initializer = self.do_in_context(
                 NodeFlags::DISALLOW_IN_CONTEXT,
                 false,
                 Parser::parse_assignment_expression_or_higher,
@@ -301,22 +299,19 @@ impl Parser {
             ParseFlags::NONE
         });
         let name = if is_generator && is_async {
-            do_in_context(
-                self,
+            self.do_in_context(
                 NodeFlags::YIELD_CONTEXT | NodeFlags::AWAIT_CONTEXT,
                 true,
                 Parser::parse_optional_binding_identifier,
             )
         } else if is_generator {
-            do_in_context(
-                self,
+            self.do_in_context(
                 NodeFlags::YIELD_CONTEXT,
                 true,
                 Parser::parse_optional_binding_identifier,
             )
         } else if is_async {
-            do_in_context(
-                self,
+            self.do_in_context(
                 NodeFlags::AWAIT_CONTEXT,
                 true,
                 Parser::parse_optional_binding_identifier,
@@ -1318,6 +1313,20 @@ impl Parser {
         }
     }
 
+    // Go: parser/parser.go:6413 (p *Parser) doInContext (ts#63902: was a free generic function)
+    pub fn do_in_context<T>(
+        &mut self,
+        flags: NodeFlags,
+        value: bool,
+        f: impl FnOnce(&mut Parser) -> T,
+    ) -> T {
+        let save_context_flags = self.context_flags;
+        self.set_context_flags(flags, value);
+        let result = f(self);
+        self.context_flags = save_context_flags;
+        result
+    }
+
     // Go: parser/parser.go:6389 inYieldContext
     pub fn in_yield_context(&self) -> bool {
         self.context_flags.intersects(NodeFlags::YIELD_CONTEXT)
@@ -1352,20 +1361,6 @@ impl Parser {
             text_range.end(),
         )
     }
-}
-
-// Go: parser/parser.go:6381 doInContext
-pub fn do_in_context<T>(
-    p: &mut Parser,
-    flags: NodeFlags,
-    value: bool,
-    f: impl FnOnce(&mut Parser) -> T,
-) -> T {
-    let save_context_flags = p.context_flags;
-    p.set_context_flags(flags, value);
-    let result = f(p);
-    p.context_flags = save_context_flags;
-    result
 }
 
 /// The body of `override_parent_in_immediate_children` through the node

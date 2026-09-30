@@ -745,7 +745,17 @@ impl Checker {
             if call_signatures != resolved_call_signatures
                 || construct_signatures != resolved_construct_signatures
             {
-                let symbol = self.ty(t).symbol;
+                let symbol = self.new_symbol(
+                    SymbolFlags::NONE,
+                    INTERNAL_SYMBOL_NAME_INSTANTIATION_EXPRESSION,
+                );
+                let t_symbol = self.ty(t).symbol;
+                debug_assert!(
+                    t_symbol.is_some(),
+                    "Instantiation expression source type must have a symbol"
+                );
+                let declarations = self.sym(t_symbol).declarations.clone();
+                self.sym_mut(symbol).declarations = declarations;
                 let result = self.new_object_type(
                     ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATION_EXPRESSION_TYPE,
                     symbol,
