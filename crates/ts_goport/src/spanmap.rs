@@ -956,17 +956,16 @@ impl OriginalIndex {
     // Go: spanmap/spanmap.go:693 originalIndex.segmentsAtOriginalPosition
     // segmentsAtOriginalPosition returns every mapping segment containing the original-text position pos.
     // Segment ends are exclusive; a segment start, including a zero-length segment, is considered contained.
-    // PORT: Go `sort.Search` with a monotone predicate is `partition_point` of its negation.
     fn segments_at_original_position(&self, pos: i32) -> (Vec<Segment>, bool) {
         // Query intervals that contain pos strictly before their exclusive end. Segments starting exactly at pos
         // are appended separately so zero-length segments are included without preventing maxEnd <= pos pruning.
-        let start = self
-            .segments
-            .partition_point(|segment| segment.original_start < pos);
+        let start = sort_search(self.segments.len(), |index| {
+            self.segments[index].original_start >= pos
+        });
         let mut results = self.segments_ending_after_position(start, pos);
-        let end = self
-            .segments
-            .partition_point(|segment| segment.original_start <= pos);
+        let end = sort_search(self.segments.len(), |index| {
+            self.segments[index].original_start > pos
+        });
         results.extend_from_slice(&self.segments[start..end]);
         let found = !results.is_empty();
         (results, found)
@@ -1044,9 +1043,9 @@ impl OriginalIndex {
     //	             left group       right group
     //	             atEnd: true      atEnd: false
     fn segment_groups_at_original_position(&self, pos: i32) -> Vec<SegmentGroupAtOriginalPosition> {
-        let limit = self
-            .segments
-            .partition_point(|segment| segment.original_start <= pos);
+        let limit = sort_search(self.segments.len(), |index| {
+            self.segments[index].original_start > pos
+        });
         let mut segments: Vec<Segment> = Vec::new();
         self.collect_segments_ending_at_or_after(
             1,
@@ -1075,6 +1074,22 @@ impl OriginalIndex {
         }
         groups
     }
+}
+
+// Go: sort/search.go:58 Search
+// Search uses binary search to find and return the smallest index i in [0, n) at which f(i) is true, assuming
+// that on the range [0, n), f(i) == true implies f(i+1) == true. It returns n when there is no such index.
+fn sort_search(n: usize, f: impl Fn(usize) -> bool) -> usize {
+    let (mut i, mut j) = (0, n);
+    while i < j {
+        let h = (i + j) >> 1;
+        if !f(h) {
+            i = h + 1;
+        } else {
+            j = h;
+        }
+    }
+    i
 }
 
 // Go: spanmap/spanmap.go:725 segmentGroupAtOriginalPosition
