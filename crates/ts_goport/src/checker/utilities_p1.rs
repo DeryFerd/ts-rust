@@ -929,17 +929,47 @@ impl Checker {
             } else if ty2.object_flags.intersects(ObjectFlags::REFERENCE) {
                 return 1;
             } else {
-                // Order unnamed non-reference object types by kind associated type mappers. Reverse mapped types have
-                // neither symbols nor mappers so they're ultimately ordered by unstable type IDs, but given their rarity
-                // this should be fine.
+                // Order unnamed non-reference object types by kind and instantiation data.
                 let k1 = i64::from((ty1.object_flags & ObjectFlags::OBJECT_TYPE_KIND_MASK).0);
                 let k2 = i64::from((ty2.object_flags & ObjectFlags::OBJECT_TYPE_KIND_MASK).0);
                 let c = clamp_compare(k1 - k2);
                 if c != 0 {
                     return c;
                 }
-                let c = self
-                    .compare_type_mappers(ty1.as_object_type().mapper, ty2.as_object_type().mapper);
+                if ty1.object_flags.intersects(ObjectFlags::REVERSE_MAPPED) {
+                    let r1 = ty1.as_reverse_mapped_type();
+                    let r2 = ty2.as_reverse_mapped_type();
+                    let c = self.compare_types(r1.source, r2.source);
+                    if c != 0 {
+                        return c;
+                    }
+                    let c = self.compare_types(r1.mapped_type, r2.mapped_type);
+                    if c != 0 {
+                        return c;
+                    }
+                    let c = self.compare_types(r1.constraint_type, r2.constraint_type);
+                    if c != 0 {
+                        return c;
+                    }
+                }
+                let mut m1 = ty1.as_object_type().mapper;
+                let mut m2 = ty2.as_object_type().mapper;
+                if ty1.object_flags.intersects(ObjectFlags::MAPPED) {
+                    // instantiateAnonymousType prepends a fresh type parameter mapping.
+                    // Compare the effective instantiation, not the identity of that fresh parameter.
+                    // PORT: Go `m.data.(*CompositeTypeMapper).m2` panics for any other mapper.
+                    let composite_m2 = |m: MapperId| match self.mapper(m) {
+                        TypeMapper::Composite(d) => d.m2,
+                        _ => panic!("interface conversion: not *checker.CompositeTypeMapper"),
+                    };
+                    if m1.is_some() {
+                        m1 = composite_m2(m1);
+                    }
+                    if m2.is_some() {
+                        m2 = composite_m2(m2);
+                    }
+                }
+                let c = self.compare_type_mappers(m1, m2);
                 if c != 0 {
                     return c;
                 }
@@ -987,6 +1017,13 @@ impl Checker {
         } else if ty1.flags.intersects(TypeFlags::NUMBER_LITERAL) {
             // Numeric literal types are ordered by their values.
             let c = compare_numbers(literal_number_value(ty1), literal_number_value(ty2));
+            if c != 0 {
+                return c;
+            }
+        } else if ty1.flags.intersects(TypeFlags::BIG_INT_LITERAL) {
+            let c = self
+                .get_big_int_literal_value(t1)
+                .compare(&self.get_big_int_literal_value(t2));
             if c != 0 {
                 return c;
             }
@@ -1150,13 +1187,10 @@ impl Checker {
         let s1 = self.get_type_name_symbol(t1);
         let s2 = self.get_type_name_symbol(t2);
         if s1 == s2 {
-            if let Some(alias1) = &self.ty(t1).alias {
-                // PORT: Go reads `t2.alias.typeArguments`; a nil `t2.alias` would
-                // panic in Go, so it panics here too.
-                let alias2 = self.ty(t2).alias.as_ref().expect("nil pointer dereference");
-                return self.compare_type_lists(&alias1.type_arguments, &alias2.type_arguments);
-            }
-            return 0;
+            return self.compare_type_lists(
+                self.ty(t1).alias.type_arguments(),
+                self.ty(t2).alias.type_arguments(),
+            );
         }
         if s1.is_nil() {
             return 1;
@@ -1166,10 +1200,15 @@ impl Checker {
         }
         let (name1, name2) = (&self.sym(s1).name, &self.sym(s2).name);
         // Equal name ids are equal texts, which compare as 0.
-        if name1 == name2 {
-            return 0;
+        if name1 != name2 {
+            let c = compare_strings(name1, name2);
+            if c != 0 {
+                return c;
+            }
         }
-        compare_strings(name1, name2)
+        // Keep distinct same-named declarations together before comparing alias arguments or structure.
+        // PORT: Go `t1.checker.compareSymbols` is always the worker (see `compare_types`).
+        self.compare_symbols_worker(s1, s2)
     }
 
     // Go: checker/utilities.go:582 getTypeNameSymbol
