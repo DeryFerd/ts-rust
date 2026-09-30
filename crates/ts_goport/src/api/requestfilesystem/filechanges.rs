@@ -119,10 +119,10 @@ pub fn add_file_changes(
     for link_name in link_names {
         add_replacement(summary, link_name);
     }
-    if let Some(layered_base) = base_fs.as_layered_file_system() {
+    if let Some(layered_base) = project::as_layered_file_system(base_fs) {
         let overlays = project::LayeredFileSystem::overlays(file_system);
-        for (path, overlay) in layered_base.overlays() {
-            if overlays.contains_key(&path) {
+        for (path, overlay) in layered_base.overlays().iter() {
+            if overlays.contains_key(path) {
                 continue;
             }
             let uri = lsconv::file_name_to_document_uri(&overlay.file_name());

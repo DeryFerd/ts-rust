@@ -7,9 +7,9 @@
 //! is `Clone` (the fields are shared handles).
 //!
 //! PORT: Go type assertions on a `vfs.FS` (`fs.(*requestFileSystem)`,
-//! `fs.(project.LayeredFileSystem)`, `fs.(project.FileHandleSource)`) use the
-//! `as_*` query methods of `vfs::Fs` (see the api lane notes for the program
-//! and server lanes).
+//! `fs.(project.LayeredFileSystem)`, `fs.(project.FileHandleSource)`) use
+//! `vfs::Fs::as_fs_layer` and the `project::FsLayer` queries (the server
+//! lane design).
 
 use crate::prelude::*;
 
@@ -202,8 +202,9 @@ struct RequestPathLookup {
 // (the fields are shared handles).
 pub fn get_request_file_system(file_system: &dyn vfs::Fs) -> Option<RequestFileSystemImpl> {
     file_system
-        .as_any()
-        .and_then(|any| any.downcast_ref::<RequestFileSystemImpl>())
+        .as_fs_layer()?
+        .as_any()?
+        .downcast_ref::<RequestFileSystemImpl>()
         .cloned()
 }
 
@@ -905,7 +906,15 @@ impl vfs::Fs for RequestFileSystemImpl {
     }
 
     // PORT: Go type assertions (see the file header).
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
+    fn as_fs_layer(&self) -> Option<&dyn project::FsLayer> {
+        Some(self)
+    }
+}
+
+// PORT: the Go interfaces and the concrete type that `*requestFileSystem`
+// satisfies (`project::FsLayer`, server lane).
+impl project::FsLayer for RequestFileSystemImpl {
+    fn as_file_handle_source(&self) -> Option<&dyn project::FileHandleSource> {
         Some(self)
     }
 
@@ -917,11 +926,11 @@ impl vfs::Fs for RequestFileSystemImpl {
         Some(self)
     }
 
-    fn as_file_handle_source(&self) -> Option<&dyn project::FileHandleSource> {
+    fn as_file_change_expander(&self) -> Option<&dyn project::FileChangeExpander> {
         Some(self)
     }
 
-    fn as_file_change_expander(&self) -> Option<&dyn project::FileChangeExpander> {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
 }
@@ -943,7 +952,7 @@ impl project::FileHandleSource for RequestFileSystemImpl {
             return None;
         }
         if let Some(file_system) = &lookup.file_system {
-            if let Some(source) = file_system.as_file_handle_source() {
+            if let Some(source) = project::as_file_handle_source(&**file_system) {
                 return source.get_file(&lookup.path);
             }
             let (content, ok) = file_system.read_file(&lookup.path);
@@ -965,19 +974,20 @@ impl project::FileHandleSource for RequestFileSystemImpl {
 // Go: api/requestfilesystem/requestfilesystem.go requestFileSystem.Overlays
 // (project.LayeredFileSystem)
 impl project::LayeredFileSystem for RequestFileSystemImpl {
-    fn overlays(&self) -> IndexMap<tspath::Path, Rc<project::Overlay>> {
-        let Some(base) = self.base.as_layered_file_system() else {
-            return IndexMap::default();
+    // PORT: Go returns nil when no overlay is kept; that is an empty map.
+    fn overlays(&self) -> Rc<IndexMap<tspath::Path, Rc<project::Overlay>>> {
+        let Some(base) = project::as_layered_file_system(&*self.base) else {
+            return Rc::new(IndexMap::default());
         };
         let mut result: IndexMap<tspath::Path, Rc<project::Overlay>> = IndexMap::default();
-        for (path, overlay) in base.overlays() {
+        for (path, overlay) in base.overlays().iter() {
             let lookup = self.lookup_path(&overlay.file_name());
-            if lookup.file_system.is_none() || self.to_path(&lookup.path) != path {
+            if lookup.file_system.is_none() || self.to_path(&lookup.path) != *path {
                 continue;
             }
-            result.insert(path, overlay);
+            result.insert(path.clone(), overlay.clone());
         }
-        result
+        Rc::new(result)
     }
 }
 
