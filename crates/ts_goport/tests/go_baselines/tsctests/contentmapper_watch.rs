@@ -379,7 +379,7 @@ fn content_mapper_build_detects_new_physical_supplemental_file() {
                 ExitStatus::DiagnosticsPresentOutputsGenerated
             );
             let output = test_sys.output_text();
-            assert!(output.contains("TS100025"), "{output}");
+            assert!(output.contains("TS18069"), "{output}");
             assert!(
                 output.contains("conflicts with an existing file"),
                 "{output}"
