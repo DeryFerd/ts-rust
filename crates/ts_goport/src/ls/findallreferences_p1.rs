@@ -34,9 +34,6 @@ use crate::spanmap::Feature;
 use std::cell::OnceCell;
 use std::collections::VecDeque;
 
-/// Go runtime panic text for a nil pointer dereference.
-const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
-
 // === types for settings ===
 // Go: ls/findallreferences.go:29 referenceUse
 go_enum!(ReferenceUse, i32 {
@@ -220,7 +217,7 @@ impl<P: ProgramView> LanguageService<P> {
             .borrow()
             .lsp_range
             .as_ref()
-            .expect(NIL_DEREF)
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .range
     }
 
@@ -243,7 +240,7 @@ impl<P: ProgramView> LanguageService<P> {
             .borrow()
             .lsp_range
             .as_ref()
-            .expect(NIL_DEREF)
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .uri
             .clone()
     }
@@ -256,7 +253,10 @@ impl<P: ProgramView> LanguageService<P> {
         let resolved = self.resolve_entry(entry);
         let resolved = resolved.borrow();
         (
-            resolved.lsp_range.clone().expect(NIL_DEREF),
+            resolved
+                .lsp_range
+                .clone()
+                .unwrap_or_else(|| crate::core::go_nil_dereference()),
             !resolved.unmappable,
         )
     }
@@ -270,7 +270,11 @@ impl<P: ProgramView> LanguageService<P> {
         self.resolve_entry_source(entry);
         let (source_file, text_range) = {
             let e = entry.borrow();
-            (e.source_file, e.text_range.expect(NIL_DEREF))
+            (
+                e.source_file,
+                e.text_range
+                    .unwrap_or_else(|| crate::core::go_nil_dereference()),
+            )
         };
         let (location, fidelity) =
             self.source_file_range_to_lsp_location_for_feature(source_file, text_range, feature);
@@ -303,7 +307,9 @@ impl<P: ProgramView> LanguageService<P> {
         {
             let mut e = entry.borrow_mut();
             if e.lsp_range.is_none() {
-                let text_range = e.text_range.expect(NIL_DEREF);
+                let text_range = e
+                    .text_range
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 let (location, fidelity) =
                     self.source_file_range_to_lsp_location(e.source_file, text_range);
                 e.lsp_range = Some(location);
@@ -482,7 +488,7 @@ pub fn get_range_of_node(node: Node, mut source_file: Node, end_node: Node) -> T
     let mut end = if end_node.is_some() { end_node } else { node }.end();
     if is_string_literal_like(node) && (end - start) > 2 {
         if end_node.is_some() {
-            panic!("endNode is not nil for stringLiteralLike");
+            crate::core::go_panic("endNode is not nil for stringLiteralLike".to_string());
         }
         start += 1;
         end -= 1;
@@ -556,12 +562,11 @@ pub fn skip_past_export_or_import_specifier_or_union(
                 SymbolId::NIL
             } else {
                 // Assertions for GH#21814. We should be handling SourceFile symbols in `getReferencedSymbolsForModule` instead of getting here.
-                // PORT: Go prints the kind with its stringer (`KindX`).
-                panic!(
-                    "Unexpected symbol at {:?}: {}",
-                    node.kind(),
+                crate::core::go_panic(format!(
+                    "Unexpected symbol at {}: {}",
+                    crate::gostd::debug::kind_string(node.kind()),
                     checker.sym(symbol).name.as_str()
-                );
+                ));
             }
         } else if decl.parent().kind() == SyntaxKind::TypeLiteral
             && decl.parent().parent().kind() == SyntaxKind::UnionType
@@ -752,7 +757,12 @@ impl LanguageService {
         let (checker, _done) = ls_program::get_type_checker(program, ctx);
         let checker = &mut *checker.borrow_mut();
         let emit_resolver = checker.get_emit_resolver();
-        let symbol = entry.borrow().definition.as_ref().expect(NIL_DEREF).symbol;
+        let symbol = entry
+            .borrow()
+            .definition
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .symbol;
         let declarations = checker.sym(symbol).declarations.to_vec();
         for d in declarations {
             if is_definition_visible(&emit_resolver, checker, d) {
@@ -889,7 +899,12 @@ impl<P: ProgramView> LanguageService<P> {
         let program = self.get_program();
         // PORT: Go reads `symbol.Declarations` directly; see the file header.
         let declarations = {
-            let symbol = entry.borrow().definition.as_ref().expect(NIL_DEREF).symbol;
+            let symbol = entry
+                .borrow()
+                .definition
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                .symbol;
             let (checker, _done) = program.get_type_checker(ctx);
             let declarations = checker.borrow().sym(symbol).declarations.to_vec();
             declarations
@@ -1240,7 +1255,7 @@ impl<P: ProgramView> LanguageService<P> {
                 params
                     .context
                     .as_ref()
-                    .expect(NIL_DEREF)
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .include_declaration,
                 Feature::REFERENCES,
             );
@@ -1557,7 +1572,7 @@ impl LanguageService {
                 let reference_file_name = &triple_slash_file_ref
                     .reference
                     .as_ref()
-                    .expect(NIL_DEREF)
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .file_name;
                 Some(ReferencedSymbolDefinitionInfo {
                     node,

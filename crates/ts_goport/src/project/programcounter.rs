@@ -39,7 +39,7 @@ impl ProgramCounter {
         };
         let count = count - 1;
         if count < 0 {
-            panic!("program reference count went below zero");
+            crate::core::go_panic("program reference count went below zero".to_string());
         }
         if count == 0 {
             refs.remove(&key);

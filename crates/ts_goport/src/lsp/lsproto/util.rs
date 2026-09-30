@@ -72,18 +72,24 @@ fn diagnostics_equal(diag1: &Diagnostic, diag2: &Diagnostic) -> bool {
 }
 
 // Go: util.go:69 diagnosticCodesEqual
-// PORT: Go dereferences a nil `*IntegerOrString` and panics; so does this.
+// PORT: a nil `*IntegerOrString` is a Go nil pointer dereference where Go
+// reads it: `code1` first, `code2` only after a `code1` field is set.
 fn diagnostic_codes_equal(
     code1: Option<&IntegerOrString>,
     code2: Option<&IntegerOrString>,
 ) -> bool {
-    let code1 = code1.expect("diagnosticCodesEqual: nil code");
-    let code2 = code2.expect("diagnosticCodesEqual: nil code");
-    if let (Some(s1), Some(s2)) = (&code1.string, &code2.string) {
-        return s1 == s2;
+    let code1 = code1.unwrap_or_else(|| crate::core::go_nil_dereference());
+    if let Some(s1) = &code1.string {
+        let code2 = code2.unwrap_or_else(|| crate::core::go_nil_dereference());
+        if let Some(s2) = &code2.string {
+            return s1 == s2;
+        }
     }
-    if let (Some(i1), Some(i2)) = (code1.integer, code2.integer) {
-        return i1 == i2;
+    if let Some(i1) = code1.integer {
+        let code2 = code2.unwrap_or_else(|| crate::core::go_nil_dereference());
+        if let Some(i2) = code2.integer {
+            return i1 == i2;
+        }
     }
     false
 }
@@ -131,7 +137,7 @@ impl Diagnostic {
             "{} ({}:{}-{}:{}): {}",
             self.code
                 .as_ref()
-                .expect("Diagnostic.AsString: nil code")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .as_string(),
             self.range.start.line,
             self.range.start.character,
@@ -148,7 +154,7 @@ impl Diagnostic {
             "Code({})",
             self.code
                 .as_ref()
-                .expect("Diagnostic.CodeAsString: nil code")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .as_string()
         )
     }

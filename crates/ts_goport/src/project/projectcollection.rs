@@ -273,7 +273,7 @@ impl ProjectCollection {
         let config_file_name = self
             .config_file_registry
             .as_ref()
-            .expect("invalid memory address or nil pointer dereference")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .get_config_file_name(path);
         if !config_file_name.is_empty() {
             return self.find_default_configured_project_worker(
@@ -357,7 +357,7 @@ impl ProjectCollection {
         let config_file_registry = self
             .config_file_registry
             .as_ref()
-            .expect("invalid memory address or nil pointer dereference");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         if let Some(config) = config_file_registry.get_config(path) {
             if config
                 .compiler_options()
@@ -431,8 +431,7 @@ pub fn find_default_configured_project_from_program_inclusion(
     let mut multiple_direct_inclusions = false;
 
     for project_path in project_paths {
-        let p =
-            get_project(project_path).expect("invalid memory address or nil pointer dereference");
+        let p = get_project(project_path).unwrap_or_else(|| crate::core::go_nil_dereference());
         let p = p.borrow();
         if p.contains_file(path) {
             containing_projects.push(project_path.clone());

@@ -155,16 +155,20 @@ pub fn is_potentially_valid_js_doc_snippet_completion_position(file: Node, posit
 fn go_text_slice(text: &str, lo: i32, hi: i32) -> &str {
     let len = text.len();
     if hi < 0 {
-        panic!("runtime error: slice bounds out of range [:{hi}]");
+        crate::core::go_panic(format!("runtime error: slice bounds out of range [:{hi}]"));
     }
     if hi as usize > len {
-        panic!("runtime error: slice bounds out of range [:{hi}] with length {len}");
+        crate::core::go_panic(format!(
+            "runtime error: slice bounds out of range [:{hi}] with length {len}"
+        ));
     }
     if lo < 0 {
-        panic!("runtime error: slice bounds out of range [{lo}:]");
+        crate::core::go_panic(format!("runtime error: slice bounds out of range [{lo}:]"));
     }
     if lo > hi {
-        panic!("runtime error: slice bounds out of range [{lo}:{hi}]");
+        crate::core::go_panic(format!(
+            "runtime error: slice bounds out of range [{lo}:{hi}]"
+        ));
     }
     &text[lo as usize..hi as usize]
 }
@@ -213,7 +217,7 @@ fn get_doc_comment_template_at_position(
             .into_boxed_str(),
         );
         let parsed = ls_program::parsed_source_file(source_file)
-            .expect("invalid memory address or nil pointer dereference");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let reparse = Rc::new(crate::frontend::parser::parse_source_file(
             parsed.parse_options(),
             reparse_text,
@@ -300,7 +304,7 @@ fn is_template_source_file_js(source_file: Node) -> bool {
         return is_source_file_js(source_file);
     }
     let script_kind = ls_program::parsed_source_file(source_file)
-        .expect("invalid memory address or nil pointer dereference")
+        .unwrap_or_else(|| crate::core::go_nil_dereference())
         .script_kind;
     script_kind == ScriptKind::JS || script_kind == ScriptKind::JSX
 }

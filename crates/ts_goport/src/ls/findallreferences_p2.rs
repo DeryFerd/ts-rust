@@ -775,9 +775,7 @@ impl<P: ProgramView> LanguageService<P> {
                         let text_range = reference
                             .ref_
                             .as_ref()
-                            .expect(
-                                "runtime error: invalid memory address or nil pointer dereference",
-                            )
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
                             .range;
                         Some(Rc::new(RefCell::new(ReferenceEntry {
                             kind: EntryKind::RANGE,
@@ -1735,7 +1733,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
             // result always sets; Go would fail on nil inside the tracker.
             let export_info = import_or_export
                 .export_info
-                .expect("runtime error: invalid memory address or nil pointer dereference");
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             self.search_for_imports_of_export(
                 reference_location,
                 import_or_export.symbol,

@@ -145,7 +145,7 @@ impl<T: Named + Clone> Index<T> {
 
         let name = value.name();
         if name.is_empty() {
-            panic!("Cannot index entry with empty name");
+            crate::core::go_panic("Cannot index entry with empty name".to_string());
         }
         let entry_index = self.entries.len() as i32;
         self.entries.push(value);

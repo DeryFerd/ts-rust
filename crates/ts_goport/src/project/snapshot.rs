@@ -14,8 +14,6 @@ use std::cell::{Cell, OnceCell};
 use std::panic::AssertUnwindSafe;
 use std::time::Instant;
 
-const NIL_DEREF: &str = "invalid memory address or nil pointer dereference";
-
 // Go: project/snapshot.go:26 Snapshot
 pub struct Snapshot {
     pub id: u64,
@@ -822,20 +820,22 @@ impl Snapshot {
         }
         let mut auto_imports_watch: Option<Rc<WatchedFiles<FxHashMap<tspath::Path, String>>>> =
             None;
-        let clone_result = old_auto_imports.expect(NIL_DEREF).clone_(
-            ctx,
-            autoimport::RegistryChange {
-                requested_file: prepare_auto_imports,
-                open_files,
-                changed: change.file_changes.changed.clone(),
-                created: change.file_changes.created.clone(),
-                deleted: change.file_changes.deleted.clone(),
-                rebuilt_programs: projects_with_new_program_structure,
-                user_preferences: change.new_config.clone(),
-            },
-            auto_import_host.clone() as Rc<dyn autoimport::RegistryCloneHost>,
-            logger.fork("UpdateAutoImports"),
-        );
+        let clone_result = old_auto_imports
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .clone_(
+                ctx,
+                autoimport::RegistryChange {
+                    requested_file: prepare_auto_imports,
+                    open_files,
+                    changed: change.file_changes.changed.clone(),
+                    created: change.file_changes.created.clone(),
+                    deleted: change.file_changes.deleted.clone(),
+                    rebuilt_programs: projects_with_new_program_structure,
+                    user_preferences: change.new_config.clone(),
+                },
+                auto_import_host.clone() as Rc<dyn autoimport::RegistryCloneHost>,
+                logger.fork("UpdateAutoImports"),
+            );
         // PORT: Go `autoImports, err := ...`; on an error Go `autoImports` is nil.
         let auto_imports: Option<Rc<autoimport::Registry>> = match clone_result {
             Ok(auto_imports) => {
@@ -893,10 +893,14 @@ impl Snapshot {
                     // mutations don't happen afterwards. In the future, we might improve things by
                     // separating what it takes to build a program from what it takes to use a program,
                     // and only pass the former into NewProgram instead of retaining it indefinitely.
-                    project.host.as_ref().expect(NIL_DEREF).freeze(
-                        snapshot_fs.clone(),
-                        new_snapshot.config_file_registry.clone(),
-                    );
+                    project
+                        .host
+                        .as_ref()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
+                        .freeze(
+                            snapshot_fs.clone(),
+                            new_snapshot.config_file_registry.clone(),
+                        );
                 }
             }
         }
@@ -936,10 +940,10 @@ impl Snapshot {
         let rc = self.ref_count.get() + 1;
         self.ref_count.set(rc);
         if rc <= 1 {
-            panic!(
+            crate::core::go_panic(format!(
                 "snapshot {}: ref on disposed snapshot, parentId={}",
                 self.id, self.parent_id
-            );
+            ));
         }
     }
 
@@ -965,10 +969,10 @@ impl Snapshot {
         let rc = self.ref_count.get() - 1;
         self.ref_count.set(rc);
         if rc < 0 {
-            panic!(
+            crate::core::go_panic(format!(
                 "snapshot {}: ref count below zero, parentId={}",
                 self.id, self.parent_id
-            );
+            ));
         }
         if rc == 0 {
             self.dispose(session);

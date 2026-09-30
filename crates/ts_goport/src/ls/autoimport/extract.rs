@@ -286,7 +286,7 @@ impl ExportExtractor<'_> {
                 let to_path = self
                     .to_path
                     .clone()
-                    .expect("invalid memory address or nil pointer dereference");
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 if resolved.is_resolved() {
                     module_file_name = resolved.resolved_file_name.clone();
                     module_id = ModuleID(to_path(&module_file_name).0);
@@ -358,7 +358,9 @@ impl SymbolExtractor<'_> {
                     if idx >= 0 || should_ignore_symbol(&self.checker.symbols, named_export) {
                         // Go: slices.Delete(allExports, idx, idx+1) panics on idx -1.
                         if idx < 0 {
-                            panic!("runtime error: slice bounds out of range [-1:]");
+                            crate::core::go_panic(
+                                "runtime error: slice bounds out of range [-1:]".to_string(),
+                            );
                         }
                         all_exports.remove(idx as usize);
                     }
@@ -544,7 +546,7 @@ impl SymbolExtractor<'_> {
                     decl = self.checker.sym(symbol).declarations[0];
                 }
                 if decl.is_nil() {
-                    panic!("no declaration for aliased symbol");
+                    crate::core::go_panic("no declaration for aliased symbol".to_string());
                 }
 
                 let mut parent = self.checker.sym(target_symbol).parent;
