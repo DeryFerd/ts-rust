@@ -23,21 +23,151 @@ pub const SYNTHETIC_PROJECT_PREFIX: &str = "/dev/null/synthetic/";
 // Go: project/project.go:27 hr
 pub const HR: &str = "-----------------------------------------------";
 
-// Go: project/project.go:30 syntheticProjectName (ts#64204)
-pub fn synthetic_project_name(id: i32) -> String {
-    format!("{SYNTHETIC_PROJECT_PREFIX}{id}")
+// Go: project/project.go:31 ID (ts#64319)
+// PORT: Go `type ID string`. The derived `Ord` is Go's string order
+// (`cmp.Compare`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ID(pub String);
+
+// Go: project/project.go:33 ConfiguredProjectID (ts#64319)
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConfiguredProjectID(pub tspath::Path);
+
+impl ConfiguredProjectID {
+    // Go: project/project.go:35 ConfiguredProjectID.Path
+    pub fn path(&self) -> tspath::Path {
+        self.0.clone()
+    }
+
+    // Go: project/project.go:53 ConfiguredProjectID.AsID
+    pub fn as_id(&self) -> ID {
+        ID(self.0.0.clone())
+    }
 }
 
-// Go: project/project.go:34 SyntheticProgramID (ts#64204)
+// Go: project/project.go:39 InferredProjectID (ts#64319)
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InferredProjectID(pub String);
+
+// Go: project/project.go:41 inferredProjectID
+// PORT: Go `const inferredProjectID InferredProjectID = inferredProjectName`.
+pub fn inferred_project_id() -> InferredProjectID {
+    InferredProjectID(INFERRED_PROJECT_NAME.to_string())
+}
+
+impl InferredProjectID {
+    // Go: project/project.go:54 InferredProjectID.AsID
+    pub fn as_id(&self) -> ID {
+        ID(self.0.clone())
+    }
+}
+
+// Go: project/project.go:43 SyntheticProjectID (ts#64319)
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SyntheticProjectID(pub String);
+
+// Go: project/project.go:45 NewSyntheticProjectID (ts#64319)
+pub fn new_synthetic_project_id(id: i32) -> SyntheticProjectID {
+    if id <= 0 {
+        panic!("invalid synthetic project ID: {id}");
+    }
+    SyntheticProjectID(format!("{SYNTHETIC_PROJECT_PREFIX}{id}"))
+}
+
+impl SyntheticProjectID {
+    // Go: project/project.go:55 SyntheticProjectID.AsID
+    pub fn as_id(&self) -> ID {
+        ID(self.0.clone())
+    }
+}
+
+/// Go `%s` of an ID type is its string.
+impl std::fmt::Display for ID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Display for ConfiguredProjectID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.0)
+    }
+}
+
+impl std::fmt::Display for SyntheticProjectID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl ID {
+    // Go: project/project.go:52 ID.String
+    pub fn string(&self) -> String {
+        self.0.clone()
+    }
+
+    // Go: project/project.go:57 ID.Configured
+    pub fn configured(&self) -> (ConfiguredProjectID, bool) {
+        parse_configured_project_id(&tspath::Path(self.0.clone()))
+    }
+
+    // Go: project/project.go:75 ID.Inferred
+    pub fn inferred(&self) -> (InferredProjectID, bool) {
+        (
+            inferred_project_id(),
+            *self == inferred_project_id().as_id(),
+        )
+    }
+
+    // Go: project/project.go:79 ID.Synthetic
+    pub fn synthetic(&self) -> (SyntheticProjectID, bool) {
+        parse_synthetic_project_id(&self.0)
+    }
+
+    /// Go: an `ID` passed as an `autoimport.ProjectID` (the Go interface holds
+    /// the `ID`; the Rust type holds its string).
+    // PORT: not in Go.
+    pub fn as_auto_import_project_id(&self) -> autoimport::ProjectID {
+        autoimport::ProjectID(self.0.clone())
+    }
+}
+
+// PORT: Go passes an `ID` as an `ata.ProjectID` (`fmt.Stringer`).
+impl ata::ProjectID for ID {
+    fn string(&self) -> String {
+        self.0.clone()
+    }
+}
+
+// Go: project/project.go:61 ParseConfiguredProjectID (ts#64319)
+pub fn parse_configured_project_id(value: &tspath::Path) -> (ConfiguredProjectID, bool) {
+    let id = ID(value.0.clone());
+    if id.0.is_empty() {
+        return (ConfiguredProjectID::default(), false);
+    }
+    if id.inferred().1 {
+        return (ConfiguredProjectID::default(), false);
+    }
+    if id.synthetic().1 {
+        return (ConfiguredProjectID::default(), false);
+    }
+    (ConfiguredProjectID(value.clone()), true)
+}
+
+// Go: project/project.go:83 SyntheticProjectID.UnmarshalJSONFrom (ts#64319)
+// PORT: the JSON impls of the project ID types are in src/api/proto.rs, with
+// the other API JSON impls.
+
+// Go: project/project.go:96 ParseSyntheticProjectID (ts#64319)
 // PORT: Go `strconv.Atoi` accepts a leading sign; `str::parse::<i32>` does
 // too.
-pub fn synthetic_program_id(path: &tspath::Path) -> (i32, bool) {
-    let Some(value) = path.as_str().strip_prefix(SYNTHETIC_PROJECT_PREFIX) else {
-        return (0, false);
+pub fn parse_synthetic_project_id(value: &str) -> (SyntheticProjectID, bool) {
+    let Some(suffix) = value.strip_prefix(SYNTHETIC_PROJECT_PREFIX) else {
+        return (SyntheticProjectID::default(), false);
     };
-    match value.parse::<i32>() {
-        Ok(id) => (id, id > 0),
-        Err(_) => (0, false),
+    match suffix.parse::<i32>() {
+        Ok(id) if id > 0 => (new_synthetic_project_id(id), true),
+        _ => (SyntheticProjectID::default(), false),
     }
 }
 
@@ -96,6 +226,8 @@ impl PendingReload {
 #[derive(Default)]
 pub struct Project {
     pub kind: Kind,
+    // ts#64319
+    pub id: ID,
     pub current_directory: String,
     pub config_file_name: String,
     pub config_file_path: tspath::Path,
@@ -136,17 +268,28 @@ pub struct Project {
 // PORT: Go `*ProjectCollectionBuilder` is only read here, so it is a borrow.
 pub fn new_configured_project(
     config_file_name: &str,
-    _config_file_path: &tspath::Path,
+    config_file_path: &tspath::Path,
     builder: &ProjectCollectionBuilder,
     logger: Option<Rc<logging::LogTree>>,
 ) -> Rc<RefCell<Project>> {
-    new_project(
-        config_file_name,
+    // ts#64319
+    let (configured_project_id, ok) = parse_configured_project_id(config_file_path);
+    if !ok {
+        panic!("invalid configured project ID: {config_file_path}");
+    }
+    let project = new_project(
+        configured_project_id.as_id(),
         Kind::CONFIGURED,
         &tspath::get_directory_path(config_file_name),
         builder,
         logger,
-    )
+    );
+    {
+        let mut p = project.borrow_mut();
+        p.config_file_name = config_file_name.to_string();
+        p.config_file_path = config_file_path.clone();
+    }
+    project
 }
 
 // Go: project/project.go:100 NewInferredProject
@@ -164,7 +307,7 @@ pub fn new_inferred_project(
     logger: Option<Rc<logging::LogTree>>,
 ) -> Rc<RefCell<Project>> {
     let p = new_project(
-        INFERRED_PROJECT_NAME,
+        inferred_project_id().as_id(),
         Kind::INFERRED,
         current_directory,
         builder,
@@ -206,7 +349,7 @@ pub fn new_inferred_project(
 // value, so a nil one is the zero options.
 #[allow(clippy::too_many_arguments)]
 pub fn new_synthetic_project(
-    name: &str,
+    id: SyntheticProjectID,
     current_directory: &str,
     compiler_options: Option<Rc<CompilerOptions>>,
     root_file_names: Vec<String>,
@@ -215,7 +358,13 @@ pub fn new_synthetic_project(
     builder: &ProjectCollectionBuilder,
     logger: Option<Rc<logging::LogTree>>,
 ) -> Rc<RefCell<Project>> {
-    let project = new_project(name, Kind::SYNTHETIC, current_directory, builder, logger);
+    let project = new_project(
+        id.as_id(),
+        Kind::SYNTHETIC,
+        current_directory,
+        builder,
+        logger,
+    );
     let command_line = new_inferred_project_command_line(
         compiler_options.unwrap_or_default(),
         root_file_names,
@@ -249,8 +398,10 @@ pub fn new_inferred_project_command_line(
 }
 
 // Go: project/project.go:134 NewProject
+// ts#64319: takes the project ID; a configured project sets its config file
+// name and path after (NewConfiguredProject).
 pub fn new_project(
-    config_file_name: &str,
+    id: ID,
     kind: Kind,
     current_directory: &str,
     builder: &ProjectCollectionBuilder,
@@ -260,25 +411,20 @@ pub fn new_project(
         logger.log(&format!(
             "Creating {}Project: {}, currentDirectory: {}",
             kind.string(),
-            config_file_name,
+            id,
             current_directory
         ));
     }
     let mut project = Project {
-        config_file_name: config_file_name.to_string(),
         kind,
+        id: id.clone(),
         current_directory: current_directory.to_string(),
         dirty: true,
         ..Default::default()
     };
 
-    project.config_file_path = tspath::to_path(
-        config_file_name,
-        current_directory,
-        builder.fs.fs.use_case_sensitive_file_names(),
-    );
     project.program_files_watch = Some(new_watched_files(
-        &format!("program files for {config_file_name}"),
+        &format!("program files for {id}"),
         lsproto::WatchKind(
             lsproto::WatchKind::CREATE.0
                 | lsproto::WatchKind::CHANGE.0
@@ -314,7 +460,7 @@ pub fn new_project(
         ));
     }
     project.content_mapper_watch = Some(new_watched_files_for_paths(
-        &format!("content mapper configuration files for {config_file_name}"),
+        &format!("content mapper configuration files for {id}"),
         lsproto::WatchKind(
             lsproto::WatchKind::CREATE.0
                 | lsproto::WatchKind::CHANGE.0
@@ -332,11 +478,6 @@ pub fn new_project(
 }
 
 impl Project {
-    // Go: project/project.go:169 Project.Name
-    pub fn name(&self) -> String {
-        self.config_file_name.clone()
-    }
-
     // Go: project/project.go:198 Project.CurrentDirectory (ts#63935)
     pub fn current_directory(&self) -> String {
         self.current_directory.clone()
@@ -351,8 +492,13 @@ impl Project {
         if self.kind == Kind::INFERRED {
             return tspath::get_base_file_name(&self.current_directory);
         }
+        // ts#64319
+        let mut name = self.id().0;
+        if self.kind == Kind::CONFIGURED {
+            name = self.config_file_name();
+        }
         tspath::convert_to_relative_path(
-            &self.config_file_name,
+            &name,
             &tspath::ComparePathsOptions {
                 current_directory: cwd.to_string(),
                 ..Default::default()
@@ -360,11 +506,11 @@ impl Project {
         )
     }
 
-    // Go: project/project.go:186 Project.ID
+    // Go: project/project.go:333 Project.ID (ts#64319: the project ID)
     // PORT: Go also has `Id()` (the `ls.Project` method, same snake name);
-    // it is the `ls::Project` impl below. Both return the config file path.
-    pub fn id(&self) -> tspath::Path {
-        self.config_file_path.clone()
+    // it is the `ls::Project` impl below and returns the ID's string.
+    pub fn id(&self) -> ID {
+        self.id.clone()
     }
 
     // Go: project/project.go:191 Project.ConfigFileName
@@ -442,6 +588,7 @@ impl Project {
     pub fn clone_(&self) -> Rc<RefCell<Project>> {
         Rc::new(RefCell::new(Project {
             kind: self.kind,
+            id: self.id.clone(),
             current_directory: self.current_directory.clone(),
             config_file_name: self.config_file_name.clone(),
             config_file_path: self.config_file_path.clone(),
@@ -774,7 +921,7 @@ impl Project {
         _write_file_explanation: bool,
         builder: &mut String,
     ) -> String {
-        builder.push_str(&format!("\nProject '{}'\n", self.name()));
+        builder.push_str(&format!("\nProject '{}'\n", self.id()));
         match &self.program {
             None => {
                 builder.push_str("\tFiles (0) NoProgram\n");
@@ -878,9 +1025,9 @@ impl dirty::Cloneable for Rc<RefCell<Project>> {
 
 // Go: project/project.go:89 `var _ ls.Project = (*Project)(nil)`
 impl ls::Project for Project {
-    // Go: project/project.go:206 Project.Id
-    fn id(&self) -> tspath::Path {
-        self.config_file_path.clone()
+    // Go: project/project.go:353 Project.Id (ts#64319: the ID string)
+    fn id(&self) -> String {
+        Project::id(self).0
     }
 
     // Go: project/project.go:210 Project.GetProgram
@@ -901,7 +1048,7 @@ impl ls::Project for Project {
 // PORT: projects are shared as `Rc<RefCell<Project>>`; this impl lets them
 // coerce to `Rc<dyn ls::Project>` (Go passes the `*Project`).
 impl ls::Project for RefCell<Project> {
-    fn id(&self) -> tspath::Path {
+    fn id(&self) -> String {
         ls::Project::id(&*self.borrow())
     }
 

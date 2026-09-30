@@ -535,23 +535,25 @@ impl ls::Host for Snapshot {
 }
 
 // Go: project/snapshot.go:308 APICreateProgramRequest (ts#64204)
-// PORT: Go `*core.CompilerOptions` is `Option<Rc<CompilerOptions>>` and Go
-// `[]*core.ProjectReference` is `Option<Vec<ProjectReference>>` (nil is
-// `None`).
+// PORT: Go `*core.CompilerOptions` is `Rc<CompilerOptions>`: every Go
+// caller (the API session) sets it. A Go nil `[]*core.ProjectReference` is
+// an empty `Vec`.
 #[derive(Clone, Default)]
 pub struct APICreateProgramRequest {
     pub root_file_names: Vec<String>,
-    pub compiler_options: Option<Rc<CompilerOptions>>,
-    pub project_references: Option<Vec<ProjectReference>>,
+    pub compiler_options: Rc<CompilerOptions>,
+    pub project_references: Vec<ProjectReference>,
     pub config_file_parsing_diagnostics: Vec<Diagnostic>,
 }
 
 // Go: project/snapshot.go:315 APIReconfigureProgramRequest (ts#64204)
-// PORT: Go embeds `APICreateProgramRequest`; here it is the field `request`.
+// PORT: Go embeds `APICreateProgramRequest`; here it is the field
+// `api_create_program_request`.
 #[derive(Clone, Default)]
 pub struct APIReconfigureProgramRequest {
-    pub program_id: i32,
-    pub request: APICreateProgramRequest,
+    // ts#64319
+    pub program_id: SyntheticProjectID,
+    pub api_create_program_request: APICreateProgramRequest,
 }
 
 // Go: project/snapshot.go:159 APISnapshotRequest
@@ -565,12 +567,11 @@ pub struct APISnapshotRequest {
     pub close_projects: Option<FxHashSet<tspath::Path>>,
     pub open_files: Option<IndexSet<lsproto::DocumentUri>>,
     pub close_files: Option<FxHashSet<tspath::Path>>,
-    // ts#64204. PORT: Go `*collections.Set` is `Option<IndexSet>` (request
-    // order; Go map order is random).
+    // ts#64204
     pub create_programs: Vec<APICreateProgramRequest>,
     pub reconfigure_programs: Vec<APIReconfigureProgramRequest>,
-    pub remove_programs: Option<IndexSet<i32>>,
-    pub ensure_programs: Option<IndexSet<tspath::Path>>,
+    pub remove_programs: Option<FxHashSet<SyntheticProjectID>>,
+    pub ensure_programs: Option<FxHashSet<ID>>,
     pub ensure_all_programs: bool,
     pub ensure_files: Option<IndexSet<lsproto::DocumentUri>>,
     // ts#64115
@@ -644,7 +645,8 @@ pub struct ResourceRequest {
     pub configured_project_documents: Vec<lsproto::DocumentUri>,
     // Update requested Projects.
     // this is used when we want to get LS and from all the Projects the file can be part of
-    pub projects: Vec<tspath::Path>,
+    // ts#64319: project IDs.
+    pub projects: Vec<ID>,
     // Update and ensure project trees that reference the projects
     // This is used to compute the solution and project tree so that
     // we can find references across all the projects in the solution irrespective of which project is open
@@ -679,7 +681,8 @@ pub struct SnapshotChange {
     pub content_mapper_contributions: Option<ContentMapperContributions>,
     pub new_config: Option<lsutil::UserPreferences>,
     // ataChanges contains ATA-related changes to apply to projects in the new snapshot.
-    pub ata_changes: FxHashMap<tspath::Path, Rc<ATAStateChange>>,
+    // ts#64319: keyed by project ID.
+    pub ata_changes: FxHashMap<ID, Rc<ATAStateChange>>,
     pub api_request: Option<APISnapshotRequest>,
     // cleanFileCache triggers cleaning of cached files not referenced by any open project.
     // ts#64291: was cleanDiskCache.
@@ -691,7 +694,6 @@ pub struct SnapshotChange {
 // PORT: Go `*ata.TypingsInfo` is `Option<Rc<ata::TypingsInfo>>`.
 #[derive(Clone, Default)]
 pub struct ATAStateChange {
-    pub project_id: tspath::Path,
     // TypingsInfo is the new typings info for the project.
     pub typings_info: Option<Rc<ata::TypingsInfo>>,
     // TypingsFiles is the new list of typing files for the project.
@@ -1013,7 +1015,8 @@ impl Snapshot {
         let (project_collection, config_file_registry) =
             project_collection_builder.finalize(logger.clone());
 
-        let mut projects_with_new_program_structure: FxHashMap<tspath::Path, bool> =
+        // ts#64319: keyed by project ID.
+        let mut projects_with_new_program_structure: FxHashMap<autoimport::ProjectID, bool> =
             FxHashMap::default();
         for project in project_collection.projects() {
             let project = project.borrow();
@@ -1021,7 +1024,7 @@ impl Snapshot {
                 && project.program_update_kind != ProgramUpdateKind::CLONED
             {
                 projects_with_new_program_structure.insert(
-                    project.config_file_path.clone(),
+                    project.id().as_auto_import_project_id(),
                     project.program_update_kind == ProgramUpdateKind::NEW_FILES,
                 );
             }

@@ -147,25 +147,35 @@ impl module::ResolutionHost for AutoImportRegistryCloneHost {
 impl autoimport::RegistryCloneHost for AutoImportRegistryCloneHost {
     // Go: project/autoimport.go:105 GetDefaultProject
     // GetDefaultProject implements autoimport.RegistryCloneHost.
+    // ts#64319: the project ID (Go nil is `None`).
     fn get_default_project(
         &self,
         path: &tspath::Path,
-    ) -> (tspath::Path, Option<Rc<compiler::NewProgram>>) {
+    ) -> (
+        Option<autoimport::ProjectID>,
+        Option<Rc<compiler::NewProgram>>,
+    ) {
         let Some(project) = self.project_collection.get_default_project(path) else {
-            return (tspath::Path::default(), None);
+            return (None, None);
         };
         let project = project.borrow();
         // PORT: Go `project.GetProgram()` is the field read.
-        (project.config_file_path.clone(), project.program.clone())
+        (
+            Some(project.id().as_auto_import_project_id()),
+            project.program.clone(),
+        )
     }
 
     // Go: project/autoimport.go:145 GetProgramForProject
     // GetProgramForProject implements autoimport.RegistryCloneHost.
+    // ts#64319: Go asserts the `autoimport.ProjectID` to a project `ID`; every
+    // Rust `ProjectID` holds an ID string.
     fn get_program_for_project(
         &self,
-        project_path: &tspath::Path,
+        project_id: &autoimport::ProjectID,
     ) -> Option<Rc<compiler::NewProgram>> {
-        let project = self.project_collection.get_project_by_path(project_path)?;
+        let id = ID(project_id.0.clone());
+        let project = self.project_collection.get_project(&id)?;
         // PORT: Go `project.GetProgram()` is the field read.
         let program = project.borrow().program.clone();
         program

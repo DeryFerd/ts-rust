@@ -19,23 +19,24 @@ impl Session {
     // host changes flushed alongside it are adopted separately.
     // PORT: Go `(*Snapshot, error)` with a nil snapshot on error is a
     // `Result` (ts#64204). Go `*APISnapshotRequest` is
-    // `Option<APISnapshotRequest>` (nil is `None`).
+    // `Option<&APISnapshotRequest>` (nil is `None`); the snapshot change holds
+    // a copy.
     pub fn api_update(
         self: &Rc<Self>,
         ctx: &Context,
-        api_file_changes: &FileChangeSummary,
-        api_request: Option<APISnapshotRequest>,
+        api_file_changes: FileChangeSummary,
+        api_request: Option<&APISnapshotRequest>,
     ) -> Result<Rc<Snapshot>, GoError> {
         self.cancel_scheduled_snapshot_update();
 
         let (host_file_changes, overlays, ata_changes, _) = self.flush_changes(ctx);
         // Go: hostFileChanges.Clone()
         let mut file_changes = host_file_changes.clone();
-        merge_file_change_summary(&mut file_changes, api_file_changes);
+        merge_file_change_summary(&mut file_changes, &api_file_changes);
         // ts#64115
         let mut fs: Option<Rc<dyn vfs::Fs>> = None;
         let mut replace_file_system = false;
-        if let Some(api_request) = &api_request {
+        if let Some(api_request) = api_request {
             fs = api_request.file_system.clone();
             replace_file_system = api_request.replace_file_system;
         }
@@ -44,7 +45,7 @@ impl Session {
             ctx,
             overlays.clone(),
             SnapshotChange {
-                api_request,
+                api_request: api_request.cloned(),
                 file_system_override: fs.is_some(),
                 fs,
                 replace_file_system,

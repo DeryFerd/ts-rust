@@ -102,21 +102,22 @@ impl SnapshotHost {
     // CloneSnapshot derives a snapshot from baseSnapshot without adopting it as any
     // canonical session state or performing session side effects.
     // PORT: Go returns `(*Snapshot, error)` and returns the snapshot also with
-    // an error; the port returns both values.
+    // an error; the port returns both values. Go `*APISnapshotRequest` is
+    // `Option<&APISnapshotRequest>`; the snapshot change holds a copy.
     pub fn clone_snapshot(
         &self,
         ctx: &Context,
         base_snapshot: &Rc<Snapshot>,
         file_changes: FileChangeSummary,
-        api_request: Option<APISnapshotRequest>,
+        api_request: Option<&APISnapshotRequest>,
     ) -> (Rc<Snapshot>, Option<GoError>) {
         let mut change = SnapshotChange {
-            api_request: api_request.clone(),
+            api_request: api_request.cloned(),
             file_changes,
             ..Default::default()
         };
         // ts#64115
-        if let Some(api_request) = &api_request {
+        if let Some(api_request) = api_request {
             change.fs = api_request.file_system.clone();
             change.file_system_override = api_request.file_system.is_some();
             change.replace_file_system = api_request.replace_file_system;

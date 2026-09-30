@@ -271,7 +271,7 @@ child_test! {
         assert_eq!(projects_len(&session), 2);
         assert!(has_inferred_project(&session));
         assert_eq!(
-            default_project_name(&session, index_uri),
+            default_project_config_file_name(&session, index_uri),
             "/home/projects/TS/p1/tsconfig.json"
         );
 

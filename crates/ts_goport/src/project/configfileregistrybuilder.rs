@@ -458,21 +458,16 @@ impl ConfigFileRegistryBuilder {
         entry.change_if(
             &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
                 let config = config.expect("invalid memory address or nil pointer dereference");
-                let project_config_file_path = project.borrow().config_file_path.clone();
-                let already_retaining = config
-                    .borrow()
-                    .retaining_projects
-                    .contains(&project_config_file_path);
+                // ts#64319
+                let project_id = project.borrow().id();
+                let already_retaining = config.borrow().retaining_projects.contains(&project_id);
                 needs_retain_project.set(!already_retaining);
                 needs_retain_project.get() || config.borrow().pending_reload != PendingReload::NONE
             },
             &mut |config: &Rc<RefCell<ConfigFileEntry>>| {
                 if needs_retain_project.get() {
-                    let project_config_file_path = project.borrow().config_file_path.clone();
-                    config
-                        .borrow_mut()
-                        .retaining_projects
-                        .insert(project_config_file_path);
+                    let project_id = project.borrow().id();
+                    config.borrow_mut().retaining_projects.insert(project_id);
                 }
                 content_mappers_changed.set(self.reload_if_needed(
                     config,
@@ -552,20 +547,17 @@ impl ConfigFileRegistryBuilder {
     // Go: project/configfileregistrybuilder.go:300 configFileRegistryBuilder.releaseConfigForProject
     // releaseConfigForProject removes the project from the config entry. Once no projects
     // or files are associated with the config entry, it will be removed on the next call to `cleanup`.
-    pub fn release_config_for_project(
-        &self,
-        config_file_path: &tspath::Path,
-        project_path: &tspath::Path,
-    ) {
+    // ts#64319: takes the project ID.
+    pub fn release_config_for_project(&self, config_file_path: &tspath::Path, project_id: &ID) {
         if let (Some(entry), true) = self.configs.load(config_file_path) {
             entry.change_if(
                 &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
                     let config = config.expect("invalid memory address or nil pointer dereference");
-                    let exists = config.borrow().retaining_projects.contains(project_path);
+                    let exists = config.borrow().retaining_projects.contains(project_id);
                     exists
                 },
                 &mut |config: &Rc<RefCell<ConfigFileEntry>>| {
-                    config.borrow_mut().retaining_projects.remove(project_path);
+                    config.borrow_mut().retaining_projects.remove(project_id);
                 },
             );
         }
@@ -574,23 +566,20 @@ impl ConfigFileRegistryBuilder {
     // Go: project/configfileregistrybuilder.go:356 configFileRegistryBuilder.retainConfigForProject (ts#63950)
     // PORT: a Go nil `retainingProjects` map is the empty set here, so the
     // Go `make` before the write is not needed.
-    pub fn retain_config_for_project(
-        &self,
-        config_file_path: &tspath::Path,
-        project_path: &tspath::Path,
-    ) {
+    // ts#64319: takes the project ID.
+    pub fn retain_config_for_project(&self, config_file_path: &tspath::Path, project_id: &ID) {
         if let (Some(entry), true) = self.configs.load(config_file_path) {
             entry.change_if(
                 &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
                     let config = config.expect("invalid memory address or nil pointer dereference");
-                    let exists = config.borrow().retaining_projects.contains(project_path);
+                    let exists = config.borrow().retaining_projects.contains(project_id);
                     !exists
                 },
                 &mut |config: &Rc<RefCell<ConfigFileEntry>>| {
                     config
                         .borrow_mut()
                         .retaining_projects
-                        .insert(project_path.clone());
+                        .insert(project_id.clone());
                 },
             );
         }
@@ -636,7 +625,7 @@ impl ConfigFileRegistryBuilder {
 
     // Go: project/configfileregistrybuilder.go:353 configFileRegistryBuilder.invalidateCache
     pub fn invalidate_cache(&self, logger: Option<Rc<logging::LogTree>>) -> ChangeFileResult {
-        let mut affected_projects: Option<FxHashSet<tspath::Path>> = None;
+        let mut affected_projects: Option<FxHashSet<ID>> = None;
         let mut affected_files: Option<FxHashSet<tspath::Path>> = None;
 
         logger.log("Too many files changed; marking all configs for reload");
@@ -711,7 +700,7 @@ impl ConfigFileRegistryBuilder {
         if summary.invalidate_all {
             return self.invalidate_cache(logger);
         }
-        let mut affected_projects: Option<FxHashSet<tspath::Path>> = None;
+        let mut affected_projects: Option<FxHashSet<ID>> = None;
         let mut affected_files: Option<FxHashSet<tspath::Path>> = None;
         let mut should_invalidate_cache = false;
 
@@ -966,8 +955,8 @@ impl ConfigFileRegistryBuilder {
         &self,
         entry: &dirty::SyncMapEntry<tspath::Path, Rc<RefCell<ConfigFileEntry>>>,
         logger: Option<Rc<logging::LogTree>>,
-    ) -> FxHashSet<tspath::Path> {
-        let mut affected_projects: FxHashSet<tspath::Path> = FxHashSet::default();
+    ) -> FxHashSet<ID> {
+        let mut affected_projects: FxHashSet<ID> = FxHashSet::default();
         let changed = entry.change_if(
             &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
                 let config = config.expect("invalid memory address or nil pointer dereference");
@@ -1275,7 +1264,8 @@ pub fn content_mapper_manifest_path(
 // PORT: a nil Go map is the empty set.
 #[derive(Clone, Debug, Default)]
 pub struct ChangeFileResult {
-    pub affected_projects: FxHashSet<tspath::Path>,
+    // ts#64319: project IDs.
+    pub affected_projects: FxHashSet<ID>,
     pub affected_files: FxHashSet<tspath::Path>,
 }
 

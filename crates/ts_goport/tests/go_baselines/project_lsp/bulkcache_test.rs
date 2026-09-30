@@ -225,7 +225,7 @@ child_test! {
 
         // Initially, the file should use the root project (strict mode)
         assert_eq!(
-            default_project_name(&session, lib_uri),
+            default_project_config_file_name(&session, lib_uri),
             "/project/tsconfig.json",
             "Should initially use root tsconfig"
         );
@@ -263,7 +263,7 @@ child_test! {
 
         // The file should now use the nested tsconfig
         assert_eq!(
-            default_project_name(&session, lib_uri),
+            default_project_config_file_name(&session, lib_uri),
             "/project/src/utils/tsconfig.json",
             "Should now use nested tsconfig after bulk invalidation"
         );
@@ -337,7 +337,7 @@ fn config_file_names_cache(file_events: Vec<lsproto::FileEvent>, expect_config_d
             "Should now use configured project after cache invalidation"
         );
         assert_eq!(
-            new_project.borrow().name(),
+            new_project.borrow().config_file_name(),
             "/project/tsconfig.json",
             "Should use the newly discovered tsconfig"
         );

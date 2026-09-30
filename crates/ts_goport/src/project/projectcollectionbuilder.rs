@@ -65,10 +65,11 @@ pub struct ProjectCollectionBuilder {
 
     // PORT: a Go nil map is an empty map (Go only reads it, compares it
     // with `maps.Equal`, or makes it before a write).
-    pub file_default_projects: RefCell<FxHashMap<tspath::Path, tspath::Path>>,
-    pub configured_projects: Rc<dirty::SyncMap<tspath::Path, Rc<RefCell<Project>>>>,
+    // ts#64319: typed project IDs.
+    pub file_default_projects: RefCell<FxHashMap<tspath::Path, ID>>,
+    pub configured_projects: Rc<dirty::SyncMap<ConfiguredProjectID, Rc<RefCell<Project>>>>,
     // ts#64204
-    pub synthetic_projects: Rc<dirty::SyncMap<tspath::Path, Rc<RefCell<Project>>>>,
+    pub synthetic_projects: Rc<dirty::SyncMap<SyntheticProjectID, Rc<RefCell<Project>>>>,
     pub inferred_project: Rc<dirty::Box<Rc<RefCell<Project>>>>,
     pub created_programs: RefCell<Vec<Rc<RefCell<Project>>>>,
 
@@ -147,11 +148,6 @@ pub fn new_project_collection_builder(
         open_files_changed: Cell::new(open_files_changed),
         file_default_projects: RefCell::new(FxHashMap::default()),
     })
-}
-
-/// Go `tspath.Path(inferredProjectName)`.
-fn inferred_project_path() -> tspath::Path {
-    tspath::Path(INFERRED_PROJECT_NAME.to_string())
 }
 
 // PORT: Go `ensureCloned` (closure in Finalize). `None` is Go
@@ -357,7 +353,10 @@ impl ProjectCollectionBuilder {
         }
 
         for project_path in &projects_to_close {
-            if let (Some(entry), true) = self.configured_projects.load(project_path) {
+            if let (Some(entry), true) = self
+                .configured_projects
+                .load(&ConfiguredProjectID(project_path.clone()))
+            {
                 self.delete_project(&*entry, logger.clone());
             }
         }
@@ -408,7 +407,7 @@ impl ProjectCollectionBuilder {
             // Go: b.cleanupConfiguredProjects(nil, logger)
             self.cleanup_configured_projects(&FxHashSet::default(), logger.clone());
         }
-        let mut seen_reconfigured_programs: FxHashSet<i32> = FxHashSet::default();
+        let mut seen_reconfigured_programs: FxHashSet<SyntheticProjectID> = FxHashSet::default();
         for request in &api_request.reconfigure_programs {
             if seen_reconfigured_programs.contains(&request.program_id) {
                 return Err(gostd::errors::errorf(
@@ -419,7 +418,7 @@ impl ProjectCollectionBuilder {
                     vec![],
                 ));
             }
-            seen_reconfigured_programs.insert(request.program_id);
+            seen_reconfigured_programs.insert(request.program_id.clone());
             if api_request
                 .remove_programs
                 .as_ref()
@@ -433,9 +432,7 @@ impl ProjectCollectionBuilder {
                     vec![],
                 ));
             }
-            let (_, ok) = self
-                .synthetic_projects
-                .load(&(self.to_path)(&synthetic_project_name(request.program_id)));
+            let (_, ok) = self.synthetic_projects.load(&request.program_id);
             if !ok {
                 return Err(gostd::errors::errorf(
                     format!(
@@ -447,8 +444,7 @@ impl ProjectCollectionBuilder {
             }
         }
         for program_id in api_request.remove_programs.iter().flatten() {
-            let project_path = (self.to_path)(&synthetic_project_name(*program_id));
-            let (Some(project), true) = self.synthetic_projects.load(&project_path) else {
+            let (Some(project), true) = self.synthetic_projects.load(program_id) else {
                 return Err(gostd::errors::errorf(
                     format!("synthetic program not found for removal: {}", program_id),
                     vec![],
@@ -456,14 +452,17 @@ impl ProjectCollectionBuilder {
             };
             self.delete_project(&*project, logger.clone());
         }
-        let mut created_entries: Vec<Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<Project>>>>> =
-            Vec::with_capacity(api_request.create_programs.len());
+        let mut created_entries: Vec<
+            Rc<dirty::SyncMapEntry<SyntheticProjectID, Rc<RefCell<Project>>>>,
+        > = Vec::with_capacity(api_request.create_programs.len());
+        // PORT: an empty `project_references` is the Go nil slice.
         for request in &api_request.create_programs {
             let entry = self.update_or_create_synthetic_project(
-                &self.next_synthetic_project_name(),
+                self.next_synthetic_project_id(),
                 request.root_file_names.clone(),
-                request.compiler_options.clone(),
-                request.project_references.clone(),
+                Some(request.compiler_options.clone()),
+                (!request.project_references.is_empty())
+                    .then(|| request.project_references.clone()),
                 request.config_file_parsing_diagnostics.clone(),
                 self.inferred_content_mappers.clone(),
                 logger.clone(),
@@ -471,19 +470,22 @@ impl ProjectCollectionBuilder {
             created_entries.push(entry);
         }
         let mut reconfigured_entries: Vec<
-            Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<Project>>>>,
+            Rc<dirty::SyncMapEntry<SyntheticProjectID, Rc<RefCell<Project>>>>,
         > = Vec::with_capacity(api_request.reconfigure_programs.len());
         for request in &api_request.reconfigure_programs {
-            let project_name = synthetic_project_name(request.program_id);
-            reconfigured_entries.push(self.update_or_create_synthetic_project(
-                &project_name,
-                request.request.root_file_names.clone(),
-                request.request.compiler_options.clone(),
-                request.request.project_references.clone(),
-                request.request.config_file_parsing_diagnostics.clone(),
-                self.inferred_content_mappers.clone(),
-                logger.clone(),
-            ));
+            let create_request = &request.api_create_program_request;
+            reconfigured_entries.push(
+                self.update_or_create_synthetic_project(
+                    request.program_id.clone(),
+                    create_request.root_file_names.clone(),
+                    Some(create_request.compiler_options.clone()),
+                    (!create_request.project_references.is_empty())
+                        .then(|| create_request.project_references.clone()),
+                    create_request.config_file_parsing_diagnostics.clone(),
+                    self.inferred_content_mappers.clone(),
+                    logger.clone(),
+                ),
+            );
         }
         // PORT: Go runs each update on its own goroutine (`sync.WaitGroup`);
         // the port runs them serially in Go start order (PORTING "Threads").
@@ -518,14 +520,14 @@ impl ProjectCollectionBuilder {
         Ok(())
     }
 
-    // Go: project/projectcollectionbuilder.go:370 nextSyntheticProjectName (ts#64204)
-    pub fn next_synthetic_project_name(&self) -> String {
+    // Go: project/projectcollectionbuilder.go:381 nextSyntheticProjectID (ts#64319: was nextSyntheticProjectName)
+    pub fn next_synthetic_project_id(&self) -> SyntheticProjectID {
         let mut id = 1;
         loop {
-            let name = synthetic_project_name(id);
-            let (_, ok) = self.synthetic_projects.load(&(self.to_path)(&name));
+            let project_id = new_synthetic_project_id(id);
+            let (_, ok) = self.synthetic_projects.load(&project_id);
             if !ok {
-                return name;
+                return project_id;
             }
             id += 1;
         }
@@ -607,7 +609,7 @@ impl ProjectCollectionBuilder {
                         if logger.is_some() {
                             logger.logf(&format!(
                                 "Marking project as dirty due to excessive watch changes: {}",
-                                p.config_file_path
+                                p.id()
                             ));
                         }
                     });
@@ -729,7 +731,7 @@ impl ProjectCollectionBuilder {
             if logger.is_some() {
                 logger.logf(&format!(
                     "Marking project as dirty due to content mapper configuration changes: {}",
-                    p.config_file_path
+                    p.id()
                 ));
             }
         });
@@ -754,24 +756,27 @@ impl ProjectCollectionBuilder {
         // insertion order so deletions run in a fixed order.
         let mut to_remove_projects: IndexSet<tspath::Path> = IndexSet::new();
         self.configured_projects.range(&mut |entry| {
-            to_remove_projects.insert(entry.key());
+            to_remove_projects.insert(entry.key().path());
             true
         });
 
-        // Go: retainProjectAndReferences (closure in cleanupConfiguredProjects)
+        // Go: retainConfiguredProjectAndReferences (closure in cleanupConfiguredProjects)
         let retain_project_and_references =
             |to_remove_projects: &mut IndexSet<tspath::Path>, project: &Rc<RefCell<Project>>| {
                 // Retain project
                 // PORT: Go `project.GetProgram()` is the field read.
                 let (config_file_path, program) = {
                     let project = project.borrow();
-                    (project.config_file_path.clone(), project.program.clone())
+                    (project.config_file_path(), project.program.clone())
                 };
                 to_remove_projects.shift_remove(&config_file_path);
                 if let Some(program) = program {
                     program.range_resolved_project_reference(
                         |reference_path: &tspath::Path, _, _, _| -> bool {
-                            if let (_, true) = self.configured_projects.load(reference_path) {
+                            if let (_, true) = self
+                                .configured_projects
+                                .load(&ConfiguredProjectID(reference_path.clone()))
+                            {
                                 to_remove_projects.shift_remove(reference_path);
                             }
                             true
@@ -852,7 +857,10 @@ impl ProjectCollectionBuilder {
             {
                 continue;
             }
-            if let (Some(p), true) = self.configured_projects.load(project_path) {
+            if let (Some(p), true) = self
+                .configured_projects
+                .load(&ConfiguredProjectID(project_path.clone()))
+            {
                 self.delete_project(&*p, logger.clone());
             }
         }
@@ -865,7 +873,7 @@ impl ProjectCollectionBuilder {
     // PORT: Go deletes entries inside `Range`; the port copies the keys first
     // and loads each one again, as Go does.
     pub fn cleanup_all_configured_projects(self: &Rc<Self>, logger: Option<Rc<logging::LogTree>>) {
-        let mut keys: Vec<tspath::Path> = Vec::new();
+        let mut keys: Vec<ConfiguredProjectID> = Vec::new();
         self.configured_projects.range(&mut |entry| {
             keys.push(entry.key());
             true
@@ -1033,23 +1041,26 @@ impl ProjectCollectionBuilder {
         }
     }
 
-    // Go: project/projectcollectionbuilder.go:449 DidRequestProject
+    // Go: project/projectcollectionbuilder.go:707 DidRequestProject (ts#64319: takes the project ID)
     pub fn did_request_project(
         self: &Rc<Self>,
-        project_id: &tspath::Path,
+        project_id: &ID,
         logger: Option<Rc<logging::LogTree>>,
     ) {
         let start_time = Instant::now();
-        if project_id.as_str() == INFERRED_PROJECT_NAME {
+        if project_id.inferred().1 {
             // Update inferred project
             if self.inferred_project.value().is_some() {
                 self.update_program(&*self.inferred_project, logger.clone());
             }
-        } else if let (Some(entry), true) = self.synthetic_projects.load(project_id) {
-            // ts#64204
-            self.update_program(&*entry, logger.clone());
-        } else if let (Some(entry), true) = self.configured_projects.load(project_id) {
-            self.update_program(&*entry, logger.clone());
+        } else if let (synthetic_id, true) = project_id.synthetic() {
+            if let (Some(entry), true) = self.synthetic_projects.load(&synthetic_id) {
+                self.update_program(&*entry, logger.clone());
+            }
+        } else if let (configured_id, true) = project_id.configured() {
+            if let (Some(entry), true) = self.configured_projects.load(&configured_id) {
+                self.update_program(&*entry, logger.clone());
+            }
         }
 
         if logger.is_some() {
@@ -1069,13 +1080,14 @@ impl ProjectCollectionBuilder {
     ) {
         let start_time = Instant::now();
 
-        let mut current_projects: Vec<tspath::Path> = Vec::new();
+        let mut current_projects: Vec<ConfiguredProjectID> = Vec::new();
         self.configured_projects.range(&mut |sme| {
             current_projects.push(sme.key());
             true
         });
 
-        let seen_projects: RefCell<FxHashSet<tspath::Path>> = RefCell::new(FxHashSet::default());
+        let seen_projects: RefCell<FxHashSet<ConfiguredProjectID>> =
+            RefCell::new(FxHashSet::default());
         // PORT: Go `core.NewWorkGroup(false)` is the parallel group, which
         // starts every queued function at once. On the dispatch thread the
         // port runs them serially in queue order (first in, first out), so
@@ -1129,9 +1141,9 @@ impl ProjectCollectionBuilder {
     pub fn ensure_project_tree<'a>(
         self: &'a Rc<Self>,
         wg: &Rc<dyn core_workgroup::WorkGroup<'a> + 'a>,
-        entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<Project>>>>,
+        entry: &Rc<dirty::SyncMapEntry<ConfiguredProjectID, Rc<RefCell<Project>>>>,
         project_tree_request: &'a ProjectTreeRequest,
-        seen_projects: &'a RefCell<FxHashSet<tspath::Path>>,
+        seen_projects: &'a RefCell<FxHashSet<ConfiguredProjectID>>,
         logger: Option<Rc<logging::LogTree>>,
     ) {
         if !seen_projects.borrow_mut().insert(entry.key()) {
@@ -1215,7 +1227,7 @@ impl ProjectCollectionBuilder {
     // PORT: Go map order is random; FxHashMap order here (log order only).
     pub fn did_update_ata_state(
         self: &Rc<Self>,
-        ata_changes: &FxHashMap<tspath::Path, Rc<ATAStateChange>>,
+        ata_changes: &FxHashMap<ID, Rc<ATAStateChange>>,
         logger: Option<Rc<logging::LogTree>>,
     ) {
         let update_project = |project: &dyn dirty::Value<Rc<RefCell<Project>>>,
@@ -1257,22 +1269,32 @@ impl ProjectCollectionBuilder {
             );
         };
 
-        for (project_path, ata_change) in ata_changes {
+        // ts#64319: keyed by project ID.
+        for (project_id, ata_change) in ata_changes {
             logger.embed(&ata_change.logs);
-            if project_path.as_str() == INFERRED_PROJECT_NAME {
+            if project_id.inferred().1 {
                 update_project(
                     &*self.inferred_project as &dyn dirty::Value<Rc<RefCell<Project>>>,
                     &**ata_change,
                 );
-            } else if let (Some(project), true) = self.configured_projects.load(project_path) {
-                update_project(
-                    &*project as &dyn dirty::Value<Rc<RefCell<Project>>>,
-                    &**ata_change,
-                );
+            } else if let (synthetic_project_id, true) = project_id.synthetic() {
+                if let (Some(project), true) = self.synthetic_projects.load(&synthetic_project_id) {
+                    update_project(
+                        &*project as &dyn dirty::Value<Rc<RefCell<Project>>>,
+                        &**ata_change,
+                    );
+                }
+            } else if let (configured_id, true) = project_id.configured() {
+                if let (Some(project), true) = self.configured_projects.load(&configured_id) {
+                    update_project(
+                        &*project as &dyn dirty::Value<Rc<RefCell<Project>>>,
+                        &**ata_change,
+                    );
+                }
             }
 
             if logger.is_some() {
-                logger.log(&format!("Updated ATA state for project {}", project_path));
+                logger.log(&format!("Updated ATA state for project {}", project_id));
             }
         }
     }
@@ -1315,7 +1337,7 @@ impl ProjectCollectionBuilder {
                     if logger.is_some() {
                         logger.logf(&format!(
                             "Marking project as dirty due to locale change: {}",
-                            p.config_file_path
+                            p.id()
                         ));
                     }
                 });
@@ -1331,30 +1353,36 @@ impl ProjectCollectionBuilder {
         logger: Option<Rc<logging::LogTree>>,
     ) -> bool {
         // PORT: Go map order is random; FxHashSet order here.
-        for project_path in &config_change_result.affected_projects {
+        for project_id in &config_change_result.affected_projects {
             // ts#63950: the inferred project can retain a config (a program
             // made by createProgram with project references).
-            let project: Option<Rc<dyn dirty::Value<Rc<RefCell<Project>>>>> = if project_path
-                .as_str()
-                == INFERRED_PROJECT_NAME
-            {
-                Some(self.inferred_project.clone() as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>)
-            } else if let (Some(synthetic_project), true) =
-                self.synthetic_projects.load(project_path)
-            {
-                // ts#64204
-                Some(synthetic_project as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>)
-            } else {
-                self.configured_projects
-                    .load(project_path)
-                    .0
-                    .map(|entry| entry as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>)
-            };
-            let Some(project) = project.filter(|project| project.value().is_some()) else {
-                panic!(
-                    "project {} affected by config change not found",
-                    project_path
+            // ts#64319: the affected projects are project IDs.
+            let mut project: Option<Rc<dyn dirty::Value<Rc<RefCell<Project>>>>> = None;
+            if project_id.inferred().1 {
+                project = Some(
+                    self.inferred_project.clone() as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>
                 );
+            } else {
+                if let (synthetic_project_id, true) = project_id.synthetic() {
+                    let (synthetic_project, loaded) =
+                        self.synthetic_projects.load(&synthetic_project_id);
+                    if loaded {
+                        project = synthetic_project
+                            .map(|entry| entry as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>);
+                    }
+                }
+                if project.is_none() {
+                    if let (configured_id, true) = project_id.configured() {
+                        project = self
+                            .configured_projects
+                            .load(&configured_id)
+                            .0
+                            .map(|entry| entry as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>);
+                    }
+                }
+            }
+            let Some(project) = project.filter(|project| project.value().is_some()) else {
+                panic!("project {} affected by config change not found", project_id);
             };
             project.change_if(
                 &mut |p: Option<&Rc<RefCell<Project>>>| -> bool {
@@ -1368,7 +1396,7 @@ impl ProjectCollectionBuilder {
                     if logger.is_some() {
                         logger.logf(&format!(
                             "Marking project {} as dirty due to change affecting config",
-                            project_path
+                            project_id
                         ));
                     }
                 },
@@ -1403,9 +1431,10 @@ impl ProjectCollectionBuilder {
         if let Some(configured_project) = self.find_default_configured_project(file_name, path) {
             return Some(configured_project as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>);
         }
+        // ts#64319
         let key_is_inferred = matches!(
             self.file_default_projects.borrow().get(path),
-            Some(key) if key.as_str() == INFERRED_PROJECT_NAME
+            Some(key) if key.inferred().1
         );
         if key_is_inferred {
             return Some(
@@ -1417,7 +1446,7 @@ impl ProjectCollectionBuilder {
                 // Go: `if b.fileDefaultProjects == nil { make(...) }` (the port map always exists).
                 self.file_default_projects
                     .borrow_mut()
-                    .insert(path.clone(), inferred_project_path());
+                    .insert(path.clone(), inferred_project_id().as_id());
                 return Some(
                     self.inferred_project.clone() as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>
                 );
@@ -1431,11 +1460,11 @@ impl ProjectCollectionBuilder {
         self: &Rc<Self>,
         file_name: &str,
         path: &tspath::Path,
-    ) -> Option<Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<Project>>>>> {
+    ) -> Option<Rc<dirty::SyncMapEntry<ConfiguredProjectID, Rc<RefCell<Project>>>>> {
         let key = self.file_default_projects.borrow().get(path).cloned();
         if let Some(key) = key {
-            if key.as_str() != INFERRED_PROJECT_NAME {
-                if let (Some(entry), true) = self.configured_projects.load(&key) {
+            if let (configured_id, true) = key.configured() {
+                if let (Some(entry), true) = self.configured_projects.load(&configured_id) {
                     return Some(entry);
                 }
             }
@@ -1444,11 +1473,12 @@ impl ProjectCollectionBuilder {
         let mut configured_project_paths: Vec<tspath::Path> = Vec::new();
         let mut configured_projects: FxHashMap<
             tspath::Path,
-            Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<Project>>>>,
+            Rc<dirty::SyncMapEntry<ConfiguredProjectID, Rc<RefCell<Project>>>>,
         > = FxHashMap::default();
         self.configured_projects.range(&mut |entry| {
-            configured_project_paths.push(entry.key());
-            configured_projects.insert(entry.key(), entry.clone());
+            let configured_path = entry.key().path();
+            configured_project_paths.push(configured_path.clone());
+            configured_projects.insert(configured_path, entry.clone());
             true
         });
         configured_project_paths.sort();
@@ -1515,7 +1545,7 @@ impl ProjectCollectionBuilder {
             let (config_file_name, config_file_path, command_line) = {
                 let p = project.borrow();
                 (
-                    p.config_file_name.clone(),
+                    p.config_file_name(),
                     p.config_file_path.clone(),
                     p.command_line.clone(),
                 )
@@ -1753,11 +1783,15 @@ impl ProjectCollectionBuilder {
         );
 
         let mut retain: FxHashSet<tspath::Path> = FxHashSet::default();
-        let mut project: Option<Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<Project>>>>> = None;
+        let mut project: Option<
+            Rc<dirty::SyncMapEntry<ConfiguredProjectID, Rc<RefCell<Project>>>>,
+        > = None;
         if !search.path.is_empty() {
             project = self
                 .configured_projects
-                .load(&(self.to_path)(&search.path[0].config_file_name))
+                .load(&ConfiguredProjectID((self.to_path)(
+                    &search.path[0].config_file_name,
+                )))
                 .0;
             // If we found a project, we retain each project along the BFS path.
             // We don't want to retain everything we visited since BFS can terminate
@@ -1835,11 +1869,12 @@ impl ProjectCollectionBuilder {
     ) -> SearchResult {
         let key = self.file_default_projects.borrow().get(path).cloned();
         if let Some(key) = key {
-            if key.as_str() == INFERRED_PROJECT_NAME {
+            if key.inferred().1 {
                 // The file belongs to the inferred project
                 return SearchResult::default();
             }
-            let (entry, _) = self.configured_projects.load(&key);
+            let (configured_id, _) = key.configured();
+            let (entry, _) = self.configured_projects.load(&configured_id);
             return SearchResult {
                 project: entry,
                 retain: FxHashSet::default(),
@@ -1864,15 +1899,10 @@ impl ProjectCollectionBuilder {
             );
             if let Some(project) = &result.project {
                 // Go: `if b.fileDefaultProjects == nil { make(...) }` (the port map always exists).
-                let config_file_path = project
-                    .value()
-                    .expect(NIL_DEREF)
-                    .borrow()
-                    .config_file_path
-                    .clone();
+                let project_id = project.value().expect(NIL_DEREF).borrow().id();
                 self.file_default_projects
                     .borrow_mut()
-                    .insert(path.clone(), config_file_path);
+                    .insert(path.clone(), project_id);
             }
             if logger.is_some() {
                 let elapsed = start_time.elapsed();
@@ -1880,7 +1910,11 @@ impl ProjectCollectionBuilder {
                     logger.log(&format!(
                         "Found default configured project for {}: {} (in {:?})",
                         file_name,
-                        project.value().expect(NIL_DEREF).borrow().config_file_name,
+                        project
+                            .value()
+                            .expect(NIL_DEREF)
+                            .borrow()
+                            .config_file_name(),
                         elapsed
                     ));
                 } else {
@@ -1902,15 +1936,17 @@ impl ProjectCollectionBuilder {
         config_file_path: &tspath::Path,
         load_kind: ProjectLoadKind,
         logger: Option<Rc<logging::LogTree>>,
-    ) -> Option<Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<Project>>>>> {
+    ) -> Option<Rc<dirty::SyncMapEntry<ConfiguredProjectID, Rc<RefCell<Project>>>>> {
         if load_kind == ProjectLoadKind::FIND {
-            let (entry, _) = self.configured_projects.load(config_file_path);
+            let (entry, _) = self
+                .configured_projects
+                .load(&ConfiguredProjectID(config_file_path.clone()));
             return entry;
         }
         // Go evaluates NewConfiguredProject before LoadOrStore, also when the
         // project exists (it logs and takes a watcher id).
         let (entry, _) = self.configured_projects.load_or_store(
-            config_file_path.clone(),
+            ConfiguredProjectID(config_file_path.clone()),
             new_configured_project(config_file_name, config_file_path, self, logger),
         );
         entry
@@ -1949,21 +1985,21 @@ impl ProjectCollectionBuilder {
 
     // Go: project/projectcollectionbuilder.go:1253 updateOrCreateSyntheticProject (ts#64204)
     #[allow(clippy::too_many_arguments)]
+    // ts#64319: keyed by SyntheticProjectID.
     pub fn update_or_create_synthetic_project(
         self: &Rc<Self>,
-        name: &str,
+        project_id: SyntheticProjectID,
         root_file_names: Vec<String>,
         compiler_options: Option<Rc<CompilerOptions>>,
         project_references: Option<Vec<ProjectReference>>,
         config_file_parsing_diagnostics: Vec<Diagnostic>,
         content_mappers: Vec<Rc<contentmapper::Mapper>>,
         logger: Option<Rc<logging::LogTree>>,
-    ) -> Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<Project>>>> {
-        let project_path = (self.to_path)(name);
-        let (project, loaded) = self.synthetic_projects.load(&project_path);
+    ) -> Rc<dirty::SyncMapEntry<SyntheticProjectID, Rc<RefCell<Project>>>> {
+        let (project, loaded) = self.synthetic_projects.load(&project_id);
         let Some(project) = project.filter(|_| loaded) else {
             let synthetic_project = new_synthetic_project(
-                name,
+                project_id.clone(),
                 &self.session_options.current_directory,
                 compiler_options,
                 root_file_names,
@@ -1981,7 +2017,7 @@ impl ProjectCollectionBuilder {
             }
             let (project, _) = self
                 .synthetic_projects
-                .load_or_store(project_path, synthetic_project);
+                .load_or_store(project_id, synthetic_project);
             return project.expect(NIL_DEREF);
         };
 
@@ -2075,15 +2111,15 @@ impl ProjectCollectionBuilder {
         if logger.is_some() {
             logger.log("Deleting inferred project");
         }
-        let (program, config_file_path) = {
+        let (program, project_id) = {
             let project = project.borrow();
-            (project.program.clone(), project.config_file_path.clone())
+            (project.program.clone(), project.id())
         };
         if let Some(program) = program {
             program.range_resolved_project_reference(
                 |reference_path: &tspath::Path, _, _, _| -> bool {
                     self.config_file_registry_builder
-                        .release_config_for_project(reference_path, &config_file_path);
+                        .release_config_for_project(reference_path, &project_id);
                     true
                 },
             );
@@ -2216,12 +2252,8 @@ impl ProjectCollectionBuilder {
         let mut update_program = false;
         let mut delete_project = false;
         let mut files_changed = false;
-        let config_file_name = entry
-            .value()
-            .expect(NIL_DEREF)
-            .borrow()
-            .config_file_name
-            .clone();
+        // ts#64319
+        let project_id = entry.value().expect(NIL_DEREF).borrow().id();
         let start_time = Instant::now();
         let mut notified_loading = false;
         let mut display_name = String::new();
@@ -2230,10 +2262,7 @@ impl ProjectCollectionBuilder {
             if value.borrow().kind == Kind::CONFIGURED {
                 let (value_config_file_name, value_config_file_path) = {
                     let value = value.borrow();
-                    (
-                        value.config_file_name.clone(),
-                        value.config_file_path.clone(),
-                    )
+                    (value.config_file_name(), value.config_file_path.clone())
                 };
                 let command_line = self
                     .config_file_registry_builder
@@ -2392,12 +2421,12 @@ impl ProjectCollectionBuilder {
                     }
                     p.dirty = false;
                     p.dirty_file_path = tspath::Path::default();
-                    let project_path = p.config_file_path.clone();
+                    let project_id = p.id();
                     drop(p);
                     self.release_dropped_project_references(
                         old_program.as_deref(),
                         Some(&*result.program),
-                        &project_path,
+                        &project_id,
                     );
                     if let Some(old_checker_pool) = old_checker_pool {
                         old_checker_pool.discard();
@@ -2414,7 +2443,7 @@ impl ProjectCollectionBuilder {
             let elapsed = start_time.elapsed();
             logger.log(&format!(
                 "Program update for {} completed in {:?}",
-                config_file_name, elapsed
+                project_id, elapsed
             ));
         }
         files_changed
@@ -2484,10 +2513,11 @@ impl ProjectCollectionBuilder {
                     if !dirty_file_path.is_empty() {
                         logger.logf(&format!(
                             "Marking project {} as dirty due to changes in {}",
-                            p.config_file_name, dirty_file_path
+                            p.id(),
+                            dirty_file_path
                         ));
                     } else {
-                        logger.logf(&format!("Marking project {} as dirty", p.config_file_name));
+                        logger.logf(&format!("Marking project {} as dirty", p.id()));
                     }
                 }
             },
@@ -2500,31 +2530,37 @@ impl ProjectCollectionBuilder {
         project: &dyn dirty::Value<Rc<RefCell<Project>>>,
         logger: Option<Rc<logging::LogTree>>,
     ) {
-        let (project_path, kind, name, program) = {
+        // ts#64319: configs release by project ID.
+        let (project_id, kind, program, config_file_path) = {
             let value = project.value().expect(NIL_DEREF);
             let value = value.borrow();
             (
-                value.config_file_path.clone(),
+                value.id(),
                 value.kind,
-                value.name(),
                 value.program.clone(),
+                value.config_file_path.clone(),
             )
         };
         if logger.is_some() {
-            logger.logf(&format!("Deleting {} project: {}", kind.string(), name));
+            logger.logf(&format!(
+                "Deleting {} project: {}",
+                kind.string(),
+                project_id
+            ));
         }
         if let Some(program) = program {
             program.range_resolved_project_reference(
                 |reference_path: &tspath::Path, _, _, _| -> bool {
                     self.config_file_registry_builder
-                        .release_config_for_project(reference_path, &project_path);
+                        .release_config_for_project(reference_path, &project_id);
                     true
                 },
             );
         }
         if kind == Kind::CONFIGURED {
+            // Go: value.ConfigFilePath()
             self.config_file_registry_builder
-                .release_config_for_project(&project_path, &project_path);
+                .release_config_for_project(&config_file_path, &project_id);
         }
         project.delete();
     }
@@ -2538,7 +2574,7 @@ impl ProjectCollectionBuilder {
         &self,
         old_program: Option<&compiler::NewProgram>,
         new_program: Option<&compiler::NewProgram>,
-        project_path: &tspath::Path,
+        project_id: &ID,
     ) {
         let Some(old_program) = old_program else {
             return;
@@ -2559,7 +2595,7 @@ impl ProjectCollectionBuilder {
             |reference_path: &tspath::Path, _, _, _| -> bool {
                 if !new_references.contains(reference_path) {
                     self.config_file_registry_builder
-                        .release_config_for_project(reference_path, project_path);
+                        .release_config_for_project(reference_path, project_id);
                 }
                 true
             },
@@ -2634,7 +2670,10 @@ fn is_referenced_by(
             }
         }
         for potential_ref in potential_project_references.iter() {
-            if let (Some(ref_project), true) = b.configured_projects.load(potential_ref) {
+            if let (Some(ref_project), true) = b
+                .configured_projects
+                .load(&ConfiguredProjectID(potential_ref.clone()))
+            {
                 if is_referenced_by(
                     b,
                     &ref_project.value().expect(NIL_DEREF),
@@ -2691,6 +2730,6 @@ pub struct SearchNodeKey {
 // Go: project/projectcollectionbuilder.go:745 searchResult
 #[derive(Clone, Default)]
 pub struct SearchResult {
-    pub project: Option<Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<Project>>>>>,
+    pub project: Option<Rc<dirty::SyncMapEntry<ConfiguredProjectID, Rc<RefCell<Project>>>>>,
     pub retain: FxHashSet<tspath::Path>,
 }

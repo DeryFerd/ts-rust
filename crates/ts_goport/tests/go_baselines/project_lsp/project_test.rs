@@ -655,6 +655,25 @@ child_test! {
 }
 
 child_test! {
+    // Go: project_test.go:819 TestDisplayName/configured project preserves config path casing (ts#64319)
+    fn display_name_configured_project_preserves_config_path_casing() {
+        let (session, _) = projecttestutil::setup(files(&[
+            ("/home/projects/Project/tsconfig.json", "{}"),
+            ("/home/projects/Project/index.ts", "export const x = 1;"),
+        ]));
+        open(&session, "file:///home/projects/Project/index.ts", "export const x = 1;");
+        let _ = language_service(&session, "file:///home/projects/Project/index.ts");
+
+        let configured = session
+            .snapshot()
+            .project_collection
+            .configured_project(&path("/home/projects/project/tsconfig.json"))
+            .expect("configured project");
+        assert_eq!(configured.borrow().display_name("/home/projects"), "Project/tsconfig.json");
+    }
+}
+
+child_test! {
     // Go: project_test.go:539 TestDisplayName/inferred project returns directory base name
     fn display_name_inferred_project_returns_directory_base_name() {
         let (session, _) = projecttestutil::setup_with_options(

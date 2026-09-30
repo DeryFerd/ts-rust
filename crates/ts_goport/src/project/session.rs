@@ -176,7 +176,7 @@ pub struct Session {
 
     // pendingATAChanges are produced by Automatic Type Acquisition (ATA)
     // installations and applied to the next snapshot update.
-    pub pending_ata_changes: RefCell<FxHashMap<tspath::Path, Rc<ATAStateChange>>>,
+    pub pending_ata_changes: RefCell<FxHashMap<ID, Rc<ATAStateChange>>>,
 
     // diagnosticsRefreshCancel is the cancelation function for a scheduled
     // diagnostics refresh. Diagnostics refreshes are scheduled and debounced
@@ -209,7 +209,7 @@ pub struct Session {
     pub performance_telemetry_cancel: RefCell<Option<gostd::context::CancelFunc>>,
 
     // seenProjects tracks projects that have already had telemetry sent.
-    pub seen_projects: RefCell<FxHashSet<tspath::Path>>,
+    pub seen_projects: RefCell<FxHashSet<ID>>,
 
     // watches tracks the current watch globs and how many individual WatchedFiles
     // are using each glob.
@@ -1329,13 +1329,13 @@ impl Session {
         }
         let ctx = self.background_context();
         crate::frontend::core_ls_ext::diff_ordered_maps(
-            &old_snapshot.project_collection.projects_by_path(),
-            &new_snapshot.project_collection.projects_by_path(),
-            |_: &tspath::Path, added_project| {
+            &old_snapshot.project_collection.projects_by_id(),
+            &new_snapshot.project_collection.projects_by_id(),
+            |_: &ID, added_project| {
                 self.send_project_info_telemetry(&ctx, added_project);
             },
-            |_: &tspath::Path, _| {},
-            |_: &tspath::Path, _, _| {},
+            |_: &ID, _| {},
+            |_: &ID, _, _| {},
         );
     }
 
@@ -1345,11 +1345,7 @@ impl Session {
             return;
         }
         let project = project.borrow();
-        if self
-            .seen_projects
-            .borrow()
-            .contains(&project.config_file_path)
-        {
+        if self.seen_projects.borrow().contains(&project.id()) {
             return;
         }
 
@@ -1373,9 +1369,7 @@ impl Session {
             return;
         }
 
-        self.seen_projects
-            .borrow_mut()
-            .insert(project.config_file_path.clone());
+        self.seen_projects.borrow_mut().insert(project.id());
     }
 
     // Go: project/session.go:774 collectProjectInfoTelemetry
@@ -1389,7 +1383,7 @@ impl Session {
 
         let mut config_file_name = "other".to_string();
         if project.kind == Kind::CONFIGURED {
-            let base_name = tspath::get_base_file_name(&project.config_file_name);
+            let base_name = tspath::get_base_file_name(&project.config_file_name());
             if base_name == "tsconfig.json" || base_name == "jsconfig.json" {
                 config_file_name = base_name;
             }
@@ -1723,7 +1717,7 @@ impl Session {
         let language_service = {
             let p = project.borrow();
             ls::new_language_service(
-                p.config_file_path.clone(),
+                p.id().as_auto_import_project_id(),
                 p.program.clone().expect(NIL_DEREF),
                 snapshot.clone(),
                 &uri.file_name(),
@@ -1819,7 +1813,7 @@ impl Session {
             };
 
             services.push(ls::new_language_service(
-                project.config_file_path.clone(),
+                project.id().as_auto_import_project_id(),
                 program,
                 snapshot.clone(),
                 &active_file,
@@ -1841,22 +1835,20 @@ impl Session {
         let snapshot = self.get_snapshot(
             ctx,
             ResourceRequest {
-                projects: vec![project.id()],
+                projects: vec![ID(project.id())],
                 ..Default::default()
             },
             false, /*callerRef*/
         );
         // Ensure we have updated project
-        let project = snapshot
-            .project_collection
-            .get_project_by_path(&project.id())?;
+        let project = snapshot.project_collection.get_project(&ID(project.id()))?;
         let project = project.borrow();
         // if program doesnt contain this file any more ignore it
         if !project.has_file(&uri.file_name()) {
             return None;
         }
         Some(ls::new_language_service(
-            project.config_file_path.clone(),
+            project.id().as_auto_import_project_id(),
             project.program.clone().expect(NIL_DEREF),
             snapshot.clone(),
             &uri.file_name(),
@@ -1938,7 +1930,7 @@ impl Session {
         };
         let project = project.borrow();
         Ok(ls::new_language_service(
-            project.config_file_path.clone(),
+            project.id().as_auto_import_project_id(),
             project.program.clone().expect(NIL_DEREF),
             snapshot.clone(),
             &uri.file_name(),
@@ -2016,7 +2008,7 @@ impl Session {
 
         let project = project.borrow();
         Ok(ls::new_language_service(
-            project.config_file_path.clone(),
+            project.id().as_auto_import_project_id(),
             project.program.clone().expect(NIL_DEREF),
             new_snapshot.clone(),
             &uri.file_name(),
@@ -2558,9 +2550,9 @@ impl Session {
         }
 
         crate::frontend::core_ls_ext::diff_ordered_maps(
-            &old_snapshot.project_collection.projects_by_path(),
-            &new_snapshot.project_collection.projects_by_path(),
-            |_: &tspath::Path, added_project| {
+            &old_snapshot.project_collection.projects_by_id(),
+            &new_snapshot.project_collection.projects_by_id(),
+            |_: &ID, added_project| {
                 let added_project = added_project.borrow();
                 let program_files = update_watch(
                     &ctx,
@@ -2587,7 +2579,7 @@ impl Session {
                 );
                 errors.borrow_mut().extend(content_mapper);
             },
-            |_: &tspath::Path, removed_project| {
+            |_: &ID, removed_project| {
                 let removed_project = removed_project.borrow();
                 let program_files = update_watch(
                     &ctx,
@@ -2614,7 +2606,7 @@ impl Session {
                 );
                 errors.borrow_mut().extend(content_mapper);
             },
-            |_: &tspath::Path, old_project, new_project| {
+            |_: &ID, old_project, new_project| {
                 let old_project = old_project.borrow();
                 let new_project = new_project.borrow();
                 if WatchedFiles::id(old_project.program_files_watch.as_deref())
@@ -2754,7 +2746,7 @@ impl Session {
     ) -> (
         FileChangeSummary,
         IndexMap<tspath::Path, Rc<Overlay>>,
-        FxHashMap<tspath::Path, Rc<ATAStateChange>>,
+        FxHashMap<ID, Rc<ATAStateChange>>,
         Option<lsutil::UserPreferences>,
     ) {
         let pending_ata_changes = std::mem::take(&mut *self.pending_ata_changes.borrow_mut());
@@ -2808,21 +2800,21 @@ impl Session {
             logged_project_changes.set(true);
         };
         crate::frontend::core_ls_ext::diff_ordered_maps(
-            &old_snapshot.project_collection.projects_by_path(),
-            &new_snapshot.project_collection.projects_by_path(),
-            |_path: &tspath::Path, added_project| {
+            &old_snapshot.project_collection.projects_by_id(),
+            &new_snapshot.project_collection.projects_by_id(),
+            |_: &ID, added_project| {
                 // New project added
                 log_project(added_project);
             },
-            |_path: &tspath::Path, removed_project| {
+            |_: &ID, removed_project| {
                 // Project removed
                 self.logger.logf(&format!(
                     "\nProject '{}' removed\n{}",
-                    removed_project.borrow().name(),
+                    removed_project.borrow().id(),
                     HR
                 ));
             },
-            |_path: &tspath::Path, _old_project, new_project| {
+            |_: &ID, _old_project, new_project| {
                 // Project updated
                 if new_project.borrow().program_update_kind == ProgramUpdateKind::NEW_FILES {
                     log_project(new_project);
@@ -2898,7 +2890,7 @@ impl Session {
                 for bucket in &auto_import_stats.project_buckets {
                     self.logger.logf(&format!(
                         "\t\t{}{}:",
-                        bucket.path,
+                        bucket.name,
                         if bucket.state.dirty() { " (dirty)" } else { "" }
                     ));
                     self.logger
@@ -2912,7 +2904,7 @@ impl Session {
                 for bucket in &auto_import_stats.node_modules_buckets {
                     self.logger.logf(&format!(
                         "\t\t{}{}:",
-                        bucket.path,
+                        bucket.name,
                         if bucket.state.dirty() { " (dirty)" } else { "" }
                     ));
                     // PORT: Go map order is random (log text only).
@@ -3045,15 +3037,13 @@ impl Session {
             let old_open_projects = old_snapshot
                 .project_collection
                 .get_open_configured_projects();
-            for (config_file_path, old_project) in
-                &old_snapshot.project_collection.projects_by_path()
-            {
-                if old_project.borrow().kind == Kind::CONFIGURED
-                    && old_open_projects.contains(config_file_path)
-                {
+            for old_project in old_snapshot.project_collection.projects_by_id().values() {
+                let (configured_id, configured) = old_project.borrow().id().configured();
+                if configured && old_open_projects.contains(&configured_id) {
+                    let config_file_path = old_project.borrow().config_file_path();
                     self.publish_project_diagnostics(
                         &self.background_context(),
-                        config_file_path,
+                        &config_file_path,
                         &[],
                         &old_snapshot.converters,
                     );
@@ -3063,8 +3053,8 @@ impl Session {
         }
 
         let ctx = self.background_context();
-        let old_projects = old_snapshot.project_collection.projects_by_path();
-        let new_projects = new_snapshot.project_collection.projects_by_path();
+        let old_projects = old_snapshot.project_collection.projects_by_id();
+        let new_projects = new_snapshot.project_collection.projects_by_id();
         let old_open_projects = old_snapshot
             .project_collection
             .get_open_configured_projects();
@@ -3074,57 +3064,66 @@ impl Session {
         crate::frontend::core_ls_ext::diff_ordered_maps(
             &old_projects,
             &new_projects,
-            |config_file_path: &tspath::Path, added_project| {
+            |_: &ID, added_project| {
+                let (configured_id, configured) = added_project.borrow().id().configured();
                 if !should_publish_program_diagnostics(&added_project.borrow(), new_snapshot.id())
-                    || !new_open_projects.contains(config_file_path)
+                    || !configured
+                    || !new_open_projects.contains(&configured_id)
                 {
                     return;
                 }
+                let config_file_path = added_project.borrow().config_file_path();
                 let diagnostics = added_project.borrow().get_project_diagnostics(&ctx);
                 self.publish_project_diagnostics(
                     &ctx,
-                    config_file_path,
+                    &config_file_path,
                     &diagnostics,
                     &new_snapshot.converters,
                 );
             },
-            |config_file_path: &tspath::Path, removed_project| {
+            |_: &ID, removed_project| {
                 if removed_project.borrow().kind != Kind::CONFIGURED {
                     return;
                 }
+                let config_file_path = removed_project.borrow().config_file_path();
                 self.publish_project_diagnostics(
                     &ctx,
-                    config_file_path,
+                    &config_file_path,
                     &[],
                     &old_snapshot.converters,
                 );
             },
-            |config_file_path: &tspath::Path, _old_project, new_project| {
+            |_: &ID, _old_project, new_project| {
+                let (configured_id, configured) = new_project.borrow().id().configured();
                 if !should_publish_program_diagnostics(&new_project.borrow(), new_snapshot.id())
-                    || !new_open_projects.contains(config_file_path)
+                    || !configured
+                    || !new_open_projects.contains(&configured_id)
                 {
                     return;
                 }
+                let config_file_path = new_project.borrow().config_file_path();
                 let diagnostics = new_project.borrow().get_project_diagnostics(&ctx);
                 self.publish_project_diagnostics(
                     &ctx,
-                    config_file_path,
+                    &config_file_path,
                     &diagnostics,
                     &new_snapshot.converters,
                 );
             },
         );
         // Sync diagnostics for projects whose open-file state changed without a program update.
-        for (config_file_path, new_project) in &new_projects {
+        for (project_id, new_project) in &new_projects {
             if new_project.borrow().kind != Kind::CONFIGURED {
                 continue;
             }
-            if !old_projects.contains_key(config_file_path) {
+            if !old_projects.contains_key(project_id) {
                 continue; // Handled by added project case above
             }
-            let old_project = old_projects.get(config_file_path);
-            let new_has_open_files = new_open_projects.contains(config_file_path);
-            let old_has_open_files = old_open_projects.contains(config_file_path);
+            let (configured_id, _) = new_project.borrow().id().configured();
+            let config_file_path = new_project.borrow().config_file_path();
+            let old_project = old_projects.get(project_id);
+            let new_has_open_files = new_open_projects.contains(&configured_id);
+            let old_has_open_files = old_open_projects.contains(&configured_id);
             if new_has_open_files
                 && !old_has_open_files
                 && (old_project.is_some_and(|old_project| Rc::ptr_eq(new_project, old_project))
@@ -3137,7 +3136,7 @@ impl Session {
                 let diagnostics = new_project.borrow().get_project_diagnostics(&ctx);
                 self.publish_project_diagnostics(
                     &ctx,
-                    config_file_path,
+                    &config_file_path,
                     &diagnostics,
                     &new_snapshot.converters,
                 );
@@ -3145,7 +3144,7 @@ impl Session {
                 // Project closed
                 self.publish_project_diagnostics(
                     &ctx,
-                    config_file_path,
+                    &config_file_path,
                     &[],
                     &new_snapshot.converters,
                 );
@@ -3261,15 +3260,15 @@ impl Session {
                     if s.options.logging_enabled {
                         log_tree = logging::new_log_tree(&format!(
                             "Triggering ATA for project {}",
-                            project.borrow().name()
+                            project.borrow().id().string()
                         ));
                     }
 
                     let typings_info = Rc::new(project.borrow().compute_typings_info());
-                    let (request, project_name, project_display_name, config_file_path) = {
+                    let (request, project_id, project_display_name) = {
                         let p = project.borrow();
                         let request = ata::TypingsInstallRequest {
-                            project_id: p.config_file_path.clone(),
+                            project_id: Rc::new(p.id()),
                             typings_info: typings_info.clone(),
                             file_names: p
                                 .program
@@ -3296,9 +3295,8 @@ impl Session {
                         };
                         (
                             request,
-                            p.name(),
+                            p.id(),
                             p.display_name(&s.options.current_directory),
-                            p.config_file_path.clone(),
                         )
                     };
 
@@ -3321,7 +3319,7 @@ impl Session {
                             if log_tree.is_some() {
                                 s.logger.log(&format!(
                                     "ATA installation failed for project {}: {}",
-                                    project_name,
+                                    project_id,
                                     err.error()
                                 ));
                                 s.logger.log(&log_tree.string());
@@ -3330,9 +3328,8 @@ impl Session {
                         Ok(result) => {
                             if result.typings_files != project.borrow().typings_files {
                                 s.pending_ata_changes.borrow_mut().insert(
-                                    config_file_path,
+                                    project_id,
                                     Rc::new(ATAStateChange {
-                                        project_id: tspath::Path::default(),
                                         typings_info: Some(typings_info),
                                         typings_files: result.typings_files,
                                         typings_files_to_watch: result.files_to_watch,
@@ -3389,7 +3386,7 @@ impl Session {
             if crate::ls::autoimport::Registry::is_prepared_for_importing_file(
                 new_snapshot.auto_imports.as_deref(),
                 &changed_file.file_name(),
-                &project.borrow().config_file_path,
+                &project.borrow().id().as_auto_import_project_id(),
                 &prefs,
             ) {
                 return;
