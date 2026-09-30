@@ -1424,6 +1424,14 @@ impl QuickInfoWriter<'_> {
             self.dpw.borrow_mut().write_punctuation("(");
             self.dpw.borrow_mut().write("type parameter");
             self.dpw.borrow_mut().write_punctuation(") ");
+            if is_identifier(node) && is_type_reference_node(node.parent()) && {
+                let t = self.c.get_type_at_location(node.parent());
+                self.c.is_distributed_type_parameter(t)
+            } {
+                self.dpw.borrow_mut().write_punctuation("(");
+                self.dpw.borrow_mut().write("distributed");
+                self.dpw.borrow_mut().write_punctuation(") ");
+            }
             let tp = self.c.get_declared_type_of_symbol_exported(symbol);
             self.write_symbol_classified(symbol, container, SymbolFlags::NONE, SYMBOL_FORMAT_FLAGS);
             let cons = self.c.get_constraint_of_type_parameter_exported(tp);
