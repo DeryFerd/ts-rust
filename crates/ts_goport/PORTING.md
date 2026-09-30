@@ -301,10 +301,12 @@ methods reach the AST through it.
   The kind is an `AtomicU16` too (step 4), so a pooled block can take
   another file's records through a shared ref with no `unsafe`; a read
   converts it with a 512-entry table (`KIND_OF_RAW`, from the generated
-  `SyntaxKind::ALL`). `SyntaxKind::try_from` is a 351-case switch until
-  late in LLVM's pipeline, so the inliner left it (with `#[inline]`) or
+  `SyntaxKind::ALL`), about 3 instructions more than a plain field
+  (`goport -p` +1.3% to +2.1% instructions against step 7).
+  `SyntaxKind::try_from` is a 351-case switch until late in LLVM's
+  pipeline, so the inliner left it (with `#[inline]`) or
   `frozen_store_kind` (with `#[inline(always)]`) out of line at thousands
-  of call sites, and `goport -p` ran 3% to 7.6% more instructions. A new per-slot field of the hot reads goes into a record or kids
+  of call sites (+3% to +7.6%). A new per-slot field of the hot reads goes into a record or kids
   word, not a new column. Debug builds check the records and kids against
   the node data at freeze (`debug_check_kids`), and each parent write
   against its stored form.

@@ -500,13 +500,17 @@ const _: () = assert!(SyntaxKind::NotEmittedTypeElement as usize + 1 == SyntaxKi
 
 /// AST node records, step 4: the `SyntaxKind` of each 9-bit raw record kind
 /// (`NodeRecord::kind`): `SyntaxKind::ALL`, then `Unknown`.
-// PERF: a read masks the raw kind and loads the entry: two instructions and
-// no bounds check. `SyntaxKind::try_from` (a match of the 351 kinds) is a
-// range check only after LLVM's late simplification. Before it the inliner
-// saw a 351-case switch: with `#[inline]` about 3,900 `try_from` calls
-// stayed out of line, and with `#[inline(always)]` `frozen_store_kind` did
-// at about 7,700 call sites (`goport -p` +3% to +7.6% instructions).
-static KIND_OF_RAW: [SyntaxKind; 512] = {
+// PERF: a read masks the raw kind and loads the entry, with no bounds
+// check: about 3 instructions more than the plain field of step 7
+// (`goport -p` +1.3% to +2.1%). A `const`, so the table address is a
+// `lea`, not a load from the GOT (a `static` ran the same instruction
+// count; a 64K-entry `static` with no mask saved 0% to 0.5% for 128 KiB).
+// `SyntaxKind::try_from` (a match of the 351 kinds) is a range check only
+// after LLVM's late simplification. Before it the inliner saw a 351-case
+// switch: with `#[inline]` about 3,900 `try_from` calls stayed out of
+// line, and with `#[inline(always)]` `frozen_store_kind` did at about 7,700
+// call sites (+3% to +7.6%).
+const KIND_OF_RAW: [SyntaxKind; 512] = {
     let mut kinds = [SyntaxKind::Unknown; 512];
     let mut raw = 0;
     while raw < SyntaxKind::COUNT {
