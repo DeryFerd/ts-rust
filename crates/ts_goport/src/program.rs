@@ -315,6 +315,7 @@ impl CheckerPool {
         // them here.
         for worker in &workers {
             let _ = worker.send(Box::new(|| {
+                stop_dts_twin();
                 drop(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
                 free_synthetic_nodes();
                 WORKER_RELEASED.with(|released| released.set(true));
@@ -461,7 +462,8 @@ pub fn emit_pool_enabled() -> bool {
         && worker_index().is_none()
 }
 
-/// The result of a job on the emit pool (`send_emit_pool_jobs`).
+/// The result of a job on the emit pool (`send_emit_pool_jobs`) or on a
+/// d.ts twin (`send_dts_twin_job`).
 pub struct EmitPoolJob<R>(std::sync::mpsc::Receiver<JobResult<R>>);
 
 impl<R> EmitPoolJob<R> {
@@ -469,6 +471,113 @@ impl<R> EmitPoolJob<R> {
     pub fn join(self) -> std::thread::Result<R> {
         self.0.recv().expect("emit thread stopped")
     }
+}
+
+/// PORT: not in Go (perf). The d.ts twin of a checker worker: a thread that
+/// prints the d.ts parts whose declaration transforms ran on the checker
+/// (`program_emit`), so the checker can go on with its next file. The
+/// transforms call the emit resolver, so they stay on the checker, and each
+/// checker's d.ts text depends on its own check. The print needs no checker:
+/// the only print handler of Go `emitDeclarationFile` maps declaration map
+/// positions through the span map of a content-mapped source file. Go runs
+/// each file's emit on its own goroutine and locks the checker only for each
+/// resolver call.
+///
+/// The twin shares the checker's synthetic chunk numbers
+/// (`share_synthetic_chunks`), so a handle names the same node on both
+/// threads, and each job brings the nodes that its print reads
+/// (`PrintPack`). The pool threads cannot print these trees: their chunk
+/// numbers and their thread-local maps keyed by node are their own. The
+/// twin runs its jobs in the order they are sent. It is made on the first
+/// job of its checker, and it stops with the checker pool
+/// (`CheckerPool::stop`).
+struct DtsTwin {
+    queue: std::sync::mpsc::Sender<Job>,
+    thread: std::thread::JoinHandle<()>,
+    /// Set by `stop_dts_twin`: the twin frees its synthetic nodes when its
+    /// queue closes. Else it ends with the process and leaks them, like its
+    /// checker.
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The jobs sent to d.ts twins in this process (`dts_twin_job_count`).
+static DTS_TWIN_JOBS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Makes the d.ts twin of this checker worker. It starts from the current
+/// program and its tables, and from an empty synthetic arena that shares
+/// the chunk counters of this thread.
+fn create_dts_twin() -> DtsTwin {
+    let index = worker_index().expect("a d.ts twin belongs to a checker thread");
+    let chunks = share_synthetic_chunks();
+    let program = prog();
+    let tables = current_tables();
+    let (queue, receiver) = std::sync::mpsc::channel::<Job>();
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_released = Arc::clone(&released);
+    let thread = std::thread::Builder::new()
+        .name(format!("dts-twin-{index}"))
+        .stack_size(crate::gostd::stack::max_stack_size())
+        .spawn(move || {
+            crate::core::set_thread_program(Some(program));
+            if let Some(tables) = tables {
+                TABLES.with(|cache| *cache.borrow_mut() = Some(tables));
+            }
+            install_twin_synthetic_arena(chunks);
+            for job in receiver {
+                job();
+            }
+            if thread_released.load(std::sync::atomic::Ordering::Acquire) {
+                free_synthetic_nodes();
+            } else {
+                forget_synthetic_nodes();
+            }
+        })
+        .expect("cannot start a d.ts twin thread");
+    DtsTwin {
+        queue,
+        thread,
+        released,
+    }
+}
+
+/// Sends `f` to the d.ts twin of this checker worker, which is made on the
+/// first call, and returns where its result arrives. Checker threads only.
+pub fn send_dts_twin_job<R: Send + 'static>(
+    f: impl FnOnce() -> R + Send + 'static,
+) -> EmitPoolJob<R> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let job: Job = Box::new(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let _ = sender.send(result);
+    });
+    DTS_TWIN.with(|twin| {
+        twin.borrow_mut()
+            .get_or_insert_with(create_dts_twin)
+            .queue
+            .send(job)
+            .expect("d.ts twin stopped");
+    });
+    DTS_TWIN_JOBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    EmitPoolJob(receiver)
+}
+
+/// Stops the d.ts twin of this checker worker, if it has one: the twin ends
+/// after the jobs already sent and frees its synthetic nodes, and this
+/// waits for it.
+fn stop_dts_twin() {
+    let Some(twin) = DTS_TWIN.with(|twin| twin.borrow_mut().take()) else {
+        return;
+    };
+    twin.released
+        .store(true, std::sync::atomic::Ordering::Release);
+    drop(twin.queue);
+    let _ = twin.thread.join();
+}
+
+/// The number of jobs sent to d.ts twins in this process so far. Tests use
+/// it to see that the twins ran.
+pub fn dts_twin_job_count() -> usize {
+    DTS_TWIN_JOBS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Sends `jobs` to the emit pool of the current program, in order, and
@@ -2747,6 +2856,8 @@ thread_local! {
     /// Set on a worker thread when `CheckerPool::stop` freed its checker and
     /// synthetic nodes.
     static WORKER_RELEASED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The d.ts twin of a worker thread (`send_dts_twin_job`).
+    static DTS_TWIN: RefCell<Option<DtsTwin>> = const { RefCell::new(None) };
 }
 
 /// The thread-local state that a checker worker starts from: the current
@@ -4421,17 +4532,21 @@ impl<R> PendingCheckerJobs<R> {
     /// first panic, in file order, continues on this thread after all jobs
     /// end (as `wait_jobs`).
     pub fn wait(self) -> Vec<R> {
-        let results: Vec<JobResult<R>> = self
-            .0
+        self.wait_all()
+            .into_iter()
+            .map(|result| result.unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
+            .collect()
+    }
+
+    /// `wait` that returns each job's result or the payload of its panic,
+    /// in file order, and continues no panic.
+    pub fn wait_all(self) -> Vec<std::thread::Result<R>> {
+        self.0
             .into_iter()
             .map(|job| match job {
                 CheckerJob::Sent(receiver) => receiver.recv().expect("checker thread stopped"),
                 CheckerJob::Inline(value) => Ok(value),
             })
-            .collect();
-        results
-            .into_iter()
-            .map(|result| result.unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
             .collect()
     }
 }

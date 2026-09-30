@@ -44,6 +44,10 @@ pub struct EmitContext {
     /// Go `collections.OrderedSet[*EmitHelper]`.
     // PORT: an insertion-ordered `Vec` with pointer-identity checks.
     pub(crate) emit_helpers: RefCell<Vec<EmitHelperRef>>,
+    /// PORT: not in Go. True when an emit node may hold a node
+    /// (`set_type_node`, `set_external_helpers_module_name`), for
+    /// `PrintTables::for_each_emit_node_value`.
+    emit_node_refs: std::cell::Cell<bool>,
 }
 
 /// Go `environmentFlags`.
@@ -86,6 +90,102 @@ pub fn new_emit_context() -> Rc<EmitContext> {
     c
 }
 
+/// The side tables of an `EmitContext` that the printer reads, out of the
+/// context, so they can move to another thread. A d.ts twin prints there
+/// (`program::send_dts_twin_job`). The transform environment (the
+/// variable and lexical scopes) is not in it: it is empty after the
+/// transforms.
+// PORT: not in Go (perf).
+pub struct PrintTables {
+    auto_generate: FxHashMap<Node, AutoGenerateInfo>,
+    text_source: FxHashMap<Node, Node>,
+    original: FxHashMap<Node, Node>,
+    emit_nodes: LinkStore<Node, Box<EmitNode>>,
+    assigned_name: FxHashMap<Node, Node>,
+    class_this: FxHashMap<Node, Node>,
+    emit_helpers: Vec<EmitHelperRef>,
+    emit_node_refs: bool,
+}
+
+impl PrintTables {
+    /// Calls `f` with every node that a table holds as a value: the nodes
+    /// that a print can reach from the nodes it prints.
+    pub fn for_each_value_node(&self, mut f: impl FnMut(Node)) {
+        for info in self.auto_generate.values() {
+            f(info.node);
+        }
+        for map in [
+            &self.text_source,
+            &self.original,
+            &self.assigned_name,
+            &self.class_this,
+        ] {
+            map.values().copied().for_each(&mut f);
+        }
+    }
+
+    /// Calls `f` with the nodes that the emit node of `node` holds.
+    // PERF: most contexts have none (they are JS transform data), and a
+    // lookup per printed node cost about a tenth of the d.ts export walk.
+    pub fn for_each_emit_node_value(&self, node: Node, mut f: impl FnMut(Node)) {
+        if !self.emit_node_refs {
+            return;
+        }
+        if let Some(emit_node) = self.emit_nodes.try_get(node) {
+            f(emit_node.type_node);
+            f(emit_node.external_helpers_module_name);
+        }
+    }
+}
+
+impl EmitContext {
+    /// Moves the side tables out of this context (`PrintTables`). The
+    /// context is then as after `reset`.
+    #[must_use]
+    pub fn take_print_tables(&self) -> PrintTables {
+        PrintTables {
+            auto_generate: std::mem::take(&mut *self.auto_generate.borrow_mut()),
+            text_source: std::mem::take(&mut *self.text_source.borrow_mut()),
+            original: std::mem::take(&mut *self.original.borrow_mut()),
+            emit_nodes: std::mem::take(&mut *self.emit_nodes.borrow_mut()),
+            assigned_name: std::mem::take(&mut *self.assigned_name.borrow_mut()),
+            class_this: std::mem::take(&mut *self.class_this.borrow_mut()),
+            emit_helpers: std::mem::take(&mut *self.emit_helpers.borrow_mut()),
+            emit_node_refs: self.emit_node_refs.replace(false),
+        }
+    }
+
+    /// A copy of the side tables of this context (`PrintTables`).
+    #[must_use]
+    pub fn clone_print_tables(&self) -> PrintTables {
+        PrintTables {
+            auto_generate: self.auto_generate.borrow().clone(),
+            text_source: self.text_source.borrow().clone(),
+            original: self.original.borrow().clone(),
+            emit_nodes: self.emit_nodes.borrow().clone(),
+            assigned_name: self.assigned_name.borrow().clone(),
+            class_this: self.class_this.borrow().clone(),
+            emit_helpers: self.emit_helpers.borrow().clone(),
+            emit_node_refs: self.emit_node_refs.get(),
+        }
+    }
+
+    /// A new context with the side tables `tables`.
+    #[must_use]
+    pub fn from_print_tables(tables: PrintTables) -> Rc<EmitContext> {
+        let c = new_emit_context();
+        *c.auto_generate.borrow_mut() = tables.auto_generate;
+        *c.text_source.borrow_mut() = tables.text_source;
+        *c.original.borrow_mut() = tables.original;
+        *c.emit_nodes.borrow_mut() = tables.emit_nodes;
+        *c.assigned_name.borrow_mut() = tables.assigned_name;
+        *c.class_this.borrow_mut() = tables.class_this;
+        *c.emit_helpers.borrow_mut() = tables.emit_helpers;
+        c.emit_node_refs.set(tables.emit_node_refs);
+        c
+    }
+}
+
 // Go: printer/emitcontext.go:57 GetEmitContext
 // PORT: Go takes a context from a `sync.Pool`. Pooling is a concurrency
 // optimization, so this makes a new context. The returned function resets
@@ -115,6 +215,7 @@ impl EmitContext {
         self.var_scope_stack.borrow_mut().clear();
         self.let_scope_stack.borrow_mut().clear();
         self.emit_helpers.borrow_mut().clear();
+        self.emit_node_refs.set(false);
     }
 
     // Go: printer/emitcontext.go:71 onCreate
@@ -1106,6 +1207,7 @@ impl EmitContext {
             .borrow_mut()
             .get(parse_node)
             .external_helpers_module_name = name;
+        self.emit_node_refs.set(true);
     }
 
     // Go: printer/emitcontext.go:740 HasRecordedExternalHelpers
@@ -1500,6 +1602,7 @@ impl EmitContext {
     // so the emitter can use the type's position for comment preservation.
     pub fn set_type_node(&self, node: Node, type_node: Node) {
         self.emit_nodes.borrow_mut().get(node).type_node = type_node;
+        self.emit_node_refs.set(true);
     }
 
     // Go: printer/emitcontext.go:1001 GetTypeNode
