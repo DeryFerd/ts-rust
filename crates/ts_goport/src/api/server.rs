@@ -188,6 +188,8 @@ impl StdioServer {
         if let Some(callback_fs) = &callback_fs {
             callback_fs.set_connection(ctx, conn.clone());
         }
+        // ts#64299
+        session.set_connection(conn.clone());
 
         // ts#64276
         server_run_error(ctx, conn.run(ctx))

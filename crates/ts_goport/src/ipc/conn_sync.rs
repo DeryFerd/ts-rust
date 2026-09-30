@@ -231,34 +231,46 @@ impl SyncConn {
         // 2. The handler code (project internals) may spawn goroutines that call
         //    filesystem callbacks concurrently
         // 3. We need to ensure write/read pairs are atomic
-        let mut protocol = self.protocol.borrow_mut();
-
+        // PORT: the Go mutex is the `protocol` borrow, taken for each read and
+        // write, so that a nested request (ts#64299) can use the protocol.
         let id = jsonrpc::new_id_string(method);
 
-        protocol.write_request(Some(&id), method, params)?;
+        self.protocol
+            .borrow_mut()
+            .write_request(Some(&id), method, params)?;
 
         if let Some(err) = ctx.err() {
             return Err(err);
         }
 
-        // Read the response inline.
-        let msg = protocol.read_message()?;
+        loop {
+            // Read the response inline.
+            let msg = self.protocol.borrow_mut().read_message()?;
 
-        if msg.is_response() && msg.id.as_ref().is_some_and(|id| id.string() == method) {
-            if let Some(error) = &msg.error {
-                return Err(errors::new(format!(
-                    "ipc: remote error [{}]: {}",
-                    error.code, error.message
-                )));
+            if msg.is_response() && msg.id.as_ref().is_some_and(|id| id.string() == method) {
+                if let Some(error) = &msg.error {
+                    return Err(errors::new(format!(
+                        "ipc: remote error [{}]: {}",
+                        error.code, error.message
+                    )));
+                }
+                return Ok(msg.result);
             }
-            return Ok(msg.result);
+            if msg.is_request() {
+                // A synchronous client callback may make a nested API request. Release
+                // the protocol lock while handling it so nested callbacks can proceed.
+                self.handle_request(ctx, msg)?;
+                continue;
+            }
+            if msg.is_notification() {
+                self.handle_notification(ctx, msg);
+                continue;
+            }
+            return Err(errors::new(format!(
+                "ipc: unexpected message while waiting for {} response",
+                strconv::quote(method)
+            )));
         }
-
-        // Unexpected message while waiting for response
-        Err(errors::new(format!(
-            "ipc: unexpected message while waiting for {} response",
-            strconv::quote(method)
-        )))
     }
 
     // Go: ipc/conn_sync.go:204 Notify

@@ -734,6 +734,15 @@ pub struct Session {
     pub open_files: RefCell<FxHashSet<tspath::Path>>,
     pub created_programs: RefCell<FxHashSet<project::SyntheticProjectID>>,
 
+    // ts#64299
+    // PORT: Go `atomic.Uint64` and the mutexes are not ported (one thread).
+    // The program resolution contexts are shared with the resolver factories
+    // (module_resolution.rs header).
+    pub next_module_resolver_id: Cell<u64>,
+    pub module_resolvers: RefCell<FxHashMap<ModuleResolverID, Rc<ModuleResolverRegistration>>>,
+    pub program_resolution_contexts: Rc<ProgramResolutionContexts>,
+    pub conn: RefCell<Option<Rc<dyn ipc::Conn>>>,
+
     pub cpu_profiler: crate::pprof::CpuProfiler,
 }
 
@@ -814,6 +823,10 @@ pub fn new_session(
         open_projects: RefCell::new(FxHashSet::default()),
         open_files: RefCell::new(FxHashSet::default()),
         created_programs: RefCell::new(FxHashSet::default()),
+        next_module_resolver_id: Cell::new(0),
+        module_resolvers: RefCell::new(FxHashMap::default()),
+        program_resolution_contexts: Rc::new(ProgramResolutionContexts::default()),
+        conn: RefCell::new(None),
         cpu_profiler: crate::pprof::CpuProfiler::default(),
     };
     if let Some(options) = options {
@@ -1024,6 +1037,11 @@ impl Session {
         self.id.clone()
     }
 
+    // Go: api/session.go SetConnection (ts#64299)
+    pub fn set_connection(&self, conn: Rc<dyn ipc::Conn>) {
+        *self.conn.borrow_mut() = Some(conn);
+    }
+
     // Go: api/session.go GetCurrentDirectory (ts#64163)
     pub fn get_current_directory(&self) -> String {
         self.snapshot_host.get_current_directory()
@@ -1215,6 +1233,16 @@ impl ipc::Handler for Session {
                 .map(to_any),
             m if m == Method::GET_CURRENT_LANGUAGE_SERVER_SNAPSHOT.0 => self
                 .handle_get_current_language_server_snapshot(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64299
+            m if m == Method::CREATE_MODULE_RESOLVER.0 => self
+                .handle_create_module_resolver(assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::RELEASE_MODULE_RESOLVER.0 => {
+                self.handle_release_module_resolver(assert_params(&parsed))
+            }
+            m if m == Method::RESOLVE_MODULE_NAME.0 => self
+                .handle_resolve_module_name(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::PARSE_COMMAND_LINE.0 => self
                 .handle_parse_command_line(ctx, assert_params(&parsed))
@@ -1991,6 +2019,11 @@ impl Session {
                 vec![ERR_CLIENT_ERROR.clone(), err],
             ));
         }
+        // ts#64299
+        if let Some(err) = module_resolution_error(&snapshot) {
+            project::Snapshot::deref(&snapshot);
+            return Err(err);
+        }
 
         let response = self.create_snapshot_response(
             &snapshot,
@@ -2062,6 +2095,11 @@ impl Session {
                     vec![ERR_CLIENT_ERROR.clone(), err],
                 ));
             }
+            // ts#64299
+            if let Some(err) = module_resolution_error(&snapshot) {
+                project::Snapshot::deref(&snapshot);
+                return Err(err);
+            }
 
             let response = self.create_snapshot_response(
                 &snapshot,
@@ -2078,7 +2116,7 @@ impl Session {
     // Go: api/session.go toAPISnapshotRequest (ts#64204, ts#64319, ts#64324, ts#64391)
     pub fn to_api_snapshot_request(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         changes: &SnapshotRequestChangesParams,
     ) -> Result<project::APISnapshotRequest, GoError> {
         let mut api_request = project::APISnapshotRequest::default();
@@ -2193,6 +2231,9 @@ impl Session {
                     .iter()
                     .map(DiagnosticResponse::to_diagnostic)
                     .collect();
+                // ts#64299
+                request.module_resolver_factory = self.module_resolver_factory(ctx, options)?;
+                request.module_resolver_id = options.module_resolver.0;
             }
             api_request.create_programs.push(request);
         }
@@ -2252,6 +2293,10 @@ impl Session {
                     .iter()
                     .map(DiagnosticResponse::to_diagnostic)
                     .collect();
+                // ts#64299
+                request.api_create_program_request.module_resolver_factory =
+                    self.module_resolver_factory(ctx, options)?;
+                request.api_create_program_request.module_resolver_id = options.module_resolver.0;
             }
             api_request.reconfigure_programs.push(request);
         }
@@ -3027,7 +3072,7 @@ impl Session {
         &self,
         _ctx: &Context,
         params: &GetModeForUsageLocationParams,
-    ) -> Result<ResolutionMode, GoError> {
+    ) -> Result<ModuleKind, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
         let program = &sd.get_program(&params.project)?;
         // Current for the whole handler (file header).
@@ -3051,7 +3096,7 @@ impl Session {
         &self,
         _ctx: &Context,
         params: &GetModeForResolutionAtIndexParams,
-    ) -> Result<ResolutionMode, GoError> {
+    ) -> Result<ModuleKind, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
         let program = &sd.get_program(&params.project)?;
         // Current for the whole handler (file header).

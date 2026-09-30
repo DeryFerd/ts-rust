@@ -135,6 +135,9 @@ impl IsZero for Method {
 // ts#64319: Go `project::ID` is gone; the api uses `project::ID` (JSON below).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SnapshotID(pub u64);
+// ts#64299
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ModuleResolverID(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SymbolID(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -182,7 +185,7 @@ macro_rules! handle_json {
     )*};
 }
 
-handle_json!(uint: SnapshotID, SymbolID, TypeID, SignatureID);
+handle_json!(uint: SnapshotID, ModuleResolverID, SymbolID, TypeID, SignatureID);
 handle_json!(string: NodeHandle);
 
 // PORT: Go `project.ID` and `project.Syntheticproject::ID` (ts#64319) are Go
@@ -285,6 +288,10 @@ impl Method {
     pub const UPDATE_SNAPSHOT: Method = Method(Cow::Borrowed("updateSnapshot"));
     pub const GET_CURRENT_LANGUAGE_SERVER_SNAPSHOT: Method =
         Method(Cow::Borrowed("getCurrentLanguageServerSnapshot"));
+    // ts#64299
+    pub const CREATE_MODULE_RESOLVER: Method = Method(Cow::Borrowed("createModuleResolver"));
+    pub const RELEASE_MODULE_RESOLVER: Method = Method(Cow::Borrowed("releaseModuleResolver"));
+    pub const RESOLVE_MODULE_NAME: Method = Method(Cow::Borrowed("resolveModuleName"));
     pub const PARSE_COMMAND_LINE: Method = Method(Cow::Borrowed("parseCommandLine"));
     pub const READ_CONFIG_FILE: Method = Method(Cow::Borrowed("readConfigFile"));
     pub const PARSE_JSON_CONFIG_FILE: Method = Method(Cow::Borrowed("parseJsonConfigFileContent"));
@@ -970,6 +977,8 @@ impl UnmarshalerFrom for ProjectReference {
 pub struct CreateProgramOptions {
     pub project_references: Vec<ProjectReference>,
     pub config_file_parsing_diagnostics: Vec<DiagnosticResponse>,
+    // ts#64299
+    pub module_resolver: ModuleResolverID,
 }
 
 impl UnmarshalerFrom for CreateProgramOptions {
@@ -980,6 +989,7 @@ impl UnmarshalerFrom for CreateProgramOptions {
                 "configFileParsingDiagnostics" => {
                     json_unmarshal_decode(dec, &mut self.config_file_parsing_diagnostics)?
                 }
+                "moduleResolver" => json_unmarshal_decode(dec, &mut self.module_resolver)?,
                 _ => return Ok(false),
             }
             Ok(true)
@@ -990,6 +1000,243 @@ impl UnmarshalerFrom for CreateProgramOptions {
         Ok(())
     }
 }
+
+// Go: proto.go ModuleResolutionFallback (ts#64299)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModuleResolutionFallback(pub Cow<'static, str>);
+
+impl ModuleResolutionFallback {
+    pub const RESOLVE: ModuleResolutionFallback =
+        ModuleResolutionFallback(Cow::Borrowed("resolve"));
+    pub const UNRESOLVED: ModuleResolutionFallback =
+        ModuleResolutionFallback(Cow::Borrowed("unresolved"));
+}
+
+impl UnmarshalerFrom for ModuleResolutionFallback {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let mut s = String::new();
+        json_ext::unmarshal_string_as(dec, &mut s, "api.ModuleResolutionFallback")?;
+        self.0 = Cow::Owned(s);
+        Ok(())
+    }
+}
+
+// Go: proto.go ResolutionMode (ts#64299): `type ResolutionMode core.ModuleKind`.
+// PORT: named `ResolutionMode` as in Go; it is not the core alias
+// (`crate::options::ResolutionMode`), which api code outside this file names
+// `ModuleKind`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ResolutionMode(pub i32);
+
+impl MarshalerTo for ResolutionMode {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
+
+impl UnmarshalerFrom for ResolutionMode {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        self.0
+            .unmarshal_json_from(dec)
+            .map_err(|err| match SemanticError::of(&err) {
+                Some(mut s) => {
+                    s.go_type = "api.ResolutionMode".to_string();
+                    s.into_json_error()
+                }
+                None => err,
+            })
+    }
+}
+
+// Go: proto.go ModuleResolutionSpec (ts#64299)
+// PORT: Go `[]*ModuleResolutionEntry` elements can be nil (JSON `null`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModuleResolutionSpec {
+    pub fallback: ModuleResolutionFallback,
+    pub entries: Vec<Option<ModuleResolutionEntry>>,
+}
+
+impl UnmarshalerFrom for ModuleResolutionSpec {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object = unmarshal_struct_fields(dec, "api.ModuleResolutionSpec", |name, dec| {
+            match name {
+                "fallback" => json_unmarshal_decode(dec, &mut self.fallback)?,
+                "entries" => json_unmarshal_decode(dec, &mut self.entries)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = ModuleResolutionSpec::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go ModuleResolutionEntry (ts#64299)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModuleResolutionEntry {
+    pub module_name: String,
+    pub containing_directory: Option<DocumentIdentifier>,
+    pub resolution_mode: Option<ResolutionMode>,
+    pub result: Option<StaticModuleResolution>,
+}
+
+impl UnmarshalerFrom for ModuleResolutionEntry {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object = unmarshal_struct_fields(dec, "api.ModuleResolutionEntry", |name, dec| {
+            match name {
+                "moduleName" => json_unmarshal_decode(dec, &mut self.module_name)?,
+                "containingDirectory" => {
+                    json_unmarshal_decode(dec, &mut self.containing_directory)?
+                }
+                "resolutionMode" => json_unmarshal_decode(dec, &mut self.resolution_mode)?,
+                "result" => json_unmarshal_decode(dec, &mut self.result)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = ModuleResolutionEntry::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go StaticModuleResolution (ts#64299)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StaticModuleResolution {
+    pub resolved_file_name: Option<DocumentIdentifier>,
+    pub original_path: Option<DocumentIdentifier>,
+    pub package_id: Option<PackageId>,
+}
+
+impl UnmarshalerFrom for StaticModuleResolution {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object = unmarshal_struct_fields(dec, "api.StaticModuleResolution", |name, dec| {
+            match name {
+                "resolvedFileName" => json_unmarshal_decode(dec, &mut self.resolved_file_name)?,
+                "originalPath" => json_unmarshal_decode(dec, &mut self.original_path)?,
+                "packageId" => json_unmarshal_decode(dec, &mut self.package_id)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = StaticModuleResolution::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go CreateModuleResolverParams (ts#64299)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CreateModuleResolverParams {
+    pub compiler_options: CompilerOptions,
+    pub module_resolutions: Option<ModuleResolutionSpec>,
+    pub resolve_module_name_callback: String,
+}
+
+impl UnmarshalerFrom for CreateModuleResolverParams {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object =
+            unmarshal_struct_fields(dec, "api.CreateModuleResolverParams", |name, dec| {
+                match name {
+                    "compilerOptions" => json_unmarshal_decode(dec, &mut self.compiler_options)?,
+                    "moduleResolutions" => {
+                        json_unmarshal_decode(dec, &mut self.module_resolutions)?
+                    }
+                    "resolveModuleNameCallback" => {
+                        json_unmarshal_decode(dec, &mut self.resolve_module_name_callback)?
+                    }
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            })?;
+        if !is_object {
+            *self = CreateModuleResolverParams::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go ReleaseModuleResolverParams (ts#64299)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReleaseModuleResolverParams {
+    pub resolver: ModuleResolverID,
+}
+
+proto_json!(both ReleaseModuleResolverParams {
+    resolver: "resolver" plain,
+});
+
+// Go: proto.go ResolveModuleNameParams (ts#64299)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResolveModuleNameParams {
+    pub snapshot: SnapshotID,
+    pub in_progress_snapshot: u64,
+    pub resolver: ModuleResolverID,
+    pub module_name: String,
+    pub containing_directory: DocumentIdentifier,
+    pub resolution_mode: Option<ResolutionMode>,
+}
+
+impl UnmarshalerFrom for ResolveModuleNameParams {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object =
+            unmarshal_struct_fields(dec, "api.ResolveModuleNameParams", |name, dec| {
+                match name {
+                    "snapshot" => json_unmarshal_decode(dec, &mut self.snapshot)?,
+                    "inProgressSnapshot" => {
+                        json_unmarshal_decode(dec, &mut self.in_progress_snapshot)?
+                    }
+                    "resolver" => json_unmarshal_decode(dec, &mut self.resolver)?,
+                    "moduleName" => json_unmarshal_decode(dec, &mut self.module_name)?,
+                    "containingDirectory" => {
+                        json_unmarshal_decode(dec, &mut self.containing_directory)?
+                    }
+                    "resolutionMode" => json_unmarshal_decode(dec, &mut self.resolution_mode)?,
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            })?;
+        if !is_object {
+            *self = ResolveModuleNameParams::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go ResolveModuleNameCallbackParams (ts#64299)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResolveModuleNameCallbackParams {
+    pub module_name: String,
+    pub containing_directory: String,
+    pub resolution_mode: Option<ResolutionMode>,
+    pub snapshot: Option<SnapshotID>,
+    pub in_progress_snapshot: Option<u64>,
+}
+
+proto_json!(marshal ResolveModuleNameCallbackParams {
+    module_name: "moduleName" plain,
+    containing_directory: "containingDirectory" plain,
+    resolution_mode: "resolutionMode" omitempty,
+    snapshot: "snapshot" omitempty,
+    in_progress_snapshot: "inProgressSnapshot" omitempty,
+});
+
+// Go: proto.go ResolveModuleNameResult (ts#64299)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResolveModuleNameResult {
+    pub resolved_module: Option<ResolvedModule>,
+    // Trace is provided when compilerOptions.traceResolution is true.
+    pub trace: Vec<String>,
+}
+
+proto_json!(marshal ResolveModuleNameResult {
+    resolved_module: "resolvedModule" omitempty,
+    trace: "trace" omitempty,
+});
 
 // ProjectFileChanges describes what source files changed within a single project.
 // Go: proto.go:278 ProjectFileChanges
@@ -1144,6 +1391,19 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     m.insert(
         Method::GET_CURRENT_LANGUAGE_SERVER_SNAPSHOT,
         unmarshaller_for::<GetCurrentLanguageServerSnapshotParams>,
+    );
+    // ts#64299
+    m.insert(
+        Method::CREATE_MODULE_RESOLVER,
+        unmarshaller_for::<CreateModuleResolverParams>,
+    );
+    m.insert(
+        Method::RELEASE_MODULE_RESOLVER,
+        unmarshaller_for::<ReleaseModuleResolverParams>,
+    );
+    m.insert(
+        Method::RESOLVE_MODULE_NAME,
+        unmarshaller_for::<ResolveModuleNameParams>,
     );
     m.insert(
         Method::PARSE_COMMAND_LINE,
@@ -2841,7 +3101,7 @@ pub struct GetResolvedModuleParams {
     pub project: project::ID,
     pub file: DocumentIdentifier,
     pub module_name: String,
-    pub mode: ResolutionMode,
+    pub mode: ModuleKind, // Go core.ResolutionMode
 }
 
 proto_json!(both GetResolvedModuleParams {
@@ -2875,7 +3135,7 @@ pub struct GetResolvedTypeReferenceDirectiveParams {
     pub project: project::ID,
     pub file: DocumentIdentifier,
     pub type_directive_name: String,
-    pub mode: ResolutionMode,
+    pub mode: ModuleKind, // Go core.ResolutionMode
 }
 
 proto_json!(both GetResolvedTypeReferenceDirectiveParams {
@@ -2893,7 +3153,7 @@ pub struct GetResolvedTypeReferenceDirectiveFromReferenceParams {
     pub project: project::ID,
     pub source_file: DocumentIdentifier,
     pub type_directive_name: String,
-    pub resolution_mode: ResolutionMode,
+    pub resolution_mode: ModuleKind, // Go core.ResolutionMode
 }
 
 proto_json!(both GetResolvedTypeReferenceDirectiveFromReferenceParams {
@@ -2915,7 +3175,7 @@ pub struct PackageId {
     pub peer_dependencies: String,
 }
 
-proto_json!(marshal PackageId {
+proto_json!(both PackageId {
     name: "name" plain,
     sub_module_name: "subModuleName" plain,
     version: "version" plain,
