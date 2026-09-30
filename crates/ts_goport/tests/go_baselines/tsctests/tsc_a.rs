@@ -106,6 +106,15 @@ fn tsc_commandline_inputs() -> Vec<TscInput> {
             ..Default::default()
         },
         TscInput {
+            sub_scenario: "malformed tsconfig property without value".into(),
+            files: file_map! {
+                "/home/src/workspaces/project/tsconfig.json" => r#"{"" }"#,
+                "/home/src/workspaces/project/index.ts" => "",
+            },
+            command_line_args: vec![],
+            ..Default::default()
+        },
+        TscInput {
             sub_scenario: "Initialized TSConfig with files options".into(),
             command_line_args: args!["--init", "file0.st", "file1.ts", "file2.ts"],
             ..Default::default()
@@ -206,6 +215,14 @@ fn tsc_commandline_inputs() -> Vec<TscInput> {
             ..Default::default()
         },
         TscInput {
+            sub_scenario: "non-object config root".into(),
+            files: file_map! {
+                "/home/src/workspaces/project/tsconfig.json" => "[]",
+            },
+            command_line_args: vec![],
+            ..Default::default()
+        },
+        TscInput {
             sub_scenario: "Project is empty string".into(),
             files: file_map! {
                 "/home/src/workspaces/project/first.ts" => "export const a = 1",
@@ -272,6 +289,15 @@ fn tsc_commandline_inputs() -> Vec<TscInput> {
                 "/home/src/workspaces/project/tsconfig.json" => "",
             },
             command_line_args: args!["-p", "."],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: "compiler option at top level of tsconfig".into(),
+            files: file_map! {
+                "/home/src/workspaces/project/index.ts" => "",
+                "/home/src/workspaces/project/tsconfig.json" => r#"{ "strict": true }"#,
+            },
+            command_line_args: args!["--pretty", "false"],
             ..Default::default()
         },
         TscInput {
@@ -376,6 +402,25 @@ fn tsc_missing_files_inputs() -> Vec<TscInput> {
 					}"#),
             },
             command_line_args: args!["-p", "./tsconfig.json"],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: "extensionless file in tsconfig exists".into(),
+            files: file_map! {
+                "/home/src/workspaces/project/tsconfig.json" => dedent(r#"{
+					"files": ["./src/script"]
+					}"#),
+                "/home/src/workspaces/project/src/script" => r#"const n: number = "s";"#,
+            },
+            command_line_args: args!["-p", "./tsconfig.json"],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: "extensionless file on command line exists".into(),
+            files: file_map! {
+                "/home/src/workspaces/project/script" => r#"const n: number = "s";"#,
+            },
+            command_line_args: args!["script"],
             ..Default::default()
         },
         TscInput {

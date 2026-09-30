@@ -24,7 +24,7 @@ use ts_goport::api::encoder::{
 use ts_goport::ast::{
     ContentMapperSourceFileInfo, MappedDiagnosticDirective, MappedDiagnosticDirectivePolicy,
     NodeVisitor, NodeVisitorHooks, TextRange, new_node_visitor, source_file_file_name,
-    source_file_text, with_ast_data,
+    source_file_parser_fields, source_file_text, with_ast_data,
 };
 use ts_goport::astdata::{NodeData, SyntaxKind};
 use ts_goport::core::Node;
@@ -345,6 +345,65 @@ fn test_decode_source_file_basic() {
     assert_eq!(source_file_text(decoded), "let x = 1;");
     assert!(decoded.statement_list().is_some());
     assert!(decoded.end_of_file_token().is_some());
+}
+
+// Go: api/encoder/decoder_test.go:39 TestDecodeSourceFile_Metadata (ts#64320)
+// PORT: Go reads the fields of the parsed and the decoded `*ast.SourceFile`.
+// The parsed fields are on the `ParsedSourceFile`; the decoded root is a
+// factory SourceFile, whose fields `source_file_parser_fields` reads.
+#[test]
+fn test_decode_source_file_metadata() {
+    struct Test {
+        name: &'static str,
+        file_name: &'static str,
+        script_kind: ScriptKind,
+        code: &'static str,
+    }
+    let tests = [
+        Test {
+            name: "JSON",
+            file_name: "/test.json",
+            script_kind: ScriptKind::JSON,
+            code: r#"{"x": 1}"#,
+        },
+        Test {
+            name: "JSX",
+            file_name: "/test.jsx",
+            script_kind: ScriptKind::JSX,
+            code: "const x = <div />;",
+        },
+        Test {
+            name: "declaration",
+            file_name: "/test.d.ts",
+            script_kind: ScriptKind::TS,
+            code: "declare const x: number;",
+        },
+    ];
+
+    let mut t = Subtests::new("TestDecodeSourceFile_Metadata");
+    for tt in tests {
+        t.run(tt.name, || {
+            let file = Rc::new(parser::parse_source_file(
+                &SourceFileParseOptions {
+                    file_name: tt.file_name.to_string(),
+                    path: Path(tt.file_name.to_string()),
+                    ..Default::default()
+                },
+                tt.code,
+                tt.script_kind,
+            ));
+            program::note_parsed_source_file(&file);
+            let (buf, _) = encode_source_file(file.root).expect("assert.NilError");
+
+            let decoded = decode_source_file(&buf).expect("assert.NilError");
+            let decoded = source_file_parser_fields(decoded);
+            assert_eq!(decoded.script_kind, file.script_kind);
+            assert_eq!(decoded.language_variant, file.language_variant);
+            assert_eq!(decoded.is_declaration_file, file.is_declaration_file);
+            Ok(())
+        });
+    }
+    t.finish();
 }
 
 // Go: api/encoder/decoder_test.go:38 TestDecodeSourceFile_Statements

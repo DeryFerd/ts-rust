@@ -443,8 +443,9 @@ child_test! {
     // a pooled block. A dead version gives it back, and it waits for two
     // more program releases (one per edit here): the version that dies in
     // the release of edit 3 gives its block to the version of edit 6. A read
-    // of the dead version after that fails the owner check: with debug
-    // assertions it panics, without them it reads the new version.
+    // of the dead version after that fails the owner check: a binder field
+    // read (symbol, flags, flow node) panics in every build, a header read
+    // with debug assertions (without them it reads the new version).
     fn edited_file_blocks_wait_two_releases_then_get_reused() {
         let session = open_p1();
         let edit_block = |version: i32, digit: &str| {
@@ -465,11 +466,23 @@ child_test! {
         assert_eq!(sixth_block, second_block, "the block of version 2 is not reused");
         assert!(node_block_is_owned(sixth));
         assert!(!node_block_is_owned(second), "the block has a new owner");
+        let released = format!("file version {} is released", second.file_index());
+        let symbol = panic_message(|| {
+            let _ = second.symbol();
+        });
+        assert_eq!(symbol.as_deref(), Some(released.as_str()), "a stale symbol read");
+        let flags = panic_message(|| {
+            let _ = second.flags();
+        });
+        assert_eq!(flags.as_deref(), Some(released.as_str()), "a stale flags read");
+        let flow_node = panic_message(|| {
+            let _ = second.flow_node();
+        });
+        assert_eq!(flow_node.as_deref(), Some(released.as_str()), "a stale flow node read");
         let stale = panic_message(|| {
             let _ = second.kind();
         });
         if cfg!(debug_assertions) {
-            let released = format!("file version {} is released", second.file_index());
             assert_eq!(stale.as_deref(), Some(released.as_str()), "a stale read of a reused block");
         } else {
             assert_eq!(stale, None);

@@ -12,6 +12,11 @@
 //! file. Without declarations, whole files run on the pool.
 //!
 //! The test needs the pool on: do not set `GOPORT_EMIT_THREADS=0`.
+//!
+//! The d.ts part of a split file prints on the d.ts twin of its checker
+//! (`program::send_dts_twin_job`). With the twins in check mode (each print
+//! also runs on the checker, and the twin panics on a different text) the
+//! emit writes and returns the same as with the twins off.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -19,12 +24,18 @@ use std::sync::{Arc, Mutex};
 use ts_goport::core::enter_program;
 use ts_goport::emitter::emitter::EmitOnly;
 use ts_goport::emitter::program_emit::{
-    EmitOptions, EmitResult, WriteFile, WriteFileData, combine_emit_results, emit, emit_batch,
+    DtsTwinMode, EmitOptions, EmitResult, WriteFile, WriteFileData, combine_emit_results, emit,
+    emit_batch, set_dts_twin_mode,
 };
 use ts_goport::options::{CompilerOptions, Tristate};
 use ts_goport::program::{
-    emit_pool_job_count, format_diagnostic, release_program, source_files, try_load_version,
+    dts_twin_job_count, emit_pool_job_count, format_diagnostic, release_program, source_files,
+    try_load_version,
 };
+
+/// The tests of this file run one at a time: the d.ts twin mode and the
+/// twin job count are process-wide.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 const CONFIG: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -52,6 +63,9 @@ struct Run {
 
 #[test]
 fn pool_emits_like_the_checker_threads() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let pool = run(|_| {});
     assert!(pool.pool_jobs > 0, "the emit pool got no job");
     assert!(
@@ -88,6 +102,37 @@ fn pool_emits_like_the_checker_threads() {
         &whole_single,
         "no declarations: the pool against --singleThreaded",
     );
+}
+
+#[test]
+fn dts_twins_print_like_the_checker_threads() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for edit in [
+        (|_: &mut CompilerOptions| {}) as fn(&mut CompilerOptions),
+        |options| options.checkers = Some(1),
+    ] {
+        set_dts_twin_mode(Some(DtsTwinMode::Check));
+        let twin_jobs = dts_twin_job_count();
+        let twins = run(edit);
+        let twin_jobs = dts_twin_job_count() - twin_jobs;
+        set_dts_twin_mode(Some(DtsTwinMode::Off));
+        let checkers = run(edit);
+        set_dts_twin_mode(None);
+
+        assert!(twin_jobs > 0, "the d.ts twins got no job");
+        assert!(
+            twins
+                .emit
+                .files
+                .keys()
+                .any(|name| name.ends_with("/out/shapes.d.ts")),
+            "the fixture must emit shapes.d.ts: {:?}",
+            twins.emit.files.keys()
+        );
+        assert_same(&twins, &checkers, "d.ts twins against the checker threads");
+    }
 }
 
 /// Asserts that two runs wrote and returned the same, for `emit` and for

@@ -14,6 +14,7 @@ use super::childprog::{
 };
 use crate::support::vfstest::{MapFile, MapFs};
 use std::sync::Arc;
+use ts_goport::ast::{MappedDiagnosticDirective, MappedDiagnosticDirectivePolicy, TextRange};
 use ts_goport::contentmapper;
 use ts_goport::diagnostics_loc;
 use ts_goport::frontend::bundled;
@@ -542,7 +543,7 @@ impl contentmapper::Project for FakeContentMapperHost {
     }
 }
 
-// Go: compiler/contentmapper_test.go:38 newContentMapperProgram
+// Go: compiler/contentmapper_test.go:39 newContentMapperProgram
 fn new_content_mapper_program(
     transform: FakeTransform,
     files: &[(&str, &str)],
@@ -561,7 +562,7 @@ fn new_content_mapper_program(
     )
 }
 
-// Go: compiler/contentmapper_test.go:46 newContentMapperProgramWithOptions
+// Go: compiler/contentmapper_test.go:47 newContentMapperProgramWithOptions
 // PORT: Go writes the files into an empty case-insensitive map file system;
 // `MapFs::from_map` makes the same files and parent directories. The first
 // map file system of the test process is also its OS file system (see
@@ -672,22 +673,179 @@ fn test_content_mapper_virtual_extension_sets_implied_node_format() {
     );
 }
 
-// Go: compiler/contentmapper_test.go:94 collectContentMapperDiagnostics
-// PORT: Go collects the syntactic, semantic and program diagnostics through
-// the program. The loader puts the content mapper diagnostics in the parse
-// diagnostics of the file (Go `SetDiagnostics`) and in the program's
-// content mapper diagnostics, so this reads those two lists.
+// Go: compiler/contentmapper_test.go:94 TestContentMapperDirectivesPreserveIncrementalGlobals
+#[test]
+fn test_content_mapper_directives_preserve_incremental_globals() {
+    in_child(
+        module_path!(),
+        "test_content_mapper_directives_preserve_incremental_globals",
+        || {
+            let mut t = Subtests::new("TestContentMapperDirectivesPreserveIncrementalGlobals");
+            for policy in [
+                MappedDiagnosticDirectivePolicy::IGNORE,
+                MappedDiagnosticDirectivePolicy::EXPECT,
+            ] {
+                let expect = policy == MappedDiagnosticDirectivePolicy::EXPECT;
+                t.run(if expect { "expect" } else { "ignore" }, || {
+                    const TEXT: &str =
+                        "export function values() { function* generator() { yield 1; } }";
+                    let program = new_content_mapper_program_with_options(
+                        fake_transform(move |_file_name, content| {
+                            // The virtual source is unchanged; the directive covers the entire file, including offset zero.
+                            let len = content.len() as i32;
+                            Ok(contentmapper::Result {
+                                text: content.to_string(),
+                                virtual_extension: ".ts".to_string(),
+                                mappings: Some(Arc::new(spanmap::new(&[spanmap::Segment {
+                                    original_end: len,
+                                    virtual_end: len,
+                                    kind: spanmap::Kind::VERBATIM,
+                                    features: spanmap::Feature::ALL,
+                                    ..Default::default()
+                                }]))),
+                                diagnostic_directives: vec![MappedDiagnosticDirective {
+                                    virtual_range: TextRange::new(0, len),
+                                    original_range: TextRange::new(0, len),
+                                    policy,
+                                    source: "vue".to_string(),
+                                    unused_code: 2578,
+                                    unused_message_text: "Unused mapped expect directive."
+                                        .to_string(),
+                                }],
+                                ..Default::default()
+                            })
+                        }),
+                        &[("/src/Component.vue", TEXT)],
+                        &["/src/Component.vue"],
+                        CompilerOptions {
+                            lib: Some(vec!["lib.es5.d.ts".to_string()]),
+                            skip_lib_check: Tristate::True,
+                            module: ModuleKind::ES_NEXT,
+                            module_resolution: ModuleResolutionKind::BUNDLER,
+                            ..Default::default()
+                        },
+                    );
+                    let ctx = context::background();
+                    assert_eq!(ls_program::get_global_diagnostics(&program, &ctx).len(), 0);
+                    let file = source_file(&program, "/src/Component.vue").root;
+                    let diags = ls_program::get_semantic_diagnostics_for_incremental(
+                        &program,
+                        &ctx,
+                        &[file],
+                    )
+                    .remove(&file)
+                    .unwrap_or_default();
+                    let (mut globals, mut unused) = (0, 0);
+                    for diag in &diags {
+                        if diag.file.is_nil() {
+                            assert_eq!(diag.code, diag::Cannot_find_global_type_0.code() as i32);
+                            assert_eq!(diag.message_args[0], "IterableIterator");
+                            globals += 1;
+                        } else {
+                            assert_eq!(diag.file, file);
+                            assert_eq!(diag.source, "vue");
+                            assert_eq!(diag.code, 2578);
+                            unused += 1;
+                        }
+                    }
+                    assert_eq!(globals, 1);
+                    assert_eq!(unused, if expect { 1 } else { 0 });
+                    Ok(())
+                });
+            }
+            t.finish();
+        },
+    );
+}
+
+// Go: compiler/contentmapper_test.go:153 TestCompositeProjectContentMapperSupplementalRoots
+#[test]
+fn test_composite_project_content_mapper_supplemental_roots() {
+    in_child(
+        module_path!(),
+        "test_composite_project_content_mapper_supplemental_roots",
+        || {
+            let content_mapper_host = fake_transform(|_file_name, _content| {
+                Ok(contentmapper::Result {
+                    text: "export {};".to_string(),
+                    virtual_extension: ".ts".to_string(),
+                    mappings: Some(Arc::new(spanmap::new(&[]))),
+                    supplemental: vec![contentmapper::MappedResult {
+                        text: "export {};".to_string(),
+                        virtual_extension: ".mts".to_string(),
+                        mappings: Some(Arc::new(spanmap::new(&[]))),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+            });
+            let options = || CompilerOptions {
+                composite: Tristate::True,
+                skip_lib_check: Tristate::True,
+                module: ModuleKind::ES_NEXT,
+                module_resolution: ModuleResolutionKind::BUNDLER,
+                ..Default::default()
+            };
+            let unlisted_file_code = diag::File_0_is_not_listed_within_the_file_list_of_project_1_Projects_must_list_all_files_or_use_an_include_pattern.code() as i32;
+            let mut t = Subtests::new("TestCompositeProjectContentMapperSupplementalRoots");
+
+            t.run("listed canonical root", || {
+                let program = new_content_mapper_program_with_options(
+                    content_mapper_host.clone(),
+                    &[("/src/Component.vue", "<template />")],
+                    &["/src/Component.vue"],
+                    options(),
+                );
+
+                let program_diagnostics = collect_content_mapper_diagnostics(&program);
+                let has_unlisted_file_diagnostic = program_diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == unlisted_file_code);
+                assert!(
+                    !has_unlisted_file_diagnostic,
+                    "supplemental output should be covered by its listed canonical root: {program_diagnostics:?}"
+                );
+                Ok(())
+            });
+
+            t.run("imported canonical file", || {
+                let program = new_content_mapper_program_with_options(
+                    content_mapper_host.clone(),
+                    &[
+                        ("/src/index.ts", r#"import "./Component.vue";"#),
+                        ("/src/Component.vue", "<template />"),
+                    ],
+                    &["/src/index.ts"],
+                    options(),
+                );
+
+                let unlisted_file_diagnostic_count = collect_content_mapper_diagnostics(&program)
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == unlisted_file_code)
+                    .count();
+                assert_eq!(unlisted_file_diagnostic_count, 2);
+                Ok(())
+            });
+
+            t.finish();
+        },
+    );
+}
+
+// Go: compiler/contentmapper_test.go:216 collectContentMapperDiagnostics
 fn collect_content_mapper_diagnostics(program: &NewProgram) -> Vec<Diagnostic> {
-    let mut diagnostics: Vec<Diagnostic> = program
-        .source_files()
-        .iter()
-        .flat_map(|file| file.diagnostics.iter().cloned())
-        .collect();
-    diagnostics.extend(program.content_mapper_diagnostics.iter().cloned());
+    let ctx = context::background();
+    let mut diagnostics = ls_program::get_syntactic_diagnostics(program, &ctx, Node::NIL);
+    diagnostics.extend(ls_program::get_semantic_diagnostics(
+        program,
+        &ctx,
+        Node::NIL,
+    ));
+    diagnostics.extend(ls_program::get_program_diagnostics(program));
     diagnostics
 }
 
-// Go: compiler/contentmapper_test.go:103 TestContentMapperInvalidMappings
+// Go: compiler/contentmapper_test.go:225 TestContentMapperInvalidMappings
 #[test]
 fn test_content_mapper_invalid_mappings() {
     in_child(
@@ -737,7 +895,7 @@ fn test_content_mapper_invalid_mappings() {
     );
 }
 
-// Go: compiler/contentmapper_test.go:131 TestContentMapperSourceFileState
+// Go: compiler/contentmapper_test.go:251 TestContentMapperSourceFileState
 #[test]
 fn test_content_mapper_source_file_state() {
     in_child(
@@ -817,7 +975,7 @@ fn test_content_mapper_source_file_state() {
     );
 }
 
-// Go: compiler/contentmapper_test.go:180 TestContentMapperProjectErrorDiagnostics
+// Go: compiler/contentmapper_test.go:302 TestContentMapperProjectErrorDiagnostics
 #[test]
 fn test_content_mapper_project_error_diagnostics() {
     let tests = [
