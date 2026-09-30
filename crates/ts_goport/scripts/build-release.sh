@@ -25,15 +25,17 @@
 # Steps:
 #   0. Dynamic build: make the glibc 2.28 sysroot once (floor_sysroot).
 #   1. Instrumented build (-Cprofile-generate) of goport, tsgo and goport_emit.
-#   2. PGO training: the same runs as build-pgo.sh.
+#   2. PGO training: the same runs as build-pgo.sh, and editor sessions
+#      (RELEASE_LSP_SESSIONS) of the instrumented tsgo in --lsp mode.
 #   3. Merge the raw profiles with llvm-profdata.
 #   4. PGO use build of the shipped bins (tsgo, goport, goport_emit,
 #      goport_build, goport_typesyms), linked with --emit-relocs. BOLT needs
 #      the relocations. They do not change the code.
 #      Dynamic build: check that no bin needs a GLIBC_ symbol version above
 #      the floor (objdump -T).
-#   5. BOLT: record each bin with perf branch sampling on training runs,
-#      convert with perf2bolt, merge with merge-fdata, rewrite with llvm-bolt.
+#   5. BOLT: record each bin with perf branch sampling on training runs
+#      (for tsgo, also the editor sessions of step 2), convert with
+#      perf2bolt, merge with merge-fdata, rewrite with llvm-bolt.
 #      Then check the program headers of the shipped bins (check_headers).
 #   6. Run tsgo in qemu on a CPU without AVX. A dynamic tsgo runs there on the
 #      glibc 2.28 of the sysroot.
@@ -138,6 +140,17 @@
 #   RELEASE_BOLT      1 (default). 0: skip step 5, for hosts without llvm-bolt
 #                     or perf branch sampling (Intel LBR, AMD LBR v2 or BRS).
 #   PGO_CORPUS_STEP   train on every Nth corpus case (default 60, about 200)
+#   RELEASE_LSP_SESSIONS  editor sessions of the PGO and BOLT training, as
+#                     <project>:<edits> (default "query-core:300 hono:200
+#                     effect:300"; empty: none). Each is the long session of
+#                     scripts/goport/ls_edit_bench.py (typing, errfix, imports
+#                     and mix edits with VS Code-like request bursts), run by
+#                     scripts/lsp-train.py with the same messages each time.
+#                     BUILD.txt records the plan digests and the sha256 of
+#                     ls_edit_bench.py. Without them, the editor's own code
+#                     (the LSP server, snapshot updates, node reads of the
+#                     edited file) runs in BOLT .cold code: 6.6% of an effect
+#                     edit (studies/lspeffect1).
 #   BOLT_PERF_FREQ    perf sample frequency for BOLT (default 20000)
 #
 # Rules this script keeps:
@@ -172,6 +185,7 @@
 #     its headers do not ask for newer symbols.
 #
 # The training runs only read project inputs: emit writes to a temp --outDir,
+# the editor sessions send the edits as overlays (didOpen, didChange),
 # tsgo writes .tsbuildinfo to a temp file, goport_build runs on a temp copy.
 set -euo pipefail
 
@@ -200,6 +214,7 @@ if [[ -n $version ]]; then export GOPORT_BUILD_VERSION="$version"; else unset GO
 glibc_floor="${RELEASE_GLIBC_FLOOR:-2.28}"
 bolt="${RELEASE_BOLT:-1}"
 corpus_step="${PGO_CORPUS_STEP:-60}"
+lsp_sessions="${RELEASE_LSP_SESSIONS-query-core:300 hono:200 effect:300}"
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95.0}"
 # The training runs start no tsgo worker (bin/tsgo.rs `launch`): when the
 # launcher exits, the parent death signal can kill the worker before it has
@@ -251,6 +266,9 @@ if [[ $bolt == 1 ]]; then
 fi
 
 command -v qemu-x86_64 > /dev/null || { echo "error: qemu-x86_64 not found (package qemu-user); step 6 needs it" >&2; exit 1; }
+if [[ -n $lsp_sessions ]]; then
+  command -v python3 > /dev/null || { echo "error: python3 not found; the editor sessions need it (or set RELEASE_LSP_SESSIONS=)" >&2; exit 1; }
+fi
 
 # floor_sysroot <dir>: makes the glibc 2.28 sysroot of the dynamic build in
 # <dir>, from Arch Linux packages of April 2019 (built for plain x86-64):
@@ -415,8 +433,17 @@ for dir in "$cases"/*/; do
     n=$((n + 1))
   fi
 done
+# Editor sessions. A failed session stops the build: a killed server writes
+# no profile.
+lsp_trained="no editor sessions"
+if [[ -n $lsp_sessions ]]; then
+  # shellcheck disable=SC2086 # one argument per session
+  python3 "$script_dir/lsp-train.py" "$gen/tsgo" "$P" $lsp_sessions > "$out/lsp-train-pgo.log" 2>&1 \
+    || { tail -5 "$out/lsp-train-pgo.log" >&2; echo "error: the editor training sessions failed (see $out/lsp-train-pgo.log)" >&2; exit 1; }
+  lsp_trained="editor sessions ($(sed -n 's/^lsp-train: \(.*\): [0-9]* of .*/\1/p' "$out/lsp-train-pgo.log" | paste -sd';' | sed 's/;/; /g'))"
+fi
 nprof=$(find "$profiles" -name '*.profraw' | wc -l)
-echo "trained on 5 projects and $n corpus cases, $nprof profraw files"
+echo "trained on 5 projects, $n corpus cases and $lsp_trained, $nprof profraw files"
 if ((killed > 0)); then
   echo "error: $killed PGO training runs were killed by a signal (see above)" >&2
   exit 1
@@ -542,7 +569,14 @@ bolt_train() {
       done
       for name in query hono; do
         rec "tsgo-emit-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --pretty false --outDir "$tmp/out-$name" --tsBuildInfoFile "$tmp/emit-$name.tsbuildinfo"
-      done ;;
+      done
+      # The editor sessions of step 2, in one recording.
+      if [[ -n $lsp_sessions ]]; then
+        # shellcheck disable=SC2086 # one argument per session
+        rec tsgo-lsp 1 python3 "$script_dir/lsp-train.py" "$b" "$P" $lsp_sessions
+        grep -qx 'lsp-train: ok' "$bolt_dir/data/tsgo-lsp.out" \
+          || { tail -5 "$bolt_dir/data/tsgo-lsp.out" >&2; echo "error: the editor sessions of the BOLT training failed" >&2; exit 1; }
+      fi ;;
     goport)
       for name in query hono zod effect; do rec "goport-$name" "${reps[$name]}" "$b" -p "${projects[$name]}"; done ;;
     goport_emit)
@@ -667,7 +701,10 @@ done
 {
   echo "source: $(git -C "$repo" rev-parse HEAD)$(git -C "$repo" diff --quiet HEAD -- crates Cargo.toml Cargo.lock ':(exclude,glob)crates/*/scripts/**' || echo ' (dirty)')"
   echo "rustc: $(rustc -V), target $target, cargo profile goport"
-  echo "pgo: $merged, trained on 5 projects and $n corpus cases"
+  echo "pgo: $merged, trained on 5 projects, $n corpus cases and $lsp_trained"
+  if [[ -n $lsp_sessions ]]; then
+    echo "editor sessions: lsp-train.py $lsp_sessions (PGO$([[ $bolt == 1 ]] && echo " and tsgo BOLT")), ls_edit_bench.py sha256 $(sha256sum "$repo/scripts/goport/ls_edit_bench.py" | cut -c1-12)"
+  fi
   echo "pie: $pie"
   if [[ $libc == musl ]]; then
     echo "libc: static musl (rustc self-contained)"
