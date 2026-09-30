@@ -752,13 +752,14 @@ impl Deref for SourceFileOrder {
 
 /// The leaked copy of `options` that `GoProgram::options` keeps: one per
 /// distinct value in the process, so the program versions of a language
-/// server session share one copy.
-// PERF: a linear search with `==`, once per program. A process has one
-// options value per project config.
+/// server session share one copy. Two values are the same only when
+/// `deep_equal` says so, so a copy keeps the `paths` order of its program.
+// PERF: a linear search, once per program. A process has one options value
+// per project config.
 pub(crate) fn intern_compiler_options(options: &CompilerOptions) -> &'static CompilerOptions {
     static INTERNED: Mutex<Vec<&'static CompilerOptions>> = Mutex::new(Vec::new());
     let mut interned = INTERNED.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(&found) = interned.iter().find(|&&found| found == options) {
+    if let Some(&found) = interned.iter().find(|found| found.deep_equal(options)) {
         return found;
     }
     let leaked: &'static CompilerOptions = Box::leak(Box::new(options.clone()));
@@ -4398,6 +4399,52 @@ pub fn checker_index_of_file(file: Node) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Options that differ only in the `paths` order are different values:
+    // each program keeps its own order.
+    #[test]
+    fn interned_options_keep_the_paths_order() {
+        let with_paths = |keys: [&str; 2]| CompilerOptions {
+            config_file_path: "/interned_options_keep_the_paths_order/tsconfig.json".into(),
+            paths: Some(
+                keys.iter()
+                    .map(|&key| (key.to_string(), Some(vec![format!("./{key}")])))
+                    .collect(),
+            ),
+            ..CompilerOptions::default()
+        };
+        let a = with_paths(["a/*", "*"]);
+        let b = with_paths(["*", "a/*"]);
+        assert_eq!(a, b, "the derived == ignores the order");
+        assert!(!a.deep_equal(&b));
+        assert!(a.deep_equal(&a.clone()));
+
+        let interned_a = intern_compiler_options(&a);
+        let interned_b = intern_compiler_options(&b);
+        assert!(!std::ptr::eq(interned_a, interned_b));
+        let keys = |options: &CompilerOptions| {
+            options
+                .paths
+                .as_ref()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(interned_a), ["a/*", "*"]);
+        assert_eq!(keys(interned_b), ["*", "a/*"]);
+        let again = intern_compiler_options(&b.clone());
+        assert!(std::ptr::eq(again, interned_b));
+
+        // The watch mode config check (Go `reflect.DeepEqual`) sees it too.
+        use crate::frontend::tsoptions::parsed_options::ParsedOptions;
+        let parsed = |options: CompilerOptions| ParsedOptions {
+            compiler_options: std::rc::Rc::new(options),
+            ..ParsedOptions::default()
+        };
+        assert!(parsed(a.clone()) != parsed(b));
+        assert!(parsed(a.clone()) == parsed(a));
+    }
 
     // Go: compiler/emitter.go:504-521. No Go test covers this part. The
     // expected values come from Go at pin B (16c25522e123): the same calls in
