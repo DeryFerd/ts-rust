@@ -2,7 +2,7 @@
 //!
 //! PORT notes for the whole file:
 //! - Go runs the per-project searches on a parallel `core.WorkGroup` and
-//!   shares `results`, `defaultDefinition`, `err` and `panicsOccured` under
+//!   shares `results`, `defaultDefinition`, `err` and `panicsOccurred` under
 //!   mutexes. The shared locals are `RefCell` fields of one
 //!   `CrossProjectState` value on the dispatch thread. The Go closures
 //!   `canSearchProject`, `enqueueItem` and the queued function are its
@@ -202,7 +202,7 @@ where
         default_definition: RefCell::new(None),
         wg: RefCell::new(VecDeque::new()),
         err: RefCell::new(None),
-        panics_occured: RefCell::new(None),
+        panics_occurred: RefCell::new(None),
     };
 
     // Initial set of projects and locations in the queue, starting with default project
@@ -235,11 +235,11 @@ where
         // Process existing known projects first
         state.run_and_wait();
         // No need to use mu here since we are not in parallel at this point
-        if let Some(panics_occured) = state.panics_occured.borrow().as_ref() {
+        if let Some(panics_occurred) = state.panics_occurred.borrow().as_ref() {
             // PORT: Go `%v` of a `[]string`.
             panic!(
                 "Panics occurred during cross-project handling: [{}]",
-                panics_occured.join(" ")
+                panics_occurred.join(" ")
             );
         }
         if let Some(err) = ctx.err() {
@@ -432,7 +432,9 @@ pub fn search_item_with_data<P: ProgramView, Req, Resp>(
 }
 
 /// Go `fmt.Sprintf("panic handling request: %v\n%s", r, debug.Stack())`, the
-/// text that the deferred recover of the queued function keeps.
+/// text that the deferred recover of the queued function keeps (Go
+/// `panicOccurred`). The name keeps the old spelling because
+/// `search_thread.rs` calls it.
 pub fn panic_occured_text(payload: Box<dyn std::any::Any + Send>) -> String {
     let text = panic_payload_text(&*payload);
     // PORT: Go `debug.Stack()`; the text is only logged.
@@ -478,8 +480,8 @@ struct CrossProjectState<'a, Req, Resp> {
     >,
     /// Go `err` (under `errMu`).
     err: RefCell<Option<GoError>>,
-    /// Go `panicsOccured` (under `panicMu`); `None` is Go's nil slice.
-    panics_occured: RefCell<Option<Vec<String>>>,
+    /// Go `panicsOccurred` (under `panicMu`); `None` is Go's nil slice.
+    panics_occurred: RefCell<Option<Vec<String>>>,
 }
 
 /// The language service of an item: the caller's for item 0, or the one
@@ -834,15 +836,15 @@ where
                 }
             }
         }));
-        let panic_occured = match committed {
+        let panic_occurred = match committed {
             Err(payload) => Some(panic_occured_text(payload)),
             Ok(()) => panic,
         };
-        if let Some(panic_occured) = panic_occured {
-            self.panics_occured
+        if let Some(panic_occurred) = panic_occurred {
+            self.panics_occurred
                 .borrow_mut()
                 .get_or_insert_with(Vec::new)
-                .push(panic_occured);
+                .push(panic_occurred);
             return;
         }
         match result {
