@@ -185,7 +185,9 @@ impl<'a> MissingMemberFixer<'a> {
                     if is_set_accessor_declaration(accessor) {
                         let parameter = get_set_accessor_value_parameter(accessor);
                         if parameter.is_nil() {
-                            panic!("Expected set accessor to have a parameter.");
+                            crate::core::go_panic(
+                                "Expected set accessor to have a parameter.".to_string(),
+                            );
                         }
 
                         let name = create_property_name(

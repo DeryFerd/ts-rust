@@ -56,14 +56,18 @@ impl<T: Cloneable + Clone> Box<T> {
             let value = self.value.borrow().clone();
             let cloned = value
                 .as_ref()
-                .expect("nil pointer dereference: Box.value")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .clone_();
             *self.value.borrow_mut() = Some(cloned);
             self.dirty.set(true);
         }
         // PORT: no borrow is held while `apply` runs.
         let value = self.value.borrow().clone();
-        apply(value.as_ref().expect("nil pointer dereference: Box.value"));
+        apply(
+            value
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference()),
+        );
     }
 
     // Go: project/dirty/box.go:44 ChangeIf

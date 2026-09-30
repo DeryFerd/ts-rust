@@ -50,14 +50,14 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> MapEntry<K, V> {
     // Go: project/dirty/map.go:10 Change
     pub fn change(&self, apply: &mut dyn FnMut(&V)) {
         if self.map_entry.borrow().delete {
-            panic!("tried to change a deleted entry");
+            crate::core::go_panic("tried to change a deleted entry".to_string());
         }
         if !self.map_entry.borrow().dirty {
             // PORT: Go calls Clone on a nil value; that dereferences nil.
             let value = self.map_entry.borrow().value.clone();
             let cloned = value
                 .as_ref()
-                .expect("nil pointer dereference: MapEntry.value")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .clone_();
             {
                 let mut e = self.map_entry.borrow_mut();
@@ -74,14 +74,14 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> MapEntry<K, V> {
         apply(
             value
                 .as_ref()
-                .expect("nil pointer dereference: MapEntry.value"),
+                .unwrap_or_else(|| crate::core::go_nil_dereference()),
         );
     }
 
     // Go: project/dirty/map.go:22 Replace
     pub fn replace(&self, new_value: V) {
         if self.map_entry.borrow().delete {
-            panic!("tried to change a deleted entry");
+            crate::core::go_panic("tried to change a deleted entry".to_string());
         }
         if !self.map_entry.borrow().dirty {
             self.map_entry.borrow_mut().dirty = true;
@@ -240,7 +240,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
         if let (Some(entry), true) = self.get(key) {
             entry.change(apply);
         } else {
-            panic!("tried to change a non-existent entry");
+            crate::core::go_panic("tried to change a non-existent entry".to_string());
         }
     }
 
@@ -256,7 +256,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
     // Go: project/dirty/map.go:118 Delete
     pub fn delete(&self, key: &K) {
         if !self.try_delete(key) {
-            panic!("tried to delete a non-existent entry");
+            crate::core::go_panic("tried to delete a non-existent entry".to_string());
         }
     }
 
@@ -338,7 +338,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
                     key,
                     e.value
                         .clone()
-                        .expect("nil pointer dereference: MapEntry.value"),
+                        .unwrap_or_else(|| crate::core::go_nil_dereference()),
                 );
             }
         }

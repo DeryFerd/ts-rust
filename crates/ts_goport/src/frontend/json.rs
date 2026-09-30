@@ -18,7 +18,9 @@
 //!
 //! PORT: without legacy flags every v2 unmarshal error is fatal
 //! (`isFatalError`), so every impl returns the first error. Error messages are
-//! not the v2 texts; no caller shows them.
+//! not the v2 texts; no caller shows them. The exception is the max depth
+//! error of the decoder, which the LSP shows in an InvalidRequest error: it
+//! has the Go `jsontext` text (`json_ext::syntactic_error_text`).
 
 use crate::frontend::prelude::*;
 
@@ -323,7 +325,13 @@ impl<'a> JsonDecoder<'a> {
                     return Err(JsonError::new("object member name must be a string"));
                 }
                 if self.stack.len() == MAX_NESTING_DEPTH {
-                    return Err(JsonError::new("exceeded max depth"));
+                    return Err(JsonError::new(
+                        crate::frontend::json_ext::syntactic_error_text(
+                            self.buf,
+                            p,
+                            "exceeded max depth",
+                        ),
+                    ));
                 }
                 self.increment();
                 let is_object = c == b'{';
@@ -1295,6 +1303,23 @@ mod marshal_depth_tests {
         let mut out: Vec<u8> = Vec::new();
         assert!(json_marshal_write(&mut out, &Nested(MAX_NESTING_DEPTH + 1), &[]).is_err());
         assert!(out.is_empty());
+    }
+
+    // Go jsontext decodes 10000 nested arrays and fails at the next `[`
+    // with the pointer "/0" x 10000 and the offset 10000 (coder_test.go
+    // "ArraysInvalid"). The text cuts the pointer to about 100 bytes
+    // (jsonwire.TruncatePointer).
+    #[test]
+    fn decode_fails_past_max_nesting_depth() {
+        let depth = MAX_NESTING_DEPTH + 1;
+        let input = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        let mut dec = JsonDecoder::new(input.as_bytes(), JsonOptions::default());
+        let err = dec.skip_value().unwrap_err();
+        let pointer = format!("{}/…/0{}", "/0".repeat(24), "/0".repeat(24));
+        assert_eq!(
+            err.message,
+            format!("jsontext: exceeded max depth within \"{pointer}\" after offset 10000")
+        );
     }
 }
 

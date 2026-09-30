@@ -193,7 +193,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMapEntry<K, V> {
             apply(
                 value
                     .as_ref()
-                    .expect("nil pointer dereference: SyncMapEntry.value"),
+                    .unwrap_or_else(|| crate::core::go_nil_dereference()),
             );
             return;
         }
@@ -206,7 +206,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMapEntry<K, V> {
             let value = entry.map_entry.borrow().value.clone();
             let cloned = value
                 .as_ref()
-                .expect("nil pointer dereference: SyncMapEntry.value")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .clone_();
             let mut e = entry.map_entry.borrow_mut();
             e.value = Some(cloned);
@@ -227,7 +227,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMapEntry<K, V> {
         apply(
             value
                 .as_ref()
-                .expect("nil pointer dereference: SyncMapEntry.value"),
+                .unwrap_or_else(|| crate::core::go_nil_dereference()),
         );
     }
 
@@ -579,7 +579,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMap<K, V> {
                 // would store nil.
                 result.as_mut().expect("cloned above").insert(
                     key,
-                    value.expect("nil pointer dereference: SyncMapEntry.value"),
+                    value.unwrap_or_else(|| crate::core::go_nil_dereference()),
                 );
             }
         }

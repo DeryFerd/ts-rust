@@ -872,11 +872,11 @@ impl LanguageService {
                 let a_from = a
                     .from
                     .as_ref()
-                    .expect("invalid memory address or nil pointer dereference");
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 let b_from = b
                     .from
                     .as_ref()
-                    .expect("invalid memory address or nil pointer dereference");
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 let uri_comp = a_from.uri.0.as_str().cmp(b_from.uri.0.as_str()) as i32;
                 if uri_comp != 0 {
                     return uri_comp;
@@ -1287,10 +1287,10 @@ impl LanguageService {
         gostd::slices::sort_func(&mut result, |a, b| {
             let a_to =
                 a.to.as_ref()
-                    .expect("invalid memory address or nil pointer dereference");
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
             let b_to =
                 b.to.as_ref()
-                    .expect("invalid memory address or nil pointer dereference");
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
             let uri_comp = a_to.uri.0.as_str().cmp(b_to.uri.0.as_str()) as i32;
             if uri_comp != 0 {
                 return uri_comp;
@@ -1365,7 +1365,7 @@ impl LanguageService {
                     let from = call
                         .from
                         .as_ref()
-                        .expect("invalid memory address or nil pointer dereference");
+                        .unwrap_or_else(|| crate::core::go_nil_dereference());
                     let location = lsproto::Location {
                         uri: from.uri.clone(),
                         range: from.selection_range,
@@ -1415,7 +1415,7 @@ impl LanguageService {
                 let to = call
                     .to
                     .as_ref()
-                    .expect("invalid memory address or nil pointer dereference");
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 let location = lsproto::Location {
                     uri: to.uri.clone(),
                     range: to.selection_range,

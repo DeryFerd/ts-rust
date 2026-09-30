@@ -40,8 +40,11 @@ pub fn run_main(args: &[String]) -> Option<i32> {
 
 // PORT: runs `f` on a new thread with the Go maximum stack
 // (`gostd::stack::max_stack_size`) and returns its status.
-// A panic that reaches the top of that thread ends Go with a crash; goport
-// returns `EXIT_UNPORTED` (70), as `bin/goport.rs` does for a failed worker.
+// A panic that reaches the top of that thread ends Go with a crash. A Go
+// panic (`core::go_panic`) ends it as the Go runtime does, as `bin/tsgo.rs`
+// does: `panic: <message>` on stderr and `EXIT_GO_PANIC` (2). Any other
+// panic is a port gap: goport returns `EXIT_UNPORTED` (70), as
+// `bin/goport.rs` does for a failed worker.
 fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
     let worker = std::thread::Builder::new()
         .name("tsgo".to_string())
@@ -49,6 +52,9 @@ fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
         .spawn(move || f(args));
     match worker.map(std::thread::JoinHandle::join) {
         Ok(Ok(code)) => code,
+        Ok(Err(payload)) if crate::core::print_go_panic(payload.as_ref()) => {
+            crate::core::EXIT_GO_PANIC
+        }
         _ => crate::execute::tsc::EXIT_UNPORTED,
     }
 }

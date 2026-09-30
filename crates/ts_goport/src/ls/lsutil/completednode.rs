@@ -9,7 +9,7 @@ use crate::ls::lsutil::prelude::*;
 /// Assumes `candidate.Pos() <= position` holds.
 pub fn position_belongs_to_node(candidate: Node, position: i32, file: Node) -> bool {
     if candidate.pos() > position {
-        panic!("Expected candidate.pos <= position");
+        crate::core::go_panic("Expected candidate.pos <= position".to_string());
     }
     position < candidate.end() || !is_completed_node(candidate, file)
 }

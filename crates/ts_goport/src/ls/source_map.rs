@@ -126,14 +126,14 @@ impl lsconv::Script for Option<Script> {
     fn file_name(&self) -> &str {
         &self
             .as_ref()
-            .expect("invalid memory address or nil pointer dereference")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .file_name
     }
 
     fn text(&self) -> &str {
         &self
             .as_ref()
-            .expect("invalid memory address or nil pointer dereference")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .text
     }
 }

@@ -746,14 +746,14 @@ fn encode_semantic_tokens(
         if start_pos.line == end_pos.line {
             token_length = end_pos.character - start_pos.character;
         } else {
-            panic!(
+            crate::core::go_panic(format!(
                 "semantic tokens: token spans multiple lines: start=({},{}) end=({},{}) for token at offset {}",
                 start_pos.line,
                 start_pos.character,
                 end_pos.line,
                 end_pos.character,
                 token.node.pos()
-            );
+            ));
         }
 
         let line = start_pos.line;
@@ -765,14 +765,14 @@ fn encode_semantic_tokens(
             continue;
         }
         if !encoded.is_empty() && (line < prev_line || line == prev_line && char < prev_char) {
-            panic!(
+            crate::core::go_panic(format!(
                 "semantic tokens: positions must be strictly increasing: prev=({},{}) current=({},{}) for token at offset {}",
                 prev_line,
                 prev_char,
                 line,
                 char,
                 token.node.pos()
-            );
+            ));
         }
 
         // Encode as: [deltaLine, deltaChar, length, tokenType, tokenModifiers]

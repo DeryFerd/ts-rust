@@ -572,7 +572,7 @@ fn merge_expandos(symbols: Vec<DocSymbol>) -> Vec<DocSymbol> {
     for (i, symbol) in symbols.iter().enumerate() {
         let symbol = symbol
             .as_ref()
-            .expect("invalid memory address or nil pointer dereference");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let symbol = symbol.borrow();
         if is_anonymous_name(&symbol.name) {
             continue;
@@ -597,7 +597,7 @@ fn merge_expandos(symbols: Vec<DocSymbol>) -> Vec<DocSymbol> {
         // iteration i sets it to nil, so it is never nil here.
         let symbol = symbols[i]
             .clone()
-            .expect("invalid memory address or nil pointer dereference");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let children = symbol.borrow_mut().children.take();
         if let Some(children) = children {
             let children = merge_expandos(children);
@@ -624,7 +624,7 @@ fn merge_expandos(symbols: Vec<DocSymbol>) -> Vec<DocSymbol> {
                 let target_index = symbols_with_same_name[j];
                 let target_symbol = symbols[target_index as usize]
                     .clone()
-                    .expect("invalid memory address or nil pointer dereference");
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 merge_children(&target_symbol, &symbol);
                 // Mark this symbol as merged.
                 symbols[i] = None;
@@ -636,7 +636,7 @@ fn merge_expandos(symbols: Vec<DocSymbol>) -> Vec<DocSymbol> {
                 if target_index != i as i32 {
                     let target_symbol = symbols[target_index as usize]
                         .clone()
-                        .expect("invalid memory address or nil pointer dereference");
+                        .unwrap_or_else(|| crate::core::go_nil_dereference());
                     merge_children(&target_symbol, &symbol);
                     // Mark this symbol as merged.
                     symbols[i] = None;

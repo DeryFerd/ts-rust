@@ -152,6 +152,6 @@ pub fn get_first_token(node: Node, source_file: Node) -> Node {
 // Go: ls/lsutil/children.go:126 AssertHasRealPosition
 pub fn assert_has_real_position(node: Node) {
     if position_is_synthesized(node.pos()) || position_is_synthesized(node.end()) {
-        panic!("Node must have a real position for this operation.");
+        crate::core::go_panic("Node must have a real position for this operation.".to_string());
     }
 }
