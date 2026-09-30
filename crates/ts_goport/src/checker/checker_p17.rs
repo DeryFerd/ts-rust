@@ -1451,7 +1451,7 @@ impl Checker {
         self.resolve_structured_type_members(module_type);
         let (resolved_members, resolved_index_infos) = {
             let st = self.ty(module_type).as_structured_type();
-            (st.members, st.index_infos.clone())
+            (st.members, st.index_infos_list())
         };
         let resolved_type =
             self.new_anonymous_type(result, resolved_members, &[], &[], &resolved_index_infos);

@@ -996,7 +996,7 @@ impl Checker {
             (
                 resolved.call_signatures().to_vec(),
                 resolved.construct_signatures().to_vec(),
-                resolved.index_infos.clone(),
+                resolved.index_infos_list(),
                 resolved.properties.clone(),
             )
         };
@@ -1134,7 +1134,7 @@ impl Checker {
                 resolved.call_signatures().to_vec(),
                 resolved.construct_signatures().to_vec(),
                 resolved.properties.clone(),
-                resolved.index_infos.len(),
+                resolved.index_infos().len(),
             )
         };
         let e = nb_e(b);

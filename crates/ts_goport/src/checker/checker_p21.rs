@@ -596,14 +596,14 @@ impl Checker {
         if !self.ty(t).flags.intersects(TypeFlags::STRUCTURED_TYPE) {
             return SharedList::default();
         }
-        let resolved = self.resolve_structured_type_members(t);
-        let call_count = resolved.call_signature_count as usize;
+        let Some(d) = &self.resolve_structured_type_members(t).signatures_data else {
+            return SharedList::default();
+        };
+        let call_count = d.call_signature_count as usize;
         if kind == SignatureKind::CALL {
-            return resolved.signatures.slice(0..call_count);
+            return d.signatures.slice(0..call_count);
         }
-        resolved
-            .signatures
-            .slice(call_count..resolved.signatures.len())
+        d.signatures.slice(call_count..d.signatures.len())
     }
 
     /// `instantiate_signatures(&get_signatures_of_type(t, kind), m)` without a
@@ -620,15 +620,15 @@ impl Checker {
             return Vec::new();
         }
         let resolved = self.resolve_structured_type_members(t);
-        let call_count = resolved.call_signature_count as usize;
+        let call_count = resolved.call_signature_count() as usize;
         let range = if kind == SignatureKind::CALL {
             0..call_count
         } else {
-            call_count..resolved.signatures.len()
+            call_count..resolved.signatures().len()
         };
         let mut result = Vec::with_capacity(range.len());
         for i in range {
-            let signature = self.ty(t).as_structured_type().signatures[i];
+            let signature = self.ty(t).as_structured_type().signatures()[i];
             result.push(self.instantiate_signature(signature, m));
         }
         result
@@ -643,7 +643,7 @@ impl Checker {
     // Go: checker/checker.go:18877 getIndexInfosOfStructuredType
     pub fn get_index_infos_of_structured_type(&mut self, t: TypeId) -> SharedList<IndexInfoId> {
         if self.ty(t).flags.intersects(TypeFlags::STRUCTURED_TYPE) {
-            return self.resolve_structured_type_members(t).index_infos.clone();
+            return self.resolve_structured_type_members(t).index_infos_list();
         }
         SharedList::default()
     }
@@ -1412,7 +1412,8 @@ impl Checker {
     ) -> SignatureId {
         if self.ty(t).flags.intersects(TypeFlags::OBJECT) {
             let resolved = self.resolve_structured_type_members(t);
-            if allow_members || resolved.properties.is_empty() && resolved.index_infos.is_empty() {
+            if allow_members || resolved.properties.is_empty() && resolved.index_infos().is_empty()
+            {
                 if kind == SignatureKind::CALL
                     && resolved.call_signatures().len() == 1
                     && resolved.construct_signatures().is_empty()

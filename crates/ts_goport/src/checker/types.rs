@@ -800,7 +800,8 @@ impl TypeAliasExt for Option<Rc<TypeAlias>> {
 // PORT: layout only. `repr(C)` keeps the hot header (flags, ids, alias) in
 // front of `data`, and `align(64)` starts each arena type on a cache line, so
 // a flags test and the `TypeData` tag read share one line. The header is 24
-// bytes and `TypeData` 168, so the size stays 192 (3 lines).
+// bytes and `TypeData` 104 (`TypeReference` is the largest kind), so the size
+// is 128 (2 lines).
 // Go: checker/types.go:666 Type
 #[derive(Clone, Default)]
 #[repr(C, align(64))]
@@ -813,8 +814,9 @@ pub struct Type {
     pub data: TypeData, // Type specific data
 }
 
-// The alignment must not grow a type past 3 cache lines.
-const _: () = assert!(std::mem::size_of::<Type>() <= 192);
+// A type must stay 2 cache lines. A rare or large field of a common kind
+// goes out of line (see `ObjectType` and `StructuredType`).
+const _: () = assert!(std::mem::size_of::<Type>() <= 128);
 
 #[cold]
 #[inline(never)]
@@ -1773,28 +1775,126 @@ pub struct ConstrainedType {
 
 // StructuredType (base of all types with members)
 
+// PORT: layout only. Go `signatures`, `callSignatureCount`, `indexInfos` and
+// `objectTypeWithoutAbstractConstructSignatures` are in `StructuredSignatures`,
+// out of line, so `Type` fits in 2 cache lines (see `Type`). Most type
+// references have none of them (effect: 8.5% have signatures and 16% index
+// infos), and the lists are 24 bytes each. Read them with the methods below
+// and write them with `set_signatures` and
+// `set_object_type_without_abstract_construct_signatures`.
 // Go: checker/types.go:917 StructuredType
 #[derive(Clone, Debug, Default)]
 pub struct StructuredType {
     pub constrained: ConstrainedType,
     pub members: SymbolTable,
     pub properties: SharedList<SymbolId>,
+    /// `None` is empty lists, a zero count and a nil
+    /// `object_type_without_abstract_construct_signatures`.
+    pub signatures_data: Option<ArenaBox<StructuredSignatures>>,
+}
+
+/// The out-of-line fields of `StructuredType`.
+// Go: checker/types.go:917 StructuredType
+#[derive(Clone, Debug, Default)]
+pub struct StructuredSignatures {
     pub signatures: SharedList<SignatureId>, // Signatures (call + construct)
     pub call_signature_count: i32,           // Count of call signatures
     pub index_infos: SharedList<IndexInfoId>,
-
     pub object_type_without_abstract_construct_signatures: TypeId,
 }
 
 impl StructuredType {
+    /// Go `signatures`: the call signatures, then the construct signatures.
+    #[inline]
+    pub fn signatures(&self) -> &[SignatureId] {
+        match &self.signatures_data {
+            Some(d) => &d.signatures,
+            None => &[],
+        }
+    }
+
+    /// Go `signatures` as a shared list (a copy of no elements).
+    pub fn signatures_list(&self) -> SharedList<SignatureId> {
+        match &self.signatures_data {
+            Some(d) => d.signatures.clone(),
+            None => SharedList::default(),
+        }
+    }
+
+    /// Go `callSignatureCount`.
+    #[inline]
+    pub fn call_signature_count(&self) -> i32 {
+        self.signatures_data
+            .as_ref()
+            .map_or(0, |d| d.call_signature_count)
+    }
+
+    /// Go `indexInfos`.
+    #[inline]
+    pub fn index_infos(&self) -> &[IndexInfoId] {
+        match &self.signatures_data {
+            Some(d) => &d.index_infos,
+            None => &[],
+        }
+    }
+
+    /// Go `indexInfos` as a shared list (a copy of no elements).
+    pub fn index_infos_list(&self) -> SharedList<IndexInfoId> {
+        match &self.signatures_data {
+            Some(d) => d.index_infos.clone(),
+            None => SharedList::default(),
+        }
+    }
+
+    /// Go `objectTypeWithoutAbstractConstructSignatures`.
+    pub fn object_type_without_abstract_construct_signatures(&self) -> TypeId {
+        self.signatures_data.as_ref().map_or(TypeId::NIL, |d| {
+            d.object_type_without_abstract_construct_signatures
+        })
+    }
+
+    /// Sets Go `signatures`, `callSignatureCount` and `indexInfos`. Empty
+    /// lists on a type with no `signatures_data` make none.
+    pub fn set_signatures(
+        &mut self,
+        signatures: SharedList<SignatureId>,
+        call_signature_count: i32,
+        index_infos: SharedList<IndexInfoId>,
+    ) {
+        if self.signatures_data.is_none() && signatures.is_empty() && index_infos.is_empty() {
+            return;
+        }
+        let d = self.signatures_data_mut();
+        d.signatures = signatures;
+        d.call_signature_count = call_signature_count;
+        d.index_infos = index_infos;
+    }
+
+    /// Sets Go `objectTypeWithoutAbstractConstructSignatures`.
+    pub fn set_object_type_without_abstract_construct_signatures(&mut self, t: TypeId) {
+        self.signatures_data_mut()
+            .object_type_without_abstract_construct_signatures = t;
+    }
+
+    fn signatures_data_mut(&mut self) -> &mut StructuredSignatures {
+        self.signatures_data
+            .get_or_insert_with(|| ArenaBox::new(StructuredSignatures::default()))
+    }
+
     // Go: checker/types.go:930 StructuredType.CallSignatures
     pub fn call_signatures(&self) -> &[SignatureId] {
-        &self.signatures[..self.call_signature_count as usize]
+        match &self.signatures_data {
+            Some(d) => &d.signatures[..d.call_signature_count as usize],
+            None => &[],
+        }
     }
 
     // Go: checker/types.go:934 StructuredType.ConstructSignatures
     pub fn construct_signatures(&self) -> &[SignatureId] {
-        &self.signatures[self.call_signature_count as usize..]
+        match &self.signatures_data {
+            Some(d) => &d.signatures[d.call_signature_count as usize..],
+            None => &[],
+        }
     }
 
     // Go: checker/types.go:938 StructuredType.Properties
@@ -1846,14 +1946,18 @@ impl StructuredType {
 /// change it to `CacheKeyMap<TypeId>`.
 pub type InstantiationMap = FlatMap<CacheHashKey, TypeId>;
 
+// PORT: Go `instantiations` (the map of type instantiations) is not here.
+// Few object types have one (effect: 7.6k anonymous object types of 129k,
+// 95 type references of 165k), so it would cost 32 bytes in every `Type`.
+// An interface or tuple keeps it in `InterfaceType`; any other object type
+// has it in `Checker::object_type_instantiations`. Read and write it with
+// `Checker::object_instantiations` and `object_instantiations_mut`.
 // Go: checker/types.go:975 ObjectType
 #[derive(Clone, Default)]
 pub struct ObjectType {
     pub structured: StructuredType,
     pub target: TypeId,   // Target of instantiated type
     pub mapper: MapperId, // Type mapper for instantiated type
-    // PORT: Go nil map is `None`; Go creates it lazily.
-    pub instantiations: Option<InstantiationMap>, // Map of type instantiations
 }
 
 // TypeReference (instantiation of an InterfaceType)
@@ -1903,6 +2007,10 @@ pub struct InterfaceType {
     pub declared_call_signatures: SharedList<SignatureId>, // Declared call signatures
     pub declared_construct_signatures: SharedList<SignatureId>, // Declared construct signatures
     pub declared_index_infos: SharedList<IndexInfoId>,     // Declared index signatures
+    // PORT: Go `ObjectType.instantiations` of an interface or tuple (see
+    // `ObjectType`): the type references of a generic target, keyed by
+    // their type list. Go nil map is `None`.
+    pub instantiations: Option<InstantiationMap>,
 }
 
 impl InterfaceType {
@@ -2510,7 +2618,7 @@ pub struct ChunkedArena<T> {
 // PERF: 8,192 entries a chunk. Every `ty(t)` reads the chunk table before the
 // entry, so a smaller table stays in L1 more (elysia: 720 chunks, 17 KB, was
 // 1,440). One chunk of each element type stays under 2 MiB, so a small project
-// does not get a 2 MiB huge page for each arena. `Type` is 192 bytes, so 13 is
+// does not get a 2 MiB huge page for each arena. `Type` is 128 bytes, so 13 is
 // the largest shift under that limit.
 const ARENA_CHUNK_SHIFT: usize = 13;
 const ARENA_CHUNK_LEN: usize = 1 << ARENA_CHUNK_SHIFT;

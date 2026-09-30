@@ -1156,7 +1156,7 @@ impl Checker {
             let (has_signatures, members, properties) = {
                 let resolved = self.ty(t).as_structured_type();
                 (
-                    !resolved.signatures.is_empty(),
+                    !resolved.signatures().is_empty(),
                     resolved.members,
                     resolved.properties.clone(),
                 )

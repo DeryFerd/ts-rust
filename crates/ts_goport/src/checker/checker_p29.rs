@@ -682,8 +682,8 @@ impl Checker {
         let s = self.ty(t).as_structured_type();
         t != self.any_function_type
             && s.properties.is_empty()
-            && s.signatures.is_empty()
-            && s.index_infos.is_empty()
+            && s.signatures().is_empty()
+            && s.index_infos().is_empty()
     }
 
     // Go: checker/checker.go:26368 isEmptyObjectType

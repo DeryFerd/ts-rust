@@ -492,7 +492,12 @@ impl Checker {
                 }
             }
         }
-        self.ty_mut(t).as_object_type_mut().structured.index_infos = index_infos.into();
+        {
+            let d = &mut self.ty_mut(t).as_object_type_mut().structured;
+            let (signatures, call_signature_count) =
+                (d.signatures_list(), d.call_signature_count());
+            d.set_signatures(signatures, call_signature_count, index_infos.into());
+        }
         // We resolve the members before computing the signatures because a signature may use
         // typeof with a qualified name expression that circularly references the type we are
         // in the process of resolving (see issue #6072). The temporarily empty signature list
@@ -504,8 +509,9 @@ impl Checker {
         {
             let signatures = self.get_signatures_of_symbol(symbol);
             let d = &mut self.ty_mut(t).as_object_type_mut().structured;
-            d.call_signature_count = signatures.len() as i32;
-            d.signatures = signatures.into();
+            let call_signature_count = signatures.len() as i32;
+            let index_infos = d.index_infos_list();
+            d.set_signatures(signatures.into(), call_signature_count, index_infos);
         }
         // And likewise for construct signatures for classes
         if self.sym(symbol).flags.intersects(SymbolFlags::CLASS) {
@@ -519,9 +525,11 @@ impl Checker {
                 construct_signatures = self.get_default_construct_signatures(class_type);
             }
             let d = &mut self.ty_mut(t).as_object_type_mut().structured;
-            let mut signatures = d.signatures.to_vec();
+            let mut signatures = d.signatures().to_vec();
             signatures.extend(construct_signatures);
-            d.signatures = signatures.into();
+            let (call_signature_count, index_infos) =
+                (d.call_signature_count(), d.index_infos_list());
+            d.set_signatures(signatures.into(), call_signature_count, index_infos);
         }
     }
 

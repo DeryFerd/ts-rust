@@ -907,8 +907,8 @@ impl Checker {
                 st.members,
                 st.call_signatures().to_vec(),
                 st.construct_signatures().to_vec(),
-                st.index_infos.clone(),
-                st.object_type_without_abstract_construct_signatures,
+                st.index_infos_list(),
+                st.object_type_without_abstract_construct_signatures(),
             )
         };
         if construct_signatures.is_empty() {
@@ -930,17 +930,17 @@ impl Checker {
         if filtered.len() == construct_signatures.len() {
             self.ty_mut(t)
                 .as_structured_type_mut()
-                .object_type_without_abstract_construct_signatures = t;
+                .set_object_type_without_abstract_construct_signatures(t);
             return t;
         }
         let type_copy =
             self.new_anonymous_type(symbol, members, &call_signatures, &filtered, &index_infos);
         self.ty_mut(t)
             .as_structured_type_mut()
-            .object_type_without_abstract_construct_signatures = type_copy;
+            .set_object_type_without_abstract_construct_signatures(type_copy);
         self.ty_mut(type_copy)
             .as_structured_type_mut()
-            .object_type_without_abstract_construct_signatures = type_copy;
+            .set_object_type_without_abstract_construct_signatures(type_copy);
         type_copy
     }
 

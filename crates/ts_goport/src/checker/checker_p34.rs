@@ -373,7 +373,7 @@ impl Checker {
         // We do a quick check for a "bind" property before performing the more expensive subtype
         // check. This gives us a quicker out in the common case where an object type is not a function.
         let resolved = self.resolve_structured_type_members(t);
-        let has_signatures = !resolved.signatures.is_empty();
+        let has_signatures = !resolved.signatures().is_empty();
         let members = resolved.members;
         if has_signatures {
             return true;

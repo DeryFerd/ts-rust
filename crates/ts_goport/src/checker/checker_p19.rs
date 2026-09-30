@@ -923,7 +923,7 @@ impl Checker {
                 let key = get_type_list_key(&d.reference.resolved_type_arguments);
                 let mut instantiations = InstantiationMap::default();
                 instantiations.insert(key, t);
-                d.reference.object.instantiations = Some(instantiations);
+                d.instantiations = Some(instantiations);
                 d.reference.object.target = t;
             }
         }

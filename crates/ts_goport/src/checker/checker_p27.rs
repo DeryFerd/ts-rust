@@ -1148,7 +1148,7 @@ impl Checker {
         d.interface.all_type_parameters = all_type_parameters;
         let mut instantiations = InstantiationMap::default();
         instantiations.insert(key, t);
-        d.interface.reference.object.instantiations = Some(instantiations);
+        d.interface.instantiations = Some(instantiations);
         d.interface.reference.object.target = t;
         d.interface.reference.resolved_type_arguments = tps.into();
         d.interface.declared_members_resolved = true;
