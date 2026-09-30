@@ -43,7 +43,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// settings of `tsgo -b`.
 /// `scripts/build-release.sh` reads it from this line for its BOLT runs.
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
-const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
+const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false";
 
 fn main() {
     // First: it must run before the first heap allocation.

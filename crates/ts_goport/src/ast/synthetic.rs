@@ -732,7 +732,7 @@ fn synthetic_ast_node(n: Node) -> HeldNode {
 /// `None` for a synthetic node and for a node that a freeable parse owns
 /// (lsshells M3c): read those with `with_scoped_ast_node`. Go dereferences
 /// the pointer, so nil panics.
-// In a one-program process almost every read after the publish is a tier 0
+// In a one-program process almost every read after the publish is a published
 // store node, so only that path is inlined into callers. The synthetic file
 // index is never a store id, so checking the store tables first gives the
 // same result as the order that `static_ast_node_slow` keeps (synthetic,

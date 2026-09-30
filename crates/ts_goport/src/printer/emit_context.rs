@@ -36,7 +36,7 @@ pub struct EmitContext {
     pub(crate) auto_generate: RefCell<FxHashMap<Node, AutoGenerateInfo>>,
     pub(crate) text_source: RefCell<FxHashMap<Node, Node>>,
     pub(crate) original: RefCell<FxHashMap<Node, Node>>,
-    pub(crate) emit_nodes: RefCell<LinkStore<Node, EmitNode>>,
+    pub(crate) emit_nodes: RefCell<LinkStore<Node, Box<EmitNode>>>,
     pub(crate) assigned_name: RefCell<FxHashMap<Node, Node>>,
     pub(crate) class_this: RefCell<FxHashMap<Node, Node>>,
     pub(crate) var_scope_stack: RefCell<Vec<Rc<RefCell<VarScope>>>>,

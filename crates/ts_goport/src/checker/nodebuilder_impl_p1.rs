@@ -177,8 +177,8 @@ pub struct NodeBuilderImpl {
     pub pc: PseudoChecker,
 
     // cache
-    pub links: LinkStore<Node, NodeBuilderLinks>,
-    pub symbol_links: LinkStore<SymbolId, NodeBuilderSymbolLinks>,
+    pub links: LinkStore<Node, Box<NodeBuilderLinks>>,
+    pub symbol_links: LinkStore<SymbolId, Box<NodeBuilderSymbolLinks>>,
 
     // state
     pub ctx: Rc<RefCell<NodeBuilderContext>>,
