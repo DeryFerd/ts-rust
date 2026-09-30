@@ -142,7 +142,9 @@ Each arena has a dummy entry at index 0. New entries are pushed; ids are
 `newIndexInfo`, `newTypePredicate`, mapper constructors push into these.
 Go `t.id` equals the arena index, so Go's per-checker `TypeId` counter order
 is kept. Link stores: `value_symbol_links: LinkStore<SymbolId, ValueSymbolLinks>`
-etc. with the Go field names.
+etc. with the Go field names. A store keeps its values in 64-key pages, so a
+value over 32 bytes (a compile-time check in `LinkStore`), or one that few
+keys have, goes in a `Box` (`type_node_links: LinkStore<Node, Box<TypeNodeLinks>>`).
 
 `checker/mapper.rs` defines `TypeMapper` (an enum over the Go mapper kinds)
 and its constructors. Go `m.Map(t)` -> `self.mapper_map(m, t)`,
