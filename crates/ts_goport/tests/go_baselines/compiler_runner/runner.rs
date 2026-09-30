@@ -1076,7 +1076,7 @@ pub fn enumerate_config_cases(
     (cases, errors)
 }
 
-// Go: compiler_runner.go:199 runSingleConfigTest
+// Go: compiler_runner.go:195 runSingleConfigTest
 // PORT: the child side of one case. Each Go subtest reports through
 // `report`; `compile` is the Go test itself (its `RecoverAndFail` covers
 // `newCompilerTest`), and `config` reports a skipped configuration.
@@ -1131,7 +1131,7 @@ pub fn run_single_config_test(case: &ConfigCase, report: Report<'_>) {
                 report(
                     "compile",
                     Outcome::Fail(format!(
-                        "Panic on compiling test {}:\n{}",
+                        "Panic on compiler test {}:\n{}",
                         test.filename,
                         payload_text(payload.as_ref())
                     )),
