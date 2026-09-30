@@ -558,14 +558,15 @@ pub struct APIReconfigureProgramRequest {
 
 // Go: project/snapshot.go:159 APISnapshotRequest
 // PORT: Go `*collections.Set[T]` is `Option<FxHashSet<T>>` (nil is `None`).
-// `open_files` is an `IndexSet`, so API-opened files enter the API state in
-// request order (Go map order is random).
+// Go `map[tspath.Path]string` (`open_files`, `ensure_files`, ts#64391) is
+// `Option<IndexMap>`, so API-opened files enter the API state in request
+// order (Go map order is random).
 // PORT: Go nil `vfs.FS` is `None`. `Debug` skips the file system.
 #[derive(Clone, Default)]
 pub struct APISnapshotRequest {
     pub open_projects: Option<FxHashSet<String>>,
     pub close_projects: Option<FxHashSet<tspath::Path>>,
-    pub open_files: Option<IndexSet<lsproto::DocumentUri>>,
+    pub open_files: Option<IndexMap<tspath::Path, String>>,
     pub close_files: Option<FxHashSet<tspath::Path>>,
     // ts#64204
     pub create_programs: Vec<APICreateProgramRequest>,
@@ -573,7 +574,7 @@ pub struct APISnapshotRequest {
     pub remove_programs: Option<FxHashSet<SyntheticProjectID>>,
     pub ensure_programs: Option<FxHashSet<ID>>,
     pub ensure_all_programs: bool,
-    pub ensure_files: Option<IndexSet<lsproto::DocumentUri>>,
+    pub ensure_files: Option<IndexMap<tspath::Path, String>>,
     // ts#64115
     pub file_system: Option<Rc<dyn vfs::Fs>>,
     // ReplaceFileSystem indicates a total filesystem replacement. Layers use
@@ -987,7 +988,7 @@ impl Snapshot {
         }
 
         for uri in &change.resource_request.documents {
-            project_collection_builder.did_request_file(
+            project_collection_builder.did_request_file_exported(
                 uri,
                 false, /*configuredProjectsOnly*/
                 logger.fork("DidRequestFile"),
@@ -995,7 +996,7 @@ impl Snapshot {
         }
 
         for uri in &change.resource_request.configured_project_documents {
-            project_collection_builder.did_request_file(
+            project_collection_builder.did_request_file_exported(
                 uri,
                 true, /*configuredProjectsOnly*/
                 logger.fork("DidRequestFile (optional)"),

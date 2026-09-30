@@ -326,13 +326,12 @@ impl ProjectCollectionBuilder {
         if let Some(request_open_files) = &api_request.open_files {
             let mut api_state = self.api_state.borrow_mut();
             let open_files = &mut api_state.open_files;
-            for uri in request_open_files {
-                let file_name = uri.file_name();
-                let path = (self.to_path)(&file_name);
+            // ts#64391: the request maps each path to its file name.
+            for (path, file_name) in request_open_files {
                 // PORT: Go reads the zero entry for a missing key and stores
                 // it back.
-                let entry = open_files.entry(path).or_default();
-                entry.file_name = file_name;
+                let entry = open_files.entry(path.clone()).or_default();
+                entry.file_name = file_name.clone();
                 entry.ref_count += 1;
             }
         }
@@ -367,14 +366,12 @@ impl ProjectCollectionBuilder {
         if let Some(request_open_files) = &api_request.open_files {
             let mut retain: FxHashSet<tspath::Path> = FxHashSet::default();
             let mut ensure_inferred_project = false;
-            for uri in request_open_files {
-                let file_name = uri.file_name();
-                let path = (self.to_path)(&file_name);
-                if self.is_open_file(&path) {
+            for (path, file_name) in request_open_files {
+                if self.is_open_file(path) {
                     if self
-                        .find_default_configured_project(&file_name, &path)
+                        .find_default_configured_project(file_name, path)
                         .is_none()
-                        && !self.is_supported_in_inferred_project(&file_name)
+                        && !self.is_supported_in_inferred_project(file_name)
                     {
                         return Err(gostd::errors::errorf(
                             format!("no project found for opened file: {}", file_name),
@@ -384,13 +381,13 @@ impl ProjectCollectionBuilder {
                     continue;
                 }
                 let result = self.ensure_configured_project_and_ancestors_for_file(
-                    &file_name,
-                    &path,
+                    file_name,
+                    path,
                     logger.clone(),
                 );
                 retain.extend(result.retain);
                 if result.project.is_none() {
-                    if !self.is_supported_in_inferred_project(&file_name) {
+                    if !self.is_supported_in_inferred_project(file_name) {
                         return Err(gostd::errors::errorf(
                             format!("no project found for opened file: {}", file_name),
                             vec![],
@@ -503,14 +500,16 @@ impl ProjectCollectionBuilder {
             }
         }
         *self.created_programs.borrow_mut() = created_programs;
-        for uri in api_request.ensure_files.iter().flatten() {
-            self.did_request_file(uri, false /*configuredProjectsOnly*/, logger.clone());
+        // ts#64391: the request maps each path to its file name.
+        for (path, file_name) in api_request.ensure_files.iter().flatten() {
+            self.did_request_file(
+                file_name,
+                path,
+                false, /*configuredProjectsOnly*/
+                logger.clone(),
+            );
             // ts#64374
-            let file_name = uri.file_name();
-            if self
-                .find_default_project(&file_name, &(self.to_path)(&file_name))
-                .is_none()
-            {
+            if self.find_default_project(file_name, path).is_none() {
                 return Err(gostd::errors::errorf(
                     format!("no project found for opened file: {}", file_name),
                     vec![],
@@ -969,15 +968,30 @@ impl ProjectCollectionBuilder {
     // DidRequestFile ensures projects are loaded for the given URI.
     // If configuredProjectsOnly is true, only configured projects are loaded; no inferred project is created
     // and it is not guaranteed that there will be any project containing the file in the resulting snapshot.
-    pub fn did_request_file(
+    // PORT: `_exported`, because Go also has `didRequestFile` (ts#64391,
+    // PORTING "Names").
+    pub fn did_request_file_exported(
         self: &Rc<Self>,
         uri: &lsproto::DocumentUri,
         configured_projects_only: bool,
         logger: Option<Rc<logging::LogTree>>,
     ) {
-        let start_time = Instant::now();
         let file_name = uri.file_name();
         let path = (self.to_path)(&file_name);
+        self.did_request_file(&file_name, &path, configured_projects_only, logger);
+    }
+
+    // Go: project/projectcollectionbuilder.go:645 didRequestFile (ts#64391)
+    pub fn did_request_file(
+        self: &Rc<Self>,
+        file_name: &str,
+        path: &tspath::Path,
+        configured_projects_only: bool,
+        logger: Option<Rc<logging::LogTree>>,
+    ) {
+        let start_time = Instant::now();
+        let file_name = file_name.to_string();
+        let path = path.clone();
         if self.default_projects_invalidated.get() {
             self.ensure_configured_project_and_ancestors_for_file(
                 &file_name,

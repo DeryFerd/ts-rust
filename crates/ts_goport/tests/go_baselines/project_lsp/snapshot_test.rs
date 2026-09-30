@@ -3,7 +3,7 @@
 
 use std::rc::{Rc, Weak};
 
-use indexmap::IndexSet;
+use indexmap::IndexMap;
 use rustc_hash::FxHashSet;
 use ts_goport::frontend::compiler::{self, NewProgram};
 use ts_goport::frontend::tspath::Path;
@@ -29,7 +29,7 @@ fn setup(files: FileMap) -> Rc<Session> {
 // the synthetic program tests that replace it are ported in their ts#64319 form.
 
 child_test! {
-    // Go: snapshot_test.go:40 TestSnapshot/creates and removes synthetic programs (ts#64204, ts#64319)
+    // Go: snapshot_test.go:40 TestSnapshot/creates and removes synthetic programs (ts#64204, ts#64319, ts#64391)
     fn creates_and_removes_synthetic_programs() {
         let session = setup(files(&[
             ("/a.ts", "export const a = 1;"),
@@ -119,7 +119,10 @@ child_test! {
             &created_snapshot,
             FileChangeSummary::default(),
             Some(&APISnapshotRequest {
-                open_files: Some(IndexSet::from_iter([uri("file:///a.ts")])),
+                open_files: Some(IndexMap::from_iter([(
+                    created_snapshot.to_path("/a.ts"),
+                    "/a.ts".to_string(),
+                )])),
                 ..Default::default()
             }),
         );
