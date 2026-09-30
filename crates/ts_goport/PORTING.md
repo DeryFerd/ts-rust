@@ -333,8 +333,9 @@ methods reach the AST through it.
   extras index, `frozen_store_bind_and_file`, `frozen_store_any_symbol`)
   and in `bind_store_records`, the one writer of a published record.
   The check is one load of the nil slot record, a compare and a branch:
-  `goport -p` +0.1% to +0.2% instructions (ownercheck1, R147 reviewer
-  option 2). The hot header and kids reads (kind, parent, loc, child ids,
+  `goport -p` 0.0% to +0.2% instructions, the editor long sessions +0.06%
+  to +0.15% (ownercheck1, R147 reviewer option 2; the flags read is about
+  two thirds of it). The hot header and kids reads (kind, parent, loc, child ids,
   name, modifier flags) are not checked in a release build (they are
   about 6 instructions). So a stale read of those gives the values of
   that node while its block waits, and the new owner's data after a
