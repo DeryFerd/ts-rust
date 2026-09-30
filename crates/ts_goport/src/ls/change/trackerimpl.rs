@@ -6,7 +6,7 @@ use crate::frontend::core_textchange::apply_bulk_edits;
 use crate::frontend::parser::utilities::get_js_doc_comment_ranges;
 use crate::frontend::scanner::scanner_p1::{rune_to_char, utf8_decode_rune_in_string};
 use crate::frontend::scanner::{get_leading_comment_ranges, get_trailing_comment_ranges};
-use crate::spanmap::SpanMap;
+use crate::spanmap::{Feature, SpanMap};
 
 // Go: ls/change/trackerimpl.go:89 dedupeIdenticalEdits
 /// dedupeIdenticalEdits drops exact duplicates from a sorted slice of edits. When a mapper copies one span
@@ -133,7 +133,7 @@ impl Tracker {
         changes
     }
 
-    // Go: ls/change/trackerimpl.go:112 computeNewText
+    // Go: ls/change/trackerimpl.go:113 computeNewText
     // PORT: Go takes `change *trackerEdit` and only reads it.
     fn compute_new_text(
         &mut self,
@@ -147,60 +147,88 @@ impl Tracker {
             _ => {}
         }
 
-        let pos = change.text_range.pos();
-        let format_node = |n: Node| -> String {
-            self.get_formatted_text_of_node(
-                n,
-                target_source_file,
-                source_file,
-                pos,
-                &change.options,
-            )
-        };
+        let start = self.to_lsp_edit_range(source_file, change.text_range).start;
+        let positions = lsconv::from_lsp_position_for_source_file(
+            &self.converters,
+            source_file,
+            start,
+            Feature::ALL,
+        );
+        let mut result = String::new();
+        let mut found = false;
+        // The original range may have multiple verbatim copies; it is safe to lose their identity only when
+        // formatting at every exact projection produces the same edit.
+        for mapped in positions {
+            if !mapped.fidelity.is_exact() {
+                continue;
+            }
+            let projection = mapped.script;
+            let pos = mapped.position;
+            let format_node = |n: Node| -> String {
+                self.get_formatted_text_of_node(
+                    n,
+                    target_source_file,
+                    projection,
+                    pos,
+                    &change.options,
+                )
+            };
 
-        let text: String = match change.kind {
-            TrackerEditKind::REPLACE_WITH_MULTIPLE_NODES => {
-                let mut joiner = change.options.joiner.as_str();
-                if joiner.is_empty() {
-                    joiner = self.new_line.as_str();
+            let text: String = match change.kind {
+                TrackerEditKind::REPLACE_WITH_MULTIPLE_NODES => {
+                    let mut joiner = change.options.joiner.as_str();
+                    if joiner.is_empty() {
+                        joiner = self.new_line.as_str();
+                    }
+                    let parts: Vec<String> = change
+                        .nodes
+                        .iter()
+                        .map(|&n| {
+                            let formatted = format_node(n);
+                            formatted
+                                .strip_suffix(self.new_line.as_str())
+                                .unwrap_or(&formatted)
+                                .to_string()
+                        })
+                        .collect();
+                    parts.join(joiner)
                 }
-                let parts: Vec<String> = change
-                    .nodes
-                    .iter()
-                    .map(|&n| {
-                        let formatted = format_node(n);
-                        formatted
-                            .strip_suffix(self.new_line.as_str())
-                            .unwrap_or(&formatted)
-                            .to_string()
-                    })
-                    .collect();
-                parts.join(joiner)
+                TrackerEditKind::REPLACE_WITH_SINGLE_NODE => format_node(change.node),
+                _ => {
+                    panic!(
+                        "change kind {} should have been handled earlier",
+                        change.kind.0
+                    );
+                }
+            };
+            // Strip initial indentation if text will be inserted in the middle of the line.
+            let mut no_indent: &str = &text;
+            if !(change.options.indentation.is_some()
+                || format::get_line_start_position_for_position(pos, projection) == pos)
+            {
+                // PORT: Go `strings.TrimLeftFunc(text, unicode.IsSpace)`. Rust
+                // `char::is_whitespace` is the Unicode White_Space set, which is
+                // Go's `unicode.IsSpace` set (including U+0085 and U+00A0).
+                no_indent = text.trim_start_matches(char::is_whitespace);
             }
-            TrackerEditKind::REPLACE_WITH_SINGLE_NODE => format_node(change.node),
-            _ => {
-                panic!(
-                    "change kind {} should have been handled earlier",
-                    change.kind.0
-                );
+            let suffix = if no_indent.ends_with(change.options.suffix.as_str()) {
+                ""
+            } else {
+                change.options.suffix.as_str()
+            };
+            let candidate = change.options.prefix.clone() + no_indent + suffix;
+            if found && candidate != result {
+                self.unmappable_files
+                    .insert(source_file_original_file_name(source_file).to_string());
+                return String::new();
             }
-        };
-        // Strip initial indentation if text will be inserted in the middle of the line.
-        let mut no_indent: &str = &text;
-        if !(change.options.indentation.is_some()
-            || format::get_line_start_position_for_position(pos, source_file) == pos)
-        {
-            // PORT: Go `strings.TrimLeftFunc(text, unicode.IsSpace)`. Rust
-            // `char::is_whitespace` is the Unicode White_Space set, which is
-            // Go's `unicode.IsSpace` set (including U+0085 and U+00A0).
-            no_indent = text.trim_start_matches(char::is_whitespace);
+            result = candidate;
+            found = true;
         }
-        let suffix = if no_indent.ends_with(change.options.suffix.as_str()) {
-            ""
-        } else {
-            change.options.suffix.as_str()
-        };
-        let result = change.options.prefix.clone() + no_indent + suffix;
+        if !found {
+            self.unmappable_files
+                .insert(source_file_original_file_name(source_file).to_string());
+        }
         self.reindent_inserted_lines(source_file, change, result)
     }
 

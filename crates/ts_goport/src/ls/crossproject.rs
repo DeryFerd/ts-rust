@@ -136,7 +136,10 @@ pub trait CrossProjectSearch: 'static {
     ) -> Result<Self::Resp, GoError>;
 }
 
-// Go: ls/crossproject.go:45 handleCrossProject
+// Go: ls/crossproject.go:46 (*LanguageService).handleCrossProject
+// PORT: Go 1.27 makes this a generic method of the default language
+// service (ts#63902); here it stays a function whose first parameter is
+// `default_ls`.
 // PORT: Go `params Req` is a pointer type: `&Req`. Go `orchestrator` can be
 // nil: `Option<&dyn CrossProjectOrchestrator>`. Go
 // `combineResults func(iter.Seq[Resp]) Resp` takes the yielded values as a
