@@ -75,7 +75,7 @@ pub fn discover_typings(
     let type_acquisition: &TypeAcquisition = typings_info
         .type_acquisition
         .as_deref()
-        .expect("nil TypeAcquisition");
+        .unwrap_or_else(|| crate::core::go_nil_dereference());
     // PORT: Go tests `Include != nil`. `TypeAcquisition.include` is a `Vec`
     // with no nil, so an explicit empty list skips the call. The call adds
     // nothing for an empty list; only its log line is lost.
@@ -94,7 +94,7 @@ pub fn discover_typings(
     let compiler_options = typings_info
         .compiler_options
         .as_deref()
-        .expect("nil CompilerOptions");
+        .unwrap_or_else(|| crate::core::go_nil_dereference());
     if compiler_options.types.is_none() {
         let mut possible_search_dirs: IndexMap<String, bool> = IndexMap::default();
         for file_name in &file_names {

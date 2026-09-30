@@ -1209,8 +1209,10 @@ static PUBLISHED: AtomicUsize = AtomicUsize::new(0);
 // PERF: rustc gives a branch into a block that calls a `#[cold]` function
 // a low weight (`find_cold_blocks`), and LLVM puts that block after the hot
 // code. `std::hint::cold_path` does the same, but is stable only from Rust
-// 1.95. `inline(never)` keeps the call in the MIR until codegen reads it;
-// LLVM can then drop the call, as it has no effect.
+// 1.95. `inline(never)` keeps the call in the MIR until codegen reads it.
+// LLVM keeps the call too: each copy of `file_block` has a call to this
+// empty function (through the GOT) in its cold block, so an out-of-line
+// reader copy is not a leaf function. The hot path runs no call.
 #[cold]
 #[inline(never)]
 fn high_block_path() {}
@@ -1223,7 +1225,7 @@ fn high_block_path() {}
 // hot read site made `goport -p` 1.5% to 3.5% slower (more icache and
 // branch misses). An id below `LOW_BLOCKS` takes the hot path; a synthetic
 // id leaves at one more compare; the other ids read `HIGH_BLOCKS` inline in
-// a cold block (`high_block_path`), with no call.
+// a cold block, which calls the empty `high_block_path` and nothing else.
 #[inline]
 fn file_block(file: usize) -> Option<&'static FileBlock> {
     if let Some(entry) = FILE_BLOCKS.get(file) {

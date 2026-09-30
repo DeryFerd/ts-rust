@@ -18,9 +18,6 @@ use crate::ls::prelude::*;
 use crate::frontend::core_ls_ext::compare_booleans;
 use std::sync::LazyLock;
 
-/// Go runtime panic text for a nil pointer dereference.
-const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
-
 // Go: ls/codeactions_importfixes.go:21 importFixErrorCodes
 // PORT: `diagnostics.X.Code()` is `int32`; `Message::code` is `u32`.
 static IMPORT_FIX_ERROR_CODES: LazyLock<Vec<i32>> = LazyLock::new(|| {
@@ -145,7 +142,7 @@ fn get_all_import_code_actions(
                 .get_current_auto_import_view(fix_context.source_file),
         );
     }
-    let view = view.expect(NIL_DEREF);
+    let view = view.unwrap_or_else(|| crate::core::go_nil_dereference());
 
     // PORT: Go passes `ch` to `NewImportAdder`, which the pinned Rust adder
     // does not take. The lease is held to the end of the function (Go
@@ -326,7 +323,7 @@ fn get_fixes_info_for_umd_import(
 
     // PORT: Go passes a nil `*Export` on to `GetFixes`, which dereferences
     // it; here the dereference is at this point.
-    let export = export.expect(NIL_DEREF);
+    let export = export.unwrap_or_else(|| crate::core::go_nil_dereference());
 
     let mut result: Vec<FixInfo> = Vec::new();
     for fix in view.get_fixes(ctx, ch, &export, false, is_valid_type_only_use_site, None) {

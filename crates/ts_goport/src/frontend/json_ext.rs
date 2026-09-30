@@ -353,6 +353,29 @@ impl std::fmt::Display for SemanticError {
     }
 }
 
+/// Go `(*jsontext.SyntacticError).Error()` (jsontext/errors.go:120) for the
+/// error `err` at the token that starts at `pos` in `data`, the input of the
+/// decoder: the JSON pointer of that token (Go `where` = +1) and its offset.
+///
+/// PORT: the decoder keeps no object names, so the pointer is found again
+/// from `data`, as in `unmarshal_root`. Only the max depth error uses it.
+#[cold]
+pub fn syntactic_error_text(data: &[u8], pos: usize, err: &str) -> String {
+    let mut b = format!("jsontext: {err}");
+    let pointer = stack_pointer(&stack_at(data, pos), ErrorPos::Before);
+    if !pointer.is_empty() {
+        b.push_str(" within ");
+        b.push_str(&crate::gostd::strconv::quote(&truncate_pointer(
+            &pointer, 100,
+        )));
+    }
+    if pos > 0 {
+        b.push_str(" after offset ");
+        b.push_str(&pos.to_string());
+    }
+    b
+}
+
 // Go: internal/jsonwire/wire.go:165 TruncatePointer
 fn truncate_pointer(s: &str, n: usize) -> String {
     if s.len() <= n {

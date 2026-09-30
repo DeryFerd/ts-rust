@@ -106,9 +106,6 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Go runtime panic text for a nil pointer dereference.
-const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
-
 // PORT: Go mutexes do not poison.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -153,7 +150,7 @@ pub struct ServerOptions {
 // Go: server.go:53 NewServer
 pub fn new_server(opts: ServerOptions) -> Rc<Server> {
     if opts.cwd.is_empty() {
-        panic!("Cwd is required");
+        crate::core::go_panic("Cwd is required".to_string());
     }
 
     let ServerOptions {
@@ -496,17 +493,24 @@ pub struct Server {
 impl ServerShared {
     /// Go `s.backgroundCtx`, set by `Run`.
     pub fn background_ctx(&self) -> Context {
-        self.background_ctx.get().cloned().expect(NIL_DEREF)
+        self.background_ctx
+            .get()
+            .cloned()
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     /// Go `s.initializeParams` (nil before `initialize`).
     pub fn initialize_params(&self) -> &lsproto::InitializeParams {
-        self.initialize_params.get().expect(NIL_DEREF)
+        self.initialize_params
+            .get()
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     /// Go `s.initializationOptions` (nil before `initialize`).
     pub fn initialization_options(&self) -> &lsproto::InitializationOptions {
-        self.initialization_options.get().expect(NIL_DEREF)
+        self.initialization_options
+            .get()
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     /// Go `&s.clientCapabilities` (the zero value before `initialize`).
@@ -548,7 +552,10 @@ impl Server {
     /// Go `s.session` where Go dereferences it: a nil session panics like a
     /// Go nil pointer dereference.
     pub fn session_ref(&self) -> Rc<project::Session> {
-        self.session.borrow().clone().expect(NIL_DEREF)
+        self.session
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     // Go: server.go:227 InitComplete
@@ -1355,7 +1362,7 @@ impl project::Client for Server {
         telemetry: lsproto::TelemetryEvent,
     ) -> Result<(), GoError> {
         if !self.telemetry_enabled.get() {
-            panic!("SendTelemetry called with telemetry disabled");
+            crate::core::go_panic("SendTelemetry called with telemetry disabled".to_string());
         }
         send_notification(&self.shared, &lsproto::TELEMETRY_EVENT_INFO, telemetry)
     }
@@ -1727,7 +1734,7 @@ fn recv_or_done<T: Send + 'static>(
             Ok(None) => {}
             // Go: a receive from a closed channel gives the zero value; no
             // caller closes its channel before it sends.
-            Err(_) => panic!("{}", NIL_DEREF),
+            Err(_) => crate::core::go_nil_dereference(),
         }
     }
 }
@@ -1768,7 +1775,7 @@ impl ServerShared {
                 }
                 return Err(err);
             }
-            let msg = msg.expect(NIL_DEREF);
+            let msg = msg.unwrap_or_else(|| crate::core::go_nil_dereference());
 
             if self.initialize_params.get().is_none()
                 && msg.kind == crate::jsonrpc::MessageKind::REQUEST
@@ -1796,7 +1803,10 @@ impl ServerShared {
             if msg.kind == crate::jsonrpc::MessageKind::RESPONSE {
                 let resp = msg.into_response();
                 let mut pending_server_requests = lock(&self.pending_server_requests);
-                let id = resp.id.clone().expect(NIL_DEREF);
+                let id = resp
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 // Go: respChan <- resp; close(respChan); delete(...)
                 if let Some(resp_chan) = pending_server_requests.remove(&id) {
                     let _ = resp_chan.try_send(Some(resp));
@@ -2828,10 +2838,10 @@ pub fn register_language_service_with_auto_imports_request_handler<
                                         result = fn_(&s, &ctx, &language_service, &params);
                                         if let Err(ls_err) = &result {
                                             if errors::is(ls_err, &ls::ERR_NEEDS_AUTO_IMPORTS) {
-                                                panic!(
+                                                crate::core::go_panic(format!(
                                                     "{} returned ErrNeedsAutoImports even after enabling auto imports",
                                                     method
-                                                );
+                                                ));
                                             }
                                         }
                                     }
@@ -3079,7 +3089,7 @@ impl ServerShared {
 
         self.init_started.store(true, Ordering::SeqCst);
 
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         let _ = self.initialize_params.set(params.clone());
         // The spec types initializationOptions as nullable; treat both null and an
         // absent value as empty options so the rest of the server can read fields
@@ -3553,7 +3563,7 @@ impl Server {
         _ctx: &Context,
         params: Option<&lsproto::DidChangeConfigurationParams>,
     ) -> Result<(), GoError> {
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         if params.settings == LspAny::Null {
             return Ok(());
         } else if let LspAny::Object(settings) = &params.settings {
@@ -3570,10 +3580,10 @@ impl Server {
         params: Option<&lsproto::DidOpenTextDocumentParams>,
     ) -> Result<(), GoError> {
         let text_document = params
-            .expect(NIL_DEREF)
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .text_document
             .as_ref()
-            .expect(NIL_DEREF);
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         self.session_ref().did_open_file(
             ctx,
             &text_document.uri,
@@ -3590,7 +3600,7 @@ impl Server {
         ctx: &Context,
         params: Option<&lsproto::DidChangeTextDocumentParams>,
     ) -> Result<(), GoError> {
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         self.session_ref().did_change_file(
             ctx,
             &params.text_document.uri,
@@ -3606,7 +3616,7 @@ impl Server {
         ctx: &Context,
         params: Option<&lsproto::DidSaveTextDocumentParams>,
     ) -> Result<(), GoError> {
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         self.session_ref()
             .did_save_file(ctx, &params.text_document.uri);
         Ok(())
@@ -3618,7 +3628,7 @@ impl Server {
         ctx: &Context,
         params: Option<&lsproto::DidCloseTextDocumentParams>,
     ) -> Result<(), GoError> {
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         self.session_ref()
             .did_close_file(ctx, &params.text_document.uri);
         Ok(())
@@ -3630,7 +3640,7 @@ impl Server {
         ctx: &Context,
         params: Option<&lsproto::DidChangeWatchedFilesParams>,
     ) -> Result<(), GoError> {
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         self.session_ref()
             .did_change_watched_files(ctx, &params.changes);
         Ok(())
@@ -3654,7 +3664,7 @@ impl Server {
         _ctx: &Context,
         params: Option<&lsproto::SetLogVerbosityParams>,
     ) -> Result<(), GoError> {
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         if !is_valid_log_verbosity(params.verbosity) {
             let code = errors::from_value(ErrorCode::INVALID_PARAMS);
             return Err(errors::errorf(
@@ -3714,12 +3724,12 @@ impl Server {
             &direct
                 .full_document_diagnostic_report
                 .as_ref()
-                .expect(NIL_DEREF)
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .items,
             &secondary
                 .full_document_diagnostic_report
                 .as_ref()
-                .expect(NIL_DEREF)
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .items,
         );
         if missing_from_pre.is_empty() && missing_from_post.is_empty() {
@@ -3758,7 +3768,7 @@ impl Server {
         }
 
         if flake_logging == lsproto::DiagnosticFlakeLogLevel::PANIC {
-            panic!("flaky diagnostic(s) logged:\n{diff}");
+            crate::core::go_panic(format!("flaky diagnostic(s) logged:\n{diff}"));
         }
         Ok(direct)
     }
@@ -3807,7 +3817,7 @@ impl Server {
         params: Option<&lsproto::RenameParams>,
         req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::RenameResponse, GoError> {
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         let (default_ls, orchestrator) = self.get_language_service_and_cross_project_orchestrator(
             ctx,
             &params.text_document.uri,
@@ -3867,7 +3877,7 @@ impl Server {
     ) -> Result<lsproto::WillRenameFilesResponse, GoError> {
         self.handle_will_rename_files_worker(
             ctx,
-            params.expect(NIL_DEREF),
+            params.unwrap_or_else(|| crate::core::go_nil_dereference()),
             msg,
             false, /*sendRenameFile*/
         )
@@ -4112,7 +4122,7 @@ impl Server {
         params: Option<&lsproto::CompletionItem>,
         req_msg: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::CompletionResolveResponse, GoError> {
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         let Some(data) = params.data.clone() else {
             return Err(errors::new("completion item data is nil"));
         };
@@ -4140,7 +4150,10 @@ impl Server {
         ls.provide_format_document(
             ctx,
             &params.text_document.uri,
-            params.options.as_ref().expect(NIL_DEREF),
+            params
+                .options
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference()),
         )
     }
 
@@ -4154,7 +4167,10 @@ impl Server {
         ls.provide_format_document_range(
             ctx,
             &params.text_document.uri,
-            params.options.as_ref().expect(NIL_DEREF),
+            params
+                .options
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference()),
             params.range,
         )
     }
@@ -4169,7 +4185,10 @@ impl Server {
         ls.provide_format_document_on_type(
             ctx,
             &params.text_document.uri,
-            params.options.as_ref().expect(NIL_DEREF),
+            params
+                .options
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference()),
             params.position,
             &params.ch,
         )
@@ -4182,7 +4201,7 @@ impl Server {
         params: Option<&lsproto::WorkspaceSymbolParams>,
         req_msg: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::WorkspaceSymbolResponse, GoError> {
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         let mut resp = lsproto::WorkspaceSymbolResponse::default();
         let mut ls_err: Option<GoError> = None;
         let mut provide_symbols =
@@ -4232,7 +4251,11 @@ impl Server {
                     .project_collection
                     .projects()
                     .iter()
-                    .map(|p| p.borrow().get_program().expect(NIL_DEREF))
+                    .map(|p| {
+                        p.borrow()
+                            .get_program()
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
+                    })
                     .collect();
                 provide_symbols(snapshot, programs);
             });
@@ -4325,10 +4348,14 @@ impl Server {
         code_lens: Option<&lsproto::CodeLens>,
         req_msg: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::CodeLensResolveResponse, GoError> {
-        let code_lens = code_lens.expect(NIL_DEREF);
+        let code_lens = code_lens.unwrap_or_else(|| crate::core::go_nil_dereference());
         let result = self.get_language_service_and_cross_project_orchestrator(
             ctx,
-            &code_lens.data.as_ref().expect(NIL_DEREF).uri,
+            &code_lens
+                .data
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                .uri,
             req_msg,
         );
         if let Some(err) = ctx.err() {
@@ -4388,7 +4415,11 @@ impl Server {
         params: Option<&lsproto::CallHierarchyIncomingCallsParams>,
         req_msg: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::CallHierarchyIncomingCallsResponse, GoError> {
-        let item = params.expect(NIL_DEREF).item.as_ref().expect(NIL_DEREF);
+        let item = params
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .item
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let (default_ls, orchestrator) =
             self.get_language_service_and_cross_project_orchestrator(ctx, &item.uri, req_msg)?;
         default_ls.provide_call_hierarchy_incoming_calls(ctx, item, Some(&orchestrator))
@@ -4401,7 +4432,11 @@ impl Server {
         params: Option<&lsproto::CallHierarchyOutgoingCallsParams>,
         _req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::CallHierarchyOutgoingCallsResponse, GoError> {
-        let item = params.expect(NIL_DEREF).item.as_ref().expect(NIL_DEREF);
+        let item = params
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .item
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let language_service = self.session_ref().get_language_service(ctx, &item.uri)?;
         language_service.provide_call_hierarchy_outgoing_calls(ctx, item)
     }
@@ -4441,7 +4476,7 @@ impl Server {
         let api_session = api::new_session(self.session_ref(), None);
 
         // Use provided pipe path or generate a unique one
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         let pipe_path = match &params.pipe {
             Some(pipe) if !pipe.is_empty() => pipe.clone(),
             _ => self.generate_api_pipe_path(),
@@ -4569,7 +4604,10 @@ impl ata::NpmExecutor for Server {
     // Go: server.go:1815 NpmInstall
     // NpmInstall implements ata.NpmExecutor
     fn npm_install(&self, cwd: &str, args: &[String]) -> (Vec<u8>, Option<GoError>) {
-        (self.npm_install.as_ref().expect(NIL_DEREF))(cwd, args)
+        (self
+            .npm_install
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference()))(cwd, args)
     }
 }
 
@@ -4619,7 +4657,11 @@ impl Server {
         params: Option<&lsproto::ProfileParams>,
         _req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::SaveHeapProfileResponse, GoError> {
-        let file_path = crate::pprof::save_heap_profile(&params.expect(NIL_DEREF).dir)?;
+        let file_path = crate::pprof::save_heap_profile(
+            &params
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                .dir,
+        )?;
         self.logger
             .info(&format!("Heap profile saved to: {file_path}"));
         Ok(Some(lsproto::ProfileResult { file: file_path }))
@@ -4632,7 +4674,11 @@ impl Server {
         params: Option<&lsproto::ProfileParams>,
         _req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::SaveAllocProfileResponse, GoError> {
-        let file_path = crate::pprof::save_alloc_profile(&params.expect(NIL_DEREF).dir)?;
+        let file_path = crate::pprof::save_alloc_profile(
+            &params
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                .dir,
+        )?;
         self.logger
             .info(&format!("Allocation profile saved to: {file_path}"));
         Ok(Some(lsproto::ProfileResult { file: file_path }))
@@ -4645,7 +4691,7 @@ impl Server {
         params: Option<&lsproto::ProfileParams>,
         _req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::StartCPUProfileResponse, GoError> {
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         self.cpu_profiler.start_cpu_profile(&params.dir)?;
         self.logger.info(&format!(
             "CPU profiling started, will save to: {}",
@@ -4674,7 +4720,10 @@ impl Server {
         params: Option<&lsproto::ProjectInfoParams>,
         _req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::CustomProjectInfoResponse, GoError> {
-        let uri = &params.expect(NIL_DEREF).text_document.uri;
+        let uri = &params
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .text_document
+            .uri;
         let (default_project, _, _) = self
             .session_ref()
             .get_language_service_and_projects_for_file(ctx, uri)?;
@@ -4693,7 +4742,7 @@ impl Server {
         params: Option<&lsproto::SetContentMapperContributionsParams>,
         _req: &Rc<lsproto::RequestMessage>,
     ) -> Result<lsproto::CustomSetContentMapperContributionsResponse, GoError> {
-        let params = params.expect(NIL_DEREF);
+        let params = params.unwrap_or_else(|| crate::core::go_nil_dereference());
         let contributions = parse_content_mapper_contributions(&params.contributions)?;
         let documents: Vec<lsproto::DocumentUri> = params
             .open_documents
@@ -4737,7 +4786,10 @@ pub fn parse_content_mapper_contributions(
         let Some(inferred_project) = &value.inferred_project_contribution else {
             continue;
         };
-        let manifest = inferred_project.manifest.as_ref().expect(NIL_DEREF);
+        let manifest = inferred_project
+            .manifest
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         if manifest.name.is_empty() || manifest.exec.is_empty() {
             return Err(errors::new(format!(
                 "content mapper contribution {} requires a manifest name and exec",

@@ -478,7 +478,11 @@ impl InlayHintState<'_> {
                 ..Default::default()
             }];
             // PORT: Go dereferences `*hint.InlayHintLabelParts`; nil panics.
-            parts.extend(hint.inlay_hint_label_parts.take().unwrap());
+            parts.extend(
+                hint.inlay_hint_label_parts
+                    .take()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference()),
+            );
             hint.inlay_hint_label_parts = Some(parts);
         }
         self.result.push(lsproto::InlayHint {
