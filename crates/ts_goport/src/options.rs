@@ -114,6 +114,12 @@ pub fn bool_to_tristate(b: bool) -> Tristate {
 // core/compileroptions.go
 // ---------------------------------------------------------------------------
 
+// Go: core/compileroptions.go:14 PluginImport (ts#64397)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PluginImport {
+    pub name: String,
+}
+
 /// Go `core.CompilerOptions`. Field names are the Go names in snake case.
 /// CompilerOptions contains the compiler options exposed by the API.
 // Go: core/compileroptions.go:16 CompilerOptions
@@ -193,6 +199,8 @@ pub struct CompilerOptions {
     pub out_dir: String,
     /// Go `*OrderedMap[string, []string]`; a nil substitution slice is `None`.
     pub paths: Option<IndexMap<String, Option<Vec<String>>>>,
+    // Plugins are parsed only so tools can report that native TypeScript does not support them.
+    pub plugins: Option<Vec<PluginImport>>,
     pub preserve_const_enums: Tristate,
     pub preserve_symlinks: Tristate,
     pub project: String,
