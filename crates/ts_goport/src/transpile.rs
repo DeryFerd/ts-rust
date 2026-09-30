@@ -18,12 +18,10 @@ use crate::emitter::emitter::EmitOnly;
 use crate::emitter::program_emit::{self, EmitOptions, WriteFile, WriteFileData};
 use crate::frontend::compiler::{NewProgram, ProgramOptions, new_compiler_host};
 use crate::frontend::tsoptions::{ParsedCommandLine, ParsedOptions, get_default_lib_file_name};
-use crate::frontend::tspath::{
-    ComparePathsOptions, combine_paths, contains_path, get_directory_path,
-    get_normalized_absolute_path,
-};
+use crate::frontend::tspath::{combine_paths, get_normalized_absolute_path};
 use crate::frontend::vfs::{Entries, FileInfo, Fs, FsError, WalkDirFunc};
 use crate::gostd::Context;
+use crate::gostd::strconv::quote;
 use crate::program;
 
 // Go: transpile/transpile.go:18 Options
@@ -113,6 +111,7 @@ interface Symbol {
 ///   - NoLib = true
 ///   - Declaration = false
 ///   - DeclarationMap = false
+///   - IsolatedDeclarations = false
 pub fn transpile_module(ctx: &Context, input: &str, options: Options) -> Option<Output> {
     transpile_worker(ctx, input, options, false /*declaration*/)
 }
@@ -195,6 +194,7 @@ fn transpile_worker(
     } else {
         opts.declaration = Tristate::False;
         opts.declaration_map = Tristate::False;
+        opts.isolated_declarations = Tristate::False;
     }
 
     // When transpiling declarations, we need a lib. GetDefaultLibFileName will
@@ -254,6 +254,7 @@ fn transpile_worker(
             single_threaded: Tristate::Unknown,
             typings_location: String::new(),
             project_name: String::new(),
+            skip_module_resolution: true,
         }))
     };
     let version = program::new_program_version(&np, None);
@@ -333,7 +334,7 @@ fn transpile_worker(
     output
 }
 
-// Go: transpile/fs.go:10 transpileFS
+// Go: transpile/fs.go:11 transpileFS
 // transpileFS embeds unsupported operations so unexpected filesystem access
 // panics.
 // PORT: Go embeds a nil `vfs.FS`, so any other method dereferences nil
@@ -343,21 +344,28 @@ struct TranspileFs {
 }
 
 impl Fs for TranspileFs {
-    // Go: transpile/fs.go:17 transpileFS.UseCaseSensitiveFileNames
+    // Go: transpile/fs.go:18 transpileFS.UseCaseSensitiveFileNames
     fn use_case_sensitive_file_names(&self) -> bool {
         true
     }
 
-    // Go: transpile/fs.go:21 transpileFS.FileExists
+    // Go: transpile/fs.go:22 transpileFS.FileExists
     fn file_exists(&self, path: &str) -> bool {
-        self.files.contains_key(path)
+        let ok = self.files.contains_key(path);
+        if !ok {
+            go_panic(format!(
+                "unexpected file existence check for {}",
+                quote(path)
+            ));
+        }
+        ok
     }
 
-    // Go: transpile/fs.go:26 transpileFS.ReadFile
+    // Go: transpile/fs.go:30 transpileFS.ReadFile
     fn read_file(&self, path: &str) -> (String, bool) {
         match self.files.get(path) {
             Some(content) => (content.clone(), true),
-            None => (String::new(), false),
+            None => go_panic(format!("unexpected file read for {}", quote(path))),
         }
     }
 
@@ -382,18 +390,12 @@ impl Fs for TranspileFs {
         go_nil_dereference()
     }
 
-    // Go: transpile/fs.go:31 transpileFS.DirectoryExists
+    // Go: transpile/fs.go:38 transpileFS.DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {
-        self.files.keys().any(|file| {
-            contains_path(
-                path,
-                &get_directory_path(file),
-                &ComparePathsOptions {
-                    use_case_sensitive_file_names: true,
-                    ..ComparePathsOptions::default()
-                },
-            )
-        })
+        go_panic(format!(
+            "unexpected directory existence check for {}",
+            quote(path)
+        ))
     }
 
     fn get_accessible_entries(&self, _path: &str) -> Entries {
@@ -408,9 +410,9 @@ impl Fs for TranspileFs {
         go_nil_dereference()
     }
 
-    // Go: transpile/fs.go:40 transpileFS.Realpath
+    // Go: transpile/fs.go:42 transpileFS.Realpath
     fn realpath(&self, path: &str) -> String {
-        path.to_string()
+        go_panic(format!("unexpected realpath request for {}", quote(path)))
     }
 }
 
@@ -419,19 +421,35 @@ mod tests {
     // Go: transpile/fs_test.go
     use super::*;
 
-    // Go: fs_test.go:7 TestTranspileFSDirectoryExists
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // Go: internal/testutil/testutil.go:14 AssertPanics
+    fn assert_panics(f: impl FnOnce(), expected: &str) {
+        let payload = catch_unwind(AssertUnwindSafe(f)).expect_err("expected a panic");
+        let got = payload
+            .downcast_ref::<GoPanic>()
+            .map(|p| p.message.clone())
+            .unwrap_or_else(|| panic!("expected a Go panic with {expected:?}"));
+        assert_eq!(got, expected);
+    }
+
+    // Go: fs_test.go:9 TestTranspileFSRejectsDirectoryAccess
     #[test]
-    fn test_transpile_fs_directory_exists() {
+    fn test_transpile_fs_rejects_directory_access() {
         let mut files = FxHashMap::default();
         files.insert("/src/module.ts".to_string(), String::new());
         let fs = TranspileFs { files };
-        assert!(
-            !fs.directory_exists("/src/module.ts"),
-            "file reported as directory"
+        assert_panics(
+            || {
+                fs.directory_exists("/src");
+            },
+            r#"unexpected directory existence check for "/src""#,
         );
-        assert!(
-            fs.directory_exists("/src"),
-            "containing directory not found"
+        assert_panics(
+            || {
+                fs.realpath("/src/module.ts");
+            },
+            r#"unexpected realpath request for "/src/module.ts""#,
         );
     }
 }
