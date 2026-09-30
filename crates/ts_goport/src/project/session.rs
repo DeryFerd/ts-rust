@@ -371,6 +371,11 @@ impl Session {
         self.options.current_directory.clone()
     }
 
+    // Go: project/session.go:260 DefaultLibraryPath (ts#64158)
+    pub fn default_library_path(&self) -> String {
+        self.options.default_library_path.clone()
+    }
+
     // Go: project/session.go:265 Config
     // Gets copy of current configuration
     pub fn config(&self) -> lsutil::UserPreferences {

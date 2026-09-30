@@ -267,6 +267,11 @@ impl SnapshotHost {
         self.options.current_directory.clone()
     }
 
+    // Go: project/snapshothost.go:180 SnapshotHost.DefaultLibraryPath (ts#64158)
+    pub fn default_library_path(&self) -> String {
+        self.options.default_library_path.clone()
+    }
+
     // Go: project/snapshothost.go:178 SnapshotHost.Close
     pub fn close(&self) {
         if let Some(content_mapper_host) = &self.content_mapper_host {
