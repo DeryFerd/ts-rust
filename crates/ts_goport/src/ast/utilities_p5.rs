@@ -1232,3 +1232,8 @@ pub fn is_named_evaluation_source(node: Node) -> bool {
 pub fn is_proto_setter(node: Node) -> bool {
     (is_identifier(node) || is_string_literal(node)) && node.text() == "__proto__"
 }
+
+// Go: ast/utilities.go:4628 IsStringLiteralLikeType (ts#63931)
+pub fn is_string_literal_like_type(node: Node) -> bool {
+    node.kind() == SyntaxKind::LiteralType && is_string_literal_like(node.literal())
+}

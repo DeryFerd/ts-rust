@@ -14,9 +14,7 @@ impl Symbol {
     // Go: ast/symbol.go:23 IsExternalModule
     #[must_use]
     pub fn is_external_module(&self) -> bool {
-        self.flags.intersects(SymbolFlags::MODULE)
-            && !self.name.is_empty()
-            && self.name.as_bytes()[0] == b'"'
+        self.flags.intersects(SymbolFlags::MODULE) && is_ambient_module_symbol_name(&self.name)
     }
 
     // Go: ast/symbol.go:27 IsStatic

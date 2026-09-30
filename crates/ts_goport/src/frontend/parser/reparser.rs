@@ -1158,6 +1158,7 @@ impl Parser {
             modifiers,
             SyntaxKind::NamespaceKeyword,
             name,
+            Node::NIL,
             block,
         );
         self.finish_reparsed_node(result, full_name);

@@ -3367,7 +3367,7 @@ impl Node {
         })
     }
 
-    // Go: ast.go:954 Attributes
+    // Go: ast.go:966 Attributes
     // PORT: also covers the `Attributes` fields of ImportDeclaration,
     // ExportDeclaration, ImportTypeNode and JSDocImportTag, which have no
     // generated accessor.
@@ -3378,6 +3378,7 @@ impl Node {
             Node::NIL,
             [JsxOpeningElement, JsxSelfClosingElement] => |f, d| req(f, d.attributes),
             [
+                ModuleDeclaration,
                 ImportDeclaration,
                 ExportDeclaration,
                 ImportTypeNode,
@@ -4325,7 +4326,9 @@ fn walk_children<'d>(data: &'d NodeData, w: &mut impl ChildVisit<'d>) -> bool {
                 || (!d.is_name_first && (o!(d.type_expression) || n!(d.name)))
                 || ol!(d.comment)
         }
-        NodeData::ModuleDeclaration(d) => m!(d.modifiers) || n!(d.name) || o!(d.body),
+        NodeData::ModuleDeclaration(d) => {
+            m!(d.modifiers) || n!(d.name) || o!(d.attributes) || o!(d.body)
+        }
         NodeData::ImportEqualsDeclaration(d) => {
             m!(d.modifiers) || n!(d.name) || n!(d.module_reference)
         }
@@ -5591,11 +5594,17 @@ pub fn is_any_export_assignment(node: Node) -> bool {
 }
 
 impl Node {
-    // Go: ast.go:2218 (*ImportAttributesNode).GetResolutionModeOverride
+    // Go: ast.go:2217 (*ImportAttributesNode).GetResolutionModeOverride
     /// The `resolution-mode` from an import attributes node, and whether
     /// one was given. The node can be nil.
+    // PORT: Go `grammarErrorOnNode` is a nil-able func; `None` is Go nil.
     #[must_use]
-    pub fn get_resolution_mode_override(self) -> (ResolutionMode, bool) {
+    pub fn get_resolution_mode_override(
+        self,
+        grammar_error_on_node: Option<
+            &mut dyn FnMut(Node, &'static crate::diagnostics::Message, Vec<String>) -> bool,
+        >,
+    ) -> (ResolutionMode, bool) {
         if self.is_nil() {
             return (RESOLUTION_MODE_NONE, false);
         }
@@ -5605,21 +5614,24 @@ impl Node {
         })
         .unwrap_or_else(|| panic!("AsImportAttributes called on {:?}", self.kind()))
         .nodes();
-        if attributes.len() != 1 {
+        let attribute = attributes
+            .iter()
+            .find(|attribute| attribute.name().text() == "resolution-mode");
+        let Some(elem) = attribute else {
             return (RESOLUTION_MODE_NONE, false);
-        }
-        let elem = attributes.get(0);
-        if !is_string_literal_like(elem.name()) {
-            return (RESOLUTION_MODE_NONE, false);
-        }
-        if elem.name().text() != "resolution-mode" {
-            return (RESOLUTION_MODE_NONE, false);
-        }
+        };
         let value = elem.value();
         if !is_string_literal_like(value) {
             return (RESOLUTION_MODE_NONE, false);
         }
         if value.text() != "import" && value.text() != "require" {
+            if let Some(grammar_error_on_node) = grammar_error_on_node {
+                grammar_error_on_node(
+                    value,
+                    diag::X_resolution_mode_should_be_either_require_or_import,
+                    Vec::new(),
+                );
+            }
             return (RESOLUTION_MODE_NONE, false);
         }
         if value.text() == "import" {

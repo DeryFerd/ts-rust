@@ -1365,18 +1365,20 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:8222 NewModuleDeclaration
+    // Go: ast/ast_generated.go:8049 NewModuleDeclaration
     pub fn new_module_declaration(
         &self,
         modifiers: ModifierList,
         keyword: SyntaxKind,
         name: Node,
+        attributes: Node,
         body: Node,
     ) -> Node {
         self.new_node(
             SyntaxKind::ModuleDeclaration,
             D::ModuleDeclaration(Box::new(crate::astdata::ModuleDeclarationData {
                 asterisk_token: None,
+                attributes: self.oid(attributes),
                 body: self.oid(body),
                 end_flow_node: None,
                 flow_node: None,

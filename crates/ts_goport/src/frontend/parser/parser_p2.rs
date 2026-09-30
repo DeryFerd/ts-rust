@@ -1300,7 +1300,7 @@ impl Parser {
         )
     }
 
-    // Go: parser/parser.go:2174 parseAmbientExternalModuleDeclaration
+    // Go: parser/parser.go:2218 parseAmbientExternalModuleDeclaration
     pub fn parse_ambient_external_module_declaration(
         &mut self,
         pos: i32,
@@ -1318,6 +1318,10 @@ impl Parser {
             // parse string literal
             name = self.parse_literal_expression();
         }
+        let mut attributes = Node::NIL;
+        if keyword == SyntaxKind::ModuleKeyword && self.parse_optional(SyntaxKind::WithKeyword) {
+            attributes = self.parse_type_literal();
+        }
         let mut body = Node::NIL;
         if self.token == SyntaxKind::OpenBraceToken {
             body = self.parse_module_block();
@@ -1326,7 +1330,7 @@ impl Parser {
         }
         let node = self
             .factory
-            .new_module_declaration(modifiers, keyword, name, body);
+            .new_module_declaration(modifiers, keyword, name, attributes, body);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.statement_has_await_identifier = save_has_await_identifier;
@@ -1384,7 +1388,7 @@ impl Parser {
         }
         let node = self
             .factory
-            .new_module_declaration(modifiers, keyword, name, body);
+            .new_module_declaration(modifiers, keyword, name, Node::NIL, body);
         let result = self.finish_node(node, pos);
         self.with_js_doc(result, jsdoc);
         self.check_js_syntax(result);
