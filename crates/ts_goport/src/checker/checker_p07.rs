@@ -129,6 +129,15 @@ impl Checker {
         }
         if is_binding_element(node) {
             let prop_name = node.property_name();
+
+            if prop_name.is_some() && is_private_identifier(prop_name) {
+                self.grammar_error_on_node(
+                    prop_name,
+                    diag::Private_identifiers_cannot_be_used_in_destructuring_patterns,
+                    args![],
+                );
+            }
+
             if prop_name.is_some()
                 && is_identifier(node.name())
                 && is_part_of_parameter_declaration(node)
