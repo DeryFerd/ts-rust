@@ -14,7 +14,7 @@ use crate::ls::prelude::*;
 // LanguageService<P>` blocks; all other methods are for the default `P`
 // only.
 pub struct LanguageService<P = compiler::NewProgram> {
-    pub project_path: tspath::Path,
+    pub project_id: autoimport::ProjectID,
     pub host: Rc<dyn Host>,
     pub active_config: lsutil::UserPreferences,
     pub program: Rc<P>,
@@ -37,7 +37,7 @@ pub struct LanguageService<P = compiler::NewProgram> {
 // Go: ls/languageservice.go:24 NewLanguageService
 // PORT: Go returns `*LanguageService`; the caller owns the value here.
 pub fn new_language_service(
-    project_path: tspath::Path,
+    project_id: autoimport::ProjectID,
     program: Rc<compiler::NewProgram>,
     host: Rc<dyn Host>,
     active_file: &str,
@@ -48,7 +48,7 @@ pub fn new_language_service(
     let active_config = host.get_preferences(active_file);
     let program_guard = ls_program::enter(&program);
     LanguageService {
-        project_path,
+        project_id,
         host,
         program,
         converters,
@@ -62,7 +62,7 @@ pub fn new_language_service(
 /// search thread, see `search_thread.rs`). `program_guard` makes the
 /// view's program version current (`ls_program::enter_version`).
 pub fn new_language_service_for_view<P: ProgramView>(
-    project_path: tspath::Path,
+    project_id: autoimport::ProjectID,
     program: Rc<P>,
     host: Rc<dyn Host>,
     active_config: lsutil::UserPreferences,
@@ -70,7 +70,7 @@ pub fn new_language_service_for_view<P: ProgramView>(
 ) -> LanguageService<P> {
     let converters = host.converters();
     LanguageService {
-        project_path,
+        project_id,
         host,
         program,
         converters,
@@ -199,7 +199,7 @@ impl LanguageService {
         if !autoimport::Registry::is_prepared_for_importing_file(
             registry.as_deref(),
             source_file_file_name(registry_file),
-            &self.project_path,
+            &self.project_id,
             &self.user_preferences(),
         ) {
             return Err((*ERR_NEEDS_AUTO_IMPORTS).clone());
@@ -210,7 +210,7 @@ impl LanguageService {
         let view = autoimport::new_view(
             registry,
             from_file,
-            self.project_path.clone(),
+            self.project_id.clone(),
             Rc::clone(&self.program),
             self.user_preferences().module_specifier_preferences(),
         );
@@ -233,7 +233,7 @@ impl LanguageService {
         Rc::new(autoimport::new_view(
             registry,
             from_file,
-            self.project_path.clone(),
+            self.project_id.clone(),
             Rc::clone(&self.program),
             self.user_preferences().module_specifier_preferences(),
         ))

@@ -16,7 +16,7 @@ use ts_goport::gostd::context;
 use ts_goport::ls::autoimport::aliasresolver::{
     AliasResolver, bind_alias_resolver_source_file, new_alias_resolver,
 };
-use ts_goport::ls::autoimport::registry::{DISCARD_ON_CANCEL_KEY, RegistryCloneHost};
+use ts_goport::ls::autoimport::registry::{DISCARD_ON_CANCEL_KEY, ProjectID, RegistryCloneHost};
 use ts_goport::options::CompilerOptions;
 
 use super::projecttestutil::{self, files};
@@ -37,10 +37,10 @@ impl module::ResolutionHost for FakeCloneHost {
 }
 
 impl RegistryCloneHost for FakeCloneHost {
-    fn get_default_project(&self, _path: &Path) -> (Path, Option<Rc<NewProgram>>) {
-        (Path(String::new()), None)
+    fn get_default_project(&self, _path: &Path) -> (Option<ProjectID>, Option<Rc<NewProgram>>) {
+        (None, None)
     }
-    fn get_program_for_project(&self, _project_path: &Path) -> Option<Rc<NewProgram>> {
+    fn get_program_for_project(&self, _project_id: &ProjectID) -> Option<Rc<NewProgram>> {
         None
     }
     fn get_package_json(&self, _file_name: &str) -> Option<Rc<InfoCacheEntry>> {

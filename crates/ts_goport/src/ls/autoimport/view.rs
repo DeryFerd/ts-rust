@@ -41,7 +41,7 @@ pub struct View {
     pub importing_file_path: tspath::Path,
     pub program: Rc<compiler::NewProgram>,
     pub preferences: modulespecifiers::UserPreferences,
-    pub project_key: tspath::Path,
+    pub project_id: ProjectID,
 
     pub allowed_endings: RefCell<Option<Vec<modulespecifiers::ModuleSpecifierEnding>>>,
     pub conditions: FxHashSet<String>,
@@ -67,7 +67,7 @@ pub fn source_file_has_file_name(file: Node) -> HasFileNameImpl {
 pub fn new_view(
     registry: Rc<Registry>,
     importing_file: Node,
-    project_key: tspath::Path,
+    project_id: ProjectID,
     program: Rc<compiler::NewProgram>,
     preferences: modulespecifiers::UserPreferences,
 ) -> View {
@@ -93,7 +93,7 @@ pub fn new_view(
         importing_file,
         importing_file_path,
         program,
-        project_key,
+        project_id,
         preferences,
         conditions,
         should_use_uri_style_node_core_modules,
@@ -180,7 +180,7 @@ impl View {
         let mut results: Vec<Rc<Export>> = Vec::new();
         let importing_file_path = tspath::Path(source_file_info(self.importing_file).path.clone());
 
-        if let Some(bucket) = self.registry.projects.get(&self.project_key) {
+        if let Some(bucket) = self.registry.projects.get(&self.project_id) {
             let exports = search_fn(&**bucket);
             results.reserve(exports.len());
             for e in exports {
@@ -220,7 +220,7 @@ impl View {
         );
         // If we found at least one package.json, also include packages directly imported by the project
         if let Some(allowed) = &allowed_packages {
-            if let Some(bucket) = self.registry.projects.get(&self.project_key) {
+            if let Some(bucket) = self.registry.projects.get(&self.project_id) {
                 // Go: allowedPackages.UnionedWith(bucket.ResolvedPackageNames)
                 let mut result = allowed.clone();
                 if let Some(other) = &bucket.resolved_package_names {

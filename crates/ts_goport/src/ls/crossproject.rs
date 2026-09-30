@@ -54,7 +54,7 @@ const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer de
 // PORT: plan contract C4. Go `*compiler.Program` is
 // `Rc<compiler::NewProgram>`, which is never nil.
 pub trait Project {
-    fn id(&self) -> tspath::Path;
+    fn id(&self) -> String;
     fn get_program(&self) -> Rc<compiler::NewProgram>;
     fn has_file(&self, file_name: &str) -> bool;
 }
@@ -256,7 +256,7 @@ where
             let mut requested_project_trees: FxHashSet<tspath::Path> = FxHashSet::default();
             for (key, response) in state.results.borrow().iter() {
                 if response.borrow().complete {
-                    requested_project_trees.insert(key.clone());
+                    requested_project_trees.insert(tspath::Path(key.clone()));
                 }
             }
 
@@ -467,8 +467,8 @@ struct CrossProjectState<'a, Req, Resp> {
     options: SymbolEntryTransformOptions,
     default_project: Rc<dyn Project>,
     all_projects: Vec<Rc<dyn Project>>,
-    /// Go `results collections.SyncMap[tspath.Path, *response[Resp]]`.
-    results: RefCell<IndexMap<tspath::Path, Rc<RefCell<Response<Resp>>>>>,
+    /// Go `results collections.SyncMap[string, *response[Resp]]`.
+    results: RefCell<IndexMap<String, Rc<RefCell<Response<Resp>>>>>,
     /// Go `defaultDefinition *nonLocalDefinition`.
     default_definition: RefCell<Option<NonLocalDefinition<'a>>>,
     /// Go `wg`: the queued items with the response each one fills.
@@ -869,7 +869,7 @@ where
     fn get_results_iterator(&self) -> Vec<Resp> {
         let mut yielded: Vec<Resp> = Vec::new();
         let results = self.results.borrow();
-        let mut seen_projects: FxHashSet<tspath::Path> = FxHashSet::default();
+        let mut seen_projects: FxHashSet<String> = FxHashSet::default();
         if let Some(response) = results.get(&self.default_project.id()) {
             let response = response.borrow();
             if response.complete {

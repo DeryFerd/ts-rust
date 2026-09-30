@@ -1277,7 +1277,7 @@ impl LanguageService {
         let vs_capability = caps.vs_supports_visual_studio_extensions;
         let mut items: Vec<lsproto::VSReferenceItem> = Vec::new();
         let mut id: i32 = 0;
-        let project_name = self.project_path.as_str().to_string();
+        let project_name = self.project_id.string();
 
         for s in &data.symbols_and_entries {
             let (definition, references) = {
