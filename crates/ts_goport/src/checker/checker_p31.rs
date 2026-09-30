@@ -1059,7 +1059,8 @@ impl Checker {
                 EXTERNAL_HELPERS_MODULE_NAME_TEXT,
                 Some(diag::This_syntax_requires_an_imported_helper_but_module_0_cannot_be_found),
                 error_node,
-                false, /*isForAugmentation*/
+                false,       /*isForAugmentation*/
+                TypeId::NIL, /*importAttributesType*/
             );
             if helpers_module.is_nil() {
                 helpers_module = self.unknown_symbol;

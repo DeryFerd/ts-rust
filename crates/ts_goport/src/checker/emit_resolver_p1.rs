@@ -704,6 +704,8 @@ impl crate::printer::EmitResolver for EmitResolver {
     }
 
     // Go: checker/emitresolver.go:1143 EmitResolver.GetResolutionModeOverride
+    // PORT: removed upstream (ts#63931). Kept while the `printer::EmitResolver`
+    // trait (emit lane) still declares it.
     fn get_resolution_mode_override(&self, node: Node) -> ResolutionMode {
         EmitResolver::get_resolution_mode_override(self, node)
     }

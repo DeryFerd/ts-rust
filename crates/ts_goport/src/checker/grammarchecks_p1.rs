@@ -1750,3 +1750,60 @@ fn file_extension_is_one_of_gc1(path: &str, extensions: &[&str]) -> bool {
     }
     false
 }
+
+impl Checker {
+    // Go: checker/grammarchecks.go:2187 checkGrammarImportAttributesType
+    // PORT: the Go function is last in grammarchecks.go (grammarchecks_p3.rs);
+    // it is here because the checker lane owns this file.
+    pub fn check_grammar_import_attributes_type(&mut self, attributes: Node) -> bool {
+        let members = attributes.members();
+        for member in members {
+            if member.kind() != SyntaxKind::PropertySignature {
+                return self.grammar_error_on_node(
+                    member,
+                    diag::An_import_attributes_type_may_only_contain_property_signatures,
+                    args![],
+                );
+            }
+            if member.type_().is_nil() {
+                return self.grammar_error_on_node(
+                    member,
+                    diag::An_import_attributes_property_must_have_a_type_annotation,
+                    args![],
+                );
+            }
+            if member.question_token().is_some() {
+                return self.grammar_error_on_node(
+                    member,
+                    diag::An_import_attributes_property_cannot_be_optional,
+                    args![],
+                );
+            }
+            let name = member.name();
+            if !(is_string_literal_like(name) || is_identifier(name)) {
+                return self.grammar_error_on_node(
+                    name,
+                    diag::An_import_attributes_property_must_have_a_string_literal_or_identifier_name,
+                    args![],
+                );
+            }
+            if name.text() == "resolution-mode" {
+                return self.grammar_error_on_node(
+                    name,
+                    diag::X_0_is_not_a_valid_key_for_an_import_attributes_type,
+                    args![name.text()],
+                );
+            }
+
+            let type_node = member.type_();
+            if !is_string_literal_like_type(type_node) {
+                return self.grammar_error_on_node(
+                    type_node,
+                    diag::An_import_attributes_property_must_have_a_string_literal_type_annotation,
+                    args![],
+                );
+            }
+        }
+        false
+    }
+}

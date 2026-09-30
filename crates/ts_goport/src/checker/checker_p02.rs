@@ -507,6 +507,7 @@ impl Checker {
         for symbol in ambient_module_symbols {
             self.merge_global_symbol(symbol);
         }
+        self.merge_pattern_ambient_modules();
         // merge _nonglobal_ module augmentations.
         // this needs to be done after global symbol table is initialized to make sure that all ambient modules are indexed
         for list in &augmentations {
@@ -529,6 +530,57 @@ impl Checker {
             merged = self.get_merged_symbol(symbol);
         }
         self.symbols.set(self.globals, name, merged);
+    }
+
+    // Go: checker/checker.go:1408 mergePatternAmbientModules
+    // Pattern ambient modules are merged together if they have the same pattern and identical import attributes type.
+    // PORT: Go `module.Pattern.Text` is the prefix, the star and the suffix
+    // (`PatternAmbientModule` stores the prefix and suffix).
+    pub fn merge_pattern_ambient_modules(&mut self) {
+        let mut groups_by_pattern: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        let pattern_ambient_modules = self.pattern_ambient_modules.clone();
+        let mut grouped: Vec<PatternAmbientModule> =
+            Vec::with_capacity(pattern_ambient_modules.len());
+        for module in &pattern_ambient_modules {
+            let pattern_text = format!("{}*{}", module.pattern_prefix, module.pattern_suffix);
+            let attributes_type = self.get_type_of_module_import_attributes(module.symbol);
+            let mut group_index: isize = -1;
+            let indexes = groups_by_pattern
+                .get(&pattern_text)
+                .cloned()
+                .unwrap_or_default();
+            for index in indexes {
+                let other = self.get_type_of_module_import_attributes(grouped[index].symbol);
+                if self.is_type_identical_to(attributes_type, other) {
+                    group_index = index as isize;
+                    break;
+                }
+            }
+            if group_index == -1 {
+                groups_by_pattern
+                    .entry(pattern_text)
+                    .or_default()
+                    .push(grouped.len());
+                grouped.push(PatternAmbientModule {
+                    pattern_prefix: module.pattern_prefix.clone(),
+                    pattern_suffix: module.pattern_suffix.clone(),
+                    symbol: module.symbol,
+                });
+            } else {
+                let group_index = group_index as usize;
+                let target = grouped[group_index].symbol;
+                grouped[group_index].symbol =
+                    self.merge_symbol(target, module.symbol, false /*unidirectional*/);
+            }
+        }
+        for module in &pattern_ambient_modules {
+            let name = self.sym(module.symbol).name.clone();
+            if self.symbols.get(self.globals, &name).is_some() {
+                let merged = self.get_merged_symbol(module.symbol);
+                self.symbols.set(self.globals, name, merged);
+            }
+        }
+        self.pattern_ambient_modules = grouped;
     }
 
     // Go: checker/checker.go:1395 mergeModuleAugmentation
@@ -563,12 +615,14 @@ impl Checker {
                 module_not_found_error =
                     Some(diag::Invalid_module_name_in_augmentation_module_0_cannot_be_found);
             }
+            // We ban import attributes on module augmentation declarations.
             let mut main_module = self.resolve_external_module_name_worker(
                 module_name,
                 module_name,
-                module_not_found_error, /*ignoreErrors*/
-                false,
-                /*isForAugmentation*/ true,
+                module_not_found_error,
+                false,       /*ignoreErrors*/
+                true,        /*isForAugmentation*/
+                TypeId::NIL, /*importAttributesType*/
             );
             if main_module.is_nil() {
                 return;
@@ -586,11 +640,10 @@ impl Checker {
                 // the pattern ('*.foo'), so that 'getMergedSymbol()' on a.foo gives you
                 // all the exports both from the pattern and from the augmentation, but
                 // 'getMergedSymbol()' on *.foo only gives you exports from *.foo.
-                if self
-                    .pattern_ambient_modules
-                    .iter()
-                    .any(|module| main_module == module.symbol)
-                {
+                if (0..self.pattern_ambient_modules.len()).any(|i| {
+                    let module_symbol = self.pattern_ambient_modules[i].symbol;
+                    main_module == self.get_merged_symbol(module_symbol)
+                }) {
                     let merged = self.merge_symbol(
                         module_augmentation_symbol,
                         main_module,
@@ -602,6 +655,11 @@ impl Checker {
                         &mut self.pattern_ambient_module_augmentations,
                     );
                     self.symbols.set(table, module_name.text(), merged);
+                    let targets = get_symbol_table(
+                        &mut self.symbols,
+                        &mut self.pattern_ambient_module_augmentation_targets,
+                    );
+                    self.symbols.set(targets, module_name.text(), main_module);
                 } else {
                     let main_exports = self.sym(main_module).exports;
                     let augmentation_exports = self.sym(module_augmentation_symbol).exports;

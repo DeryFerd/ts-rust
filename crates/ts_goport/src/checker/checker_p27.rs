@@ -758,10 +758,13 @@ impl Checker {
                 SymbolFlags::TYPE
             };
             // Go comment: Future work: support unions/generics/whatever via a deferred import-type
+            let import_attributes_type =
+                self.get_type_from_import_attributes(get_import_attributes(node));
             let inner_module_symbol = self.resolve_external_module_name(
                 node,
                 n.argument().literal(),
                 false, /*ignoreErrors*/
+                import_attributes_type,
             );
             if inner_module_symbol.is_nil() {
                 let unknown_symbol = self.unknown_symbol;

@@ -1199,7 +1199,14 @@ impl Checker {
                             && is_literal_import_type_node(grand_parent)
                             && grand_parent.argument() == parent)
                     {
-                        return self.resolve_external_module_name(node, node, ignore_errors);
+                        let import_attributes_type =
+                            self.get_import_attributes_type_for_module_specifier(node);
+                        return self.resolve_external_module_name(
+                            node,
+                            node,
+                            ignore_errors,
+                            import_attributes_type,
+                        );
                     }
                     if is_call_expression(parent)
                         && is_bindable_object_define_property_call(parent)

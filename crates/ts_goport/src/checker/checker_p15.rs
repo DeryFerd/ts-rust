@@ -1012,6 +1012,9 @@ impl Checker {
         if is_const_assertion(parent) {
             return true;
         }
+        if self.is_inline_import_attributes(node) {
+            return true;
+        }
         if self.is_valid_const_assertion_argument(node) {
             let contextual_type = self.get_contextual_type(node, ContextFlags::NONE);
             if self.is_const_type_variable(contextual_type, 0) {
@@ -1029,6 +1032,30 @@ impl Checker {
             || is_shorthand_property_assignment(parent)
             || is_template_span(parent))
             && self.is_const_context(parent.parent())
+    }
+
+    // Go: checker/checker.go:13806 isInlineImportAttributes
+    pub fn is_inline_import_attributes(&self, node: Node) -> bool {
+        if !is_object_literal_expression(node)
+            || !is_property_assignment(node.parent())
+            || node.parent().initializer() != node
+        {
+            return false;
+        }
+        let property = node.parent();
+        if (!is_identifier(property.name()) && !is_string_literal_like(property.name()))
+            || property.name().text() != "with"
+        {
+            return false;
+        }
+        let options = property.parent();
+        if !is_object_literal_expression(options) {
+            return false;
+        }
+        let import_call = find_ancestor(options, is_import_call);
+        import_call.is_some()
+            && import_call.arguments().len() > 1
+            && skip_parentheses(import_call.arguments().get(1)) == options
     }
 
     // Go: checker/checker.go:13553 isValidConstAssertionArgument

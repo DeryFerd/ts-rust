@@ -1258,8 +1258,7 @@ impl Checker {
     // Go: checker/utilities.go:1630 IsExternalModuleSymbol
     // True if the symbol is for an external module, as opposed to a namespace.
     pub fn is_external_module_symbol(&self, module_symbol: SymbolId) -> bool {
-        let s = self.sym(module_symbol);
-        s.flags.intersects(SymbolFlags::MODULE) && s.name.starts_with('"')
+        self.sym(module_symbol).is_external_module()
     }
 
     // Go: checker/utilities.go:1635 isCanceled

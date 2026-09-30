@@ -828,6 +828,7 @@ impl Checker {
                         ModifierList::NIL,
                         SyntaxKind::NamespaceKeyword,
                         bb.f().new_identifier(m_name),
+                        Node::NIL, /*attributes*/
                         bb.f().new_module_block(bb.f().new_node_list(&[])),
                     );
                     body_stmts.push(HoverStatement {
@@ -879,10 +880,25 @@ impl Checker {
         if !is_identifier(local_name) {
             keyword = SyntaxKind::ModuleKeyword;
         }
+        let mut attributes = Node::NIL;
+        let declaration = self
+            .sym(symbol)
+            .declarations
+            .iter()
+            .copied()
+            .find(|&declaration| {
+                is_module_declaration(declaration) && declaration.attributes().is_some()
+            })
+            .unwrap_or(Node::NIL);
+        if declaration.is_some() {
+            attributes = bb.f().deep_clone_node(declaration.attributes());
+            bb.e.set_emit_flags(attributes, EmitFlags::SINGLE_LINE);
+        }
         bb.f().new_module_declaration(
             ModifierList::NIL,
             keyword,
             local_name,
+            attributes,
             bb.f()
                 .new_module_block(bb.f().new_node_list(&body_statements)),
         )

@@ -165,12 +165,17 @@ impl Checker {
         self.get_type_only_alias_declaration(symbol)
     }
 
-    // Go: checker/exports.go:104 ResolveExternalModuleName
-    pub fn resolve_external_module_name_exported(&mut self, module_specifier: Node) -> SymbolId {
+    // Go: checker/exports.go:123 ResolveExternalModuleName
+    pub fn resolve_external_module_name_exported(
+        &mut self,
+        module_specifier: Node,
+        import_attributes_type: TypeId,
+    ) -> SymbolId {
         self.resolve_external_module_name(
             module_specifier,
             module_specifier,
             true, /*ignoreErrors*/
+            import_attributes_type,
         )
     }
 
@@ -288,15 +293,6 @@ impl Checker {
     // Go: checker/exports.go:172 GetDefaultFromTypeParameter
     pub fn get_default_from_type_parameter_exported(&mut self, type_parameter: TypeId) -> TypeId {
         self.get_default_from_type_parameter(type_parameter)
-    }
-
-    // Go: checker/exports.go:176 GetResolutionModeOverride
-    pub fn get_resolution_mode_override_exported(
-        &mut self,
-        node: Node,
-        report_errors: bool,
-    ) -> ResolutionMode {
-        self.get_resolution_mode_override(node, report_errors)
     }
 
     // Go: checker/exports.go:180 GetEffectiveDeclarationFlags
