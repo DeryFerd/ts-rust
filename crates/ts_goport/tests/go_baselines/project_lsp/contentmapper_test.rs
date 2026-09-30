@@ -1101,7 +1101,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: contentmapper_test.go:638 TestContentMapperOpenFileExcludedByConfigChange
+    // Go: contentmapper_test.go:720 TestContentMapperOpenFileExcludedByConfigChange (ts#64137)
     fn content_mapper_open_file_excluded_by_config_change() {
         const SRC_BOX_URI: &str = "file:///home/project/src/app.box";
         const SRC_BOX_PATH: &str = "/home/project/src/app.box";
@@ -1143,6 +1143,18 @@ child_test! {
 	}"#,
         );
         watch(&session, &[(CHANGED, "file:///home/project/tsconfig.json")]);
+        session.wait_for_background_tasks();
+
+        // The background update removes app.box from the configured project, but inferred
+        // project cleanup is deferred until the next file open.
+        assert!(
+            session
+                .snapshot()
+                .get_default_project(&uri(SRC_BOX_URI))
+                .is_none()
+        );
+        let main_uri = "file:///home/project/src/main.ts";
+        open(&session, main_uri, "export const main = true;\n");
 
         let box_program = program(&session, SRC_BOX_URI);
         let default_project = default_project(&session, SRC_BOX_URI);
