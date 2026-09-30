@@ -927,8 +927,11 @@ impl BuildInfoPrefetch {
             let compare_paths_options = compare_paths_options.clone();
             let m_times = m_times.clone();
             // A thread that cannot start leaves its files to the others.
+            // The JSON parse of a build info file is recursive, so the
+            // thread gets the Go stack size.
             let spawned = std::thread::Builder::new()
                 .name("goport-buildinfo".to_string())
+                .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
                     let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
                     loop {

@@ -1,6 +1,7 @@
 //! The stack size of a thread that runs Go code: the work threads of the
-//! binaries, and the parse, bind, checker, emit, search and goroutine
-//! threads.
+//! binaries, the parse, bind, checker, emit, search and goroutine threads,
+//! the `tsc -b` config and build info threads, the file watcher thread and
+//! the LSP read thread.
 //!
 //! Go: a goroutine stack starts small and grows up to the maximum stack
 //! size (runtime `maxstacksize`, 1e9 bytes on 64-bit systems). Past it, Go
