@@ -505,10 +505,10 @@ impl AliasResolver {
         go_panic("unimplemented".to_string())
     }
 
-    // Go: ls/autoimport/aliasresolver.go:173 GetJSXRuntimeImportSpecifier
+    // Go: ls/autoimport/aliasresolver.go:178 GetJSXRuntimeImportSpecifier
     // GetJSXRuntimeImportSpecifier implements checker.Program.
     pub fn get_jsx_runtime_import_specifier(&self, path: &tspath::Path) -> (String, Node) {
-        go_panic("unimplemented".to_string())
+        (String::new(), Node::NIL)
     }
 
     // Go: ls/autoimport/aliasresolver.go:178 GetNearestAncestorDirectoryWithPackageJson

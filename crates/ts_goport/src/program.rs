@@ -2605,8 +2605,11 @@ pub fn get_output_paths_for_source_file(
 // PORT: the Go frontend loader records the value and its synthetic import
 // (Go `createSyntheticImport`).
 pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
-    // Go: ls/autoimport/aliasresolver.go:173 (unimplemented)
-    alias_resolver_unimplemented();
+    // Go: ls/autoimport/aliasresolver.go:178 GetJSXRuntimeImportSpecifier
+    // (no specifier, ts#64417)
+    if state().alias_resolver {
+        return (String::new(), Node::NIL);
+    }
     with_go(|go| go.get_jsx_runtime_import_specifier(path))
 }
 
