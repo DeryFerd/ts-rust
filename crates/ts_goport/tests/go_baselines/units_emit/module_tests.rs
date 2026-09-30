@@ -1,4 +1,5 @@
-//! Ports of internal/module/resolver_test.go and
+//! Ports of internal/module/resolver_test.go,
+//! internal/module/staticresolver_test.go (ts#64299) and
 //! internal/modulespecifiers/specifiers_test.go.
 //!
 //! Not ported (blocked, see bugs/S3.md): TestContainsIgnoredPath and
@@ -12,7 +13,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use ts_goport::frontend::module::{
-    DefaultResolver, ResolutionHost, ResolverOptions, new_resolver, parse_node_module_from_path,
+    DefaultResolver, ResolutionHost, Resolver, ResolverOptions, StaticResolutionEntry,
+    new_resolver, new_static_resolutions, new_static_resolver, parse_node_module_from_path,
 };
 use ts_goport::frontend::tspath::{self, Path};
 use ts_goport::frontend::vfs::{Fs, Replacements, wrapvfs_wrap};
@@ -471,6 +473,149 @@ fn test_resolve_peer_dependency_nil_contents_race() {
         "\"/repo/src/a/file.ts\" failed to resolve pkg"
     );
     assert!(second, "\"/repo/src/b/file.ts\" failed to resolve pkg");
+}
+
+// ---------------------------------------------------------------------------
+// module/staticresolver_test.go
+// ---------------------------------------------------------------------------
+
+// Go: module/staticresolver_test.go:12 TestStaticResolver
+#[test]
+fn test_static_resolver() {
+    let fs = vfstest::from_map(
+        [
+            (
+                "/repo/node_modules/fallback/package.json",
+                r#"{"name":"fallback","types":"index.d.ts"}"#,
+            ),
+            ("/repo/node_modules/fallback/index.d.ts", "export {};"),
+        ],
+        true,
+    );
+    let host: Rc<dyn ResolutionHost> = Rc::new(ResolutionHostStub {
+        fs,
+        cwd: "/repo".to_string(),
+    });
+    let fallback: Rc<dyn Resolver> = Rc::new(new_resolver(ResolverOptions {
+        host: Some(host),
+        compiler_options: Some(Rc::new(CompilerOptions {
+            module: ModuleKind::ES_NEXT,
+            module_resolution: ModuleResolutionKind::BUNDLER,
+            ..Default::default()
+        })),
+        ..Default::default()
+    }));
+    let esm = ResolutionMode::ESM;
+    let resolved = |resolved_file_name: &str| {
+        Some(Arc::new(ts_goport::program::ResolvedModule {
+            resolved_file_name: resolved_file_name.to_string(),
+            ..Default::default()
+        }))
+    };
+    let resolutions = new_static_resolutions(
+        &[
+            StaticResolutionEntry {
+                module_name: "provided".to_string(),
+                result: resolved("/global.d.ts"),
+                ..Default::default()
+            },
+            StaticResolutionEntry {
+                module_name: "provided".to_string(),
+                containing_directory: "/repo/src".to_string(),
+                result: resolved("/directory.d.ts"),
+                ..Default::default()
+            },
+            StaticResolutionEntry {
+                module_name: "provided".to_string(),
+                resolution_mode: Some(esm),
+                result: resolved("/esm.d.ts"),
+                ..Default::default()
+            },
+            StaticResolutionEntry {
+                module_name: "provided".to_string(),
+                containing_directory: "/repo/src".to_string(),
+                resolution_mode: Some(esm),
+                result: resolved("/directory-esm.d.ts"),
+            },
+            StaticResolutionEntry {
+                module_name: "unresolved".to_string(),
+                ..Default::default()
+            },
+        ],
+        true,
+        "/repo",
+        true,
+    )
+    .unwrap_or_else(|err| panic!("unexpected error: {}", err.error()));
+    let resolver = new_static_resolver(fallback, Rc::new(resolutions));
+
+    struct Test {
+        name: &'static str,
+        containing_file: &'static str,
+        mode: ResolutionMode,
+        resolved_file_name: &'static str,
+    }
+    let tests = [
+        Test {
+            name: "provided",
+            containing_file: "/repo/src/index.ts",
+            mode: ResolutionMode::ESM,
+            resolved_file_name: "/directory-esm.d.ts",
+        },
+        Test {
+            name: "provided",
+            containing_file: "/repo/src/index.ts",
+            mode: ResolutionMode::COMMON_JS,
+            resolved_file_name: "/directory.d.ts",
+        },
+        Test {
+            name: "provided",
+            containing_file: "/repo/other/index.ts",
+            mode: ResolutionMode::ESM,
+            resolved_file_name: "/esm.d.ts",
+        },
+        Test {
+            name: "provided",
+            containing_file: "/repo/other/index.ts",
+            mode: ResolutionMode::COMMON_JS,
+            resolved_file_name: "/global.d.ts",
+        },
+        Test {
+            name: "fallback",
+            containing_file: "/repo/src/index.ts",
+            mode: ResolutionMode::ESM,
+            resolved_file_name: "/repo/node_modules/fallback/index.d.ts",
+        },
+        Test {
+            name: "unresolved",
+            containing_file: "/repo/src/index.ts",
+            mode: ResolutionMode::ESM,
+            resolved_file_name: "",
+        },
+    ];
+    for test in &tests {
+        let (result, _, err) =
+            resolver.resolve_module_name(test.name, test.containing_file, test.mode, None);
+        if let Some(err) = err {
+            panic!("unexpected error: {}", err.error());
+        }
+        if test.resolved_file_name.is_empty() {
+            assert!(
+                result.is_none(),
+                "{} from {}: expected no result",
+                test.name,
+                test.containing_file
+            );
+        } else {
+            assert_eq!(
+                result.map(|result| result.resolved_file_name.clone()),
+                Some(test.resolved_file_name.to_string()),
+                "{} from {}",
+                test.name,
+                test.containing_file
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

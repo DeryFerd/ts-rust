@@ -37,6 +37,7 @@ mod stringutil;
 mod symlinks;
 mod tracing;
 mod tspath;
+mod vfs_walkdir;
 mod vfsmatch;
 mod vfsmock;
 mod watchmanager;

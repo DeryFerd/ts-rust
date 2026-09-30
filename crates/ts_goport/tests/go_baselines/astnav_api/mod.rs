@@ -84,34 +84,15 @@ pub(crate) mod repo {
     use std::path::PathBuf;
 
     // Go: repo/paths.go:42 RootPath
-    // PORT: Go finds go.mod above the test source file. The port uses the
-    // pinned typescript-go checkout (env TS_GO_REPO).
+    // PORT: Go finds go.mod above the test source file (`tsc/` at the
+    // microsoft/TypeScript layout). The port uses the pinned Go checkout
+    // (env TS_GO_REPO).
     pub(crate) fn root_path() -> PathBuf {
         crate::support::baseline::go_repo()
     }
 
-    // Go: repo/paths.go:50 TypeScriptSubmodulePath
-    pub(crate) fn type_script_submodule_path() -> PathBuf {
-        root_path().join("_submodules").join("TypeScript")
-    }
-
-    // Go: repo/paths.go:62 typeScriptSubmoduleExists
-    pub(crate) fn type_script_submodule_exists() -> bool {
-        let p = type_script_submodule_path().join("package.json");
-        match std::fs::metadata(&p) {
-            Ok(_) => true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-            Err(err) => panic!("{err}"),
-        }
-    }
-
-    // Go: repo/paths.go:82 SkipIfNoTypeScriptSubmodule
-    /// True (after it prints the skip reason) when the test must return.
-    pub(crate) fn skip_if_no_type_script_submodule(test: &str) -> bool {
-        if !type_script_submodule_exists() {
-            println!("SKIP {test}: TypeScript submodule does not exist");
-            return true;
-        }
-        false
+    // Go: repo/paths.go:50 TestDataPath
+    pub(crate) fn test_data_path() -> PathBuf {
+        crate::support::baseline::test_data_path()
     }
 }
