@@ -913,6 +913,7 @@ pub struct Checker {
     pub type_resolutions: Vec<TypeResolution>,
     pub resolution_start: i32,
     pub variance_stack: Vec<VarianceStackEntry>,
+    pub call_resolution_stack: Vec<Node>,
     /// Go `*int`; nil is `None`.
     pub apparent_argument_count: Option<i32>,
     pub last_get_combined_node_flags_node: Node,
@@ -1391,6 +1392,7 @@ impl Checker {
             type_resolutions: Vec::new(),
             resolution_start: 0,
             variance_stack: Vec::new(),
+            call_resolution_stack: Vec::new(),
             apparent_argument_count: None,
             last_get_combined_node_flags_node: Node::NIL,
             last_get_combined_node_flags_result: NodeFlags::default(),

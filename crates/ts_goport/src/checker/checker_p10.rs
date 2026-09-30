@@ -21,6 +21,7 @@ pub struct CallState {
     pub arg_check_mode: CheckMode,
     pub is_single_non_generic_candidate: bool,
     pub signature_help_trailing_comma: bool,
+    pub recursive_resolution: bool,
     pub candidates_for_argument_error: Vec<SignatureId>,
     pub candidate_for_argument_arity_error: SignatureId,
     pub candidate_for_type_argument_error: SignatureId,
@@ -811,6 +812,8 @@ impl Checker {
         // is just important for choosing the best signature. So in the case where there is only one
         // signature, the subtype pass is useless. So skipping it is an optimization.
         let mut result = SignatureId::NIL;
+        s.recursive_resolution = self.call_resolution_stack.contains(&s.node);
+        self.call_resolution_stack.push(s.node);
         if s.candidates.len() > 1 {
             let relation = self.subtype_relation.clone();
             result = self.choose_overload(&mut s, &relation);
@@ -819,6 +822,7 @@ impl Checker {
             let relation = self.assignable_relation.clone();
             result = self.choose_overload(&mut s, &relation);
         }
+        self.call_resolution_stack.pop();
         if let Some(out) = candidates_out_array.as_deref_mut() {
             *out = s.candidates.clone();
         }
@@ -1027,11 +1031,15 @@ impl Checker {
                         }
                     }
                 } else {
-                    let flags = if is_in_js_file(s.node) {
-                        InferenceFlags::ANY_DEFAULT
-                    } else {
-                        InferenceFlags::NONE
-                    };
+                    // When we are recursively resolving a call with a single candidate, we skip constraints checks during
+                    // type inference to avoid circularity errors. For example, see #64192.
+                    let mut flags = InferenceFlags::NONE;
+                    if s.recursive_resolution && s.candidates.len() == 1 {
+                        flags |= InferenceFlags::NO_CONSTRAINT_CHECKS;
+                    }
+                    if is_in_js_file(s.node) {
+                        flags |= InferenceFlags::ANY_DEFAULT;
+                    }
                     inference_context = self.new_inference_context(
                         &candidate_type_parameters,
                         candidate,
