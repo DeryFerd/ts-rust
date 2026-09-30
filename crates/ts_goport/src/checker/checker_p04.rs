@@ -745,6 +745,7 @@ impl Checker {
         // reaches here embeds FunctionLikeBase, which `full_signature()` covers.
         let full_signature = node.full_signature();
         if full_signature.is_some() {
+            self.check_source_element(full_signature);
             let full_signature_type = self.get_type_from_type_node(full_signature);
             if self
                 .get_contextual_call_signature(full_signature_type, node)

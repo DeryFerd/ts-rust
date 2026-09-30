@@ -1387,6 +1387,10 @@ impl Checker {
         check_mode: CheckMode,
     ) -> TypeId {
         self.check_node_deferred(node);
+        let full_signature = node.full_signature();
+        if full_signature.is_some() {
+            self.check_source_element(full_signature);
+        }
         if is_function_expression(node) {
             self.check_collisions_for_declaration_name(node, node.name());
         }
