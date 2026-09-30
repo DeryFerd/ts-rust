@@ -19,9 +19,9 @@
 //!
 //! M3b: at publish the version takes its `FileStore` and its `GoFile`
 //! (info, `node_bind`, `file_bind`, `flow_nodes`)
-//! (`ast::store::VersionStore`). Its header columns (headers, kinds, names,
-//! modifier bits, children, resolved) are leaked in its node shell, the
-//! tier 1 publish of its id, so the header and child reads stay inline
+//! (`ast::store::VersionStore`). Its node records and kids (and its
+//! foreign parents) are leaked in its node shell, the registry block of its
+//! id, so the header and child reads stay inline
 //! (`ast::store::node_shell`); the child link column is dropped.
 //! M3c (owned nodes; on by default in a language server or API process,
 //! see `owned_nodes_enabled`): its parse was a freeable parse
@@ -46,8 +46,8 @@
 //! Freeable rule (`free_file_versions`, `freeable_path`): only a parse of
 //! the language server parse cache (project/parsecache.rs), in a language
 //! server or API process, of a path that a publish on this thread published
-//! before. So tier 0, the first version of each file and every CLI publish
-//! never get a `FileVersion`. `GOPORT_FREE_FILE_VERSIONS=0` turns it off
+//! before. So the first publish, the first version of each file and every
+//! CLI publish never get a `FileVersion`. `GOPORT_FREE_FILE_VERSIONS=0` turns it off
 //! (the behavior before M3a); `=1` turns it on in any process, and then
 //! `program::update_program_version` (`goport_multiprog`) applies the same
 //! rule to its new parses (the compiler host opens the freeable parse scope
@@ -187,7 +187,7 @@ static MADE: AtomicUsize = AtomicUsize::new(0);
 static EDITOR_PROCESS: AtomicBool = AtomicBool::new(false);
 
 /// Set when the first freeable version is published. Until then a registry
-/// read (`frozen!` in `ast/store.rs`) never looks for a version.
+/// read (`with_version_store` in `ast/store.rs`) never looks for a version.
 static FREEABLE_PUBLISHED: AtomicBool = AtomicBool::new(false);
 
 /// Raised by each program release (`release_file_version_pins`). A thread
@@ -345,7 +345,7 @@ thread_local! {
 /// Runs `read` on the live version `file`, pinned on this thread. `None`
 /// when `file` is no live version (a static, synthetic or unknown id).
 /// Panics when `file` was a freeable version that died: a stale read never
-/// reads other data. `ast::store` calls it only after the static tiers
+/// reads other data. `ast::store` calls it only after the static blocks
 /// missed.
 // PERF: a hit is a thread-local borrow, an epoch compare and a short scan,
 // with no atomic write. `read` runs while the pins are borrowed, so a read
@@ -555,7 +555,7 @@ pub fn release_file_version_pins() {
 /// A borrow of per-file data (lsshells M3b), the return type of the file
 /// data accessors (`ast::go_file`, `ast::source_file_info`,
 /// `FlowNodeId::get_flow`, ...). It derefs to the data.
-/// - `Static`: a file that is never freed (tier 0, tier 1, synthetic or
+/// - `Static`: a file that is never freed (a static publish, synthetic or
 ///   leaked data). `as_static` gives the `'static` borrow.
 /// - `Pinned`: a freeable file version. The guard holds the version (a
 ///   thread-local pin, `VersionPin`, so a guard stays on its thread), and
@@ -676,7 +676,7 @@ impl FileVersionProbe {
 }
 
 /// A probe of the version of the file of `node`. None for a static file
-/// (tier 0, a first version, a CLI publish) or a dead version.
+/// (the first publish, a first version, a CLI publish) or a dead version.
 #[must_use]
 pub fn file_version_probe(node: Node) -> Option<FileVersionProbe> {
     let weak = lock(&VERSIONS).get(&node.file_index()).cloned()?;

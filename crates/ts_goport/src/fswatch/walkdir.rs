@@ -5,8 +5,8 @@
 //! and fanotify on Linux, kqueue on darwin and the BSDs. Go's Windows walk
 //! (walkdir_windows.go, FindFirstFile) is not ported: the Windows backend
 //! does not walk, and only walkdir_test.go calls it there.
-//! `os.Lstat` and `os.ReadDir` are `std::fs`; their error text is the Rust
-//! text (Go prints `lstat <path>: <errno text>`).
+//! `os.Lstat` and `os.ReadDir` are `std::fs`, with Go's error texts
+//! (`path_error`).
 
 use crate::fswatch::prelude::*;
 
@@ -85,7 +85,8 @@ pub fn walk_dir_generic_visit(
     Ok(())
 }
 
-// PORT: Go `*fs.PathError` (`op path: err`) for a `std::io::Error`.
+// PORT: Go `*fs.PathError` (`op path: err`) for a `std::io::Error`, with
+// the Go text of its errno.
 pub(crate) fn path_error(op: &str, path: &str, err: &std::io::Error) -> GoError {
-    errors::new(format!("{op} {path}: {err}"))
+    errors::new(format!("{op} {path}: {}", syscall::io_error_text(err)))
 }

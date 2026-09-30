@@ -42,7 +42,9 @@ CO=$(cd -- "$here/../.." && pwd)
 P=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")/target/project-inputs
 QEMU=${QEMU:-qemu-aarch64}
 SYSROOT=${XTEST_SYSROOT:-/usr/aarch64-linux-gnu}
-JEMALLOC_CONF="narenas:4,thp:always,metadata_thp:always"
+# The JEMALLOC_CONF line of bin/tsgo.rs (the value tsgo sets when it execs itself), as build-release.sh reads it.
+JEMALLOC_CONF=$(sed -n 's/^const JEMALLOC_CONF: &str = "\([^"]*\)";$/\1/p' "$CO/crates/ts_goport/src/bin/tsgo.rs" | head -1)
+[[ -n $JEMALLOC_CONF ]] || { echo "xtest-arm64.sh: no JEMALLOC_CONF line in bin/tsgo.rs" >&2; echo "FAIL rc=2"; exit 2; }
 DEFAULT_TESTS=(
   "fswatch_linux:"
   "go_baselines:units_platform::fswatch"

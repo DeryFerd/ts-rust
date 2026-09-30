@@ -2,11 +2,12 @@
 //! internal/api/transport_unix.go before tsgo#4712).
 //!
 //! PORT: Go `net.Listen("unix", path)` and `net.UnixConn` are
-//! `std::os::unix::net`. Error texts are the `std::io::Error` texts, not the
-//! Go `*net.OpError` texts.
+//! `std::os::unix::net`. Errors are Go's `*net.OpError` texts ("op unix
+//! addr: syscall: errno text").
 
 use crate::ipc::prelude::*;
 
+use crate::fswatch::syscall::io_error_text;
 use crate::gostd::{GoError, errors};
 use crate::ipc::transport::{NetListener, ReadWriteCloser};
 use std::net::Shutdown;
@@ -26,7 +27,20 @@ pub fn new_pipe_listener(path: &str) -> Result<Box<dyn NetListener>, GoError> {
             listener: Mutex::new(Some(listener)),
             path: path.to_string(),
         })),
-        Err(err) => Err(errors::new(format!("listen unix {path}: {err}"))),
+        // Go: net/sock_posix.go listenStream, `os.NewSyscallError("bind",
+        // err)`, in `&OpError{Op: "listen", Net: "unix", Addr: laddr}`.
+        // PORT: std checks the name length before the socket call and
+        // fails with no errno, where Go's `syscall.Bind` gives EINVAL. A
+        // `socket` or `listen` failure also prints "bind" here.
+        Err(err) => {
+            let text = match err.raw_os_error() {
+                None if err.kind() == std::io::ErrorKind::InvalidInput => {
+                    "invalid argument".to_string()
+                }
+                _ => io_error_text(&err),
+            };
+            Err(errors::new(format!("listen unix {path}: bind: {text}")))
+        }
     }
 }
 
@@ -62,6 +76,13 @@ fn path_join(dir: &str, name: &str) -> String {
     crate::frontend::vfs::filepath_clean(&buf)
 }
 
+// Go: internal/poll/sock_cloexec.go (accept4) and sys_cloexec.go (accept),
+// the `errcall` of an accept error.
+#[cfg(not(target_vendor = "apple"))]
+const ACCEPT_CALL: &str = "accept4";
+#[cfg(target_vendor = "apple")]
+const ACCEPT_CALL: &str = "accept";
+
 /// Go `*net.UnixListener` from `net.Listen("unix", path)`.
 /// PORT: the listener sits in a mutex so `close` can drop it through `&self`.
 struct UnixPipeListener {
@@ -82,9 +103,15 @@ impl NetListener for UnixPipeListener {
                 self.path
             )));
         };
+        // Go: net/fd_unix.go accept, `wrapSyscallError(errcall, err)`: std
+        // and Go call accept4 on Linux and the BSDs, accept on darwin.
         match listener.accept() {
             Ok((stream, _)) => Ok(Arc::new(UnixConn { stream })),
-            Err(err) => Err(errors::new(format!("accept unix {}: {err}", self.path))),
+            Err(err) => Err(errors::new(format!(
+                "accept unix {}: {ACCEPT_CALL}: {}",
+                self.path,
+                io_error_text(&err)
+            ))),
         }
     }
 
@@ -136,9 +163,11 @@ impl ReadWriteCloser for UnixConn {
 
     // PORT: Go closes the file descriptor. The stream is shared, so the port
     // shuts both directions down; the descriptor closes with the last owner.
+    // Go's error is "close unix <laddr>-><raddr>: <err>". The port's text
+    // has no addresses; callers ignore it.
     fn close(&self) -> Result<(), GoError> {
         self.stream
             .shutdown(Shutdown::Both)
-            .map_err(|err| errors::new(format!("close unix: {err}")))
+            .map_err(|err| errors::new(format!("close unix: {}", io_error_text(&err))))
     }
 }

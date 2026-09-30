@@ -54,7 +54,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// Same as `goport.rs` `JEMALLOC_CONF`. `scripts/build-release.sh` reads it
 /// from this line for its BOLT runs.
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
-const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
+const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false";
 
 /// Set in a worker (see `launch`): the number of its end of the pipe that
 /// takes the exit code.
