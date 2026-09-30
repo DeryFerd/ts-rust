@@ -313,11 +313,8 @@ impl Watcher {
             self.config_file_paths = config_file_paths;
         }
 
-        if !self
-            .sys
-            .get_environment_variable("TS_WATCH_DEBUG")
-            .is_empty()
-        {
+        let (value, _) = self.sys.get_environment_variable("TS_WATCH_DEBUG");
+        if !value.is_empty() {
             self.wm.borrow_mut().debug_log = Some(self.sys.writer());
         }
 
@@ -456,7 +453,7 @@ impl Watcher {
         }
 
         // Re-resolve in case newly added dirs don't exist
-        self.wm.borrow().resolve_desired_dirs(coverage.dirs())
+        self.wm.borrow().resolve_desired_dirs(&coverage.dirs())
     }
 
     // Go: execute/watcher.go:201 (*Watcher).reconcileWatches
@@ -897,7 +894,8 @@ impl Watcher {
         // PORT: `reuse_program` is Go `Program.ReuseProgram` (tsgo#4399, the
         // program part). The Rust frontend program has no checker pool, so
         // Go's `createCheckerPool` argument (nil here) is dropped, as in
-        // `update_program`.
+        // `update_program`. Go also passes a nil `createModuleResolver`
+        // (ts#64299), so the program keeps its own resolver.
         let (new_program, _, reused) = old_program.reuse_program(changed_path, host.clone());
         if reused {
             let np = Rc::new(new_program.expect("ReuseProgram returns the reused program"));
@@ -1015,12 +1013,10 @@ impl Watcher {
             if mapper.package_directory.is_empty() || !mapper.contribution_id.is_empty() {
                 continue;
             }
-            if changed_paths.contains_key(
-                &self
-                    .sys
-                    .fs()
-                    .realpath(&combine_paths(&mapper.package_directory, &["package.json"])),
-            ) {
+            // ts#63936: `package_directory` is already a real path.
+            if changed_paths
+                .contains_key(&combine_paths(&mapper.package_directory, &["package.json"]))
+            {
                 return true;
             }
         }

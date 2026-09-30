@@ -33,9 +33,9 @@ use std::time::SystemTime;
 // PORT: concurrency. `ParsedCommandLine` and the frontend program are not
 // `Send`, so tasks are `Rc<RefCell<BuildTask>>` and run on one thread, the
 // orchestrator thread. It is the loading thread of every program of the
-// build. Go `done` and `reportDone` channels, `prevReporter`, and the
-// mutexes are dropped. `buildProject` is split where `compileAndEmit` has
-// made the program (`build_project_start`) and the rest
+// build. Go `done` and `built` channels and the mutexes are dropped.
+// `buildProject` is split where `compileAndEmit` has made the program
+// (`build_project_start`) and the rest
 // (`build_project_finish`). The orchestrator starts a task after its
 // upstream tasks are done, finishes it later, and calls `report` in
 // `order` (see orchestrator.rs). The work that Go does on the task
@@ -91,11 +91,13 @@ pub struct BuildInfoEntry {
 pub type TaskDiagnosticReporter = Box<dyn Fn(&mut String, &Diagnostic)>;
 
 // Go: build/buildtask.go:44 taskResult
-// PORT: Go `program *incremental.Program` is `program` (`None` = nil). The
-// task keeps it until it reports, for `Testing.OnProgram`, and the
-// orchestrator releases it there (`release_task_program`), where Go drops
-// `t.result`. `has_changed_dts_file` is its `HasChangedDtsFile()` after the
-// emit, which `updateDownstream` reads. Go `*tsc.Statistics` is an `Option`
+// PORT: Go `program *incremental.Program` is `program` (`None` = nil). In
+// tests the task keeps it until it reports, for `Testing.OnProgram`, and
+// the orchestrator releases it there (`release_task_program`), where Go
+// drops `t.result`. Outside tests the orchestrator releases it when the
+// task is built, where Go sets it to nil (ts#64220).
+// `has_changed_dts_file` is its `HasChangedDtsFile()` after the emit,
+// which `updateDownstream` reads. Go `*tsc.Statistics` is an `Option`
 // (nil = `None`).
 pub struct TaskResult {
     pub builder: String,
@@ -130,7 +132,8 @@ impl TaskResult {
     }
 }
 
-/// Go drops `t.result` after `report`, and with it the task's program.
+/// Go drops the task's program when the task is built (outside tests) or
+/// `t.result` after `report`.
 /// This frees the checker pool and the frontend of the program. Its files
 /// stay published, so the diagnostics in `t.errors` can still be written.
 // PORT: Go frees the program in the background GC. The checker threads
@@ -323,17 +326,19 @@ impl BuildTask {
         (result.diagnostic_reporter)(&mut result.builder, &err);
     }
 
-    // Go: build/buildtask.go:120 (*BuildTask).report
-    // PORT: Go writes the buffered output to `Sys.Writer()` and merges into
-    // the orchestrator's `orchestratorResult`. That type belongs to the
+    // Go: build/buildtask.go:119 (*BuildTask).report
+    // PORT: the orchestrator calls it in `order` when the task is built
+    // (ts#64220: Go no longer waits for the previous task here). Go writes
+    // the buffered output to `Sys.Writer()` and merges into the
+    // orchestrator's `OrchestratorResult` (ts#64158). That type belongs to the
     // orchestrator, so this takes the task result and errors and returns
     // them; the orchestrator must, in build order:
-    //   - append `errors` to `buildResult.errors` when not empty,
+    //   - append `errors` to `buildResult.Errors` when not empty,
     //   - write `result.builder` to the writer,
-    //   - raise `buildResult.result.Status` to `result.exit_status` if higher,
-    //   - aggregate `result.statistics` into `buildResult.statistics` when set,
+    //   - raise `buildResult.Result.Status` to `result.exit_status` if higher,
+    //   - aggregate `result.statistics` into `buildResult.Statistics` when set,
     //   - count `result.build_kind` (ProjectsBuilt / TimestampUpdates),
-    //   - append `result.files_to_delete` to `buildResult.filesToDelete`.
+    //   - append `result.files_to_delete` to `buildResult.FilesToDelete`.
     pub fn report(&mut self) -> (TaskResult, Vec<Diagnostic>) {
         let result = self.result.take().expect("task result is set");
         (result, self.errors.clone())
@@ -1103,7 +1108,10 @@ impl BuildTask {
                 if seen_roots.contains(&input_path) || resolved_roots.contains(&input_path) {
                     continue;
                 }
-                if is_content_mapper_supplemental_build_info_path(&input_path, reader.roots()) {
+                // ts#63936: a supplemental file that exists is an input like any other.
+                if is_content_mapper_supplemental_build_info_path(&input_path, reader.roots())
+                    && !orchestrator.fs().file_exists(&input_file)
+                {
                     continue;
                 }
                 let input_time = orchestrator.get_m_time(&input_file);

@@ -550,33 +550,41 @@ impl WatchManagerShared {
 /// answering coverage queries efficiently. A directory is "covered" when it is
 /// already present in the set, or when it is contained within a recursive watch
 /// directory already in the set.
+// PORT: `names` maps each canonical key to the spelling first registered
+// for it (ts#64210).
 pub struct DirWatchSet {
     opts: tspath::ComparePathsOptions,
     dirs: FxHashMap<String, bool>,
+    names: FxHashMap<String, String>,
 }
 
-// Go: watchmanager.go:300 NewDirWatchSet
+// Go: watchmanager.go:301 NewDirWatchSet
 pub fn new_dir_watch_set(opts: tspath::ComparePathsOptions) -> DirWatchSet {
     DirWatchSet {
         opts,
         dirs: FxHashMap::default(),
+        names: FxHashMap::default(),
     }
 }
 
 impl DirWatchSet {
-    // Go: watchmanager.go:307 DirWatchSet.canonical
+    // Go: watchmanager.go:309 DirWatchSet.canonical
     fn canonical(&self, dir: &str) -> String {
         tspath::get_canonical_file_name(dir, self.opts.use_case_sensitive_file_names)
     }
 
-    // Go: watchmanager.go:311 DirWatchSet.Set
+    // Go: watchmanager.go:313 DirWatchSet.Set (ts#64210)
     pub fn set(&mut self, dir: &str, recursive: bool) {
+        let original = dir;
         let dir = self.canonical(dir);
+        if !self.names.contains_key(&dir) {
+            self.names.insert(dir.clone(), original.to_string());
+        }
         let entry = self.dirs.entry(dir).or_insert(false);
         *entry = *entry || recursive;
     }
 
-    // Go: watchmanager.go:316 DirWatchSet.Covered
+    // Go: watchmanager.go:322 DirWatchSet.Covered
     pub fn covered(&self, dir: &str) -> bool {
         let mut dir = self.canonical(dir);
         if self.dirs.contains_key(&dir) {
@@ -592,9 +600,16 @@ impl DirWatchSet {
         false
     }
 
-    // Go: watchmanager.go:331 DirWatchSet.Dirs
-    pub fn dirs(&self) -> &FxHashMap<String, bool> {
-        &self.dirs
+    // Go: watchmanager.go:337 DirWatchSet.Dirs (ts#64210)
+    // PORT: Go ranges over a map; the result is a map, so the order does
+    // not matter.
+    pub fn dirs(&self) -> FxHashMap<String, bool> {
+        let mut dirs: FxHashMap<String, bool> =
+            FxHashMap::with_capacity_and_hasher(self.dirs.len(), Default::default());
+        for (key, recursive) in &self.dirs {
+            dirs.insert(self.names[key].clone(), *recursive);
+        }
+        dirs
     }
 }
 

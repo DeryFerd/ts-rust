@@ -236,7 +236,7 @@ pub fn tsc_build_compilation(
         command: Rc::new(build_command),
         testing,
     }));
-    orchestrator.start(ctx)
+    orchestrator.start_exported(ctx)
 }
 
 // Go: execute/tsc.go:121 tscCompilation
@@ -545,6 +545,8 @@ fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) ->
         single_threaded: Tristate::Unknown,
         typings_location: String::new(),
         project_name: String::new(),
+        // ts#64024: Go leaves `SkipModuleResolution` false here.
+        skip_module_resolution: false,
     }
 }
 
@@ -558,7 +560,7 @@ fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) ->
 // has the same rows as Go. Without the incremental program there is no
 // `testing.OnProgram` (only a bin replaces it, and bins pass no testing).
 // PORT: perf. The incremental program sends its check, and when it can,
-// the second global diagnostics read and the emit, before
+// the emit, before
 // `EmitAndReportStatistics` (`Program::start_check_and_emit`). Each checker
 // then emits when its own check ends. `EmitAndReportStatistics` makes the
 // same calls as in Go and waits for that work. Its check time is the time
