@@ -2245,10 +2245,6 @@ impl Fs for WorkerFs {
         self.fs.stat(path)
     }
 
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        self.fs.walk_dir(root, walk_fn)
-    }
-
     fn realpath(&self, path: &str) -> String {
         cached_stat(&self.stats.realpath, path, || self.fs.realpath(path))
     }

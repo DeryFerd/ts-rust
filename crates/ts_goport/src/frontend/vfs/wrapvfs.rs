@@ -19,7 +19,6 @@ pub struct Replacements {
     pub directory_exists: Option<Box<dyn Fn(&str) -> bool>>,
     pub get_accessible_entries: Option<Box<dyn Fn(&str) -> Entries>>,
     pub stat: Option<Box<dyn Fn(&str) -> Option<FileInfo>>>,
-    pub walk_dir: Option<Box<dyn Fn(&str, &mut WalkDirFunc<'_>) -> Result<(), FsError>>>,
     pub realpath: Option<Box<dyn Fn(&str) -> String>>,
 }
 
@@ -129,15 +128,6 @@ impl Fs for WrappedFs {
             return f(path);
         }
         self.fs.stat(path)
-    }
-
-    // Go: wrapvfs.go:117 WalkDir
-    // WalkDir implements [vfs.FS].
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        if let Some(f) = &self.replacements.walk_dir {
-            return f(root, walk_fn);
-        }
-        self.fs.walk_dir(root, walk_fn)
     }
 
     // Go: wrapvfs.go:125 Realpath

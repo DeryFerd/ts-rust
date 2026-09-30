@@ -949,11 +949,6 @@ impl Fs for ProjectReferenceDtsFakingVfs {
         panic!("should not be called by resolver")
     }
 
-    // Go: projectreferencedtsfakinghost.go:118 (*projectReferenceDtsFakingVfs).WalkDir
-    fn walk_dir(&self, _root: &str, _walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        panic!("should not be called by resolver")
-    }
-
     // Go: projectreferencedtsfakinghost.go:123 (*projectReferenceDtsFakingVfs).Realpath
     fn realpath(&self, path: &str) -> String {
         if let Some(result) = self
