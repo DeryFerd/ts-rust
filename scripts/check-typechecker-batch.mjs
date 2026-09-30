@@ -22,6 +22,10 @@ export const GOPORT_BASELINE_SHA256 = "d1b90114690033ea0d3450182b7340c7f87df27d7
 // Unit test suites of the kept legacy crates. A name map may remove their tests when goport's Go
 // port replaces a crate (legacy removal stages 5 and 6); other removals need a Go pin change.
 const KEPT_CRATE_SUITE = /^ts_(scanner|ast|diagnostics|path|core|jsnum)_lib$/;
+// The only suite whose "ignored" names a removal line may keep (stale Go reference files; compare-tests.py).
+const STALE_REFERENCE_SUITE = "go_baselines_reference";
+// The wire of every API rebase run (api_oracle.py check --wire 3, its only wire; bump C reviewer ruling 1 item 1).
+const API_REBASE_WIRE = 3;
 // R132 is the last revision under the legacy cargo roster (rule goport-protected-set). It was opened
 // in batch port-18 under the legacy rules before stage 1 merged. A later revision needs protectedSet
 // "goport": the legacy check, and with it the roster carry-forward, is only for revisions up to this one.
@@ -389,8 +393,9 @@ function testSuites(results, label) {
 // moves or removes a name needs the old name gone from the new results, and a new name that is
 // not a base name (so a map cannot swap a lost name for a passing one). A removal needs a Go
 // pin change (pinChanged: the base batch pin differs from batch.upstreamPin.to), or a kept-crate suite.
-// A removal line may keep its old name in the new results only when that name is "ignored" there (a stale
-// Go file that no Go test at the new pin writes; bump C reviewer ruling 1 item 5): removedIgnored lists it.
+// A removal line may keep its old name in the new results only when it is a go_baselines_reference name that
+// is "ignored" there (a stale Go reference file that no Go test at the new pin writes; bump C reviewer ruling 1
+// item 5): removedIgnored lists it.
 function compareTests(baseResults, newResults, map, pinChanged) {
   const before = testSuites(baseResults, "Base goport results"), after = testSuites(newResults, "goportTests results");
   requireValue(newResults.incomplete === undefined || (Array.isArray(newResults.incomplete) && newResults.incomplete.every(text)),
@@ -401,7 +406,7 @@ function compareTests(baseResults, newResults, map, pinChanged) {
   for (const [id, { line, to, evidence }] of map ?? []) {
     const [suite, name] = JSON.parse(id);
     if (to && to[0] === suite && to[1] === name) continue;
-    const ignored = !to && has(after, suite, name) && after[suite][name] === "ignored";
+    const ignored = !to && suite === STALE_REFERENCE_SUITE && has(after, suite, name) && after[suite][name] === "ignored";
     if (ignored) removedIgnored.push({ suite, name, evidence });
     requireValue(ignored || !has(after, suite, name), `Name map line ${line}: ${suite} ${name} is still in the new results.`);
     requireValue(!to || !has(before, ...to), `Name map line ${line}: the new name ${to?.[0]} ${to?.[1]} is a base name.`);
@@ -546,9 +551,9 @@ function answerKeys(list) {
 }
 
 // batch.oracleRebase.<kind> (reviewer ruling 10) {runs [{label, dir, resultsSha256}], binsSha256,
-// oracleSha256, knownDiffs? [{key, reason}] (API only)}: runs of the base batch's bins (binsSha256, the
-// tsgo sha256 of its gate manifest) with the oracle of the batch pin (oracleSha256,
-// upstreamPin.oracleSha256). Returns the runs, the base of the compare.
+// oracleSha256, knownDiffs? [{key, reason}] (API only), wire and toolSha256 (API only)}: runs of the base
+// batch's bins (binsSha256, the tsgo sha256 of its gate manifest) with the oracle of the batch pin
+// (oracleSha256, upstreamPin.oracleSha256). Returns the runs, the base of the compare.
 function rebaseRuns(kind, entry, tsgo, oracle) {
   const field = `batch.oracleRebase.${kind}`;
   requireValue(Array.isArray(entry?.runs) && entry.runs.length > 0
@@ -560,7 +565,24 @@ function rebaseRuns(kind, entry, tsgo, oracle) {
   const known = entry.knownDiffs ?? [];
   requireValue(Array.isArray(known) && known.every(diff => text(diff?.key) && text(diff.reason)) && new Set(known.map(diff => diff.key)).size === known.length
     && (kind === "api" || known.length === 0), `${field}.knownDiffs must list each {key, reason} once${kind === "lsp" ? "; the LSP has none" : ""}.`);
+  if (kind === "api") {
+    requireValue(entry.wire === API_REBASE_WIRE && HASH.test(entry.toolSha256),
+      `${field} needs "wire": ${API_REBASE_WIRE} and toolSha256, the api_oracle.py sha256 of its runs (bump C ruling 1 item 1).`);
+  }
   return entry.runs;
+}
+
+// batch.oracleRebase.api (bump C reviewer ruling 1 item 1): the base bins speak an older API protocol, so each run
+// is `api_oracle.py check --wire 3` with one API tool. Every battery of each run's manifest.json must have that
+// wire and toolSha256 as its scriptSha.
+function checkRebaseWire(entry, readEvidence) {
+  for (const run of entry.runs) {
+    const manifest = readEvidence({ path: join(run.dir, "manifest.json") }, { pinned: false });
+    const batteries = Object.entries(manifest?.batteries ?? {});
+    const other = batteries.filter(([, record]) => record?.wire !== entry.wire || record.scriptSha !== entry.toolSha256).map(([name]) => name);
+    requireValue(batteries.length > 0 && other.length === 0,
+      `batch.oracleRebase.api: rebase run ${run.label} (${run.dir}) has batteries without "wire": ${entry.wire} or api_oracle.py ${entry.toolSha256}${other.length ? `: ${other.join(", ")}` : ""}.`);
+  }
 }
 
 // The external tools of the goport check. Tests may replace them.
@@ -863,6 +885,7 @@ function checkGoport(state, rule, readEvidence, tools) {
     const tsgo = baseGate.binaries?.tsgo?.sha256, oracle = batch.upstreamPin?.oracleSha256;
     requireValue(HASH.test(tsgo) && HASH.test(oracle), "batch.oracleRebase needs the tsgo sha256 of the base gate manifest and upstreamPin.oracleSha256.");
     [lspRuns, apiRuns] = [rebaseRuns("lsp", rebase.lsp, tsgo, oracle), rebaseRuns("api", rebase.api, tsgo, oracle)];
+    checkRebaseWire(rebase.api, readEvidence);
   }
   const lsp = checkOracle("languageServerOracle", "lsp", batch.languageServerOracle, lspRuns, ofKind("lsp"), rebase?.lsp ?? null, pin,
     tools, readEvidence, reasons);
@@ -1046,9 +1069,10 @@ tree, Cargo.toml and Cargo.lock), as candidate.sh reuses it by that key.
 - nameMap {path, sha256}: a TSV of oldSuite, oldName, newSuite, newName and a
   non-empty evidence cell, for pin bumps and moved tests. A mapped old name
   must be gone from the new results, and a new name must not be a base name.
-  A removal line may keep an old name that is "ignored" in the new results (a
-  stale Go file that no Go test at the new pin writes); nameMapRemovedIgnored
-  lists those lines with their evidence for the reviewer.
+  A removal line may keep a go_baselines_reference old name that is "ignored"
+  in the new results (a stale Go reference file that no Go test at the new pin
+  writes); nameMapRemovedIgnored lists those lines with their evidence for the
+  reviewer. An ignored name of another suite is still in the new results.
   "-" "-" removes a name: only when the base pin and batch.upstreamPin.to
   differ (the pins in the results files do not count), or for a kept-crate
   suite (ts_scanner, ts_ast, ts_diagnostics, ts_path, ts_core, ts_jsnum). The
@@ -1121,7 +1145,10 @@ tree, Cargo.toml and Cargo.lock), as candidate.sh reuses it by that key.
   pin, which replace the base batch's runs as the oracle base. Only a
   pin-bump batch (the base batch pin differs from upstreamPin.to) can have it.
   binsSha256 must be the tsgo sha256 of the base batch's gate manifest and
-  oracleSha256 upstreamPin.oracleSha256. The check runs oracle-compare.py
+  oracleSha256 upstreamPin.oracleSha256. The api entry also has "wire": 3
+  and toolSha256 (bump C reviewer ruling 1 item 1): every battery of each
+  run's manifest.json must have that wire and that api_oracle.py sha256 as
+  its scriptSha (scripts/goport/oracle-rebase.sh writes the fragment). The check runs oracle-compare.py
   with every run as a base (protected in any run), --identity and --parity
   with the known diff keys: each run must have its resultsSha256, binsSha256
   as its only tsgo and oracleSha256 as its only oracle, and the new run that

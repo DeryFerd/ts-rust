@@ -1338,22 +1338,26 @@ test("a removal needs a Go pin change or a kept-crate suite, and is listed for t
   assert.equal(result.verdict, "PASS", result.reasons.join(" "));
   assert.equal(result.counts.goportTests.removedByMap, 1);
   assert.deepEqual(result.nameMapRemoved, [{ suite: "go_baselines", name: "b::one", evidence: "removed at 16c25522e123: go/testdata/x.ts deleted" }]);
-  // A removal line may keep an old name that is ignored in the new results (bump C ruling 1 item 5), not an ok or
-  // failed one.
-  for (const [status, pass] of [["ignored", true], ["ok", false], ["failed", false]]) {
+  // A removal line may keep a go_baselines_reference name that is ignored in the new results (bump C ruling 1
+  // item 5), not an ok or failed one, and not an ignored name of another suite (a libtest #[ignore]).
+  const REF = "tsc/commandLine/adds-color.js";
+  for (const [suite, name, status, pass] of [["go_baselines_reference", REF, "ignored", true], ["go_baselines_reference", REF, "ok", false],
+    ["go_baselines_reference", REF, "failed", false], ["go_baselines", "b::one", "ignored", false]]) {
     f = goportFixture();
-    f.results.suites.go_baselines["b::one"] = status;
+    f.files[BASELINE_PATH].value.suites.go_baselines_reference = { [REF]: "ok" };
+    f.results.suites.go_baselines_reference = { [REF]: "ok" };
+    f.results.suites[suite][name] = status;
     f.results.pin = NEW_PIN;
     f.gateNew.upstreamPin = NEW_PIN;
     f.state.batch.upstreamPin = { from: GO_PIN, to: NEW_PIN };
-    withMap(f, "go_baselines\tb::one\t-\t-\tGo test removed at 16c25522e123, its baseline file left behind\n");
+    withMap(f, `${suite}\t${name}\t-\t-\tGo test removed at 16c25522e123, its baseline file left behind\n`);
     if (pass) {
       result = check(f);
       assert.equal(result.verdict, "PASS", result.reasons.join(" "));
       assert.deepEqual([result.counts.goportTests.removedByMap, result.counts.goportTests.removedIgnored], [1, 1]);
-      assert.deepEqual(result.nameMapRemovedIgnored.map(r => r.name), ["b::one"]);
+      assert.deepEqual(result.nameMapRemovedIgnored.map(r => r.name), [REF]);
     } else {
-      stopped(f, /Name map line 1: go_baselines b::one is still in the new results/);
+      stopped(f, new RegExp(`Name map line 1: ${suite} ${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} is still in the new results`));
     }
   }
   f = goportFixture();
@@ -1483,7 +1487,7 @@ test("goport unbound history rows come from the standing rule list, never the cu
 
 // Oracle answer sets and rebase runs (reviewer ruling 10, r139-diag/reviewer-ruling.md). GOLDEN_A and GOLDEN_B
 // are the oracles of GO_PIN and NEW_PIN; BASE_TSGO is the tsgo of the base batch's gate (batch-0).
-const [GOLDEN_A, GOLDEN_B, BASE_TSGO] = ["a1".repeat(32), "b2".repeat(32), "b".repeat(64)];
+const [GOLDEN_A, GOLDEN_B, BASE_TSGO, API_TOOL] = ["a1".repeat(32), "b2".repeat(32), "b".repeat(64), "c3".repeat(32)];
 
 // An answer set file (goport-oracle-answers/1) in dir, named in the fixture by its absolute path: each request key
 // gets its Go answers, each from one Go golden at the set's oracle. The answers are JSON objects with one key, so
@@ -1605,10 +1609,11 @@ function withRebase(f, { lsp = [["same", "flaky_oracle", "not_run"]], knownDiffs
     return { label: basename(dir), dir };
   });
   f.oracle["api/api-r131-atB"] = [trace("qc", "a1", ["same", "goport_error"])];
-  f.put("api/api-r131-atB/manifest.json", "0", { batteries: { qc: { goportSha: BASE_TSGO, oracleSha: GOLDEN_B, traces: 1 } } });
+  f.put("api/api-r131-atB/manifest.json", "0", { batteries: { qc: { goportSha: BASE_TSGO, oracleSha: GOLDEN_B, traces: 1, wire: 3, scriptSha: API_TOOL } } });
   f.state.batch.oracleRebase = {
     lsp: { runs: lspRuns, binsSha256: BASE_TSGO, oracleSha256: GOLDEN_B },
-    api: { runs: [{ label: "api-r131-atB", dir: "api/api-r131-atB" }], binsSha256: BASE_TSGO, oracleSha256: GOLDEN_B, knownDiffs } };
+    api: { runs: [{ label: "api-r131-atB", dir: "api/api-r131-atB" }], binsSha256: BASE_TSGO, oracleSha256: GOLDEN_B, wire: 3, toolSha256: API_TOOL,
+      knownDiffs } };
   f.state.batch.oracleAnswers = answers;
   resultsShas(f);
 }
@@ -1652,6 +1657,13 @@ test("the oracle base of a pin bump is the base bins measured again at the new p
     [g => { g.files["api/api-r131-atB/manifest.json"].value.batteries.qc.oracleSha = GOLDEN_A; resultsShas(g); }, /rebase run api-r131-atB used the oracle a1a1.*, not the batch pin's/],
     [g => { g.state.batch.oracleRebase.lsp.runs[0].resultsSha256 = "e".repeat(64); rebind(g); }, /rebase run lsp-r131-atB \(lsp\/lsp-r131-atB\) has resultsSha256 /],
     [g => { g.state.batch.oracleRebase.lsp.knownDiffs = [{ key: "b1/t1#1", reason: "r" }]; rebind(g); }, /knownDiffs must list each \{key, reason\} once; the LSP has none/],
+    // bump C ruling 1 item 1: the API rebase runs are --wire 3 runs of one API tool, and the entry says so.
+    [g => { delete g.state.batch.oracleRebase.api.wire; rebind(g); }, /batch.oracleRebase.api needs "wire": 3 and toolSha256, the api_oracle.py sha256 of its runs/],
+    [g => { g.state.batch.oracleRebase.api.toolSha256 = "c3"; rebind(g); }, /batch.oracleRebase.api needs "wire": 3 and toolSha256/],
+    [g => { delete g.files["api/api-r131-atB/manifest.json"].value.batteries.qc.wire; resultsShas(g); },
+      /rebase run api-r131-atB \(api\/api-r131-atB\) has batteries without "wire": 3 or api_oracle.py c3c3.*: qc/],
+    [g => { g.files["api/api-r131-atB/manifest.json"].value.batteries.qc.scriptSha = "d".repeat(64); resultsShas(g); },
+      /rebase run api-r131-atB .* has batteries without "wire": 3 or api_oracle.py c3c3.*: qc/],
     [g => { g.state.batch.auditor.oracleRebaseSha256 = null; }, /Verdict is not bound to this batch/],
     [g => { g.state.batch.languageServerOracle.bases = g.state.batch.languageServerOracle.bases.slice(0, 0); },
       /languageServerOracle needs its results dir and the base run lsp\/lsp-r131-atB/]]) {

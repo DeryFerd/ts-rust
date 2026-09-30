@@ -21,10 +21,12 @@ removedByMap and does not block. Blank lines, lines that start with # and a firs
 is "oldSuite" (a header) are skipped. Two base names may not map to one new name (exit 2). A map line
 that is not an identity is rejected (mapRejected, exit 1) when:
   - its old name is still in the new results (a moved or removed test leaves no copy behind), except a
-    removal line whose old name is "ignored" in the same suite of the new results: a stale Go file that
-    no Go test at the new pin writes, which the reference walk lists as ignored (bump C reviewer ruling 1
-    item 5). Such lines are counted on their own in mapRemovedIgnored, and the reviewer checks the Go
-    evidence of each. A removal line of a name that is ok or failed in the new results is rejected,
+    removal line of a go_baselines_reference name that is "ignored" in go_baselines_reference of the new
+    results: a stale Go reference file that no Go test at the new pin writes, which the reference walk
+    lists as ignored (bump C reviewer ruling 1 item 5). Such lines are counted on their own in
+    mapRemovedIgnored, and the reviewer checks the Go evidence of each. A removal line of a name that is
+    ok or failed in the new results, or of an ignored name of another suite (a libtest #[ignore]), is
+    rejected,
   - its new name is a base name (so a map cannot swap a lost name for a passing one, or chain), or
   - it removes a name, the Go pin did not change and the suite is not a kept-crate suite.
 The reviewer checks each entry against its evidence. check-typechecker-batch.mjs applies the same
@@ -52,6 +54,8 @@ LISTS = ('lost', 'absent', 'unrun')
 HEX_HASH = re.compile(r'[0-9a-fA-F]{7,64}')  # use fullmatch
 # Suites of the kept crates: stages 5 and 6 move or delete their tests without a Go pin change.
 KEPT_CRATE_SUITE = re.compile(r'^ts_(scanner|ast|diagnostics|path|core|jsnum)_lib$')
+# The only suite whose "ignored" names a removal line may keep (stale Go reference files, ruling 1 item 5).
+STALE_REFERENCE_SUITE = 'go_baselines_reference'
 
 
 def die(msg):
@@ -103,15 +107,15 @@ def same_hash(a, b):
 
 
 def rejected_map_lines(base, new, name_map):
-    """The map lines that could hide a lost name, as "line <n>: <reason>", and the removal lines of names that
-    are "ignored" in the new results, as "<suite>: <name>"."""
+    """The map lines that could hide a lost name, as "line <n>: <reason>", and the removal lines of
+    go_baselines_reference names that are "ignored" in the new results, as "<suite>: <name>"."""
     before, after = base['suites'], new['suites']
     pin_changed = not same_hash(base['pin'], new['pin'])  # load() checked that both pins are hashes
     out, ignored = [], []
     for (suite, name), (line, to) in sorted(name_map.items(), key=lambda e: e[1][0]):
         if to == (suite, name):
             continue
-        if to is None and after.get(suite, {}).get(name) == 'ignored':
+        if to is None and suite == STALE_REFERENCE_SUITE and after.get(suite, {}).get(name) == 'ignored':
             ignored.append(f'{suite}: {name}')
         elif name in after.get(suite, {}):
             out.append(f'line {line}: {suite} {name} is still in the new results')
