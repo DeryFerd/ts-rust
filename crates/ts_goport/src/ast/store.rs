@@ -243,9 +243,9 @@ pub struct StoreFacts {
     /// Some node slot has kind `ConditionalType` or `MappedType`.
     pub has_flow_constraint_kind: bool,
     /// U4 (CH7): some node slot has the parser flag
-    /// `POSSIBLY_CONTAINS_DEPRECATED_TAG`. The binder never adds that bit
-    /// (`BINDER_ADDED_FLAGS` in node.rs), and a frozen header does not
-    /// change, so without it no node of the store has the bit in Go
+    /// `POSSIBLY_CONTAINS_DEPRECATED_TAG`. The parse of a frozen store is
+    /// over, and the bind never adds that bit (`BINDER_ADDED_FLAGS` in
+    /// node.rs), so without it no node of the store has the bit in Go
     /// `node.Flags` (`frozen_store_lacks_deprecated_tag`).
     pub has_deprecated_tag: bool,
 }
@@ -462,11 +462,14 @@ impl SlotChildren {
 ///   of the other binder fields of the node in `FileNodeBind` (0 for none).
 ///
 /// Only the parse and the bind write a record. The bind writes after the
-/// publish, and changes only `flags`, the high half of `up` and `bind`, so
-/// `header` (parse fields only) never mixes an old and a new word. The
-/// bind of a file ends before any reader of its binder fields starts: the
-/// checker threads start after the bind, or get their work through a lock
-/// or a channel, which orders the writes before their reads.
+/// publish, and changes only `flags` (it ORs in the bits it adds), the high
+/// half of `up` and `bind`. `header` reads each word once and takes only
+/// the low half of `up` of a node slot (the bind never writes `up` of the
+/// nil slot or an alias slot), so it sees the parse fields and the flags
+/// from before or after the bind, never a mix of one word. The bind of a
+/// file ends before any reader of its binder fields starts: the checker
+/// threads start after the bind, or get their work through a lock or a
+/// channel, which orders the writes before their reads.
 // PORT: `kind` is a plain field. Safe Rust has no inline u16 to
 // `SyntaxKind` conversion (`SyntaxKind::try_from` is a 351-arm match in
 // goport_util, not inline), and the kind of a slot never changes after the

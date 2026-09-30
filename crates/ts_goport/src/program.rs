@@ -2711,16 +2711,20 @@ impl WorkerSeed {
     }
 }
 
-/// Runs `f` on a new thread that starts from this thread's state, as a
-/// checker, bind, emit or search thread does (`WorkerSeed`). Tests use it.
+/// Runs `f` on a new thread that starts from this thread's state and has
+/// the Go stack size, as a checker, bind, emit or search thread does
+/// (`WorkerSeed`). Tests use it.
 pub fn spawn_seeded_thread<R: Send + 'static>(
     f: impl FnOnce() -> R + Send + 'static,
 ) -> std::thread::JoinHandle<R> {
     let seed = WorkerSeed::take();
-    std::thread::spawn(move || {
-        seed.install();
-        f()
-    })
+    std::thread::Builder::new()
+        .stack_size(crate::gostd::stack::max_stack_size())
+        .spawn(move || {
+            seed.install();
+            f()
+        })
+        .expect("start a seeded thread")
 }
 
 // Go: compiler/checkerpool.go:40 newCheckerPoolWithTracing (the count)

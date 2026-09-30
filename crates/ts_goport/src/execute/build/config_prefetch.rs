@@ -15,7 +15,6 @@
 //! thread has started yet is the orchestrator's own: it matches the specs
 //! itself and queues the references it finds.
 //!
-//!
 //! Go caches the lookups of each match (`GetAccessibleEntries`,
 //! `Realpath`) in the build host's `cachedvfs` for the rest of the build,
 //! and a later program reads them: for example the listing of a typeRoots
@@ -161,8 +160,12 @@ impl ConfigPrefetch {
         for _ in 0..threads {
             let shared = shared.clone();
             // A thread that cannot start leaves its configs to the others.
+            // A config parse is recursive (nested JSON values, `extends`
+            // chains), so the thread gets the Go stack size, as a parse
+            // worker does.
             let spawned = std::thread::Builder::new()
                 .name("goport-config".to_string())
+                .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || run_config_thread(&shared));
             started += usize::from(spawned.is_ok());
         }
