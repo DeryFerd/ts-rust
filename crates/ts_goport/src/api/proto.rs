@@ -808,6 +808,25 @@ impl SnapshotRequestChangesParams {
         }
         Ok(true)
     }
+
+    /// The members of Go `SnapshotRequestChangesParams`, which the structs
+    /// that embed it marshal inline (Go embedded struct fields, every tag
+    /// `omitempty`).
+    fn marshal_members(&self, enc: &mut String, first: &mut bool) -> Result<(), JsonError> {
+        marshal_field_omitempty(enc, first, "openProjects", &self.open_projects)?;
+        marshal_field_omitempty(enc, first, "closeProjects", &self.close_projects)?;
+        marshal_field_omitempty(enc, first, "openFiles", &self.open_files)?;
+        marshal_field_omitempty(enc, first, "closeFiles", &self.close_files)?;
+        marshal_field_omitempty(enc, first, "createPrograms", &self.create_programs)?;
+        marshal_field_omitempty(
+            enc,
+            first,
+            "reconfigurePrograms",
+            &self.reconfigure_programs,
+        )?;
+        marshal_field_omitempty(enc, first, "removePrograms", &self.remove_programs)?;
+        marshal_field_omitempty(enc, first, "ensurePrograms", &self.ensure_programs)
+    }
 }
 
 impl UnmarshalerFrom for SnapshotRequestChangesParams {
@@ -844,7 +863,20 @@ impl UnmarshalerFrom for EnsurePrograms {
                 "ensurePrograms must be true or an array of project IDs",
             ));
         }
-        crate::frontend::json::json_unmarshal(&value, &mut self.projects)
+        crate::frontend::json::json_unmarshal(&value, &mut self.projects, &[])
+    }
+}
+
+// PORT: Go has no marshaler for `EnsurePrograms`, so it marshals by the v2
+// default struct rule: the untagged fields keep their Go names.
+impl MarshalerTo for EnsurePrograms {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "All", &self.all)?;
+        marshal_field(enc, &mut first, "Projects", &self.projects)?;
+        write_object_end(enc);
+        Ok(())
     }
 }
 
@@ -882,6 +914,100 @@ impl UnmarshalerFrom for CreateSnapshotParams {
     }
 }
 
+// PORT: the server only decodes the snapshot params, but a decoded payload
+// is a Go `any` (`AnyValue`), which marshals. The marshalers below follow
+// the v2 default struct rule, so they match Go reflection.
+impl MarshalerTo for CreateSnapshotParams {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        self.snapshot_request_changes_params
+            .marshal_members(enc, &mut first)?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "fileNotifications",
+            &self.file_notifications,
+        )?;
+        marshal_field_omitempty(enc, &mut first, "fileSystem", &self.file_system)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+// PORT: Go v2 default marshal of the `requestfilesystem` request structs
+// (`CreateSnapshotParams.FileSystem`). They live here with the other
+// params marshalers. Go map members come in random order; the port writes
+// them in sorted key order.
+impl MarshalerTo for requestfilesystem::Kind {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.as_ref().marshal_json_to(enc)
+    }
+}
+
+impl MarshalerTo for requestfilesystem::RequestDirectoryEntries {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "files", &self.files)?;
+        marshal_field(enc, &mut first, "directories", &self.directories)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+impl MarshalerTo for requestfilesystem::RequestSymlink {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "target", &self.target)?;
+        marshal_field_omitempty(enc, &mut first, "host", &self.host)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+impl MarshalerTo for requestfilesystem::RequestFileSystem {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "kind", &self.kind)?;
+        marshal_field(enc, &mut first, "files", &SortedMapJSON(&self.files))?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "directories",
+            &SortedMapJSON(&self.directories),
+        )?;
+        marshal_field_omitempty(enc, &mut first, "symlinks", &SortedMapJSON(&self.symlinks))?;
+        marshal_field_omitempty(enc, &mut first, "removedPaths", &self.removed_paths)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+/// Go v2 marshal of a `map[string]V` (a nil map writes `{}`), with the
+/// members in sorted key order.
+struct SortedMapJSON<'a, V>(&'a FxHashMap<String, V>);
+
+impl<V: MarshalerTo> MarshalerTo for SortedMapJSON<'_, V> {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        let mut entries: Vec<(&String, &V)> = self.0.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        enc.push('{');
+        for (i, (k, v)) in entries.into_iter().enumerate() {
+            if i > 0 {
+                enc.push(',');
+            }
+            k.marshal_json_to(enc)?;
+            enc.push(':');
+            v.marshal_json_to(enc)?;
+        }
+        enc.push('}');
+        Ok(())
+    }
+}
+
 // Go: proto.go CreateSnapshotProgramParams (ts#64204, ts#64324)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CreateSnapshotProgramParams {
@@ -911,6 +1037,23 @@ impl UnmarshalerFrom for CreateSnapshotProgramParams {
     }
 }
 
+impl MarshalerTo for CreateSnapshotProgramParams {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "rootFiles", &self.root_files)?;
+        marshal_field(
+            enc,
+            &mut first,
+            "compilerOptions",
+            &CompilerOptionsJSON(&self.compiler_options),
+        )?;
+        marshal_field_omitempty(enc, &mut first, "options", &self.options)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
 // Go: proto.go ReconfigureSnapshotProgramParams (ts#64204, ts#64319, ts#64324)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReconfigureSnapshotProgramParams {
@@ -936,6 +1079,24 @@ impl UnmarshalerFrom for ReconfigureSnapshotProgramParams {
         if !is_object {
             *self = ReconfigureSnapshotProgramParams::default();
         }
+        Ok(())
+    }
+}
+
+impl MarshalerTo for ReconfigureSnapshotProgramParams {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "id", &self.id)?;
+        marshal_field(enc, &mut first, "rootFiles", &self.root_files)?;
+        marshal_field(
+            enc,
+            &mut first,
+            "compilerOptions",
+            &CompilerOptionsJSON(&self.compiler_options),
+        )?;
+        marshal_field_omitempty(enc, &mut first, "options", &self.options)?;
+        write_object_end(enc);
         Ok(())
     }
 }
@@ -983,6 +1144,17 @@ impl UnmarshalerFrom for LanguageServerSnapshotChanges {
         if !is_object {
             *self = LanguageServerSnapshotChanges::default();
         }
+        Ok(())
+    }
+}
+
+impl MarshalerTo for LanguageServerSnapshotChanges {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        self.snapshot_request_changes_params
+            .marshal_members(enc, &mut first)?;
+        write_object_end(enc);
         Ok(())
     }
 }
@@ -1037,6 +1209,12 @@ impl UnmarshalerFrom for CreateProgramOptions {
     }
 }
 
+proto_json!(marshal CreateProgramOptions {
+    project_references: "projectReferences" omitempty,
+    config_file_parsing_diagnostics: "configFileParsingDiagnostics" omitempty,
+    module_resolver: "moduleResolver" omitempty,
+});
+
 // Go: proto.go ModuleResolutionFallback (ts#64299)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModuleResolutionFallback(pub Cow<'static, str>);
@@ -1054,6 +1232,12 @@ impl UnmarshalerFrom for ModuleResolutionFallback {
         json_ext::unmarshal_string_as(dec, &mut s, "api.ModuleResolutionFallback")?;
         self.0 = Cow::Owned(s);
         Ok(())
+    }
+}
+
+impl MarshalerTo for ModuleResolutionFallback {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.as_ref().marshal_json_to(enc)
     }
 }
 
@@ -1109,6 +1293,11 @@ impl UnmarshalerFrom for ModuleResolutionSpec {
     }
 }
 
+proto_json!(marshal ModuleResolutionSpec {
+    fallback: "fallback" plain,
+    entries: "entries" plain,
+});
+
 // Go: proto.go ModuleResolutionEntry (ts#64299)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModuleResolutionEntry {
@@ -1139,6 +1328,13 @@ impl UnmarshalerFrom for ModuleResolutionEntry {
     }
 }
 
+proto_json!(marshal ModuleResolutionEntry {
+    module_name: "moduleName" plain,
+    containing_directory: "containingDirectory" omitempty,
+    resolution_mode: "resolutionMode" omitempty,
+    result: "result" plain,
+});
+
 // Go: proto.go StaticModuleResolution (ts#64299)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StaticModuleResolution {
@@ -1164,6 +1360,12 @@ impl UnmarshalerFrom for StaticModuleResolution {
         Ok(())
     }
 }
+
+proto_json!(marshal StaticModuleResolution {
+    resolved_file_name: "resolvedFileName" omitempty,
+    original_path: "originalPath" omitempty,
+    package_id: "packageId" omitempty,
+});
 
 // Go: proto.go CreateModuleResolverParams (ts#64299)
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1192,6 +1394,33 @@ impl UnmarshalerFrom for CreateModuleResolverParams {
         if !is_object {
             *self = CreateModuleResolverParams::default();
         }
+        Ok(())
+    }
+}
+
+impl MarshalerTo for CreateModuleResolverParams {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(
+            enc,
+            &mut first,
+            "compilerOptions",
+            &CompilerOptionsJSON(&self.compiler_options),
+        )?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "moduleResolutions",
+            &self.module_resolutions,
+        )?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "resolveModuleNameCallback",
+            &self.resolve_module_name_callback,
+        )?;
+        write_object_end(enc);
         Ok(())
     }
 }
@@ -1242,6 +1471,15 @@ impl UnmarshalerFrom for ResolveModuleNameParams {
         Ok(())
     }
 }
+
+proto_json!(marshal ResolveModuleNameParams {
+    snapshot: "snapshot" omitempty,
+    in_progress_snapshot: "inProgressSnapshot" omitempty,
+    resolver: "resolver" plain,
+    module_name: "moduleName" plain,
+    containing_directory: "containingDirectory" plain,
+    resolution_mode: "resolutionMode" omitempty,
+});
 
 // Go: proto.go ResolveModuleNameCallbackParams (ts#64299)
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2407,6 +2645,71 @@ impl UnmarshalerFrom for CreateBuildOrchestratorParams {
         if !is_object {
             *self = CreateBuildOrchestratorParams::default();
         }
+        Ok(())
+    }
+}
+
+impl MarshalerTo for CreateBuildOrchestratorParams {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "rootNames", &self.root_names)?;
+        marshal_field_omitempty(enc, &mut first, "cwd", &self.cwd)?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "buildOptions",
+            &self.build_options.as_ref().map(BuildOptionsJSON),
+        )?;
+        marshal_field_omitempty(
+            enc,
+            &mut first,
+            "compilerOptions",
+            &self.compiler_options.as_ref().map(CompilerOptionsJSON),
+        )?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+/// Go v2 marshal of `core.BuildOptions` (by reflection: the tags `dry`,
+/// `force`, `verbose`, `builders`, `stopBuildOnErrors` and `clean`, each
+/// `omitzero`). A `Tristate` writes its legacy `MarshalJSON` text.
+struct BuildOptionsJSON<'a>(&'a crate::execute::build::BuildOptions);
+
+impl MarshalerTo for BuildOptionsJSON<'_> {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        // `TSUnknown` is the `Tristate` zero value.
+        fn tristate_omitzero(
+            enc: &mut String,
+            first: &mut bool,
+            name: &str,
+            value: Tristate,
+        ) -> Result<(), JsonError> {
+            if value == Tristate::Unknown {
+                return Ok(());
+            }
+            if !*first {
+                enc.push(',');
+            }
+            *first = false;
+            name.marshal_json_to(enc)?;
+            enc.push(':');
+            enc.push_str(
+                std::str::from_utf8(value.marshal_json()).expect("Tristate JSON is ASCII"),
+            );
+            Ok(())
+        }
+        let o = self.0;
+        write_object_start(enc);
+        let mut first = true;
+        tristate_omitzero(enc, &mut first, "dry", o.dry)?;
+        tristate_omitzero(enc, &mut first, "force", o.force)?;
+        tristate_omitzero(enc, &mut first, "verbose", o.verbose)?;
+        marshal_opt_field(enc, &mut first, "builders", &o.builders)?;
+        tristate_omitzero(enc, &mut first, "stopBuildOnErrors", o.stop_build_on_errors)?;
+        tristate_omitzero(enc, &mut first, "clean", o.clean)?;
+        write_object_end(enc);
         Ok(())
     }
 }

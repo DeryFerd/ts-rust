@@ -264,7 +264,7 @@ impl CallbackModuleResolver {
             return (None, Vec::new(), None);
         }
         let mut static_resolution = StaticModuleResolution::default();
-        if let Err(err) = json_unmarshal(&callback_result.0, &mut static_resolution) {
+        if let Err(err) = json_unmarshal(&callback_result.0, &mut static_resolution, &[]) {
             let err = errors::from_value(err);
             return (
                 None,
@@ -366,7 +366,8 @@ pub fn compile_module_resolution_spec(
             static_entry.resolution_mode = Some(mode);
         }
         static_entry.result =
-            static_module_resolution_to_resolved_module(Some(result), current_directory);
+            static_module_resolution_to_resolved_module(Some(result), current_directory)
+                .map(Arc::new);
         entries.push(static_entry);
     }
 
