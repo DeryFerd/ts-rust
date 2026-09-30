@@ -111,13 +111,10 @@ impl Checker {
 
     // Go: checker/exports.go:69 GetNameTypeOfSymbol
     pub fn get_name_type_of_symbol(&self, symbol: SymbolId) -> TypeId {
-        if !self.value_symbol_links.has(symbol) {
-            return TypeId::NIL;
+        if let Some(links) = self.value_symbol_links.try_get(symbol) {
+            return links.name_type;
         }
-        self.value_symbol_links
-            .try_get(symbol)
-            .expect("value symbol links exist")
-            .name_type
+        TypeId::NIL
     }
 
     // Go: checker/exports.go:76 IsTypeUsableAsPropertyName
