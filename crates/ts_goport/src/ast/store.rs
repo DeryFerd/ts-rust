@@ -88,6 +88,7 @@
 
 use crate::astdata::NodeData;
 use crate::frontend::parser::SourceFileParseOptions;
+use crate::leak_arena::LeakArena;
 use crate::prelude::*;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -5131,9 +5132,8 @@ thread_local! {
     /// pointer bump, not a malloc. The arena never drops, like the
     /// `Box::leak` it replaces. Synthetic nodes are not here: the synthetic
     /// arena (`ast/synthetic.rs`) owns them, so checker workers make no AST
-    /// arena.
-    static AST_ARENA: &'static bumpalo::Bump =
-        Box::leak(Box::new(bumpalo::Bump::with_capacity(1 << 20)));
+    /// arena. rss2: it grows in fixed-size chunks (`LeakArena`).
+    static AST_ARENA: &'static LeakArena = LeakArena::leak();
 }
 
 /// Moves `value` into this thread's leaked AST arena.
@@ -5141,7 +5141,7 @@ thread_local! {
 // `LocalKey::with`, so `value` is not copied through its closure.
 #[inline]
 pub(crate) fn leak_in_ast_arena<T>(value: T) -> &'static T {
-    let arena: &'static bumpalo::Bump = AST_ARENA.with(|a| *a);
+    let arena: &'static LeakArena = AST_ARENA.with(|a| *a);
     arena.alloc(value)
 }
 
@@ -5434,10 +5434,11 @@ impl PendingList {
     /// A pending list of store `file` over `nodes`, at `loc`. Makes the
     /// alias slots of the nodes in order, as `ts_list` does.
     fn new(file: usize, nodes: &[Node], loc: TextRange) -> Self {
-        let arena: &'static bumpalo::Bump = AST_ARENA.with(|a| *a);
+        let arena: &'static LeakArena = AST_ARENA.with(|a| *a);
         Self {
             range: ts_range(loc),
-            nodes: arena.alloc_slice_fill_iter(nodes.iter().map(|&n| store_child_id(file, n))),
+            nodes: arena
+                .alloc_slice_fill_iter(nodes.len(), nodes.iter().map(|&n| store_child_id(file, n))),
             has_trailing_comma: false,
         }
     }

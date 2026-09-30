@@ -6,6 +6,7 @@
 //! lib texts come from `crates/ts_goport/libs`, a copy of the pinned
 //! `internal/bundled/libs` (see its PROVENANCE.md).
 
+use super::{SNAPSHOT_TEXT_MIN, const_hash};
 use crate::frontend::prelude::*;
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -38,6 +39,23 @@ pub fn bundled_text(path: &str) -> Option<&'static str> {
 // Go: embed.go:25 IsBundled
 pub fn is_bundled(path: &str) -> bool {
     split_path(path).is_some()
+}
+
+/// The `const_hash` of `text`, computed at compile time, when `text` is the
+/// embedded text of a bundled lib of at least `SNAPSHOT_TEXT_MIN` bytes
+/// (the same pointer and length, as `bundled_text` returns it). The lib
+/// parse and bind snapshots check their keys with it.
+///
+/// PERF (rss2): the keys hashed the lib text at each load, and that read
+/// brought every page of lib.dom (2.3 MB of the binary) into the RSS of a
+/// program that uses it. With this hash a load reads no page of the text.
+// PORT: not in Go.
+#[must_use]
+pub fn embedded_text_hash(text: &str) -> Option<u64> {
+    EMBEDDED_CONTENTS
+        .iter()
+        .find(|&&(_, lib, hash)| hash != 0 && std::ptr::eq(lib, text))
+        .map(|&(_, _, hash)| hash)
 }
 
 /// The base name of bundled lib path `path` (`bundled:///libs/lib.dom.d.ts`
@@ -281,27 +299,45 @@ fn libs_entries() -> Vec<DirEntry> {
 // PORT: the Go map is built once from `EMBEDDED_CONTENTS`.
 fn embedded_contents(rest: &str) -> Option<&'static str> {
     static MAP: OnceLock<FxHashMap<&'static str, &'static str>> = OnceLock::new();
-    MAP.get_or_init(|| EMBEDDED_CONTENTS.iter().copied().collect())
-        .get(rest)
-        .copied()
+    MAP.get_or_init(|| {
+        EMBEDDED_CONTENTS
+            .iter()
+            .map(|&(path, text, _)| (path, text))
+            .collect()
+    })
+    .get(rest)
+    .copied()
 }
 
-// PORT: one `EMBEDDED_CONTENTS` entry, from `crates/ts_goport/libs`.
-// The include path is relative to this file: this file builds in
-// `goport_util`, whose manifest dir is not `crates/ts_goport`.
+// PORT: one `EMBEDDED_CONTENTS` entry, from `crates/ts_goport/libs`: the
+// path, the text and its compile-time `snapshot_text_hash`. The include path
+// is relative to this file: this file builds in `goport_util`, whose
+// manifest dir is not `crates/ts_goport`.
 // `crates/ts_goport/scripts/copy-libs.sh` copies the same set for a noembed
 // build.
 macro_rules! bundled_lib {
-    ($name:literal) => {
-        (
-            concat!("libs/", $name),
-            include_str!(concat!("../../../libs/", $name)),
-        )
-    };
+    ($name:literal) => {{
+        const TEXT: &str = include_str!(concat!("../../../libs/", $name));
+        // One compile-time evaluation per lib, so each stays under the
+        // rustc step limit.
+        const HASH: u64 = snapshot_text_hash(TEXT);
+        (concat!("libs/", $name), TEXT, HASH)
+    }};
+}
+
+/// `const_hash` of `text` for a snapshot lib (`SNAPSHOT_TEXT_MIN`), else 0.
+/// Only the three snapshot libs are hashed, so the compile-time evaluation
+/// stays short (about 3 s for 3.4 MB).
+const fn snapshot_text_hash(text: &str) -> u64 {
+    if text.len() >= SNAPSHOT_TEXT_MIN {
+        const_hash(text.as_bytes())
+    } else {
+        0
+    }
 }
 
 // Go: embed_generated.go:13 (the go:embed variables)
-static EMBEDDED_CONTENTS: &[(&str, &str)] = &[
+static EMBEDDED_CONTENTS: &[(&str, &str, u64)] = &[
     bundled_lib!("lib.d.ts"),
     bundled_lib!("lib.decorators.d.ts"),
     bundled_lib!("lib.decorators.legacy.d.ts"),
@@ -411,3 +447,20 @@ static EMBEDDED_CONTENTS: &[(&str, &str)] = &[
     bundled_lib!("lib.webworker.importscripts.d.ts"),
     bundled_lib!("lib.webworker.iterable.d.ts"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot lib has its compile-time hash only as the embedded text
+    /// itself: a copy of the text, or a small lib, has none.
+    #[test]
+    fn embedded_text_hash_is_compile_time_hash() {
+        let dom = bundled_text("bundled:///libs/lib.dom.d.ts").expect("lib.dom");
+        assert!(dom.len() >= SNAPSHOT_TEXT_MIN);
+        assert_eq!(embedded_text_hash(dom), Some(const_hash(dom.as_bytes())));
+        assert_eq!(embedded_text_hash(&dom.to_string()), None);
+        let small = bundled_text("bundled:///libs/lib.es2015.d.ts").expect("lib.es2015");
+        assert_eq!(embedded_text_hash(small), None);
+    }
+}
