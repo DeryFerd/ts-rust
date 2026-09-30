@@ -301,6 +301,8 @@ struct PendingCompile {
     // Go `t.writeFile`, and the build info that it wrote.
     write_file: WriteFile,
     written_build_info: WrittenBuildInfo,
+    // The writes that wait for the orchestrator thread (`DeferredWrites`).
+    deferred_writes: Option<DeferredWrites>,
     // `incremental_program.start_emit` ran (see `compile_and_emit_start`).
     emit_started: bool,
 }
@@ -652,8 +654,10 @@ impl BuildTask {
         let program = crate::execute::execute_tsc::new_program_version(compiler_host, resolved);
         compile_times.borrow_mut().parse_time = elapsed(&*sys, parse_start);
         let written_build_info: WrittenBuildInfo = Arc::default();
+        let deferred_writes = (!sys.emit_writes_through_osvfs()).then(DeferredWrites::default);
         let write_file = new_task_write_file(
             written_build_info.clone(),
+            deferred_writes.clone(),
             self.store_output_time_stamp(orchestrator),
             host.m_times.clone(),
             orchestrator.compare_paths_options().clone(),
@@ -710,6 +714,7 @@ impl BuildTask {
             compile_times,
             write_file,
             written_build_info,
+            deferred_writes,
             emit_started,
         });
         true
@@ -728,12 +733,13 @@ impl BuildTask {
             compile_times,
             write_file,
             written_build_info,
+            deferred_writes,
             emit_started,
         } = self.compile.take().expect("compile_and_emit_start ran");
         let sys = orchestrator.sys();
         let host = orchestrator.host();
         let resolved = self.resolved().clone();
-        let (result, statistics) = {
+        let (mut result, statistics) = {
             let _scope = crate::core::enter_program(Some(program));
             WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = Some(sys.clone()));
             // PORT: perf. Each checker emits when its own check ends, as in
@@ -760,6 +766,9 @@ impl BuildTask {
                 testing: orchestrator.testing(),
                 testing_m_times_cache: Some(&*host.m_times),
             });
+            if let Some(deferred_writes) = &deferred_writes {
+                write_deferred(deferred_writes, &*sys.fs());
+            }
             WRITE_FILE_SYS.with(|write_file_sys| *write_file_sys.borrow_mut() = None);
             emitted
         };
@@ -778,6 +787,25 @@ impl BuildTask {
                 .push_str(&String::from_utf8_lossy(&builder.borrow()));
             task_result.has_changed_dts_file = has_changed_dts_file;
             task_result.program = Some(incremental_program);
+        }
+        // PORT: see `DeferredWrites`. Go's emitter reports a failed write as
+        // TS5033; here the waiting writes fail after the emit.
+        let failed = deferred_writes.map_or_else(Vec::new, |deferred| {
+            std::mem::take(
+                &mut deferred
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .failed,
+            )
+        });
+        for (file_name, err) in failed {
+            self.report_diagnostic(new_compiler_diagnostic(
+                diag::Could_not_write_file_0_Colon_1,
+                args![file_name, err],
+            ));
+            if result.status == ExitStatus::Success {
+                result.status = ExitStatus::DiagnosticsPresentOutputsGenerated;
+            }
         }
         // Go: build/buildtask.go:906 (*BuildTask).writeFile, the build info
         // part (`onBuildInfoEmit`), with the time of the write.
@@ -1797,17 +1825,23 @@ type WrittenBuildInfo = Arc<Mutex<Option<(String, Arc<BuildInfo>, SystemTime)>>>
 // in `written`, and `compile_and_emit_finish` calls it after the emit. The
 // watch-only `storeMTime` branch stores into the build host `m_times` at
 // once (Go `SyncMap`), before the test `OnEmittedFiles` reads it.
+// With `deferred` (`System::emit_writes_through_osvfs` is false) it writes
+// through the system file system instead (see `DeferredWrites`).
 fn new_task_write_file(
     written: WrittenBuildInfo,
+    deferred: Option<DeferredWrites>,
     store_output_time_stamp: bool,
     m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
     compare_paths_options: ComparePathsOptions,
 ) -> WriteFile {
     Arc::new(
         move |file_name: &str, text: &str, data: &mut WriteFileData| -> Result<(), String> {
-            osvfs_fs()
-                .write_file(file_name, text)
-                .map_err(|err| fs_error_text(&err))?;
+            match &deferred {
+                None => osvfs_fs()
+                    .write_file(file_name, text)
+                    .map_err(|err| fs_error_text(&err))?,
+                Some(deferred) => write_or_defer(deferred, file_name, text)?,
+            }
             if let Some(build_info) = &data.build_info {
                 *written.lock().unwrap_or_else(PoisonError::into_inner) = Some((
                     file_name.to_string(),
@@ -1831,6 +1865,64 @@ fn new_task_write_file(
             Ok(())
         },
     )
+}
+
+/// PORT: not in Go. The emit writes of a task whose system file system only
+/// the orchestrator thread can reach (`System::emit_writes_through_osvfs`,
+/// the API build orchestrator). Go's `writeFile` writes through
+/// `orchestrator.host.FS()` from the emit goroutines. Here a write on the
+/// orchestrator thread (the build info, and the early emit's writes that
+/// `finish_emit_files` flushes there) goes to that file system at once, after
+/// the waiting ones. A write on another thread (a checker thread) waits in
+/// `writes`, and the next write on the orchestrator thread, or the end of the
+/// task's emit, makes it. A waiting write that fails is kept in `failed` for
+/// Go's TS5033 after the emit (`compile_and_emit_finish`).
+#[derive(Default)]
+struct PendingWrites {
+    writes: Vec<(String, String)>,
+    failed: Vec<(String, String)>,
+}
+
+type DeferredWrites = Arc<Mutex<PendingWrites>>;
+
+/// The `DeferredWrites` part of the task `writeFile`: writes through the
+/// orchestrator system on the orchestrator thread, else keeps the write.
+fn write_or_defer(deferred: &DeferredWrites, file_name: &str, text: &str) -> Result<(), String> {
+    let fs = WRITE_FILE_SYS.with(|sys| sys.borrow().as_ref().map(|sys| sys.fs()));
+    match fs {
+        Some(fs) => {
+            write_deferred(deferred, &*fs);
+            fs.write_file(file_name, text)
+                .map_err(|err| fs_error_text(&err))
+        }
+        None => {
+            deferred
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .writes
+                .push((file_name.to_string(), text.to_string()));
+            Ok(())
+        }
+    }
+}
+
+/// Makes the waiting writes of `deferred` through `fs`, in order.
+fn write_deferred(deferred: &DeferredWrites, fs: &dyn Fs) {
+    let writes = std::mem::take(
+        &mut deferred
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .writes,
+    );
+    for (file_name, text) in writes {
+        if let Err(err) = fs.write_file(&file_name, &text) {
+            deferred
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .failed
+                .push((file_name, fs_error_text(&err)));
+        }
+    }
 }
 
 thread_local! {

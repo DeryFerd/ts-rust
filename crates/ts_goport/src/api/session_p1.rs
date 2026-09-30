@@ -3138,6 +3138,11 @@ impl crate::execute::tsc::System for ApiBuildSystem {
     fn since_start(&self) -> std::time::Duration {
         self.start.elapsed()
     }
+    // PORT: the session file system (the client's, with `--callbacks`)
+    // belongs to this thread, so the build writes through it here.
+    fn emit_writes_through_osvfs(&self) -> bool {
+        false
+    }
 }
 
 // PORT: Go passes the `tsc.System` as the `tsoptions.ParseConfigHost` of

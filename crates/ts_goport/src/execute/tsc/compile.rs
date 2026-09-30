@@ -111,6 +111,15 @@ pub trait System {
 
     fn now(&self) -> SystemTime;
     fn since_start(&self) -> Duration;
+
+    /// PORT: not in Go. True when a write through the osvfs of any thread
+    /// (`osvfs_fs()`) reaches `fs()`, so the emit of `tsc -b` can write from
+    /// the checker threads (build/build_task.rs `new_task_write_file`): the
+    /// OS system, and a test system, whose tests install their file system
+    /// as the osvfs. False when only this thread can reach `fs()`.
+    fn emit_writes_through_osvfs(&self) -> bool {
+        true
+    }
 }
 
 // Go: execute/tsc/compile.go:37 newContentMapperLogger
