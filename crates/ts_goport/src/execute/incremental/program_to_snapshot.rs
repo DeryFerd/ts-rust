@@ -541,8 +541,14 @@ pub fn start_referenced_files_job(file: Node) -> ReferencedFilesJob {
             );
         }
         // From ambient modules
-        for ambient_module in checker.get_ambient_modules() {
-            add_referenced_files_from_symbol(checker, file, &mut referenced_files, ambient_module);
+        // PORT: perf. Go runs `addReferencedFilesFromSymbol` for every
+        // ambient module of every file. The files of those declarations
+        // are the same for each file of this checker, so they are found
+        // once per checker (`ambient_module_files`).
+        for &file_of_decl in ambient_module_files(checker).iter() {
+            if file != file_of_decl {
+                referenced_files.add_file(file_of_decl);
+            }
         }
         if referenced_files.paths.is_empty() {
             None
@@ -550,6 +556,79 @@ pub fn start_referenced_files_job(file: Node) -> ReferencedFilesJob {
             Some(referenced_files.paths)
         }
     })
+}
+
+/// The source files of the declarations of the checker's ambient modules,
+/// for one checker (see `ambient_module_files`).
+struct AmbientModuleFiles {
+    /// The program and the checker that the list is for.
+    program: u32,
+    checker: u32,
+    /// The declaration count of each ambient module when the list was made.
+    /// A merge can add declarations later, and then the list is made again.
+    counts: Vec<usize>,
+    files: Rc<[Node]>,
+}
+
+thread_local! {
+    /// The ambient module files of the last checker that used this thread.
+    static AMBIENT_MODULE_FILES: std::cell::RefCell<Option<AmbientModuleFiles>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The files that `add_referenced_files_from_symbol` adds for the ambient
+/// modules of `checker` (Go `checker.GetAmbientModules()` in
+/// `getReferencedFiles`): the source file of each declaration of each
+/// ambient module, in that order, each file once, with no nil file. The
+/// caller skips the file whose references it collects, as Go does. The
+/// list is the same for every file of the checker, so it is made once per
+/// checker, not once per file (in Hono, about 110 declarations and a walk
+/// up to the source file for each).
+fn ambient_module_files(checker: &mut Checker) -> Rc<[Node]> {
+    let modules = checker.get_ambient_modules();
+    let program = crate::core::prog().id;
+    let checker_id = checker.id;
+    let current = |cache: &AmbientModuleFiles, checker: &Checker| {
+        cache.program == program
+            && cache.checker == checker_id
+            && cache.counts.len() == modules.len()
+            && modules
+                .iter()
+                .zip(&cache.counts)
+                .all(|(&module, &count)| checker.sym(module).declarations.len() == count)
+    };
+    let cached = AMBIENT_MODULE_FILES.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|cache| current(cache, checker))
+            .map(|cache| Rc::clone(&cache.files))
+    });
+    if let Some(files) = cached {
+        return files;
+    }
+    let mut seen = FxHashSet::default();
+    let mut files = Vec::new();
+    let mut counts = Vec::with_capacity(modules.len());
+    for &module in &modules {
+        let declarations = &checker.sym(module).declarations;
+        counts.push(declarations.len());
+        for &declaration in declarations.iter() {
+            let file_of_decl = get_source_file_of_node(declaration);
+            if !file_of_decl.is_nil() && seen.insert(file_of_decl) {
+                files.push(file_of_decl);
+            }
+        }
+    }
+    let files: Rc<[Node]> = files.into();
+    AMBIENT_MODULE_FILES.with(|slot| {
+        *slot.borrow_mut() = Some(AmbientModuleFiles {
+            program,
+            checker: checker_id,
+            counts,
+            files: Rc::clone(&files),
+        });
+    });
+    files
 }
 
 /// The triple slash and type reference parts of `get_referenced_files`, in
