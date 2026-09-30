@@ -669,7 +669,9 @@ impl Checker {
         {
             // PORT: Go `nameType.AsUniqueESSymbolType().symbol` is the embedded `Type.symbol`.
             let unique_symbol = self.ty(name_type).symbol;
-            let expression = self.symbol_to_expression(b, unique_symbol, SymbolFlags::VALUE);
+            // The reference was tracked in the destination scope by trackComputedName.
+            // Reconstructing its spelling in the source scope must not paint that scope's declarations visible.
+            let expression = self.symbol_to_expression_worker(b, unique_symbol, SymbolFlags::VALUE);
             return f.new_computed_property_name(expression);
         }
         Node::NIL

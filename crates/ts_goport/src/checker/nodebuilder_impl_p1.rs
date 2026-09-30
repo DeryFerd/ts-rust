@@ -984,7 +984,7 @@ impl Checker {
                     let old_enclosing = ctx.borrow().enclosing_declaration;
                     ctx.borrow_mut().enclosing_declaration =
                         self.sym(name_type_symbol).value_declaration;
-                    let expression = self.symbol_to_expression(b, name_type_symbol, meaning);
+                    let expression = self.symbol_to_expression_worker(b, name_type_symbol, meaning);
                     let result = p1_e(b).factory().new_computed_property_name(expression);
                     ctx.borrow_mut().enclosing_declaration = old_enclosing;
                     return result;
@@ -1394,7 +1394,23 @@ impl Checker {
         symbol: SymbolId,
         mask: SymbolFlags,
     ) -> Node {
-        let chain = self.lookup_symbol_chain(b, symbol, mask, false);
+        let (tracker, enclosing_declaration) = {
+            let ctx = p1_ctx(b);
+            let ctx = ctx.borrow();
+            (ctx.tracker.clone(), ctx.enclosing_declaration)
+        };
+        tracker.track_symbol(self, symbol, enclosing_declaration, mask);
+        self.symbol_to_expression_worker(b, symbol, mask)
+    }
+
+    // Go: checker/nodebuilderimpl.go:853 symbolToExpressionWorker
+    pub fn symbol_to_expression_worker(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+        symbol: SymbolId,
+        mask: SymbolFlags,
+    ) -> Node {
+        let chain = self.lookup_symbol_chain_worker(b, symbol, mask, false);
         // PORT: see `symbol_to_name` for the empty chain case.
         self.create_expression_from_symbol_chain(b, &chain, chain.len() - 1)
     }
