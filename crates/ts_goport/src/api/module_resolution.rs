@@ -15,7 +15,6 @@
 use crate::api::prelude::*;
 
 use crate::api::proto;
-use crate::frontend::json::json_unmarshal;
 use crate::frontend::json_ext::AnyValue;
 use crate::frontend::module;
 use crate::gostd::errors;
@@ -267,7 +266,10 @@ impl CallbackModuleResolver {
             return (None, Vec::new(), None);
         }
         let mut static_resolution = StaticModuleResolution::default();
-        if let Err(err) = json_unmarshal(&callback_result.0, &mut static_resolution, &[]) {
+        // Go `json.Unmarshal`, with the v2 error texts.
+        if let Err(err) =
+            crate::frontend::json_ext::unmarshal_root(&callback_result.0, &mut static_resolution)
+        {
             let err = errors::from_value(err);
             return (
                 None,

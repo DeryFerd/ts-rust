@@ -225,7 +225,8 @@ impl RequestMessage {
     // Go: jsonrpc.go:102 UnmarshalJSON
     pub fn unmarshal_json(&mut self, data: &[u8]) -> Result<(), GoError> {
         let mut raw = RawRequestMessage::default();
-        if let Err(err) = json_unmarshal(data, &mut raw, &[]) {
+        // Go `json.Unmarshal(data, &raw)`, with the v2 error texts.
+        if let Err(err) = json_ext::unmarshal_root(data, &mut raw) {
             return Err(wrap_error_code(
                 ErrorCode::INVALID_REQUEST,
                 gostd::errors::from_value(err),
