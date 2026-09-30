@@ -107,6 +107,23 @@ test("the type-ids mask keeps a type or signature id change and loses a symbol, 
   }
 }));
 
+test("the type-ids mask keeps symbol names exact: a change of the id inside a symbol name is lost", () => inTemp(root => {
+  // The 3 internal name forms that api_oracle.mask_name masks (protocol 4 at pin N: "__" prefix).
+  const SYM_METHOD = "getSymbolAtPosition";
+  for (const [from, to] of [["__@iterator@57", "__@iterator@58"], ["__#57@#x", "__#58@#x"], ["a⟨57⟩", "a⟨58⟩"]]) {
+    const go = { id: "x@1.2.@PROJECT_DIR@/a.ts", flags: 4, name: from };
+    const set = answerSet(root, { entries: { "qc/t#1": { method: SYM_METHOD, answer: go, mask: "type-ids" } } });
+    const one = result => [{ event: 1, method: SYM_METHOD, cls: "flaky_oracle", result }];
+    const base = results(root, `base-${to}`, null, null, { events: one(go) });
+    const same = run([base, results(root, `same-${to}`, null, null, { events: one(go) }), "--answers", set]);
+    assert.deepEqual([same.rc, same.out.total.retainedByMaskedAnswers], [0, 1], `${from}: ${same.stderr}`);
+    const lost = run([base, results(root, `new-${to}`, null, null, { events: one({ ...go, name: to }) }), "--answers", set]);
+    assert.equal(lost.rc, 1, `${to}: ${lost.stderr}`);
+    assert.deepEqual([lost.out.total.lost, lost.out.total.retainedByMaskedAnswers], [1, 0], to);
+    assert.match(lost.out.lostFirst[0].answersWhy, /not in the answer set/);
+  }
+}));
+
 test("a masked entry covers only its own key", () => inTemp(root => {
   // qc/t#2 is in the same set without a mask: its answer is compared exactly, so another type id is lost.
   const set = answerSet(root, { entries: { "qc/t#1": { method: TYPE, answer: MASKED[TYPE], mask: "type-ids" }, "qc/t#2": { method: TYPE, answer: GO } } });

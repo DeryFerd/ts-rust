@@ -47,12 +47,13 @@ answersWhy).
 Masked entries (bump C reviewer ruling 1 item 3, ruling 2 item 1): an API set whose header has "mask":
 "type-ids" (the only mask kind) may have entries with that "mask" and exactly one answer: the Go answer after
 mask_type_ids(), the same for every Go run at the set's pin. mask_type_ids replaces only type and signature ids;
-the symbol field, all flags and every other field stay exact (api_oracle.mask_ids, which also masks symbols and
-defines the id_only class, is not used). goport's answer is masked the same way (the API tool loaded at the set's
-pin, after apply_multisets) before it is compared. A masked entry covers only its own key; every other key is
-compared unmasked. The header also has "maskTool" {<path>: sha256} of scripts/goport/api_oracle.py (SHAPES,
-walk_shape, mask_name) and scripts/goport/oracle-compare.py (mask_type_ids) when the set was made. When a sha256 differs from this checkout's file, every source golden of every masked entry is masked
-again with this checkout's tools, and each must give the entry's answer, or the set is refused. Retention
+the symbol field, symbol names, all flags and every other field stay exact (api_oracle.mask_ids, which also masks
+symbols and defines the id_only class, is not used). goport's answer is masked the same way (the API tool loaded
+at the set's pin, after apply_multisets) before it is compared. A masked entry covers only its own key; every
+other key is compared unmasked. The header also has "maskTool" {<path>: sha256} of scripts/goport/api_oracle.py
+(SHAPES, walk_shape) and scripts/goport/oracle-compare.py (mask_type_ids) when the set was made. When a sha256
+differs from this checkout's file, every source golden of every masked entry is masked again with this
+checkout's tools, and each must give the entry's answer, or the set is refused. Retention
 through a masked entry counts as retainedByMaskedAnswers, not retainedByAnswers, and each set in the output has
 maskedRequests, mask and maskTool {same, rechecked (source goldens masked again)}. These fields appear only
 when a set has a masked entry, so other outputs stay the same.
@@ -155,13 +156,12 @@ def tool_at(kind, pin):
 def mask_type_ids(api, method, v):
     """An API answer v of method with every type and signature id replaced by "#" (the "type-ids" mask; bump C
     reviewer ruling 2 item 1), by the API tool api (tool_at(), loaded at the answer set's pin). Symbol references,
-    flags and every other field are kept; ids embedded in symbol names are masked as api_oracle.mask_name does.
-    masked-answers.py builds masked sets with this function."""
+    symbol names (also the ids inside them), flags and every other field are kept. masked-answers.py builds masked
+    sets with this function."""
     shape = api.SHAPES.get(method)
     if shape is None:
         return v
-    return api.walk_shape(shape, v, lambda kind, val: api.mask_name(val) if kind == 'symname'
-                          else '#' if kind in ('type', 'sig') and val not in (None, 0) else val)
+    return api.walk_shape(shape, v, lambda kind, val: '#' if kind in ('type', 'sig') and val not in (None, 0) else val)
 
 
 def sha256_file(path):
