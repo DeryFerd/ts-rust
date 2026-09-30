@@ -44,6 +44,19 @@ absent). With a set of another oracle only (a later pin bump) it is protected li
 total also count retainedByAnswers, the output has kind and answers [{path, sha256, kind, pin, oracleSha256,
 requests, applied, notApplied}], and a lostFirst row of such a request names its set (answers, carried,
 answersWhy).
+Masked entries (bump C reviewer ruling 1 item 3, ruling 2 item 1): an API set whose header has "mask":
+"type-ids" (the only mask kind) may have entries with that "mask" and exactly one answer: the Go answer after
+mask_type_ids(), the same for every Go run at the set's pin. mask_type_ids replaces only type and signature ids;
+the symbol field, symbol names, all flags and every other field stay exact (api_oracle.mask_ids, which also masks
+symbols and defines the id_only class, is not used). goport's answer is masked the same way (the API tool loaded
+at the set's pin, after apply_multisets) before it is compared. A masked entry covers only its own key; every
+other key is compared unmasked. The header also has "maskTool" {<path>: sha256} of scripts/goport/api_oracle.py
+(SHAPES, walk_shape) and scripts/goport/oracle-compare.py (mask_type_ids) when the set was made. When a sha256
+differs from this checkout's file, every source golden of every masked entry is masked again with this
+checkout's tools, and each must give the entry's answer, or the set is refused. Retention
+through a masked entry counts as retainedByMaskedAnswers, not retainedByAnswers, and each set in the output has
+maskedRequests, mask and maskTool {same, rechecked (source goldens masked again)}. These fields appear only
+when a set has a masked entry, so other outputs stay the same.
 
 Parity (--parity, ruling 10 condition 3): the new run itself must match Go at its pin. LSP: no request of
 class diff, goport_error, oracle_error_diff, timeout or crash (lsp_oracle.py DIVERGENT_CLASSES) and no crash
@@ -51,8 +64,13 @@ exit (summary.json crashExits). API: no goport_error, crash or timeout, and each
 oracle_error_diff request is a known diff (--known-diff "<battery>/<trace>#<event>", repeatable; API only).
 A request in an answer set of the oracle of its trace must have the set's method and goport's answer must be
 one of the set's answers, whatever its class; it is then allowed. The output has parity {classes, crashExits,
-answerRequests, allowedByAnswers, knownDiffs, knownDiffsUsed, bad, badFirst [{battery, trace, event, method,
-class, why}]}. An unused known diff and an answer set request that the new run lacks are bad too.
+answerRequests, allowedByAnswers, knownDiffs, knownDiffsUsed, knownDiffRows, bad, badFirst [{battery, trace,
+event, method, class, why}]}. An unused known diff and an answer set request that the new run lacks are bad too.
+knownDiffRows (bump C ruling 1 item 4) has one row per known diff, in the order given: {key, class, method,
+pointer, sub, goldenError}, the new run's class, first diff pointer and sub of the request, and for an
+oracle_error class the error message of the Go golden (<out-root>/golden/<oracle sha256 prefix>/<battery>/
+<trace>.golden.jsonl.gz, where the results dir is <out-root>/results/<label>). Each row is also printed on
+stderr, so the reviewer sees the class and pointer of every known diff at each run.
 
 Identity (--identity): each head (base, bases, new) also has resultsSha256 (the sha256 of the lines
 "<sha256>  ./<path>" of every regular file in the dir, sorted by path: the output of
@@ -60,6 +78,10 @@ Identity (--identity): each head (base, bases, new) also has resultsSha256 (the 
 sha256 values that the run records: LSP summary.json goport[].sha256, API manifest.json
 batteries.*.goportSha) and oracleSha256 (the oracle sha256 values: LSP summary.json oracleSha256 and
 each trace's, API manifest.json batteries.*.oracleSha), each sorted.
+
+Wire (bump C reviewer ruling 1 item 1): `api_oracle.py check --wire 3` is only for the base re-measure of a
+revision that speaks an older API protocol. The new run is refused (exit 2) when its manifest.json has a battery
+with a "wire" key or a trace result has "wire" in its meta. Base runs may have it.
 
 Prints one JSON object {base, new, protectedClasses, total, batteries, lostFirst[, bases, kind, answers,
 parity]}, and writes it to --out when given. Without --answers, --parity and --identity, and with one base
@@ -82,7 +104,13 @@ ORACLE_TOOLS = {'lsp': 'lsp_oracle', 'api': 'api_oracle'}
 # Parity: the classes that are always a problem, and (API) the classes that need a known diff.
 PARITY_BAD = {'lsp': ('diff', 'goport_error', 'oracle_error_diff', 'timeout', 'crash'), 'api': ('goport_error', 'crash', 'timeout')}
 PARITY_DIFF = {'lsp': (), 'api': ('diff', 'id_only', 'oracle_error_diff')}
+# The mask kind of masked answer set entries (see the docstring and mask_type_ids()).
+MASK = 'type-ids'
+# The files whose code a mask runs, keyed as the answer set header's maskTool names them.
+MASK_TOOL_FILES = {'scripts/goport/api_oracle.py': os.path.join(HERE, 'api_oracle.py'),
+                   'scripts/goport/oracle-compare.py': os.path.abspath(__file__)}
 _tools = {}
+_pinned_tools = {}
 
 
 def fail(msg):
@@ -106,6 +134,49 @@ def tool(kind):
     return _tools[kind]
 
 
+def tool_at(kind, pin):
+    """lsp_oracle.py or api_oracle.py of this checkout, loaded as at a Go pin (GOPORT_PIN_ACTIVE, which sets the
+    API protocol and with it the internal symbol name form that mask_ids masks)."""
+    if (kind, pin) not in _pinned_tools:
+        spec = importlib.util.spec_from_file_location(f'{ORACLE_TOOLS[kind]}_{pin}', os.path.join(HERE, ORACLE_TOOLS[kind] + '.py'))
+        mod = importlib.util.module_from_spec(spec)
+        saved = os.environ.get('GOPORT_PIN_ACTIVE')
+        os.environ['GOPORT_PIN_ACTIVE'] = pin
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            if saved is None:
+                del os.environ['GOPORT_PIN_ACTIVE']
+            else:
+                os.environ['GOPORT_PIN_ACTIVE'] = saved
+        _pinned_tools[(kind, pin)] = mod
+    return _pinned_tools[(kind, pin)]
+
+
+def mask_type_ids(api, method, v):
+    """An API answer v of method with every type and signature id replaced by "#" (the "type-ids" mask; bump C
+    reviewer ruling 2 item 1), by the API tool api (tool_at(), loaded at the answer set's pin). Symbol references,
+    symbol names (also the ids inside them), flags and every other field are kept. masked-answers.py builds masked
+    sets with this function."""
+    shape = api.SHAPES.get(method)
+    if shape is None:
+        return v
+    return api.walk_shape(shape, v, lambda kind, val: '#' if kind in ('type', 'sig') and val not in (None, 0) else val)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def mask_tool():
+    """{path: sha256} of the files whose code the masks run (the maskTool of a masked answer set header)."""
+    return {name: sha256_file(path) for name, path in MASK_TOOL_FILES.items()}
+
+
 def keytext(key):
     return f'{key[0]}/{key[1]}#{key[2]}'
 
@@ -120,11 +191,12 @@ def parse_key(text):
 
 def load(results_dir):
     """{(battery, trace, event): (class, method)} of one results dir, its head, and its trace info
-    (kinds of the trace formats, oracle sha256 values the traces name, and per trace its oracle)."""
+    (kinds of the trace formats, oracle sha256 values the traces name, per trace its oracle, and per request
+    with a diff pointer or sub its (pointer, sub))."""
     tdir = os.path.join(results_dir, 'traces')
     if not os.path.isdir(tdir):
         fail(f'no traces/ in {results_dir}')
-    requests, traces, info = {}, 0, {'kinds': set(), 'oracles': set(), 'traces': {}}
+    requests, traces, info = {}, 0, {'kinds': set(), 'oracles': set(), 'traces': {}, 'wire': set(), 'detail': {}}
     for d, _, files in sorted(os.walk(tdir)):
         for f in sorted(files):
             if not f.endswith('.json'):
@@ -135,9 +207,14 @@ def load(results_dir):
             if t.get('oracleSha256'):
                 info['oracles'].add(t['oracleSha256'])
             info['traces'][(t['battery'], t['trace'])] = t.get('oracleSha256')
+            if 'wire' in (t.get('meta') or {}):
+                info['wire'].add(f"{t['battery']}/{t['trace']}")
             for e in t.get('events') or []:
                 event = e.get('i', e.get('event'))
-                requests[(t['battery'], t['trace'], str(event))] = (e['class'], e.get('method'))
+                key = (t['battery'], t['trace'], str(event))
+                requests[key] = (e['class'], e.get('method'))
+                if e.get('pointer') is not None or e.get('sub') is not None:
+                    info['detail'][key] = (e.get('pointer'), e.get('sub'))
     if not traces:
         fail(f'no trace results in {tdir}')
     return requests, {'dir': os.path.abspath(results_dir), 'label': os.path.basename(os.path.normpath(results_dir)),
@@ -174,11 +251,7 @@ def identity(results_dir, kind, info):
             path = os.path.join(d, name)
             if os.path.islink(path) or not os.path.isfile(path):
                 continue
-            h = hashlib.sha256()
-            with open(path, 'rb') as f:
-                for chunk in iter(lambda: f.read(1 << 20), b''):
-                    h.update(chunk)
-            files.append((os.path.relpath(path, results_dir).encode(), h.hexdigest()))
+            files.append((os.path.relpath(path, results_dir).encode(), sha256_file(path)))
     listing = b''.join(f'{digest}  ./'.encode() + path + b'\n' for path, digest in sorted(files))
     if kind == 'lsp':
         goport = [g.get('sha256') for g in side_file(results_dir, 'summary.json').get('goport') or [] if isinstance(g, dict)]
@@ -207,9 +280,10 @@ class Run:
             found = (self.batteries.get(battery) or {}).get('oracleSha')
         return found or (next(iter(self.goldens)) if len(self.goldens) == 1 else None)
 
-    def answer(self, key, patterns):
+    def answer(self, key, patterns, mask=None):
         """goport's answer to a request in this run as canon() text (normalized as the oracle tools do), or None
-        when goport gave no answer (no record, or a status other than ok and error)."""
+        when goport gave no answer (no record, or a status other than ok and error). mask (pin, method): an ok
+        result is masked with mask_type_ids by the API tool at that pin (a masked answer set entry)."""
         battery, trace, event = key
         path = os.path.join(self.dir, 'responses', battery, trace + '.jsonl.gz')
         if path not in self.response_cache:
@@ -229,7 +303,10 @@ class Run:
         t, resp = tool(self.kind), rec.get('response') or {}
         if rec['status'] == 'error' or 'result' not in resp:
             return t.canon({'status': rec['status'], 'response': resp})
-        return t.canon(t.apply_multisets(resp['result'], patterns))
+        v = t.apply_multisets(resp['result'], patterns)
+        if mask:
+            v = mask_type_ids(tool_at('api', mask[0]), mask[1], v)
+        return t.canon(v)
 
 
 def load_answers(ref, cache):
@@ -256,12 +333,23 @@ def load_answers(ref, cache):
             or doc.get('goldenSha12') != oracle[:12] or not isinstance(doc.get('requests'), dict)):
         raise ValueError(f'answer set {path} lacks the {ANSWERS_FORMAT} header (kind, pin, oracleSha256, goldenSha12, requests)')
     canon, requests = tool(kind).canon, {}
+    set_mask = doc.get('mask')
+    if any(isinstance(e, dict) and e.get('mask') is not None for e in doc['requests'].values()) or set_mask is not None:
+        tools = doc.get('maskTool')
+        if (kind != 'api' or set_mask != MASK or not isinstance(tools, dict) or sorted(tools) != sorted(MASK_TOOL_FILES)
+                or not all(isinstance(v, str) and SHA256.match(v) for v in tools.values())):
+            raise ValueError(f'answer set {path} has masked entries: an API set needs the header mask {MASK!r} and '
+                             f'maskTool {{{", ".join(sorted(MASK_TOOL_FILES))}: sha256}}')
     for k, entry in doc['requests'].items():
         key = parse_key(k)
         answers = entry.get('answers') if isinstance(entry, dict) else None
         multiset = entry.get('multiset') or [] if isinstance(entry, dict) else None
         if not key or not answers or not isinstance(answers, list) or not isinstance(multiset, list):
             raise ValueError(f'answer set {path}: request {k} needs battery/trace#event, answers and multiset')
+        mask = entry.get('mask')
+        if mask is not None and (mask != set_mask or len(answers) != 1):
+            raise ValueError(f'answer set {path}: request {k} has mask {mask!r}; a masked entry has the mask of the set '
+                             f'header ({set_mask!r}) and one answer')
         texts, sources = [], set()
         for a in answers:
             text = canon(a.get('answer')) if isinstance(a, dict) else None
@@ -274,10 +362,42 @@ def load_answers(ref, cache):
                                  f'a Go golden ...{end}')
             sources.update(src)
             texts.append(text)
-        requests[key] = {'method': entry.get('method'), 'multiset': multiset, 'texts': texts}
+        requests[key] = {'method': entry.get('method'), 'multiset': multiset, 'texts': texts, 'mask': mask,
+                         'sources': sorted(sources)}
     found = {'path': path, 'sha256': want, 'kind': kind, 'pin': doc['pin'], 'oracleSha256': oracle, 'requests': requests}
+    if set_mask is not None:
+        same = doc['maskTool'] == mask_tool()
+        found.update(mask=set_mask, maskTool={'same': same, 'rechecked': 0 if same else recheck_masked(path, found)})
     cache[(path, want)] = found
     return found
+
+
+def recheck_masked(path, s):
+    """The mask code changed since the set was made: masks every source golden of every masked entry of the set s
+    again with this checkout's tools. Returns the number of goldens; raises ValueError when one is missing or does
+    not give the entry's answer."""
+    api, count, goldens = tool_at('api', s['pin']), 0, {}
+    for key, entry in sorted(s['requests'].items()):
+        if not entry['mask']:
+            continue
+        for src in entry['sources']:
+            full = src if os.path.isabs(src) else os.path.join(api.REPO, src)
+            if full not in goldens:
+                try:
+                    with gzip.open(full, 'rt', encoding='utf-8') as f:
+                        lines = [json.loads(line) for line in f if line.strip()]
+                except (OSError, ValueError) as e:
+                    raise ValueError(f'answer set {path}: the mask tool changed and the source golden {src} cannot be read: {e}')
+                goldens[full] = {str(k): r for k, r in api.records_by_event(lines[1:]).items()}
+            rec = goldens[full].get(key[2]) or {}
+            resp = rec.get('response') or {}
+            text = (api.canon(mask_type_ids(api, entry['method'], api.apply_multisets(resp['result'], entry['multiset'])))
+                    if rec.get('status') == 'ok' and 'result' in resp else None)
+            if text != entry['texts'][0]:
+                raise ValueError(f'answer set {path}: the mask tool changed, and {keytext(key)} in the source golden {src} does '
+                                 f'not give the masked answer with this checkout\'s mask')
+            count += 1
+    return count
 
 
 def answer_why(new_run, key, method, s):
@@ -285,12 +405,27 @@ def answer_why(new_run, key, method, s):
     entry = s['requests'][key]
     if method != entry['method']:
         return f'the new request has the method {method}, the answer set {s["path"]} {entry["method"]}'
-    got = new_run.answer(key, entry['multiset'])
+    got = new_run.answer(key, entry['multiset'], (s['pin'], entry['method']) if entry['mask'] else None)
     if got is None:
         return 'goport has no answer'
     if got not in entry['texts']:
         return f'goport\'s answer (sha256 {hashlib.sha256(got.encode()).hexdigest()[:12]}) is not in the answer set {s["path"]}'
     return None
+
+
+def golden_error(run, key):
+    """The error message of the Go golden record of an API request in the new run (see knownDiffRows), or None."""
+    battery, trace, event = key
+    oracle = run.oracle(battery, trace)
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(run.dir))), 'golden', (oracle or '')[:12], battery,
+                        trace + '.golden.jsonl.gz')
+    if not oracle or not os.path.isfile(path):
+        return None
+    with gzip.open(path, 'rt', encoding='utf-8') as f:
+        lines = [json.loads(line) for line in f if line.strip()]
+    rec = tool('api').records_by_event(lines[1:]).get(int(event) if event.isdigit() else event) or {}
+    error = (rec.get('response') or {}).get('error')
+    return error.get('message') if isinstance(error, dict) else None
 
 
 def main():
@@ -313,6 +448,10 @@ def main():
         fail('--known-diff needs --parity')
     runs = [load(d) for d in a.dirs[:-1]]
     new, nhead, ninfo = load(a.dirs[-1])
+    wired = sorted(f'manifest battery {b}' for b, rec in (side_file(a.dirs[-1], 'manifest.json').get('batteries') or {}).items()
+                   if isinstance(rec, dict) and 'wire' in rec) + sorted(ninfo['wire'])
+    if wired:
+        fail(f'the new run {a.dirs[-1]} was made with --wire ({", ".join(wired[:5])}); only a base re-measure may use it')
     # The union of the base runs: a request is protected when a base run has it protected (see the docstring).
     base = dict(runs[0][0])
     for requests, _, _ in runs[1:]:
@@ -356,7 +495,8 @@ def main():
         by = holder.get(key)
         return by.get(new_run.oracle(key[0], key[1])) if by else None
 
-    fields = FIELDS + (ANSWER_FIELDS if a.answers else ())
+    masked = any(e['mask'] for s in answer_sets for e in s['requests'].values())
+    fields = FIELDS + (ANSWER_FIELDS if a.answers else ()) + (('retainedByMaskedAnswers',) if masked else ())
     total, per = collections.Counter(), collections.defaultdict(collections.Counter)
     lost = []
     for key, (cls, method) in base.items():
@@ -373,7 +513,7 @@ def main():
                 field = 'unrun'
             else:
                 why = answer_why(new_run, key, now[1], s)
-                field = 'lost' if why else 'retainedByAnswers'
+                field = 'lost' if why else 'retainedByMaskedAnswers' if s['requests'][key]['mask'] else 'retainedByAnswers'
         elif carried:
             # A set of another pin only: protected like a same request (a later pin bump).
             for c in carried.values():
@@ -412,7 +552,10 @@ def main():
     if a.answers:
         out.update(kind=kind, answers=[{**{k: s[k] for k in ('path', 'sha256', 'kind', 'pin', 'oracleSha256')},
                                         'requests': len(s['requests']), 'applied': stats[id(s)]['applied'],
-                                        'notApplied': stats[id(s)]['notApplied']} for s in answer_sets])
+                                        'notApplied': stats[id(s)]['notApplied'],
+                                        **({'maskedRequests': sum(bool(e['mask']) for e in s['requests'].values()),
+                                            **{k: s[k] for k in ('mask', 'maskTool') if k in s}}
+                                           if masked else {})} for s in answer_sets])
     bad = []
     if a.parity:
         if a.known_diff and kind != 'api':
@@ -450,6 +593,15 @@ def main():
             if not used:
                 cls, method = new.get(key) or ('absent', None)
                 bad.append(row(key, method, cls, 'known diff is not a diff in the new run'))
+        known_rows = []
+        for key in known:
+            cls, method = new.get(key) or ('absent', None)
+            pointer, sub = ninfo['detail'].get(key, (None, None))
+            error = golden_error(new_run, key) if cls.startswith('oracle_error') else None
+            known_rows.append({'key': keytext(key), 'class': cls, 'method': method, 'pointer': pointer, 'sub': sub,
+                               'goldenError': error})
+            print(f'oracle-compare.py: known diff {keytext(key)}: {cls} {method} pointer {pointer}'
+                  + (f' sub {sub}' if sub is not None else '') + (f'; Go golden error: {error}' if error else ''), file=sys.stderr)
         exits = 0
         if kind == 'lsp':
             exits = sum((b or {}).get('crashExits') or 0 for b in (side_file(a.dirs[-1], 'summary.json').get('batteries') or {}).values())
@@ -457,7 +609,7 @@ def main():
                 bad.append(row(('*', '*', '*'), None, 'crash', f'{exits} crash exits (summary.json)'))
         out.update(kind=kind, parity={'classes': dict(sorted(classes.items())), 'crashExits': exits, 'answerRequests': checked,
                                       'allowedByAnswers': allowed, 'knownDiffs': len(known), 'knownDiffsUsed': sum(known.values()),
-                                      'bad': len(bad), 'badFirst': bad[:50]})
+                                      'knownDiffRows': known_rows, 'bad': len(bad), 'badFirst': bad[:50]})
     text = json.dumps(out, indent=1)
     if a.out:
         with open(a.out, 'w') as f:

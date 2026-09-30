@@ -25,14 +25,17 @@ const base = () => ({
 });
 
 // Runs the tool on base() and the new results that `edit` makes from base(), with the map lines
-// (arrays of cells). gzip writes the base as base.json.gz. Returns the exit code and the JSON output.
-function compare(edit, mapLines, { gzip = false } = {}) {
+// (arrays of cells). gzip writes the base as base.json.gz. baseEdit changes base() on both sides first.
+// Returns the exit code and the JSON output.
+function compare(edit, mapLines, { gzip = false, baseEdit } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "compare-tests-"));
   try {
-    const next = base();
+    const old = base();
+    baseEdit?.(old);
+    const next = structuredClone(old);
     edit?.(next);
     const baseFile = join(dir, gzip ? "base.json.gz" : "base.json");
-    writeFileSync(baseFile, gzip ? gzipSync(JSON.stringify(base())) : JSON.stringify(base()));
+    writeFileSync(baseFile, gzip ? gzipSync(JSON.stringify(old)) : JSON.stringify(old));
     writeFileSync(join(dir, "new.json"), JSON.stringify(next));
     const args = [TOOL, baseFile, join(dir, "new.json")];
     if (mapLines) {
@@ -80,6 +83,34 @@ test("a map line whose old name is still in the new results fails", () => {
   const renamed = compare(next => { lib(next)["a::ok"] = "failed"; lib(next)["fresh::ok"] = "ok"; },
     [["ts_goport_lib", "a::ok", "ts_goport_lib", "fresh::ok", "renamed"]]);
   assert.equal(renamed.rc, 1);
+});
+
+test("a removal line of a reference name that is ignored in the new results passes on its own count (bump C ruling 1 item 5)", () => {
+  // A stale Go reference file: ok at the base pin, still in the Go tree at the new pin, but no Go test writes it.
+  const REF = "tsc/commandLine/adds-color.js";
+  const withRef = old => { old.suites.go_baselines_reference = { [REF]: "ok" }; };
+  const ref = (next, status) => { next.pin = "16c25522e"; next.suites.go_baselines_reference[REF] = status; };
+  const line = [["go_baselines_reference", REF, "-", "-", "Go test removed, baseline file left behind"]];
+  const stale = compare(next => ref(next, "ignored"), line, { baseEdit: withRef });
+  assert.equal(stale.rc, 0);
+  assert.deepEqual([stale.out.mapRejected, stale.out.mapRemovedIgnored, stale.out.total.removedByMap], [[], [`go_baselines_reference: ${REF}`], 1]);
+  // Still rejected when the name is ok or failed in the new results.
+  for (const status of ["ok", "failed"]) {
+    const kept = compare(next => ref(next, status), line, { baseEdit: withRef });
+    assert.equal(kept.rc, 1);
+    assert.deepEqual(kept.out.mapRemovedIgnored, []);
+    assert.match(kept.out.mapRejected[0], /adds-color.js is still in the new results/);
+  }
+  // Only go_baselines_reference: an ignored libtest name (#[ignore]) with a removal line is rejected.
+  const libtest = compare(next => { next.pin = "16c25522e"; lib(next)["a::ok"] = "ignored"; },
+    [["ts_goport_lib", "a::ok", "-", "-", "Go test removed"]]);
+  assert.equal(libtest.rc, 1);
+  assert.deepEqual(libtest.out.mapRemovedIgnored, []);
+  assert.match(libtest.out.mapRejected[0], /ts_goport_lib a::ok is still in the new results/);
+  // A move (not a removal) of an ignored name is still rejected.
+  const moved = compare(next => { ref(next, "ignored"); next.suites.go_baselines_reference["fresh.js"] = "ok"; },
+    [["go_baselines_reference", REF, "go_baselines_reference", "fresh.js", "renamed"]], { baseEdit: withRef });
+  assert.equal(moved.rc, 1);
 });
 
 test("a swap with a base name fails", () => {
