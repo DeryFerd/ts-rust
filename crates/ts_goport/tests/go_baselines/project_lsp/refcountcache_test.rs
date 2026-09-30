@@ -661,6 +661,8 @@ child_test! {
                     compiler_options: command_line.compiler_options().clone(),
                     project_references: command_line.project_references().to_vec(),
                     config_file_parsing_diagnostics: command_line.errors.clone(),
+                    module_resolver_factory: None,
+                    module_resolver_id: 0,
                 }],
                 ..Default::default()
             }

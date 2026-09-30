@@ -70,7 +70,8 @@ child_test! {
             },
         );
         assert!(message.error.is_none(), "Initialize failed");
-        let result = result.expect("Initialize failed");
+        // Go dereferences the `*InitializeResult`.
+        let result = result.flatten().expect("Initialize failed");
         let kinds = result
             .capabilities
             .and_then(|capabilities| capabilities.code_action_provider)

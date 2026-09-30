@@ -14,7 +14,7 @@ use ts_goport::program::ls_program;
 use ts_goport::project::{
     APICreateProgramRequest, APISnapshotRequest, CompilerHost, ConfiguredProjectID, FileChange,
     FileChangeKind, FileChangeSummary, FileSource, ID, INFERRED_PROJECT_NAME, ProgramUpdateKind,
-    Session, Snapshot, inferred_project_id, new_synthetic_project_id, parse_configured_project_id,
+    Session, inferred_project_id, new_synthetic_project_id, parse_configured_project_id,
 };
 
 use super::projecttestutil::{FileMap, files, with_request_id};

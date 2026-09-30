@@ -14,7 +14,6 @@ use std::rc::Rc;
 use ts_goport::execute::build::command_line::parse_build_command_line;
 use ts_goport::execute::build::orchestrator::{Options, Orchestrator, new_orchestrator};
 use ts_goport::execute::tsc::compile::{ExitStatus, System, SystemParseConfigHost};
-use ts_goport::frontend::vfs::Fs;
 
 /// Go `assert.Assert(t, cond)` inside a subtest.
 fn check(cond: bool, what: &str) -> Result<(), String> {
