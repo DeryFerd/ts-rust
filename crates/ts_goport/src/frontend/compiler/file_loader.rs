@@ -1858,7 +1858,9 @@ pub(crate) fn get_mode_for_usage_location(
                 SyntaxKind::ImportDeclaration
                 | SyntaxKind::JsImportDeclaration
                 | SyntaxKind::ExportDeclaration
-                | SyntaxKind::JsDocImportTag => parent.attributes().get_resolution_mode_override(),
+                | SyntaxKind::JsDocImportTag => {
+                    parent.attributes().get_resolution_mode_override(None)
+                }
                 _ => (RESOLUTION_MODE_NONE, false),
             };
             if ok {
@@ -1867,7 +1869,10 @@ pub(crate) fn get_mode_for_usage_location(
         }
     }
     if is_literal_type_node(parent) && is_import_type_node(parent.parent()) {
-        let (override_, ok) = parent.parent().attributes().get_resolution_mode_override();
+        let (override_, ok) = parent
+            .parent()
+            .attributes()
+            .get_resolution_mode_override(None);
         if ok {
             return override_;
         }
