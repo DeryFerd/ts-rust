@@ -59,6 +59,14 @@ pub trait Resolver {
     // PORT: not in Go (Go's GC frees the resolver). Only `DefaultResolver`
     // has caches to release.
     fn release_caches(&self) {}
+
+    /// The resolver as a `DefaultResolver`, when it is one (Go
+    /// `resolver.(*module.DefaultResolver)`).
+    // PORT: Rust has no type assertion on a trait object; tests read the
+    // caches through this.
+    fn as_default_resolver(&self) -> Option<&DefaultResolver> {
+        None
+    }
 }
 
 // Go: module/resolver.go:148 DefaultResolver as a module.Resolver
@@ -146,6 +154,10 @@ impl Resolver for DefaultResolver {
 
     fn release_caches(&self) {
         self.caches.release();
+    }
+
+    fn as_default_resolver(&self) -> Option<&DefaultResolver> {
+        Some(self)
     }
 }
 

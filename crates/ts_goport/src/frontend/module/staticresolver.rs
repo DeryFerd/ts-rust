@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 // Go: module/staticresolver.go:12 StaticResolutionEntry
 // PORT: Go `*core.ResolutionMode` and `*ResolvedModule` are `Option`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct StaticResolutionEntry {
     pub module_name: String,
     pub containing_directory: String,
