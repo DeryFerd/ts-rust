@@ -648,7 +648,7 @@ pub(crate) fn get_containing_node_array(node: Node) -> NodeList {
             {
                 return parent.type_parameter_list();
             } else if is_infer_type_node(parent) {
-                // Go `break`: fall through to the parent kind switch.
+                // infer type nodes have no associated type parameter list
             } else {
                 panic!("Unexpected TypeParameter parent: {:?}", parent.kind());
             }

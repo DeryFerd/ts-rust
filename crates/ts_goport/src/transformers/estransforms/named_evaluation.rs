@@ -75,7 +75,9 @@ pub(crate) fn is_anonymous_function_definition(
                 return false;
             }
         }
-        SyntaxKind::ArrowFunction => {}
+        SyntaxKind::ArrowFunction => {
+            // arrow functions are always anonymous
+        }
         _ => return false,
     }
     if let Some(cb) = cb {

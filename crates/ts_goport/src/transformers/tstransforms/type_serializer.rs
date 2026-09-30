@@ -238,10 +238,14 @@ impl MetadataSerializer {
             | SyntaxKind::AnyKeyword
             | SyntaxKind::UnknownKeyword
             | SyntaxKind::ThisType
-            | SyntaxKind::ImportType => {}
+            | SyntaxKind::ImportType => {
+                // These types fall back to Object.
+            }
 
             // handle JSDoc types from an invalid parse
-            SyntaxKind::JsDocAllType | SyntaxKind::JsDocVariadicType => {}
+            SyntaxKind::JsDocAllType | SyntaxKind::JsDocVariadicType => {
+                // no meaningful serialization for these invalid-parse JSDoc types
+            }
             SyntaxKind::JsDocNullableType
             | SyntaxKind::JsDocNonNullableType
             | SyntaxKind::JsDocOptionalType => {

@@ -702,7 +702,9 @@ impl Printer {
             }
             SyntaxKind::EnumDeclaration => self.emit_enum_declaration(node),
             SyntaxKind::ModuleDeclaration => self.emit_module_declaration(node),
-            SyntaxKind::MissingDeclaration => {}
+            SyntaxKind::MissingDeclaration => {
+                // Missing declarations do not emit a statement.
+            }
 
             // Import/Export Statements
             SyntaxKind::NamespaceExportDeclaration => self.emit_namespace_export_declaration(node),

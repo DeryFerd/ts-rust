@@ -261,6 +261,7 @@ impl Printer {
     pub(crate) fn write_delimiter(&mut self, format: ListFormat) {
         let delimiter = format & ListFormat::DELIMITERS_MASK;
         if delimiter == ListFormat::NONE {
+            // no delimiter for this format
         } else if delimiter == ListFormat::COMMA_DELIMITED {
             self.write_punctuation(",");
         } else if delimiter == ListFormat::BAR_DELIMITED {
