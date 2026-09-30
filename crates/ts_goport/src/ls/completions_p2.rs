@@ -2276,6 +2276,9 @@ pub fn is_context_token_type_location(context_token: Node) -> bool {
             SyntaxKind::SatisfiesKeyword => {
                 return parent_kind == SyntaxKind::SatisfiesExpression;
             }
+            SyntaxKind::OpenBracketToken | SyntaxKind::CommaToken => {
+                return parent_kind == SyntaxKind::TupleType;
+            }
             _ => {}
         }
     }
