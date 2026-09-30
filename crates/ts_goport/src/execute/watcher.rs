@@ -894,7 +894,8 @@ impl Watcher {
         // PORT: `reuse_program` is Go `Program.ReuseProgram` (tsgo#4399, the
         // program part). The Rust frontend program has no checker pool, so
         // Go's `createCheckerPool` argument (nil here) is dropped, as in
-        // `update_program`.
+        // `update_program`. Go also passes a nil `createModuleResolver`
+        // (ts#64299), so the program keeps its own resolver.
         let (new_program, _, reused) = old_program.reuse_program(changed_path, host.clone());
         if reused {
             let np = Rc::new(new_program.expect("ReuseProgram returns the reused program"));
