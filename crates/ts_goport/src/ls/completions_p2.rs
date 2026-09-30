@@ -361,7 +361,9 @@ impl LanguageService {
                         &preferences,
                         is_snippet,
                     );
-                filter_text = auto_import.fix.name.clone();
+                // The edit range covers the whole import statement typed so far, and clients match that text against the
+                // filter text, so it has to be the statement being inserted (as in Strada), not just the bare name.
+                filter_text = insert_text.clone();
                 sort_text = SORT_TEXT_LOCATION_PRIORITY.to_string();
             }
 
