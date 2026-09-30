@@ -6,14 +6,16 @@
 //! session and project state live on the dispatch thread, so here `Run`
 //! handles each request and notification inline, and `Call` reads messages
 //! itself until its response arrives. Responses delivered this way keep
-//! their IDs; requests and notifications that `Call` reads while it waits
-//! are queued and `Run` handles them next, in arrival order. So the
-//! responses can come in a different order than in Go.
+//! their IDs. A request or notification that `Call` reads while it waits is
+//! handled inline at once, as the sync connection does: a client callback
+//! may make a nested API request and wait for its answer before it answers
+//! the call (ts#64299), which Go's goroutines allow. So the responses can
+//! come in a different order than in Go.
 //!
 //! PORT: the reads in `Call` are Go's `Run` reads. When one fails, the read
 //! loop ends there, as Go's `Run` would: `closePendingCalls` sets
-//! `terminal` (tsgo#4712), the call returns it, and a later `run` handles
-//! the queued messages and then returns what Go's `Run` returned.
+//! `terminal` (tsgo#4712), the call returns it, and a later `run` returns
+//! what Go's `Run` returned.
 
 use crate::ipc::prelude::*;
 
@@ -25,7 +27,6 @@ use crate::ipc::protocol_jsonrpc::new_jsonrpc_protocol;
 use crate::ipc::transport::ReadWriteCloser;
 use crate::jsonrpc;
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Instant;
@@ -56,9 +57,9 @@ pub struct AsyncConn {
     // ts#64142
     has_cause: Cell<bool>,
 
-    // PORT: requests and notifications that `call` read while it waited for
-    // its response. `run` handles them before it reads more.
-    deferred: RefCell<VecDeque<Message>>,
+    // ts#64142: Go `requestErrors := make(chan error, 1)` of `Run`. PORT: a
+    // field, because `call` also handles requests (file header).
+    request_errors: RefCell<Option<GoError>>,
     // PORT: how the read loop ended when a read in `call` ended it: the
     // value Go's `Run` returned. `run` returns it and reads no more.
     read_loop_end: RefCell<Option<Result<(), GoError>>>,
@@ -88,7 +89,7 @@ pub fn new_async_conn_with_protocol(
         pending: RefCell::new(FxHashMap::default()),
         terminal: RefCell::new(None),
         has_cause: Cell::new(false),
-        deferred: RefCell::new(VecDeque::new()),
+        request_errors: RefCell::new(None),
         read_loop_end: RefCell::new(None),
     })
 }
@@ -112,15 +113,13 @@ impl AsyncConn {
     // Run starts processing messages on the connection.
     // It blocks until the context is cancelled or an error occurs.
     pub fn run(&self, ctx: &Context) -> Result<(), GoError> {
-        // ts#64142: Go `requestErrors := make(chan error, 1)`.
-        let request_errors: RefCell<Option<GoError>> = RefCell::new(None);
         // Go: defer func() { c.closePendingCalls(err); cancelHandlers(); c.handlers.Wait(); ... }()
         // PORT: the handlers run inline (file header), so when the loop ends
         // no handler is active: the Go `handlerCtx` cancel and the
         // `handlers.Wait()` (ts#64163) have nothing to do.
-        let mut result = self.run_loop(ctx, &request_errors);
+        let mut result = self.run_loop(ctx);
         self.close_pending_calls(result.as_ref().err());
-        let request_err = request_errors.borrow_mut().take();
+        let request_err = self.request_errors.borrow_mut().take();
         if let Some(request_err) = request_err {
             result = Err(errors::join([result.err(), Some(request_err)])
                 .expect("the request error is non-nil"));
@@ -129,48 +128,43 @@ impl AsyncConn {
     }
 
     /// The loop of Go `Run`, without its deferred function.
-    fn run_loop(
-        &self,
-        ctx: &Context,
-        request_errors: &RefCell<Option<GoError>>,
-    ) -> Result<(), GoError> {
+    fn run_loop(&self, ctx: &Context) -> Result<(), GoError> {
         loop {
             if let Some(err) = ctx.err() {
                 return Err(err);
             }
 
-            // PORT: messages that `call` queued come first. When a read in
-            // `call` ended the read loop, there is nothing more to read.
-            let queued = self.deferred.borrow_mut().pop_front();
-            let result = match queued {
-                Some(msg) => Ok(msg),
-                None => {
-                    if let Some(end) = self.read_loop_end.borrow().clone() {
-                        return end;
-                    }
-                    self.protocol.borrow_mut().read_message()
-                }
-            };
+            // PORT: when a read in `call` ended the read loop, there is
+            // nothing more to read.
+            if let Some(end) = self.read_loop_end.borrow().clone() {
+                return end;
+            }
+            let result = self.protocol.borrow_mut().read_message();
             let msg = match result {
                 Ok(msg) => msg,
                 Err(err) => return read_loop_result(err),
             };
 
-            if msg.is_response() {
-                self.handle_response(msg);
-            } else if msg.is_request() {
-                // PORT: Go `c.handlers.Go(...)` (ts#64163); handled inline.
-                if let Err(request_err) = self.handle_request(ctx, msg)
-                    && self.record_request_error(request_err, request_errors)
-                {
-                    // PORT: Go checks `c.rwc != nil`; the Rust transport is
-                    // always set.
-                    let _ = self.rwc.close();
-                }
-            } else if msg.is_notification() {
-                // PORT: Go `c.handlers.Go(...)` (ts#64163); handled inline.
-                self.handle_notification(ctx, msg);
+            self.dispatch(ctx, msg);
+        }
+    }
+
+    /// The message branches of the Go `Run` loop. A request and a
+    /// notification run inline (Go `c.handlers.Go(...)`, ts#64163), also
+    /// when `call` read them.
+    fn dispatch(&self, ctx: &Context, msg: Message) {
+        if msg.is_response() {
+            self.handle_response(msg);
+        } else if msg.is_request() {
+            if let Err(request_err) = self.handle_request(ctx, msg)
+                && self.record_request_error(request_err)
+            {
+                // PORT: Go checks `c.rwc != nil`; the Rust transport is
+                // always set.
+                let _ = self.rwc.close();
             }
+        } else if msg.is_notification() {
+            self.handle_notification(ctx, msg);
         }
     }
 
@@ -188,15 +182,11 @@ impl AsyncConn {
     // PORT: Go sends to the `requestErrors` channel (capacity 1); here the
     // slot is an `Option`. Only the first cause returns true, so one error is
     // stored at most.
-    fn record_request_error(
-        &self,
-        request_err: GoError,
-        request_errors: &RefCell<Option<GoError>>,
-    ) -> bool {
+    fn record_request_error(&self, request_err: GoError) -> bool {
         if !self.record_terminal_error_locked(Some(&request_err)) {
             return false;
         }
-        *request_errors.borrow_mut() = Some(request_err);
+        *self.request_errors.borrow_mut() = Some(request_err);
         self.close_pending_calls_locked();
         true
     }
@@ -444,10 +434,12 @@ impl AsyncConn {
                     return Err(terminal.expect("closePendingCalls sets terminal"));
                 }
             };
-            if msg.is_response() {
-                self.handle_response(msg);
-            } else {
-                self.deferred.borrow_mut().push_back(msg);
+            self.dispatch(ctx, msg);
+            // Go: a closed response channel (`closePendingCalls` after a
+            // request error) makes the call return `terminal`.
+            if !self.pending.borrow().contains_key(&id) && response_chan.borrow().is_none() {
+                let terminal = self.terminal.borrow().clone();
+                return Err(terminal.expect("closePendingCalls sets terminal"));
             }
         }
     }
@@ -590,6 +582,78 @@ mod tests {
             call_err.error()
         );
         client.close().expect("client close");
+    }
+
+    /// Answers every request with `true`.
+    struct TrueHandler;
+
+    impl Handler for TrueHandler {
+        fn handle_request(
+            &self,
+            _ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+            Ok(Some(Box::new(true)))
+        }
+
+        fn handle_notification(
+            &self,
+            _ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<(), GoError> {
+            Ok(())
+        }
+    }
+
+    /// Reads one message with its `Content-Length` header.
+    fn read_framed(stream: &UnixStream) -> String {
+        let mut header = Vec::new();
+        let mut byte = [0u8; 1];
+        while !header.ends_with(b"\r\n\r\n") {
+            (&*stream).read_exact(&mut byte).expect("header byte");
+            header.push(byte[0]);
+        }
+        let header = String::from_utf8(header).expect("utf-8 header");
+        let length: usize = header
+            .trim()
+            .strip_prefix("Content-Length: ")
+            .and_then(|length| length.parse().ok())
+            .expect("Content-Length header");
+        let mut body = vec![0u8; length];
+        (&*stream).read_exact(&mut body).expect("body");
+        String::from_utf8(body).expect("utf-8 body")
+    }
+
+    fn write_framed(stream: &UnixStream, body: &str) {
+        write!(&*stream, "Content-Length: {}\r\n\r\n{body}", body.len()).expect("write");
+    }
+
+    // PORT: not in Go, whose goroutines handle the request below while
+    // `Call` waits. A client callback may answer a call only after its own
+    // request returns (ts#64299), so the call handles that request inline.
+    #[test]
+    fn test_async_conn_call_handles_a_nested_request() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let conn = new_async_conn(Arc::new(PipeEnd(client)), Rc::new(TrueHandler));
+        let peer = std::thread::spawn(move || {
+            let call = read_framed(&server);
+            write_framed(&server, r#"{"jsonrpc":"2.0","id":"n1","method":"nested"}"#);
+            let nested = read_framed(&server);
+            write_framed(&server, r#"{"jsonrpc":"2.0","id":"api1","result":1}"#);
+            (call, nested)
+        });
+        let result = conn
+            .call(&context::background(), "resolve", None)
+            .expect("the call returns");
+        let (call, nested) = peer.join().expect("peer thread");
+        assert!(call.contains(r#""method":"resolve""#), "{call}");
+        assert!(
+            nested.contains(r#""id":"n1""#) && nested.contains(r#""result":true"#),
+            "{nested}"
+        );
+        assert_eq!(result.0, b"1");
     }
 
     // Go: ipc/conn_async_test.go:48 TestAsyncConnCallAfterReadLoopFailureReturnsImmediately
