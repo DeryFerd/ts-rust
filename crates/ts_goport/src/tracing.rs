@@ -19,12 +19,9 @@
 //! them the same way. No Go call site passes an empty non-nil map, so an
 //! empty `Args` is the Go nil map and is left out of the JSON.
 //!
-//! PORT: Go writes through the program `vfs.FS`. The session is shared by
-//! the checker threads, so it writes with `std::fs`, with the same
-//! create-directory-and-retry step as Go `osvfs` `WriteFile`/`AppendFile`.
-//! OS error texts are the Rust `io::Error` texts, not the Go ones. A test
-//! process that installs an OS override writes through `osvfs_fs()`
-//! instead (see `write_file`).
+//! PORT: Go writes through the program `vfs.FS` (`sys.FS()`). The session
+//! is shared by the checker threads, so each thread writes through its own
+//! `osvfs_fs()` (see `write_file`).
 
 use crate::execute::incremental::emit_files::fs_error_text;
 use crate::prelude::*;
@@ -976,7 +973,7 @@ impl TypeTracer {
 
         sb.push_str("]\n");
 
-        write_file(&self.types_path, &sb).map_err(|err| err.to_string())
+        write_file(&self.types_path, &sb)
     }
 }
 
@@ -1556,55 +1553,21 @@ fn write_json_float(out: &mut String, value: f64) {
     let _ = write!(out, "{value}");
 }
 
-// Go: vfs/osvfs/os.go:194 writeFileEnsuringDir
-// PORT: Go `WriteFile` truncates and `AppendFile` appends; a failed first
-// write creates the directory and tries once more.
-// PORT: `path` and `content` are port forms of Go strings (see
-// `scanner_util::GO_STRING_MARKER`). The OS gets the Go bytes of the path
-// (`os_path`), and the file gets the Go bytes of the content.
-fn write_file_ensuring_dir(path: &str, content: &str, append: bool) -> std::io::Result<()> {
-    use crate::frontend::vfs::os_path;
-    let write = || -> std::io::Result<()> {
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(!append)
-            .append(append)
-            .open(os_path(path))?;
-        file.write_all(&go_string_bytes(content))
-    };
-    if write().is_ok() {
-        return Ok(());
-    }
-    let directory =
-        crate::frontend::tspath::get_directory_path(&crate::frontend::tspath::normalize_path(path));
-    std::fs::create_dir_all(os_path(&directory))?;
-    write()
+// Go: `tr.fs.WriteFile`, where `tr.fs` is `sys.FS()`: vfs/osvfs/os.go:205
+// WriteFile, or the test file system in a test process.
+// PORT: `osvfs_fs()` is the file system of the calling thread: the OS one,
+// or the test one when a test process installs an OS override
+// (`osvfs::install_os_override`). The error text is Go `err.Error()`.
+fn write_file(path: &str, content: &str) -> Result<(), String> {
+    crate::frontend::vfs::osvfs_fs()
+        .write_file(path, content)
+        .map_err(|err| fs_error_text(&err))
 }
 
-// Go: vfs/osvfs/os.go:205 WriteFile
-// PORT: Go `tr.fs.WriteFile`, where `tr.fs` is `sys.FS()`. A test process
-// installs an OS override (`osvfs::install_os_override`), and then the
-// session writes through that thread's `osvfs_fs()`, which is the test
-// file system. The error text is Go `err.Error()`. A real run never
-// installs the override and writes with `std::fs` as before.
-fn write_file(path: &str, content: &str) -> std::io::Result<()> {
-    if crate::frontend::vfs::os_override_installed() {
-        return crate::frontend::vfs::osvfs_fs()
-            .write_file(path, content)
-            .map_err(|err| std::io::Error::other(fs_error_text(&err)));
-    }
-    write_file_ensuring_dir(path, content, false)
-}
-
-// Go: vfs/osvfs/os.go:209 AppendFile
-// PORT: Go `tr.fs.AppendFile`; see `write_file` for the OS override.
-fn append_file(path: &str, content: &str) -> std::io::Result<()> {
-    if crate::frontend::vfs::os_override_installed() {
-        return crate::frontend::vfs::osvfs_fs()
-            .append_file(path, content)
-            .map_err(|err| std::io::Error::other(fs_error_text(&err)));
-    }
-    write_file_ensuring_dir(path, content, true)
+// Go: `tr.fs.AppendFile` (vfs/osvfs/os.go:209 AppendFile); see
+// `write_file`.
+fn append_file(path: &str, content: &str) -> Result<(), String> {
+    crate::frontend::vfs::osvfs_fs()
+        .append_file(path, content)
+        .map_err(|err| fs_error_text(&err))
 }

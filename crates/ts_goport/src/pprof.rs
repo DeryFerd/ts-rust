@@ -26,13 +26,13 @@
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, FileExt};
+use std::os::unix::fs::FileExt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -42,10 +42,13 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use rustc_hash::FxHashMap;
 
+use crate::core::go_panic;
+use crate::execute::incremental::emit_files::fs_error_text;
 use crate::execute::tsc::compile::{Writer, write_str};
 // PORT: the paths are port forms of Go strings (see
 // `scanner_util::GO_STRING_MARKER`); the OS gets their Go bytes (`os_path`).
-use crate::frontend::vfs::osvfs::{filepath_clean, os_path};
+use crate::frontend::vfs::osvfs::{filepath_clean, os_mkdir_all, os_path};
+use crate::fswatch::syscall::io_error_text;
 use crate::gostd::{GoError, errors};
 
 // Go: pprof/pprof.go:15 ProfileSession
@@ -62,17 +65,11 @@ pub struct ProfileSession {
 
 // Go: pprof/pprof.go:23 BeginProfiling
 // BeginProfiling starts CPU and memory profiling, writing the profiles to the specified directory.
-// PORT: Go `panic(err)` panics with the Go error text.
+// PORT: Go `panic(err)` is `go_panic` with the Go error text.
 #[must_use]
 pub fn begin_profiling(profile_dir: &str, log_writer: Writer) -> ProfileSession {
-    // Go: os.MkdirAll(profileDir, 0o755). Off unix the mode does not
-    // apply, as in Go.
-    let mut builder = DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    builder.mode(0o755);
-    if let Err(err) = builder.create(os_path(profile_dir)) {
-        panic!("mkdir {profile_dir}: {err}");
+    if let Err(err) = mkdir_all(profile_dir, 0o755) {
+        go_panic(err.error());
     }
 
     let pid = std::process::id();
@@ -85,7 +82,7 @@ pub fn begin_profiling(profile_dir: &str, log_writer: Writer) -> ProfileSession 
     // Go: pprof.StartCPUProfile(cpuFile), then `panic(err)`.
     let cpu_profile = match start_cpu_profile() {
         Ok(cpu_profile) => cpu_profile,
-        Err(err) => panic!("{err}"),
+        Err(err) => go_panic(err.to_string()),
     };
 
     ProfileSession {
@@ -112,7 +109,7 @@ impl ProfileSession {
             let mem_file = os_create(&self.mem_file_path);
             // Go: pprof.Lookup("allocs").WriteTo(memFile, 0), then `panic(err)`.
             if let Err(err) = write_alloc(&mem_file) {
-                panic!("write {}: {err}", self.mem_file_path);
+                go_panic(path_error("write", &self.mem_file_path, &err).error());
             }
             // Go: memFile.Close()
             drop(mem_file);
@@ -140,15 +137,9 @@ impl Drop for ProfileSession {
 
 // Go: os.Create (O_RDWR|O_CREATE|O_TRUNC, 0o666), then `panic(err)`.
 fn os_create(name: &str) -> File {
-    match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(os_path(name))
-    {
+    match create(name) {
         Ok(file) => file,
-        Err(err) => panic!("open {name}: {err}"),
+        Err(err) => go_panic(err.error()),
     }
 }
 
@@ -304,64 +295,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 // Go standard library: os (go1.26.8)
 // ---------------------------------------------------------------------
 
-// Go: os/path.go:19 MkdirAll
-// MkdirAll creates a directory named path,
-// along with any necessary parents, and returns nil,
-// or else returns an error.
-// PORT: Go `Stat`, `Mkdir` and `Lstat` are `std::fs::metadata`,
-// `DirBuilder::create` and `std::fs::symlink_metadata`. There is no
-// volume name on Unix.
+// Go: os/path.go:19 MkdirAll, as a Go error (osvfs `os_mkdir_all`).
 fn mkdir_all(path: &str, perm: u32) -> Result<(), GoError> {
-    // Fast path: if we can tell whether path is a directory or file, stop with success or error.
-    if let Ok(dir) = std::fs::metadata(os_path(path)) {
-        if dir.is_dir() {
-            return Ok(());
-        }
-        // Go: &PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
-        return Err(errors::new(format!(
-            "mkdir {path}: {}",
-            errno_text(ENOTDIR)
-        )));
-    }
-
-    // Slow path: make sure parent exists and then call Mkdir for path.
-
-    // Extract the parent folder from path by first removing any trailing
-    // path separator and then scanning backward until finding a path
-    // separator or reaching the beginning of the string.
-    let p = path.as_bytes();
-    let mut i = p.len() as isize - 1;
-    while i >= 0 && p[i as usize] == b'/' {
-        i -= 1;
-    }
-    while i >= 0 && p[i as usize] != b'/' {
-        i -= 1;
-    }
-    if i < 0 {
-        i = 0;
-    }
-
-    // If there is a parent directory, and it is not the volume name,
-    // recurse to ensure parent directory exists.
-    let parent = &path[..i as usize];
-    if !parent.is_empty() {
-        mkdir_all(parent, perm)?;
-    }
-
-    // Parent now exists; invoke Mkdir and use its result.
-    // PORT: off unix `perm` does not apply, as in Go.
-    let mut builder = DirBuilder::new();
-    #[cfg(unix)]
-    builder.mode(perm);
-    if let Err(err) = builder.create(os_path(path)) {
-        // Handle arguments like "foo/." by
-        // double-checking that directory doesn't exist.
-        if std::fs::symlink_metadata(os_path(path)).is_ok_and(|dir| dir.is_dir()) {
-            return Ok(());
-        }
-        return Err(path_error("mkdir", path, &err));
-    }
-    Ok(())
+    os_mkdir_all(path, perm).map_err(|err| errors::new(fs_error_text(&err)))
 }
 
 // Go: os/file.go:399 Create, which returns `&PathError{Op: "open", ...}`.
@@ -377,52 +313,7 @@ fn create(name: &str) -> Result<File, GoError> {
 
 // Go: io/fs.PathError.Error, "op path: err", with the Go text of the errno.
 pub(crate) fn path_error(op: &str, path: &str, err: &io::Error) -> GoError {
-    let text = match err.raw_os_error() {
-        Some(errno) => errno_text(errno),
-        None => err.to_string(),
-    };
-    errors::new(format!("{op} {path}: {text}"))
-}
-
-// Go: syscall/zerrors_linux_amd64.go ENOTDIR
-const ENOTDIR: i32 = 0x14;
-
-// Go: syscall/syscall_unix.go:110 Errno.Error, with the texts of
-// syscall/zerrors_linux_amd64.go `errors`.
-// PORT: only the errnos that stat, mkdir, open, write and read can give.
-fn errno_text(errno: i32) -> String {
-    let text = match errno {
-        1 => "operation not permitted",
-        2 => "no such file or directory",
-        4 => "interrupted system call",
-        5 => "input/output error",
-        6 => "no such device or address",
-        9 => "bad file descriptor",
-        11 => "resource temporarily unavailable",
-        12 => "cannot allocate memory",
-        13 => "permission denied",
-        14 => "bad address",
-        16 => "device or resource busy",
-        17 => "file exists",
-        19 => "no such device",
-        20 => "not a directory",
-        21 => "is a directory",
-        22 => "invalid argument",
-        23 => "too many open files in system",
-        24 => "too many open files",
-        26 => "text file busy",
-        27 => "file too large",
-        28 => "no space left on device",
-        30 => "read-only file system",
-        31 => "too many links",
-        36 => "file name too long",
-        40 => "too many levels of symbolic links",
-        75 => "value too large for defined data type",
-        95 => "operation not supported",
-        122 => "disk quota exceeded",
-        _ => return format!("errno {errno}"),
-    };
-    text.to_string()
+    errors::new(format!("{op} {path}: {}", io_error_text(err)))
 }
 
 // ---------------------------------------------------------------------
