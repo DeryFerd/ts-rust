@@ -181,7 +181,10 @@ impl module::Resolver for CallbackModuleResolver {
     // Go: api/module_resolution.go callbackModuleResolver.PackageJsonCacheEntries
     fn package_json_cache_entries(
         &self,
-        f: &mut dyn FnMut(&tspath::Path, &Rc<crate::frontend::packagejson::InfoCacheEntry>) -> bool,
+        f: &mut dyn FnMut(
+            &tspath::Path,
+            crate::frontend::module::cache::PackageJsonCacheEntry<'_>,
+        ) -> bool,
     ) {
         self.fallback_resolver.package_json_cache_entries(f);
     }

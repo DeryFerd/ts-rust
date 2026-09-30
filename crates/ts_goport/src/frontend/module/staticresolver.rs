@@ -250,7 +250,10 @@ impl Resolver for StaticResolver {
     }
 
     // Go: module/staticresolver.go:144 PackageJsonCacheEntries
-    fn package_json_cache_entries(&self, f: &mut dyn FnMut(&Path, &Rc<InfoCacheEntry>) -> bool) {
+    fn package_json_cache_entries(
+        &self,
+        f: &mut dyn FnMut(&Path, PackageJsonCacheEntry<'_>) -> bool,
+    ) {
         self.fallback.package_json_cache_entries(f);
     }
 

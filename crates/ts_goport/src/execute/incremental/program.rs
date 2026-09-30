@@ -883,11 +883,11 @@ impl Program {
         let config = get_directory_path(command_line().config_name());
         if !config.is_empty() {
             package_json_cache_entries(|_key, value| {
-                let mut package_json = combine_paths(&value.package_directory, &["package.json"]);
-                if value.exists() || value.directory_exists {
+                let mut package_json = combine_paths(value.package_directory, &["package.json"]);
+                if value.exists || value.directory_exists {
                     package_json = host().fs().realpath(&package_json);
                 }
-                if value.exists() {
+                if value.exists {
                     package_jsons.push(package_json);
                 } else if package_json.contains("/node_modules/") {
                     missing_package_jsons.push(package_json);
@@ -910,8 +910,8 @@ impl Program {
 
         let mut package_jsons = Vec::new();
         package_json_cache_entries(|_key, value| {
-            let mut package_json = combine_paths(&value.package_directory, &["package.json"]);
-            if value.exists() || value.directory_exists {
+            let mut package_json = combine_paths(value.package_directory, &["package.json"]);
+            if value.exists || value.directory_exists {
                 package_json = host().fs().realpath(&package_json);
             }
             package_jsons.push(package_json);

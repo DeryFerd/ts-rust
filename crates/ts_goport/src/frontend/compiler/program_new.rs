@@ -183,7 +183,7 @@ impl NewProgram {
     // PackageJsonCacheEntries iterates on all package json cache entries.
     pub fn package_json_cache_entries(
         &self,
-        mut f: impl FnMut(&Path, &Rc<InfoCacheEntry>) -> bool,
+        mut f: impl FnMut(&Path, PackageJsonCacheEntry<'_>) -> bool,
     ) {
         self.resolver_ref().package_json_cache_entries(&mut f);
     }

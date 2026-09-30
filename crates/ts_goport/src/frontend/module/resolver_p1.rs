@@ -305,10 +305,53 @@ impl DefaultResolver {
 
     // Go: module/resolver.go:215 PackageJsonCacheEntries (tsgo#4301)
     // PORT: the entries include the package.json lookups of the parse
-    // worker answers that this resolver took (`add_worker_package_jsons`).
-    pub fn package_json_cache_entries(&self, f: impl FnMut(&Path, &Rc<InfoCacheEntry>) -> bool) {
-        self.add_worker_package_jsons();
-        self.caches.package_json_info_cache.range(f);
+    // worker answers that this resolver took (`Caches::worker_package_jsons`),
+    // so that they are what the one Go cache of all parse tasks holds: after
+    // the cache's own entries, each lookup whose package.json the cache and
+    // the lookups before it do not have, as the worker saw it. Go's lookup
+    // reads each package.json that exists; the worker read it, and its
+    // `exists` flag is `InfoCacheEntry::exists` of what it read, so the
+    // entry is not read again (`PackageJsonCacheEntry`). The order of the
+    // entries is not defined, as in Go.
+    pub fn package_json_cache_entries(
+        &self,
+        mut f: impl FnMut(&Path, PackageJsonCacheEntry<'_>) -> bool,
+    ) {
+        let cache = &self.caches.package_json_info_cache;
+        let mut go_on = true;
+        cache.range(|key, entry| {
+            go_on = f(
+                key,
+                PackageJsonCacheEntry {
+                    package_directory: &entry.package_directory,
+                    directory_exists: entry.directory_exists,
+                    exists: entry.exists(),
+                },
+            );
+            go_on
+        });
+        if !go_on {
+            return;
+        }
+        let worker_package_jsons = self.caches.worker_package_jsons.borrow();
+        let mut seen: FxHashSet<Path> = FxHashSet::default();
+        for lookup in worker_package_jsons
+            .iter()
+            .flat_map(|lookups| lookups.iter())
+        {
+            let key = cache.key(&combine_paths(&lookup.package_directory, &["package.json"]));
+            if cache.contains_key(&key) || !seen.insert(key.clone()) {
+                continue;
+            }
+            let entry = PackageJsonCacheEntry {
+                package_directory: &lookup.package_directory,
+                directory_exists: lookup.directory_exists,
+                exists: lookup.exists,
+            };
+            if !f(&key, entry) {
+                return;
+            }
+        }
     }
 
     /// Takes the file system lookups of the parse worker answers that this
@@ -316,43 +359,6 @@ impl DefaultResolver {
     // PORT: not in Go (see `BuildStatCache`).
     pub fn take_worker_lookups(&self) -> Vec<Arc<[StatLookup]>> {
         std::mem::take(&mut *self.caches.worker_lookups.borrow_mut())
-    }
-
-    /// Adds to the package.json cache the lookups of the parse worker
-    /// answers that this resolver took (`Caches::worker_package_jsons`), so
-    /// that it holds what the one Go cache of all parse tasks holds. An
-    /// entry with no package.json is stored as the worker saw it. A
-    /// package.json that exists is read again, as the lookup reads it.
-    // PORT: not in Go. Go's parse tasks share one package.json cache.
-    fn add_worker_package_jsons(&self) {
-        let worker_package_jsons =
-            std::mem::take(&mut *self.caches.worker_package_jsons.borrow_mut());
-        if worker_package_jsons.is_empty() {
-            return;
-        }
-        let cache = &self.caches.package_json_info_cache;
-        let mut state = ResolutionState::zero(self, self.compiler_options.clone());
-        for lookup in worker_package_jsons
-            .iter()
-            .flat_map(|lookups| lookups.iter())
-        {
-            let package_json_path = combine_paths(&lookup.package_directory, &["package.json"]);
-            if cache.get(&package_json_path).is_some() {
-                continue;
-            }
-            if lookup.exists {
-                let _ = state.get_package_json_info(&lookup.package_directory);
-            } else {
-                let _ = cache.set(
-                    &package_json_path,
-                    Rc::new(InfoCacheEntry {
-                        package_directory: lookup.package_directory.clone(),
-                        directory_exists: lookup.directory_exists,
-                        contents: None,
-                    }),
-                );
-            }
-        }
     }
 }
 

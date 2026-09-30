@@ -71,6 +71,6 @@ pub fn host() -> Rc<dyn CompilerHost> {
 }
 
 // Go: compiler/program.go:156 PackageJsonCacheEntries
-pub fn package_json_cache_entries(f: impl FnMut(&Path, &Rc<InfoCacheEntry>) -> bool) {
+pub fn package_json_cache_entries(f: impl FnMut(&Path, PackageJsonCacheEntry<'_>) -> bool) {
     frontend_program().package_json_cache_entries(f);
 }

@@ -1644,29 +1644,79 @@ fn handle_option_config_dir_template_substitution(
     );
 }
 
-/// Go `[]string` extension group as the `&[&str]` that tspath takes.
-fn str_group(group: &[String]) -> Vec<&str> {
-    group.iter().map(String::as_str).collect()
+/// PORT: not in Go (perf). The extension group of one file and the
+/// `ChangeExtension` results of that file, as the two extension priority
+/// checks below read them. Go computes the group in each check and makes a
+/// new string for each changed extension; here the group is computed once
+/// per file and each changed name is built in one reused buffer, with the
+/// same text.
+struct ExtensionPriority<'e> {
+    /// The extension groups of the supported extensions.
+    groups: &'e [Vec<&'e str>],
+    /// The extensions of the groups that contain the file's extension, in
+    /// order (Go `extensionGroup`).
+    group: Vec<&'e str>,
+    /// `ChangeExtension(file, ext)` of the last `changed` call.
+    changed: String,
+    /// `ChangeExtension(file, "")`, made at the first `changed` call.
+    stem: Option<String>,
+}
+
+impl<'e> ExtensionPriority<'e> {
+    fn new(groups: &'e [Vec<&'e str>]) -> Self {
+        ExtensionPriority {
+            groups,
+            group: Vec::new(),
+            changed: String::new(),
+            stem: None,
+        }
+    }
+
+    /// Starts on `file`: its extension group.
+    fn start(&mut self, file: &str) {
+        self.group.clear();
+        self.stem = None;
+        for group in self.groups {
+            if file_extension_is_one_of(file, group) {
+                self.group.extend_from_slice(group);
+            }
+        }
+    }
+
+    /// Go `tspath.ChangeExtension(file, ext)` for a non-empty `ext`.
+    // PORT: `change_extension(file, "")` is the file name without the
+    // extension that `ChangeExtension` removes, or the file name when it
+    // removes none; then `ChangeExtension` returns the file name unchanged.
+    fn changed(&mut self, file: &str, ext: &str) -> &str {
+        let stem = self.stem.get_or_insert_with(|| change_extension(file, ""));
+        self.changed.clear();
+        if stem.len() == file.len() {
+            self.changed.push_str(file);
+        } else {
+            self.changed.push_str(stem);
+            if !ext.starts_with('.') {
+                self.changed.push('.');
+            }
+            self.changed.push_str(ext);
+        }
+        &self.changed
+    }
 }
 
 // hasFileWithHigherPriorityExtension determines whether a literal or wildcard file has already been included that has a higher extension priority.
 // file is the path to the file.
 // Go: tsoptions/tsconfigparsing.go:1601 hasFileWithHigherPriorityExtension
+// PORT: `priority` has the file's extension group (`ExtensionPriority::start`).
 fn has_file_with_higher_priority_extension(
     file: &str,
-    extensions: &[Vec<String>],
+    priority: &mut ExtensionPriority<'_>,
     has_file: impl Fn(&str) -> bool,
 ) -> bool {
-    let mut extension_group: Vec<&str> = Vec::new();
-    for group in extensions {
-        if file_extension_is_one_of(file, &str_group(group)) {
-            extension_group.extend(group.iter().map(String::as_str));
-        }
-    }
-    if extension_group.is_empty() {
+    if priority.group.is_empty() {
         return false;
     }
-    for ext in extension_group {
+    for index in 0..priority.group.len() {
+        let ext = priority.group[index];
         // d.ts files match with .ts extension and with case sensitive sorting the file order for same files with ts tsx and dts extension is
         // d.ts, .ts, .tsx in that order so we need to handle tsx and dts of same same name case here and in remove files with same extensions
         // So dont match .d.ts files with .ts extension
@@ -1675,7 +1725,7 @@ fn has_file_with_higher_priority_extension(
         {
             return false;
         }
-        if has_file(&change_extension(file, ext)) {
+        if has_file(priority.changed(file, ext)) {
             if ext == EXTENSION_DTS
                 && (file_extension_is(file, EXTENSION_JS) || file_extension_is(file, EXTENSION_JSX))
             {
@@ -1693,29 +1743,27 @@ fn has_file_with_higher_priority_extension(
 // Removes files included via wildcard expansion with a lower extension priority that have already been included.
 // file is the path to the file.
 // Go: tsoptions/tsconfigparsing.go:1633 removeWildcardFilesWithLowerPriorityExtension
-// PORT: Go `OrderedMap.Delete` keeps the order of the other keys, like
-// `shift_remove`.
+// PORT: `priority` has the file's extension group (`ExtensionPriority::start`).
 fn remove_wildcard_files_with_lower_priority_extension(
     file: &str,
     wildcard_files: &mut IndexMap<String, String>,
-    extensions: &[Vec<String>],
-    key_mapper: impl Fn(&str) -> String,
+    priority: &mut ExtensionPriority<'_>,
+    use_case_sensitive_file_names: bool,
 ) {
-    let mut extension_group: Vec<&str> = Vec::new();
-    for group in extensions {
-        if file_extension_is_one_of(file, &str_group(group)) {
-            extension_group.extend(group.iter().map(String::as_str));
-        }
-    }
-    if extension_group.is_empty() {
+    if priority.group.is_empty() {
         return;
     }
-    for ext in extension_group.iter().rev() {
+    for index in (0..priority.group.len()).rev() {
+        let ext = priority.group[index];
         if file_extension_is(file, ext) {
             return;
         }
-        let lower_priority_path = key_mapper(&change_extension(file, ext));
-        wildcard_files.shift_remove(&lower_priority_path);
+        let changed = priority.changed(file, ext);
+        if use_case_sensitive_file_names {
+            wildcard_files.shift_remove(changed);
+        } else {
+            wildcard_files.shift_remove(&get_canonical_file_name(changed, false));
+        }
     }
 }
 
@@ -1775,6 +1823,12 @@ pub(crate) fn get_file_names_from_config_specs(
     }
 
     let mut json_only_include_matchers: Option<SpecMatcher> = None;
+    let use_case_sensitive_file_names = host.use_case_sensitive_file_names();
+    let extension_groups: Vec<Vec<&str>> = supported_extensions
+        .iter()
+        .map(|group| group.iter().map(String::as_str).collect())
+        .collect();
+    let mut priority = ExtensionPriority::new(&extension_groups);
     if !validated_include_specs.is_empty() {
         let flat_extensions: Vec<String> = supported_extensions_with_json_if_resolve_json_module
             .iter()
@@ -1825,10 +1879,16 @@ pub(crate) fn get_file_names_from_config_specs(
             // This handles cases where we may encounter both <file>.ts and
             // <file>.d.ts (or <file>.js if "allowJs" is enabled) in the same
             // directory when they are compilation outputs.
-            if has_file_with_higher_priority_extension(file, &supported_extensions, |file_name| {
-                let canonical_file_name = key_mappper(file_name);
-                literal_file_map.contains_key(&canonical_file_name)
-                    || wildcard_file_map.contains_key(&canonical_file_name)
+            priority.start(file);
+            if has_file_with_higher_priority_extension(file, &mut priority, |file_name| {
+                let has = |key: &str| {
+                    literal_file_map.contains_key(key) || wildcard_file_map.contains_key(key)
+                };
+                if use_case_sensitive_file_names {
+                    has(file_name)
+                } else {
+                    has(&key_mappper(file_name))
+                }
             }) {
                 continue;
             }
@@ -1839,8 +1899,8 @@ pub(crate) fn get_file_names_from_config_specs(
             remove_wildcard_files_with_lower_priority_extension(
                 file,
                 &mut wildcard_file_map,
-                &supported_extensions,
-                key_mappper,
+                &mut priority,
+                use_case_sensitive_file_names,
             );
             let key = key_mappper(file);
             if !literal_file_map.contains_key(&key) && !wildcard_file_map.contains_key(&key) {
@@ -1985,4 +2045,51 @@ pub fn get_parsed_command_line_of_config_file_path(
         )),
         Vec::new(),
     )
+}
+
+#[cfg(test)]
+mod extension_priority_tests {
+    use super::*;
+
+    // `ExtensionPriority::changed` is `change_extension`, and `start` finds
+    // the groups that Go's checks find.
+    #[test]
+    fn changed_matches_change_extension() {
+        let groups: Vec<Vec<&str>> = vec![
+            vec![".ts", ".tsx", ".d.ts"],
+            vec![".cts", ".d.cts"],
+            vec![".mts", ".d.mts"],
+            vec![".js", ".jsx"],
+            vec![".vue"],
+        ];
+        let mut priority = ExtensionPriority::new(&groups);
+        for file in [
+            "/a/b.ts",
+            "/a/b.d.ts",
+            "/a/b.tsx",
+            "/a/b.d.mts",
+            "/a/b.js",
+            "/a.dir/b.c.jsx",
+            "/a/b.json",
+            "/a/b.vue",
+            "/a/b",
+            "/a/.ts",
+        ] {
+            priority.start(file);
+            let expected: Vec<&str> = groups
+                .iter()
+                .filter(|group| file_extension_is_one_of(file, group))
+                .flatten()
+                .copied()
+                .collect();
+            assert_eq!(priority.group, expected, "{file}");
+            for ext in [".ts", ".d.ts", ".tsx", ".d.mts", ".js", "vue"] {
+                assert_eq!(
+                    priority.changed(file, ext),
+                    change_extension(file, ext),
+                    "{file} {ext}"
+                );
+            }
+        }
+    }
 }

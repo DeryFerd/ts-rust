@@ -41,10 +41,11 @@ fn unmarshal_int(dec: &mut JsonDecoder<'_>) -> Result<i64, JsonError> {
             Ok(0)
         }
         b'0' => {
-            let JsonToken::Number(raw) = dec.read_token()? else {
+            // PERF: the number text is borrowed (`read_token_ref`).
+            let JsonTokenRef::Number(raw) = dec.read_token_ref()? else {
                 unreachable!("peeked a number")
             };
-            parse_go_int(&raw)
+            parse_go_int(raw)
         }
         _ => {
             dec.skip_value()?;
@@ -152,7 +153,8 @@ fn unmarshal_object(
         b'{' => {
             dec.read_token()?;
             while dec.peek_kind() != b'}' {
-                let JsonToken::String(name) = dec.read_token()? else {
+                // PERF: the name is borrowed when it can be (`read_token_ref`).
+                let JsonTokenRef::String(name) = dec.read_token_ref()? else {
                     return Err(json_error("invalid object member name"));
                 };
                 if !field(&name, dec)? {

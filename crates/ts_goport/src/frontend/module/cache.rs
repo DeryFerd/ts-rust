@@ -143,8 +143,8 @@ pub struct Caches {
     pub package_json_log: RefCell<Vec<PackageJsonLookup>>,
 
     /// The loader's resolver: the package.json lookups of the worker
-    /// answers that it took from `shared`. They go into
-    /// `package_json_info_cache` before a read of all its entries
+    /// answers that it took from `shared`. A read of all the package.json
+    /// cache entries lists them too
     /// (`DefaultResolver::package_json_cache_entries`).
     pub worker_package_jsons: RefCell<Vec<Arc<[PackageJsonLookup]>>>,
 
@@ -294,6 +294,21 @@ pub struct PackageJsonLookup {
     pub package_directory: String,
     pub directory_exists: bool,
     /// The package.json file exists (`InfoCacheEntry::exists`).
+    pub exists: bool,
+}
+
+/// One entry of `DefaultResolver::package_json_cache_entries`: the parts
+/// of a package.json cache entry (Go `*packagejson.InfoCacheEntry`) that the
+/// build info reads.
+// PORT: Go yields the cache entries. The entries of the parse workers'
+// lookups (`Caches::worker_package_jsons`) have no contents here, so the
+// callback gets these parts of each entry instead.
+#[derive(Clone, Copy, Debug)]
+pub struct PackageJsonCacheEntry<'e> {
+    /// Go `GetDirectory()`.
+    pub package_directory: &'e str,
+    pub directory_exists: bool,
+    /// Go `Exists()`: the package.json file was read.
     pub exists: bool,
 }
 
@@ -530,9 +545,9 @@ mod tests {
         resolver.package_json_cache_entries(|key, entry| {
             entries.push((
                 key.0.clone(),
-                entry.package_directory.clone(),
+                entry.package_directory.to_string(),
                 entry.directory_exists,
-                entry.exists(),
+                entry.exists,
             ));
             true
         });

@@ -23,6 +23,7 @@
 //! has the Go `jsontext` text (`json_ext::syntactic_error_text`).
 
 use crate::frontend::prelude::*;
+use std::borrow::Cow;
 
 /// Go JSON v2 `*json.SemanticError` / `*jsontext.SyntacticError`.
 /// PORT: one error type with a message.
@@ -118,11 +119,46 @@ const MAX_NESTING_DEPTH: usize = 10000;
 
 // One open JSON object or array (Go jsontext `stateEntry` plus the
 // namespace of seen object names).
-struct Frame {
+struct Frame<'a> {
     is_object: bool,
     len: usize,
     // `None` when duplicate names are allowed or the namespace is disabled.
-    names: Option<FxHashSet<String>>,
+    // PERF: a name is its unquoted text before the port form conversion
+    // (`scan_string`), which is one to one, so equal names are still equal.
+    // A name with no escape borrows the input.
+    names: Option<FxHashSet<Cow<'a, str>>>,
+}
+
+/// PORT: not in Go (perf). A `JsonToken` whose text borrows the input
+/// where it can (`JsonDecoder::read_token_ref`): a string with no escape
+/// and no port form change, and each number.
+#[derive(Clone, Debug, PartialEq)]
+pub enum JsonTokenRef<'a> {
+    Null,
+    False,
+    True,
+    String(Cow<'a, str>),
+    /// The raw number text.
+    Number(&'a str),
+    BeginObject,
+    EndObject,
+    BeginArray,
+    EndArray,
+}
+
+/// A token of `JsonDecoder::next_token`: a `JsonToken` whose string is the
+/// unquoted text before the port form conversion, and whose number is the
+/// raw text, both borrowed from the input when they can be.
+enum RawToken<'a> {
+    Null,
+    False,
+    True,
+    String(Cow<'a, str>),
+    Number(&'a str),
+    BeginObject,
+    EndObject,
+    BeginArray,
+    EndArray,
 }
 
 /// Go `jsontext.Decoder` over a complete input buffer.
@@ -131,9 +167,11 @@ pub struct JsonDecoder<'a> {
     // Go `prevEnd`: the end of the last read token or value.
     pos: usize,
     // Open containers. The top-level virtual array is `top_len`.
-    stack: Vec<Frame>,
+    stack: Vec<Frame<'a>>,
     top_len: usize,
     pub options: JsonOptions,
+    // PERF: the name sets of closed objects, empty, for the next objects.
+    spare_names: Vec<FxHashSet<Cow<'a, str>>>,
 }
 
 fn is_ws(c: u8) -> bool {
@@ -179,6 +217,7 @@ impl<'a> JsonDecoder<'a> {
             stack: Vec::new(),
             top_len: 0,
             options,
+            spare_names: Vec::new(),
         }
     }
 
@@ -259,9 +298,15 @@ impl<'a> JsonDecoder<'a> {
     /// `Tokens.Last.DisableNamespace`): stop duplicate-name checks for the
     /// innermost open object.
     pub fn disable_namespace(&mut self) {
-        if let Some(f) = self.stack.last_mut() {
-            f.names = None;
+        if let Some(names) = self.stack.last_mut().and_then(|f| f.names.take()) {
+            self.keep_names(names);
         }
+    }
+
+    /// Keeps the emptied name set `names` for a later object.
+    fn keep_names(&mut self, mut names: FxHashSet<Cow<'a, str>>) {
+        names.clear();
+        self.spare_names.push(names);
     }
 
     /// Go `jsontext.Decoder.StackDepth` plus the length of the innermost
@@ -280,14 +325,60 @@ impl<'a> JsonDecoder<'a> {
 
     /// Go `jsontext.Decoder.ReadToken`.
     pub fn read_token(&mut self) -> Result<JsonToken, JsonError> {
+        Ok(match self.next_token()? {
+            RawToken::Null => JsonToken::Null,
+            RawToken::False => JsonToken::False,
+            RawToken::True => JsonToken::True,
+            RawToken::String(s) => JsonToken::String(self.string_value(s)),
+            RawToken::Number(raw) => JsonToken::Number(raw.to_string()),
+            RawToken::BeginObject => JsonToken::BeginObject,
+            RawToken::EndObject => JsonToken::EndObject,
+            RawToken::BeginArray => JsonToken::BeginArray,
+            RawToken::EndArray => JsonToken::EndArray,
+        })
+    }
+
+    /// PORT: not in Go (perf). `read_token` as a `JsonTokenRef`: the same
+    /// token, checks and errors, without a copy of text that it can borrow.
+    pub fn read_token_ref(&mut self) -> Result<JsonTokenRef<'a>, JsonError> {
+        Ok(match self.next_token()? {
+            RawToken::Null => JsonTokenRef::Null,
+            RawToken::False => JsonTokenRef::False,
+            RawToken::True => JsonTokenRef::True,
+            RawToken::String(s) => JsonTokenRef::String(
+                if self.options.port_form || !crate::scanner_util::contains_go_string_marker(&s) {
+                    s
+                } else {
+                    Cow::Owned(self.string_value(s))
+                },
+            ),
+            RawToken::Number(raw) => JsonTokenRef::Number(raw),
+            RawToken::BeginObject => JsonTokenRef::BeginObject,
+            RawToken::EndObject => JsonTokenRef::EndObject,
+            RawToken::BeginArray => JsonTokenRef::BeginArray,
+            RawToken::EndArray => JsonTokenRef::EndArray,
+        })
+    }
+
+    /// The string of a `JsonToken`: the unquoted text `s` in the port form.
+    fn string_value(&self, s: Cow<'a, str>) -> String {
+        if self.options.port_form {
+            return s.into_owned();
+        }
+        crate::scanner_util::go_string_from_utf8(s.into_owned())
+    }
+
+    /// `read_token` without the `JsonToken` copies of the text
+    /// (`RawToken`): the same checks, state changes and errors.
+    fn next_token(&mut self) -> Result<RawToken<'a>, JsonError> {
         let (p, _) = self.peek_pos()?;
         let c = self.buf[p];
         match c {
             b'n' | b't' | b'f' => {
-                let (lit, tok): (&[u8], JsonToken) = match c {
-                    b'n' => (b"null", JsonToken::Null),
-                    b't' => (b"true", JsonToken::True),
-                    _ => (b"false", JsonToken::False),
+                let (lit, tok): (&[u8], RawToken<'a>) = match c {
+                    b'n' => (b"null", RawToken::Null),
+                    b't' => (b"true", RawToken::True),
+                    _ => (b"false", RawToken::False),
                 };
                 if !self.buf[p..].starts_with(lit) {
                     return Err(JsonError::new(format!("invalid literal at offset {p}")));
@@ -297,13 +388,14 @@ impl<'a> JsonDecoder<'a> {
                 Ok(tok)
             }
             b'"' => {
-                let (end, s) = self.consume_string(p)?;
+                let (end, s) = self.scan_string(p)?;
                 if self.need_object_name() {
                     let dup = match &mut self.stack.last_mut().expect("object frame").names {
                         Some(names) => !names.insert(s.clone()),
                         None => false,
                     };
                     if dup {
+                        let s = self.string_value(s);
                         return Err(JsonError::new(format!(
                             "duplicate object member name {s:?}"
                         )));
@@ -311,14 +403,14 @@ impl<'a> JsonDecoder<'a> {
                 }
                 self.increment();
                 self.pos = end;
-                Ok(JsonToken::String(s))
+                Ok(RawToken::String(s))
             }
             b'-' | b'0'..=b'9' => {
                 let end = self.consume_number(p)?;
                 self.append_value()?;
                 self.pos = end;
                 let raw = std::str::from_utf8(&self.buf[p..end]).expect("number is ASCII");
-                Ok(JsonToken::Number(raw.to_string()))
+                Ok(RawToken::Number(raw))
             }
             b'{' | b'[' => {
                 if self.need_object_name() {
@@ -336,7 +428,7 @@ impl<'a> JsonDecoder<'a> {
                 self.increment();
                 let is_object = c == b'{';
                 let names = if is_object && !self.options.allow_duplicate_names {
-                    Some(FxHashSet::default())
+                    Some(self.spare_names.pop().unwrap_or_default())
                 } else {
                     None
                 };
@@ -347,9 +439,9 @@ impl<'a> JsonDecoder<'a> {
                 });
                 self.pos = p + 1;
                 Ok(if is_object {
-                    JsonToken::BeginObject
+                    RawToken::BeginObject
                 } else {
-                    JsonToken::BeginArray
+                    RawToken::BeginArray
                 })
             }
             b'}' => {
@@ -359,9 +451,11 @@ impl<'a> JsonDecoder<'a> {
                 if self.need_object_value() {
                     return Err(JsonError::new("missing value after object name"));
                 }
-                self.stack.pop();
+                if let Some(names) = self.stack.pop().and_then(|f| f.names) {
+                    self.keep_names(names);
+                }
                 self.pos = p + 1;
-                Ok(JsonToken::EndObject)
+                Ok(RawToken::EndObject)
             }
             b']' => {
                 if self.stack.is_empty() || self.last_is_object() {
@@ -369,7 +463,7 @@ impl<'a> JsonDecoder<'a> {
                 }
                 self.stack.pop();
                 self.pos = p + 1;
-                Ok(JsonToken::EndArray)
+                Ok(RawToken::EndArray)
             }
             _ => Err(JsonError::new(format!(
                 "invalid character {:?} at offset {p}",
@@ -383,10 +477,10 @@ impl<'a> JsonDecoder<'a> {
     pub fn read_value(&mut self) -> Result<&'a [u8], JsonError> {
         let (start, _) = self.peek_pos()?;
         let depth = self.stack.len();
-        let tok = self.read_token()?;
-        if matches!(tok, JsonToken::BeginObject | JsonToken::BeginArray) {
+        let tok = self.next_token()?;
+        if matches!(tok, RawToken::BeginObject | RawToken::BeginArray) {
             while self.stack.len() > depth {
-                self.read_token()?;
+                self.next_token()?;
             }
         }
         Ok(&self.buf[start..self.pos])
@@ -411,14 +505,28 @@ impl<'a> JsonDecoder<'a> {
     }
 
     // Go `jsonwire.ConsumeString` plus unquoting. Returns the end offset and
-    // the unquoted text.
-    // PORT: the text is in the port form (see `JsonOptions::port_form`).
-    fn consume_string(&self, p: usize) -> Result<(usize, String), JsonError> {
-        let (end, out) = self.consume_string_chars(p)?;
-        if self.options.port_form {
-            return Ok((end, out));
+    // the unquoted text, before the port form conversion (`string_value`).
+    // PERF: a string with no escape and no control character whose bytes
+    // are valid UTF-8 is its own unquoted text, so it is borrowed. Any
+    // other string, and each error, goes through `consume_string_chars`.
+    fn scan_string(&self, p: usize) -> Result<(usize, Cow<'a, str>), JsonError> {
+        let b = self.buf;
+        let start = p + 1;
+        let mut i = start;
+        while let Some(&c) = b.get(i) {
+            if c == b'"' {
+                if let Ok(text) = std::str::from_utf8(&b[start..i]) {
+                    return Ok((i + 1, Cow::Borrowed(text)));
+                }
+                break;
+            }
+            if c == b'\\' || c < 0x20 {
+                break;
+            }
+            i += 1;
         }
-        Ok((end, crate::scanner_util::go_string_from_utf8(out)))
+        let (end, out) = self.consume_string_chars(p)?;
+        Ok((end, Cow::Owned(out)))
     }
 
     fn consume_string_chars(&self, p: usize) -> Result<(usize, String), JsonError> {
@@ -1341,5 +1449,122 @@ mod marshal_indent_tests {
             "{\n \t\"a\": [\n \t\t\"x\",\n \t\t\"y:{\"\n \t],\n \t\"b\": [],\n \t\"c\": [\n \t\t[\n \t\t\ttrue\n \t\t],\n \t\t[]\n \t]\n }"
         );
         assert_eq!(json_marshal_indent("s", "", "  ").unwrap(), "\"s\"");
+    }
+}
+
+#[cfg(test)]
+mod decode_string_tests {
+    use super::*;
+
+    fn token_ref_of(token: &JsonToken) -> JsonTokenRef<'static> {
+        match token {
+            JsonToken::Null => JsonTokenRef::Null,
+            JsonToken::False => JsonTokenRef::False,
+            JsonToken::True => JsonTokenRef::True,
+            JsonToken::BeginObject => JsonTokenRef::BeginObject,
+            JsonToken::EndObject => JsonTokenRef::EndObject,
+            JsonToken::BeginArray => JsonTokenRef::BeginArray,
+            JsonToken::EndArray => JsonTokenRef::EndArray,
+            JsonToken::String(_) | JsonToken::Number(_) => unreachable!("compared by text"),
+        }
+    }
+
+    // `scan_string` borrows only where `consume_string_chars` gives the
+    // same text, and gives its end offset and errors everywhere.
+    #[test]
+    fn scan_string_matches_consume_string_chars() {
+        let bodies: [&[u8]; 16] = [
+            b"",
+            b"plain ascii",
+            b"tab\there",
+            b"quote \\\" and \\\\ and \\/",
+            b"\\u0041\\u00e9\\ud83d\\ude00",
+            b"\\ud800 lone",
+            "caf\u{e9} \u{1f600} \u{fdd0}".as_bytes(),
+            b"bad \xff byte",
+            b"overlong \xc0\x80",
+            b"surrogate \xed\xa0\x80",
+            b"cut \xe2\x82",
+            b"ctl \x01",
+            b"del \x7f",
+            b"\\x bad escape",
+            b"\\u12 short",
+            b"unterminated",
+        ];
+        for allow_invalid_utf8 in [false, true] {
+            let options = JsonOptions {
+                allow_invalid_utf8,
+                ..JsonOptions::default()
+            };
+            for body in bodies {
+                for terminated in [true, false] {
+                    let mut input = vec![b'"'];
+                    input.extend_from_slice(body);
+                    if terminated {
+                        input.extend_from_slice(b"\" ,");
+                    }
+                    let dec = JsonDecoder::new(&input, options);
+                    let fast = dec.scan_string(0).map(|(end, s)| (end, s.into_owned()));
+                    let slow = dec.consume_string_chars(0);
+                    assert_eq!(
+                        fast, slow,
+                        "{input:?} allow_invalid_utf8={allow_invalid_utf8}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Names with and without escapes share one namespace per object, and a
+    // later object starts with an empty one.
+    #[test]
+    fn duplicate_names() {
+        let read_all = |text: &str| {
+            let mut dec = JsonDecoder::new(text.as_bytes(), JsonOptions::default());
+            dec.skip_value().and_then(|()| dec.check_eof())
+        };
+        assert_eq!(
+            read_all(r#"{"a":1,"a":2}"#).unwrap_err().message,
+            r#"duplicate object member name "a""#
+        );
+        assert_eq!(
+            read_all(r#"{"x":{"é":1,"é":2}}"#).unwrap_err().message,
+            r#"duplicate object member name "é""#
+        );
+        assert!(read_all(r#"[{"a":1,"b":{"a":2}},{"a":3,"b":4}]"#).is_ok());
+        let mut dec = JsonDecoder::new(br#"{"k":"v","n":1}"#, JsonOptions::default());
+        let tokens: Vec<JsonToken> = std::iter::from_fn(|| dec.read_token().ok()).collect();
+        let mut dec = JsonDecoder::new(
+            "{\"k\\n\":\"\u{fdd0}\",\"n\":-1.5e3}".as_bytes(),
+            JsonOptions::default(),
+        );
+        let refs: Vec<JsonTokenRef<'_>> =
+            std::iter::from_fn(|| dec.read_token_ref().ok()).collect();
+        let mut dec = JsonDecoder::new(
+            "{\"k\\n\":\"\u{fdd0}\",\"n\":-1.5e3}".as_bytes(),
+            JsonOptions::default(),
+        );
+        let owned: Vec<JsonToken> = std::iter::from_fn(|| dec.read_token().ok()).collect();
+        assert_eq!(refs.len(), owned.len());
+        for (token_ref, token) in refs.iter().zip(&owned) {
+            match (token_ref, token) {
+                (JsonTokenRef::String(a), JsonToken::String(b)) => assert_eq!(a, b),
+                (JsonTokenRef::Number(a), JsonToken::Number(b)) => assert_eq!(a, b),
+                (a, b) => assert_eq!(a.clone(), token_ref_of(b)),
+            }
+        }
+        assert!(matches!(&refs[2], JsonTokenRef::String(Cow::Owned(_))));
+        assert!(matches!(&refs[3], JsonTokenRef::String(Cow::Borrowed("n"))));
+        assert_eq!(
+            tokens,
+            [
+                JsonToken::BeginObject,
+                JsonToken::String("k".into()),
+                JsonToken::String("v".into()),
+                JsonToken::String("n".into()),
+                JsonToken::Number("1".into()),
+                JsonToken::EndObject,
+            ]
+        );
     }
 }
