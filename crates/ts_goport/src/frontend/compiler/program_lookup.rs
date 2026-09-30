@@ -817,6 +817,29 @@ impl NewProgram {
         )
     }
 
+    // Go: program.go:1708 (*Program).GetModeForResolutionAtIndex (ts#64292)
+    // PORT: Go `index int` is `usize`.
+    pub fn get_mode_for_resolution_at_index(
+        &self,
+        source_file: &ParsedSourceFile,
+        index: usize,
+    ) -> ResolutionMode {
+        let imports = &source_file.imports;
+        if index < imports.len() {
+            return self.get_mode_for_usage_location(source_file, imports[index]);
+        }
+        let mut index = index - imports.len();
+        for augmentation in &source_file.module_augmentations {
+            if augmentation.kind() == SyntaxKind::StringLiteral {
+                if index == 0 {
+                    return self.get_mode_for_usage_location(source_file, *augmentation);
+                }
+                index -= 1;
+            }
+        }
+        panic!("resolution index out of range")
+    }
+
     // Go: program.go:1539 (*Program).GetDefaultResolutionModeForFile
     pub fn get_default_resolution_mode_for_file(
         &self,
