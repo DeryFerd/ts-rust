@@ -166,12 +166,24 @@ fn format_location(file: Node, pos: i32, format_opts: &FormattingOptions) -> Str
     capture_writer(|w| write_location(w, file, pos, Some(format_opts), write_plain))
 }
 
-/// Go `diag.File().FileName()` for a diagnostic with a file.
+/// Go `diag.File().FileName()` for an `*ast.Diagnostic` with a file: the
+/// file's own name (a supplemental mapper output keeps its own name). The
+/// compiler runner, the content mapper baseline and the transpile runner read
+/// it.
 pub fn diagnostic_file_name(diagnostic: &Diagnostic) -> Option<String> {
     diagnostic
         .file
         .is_some()
-        .then(|| ast_diagnostic_file_name(diagnostic.file).to_string())
+        .then(|| source_file_file_name(diagnostic.file).to_string())
+}
+
+/// Go `diag.File().FileName()` for a wrapped `*diagnosticwriter.ASTDiagnostic`
+/// with a file (the error baseline, ts#63936).
+fn wrapped_diagnostic_file_name(diagnostic: &Diagnostic) -> Option<&'static str> {
+    diagnostic
+        .file
+        .is_some()
+        .then(|| ast_diagnostic_file_name(diagnostic.file))
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:57 ASTDiagnostic.File (ts#63936)
@@ -271,10 +283,10 @@ fn iterate_error_baseline(
         // Similarly for tsconfig, which may be in the input files and contain errors.
         // 'totalErrorsReportedInNonLibraryNonTsconfigFiles + numLibraryDiagnostics + numTsconfigDiagnostics, diagnostics.length
 
-        match diagnostic_file_name(diag) {
+        match wrapped_diagnostic_file_name(diag) {
             None => *total += 1,
             Some(name) => {
-                if !is_default_library_file(&name) && !is_ts_config_file(&name) {
+                if !is_default_library_file(name) && !is_ts_config_file(name) {
                     *total += 1;
                 }
             }
@@ -424,13 +436,13 @@ fn iterate_error_baseline(
     let num_library_diagnostics = diagnostics
         .iter()
         .filter(|d| {
-            diagnostic_file_name(d)
-                .is_some_and(|name| is_default_library_file(&name) || is_built_file(&name))
+            wrapped_diagnostic_file_name(d)
+                .is_some_and(|name| is_default_library_file(name) || is_built_file(name))
         })
         .count() as i64;
     let num_tsconfig_diagnostics = diagnostics
         .iter()
-        .filter(|d| diagnostic_file_name(d).is_some_and(|name| is_ts_config_file(&name)))
+        .filter(|d| wrapped_diagnostic_file_name(d).is_some_and(is_ts_config_file))
         .count() as i64;
     // Go: error_baseline.go:255 (tsgo#4712, ts#63936)
     // PORT: the diagnostics are Go `*diagnosticwriter.ASTDiagnostic`, so this

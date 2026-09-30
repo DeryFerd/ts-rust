@@ -485,9 +485,9 @@ fn builder_no_change_when_no_files_added_or_deleted() {
     assert!(dir_has(&snapshot.cache_directories, "/src", "/src/foo.ts"));
 }
 
-// Go: snapshotfs_test.go:296 TestSnapshotFSBuilder/overlay files are returned over disk files
+// Go: snapshotfs_test.go:355 TestSnapshotFSBuilder/overlay files are returned over disk files
 #[test]
-fn builder_overlay_files_are_returned_over_cache_files() {
+fn builder_overlay_files_are_returned_over_disk_files() {
     let b = builder(
         text_fs(&[("/src/foo.ts", "const foo = 1;")], false),
         overlays(&[("/src/foo.ts", "const foo = 999;")]),
