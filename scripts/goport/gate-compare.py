@@ -73,7 +73,10 @@ case path), and two lines with one old id, one new id, or one case path in one f
 When the map is used:
 - A base id with a line is compared with the new item of its new id: the same item under another id.
 - The line's case path must equal the case path of the base item and of the new item. Else the line is
-  broken and its base id is a removed id, so a map cannot pair two different cases.
+  broken and its base id is a removed id, so a map cannot pair two different cases. Layout move: when the
+  new pin has the layout "typescript" (microsoft/TypeScript, tsc/), the new item's case path is the line's
+  case path moved as below (an old _submodules/TypeScript/tests/cases path is under testdata/tests/cases),
+  and a base allow entry that moves with its case has its case path moved the same way.
 - A family with a line is a mapped family. A base id of a mapped family without a working line is a
   removed id, never compared with the new item of the same id (that id can be another case now).
   The ids of the other families are compared as before.
@@ -324,15 +327,26 @@ def main():
         if not id_map['applied']:
             lines = {}
     mapped_families = {family(old) for old in lines}
-    go = {}  # 'base' and 'new': (Go checkout, layout), read for the first removal line
+    go = {}  # 'base' and 'new': (Go checkout, layout), read when a line needs them
+
+    def pins():
+        if not go:
+            go.update(base=go_pin(bhead['upstreamPin']), new=go_pin(nhead['upstreamPin']))
+        return go['base'], go['new']
+
+    def at_new(source):
+        """A base case path as the new pin names it (the layout move; unchanged at an old-layout new pin)."""
+        if not lines or not source or not source.startswith(OLD_CASES):
+            return source
+        (_, (ngo, nlayout)) = pins()
+        return moved_path(source, ngo, nlayout)
+
     for old, (to, source, n) in sorted(lines.items(), key=lambda e: e[1][2]):
         b, t = base.get(old), new.get(to)
         if b is None:
             id_map['unused'].append(old)
         elif to == '-':
-            if not go:
-                go = {'base': go_pin(bhead['upstreamPin']), 'new': go_pin(nhead['upstreamPin'])}
-            why = removal_problem(old, source, b, new, go['base'], go['new'])
+            why = removal_problem(old, source, b, new, *pins())
             if why:
                 gone[old] = f'removed id (id map line {n} removes it, but {why})'
                 id_map['broken'].append(old)
@@ -343,8 +357,8 @@ def main():
             id_map['broken'].append(old)
         elif t is None:
             gone[old] = f'removed id (id map line {n}: its new id {to} is not in the new run)'
-        elif case_path(t) != source:
-            gone[old] = f'removed id (id map line {n}: {to} is the case {case_path(t)}, not {source})'
+        elif case_path(t) != at_new(source):
+            gone[old] = f'removed id (id map line {n}: {to} is the case {case_path(t)}, not {at_new(source)})'
             id_map['broken'].append(old)
         else:
             moved[old] = to
@@ -361,7 +375,8 @@ def main():
 
     # Allow entries of the base allow list, by (entry id at the new pin, condition, case path). An entry of a CASE_PATH
     # family without a case path gives no allowance.
-    base_allow = {(new_id(e['id']), e['condition'], entry_path(e, base)) for e in (bm.get('allowList') or {}).get('entries', [])
+    base_allow = {(new_id(e['id']), e['condition'], at_new(entry_path(e, base)) if family(e['id']) in mapped_families else entry_path(e, base))
+                  for e in (bm.get('allowList') or {}).get('entries', [])
                   if new_id(e['id']) is not None and (entry_path(e, base) is not None or family(e['id']) not in CASE_PATH)}
     regressions, fixed, known_open, reallowed = [], [], [], []
     # The cap of each project for this compare: LONG_CAP, or NORMAL_LIMIT once the base growth is at or under it.

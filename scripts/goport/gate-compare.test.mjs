@@ -66,3 +66,32 @@ test("a removal line cannot remove a case that moved at the new pin", { skip }, 
   out = compare([item("corpus-diag/00001", `${SUB}/x.ts`)], [], `corpus-diag/00001\t-\t${SUB}/x.ts\n`);
   assert.match(out.regressions[0].why, /x\.ts is not in the base pin Go checkout/);
 });
+
+test("a move line pairs a base case with its layout move at a microsoft/TypeScript pin, allow entries too", { skip }, () => {
+  const st = "single-threaded-equal", bpath = `${SUB}/importWithTrailingSlash.ts`, npath = "testdata/tests/cases/compiler/importWithTrailingSlash.ts";
+  // The base allow list has the pin B entry; the new item is ALLOWED by the pin N entry of the same case.
+  const base = [item("corpus-diag/03599", bpath)];
+  const allowed = { id: "corpus-diag/03363", status: "ALLOWED", detail: `MISMATCH ${npath}`,
+    allowedBy: [{ id: "corpus-diag/03363", path: npath, condition: st }] };
+  const dir = mkdtempSync(join(tmpdir(), "gate-compare-"));
+  try {
+    const mapText = `corpus-diag/03599\tcorpus-diag/03363\t${bpath}\n`;
+    writeFileSync(join(dir, "base.json"), JSON.stringify({ upstreamPin: B, results: base,
+      allowList: { entries: [{ id: "corpus-diag/03599", path: bpath, condition: st }] } }));
+    writeFileSync(join(dir, "new.json"), JSON.stringify({ upstreamPin: N, results: [allowed] }));
+    writeFileSync(join(dir, "map.tsv"), mapText);
+    const sha256 = createHash("sha256").update(mapText).digest("hex");
+    writeFileSync(join(dir, "state.json"), JSON.stringify({ batch: { gateIdMap: { path: join(dir, "map.tsv"), sha256 } } }));
+    const run = spawnSync("python3", [COMPARE, join(dir, "base.json"), join(dir, "new.json"), "--state", join(dir, "state.json")], { encoding: "utf8" });
+    const out = JSON.parse(run.stdout);
+    assert.equal(run.status, 0, run.stderr);
+    assert.deepEqual([out.idMap.mapped, out.idMap.broken, out.reallowed.map(r => r.id), out.newAllowEntries], [1, [], ["corpus-diag/03363"], []]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // The same line when the new id is another case: a removed id.
+  const other = compare([item("corpus-diag/03599", bpath)], [item("corpus-diag/03363", "testdata/tests/cases/compiler/other.ts")],
+    `corpus-diag/03599\tcorpus-diag/03363\t${bpath}\n`);
+  assert.deepEqual(other.idMap.broken, ["corpus-diag/03599"]);
+  assert.match(other.regressions[0].why, /corpus-diag\/03363 is the case testdata\/tests\/cases\/compiler\/other\.ts, not testdata\/tests\/cases\/compiler\/importWithTrailingSlash\.ts/);
+});
