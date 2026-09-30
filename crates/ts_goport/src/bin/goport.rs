@@ -59,7 +59,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// the same value into jemalloc (`JEMALLOC_SYS_WITH_MALLOC_CONF`); with
 /// another value there, the bins exec themselves to set it.
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
-const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:always";
+const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false";
 
 fn main() {
     // First: it must run before the first heap allocation.
@@ -113,16 +113,31 @@ fn main() {
 /// `JEMALLOC_CONF`.
 /// - `narenas:4` has the same speed as the default (4 arenas per CPU), with
 ///   less RSS (query: 140 MB against 160 MB).
-/// - `thp:always` and `metadata_thp:always` make jemalloc ask for huge pages
-///   (`madvise`). Without them, a kernel in THP `madvise` mode gives jemalloc
-///   none (dbook: query 26k minor faults, effect 286k, against 1k and 6k for
-///   a static glibc build with the tunables below). release2 measurement,
-///   geometric mean against that static build: without them 12 to 14% slower
+/// - `thp:always` makes jemalloc ask for huge pages (`madvise`) for its
+///   data. Without it, a kernel in THP `madvise` mode gives jemalloc none
+///   (dbook: query 26k minor faults, effect 286k, against 1k and 6k for a
+///   static glibc build with the tunables below). release2 measurement,
+///   geometric mean against that static build: without it 12 to 14% slower
 ///   on dbook (THP `madvise`) and 3 to 7% slower on cup2 (THP `always`); with
-///   them 0.5 to 6% faster on dbook and 2 to 4% slower on cup2. On cup2
+///   it 0.5 to 6% faster on dbook and 2 to 4% slower on cup2. On cup2
 ///   jemalloc peak RSS is 2 to 11% above the static build. When little
 ///   memory is free in 2 MiB blocks, huge page faults wait in compaction;
-///   `thp_guard` (called first in `main`) then turns THP off.
+///   `thp_guard` (called first in `main`) then turns THP off. rss1 (dbook,
+///   check): with 4 KiB pages (`thp:default` there) query has 18 MiB less
+///   peak RSS (130 to 112 MiB), but check is 4% slower on query, 17% on
+///   hono and 11% to 13% on zod and effect.
+/// - `metadata_thp:disabled` (the jemalloc default) and
+///   `cache_oblivious:false` cut the RSS that huge pages add, at the same
+///   speed (rss1, dbook, THP `madvise`, peak RSS of check: query 145 to
+///   130 MiB, hono 325 to 300, zod 1007 to 940, effect 1106 to 1039; wall
+///   time -0.6% to +0.7%). `metadata_thp:always` puts the jemalloc metadata
+///   (7 MiB on query, 22 MiB on effect) in huge pages that it fills only in
+///   part: 13 to 20 MiB more RSS. `cache_oblivious` (the jemalloc default)
+///   gives each allocation of 16 KiB or more one more 4 KiB page for a
+///   random start offset. Effect has about 12,000 of them live (47 MiB), and
+///   huge pages make those pages resident. In THP `always` mode (cup2) the
+///   kernel gives huge pages to the metadata anyway, and the change saves
+///   4 to 50 MiB.
 ///
 /// glibc malloc (a build without the `jemalloc` feature):
 /// - `top_pad=67108864` (64 MiB) makes each thread heap read-write in full
