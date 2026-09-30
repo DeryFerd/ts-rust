@@ -208,13 +208,27 @@ impl NewProgram {
         type_ref: &FileReference,
         source_file: &ParsedSourceFile,
     ) -> Option<Rc<ResolvedTypeReferenceDirective>> {
+        self.get_resolved_type_reference_directive(
+            source_file,
+            &type_ref.file_name,
+            self.get_mode_for_type_reference_directive_in_file(type_ref, source_file),
+        )
+    }
+
+    // Go: program.go:2104 (*Program).GetResolvedTypeReferenceDirective (ts#64247)
+    pub fn get_resolved_type_reference_directive(
+        &self,
+        file: &dyn HasFileName,
+        type_directive_name: &str,
+        mode: ResolutionMode,
+    ) -> Option<Rc<ResolvedTypeReferenceDirective>> {
         let resolutions = self
             .processed_files
             .type_resolutions_in_file
-            .get(source_file.path())?;
+            .get(&file.path())?;
         let key = ModeAwareCacheKey {
-            name: type_ref.file_name.clone(),
-            mode: self.get_mode_for_type_reference_directive_in_file(type_ref, source_file),
+            name: type_directive_name.to_string(),
+            mode,
         };
         resolutions.get(&key).cloned()
     }
@@ -508,21 +522,10 @@ impl NewProgram {
             .clone()
     }
 
-    // Go: program.go:2072 (*Program).ResolveModuleName
-    pub fn resolve_module_name(
-        &self,
-        module_name: &str,
-        containing_file: &str,
-        resolution_mode: ResolutionMode,
-    ) -> Arc<ResolvedModule> {
-        let resolver = self
-            .processed_files
-            .resolver
-            .as_ref()
-            .expect("program has a resolver");
-        let (resolved, _) =
-            resolver.resolve_module_name(module_name, containing_file, resolution_mode, None);
-        resolved
+    // Go: program.go:644 (*Program).ModuleResolutionError (ts#64299)
+    // PORT: a nil Go `error` is `None`.
+    pub fn module_resolution_error(&self) -> Option<crate::gostd::GoError> {
+        self.processed_files.module_resolution_error.clone()
     }
 
     // Go: program.go:2077 (*Program).ForEachResolvedModule
@@ -801,6 +804,29 @@ impl NewProgram {
             location,
             Some(&self.mapper().get_compiler_options_for_file(source_file)),
         )
+    }
+
+    // Go: program.go:1708 (*Program).GetModeForResolutionAtIndex (ts#64292)
+    // PORT: Go `index int` is `usize`.
+    pub fn get_mode_for_resolution_at_index(
+        &self,
+        source_file: &ParsedSourceFile,
+        index: usize,
+    ) -> ResolutionMode {
+        let imports = &source_file.imports;
+        if index < imports.len() {
+            return self.get_mode_for_usage_location(source_file, imports[index]);
+        }
+        let mut index = index - imports.len();
+        for augmentation in &source_file.module_augmentations {
+            if augmentation.kind() == SyntaxKind::StringLiteral {
+                if index == 0 {
+                    return self.get_mode_for_usage_location(source_file, *augmentation);
+                }
+                index -= 1;
+            }
+        }
+        panic!("resolution index out of range")
     }
 
     // Go: program.go:1539 (*Program).GetDefaultResolutionModeForFile

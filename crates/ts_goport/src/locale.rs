@@ -47,6 +47,11 @@ pub fn from_context(ctx: &Context) -> Locale {
     }
 }
 
+// Go: locale/locale.go:31 HasLocale (ts#64163)
+pub fn has_locale(ctx: &Context) -> bool {
+    ctx.value(&CONTEXT_KEY).is_some()
+}
+
 // Go: locale/locale.go:11 Locale
 /// Go `locale.Locale` (`language.Tag`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

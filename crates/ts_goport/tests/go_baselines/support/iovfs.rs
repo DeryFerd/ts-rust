@@ -19,8 +19,8 @@ use ts_goport::frontend::tspath::{
     get_directory_path, is_url, normalize_path, remove_trailing_directory_separator,
 };
 use ts_goport::frontend::vfs::{
-    Common, DirEntry, Entries, FileInfo, FileMode, Fs, FsError, IoFs, WalkDirFunc,
-    file_info_to_dir_entry, filepath_clean, io_fs_valid_path, root_length, split_path,
+    Common, DirEntry, Entries, FileInfo, FileMode, Fs, FsError, IoFs, file_info_to_dir_entry,
+    filepath_clean, io_fs_valid_path, root_length, split_path,
 };
 use ts_goport::scanner_util::compare_go_strings;
 
@@ -553,11 +553,6 @@ impl Fs for IoVfs {
     fn stat(&self, path: &str) -> Option<FileInfo> {
         let _ = root_length(path); // Assert path is rooted
         self.with_common(|common| common.stat(path))
-    }
-
-    // Go: iofs.go:176 WalkDir
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        self.with_common(|common| common.walk_dir(root, walk_fn))
     }
 
     // Go: iofs.go:190 Realpath

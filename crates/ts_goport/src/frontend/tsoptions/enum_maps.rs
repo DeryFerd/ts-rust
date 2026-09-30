@@ -251,6 +251,7 @@ pub static TARGET_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new
         ("es2023", V(ScriptTarget::ES2023)),
         ("es2024", V(ScriptTarget::ES2024)),
         ("es2025", V(ScriptTarget::ES2025)),
+        ("es2026", V(ScriptTarget::ES2026)),
         ("esnext", V(ScriptTarget::ES_NEXT)),
     ])
 });
@@ -309,8 +310,9 @@ pub static NEW_LINE_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::n
 
 // Go: tsoptions/enummaps.go:207 targetToLibMap
 pub static TARGET_TO_LIB_MAP: LazyLock<FxHashMap<ScriptTarget, String>> = LazyLock::new(|| {
-    let entries: [(ScriptTarget, &str); 12] = [
+    let entries: [(ScriptTarget, &str); 13] = [
         (ScriptTarget::ES_NEXT, "lib.esnext.full.d.ts"),
+        (ScriptTarget::ES2026, "lib.es2026.full.d.ts"),
         (ScriptTarget::ES2025, "lib.es2025.full.d.ts"),
         (ScriptTarget::ES2024, "lib.es2024.full.d.ts"),
         (ScriptTarget::ES2023, "lib.es2023.full.d.ts"),

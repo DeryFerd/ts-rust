@@ -149,14 +149,11 @@ impl JSONValue {
 // Go: jsonvalue.go:88 UnmarshalJSONFrom
 impl UnmarshalerFrom for JSONValue {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        unmarshal_json_value_v2::<JSONValue>(self, dec)
+        self.unmarshal_json_value_from::<JSONValue>(dec)
     }
 }
 
-// Go: jsonvalue.go:92 unmarshalJSONValue
-// PORT: not ported. It has no callers in Go; only the v2 form is used.
-
-/// Element types of `unmarshalJSONValueV2[T]`.
+/// Element types of `unmarshalJSONValueFrom[T]`.
 /// PORT: stands in for storing `[]T` and `*OrderedMap[string, T]` in `any`.
 pub trait JsonValueElement: UnmarshalerFrom + Default + Sized {
     fn wrap_array(elements: Vec<Self>) -> JsonAny;
@@ -181,52 +178,55 @@ impl JsonValueElement for ExportsOrImports {
     }
 }
 
-// Go: jsonvalue.go:125 unmarshalJSONValueV2
-fn unmarshal_json_value_v2<T: JsonValueElement>(
-    v: &mut JSONValue,
-    dec: &mut JsonDecoder<'_>,
-) -> Result<(), JsonError> {
-    match dec.peek_kind() {
-        b'n' => {
-            // json.Null.Kind()
-            dec.read_token()?;
-            v.value = JsonAny::Nil;
-            v.type_ = JSONValueType::NULL;
-            return Ok(());
-        }
-        b'"' => {
-            v.type_ = JSONValueType::STRING;
-            unmarshal_any(dec, &mut v.value)?;
-        }
-        b'[' => {
-            dec.read_token()?;
-            let mut elements: Vec<T> = Vec::new();
-            while dec.peek_kind() != b']' {
-                let mut element = T::default();
-                json_unmarshal_decode(dec, &mut element)?;
-                elements.push(element);
+impl JSONValue {
+    // Go: jsonvalue.go:92 (*JSONValue).unmarshalJSONValueFrom (ts#63902)
+    fn unmarshal_json_value_from<T: JsonValueElement>(
+        &mut self,
+        dec: &mut JsonDecoder<'_>,
+    ) -> Result<(), JsonError> {
+        let v = self;
+        match dec.peek_kind() {
+            b'n' => {
+                // json.Null.Kind()
+                dec.read_token()?;
+                v.value = JsonAny::Nil;
+                v.type_ = JSONValueType::NULL;
+                return Ok(());
             }
-            dec.read_token()?;
-            v.type_ = JSONValueType::ARRAY;
-            v.value = T::wrap_array(elements);
+            b'"' => {
+                v.type_ = JSONValueType::STRING;
+                unmarshal_any(dec, &mut v.value)?;
+            }
+            b'[' => {
+                dec.read_token()?;
+                let mut elements: Vec<T> = Vec::new();
+                while dec.peek_kind() != b']' {
+                    let mut element = T::default();
+                    json_unmarshal_decode(dec, &mut element)?;
+                    elements.push(element);
+                }
+                dec.read_token()?;
+                v.type_ = JSONValueType::ARRAY;
+                v.value = T::wrap_array(elements);
+            }
+            b'{' => {
+                let mut object: IndexMap<String, T> = IndexMap::new();
+                json_unmarshal_decode(dec, &mut object)?;
+                v.type_ = JSONValueType::OBJECT;
+                v.value = T::wrap_object(object);
+            }
+            b't' | b'f' => {
+                // json.True.Kind(), json.False.Kind()
+                v.type_ = JSONValueType::BOOLEAN;
+                unmarshal_any(dec, &mut v.value)?;
+            }
+            _ => {
+                v.type_ = JSONValueType::NUMBER;
+                unmarshal_any(dec, &mut v.value)?;
+            }
         }
-        b'{' => {
-            let mut object: IndexMap<String, T> = IndexMap::new();
-            json_unmarshal_decode(dec, &mut object)?;
-            v.type_ = JSONValueType::OBJECT;
-            v.value = T::wrap_object(object);
-        }
-        b't' | b'f' => {
-            // json.True.Kind(), json.False.Kind()
-            v.type_ = JSONValueType::BOOLEAN;
-            unmarshal_any(dec, &mut v.value)?;
-        }
-        _ => {
-            v.type_ = JSONValueType::NUMBER;
-            unmarshal_any(dec, &mut v.value)?;
-        }
+        Ok(())
     }
-    Ok(())
 }
 
 // PORT: the JSON v2 interface arshaler for `json.UnmarshalDecode(dec, &v.Value)`
@@ -445,7 +445,8 @@ impl std::ops::Deref for ExportsOrImports {
 // Go: exportsorimports.go:25 UnmarshalJSONFrom
 impl UnmarshalerFrom for ExportsOrImports {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        unmarshal_json_value_v2::<ExportsOrImports>(&mut self.json_value, dec)
+        self.json_value
+            .unmarshal_json_value_from::<ExportsOrImports>(dec)
     }
 }
 

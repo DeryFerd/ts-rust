@@ -1406,7 +1406,19 @@ pub fn for_each_ancestor_directory<T: Default>(
     }
 }
 
+impl Path {
+    // Go: tspath/path.go:1133 (Path).ForEachAncestorDirectory (ts#63902)
+    pub fn for_each_ancestor_directory<T: Default>(
+        &self,
+        mut callback: impl FnMut(Path) -> (T, bool),
+    ) -> (T, bool) {
+        for_each_ancestor_directory(&self.0, |directory| callback(Path(directory.to_string())))
+    }
+}
+
 // Go: tspath/path.go:1083 ForEachAncestorDirectoryPath
+// PORT: Go N replaces it with the `Path` method above (ts#63902). It stays
+// until its callers in `ls/autoimport` move to the method.
 pub fn for_each_ancestor_directory_path<T: Default>(
     directory: &Path,
     mut callback: impl FnMut(Path) -> (T, bool),
@@ -1484,10 +1496,9 @@ pub fn get_common_parents(
 }
 
 // Go: tspath/path.go:1147 getCommonParentsWorker
-// PORT: Go `append(group.head, sr...)` can write into the backing array of a
-// component slice, so two results of one group can share memory. This port
-// copies values instead. The function is used only by project watching,
-// which is out of scope for the frontend.
+// ts#64493: each result gets its own copy of the group head (Go no longer
+// appends into the head's backing array). The function is used only by
+// project watching, which is out of scope for the frontend.
 fn get_common_parents_worker(
     component_groups: &[Vec<String>],
     min_components: i32,
@@ -1540,9 +1551,11 @@ fn get_common_parents_worker(
                             options,
                         );
                         for sr in sub_results {
-                            let mut combined = head.clone();
-                            combined.extend(sr);
-                            result.push(combined);
+                            if sr.is_empty() {
+                                result.push(head.clone());
+                            } else {
+                                result.push([head.as_slice(), sr.as_slice()].concat());
+                            }
                         }
                     }
                     return result;

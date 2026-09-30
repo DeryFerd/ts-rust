@@ -22,8 +22,8 @@ pub fn get_module_specifiers(
     user_preferences: &UserPreferences,
     options: ModuleSpecifierOptions,
     for_auto_imports: bool,
-) -> Vec<String> {
-    let (result, _) = get_module_specifiers_with_info(
+) -> ModuleSpecifiersResult {
+    get_module_specifiers_with_info(
         module_symbol,
         checker,
         compiler_options,
@@ -32,8 +32,7 @@ pub fn get_module_specifiers(
         user_preferences,
         options,
         for_auto_imports,
-    );
-    result
+    )
 }
 
 // Go: modulespecifiers/specifiers.go:42 GetModuleSpecifiersWithInfo
@@ -47,30 +46,38 @@ pub fn get_module_specifiers_with_info(
     user_preferences: &UserPreferences,
     options: ModuleSpecifierOptions,
     for_auto_imports: bool,
-) -> (Vec<String>, ResultKind) {
+) -> ModuleSpecifiersResult {
     let ambient = try_get_module_name_from_ambient_module(module_symbol, checker);
-    if !ambient.is_empty() {
+    if !ambient.name.is_empty() {
         if for_auto_imports
             && is_excluded_by_regex(
-                &ambient,
+                &ambient.name,
                 &user_preferences.auto_import_specifier_exclude_regexes,
             )
         {
-            return (Vec::new(), ResultKind::Ambient);
+            return ModuleSpecifiersResult {
+                kind: ResultKind::Ambient,
+                ambient_module_symbol: ambient.symbol,
+                ..Default::default()
+            };
         }
-        return (vec![ambient], ResultKind::Ambient);
+        return ModuleSpecifiersResult {
+            specifiers: vec![ambient.name],
+            kind: ResultKind::Ambient,
+            ambient_module_symbol: ambient.symbol,
+        };
     }
 
     let module_source_file = get_source_file_of_module(checker.symbols(), module_symbol);
     if module_source_file.is_nil() {
-        return (Vec::new(), ResultKind::None);
+        return ModuleSpecifiersResult::default();
     }
 
     // Use original source file name when file is from project reference output
     let module_file_name =
         host.get_source_of_project_reference_if_output_included(module_source_file);
 
-    get_module_specifiers_for_file_with_info(
+    let (specifiers, kind) = get_module_specifiers_for_file_with_info(
         importing_source_file,
         &module_file_name,
         compiler_options,
@@ -78,7 +85,12 @@ pub fn get_module_specifiers_with_info(
         user_preferences,
         options,
         for_auto_imports,
-    )
+    );
+    ModuleSpecifiersResult {
+        specifiers,
+        kind,
+        ..Default::default()
+    }
 }
 
 // Go: modulespecifiers/specifiers.go:79 GetModuleSpecifiersForFileWithInfo
@@ -113,18 +125,28 @@ pub fn get_module_specifiers_for_file_with_info(
     )
 }
 
-// Go: modulespecifiers/specifiers.go:106 tryGetModuleNameFromAmbientModule
+// Go: modulespecifiers/specifiers.go:107 ambientModuleInfo (ts#63931)
+#[derive(Default)]
+struct AmbientModuleInfo {
+    name: String,
+    symbol: SymbolId,
+}
+
+// Go: modulespecifiers/specifiers.go:112 tryGetModuleNameFromAmbientModule
 fn try_get_module_name_from_ambient_module(
     module_symbol: SymbolId,
     checker: &mut dyn CheckerShape,
-) -> String {
+) -> AmbientModuleInfo {
     let declarations = checker.symbols().sym(module_symbol).declarations.clone();
     for decl in &declarations {
         if is_module_with_string_literal_name(*decl)
             && (!is_module_augmentation_external(*decl)
                 || !tspath::is_external_module_name_relative(decl.name().text()))
         {
-            return decl.name().text().to_string();
+            return AmbientModuleInfo {
+                name: decl.name().text().to_string(),
+                symbol: module_symbol,
+            };
         }
     }
 
@@ -179,10 +201,13 @@ fn try_get_module_name_from_ambient_module(
         }
         // TODO: Possible strada bug - isn't this insufficient in the presence of merge symbols?
         if export_symbol == d.symbol() {
-            return possible_container.name().text().to_string();
+            return AmbientModuleInfo {
+                name: possible_container.name().text().to_string(),
+                symbol: possible_container.symbol(),
+            };
         }
     }
-    String::new()
+    AmbientModuleInfo::default()
 }
 
 // Go: modulespecifiers/specifiers.go:156 Info
