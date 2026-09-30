@@ -1,6 +1,6 @@
 //! Go `cmd/tsgo/main.go`, and the parts of the Go standard library that
 //! package main needs and the crate does not have yet: `flag` (bool, int
-//! and string flags, `Parse`, the default usage text), `os.Getwd` and
+//! and string flags, `Parse`, the default usage text) and
 //! `signal.NotifyContext`.
 
 use crate::cmd::tsgo::prelude::*;
@@ -138,29 +138,15 @@ fn signal_string(s: i32) -> String {
     }
 }
 
-// Go: os/getwd.go:26 Getwd (the Unix path), with `core.Must`.
-// PORT: `syscall.Getwd` is `std::env::current_dir`.
+// Go: core.Must(os.Getwd()), for the LSP and the API.
+// PORT: Go `os.Getwd` is `frontend::vfs::os_current_dir`, the same one the
+// compile path reads (a symlinked cwd keeps the `$PWD` link path; the value
+// is in the port form of the Go bytes). Go `core.Must` panics with the
+// error value, so the run ends with `panic: <err.Error()>` and exit 2
+// (`core::go_panic`, `getwd_error_text`).
 pub fn must_getwd() -> String {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // Clumsy but widespread kludge:
-        // if $PWD is set and matches ".", use it.
-        if let Ok(dir) = std::env::var("PWD") {
-            if dir.starts_with('/') {
-                let dot = std::fs::metadata(".").expect("getwd: stat .");
-                if let Ok(d) = std::fs::metadata(&dir) {
-                    if dot.dev() == d.dev() && dot.ino() == d.ino() {
-                        return dir;
-                    }
-                }
-            }
-        }
-    }
-    std::env::current_dir()
-        .expect("getwd")
-        .to_string_lossy()
-        .into_owned()
+    crate::frontend::vfs::os_current_dir()
+        .unwrap_or_else(|err| crate::core::go_panic(crate::frontend::vfs::getwd_error_text(&err)))
 }
 
 // Go: flag/flag.go (go1.26.8), the part that package main uses.
