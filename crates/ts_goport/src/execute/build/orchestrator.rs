@@ -182,11 +182,10 @@ pub struct Orchestrator {
     // of the up-to-date checks of this build cycle (`BuildInfoPrefetch`).
     build_info_prefetch: RefCell<Option<BuildInfoPrefetch>>,
     // PORT: not in Go (perf). The released programs of built tasks whose
-    // frontend programs and tables are not freed yet
-    // (`release_task_program`), oldest first. Go's GC frees them in the
-    // background. Their `Rc` data frees on this thread: when it would
-    // wait for a task (`build_all_tasks`), or when more than
-    // `MAX_KEPT_RELEASED` wait.
+    // frontend programs are not freed yet (`release_task_program`), oldest
+    // first. Go's GC frees them in the background. Their `Rc` data frees on
+    // this thread: when it would wait for a task (`build_all_tasks`), or
+    // when more than `MAX_KEPT_RELEASED` wait.
     released: RefCell<std::collections::VecDeque<crate::program::ReleasedProgram>>,
     // PORT: not in Go (perf). True when the process ends after this `tsc -b`
     // build (`start_exported`, not in watch mode or a test), so what the

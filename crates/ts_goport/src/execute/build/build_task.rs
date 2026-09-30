@@ -287,8 +287,8 @@ impl TaskResult {
 // PORT: Go frees the program in the background GC. The checker threads
 // free their checkers while the build goes on
 // (`program::release_program_in_background_later`). The frontend program
-// and the tables free when the result drops; the orchestrator drops it when
-// its thread would wait anyway (`Orchestrator::keep_released`).
+// frees when the result drops; the orchestrator drops it when its thread
+// would wait anyway (`Orchestrator::keep_released`).
 pub fn release_task_program(program: IncrementalProgram) -> crate::program::ReleasedProgram {
     let go_program = program.get_program();
     // PORT: perf. The snapshot's maps free on a thread (`drop_in_background`).

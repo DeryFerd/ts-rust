@@ -2127,11 +2127,15 @@ pub fn release_program_in_background(program: &'static GoProgram) {
     ));
 }
 
-/// `release_program_in_background` that frees the frontend program and the
-/// tables only when the result drops, as `release_program_later` does.
-/// `tsc -b` drops it when its orchestrator thread would wait anyway.
+/// `release_program_in_background` that frees the frontend program only
+/// when the result drops. The tables go at once, as in
+/// `release_program_in_background`: the checker threads keep them until
+/// they end, so the last of them frees them in the background. `tsc -b`
+/// drops the result when its orchestrator thread would wait anyway.
 pub fn release_program_in_background_later(program: &'static GoProgram) -> ReleasedProgram {
-    release_program_with(program, CheckerPool::shut_down_in_background)
+    let mut released = release_program_with(program, CheckerPool::shut_down_in_background);
+    drop(released.tables.take());
+    released
 }
 
 /// `release_program` with the pool stop that `shut_down` names. The caller
