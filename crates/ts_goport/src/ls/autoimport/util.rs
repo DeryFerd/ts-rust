@@ -574,10 +574,6 @@ impl vfs::Fs for RegistryCloneHostFs {
         self.host.fs().stat(path)
     }
 
-    fn walk_dir(&self, root: &str, walk_fn: &mut vfs::WalkDirFunc<'_>) -> Result<(), vfs::FsError> {
-        self.host.fs().walk_dir(root, walk_fn)
-    }
-
     fn realpath(&self, path: &str) -> String {
         self.host.fs().realpath(path)
     }
