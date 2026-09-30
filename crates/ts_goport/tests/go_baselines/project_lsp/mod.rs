@@ -2,7 +2,9 @@
 //! `background`, `dirty`, `logging`), `internal/lsp` and
 //! `internal/ls/autoimport`, and their helpers `projecttestutil`,
 //! `lsptestutil` and `autoimporttestutil`. The `internal/api` session tests
-//! that use `projecttestutil` are here too (`api_session_*_test`).
+//! that use `projecttestutil` are here too (`api_session_*_test`, with the
+//! helpers `api_util`), and the `internal/api/requestfilesystem` tests
+//! (`requestfilesystem_*test`), which use `support::vfstest`.
 //!
 //! PORT: each Go leaf subtest (`t.Run`) is one `#[test]`, so a port bug
 //! can be marked `#[ignore = "bug: S4-..."]` on the one subtest that shows
@@ -48,13 +50,19 @@ macro_rules! child_test {
     };
 }
 
+pub(crate) mod api_util;
 pub(crate) mod autoimporttestutil;
 pub(crate) mod lsptestutil;
 pub(crate) mod projecttestutil;
 pub(crate) mod util;
 
 mod api_session_apistate_test;
+mod api_session_batch_test;
 mod api_session_completion_test;
+mod api_session_createprogram_test;
+mod api_session_createsourcefile_test;
+mod api_session_module_resolution_test;
+mod api_session_requestfilesystem_test;
 mod ata_discovertypings_test;
 mod ata_installnpmpackages_test;
 mod ata_test;
@@ -93,6 +101,9 @@ mod projectlifetime_test;
 mod projectreferencesprogram_test;
 mod refcountcache_test;
 mod released_program_test;
+mod requestfilesystem_filechanges_test;
+mod requestfilesystem_pathtree_test;
+mod requestfilesystem_test;
 mod session_test;
 mod snapshot_test;
 mod snapshotfs_test;
