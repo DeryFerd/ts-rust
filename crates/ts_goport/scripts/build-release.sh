@@ -61,15 +61,21 @@
 # SIGILL), and panic=abort (the port catches panics for Go recover parity).
 # Measured on R145 source (static1 lane, target/continuation-r97-goport/static1):
 # PGO + BOLT builds against the default, paired rounds of tsgo check and emit on
-# query, hono, zod and effect, on dbook and mini-abf9. Output is byte-equal.
-#   - RELEASE_PIE=0: 1.0 to 1.3% faster (mean of the 8 cells), peak RSS the
-#     same. Same glibc floor. The bin loses ASLR for its own code and data, as
-#     Go's tsgo (non-PIE) does.
+# query, hono, zod and effect, on dbook, mini-abf9 and mini-743d (mean of the 8
+# cells per run). Output is byte-equal.
+#   - RELEASE_PIE=0: 1.0 to 1.3% faster, peak RSS the same. Same glibc floor.
+#     The bin loses ASLR for its own code and data, as Go's tsgo (non-PIE) does.
 #   - RELEASE_LIBC=musl RELEASE_PIE=0: starts on any x86-64 Linux (glibc 2.27,
-#     Alpine), no shared libraries, 2 to 4 MiB less RSS on query and hono. But
-#     1.0 to 1.4% slower (hono and effect emit up to 2.7%): musl's memcpy,
-#     memcmp and memset take 5 to 7% of the time, glibc's about 3.5%. Without
-#     PGO and BOLT, a musl static-pie bin is 4% slower than the default.
+#     Alpine), no shared libraries, 2 to 5 MiB less RSS on query, 0.6 to 1.2 ms
+#     less to start. But 0.5 to 1.9% slower (hono up to 3.8%): musl's
+#     memcpy, memcmp and memset take 5 to 7% of the time, glibc's about 3.5%.
+#     Without PGO and BOLT, a musl static-pie bin is 4% slower than the
+#     default.
+#   - RELEASE_STATIC=1 RELEASE_JEMALLOC=1 with the plain x86-64 Arch glibc 2.44
+#     (RELEASE_SYSROOT): starts on any x86-64 Linux with kernel 4.4 or later,
+#     Alpine too; 0.8 to 1.3% faster, 0 to 7 MiB less RSS. The best of these,
+#     but static glibc brings the LGPL duties (see RELEASE_STATIC), which need
+#     a decision.
 #   - -Wl,-z,pack-relative-relocs with glibc: the bin needs GLIBC_ABI_DT_RELR
 #     (glibc 2.36), so it does not start on the floor glibc. Not used.
 # So the default stays dynamic glibc and PIE.
