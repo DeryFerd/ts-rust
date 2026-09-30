@@ -24,9 +24,11 @@
 //! checker emits when its check ends, and the emit keeps its writes in
 //! memory. The started tasks write their outputs one at a time
 //! (`build_project_finish`), in the order their check and emit end, as each
-//! Go builder writes when its own task ends. Tasks start before a started
-//! task writes, so a task that runs beside others in Go reads the file
-//! system before they write their outputs. Every task
+//! Go builder writes when its own task ends. PORT (determinism): tasks that
+//! can see each other's writes (shared_outputs.rs) finish in build order
+//! instead, and are taken and start as if all tasks did. Tasks start
+//! before a started task writes, so a task that runs beside others in Go
+//! reads the file system before they write their outputs. Every task
 //! uses `o.host` and its caches (parsed `.d.ts` and
 //! `.json` files, configs, the cached file system, the mtimes), as in Go.
 //! Outside tests each program is released when its task is built, as Go
@@ -50,6 +52,7 @@ use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::config_prefetch::ConfigPrefetch;
 use crate::execute::build::host::BuildHost;
+use crate::execute::build::shared_outputs::SharedOutputs;
 use crate::execute::incremental::build_info::{BuildInfo, is_build_info_file_name_default_library};
 use crate::execute::incremental::incremental::{new_build_info_reader, parse_build_info};
 use crate::execute::tsc::compile::{
@@ -871,14 +874,29 @@ impl Orchestrator {
                 compiled.push_back(index);
             }
         }
+        // PORT: not in Go (determinism). The tasks that finish in build
+        // order (see shared_outputs.rs), found when the first task
+        // compiles. Until then every task was done when it started, so the
+        // build order and the order of the checks' ends were the same. With
+        // one builder that is always so.
+        let mut shared: Option<SharedOutputs> = None;
         // Tasks taken (Go `currentTaskIndex`), taken and not built, and
         // reported. The tasks before `next_report` are built.
         let mut next_take = 0;
         let mut in_flight = 0;
         let mut next_report = 0;
         while next_report < paths.len() {
-            // Each free builder takes the next task in order.
+            // Each free builder takes the next task in order. A bound task
+            // is taken only when fewer than `num_routines` tasks before it
+            // are not built, as when all tasks finish in build order.
             while in_flight < num_routines && next_take < paths.len() {
+                if shared
+                    .as_ref()
+                    .is_some_and(|shared| shared.bound[next_take])
+                    && next_take - next_report >= num_routines
+                {
+                    break;
+                }
                 states[next_take] = State::Waiting;
                 next_take += 1;
                 in_flight += 1;
@@ -932,6 +950,10 @@ impl Orchestrator {
                     in_flight -= 1;
                     progressed = true;
                 }
+                drop(task);
+                if states[index] == State::Compiling && shared.is_none() && num_routines > 1 {
+                    shared = Some(self.shared_outputs(&paths, &index_of));
+                }
             }
             // Tasks report in order, each when it is built.
             while next_report < paths.len() && states[next_report] == State::Done {
@@ -944,19 +966,25 @@ impl Orchestrator {
                 continue;
             }
             // No task can start or report, so a taken task compiles (the
-            // first taken task that is not built has its upstream tasks
-            // done). A Go builder writes the outputs of its task when the
-            // task's check ends, and then takes the next task. So the task
-            // whose started check and emit ended first finishes now: it
-            // writes its outputs, and its builder takes the next task. When
-            // none has ended yet, this waits for a signal, and frees a kept
-            // released program first.
+            // first task that is not built, `next_report`, has its upstream
+            // tasks done). A Go builder writes the outputs of its task
+            // when the task's check ends, and then takes the next task. So
+            // the task whose started check and emit ended first finishes
+            // now: it writes its outputs, and its builder takes the next
+            // task. An ordered task (`SharedOutputs::ordered`) finishes only
+            // when it is the first task that is not built. When no task can
+            // finish yet, this waits for a signal, and frees a kept released
+            // program first.
             let index = loop {
                 while let Ok(index) = ready_calls.try_recv() {
                     signal_arrived(&mut signals, &mut compiled, index);
                 }
-                if let Some(index) = compiled.pop_front() {
-                    break index;
+                let can_finish = |&index: &usize| {
+                    index == next_report
+                        || !shared.as_ref().is_some_and(|shared| shared.ordered[index])
+                };
+                if let Some(at) = compiled.iter().position(can_finish) {
+                    break compiled.remove(at).expect("the position is in the queue");
                 }
                 if !self.free_released() {
                     let index = ready_calls.recv().expect("this thread keeps a sender");
@@ -995,6 +1023,29 @@ impl Orchestrator {
                 self.keep_released(release_task_program(program));
             }
         }
+    }
+
+    /// PORT: not in Go (determinism). The `SharedOutputs` of the tasks at
+    /// `paths` (the build order of `build_all_tasks`).
+    fn shared_outputs(&self, paths: &[Path], index_of: &FxHashMap<Path, usize>) -> SharedOutputs {
+        let mut configs = Vec::with_capacity(paths.len());
+        let mut upstream = Vec::with_capacity(paths.len());
+        for path in paths {
+            let task = self.get_task(path);
+            let task = task.borrow();
+            configs.push(task.resolved.clone());
+            upstream.push(
+                task.up_stream
+                    .iter()
+                    .filter_map(|up| {
+                        index_of
+                            .get(&self.to_path(&up.task.borrow().config))
+                            .copied()
+                    })
+                    .collect(),
+            );
+        }
+        SharedOutputs::new(&configs, &upstream, |file_name| self.to_path(file_name))
     }
 
     /// PORT: not in Go (perf). Keeps `released` to free later (see
