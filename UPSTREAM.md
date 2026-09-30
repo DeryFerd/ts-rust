@@ -40,6 +40,29 @@ mount namespace where the default oracle, Go checkout and caches show the pin's 
 The `tests/go_baselines` harness reads `TS_GO_REPO`; under `pin.py exec` its default path is
 the pin checkout.
 
+## Pins in microsoft/TypeScript
+
+`microsoft/typescript-go` is archived. From 2026-08-19 the Go code is in
+[`microsoft/TypeScript`](https://github.com/microsoft/TypeScript) under `tsc/`, with Go 1.27 and
+the module path `github.com/microsoft/TypeScript/tsc`. Pin B (`16c25522e123`) is tree-identical to
+`microsoft/TypeScript` `51c91ec1d:tsc`; the "equivalent" field of each old pin names its commit there.
+
+- `pin.py add <full sha or main> --repo microsoft/TypeScript` fetches that one commit into
+  `~/.explore/repos/microsoft__TypeScript@<key>` and builds `tsgo-oracle-<key>` from `tsc/cmd/tsc`
+  with Go 1.27.1. The pin record has `"layout": "typescript"`, `"subdir": "tsc"` and
+  `goCheckout` `<checkout>/tsc`. So under `pin.py exec` the default Go checkout path shows `tsc/`,
+  and tools find `internal/`, `cmd/` and `testdata/` where they always did.
+- The TypeScript submodule is gone. Its test cases are in `testdata/tests/cases` (a case that
+  collided with a Go case has the name in `testdata/promotedTestCollisions.txt`), the
+  `submodule*` baseline dirs are merged into the plain dirs, and the `.diff` baselines are gone.
+  `record.py corpus` maps the old sample paths. `cmd/tsgo` is now `cmd/tsc`.
+- `record.py typesyms` rewrites the module path in its overlay main. `drift.py` reads the new repo
+  with `--repo <clone> --subdir tsc`.
+- Not adapted yet: the fourslash trace recorder (goport-ls `scripts/goport/fourslash-record`),
+  `np-suite.sh` (the client moved to `packages/typescript` at the repo root) and the
+  `tests/go_baselines` submodule runner. Bump C ports them (see
+  `target/continuation-r97-goport/upstream/bumpC/plan.md`).
+
 Some pin caches are inputs, not oracle outputs, because they come from the pin's Go tests or
 API: the API traces (`tests2/api/traces`, built by `scripts/goport/api_oracle.py build` under
 `GOPORT_PIN`; pins after `dc37b5249ab6` speak API protocol 2), the fourslash LS traces

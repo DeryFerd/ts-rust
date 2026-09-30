@@ -5,6 +5,12 @@ UPSTREAM.json (repo root) records the typescript-go pins. The default paths hold
 current pin: the oracle ~/.local/bin/tsgo-oracle, the Go checkout
 ~/.explore/repos/microsoft__typescript-go and the oracle caches listed in "caches".
 
+A pin names a repo and a commit. microsoft/typescript-go pins (layout "typescript-go") have the Go
+module at the checkout root and the TypeScript submodule in _submodules/TypeScript.
+microsoft/TypeScript pins (layout "typescript", from 2026-08-19 on) have the Go module in tsc/ and
+no submodule; their goCheckout is that tsc/ dir, so the binds below show it at the default Go
+checkout path and tools read internal/, cmd/ and testdata/ where they always did.
+
 GOPORT_PIN=<key> selects another pin for one run. The key is the first 12 hex digits of
 the commit (a unique prefix of 7 or more also works). `pin.py exec -- <command>` then
 starts the command in a private mount namespace (bubblewrap, same uid, no root) where
@@ -25,10 +31,16 @@ usage:
   pin.py path FIELD [KEY]         oracle | goCheckout | root | commit | dumper | cache:<entry>
   pin.py exec -- COMMAND...       run COMMAND under GOPORT_PIN
   pin.py binds [KEY]              the binds that exec makes ("src -> dest [ro]")
-  pin.py add COMMIT [--go GO] [--checkout DIR]
-                                  old-layout commit: clone a checkout next to the default one
-                                  (or use DIR), build tsgo-oracle-<key> with GOTOOLCHAIN=GO
-                                  unless it exists, add the pin
+  pin.py add COMMIT [--repo REPO] [--go GO] [--checkout DIR]
+                                  REPO microsoft/typescript-go (default): clone a checkout next to
+                                  the default one (or use DIR), build tsgo-oracle-<key> from
+                                  ./cmd/tsgo with GOTOOLCHAIN=GO (default go1.26.4) unless it
+                                  exists, add the pin.
+                                  REPO microsoft/TypeScript: COMMIT is a full sha or one ref name
+                                  (main). Fetch that commit (depth 1) into
+                                  ~/.explore/repos/microsoft__TypeScript@<key> (or DIR), build the
+                                  oracle from tsc/cmd/tsc (default go1.27.1), add the pin with
+                                  goCheckout <DIR>/tsc.
   pin.py sync HOST [KEY]          copy the pin's oracle, checkout (no .git), caches and
                                   UPSTREAM.json to a remote host (same absolute paths)
 """
@@ -36,6 +48,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -173,8 +186,16 @@ def git(repo, *args):
     return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
-def cmd_add(commit, go='go1.26.4', checkout=None):
-    """Adds an old-layout (microsoft/typescript-go) commit: checkout, TypeScript submodule, oracle."""
+OLD_REPO, NEW_REPO = 'microsoft/typescript-go', 'microsoft/TypeScript'
+
+
+def cmd_add(commit, go=None, checkout=None, repo=OLD_REPO):
+    """Adds a pin. A microsoft/typescript-go commit: checkout, TypeScript submodule, oracle."""
+    if repo == NEW_REPO:
+        return add_new_layout(commit, go or 'go1.27.1', checkout, repo)
+    if repo != OLD_REPO:
+        die(f'--repo must be {OLD_REPO} or {NEW_REPO}')
+    go = go or 'go1.26.4'
     cfg = load()
     base = Path(cfg['defaults']['goCheckout'])
     full = git(base, 'rev-parse', '--verify', f'{commit}^{{commit}}')
@@ -205,6 +226,46 @@ def cmd_add(commit, go='go1.26.4', checkout=None):
         'typescriptSubmodule': sub, 'goCheckout': str(dest),
         'oracle': {'path': str(oracle), 'sha256': sha256(oracle), 'go': go, 'version': version,
                    'build': 'CGO_ENABLED=0 GOAMD64=v1 go build ./cmd/tsgo'},
+    }
+    save(cfg)
+    print(json.dumps(cfg['pins'][key], indent=2))
+
+
+def add_new_layout(commit, go, checkout, repo):
+    """Adds a microsoft/TypeScript commit: a depth-1 checkout (Go module in tsc/) and the oracle."""
+    cfg = load()
+    url = f'https://github.com/{repo}.git'
+    full = commit.lower()
+    if not re.fullmatch(r'[0-9a-f]{40}', full):
+        # GitHub serves a commit by its full sha only, so a ref name is resolved first.
+        out = subprocess.run(['git', 'ls-remote', url, commit], check=True, capture_output=True, text=True).stdout
+        hits = {line.split()[0] for line in out.splitlines()}
+        if len(hits) != 1:
+            die(f'{commit!r} is not a full commit sha or one ref of {url}')
+        full = hits.pop()
+    key = full[:12]
+    if key in cfg['pins']:
+        die(f'pin {key} exists')
+    dest = Path(checkout or Path(cfg['defaults']['goCheckout']).with_name(f'{repo.replace("/", "__")}@{key}'))
+    if not dest.exists():
+        subprocess.run(['git', 'init', '--quiet', str(dest)], check=True)
+        git(dest, 'remote', 'add', 'origin', url)
+        git(dest, 'fetch', '--quiet', '--depth=1', '--no-tags', 'origin', full)
+        git(dest, 'checkout', '--quiet', '--detach', full)
+    go_root = dest / 'tsc'
+    if git(dest, 'rev-parse', 'HEAD') != full or git(dest, 'status', '--porcelain') or not (go_root / 'go.mod').is_file():
+        die(f'{dest} is not a clean checkout of {full} with tsc/go.mod')
+    oracle = Path(cfg['defaults']['oracle']).with_name(f'tsgo-oracle-{key}')
+    if not oracle.exists():
+        # As upstream's Herebyfile builds tsc: in tsc/, with the root go.work. This build embeds the libs.
+        env = dict(os.environ, GOTOOLCHAIN=go, CGO_ENABLED='0', GOAMD64='v1')
+        subprocess.run(['go', 'build', '-o', str(oracle), './cmd/tsc'], cwd=go_root, env=env, check=True)
+    version = subprocess.run([str(oracle), '--version'], capture_output=True, text=True).stdout.strip()
+    cfg['pins'][key] = {
+        'repo': repo, 'commit': full, 'date': git(dest, 'log', '-1', '--format=%cs', full),
+        'layout': 'typescript', 'subdir': 'tsc', 'goCheckout': str(go_root),
+        'oracle': {'path': str(oracle), 'sha256': sha256(oracle), 'go': go, 'version': version,
+                   'build': 'CGO_ENABLED=0 GOAMD64=v1 go build ./cmd/tsc (in tsc/)'},
     }
     save(cfg)
     print(json.dumps(cfg['pins'][key], indent=2))
@@ -250,7 +311,7 @@ def main():
         cmd_path(*rest[:2])
     elif cmd == 'add' and rest:
         opt = lambda name, default=None: rest[rest.index(name) + 1] if name in rest else default
-        cmd_add(rest[0], opt('--go', 'go1.26.4'), opt('--checkout'))
+        cmd_add(rest[0], opt('--go'), opt('--checkout'), opt('--repo', OLD_REPO))
     elif cmd == 'sync' and rest:
         cmd_sync(*rest[:2])
     else:

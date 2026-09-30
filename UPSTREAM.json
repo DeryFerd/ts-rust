@@ -109,6 +109,28 @@
         "go": "go1.26.8",
         "build": "go build -overlay with typesyms/tools/typesymdump-main-16c25522e123.go (sha256 ab0d134280b1): typesymdump-main.go plus the new contentMapperProject argument of compiler.NewCompilerHost, nil as tsgo passes for a config without contentMappers. Then scripts/upstream/record.py typesyms."
       }
+    },
+    "673a5f17d713": {
+      "repo": "microsoft/TypeScript",
+      "commit": "673a5f17d713bdc8c7185f18a9c11e3c4ac5d781",
+      "date": "2026-09-29",
+      "layout": "typescript",
+      "subdir": "tsc",
+      "goCheckout": "/home/theo/.explore/repos/microsoft__TypeScript@673a5f17d713/tsc",
+      "oracle": {
+        "path": "/home/theo/.local/bin/tsgo-oracle-673a5f17d713",
+        "sha256": "2991c6e91578b4765ef34de5de47734e167f409a17bda7f450bf3d2eac64389a",
+        "go": "go1.27.1",
+        "version": "Version 7.1.0-dev",
+        "build": "CGO_ENABLED=0 GOAMD64=v1 go build ./cmd/tsc (in tsc/)"
+      },
+      "typesymDumper": {
+        "path": "/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/pins/673a5f17d713/target/continuation-r97-goport/typesyms/typesymdump-go",
+        "sha256": "be47536be09809ce87d702cbd3d963d5de2ecd75e27442160a28d357a9de57b7",
+        "go": "go1.27.1",
+        "build": "scripts/upstream/record.py typesyms: go build -overlay with typesyms/tools/typesymdump-main-16c25522e123.go (sha256 ab0d134280b1), module path rewritten to github.com/microsoft/TypeScript/tsc"
+      },
+      "note": "Upstream head on 2026-09-29, the first microsoft/TypeScript pin: proof that the tools read the new layout. Not a bump target yet."
     }
   }
 }

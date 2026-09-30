@@ -16,7 +16,7 @@
 #                 pins in its EXIT2_PINS.
 #   sweep-wide    (--full) 292 configs of 51 more real projects (sweep-wide.sh)
 #   f1            sample-f1/run-f1.py (R104 conformance sample)
-#   emit          emit/compare-emit.sh
+#   emit          compare-emit.sh (the tracked copy next to this script)
 #   typesyms      Go vs Rust dumps for query and hono (+ effect in --full)
 #   build         build-mode/compare-build.sh seq <repo> cold edits flags foreign, repro and query-chain
 #   determinism   goport 3x on zod, effect, elysia: runs must be equal and equal to the oracle
@@ -103,6 +103,8 @@ REPO = Path('/home/theo/Code/sandbox/ts-rust')
 R = REPO / 'target/continuation-r97-goport'
 X = REPO / 'target/project-inputs-extra'
 ORACLE = Path.home() / '.local/bin/tsgo-oracle'
+# The Go checkout of the run's pin (pin.py exec shows the pin's goCheckout here).
+GO = Path.home() / '.explore/repos/microsoft__typescript-go'
 GO_DUMPER = R / 'typesyms/typesymdump-go'
 RSS_LIMIT = 40 * 2**30
 
@@ -360,7 +362,12 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file, sample_file):
     shards: a pin that adds or renumbers cases keeps the same cases, under the pin's ids. The file holds
     the 1,501 case paths of the sample at pin 52168999f3dc, shard 0 + the first 502 of shard 1, where the
     runner gets the same arguments as before (no --ids). A path that the pin lacks gets no item, so the
-    stage has fewer items than expected and fails."""
+    stage has fewer items than expected and fails.
+    A microsoft/TypeScript pin (layout "typescript": its Go checkout has testdata/promotedTestCollisions.txt) has no
+    TypeScript submodule. There a sample path _submodules/TypeScript/tests/cases/<p> is testdata/tests/cases/<p>, or
+    the new name that the collisions file gives (as scripts/upstream/record.py corpus maps the corpus-int3 sample),
+    and a sample case whose file is not in the pin's Go checkout (Go deleted it) is not expected. The log lists it.
+    At the other pins nothing changes."""
     work = Path(work).resolve()
     work.mkdir(parents=True)
     sys.path.insert(0, str(R / 'emit-corpus'))
@@ -369,6 +376,14 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file, sample_file):
     if os.environ.get('GOPORT_PIN_ACTIVE'):  # pin run: the runner asserts the pin oracle's hash
         es.ORACLE_SHA256 = os.environ['GOPORT_PIN_ORACLE_SHA256']
     sample = [l for l in Path(sample_file).read_text().splitlines() if l and not l.startswith('#')]
+    collisions, gone = GO / 'testdata/promotedTestCollisions.txt', []
+    if collisions.is_file():
+        old = '_submodules/TypeScript/tests/cases/'
+        renamed = dict(re.findall(r'^renamed-promoted\S* (\S+) -> (\S+)$', collisions.read_text(), re.M))
+        sample = [f"testdata/tests/cases/{renamed.get(s[len(old):], s[len(old):])}" if s.startswith(old) else s for s in sample]
+        gone = [s for s in sample if not (GO / s).is_file()]
+        for source in gone:
+            print(f'sample case path not in this pin\'s Go checkout (not expected): {source}', flush=True)
     wanted, found, items = set(sample), set(), []
     shards = json.loads((R / 'corpus-full/shards/shard-0.json').read_text())['of']
     for shard in range(shards):
@@ -393,7 +408,7 @@ def cmd_corpus_emit(goport_emit, commit, work, items_file, sample_file):
             items.append(item('corpus-emit', r['id'], r['class'] == 'MATCH' and not bad, detail + (' INPUTS-CHANGED' if bad else '')))
     for source in sorted(wanted - found):
         print(f'sample case path not in this pin\'s corpus: {source}', flush=True)
-    write_items(items_file, items, len(sample))
+    write_items(items_file, items, len(set(sample)) - len(set(gone)))
 
 
 # ---- allow-list ----
@@ -570,7 +585,7 @@ fi
 stage sweep-hono-runtime bash "$HERE/sweep-hono-runtime.sh" "$RUNS_REL/hono-rt"; parse sweep-hono-runtime "$OUT/runs/hono-rt" 7
 stage f1 python3 "$R/sample-f1/run-f1.py" "$BINS/goport" "$OUT/runs/f1"
 py f1 "$OUT/runs/f1/summary.json" "$OUT/items/f1.jsonl" >> "$OUT/logs/f1.log" 2>&1
-stage emit env JOBS=4 bash "$R/emit/compare-emit.sh" "$BINS/goport_emit" "gate-$LABEL"; parse emit "/tmp/goport-emit-gate-$LABEL" 45
+stage emit env JOBS=4 bash "$HERE/compare-emit.sh" "$BINS/goport_emit" "gate-$LABEL"; parse emit "/tmp/goport-emit-gate-$LABEL" 45
 TS_NAMES=(query hono); [[ $MODE == full ]] && TS_NAMES+=(effect)
 stage typesyms py typesyms "$BINS/goport_typesyms" "$OUT/runs/typesyms" "$OUT/items/typesyms.jsonl" "${TS_NAMES[@]}"
 build_seq() {
@@ -608,7 +623,7 @@ def family(root, pattern):
     return h.hexdigest()
 scripts = [R / 'tools-port/measure.sh', R / 'tools-port/measure-extra.sh', Path(gate).parent / 'sweep.sh',
            Path(gate).parent / 'sweep-extra2.sh', Path(gate).parent / 'sweep-wide.sh', Path(gate).parent / 'sweep-hono-runtime.sh',
-           R / 'sample-f1/run-f1.py', R / 'emit/compare-emit.sh', R / 'typesyms/compare-int.py',
+           R / 'sample-f1/run-f1.py', Path(gate).parent / 'compare-emit.sh', R / 'typesyms/compare-int.py',
            R / 'build-mode/compare-build.sh', R / 'corpus-full/run_shard.py', R / 'corpus-full/run_shard_parallel.py',
            R / 'emit-corpus/run_emit_shard2.py', Path(gate).parent / 'ls_edit_bench.py', Path(gate).parent / 'exit-rule.sh',
            Path(gate).parent / 'gate-emit-sample.txt']
