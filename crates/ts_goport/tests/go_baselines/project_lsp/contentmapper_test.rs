@@ -234,6 +234,136 @@ const BOX_PATH: &str = "/home/project/app.box";
 const BOX_TEXT: &str = "export const version = #{target};\n";
 
 // ---------------------------------------------------------------------------
+// TestContentMapperProjectWithoutMappedFiles, TestContentMapperParallelFileLoading (ts#64221)
+// ---------------------------------------------------------------------------
+
+/// Go `&project.SessionOptions{CurrentDirectory: "/home/project",
+/// DefaultLibraryPath: bundled.LibPath(), PositionEncoding:
+/// lsproto.PositionEncodingKindUTF8, RunExternalCode: true}` (no typings
+/// location).
+fn race_options() -> SessionOptions {
+    SessionOptions {
+        typings_location: String::new(),
+        ..options("/home/project", true)
+    }
+}
+
+// Go: contentmapper_test.go:53 TestContentMapperProjectWithoutMappedFiles
+fn content_mapper_project_without_mapped_files(has_mapper: bool) {
+    let mut config = r#"{"compilerOptions": {"noLib": true}}"#;
+    if has_mapper {
+        config = r#"{
+					"compilerOptions": { "noLib": true },
+					"contentMappers": [ { "package": "mapper", "extensions": [".box"] } ]
+				}"#;
+    }
+    let mapper = contentmappertest::package_json(contentmappertest::TRANSFORMING_MAPPER);
+    let file_map = files(&[
+        ("/home/project/tsconfig.json", config),
+        (
+            "/home/project/node_modules/mapper/package.json",
+            mapper.as_str(),
+        ),
+        ("/home/project/main.ts", "export {};"),
+    ]);
+    let (mut init, _utils) = init_options(file_map, race_options());
+    let spawner = RecordingContentMapperSpawner::new(contentmappertest::new_spawner());
+    let spawner_for_init: Rc<dyn contentmapper::Spawner> = spawner.clone();
+    init.spawner = Some(spawner_for_init);
+    let session = project::new_session(&init);
+
+    let ctx = bg();
+    session.did_open_file(
+        &ctx,
+        &uri(MAIN_URI),
+        1,
+        "export {};",
+        &lsproto::LanguageKind::TYPE_SCRIPT,
+    );
+    let language_service = session
+        .get_language_service(&ctx, &uri(MAIN_URI))
+        .unwrap_or_else(|err| panic!("GetLanguageService: {}", err.error()));
+    // Access after freezing must not try to initialize using the cleared builder.
+    let program = language_service.get_program();
+    let mapper_project = program.content_mapper_project();
+    assert_eq!(mapper_project.is_some(), has_mapper);
+    let again = program.content_mapper_project();
+    assert_eq!(
+        again.as_ref().map(|p| Rc::as_ptr(p) as *const u8),
+        mapper_project.as_ref().map(|p| Rc::as_ptr(p) as *const u8)
+    );
+    assert_eq!(spawner.spawns(), 0);
+    session.close();
+}
+
+child_test! {
+    // Go: contentmapper_test.go:56 TestContentMapperProjectWithoutMappedFiles/hasMapper=false
+    fn content_mapper_project_without_mapped_files_has_mapper_false() {
+        content_mapper_project_without_mapped_files(false);
+    }
+}
+
+child_test! {
+    // Go: contentmapper_test.go:56 TestContentMapperProjectWithoutMappedFiles/hasMapper=true
+    fn content_mapper_project_without_mapped_files_has_mapper_true() {
+        content_mapper_project_without_mapped_files(true);
+    }
+}
+
+child_test! {
+    // Go: contentmapper_test.go:95 TestContentMapperParallelFileLoading
+    fn content_mapper_parallel_file_loading() {
+        let mapper = contentmappertest::package_json(contentmappertest::TRANSFORMING_MAPPER);
+        let mut entries: Vec<(String, String)> = vec![
+            (
+                "/home/project/tsconfig.json".to_string(),
+                r#"{
+			"compilerOptions": { "target": "es2020", "noLib": true },
+			"contentMappers": [ { "package": "mapper", "extensions": [".box"] } ]
+		}"#
+                .to_string(),
+            ),
+            ("/home/project/node_modules/mapper/package.json".to_string(), mapper.clone()),
+            ("/home/project/main.ts".to_string(), "export {};".to_string()),
+        ];
+        // Parallel parsing reads the mapper project identity while another file initializes it.
+        const FILE_COUNT: usize = 32;
+        for i in 0..FILE_COUNT {
+            entries.push((
+                format!("/home/project/file{i}.box"),
+                "export const version = #{target};\n".to_string(),
+            ));
+        }
+        let borrowed: Vec<(&str, &str)> =
+            entries.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (mut init, _utils) = init_options(files(&borrowed), race_options());
+        init.spawner = Some(contentmappertest::new_spawner());
+        let session = project::new_session(&init);
+
+        let ctx = bg();
+        session.did_open_file(&ctx, &uri(MAIN_URI), 1, "export {};", &lsproto::LanguageKind::TYPE_SCRIPT);
+        let language_service = session
+            .get_language_service(&ctx, &uri(MAIN_URI))
+            .unwrap_or_else(|err| panic!("GetLanguageService: {}", err.error()));
+        let program = language_service.get_program();
+        let mapper_project = program.content_mapper_project().expect("mapper project");
+        let again = program.content_mapper_project().expect("mapper project");
+        assert!(Rc::ptr_eq(&again, &mapper_project));
+        for i in 0..FILE_COUNT {
+            let file_name = format!("/home/project/file{i}.box");
+            let file = program
+                .get_source_file(&file_name)
+                .unwrap_or_else(|| panic!("expected {file_name} to be loaded"));
+            assert_eq!(
+                file.text,
+                "const __VERSION = \"1.0.0\";\nexport const version = 7;\n"
+            );
+        }
+        session.close();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TestContentMapperInProject
 // ---------------------------------------------------------------------------
 

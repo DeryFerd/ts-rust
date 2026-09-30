@@ -2083,14 +2083,14 @@ impl ProjectCollectionBuilder {
                         .iter()
                         .any(|file| !file.content_mapper().is_empty())
                     {
-                        new_host.ensure_content_mapper_project();
-                    }
-                    let content_mapper_project =
-                        compiler::CompilerHost::content_mapper_project(&*new_host);
-                    if let Some(content_mapper_project) = content_mapper_project {
-                        let dynamic_watched_files =
-                            content_mapper_project.watched_files().unwrap_or_default();
-                        watched_files.extend(dynamic_watched_files);
+                        // ts#64221
+                        if let Some(content_mapper_project) =
+                            compiler::CompilerHost::content_mapper_project(&*new_host)
+                        {
+                            let dynamic_watched_files =
+                                content_mapper_project.watched_files().unwrap_or_default();
+                            watched_files.extend(dynamic_watched_files);
+                        }
                     }
                     watched_files.sort();
                     watched_files.dedup();

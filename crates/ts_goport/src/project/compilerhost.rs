@@ -102,37 +102,6 @@ impl CompilerHost {
             panic!("method must not be called after snapshot initialization");
         }
     }
-
-    // Go: project/compilerhost.go:153 compilerHost.ensureContentMapperProject (tsgo#4712)
-    pub fn ensure_content_mapper_project(&self) {
-        if self.content_mapper_once.replace(true) {
-            return;
-        }
-        let content_mapper_host = self
-            .builder
-            .borrow()
-            .as_ref()
-            .expect("invalid memory address or nil pointer dereference: compilerHost.builder")
-            .content_mapper_host
-            .clone();
-        let Some(content_mapper_host) = content_mapper_host else {
-            return;
-        };
-        let project = self
-            .project
-            .borrow()
-            .clone()
-            .expect("invalid memory address or nil pointer dereference: compilerHost.project");
-        let command_line = project.borrow().get_command_line_with_typings_files().expect(
-            "invalid memory address or nil pointer dereference: project.getCommandLineWithTypingsFiles",
-        );
-        let content_mapper_project = content_mapper_host.project(contentmapper::ProjectSpec {
-            config_file_name: command_line.config_name().to_string(),
-            mappers: command_line.content_mappers().to_vec(),
-            compiler_options: Some(command_line.compiler_options().clone()),
-        });
-        *self.content_mapper_project.borrow_mut() = content_mapper_project;
-    }
 }
 
 // Go: project/compilerhost.go:14 `var _ compiler.CompilerHost = (*compilerHost)(nil)`
@@ -231,8 +200,8 @@ impl compiler::CompilerHost for CompilerHost {
             .expect("invalid memory address or nil pointer dereference: compilerHost.builder");
         // ts#64163: the locale comes from the builder context.
         let diagnostic_locale = locale::from_context(&builder.ctx);
-        self.ensure_content_mapper_project();
-        let Some(project) = self.content_mapper_project.borrow().clone() else {
+        // ts#64221
+        let Some(project) = compiler::CompilerHost::content_mapper_project(self) else {
             return Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone());
         };
         let identity = match project.identity(mapper) {
@@ -285,8 +254,34 @@ impl compiler::CompilerHost for CompilerHost {
         Ok(files)
     }
 
-    // Go: project/compilerhost.go:167 compilerHost.ContentMapperProject (tsgo#4712)
+    // Go: project/compilerhost.go:153 compilerHost.ContentMapperProject (tsgo#4712, ts#64221)
+    // PORT: the body of Go `ensureContentMapperProject` moved here in ts#64221
+    // (Go `contentMapperOnce.Do`).
     fn content_mapper_project(&self) -> Option<Rc<dyn contentmapper::Project>> {
+        if !self.content_mapper_once.replace(true) {
+            let content_mapper_host = self
+                .builder
+                .borrow()
+                .as_ref()
+                .and_then(|builder| builder.content_mapper_host.clone());
+            if let Some(content_mapper_host) = content_mapper_host {
+                let project = self.project.borrow().clone().expect(
+                    "invalid memory address or nil pointer dereference: compilerHost.project",
+                );
+                let command_line = project.borrow().get_command_line_with_typings_files().expect(
+                    "invalid memory address or nil pointer dereference: project.getCommandLineWithTypingsFiles",
+                );
+                if !command_line.content_mappers().is_empty() {
+                    let content_mapper_project =
+                        content_mapper_host.project(contentmapper::ProjectSpec {
+                            config_file_name: command_line.config_name().to_string(),
+                            mappers: command_line.content_mappers().to_vec(),
+                            compiler_options: Some(command_line.compiler_options().clone()),
+                        });
+                    *self.content_mapper_project.borrow_mut() = content_mapper_project;
+                }
+            }
+        }
         self.content_mapper_project.borrow().clone()
     }
 
