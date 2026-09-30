@@ -203,3 +203,40 @@ fn server_run_error(ctx: &Context, err: Result<(), GoError>) -> Result<(), GoErr
     }
     err
 }
+
+// Go: api/server_test.go (ts#64276)
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+    use crate::gostd::context;
+
+    // Go: api/server_test.go:14 TestServerRunError/EOF
+    #[test]
+    fn test_server_run_error_eof() {
+        assert!(server_run_error(&context::background(), Ok(())).is_ok());
+    }
+
+    // Go: api/server_test.go:19 TestServerRunError/context cancellation
+    #[test]
+    fn test_server_run_error_context_cancellation() {
+        let (ctx, cancel) = context::with_cancel(&context::background());
+        cancel();
+        assert!(server_run_error(&ctx, Err(context::CANCELED.clone())).is_ok());
+    }
+
+    // Go: api/server_test.go:26 TestServerRunError/unrelated cancellation
+    #[test]
+    fn test_server_run_error_unrelated_cancellation() {
+        let err = context::CANCELED.clone();
+        let result = server_run_error(&context::background(), Err(err.clone()));
+        assert!(result.is_err_and(|result| errors::is(&result, &err)));
+    }
+
+    // Go: api/server_test.go:32 TestServerRunError/context cancellation supersedes server error
+    #[test]
+    fn test_server_run_error_context_cancellation_supersedes_server_error() {
+        let (ctx, cancel) = context::with_cancel(&context::background());
+        cancel();
+        assert!(server_run_error(&ctx, Err(errors::new("server failed"))).is_ok());
+    }
+}

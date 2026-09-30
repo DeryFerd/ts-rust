@@ -1,9 +1,8 @@
-//! Port of Go `internal/api/session_completion_test.go`
-//! (`TestCompletionSymbolTypeIsResolvable`, `TestCompletionOnInferredProject`).
-//! Bump C: the two tests use the N session API (ts#64163, ts#64204). The N
-//! tests `TestCompletionRetriesWithAutoImports` (ts#64133) and
+//! Port of Go `internal/api/session_completion_test.go`.
+//! Bump C: the tests use the N session API (ts#64163, ts#64204). The N tests
+//! `TestCompletionRetriesWithAutoImports` (ts#64133) and
 //! `TestCompletionWithSymbolsAndExistingImportDoesNotDeadlock` (ts#64178)
-//! are not ported yet.
+//! are new at N.
 //!
 //! PORT: the tests are in `project_lsp` because they use `projecttestutil`
 //! and `child_test!`. Go `bundled.Embedded` is always true in the port, so
@@ -14,6 +13,8 @@ use ts_goport::api::{
     GetDefaultProjectForFileParams, GetTypeOfSymbolParams, SnapshotRequestChangesParams,
 };
 use ts_goport::gostd::GoError;
+use ts_goport::ls::lsutil;
+use ts_goport::options::Tristate;
 
 use super::projecttestutil::{self, files};
 use super::util::*;
@@ -31,7 +32,7 @@ fn doc(name: &str) -> DocumentIdentifier {
     }
 }
 
-// Go: session_completion_test.go:24 TestCompletionSymbolTypeIsResolvable
+// Go: session_completion_test.go:26 TestCompletionSymbolTypeIsResolvable
 // TestCompletionSymbolTypeIsResolvable reproduces a crash where requesting the
 // type of a completion-provided symbol panicked with a nil pointer dereference.
 //
@@ -187,6 +188,141 @@ child_test! {
         assert!(
             completions.is_some(),
             "expected a completion list for array members"
+        );
+        session.close();
+        project_session.close();
+    }
+}
+
+/// Go `lsutil.UserPreferences{IncludeCompletionsForModuleExports: core.TSTrue, IncludeCompletionsForImportStatements: core.TSTrue}`.
+fn auto_import_preferences() -> lsutil::UserPreferences {
+    lsutil::UserPreferences {
+        include_completions_for_module_exports: Tristate::True,
+        include_completions_for_import_statements: Tristate::True,
+        ..Default::default()
+    }
+}
+
+// Go: session_completion_test.go:141 TestCompletionRetriesWithAutoImports
+child_test! {
+    fn completion_retries_with_auto_imports() {
+        const FILE_NAME: &str = "/home/projects/p/src/index.ts";
+        const CONTENT: &str = "someV";
+        let (project_session, _) = projecttestutil::setup(files(&[
+            (
+                "/home/projects/p/tsconfig.json",
+                r#"{ "compilerOptions": { "module": "esnext", "target": "esnext" } }"#,
+            ),
+            ("/home/projects/p/src/export.ts", "export const someValue = 1;"),
+            (FILE_NAME, CONTENT),
+        ]));
+        project_session.configure(auto_import_preferences());
+
+        let session = api::new_lsp_session(project_session.clone(), None);
+
+        let ctx = bg();
+        let snapshot_resp = nil_error(session.handle_create_snapshot(
+            &ctx,
+            &CreateSnapshotParams {
+                snapshot_request_changes_params: SnapshotRequestChangesParams {
+                    open_files: Some(vec![doc(FILE_NAME)]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        let proj = nil_error(session.handle_get_default_project_for_file(
+            &ctx,
+            &GetDefaultProjectForFileParams {
+                snapshot: snapshot_resp.snapshot,
+                file: doc(FILE_NAME),
+            },
+        ))
+        .expect("file should resolve to a default project");
+
+        let completions = nil_error(session.handle_get_completions_at_position(
+            &ctx,
+            &GetCompletionsAtPositionParams {
+                snapshot: snapshot_resp.snapshot,
+                project: proj.id.clone(),
+                file: doc(FILE_NAME),
+                position: CONTENT.len() as u32,
+                ..Default::default()
+            },
+        ))
+        .expect("expected a completion list");
+        assert!(
+            completions.entries.iter().any(|entry| entry.name == "someValue"),
+            "expected auto-import completion for someValue"
+        );
+        session.close();
+        project_session.close();
+    }
+}
+
+// Go: session_completion_test.go:190 TestCompletionWithSymbolsAndExistingImportDoesNotDeadlock
+// PORT: the port is one thread, so the request runs on the test thread
+// instead of a goroutine with a 10 second timeout. A deadlock (a checker
+// taken twice) is a panic or a hang here, and the child runner's timeout
+// ends a hang.
+child_test! {
+    fn completion_with_symbols_and_existing_import_does_not_deadlock() {
+        const FILE_NAME: &str = "/home/projects/p/src/index.ts";
+        const CONTENT: &str = "import { otherValue } from \"./export\";\nsomeV";
+        let (project_session, _) = projecttestutil::setup(files(&[
+            (
+                "/home/projects/p/tsconfig.json",
+                r#"{ "compilerOptions": { "module": "esnext", "target": "esnext" } }"#,
+            ),
+            (
+                "/home/projects/p/src/export.ts",
+                "export const otherValue = 0; export const someValue = 1;",
+            ),
+            (FILE_NAME, CONTENT),
+        ]));
+        project_session.configure(auto_import_preferences());
+
+        let session = api::new_lsp_session(project_session.clone(), None);
+
+        let ctx = bg();
+        let snapshot_resp = nil_error(session.handle_create_snapshot(
+            &ctx,
+            &CreateSnapshotParams {
+                snapshot_request_changes_params: SnapshotRequestChangesParams {
+                    open_files: Some(vec![doc(FILE_NAME)]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        let proj = nil_error(session.handle_get_default_project_for_file(
+            &ctx,
+            &GetDefaultProjectForFileParams {
+                snapshot: snapshot_resp.snapshot,
+                file: doc(FILE_NAME),
+            },
+        ))
+        .expect("file should resolve to a default project");
+
+        // IncludeSymbol pins completion to the single persistent API checker. When
+        // ranking the auto-import completion, the existing import makes the view
+        // consult that checker. This used to try to acquire the same checker again
+        // and deadlock.
+        let completions = nil_error(session.handle_get_completions_at_position(
+            &ctx,
+            &GetCompletionsAtPositionParams {
+                snapshot: snapshot_resp.snapshot,
+                project: proj.id.clone(),
+                file: doc(FILE_NAME),
+                position: CONTENT.len() as u32,
+                include_symbol: true,
+                ..Default::default()
+            },
+        ))
+        .expect("expected a completion list");
+        assert!(
+            completions.entries.iter().any(|entry| entry.name == "someValue"),
+            "expected auto-import completion for someValue"
         );
         session.close();
         project_session.close();
