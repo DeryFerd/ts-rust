@@ -117,6 +117,18 @@ impl ToProgramSnapshot<'_> {
                     == old.options.skip_default_lib_check.is_true()
             });
 
+        // PORT: perf. Go looks up each referenced path of each unchanged
+        // file in the new program, to find a referenced file that the new
+        // program deleted. Only a path of the old snapshot can match, so
+        // those paths are looked up once here: when the new program has all
+        // of them (a watch rebuild of changed file texts), no file can have
+        // a deleted reference and the loop below skips the lookups.
+        let old_file_deleted = old_snapshot.is_some_and(|old| {
+            old.file_infos
+                .keys()
+                .any(|path| get_source_file_by_path(path).is_nil())
+        });
+
         let files = source_files();
         // PORT: perf. Go hashes each file text in the file's WorkGroup job.
         // Here another thread hashes the texts while the files bind and the
@@ -160,12 +172,15 @@ impl ToProgramSnapshot<'_> {
                         || old_file_info.implied_node_format != implied_node_format
                     {
                         self.snapshot.add_file_to_change_set(file_path.clone());
-                    } else if new_references.as_deref()
-                        != old_snapshot.referenced_map.get_references(&file_path)
-                    {
+                    } else if !same_references(
+                        new_references.as_deref(),
+                        old_snapshot.referenced_map.get_references(&file_path),
+                    ) {
                         // Referenced files changed
                         self.snapshot.add_file_to_change_set(file_path.clone());
-                    } else if let Some(new_references) = &new_references {
+                    } else if let Some(new_references) =
+                        new_references.as_ref().filter(|_| old_file_deleted)
+                    {
                         for ref_path in new_references.iter() {
                             if get_source_file_by_path(ref_path).is_nil()
                                 && old_snapshot.file_infos.contains_key(ref_path)
@@ -333,6 +348,18 @@ impl ToProgramSnapshot<'_> {
                 self.snapshot.build_info_emit_pending = true;
             }
         }
+    }
+}
+
+/// Go `newReferences.Equals(oldReferences)`: both absent, or the same
+/// paths in any order.
+// PORT: perf. A file whose imports did not change gets the same paths in
+// the same order as in the old snapshot, so an equal order is checked
+// first, without a hash of each path.
+fn same_references(a: Option<&FxIndexSet<Path>>, b: Option<&FxIndexSet<Path>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.len() == b.len() && (a.iter().eq(b.iter()) || a == b),
+        (a, b) => a.is_none() && b.is_none(),
     }
 }
 
