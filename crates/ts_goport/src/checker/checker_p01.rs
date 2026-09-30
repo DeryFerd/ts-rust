@@ -1043,11 +1043,11 @@ pub struct Checker {
     // so handle value 0 stays nil.
     pub symbols: SymbolArena,
     pub types: ChunkedArena<Type>,
-    pub signatures: ChunkedArena<Signature>,
+    pub signatures: Vec<Signature>,
     pub index_infos: Vec<IndexInfo>,
     pub type_predicates: Vec<TypePredicate>,
     pub mappers: ChunkedArena<TypeMapper>,
-    pub inference_contexts: ChunkedArena<InferenceContext>,
+    pub inference_contexts: Vec<InferenceContext>,
 
     /// Go `tracer *Tracer` (checker.go:897): optional tracer for trace
     /// events and type recording (for --generateTrace). None is Go nil.
@@ -1498,11 +1498,11 @@ impl Checker {
             merge_version: 0,
             symbols: bound_symbols,
             types: ChunkedArena::with_nil(Type::default()),
-            signatures: ChunkedArena::with_nil(Signature::default()),
+            signatures: vec![Signature::default()],
             index_infos: vec![IndexInfo::default()],
             type_predicates: vec![TypePredicate::default()],
             mappers: ChunkedArena::with_nil(TypeMapper::default()),
-            inference_contexts: ChunkedArena::with_nil(InferenceContext::default()),
+            inference_contexts: vec![InferenceContext::default()],
             // Go: compiler/checkerpool.go:104 makes the tracer when the pool
             // has a tracing session; NewChecker stores it (checker.go:905).
             tracer: crate::tracing::new_checker_tracer(checker_index),
