@@ -997,7 +997,8 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   names keep the Go spelling (`HoverParams`, `URI`, `DocumentUri`); fields
   are snake case (`text_document`, `type_`); `*T` is `Option<T>`
   (`Option<Box<T>>` only on a type cycle); `*[]T` is `Option<Vec<T>>`;
-  `[]T` and `[]*T` are `Vec<T>`, except that `[]*T` is `Vec<Option<T>>`
+  `[]T` and `[]*T` are `Vec<T>`, except that `[]*T` (also as a map value,
+  `WorkspaceEdit.changes`) is `Vec<Option<T>>`
   in a type that the server decodes (client-to-server params,
   server-to-client results, and the types they hold), so a JSON null
   element is Go's nil element and a nil element encodes as null (the

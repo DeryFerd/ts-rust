@@ -4014,7 +4014,7 @@ impl Server {
 
         // PORT: Go map order is random; the oracle compares this map
         // without order. Insertion order here.
-        let mut changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> =
+        let mut changes: IndexMap<lsproto::DocumentUri, Vec<Option<lsproto::TextEdit>>> =
             IndexMap::default();
         for change in &document_changes {
             if let Some(text_document_edit) = &change.text_document_edit {
@@ -4024,7 +4024,7 @@ impl Server {
                         changes
                             .entry(uri.clone())
                             .or_default()
-                            .push(text_edit.clone());
+                            .push(Some(text_edit.clone()));
                     }
                 }
             }
