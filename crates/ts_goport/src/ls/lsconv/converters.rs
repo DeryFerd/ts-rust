@@ -159,7 +159,7 @@ impl Converters {
     /// Go `c.getLineMap(fileName)` followed by a dereference.
     // PORT: Go dereferences the returned pointer, which panics when it is nil.
     fn line_map_of(&self, file_name: &str) -> Rc<LSPLineMap> {
-        (self.get_line_map)(file_name).expect("invalid memory address or nil pointer dereference")
+        (self.get_line_map)(file_name).unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     // Go: ls/lsconv/converters.go:66 ToLSPRange
@@ -748,10 +748,10 @@ pub fn file_name_to_document_uri(file_name: &str) -> lsproto::DocumentUri {
     }
     if tspath::is_dynamic_file_name(file_name) {
         let Some((scheme, rest)) = file_name[2..].split_once('/') else {
-            panic!("invalid file name: {file_name}");
+            crate::core::go_panic(format!("invalid file name: {file_name}"));
         };
         let Some((authority, path)) = rest.split_once('/') else {
-            panic!("invalid file name: {file_name}");
+            crate::core::go_panic(format!("invalid file name: {file_name}"));
         };
         if authority == "ts-nul-authority" {
             return lsproto::DocumentUri(format!("{scheme}:{path}"));
@@ -849,7 +849,12 @@ impl Converters {
         let text = script.text();
         while pos < end {
             // Go `text[pos:]` panics past the end of the text.
-            assert!(pos <= text.len(), "slice bounds out of range");
+            if pos > text.len() {
+                crate::core::go_panic(format!(
+                    "runtime error: slice bounds out of range [{pos}:{}]",
+                    text.len()
+                ));
+            }
             let (r, size) = utf8_decode_rune_in_string(text, pos);
             let u16_len = utf16_rune_len(r);
             if utf16_char + u16_len > char {
@@ -904,7 +909,11 @@ impl Converters {
             // PORT: Go ranges over `text[start:position]`. A character cut by
             // the slice end decodes as one-byte `RuneError`s, as in Go.
             let text = script.text();
-            assert!(start <= position, "slice bounds out of range");
+            if start > position {
+                crate::core::go_panic(format!(
+                    "runtime error: slice bounds out of range [{start}:{position}]"
+                ));
+            }
             let slice_end = position as usize;
             let mut pos = start as usize;
             while pos < slice_end {

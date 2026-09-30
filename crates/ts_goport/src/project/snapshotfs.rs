@@ -443,7 +443,7 @@ impl SnapshotFSBuilder {
         };
         let mut on_add = |key: &tspath::Path, value: Option<&Rc<RefCell<CachedFile>>>| {
             let file_name = value
-                .expect("invalid memory address or nil pointer dereference")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .borrow()
                 .file_base
                 .file_name();
@@ -467,7 +467,7 @@ impl SnapshotFSBuilder {
         for (deleted_path, deleted_file) in deleted.iter().flatten() {
             let realpath_path = deleted_file
                 .as_ref()
-                .expect("invalid memory address or nil pointer dereference")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .borrow()
                 .realpath_path
                 .clone();
@@ -481,7 +481,7 @@ impl SnapshotFSBuilder {
                     });
                     let is_empty = e
                         .value()
-                        .expect("invalid memory address or nil pointer dereference")
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
                         .borrow()
                         .paths
                         .is_empty();
@@ -594,7 +594,7 @@ impl SnapshotFSBuilder {
                 Rc::new(RefCell::new(RealpathAliasSet::default())),
             );
             entry
-                .expect("invalid memory address or nil pointer dereference")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .change(&mut |alias_set: &Rc<RefCell<RealpathAliasSet>>| {
                     alias_set.borrow_mut().add(symlink_path.clone());
                 });
@@ -1159,7 +1159,7 @@ impl SourceFS {
         self.seen_files
             .borrow()
             .as_ref()
-            .expect("invalid memory address or nil pointer dereference")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .borrow_mut()
             .insert(path);
     }
@@ -1314,19 +1314,19 @@ impl vfs::Fs for SourceFS {
     // Go: project/snapshotfs.go:763 sourceFS.WriteFile
     // WriteFile implements vfs.FS.
     fn write_file(&self, _path: &str, _data: &str) -> Result<(), vfs::FsError> {
-        panic!("unimplemented");
+        crate::core::go_panic("unimplemented".to_string());
     }
 
     // Go: project/snapshotfs.go:768 sourceFS.AppendFile
     // AppendFile implements vfs.FS.
     fn append_file(&self, _path: &str, _data: &str) -> Result<(), vfs::FsError> {
-        panic!("unimplemented");
+        crate::core::go_panic("unimplemented".to_string());
     }
 
     // Go: project/snapshotfs.go:773 sourceFS.Remove
     // Remove implements vfs.FS.
     fn remove(&self, _path: &str) -> Result<(), vfs::FsError> {
-        panic!("unimplemented");
+        crate::core::go_panic("unimplemented".to_string());
     }
 
     // Go: project/snapshotfs.go:778 sourceFS.Chtimes
@@ -1337,7 +1337,7 @@ impl vfs::Fs for SourceFS {
         _a_time: Option<SystemTime>,
         _m_time: Option<SystemTime>,
     ) -> Result<(), vfs::FsError> {
-        panic!("unimplemented");
+        crate::core::go_panic("unimplemented".to_string());
     }
 
     // Go: project/snapshotfs.go:715 sourceFS.DirectoryExists
@@ -1347,7 +1347,7 @@ impl vfs::Fs for SourceFS {
         if !exists && self.tracking.get() {
             self.missing_directories
                 .as_ref()
-                .expect("invalid memory address or nil pointer dereference")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .borrow_mut()
                 .insert((self.to_path)(path));
         }

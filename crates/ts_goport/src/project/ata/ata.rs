@@ -44,12 +44,12 @@ impl TypingsInfo {
         ) && self
             .compiler_options
             .as_deref()
-            .expect("nil CompilerOptions")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .get_allow_js()
             == other
                 .compiler_options
                 .as_deref()
-                .expect("nil CompilerOptions")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .get_allow_js()
             // Go: collections.Set.Equals (pointer equality, then nil checks,
             // then maps.Equal).

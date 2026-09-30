@@ -58,11 +58,11 @@ pub fn get_module_id_and_file_name_of_module_symbol(
     symbol: SymbolId,
 ) -> (ModuleID, String) {
     if !symbols.sym(symbol).is_external_module() {
-        panic!("symbol is not an external module");
+        crate::core::go_panic("symbol is not an external module".to_string());
     }
     let decl = get_non_augmentation_declaration(symbols, symbol);
     if decl.is_nil() {
-        panic!("module symbol has no non-augmentation declaration");
+        crate::core::go_panic("module symbol has no non-augmentation declaration".to_string());
     }
     if decl.kind() == SyntaxKind::SourceFile {
         return (
@@ -73,7 +73,7 @@ pub fn get_module_id_and_file_name_of_module_symbol(
     if is_module_with_string_literal_name(decl) {
         return (ModuleID(decl.name().text().to_string()), String::new());
     }
-    panic!("could not determine module ID of module symbol");
+    crate::core::go_panic("could not determine module ID of module symbol".to_string());
 }
 
 // Go: ls/autoimport/util.go:68 wordIndices
@@ -128,7 +128,7 @@ pub fn get_package_names_in_node_modules(
 ) -> FxHashSet<String> {
     let mut package_names: FxHashSet<String> = FxHashSet::default();
     if tspath::get_base_file_name(node_modules_dir) != "node_modules" {
-        panic!("nodeModulesDir is not a node_modules directory");
+        crate::core::go_panic("nodeModulesDir is not a node_modules directory".to_string());
     }
     // A missing node_modules directory yields no entries (GetAccessibleEntries returns
     // empty), so there's no need to check existence first: a deleted node_modules is
@@ -322,7 +322,7 @@ pub fn create_checker_pool(
             let closed = closed.clone();
             ls_program::Release::new(move || {
                 if closed.get() {
-                    panic!("send on closed channel");
+                    crate::core::go_panic("send on closed channel".to_string());
                 }
                 pool.borrow_mut().push_back(ch);
             })
@@ -362,7 +362,7 @@ pub fn create_checker_pool(
         Box::new(move || {
             // Go: close(pool)
             if closed.get() {
-                panic!("close of closed channel");
+                crate::core::go_panic("close of closed channel".to_string());
             }
             closed.set(true);
         })

@@ -4,9 +4,6 @@ use crate::ls::autoimport::prelude::*;
 
 use crate::modulespecifiers;
 
-/// Go runtime panic text for a nil pointer dereference.
-const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
-
 impl View {
     // Go: ls/autoimport/specifiers.go:9 GetModuleSpecifier
     // PORT: Go passes `v.program` as the `ModuleSpecifierGenerationHost`; the
@@ -85,7 +82,7 @@ impl View {
         if export.package_name.is_empty() {
             let loaded = cache
                 .as_ref()
-                .expect(NIL_DEREF)
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .borrow()
                 .get(&export.path)
                 .cloned();
@@ -115,14 +112,14 @@ impl View {
             }
             cache
                 .as_ref()
-                .expect(NIL_DEREF)
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .borrow_mut()
                 .insert(export.path.clone(), specifier.clone());
             return (specifier, kind);
         }
         cache
             .as_ref()
-            .expect(NIL_DEREF)
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .borrow_mut()
             .insert(export.path.clone(), String::new());
         (String::new(), modulespecifiers::ResultKind::None)

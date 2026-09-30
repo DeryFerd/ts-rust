@@ -47,8 +47,16 @@ macro_rules! unported {
 
 /// The panic payload of `go_panic`.
 pub struct GoPanic {
-    /// The Go panic value as the Go runtime prints it (port form).
+    /// The Go panic value as the Go runtime prints it (port form). It is
+    /// also the Go `%v` of the value that `recover()` returns.
     pub message: String,
+    /// The Go type of a value whose type is a named string type, such as
+    /// `lsproto.DocumentUri` (`go_panic_typed`). The runtime prints it as
+    /// `<type>("<message>")`. `None` for a plain string or an error.
+    pub go_type: Option<&'static str>,
+    /// A Go `recover()` raised the value again with `panic(r)`
+    /// (`go_repanic`). The runtime adds ` [recovered, repanicked]`.
+    pub repanicked: bool,
     /// The port site, for the stderr report.
     pub location: &'static std::panic::Location<'static>,
 }
@@ -63,8 +71,45 @@ pub struct GoPanic {
 pub fn go_panic(message: String) -> ! {
     std::panic::panic_any(GoPanic {
         message,
+        go_type: None,
+        repanicked: false,
         location: std::panic::Location::caller(),
     })
+}
+
+/// `go_panic` with a value of the named Go string type `go_type`, for
+/// example `panic("overlay not found: " + uri)` where `uri` is a
+/// `lsproto.DocumentUri`. `recover()` gives the same text, but the runtime
+/// prints `panic: <go_type>("<message>")`.
+#[track_caller]
+pub fn go_panic_typed(go_type: &'static str, message: String) -> ! {
+    std::panic::panic_any(GoPanic {
+        message,
+        go_type: Some(go_type),
+        repanicked: false,
+        location: std::panic::Location::caller(),
+    })
+}
+
+/// Go `if r := recover(); r != nil { ...; panic(r) }`: raises a caught
+/// panic again. A `go_panic` value is marked, so the runtime line gets
+/// ` [recovered, repanicked]`. Any other payload continues as it is.
+pub fn go_repanic(mut payload: Box<dyn std::any::Any + Send>) -> ! {
+    if let Some(panic) = payload.downcast_mut::<GoPanic>() {
+        panic.repanicked = true;
+    }
+    std::panic::resume_unwind(payload)
+}
+
+/// Runs `f` as the goroutine of Go `sync.WaitGroup.Go(f)`. At Go 1.26 that
+/// goroutine has a deferred recover that panics again with the value of a
+/// panic in `f` (`go_repanic`), so the runtime line ends with
+/// ` [recovered, repanicked]`. The port runs the task on the calling thread.
+pub fn go_wait_group_task<R>(f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(payload) => go_repanic(payload),
+    }
 }
 
 /// `go_panic` with the Go runtime text for a nil pointer dereference, at a
@@ -89,15 +134,27 @@ pub fn resume_go_panic(payload: Box<dyn std::any::Any + Send>) -> Box<dyn std::a
 }
 
 /// Prints a caught `go_panic` to stderr and returns true. The first line is
-/// the Go runtime one (`panic: <message>`). The port site takes the place of
-/// the goroutine trace. False for any other payload.
+/// the Go runtime one (`panic: <value>`, Go `printpanics`): a typed value
+/// is `<type>("<message>")`, each newline in the message is followed by a
+/// tab (Go `printindented`), and a value raised again after a recover ends
+/// with ` [recovered, repanicked]`. The port site takes the place of the
+/// goroutine trace. False for any other payload.
 pub fn print_go_panic(payload: &(dyn std::any::Any + Send)) -> bool {
     let Some(panic) = payload.downcast_ref::<GoPanic>() else {
         return false;
     };
+    let message = panic.message.replace('\n', "\n\t");
+    let value = match panic.go_type {
+        Some(go_type) => format!("{go_type}(\"{message}\")"),
+        None => message,
+    };
+    let suffix = if panic.repanicked {
+        " [recovered, repanicked]"
+    } else {
+        ""
+    };
     let text = format!(
-        "panic: {}\n\n\t{}:{}\n",
-        panic.message,
+        "panic: {value}{suffix}\n\n\t{}:{}\n",
         panic.location.file(),
         panic.location.line()
     );

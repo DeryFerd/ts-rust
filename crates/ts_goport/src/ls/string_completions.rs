@@ -184,7 +184,7 @@ impl LanguageService {
                 include_symbols, /*includeSymbols*/
             ) {
                 Ok(result) => result,
-                Err(err) => panic!("{}", err.error()),
+                Err(err) => crate::core::go_panic(err.error().to_string()),
             };
             let default_commit_characters =
                 get_default_commit_characters(completion.has_index_signature);
@@ -506,11 +506,14 @@ impl LanguageService {
                     .filter(|&t| {
                         // PORT: Go passes the `any` value; nil makes `hasValue`
                         // panic with this text.
-                        let value = type_checker
-                            .ty(t)
-                            .as_literal_type()
-                            .value()
-                            .unwrap_or_else(|| panic!("Unsupported type: <nil>"));
+                        let value =
+                            type_checker
+                                .ty(t)
+                                .as_literal_type()
+                                .value()
+                                .unwrap_or_else(|| {
+                                    crate::core::go_panic("Unsupported type: <nil>".to_string())
+                                });
                         !tracker.has_value(value)
                     })
                     .collect();
@@ -875,7 +878,7 @@ fn modulet_to_script_element_kind(kind: ModuleCompletionKind) -> lsutil::ScriptE
         }
         _ => {}
     }
-    panic!("Unknown moduleCompletionKind: {}", kind.0);
+    crate::core::go_panic(format!("Unknown moduleCompletionKind: {}", kind.0));
 }
 
 // Go: ls/string_completions.go:622 isAnyDirectorySeparator
@@ -2656,12 +2659,10 @@ fn kind_modifiers_from_extension(extension: &str) -> lsutil::ScriptElementKindMo
         tspath::EXTENSION_DCTS => lsutil::ScriptElementKindModifier::DCTS,
         tspath::EXTENSION_CJS => lsutil::ScriptElementKindModifier::CJS,
         tspath::EXTENSION_CTS => lsutil::ScriptElementKindModifier::CTS,
-        tspath::EXTENSION_TS_BUILD_INFO => {
-            panic!(
-                "Extension {} is unsupported.",
-                tspath::EXTENSION_TS_BUILD_INFO
-            )
-        }
+        tspath::EXTENSION_TS_BUILD_INFO => crate::core::go_panic(format!(
+            "Extension {} is unsupported.",
+            tspath::EXTENSION_TS_BUILD_INFO
+        )),
         _ => lsutil::ScriptElementKindModifier::NONE,
     }
 }
@@ -2679,7 +2680,10 @@ fn get_string_literal_completions_from_signature(
     if is_jsx_opening_like_element(call) {
         editing_argument = find_ancestor(arg.parent(), is_jsx_attribute);
         if editing_argument.is_nil() {
-            panic!("Expected jsx opening-like element to have a jsx attribute as ancestor.");
+            crate::core::go_panic(
+                "Expected jsx opening-like element to have a jsx attribute as ancestor."
+                    .to_string(),
+            );
         }
     } else {
         editing_argument = arg;

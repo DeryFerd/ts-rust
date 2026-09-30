@@ -312,7 +312,7 @@ pub fn get_type_help_item(
                     .label
                     .string
                     .as_deref()
-                    .expect("nil pointer dereference"),
+                    .unwrap_or_else(|| crate::core::go_nil_dereference()),
             );
         }
         display_parts.push_str(token_to_string(SyntaxKind::GreaterThanToken));
@@ -861,7 +861,7 @@ impl LanguageService {
                 .label
                 .string
                 .clone()
-                .expect("nil pointer dereference");
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             dpw.borrow_mut()
                 .write_classified(&label, lsproto::ClassificationTypeName::TYPE_PARAMETER_NAME);
         }
@@ -975,7 +975,7 @@ impl LanguageService {
                     .label
                     .string
                     .clone()
-                    .expect("nil pointer dereference");
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 dpw.borrow_mut()
                     .write_classified(&label, lsproto::ClassificationTypeName::TYPE_PARAMETER_NAME);
             }
@@ -1211,7 +1211,7 @@ pub fn get_enclosing_declaration_from_invocation(invocation: &Invocation) -> Nod
         invocation
             .contextual_invocation
             .as_ref()
-            .expect("nil pointer dereference")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .node
     }
 }
@@ -1225,7 +1225,7 @@ pub fn get_expression_from_invocation(argument_info: &ArgumentListInfo) -> Node 
         .invocation
         .type_args_invocation
         .as_ref()
-        .expect("nil pointer dereference")
+        .unwrap_or_else(|| crate::core::go_nil_dereference())
         .called
 }
 
@@ -1319,7 +1319,8 @@ pub fn get_candidate_or_type_info(
         });
     }
     // Go: debug.AssertNever(info.invocation)
-    panic!("Illegal value: {:?}", info.invocation);
+    // PORT: Go `%v` of the `*invocation`, whose three fields are nil here.
+    crate::gostd::debug::assert_never("&{<nil> <nil> <nil>}", None);
 }
 
 // Go: ls/signaturehelp.go:805 isSyntacticOwner
@@ -2083,7 +2084,10 @@ pub fn get_applicable_range_for_tagged_template(
     // leading up to the next token in case the user is about to type in a TemplateMiddle or TemplateTail.
     if template.kind() == SyntaxKind::TemplateExpression {
         let template_spans = template.template_spans();
-        let last_span = template_spans.nodes().last().expect("index out of range");
+        // Go: templateSpans.Nodes[len(templateSpans.Nodes)-1]
+        let last_span = template_spans.nodes().last().unwrap_or_else(|| {
+            crate::core::go_panic("runtime error: index out of range [-1]".to_string())
+        });
         if last_span.literal().end() - last_span.literal().pos() == 0 {
             applicable_span_end = skip_trivia(source_file_text(source_file), applicable_span_end);
         }

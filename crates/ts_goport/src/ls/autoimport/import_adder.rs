@@ -27,9 +27,6 @@ use crate::locale;
 use crate::ls::{change, lsconv, lsutil};
 use crate::lsp::lsproto;
 
-/// Go runtime panic text for a nil pointer dereference.
-const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
-
 // Go: ls/autoimport/import_adder.go:24 ImportAdder
 pub trait ImportAdder {
     fn has_fixes(&self) -> bool;
@@ -288,7 +285,7 @@ impl ImportAdder for ImportAdderImpl {
                         property_name: existing_fix
                             .named_import
                             .as_ref()
-                            .expect(NIL_DEREF)
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
                             .property_name
                             .clone(),
                     };

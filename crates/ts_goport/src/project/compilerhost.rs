@@ -81,7 +81,7 @@ impl CompilerHost {
         config_file_registry: Rc<ConfigFileRegistry>,
     ) {
         if self.builder.borrow().is_none() {
-            panic!("freeze can only be called once");
+            crate::core::go_panic("freeze can only be called once".to_string());
         }
         *self.source_fs.source.borrow_mut() = snapshot_fs;
         self.source_fs.disable_tracking();
@@ -99,7 +99,9 @@ impl CompilerHost {
     // Go: project/compilerhost.go:62 compilerHost.ensureAlive
     pub fn ensure_alive(&self) {
         if self.builder.borrow().is_none() || self.project.borrow().is_none() {
-            panic!("method must not be called after snapshot initialization");
+            crate::core::go_panic(
+                "method must not be called after snapshot initialization".to_string(),
+            );
         }
     }
 }
@@ -137,7 +139,7 @@ impl compiler::CompilerHost for CompilerHost {
                 .config_file_registry
                 .borrow()
                 .as_ref()
-                .expect("invalid memory address or nil pointer dereference: compilerHost.configFileRegistry")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .get_config(path),
             Some(builder) => {
                 // acquireConfigForProject will bypass sourceFS, so track the file here.
@@ -146,7 +148,7 @@ impl compiler::CompilerHost for CompilerHost {
                     .project
                     .borrow()
                     .clone()
-                    .expect("invalid memory address or nil pointer dereference: compilerHost.project");
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 let logger = self.logger.borrow().clone();
                 builder
                     .config_file_registry_builder
@@ -167,10 +169,11 @@ impl compiler::CompilerHost for CompilerHost {
         self.ensure_alive();
         if let Some(fh) = self.source_fs.get_file_by_path(&opts.file_name, &opts.path) {
             let key = new_parse_cache_key(opts, fh.hash(), fh.kind());
-            let builder =
-                self.builder.borrow().clone().expect(
-                    "invalid memory address or nil pointer dereference: compilerHost.builder",
-                );
+            let builder = self
+                .builder
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             return Some(builder.parse_cache.acquire(key, fh).file);
         }
         None
@@ -197,7 +200,7 @@ impl compiler::CompilerHost for CompilerHost {
             .builder
             .borrow()
             .clone()
-            .expect("invalid memory address or nil pointer dereference: compilerHost.builder");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         // ts#64163: the locale comes from the builder context.
         let diagnostic_locale = locale::from_context(&builder.ctx);
         // ts#64221
@@ -265,13 +268,17 @@ impl compiler::CompilerHost for CompilerHost {
                 .as_ref()
                 .and_then(|builder| builder.content_mapper_host.clone());
             if let Some(content_mapper_host) = content_mapper_host {
-                let project = self.project.borrow().clone().expect(
-                    "invalid memory address or nil pointer dereference: compilerHost.project",
-                );
-                let command_line = project.borrow().get_command_line_with_typings_files().expect(
-                    "invalid memory address or nil pointer dereference: project.getCommandLineWithTypingsFiles",
-                );
-                if !command_line.content_mappers().is_empty() {
+                let project = self
+                    .project
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
+                let command_line = project.borrow().get_command_line_with_typings_files();
+                // Go `ContentMappers` is nil-safe: a nil command line has
+                // none, so it returns before the other getters.
+                if let Some(command_line) =
+                    command_line.filter(|command_line| !command_line.content_mappers().is_empty())
+                {
                     let content_mapper_project =
                         content_mapper_host.project(contentmapper::ProjectSpec {
                             config_file_name: command_line.config_name().to_string(),

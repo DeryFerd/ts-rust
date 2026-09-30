@@ -143,7 +143,7 @@ impl ConfigFileRegistryBuilder {
             >| {
                 let command_line = entry
                     .value()
-                    .expect("invalid memory address or nil pointer dereference")
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .borrow()
                     .command_line
                     .clone();
@@ -181,7 +181,7 @@ impl ConfigFileRegistryBuilder {
                 if let (Some(entry), true) = self.configs.load(config_file_path) {
                     return entry
                         .value()
-                        .expect("invalid memory address or nil pointer dereference")
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
                         .borrow()
                         .command_line
                         .clone();
@@ -192,7 +192,7 @@ impl ConfigFileRegistryBuilder {
                 self.acquire_config_for_file(config_file_name, config_file_path, file_path, logger)
             }
             #[allow(unreachable_patterns)]
-            _ => panic!("unknown project load kind: {load_kind:?}"),
+            _ => crate::core::go_panic(format!("unknown project load kind: {}", load_kind.0)),
         }
     }
 
@@ -214,9 +214,11 @@ impl ConfigFileRegistryBuilder {
         let pending_reload = entry.borrow().pending_reload;
         if pending_reload == PendingReload::FILE_NAMES {
             logger.log(&format!("Reloading file names for config: {file_name}"));
-            let command_line = entry.borrow().command_line.clone().expect(
-                "invalid memory address or nil pointer dereference: configFileEntry.commandLine",
-            );
+            let command_line = entry
+                .borrow()
+                .command_line
+                .clone()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             let reloaded = command_line.reload_file_names_of_parsed_command_line(&*self.fs);
             entry.borrow_mut().command_line = Some(Rc::new(reloaded));
         } else if pending_reload == PendingReload::FULL {
@@ -280,7 +282,7 @@ impl ConfigFileRegistryBuilder {
                     entry.change_if(
                         &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
                             let config =
-                                config.expect("invalid memory address or nil pointer dereference");
+                                config.unwrap_or_else(|| crate::core::go_nil_dereference());
                             let already_retaining = config
                                 .borrow()
                                 .retaining_configs
@@ -308,7 +310,7 @@ impl ConfigFileRegistryBuilder {
                     entry.change_if(
                         &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
                             let config =
-                                config.expect("invalid memory address or nil pointer dereference");
+                                config.unwrap_or_else(|| crate::core::go_nil_dereference());
                             let exists = config
                                 .borrow()
                                 .retaining_configs
@@ -457,7 +459,7 @@ impl ConfigFileRegistryBuilder {
         let content_mappers_changed = Cell::new(false);
         entry.change_if(
             &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
-                let config = config.expect("invalid memory address or nil pointer dereference");
+                let config = config.unwrap_or_else(|| crate::core::go_nil_dereference());
                 // ts#64319
                 let project_id = project.borrow().id();
                 let already_retaining = config.borrow().retaining_projects.contains(&project_id);
@@ -482,7 +484,7 @@ impl ConfigFileRegistryBuilder {
         }
         entry
             .value()
-            .expect("invalid memory address or nil pointer dereference")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .borrow()
             .command_line
             .clone()
@@ -509,7 +511,7 @@ impl ConfigFileRegistryBuilder {
         let content_mappers_changed = Cell::new(false);
         entry.change_if(
             &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
-                let config = config.expect("invalid memory address or nil pointer dereference");
+                let config = config.unwrap_or_else(|| crate::core::go_nil_dereference());
                 if (self.is_open_file)(file_path) {
                     let already_retaining =
                         config.borrow().retaining_open_files.contains(file_path);
@@ -538,7 +540,7 @@ impl ConfigFileRegistryBuilder {
         }
         entry
             .value()
-            .expect("invalid memory address or nil pointer dereference")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .borrow()
             .command_line
             .clone()
@@ -552,7 +554,7 @@ impl ConfigFileRegistryBuilder {
         if let (Some(entry), true) = self.configs.load(config_file_path) {
             entry.change_if(
                 &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
-                    let config = config.expect("invalid memory address or nil pointer dereference");
+                    let config = config.unwrap_or_else(|| crate::core::go_nil_dereference());
                     let exists = config.borrow().retaining_projects.contains(project_id);
                     exists
                 },
@@ -571,7 +573,7 @@ impl ConfigFileRegistryBuilder {
         if let (Some(entry), true) = self.configs.load(config_file_path) {
             entry.change_if(
                 &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
-                    let config = config.expect("invalid memory address or nil pointer dereference");
+                    let config = config.unwrap_or_else(|| crate::core::go_nil_dereference());
                     let exists = config.borrow().retaining_projects.contains(project_id);
                     !exists
                 },
@@ -598,7 +600,7 @@ impl ConfigFileRegistryBuilder {
         >| {
             entry.change_if(
                 &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
-                    let config = config.expect("invalid memory address or nil pointer dereference");
+                    let config = config.unwrap_or_else(|| crate::core::go_nil_dereference());
                     let ok = config.borrow().retaining_open_files.contains(path);
                     ok
                 },
@@ -639,40 +641,42 @@ impl ConfigFileRegistryBuilder {
         });
         self.config_file_names.clear();
 
-        self.configs.range(
-            &mut |entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<ConfigFileEntry>>>>| {
-                entry.change(&mut |entry: &Rc<RefCell<ConfigFileEntry>>| {
-                    let retaining_projects = entry.borrow().retaining_projects.clone();
-                    affected_projects =
-                        Some(copy_map_into(affected_projects.take(), &retaining_projects));
-                    let pending_reload = entry.borrow().pending_reload;
-                    if pending_reload != PendingReload::FULL {
-                        let file_name = entry.borrow().file_name.clone();
-                        let (text, ok) = self.fs().read_file(&file_name);
-                        // Go: entry.commandLine.ConfigFile.SourceFile.Text()
-                        let config_text = || -> &'static str {
-                            let entry = entry.borrow();
-                            let command_line = entry.command_line.as_ref().expect(
-                                "invalid memory address or nil pointer dereference: configFileEntry.commandLine",
-                            );
-                            let config_file = command_line.config_file.as_ref().expect(
-                                "invalid memory address or nil pointer dereference: ParsedCommandLine.ConfigFile",
-                            );
-                            source_file_text(config_file.source_file)
-                        };
-                        if !ok
-                            || entry.borrow().command_line.is_none()
-                            || text.as_str() != config_text()
-                        {
-                            entry.borrow_mut().pending_reload = PendingReload::FULL;
-                        } else {
-                            entry.borrow_mut().pending_reload = PendingReload::FILE_NAMES;
-                        }
+        self.configs.range(&mut |entry: &Rc<
+            dirty::SyncMapEntry<tspath::Path, Rc<RefCell<ConfigFileEntry>>>,
+        >| {
+            entry.change(&mut |entry: &Rc<RefCell<ConfigFileEntry>>| {
+                let retaining_projects = entry.borrow().retaining_projects.clone();
+                affected_projects =
+                    Some(copy_map_into(affected_projects.take(), &retaining_projects));
+                let pending_reload = entry.borrow().pending_reload;
+                if pending_reload != PendingReload::FULL {
+                    let file_name = entry.borrow().file_name.clone();
+                    let (text, ok) = self.fs().read_file(&file_name);
+                    // Go: entry.commandLine.ConfigFile.SourceFile.Text()
+                    let config_text = || -> &'static str {
+                        let entry = entry.borrow();
+                        let command_line = entry
+                            .command_line
+                            .as_ref()
+                            .unwrap_or_else(|| crate::core::go_nil_dereference());
+                        let config_file = command_line
+                            .config_file
+                            .as_ref()
+                            .unwrap_or_else(|| crate::core::go_nil_dereference());
+                        source_file_text(config_file.source_file)
+                    };
+                    if !ok
+                        || entry.borrow().command_line.is_none()
+                        || text.as_str() != config_text()
+                    {
+                        entry.borrow_mut().pending_reload = PendingReload::FULL;
+                    } else {
+                        entry.borrow_mut().pending_reload = PendingReload::FILE_NAMES;
                     }
-                });
-                true
-            },
-        );
+                }
+            });
+            true
+        });
 
         ChangeFileResult {
             affected_projects: affected_projects.unwrap_or_default(),
@@ -779,7 +783,7 @@ impl ConfigFileRegistryBuilder {
                 // PORT: the keys are copied before the loop changes entries.
                 let retaining_configs: Vec<tspath::Path> = entry
                     .value()
-                    .expect("invalid memory address or nil pointer dereference")
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .borrow()
                     .retaining_configs
                     .iter()
@@ -804,7 +808,7 @@ impl ConfigFileRegistryBuilder {
                 >| {
                     let command_line = entry
                         .value()
-                        .expect("invalid memory address or nil pointer dereference")
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
                         .borrow()
                         .command_line
                         .clone();
@@ -854,7 +858,7 @@ impl ConfigFileRegistryBuilder {
                 entry.change_if(
                     &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
                         let config = config
-                            .expect("invalid memory address or nil pointer dereference")
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
                             .borrow();
                         if config.pending_reload != PendingReload::NONE {
                             return false;
@@ -897,7 +901,7 @@ impl ConfigFileRegistryBuilder {
                 entry.change_if(
                     &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
                         let config = config
-                            .expect("invalid memory address or nil pointer dereference")
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
                             .borrow();
                         if config.command_line.is_none()
                             || config.root_files_watch.is_none()
@@ -959,7 +963,7 @@ impl ConfigFileRegistryBuilder {
         let mut affected_projects: FxHashSet<ID> = FxHashSet::default();
         let changed = entry.change_if(
             &mut |config: Option<&Rc<RefCell<ConfigFileEntry>>>| {
-                let config = config.expect("invalid memory address or nil pointer dereference");
+                let config = config.unwrap_or_else(|| crate::core::go_nil_dereference());
                 let pending_reload = config.borrow().pending_reload;
                 pending_reload != PendingReload::FULL
             },
@@ -971,7 +975,7 @@ impl ConfigFileRegistryBuilder {
             logger.logf(&format!("Config file {} changed", entry.key()));
             affected_projects = entry
                 .value()
-                .expect("invalid memory address or nil pointer dereference")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .borrow()
                 .retaining_projects
                 .clone();
@@ -1066,7 +1070,7 @@ impl ConfigFileRegistryBuilder {
         if let (Some(entry), true) = self.config_file_names.get(path) {
             return entry
                 .value()
-                .expect("invalid memory address or nil pointer dereference")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .borrow()
                 .nearest_config_file_name
                 .clone();
@@ -1094,7 +1098,7 @@ impl ConfigFileRegistryBuilder {
         if let (Some(entry), true) = self.config_file_names.get(path) {
             let mut config_file_name = entry
                 .value()
-                .expect("invalid memory address or nil pointer dereference")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .borrow()
                 .nearest_config_file_name
                 .clone();
@@ -1102,7 +1106,7 @@ impl ConfigFileRegistryBuilder {
                 cb(&config_file_name);
                 let ancestor_config_name = entry
                     .value()
-                    .expect("invalid memory address or nil pointer dereference")
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .borrow()
                     .ancestors
                     .get(&config_file_name)
@@ -1136,7 +1140,7 @@ impl ConfigFileRegistryBuilder {
 
         let ancestor_config_name = entry
             .value()
-            .expect("invalid memory address or nil pointer dereference")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .borrow()
             .ancestors
             .get(config_file_name)
@@ -1220,7 +1224,7 @@ impl ConfigFileRegistryBuilder {
         >| {
             entry.delete_if(&mut |value: Option<&Rc<RefCell<ConfigFileEntry>>>| {
                 let value = value
-                    .expect("invalid memory address or nil pointer dereference")
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .borrow();
                 let should_delete = value.retaining_projects.is_empty()
                     && value.retaining_open_files.is_empty()

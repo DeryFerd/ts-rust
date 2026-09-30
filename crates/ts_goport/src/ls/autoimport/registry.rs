@@ -54,9 +54,6 @@ use crate::project::{dirty, logging};
 use std::sync::LazyLock;
 use std::time::Instant;
 
-/// Go runtime panic text for a nil pointer dereference.
-const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
-
 // Go: ls/autoimport/registry.go:32 ProjectID
 // PORT: Go `ProjectID` is an interface (`fmt.Stringer`) that the project
 // package fills with its string type `project.ID`; interface map keys compare
@@ -935,7 +932,7 @@ impl RegistryBuilder {
                 &self.base.projects,
                 &needed_projects,
                 |_: &Rc<RegistryBucket>, _: &()| -> bool {
-                    panic!("never called because onChanged is nil")
+                    crate::core::go_panic("never called because onChanged is nil".to_string())
                 },
                 Some(on_added),
                 Some(on_removed),
@@ -951,47 +948,50 @@ impl RegistryBuilder {
             }
         }
 
-        let update_directory = |dir_path: &tspath::Path,
-                                dir_name: &str,
-                                package_json_changed: bool| {
-            let package_json_file_name = tspath::combine_paths(dir_name, &["package.json"]);
-            let has_node_modules = self
-                .host
-                .fs()
-                .directory_exists(&tspath::combine_paths(dir_name, &["node_modules"]));
-            if let (Some(entry), true) = self.directories.get(dir_path) {
-                entry.change_if(
-                    &mut |dir: Option<&Rc<RefCell<Directory>>>| {
-                        package_json_changed
-                            || dir.expect(NIL_DEREF).borrow().has_node_modules != has_node_modules
-                    },
-                    &mut |dir: &Rc<RefCell<Directory>>| {
-                        let package_json = self.host.get_package_json(&package_json_file_name);
-                        let mut dir = dir.borrow_mut();
-                        dir.package_json = package_json;
-                        dir.has_node_modules = has_node_modules;
-                    },
-                );
-            } else {
-                self.directories.add(
-                    dir_path.clone(),
-                    Rc::new(RefCell::new(Directory {
-                        name: dir_name.to_string(),
-                        package_json: self.host.get_package_json(&package_json_file_name),
-                        has_node_modules,
-                    })),
-                );
-            }
-
-            if has_node_modules {
-                if !self.node_modules.get(dir_path).1 {
-                    self.node_modules
-                        .add(dir_path.clone(), new_registry_bucket());
+        let update_directory =
+            |dir_path: &tspath::Path, dir_name: &str, package_json_changed: bool| {
+                let package_json_file_name = tspath::combine_paths(dir_name, &["package.json"]);
+                let has_node_modules = self
+                    .host
+                    .fs()
+                    .directory_exists(&tspath::combine_paths(dir_name, &["node_modules"]));
+                if let (Some(entry), true) = self.directories.get(dir_path) {
+                    entry.change_if(
+                        &mut |dir: Option<&Rc<RefCell<Directory>>>| {
+                            package_json_changed
+                                || dir
+                                    .unwrap_or_else(|| crate::core::go_nil_dereference())
+                                    .borrow()
+                                    .has_node_modules
+                                    != has_node_modules
+                        },
+                        &mut |dir: &Rc<RefCell<Directory>>| {
+                            let package_json = self.host.get_package_json(&package_json_file_name);
+                            let mut dir = dir.borrow_mut();
+                            dir.package_json = package_json;
+                            dir.has_node_modules = has_node_modules;
+                        },
+                    );
+                } else {
+                    self.directories.add(
+                        dir_path.clone(),
+                        Rc::new(RefCell::new(Directory {
+                            name: dir_name.to_string(),
+                            package_json: self.host.get_package_json(&package_json_file_name),
+                            has_node_modules,
+                        })),
+                    );
                 }
-            } else {
-                self.node_modules.try_delete(dir_path);
-            }
-        };
+
+                if has_node_modules {
+                    if !self.node_modules.get(dir_path).1 {
+                        self.node_modules
+                            .add(dir_path.clone(), new_registry_bucket());
+                    }
+                } else {
+                    self.node_modules.try_delete(dir_path);
+                }
+            };
 
         let mut added_node_modules_dirs: Vec<tspath::Path> = Vec::new();
         let mut removed_node_modules_dirs: Vec<tspath::Path> = Vec::new();
@@ -1099,7 +1099,7 @@ impl RegistryBuilder {
         >| {
             if !entry
                 .value()
-                .expect(NIL_DEREF)
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .state
                 .borrow()
                 .multiple_files_dirty
@@ -1112,7 +1112,7 @@ impl RegistryBuilder {
             &mut |entry: &Rc<dirty::MapEntry<ProjectID, Rc<RegistryBucket>>>| {
                 if !entry
                     .value()
-                    .expect(NIL_DEREF)
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .state
                     .borrow()
                     .multiple_files_dirty
@@ -1137,11 +1137,15 @@ impl RegistryBuilder {
                         let dir_path =
                             tspath::Path(path.as_str()[..node_modules_index].to_string());
                         if clean_node_modules_buckets.contains(&dir_path) {
-                            let entry = self.node_modules.get(&dir_path).0.expect(NIL_DEREF);
+                            let entry = self
+                                .node_modules
+                                .get(&dir_path)
+                                .0
+                                .unwrap_or_else(|| crate::core::go_nil_dereference());
                             // Look up the package name for granular updates
                             let package_name = entry
                                 .value()
-                                .expect(NIL_DEREF)
+                                .unwrap_or_else(|| crate::core::go_nil_dereference())
                                 .paths
                                 .get(&path)
                                 .cloned()
@@ -1151,7 +1155,7 @@ impl RegistryBuilder {
                             });
                             if !entry
                                 .value()
-                                .expect(NIL_DEREF)
+                                .unwrap_or_else(|| crate::core::go_nil_dereference())
                                 .state
                                 .borrow()
                                 .multiple_files_dirty
@@ -1165,9 +1169,17 @@ impl RegistryBuilder {
                         let bucket_dir_paths: Vec<tspath::Path> =
                             clean_node_modules_buckets.iter().cloned().collect();
                         for bucket_dir_path in bucket_dir_paths {
-                            let entry = self.node_modules.get(&bucket_dir_path).0.expect(NIL_DEREF);
-                            let package_name =
-                                entry.value().expect(NIL_DEREF).paths.get(&path).cloned();
+                            let entry = self
+                                .node_modules
+                                .get(&bucket_dir_path)
+                                .0
+                                .unwrap_or_else(|| crate::core::go_nil_dereference());
+                            let package_name = entry
+                                .value()
+                                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                                .paths
+                                .get(&path)
+                                .cloned();
                             if let Some(package_name) = package_name {
                                 // Use the package name for granular updates
                                 entry.change(&mut |bucket: &Rc<RegistryBucket>| {
@@ -1175,7 +1187,7 @@ impl RegistryBuilder {
                                 });
                                 if !entry
                                     .value()
-                                    .expect(NIL_DEREF)
+                                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                                     .state
                                     .borrow()
                                     .multiple_files_dirty
@@ -1194,15 +1206,20 @@ impl RegistryBuilder {
                     clean_project_buckets.iter().cloned().collect();
                 for project_dir_path in project_dir_paths {
                     let (entry, _) = self.projects.get(&project_dir_path);
-                    let entry = entry.expect(NIL_DEREF);
-                    if entry.value().expect(NIL_DEREF).paths.contains_key(&path) {
+                    let entry = entry.unwrap_or_else(|| crate::core::go_nil_dereference());
+                    if entry
+                        .value()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
+                        .paths
+                        .contains_key(&path)
+                    {
                         // Project buckets don't use package-based granular updates
                         entry.change(&mut |bucket: &Rc<RegistryBucket>| {
                             bucket.mark_project_file_dirty(&path)
                         });
                         if !entry
                             .value()
-                            .expect(NIL_DEREF)
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
                             .state
                             .borrow()
                             .multiple_files_dirty
@@ -1308,9 +1325,9 @@ impl RegistryBuilder {
                         .directories
                         .get(&dir_path)
                         .0
-                        .expect(NIL_DEREF)
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
                         .value()
-                        .expect(NIL_DEREF)
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
                         .borrow()
                         .name
                         .clone();
@@ -1320,7 +1337,9 @@ impl RegistryBuilder {
                         &dir_name,
                         &dir_path,
                     );
-                    let bucket_value = node_modules_bucket.value().expect(NIL_DEREF);
+                    let bucket_value = node_modules_bucket
+                        .value()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference());
                     let bucket_state = bucket_value.state.borrow().clone();
                     // !!! Optimization: handle different dependency set via granular updates
                     let needs_full_rebuild = bucket_state.multiple_files_dirty
@@ -1547,7 +1566,9 @@ impl RegistryBuilder {
                 self.update_node_modules_bucket(
                     ctx,
                     &mut br,
-                    task.existing_bucket.as_ref().expect(NIL_DEREF),
+                    task.existing_bucket
+                        .as_ref()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference()),
                     task.dirty_packages.as_ref(),
                     &task.discovered,
                     &extraction_cache,
@@ -1574,7 +1595,9 @@ impl RegistryBuilder {
         if let (Some(project), true) = self.projects.get(&project_id) {
             let program = self.host.get_program_for_project(&project_id);
             let resolved_package_names = all_resolved_package_names.get(&project_id).cloned();
-            let project_value = project.value().expect(NIL_DEREF);
+            let project_value = project
+                .value()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             let mut should_rebuild = project_value
                 .state
                 .borrow()
@@ -1600,7 +1623,10 @@ impl RegistryBuilder {
                 let mut br = new_bucket_build_result(
                     Box::new(move |bucket: Rc<RegistryBucket>| entry.replace(bucket)),
                     (self.base.to_path)(
-                        &program.as_deref().expect(NIL_DEREF).get_current_directory(),
+                        &program
+                            .as_deref()
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
+                            .get_current_directory(),
                     ),
                 );
                 // Go: wg.Go(func() {...})
@@ -1630,7 +1656,11 @@ impl RegistryBuilder {
             for (path, entries) in &br.entrypoints {
                 self.entrypoints.set(path.clone(), entries.clone());
             }
-            (br.replace_bucket)(br.bucket.clone().expect(NIL_DEREF));
+            (br.replace_bucket)(
+                br.bucket
+                    .clone()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference()),
+            );
         }
 
         // If we failed to resolve any alias exports by ending up at a non-relative module specifier
@@ -1694,7 +1724,7 @@ impl RegistryBuilder {
                 let sources = br
                     .possible_failed_ambient_module_lookup_sources
                     .as_ref()
-                    .expect(NIL_DEREF);
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 // PORT: Go reads each source file after NewChecker. Here they
                 // are read first, so the checker's arena holds them
                 // (`AliasResolver::new_checker`).
@@ -1725,10 +1755,10 @@ impl RegistryBuilder {
                     let index = br
                         .bucket
                         .as_ref()
-                        .expect(NIL_DEREF)
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
                         .index
                         .clone()
-                        .expect(NIL_DEREF);
+                        .unwrap_or_else(|| crate::core::go_nil_dereference());
                     for exp in file_exports {
                         index.borrow_mut().insert_as_words(exp);
                     }
@@ -1759,7 +1789,7 @@ pub fn has_new_non_node_modules_files(
     if bucket.state.borrow().new_program_structure != NewProgramStructure::DIFFERENT_FILE_NAMES {
         return false;
     }
-    let program = program.expect(NIL_DEREF);
+    let program = program.unwrap_or_else(|| crate::core::go_nil_dereference());
     for file in program.get_source_files() {
         if file.is_content_mapper_supplemental()
             || file.file_name().contains("/node_modules/")
@@ -1918,7 +1948,7 @@ impl RegistryBuilder {
         let program = self
             .host
             .get_program_for_project(project_id)
-            .expect(NIL_DEREF);
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let program = &*program;
         let project_root_path = (self.base.to_path)(&program.get_current_directory());
         let symlink_cache = program.get_symlink_cache();
@@ -2049,7 +2079,9 @@ impl RegistryBuilder {
         self.directories.range(&mut |entry: &Rc<
             dirty::MapEntry<tspath::Path, Rc<RefCell<Directory>>>,
         >| {
-            let value = entry.value().expect(NIL_DEREF);
+            let value = entry
+                .value()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             let value = value.borrow();
             if value.package_json.as_ref().is_some_and(|p| p.exists())
                 && dir_path.contains_path(&entry.key())
@@ -2060,7 +2092,7 @@ impl RegistryBuilder {
                     .unwrap()
                     .contents
                     .as_ref()
-                    .expect(NIL_DEREF);
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 add_package_json_dependencies(contents, &mut dependencies);
             }
             true
@@ -2161,12 +2193,18 @@ impl RegistryBuilder {
                     dir_name,
                     &["node_modules", types_package_name.as_str(), "package.json"],
                 ));
-                if types_json.as_ref().expect(NIL_DEREF).directory_exists {
+                if types_json
+                    .as_ref()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
+                    .directory_exists
+                {
                     types_package_json = types_json;
                 }
             }
             let mut realpath = String::new();
-            let package_json_entry = package_json.as_ref().expect(NIL_DEREF);
+            let package_json_entry = package_json
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             if package_json_entry.directory_exists {
                 realpath = self
                     .host
@@ -2587,7 +2625,10 @@ impl RegistryBuilder {
                 .clone(),
         );
         {
-            let index = bucket.index.as_ref().expect(NIL_DEREF);
+            let index = bucket
+                .index
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             let mut index = index.borrow_mut();
             for file_exports in extraction.exports.values() {
                 // PORT: see `should_stop_build`. Go sets `err` at the end of
@@ -2615,7 +2656,9 @@ impl RegistryBuilder {
         // Compute old entrypoint paths to remove from the registry-level map.
         // For a full rebuild, all entrypoints belonging to the old bucket's packages must be removed.
         if let (Some(old_entry), true) = self.node_modules.get(dir_path) {
-            let old_bucket = old_entry.value().expect(NIL_DEREF);
+            let old_bucket = old_entry
+                .value()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             if let Some(package_files) = &old_bucket.package_files {
                 for files in package_files.values() {
                     for path in files.iter().flat_map(|f| f.keys()) {
@@ -2695,7 +2738,9 @@ impl RegistryBuilder {
         for (pkg_name, files) in &extraction.package_files {
             new_package_files
                 .as_mut()
-                .expect("assignment to entry in nil map")
+                .unwrap_or_else(|| {
+                    crate::core::go_panic("assignment to entry in nil map".to_string())
+                })
                 .insert(pkg_name.clone(), Some(files.clone()));
         }
 
@@ -2778,7 +2823,7 @@ impl RegistryBuilder {
             for exp in file_exports {
                 new_index
                     .as_mut()
-                    .expect(NIL_DEREF)
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .insert_as_words(exp.clone());
             }
         }
@@ -2834,7 +2879,9 @@ impl RegistryBuilder {
             .for_each_ancestor_directory(
                 |dir_path: tspath::Path| -> (Option<Rc<RefCell<Directory>>>, bool) {
                     if let (Some(dir_entry), true) = self.directories.get(&dir_path) {
-                        let value = dir_entry.value().expect(NIL_DEREF);
+                        let value = dir_entry
+                            .value()
+                            .unwrap_or_else(|| crate::core::go_nil_dereference());
                         if value
                             .borrow()
                             .package_json
@@ -2861,7 +2908,7 @@ impl RegistryBuilder {
                 if let (Some(bucket), true) = self.node_modules.get(&dir_path) {
                     if let Some(file_names) = bucket
                         .value()
-                        .expect(NIL_DEREF)
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
                         .ambient_module_names
                         .get(module_name)
                     {

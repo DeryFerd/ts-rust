@@ -120,13 +120,18 @@ impl Tracker {
                         break;
                     }
                     // assert change[i].End <= change[i + 1].Start
-                    // PORT: Go `%v` of a Range prints `{{l c} {l c}}`; this
-                    // prints the Rust Debug text. Panic text only.
-                    panic!(
-                        "changes overlap: {:?} and {:?}",
-                        text_changes[i].range,
-                        text_changes[i + 1].range
-                    );
+                    // PORT: Go `%v` of a Range prints `{{l c} {l c}}`.
+                    let go_range = |r: &lsproto::Range| {
+                        format!(
+                            "{{{{{} {}}} {{{} {}}}}}",
+                            r.start.line, r.start.character, r.end.line, r.end.character
+                        )
+                    };
+                    crate::core::go_panic(format!(
+                        "changes overlap: {} and {}",
+                        go_range(&text_changes[i].range),
+                        go_range(&text_changes[i + 1].range)
+                    ));
                 }
             }
         }
@@ -195,10 +200,10 @@ impl Tracker {
                 }
                 TrackerEditKind::REPLACE_WITH_SINGLE_NODE => format_node(change.node),
                 _ => {
-                    panic!(
+                    crate::core::go_panic(format!(
                         "change kind {} should have been handled earlier",
                         change.kind.0
-                    );
+                    ));
                 }
             };
             // Strip initial indentation if text will be inserted in the middle of the line.
@@ -615,7 +620,12 @@ pub fn has_comments_before_line_break(text: &str, start: i32) -> bool {
     // PORT: Go `[]rune(text[start:])` decodes runes from byte `start`
     // (invalid bytes become U+FFFD). Go `text[start:]` panics past the end.
     let mut pos = start as usize;
-    assert!(pos <= text.len(), "slice bounds out of range");
+    if pos > text.len() {
+        crate::core::go_panic(format!(
+            "runtime error: slice bounds out of range [{pos}:{}]",
+            text.len()
+        ));
+    }
     while pos < text.len() {
         let (r, size) = utf8_decode_rune_in_string(text, pos);
         let ch = rune_to_char(r);

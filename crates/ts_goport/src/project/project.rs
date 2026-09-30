@@ -70,7 +70,7 @@ pub struct SyntheticProjectID(pub String);
 // Go: project/project.go:45 NewSyntheticProjectID (ts#64319)
 pub fn new_synthetic_project_id(id: i32) -> SyntheticProjectID {
     if id <= 0 {
-        panic!("invalid synthetic project ID: {id}");
+        crate::core::go_panic(format!("invalid synthetic project ID: {id}"));
     }
     SyntheticProjectID(format!("{SYNTHETIC_PROJECT_PREFIX}{id}"))
 }
@@ -280,7 +280,7 @@ pub fn new_configured_project(
     // ts#64319
     let (configured_project_id, ok) = parse_configured_project_id(config_file_path);
     if !ok {
-        panic!("invalid configured project ID: {config_file_path}");
+        crate::core::go_panic(format!("invalid configured project ID: {config_file_path}"));
     }
     let project = new_project(
         configured_project_id.as_id(),
@@ -522,7 +522,7 @@ impl Project {
     // ConfigFileName panics if Kind() is not KindConfigured.
     pub fn config_file_name(&self) -> String {
         if self.kind != Kind::CONFIGURED {
-            panic!("ConfigFileName called on non-configured project");
+            crate::core::go_panic("ConfigFileName called on non-configured project".to_string());
         }
         self.config_file_name.clone()
     }
@@ -531,7 +531,7 @@ impl Project {
     // ConfigFilePath panics if Kind() is not KindConfigured.
     pub fn config_file_path(&self) -> tspath::Path {
         if self.kind != Kind::CONFIGURED {
-            panic!("ConfigFilePath called on non-configured project");
+            crate::core::go_panic("ConfigFilePath called on non-configured project".to_string());
         }
         self.config_file_path.clone()
     }
@@ -560,7 +560,7 @@ impl Project {
         let program = self
             .program
             .as_deref()
-            .expect("invalid memory address or nil pointer dereference: Project.Program");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         // Go: slices.Concat
         let mut diagnostics = program.get_config_file_parsing_diagnostics();
         diagnostics.extend(ls_program::get_program_diagnostics(program));
@@ -665,7 +665,7 @@ impl Project {
             let command_line = self
                 .command_line
                 .as_ref()
-                .expect("invalid memory address or nil pointer dereference: Project.CommandLine");
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             // Create an augmented command line that includes typing files
             let original_root_names = command_line.file_names();
             let mut new_root_names: Vec<String> =
@@ -725,7 +725,7 @@ impl Project {
         let host = self
             .host
             .clone()
-            .expect("invalid memory address or nil pointer dereference: Project.host");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
 
         // Define a fresh CreateCheckerPool closure for this call. Each invocation of
         // CreateProgram must use its own closure so that concurrent goroutines cloning
@@ -804,9 +804,10 @@ impl Project {
             program_cloned = cloned;
             // Go: p.host.builder (read in each branch below)
             let builder = || {
-                host.builder.borrow().clone().expect(
-                    "invalid memory address or nil pointer dereference: compilerHost.builder",
-                )
+                host.builder
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
             };
             if program_cloned {
                 update_kind = ProgramUpdateKind::CLONED;
@@ -874,7 +875,7 @@ impl Project {
             let mut typings_location = String::new();
             let type_acquisition = self
                 .get_type_acquisition()
-                .expect("invalid memory address or nil pointer dereference: TypeAcquisition");
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             if type_acquisition.enable.is_true() {
                 typings_location = host.session_options.typings_location.clone();
             }
@@ -884,7 +885,7 @@ impl Project {
                     host: host_rc,
                     config: command_line
                         .clone()
-                        .expect("invalid memory address or nil pointer dereference: Config"),
+                        .unwrap_or_else(|| crate::core::go_nil_dereference()),
                     use_source_of_project_reference: true,
                     single_threaded: Tristate::Unknown,
                     typings_location,
@@ -930,7 +931,7 @@ impl Project {
         let host = self
             .host
             .as_ref()
-            .expect("invalid memory address or nil pointer dereference: Project.host");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let seen_files = host.source_fs.seen_files.borrow().clone();
         WatchedFiles::clone_(self.program_files_watch.as_deref(), seen_files)
     }
@@ -945,7 +946,7 @@ impl Project {
         let host = self
             .host
             .as_ref()
-            .expect("invalid memory address or nil pointer dereference: Project.host");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         tspath::to_path(
             file_name,
             &self.current_directory,
@@ -1075,7 +1076,7 @@ impl ls::Project for Project {
     fn get_program(&self) -> Rc<compiler::NewProgram> {
         self.program
             .clone()
-            .expect("invalid memory address or nil pointer dereference: Project.Program")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     // Go: project/project.go:228 Project.HasFile

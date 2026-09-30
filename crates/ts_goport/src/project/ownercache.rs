@@ -88,10 +88,10 @@ impl<K: Eq + Hash + Clone, V: Clone, LoadArgs> OwnerCache<K, V, LoadArgs> {
     pub fn add_owner(&self, identity: &K, owner: u64) {
         let entry = self.entries.borrow().get(identity).cloned();
         let Some(entry) = entry else {
-            panic!("OwnerCache.AddOwner: entry not found");
+            crate::core::go_panic("OwnerCache.AddOwner: entry not found".to_string());
         };
         if entry.owners.borrow().is_empty() {
-            panic!("OwnerCache.AddOwner: entry has no owners");
+            crate::core::go_panic("OwnerCache.AddOwner: entry has no owners".to_string());
         }
         entry.owners.borrow_mut().insert(owner);
     }

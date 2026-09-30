@@ -128,7 +128,7 @@ fn key_for_code_lens(code_lens: &lsproto::CodeLens) -> CodeLensKey {
     let data = code_lens
         .data
         .as_ref()
-        .expect("invalid memory address or nil pointer dereference");
+        .unwrap_or_else(|| crate::core::go_nil_dereference());
     CodeLensKey {
         kind: data.kind.clone(),
         start_line: code_lens.range.start.line,
@@ -153,7 +153,7 @@ impl LanguageService {
         let data = code_lens
             .data
             .clone()
-            .expect("invalid memory address or nil pointer dereference");
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let uri = data.uri.clone();
         let text_doc = lsproto::TextDocumentIdentifier { uri: uri.clone() };
         let (program, file) = self.get_program_and_file(&uri);
@@ -164,7 +164,7 @@ impl LanguageService {
             // is nil.
             let index = data
                 .supplemental_file_index
-                .expect("invalid memory address or nil pointer dereference");
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             return Err(gostd::errors::errorf(
                 format!("supplemental source file index not found: {index}"),
                 Vec::new(),

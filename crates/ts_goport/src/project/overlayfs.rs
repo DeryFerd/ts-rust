@@ -744,7 +744,7 @@ impl OverlayFS {
             let uri = &change.uri;
             if let Some(events) = file_event_map.get(uri) {
                 if events.open_change.is_some() {
-                    panic!("should see no changes after open");
+                    crate::core::go_panic("should see no changes after open".to_string());
                 }
             } else {
                 file_event_map.insert(uri.clone(), FileEvents::default());
@@ -780,7 +780,7 @@ impl OverlayFS {
                 }
                 FileChangeKind::CHANGE => {
                     if events.close_change.is_some() {
-                        panic!("should see no changes after close");
+                        crate::core::go_panic("should see no changes after close".to_string());
                     }
                     events.changes.push(change);
                     events.saved = false;
@@ -825,7 +825,9 @@ impl OverlayFS {
 
             if let Some(open_change) = events.open_change {
                 if !result.opened.0.is_empty() || !result.reopened.0.is_empty() {
-                    panic!("can only process one file open event at a time");
+                    crate::core::go_panic(
+                        "can only process one file open event at a time".to_string(),
+                    );
                 }
                 if o.as_ref()
                     .is_some_and(|o| o.file_base.content != open_change.content)
@@ -897,7 +899,7 @@ impl OverlayFS {
                                 o_for_line_map
                                     .borrow()
                                     .as_ref()
-                                    .expect("invalid memory address or nil pointer dereference")
+                                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                                     .file_base
                                     .lsp_line_map(),
                             )
@@ -907,7 +909,7 @@ impl OverlayFS {
                         let cur = o_cell
                             .borrow()
                             .clone()
-                            .expect("invalid memory address or nil pointer dereference");
+                            .unwrap_or_else(|| crate::core::go_nil_dereference());
                         if let Some(partial_change) = &text_change.partial {
                             // tsgo#4712
                             let ranges = lsconv::from_lsp_range(
@@ -944,7 +946,7 @@ impl OverlayFS {
                         let cur = o_cell
                             .borrow()
                             .clone()
-                            .expect("invalid memory address or nil pointer dereference");
+                            .unwrap_or_else(|| crate::core::go_nil_dereference());
                         cur.version.set(change.version);
                         cur.file_base
                             .hash

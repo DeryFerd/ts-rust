@@ -178,7 +178,7 @@ impl LanguageService {
                 .contents
                 .markup_content
                 .as_ref()
-                .expect("invalid memory address or nil pointer dereference")
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .value
                 .trim_end_matches('\n')
                 .to_string();
@@ -210,7 +210,7 @@ impl LanguageService {
             .contents
             .markup_content
             .as_mut()
-            .expect("invalid memory address or nil pointer dereference")
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .value = contents.join(separator);
         combined.range = common_range;
         match raw_contents.len() {

@@ -205,9 +205,7 @@ impl AliasResolver {
     ) -> Option<(Rc<RefCell<Checker>>, AliasResolverProgramScope)> {
         // Go: NewChecker reads each root file; a nil file is a nil dereference.
         if self.root_files.iter().any(|file| file.is_nil()) {
-            go_panic(
-                "runtime error: invalid memory address or nil pointer dereference".to_string(),
-            );
+            crate::core::go_nil_dereference();
         }
         let current_directory = self.get_current_directory();
         // The registry reads the second-pass root files from its host.

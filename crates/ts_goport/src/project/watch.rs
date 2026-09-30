@@ -135,7 +135,9 @@ pub fn to_file_system_watcher_key(w: &lsproto::FileSystemWatcher) -> FileSystemW
         if let Some(uri) = &relative_pattern.base_uri.uri {
             base = uri.0.clone();
         } else if relative_pattern.base_uri.workspace_folder.is_some() {
-            panic!("workspace folder-based relative patterns not implemented");
+            crate::core::go_panic(
+                "workspace folder-based relative patterns not implemented".to_string(),
+            );
         }
         pattern = base + "/" + &relative_pattern.pattern;
     }
@@ -152,7 +154,9 @@ pub fn file_system_watcher_glob_string(w: &lsproto::FileSystemWatcher) -> String
         if let Some(uri) = &relative_pattern.base_uri.uri {
             base = uri.0.clone();
         } else if relative_pattern.base_uri.workspace_folder.is_some() {
-            panic!("workspace folder-based relative patterns not implemented");
+            crate::core::go_panic(
+                "workspace folder-based relative patterns not implemented".to_string(),
+            );
         }
         return base + "/" + &relative_pattern.pattern;
     }
@@ -292,7 +296,7 @@ impl<T> WatchedFiles<T> {
                         a.glob_pattern
                             .pattern
                             .as_ref()
-                            .expect("invalid memory address or nil pointer dereference")
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
                             == b
                     })
             };

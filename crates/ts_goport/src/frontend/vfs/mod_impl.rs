@@ -311,7 +311,10 @@ pub struct Common {
 pub fn root_length(p: &str) -> i32 {
     let l = get_encoded_root_length(p);
     if l == 0 {
-        panic!("vfs: path {p:?} is not absolute");
+        crate::core::go_panic(format!(
+            "vfs: path {} is not absolute",
+            crate::gostd::strconv::quote(p)
+        ));
     } else if l < 0 {
         return !l;
     }

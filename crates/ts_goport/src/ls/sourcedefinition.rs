@@ -68,7 +68,7 @@ impl LanguageService {
             if !declarations.is_empty() {
                 // PORT: Go reads `ref.Pos()` through the pointer; a nil
                 // pointer panics there.
-                let ref_ = ref_.expect("invalid memory address or nil pointer dereference");
+                let ref_ = ref_.unwrap_or_else(|| crate::core::go_nil_dereference());
                 let (origin_selection_range, _) =
                     self.create_lsp_range_from_bounds(ref_.range.pos(), ref_.range.end(), file);
                 return Ok(self.create_definition_locations(
@@ -689,7 +689,7 @@ impl SourceDefResolver<'_> {
                 let contents = scope
                     .contents
                     .as_ref()
-                    .expect("invalid memory address or nil pointer dereference");
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 let (value, ok) = contents.header_fields.type_.get_value();
                 if ok {
                     package_json_type = value;

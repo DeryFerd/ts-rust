@@ -30,10 +30,6 @@ use std::cell::Cell;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-// PORT: the Go text of a nil pointer dereference, for the Go calls on a
-// maybe-nil pointer or interface that do not check for nil.
-const NIL_DEREF: &str = "invalid memory address or nil pointer dereference";
-
 // Go: project/session.go:33 UpdateReason
 // PORT: Go `type UpdateReason int` with iota consts. Go
 // `UpdateReasonDidOpenFile` is `UpdateReason::DID_OPEN_FILE` (same values).
@@ -353,7 +349,7 @@ impl ata::NpmExecutor for Session {
     fn npm_install(&self, cwd: &str, npm_install_args: &[String]) -> (Vec<u8>, Option<GoError>) {
         self.npm_executor
             .as_ref()
-            .expect(NIL_DEREF)
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .npm_install(cwd, npm_install_args)
     }
 }
@@ -398,7 +394,7 @@ impl Session {
     // Go: project/session.go:272 Trace
     // Trace implements module.ResolutionHost
     pub fn trace(&self, _msg: &str) {
-        panic!("ATA module resolution should not use tracing");
+        crate::core::go_panic("ATA module resolution should not use tracing".to_string());
     }
 
     // Go: project/session.go:346 Configure
@@ -408,7 +404,10 @@ impl Session {
         let old_config = self.workspace_user_preferences.replace(config.clone());
 
         if !config.locale.is_empty() {
-            let client = self.client.as_ref().expect(NIL_DEREF);
+            let client = self
+                .client
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             let old_locale = client.get_locale();
             client.set_locale(&config.locale);
             let new_locale = client.get_locale();
@@ -739,7 +738,7 @@ impl Session {
                     if let Err(err) = s
                         .client
                         .as_ref()
-                        .expect(NIL_DEREF)
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
                         .refresh_diagnostics(&s.background_context())
                     {
                         if s.options.logging_enabled {
@@ -748,7 +747,8 @@ impl Session {
                         }
                     }
                 };
-                run();
+                // Go: the rest of the same wg.Go goroutine (`TaskHold`).
+                crate::core::go_wait_group_task(run);
                 // Go: defer cancel()
                 cancel();
                 drop(hold);
@@ -845,7 +845,8 @@ impl Session {
                         },
                     );
                 };
-                run();
+                // Go: the rest of the same wg.Go goroutine (`TaskHold`).
+                crate::core::go_wait_group_task(run);
                 // Go: defer cancel()
                 cancel();
                 drop(hold);
@@ -1172,7 +1173,13 @@ impl Session {
                     if let Some(t) = tick_ticker.borrow().as_ref() {
                         t.reset(PERFORMANCE_TELEMETRY_INTERVAL);
                     }
-                    if s.client.is_none() || !s.client.as_ref().expect(NIL_DEREF).is_active() {
+                    if s.client.is_none()
+                        || !s
+                            .client
+                            .as_ref()
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
+                            .is_active()
+                    {
                         return; // Go: continue
                     }
                     s.send_performance_telemetry(&ctx);
@@ -1304,16 +1311,23 @@ impl Session {
             }
         }
 
-        if let Err(err) = self.client.as_ref().expect(NIL_DEREF).send_telemetry(
-            ctx,
-            lsproto::TelemetryEvent {
-                performance_stats_telemetry_event: Some(lsproto::PerformanceStatsTelemetryEvent {
-                    measurements: Some(measurements),
+        if let Err(err) = self
+            .client
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .send_telemetry(
+                ctx,
+                lsproto::TelemetryEvent {
+                    performance_stats_telemetry_event: Some(
+                        lsproto::PerformanceStatsTelemetryEvent {
+                            measurements: Some(measurements),
+                            ..Default::default()
+                        },
+                    ),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-        ) {
+                },
+            )
+        {
             if self.options.logging_enabled {
                 self.logger.logf(&format!(
                     "Error sending performance telemetry: {}",
@@ -1362,7 +1376,7 @@ impl Session {
         if let Err(err) = self
             .client
             .as_ref()
-            .expect(NIL_DEREF)
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .send_telemetry(ctx, info)
         {
             if self.options.logging_enabled {
@@ -1381,10 +1395,12 @@ impl Session {
     // PORT: Go `map[string]string` and `map[string]any` are `IndexMap`s in
     // insertion order (PORT: Go map order is random, also in its JSON).
     pub fn collect_project_info_telemetry(&self, project: &Project) -> lsproto::TelemetryEvent {
-        let command_line = project.command_line.as_ref().expect(NIL_DEREF);
-        // PORT: Go replaces a nil `CompilerOptions()` with an empty
-        // `core.CompilerOptions`; the Rust command line always has options.
-        let opts = command_line.compiler_options().clone();
+        // Go `CompilerOptions` is nil-safe, and a nil result becomes an empty
+        // `core.CompilerOptions`.
+        let opts = project.command_line.as_ref().map_or_else(
+            || Rc::new(CompilerOptions::default()),
+            |command_line| command_line.compiler_options().clone(),
+        );
 
         let mut config_file_name = "other".to_string();
         if project.kind == Kind::CONFIGURED {
@@ -1482,7 +1498,12 @@ impl Session {
 
         // Config file shape
         // PORT: Go `Raw.(*collections.OrderedMap[string, any])` is the
-        // `CompilerOptionsValue::Map` form of `raw`.
+        // `CompilerOptionsValue::Map` form of `raw`. Go reads the field of a
+        // nil command line here.
+        let command_line = project
+            .command_line
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         if let tsoptions::CompilerOptionsValue::Map(raw) = &command_line.raw {
             props.insert(
                 "extends".to_string(),
@@ -1509,7 +1530,7 @@ impl Session {
                     project
                         .program
                         .as_ref()
-                        .expect(NIL_DEREF)
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
                         .get_source_files(),
                 )),
                 ..Default::default()
@@ -1723,7 +1744,9 @@ impl Session {
             let p = project.borrow();
             ls::new_language_service(
                 p.id().as_auto_import_project_id(),
-                p.program.clone().expect(NIL_DEREF),
+                p.program
+                    .clone()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference()),
                 snapshot.clone(),
                 &uri.file_name(),
             )
@@ -1854,7 +1877,10 @@ impl Session {
         }
         Some(ls::new_language_service(
             project.id().as_auto_import_project_id(),
-            project.program.clone().expect(NIL_DEREF),
+            project
+                .program
+                .clone()
+                .unwrap_or_else(|| crate::core::go_nil_dereference()),
             snapshot.clone(),
             &uri.file_name(),
         ))
@@ -1936,7 +1962,10 @@ impl Session {
         let project = project.borrow();
         Ok(ls::new_language_service(
             project.id().as_auto_import_project_id(),
-            project.program.clone().expect(NIL_DEREF),
+            project
+                .program
+                .clone()
+                .unwrap_or_else(|| crate::core::go_nil_dereference()),
             snapshot.clone(),
             &uri.file_name(),
         ))
@@ -2014,7 +2043,10 @@ impl Session {
         let project = project.borrow();
         Ok(ls::new_language_service(
             project.id().as_auto_import_project_id(),
-            project.program.clone().expect(NIL_DEREF),
+            project
+                .program
+                .clone()
+                .unwrap_or_else(|| crate::core::go_nil_dereference()),
             new_snapshot.clone(),
             &uri.file_name(),
         ))
@@ -2346,11 +2378,11 @@ pub fn update_watch<T>(
                 // don't consume the deadline for later ones.
                 let (call_ctx, call_cancel) =
                     gostd::context::with_timeout(ctx, WATCH_REQUEST_TIMEOUT);
-                let err = session.client.as_ref().expect(NIL_DEREF).watch_files(
-                    &call_ctx,
-                    id.clone(),
-                    std::slice::from_ref(watcher),
-                );
+                let err = session
+                    .client
+                    .as_ref()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
+                    .watch_files(&call_ctx, id.clone(), std::slice::from_ref(watcher));
                 call_cancel();
                 match err {
                     Err(err) => watch_errors.push(err),
@@ -2410,7 +2442,7 @@ pub fn update_watch<T>(
                 let err = session
                     .client
                     .as_ref()
-                    .expect(NIL_DEREF)
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .unwatch_files(&call_ctx, id.clone());
                 call_cancel();
                 match err {
@@ -2884,7 +2916,7 @@ impl Session {
             self.logger.log("Auto Imports:");
             let auto_import_stats = snapshot
                 .auto_import_registry()
-                .expect(NIL_DEREF)
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .get_cache_stats();
             self.logger.logf(&format!(
                 "\tUnique packages (by realpath): {}",
@@ -2966,7 +2998,7 @@ impl Session {
             if let Err(err) = self
                 .client
                 .as_ref()
-                .expect(NIL_DEREF)
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .refresh_inlay_hints(&self.background_context())
             {
                 if self.options.logging_enabled {
@@ -2987,7 +3019,7 @@ impl Session {
             if let Err(err) = self
                 .client
                 .as_ref()
-                .expect(NIL_DEREF)
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .refresh_code_lens(&self.background_context())
             {
                 if self.options.logging_enabled {
@@ -3187,14 +3219,19 @@ impl Session {
             lsp_diagnostics.push(lsconv::diagnostic_to_lsp_push(ctx, converters, diag));
         }
 
-        if let Err(err) = self.client.as_ref().expect(NIL_DEREF).publish_diagnostics(
-            ctx,
-            lsproto::PublishDiagnosticsParams {
-                uri: lsconv::file_name_to_document_uri(config_file_path),
-                diagnostics: lsp_diagnostics,
-                ..Default::default()
-            },
-        ) {
+        if let Err(err) = self
+            .client
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .publish_diagnostics(
+                ctx,
+                lsproto::PublishDiagnosticsParams {
+                    uri: lsconv::file_name_to_document_uri(config_file_path),
+                    diagnostics: lsp_diagnostics,
+                    ..Default::default()
+                },
+            )
+        {
             if self.options.logging_enabled {
                 self.logger
                     .logf(&format!("Error publishing diagnostics: {}", err.error()));
@@ -3234,7 +3271,7 @@ impl Session {
             if project
                 .checker_pool
                 .as_ref()
-                .expect(NIL_DEREF)
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .take_new_global_diagnostics()
             {
                 let diagnostics = project.get_project_diagnostics(ctx);
@@ -3278,19 +3315,18 @@ impl Session {
                             file_names: p
                                 .program
                                 .as_ref()
-                                .expect(NIL_DEREF)
+                                .unwrap_or_else(|| crate::core::go_nil_dereference())
                                 .get_source_files()
                                 .iter()
                                 .map(|file| file.file_name().to_string())
                                 .collect(),
                             project_root_path: p.current_directory.clone(),
-                            compiler_options: Some(
-                                p.command_line
-                                    .as_ref()
-                                    .expect(NIL_DEREF)
-                                    .compiler_options()
-                                    .clone(),
-                            ),
+                            // Go `CompilerOptions` is nil-safe: a nil
+                            // command line gives nil.
+                            compiler_options: p
+                                .command_line
+                                .as_ref()
+                                .map(|c| c.compiler_options().clone()),
                             current_directory: s.options.current_directory.clone(),
                             get_script_kind: Rc::new(|file_name: &str| {
                                 crate::frontend::core_ext::get_script_kind_from_file_name(file_name)
@@ -3311,7 +3347,11 @@ impl Session {
                             args![project_display_name],
                         );
                     }
-                    let typings_installer = s.typings_installer.borrow().clone().expect(NIL_DEREF);
+                    let typings_installer = s
+                        .typings_installer
+                        .borrow()
+                        .clone()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference());
                     let result = typings_installer.install_typings_exported(&request);
                     if let Some(client) = s.client.as_ref() {
                         client.progress_finish(

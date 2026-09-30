@@ -3204,7 +3204,7 @@ function generateCode(): Map<string, string> {
 
             // Assert RegisterOptions is set and exactly one field is set
             writeLine(`        let Some(register_options) = &self.register_options else {`);
-            writeLine(`            panic!("RegisterOptions must be set");`);
+            writeLine(`            crate::core::go_panic("RegisterOptions must be set".to_string());`);
             writeLine(`        };`);
             const regParts = regFields.map(r => `bool_to_int(register_options.${r.rustName}.is_some())`);
             writeLine(`        assert_only_one(`);

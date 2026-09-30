@@ -15,8 +15,6 @@ use std::cell::{Cell, OnceCell};
 use std::panic::AssertUnwindSafe;
 use std::time::Instant;
 
-const NIL_DEREF: &str = "invalid memory address or nil pointer dereference";
-
 // Go: project/snapshot.go:29 Snapshot
 pub struct Snapshot {
     pub host: Rc<SnapshotHost>,
@@ -749,7 +747,8 @@ impl Snapshot {
     // Go: project/snapshot.go:477 Clone
     // PORT: Go `Clone` is `clone_` (Rust `Clone::clone` copies a value).
     // The deferred `recover()` is `catch_unwind` around the body
-    // (`clone_body`); the panic is logged and raised again, as in Go.
+    // (`clone_body`); the panic is logged and raised again, as in Go
+    // (`go_repanic`: the runtime line ends with `[recovered, repanicked]`).
     pub fn clone_(
         &self,
         ctx: &Context,
@@ -760,10 +759,10 @@ impl Snapshot {
     ) -> Rc<Snapshot> {
         // ts#64204
         if let Some(api_error) = &self.api_error {
-            panic!(
+            crate::core::go_panic(format!(
                 "cannot clone snapshot with API error: {}",
                 api_error.error()
-            );
+            ));
         }
         let store = &self.host;
         let mut logger: Option<Rc<logging::LogTree>> = None;
@@ -779,7 +778,7 @@ impl Snapshot {
                 Ok(new_snapshot) => new_snapshot,
                 Err(r) => {
                     session_logger.log(&logger.string());
-                    std::panic::resume_unwind(r)
+                    crate::core::go_repanic(r)
                 }
             };
         }
@@ -974,7 +973,10 @@ impl Snapshot {
         {
             let (file_names, project_references, errors, content_mappers) = {
                 let inferred_project = inferred_project.borrow();
-                let command_line = inferred_project.command_line.as_ref().expect(NIL_DEREF);
+                let command_line = inferred_project
+                    .command_line
+                    .as_ref()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 (
                     command_line.file_names().to_vec(),
                     command_line.parsed_config.project_references.clone(),
@@ -1130,20 +1132,22 @@ impl Snapshot {
         }
         let mut auto_imports_watch: Option<Rc<WatchedFiles<FxHashMap<tspath::Path, String>>>> =
             None;
-        let clone_result = old_auto_imports.expect(NIL_DEREF).clone_(
-            ctx,
-            autoimport::RegistryChange {
-                requested_file: prepare_auto_imports,
-                open_files,
-                changed: change.file_changes.changed.clone(),
-                created: change.file_changes.created.clone(),
-                deleted: change.file_changes.deleted.clone(),
-                rebuilt_programs: projects_with_new_program_structure,
-                user_preferences: change.new_config.clone(),
-            },
-            auto_import_host.clone() as Rc<dyn autoimport::RegistryCloneHost>,
-            logger.fork("UpdateAutoImports"),
-        );
+        let clone_result = old_auto_imports
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .clone_(
+                ctx,
+                autoimport::RegistryChange {
+                    requested_file: prepare_auto_imports,
+                    open_files,
+                    changed: change.file_changes.changed.clone(),
+                    created: change.file_changes.created.clone(),
+                    deleted: change.file_changes.deleted.clone(),
+                    rebuilt_programs: projects_with_new_program_structure,
+                    user_preferences: change.new_config.clone(),
+                },
+                auto_import_host.clone() as Rc<dyn autoimport::RegistryCloneHost>,
+                logger.fork("UpdateAutoImports"),
+            );
         // PORT: Go `autoImports, err := ...`; on an error Go `autoImports` is nil.
         let auto_imports: Option<Rc<autoimport::Registry>> = match clone_result {
             Ok(auto_imports) => {
@@ -1201,10 +1205,14 @@ impl Snapshot {
                     // mutations don't happen afterwards. In the future, we might improve things by
                     // separating what it takes to build a program from what it takes to use a program,
                     // and only pass the former into NewProgram instead of retaining it indefinitely.
-                    project.host.as_ref().expect(NIL_DEREF).freeze(
-                        snapshot_fs.clone(),
-                        new_snapshot.config_file_registry.clone(),
-                    );
+                    project
+                        .host
+                        .as_ref()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
+                        .freeze(
+                            snapshot_fs.clone(),
+                            new_snapshot.config_file_registry.clone(),
+                        );
                 }
             }
         }
@@ -1243,10 +1251,10 @@ impl Snapshot {
         let rc = self.ref_count.get() + 1;
         self.ref_count.set(rc);
         if rc <= 1 {
-            panic!(
+            crate::core::go_panic(format!(
                 "snapshot {}: ref on disposed snapshot, parentId={}",
                 self.id, self.parent_id
-            );
+            ));
         }
     }
 
@@ -1272,10 +1280,10 @@ impl Snapshot {
         let rc = self.ref_count.get() - 1;
         self.ref_count.set(rc);
         if rc < 0 {
-            panic!(
+            crate::core::go_panic(format!(
                 "snapshot {}: ref count below zero, parentId={}",
                 self.id, self.parent_id
-            );
+            ));
         }
         if rc == 0 {
             self.dispose();

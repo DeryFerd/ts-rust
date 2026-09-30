@@ -18,9 +18,6 @@ use crate::ls::prelude::*;
 use crate::frontend::scanner::{Scanner, new_scanner};
 use crate::frontend::stringutil_ls;
 
-/// Go runtime panic text for a call through a nil func value.
-const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
-
 impl LanguageService {
     // Go: ls/organizeimports.go:24 OrganizeImports
     // OrganizeImports organizes imports by:
@@ -190,7 +187,9 @@ struct OrganizeImportsComparerSettings {
 /// Go `comparer(a, b)` on a `func(a, b string) int` value.
 // PORT: Go calls the func value where it is used; a nil one panics then.
 fn call_string_comparer(comparer: &Option<lsutil::StringComparer>, a: &str, b: &str) -> i32 {
-    (comparer.as_ref().expect(NIL_DEREF))(a, b)
+    (comparer
+        .as_ref()
+        .unwrap_or_else(|| crate::core::go_nil_dereference()))(a, b)
 }
 
 // Go: ls/organizeimports.go:122 organizeImportsWorker

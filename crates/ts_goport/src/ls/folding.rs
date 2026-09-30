@@ -35,9 +35,15 @@ impl LanguageService {
                 return c;
             }
             // PORT: Go dereferences `*a.StartCharacter` and
-            // `*a.EndCharacter`; a nil pointer panics there as `unwrap`
-            // panics here. Every range made in this file sets both.
-            let c = a.start_character.unwrap().cmp(&b.start_character.unwrap()) as i32;
+            // `*a.EndCharacter`; a nil pointer panics there. Every range made
+            // in this file sets both.
+            let a_start = a
+                .start_character
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
+            let b_start = b
+                .start_character
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
+            let c = a_start.cmp(&b_start) as i32;
             if c != 0 {
                 return c;
             }
@@ -45,7 +51,13 @@ impl LanguageService {
             if c != 0 {
                 return c;
             }
-            a.end_character.unwrap().cmp(&b.end_character.unwrap()) as i32
+            let a_end = a
+                .end_character
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
+            let b_end = b
+                .end_character
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
+            a_end.cmp(&b_end) as i32
         });
         let mut seen: FxHashSet<FoldingRangeKey> = FxHashSet::default();
         res.retain(|folding_range| seen.insert(key_for_folding_range(folding_range)));

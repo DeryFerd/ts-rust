@@ -23,9 +23,6 @@ use crate::lsp::lsproto;
 use crate::modulespecifiers;
 use std::cell::Cell;
 
-/// Go runtime panic text for a nil pointer dereference.
-const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
-
 // Go: ls/autoimport/view.go:21 View
 // PORT: Go `checker *checker.Checker` (ts#64178) is not a field; see
 // `new_view`.
@@ -142,12 +139,16 @@ impl View {
     // Go `bucket.Index` is a pointer; a nil index panics as in Go.
     pub fn search_exported(&self, query: &str, kind: QueryKind) -> Vec<Rc<Export>> {
         let search_fn = |bucket: &RegistryBucket| -> Vec<Rc<Export>> {
-            let index = bucket.index.as_ref().expect(NIL_DEREF).borrow();
+            let index = bucket
+                .index
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                .borrow();
             match kind {
                 QueryKind::WORD_PREFIX => index.search_word_prefix(query),
                 QueryKind::EXACT_MATCH => index.find(query, true),
                 QueryKind::CASE_INSENSITIVE_MATCH => index.find(query, false),
-                _ => panic!("unreachable"),
+                _ => crate::core::go_panic("unreachable".to_string()),
             }
         };
 
@@ -157,7 +158,11 @@ impl View {
     // Go: ls/autoimport/view.go:90 SearchByExportID
     pub fn search_by_export_id(&self, id: &ExportID) -> Vec<Rc<Export>> {
         let search = |bucket: &RegistryBucket| -> Vec<Rc<Export>> {
-            let index = bucket.index.as_ref().expect(NIL_DEREF).borrow();
+            let index = bucket
+                .index
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                .borrow();
             index
                 .entries
                 .iter()
@@ -202,14 +207,20 @@ impl View {
                 if let Some(dir) = self.registry.directories.get(&dir_path) {
                     let dir = dir.borrow();
                     if let Some(pj) = dir.package_json.as_ref().filter(|pj| pj.exists())
-                        && pj.contents.as_ref().expect(NIL_DEREF).parseable
+                        && pj
+                            .contents
+                            .as_ref()
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
+                            .parseable
                     {
                         // Initialize to empty set if this is the first package.json we've seen
                         if allowed_packages.is_none() {
                             allowed_packages = Some(FxHashSet::default());
                         }
                         add_package_json_dependencies(
-                            pj.contents.as_ref().expect(NIL_DEREF),
+                            pj.contents
+                                .as_ref()
+                                .unwrap_or_else(|| crate::core::go_nil_dereference()),
                             allowed_packages.as_mut().expect("set above when nil"),
                         );
                     }

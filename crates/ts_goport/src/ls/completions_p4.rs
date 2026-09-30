@@ -34,7 +34,7 @@ impl LanguageService {
             // returns the file, so the index is set when the file is nil.
             let index = data
                 .supplemental_file_index
-                .expect("invalid memory address or nil pointer dereference");
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             return Err(gostd::errors::errorf(
                 format!("supplemental source file index not found: {index}"),
                 Vec::new(),
@@ -150,7 +150,9 @@ impl LanguageService {
                 }
                 // PORT: Go prints the dynamic type with `%T`; the only other
                 // variant is `*completionDataData`.
-                _ => panic!("Unexpected completion data type: *ls.completionDataData"),
+                _ => crate::core::go_panic(
+                    "Unexpected completion data type: *ls.completionDataData".to_string(),
+                ),
             }
         } else if let Some(symbol_details) = symbol_completion.symbol {
             return self.create_completion_details_for_symbol(
@@ -232,7 +234,7 @@ impl LanguageService {
             true, /*forItemResolve*/
         ) {
             Ok(completion_data) => completion_data,
-            Err(err) => panic!("{}", err.error()),
+            Err(err) => crate::core::go_panic(err.error().to_string()),
         };
 
         let Some(completion_data) = completion_data else {
@@ -493,9 +495,7 @@ impl LanguageService {
         }
 
         if node.kind() == SyntaxKind::ImportKeyword || node.kind() == SyntaxKind::ImportSpecifier {
-            panic!(
-                "ImportKeyword was necessarily on one line; ImportSpecifier was necessarily parented in an ImportDeclaration"
-            );
+            crate::core::go_panic("ImportKeyword was necessarily on one line; ImportSpecifier was necessarily parented in an ImportDeclaration".to_string());
         }
 
         // Guess which point in the import might actually be a later statement parsed as part of the import
@@ -1455,7 +1455,9 @@ impl LanguageService {
                         .as_literal_type()
                         .value()
                         .cloned()
-                        .expect("Unsupported type: <nil>");
+                        .unwrap_or_else(|| {
+                            crate::core::go_panic("Unsupported type: <nil>".to_string())
+                        });
                     if !tracker.has_value(&value) {
                         match value {
                             LiteralValue::PseudoBigInt(mut v) => {
@@ -1642,8 +1644,8 @@ pub fn type_node_to_expression(
             entity_name_to_expression(type_node.expr_name(), target, quote_preference, factory)
         }
         SyntaxKind::ImportType => {
-            panic!(
-                "Debug failure. We should not get an import type after calling 'typeToAutoImportableTypeNode'."
+            crate::gostd::debug::fail(
+                "We should not get an import type after calling 'typeToAutoImportableTypeNode'.",
             );
         }
         _ => Node::NIL,

@@ -1,6 +1,6 @@
 //! Go `cmd/tsgo/main.go`, and the parts of the Go standard library that
 //! package main needs and the crate does not have yet: `flag` (bool, int
-//! and string flags, `Parse`, the default usage text), `os.Getwd` and
+//! and string flags, `Parse`, the default usage text) and
 //! `signal.NotifyContext`.
 
 use crate::cmd::tsgo::prelude::*;
@@ -40,8 +40,11 @@ pub fn run_main(args: &[String]) -> Option<i32> {
 
 // PORT: runs `f` on a new thread with the Go maximum stack
 // (`gostd::stack::max_stack_size`) and returns its status.
-// A panic that reaches the top of that thread ends Go with a crash; goport
-// returns `EXIT_UNPORTED` (70), as `bin/goport.rs` does for a failed worker.
+// A panic that reaches the top of that thread ends Go with a crash. A Go
+// panic (`core::go_panic`) ends it as the Go runtime does, as `bin/tsgo.rs`
+// does: `panic: <message>` on stderr and `EXIT_GO_PANIC` (2). Any other
+// panic is a port gap: goport returns `EXIT_UNPORTED` (70), as
+// `bin/goport.rs` does for a failed worker.
 fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
     let worker = std::thread::Builder::new()
         .name("tsgo".to_string())
@@ -49,6 +52,9 @@ fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
         .spawn(move || f(args));
     match worker.map(std::thread::JoinHandle::join) {
         Ok(Ok(code)) => code,
+        Ok(Err(payload)) if crate::core::print_go_panic(payload.as_ref()) => {
+            crate::core::EXIT_GO_PANIC
+        }
         _ => crate::execute::tsc::EXIT_UNPORTED,
     }
 }
@@ -132,29 +138,15 @@ fn signal_string(s: i32) -> String {
     }
 }
 
-// Go: os/getwd.go:26 Getwd (the Unix path), with `core.Must`.
-// PORT: `syscall.Getwd` is `std::env::current_dir`.
+// Go: core.Must(os.Getwd()), for the LSP and the API.
+// PORT: Go `os.Getwd` is `frontend::vfs::os_current_dir`, the same one the
+// compile path reads (a symlinked cwd keeps the `$PWD` link path; the value
+// is in the port form of the Go bytes). Go `core.Must` panics with the
+// error value, so the run ends with `panic: <err.Error()>` and exit 2
+// (`core::go_panic`, `getwd_error_text`).
 pub fn must_getwd() -> String {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // Clumsy but widespread kludge:
-        // if $PWD is set and matches ".", use it.
-        if let Ok(dir) = std::env::var("PWD") {
-            if dir.starts_with('/') {
-                let dot = std::fs::metadata(".").expect("getwd: stat .");
-                if let Ok(d) = std::fs::metadata(&dir) {
-                    if dot.dev() == d.dev() && dot.ino() == d.ino() {
-                        return dir;
-                    }
-                }
-            }
-        }
-    }
-    std::env::current_dir()
-        .expect("getwd")
-        .to_string_lossy()
-        .into_owned()
+    crate::frontend::vfs::os_current_dir()
+        .unwrap_or_else(|err| crate::core::go_panic(crate::frontend::vfs::getwd_error_text(&err)))
 }
 
 // Go: flag/flag.go (go1.26.8), the part that package main uses.

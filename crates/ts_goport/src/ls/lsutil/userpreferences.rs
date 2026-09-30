@@ -1553,7 +1553,10 @@ fn collect_field_infos(fields: &'static [StructField]) -> Vec<FieldInfo> {
         let config_tag = field.config_tag;
 
         if raw_tag.is_empty() && config_tag.is_empty() {
-            panic!("raw or config tag required for field {}", field.name);
+            crate::core::go_panic(format!(
+                "raw or config tag required for field {}",
+                field.name
+            ));
         }
 
         let fallback_config_tag = field.fallback_config_tag;

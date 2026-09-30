@@ -459,7 +459,9 @@ impl CheckerPool {
                 return (c, i as i32);
             }
         }
-        panic!("checkerpool: no available query slot despite holding semaphore token");
+        crate::core::go_panic(
+            "checkerpool: no available query slot despite holding semaphore token".to_string(),
+        );
     }
 
     // Go: project/checkerpool.go:315 checkerPool.getPersistentChecker

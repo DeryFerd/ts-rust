@@ -1099,12 +1099,10 @@ impl Tracker {
             _ => {
                 if !(is_statement(node) || is_class_or_type_element(node)) {
                     // Else we haven't handled this kind of node yet -- add it
-                    // PORT: Go `Kind.String()` prints "KindX"; this prints the
-                    // Rust kind name. Panic text only.
-                    panic!(
-                        "unimplemented node type {:?} in changeTracker.getInsertNodeAfterOptions",
-                        node.kind()
-                    );
+                    crate::core::go_panic(format!(
+                        "unimplemented node type {} in changeTracker.getInsertNodeAfterOptions",
+                        crate::gostd::debug::kind_string(node.kind())
+                    ));
                 }
                 options = NodeOptions {
                     suffix: new_line_char.clone(),
@@ -1173,12 +1171,10 @@ impl Tracker {
             };
         }
         // We haven't handled this kind of node yet -- add it
-        // PORT: Go `Kind.String()` prints "KindX"; this prints the Rust kind
-        // name. Panic text only.
-        panic!(
-            "unimplemented node type {:?} in changeTracker.getOptionsForInsertNodeBefore",
-            before.kind()
-        );
+        crate::core::go_panic(format!(
+            "unimplemented node type {} in changeTracker.getOptionsForInsertNodeBefore",
+            crate::gostd::debug::kind_string(before.kind())
+        ));
     }
 
     // Go: ls/change/tracker.go:707 getInsertNodeAtStartInsertOptions

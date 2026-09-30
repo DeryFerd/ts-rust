@@ -47,9 +47,6 @@ use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc;
 
-/// Go runtime panic text for a nil pointer dereference.
-const NIL_DEREF: &str = "runtime error: invalid memory address or nil pointer dereference";
-
 // Go: ls/crossproject.go:17 Project
 // PORT: plan contract C4. Go `*compiler.Program` is
 // `Rc<compiler::NewProgram>`, which is never nil.
@@ -237,10 +234,10 @@ where
         // No need to use mu here since we are not in parallel at this point
         if let Some(panics_occurred) = state.panics_occurred.borrow().as_ref() {
             // PORT: Go `%v` of a `[]string`.
-            panic!(
+            crate::core::go_panic(format!(
                 "Panics occurred during cross-project handling: [{}]",
                 panics_occurred.join(" ")
-            );
+            ));
         }
         if let Some(err) = ctx.err() {
             return Err(err);
@@ -284,7 +281,9 @@ where
 
                     // Enqueue the project and location for further processing
                     let default_definition = state.default_definition.borrow();
-                    let default_definition = default_definition.as_ref().expect(NIL_DEREF);
+                    let default_definition = default_definition
+                        .as_ref()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference());
                     if loaded_project.has_file(&default_definition.text_document_uri().file_name())
                     {
                         state.enqueue_item(ProjectAndTextDocumentPosition {
@@ -1073,7 +1072,12 @@ pub fn combine_incoming_calls(
     for resp in results {
         if let Some(call_hierarchy_incoming_calls) = &resp.call_hierarchy_incoming_calls {
             for call in call_hierarchy_incoming_calls {
-                if seen_calls.insert(call.from.as_ref().expect(NIL_DEREF).get_location()) {
+                if seen_calls.insert(
+                    call.from
+                        .as_ref()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
+                        .get_location(),
+                ) {
                     combined.push(call.clone());
                 }
             }

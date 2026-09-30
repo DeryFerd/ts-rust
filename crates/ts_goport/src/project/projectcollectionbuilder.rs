@@ -20,8 +20,6 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::time::Instant;
 
-const NIL_DEREF: &str = "invalid memory address or nil pointer dereference";
-
 // Go: project/projectcollectionbuilder.go:20 projectLoadKind
 // PORT: Go `type projectLoadKind int` with iota consts; Go
 // `projectLoadKindFind` is `ProjectLoadKind::FIND` (same values).
@@ -343,7 +341,7 @@ impl ProjectCollectionBuilder {
             {
                 let config_file_path = entry
                     .value()
-                    .expect(NIL_DEREF)
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .borrow()
                     .config_file_path
                     .clone();
@@ -495,13 +493,27 @@ impl ProjectCollectionBuilder {
         let mut created_programs: Vec<Rc<RefCell<Project>>> =
             Vec::with_capacity(created_entries.len());
         for entry in &created_entries {
-            if entry.value().expect(NIL_DEREF).borrow().dirty {
+            if entry
+                .value()
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                .borrow()
+                .dirty
+            {
                 self.update_program(&**entry, logger.clone());
             }
-            created_programs.push(entry.value().expect(NIL_DEREF));
+            created_programs.push(
+                entry
+                    .value()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference()),
+            );
         }
         for entry in &reconfigured_entries {
-            if entry.value().expect(NIL_DEREF).borrow().dirty {
+            if entry
+                .value()
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                .borrow()
+                .dirty
+            {
                 self.update_program(&**entry, logger.clone());
             }
         }
@@ -537,7 +549,9 @@ impl ProjectCollectionBuilder {
         let mut module_resolution_error: Option<GoError> = None;
         self.for_each_project(
             &mut |entry: &dyn dirty::Value<Rc<RefCell<Project>>>| -> bool {
-                let project = entry.value().expect(NIL_DEREF);
+                let project = entry
+                    .value()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 if let Some(program) = &project.borrow().program {
                     module_resolution_error = program.module_resolution_error();
                 }
@@ -653,13 +667,18 @@ impl ProjectCollectionBuilder {
                     lsproto::FileChangeType::CHANGED,
                     logger.clone(),
                 );
-                let value = entry.value().expect(NIL_DEREF);
+                let value = entry
+                    .value()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 if value.borrow().kind == Kind::INFERRED && !summary.closed.is_empty() {
                     // PORT: Go `newRootFiles` aliases the command line's slice and
                     // `slices.Delete` edits it in place; the port edits a copy.
                     let (root_files_map, mut new_root_files) = {
                         let value = value.borrow();
-                        let command_line = value.command_line.as_ref().expect(NIL_DEREF);
+                        let command_line = value
+                            .command_line
+                            .as_ref()
+                            .unwrap_or_else(|| crate::core::go_nil_dereference());
                         (
                             command_line.file_names_by_path().clone(),
                             command_line.file_names().to_vec(),
@@ -670,9 +689,13 @@ impl ProjectCollectionBuilder {
                         let path = (self.to_path)(&file_name);
                         if root_files_map.contains_key(&path) {
                             // Go: slices.Delete(newRootFiles, slices.Index(newRootFiles, fileName), slices.Index(newRootFiles, fileName)+1)
+                            // A missing file is index -1. The bound check is the
+                            // 3-index `s[i:j:len(s)]`, so the runtime text is `[-1::]`.
                             let Some(index) = new_root_files.iter().position(|f| *f == file_name)
                             else {
-                                panic!("runtime error: slice bounds out of range [-1:]");
+                                crate::core::go_panic(
+                                    "runtime error: slice bounds out of range [-1::]".to_string(),
+                                );
                             };
                             new_root_files.remove(index);
                         }
@@ -727,7 +750,9 @@ impl ProjectCollectionBuilder {
         refresh_all: bool,
         logger: Option<Rc<logging::LogTree>>,
     ) {
-        let project = entry.value().expect(NIL_DEREF);
+        let project = entry
+            .value()
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         let (program, content_mapper_watched_files) = {
             let project = project.borrow();
             (
@@ -836,7 +861,9 @@ impl ProjectCollectionBuilder {
                             ) {
                                 retain_project_and_references(
                                     &mut *to_remove_projects,
-                                    &ancestor.value().expect(NIL_DEREF),
+                                    &ancestor
+                                        .value()
+                                        .unwrap_or_else(|| crate::core::go_nil_dereference()),
                                 );
                             }
                         },
@@ -852,7 +879,8 @@ impl ProjectCollectionBuilder {
                 retain_default_configured_project(
                     &mut to_remove_projects,
                     &open_file_path,
-                    &p.value().expect(NIL_DEREF),
+                    &p.value()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference()),
                 );
             } else {
                 inferred_project_files.push(open_file);
@@ -868,7 +896,8 @@ impl ProjectCollectionBuilder {
                 retain_default_configured_project(
                     &mut to_remove_projects,
                     &path,
-                    &p.value().expect(NIL_DEREF),
+                    &p.value()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference()),
                 );
             } else {
                 inferred_project_files.push(file_name);
@@ -1243,7 +1272,7 @@ impl ProjectCollectionBuilder {
                 let child_config_path = child_config
                     .config_file
                     .as_ref()
-                    .expect(NIL_DEREF)
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .path
                     .clone();
                 let child_project_entry = self
@@ -1253,7 +1282,7 @@ impl ProjectCollectionBuilder {
                         ProjectLoadKind::CREATE,
                         logger.clone(),
                     )
-                    .expect(NIL_DEREF);
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 self.update_program(&*child_project_entry, logger.clone());
 
                 // Ensure children for this project
@@ -1289,7 +1318,7 @@ impl ProjectCollectionBuilder {
                     ata_change
                         .typings_info
                         .as_ref()
-                        .expect(NIL_DEREF)
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
                         .equals(&typings_info)
                 },
                 &mut |p: &Rc<RefCell<Project>>| {
@@ -1418,20 +1447,30 @@ impl ProjectCollectionBuilder {
                 }
                 if project.is_none() {
                     if let (configured_id, true) = project_id.configured() {
-                        project = self
-                            .configured_projects
-                            .load(&configured_id)
-                            .0
-                            .map(|entry| entry as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>);
+                        // PORT: Go stores the nil `*SyncMapEntry` of a missed
+                        // `Load` in the interface, so `project == nil` is
+                        // false and `project.Value()` reads the nil entry.
+                        project = Some(
+                            self.configured_projects
+                                .load(&configured_id)
+                                .0
+                                .map(|entry| entry as Rc<dyn dirty::Value<Rc<RefCell<Project>>>>)
+                                .unwrap_or_else(|| crate::core::go_nil_dereference()),
+                        );
                     }
                 }
             }
             let Some(project) = project.filter(|project| project.value().is_some()) else {
-                panic!("project {} affected by config change not found", project_id);
+                crate::core::go_panic(format!(
+                    "project {} affected by config change not found",
+                    project_id
+                ));
             };
             project.change_if(
                 &mut |p: Option<&Rc<RefCell<Project>>>| -> bool {
-                    let p = p.expect(NIL_DEREF).borrow();
+                    let p = p
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
+                        .borrow();
                     !p.dirty || !p.dirty_file_path.is_empty()
                 },
                 &mut |p: &Rc<RefCell<Project>>| {
@@ -1532,7 +1571,12 @@ impl ProjectCollectionBuilder {
             file_name,
             path,
             &configured_project_paths,
-            &mut |path: &tspath::Path| configured_projects.get(path).expect(NIL_DEREF).value(),
+            &mut |path: &tspath::Path| {
+                configured_projects
+                    .get(path)
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
+                    .value()
+            },
         );
 
         if multiple_candidates {
@@ -1582,9 +1626,9 @@ impl ProjectCollectionBuilder {
         let mut project = open_result
             .project
             .as_ref()
-            .expect(NIL_DEREF)
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
             .value()
-            .expect(NIL_DEREF);
+            .unwrap_or_else(|| crate::core::go_nil_dereference());
         loop {
             // Skip if project is not composite and we are only looking for solution
             let (config_file_name, config_file_path, command_line) = {
@@ -1632,7 +1676,7 @@ impl ProjectCollectionBuilder {
             // we would make the current project as its potential project reference
             let ancestor_has_no_command_line = ancestor
                 .value()
-                .expect(NIL_DEREF)
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
                 .borrow()
                 .command_line
                 .is_none();
@@ -1648,7 +1692,9 @@ impl ProjectCollectionBuilder {
                 });
             }
 
-            project = ancestor.value().expect(NIL_DEREF);
+            project = ancestor
+                .value()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
         }
     }
 
@@ -1776,7 +1822,9 @@ impl ProjectCollectionBuilder {
                     self.update_program(&*project, node.logger.clone());
                 }
 
-                let value = project.value().expect(NIL_DEREF);
+                let value = project
+                    .value()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 if value.borrow().contains_file(path) {
                     let is_direct_inclusion =
                         !value.borrow().is_source_from_project_reference(path);
@@ -1944,7 +1992,11 @@ impl ProjectCollectionBuilder {
             );
             if let Some(project) = &result.project {
                 // Go: `if b.fileDefaultProjects == nil { make(...) }` (the port map always exists).
-                let project_id = project.value().expect(NIL_DEREF).borrow().id();
+                let project_id = project
+                    .value()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
+                    .borrow()
+                    .id();
                 self.file_default_projects
                     .borrow_mut()
                     .insert(path.clone(), project_id);
@@ -1957,7 +2009,7 @@ impl ProjectCollectionBuilder {
                         file_name,
                         project
                             .value()
-                            .expect(NIL_DEREF)
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
                             .borrow()
                             .config_file_name(),
                         elapsed
@@ -2012,7 +2064,10 @@ impl ProjectCollectionBuilder {
         let mut config_file_parsing_diagnostics: Vec<Diagnostic> = Vec::new();
         if let Some(project) = self.inferred_project.value() {
             let project = project.borrow();
-            let command_line = project.command_line.as_ref().expect(NIL_DEREF);
+            let command_line = project
+                .command_line
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             // PORT: Go `CommandLine.ProjectReferences()` keeps nil apart
             // from an empty list; that is the `ParsedOptions` field here.
             project_references = command_line.parsed_config.project_references.clone();
@@ -2059,9 +2114,13 @@ impl ProjectCollectionBuilder {
             {
                 let mut p = synthetic_project.borrow_mut();
                 // Go: syntheticProject.CommandLine.Errors = configFileParsingDiagnostics
-                Rc::get_mut(p.command_line.as_mut().expect(NIL_DEREF))
-                    .expect("the new command line is not shared yet")
-                    .errors = config_file_parsing_diagnostics;
+                Rc::get_mut(
+                    p.command_line
+                        .as_mut()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference()),
+                )
+                .expect("the new command line is not shared yet")
+                .errors = config_file_parsing_diagnostics;
                 // ts#64299
                 p.module_resolver_factory = module_resolver_factory;
                 p.module_resolver_id = module_resolver_id;
@@ -2069,20 +2128,25 @@ impl ProjectCollectionBuilder {
             let (project, _) = self
                 .synthetic_projects
                 .load_or_store(project_id, synthetic_project);
-            return project.expect(NIL_DEREF);
+            return project.unwrap_or_else(|| crate::core::go_nil_dereference());
         };
 
         let (compiler_options, current_directory) = {
-            let current_project = project.value().expect(NIL_DEREF);
+            let current_project = project
+                .value()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             let current_project = current_project.borrow();
+            // Go `CompilerOptions` is nil-safe: a nil command line gives nil.
+            // PORT: the port command line cannot hold nil options. A
+            // synthetic project always has a command line, so this is a port
+            // assert, not a Go panic.
             let compiler_options = match compiler_options {
                 Some(compiler_options) => compiler_options,
                 None => current_project
                     .command_line
                     .as_ref()
-                    .expect(NIL_DEREF)
-                    .compiler_options()
-                    .clone(),
+                    .map(|command_line| command_line.compiler_options().clone())
+                    .expect("port: a synthetic project has a command line"),
             };
             (compiler_options, current_project.current_directory.clone())
         };
@@ -2100,8 +2164,8 @@ impl ProjectCollectionBuilder {
         let new_command_line = Rc::new(new_command_line);
         project.change_if(
             &mut |p: Option<&Rc<RefCell<Project>>>| -> bool {
-                let p = p.expect(NIL_DEREF).borrow();
-                let command_line = p.command_line.as_ref().expect(NIL_DEREF);
+                let p = p.unwrap_or_else(|| crate::core::go_nil_dereference()).borrow();
+                let command_line = p.command_line.as_ref().unwrap_or_else(|| crate::core::go_nil_dereference());
                 command_line.file_names() != new_command_line.file_names()
                     // Go: !reflect.DeepEqual(p.CommandLine.CompilerOptions(), compilerOptions)
                     || **command_line.compiler_options() != *compiler_options
@@ -2210,9 +2274,13 @@ impl ProjectCollectionBuilder {
             {
                 let mut p = project.borrow_mut();
                 // Go: project.CommandLine.Errors = configFileParsingDiagnostics
-                Rc::get_mut(p.command_line.as_mut().expect(NIL_DEREF))
-                    .expect("the new command line is not shared yet")
-                    .errors = config_file_parsing_diagnostics;
+                Rc::get_mut(
+                    p.command_line
+                        .as_mut()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference()),
+                )
+                .expect("the new command line is not shared yet")
+                .errors = config_file_parsing_diagnostics;
             }
             self.inferred_project.set(project);
             return true;
@@ -2220,14 +2288,17 @@ impl ProjectCollectionBuilder {
 
         let (compiler_options, current_directory) = {
             let project = project.borrow();
+            // Go `CompilerOptions` is nil-safe: a nil command line gives nil.
+            // PORT: the port command line cannot hold nil options. An
+            // inferred project always has a command line, so this is a port
+            // assert, not a Go panic.
             let compiler_options = match compiler_options {
                 Some(compiler_options) => compiler_options,
                 None => project
                     .command_line
                     .as_ref()
-                    .expect(NIL_DEREF)
-                    .compiler_options()
-                    .clone(),
+                    .map(|command_line| command_line.compiler_options().clone())
+                    .expect("port: an inferred project has a command line"),
             };
             (compiler_options, project.current_directory.clone())
         };
@@ -2245,8 +2316,8 @@ impl ProjectCollectionBuilder {
         let new_command_line = Rc::new(new_command_line);
         let changed = self.inferred_project.change_if(
             &mut |p: Option<&Rc<RefCell<Project>>>| -> bool {
-                let p = p.expect(NIL_DEREF).borrow();
-                let command_line = p.command_line.as_ref().expect(NIL_DEREF);
+                let p = p.unwrap_or_else(|| crate::core::go_nil_dereference()).borrow();
+                let command_line = p.command_line.as_ref().unwrap_or_else(|| crate::core::go_nil_dereference());
                 command_line.file_names() != new_command_line.file_names()
                     // Go: !reflect.DeepEqual(p.CommandLine.CompilerOptions(), compilerOptions)
                     || **command_line.compiler_options() != *compiler_options
@@ -2309,12 +2380,16 @@ impl ProjectCollectionBuilder {
         let mut delete_project = false;
         let mut files_changed = false;
         // ts#64319
-        let project_id = entry.value().expect(NIL_DEREF).borrow().id();
+        let project_id = entry
+            .value()
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .borrow()
+            .id();
         let start_time = Instant::now();
         let mut notified_loading = false;
         let mut display_name = String::new();
         entry.locked(&mut |entry: &dyn dirty::Value<Rc<RefCell<Project>>>| {
-            let value = entry.value().expect(NIL_DEREF);
+            let value = entry.value().unwrap_or_else(|| crate::core::go_nil_dereference());
             if value.borrow().kind == Kind::CONFIGURED {
                 let (value_config_file_name, value_config_file_path) = {
                     let value = value.borrow();
@@ -2335,7 +2410,7 @@ impl ProjectCollectionBuilder {
                 };
                 // Go: pointer compare `entry.Value().CommandLine != commandLine`.
                 let same_command_line = matches!(
-                    &entry.value().expect(NIL_DEREF).borrow().command_line,
+                    &entry.value().unwrap_or_else(|| crate::core::go_nil_dereference()).borrow().command_line,
                     Some(current) if Rc::ptr_eq(current, &command_line)
                 );
                 if !same_command_line {
@@ -2346,12 +2421,12 @@ impl ProjectCollectionBuilder {
                 }
             }
             if !update_program {
-                update_program = entry.value().expect(NIL_DEREF).borrow().dirty;
+                update_program = entry.value().unwrap_or_else(|| crate::core::go_nil_dereference()).borrow().dirty;
             }
             if update_program && self.client.is_some() {
                 display_name = entry
                     .value()
-                    .expect(NIL_DEREF)
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
                     .borrow()
                     .display_name(&self.session_options.current_directory);
                 notified_loading = true;
@@ -2391,12 +2466,14 @@ impl ProjectCollectionBuilder {
                     let (new_host, content_mappers) = {
                         let p = project.borrow();
                         (
-                            p.host.clone().expect(NIL_DEREF),
+                            p.host
+                                .clone()
+                                .unwrap_or_else(|| crate::core::go_nil_dereference()),
+                            // Go `ContentMappers` is nil-safe: a nil command
+                            // line has none.
                             p.command_line
                                 .as_ref()
-                                .expect(NIL_DEREF)
-                                .content_mappers()
-                                .to_vec(),
+                                .map_or_else(Vec::new, |c| c.content_mappers().to_vec()),
                         )
                     };
                     let mut watched_files: Vec<String> = Vec::new();
@@ -2458,14 +2535,14 @@ impl ProjectCollectionBuilder {
                     if result.update_kind == ProgramUpdateKind::CLONED {
                         let seen_files = old_host
                             .as_ref()
-                            .expect(NIL_DEREF)
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
                             .source_fs
                             .seen_files
                             .borrow()
                             .clone();
                         *p.host
                             .as_ref()
-                            .expect(NIL_DEREF)
+                            .unwrap_or_else(|| crate::core::go_nil_dereference())
                             .source_fs
                             .seen_files
                             .borrow_mut() = seen_files;
@@ -2519,7 +2596,9 @@ impl ProjectCollectionBuilder {
         let dirty_file_path: RefCell<tspath::Path> = RefCell::new(tspath::Path::default());
         entry.change_if(
             &mut |p: Option<&Rc<RefCell<Project>>>| -> bool {
-                let p = p.expect(NIL_DEREF).borrow();
+                let p = p
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
+                    .borrow();
                 if p.program.is_none() || p.dirty && p.dirty_file_path.is_empty() {
                     return false;
                 }
@@ -2588,7 +2667,9 @@ impl ProjectCollectionBuilder {
     ) {
         // ts#64319: configs release by project ID.
         let (project_id, kind, program, config_file_path) = {
-            let value = project.value().expect(NIL_DEREF);
+            let value = project
+                .value()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
             let value = value.borrow();
             (
                 value.id(),
@@ -2732,7 +2813,9 @@ fn is_referenced_by(
             {
                 if is_referenced_by(
                     b,
-                    &ref_project.value().expect(NIL_DEREF),
+                    &ref_project
+                        .value()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference()),
                     ref_path,
                     seen_projects,
                 ) {

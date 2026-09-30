@@ -142,9 +142,9 @@ pub enum HostAnswer {
     Strings(Vec<String>),
     FileReferences(Vec<FileReference>),
     RefInfo(Option<RefInfo>),
-    /// The read panicked on the dispatch thread; the search panics with the
-    /// same text.
-    Panic(String),
+    /// The read panicked on the dispatch thread; the search panics again
+    /// with the same payload, so a Go panic (`core::GoPanic`) stays one.
+    Panic(Box<dyn std::any::Any + Send>),
     /// The request no longer waits (it panicked); the search result is
     /// dropped.
     Gone,
@@ -332,7 +332,7 @@ pub fn answer_query(ls: &LanguageService, query: HostQuery) -> HostAnswer {
             &ls.program,
         )),
     }));
-    answered.unwrap_or_else(|payload| HostAnswer::Panic(panic_payload_text(&*payload)))
+    answered.unwrap_or_else(HostAnswer::Panic)
 }
 
 /// Starts the search thread of `program` and returns its job queue.
@@ -585,7 +585,7 @@ impl SearchView {
             None => HostAnswer::Gone,
         };
         match answer {
-            HostAnswer::Panic(text) => std::panic::panic_any(text),
+            HostAnswer::Panic(payload) => std::panic::resume_unwind(payload),
             answer => answer,
         }
     }

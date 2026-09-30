@@ -244,7 +244,9 @@ pub fn new_content_mapped_parse_cache(
     new_ref_count_cache(
         options,
         |_: &ContentMappedParseCacheKey, (): ()| -> contentmapper::SourceFiles {
-            panic!("content-mapped source files must be produced with AcquireOrError")
+            crate::core::go_panic(
+                "content-mapped source files must be produced with AcquireOrError".to_string(),
+            )
         },
     )
 }
