@@ -355,6 +355,16 @@ impl<'a> Generator<'a> {
         writeln!(output).unwrap();
         writeln!(output, "impl SyntaxKind {{").unwrap();
         writeln!(output, "    pub const COUNT: usize = {};", self.kinds.len()).unwrap();
+        writeln!(
+            output,
+            "    /// Every kind, in value order: `ALL[kind as usize] == kind`."
+        )
+        .unwrap();
+        writeln!(output, "    pub const ALL: [Self; Self::COUNT] = [").unwrap();
+        for kind in &self.kinds {
+            writeln!(output, "        Self::{},", kind.rust_name).unwrap();
+        }
+        writeln!(output, "    ];").unwrap();
         for marker in &self.schema.kinds.markers {
             writeln!(
                 output,
@@ -422,22 +432,6 @@ impl<'a> Generator<'a> {
         writeln!(output, "impl TryFrom<u16> for SyntaxKind {{").unwrap();
         writeln!(output, "    type Error = (); ").unwrap();
         writeln!(output).unwrap();
-        writeln!(
-            output,
-            "    // PERF: always inline. The match compiles to a range check, but only"
-        )
-        .unwrap();
-        writeln!(
-            output,
-            "    // after the inliner ran: with `#[inline]` LLVM saw a 351-case switch and"
-        )
-        .unwrap();
-        writeln!(
-            output,
-            "    // left thousands of calls out of line (AST node records, step 4)."
-        )
-        .unwrap();
-        writeln!(output, "    #[inline(always)]").unwrap();
         writeln!(output, "    #[allow(clippy::too_many_lines)]").unwrap();
         writeln!(
             output,

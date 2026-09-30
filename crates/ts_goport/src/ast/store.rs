@@ -481,10 +481,8 @@ impl SlotChildren {
 // PORT: AST node records, step 4: `kind` is an atomic, as the other words
 // are, so a pooled block (`BlockPool`) can take the records of another file
 // through a shared borrow, with no `unsafe`. The kind of a slot never
-// changes after the slot is made (`replace_store_node_data` keeps it).
-// PERF: `SyntaxKind::try_from` is `#[inline(always)]`; its match of the
-// 351 kinds compiles to a range check (`cmp; cmov`), with no table and no
-// branch.
+// changes after the slot is made (`replace_store_node_data` keeps it). A
+// read converts it with a table (`KIND_OF_RAW`).
 #[repr(C)]
 #[derive(Debug)]
 pub struct NodeRecord {
@@ -499,6 +497,25 @@ pub struct NodeRecord {
 const _: () = assert!(std::mem::size_of::<NodeRecord>() == 32);
 // `NodeRecord::kind`: every raw kind below `COUNT` is a kind.
 const _: () = assert!(SyntaxKind::NotEmittedTypeElement as usize + 1 == SyntaxKind::COUNT);
+
+/// AST node records, step 4: the `SyntaxKind` of each 9-bit raw record kind
+/// (`NodeRecord::kind`): `SyntaxKind::ALL`, then `Unknown`.
+// PERF: a read masks the raw kind and loads the entry: two instructions and
+// no bounds check. `SyntaxKind::try_from` (a match of the 351 kinds) is a
+// range check only after LLVM's late simplification. Before it the inliner
+// saw a 351-case switch: with `#[inline]` about 3,900 `try_from` calls
+// stayed out of line, and with `#[inline(always)]` `frozen_store_kind` did
+// at about 7,700 call sites (`goport -p` +3% to +7.6% instructions).
+static KIND_OF_RAW: [SyntaxKind; 512] = {
+    let mut kinds = [SyntaxKind::Unknown; 512];
+    let mut raw = 0;
+    while raw < SyntaxKind::COUNT {
+        assert!(SyntaxKind::ALL[raw] as usize == raw);
+        kinds[raw] = SyntaxKind::ALL[raw];
+        raw += 1;
+    }
+    kinds
+};
 
 /// AST node records, step 2: the low half of `NodeRecord::up` of a node
 /// slot. 0 is a nil parent. `1..FOREIGN_PARENT` is a parent in the same
@@ -584,9 +601,9 @@ impl NodeRecord {
 
     #[inline]
     fn kind(&self) -> SyntaxKind {
-        let raw = self.kind.load(Ordering::Relaxed);
-        debug_assert!(usize::from(raw) < SyntaxKind::COUNT, "record kind {raw}");
-        SyntaxKind::try_from(raw).unwrap_or(SyntaxKind::Unknown)
+        let raw = usize::from(self.kind.load(Ordering::Relaxed));
+        debug_assert!(raw < SyntaxKind::COUNT, "record kind {raw}");
+        KIND_OF_RAW[raw & (KIND_OF_RAW.len() - 1)]
     }
 
     #[inline]

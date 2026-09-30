@@ -299,11 +299,12 @@ methods reach the AST through it.
   (`NodeBindBuilder`) to the install; a lib bind snapshot load hands the
   compact form (`NodeBindParts`), which the lib bind blob keeps.
   The kind is an `AtomicU16` too (step 4), so a pooled block can take
-  another file's records through a shared ref with no `unsafe`; the
-  generated `SyntaxKind::try_from` is `#[inline(always)]` and compiles to
-  a range check (with `#[inline]` LLVM left its 351-case switch out of
-  line at about 3,900 call sites, and `goport -p` ran 3% to 6% more
-  instructions). A new per-slot field of the hot reads goes into a record or kids
+  another file's records through a shared ref with no `unsafe`; a read
+  converts it with a 512-entry table (`KIND_OF_RAW`, from the generated
+  `SyntaxKind::ALL`). `SyntaxKind::try_from` is a 351-case switch until
+  late in LLVM's pipeline, so the inliner left it (with `#[inline]`) or
+  `frozen_store_kind` (with `#[inline(always)]`) out of line at thousands
+  of call sites, and `goport -p` ran 3% to 7.6% more instructions. A new per-slot field of the hot reads goes into a record or kids
   word, not a new column. Debug builds check the records and kids against
   the node data at freeze (`debug_check_kids`), and each parent write
   against its stored form.
