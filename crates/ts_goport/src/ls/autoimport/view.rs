@@ -197,9 +197,9 @@ impl View {
         // plus packages that are directly imported by the project's program files.
         // If no package.json is found, allowedPackages remains nil and all packages are allowed.
         let mut allowed_packages: Option<FxHashSet<String>> = None;
-        tspath::for_each_ancestor_directory_path(
-            &importing_file_path.get_directory_path(),
-            |dir_path: tspath::Path| -> ((), bool) {
+        importing_file_path
+            .get_directory_path()
+            .for_each_ancestor_directory(|dir_path: tspath::Path| -> ((), bool) {
                 if let Some(dir) = self.registry.directories.get(&dir_path) {
                     let dir = dir.borrow();
                     if let Some(pj) = dir.package_json.as_ref().filter(|pj| pj.exists())
@@ -216,8 +216,7 @@ impl View {
                     }
                 }
                 ((), false)
-            },
-        );
+            });
         // If we found at least one package.json, also include packages directly imported by the project
         if let Some(allowed) = &allowed_packages {
             if let Some(bucket) = self.registry.projects.get(&self.project_id) {
@@ -231,9 +230,9 @@ impl View {
         }
 
         let mut exclude_packages: FxHashSet<String> = FxHashSet::default();
-        tspath::for_each_ancestor_directory_path(
-            &importing_file_path.get_directory_path(),
-            |dir_path: tspath::Path| -> ((), bool) {
+        importing_file_path
+            .get_directory_path()
+            .for_each_ancestor_directory(|dir_path: tspath::Path| -> ((), bool) {
                 if let Some(node_modules_bucket) = self.registry.node_modules.get(&dir_path) {
                     let exports = search_fn(&**node_modules_bucket);
                     results.reserve(exports.len());
@@ -260,8 +259,7 @@ impl View {
                     }
                 }
                 ((), false)
-            },
-        );
+            });
         results
     }
 }

@@ -1300,9 +1300,9 @@ impl RegistryBuilder {
 
         // --- Collect node_modules tasks ---
         let mut node_modules_tasks: Vec<NodeModulesBucketTask> = Vec::new();
-        tspath::for_each_ancestor_directory_path(
-            &change.requested_file,
-            |dir_path: tspath::Path| -> ((), bool) {
+        change
+            .requested_file
+            .for_each_ancestor_directory(|dir_path: tspath::Path| -> ((), bool) {
                 if let (Some(node_modules_bucket), true) = self.node_modules.get(&dir_path) {
                     let dir_name = self
                         .directories
@@ -1368,8 +1368,7 @@ impl RegistryBuilder {
                     }
                 }
                 ((), false)
-            },
-        );
+            });
 
         let mut node_modules_logger: Option<Rc<logging::LogTree>> = None;
         if logger.is_some() && !node_modules_tasks.is_empty() {
@@ -1821,7 +1820,7 @@ pub fn has_symlink_to_node_modules(
     // Fall back to checking ancestor directories
     let directories_by_realpath = symlink_cache.directories_by_realpath();
     let mut found = false;
-    tspath::for_each_ancestor_directory_path(file_path, |dir_path: tspath::Path| -> ((), bool) {
+    file_path.for_each_ancestor_directory(|dir_path: tspath::Path| -> ((), bool) {
         let Some(symlink_paths) =
             directories_by_realpath.get(&dir_path.ensure_trailing_directory_separator())
         else {
@@ -2830,24 +2829,25 @@ impl RegistryBuilder {
         &self,
         file_path: &tspath::Path,
     ) -> Option<Rc<RefCell<Directory>>> {
-        tspath::for_each_ancestor_directory_path(
-            &file_path.get_directory_path(),
-            |dir_path: tspath::Path| -> (Option<Rc<RefCell<Directory>>>, bool) {
-                if let (Some(dir_entry), true) = self.directories.get(&dir_path) {
-                    let value = dir_entry.value().expect(NIL_DEREF);
-                    if value
-                        .borrow()
-                        .package_json
-                        .as_ref()
-                        .is_some_and(|p| p.exists())
-                    {
-                        return (Some(value), true);
+        file_path
+            .get_directory_path()
+            .for_each_ancestor_directory(
+                |dir_path: tspath::Path| -> (Option<Rc<RefCell<Directory>>>, bool) {
+                    if let (Some(dir_entry), true) = self.directories.get(&dir_path) {
+                        let value = dir_entry.value().expect(NIL_DEREF);
+                        if value
+                            .borrow()
+                            .package_json
+                            .as_ref()
+                            .is_some_and(|p| p.exists())
+                        {
+                            return (Some(value), true);
+                        }
                     }
-                }
-                (None, false)
-            },
-        )
-        .0
+                    (None, false)
+                },
+            )
+            .0
     }
 
     // Go: ls/autoimport/registry.go:1819 resolveAmbientModuleName
@@ -2856,9 +2856,8 @@ impl RegistryBuilder {
         module_name: &str,
         from_path: &tspath::Path,
     ) -> Vec<String> {
-        tspath::for_each_ancestor_directory_path(
-            from_path,
-            |dir_path: tspath::Path| -> (Vec<String>, bool) {
+        from_path
+            .for_each_ancestor_directory(|dir_path: tspath::Path| -> (Vec<String>, bool) {
                 if let (Some(bucket), true) = self.node_modules.get(&dir_path) {
                     if let Some(file_names) = bucket
                         .value()
@@ -2870,8 +2869,7 @@ impl RegistryBuilder {
                     }
                 }
                 (Vec::new(), false)
-            },
-        )
-        .0
+            })
+            .0
     }
 }
