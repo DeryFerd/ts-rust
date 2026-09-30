@@ -455,7 +455,7 @@ pub fn new_tsconfig_source_file_from_file_path(
             path: config_path,
             ..Default::default()
         },
-        Box::leak(config_source_text.to_string().into_boxed_str()),
+        FileText::Static(Box::leak(config_source_text.to_string().into_boxed_str())),
         ScriptKind::JSON,
     ));
     crate::program::note_parsed_source_file(&source_file);
@@ -1194,7 +1194,7 @@ pub fn parse_config_file_text_to_json(
             path,
             ..Default::default()
         },
-        Box::leak(json_text.to_string().into_boxed_str()),
+        FileText::Static(Box::leak(json_text.to_string().into_boxed_str())),
         ScriptKind::JSON,
     )
     .root;

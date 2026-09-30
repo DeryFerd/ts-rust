@@ -22,8 +22,13 @@ pub struct ParsedSourceFile {
 
     // Fields set by NewSourceFile
     pub parse_options: SourceFileParseOptions,
-    pub text: &'static str,
+    /// The file text, shared with the store of the file (`FileText`).
+    pub text: FileText,
     pub end_of_file_token: Node,
+    /// Go `SourceFile.Hash`: set by the language server parse caches
+    /// (project/parsecache.go, compilerhost.go), else `None`. Read it with
+    /// `source_hash`.
+    pub hash: std::cell::Cell<Option<u128>>,
 
     // Fields set by parser
     pub diagnostics: Vec<Diagnostic>,
@@ -70,7 +75,7 @@ impl ParsedSourceFile {
         store: usize,
         root: Node,
         parse_options: SourceFileParseOptions,
-        text: &'static str,
+        text: FileText,
         end_of_file_token: Node,
     ) -> Self {
         Self {
@@ -79,6 +84,7 @@ impl ParsedSourceFile {
             parse_options,
             text,
             end_of_file_token,
+            hash: std::cell::Cell::new(None),
             diagnostics: Vec::new(),
             js_diagnostics: Vec::new(),
             jsdoc_diagnostics: Vec::new(),
@@ -145,8 +151,18 @@ impl ParsedSourceFile {
 
     // Go: ast/ast.go:2566 Text
     #[must_use]
-    pub fn text(&self) -> &'static str {
-        self.text
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Go `file.Hash` where the language server reads it: the hash that a
+    /// parse cache set (`hash`), else the xxh3-128 of the text, which is Go
+    /// `fh.Hash()` for a file that the parse cache made.
+    #[must_use]
+    pub fn source_hash(&self) -> u128 {
+        self.hash
+            .get()
+            .unwrap_or_else(|| xxhash_rust::xxh3::xxh3_128(self.text.as_bytes()))
     }
 
     // Go: ast/ast.go:2570 FileName
@@ -189,7 +205,7 @@ impl ParsedSourceFile {
     pub fn original_text(&self) -> &str {
         match source_file_content_mapper_info(self.root) {
             Some(info) if !info.content_mapper.is_empty() => &info.original_text,
-            _ => self.text,
+            _ => &self.text,
         }
     }
 

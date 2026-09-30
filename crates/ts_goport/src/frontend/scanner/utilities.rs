@@ -22,7 +22,7 @@ pub fn get_source_text_of_node_from_source_file(
     node: Node,
     include_trivia: bool,
 ) -> String {
-    get_text_of_node_from_source_text(source_file_text(source_file), node, include_trivia)
+    get_text_of_node_from_source_text(&source_file_text(source_file), node, include_trivia)
 }
 
 // Go: scanner/utilities.go:26 isJSDocTypeExpressionOrChild

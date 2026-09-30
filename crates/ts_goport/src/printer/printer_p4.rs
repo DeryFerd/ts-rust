@@ -1204,7 +1204,7 @@ impl Printer {
         if node_is_synthesized(node) {
             return;
         }
-        let shebang = get_shebang(source_file_text(node));
+        let shebang = get_shebang(&source_file_text(node));
         if !shebang.is_empty() {
             self.write_comment(&shebang);
             self.write_line();

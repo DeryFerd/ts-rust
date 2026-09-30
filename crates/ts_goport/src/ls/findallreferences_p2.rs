@@ -574,7 +574,8 @@ pub fn get_possible_symbol_reference_positions(
         return positions;
     }
 
-    let text = source_file_text(source_file).as_bytes();
+    let text_text = source_file_text(source_file);
+    let text = text_text.as_bytes();
     let source_length = text.len() as i32;
     let symbol_name = symbol_name.as_bytes();
     let symbol_name_length = symbol_name.len() as i32;

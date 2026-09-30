@@ -104,13 +104,13 @@ impl lsconv::Script for Script {
     }
 
     // Go: ls/source_map.go:76 Text
-    fn text(&self) -> &str {
-        &self.text
+    fn text(&self) -> lsconv::ScriptText<'_> {
+        lsconv::ScriptText::Borrowed(&self.text)
     }
 
     // Go: ls/source_map.go:80 OriginalText
-    fn original_text(&self) -> &str {
-        &self.text
+    fn original_text(&self) -> lsconv::ScriptText<'_> {
+        lsconv::ScriptText::Borrowed(&self.text)
     }
 
     // Go: ls/source_map.go:81 SpanMap
@@ -130,11 +130,13 @@ impl lsconv::Script for Option<Script> {
             .file_name
     }
 
-    fn text(&self) -> &str {
-        &self
-            .as_ref()
-            .unwrap_or_else(|| crate::core::go_nil_dereference())
-            .text
+    fn text(&self) -> lsconv::ScriptText<'_> {
+        lsconv::ScriptText::Borrowed(
+            &self
+                .as_ref()
+                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                .text,
+        )
     }
 }
 

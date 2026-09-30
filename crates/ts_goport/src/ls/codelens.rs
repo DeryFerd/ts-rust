@@ -305,7 +305,7 @@ impl LanguageService {
         if node_name.is_some() {
             node_for_range = node_name;
         }
-        let pos = skip_trivia(source_file_text(file), node_for_range.pos());
+        let pos = skip_trivia(&source_file_text(file), node_for_range.pos());
         let (lsp_range, fidelity) = self.converters.to_lsp_range_for_feature(
             &file,
             TextRange::new(pos, node.end()),

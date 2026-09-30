@@ -38,8 +38,8 @@ pub struct TokenInfo {
 // Go: format/scanner.go:30 formattingScanner
 // PORT: Go `s *scanner.Scanner` is owned here (the literal
 // frontend::scanner::Scanner port, which has the JSX rescans).
-pub struct FormattingScanner {
-    pub s: Scanner,
+pub struct FormattingScanner<'t> {
+    pub s: Scanner<'t>,
     pub start_pos: i32,
     pub end_pos: i32,
     pub saved_pos: i32,
@@ -55,12 +55,12 @@ pub struct FormattingScanner {
 // PORT: Go passes `*formatSpanWorker` and the worker keeps a pointer to the
 // formatting scanner. Here the worker is moved in, `execute` moves the
 // formatting scanner into the worker, and the worker's edits are returned.
-pub fn new_formatting_scanner(
-    text: &'static str,
+pub fn new_formatting_scanner<'t>(
+    text: &'t str,
     language_variant: LanguageVariant,
     start_pos: i32,
     end_pos: i32,
-    mut worker: FormatSpanWorker,
+    mut worker: FormatSpanWorker<'t>,
 ) -> Vec<TextChange> {
     let mut scan = new_scanner();
     scan.set_skip_trivia(false);
@@ -91,7 +91,7 @@ pub fn new_formatting_scanner(
     res
 }
 
-impl FormattingScanner {
+impl<'t> FormattingScanner<'t> {
     // Go: format/scanner.go:65 advance
     pub fn advance(&mut self) {
         self.has_last_token_info = false;
@@ -181,7 +181,7 @@ fn is_leftmost_jsx_tag_name(node: Node) -> bool {
     .is_some()
 }
 
-impl FormattingScanner {
+impl<'t> FormattingScanner<'t> {
     // Go: format/scanner.go:126 shouldRescanJsxText
     pub fn should_rescan_jsx_text(&self, node: Node) -> bool {
         if is_jsx_text(node) {
@@ -236,7 +236,7 @@ pub fn fix_token_kind(mut token_info: TokenInfo, container: Node) -> TokenInfo {
     token_info
 }
 
-impl FormattingScanner {
+impl<'t> FormattingScanner<'t> {
     // Go: format/scanner.go:173 readTokenInfo
     // PORT: Go returns the struct by value (the trivia slices are shared);
     // this returns a clone.

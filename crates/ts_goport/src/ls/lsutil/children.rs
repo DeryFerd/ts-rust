@@ -18,7 +18,9 @@ pub fn get_last_child(node: Node, source_file: Node) -> Node {
         node.pos()
     };
     let mut last_token = Node::NIL;
-    let mut scanner = scanner_ls::get_scanner_for_source_file(source_file, token_start_pos);
+    let sf_text = source_file_text(source_file);
+    let mut scanner =
+        scanner_ls::get_scanner_for_source_file(source_file, &sf_text, token_start_pos);
     let mut start_pos = token_start_pos;
     while start_pos < node.end() {
         let token_kind = scanner.token();
@@ -121,7 +123,8 @@ pub fn get_first_token(node: Node, source_file: Node) -> Node {
     } else {
         node.end()
     };
-    let scanner = scanner_ls::get_scanner_for_source_file(source_file, node.pos());
+    let sf_text = source_file_text(source_file);
+    let scanner = scanner_ls::get_scanner_for_source_file(source_file, &sf_text, node.pos());
     let mut first_token = Node::NIL;
     if node.pos() < token_end_position {
         let token_kind = scanner.token();

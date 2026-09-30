@@ -8,7 +8,7 @@ use crate::frontend::prelude::*;
 // `&mut self` call as an argument to another `&mut self` call, so each such
 // argument is moved into a local first, in the Go order.
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: parser.go:4184 parseYieldExpression
     pub fn parse_yield_expression(&mut self) -> Node {
         let pos = self.node_pos();
@@ -154,7 +154,7 @@ impl Parser {
             }
             // JSX overrides
             if self.language_variant == LanguageVariant::JSX {
-                let is_arrow_function_in_jsx = self.look_ahead(|p: &mut Parser| {
+                let is_arrow_function_in_jsx = self.look_ahead(|p: &mut Parser<'a>| {
                     p.parse_optional(SyntaxKind::ConstKeyword);
                     let third = p.next_token();
                     if third == SyntaxKind::ExtendsKeyword {

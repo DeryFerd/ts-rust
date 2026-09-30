@@ -127,7 +127,7 @@ fn may_have_js_doc_parameter_tag(node: Node) -> bool {
             if pos < 0 {
                 return true;
             }
-            let end = skip_trivia(text, pos);
+            let end = skip_trivia(&text, pos);
             let Some(range) = text.as_bytes().get(pos as usize..end as usize) else {
                 return true;
             };

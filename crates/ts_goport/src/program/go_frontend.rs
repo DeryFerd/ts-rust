@@ -127,10 +127,12 @@ impl ProjectReferenceCopies {
     }
 }
 
-/// What `parse_js_doc_for_node` needs from a parsed file.
+/// What `parse_js_doc_for_node` needs from a parsed file. It shares the
+/// file text (`FileText`), so it keeps the text of a freeable file version
+/// while it lives.
 struct LazyJsDocInput {
     parse_options: SourceFileParseOptions,
-    text: &'static str,
+    text: FileText,
     script_kind: ScriptKind,
 }
 
@@ -220,7 +222,7 @@ pub(super) fn update_program_version(
     let old_np = FRONTENDS
         .with(|frontends| frontends.borrow().get(&old.id).cloned())
         .expect("the old program version has no frontend on this thread");
-    let cwd = state_of(old).cwd.clone();
+    let cwd = state_of(old).cwd.to_string();
     // A new version parses with no current program, like the first load.
     let _scope = crate::core::enter_program(None);
     // PORT: Go watch gives `UpdateProgram` a host whose cache no longer has
@@ -340,7 +342,7 @@ fn parse_lazy_js_doc(input: &LazyJsDocInput, node: Node) -> &'static [Node] {
     let jsdocs: &'static [Node] = Box::leak(
         crate::frontend::parser::parse_js_doc_for_node(
             &input.parse_options,
-            input.text,
+            &input.text,
             input.script_kind,
             node,
         )
@@ -371,7 +373,7 @@ pub(super) fn resolve_js_doc_outside_program(file: Node, node: Node) -> Option<&
                     .filter(|parsed| parsed.store == store)?;
                 Some(Arc::new(LazyJsDocInput {
                     parse_options: parsed.parse_options.clone(),
-                    text: parsed.text,
+                    text: parsed.text.clone(),
                     script_kind: parsed.script_kind,
                 }))
             })
@@ -411,7 +413,7 @@ fn go_files_of_unpublished_stores(
         {
             let input = Arc::new(LazyJsDocInput {
                 parse_options: file.parse_options.clone(),
-                text: file.text,
+                text: file.text.clone(),
                 script_kind: file.script_kind,
             });
             OUTSIDE_PARSE_INPUTS.with(|inputs| inputs.borrow_mut().insert(store, input));
@@ -596,7 +598,7 @@ fn build_program(
     previous: Option<&'static GoProgram>,
 ) -> &'static GoProgram {
     let use_case_sensitive_file_names = osvfs_fs().use_case_sensitive_file_names();
-    let options = np.options().clone();
+    let options = crate::program::intern_compiler_options(np.options());
 
     // PERF: the publish keeps the parse of each new file, so each
     // `SourceFileInfo` can borrow its fields instead of copying them
@@ -664,7 +666,6 @@ fn build_program(
     }
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
         id,
-        source_file_order,
         options,
         state: OnceLock::new(),
     }));
@@ -707,16 +708,15 @@ fn build_program(
             .values()
             .filter_map(|file| file.version.get().cloned())
             .collect(),
-        ..VersionTables::new(file_by_path)
+        ..VersionTables::new(source_file_order, file_by_path)
     };
-    let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
-        cwd,
+    let program_state = ProgramState {
+        cwd: intern_program_str(&cwd),
         use_case_sensitive_file_names,
-        resolved_modules: OnceLock::new(),
-        common_source_directory: OnceLock::from(common_source_directory_of(np)),
+        common_source_directory: Some(intern_program_str(&common_source_directory_of(np))),
         alias_resolver: false,
         tables: TablesSlot::new(tables, one_program),
-    }));
+    };
     assert!(program.state.set(program_state).is_ok());
     program
 }
@@ -997,7 +997,7 @@ impl GoSharedState {
                     || {
                         Arc::new(LazyJsDocInput {
                             parse_options: file.parse_options.clone(),
-                            text: file.text,
+                            text: file.text.clone(),
                             script_kind: file.script_kind,
                         })
                     },

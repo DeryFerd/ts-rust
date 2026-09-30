@@ -789,7 +789,7 @@ impl LanguageService {
                     let end = position as usize;
                     let mut pos = line_start as usize;
                     while pos < end {
-                        let (mut r, mut size) = utf8_decode_rune_in_string(text, pos);
+                        let (mut r, mut size) = utf8_decode_rune_in_string(&text, pos);
                         if pos + size as usize > end {
                             r = RUNE_ERROR;
                             size = 1;

@@ -16,7 +16,7 @@ use smallvec::SmallVec;
 // PORT: Go reads `p.diagnostics` directly. The parser and the scanner share
 // the diagnostics through `Rc<RefCell<ParseDiagnostics>>` (contract 4.5).
 // These two helpers are the only places in this file that touch that store.
-fn diagnostics_len(p: &Parser) -> usize {
+fn diagnostics_len(p: &Parser<'_>) -> usize {
     p.diagnostics.borrow().diagnostics.len()
 }
 
@@ -32,7 +32,7 @@ fn diagnostics_len(p: &Parser) -> usize {
 //
 // Both copies call this helper. Go changes the diagnostic through its pointer;
 // Rust changes the stored diagnostic in place.
-fn add_related_brace_info_to_last_diagnostic(p: &Parser, open_brace_position: i32) {
+fn add_related_brace_info_to_last_diagnostic(p: &Parser<'_>, open_brace_position: i32) {
     let mut sink = p.diagnostics.borrow_mut();
     if let Some(last_diagnostic) = sink.diagnostics.last_mut() {
         if last_diagnostic.code == diag::X_0_expected.code() as i32 {
@@ -47,7 +47,7 @@ fn add_related_brace_info_to_last_diagnostic(p: &Parser, open_brace_position: i3
     }
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: parser/parser.go:2827 parseKeywordTypeNode
     pub fn parse_keyword_type_node(&mut self) -> Node {
         let pos = self.node_pos();
@@ -705,7 +705,7 @@ impl Parser {
             flags.intersects(ParseFlags::AWAIT),
         );
         let parameters =
-            self.parse_delimited_list(ParsingContext::Parameters, &mut |p: &mut Parser| {
+            self.parse_delimited_list(ParsingContext::Parameters, &mut |p: &mut Parser<'a>| {
                 let parameter = p.parse_parameter_ex(in_await_context, allow_ambiguity);
                 if parameter.is_some() && !flags.intersects(ParseFlags::TYPE) {
                     p.check_js_syntax(parameter);
@@ -1369,7 +1369,7 @@ impl Parser {
     pub fn parse_function_or_constructor_type_to_error(
         &mut self,
         is_in_union_type: bool,
-        parse_constituent_type: impl FnOnce(&mut Parser) -> Node,
+        parse_constituent_type: impl FnOnce(&mut Parser<'a>) -> Node,
     ) -> Node {
         // the function type and constructor type shorthand notation
         // are not allowed directly in unions and intersections, but we'll

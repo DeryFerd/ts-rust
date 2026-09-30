@@ -736,7 +736,7 @@ impl Tracker {
                 let next_node = containing_nodes.get((index + 1) as usize);
                 let text = source_file_text(source_file);
                 let start_pos = skip_trivia_ex(
-                    text,
+                    &text,
                     next_node.pos(),
                     Some(&SkipTriviaOptions {
                         stop_after_line_break: false,
@@ -800,7 +800,7 @@ impl Tracker {
             );
             multiline_list = after_minus_one_start_line_position != after_start_line_position;
         }
-        if has_comments_before_line_break(source_file_text(source_file), after.end())
+        if has_comments_before_line_break(&source_file_text(source_file), after.end())
             || !positions_are_on_same_line(
                 containing_list.pos(),
                 containing_list.end(),
@@ -836,7 +836,7 @@ impl Tracker {
             // insert element before the line break on the line that contains 'after' element
             let text = source_file_text(source_file);
             let mut insert_pos = skip_trivia_ex(
-                text,
+                &text,
                 end,
                 Some(&SkipTriviaOptions {
                     stop_after_line_break: true,
@@ -1000,7 +1000,7 @@ impl Tracker {
         }
         i32::max(
             find_indentation_column(
-                source_file_text(source_file),
+                &source_file_text(source_file),
                 line_start,
                 node_start,
                 tab_size,
@@ -1036,7 +1036,7 @@ impl Tracker {
             let member_start = astnav::get_start_of_node(member, source_file, false);
             let line_start =
                 format::get_line_start_position_for_position(member_start, source_file);
-            let column = find_indentation_column(text, line_start, member_start, tab_size);
+            let column = find_indentation_column(&text, line_start, member_start, tab_size);
             if column < 0 {
                 return -1;
             }

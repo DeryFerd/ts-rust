@@ -629,7 +629,7 @@ impl Checker {
         if error_type.is_some() {
             let source_file = get_source_file_of_node(node);
             let loc = TextRange::new(
-                skip_trivia(source_file_text(source_file), type_arguments.pos()),
+                skip_trivia(&source_file_text(source_file), type_arguments.pos()),
                 type_arguments.end(),
             );
             let type_string = self.type_to_string_exported(error_type);

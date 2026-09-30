@@ -170,11 +170,12 @@ pub fn prepare_range_contains_error_function(
 
 // Go: format/span.go:154 formatSpanWorker
 // PORT: Go keeps the NodeVisitor built in `execute` in `w.visitor`. The Rust
-// visitor holds `&mut FormatSpanWorker` as its ctx, so it cannot live in the
+// visitor holds `&mut FormatSpanWorker<'t>` as its ctx, so it cannot live in the
 // worker; `execute_process_node_visitor` builds one per call with the same
 // callbacks (`new_format_span_visitor`). The worker owns the formatting
-// scanner (see `new_formatting_scanner`).
-pub struct FormatSpanWorker {
+// scanner (see `new_formatting_scanner`), which borrows the file text
+// (`'t`).
+pub struct FormatSpanWorker<'t> {
     pub original_range: TextRange,
     pub enclosing_node: Node,
     pub initial_indentation: i32,
@@ -185,7 +186,7 @@ pub struct FormatSpanWorker {
 
     pub ctx: Context,
 
-    pub formatting_scanner: Option<FormattingScanner>,
+    pub formatting_scanner: Option<FormattingScanner<'t>>,
     pub formatting_context: Option<FormattingContext>,
 
     pub edits: Vec<TextChange>,
@@ -209,7 +210,7 @@ pub struct FormatSpanWorker {
 // Go: format/span.go:187 newFormatSpanWorker
 // PORT: `range_contains_error` is 'static: every caller passes a closure over
 // the file's parse diagnostics (`&'static`) or none.
-pub fn new_format_span_worker(
+pub fn new_format_span_worker<'t>(
     ctx: &Context,
     original_range: TextRange,
     enclosing_node: Node,
@@ -218,7 +219,7 @@ pub fn new_format_span_worker(
     request_kind: FormatRequestKind,
     range_contains_error: Box<dyn FnMut(TextRange) -> bool>,
     source_file: Node,
-) -> FormatSpanWorker {
+) -> FormatSpanWorker<'t> {
     FormatSpanWorker {
         ctx: ctx.clone(),
         original_range,
@@ -263,19 +264,21 @@ pub fn get_non_decorator_token_pos_of_node(node: Node, mut file: Node) -> i32 {
     if last_decorator.is_nil() {
         return with_token_start(node, file).pos();
     }
-    skip_trivia(source_file_text(file), last_decorator.end())
+    skip_trivia(&source_file_text(file), last_decorator.end())
 }
 
 /// Go `w.visitor` (built in `execute`).
-pub type FormatSpanVisitor<'a> = NodeVisitor<'a, &'a mut FormatSpanWorker>;
+pub type FormatSpanVisitor<'a, 't> = NodeVisitor<'a, &'a mut FormatSpanWorker<'t>>;
 
 // Go: format/span.go:231 (the visitor built in execute)
 // PORT: see `FormatSpanWorker`. Go passes `&ast.NodeFactory{}`; `None` is the
 // visitor's own default factory.
-pub fn new_format_span_visitor<'a>(w: &'a mut FormatSpanWorker) -> FormatSpanVisitor<'a> {
-    let hooks: NodeVisitorHooks<'a, &'a mut FormatSpanWorker> = NodeVisitorHooks {
+pub fn new_format_span_visitor<'a, 't>(
+    w: &'a mut FormatSpanWorker<'t>,
+) -> FormatSpanVisitor<'a, 't> {
+    let hooks: NodeVisitorHooks<'a, &'a mut FormatSpanWorker<'t>> = NodeVisitorHooks {
         visit_nodes: Some(Rc::new(
-            |nodes: NodeList, v: &mut FormatSpanVisitor<'a>| -> NodeList {
+            |nodes: NodeList, v: &mut FormatSpanVisitor<'a, 't>| -> NodeList {
                 if nodes.is_nil() {
                     return nodes;
                 }
@@ -300,7 +303,7 @@ pub fn new_format_span_visitor<'a>(w: &'a mut FormatSpanWorker) -> FormatSpanVis
         ..NodeVisitorHooks::default()
     };
     new_node_visitor(
-        |child: Node, v: &mut FormatSpanVisitor<'a>| -> Node {
+        |child: Node, v: &mut FormatSpanVisitor<'a, 't>| -> Node {
             if child.is_nil() {
                 return child;
             }
@@ -331,9 +334,9 @@ pub fn new_format_span_visitor<'a>(w: &'a mut FormatSpanWorker) -> FormatSpanVis
     )
 }
 
-impl FormatSpanWorker {
+impl<'t> FormatSpanWorker<'t> {
     /// Go `w.formattingScanner` (set in `execute`).
-    pub fn formatting_scanner(&mut self) -> &mut FormattingScanner {
+    pub fn formatting_scanner(&mut self) -> &mut FormattingScanner<'t> {
         self.formatting_scanner
             .as_mut()
             .expect("nil formattingScanner")
@@ -349,7 +352,7 @@ impl FormatSpanWorker {
     }
 
     // Go: format/span.go:224 execute
-    pub fn execute(&mut self, s: FormattingScanner) -> Vec<TextChange> {
+    pub fn execute(&mut self, s: FormattingScanner<'t>) -> Vec<TextChange> {
         self.formatting_scanner = Some(s);
         self.indentation_on_last_indented_line = -1;
         self.last_indented_line = -1;
@@ -410,7 +413,7 @@ impl FormatSpanWorker {
                 &remaining_trivia,
                 indentation,
                 true,
-                &mut |w: &mut FormatSpanWorker, item: TextRangeWithKind| {
+                &mut |w: &mut FormatSpanWorker<'t>, item: TextRangeWithKind| {
                     let (start_line, start_char) =
                         get_ecma_line_and_byte_offset_of_position(w.source_file, item.loc.pos());
                     w.process_range(
@@ -1198,7 +1201,7 @@ go_enum!(LineAction, i32 {
     LINE_REMOVED = 2; // LineActionLineRemoved
 });
 
-impl FormatSpanWorker {
+impl<'t> FormatSpanWorker<'t> {
     // Go: format/span.go:752 processRange
     pub fn process_range(
         &mut self,
@@ -1346,7 +1349,7 @@ impl FormatSpanWorker {
             if whitespace_start != -1 {
                 if whitespace_start != line_start_position {
                     let (r, _) = utf8_decode_rune_in_string(
-                        source_file_text(self.source_file),
+                        &source_file_text(self.source_file),
                         (whitespace_start - 1) as usize,
                     );
                     debug_assert!(!is_white_space_single_line(rune_to_char(r)));
@@ -1365,7 +1368,7 @@ impl FormatSpanWorker {
         let mut pos = end;
         let text = source_file_text(self.source_file);
         while pos >= start {
-            let (ch, size) = utf8_decode_rune_in_string(text, pos as usize);
+            let (ch, size) = utf8_decode_rune_in_string(&text, pos as usize);
             if size == 0 {
                 pos -= 1; // multibyte character, rewind more
                 continue;
@@ -1394,7 +1397,7 @@ pub fn is_comment(kind: SyntaxKind) -> bool {
     kind == SyntaxKind::SingleLineCommentTrivia || kind == SyntaxKind::MultiLineCommentTrivia
 }
 
-impl FormatSpanWorker {
+impl<'t> FormatSpanWorker<'t> {
     // Go: format/span.go:868 insertIndentation
     pub fn insert_indentation(&mut self, pos: i32, indentation: i32, line_added: bool) {
         let indentation_string = get_indentation_string(indentation, self.options());
@@ -1422,7 +1425,8 @@ impl FormatSpanWorker {
     // Go: format/span.go:883 characterToColumn
     pub fn character_to_column(&self, start_line_position: i32, character_in_line: i32) -> i32 {
         let mut column = 0;
-        let text = source_file_text(self.source_file).as_bytes();
+        let text_text = source_file_text(self.source_file);
+        let text = text_text.as_bytes();
         for i in 0..character_in_line {
             if text[(start_line_position + i) as usize] == b'\t' {
                 if self.options().editor_settings.tab_size > 0 {
@@ -1442,7 +1446,8 @@ impl FormatSpanWorker {
         indentation_string: &str,
         start_line_position: i32,
     ) -> bool {
-        let text = source_file_text(self.source_file).as_bytes();
+        let text_text = source_file_text(self.source_file);
+        let text = text_text.as_bytes();
         let end = start_line_position as usize + indentation_string.len();
         if end > text.len() {
             return true;
@@ -1458,7 +1463,7 @@ impl FormatSpanWorker {
         trivia: &[TextRangeWithKind],
         comment_indentation: i32,
         mut indent_next_token_or_trivia: bool,
-        indent_single_line: &mut dyn FnMut(&mut FormatSpanWorker, TextRangeWithKind),
+        indent_single_line: &mut dyn FnMut(&mut FormatSpanWorker<'t>, TextRangeWithKind),
     ) -> bool {
         for &trivia_item in trivia {
             let trivia_in_range = trivia_item.loc.contained_by(self.original_range);
@@ -1618,7 +1623,7 @@ pub fn create_text_change_from_start_length(start: i32, length: i32, new_text: &
     }
 }
 
-impl FormatSpanWorker {
+impl<'t> FormatSpanWorker<'t> {
     // Go: format/span.go:1014 recordDelete
     pub fn record_delete(&mut self, start: i32, length: i32) {
         if length != 0 {
@@ -1767,7 +1772,7 @@ impl FormatSpanWorker {
                     &current_token_info.leading_trivia,
                     comment_indentation,
                     indent_next_token_or_trivia,
-                    &mut |w: &mut FormatSpanWorker, item: TextRangeWithKind| {
+                    &mut |w: &mut FormatSpanWorker<'t>, item: TextRangeWithKind| {
                         w.insert_indentation(item.loc.pos(), comment_indentation, false);
                     },
                 );
@@ -1970,7 +1975,7 @@ pub fn get_first_non_decorator_token_of_node(node: Node) -> SyntaxKind {
     SyntaxKind::Unknown
 }
 
-impl FormatSpanWorker {
+impl<'t> FormatSpanWorker<'t> {
     // Go: format/span.go:1243 getDynamicIndentation
     pub fn get_dynamic_indentation(
         &self,
