@@ -286,6 +286,12 @@ impl BuildHost {
         self.load_or_store_m_time(file, None, true)
     }
 
+    /// PORT: not in Go (perf). `get_m_time` of `file`, whose `toPath` is
+    /// `path`.
+    pub fn get_m_time_of_path(&self, file: &str, path: &Path) -> Option<SystemTime> {
+        self.load_or_store_m_time_of_path(file, path.clone(), None, true)
+    }
+
     // Go: build/host.go:98 (*host).SetMTime
     pub fn set_m_time(&self, file: &str, m_time: Option<SystemTime>) -> Result<(), FsError> {
         CompilerHost::fs(self).chtimes(file, None, m_time)
@@ -298,7 +304,18 @@ impl BuildHost {
         old_cache: Option<&FxHashMap<Path, Option<SystemTime>>>,
         store: bool,
     ) -> Option<SystemTime> {
-        let path = self.to_path(file);
+        self.load_or_store_m_time_of_path(file, self.to_path(file), old_cache, store)
+    }
+
+    // Go: build/host.go:102 (*host).loadOrStoreMTime, with
+    // `h.orchestrator.toPath(file)` computed by the caller.
+    fn load_or_store_m_time_of_path(
+        &self,
+        file: &str,
+        path: Path,
+        old_cache: Option<&FxHashMap<Path, Option<SystemTime>>>,
+        store: bool,
+    ) -> Option<SystemTime> {
         // PORT: Go `Load`, then `LoadOrStore` below. The lock is not held
         // while `get_m_time` reads the file system.
         let existing = self

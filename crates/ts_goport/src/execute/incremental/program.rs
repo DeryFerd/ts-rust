@@ -267,6 +267,14 @@ impl Program {
         self.program.expect("program")
     }
 
+    /// PORT: not in Go. Drops this program and returns its snapshot when
+    /// nothing else holds it, so the caller can free it elsewhere.
+    #[must_use]
+    pub fn into_snapshot(self) -> Option<Snapshot> {
+        let Program { snapshot, .. } = self;
+        Rc::try_unwrap(snapshot).ok().map(RefCell::into_inner)
+    }
+
     // Go: incremental/program.go:79 HasChangedDtsFile
     #[must_use]
     pub fn has_changed_dts_file(&self) -> bool {

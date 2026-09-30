@@ -936,8 +936,8 @@ impl Orchestrator {
 
     /// PORT: not in Go (perf). Starts reading the build info files that the
     /// up-to-date checks of the tasks at `paths` will read (see
-    /// `BuildInfoPrefetch`), on up to `num_routines` threads. None when
-    /// there is nothing to gain or the read could differ from the task's
+    /// `BuildInfoPrefetch`), on up to `MAX_BUILD_INFO_THREADS` threads. None
+    /// when there is nothing to gain or the read could differ from the task's
     /// own read: one routine (`--singleThreaded` or `--builders 1`: Go
     /// checks one task at a time), `--force` (no check reads the build
     /// info), a file system other than the OS one (tests), or fewer than
@@ -981,6 +981,7 @@ impl Orchestrator {
                     BuildInfoRead {
                         name,
                         input_files: resolved.file_names().to_vec(),
+                        check: StatusCheckOptions::new(resolved.compiler_options()),
                     },
                 ));
             }
@@ -992,13 +993,16 @@ impl Orchestrator {
         if reads.len() < 2 {
             return None;
         }
+        // The checks store about this many mtimes; the map grows once.
+        let inputs: usize = reads.iter().map(|read| read.input_files.len()).sum();
+        self.host
+            .m_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reserve(inputs);
         let m_times: MTimePrefetch = Arc::default();
-        let prefetch = BuildInfoPrefetch::start(
-            reads,
-            num_routines,
-            self.compare_paths_options.clone(),
-            m_times.clone(),
-        )?;
+        let prefetch =
+            BuildInfoPrefetch::start(reads, self.compare_paths_options.clone(), m_times.clone())?;
         *self.host.m_time_prefetch.borrow_mut() = Some(m_times);
         Some(prefetch)
     }
@@ -1134,6 +1138,10 @@ impl BuildTaskOrchestrator for Orchestrator {
         self.host.get_m_time(file)
     }
 
+    fn get_m_time_of_path(&self, file: &str, path: &Path) -> Option<SystemTime> {
+        self.host.get_m_time_of_path(file, path)
+    }
+
     fn set_m_time(&self, file: &str, m_time: SystemTime) -> Result<(), FsError> {
         self.host.set_m_time(file, Some(m_time))
     }
@@ -1195,16 +1203,20 @@ impl BuildTaskOrchestrator for Orchestrator {
 /// (`StatusPrefetch`), and the mtimes of the task's TypeScript sources
 /// that are not declaration files, the root files and the files of the
 /// build info (`MTimePrefetch`). No task of a build writes such a file, so
-/// the mtime is the one that the check would read later.
+/// the mtime is the one that the check would read later. When the build
+/// info shows that the check returns before these parts (errors, pending
+/// emit: `StatusCheckOptions::reads_input_times`), the thread skips them,
+/// as Go reads no input mtime there.
 struct BuildInfoPrefetch {
     slots: FxHashMap<String, Arc<BuildInfoSlot>>,
 }
 
-/// One build info file that the threads read, and the root files of its
-/// task (`resolved.FileNames()`).
+/// One build info file that the threads read, the root files of its task
+/// (`resolved.FileNames()`) and the options that its check reads.
 struct BuildInfoRead {
     name: String,
     input_files: Vec<String>,
+    check: StatusCheckOptions,
 }
 
 /// The mtimes that the build info threads read ahead of the checks, by
@@ -1235,16 +1247,17 @@ fn is_typescript_source(file_name: &str) -> bool {
     ) && !is_declaration_file_name(file_name)
 }
 
-/// The most threads that read build info files.
+/// The most threads that read build info files. The count is not Go's
+/// `numRoutines`: the threads only read, so their count changes no output,
+/// and a build info takes the port longer to parse than to check.
 const MAX_BUILD_INFO_THREADS: usize = 8;
 
 impl BuildInfoPrefetch {
     /// Starts the threads that read and parse the files of `reads`, in
-    /// order, at most `num_routines` (Go `numRoutines`), and put the
+    /// order, at most `MAX_BUILD_INFO_THREADS` and the cores, and put the
     /// mtimes they read into `m_times`. None when no thread starts.
     fn start(
         reads: Vec<BuildInfoRead>,
-        num_routines: usize,
         compare_paths_options: ComparePathsOptions,
         m_times: MTimePrefetch,
     ) -> Option<Self> {
@@ -1261,7 +1274,6 @@ impl BuildInfoPrefetch {
         ));
         let compare_paths_options = Arc::new(compare_paths_options);
         let threads = MAX_BUILD_INFO_THREADS
-            .min(num_routines)
             .min(crate::program::available_cores())
             .min(slots.len());
         let mut started = 0;
@@ -1287,16 +1299,21 @@ impl BuildInfoPrefetch {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let (data, ok) = fs.read_file(&read.name);
                             let build_info = if ok { parse_build_info(&data) } else { None };
-                            let status = build_info.as_ref().map(|build_info| {
-                                let status = StatusPrefetch::new(
-                                    build_info,
-                                    &read.name,
-                                    &read.input_files,
-                                    &compare_paths_options,
-                                );
-                                prefetch_m_times(&*fs, &read, &status, &m_times);
-                                status
-                            });
+                            // A check that returns before the input mtimes
+                            // reads neither the check parts nor the mtimes.
+                            let status = build_info
+                                .as_ref()
+                                .filter(|build_info| read.check.reads_input_times(build_info))
+                                .map(|build_info| {
+                                    let status = StatusPrefetch::new(
+                                        build_info,
+                                        &read.name,
+                                        &read.input_files,
+                                        &compare_paths_options,
+                                    );
+                                    prefetch_m_times(&*fs, &read, &status, &m_times);
+                                    status
+                                });
                             (build_info, status)
                         }));
                         *slot.result.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -1333,6 +1350,8 @@ impl BuildInfoPrefetch {
 /// Reads the mtimes of the TypeScript sources (`is_typescript_source`) of
 /// `read` (its root files and the files of its build info, `status`) into
 /// `m_times`, as `BuildHost::get_m_time` reads them (`incremental.GetMTime`).
+/// Each path is read once: the build info lists the root files too, and the
+/// check keeps the first mtime of a path.
 fn prefetch_m_times(
     fs: &dyn Fs,
     read: &BuildInfoRead,
@@ -1341,9 +1360,11 @@ fn prefetch_m_times(
 ) {
     let roots = read.input_files.iter().zip(&status.input_paths);
     let files = status.file_names.iter().map(|(file, path)| (file, path));
+    let mut seen: FxHashSet<&Path> =
+        FxHashSet::with_capacity_and_hasher(read.input_files.len(), Default::default());
     let read: Vec<(Path, Option<SystemTime>)> = roots
         .chain(files)
-        .filter(|(file, _)| is_typescript_source(file))
+        .filter(|(file, path)| is_typescript_source(file) && seen.insert(path))
         .map(|(file, path)| (path.clone(), fs.stat(file).and_then(|stat| stat.mod_time())))
         .collect();
     let mut m_times = m_times.lock().unwrap_or_else(PoisonError::into_inner);
