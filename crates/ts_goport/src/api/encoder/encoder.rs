@@ -322,17 +322,16 @@ struct Uint128 {
 }
 
 /// Go `sourceFile.Hash`.
-// PORT: ts_goport keeps no `SourceFile.Hash` field. At pin B only the two
-// project parse caches set Go `file.Hash`:
+// PORT: Go `SourceFile.Hash` is `ParsedSourceFile::hash`. At pin B only the
+// two project parse caches set it:
 // - project/parsecache.go NewParseCache sets `fh.Hash()`, the xxh3-128 of
 //   the file content, which is the parsed text.
 // - project/compilerhost.go GetContentMappedSourceFiles (tsgo#4712) sets
 //   the hash of the cache key on the canonical file and on each
 //   supplemental file of a content-mapped file.
-// The project parse cache keeps each value by file text
-// (`project::parsecache::source_file_hash`, which gives the xxh3-128 of the
-// text for a text it did not record). This reads it for a file of a
-// language server program, which the parse caches made. Any other parse
+// This reads it (`ParsedSourceFile::source_hash`, the xxh3-128 of the text
+// for a file that has none) for a file of a language server program, which
+// the parse caches made. Any other parse
 // (Go `parser.ParseSourceFile`, for example a tsconfig from
 // `tsoptions.NewTsconfigSourceFileFromFilePath`) keeps Go Hash 0. Such a
 // file is in no program, also when a publish kept its parse (the root
@@ -344,19 +343,17 @@ struct Uint128 {
 // api/session.go createSourceFile (ts#64434) takes its file from the
 // snapshot host's parse cache, so its Go `Hash` is `fh.Hash()`, and a
 // program that has the same file shares it (the client keeps one object per
-// content hash). Such a file keeps the hash that the parse cache recorded
-// for its text (`recorded_source_file_hash`); the root config has none.
+// content hash). Such a file keeps the hash that the parse cache set
+// (`ParsedSourceFile::hash`); the root config has none.
 fn source_file_content_hash(source_file: Node) -> Uint128 {
     if source_file.is_nil() || is_synthetic_node(source_file) {
         return Uint128::default();
     }
     let h = match crate::program::ls_program::program_parsed_source_file(source_file) {
-        Some(parsed) => crate::project::parsecache::source_file_hash(parsed.text),
+        Some(parsed) => parsed.source_hash(),
         None => {
-            let recorded = parsed_source_file_of(source_file).and_then(|parsed| {
-                crate::project::parsecache::recorded_source_file_hash(parsed.text)
-            });
-            let Some(h) = recorded else {
+            let Some(h) = parsed_source_file_of(source_file).and_then(|parsed| parsed.hash.get())
+            else {
                 return Uint128::default();
             };
             h
@@ -1120,11 +1117,11 @@ pub fn record_extended_data_source_file(
 ) {
     let sf = node;
     let fields = source_file_fields(sf);
-    let text_index = strs.add(source_file_text(sf), sf.kind(), sf.pos(), sf.end());
+    let text_index = strs.add(&source_file_text(sf), sf.kind(), sf.pos(), sf.end());
     let original_text = source_file_original_text(sf);
     let mut original_text_index = text_index;
     if original_text != source_file_text(sf) {
-        original_text_index = strs.add(original_text, SyntaxKind::Unknown, 0, 0);
+        original_text_index = strs.add(&original_text, SyntaxKind::Unknown, 0, 0);
     }
     let file_name_index = strs.add(source_file_file_name(sf), SyntaxKind::Unknown, 0, 0);
     let path_index = strs.add(fields.path(), SyntaxKind::Unknown, 0, 0);
@@ -1146,7 +1143,7 @@ pub fn record_extended_data_source_file(
     // is the same.
     let original_positions_cell: OnceCell<PositionMap> = OnceCell::new();
     let original_positions =
-        || original_positions_cell.get_or_init(|| compute_position_map(original_text));
+        || original_positions_cell.get_or_init(|| compute_position_map(&original_text));
     let mut span_map_offset = NO_STRUCTURED_DATA;
     if let Some(span_map) = source_file_span_map(sf) {
         span_map_offset = encode_span_map(

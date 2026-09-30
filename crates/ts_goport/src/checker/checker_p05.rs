@@ -498,7 +498,7 @@ impl Checker {
         self.check_expression(node.expression());
         let source_file = get_source_file_of_node(node);
         if !self.has_parse_diagnostics(source_file) {
-            let start = skip_trivia(source_file_text(source_file), node.pos());
+            let start = skip_trivia(&source_file_text(source_file), node.pos());
             let end = node.statement().pos();
             self.grammar_error_at_pos(
                 source_file,
@@ -1151,7 +1151,7 @@ impl Checker {
             let (has_signatures, members, properties) = {
                 let resolved = self.ty(t).as_structured_type();
                 (
-                    !resolved.signatures.is_empty(),
+                    !resolved.signatures().is_empty(),
                     resolved.members,
                     resolved.properties.clone(),
                 )

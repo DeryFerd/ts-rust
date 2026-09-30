@@ -1,6 +1,8 @@
 //! Port of typescript-go `internal/ast/utilities.go` lines 1-905.
 
 use crate::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 // Atomic ids
 
@@ -16,12 +18,160 @@ thread_local! {
     // Their nodes are not read again, and an id is never given twice: a
     // node of a dead version that has no id here panics (`get_node_id`).
     static NODE_IDS: RefCell<PerFileMap<u64>> = const { RefCell::new(PerFileMap::new()) };
-    // Dense: indexed by the lineage index of a binder symbol; 0 means no id
-    // yet (Go ids start at 1). Binder symbols only: every arena gives an
-    // index the same binder symbol (`SymbolArena::id_slot`, key 0).
-    static SYMBOL_IDS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    // By the lineage index of a binder symbol (`LineageIds`). Binder symbols
+    // only: every arena gives an index the same binder symbol
+    // (`SymbolArena::id_slot`, key 0).
+    static SYMBOL_IDS: RefCell<LineageIds> = const { RefCell::new(LineageIds::new()) };
     // The ids of the symbols that checker arenas add, by arena.
     static OWN_SYMBOL_IDS: RefCell<OwnSymbolIds> = const { RefCell::new(OwnSymbolIds::new()) };
+}
+
+/// The ids of the binder lineage symbols on one thread, by lineage index, in
+/// chunks of the symbol chunk size of `SymbolArena` (`LINEAGE_ID_CHUNK`);
+/// 0 means no id yet (Go ids start at 1). A chunk is made at the first id
+/// in it.
+///
+/// lsshells M3d: when `program::Lineage` frees the chunks of a dead file
+/// version (`free_lineage_symbol_ids`), each thread frees its id chunks of
+/// that range the next time it makes a chunk. Only a new chunk grows the
+/// table, so the table does not grow with edits. A later id read of a freed
+/// chunk panics, as a read of the symbol in the lineage does.
+#[derive(Clone, Debug, Default)]
+struct LineageIds {
+    /// None: no id in this chunk yet, or a freed chunk (`freed`).
+    chunks: Vec<Option<Box<[u64; LINEAGE_ID_CHUNK]>>>,
+    /// The freed chunks, one bit each.
+    freed: Vec<u64>,
+    /// The entries of `FREED_LINEAGE` that this table has freed.
+    seen: usize,
+}
+
+/// The symbols of one `SymbolArena` chunk (core.rs `COW_CHUNK_LEN`), so a
+/// freed lineage range frees whole id chunks. A test checks that the two
+/// agree (`lineage_id_chunks_are_symbol_chunks`).
+// PORT: not shared with core.rs, which is a lib blob key.
+const LINEAGE_ID_SHIFT: usize = 8;
+const LINEAGE_ID_CHUNK: usize = 1 << LINEAGE_ID_SHIFT;
+
+/// A lineage range that `program::Lineage` freed: the symbol chunks from
+/// `first` to `end` of file version `file`.
+#[derive(Clone, Copy, Debug)]
+struct FreedLineage {
+    file: usize,
+    first: u32,
+    end: u32,
+}
+
+/// The lineage ranges freed so far, in order. Each `LineageIds` frees the
+/// entries after its `seen` count.
+// PERF: one entry per dead file version, so it grows by 16 bytes per edit.
+static FREED_LINEAGE: Mutex<Vec<FreedLineage>> = Mutex::new(Vec::new());
+
+/// The length of `FREED_LINEAGE`, so a table with nothing to free does not
+/// lock it.
+static FREED_LINEAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Notes that `program::Lineage` freed the symbols of file version `file`
+/// at lineage indexes `symbols`, whose ends are chunk starts
+/// (`SymbolArena::free_range`). Each thread frees its ids of those symbols
+/// when it next makes an id chunk (`LineageIds`).
+pub(crate) fn free_lineage_symbol_ids(file: usize, symbols: std::ops::Range<usize>) {
+    let chunk = |chunk: usize| u32::try_from(chunk).expect("symbol overflow");
+    // Only whole chunks, which the range is (`SymbolArena::end_chunk`).
+    let first = chunk(symbols.start.div_ceil(LINEAGE_ID_CHUNK));
+    let end = chunk(symbols.end >> LINEAGE_ID_SHIFT);
+    if first >= end {
+        return;
+    }
+    let mut freed = FREED_LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
+    freed.push(FreedLineage { file, first, end });
+    FREED_LINEAGE_COUNT.store(freed.len(), Ordering::Release);
+}
+
+impl LineageIds {
+    const fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            freed: Vec::new(),
+            seen: 0,
+        }
+    }
+
+    /// The id of lineage index `index`, assigned now when it has none.
+    // PERF: the hot path of `get_symbol_id` is one more load and test than
+    // a dense `Vec`; a new chunk and the frees are out of line.
+    #[inline]
+    fn id(&mut self, index: usize) -> u64 {
+        if let Some(Some(chunk)) = self.chunks.get_mut(index >> LINEAGE_ID_SHIFT) {
+            let id = &mut chunk[index & (LINEAGE_ID_CHUNK - 1)];
+            if *id == 0 {
+                *id = next_symbol_id();
+            }
+            return *id;
+        }
+        self.id_in_new_chunk(index)
+    }
+
+    /// `id` when the chunk of `index` has no ids: frees the chunks of the
+    /// lineage ranges freed since the last call, then makes the chunk.
+    /// Panics when the chunk is freed.
+    #[cold]
+    #[inline(never)]
+    fn id_in_new_chunk(&mut self, index: usize) -> u64 {
+        self.free_dead();
+        let chunk = index >> LINEAGE_ID_SHIFT;
+        if self
+            .freed
+            .get(chunk / 64)
+            .is_some_and(|bits| bits & (1 << (chunk % 64)) != 0)
+        {
+            freed_lineage_read(chunk);
+        }
+        if chunk >= self.chunks.len() {
+            self.chunks.resize_with(chunk + 1, || None);
+        }
+        let ids = self.chunks[chunk].insert(Box::new([0; LINEAGE_ID_CHUNK]));
+        let id = next_symbol_id();
+        ids[index & (LINEAGE_ID_CHUNK - 1)] = id;
+        id
+    }
+
+    /// Frees the chunks of the lineage ranges freed since the last call.
+    fn free_dead(&mut self) {
+        if self.seen == FREED_LINEAGE_COUNT.load(Ordering::Acquire) {
+            return;
+        }
+        let freed = FREED_LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
+        for range in &freed[self.seen..] {
+            for chunk in range.first as usize..range.end as usize {
+                if chunk / 64 >= self.freed.len() {
+                    self.freed.resize(chunk / 64 + 1, 0);
+                }
+                self.freed[chunk / 64] |= 1 << (chunk % 64);
+                if let Some(ids) = self.chunks.get_mut(chunk) {
+                    *ids = None;
+                }
+            }
+        }
+        self.seen = freed.len();
+    }
+}
+
+/// Panics for an id read of freed lineage chunk `chunk`, with the file
+/// version whose symbols it held.
+#[cold]
+#[inline(never)]
+fn freed_lineage_read(chunk: usize) -> ! {
+    let file = FREED_LINEAGE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|range| (range.first as usize..range.end as usize).contains(&chunk))
+        .map(|range| range.file);
+    match file {
+        Some(file) => crate::ast::file_version::released(file),
+        None => unreachable!("lineage id chunk {chunk} is not freed"),
+    }
 }
 
 /// The ids of the symbols that checker arenas add on one thread, by arena
@@ -102,7 +252,7 @@ pub struct IdSeed {
     next_node_id: u64,
     next_symbol_id: u64,
     node_ids: PerFileMap<u64>,
-    symbol_ids: Vec<u64>,
+    symbol_ids: LineageIds,
 }
 
 /// The ids assigned on this thread so far. A checker worker starts from
@@ -123,7 +273,12 @@ pub fn id_seed() -> IdSeed {
             ids.write();
             ids.clone()
         }),
-        symbol_ids: SYMBOL_IDS.with(|ids| ids.borrow().clone()),
+        symbol_ids: SYMBOL_IDS.with(|ids| {
+            let mut ids = ids.borrow_mut();
+            // The copy has no ids of freed lineage chunks.
+            ids.free_dead();
+            ids.clone()
+        }),
     }
 }
 
@@ -195,7 +350,7 @@ pub fn get_symbol_id(symbols: &SymbolArena, symbol: SymbolId) -> u64 {
     let slot = symbols.id_slot(symbol);
     let place = slot.place as usize;
     if slot.key == 0 {
-        SYMBOL_IDS.with(|ids| symbol_id_at(&mut ids.borrow_mut(), place))
+        SYMBOL_IDS.with(|ids| ids.borrow_mut().id(place))
     } else {
         OWN_SYMBOL_IDS.with(|own| symbol_id_at(own.borrow_mut().ids_of(slot.key), place))
     }
@@ -1446,5 +1601,40 @@ mod symbol_id_tests {
 
         drop(first);
         assert_eq!(get_symbol_id(&second, shadow), id);
+    }
+
+    /// An id chunk of `LineageIds` holds the symbols of one `SymbolArena`
+    /// chunk, so a freed lineage range frees whole id chunks.
+    #[test]
+    fn lineage_id_chunks_are_symbol_chunks() {
+        let mut arena = SymbolArena::new();
+        arena.new_symbol(SymbolFlags::NONE, "a");
+        arena.end_chunk();
+        assert_eq!(arena.symbol_count(), LINEAGE_ID_CHUNK);
+    }
+
+    /// When the lineage frees the symbols of a dead file version, a thread
+    /// frees its id chunks of them when it next makes a chunk. The other
+    /// ids stay, and an id read of a freed symbol panics.
+    #[test]
+    #[should_panic(expected = "file version 4194297 is released")]
+    fn freed_lineage_symbols_free_their_ids() {
+        const FILE: usize = (1 << 22) - 7;
+        // Far above the indexes that other tests bind: every thread of the
+        // process frees this range.
+        const START: usize = 1 << 26;
+        let mut ids = LineageIds::new();
+        let kept = ids.id(START - 1);
+        let dying = ids.id(START + 5);
+        assert_eq!(ids.id(START + 5), dying);
+
+        free_lineage_symbol_ids(FILE, START..START + 2 * LINEAGE_ID_CHUNK);
+        // Until the next new chunk the id stays.
+        assert_eq!(ids.id(START + 5), dying);
+        let later = ids.id(START + 2 * LINEAGE_ID_CHUNK);
+        assert!(later > dying);
+        assert!(ids.chunks[START >> LINEAGE_ID_SHIFT].is_none());
+        assert_eq!(ids.id(START - 1), kept);
+        ids.id(START + LINEAGE_ID_CHUNK + 1);
     }
 }

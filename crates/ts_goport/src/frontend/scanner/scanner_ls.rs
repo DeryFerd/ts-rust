@@ -8,12 +8,13 @@
 
 use crate::frontend::prelude::*;
 use crate::frontend::scanner::{Scanner, new_scanner};
-use std::borrow::Cow;
 
 // Go: scanner/scanner.go:2519 GetScannerForSourceFile
-pub fn get_scanner_for_source_file(source_file: Node, pos: i32) -> Scanner {
+// PORT: the scanner borrows the text of `source_file`, so the caller holds
+// it (`let text = source_file_text(source_file);`) while it scans.
+pub fn get_scanner_for_source_file(source_file: Node, text: &str, pos: i32) -> Scanner<'_> {
     let mut s = new_scanner();
-    s.text = Cow::Borrowed(source_file_text(source_file));
+    s.text = text;
     s.scanner_state.pos = pos;
     s.end = s.text.len() as i32;
     s.language_variant = source_file_language_variant(source_file);

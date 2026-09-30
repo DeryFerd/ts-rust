@@ -776,3 +776,75 @@ child_test! {
         );
     }
 }
+
+child_test! {
+    // PORT: no Go counterpart (the GC frees the nodes). The declaration
+    // transform gives the parsed nodes that it keeps alias slots, and those
+    // go with their file version. So over many edits of one file the live
+    // synthetic slots stop growing once the first versions die.
+    fn dead_file_versions_free_their_alias_slots() {
+        let file = "/home/projects/TS/p1/index.ts";
+        let file_uri = "file:///home/projects/TS/p1/index.ts";
+        let members: String = (0..80).map(|i| format!("  m{i}(a: string, b: number): void;\n")).collect();
+        let text = format!("export interface I {{\n{members}}}\n");
+        let session = setup(files(&[
+            ("/home/projects/TS/p1/tsconfig.json", r#"{ "compilerOptions": { "declaration": true } }"#),
+            (file, text.as_str()),
+        ]));
+        open(&session, file_uri, &text);
+        let declaration_diagnostics = |p: &NewProgram| {
+            let root = p.get_source_file(file).expect("index.ts is in the program").root;
+            ls_program::get_declaration_diagnostics(p, &with_request_id(&bg()), root)
+        };
+        let live = ts_goport::ast::synthetic_live_slot_count;
+
+        let end_line = text.lines().count() as u32;
+        let mut live_after = Vec::new();
+        for version in 2..=10 {
+            edit(&session, file_uri, version, (end_line, 0), (end_line, 0), "\n");
+            session.wait_for_background_tasks();
+            let p = program(&session, file_uri);
+            assert!(declaration_diagnostics(&p).is_empty());
+            live_after.push(live());
+        }
+        // Each version makes about 320 alias slots, and they go when it dies.
+        assert!(
+            live_after[8] <= live_after[2],
+            "live synthetic slots grew after the first versions died: {live_after:?}"
+        );
+    }
+}
+
+child_test! {
+    // PORT: no Go counterpart (the GC frees the nodes). A lazy JSDoc parse
+    // gives its nodes to the file version of the node it parses for, so
+    // over many edits of one file the live synthetic slots stop growing
+    // once the first versions die.
+    fn dead_file_versions_free_their_lazy_jsdoc() {
+        let file = "/home/projects/TS/p1/index.ts";
+        let file_uri = "file:///home/projects/TS/p1/index.ts";
+        let text: String = (0..40)
+            .map(|i| format!("/**\n * Doc {i}.\n * @param a The a.\n */\nexport function f{i}(a: string) {{}}\n"))
+            .collect();
+        let session = setup(files(&[("/home/projects/TS/p1/tsconfig.json", "{}"), (file, text.as_str())]));
+        open(&session, file_uri, &text);
+        let live = ts_goport::ast::synthetic_live_slot_count;
+
+        let end_line = text.lines().count() as u32;
+        let mut live_after = Vec::new();
+        for version in 2..=10 {
+            edit(&session, file_uri, version, (end_line, 0), (end_line, 0), "\n");
+            session.wait_for_background_tasks();
+            let p = program(&session, file_uri);
+            let root = p.get_source_file(file).expect("index.ts is in the program").root;
+            let _program = ls_program::enter(&p);
+            let docs: usize = root.statements().iter().map(|s| s.js_doc(root).len()).sum();
+            assert_eq!(docs, 40, "each function has one JSDoc comment");
+            live_after.push(live());
+        }
+        assert!(
+            live_after[8] <= live_after[2],
+            "live synthetic slots grew after the first versions died: {live_after:?}"
+        );
+    }
+}

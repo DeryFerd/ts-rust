@@ -30,7 +30,8 @@ pub fn is_valid_big_int_string(s: &str, round_trip_only: bool) -> bool {
             success_in_callback.set(false);
         },
     )));
-    scanner.set_text(format!("{s}n"));
+    let text = format!("{s}n");
+    scanner.set_text(&text);
     let mut result = scanner.scan();
     let negative = result == SyntaxKind::MinusToken;
     if negative {
@@ -1142,7 +1143,7 @@ pub fn range_of_type_parameters(source_file: Node, type_parameters: NodeList) ->
     let text = source_file_text(source_file);
     TextRange::new(
         type_parameters.pos() - 1,
-        (text.len() as i32).min(skip_trivia(text, type_parameters.end()) + 1),
+        (text.len() as i32).min(skip_trivia(&text, type_parameters.end()) + 1),
     )
 }
 

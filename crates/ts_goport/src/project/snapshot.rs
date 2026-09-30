@@ -1321,7 +1321,7 @@ impl Snapshot {
                                 deref_program_file(
                                     &store.parse_cache,
                                     file.parse_options(),
-                                    file.text,
+                                    file.source_hash(),
                                     file.script_kind,
                                 );
                             }
@@ -1338,7 +1338,7 @@ impl Snapshot {
                                 deref_program_file(
                                     &store.parse_cache,
                                     &file.parse_options,
-                                    file.text,
+                                    file.source_hash(),
                                     file.script_kind,
                                 );
                             }

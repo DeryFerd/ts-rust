@@ -164,11 +164,11 @@ fn change_whole(session: &Rc<Session>, u: &str, version: i32, text: &str) {
 }
 
 /// Go `&lsproto.FileEvent{Uri: uri, Type: kind}`.
-fn file_event(u: &str, kind: lsproto::FileChangeType) -> lsproto::FileEvent {
-    lsproto::FileEvent {
+fn file_event(u: &str, kind: lsproto::FileChangeType) -> Option<lsproto::FileEvent> {
+    Some(lsproto::FileEvent {
         uri: uri(u),
         type_: kind,
-    }
+    })
 }
 
 /// Go `utils.FS().WriteFile(path, content)` with `assert.NilError`.
@@ -707,7 +707,7 @@ child_test! {
 
 child_test! {
     // Go: contentmapper_test.go:290 TestContentMapperSupplementalFileClonedOnEdit
-    // PORT: Go `file.Hash` is `project::source_file_hash(file.text)`. The
+    // PORT: Go `file.Hash` is `file.source_hash()`. The
     // old hashes are read before the edit: the parse cache forgets the hash
     // of a file when its last program lets it go (Go keeps it in the file).
     fn content_mapper_supplemental_file_cloned_on_edit() {
@@ -736,10 +736,10 @@ child_test! {
         assert_eq!(old_supplemental.len(), 1);
         assert_eq!(old_supplemental[0].file_name(), "/home/project/app.box.0.ts");
         assert_eq!(old_supplemental[0].path(), &path("/home/project/app.box.0.ts"));
-        let old_supplemental_hash = project::source_file_hash(old_supplemental[0].text);
+        let old_supplemental_hash = old_supplemental[0].source_hash();
         assert_eq!(
             old_supplemental_hash,
-            project::source_file_hash(old_canonical.text)
+            old_canonical.source_hash()
         );
         assert!(
             old_program
@@ -768,10 +768,10 @@ child_test! {
         assert_eq!(new_supplemental[0].path(), old_supplemental[0].path());
         assert!(!Rc::ptr_eq(&new_canonical, &old_canonical));
         assert!(!Rc::ptr_eq(&new_supplemental[0], &old_supplemental[0]));
-        let new_supplemental_hash = project::source_file_hash(new_supplemental[0].text);
+        let new_supplemental_hash = new_supplemental[0].source_hash();
         assert_eq!(
             new_supplemental_hash,
-            project::source_file_hash(new_canonical.text)
+            new_canonical.source_hash()
         );
         assert_ne!(new_supplemental_hash, old_supplemental_hash);
         assert!(
@@ -950,7 +950,7 @@ child_test! {
 }
 
 // Go: contentmapper_test.go:531 TestDynamicContentMapperRefreshesForMixedWatchBatches (the body of each subtest)
-fn refreshes_for_mixed_watch_batch(events: &[lsproto::FileEvent]) {
+fn refreshes_for_mixed_watch_batch(events: &[Option<lsproto::FileEvent>]) {
     let mapper = contentmappertest::package_json(contentmappertest::DYNAMIC_VERBATIM_MAPPER);
     let file_map = files(&[
         (
@@ -988,7 +988,7 @@ fn refreshes_for_mixed_watch_batch(events: &[lsproto::FileEvent]) {
 child_test! {
     // Go: contentmapper_test.go:500 TestDynamicContentMapperRefreshesForMixedWatchBatches/excessive events
     fn excessive_events() {
-        let mut events: Vec<lsproto::FileEvent> = (0..1001)
+        let mut events: Vec<Option<lsproto::FileEvent>> = (0..1001)
             .map(|i| file_event(&format!("file:///home/project/noise-{i}.ts"), CHANGED))
             .collect();
         events[0] = file_event("file:///home/project/mapper.config.json", CHANGED);

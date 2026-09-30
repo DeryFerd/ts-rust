@@ -168,7 +168,9 @@ fn node_ends_with(n: Node, expected_last_token: SyntaxKind, source_file: Node) -
     } else {
         token_start_pos = n.pos();
     }
-    let mut scanner = scanner_ls::get_scanner_for_source_file(source_file, token_start_pos);
+    let sf_text = source_file_text(source_file);
+    let mut scanner =
+        scanner_ls::get_scanner_for_source_file(source_file, &sf_text, token_start_pos);
     let mut start_pos = token_start_pos;
     while start_pos < n.end() {
         let token_kind = scanner.token();

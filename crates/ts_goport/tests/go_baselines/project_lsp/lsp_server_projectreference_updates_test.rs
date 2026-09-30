@@ -59,10 +59,10 @@ child_test! {
         client.send_notification(
             &lsproto::WORKSPACE_DID_CHANGE_WATCHED_FILES_INFO,
             lsproto::DidChangeWatchedFilesParams {
-                changes: vec![lsproto::FileEvent {
+                changes: vec![Some(lsproto::FileEvent {
                     uri: lsconv::file_name_to_document_uri("/root/tsconfig.json"),
                     type_: lsproto::FileChangeType::DELETED,
-                }],
+                })],
             },
         );
 

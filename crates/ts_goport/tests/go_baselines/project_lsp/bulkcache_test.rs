@@ -53,7 +53,7 @@ const ESNEXT_TSCONFIG: &str = r#"{
 
 // Go: bulkcache_test.go:44 TestBulkCacheInvalidation/large number of node_modules changes invalidates only node_modules cache (test)
 fn node_modules_changes(
-    file_events: Vec<lsproto::FileEvent>,
+    file_events: Vec<Option<lsproto::FileEvent>>,
     expect_node_modules_invalidation: bool,
 ) {
     let (session, utils) = projecttestutil::setup(base_files());
@@ -121,14 +121,14 @@ child_test! {
         );
         // Include two files in the program to trigger a full program creation.
         // Exclude fs.d.ts to show that its content still gets invalidated.
-        file_events.push(lsproto::FileEvent {
+        file_events.push(Some(lsproto::FileEvent {
             uri: uri("file:///project/node_modules/@types/node/index.d.ts"),
             type_: CHANGED,
-        });
-        file_events.push(lsproto::FileEvent {
+        }));
+        file_events.push(Some(lsproto::FileEvent {
             uri: uri("file:///project/node_modules/@types/node/console.d.ts"),
             type_: CHANGED,
-        });
+        }));
 
         node_modules_changes(file_events, true);
     }
@@ -147,7 +147,10 @@ child_test! {
 }
 
 // Go: bulkcache_test.go:121 TestBulkCacheInvalidation/large number of changes outside node_modules (test)
-fn outside_node_modules_changes(file_events: Vec<lsproto::FileEvent>, expect_config_reload: bool) {
+fn outside_node_modules_changes(
+    file_events: Vec<Option<lsproto::FileEvent>>,
+    expect_config_reload: bool,
+) {
     let (session, utils) = projecttestutil::setup(base_files());
 
     // Open a file to create the project
@@ -198,10 +201,10 @@ child_test! {
     // Go: bulkcache_test.go:159 TestBulkCacheInvalidation/large number of changes outside node_modules/with event matching include glob
     fn outside_node_modules_with_event_matching_include_glob() {
         let mut file_events = generate_file_events(1001, "file:///project/generated/file%d.ts", CREATED);
-        file_events.push(lsproto::FileEvent {
+        file_events.push(Some(lsproto::FileEvent {
             uri: uri("file:///project/src/rootFile.ts"),
             type_: CREATED,
-        });
+        }));
         outside_node_modules_changes(file_events, true);
     }
 }
@@ -281,7 +284,10 @@ child_test! {
 }
 
 // Go: bulkcache_test.go:223 TestBulkCacheInvalidation/config file names cache (test)
-fn config_file_names_cache(file_events: Vec<lsproto::FileEvent>, expect_config_discovery: bool) {
+fn config_file_names_cache(
+    file_events: Vec<Option<lsproto::FileEvent>>,
+    expect_config_discovery: bool,
+) {
     let (session, utils) = projecttestutil::setup(files(&[(
         "/project/src/index.ts",
         r#"console.log("test");"#,
@@ -371,10 +377,10 @@ child_test! {
     fn config_file_names_cache_excessive_changes_outside_node_modules_clears_config_file_names_cache() {
         let mut file_events = generate_file_events(1001, "file:///project/src/generated/file%d.ts", CREATED);
         // Presence of any tsconfig.json file event triggers rediscovery for config for all open files
-        file_events.push(lsproto::FileEvent {
+        file_events.push(Some(lsproto::FileEvent {
             uri: uri("file:///project/src/generated/tsconfig.json"),
             type_: CREATED,
-        });
+        }));
         config_file_names_cache(file_events, true);
     }
 }

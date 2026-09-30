@@ -305,7 +305,8 @@ fn get_smart_selection_range(
         push_selection_range(start, end);
 
         let mut comment_pos = start;
-        let text = source_file_text(source_file).as_bytes();
+        let text_text = source_file_text(source_file);
+        let text = text_text.as_bytes();
         while comment_pos < end
             && (comment_pos as usize) < text.len()
             && text[comment_pos as usize] == b'/'
@@ -369,9 +370,11 @@ fn get_smart_selection_range(
             if node.is_some() && next.get().is_nil() {
                 let mut found_comment: Option<CommentRange> = None;
                 // PORT: Go reads only the first item of the lazy iterator.
-                for comment in
-                    get_trailing_comment_ranges(&factory, source_file_text(source_file), node.end())
-                {
+                for comment in get_trailing_comment_ranges(
+                    &factory,
+                    &source_file_text(source_file),
+                    node.end(),
+                ) {
                     found_comment = Some(comment);
                     break;
                 }

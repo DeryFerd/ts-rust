@@ -233,10 +233,10 @@ pub fn create_type_help_items(
     let supports_per_signature_active_param = sig_info_caps.active_parameter_support;
 
     // Converting signatureHelpParameter to *lsproto.ParameterInformation
-    let parameters: Vec<lsproto::ParameterInformation> = item
+    let parameters: Vec<Option<lsproto::ParameterInformation>> = item
         .parameters
         .iter()
-        .map(|param| param.parameter_info.clone())
+        .map(|param| Some(param.parameter_info.clone()))
         .collect();
 
     let mut sig_info = lsproto::SignatureInformation {
@@ -254,7 +254,7 @@ pub fn create_type_help_items(
     }
 
     let mut help = lsproto::SignatureHelp {
-        signatures: vec![sig_info],
+        signatures: vec![Some(sig_info)],
         active_signature: Some(0),
         ..Default::default()
     };
@@ -551,13 +551,13 @@ impl LanguageService {
         let supports_null_active_param = sig_info_caps.no_active_parameter_support;
 
         // Converting []signatureInformation to []*lsproto.SignatureInformation
-        let mut signature_information: Vec<lsproto::SignatureInformation> =
+        let mut signature_information: Vec<Option<lsproto::SignatureInformation>> =
             Vec::with_capacity(flattened_signatures.len());
         for item in &flattened_signatures {
-            let parameters: Vec<lsproto::ParameterInformation> = item
+            let parameters: Vec<Option<lsproto::ParameterInformation>> = item
                 .parameters
                 .iter()
-                .map(|param| param.parameter_info.clone())
+                .map(|param| Some(param.parameter_info.clone()))
                 .collect();
             let mut documentation: Option<lsproto::StringOrMarkupContent> = None;
             if let Some(item_documentation) = &item.documentation {
@@ -579,7 +579,7 @@ impl LanguageService {
             // Set VS-specific colorized label if we have classified runs
             if !item.colorized_runs.is_empty() {
                 sig_info.vs_colorized_label = Some(lsproto::VSClassifiedTextElement {
-                    runs: item.colorized_runs.clone(),
+                    runs: item.colorized_runs.iter().cloned().map(Some).collect(),
                     ..Default::default()
                 });
             }
@@ -593,7 +593,7 @@ impl LanguageService {
                 );
             }
 
-            signature_information.push(sig_info);
+            signature_information.push(Some(sig_info));
         }
 
         let mut help = lsproto::SignatureHelp {
@@ -1540,7 +1540,7 @@ pub fn get_immediately_containing_argument_info(
         //      <MainButton /*signatureHelp*/
         let attribute_span_start = parent.attributes().loc().pos();
         let attribute_span_end =
-            skip_trivia(source_file_text(source_file), parent.attributes().end());
+            skip_trivia(&source_file_text(source_file), parent.attributes().end());
         // PORT: Go passes the span length as the end of `core.NewTextRange`; kept as in Go.
         return Some(ArgumentListInfo {
             is_type_parameter_list: false,
@@ -1783,12 +1783,12 @@ pub fn get_applicable_span_for_arguments(
         //                  |  |
         // The span should include positions inside the parentheses.
         let span_start = node.end();
-        let mut span_end = skip_trivia(source_file_text(source_file), node.end());
+        let mut span_end = skip_trivia(&source_file_text(source_file), node.end());
         span_end = ensure_minimum_span_size(span_start, span_end);
         return TextRange::new(span_start, span_end);
     }
     let applicable_span_start = argument_list.pos();
-    let mut applicable_span_end = skip_trivia(source_file_text(source_file), argument_list.end());
+    let mut applicable_span_end = skip_trivia(&source_file_text(source_file), argument_list.end());
 
     // If the argument list is empty (Pos == End), extend the span to include at least
     // one position. This handles foo(|) where the cursor is right after the opening paren.
@@ -2019,7 +2019,8 @@ pub fn get_token_from_node_list(
             left = nodes.get(node_list_index).end();
             node_list_index += 1;
         } else {
-            let scanner = scanner_ls::get_scanner_for_source_file(source_file, left);
+            let sf_text = source_file_text(source_file);
+            let scanner = scanner_ls::get_scanner_for_source_file(source_file, &sf_text, left);
             let token = scanner.token();
             let token_full_start = scanner.token_full_start();
             let token_end = scanner.token_end();
@@ -2089,7 +2090,7 @@ pub fn get_applicable_range_for_tagged_template(
             crate::core::go_panic("runtime error: index out of range [-1]".to_string())
         });
         if last_span.literal().end() - last_span.literal().pos() == 0 {
-            applicable_span_end = skip_trivia(source_file_text(source_file), applicable_span_end);
+            applicable_span_end = skip_trivia(&source_file_text(source_file), applicable_span_end);
         }
     }
 

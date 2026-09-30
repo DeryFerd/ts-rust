@@ -344,7 +344,7 @@ impl Checker {
             (
                 resolved.call_signatures().to_vec(),
                 resolved.construct_signatures().to_vec(),
-                resolved.index_infos.clone(),
+                resolved.index_infos_list(),
             )
         };
         let regular = self.new_anonymous_type(

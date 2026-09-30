@@ -92,10 +92,16 @@ impl SourceMapSource {
     }
 
     /// Go `source.Text()`.
-    pub fn text(&self) -> &str {
+    // PORT: the text of a freeable file version is not `'static`
+    // (`FileText`, textleak1), so it is copied. Only `inlineSources` reads
+    // it.
+    pub fn text(&self) -> Cow<'_, str> {
         match self {
-            SourceMapSource::Node(node) => source_file_text(*node),
-            SourceMapSource::Other(source) => source.text(),
+            SourceMapSource::Node(node) => match source_file_text(*node) {
+                FileText::Static(text) => Cow::Borrowed(text),
+                text @ FileText::Shared(_) => Cow::Owned(text.to_string()),
+            },
+            SourceMapSource::Other(source) => Cow::Borrowed(source.text()),
         }
     }
 }
@@ -189,6 +195,7 @@ pub struct Printer {
     // `set_source_file` clears them.
     pub(crate) current_original_cache: Cell<(Node, Node)>,
     pub(crate) current_line_map_cache: Cell<(Node, &'static [i32])>,
+    pub(crate) current_text_cache: Cell<(Node, &'static str)>,
     pub(crate) skip_trivia_memo: SkipTriviaMemo,
 }
 
@@ -204,7 +211,7 @@ impl SkipTriviaMemo {
         if memo_file == file && memo_pos == pos && file.is_some() {
             return memo_result;
         }
-        let result = skip_trivia(source_file_text(file), pos);
+        let result = skip_trivia(&source_file_text(file), pos);
         self.0.set((file, pos, result));
         result
     }
@@ -311,6 +318,7 @@ pub fn new_printer(
         id_to_symbol: None,
         current_original_cache: Cell::default(),
         current_line_map_cache: Cell::default(),
+        current_text_cache: Cell::default(),
         skip_trivia_memo: SkipTriviaMemo::default(),
     };
     printer.name_generator.context = Some(Rc::clone(&emit_context));
@@ -463,6 +471,24 @@ impl Printer {
         original
     }
 
+    /// Go `p.currentSourceFile.Text()`.
+    // PERF: a static text is cached for one file in `current_text_cache`,
+    // so the comment reads of each node do no store lookup. The text of a
+    // freeable file version (textleak1) is read each time: the cache keeps
+    // no `FileText`.
+    pub(crate) fn current_source_file_text(&self) -> FileText {
+        let file = self.current_source_file;
+        let (cached_file, cached_text) = self.current_text_cache.get();
+        if cached_file == file && file.is_some() {
+            return FileText::Static(cached_text);
+        }
+        let text = source_file_text(file);
+        if let Some(static_text) = text.as_static() {
+            self.current_text_cache.set((file, static_text));
+        }
+        text
+    }
+
     /// Go `p.currentSourceFile.ECMALineMap()`.
     // PERF: a transformed SourceFile is a synthetic node with the text of its
     // most original parsed file. It reads the frozen line map of that file,
@@ -483,7 +509,8 @@ impl Printer {
             if original.is_some() && !is_synthetic_node(original) && is_source_file(original) {
                 let text = source_file_text(file);
                 let original_text = source_file_text(original);
-                let same_text = std::ptr::eq(text, original_text) || text == original_text;
+                let same_text =
+                    std::ptr::eq::<str>(&*text, &*original_text) || text == original_text;
                 debug_assert!(
                     same_text,
                     "transformed SourceFile text differs from its original"
@@ -700,7 +727,12 @@ fn source_text_of_node_cow(
     } else {
         skip_trivia_memo.skip_trivia(source_file, node.pos())
     };
-    Cow::Borrowed(&text[pos as usize..node.end() as usize])
+    let range = pos as usize..node.end() as usize;
+    // A freeable file version's text is not `'static` (`FileText`).
+    match text.as_static() {
+        Some(text) => Cow::Borrowed(&text[range]),
+        None => Cow::Owned(text[range].to_string()),
+    }
 }
 
 /// Go `getLiteralText` (printer/utilities.go) that borrows where the result
@@ -1282,9 +1314,9 @@ impl Printer {
             return;
         }
 
-        let text = source_file_text(self.current_source_file);
+        let text = self.current_source_file_text();
         let line_map = self.current_line_map();
-        self.write_comment_range_worker(text, &line_map, comment.kind, comment.text_range);
+        self.write_comment_range_worker(&text, &line_map, comment.kind, comment.text_range);
     }
 
     // Go: printer/printer.go:648 writeCommentRangeWorker
@@ -1404,9 +1436,9 @@ impl Printer {
     pub(crate) fn should_write_comment(&self, comment: CommentRange) -> bool {
         !self.options.only_print_js_doc_style
             || self.current_source_file.is_some()
-                && is_js_doc_like_text(source_file_text(self.current_source_file), comment)
+                && is_js_doc_like_text(&self.current_source_file_text(), comment)
             || self.current_source_file.is_some()
-                && is_pinned_comment(source_file_text(self.current_source_file), comment)
+                && is_pinned_comment(&self.current_source_file_text(), comment)
     }
 
     // Go: printer/printer.go:749 shouldEmitIndented
@@ -1580,12 +1612,13 @@ impl Printer {
         }
 
         let factory = self.emit_context.factory().as_node_factory();
-        let text = source_file_text(self.current_source_file);
-        if !crate::frontend::scanner::get_trailing_comment_ranges(factory, text, pos + 1).is_empty()
+        let text = self.current_source_file_text();
+        if !crate::frontend::scanner::get_trailing_comment_ranges(factory, &text, pos + 1)
+            .is_empty()
         {
             return true;
         }
-        if !crate::frontend::scanner::get_leading_comment_ranges(factory, text, pos + 1).is_empty()
+        if !crate::frontend::scanner::get_leading_comment_ranges(factory, &text, pos + 1).is_empty()
         {
             return true;
         }

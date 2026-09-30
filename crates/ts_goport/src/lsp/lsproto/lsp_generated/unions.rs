@@ -300,7 +300,7 @@ impl IsZero for TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StringOrInlayHintLabelParts {
     pub string: Option<String>,
-    pub inlay_hint_label_parts: Option<Vec<InlayHintLabelPart>>,
+    pub inlay_hint_label_parts: Option<Vec<Option<InlayHintLabelPart>>>,
 }
 
 impl MarshalerTo for StringOrInlayHintLabelParts {
@@ -702,7 +702,7 @@ impl IsZero for InitializationOptionsOrNull {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WorkspaceFoldersOrNull {
-    pub workspace_folders: Option<Vec<WorkspaceFolder>>,
+    pub workspace_folders: Option<Vec<Option<WorkspaceFolder>>>,
 }
 
 impl MarshalerTo for WorkspaceFoldersOrNull {
@@ -831,11 +831,11 @@ impl UnmarshalerFrom for TextDocumentContentChangePartialOrWholeDocument {
             0 => {
                 // range
                 let v = self.partial.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             _ => {
                 let v = self.whole_document.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
         }
     }
@@ -882,12 +882,12 @@ impl UnmarshalerFrom for TextEditOrInsertReplaceEdit {
             0 => {
                 // insert
                 let v = self.insert_replace_edit.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             1 => {
                 // range
                 let v = self.text_edit.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             _ => {}
         }
@@ -949,12 +949,12 @@ impl UnmarshalerFrom for MarkupContentOrStringOrMarkedStringWithLanguageOrMarked
                     0 => {
                         // kind
                         let v = self.markup_content.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     1 => {
                         // language
                         let v = self.marked_string_with_language.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {}
                 }
@@ -1070,11 +1070,11 @@ impl UnmarshalerFrom for LocationOrLocationUriOnly {
             0 => {
                 // range
                 let v = self.location.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             _ => {
                 let v = self.location_uri_only.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
         }
     }
@@ -1193,16 +1193,16 @@ impl UnmarshalerFrom for TextEditOrAnnotatedTextEditOrSnippetTextEdit {
             0 => {
                 // snippet
                 let v = self.snippet_text_edit.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             1 => {
                 // annotationId
                 let v = self.annotated_text_edit.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             _ => {
                 let v = self.text_edit.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
         }
     }
@@ -1437,11 +1437,11 @@ impl UnmarshalerFrom for BooleanOrDeclarationOptionsOrDeclarationRegistrationOpt
                         let v = self
                             .declaration_registration_options
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.declaration_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -1571,11 +1571,11 @@ impl UnmarshalerFrom for BooleanOrTypeDefinitionOptionsOrTypeDefinitionRegistrat
                         let v = self
                             .type_definition_registration_options
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.type_definition_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -1648,11 +1648,11 @@ impl UnmarshalerFrom for BooleanOrImplementationOptionsOrImplementationRegistrat
                         let v = self
                             .implementation_registration_options
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.implementation_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -1955,11 +1955,11 @@ impl UnmarshalerFrom for BooleanOrDocumentColorOptionsOrDocumentColorRegistratio
                         let v = self
                             .document_color_registration_options
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.document_color_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -2262,11 +2262,11 @@ impl UnmarshalerFrom for BooleanOrFoldingRangeOptionsOrFoldingRangeRegistrationO
                         let v = self
                             .folding_range_registration_options
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.folding_range_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -2339,11 +2339,11 @@ impl UnmarshalerFrom for BooleanOrSelectionRangeOptionsOrSelectionRangeRegistrat
                         let v = self
                             .selection_range_registration_options
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.selection_range_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -2416,11 +2416,11 @@ impl UnmarshalerFrom for BooleanOrCallHierarchyOptionsOrCallHierarchyRegistratio
                         let v = self
                             .call_hierarchy_registration_options
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.call_hierarchy_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -2494,11 +2494,11 @@ impl UnmarshalerFrom for BooleanOrLinkedEditingRangeOptionsOrLinkedEditingRangeR
                         let v = self
                             .linked_editing_range_registration_options
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.linked_editing_range_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -2555,11 +2555,11 @@ impl UnmarshalerFrom for SemanticTokensOptionsOrRegistrationOptions {
             0 => {
                 // documentSelector
                 let v = self.registration_options.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             _ => {
                 let v = self.options.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
         }
     }
@@ -2620,11 +2620,11 @@ impl UnmarshalerFrom for BooleanOrMonikerOptionsOrMonikerRegistrationOptions {
                     0 => {
                         // documentSelector
                         let v = self.moniker_registration_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.moniker_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -2697,11 +2697,11 @@ impl UnmarshalerFrom for BooleanOrTypeHierarchyOptionsOrTypeHierarchyRegistratio
                         let v = self
                             .type_hierarchy_registration_options
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.type_hierarchy_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -2774,11 +2774,11 @@ impl UnmarshalerFrom for BooleanOrInlineValueOptionsOrInlineValueRegistrationOpt
                         let v = self
                             .inline_value_registration_options
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.inline_value_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -2851,11 +2851,11 @@ impl UnmarshalerFrom for BooleanOrInlayHintOptionsOrInlayHintRegistrationOptions
                         let v = self
                             .inlay_hint_registration_options
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {
                         let v = self.inlay_hint_options.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                 }
             }
@@ -2912,11 +2912,11 @@ impl UnmarshalerFrom for DiagnosticOptionsOrRegistrationOptions {
             0 => {
                 // documentSelector
                 let v = self.registration_options.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             _ => {
                 let v = self.options.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
         }
     }
@@ -3077,14 +3077,14 @@ impl UnmarshalerFrom for RangeOrEditRangeWithInsertReplace {
             0 => {
                 // start
                 let v = self.range.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             1 => {
                 // insert
                 let v = self
                     .edit_range_with_insert_replace
                     .insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             _ => {}
         }
@@ -3997,12 +3997,12 @@ impl UnmarshalerFrom for SemanticTokensOrSemanticTokensDeltaOrNull {
                     0 => {
                         // data
                         let v = self.semantic_tokens.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     1 => {
                         // edits
                         let v = self.semantic_tokens_delta.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {}
                 }
@@ -5146,19 +5146,19 @@ impl UnmarshalerFrom for RangeOrPrepareRenamePlaceholderOrPrepareRenameDefaultBe
                     0 => {
                         // start
                         let v = self.range.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     1 => {
                         // range
                         let v = self.prepare_rename_placeholder.insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     2 => {
                         // defaultBehavior
                         let v = self
                             .prepare_rename_default_behavior
                             .insert(Default::default());
-                        return json_unmarshal(data, v, &[]);
+                        return unmarshal_read_value(data, v);
                     }
                     _ => {}
                 }
@@ -5615,16 +5615,16 @@ impl UnmarshalerFrom for InlineValueTextOrVariableLookupOrEvaluatableExpression 
             0 => {
                 // text
                 let v = self.text.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             1 => {
                 // caseSensitiveLookup
                 let v = self.variable_lookup.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
             _ => {
                 let v = self.evaluatable_expression.insert(Default::default());
-                return json_unmarshal(data, v, &[]);
+                return unmarshal_read_value(data, v);
             }
         }
     }

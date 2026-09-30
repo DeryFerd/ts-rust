@@ -1338,7 +1338,9 @@ impl LanguageService {
             insert_text_format,
             text_edit,
             commit_characters,
-            additional_text_edits,
+            // Go `[]*lsproto.TextEdit`: the port's edits are never nil.
+            additional_text_edits: additional_text_edits
+                .map(|edits| edits.into_iter().map(Some).collect()),
             data: Some(data),
             ..Default::default()
         }
