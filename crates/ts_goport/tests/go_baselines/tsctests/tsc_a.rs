@@ -1565,7 +1565,7 @@ fn tsc_incremental_inputs() -> Vec<TscInput> {
             files: file_map! {
                 "/home/src/workspaces/project/tsconfig.json" => r#"{"compilerOptions": {"strict": true, "noEmit": true, "incremental": true}}"#,
                 "/home/src/workspaces/project/repro.ts" => dedent(source),
-                format!("{TSC_LIB_PATH}/lib.es2025.full.d.ts") => lib_with_readonly_array.clone(),
+                format!("{TSC_LIB_PATH}/lib.es2026.full.d.ts") => lib_with_readonly_array.clone(),
             },
             edits: vec![
                 TscEdit {
