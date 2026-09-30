@@ -151,7 +151,7 @@ impl Node {
         // After freeze, a store file resolves every child id with no store
         // borrow: an alias-free store gives the slot 0 value for id 0 and
         // the raw handle `(file << 32) | (id + 1)` for any other id, with no
-        // table load; a store with alias slots reads its resolved table.
+        // table load; a store with alias slots reads the record of the id.
         // The synthetic file has no store, so it takes the slow path.
         if let Some(n) = crate::ast::frozen_resolve_store_id(file, node) {
             return n;
@@ -238,6 +238,21 @@ impl Name {
     #[must_use]
     pub fn from_stable_id(id: u32) -> Option<Name> {
         intern::stable(id)
+    }
+
+    /// The 4-byte id, for a packed node column (`ast::store::NodeKids`).
+    /// It is valid only in this process.
+    #[inline]
+    #[must_use]
+    pub(crate) fn id(&self) -> u32 {
+        self.0
+    }
+
+    /// The name whose `Name::id` in this process is `id`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_id(id: u32) -> Name {
+        Name(id)
     }
 }
 
@@ -2545,12 +2560,85 @@ pub struct NodeBindData {
     pub added_flags: NodeFlags,
 }
 
-/// Binder data of every node of one bound file, stored compactly. Most
-/// nodes have no data, or the same data as the node before them (a run of
-/// identifiers in one flow region), so they share one entry. Each node keeps
-/// one byte: the offset of its entry from the first entry of its block.
+/// AST node records, step 2: the binder fields of one node that are not in
+/// its `NodeRecord` (`ast/store.rs`, which holds the symbol, the flow node
+/// and the added flags). Most nodes have none of them: only locals
+/// containers, exported declarations and function-like nodes do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeBindExtra {
+    pub local_symbol: SymbolId,
+    pub locals: SymbolTable,
+    pub next_container: Node,
+    pub end_flow_node: FlowNodeId,
+    pub return_flow_node: FlowNodeId,
+}
+
+impl NodeBindExtra {
+    /// The fields of `data` that are not in the record.
+    #[inline]
+    #[must_use]
+    pub fn of(data: &NodeBindData) -> Self {
+        NodeBindExtra {
+            local_symbol: data.local_symbol,
+            locals: data.locals,
+            next_container: data.next_container,
+            end_flow_node: data.end_flow_node,
+            return_flow_node: data.return_flow_node,
+        }
+    }
+
+    /// The empty fields: a node with no extras entry.
+    pub const NONE: Self = NodeBindExtra {
+        local_symbol: SymbolId::NIL,
+        locals: SymbolTable::NIL,
+        next_container: Node::NIL,
+        end_flow_node: FlowNodeId::NIL,
+        return_flow_node: FlowNodeId::NIL,
+    };
+}
+
+/// AST node records, step 2: the binder fields of the nodes of one bound
+/// file that are not in their records (`NodeBindExtra`). The `bind` word of
+/// a record holds the index + 1 of its entry, or 0 (`FileNodeBind::extra`).
+/// `BoundFile::install` makes it (`ast::bind_store_records`).
 #[derive(Debug, Default)]
 pub struct FileNodeBind {
+    extras: Box<[NodeBindExtra]>,
+}
+
+impl FileNodeBind {
+    /// The extras entries that the install made.
+    #[must_use]
+    pub fn new(extras: Vec<NodeBindExtra>) -> Self {
+        FileNodeBind {
+            extras: extras.into_boxed_slice(),
+        }
+    }
+
+    /// The extras entry whose index + 1 is `extra` (the high half of the
+    /// `bind` word of a record, not 0).
+    #[inline]
+    #[must_use]
+    pub fn extra(&self, extra: u32) -> &NodeBindExtra {
+        &self.extras[extra as usize - 1]
+    }
+
+    /// The extras entries.
+    #[must_use]
+    pub fn extras(&self) -> &[NodeBindExtra] {
+        &self.extras
+    }
+}
+
+/// The binder data of every node of one file, stored compactly, as the lib
+/// bind snapshot keeps it (`parts`, `binder::BoundNodes`). Most nodes have
+/// no data, or the same data as the node before them (a run of identifiers
+/// in one flow region), so they share one entry. Each node keeps one byte:
+/// the offset of its entry from the first entry of its block. The install
+/// writes it into the node records and a `FileNodeBind`
+/// (`ast::bind_store_records`).
+#[derive(Clone, Debug, Default)]
+pub struct NodeBindParts {
     /// Per node, by `NodeId::index()`: entry offset in its block, or
     /// `NO_NODE_BIND` for the empty data.
     slots: Vec<u8>,
@@ -2575,7 +2663,7 @@ static EMPTY_NODE_BIND: NodeBindData = NodeBindData {
     added_flags: NodeFlags::NONE,
 };
 
-impl FileNodeBind {
+impl NodeBindParts {
     /// Compacts the per-node data of a bound file, given in node order.
     /// `None` is a node with no data. At most `max_entries` items are
     /// `Some`.
@@ -2610,11 +2698,25 @@ impl FileNodeBind {
             slots[index] = u8::try_from(entries.len() - 1 - block_start).expect("block offset");
         }
         entries.shrink_to_fit();
-        FileNodeBind {
+        NodeBindParts {
             slots,
             bases,
             entries,
         }
+    }
+
+    /// Each node that has data, in node order: its `NodeId::index()`, the
+    /// index of its entry (nodes that share an entry give the same index)
+    /// and the data.
+    pub fn nodes(&self) -> impl Iterator<Item = (usize, usize, &NodeBindData)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|&(_, &offset)| offset != NO_NODE_BIND)
+            .map(|(index, &offset)| {
+                let entry = self.bases[index >> NODE_BIND_BLOCK_BITS] as usize + offset as usize;
+                (index, entry, &self.entries[entry])
+            })
     }
 
     /// The distinct data entries, for remapping ids in place. Non-empty data
@@ -2653,22 +2755,11 @@ impl FileNodeBind {
                 return None;
             }
         }
-        Some(FileNodeBind {
+        Some(NodeBindParts {
             slots,
             bases,
             entries,
         })
-    }
-
-    /// The data of node `index` (`NodeId::index()`).
-    #[inline]
-    #[must_use]
-    pub fn get(&self, index: usize) -> &NodeBindData {
-        let offset = self.slots[index];
-        if offset == NO_NODE_BIND {
-            return &EMPTY_NODE_BIND;
-        }
-        &self.entries[self.bases[index >> NODE_BIND_BLOCK_BITS] as usize + offset as usize]
     }
 }
 
@@ -2747,7 +2838,7 @@ pub enum LinkSlot {
 
 /// A `LinkStore` key. Arena handles are dense small indexes, and node and
 /// flow node handles are dense small indexes within a file, so their links
-/// live in paged slot arrays instead of a hash map.
+/// live in pages instead of a hash map.
 pub trait LinkKey: Copy + Eq + std::hash::Hash {
     /// Where the record of this key lives.
     fn link_slot(self) -> LinkSlot;
@@ -2804,129 +2895,118 @@ impl LinkKey for FlowNodeId {
     }
 }
 
-/// Slots per page. Pages are handed out on first use, so a store that few
-/// keys use stays small. Larger pages make the page tables smaller, but
-/// cost memory in sparse stores (check query peak RSS).
+/// Keys per page. Pages are made on first use, so a store that few keys use
+/// stays small.
 const LINK_PAGE_SIZE: usize = 1 << 6;
-/// Pages per `LinkPages` chunk.
-const LINK_CHUNK_PAGES: usize = 1 << 6;
-/// Slots per `LinkPages` chunk.
-const LINK_CHUNK_SLOTS: usize = LINK_PAGE_SIZE * LINK_CHUNK_PAGES;
 
-/// A page table: for each page of `LINK_PAGE_SIZE` keys, the `LinkPages`
-/// page index + 1, or zero when the page is absent.
-type PageTable = Vec<u32>;
+/// The records of `LINK_PAGE_SIZE` keys, `None` for a key with no record.
+type LinkPage<V> = [Option<V>; LINK_PAGE_SIZE];
 
-/// The slot pages of one `LinkStore`, for all its page tables. A slot holds
-/// the value index + 1; zero is absent.
-// PERF: pages come from chunks of `LINK_CHUNK_PAGES` pages, so one zeroed
-// allocation serves 64 pages, and a page table entry is a 4-byte index in
-// place of an 8-byte page pointer.
-#[derive(Clone, Debug, Default)]
-struct LinkPages {
-    chunks: Vec<Box<[u32; LINK_CHUNK_SLOTS]>>,
-    /// Pages handed out.
-    len: usize,
-}
+/// A page table: for each page of `LINK_PAGE_SIZE` keys, the page, or `None`
+/// when no key of the page has a record.
+type PageTable<V> = Vec<Option<Box<LinkPage<V>>>>;
 
-impl LinkPages {
-    /// The slot of key `index` in `table`, or zero when its page is absent.
-    #[inline]
-    fn slot(&self, table: &[u32], index: usize) -> u32 {
-        match table.get(index / LINK_PAGE_SIZE) {
-            Some(&page) if page != 0 => {
-                let page = page as usize - 1;
-                self.chunks[page / LINK_CHUNK_PAGES]
-                    [(page % LINK_CHUNK_PAGES) * LINK_PAGE_SIZE + index % LINK_PAGE_SIZE]
-            }
-            _ => 0,
-        }
-    }
-
-    /// The slot of key `index` in `page`, a nonzero page table entry: the
-    /// page-hit path of `slot_mut`.
-    #[inline]
-    fn page_slot_mut(&mut self, page: u32, index: usize) -> &mut u32 {
-        let page = page as usize - 1;
-        &mut self.chunks[page / LINK_CHUNK_PAGES]
-            [(page % LINK_CHUNK_PAGES) * LINK_PAGE_SIZE + index % LINK_PAGE_SIZE]
-    }
-
-    /// The slot of key `index` in `table`. Adds the page if it is absent.
-    /// Only the out-of-line `LinkStore::add_record` calls it; the usual
-    /// case (the page exists) is `page_slot_mut` inline.
-    fn slot_mut(&mut self, table: &mut PageTable, index: usize) -> &mut u32 {
-        let entry = index / LINK_PAGE_SIZE;
-        if entry >= table.len() {
-            table.resize(entry + 1, 0);
-        }
-        if table[entry] == 0 {
-            if self.len % LINK_CHUNK_PAGES == 0 {
-                // `vec!` of zeros allocates zeroed memory (`calloc`), so
-                // the pages that stay unused are not written.
-                let chunk = vec![0u32; LINK_CHUNK_SLOTS].into_boxed_slice();
-                self.chunks.push(chunk.try_into().expect("link chunk size"));
-            }
-            self.len += 1;
-            table[entry] = u32::try_from(self.len).expect("link page overflow");
-        }
-        self.page_slot_mut(table[entry], index)
-    }
+/// Makes the record of a key that has none.
+// PERF: out of line, so an inlined `get` stays small; not `#[cold]`, because
+// `get` calls it for every new record.
+#[inline(never)]
+fn new_link_record<V: Default>(cell: &mut Option<V>) -> &mut V {
+    cell.insert(V::default())
 }
 
 /// Go `core.LinkStore[K, V]`: lazily created per-key link records.
-/// Dense keys map through paged slots into `values`. Other keys use a hash
-/// map. `get` reads an existing record inline and adds a new one out of line.
+/// Dense keys keep their records in pages (Go `core.PagedLinkStore`,
+/// tsgo#4329). Other keys use a hash map. `get` reads an existing record
+/// inline and adds a new page out of line.
+///
+/// A page holds its values in place, so a node key reads 4 dependent loads
+/// (the list of file tables, the table of the file, the page, the value)
+/// and an arena key 3. Each page costs 64 values, used or not, so a value must be 32
+/// bytes or less (a page of 2 KiB at most). Put a larger value, or one that
+/// few keys of a page have, in a `Box` (`LinkStore<Node, Box<V>>`, like Go
+/// `symbolArenaLinkStore`): a page then costs 8 bytes per key, and a read
+/// one more load.
 #[derive(Clone, Debug)]
 pub struct LinkStore<K: LinkKey, V: Default> {
-    /// Page table of arena keys. One flat table, so a hit reads the table
-    /// entry, the slot and the value, with no per-group hop.
-    arena: PageTable,
+    /// Page table of arena keys: one flat table for the whole arena.
+    arena: PageTable<V>,
     /// Page tables of file keys, by file.
-    files: Vec<PageTable>,
-    /// The slot pages of all page tables.
-    pages: LinkPages,
-    /// Dense values in fixed-size chunks, so growth never copies or
-    /// over-allocates a large block.
-    values: Vec<Vec<V>>,
-    len: usize,
+    files: Vec<PageTable<V>>,
     map: FxHashMap<K, V>,
 }
-
-/// Values per chunk of a dense `LinkStore`.
-const LINK_CHUNK_SIZE: usize = 1 << 12;
 
 impl<K: LinkKey, V: Default> Default for LinkStore<K, V> {
     fn default() -> Self {
         Self {
             arena: Vec::new(),
             files: Vec::new(),
-            pages: LinkPages::default(),
-            values: Vec::new(),
-            len: 0,
             map: FxHashMap::default(),
         }
     }
 }
 
 impl<K: LinkKey, V: Default> LinkStore<K, V> {
-    /// The value index of a key with slots, if it has a record.
-    #[inline]
-    fn slot_value(&self, slot: LinkSlot) -> Option<usize> {
-        let stored = match slot {
-            LinkSlot::Arena(index) => self.pages.slot(&self.arena, index),
-            LinkSlot::File(file, index) => self
-                .files
-                .get(file)
-                .map_or(0, |table| self.pages.slot(table, index)),
-            LinkSlot::Map => 0,
+    /// The record cell of a key with slots, or `None` when its page is
+    /// absent.
+    #[inline(always)]
+    fn cell(&self, slot: LinkSlot) -> Option<&Option<V>> {
+        let (table, index) = match slot {
+            LinkSlot::Arena(index) => (&self.arena, index),
+            LinkSlot::File(file, index) => (self.files.get(file)?, index),
+            LinkSlot::Map => return None,
         };
-        (stored as usize).checked_sub(1)
+        let page = table.get(index / LINK_PAGE_SIZE)?.as_deref()?;
+        Some(&page[index % LINK_PAGE_SIZE])
     }
 
-    #[inline]
-    fn value(&self, value: usize) -> &V {
-        &self.values[value / LINK_CHUNK_SIZE][value % LINK_CHUNK_SIZE]
+    /// The record cell of a key with slots. Adds its page if it is absent.
+    // PERF: the page lookup runs twice in the source (a shared lookup, then
+    // the mutable one, which the borrow checker needs), but the second one
+    // reads the same memory with no store between, so LLVM merges them.
+    #[inline(always)]
+    fn cell_mut(&mut self, key: K, slot: LinkSlot) -> &mut Option<V> {
+        if self.cell(slot).is_none() {
+            return self.add_page(key);
+        }
+        let (table, index) = match slot {
+            LinkSlot::Arena(index) => (&mut self.arena, index),
+            LinkSlot::File(file, index) => (&mut self.files[file], index),
+            LinkSlot::Map => unreachable!("map keys have no slot"),
+        };
+        let page = table[index / LINK_PAGE_SIZE]
+            .as_deref_mut()
+            .expect("link page");
+        &mut page[index % LINK_PAGE_SIZE]
+    }
+
+    /// `cell_mut` when the page of the key is absent: adds the page (and the
+    /// file table) first. The key, not its 24-byte `LinkSlot`, is passed, so
+    /// it goes in a register.
+    #[cold]
+    #[inline(never)]
+    fn add_page(&mut self, key: K) -> &mut Option<V> {
+        const {
+            assert!(
+                size_of::<Option<V>>() <= 32,
+                "a link value over 32 bytes goes in a Box"
+            );
+        }
+        let (table, index) = match key.link_slot() {
+            LinkSlot::Arena(index) => (&mut self.arena, index),
+            LinkSlot::File(file, index) => {
+                if file >= self.files.len() {
+                    self.files.resize_with(file + 1, Vec::new);
+                }
+                (&mut self.files[file], index)
+            }
+            LinkSlot::Map => unreachable!("map keys have no slot"),
+        };
+        let entry = index / LINK_PAGE_SIZE;
+        if entry >= table.len() {
+            table.resize_with(entry + 1, || None);
+        }
+        let page = table[entry].get_or_insert_with(|| Box::new(std::array::from_fn(|_| None)));
+        &mut page[index % LINK_PAGE_SIZE]
     }
 
     /// Go `store.Get(key)`: creates the record on first use.
@@ -2936,11 +3016,11 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
         if matches!(slot, LinkSlot::Map) {
             return self.map_get(key);
         }
-        let value = match self.slot_value(slot) {
+        let cell = self.cell_mut(key, slot);
+        match cell {
             Some(value) => value,
-            None => self.create(key),
-        };
-        &mut self.values[value / LINK_CHUNK_SIZE][value % LINK_CHUNK_SIZE]
+            None => new_link_record(cell),
+        }
     }
 
     #[cold]
@@ -2949,31 +3029,19 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
         self.map.entry(key).or_default()
     }
 
-    /// Adds the default record of a key with slots, which has none, and
-    /// returns its value index.
-    // PERF: not `#[cold]`: `get` calls it for every new record. Its usual
-    // case is inline (`new_record`).
-    #[inline(never)]
-    fn create(&mut self, key: K) -> usize {
-        let value = self.len;
-        self.new_record(key).push(V::default());
-        value
-    }
-
     /// Go `store.Get(key)` followed by writes to the new record, for a key
     /// that has no record (a symbol or type made just before): adds the
     /// record with `value` and returns it.
-    // PERF: an inlined caller builds `value` in its chunk slot, and the
+    // PERF: an inlined caller builds `value` in its page slot, and the
     // default record is not written first.
     #[inline(always)]
     pub fn insert_new(&mut self, key: K, value: V) -> &mut V {
         debug_assert!(!self.has(key), "insert_new on a key with a record");
-        if matches!(key.link_slot(), LinkSlot::Map) {
+        let slot = key.link_slot();
+        if matches!(slot, LinkSlot::Map) {
             return self.map_insert_new(key, value);
         }
-        let values = self.new_record(key);
-        values.push(value);
-        values.last_mut().expect("link record")
+        self.cell_mut(key, slot).insert(value)
     }
 
     #[cold]
@@ -2982,85 +3050,62 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
         self.map.entry(key).insert_entry(value).into_mut()
     }
 
-    /// Gives a key with slots, which has no record, the next value index
-    /// (records get value indexes in creation order). Returns the values
-    /// chunk that the caller pushes the value of the record into next.
-    // PERF: it takes no value, so an inlined caller builds the value in its
-    // chunk slot. The usual case (the page of the key exists and the last
-    // chunk has room) is inline; `add_record` does the rest. The key, not
-    // its 24-byte `LinkSlot`, is passed on, so it goes in a register.
-    #[inline(always)]
-    fn new_record(&mut self, key: K) -> &mut Vec<V> {
-        let (table, index) = match key.link_slot() {
-            LinkSlot::Arena(index) => (self.arena.as_slice(), index),
-            LinkSlot::File(file, index) => {
-                (self.files.get(file).map_or(&[][..], Vec::as_slice), index)
-            }
-            LinkSlot::Map => unreachable!("map keys have no slot"),
-        };
-        let page = table.get(index / LINK_PAGE_SIZE).copied().unwrap_or(0);
-        let has_room = page != 0
-            && self.len % LINK_CHUNK_SIZE != 0
-            && self
-                .values
-                .last()
-                .is_some_and(|values| values.len() < values.capacity());
-        if !has_room {
-            return self.add_record(key);
-        }
-        self.len += 1;
-        *self.pages.page_slot_mut(page, index) =
-            u32::try_from(self.len).expect("link store overflow");
-        self.values.last_mut().expect("link chunk")
-    }
-
-    /// `new_record` when the page of the key or room in the last chunk is
-    /// missing: adds them first.
-    #[cold]
-    #[inline(never)]
-    fn add_record(&mut self, key: K) -> &mut Vec<V> {
-        let stored = match key.link_slot() {
-            LinkSlot::Arena(index) => self.pages.slot_mut(&mut self.arena, index),
-            LinkSlot::File(file, index) => {
-                if file >= self.files.len() {
-                    self.files.resize_with(file + 1, Vec::new);
-                }
-                self.pages.slot_mut(&mut self.files[file], index)
-            }
-            LinkSlot::Map => unreachable!("map keys have no slot"),
-        };
-        if self.len % LINK_CHUNK_SIZE == 0 {
-            // The first chunk grows on demand; small stores stay small.
-            self.values.push(if self.len == 0 {
-                Vec::new()
-            } else {
-                Vec::with_capacity(LINK_CHUNK_SIZE)
-            });
-        }
-        self.len += 1;
-        *stored = u32::try_from(self.len).expect("link store overflow");
-        let values = self.values.last_mut().expect("link chunk");
-        // The same growth as `Vec::push` on a full first chunk.
-        values.reserve(1);
-        values
-    }
-
     /// Go `store.Has(key)`.
+    #[inline]
     #[must_use]
     pub fn has(&self, key: K) -> bool {
         match key.link_slot() {
             LinkSlot::Map => self.map.contains_key(&key),
-            slot => self.slot_value(slot).is_some(),
+            slot => self.cell(slot).is_some_and(Option::is_some),
         }
     }
 
     /// Go `store.TryGet(key)`.
+    #[inline]
     #[must_use]
     pub fn try_get(&self, key: K) -> Option<&V> {
         match key.link_slot() {
             LinkSlot::Map => self.map.get(&key),
-            slot => self.slot_value(slot).map(|value| self.value(value)),
+            slot => self.cell(slot)?.as_ref(),
         }
+    }
+}
+
+// PORT: no Go counterpart. The pages of `LinkStore` (AST node records step 7).
+#[cfg(test)]
+mod link_store_tests {
+    use super::*;
+
+    // `get` makes a default record, `insert_new` a record with a value, and
+    // `has` and `try_get` see only keys with a record: not the other keys of
+    // a page, a file or the map. File keys, synthetic (map) keys and arena
+    // keys with a boxed value.
+    #[test]
+    fn link_store_pages_keep_records_by_key() {
+        let node = |file: u64, local: u64| Node(file << 32 | local);
+        let mut nodes = LinkStore::<Node, u32>::default();
+        let a = node(3, 5);
+        assert!(!nodes.has(a) && nodes.try_get(a).is_none());
+        *nodes.get(a) = 7;
+        assert_eq!(nodes.try_get(a), Some(&7));
+        assert!(!nodes.has(node(3, 6)), "a key in the same page");
+        assert_eq!(*nodes.get(node(3, 6)), 0, "get makes a default record");
+        assert!(nodes.has(node(3, 6)));
+        assert!(!nodes.has(node(1, 5)), "a key of another file");
+        let far = node(0, 64 * 1000 + 1);
+        *nodes.insert_new(far, 9) += 1;
+        assert_eq!(nodes.try_get(far), Some(&10));
+        let synthetic = node(u64::from(u32::MAX) - 1, 5);
+        *nodes.get(synthetic) = 4;
+        assert_eq!(nodes.try_get(synthetic), Some(&4));
+        assert!(!nodes.has(node(u64::from(u32::MAX) - 1, 6)));
+
+        let mut symbols = LinkStore::<SymbolId, Box<[u64; 8]>>::default();
+        symbols.get(SymbolId(70))[1] = 2;
+        symbols.insert_new(SymbolId(1), Box::new([1; 8]));
+        assert_eq!(symbols.try_get(SymbolId(70)).map(|v| v[1]), Some(2));
+        assert_eq!(symbols.try_get(SymbolId(1)).map(|v| v[7]), Some(1));
+        assert!(!symbols.has(SymbolId(71)) && !symbols.has(SymbolId(64 * 50)));
     }
 }
 
@@ -3082,7 +3127,8 @@ pub struct GoFile {
     pub parser_flags: Vec<NodeFlags>,
     /// Go `ast.SourceFile` fields that the parser and program set.
     pub info: crate::program::SourceFileInfo,
-    /// Binder data per node, indexed by `NodeId::index()`.
+    /// The binder fields of the nodes that are not in their node records
+    /// (`ast/store.rs`, `NodeRecord`): set by the install with the records.
     pub node_bind: std::sync::OnceLock<FileNodeBind>,
     pub file_bind: std::sync::OnceLock<FileBindData>,
     pub flow_nodes: std::sync::OnceLock<Vec<FlowNode>>,

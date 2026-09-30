@@ -311,6 +311,13 @@ impl DefaultResolver {
         self.caches.package_json_info_cache.range(f);
     }
 
+    /// Takes the file system lookups of the parse worker answers that this
+    /// resolver took (`Caches::worker_lookups`).
+    // PORT: not in Go (see `BuildStatCache`).
+    pub fn take_worker_lookups(&self) -> Vec<Arc<[StatLookup]>> {
+        std::mem::take(&mut *self.caches.worker_lookups.borrow_mut())
+    }
+
     /// Adds to the package.json cache the lookups of the parse worker
     /// answers that this resolver took (`Caches::worker_package_jsons`), so
     /// that it holds what the one Go cache of all parse tasks holds. An
@@ -404,6 +411,7 @@ impl DefaultResolver {
                 && let Some(found) = shared.cache.get_type_ref_directive(&cache_key)
             {
                 self.caches.note_worker_package_jsons(&found.package_jsons);
+                self.caches.note_worker_lookups(&found.lookups);
                 let found = Rc::new((*found.value).clone());
                 self.caches
                     .type_ref_directive_resolution_cache
@@ -459,6 +467,7 @@ impl DefaultResolver {
                 SharedResolution {
                     value: Arc::new((*result).clone()),
                     package_jsons: self.caches.take_package_json_log(),
+                    lookups: self.caches.take_worker_lookup_log(),
                 },
             );
         }
@@ -539,6 +548,7 @@ impl DefaultResolver {
                 && let Some(found) = shared.cache.get_module(&cache_key)
             {
                 self.caches.note_worker_package_jsons(&found.package_jsons);
+                self.caches.note_worker_lookups(&found.lookups);
                 self.caches
                     .module_resolution_cache
                     .set(cache_key, found.value.clone());
@@ -627,6 +637,7 @@ impl DefaultResolver {
                 SharedResolution {
                     value: Arc::clone(&final_result),
                     package_jsons: self.caches.take_package_json_log(),
+                    lookups: self.caches.take_worker_lookup_log(),
                 },
             );
         }

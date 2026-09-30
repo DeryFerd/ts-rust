@@ -1045,11 +1045,11 @@ pub fn parse_json_config_file_content_worker(
     // Go: getFileNames(basePathForFileNames)
     let (file_names, literal_file_names_len) = {
         let parsed_config_options = parsed_config.options.as_ref();
-        let (file_names, literal_file_names_len) = get_file_names_from_config_specs(
+        let (file_names, literal_file_names_len) = host.get_file_names_from_config_specs(
+            config_file_name,
             &config_file_specs,
             &base_path_for_file_names,
             parsed_config_options,
-            &*host.fs(),
             &content_mapper_extensions,
         );
         if should_report_no_input_files(

@@ -263,9 +263,15 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         // PERF: Go resolves in all parse tasks with one shared cache. Here the
         // parse workers resolve ahead of the loader, and the loader reads their
         // answers. Only when every resolver sees the same files: the plain OS
-        // file system (no project reference faking host) and no traced
-        // resolution (Go then skips the cache too). Only for the default
-        // resolver: a parse worker cannot run a `create_module_resolver` one.
+        // file system (for `tsc -b`, the workers read the host's cache,
+        // `BuildStatCache`), no project reference faking host (only a
+        // program that uses the sources of its references has one) and no
+        // traced resolution (Go then skips the cache too). A worker resolves
+        // the output `.d.ts` file of a project reference with its redirect, as
+        // the loader does; the redirect is part of the cache key. A program
+        // with project references shares answers only in `tsc -b`. Only for
+        // the default resolver: a parse worker cannot run a
+        // `create_module_resolver` one.
         // PORT: with `skip_module_resolution` the loader resolves nothing
         // (ts#64024), so the workers do not either.
         if !single_threaded
@@ -274,11 +280,13 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
             && !loader.opts.skip_module_resolution
             && loader.opts.host.is_plain_os_fs()
             && compiler_options.trace_resolution != Tristate::True
-            && loader
+            && (loader
                 .opts
                 .config
                 .resolved_project_reference_paths()
                 .is_empty()
+                || loader.opts.host.stat_cache().is_some())
+            && !loader.opts.can_use_project_reference_source()
         {
             let shared = Arc::new(SharedResolutionCache::default());
             resolver.caches.shared = Some(SharedResolutionLink {
@@ -341,6 +349,20 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
 
     let root_tasks = loader.root_tasks.clone();
     loader.files_parser.borrow_mut().parse(&loader, &root_tasks);
+    // The parse workers have ended. The `tsc -b` host's cache keeps the
+    // lookups of the worker answers that the loader took, as Go's cache
+    // keeps the lookups of its parse tasks, and drops the other worker
+    // lookups (`BuildStatCache`). Only the default resolver takes worker
+    // answers.
+    if let Some(stats) = loader.opts.host.stat_cache() {
+        let taken = loader
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.as_default_resolver())
+            .map(|resolver| resolver.take_worker_lookups())
+            .unwrap_or_default();
+        stats.end_load(&taken);
+    }
 
     // Clear out loader and host to ensure its not used post program creation
     {

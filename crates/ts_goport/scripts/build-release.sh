@@ -4,7 +4,7 @@
 #
 # Default (the shipped build): dynamic glibc with jemalloc as the allocator
 # (default cargo feature `jemalloc`; jemalloc has
-# narenas:4,thp:always,metadata_thp:always built in: this script sets
+# narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false built in: this script sets
 # JEMALLOC_SYS_WITH_MALLOC_CONF to the JEMALLOC_CONF line of bin/tsgo.rs, see bin/goport.rs
 # `set_malloc_tunables`; step 4 checks it). The bins link against glibc 2.28, so
 # they start on any x86-64 Linux with glibc 2.28 or later (Debian 10, RHEL 8,
@@ -49,7 +49,9 @@
 # with narenas:4 only was 12 to 14% slower on dbook (THP madvise: jemalloc got
 # no huge pages) and 3 to 7% slower on cup2 (THP always). With
 # thp:always,metadata_thp:always set by hand it was 0.5 to 6% faster on dbook
-# and 2 to 4% slower on cup2. So the bins now set those. A dynamic build has
+# and 2 to 4% slower on cup2. So the bins now set thp:always (rss1 then set
+# metadata_thp:disabled and cache_oblivious:false for less RSS, see
+# bin/goport.rs `set_malloc_tunables`). A dynamic build has
 # no LGPL relink duties (glibc stays a shared library). Linked against the
 # host glibc it needed glibc 2.39 (pidfd_spawnp in Rust std), hence the floor.
 # Not used: -C target-cpu=x86-64-v3 (no measurable gain, and no AVX2 means

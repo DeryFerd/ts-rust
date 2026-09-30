@@ -3,7 +3,8 @@
 //! PORT: Go stores binder output on AST nodes and on `ast.SourceFile`. Here
 //! the AST is immutable, so the binder keeps that output in `Binder`
 //! (`node_bind`, `file_bind`, `flow_nodes`) while it runs, and
-//! `bind_source_file` moves it into the `GoFile` `OnceCell`s at the end.
+//! `bind_source_file` moves it into the node records (`ast/store.rs`) and
+//! the `GoFile` `OnceCell`s at the end (`BoundFile::install`).
 //! Binder code must read and write node binder data through the `Binder`
 //! helpers below (`node_symbol`, `set_node_symbol`, `node_flags`,
 //! `get_locals`, `flow`, `flow_mut`, ...), not through `Node::symbol()` and
@@ -151,7 +152,9 @@ pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
 /// Binder data per node of the file being bound. Most nodes get no data, so
 /// a node keeps a 4-byte slot into `entries`, and `entries[0]` is the empty
 /// data, which is never written. The flow node of a node is kept in `flows`,
-/// not in `entries`, and `finish` merges it into the data.
+/// not in `entries`. The install writes both into the node records
+/// (`nodes`, `ast::bind_store_records`); `compact` merges them into the
+/// compact form of the lib bind snapshot.
 // PERF: bind C. The binder gives a flow node to every identifier (Go
 // binder.go `bind`), so a flow node in `entries` made a 40-byte entry for
 // each of them. Now it is one 4-byte write.
@@ -220,8 +223,29 @@ impl NodeBindBuilder {
         self.flow_count += usize::from(old == 0 && low != 0);
     }
 
+    /// Each node that has data or a flow node, in node order: its
+    /// `NodeId::index()`, the index of its entry in `entries`, the data
+    /// (`None` for a node with only a flow node) and the flow node.
+    fn nodes(&self) -> impl Iterator<Item = (usize, usize, Option<&NodeBindData>, FlowNodeId)> {
+        let flow_file = self.flow_file;
+        self.slots
+            .iter()
+            .zip(&self.flows)
+            .enumerate()
+            .filter(|&(_, (&slot, &flow))| slot | flow != 0)
+            .map(move |(index, (&slot, &flow))| {
+                let flow = if flow == 0 {
+                    FlowNodeId::NIL
+                } else {
+                    FlowNodeId(flow_file | u64::from(flow))
+                };
+                let data = (slot != 0).then(|| &self.entries[slot as usize]);
+                (index, slot as usize, data, flow)
+            })
+    }
+
     /// The compact form of the data, in node order.
-    fn finish(&self) -> FileNodeBind {
+    fn compact(&self) -> NodeBindParts {
         debug_assert!(
             self.entries.iter().all(|data| data.flow_node.is_nil()),
             "flow node written outside set_flow_node"
@@ -238,16 +262,60 @@ impl NodeBindBuilder {
             }
             Some(data)
         });
-        FileNodeBind::new(nodes, entries.len() - 1 + self.flow_count)
+        NodeBindParts::new(nodes, entries.len() - 1 + self.flow_count)
+    }
+}
+
+/// The binder data of the nodes of one file as the bind hands it over
+/// (`BoundFile`): the builder of a live bind, or the compact form that the
+/// lib bind snapshot keeps. The install writes either into the node records
+/// (`ast::bind_store_records`).
+// PERF: AST node records, step 2. A live bind hands over its builder: a
+// compact form made on the bind thread would be read again by the install,
+// and the compaction (`NodeBindParts::new`) was about 0.35% of the
+// instructions of `goport -p` on effect.
+pub enum BoundNodes {
+    Built(NodeBindBuilder),
+    Parts(NodeBindParts),
+}
+
+impl BoundNodes {
+    /// The compact form, as the lib bind snapshot keeps it.
+    #[must_use]
+    pub fn compact(&self) -> std::borrow::Cow<'_, NodeBindParts> {
+        match self {
+            BoundNodes::Built(builder) => std::borrow::Cow::Owned(builder.compact()),
+            BoundNodes::Parts(parts) => std::borrow::Cow::Borrowed(parts),
+        }
+    }
+
+    /// The data entries, for remapping ids in place (`BoundFile::remap`).
+    fn entries_mut(&mut self) -> &mut [NodeBindData] {
+        match self {
+            BoundNodes::Built(builder) => &mut builder.entries,
+            BoundNodes::Parts(parts) => parts.entries_mut(),
+        }
+    }
+
+    /// Writes the data into the node records of published file `file` and
+    /// gives the extras (`ast::bind_store_records`).
+    fn write_records(&self, file: usize) -> Vec<NodeBindExtra> {
+        match self {
+            BoundNodes::Built(builder) => crate::ast::bind_store_records(file, builder.nodes()),
+            BoundNodes::Parts(parts) => crate::ast::bind_store_records(
+                file,
+                parts
+                    .nodes()
+                    .map(|(index, entry, data)| (index, entry, Some(data), data.flow_node)),
+            ),
+        }
     }
 }
 
 /// The binder output of one file before it is stored in its `GoFile`.
 pub struct BoundFile {
     pub file: Node,
-    /// Compacted on the bind thread, so the dense per-node arrays are freed
-    /// (and reused) there.
-    pub node_bind: FileNodeBind,
+    pub node_bind: BoundNodes,
     pub flow_nodes: Vec<FlowNode>,
     pub file_bind: FileBindData,
 }
@@ -310,9 +378,13 @@ pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile
         flow_nodes,
         ..
     } = b;
+    debug_assert!(
+        node_bind.entries.iter().all(|data| data.flow_node.is_nil()),
+        "flow node written outside set_flow_node"
+    );
     BoundFile {
         file,
-        node_bind: node_bind.finish(),
+        node_bind: BoundNodes::Built(node_bind),
         flow_nodes,
         file_bind,
     }
@@ -320,11 +392,17 @@ pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile
 
 impl BoundFile {
     /// Stores the output in the file's `GoFile` `OnceLock`s (Go
-    /// `file.BindOnce`).
+    /// `file.BindOnce`). AST node records, step 2: first writes the symbol,
+    /// the flow node and the added flags of each node into its record
+    /// (`ast::bind_store_records`); the other fields go into the
+    /// `FileNodeBind` of the file.
     pub fn install(self) {
-        let go_file = crate::ast::go_file(self.file.file_index());
+        let file = self.file.file_index();
+        let go_file = crate::ast::go_file(file);
+        assert!(go_file.node_bind.get().is_none(), "file already bound");
+        let extras = self.node_bind.write_records(file);
         assert!(
-            go_file.node_bind.set(self.node_bind).is_ok(),
+            go_file.node_bind.set(FileNodeBind::new(extras)).is_ok(),
             "file already bound"
         );
         assert!(
@@ -341,6 +419,7 @@ impl BoundFile {
     /// arena to their place in the program arena (see
     /// `SymbolArena::append_file_arena`).
     pub fn remap(&mut self, offsets: ArenaOffsets) {
+        // A live bind remaps its entry 0 (the empty data) too: nil stays nil.
         for data in self.node_bind.entries_mut() {
             data.symbol = offsets.symbol(data.symbol);
             data.local_symbol = offsets.symbol(data.local_symbol);

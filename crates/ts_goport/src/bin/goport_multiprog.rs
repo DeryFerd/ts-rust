@@ -98,7 +98,7 @@ fn pair(config: &str, changed: &str, new_text_file: &str, out: &Path, first: Opt
     let new_text = read(new_text_file);
     let changed_name = go_file_name(changed);
 
-    // 1. An unrelated version first, so A and B live in tier 1.
+    // 1. An unrelated version first, so A and B are not in the first publish.
     if let Some(first) = first {
         let x = load(first);
         write(&out.join("first.txt"), &report(x).0);

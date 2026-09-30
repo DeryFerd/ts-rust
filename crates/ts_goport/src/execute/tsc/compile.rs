@@ -19,6 +19,7 @@ use crate::contentmapper::{
 use crate::emitter::program_emit::EmitResult;
 use crate::frontend::tsoptions::ParseConfigHost;
 use crate::frontend::vfs::Fs;
+use crate::fswatch::syscall::io_error_text;
 use crate::gostd::{Context, GoError};
 // PORT: testing (`CommandLineTesting`)
 use crate::frontend::compiler::TraceFn;
@@ -309,7 +310,10 @@ pub fn new_os_system() -> Result<OsSystem, ExitStatus> {
     let cwd = match crate::frontend::vfs::os_current_dir() {
         Ok(cwd) => cwd,
         Err(err) => {
-            eprintln!("Error getting current directory: {err}");
+            eprintln!(
+                "Error getting current directory: {}",
+                crate::frontend::vfs::getwd_error_text(&err)
+            );
             return Err(ExitStatus::InvalidProjectOutputsSkipped);
         }
     };
@@ -464,10 +468,10 @@ pub fn spawn_process(
     {
         return Err(crate::gostd::errors::new(format!(
             "chdir {dir}: {}",
-            go_errno_text(&err)
+            io_error_text(&err)
         )));
     }
-    let io_error = |err: std::io::Error| crate::gostd::errors::new(go_errno_text(&err));
+    let io_error = |err: std::io::Error| crate::gostd::errors::new(io_error_text(&err));
     let (stdin, child_stdin) = UnixStream::pair().map_err(io_error)?;
     let (stdout, child_stdout) = UnixStream::pair().map_err(io_error)?;
     let mut cmd = Command::new(&program);
@@ -495,7 +499,7 @@ pub fn spawn_process(
     // end of the stream when the child exits.
     drop(cmd);
     let child = spawned.map_err(|err| {
-        crate::gostd::errors::new(format!("fork/exec {program}: {}", go_errno_text(&err)))
+        crate::gostd::errors::new(format!("fork/exec {program}: {}", io_error_text(&err)))
     })?;
     // Go copies a non-file `cmd.Stderr` on a goroutine.
     let stderr = stderr_copy.map(|(stream, reader, mut writer)| {
@@ -591,7 +595,7 @@ impl crate::ipc::ReadWriteCloser for ChildProcess {
             }
             Err(err) => Err(crate::gostd::errors::new(format!(
                 "wait: {}",
-                go_errno_text(&err)
+                io_error_text(&err)
             ))),
         }
     }
@@ -671,28 +675,9 @@ fn go_abs(path: &str) -> Result<String, GoError> {
     if path.starts_with('/') {
         return Ok(go_path_clean(path));
     }
-    let wd = go_getwd()?;
+    let wd = crate::frontend::vfs::os_current_dir()
+        .map_err(|err| crate::gostd::errors::new(crate::frontend::vfs::getwd_error_text(&err)))?;
     Ok(go_path_clean(&format!("{wd}/{path}")))
-}
-
-/// Go `os.Getwd()` on Unix (os/getwd.go): `$PWD` when it is absolute and
-/// names the current directory, else the `getcwd` result.
-#[cfg(unix)]
-fn go_getwd() -> Result<String, GoError> {
-    use std::os::unix::fs::MetadataExt;
-    let dot = std::fs::metadata(".")
-        .map_err(|err| crate::gostd::errors::new(format!("stat .: {}", go_errno_text(&err))))?;
-    if let Ok(dir) = std::env::var("PWD")
-        && dir.starts_with('/')
-        && let Ok(d) = std::fs::metadata(&dir)
-        && d.dev() == dot.dev()
-        && d.ino() == dot.ino()
-    {
-        return Ok(dir);
-    }
-    std::env::current_dir()
-        .map(|dir| dir.to_string_lossy().into_owned())
-        .map_err(|err| crate::gostd::errors::new(format!("getwd: {}", go_errno_text(&err))))
 }
 
 /// Go `path.Clean` (the Unix `filepath.Clean`).
@@ -746,39 +731,6 @@ fn go_path_clean(path: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The Go text of an OS error: Go's errno table is the C text with a
-/// lowercase first letter, without Rust's " (os error N)".
-#[cfg(unix)]
-fn go_errno_text(err: &std::io::Error) -> String {
-    let text = err.to_string();
-    let text = match err.raw_os_error() {
-        Some(code) => text
-            .strip_suffix(&format!(" (os error {code})"))
-            .unwrap_or(&text)
-            .to_string(),
-        None => text,
-    };
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(first) => first.to_lowercase().chain(chars).collect(),
-        None => String::new(),
-    }
-}
-
-/// The Go text of an OS error on Windows: Go `syscall.Errno.Error()` is the
-/// system message, which is Rust's text without its " (os error N)".
-#[cfg(windows)]
-fn go_errno_text(err: &std::io::Error) -> String {
-    let text = err.to_string();
-    match err.raw_os_error() {
-        Some(code) => text
-            .strip_suffix(&format!(" (os error {code})"))
-            .unwrap_or(&text)
-            .to_string(),
-        None => text,
-    }
-}
-
 // Go: cmd/tsgo/sys.go:74 spawnProcess (tsgo#4712), on Windows
 // spawnProcess launches a process and adapts its stdio to an io.ReadWriteCloser (Read is its stdout,
 // Write is its stdin).
@@ -829,7 +781,7 @@ pub fn spawn_process(
     {
         return Err(crate::gostd::errors::new(format!(
             "chdir {dir}: {}",
-            go_errno_text(&err)
+            io_error_text(&err)
         )));
     }
     let fork_exec_error =
@@ -842,7 +794,7 @@ pub fn spawn_process(
     } else {
         win_exec::join_exe_dir_and_fname(dir, &lp).map_err(fork_exec_error)?
     };
-    let io_error = |err: std::io::Error| crate::gostd::errors::new(go_errno_text(&err));
+    let io_error = |err: std::io::Error| crate::gostd::errors::new(io_error_text(&err));
     let (child_stdin, stdin) = std::io::pipe().map_err(io_error)?;
     let (stdout, child_stdout) = std::io::pipe().map_err(io_error)?;
     let mut cmd = Command::new(crate::frontend::vfs::os_path(&program).as_os_str());
@@ -867,7 +819,7 @@ pub fn spawn_process(
     // The command holds the child's ends; drop them so that a read sees the
     // end of the stream when the child exits.
     drop(cmd);
-    let child = spawned.map_err(|err| fork_exec_error(go_errno_text(&err)))?;
+    let child = spawned.map_err(|err| fork_exec_error(io_error_text(&err)))?;
     // Go copies a non-file `cmd.Stderr` on a goroutine.
     let stderr_done = stderr_copy.map(|(mut reader, mut writer)| {
         let (done_tx, done) = std::sync::mpsc::channel();
@@ -961,7 +913,7 @@ impl crate::ipc::ReadWriteCloser for ChildProcess {
             }
             Err(err) => Err(crate::gostd::errors::new(format!(
                 "wait: {}",
-                go_errno_text(&err)
+                io_error_text(&err)
             ))),
         }
     }
@@ -974,11 +926,11 @@ impl crate::ipc::ReadWriteCloser for ChildProcess {
 // or in a relative PATH entry is the `ErrDot` error.
 #[cfg(windows)]
 mod win_exec {
-    use super::go_errno_text;
     use crate::frontend::vfs::{
         filepath_clean, filepath_volume_name_len, go_string_from_os, os_path,
         win_is_path_separator as is_slash,
     };
+    use crate::fswatch::syscall::io_error_text;
     use crate::gostd::{GoError, errors, strconv};
 
     /// Go `exec.ErrNotFound` on Windows.
@@ -1014,7 +966,7 @@ mod win_exec {
                 } else {
                     "CreateFile"
                 };
-                Err(format!("{op} {file}: {}", go_errno_text(&err)))
+                Err(format!("{op} {file}: {}", io_error_text(&err)))
             }
         }
     }
@@ -1252,7 +1204,7 @@ mod win_exec {
     fn full_path(name: &str) -> Result<String, String> {
         std::path::absolute(os_path(name))
             .map(go_string_from_os)
-            .map_err(|err| go_errno_text(&err))
+            .map_err(|err| io_error_text(&err))
     }
 
     // Go: syscall/exec_windows.go normalizeDir

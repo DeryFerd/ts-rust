@@ -821,9 +821,10 @@ impl TypingsInstaller {
             ));
             let err = fs.write_file(&npm_config_path, "{ \"private\": true }");
             if let Err(err) = err {
-                // PORT: Go `%v` of an error; `FsError` has no Go text, and
-                // log text is not compared.
-                logger.log(&format!("ATA:: Npm config file write failed: {err:?}"));
+                logger.log(&format!(
+                    "ATA:: Npm config file write failed: {}",
+                    crate::execute::incremental::emit_files::fs_error_text(&err)
+                ));
             }
         }
     }
