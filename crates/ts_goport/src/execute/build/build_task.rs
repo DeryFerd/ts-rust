@@ -850,7 +850,7 @@ impl BuildTask {
             // until `compile_and_emit_finish`, which writes them first
             // (`buffer_early_emit_writes`). So the task writes when the
             // orchestrator finishes it (in the order the checks end, or in
-            // build order for tasks that share outputs, see
+            // build order when tasks share outputs, see
             // `build_all_tasks`), and a task that runs beside others reads
             // the file system before they write. The statistics' check time
             // is the time of the wait for the check plus the time that

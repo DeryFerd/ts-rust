@@ -5,10 +5,11 @@
 //! which task ends first, so Go's output can change between runs. The port
 //! makes the task programs one at a time on the orchestrator thread
 //! (build_task.rs), so its task end order is not Go's. `build_all_tasks`
-//! finishes most tasks in the order their checks end. `SharedOutputs`
-//! finds the tasks where that order can change what a task writes or
-//! reads. These tasks finish in build order, so the output is the same in
-//! every run, and it is Go's output when Go's tasks end in build order.
+//! finishes the tasks in the order their checks end, except in a build
+//! where `outputs_overlap` finds two tasks that can see each other's
+//! writes. There every task finishes in build order, so the output is the
+//! same in every run, and it is Go's output when Go's tasks end in build
+//! order.
 //!
 //! For example, when two tasks A and B (in that order) write the same
 //! `.d.ts`, and D references B while E references A: A ends first here, E
@@ -19,31 +20,33 @@
 
 use crate::frontend::prelude::*;
 
-/// The tasks of one `build_all_tasks` call (by build order index) that can
-/// see the writes of a task that runs at the same time.
+/// True when the output area of one task of `configs` (the configs of the
+/// tasks of a build; None when a config did not parse) overlaps the output
+/// area or a root file directory of another. `to_path` is the
+/// orchestrator's `to_path`.
 ///
 /// The output area of a task is where it can write: its output directories
 /// and everything under them (`outDir`, `declarationDir`, or the directories
 /// of its root files when its outputs go next to them) and its build info
-/// file. Two output areas overlap when one holds the other. The areas come
+/// file. Two directories overlap when one holds the other. The areas come
 /// from the configs, so they are known before a task starts, and the same in
 /// every run. A task can also emit a file that is not a root file; when that
 /// file is outside the directories above, its outputs are not in the area.
-pub(crate) struct SharedOutputs {
-    /// A task whose output area overlaps the output area or a root file
-    /// directory of another task, and each task downstream of such a task.
-    /// A bound task is taken where it would be if all tasks finished in
-    /// build order.
-    pub bound: Vec<bool>,
-    /// A task that finishes only in build order: a bound task, or a task
-    /// with a bound downstream task (its finish starts that task).
-    pub ordered: Vec<bool>,
+pub(crate) fn outputs_overlap(
+    configs: &[Option<Rc<ParsedCommandLine>>],
+    to_path: impl Fn(&str) -> Path,
+) -> bool {
+    let areas: Vec<Area> = configs
+        .iter()
+        .flatten()
+        .map(|config| Area::of(config, &to_path))
+        .collect();
+    areas_overlap(&areas)
 }
 
 /// The output area and the root file directories of one task, as path
 /// keys (`to_path`). A directory key ends with '/', so a directory holds
 /// each key that starts with its key.
-#[derive(Default)]
 struct Area {
     output_dirs: Vec<String>,
     build_info: Option<String>,
@@ -103,93 +106,43 @@ enum Kind {
     RootDir,
 }
 
-impl SharedOutputs {
-    /// `configs[i]` is the config of task `i` (None when it did not parse),
-    /// and `upstream[i]` its upstream tasks in this build. The build order
-    /// puts upstream tasks first. `to_path` is the orchestrator's `to_path`.
-    pub fn new(
-        configs: &[Option<Rc<ParsedCommandLine>>],
-        upstream: &[Vec<usize>],
-        to_path: impl Fn(&str) -> Path,
-    ) -> Self {
-        let areas: Vec<Area> = configs
-            .iter()
-            .map(|config| {
-                config
-                    .as_ref()
-                    .map_or_else(Area::default, |config| Area::of(config, &to_path))
-            })
-            .collect();
-        Self::of_areas(&areas, upstream)
+fn areas_overlap(areas: &[Area]) -> bool {
+    let mut entries: Vec<(&str, Kind, usize)> = Vec::new();
+    for (task, area) in areas.iter().enumerate() {
+        let dirs = area.output_dirs.iter().map(|key| (key, Kind::OutputDir));
+        let file = area.build_info.iter().map(|key| (key, Kind::OutputFile));
+        let roots = area.root_dirs.iter().map(|key| (key, Kind::RootDir));
+        entries.extend(
+            dirs.chain(file)
+                .chain(roots)
+                .map(|(key, kind)| (key.as_str(), kind, task)),
+        );
     }
-
-    fn of_areas(areas: &[Area], upstream: &[Vec<usize>]) -> Self {
-        let n = areas.len();
-        let mut entries: Vec<(&str, Kind, usize)> = Vec::new();
-        for (task, area) in areas.iter().enumerate() {
-            entries.extend(
-                area.output_dirs
-                    .iter()
-                    .map(|key| (key.as_str(), Kind::OutputDir, task)),
-            );
-            entries.extend(
-                area.build_info
-                    .iter()
-                    .map(|key| (key.as_str(), Kind::OutputFile, task)),
-            );
-            entries.extend(
-                area.root_dirs
-                    .iter()
-                    .map(|key| (key.as_str(), Kind::RootDir, task)),
-            );
+    entries.sort_unstable();
+    // In key order, each key comes right after the keys of the directories
+    // that hold it. `open` keeps the output directories that hold the
+    // current key, and `file` the last output file and its task.
+    let mut open: Vec<(&str, usize)> = Vec::new();
+    let mut file: Option<(&str, usize)> = None;
+    for &(key, kind, task) in &entries {
+        while open.last().is_some_and(|(dir, _)| !key.starts_with(dir)) {
+            open.pop();
         }
-        entries.sort_unstable();
-        entries.dedup();
-
-        // In key order, each key comes right after the keys of the
-        // directories that hold it. `open` keeps the output directories that
-        // hold the current key, and `files` the tasks of the current output
-        // file.
-        let mut bound = vec![false; n];
-        let mut open: Vec<(&str, usize)> = Vec::new();
-        let mut files: (&str, Vec<usize>) = ("", Vec::new());
-        for &(key, kind, task) in &entries {
-            while open.last().is_some_and(|(dir, _)| !key.starts_with(dir)) {
-                open.pop();
-            }
-            let mut others: Vec<usize> = open.iter().map(|&(_, other)| other).collect();
-            if kind == Kind::OutputFile {
-                if files.0 != key {
-                    files = (key, Vec::new());
+        if open.iter().any(|&(_, other)| other != task) {
+            return true;
+        }
+        match kind {
+            Kind::OutputDir => open.push((key, task)),
+            Kind::OutputFile => {
+                if file.is_some_and(|(other_key, other)| other_key == key && other != task) {
+                    return true;
                 }
-                others.extend(&files.1);
-                files.1.push(task);
+                file = Some((key, task));
             }
-            if others.iter().any(|&other| other != task) {
-                bound[task] = true;
-                for other in others {
-                    bound[other] = true;
-                }
-            }
-            if kind == Kind::OutputDir {
-                open.push((key, task));
-            }
+            Kind::RootDir => {}
         }
-
-        // A downstream task reads the outputs of its upstream tasks.
-        for task in 0..n {
-            if upstream[task].iter().any(|&up| bound[up]) {
-                bound[task] = true;
-            }
-        }
-        let mut ordered = bound.clone();
-        for task in (0..n).filter(|&task| bound[task]) {
-            for &up in &upstream[task] {
-                ordered[up] = true;
-            }
-        }
-        SharedOutputs { bound, ordered }
     }
+    false
 }
 
 #[cfg(test)]
@@ -206,11 +159,11 @@ mod tests {
     }
 
     #[test]
-    fn separate_outputs_are_free() {
-        // Two packages and one that references both (query-chain).
+    fn separate_outputs_do_not_overlap() {
+        // Packages that each write to their own dist (query-chain, wide).
         let areas = [
             area(
-                &["/r/a/dist/"],
+                &["/r/a/dist/", "/r/a/dist/"],
                 "/r/a/dist/tsconfig.tsbuildinfo",
                 &["/r/a/src/", "/r/a/"],
             ),
@@ -219,60 +172,21 @@ mod tests {
                 "/r/b/dist/tsconfig.tsbuildinfo",
                 &["/r/b/src/", "/r/b/"],
             ),
-            area(
-                &["/r/c/dist/"],
-                "/r/c/dist/tsconfig.tsbuildinfo",
-                &["/r/c/src/"],
-            ),
+            area(&[], "/r/c/tsconfig.tsbuildinfo", &["/r/c/src/"]),
         ];
-        let shared = SharedOutputs::of_areas(&areas, &[vec![], vec![], vec![0, 1]]);
-        assert_eq!(shared.bound, [false; 3]);
-        assert_eq!(shared.ordered, [false; 3]);
+        assert!(!areas_overlap(&areas));
     }
 
     #[test]
-    fn shared_outputs_are_bound() {
-        // A and B share an outDir and a build info (the skeptic's dep
-        // shape). D references B and E references A. F is apart, G
-        // references F, and H, which also references F, writes in the
-        // shared outDir.
-        let shared_dir = "/r/shared/";
-        let areas = [
-            area(&[shared_dir], "/r/shared.tsbuildinfo", &["/r/pA/src/"]),
-            area(
-                &[shared_dir, shared_dir],
-                "/r/shared.tsbuildinfo",
-                &["/r/pB/src/"],
-            ),
-            area(
-                &["/r/pD/dist/"],
-                "/r/pD/dist/tsconfig.tsbuildinfo",
-                &["/r/pD/src/"],
-            ),
-            area(
-                &["/r/pE/dist/"],
-                "/r/pE/dist/tsconfig.tsbuildinfo",
-                &["/r/pE/src/"],
-            ),
-            area(
-                &["/r/pF/dist/"],
-                "/r/pF/dist/tsconfig.tsbuildinfo",
-                &["/r/pF/src/"],
-            ),
-            area(&["/r/pG/dist/"], "/r/pG/dist/x.tsbuildinfo", &["/r/pG/"]),
-            area(&[shared_dir], "/r/pH/dist/x.tsbuildinfo", &["/r/pH/"]),
-        ];
-        let upstream = [vec![], vec![], vec![1], vec![0], vec![], vec![4], vec![4]];
-        let shared = SharedOutputs::of_areas(&areas, &upstream);
-        assert_eq!(shared.bound, [true, true, true, true, false, false, true]);
-        assert_eq!(shared.ordered, [true, true, true, true, true, false, true]);
-    }
-
-    #[test]
-    fn overlaps_are_by_directory() {
-        // An outDir under another one, a build info in another outDir, a
-        // root directory in another outDir, and a shared build info alone.
+    fn overlaps() {
+        // A shared outDir, an outDir under another one, a build info in
+        // another outDir, a root directory in another outDir, and a shared
+        // build info alone.
         let pairs = [
+            (
+                area(&["/r/shared/"], "", &[]),
+                area(&["/r/shared/"], "", &[]),
+            ),
             (area(&["/r/dist/"], "", &[]), area(&["/r/dist/b/"], "", &[])),
             (
                 area(&["/r/dist/"], "", &[]),
@@ -288,8 +202,7 @@ mod tests {
             ),
         ];
         for (a, b) in pairs {
-            let shared = SharedOutputs::of_areas(&[a, b], &[vec![], vec![]]);
-            assert_eq!(shared.bound, [true, true]);
+            assert!(areas_overlap(&[a, b]));
         }
         // A directory whose name starts with another's name, and an outDir
         // inside a root directory (the root files are only the ones there).
@@ -301,8 +214,7 @@ mod tests {
             (area(&["/r/a/dist/"], "", &[]), area(&[], "", &["/r/a/"])),
         ];
         for (a, b) in pairs {
-            let shared = SharedOutputs::of_areas(&[a, b], &[vec![], vec![]]);
-            assert_eq!(shared.bound, [false, false]);
+            assert!(!areas_overlap(&[a, b]));
         }
     }
 }
