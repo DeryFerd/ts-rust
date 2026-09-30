@@ -10,6 +10,9 @@
 # they start on any x86-64 Linux with glibc 2.28 or later (Debian 10, RHEL 8,
 # Ubuntu 20.04 and later).
 # RELEASE_STATIC=1: static glibc with glibc malloc, for comparison.
+# RELEASE_LIBC=musl: static musl with jemalloc (no shared libraries, like Go's
+# tsgo). RELEASE_PIE=0: a non-PIE bin (like Go's tsgo). See the static1 note
+# below for what each one costs.
 #
 # Lib files: a shipped release (RELEASE_VERSION set) is Go's noembed build, as
 # Go's release builds and npm packages are. The lib files are not in the bins;
@@ -55,8 +58,21 @@
 # no LGPL relink duties (glibc stays a shared library). Linked against the
 # host glibc it needed glibc 2.39 (pidfd_spawnp in Rust std), hence the floor.
 # Not used: -C target-cpu=x86-64-v3 (no measurable gain, and no AVX2 means
-# SIGILL), -C relocation-model=static (0.3 ms per process, loses ASLR), and
-# panic=abort (the port catches panics for Go recover parity).
+# SIGILL), and panic=abort (the port catches panics for Go recover parity).
+# Measured on R145 source (static1 lane, target/continuation-r97-goport/static1):
+# PGO + BOLT builds against the default, paired rounds of tsgo check and emit on
+# query, hono, zod and effect, on dbook and mini-abf9. Output is byte-equal.
+#   - RELEASE_PIE=0: 1.0 to 1.3% faster (mean of the 8 cells), peak RSS the
+#     same. Same glibc floor. The bin loses ASLR for its own code and data, as
+#     Go's tsgo (non-PIE) does.
+#   - RELEASE_LIBC=musl RELEASE_PIE=0: starts on any x86-64 Linux (glibc 2.27,
+#     Alpine), no shared libraries, 2 to 4 MiB less RSS on query and hono. But
+#     1.0 to 1.4% slower (hono and effect emit up to 2.7%): musl's memcpy,
+#     memcmp and memset take 5 to 7% of the time, glibc's about 3.5%. Without
+#     PGO and BOLT, a musl static-pie bin is 4% slower than the default.
+#   - -Wl,-z,pack-relative-relocs with glibc: the bin needs GLIBC_ABI_DT_RELR
+#     (glibc 2.36), so it does not start on the floor glibc. Not used.
+# So the default stays dynamic glibc and PIE.
 #
 # Environment:
 #   RUSTUP_TOOLCHAIN  default 1.95.0. Its LLVM 22 matches the system
@@ -68,9 +84,18 @@
 #                     sysroot. 1: static-pie, glibc linked in. Static glibc
 #                     brings LGPL relink duties when shipped, and the glibc
 #                     must support the oldest kernel we ship to.
-#   RELEASE_JEMALLOC  1: jemalloc (default when dynamic). 0: glibc malloc
-#                     (default when static; the build passes
-#                     --no-default-features).
+#   RELEASE_LIBC      gnu (default): glibc, as RELEASE_STATIC says. musl: the
+#                     target x86_64-unknown-linux-musl, fully static. rustc
+#                     links its own musl (1.2.5) and libunwind; the jemalloc C
+#                     code builds with musl-gcc (package musl). Needs
+#                     `rustup target add x86_64-unknown-linux-musl` for
+#                     RUSTUP_TOOLCHAIN. musl is MIT licensed (no LGPL duties).
+#   RELEASE_PIE       1 (default): a position-independent bin (PIE or
+#                     static-pie). 0: -C relocation-model=static, a bin at a
+#                     fixed address with no relative relocations, as Go's.
+#   RELEASE_JEMALLOC  1: jemalloc (default, except with static glibc). 0:
+#                     glibc malloc (default with static glibc; the build
+#                     passes --no-default-features).
 #   RELEASE_FEATURES  more cargo features of ts_goport for both builds
 #                     (default none). "jemalloc" there sets RELEASE_JEMALLOC=1.
 #                     "noembed" builds Go's noembed mode, as Go's release builds
@@ -148,8 +173,14 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$script_dir/../../.." && pwd)"
 data_root="${GOPORT_DATA_ROOT:-$(cd -- "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)}"
 out="${1:-$data_root/target/goport-release}"
+libc="${RELEASE_LIBC:-gnu}"
+pie="${RELEASE_PIE:-1}"
 static="${RELEASE_STATIC:-0}"
-jemalloc="${RELEASE_JEMALLOC:-$((static == 1 ? 0 : 1))}"
+case $libc in
+  gnu) jemalloc="${RELEASE_JEMALLOC:-$((static == 1 ? 0 : 1))}" ;;
+  musl) static=1 jemalloc="${RELEASE_JEMALLOC:-1}" ;;
+  *) echo "error: RELEASE_LIBC is gnu or musl, not $libc" >&2; exit 1 ;;
+esac
 features="${RELEASE_FEATURES:-}"
 # A shipped release is the noembed build (see the header).
 if [[ -n ${RELEASE_VERSION:-} && ",${features// /,}," != *,noembed,* ]]; then
@@ -176,6 +207,14 @@ cd "$repo"
 # llvm-profdata must not be newer than rustc's LLVM (see build-pgo.sh).
 sysroot="$(rustc --print sysroot)"
 host="$(rustc -vV | sed -n 's/^host: //p')"
+target="$host"
+if [[ $libc == musl ]]; then
+  target="${host%-gnu}-musl"
+  # -Cprofile-generate needs the profiler runtime of the target's std.
+  compgen -G "$sysroot/lib/rustlib/$target/lib/libprofiler_builtins-*.rlib" > /dev/null \
+    || { echo "error: no std for $target in $sysroot (rustup target add $target)" >&2; exit 1; }
+  command -v musl-gcc > /dev/null || { echo "error: musl-gcc not found (package musl); jemalloc needs it" >&2; exit 1; }
+fi
 rustc_llvm="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
 profdata="${LLVM_PROFDATA:-}"
 if [[ -z "$profdata" ]]; then
@@ -240,7 +279,11 @@ link_flags=""
 # CFLAGS_<target> for the C code (jemalloc), in both builds.
 c_env=()
 glibc_root=""
-if [[ $static == 1 ]]; then
+if [[ $libc == musl ]]; then
+  # Static by default. rustc links its own musl libc.a, crt files and
+  # libunwind (self-contained), so only the jemalloc C code needs musl-gcc.
+  c_env=("CC_${target//-/_}=musl-gcc")
+elif [[ $static == 1 ]]; then
   link_flags="-C target-feature=+crt-static"
   if [[ -n ${RELEASE_SYSROOT:-} ]]; then
     RELEASE_SYSROOT="$(cd -- "$RELEASE_SYSROOT" && pwd)"
@@ -270,6 +313,9 @@ else
   for f in $floor_flags; do link_flags+=" -C link-arg=$f"; done
   c_env=("CFLAGS_${host//-/_}=$floor_flags")
 fi
+# No PIE: the code uses fixed addresses, so the bin has almost no relocations
+# to apply at start and no .data.rel.ro pages to write.
+[[ $pie == 1 ]] || link_flags+=" -C relocation-model=static"
 
 cargo_cmd=(cargo)
 [[ -x "$repo/scripts/run-cargo-capped.sh" ]] && cargo_cmd=("$repo/scripts/run-cargo-capped.sh")
@@ -311,7 +357,7 @@ build() {
   for b in "$@"; do bin_args+=(--bin "$b"); done
   echo "== build $name ($flags) ${feature_args[*]}"
   env "${c_env[@]}" CARGO_TARGET_DIR="$out/$name" TS_CARGO_SEPARATE_TARGET=1 TS_CARGO_SCCACHE=0 RUSTFLAGS="$flags" \
-    "${cargo_cmd[@]}" build --profile goport --offline --locked -p ts_goport --target "$host" "${feature_args[@]}" "${bin_args[@]}" \
+    "${cargo_cmd[@]}" build --profile goport --offline --locked -p ts_goport --target "$target" "${feature_args[@]}" "${bin_args[@]}" \
     > "$out/build-$name.log" 2>&1 || { tail -20 "$out/build-$name.log" >&2; exit 1; }
 }
 
@@ -332,7 +378,7 @@ profiles="$out/profiles"
 rm -rf "$profiles"
 mkdir -p "$profiles"
 build target-gen "-Cprofile-generate=$profiles $link_flags" goport tsgo goport_emit
-gen="$out/target-gen/$host/goport"
+gen="$out/target-gen/$target/goport"
 libs_to "$gen"
 
 # 2. PGO training. Exit codes 1 and 2 are expected: some inputs have diagnostics on
@@ -388,7 +434,7 @@ if grep -q "profile format version\|profile-use" "$out/build-target-use.log"; th
   echo "error: rustc did not use the profile" >&2
   exit 1
 fi
-use="$out/target-use/$host/goport"
+use="$out/target-use/$target/goport"
 libs_to "$use"
 if [[ -n $version && $("$use/tsgo" -v) != "Version $version" ]]; then
   echo "error: $use/tsgo reports $("$use/tsgo" -v), not Version $version (RELEASE_VERSION)" >&2
@@ -418,6 +464,12 @@ if [[ $static != 1 ]]; then
     [[ -n $need ]] || { echo "error: objdump -T shows no GLIBC_ version in $use/$b" >&2; exit 1; }
     if [[ $(printf '%s\n' "$need" "GLIBC_$glibc_floor" | sort -V | tail -1) != "GLIBC_$glibc_floor" ]]; then
       echo "error: $b needs $need, above the glibc floor $glibc_floor: $(objdump -T "$use/$b" | grep "($need)" | awk '{print $NF}' | head -5 | xargs)" >&2
+      exit 1
+    fi
+    # -z pack-relative-relocs adds GLIBC_ABI_DT_RELR (glibc 2.36 and later),
+    # which objdump -T does not list.
+    if readelf -VW "$use/$b" | grep -q GLIBC_ABI_DT_RELR; then
+      echo "error: $b needs GLIBC_ABI_DT_RELR (glibc 2.36), above the glibc floor $glibc_floor" >&2
       exit 1
     fi
     echo "glibc floor: $b needs $need at most"
@@ -452,7 +504,7 @@ fi
 # 5. BOLT. No -use-gnu-stack: it drops PT_GNU_STACK (see the rules above).
 bolt_opts=(-reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -split-eh)
 p2b_opts=()
-if [[ $static == 1 ]]; then
+if [[ $static == 1 && $libc == gnu ]]; then
   # The static libgcc unwinder has jump tables that point into ".cold" parts
   # that BOLT cannot tie to their parent (3 local copies of
   # read_encoded_value_with_base). perf2bolt is strict by default and stops on
@@ -607,10 +659,13 @@ for name in query hono; do
 done
 
 {
-  echo "source: $(git -C "$repo" rev-parse HEAD)$(git -C "$repo" diff --quiet HEAD -- crates Cargo.toml Cargo.lock ':!crates/*/scripts' || echo ' (dirty)')"
-  echo "rustc: $(rustc -V), target $host, cargo profile goport"
+  echo "source: $(git -C "$repo" rev-parse HEAD)$(git -C "$repo" diff --quiet HEAD -- crates Cargo.toml Cargo.lock ':(exclude,glob)crates/*/scripts/**' || echo ' (dirty)')"
+  echo "rustc: $(rustc -V), target $target, cargo profile goport"
   echo "pgo: $merged, trained on 5 projects and $n corpus cases"
-  if [[ $static == 1 ]]; then
+  echo "pie: $pie"
+  if [[ $libc == musl ]]; then
+    echo "libc: static musl (rustc self-contained)"
+  elif [[ $static == 1 ]]; then
     echo "static glibc: 1${RELEASE_SYSROOT:+, sysroot $RELEASE_SYSROOT}"
   else
     echo "static glibc: 0, glibc floor $glibc_floor, sysroot $glibc_root"
