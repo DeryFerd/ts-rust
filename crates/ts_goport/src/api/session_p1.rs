@@ -1119,6 +1119,13 @@ impl ipc::Handler for Session {
             m if m == Method::GET_SOURCE_FILE_METADATA.0 => self
                 .handle_get_source_file_metadata(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#64292
+            m if m == Method::GET_MODE_FOR_USAGE_LOCATION.0 => self
+                .handle_get_mode_for_usage_location(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_MODE_FOR_RESOLUTION_AT_INDEX.0 => self
+                .handle_get_mode_for_resolution_at_index(ctx, assert_params(&parsed))
+                .map(to_any),
             // ts#64247
             m if m == Method::GET_RESOLVED_MODULE.0 => self
                 .handle_get_resolved_module(ctx, assert_params(&parsed))
@@ -2485,6 +2492,60 @@ fn file_of(source_file: Node) -> HasFileNameImpl {
 }
 
 impl Session {
+    // Go: api/session.go handleGetModeForUsageLocation (ts#64292)
+    pub fn handle_get_mode_for_usage_location(
+        &self,
+        _ctx: &Context,
+        params: &GetModeForUsageLocationParams,
+    ) -> Result<ResolutionMode, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let source_file = self.resolve_optional_source_file(program, Some(&params.file))?;
+        let usage = sd.resolve_node_handle(program, &params.usage)?;
+        if !is_string_literal_like(usage) {
+            return Err(errors::errorf(
+                format!(
+                    "{}: usage must be a StringLiteralLike node",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        Ok(program.get_mode_for_usage_location(&file_of(source_file), usage))
+    }
+
+    // Go: api/session.go handleGetModeForResolutionAtIndex (ts#64292)
+    pub fn handle_get_mode_for_resolution_at_index(
+        &self,
+        _ctx: &Context,
+        params: &GetModeForResolutionAtIndexParams,
+    ) -> Result<ResolutionMode, GoError> {
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let program = &sd.get_program(&params.project)?;
+        // Current for the whole handler (file header).
+        let _program = ls_program::enter(program);
+        let source_file = self.resolve_optional_source_file(program, Some(&params.file))?;
+        let resolution_count = {
+            let fields = source_file_fields(source_file);
+            let mut resolution_count = fields.imports().len() as i32;
+            for &augmentation in fields.module_augmentations() {
+                if augmentation.kind() == SyntaxKind::StringLiteral {
+                    resolution_count += 1;
+                }
+            }
+            resolution_count
+        };
+        if params.index < 0 || params.index >= resolution_count {
+            return Err(errors::errorf(
+                format!("{}: invalid resolution index", *ERR_CLIENT_ERROR),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        }
+        Ok(program.get_mode_for_resolution_at_index(source_file, params.index))
+    }
+
     // Go: api/session.go handleGetResolvedModule (ts#64247)
     pub fn handle_get_resolved_module(
         &self,

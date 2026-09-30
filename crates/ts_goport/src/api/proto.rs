@@ -267,6 +267,11 @@ impl Method {
     pub const GET_SOURCE_FILE: Method = Method(Cow::Borrowed("getSourceFile"));
     pub const GET_SOURCE_FILE_NAMES: Method = Method(Cow::Borrowed("getSourceFileNames"));
     pub const GET_SOURCE_FILE_METADATA: Method = Method(Cow::Borrowed("getSourceFileMetadata"));
+    // ts#64292
+    pub const GET_MODE_FOR_USAGE_LOCATION: Method =
+        Method(Cow::Borrowed("getModeForUsageLocation"));
+    pub const GET_MODE_FOR_RESOLUTION_AT_INDEX: Method =
+        Method(Cow::Borrowed("getModeForResolutionAtIndex"));
     // ts#64247
     pub const GET_RESOLVED_MODULE: Method = Method(Cow::Borrowed("getResolvedModule"));
     pub const GET_RESOLVED_MODULE_FROM_MODULE_SPECIFIER: Method =
@@ -875,6 +880,15 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     m.insert(
         Method::GET_SOURCE_FILE_METADATA,
         unmarshaller_for::<GetSourceFileParams>,
+    );
+    // ts#64292
+    m.insert(
+        Method::GET_MODE_FOR_USAGE_LOCATION,
+        unmarshaller_for::<GetModeForUsageLocationParams>,
+    );
+    m.insert(
+        Method::GET_MODE_FOR_RESOLUTION_AT_INDEX,
+        unmarshaller_for::<GetModeForResolutionAtIndexParams>,
     );
     // ts#64247
     m.insert(
@@ -2385,6 +2399,38 @@ impl IsZero for ModuleKind {
         self.0 == 0
     }
 }
+
+// Go: proto.go GetModeForUsageLocationParams (ts#64292)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetModeForUsageLocationParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub file: DocumentIdentifier,
+    pub usage: NodeHandle,
+}
+
+proto_json!(both GetModeForUsageLocationParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    file: "file" plain,
+    usage: "usage" plain,
+});
+
+// Go: proto.go GetModeForResolutionAtIndexParams (ts#64292)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetModeForResolutionAtIndexParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub file: DocumentIdentifier,
+    pub index: i32,
+}
+
+proto_json!(both GetModeForResolutionAtIndexParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    file: "file" plain,
+    index: "index" plain,
+});
 
 // Go: proto.go GetResolvedModuleParams (ts#64247)
 #[derive(Clone, Debug, Default, PartialEq)]
