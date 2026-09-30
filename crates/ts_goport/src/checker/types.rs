@@ -817,6 +817,12 @@ pub struct Type {
 // A type must stay 2 cache lines. A rare or large field of a common kind
 // goes out of line (see `ObjectType` and `StructuredType`).
 const _: () = assert!(std::mem::size_of::<Type>() <= 128);
+// The first line holds the header and the first 40 bytes of `TypeData`: for
+// a type reference, the memo (the `TypeData` tag), the type arguments, the
+// target and the mapper (see `TypeReference`).
+const _: () = assert!(std::mem::offset_of!(Type, data) == 24);
+const _: () = assert!(std::mem::offset_of!(TypeReference, object.mapper) + 4 <= 40);
+const _: () = assert!(std::mem::size_of::<TypeData>() == std::mem::size_of::<TypeReference>());
 
 #[cold]
 #[inline(never)]
@@ -1782,15 +1788,17 @@ pub struct ConstrainedType {
 // infos), and the lists are 24 bytes each. Read them with the methods below
 // and write them with `set_signatures` and
 // `set_object_type_without_abstract_construct_signatures`.
+// PORT: layout only. `repr(C)` keeps this field order (see `ObjectType`).
 // Go: checker/types.go:917 StructuredType
 #[derive(Clone, Debug, Default)]
+#[repr(C)]
 pub struct StructuredType {
     pub constrained: ConstrainedType,
     pub members: SymbolTable,
-    pub properties: SharedList<SymbolId>,
     /// `None` is empty lists, a zero count and a nil
     /// `object_type_without_abstract_construct_signatures`.
     pub signatures_data: Option<ArenaBox<StructuredSignatures>>,
+    pub properties: SharedList<SymbolId>,
 }
 
 /// The out-of-line fields of `StructuredType`.
@@ -1952,33 +1960,49 @@ pub type InstantiationMap = FlatMap<CacheHashKey, TypeId>;
 // An interface or tuple keeps it in `InterfaceType`; any other object type
 // has it in `Checker::object_type_instantiations`. Read and write it with
 // `Checker::object_instantiations` and `object_instantiations_mut`.
+// PORT: layout only. `repr(C)` keeps `target` and `mapper` first. An
+// anonymous object type then has them, its members table and its
+// signatures on the first cache line of its `Type` (see `TypeReference`).
 // Go: checker/types.go:975 ObjectType
 #[derive(Clone, Default)]
+#[repr(C)]
 pub struct ObjectType {
-    pub structured: StructuredType,
     pub target: TypeId,   // Target of instantiated type
     pub mapper: MapperId, // Type mapper for instantiated type
+    pub structured: StructuredType,
 }
 
 // TypeReference (instantiation of an InterfaceType)
 
+// PORT: layout only. `repr(C)` keeps this field order, so the first cache
+// line of a type reference's `Type` holds the `TypeData` tag (the memo, see
+// `GenericArgumentsMemo`), the type arguments, the target and the mapper.
+// The resolved members and `node` are on the second line.
 // Go: checker/types.go:986 TypeReference
 #[derive(Clone, Default)]
+#[repr(C)]
 pub struct TypeReference {
-    pub object: ObjectType,
-    pub node: Node, // TypeReferenceNode | ArrayTypeNode | TupleTypeNode when deferred, else nil
-    pub resolved_type_arguments: SharedList<TypeId>,
     // PORT: no Go field. Memo of `is_type_reference_with_generic_arguments`
     // for a non-deferred reference with a non-empty resolved list.
     pub generic_arguments_memo: GenericArgumentsMemo,
+    pub resolved_type_arguments: SharedList<TypeId>,
+    pub object: ObjectType,
+    pub node: Node, // TypeReferenceNode | ArrayTypeNode | TupleTypeNode when deferred, else nil
 }
 
 /// Memo state of `Checker::is_type_reference_with_generic_arguments`.
 ///
-/// PORT: layout only. An enum (not a `u8`) leaves invalid values that
-/// `TypeData` uses for its tag, so the byte does not grow `Type`.
+/// PORT: layout only. An enum (not an integer) leaves invalid values that
+/// `TypeData` uses for its tag, so the tag does not grow `Type`. It is
+/// `u64`: the tags of `SharedList` and `Option<ArenaBox>` are 8 bytes wide
+/// too, and of fields with the same number of invalid values the compiler
+/// takes the first one. So the `TypeData` tag is this field, on the first
+/// cache line, and the other kinds fit after it (with a `u32` memo the
+/// compiler took a list tag on the second line, and `TypeData` grew by an
+/// 8-byte tag). The field has 8 bytes of room anyway: the list after it is
+/// 8-byte aligned.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
+#[repr(u64)]
 pub enum GenericArgumentsMemo {
     #[default]
     Unknown = 0,
