@@ -687,6 +687,8 @@ impl Project {
                     single_threaded: Tristate::Unknown,
                     typings_location,
                     project_name: String::new(),
+                    // ts#64024: Go leaves `SkipModuleResolution` zero here.
+                    skip_module_resolution: false,
                 },
                 Some(create_checker_pool),
             );
