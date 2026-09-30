@@ -188,11 +188,11 @@ child_test! {
             &lsproto::CUSTOM_SET_CONTENT_MAPPER_CONTRIBUTIONS_INFO,
             lsproto::SetContentMapperContributionsParams {
                 open_documents: vec![document(&u)],
-                contributions: vec![lsproto::ContentMapperContribution {
+                contributions: vec![Some(lsproto::ContentMapperContribution {
                     contributor_id: "test".to_string(),
                     extensions: vec![".vue".to_string(), ".svelte".to_string()],
                     inferred_project_contribution: None,
-                }],
+                })],
             },
         );
         assert!(result.is_some() && msg.error.is_none());

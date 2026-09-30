@@ -79,11 +79,13 @@ pub fn same_program(a: &NewProgram, b: &NewProgram) -> bool {
 
 /// Go `session.DidChangeWatchedFiles(ctx, []*lsproto.FileEvent{...})`.
 pub fn watch(session: &Rc<Session>, events: &[(lsproto::FileChangeType, &str)]) {
-    let events: Vec<lsproto::FileEvent> = events
+    let events: Vec<Option<lsproto::FileEvent>> = events
         .iter()
-        .map(|(kind, u)| lsproto::FileEvent {
-            uri: uri(u),
-            type_: *kind,
+        .map(|(kind, u)| {
+            Some(lsproto::FileEvent {
+                uri: uri(u),
+                type_: *kind,
+            })
         })
         .collect();
     session.did_change_watched_files(&bg(), &events);
@@ -238,11 +240,13 @@ pub fn generate_file_events(
     count: usize,
     path_template: &str,
     change_type: lsproto::FileChangeType,
-) -> Vec<lsproto::FileEvent> {
+) -> Vec<Option<lsproto::FileEvent>> {
     (0..count)
-        .map(|i| lsproto::FileEvent {
-            uri: uri(&path_template.replace("%d", &i.to_string())),
-            type_: change_type,
+        .map(|i| {
+            Some(lsproto::FileEvent {
+                uri: uri(&path_template.replace("%d", &i.to_string())),
+                type_: change_type,
+            })
         })
         .collect()
 }

@@ -164,11 +164,11 @@ fn change_whole(session: &Rc<Session>, u: &str, version: i32, text: &str) {
 }
 
 /// Go `&lsproto.FileEvent{Uri: uri, Type: kind}`.
-fn file_event(u: &str, kind: lsproto::FileChangeType) -> lsproto::FileEvent {
-    lsproto::FileEvent {
+fn file_event(u: &str, kind: lsproto::FileChangeType) -> Option<lsproto::FileEvent> {
+    Some(lsproto::FileEvent {
         uri: uri(u),
         type_: kind,
-    }
+    })
 }
 
 /// Go `utils.FS().WriteFile(path, content)` with `assert.NilError`.
@@ -819,7 +819,7 @@ child_test! {
 }
 
 // Go: contentmapper_test.go:531 TestDynamicContentMapperRefreshesForMixedWatchBatches (the body of each subtest)
-fn refreshes_for_mixed_watch_batch(events: &[lsproto::FileEvent]) {
+fn refreshes_for_mixed_watch_batch(events: &[Option<lsproto::FileEvent>]) {
     let mapper = contentmappertest::package_json(contentmappertest::DYNAMIC_VERBATIM_MAPPER);
     let file_map = files(&[
         (
@@ -857,7 +857,7 @@ fn refreshes_for_mixed_watch_batch(events: &[lsproto::FileEvent]) {
 child_test! {
     // Go: contentmapper_test.go:500 TestDynamicContentMapperRefreshesForMixedWatchBatches/excessive events
     fn excessive_events() {
-        let mut events: Vec<lsproto::FileEvent> = (0..1001)
+        let mut events: Vec<Option<lsproto::FileEvent>> = (0..1001)
             .map(|i| file_event(&format!("file:///home/project/noise-{i}.ts"), CHANGED))
             .collect();
         events[0] = file_event("file:///home/project/mapper.config.json", CHANGED);
