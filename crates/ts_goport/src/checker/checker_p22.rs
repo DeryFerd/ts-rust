@@ -168,14 +168,14 @@ impl Checker {
             let call_signatures = self.get_signatures_of_symbol(call_symbol);
             self.ty_mut(t)
                 .as_interface_type_mut()
-                .declared_call_signatures = call_signatures;
+                .declared_call_signatures = call_signatures.into();
             let new_symbol = self.symbols.get(members, INTERNAL_SYMBOL_NAME_NEW);
             let construct_signatures = self.get_signatures_of_symbol(new_symbol);
             self.ty_mut(t)
                 .as_interface_type_mut()
-                .declared_construct_signatures = construct_signatures;
+                .declared_construct_signatures = construct_signatures.into();
             let index_infos = self.get_index_infos_of_symbol(symbol);
-            self.ty_mut(t).as_interface_type_mut().declared_index_infos = index_infos;
+            self.ty_mut(t).as_interface_type_mut().declared_index_infos = index_infos.into();
         }
         self.ty(t).as_interface_type()
     }
