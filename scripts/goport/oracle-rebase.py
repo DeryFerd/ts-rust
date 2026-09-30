@@ -100,7 +100,7 @@ def fragment(a):
 
 def table(title, rows, cols):
     lines = [f'**{title}**', '', '| ' + ' | '.join(cols) + ' |', '|' + '---|' * len(cols)]
-    lines += ['| ' + ' | '.join(str(c) for c in row) + ' |' for row in rows]
+    lines += ['| ' + ' | '.join(str(c) for c in row) + ' |' for row in rows] or ['| (none) |' + ' |' * (len(cols) - 1)]
     return lines + ['']
 
 
