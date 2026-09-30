@@ -744,8 +744,13 @@ pub struct Session {
     pub conn: RefCell<Option<Rc<dyn ipc::Conn>>>,
     // ts#64158
     // PORT: the Go `buildMu` lock is not ported (one thread).
+    // PORT: the orchestrator methods take `&mut self`, so each is in a
+    // `RefCell`.
     pub build_orchestrators: RefCell<
-        FxHashMap<BuildOrchestratorID, Rc<crate::execute::build::orchestrator::Orchestrator>>,
+        FxHashMap<
+            BuildOrchestratorID,
+            Rc<RefCell<crate::execute::build::orchestrator::Orchestrator>>,
+        >,
     >,
     // ts#64434
     // PORT: the Go `sourceFileLeasesMu` lock is not ported (one thread).
@@ -1182,7 +1187,9 @@ impl Session {
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
         };
-        let project_id = proj.borrow().id();
+        // ts#64319: Go passes `proj.ID()` as the `autoimport.ProjectID`
+        // interface value; the Rust type is `autoimport::ProjectID`.
+        let project_id = autoimport::ProjectID(proj.borrow().id().0);
         let host: Rc<dyn ls::Host> = snapshot.clone();
         Ok(ls::new_language_service(
             project_id,
@@ -2580,7 +2587,7 @@ impl Session {
         created_orchestrator_response.build_orchestrator_id = new_build_orchestrator_id();
         self.build_orchestrators.borrow_mut().insert(
             created_orchestrator_response.build_orchestrator_id,
-            Rc::new(orchestrator),
+            Rc::new(RefCell::new(orchestrator)),
         );
         Ok(created_orchestrator_response)
     }
@@ -2605,7 +2612,7 @@ impl Session {
     fn build_orchestrator(
         &self,
         id: BuildOrchestratorID,
-    ) -> Option<Rc<crate::execute::build::orchestrator::Orchestrator>> {
+    ) -> Option<Rc<RefCell<crate::execute::build::orchestrator::Orchestrator>>> {
         self.build_orchestrators.borrow().get(&id).cloned()
     }
 
@@ -2621,7 +2628,7 @@ impl Session {
                 params.project
             )));
         };
-        let result = orchestrator.build(ctx, &params.project);
+        let result = orchestrator.borrow_mut().build(ctx, &params.project);
 
         Ok(BuildResponse {
             status: result.result.status,
@@ -2642,7 +2649,9 @@ impl Session {
                 params.project
             )));
         };
-        let result = orchestrator.build_references(ctx, &params.project);
+        let result = orchestrator
+            .borrow_mut()
+            .build_references(ctx, &params.project);
 
         Ok(BuildResponse {
             status: result.result.status,
@@ -2663,7 +2672,9 @@ impl Session {
                 params.project
             )));
         };
-        let result = orchestrator.clean(&params.project);
+        // PORT: Go `Clean` is `clean_exported` (the build lane names it so;
+        // Go also has `clean`).
+        let result = orchestrator.borrow_mut().clean_exported(&params.project);
         Ok(CleanBuildResponse {
             status: result.result.status,
             diagnostics: new_diagnostic_responses(&result.errors),
@@ -2684,7 +2695,7 @@ impl Session {
                 params.project
             )));
         };
-        let result = orchestrator.clean_references(&params.project);
+        let result = orchestrator.borrow_mut().clean_references(&params.project);
         Ok(CleanBuildResponse {
             status: result.result.status,
             diagnostics: new_diagnostic_responses(&result.errors),
@@ -3108,8 +3119,8 @@ impl crate::execute::tsc::System for ApiBuildSystem {
     fn get_width_of_terminal(&self) -> i32 {
         0
     }
-    fn get_environment_variable(&self, _name: &str) -> String {
-        String::new()
+    fn get_environment_variable(&self, _name: &str) -> (String, bool) {
+        (String::new(), false)
     }
     fn spawn(
         &self,
@@ -4471,7 +4482,7 @@ impl Session {
             || !autoimport::Registry::is_prepared_for_importing_file(
                 registry.as_deref(),
                 source_file_file_name(source_file),
-                &project_id,
+                &autoimport::ProjectID(project_id.0.clone()),
                 &user_preferences,
             )
         {
@@ -4530,13 +4541,13 @@ impl Session {
 
         let (ch, _done) = ls_program::get_type_checker(&program, ctx);
 
+        // ts#64178: Go passes `ch` to NewView; the Rust view keeps no
+        // checker (its methods take the checker from their callers).
         let view = autoimport::new_view(
             registry,
             source_file,
-            project_id,
+            autoimport::ProjectID(project_id.0.clone()),
             program.clone(),
-            // ts#64178
-            ch.clone(),
             user_preferences.module_specifier_preferences(),
         );
         let mut import_adder = autoimport::new_import_adder(
