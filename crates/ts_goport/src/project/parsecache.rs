@@ -119,40 +119,32 @@ pub fn content_mapped_parse_cache_key(
 // Go: project/parsecache.go:54 parseCacheKeyForFile (tsgo#4712)
 // parseCacheKeyForFile reconstructs the ordinary parse-cache key for a source file held by a program.
 pub fn parse_cache_key_for_file(file: &parser::ParsedSourceFile) -> ParseCacheKey {
-    program_file_key(file.parse_options(), file.text, file.script_kind)
+    new_parse_cache_key(file.parse_options(), file.source_hash(), file.script_kind)
 }
 
 // Go: project/parsecache.go:58 contentMappedParseCacheKeyForFile (tsgo#4712)
 pub fn content_mapped_parse_cache_key_for_file(
     file: &parser::ParsedSourceFile,
 ) -> ContentMappedParseCacheKey {
-    ContentMappedParseCacheKey::new(
-        file.content_mapper_parse_options(),
-        source_file_hash(file.text),
-    )
+    ContentMappedParseCacheKey::new(file.content_mapper_parse_options(), file.source_hash())
 }
 
 // Go: project/parsecache.go:63 parseCacheKeyForDuplicate (tsgo#4712)
 // parseCacheKeyForDuplicate reconstructs an ordinary parse-cache key for a deduplicated source file.
 pub fn parse_cache_key_for_duplicate(file: &compiler::DuplicateSourceFile) -> ParseCacheKey {
-    program_file_key(&file.parse_options, file.text, file.script_kind)
+    new_parse_cache_key(&file.parse_options, file.source_hash(), file.script_kind)
 }
 
 // Go: project/parsecache.go:67 contentMappedParseCacheKeyForDuplicate (tsgo#4712)
 pub fn content_mapped_parse_cache_key_for_duplicate(
     file: &compiler::DuplicateSourceFile,
 ) -> ContentMappedParseCacheKey {
-    ContentMappedParseCacheKey::new(
-        &file.content_mapper_parse_options,
-        source_file_hash(file.text),
-    )
+    ContentMappedParseCacheKey::new(&file.content_mapper_parse_options, file.source_hash())
 }
 
 /// The value the parse cache holds: Go `*ast.SourceFile` after
-/// `file.Hash = fh.Hash()`.
-// PORT: `ParsedSourceFile` has no `Hash` field and the plan does not edit
-// it, so the cache entry keeps the hash next to the file. For a file that a
-// program returns, Go `file.Hash` is `xxh3_128(file.text)`, the same value.
+/// `file.Hash = fh.Hash()`. The file has the hash too
+/// (`ParsedSourceFile::hash`).
 #[derive(Clone, Debug)]
 pub struct HashedSourceFile {
     pub file: Rc<parser::ParsedSourceFile>,
@@ -190,10 +182,10 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
                     parser::parse_source_file(&opts, text, key.script_kind)
                 }
                 compiler::Prefetched::Nothing => {
-                    // PORT: the parser takes `&'static str` (node data points
-                    // into the text), so the text is leaked, as in
-                    // compiler/host.rs.
-                    let text: &'static str = Box::leak(content.into_boxed_str());
+                    // The text of a freeable version is shared with its
+                    // store and goes with the version; another text is
+                    // leaked, as in compiler/host.rs (`FileText::new`).
+                    let text = FileText::new(content, freeable);
                     parser::parse_source_file(&opts, text, key.script_kind)
                 }
             };
@@ -207,17 +199,15 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
                         .is_ok()
                 );
             }
+            // Go: file.Hash = fh.Hash()
+            let hash = fh.hash();
+            file.hash.set(Some(hash));
             let file = Rc::new(file);
             // PORT: the next program version publishes the file's store. A
             // version that does not include the file (a package duplicate, an
             // auto-import entrypoint) must still publish its parser fields,
             // so a later version can share the file.
             crate::program::note_parsed_source_file(&file);
-            // Go: file.Hash = fh.Hash()
-            let hash = fh.hash();
-            TEXT_HASHES.with_borrow_mut(|hashes| {
-                hashes.insert(text_id(file.text), hash);
-            });
             // Go: binder.BindSourceFile(file) (ts#63952). PORT: the Rust
             // binder binds each program version into one arena on the
             // dispatch thread (`program::bind_all`), not a parse on its own,
@@ -252,120 +242,44 @@ pub fn new_content_mapped_parse_cache(
 }
 
 /// Go `file.Hash = hash` for a file that the content-mapped parse cache
-/// holds (project/compilerhost.go GetContentMappedSourceFiles).
-// PORT: see `TEXT_HASHES`. A content-mapped file's Go `Hash` is the hash of
-// its cache key, not of its text.
+/// holds (project/compilerhost.go GetContentMappedSourceFiles). A
+/// content-mapped file's Go `Hash` is the hash of its cache key, not of its
+/// text.
 pub fn set_source_file_hash(file: &parser::ParsedSourceFile, hash: u128) {
-    TEXT_HASHES.with_borrow_mut(|hashes| {
-        hashes.insert(text_id(file.text), hash);
-    });
-}
-
-/// Go `file.Hash` of a file that the parse cache or the content-mapped
-/// parse cache made on this thread. For any other text it is the xxh3-128
-/// of the text (Go `fh.Hash()`).
-// PORT: for the api encoder (Go `Hash` of a content-mapped file is its key
-// hash) and the key helpers above.
-pub fn source_file_hash(text: &'static str) -> u128 {
-    TEXT_HASHES
-        .with_borrow(|hashes| hashes.get(&text_id(text)).copied())
-        .unwrap_or_else(|| xxh3_128(text.as_bytes()))
-}
-
-/// Go `file.Hash` of a file that the parse cache or the content-mapped
-/// parse cache made on this thread, or `None` for a text that neither
-/// recorded (a parse whose Go `Hash` stays 0).
-// PORT: for the api encoder: a file of no program that a parse cache made
-// (api/session.go createSourceFile, ts#64434) has a Go `Hash`.
-pub fn recorded_source_file_hash(text: &'static str) -> Option<u128> {
-    TEXT_HASHES.with_borrow(|hashes| hashes.get(&text_id(text)).copied())
+    file.hash.set(Some(hash));
 }
 
 /// Go `contentMappedParseCache.Deref(key)` for a program file or a
-/// duplicate source file. When the bundle entry is gone, the hashes of its
-/// files are forgotten too.
-// PORT: see `deref_program_file`.
+/// duplicate source file.
 pub fn deref_content_mapped_file(
     cache: &ContentMappedParseCache,
     key: &ContentMappedParseCacheKey,
 ) {
-    let bundle = cache
-        .entries
-        .borrow()
-        .get(key)
-        .and_then(|entry| entry.value.borrow().clone());
     // PORT: called by path so `std::ops::Deref::deref` can not win.
     ContentMappedParseCache::deref(cache, key);
-    if !cache.has(key)
-        && let Some(bundle) = bundle
-    {
-        TEXT_HASHES.with_borrow_mut(|hashes| {
-            if let Some(canonical) = &bundle.canonical {
-                hashes.remove(&text_id(canonical.text));
-            }
-            for supplemental in &bundle.supplemental {
-                hashes.remove(&text_id(supplemental.text));
-            }
-        });
-    }
-}
-
-thread_local! {
-    /// Go `file.Hash` of each text that the parse cache parsed on this
-    /// thread, by `text_id`. It also holds the Go `Hash` of the files of the
-    /// content-mapped parse cache (`set_source_file_hash`).
-    // PORT: `ParsedSourceFile` has no `Hash` field. This map lets program
-    // clones and snapshot disposal find the hash without hashing every file
-    // text again. `deref_program_file` removes an entry with its cache
-    // entry; other derefs (autoimport.rs) leave a few bytes for each parse.
-    static TEXT_HASHES: RefCell<FxHashMap<(usize, usize), u128>> =
-        RefCell::new(FxHashMap::default());
-}
-
-/// Address and length of a file text. A `&'static str` is never freed, so
-/// two texts with the same id have the same bytes and the same hash.
-fn text_id(text: &'static str) -> (usize, usize) {
-    (text.as_ptr().addr(), text.len())
-}
-
-/// Go `NewParseCacheKey(file.ParseOptions(), file.Hash, file.ScriptKind)`.
-// PORT: a text the parse cache did not parse on this thread is hashed
-// again. It is the same value: Go `file.Hash` is `fh.Hash()`, the xxh3-128
-// of the text.
-fn program_file_key(
-    options: &parser::SourceFileParseOptions,
-    text: &'static str,
-    script_kind: ScriptKind,
-) -> ParseCacheKey {
-    new_parse_cache_key(options, source_file_hash(text), script_kind)
 }
 
 /// Go `parseCache.Ref(NewParseCacheKey(file.ParseOptions(), file.Hash,
 /// file.ScriptKind))` for a program file or a duplicate source file.
+/// `hash` is Go `file.Hash` (`ParsedSourceFile::source_hash`).
 pub fn ref_program_file(
     cache: &ParseCache,
     options: &parser::SourceFileParseOptions,
-    text: &'static str,
+    hash: u128,
     script_kind: ScriptKind,
 ) {
-    cache.ref_(&program_file_key(options, text, script_kind));
+    cache.ref_(&new_parse_cache_key(options, hash, script_kind));
 }
 
 /// Go `parseCache.Deref(NewParseCacheKey(file.ParseOptions(), file.Hash,
 /// file.ScriptKind))` for a program file or a duplicate source file.
-/// When the entry is gone, its hash is forgotten too.
 pub fn deref_program_file(
     cache: &ParseCache,
     options: &parser::SourceFileParseOptions,
-    text: &'static str,
+    hash: u128,
     script_kind: ScriptKind,
 ) {
-    let key = program_file_key(options, text, script_kind);
+    let key = new_parse_cache_key(options, hash, script_kind);
     // PORT: called by path so `std::ops::Deref::deref` can not win.
     ParseCache::deref(cache, &key);
-    if !cache.has(&key) {
-        TEXT_HASHES.with_borrow_mut(|hashes| {
-            hashes.remove(&text_id(text));
-        });
-    }
 }

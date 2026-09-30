@@ -311,7 +311,9 @@ fn get_token_at_position_unexported(
             if is_token_kind(current.kind()) || should_skip_child(current) {
                 return current;
             }
-            let mut scanner = scanner_ls::get_scanner_for_source_file(source_file, left.get());
+            let sf_text = source_file_text(source_file);
+            let mut scanner =
+                scanner_ls::get_scanner_for_source_file(source_file, &sf_text, left.get());
             let mut end = current.end();
             // We should only scan up to the start of the next node in the AST after the node ending at position `left`.
             // It is necessary to enforce this invariant in cases where `position` occurs in between two node/tokens,
@@ -755,7 +757,9 @@ fn find_rightmost_valid_token(
             } else {
                 n.pos()
             };
-            let mut scanner = scanner_ls::get_scanner_for_source_file(source_file, start_pos);
+            let sf_text = source_file_text(source_file);
+            let mut scanner =
+                scanner_ls::get_scanner_for_source_file(source_file, &sf_text, start_pos);
             let mut tokens: Vec<Node> = Vec::new();
             for visited_node in rightmost_visited_nodes.iter().copied() {
                 // Trailing tokens that occur before this node.
@@ -901,7 +905,8 @@ pub fn find_next_token(previous_token: Node, parent: Node, file: Node) -> Node {
         let start_pos = previous_token.end();
         // Case 2: look for the next token directly.
         if start_pos >= n.pos() && start_pos < n.end() {
-            let scanner = scanner_ls::get_scanner_for_source_file(file, start_pos);
+            let sf_text = source_file_text(file);
+            let scanner = scanner_ls::get_scanner_for_source_file(file, &sf_text, start_pos);
             let token = scanner.token();
             let token_full_start = scanner.token_full_start();
             let token_end = scanner.token_end();
@@ -1008,7 +1013,8 @@ fn should_skip_child(node: Node) -> bool {
 /// This function scans through both AST nodes and intervening tokens to find the first match.
 pub fn find_child_of_kind(containing_node: Node, kind: SyntaxKind, source_file: Node) -> Node {
     let mut last_node_pos = containing_node.pos();
-    let mut scan = scanner_ls::get_scanner_for_source_file(source_file, last_node_pos);
+    let sf_text = source_file_text(source_file);
+    let mut scan = scanner_ls::get_scanner_for_source_file(source_file, &sf_text, last_node_pos);
 
     let mut found_child = Node::NIL;
     let mut visit_node = |node: Node| -> bool {

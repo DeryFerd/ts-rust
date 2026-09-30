@@ -16,9 +16,10 @@ use crate::api::encoder::prelude::*;
 
 // Go: api/encoder/stringtable.go:9 stringTable
 pub struct StringTable {
-    // PORT: the Go bytes of the file text. Borrowed when the text has no
-    // unit.
-    pub file_text: Cow<'static, [u8]>,
+    // PORT: the file text. Its Go bytes are `go_file_bytes` when it has a
+    // unit, else its own bytes (`file_bytes`).
+    pub file_text: FileText,
+    go_file_bytes: Option<Vec<u8>>,
     // PORT: Go `*strings.Builder`, with Go bytes.
     pub other_strings: Vec<u8>,
     // offsets are pos/end pairs
@@ -30,13 +31,19 @@ pub struct StringTable {
 }
 
 // Go: api/encoder/stringtable.go:16 newStringTable
-pub fn new_string_table(file_text: &'static str, string_count: usize) -> StringTable {
+pub fn new_string_table(file_text: impl Into<FileText>, string_count: usize) -> StringTable {
+    let file_text: FileText = file_text.into();
     let builder = Vec::new();
+    let go_file_bytes = match go_string_bytes(&file_text) {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(bytes) => Some(bytes),
+    };
     StringTable {
-        file_text: go_string_bytes(file_text),
+        units: port_units(&file_text),
+        file_text,
+        go_file_bytes,
         other_strings: builder,
         offsets: Vec::with_capacity(string_count * 2),
-        units: port_units(file_text),
     }
 }
 
@@ -59,6 +66,13 @@ fn port_units(text: &str) -> Vec<(usize, usize)> {
 }
 
 impl StringTable {
+    /// The Go bytes of the file text.
+    fn file_bytes(&self) -> &[u8] {
+        self.go_file_bytes
+            .as_deref()
+            .unwrap_or_else(|| self.file_text.as_bytes())
+    }
+
     /// PORT: the Go byte offset of the port offset `pos` in the file text.
     /// `pos` must not be inside a unit. A negative offset is kept.
     fn go_offset(&self, pos: i32) -> i64 {
@@ -84,7 +98,7 @@ impl StringTable {
         }
         let text = go_string_bytes(text);
         let length = text.len() as i64;
-        if end - pos > 0 && end <= self.file_text.len() as i64 {
+        if end - pos > 0 && end <= self.file_bytes().len() as i64 {
             // pos includes leading trivia, but we can usually infer the actual start of the
             // string from the kind and end
             let mut end_offset: i64 = 0;
@@ -98,7 +112,7 @@ impl StringTable {
             let start = end - length;
             // PORT: Go `t.fileText[start:end]` panics when `start` is negative;
             // the `usize` conversion makes the Rust slice panic too.
-            let file_slice = &self.file_text[start as usize..end as usize];
+            let file_slice = &self.file_bytes()[start as usize..end as usize];
             if *file_slice == *text {
                 self.offsets.push(start as u32);
                 self.offsets.push(end as u32);
@@ -106,7 +120,7 @@ impl StringTable {
             }
         }
         // no exact match, so we need to add it to the string table
-        let offset = self.file_text.len() + self.other_strings.len();
+        let offset = self.file_bytes().len() + self.other_strings.len();
         self.other_strings.extend_from_slice(&text);
         self.offsets.push(offset as u32);
         self.offsets.push((offset + length as usize) as u32);
@@ -117,19 +131,19 @@ impl StringTable {
     pub fn encode(&self) -> Vec<u8> {
         let mut result = Vec::with_capacity(self.encoded_length());
         append_uint32s(&mut result, &self.offsets);
-        result.extend_from_slice(&self.file_text);
+        result.extend_from_slice(self.file_bytes());
         result.extend_from_slice(&self.other_strings);
         result
     }
 
     // Go: api/encoder/stringtable.go:62 (*stringTable).stringLength
     pub fn string_length(&self) -> usize {
-        self.file_text.len() + self.other_strings.len()
+        self.file_bytes().len() + self.other_strings.len()
     }
 
     // Go: api/encoder/stringtable.go:66 (*stringTable).encodedLength
     pub fn encoded_length(&self) -> usize {
-        self.offsets.len() * 4 + self.file_text.len() + self.other_strings.len()
+        self.offsets.len() * 4 + self.file_bytes().len() + self.other_strings.len()
     }
 }
 

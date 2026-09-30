@@ -244,12 +244,12 @@ fn check_on_this_thread(lives: &[Live]) -> Vec<[Box<Checker>; 2]> {
     let mut texts: Vec<[String; 2]> = vec![[String::new(), String::new()]; lives.len()];
     let most_files = lives
         .iter()
-        .map(|live| live.program.source_file_order.len())
+        .map(|live| live.program.source_file_order().len())
         .max()
         .unwrap_or(0);
     for position in 0..most_files {
         for ((live, pair), text) in lives.iter().zip(&mut checkers).zip(&mut texts) {
-            let Some(&file) = live.program.source_file_order.get(position) else {
+            let Some(&file) = live.program.source_file_order().get(position) else {
                 continue;
             };
             let _scope = enter_program(Some(live.program));
@@ -367,7 +367,7 @@ fn release(out: &Path, p_config: &str, q_config: &str) {
             write(&q_out.join("q.status"), q_first.1.to_string().as_bytes());
             let scope = enter_program(Some(q));
             let file = go_file(
-                *q.source_file_order
+                *q.source_file_order()
                     .last()
                     .expect("the second program has files"),
             )

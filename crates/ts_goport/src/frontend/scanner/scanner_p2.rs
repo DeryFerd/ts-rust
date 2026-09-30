@@ -98,7 +98,7 @@ impl NumberFragment {
     }
 }
 
-impl Scanner {
+impl<'a> Scanner<'a> {
     // Go: scanner/scanner.go:1237 ReScanJsxToken
     pub fn re_scan_jsx_token(&mut self, allow_multiline_jsx_text: bool) -> SyntaxKind {
         self.scanner_state.pos = self.scanner_state.full_start_pos;
@@ -570,7 +570,7 @@ impl Scanner {
     // `scanner_util::go_value`): Go joins the bytes of the parts around an
     // escape, so the invalid bytes before and after a line continuation can
     // form one char.
-    pub(crate) fn scan_string(&mut self, jsx_attribute_string: bool) -> &'static str {
+    pub(crate) fn scan_string(&mut self, jsx_attribute_string: bool) -> &'a str {
         let quote = self.char();
         if quote == '\'' as i32 {
             self.scanner_state.token_flags |= TokenFlags::SINGLE_QUOTE;
@@ -637,7 +637,7 @@ impl Scanner {
     /// with the bytes of each WTF-8 surrogate fused into one unit (see
     /// `scanner_util::go_value`).
     // PORT: Go uses the slice as is. It holds the same Go bytes.
-    fn string_token_value(&self, from: usize, to: usize) -> &'static str {
+    fn string_token_value(&self, from: usize, to: usize) -> &'a str {
         match go_value(&self.text[from..to]) {
             Cow::Borrowed(_) => self.text_token_value(from, to),
             Cow::Owned(value) => intern_token_value(&value),
@@ -1297,8 +1297,7 @@ impl Scanner {
     }
 
     // Go: scanner/scanner.go:2103 scanDigits
-    // PORT: returns an owned `String`; the source text is a `Cow` that the
-    // caller cannot borrow while it mutates the scanner.
+    // PORT: returns an owned `String` (Go returns a substring of the text).
     pub(crate) fn scan_digits(&mut self) -> (String, bool) {
         let start = self.scanner_state.pos;
         let mut is_octal = true;

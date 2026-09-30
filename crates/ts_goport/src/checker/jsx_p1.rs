@@ -1089,7 +1089,7 @@ impl Checker {
                     let source_file = get_source_file_of_node(node);
                     let type_argument_list = node.type_argument_list();
                     let loc = TextRange::new(
-                        skip_trivia(source_file_text(source_file), type_argument_list.pos()),
+                        skip_trivia(&source_file_text(source_file), type_argument_list.pos()),
                         type_argument_list.end(),
                     );
                     self.add_diagnostic(new_diagnostic(

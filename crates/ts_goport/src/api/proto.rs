@@ -3068,6 +3068,8 @@ pub fn to_protocol_json_value(
             }
             CompilerOptionsValue::List(result)
         }
+        // Go `case []any` makes a non-nil slice, also for a nil `[]any`.
+        CompilerOptionsValue::NilList => CompilerOptionsValue::List(Vec::new()),
         value => value.clone(),
     }
 }
@@ -5029,8 +5031,8 @@ fn new_diagnostic_response_wrapped(d: diagnosticwriter::AstDiagnostic<'_>) -> Di
             resp.pos = position_map.utf8_to_utf16(pos);
             resp.end = position_map.utf8_to_utf16(end);
         } else {
-            resp.pos = utf16_len_of_prefix(file.text(), pos);
-            resp.end = utf16_len_of_prefix(file.text(), end);
+            resp.pos = utf16_len_of_prefix(&file.text(), pos);
+            resp.end = utf16_len_of_prefix(&file.text(), end);
         }
         let (start_line, start_character) =
             diagnosticwriter::get_ecma_line_and_utf16_character_of_file_position(file, pos);

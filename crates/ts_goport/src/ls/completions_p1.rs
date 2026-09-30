@@ -118,7 +118,8 @@ impl LanguageService {
             if !ok {
                 return false;
             }
-            item.additional_text_edits = Some(edits);
+            // Go `&edits`: a `[]*lsproto.TextEdit` of non-nil edits.
+            item.additional_text_edits = Some(edits.into_iter().map(Some).collect());
             item.detail = str_ptr_to(&description);
             true
         });
@@ -789,7 +790,7 @@ impl LanguageService {
                     let end = position as usize;
                     let mut pos = line_start as usize;
                     while pos < end {
-                        let (mut r, mut size) = utf8_decode_rune_in_string(text, pos);
+                        let (mut r, mut size) = utf8_decode_rune_in_string(&text, pos);
                         if pos + size as usize > end {
                             r = RUNE_ERROR;
                             size = 1;

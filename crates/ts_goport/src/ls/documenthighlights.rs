@@ -536,7 +536,8 @@ impl LanguageService {
                     if_token_start = if_keyword.pos();
                 }
                 // PORT: Go `rune(sourceFile.Text()[j])` converts one byte.
-                let text = source_file_text(source_file).as_bytes();
+                let text_text = source_file_text(source_file);
+                let text = text_text.as_bytes();
                 let mut j = if_token_start - 1;
                 while j >= else_keyword.end() {
                     if !is_white_space_single_line(text[j as usize] as char) {
@@ -547,7 +548,7 @@ impl LanguageService {
                 }
                 if should_combine {
                     let (lsp_range, fidelity) = self.create_lsp_range_from_bounds(
-                        skip_trivia(source_file_text(source_file), else_keyword.pos()),
+                        skip_trivia(&source_file_text(source_file), else_keyword.pos()),
                         if_keyword.end(),
                         source_file,
                     );

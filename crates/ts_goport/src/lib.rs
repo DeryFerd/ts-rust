@@ -33,6 +33,8 @@ pub mod emitter;
 pub mod evaluator;
 pub mod execute;
 pub mod flags;
+/// The leaked bump arena of a thread (AST and checker arenas).
+pub mod leak_arena;
 /// `go_enum!` and `go_flags!` (`#[macro_export]` in goport_util).
 mod flags_macros {
     pub(crate) use goport_util::{go_enum, go_flags};

@@ -1689,7 +1689,7 @@ pub fn get_leading_comment_ranges_of_node(node: Node, file: Node) -> Vec<Comment
     }
     crate::frontend::scanner::get_leading_comment_ranges(
         &NodeFactory::default(),
-        source_file_text(file),
+        &source_file_text(file),
         node.pos(),
     )
 }
@@ -1711,8 +1711,9 @@ pub fn get_children_from_non_js_doc_node(node: Node, source_file: Node) -> Vec<N
 
     let mut children: Vec<Node> = Vec::new();
     let mut pos = node.pos();
+    let sf_text = source_file_text(source_file);
     for child in child_nodes {
-        let mut scanner = scanner_ls::get_scanner_for_source_file(source_file, pos);
+        let mut scanner = scanner_ls::get_scanner_for_source_file(source_file, &sf_text, pos);
         while pos < child.pos() {
             let token = scanner.token();
             let token_full_start = scanner.token_full_start();
@@ -1731,7 +1732,7 @@ pub fn get_children_from_non_js_doc_node(node: Node, source_file: Node) -> Vec<N
         children.push(child);
         pos = child.end();
     }
-    let mut scanner = scanner_ls::get_scanner_for_source_file(source_file, pos);
+    let mut scanner = scanner_ls::get_scanner_for_source_file(source_file, &sf_text, pos);
     while pos < node.end() {
         let token = scanner.token();
         let token_full_start = scanner.token_full_start();

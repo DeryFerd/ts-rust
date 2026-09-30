@@ -247,7 +247,7 @@ impl JsonMapKey for DocumentUri {
                         s.insert(k.clone(), ());
                     }
                     map.insert(k, v);
-                    err.map_err(wrap_method_error::<V>)?;
+                    err?;
                 }
                 dec.read_token()?;
                 Ok(())

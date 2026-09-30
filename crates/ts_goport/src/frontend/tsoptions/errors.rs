@@ -145,7 +145,7 @@ pub fn create_diagnostic_for_node_in_source_file(
     new_diagnostic(
         source_file,
         TextRange::new(
-            skip_trivia(source_file_text(source_file), node.loc().pos()),
+            skip_trivia(&source_file_text(source_file), node.loc().pos()),
             node.end(),
         ),
         message,

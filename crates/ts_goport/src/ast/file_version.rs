@@ -19,10 +19,13 @@
 //!
 //! M3b: at publish the version takes its `FileStore` and its `GoFile`
 //! (info, `node_bind`, `file_bind`, `flow_nodes`)
-//! (`ast::store::VersionStore`). Its node records and kids (and its
-//! foreign parents) are leaked in its node shell, the registry block of its
-//! id, so the header and child reads stay inline
-//! (`ast::store::node_shell`); the child link column is dropped.
+//! (`ast::store::VersionStore`). Its node records and kids are in its node
+//! shell, the registry block of its id, so the header and child reads stay
+//! inline (`ast::store::node_shell`); its foreign parents are leaked there,
+//! and the child link column is dropped. AST node records, step 4: the
+//! records and kids are in a pooled block that the version gives back when
+//! it dies; after two more program releases (`pin_epoch`) a later node
+//! shell can take it (`ast::store::BlockPool`).
 //! M3c (owned nodes; on by default in a language server or API process,
 //! see `owned_nodes_enabled`): its parse was a freeable parse
 //! (`ast::enter_freeable_parse`), so its store owns its astdata nodes (node
@@ -39,9 +42,13 @@
 //! When the last holder lets go, the version is dead: its store and
 //! `GoFile` are freed, its id goes to `DEAD_FILES`, and each per-file
 //! thread-local map (`PerFileMap`) forgets the entries of that id when it
-//! is next written. A later read of the id panics with "file version N is
-//! released": ids are never reused, so a missed holder panics and never
-//! reads another file.
+//! is next written. A later read of its store, `GoFile` or node data panics
+//! with "file version N is released": ids are never reused, so a missed
+//! holder panics there and never reads another file. A header or child
+//! read of its node shell reads its pooled block: the data of that node
+//! until another version takes the block, then that version's data. With
+//! debug assertions that read panics with the same message (the owner
+//! check, `ast::store::file_block`).
 //!
 //! Freeable rule (`free_file_versions`, `freeable_path`): only a parse of
 //! the language server parse cache (project/parsecache.rs), in a language
@@ -279,6 +286,14 @@ pub(crate) fn any_freeable_published() -> bool {
 // PERF: a scan, on the path of a read that found no live version only.
 fn is_dead_file(file: usize) -> bool {
     lock(&DEAD_FILES).contains(&file)
+}
+
+/// The pin epoch: the number of program releases so far
+/// (`release_file_version_pins`). A pooled node block given back at epoch
+/// `e` is free from epoch `e + 2` (`ast::store::BlockPool`).
+#[inline]
+pub(crate) fn pin_epoch() -> usize {
+    PIN_EPOCH.load(Ordering::Acquire)
 }
 
 /// Panics for a read of dead file version `file`.
@@ -662,6 +677,117 @@ macro_rules! go_file_ref {
     }};
 }
 pub(crate) use go_file_ref;
+
+/// The text of one file (Go `SourceFile.text`). It derefs to `str`.
+/// - `Static`: a file that is never freed (every CLI file, a lib, the first
+///   version of an edited file, a synthetic file): the leaked text, as
+///   before textleak1.
+/// - `Shared`: a freeable file version (lsshells M3a). Its store, its parse
+///   and its program inputs share the text, and it goes with the last of
+///   them.
+///
+/// A parse borrows the text (`Parser<'a>`, `Scanner<'a>`), and a reader
+/// holds a clone only as long as it reads: a kept clone keeps the text of a
+/// dead version alive, but never reads freed memory.
+// PORT: Go strings are GC values. No node data points into the text: the
+// node texts are owned copies or interned names.
+#[derive(Clone)]
+pub enum FileText {
+    Static(&'static str),
+    Shared(Arc<str>),
+}
+
+impl FileText {
+    /// The text of a new parse: `Shared` for a parse of a freeable file
+    /// version (`freeable`, see `freeable_path`), else leaked (`Static`),
+    /// as every CLI text is.
+    #[must_use]
+    pub fn new(text: String, freeable: bool) -> Self {
+        if freeable {
+            FileText::Shared(Arc::from(text))
+        } else {
+            FileText::Static(Box::leak(text.into_boxed_str()))
+        }
+    }
+
+    /// The `'static` text of a static file, or `None` for a shared text.
+    #[inline]
+    #[must_use]
+    pub fn as_static(&self) -> Option<&'static str> {
+        match self {
+            FileText::Static(text) => Some(text),
+            FileText::Shared(_) => None,
+        }
+    }
+
+    /// A weak handle to a shared text, or `None` for a static text. Tests
+    /// use it to see that a text goes with its file version.
+    #[must_use]
+    pub fn weak(&self) -> Option<Weak<str>> {
+        match self {
+            FileText::Static(_) => None,
+            FileText::Shared(text) => Some(Arc::downgrade(text)),
+        }
+    }
+}
+
+impl Default for FileText {
+    /// The empty static text.
+    fn default() -> Self {
+        FileText::Static("")
+    }
+}
+
+impl Deref for FileText {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        match self {
+            FileText::Static(text) => text,
+            FileText::Shared(text) => text,
+        }
+    }
+}
+
+impl From<&'static str> for FileText {
+    #[inline]
+    fn from(text: &'static str) -> Self {
+        FileText::Static(text)
+    }
+}
+
+impl std::fmt::Debug for FileText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl std::fmt::Display for FileText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl PartialEq for FileText {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for FileText {}
+
+impl PartialEq<str> for FileText {
+    fn eq(&self, other: &str) -> bool {
+        &**self == other
+    }
+}
+
+impl PartialEq<&str> for FileText {
+    fn eq(&self, other: &&str) -> bool {
+        &**self == *other
+    }
+}
 
 /// A weak handle to a file version. Tests use it to see when the version
 /// dies.

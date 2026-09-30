@@ -6924,7 +6924,7 @@ impl IsZero for ContentMapperContribution {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SetContentMapperContributionsParams {
     // Complete replacement set of active extension contributions.
-    pub contributions: Vec<ContentMapperContribution>,
+    pub contributions: Vec<Option<ContentMapperContribution>>,
 
     // Currently open documents matching contributed extensions.
     pub open_documents: Vec<TextDocumentIdentifier>,
@@ -7992,7 +7992,7 @@ impl IsZero for VSClassifiedTextRun {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct VSClassifiedTextElement {
     // The classified text runs that make up this element.
-    pub runs: Vec<VSClassifiedTextRun>,
+    pub runs: Vec<Option<VSClassifiedTextRun>>,
 
     // VS type discriminator required by ObjectContentConverter for deserialization.
     pub vs_type: StringLiteralClassifiedTextElement,

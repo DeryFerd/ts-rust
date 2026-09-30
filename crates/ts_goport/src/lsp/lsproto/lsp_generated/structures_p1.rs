@@ -4084,7 +4084,7 @@ impl IsZero for LinkedEditingRangeRegistrationOptions {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CreateFilesParams {
     // An array of all files/folders created in this operation.
-    pub files: Vec<FileCreate>,
+    pub files: Vec<Option<FileCreate>>,
 }
 
 impl UnmarshalerFrom for CreateFilesParams {
@@ -4333,7 +4333,7 @@ impl IsZero for FileOperationRegistrationOptions {
 pub struct RenameFilesParams {
     // An array of all files/folders renamed in this operation. When a folder is renamed, only
     // the folder will be included, and not its children.
-    pub files: Vec<FileRename>,
+    pub files: Vec<Option<FileRename>>,
 }
 
 impl UnmarshalerFrom for RenameFilesParams {
@@ -4404,7 +4404,7 @@ impl IsZero for RenameFilesParams {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DeleteFilesParams {
     // An array of all files/folders deleted in this operation.
-    pub files: Vec<FileDelete>,
+    pub files: Vec<Option<FileDelete>>,
 }
 
 impl UnmarshalerFrom for DeleteFilesParams {
@@ -5653,7 +5653,7 @@ pub struct InlayHint {
     // *Note* that edits are expected to change the document so that the inlay
     // hint (or its nearest variant) is now part of the document and the inlay
     // hint itself is now obsolete.
-    pub text_edits: Option<Vec<TextEdit>>,
+    pub text_edits: Option<Vec<Option<TextEdit>>>,
 
     // The tooltip text when you hover over this item.
     pub tooltip: Option<StringOrMarkupContent>,
@@ -8822,7 +8822,7 @@ impl TextEdit {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DidChangeWatchedFilesParams {
     // The actual file events.
-    pub changes: Vec<FileEvent>,
+    pub changes: Vec<Option<FileEvent>>,
 }
 
 impl UnmarshalerFrom for DidChangeWatchedFilesParams {

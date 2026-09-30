@@ -668,7 +668,7 @@ impl Emitter {
 // Go: compiler/emitter.go:295 declarationMapSource
 struct DeclarationMapSource {
     file_name: &'static str,
-    text: &'static str,
+    text: FileText,
     line_map: Vec<i32>,
 }
 
@@ -677,15 +677,15 @@ fn new_declaration_map_source(source_file: Node) -> DeclarationMapSource {
     let text = source_file_original_text(source_file);
     DeclarationMapSource {
         file_name: source_file_original_file_name(source_file),
+        line_map: compute_ecma_line_starts(&text),
         text,
-        line_map: compute_ecma_line_starts(text),
     }
 }
 
 // Go: compiler/emitter.go:310 declarationMapSource.FileName, Text, ECMALineMap
 impl crate::sourcemap::source::Source for DeclarationMapSource {
     fn text(&self) -> &str {
-        self.text
+        &self.text
     }
 
     fn file_name(&self) -> &str {

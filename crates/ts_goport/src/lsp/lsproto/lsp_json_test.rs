@@ -852,7 +852,11 @@ fn test_unmarshal_string_or_array_union_string_or_inlay_hint_label_parts_with_ar
     assert!(v.string.is_none());
     assert!(v.inlay_hint_label_parts.is_some());
     assert_eq!(v.inlay_hint_label_parts.as_ref().unwrap().len(), 3);
-    assert_eq!(v.inlay_hint_label_parts.as_ref().unwrap()[0].value, "param");
+    // Go `(*v.InlayHintLabelParts)[0].Value`: the element is a `*InlayHintLabelPart`.
+    let first = v.inlay_hint_label_parts.as_ref().unwrap()[0]
+        .as_ref()
+        .unwrap();
+    assert_eq!(first.value, "param");
 }
 
 // Go: lsp_json_test.go:696 TestUnmarshalDocumentEditUnion, "TextDocumentEdit without kind"

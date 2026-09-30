@@ -24,6 +24,46 @@ mod noembed;
 #[cfg(feature = "noembed")]
 pub use noembed::*;
 
+/// Bundled lib files with at least this many text bytes get a lib parse and
+/// bind snapshot (`binder::lib_snapshot::MIN_TEXT_LEN`): lib.dom (2.3 MB),
+/// lib.webworker (0.8 MB) and lib.es5 (0.2 MB). The next largest lib has
+/// 40 KB and binds in well under a millisecond, so its section would add
+/// binary size for almost no time.
+// PORT: not in Go.
+pub const SNAPSHOT_TEXT_MIN: usize = 200_000;
+
+/// A 64-bit hash of `bytes` that runs at compile time. It only has to
+/// change when the bytes change. The lib snapshots hash their sources with
+/// it (`SOURCES_HASH`), and the embed build hashes the text of each
+/// snapshot lib with it at compile time (`embedded_text_hash`). It is not
+/// xxh3: a const xxh3 of lib.dom takes too long to compile.
+// The slice patterns need no bounds check per byte, so the compile-time
+// evaluation of the largest file stays far below the rustc step limit.
+// PORT: not in Go.
+pub const fn const_hash(bytes: &[u8]) -> u64 {
+    let mut hash = bytes.len() as u64;
+    let mut rest = bytes;
+    while let [b0, b1, b2, b3, b4, b5, b6, b7, tail @ ..] = rest {
+        hash = mix(hash ^ u64::from_le_bytes([*b0, *b1, *b2, *b3, *b4, *b5, *b6, *b7]));
+        rest = tail;
+    }
+    let mut last = 0u64;
+    let mut shift = 0;
+    while let [byte, tail @ ..] = rest {
+        last |= (*byte as u64) << shift;
+        shift += 8;
+        rest = tail;
+    }
+    mix(hash ^ last)
+}
+
+/// Multiplies by a 64-bit odd constant and folds the 128-bit product.
+// PORT: not in Go.
+pub const fn mix(value: u64) -> u64 {
+    let product = (value as u128) * 0x9E37_79B9_7F4A_7C15u128;
+    (product as u64) ^ ((product >> 64) as u64)
+}
+
 // Go: bundled.go:19 Embedded
 // Embedded is true if the bundled files are implemented through an embedded FS.
 pub const EMBEDDED: bool = EMBEDDED_UNEXPORTED;

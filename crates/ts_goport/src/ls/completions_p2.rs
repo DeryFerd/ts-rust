@@ -864,8 +864,9 @@ impl LanguageService {
                 if parent_named_import_or_export.kind() == SyntaxKind::NamedImports {
                     // Check if it is `import { ^here as name } from '...'``.
                     // We have to access the scanner here to check if it is `{ ^here as name }`` or `{ ^here, as, name }`.
+                    let text = source_file_text(file);
                     let mut scanner = crate::frontend::scanner::new_scanner();
-                    scanner.set_text(source_file_text(file));
+                    scanner.set_text(&text);
                     scanner.reset_pos(position);
                     if !(scanner.scan() == SyntaxKind::AsKeyword
                         && scanner.scan() == SyntaxKind::Identifier)
@@ -1654,19 +1655,19 @@ pub fn get_word_length_and_start(source_file: Node, position: i32) -> (i32, i32)
     let text_len = position as usize;
     let mut total_size: i32 = 0;
     let mut first_rune: i32 = 0;
-    let (mut r, mut size) = utf8_decode_last_rune_in_string(text, text_len);
+    let (mut r, mut size) = utf8_decode_last_rune_in_string(&text, text_len);
     while size != 0 {
         if WORD_SEPARATORS.contains(&r) || unicode_is_space(r) {
             break;
         }
         total_size += size;
         first_rune = r;
-        (r, size) = utf8_decode_last_rune_in_string(text, text_len - total_size as usize);
+        (r, size) = utf8_decode_last_rune_in_string(&text, text_len - total_size as usize);
     }
     // If word starts with `@`, disregard this first character.
     if first_rune == '@' as i32 {
         total_size -= 1;
-        (first_rune, _) = decode_rune_in_range(text, text_len - total_size as usize, text_len);
+        (first_rune, _) = decode_rune_in_range(&text, text_len - total_size as usize, text_len);
     }
     (total_size, first_rune)
 }
@@ -1817,7 +1818,8 @@ pub fn get_line_end_of_position(file: Node, pos: i32) -> i32 {
     } else {
         line_starts[(line + 1) as usize] - 1
     };
-    let full_text = source_file_text(file).as_bytes();
+    let full_text_text = source_file_text(file);
+    let full_text = full_text_text.as_bytes();
     if last_char_pos > 0
         && (last_char_pos as usize) < full_text.len()
         && full_text[last_char_pos as usize] == b'\n'

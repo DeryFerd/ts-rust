@@ -434,8 +434,9 @@ impl AstDecoder<'_> {
         }
         // PORT: Go `NewSourceFile(opts, text, ...)`. The factory SourceFile
         // keeps only `FileName` and `Path` of `opts` (see
-        // `NodeFactory::new_source_file`), and it takes `&'static str` file
-        // name and text. Go keeps both alive with the node; here they leak.
+        // `NodeFactory::new_source_file`), and it takes a `&'static str` file
+        // name. Go keeps both alive with the node; here they leak (the text
+        // as a static `FileText`).
         let file_name: &'static str = Box::leak(opts.file_name.clone().into_boxed_str());
         let text: &'static str = Box::leak(text.into_boxed_str());
         let node = self

@@ -458,10 +458,10 @@ impl FileLike {
 
     /// Go `FileLike.Text`.
     #[must_use]
-    pub fn text(&self) -> &str {
+    pub fn text(&self) -> FileText {
         match self {
             FileLike::Source(file) => source_file_text(*file),
-            FileLike::Original(file) => file.text,
+            FileLike::Original(file) => file.text.clone(),
             FileLike::Renamed(file) => source_file_text(file.file),
         }
     }
@@ -661,7 +661,7 @@ struct ResolvedLocation {
 /// point into that text render at the correct locations.
 pub struct OriginalTextFile {
     file_name: &'static str,
-    text: &'static str,
+    text: FileText,
     line_map: Vec<i32>,
 }
 
@@ -670,8 +670,8 @@ fn new_original_text_file(file: Node, file_name: &'static str) -> Rc<OriginalTex
     let text = source_file_original_text(file);
     Rc::new(OriginalTextFile {
         file_name,
+        line_map: compute_ecma_line_starts(&text),
         text,
-        line_map: compute_ecma_line_starts(text),
     })
 }
 

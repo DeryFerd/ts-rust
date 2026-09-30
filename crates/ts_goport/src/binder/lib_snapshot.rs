@@ -9,7 +9,8 @@
 //! ids, node data, flow nodes and file data (bind diagnostics included).
 //! The file then joins the program arena like any other bound file.
 //!
-//! The key of a lib file (`SnapshotKey`) is the xxh3 hash of its text, its
+//! The key of a lib file (`SnapshotKey`) is two hashes of its text (xxh3,
+//! and `const_hash`, which the embed build has from compile time), its
 //! slot count, an xxh3 hash of its kinds, parser flags and names columns
 //! and of the file facts that the binder reads, and a compile-time hash of
 //! the binder sources (`SOURCES_HASH`). Any mismatch or load error binds the
@@ -50,11 +51,9 @@ static BLOB: &[u8] = include_bytes!("lib_bind.bin");
 /// The first bytes of `BLOB`.
 const MAGIC: &[u8; 8] = b"TSLIBBND";
 
-/// Bundled lib files with at least this many text bytes get a snapshot:
-/// lib.dom (2.3 MB), lib.webworker (0.8 MB) and lib.es5 (0.2 MB). The next
-/// largest lib has 40 KB and binds in well under a millisecond, so its
-/// section would add binary size for almost no time.
-pub const MIN_TEXT_LEN: usize = 200_000;
+/// Bundled lib files with at least this many text bytes get a snapshot
+/// (see `bundled::SNAPSHOT_TEXT_MIN`).
+pub const MIN_TEXT_LEN: usize = bundled::SNAPSHOT_TEXT_MIN;
 
 /// Set in a stored name entry (and in a names column entry of the parse
 /// hash) when text follows. The bits below it hold the text length. A
@@ -131,34 +130,10 @@ const SOURCE_FLAGS: u64 = const_hash(include_bytes!("../flags.rs"));
 const SOURCE_LIB_NAMES: u64 = const_hash(include_bytes!("../core/lib_names.rs"));
 const SOURCE_SNAPSHOT: u64 = const_hash(include_bytes!("lib_snapshot.rs"));
 
-/// A 64-bit hash of `bytes` that runs at compile time (`SOURCES_HASH`). It
-/// only has to change when a file changes. It is not xxh3: xxhash-rust has
-/// no const xxh3 in the features this crate uses. The lib parse snapshot
-/// (`frontend/parser/lib_parse_snapshot.rs`) uses it too.
-// The slice patterns need no bounds check per byte, so the compile-time
-// evaluation of the largest file stays far below the rustc step limit.
-pub(crate) const fn const_hash(bytes: &[u8]) -> u64 {
-    let mut hash = bytes.len() as u64;
-    let mut rest = bytes;
-    while let [b0, b1, b2, b3, b4, b5, b6, b7, tail @ ..] = rest {
-        hash = mix(hash ^ u64::from_le_bytes([*b0, *b1, *b2, *b3, *b4, *b5, *b6, *b7]));
-        rest = tail;
-    }
-    let mut last = 0u64;
-    let mut shift = 0;
-    while let [byte, tail @ ..] = rest {
-        last |= (*byte as u64) << shift;
-        shift += 8;
-        rest = tail;
-    }
-    mix(hash ^ last)
-}
-
-/// Multiplies by a 64-bit odd constant and folds the 128-bit product.
-pub(crate) const fn mix(value: u64) -> u64 {
-    let product = (value as u128) * 0x9E37_79B9_7F4A_7C15u128;
-    (product as u64) ^ ((product >> 64) as u64)
-}
+/// `SOURCES_HASH` and the text part of the keys (`SnapshotKey::text_const`)
+/// use the compile-time hash of `frontend/bundled.rs`. The lib parse
+/// snapshot (`frontend/parser/lib_parse_snapshot.rs`) uses it too.
+pub(crate) use crate::frontend::bundled::{const_hash, mix};
 
 /// What must match for a lib file to load its section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +144,8 @@ struct SnapshotKey {
     nodes: u32,
     /// xxh3 of the file text.
     text: u64,
+    /// `const_hash` of the file text (`text_matches`).
+    text_const: u64,
     /// `parse_hash` of the file.
     parse: u64,
 }
@@ -182,6 +159,7 @@ impl SnapshotKey {
             sources: SOURCES_HASH,
             nodes: u32::try_from(go_file.parser_flags.len()).ok()?,
             text: text_hash(file),
+            text_const: const_hash(source_file_text(file).as_bytes()),
             parse: parse_hash(file, &go_file)?,
         })
     }
@@ -190,6 +168,7 @@ impl SnapshotKey {
         out.extend_from_slice(&self.sources.to_le_bytes());
         out.extend_from_slice(&self.nodes.to_le_bytes());
         out.extend_from_slice(&self.text.to_le_bytes());
+        out.extend_from_slice(&self.text_const.to_le_bytes());
         out.extend_from_slice(&self.parse.to_le_bytes());
     }
 
@@ -198,6 +177,7 @@ impl SnapshotKey {
             sources: r.u64()?,
             nodes: r.u32()?,
             text: r.u64()?,
+            text_const: r.u64()?,
             parse: r.u64()?,
         })
     }
@@ -212,7 +192,7 @@ impl SnapshotKey {
         if self.nodes as usize != go_file.parser_flags.len() {
             return Err("nodes");
         }
-        if self.text != text_hash(file) {
+        if !text_matches(self.text, self.text_const, &source_file_text(file)) {
             return Err("text");
         }
         if Some(self.parse) != parse_hash(file, go_file) {
@@ -225,6 +205,21 @@ impl SnapshotKey {
 /// xxh3 of the text of `file`.
 fn text_hash(file: Node) -> u64 {
     xxh3_64(source_file_text(file).as_bytes())
+}
+
+/// Whether `text` has the stored text hashes of a key: `text_const` for an
+/// embedded lib, whose `const_hash` is known at compile time, else `text`
+/// (xxh3). The parse snapshot checks its key the same way.
+///
+/// PERF (rss2): an embedded lib is not read here. Hashing it brought each
+/// page of lib.dom (2.3 MB of the binary) into the RSS of a program that
+/// uses it. xxh3 stays for a text read from a file (noembed), where it is
+/// four times faster than `const_hash`.
+pub(crate) fn text_matches(text_hash: u64, text_const: u64, text: &str) -> bool {
+    match bundled::embedded_text_hash(text) {
+        Some(hash) => text_const == hash,
+        None => text_hash == xxh3_64(text.as_bytes()),
+    }
 }
 
 /// An xxh3 hash of what the binder reads from the parse of `file` besides
