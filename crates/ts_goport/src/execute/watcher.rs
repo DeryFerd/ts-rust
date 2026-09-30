@@ -453,7 +453,7 @@ impl Watcher {
         }
 
         // Re-resolve in case newly added dirs don't exist
-        self.wm.borrow().resolve_desired_dirs(coverage.dirs())
+        self.wm.borrow().resolve_desired_dirs(&coverage.dirs())
     }
 
     // Go: execute/watcher.go:201 (*Watcher).reconcileWatches

@@ -408,7 +408,7 @@ impl Orchestrator {
             }
         }
 
-        self.wm.borrow().resolve_desired_dirs(desired_dirs.dirs())
+        self.wm.borrow().resolve_desired_dirs(&desired_dirs.dirs())
     }
 
     // Go: build/orchestrator.go:572 (*Orchestrator).addWatchDir
