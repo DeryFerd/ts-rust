@@ -48,7 +48,7 @@ use ts_goport::frontend::tspath::{
     ComparePathsOptions, EXTENSION_TS_BUILD_INFO, Path, file_extension_is,
     get_relative_path_from_directory, to_path,
 };
-use ts_goport::frontend::vfs::{Entries, FileInfo, Fs, FsError, WalkDirFunc};
+use ts_goport::frontend::vfs::{Entries, FileInfo, Fs, FsError};
 use ts_goport::gostd::GoError;
 use ts_goport::locale::{self, Locale};
 use ts_goport::scanner_util::{go_string_bytes, go_string_from_bytes};
@@ -360,10 +360,6 @@ impl Fs for TestFs {
 
     fn stat(&self, path: &str) -> Option<FileInfo> {
         self.fs.stat(path)
-    }
-
-    fn walk_dir(&self, root: &str, walk_fn: &mut WalkDirFunc<'_>) -> Result<(), FsError> {
-        self.fs.walk_dir(root, walk_fn)
     }
 
     fn realpath(&self, path: &str) -> String {
