@@ -2047,7 +2047,7 @@ impl Session {
             api_request.replace_file_system =
                 request_file_system.kind == requestfilesystem::Kind::FULL;
         }
-        let root = self.snapshot_host.new_root_snapshot();
+        let root = self.snapshot_host.new_root_snapshot_exported();
         let (snapshot, err) =
             self.snapshot_host
                 .clone_snapshot(ctx, &root, file_changes, Some(&api_request));
