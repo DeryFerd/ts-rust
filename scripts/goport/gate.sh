@@ -180,16 +180,35 @@ def parse_measure(stage, log, runs):
     return items
 
 
+EMIT_ORACLE = Path('/tmp/goport-emit-oracle')  # compare-emit.sh's oracle cache (the pin's under pin.py exec)
+
+
+def same_bytes(a, b):
+    try:
+        return Path(a).read_bytes() == Path(b).read_bytes()
+    except OSError:
+        return False
+
+
 EMIT = re.compile(r'^(\S+) (MATCH|DIFF) oracle=(\d+) goport=(\d+) differ=(\d+) only=(\d+) rc=(\S+) oracle_rc=(\S+) \S+ panics=(\d+) unported=(\d+)')
 
 
 def parse_emit(stage, log, runs):
+    """Items of the emit stage (compare-emit.sh lines; runs is its output dir). compare-emit.sh says DIFF when Go
+    writes no file. When Go and goport both write no file (noEmitOnError with diagnostics: redux-toolkit at
+    673a5f17d713, ts#64431), the item is MATCH only with equal exits, no panic or unported line, and byte-equal
+    diagnostic logs (runs/<project>/log and the oracle cache /tmp/goport-emit-oracle/<project>/log); its detail
+    says so. At a pin where Go writes files for every project nothing changes."""
     items = []
     for line in Path(log).read_text(errors='replace').splitlines():
         m = EMIT.match(line)
         if m:
             ok = m[2] == 'MATCH' and m[7] == m[8] and m[9] == '0' and m[10] == '0'
-            items.append(item(stage, m[1], ok, line.strip()))
+            note = ''
+            if (not ok and m[2] == 'DIFF' and m.group(3, 4, 5, 6) == ('0', '0', '0', '0') and m[7] == m[8]
+                    and m[9] == m[10] == '0' and same_bytes(Path(runs) / m[1] / 'log', EMIT_ORACLE / m[1] / 'log')):
+                ok, note = True, ' (no files from Go and goport: equal exit and diagnostics log)'
+            items.append(item(stage, m[1], ok, line.strip() + note))
         elif ' WROTE-INTO-PROJECT' in line:
             items.append(item(stage, line.split()[0] + '/wrote-into-project', False, line.strip()[:300]))
     return items
