@@ -208,15 +208,39 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
             // auto-import entrypoint) must still publish its parser fields,
             // so a later version can share the file.
             crate::program::note_parsed_source_file(&file);
-            // Go: binder.BindSourceFile(file) (ts#63952). PORT: the Rust
-            // binder binds each program version into one arena on the
-            // dispatch thread (`program::bind_all`), not a parse on its own,
-            // so the Go race (two programs binding one shared file at once)
-            // does not exist here. Binding is idempotent in Go, so binding at
-            // program load gives the same result.
+            // Go: binder.BindSourceFile(file) (ts#63952). PORT: not here, see
+            // `acquire_bound`. The binder lineage gets each file when a
+            // program binds its files in file order (`program::bind_all`),
+            // or when the auto-import alias resolver reads it. A bind here
+            // would bind in parse order and change the lineage ids. There is
+            // one dispatch thread, so the Go race (two programs binding one
+            // shared file at once) does not exist here.
             HashedSourceFile { file, hash }
         },
     )
+}
+
+/// Go `ParseCache.Acquire` with the bind of Go `NewParseCache`
+/// (parsecache.go:80, ts#63952): the file is published with no program and
+/// bound into the binder lineage before it is returned, on a new entry and
+/// on a reused one. `current_directory` is the caller host's. Use it for a
+/// file that a caller reads outside a program load (Go
+/// `SnapshotHost.AcquireSourceFile`).
+// PORT: a program load and the auto-import registry use `acquire`, and
+// their files bind later in the order that keeps the lineage ids (see
+// `new_parse_cache`). A file that is bound already is not bound again (Go
+// `BindOnce`), so a later program that includes the file gives the same
+// result.
+pub fn acquire_bound(
+    cache: &ParseCache,
+    key: ParseCacheKey,
+    fh: Rc<dyn FileHandle>,
+    current_directory: &str,
+) -> HashedSourceFile {
+    let result = cache.acquire(key, fh);
+    crate::program::publish_parsed_files(current_directory);
+    crate::program::bind_file_outside_program(result.file.root);
+    result
 }
 
 // Go: project/parsecache.go:84 ContentMappedParseCache (tsgo#4712)

@@ -85,7 +85,14 @@ impl SnapshotHost {
     ) -> Rc<SourceFileLease> {
         let file_handle = new_cached_file_handle(&options.file_name, text.to_string());
         let key = new_parse_cache_key(&options, file_handle.hash(), script_kind);
-        let source_file = self.parse_cache.acquire(key.clone(), file_handle).file;
+        // PORT: `acquire_bound` is Go `Acquire`, whose parse cache binds.
+        let source_file = acquire_bound(
+            &self.parse_cache,
+            key.clone(),
+            file_handle,
+            &self.options.current_directory,
+        )
+        .file;
         Rc::new(SourceFileLease {
             cache: self.parse_cache.clone(),
             key,
