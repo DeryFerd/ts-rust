@@ -1044,9 +1044,9 @@ pub struct Checker {
     pub symbols: SymbolArena,
     pub types: ChunkedArena<Type>,
     /// PORT: Go `ObjectType.instantiations` of the object types that are
-    /// not interfaces or tuples (see `ObjectType`). A key that is not here
-    /// is a Go nil map.
-    pub object_type_instantiations: FxHashMap<TypeId, InstantiationMap>,
+    /// not interfaces or tuples, at `ObjectType::instantiations` (see
+    /// `ObjectType`). Index 0 is a dummy, so `InstantiationMapId::NIL` is 0.
+    pub object_type_instantiations: Vec<InstantiationMap>,
     pub signatures: Vec<Signature>,
     pub index_infos: Vec<IndexInfo>,
     pub type_predicates: Vec<TypePredicate>,
@@ -1502,7 +1502,7 @@ impl Checker {
             merge_version: 0,
             symbols: bound_symbols,
             types: ChunkedArena::with_nil(Type::default()),
-            object_type_instantiations: FxHashMap::default(),
+            object_type_instantiations: vec![InstantiationMap::default()],
             signatures: vec![Signature::default()],
             index_infos: vec![IndexInfo::default()],
             type_predicates: vec![TypePredicate::default()],
@@ -1731,8 +1731,7 @@ impl Checker {
             &[],
         );
         let empty_generic_type = c.empty_generic_type;
-        c.object_type_instantiations
-            .insert(empty_generic_type, InstantiationMap::default());
+        c.object_instantiations_mut(empty_generic_type);
         c.any_function_type = c.new_anonymous_type(
             SymbolId::NIL, /*symbol*/
             SymbolTable::NIL,

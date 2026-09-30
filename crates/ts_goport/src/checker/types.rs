@@ -1802,14 +1802,20 @@ pub struct StructuredType {
 }
 
 /// The out-of-line fields of `StructuredType`.
+///
+/// PERF: `align(64)`, so a record never spans 2 cache lines. `repr(C)` puts
+/// the signatures and their count first.
 // Go: checker/types.go:917 StructuredType
 #[derive(Clone, Debug, Default)]
+#[repr(C, align(64))]
 pub struct StructuredSignatures {
     pub signatures: SharedList<SignatureId>, // Signatures (call + construct)
     pub call_signature_count: i32,           // Count of call signatures
-    pub index_infos: SharedList<IndexInfoId>,
     pub object_type_without_abstract_construct_signatures: TypeId,
+    pub index_infos: SharedList<IndexInfoId>,
 }
+
+const _: () = assert!(std::mem::size_of::<StructuredSignatures>() == 64);
 
 impl StructuredType {
     /// Go `signatures`: the call signatures, then the construct signatures.
@@ -1869,24 +1875,29 @@ impl StructuredType {
         call_signature_count: i32,
         index_infos: SharedList<IndexInfoId>,
     ) {
-        if self.signatures_data.is_none() && signatures.is_empty() && index_infos.is_empty() {
-            return;
+        match &mut self.signatures_data {
+            Some(d) => {
+                d.signatures = signatures;
+                d.call_signature_count = call_signature_count;
+                d.index_infos = index_infos;
+            }
+            None if signatures.is_empty() && index_infos.is_empty() => {}
+            None => {
+                self.signatures_data = Some(ArenaBox::new(StructuredSignatures {
+                    signatures,
+                    call_signature_count,
+                    object_type_without_abstract_construct_signatures: TypeId::NIL,
+                    index_infos,
+                }));
+            }
         }
-        let d = self.signatures_data_mut();
-        d.signatures = signatures;
-        d.call_signature_count = call_signature_count;
-        d.index_infos = index_infos;
     }
 
     /// Sets Go `objectTypeWithoutAbstractConstructSignatures`.
     pub fn set_object_type_without_abstract_construct_signatures(&mut self, t: TypeId) {
-        self.signatures_data_mut()
-            .object_type_without_abstract_construct_signatures = t;
-    }
-
-    fn signatures_data_mut(&mut self) -> &mut StructuredSignatures {
         self.signatures_data
             .get_or_insert_with(|| ArenaBox::new(StructuredSignatures::default()))
+            .object_type_without_abstract_construct_signatures = t;
     }
 
     // Go: checker/types.go:930 StructuredType.CallSignatures
@@ -1956,10 +1967,11 @@ pub type InstantiationMap = FlatMap<CacheHashKey, TypeId>;
 
 // PORT: Go `instantiations` (the map of type instantiations) is not here.
 // Few object types have one (effect: 7.6k anonymous object types of 129k,
-// 95 type references of 165k), so it would cost 32 bytes in every `Type`.
+// 95 type references of 165k), so the 32-byte map would grow every `Type`.
 // An interface or tuple keeps it in `InterfaceType`; any other object type
-// has it in `Checker::object_type_instantiations`. Read and write it with
-// `Checker::object_instantiations` and `object_instantiations_mut`.
+// has it in `Checker::object_type_instantiations`, at the index in
+// `instantiations`. Read and write it with `Checker::object_instantiations`
+// and `object_instantiations_mut`.
 // PORT: layout only. `repr(C)` keeps `target` and `mapper` first. An
 // anonymous object type then has them, its members table and its
 // signatures on the first cache line of its `Type` (see `TypeReference`).
@@ -1970,6 +1982,17 @@ pub struct ObjectType {
     pub target: TypeId,   // Target of instantiated type
     pub mapper: MapperId, // Type mapper for instantiated type
     pub structured: StructuredType,
+    pub instantiations: InstantiationMapId, // Map of type instantiations
+}
+
+/// The index of an object type's instantiation map in
+/// `Checker::object_type_instantiations`. `NIL` is a Go nil map, and it is
+/// always `NIL` on an interface or tuple (see `ObjectType`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InstantiationMapId(pub u32);
+
+impl InstantiationMapId {
+    pub const NIL: Self = Self(0);
 }
 
 // TypeReference (instantiation of an InterfaceType)

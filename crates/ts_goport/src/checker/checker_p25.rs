@@ -16,9 +16,13 @@ impl Checker {
     /// tuple keeps the map in `InterfaceType`, any other object type in
     /// `object_type_instantiations` (see `ObjectType`).
     pub fn object_instantiations(&self, t: TypeId) -> Option<&InstantiationMap> {
-        match self.ty(t).data.as_interface_type() {
-            Some(d) => d.instantiations.as_ref(),
-            None => self.object_type_instantiations.get(&t),
+        let data = &self.ty(t).data;
+        if let Some(d) = data.as_interface_type() {
+            return d.instantiations.as_ref();
+        }
+        match data.as_object_type()?.instantiations {
+            InstantiationMapId::NIL => None,
+            id => Some(&self.object_type_instantiations[id.0 as usize]),
         }
     }
 
@@ -31,7 +35,17 @@ impl Checker {
                 .instantiations
                 .get_or_insert_with(InstantiationMap::default);
         }
-        self.object_type_instantiations.entry(t).or_default()
+        let mut id = self.ty(t).as_object_type().instantiations;
+        if id == InstantiationMapId::NIL {
+            id = InstantiationMapId(
+                u32::try_from(self.object_type_instantiations.len())
+                    .expect("instantiation map overflow"),
+            );
+            self.object_type_instantiations
+                .push(InstantiationMap::default());
+            self.ty_mut(t).as_object_type_mut().instantiations = id;
+        }
+        &mut self.object_type_instantiations[id.0 as usize]
     }
 
     // Go: checker/checker.go:22203 getObjectTypeInstantiation
