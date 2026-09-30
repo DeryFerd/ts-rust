@@ -330,15 +330,15 @@ impl BuildTask {
     // PORT: the orchestrator calls it in `order` when the task is built
     // (ts#64220: Go no longer waits for the previous task here). Go writes
     // the buffered output to `Sys.Writer()` and merges into the
-    // orchestrator's `orchestratorResult`. That type belongs to the
+    // orchestrator's `OrchestratorResult` (ts#64158). That type belongs to the
     // orchestrator, so this takes the task result and errors and returns
     // them; the orchestrator must, in build order:
-    //   - append `errors` to `buildResult.errors` when not empty,
+    //   - append `errors` to `buildResult.Errors` when not empty,
     //   - write `result.builder` to the writer,
-    //   - raise `buildResult.result.Status` to `result.exit_status` if higher,
-    //   - aggregate `result.statistics` into `buildResult.statistics` when set,
+    //   - raise `buildResult.Result.Status` to `result.exit_status` if higher,
+    //   - aggregate `result.statistics` into `buildResult.Statistics` when set,
     //   - count `result.build_kind` (ProjectsBuilt / TimestampUpdates),
-    //   - append `result.files_to_delete` to `buildResult.filesToDelete`.
+    //   - append `result.files_to_delete` to `buildResult.FilesToDelete`.
     pub fn report(&mut self) -> (TaskResult, Vec<Diagnostic>) {
         let result = self.result.take().expect("task result is set");
         (result, self.errors.clone())

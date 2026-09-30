@@ -5,15 +5,18 @@
 //! `checkTasksForEventChanges`, `computeDesiredWatches`, `DoCycle`) is in
 //! orchestrator_watch.rs.
 //!
-//! PORT: concurrency. Go runs `buildOrCleanProject` for the tasks in
-//! `scheduleOrder` on up to `numRoutines` goroutines (ts#64220); each
+//! PORT: concurrency. Go runs `buildOrCleanProject` for the tasks of the
+//! build order (`order`, or the part of it that an API build asks for,
+//! ts#64158) on up to `numRoutines` goroutines (`rangeTasks`); each
 //! goroutine takes the next task, waits for its upstream tasks, builds, and
 //! closes the task's `built` channel. One more goroutine reports the tasks
-//! in `order`, each when it is built. Tasks here are
+//! in the same order, each when it is built (ts#64220). Go computes
+//! `scheduleOrder` with the graph, but since ts#64158 the builders take the
+//! tasks in build order. Tasks here are
 //! `Rc<RefCell<BuildTask>>` on this thread, which makes, emits and releases
 //! the program of every task (see build_task.rs). `build_all_tasks` keeps
 //! the Go schedule: at most `numRoutines` tasks are taken and not yet
-//! built, they are taken in `scheduleOrder`, and tasks report in `order`.
+//! built, and tasks are taken and report in build order.
 //! A taken task starts when its upstream tasks are done, and a task that
 //! compiles makes its program at once (`build_project_start`) and starts
 //! its check on the program's checker threads, so the checkers of the
@@ -66,20 +69,36 @@ pub struct Options {
     pub testing: Option<Rc<dyn CommandLineTesting>>,
 }
 
-// Go: build/orchestrator.go:33 orchestratorResult
-// PORT: Go `filesToDelete` is nil until a task adds a file, so an empty
+// Go: build/orchestrator.go:32 OrchestratorResult (ts#64158)
+// PORT: Go `FilesToDelete` is nil until a task adds a file, so an empty
 // `Vec` is the Go nil.
 #[derive(Default)]
-struct OrchestratorResult {
-    result: CommandLineResult,
-    errors: Vec<Diagnostic>,
-    statistics: Statistics,
-    files_to_delete: Vec<String>,
+pub struct OrchestratorResult {
+    pub result: CommandLineResult,
+    pub errors: Vec<Diagnostic>,
+    pub statistics: Statistics,
+    pub files_to_delete: Vec<String>,
 }
 
 impl OrchestratorResult {
-    // Go: build/orchestrator.go:40 (*orchestratorResult).report
+    /// Go `&OrchestratorResult{Result: tsc.CommandLineResult{Status: status}}`.
+    fn with_status(status: ExitStatus) -> Self {
+        OrchestratorResult {
+            result: CommandLineResult {
+                status,
+                watcher: None,
+            },
+            ..OrchestratorResult::default()
+        }
+    }
+
+    // Go: build/orchestrator.go:39 (*OrchestratorResult).report
     fn report(&mut self, o: &Orchestrator) {
+        self.report_with_files_to_delete(o, true);
+    }
+
+    // Go: build/orchestrator.go:43 (*OrchestratorResult).reportWithFilesToDelete (ts#64158)
+    fn report_with_files_to_delete(&mut self, o: &Orchestrator, report_files_to_delete: bool) {
         if o.opts.command.compiler_options.watch.is_true() {
             let message = if self.errors.len() == 1 {
                 diag::Found_1_error_Watching_for_file_changes
@@ -97,7 +116,7 @@ impl OrchestratorResult {
                 .as_ref()
                 .expect("error summary reporter"))(&self.errors);
         }
-        if !self.files_to_delete.is_empty() {
+        if report_files_to_delete && !self.files_to_delete.is_empty() {
             (o.create_builder_status_reporter())(&new_compiler_diagnostic(
                 diag::A_non_dry_build_would_delete_the_following_files_Colon_0,
                 args![
@@ -144,6 +163,7 @@ pub struct Orchestrator {
     tasks: FxHashMap<Path, Rc<RefCell<BuildTask>>>,
     pub(crate) order: Vec<String>,
     errors: Vec<Diagnostic>,
+    graph_generated: bool,
 
     error_summary_reporter: Option<DiagnosticsReporter>,
     pub(crate) watch_status_reporter: Option<DiagnosticReporter>,
@@ -189,13 +209,13 @@ impl Orchestrator {
         &self.order
     }
 
-    // Go: build/orchestrator.go:109 (*Orchestrator).ScheduleOrder (ts#64220)
+    // Go: build/orchestrator.go:113 (*Orchestrator).ScheduleOrder (ts#64220)
     // ScheduleOrder is the order in which builders pick up projects: Order() stably sorted by dependency depth.
     pub fn schedule_order(&self) -> &[String] {
         &self.schedule_order
     }
 
-    // Go: build/orchestrator.go:122 (*Orchestrator).computeScheduleOrder (ts#64220)
+    // Go: build/orchestrator.go:126 (*Orchestrator).computeScheduleOrder (ts#64220)
     // computeScheduleOrder sorts the build order by dependency depth (projects with no
     // upstream first, then their dependents, and so on). Builders take projects from this
     // order and block until upstream projects are done, so with the plain depth-first order
@@ -415,50 +435,293 @@ impl Orchestrator {
                 }
             }
         }
+        self.graph_generated = true;
     }
 
-    // Go: build/orchestrator.go:247 (*Orchestrator).Start
-    // PORT: Go returns the orchestrator itself as `result.Watcher`, so this
-    // takes the boxed orchestrator. `Watch` blocks in the watch loop until
-    // `ctx` ends (orchestrator_watch.rs).
-    // PORT: Go `defer o.contentMapperHost.Close()` runs when `start`
-    // returns; `start` has one return, so the close is written before it.
-    pub fn start(mut self: Box<Self>, ctx: &Context) -> CommandLineResult {
+    // Go: build/orchestrator.go:290 (*Orchestrator).Start
+    // tsc -b entrypoint
+    // PORT: Go `start` sets `result.Result.Watcher = o` in watch mode. The
+    // watcher is the boxed orchestrator, so `Start` sets it after `start`.
+    // `Watch` blocks in the watch loop until `ctx` ends
+    // (orchestrator_watch.rs).
+    pub fn start_exported(mut self: Box<Self>, ctx: &Context) -> CommandLineResult {
+        let mut result = self.start(ctx, "", false /*onlyReferences*/).result;
+        if self.opts.command.compiler_options.watch.is_true() {
+            result.watcher = Some(self as Box<dyn Watcher>);
+        }
+        result
+    }
+
+    // Go: build/orchestrator.go:295 (*Orchestrator).Build (ts#64158)
+    // orchestrator.Build() entrypoint for api
+    // PORT: in watch mode the result has no watcher (see `start_exported`).
+    pub fn build(&mut self, ctx: &Context, project: &str) -> OrchestratorResult {
+        self.recheck_all_projects(project);
+        self.start(ctx, project, false /*onlyReferences*/)
+    }
+
+    // Go: build/orchestrator.go:301 (*Orchestrator).BuildReferences (ts#64158)
+    // orchestrator.BuildReferences() entrypoint for api
+    pub fn build_references(&mut self, ctx: &Context, project: &str) -> OrchestratorResult {
+        self.recheck_all_projects(project);
+        self.start(ctx, project, true /*onlyReferences*/)
+    }
+
+    // Go: build/orchestrator.go:306 (*Orchestrator).start (ts#64158)
+    // PORT: Go `defer o.contentMapperHost.Close()` runs at each return; the
+    // returns break out of the `'start` block, and the close follows it.
+    // Go also sets `result.Result.Watcher = o` (see `start_exported`).
+    fn start(&mut self, ctx: &Context, project: &str, only_references: bool) -> OrchestratorResult {
         self.content_mapper_host =
             new_content_mapper_host(ctx, &self.opts.sys, &self.opts.command.compiler_options);
         let close_content_mapper_host = self.content_mapper_host.clone().filter(|_| {
             !self.opts.command.compiler_options.watch.is_true() || self.opts.testing.is_none()
         });
-        if self.opts.command.compiler_options.watch.is_true() {
-            (self
-                .watch_status_reporter
-                .as_ref()
-                .expect("watch status reporter"))(&new_compiler_diagnostic(
-                diag::Starting_compilation_in_watch_mode,
-                args![],
-            ));
-        }
-        self.generate_graph(None);
-        let mut result = self.build_or_clean();
-        if self.opts.command.compiler_options.watch.is_true() {
-            self.watch(ctx);
-            result.watcher = Some(self as Box<dyn Watcher>);
-        }
+        let result = 'start: {
+            if self.opts.command.compiler_options.watch.is_true() {
+                (self
+                    .watch_status_reporter
+                    .as_ref()
+                    .expect("watch status reporter"))(&new_compiler_diagnostic(
+                    diag::Starting_compilation_in_watch_mode,
+                    args![],
+                ));
+            }
+            if self.graph_generated {
+                self.generate_graph_reusing_old_tasks();
+            } else {
+                self.generate_graph(None);
+            }
+            let (mut order, ok) = self.get_build_order_for(project);
+            if !ok {
+                break 'start OrchestratorResult::with_status(
+                    ExitStatus::InvalidProjectOutputsSkipped,
+                );
+            }
+            if only_references && self.errors.is_empty() {
+                if project.is_empty() {
+                    break 'start OrchestratorResult::with_status(
+                        ExitStatus::InvalidProjectOutputsSkipped,
+                    );
+                }
+                // Go `order[:len(order)-1]`: the project itself is last.
+                order.pop();
+            }
+            let result = self.build_or_clean_order(&order);
+            if self.opts.command.compiler_options.watch.is_true() {
+                self.watch(ctx);
+            }
+            result
+        };
         if let Some(host) = close_content_mapper_host {
             let _ = host.close();
         }
         result
     }
 
-    // Go: build/orchestrator.go:660 (*Orchestrator).buildOrClean
+    // Go: build/orchestrator.go:330 (*Orchestrator).recheckAllProjects (ts#64158)
+    fn recheck_all_projects(&self, project: &str) {
+        if !self.graph_generated {
+            return;
+        }
+        let (order, ok) = self.get_build_order_for(project);
+        if !ok {
+            return;
+        }
+        self.range_tasks(
+            &order,
+            &mut |_path: &Path, task: &Rc<RefCell<BuildTask>>| {
+                let mut task = task.borrow_mut();
+                task.reset_status();
+                let path = self.to_path(&task.config);
+                task.reset_config(self, &path);
+            },
+        );
+        *self
+            .host
+            .m_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = FxHashMap::default();
+        self.reset_caches();
+    }
+
+    // Go: build/orchestrator.go:347 (*Orchestrator).Clean (ts#64158)
+    // orchestrator.Clean() entrypoint for api
+    pub fn clean_exported(&mut self, project: &str) -> OrchestratorResult {
+        self.clean(project, false)
+    }
+
+    // Go: build/orchestrator.go:352 (*Orchestrator).CleanReferences (ts#64158)
+    // orchestrator.CleanReferences() entrypoint for api
+    pub fn clean_references(&mut self, project: &str) -> OrchestratorResult {
+        self.clean(project, true)
+    }
+
+    // Go: build/orchestrator.go:356 (*Orchestrator).clean (ts#64158)
+    // PORT: Go `task.buildInfoEntryMu` guards the entry; the task is on
+    // this thread (build_task.rs).
+    fn clean(&mut self, project: &str, only_references: bool) -> OrchestratorResult {
+        if !self.graph_generated {
+            self.generate_graph(None);
+        }
+        if !self.errors.is_empty() {
+            let mut result = OrchestratorResult {
+                result: CommandLineResult {
+                    status: ExitStatus::ProjectReferenceCycleOutputsSkipped,
+                    watcher: None,
+                },
+                errors: self.errors.clone(),
+                ..OrchestratorResult::default()
+            };
+            result.report_with_files_to_delete(self, true);
+            return result;
+        }
+
+        let (mut order, ok) = self.get_build_order_for(project);
+        if !ok {
+            return OrchestratorResult::with_status(ExitStatus::InvalidProjectOutputsSkipped);
+        }
+        if only_references {
+            // Go `order[:len(order)-1]` panics on an empty order.
+            assert!(!order.is_empty(), "slice bounds out of range [:-1]");
+            order.pop();
+        }
+
+        let mut result = OrchestratorResult::default();
+        result.statistics.projects = order.len() as i32;
+        let dry = self.opts.command.build_options.dry.is_true();
+        let report_diagnostic = self.create_diagnostic_reporter();
+        for config in &order {
+            let task = self.get_task(&self.to_path(config));
+            let mut task = task.borrow_mut();
+            let Some(resolved) = task.resolved.clone() else {
+                let diagnostic =
+                    new_compiler_diagnostic(diag::File_0_not_found, args![task.config.clone()]);
+                report_diagnostic(&diagnostic);
+                result.errors.push(diagnostic);
+                continue;
+            };
+
+            let inputs: FxHashSet<Path> = resolved
+                .file_names()
+                .iter()
+                .map(|file_name| self.to_path(file_name))
+                .collect();
+            let project_outputs = resolved.get_output_file_names();
+            let mut deleted = false;
+            for output_file in &project_outputs {
+                deleted = self.clean_project_output(
+                    output_file,
+                    &inputs,
+                    dry,
+                    &mut result.files_to_delete,
+                    &report_diagnostic,
+                ) || deleted;
+            }
+            deleted = self.clean_project_output(
+                &resolved.get_build_info_file_name(),
+                &inputs,
+                dry,
+                &mut result.files_to_delete,
+                &report_diagnostic,
+            ) || deleted;
+            if deleted {
+                task.reset_status();
+                task.build_info_entry = None;
+            }
+        }
+
+        result.report_with_files_to_delete(self, dry);
+        result
+    }
+
+    // Go: build/orchestrator.go:410 (*Orchestrator).getBuildOrderFor (ts#64158)
+    // PORT: Go returns `o.order` itself for an empty project; this clones it.
+    fn get_build_order_for(&self, project: &str) -> (Vec<String>, bool) {
+        if project.is_empty() {
+            return (self.order.clone(), true);
+        }
+
+        let config = resolve_config_file_name_of_project_reference(&resolve_path(
+            &self.opts.sys.get_current_directory(),
+            &[project],
+        ));
+        let Some(target) = self.tasks.get(&self.to_path(&config)).cloned() else {
+            return (Vec::new(), false);
+        };
+
+        let mut projects: FxHashSet<Path> = FxHashSet::default();
+        fn add_project_and_references(
+            o: &Orchestrator,
+            projects: &mut FxHashSet<Path>,
+            task: &Rc<RefCell<BuildTask>>,
+        ) {
+            let task = task.borrow();
+            let path = o.to_path(&task.config);
+            if projects.contains(&path) {
+                return;
+            }
+            projects.insert(path);
+            for upstream in &task.up_stream {
+                add_project_and_references(o, projects, &upstream.task);
+            }
+        }
+        add_project_and_references(self, &mut projects, &target);
+
+        let mut order: Vec<String> = Vec::with_capacity(projects.len());
+        for config in &self.order {
+            if projects.contains(&self.to_path(config)) {
+                order.push(config.clone());
+            }
+        }
+        (order, true)
+    }
+
+    // Go: build/orchestrator.go:443 (*Orchestrator).cleanProjectOutput (ts#64158)
+    fn clean_project_output(
+        &self,
+        output_file: &str,
+        inputs: &FxHashSet<Path>,
+        dry: bool,
+        files_to_delete: &mut Vec<String>,
+        report_diagnostic: &DiagnosticReporter,
+    ) -> bool {
+        let fs = CompilerHost::fs(&*self.host);
+        if output_file.is_empty()
+            || inputs.contains(&self.to_path(output_file))
+            || !fs.file_exists(output_file)
+        {
+            return false;
+        }
+        files_to_delete.push(output_file.to_string());
+        if dry {
+            return false;
+        }
+        if fs.remove(output_file).is_err() {
+            report_diagnostic(&new_compiler_diagnostic(
+                diag::Failed_to_delete_file_0,
+                args![output_file],
+            ));
+            return false;
+        }
+        true
+    }
+
+    // Go: build/orchestrator.go:869 (*Orchestrator).buildOrClean
     pub(crate) fn build_or_clean(&mut self) -> CommandLineResult {
+        let order = self.order.clone();
+        self.build_or_clean_order(&order).result
+    }
+
+    // Go: build/orchestrator.go:873 (*Orchestrator).buildOrCleanOrder (ts#64158)
+    fn build_or_clean_order(&mut self, order: &[String]) -> OrchestratorResult {
         if !self.opts.command.build_options.clean.is_true()
             && self.opts.command.build_options.verbose.is_true()
         {
             (self.create_builder_status_reporter())(&new_compiler_diagnostic(
                 diag::Projects_in_this_build_Colon_0,
                 args![
-                    self.order()
+                    order
                         .iter()
                         .map(|p| format!("\r\n    * {}", self.relative_file_name(p)))
                         .collect::<String>()
@@ -467,8 +730,8 @@ impl Orchestrator {
         }
         let mut build_result = OrchestratorResult::default();
         if self.errors.is_empty() {
-            build_result.statistics.projects = self.order().len() as i32;
-            self.build_all_tasks(&mut build_result);
+            build_result.statistics.projects = order.len() as i32;
+            self.build_all_tasks(order, &mut build_result);
         } else {
             // Circularity errors prevent any project from being built
             build_result.result.status = ExitStatus::ProjectReferenceCycleOutputsSkipped;
@@ -482,7 +745,7 @@ impl Orchestrator {
         build_result.result
     }
 
-    // Go: build/orchestrator.go:688 (*Orchestrator).numRoutines part of rangeTask
+    // Go: build/orchestrator.go:924 the numRoutines part of (*Orchestrator).rangeTasks
     pub(crate) fn num_routines(&self) -> i32 {
         let mut num_routines = 4;
         if self.opts.command.compiler_options.single_threaded.is_true() {
@@ -493,13 +756,13 @@ impl Orchestrator {
         num_routines
     }
 
-    // Go: build/orchestrator.go:737 (*Orchestrator).rangeTask over
-    // `scheduleOrder` with build/orchestrator.go:773
-    // (*Orchestrator).buildOrCleanProject, and the reporting goroutine of
-    // build/orchestrator.go:697 buildOrClean (ts#64220).
+    // Go: build/orchestrator.go:923 (*Orchestrator).rangeTasks over `order`
+    // with build/orchestrator.go:959 (*Orchestrator).buildOrCleanProject, and
+    // the reporting goroutine of build/orchestrator.go:873 buildOrCleanOrder
+    // (ts#64220, ts#64158).
     // PORT: see the top comment for the schedule. Go `numRoutines <= 0`
     // starts no builder, so no task runs; that is kept.
-    fn build_all_tasks(&self, build_result: &mut OrchestratorResult) {
+    fn build_all_tasks(&self, order: &[String], build_result: &mut OrchestratorResult) {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum State {
             NotTaken,
@@ -515,34 +778,25 @@ impl Orchestrator {
         let clean = self.opts.command.build_options.clean.is_true();
         // PORT: testing (see the top comment)
         let testing = self.opts.testing.is_some();
-        // Tasks report in `paths` (Go `order`); builders take them in
-        // `schedule` (Go `scheduleOrder`), as indexes into `paths`.
-        let paths: Vec<Path> = self.order.iter().map(|c| self.to_path(c)).collect();
+        let paths: Vec<Path> = order.iter().map(|c| self.to_path(c)).collect();
+        if !clean {
+            *self.build_info_prefetch.borrow_mut() = self.start_build_info_prefetch(&paths);
+        }
         let index_of: FxHashMap<Path, usize> = paths
             .iter()
             .enumerate()
             .map(|(i, p)| (p.clone(), i))
             .collect();
-        let schedule: Vec<usize> = self
-            .schedule_order
-            .iter()
-            .map(|config| index_of[&self.to_path(config)])
-            .collect();
-        if !clean {
-            let schedule_paths: Vec<Path> = schedule.iter().map(|&i| paths[i].clone()).collect();
-            *self.build_info_prefetch.borrow_mut() =
-                self.start_build_info_prefetch(&schedule_paths);
-        }
         let mut states = vec![State::NotTaken; paths.len()];
         // Tasks taken (Go `currentTaskIndex`), taken and not built, and
-        // reported.
+        // reported. The tasks before `next_report` are built.
         let mut next_take = 0;
         let mut in_flight = 0;
         let mut next_report = 0;
         while next_report < paths.len() {
-            // Each free builder takes the next task in schedule order.
-            while in_flight < num_routines && next_take < schedule.len() {
-                states[schedule[next_take]] = State::Waiting;
+            // Each free builder takes the next task in order.
+            while in_flight < num_routines && next_take < paths.len() {
+                states[next_take] = State::Waiting;
                 next_take += 1;
                 in_flight += 1;
             }
@@ -551,7 +805,7 @@ impl Orchestrator {
             // that compiles makes its program now. A built task frees its
             // builder (Go `close(task.built)`).
             let mut progressed = false;
-            for &index in &schedule[..next_take] {
+            for index in next_report..next_take {
                 if states[index] != State::Waiting {
                     continue;
                 }
@@ -603,9 +857,7 @@ impl Orchestrator {
             // first taken task that is not built has its upstream tasks
             // done). The first taken one that compiles emits now, before
             // the other started tasks.
-            let index = schedule[..next_take]
-                .iter()
-                .copied()
+            let index = (next_report..next_take)
                 .find(|&index| states[index] == State::Compiling)
                 .expect("a taken build task compiles");
             let task = self.get_task(&paths[index]);
@@ -619,7 +871,7 @@ impl Orchestrator {
         self.build_info_prefetch.borrow_mut().take();
     }
 
-    // Go: build/orchestrator.go:773 (*Orchestrator).buildOrCleanProject,
+    // Go: build/orchestrator.go:959 (*Orchestrator).buildOrCleanProject,
     // after the build (ts#64220).
     fn task_built(&self, task: &mut BuildTask) {
         if self.opts.testing.is_none() {
@@ -975,6 +1227,7 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
         watch_status_reporter: None,
         wm: Rc::new(RefCell::new(wm)),
         schedule_order: Vec::new(),
+        graph_generated: false,
         build_info_prefetch: RefCell::new(None),
     };
     if orchestrator.opts.command.compiler_options.watch.is_true() {

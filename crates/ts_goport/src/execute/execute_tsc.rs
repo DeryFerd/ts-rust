@@ -236,7 +236,7 @@ pub fn tsc_build_compilation(
         command: Rc::new(build_command),
         testing,
     }));
-    orchestrator.start(ctx)
+    orchestrator.start_exported(ctx)
 }
 
 // Go: execute/tsc.go:121 tscCompilation

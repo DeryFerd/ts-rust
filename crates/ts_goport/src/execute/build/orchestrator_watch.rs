@@ -519,17 +519,26 @@ impl Orchestrator {
         self.wm.borrow().unlock();
     }
 
-    // Go: build/orchestrator.go:737 (*Orchestrator).rangeTask (ts#64220)
-    // PORT: the build itself uses `build_all_tasks` (orchestrator.rs). The
-    // watch callers pass an `f` that touches only its own task and the host
-    // caches, so the tasks run one at a time in `scheduleOrder`, the order
-    // in which Go's goroutines take them. With `numRoutines <= 0` Go starts
-    // no goroutine and runs no task; that is kept.
+    // Go: build/orchestrator.go:919 (*Orchestrator).rangeTask
     pub(crate) fn range_task(&self, f: &mut dyn FnMut(&Path, &Rc<RefCell<BuildTask>>)) {
+        self.range_tasks(&self.order, f);
+    }
+
+    // Go: build/orchestrator.go:923 (*Orchestrator).rangeTasks (ts#64158)
+    // PORT: the build itself uses `build_all_tasks` (orchestrator.rs). The
+    // other callers pass an `f` that touches only its own task and the host
+    // caches, so the tasks run one at a time in `order`, the order in which
+    // Go's goroutines take them. With `numRoutines <= 0` Go starts no
+    // goroutine and runs no task; that is kept.
+    pub(crate) fn range_tasks(
+        &self,
+        order: &[String],
+        f: &mut dyn FnMut(&Path, &Rc<RefCell<BuildTask>>),
+    ) {
         if self.num_routines() <= 0 {
             return;
         }
-        for config in &self.schedule_order {
+        for config in order {
             let path = self.to_path(config);
             let task = self.get_task(&path);
             f(&path, &task);
