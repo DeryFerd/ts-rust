@@ -607,7 +607,9 @@ impl Checker {
         self.check_source_element(node.argument());
         let attributes = node.attributes();
         if attributes.is_some() {
-            self.get_resolution_mode_override(attributes, true /*reportErrors*/);
+            let import_attributes = attributes;
+            self.check_grammar_import_attribute_values(import_attributes);
+            self.get_resolution_mode_override(import_attributes, true /*reportErrors*/);
         }
         self.check_type_reference_or_import(node);
         self.check_import_attributes(node);

@@ -1178,18 +1178,9 @@ impl Checker {
         if !is_import_equals_declaration(node) {
             let attributes = get_import_attributes(node);
             if attributes.is_some() {
-                let mut has_error = false;
-                for attr in import_attributes_list_p06(attributes) {
-                    if !is_string_literal(attr.value()) {
-                        has_error = true;
-                        self.error(
-                            attr.value(),
-                            diag::Import_attribute_values_must_be_string_literal_expressions,
-                            args![],
-                        );
-                    }
+                if self.check_grammar_import_attribute_values(attributes) {
+                    return false;
                 }
-                return !has_error;
             }
         }
         true

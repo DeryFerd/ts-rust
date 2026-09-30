@@ -1752,7 +1752,35 @@ fn file_extension_is_one_of_gc1(path: &str, extensions: &[&str]) -> bool {
 }
 
 impl Checker {
-    // Go: checker/grammarchecks.go:2187 checkGrammarImportAttributesType
+    // Go: checker/grammarchecks.go:2123 checkGrammarImportAttributeValues
+    // PORT: in Go this follows checkGrammarImportClause (grammarchecks_p3.rs);
+    // it is here because the checker lane owns this file. The children of an
+    // ImportAttributes node are its `Attributes` list.
+    pub fn check_grammar_import_attribute_values(&mut self, node: Node) -> bool {
+        let mut has_error = false;
+        let mut attributes = Vec::new();
+        node.for_each_child(&mut |child: Node| {
+            if child.kind() == SyntaxKind::ImportAttribute {
+                attributes.push(child);
+            }
+            false
+        });
+        for attribute in attributes {
+            let value = attribute.value();
+            if is_string_literal(value) {
+                continue;
+            }
+            has_error = true;
+            self.error(
+                value,
+                diag::Import_attribute_values_must_be_string_literal_expressions,
+                args![],
+            );
+        }
+        has_error
+    }
+
+    // Go: checker/grammarchecks.go:2200 checkGrammarImportAttributesType
     // PORT: the Go function is last in grammarchecks.go (grammarchecks_p3.rs);
     // it is here because the checker lane owns this file.
     pub fn check_grammar_import_attributes_type(&mut self, attributes: Node) -> bool {
