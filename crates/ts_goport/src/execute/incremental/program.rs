@@ -137,6 +137,19 @@ pub fn read_build_info_program(
 ) -> Option<Program> {
     // Read buildInfo file
     let build_info = reader.read_build_info(config)?;
+    build_info_program(config, &build_info, host)
+}
+
+/// `read_build_info_program` after the read: the program of `build_info`.
+// PORT: not in Go. The `tsc -b` task holds its build info
+// (`loadOrStoreBuildInfo`), and gives it here without the copy that a
+// `BuildInfoReader` returns.
+#[must_use]
+pub fn build_info_program(
+    config: &ParsedCommandLine,
+    build_info: &BuildInfo,
+    host: &dyn CompilerHost,
+) -> Option<Program> {
     if !build_info.is_valid_version() || !build_info.is_incremental() {
         return None;
     }
@@ -151,9 +164,7 @@ pub fn read_build_info_program(
     // Convert to information that can be used to create incremental program
     Some(Program {
         snapshot: Rc::new(RefCell::new(build_info_to_snapshot(
-            &build_info,
-            config,
-            host,
+            build_info, config, host,
         ))),
         program: None,
         host: None,

@@ -384,7 +384,7 @@ impl BuildHost {
     // PORT: Go reads the build info cache of the config's task
     // (`loadOrStoreBuildInfo`). Its only caller is `ReadBuildInfoProgram` in
     // `compileAndEmit`, with the config of the task that compiles, so
-    // `BuildTask::compile_and_emit_start` reads its own cache (`TaskBuildInfo`)
+    // `BuildTask::compile_and_emit_start` reads its own cache (`build_info_program`)
     // and the host does not implement `incremental.BuildInfoReader`.
 }
 

@@ -7,10 +7,10 @@ use crate::execute::incremental::build_info::{
     BuildInfoRootInfoReader, content_mapper_identities, is_build_info_file_name_default_library,
 };
 use crate::execute::incremental::emit_files::{buffer_early_emit_writes, fs_error_text};
-use crate::execute::incremental::incremental::{BuildInfoReader, Host as IncrementalHost};
+use crate::execute::incremental::incremental::Host as IncrementalHost;
 use crate::execute::incremental::program::{
-    NestedEmitNow, Program as IncrementalProgram, new_program as new_incremental_program,
-    read_build_info_program,
+    NestedEmitNow, Program as IncrementalProgram, build_info_program,
+    new_program as new_incremental_program,
 };
 use crate::execute::incremental::{BuildInfo, compute_hash};
 use crate::execute::tsc::compile::{CompileTimes, System, Writer};
@@ -800,15 +800,16 @@ impl BuildTask {
         if !command.build_options.force.is_true() {
             // Go: `ReadBuildInfoProgram(t.resolved, o.host, compilerHost)`.
             // Its `o.host.ReadBuildInfo(t.resolved)` (build/host.go:77) is
-            // this task's `loadOrStoreBuildInfo`.
+            // this task's `loadOrStoreBuildInfo`, and the rest is
+            // `build_info_program`, which reads that build info in place.
             let config_path = orchestrator.to_path(resolved.config_name());
             let (build_info, _) = self.load_or_store_build_info(
                 orchestrator,
                 &config_path,
                 &resolved.get_build_info_file_name(),
             );
-            old_program =
-                read_build_info_program(&resolved, &TaskBuildInfo(build_info), &*compiler_host);
+            old_program = build_info
+                .and_then(|build_info| build_info_program(&resolved, &build_info, &*compiler_host));
         }
         compile_times.borrow_mut().build_info_read_time = elapsed(&*sys, build_info_read_start);
         let parse_start = sys.now();
@@ -2148,17 +2149,6 @@ fn task_write_file_now() -> SystemTime {
     WRITE_FILE_SYS
         .with(|sys| sys.borrow().as_ref().map(|sys| sys.now()))
         .unwrap_or_else(SystemTime::now)
-}
-
-/// Go `o.host` as the `incremental.BuildInfoReader` of
-/// `ReadBuildInfoProgram`: its `ReadBuildInfo` (build/host.go:77) is the
-/// task's `loadOrStoreBuildInfo`, whose value this holds.
-struct TaskBuildInfo(Option<Rc<BuildInfo>>);
-
-impl BuildInfoReader for TaskBuildInfo {
-    fn read_build_info(&self, _config: &ParsedCommandLine) -> Option<Rc<BuildInfo>> {
-        self.0.clone()
-    }
 }
 
 /// Go `o.opts.Sys.Now().Sub(start)`.
