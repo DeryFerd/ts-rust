@@ -1793,6 +1793,18 @@ impl Checker {
                     args![],
                 );
             }
+            let modifiers = member.modifiers();
+            if modifiers.is_some() {
+                for modifier in modifiers.nodes() {
+                    if modifier.kind() == SyntaxKind::ReadonlyKeyword {
+                        return self.grammar_error_on_node(
+                            modifier,
+                            diag::An_import_attributes_property_cannot_have_a_readonly_modifier,
+                            args![],
+                        );
+                    }
+                }
+            }
             if member.type_().is_nil() {
                 return self.grammar_error_on_node(
                     member,
