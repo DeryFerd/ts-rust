@@ -265,7 +265,7 @@ pub struct CompletionItem {
     // Additional text edits should be used to change text unrelated to the current cursor position
     // (for example adding an import statement at the top of the file if the completion item will
     // insert an unqualified type).
-    pub additional_text_edits: Option<Vec<TextEdit>>,
+    pub additional_text_edits: Option<Vec<Option<TextEdit>>>,
 
     // An optional set of characters that when pressed while this completion is active will accept it first and
     // then type that character. *Note* that all commit characters should have `length=1` and that superfluous
@@ -1202,7 +1202,7 @@ impl IsZero for SignatureHelpParams {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SignatureHelp {
     // One or more signatures.
-    pub signatures: Vec<SignatureInformation>,
+    pub signatures: Vec<Option<SignatureInformation>>,
 
     // The active signature. If omitted or the value lies outside the
     // range of `signatures` the value defaults to zero or is ignored if
@@ -2865,7 +2865,7 @@ pub struct CodeAction {
     pub kind: Option<CodeActionKind>,
 
     // The diagnostics that this code action resolves.
-    pub diagnostics: Option<Vec<Diagnostic>>,
+    pub diagnostics: Option<Vec<Option<Diagnostic>>>,
 
     // Marks this as a preferred action. Preferred actions are used by the `auto fix` command and can be targeted
     // by keybindings.

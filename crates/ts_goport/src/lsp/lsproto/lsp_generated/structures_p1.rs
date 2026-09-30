@@ -5777,7 +5777,7 @@ pub struct InlayHint {
     // *Note* that edits are expected to change the document so that the inlay
     // hint (or its nearest variant) is now part of the document and the inlay
     // hint itself is now obsolete.
-    pub text_edits: Option<Vec<TextEdit>>,
+    pub text_edits: Option<Vec<Option<TextEdit>>>,
 
     // The tooltip text when you hover over this item.
     pub tooltip: Option<StringOrMarkupContent>,

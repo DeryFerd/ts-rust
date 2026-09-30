@@ -224,10 +224,10 @@ pub fn create_type_help_items(
     let supports_per_signature_active_param = sig_info_caps.active_parameter_support;
 
     // Converting signatureHelpParameter to *lsproto.ParameterInformation
-    let parameters: Vec<lsproto::ParameterInformation> = item
+    let parameters: Vec<Option<lsproto::ParameterInformation>> = item
         .parameters
         .iter()
-        .map(|param| param.parameter_info.clone())
+        .map(|param| Some(param.parameter_info.clone()))
         .collect();
 
     let mut sig_info = lsproto::SignatureInformation {
@@ -245,7 +245,7 @@ pub fn create_type_help_items(
     }
 
     let mut help = lsproto::SignatureHelp {
-        signatures: vec![sig_info],
+        signatures: vec![Some(sig_info)],
         active_signature: Some(0),
         ..Default::default()
     };
@@ -542,13 +542,13 @@ impl LanguageService {
         let supports_null_active_param = sig_info_caps.no_active_parameter_support;
 
         // Converting []signatureInformation to []*lsproto.SignatureInformation
-        let mut signature_information: Vec<lsproto::SignatureInformation> =
+        let mut signature_information: Vec<Option<lsproto::SignatureInformation>> =
             Vec::with_capacity(flattened_signatures.len());
         for item in &flattened_signatures {
-            let parameters: Vec<lsproto::ParameterInformation> = item
+            let parameters: Vec<Option<lsproto::ParameterInformation>> = item
                 .parameters
                 .iter()
-                .map(|param| param.parameter_info.clone())
+                .map(|param| Some(param.parameter_info.clone()))
                 .collect();
             let mut documentation: Option<lsproto::StringOrMarkupContent> = None;
             if let Some(item_documentation) = &item.documentation {
@@ -570,7 +570,7 @@ impl LanguageService {
             // Set VS-specific colorized label if we have classified runs
             if !item.colorized_runs.is_empty() {
                 sig_info.vs_colorized_label = Some(lsproto::VSClassifiedTextElement {
-                    runs: item.colorized_runs.clone(),
+                    runs: item.colorized_runs.iter().cloned().map(Some).collect(),
                     ..Default::default()
                 });
             }
@@ -584,7 +584,7 @@ impl LanguageService {
                 );
             }
 
-            signature_information.push(sig_info);
+            signature_information.push(Some(sig_info));
         }
 
         let mut help = lsproto::SignatureHelp {

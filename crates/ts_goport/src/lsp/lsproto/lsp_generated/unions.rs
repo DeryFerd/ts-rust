@@ -292,7 +292,7 @@ impl IsZero for TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StringOrInlayHintLabelParts {
     pub string: Option<String>,
-    pub inlay_hint_label_parts: Option<Vec<InlayHintLabelPart>>,
+    pub inlay_hint_label_parts: Option<Vec<Option<InlayHintLabelPart>>>,
 }
 
 impl MarshalerTo for StringOrInlayHintLabelParts {

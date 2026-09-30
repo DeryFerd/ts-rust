@@ -978,7 +978,7 @@ fn diagnostic_to_lsp(
         severity = lsproto::DiagnosticSeverity::WARNING;
     }
 
-    let mut related_information: Vec<lsproto::DiagnosticRelatedInformation> = Vec::new();
+    let mut related_information: Vec<Option<lsproto::DiagnosticRelatedInformation>> = Vec::new();
     if opts.related_information {
         related_information = Vec::with_capacity(diagnostic.related_information().len());
         for related in diagnostic.related_information() {
@@ -991,13 +991,13 @@ fn diagnostic_to_lsp(
                 // location instead of presenting the synthesized span's insertion point as related source.
                 related_range = lsproto::Range::default();
             }
-            related_information.push(lsproto::DiagnosticRelatedInformation {
+            related_information.push(Some(lsproto::DiagnosticRelatedInformation {
                 location: lsproto::Location {
                     uri: file_name_to_document_uri(source_file_original_file_name(related_file)),
                     range: related_range,
                 },
                 message: related.localize(&locale),
-            });
+            }));
         }
     }
 

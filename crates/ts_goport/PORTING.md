@@ -954,10 +954,11 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   are snake case (`text_document`, `type_`); `*T` is `Option<T>`
   (`Option<Box<T>>` only on a type cycle); `*[]T` is `Option<Vec<T>>`;
   `[]T` and `[]*T` are `Vec<T>`, except that `[]*T` is `Vec<Option<T>>`
-  in a type that the server only decodes (client-to-server params,
-  server-to-client results, and the types they hold that the server never
-  encodes), so a JSON null element is Go's nil element (the generator's
-  `decodeOnlyTypes`); `map[K]V` is `IndexMap<K, V>`; LSPAny is
+  in a type that the server decodes (client-to-server params,
+  server-to-client results, and the types they hold), so a JSON null
+  element is Go's nil element and a nil element encodes as null (the
+  generator's `decodedTypes`). Code that builds such a list wraps each
+  element in `Some`; `map[K]V` is `IndexMap<K, V>`; LSPAny is
   `LspAny`; a string enum is `pub struct MarkupKind(pub Cow<'static, str>)`
   with consts such as `MarkupKind::PLAIN_TEXT`; an int enum is
   `pub struct CompletionItemKind(pub i32)` with consts; method consts are

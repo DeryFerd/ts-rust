@@ -322,6 +322,10 @@ impl InlayHintState<'_> {
         } else if let Some(inlay_hint_label_parts) = &hint_parts.inlay_hint_label_parts {
             let mut b = String::new();
             for part in inlay_hint_label_parts {
+                // Go `part.Value` (a nil part panics).
+                let part = part
+                    .as_ref()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 b.push_str(&part.value);
             }
             hint_text = b;
@@ -473,10 +477,10 @@ impl InlayHintState<'_> {
         if hint.string.is_some() {
             hint.string = Some(format!(": {}", hint.string.as_ref().unwrap()));
         } else {
-            let mut parts = vec![lsproto::InlayHintLabelPart {
+            let mut parts = vec![Some(lsproto::InlayHintLabelPart {
                 value: ": ".to_string(),
                 ..Default::default()
-            }];
+            })];
             // PORT: Go dereferences `*hint.InlayHintLabelParts`; nil panics.
             parts.extend(
                 hint.inlay_hint_label_parts
@@ -537,11 +541,11 @@ impl InlayHintState<'_> {
             text
         );
         let display_parts = vec![
-            self.get_node_display_part(&hint_text, parameter),
-            lsproto::InlayHintLabelPart {
+            Some(self.get_node_display_part(&hint_text, parameter)),
+            Some(lsproto::InlayHintLabelPart {
                 value: ":".to_string(),
                 ..Default::default()
-            },
+            }),
         ];
         let label_parts = lsproto::StringOrInlayHintLabelParts {
             inlay_hint_label_parts: Some(display_parts),
@@ -560,15 +564,17 @@ impl InlayHintState<'_> {
     // Go: ls/inlay_hints.go:422 inlayHintState.getInlayHintLabelParts
     // PORT: the Go closures `visitForDisplayParts`, `visitDisplayPartList` and
     // `visitParametersAndTypeParameters` are methods below. They take the
-    // captured `parts` and `idToSymbol` as parameters.
+    // captured `parts` and `idToSymbol` as parameters. Go returns
+    // `[]*lsproto.InlayHintLabelPart`; the visitors build values, which are
+    // never nil.
     fn get_inlay_hint_label_parts(
         &self,
         node: Node,
         id_to_symbol: &FxHashMap<Node, SymbolId>,
-    ) -> Vec<lsproto::InlayHintLabelPart> {
+    ) -> Vec<Option<lsproto::InlayHintLabelPart>> {
         let mut parts: Vec<lsproto::InlayHintLabelPart> = Vec::new();
         self.visit_for_display_parts(node, id_to_symbol, &mut parts);
-        parts
+        parts.into_iter().map(Some).collect()
     }
 
     // Go: ls/inlay_hints.go:429 visitForDisplayParts (closure in getInlayHintLabelParts)

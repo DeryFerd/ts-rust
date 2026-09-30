@@ -7949,7 +7949,7 @@ impl IsZero for VSClassifiedTextRun {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct VSClassifiedTextElement {
     // The classified text runs that make up this element.
-    pub runs: Vec<VSClassifiedTextRun>,
+    pub runs: Vec<Option<VSClassifiedTextRun>>,
 
     // VS type discriminator required by ObjectContentConverter for deserialization.
     pub vs_type: StringLiteralClassifiedTextElement,

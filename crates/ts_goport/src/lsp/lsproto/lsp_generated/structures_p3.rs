@@ -2708,7 +2708,7 @@ pub struct Diagnostic {
 
     // An array of related diagnostic information, e.g. when symbol-names within
     // a scope collide all definitions can be marked via this property.
-    pub related_information: Option<Vec<DiagnosticRelatedInformation>>,
+    pub related_information: Option<Vec<Option<DiagnosticRelatedInformation>>>,
 
     // A data entry field that is preserved between a `textDocument/publishDiagnostics`
     // notification and `textDocument/codeAction` request.
@@ -3645,7 +3645,7 @@ pub struct SignatureInformation {
     pub documentation: Option<StringOrMarkupContent>,
 
     // The parameters of this signature.
-    pub parameters: Option<Vec<ParameterInformation>>,
+    pub parameters: Option<Vec<Option<ParameterInformation>>>,
 
     // The index of the active parameter.
     //
