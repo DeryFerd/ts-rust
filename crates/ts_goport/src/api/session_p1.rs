@@ -287,6 +287,36 @@ impl SnapshotData {
         }
         let id = self.register_type(project_id, checker, t);
         let mut resp = new_type_response(&checker.borrow(), t, id);
+        // ts#64397
+        let is_mapped = checker
+            .borrow()
+            .ty(t)
+            .object_flags()
+            .intersects(ObjectFlags::MAPPED);
+        if is_mapped {
+            // Go `mapped.ResolveComponents(c, t)` (checker/types.go).
+            {
+                let mut c = checker.borrow_mut();
+                c.get_type_parameter_from_mapped_type(t);
+                c.get_constraint_type_from_mapped_type(t);
+                c.get_name_type_from_mapped_type(t);
+                c.get_template_type_from_mapped_type(t);
+            }
+            let (type_parameter, constraint_type, name_type, template_type) = {
+                let c = checker.borrow();
+                let mapped = c.ty(t).as_mapped_type();
+                (
+                    mapped.type_parameter,
+                    mapped.constraint_type,
+                    mapped.name_type,
+                    mapped.template_type,
+                )
+            };
+            resp.type_parameter = self.register_type(project_id, checker, type_parameter);
+            resp.constraint_type = self.register_type(project_id, checker, constraint_type);
+            resp.name_type = self.register_type(project_id, checker, name_type);
+            resp.template_type = self.register_type(project_id, checker, template_type);
+        }
         // ts#64109
         // PORT: the labeled declarations are copied out of the checker arena
         // before the node handles are built.
@@ -858,11 +888,8 @@ pub struct CheckerSetup {
 }
 
 impl CheckerSetup {
-    // Go: api/session.go:464 checkerSetup.newTypeResponse
-    pub fn new_type_response(&self, t: TypeId) -> Option<TypeResponse> {
-        self.sd
-            .new_type_response(&self.project_id, &self.checker, t)
-    }
+    // ts#64397: Go `checkerSetup.newTypeResponse` is gone; callers use
+    // `setup.sd.new_type_response(&setup.project_id, &setup.checker, t)`.
 
     // Go: api/session.go:468 checkerSetup.newSymbolResponse
     pub fn new_symbol_response(&self, sym: SymbolId) -> Option<SymbolResponse> {
@@ -895,10 +922,12 @@ impl CheckerSetup {
         };
         let mut result = IndexInfoResponse {
             key_type: self
-                .new_type_response(key_type)
+                .sd
+                .new_type_response(&self.project_id, &self.checker, key_type)
                 .expect("invalid memory address or nil pointer dereference"),
             value_type: self
-                .new_type_response(value_type)
+                .sd
+                .new_type_response(&self.project_id, &self.checker, value_type)
                 .expect("invalid memory address or nil pointer dereference"),
             is_readonly,
             ..Default::default()
@@ -1378,6 +1407,19 @@ impl ipc::Handler for Session {
                 .map(to_any),
             m if m == Method::GET_CONSTRAINT_OF_TYPE.0 => self
                 .handle_get_constraint_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64397
+            m if m == Method::GET_TYPE_PARAMETER_OF_MAPPED_TYPE.0 => self
+                .handle_get_type_parameter_of_mapped_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_CONSTRAINT_TYPE_OF_MAPPED_TYPE.0 => self
+                .handle_get_constraint_type_of_mapped_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_NAME_TYPE_OF_MAPPED_TYPE.0 => self
+                .handle_get_name_type_of_mapped_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_TEMPLATE_TYPE_OF_MAPPED_TYPE.0 => self
+                .handle_get_template_type_of_mapped_type(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_TRUE_TYPE_OF_CONDITIONAL_TYPE.0 => self
                 .handle_get_true_type_of_conditional_type(ctx, assert_params(&parsed))
@@ -3368,7 +3410,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_type_of_symbol_exported(symbol);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:934 handleGetTypesOfSymbols
@@ -3391,7 +3435,9 @@ impl Session {
                 .checker
                 .borrow_mut()
                 .get_type_of_symbol_exported(symbol);
-            results[i] = setup.new_type_response(t);
+            results[i] = setup
+                .sd
+                .new_type_response(&setup.project_id, &setup.checker, t);
         }
 
         Ok(results)
@@ -3413,7 +3459,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_declared_type_of_symbol_exported(symbol);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go handleGetNonMissingTypeOfSymbol (ts#63956)
@@ -3432,7 +3480,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_non_missing_type_of_symbol_exported(symbol);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:984 handleResolveName
@@ -3554,7 +3604,9 @@ impl Session {
             .resolve_node_handle(&setup.program, &params.location)?;
 
         let t = setup.checker.borrow_mut().get_type_at_location(node);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:1081 handleGetTypeAtLocations
@@ -3573,7 +3625,9 @@ impl Session {
             // resolveNodeHandle errors on an unresolvable handle and GetTypeAtLocation
             // never returns nil, so every element resolves to a type (error type at worst).
             let t = setup.checker.borrow_mut().get_type_at_location(node);
-            results[i] = setup.new_type_response(t);
+            results[i] = setup
+                .sd
+                .new_type_response(&setup.project_id, &setup.checker, t);
         }
 
         Ok(results)
@@ -3617,7 +3671,9 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:1134 handleGetTypesAtPositions
@@ -3657,7 +3713,9 @@ impl Session {
             }
             let t = setup.checker.borrow_mut().get_type_at_location(node);
             if t.is_some() {
-                results[i] = setup.new_type_response(t);
+                results[i] = setup
+                    .sd
+                    .new_type_response(&setup.project_id, &setup.checker, t);
             }
         }
 
@@ -3724,19 +3782,19 @@ impl Session {
     // Go: api/session.go:1186 handleGetTargetOfType
     pub fn handle_get_target_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| c.ty(t).target())
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| c.ty(t).target())
     }
 
     // Go: api/session.go:1190 handleGetFreshTypeOfType
     pub fn handle_get_fresh_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_literal_type().fresh_type()
         })
     }
@@ -3744,10 +3802,10 @@ impl Session {
     // Go: api/session.go:1194 handleGetRegularTypeOfType
     pub fn handle_get_regular_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_literal_type().regular_type()
         })
     }
@@ -3755,10 +3813,10 @@ impl Session {
     // Go: api/session.go:1198 handleGetTypesOfType
     pub fn handle_get_types_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_array_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).types().to_vec()
         })
     }
@@ -3766,10 +3824,10 @@ impl Session {
     // Go: api/session.go:1202 handleGetTypeParametersOfType
     pub fn handle_get_type_parameters_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_array_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_interface_type().type_parameters().to_vec()
         })
     }
@@ -3777,10 +3835,10 @@ impl Session {
     // Go: api/session.go:1206 handleGetOuterTypeParametersOfType
     pub fn handle_get_outer_type_parameters_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_array_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_interface_type().outer_type_parameters().to_vec()
         })
     }
@@ -3788,10 +3846,10 @@ impl Session {
     // Go: api/session.go:1210 handleGetLocalTypeParametersOfType
     pub fn handle_get_local_type_parameters_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_array_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_interface_type().local_type_parameters().to_vec()
         })
     }
@@ -3800,10 +3858,10 @@ impl Session {
     // PORT: Go `t.AsInterfaceType().ThisType()` returns this field.
     pub fn handle_get_this_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_interface_type().this_type
         })
     }
@@ -3811,10 +3869,10 @@ impl Session {
     // Go: api/session.go:1214 handleGetAliasTypeArgumentsOfType
     pub fn handle_get_alias_type_arguments_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_array_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             let Some(alias) = c.ty(t).alias() else {
                 return Vec::new();
             };
@@ -3839,10 +3897,10 @@ impl Session {
     // Go: api/session.go:1232 handleGetObjectTypeOfType
     pub fn handle_get_object_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_indexed_access_type().object_type()
         })
     }
@@ -3850,10 +3908,10 @@ impl Session {
     // Go: api/session.go:1236 handleGetIndexTypeOfType
     pub fn handle_get_index_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_indexed_access_type().index_type()
         })
     }
@@ -3861,10 +3919,10 @@ impl Session {
     // Go: api/session.go:1240 handleGetCheckTypeOfType
     pub fn handle_get_check_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_conditional_type().check_type()
         })
     }
@@ -3872,10 +3930,10 @@ impl Session {
     // Go: api/session.go:1244 handleGetExtendsTypeOfType
     pub fn handle_get_extends_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_conditional_type().extends_type()
         })
     }
@@ -3883,10 +3941,10 @@ impl Session {
     // Go: api/session.go:1248 handleGetBaseTypeOfType
     pub fn handle_get_base_type_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_substitution_type().base_type()
         })
     }
@@ -3896,23 +3954,70 @@ impl Session {
     // Type parameter constraints are handled by handleGetConstraintOfTypeParameter.
     pub fn handle_get_constraint_of_type(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetTypePropertyParams,
     ) -> Result<Option<TypeResponse>, GoError> {
-        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_substitution_type().subst_constraint()
+        })
+    }
+
+    // Go: api/session.go handleGetTypeParameterOfMappedType (ts#64397)
+    // PORT: Go `t.AsMappedType().TypeParameter()` returns this field.
+    pub fn handle_get_type_parameter_of_mapped_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
+            c.ty(t).as_mapped_type().type_parameter
+        })
+    }
+
+    // Go: api/session.go handleGetConstraintTypeOfMappedType (ts#64397)
+    pub fn handle_get_constraint_type_of_mapped_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
+            c.ty(t).as_mapped_type().constraint_type
+        })
+    }
+
+    // Go: api/session.go handleGetNameTypeOfMappedType (ts#64397)
+    pub fn handle_get_name_type_of_mapped_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
+            c.ty(t).as_mapped_type().name_type
+        })
+    }
+
+    // Go: api/session.go handleGetTemplateTypeOfMappedType (ts#64397)
+    pub fn handle_get_template_type_of_mapped_type(
+        &self,
+        ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| {
+            c.ty(t).as_mapped_type().template_type
         })
     }
 
     // Go: api/session.go:1256 handleGetTypeParametersOfSignature
     pub fn handle_get_type_parameters_of_signature(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         params: &GetSignaturePropertyParams,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        self.resolve_type_array_property_of_signature(params, &|c: &Checker, sig: SignatureId| {
-            c.sig(sig).type_parameters().to_vec()
-        })
+        self.resolve_type_array_property_of_signature(
+            ctx,
+            params,
+            &|c: &Checker, sig: SignatureId| c.sig(sig).type_parameters().to_vec(),
+        )
     }
 
     // Go: api/session.go:1260 handleGetParametersOfSignature

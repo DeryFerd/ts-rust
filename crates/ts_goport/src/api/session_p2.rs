@@ -30,46 +30,58 @@ impl Session {
     // Go: api/session.go:1273 resolveTypePropertyOfType
     // resolveTypePropertyOfType resolves a type property of type `Type` and returns a type response.
     // PORT: the getter reads the type in the arena of its checker.
+    // ts#64397: takes the context and uses the setup checker.
     pub fn resolve_type_property_of_type(
         &self,
+        ctx: &Context,
         params: &GetTypePropertyParams,
         getter: &dyn Fn(&Checker, TypeId) -> TypeId,
     ) -> Result<Option<TypeResponse>, GoError> {
-        let sd = self.get_snapshot_data(params.snapshot)?;
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (checker, t) = sd.resolve_type_handle(&params.project, params.type_)?;
-        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
-        let _program = ls_program::enter_version(checker.borrow().program);
+        let (owner, t) = setup
+            .sd
+            .resolve_type_handle(&params.project, params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
 
-        let result = getter(&checker.borrow(), t);
+        let result = getter(&setup.checker.borrow(), t);
         if result.is_nil() {
             return Ok(None);
         }
 
-        Ok(sd.new_type_response(&params.project, &checker, result))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, result))
     }
 
     // Go: api/session.go:1293 resolveTypeArrayPropertyOfType
     // resolveTypeArrayPropertyOfType resolves a type property of an array of types and returns an array of type responses.
+    // ts#64397: takes the context and uses the setup checker.
     pub fn resolve_type_array_property_of_type(
         &self,
+        ctx: &Context,
         params: &GetTypePropertyParams,
         getter: &dyn Fn(&Checker, TypeId) -> Vec<TypeId>,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        let sd = self.get_snapshot_data(params.snapshot)?;
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (checker, t) = sd.resolve_type_handle(&params.project, params.type_)?;
-        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
-        let _program = ls_program::enter_version(checker.borrow().program);
+        let (owner, t) = setup
+            .sd
+            .resolve_type_handle(&params.project, params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
 
-        let types = getter(&checker.borrow(), t);
+        let types = getter(&setup.checker.borrow(), t);
         if types.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut results = Vec::with_capacity(types.len());
         for sub in types {
-            results.push(sd.new_type_response(&params.project, &checker, sub));
+            results.push(
+                setup
+                    .sd
+                    .new_type_response(&setup.project_id, &setup.checker, sub),
+            );
         }
         Ok(results)
     }
@@ -215,25 +227,32 @@ impl Session {
     }
 
     // Go: api/session.go:1421 resolveTypeArrayPropertyOfSignature
+    // ts#64397: takes the context and uses the setup checker.
     pub fn resolve_type_array_property_of_signature(
         &self,
+        ctx: &Context,
         params: &GetSignaturePropertyParams,
         getter: &dyn Fn(&Checker, SignatureId) -> Vec<TypeId>,
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
-        let sd = self.get_snapshot_data(params.snapshot)?;
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let (checker, sig) = sd.resolve_signature_handle(&params.project, params.signature)?;
-        // Node handles in the answer read lazy JSDoc (session_p1.rs header).
-        let _program = ls_program::enter_version(checker.borrow().program);
+        let (owner, sig) = setup
+            .sd
+            .resolve_signature_handle(&params.project, params.signature)?;
+        let sig = checker_signature(&setup.checker, &owner, sig);
 
-        let types = getter(&checker.borrow(), sig);
+        let types = getter(&setup.checker.borrow(), sig);
         if types.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut results = Vec::with_capacity(types.len());
         for sub in types {
-            results.push(sd.new_type_response(&params.project, &checker, sub));
+            results.push(
+                setup
+                    .sd
+                    .new_type_response(&setup.project_id, &setup.checker, sub),
+            );
         }
         Ok(results)
     }
@@ -281,7 +300,9 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go handleGetContextualTypeForArgument (ts#64264)
@@ -299,7 +320,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_contextual_type_for_argument_at_index_exported(node, params.index);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go handleGetAwaitedType (ts#64264)
@@ -313,7 +336,9 @@ impl Session {
         let (owner, t) = setup.resolve_type_handle(params.type_)?;
         let t = checker_type(&setup.checker, &owner, t);
         let awaited = setup.checker.borrow_mut().get_awaited_type_exported(t);
-        Ok(setup.new_type_response(awaited))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, awaited))
     }
 
     // Go: api/session.go:1487 handleGetBaseTypeOfLiteralType
@@ -332,7 +357,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_base_type_of_literal_type_exported(t);
-        Ok(setup.new_type_response(result))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, result))
     }
 
     // Go: api/session.go:1508 handleGetNonNullableType
@@ -348,7 +375,9 @@ impl Session {
         let t = checker_type(&setup.checker, &owner, t);
 
         let result = setup.checker.borrow_mut().get_non_nullable_type(t);
-        Ok(setup.new_type_response(result))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, result))
     }
 
     // Go: api/session.go:1529 handleGetTypeFromTypeNode
@@ -368,7 +397,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_type_from_type_node_exported(node);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:1553 handleGetWidenedType
@@ -384,7 +415,9 @@ impl Session {
         let t = checker_type(&setup.checker, &owner, t);
 
         let result = setup.checker.borrow_mut().get_widened_type_exported(t);
-        Ok(setup.new_type_response(result))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, result))
     }
 
     // Go: api/session.go:1574 handleGetParameterType
@@ -410,7 +443,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_type_at_position_exported(sig, params.index);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:2398 handleGetTypeParameterAtPosition
@@ -433,7 +468,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_type_parameter_at_position(sig, params.index);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:1599 handleIsArrayLikeType
@@ -520,7 +557,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_type_of_symbol_at_location(symbol, node);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:1691 handleTypeToTypeNode
@@ -1071,7 +1110,9 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:1831 handleIsContextSensitive
@@ -1113,7 +1154,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_return_type_of_signature_exported(sig);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:1871 handleGetRestTypeOfSignature
@@ -1132,7 +1175,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_rest_type_of_signature_exported(sig);
-        Ok(setup.new_type_response(t))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
     // Go: api/session.go:1892 handleGetTypePredicateOfSignature
@@ -1172,7 +1217,9 @@ impl Session {
             ..Default::default()
         };
         if pred_type.is_some() {
-            resp.type_ = setup.new_type_response(pred_type);
+            resp.type_ = setup
+                .sd
+                .new_type_response(&setup.project_id, &setup.checker, pred_type);
         }
 
         Ok(Some(resp))
@@ -1286,7 +1333,11 @@ impl Session {
 
         let mut results = Vec::with_capacity(base_types.len());
         for bt in base_types {
-            results.push(setup.new_type_response(bt));
+            results.push(
+                setup
+                    .sd
+                    .new_type_response(&setup.project_id, &setup.checker, bt),
+            );
         }
 
         Ok(results)
@@ -1354,7 +1405,9 @@ impl Session {
         let t = checker_type(&setup.checker, &owner, t);
 
         let apparent = setup.checker.borrow_mut().get_apparent_type_exported(t);
-        Ok(setup.new_type_response(apparent))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, apparent))
     }
 
     // Go: api/session.go:3068 handleGetReducedType (ts#63899)
@@ -1370,7 +1423,9 @@ impl Session {
         let t = checker_type(&setup.checker, &owner, t);
 
         let reduced = setup.checker.borrow_mut().get_reduced_type_exported(t);
-        Ok(setup.new_type_response(reduced))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, reduced))
     }
 
     // Go: api/session.go:1974 handleGetIndexInfosOfType
@@ -1426,7 +1481,9 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.new_type_response(constraint))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, constraint))
     }
 
     // Go: api/session.go:3123 handleGetDefaultFromTypeParameter
@@ -1445,7 +1502,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_default_from_type_parameter_exported(t);
-        Ok(setup.new_type_response(result))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, result))
     }
 
     // Go: api/session.go:2281 handleGetBaseConstraintOfType
@@ -1468,7 +1527,9 @@ impl Session {
             return Ok(None);
         }
 
-        Ok(setup.new_type_response(constraint))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, constraint))
     }
 
     // Go: api/session.go:2302 handleGetPropertyOfType
@@ -1509,7 +1570,9 @@ impl Session {
             .checker
             .borrow_mut()
             .get_type_of_property_of_type_exported(t, &params.name);
-        Ok(setup.new_type_response(prop_type))
+        Ok(setup
+            .sd
+            .new_type_response(&setup.project_id, &setup.checker, prop_type))
     }
 
     // Go: api/session.go:2323 handleGetConstantValue
@@ -1730,7 +1793,11 @@ impl Session {
 
         let mut results = Vec::with_capacity(type_args.len());
         for ta in type_args {
-            results.push(setup.new_type_response(ta));
+            results.push(
+                setup
+                    .sd
+                    .new_type_response(&setup.project_id, &setup.checker, ta),
+            );
         }
 
         Ok(results)

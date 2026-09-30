@@ -373,6 +373,15 @@ impl Method {
     pub const GET_EXTENDS_TYPE_OF_TYPE: Method = Method(Cow::Borrowed("getExtendsTypeOfType"));
     pub const GET_BASE_TYPE_OF_TYPE: Method = Method(Cow::Borrowed("getBaseTypeOfType"));
     pub const GET_CONSTRAINT_OF_TYPE: Method = Method(Cow::Borrowed("getConstraintOfType"));
+    // ts#64397
+    pub const GET_TYPE_PARAMETER_OF_MAPPED_TYPE: Method =
+        Method(Cow::Borrowed("getTypeParameterOfMappedType"));
+    pub const GET_CONSTRAINT_TYPE_OF_MAPPED_TYPE: Method =
+        Method(Cow::Borrowed("getConstraintTypeOfMappedType"));
+    pub const GET_NAME_TYPE_OF_MAPPED_TYPE: Method =
+        Method(Cow::Borrowed("getNameTypeOfMappedType"));
+    pub const GET_TEMPLATE_TYPE_OF_MAPPED_TYPE: Method =
+        Method(Cow::Borrowed("getTemplateTypeOfMappedType"));
 
     // Signature sub-property methods
     pub const GET_TYPE_PARAMETERS_OF_SIGNATURE: Method =
@@ -1383,6 +1392,23 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(
         Method::GET_CONSTRAINT_OF_TYPE,
+        unmarshaller_for::<GetTypePropertyParams>,
+    );
+    // ts#64397
+    m.insert(
+        Method::GET_TYPE_PARAMETER_OF_MAPPED_TYPE,
+        unmarshaller_for::<GetTypePropertyParams>,
+    );
+    m.insert(
+        Method::GET_CONSTRAINT_TYPE_OF_MAPPED_TYPE,
+        unmarshaller_for::<GetTypePropertyParams>,
+    );
+    m.insert(
+        Method::GET_NAME_TYPE_OF_MAPPED_TYPE,
+        unmarshaller_for::<GetTypePropertyParams>,
+    );
+    m.insert(
+        Method::GET_TEMPLATE_TYPE_OF_MAPPED_TYPE,
         unmarshaller_for::<GetTypePropertyParams>,
     );
     m.insert(
@@ -2450,6 +2476,12 @@ pub struct TypeResponse {
     pub base_type: TypeID,
     pub subst_constraint: TypeID,
 
+    // MappedType data (ts#64397)
+    pub type_parameter: TypeID,
+    pub constraint_type: TypeID,
+    pub name_type: TypeID,
+    pub template_type: TypeID,
+
     // TemplateLiteralType text segments
     pub texts: Vec<String>,
 
@@ -2514,6 +2546,10 @@ impl MarshalerTo for TypeResponse {
         marshal_field_omitzero(enc, &mut first, "extendsType", &self.extends_type)?;
         marshal_field_omitzero(enc, &mut first, "baseType", &self.base_type)?;
         marshal_field_omitzero(enc, &mut first, "substConstraint", &self.subst_constraint)?;
+        marshal_field_omitzero(enc, &mut first, "typeParameter", &self.type_parameter)?;
+        marshal_field_omitzero(enc, &mut first, "constraintType", &self.constraint_type)?;
+        marshal_field_omitzero(enc, &mut first, "nameType", &self.name_type)?;
+        marshal_field_omitzero(enc, &mut first, "templateType", &self.template_type)?;
         marshal_field_omitempty(enc, &mut first, "texts", &self.texts)?;
         marshal_field_omitzero(enc, &mut first, "freshType", &self.fresh_type)?;
         marshal_field_omitzero(enc, &mut first, "regularType", &self.regular_type)?;
