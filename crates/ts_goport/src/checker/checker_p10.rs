@@ -1259,7 +1259,7 @@ impl Checker {
             }
             SyntaxKind::MethodDeclaration | SyntaxKind::GetAccessor | SyntaxKind::SetAccessor => {
                 // For decorators with only two parameters we supply only two arguments
-                if self.sig(signature).parameters.len() <= 2 {
+                if self.get_parameter_count(signature) <= 2 {
                     return 2;
                 }
                 3
