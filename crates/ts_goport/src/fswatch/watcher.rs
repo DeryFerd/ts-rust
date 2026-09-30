@@ -23,6 +23,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use crate::frontend::vfs::osvfs::{filepath_clean, go_string_from_os, os_path};
+use crate::fswatch::pathcompare::{ComparisonCache, ComparisonPath, PathComparer};
 use crate::fswatch::syscall;
 use crate::fswatch::walkdir::path_error;
 use crate::gostd::{errors, strconv};
@@ -160,11 +161,27 @@ pub struct WatchDirectoryRequest<'a> {
     pub options: &'a [Box<dyn WatchOption>],
 }
 
-// Go: watcher.go:89 watchOptions
+// Go: watcher.go:119 watchOptions
 #[derive(Clone, Default)]
 pub struct WatchOptions {
     pub ignore: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     pub recursive: bool,
+    // ts#64210
+    pub file: String,
+}
+
+// Go: watcher.go:127 fileOption (ts#64210)
+/// fileOption defers the file filter until the parent directory's comparer is
+/// available, so WatchFile does not need a second filesystem query.
+pub struct FileOption {
+    pub path: String,
+}
+
+impl WatchOption for FileOption {
+    // Go: watcher.go:131 fileOption.applyWatchOption
+    fn apply_watch_option(&self, opts: &mut WatchOptions) {
+        opts.file = self.path.clone();
+    }
 }
 
 // Go: watcher.go:94 ignoreOption
@@ -583,17 +600,19 @@ impl WatcherStruct {
         dir.to_string()
     }
 
-    // Go: watcher.go:299 watcher.findCoveringRecursiveWatchLocked
+    // Go: watcher.go:385 watcher.findCoveringRecursiveWatchLocked (ts#64210: takes the comparer)
     // PORT: takes the data that `w.mu` guards.
     pub fn find_covering_recursive_watch_locked(
         &self,
         w: &WatcherStructLocked,
         dir: &str,
         physical_dir: &str,
+        comparer: PathComparer,
     ) -> Option<Arc<DirWatch>> {
         let mut best: Option<&Arc<DirWatch>> = None;
         for dw in w.dir_watches.iter().flat_map(|m| m.values()) {
             if !dw.recursive
+                || dw.comparer != comparer
                 || !is_in_directory_or_self(&dw.dir, dir)
                 || !is_in_directory_or_self(&dw.physical_dir, physical_dir)
             {
@@ -648,13 +667,14 @@ impl WatcherStruct {
         String::new()
     }
 
-    // Go: watcher.go:344 watcher.getOrCreateDirWatch
+    // Go: watcher.go:430 watcher.getOrCreateDirWatch (ts#64210: takes the comparer, returns an error)
     pub fn get_or_create_dir_watch(
         &self,
         dir: &str,
         physical_dir: &str,
         recursive: bool,
-    ) -> Arc<DirWatch> {
+        comparer: PathComparer,
+    ) -> Result<Arc<DirWatch>, GoError> {
         let mut w = self.mu.lock().unwrap();
         if w.dir_watches.is_none() {
             w.dir_watches = Some(FxHashMap::default());
@@ -667,32 +687,45 @@ impl WatcherStruct {
         let mut physical_dir = physical_dir.to_string();
         let mut recursive = recursive;
         if self.can_share_recursive_dir_watches() {
-            if let Some(dw) = self.find_covering_recursive_watch_locked(&w, &dir, &physical_dir) {
-                return dw;
+            if let Some(dw) =
+                self.find_covering_recursive_watch_locked(&w, &dir, &physical_dir, comparer)
+            {
+                return Ok(dw);
             }
             let consolidation_dir = self.find_consolidation_dir_locked(&w, &dir, &physical_dir);
             if !consolidation_dir.is_empty() {
-                dir = consolidation_dir;
-                physical_dir = physical_dir_for(&dir);
-                recursive = true;
-                if let Some(dw) = self.find_covering_recursive_watch_locked(&w, &dir, &physical_dir)
-                {
-                    return dw;
+                let parent_comparer = self.path_comparer(&consolidation_dir)?;
+                if parent_comparer == comparer {
+                    dir = consolidation_dir;
+                    physical_dir = physical_dir_for(&dir);
+                    recursive = true;
+                    if let Some(dw) =
+                        self.find_covering_recursive_watch_locked(&w, &dir, &physical_dir, comparer)
+                    {
+                        return Ok(dw);
+                    }
                 }
             }
         }
 
         let key = self.key_for_dir_watch(&dir, recursive);
         if let Some(dw) = w.dir_watches.as_ref().unwrap().get(&key) {
-            return dw.clone();
+            return Ok(dw.clone());
         }
-        // PORT: Go sets `dw.recursive = recursive` right after newDirWatch,
-        // before the dirWatch is shared; the port passes it in. Go also sets
+        // PORT: Go sets `dw.recursive = recursive` and calls
+        // `dw.setComparer(comparer)` right after newDirWatch, before the
+        // dirWatch is shared; the port passes both in. Go also sets
         // `dw.sequence = w.sequence`, which is always nil here (see
         // `WatcherStruct`).
-        let dw = new_dir_watch(&dir, &physical_dir, w.debounce.clone().unwrap(), recursive);
+        let dw = new_dir_watch(
+            &dir,
+            &physical_dir,
+            w.debounce.clone().unwrap(),
+            recursive,
+            comparer,
+        );
         w.dir_watches.as_mut().unwrap().insert(key, dw.clone());
-        dw
+        Ok(dw)
     }
 
     // Go: watcher.go:379 watcher.removeDirWatch
@@ -751,7 +784,7 @@ impl Watcher for WatcherStruct {
             .expect("WatchDirectories returns one watch per request"))
     }
 
-    // Go: watcher.go:401 watcher.WatchDirectories
+    // Go: watcher.go:494 watcher.WatchDirectories (ts#64210: the path comparer)
     fn watch_directories(
         &self,
         requests: &[WatchDirectoryRequest<'_>],
@@ -804,13 +837,33 @@ impl Watcher for WatcherStruct {
                 o.apply_watch_option(&mut sopts);
             }
 
-            let dw = self.get_or_create_dir_watch(&dir, &physical_dir, sopts.recursive);
-            let (id, _) = dw.watch(
+            // ts#64210
+            let comparer = match self.path_comparer(&dir) {
+                Ok(comparer) => comparer,
+                Err(err) => {
+                    rollback(&prepared);
+                    return Err(err);
+                }
+            };
+            let dw = match self.get_or_create_dir_watch(
+                &dir,
+                &physical_dir,
+                sopts.recursive,
+                comparer,
+            ) {
+                Ok(dw) => dw,
+                Err(err) => {
+                    rollback(&prepared);
+                    return Err(err);
+                }
+            };
+            let (id, _) = dw.add_callback(
                 &dir,
                 &physical_dir,
                 sopts.recursive,
                 fn_,
                 sopts.ignore.clone(),
+                &sopts.file,
             );
             prepared.push(PreparedWatch {
                 dw: dw.clone(),
@@ -848,7 +901,7 @@ impl Watcher for WatcherStruct {
         Ok(watches)
     }
 
-    // Go: watcher.go:332 watcher.WatchFile
+    // Go: watcher.go:591 watcher.WatchFile (ts#64210: fileOption)
     fn watch_file(&self, path: &str, fn_: WatchCallback) -> Result<Box<dyn Watch>, GoError> {
         // PORT: Go `if fn == nil { return nil, errNilCallback }`; a Rust
         // callback is never nil.
@@ -865,7 +918,8 @@ impl Watcher for WatcherStruct {
             return Err(ERR_ROOT_PATH.clone());
         }
 
-        self.watch_directory(&dir, file_callback(path, fn_), &[])
+        // ts#64210: the parent directory watch filters for the file.
+        self.watch_directory(&dir, fn_, &[Box::new(FileOption { path })])
     }
 }
 
@@ -944,25 +998,6 @@ fn filepath_dir(path: &str) -> String {
         return vol.to_string();
     }
     format!("{vol}{dir}")
-}
-
-// Go: watcher.go:356 fileCallback
-/// fileCallback wraps a WatchCallback so it only sees events for the
-/// specific target path. Errors are always forwarded (with any matching
-/// events delivered alongside) so callers don't lose overflow signals
-/// just because their target wasn't in the same batch.
-pub fn file_callback(target: String, fn_: WatchCallback) -> WatchCallback {
-    Arc::new(move |events: Vec<Event>, err: Option<GoError>| {
-        let mut filtered: Vec<Event> = Vec::new();
-        for e in events {
-            if e.path == target {
-                filtered.push(e);
-            }
-        }
-        if !filtered.is_empty() || err.is_some() {
-            fn_(filtered, err);
-        }
-    })
 }
 
 // Go: watcher.go:370 watch
@@ -1256,7 +1291,7 @@ impl WatcherBase {
 
 // ----- dirWatch: per-directory watch state -------------------------
 
-// Go: watcher.go:698 callback
+// Go: watcher.go:782 callback
 #[derive(Clone)]
 pub struct Callback {
     pub id: u64,
@@ -1270,6 +1305,11 @@ pub struct Callback {
     pub since_seq: u64,
     pub terminal: Option<GoError>,
     pub delivered: bool,
+    // ts#64210
+    pub comparer: PathComparer,
+    pub dir_comparison: ComparisonPath<'static>,
+    pub physical_comparison: ComparisonPath<'static>,
+    pub file_comparison: ComparisonPath<'static>,
 }
 
 // Go: watcher.go:513 dirWatchError
@@ -1331,6 +1371,8 @@ impl PartialEq for DirWatchError {
 /// PORT: Go `mu` guards the fields in `DirWatchLocked`. `state` is only
 /// used by the fsevents (not ported) and Windows backends. Go
 /// `sequence` is always nil here (see `WatcherStruct`), so it is not a field.
+/// Go sets `comparer`, `dirFold` and `physicalDirFold` with `setComparer`
+/// before the dirWatch is shared; the port sets them in `new_dir_watch`.
 pub struct DirWatch {
     /// dir is the caller-visible watch root used in delivered event paths.
     pub dir: String,
@@ -1339,6 +1381,10 @@ pub struct DirWatch {
     pub physical_dir: String,
     pub recursive: bool,
     pub events: EventList,
+    // ts#64210
+    pub comparer: PathComparer,
+    pub dir_fold: String,
+    pub physical_dir_fold: String,
 
     /// state stores per-directory platform-specific bookkeeping (fsevents, windows).
     pub state: Mutex<Option<Box<dyn Any + Send>>>,
@@ -1354,20 +1400,32 @@ pub struct DirWatchLocked {
     pub next_cbid: u64,
 }
 
-// Go: watcher.go:743 newDirWatch
-// PORT: `recursive` is a parameter (see getOrCreateDirWatch). The debounce
-// key is the dirWatch pointer.
+// Go: watcher.go:834 newDirWatch
+// PORT: `recursive` and `comparer` are parameters (see getOrCreateDirWatch):
+// Go sets them on the new dirWatch before it is shared, the comparer with
+// `setComparer`. The debounce key is the dirWatch pointer.
 pub fn new_dir_watch(
     dir: &str,
     physical_dir: &str,
     db: Arc<Debounce>,
     recursive: bool,
+    comparer: PathComparer,
 ) -> Arc<DirWatch> {
+    // Go: watcher.go:841 dirWatch.setComparer (ts#64210)
+    let dir_fold = comparer.prepare(dir).folded;
+    let physical_dir_fold = if physical_dir == dir {
+        dir_fold.clone()
+    } else {
+        comparer.prepare(physical_dir).folded
+    };
     let dw = Arc::new(DirWatch {
         dir: dir.to_string(),
         physical_dir: physical_dir.to_string(),
         recursive,
         events: EventList::default(),
+        comparer,
+        dir_fold,
+        physical_dir_fold,
         state: Mutex::new(None),
         mu: Mutex::new(DirWatchLocked::default()),
     });
@@ -1548,15 +1606,32 @@ impl DirWatch {
             (events_by_callback, err, cbs)
         };
 
+        // ts#64210
+        let comparisons: Mutex<ComparisonCache> = Mutex::new(ComparisonCache::default());
         for (cb, cb_events) in cbs.iter().zip(events_by_callback) {
             let mut filtered: Vec<Event> = Vec::with_capacity(cb_events.len());
-            let filter = cb.ignore.is_some() || !cb.recursive || cb.dir != self.dir;
+            let filter = cb.ignore.is_some()
+                || !cb.recursive
+                || cb.dir != self.dir
+                || !cb.file_comparison.path.is_empty();
             for (e, included_watch_root) in cb_events {
                 if !filter {
                     filtered.push(e);
                     continue;
                 }
-                let e = cb.map_event(e);
+                let mut e = cb.map_event_cached(e, Some(&comparisons));
+                if !cb.file_comparison.path.is_empty() {
+                    let mut path = ComparisonPath {
+                        path: e.path.clone(),
+                        cache: Some(&comparisons),
+                        ..Default::default()
+                    };
+                    let (suffix, ok) = cb.comparer.suffix_prepared(&cb.file_comparison, &mut path);
+                    if !ok || !suffix.is_empty() {
+                        continue;
+                    }
+                    e.path = cb.file_comparison.path.clone();
+                }
                 if let Some(ignore) = &cb.ignore {
                     if ignore(&e.path) {
                         continue;
@@ -1590,19 +1665,31 @@ impl DirWatch {
         }
     }
 
-    // Go: watcher.go:946 dirWatch.terminateCallbacksForDeletedRoot
+    // Go: watcher.go:1063 dirWatch.terminateCallbacksForDeletedRoot
     pub fn terminate_callbacks_for_deleted_root(&self, path: &str, seq: u64, err: GoError) -> bool {
         let mut dw = self.mu.lock().unwrap();
         let mut changed = false;
+        // ts#64210
+        let comparisons: Mutex<ComparisonCache> = Mutex::new(ComparisonCache::default());
+        let deleted = ComparisonPath {
+            path: path.to_string(),
+            cache: Some(&comparisons),
+            ..Default::default()
+        };
         for cb in dw.callbacks.iter_mut() {
             if cb.delivered || cb.terminal.is_some() || cb.since_seq >= seq {
                 continue;
             }
-            let physical_path = cb.event_physical_path(path);
-            if is_in_directory_or_self(path, &cb.dir)
-                || (cb.physical_dir != cb.dir
-                    && is_in_directory_or_self(&physical_path, &cb.physical_dir))
-            {
+            let physical_path = ComparisonPath {
+                path: cb.event_physical_path(path),
+                cache: Some(&comparisons),
+                ..Default::default()
+            };
+            let (mut dir, mut physical) =
+                (cb.dir_comparison.clone(), cb.physical_comparison.clone());
+            let (_, logical_match) = cb.comparer.suffix_prepared(&deleted, &mut dir);
+            let (_, physical_match) = cb.comparer.suffix_prepared(&physical_path, &mut physical);
+            if logical_match || physical_match {
                 cb.terminal = Some(err.clone());
                 changed = true;
             }
@@ -1612,12 +1699,30 @@ impl DirWatch {
 }
 
 impl Callback {
-    // Go: watcher.go:929 callback.mapEvent
-    pub fn map_event(&self, mut e: Event) -> Event {
-        if !self.physical_dir.is_empty() && self.physical_dir != self.dir {
-            let physical_path = self.event_physical_path(&e.path);
-            if is_in_directory_or_self(&self.physical_dir, &physical_path) {
-                e.path = rebase_path(&physical_path, &self.physical_dir, &self.dir);
+    // Go: watcher.go:1038 callback.mapEvent
+    pub fn map_event(&self, e: Event) -> Event {
+        self.map_event_cached(e, None)
+    }
+
+    // Go: watcher.go:1042 callback.mapEventCached (ts#64210)
+    pub fn map_event_cached(&self, mut e: Event, cache: Option<&Mutex<ComparisonCache>>) -> Event {
+        if !self.physical_dir.is_empty()
+            && (self.physical_dir != self.dir || self.comparer.ignore_case)
+        {
+            let mut physical_path = ComparisonPath {
+                path: self.event_physical_path(&e.path),
+                cache,
+                ..Default::default()
+            };
+            let mut root = self.physical_comparison.clone();
+            if root.path.is_empty() {
+                root.path = self.physical_dir.clone();
+            }
+            let (path, ok) = self
+                .comparer
+                .rebase_prepared(&mut physical_path, &root, &self.dir);
+            if ok {
+                e.path = path;
             }
         }
         e
@@ -1676,9 +1781,7 @@ pub fn is_direct_child(dir: &str, path: &str) -> bool {
 }
 
 impl DirWatch {
-    // Go: watcher.go:1001 dirWatch.watch
-    // PORT: Go reads `dw.sequence()` when it is set; it is always nil here
-    // (see `WatcherStruct`).
+    // Go: watcher.go:1123 dirWatch.watch
     pub fn watch(
         &self,
         dir: &str,
@@ -1686,6 +1789,21 @@ impl DirWatch {
         recursive: bool,
         fn_: WatchCallback,
         ignore: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    ) -> (u64, bool) {
+        self.add_callback(dir, physical_dir, recursive, fn_, ignore, "")
+    }
+
+    // Go: watcher.go:1127 dirWatch.addCallback (ts#64210)
+    // PORT: Go reads `dw.sequence()` when it is set; it is always nil here
+    // (see `WatcherStruct`).
+    pub fn add_callback(
+        &self,
+        dir: &str,
+        physical_dir: &str,
+        recursive: bool,
+        fn_: WatchCallback,
+        ignore: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+        file: &str,
     ) -> (u64, bool) {
         let mut dw = self.mu.lock().unwrap();
         dw.next_cbid += 1;
@@ -1703,6 +1821,10 @@ impl DirWatch {
             since_seq,
             terminal: None,
             delivered: false,
+            comparer: self.comparer,
+            dir_comparison: self.comparer.prepare(dir),
+            physical_comparison: self.comparer.prepare(physical_dir),
+            file_comparison: self.comparer.prepare(file),
         });
         (id, true)
     }

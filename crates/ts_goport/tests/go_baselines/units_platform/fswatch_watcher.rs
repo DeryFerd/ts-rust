@@ -27,11 +27,12 @@ use ts_goport::fswatch::fanotify_linux::{
     fanotify_available, make_fanotify_handle_key, maybe_wrap_unsupported_filesystem,
     new_fanotify_backend,
 };
+use ts_goport::fswatch::pathcompare::PathComparer;
 use ts_goport::fswatch::{
     self, DirWatch, DirWatchError, ERR_FILESYSTEM_UNSUPPORTED, ERR_UNAVAILABLE,
     ERR_WATCH_TERMINATED, Event, EventKind, EventList, MAX_WAIT_TIME, Watch, WatchCallback,
-    WatchOption, Watcher, WatcherBase, WatcherImpl, WatcherStruct, file_callback, new_debounce,
-    new_dir_watch, new_watcher, with_recursive,
+    WatchOption, Watcher, WatcherBase, WatcherImpl, WatcherStruct, new_debounce, new_dir_watch,
+    new_watcher, with_recursive,
 };
 use ts_goport::gostd::{GoError, errors};
 
@@ -268,7 +269,7 @@ fn join(dir: &str, name: &str) -> String {
 
 // Go: watcher_test.go:137 newDirectWatcher
 fn new_direct_watcher(t: &T, dir: &str) -> Arc<DirWatch> {
-    let w = new_dir_watch(dir, dir, new_debounce(), true);
+    let w = new_dir_watch(dir, dir, new_debounce(), true, PathComparer::default());
     let w2 = w.clone();
     t.cleanup(move || w2.destroy_debounce());
     w
@@ -1554,7 +1555,13 @@ fn test_backend_run_returns_start_error() {
 // fresh dirWatch.
 #[test]
 fn test_dir_watch_error_implements_error() {
-    let dw = new_dir_watch("/unused", "/unused", new_debounce(), false);
+    let dw = new_dir_watch(
+        "/unused",
+        "/unused",
+        new_debounce(),
+        false,
+        PathComparer::default(),
+    );
     let err = DirWatchError {
         err: errors::new("boom"),
         dir_watch: dw.clone(),
@@ -1564,7 +1571,10 @@ fn test_dir_watch_error_implements_error() {
     dw.destroy_debounce();
 }
 
-// Go: watcher_test.go:1596 TestFileCallbackForwardsErrAlongsideEvents
+// Go: watcher_test.go:2223 TestFileCallbackForwardsErrAlongsideEvents
+// ts#64210: the file filter is a dirWatch callback option (Go `addCallback`
+// with a file), not the removed `fileCallback` wrapper. `cb` feeds the
+// events through the dirWatch event list.
 #[test]
 fn test_file_callback_forwards_err_alongside_events() {
     let target = "/abs/dir/target.txt";
@@ -1574,10 +1584,29 @@ fn test_file_callback_forwards_err_alongside_events() {
     type Call = (Vec<Event>, Option<GoError>);
     let got: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
     let g = got.clone();
-    let cb = file_callback(
-        target.to_string(),
+    let t = T::new(1);
+    let dw = new_direct_watcher(&t, "/abs/dir");
+    dw.add_callback(
+        "/abs/dir",
+        "/abs/dir",
+        false,
         Arc::new(move |events, err| g.lock().unwrap().push((events, err))),
+        None,
+        target,
     );
+    let cb = |events: Vec<Event>, err: Option<GoError>| {
+        for e in &events {
+            if e.kind == DELETE {
+                dw.events.remove(&e.path);
+            } else {
+                dw.events.update(&e.path);
+            }
+        }
+        if let Some(err) = err {
+            dw.events.set_error(err);
+        }
+        dw.trigger_callbacks();
+    };
     let ev = |kind, path: &str| Event {
         kind,
         path: path.to_string(),
@@ -1629,6 +1658,7 @@ fn test_file_callback_forwards_err_alongside_events() {
     got.lock().unwrap().clear();
     cb(Vec::new(), None);
     assert!(got.lock().unwrap().is_empty(), "no-op delivery");
+    t.finish();
 }
 
 // Go: watcher_test.go:1650 TestRenameDirOutOfTreeNoStaleEvents
