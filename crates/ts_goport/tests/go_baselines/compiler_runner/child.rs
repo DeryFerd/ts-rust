@@ -222,7 +222,7 @@ pub fn child_entry() {
                 report(
                     "test",
                     Outcome::Fail(format!(
-                        "Panic on compiling test {}:\n{}",
+                        "Panic on compiler test {}:\n{}",
                         case.filename,
                         payload_text(payload.as_ref())
                     )),

@@ -3,9 +3,11 @@
 use super::component::ComponentHandler;
 use super::diagnostic_code_collision::DiagnosticCodeCollisionHandler;
 use super::duplicate::DuplicateHandler;
+use super::duplicate_projection::DuplicateProjectionHandler;
 use super::dynamic_verbatim::{DynamicVerbatimHandler, ProjectLifecycle};
 use super::editing::{PrefixedSupplementalHandler, UnmappedFoldingHandler};
 use super::failing::FailingHandler;
+use super::hoisting::HoistingHandler;
 use super::lisp::LispHandler;
 use super::prelude::*;
 use super::supplemental::SupplementalHandler;
@@ -33,8 +35,10 @@ pub const SUPPLEMENTAL_GLOBALS_MAPPER: &str = "supplemental-globals-mapper";
 pub const SUPPLEMENTAL_MODULE_MAPPER: &str = "supplemental-module-mapper";
 pub const PREFIXED_SUPPLEMENTAL_MAPPER: &str = "prefixed-supplemental-mapper";
 pub const UNMAPPED_FOLDING_MAPPER: &str = "unmapped-folding-mapper";
+pub const HOISTING_MAPPER: &str = "hoisting-mapper";
+pub const DUPLICATE_PROJECTION_MAPPER: &str = "duplicate-projection-mapper";
 
-// Go: registry.go:29 handlerConstructor, registry.go:31 mapperHandlers
+// Go: registry.go:31 handlerConstructor, registry.go:33 mapperHandlers
 // PORT: the Go map of constructors is a match on the command name. `None`
 // is a name that the map does not have.
 fn new_mapper_handler(
@@ -61,12 +65,14 @@ fn new_mapper_handler(
         SUPPLEMENTAL_MODULE_MAPPER => Box::new(SupplementalModuleHandler),
         PREFIXED_SUPPLEMENTAL_MAPPER => Box::new(PrefixedSupplementalHandler),
         UNMAPPED_FOLDING_MAPPER => Box::new(UnmappedFoldingHandler),
+        HOISTING_MAPPER => Box::new(HoistingHandler),
+        DUPLICATE_PROJECTION_MAPPER => Box::new(DuplicateProjectionHandler),
         _ => return None,
     };
     Some(handler)
 }
 
-// Go: registry.go:50 handlerForMapper
+// Go: registry.go:54 handlerForMapper
 pub(super) fn handler_for_mapper(
     command: &[String],
     lifecycle: Option<&Arc<ProjectLifecycle>>,
