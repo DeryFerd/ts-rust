@@ -2,7 +2,7 @@
 
 use super::Subtests;
 use ts_goport::api::{
-    DiagnosticPositionResponse, DiagnosticSourceLineResponse, DocumentIdentifier,
+    DiagnosticPositionResponse, DiagnosticSourceLineResponse, DocumentIdentifier, EnsurePrograms,
     new_diagnostic_response,
 };
 use ts_goport::ast::{TextRange, new_diagnostic, source_file_get_position_map};
@@ -10,8 +10,10 @@ use ts_goport::diag;
 use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::json::json_unmarshal;
 use ts_goport::frontend::parser::{SourceFileParseOptions, parse_source_file};
+use ts_goport::frontend::tspath;
+use ts_goport::project;
 
-// Go: api/proto_test.go:16 TestDocumentIdentifierUnmarshalJSON
+// Go: api/proto_test.go:18 TestDocumentIdentifierUnmarshalJSON
 #[test]
 fn test_document_identifier_unmarshal_json() {
     struct Test {
@@ -93,7 +95,40 @@ fn test_document_identifier_unmarshal_json() {
     t.finish();
 }
 
-// Go: api/proto_test.go:67 TestNewDiagnosticResponseIncludesFormattingContext (ts#63935; was
+// Go: api/proto_test.go:69 TestEnsureProgramsUnmarshalJSON (ts#64204, ts#64319)
+#[test]
+fn test_ensure_programs_unmarshal_json() {
+    let mut all = EnsurePrograms::default();
+    json_unmarshal(b"true", &mut all, &[]).unwrap_or_else(|err| panic!("unmarshal: {err}"));
+    assert!(all.all);
+
+    let mut projects = EnsurePrograms::default();
+    json_unmarshal(
+        br#"["/tsconfig.json","/dev/null/synthetic/1"]"#,
+        &mut projects,
+        &[],
+    )
+    .unwrap_or_else(|err| panic!("unmarshal: {err}"));
+    assert_eq!(
+        projects.projects,
+        vec![
+            project::ConfiguredProjectID(tspath::Path("/tsconfig.json".to_string())).as_id(),
+            project::new_synthetic_project_id(1).as_id(),
+        ]
+    );
+
+    let mut invalid = EnsurePrograms::default();
+    match json_unmarshal(b"false", &mut invalid, &[]) {
+        Ok(()) => panic!("expected an error containing \"must be true or an array\", got nil"),
+        Err(err) => assert!(
+            err.message.contains("must be true or an array"),
+            "expected error {:?} to contain \"must be true or an array\"",
+            err.message
+        ),
+    }
+}
+
+// Go: api/proto_test.go:87 TestNewDiagnosticResponseIncludesFormattingContext (ts#63935; was
 // TestNewDiagnosticResponseUsesUTF16Offsets)
 #[test]
 fn test_new_diagnostic_response_includes_formatting_context() {
@@ -153,7 +188,7 @@ fn test_new_diagnostic_response_includes_formatting_context() {
     );
 }
 
-// Go: api/proto_test.go:88 TestNewDiagnosticResponseTruncatesLongFormattingContext (ts#63935)
+// Go: api/proto_test.go:108 TestNewDiagnosticResponseTruncatesLongFormattingContext (ts#63935)
 #[test]
 fn test_new_diagnostic_response_truncates_long_formatting_context() {
     let text = "one\ntwo\nthree\nfour\nfive\nsix\nseven";

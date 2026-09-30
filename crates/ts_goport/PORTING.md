@@ -324,19 +324,25 @@ methods reach the AST through it.
   later node shell of a size it fits (`len` to `2 * len + 64` slots) takes
   it. In a language server the version that dies in the release of edit N
   gives its block to the version of edit N + 3. `bind` of the nil slot
-  holds the owner (file id + 1), written at the publish. With debug
-  assertions every `file_block` read checks it and panics with "file
-  version N is released", as a read of a dead version's store does. A
-  release build checks it only in `bind_store_records`, the one writer of
-  a published record; its hot header and kids reads are not checked (a
-  check is a load, a compare and a branch on reads of about 6
-  instructions). So a stale header or child read of a dead version
-  (parent, loc, flags, symbol, flow node, child ids, name) gives the
-  values of that node while its block waits, and the new owner's data
-  after a reuse, never undefined behavior. Its kind column is never
-  reused, so a stale kind read gives the old kind. Its store, `GoFile`, extras,
-  flow, node data and list reads still panic. Every holder of a node of a
-  version holds the version, so a correct reader never sees a reuse; the
+  holds the owner (the file id), written at the publish. A read that
+  finds another owner panics with "file version N is released", as a read
+  of a dead version's store does. With debug assertions every
+  `file_block` read checks it. A release build checks it
+  (`check_block_owner`) in the binder field reads (`frozen_owned_record`:
+  the symbol, the flags, the `bind` word with the flow node and the
+  extras index, `frozen_store_bind_and_file`, `frozen_store_any_symbol`)
+  and in `bind_store_records`, the one writer of a published record.
+  The check is one load of the nil slot record, a compare and a branch:
+  `goport -p` 0.0% to +0.2% instructions, the editor long sessions +0.06%
+  to +0.15% (ownercheck1, R147 reviewer option 2; the flags read is about
+  two thirds of it). The hot header and kids reads (kind, parent, loc, child ids,
+  name, modifier flags) are not checked in a release build (they are
+  about 6 instructions). So a stale read of those gives the values of
+  that node while its block waits, and the new owner's data after a
+  reuse, never undefined behavior. Its kind column is never reused, so a
+  stale kind read gives the old kind. Its store, `GoFile`, extras, flow,
+  node data and list reads panic. Every holder of a node of a version
+  holds the version, so a correct reader never sees a reuse; the
   debug-assertion runs (protected tests, the corpus, and the editor and
   oracle runs) find a missed holder. This is the owner check that the R141
   reviewer asked for before any step that reuses records: it replaces step
@@ -344,8 +350,9 @@ methods reach the AST through it.
   reads the old values inside the quarantine), and
   `edited_file_blocks_wait_two_releases_then_get_reused` and
   `pooled_node_blocks_wait_two_releases_and_check_their_owner` check the
-  panic after a reuse. The extras and flow nodes of a node shell stay in
-  its `GoFile` (step 6 moves them into pooled blocks).
+  panic after a reuse, in both builds for the binder field reads. The
+  extras and flow nodes of a node shell stay in its `GoFile` (step 6
+  moves them into pooled blocks).
 
 ## Program (owned by program.rs)
 

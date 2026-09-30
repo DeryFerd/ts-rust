@@ -24,6 +24,41 @@ fn args<const N: usize>(args: [&str; N]) -> Vec<String> {
     args.map(String::from).into()
 }
 
+// Go: tscwatch_test.go:12 bunDependencyTest (in TestWatch)
+fn bun_dependency_test() -> TscInput {
+    let mut files = FileMap::new();
+    let mut index = String::new();
+    let mut file_names = String::new();
+    file_names.push_str(r#""index.ts""#);
+    for i in 0..12 {
+        let name = format!("pkg{i}");
+        let value = format!("value{i}");
+        index.push_str(&format!(
+            r#"import {{ {value} }} from "./node_modules/.bun/{name}/index"; {value};"#
+        ));
+        index.push('\n');
+        files.insert(
+            format!("/home/src/workspaces/project/node_modules/.bun/{name}/index.ts"),
+            format!("export const {value} = {i};").into(),
+        );
+        file_names.push_str(&format!(r#", "node_modules/.bun/{name}/index.ts""#));
+    }
+    files.insert(
+        "/home/src/workspaces/project/index.ts".to_string(),
+        index.into(),
+    );
+    files.insert(
+        "/home/src/workspaces/project/tsconfig.json".to_string(),
+        format!("{{\n\t\"compilerOptions\": {{}},\n\t\"files\": [{file_names}]\n}}").into(),
+    );
+    TscInput {
+        sub_scenario: "watch handles many bun dependency files".into(),
+        files,
+        command_line_args: args(["--watch"]),
+        ..Default::default()
+    }
+}
+
 // Go: tscwatch_test.go:10 TestWatch
 #[test]
 fn watch_watch() {
@@ -43,6 +78,7 @@ fn watch_watch() {
             command_line_args: args(["--watch", "--incremental"]),
             ..Default::default()
         },
+        bun_dependency_test(),
         TscInput {
             sub_scenario: "watch skips build when no files change".into(),
             files: file_map([

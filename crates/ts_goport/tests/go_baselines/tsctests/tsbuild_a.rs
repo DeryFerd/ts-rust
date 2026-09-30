@@ -594,6 +594,44 @@ fn build_config_file_errors_inputs() -> Vec<TscInput> {
             ..Default::default()
         },
         TscInput {
+            sub_scenario: "reports invalid project reference fields".into(),
+            files: files! {
+                "/home/src/workspaces/project/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"composite": true
+						},
+						"files": ["index.ts"],
+						"references": [
+							{ "path": true },
+							{ "circular": true },
+							{ "path": "./utils", "circular": "yes" },
+							{ "path": "" },
+							{ "path": "./valid", "circular": true }
+						]
+					}"#),
+                "/home/src/workspaces/project/index.ts" => "export const x = 10;",
+                "/home/src/workspaces/project/utils/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"composite": true
+						},
+						"files": ["index.ts"]
+					}"#),
+                "/home/src/workspaces/project/utils/index.ts" => "export const y = 10;",
+                "/home/src/workspaces/project/valid/tsconfig.json" => dedent(r#"
+					{
+						"compilerOptions": {
+							"composite": true
+						},
+						"files": ["index.ts"]
+					}"#),
+                "/home/src/workspaces/project/valid/index.ts" => "export const z = 10;",
+            },
+            command_line_args: args(&["--b", "--dry"]),
+            ..Default::default()
+        },
+        TscInput {
             sub_scenario: "reports syntax errors in config file".into(),
             files: files! {
                 "/home/src/workspaces/project/a.ts" => "export function foo() { }",

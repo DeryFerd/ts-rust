@@ -476,7 +476,7 @@ impl SlotChildren {
 ///   node is in the same file; 0 is nil), and in the high half the index + 1
 ///   of the other binder fields of the node in `FileNodeBind` (0 for none).
 ///   AST node records, step 4: `bind` of the nil slot (slot 0) is the
-///   owner, the file id + 1 of the block (`block_is_owned`). The publish
+///   owner, the file id of the block (`block_is_owned`). The publish
 ///   writes it; the bind never writes the nil slot.
 ///
 /// Only the parse and the bind write a record. The bind writes after the
@@ -698,9 +698,14 @@ impl NodeRecord {
 
     /// AST node records, step 4: the owner word of the nil slot of the
     /// block of file `file` (see `NodeRecord`, `bind`).
+    // PERF: ownercheck1. The file id itself, not id + 1: the owner check
+    // (`check_block_owner`) compares it with the file id of the handle, which
+    // the read has in a register already, with no add. A fresh pool block
+    // is all zero, but no read reaches it before `node_shell` writes its
+    // owner.
     #[inline]
     fn owner_word(file: usize) -> u64 {
-        file as u64 + 1
+        file as u64
     }
 
     /// AST node records, step 4: true when this nil slot record is the one
@@ -1303,7 +1308,8 @@ fn high_block_path() {}
 // AST node records, step 4: with debug assertions, it panics when the
 // block of `file` is a pooled block that another file version took
 // (`block_is_owned`), as a read of a dead version's store does ("file
-// version N is released"). A release build does not check the hot reads
+// version N is released"). A release build checks only the binder field
+// reads (`check_block_owner`), not the hot header and kids reads
 // (PORTING.md, "AST": a stale read after a reuse gives the new owner's
 // data).
 // PERF: step 4b. The release body is the one of step 3, with no call to
@@ -3889,8 +3895,9 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
 // parse lists) are freed with the version, and its pooled block goes back
 // to the pool (step 4). A stale header or child read gives the data of
 // that node until another version takes the block, then the data of that
-// version (a panic with debug assertions, `file_block`); a stale node
-// data read panics.
+// version (a panic with debug assertions, `file_block`); a stale binder
+// field read after the reuse (`check_block_owner`) and a stale node data
+// read panic.
 fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
     debug_assert_eq!(
         record_resolve(file, NIL_SLOT as usize, &store.records),
@@ -4159,30 +4166,64 @@ fn frozen_foreign_parent(file: usize, index: usize) -> Node {
         .foreign[index]
 }
 
-/// Parser `node.Flags` of a published store node (see `frozen_record`).
+/// Parser `node.Flags` of a published store node (see
+/// `frozen_owned_record`), with the binder bits after its file is bound.
 #[inline]
 #[must_use]
 pub fn frozen_store_flags(n: Node) -> Option<NodeFlags> {
-    frozen_record(n).map(NodeRecord::flags)
+    frozen_owned_record(n).map(NodeRecord::flags)
+}
+
+/// `frozen_record` with the owner check (`check_block_owner`), for the
+/// binder field reads: the symbol, the `bind` word (the flow node and the
+/// extras) and the flags.
+#[inline]
+fn frozen_owned_record(n: Node) -> Option<&'static NodeRecord> {
+    if n.is_nil() {
+        return None;
+    }
+    let file = n.file_index();
+    let b = file_block(file)?;
+    let r = &b.records[slot_index(n)];
+    check_block_owner(b, file);
+    Some(r)
+}
+
+/// AST node records, step 4: the owner check of a release build. Panics
+/// as a read of a dead version's store does ("file version N is
+/// released") when block `b` of file `file` is a pooled block that another
+/// file version took (`block_is_owned`). The binder field reads
+/// (`frozen_owned_record`) and the bind (`bind_store_records`) run it; the
+/// header and kids reads do not (PORTING.md, "AST").
+// PERF: ownercheck1. One load of the owner word (the nil slot record of
+// the block, next to the `records` address that the read loaded), one
+// compare and one branch to a cold call. A hot header read is about 6
+// instructions, so the kind, parent and loc reads do not check.
+#[inline]
+fn check_block_owner(b: &FileBlock, file: usize) {
+    if !block_is_owned(b, file) {
+        super::file_version::released(file);
+    }
 }
 
 /// AST node records, step 2: Go `node.Symbol()` of a published store node
-/// (see `frozen_record`), nil before its file is bound.
+/// (see `frozen_owned_record`), nil before its file is bound.
 #[inline]
 #[must_use]
 pub fn frozen_store_symbol(n: Node) -> Option<SymbolId> {
-    frozen_record(n).map(|r| {
+    frozen_owned_record(n).map(|r| {
         debug_assert!(r.is_node(), "store handle does not name a node slot");
         r.symbol()
     })
 }
 
 /// AST node records, step 2: the `bind` word of a published store node
-/// (see `NodeRecord` and `frozen_record`), 0 before its file is bound.
+/// (see `NodeRecord` and `frozen_owned_record`), 0 before its file is
+/// bound.
 #[inline]
 #[must_use]
 pub fn frozen_store_bind_word(n: Node) -> Option<u64> {
-    frozen_record(n).map(|r| {
+    frozen_owned_record(n).map(|r| {
         debug_assert!(r.is_node(), "store handle does not name a node slot");
         r.bind_word()
     })
@@ -4192,28 +4233,33 @@ pub fn frozen_store_bind_word(n: Node) -> Option<u64> {
 /// of the file of `n` when it is static (`None` in the node shell of a
 /// freeable file version), with one block lookup: the extras of a node
 /// (`Node::bind_extra`) are in that `GoFile`. `None` as for
-/// `frozen_record`.
+/// `frozen_record`; panics as `check_block_owner`.
 #[inline]
 #[must_use]
 pub fn frozen_store_bind_and_file(n: Node) -> Option<(u64, Option<&'static GoFile>)> {
     if n.is_nil() {
         return None;
     }
-    let b = file_block(n.file_index())?;
+    let file = n.file_index();
+    let b = file_block(file)?;
     let r = &b.records[slot_index(n)];
+    check_block_owner(b, file);
     debug_assert!(r.is_node(), "store handle does not name a node slot");
     Some((r.bind_word(), b.file.go_file.as_ref()))
 }
 
 /// AST node records, step 2: true when `test` is true for the symbol of
 /// some node slot of published store `file`. `None` when `file` is not a
-/// published store.
+/// published store; panics as `check_block_owner`.
 #[must_use]
 pub fn frozen_store_any_symbol(
     file: usize,
     mut test: impl FnMut(SymbolId) -> bool,
 ) -> Option<bool> {
-    file_block(file).map(|b| b.records.iter().any(|r| r.is_node() && test(r.symbol())))
+    file_block(file).map(|b| {
+        check_block_owner(b, file);
+        b.records.iter().any(|r| r.is_node() && test(r.symbol()))
+    })
 }
 
 /// AST node records, step 2 (`BoundFile::install`): writes the binder
@@ -4236,12 +4282,9 @@ pub fn bind_store_records<'d>(
     nodes: impl Iterator<Item = (usize, usize, Option<&'d NodeBindData>, FlowNodeId)>,
 ) -> Vec<NodeBindExtra> {
     let block = file_block(file).unwrap_or_else(|| panic!("file {file} has no published records"));
-    // AST node records, step 4: the one owner check of a release build
-    // (`block_is_owned`). The bind writes the records of a live version
-    // only.
-    if !block_is_owned(block, file) {
-        super::file_version::released(file);
-    }
+    // AST node records, step 4: the bind writes the records of a live
+    // version only.
+    check_block_owner(block, file);
     let records: &'static [NodeRecord] = block.records;
     let flow_file = (file as u64) << 32;
     let mut extras: Vec<NodeBindExtra> = Vec::new();
@@ -6792,15 +6835,6 @@ mod tests {
         assert!(file_block(FILE_ID_LIMIT).is_none(), "no file id");
     }
 
-    // AST node records, step 4: the node shell of a freeable file version
-    // takes a pooled block (`BlockPool`). A dead version gives its block
-    // back, the block waits for two program releases, and then the next
-    // node shell that fits it takes it. A stale read of the dead version
-    // then fails the owner check: with debug assertions it panics as a read
-    // of a dead version's store does, without them a record read gives the
-    // new owner's data (the kind column is not pooled; shells with equal
-    // kinds share one). It publishes, so no other test may build or publish
-    // stores while it runs (the runner uses one thread).
     // textleak1 A1: a publish keeps the emptied cells of its build stores,
     // and the next build store of the thread reuses one, so a language
     // server edit leaks no store cell in the AST arena.
@@ -6825,6 +6859,17 @@ mod tests {
         .unwrap();
     }
 
+    // AST node records, step 4: the node shell of a freeable file version
+    // takes a pooled block (`BlockPool`). A dead version gives its block
+    // back, the block waits for two program releases, and then the next
+    // node shell that fits it takes it. A stale read of the dead version
+    // then fails the owner check, and panics as a read of a dead version's
+    // store does: a binder field read (the symbol, the flags, the flow node
+    // and the extras) in every build (`check_block_owner`), every other
+    // read with debug assertions. Without them a header read gives the new
+    // owner's data (the kind column is not pooled; shells with equal kinds
+    // share one). It publishes, so no other test may build or publish
+    // stores while it runs (the runner uses one thread).
     #[test]
     fn pooled_node_blocks_wait_two_releases_and_check_their_owner() {
         use super::super::file_version::{FileVersion, release_file_version_pins};
@@ -6901,21 +6946,54 @@ mod tests {
         assert_ne!(kinds_of(statement), kinds_of(cy), "other kinds");
 
         // A stale read of c.
-        let stale = catch_unwind(AssertUnwindSafe(|| (cy.kind(), frozen_store_symbol(cy))));
-        if cfg!(debug_assertions) {
-            let message = stale.expect_err("a stale read of a reused block panics");
-            let message = message
-                .downcast_ref::<String>()
-                .cloned()
-                .unwrap_or_default();
-            assert_eq!(message, format!("file version {c_file} is released"));
-        } else {
-            // The kind column is not pooled, so the kind is c's. The record
-            // is the one of e's statement.
+        let released = format!("file version {c_file} is released");
+        let panic_message = |read: &dyn Fn()| {
+            catch_unwind(AssertUnwindSafe(read)).err().map(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+        };
+        let binder_reads: [(&str, &dyn Fn()); 6] = [
+            ("symbol", &|| {
+                let _ = cy.symbol();
+            }),
+            ("flags", &|| {
+                let _ = cy.flags();
+            }),
+            ("parser flags", &|| {
+                let _ = cy.parser_flags(NodeFlags::AMBIENT);
+            }),
+            ("flow node", &|| {
+                let _ = cy.flow_node();
+            }),
+            ("extras", &|| {
+                let _ = cy.local_symbol();
+            }),
+            ("any symbol", &|| {
+                let _ = frozen_store_any_symbol(c_file, |_| false);
+            }),
+        ];
+        for (name, read) in binder_reads {
             assert_eq!(
-                stale.ok(),
-                Some((SyntaxKind::Identifier, Some(SymbolId::NIL)))
+                panic_message(read).as_deref(),
+                Some(released.as_str()),
+                "a stale {name} read of a reused block"
             );
+        }
+        let kind = panic_message(&|| {
+            let _ = cy.kind();
+        });
+        if cfg!(debug_assertions) {
+            assert_eq!(kind.as_deref(), Some(released.as_str()));
+        } else {
+            // The kind column is not pooled, so the kind is c's. A header
+            // read gives the record of e: x has the parent of q, in c.
+            assert_eq!(kind, None);
+            assert_eq!(cy.kind(), SyntaxKind::Identifier);
+            assert_eq!(slot_index(c_nodes[0]), slot_index(q));
+            assert_eq!(c_nodes[0].parent(), cy);
         }
 
         // A version with more slots than a free block has gets a fresh

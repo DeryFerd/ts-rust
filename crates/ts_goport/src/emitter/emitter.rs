@@ -58,6 +58,42 @@ pub struct Emitter {
     pub js_part: Option<Rc<RefCell<PoolJsPart>>>,
 }
 
+/// PORT: not in Go (perf). The second half of Go `emitDeclarationFile`: the
+/// print of a transformed d.ts tree (`Emitter::transform_declaration_file`).
+/// A split file's d.ts part hands it to the d.ts twin of its checker
+/// (`program_emit`).
+pub struct DeclarationPrint {
+    /// The transformed SourceFile.
+    pub source_file: Node,
+    /// Go `contentMappedSource`: the SourceFile before the transforms. The
+    /// print reads its span map for the declaration map.
+    pub content_mapped_source: Node,
+    pub emit_declaration_map: bool,
+    pub emit_context: Rc<EmitContext>,
+    /// The Go `emitDeclarationFileOrBundle` trace event, which ends after
+    /// the print.
+    trace: Option<crate::tracing::Pop>,
+}
+
+impl DeclarationPrint {
+    /// A print with no trace event, for another thread.
+    #[must_use]
+    pub fn new(
+        source_file: Node,
+        content_mapped_source: Node,
+        emit_declaration_map: bool,
+        emit_context: Rc<EmitContext>,
+    ) -> Self {
+        Self {
+            source_file,
+            content_mapped_source,
+            emit_declaration_map,
+            emit_context,
+            trace: None,
+        }
+    }
+}
+
 // Go: compiler/emitter.go:55 declarationTransformer (#4712)
 // PORT: renamed, because `DeclarationTransformer` is the declarations
 // transformer struct.
@@ -270,6 +306,35 @@ impl Emitter {
         put_emit_context();
     }
 
+    /// PORT: not in Go. The d.ts part of a split file (`emit_only` is
+    /// `Dts`) up to its print: the declaration transforms, which call the
+    /// emit resolver, so they run on the file's checker thread. It returns
+    /// the print, or `None` when the part has nothing to print (skipped or
+    /// blocked). `finish_declaration_part` runs the rest.
+    pub fn transform_declaration_part(&mut self) -> Option<DeclarationPrint> {
+        debug_assert!(self.emit_only == EmitOnly::Dts, "not a d.ts part");
+        let declaration_file_path = self.paths.declaration_file_path().to_string();
+        let declaration_map_path = self.paths.declaration_map_path().to_string();
+        let print = self.transform_declaration_file(
+            self.source_file,
+            &declaration_file_path,
+            &declaration_map_path,
+        );
+        if print.is_none() {
+            self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
+        }
+        print
+    }
+
+    /// PORT: not in Go. The rest of `emit` after `transform_declaration_part`
+    /// returned `print`. It needs no checker.
+    pub fn finish_declaration_part(&mut self, print: DeclarationPrint) {
+        let declaration_file_path = self.paths.declaration_file_path().to_string();
+        let declaration_map_path = self.paths.declaration_map_path().to_string();
+        self.print_declaration_file(print, &declaration_file_path, &declaration_map_path);
+        self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
+    }
+
     // Go: compiler/emitter.go:223 emitter.emitDeclarationFile
     fn emit_declaration_file(
         &mut self,
@@ -277,19 +342,36 @@ impl Emitter {
         declaration_file_path: &str,
         declaration_map_path: &str,
     ) {
+        if let Some(print) = self.transform_declaration_file(
+            source_file,
+            declaration_file_path,
+            declaration_map_path,
+        ) {
+            self.print_declaration_file(print, declaration_file_path, declaration_map_path);
+        }
+    }
+
+    /// The part of Go `emitDeclarationFile` up to its printer: the
+    /// declaration transforms. None when it returns before the print.
+    fn transform_declaration_file(
+        &mut self,
+        source_file: Node,
+        declaration_file_path: &str,
+        declaration_map_path: &str,
+    ) -> Option<DeclarationPrint> {
         let options = options();
 
         if source_file.is_nil()
             || self.emit_only == EmitOnly::Js
             || declaration_file_path.is_empty()
         {
-            return;
+            return None;
         }
         let emit_declaration_map =
             self.emit_only != EmitOnly::BuilderSignature && options.declaration_map.is_true();
         let content_mapped_source = source_file;
 
-        let _trace = crate::tracing::get().map(|tr| {
+        let trace = crate::tracing::get().map(|tr| {
             tr.push(
                 crate::tracing::Phase::Emit,
                 "emitDeclarationFileOrBundle",
@@ -324,7 +406,7 @@ impl Emitter {
         {
             self.emit_result.emit_skipped = true;
             put_emit_context();
-            return;
+            return None;
         }
 
         let decl_blocked =
@@ -332,8 +414,34 @@ impl Emitter {
         if decl_blocked {
             self.emit_result.emit_skipped = true;
             put_emit_context();
-            return;
+            return None;
         }
+
+        Some(DeclarationPrint {
+            source_file,
+            content_mapped_source,
+            emit_declaration_map,
+            emit_context,
+            trace,
+        })
+    }
+
+    /// The rest of Go `emitDeclarationFile`: the printer and the print of
+    /// `print`.
+    fn print_declaration_file(
+        &mut self,
+        print: DeclarationPrint,
+        declaration_file_path: &str,
+        declaration_map_path: &str,
+    ) {
+        let options = options();
+        let DeclarationPrint {
+            source_file,
+            content_mapped_source,
+            emit_declaration_map,
+            emit_context,
+            trace: _trace,
+        } = print;
 
         let printer_options = PrinterOptions {
             remove_comments: options.remove_comments.is_true(),
@@ -406,7 +514,8 @@ impl Emitter {
             &declaration_map_options,
             should_emit_source_maps,
         );
-        put_emit_context();
+        // Go `putEmitContext()`.
+        emit_context.reset();
     }
 
     // Go: compiler/emitter.go:314 emitter.printSourceFile
