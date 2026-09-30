@@ -1707,6 +1707,7 @@ impl Checker {
     // Go: checker/checker.go:13891 GetGlobalDiagnostics
     pub fn get_global_diagnostics(&mut self) -> Vec<Diagnostic> {
         self.check_not_canceled();
+        self.produce_deferred_diagnostics();
         self.diagnostics.get_global_diagnostics()
     }
 
