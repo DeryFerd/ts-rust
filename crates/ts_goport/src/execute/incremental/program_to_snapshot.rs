@@ -142,9 +142,18 @@ impl ToProgramSnapshot<'_> {
         // the same order. Binding comes first, as in the first iteration of
         // the loop (`file_affects_global_scope`).
         bind_all();
+        // PORT: perf. Each job gets the file's set of the old snapshot, and
+        // returns that set when the new set is the same (see
+        // `ReferencedFileSet::finish`).
         let mut reference_jobs: std::collections::VecDeque<_> = files
             .iter()
-            .map(|&file| start_referenced_files_job(file))
+            .map(|&file| {
+                let old = old_snapshot.and_then(|old| {
+                    old.referenced_map
+                        .get_references_arc(source_file_info(file).path.as_str())
+                });
+                start_referenced_files_job(file, old)
+            })
             .collect();
         for file in files {
             let file_path = Path(source_file_info(file).path.clone());
@@ -157,8 +166,7 @@ impl ToProgramSnapshot<'_> {
             let new_references = reference_jobs
                 .pop_front()
                 .expect("one referenced files job per file")
-                .wait()
-                .map(Arc::new);
+                .wait();
             if let Some(new_references) = &new_references {
                 self.snapshot
                     .referenced_map
@@ -358,7 +366,9 @@ impl ToProgramSnapshot<'_> {
 // first, without a hash of each path.
 fn same_references(a: Option<&FxIndexSet<Path>>, b: Option<&FxIndexSet<Path>>) -> bool {
     match (a, b) {
-        (Some(a), Some(b)) => a.len() == b.len() && (a.iter().eq(b.iter()) || a == b),
+        (Some(a), Some(b)) => {
+            std::ptr::eq(a, b) || (a.len() == b.len() && (a.iter().eq(b.iter()) || a == b))
+        }
         (a, b) => a.is_none() && b.is_none(),
     }
 }
@@ -474,22 +484,83 @@ fn add_referenced_files_from_import_literal(
 /// The Go `referencedFiles` set of `getReferencedFiles`, in Go order.
 // PORT: perf. Go inserts a path for every declaration of every ambient
 // module, and the set keeps the first. `add_file` skips a file that it
-// added before, without the path copy and the path hash (in Hono, about
-// 110 ambient module declarations for each file). The set and its order
+// added before, without the path hash (in Hono, about 110 ambient module
+// declarations for each file). The paths are kept as a list of
+// candidates in Go order, so `finish` can give back the old snapshot's set
+// when it is the same, without a copy of each path. The set and its order
 // are the same.
 #[derive(Default)]
 struct ReferencedFileSet {
-    paths: FxIndexSet<Path>,
+    /// What Go adds to the set, in order. A path can repeat.
+    candidates: Vec<ReferencedCandidate>,
     /// The files that `add_file` added.
     files: FxHashSet<Node>,
 }
 
+/// One path that `getReferencedFiles` adds: the path of a source file, or
+/// a path from a file name.
+enum ReferencedCandidate {
+    File(Node),
+    Path(Path),
+}
+
 impl ReferencedFileSet {
-    /// Inserts the path of `file`.
+    /// Adds the path of `file`.
     fn add_file(&mut self, file: Node) {
         if self.files.insert(file) {
-            self.paths.insert(Path(source_file_info(file).path.clone()));
+            self.candidates.push(ReferencedCandidate::File(file));
         }
+    }
+
+    /// Adds `paths`, in order.
+    fn add_paths(&mut self, paths: Vec<Path>) {
+        self.candidates
+            .extend(paths.into_iter().map(ReferencedCandidate::Path));
+    }
+
+    /// The set: None when it is empty (Go stores no set then). `old` is the
+    /// file's set in the old snapshot; when the new set has the same paths
+    /// in the same order, `old` itself is the result.
+    fn finish(self, old: Option<Arc<FxIndexSet<Path>>>) -> Option<Arc<FxIndexSet<Path>>> {
+        if let Some(old) = old
+            && self.same_as(&old)
+        {
+            return Some(old);
+        }
+        let mut paths = FxIndexSet::default();
+        for candidate in self.candidates {
+            match candidate {
+                ReferencedCandidate::File(file) => {
+                    paths.insert(Path(source_file_info(file).path.clone()));
+                }
+                ReferencedCandidate::Path(path) => {
+                    paths.insert(path);
+                }
+            }
+        }
+        (!paths.is_empty()).then(|| Arc::new(paths))
+    }
+
+    /// True when inserting the candidates in order into an empty set gives
+    /// `old`, in the same order: the first time each path comes, it is the
+    /// next path of `old`, a repeat is a path that came before, and every
+    /// path of `old` comes.
+    fn same_as(&self, old: &FxIndexSet<Path>) -> bool {
+        let mut next = 0;
+        for candidate in &self.candidates {
+            let index = match candidate {
+                ReferencedCandidate::File(file) => {
+                    old.get_index_of(source_file_info(*file).path.as_str())
+                }
+                ReferencedCandidate::Path(path) => old.get_index_of(path.as_str()),
+            };
+            match index {
+                Some(index) if index == next => next += 1,
+                Some(index) if index < next => {}
+                _ => return false,
+            }
+        }
+        next == old.len()
     }
 }
 
@@ -522,12 +593,14 @@ fn add_referenced_file_from_file_name(
 // Gets the referenced files for a file from the program with values for the keys as referenced file's path to be true
 #[must_use]
 pub fn get_referenced_files(file: Node) -> Option<FxIndexSet<Path>> {
-    start_referenced_files_job(file).wait()
+    start_referenced_files_job(file, None)
+        .wait()
+        .map(Arc::unwrap_or_clone)
 }
 
 /// The result of `get_referenced_files`, computed on the file's checker
 /// thread.
-pub type ReferencedFilesJob = CheckerJob<Option<FxIndexSet<Path>>>;
+pub type ReferencedFilesJob = CheckerJob<Option<Arc<FxIndexSet<Path>>>>;
 
 /// Sends `get_referenced_files` for `file` to its checker thread without
 /// waiting (see `compute_program_file_changes`).
@@ -537,7 +610,12 @@ pub type ReferencedFilesJob = CheckerJob<Option<FxIndexSet<Path>>>;
 // the Go frontend program, which works on the loading thread only. The set
 // work is large: in Hono, the ambient module part tries about 110 paths for
 // each file (the `@types/node` modules).
-pub fn start_referenced_files_job(file: Node) -> ReferencedFilesJob {
+/// `old` is the file's set in the old snapshot (see
+/// `ReferencedFileSet::finish`).
+pub fn start_referenced_files_job(
+    file: Node,
+    old: Option<Arc<FxIndexSet<Path>>>,
+) -> ReferencedFilesJob {
     // We need to use a set here since the code can contain the same import twice,
     // but that will only be one dependency.
     // To avoid invernal conversion, the key of the referencedFiles map must be of type Path
@@ -554,7 +632,7 @@ pub fn start_referenced_files_job(file: Node) -> ReferencedFilesJob {
                 import_name,
             );
         }
-        referenced_files.paths.extend(file_name_paths);
+        referenced_files.add_paths(file_name_paths);
         // Add module augmentation as references
         for module_name in module_augmentations {
             if !is_string_literal(module_name) {
@@ -577,11 +655,7 @@ pub fn start_referenced_files_job(file: Node) -> ReferencedFilesJob {
                 referenced_files.add_file(file_of_decl);
             }
         }
-        if referenced_files.paths.is_empty() {
-            None
-        } else {
-            Some(referenced_files.paths)
-        }
+        referenced_files.finish(old)
     })
 }
 
