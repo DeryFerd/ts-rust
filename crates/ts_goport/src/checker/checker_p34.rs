@@ -1022,23 +1022,15 @@ impl Checker {
             return self.get_actual_type_variable(base_type);
         }
         if flags.intersects(TypeFlags::INDEXED_ACCESS) {
-            let object_type = self.ty(t).as_indexed_access_type().object_type;
-            let index_type = self.ty(t).as_indexed_access_type().index_type;
-            if self
-                .ty(object_type)
-                .flags
-                .intersects(TypeFlags::SUBSTITUTION)
-                || self
-                    .ty(index_type)
-                    .flags
-                    .intersects(TypeFlags::SUBSTITUTION)
-            {
-                let object_actual = self.get_actual_type_variable(object_type);
-                let index_actual = self.get_actual_type_variable(index_type);
-                return self.get_indexed_access_type(object_actual, index_actual);
+            let t_object_type = self.ty(t).as_indexed_access_type().object_type;
+            let t_index_type = self.ty(t).as_indexed_access_type().index_type;
+            let object_type = self.get_actual_type_variable(t_object_type);
+            let index_type = self.get_actual_type_variable(t_index_type);
+            if object_type != t_object_type || index_type != t_index_type {
+                return self.get_indexed_access_type(object_type, index_type);
             }
         }
-        t
+        self.get_non_distributed_type_parameter(t)
     }
 
     // Go: checker/checker.go:31333 GetSymbolAtLocation

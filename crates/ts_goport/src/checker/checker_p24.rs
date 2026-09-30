@@ -1905,7 +1905,7 @@ impl Checker {
         let mut alias = alias;
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::TYPE_PARAMETER) {
-            return self.mapper_map(m, t);
+            return self.get_mapped_type(t, m);
         } else if flags.intersects(TypeFlags::OBJECT) {
             let object_flags = self.ty(t).object_flags;
             if object_flags

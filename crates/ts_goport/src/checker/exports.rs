@@ -594,4 +594,12 @@ impl Checker {
     pub fn compare_symbols_exported(&mut self, s1: SymbolId, s2: SymbolId) -> i32 {
         self.compare_symbols(s1, s2)
     }
+
+    // Go: checker/exports.go:398 IsDistributedTypeParameter
+    // PORT: a Go package function; a `Checker` method here because it reads
+    // the type arena.
+    pub fn is_distributed_type_parameter(&self, t: TypeId) -> bool {
+        let ty = self.ty(t);
+        ty.flags.intersects(TypeFlags::TYPE_PARAMETER) && ty.as_type_parameter().is_distributed
+    }
 }

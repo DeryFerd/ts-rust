@@ -1099,6 +1099,7 @@ impl Checker {
     // Go: checker/inference.go:1462 getInferenceInfoForType
     pub fn get_inference_info_for_type(&self, n: &InferenceState, t: TypeId) -> Option<usize> {
         if self.ty(t).flags.intersects(TypeFlags::TYPE_VARIABLE) {
+            let t = self.get_non_distributed_type_parameter(t);
             for (i, inference) in self
                 .inference_context(n.inferences)
                 .inferences

@@ -1559,10 +1559,10 @@ impl Checker {
                 let mapper = self.ty(method_type).mapper();
                 let mut next_type = TypeId::NIL;
                 if method_name == "next" {
-                    next_type = self.mapper_map(mapper, type_parameters[2]);
+                    next_type = self.get_mapped_type(type_parameters[2], mapper);
                 }
-                let yield_type = self.mapper_map(mapper, type_parameters[0]);
-                let return_type = self.mapper_map(mapper, type_parameters[1]);
+                let yield_type = self.get_mapped_type(type_parameters[0], mapper);
+                let return_type = self.get_mapped_type(type_parameters[1], mapper);
                 return IterationTypes {
                     yield_type,
                     return_type,

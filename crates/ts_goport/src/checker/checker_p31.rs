@@ -285,6 +285,7 @@ impl Checker {
                         .flags
                         .intersects(TypeFlags::TYPE_PARAMETER)
                 {
+                    let constraint = self.get_non_distributed_type_parameter(constraint);
                     extended_constraint = self.get_constraint_of_type_parameter(constraint);
                 }
                 if extended_constraint.is_some()

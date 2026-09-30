@@ -191,21 +191,13 @@ impl Checker {
     // Go: checker/nodebuilderimpl.go:3143 typeToTypeNode
     pub fn type_to_type_node(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, t: TypeId) -> Node {
         let ctx = nb_ctx(b);
-        // Push type onto typeStack for expansion depth tracking
-        let pushed = {
-            let mut c = ctx.borrow_mut();
-            if c.max_expansion_depth >= 0 && t.is_some() {
-                c.type_stack.push(t);
-                true
-            } else {
-                false
-            }
-        };
-        // PORT: Go uses two defers (typeStack pop, and depth-- in the alias
-        // branch). The body reports whether it took the depth++ path, and the
-        // deferred work runs here in Go's LIFO order.
+        // PORT: Go uses two defers (typeStack pop after the push in the body,
+        // and depth-- in the alias branch). The body reports whether it pushed
+        // and whether it took the depth++ path, and the deferred work runs
+        // here in Go's LIFO order.
+        let mut pushed = false;
         let mut depth_incremented = false;
-        let result = self.type_to_type_node_body(b, t, &mut depth_incremented);
+        let result = self.type_to_type_node_body(b, t, &mut pushed, &mut depth_incremented);
         if depth_incremented {
             ctx.borrow_mut().depth -= 1;
         }
@@ -221,6 +213,7 @@ impl Checker {
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
         mut t: TypeId,
+        pushed: &mut bool,
         depth_incremented: &mut bool,
     ) -> Node {
         let ctx = nb_ctx(b);
@@ -246,6 +239,17 @@ impl Checker {
             }
             c.approximate_length += 3;
             return f.new_keyword_type_node(SyntaxKind::AnyKeyword);
+        }
+
+        t = self.get_non_distributed_type_parameter(t);
+
+        // Push type onto typeStack for expansion depth tracking
+        {
+            let mut c = ctx.borrow_mut();
+            if c.max_expansion_depth >= 0 {
+                c.type_stack.push(t);
+                *pushed = true;
+            }
         }
 
         if !nb_flags(b).intersects(NodeBuilderFlags::NO_TYPE_REDUCTION) {

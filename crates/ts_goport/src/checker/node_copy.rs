@@ -912,7 +912,7 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         {
             let declared_type = self.ctx.c.get_declared_type_of_symbol(s);
             let mapper = nb_ctx(self.ctx.b).borrow().mapper;
-            if mapper.is_some() && self.ctx.c.mapper_map(mapper, declared_type) != declared_type {
+            if mapper.is_some() && self.ctx.c.get_mapped_type(declared_type, mapper) != declared_type {
                 return Node::NIL; // refers to type parameter remapped by context (TODO improvement: just return the remapped param name?)
             }
         }

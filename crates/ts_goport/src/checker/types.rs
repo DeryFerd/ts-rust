@@ -2069,7 +2069,9 @@ pub struct TypeParameter {
     pub target: TypeId,
     pub mapper: MapperId,
     pub is_this_type: bool,
+    pub is_distributed: bool,
     pub resolved_default_type: TypeId,
+    pub distributed_type: TypeId,
 }
 
 impl TypeParameter {
