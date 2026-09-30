@@ -951,16 +951,16 @@ impl Session {
     // are produced on the persistent API checker and stay resolvable. Only safe when the
     // LS operation acquires a checker exactly once; nested acquisitions (e.g. find-all-
     // references) would deadlock on the single-slot persistent checker.
+    // ts#64133: takes the snapshot, not the snapshot data.
     pub fn setup_language_service(
         &self,
-        sd: &SnapshotData,
+        snapshot: &Rc<project::Snapshot>,
         program: Rc<compiler::NewProgram>,
         project_handle: &ProjectID,
         active_file: &str,
     ) -> Result<ls::LanguageService, GoError> {
         let project_name = parse_project_handle(project_handle);
-        let proj = sd
-            .snapshot
+        let proj = snapshot
             .project_collection
             .get_project_by_path(&project_name);
         let Some(proj) = proj else {
@@ -974,7 +974,7 @@ impl Session {
             ));
         };
         let project_id = proj.borrow().id();
-        let host: Rc<dyn ls::Host> = sd.snapshot.clone();
+        let host: Rc<dyn ls::Host> = snapshot.clone();
         Ok(ls::new_language_service(
             project_id,
             program,

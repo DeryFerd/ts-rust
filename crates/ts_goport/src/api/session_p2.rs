@@ -2262,7 +2262,8 @@ impl Session {
             return Ok(Vec::new());
         }
 
-        let lang_svc = self.setup_language_service(&sd, Rc::clone(program), &params.project, "")?;
+        let lang_svc =
+            self.setup_language_service(&sd.snapshot, Rc::clone(program), &params.project, "")?;
 
         let usages = lang_svc.get_signature_usages(ctx, signature_decl);
         // PORT: Go `usages == nil`. Go returns a nil slice exactly when there
@@ -2300,29 +2301,87 @@ impl Session {
             ctx
         };
         let sd = self.get_snapshot_data(params.snapshot)?;
-        let program = &sd.get_program(&params.project)?;
+        // ts#64133
+        // PORT: `run` also returns the source file; the symbol reads below take
+        // the checker for it.
+        let run = |snapshot: &Rc<project::Snapshot>,
+                   program: &Rc<compiler::NewProgram>|
+         -> Result<(Option<ls::CompletionList>, Node), GoError> {
+            let source_file = program
+                .get_source_file(&params.file.to_file_name())
+                .map_or(Node::NIL, |f| f.root);
+            if source_file.is_nil() {
+                return Ok((None, source_file));
+            }
+            let lang_svc =
+                self.setup_language_service(snapshot, Rc::clone(program), &params.project, "")?;
+            let internal_pos =
+                source_file_get_position_map(source_file).utf16_to_utf8(params.position as i32);
+            let result = lang_svc.get_completions_at_position_exported(
+                ctx,
+                source_file,
+                internal_pos,
+                params.trigger_character.clone(),
+                params.include_symbol,
+            )?;
+            Ok((result, source_file))
+        };
+
+        let mut program = sd.get_program(&params.project)?;
         // Current for the whole handler (session_p1.rs header).
-        let _program = ls_program::enter(program);
-        let source_file = program
-            .get_source_file(&params.file.to_file_name())
-            .map_or(Node::NIL, |f| f.root);
-        if source_file.is_nil() {
-            return Ok(None);
+        let mut program_guard = ls_program::enter(&program);
+        let mut result = run(&sd.snapshot, &program);
+        // PORT: Go `defer preparedSnapshot.Deref(...)`: the guard derefs it
+        // when the handler returns.
+        let mut _prepared_snapshot: Option<SnapshotDerefGuard> = None;
+        if let Err(err) = &result
+            && errors::is(err, &ls::ERR_NEEDS_AUTO_IMPORTS)
+        {
+            let prepared_snapshot = self.project_session.get_snapshot_with_auto_imports(
+                ctx,
+                &sd.snapshot,
+                &params
+                    .file
+                    .to_uri(&self.project_session.get_current_directory()),
+            );
+            _prepared_snapshot = Some(SnapshotDerefGuard {
+                snapshot: prepared_snapshot.clone(),
+                session: self.project_session.clone(),
+            });
+            if let Some(err) = ctx.err() {
+                return Err(err);
+            }
+            let project_path = parse_project_handle(&params.project);
+            let proj = prepared_snapshot
+                .project_collection
+                .get_project_by_path(&project_path);
+            let Some(proj) = proj else {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: project {} not found",
+                        *ERR_CLIENT_ERROR,
+                        project_path.as_str()
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            let Some(prepared_program) = proj.borrow().get_program() else {
+                return Err(errors::errorf(
+                    format!("{}: project has no program", *ERR_CLIENT_ERROR),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            program = prepared_program;
+            drop(program_guard);
+            program_guard = ls_program::enter(&program);
+            result = run(&prepared_snapshot, &program);
         }
-        let lang_svc = self.setup_language_service(&sd, Rc::clone(program), &params.project, "")?;
-        let position_map = source_file_get_position_map(source_file);
-        let internal_pos = position_map.utf16_to_utf8(params.position as i32);
-        let result = lang_svc.get_completions_at_position_exported(
-            ctx,
-            source_file,
-            internal_pos,
-            params.trigger_character.clone(),
-            params.include_symbol,
-        );
-        let result = match result {
+        let _program_guard = program_guard;
+        let program = &program;
+        let (result, source_file) = match result {
             Err(err) => return Err(err),
-            Ok(None) => return Ok(None),
-            Ok(Some(result)) => result,
+            Ok((None, _)) => return Ok(None),
+            Ok((Some(result), source_file)) => (result, source_file),
         };
         // PORT: Go reads `item.Symbol` without a checker. The symbols live in
         // the arena of the checker the completion request used, so the port
@@ -2379,7 +2438,8 @@ impl Session {
             return Ok(Vec::new());
         }
 
-        let lang_svc = self.setup_language_service(&sd, Rc::clone(program), &params.project, "")?;
+        let lang_svc =
+            self.setup_language_service(&sd.snapshot, Rc::clone(program), &params.project, "")?;
 
         let source_files: Vec<Node> = program.get_source_files().iter().map(|f| f.root).collect();
         let entries = lang_svc.get_referenced_symbols_for_node_exported(
@@ -2636,4 +2696,17 @@ fn strconv_parse_uint(s: &str, base: u32, bit_size: u32) -> Result<u64, GoError>
     }
 
     Ok(n)
+}
+
+/// PORT: Go `defer snapshot.Deref(session)` (ts#64133): derefs the snapshot
+/// when the guard drops.
+struct SnapshotDerefGuard {
+    snapshot: Rc<project::Snapshot>,
+    session: Rc<project::Session>,
+}
+
+impl Drop for SnapshotDerefGuard {
+    fn drop(&mut self) {
+        project::Snapshot::deref(&self.snapshot, &self.session);
+    }
 }
