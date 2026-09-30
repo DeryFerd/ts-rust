@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "status": "active",
-  "decision": "STOP",
-  "updated": "2026-09-30T00:03:31.631027+00:00",
-  "reason": "R141 stopped by the independent reviewer (goport-config thread stack); repair as R142.",
+  "decision": "REVIEW",
+  "updated": "2026-09-30T02:18:22.318579+00:00",
+  "reason": "R142 bound in batch recovery-continuation-go-checker-port-27.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -725,31 +725,26 @@
     "ordinaryQuery": null,
     "localCheck": null,
     "acceptance": null,
-    "recoveryRevision": 141,
-    "hypothesis": "tsc -b reads configs and up-to-date inputs on threads and takes later-program file reads and resolutions from the parse workers (with Go's build-wide stat cache semantics), and AST node records hold kind, parent, loc, children and binder fields in one per-node record, with no output change at pin 16c25522e123: every R140 test name keeps its status (one port-only test body change for review), the gate has 0 regressions, the LSP and API oracles lose nothing, and wide -b noop goes from 0.64x to about 0.97x of Go and wide -b body from 1.17x to 1.46x at 16 cores.",
-    "sourceFingerprint": "1e54b1f619a0d77e7cfbb5b456cb13f26c3ce6dee439b50aa4818bc07e68ce30",
-    "beforeEditingSourceFingerprint": "a232bbb2e35c6ecbf189f2db26aa17c52147ab97654e06b8be92b31034176709",
+    "recoveryRevision": 142,
+    "hypothesis": "Repair of R141 (reviewer STOP): the tsc -b goport-config and goport-buildinfo threads, the LSP reader thread, the fswatch watcher and the seeded test thread get the Go stack size (gostd::stack::max_stack_size), as PORTING requires for threads that run Go code. tsc -b with deep tsconfig nesting (depth 2000 to 30000), a 1000-file extends chain, or a deep tsbuildinfo, and an LSP initialize with deep initializationOptions, then give Go-B's result where R141 (and for the build info and LSP cases also R140) abort. Everything else equals R141: 0 lost tests, gate 0 regressions, oracles 0 lost.",
+    "sourceFingerprint": "b3c84c0a867d675898233a58d8fb7496f03a9191ece7dc645c1d454abc8a9e1a",
+    "beforeEditingSourceFingerprint": "1e54b1f619a0d77e7cfbb5b456cb13f26c3ce6dee439b50aa4818bc07e68ce30",
     "sourceBindingStatus": "SOURCE_BOUND",
-    "commit": "cd425b240",
+    "commit": "52d8a9563",
     "completedRuns": [],
     "compilerAccepted": false,
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
       "agent": "aae6dbb734c07335a",
-      "verdict": "PASS",
-      "revision": 141,
-      "sourceFingerprint": "1e54b1f619a0d77e7cfbb5b456cb13f26c3ce6dee439b50aa4818bc07e68ce30"
+      "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
       "agent": "a0bc38f3370585da3",
-      "verdict": "STOP",
-      "revision": 141,
-      "sourceFingerprint": "1e54b1f619a0d77e7cfbb5b456cb13f26c3ce6dee439b50aa4818bc07e68ce30",
-      "reason": "goport-config threads use the default 2 MiB stack; deep tsconfig nesting aborts tsc -b (exit 134) where R140 and Go build; note r141-stop-2026-09-30"
+      "verdict": "PENDING"
     },
-    "nextPermittedAction": "Repair R141 as R142 in this batch: goport-config and build info prefetch thread stacks, the reviewer repro, doc fixes; no new feature work until the repair is accepted."
+    "nextPermittedAction": "Run the R142 pipeline (candidate.sh side)."
   },
   "parallelModelPreference": {
     "model": "GPT-6 Astra",
