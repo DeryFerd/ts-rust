@@ -19,7 +19,28 @@ fn setup(files: FileMap) -> Rc<Session> {
 }
 
 child_test! {
-    // Go: snapshot_test.go:38 TestSnapshot/compilerHost gets frozen with snapshot's FS only once
+    // Go: snapshot_test.go:38 TestSnapshot/temporary file can be added to an empty root snapshot (ts#64163)
+    fn temporary_file_can_be_added_to_an_empty_root_snapshot() {
+        let session = setup(files(&[]));
+
+        let base_snapshot = session.snapshot();
+        let u = uri("file:///temporary.ts");
+        let snapshot = session
+            .clone_snapshot_with_temporary_file(&bg(), &base_snapshot, &u, "export const value = 1;".to_string())
+            .unwrap_or_else(|err| panic!("CloneSnapshotWithTemporaryFile: {}", err.error()));
+
+        assert_eq!(
+            snapshot.get_file(&u.file_name()).expect("temporary file").content(),
+            "export const value = 1;"
+        );
+        // Go: defer snapshot.Deref(); defer session.Close()
+        snapshot.deref();
+        session.close();
+    }
+}
+
+child_test! {
+    // Go: snapshot_test.go:52 TestSnapshot/compilerHost gets frozen with snapshot's FS only once
     fn compiler_host_gets_frozen_with_snapshots_fs_only_once() {
         let session = setup(files(&[
             ("/home/projects/TS/p1/tsconfig.json", "{}"),
@@ -220,14 +241,20 @@ child_test! {
         let _ = language_service(&session, index_uri);
 
         let base_snapshot = session.snapshot();
-        let prepared_snapshot =
-            session.get_snapshot_with_auto_imports(&ctx, &base_snapshot, &uri(index_uri));
+        // ts#64163
+        let prepared_snapshot = session.snapshot_host.clone_snapshot_with_auto_imports(
+            &ctx,
+            &base_snapshot,
+            &uri(index_uri),
+            None,
+        );
+        session.try_adopt_snapshot_in_background(&base_snapshot, &prepared_snapshot);
 
         session.wait_for_background_tasks();
         assert!(Rc::ptr_eq(&session.snapshot(), &prepared_snapshot));
 
-        // Go: defer preparedSnapshot.Deref(session); t.Cleanup(session.Close)
-        Snapshot::deref(&prepared_snapshot, &session);
+        // Go: defer preparedSnapshot.Deref(); t.Cleanup(session.Close)
+        prepared_snapshot.deref();
         session.close();
     }
 }

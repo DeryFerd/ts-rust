@@ -591,7 +591,7 @@ child_test! {
                 ..Default::default()
             },
             &base_snapshot.fs.overlays,
-            &session,
+            None,
         );
 
         let project = clone.get_default_project(&u).expect("default project");
@@ -604,7 +604,7 @@ child_test! {
 
         assert_eq!(extended_owners(&session, extended_config_path), Some(1));
 
-        clone.deref(&session);
+        clone.deref();
 
         assert!(load(&session, &main_key).is_none());
 

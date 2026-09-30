@@ -756,8 +756,15 @@ child_test! {
         }));
 
         let session = project::new_session(&init);
-        open(&session, MAIN_URI, MAIN_TEXT);
-        program(&session, MAIN_URI);
+        // ts#64163
+        let ctx = locale::with_locale(&bg(), locale::DEFAULT);
+        let locale_reads = utils.client().get_locale_calls();
+        session.did_open_file(&ctx, &uri(MAIN_URI), 1, MAIN_TEXT, &lsproto::LanguageKind::TYPE_SCRIPT);
+        session
+            .get_language_service(&ctx, &uri(MAIN_URI))
+            .unwrap_or_else(|err| panic!("GetLanguageService: {}", err.error()));
+        // Snapshot adoption reads the current locale for its background work; project construction should not.
+        assert_eq!(utils.client().get_locale_calls(), locale_reads + 1);
         assert_eq!(spawner.spawns(), 1);
 
         let mut preferences = session.config();

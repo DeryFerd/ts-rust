@@ -10,23 +10,20 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
-use crate::frontend::core_ext::ProjectReference;
+use crate::frontend::core_ext::{ProjectReference, get_script_kind_from_file_name};
 use std::cell::{Cell, OnceCell};
 use std::panic::AssertUnwindSafe;
 use std::time::Instant;
 
 const NIL_DEREF: &str = "invalid memory address or nil pointer dereference";
 
-// Go: project/snapshot.go:26 Snapshot
+// Go: project/snapshot.go:29 Snapshot
 pub struct Snapshot {
+    pub host: Rc<SnapshotHost>,
     pub id: u64,
     pub parent_id: u64,
     pub ref_count: Cell<i32>,
 
-    // Session options are immutable for the server lifetime,
-    // so can be a pointer.
-    pub session_options: Rc<SessionOptions>,
-    pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     pub converters: Rc<lsconv::Converters>,
 
     // Immutable state, cloned between snapshots
@@ -97,28 +94,53 @@ fn lsp_line_map_of(fs: &SnapshotFS, file_name: &str) -> Option<Rc<lsconv::LSPLin
     None
 }
 
-// Go: project/snapshot.go:52 NewSnapshot
-// NewSnapshot initializes a snapshot with refCount 1.
-// The caller is responsible for calling Deref when done.
+// Go: project/snapshot.go:77 SnapshotHost.newSnapshot (ts#64163)
+// PORT: Go `NewSnapshot` became this host method; the snapshot starts with
+// refCount 1 and keeps the host.
+impl SnapshotHost {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_snapshot(
+        self: &Rc<Self>,
+        id: u64,
+        fs: Rc<SnapshotFS>,
+        config_file_registry: Rc<ConfigFileRegistry>,
+        compiler_options_for_inferred_projects: Option<Rc<CompilerOptions>>,
+        user_preferences: lsutil::UserPreferences,
+        auto_imports: Option<Rc<autoimport::Registry>>,
+        auto_imports_watch: Option<Rc<WatchedFiles<FxHashMap<tspath::Path, String>>>>,
+    ) -> Rc<Snapshot> {
+        new_snapshot_with_host(
+            self,
+            id,
+            fs,
+            config_file_registry,
+            compiler_options_for_inferred_projects,
+            user_preferences,
+            auto_imports,
+            auto_imports_watch,
+        )
+    }
+}
+
+// PORT: the body of Go `SnapshotHost.newSnapshot`.
 #[allow(clippy::too_many_arguments)]
-pub fn new_snapshot(
+fn new_snapshot_with_host(
+    host: &Rc<SnapshotHost>,
     id: u64,
     fs: Rc<SnapshotFS>,
-    session_options: Rc<SessionOptions>,
     config_file_registry: Rc<ConfigFileRegistry>,
     compiler_options_for_inferred_projects: Option<Rc<CompilerOptions>>,
     user_preferences: lsutil::UserPreferences,
     auto_imports: Option<Rc<autoimport::Registry>>,
     auto_imports_watch: Option<Rc<WatchedFiles<FxHashMap<tspath::Path, String>>>>,
-    to_path: Rc<dyn Fn(&str) -> tspath::Path>,
 ) -> Rc<Snapshot> {
     let line_map_fs = fs.clone();
     let converters = lsconv::new_converters(
-        session_options.position_encoding.clone(),
+        host.options.position_encoding.clone(),
         move |file_name: &str| lsp_line_map_of(&line_map_fs, file_name),
     );
     let project_collection = Rc::new(ProjectCollection {
-        to_path: to_path.clone(),
+        to_path: host.to_path.clone(),
         config_file_registry: None,
         file_default_projects: FxHashMap::default(),
         configured_projects: FxHashMap::default(),
@@ -128,13 +150,12 @@ pub fn new_snapshot(
         open_configured_projects: std::cell::OnceCell::new(),
     });
     Rc::new(Snapshot {
+        host: host.clone(),
         id,
         parent_id: 0,
         // Go: s.refCount.Store(1)
         ref_count: Cell::new(1),
 
-        session_options,
-        to_path,
         converters,
 
         fs,
@@ -154,7 +175,7 @@ pub fn new_snapshot(
 }
 
 impl Snapshot {
-    // Go: project/snapshot.go:112 cloneForProgram (ts#63950)
+    // Go: project/snapshot.go:103 cloneForProgram (ts#63950, ts#64163)
     // cloneForProgram clones a snapshot and creates a single synthetic inferred
     // project representing createProgram input.
     // PORT: the deferred `recover()` is `catch_unwind` around the body, as in
@@ -169,11 +190,14 @@ impl Snapshot {
         config_file_parsing_diagnostics: Vec<Diagnostic>,
         old_project: Option<&Rc<RefCell<Project>>>,
         file_changes: FileChangeSummary,
-        session: &Session,
+        session_logger: SessionLogger<'_>,
     ) -> Rc<Snapshot> {
+        let store = &self.host;
         let mut logger: Option<Rc<logging::LogTree>> = None;
 
-        if session.options.logging_enabled {
+        if store.options.logging_enabled
+            && let Some(session_logger) = session_logger
+        {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 self.clone_for_program_body(
                     ctx,
@@ -183,14 +207,14 @@ impl Snapshot {
                     config_file_parsing_diagnostics.clone(),
                     old_project,
                     file_changes.clone(),
-                    session,
+                    true,
                     &mut logger,
                 )
             }));
             return match result {
                 Ok(new_snapshot) => new_snapshot,
                 Err(r) => {
-                    session.logger.log(&logger.string());
+                    session_logger.log(&logger.string());
                     std::panic::resume_unwind(r)
                 }
             };
@@ -204,12 +228,14 @@ impl Snapshot {
             config_file_parsing_diagnostics,
             old_project,
             file_changes,
-            session,
+            false,
             &mut logger,
         )
     }
 
-    // Go: project/snapshot.go:112 cloneForProgram (the body after the deferred recover)
+    // Go: project/snapshot.go:103 cloneForProgram (the body after the deferred recover)
+    // PORT: `make_logger` is Go `store.options.LoggingEnabled && sessionLogger
+    // != nil` (the Go code makes the log tree only then).
     #[allow(clippy::too_many_arguments)]
     fn clone_for_program_body(
         &self,
@@ -220,10 +246,11 @@ impl Snapshot {
         config_file_parsing_diagnostics: Vec<Diagnostic>,
         old_project: Option<&Rc<RefCell<Project>>>,
         file_changes: FileChangeSummary,
-        session: &Session,
+        make_logger: bool,
         logger_out: &mut Option<Rc<logging::LogTree>>,
     ) -> Rc<Snapshot> {
-        if session.options.logging_enabled {
+        let store = &self.host;
+        if make_logger {
             *logger_out =
                 logging::new_log_tree(&format!("Cloning snapshot {} for program", self.id));
         }
@@ -231,20 +258,18 @@ impl Snapshot {
 
         let start = Instant::now();
         let fs = new_snapshot_fs_builder(
-            session.fs.fs.clone(),
+            store.fs.clone(),
             self.fs.overlays.clone(),
             self.fs.overlays.clone(),
             self.fs.disk_files.clone(),
             self.fs.disk_directories.clone(),
             self.fs.node_modules_realpath_aliases.clone(),
-            session.options.position_encoding.clone(),
-            self.to_path.clone(),
+            store.options.position_encoding.clone(),
+            store.to_path.clone(),
         );
         let file_changes = self.process_file_changes(&fs, file_changes, &logger, None);
 
-        // Go: session.snapshotID.Add(1)
-        let new_snapshot_id = session.snapshot_id.get() + 1;
-        session.snapshot_id.set(new_snapshot_id);
+        let new_snapshot_id = store.next_snapshot_id();
         let project_collection_builder = new_project_collection_builder(
             ctx,
             new_snapshot_id,
@@ -255,13 +280,13 @@ impl Snapshot {
             compiler_options.clone(),
             self.inferred_project_content_mappers.clone(),
             self.inferred_project_content_mapper_extensions.clone(),
-            self.session_options.clone(),
+            store.options.clone(),
             &self.config_file_registry.custom_config_file_name,
-            session.parse_cache.clone(),
-            session.content_mapped_parse_cache.clone(),
-            session.extended_config_cache.clone(),
-            session.content_mapper_host.clone(),
-            session.client.clone(),
+            store.parse_cache.clone(),
+            store.content_mapped_parse_cache.clone(),
+            store.extended_config_cache.clone(),
+            store.content_mapper_host.clone(),
+            None,
         );
 
         project_collection_builder.seed_inferred_project_for_program(old_project, logger.clone());
@@ -309,7 +334,7 @@ impl Snapshot {
             removed_files += 1;
             true
         });
-        if session.options.logging_enabled {
+        if logger.is_some() {
             logger.logf(&format!(
                 "Removed {} cached file(s) in {:?}",
                 removed_files,
@@ -318,16 +343,14 @@ impl Snapshot {
         }
 
         let (snapshot_fs, _) = fs.finalize();
-        let mut new_snapshot = new_snapshot(
+        let mut new_snapshot = store.new_snapshot(
             new_snapshot_id,
             snapshot_fs.clone(),
-            self.session_options.clone(),
             new_config_file_registry.clone(),
             compiler_options,
             self.user_preferences.clone(),
             None,
             None,
-            self.to_path.clone(),
         );
         {
             let s = Rc::get_mut(&mut new_snapshot).expect("new snapshot is not shared yet");
@@ -343,7 +366,7 @@ impl Snapshot {
         for project in new_snapshot.project_collection.projects() {
             let project = project.borrow();
             if let Some(program) = &project.program {
-                session.program_counter.ref_(program);
+                store.program_counter.ref_(program);
                 if project.program_last_update == new_snapshot_id {
                     project.host.as_ref().expect(NIL_DEREF).freeze(
                         snapshot_fs.clone(),
@@ -359,9 +382,9 @@ impl Snapshot {
             if let Some(command_line) = &config.command_line {
                 if let Some(config_file) = &command_line.config_file {
                     for file in &config_file.extended_source_files {
-                        session
+                        store
                             .extended_config_cache
-                            .add_owner(&(new_snapshot.to_path)(file), new_snapshot.id);
+                            .add_owner(&(store.to_path)(file), new_snapshot.id);
                     }
                 }
             }
@@ -376,6 +399,60 @@ impl Snapshot {
             ));
         }
         new_snapshot
+    }
+
+    // Go: project/snapshot.go:238 cloneWithTemporaryFile (ts#64163)
+    // PORT: moved here from Go `Session.APIUpdateTemporary`.
+    pub fn clone_with_temporary_file(
+        &self,
+        ctx: &Context,
+        uri: &lsproto::DocumentUri,
+        new_text: String,
+    ) -> Result<Rc<Snapshot>, GoError> {
+        let path = uri.path(self.use_case_sensitive_file_names());
+
+        let mut overlays = self.fs.overlays.clone();
+        let mut version: i32 = 0;
+        let mut file_changes = FileChangeSummary::default();
+        let existing = overlays.get(&path).cloned();
+        let script_kind;
+        if let Some(existing) = existing {
+            version = existing.version() + 1;
+            script_kind = existing.kind();
+            file_changes.changed.insert(uri.clone());
+        } else {
+            script_kind = get_script_kind_from_file_name(&uri.file_name());
+            if script_kind == ScriptKind::UNKNOWN {
+                return Err(gostd::errors::errorf(
+                    format!("unsupported file extension: {}", uri.file_name()),
+                    vec![],
+                ));
+            }
+            file_changes.opened = uri.clone();
+        }
+        overlays.insert(
+            path,
+            Rc::new(new_overlay(
+                &uri.file_name(),
+                new_text,
+                version,
+                script_kind,
+            )),
+        );
+
+        Ok(self.clone_(
+            ctx,
+            SnapshotChange {
+                file_changes,
+                resource_request: ResourceRequest {
+                    documents: vec![uri.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &overlays,
+            None,
+        ))
     }
 
     // Go: project/snapshot.go:249 processFileChanges (ts#63950)
@@ -456,7 +533,7 @@ impl Snapshot {
         uri: &lsproto::DocumentUri,
     ) -> Vec<Rc<dyn ls::Project>> {
         let file_name = uri.file_name();
-        let path = (self.to_path)(&file_name);
+        let path = (self.host.to_path)(&file_name);
         // TODO!! sheetal may be change this to handle symlinks!!
         self.project_collection.get_projects_containing_file(&path)
     }
@@ -508,6 +585,11 @@ impl Snapshot {
     // Go: project/snapshot.go:127 ID
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    // Go: project/snapshot.go:367 toPath (ts#64163)
+    pub fn to_path(&self, file_name: &str) -> tspath::Path {
+        (self.host.to_path)(file_name)
     }
 
     // Go: project/snapshot.go:131 UseCaseSensitiveFileNames
@@ -708,6 +790,8 @@ pub struct SnapshotChange {
     // ataChanges contains ATA-related changes to apply to projects in the new snapshot.
     pub ata_changes: FxHashMap<tspath::Path, Rc<ATAStateChange>>,
     pub api_request: Option<APISnapshotRequest>,
+    // ts#64163. PORT: Go nil interface is `None`.
+    pub client: Option<Rc<dyn Client>>,
     // cleanDiskCache triggers cleaning of cached disk files not referenced by any open project.
     pub clean_disk_cache: bool,
 }
@@ -740,7 +824,7 @@ fn fmt_uris(uris: &[lsproto::DocumentUri]) -> String {
 }
 
 impl Snapshot {
-    // Go: project/snapshot.go:233 Clone
+    // Go: project/snapshot.go:477 Clone
     // PORT: Go `Clone` is `clone_` (Rust `Clone::clone` copies a value).
     // The deferred `recover()` is `catch_unwind` around the body
     // (`clone_body`); the panic is logged and raised again, as in Go.
@@ -749,41 +833,46 @@ impl Snapshot {
         ctx: &Context,
         change: SnapshotChange,
         overlays: &IndexMap<tspath::Path, Rc<Overlay>>,
-        session: &Session,
+        session_logger: SessionLogger<'_>,
     ) -> Rc<Snapshot> {
+        let store = &self.host;
         let mut logger: Option<Rc<logging::LogTree>> = None;
 
         // Print in-progress logs immediately if cloning fails
-        if session.options.logging_enabled {
+        if store.options.logging_enabled
+            && let Some(session_logger) = session_logger
+        {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                self.clone_body(ctx, change, overlays, session, &mut logger)
+                self.clone_body(ctx, change, overlays, true, &mut logger)
             }));
             return match result {
                 Ok(new_snapshot) => new_snapshot,
                 Err(r) => {
-                    session.logger.log(&logger.string());
+                    session_logger.log(&logger.string());
                     std::panic::resume_unwind(r)
                 }
             };
         }
 
-        self.clone_body(ctx, change, overlays, session, &mut logger)
+        self.clone_body(ctx, change, overlays, false, &mut logger)
     }
 
-    // Go: project/snapshot.go:233 Clone (the body after the deferred recover)
+    // Go: project/snapshot.go:477 Clone (the body after the deferred recover)
     // PORT: split out of `clone_` so the recover can wrap it; `logger` is
-    // the Go local that the deferred function reads.
+    // the Go local that the deferred function reads. `make_logger` is Go
+    // `store.options.LoggingEnabled && sessionLogger != nil`.
     fn clone_body(
         &self,
         ctx: &Context,
         change: SnapshotChange,
         overlays: &IndexMap<tspath::Path, Rc<Overlay>>,
-        session: &Session,
+        make_logger: bool,
         logger_out: &mut Option<Rc<logging::LogTree>>,
     ) -> Rc<Snapshot> {
+        let store = &self.host;
         let mut change = change;
 
-        if session.options.logging_enabled {
+        if make_logger {
             *logger_out = logging::new_log_tree(&format!("Cloning snapshot {}", self.id));
             let logger = logger_out.clone();
             let get_details = || -> String {
@@ -874,14 +963,14 @@ impl Snapshot {
             inferred_content_mapper_extensions = contributions.extensions.clone();
         }
         let fs = new_snapshot_fs_builder(
-            session.fs.fs.clone(),
+            store.fs.clone(),
             self.fs.overlays.clone(),
             overlays.clone(),
             self.fs.disk_files.clone(),
             self.fs.disk_directories.clone(),
             self.fs.node_modules_realpath_aliases.clone(),
-            session.options.position_encoding.clone(),
-            self.to_path.clone(),
+            store.options.position_encoding.clone(),
+            store.to_path.clone(),
         );
         change.file_changes = self.process_file_changes(
             &fs,
@@ -903,9 +992,7 @@ impl Snapshot {
             custom_config_file_name = new_config.custom_config_file_name.clone();
         }
 
-        // Go: session.snapshotID.Add(1)
-        let new_snapshot_id = session.snapshot_id.get() + 1;
-        session.snapshot_id.set(new_snapshot_id);
+        let new_snapshot_id = store.next_snapshot_id();
         let project_collection_builder = new_project_collection_builder(
             ctx,
             new_snapshot_id,
@@ -916,13 +1003,13 @@ impl Snapshot {
             compiler_options_for_inferred_projects.clone(),
             inferred_content_mappers.clone(),
             inferred_content_mapper_extensions.clone(),
-            self.session_options.clone(),
+            store.options.clone(),
             &custom_config_file_name,
-            session.parse_cache.clone(),
-            session.content_mapped_parse_cache.clone(),
-            session.extended_config_cache.clone(),
-            session.content_mapper_host.clone(),
-            session.client.clone(),
+            store.parse_cache.clone(),
+            store.content_mapped_parse_cache.clone(),
+            store.extended_config_cache.clone(),
+            store.content_mapper_host.clone(),
+            change.client.clone(),
         );
 
         if !change.ata_changes.is_empty() {
@@ -1049,7 +1136,7 @@ impl Snapshot {
                     removed_files += 1;
                     true
                 });
-                if session.options.logging_enabled {
+                if logger.is_some() {
                     logger.logf(&format!(
                         "Removed {} cached file(s) in {:?}",
                         removed_files,
@@ -1066,11 +1153,11 @@ impl Snapshot {
 
         let auto_import_host = new_auto_import_registry_clone_host(
             project_collection.clone(),
-            session.parse_cache.clone(),
+            store.parse_cache.clone(),
             fs.clone(),
-            &self.session_options.current_directory,
-            self.to_path.clone(),
-            session.auto_import_parse_keys.clone(),
+            &store.options.current_directory,
+            store.to_path.clone(),
+            store.auto_import_parse_keys.clone(),
         );
         let mut open_files: FxHashMap<tspath::Path, String> =
             FxHashMap::with_capacity_and_hasher(overlays.len(), Default::default());
@@ -1087,7 +1174,7 @@ impl Snapshot {
         let mut old_auto_imports = self.auto_imports.clone();
         if old_auto_imports.is_none() {
             old_auto_imports = Some(Rc::new(autoimport::new_registry(
-                self.to_path.clone(),
+                store.to_path.clone(),
                 self.user_preferences.clone(),
             )));
         }
@@ -1122,16 +1209,14 @@ impl Snapshot {
         let (snapshot_fs, _) = fs.finalize();
         // PORT: Go passes nil for the config file registry and assigns it
         // right after; the port passes the final registry here.
-        let mut new_snapshot = new_snapshot(
+        let mut new_snapshot = store.new_snapshot(
             new_snapshot_id,
             snapshot_fs.clone(),
-            self.session_options.clone(),
             config_file_registry.clone(),
             compiler_options_for_inferred_projects,
             config,
             auto_imports,
             auto_imports_watch,
-            self.to_path.clone(),
         );
         {
             // PORT: Go writes the new snapshot's fields before anyone else
@@ -1150,7 +1235,7 @@ impl Snapshot {
             let project = project.borrow();
             // PORT: Go `project.Program` (the field).
             if let Some(program) = &project.program {
-                session.program_counter.ref_(program);
+                store.program_counter.ref_(program);
                 if project.program_last_update == new_snapshot_id {
                     // If the program was updated during this clone, the project and its host are new
                     // and still retain references to the builder. Freezing clears the builder reference
@@ -1178,9 +1263,9 @@ impl Snapshot {
             if let Some(command_line) = &config.command_line {
                 if let Some(config_file) = &command_line.config_file {
                     for file in &config_file.extended_source_files {
-                        session
+                        store
                             .extended_config_cache
-                            .add_owner(&(new_snapshot.to_path)(file), new_snapshot.id);
+                            .add_owner(&(store.to_path)(file), new_snapshot.id);
                     }
                 }
             }
@@ -1200,8 +1285,7 @@ impl Snapshot {
     // Go: project/snapshot.go:502 ref
     // ref increments the snapshot's reference count, preventing it from being
     // disposed until a corresponding Deref is called. The snapshot must still
-    // be alive (refCount > 0) when ref is called. Only the project Session
-    // should call ref(), and it should be done while holding session.snapshotMu.
+    // be alive (refCount > 0) when ref is called.
     pub fn ref_(&self) {
         // Go: s.refCount.Add(1)
         let rc = self.ref_count.get() + 1;
@@ -1228,10 +1312,10 @@ impl Snapshot {
         true
     }
 
-    // Go: project/snapshot.go:525 Deref
+    // Go: project/snapshot.go:782 Deref
     // Deref decrements the snapshot's reference count. When the count reaches
-    // zero, the snapshot is disposed and its resources are released.
-    pub fn deref(&self, session: &Session) {
+    // zero, the snapshot is disposed and its store-owned resources are released.
+    pub fn deref(&self) {
         // Go: s.refCount.Add(-1)
         let rc = self.ref_count.get() - 1;
         self.ref_count.set(rc);
@@ -1242,17 +1326,18 @@ impl Snapshot {
             );
         }
         if rc == 0 {
-            self.dispose(session);
+            self.dispose();
         }
     }
 
-    // Go: project/snapshot.go:535 dispose
-    pub fn dispose(&self, session: &Session) {
+    // Go: project/snapshot.go:792 dispose
+    pub fn dispose(&self) {
+        let store = &self.host;
         for project in self.project_collection.projects() {
             let project = project.borrow();
             // PORT: Go `project.Program` (the field).
             if let Some(program) = &project.program {
-                if session.program_counter.deref(program) {
+                if store.program_counter.deref(program) {
                     if let Some(content_mapper_project) = program.content_mapper_project() {
                         let _ = content_mapper_project.close();
                     }
@@ -1269,12 +1354,12 @@ impl Snapshot {
                         {
                             if !file.content_mapper().is_empty() {
                                 deref_content_mapped_file(
-                                    &session.content_mapped_parse_cache,
+                                    &store.content_mapped_parse_cache,
                                     &content_mapped_parse_cache_key_for_file(file),
                                 );
                             } else {
                                 deref_program_file(
-                                    &session.parse_cache,
+                                    &store.parse_cache,
                                     file.parse_options(),
                                     file.text,
                                     file.script_kind,
@@ -1286,12 +1371,12 @@ impl Snapshot {
                         if !file.is_content_mapper_failure_stub {
                             if !file.content_mapper.is_empty() {
                                 deref_content_mapped_file(
-                                    &session.content_mapped_parse_cache,
+                                    &store.content_mapped_parse_cache,
                                     &content_mapped_parse_cache_key_for_duplicate(file),
                                 );
                             } else {
                                 deref_program_file(
-                                    &session.parse_cache,
+                                    &store.parse_cache,
                                     &file.parse_options,
                                     file.text,
                                     file.script_kind,
@@ -1317,9 +1402,9 @@ impl Snapshot {
             let config = config.borrow();
             if let Some(command_line) = &config.command_line {
                 for file in command_line.extended_source_files() {
-                    session
+                    store
                         .extended_config_cache
-                        .release(&(session.to_path)(file), self.id);
+                        .release(&(store.to_path)(file), self.id);
                 }
             }
         }

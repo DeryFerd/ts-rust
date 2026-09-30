@@ -122,22 +122,23 @@ pub struct SessionInit {
 // `scheduledSnapshotUpdateMu`, `userConfigRWMu`, `pendingFileChangesMu`,
 // `pendingATAChangesMu`, `diagnosticsRefreshMu`, `warmAutoImportMu`,
 // `idleCacheCleanMu`) are dropped. Go `atomic.*` fields are `Cell`.
+// PORT: Go embeds `*SnapshotHost` (ts#64163); here it is the field
+// `snapshot_host`, and `Session` derefs to it, so the host's fields and
+// methods are promoted as in Go. A `Session` method with the same name
+// (`fs`, `get_current_directory`, `close`) wins, as in Go.
 pub struct Session {
-    pub background_ctx: Context,
+    pub snapshot_host: Rc<SnapshotHost>,
     pub options: Rc<SessionOptions>,
-    pub start_time: Instant,
+    pub logger: Option<Rc<dyn logging::Logger>>,
+    pub background_ctx: Context,
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     pub client: Option<Rc<dyn Client>>,
-    pub logger: Option<Rc<dyn logging::Logger>>,
+    pub start_time: Instant,
     pub npm_executor: Option<Rc<dyn ata::NpmExecutor>>,
-    // contentMapperHost drives configured content mappers for all projects in the session. It is nil unless
-    // the workspace is trusted (RunExternalCode) and a spawner is available. It is shared so
-    // projects that use the same mapper share a single process, and is closed when the session ends.
-    pub content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
+    pub fs: Rc<OverlayFS>,
     // contentMapperTimings is the cumulative host snapshot at the most recent session snapshot adoption.
     // PORT: `contentMapperTimingsMu` is dropped (one thread).
     pub content_mapper_timings: RefCell<contentmapper::Timings>,
-    pub fs: Rc<OverlayFS>,
 
     // registeredContentMapperSnapshotID is the ID of the newest snapshot whose registration has been
     // applied. Registration runs from background tasks that may finish out of order, so
@@ -146,22 +147,6 @@ pub struct Session {
     // PORT: `contentMapperRegistrationMu` is dropped (one thread).
     pub registered_content_mapper_extensions: RefCell<Vec<String>>,
     pub registered_content_mapper_snapshot_id: Cell<u64>,
-
-    // parseCache is the ref-counted cache of source files used when
-    // creating programs during snapshot cloning.
-    pub parse_cache: Rc<ParseCache>,
-    pub content_mapped_parse_cache: Rc<ContentMappedParseCache>,
-    // PORT: the parse cache references that auto-import registry clones
-    // keep after the clone, one per path (see
-    // `AutoImportRegistryCloneHost::dispose`). No Go counterpart.
-    pub auto_import_parse_keys: Rc<AutoImportParseKeys>,
-    // extendedConfigCache is the ref-counted cache of tsconfig ASTs
-    // that are used in the "extends" of another tsconfig.
-    pub extended_config_cache: Rc<ExtendedConfigCache>,
-    // programCounter counts how many snapshots reference a program.
-    // When a program is no longer referenced, its source files are
-    // released from the parseCache.
-    pub program_counter: Rc<ProgramCounter>,
 
     // read-only after initialization
     pub initial_user_preferences: RefCell<lsutil::UserPreferences>,
@@ -173,11 +158,6 @@ pub struct Session {
     // so the pair is a reference cycle that lives as long as the process.
     pub typings_installer: RefCell<Option<Rc<ata::TypingsInstaller>>>,
     pub background_queue: Rc<background::Queue>,
-
-    // snapshotID is the counter for snapshot IDs. It does not necessarily
-    // equal the `snapshot.ID`. It is stored on Session instead of globally
-    // so IDs are predictable in tests.
-    pub snapshot_id: Cell<u64>,
 
     // snapshot is the current immutable state of all projects.
     pub snapshot: RefCell<Rc<Snapshot>>,
@@ -264,106 +244,49 @@ pub fn new_content_mapper_host(init: &SessionInit) -> Option<Rc<dyn contentmappe
     ))
 }
 
-// Go: project/session.go:180 NewSession
+// Go: project/session.go:210 NewSession
 pub fn new_session(init: &SessionInit) -> Rc<Session> {
     // Not in Go: a process with a session is a language server or API
     // process, which frees the file versions it publishes again
     // (`ast::free_file_versions`).
     crate::ast::set_editor_process();
-    let current_directory = init.options.current_directory.clone();
-    let use_case_sensitive_file_names = init.fs.use_case_sensitive_file_names();
-    let to_path: Rc<dyn Fn(&str) -> tspath::Path> = Rc::new(move |file_name: &str| {
-        tspath::to_path(file_name, &current_directory, use_case_sensitive_file_names)
-    });
-    let overlay_fs = new_overlay_fs(
-        init.fs.clone(),
-        IndexMap::default(),
-        init.options.position_encoding.clone(),
-        to_path.clone(),
-    );
-    let mut parse_cache = init.parse_cache.clone();
-    if parse_cache.is_none() {
-        parse_cache = Some(new_parse_cache(RefCountCacheOptions::default()));
-    }
-    let mut content_mapped_parse_cache = init.content_mapped_parse_cache.clone();
-    if content_mapped_parse_cache.is_none() {
-        content_mapped_parse_cache = Some(new_content_mapped_parse_cache(
-            RefCountCacheOptions::default(),
-        ));
-    }
-    let extended_config_cache = new_extended_config_cache();
-
+    let snapshot_host = new_snapshot_host(init);
     let mut session_logger = init.logger.clone();
     if session_logger.is_none() {
         session_logger = logging::new_nop_logger();
     }
     let session = Rc::new(Session {
-        background_ctx: init.background_ctx.clone(),
+        snapshot_host: snapshot_host.clone(),
         options: init.options.clone(),
-        to_path: to_path.clone(),
-        client: init.client.clone(),
         logger: session_logger,
+        background_ctx: init.background_ctx.clone(),
+        to_path: snapshot_host.to_path.clone(),
+        client: init.client.clone(),
         npm_executor: init.npm_executor.clone(),
-        content_mapper_host: new_content_mapper_host(init),
+        fs: new_overlay_fs(
+            snapshot_host.fs.clone(),
+            IndexMap::default(),
+            init.options.position_encoding.clone(),
+            snapshot_host.to_path.clone(),
+        ),
         content_mapper_timings: RefCell::new(contentmapper::Timings::default()),
-        fs: overlay_fs,
         registered_content_mapper_extensions: RefCell::new(Vec::new()),
         registered_content_mapper_snapshot_id: Cell::new(0),
-        parse_cache: parse_cache.expect(NIL_DEREF),
-        content_mapped_parse_cache: content_mapped_parse_cache.expect(NIL_DEREF),
-        auto_import_parse_keys: Rc::new(RefCell::new(FxHashMap::default())),
-        extended_config_cache,
-        program_counter: Rc::new(ProgramCounter::default()),
         background_queue: background::new_queue(),
         start_time: Instant::now(),
-        snapshot: RefCell::new(new_snapshot(
-            0_u64,
-            Rc::new(SnapshotFS {
-                to_path: to_path.clone(),
-                fs: init.fs.clone(),
-                overlays: IndexMap::default(),
-                overlay_directories: FxHashMap::default(),
-                disk_files: Rc::new(FxHashMap::default()),
-                disk_directories: Rc::new(FxHashMap::default()),
-                read_files: RefCell::new(FxHashMap::default()),
-                node_modules_realpath_aliases: Rc::new(FxHashMap::default()),
-            }),
-            init.options.clone(),
-            Rc::new(ConfigFileRegistry::default()),
-            None,
-            lsutil::new_default_user_preferences(),
-            None,
-            Some(new_watched_files::<FxHashMap<tspath::Path, String>>(
-                "auto-import",
-                lsproto::WatchKind(
-                    lsproto::WatchKind::CREATE.0
-                        | lsproto::WatchKind::CHANGE.0
-                        | lsproto::WatchKind::DELETE.0,
-                ),
+        snapshot: RefCell::new(
+            snapshot_host.new_root_snapshot(
+                0,
                 lsproto::get_client_capabilities(&init.background_ctx)
                     .workspace
                     .did_change_watched_files
                     .relative_pattern_support,
-                Rc::new(|node_modules_dirs: &FxHashMap<tspath::Path, String>| {
-                    let mut patterns: Vec<String> = Vec::with_capacity(node_modules_dirs.len());
-                    // PORT: Go map order is random; the patterns are sorted below.
-                    for dir in node_modules_dirs.values() {
-                        patterns.push(get_recursive_glob_pattern(dir));
-                    }
-                    patterns.sort();
-                    PatternsAndIgnored {
-                        patterns_inside_workspace: patterns,
-                        ..Default::default()
-                    }
-                }),
-            )),
-            to_path,
-        )),
+            ),
+        ),
         initial_user_preferences: RefCell::new(lsutil::new_default_user_preferences()),
         workspace_user_preferences: RefCell::new(lsutil::new_default_user_preferences()),
         compiler_options_for_inferred_projects: RefCell::new(None),
         typings_installer: RefCell::new(None),
-        snapshot_id: Cell::new(0),
         scheduled_snapshot_update_cancel: RefCell::new(None),
         scheduled_snapshot_update_generation: Cell::new(0),
         pending_user_config_changes: Cell::new(false),
@@ -392,11 +315,20 @@ pub fn new_session(init: &SessionInit) -> Rc<Session> {
         );
         *session.typings_installer.borrow_mut() = Some(typings_installer);
     }
-    if let Some(content_mapper_host) = &session.content_mapper_host {
+    if let Some(content_mapper_host) = &snapshot_host.content_mapper_host {
         *session.content_mapper_timings.borrow_mut() = content_mapper_host.timings();
     }
 
     session
+}
+
+// PORT: Go `Session` embeds `*SnapshotHost` (ts#64163).
+impl std::ops::Deref for Session {
+    type Target = SnapshotHost;
+
+    fn deref(&self) -> &SnapshotHost {
+        &self.snapshot_host
+    }
 }
 
 // PORT: Go `FS()` and `GetCurrentDirectory()` implement
@@ -445,13 +377,13 @@ impl Session {
         self.workspace_user_preferences.borrow().clone()
     }
 
-    // Go: project/session.go:330 backgroundContext
+    // Go: project/session.go:267 backgroundContext
     fn background_context(&self) -> Context {
         self.with_current_locale(&self.background_ctx)
     }
 
-    // Go: project/session.go:334 withCurrentLocale
-    fn with_current_locale(&self, ctx: &Context) -> Context {
+    // Go: project/session.go:271 WithCurrentLocale (exported by ts#64163)
+    pub fn with_current_locale(&self, ctx: &Context) -> Context {
         let Some(client) = &self.client else {
             return ctx.clone();
         };
@@ -1763,7 +1695,7 @@ impl Session {
         let Some(project) = snapshot.get_default_project(uri) else {
             // tsgo#4712
             if caller_ref {
-                Snapshot::deref(&snapshot, self);
+                snapshot.deref();
             }
             if let Some(file) = snapshot.get_file(&uri.file_name())
                 && file.kind() == ScriptKind::UNKNOWN
@@ -1948,8 +1880,8 @@ impl Session {
             true, /*callerRef*/
         );
         fn_(&snapshot);
-        // Go: defer snapshot.Deref(s)
-        Snapshot::deref(&snapshot, self);
+        // Go: defer snapshot.Deref()
+        snapshot.deref();
     }
 
     // Go: project/session.go:1279 WithSnapshotForDocument
@@ -1968,8 +1900,8 @@ impl Session {
             true, /*callerRef*/
         );
         fn_(&snapshot);
-        // Go: defer snapshot.Deref(s)
-        Snapshot::deref(&snapshot, self);
+        // Go: defer snapshot.Deref()
+        snapshot.deref();
     }
 
     // Go: project/session.go:1083 GetCurrentLanguageServiceWithAutoImports
@@ -2036,24 +1968,23 @@ impl Session {
         let async_work = match async_work {
             Ok(Some(async_work)) => async_work,
             Ok(None) => {
-                Snapshot::deref(&snapshot, self);
+                snapshot.deref();
                 return Ok(None);
             }
             Err(err) => {
-                Snapshot::deref(&snapshot, self);
+                snapshot.deref();
                 return Err(err);
             }
         };
-        let s = self.clone();
         Ok(Some(Box::new(move || {
             let result = async_work();
-            // Go: defer snapshot.Deref(s)
-            Snapshot::deref(&snapshot, &s);
+            // Go: defer snapshot.Deref()
+            snapshot.deref();
             result
         })))
     }
 
-    // Go: project/session.go:1344 GetLanguageServiceWithAutoImports
+    // Go: project/session.go:1281 GetLanguageServiceWithAutoImports
     // GetLanguageServiceWithAutoImports clones the given snapshot with auto-import
     // preparation for the given URI, without flushing pending file changes.
     // The cloned snapshot will be adopted as the session's current snapshot in the background
@@ -2065,17 +1996,17 @@ impl Session {
         uri: &lsproto::DocumentUri,
     ) -> Result<ls::LanguageService, GoError> {
         let new_snapshot =
-            self.clone_with_auto_imports(ctx, base_snapshot, uri, false /*callerRef*/);
+            self.clone_snapshot_with_auto_imports(ctx, base_snapshot, uri, Some(&self.logger));
         let Some(project) = new_snapshot.get_default_project(uri) else {
             // Clone's initial ref (1) is released since we won't use this snapshot.
-            Snapshot::deref(&new_snapshot, self);
+            new_snapshot.deref();
             return Err(gostd::errors::errorf(
                 format!("no project found for URI {}", uri),
                 vec![],
             ));
         };
 
-        self.adopt_snapshot_change_in_background(base_snapshot, &new_snapshot);
+        self.try_adopt_snapshot_change_in_background(base_snapshot, &new_snapshot);
 
         let project = project.borrow();
         Ok(ls::new_language_service(
@@ -2086,51 +2017,9 @@ impl Session {
         ))
     }
 
-    // Go: project/session.go:1363 GetSnapshotWithAutoImports
-    // GetSnapshotWithAutoImports clones the given snapshot with auto-import
-    // preparation for the given URI, without flushing pending file changes.
-    // The returned snapshot is ref'd for the caller, which must call Deref when done.
-    // The cloned snapshot will also be adopted as the session's current snapshot in
-    // the background if other changes haven't been adopted in the meantime.
-    pub fn get_snapshot_with_auto_imports(
-        self: &Rc<Self>,
-        ctx: &Context,
-        base_snapshot: &Rc<Snapshot>,
-        uri: &lsproto::DocumentUri,
-    ) -> Rc<Snapshot> {
-        let new_snapshot =
-            self.clone_with_auto_imports(ctx, base_snapshot, uri, true /*callerRef*/);
-        self.adopt_snapshot_change_in_background(base_snapshot, &new_snapshot);
-        new_snapshot
-    }
-
-    // Go: project/session.go:1369 cloneWithAutoImports
-    fn clone_with_auto_imports(
-        self: &Rc<Self>,
-        ctx: &Context,
-        base_snapshot: &Rc<Snapshot>,
-        uri: &lsproto::DocumentUri,
-        caller_ref: bool,
-    ) -> Rc<Snapshot> {
-        let change = SnapshotChange {
-            reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
-            resource_request: ResourceRequest {
-                documents: vec![uri.clone()],
-                auto_imports: uri.clone(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let new_snapshot =
-            Snapshot::clone_(base_snapshot, ctx, change, &base_snapshot.fs.overlays, self);
-        if caller_ref {
-            new_snapshot.ref_();
-        }
-        new_snapshot
-    }
-
-    // Go: project/session.go:1384 adoptSnapshotChangeInBackground
-    fn adopt_snapshot_change_in_background(
+    // Go: project/session.go:1295 tryAdoptSnapshotChangeInBackground
+    // PORT: renamed from `adoptSnapshotChangeInBackground` by ts#64163.
+    pub fn try_adopt_snapshot_change_in_background(
         self: &Rc<Self>,
         base_snapshot: &Rc<Snapshot>,
         new_snapshot: &Rc<Snapshot>,
@@ -2162,14 +2051,16 @@ impl Session {
             // Session hasn't moved on; adopt the new snapshot. The clone's initial
             // ref is transferred to become the session's ref for its current snapshot.
             *self.snapshot.borrow_mut() = new_snapshot.clone();
-            Snapshot::deref(&old_snapshot, self);
+            old_snapshot.deref();
             let content_mapper_timings = self.take_content_mapper_timing_delta();
             if self.options.logging_enabled {
                 self.logger.logf(&format!(
                     "Adopted snapshot {} (parent {}) as current session snapshot (replacing {})",
                     new_snapshot.id, new_snapshot.parent_id, old_snapshot.id
                 ));
-                self.logger.log(&new_snapshot.builder_logs.string());
+                if new_snapshot.builder_logs.is_some() {
+                    self.logger.log(&new_snapshot.builder_logs.string());
+                }
                 self.log_content_mapper_timings(&content_mapper_timings);
             }
         } else {
@@ -2181,20 +2072,22 @@ impl Session {
                     "Discarded snapshot {} (parent {}); session has moved on to snapshot {}",
                     new_snapshot.id, new_snapshot.parent_id, old_snapshot.id
                 ));
-                let logs = new_snapshot.builder_logs.string();
-                if !logs.is_empty() {
-                    self.logger.logf(&format!(
-                        "--- Discarded snapshot {} builder logs (NOT adopted) ---",
-                        new_snapshot.id
-                    ));
-                    self.logger.log(&logs);
-                    self.logger.logf(&format!(
-                        "--- End discarded snapshot {} builder logs ---",
-                        new_snapshot.id
-                    ));
+                if new_snapshot.builder_logs.is_some() {
+                    let logs = new_snapshot.builder_logs.string();
+                    if !logs.is_empty() {
+                        self.logger.logf(&format!(
+                            "--- Discarded snapshot {} builder logs (NOT adopted) ---",
+                            new_snapshot.id
+                        ));
+                        self.logger.log(&logs);
+                        self.logger.logf(&format!(
+                            "--- End discarded snapshot {} builder logs ---",
+                            new_snapshot.id
+                        ));
+                    }
                 }
             }
-            Snapshot::deref(new_snapshot, self);
+            new_snapshot.deref();
         }
     }
 
@@ -2214,7 +2107,7 @@ impl Session {
     // updateSnapshotRef is like UpdateSnapshot but returns the created snapshot
     // with an extra reference for the caller. The ref is taken atomically with
     // the snapshot assignment under snapshotMu, so the snapshot is guaranteed
-    // to be alive when returned. The caller must call snapshot.Deref(s) when done.
+    // to be alive when returned. The caller must call snapshot.Deref() when done.
     pub fn update_snapshot_ref(
         self: &Rc<Self>,
         ctx: &Context,
@@ -2235,7 +2128,16 @@ impl Session {
         caller_ref: bool,
     ) -> Rc<Snapshot> {
         let old_snapshot = self.snapshot.borrow().clone();
-        let new_snapshot = Snapshot::clone_(&old_snapshot, ctx, change.clone(), &overlays, self);
+        // ts#64163
+        let locale_ctx;
+        let mut ctx = ctx;
+        if !locale::has_locale(ctx) {
+            locale_ctx = self.with_current_locale(ctx);
+            ctx = &locale_ctx;
+        }
+        let mut change = change;
+        change.client = self.client.clone();
+        let new_snapshot = old_snapshot.clone_(ctx, change.clone(), &overlays, Some(&self.logger));
         *self.snapshot.borrow_mut() = new_snapshot.clone();
         if caller_ref {
             new_snapshot.ref_();
@@ -2246,7 +2148,7 @@ impl Session {
             // clone ref (1) is transferred to become the session's ref for its current
             // snapshot. Other holders (e.g. active handlers) keep the old snapshot alive
             // via their own refs until they complete.
-            Snapshot::deref(&old_snapshot, self);
+            old_snapshot.deref();
             content_mapper_timings = self.take_content_mapper_timing_delta();
         }
 
@@ -2269,7 +2171,9 @@ impl Session {
                         "Adopted snapshot {} (parent {}) as current session snapshot (replacing {})",
                         new_snapshot.id, new_snapshot.parent_id, old_snapshot.id
                     ));
-                    s.logger.log(&new_snapshot.builder_logs.string());
+                    if new_snapshot.builder_logs.is_some() {
+                        s.logger.log(&new_snapshot.builder_logs.string());
+                    }
                     s.log_project_changes(old_snapshot, new_snapshot);
                     s.log_content_mapper_timings(&content_mapper_timings);
                     s.logger.log("");
@@ -2815,9 +2719,7 @@ impl Session {
         // Cancel periodic performance telemetry
         self.stop_performance_telemetry();
         self.background_queue.close();
-        if let Some(content_mapper_host) = &self.content_mapper_host {
-            let _ = content_mapper_host.close();
-        }
+        self.snapshot_host.close();
     }
 
     // Go: project/session.go:1424 flushChanges
@@ -3317,8 +3219,8 @@ impl Session {
             }
         }
 
-        // Go: defer snapshot.Deref(s); defer s.globalDiagPublishPending.Store(false)
-        Snapshot::deref(&snapshot, self);
+        // Go: defer snapshot.Deref(); defer s.globalDiagPublishPending.Store(false)
+        snapshot.deref();
         self.global_diag_publish_pending.set(false);
     }
 
@@ -3558,6 +3460,7 @@ impl Session {
 
         let warm_change = SnapshotChange {
             reason: UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS,
+            client: self.client.clone(),
             resource_request: ResourceRequest {
                 documents: vec![changed_file.clone()],
                 auto_imports: changed_file,
@@ -3577,19 +3480,18 @@ impl Session {
         );
         // PORT: the clone takes the id kept for it when the warm started.
         let next_snapshot_id = self.snapshot_id.replace(snapshot_id - 1);
-        let cloned_snapshot = Snapshot::clone_(
-            &new_snapshot,
+        let cloned_snapshot = new_snapshot.clone_(
             &build_ctx,
             warm_change,
             &new_snapshot.fs.overlays,
-            self,
+            Some(&self.logger),
         );
         self.snapshot_id.set(next_snapshot_id);
 
         // If cancelled during clone, discard the incomplete result.
         if warm_ctx.err().is_some() {
-            Snapshot::deref(&cloned_snapshot, self);
-            Snapshot::deref(&new_snapshot, self);
+            cloned_snapshot.deref();
+            new_snapshot.deref();
             cancel();
             return;
         }
@@ -3597,14 +3499,14 @@ impl Session {
         // Conditionally adopt: if the session hasn't moved past newSnapshot,
         // promote the clone so future requests benefit from the warmed cache.
         self.adopt_snapshot_change(&new_snapshot, &cloned_snapshot);
-        Snapshot::deref(&new_snapshot, self);
+        new_snapshot.deref();
         cancel();
     }
 
     /// PORT: Go's deferred `newSnapshot.Deref(s)` and `cancel()` for a
     /// pending warm that ends without its clone.
     fn end_pending_warm(&self, warm: PendingWarm) {
-        Snapshot::deref(&warm.new_snapshot, self);
+        warm.new_snapshot.deref();
         (warm.cancel)();
     }
 }

@@ -229,10 +229,8 @@ impl compiler::CompilerHost for CompilerHost {
             .borrow()
             .clone()
             .expect("invalid memory address or nil pointer dereference: compilerHost.builder");
-        let mut diagnostic_locale = locale::DEFAULT;
-        if let Some(client) = &builder.client {
-            diagnostic_locale = client.get_locale();
-        }
+        // ts#64163: the locale comes from the builder context.
+        let diagnostic_locale = locale::from_context(&builder.ctx);
         self.ensure_content_mapper_project();
         let Some(project) = self.content_mapper_project.borrow().clone() else {
             return Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone());
