@@ -10,8 +10,10 @@ use crate::frontend::prelude::*;
 use std::time::SystemTime;
 
 // Go: incremental/incremental.go:9 BuildInfoReader
+// PORT: Go `*BuildInfo` is `Rc<BuildInfo>`, so a reader that keeps the
+// build info (the `tsc -b` task) gives it without a copy.
 pub trait BuildInfoReader {
-    fn read_build_info(&self, config: &ParsedCommandLine) -> Option<BuildInfo>;
+    fn read_build_info(&self, config: &ParsedCommandLine) -> Option<Rc<BuildInfo>>;
 }
 
 // Go: incremental/incremental.go:15 buildInfoReader
@@ -22,7 +24,7 @@ pub struct BuildInfoReaderImpl {
 
 impl BuildInfoReader for BuildInfoReaderImpl {
     // Go: incremental/incremental.go:19 ReadBuildInfo
-    fn read_build_info(&self, config: &ParsedCommandLine) -> Option<BuildInfo> {
+    fn read_build_info(&self, config: &ParsedCommandLine) -> Option<Rc<BuildInfo>> {
         let build_info_file_name = config.get_build_info_file_name();
         if build_info_file_name.is_empty() {
             return None;
@@ -33,7 +35,7 @@ impl BuildInfoReader for BuildInfoReaderImpl {
         if !ok {
             return None;
         }
-        parse_build_info(&data)
+        parse_build_info(&data).map(Rc::new)
     }
 }
 

@@ -592,8 +592,17 @@ impl<'a> JsonDecoder<'a> {
                 }
                 0x00..=0x1F => return Err(JsonError::new("invalid control character in string")),
                 0x20..=0x7F => {
-                    out.push(char::from(c));
+                    // PERF: the run of plain ASCII bytes up to the next quote,
+                    // backslash, control or non-ASCII byte in one copy.
+                    let start = i;
                     i += 1;
+                    while let Some(&c) = b.get(i) {
+                        if c == b'"' || c == b'\\' || c < 0x20 || c >= 0x80 {
+                            break;
+                        }
+                        i += 1;
+                    }
+                    out.push_str(std::str::from_utf8(&b[start..i]).expect("ASCII run"));
                 }
                 _ => match decode_utf8(&b[i..]) {
                     Some((ch, n)) => {

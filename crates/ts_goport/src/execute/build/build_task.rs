@@ -2156,8 +2156,8 @@ fn task_write_file_now() -> SystemTime {
 struct TaskBuildInfo(Option<Rc<BuildInfo>>);
 
 impl BuildInfoReader for TaskBuildInfo {
-    fn read_build_info(&self, _config: &ParsedCommandLine) -> Option<BuildInfo> {
-        self.0.as_deref().cloned()
+    fn read_build_info(&self, _config: &ParsedCommandLine) -> Option<Rc<BuildInfo>> {
+        self.0.clone()
     }
 }
 

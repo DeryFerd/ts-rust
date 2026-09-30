@@ -1228,9 +1228,7 @@ impl BuildTaskOrchestrator for Orchestrator {
             *self.status_prefetch.borrow_mut() = status_prefetch.map(|status| (name, status));
             return build_info.map(Rc::new);
         }
-        new_build_info_reader(self.host.clone() as Rc<dyn CompilerHost>)
-            .read_build_info(config)
-            .map(Rc::new)
+        new_build_info_reader(self.host.clone() as Rc<dyn CompilerHost>).read_build_info(config)
     }
 
     fn take_status_prefetch(&self, build_info_file_name: &str) -> Option<StatusPrefetch> {
