@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Writes a masked API answer set for oracle-compare.py --answers (bump C reviewer ruling 1 item 3, request 2 item 1).
+"""Writes a masked API answer set for oracle-compare.py --answers (bump C reviewer ruling 1 item 3, ruling 2 item 1).
 
-usage: masked-answers.py --keys TSV --mask ids|strict --pin PIN --golden DIR... --out FILE.json.gz [--note TEXT]
+usage: masked-answers.py --keys TSV --pin PIN --golden DIR... --out FILE.json.gz [--note TEXT]
 
 --keys: lines "api TAB <battery>/<trace>#<event> ..." (for example upstream/bumpC/rebaseN/answers-excluded.tsv; #
 comments). --golden: the Go golden roots of the pin's oracle, each .../golden/<oracle sha256 prefix> (the pin's
 golden and every re-record). For each key, every golden root gives the Go answer of that event, normalized as the
 tools do (apply_multisets with the key's multiset patterns from the flaky file of the first golden root), then
-masked with oracle-compare.py mask_answer() and the API tool loaded at the pin. All runs must give one masked
-answer, or the key fails and nothing is written. The entry is {method, multiset, mask, answers: [{answer, sha256,
-sources}]} with every Go golden as a source (relative to the repo root, sorted). The header is goport-oracle-answers/1
-with kind api, pin, oracleSha256 (every golden's oracleSha), goldenSha12, mask, maskTool (oracle-compare.py
-mask_tool()) and note. Prints per key the method, the run count and the masked sha256, then the file sha256.
+masked with oracle-compare.py mask_type_ids() (the "type-ids" mask) and the API tool loaded at the pin. All runs
+must give one masked answer, or the key fails and nothing is written. The entry is {method, multiset, mask,
+answers: [{answer, sha256, sources}]} with every Go golden as a source (relative to the repo root, sorted). The
+header is goport-oracle-answers/1 with kind api, pin, oracleSha256 (every golden's oracleSha), goldenSha12, mask,
+maskTool (oracle-compare.py mask_tool()) and note. Prints per key the method, the run count and the masked
+sha256, then the file sha256.
 """
 import argparse, gzip, hashlib, importlib.util, json, os, sys
 
@@ -24,7 +25,6 @@ spec.loader.exec_module(OC)
 def main():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     p.add_argument('--keys', required=True)
-    p.add_argument('--mask', required=True, choices=OC.MASKS)
     p.add_argument('--pin', required=True)
     p.add_argument('--golden', nargs='+', required=True)
     p.add_argument('--out', required=True)
@@ -58,14 +58,14 @@ def main():
                 bad.append(f'{key}: {path} has no ok answer')
                 continue
             method = method or rec.get('method')
-            v = OC.mask_answer(api, a.mask, method, api.apply_multisets(rec['response']['result'], patterns))
+            v = OC.mask_type_ids(api, method, api.apply_multisets(rec['response']['result'], patterns))
             text = api.canon(v)
             masked.setdefault(hashlib.sha256(text.encode('utf-8')).hexdigest(), (v, []))[1].append(os.path.relpath(path, api.REPO))
         if len(masked) != 1:
             bad.append(f'{key}: {len(masked)} masked answers in {len(roots)} Go runs')
             continue
         (sha, (answer, sources)), = masked.items()
-        out[key] = {'method': method, 'multiset': patterns, 'mask': a.mask,
+        out[key] = {'method': method, 'multiset': patterns, 'mask': OC.MASK,
                     'answers': [{'answer': answer, 'sha256': sha, 'sources': sorted(sources)}]}
         print(f'{key}\t{method}\t{len(sources)} Go runs\tmasked {sha[:16]}')
     if len(oracles) != 1 or not str(next(iter(oracles))).startswith(sha12):
@@ -73,11 +73,11 @@ def main():
     if bad:
         sys.exit('\n'.join(bad))
     doc = {'format': OC.ANSWERS_FORMAT, 'kind': 'api', 'pin': a.pin, 'oracleSha256': oracles.pop(), 'goldenSha12': sha12,
-           'mask': a.mask, 'maskTool': OC.mask_tool(), 'note': a.note, 'requests': dict(sorted(out.items()))}
+           'mask': OC.MASK, 'maskTool': OC.mask_tool(), 'note': a.note, 'requests': dict(sorted(out.items()))}
     data = gzip.compress(json.dumps(doc, sort_keys=True).encode('utf-8'), mtime=0)
     with open(a.out, 'wb') as f:
         f.write(data)
-    print(f'{len(out)} masked keys, mask {a.mask}; {a.out} sha256 {hashlib.sha256(data).hexdigest()}')
+    print(f'{len(out)} masked keys, mask {OC.MASK}; {a.out} sha256 {hashlib.sha256(data).hexdigest()}')
 
 
 if __name__ == '__main__':

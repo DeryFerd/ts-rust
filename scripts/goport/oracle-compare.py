@@ -44,15 +44,14 @@ absent). With a set of another oracle only (a later pin bump) it is protected li
 total also count retainedByAnswers, the output has kind and answers [{path, sha256, kind, pin, oracleSha256,
 requests, applied, notApplied}], and a lostFirst row of such a request names its set (answers, carried,
 answersWhy).
-Masked entries (bump C reviewer ruling 1 item 3, request 2 item 1): the set header's "mask" names the mask of
-the set, and each masked entry has that "mask" and exactly one answer: the Go answer after the mask, the same
-for every Go run at the set's pin. The masks (MASKS, mask_answer()):
-- "ids": api_oracle.mask_ids, every symbol, type and signature id replaced (the symbol field of a type too);
-- "strict": type and signature ids only; symbol references, flags and every other field are kept.
-goport's answer is masked the same way (the API tool loaded at the set's pin, after apply_multisets) before it
-is compared. A masked entry covers only its own key; every other key is compared unmasked. The header also has
-"maskTool" {<path>: sha256} of scripts/goport/api_oracle.py and scripts/goport/oracle-compare.py when the set
-was made. When a sha256 differs from this checkout's file, every source golden of every masked entry is masked
+Masked entries (bump C reviewer ruling 1 item 3, ruling 2 item 1): an API set whose header has "mask":
+"type-ids" (the only mask kind) may have entries with that "mask" and exactly one answer: the Go answer after
+mask_type_ids(), the same for every Go run at the set's pin. mask_type_ids replaces only type and signature ids;
+the symbol field, all flags and every other field stay exact (api_oracle.mask_ids, which also masks symbols and
+defines the id_only class, is not used). goport's answer is masked the same way (the API tool loaded at the set's
+pin, after apply_multisets) before it is compared. A masked entry covers only its own key; every other key is
+compared unmasked. The header also has "maskTool" {<path>: sha256} of scripts/goport/api_oracle.py (SHAPES,
+walk_shape, mask_name) and scripts/goport/oracle-compare.py (mask_type_ids) when the set was made. When a sha256 differs from this checkout's file, every source golden of every masked entry is masked
 again with this checkout's tools, and each must give the entry's answer, or the set is refused. Retention
 through a masked entry counts as retainedByMaskedAnswers, not retainedByAnswers, and each set in the output has
 maskedRequests, mask and maskTool {same, rechecked (source goldens masked again)}. These fields appear only
@@ -104,8 +103,8 @@ ORACLE_TOOLS = {'lsp': 'lsp_oracle', 'api': 'api_oracle'}
 # Parity: the classes that are always a problem, and (API) the classes that need a known diff.
 PARITY_BAD = {'lsp': ('diff', 'goport_error', 'oracle_error_diff', 'timeout', 'crash'), 'api': ('goport_error', 'crash', 'timeout')}
 PARITY_DIFF = {'lsp': (), 'api': ('diff', 'id_only', 'oracle_error_diff')}
-# The masks of masked answer set entries (see the docstring and mask_answer()).
-MASKS = ('ids', 'strict')
+# The mask kind of masked answer set entries (see the docstring and mask_type_ids()).
+MASK = 'type-ids'
 # The files whose code a mask runs, keyed as the answer set header's maskTool names them.
 MASK_TOOL_FILES = {'scripts/goport/api_oracle.py': os.path.join(HERE, 'api_oracle.py'),
                    'scripts/goport/oracle-compare.py': os.path.abspath(__file__)}
@@ -153,11 +152,11 @@ def tool_at(kind, pin):
     return _pinned_tools[(kind, pin)]
 
 
-def mask_answer(api, mask, method, v):
-    """An API answer v of method masked with mask ("ids" or "strict") by the API tool api (tool_at(), loaded at the
-    answer set's pin). masked-answers.py builds masked sets with this function."""
-    if mask == 'ids':
-        return api.mask_ids(method, v)
+def mask_type_ids(api, method, v):
+    """An API answer v of method with every type and signature id replaced by "#" (the "type-ids" mask; bump C
+    reviewer ruling 2 item 1), by the API tool api (tool_at(), loaded at the answer set's pin). Symbol references,
+    flags and every other field are kept; ids embedded in symbol names are masked as api_oracle.mask_name does.
+    masked-answers.py builds masked sets with this function."""
     shape = api.SHAPES.get(method)
     if shape is None:
         return v
@@ -283,8 +282,8 @@ class Run:
 
     def answer(self, key, patterns, mask=None):
         """goport's answer to a request in this run as canon() text (normalized as the oracle tools do), or None
-        when goport gave no answer (no record, or a status other than ok and error). mask (pin, mask, method): an ok
-        result is masked with that mask by the API tool at that pin (a masked answer set entry)."""
+        when goport gave no answer (no record, or a status other than ok and error). mask (pin, method): an ok
+        result is masked with mask_type_ids by the API tool at that pin (a masked answer set entry)."""
         battery, trace, event = key
         path = os.path.join(self.dir, 'responses', battery, trace + '.jsonl.gz')
         if path not in self.response_cache:
@@ -306,7 +305,7 @@ class Run:
             return t.canon({'status': rec['status'], 'response': resp})
         v = t.apply_multisets(resp['result'], patterns)
         if mask:
-            v = mask_answer(tool_at('api', mask[0]), *mask[1:], v)
+            v = mask_type_ids(tool_at('api', mask[0]), mask[1], v)
         return t.canon(v)
 
 
@@ -337,10 +336,10 @@ def load_answers(ref, cache):
     set_mask = doc.get('mask')
     if any(isinstance(e, dict) and e.get('mask') is not None for e in doc['requests'].values()) or set_mask is not None:
         tools = doc.get('maskTool')
-        if (kind != 'api' or set_mask not in MASKS or not isinstance(tools, dict) or sorted(tools) != sorted(MASK_TOOL_FILES)
+        if (kind != 'api' or set_mask != MASK or not isinstance(tools, dict) or sorted(tools) != sorted(MASK_TOOL_FILES)
                 or not all(isinstance(v, str) and SHA256.match(v) for v in tools.values())):
-            raise ValueError(f'answer set {path} has masked entries: an API set needs the header mask (one of '
-                             f'{", ".join(MASKS)}) and maskTool {{{", ".join(sorted(MASK_TOOL_FILES))}: sha256}}')
+            raise ValueError(f'answer set {path} has masked entries: an API set needs the header mask {MASK!r} and '
+                             f'maskTool {{{", ".join(sorted(MASK_TOOL_FILES))}: sha256}}')
     for k, entry in doc['requests'].items():
         key = parse_key(k)
         answers = entry.get('answers') if isinstance(entry, dict) else None
@@ -392,11 +391,11 @@ def recheck_masked(path, s):
                 goldens[full] = {str(k): r for k, r in api.records_by_event(lines[1:]).items()}
             rec = goldens[full].get(key[2]) or {}
             resp = rec.get('response') or {}
-            text = (api.canon(mask_answer(api, entry['mask'], entry['method'], api.apply_multisets(resp['result'], entry['multiset'])))
+            text = (api.canon(mask_type_ids(api, entry['method'], api.apply_multisets(resp['result'], entry['multiset'])))
                     if rec.get('status') == 'ok' and 'result' in resp else None)
             if text != entry['texts'][0]:
                 raise ValueError(f'answer set {path}: the mask tool changed, and {keytext(key)} in the source golden {src} does '
-                                 f'not give the masked answer with this checkout\'s mask {entry["mask"]!r}')
+                                 f'not give the masked answer with this checkout\'s mask')
             count += 1
     return count
 
@@ -406,7 +405,7 @@ def answer_why(new_run, key, method, s):
     entry = s['requests'][key]
     if method != entry['method']:
         return f'the new request has the method {method}, the answer set {s["path"]} {entry["method"]}'
-    got = new_run.answer(key, entry['multiset'], (s['pin'], entry['mask'], entry['method']) if entry['mask'] else None)
+    got = new_run.answer(key, entry['multiset'], (s['pin'], entry['method']) if entry['mask'] else None)
     if got is None:
         return 'goport has no answer'
     if got not in entry['texts']:
