@@ -2881,7 +2881,7 @@ function generateCode(): Map<string, string> {
         for (const [value, entry] of disc.mapping) {
             writeLine(`${indent}    ${rustByteStr(`"${value}"`)} => {`);
             writeLine(`${indent}        let v = self.${rustFieldName(entry.fieldName)}.insert(Default::default());`);
-            writeLine(`${indent}        return json_unmarshal(data, ${derefBoxed(entry)}, &[]);`);
+            writeLine(`${indent}        return unmarshal_read_value(data, ${derefBoxed(entry)});`);
             writeLine(`${indent}    }`);
         }
         let exhaustive = false;
@@ -2912,7 +2912,7 @@ function generateCode(): Map<string, string> {
             // so use a hard error return instead of speculative err == nil.
             for (const entry of unmapped) {
                 writeLine(`${indent}let v = self.${rustFieldName(entry.fieldName)}.insert(Default::default());`);
-                writeLine(`${indent}return json_unmarshal(data, ${derefBoxed(entry)}, &[]);`);
+                writeLine(`${indent}return unmarshal_read_value(data, ${derefBoxed(entry)});`);
             }
             return unmapped.length === 1;
         }
@@ -2968,7 +2968,7 @@ function generateCode(): Map<string, string> {
             writeLine(`${indent}    ${i} => {`);
             writeLine(`${indent}        // ${allChecks[i].jsonFieldName}`);
             writeLine(`${indent}        let v = self.${rustFieldName(allChecks[i].entry.fieldName)}.insert(Default::default());`);
-            writeLine(`${indent}        return json_unmarshal(data, ${derefBoxed(allChecks[i].entry)}, &[]);`);
+            writeLine(`${indent}        return unmarshal_read_value(data, ${derefBoxed(allChecks[i].entry)});`);
             writeLine(`${indent}    }`);
         }
         if (finalUnmapped.length > 0) {
@@ -2977,7 +2977,7 @@ function generateCode(): Map<string, string> {
                 // Only one variant left after dispatch — use hard error return.
                 const entry = finalUnmapped[0];
                 writeLine(`${indent}        let v = self.${rustFieldName(entry.fieldName)}.insert(Default::default());`);
-                writeLine(`${indent}        return json_unmarshal(data, ${derefBoxed(entry)}, &[]);`);
+                writeLine(`${indent}        return unmarshal_read_value(data, ${derefBoxed(entry)});`);
             }
             else {
                 for (const entry of finalUnmapped) {
@@ -3468,17 +3468,19 @@ function generateCode(): Map<string, string> {
         writeLine(`}`);
         writeLine("");
 
+        // PORT: the errors name the Go type, as the v2 default arshalers do.
         writeLine(`impl UnmarshalerFrom for ${enumeration.name} {`);
         writeLine(`    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {`);
         if (isString) {
             writeLine(`        let mut v = String::new();`);
-            writeLine(`        v.unmarshal_json_from(dec)?;`);
+            writeLine(`        unmarshal_string_as(dec, &mut v, ${rustStr(`lsproto.${enumeration.name}`)})?;`);
             writeLine(`        self.0 = Cow::Owned(v);`);
-            writeLine(`        Ok(())`);
         }
         else {
-            writeLine(`        self.0.unmarshal_json_from(dec)`);
+            const helper = baseType === "uint32" ? "unmarshal_uint_as" : "unmarshal_int_as";
+            writeLine(`        self.0 = ${helper}(dec, ${rustStr(`lsproto.${enumeration.name}`)})?;`);
         }
+        writeLine(`        Ok(())`);
         writeLine(`    }`);
         writeLine(`}`);
         writeLine("");

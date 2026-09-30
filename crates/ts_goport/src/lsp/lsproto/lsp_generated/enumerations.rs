@@ -62,7 +62,7 @@ impl MarshalerTo for SemanticTokenType {
 impl UnmarshalerFrom for SemanticTokenType {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.SemanticTokenType")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -110,7 +110,7 @@ impl MarshalerTo for SemanticTokenModifier {
 impl UnmarshalerFrom for SemanticTokenModifier {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.SemanticTokenModifier")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -148,7 +148,7 @@ impl MarshalerTo for DocumentDiagnosticReportKind {
 impl UnmarshalerFrom for DocumentDiagnosticReportKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.DocumentDiagnosticReportKind")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -209,7 +209,8 @@ impl MarshalerTo for ErrorCode {
 
 impl UnmarshalerFrom for ErrorCode {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_int_as(dec, "lsproto.ErrorCode")?;
+        Ok(())
     }
 }
 
@@ -289,7 +290,7 @@ impl MarshalerTo for FoldingRangeKind {
 impl UnmarshalerFrom for FoldingRangeKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.FoldingRangeKind")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -342,7 +343,8 @@ impl MarshalerTo for SymbolKind {
 
 impl UnmarshalerFrom for SymbolKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.SymbolKind")?;
+        Ok(())
     }
 }
 
@@ -396,7 +398,8 @@ impl MarshalerTo for SymbolTag {
 
 impl UnmarshalerFrom for SymbolTag {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.SymbolTag")?;
+        Ok(())
     }
 }
 
@@ -456,7 +459,7 @@ impl MarshalerTo for UniquenessLevel {
 impl UnmarshalerFrom for UniquenessLevel {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.UniquenessLevel")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -493,7 +496,7 @@ impl MarshalerTo for MonikerKind {
 impl UnmarshalerFrom for MonikerKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.MonikerKind")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -526,7 +529,8 @@ impl MarshalerTo for InlayHintKind {
 
 impl UnmarshalerFrom for InlayHintKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.InlayHintKind")?;
+        Ok(())
     }
 }
 
@@ -586,7 +590,8 @@ impl MarshalerTo for MessageType {
 
 impl UnmarshalerFrom for MessageType {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.MessageType")?;
+        Ok(())
     }
 }
 
@@ -643,7 +648,8 @@ impl MarshalerTo for TextDocumentSyncKind {
 
 impl UnmarshalerFrom for TextDocumentSyncKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.TextDocumentSyncKind")?;
+        Ok(())
     }
 }
 
@@ -698,7 +704,8 @@ impl MarshalerTo for TextDocumentSaveReason {
 
 impl UnmarshalerFrom for TextDocumentSaveReason {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.TextDocumentSaveReason")?;
+        Ok(())
     }
 }
 
@@ -771,7 +778,8 @@ impl MarshalerTo for CompletionItemKind {
 
 impl UnmarshalerFrom for CompletionItemKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.CompletionItemKind")?;
+        Ok(())
     }
 }
 
@@ -827,7 +835,8 @@ impl MarshalerTo for CompletionItemTag {
 
 impl UnmarshalerFrom for CompletionItemTag {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.CompletionItemTag")?;
+        Ok(())
     }
 }
 
@@ -887,7 +896,8 @@ impl MarshalerTo for InsertTextFormat {
 
 impl UnmarshalerFrom for InsertTextFormat {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.InsertTextFormat")?;
+        Ok(())
     }
 }
 
@@ -952,7 +962,8 @@ impl MarshalerTo for InsertTextMode {
 
 impl UnmarshalerFrom for InsertTextMode {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.InsertTextMode")?;
+        Ok(())
     }
 }
 
@@ -1006,7 +1017,8 @@ impl MarshalerTo for DocumentHighlightKind {
 
 impl UnmarshalerFrom for DocumentHighlightKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.DocumentHighlightKind")?;
+        Ok(())
     }
 }
 
@@ -1116,7 +1128,7 @@ impl MarshalerTo for CodeActionKind {
 impl UnmarshalerFrom for CodeActionKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.CodeActionKind")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -1147,7 +1159,8 @@ impl MarshalerTo for CodeActionTag {
 
 impl UnmarshalerFrom for CodeActionTag {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.CodeActionTag")?;
+        Ok(())
     }
 }
 
@@ -1201,7 +1214,7 @@ impl MarshalerTo for TraceValue {
 impl UnmarshalerFrom for TraceValue {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.TraceValue")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -1237,7 +1250,7 @@ impl MarshalerTo for MarkupKind {
 impl UnmarshalerFrom for MarkupKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.MarkupKind")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -1332,7 +1345,7 @@ impl MarshalerTo for LanguageKind {
 impl UnmarshalerFrom for LanguageKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.LanguageKind")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -1365,7 +1378,8 @@ impl MarshalerTo for InlineCompletionTriggerKind {
 
 impl UnmarshalerFrom for InlineCompletionTriggerKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.InlineCompletionTriggerKind")?;
+        Ok(())
     }
 }
 
@@ -1429,7 +1443,7 @@ impl MarshalerTo for PositionEncodingKind {
 impl UnmarshalerFrom for PositionEncodingKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.PositionEncodingKind")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -1462,7 +1476,8 @@ impl MarshalerTo for FileChangeType {
 
 impl UnmarshalerFrom for FileChangeType {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.FileChangeType")?;
+        Ok(())
     }
 }
 
@@ -1515,7 +1530,8 @@ impl MarshalerTo for WatchKind {
 
 impl UnmarshalerFrom for WatchKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.WatchKind")?;
+        Ok(())
     }
 }
 
@@ -1586,7 +1602,8 @@ impl MarshalerTo for DiagnosticSeverity {
 
 impl UnmarshalerFrom for DiagnosticSeverity {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.DiagnosticSeverity")?;
+        Ok(())
     }
 }
 
@@ -1645,7 +1662,8 @@ impl MarshalerTo for DiagnosticTag {
 
 impl UnmarshalerFrom for DiagnosticTag {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.DiagnosticTag")?;
+        Ok(())
     }
 }
 
@@ -1701,7 +1719,8 @@ impl MarshalerTo for CompletionTriggerKind {
 
 impl UnmarshalerFrom for CompletionTriggerKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.CompletionTriggerKind")?;
+        Ok(())
     }
 }
 
@@ -1761,7 +1780,8 @@ impl MarshalerTo for ApplyKind {
 
 impl UnmarshalerFrom for ApplyKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.ApplyKind")?;
+        Ok(())
     }
 }
 
@@ -1816,7 +1836,8 @@ impl MarshalerTo for SignatureHelpTriggerKind {
 
 impl UnmarshalerFrom for SignatureHelpTriggerKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.SignatureHelpTriggerKind")?;
+        Ok(())
     }
 }
 
@@ -1873,7 +1894,8 @@ impl MarshalerTo for CodeActionTriggerKind {
 
 impl UnmarshalerFrom for CodeActionTriggerKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.CodeActionTriggerKind")?;
+        Ok(())
     }
 }
 
@@ -1929,7 +1951,7 @@ impl MarshalerTo for FileOperationPatternKind {
 impl UnmarshalerFrom for FileOperationPatternKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.FileOperationPatternKind")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -1962,7 +1984,7 @@ impl MarshalerTo for ResourceOperationKind {
 impl UnmarshalerFrom for ResourceOperationKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.ResourceOperationKind")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -2004,7 +2026,7 @@ impl MarshalerTo for FailureHandlingKind {
 impl UnmarshalerFrom for FailureHandlingKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.FailureHandlingKind")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -2033,7 +2055,8 @@ impl MarshalerTo for PrepareSupportDefaultBehavior {
 
 impl UnmarshalerFrom for PrepareSupportDefaultBehavior {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_uint_as(dec, "lsproto.PrepareSupportDefaultBehavior")?;
+        Ok(())
     }
 }
 
@@ -2082,7 +2105,7 @@ impl MarshalerTo for TokenFormat {
 impl UnmarshalerFrom for TokenFormat {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.TokenFormat")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -2113,7 +2136,8 @@ impl MarshalerTo for VSContainerElementStyle {
 
 impl UnmarshalerFrom for VSContainerElementStyle {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_int_as(dec, "lsproto.VSContainerElementStyle")?;
+        Ok(())
     }
 }
 
@@ -2173,7 +2197,8 @@ impl MarshalerTo for LogVerbosity {
 
 impl UnmarshalerFrom for LogVerbosity {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_int_as(dec, "lsproto.LogVerbosity")?;
+        Ok(())
     }
 }
 
@@ -2226,7 +2251,8 @@ impl MarshalerTo for DiagnosticFlakeLogLevel {
 
 impl UnmarshalerFrom for DiagnosticFlakeLogLevel {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_int_as(dec, "lsproto.DiagnosticFlakeLogLevel")?;
+        Ok(())
     }
 }
 
@@ -2291,7 +2317,8 @@ impl MarshalerTo for VSReferenceKind {
 
 impl UnmarshalerFrom for VSReferenceKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_int_as(dec, "lsproto.VSReferenceKind")?;
+        Ok(())
     }
 }
 
@@ -2343,7 +2370,7 @@ impl MarshalerTo for CodeLensKind {
 impl UnmarshalerFrom for CodeLensKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.CodeLensKind")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }
@@ -2379,7 +2406,8 @@ impl MarshalerTo for AutoImportFixKind {
 
 impl UnmarshalerFrom for AutoImportFixKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_int_as(dec, "lsproto.AutoImportFixKind")?;
+        Ok(())
     }
 }
 
@@ -2435,7 +2463,8 @@ impl MarshalerTo for ImportKind {
 
 impl UnmarshalerFrom for ImportKind {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_int_as(dec, "lsproto.ImportKind")?;
+        Ok(())
     }
 }
 
@@ -2487,7 +2516,8 @@ impl MarshalerTo for AddAsTypeOnly {
 
 impl UnmarshalerFrom for AddAsTypeOnly {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        self.0.unmarshal_json_from(dec)
+        self.0 = unmarshal_int_as(dec, "lsproto.AddAsTypeOnly")?;
+        Ok(())
     }
 }
 
@@ -2591,7 +2621,7 @@ impl MarshalerTo for ClassificationTypeName {
 impl UnmarshalerFrom for ClassificationTypeName {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let mut v = String::new();
-        v.unmarshal_json_from(dec)?;
+        unmarshal_string_as(dec, &mut v, "lsproto.ClassificationTypeName")?;
         self.0 = Cow::Owned(v);
         Ok(())
     }

@@ -17,10 +17,13 @@
 //!   the compiler marshals (strings, booleans, slices and ordered maps).
 //!
 //! PORT: without legacy flags every v2 unmarshal error is fatal
-//! (`isFatalError`), so every impl returns the first error. Error messages are
-//! not the v2 texts; no caller shows them. The exception is the max depth
-//! error of the decoder, which the LSP shows in an InvalidRequest error: it
-//! has the Go `jsontext` text (`json_ext::syntactic_error_text`).
+//! (`isFatalError`), so every impl returns the first error. Most error
+//! messages are not the v2 texts; no caller shows them. The exceptions are
+//! the ones the LSP and the API show: a kind mismatch of a string, a boolean
+//! or a number is a v2 `SemanticError` (`json_ext::unmarshal_kind_error`),
+//! `json_unmarshal_decode` gives a method's plain error the Go type (as the
+//! v2 arshaler of a type with a method does), and the max depth error of the
+//! decoder has the Go `jsontext` text (`json_ext::syntactic_error_text`).
 
 use crate::frontend::prelude::*;
 
@@ -583,9 +586,9 @@ impl UnmarshalerFrom for String {
                 *self = s;
                 Ok(())
             }
-            _ => {
+            k => {
                 dec.skip_value()?;
-                Err(JsonError::new("cannot unmarshal JSON value into Go string"))
+                Err(crate::frontend::json_ext::unmarshal_kind_error(k, "string"))
             }
         }
     }
@@ -599,9 +602,9 @@ impl UnmarshalerFrom for bool {
                 *self = dec.read_token()? == JsonToken::True;
                 Ok(())
             }
-            _ => {
+            k => {
                 dec.skip_value()?;
-                Err(JsonError::new("cannot unmarshal JSON value into Go bool"))
+                Err(crate::frontend::json_ext::unmarshal_kind_error(k, "bool"))
             }
         }
     }
@@ -632,10 +635,10 @@ impl UnmarshalerFrom for f64 {
                 }
                 Ok(())
             }
-            _ => {
+            k => {
                 dec.skip_value()?;
-                Err(JsonError::new(
-                    "cannot unmarshal JSON value into Go float64",
+                Err(crate::frontend::json_ext::unmarshal_kind_error(
+                    k, "float64",
                 ))
             }
         }
@@ -1217,13 +1220,17 @@ pub fn json_unmarshal<T: UnmarshalerFrom + ?Sized>(
 // Go: json/json.go:61 UnmarshalDecode
 // PORT: Go merges `opts` into the decoder options; callers here pass none,
 // so the decoder options apply. The v2 check that an `UnmarshalerFrom`
-// reads exactly one value is kept.
+// reads exactly one value is kept. A plain error of the method of `T` gets
+// the Go type `T` (`json_ext::wrap_method_error`), as the v2 arshaler of a
+// type with an `UnmarshalJSONFrom` method does; an error that already has
+// its type keeps it.
 pub fn json_unmarshal_decode<T: UnmarshalerFrom + ?Sized>(
     dec: &mut JsonDecoder<'_>,
     out: &mut T,
 ) -> Result<(), JsonError> {
     let (prev_depth, prev_len) = dec.depth_length();
-    out.unmarshal_json_from(dec)?;
+    out.unmarshal_json_from(dec)
+        .map_err(crate::frontend::json_ext::wrap_method_error::<T>)?;
     let (curr_depth, curr_len) = dec.depth_length();
     if prev_depth != curr_depth || prev_len + 1 != curr_len {
         return Err(JsonError::new("must read exactly one JSON value"));
