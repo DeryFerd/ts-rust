@@ -586,14 +586,13 @@ impl DeclarationTransformer {
                 let ec = self.emit_context.clone();
                 let module_specifier =
                     self.rewrite_module_specifier(input, input.module_specifier());
-                let attributes = self.try_get_resolution_mode_override(input.attributes());
                 ec.factory().update_export_declaration(
                     input,
                     input.modifiers(),
                     input.is_type_only(),
                     input.export_clause(),
                     module_specifier,
-                    attributes,
+                    input.attributes(),
                 )
             }
             SyntaxKind::ExportAssignment => self.transform_export_assignment(
@@ -927,6 +926,7 @@ impl DeclarationTransformer {
                             f.new_modifier_list(&ns_mods),
                             SyntaxKind::NamespaceKeyword,
                             ns_name,
+                            Node::NIL,
                             f.new_module_block(f.new_node_list(&[class_decl])),
                         );
 

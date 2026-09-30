@@ -260,7 +260,6 @@ pub trait EmitResolver {
     fn mark_linked_references_recursively(&self, file: Node);
     fn get_external_module_file_from_declaration(&self, node: Node) -> Node;
     fn get_effective_declaration_flags(&self, node: Node, flags: ModifierFlags) -> ModifierFlags;
-    fn get_resolution_mode_override(&self, node: Node) -> ResolutionMode;
 
     // decorator metadata
     fn get_type_reference_serialization_kind(
