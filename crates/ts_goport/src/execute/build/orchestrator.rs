@@ -335,7 +335,7 @@ impl Orchestrator {
         }
     }
 
-    // Go: build/orchestrator.go:206 (*Orchestrator).setupBuildTask
+    // Go: build/orchestrator.go:210 (*Orchestrator).setupBuildTask
     // PORT: the Go `built` and `done` channels are dropped (see top).
     fn setup_build_task(
         &mut self,
@@ -400,7 +400,7 @@ impl Orchestrator {
         self.generate_graph(Some(&tasks));
     }
 
-    // Go: build/orchestrator.go:220 (*Orchestrator).GenerateGraph
+    // Go: build/orchestrator.go:260 (*Orchestrator).GenerateGraph (ts#64220, ts#64158)
     pub fn generate_graph(&mut self, old_tasks: Option<&FxHashMap<Path, Rc<RefCell<BuildTask>>>>) {
         let projects = self.opts.command.resolved_project_paths().to_vec();
         // Parse all config files in parallel
@@ -519,7 +519,7 @@ impl Orchestrator {
         result
     }
 
-    // Go: build/orchestrator.go:330 (*Orchestrator).recheckAllProjects (ts#64158)
+    // Go: build/orchestrator.go:337 (*Orchestrator).recheckAllProjects (ts#64158)
     fn recheck_all_projects(&self, project: &str) {
         if !self.graph_generated {
             return;
@@ -545,19 +545,19 @@ impl Orchestrator {
         self.reset_caches();
     }
 
-    // Go: build/orchestrator.go:347 (*Orchestrator).Clean (ts#64158)
+    // Go: build/orchestrator.go:354 (*Orchestrator).Clean (ts#64158)
     // orchestrator.Clean() entrypoint for api
     pub fn clean_exported(&mut self, project: &str) -> OrchestratorResult {
         self.clean(project, false)
     }
 
-    // Go: build/orchestrator.go:352 (*Orchestrator).CleanReferences (ts#64158)
+    // Go: build/orchestrator.go:359 (*Orchestrator).CleanReferences (ts#64158)
     // orchestrator.CleanReferences() entrypoint for api
     pub fn clean_references(&mut self, project: &str) -> OrchestratorResult {
         self.clean(project, true)
     }
 
-    // Go: build/orchestrator.go:356 (*Orchestrator).clean (ts#64158)
+    // Go: build/orchestrator.go:363 (*Orchestrator).clean (ts#64158)
     // PORT: Go `task.buildInfoEntryMu` guards the entry; the task is on
     // this thread (build_task.rs).
     fn clean(&mut self, project: &str, only_references: bool) -> OrchestratorResult {
@@ -635,7 +635,7 @@ impl Orchestrator {
         result
     }
 
-    // Go: build/orchestrator.go:410 (*Orchestrator).getBuildOrderFor (ts#64158)
+    // Go: build/orchestrator.go:416 (*Orchestrator).getBuildOrderFor (ts#64158)
     // PORT: Go returns `o.order` itself for an empty project; this clones it.
     fn get_build_order_for(&self, project: &str) -> (Vec<String>, bool) {
         if project.is_empty() {
@@ -677,7 +677,7 @@ impl Orchestrator {
         (order, true)
     }
 
-    // Go: build/orchestrator.go:443 (*Orchestrator).cleanProjectOutput (ts#64158)
+    // Go: build/orchestrator.go:452 (*Orchestrator).cleanProjectOutput (ts#64158)
     fn clean_project_output(
         &self,
         output_file: &str,
@@ -742,7 +742,7 @@ impl Orchestrator {
             build_result.errors = self.errors.clone();
         }
         build_result.report(self);
-        build_result.result
+        build_result
     }
 
     // Go: build/orchestrator.go:924 the numRoutines part of (*Orchestrator).rangeTasks
