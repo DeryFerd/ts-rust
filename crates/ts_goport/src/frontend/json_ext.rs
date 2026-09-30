@@ -16,7 +16,9 @@
 //! Unmarshal errors of the arshalers here are Go v2 `SemanticError` texts
 //! (see `SemanticError`). The JSON pointer is added by `unmarshal_root`; an
 //! error that reaches the caller through `json.rs` `json_unmarshal` has no
-//! pointer. The `json.rs` impls keep their own texts.
+//! pointer. The `json.rs` impls keep their own texts, except that their kind
+//! errors (a string, a boolean or a number of the wrong kind) use
+//! `unmarshal_kind_error`.
 //!
 //! PORT: integer arshalers do not port the stringified form that v2 uses
 //! for integer map keys (no LSP type has integer keys).
