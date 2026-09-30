@@ -1995,6 +1995,38 @@ pub struct MappedType {
     pub contains_error: bool,
 }
 
+impl MappedType {
+    // Go: checker/types.go:1123 MappedType.TypeParameter
+    pub fn type_parameter(&self) -> TypeId {
+        self.type_parameter
+    }
+
+    // Go: checker/types.go:1124 MappedType.ConstraintType
+    pub fn constraint_type(&self) -> TypeId {
+        self.constraint_type
+    }
+
+    // Go: checker/types.go:1125 MappedType.NameType
+    pub fn name_type(&self) -> TypeId {
+        self.name_type
+    }
+
+    // Go: checker/types.go:1126 MappedType.TemplateType
+    pub fn template_type(&self) -> TypeId {
+        self.template_type
+    }
+
+    // Go: checker/types.go:1127 MappedType.ResolveComponents
+    // PORT: the Go receiver is unused; the mapped type lives in the checker's
+    // arena, so this takes the checker and the type and no `self`.
+    pub fn resolve_components(c: &mut Checker, typ: TypeId) {
+        c.get_type_parameter_from_mapped_type(typ);
+        c.get_constraint_type_from_mapped_type(typ);
+        c.get_name_type_from_mapped_type(typ);
+        c.get_template_type_from_mapped_type(typ);
+    }
+}
+
 // ReverseMappedType
 
 // Go: checker/types.go:1101 ReverseMappedType
