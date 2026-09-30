@@ -1521,41 +1521,62 @@ pub fn get_config_name_from_file_name(filename: &str) -> String {
     String::new()
 }
 
-// Go: harnessutil.go:1190 SkipUnsupportedCompilerOptions
-// PORT: returns the Go `t.Skipf` message instead of skipping.
-pub fn skip_unsupported_compiler_options(options: &CompilerOptions) -> Option<String> {
-    if matches!(
-        options.module,
-        ModuleKind::AMD | ModuleKind::UMD | ModuleKind::SYSTEM
-    ) {
-        return Some(format!("unsupported module kind {}", options.module));
+/// A configuration that Go `SkipUnsupportedCompilerOptions` does not
+/// accept, with the Go message.
+pub enum UnsupportedCompilerOptions {
+    /// Go `t.Fatalf` of `failOnUnsupportedCompilerOptions` (ts#64122).
+    Fail(String),
+    /// Go `t.Skipf`.
+    Skip(String),
+}
+
+// Go: harnessutil.go:1236 SkipUnsupportedCompilerOptions
+// PORT: returns the Go `t.Fatalf` or `t.Skipf` message instead of failing
+// or skipping.
+pub fn skip_unsupported_compiler_options(
+    options: &CompilerOptions,
+) -> Option<UnsupportedCompilerOptions> {
+    if let Some(message) = fail_on_unsupported_compiler_options(options) {
+        return Some(UnsupportedCompilerOptions::Fail(message));
+    }
+    let skip = |message: String| Some(UnsupportedCompilerOptions::Skip(message));
+    if matches!(options.module, ModuleKind::UMD | ModuleKind::SYSTEM) {
+        return skip(format!("unsupported module kind {}", options.module));
     }
     if matches!(
         options.module_resolution,
         ModuleResolutionKind::NODE10 | ModuleResolutionKind::CLASSIC
     ) {
-        return Some(format!(
+        return skip(format!(
             "unsupported module resolution kind {}",
             options.module_resolution.0
         ));
     }
     if options.es_module_interop.is_false() {
-        return Some("esModuleInterop=false is unsupported".to_string());
+        return skip("esModuleInterop=false is unsupported".to_string());
     }
     if options.allow_synthetic_default_imports.is_false() {
-        return Some("allowSyntheticDefaultImports=false is unsupported".to_string());
+        return skip("allowSyntheticDefaultImports=false is unsupported".to_string());
     }
     if !options.base_url.is_empty() {
-        return Some(format!("unsupported baseUrl {}", options.base_url));
+        return skip(format!("unsupported baseUrl {}", options.base_url));
+    }
+    if options.target == ScriptTarget::ES5 {
+        return skip(format!("unsupported target {}", options.target.string()));
+    }
+    if options.always_strict.is_false() {
+        return skip("alwaysStrict=false is unsupported".to_string());
+    }
+    None
+}
+
+// Go: harnessutil.go:1265 failOnUnsupportedCompilerOptions (ts#64122)
+fn fail_on_unsupported_compiler_options(options: &CompilerOptions) -> Option<String> {
+    if options.module == ModuleKind::AMD {
+        return Some(format!("unsupported module kind {}", options.module));
     }
     if !options.out_file.is_empty() {
         return Some(format!("unsupported outFile {}", options.out_file));
-    }
-    if options.target == ScriptTarget::ES5 {
-        return Some(format!("unsupported target {}", options.target.string()));
-    }
-    if options.always_strict.is_false() {
-        return Some("alwaysStrict=false is unsupported".to_string());
     }
     None
 }

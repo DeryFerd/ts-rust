@@ -18,7 +18,7 @@ use ts_goport::program as tsprogram;
 use super::go_regex;
 use super::harness::{
     CompilationResult, HarnessOptions, NamedTestConfiguration, SkipPayload, TestConfiguration,
-    compile_files, enumerate_files, get_file_based_test_configurations,
+    UnsupportedCompilerOptions, compile_files, enumerate_files, get_file_based_test_configurations,
     set_options_from_test_config, skip_unsupported_compiler_options,
 };
 use super::test_case_parser::{
@@ -92,7 +92,7 @@ impl CompilerBaselineRunner {
     }
 }
 
-// Go: compiler_runner.go:85 skippedTests
+// Go: compiler_runner.go:78 skippedTests
 pub const SKIPPED_TESTS: &[&str] = &[
     // Tests that depended on typescript.d.ts in built.
     "APILibCheck.ts",
@@ -124,18 +124,15 @@ pub const SKIPPED_TESTS: &[&str] = &[
     "mappedTypeUnionConstraintInferences.ts",
     "lateBoundConstraintTypeChecksCorrectly.ts",
     "keyofDoesntContainSymbols.ts",
-    "isolatedModulesOut.ts",
     "noStrictGenericChecks.ts",
     "noImplicitUseStrict_umd.ts",
     "noImplicitUseStrict_system.ts",
     "noImplicitUseStrict_es6.ts",
     "noImplicitUseStrict_commonjs.ts",
-    "noImplicitUseStrict_amd.ts",
     "noImplicitAnyIndexingSuppressed.ts",
     "excessPropertyErrorsSuppressed.ts",
     "moduleNoneDynamicImport.ts",
     "moduleNoneErrors.ts",
-    "moduleNoneOutFile.ts",
     "noErrorUsingImportExportModuleAugmentationInDeclarationFile1.ts",
     "noErrorUsingImportExportModuleAugmentationInDeclarationFile2.ts",
     "noErrorUsingImportExportModuleAugmentationInDeclarationFile3.ts",
@@ -1103,13 +1100,13 @@ pub fn run_single_config_test(case: &ConfigCase, report: Report<'_>) {
     let compiled = catch_unwind(AssertUnwindSafe(|| {
         let payload = make_units_from_test(&test.content, &test.filename);
         let inputs = new_compiler_test_inputs(payload, config.as_ref());
-        // PORT: Go skips after the compilation; the options do not change
-        // there, so the check comes first and a skipped configuration is not
-        // compiled.
-        if let Some(message) =
+        // PORT: Go skips (or fails, ts#64122) after the compilation; the
+        // options do not change there, so the check comes first and a skipped
+        // or failed configuration is not compiled.
+        if let Some(unsupported) =
             skip_unsupported_compiler_options(&precompute_compiler_options(&inputs))
         {
-            return Err(message);
+            return Err(unsupported);
         }
         Ok(new_compiler_test(
             &case.test_name,
@@ -1120,8 +1117,12 @@ pub fn run_single_config_test(case: &ConfigCase, report: Report<'_>) {
     }));
     let compiler_test = match compiled {
         Ok(Ok(compiler_test)) => compiler_test,
-        Ok(Err(skip_message)) => {
+        Ok(Err(UnsupportedCompilerOptions::Skip(skip_message))) => {
             report("config", Outcome::Skip(skip_message));
+            return;
+        }
+        Ok(Err(UnsupportedCompilerOptions::Fail(message))) => {
+            report("compile", Outcome::Fail(message));
             return;
         }
         Err(payload) => {
