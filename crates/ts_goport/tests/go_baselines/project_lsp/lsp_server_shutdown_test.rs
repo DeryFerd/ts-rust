@@ -3,6 +3,7 @@
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::sync_channel;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ts_goport::frontend::bundled;
@@ -169,7 +170,7 @@ fn server_outgoing_queue_does_not_block_without_writer() {
     }
 }
 
-// Go: server_test.go:133 TestWriteLoopRecoversFromUnserializableResponse
+// Go: server_test.go:150 TestWriteLoopRecoversFromUnserializableResponse
 // PORT: Go renamed `server_shutdown_test.go` to `server_test.go` (#4896);
 // this file keeps its name. The Go bad result is a selection range 20000
 // levels deep, which the Go JSON encoder rejects (jsontext
@@ -190,29 +191,53 @@ impl ts_goport::frontend::json::MarshalerTo for UnserializableResult {
     }
 }
 
+// Go: server_test.go:24 cancelingTestWriter (ts#64215)
+// PORT: `lsproto::Message` is not `Clone`, so the writer records what the
+// checks read from each written response: its id and its error code.
+struct CancelingTestWriter {
+    writer: Box<dyn lsp::Writer + Send>,
+    cancel: context::CancelFunc,
+    messages: Arc<Mutex<Vec<RecordedResponse>>>,
+}
+
+/// `(resp.ID, resp.Error.Code)` of one written message.
+type RecordedResponse = (Option<ts_goport::jsonrpc::ID>, Option<i32>);
+
+impl lsp::Writer for CancelingTestWriter {
+    // Go: server_test.go:30 cancelingTestWriter.Write
+    fn write(&mut self, msg: &lsproto::Message) -> Result<(), GoError> {
+        self.writer.write(msg)?;
+        let resp = msg.as_response();
+        let mut messages = self.messages.lock().unwrap();
+        messages.push((resp.id.clone(), resp.error.as_ref().map(|err| err.code)));
+        if messages.len() == 2 {
+            (self.cancel)();
+        }
+        Ok(())
+    }
+}
+
 // A response that exceeds the JSON encoder's nesting limit must fail only its
 // request. The write loop must remain available to deliver subsequent responses.
+// ts#64215: the write loop runs on the test thread until the writer cancels
+// it after the second message.
 #[test]
 fn write_loop_recovers_from_unserializable_response() {
-    let (pr, pw) = std::io::pipe().expect("pipe");
+    let (ctx, cancel) = context::with_cancel(&context::background());
+    let messages: Arc<Mutex<Vec<RecordedResponse>>> = Arc::new(Mutex::new(Vec::new()));
     let fs = crate::support::vfstest::from_map(Vec::<(String, String)>::new(), false);
     let server = lsp::new_server(lsp::ServerOptions {
         in_: Box::new(ShutdownTestReader),
-        out: lsp::to_writer(Box::new(pw)),
+        out: Box::new(CancelingTestWriter {
+            writer: lsp::to_writer(Box::new(std::io::sink())),
+            cancel: cancel.clone(),
+            messages: messages.clone(),
+        }),
         err: Box::new(std::io::sink()),
         ..server_options("/test", fs, String::new())
     });
 
-    let (ctx, cancel) = context::with_cancel(&context::background());
     let _ = server.shared.background_ctx.set(ctx.clone());
-
-    let (write_loop_err_tx, write_loop_err) = sync_channel::<Result<(), GoError>>(1);
-    let mut w = server.w.borrow_mut().take().expect("writer");
-    let shared = server.shared.clone();
-    let write_ctx = ctx.clone();
-    std::thread::spawn(move || {
-        let _ = write_loop_err_tx.send(shared.write_loop(&write_ctx, &mut *w));
-    });
 
     let bad_id = ts_goport::jsonrpc::new_id_string("bad");
     if let Err(err) = server.shared.send(
@@ -239,53 +264,37 @@ fn write_loop_recovers_from_unserializable_response() {
         panic!("failed to enqueue good response: {}", err.error());
     }
 
-    // Go: readMessageWithTimeout (server_test.go:209).
-    // PORT: the timeout is 60 s (Go: 2 s) for a loaded test machine.
-    let (msg_tx, msg_rx) = sync_channel::<Result<lsproto::Message, String>>(2);
-    std::thread::spawn(move || {
-        let mut reader = lsp::to_reader(Box::new(std::io::BufReader::new(pr)));
-        for _ in 0..2 {
-            let result = match lsp::Reader::read(&mut *reader) {
-                (Some(msg), None) => Ok(msg),
-                (_, Some(err)) => Err(err.error()),
-                (None, None) => Err("no message".to_string()),
-            };
-            if msg_tx.send(result).is_err() {
-                return;
-            }
-        }
-    });
+    let mut w = server.w.borrow_mut().take().expect("writer");
+    match server.shared.write_loop(&ctx, &mut *w) {
+        Err(err) if errors::is(&err, &context::CANCELED) => {}
+        Err(err) => panic!("write loop exited unexpectedly: {}", err.error()),
+        Ok(()) => panic!("write loop exited unexpectedly: <nil>"),
+    }
 
     let mut saw_error = false;
     let mut saw_good = false;
-    for _ in 0..2 {
-        let msg = match msg_rx.recv_timeout(Duration::from_secs(60)) {
-            Ok(Ok(msg)) => msg,
-            Ok(Err(err)) => panic!("failed to read message: {err}"),
-            Err(_) => panic!("timed out waiting for a message (write loop may have died)"),
-        };
-        let resp = msg.as_response();
-        if resp.id.as_ref() == Some(&bad_id) {
-            match &resp.error {
+    for (id, error_code) in messages.lock().unwrap().iter() {
+        if id.as_ref() == Some(&bad_id) {
+            match error_code {
                 None => panic!(
                     "expected an error response for the unserializable request, got a result"
                 ),
-                Some(err) => assert_eq!(
-                    err.code,
+                Some(code) => assert_eq!(
+                    *code,
                     lsproto::ErrorCode::INTERNAL_ERROR.0,
                     "error response code = {}, want {}",
-                    err.code,
+                    code,
                     lsproto::ErrorCode::INTERNAL_ERROR.0
                 ),
             }
             saw_error = true;
-        } else if resp.id.as_ref() == Some(&good_id) {
-            if let Some(err) = &resp.error {
-                panic!("expected a successful response for the good request, got error: {err:?}");
+        } else if id.as_ref() == Some(&good_id) {
+            if let Some(code) = error_code {
+                panic!("expected a successful response for the good request, got error: {code}");
             }
             saw_good = true;
         } else {
-            panic!("unexpected response id: {:?}", resp.id);
+            panic!("unexpected response id: {id:?}");
         }
     }
 
@@ -297,12 +306,6 @@ fn write_loop_recovers_from_unserializable_response() {
         saw_good,
         "did not receive the subsequent well-formed response (write loop likely died)"
     );
-
-    // The write loop must still be running.
-    if let Ok(result) = write_loop_err.try_recv() {
-        let err = result.err().map(|err| err.error()).unwrap_or_default();
-        panic!("write loop exited unexpectedly: {err}");
-    }
     // Go: defer cancel()
     cancel();
 }
