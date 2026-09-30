@@ -116,13 +116,20 @@ impl AsyncConn {
         // Go: ipc/conn_async.go:69
         let (handler_ctx, cancel_handlers) = context::with_cancel(ctx);
         // Go: defer func() { c.closePendingCalls(err); cancelHandlers(); c.handlers.Wait(); ... }()
-        // PORT: the handlers run inline (file header), so when the loop ends
-        // no handler is active and `handlers.Wait()` (ts#64163) has nothing
-        // to wait for. The cancel still reaches a context that a handler
-        // kept.
+        // PORT: `RunDefer` runs the first two calls on every exit, also when
+        // the loop panics. The handlers run inline (file header), so when
+        // the loop ends no handler is active and `handlers.Wait()`
+        // (ts#64163) has nothing to wait for. The cancel still reaches a
+        // context that a handler kept. The join of the request error comes
+        // after the guard, because a panic discards Go's result too.
+        let mut deferred = RunDefer {
+            conn: self,
+            cancel_handlers,
+            err: None,
+        };
         let mut result = self.run_loop(ctx, &handler_ctx);
-        self.close_pending_calls(result.as_ref().err());
-        cancel_handlers();
+        deferred.err = result.as_ref().err().cloned();
+        drop(deferred);
         let request_err = self.request_errors.borrow_mut().take();
         if let Some(request_err) = request_err {
             result = Err(errors::join([result.err(), Some(request_err)])
@@ -468,6 +475,23 @@ impl AsyncConn {
     }
 }
 
+/// The first part of the deferred function of Go `Run`: close the pending
+/// calls with Go's named result `err`, then cancel the handler context. Its
+/// `Drop` runs on a normal return and when the loop panics (Go runs a
+/// deferred function while a panic unwinds; `err` is then nil).
+struct RunDefer<'a> {
+    conn: &'a AsyncConn,
+    cancel_handlers: context::CancelFunc,
+    err: Option<GoError>,
+}
+
+impl Drop for RunDefer<'_> {
+    fn drop(&mut self) {
+        self.conn.close_pending_calls(self.err.as_ref());
+        (self.cancel_handlers)();
+    }
+}
+
 /// What Go `Run` returns when its read fails: nil for `io.EOF`, else the
 /// error.
 fn read_loop_result(err: GoError) -> Result<(), GoError> {
@@ -775,6 +799,89 @@ pub(crate) mod tests {
         assert!(
             errors::is(&err, &context::CANCELED),
             "expected context.Canceled, got {}",
+            err.error()
+        );
+    }
+
+    /// A `QueuedProtocol` whose read panics when the queue is empty.
+    struct PanicAtEndProtocol(QueuedProtocol);
+
+    impl Protocol for PanicAtEndProtocol {
+        fn read_message(&mut self) -> Result<Message, GoError> {
+            if self.0.messages.is_empty() {
+                panic!("read panicked");
+            }
+            self.0.read_message()
+        }
+
+        fn write_request(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.0.write_request(id, method, params)
+        }
+
+        fn write_notification(
+            &mut self,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.0.write_notification(method, params)
+        }
+
+        fn write_response(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            result: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.0.write_response(id, result)
+        }
+
+        fn write_error(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            err: &jsonrpc::ResponseError,
+        ) -> Result<(), GoError> {
+            self.0.write_error(id, err)
+        }
+    }
+
+    // PORT: no Go test. Go's deferred function in `Run` also runs while a
+    // panic unwinds. When the loop panics, `run` must still close the
+    // pending calls and cancel the context that a handler kept.
+    #[test]
+    fn test_async_conn_run_cancels_handlers_on_panic() {
+        let (contexts, contexts_rx) = mpsc::channel();
+        let protocol = PanicAtEndProtocol(QueuedProtocol {
+            messages: vec![message(Some(jsonrpc::new_id_string("1")), "request")],
+            response_err: None,
+        });
+        let conn = new_async_conn_with_protocol(
+            Arc::new(NilTransport),
+            Box::new(protocol),
+            Rc::new(ContextHandler { contexts }),
+        );
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| conn.run(&context::background())));
+        assert!(outcome.is_err(), "run did not panic");
+
+        let handler_ctx = contexts_rx.recv().expect("the handler ran");
+        let err = handler_ctx
+            .err()
+            .expect("Run did not cancel active handlers after a panic");
+        assert!(
+            errors::is(&err, &context::CANCELED),
+            "expected context.Canceled, got {}",
+            err.error()
+        );
+        let err = conn
+            .notify(&context::background(), "after", None)
+            .expect_err("Run did not close the pending calls after a panic");
+        assert!(
+            errors::is(&err, &ERR_CONN_CLOSED),
+            "expected ErrConnClosed, got {}",
             err.error()
         );
     }
