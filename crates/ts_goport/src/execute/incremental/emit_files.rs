@@ -875,7 +875,7 @@ pub(crate) struct StartedEmit {
 /// false)` for `Program::start_emit`: pass 1 of
 /// `emit_files_incremental`, then the emit jobs are sent without a wait.
 /// Each checker thread runs them after the jobs sent to it before (the
-/// check and the second global diagnostics read). The caller has the
+/// check). The caller has the
 /// incremental state (`can_use_incremental_state`), and `options` name no
 /// target file and emit all.
 ///

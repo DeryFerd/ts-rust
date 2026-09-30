@@ -66,6 +66,15 @@ fn tsc_commandline_inputs() -> Vec<TscInput> {
         ..Default::default()
     };
     vec![
+        // ts#64452
+        TscInput {
+            sub_scenario: "global diagnostics produced during ordinary semantic checking".into(),
+            files: file_map! {
+                "/home/src/workspaces/project/index.ts" => "export function* values() { yield 1; }",
+            },
+            command_line_args: args!["index.ts", "--noEmit"],
+            ..Default::default()
+        },
         TscInput {
             sub_scenario: "show help with ExitStatus.DiagnosticsPresent_OutputsSkipped".into(),
             env: BTreeMap::from([
@@ -1543,7 +1552,49 @@ fn tsc_ignore_config() {
 
 // Go: tsc_test.go:1259 TestTscIncremental
 fn tsc_incremental_inputs() -> Vec<TscInput> {
-    // Go: tsc_test.go:1261 getConstEnumTest
+    // Go: tsc_test.go:1359 libWithReadonlyArray (ts#64452)
+    let lib_with_readonly_array = tsc_default_lib_content().replacen(
+        "interface ReadonlyArray<T> {}",
+        "interface ReadonlyArray<T> { readonly length: number; readonly [n: number]: T; }",
+        1,
+    );
+    // Go: tsc_test.go:1360 getRecursiveTypeTest (ts#64452)
+    let get_recursive_type_test = |name: &str, source: &str| -> TscInput {
+        TscInput {
+            sub_scenario: format!("{name} after comment only edit"),
+            files: file_map! {
+                "/home/src/workspaces/project/tsconfig.json" => r#"{"compilerOptions": {"strict": true, "noEmit": true, "incremental": true}}"#,
+                "/home/src/workspaces/project/repro.ts" => dedent(source),
+                format!("{TSC_LIB_PATH}/lib.es2025.full.d.ts") => lib_with_readonly_array.clone(),
+            },
+            edits: vec![
+                TscEdit {
+                    caption: "add a comment".into(),
+                    edit: edit(|sys: &TestSys| {
+                        sys.append_file(
+                            "/home/src/workspaces/project/repro.ts",
+                            "\n// comment-only edit\n",
+                        );
+                    }),
+                    ..Default::default()
+                },
+                no_change(),
+                TscEdit {
+                    caption: "add another comment".into(),
+                    edit: edit(|sys: &TestSys| {
+                        sys.append_file(
+                            "/home/src/workspaces/project/repro.ts",
+                            "\n// another comment\n",
+                        );
+                    }),
+                    ..Default::default()
+                },
+                no_change(),
+            ],
+            ..Default::default()
+        }
+    };
+    // Go: tsc_test.go:1386 getConstEnumTest
     fn get_const_enum_test(
         bds_contents: &str,
         change_enum_file: &str,
@@ -2550,6 +2601,93 @@ fn tsc_incremental_inputs() -> Vec<TscInput> {
 				"#),
             },
             command_line_args: args!["--noEmit"],
+            ..Default::default()
+        },
+        get_recursive_type_test("recursive mapped type", r#"
+			type Json = string | Json[];
+			type Parsed<T> = T extends object ? { [K in keyof T]: Parsed<T[K]> } : T;
+			declare function wrap<T>(value: T): Parsed<T>;
+			export const value = wrap({ items: [] as Json[] });
+		"#),
+        get_recursive_type_test("recursive readonly mapped type", r#"
+			type Json = string | readonly Json[];
+			type Parsed<T> = T extends object ? { [K in keyof T]: Parsed<T[K]> } : T;
+			declare function wrap<T>(value: T): Parsed<T>;
+			export const value = wrap({ items: [] as readonly Json[] });
+		"#),
+        TscInput {
+            sub_scenario: "global diagnostics produced during semantic checking".into(),
+            files: file_map! {
+                "/home/src/workspaces/project/tsconfig.json" => r#"{"compilerOptions": {"noEmit": true, "incremental": true}}"#,
+                "/home/src/workspaces/project/repro.ts" => "export function* values() { yield 1; }",
+            },
+            edits: vec![
+                no_change(),
+                TscEdit {
+                    caption: "add a comment".into(),
+                    edit: edit(|sys: &TestSys| {
+                        sys.append_file("/home/src/workspaces/project/repro.ts", "\n// comment-only edit\n");
+                    }),
+                    expected_diff: "Like Strada, signature generation produces the missing-global diagnostic before semantic checking, so it is excluded from the file's semantic diagnostics.".into(),
+                    ..Default::default()
+                },
+                TscEdit {
+                    caption: "no change".into(),
+                    edit: no_change().edit,
+                    expected_diff: "Like Strada, the cached semantic diagnostics do not include the missing-global diagnostic produced during signature generation.".into(),
+                    ..Default::default()
+                },
+                TscEdit {
+                    caption: "delete build info to restore the semantic diagnostic".into(),
+                    edit: edit(|sys: &TestSys| {
+                        sys.remove_no_error("/home/src/workspaces/project/tsconfig.tsbuildinfo");
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: "global diagnostics from function bodies after incremental edits".into(),
+            files: file_map! {
+                "/home/src/workspaces/project/tsconfig.json" => r#"{"compilerOptions": {"noEmit": true, "incremental": true}}"#,
+                "/home/src/workspaces/project/repro.ts" => dedent(r#"
+					export function values() {
+						// @ts-ignore
+						function* generator() { yield 1; }
+					}
+				"#),
+            },
+            edits: vec![
+                no_change(),
+                TscEdit {
+                    caption: "add a comment".into(),
+                    edit: edit(|sys: &TestSys| {
+                        sys.append_file("/home/src/workspaces/project/repro.ts", "\n// comment-only edit\n");
+                    }),
+                    ..Default::default()
+                },
+                no_change(),
+            ],
+            ..Default::default()
+        },
+        TscInput {
+            sub_scenario: "global diagnostics produced during unchecked javascript checking".into(),
+            files: file_map! {
+                "/home/src/workspaces/project/tsconfig.json" => r#"{"compilerOptions": {"allowJs": true, "noEmit": true, "incremental": true}}"#,
+                "/home/src/workspaces/project/repro.js" => "export function* values() { yield 1; }",
+            },
+            edits: vec![
+                no_change(),
+                TscEdit {
+                    caption: "enable javascript checking".into(),
+                    edit: edit(|sys: &TestSys| {
+                        sys.replace_file_text("/home/src/workspaces/project/tsconfig.json", r#""allowJs": true"#, r#""allowJs": true, "checkJs": true"#);
+                    }),
+                    ..Default::default()
+                },
+                no_change(),
+            ],
             ..Default::default()
         },
         TscInput {
