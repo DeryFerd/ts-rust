@@ -425,7 +425,7 @@ impl Checker {
             if file.symbol().is_some() {
                 // Merge in UMD exports with first-in-wins semantics (see #9771)
                 for (name, symbol) in self.symbols.entries(file_bind_data(file).global_exports) {
-                    if self.symbols.get(self.globals, &name).is_nil() {
+                    if self.symbols.get_name(self.globals, &name).is_nil() {
                         self.symbols.set(self.globals, name, symbol);
                     }
                 }
@@ -522,7 +522,9 @@ impl Checker {
     // Go: checker/checker.go:1384 mergeGlobalSymbol
     pub fn merge_global_symbol(&mut self, symbol: SymbolId) {
         let name = self.sym(symbol).name.clone();
-        let global_symbol = self.symbols.get(self.globals, &name);
+        // PERF: `get_name` finds the name by id with the interner's hash;
+        // `get` hashes and compares the text. Same entry.
+        let global_symbol = self.symbols.get_name(self.globals, &name);
         let merged;
         if global_symbol.is_some() {
             merged = self.merge_symbol(global_symbol, symbol, false /*unidirectional*/);

@@ -124,6 +124,21 @@ impl<T: Copy + Default> SharedList<T> {
         Self::from_repr(repr)
     }
 
+    /// Go `core.Concatenate`: `a` followed by `b`. When one list is empty,
+    /// the result is the other list itself, not a copy.
+    pub fn concat(a: Self, b: Self) -> Self {
+        if b.is_empty() {
+            return a;
+        }
+        if a.is_empty() {
+            return b;
+        }
+        let mut items = Vec::with_capacity(a.len() + b.len());
+        items.extend_from_slice(&a);
+        items.extend_from_slice(&b);
+        Self::from(&items[..])
+    }
+
     /// The sub-list `range` of this list. A long sub-list of an arena list
     /// shares the same storage; a short one is copied inline, and a long
     /// one of an owned list is a new owned copy.
@@ -1524,8 +1539,24 @@ impl TypeData {
     }
 
     // Go: checker/types.go:859 TypeBase.AsStructuredType
+    // PERF: the common kinds are tests at the call site, and the other kinds
+    // are out of line (`as_structured_type_other`). With every kind in one
+    // match, LLVM makes a jump table: a load and an indirect jump for every
+    // cast. `if let` tests before the match do not help, because LLVM merges
+    // them into the jump table.
     #[inline]
     pub fn as_structured_type(&self) -> Option<&StructuredType> {
+        match self {
+            TypeData::Object(d) => Some(&d.structured),
+            TypeData::TypeReference(d) => Some(&d.object.structured),
+            TypeData::Interface(d) => Some(&d.reference.object.structured),
+            _ => self.as_structured_type_other(),
+        }
+    }
+
+    /// `as_structured_type` for the kinds it does not test inline.
+    #[inline(never)]
+    fn as_structured_type_other(&self) -> Option<&StructuredType> {
         match self {
             TypeData::Union(d) => Some(&d.union_or_intersection.structured),
             TypeData::Intersection(d) => Some(&d.union_or_intersection.structured),
@@ -1875,9 +1906,12 @@ pub struct InterfaceType {
     // PERF: shared, so `get_base_types_shared` returns it without a copy.
     pub resolved_base_types: SharedList<TypeId>,
     pub declared_members: SymbolTable, // Declared members
-    pub declared_call_signatures: Vec<SignatureId>, // Declared call signatures
-    pub declared_construct_signatures: Vec<SignatureId>, // Declared construct signatures
-    pub declared_index_infos: Vec<IndexInfoId>, // Declared index signatures
+    // PERF: shared, so `resolve_object_type_members` reads them without a
+    // copy, and a type without instantiation stores the same lists, as Go
+    // shares its slices.
+    pub declared_call_signatures: SharedList<SignatureId>, // Declared call signatures
+    pub declared_construct_signatures: SharedList<SignatureId>, // Declared construct signatures
+    pub declared_index_infos: SharedList<IndexInfoId>,     // Declared index signatures
 }
 
 impl InterfaceType {
