@@ -2175,6 +2175,45 @@ fn tsc_project_references_inputs() -> Vec<TscInput> {
             ..Default::default()
         },
         TscInput {
+            sub_scenario: "when project references have invalid fields".to_string(),
+            files: files! {
+                "/home/src/workspaces/solution/project/index.ts" => r"export const x = 10;",
+                "/home/src/workspaces/solution/project/tsconfig.json" => dedent(r#"
+				{
+					"compilerOptions": {
+						"noEmit": true
+					},
+					"files": ["index.ts"],
+					"references": [
+						{ "path": true },
+						{ "circular": true },
+						{ "path": "../utils", "circular": "yes" },
+						{ "path": "" },
+						{ "path": "../valid", "circular": true }
+					]
+				}"#),
+                "/home/src/workspaces/solution/utils/index.ts" => "export const y = 10;",
+                "/home/src/workspaces/solution/utils/index.d.ts" => "export declare const y = 10;",
+                "/home/src/workspaces/solution/utils/tsconfig.json" => dedent(r#"
+				{
+					"compilerOptions": {
+						"composite": true
+					}
+				}"#),
+                "/home/src/workspaces/solution/valid/index.ts" => "export const z = 10;",
+                "/home/src/workspaces/solution/valid/index.d.ts" => "export declare const z = 10;",
+                "/home/src/workspaces/solution/valid/tsconfig.json" => dedent(r#"
+				{
+					"compilerOptions": {
+						"composite": true
+					}
+				}"#),
+            },
+            cwd: "/home/src/workspaces/solution".to_string(),
+            command_line_args: argv(&["--p", "project"]),
+            ..Default::default()
+        },
+        TscInput {
             sub_scenario: "default import interop uses referenced project settings".to_string(),
             files: files! {
                 "/home/src/workspaces/project/node_modules/ambiguous-package/package.json" => dedent(r#"
