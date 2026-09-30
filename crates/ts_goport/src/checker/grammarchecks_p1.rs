@@ -100,6 +100,7 @@ impl Checker {
         if !self.has_parse_diagnostics(source_file) {
             let reports: Rc<RefCell<Vec<(&'static Message, i32, i32, Vec<String>)>>> =
                 Rc::new(RefCell::new(Vec::new()));
+            let text = source_file_text(source_file);
             let mut reg_exp_scanner = crate::frontend::scanner::new_scanner();
             reg_exp_scanner.set_script_target(self.language_version);
             reg_exp_scanner.set_language_variant(with_source_file_info(source_file, |info| {
@@ -111,7 +112,7 @@ impl Checker {
                     sink.borrow_mut().push((message, start, length, args));
                 },
             )));
-            reg_exp_scanner.set_text(source_file_text(source_file));
+            reg_exp_scanner.set_text(&text);
             reg_exp_scanner.reset_token_state(node.pos());
             reg_exp_scanner.scan();
             let token_is_regular_expression_literal =
@@ -1283,7 +1284,8 @@ impl Checker {
     ) -> bool {
         if type_parameters.is_some() && type_parameters.nodes().len() == 0 {
             let start = type_parameters.pos() - "<".len() as i32;
-            let end = skip_trivia(source_file_text(file), type_parameters.end()) + ">".len() as i32;
+            let end =
+                skip_trivia(&source_file_text(file), type_parameters.end()) + ">".len() as i32;
             return self.grammar_error_at_pos(
                 file,
                 start,
@@ -1593,8 +1595,8 @@ impl Checker {
         if type_arguments.is_some() && type_arguments.nodes().len() == 0 {
             let source_file = get_source_file_of_node(node);
             let start = type_arguments.pos() - "<".len() as i32;
-            let end =
-                skip_trivia(source_file_text(source_file), type_arguments.end()) + ">".len() as i32;
+            let end = skip_trivia(&source_file_text(source_file), type_arguments.end())
+                + ">".len() as i32;
             return self.grammar_error_at_pos(
                 source_file,
                 start,

@@ -1773,7 +1773,7 @@ impl SnippetPrinter {
             });
         }
 
-        apply_bulk_edits(source_file_text(synthetic_file), &all_changes)
+        apply_bulk_edits(&source_file_text(synthetic_file), &all_changes)
     }
 }
 

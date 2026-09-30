@@ -212,7 +212,7 @@ pub fn get_range_of_enclosing_comment(
     if preceding_token.is_some() {
         trailing_ranges_of_previous_token = get_trailing_comment_ranges(
             &NodeFactory::default(),
-            source_file_text(file),
+            &source_file_text(file),
             preceding_token.end(),
         );
     }

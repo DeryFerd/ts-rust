@@ -583,7 +583,7 @@ child_test! {
 
 child_test! {
     // Go: contentmapper_test.go:290 TestContentMapperSupplementalFileClonedOnEdit
-    // PORT: Go `file.Hash` is `project::source_file_hash(file.text)`. The
+    // PORT: Go `file.Hash` is `file.source_hash()`. The
     // old hashes are read before the edit: the parse cache forgets the hash
     // of a file when its last program lets it go (Go keeps it in the file).
     fn content_mapper_supplemental_file_cloned_on_edit() {
@@ -612,10 +612,10 @@ child_test! {
         assert_eq!(old_supplemental.len(), 1);
         assert_eq!(old_supplemental[0].file_name(), "/home/project/app.box.0.ts");
         assert_eq!(old_supplemental[0].path(), &path("/home/project/app.box.0.ts"));
-        let old_supplemental_hash = project::source_file_hash(old_supplemental[0].text);
+        let old_supplemental_hash = old_supplemental[0].source_hash();
         assert_eq!(
             old_supplemental_hash,
-            project::source_file_hash(old_canonical.text)
+            old_canonical.source_hash()
         );
         assert!(
             old_program
@@ -644,10 +644,10 @@ child_test! {
         assert_eq!(new_supplemental[0].path(), old_supplemental[0].path());
         assert!(!Rc::ptr_eq(&new_canonical, &old_canonical));
         assert!(!Rc::ptr_eq(&new_supplemental[0], &old_supplemental[0]));
-        let new_supplemental_hash = project::source_file_hash(new_supplemental[0].text);
+        let new_supplemental_hash = new_supplemental[0].source_hash();
         assert_eq!(
             new_supplemental_hash,
-            project::source_file_hash(new_canonical.text)
+            new_canonical.source_hash()
         );
         assert_ne!(new_supplemental_hash, old_supplemental_hash);
         assert!(

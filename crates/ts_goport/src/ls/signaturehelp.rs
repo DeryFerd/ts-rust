@@ -1531,7 +1531,7 @@ pub fn get_immediately_containing_argument_info(
         //      <MainButton /*signatureHelp*/
         let attribute_span_start = parent.attributes().loc().pos();
         let attribute_span_end =
-            skip_trivia(source_file_text(source_file), parent.attributes().end());
+            skip_trivia(&source_file_text(source_file), parent.attributes().end());
         // PORT: Go passes the span length as the end of `core.NewTextRange`; kept as in Go.
         return Some(ArgumentListInfo {
             is_type_parameter_list: false,
@@ -1774,12 +1774,12 @@ pub fn get_applicable_span_for_arguments(
         //                  |  |
         // The span should include positions inside the parentheses.
         let span_start = node.end();
-        let mut span_end = skip_trivia(source_file_text(source_file), node.end());
+        let mut span_end = skip_trivia(&source_file_text(source_file), node.end());
         span_end = ensure_minimum_span_size(span_start, span_end);
         return TextRange::new(span_start, span_end);
     }
     let applicable_span_start = argument_list.pos();
-    let mut applicable_span_end = skip_trivia(source_file_text(source_file), argument_list.end());
+    let mut applicable_span_end = skip_trivia(&source_file_text(source_file), argument_list.end());
 
     // If the argument list is empty (Pos == End), extend the span to include at least
     // one position. This handles foo(|) where the cursor is right after the opening paren.
@@ -2010,7 +2010,8 @@ pub fn get_token_from_node_list(
             left = nodes.get(node_list_index).end();
             node_list_index += 1;
         } else {
-            let scanner = scanner_ls::get_scanner_for_source_file(source_file, left);
+            let sf_text = source_file_text(source_file);
+            let scanner = scanner_ls::get_scanner_for_source_file(source_file, &sf_text, left);
             let token = scanner.token();
             let token_full_start = scanner.token_full_start();
             let token_end = scanner.token_end();
@@ -2080,7 +2081,7 @@ pub fn get_applicable_range_for_tagged_template(
             crate::core::go_panic("runtime error: index out of range [-1]".to_string())
         });
         if last_span.literal().end() - last_span.literal().pos() == 0 {
-            applicable_span_end = skip_trivia(source_file_text(source_file), applicable_span_end);
+            applicable_span_end = skip_trivia(&source_file_text(source_file), applicable_span_end);
         }
     }
 

@@ -383,7 +383,7 @@ impl JsxTransformer {
     /// Go `core.NewTextRange(scanner.SkipTrivia(tx.currentSourceFile.Text(), node.Pos()), node.End())`.
     fn trivia_skipped_location(&self, node: Node) -> TextRange {
         TextRange::new(
-            skip_trivia(source_file_text(self.current_source_file), node.pos()),
+            skip_trivia(&source_file_text(self.current_source_file), node.pos()),
             node.end(),
         )
     }

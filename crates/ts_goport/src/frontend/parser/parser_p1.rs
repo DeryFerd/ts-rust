@@ -144,12 +144,14 @@ impl ParseDiagnostics {
 // `ParseDiagnostics` (see there). Go `setParentFromContext` is a closure
 // field; p5 `override_parent_in_immediate_children` uses `current_parent`
 // directly. `store` is the node store of the file (Go has no store).
-pub struct Parser {
-    pub scanner: Scanner,
+pub struct Parser<'a> {
+    pub scanner: Scanner<'a>,
     pub factory: NodeFactory,
 
     pub opts: SourceFileParseOptions,
-    pub source_text: &'static str,
+    /// The text of the parsed file. The parse borrows it (textleak1): the
+    /// text of a freeable file version is not leaked.
+    pub source_text: &'a str,
 
     pub script_kind: ScriptKind,
     pub language_variant: LanguageVariant,
@@ -184,7 +186,7 @@ pub struct Parser {
 // PORT: Go keeps parsers in a `sync.Pool` (`getParser`/`putParser`). A new
 // parser is made for each parse here.
 #[must_use]
-pub fn new_parser() -> Parser {
+pub fn new_parser<'a>() -> Parser<'a> {
     let mut res = Parser {
         scanner: new_scanner(),
         factory: NodeFactory::new(),
@@ -250,15 +252,18 @@ pub fn is_missing_node_list(list: NodeList) -> bool {
 // Go: parser.go:137 ParseSourceFile
 // PORT: Go `NewSourceFile` makes a heap node. Here the parse makes a node
 // store for the file first and freezes it at the end. The store keeps the
-// file name as `&'static str`, so the name is leaked once per file.
+// file name as `&'static str`, so the name is leaked once per file. The
+// store and the result keep the text (`FileText`), and the parser borrows
+// it while it runs.
 #[must_use]
 pub fn parse_source_file(
     opts: &SourceFileParseOptions,
-    source_text: &'static str,
+    source_text: impl Into<FileText>,
     script_kind: ScriptKind,
 ) -> ParsedSourceFile {
+    let source_text: FileText = source_text.into();
     let mut p = new_parser();
-    p.initialize_state(opts, source_text, script_kind);
+    p.initialize_state(opts, &source_text, script_kind);
     // lsshells M3c: each version of an edited file is a new parse, so a
     // freeable parse (`crate::ast::is_freeable_parse`) interns the name,
     // which all its versions share, instead of leaking it again.
@@ -268,11 +273,14 @@ pub fn parse_source_file(
     } else {
         Box::leak(opts.file_name.clone().into_boxed_str())
     };
-    p.store = new_file_store(file_name, source_text);
+    p.store = new_file_store(file_name, source_text.clone());
     // PERF: R3-1. A large bundled lib whose snapshot key matches is loaded
     // into the new store from `lib_parse.bin` (`lib_parse_snapshot.rs`),
-    // with the same store and result as a parse.
-    let result = match super::lib_parse_snapshot::load(p.store, opts, source_text, script_kind) {
+    // with the same store and result as a parse. A lib text is static.
+    let loaded = source_text
+        .as_static()
+        .and_then(|text| super::lib_parse_snapshot::load(p.store, opts, text, script_kind));
+    let result = match loaded {
         Some(loaded) => loaded.file,
         None => p.parse_into_store(),
     };
@@ -310,19 +318,23 @@ pub struct DetachedParse {
 pub fn parse_source_file_detached(
     job: usize,
     opts: &SourceFileParseOptions,
-    source_text: &'static str,
+    source_text: impl Into<FileText>,
     script_kind: ScriptKind,
 ) -> DetachedParse {
+    let source_text: FileText = source_text.into();
     let mut p = new_parser();
-    p.initialize_state(opts, source_text, script_kind);
+    p.initialize_state(opts, &source_text, script_kind);
     let file_name: &'static str = Box::leak(opts.file_name.clone().into_boxed_str());
     // Drop what a parse that panicked left on this thread.
     let _ = take_detached_file_store();
-    p.store = new_detached_file_store(job, file_name, source_text);
+    p.store = new_detached_file_store(job, file_name, source_text.clone());
     reset_module_indicator_options_read();
     // PERF: R3-1, as in `parse_source_file`. A snapshot parse did not read
     // the module indicator options.
-    if let Some(loaded) = super::lib_parse_snapshot::load(p.store, opts, source_text, script_kind) {
+    if let Some(loaded) = source_text
+        .as_static()
+        .and_then(|text| super::lib_parse_snapshot::load(p.store, opts, text, script_kind))
+    {
         return DetachedParse {
             file: loaded.file,
             store: take_detached_file_store().expect("the detached store of the parse"),
@@ -362,7 +374,7 @@ pub fn adopt_detached_parse(
     file
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     /// The part of Go `ParseSourceFile` after `initializeState`, for the
     /// store in `self.store`. Freezes the store at the end.
     fn parse_into_store(&mut self) -> ParsedSourceFile {
@@ -411,7 +423,7 @@ impl Parser {
                     | SyntaxKind::FalseKeyword
                     | SyntaxKind::NullKeyword => self.parse_token_node(),
                     SyntaxKind::MinusToken => {
-                        if self.look_ahead(|p: &mut Parser| {
+                        if self.look_ahead(|p: &mut Parser<'a>| {
                             p.next_token() == SyntaxKind::NumericLiteral
                                 && p.next_token() != SyntaxKind::ColonToken
                         }) {
@@ -421,7 +433,7 @@ impl Parser {
                         }
                     }
                     SyntaxKind::NumericLiteral | SyntaxKind::StringLiteral
-                        if self.look_ahead(|p: &mut Parser| {
+                        if self.look_ahead(|p: &mut Parser<'a>| {
                             p.next_token() != SyntaxKind::ColonToken
                         }) =>
                     {
@@ -456,8 +468,13 @@ impl Parser {
             self.factory
                 .new_parsed_source_file(&self.opts, self.source_text, statements, eof);
         let node = self.finish_node(node, pos);
-        let mut result =
-            ParsedSourceFile::new(self.store, node, self.opts.clone(), self.source_text, eof);
+        let mut result = ParsedSourceFile::new(
+            self.store,
+            node,
+            self.opts.clone(),
+            file_store_text(self.store),
+            eof,
+        );
         let first = result.statements().nodes();
         if !first.is_empty() {
             self.validate_json_value(&result, first.get(0).expression());
@@ -551,7 +568,7 @@ impl Parser {
     pub fn initialize_state(
         &mut self,
         opts: &SourceFileParseOptions,
-        source_text: &'static str,
+        source_text: &'a str,
         script_kind: ScriptKind,
     ) {
         if script_kind == ScriptKind::UNKNOWN {
@@ -632,7 +649,7 @@ impl Parser {
 
     // Go: parser.go:351 mark
     #[must_use]
-    pub fn mark(&self) -> ParserState {
+    pub fn mark(&self) -> ParserState<'a> {
         let diagnostics = self.diagnostics.borrow();
         ParserState {
             scanner_state: self.scanner.mark(),
@@ -647,7 +664,7 @@ impl Parser {
     }
 
     // Go: parser.go:364 rewind
-    pub fn rewind(&mut self, state: ParserState) {
+    pub fn rewind(&mut self, state: ParserState<'a>) {
         self.scanner.rewind(state.scanner_state);
         self.token = self.scanner.token();
         self.context_flags = state.context_flags;
@@ -663,7 +680,7 @@ impl Parser {
     }
 
     // Go: parser.go:376 lookAhead
-    pub fn look_ahead(&mut self, callback: impl FnOnce(&mut Parser) -> bool) -> bool {
+    pub fn look_ahead(&mut self, callback: impl FnOnce(&mut Parser<'a>) -> bool) -> bool {
         let state = self.mark();
         let result = callback(self);
         self.rewind(state);
@@ -761,8 +778,13 @@ impl Parser {
             .factory
             .new_parsed_source_file(&self.opts, self.source_text, list, eof);
         let node = self.finish_node(node, pos);
-        let mut result =
-            ParsedSourceFile::new(self.store, node, self.opts.clone(), self.source_text, eof);
+        let mut result = ParsedSourceFile::new(
+            self.store,
+            node,
+            self.opts.clone(),
+            file_store_text(self.store),
+            eof,
+        );
         self.finish_source_file(&mut result, is_declaration_file);
         if !result.is_declaration_file
             && !result.external_module_indicator.is_nil()
@@ -775,7 +797,7 @@ impl Parser {
                     self.store,
                     reparse,
                     self.opts.clone(),
-                    self.source_text,
+                    result.text.clone(),
                     result.end_of_file_token,
                 );
                 self.finish_source_file(&mut result, is_declaration_file);
@@ -973,7 +995,7 @@ impl Parser {
     pub fn parse_list_index(
         &mut self,
         kind: ParsingContext,
-        mut parse_element: impl FnMut(&mut Parser, i32) -> Node,
+        mut parse_element: impl FnMut(&mut Parser<'a>, i32) -> Node,
     ) -> Vec<Node> {
         let save_parsing_contexts = self.parsing_contexts;
         self.parsing_contexts |= 1 << (kind as i32);
@@ -1011,10 +1033,10 @@ impl Parser {
     pub fn parse_list(
         &mut self,
         kind: ParsingContext,
-        mut parse_element: impl FnMut(&mut Parser) -> Node,
+        mut parse_element: impl FnMut(&mut Parser<'a>) -> Node,
     ) -> NodeList {
         let pos = self.node_pos();
-        let nodes = self.parse_list_index(kind, |p: &mut Parser, _: i32| parse_element(p));
+        let nodes = self.parse_list_index(kind, |p: &mut Parser<'a>, _: i32| parse_element(p));
         let end = self.node_pos();
         self.new_node_list(TextRange::new(pos, end), &nodes)
     }
@@ -1024,7 +1046,7 @@ impl Parser {
     pub fn parse_delimited_list(
         &mut self,
         kind: ParsingContext,
-        mut parse_element: impl FnMut(&mut Parser) -> Node,
+        mut parse_element: impl FnMut(&mut Parser<'a>) -> Node,
     ) -> NodeList {
         let pos = self.node_pos();
         let save_parsing_contexts = self.parsing_contexts;
@@ -1098,7 +1120,7 @@ impl Parser {
     pub fn parse_bracketed_list(
         &mut self,
         kind: ParsingContext,
-        parse_element: impl FnMut(&mut Parser) -> Node,
+        parse_element: impl FnMut(&mut Parser<'a>) -> Node,
         opening: SyntaxKind,
         closing: SyntaxKind,
     ) -> NodeList {
@@ -2152,12 +2174,10 @@ pub fn is_double_quoted_string(node: Node) -> bool {
 }
 
 // Go: parser.go:281 ParseIsolatedEntityName
-// PORT: the parser keeps `source_text` as `&'static str`, so the text is
-// leaked. The nodes use the synthetic factory of `new_parser`, as there is
+// PORT: the nodes use the synthetic factory of `new_parser`, as there is
 // no source file.
 #[must_use]
 pub fn parse_isolated_entity_name(text: &str) -> Node {
-    let text: &'static str = Box::leak(text.to_owned().into_boxed_str());
     let mut p = new_parser();
     p.initialize_state(&SourceFileParseOptions::default(), text, ScriptKind::JS);
     p.next_token();
@@ -2171,8 +2191,8 @@ pub fn parse_isolated_entity_name(text: &str) -> Node {
 
 // Go: parser.go:340 ParserState
 #[derive(Clone, Copy, Debug)]
-pub struct ParserState {
-    pub scanner_state: ScannerState,
+pub struct ParserState<'a> {
+    pub scanner_state: ScannerState<'a>,
     pub context_flags: NodeFlags,
     pub diagnostics_len: usize,
     pub js_diagnostics_len: usize,

@@ -7,7 +7,7 @@
 
 use crate::frontend::prelude::*;
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: parser/parser.go:5534 parseTemplateExpression
     pub fn parse_template_expression(&mut self, is_tagged_template: bool) -> Node {
         let pos = self.node_pos();
@@ -1252,7 +1252,7 @@ impl Parser {
         // 'using' always starts a lexical declaration if followed by an identifier. We also eagerly parse
         // |ObjectBindingPattern| so that we can report a grammar error during check. We don't parse out
         // |ArrayBindingPattern| since it potentially conflicts with element access (i.e., `using[x]`).
-        self.look_ahead(|p: &mut Parser| {
+        self.look_ahead(|p: &mut Parser<'a>| {
             p.next_token_is_binding_identifier_or_start_of_destructuring_on_same_line(
                 false, /*disallowOf*/
             )
@@ -1355,11 +1355,11 @@ impl Parser {
 }
 
 // Go: parser/parser.go:6381 doInContext
-pub fn do_in_context<T>(
-    p: &mut Parser,
+pub fn do_in_context<'a, T>(
+    p: &mut Parser<'a>,
     flags: NodeFlags,
     value: bool,
-    f: impl FnOnce(&mut Parser) -> T,
+    f: impl FnOnce(&mut Parser<'a>) -> T,
 ) -> T {
     let save_context_flags = p.context_flags;
     p.set_context_flags(flags, value);
@@ -1641,7 +1641,7 @@ fn extract_quoted_string(text: &str, mut pos: i32) -> Option<&str> {
     Some(&text[start as usize..pos as usize])
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: parser/parser.go:6606 processPragmasIntoFields
     // PORT: Go `context *ast.SourceFile` is the U4 `ParsedSourceFile` field
     // struct. Go `[]*ast.FileReference` is `Vec<FileReference>` and the nil

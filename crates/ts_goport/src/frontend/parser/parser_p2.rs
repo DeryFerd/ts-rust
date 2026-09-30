@@ -14,7 +14,7 @@
 
 use crate::frontend::prelude::*;
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: parser/parser.go:1409 parseDefaultClause
     pub fn parse_default_clause(&mut self) -> Node {
         let pos = self.node_pos();
@@ -243,7 +243,7 @@ impl Parser {
         } else {
             let save_context_flags = self.context_flags;
             self.set_context_flags(NodeFlags::DISALLOW_IN_CONTEXT, in_for_statement_initializer);
-            let parse_element: fn(&mut Parser) -> Node = if in_for_statement_initializer {
+            let parse_element: fn(&mut Parser<'a>) -> Node = if in_for_statement_initializer {
                 Parser::parse_variable_declaration
             } else {
                 Parser::parse_variable_declaration_allow_exclamation
@@ -612,13 +612,13 @@ pub fn is_async_modifier(modifier: Node) -> bool {
     modifier.kind() == SyntaxKind::AsyncKeyword
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: parser/parser.go:1823 parseHeritageClauses
     pub fn parse_heritage_clauses(&mut self, is_interface: bool) -> NodeList {
         // ClassTail[Yield,Await] : (Modified) See 14.5
         //      ClassHeritage[?Yield,?Await]opt { ClassBody[?Yield,?Await]opt }
         if self.is_heritage_clause() {
-            return self.parse_list(ParsingContext::HeritageClauses, |p: &mut Parser| {
+            return self.parse_list(ParsingContext::HeritageClauses, |p: &mut Parser<'a>| {
                 p.parse_heritage_clause(is_interface)
             });
         }
@@ -630,7 +630,7 @@ impl Parser {
         let pos = self.node_pos();
         let kind = self.token;
         self.next_token();
-        let mut parse_element: fn(&mut Parser) -> Node =
+        let mut parse_element: fn(&mut Parser<'a>) -> Node =
             Parser::parse_expression_with_type_arguments;
         if is_type_heritage_clause(is_interface, kind) {
             parse_element = Parser::parse_type_heritage_clause_element;
@@ -648,7 +648,7 @@ pub fn is_type_heritage_clause(is_interface: bool, token: SyntaxKind) -> bool {
         || !is_interface && token == SyntaxKind::ImplementsKeyword
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: parser/parser.go:1852 parseTypeHeritageClauseElement
     /// Go returns an `*ast.HeritageClauseElement`: a TypeReference, or the
     /// ExpressionWithTypeArguments when its expression is not an entity name.
@@ -681,7 +681,7 @@ pub fn is_valid_heritage_type_reference_expression(node: Node) -> bool {
         && is_valid_heritage_type_reference_expression(node.expression())
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: parser/parser.go:1872 convertEntityNameExpressionToEntityName
     pub fn convert_entity_name_expression_to_entity_name(&mut self, node: Node) -> Node {
         if is_identifier(node) {
@@ -946,7 +946,7 @@ pub fn modifier_list_has_async(modifiers: ModifierList) -> bool {
     modifiers.is_some() && modifiers.nodes().iter().any(is_async_modifier)
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: parser/parser.go:1971 parsePropertyDeclaration
     pub fn parse_property_declaration(
         &mut self,
@@ -1148,7 +1148,7 @@ pub fn get_space_suggestion(expression_text: &str) -> String {
     String::new()
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     // Go: parser/parser.go:2078 parseErrorForInvalidName
     pub fn parse_error_for_invalid_name(
         &mut self,
@@ -2004,7 +2004,7 @@ impl Parser {
     pub fn parse_union_or_intersection_type(
         &mut self,
         operator: SyntaxKind,
-        parse_constituent_type: fn(&mut Parser) -> Node,
+        parse_constituent_type: fn(&mut Parser<'a>) -> Node,
     ) -> Node {
         let pos = self.node_pos();
         let is_union_type = operator == SyntaxKind::BarToken;

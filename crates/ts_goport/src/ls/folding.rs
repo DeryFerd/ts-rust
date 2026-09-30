@@ -182,8 +182,8 @@ impl LanguageService {
             // rune at `lineEnd`. Go keeps those invalid bytes; Rust cannot
             // hold them in a `&str`, so the line text is decoded lossily
             // (U+FFFD). Byte positions below use `line_bytes`.
-            let line_bytes = &source_file_text(source_file).as_bytes()
-                [current_line_start as usize..line_end as usize];
+            let file_text = source_file_text(source_file);
+            let line_bytes = &file_text.as_bytes()[current_line_start as usize..line_end as usize];
             let line_text = String::from_utf8_lossy(line_bytes);
             let result = parse_region_delimiter(&line_text);
             if result.is_none()
@@ -447,7 +447,7 @@ fn add_outlining_for_leading_comments_for_pos(
 
     let source_text = source_file_text(source_file);
     let factory = crate::printer::factory::NodeFactory::new(&p);
-    for comment in get_leading_comment_ranges(factory.as_node_factory(), source_text, pos) {
+    for comment in get_leading_comment_ranges(factory.as_node_factory(), &source_text, pos) {
         let comment_pos = comment.pos();
         let comment_end = comment.end();
 

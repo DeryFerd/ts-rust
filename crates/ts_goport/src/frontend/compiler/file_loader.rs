@@ -95,17 +95,18 @@ pub struct RedirectsFile {
 }
 
 // Go: fileloader.go:70 DuplicateSourceFile
-// PORT: Go keeps `Hash xxh3.Uint128` of the file text for the language
-// server parse cache. The frontend has no hash, so the field is the text,
-// and the language server hashes it (Go `SourceFile.Hash` is the hash of
-// the text).
+// PORT: Go keeps `Hash xxh3.Uint128` for the language server parse cache.
+// Here `hash` is the hash that a parse cache set on the file
+// (`ParsedSourceFile::hash`), and `text` is kept so the language server can
+// hash it when none was set (`source_hash`), as Go `fh.Hash()`.
 #[derive(Clone, Debug)]
 pub struct DuplicateSourceFile {
     pub parse_options: SourceFileParseOptions,
     // ContentMapperParseOptions are the acquire-time options for a content-mapped parse-cache entry.
     // tsgo#4712
     pub content_mapper_parse_options: SourceFileParseOptions,
-    pub text: &'static str,
+    pub text: FileText,
+    pub hash: Option<u128>,
     pub script_kind: ScriptKind,
     // ContentMapper is the identity of the content mapper that produced this file,
     // or "" if the file is not content-mapped.
@@ -115,6 +116,16 @@ pub struct DuplicateSourceFile {
     // from a failed transform.
     // tsgo#4712
     pub is_content_mapper_failure_stub: bool,
+}
+
+impl DuplicateSourceFile {
+    /// Go `file.Hash`: `hash`, else the xxh3-128 of the text (see
+    /// `ParsedSourceFile::source_hash`).
+    #[must_use]
+    pub fn source_hash(&self) -> u128 {
+        self.hash
+            .unwrap_or_else(|| xxhash_rust::xxh3::xxh3_128(self.text.as_bytes()))
+    }
 }
 
 impl RedirectsFile {

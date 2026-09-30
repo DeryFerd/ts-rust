@@ -73,8 +73,8 @@ pub fn go_text_range(file: Node, loc: TextRange) -> (i32, i32) {
     }
     let text = source_file_text(file);
     (
-        go_byte_offset(text, loc.pos()),
-        go_byte_offset(text, loc.end()),
+        go_byte_offset(&text, loc.pos()),
+        go_byte_offset(&text, loc.end()),
     )
 }
 
@@ -85,7 +85,7 @@ pub fn port_text_range(file: Node, pos: i32, end: i32) -> TextRange {
         return TextRange::new(pos, end);
     }
     let text = source_file_text(file);
-    TextRange::new(port_byte_offset(text, pos), port_byte_offset(text, end))
+    TextRange::new(port_byte_offset(&text, pos), port_byte_offset(&text, end))
 }
 
 // Go: incremental/snapshot.go:151 DiagnosticsOrBuildInfoDiagnosticsWithFileName

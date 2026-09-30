@@ -12,7 +12,6 @@
 
 use crate::flags_macros::go_flags;
 use crate::frontend::prelude::*;
-use std::borrow::Cow;
 
 use super::regexp::{RegExpParser, RegularExpressionFlags, char_code_to_reg_exp_flag};
 
@@ -495,10 +494,11 @@ pub(crate) fn text_to_token(text: &str) -> Option<SyntaxKind> {
 // PORT: `commentDirectives` is a Go slice header. Go `Rewind` restores its
 // length, and later appends overwrite the shared backing array after that
 // length. Here the backing array is `Scanner.comment_directives` and the
-// state keeps only the length (`comment_directives_len`). `tokenValue` is an
-// interned `&'static str` (see `intern_token_value`) so the state is `Copy`.
+// state keeps only the length (`comment_directives_len`). `tokenValue` is a
+// slice of the scanned text or an interned `&'static str` (see
+// `intern_token_value`), so the state is `Copy`.
 #[derive(Clone, Copy, Debug)]
-pub struct ScannerState {
+pub struct ScannerState<'a> {
     /// Current position in text (and ending position of current token)
     pub pos: i32,
     /// Starting position of current token including preceding whitespace
@@ -508,7 +508,7 @@ pub struct ScannerState {
     /// Kind of current token
     pub token: SyntaxKind,
     /// Parsed value of current token
-    pub token_value: &'static str,
+    pub token_value: &'a str,
     /// Flags for current token
     pub token_flags: TokenFlags,
     pub comment_directives_len: usize,
@@ -516,7 +516,7 @@ pub struct ScannerState {
     pub skip_js_doc_leading_asterisks: i32,
 }
 
-impl Default for ScannerState {
+impl Default for ScannerState<'_> {
     fn default() -> Self {
         ScannerState {
             pos: 0,
@@ -534,35 +534,36 @@ impl Default for ScannerState {
 /// Go `scanner.Scanner`.
 // PORT: the Go embedded `ScannerState` is the field `scanner_state`.
 // `comment_directives` is the backing array of the Go `commentDirectives`
-// slice (see `ScannerState`).
-pub struct Scanner {
-    pub(crate) text: Cow<'static, str>,
+// slice (see `ScannerState`). The scanner borrows its text (`'a`): a parse
+// borrows the file text for the parse (textleak1).
+pub struct Scanner<'a> {
+    pub(crate) text: &'a str,
     pub(crate) end: i32,
     pub(crate) language_variant: LanguageVariant,
     pub(crate) script_target: ScriptTarget,
     pub(crate) on_error: Option<ErrorCallback>,
     pub(crate) skip_trivia: bool,
-    pub(crate) scanner_state: ScannerState,
+    pub(crate) scanner_state: ScannerState<'a>,
 
     // PORT: maps a token value to its interned `jsnum` string, so a hit
     // needs no second intern lookup.
-    pub(crate) number_cache: FxHashMap<&'static str, &'static str>,
+    pub(crate) number_cache: FxHashMap<&'a str, &'static str>,
     // PORT: values (and `hex_number_cache` keys) are interned `&'static str`,
     // like Go strings, so a cache hit needs no allocation or clone. The
     // `hex_digit_cache` key is looked up by `&str` and owned only on a miss.
-    pub(crate) hex_number_cache: FxHashMap<&'static str, &'static str>,
+    pub(crate) hex_number_cache: FxHashMap<&'static str, &'a str>,
     pub(crate) hex_digit_cache: FxHashMap<Box<str>, &'static str>,
 
     pub(crate) comment_directives: Vec<CommentDirective>,
 }
 
 // Go: scanner/scanner.go:217 defaultScanner
-pub(crate) fn default_scanner() -> Scanner {
+pub(crate) fn default_scanner<'a>() -> Scanner<'a> {
     // Using a function rather than a global is intentional; this function is
     // inlined as pure code (zeroing + moves), whereas a global requires write
     // barriers since the memory is mutable.
     Scanner {
-        text: Cow::Borrowed(""),
+        text: "",
         end: 0,
         language_variant: LanguageVariant::STANDARD,
         script_target: ScriptTarget::NONE,
@@ -577,11 +578,11 @@ pub(crate) fn default_scanner() -> Scanner {
 }
 
 // Go: scanner/scanner.go:225 NewScanner
-pub fn new_scanner() -> Scanner {
+pub fn new_scanner<'a>() -> Scanner<'a> {
     default_scanner()
 }
 
-impl Scanner {
+impl<'a> Scanner<'a> {
     // Go: scanner/scanner.go:230 Reset
     pub fn reset(&mut self) {
         let number_cache = cleared(std::mem::take(&mut self.number_cache));
@@ -600,10 +601,10 @@ pub(crate) fn cleared<K, V>(mut m: FxHashMap<K, V>) -> FxHashMap<K, V> {
     m
 }
 
-impl Scanner {
+impl<'a> Scanner<'a> {
     // Go: scanner/scanner.go:245 Text
-    pub fn text(&self) -> &str {
-        &self.text
+    pub fn text(&self) -> &'a str {
+        self.text
     }
 
     // Go: scanner/scanner.go:249 Token
@@ -637,21 +638,15 @@ impl Scanner {
     }
 
     // Go: scanner/scanner.go:273 TokenValue
-    pub fn token_value(&self) -> &'static str {
+    pub fn token_value(&self) -> &'a str {
         self.scanner_state.token_value
     }
 
-    /// Go `s.text[start:end]` as a token value. A slice of `'static` source
-    /// text needs no interning: like a Go substring, it shares the text.
+    /// Go `s.text[start:end]` as a token value. A slice of the text needs
+    /// no interning: like a Go substring, it shares the text.
     #[inline]
-    pub(crate) fn text_token_value(&self, start: usize, end: usize) -> &'static str {
-        match &self.text {
-            Cow::Borrowed(text) => {
-                let text: &'static str = *text;
-                &text[start..end]
-            }
-            Cow::Owned(text) => intern_token_value(&text[start..end]),
-        }
+    pub(crate) fn text_token_value(&self, start: usize, end: usize) -> &'a str {
+        &self.text[start..end]
     }
 
     /// Go `s.tokenValue = value`.
@@ -671,12 +666,12 @@ impl Scanner {
     }
 
     // Go: scanner/scanner.go:285 Mark
-    pub fn mark(&self) -> ScannerState {
+    pub fn mark(&self) -> ScannerState<'a> {
         self.scanner_state
     }
 
     // Go: scanner/scanner.go:289 Rewind
-    pub fn rewind(&mut self, state: ScannerState) {
+    pub fn rewind(&mut self, state: ScannerState<'a>) {
         self.scanner_state = state;
     }
 
@@ -816,10 +811,10 @@ pub(crate) fn has_js_doc_tag(text: &str, tags: &[&str]) -> bool {
     false
 }
 
-impl Scanner {
+impl<'a> Scanner<'a> {
     // Go: scanner/scanner.go:396 SetText
-    pub fn set_text(&mut self, text: impl Into<Cow<'static, str>>) {
-        self.text = text.into();
+    pub fn set_text(&mut self, text: &'a str) {
+        self.text = text;
         self.end = self.text.len() as i32;
         self.scanner_state = ScannerState::default();
     }

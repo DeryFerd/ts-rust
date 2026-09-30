@@ -63,7 +63,7 @@ impl Checker {
                 if scan_token_at_position(source_file, type_name.end()) == SyntaxKind::DotToken {
                     self.grammar_error_at_pos(
                         node,
-                        skip_trivia(source_file_text(source_file), type_name.end()),
+                        skip_trivia(&source_file_text(source_file), type_name.end()),
                         1,
                         diag::JSDoc_types_can_only_be_used_inside_documentation_comments,
                         args![],

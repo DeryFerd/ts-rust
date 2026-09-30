@@ -118,7 +118,8 @@ fn test_content_mapped_parse_cache_key_reconstruction() {
     let duplicate = DuplicateSourceFile {
         parse_options: mapped_options,
         content_mapper_parse_options: acquire_options,
-        text: file.text,
+        text: file.text.clone(),
+        hash: file.hash.get(),
         script_kind: ScriptKind::UNKNOWN,
         content_mapper: "mapper".to_string(),
         is_content_mapper_failure_stub: false,

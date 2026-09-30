@@ -640,7 +640,7 @@ impl SearchView {
                 .line_maps
                 .borrow_mut()
                 .entry(root)
-                .or_insert_with(|| lsconv::compute_lsp_line_starts(source_file_text(root)))
+                .or_insert_with(|| lsconv::compute_lsp_line_starts(&source_file_text(root)))
                 .clone();
             return Some(line_map);
         }
@@ -659,8 +659,8 @@ impl SearchView {
                 .or_insert_with(|| {
                     let text = source_file_text(root);
                     Rc::new(sourcemap::lineinfo::create_ecma_line_info(
-                        text,
-                        compute_ecma_line_starts(text),
+                        &text,
+                        compute_ecma_line_starts(&text),
                     ))
                 })
                 .clone();

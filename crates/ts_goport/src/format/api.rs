@@ -75,7 +75,7 @@ pub fn format_span(
     let opts = get_format_code_settings_from_context(ctx);
 
     new_formatting_scanner(
-        source_file_text(file),
+        &source_file_text(file),
         source_file_language_variant(file),
         get_scan_start_position(enclosing_node, span, file),
         span.end(),
@@ -103,7 +103,7 @@ pub fn format_node_given_indentation(
 ) -> Vec<TextChange> {
     let text_range = TextRange::new(node.pos(), node.end());
     new_formatting_scanner(
-        source_file_text(file),
+        &source_file_text(file),
         language_variant,
         text_range.pos(),
         text_range.end(),
@@ -238,7 +238,7 @@ pub fn format_on_enter(ctx: &Context, source_file: Node, position: i32) -> Vec<T
     let text = source_file_text(source_file);
     let mut end_of_format_span = get_ecma_end_line_position(source_file, line);
     while end_of_format_span > start_pos {
-        let (ch, s) = utf8_decode_rune_in_string(text, end_of_format_span as usize);
+        let (ch, s) = utf8_decode_rune_in_string(&text, end_of_format_span as usize);
         if s == 0 || is_white_space_single_line(rune_to_char(ch)) {
             // on multibyte character keep backing up
             end_of_format_span -= 1;
@@ -250,7 +250,7 @@ pub fn format_on_enter(ctx: &Context, source_file: Node, position: i32) -> Vec<T
     // if the character at the end of the span is a line break, we shouldn't include it, because it indicates we don't want to
     // touch the current line at all. Also, on some OSes the line break consists of two characters (\r\n), we should test if the
     // previous character before the end of format span is line break character as well.
-    let (ch, _) = utf8_decode_rune_in_string(text, end_of_format_span as usize);
+    let (ch, _) = utf8_decode_rune_in_string(&text, end_of_format_span as usize);
     if is_line_break(rune_to_char(ch)) {
         end_of_format_span -= 1;
     }

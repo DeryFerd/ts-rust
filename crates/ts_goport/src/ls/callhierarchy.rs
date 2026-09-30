@@ -185,7 +185,7 @@ pub fn get_call_hierarchy_item_name(
             for m in modifiers.nodes() {
                 if m.kind() == SyntaxKind::DefaultKeyword {
                     let source_file = get_source_file_of_node(node);
-                    let start = skip_trivia(source_file_text(source_file), m.pos());
+                    let start = skip_trivia(&source_file_text(source_file), m.pos());
                     return ("default".to_string(), start, m.end());
                 }
             }
@@ -195,7 +195,7 @@ pub fn get_call_hierarchy_item_name(
     if is_class_static_block_declaration(node) {
         let source_file = get_source_file_of_node(node);
         let pos = skip_trivia(
-            source_file_text(source_file),
+            &source_file_text(source_file),
             move_range_past_modifiers(node).pos(),
         );
         let end = pos + 6; // "static".length
@@ -226,13 +226,13 @@ pub fn get_call_hierarchy_item_name(
         let source_file = get_source_file_of_node(node);
         if is_function_declaration(node) || is_function_expression(node) {
             let kw_pos = skip_trivia(
-                source_file_text(source_file),
+                &source_file_text(source_file),
                 move_range_past_modifiers(node).pos(),
             );
             return ("(anonymous)".to_string(), kw_pos, kw_pos + 8); // "function".length
         } else if is_class_declaration(node) || is_class_expression(node) {
             let kw_pos = skip_trivia(
-                source_file_text(source_file),
+                &source_file_text(source_file),
                 move_range_past_modifiers(node).pos(),
             );
             return ("(anonymous)".to_string(), kw_pos, kw_pos + 5); // "class".length
@@ -246,7 +246,7 @@ pub fn get_call_hierarchy_item_name(
     let text = get_text_of_call_hierarchy_name(program, node, decl_name, node);
 
     let source_file = get_source_file_of_node(node);
-    let name_pos = skip_trivia(source_file_text(source_file), decl_name.pos());
+    let name_pos = skip_trivia(&source_file_text(source_file), decl_name.pos());
 
     (text, name_pos, decl_name.end())
 }
@@ -632,7 +632,7 @@ impl LanguageService {
         let kind = get_symbol_kind_from_node(node);
 
         let full_start = skip_trivia_ex(
-            source_file_text(source_file),
+            &source_file_text(source_file),
             node.pos(),
             Some(&SkipTriviaOptions {
                 stop_at_comments: true,
@@ -714,7 +714,7 @@ pub fn convert_entry_to_call_site(entry: &Rc<RefCell<ReferenceEntry>>) -> Option
         ancestor = source_file;
     }
 
-    let start = skip_trivia(source_file_text(source_file), node.pos());
+    let start = skip_trivia(&source_file_text(source_file), node.pos());
     Some(CallSite {
         declaration: ancestor,
         text_range: TextRange::new(start, node.end()),
@@ -979,7 +979,7 @@ impl CallSiteCollector<'_> {
         };
 
         let source_file = get_source_file_of_node(target);
-        let start = skip_trivia(source_file_text(source_file), target.pos());
+        let start = skip_trivia(&source_file_text(source_file), target.pos());
         let text_range = TextRange::new(start, target.end());
 
         match declaration {

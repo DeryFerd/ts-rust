@@ -853,12 +853,12 @@ impl Printer {
         if self.current_source_file.is_nil() {
             return false;
         }
-        let text = source_file_text(self.current_source_file);
+        let text = self.current_source_file_text();
         let mut has_leading_comment_ranges = false;
         let mut has_new_line_comment = false;
         for comment in crate::frontend::scanner::get_leading_comment_ranges(
             self.emit_context.factory().as_node_factory(),
-            text,
+            &text,
             node.pos(),
         ) {
             has_leading_comment_ranges = true;
@@ -888,7 +888,7 @@ impl Printer {
             if node.pos() != expression.pos() {
                 for comment in crate::frontend::scanner::get_trailing_comment_ranges(
                     self.emit_context.factory().as_node_factory(),
-                    text,
+                    &text,
                     expression.pos(),
                 ) {
                     if self.comment_will_emit_new_line(&comment) {

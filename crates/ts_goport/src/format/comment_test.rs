@@ -49,7 +49,8 @@ fn test_comment_formatting_format_comment_issue_reproduction() {
 
     // Apply formatting once
     let edits = format_document(&ctx, source_file);
-    // PORT: the parser takes `&'static str`, so the formatted text is leaked.
+    // PORT: the formatted text is leaked, so the parse keeps it as a static
+    // `FileText`.
     let first_formatted: &'static str = apply_bulk_edits(original_text, &edits).leak();
 
     // Check that the asterisk is not corrupted

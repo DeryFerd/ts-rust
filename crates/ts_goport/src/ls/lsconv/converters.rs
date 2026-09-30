@@ -69,14 +69,35 @@ pub trait Script {
         self.file_name()
     }
 
-    fn text(&self) -> &str;
+    fn text(&self) -> ScriptText<'_>;
 
     fn span_map(&self) -> Option<&SpanMap> {
         None
     }
 
-    fn original_text(&self) -> &str {
+    fn original_text(&self) -> ScriptText<'_> {
         self.text()
+    }
+}
+
+/// The text of a `Script`: a borrow of the script, or the text of a source
+/// file (`FileText`), which a file node cannot lend. It derefs to `str`.
+// PORT: Go returns a string. A source file's text can be a freeable
+// version's text (textleak1), so the reader holds it while it reads.
+#[derive(Clone)]
+pub enum ScriptText<'a> {
+    Borrowed(&'a str),
+    File(FileText),
+}
+
+impl std::ops::Deref for ScriptText<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            ScriptText::Borrowed(text) => text,
+            ScriptText::File(text) => text,
+        }
     }
 }
 
@@ -93,7 +114,7 @@ impl<S: Script + ?Sized> Script for &S {
         (**self).original_file_name()
     }
 
-    fn text(&self) -> &str {
+    fn text(&self) -> ScriptText<'_> {
         (**self).text()
     }
 
@@ -101,7 +122,7 @@ impl<S: Script + ?Sized> Script for &S {
         (**self).span_map()
     }
 
-    fn original_text(&self) -> &str {
+    fn original_text(&self) -> ScriptText<'_> {
         (**self).original_text()
     }
 }
@@ -121,8 +142,8 @@ impl Script for Node {
         source_file_original_file_name(*self)
     }
 
-    fn text(&self) -> &str {
-        source_file_text(*self)
+    fn text(&self) -> ScriptText<'_> {
+        ScriptText::File(source_file_text(*self))
     }
 
     // Go: ast/ast.go:2579 (*SourceFile).SpanMap
@@ -131,8 +152,8 @@ impl Script for Node {
     }
 
     // Go: ast/ast.go:2561 (*SourceFile).OriginalText
-    fn original_text(&self) -> &str {
-        source_file_original_text(*self)
+    fn original_text(&self) -> ScriptText<'_> {
+        ScriptText::File(source_file_original_text(*self))
     }
 }
 
@@ -518,7 +539,7 @@ impl Script for ScriptOrOriginal<'_> {
         }
     }
 
-    fn text(&self) -> &str {
+    fn text(&self) -> ScriptText<'_> {
         match self {
             ScriptOrOriginal::Script(s) => s.text(),
             ScriptOrOriginal::Original(s) => s.text(),
@@ -532,7 +553,7 @@ impl Script for ScriptOrOriginal<'_> {
         }
     }
 
-    fn original_text(&self) -> &str {
+    fn original_text(&self) -> ScriptText<'_> {
         match self {
             ScriptOrOriginal::Script(s) => s.original_text(),
             ScriptOrOriginal::Original(s) => s.original_text(),
@@ -604,7 +625,7 @@ fn virtual_position_to_original(
 // PORT: Go copies the two strings; here the script borrows them.
 struct OriginalTextScript<'a> {
     file_name: &'a str,
-    text: &'a str,
+    text: ScriptText<'a>,
 }
 
 impl Script for OriginalTextScript<'_> {
@@ -619,13 +640,13 @@ impl Script for OriginalTextScript<'_> {
     }
 
     // Go: ls/lsconv/converters.go:596 originalTextScript.Text
-    fn text(&self) -> &str {
-        self.text
+    fn text(&self) -> ScriptText<'_> {
+        ScriptText::Borrowed(&self.text)
     }
 
     // Go: ls/lsconv/converters.go:597 originalTextScript.OriginalText
-    fn original_text(&self) -> &str {
-        self.text
+    fn original_text(&self) -> ScriptText<'_> {
+        ScriptText::Borrowed(&self.text)
     }
 
     // Go: ls/lsconv/converters.go:598 originalTextScript.SpanMap
@@ -812,7 +833,7 @@ impl Converters {
                     text.len()
                 ));
             }
-            let (r, size) = utf8_decode_rune_in_string(text, pos);
+            let (r, size) = utf8_decode_rune_in_string(&text, pos);
             let u16_len = utf16_rune_len(r);
             if utf16_char + u16_len > char {
                 break;
@@ -874,7 +895,7 @@ impl Converters {
             let slice_end = position as usize;
             let mut pos = start as usize;
             while pos < slice_end {
-                let (mut r, mut size) = utf8_decode_rune_in_string(text, pos);
+                let (mut r, mut size) = utf8_decode_rune_in_string(&text, pos);
                 if pos + size as usize > slice_end {
                     r = RUNE_ERROR;
                     size = 1;
@@ -1090,7 +1111,7 @@ fn diagnostic_script_and_range<'a>(
     };
     let original = OriginalTextScript {
         file_name: source_file_original_file_name(*file),
-        text: source_file_original_text(*file),
+        text: ScriptText::File(source_file_original_text(*file)),
     };
     if !source.is_empty() {
         // A content mapper's own diagnostics already carry original-text ranges.

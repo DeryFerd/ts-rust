@@ -5659,8 +5659,11 @@ fn file_version_of(file: Node) -> Option<crate::ast::VersionPin> {
 }
 
 // Go: ast.go:2566 (*SourceFile).Text
+/// The text of a SourceFile node. Hold the result only as long as it is
+/// read: the text of a freeable file version goes when the last holder
+/// lets go (`FileText`).
 #[must_use]
-pub fn source_file_text(file: Node) -> &'static str {
+pub fn source_file_text(file: Node) -> FileText {
     if is_synthetic_node(file) {
         return synthetic_source_file_text(file);
     }
@@ -5808,9 +5811,9 @@ pub fn source_file_content_mapper_info(file: Node) -> Option<&'static ContentMap
 // Go: ast/ast.go:2561 (*SourceFile).OriginalText
 // OriginalText returns the untransformed source text for content-mapped files, or Text() otherwise.
 #[must_use]
-pub fn source_file_original_text(file: Node) -> &'static str {
+pub fn source_file_original_text(file: Node) -> FileText {
     match source_file_content_mapper_info(file) {
-        Some(info) if !info.content_mapper.is_empty() => &info.original_text,
+        Some(info) if !info.content_mapper.is_empty() => FileText::Static(&info.original_text),
         _ => source_file_text(file),
     }
 }
@@ -6059,7 +6062,7 @@ pub fn source_file_ecma_line_map(file: Node) -> FileRef<[i32]> {
     if let Some(line_map) = ECMA_LINE_MAPS.with(|c| c.borrow().get(&file).copied()) {
         return FileRef::Static(line_map);
     }
-    let line_map: &'static [i32] = Vec::leak(compute_ecma_line_starts(source_file_text(file)));
+    let line_map: &'static [i32] = Vec::leak(compute_ecma_line_starts(&source_file_text(file)));
     ECMA_LINE_MAPS.with(|c| c.borrow_mut().insert(file, line_map));
     FileRef::Static(line_map)
 }
@@ -6145,7 +6148,7 @@ pub fn source_file_get_position_map(file: Node) -> FileRef<PositionMap> {
 
 /// Go `(*SourceFile).GetPositionMap` without the cache.
 fn compute_source_file_position_map(file: Node) -> PositionMap {
-    compute_position_map(source_file_text(file))
+    compute_position_map(&source_file_text(file))
 }
 
 // Go: ast.go:2840 (*SourceFile).GetDeclarationMap

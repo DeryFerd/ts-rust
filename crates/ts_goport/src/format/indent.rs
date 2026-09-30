@@ -198,7 +198,7 @@ pub fn get_leading_comment_ranges_of_node(node: Node, file: Node) -> Vec<Comment
     if node.kind() == SyntaxKind::JsxText {
         return Vec::new();
     }
-    get_leading_comment_ranges(&NodeFactory::default(), source_file_text(file), node.pos())
+    get_leading_comment_ranges(&NodeFactory::default(), &source_file_text(file), node.pos())
 }
 
 // Go: format/indent.go:144 getRangeOfEnclosingComment
@@ -224,7 +224,7 @@ pub fn get_range_of_enclosing_comment(
     if preceding_token.is_some() {
         trailing_ranges_of_previous_token = get_trailing_comment_ranges(
             &NodeFactory::default(),
-            source_file_text(source_file),
+            &source_file_text(source_file),
             preceding_token.end(),
         );
     }
@@ -256,7 +256,7 @@ pub fn get_block_indent(
     let mut current = position;
     let text = source_file_text(source_file);
     while current > 0 {
-        let (ch, size) = utf8_decode_rune_in_string(text, current as usize);
+        let (ch, size) = utf8_decode_rune_in_string(&text, current as usize);
         if !is_white_space_like(rune_to_char(ch)) {
             break;
         }
@@ -710,7 +710,7 @@ pub fn find_first_non_whitespace_character_and_column(
     let text = source_file_text(source_file);
     let mut pos = start_pos;
     while pos < end_pos {
-        let (ch, size) = utf8_decode_rune_in_string(text, pos as usize);
+        let (ch, size) = utf8_decode_rune_in_string(&text, pos as usize);
         if !is_white_space_single_line(rune_to_char(ch)) {
             break;
         }
@@ -866,7 +866,8 @@ pub fn get_visual_list_range(node: Node, list: TextRange, source_file: Node) -> 
         prior.end()
     };
     // Find the token that starts at or after list.End() using the scanner
-    let scan = scanner_ls::get_scanner_for_source_file(source_file, list.end());
+    let sf_text = source_file_text(source_file);
+    let scan = scanner_ls::get_scanner_for_source_file(source_file, &sf_text, list.end());
     let next_start = if scan.token() == SyntaxKind::EndOfFile {
         list.end()
     } else {
@@ -1004,11 +1005,11 @@ pub fn node_will_indent_child(
             {
                 let parent_start_line = get_ecma_line_of_position(
                     source_file,
-                    skip_trivia(source_file_text(source_file), parent.pos()),
+                    skip_trivia(&source_file_text(source_file), parent.pos()),
                 );
                 let child_start_line = get_ecma_line_of_position(
                     source_file,
-                    skip_trivia(source_file_text(source_file), child.pos()),
+                    skip_trivia(&source_file_text(source_file), child.pos()),
                 );
                 return parent_start_line != child_start_line;
             }

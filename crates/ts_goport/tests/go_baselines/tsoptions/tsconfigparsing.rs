@@ -1180,7 +1180,7 @@ fn parse_src_compiler() {
             path: tsconfig_path,
             ..Default::default()
         },
-        Box::leak(json_text.into_boxed_str()),
+        &*Box::leak(json_text.into_boxed_str()),
         ScriptKind::JSON,
     );
 
@@ -1462,7 +1462,7 @@ fn parse_config_with_cache(
             path: cfg_path,
             ..Default::default()
         },
-        Box::leak(json_text.into_boxed_str()),
+        &*Box::leak(json_text.into_boxed_str()),
         ScriptKind::JSON,
     );
     let ts_config_source_file = ts_config_source_file(&parsed);

@@ -271,25 +271,25 @@ impl DeclarationTransformer {
                 // ... parameters, /** @internal */
                 // public param: string
                 let trailing_pos = skip_trivia_ex(
-                    text,
+                    &text,
                     previous_sibling.end() + 1,
                     Some(&SkipTriviaOptions {
                         stop_at_comments: true,
                         ..Default::default()
                     }),
                 );
-                comment_ranges.extend(get_trailing_comment_ranges(text, trailing_pos));
-                comment_ranges.extend(get_leading_comment_ranges(text, node.pos()));
+                comment_ranges.extend(get_trailing_comment_ranges(&text, trailing_pos));
+                comment_ranges.extend(get_leading_comment_ranges(&text, node.pos()));
             } else {
                 let trailing_pos = skip_trivia_ex(
-                    text,
+                    &text,
                     node.pos(),
                     Some(&SkipTriviaOptions {
                         stop_at_comments: true,
                         ..Default::default()
                     }),
                 );
-                comment_ranges.extend(get_trailing_comment_ranges(text, trailing_pos));
+                comment_ranges.extend(get_trailing_comment_ranges(&text, trailing_pos));
             }
 
             if let Some(last) = comment_ranges.last() {
@@ -315,7 +315,7 @@ impl DeclarationTransformer {
         if node.is_nil() || node.kind() == SyntaxKind::JsxText {
             return Vec::new();
         }
-        get_leading_comment_ranges(source_file_text(source_file), node.pos())
+        get_leading_comment_ranges(&source_file_text(source_file), node.pos())
     }
 
     // Go: transformers/declarations/transform.go:225 DeclarationTransformer.visit

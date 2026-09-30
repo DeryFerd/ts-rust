@@ -3120,8 +3120,8 @@ impl Session {
 // nil is `None`.
 pub fn to_api_text_edits(source_file: Node, edits: &[lsproto::TextEdit]) -> Option<Vec<TextEdit>> {
     let original_text = source_file_original_text(source_file);
-    let line_map = lsconv::compute_lsp_line_starts(original_text);
-    let position_map = compute_position_map(original_text);
+    let line_map = lsconv::compute_lsp_line_starts(&original_text);
+    let position_map = compute_position_map(&original_text);
     let mut result = Vec::with_capacity(edits.len());
     for edit in edits {
         let (start, ok) = original_text_offset(&line_map, &edit.range.start, original_text.len());

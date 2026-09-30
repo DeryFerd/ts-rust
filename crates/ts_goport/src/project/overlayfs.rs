@@ -300,8 +300,8 @@ impl lsconv::Script for Overlay {
         &self.file_base.file_name
     }
 
-    fn text(&self) -> &str {
-        &self.file_base.content
+    fn text(&self) -> lsconv::ScriptText<'_> {
+        lsconv::ScriptText::Borrowed(&self.file_base.content)
     }
 
     // Go: project/overlayfs.go:147 Overlay.OriginalFileName (tsgo#4712)
@@ -318,8 +318,8 @@ impl lsconv::Script for Overlay {
     }
 
     // Go: project/overlayfs.go:154 Overlay.OriginalText (tsgo#4712)
-    fn original_text(&self) -> &str {
-        &self.file_base.content
+    fn original_text(&self) -> lsconv::ScriptText<'_> {
+        lsconv::ScriptText::Borrowed(&self.file_base.content)
     }
 }
 

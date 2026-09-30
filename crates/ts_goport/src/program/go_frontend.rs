@@ -127,10 +127,12 @@ impl ProjectReferenceCopies {
     }
 }
 
-/// What `parse_js_doc_for_node` needs from a parsed file.
+/// What `parse_js_doc_for_node` needs from a parsed file. It shares the
+/// file text (`FileText`), so it keeps the text of a freeable file version
+/// while it lives.
 struct LazyJsDocInput {
     parse_options: SourceFileParseOptions,
-    text: &'static str,
+    text: FileText,
     script_kind: ScriptKind,
 }
 
@@ -139,15 +141,22 @@ thread_local! {
     /// thread. PORT: the parsed file is shared and read only, so the lazy
     /// entries live here. The slices are leaked to give `NodeSlice` a static
     /// borrow. The parsed nodes are synthetic nodes of this thread, so each
-    /// thread keeps its own entries (see `WorkerSeed`).
-    static LAZY_JSDOC: RefCell<FxHashMap<Node, &'static [Node]>> = RefCell::new(FxHashMap::default());
+    /// thread keeps its own entries (see `WorkerSeed`). The entries of a
+    /// dead file version go, and so do its JSDoc nodes (a file scope,
+    /// `parse_lazy_js_doc`).
+    static LAZY_JSDOC: RefCell<PerFileMap<&'static [Node]>> = const { RefCell::new(PerFileMap::new()) };
     /// The file system of a checker worker thread (Go `host.FS()`, without the cache).
     static WORKER_FS: Rc<dyn Fs> = bundled::wrap_fs(osvfs_fs());
 }
 
 /// The lazy JSDoc entries of this thread, to seed a checker worker.
-pub(super) fn lazy_jsdoc_seed() -> FxHashMap<Node, &'static [Node]> {
-    LAZY_JSDOC.with(|cache| cache.borrow().clone())
+pub(super) fn lazy_jsdoc_seed() -> PerFileMap<&'static [Node]> {
+    LAZY_JSDOC.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        // The copy has no entries of dead file versions.
+        cache.write();
+        cache.clone()
+    })
 }
 
 /// The number of lazy JSDoc entries on this thread.
@@ -156,7 +165,7 @@ pub(super) fn lazy_jsdoc_count() -> usize {
 }
 
 /// Installs the entries of `lazy_jsdoc_seed` on a new checker worker.
-pub(super) fn install_lazy_jsdoc_seed(seed: FxHashMap<Node, &'static [Node]>) {
+pub(super) fn install_lazy_jsdoc_seed(seed: PerFileMap<&'static [Node]>) {
     LAZY_JSDOC.with(|cache| *cache.borrow_mut() = seed);
 }
 
@@ -220,7 +229,7 @@ pub(super) fn update_program_version(
     let old_np = FRONTENDS
         .with(|frontends| frontends.borrow().get(&old.id).cloned())
         .expect("the old program version has no frontend on this thread");
-    let cwd = state_of(old).cwd.clone();
+    let cwd = state_of(old).cwd.to_string();
     // A new version parses with no current program, like the first load.
     let _scope = crate::core::enter_program(None);
     // PORT: Go watch gives `UpdateProgram` a host whose cache no longer has
@@ -335,18 +344,19 @@ pub(super) fn publish_parsed_files(cwd: &str) {
 /// Go `parseJSDocForNode` for a lazy JSDoc read of `node` (ast/ast.go:2614
 /// `resolveJSDoc`). The result is cached in `LAZY_JSDOC`.
 fn parse_lazy_js_doc(input: &LazyJsDocInput, node: Node) -> &'static [Node] {
-    // The cache outlives program versions, so the nodes belong to the thread.
-    let _base = crate::ast::enter_base_synthetic_owner();
+    // The cache outlives program versions and keeps the nodes as long as
+    // `node` lives: they belong to its file version, or to the thread.
+    let _file = crate::ast::enter_file_synthetic_owner(node);
     let jsdocs: &'static [Node] = Box::leak(
         crate::frontend::parser::parse_js_doc_for_node(
             &input.parse_options,
-            input.text,
+            &input.text,
             input.script_kind,
             node,
         )
         .into_boxed_slice(),
     );
-    LAZY_JSDOC.with(|cache| cache.borrow_mut().insert(node, jsdocs));
+    LAZY_JSDOC.with(|cache| cache.borrow_mut().write().insert(node, jsdocs));
     jsdocs
 }
 
@@ -371,7 +381,7 @@ pub(super) fn resolve_js_doc_outside_program(file: Node, node: Node) -> Option<&
                     .filter(|parsed| parsed.store == store)?;
                 Some(Arc::new(LazyJsDocInput {
                     parse_options: parsed.parse_options.clone(),
-                    text: parsed.text,
+                    text: parsed.text.clone(),
                     script_kind: parsed.script_kind,
                 }))
             })
@@ -411,7 +421,7 @@ fn go_files_of_unpublished_stores(
         {
             let input = Arc::new(LazyJsDocInput {
                 parse_options: file.parse_options.clone(),
-                text: file.text,
+                text: file.text.clone(),
                 script_kind: file.script_kind,
             });
             OUTSIDE_PARSE_INPUTS.with(|inputs| inputs.borrow_mut().insert(store, input));
@@ -594,7 +604,7 @@ fn build_program(
     previous: Option<&'static GoProgram>,
 ) -> &'static GoProgram {
     let use_case_sensitive_file_names = osvfs_fs().use_case_sensitive_file_names();
-    let options = np.options().clone();
+    let options = crate::program::intern_compiler_options(np.options());
 
     // PERF: the publish keeps the parse of each new file, so each
     // `SourceFileInfo` can borrow its fields instead of copying them
@@ -662,7 +672,6 @@ fn build_program(
     }
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
         id,
-        source_file_order,
         options,
         state: OnceLock::new(),
     }));
@@ -705,16 +714,15 @@ fn build_program(
             .values()
             .filter_map(|file| file.version.get().cloned())
             .collect(),
-        ..VersionTables::new(file_by_path)
+        ..VersionTables::new(source_file_order, file_by_path)
     };
-    let program_state: &'static ProgramState = Box::leak(Box::new(ProgramState {
-        cwd,
+    let program_state = ProgramState {
+        cwd: intern_program_str(&cwd),
         use_case_sensitive_file_names,
-        resolved_modules: OnceLock::new(),
-        common_source_directory: OnceLock::from(common_source_directory_of(np)),
+        common_source_directory: Some(intern_program_str(&common_source_directory_of(np))),
         alias_resolver: false,
         tables: TablesSlot::new(tables, one_program),
-    }));
+    };
     assert!(program.state.set(program_state).is_ok());
     program
 }
@@ -995,7 +1003,7 @@ impl GoSharedState {
                     || {
                         Arc::new(LazyJsDocInput {
                             parse_options: file.parse_options.clone(),
-                            text: file.text,
+                            text: file.text.clone(),
                             script_kind: file.script_kind,
                         })
                     },
