@@ -20,6 +20,7 @@
 
 use crate::api::prelude::*;
 
+use crate::api::requestfilesystem;
 use crate::execute::tsc::diagnostics as diagnosticwriter;
 use crate::frontend::json::{
     JsonDecoder, JsonError, JsonToken, MarshalerTo, UnmarshalerFrom, json_unmarshal_decode,
@@ -131,10 +132,9 @@ impl IsZero for Method {
 // Go: proto.go:27
 // PORT: Go named integer and string types are newtypes. Their JSON form,
 // zero test and `%v` text are those of the underlying Go type.
+// ts#64319: Go `project::ID` is gone; the api uses `project::ID` (JSON below).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SnapshotID(pub u64);
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ProjectID(pub String);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SymbolID(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -183,11 +183,57 @@ macro_rules! handle_json {
 }
 
 handle_json!(uint: SnapshotID, SymbolID, TypeID, SignatureID);
-handle_json!(string: ProjectID, NodeHandle);
+handle_json!(string: NodeHandle);
 
-// Go: proto.go:36 ProjectHandle
-pub fn project_handle(p: &project::Project) -> ProjectID {
-    ProjectID(p.id().0)
+// PORT: Go `project.ID` and `project.Syntheticproject::ID` (ts#64319) are Go
+// string types: JSON uses the v2 string arshaler, except the Go
+// `Syntheticproject::ID.UnmarshalJSONFrom`, ported here. The project package
+// has no JSON code for them, so their trait impls live with the protocol.
+impl MarshalerTo for project::ID {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
+
+impl UnmarshalerFrom for project::ID {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        json_ext::unmarshal_string_as(dec, &mut self.0, "project.ID")
+    }
+}
+
+impl IsZero for project::ID {
+    fn is_zero(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl MarshalerTo for project::Syntheticproject::ID {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        self.0.marshal_json_to(enc)
+    }
+}
+
+// Go: project/project.go Syntheticproject::ID.UnmarshalJSONFrom (ts#64319)
+impl UnmarshalerFrom for project::Syntheticproject::ID {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let mut value = String::new();
+        json_unmarshal_decode(dec, &mut value)?;
+        let (parsed, ok) = project::parse_synthetic_project_id(&value);
+        if !ok {
+            return Err(SemanticError::method(
+                ErrorPos::After,
+                format!("invalid synthetic project ID: {value}"),
+            ));
+        }
+        *self = parsed;
+        Ok(())
+    }
+}
+
+impl IsZero for project::Syntheticproject::ID {
+    fn is_zero(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 // Go: proto.go:40 SymbolHandle
@@ -220,10 +266,7 @@ pub fn signature_handle(sig: SignatureId) -> SignatureID {
     SignatureID(u64::from(sig.0))
 }
 
-// Go: proto.go:52 parseProjectHandle
-pub fn parse_project_handle(handle: &ProjectID) -> tspath::Path {
-    tspath::Path(handle.0.clone())
-}
+// ts#64319: Go `parseProjectHandle` is gone.
 
 // Go: proto.go:56
 impl Method {
@@ -235,9 +278,13 @@ impl Method {
     // tsgo#4915: MethodGetServerTiming and MethodResetServerTiming are gone;
     // the connection answers them (`ipc::timing`).
     pub const INITIALIZE: Method = Method(Cow::Borrowed("initialize"));
+    // ts#64204: createSnapshot, updateSnapshot (new params) and
+    // getCurrentLanguageServerSnapshot replace updateSnapshot and
+    // updateTemporarySnapshot.
+    pub const CREATE_SNAPSHOT: Method = Method(Cow::Borrowed("createSnapshot"));
     pub const UPDATE_SNAPSHOT: Method = Method(Cow::Borrowed("updateSnapshot"));
-    // tsgo#4642
-    pub const UPDATE_TEMPORARY_SNAPSHOT: Method = Method(Cow::Borrowed("updateTemporarySnapshot"));
+    pub const GET_CURRENT_LANGUAGE_SERVER_SNAPSHOT: Method =
+        Method(Cow::Borrowed("getCurrentLanguageServerSnapshot"));
     pub const PARSE_COMMAND_LINE: Method = Method(Cow::Borrowed("parseCommandLine"));
     pub const READ_CONFIG_FILE: Method = Method(Cow::Borrowed("readConfigFile"));
     pub const PARSE_JSON_CONFIG_FILE: Method = Method(Cow::Borrowed("parseJsonConfigFileContent"));
@@ -634,91 +681,306 @@ impl std::fmt::Display for DocumentIdentifier {
     }
 }
 
-// APIFileChangeSummary lists documents that have been changed, created, or deleted.
-// Go: proto.go:252 APIFileChangeSummary
+// FileNotifications describes changes to files that have occurred on the host
+// file system, used to notify the session to reload cached files and reevaluate
+// tsconfig.json `include` globs. Either InvalidateAll is true (discard all caches)
+// or Changed/Created/Deleted list individual documents.
+// Go: proto.go FileNotifications (ts#64204; was APIFileChanges)
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct APIFileChangeSummary {
-    pub changed: Vec<DocumentIdentifier>,
-    pub created: Vec<DocumentIdentifier>,
-    pub deleted: Vec<DocumentIdentifier>,
-}
-
-proto_json!(marshal APIFileChangeSummary {
-    changed: "changed" omitempty,
-    created: "created" omitempty,
-    deleted: "deleted" omitempty,
-});
-
-// APIFileChanges describes file changes to apply when updating a snapshot.
-// Either InvalidateAll is true (discard all caches) or Changed/Created/Deleted
-// list individual documents.
-// Go: proto.go:261 APIFileChanges
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct APIFileChanges {
+pub struct FileNotifications {
     pub invalidate_all: bool,
     pub changed: Vec<DocumentIdentifier>,
     pub created: Vec<DocumentIdentifier>,
     pub deleted: Vec<DocumentIdentifier>,
 }
 
-proto_json!(both APIFileChanges {
+proto_json!(both FileNotifications {
     invalidate_all: "invalidateAll" omitempty,
     changed: "changed" omitempty,
     created: "created" omitempty,
     deleted: "deleted" omitempty,
 });
 
-// UpdateSnapshotParams are the parameters for creating a new snapshot.
-// All fields are optional. With no fields set, the server adopts the latest LSP state.
-// Go: proto.go:308 UpdateSnapshotParams
+// SnapshotRequestChangesParams describes project, file, and program changes to apply
+// while creating or updating a snapshot.
+// Go: proto.go SnapshotRequestChangesParams (ts#64204, ts#64319, ts#64374)
+// PORT: Go `[]*CreateSnapshotProgramParams` can hold nil elements (a JSON
+// `null`), which the session rejects, so they are `Vec<Option<..>>`. Go
+// `CreatePrograms != nil` (an empty array included) is `Some`.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct UpdateSnapshotParams {
+pub struct SnapshotRequestChangesParams {
     // OpenProjects lists tsconfig.json files to open/load in the new snapshot.
-    // Opens are ref-counted and persist across snapshots until closed.
     pub open_projects: Vec<DocumentIdentifier>,
     // CloseProjects lists tsconfig.json files to release in the new snapshot.
     // A project is only unloaded once every API client that opened it closes it.
     pub close_projects: Vec<DocumentIdentifier>,
-    // FileChanges describes file system changes since the last snapshot.
-    pub file_changes: Option<APIFileChanges>,
-    // OpenFiles lists files to keep open for the API client, mirroring LSP's
+    // OpenFiles lists files to open in the new snapshot, mirroring LSP's
     // textDocument/didOpen. For each file, ancestor directories are searched for a
     // tsconfig that contains it; if found, that configured project is loaded and
     // becomes the file's default project. Otherwise the file is loaded into the
     // inferred project (e.g. a node_modules d.ts not in any project's import graph).
-    // Opens persist across snapshots until the file is closed.
-    pub open_files: Vec<DocumentIdentifier>,
+    // If a file cannot be loaded into any project, the request fails.
+    pub open_files: Option<Vec<DocumentIdentifier>>,
     // CloseFiles lists files to release in the new snapshot. A file is only fully
     // closed once every API client that opened it closes it.
     pub close_files: Vec<DocumentIdentifier>,
+    // CreatePrograms describes synthetic programs to create in the snapshot.
+    pub create_programs: Option<Vec<Option<CreateSnapshotProgramParams>>>,
+    // ReconfigurePrograms replaces the configuration of existing synthetic programs.
+    pub reconfigure_programs: Vec<Option<ReconfigureSnapshotProgramParams>>,
+    // RemovePrograms lists synthetic project handles to remove from the snapshot.
+    pub remove_programs: Vec<project::Syntheticproject::ID>,
+    // EnsurePrograms identifies projects whose programs should be updated if dirty,
+    // or all contained projects when true.
+    pub ensure_programs: Option<EnsurePrograms>,
+}
+
+impl SnapshotRequestChangesParams {
+    /// The members of Go `SnapshotRequestChangesParams`, which the structs
+    /// that embed it decode inline (Go embedded struct fields).
+    fn unmarshal_member(
+        &mut self,
+        name: &str,
+        dec: &mut JsonDecoder<'_>,
+    ) -> Result<bool, JsonError> {
+        match name {
+            "openProjects" => json_unmarshal_decode(dec, &mut self.open_projects)?,
+            "closeProjects" => json_unmarshal_decode(dec, &mut self.close_projects)?,
+            "openFiles" => json_unmarshal_decode(dec, &mut self.open_files)?,
+            "closeFiles" => json_unmarshal_decode(dec, &mut self.close_files)?,
+            "createPrograms" => json_unmarshal_decode(dec, &mut self.create_programs)?,
+            "reconfigurePrograms" => json_unmarshal_decode(dec, &mut self.reconfigure_programs)?,
+            "removePrograms" => json_unmarshal_decode(dec, &mut self.remove_programs)?,
+            "ensurePrograms" => json_unmarshal_decode(dec, &mut self.ensure_programs)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+impl UnmarshalerFrom for SnapshotRequestChangesParams {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object =
+            unmarshal_struct_fields(dec, "api.SnapshotRequestChangesParams", |name, dec| {
+                self.unmarshal_member(name, dec)
+            })?;
+        if !is_object {
+            *self = SnapshotRequestChangesParams::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go EnsurePrograms (ts#64204, ts#64319)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EnsurePrograms {
+    pub all: bool,
+    pub projects: Vec<project::ID>,
+}
+
+// Go: proto.go EnsurePrograms.UnmarshalJSONFrom (ts#64204)
+impl UnmarshalerFrom for EnsurePrograms {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let value = dec.read_value()?.to_vec();
+        if value == b"true" {
+            self.all = true;
+            return Ok(());
+        }
+        if value.first() != Some(&b'[') {
+            return Err(SemanticError::method(
+                ErrorPos::After,
+                "ensurePrograms must be true or an array of project IDs",
+            ));
+        }
+        crate::frontend::json::json_unmarshal(&value, &mut self.projects)
+    }
+}
+
+// CreateSnapshotParams are the parameters for creating a new independent snapshot.
+// Go: proto.go CreateSnapshotParams (ts#64204, ts#64115)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CreateSnapshotParams {
+    pub snapshot_request_changes_params: SnapshotRequestChangesParams,
+    // FileNotifications describes host file system changes to invalidate while creating the snapshot.
+    pub file_notifications: Option<FileNotifications>,
+    // FileSystem supplies file contents and directory listings for the new snapshot.
+    // A full filesystem is canonical and total. A filesystem layer is checked
+    // before falling back to the base snapshot or host filesystem.
+    pub file_system: Option<requestfilesystem::RequestFileSystem>,
+}
+
+impl UnmarshalerFrom for CreateSnapshotParams {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object = unmarshal_struct_fields(dec, "api.CreateSnapshotParams", |name, dec| {
+            match name {
+                "fileNotifications" => json_unmarshal_decode(dec, &mut self.file_notifications)?,
+                "fileSystem" => json_unmarshal_decode(dec, &mut self.file_system)?,
+                _ => {
+                    return self
+                        .snapshot_request_changes_params
+                        .unmarshal_member(name, dec);
+                }
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = CreateSnapshotParams::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go CreateSnapshotProgramParams (ts#64204, ts#64324)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CreateSnapshotProgramParams {
+    pub root_files: Vec<DocumentIdentifier>,
+    pub compiler_options: CompilerOptions,
+    pub options: Option<CreateProgramOptions>,
+}
+
+// PORT: the params are only decoded (`core.CompilerOptions` has no plain
+// marshaler in the port), so only the decode is written.
+impl UnmarshalerFrom for CreateSnapshotProgramParams {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object =
+            unmarshal_struct_fields(dec, "api.CreateSnapshotProgramParams", |name, dec| {
+                match name {
+                    "rootFiles" => json_unmarshal_decode(dec, &mut self.root_files)?,
+                    "compilerOptions" => json_unmarshal_decode(dec, &mut self.compiler_options)?,
+                    "options" => json_unmarshal_decode(dec, &mut self.options)?,
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            })?;
+        if !is_object {
+            *self = CreateSnapshotProgramParams::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go ReconfigureSnapshotProgramParams (ts#64204, ts#64319, ts#64324)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReconfigureSnapshotProgramParams {
+    pub id: project::Syntheticproject::ID,
+    pub root_files: Vec<DocumentIdentifier>,
+    pub compiler_options: CompilerOptions,
+    pub options: Option<CreateProgramOptions>,
+}
+
+impl UnmarshalerFrom for ReconfigureSnapshotProgramParams {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object =
+            unmarshal_struct_fields(dec, "api.ReconfigureSnapshotProgramParams", |name, dec| {
+                match name {
+                    "id" => json_unmarshal_decode(dec, &mut self.id)?,
+                    "rootFiles" => json_unmarshal_decode(dec, &mut self.root_files)?,
+                    "compilerOptions" => json_unmarshal_decode(dec, &mut self.compiler_options)?,
+                    "options" => json_unmarshal_decode(dec, &mut self.options)?,
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            })?;
+        if !is_object {
+            *self = ReconfigureSnapshotProgramParams::default();
+        }
+        Ok(())
+    }
+}
+
+// UpdateSnapshotParams are the parameters for deriving a snapshot from an existing one.
+// Go: proto.go UpdateSnapshotParams (ts#64204)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UpdateSnapshotParams {
+    pub snapshot: SnapshotID,
+    pub changes: Option<CreateSnapshotParams>,
 }
 
 proto_json!(both UpdateSnapshotParams {
-    open_projects: "openProjects" omitempty,
-    close_projects: "closeProjects" omitempty,
-    file_changes: "fileChanges" omitempty,
-    open_files: "openFiles" omitempty,
-    close_files: "closeFiles" omitempty,
+    snapshot: "snapshot" plain,
+    changes: "changes" omitempty,
 });
 
-// UpdateTemporarySnapshotParams are the parameters for creating a temporary
-// snapshot that overrides a single file's content.
-// Go: proto.go:360 UpdateTemporarySnapshotParams (tsgo#4642)
+// Go: proto.go GetCurrentLanguageServerSnapshotParams (ts#64204)
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct UpdateTemporarySnapshotParams {
-    // Snapshot is the current client snapshot on which to layer the temporary update.
-    pub snapshot: SnapshotID,
-    // File identifies the file whose content is temporarily overridden.
-    pub file: DocumentIdentifier,
-    // NewText is the temporary content for the file.
-    pub new_text: String,
+pub struct GetCurrentLanguageServerSnapshotParams {
+    pub base_snapshot: SnapshotID,
+    pub changes: Option<LanguageServerSnapshotChanges>,
 }
 
-proto_json!(both UpdateTemporarySnapshotParams {
-    snapshot: "snapshot" plain,
-    file: "file" plain,
-    new_text: "newText" plain,
+proto_json!(both GetCurrentLanguageServerSnapshotParams {
+    base_snapshot: "baseSnapshot" omitempty,
+    changes: "changes" omitempty,
 });
+
+// LanguageServerSnapshotChanges describes API-driven changes to adopt into the
+// language server's canonical state.
+// Go: proto.go LanguageServerSnapshotChanges (ts#64204)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LanguageServerSnapshotChanges {
+    pub snapshot_request_changes_params: SnapshotRequestChangesParams,
+}
+
+impl UnmarshalerFrom for LanguageServerSnapshotChanges {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object =
+            unmarshal_struct_fields(dec, "api.LanguageServerSnapshotChanges", |name, dec| {
+                self.snapshot_request_changes_params
+                    .unmarshal_member(name, dec)
+            })?;
+        if !is_object {
+            *self = LanguageServerSnapshotChanges::default();
+        }
+        Ok(())
+    }
+}
+
+// PORT: Go decodes `core.ProjectReference` by reflection (the fields
+// `path`, `originalPath` and `circular`); only the api decodes it.
+impl UnmarshalerFrom for ProjectReference {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object = unmarshal_struct_fields(dec, "core.ProjectReference", |name, dec| {
+            match name {
+                "path" => json_unmarshal_decode(dec, &mut self.path)?,
+                "originalPath" => json_unmarshal_decode(dec, &mut self.original_path)?,
+                "circular" => json_unmarshal_decode(dec, &mut self.circular)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = ProjectReference::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go CreateProgramOptions (ts#63950, ts#64324)
+// PORT: Go `[]*core.ProjectReference` elements are never nil here.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CreateProgramOptions {
+    pub project_references: Vec<ProjectReference>,
+    pub config_file_parsing_diagnostics: Vec<DiagnosticResponse>,
+}
+
+impl UnmarshalerFrom for CreateProgramOptions {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object = unmarshal_struct_fields(dec, "api.CreateProgramOptions", |name, dec| {
+            match name {
+                "projectReferences" => json_unmarshal_decode(dec, &mut self.project_references)?,
+                "configFileParsingDiagnostics" => {
+                    json_unmarshal_decode(dec, &mut self.config_file_parsing_diagnostics)?
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = CreateProgramOptions::default();
+        }
+        Ok(())
+    }
+}
 
 // ProjectFileChanges describes what source files changed within a single project.
 // Go: proto.go:278 ProjectFileChanges
@@ -744,18 +1006,18 @@ impl MarshalerTo for ProjectFileChanges {
     }
 }
 
-// SnapshotChanges describes what changed between the previous latest snapshot
-// and the newly created snapshot. Changes are reported per-project so clients
+// SnapshotChanges describes what changed between a response base and a new
+// snapshot. Changes are reported per-project so clients
 // can track cache refs at the (snapshot, project) level.
-// Go: proto.go:288 SnapshotChanges
+// Go: proto.go SnapshotChanges (ts#64204, ts#64319)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SnapshotChanges {
     // ChangedProjects maps project handles to the file changes within that project.
     // Projects not listed here (and not in RemovedProjects) are unchanged.
-    pub changed_projects: IndexMap<ProjectID, ProjectFileChanges>,
+    pub changed_projects: IndexMap<project::ID, ProjectFileChanges>,
     // RemovedProjects lists project handles that were present in the previous
     // snapshot but absent from the new one.
-    pub removed_projects: Vec<ProjectID>,
+    pub removed_projects: Vec<project::ID>,
 }
 
 impl MarshalerTo for SnapshotChanges {
@@ -774,11 +1036,11 @@ impl MarshalerTo for SnapshotChanges {
     }
 }
 
-// Go v2 map marshal of `map[ProjectID]*ProjectFileChanges`: an object with
+// Go v2 map marshal of `map[project.ID]*ProjectFileChanges`: an object with
 // the handles as names.
 // PORT: Go map order is random; the port writes insertion order. Go values
 // are never nil pointers, so the map holds values.
-struct ProjectChangesJSON<'a>(&'a IndexMap<ProjectID, ProjectFileChanges>);
+struct ProjectChangesJSON<'a>(&'a IndexMap<project::ID, ProjectFileChanges>);
 
 impl MarshalerTo for ProjectChangesJSON<'_> {
     fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
@@ -796,23 +1058,56 @@ impl MarshalerTo for ProjectChangesJSON<'_> {
     }
 }
 
-// UpdateSnapshotResponse is returned by updateSnapshot.
-// Go: proto.go:298 UpdateSnapshotResponse
+// CreateSnapshotResponse is returned by createSnapshot.
+// Go: proto.go CreateSnapshotResponse (ts#64204; was UpdateSnapshotResponse)
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct UpdateSnapshotResponse {
+pub struct CreateSnapshotResponse {
     // Snapshot is the handle for the newly created snapshot.
     pub snapshot: SnapshotID,
-    // Projects is the list of projects in the snapshot.
+    // Projects contains all projects when no response base was supplied, or only
+    // projects added or replaced relative to that base.
     pub projects: Vec<ProjectResponse>,
-    // Changes describes source file differences from the previous snapshot.
-    // Nil for the first snapshot in a session.
+    // Changes describes source file differences from the response base.
     pub changes: Option<SnapshotChanges>,
+    // Operation describes results correlated with the request that produced the snapshot.
+    pub operation: Option<SnapshotOperationResponse>,
 }
 
-proto_json!(marshal UpdateSnapshotResponse {
+proto_json!(marshal CreateSnapshotResponse {
     snapshot: "snapshot" plain,
     projects: "projects" plain,
     changes: "changes" omitempty,
+    operation: "operation" plain,
+});
+
+// Go: proto.go SnapshotOperationResponse (ts#64204, ts#64319)
+// PORT: Go `*[]T` with `omitzero`: `None` is the nil pointer (omitted);
+// `Some(vec![])` writes `[]`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SnapshotOperationResponse {
+    pub created_programs: Option<Vec<project::Syntheticproject::ID>>,
+    pub opened_files: Option<Vec<OpenedFileOperationResult>>,
+}
+
+impl MarshalerTo for SnapshotOperationResponse {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_opt_field(enc, &mut first, "createdPrograms", &self.created_programs)?;
+        marshal_opt_field(enc, &mut first, "openedFiles", &self.opened_files)?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+// Go: proto.go OpenedFileOperationResult (ts#64204, ts#64319)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OpenedFileOperationResult {
+    pub project: project::ID,
+}
+
+proto_json!(marshal OpenedFileOperationResult {
+    project: "project" plain,
 });
 
 /// Go `func([]byte) (any, error)` in `unmarshalers`.
@@ -828,13 +1123,18 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     );
     m.insert(Method::RELEASE, unmarshaller_for::<ReleaseParams>);
     m.insert(Method::INITIALIZE, no_params);
+    // ts#64204
+    m.insert(
+        Method::CREATE_SNAPSHOT,
+        unmarshaller_for::<CreateSnapshotParams>,
+    );
     m.insert(
         Method::UPDATE_SNAPSHOT,
         unmarshaller_for::<UpdateSnapshotParams>,
     );
     m.insert(
-        Method::UPDATE_TEMPORARY_SNAPSHOT,
-        unmarshaller_for::<UpdateTemporarySnapshotParams>,
+        Method::GET_CURRENT_LANGUAGE_SERVER_SNAPSHOT,
+        unmarshaller_for::<GetCurrentLanguageServerSnapshotParams>,
     );
     m.insert(
         Method::PARSE_COMMAND_LINE,
@@ -1833,10 +2133,12 @@ proto_json!(both GetDefaultProjectForFileParams {
 // Go: proto.go:432 ProjectResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProjectResponse {
-    pub id: ProjectID,
+    pub id: project::ID,
     pub config_file_name: String,
     // ts#63935
     pub current_directory: String,
+    // ts#64204
+    pub dirty: bool,
     pub parsed_command_line: Option<ConfigFileResponse>,
     // Deprecated: Use parsedCommandLine.fileNames.
     pub root_files: Vec<String>,
@@ -1851,6 +2153,7 @@ impl MarshalerTo for ProjectResponse {
         marshal_field(enc, &mut first, "id", &self.id)?;
         marshal_field(enc, &mut first, "configFileName", &self.config_file_name)?;
         marshal_field(enc, &mut first, "currentDirectory", &self.current_directory)?;
+        marshal_field(enc, &mut first, "dirty", &self.dirty)?;
         marshal_field(
             enc,
             &mut first,
@@ -1933,11 +2236,18 @@ pub fn new_project_response(p: &project::Project) -> ProjectResponse {
     let Some(command_line) = p.command_line.as_ref() else {
         panic!("NewProjectResponse called with unloaded project");
     };
+    // ts#64204: the config file name of a configured project only.
+    let mut config_file_name = String::new();
+    if p.kind == project::Kind::CONFIGURED {
+        config_file_name = p.config_file_name();
+    }
     ProjectResponse {
-        id: project_handle(p),
-        config_file_name: p.name(),
+        id: p.id(),
+        config_file_name,
         // PORT: Go `p.CurrentDirectory()` (ts#63935) returns this field.
         current_directory: p.current_directory.clone(),
+        // PORT: Go `p.IsDirty()` returns this field.
+        dirty: p.dirty,
         parsed_command_line: new_config_file_response(Some(command_line)),
         root_files: command_line.file_names().to_vec(),
         compiler_options: Some((**command_line.compiler_options()).clone()),
@@ -1948,7 +2258,7 @@ pub fn new_project_response(p: &project::Project) -> ProjectResponse {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolAtPositionParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
     pub position: u32,
 }
@@ -1964,7 +2274,7 @@ proto_json!(both GetSymbolAtPositionParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolsAtPositionsParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
     pub positions: Vec<u32>,
 }
@@ -1980,7 +2290,7 @@ proto_json!(both GetSymbolsAtPositionsParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolOfSourceFileParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
 }
 
@@ -1994,7 +2304,7 @@ proto_json!(both GetSymbolOfSourceFileParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolsOfSourceFilesParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub files: Vec<DocumentIdentifier>,
 }
 
@@ -2008,7 +2318,7 @@ proto_json!(both GetSymbolsOfSourceFilesParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolAtLocationParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub location: NodeHandle,
 }
 
@@ -2022,7 +2332,7 @@ proto_json!(both GetSymbolAtLocationParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolsAtLocationsParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub locations: Vec<NodeHandle>,
 }
 
@@ -2038,7 +2348,7 @@ pub struct SymbolResponse {
     pub id: SymbolID,
     // Project is the project in which the symbol was first observed. It is the
     // default project for follow-up lookups whose results can vary by project.
-    pub project: ProjectID,
+    pub project: project::ID,
     pub name: String,
     pub flags: u32,
     pub check_flags: u32,
@@ -2076,7 +2386,7 @@ pub fn symbol_handles(symbols: &SymbolArena, symbol_list: &[SymbolId]) -> Vec<Sy
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeOfSymbolParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub symbol: SymbolID,
 }
 
@@ -2090,7 +2400,7 @@ proto_json!(both GetTypeOfSymbolParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypesOfSymbolsParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub symbols: Vec<SymbolID>,
 }
 
@@ -2398,7 +2708,7 @@ proto_json!(marshal SignatureResponse {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSourceFileParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
 }
 
@@ -2412,7 +2722,7 @@ proto_json!(both GetSourceFileParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSourceFileNamesParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
 }
 
 proto_json!(both GetSourceFileNamesParams {
@@ -2460,7 +2770,7 @@ core_int_json!(ModuleKind: "core.ModuleKind", ScriptKind: "core.ScriptKind");
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetModeForUsageLocationParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
     pub usage: NodeHandle,
 }
@@ -2476,7 +2786,7 @@ proto_json!(both GetModeForUsageLocationParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetModeForResolutionAtIndexParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
     pub index: i32,
 }
@@ -2492,7 +2802,7 @@ proto_json!(both GetModeForResolutionAtIndexParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetResolvedModuleParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
     pub module_name: String,
     pub mode: ResolutionMode,
@@ -2510,7 +2820,7 @@ proto_json!(both GetResolvedModuleParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetResolvedModuleFromModuleSpecifierParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub module_specifier: NodeHandle,
     pub source_file: Option<DocumentIdentifier>,
 }
@@ -2526,7 +2836,7 @@ proto_json!(both GetResolvedModuleFromModuleSpecifierParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetResolvedTypeReferenceDirectiveParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
     pub type_directive_name: String,
     pub mode: ResolutionMode,
@@ -2544,7 +2854,7 @@ proto_json!(both GetResolvedTypeReferenceDirectiveParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetResolvedTypeReferenceDirectiveFromReferenceParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub source_file: DocumentIdentifier,
     pub type_directive_name: String,
     pub resolution_mode: ResolutionMode,
@@ -2657,7 +2967,7 @@ proto_json!(marshal SourceFileMetadata {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResolveNameParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub name: String,
     pub location: NodeHandle, // Optional: node handle for location context
     pub file: Option<DocumentIdentifier>, // Optional: file for location context (alternative to Location)
@@ -2683,7 +2993,7 @@ proto_json!(both ResolveNameParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolsInScopeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub location: NodeHandle, // Optional: node handle for location context
     pub file: Option<DocumentIdentifier>, // Optional: file for location context (alternative to Location)
     pub position: Option<u32>, // Optional: position in file for location context (with File)
@@ -2704,7 +3014,7 @@ proto_json!(both GetSymbolsInScopeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypePropertyParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub type_: TypeID,
 }
 
@@ -2719,7 +3029,7 @@ proto_json!(both GetTypePropertyParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolPropertyParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub symbol: SymbolID,
 }
 
@@ -2734,7 +3044,7 @@ proto_json!(both GetSymbolPropertyParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSignaturePropertyParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub signature: SignatureID,
 }
 
@@ -2749,7 +3059,7 @@ proto_json!(both GetSignaturePropertyParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetContextualTypeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub location: NodeHandle,
 }
 
@@ -2763,7 +3073,7 @@ proto_json!(both GetContextualTypeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetContextualTypeForArgumentParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub location: NodeHandle,
     pub index: i32,
 }
@@ -2780,7 +3090,7 @@ proto_json!(both GetContextualTypeForArgumentParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeOfSymbolAtLocationParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub symbol: SymbolID,
     pub location: NodeHandle,
 }
@@ -2797,7 +3107,7 @@ proto_json!(both GetTypeOfSymbolAtLocationParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetReferencesToSymbolInFileParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
     pub symbol: SymbolID,
 }
@@ -2814,7 +3124,7 @@ proto_json!(both GetReferencesToSymbolInFileParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetReferencedSymbolsForNodeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub node: NodeHandle,
     pub position: i32,
 }
@@ -2846,7 +3156,7 @@ proto_json!(marshal ReferencedSymbolEntry {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSignatureUsagesParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub signature_decl: NodeHandle,
 }
 
@@ -2874,7 +3184,7 @@ proto_json!(marshal SignatureUsageResponse {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetCompletionsAtPositionParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
     pub position: u32,
     pub trigger_character: Option<String>,
@@ -2946,7 +3256,7 @@ proto_json!(marshal CompletionInfoResponse {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetIntrinsicTypeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
 }
 
 proto_json!(both GetIntrinsicTypeParams {
@@ -2989,7 +3299,7 @@ proto_json!(marshal WellKnownSignaturesResponse {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetBaseTypeOfLiteralTypeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub type_: TypeID,
 }
 
@@ -3004,7 +3314,7 @@ proto_json!(both GetBaseTypeOfLiteralTypeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetNonNullableTypeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub type_: TypeID,
 }
 
@@ -3019,7 +3329,7 @@ proto_json!(both GetNonNullableTypeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeFromTypeNodeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub location: NodeHandle,
 }
 
@@ -3034,7 +3344,7 @@ proto_json!(both GetTypeFromTypeNodeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetWidenedTypeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub type_: TypeID,
 }
 
@@ -3049,7 +3359,7 @@ proto_json!(both GetWidenedTypeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetParameterTypeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub signature: SignatureID,
     pub index: i32,
 }
@@ -3066,7 +3376,7 @@ proto_json!(both GetParameterTypeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IsArrayLikeTypeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub type_: TypeID,
 }
 
@@ -3081,7 +3391,7 @@ proto_json!(both IsArrayLikeTypeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IsTypeAssignableToParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub source: TypeID,
     pub target: TypeID,
 }
@@ -3097,7 +3407,7 @@ proto_json!(both IsTypeAssignableToParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSignaturesOfTypeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub type_: TypeID,
     pub kind: i32,
 }
@@ -3113,7 +3423,7 @@ proto_json!(both GetSignaturesOfTypeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetResolvedSignatureParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub location: NodeHandle,
 }
 
@@ -3127,7 +3437,7 @@ proto_json!(both GetResolvedSignatureParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeAtLocationParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub location: NodeHandle,
 }
 
@@ -3141,7 +3451,7 @@ proto_json!(both GetTypeAtLocationParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeAtLocationsParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub locations: Vec<NodeHandle>,
 }
 
@@ -3155,7 +3465,7 @@ proto_json!(both GetTypeAtLocationsParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeAtPositionParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
     pub position: u32,
 }
@@ -3171,7 +3481,7 @@ proto_json!(both GetTypeAtPositionParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypesAtPositionsParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
     pub positions: Vec<u32>,
 }
@@ -3211,7 +3521,7 @@ proto_json!(both ImportAdderAction {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetImportAdderEditsParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier,
     pub actions: Vec<ImportAdderAction>,
 }
@@ -3242,7 +3552,7 @@ proto_json!(marshal TextEdit {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TypeToTypeNodeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub type_: TypeID,
     pub location: NodeHandle,
     pub flags: i32,
@@ -3261,7 +3571,7 @@ proto_json!(both TypeToTypeNodeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SignatureToSignatureDeclarationParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub signature: SignatureID,
     pub kind: i32,
     pub location: NodeHandle,
@@ -3299,7 +3609,7 @@ proto_json!(both PrintNodeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EmitParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub emit_only: Option<u32>,
 }
 
@@ -3315,7 +3625,7 @@ proto_json!(both EmitParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SelectedFilesEmitParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub files: Option<Vec<DocumentIdentifier>>,
 }
 
@@ -3331,12 +3641,17 @@ pub struct EmitResponse {
     pub emit_skipped: bool,
     pub diagnostics: Vec<DiagnosticResponse>,
     pub emitted_files: Vec<String>,
+    // EmittedFilesContents contains contents parallel to EmittedFiles when the
+    // source snapshot uses a full filesystem. It is empty for write-through emits.
+    // ts#64115
+    pub emitted_files_contents: Vec<String>,
 }
 
 proto_json!(marshal EmitResponse {
     emit_skipped: "emitSkipped" plain,
     diagnostics: "diagnostics" plain,
     emitted_files: "emittedFiles" plain,
+    emitted_files_contents: "emittedFilesContents" plain,
 });
 
 // Go: proto.go:1304 EmitOutputFile (tsgo#4699)
@@ -3372,7 +3687,7 @@ proto_json!(marshal EmitOutputResponse {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FormatNodeForInsertionParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub file: DocumentIdentifier, // target file where the node will be inserted
     pub position: u32, // UTF-16 code-unit offset of the insertion position in the target file
     pub data: String,  // base64-encoded binary AST data for the synthesized node
@@ -3391,7 +3706,7 @@ proto_json!(both FormatNodeForInsertionParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CheckerTypeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub type_: TypeID,
 }
 
@@ -3406,7 +3721,7 @@ proto_json!(both CheckerTypeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetPropertyOfTypeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub type_: TypeID,
     pub name: String,
 }
@@ -3422,7 +3737,7 @@ proto_json!(both GetPropertyOfTypeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetIndexInfoOfTypeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub type_: TypeID,
     pub kind: i32,
 }
@@ -3439,7 +3754,7 @@ proto_json!(both GetIndexInfoOfTypeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CheckerNodeParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub location: NodeHandle,
 }
 
@@ -3454,7 +3769,7 @@ proto_json!(both CheckerNodeParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetMemberInModuleExportsParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub symbol: SymbolID,
     pub name: String,
 }
@@ -3471,7 +3786,7 @@ proto_json!(both GetMemberInModuleExportsParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CheckerSymbolParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub symbol: SymbolID,
 }
 
@@ -3500,7 +3815,7 @@ proto_json!(marshal JSDocTagInfo {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CheckerSignatureParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub signature: SignatureID,
 }
 
@@ -3565,7 +3880,7 @@ proto_json!(marshal SourceFileResponse {
 // tells them apart.
 pub struct GetDiagnosticsParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
     pub files: Option<Vec<DocumentIdentifier>>,
 }
 
@@ -3580,7 +3895,7 @@ proto_json!(both GetDiagnosticsParams {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetProjectDiagnosticsParams {
     pub snapshot: SnapshotID,
-    pub project: ProjectID,
+    pub project: project::ID,
 }
 
 proto_json!(both GetProjectDiagnosticsParams {
@@ -3590,7 +3905,8 @@ proto_json!(both GetProjectDiagnosticsParams {
 
 // DiagnosticResponse is the API response for a single diagnostic.
 // Go: proto.go:977 DiagnosticResponse
-// PORT: no `Default`; `diagnostics.Category` has none in the port.
+// PORT: `Default` is written below; `diagnostics.Category` has none in the
+// port.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DiagnosticResponse {
     // FileName is the path of the file this diagnostic belongs to, if any.
@@ -3662,6 +3978,100 @@ impl MarshalerTo for DiagnosticResponse {
     }
 }
 
+// PORT: Go `diagnostics.Category` is a Go int32 type; the Go zero value is
+// `CategoryWarning`.
+impl Default for DiagnosticResponse {
+    fn default() -> Self {
+        DiagnosticResponse {
+            file_name: String::new(),
+            pos: 0,
+            end: 0,
+            start_position: None,
+            end_position: None,
+            source_lines: Vec::new(),
+            code: 0,
+            category: crate::diagnostics::Category::Warning,
+            source: String::new(),
+            text: String::new(),
+            reports_unnecessary: false,
+            reports_deprecated: false,
+            message_chain: Vec::new(),
+            related_information: Vec::new(),
+        }
+    }
+}
+
+// PORT: the Go v2 default struct unmarshal of `DiagnosticResponse`
+// (`CreateProgramOptions.ConfigFileParsingDiagnostics`, ts#63950). A
+// `category` outside the four Go constants is a decode error here (the Rust
+// enum holds only those).
+impl UnmarshalerFrom for DiagnosticResponse {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object = unmarshal_struct_fields(dec, "api.DiagnosticResponse", |name, dec| {
+            match name {
+                "fileName" => json_unmarshal_decode(dec, &mut self.file_name)?,
+                "pos" => json_unmarshal_decode(dec, &mut self.pos)?,
+                "end" => json_unmarshal_decode(dec, &mut self.end)?,
+                "startPosition" => json_unmarshal_decode(dec, &mut self.start_position)?,
+                "endPosition" => json_unmarshal_decode(dec, &mut self.end_position)?,
+                "sourceLines" => json_unmarshal_decode(dec, &mut self.source_lines)?,
+                "code" => json_unmarshal_decode(dec, &mut self.code)?,
+                "category" => {
+                    let mut category: i32 = 0;
+                    json_unmarshal_decode(dec, &mut category)?;
+                    self.category = match category {
+                        0 => crate::diagnostics::Category::Warning,
+                        1 => crate::diagnostics::Category::Error,
+                        2 => crate::diagnostics::Category::Suggestion,
+                        3 => crate::diagnostics::Category::Message,
+                        _ => {
+                            return Err(SemanticError::method(
+                                ErrorPos::After,
+                                format!("invalid diagnostics.Category {category}"),
+                            ));
+                        }
+                    };
+                }
+                "source" => json_unmarshal_decode(dec, &mut self.source)?,
+                "text" => json_unmarshal_decode(dec, &mut self.text)?,
+                "reportsUnnecessary" => json_unmarshal_decode(dec, &mut self.reports_unnecessary)?,
+                "reportsDeprecated" => json_unmarshal_decode(dec, &mut self.reports_deprecated)?,
+                "messageChain" => json_unmarshal_decode(dec, &mut self.message_chain)?,
+                "relatedInformation" => json_unmarshal_decode(dec, &mut self.related_information)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = DiagnosticResponse::default();
+        }
+        Ok(())
+    }
+}
+
+// Go: proto.go DiagnosticResponse.ToDiagnostic (ts#63950)
+impl DiagnosticResponse {
+    pub fn to_diagnostic(&self) -> Diagnostic {
+        new_diagnostic_from_text(
+            Node::NIL,
+            TextRange::new(self.pos, self.end),
+            self.code,
+            self.category,
+            &self.text,
+            self.message_chain
+                .iter()
+                .map(DiagnosticResponse::to_diagnostic)
+                .collect(),
+            self.related_information
+                .iter()
+                .map(DiagnosticResponse::to_diagnostic)
+                .collect(),
+            self.reports_unnecessary,
+            self.reports_deprecated,
+        )
+    }
+}
+
 // Go: proto.go DiagnosticPositionResponse (ts#63935)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DiagnosticPositionResponse {
@@ -3670,7 +4080,7 @@ pub struct DiagnosticPositionResponse {
     pub character: i32,
 }
 
-proto_json!(marshal DiagnosticPositionResponse {
+proto_json!(both DiagnosticPositionResponse {
     line: "line" plain,
     character: "character" plain,
 });
@@ -3682,7 +4092,7 @@ pub struct DiagnosticSourceLineResponse {
     pub text: String,
 }
 
-proto_json!(marshal DiagnosticSourceLineResponse {
+proto_json!(both DiagnosticSourceLineResponse {
     line: "line" plain,
     text: "text" plain,
 });

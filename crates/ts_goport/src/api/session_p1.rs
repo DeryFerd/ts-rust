@@ -38,6 +38,7 @@ use crate::api::prelude::*;
 
 use crate::api::encoder;
 use crate::api::proto;
+use crate::api::requestfilesystem;
 use crate::astnav;
 use crate::emitter::emitter::EmitOnly;
 use crate::frontend::compiler;
@@ -67,7 +68,14 @@ pub static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 // PORT: registry values keep the checker that owns the handle (file header).
 pub struct SnapshotData {
     pub snapshot: Rc<project::Snapshot>,
+    // ts#64115: the request file system the snapshot was made with (Go nil
+    // is `None`).
+    pub file_system: Option<Rc<dyn vfs::Fs>>,
     pub ref_count: Cell<i32>,
+
+    // ts#64204
+    pub open_projects: FxHashSet<tspath::Path>,
+    pub open_files: FxHashSet<tspath::Path>,
 
     // Symbol IDs come from ast.GetSymbolId, a global atomic counter, so the same
     // *ast.Symbol pointer always has the same unique ID across all projects in the
@@ -81,9 +89,9 @@ pub struct SnapshotData {
     // a project context (e.g. member/export ordering, node handle resolution) but don't
     // receive one from the caller default to this canonical project. First-writer wins so
     // the choice is stable. Guarded by symbolRegistryMu.
-    pub symbol_canonical_projects: RefCell<FxHashMap<SymbolID, ProjectID>>,
+    pub symbol_canonical_projects: RefCell<FxHashMap<SymbolID, project::ID>>,
 
-    pub project_registries: RefCell<FxHashMap<ProjectID, Rc<ProjectRegistryData>>>,
+    pub project_registries: RefCell<FxHashMap<project::ID, Rc<ProjectRegistryData>>>,
 }
 
 // Go: api/session.go:64 projectRegistryData
@@ -102,7 +110,7 @@ impl SnapshotData {
     // getProgram looks up a program from a project handle within this snapshot.
     pub fn get_program(
         &self,
-        project_handle: &ProjectID,
+        project_handle: &project::ID,
     ) -> Result<Rc<compiler::NewProgram>, GoError> {
         let proj = self.get_project(project_handle)?;
 
@@ -119,21 +127,17 @@ impl SnapshotData {
 
     // Go: api/session.go:88 getProject
     // getProject looks up a project from a project handle within this snapshot.
+    // ts#64319: looked up by project ID.
     pub fn get_project(
         &self,
-        project_handle: &ProjectID,
+        project_handle: &project::ID,
     ) -> Result<Rc<RefCell<project::Project>>, GoError> {
-        let project_name = parse_project_handle(project_handle);
-        let proj = self
-            .snapshot
-            .project_collection
-            .get_project_by_path(&project_name);
+        let proj = self.snapshot.project_collection.get_project(project_handle);
         let Some(proj) = proj else {
             return Err(errors::errorf(
                 format!(
                     "{}: project {} not found",
-                    *ERR_CLIENT_ERROR,
-                    project_name.as_str()
+                    *ERR_CLIENT_ERROR, project_handle.0
                 ),
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
@@ -156,7 +160,7 @@ impl SnapshotData {
     // getOrCreateProjectRegistry returns the registry for the given project, creating it if needed.
     pub fn get_or_create_project_registry(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
     ) -> Rc<ProjectRegistryData> {
         if project_id.0.is_empty() {
             panic!("getOrCreateProjectRegistry: empty project ID");
@@ -183,7 +187,7 @@ impl SnapshotData {
         &self,
         checker: &Rc<RefCell<Checker>>,
         symbol: SymbolId,
-        canonical_project: &ProjectID,
+        canonical_project: &project::ID,
     ) -> Option<SymbolResponse> {
         if symbol.is_nil() {
             return None;
@@ -236,10 +240,10 @@ impl SnapshotData {
         &self,
         checker: &Rc<RefCell<Checker>>,
         symbol: SymbolId,
-        canonical_project: &ProjectID,
-    ) -> (SymbolID, ProjectID) {
+        canonical_project: &project::ID,
+    ) -> (SymbolID, project::ID) {
         if symbol.is_nil() {
-            return (SymbolID(0), ProjectID::default());
+            return (SymbolID(0), project::ID::default());
         }
         if canonical_project.0.is_empty() {
             panic!("registerSymbol requires a non-empty canonical project");
@@ -274,7 +278,7 @@ impl SnapshotData {
     // newTypeResponse registers a type in the project's registry and returns the response.
     pub fn new_type_response(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         checker: &Rc<RefCell<Checker>>,
         t: TypeId,
     ) -> Option<TypeResponse> {
@@ -318,7 +322,7 @@ impl SnapshotData {
     // Go: api/session.go:136 registerType
     pub fn register_type(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         checker: &Rc<RefCell<Checker>>,
         t: TypeId,
     ) -> TypeID {
@@ -376,7 +380,7 @@ impl SnapshotData {
     // PORT: returns the checker that owns the type with it (file header).
     pub fn resolve_type_handle(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         handle: TypeID,
     ) -> Result<(Rc<RefCell<Checker>>, TypeId), GoError> {
         if handle.0 == 0 {
@@ -427,7 +431,7 @@ impl SnapshotData {
     // PORT: returns the checker that owns the signature with it (file header).
     pub fn resolve_signature_handle(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         handle: SignatureID,
     ) -> Result<(Rc<RefCell<Checker>>, SignatureId), GoError> {
         if handle.0 == 0 {
@@ -477,7 +481,7 @@ impl SnapshotData {
     // newSignatureResponse registers a signature in the project's registry and returns the response.
     pub fn new_signature_response(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         checker: &Rc<RefCell<Checker>>,
         sig: SignatureId,
     ) -> Option<SignatureResponse> {
@@ -518,7 +522,7 @@ impl SnapshotData {
     // Go: api/session.go:240 registerSignature
     pub fn register_signature(
         &self,
-        project_id: &ProjectID,
+        project_id: &project::ID,
         checker: &Rc<RefCell<Checker>>,
         sig: SignatureId,
     ) -> SignatureID {
@@ -667,9 +671,18 @@ pub fn checker_signature(
 // It implements the Handler interface to process incoming API requests.
 // The session supports multiple active snapshots, each with their own
 // symbol and type registries for maintaining object identity.
+// PORT: ts#64163 gives the session a snapshot host, and a project session
+// only in LSP mode (Go nil is `None`).
 pub struct Session {
     pub id: String,
-    pub project_session: Rc<project::Session>,
+    pub snapshot_host: Rc<project::SnapshotHost>,
+    pub owns_snapshot_host: bool,
+    // PORT: Go `withLocale func(context.Context) context.Context`.
+    pub with_locale: Rc<dyn Fn(&Context) -> Context>,
+    pub project_session: Option<Rc<project::Session>>,
+
+    // PORT: Go `closeOnce sync.Once`.
+    pub close_once: Cell<bool>,
 
     // This is set to true when using MessagePackProtocol.
     pub use_binary_responses: bool,
@@ -680,20 +693,16 @@ pub struct Session {
 
     // snapshots maps snapshot handles to their data. Each snapshot has its own
     // symbol/type registries.
-    // PORT: the port is one thread, so the Go `snapshotsMu` and `updateMu`
-    // locks are not ported.
+    // PORT: the port is one thread, so the Go `snapshotsMu` lock is not
+    // ported.
     pub snapshots: RefCell<FxHashMap<SnapshotID, Rc<SnapshotData>>>,
 
-    // latestSnapshot tracks the most recently created snapshot, used as the diff base
-    // for the next update.
-    pub latest_snapshot: Cell<SnapshotID>,
-
-    // openProjects and openFiles track the projects and files this session
-    // currently holds open in the project session's API state. The session holds
-    // at most one ref per project/file (opens are idempotent), so it can release
-    // exactly those refs on Close and never send a close for a ref it doesn't hold.
+    // openProjects, openFiles, and createdPrograms are the canonical LSP-state resources
+    // owned by this API client. Guarded by languageServerUpdateMu.
+    // PORT: `languageServerUpdateMu` is not ported (one thread).
     pub open_projects: RefCell<FxHashSet<tspath::Path>>,
     pub open_files: RefCell<FxHashSet<tspath::Path>>,
+    pub created_programs: RefCell<FxHashSet<project::SyntheticProjectID>>,
 
     pub cpu_profiler: crate::pprof::CpuProfiler,
 }
@@ -721,42 +730,114 @@ pub struct SessionOptions {
 // maximum string length while rounding down to an even decimal value.
 pub const DEFAULT_MAX_RESPONSE_BYTES_PER_PAGE: i32 = 300_000_000;
 
-// Go: api/session.go:293 NewSession
-// NewSession creates a new API session with the given project session.
-pub fn new_session(
+// Go: api/session.go NewLSPSession (ts#64163)
+// NewLSPSession creates a new API session with the given project session.
+pub fn new_lsp_session(
     project_session: Rc<project::Session>,
     options: Option<&SessionOptions>,
 ) -> Rc<Session> {
+    let with_locale_session = project_session.clone();
+    let mut s = new_session(
+        project_session.snapshot_host.clone(),
+        Some(Rc::new(move |ctx: &Context| {
+            with_locale_session.with_current_locale(ctx)
+        })),
+        options,
+    );
+    s.project_session = Some(project_session);
+    Rc::new(s)
+}
+
+// Go: api/session.go NewStandaloneSession (ts#64163)
+// NewStandaloneSession creates an API session with an independently owned snapshot host.
+pub fn new_standalone_session(
+    init: &project::SessionInit,
+    options: Option<&SessionOptions>,
+) -> Rc<Session> {
+    let snapshot_host = project::new_snapshot_host(init);
+    let mut s = new_session(snapshot_host, None, options);
+    s.owns_snapshot_host = true;
+    Rc::new(s)
+}
+
+// Go: api/session.go newSession (ts#64163)
+// PORT: returns the session by value so the two constructors can set their
+// fields before it is shared.
+pub fn new_session(
+    snapshot_host: Rc<project::SnapshotHost>,
+    with_locale: Option<Rc<dyn Fn(&Context) -> Context>>,
+    options: Option<&SessionOptions>,
+) -> Session {
     let id = SESSION_ID_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+    let with_locale = with_locale.unwrap_or_else(|| Rc::new(|ctx: &Context| ctx.clone()));
     let mut s = Session {
         id: format_session_id(id),
-        project_session,
+        snapshot_host,
+        owns_snapshot_host: false,
+        with_locale,
+        project_session: None,
+        close_once: Cell::new(false),
         use_binary_responses: false,
         batch_response_pages: RefCell::new(FxHashMap::default()),
         next_batch_response_page_id: Cell::new(0),
         snapshots: RefCell::new(FxHashMap::default()),
-        latest_snapshot: Cell::new(SnapshotID(0)),
         open_projects: RefCell::new(FxHashSet::default()),
         open_files: RefCell::new(FxHashSet::default()),
+        created_programs: RefCell::new(FxHashSet::default()),
         cpu_profiler: crate::pprof::CpuProfiler::default(),
     };
     if let Some(options) = options {
         s.use_binary_responses = options.use_binary_responses;
     }
-    Rc::new(s)
+    s
 }
 
-// PORT: Go `project.Session` satisfies `tsoptions.ParseConfigHost` through
-// its `FS` and `GetCurrentDirectory` methods (handleParseConfigFile passes
-// it). Rust needs the impl; it forwards to the inherent methods.
-impl tsoptions::ParseConfigHost for project::Session {
+// PORT: Go `project.SnapshotHost` satisfies `tsoptions.ParseConfigHost`
+// through its `FS` and `GetCurrentDirectory` methods; the config handlers
+// pass it (ts#64163). Rust needs the impl; it forwards to the inherent
+// methods.
+impl tsoptions::ParseConfigHost for project::SnapshotHost {
     fn fs(&self) -> Rc<dyn vfs::Fs> {
-        project::Session::fs(self)
+        project::SnapshotHost::fs(self)
     }
 
     fn get_current_directory(&self) -> String {
-        project::Session::get_current_directory(self)
+        project::SnapshotHost::get_current_directory(self)
     }
+}
+
+// Go: api/session.go languageServerSnapshotUpdate (ts#64204)
+pub struct LanguageServerSnapshotUpdate {
+    pub request: project::APISnapshotRequest,
+    pub open_state: SnapshotOpenState,
+}
+
+impl LanguageServerSnapshotUpdate {
+    // Go: api/session.go languageServerSnapshotUpdate.commit (ts#64204)
+    pub fn commit(&self, s: &Session, snapshot: &project::Snapshot) {
+        *s.open_projects.borrow_mut() = self.open_state.open_projects.clone();
+        *s.open_files.borrow_mut() = self.open_state.open_files.clone();
+        if let Some(remove_programs) = &self.request.remove_programs {
+            for program_id in remove_programs {
+                s.created_programs.borrow_mut().remove(program_id);
+            }
+        }
+        for program in snapshot.created_programs() {
+            let id = program.borrow().id();
+            let (program_id, ok) = id.synthetic();
+            if !ok {
+                panic!("created program has non-synthetic project ID: {}", id.0);
+            }
+            s.created_programs.borrow_mut().insert(program_id);
+        }
+    }
+}
+
+// Go: api/session.go snapshotOpenState (ts#64204)
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotOpenState {
+    pub open_projects: FxHashSet<tspath::Path>,
+    pub open_files: FxHashSet<tspath::Path>,
 }
 
 // Go: api/session.go:317 snapshotHandle
@@ -773,7 +854,7 @@ pub struct CheckerSetup {
     pub program: Rc<compiler::NewProgram>,
     pub checker: Rc<RefCell<Checker>>,
     pub done: ls_program::Release,
-    pub project_id: ProjectID,
+    pub project_id: project::ID,
 }
 
 impl CheckerSetup {
@@ -914,10 +995,30 @@ impl Session {
         self.id.clone()
     }
 
-    // Go: api/session.go:312 ProjectSession
-    // ProjectSession returns the underlying project session.
-    pub fn project_session(&self) -> Rc<project::Session> {
-        self.project_session.clone()
+    // Go: api/session.go GetCurrentDirectory (ts#64163)
+    pub fn get_current_directory(&self) -> String {
+        self.snapshot_host.get_current_directory()
+    }
+
+    // Go: api/session.go FS (ts#64163)
+    pub fn fs(&self) -> Rc<dyn vfs::Fs> {
+        if let Some(project_session) = &self.project_session {
+            return project_session.fs();
+        }
+        self.snapshot_host.fs()
+    }
+
+    // Go: api/session.go DefaultLibraryPath (ts#64158)
+    pub fn default_library_path(&self) -> String {
+        if let Some(project_session) = &self.project_session {
+            return project_session.default_library_path();
+        }
+        self.snapshot_host.default_library_path()
+    }
+
+    // Go: api/session.go useCaseSensitiveFileNames (ts#64163)
+    pub fn use_case_sensitive_file_names(&self) -> bool {
+        self.snapshot_host.fs().use_case_sensitive_file_names()
     }
 
     // Go: api/session.go:322 getSnapshotData
@@ -959,7 +1060,8 @@ impl Session {
         sd.ref_count.set(sd.ref_count.get() - 1);
         if sd.ref_count.get() <= 0 {
             self.snapshots.borrow_mut().remove(&handle);
-            project::Snapshot::deref(&sd.snapshot, &self.project_session);
+            // ts#64163: the snapshot derefs without the project session.
+            project::Snapshot::deref(&sd.snapshot);
         }
         Ok(())
     }
@@ -971,7 +1073,7 @@ impl Session {
         &self,
         ctx: &Context,
         snapshot: SnapshotID,
-        project_handle: &ProjectID,
+        project_handle: &project::ID,
     ) -> Result<CheckerSetup, GoError> {
         let sd = self.get_snapshot_data(snapshot)?;
 
@@ -1007,19 +1109,16 @@ impl Session {
         &self,
         snapshot: &Rc<project::Snapshot>,
         program: Rc<compiler::NewProgram>,
-        project_handle: &ProjectID,
+        project_handle: &project::ID,
         active_file: &str,
     ) -> Result<ls::LanguageService, GoError> {
-        let project_name = parse_project_handle(project_handle);
-        let proj = snapshot
-            .project_collection
-            .get_project_by_path(&project_name);
+        // ts#64319: looked up by project ID.
+        let proj = snapshot.project_collection.get_project(project_handle);
         let Some(proj) = proj else {
             return Err(errors::errorf(
                 format!(
                     "{}: project {} not found",
-                    *ERR_CLIENT_ERROR,
-                    project_name.as_str()
+                    *ERR_CLIENT_ERROR, project_handle.0
                 ),
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
@@ -1044,6 +1143,8 @@ impl ipc::Handler for Session {
         method: &str,
         params: JsonValue,
     ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        // ts#64163
+        let ctx = &(self.with_locale)(ctx);
         // Handle simple methods that don't need param parsing
         match method {
             "echo" => {
@@ -1076,11 +1177,15 @@ impl ipc::Handler for Session {
                 .map(to_any),
             m if m == Method::RELEASE.0 => self.handle_release(ctx, Some(assert_params(&parsed))),
             m if m == Method::INITIALIZE.0 => self.handle_initialize(ctx).map(to_any),
+            // ts#64204
+            m if m == Method::CREATE_SNAPSHOT.0 => self
+                .handle_create_snapshot(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::UPDATE_SNAPSHOT.0 => self
                 .handle_update_snapshot(ctx, assert_params(&parsed))
                 .map(to_any),
-            m if m == Method::UPDATE_TEMPORARY_SNAPSHOT.0 => self
-                .handle_update_temporary_snapshot(ctx, assert_params(&parsed))
+            m if m == Method::GET_CURRENT_LANGUAGE_SERVER_SNAPSHOT.0 => self
+                .handle_get_current_language_server_snapshot(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::PARSE_COMMAND_LINE.0 => self
                 .handle_parse_command_line(ctx, assert_params(&parsed))
@@ -1793,143 +1898,449 @@ impl Session {
     // Go: api/session.go:614 handleInitialize
     pub fn handle_initialize(&self, _ctx: &Context) -> Result<InitializeResponse, GoError> {
         Ok(InitializeResponse {
-            use_case_sensitive_file_names: self
-                .project_session
-                .fs()
-                .use_case_sensitive_file_names(),
-            current_directory: self.project_session.get_current_directory(),
+            use_case_sensitive_file_names: self.use_case_sensitive_file_names(),
+            current_directory: self.get_current_directory(),
         })
     }
 
-    // Go: api/session.go:827 handleUpdateSnapshot
-    // handleUpdateSnapshot creates a new snapshot, optionally opening or closing
-    // projects and files. With no args, it adopts the latest LSP state. Opens and
-    // closes are ref-counted per session: the session holds at most one ref per
-    // project/file, so repeated opens are idempotent and a close only releases a ref
-    // the session is actually holding.
-    // PORT: the Go `updateMu` lock is not ported (one thread).
-    pub fn handle_update_snapshot(
+    // Go: api/session.go handleCreateSnapshot (ts#64204)
+    // handleCreateSnapshot creates a new independent snapshot.
+    pub fn handle_create_snapshot(
         &self,
         ctx: &Context,
-        params: &UpdateSnapshotParams,
-    ) -> Result<UpdateSnapshotResponse, GoError> {
-        let file_changes = self.to_file_change_summary(params.file_changes.as_ref());
+        params: &CreateSnapshotParams,
+    ) -> Result<CreateSnapshotResponse, GoError> {
+        let mut api_request =
+            self.to_api_snapshot_request(ctx, &params.snapshot_request_changes_params)?;
 
-        let mut api_request = project::APISnapshotRequest::default();
-        let cwd = self.project_session.get_current_directory();
-
-        // Open projects: only take a new ref for projects we aren't already holding open.
-        let mut opened_projects: Vec<tspath::Path> = Vec::new();
-        for p in &params.open_projects {
-            let config_file_name = p.to_absolute_file_name(&cwd);
-            let config_path = self.to_path(&config_file_name);
-            if self.open_projects.borrow().contains(&config_path) {
-                continue;
-            }
-            api_request
-                .open_projects
-                .get_or_insert_with(|| {
-                    FxHashSet::with_capacity_and_hasher(
-                        params.open_projects.len(),
-                        Default::default(),
-                    )
-                })
-                .insert(config_file_name);
-            opened_projects.push(config_path);
+        let open_state =
+            self.reconcile_snapshot_opens(&mut api_request, SnapshotOpenState::default());
+        let mut file_changes = self.to_file_change_summary(params.file_notifications.as_ref());
+        let mut snapshot_file_system: Option<Rc<dyn vfs::Fs>> = None;
+        if let Some(request_file_system) = &params.file_system {
+            let file_system = match requestfilesystem::new_for_update(
+                Some(request_file_system),
+                self.fs(),
+                &self.get_current_directory(),
+                &mut file_changes,
+            ) {
+                Ok(file_system) => file_system,
+                Err(file_system_err) => {
+                    return Err(errors::errorf(
+                        format!("{}: {}", *ERR_CLIENT_ERROR, file_system_err),
+                        vec![ERR_CLIENT_ERROR.clone(), file_system_err],
+                    ));
+                }
+            };
+            snapshot_file_system = Some(file_system.clone());
+            api_request.file_system = Some(file_system);
+            api_request.replace_file_system =
+                request_file_system.kind == requestfilesystem::Kind::FULL;
         }
-
-        // Close projects: only release a ref we currently hold.
-        let mut closed_projects: Vec<tspath::Path> = Vec::new();
-        for p in &params.close_projects {
-            let config_path = self.to_path(&p.to_absolute_file_name(&cwd));
-            if !self.open_projects.borrow().contains(&config_path) {
-                continue;
-            }
-            api_request
-                .close_projects
-                .get_or_insert_with(|| {
-                    FxHashSet::with_capacity_and_hasher(
-                        params.close_projects.len(),
-                        Default::default(),
-                    )
-                })
-                .insert(config_path.clone());
-            closed_projects.push(config_path);
-        }
-
-        // Open files: only open files we aren't already holding open, so each file is
-        // held by at most one API ref from this session.
-        let mut opened_files: Vec<tspath::Path> = Vec::new();
-        for f in &params.open_files {
-            let uri = f.to_uri(&cwd);
-            let path = self.to_path(&uri.file_name());
-            if self.open_files.borrow().contains(&path) {
-                continue;
-            }
-            api_request
-                .open_files
-                .get_or_insert_with(|| IndexSet::with_capacity(params.open_files.len()))
-                .insert(uri);
-            opened_files.push(path);
-        }
-
-        // Close files: only release a ref we currently hold.
-        let mut closed_files: Vec<tspath::Path> = Vec::new();
-        for f in &params.close_files {
-            let path = self.to_path(&f.to_uri(&cwd).file_name());
-            if !self.open_files.borrow().contains(&path) {
-                continue;
-            }
-            api_request
-                .close_files
-                .get_or_insert_with(|| {
-                    FxHashSet::with_capacity_and_hasher(
-                        params.close_files.len(),
-                        Default::default(),
-                    )
-                })
-                .insert(path.clone());
-            closed_files.push(path);
-        }
-
-        // Even when nothing is opened or closed, APIUpdate ensures all projects and
-        // files opened by the API are up to date. For an API connected to an LSP server,
-        // this brings the API state up to date with the LSP state and ensures projects
-        // the API cares about are ready to be queried.
-        let (snapshot, err) = self
-            .project_session
-            .api_update(ctx, &file_changes, api_request);
+        let root = self.snapshot_host.new_root_snapshot();
+        let (snapshot, err) =
+            self.snapshot_host
+                .clone_snapshot(ctx, &root, file_changes, Some(&api_request));
+        project::Snapshot::deref(&root);
         if let Some(err) = err {
-            // APIUpdate returns a ref'd snapshot even on error; release it.
-            project::Snapshot::deref(&snapshot, &self.project_session);
+            project::Snapshot::deref(&snapshot);
             return Err(errors::errorf(
-                format!("{}: failed to update snapshot: {}", *ERR_CLIENT_ERROR, err),
+                format!("{}: failed to create snapshot: {}", *ERR_CLIENT_ERROR, err),
                 vec![ERR_CLIENT_ERROR.clone(), err],
             ));
         }
 
-        // Commit ref tracking now that the update succeeded.
-        {
-            let mut open_projects = self.open_projects.borrow_mut();
-            for config_path in opened_projects {
-                open_projects.insert(config_path);
+        let response = self.create_snapshot_response(
+            &snapshot,
+            None,
+            Some(&params.snapshot_request_changes_params),
+        );
+        self.register_snapshot(snapshot, open_state, snapshot_file_system);
+        Ok(response)
+    }
+
+    // Go: api/session.go handleUpdateSnapshot (ts#64204)
+    // PORT: Go `defer func() { _ = s.releaseSnapshot(params.Snapshot) }()`: the
+    // body runs in a closure, and the release runs after it on every path.
+    pub fn handle_update_snapshot(
+        &self,
+        ctx: &Context,
+        params: &UpdateSnapshotParams,
+    ) -> Result<CreateSnapshotResponse, GoError> {
+        let base_sd = self.retain_snapshot_data(params.snapshot)?;
+        let result = (|| {
+            let default_changes = CreateSnapshotParams::default();
+            let changes = params.changes.as_ref().unwrap_or(&default_changes);
+            let mut api_request =
+                self.to_api_snapshot_request(ctx, &changes.snapshot_request_changes_params)?;
+            let open_state = self.reconcile_snapshot_opens(
+                &mut api_request,
+                SnapshotOpenState {
+                    open_projects: base_sd.open_projects.clone(),
+                    open_files: base_sd.open_files.clone(),
+                },
+            );
+            let mut file_changes = self.to_file_change_summary(changes.file_notifications.as_ref());
+            let mut snapshot_file_system = base_sd.file_system.clone();
+            if let Some(request_file_system) = &changes.file_system {
+                let base_file_system = snapshot_file_system.clone().unwrap_or_else(|| self.fs());
+                let file_system = match requestfilesystem::new_for_update(
+                    Some(request_file_system),
+                    base_file_system,
+                    &self.get_current_directory(),
+                    &mut file_changes,
+                ) {
+                    Ok(file_system) => file_system,
+                    Err(file_system_err) => {
+                        return Err(errors::errorf(
+                            format!("{}: {}", *ERR_CLIENT_ERROR, file_system_err),
+                            vec![ERR_CLIENT_ERROR.clone(), file_system_err],
+                        ));
+                    }
+                };
+                snapshot_file_system = Some(file_system);
             }
-            for config_path in &closed_projects {
-                open_projects.remove(config_path);
+            if let Some(snapshot_file_system) = &snapshot_file_system {
+                api_request.file_system = Some(snapshot_file_system.clone());
+                api_request.replace_file_system = changes
+                    .file_system
+                    .as_ref()
+                    .is_some_and(|file_system| file_system.kind == requestfilesystem::Kind::FULL);
             }
+            let (snapshot, err) = self.snapshot_host.clone_snapshot(
+                ctx,
+                &base_sd.snapshot,
+                file_changes,
+                Some(&api_request),
+            );
+            if let Some(err) = err {
+                project::Snapshot::deref(&snapshot);
+                return Err(errors::errorf(
+                    format!("{}: failed to update snapshot: {}", *ERR_CLIENT_ERROR, err),
+                    vec![ERR_CLIENT_ERROR.clone(), err],
+                ));
+            }
+
+            let response = self.create_snapshot_response(
+                &snapshot,
+                Some(&base_sd.snapshot),
+                Some(&changes.snapshot_request_changes_params),
+            );
+            self.register_snapshot(snapshot, open_state, snapshot_file_system);
+            Ok(response)
+        })();
+        let _ = self.release_snapshot(params.snapshot);
+        result
+    }
+
+    // Go: api/session.go toAPISnapshotRequest (ts#64204, ts#64319, ts#64324, ts#64391)
+    pub fn to_api_snapshot_request(
+        &self,
+        _ctx: &Context,
+        changes: &SnapshotRequestChangesParams,
+    ) -> Result<project::APISnapshotRequest, GoError> {
+        let mut api_request = project::APISnapshotRequest::default();
+        let cwd = self.get_current_directory();
+
+        for p in &changes.open_projects {
+            let config_file_name = p.to_absolute_file_name(&cwd);
+            let (configured_project_id, ok) =
+                project::parse_configured_project_id(&self.to_path(&config_file_name));
+            if !ok {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: invalid configured project ID: {}",
+                        *ERR_CLIENT_ERROR, config_file_name
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            api_request
+                .ensure_programs
+                .get_or_insert_with(|| {
+                    FxHashSet::with_capacity_and_hasher(
+                        changes.open_projects.len(),
+                        Default::default(),
+                    )
+                })
+                .insert(configured_project_id.as_id());
+            api_request
+                .open_projects
+                .get_or_insert_with(|| {
+                    FxHashSet::with_capacity_and_hasher(
+                        changes.open_projects.len(),
+                        Default::default(),
+                    )
+                })
+                .insert(config_file_name);
         }
-        {
-            let mut open_files = self.open_files.borrow_mut();
-            for path in opened_files {
-                open_files.insert(path);
-            }
-            for path in &closed_files {
-                open_files.remove(path);
+
+        for p in &changes.close_projects {
+            let config_path = self.to_path(&p.to_absolute_file_name(&cwd));
+            api_request
+                .close_projects
+                .get_or_insert_with(|| {
+                    FxHashSet::with_capacity_and_hasher(
+                        changes.close_projects.len(),
+                        Default::default(),
+                    )
+                })
+                .insert(config_path);
+        }
+
+        if let Some(open_files) = &changes.open_files {
+            for f in open_files {
+                let file_name = f.to_absolute_file_name(&cwd);
+                let path = self.to_path(&file_name);
+                if api_request.open_files.is_none() {
+                    api_request.open_files = Some(IndexMap::with_capacity(open_files.len()));
+                    api_request.ensure_files = Some(IndexMap::with_capacity(open_files.len()));
+                }
+                let request_open_files = api_request.open_files.as_mut().expect("set above");
+                if !request_open_files.contains_key(&path) {
+                    request_open_files.insert(path.clone(), file_name.clone());
+                    api_request
+                        .ensure_files
+                        .as_mut()
+                        .expect("set above")
+                        .insert(path, file_name);
+                }
             }
         }
 
-        // Create or ref-count snapshot data, then atomically read the previous latest
-        // snapshot (the diff base) and advance latestSnapshot to the new handle.
+        for f in &changes.close_files {
+            let path = self.to_path(&f.to_uri(&cwd).file_name());
+            api_request
+                .close_files
+                .get_or_insert_with(|| {
+                    FxHashSet::with_capacity_and_hasher(
+                        changes.close_files.len(),
+                        Default::default(),
+                    )
+                })
+                .insert(path);
+        }
+
+        let create_programs: &[Option<CreateSnapshotProgramParams>] =
+            changes.create_programs.as_deref().unwrap_or(&[]);
+        api_request.create_programs = Vec::with_capacity(create_programs.len());
+        for (i, program_params) in create_programs.iter().enumerate() {
+            let Some(program_params) = program_params else {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: createPrograms[{i}] must not be null",
+                        *ERR_CLIENT_ERROR
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            let root_file_names: Vec<String> = program_params
+                .root_files
+                .iter()
+                .map(|root_file| root_file.to_absolute_file_name(&cwd))
+                .collect();
+            let mut request = project::APICreateProgramRequest {
+                root_file_names,
+                compiler_options: Rc::new(program_params.compiler_options.clone()),
+                ..Default::default()
+            };
+            if let Some(options) = &program_params.options {
+                request.project_references = options.project_references.clone();
+                request.config_file_parsing_diagnostics = options
+                    .config_file_parsing_diagnostics
+                    .iter()
+                    .map(DiagnosticResponse::to_diagnostic)
+                    .collect();
+            }
+            api_request.create_programs.push(request);
+        }
+        api_request.reconfigure_programs = Vec::with_capacity(changes.reconfigure_programs.len());
+        let mut reconfigured_program_ids: FxHashSet<project::SyntheticProjectID> =
+            FxHashSet::default();
+        for (i, program_params) in changes.reconfigure_programs.iter().enumerate() {
+            let Some(program_params) = program_params else {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: reconfigurePrograms[{i}] must not be null",
+                        *ERR_CLIENT_ERROR
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            };
+            let (program_id, ok) = project::parse_synthetic_project_id(&program_params.id.0);
+            if !ok {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: invalid synthetic project handle: {}",
+                        *ERR_CLIENT_ERROR, program_params.id.0
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            if reconfigured_program_ids.contains(&program_id) {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: synthetic program reconfigured more than once: {}",
+                        *ERR_CLIENT_ERROR, program_id.0
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            reconfigured_program_ids.insert(program_id.clone());
+            let root_file_names: Vec<String> = program_params
+                .root_files
+                .iter()
+                .map(|root_file| root_file.to_absolute_file_name(&cwd))
+                .collect();
+            let mut request = project::APIReconfigureProgramRequest {
+                program_id,
+                api_create_program_request: project::APICreateProgramRequest {
+                    root_file_names,
+                    compiler_options: Rc::new(program_params.compiler_options.clone()),
+                    ..Default::default()
+                },
+            };
+            if let Some(options) = &program_params.options {
+                request.api_create_program_request.project_references =
+                    options.project_references.clone();
+                request
+                    .api_create_program_request
+                    .config_file_parsing_diagnostics = options
+                    .config_file_parsing_diagnostics
+                    .iter()
+                    .map(DiagnosticResponse::to_diagnostic)
+                    .collect();
+            }
+            api_request.reconfigure_programs.push(request);
+        }
+        if !changes.remove_programs.is_empty() {
+            api_request.remove_programs = Some(FxHashSet::with_capacity_and_hasher(
+                changes.remove_programs.len(),
+                Default::default(),
+            ));
+        }
+        for program_id in &changes.remove_programs {
+            if reconfigured_program_ids.contains(program_id) {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: synthetic program cannot be reconfigured and removed: {}",
+                        *ERR_CLIENT_ERROR, program_id.0
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+            api_request
+                .remove_programs
+                .as_mut()
+                .expect("set above")
+                .insert(program_id.clone());
+        }
+        if let Some(ensure_programs) = &changes.ensure_programs {
+            api_request.ensure_all_programs = ensure_programs.all;
+            if !ensure_programs.projects.is_empty() && api_request.ensure_programs.is_none() {
+                api_request.ensure_programs = Some(FxHashSet::with_capacity_and_hasher(
+                    ensure_programs.projects.len(),
+                    Default::default(),
+                ));
+            }
+            for program in &ensure_programs.projects {
+                api_request
+                    .ensure_programs
+                    .as_mut()
+                    .expect("set above")
+                    .insert(program.clone());
+            }
+        }
+        Ok(api_request)
+    }
+
+    // Go: api/session.go toLanguageServerSnapshotUpdate (ts#64204)
+    pub fn to_language_server_snapshot_update(
+        &self,
+        ctx: &Context,
+        changes: &SnapshotRequestChangesParams,
+    ) -> Result<LanguageServerSnapshotUpdate, GoError> {
+        let mut api_request = self.to_api_snapshot_request(ctx, changes)?;
+        let open_state = self.reconcile_snapshot_opens(
+            &mut api_request,
+            SnapshotOpenState {
+                open_projects: self.open_projects.borrow().clone(),
+                open_files: self.open_files.borrow().clone(),
+            },
+        );
+
+        if let Some(remove_programs) = &mut api_request.remove_programs {
+            let created_programs = self.created_programs.borrow();
+            remove_programs.retain(|program_id| created_programs.contains(program_id));
+        }
+        for reconfigure in &api_request.reconfigure_programs {
+            if !self
+                .created_programs
+                .borrow()
+                .contains(&reconfigure.program_id)
+            {
+                return Err(errors::errorf(
+                    format!(
+                        "{}: synthetic program is not owned by this API session: {}",
+                        *ERR_CLIENT_ERROR, reconfigure.program_id.0
+                    ),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+        }
+        Ok(LanguageServerSnapshotUpdate {
+            request: api_request,
+            open_state,
+        })
+    }
+
+    // Go: api/session.go reconcileSnapshotOpens (ts#64204)
+    pub fn reconcile_snapshot_opens(
+        &self,
+        api_request: &mut project::APISnapshotRequest,
+        base: SnapshotOpenState,
+    ) -> SnapshotOpenState {
+        let mut state = SnapshotOpenState {
+            open_projects: base.open_projects.clone(),
+            open_files: base.open_files.clone(),
+        };
+        if let Some(close_projects) = &mut api_request.close_projects {
+            close_projects.retain(|path| state.open_projects.remove(path));
+        }
+        if let Some(open_projects) = &mut api_request.open_projects {
+            open_projects.retain(|config_file_name| {
+                let path = self.to_path(config_file_name);
+                if state.open_projects.contains(&path) {
+                    false
+                } else {
+                    state.open_projects.insert(path);
+                    true
+                }
+            });
+        }
+        if let Some(close_files) = &mut api_request.close_files {
+            close_files.retain(|path| state.open_files.remove(path));
+        }
+        if let Some(open_files) = &mut api_request.open_files {
+            open_files.retain(|path, _| {
+                if state.open_files.contains(path) {
+                    false
+                } else {
+                    state.open_files.insert(path.clone());
+                    true
+                }
+            });
+        }
+        state
+    }
+
+    // Go: api/session.go registerSnapshot (ts#64204)
+    pub fn register_snapshot(
+        &self,
+        snapshot: Rc<project::Snapshot>,
+        open_state: SnapshotOpenState,
+        file_system: Option<Rc<dyn vfs::Fs>>,
+    ) {
         // If the same snapshot ID is returned (no changes), we increment the ref count
         // so each client-side Snapshot can be disposed independently.
         let handle = snapshot_handle(&snapshot);
@@ -1937,76 +2348,63 @@ impl Session {
         if let Some(sd) = existing {
             // Same snapshot already stored — release the caller's ref since
             // the stored snapshot already has one, and bump the API refcount.
-            project::Snapshot::deref(&snapshot, &self.project_session);
+            project::Snapshot::deref(&snapshot);
             sd.ref_count.set(sd.ref_count.get() + 1);
         } else {
             let sd = Rc::new(SnapshotData {
-                snapshot: snapshot.clone(),
+                snapshot,
+                file_system,
                 ref_count: Cell::new(1),
+                open_projects: open_state.open_projects.clone(),
+                open_files: open_state.open_files.clone(),
                 symbol_registry: RefCell::new(FxHashMap::default()),
                 symbol_canonical_projects: RefCell::new(FxHashMap::default()),
                 project_registries: RefCell::new(FxHashMap::default()),
             });
             self.snapshots.borrow_mut().insert(handle, sd);
         }
-        let prev_sd = self
-            .snapshots
-            .borrow()
-            .get(&self.latest_snapshot.get())
-            .cloned();
-        self.latest_snapshot.set(handle);
-
-        // Build projects list
-        let projects = snapshot.project_collection.projects();
-        let mut project_responses = Vec::with_capacity(projects.len());
-        for proj in &projects {
-            if proj.borrow().command_line.is_none() {
-                continue;
-            }
-            project_responses.push(new_project_response(&proj.borrow()));
-        }
-
-        // Compute changes from the previous latest snapshot
-        let mut changes: Option<SnapshotChanges> = None;
-        if let Some(prev_sd) = prev_sd {
-            changes = Some(compute_snapshot_changes(&prev_sd.snapshot, &snapshot));
-        }
-
-        Ok(UpdateSnapshotResponse {
-            snapshot: handle,
-            projects: project_responses,
-            changes,
-        })
     }
 
-    // Go: api/session.go:1076 handleUpdateTemporarySnapshot (tsgo#4642)
-    // handleUpdateTemporarySnapshot creates a temporary snapshot that overrides the
-    // content of a single file, without opening/closing any projects or files and
-    // without advancing the session's latest snapshot.
-    // PORT: Go `defer func() { _ = s.releaseSnapshot(params.Snapshot) }()`: the
-    // body runs in a closure, and the release runs after it on every path.
-    pub fn handle_update_temporary_snapshot(
+    // Go: api/session.go handleGetCurrentLanguageServerSnapshot (ts#64204)
+    // PORT: Go `defer func() { _ = s.releaseSnapshot(params.BaseSnapshot) }()`:
+    // the body runs in a closure, and the release runs after it.
+    pub fn handle_get_current_language_server_snapshot(
         &self,
         ctx: &Context,
-        params: &UpdateTemporarySnapshotParams,
-    ) -> Result<UpdateSnapshotResponse, GoError> {
-        let base_sd = self.retain_snapshot_data(params.snapshot)?;
+        params: &GetCurrentLanguageServerSnapshotParams,
+    ) -> Result<CreateSnapshotResponse, GoError> {
+        let Some(project_session) = self.project_session.clone() else {
+            return Err(errors::errorf(
+                format!(
+                    "{}: getCurrentLanguageServerSnapshot requires an LSP-connected API session",
+                    *ERR_CLIENT_ERROR
+                ),
+                vec![ERR_CLIENT_ERROR.clone()],
+            ));
+        };
+        let mut base_snapshot: Option<Rc<project::Snapshot>> = None;
+        if params.base_snapshot.0 != 0 {
+            let base_sd = self.retain_snapshot_data(params.base_snapshot)?;
+            base_snapshot = Some(base_sd.snapshot.clone());
+        }
         let result = (|| {
-            let uri = params
-                .file
-                .to_uri(&self.project_session.get_current_directory());
-
-            let snapshot = match self.project_session.api_update_temporary(
+            let default_changes = LanguageServerSnapshotChanges::default();
+            let changes = params.changes.as_ref().unwrap_or(&default_changes);
+            let update = self.to_language_server_snapshot_update(
                 ctx,
-                &base_sd.snapshot,
-                &uri,
-                params.new_text.clone(),
+                &changes.snapshot_request_changes_params,
+            )?;
+
+            let snapshot = match project_session.api_update(
+                ctx,
+                project::FileChangeSummary::default(),
+                Some(&update.request),
             ) {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     return Err(errors::errorf(
                         format!(
-                            "{}: failed to update temporary snapshot: {}",
+                            "{}: failed to update language server snapshot: {}",
                             *ERR_CLIENT_ERROR, err
                         ),
                         vec![ERR_CLIENT_ERROR.clone(), err],
@@ -2014,43 +2412,25 @@ impl Session {
                 }
             };
 
-            let handle = snapshot_handle(&snapshot);
-            let existing = self.snapshots.borrow().get(&handle).cloned();
-            if let Some(sd) = existing {
-                project::Snapshot::deref(&snapshot, &self.project_session);
-                sd.ref_count.set(sd.ref_count.get() + 1);
-            } else {
-                let sd = Rc::new(SnapshotData {
-                    snapshot: snapshot.clone(),
-                    ref_count: Cell::new(1),
-                    symbol_registry: RefCell::new(FxHashMap::default()),
-                    symbol_canonical_projects: RefCell::new(FxHashMap::default()),
-                    project_registries: RefCell::new(FxHashMap::default()),
-                });
-                self.snapshots.borrow_mut().insert(handle, sd);
-            }
-
-            // Build projects list
-            let projects = snapshot.project_collection.projects();
-            let mut project_responses = Vec::with_capacity(projects.len());
-            for proj in &projects {
-                if proj.borrow().command_line.is_none() {
-                    continue;
-                }
-                project_responses.push(new_project_response(&proj.borrow()));
-            }
-
-            // Compute changes from the requested base snapshot so the client can retain
-            // cached source files for unchanged files.
-            let changes = compute_snapshot_changes(&base_sd.snapshot, &snapshot);
-
-            Ok(UpdateSnapshotResponse {
-                snapshot: handle,
-                projects: project_responses,
-                changes: Some(changes),
-            })
+            update.commit(self, &snapshot);
+            let response = self.create_snapshot_response(
+                &snapshot,
+                base_snapshot.as_ref(),
+                Some(&changes.snapshot_request_changes_params),
+            );
+            self.register_snapshot(
+                snapshot,
+                SnapshotOpenState {
+                    open_projects: self.open_projects.borrow().clone(),
+                    open_files: self.open_files.borrow().clone(),
+                },
+                None,
+            );
+            Ok(response)
         })();
-        let _ = self.release_snapshot(params.snapshot);
+        if params.base_snapshot.0 != 0 {
+            let _ = self.release_snapshot(params.base_snapshot);
+        }
         result
     }
 
@@ -2083,9 +2463,7 @@ impl Session {
     ) -> Result<Option<ProjectResponse>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let uri = params
-            .file
-            .to_uri(&self.project_session.get_current_directory());
+        let uri = params.file.to_uri(&self.get_current_directory());
         let proj = sd.snapshot.get_default_project(&uri);
         let Some(proj) = proj else {
             return Ok(None);
@@ -2102,7 +2480,7 @@ impl Session {
         params: &ParseCommandLineParams,
     ) -> Result<Option<ConfigFileResponse>, GoError> {
         Ok(new_config_file_response(Some(
-            &tsoptions::parse_command_line(&params.command_line, &*self.project_session),
+            &tsoptions::parse_command_line(&params.command_line, &*self.snapshot_host),
         )))
     }
 
@@ -2115,8 +2493,8 @@ impl Session {
     ) -> Result<ReadConfigFileResponse, GoError> {
         let config_file_name = params
             .file
-            .to_absolute_file_name(&self.project_session.get_current_directory());
-        let (config_file_content, ok) = self.project_session.fs().read_file(&config_file_name);
+            .to_absolute_file_name(&self.get_current_directory());
+        let (config_file_content, ok) = self.snapshot_host.fs().read_file(&config_file_name);
         if !ok {
             return Ok(ReadConfigFileResponse {
                 config: tsoptions::CompilerOptionsValue::Map(IndexMap::new()),
@@ -2164,20 +2542,20 @@ impl Session {
         if let Some(config_directory) = &params.config_directory {
             base_path = tspath::get_normalized_absolute_path(
                 config_directory,
-                &self.project_session.get_current_directory(),
+                &self.get_current_directory(),
             );
         } else {
             config_file_name = params
                 .config_file_name
                 .as_ref()
                 .expect("configFileName is set")
-                .to_absolute_file_name(&self.project_session.get_current_directory());
+                .to_absolute_file_name(&self.get_current_directory());
             base_path = tspath::get_directory_path(&config_file_name);
         }
 
         let parsed_command_line = tsoptions::parse_json_config_file_content(
             &json_value_to_any(&params.json),
-            &*self.project_session,
+            &*self.snapshot_host,
             &base_path,
             None, /*existingOptions*/
             &config_file_name,
@@ -2196,8 +2574,8 @@ impl Session {
     ) -> Result<ConfigFileResponse, GoError> {
         let config_file_name = params
             .file
-            .to_absolute_file_name(&self.project_session.get_current_directory());
-        let (config_file_content, ok) = self.project_session.fs().read_file(&config_file_name);
+            .to_absolute_file_name(&self.get_current_directory());
+        let (config_file_content, ok) = self.snapshot_host.fs().read_file(&config_file_name);
         if !ok {
             return Err(errors::errorf(
                 format!(
@@ -2217,7 +2595,7 @@ impl Session {
         );
         let parsed_command_line = tsoptions::parse_json_source_file_config_file_content(
             ts_config_source_file,
-            &*self.project_session,
+            &*self.snapshot_host,
             &config_dir,
             None, /*existingOptions*/
             None, /*existingOptionsRaw*/
@@ -2248,11 +2626,9 @@ impl Session {
         _ctx: &Context,
         params: &CreateSourceFileFromFileParams,
     ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
-        let file_name = tspath::get_normalized_absolute_path(
-            &params.file_name,
-            &self.project_session.get_current_directory(),
-        );
-        let (source_text, ok) = self.project_session.fs().read_file(&file_name);
+        let file_name =
+            tspath::get_normalized_absolute_path(&params.file_name, &self.get_current_directory());
+        let (source_text, ok) = self.snapshot_host.fs().read_file(&file_name);
         if !ok {
             return Err(errors::errorf(
                 format!(
@@ -2289,10 +2665,8 @@ impl Session {
                 vec![ERR_CLIENT_ERROR.clone()],
             ));
         }
-        let file_name = tspath::get_normalized_absolute_path(
-            file_name,
-            &self.project_session.get_current_directory(),
-        );
+        let file_name =
+            tspath::get_normalized_absolute_path(file_name, &self.get_current_directory());
         let path = self.to_path(&file_name);
         Ok(Rc::new(crate::frontend::parser::parse_source_file(
             &crate::frontend::parser::SourceFileParseOptions {
@@ -2322,11 +2696,9 @@ impl Session {
         params: &TranspileFromFileParams,
         declaration: bool,
     ) -> Result<TranspileOutputResponse, GoError> {
-        let file_name = tspath::get_normalized_absolute_path(
-            &params.file_name,
-            &self.project_session.get_current_directory(),
-        );
-        let (input, ok) = self.project_session.fs().read_file(&file_name);
+        let file_name =
+            tspath::get_normalized_absolute_path(&params.file_name, &self.get_current_directory());
+        let (input, ok) = self.snapshot_host.fs().read_file(&file_name);
         if !ok {
             return Err(errors::errorf(
                 format!(
@@ -3593,7 +3965,8 @@ impl Session {
     ) -> Result<Option<Vec<TextEdit>>, GoError> {
         let sd = self.get_snapshot_data(params.snapshot)?;
 
-        let project_path = parse_project_handle(&params.project);
+        // ts#64319: the project ID is used as is.
+        let project_id = params.project.clone();
         let mut working_snapshot = sd.snapshot.clone();
         let mut program = sd.get_program(&params.project)?;
         let mut source_file = program
@@ -3617,33 +3990,31 @@ impl Session {
             || !autoimport::Registry::is_prepared_for_importing_file(
                 registry.as_deref(),
                 source_file_file_name(source_file),
-                &project_path,
+                &project_id,
                 &user_preferences,
             )
         {
-            let prepared_snapshot = self.project_session.get_snapshot_with_auto_imports(
+            // ts#64163
+            let prepared_snapshot = self.snapshot_host.clone_snapshot_with_auto_imports(
                 ctx,
                 &working_snapshot,
-                &params
-                    .file
-                    .to_uri(&self.project_session.get_current_directory()),
+                &params.file.to_uri(&self.get_current_directory()),
+                None,
             );
+            if let Some(project_session) = &self.project_session {
+                project_session
+                    .try_adopt_snapshot_in_background(&working_snapshot, &prepared_snapshot);
+            }
             _deref_prepared = {
-                let (snapshot, session) = (prepared_snapshot.clone(), self.project_session.clone());
-                ls_program::Release::new(move || project::Snapshot::deref(&snapshot, &session))
+                let snapshot = prepared_snapshot.clone();
+                ls_program::Release::new(move || project::Snapshot::deref(&snapshot))
             };
 
             working_snapshot = prepared_snapshot;
-            let proj = working_snapshot
-                .project_collection
-                .get_project_by_path(&project_path);
+            let proj = working_snapshot.project_collection.get_project(&project_id);
             let Some(proj) = proj else {
                 return Err(errors::errorf(
-                    format!(
-                        "{}: project {} not found",
-                        *ERR_CLIENT_ERROR,
-                        project_path.as_str()
-                    ),
+                    format!("{}: project {} not found", *ERR_CLIENT_ERROR, project_id.0),
                     vec![ERR_CLIENT_ERROR.clone()],
                 ));
             };
@@ -3681,7 +4052,7 @@ impl Session {
         let view = autoimport::new_view(
             registry,
             source_file,
-            project_path,
+            project_id,
             program.clone(),
             // ts#64178
             ch.clone(),

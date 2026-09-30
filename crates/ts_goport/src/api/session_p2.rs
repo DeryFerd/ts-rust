@@ -10,6 +10,7 @@ use crate::api::prelude::*;
 // and `checker_signature`).
 
 use crate::api::encoder;
+use crate::api::requestfilesystem;
 use crate::emitter::emitter::EmitOnly;
 use crate::emitter::program_emit::{self, EmitOptions, EmitResult, WriteFile, WriteFileData};
 use crate::execute::incremental::emit_files::fs_error_text;
@@ -703,25 +704,46 @@ impl Session {
             },
         );
         options.write_file = Some(write_file);
+        // ts#64115: a snapshot with a full request file system keeps the
+        // outputs (Go `outputFiles`) and writes nothing.
+        let sd = self.get_snapshot_data(params.snapshot)?;
+        let keep_outputs = requestfilesystem::has_full_file_system(sd.file_system.as_deref());
         let mut result = emit_program(ctx, &program, options)?;
         let writes = std::mem::take(&mut *writes.lock().unwrap_or_else(PoisonError::into_inner));
-        let fs = self.project_session.fs();
-        for (file_name, text) in writes {
-            if let Err(err) = fs.write_file(&file_name, &text) {
-                let output_file = file_name.strip_suffix(".map").unwrap_or(&file_name);
-                result.diagnostics.push(new_compiler_diagnostic(
-                    diag::Could_not_write_file_0_Colon_1,
-                    args![output_file, fs_error_text(&err)],
-                ));
-                result.emitted_files.retain(|emitted| *emitted != file_name);
+        let mut output_files: Option<FxHashMap<String, String>> = None;
+        if keep_outputs {
+            let outputs = output_files.get_or_insert_with(FxHashMap::default);
+            for (file_name, text) in writes {
+                outputs.insert(file_name, text);
+            }
+        } else {
+            let fs = self.snapshot_host.fs();
+            for (file_name, text) in writes {
+                if let Err(err) = fs.write_file(&file_name, &text) {
+                    let output_file = file_name.strip_suffix(".map").unwrap_or(&file_name);
+                    result.diagnostics.push(new_compiler_diagnostic(
+                        diag::Could_not_write_file_0_Colon_1,
+                        args![output_file, fs_error_text(&err)],
+                    ));
+                    result.emitted_files.retain(|emitted| *emitted != file_name);
+                }
             }
         }
         // Go clones `EmittedFiles` and makes a nil one `[]string{}`; an empty
         // `Vec` marshals as `[]`.
+        let emitted_files = result.emitted_files;
+        let mut emitted_files_contents: Vec<String> = Vec::new();
+        if let Some(output_files) = &output_files {
+            emitted_files_contents = emitted_files
+                .iter()
+                .map(|file_name| output_files.get(file_name).cloned().unwrap_or_default())
+                .collect();
+        }
         Ok(EmitResponse {
             emit_skipped: result.emit_skipped,
             diagnostics: non_nil_diagnostics(&result.diagnostics),
-            emitted_files: result.emitted_files,
+            emitted_files,
+            emitted_files_contents,
         })
     }
 
@@ -836,7 +858,7 @@ impl Session {
     pub fn get_emit_program(
         &self,
         snapshot: SnapshotID,
-        project_id: &ProjectID,
+        project_id: &project::ID,
     ) -> Result<Rc<compiler::NewProgram>, GoError> {
         let sd = self.get_snapshot_data(snapshot)?;
         sd.get_program(project_id)
@@ -1921,8 +1943,9 @@ pub fn compute_snapshot_changes(
     prev: &project::Snapshot,
     next: &project::Snapshot,
 ) -> SnapshotChanges {
-    let prev_projects = prev.project_collection.projects_by_path();
-    let next_projects = next.project_collection.projects_by_path();
+    // ts#64319: keyed by project ID.
+    let prev_projects = prev.project_collection.projects_by_id();
+    let next_projects = next.project_collection.projects_by_id();
 
     let mut changes = SnapshotChanges::default();
 
@@ -1933,9 +1956,7 @@ pub fn compute_snapshot_changes(
         |_, _| {},
         // onRemoved: project removed entirely.
         |_, old_proj| {
-            changes
-                .removed_projects
-                .push(project_handle(&old_proj.borrow()));
+            changes.removed_projects.push(old_proj.borrow().id());
         },
         // onModified: project changed, diff its files.
         |_, old_proj, new_proj| {
@@ -1984,7 +2005,7 @@ pub fn compute_snapshot_changes(
                 // value to the `omitempty` field.
                 changes
                     .changed_projects
-                    .insert(project_handle(&new_proj.borrow()), project_changes);
+                    .insert(new_proj.borrow().id(), project_changes);
             }
         },
     );
@@ -1993,31 +2014,146 @@ pub fn compute_snapshot_changes(
 }
 
 impl Session {
+    // Go: api/session.go createSnapshotResponse (ts#64204)
+    pub fn create_snapshot_response(
+        &self,
+        snapshot: &Rc<project::Snapshot>,
+        base: Option<&Rc<project::Snapshot>>,
+        request: Option<&SnapshotRequestChangesParams>,
+    ) -> CreateSnapshotResponse {
+        let operation = self.create_snapshot_operation_response(snapshot, request);
+        let Some(base) = base else {
+            let projects = snapshot.project_collection.projects();
+            let mut project_responses = Vec::with_capacity(projects.len());
+            for proj in &projects {
+                if proj.borrow().command_line.is_some() {
+                    project_responses.push(new_project_response(&proj.borrow()));
+                }
+            }
+            return CreateSnapshotResponse {
+                snapshot: snapshot_handle(snapshot),
+                projects: project_responses,
+                changes: None,
+                operation: Some(operation),
+            };
+        };
+
+        // PORT: two callbacks append, so the list is in a `RefCell`.
+        let project_responses = RefCell::new(Vec::new());
+        diff_ordered_maps(
+            &base.project_collection.projects_by_id(),
+            &snapshot.project_collection.projects_by_id(),
+            |_, proj| {
+                if proj.borrow().command_line.is_some() {
+                    project_responses
+                        .borrow_mut()
+                        .push(new_project_response(&proj.borrow()));
+                }
+            },
+            |_, _| {},
+            |_, old_proj, new_proj| {
+                if !Rc::ptr_eq(old_proj, new_proj) && new_proj.borrow().command_line.is_some() {
+                    project_responses
+                        .borrow_mut()
+                        .push(new_project_response(&new_proj.borrow()));
+                }
+            },
+        );
+        CreateSnapshotResponse {
+            snapshot: snapshot_handle(snapshot),
+            projects: project_responses.into_inner(),
+            changes: Some(compute_snapshot_changes(base, snapshot)),
+            operation: Some(operation),
+        }
+    }
+
+    // Go: api/session.go createSnapshotOperationResponse (ts#64204, ts#64374)
+    pub fn create_snapshot_operation_response(
+        &self,
+        snapshot: &project::Snapshot,
+        request: Option<&SnapshotRequestChangesParams>,
+    ) -> SnapshotOperationResponse {
+        let mut operation = SnapshotOperationResponse::default();
+        let Some(request) = request else {
+            return operation;
+        };
+
+        if let Some(request_create_programs) = &request.create_programs {
+            let created_programs = snapshot.created_programs();
+            if created_programs.len() != request_create_programs.len() {
+                panic!("created program result count does not match request");
+            }
+            let mut results = Vec::with_capacity(created_programs.len());
+            for created_program in &created_programs {
+                let (program_id, ok) = created_program.borrow().id().synthetic();
+                if !ok {
+                    panic!("created program has non-synthetic project ID");
+                }
+                results.push(program_id);
+            }
+            operation.created_programs = Some(results);
+        }
+
+        if let Some(open_files) = &request.open_files {
+            let mut results = Vec::with_capacity(open_files.len());
+            for file in open_files {
+                let project =
+                    snapshot.get_default_project(&file.to_uri(&self.get_current_directory()));
+                let Some(project) = project else {
+                    panic!(
+                        "no project found for opened file {}",
+                        file.to_absolute_file_name(&self.get_current_directory())
+                    );
+                };
+                results.push(OpenedFileOperationResult {
+                    project: project.borrow().id(),
+                });
+            }
+            operation.opened_files = Some(results);
+        }
+        operation
+    }
+}
+
+impl Session {
     // Go: api/session.go:2855 Close
     // Close closes the session and releases all active snapshots,
     // regardless of their ref counts.
+    // PORT: Go `closeOnce.Do`: `close_once` records the first call.
     pub fn close(&self) {
-        self.release_open_refs();
-
-        let mut snapshots = self.snapshots.borrow_mut();
-        // PORT: Go deletes while it ranges over the map; the port drains it.
-        for (_, sd) in snapshots.drain() {
-            project::Snapshot::deref(&sd.snapshot, &self.project_session);
+        if self.close_once.replace(true) {
+            return;
         }
-        drop(snapshots);
+        self.release_language_server_refs();
+
+        let snapshots: Vec<Rc<project::Snapshot>> = self
+            .snapshots
+            .borrow_mut()
+            .drain()
+            .map(|(_, sd)| sd.snapshot.clone())
+            .collect();
+        for snapshot in snapshots {
+            project::Snapshot::deref(&snapshot);
+        }
+
+        if self.owns_snapshot_host {
+            self.snapshot_host.close();
+        }
         // ts#64061
         self.batch_response_pages.borrow_mut().clear();
     }
 
-    // Go: api/session.go:2871 releaseOpenRefs
-    // releaseOpenRefs releases every project and file ref this session is holding open
-    // in the project session. This keeps the API's ref counts balanced when an API
-    // session is shut down while sharing a longer-lived project session (e.g. one
-    // backing an LSP server), so API-opened projects and files aren't leaked. Only
-    // refs the session currently holds are closed, so it never over-releases.
-    // PORT: the Go `updateMu` lock is not ported (one thread).
-    fn release_open_refs(&self) {
-        if self.open_projects.borrow().is_empty() && self.open_files.borrow().is_empty() {
+    // Go: api/session.go releaseLanguageServerRefs (ts#64204)
+    // PORT: the Go `languageServerUpdateMu` lock is not ported (one thread).
+    fn release_language_server_refs(&self) {
+        let Some(project_session) = &self.project_session else {
+            return;
+        };
+
+        if self.open_projects.borrow().is_empty()
+            && self.open_files.borrow().is_empty()
+            && self.created_programs.borrow().is_empty()
+        {
             return;
         }
 
@@ -2028,19 +2164,21 @@ impl Session {
         if !self.open_files.borrow().is_empty() {
             api_request.close_files = Some(self.open_files.borrow().clone());
         }
-        let (snapshot, err) = self.project_session.api_update(
-            &gostd::context::background(),
-            &project::FileChangeSummary::default(),
-            api_request,
-        );
-        // APIUpdate returns a ref'd snapshot even on error; always release it.
-        project::Snapshot::deref(&snapshot, &self.project_session);
-        if err.is_some() {
-            return;
+        if !self.created_programs.borrow().is_empty() {
+            api_request.remove_programs = Some(self.created_programs.borrow().clone());
         }
-
+        let snapshot = match project_session.api_update(
+            &(self.with_locale)(&gostd::context::background()),
+            project::FileChangeSummary::default(),
+            Some(&api_request),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return,
+        };
+        project::Snapshot::deref(&snapshot);
         self.open_projects.borrow_mut().clear();
         self.open_files.borrow_mut().clear();
+        self.created_programs.borrow_mut().clear();
     }
 }
 
@@ -2055,8 +2193,8 @@ impl Session {
     pub fn to_path(&self, file_name: &str) -> tspath::Path {
         tspath::to_path(
             file_name,
-            &self.project_session.get_current_directory(),
-            self.project_session.fs().use_case_sensitive_file_names(),
+            &self.get_current_directory(),
+            self.use_case_sensitive_file_names(),
         )
     }
 
@@ -2064,7 +2202,7 @@ impl Session {
     // toFileChangeSummary converts API file changes to a project.FileChangeSummary.
     pub fn to_file_change_summary(
         &self,
-        changes: Option<&APIFileChanges>,
+        changes: Option<&FileNotifications>,
     ) -> project::FileChangeSummary {
         let Some(changes) = changes else {
             return project::FileChangeSummary::default();
@@ -2075,7 +2213,7 @@ impl Session {
             summary.includes_watch_change_outside_node_modules = true;
             return summary;
         }
-        let cwd = self.project_session.get_current_directory();
+        let cwd = self.get_current_directory();
         for doc in &changes.changed {
             let uri = doc.to_uri(&cwd);
             summary.changed.insert(uri);
@@ -2398,35 +2536,33 @@ impl Session {
         let mut result = run(&sd.snapshot, &program);
         // PORT: Go `defer preparedSnapshot.Deref(...)`: the guard derefs it
         // when the handler returns.
-        let mut _prepared_snapshot: Option<SnapshotDerefGuard> = None;
+        let mut _prepared_snapshot = ls_program::Release::noop();
         if let Err(err) = &result
             && errors::is(err, &ls::ERR_NEEDS_AUTO_IMPORTS)
         {
-            let prepared_snapshot = self.project_session.get_snapshot_with_auto_imports(
+            // ts#64163
+            let prepared_snapshot = self.snapshot_host.clone_snapshot_with_auto_imports(
                 ctx,
                 &sd.snapshot,
-                &params
-                    .file
-                    .to_uri(&self.project_session.get_current_directory()),
+                &params.file.to_uri(&self.get_current_directory()),
+                None,
             );
-            _prepared_snapshot = Some(SnapshotDerefGuard {
-                snapshot: prepared_snapshot.clone(),
-                session: self.project_session.clone(),
-            });
+            if let Some(project_session) = &self.project_session {
+                project_session.try_adopt_snapshot_in_background(&sd.snapshot, &prepared_snapshot);
+            }
+            _prepared_snapshot = {
+                let snapshot = prepared_snapshot.clone();
+                ls_program::Release::new(move || project::Snapshot::deref(&snapshot))
+            };
             if let Some(err) = ctx.err() {
                 return Err(err);
             }
-            let project_path = parse_project_handle(&params.project);
-            let proj = prepared_snapshot
-                .project_collection
-                .get_project_by_path(&project_path);
+            // ts#64319: looked up by project ID.
+            let project_id = &params.project;
+            let proj = prepared_snapshot.project_collection.get_project(project_id);
             let Some(proj) = proj else {
                 return Err(errors::errorf(
-                    format!(
-                        "{}: project {} not found",
-                        *ERR_CLIENT_ERROR,
-                        project_path.as_str()
-                    ),
+                    format!("{}: project {} not found", *ERR_CLIENT_ERROR, project_id.0),
                     vec![ERR_CLIENT_ERROR.clone()],
                 ));
             };
@@ -2761,57 +2897,4 @@ fn strconv_parse_uint(s: &str, base: u32, bit_size: u32) -> Result<u64, GoError>
     }
 
     Ok(n)
-}
-
-/// PORT: Go `defer snapshot.Deref(session)` (ts#64133): derefs the snapshot
-/// when the guard drops.
-struct SnapshotDerefGuard {
-    snapshot: Rc<project::Snapshot>,
-    session: Rc<project::Session>,
-}
-
-impl Drop for SnapshotDerefGuard {
-    fn drop(&mut self) {
-        project::Snapshot::deref(&self.snapshot, &self.session);
-    }
-}
-
-// Go: api/session.go decodePrintNode (ts#64320)
-pub fn decode_print_node(encoded: &str) -> Result<Node, GoError> {
-    let data = match base64_std_encoding_decode_string(encoded) {
-        Ok(data) => data,
-        Err(err) => {
-            return Err(errors::errorf(
-                format!("{}: invalid base64 data: {}", *ERR_CLIENT_ERROR, err),
-                vec![ERR_CLIENT_ERROR.clone(), err],
-            ));
-        }
-    };
-
-    let node = match encoder::decode_nodes(&data) {
-        Ok(node) => node,
-        Err(err) => {
-            return Err(errors::errorf(
-                format!("{}: failed to decode AST: {}", *ERR_CLIENT_ERROR, err),
-                vec![ERR_CLIENT_ERROR.clone(), err],
-            ));
-        }
-    };
-    Ok(node)
-}
-
-// Go: api/session.go newPrinter (ts#64320)
-// PORT: private, so it does not collide with `printer::new_printer` in the
-// api prelude; it calls that one by path.
-fn new_printer(params: &PrintNodeParams) -> Printer {
-    crate::printer::new_printer(
-        PrinterOptions {
-            preserve_source_newlines: params.preserve_source_newlines,
-            never_ascii_escape: params.never_ascii_escape,
-            terminate_unterminated_literals: params.terminate_unterminated_literals,
-            ..Default::default()
-        },
-        PrintHandlers::default(),
-        None,
-    )
 }

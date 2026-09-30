@@ -4432,7 +4432,8 @@ impl Server {
             *self.api_sessions.borrow_mut() = Some(FxHashMap::default());
         }
 
-        let api_session = api::new_session(self.session_ref(), None);
+        // ts#64163
+        let api_session = api::new_lsp_session(self.session_ref(), None);
 
         // Use provided pipe path or generate a unique one
         let params = params.expect(NIL_DEREF);
