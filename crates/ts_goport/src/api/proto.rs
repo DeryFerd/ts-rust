@@ -306,6 +306,8 @@ impl Method {
         Method(Cow::Borrowed("getOuterTypeParametersOfType"));
     pub const GET_LOCAL_TYPE_PARAMETERS_OF_TYPE: Method =
         Method(Cow::Borrowed("getLocalTypeParametersOfType"));
+    // ts#64264
+    pub const GET_THIS_TYPE_OF_TYPE: Method = Method(Cow::Borrowed("getThisTypeOfType"));
     pub const GET_ALIAS_TYPE_ARGUMENTS_OF_TYPE: Method =
         Method(Cow::Borrowed("getAliasTypeArgumentsOfType"));
     pub const GET_ALIAS_SYMBOL_OF_TYPE: Method = Method(Cow::Borrowed("getAliasSymbolOfType"));
@@ -327,6 +329,10 @@ impl Method {
 
     // Checker methods
     pub const GET_CONTEXTUAL_TYPE: Method = Method(Cow::Borrowed("getContextualType"));
+    // ts#64264
+    pub const GET_CONTEXTUAL_TYPE_FOR_ARGUMENT: Method =
+        Method(Cow::Borrowed("getContextualTypeForArgument"));
+    pub const GET_AWAITED_TYPE: Method = Method(Cow::Borrowed("getAwaitedType"));
     pub const GET_BASE_TYPE_OF_LITERAL_TYPE: Method =
         Method(Cow::Borrowed("getBaseTypeOfLiteralType"));
     pub const GET_NON_NULLABLE_TYPE: Method = Method(Cow::Borrowed("getNonNullableType"));
@@ -359,6 +365,11 @@ impl Method {
     // ts#63899
     pub const GET_REDUCED_TYPE: Method = Method(Cow::Borrowed("getReducedType"));
     pub const GET_PROPERTY_OF_TYPE: Method = Method(Cow::Borrowed("getPropertyOfType"));
+    // ts#64264 (MethodGetIndexTypeOfTypeByKind is not ported: ts#64408
+    // removes it)
+    pub const GET_TYPE_OF_PROPERTY_OF_TYPE: Method =
+        Method(Cow::Borrowed("getTypeOfPropertyOfType"));
+    pub const GET_INDEX_INFO_OF_TYPE: Method = Method(Cow::Borrowed("getIndexInfoOfType"));
     pub const GET_INDEX_INFOS_OF_TYPE: Method = Method(Cow::Borrowed("getIndexInfosOfType"));
     pub const GET_CONSTRAINT_OF_TYPE_PARAMETER: Method =
         Method(Cow::Borrowed("getConstraintOfTypeParameter"));
@@ -383,6 +394,9 @@ impl Method {
         Method(Cow::Borrowed("getImmediateAliasedSymbol"));
     // ts#63945
     pub const GET_TARGET_SYMBOL: Method = Method(Cow::Borrowed("getTargetSymbol"));
+    // ts#64264
+    pub const GET_EXPORT_SYMBOL_OF_SYMBOL_FOR_CHECKER: Method =
+        Method(Cow::Borrowed("getExportSymbolOfSymbolForChecker"));
     pub const GET_FULLY_QUALIFIED_NAME: Method = Method(Cow::Borrowed("getFullyQualifiedName"));
     pub const GET_EXPORTS_OF_MODULE: Method = Method(Cow::Borrowed("getExportsOfModule"));
     pub const GET_MEMBER_IN_MODULE_EXPORTS: Method =
@@ -1007,6 +1021,11 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         Method::GET_LOCAL_TYPE_PARAMETERS_OF_TYPE,
         unmarshaller_for::<GetTypePropertyParams>,
     );
+    // ts#64264
+    m.insert(
+        Method::GET_THIS_TYPE_OF_TYPE,
+        unmarshaller_for::<GetTypePropertyParams>,
+    );
     m.insert(
         Method::GET_ALIAS_TYPE_ARGUMENTS_OF_TYPE,
         unmarshaller_for::<GetTypePropertyParams>,
@@ -1068,6 +1087,15 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     m.insert(
         Method::GET_CONTEXTUAL_TYPE,
         unmarshaller_for::<GetContextualTypeParams>,
+    );
+    // ts#64264
+    m.insert(
+        Method::GET_CONTEXTUAL_TYPE_FOR_ARGUMENT,
+        unmarshaller_for::<GetContextualTypeForArgumentParams>,
+    );
+    m.insert(
+        Method::GET_AWAITED_TYPE,
+        unmarshaller_for::<CheckerTypeParams>,
     );
     m.insert(
         Method::GET_BASE_TYPE_OF_LITERAL_TYPE,
@@ -1162,6 +1190,15 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
         Method::GET_PROPERTY_OF_TYPE,
         unmarshaller_for::<GetPropertyOfTypeParams>,
     );
+    // ts#64264
+    m.insert(
+        Method::GET_TYPE_OF_PROPERTY_OF_TYPE,
+        unmarshaller_for::<GetPropertyOfTypeParams>,
+    );
+    m.insert(
+        Method::GET_INDEX_INFO_OF_TYPE,
+        unmarshaller_for::<GetIndexInfoOfTypeParams>,
+    );
     m.insert(
         Method::GET_INDEX_INFOS_OF_TYPE,
         unmarshaller_for::<CheckerTypeParams>,
@@ -1209,6 +1246,11 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     // ts#63945
     m.insert(
         Method::GET_TARGET_SYMBOL,
+        unmarshaller_for::<CheckerSymbolParams>,
+    );
+    // ts#64264
+    m.insert(
+        Method::GET_EXPORT_SYMBOL_OF_SYMBOL_FOR_CHECKER,
         unmarshaller_for::<CheckerSymbolParams>,
     );
     m.insert(
@@ -2045,6 +2087,9 @@ pub struct TypeResponse {
     // TypeParameter data
     pub is_this_type: bool,
 
+    // InterfaceType data (ts#64264)
+    pub this_type: TypeID,
+
     // IntrinsicType data
     pub intrinsic_name: String,
 
@@ -2100,6 +2145,7 @@ impl MarshalerTo for TypeResponse {
         marshal_field_omitzero(enc, &mut first, "freshType", &self.fresh_type)?;
         marshal_field_omitzero(enc, &mut first, "regularType", &self.regular_type)?;
         marshal_field_omitempty(enc, &mut first, "isThisType", &self.is_this_type)?;
+        marshal_field_omitzero(enc, &mut first, "thisType", &self.this_type)?;
         marshal_field_omitempty(enc, &mut first, "intrinsicName", &self.intrinsic_name)?;
         marshal_field_omitempty(
             enc,
@@ -2174,6 +2220,11 @@ pub fn new_type_response(c: &Checker, t: TypeId, id: TypeID) -> TypeResponse {
             resp.type_parameters = type_handles(iface.type_parameters());
             resp.outer_type_parameters = type_handles(iface.outer_type_parameters());
             resp.local_type_parameters = type_handles(iface.local_type_parameters());
+            // ts#64264
+            // PORT: Go `iface.ThisType()` returns this field.
+            if iface.this_type.is_some() {
+                resp.this_type = type_handle(iface.this_type);
+            }
         }
     } else if flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
         // types omitted; fetched via separate request
@@ -2579,6 +2630,22 @@ proto_json!(both GetContextualTypeParams {
     snapshot: "snapshot" plain,
     project: "project" plain,
     location: "location" plain,
+});
+
+// Go: proto.go GetContextualTypeForArgumentParams (ts#64264)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetContextualTypeForArgumentParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub location: NodeHandle,
+    pub index: i32,
+}
+
+proto_json!(both GetContextualTypeForArgumentParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    location: "location" plain,
+    index: "index" plain,
 });
 
 // GetTypeOfSymbolAtLocationParams returns the narrowed type of a symbol at a specific location.
@@ -3222,6 +3289,22 @@ proto_json!(both GetPropertyOfTypeParams {
     project: "project" plain,
     type_: "type" plain,
     name: "name" plain,
+});
+
+// Go: proto.go GetIndexInfoOfTypeParams (ts#64264)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GetIndexInfoOfTypeParams {
+    pub snapshot: SnapshotID,
+    pub project: ProjectID,
+    pub type_: TypeID,
+    pub kind: i32,
+}
+
+proto_json!(both GetIndexInfoOfTypeParams {
+    snapshot: "snapshot" plain,
+    project: "project" plain,
+    type_: "type" plain,
+    kind: "kind" plain,
 });
 
 // CheckerNodeParams are parameters for checker methods that operate on a node location.

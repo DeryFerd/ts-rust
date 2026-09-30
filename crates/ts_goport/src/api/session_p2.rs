@@ -283,6 +283,38 @@ impl Session {
         Ok(setup.new_type_response(t))
     }
 
+    // Go: api/session.go handleGetContextualTypeForArgument (ts#64264)
+    pub fn handle_get_contextual_type_for_argument(
+        &self,
+        ctx: &Context,
+        params: &GetContextualTypeForArgumentParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let node = setup
+            .sd
+            .resolve_node_handle(&setup.program, &params.location)?;
+        let t = setup
+            .checker
+            .borrow_mut()
+            .get_contextual_type_for_argument_at_index_exported(node, params.index);
+        Ok(setup.new_type_response(t))
+    }
+
+    // Go: api/session.go handleGetAwaitedType (ts#64264)
+    pub fn handle_get_awaited_type(
+        &self,
+        ctx: &Context,
+        params: &CheckerTypeParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+        let awaited = setup.checker.borrow_mut().get_awaited_type_exported(t);
+        Ok(setup.new_type_response(awaited))
+    }
+
     // Go: api/session.go:1487 handleGetBaseTypeOfLiteralType
     // handleGetBaseTypeOfLiteralType returns the base type of a literal type (e.g. number for 42).
     pub fn handle_get_base_type_of_literal_type(
@@ -1163,6 +1195,60 @@ impl Session {
         Ok(result)
     }
 
+    // Go: api/session.go resolveIndexInfoRequest (ts#64264)
+    // PORT: Go calls `setup.done()` on each error path; the setup's guard
+    // releases the checker when it drops there.
+    pub fn resolve_index_info_request(
+        &self,
+        ctx: &Context,
+        params: &GetIndexInfoOfTypeParams,
+    ) -> Result<(CheckerSetup, TypeId, TypeId), GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let key_type = match IndexKind(params.kind) {
+            IndexKind::STRING => setup.checker.borrow().get_string_type(),
+            IndexKind::NUMBER => setup.checker.borrow().get_number_type(),
+            _ => {
+                return Err(errors::errorf(
+                    format!("{}: invalid index kind {}", *ERR_CLIENT_ERROR, params.kind),
+                    vec![ERR_CLIENT_ERROR.clone()],
+                ));
+            }
+        };
+        Ok((setup, t, key_type))
+    }
+
+    // Go: api/session.go handleGetIndexInfoOfType (ts#64264)
+    pub fn handle_get_index_info_of_type(
+        &self,
+        ctx: &Context,
+        params: &GetIndexInfoOfTypeParams,
+    ) -> Result<Option<IndexInfoResponse>, GoError> {
+        let (setup, t, key_type) = self.resolve_index_info_request(ctx, params)?;
+        let info = setup
+            .checker
+            .borrow_mut()
+            .get_index_info_of_type_exported(t, key_type);
+        Ok(setup.new_index_info_response(info))
+    }
+
+    // Go: api/session.go handleGetExportSymbolOfSymbolForChecker (ts#64264)
+    pub fn handle_get_export_symbol_of_symbol_for_checker(
+        &self,
+        ctx: &Context,
+        params: &CheckerSymbolParams,
+    ) -> Result<Option<SymbolResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, symbol) = setup.resolve_symbol_handle(params.symbol)?;
+        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+        let export_symbol = setup.checker.borrow().get_export_symbol_of_symbol(symbol);
+        Ok(setup.new_symbol_response(export_symbol))
+    }
+
     // Go: api/session.go handleIsReadonlySymbol (ts#63943)
     // handleIsReadonlySymbol returns whether a symbol is a readonly symbol.
     pub fn handle_is_readonly_symbol(
@@ -1310,32 +1396,12 @@ impl Session {
 
         let mut results = Vec::with_capacity(infos.len());
         for info in infos {
-            let (key_type, value_type, is_readonly, declaration) = {
-                let c = setup.checker.borrow();
-                let info = c.index_info(info);
-                (
-                    info.key_type(),
-                    info.value_type(),
-                    info.is_readonly(),
-                    info.declaration(),
-                )
-            };
-            // PORT: Go dereferences the `*TypeResponse` (`*setup.newTypeResponse(..)`),
-            // which panics on nil.
-            let mut result = IndexInfoResponse {
-                key_type: setup
-                    .new_type_response(key_type)
-                    .expect("invalid memory address or nil pointer dereference"),
-                value_type: setup
-                    .new_type_response(value_type)
-                    .expect("invalid memory address or nil pointer dereference"),
-                is_readonly,
-                ..Default::default()
-            };
-            if declaration.is_some() {
-                result.declaration = setup.sd.node_handle_from(declaration);
-            }
-            results.push(result);
+            // ts#64264: checkerSetup.newIndexInfoResponse
+            results.push(
+                setup
+                    .new_index_info_response(info)
+                    .expect("an index info of a type is non-nil"),
+            );
         }
 
         Ok(results)
@@ -1427,6 +1493,24 @@ impl Session {
         }
 
         Ok(setup.new_symbol_response(prop))
+    }
+
+    // Go: api/session.go handleGetTypeOfPropertyOfType (ts#64264)
+    pub fn handle_get_type_of_property_of_type(
+        &self,
+        ctx: &Context,
+        params: &GetPropertyOfTypeParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
+
+        let (owner, t) = setup.resolve_type_handle(params.type_)?;
+        let t = checker_type(&setup.checker, &owner, t);
+
+        let prop_type = setup
+            .checker
+            .borrow_mut()
+            .get_type_of_property_of_type_exported(t, &params.name);
+        Ok(setup.new_type_response(prop_type))
     }
 
     // Go: api/session.go:2323 handleGetConstantValue

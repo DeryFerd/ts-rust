@@ -795,6 +795,39 @@ impl CheckerSetup {
             .new_signature_response(&self.project_id, &self.checker, sig)
     }
 
+    // Go: api/session.go checkerSetup.newIndexInfoResponse (ts#64264)
+    // PORT: Go dereferences the `*TypeResponse` (`*setup.newTypeResponse(..)`),
+    // which panics on nil.
+    pub fn new_index_info_response(&self, info: IndexInfoId) -> Option<IndexInfoResponse> {
+        if info.is_nil() {
+            return None;
+        }
+        let (key_type, value_type, is_readonly, declaration) = {
+            let c = self.checker.borrow();
+            let info = c.index_info(info);
+            (
+                info.key_type(),
+                info.value_type(),
+                info.is_readonly(),
+                info.declaration(),
+            )
+        };
+        let mut result = IndexInfoResponse {
+            key_type: self
+                .new_type_response(key_type)
+                .expect("invalid memory address or nil pointer dereference"),
+            value_type: self
+                .new_type_response(value_type)
+                .expect("invalid memory address or nil pointer dereference"),
+            is_readonly,
+            ..Default::default()
+        };
+        if declaration.is_some() {
+            result.declaration = self.sd.node_handle_from(declaration);
+        }
+        Some(result)
+    }
+
     // Go: api/session.go:476 checkerSetup.resolveTypeHandle
     pub fn resolve_type_handle(
         &self,
@@ -1199,6 +1232,10 @@ impl ipc::Handler for Session {
             m if m == Method::GET_LOCAL_TYPE_PARAMETERS_OF_TYPE.0 => self
                 .handle_get_local_type_parameters_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#64264
+            m if m == Method::GET_THIS_TYPE_OF_TYPE.0 => self
+                .handle_get_this_type_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_ALIAS_TYPE_ARGUMENTS_OF_TYPE.0 => self
                 .handle_get_alias_type_arguments_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1243,6 +1280,13 @@ impl ipc::Handler for Session {
                 .map(to_any),
             m if m == Method::GET_CONTEXTUAL_TYPE.0 => self
                 .handle_get_contextual_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64264
+            m if m == Method::GET_CONTEXTUAL_TYPE_FOR_ARGUMENT.0 => self
+                .handle_get_contextual_type_for_argument(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_AWAITED_TYPE.0 => self
+                .handle_get_awaited_type(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_BASE_TYPE_OF_LITERAL_TYPE.0 => self
                 .handle_get_base_type_of_literal_type(ctx, assert_params(&parsed))
@@ -1331,6 +1375,13 @@ impl ipc::Handler for Session {
             m if m == Method::GET_PROPERTY_OF_TYPE.0 => self
                 .handle_get_property_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
+            // ts#64264
+            m if m == Method::GET_TYPE_OF_PROPERTY_OF_TYPE.0 => self
+                .handle_get_type_of_property_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
+            m if m == Method::GET_INDEX_INFO_OF_TYPE.0 => self
+                .handle_get_index_info_of_type(ctx, assert_params(&parsed))
+                .map(to_any),
             m if m == Method::GET_INDEX_INFOS_OF_TYPE.0 => self
                 .handle_get_index_infos_of_type(ctx, assert_params(&parsed))
                 .map(to_any),
@@ -1367,6 +1418,10 @@ impl ipc::Handler for Session {
             // ts#63945
             m if m == Method::GET_TARGET_SYMBOL.0 => self
                 .handle_method_get_target_symbol(ctx, assert_params(&parsed))
+                .map(to_any),
+            // ts#64264
+            m if m == Method::GET_EXPORT_SYMBOL_OF_SYMBOL_FOR_CHECKER.0 => self
+                .handle_get_export_symbol_of_symbol_for_checker(ctx, assert_params(&parsed))
                 .map(to_any),
             m if m == Method::GET_FULLY_QUALIFIED_NAME.0 => self
                 .handle_get_fully_qualified_name(ctx, assert_params(&parsed))
@@ -3189,6 +3244,18 @@ impl Session {
     ) -> Result<Vec<Option<TypeResponse>>, GoError> {
         self.resolve_type_array_property_of_type(params, &|c: &Checker, t: TypeId| {
             c.ty(t).as_interface_type().local_type_parameters().to_vec()
+        })
+    }
+
+    // Go: api/session.go handleGetThisTypeOfType (ts#64264)
+    // PORT: Go `t.AsInterfaceType().ThisType()` returns this field.
+    pub fn handle_get_this_type_of_type(
+        &self,
+        _ctx: &Context,
+        params: &GetTypePropertyParams,
+    ) -> Result<Option<TypeResponse>, GoError> {
+        self.resolve_type_property_of_type(params, &|c: &Checker, t: TypeId| {
+            c.ty(t).as_interface_type().this_type
         })
     }
 
