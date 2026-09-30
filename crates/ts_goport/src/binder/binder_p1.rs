@@ -135,6 +135,8 @@ impl FlowNode {
 // the program-wide arena; it is moved into the binder and moved back when
 // binding ends. The binder output is stored in the file's `GoFile`
 // `OnceCell`s (Go `file.BindOnce`). A file that is already bound is skipped.
+// The caller publishes what the file added to `symbols` for the checkers'
+// copies (`Lineage::add_file`).
 pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
     if crate::ast::go_file(file.file_index())
         .file_bind
@@ -143,10 +145,7 @@ pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
     {
         return;
     }
-    let mark = symbols.mark();
     bind_source_file_detached(file, symbols).install();
-    // Checkers clone the program arena; share what this file added.
-    symbols.share_since(mark);
 }
 
 /// Binder data per node of the file being bound. Most nodes get no data, so

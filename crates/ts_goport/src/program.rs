@@ -1119,13 +1119,19 @@ impl Lineage {
         freeable: bool,
         add: impl FnOnce(&mut SymbolArena) -> R,
     ) -> R {
+        // Checkers copy the lineage; publish what the file added, so they
+        // share it (`SymbolArena::freeze_since` and `share_since`).
         if !freeable {
-            return add(&mut self.symbols);
+            let mark = self.symbols.mark();
+            let result = add(&mut self.symbols);
+            self.symbols.freeze_since(mark);
+            return result;
         }
         self.symbols.end_chunk();
         let start = self.symbols.mark();
         let result = add(&mut self.symbols);
         self.symbols.end_chunk();
+        self.symbols.share_since(start);
         self.freeable.insert(file, (start, self.symbols.mark()));
         result
     }
@@ -1168,7 +1174,6 @@ pub fn bind_all() {
     let program = prog();
     held_tables(program).bound_symbols.get_or_init(|| {
         with_lineage(|lineage| {
-            let mark = lineage.symbols.mark();
             if single_threaded() {
                 bind_files_last_queued_first(lineage);
             } else {
@@ -1183,8 +1188,8 @@ pub fn bind_all() {
                 };
                 lineage.bind(file.root);
             }
-            // Checkers clone the copy; share what this program added.
-            lineage.symbols.share_since(mark);
+            // Checkers clone the copy. Each file published what it added
+            // (`Lineage::add_file`).
             lineage.symbols.clone()
         })
     });
