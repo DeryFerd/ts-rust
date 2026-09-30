@@ -46,9 +46,9 @@ pub fn find_many_ancestors(mut node: Node, callbacks: &[fn(Node) -> bool]) -> Ve
 
 /// `find_ancestor(node, |n| callback(n, n.kind()))`: the callback also gets
 /// the node's Go `Kind`.
-// PERF: U4 (CH7). The steps inside a tier 0 store read its kind and header
-// tables, found once (`frozen_find_ancestor`), not through the `FROZEN`
-// lookup of every `kind()` and `parent()` read. Same nodes, same order.
+// PERF: U4 (CH7). The steps inside a published store read its records,
+// found once (`frozen_find_ancestor`), not through the registry lookup of
+// every `kind()` and `parent()` read. Same nodes, same order.
 pub fn find_ancestor_with_kind(
     mut node: Node,
     mut callback: impl FnMut(Node, SyntaxKind) -> bool,
@@ -158,7 +158,7 @@ pub fn has_syntactic_modifier(node: Node, flags: ModifierFlags) -> bool {
 
 /// `has_syntactic_modifier` on `d`, the data of `node` that the caller
 /// already loaded with `parsed_node_data` (query Q7-3, see `Node::modifiers_in`).
-// PERF: U4 (bind A). A tier 0 store node reads the U1 (b) modifier column
+// PERF: U4 (bind A). A published store node reads the U1 (b) modifier column
 // (`frozen_store_modifier_flags`), as `Node::modifier_flags` does, not its
 // modifier list.
 pub fn has_syntactic_modifier_in(node: Node, d: LoadedData, flags: ModifierFlags) -> bool {

@@ -152,7 +152,9 @@ pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
 /// Binder data per node of the file being bound. Most nodes get no data, so
 /// a node keeps a 4-byte slot into `entries`, and `entries[0]` is the empty
 /// data, which is never written. The flow node of a node is kept in `flows`,
-/// not in `entries`, and `finish` merges it into the data.
+/// not in `entries`. The install writes both into the node records
+/// (`nodes`, `ast::bind_store_records`); `compact` merges them into the
+/// compact form of the lib bind snapshot.
 // PERF: bind C. The binder gives a flow node to every identifier (Go
 // binder.go `bind`), so a flow node in `entries` made a 40-byte entry for
 // each of them. Now it is one 4-byte write.
