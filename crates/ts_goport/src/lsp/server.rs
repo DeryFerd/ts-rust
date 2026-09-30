@@ -589,6 +589,17 @@ const CONTENT_MAPPER_LINKED_EDITING_REGISTRATION_ID: &str = "content-mapper-link
 const CONTENT_MAPPER_CALL_HIERARCHY_REGISTRATION_ID: &str = "content-mapper-call-hierarchy";
 const CONTENT_MAPPER_WILL_RENAME_FILES_REGISTRATION_ID: &str = "content-mapper-will-rename-files";
 
+// Go: server.go:352 supportedCodeActionKinds (ts#63951)
+pub fn supported_code_action_kinds() -> Vec<lsproto::CodeActionKind> {
+    vec![
+        lsproto::CodeActionKind::QUICK_FIX,
+        lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS_TS,
+        lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS_TS,
+        lsproto::CodeActionKind::SOURCE_SORT_IMPORTS_TS,
+        lsproto::CodeActionKind::SOURCE_FIX_ALL_TS,
+    ]
+}
+
 impl Server {
     // Go: server.go:351 supportsContentMapperRegistration (tsgo#4712)
     pub fn supports_content_mapper_registration(&self, id: &str) -> bool {
@@ -1191,13 +1202,7 @@ impl project::Client for Server {
                 register_options: Some(lsproto::RegisterOptions {
                     text_document_code_action: Some(lsproto::CodeActionRegistrationOptions {
                         document_selector: selector.clone(),
-                        code_action_kinds: Some(vec![
-                            lsproto::CodeActionKind::QUICK_FIX,
-                            lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_SORT_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_FIX_ALL,
-                        ]),
+                        code_action_kinds: Some(supported_code_action_kinds()),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -2957,7 +2962,8 @@ impl ls::CrossProjectOrchestrator for CrossProjectOrchestrator {
                 ctx,
                 Some(requested_project_trees),
                 &mut |snapshot: &Rc<Snapshot>| {
-                    for p in snapshot.project_collection.projects() {
+                    // ts#64204
+                    for p in snapshot.project_collection.language_service_projects() {
                         if !yield_(p) {
                             return;
                         }
@@ -3142,7 +3148,8 @@ impl ServerShared {
 
         let response = lsproto::InitializeResult {
             server_info: Some(lsproto::ServerInfo {
-                name: "typescript-go".to_string(),
+                // microsoft/TypeScript 5f647a841a (the TS 7 migration)
+                name: "typescript".to_string(),
                 version: Some(crate::core::version().to_string()),
             }),
             capabilities: Some(lsproto::ServerCapabilities {
@@ -3286,13 +3293,7 @@ impl ServerShared {
                 }),
                 code_action_provider: Some(lsproto::BooleanOrCodeActionOptions {
                     code_action_options: Some(lsproto::CodeActionOptions {
-                        code_action_kinds: Some(vec![
-                            lsproto::CodeActionKind::QUICK_FIX,
-                            lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_SORT_IMPORTS,
-                            lsproto::CodeActionKind::SOURCE_FIX_ALL,
-                        ]),
+                        code_action_kinds: Some(supported_code_action_kinds()),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -4209,9 +4210,9 @@ impl Server {
         {
             let uri = &text_document.uri;
             session.with_snapshot_for_document(ctx, uri, &mut |snapshot: &Rc<Snapshot>| {
-                // Go: core.Map(snapshot.GetProjectsContainingFile(uri), ls.Project.GetProgram)
+                // Go: core.Map(snapshot.GetLanguageServiceProjectsContainingFile(uri), ls.Project.GetProgram) (ts#64204)
                 let programs: Vec<Rc<compiler::NewProgram>> = snapshot
-                    .get_projects_containing_file(uri)
+                    .get_language_service_projects_containing_file(uri)
                     .iter()
                     .map(|p| p.get_program())
                     .collect();
@@ -4221,10 +4222,10 @@ impl Server {
             session.with_snapshot_loading_project_tree(ctx, None, &mut |snapshot: &Rc<
                 Snapshot,
             >| {
-                // Go: core.Map(snapshot.ProjectCollection.Projects(), (*project.Project).GetProgram)
+                // Go: core.Map(snapshot.ProjectCollection.LanguageServiceProjects(), (*project.Project).GetProgram) (ts#64204)
                 let programs: Vec<Rc<compiler::NewProgram>> = snapshot
                     .project_collection
-                    .projects()
+                    .language_service_projects()
                     .iter()
                     .map(|p| p.borrow().get_program().expect(NIL_DEREF))
                     .collect();
@@ -4754,7 +4755,12 @@ pub fn parse_content_mapper_contributions(
             }
         }
         for extension in &valid_extensions {
-            if !claimed_extensions.insert(extension.clone()) {
+            // ts#63936: Go `strings.ToLower` (rune by rune).
+            let lowered: String = extension
+                .chars()
+                .map(crate::gostd::unicode::to_lower)
+                .collect();
+            if !claimed_extensions.insert(lowered) {
                 return Err(errors::new(format!(
                     "content mapper contributions both claim extension {}",
                     gostd::strconv::quote(extension)
@@ -4813,8 +4819,14 @@ pub fn is_valid_contributed_content_mapper_extension(extension: &str) -> bool {
     {
         return false;
     }
+    // ts#63936: Go `strings.EqualFold`.
     !tspath::ALL_SUPPORTED_EXTENSIONS_WITH_JSON
         .iter()
         .flat_map(|group| group.iter())
-        .any(|supported| *supported == extension)
+        .any(|native_extension| {
+            crate::frontend::stringutil_ls::equate_string_case_insensitive(
+                native_extension,
+                extension,
+            )
+        })
 }
