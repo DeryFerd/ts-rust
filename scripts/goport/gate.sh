@@ -16,7 +16,7 @@
 #                 pins in its EXIT2_PINS.
 #   sweep-wide    (--full) 292 configs of 51 more real projects (sweep-wide.sh)
 #   f1            sample-f1/run-f1.py (R104 conformance sample)
-#   emit          emit/compare-emit.sh
+#   emit          compare-emit.sh (the tracked copy next to this script)
 #   typesyms      Go vs Rust dumps for query and hono (+ effect in --full)
 #   build         build-mode/compare-build.sh seq <repo> cold edits flags foreign, repro and query-chain
 #   determinism   goport 3x on zod, effect, elysia: runs must be equal and equal to the oracle
@@ -180,35 +180,16 @@ def parse_measure(stage, log, runs):
     return items
 
 
-EMIT_ORACLE = Path('/tmp/goport-emit-oracle')  # compare-emit.sh's oracle cache (the pin's under pin.py exec)
-
-
-def same_bytes(a, b):
-    try:
-        return Path(a).read_bytes() == Path(b).read_bytes()
-    except OSError:
-        return False
-
-
 EMIT = re.compile(r'^(\S+) (MATCH|DIFF) oracle=(\d+) goport=(\d+) differ=(\d+) only=(\d+) rc=(\S+) oracle_rc=(\S+) \S+ panics=(\d+) unported=(\d+)')
 
 
 def parse_emit(stage, log, runs):
-    """Items of the emit stage (compare-emit.sh lines; runs is its output dir). compare-emit.sh says DIFF when Go
-    writes no file. When Go and goport both write no file (noEmitOnError with diagnostics: redux-toolkit at
-    673a5f17d713, ts#64431), the item is MATCH only with equal exits, no panic or unported line, and byte-equal
-    diagnostic logs (runs/<project>/log and the oracle cache /tmp/goport-emit-oracle/<project>/log); its detail
-    says so. At a pin where Go writes files for every project nothing changes."""
     items = []
     for line in Path(log).read_text(errors='replace').splitlines():
         m = EMIT.match(line)
         if m:
             ok = m[2] == 'MATCH' and m[7] == m[8] and m[9] == '0' and m[10] == '0'
-            note = ''
-            if (not ok and m[2] == 'DIFF' and m.group(3, 4, 5, 6) == ('0', '0', '0', '0') and m[7] == m[8]
-                    and m[9] == m[10] == '0' and same_bytes(Path(runs) / m[1] / 'log', EMIT_ORACLE / m[1] / 'log')):
-                ok, note = True, ' (no files from Go and goport: equal exit and diagnostics log)'
-            items.append(item(stage, m[1], ok, line.strip() + note))
+            items.append(item(stage, m[1], ok, line.strip()))
         elif ' WROTE-INTO-PROJECT' in line:
             items.append(item(stage, line.split()[0] + '/wrote-into-project', False, line.strip()[:300]))
     return items
@@ -604,7 +585,7 @@ fi
 stage sweep-hono-runtime bash "$HERE/sweep-hono-runtime.sh" "$RUNS_REL/hono-rt"; parse sweep-hono-runtime "$OUT/runs/hono-rt" 7
 stage f1 python3 "$R/sample-f1/run-f1.py" "$BINS/goport" "$OUT/runs/f1"
 py f1 "$OUT/runs/f1/summary.json" "$OUT/items/f1.jsonl" >> "$OUT/logs/f1.log" 2>&1
-stage emit env JOBS=4 bash "$R/emit/compare-emit.sh" "$BINS/goport_emit" "gate-$LABEL"; parse emit "/tmp/goport-emit-gate-$LABEL" 45
+stage emit env JOBS=4 bash "$HERE/compare-emit.sh" "$BINS/goport_emit" "gate-$LABEL"; parse emit "/tmp/goport-emit-gate-$LABEL" 45
 TS_NAMES=(query hono); [[ $MODE == full ]] && TS_NAMES+=(effect)
 stage typesyms py typesyms "$BINS/goport_typesyms" "$OUT/runs/typesyms" "$OUT/items/typesyms.jsonl" "${TS_NAMES[@]}"
 build_seq() {
@@ -642,7 +623,7 @@ def family(root, pattern):
     return h.hexdigest()
 scripts = [R / 'tools-port/measure.sh', R / 'tools-port/measure-extra.sh', Path(gate).parent / 'sweep.sh',
            Path(gate).parent / 'sweep-extra2.sh', Path(gate).parent / 'sweep-wide.sh', Path(gate).parent / 'sweep-hono-runtime.sh',
-           R / 'sample-f1/run-f1.py', R / 'emit/compare-emit.sh', R / 'typesyms/compare-int.py',
+           R / 'sample-f1/run-f1.py', Path(gate).parent / 'compare-emit.sh', R / 'typesyms/compare-int.py',
            R / 'build-mode/compare-build.sh', R / 'corpus-full/run_shard.py', R / 'corpus-full/run_shard_parallel.py',
            R / 'emit-corpus/run_emit_shard2.py', Path(gate).parent / 'ls_edit_bench.py', Path(gate).parent / 'exit-rule.sh',
            Path(gate).parent / 'gate-emit-sample.txt']
