@@ -500,14 +500,26 @@ impl DeclarationTransformer {
             }
         }
         let ec = self.emit_context.clone();
-        let modifiers = self.ensure_modifiers(input);
-        let result = ec.factory().new_property_declaration(
-            modifiers,
-            input.name(),
-            Node::NIL,
-            Node::NIL,
-            Node::NIL,
-        );
+        let result;
+        if is_method_signature_declaration(input) {
+            let modifiers = self.ensure_modifiers(input);
+            result = ec.factory().new_property_signature_declaration(
+                modifiers,
+                input.name(),
+                Node::NIL, /*postfixToken*/
+                Node::NIL, /*typeNode*/
+                Node::NIL, /*initializer*/
+            );
+        } else {
+            let modifiers = self.ensure_modifiers(input);
+            result = ec.factory().new_property_declaration(
+                modifiers,
+                input.name(),
+                Node::NIL, /*postfixToken*/
+                Node::NIL, /*typeNode*/
+                Node::NIL, /*initializer*/
+            );
+        }
         self.preserve_js_doc(result, input);
         result
     }
