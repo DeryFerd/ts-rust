@@ -1114,15 +1114,16 @@ pub fn try_load_timed(
 /// lsshells M3d: a freeable file version (`ast::FileVersion`) binds into
 /// whole chunks of its own (`add_file`), and the lineage keeps their range.
 /// After the version dies, the next use of the lineage frees those chunks
-/// (`free_dead`): its ids become holes, and a read of one panics. A static
-/// file keeps its symbols until exit. The program copies
-/// (`VersionTables::bound_symbols`) and checker arenas that share a freed
-/// chunk keep it until they drop.
+/// (`free_dead`): its ids become holes, and a read of one panics. Each
+/// thread then frees its `get_symbol_id` ids of those chunks
+/// (`ast::free_lineage_symbol_ids`). A static file keeps its symbols until
+/// exit. The program copies (`VersionTables::bound_symbols`) and checker
+/// arenas that share a freed chunk keep it until they drop.
 struct Lineage {
     symbols: SymbolArena,
     /// The arena range of each freeable file version bound here, by file
-    /// id, until the version dies.
-    freeable: FxHashMap<usize, (ArenaMark, ArenaMark)>,
+    /// id, until the version dies, with its symbol indexes.
+    freeable: FxHashMap<usize, (ArenaMark, ArenaMark, std::ops::Range<usize>)>,
     /// `ast::dead_file_versions` when `free_dead` last looked.
     seen_dead: usize,
 }
@@ -1157,8 +1158,9 @@ impl Lineage {
         let (dead, seen) = crate::ast::dead_files_since(self.seen_dead);
         self.seen_dead = seen;
         for file in dead {
-            if let Some((start, end)) = self.freeable.remove(&file) {
+            if let Some((start, end, symbols)) = self.freeable.remove(&file) {
                 self.symbols.free_range(start, end);
+                crate::ast::free_lineage_symbol_ids(file, symbols);
             }
         }
     }
@@ -1180,9 +1182,12 @@ impl Lineage {
         }
         self.symbols.end_chunk();
         let start = self.symbols.mark();
+        let first = self.symbols.symbol_count();
         let result = add(&mut self.symbols);
         self.symbols.end_chunk();
-        self.freeable.insert(file, (start, self.symbols.mark()));
+        let symbols = first..self.symbols.symbol_count();
+        self.freeable
+            .insert(file, (start, self.symbols.mark(), symbols));
         result
     }
 
