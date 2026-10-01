@@ -4653,8 +4653,7 @@ impl Server {
     ) -> Option<Box<dyn Any + Send>> {
         // Create a cancellable context for the API connection
         let (api_ctx, api_cancel) = context::with_cancel(&self.shared.background_ctx());
-        let handlers = Rc::new(Cell::new(0));
-        let serving_lsp = Rc::new(Cell::new(false));
+        let state = Rc::new(ApiConnState::default());
         let lsp_panic = Rc::new(RefCell::new(None));
 
         // Run the connection with panic recovery
@@ -4663,19 +4662,18 @@ impl Server {
                 inner: ipc::new_jsonrpc_protocol(rwc.clone()),
                 inbox: start_api_reader(&self.shared, rwc.clone()),
                 server: Rc::downgrade(self),
-                handlers: handlers.clone(),
-                serving_lsp: serving_lsp.clone(),
+                state: state.clone(),
                 lsp_panic: lsp_panic.clone(),
             };
-            let handler = Rc::new(ApiConnHandler {
-                session: api_session.clone(),
-                handlers: handlers.clone(),
-            });
-            let conn = ipc::new_async_conn_with_protocol(rwc.clone(), Box::new(protocol), handler);
+            let conn = ipc::new_async_conn_with_protocol(
+                rwc.clone(),
+                Box::new(protocol),
+                api_session.clone(),
+            );
             // ts#64299
             api_session.set_connection(Rc::new(ApiSessionConn {
                 conn: conn.clone(),
-                serving_lsp: serving_lsp.clone(),
+                state: state.clone(),
             }));
             if let Err(api_err) = conn.run(&api_ctx) {
                 self.logger.errorf(&format!(
@@ -4808,11 +4806,11 @@ fn start_api_reader(
 /// While the inbox is empty and no handler of the connection runs, the read
 /// runs the dispatch loop (`dispatch_next`), so LSP messages, exit, stdin
 /// EOF, SIGTERM and the parent watchdog work while the connection waits,
-/// as in Go, where the connection has its own goroutine. Inside a handler
-/// (a client callback in `AsyncConn::call`) the read waits for the inbox
-/// only, because the handler is in the middle of its work on the session.
-/// When the dispatch loop ends, the read returns EOF, which ends the
-/// connection.
+/// as in Go, where the connection has its own goroutine. A read for a call
+/// to the client (`AsyncConn::call` in a request handler) waits for the
+/// inbox only, because the handler is in the middle of its work on the
+/// session. When the dispatch loop ends, the read returns EOF, which ends
+/// the connection.
 ///
 /// Limits of the one dispatch thread: LSP messages wait while an API
 /// request runs (as they wait for a slow LSP request). A connection that
@@ -4823,10 +4821,7 @@ struct ApiConnProtocol {
     inner: ipc::JSONRPCProtocol,
     inbox: Arc<ApiInbox>,
     server: Weak<Server>,
-    /// The number of running handlers (`ApiConnHandler`).
-    handlers: Rc<Cell<u32>>,
-    /// Whether a read runs the dispatch loop (`ApiSessionConn`).
-    serving_lsp: Rc<Cell<bool>>,
+    state: Rc<ApiConnState>,
     /// The panic of an LSP message served in a read (`run_api_connection`).
     lsp_panic: Rc<RefCell<Option<Box<dyn Any + Send>>>>,
 }
@@ -4846,13 +4841,13 @@ impl ipc::Protocol for ApiConnProtocol {
             if let Some(msg) = lock(&self.inbox.messages).pop_front() {
                 return msg;
             }
-            if self.handlers.get() > 0 {
+            if self.state.calls.get() > 0 {
                 self.inbox.wait(&ctx);
                 continue;
             }
-            self.serving_lsp.set(true);
+            self.state.serving_lsp.set(true);
             let served = catch_unwind(AssertUnwindSafe(|| server.dispatch_next(&ctx, &lsp_exit)));
-            self.serving_lsp.set(false);
+            self.state.serving_lsp.set(false);
             match served {
                 Ok(Ok(())) => {}
                 // The dispatch loop ended.
@@ -4899,26 +4894,46 @@ impl ipc::Protocol for ApiConnProtocol {
     }
 }
 
+/// PORT: what an API connection of the LSP server is doing, for its
+/// protocol (`ApiConnProtocol`) and its session connection
+/// (`ApiSessionConn`).
+#[derive(Default)]
+struct ApiConnState {
+    /// The calls to the client that wait for their answer.
+    calls: Cell<u32>,
+    /// Whether a read runs the dispatch loop.
+    serving_lsp: Cell<bool>,
+}
+
 /// PORT: the connection of an API session of the LSP server
-/// (`apiSession.SetConnection(conn)`). While a read of the connection runs
-/// the dispatch loop, `AsyncConn` holds its protocol, so a call or
-/// notification to the client from an LSP message (a callback module
-/// resolver of a project that the API session opened, when an LSP request
-/// rebuilds it) returns an error here instead of a panic. Go makes the
-/// call.
+/// (`apiSession.SetConnection(conn)`). It counts the calls to the client
+/// for `ApiConnProtocol`. While a read of the connection runs the dispatch
+/// loop, `AsyncConn` holds its protocol, so a call or notification to the
+/// client from an LSP message (a callback module resolver of a project
+/// that the API session opened, when an LSP request rebuilds it) returns
+/// an error here instead of a panic. Go makes the call.
 struct ApiSessionConn {
     conn: Rc<ipc::AsyncConn>,
-    serving_lsp: Rc<Cell<bool>>,
+    state: Rc<ApiConnState>,
 }
 
 impl ApiSessionConn {
     fn check_idle(&self) -> Result<(), GoError> {
-        if self.serving_lsp.get() {
+        if self.state.serving_lsp.get() {
             return Err(errors::new(
                 "ipc: the API connection cannot write while an LSP message runs in its read",
             ));
         }
         Ok(())
+    }
+}
+
+/// Counts one call to the client until it is dropped (also on a panic).
+struct PendingCall<'a>(&'a Cell<u32>);
+
+impl Drop for PendingCall<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
     }
 }
 
@@ -4934,6 +4949,8 @@ impl ipc::Conn for ApiSessionConn {
         params: Option<Box<dyn AnyValue>>,
     ) -> Result<json_ext::JsonValue, GoError> {
         self.check_idle()?;
+        self.state.calls.set(self.state.calls.get() + 1);
+        let _pending = PendingCall(&self.state.calls);
         self.conn.call(ctx, method, params)
     }
 
@@ -4945,52 +4962,6 @@ impl ipc::Conn for ApiSessionConn {
     ) -> Result<(), GoError> {
         self.check_idle()?;
         self.conn.notify(ctx, method, params)
-    }
-}
-
-/// PORT: the API session as the handler of its connection
-/// (`ipc.NewAsyncConn(rwc, apiSession)`). It counts the running handlers
-/// for `ApiConnProtocol`.
-struct ApiConnHandler {
-    session: Rc<api::Session>,
-    handlers: Rc<Cell<u32>>,
-}
-
-/// Counts one running handler until it is dropped (also on a panic).
-struct RunningHandler<'a>(&'a Cell<u32>);
-
-impl<'a> RunningHandler<'a> {
-    fn new(handlers: &'a Cell<u32>) -> Self {
-        handlers.set(handlers.get() + 1);
-        RunningHandler(handlers)
-    }
-}
-
-impl Drop for RunningHandler<'_> {
-    fn drop(&mut self) {
-        self.0.set(self.0.get() - 1);
-    }
-}
-
-impl ipc::Handler for ApiConnHandler {
-    fn handle_request(
-        &self,
-        ctx: &Context,
-        method: &str,
-        params: json_ext::JsonValue,
-    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
-        let _running = RunningHandler::new(&self.handlers);
-        ipc::Handler::handle_request(&*self.session, ctx, method, params)
-    }
-
-    fn handle_notification(
-        &self,
-        ctx: &Context,
-        method: &str,
-        params: json_ext::JsonValue,
-    ) -> Result<(), GoError> {
-        let _running = RunningHandler::new(&self.handlers);
-        ipc::Handler::handle_notification(&*self.session, ctx, method, params)
     }
 }
 
