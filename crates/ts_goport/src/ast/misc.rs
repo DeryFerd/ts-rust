@@ -747,7 +747,7 @@ impl DiagnosticsCollection {
     // PORT: returns the stored diagnostic (Go returns the pointer).
     pub fn lookup(&mut self, diagnostic: &Diagnostic) -> Option<&mut Diagnostic> {
         let diagnostics = if diagnostic.file().is_some() {
-            self.get_diagnostics_for_file_locked(diagnostic.file())
+            self.get_diagnostics_for_file_locked(source_file_file_name(diagnostic.file()))
         } else {
             self.get_global_diagnostics_locked()
         };
@@ -782,14 +782,26 @@ impl DiagnosticsCollection {
     // Go: ast/diagnostic.go:222 GetDiagnosticsForFile
     // #4825: takes the source file, not its name.
     pub fn get_diagnostics_for_file(&mut self, file: Node) -> Vec<Diagnostic> {
-        let ids = self.get_diagnostics_for_file_locked(file);
+        self.get_diagnostics_for_file_name(source_file_file_name(file))
+    }
+
+    /// `get_diagnostics_for_file` for the file named `name` (see
+    /// `file_names`).
+    pub fn get_diagnostics_for_file_name(&mut self, name: &'static str) -> Vec<Diagnostic> {
+        let ids = self.get_diagnostics_for_file_locked(name);
         ids.iter().map(|&id| self.diagnostics[id].clone()).collect()
+    }
+
+    /// The names of the files that have diagnostics (Go `fileDiagnostics`
+    /// keys), in the order of their first diagnostic.
+    pub fn file_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.file_diagnostics.keys().copied()
     }
 
     // Go: ast/diagnostic.go:229 getDiagnosticsForFileLocked
     // PORT: returns positions in `diagnostics` (Go returns the pointers).
-    fn get_diagnostics_for_file_locked(&mut self, file: Node) -> Vec<usize> {
-        let path = source_file_file_name(file);
+    // Takes the file name, the key of the lists.
+    fn get_diagnostics_for_file_locked(&mut self, path: &'static str) -> Vec<usize> {
         if !self.file_diagnostics_sorted.contains(path) {
             if let Some(ids) = self.file_diagnostics.get_mut(path) {
                 // Go: ast/diagnostic.go:347 slices.SortStableFunc(c.fileDiagnostics[path], CompareDiagnostics)
