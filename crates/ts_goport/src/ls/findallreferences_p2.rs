@@ -7,8 +7,8 @@ use crate::ls::prelude::*;
 use crate::astnav;
 use crate::gostd::Context;
 use crate::scanner_util::{
-    contains_go_string_marker, go_byte_offset, go_string_bytes, go_unit_at, go_unit_before,
-    go_unit_bytes, port_byte_offset,
+    GoOffsets, contains_go_string_marker, go_byte_offset, go_string_bytes, go_unit_at,
+    go_unit_before, go_unit_bytes,
 };
 use std::borrow::Cow;
 
@@ -557,7 +557,7 @@ pub fn get_possible_symbol_reference_nodes(
     result
 }
 
-// Go: ls/findallreferences.go:1538 getPossibleSymbolReferencePositions
+// Go: ls/findallreferences.go:1646 getPossibleSymbolReferencePositions
 // PORT: Go indexes the text by byte. The search runs on the bytes, because
 // `position + symbolNameLength + 1` can fall inside a multi-byte character,
 // where a `&str` slice would panic.
@@ -568,8 +568,9 @@ pub fn get_possible_symbol_reference_nodes(
 // does not find it. A name with a marker unit, or with a char that can be
 // the second char of one (lead byte 0xF4), is searched on the Go bytes
 // (`go_string_bytes`) and the Go positions are mapped back
-// (`port_byte_offset`). So is any name in a text with a marker when the
-// container does not start the text: as in Go, the first index is relative
+// (`port_byte_offset`, with one scan for all of them: `GoOffsets`). So is
+// any name in a text with a marker when the container does not start the
+// text: as in Go, the first index is relative
 // to the container start and is then used as an absolute position, which
 // is only the same position in both forms when the bytes before agree.
 // Otherwise the port search finds the same positions. When the container
@@ -687,8 +688,9 @@ pub fn get_possible_symbol_reference_positions(
     }
 
     if go_search {
+        let offsets = GoOffsets::new(&text_text);
         for position in &mut positions {
-            *position = port_byte_offset(&text_text, *position);
+            *position = offsets.port_offset(*position);
         }
     }
     positions
@@ -2507,6 +2509,7 @@ mod tests {
     use super::*;
     use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
     use crate::frontend::tspath::Path;
+    use crate::scanner_util::port_byte_offset;
     use crate::scanner_util::{go_string_from_bytes, push_js_string_rune};
 
     // PORT: no Go test. Go searches the Go bytes of the text. The text is in
