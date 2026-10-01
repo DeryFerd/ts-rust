@@ -1786,6 +1786,21 @@ fn cancels_warm_auto_import(method: &lsproto::Method) -> bool {
         || *method == lsproto::Method::WORKSPACE_DID_CHANGE_WATCHED_FILES
 }
 
+/// PORT: the LSP messages that the wait of a call to the client from an
+/// API request serves (`wait_during_api_call`). Their Go handlers queue
+/// file changes and timers and do not build a snapshot (session.go:363
+/// DidCloseFile, :375 DidChangeFile, :410 DidSaveFile; server.go:1834
+/// handleSetTrace does nothing). Go's DidChangeFile reads the session's
+/// snapshot (`isContentMapperFile`), so it waits while an API request
+/// builds the session's next snapshot (project/api.go:18 APIUpdate holds
+/// `snapshotMu`). Here it reads the snapshot before that one.
+fn served_during_api_call(method: &lsproto::Method) -> bool {
+    *method == lsproto::Method::TEXT_DOCUMENT_DID_CHANGE
+        || *method == lsproto::Method::TEXT_DOCUMENT_DID_CLOSE
+        || *method == lsproto::Method::TEXT_DOCUMENT_DID_SAVE
+        || *method == lsproto::Method::SET_TRACE
+}
+
 impl ServerShared {
     // Go: server.go:447 readLoop
     // PORT: `r` is the reader, which this thread owns.
@@ -1906,12 +1921,17 @@ impl ServerShared {
 
     /// PORT: the wait of a call to the client from an API request
     /// (`ApiConnProtocol`). Returns when a message is in `inbox` or `ctx`
-    /// is done, or with an LSP `shutdown` or `exit` that no other LSP
-    /// message comes before in the request queue, which it takes out of
-    /// the queue. Go serves those on the dispatch goroutine while the API
-    /// goroutine waits, and its process exits when the dispatch loop ends.
-    /// The API reader queues a `Wake` after each message it puts in
-    /// `inbox`, so each message signals `queued_cond`.
+    /// is done, or with an LSP message to serve now, which it takes out of
+    /// the request queue. Go serves LSP messages on its dispatch goroutine
+    /// while the API goroutine waits (server.go:968 dispatchLoop), and its
+    /// process exits when the dispatch loop ends. Here the API request is
+    /// in the middle of its work on the session, so the wait serves, in
+    /// arrival order, only the messages that do not need the session
+    /// (`served_during_api_call`). The first message that needs it stays
+    /// in the queue with all messages after it, except `shutdown` and
+    /// `exit`, which never wait behind another message. The API reader
+    /// queues a `Wake` after each message it puts in `inbox`, so each
+    /// message signals `queued_cond`.
     fn wait_during_api_call(
         self: &Arc<Self>,
         ctx: &Context,
@@ -1931,15 +1951,20 @@ impl ServerShared {
                 break None;
             }
             let taken = self.request_queue.with_items(|items| {
-                let index = items
-                    .iter()
-                    .position(|item| matches!(item, QueuedRequest::Request(_)))?;
-                let QueuedRequest::Request(req) = &items[index] else {
-                    return None;
-                };
-                if req.method != lsproto::Method::SHUTDOWN && req.method != lsproto::Method::EXIT {
-                    return None;
-                }
+                // Whether a message that needs the session is ahead.
+                let mut kept = false;
+                let index = items.iter().position(|item| {
+                    let QueuedRequest::Request(req) = item else {
+                        return false;
+                    };
+                    if req.method == lsproto::Method::SHUTDOWN
+                        || req.method == lsproto::Method::EXIT
+                    {
+                        return true;
+                    }
+                    kept |= !served_during_api_call(&req.method);
+                    !kept
+                })?;
                 match items.remove(index) {
                     Some(QueuedRequest::Request(req)) => Some(req),
                     _ => None,
@@ -2061,8 +2086,8 @@ impl Server {
 
     /// PORT: the part of one turn of the Go dispatch loop that handles the
     /// request or notification `req`. `dispatch_next` calls it, and so does
-    /// the wait of a call to the client from an API request for an LSP
-    /// `shutdown` or `exit` (`ApiConnProtocol`).
+    /// the wait of a call to the client from an API request for the LSP
+    /// messages that it serves (`ApiConnProtocol`).
     fn dispatch_request(
         self: &Rc<Self>,
         ctx: &Context,
@@ -4863,14 +4888,16 @@ fn start_api_reader(
 /// the dispatch loop (`dispatch_next`), so LSP messages, exit, stdin
 /// EOF, SIGTERM and the parent watchdog work while the connection waits,
 /// as in Go, where the connection has its own goroutine. A read for a call
-/// to the client (`AsyncConn::call` in a request handler) serves only an
-/// LSP `shutdown` or `exit` that no other LSP message comes before
-/// (`ServerShared::wait_during_api_call`), because the handler is in the
-/// middle of its work on the session. When the dispatch loop ends, the read
-/// returns EOF, which ends the connection.
+/// to the client (`AsyncConn::call` in a request handler) serves only the
+/// LSP messages that do not need the session, in order, and `shutdown` and
+/// `exit` (`ServerShared::wait_during_api_call`), because the handler is in
+/// the middle of its work on the session. When the dispatch loop ends, the
+/// read returns EOF, which ends the connection. A panic of an LSP message
+/// served in a read ends the connection too, and `run_api_connection`
+/// raises it again.
 ///
 /// Limits of the one dispatch thread: LSP messages wait while an API
-/// request runs (as they wait for a slow LSP request), and other LSP
+/// request runs (as they wait for a slow LSP request), and the other LSP
 /// messages wait while a call to the client waits, until the client
 /// answers (Go answers them). A connection that is accepted while another
 /// waits runs inside the other's wait, so the first one's messages wait
@@ -4895,20 +4922,23 @@ impl ipc::Protocol for ApiConnProtocol {
             return Err(errors::EOF.clone());
         };
         loop {
-            if ctx.err().is_some() {
+            // After an LSP message panicked in a read, the connection ends.
+            if ctx.err().is_some() || self.lsp_panic.borrow().is_some() {
                 return Err(errors::EOF.clone());
             }
             if let Some(msg) = lock(&self.inbox.messages).pop_front() {
                 return msg;
             }
-            if self.state.calls.get() > 0 {
+            self.state.serving_lsp.set(true);
+            let served = catch_unwind(AssertUnwindSafe(|| {
+                if self.state.calls.get() == 0 {
+                    return server.dispatch_next(&ctx, &lsp_exit);
+                }
                 if let Some(req) = server.shared.wait_during_api_call(&ctx, &self.inbox) {
                     server.dispatch_request(&ctx, &lsp_exit, &Rc::new(req));
                 }
-                continue;
-            }
-            self.state.serving_lsp.set(true);
-            let served = catch_unwind(AssertUnwindSafe(|| server.dispatch_next(&ctx, &lsp_exit)));
+                Ok(())
+            }));
             self.state.serving_lsp.set(false);
             match served {
                 Ok(Ok(())) => {}

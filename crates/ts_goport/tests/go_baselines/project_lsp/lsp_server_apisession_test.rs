@@ -206,3 +206,53 @@ child_test! {
         let _ = std::fs::remove_file(&pipe);
     }
 }
+
+child_test! {
+    // followups2 (apisess1 item 6): while an API request waits for a
+    // client callback that never comes, Go serves LSP messages in order on
+    // its dispatch goroutine (server.go:968). The port serves the ones that
+    // do not need the session (didChange here) in order, keeps the others
+    // (hover), and serves shutdown and exit wherever they are in the queue.
+    fn api_callback_wait_serves_shutdown_and_exit_behind_other_messages() {
+        let client = start_server();
+        let pipe = init_api_session(&client);
+        let mut api = ApiClient::connect(&pipe);
+        api.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
+        api.recv();
+        api.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"createModuleResolver","params":{"compilerOptions":{"module":199,"moduleResolution":99},"resolveModuleNameCallback":"resolveCb"}}"#,
+        );
+        let answer = api.recv();
+        let resolver = answer
+            .split_once(r#""result":"#)
+            .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .unwrap_or_else(|| panic!("no resolver id: {answer}"));
+        api.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"createSnapshot","params":{{"createPrograms":[{{"rootFiles":["/home/projects/b.ts"],"compilerOptions":{{"module":199,"moduleResolution":99,"noEmit":true}},"options":{{"moduleResolver":{resolver}}}}}]}}}}"#
+        ));
+        let callback = api.recv();
+        assert!(callback.contains(r#""method":"resolveCb""#), "{callback}");
+
+        // The callback is never answered.
+        client.send_notification(
+            &lsproto::TEXT_DOCUMENT_DID_CHANGE_INFO,
+            lsproto::DidChangeTextDocumentParams {
+                text_document: lsproto::VersionedTextDocumentIdentifier {
+                    uri: uri("file:///home/projects/a.ts"),
+                    version: 2,
+                },
+                content_changes: vec![lsproto::TextDocumentContentChangePartialOrWholeDocument {
+                    partial: None,
+                    whole_document: Some(lsproto::TextDocumentContentChangeWholeDocument {
+                        text: format!("{A_TS}export const c = 2;\n"),
+                    }),
+                }],
+            },
+        );
+        let _kept_hover =
+            client.send_request_async(&lsproto::TEXT_DOCUMENT_HOVER_INFO, hover_params());
+        shutdown_and_exit(&client);
+        drop(api);
+        let _ = std::fs::remove_file(&pipe);
+    }
+}

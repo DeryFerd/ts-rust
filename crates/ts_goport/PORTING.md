@@ -1077,10 +1077,14 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   served on the dispatch thread too (`lsp/server.rs` `ApiConnProtocol`).
   LSP messages and API requests do not run at the same time. These
   limits are more than order and timing:
-  - While an API request waits for a client callback, other LSP messages
-    wait until the client answers. Only an LSP `shutdown` or `exit` that
-    no other LSP message comes before is served, so the server still
-    stops as Go's does.
+  - While an API request waits for a client callback, the server serves
+    `didChange`, `didClose`, `didSave` and `$/setTrace` in arrival order.
+    Other LSP messages, and all messages after the first of them, wait
+    until the client answers. `shutdown` and `exit` are served wherever
+    they are in the queue, so the server still stops; a message that
+    waits behind them is answered later, or not at all after `exit`. Go
+    answers the waiting messages, except those that need the snapshot
+    that an API request builds for the session.
   - A second connected API session holds the first until it closes. A
     client that waits for the first before it closes the second
     deadlocks.
