@@ -1401,10 +1401,6 @@ mod tests {
         let script = PortScript("é = 1;\n€x = \"\u{1F600}\";".to_string());
         let line_map = compute_lsp_line_starts(&script.0);
         assert!(!line_map.ascii_only && !line_map.has_marker);
-        let marked = compute_lsp_line_starts(&crate::scanner_util::go_string_from_bytes(
-            b"\xFF\n".to_vec(),
-        ));
-        assert!(marked.has_marker);
         let converters = new_converters(lsproto::PositionEncodingKind::UTF8, move |_| {
             Some(Rc::clone(&line_map))
         });
@@ -1417,6 +1413,33 @@ mod tests {
             };
             assert_eq!(converters.to_lsp_position(&script, pos).0, lc, "{pos}");
             let back = from_lsp_position(&converters, script.clone(), lc, Feature::ALL);
+            assert_eq!(back[0].position, pos, "{lc:?}");
+        }
+
+        // The skip itself (followups4): the text of `marked` has a 7-byte
+        // unit at the start of each line, and the line map comes from
+        // `plain`, which has the same line starts and no marker. A converter
+        // that trusts `has_marker` gives the byte columns of `plain`. One
+        // that scans the text counts each unit as one Go byte.
+        let plain = "éééa = 1;\néééax = 2;";
+        let marked = PortScript(crate::scanner_util::go_string_from_bytes(
+            b"\xFF = 1;\n\xFFx = 2;".to_vec(),
+        ));
+        assert_eq!(marked.0.len(), plain.len());
+        let line_map = compute_lsp_line_starts(plain);
+        assert!(!line_map.ascii_only && !line_map.has_marker);
+        assert!(compute_lsp_line_starts(&marked.0).has_marker);
+        let converters = new_converters(lsproto::PositionEncodingKind::UTF8, move |_| {
+            Some(Rc::clone(&line_map))
+        });
+        for pos in [0, 7, 12, 13, 20, 26] {
+            let line = i32::from(pos >= 13);
+            let lc = lsproto::Position {
+                line: line as u32,
+                character: (pos - [0, 13][line as usize]) as u32,
+            };
+            assert_eq!(converters.to_lsp_position(&marked, pos).0, lc, "{pos}");
+            let back = from_lsp_position(&converters, marked.clone(), lc, Feature::ALL);
             assert_eq!(back[0].position, pos, "{lc:?}");
         }
     }
