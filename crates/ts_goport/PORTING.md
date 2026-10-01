@@ -1107,7 +1107,29 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 - One dispatch thread (see "Threads"): the server answers requests in
   arrival order, where Go runs the async part of a request on a goroutine
   and answers in finish order. Timers and background tasks run at message
-  boundaries. The results are Go's; only order and timing differ.
+  boundaries. Without an API session, the results of LSP requests are
+  Go's and only order and timing differ. With an API session, the limits
+  below also change which messages are answered and when.
+- API sessions of the LSP server (`custom/initializeAPISession`) are
+  served on the dispatch thread too (`lsp/server.rs` `ApiConnProtocol`).
+  LSP messages and API requests do not run at the same time. These
+  limits are more than order and timing:
+  - While an API request waits for a client callback, the server serves
+    `didChange`, `didClose`, `didSave` and `$/setTrace` in arrival order.
+    Other LSP messages, and all messages after the first of them, wait
+    until the client answers. `shutdown` and `exit` are served wherever
+    they are in the queue, so the server still stops; a message that
+    waits behind them is answered later, or not at all after `exit`. Go
+    answers the waiting messages, except those that need the snapshot
+    that an API request builds for the session.
+  - A second connected API session holds the first until it closes. A
+    client that waits for the first before it closes the second
+    deadlocks.
+  - A client callback from an LSP message served while an API connection
+    waits returns an error. Go makes the call.
+  - `--api --async` and the API sessions run requests one at a time
+    (`ipc/conn_async.rs`). A pipelined request sees the result of the one
+    before it. Go runs them at the same time.
 - Go runtime profiles (pprof) have no samples: the port writes Go's file
   names, errors and log lines and valid empty profiles. `runtime.GC` is a
   no-op. `runtime/metrics` reads as `KindBad`, so the Go runtime fields of

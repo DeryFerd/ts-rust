@@ -437,7 +437,7 @@ fn create_emit_pool(count: usize) -> EmitPool {
                         forget_synthetic_nodes();
                     }
                 })
-                .expect("cannot start an emit thread")
+                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err))
         })
         .collect();
     EmitPool {
@@ -532,7 +532,7 @@ fn create_dts_twin() -> DtsTwin {
                 forget_synthetic_nodes();
             }
         })
-        .expect("cannot start a d.ts twin thread");
+        .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
     DtsTwin {
         queue,
         thread,
@@ -3017,7 +3017,7 @@ pub fn spawn_seeded_thread<R: Send + 'static>(
             seed.install();
             f()
         })
-        .expect("start a seeded thread")
+        .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err))
 }
 
 // Go: compiler/checkerpool.go:40 newCheckerPoolWithTracing (the count)
@@ -3091,7 +3091,7 @@ fn create_checkers() -> CheckerPool {
                         forget_synthetic_nodes();
                     }
                 })
-                .expect("cannot start a checker thread");
+                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
             (sender, thread)
         })
         .unzip();
