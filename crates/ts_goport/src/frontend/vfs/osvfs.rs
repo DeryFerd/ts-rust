@@ -318,10 +318,52 @@ impl Fs for OsFs {
     }
 
     // Go: os.go:219 Chtimes
-    // PORT: Go `os.Chtimes` calls utimensat on the path and leaves a zero
-    // time unchanged. Rust std sets times through an open file, so the port
-    // opens the path read-only first; a file without read permission fails
-    // where Go succeeds. `None` leaves that time unchanged, as in Go.
+    // PORT: Go `os.Chtimes` is utimensat(AT_FDCWD, path, times, 0) on unix,
+    // so it works on a file without read permission; a zero Go time
+    // (`None` here) is UTIME_OMIT. Off unix, Rust std sets times through an
+    // open file (opened read-only here).
+    #[cfg(unix)]
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<SystemTime>,
+        m_time: Option<SystemTime>,
+    ) -> Result<(), FsError> {
+        use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_OMIT};
+        // Go: syscall.NsecToTimespec(t.UnixNano())
+        let timespec = |time: Option<SystemTime>| match time {
+            None => Timespec {
+                tv_sec: 0,
+                tv_nsec: UTIME_OMIT,
+            },
+            Some(time) => {
+                let (sec, nsec) = match time.duration_since(SystemTime::UNIX_EPOCH) {
+                    Ok(d) => (d.as_secs() as i64, i64::from(d.subsec_nanos())),
+                    Err(err) => {
+                        let d = err.duration();
+                        let (sec, nsec) = (-(d.as_secs() as i64), -i64::from(d.subsec_nanos()));
+                        if nsec < 0 {
+                            (sec - 1, nsec + 1_000_000_000)
+                        } else {
+                            (sec, nsec)
+                        }
+                    }
+                };
+                Timespec {
+                    tv_sec: sec,
+                    tv_nsec: nsec as _,
+                }
+            }
+        };
+        let times = Timestamps {
+            last_access: timespec(a_time),
+            last_modification: timespec(m_time),
+        };
+        rustix::fs::utimensat(CWD, &*os_path(path), &times, AtFlags::empty())
+            .map_err(|err| FsError::path("chtimes", path, io::Error::from(err)))
+    }
+
+    #[cfg(not(unix))]
     fn chtimes(
         &self,
         path: &str,
