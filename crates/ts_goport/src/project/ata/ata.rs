@@ -1099,3 +1099,94 @@ impl TypingsInstaller {
         FxHashMap::default()
     }
 }
+
+#[cfg(test)]
+mod npm_thread_tests {
+    use super::*;
+    use std::sync::{Condvar, Mutex};
+
+    /// An ATA host whose npm runs on a helper thread and waits for `open`.
+    struct GatedNpm {
+        fs: Rc<dyn vfs::Fs>,
+        cwd: String,
+        calls: Arc<Mutex<Vec<String>>>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl NpmExecutor for GatedNpm {
+        fn npm_install(&self, _cwd: &str, _args: &[String]) -> (Vec<u8>, Option<GoError>) {
+            panic!("npm ran on the dispatch thread");
+        }
+
+        fn npm_install_func(&self) -> Option<NpmInstallFunc> {
+            let (calls, gate) = (self.calls.clone(), self.gate.clone());
+            Some(Arc::new(move |cwd: &str, args: &[String]| {
+                calls.lock().unwrap().push(args.join(" "));
+                let (open, cond) = &*gate;
+                drop(
+                    cond.wait_while(open.lock().unwrap(), |open| !*open)
+                        .unwrap(),
+                );
+                let dir = std::path::Path::new(cwd).join("node_modules/types-registry");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("index.json"), r#"{"entries":{"left-pad":{}}}"#).unwrap();
+                (Vec::new(), None)
+            }))
+        }
+    }
+
+    impl module::ResolutionHost for GatedNpm {
+        fn fs(&self) -> &dyn vfs::Fs {
+            &*self.fs
+        }
+        fn get_current_directory(&self) -> &str {
+            &self.cwd
+        }
+    }
+
+    /// Go runs ATA requests on goroutines, and `initOnce.Do` blocks a second
+    /// request until the first one's npm call ends. The port's requests wait
+    /// for npm without blocking the thread, and npm runs once.
+    #[test]
+    fn second_request_waits_for_init_off_thread() {
+        let dir = std::env::temp_dir().join(format!("goport-ata-{}", std::process::id()));
+        let cwd = dir.to_string_lossy().replace('\\', "/");
+        let host = Rc::new(GatedNpm {
+            fs: vfs::osvfs::osvfs_fs(),
+            cwd: cwd.clone(),
+            calls: Arc::default(),
+            gate: Arc::default(),
+        });
+        let ti = new_typings_installer(
+            &TypingsInstallerOptions {
+                typings_location: format!("{cwd}/cache"),
+                throttle_limit: 5,
+            },
+            host.clone(),
+        );
+        let done = Rc::new(Cell::new(0));
+        for _ in 0..2 {
+            let (ti, fs, done) = (ti.clone(), host.fs.clone(), done.clone());
+            run_task(Box::pin(async move {
+                ti.init("p", &*fs, &None::<Rc<dyn logging::Logger>>).await;
+                assert_eq!(ti.init_once.get(), OnceState::Done);
+                done.set(done.get() + 1);
+            }));
+        }
+        assert_eq!((done.get(), ti.init_once.get()), (0, OnceState::Running));
+
+        let (open, cond) = &*host.gate;
+        *open.lock().unwrap() = true;
+        cond.notify_all();
+        while done.get() < 2 && gostd::local::wait_pending() {
+            gostd::local::run_pending();
+        }
+        assert_eq!(done.get(), 2);
+        assert_eq!(
+            *host.calls.lock().unwrap(),
+            ["install --ignore-scripts types-registry@latest"]
+        );
+        assert!(ti.types_registry.borrow().contains_key("left-pad"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
