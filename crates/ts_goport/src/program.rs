@@ -1902,7 +1902,8 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
                 })
-                .expect("cannot start a bind thread");
+                // Go starts its threads on demand and fails the same way.
+                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
         }
         drop(sender);
         // Join the files in order as they arrive.

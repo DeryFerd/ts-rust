@@ -135,6 +135,71 @@ pub fn go_wait_group_goroutine<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
+thread_local! {
+    /// How many `go_recover` calls this thread is inside.
+    static GO_RECOVER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Go `defer func() { if r := recover(); r != nil { ... } }()` around `f`,
+/// for a recover that answers the panic and goes on (the IPC request
+/// handlers). Returns the payload of a panic in `f`. The Go runtime prints
+/// nothing for a recovered panic, so the bins' panic hooks stay quiet while
+/// `in_go_recover` is true.
+pub fn go_recover<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
+    GO_RECOVER_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    GO_RECOVER_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    result
+}
+
+/// True inside `go_recover` on this thread.
+#[must_use]
+pub fn in_go_recover() -> bool {
+    GO_RECOVER_DEPTH.with(|depth| depth.get() > 0)
+}
+
+/// Runs `f` as a task of Go `core.parallelWorkGroup` (`sync.WaitGroup.Go`).
+/// Inside `go_recover` this is `go_wait_group_goroutine`: Go's recover sees
+/// only its own goroutine, so a Go panic in `f` ends the process. Elsewhere
+/// it is `go_wait_group_task`: the panic reaches the bin, which writes the
+/// output so far and prints it as Go prints it.
+pub fn go_work_group_task<R>(f: impl FnOnce() -> R) -> R {
+    if in_go_recover() {
+        go_wait_group_goroutine(f)
+    } else {
+        go_wait_group_task(f)
+    }
+}
+
+/// The Go runtime when the OS refuses a new thread (runtime/os_linux.go
+/// `newosproc`): it prints the error and the thread count, then
+/// `throw("newosproc")` ends the process with exit 2. The port site takes
+/// the place of the goroutine dump. Use it where the port starts a thread
+/// for work that Go runs on goroutines, so the run fails as Go's does.
+#[cold]
+#[inline(never)]
+#[track_caller]
+pub fn go_fatal_newosproc(err: &std::io::Error) -> ! {
+    // PORT: Go prints `mcount()`, its own count of threads.
+    let threads = std::fs::read_dir("/proc/self/task").map_or(0, Iterator::count);
+    let errno = err.raw_os_error().unwrap_or(0);
+    let mut text = format!(
+        "runtime: failed to create new OS thread (have {threads} already; errno={errno})\n"
+    );
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        text.push_str("runtime: may need to increase max user processes (ulimit -u)\n");
+    }
+    let location = std::panic::Location::caller();
+    text.push_str(&format!(
+        "fatal error: newosproc\n\n\t{}:{}\n",
+        location.file(),
+        location.line()
+    ));
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(text.as_bytes());
+    std::process::exit(EXIT_GO_PANIC)
+}
+
 /// `go_panic` with the Go runtime text for a nil pointer dereference, at a
 /// site where the pinned Go dereferences nil on the same input. It is cold
 /// and out of line, so the nil check at a hot site is one compare.

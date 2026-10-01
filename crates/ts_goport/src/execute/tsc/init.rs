@@ -337,7 +337,7 @@ fn format_single_value(
             }
         }
         if !found {
-            panic!("No matching value of {}", format_value_v(&value));
+            crate::core::go_panic(format!("No matching value of {}", format_value_v(&value)));
         }
     }
 
@@ -346,7 +346,7 @@ fn format_single_value(
     // is the Go `any` marshaler.
     let mut b = String::new();
     if let Err(err) = marshal_any(&mut b, &value) {
-        panic!("should not happen: {err}");
+        crate::core::go_panic(format!("should not happen: {err}"));
     }
     b
 }
@@ -366,7 +366,7 @@ fn format_value_or_array(setting_name: &str, value: &CompilerOptionsValue) -> St
         }
     }
     let Some(option) = option else {
-        panic!("No option named {setting_name}");
+        crate::core::go_panic(format!("No option named {setting_name}"));
     };
 
     let elems: Vec<CompilerOptionsValue> = match value {
