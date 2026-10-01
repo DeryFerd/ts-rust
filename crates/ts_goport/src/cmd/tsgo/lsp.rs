@@ -8,11 +8,13 @@ use crate::cmd::tsgo::isprocessalive_other::{PROCESS_ALIVE_SUPPORTED, is_process
 use crate::cmd::tsgo::isprocessalive_unix::{PROCESS_ALIVE_SUPPORTED, is_process_alive};
 use crate::cmd::tsgo::main::{ErrorHandling, must_getwd, new_flag_set, notify_context};
 use crate::execute::tsc::compile::{Writer, spawn_process};
+use crate::execute::tsc::stdio;
 use crate::frontend::bundled;
 use crate::frontend::tspath;
 use crate::frontend::vfs::osvfs;
 use crate::gostd::context::{self, CancelFunc};
 use crate::gostd::errors;
+use std::io::Write;
 use std::time::Duration;
 
 // Go: cmd/tsgo/lsp.go:20 runLSP
@@ -38,7 +40,7 @@ pub fn run_lsp(args: &[String]) -> i32 {
     }
 
     if !stdio.get() {
-        eprintln!("only stdio is supported");
+        let _ = writeln!(stdio::Stderr, "only stdio is supported");
         return 1;
     }
 
@@ -48,8 +50,12 @@ pub fn run_lsp(args: &[String]) -> i32 {
     let _profile_session = if pprof_dir.borrow().is_empty() {
         None
     } else {
-        eprintln!("pprof profiles will be written to: {}", pprof_dir.borrow());
-        let stderr: Writer = Rc::new(RefCell::new(std::io::stderr()));
+        let _ = writeln!(
+            stdio::Stderr,
+            "pprof profiles will be written to: {}",
+            pprof_dir.borrow()
+        );
+        let stderr: Writer = Rc::new(RefCell::new(stdio::Stderr));
         Some(crate::pprof::begin_profiling(&pprof_dir.borrow(), stderr))
     };
 
@@ -61,9 +67,10 @@ pub fn run_lsp(args: &[String]) -> i32 {
     let (ctx, stop) = notify_context(&context::background());
 
     let s = crate::lsp::new_server(crate::lsp::ServerOptions {
-        in_: crate::lsp::to_reader(Box::new(std::io::BufReader::new(std::io::stdin()))),
-        out: crate::lsp::to_writer(Box::new(std::io::stdout())),
-        err: Box::new(std::io::stderr()),
+        // Go: os.Stdin, os.Stdout and os.Stderr (see `execute::tsc::stdio`).
+        in_: crate::lsp::to_reader(Box::new(std::io::BufReader::new(stdio::Stdin))),
+        out: crate::lsp::to_writer(Box::new(stdio::Stdout)),
+        err: Box::new(stdio::Stderr),
         cwd: must_getwd(),
         fs,
         default_library_path,
@@ -72,10 +79,17 @@ pub fn run_lsp(args: &[String]) -> i32 {
         npm_install: Some(Box::new(|cwd: &str, args: &[String]| {
             // Go: cmd := exec.Command("npm", args...); cmd.Dir = cwd; return cmd.Output()
             // PORT: Go error texts are approximated (ATA only logs them).
-            match std::process::Command::new("npm")
-                .args(args)
+            // `Output` reads stdin from the null device and keeps stdout and
+            // stderr; `rlimit::spawn` gives npm the open-file limit as Go
+            // does.
+            let mut npm = std::process::Command::new("npm");
+            npm.args(args)
                 .current_dir(cwd)
-                .output()
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            match crate::gostd::rlimit::spawn(&mut npm)
+                .and_then(std::process::Child::wait_with_output)
             {
                 Ok(output) => {
                     if output.status.success() {
@@ -102,7 +116,7 @@ pub fn run_lsp(args: &[String]) -> i32 {
     // Go: defer stop()
     stop();
     if let Err(err) = result {
-        eprintln!("{}", err.error());
+        let _ = writeln!(stdio::Stderr, "{}", err.error());
         return 1;
     }
     0
@@ -162,7 +176,10 @@ pub fn start_parent_process_watchdog(ctx: &Context, stop: &CancelFunc, parent_pi
                     return;
                 }
                 if !is_process_alive(parent_pid) {
-                    eprintln!("Parent process {parent_pid} has exited, shutting down.");
+                    let _ = writeln!(
+                        stdio::Stderr,
+                        "Parent process {parent_pid} has exited, shutting down."
+                    );
                     stop();
                     return;
                 }

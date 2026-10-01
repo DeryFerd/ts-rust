@@ -27,7 +27,7 @@ use crate::ls::prelude::*;
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 /// A search thread drops its checker after this long with no job.
@@ -41,9 +41,7 @@ static NEXT_SEARCH_CHECKER_INDEX: AtomicUsize = AtomicUsize::new(1 << 20);
 
 /// The most searches that run on search threads at once (Go: GOMAXPROCS).
 pub fn max_in_flight() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT
-        .get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get))
+    crate::gostd::runtime::gomaxprocs()
 }
 
 // ---------------------------------------------------------------------------

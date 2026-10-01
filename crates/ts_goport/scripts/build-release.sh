@@ -32,8 +32,9 @@
 #      the relocations. They do not change the code.
 #      Dynamic build: check that no bin needs a GLIBC_ symbol version above
 #      the floor (objdump -T).
-#   5. BOLT: record each bin with perf branch sampling on training runs,
-#      convert with perf2bolt, merge with merge-fdata, rewrite with llvm-bolt.
+#   5. BOLT: record each bin with perf branch sampling on training runs
+#      (for tsgo, also editor sessions: RELEASE_LSP_SESSIONS), convert with
+#      perf2bolt, merge with merge-fdata, rewrite with llvm-bolt.
 #      Then check the program headers of the shipped bins (check_headers).
 #   6. Run tsgo in qemu on a CPU without AVX. A dynamic tsgo runs there on the
 #      glibc 2.28 of the sysroot.
@@ -79,6 +80,22 @@
 #   - -Wl,-z,pack-relative-relocs with glibc: the bin needs GLIBC_ABI_DT_RELR
 #     (glibc 2.36), so it does not start on the floor glibc. Not used.
 # So the default stays dynamic glibc and PIE.
+# Measured on R148 source (pgolsp1, target/continuation-r97-goport/pgolsp1):
+# editor sessions in the training against none, every side in one job on a
+# mini (the first two rounds on dbook-lan). Output is byte-equal, and the LSP
+# oracle answers are the same.
+#   - Sessions in BOLT only at 2500 Hz (the default), on mini-abf9: editor
+#     edit medians (ls_edit_bench long) query-core -3.7%, effect -3.5%, hono
+#     -1.1% (another build of the same script on mini-743d: -4.9%, -4.9%,
+#     -1.3%). The CLI cells (-p, --singleThreaded, tsc -b, watch) moved
+#     -4.2 to +0.8% (hono watch api +1.4%, and -0.6% in a rerun with more
+#     reps). Peak RSS moved 0.3% at most (the other build: query +1.6%).
+#   - Sessions in PGO and BOLT at 1/8 of the CLI weight: about 1 point more
+#     on effect and hono, but the bin text that a CLI run maps grew by 2 to
+#     7 MiB (query check peak RSS +7.7% on mini-743d), most of it in the PGO
+#     layout.
+#   - Sessions in PGO and BOLT at full weight or 1/4: zod and effect check
+#     lost 1.1 to 2.2%.
 #
 # Environment:
 #   RUSTUP_TOOLCHAIN  default 1.95.0. Its LLVM 22 matches the system
@@ -139,6 +156,20 @@
 #                     or perf branch sampling (Intel LBR, AMD LBR v2 or BRS).
 #   PGO_CORPUS_STEP   train on every Nth corpus case (default 60, about 200)
 #   BOLT_PERF_FREQ    perf sample frequency for BOLT (default 20000)
+#   RELEASE_LSP_SESSIONS  editor sessions of the tsgo BOLT training, as
+#                     <project>:<edits> (default "query-core:300 hono:200
+#                     effect:300"; empty: none). Each is the long session of
+#                     scripts/goport/ls_edit_bench.py (typing, errfix, imports
+#                     and mix edits with VS Code-like request bursts), run by
+#                     scripts/lsp-train.py with the same messages each time.
+#                     BUILD.txt records the plan digests and the sha256 of
+#                     ls_edit_bench.py. Without them, the editor's own code
+#                     (the LSP server, snapshot updates, node reads of the
+#                     edited file) runs in BOLT .cold code: 6.6% of an effect
+#                     edit (studies/lspeffect1).
+#   BOLT_LSP_PERF_FREQ  perf sample frequency of the editor sessions (default
+#                     2500, 1/8 of the CLI runs' rate, so they are about 12%
+#                     of the tsgo samples; see the pgolsp1 note above)
 #
 # Rules this script keeps:
 #   - Both cargo builds pass --target. The flags then reach only the shipped
@@ -172,6 +203,7 @@
 #     its headers do not ask for newer symbols.
 #
 # The training runs only read project inputs: emit writes to a temp --outDir,
+# the editor sessions send the edits as overlays (didOpen, didChange),
 # tsgo writes .tsbuildinfo to a temp file, goport_build runs on a temp copy.
 set -euo pipefail
 
@@ -200,6 +232,7 @@ if [[ -n $version ]]; then export GOPORT_BUILD_VERSION="$version"; else unset GO
 glibc_floor="${RELEASE_GLIBC_FLOOR:-2.28}"
 bolt="${RELEASE_BOLT:-1}"
 corpus_step="${PGO_CORPUS_STEP:-60}"
+lsp_sessions="${RELEASE_LSP_SESSIONS-query-core:300 hono:200 effect:300}"
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95.0}"
 # The training runs start no tsgo worker (bin/tsgo.rs `launch`): when the
 # launcher exits, the parent death signal can kill the worker before it has
@@ -251,6 +284,9 @@ if [[ $bolt == 1 ]]; then
 fi
 
 command -v qemu-x86_64 > /dev/null || { echo "error: qemu-x86_64 not found (package qemu-user); step 6 needs it" >&2; exit 1; }
+if [[ $bolt == 1 && -n $lsp_sessions ]]; then
+  command -v python3 > /dev/null || { echo "error: python3 not found; the editor sessions need it (or set RELEASE_LSP_SESSIONS=)" >&2; exit 1; }
+fi
 
 # floor_sysroot <dir>: makes the glibc 2.28 sysroot of the dynamic build in
 # <dir>, from Arch Linux packages of April 2019 (built for plain x86-64):
@@ -522,11 +558,12 @@ bolt_dir="$out/bolt"
 declare -A reps=([query]=12 [hono]=6 [zod]=4 [effect]=3) # about 5 s of work per recording
 
 # rec <name> <reps> <cmd...>: one perf recording of <reps> runs, each without
-# old .tsbuildinfo or emit output in $tmp.
+# old .tsbuildinfo or emit output in $tmp. freq (default BOLT_PERF_FREQ) sets
+# the sample frequency.
 rec() {
   local name=$1 count=$2
   shift 2
-  perf record -q -e cycles:u -j any,u -F "${BOLT_PERF_FREQ:-20000}" -o "$bolt_dir/data/$name.data" -- bash -c \
+  perf record -q -e cycles:u -j any,u -F "${freq:-${BOLT_PERF_FREQ:-20000}}" -o "$bolt_dir/data/$name.data" -- bash -c \
     'n=$1; t=$2; shift 2; for ((i = 0; i < n; i++)); do rm -rf "$t"/*.tsbuildinfo "$t"/out-*; "$@"; done; true' \
     _ "$count" "$tmp" "$@" > "$bolt_dir/data/$name.out" 2>&1 || true
   [[ -s "$bolt_dir/data/$name.data" ]] || { echo "error: no perf data for $name" >&2; exit 1; }
@@ -542,7 +579,14 @@ bolt_train() {
       done
       for name in query hono; do
         rec "tsgo-emit-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --pretty false --outDir "$tmp/out-$name" --tsBuildInfoFile "$tmp/emit-$name.tsbuildinfo"
-      done ;;
+      done
+      # The editor sessions, in one recording at a lower sample frequency.
+      if [[ -n $lsp_sessions ]]; then
+        # shellcheck disable=SC2086 # one argument per session
+        freq=${BOLT_LSP_PERF_FREQ:-2500} rec tsgo-lsp 1 python3 "$script_dir/lsp-train.py" "$b" "$P" $lsp_sessions
+        grep -qx 'lsp-train: ok' "$bolt_dir/data/tsgo-lsp.out" \
+          || { tail -5 "$bolt_dir/data/tsgo-lsp.out" >&2; echo "error: the editor sessions of the BOLT training failed" >&2; exit 1; }
+      fi ;;
     goport)
       for name in query hono zod effect; do rec "goport-$name" "${reps[$name]}" "$b" -p "${projects[$name]}"; done ;;
     goport_emit)
@@ -682,6 +726,9 @@ done
   echo "lib files: $([[ $noembed == 1 ]] && echo "next to the bins (noembed)" || echo "embedded")"
   if [[ $bolt == 1 ]]; then
     echo "bolt: $(llvm-bolt --version | grep -m1 'LLVM version' | xargs), ${bolt_opts[*]}"
+    if [[ -n $lsp_sessions ]]; then
+      echo "bolt editor sessions (tsgo, ${BOLT_LSP_PERF_FREQ:-2500} Hz): $(sed -n 's/^lsp-train: \(.*\): [0-9]* of .*/\1/p' "$bolt_dir/data/tsgo-lsp.out" | paste -sd';' | sed 's/;/; /g'); ls_edit_bench.py sha256 $(sha256sum "$repo/scripts/goport/ls_edit_bench.py" | cut -c1-12)"
+    fi
   else
     echo "bolt: off"
   fi
