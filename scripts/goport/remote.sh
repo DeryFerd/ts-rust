@@ -4,7 +4,8 @@
 # Each host keeps a mirror at the same absolute paths as zbook: this repo's tooling, target/project-inputs*,
 # the target/continuation-r97-goport runners, oracle caches and default binaries, ~/.local/bin/tsgo-oracle and
 # ~/.explore/repos/microsoft__typescript-go (see target/continuation-r97-goport/remote/*-manifest.txt, *-setup.md).
-# usage: remote.sh status [host...]            per host: zbook lock (holder, age, waiters), load, free RAM, top process
+# usage: remote.sh help                       this text
+#        remote.sh status [host...]            per host: zbook lock (holder, age, waiters), load, free RAM, top process
 #        remote.sh look <host> <command...>    a quick look (logs, files, tools): no lock, 120 s limit
 #        remote.sh run <host> <command...>     a job in the repo root with a login shell, under the host lock;
 #                                              output and stdin pass through: run <host> bash -s <<'EOF' works
@@ -23,6 +24,10 @@
 # its children; run sees it and does not lock again. So a script under `job`, and the older
 # `flock /tmp/goport-remote-<host>.lock remote.sh run <host> ...` form, both work. A script under `job` must not
 # take the lock itself: it would wait for its own lock.
+# Reserved: dbook-lan is kept for revision evidence (candidate.sh side runs the gate and the oracles there). auto
+# skips it, and run and job refuse it unless REMOTE_USE_RESERVED=1 (candidate.sh sets it; the auditor and reviewer
+# set it to repeat a revision run). Time on mini-abf9 or mini-743d. On 2026-09-30 the 11-minute R148 and R149
+# gates waited 104 and 45 minutes for skeptic timing jobs on dbook. REMOTE_RESERVED overrides the list ("" for none).
 # dbook and the minis are on zbook's LAN and always go over it, never Tailscale. Relative dirs are relative to the repo root.
 set -uo pipefail
 REPO=/home/theo/Code/sandbox/ts-rust
@@ -44,6 +49,9 @@ canon() {
 }
 read -ra HOSTS <<< "${REMOTE_HOSTS:-alvin cup2 dbook-lan mini-743d mini-abf9}"
 for i in "${!HOSTS[@]}"; do HOSTS[i]=$(canon "${HOSTS[i]}"); done
+read -ra RESERVED <<< "${REMOTE_RESERVED-dbook-lan}"
+# True when host $1 is kept for revision evidence (see Reserved above).
+reserved() { local r; for r in "${RESERVED[@]}"; do [[ $(canon "$r") == "$1" ]] && return 0; done; return 1; }
 RS=(rsync -aH --mkpath --compress --compress-choice=zstd --info=progress2)
 # rsync to or from host $1 with its ssh options.
 rs() { local h=$1 e=(); shift; [[ -n ${SSH_OPTS[$h]:-} ]] && e=(-e "ssh ${SSH_OPTS[$h]}"); "${RS[@]}" "${e[@]}" "$@"; }
@@ -96,6 +104,7 @@ pick() {
   local h n=0
   while :; do
     for h in "${HOSTS[@]}"; do
+      reserved "$h" && continue
       exec {LOCKFD}> "$(lockfile "$h")"
       if flock -n "$LOCKFD"; then
         quiet "$h" && { HOST=$h; echo "remote.sh: auto picked $h" >&2; return; }
@@ -103,7 +112,7 @@ pick() {
       fi
       exec {LOCKFD}>&-
     done
-    ((n++)) || echo "remote.sh: no free, quiet host with a correct mirror in ${HOSTS[*]}; checking every 30 s" >&2
+    ((n++)) || echo "remote.sh: no free, quiet host with a correct mirror in ${HOSTS[*]} (reserved: ${RESERVED[*]:-none}); checking every 30 s" >&2
     sleep 30
   done
 }
@@ -188,9 +197,11 @@ fetch() {
     rs "$h" --ignore-existing "$h:$d/" "$d/" || return
   done
 }
-[[ $# -ge 1 ]] || { sed -n '/^# usage:/,/^# dbook and the minis/p' "$0"; exit 2; }
+usage() { sed -n '/^# usage:/,/^# dbook and the minis/p' "$0"; }
+[[ $# -ge 1 ]] || { usage; exit 2; }
 cmd=$1; shift
 case $cmd in
+  help|-h|--help) usage; exit ;;
   status) (($#)) || set -- "${HOSTS[@]}"; hs=(); for h; do hs+=("$(canon "$h")"); done; status "${hs[@]}"; exit ;;
   look|run|job|sync-bins|sync-scripts|sync-pin|push|fetch) ;;
   *) die "unknown command $cmd" ;;
@@ -203,6 +214,9 @@ if [[ $host == auto ]]; then
   [[ $cmd == run || $cmd == job ]] || die "'auto' only works with run and job; inside a job, use \$REMOTE_HOST"
   # pick holds the lock of the host it picks, so run and job do not lock again.
   pick; host=$HOST
+fi
+if [[ ($cmd == run || $cmd == job) && ${REMOTE_USE_RESERVED:-0} != 1 ]] && reserved "$host"; then
+  die "$host is kept for revision evidence (candidate.sh side). Use auto, or mini-abf9 or mini-743d for timing. The auditor and reviewer set REMOTE_USE_RESERVED=1 to repeat a revision run."
 fi
 if [[ $host == all ]]; then
   [[ $cmd == sync-* ]] || die "'all' only works with sync-bins, sync-scripts and sync-pin"

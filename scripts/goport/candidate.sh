@@ -3,11 +3,12 @@
 # gate items (docs/typechecker-accountability.md, "Protected set"); the legacy roster drive is retired.
 #
 # usage: scripts/goport/candidate.sh <command> ... [--dry-run]
+#   help                   this text
 #   check <branch>         Scope of the <branch> diff against the allowedChangedFiles of the revision (the
 #                          batch's, or a new goport batch's when the batch is accepted or with --new-batch),
 #                          no change of a protected path (open_revision.py --protected) since the branch's
-#                          merge base with main, and rustfmt --edition 2024 on each changed .rs file. Exit 1
-#                          on any problem.
+#                          merge base with main, rustfmt --edition 2024 on each changed .rs file, and no stale
+#                          lib blob (lib-blobs.sh stale). Exit 1 on any problem.
 #   open <rev> <branch> --hypothesis TEXT --change TEXT [--message TEXT] [--new-batch ID --origin TEXT]
 #                          check, apply <branch> to the checkout (paths in scope, one commit), fp.py, and
 #                          open_revision.py last (the only state write). A new batch has protectedSet goport.
@@ -19,7 +20,8 @@
 #                          or renamed tests); two bound runs; the full gate and gate-compare.py against the
 #                          base gate manifest; the LSP and API oracles, each compared per request with the
 #                          base results (oracle-compare.py); rustfmt and clippy on ts_goport and the kept
-#                          crates. The gate and the oracles run on --gate-host (default dbook-lan). The base
+#                          crates. The gate and the oracles run on --gate-host (default dbook-lan, which
+#                          remote.sh keeps for this; REMOTE_USE_RESERVED=1 is set below). The base
 #                          is the last accepted revision (open_revision.py --base). Each step is cached by
 #                          source under evidence-cache/<key>/ and reused. The oracle compares use the answer
 #                          sets of the base (protectedBase.oracleAnswers) and of the batch (batch.oracleAnswers)
@@ -49,6 +51,7 @@ TOOLS=$(dirname "$(dirname "$(dirname "$SELF")")")  # the checkout of this scrip
 G=$TOOLS/scripts/goport
 EVIDENCE=${CANDIDATE_EVIDENCE:-$R/evidence-cache}  # tests point this at a copy
 TARGET=$R/runtime/cargo-target                     # one warm target for candidate bins (gate.sh's default)
+export REMOTE_USE_RESERVED=1                       # remote.sh keeps dbook-lan for revision evidence
 BINS=(goport goport_emit goport_typesyms goport_build tsgo)
 LSP_BATTERIES=b1-inline,b1-query-core,b2-query-core,b1-hono,b2-hono,fourslash
 # The API oracle batteries: the 10 of pin 52168999f3dc (bumpA4 verify), and from pin 16c25522e123 (bump B)
@@ -63,7 +66,7 @@ KEPT_CRATES=(ts_scanner ts_ast ts_diagnostics ts_path ts_core ts_jsnum)
 CHECKER_PORT=$ROOT/target/worktrees/checker-port
 cd "$ROOT"
 
-usage() { sed -n '2,/^set -euo/p' "$SELF" | sed '$d'; exit 2; }
+usage() { sed -n '2,/^set -euo/p' "$SELF" | sed '$d'; exit "${1:-2}"; }
 die() { echo "candidate.sh: $*" >&2; exit 1; }
 say() { echo "== $*"; }
 # need <condition text>: stops, except in a dry run, where an earlier step (open) would fix it.
@@ -193,6 +196,9 @@ check_branch() {
     fi
   done < <(git diff --no-renames --name-status -z "$base" "$sha")
   ((skipped == 0)) || echo "   $skipped changed path(s) under the excluded globs are not applied"
+  # A stale lib blob fails the protected snapshot_matches_live_* tests: 59 agents met one from 2026-09-28 to 30.
+  local line
+  while IFS= read -r line; do problems+=("$line"); done < <("$G/lib-blobs.sh" stale "$sha" || true)
   # Protected paths the branch itself changed (from its merge base with main, so paths that only main changed
   # since do not count). A batch that must change one lists the exact path and no exclude glob names it.
   mapfile -t protected < <(python3 "$G/open_revision.py" --protected)
@@ -803,6 +809,7 @@ args=()
 while (($#)); do
   case $1 in
     --dry-run) DRY=1; shift ;;
+    -h|--help) usage 0 ;;
     --hypothesis) HYP=${2:?--hypothesis needs a value}; shift 2 ;;
     --change) CHANGE=${2:?--change needs a value}; shift 2 ;;
     --message) MESSAGE=${2:?--message needs a value}; shift 2 ;;
@@ -819,6 +826,7 @@ set -- "${args[@]}"
 cmd=${1:-}
 (($#)) && shift
 case $cmd:$# in
+  help:0) usage 0 ;;
   check:1) load_state; check_branch "$1" ;;
   open:2) load_state; cmd_open "$@" ;;
   side:1) load_state; cmd_side "$1" ;;

@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
+# Cargo for this repo with caps: one Cargo at a time across all worktrees (one lock), a memory limit, and each
+# worktree's own target dir.
+# usage: scripts/run-cargo-capped.sh <cargo command> [args...]   e.g. build --release -p ts_goport --bins
+#        scripts/run-cargo-capped.sh help                       this text
+# - Target: <worktree>/target, with sccache when installed. Do not set CARGO_TARGET_DIR (TS_CARGO_SEPARATE_TARGET=1
+#   with its own CARGO_TARGET_DIR only for a deliberate fresh-target reproduction).
+# - TS_CARGO_JOBS: build jobs (16 on zbook, 1 elsewhere). TS_CARGO_MEMORY_LIMIT_KIB: the memory cap of the run.
+# - Edit-loop builds (build, check, test, run, bench without --profile goport) use nightly -Zthreads=8 and
+#   incremental ts_goport. TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 gives a stable build (for timing, or after an
+#   internal compiler error). --profile goport (fat LTO, 7 to 20 minutes) stays on 1.93.0: timing and shipped bins.
 set -euo pipefail
+case "${1:-}" in help | -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; esac
 
 # One brace group: bash reads the whole script before it runs it, so a run that
 # waits for the lock keeps its own text when this file changes on disk.

@@ -14,7 +14,7 @@
 # <first side> / <side>, and how many runs had an output tree (with and without .tsbuildinfo) or stdout that
 # differs from the first side's run of the same step and round.
 # Timing on a loaded host is noise: the tool refuses to start above load PERF_MAX_LOAD (1.5), or waits up to 30
-# minutes with PERF_WAIT=1. Run it on a quiet host through remote.sh (dbook-lan or a mini). GOPORT_* and
+# minutes with PERF_WAIT=1. Run it on a quiet host through remote.sh (mini-abf9 or mini-743d). GOPORT_* and
 # allocator variables are removed and GOPORT_LAUNCH=0 is set, as in perf.sh (PERF_LAUNCH=1 keeps the launcher).
 # Output: target/continuation-r97-goport/perf-build/<label>/ (runs.jsonl, host.json, table.txt).
 set -uo pipefail

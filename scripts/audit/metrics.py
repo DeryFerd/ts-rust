@@ -128,7 +128,7 @@ def main():
         if d.get('kind') == 'revision' and lo <= ts(d.get('recordedUtc', '1970-01-01T00:00:00Z')) <= hi:
             revs[v['revision']] = v  # the last line for a revision is its current row
     m['revisions'] = len(revs)
-    m['formatOnlyRevisions'] = sum(bool(re.search(r'format only|rustfmt', v.get('hypothesis', ''), re.I)) for v in revs.values())
+    m['formatOnlyRevisions'] = sum(bool(re.search(r"format.only|rustfmt.only", v.get("hypothesis", ""), re.I)) for v in revs.values())
     m['carryForwardRevisions'] = sum(bool(v.get('rosterCarryForward')) for v in revs.values())
     for k in ('subagentHours', 'pollHours', 'askBlockedHours'):
         m[k] = round(m[k], 1)
