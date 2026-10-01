@@ -2514,6 +2514,7 @@ mod tests {
     // string literal's name in the value form, where it is one surrogate unit
     // (see `scanner_util::GO_STRING_MARKER`). The bytes next to a match are
     // Go bytes: 0xC5 (`Å`) and 0xFF (`ÿ`) are identifier parts, 0x80 is not.
+    // The checker's copy of the search gives the same positions.
     #[test]
     fn possible_reference_positions_search_go_bytes() {
         let mut lone = String::new();
@@ -2542,6 +2543,12 @@ mod tests {
             let got = get_possible_symbol_reference_positions(file.root, name, Node::NIL);
             let want: Vec<i32> = want.iter().map(|&g| port_byte_offset(&text, g)).collect();
             assert_eq!(got, want, "{bytes:?} {name:?}");
+            // Go checker/services.go:655, the identifier search of
+            // `IsSymbolReferencedInFile`, has the same body.
+            let checker_got = crate::checker::services::get_possible_symbol_reference_positions(
+                file.root, name, file.root,
+            );
+            assert_eq!(checker_got, want, "checker: {bytes:?} {name:?}");
         }
         // A container that does not start the text: as in Go, the first
         // index is relative to it and is used as an absolute position. Here
