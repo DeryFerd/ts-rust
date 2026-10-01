@@ -214,7 +214,7 @@ pub fn new_lsp_client(
     }
 }
 
-type NpmInstall = Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>)>;
+type NpmInstall = Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>) + Send + Sync>;
 
 /// Go `exec.Command("npm", args...)` in `cwd`, `cmd.Output()` (the
 /// `NpmInstall` of lsp `TestReplay`). PORT: the error text is approximated.
