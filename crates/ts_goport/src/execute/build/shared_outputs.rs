@@ -33,8 +33,12 @@ use crate::frontend::prelude::*;
 /// compared by its real path (`real_path`), so two names of one place
 /// through a symbolic link overlap. The areas come from the configs and the
 /// links on disk, so they are known before a task starts, and the same in
-/// every run. A task can also emit a file that is not a root file; when that
-/// file is outside the directories above, its outputs are not in the area.
+/// every run. A task can also emit a file that is not a root file (a file
+/// that it imports). With an output directory, that output is in the
+/// directory too. When its outputs go next to its sources, that output goes
+/// next to the imported file, and the config does not show where. So two
+/// tasks whose outputs go next to their sources overlap, as they can import
+/// one file and write its outputs (R149 reviewer item 2).
 pub(crate) fn outputs_overlap(
     configs: &[Option<Rc<ParsedCommandLine>>],
     fs: &Rc<dyn Fs>,
@@ -124,11 +128,13 @@ fn os_read_link(path: &str) -> Option<String> {
 
 /// The output area and the root file directories of one task, as path
 /// keys (`to_path` of the real path). A directory key ends with '/', so a
-/// directory holds each key that starts with its key.
+/// directory holds each key that starts with its key. `beside_sources` is
+/// true when some outputs of the task go next to its sources.
 struct Area {
     output_dirs: Vec<String>,
     build_info: Option<String>,
     root_dirs: Vec<String>,
+    beside_sources: bool,
 }
 
 impl Area {
@@ -161,6 +167,7 @@ impl Area {
             });
         }
         let mut output_dirs = Vec::new();
+        let beside_sources = dirs.iter().any(|dir| dir.is_empty());
         for dir in dirs {
             if dir.is_empty() {
                 // The outputs go next to the root files.
@@ -174,6 +181,7 @@ impl Area {
             output_dirs,
             build_info: (!build_info.is_empty()).then(|| key(&build_info)),
             root_dirs,
+            beside_sources,
         }
     }
 }
@@ -186,6 +194,9 @@ enum Kind {
 }
 
 fn areas_overlap(areas: &[Area]) -> bool {
+    if areas.iter().filter(|area| area.beside_sources).count() > 1 {
+        return true;
+    }
     let mut entries: Vec<(&str, Kind, usize)> = Vec::new();
     for (task, area) in areas.iter().enumerate() {
         let dirs = area.output_dirs.iter().map(|key| (key, Kind::OutputDir));
@@ -236,6 +247,16 @@ mod tests {
             output_dirs: keys(output_dirs),
             build_info: (!build_info.is_empty()).then(|| build_info.to_string()),
             root_dirs: keys(root_dirs),
+            beside_sources: false,
+        }
+    }
+
+    /// The area of a task whose outputs go next to its sources in
+    /// `root_dir`, with the build info `build_info`.
+    fn beside(root_dir: &str, build_info: &str) -> Area {
+        Area {
+            beside_sources: true,
+            ..area(&[root_dir], build_info, &[root_dir])
         }
     }
 
@@ -261,8 +282,10 @@ mod tests {
     #[test]
     fn overlaps() {
         // A shared outDir, an outDir under another one, a build info in
-        // another outDir, a root directory in another outDir, and a shared
-        // build info alone.
+        // another outDir, a root directory in another outDir, a shared
+        // build info alone, and two tasks whose outputs go next to their
+        // sources in separate directories (they can import one file, as
+        // the R149 reviewer's pX and pY import ../shared/u.ts).
         let pairs = [
             (
                 area(&["/r/shared/"], "", &[]),
@@ -281,18 +304,28 @@ mod tests {
                 area(&[], "/r/x.tsbuildinfo", &[]),
                 area(&[], "/r/x.tsbuildinfo", &[]),
             ),
+            (
+                beside("/r/pX/src/", "/r/x.tsbuildinfo"),
+                beside("/r/pY/src/", "/r/y.tsbuildinfo"),
+            ),
         ];
         for (a, b) in pairs {
             assert!(areas_overlap(&[a, b]));
         }
-        // A directory whose name starts with another's name, and an outDir
-        // inside a root directory (the root files are only the ones there).
+        // A directory whose name starts with another's name, an outDir
+        // inside a root directory (the root files are only the ones there),
+        // and one task whose outputs go next to its sources beside one
+        // with an outDir.
         let pairs = [
             (
                 area(&["/r/dist/"], "", &[]),
                 area(&["/r/dist2/"], "/r/dist.tsbuildinfo", &[]),
             ),
             (area(&["/r/a/dist/"], "", &[]), area(&[], "", &["/r/a/"])),
+            (
+                beside("/r/pX/src/", "/r/x.tsbuildinfo"),
+                area(&["/r/pY/dist/"], "/r/y.tsbuildinfo", &["/r/pY/src/"]),
+            ),
         ];
         for (a, b) in pairs {
             assert!(!areas_overlap(&[a, b]));
