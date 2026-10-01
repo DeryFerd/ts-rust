@@ -33,8 +33,6 @@ Run from the repository root. --extra is a JSON object merged into the batch (e.
 import argparse, datetime, glob, hashlib, json, os, re, subprocess, sys, tempfile
 
 ROOT = os.getcwd()  # the repository root (run from there)
-AUDITOR = 'aae6dbb734c07335a'  # fallback when the batch names no auditor (batches up to 34)
-REVIEWER = 'a0bc38f3370585da3'  # fallback when the batch names no reviewer (batches up to 34)
 RULE = 'goport-protected-set'
 
 
@@ -171,8 +169,9 @@ def main():
     s = export()
     b = s['batch']
     # Each batch has its own auditor and reviewer (AGENTS.md): use the agents the batch names.
-    auditor = (b.get('auditor') or {}).get('agent') or AUDITOR
-    reviewer = (b.get('reviewer') or {}).get('agent') or REVIEWER
+    auditor, reviewer = ((b.get(k) or {}).get('agent') or '' for k in ('auditor', 'reviewer'))
+    if not auditor or not reviewer or auditor.startswith('pending') or reviewer.startswith('pending'):
+        sys.exit('record the batch auditor and reviewer agent ids first (scripts/state record current)')
     row = b['recoveryHistory'][-1]
     if row['revision'] != a.revision or b['recoveryRevision'] != a.revision:
         sys.exit(f'current revision is R{row["revision"]}, not R{a.revision}')
