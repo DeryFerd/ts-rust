@@ -491,3 +491,43 @@ fn when(d: Duration) -> Instant {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs the ready work of this thread until no timer is armed.
+    fn run_until_idle() {
+        while wait_pending() {
+            run_pending();
+        }
+    }
+
+    #[test]
+    fn timers_of_one_thread_fire_in_deadline_order_after_stop_and_reset() {
+        // A thread of its own: the timer thread ends with it.
+        std::thread::spawn(|| {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let push = |name: &'static str| -> Box<dyn FnMut()> {
+                let log = log.clone();
+                Box::new(move || log.borrow_mut().push(name))
+            };
+            let late = after_func(Duration::from_millis(40), push("late"));
+            let early = after_func(Duration::from_millis(10), push("early"));
+            let stopped = after_func(Duration::from_millis(5), push("stopped"));
+            assert!(stopped.stop());
+            assert!(!stopped.stop());
+            run_until_idle();
+            assert_eq!(*log.borrow(), ["early", "late"]);
+            // Reset after it fired: false, and it runs again.
+            assert!(!early.reset(Duration::from_millis(1)));
+            // Reset while armed moves the deadline: true.
+            assert!(!late.reset(Duration::from_millis(30)));
+            assert!(late.reset(Duration::from_millis(2)));
+            run_until_idle();
+            assert_eq!(*log.borrow(), ["early", "late", "early", "late"]);
+        })
+        .join()
+        .expect("timer test thread");
+    }
+}
