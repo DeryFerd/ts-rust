@@ -1718,7 +1718,7 @@ impl Server {
                         Err(payload) => go_crash(payload),
                     }
                 })
-                .expect("lsp: failed to start the read goroutine");
+                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
         }
 
         let dispatch_result = self.dispatch_loop(&ctx);
@@ -4659,7 +4659,7 @@ impl Server {
                     let accepted = ApiAccepted { session_id, rwc };
                     let _ = shared.queue_request(&ctx, QueuedRequest::ApiAccepted(accepted));
                 })
-                .expect("lsp: failed to start the API accept goroutine");
+                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
         }
 
         self.api_sessions
@@ -4853,7 +4853,7 @@ fn start_api_reader(
                 }
             }
         })
-        .expect("lsp: failed to start the API read goroutine");
+        .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
     inbox
 }
 
