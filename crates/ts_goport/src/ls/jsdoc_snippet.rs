@@ -7,6 +7,13 @@ use crate::ls::prelude::*;
 // with `stringutil.IsWhiteSpace*`. A Go rune can be a lone surrogate, which
 // is not a Rust `char`; it is not white space, so `char::from_u32` failing
 // counts as "not white space".
+//
+// PORT: `position` can cut a char: a UTF-8 client column inside a char, or
+// an API UTF-16 offset inside a surrogate pair (Go `UTF16ToUTF8` maps it to
+// a byte inside the char). Go slices the bytes there. `go_text_slice` gives
+// each cut byte as an invalid byte unit, which is not white space, '*' or
+// '/', as Go's RuneError byte is not. So the snippet checks answer as Go: a
+// prefix that ends in a cut char is not a snippet prefix.
 
 // Go: ls/jsdoc_snippet.go:19 docCommentTemplate
 struct DocCommentTemplate {
@@ -85,7 +92,7 @@ impl LanguageService {
         })
     }
 
-    // Go: ls/jsdoc_snippet.go:86 getJSDocSnippetCompletionRange
+    // Go: ls/jsdoc_snippet.go:87 getJSDocSnippetCompletionRange
     // PORT: Go returns `*lsproto.TextEditOrInsertReplaceEdit`; nil is `None`.
     fn get_js_doc_snippet_completion_range(
         &self,
@@ -98,14 +105,14 @@ impl LanguageService {
         let line_start = crate::format::get_line_start_position_for_position(position, file);
         let prefix = go_text_slice(&text, line_start, position);
         let mut start = position;
-        if let Some(prefix_start) = get_js_doc_snippet_prefix_start(prefix) {
+        if let Some(prefix_start) = get_js_doc_snippet_prefix_start(&prefix) {
             start = line_start + prefix_start as i32;
         }
 
         let line_end = get_line_end_of_position(file, position);
         let suffix = go_text_slice(&text, position, line_end);
         let mut end = position;
-        if let Some(suffix_end) = get_js_doc_snippet_suffix_end(suffix) {
+        if let Some(suffix_end) = get_js_doc_snippet_suffix_end(&suffix) {
             end += suffix_end as i32;
         }
 
@@ -133,47 +140,21 @@ impl LanguageService {
     }
 }
 
-// Go: ls/jsdoc_snippet.go:73 isPotentiallyValidJSDocSnippetCompletionPosition
+// Go: ls/jsdoc_snippet.go:74 isPotentiallyValidJSDocSnippetCompletionPosition
 pub fn is_potentially_valid_js_doc_snippet_completion_position(file: Node, position: i32) -> bool {
     let text = source_file_text(file);
     let line_start = crate::format::get_line_start_position_for_position(position, file);
     let prefix = go_text_slice(&text, line_start, position);
-    if !is_js_doc_snippet_prefix(prefix) {
+    if !is_js_doc_snippet_prefix(&prefix) {
         return false;
     }
 
     let line_end = get_line_end_of_position(file, position);
     let suffix = go_text_slice(&text, position, line_end);
-    is_js_doc_snippet_suffix(suffix)
+    is_js_doc_snippet_suffix(&suffix)
 }
 
-// Go `text[lo:hi]` on a string, with the Go runtime panic text when a bound
-// is out of range. Go checks `hi` against the length first, then `lo`
-// against `hi`; a negative bound is printed alone. A content-mapped file
-// reaches the snippet checks with empty text in Go at B too, so the panic
-// text must be Go's (the LSP error response carries it).
-fn go_text_slice(text: &str, lo: i32, hi: i32) -> &str {
-    let len = text.len();
-    if hi < 0 {
-        crate::core::go_panic(format!("runtime error: slice bounds out of range [:{hi}]"));
-    }
-    if hi as usize > len {
-        crate::core::go_panic(format!(
-            "runtime error: slice bounds out of range [:{hi}] with length {len}"
-        ));
-    }
-    if lo < 0 {
-        crate::core::go_panic(format!("runtime error: slice bounds out of range [{lo}:]"));
-    }
-    if lo > hi {
-        crate::core::go_panic(format!(
-            "runtime error: slice bounds out of range [{lo}:{hi}]"
-        ));
-    }
-    &text[lo as usize..hi as usize]
-}
-
-// Go: ls/jsdoc_snippet.go:118 getDocCommentTemplateAtPosition
+// Go: ls/jsdoc_snippet.go:124 getDocCommentTemplateAtPosition
 // PORT: Go reads the reparse like any parsed file, with lazy JSDoc. Here a
 // lazy JSDoc read of a published file asks the current program for the
 // parser input, and the language service program has none for a file that
@@ -203,6 +184,9 @@ fn get_doc_comment_template_at_position(
         && !has_closing_doc_comment_at_position
     {
         let text = source_file_text(source_file);
+        // A doc comment at the position means that the line before it ends
+        // with "/**" and single-line white space, so `position` does not cut
+        // a char and the slices below are Go's byte slices.
         // The reparse is published for good (and its lazy JSDoc is cached
         // before that), so its nodes belong to the thread.
         let _base = crate::ast::enter_base_synthetic_owner();
@@ -313,18 +297,18 @@ fn is_template_source_file_js(source_file: Node) -> bool {
     script_kind == ScriptKind::JS || script_kind == ScriptKind::JSX
 }
 
-// Go: ls/jsdoc_snippet.go:177 getDocCommentEndAtPosition
+// Go: ls/jsdoc_snippet.go:181 getDocCommentEndAtPosition
 fn get_doc_comment_end_at_position(file: Node, position: i32) -> (i32, bool, bool) {
     let text = source_file_text(file);
     let line_start = crate::format::get_line_start_position_for_position(position, file);
     let line_end = get_line_end_of_position(file, position);
     let prefix = go_text_slice(&text, line_start, position);
     let suffix = go_text_slice(&text, position, line_end);
-    if !trim_right_single_line_whitespace(prefix).ends_with("/**") {
+    if !trim_right_single_line_whitespace(&prefix).ends_with("/**") {
         return (0, false, false);
     }
     // PORT: Go `getJSDocSnippetSuffixEnd` gives `(0, false)` for no closing.
-    let suffix_end = get_js_doc_snippet_suffix_end(suffix);
+    let suffix_end = get_js_doc_snippet_suffix_end(&suffix);
     (
         position + suffix_end.unwrap_or(0) as i32,
         true,
@@ -332,10 +316,15 @@ fn get_doc_comment_end_at_position(file: Node, position: i32) -> (i32, bool, boo
     )
 }
 
-// Go: ls/jsdoc_snippet.go:190 skipWhitespace
+// Go: ls/jsdoc_snippet.go:194 skipWhitespace
 fn skip_whitespace(text: &str, mut position: i32) -> i32 {
     while (position as usize) < text.len() {
-        let (ch, size) = decode_js_string_rune(&text[position as usize..]);
+        // PORT: a position inside a char is a byte that Go decodes as
+        // RuneError, which is not white space.
+        let Some(rest) = text.get(position as usize..) else {
+            break;
+        };
+        let (ch, size) = decode_js_string_rune(rest);
         if size == 0 {
             break;
         }
@@ -813,4 +802,83 @@ fn starts_with_single_line_whitespace(text: &str) -> bool {
 // Go: ls/jsdoc_snippet.go:583 isOnlySpacesOrTabs
 fn is_only_spaces_or_tabs(text: &str) -> bool {
     text.bytes().all(|b| b == b' ' || b == b'\t')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::parser::{self, SourceFileParseOptions};
+    use std::fmt::Write;
+
+    /// The JSDoc snippet checks answer as Go when the position cuts a char,
+    /// where Go slices the line's bytes. The expected lines are from a Go
+    /// test at pin N with Go 1.27.1 (`utf8cmp1/tools/gomodel` in the lane
+    /// dir, an overlay test file in package `ls`). It runs the pin N helpers
+    /// at each byte position of each one-line file: `isJSDocSnippetPrefix &&
+    /// isJSDocSnippetSuffix` (Go `isPotentiallyValidJSDocSnippetCompletion
+    /// Position`), `getJSDocSnippetPrefixStart`, `getJSDocSnippetSuffixEnd`,
+    /// `getDocCommentEndAtPosition` and `skipWhitespace`. The cut chars are
+    /// U+1F600, U+3000 (white space) and U+00A0 (white space).
+    #[test]
+    fn js_doc_snippet_checks_cut_chars_as_go() {
+        let go = "\
+J0 0 false - 1 0,false,false 0\n\
+J0 1 false 0 - 0,false,false 1\n\
+J0 2 false 0 - 0,false,false 2\n\
+J0 3 false 0 - 3,true,false 4\n\
+J0 4 false 0 - 4,true,false 4\n\
+J0 5 false - - 0,false,false 5\n\
+J0 6 false - - 0,false,false 6\n\
+J0 7 false - - 0,false,false 7\n\
+J0 8 false - - 0,false,false 8\n\
+J1 0 false - 1 0,false,false 0\n\
+J1 1 false 0 - 0,false,false 1\n\
+J1 2 false 0 - 0,false,false 2\n\
+J1 3 true 0 5 8,true,true 6\n\
+J1 4 false - - 0,false,false 4\n\
+J1 5 false - - 0,false,false 5\n\
+J1 6 true 0 2 8,true,true 6\n\
+J1 7 false - 1 0,false,false 7\n\
+J1 8 false 7 - 0,false,false 8\n\
+J2 0 false - 3 0,false,false 2\n\
+J2 1 false - - 0,false,false 1\n\
+J2 2 false - 1 0,false,false 2\n\
+J2 3 false 2 - 0,false,false 3\n\
+J2 4 false 2 - 0,false,false 4\n\
+J2 5 true 2 - 5,true,false 7\n\
+J2 6 false - - 0,false,false 6\n\
+J2 7 true 2 - 7,true,false 7\n\
+";
+        let lines = ["/** \u{1F600}", "/**\u{3000}*/", "\u{A0}/**\u{A0}"];
+        let opt = |n: Option<usize>| n.map_or("-".to_string(), |n| n.to_string());
+        let mut port = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            let file = Rc::new(parser::parse_source_file(
+                &SourceFileParseOptions {
+                    file_name: "/a.ts".to_string(),
+                    path: tspath::Path("/a.ts".to_string()),
+                    ..Default::default()
+                },
+                *line,
+                ScriptKind::TS,
+            ));
+            crate::program::note_parsed_source_file(&file);
+            let len = line.len() as i32;
+            for p in 0..=len {
+                let valid = is_potentially_valid_js_doc_snippet_completion_position(file.root, p);
+                let prefix_start = get_js_doc_snippet_prefix_start(&go_text_slice(line, 0, p));
+                let suffix_end = get_js_doc_snippet_suffix_end(&go_text_slice(line, p, len));
+                let (end, ok, closing) = get_doc_comment_end_at_position(file.root, p);
+                let skip = skip_whitespace(line, p);
+                writeln!(
+                    port,
+                    "J{i} {p} {valid} {} {} {end},{ok},{closing} {skip}",
+                    opt(prefix_start),
+                    opt(suffix_end)
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(port, go);
+    }
 }
