@@ -245,7 +245,10 @@ impl Statistics {
         if let Some(testing) = &testing {
             testing.on_statistics_start(w);
         }
+        // PORT: one report (`stdio::keep_writes`).
+        let report = super::stdio::keep_writes();
         self.report(w);
+        drop(report);
         if let Some(testing) = &testing {
             testing.on_statistics_end(w);
         }

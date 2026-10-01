@@ -61,10 +61,10 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false";
 
 /// The `arg0` of a worker (see `launch`) is this word, the launcher's
-/// process id, and the number and inode of the launcher's end of the pipe
-/// that takes the exit code: `tsgo-worker 4242 3 81234`. The arguments, not
-/// the environment, name a worker, so a process that the worker starts gets
-/// nothing of it.
+/// process id, and the number, device and inode of the launcher's end of
+/// the pipe that takes the exit code: `tsgo-worker 4242 3 15 81234`. The
+/// arguments, not the environment, name a worker, so a process that the
+/// worker starts gets nothing of it.
 #[cfg(target_os = "linux")]
 const WORKER_ARG0: &str = "tsgo-worker";
 
@@ -74,7 +74,8 @@ const WORKER_ARG0: &str = "tsgo-worker";
 struct Worker {
     /// The number of the launcher's end of the pipe that takes the exit code.
     fd: u32,
-    /// The inode of that pipe.
+    /// The device and inode of that pipe.
+    dev: u64,
     ino: u64,
     /// The launcher.
     launcher: rustix::process::Pid,
@@ -205,11 +206,13 @@ fn launch(huge_pages: bool) -> Option<i32> {
     // worker.
     let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok()?;
     let launcher = rustix::process::getpid().as_raw_pid();
-    let ino = rustix::fs::fstat(&read).ok()?.st_ino;
+    let stat = rustix::fs::fstat(&read).ok()?;
     let mut worker = std::process::Command::new(exe)
         .arg0(format!(
-            "{WORKER_ARG0} {launcher} {} {ino}",
-            read.as_raw_fd()
+            "{WORKER_ARG0} {launcher} {} {} {}",
+            read.as_raw_fd(),
+            stat.st_dev,
+            stat.st_ino
         ))
         .args(args)
         .spawn()
@@ -256,7 +259,7 @@ fn launch(huge_pages: bool) -> Option<i32> {
 }
 
 /// This process as a worker (see `launch`): its `arg0` is `WORKER_ARG0`
-/// with a launcher and a pipe number, and its parent is that launcher. A
+/// with a launcher and its pipe, and its parent is that launcher. A
 /// worker whose launcher ends before the first call runs as a plain tsgo.
 /// The first call decides, at the start of `main`.
 #[cfg(target_os = "linux")]
@@ -271,11 +274,17 @@ fn worker() -> Option<Worker> {
         let mut fields = rest.split(' ');
         let launcher = rustix::process::Pid::from_raw(fields.next()?.parse().ok()?)?;
         let fd = fields.next()?.parse().ok()?;
+        let dev = fields.next()?.parse().ok()?;
         let ino = fields.next()?.parse().ok()?;
         if fields.next().is_some() {
             return None;
         }
-        (rustix::process::getppid() == Some(launcher)).then_some(Worker { fd, ino, launcher })
+        (rustix::process::getppid() == Some(launcher)).then_some(Worker {
+            fd,
+            dev,
+            ino,
+            launcher,
+        })
     })
 }
 
@@ -458,8 +467,9 @@ fn send_code(worker: Worker, code: i32) {
     // new file has a close-on-exec flag. When it cannot open, the launcher
     // takes the code from the worker's exit. In a PID namespace whose /proc
     // is not its own, the path names a file of another process: the code is
-    // written only to a FIFO with the inode that the launcher passed, and
-    // the open does not wait (`O_NONBLOCK`) for a reader of another FIFO.
+    // written only to a FIFO with the device and inode that the launcher
+    // passed, and the open does not wait (`O_NONBLOCK`) for a reader of
+    // another FIFO.
     let pipe = format!("/proc/{}/fd/{}", worker.launcher.as_raw_pid(), worker.fd);
     if let Ok(mut pipe) = std::fs::File::options()
         .write(true)
@@ -467,6 +477,7 @@ fn send_code(worker: Worker, code: i32) {
         .open(pipe)
         && rustix::fs::fstat(&pipe).is_ok_and(|stat| {
             rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Fifo
+                && stat.st_dev == worker.dev
                 && stat.st_ino == worker.ino
         })
     {

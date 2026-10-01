@@ -487,9 +487,6 @@ impl WatchManager {
     pub fn run_loop(&self, ctx: &Context, do_cycle: &mut dyn FnMut()) {
         const CTX_POLL_INTERVAL: Duration = Duration::from_millis(50);
         loop {
-            // PORT: the output that `CliStdout` keeps goes out while the
-            // loop waits (see `stdio::init`).
-            let _ = crate::execute::tsc::stdio::CliStdout.flush();
             if ctx.err().is_some() {
                 self.close_all_watches();
                 return;

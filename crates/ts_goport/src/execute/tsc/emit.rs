@@ -252,6 +252,8 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
     }
 
     let all_diagnostics = sort_and_deduplicate_diagnostics(all_diagnostics);
+    // PORT: one report (`stdio::keep_writes`).
+    let report = super::stdio::keep_writes();
     for diagnostic in &all_diagnostics {
         (input.report_diagnostic)(diagnostic);
     }
@@ -259,6 +261,7 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
     list_files(input, &emit_result);
 
     (input.report_error_summary)(&all_diagnostics);
+    drop(report);
     result.diagnostics = all_diagnostics;
     result.emit_result = emit_result;
     result.status = ExitStatus::Success;

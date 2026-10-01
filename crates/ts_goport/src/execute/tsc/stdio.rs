@@ -18,10 +18,12 @@
 //! ignores SIGPIPE, so a write here gets EPIPE and raises the signal as Go
 //! does. A write that writes 0 bytes gives `WriteZero` (Go
 //! `io.ErrUnexpectedEOF`). As in Go, none of these files has a buffer,
-//! except `CliStdout` on a regular file (see `init`). On Windows these are
-//! the std handles, as before.
+//! except `CliStdout` on a regular file inside a report (`keep_writes`). On
+//! Windows these are the std handles, as before.
 
+use std::cell::Cell;
 use std::io;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -43,13 +45,17 @@ pub struct Stdout;
 /// Go's `poll.FD.Write` holds the write lock of the file, so a line of
 /// another thread never lands inside it.
 ///
-/// PORT: when fd 1 is a regular file at start (`init`), the writes are
-/// kept and go out together: at 64 KiB, at `flush`, before a write to
-/// `Stderr`, at each turn of the watch loop and at exit
-/// (`flush_cli_stdout_at_exit`). Only the system calls change: a file has
-/// no reader that sees the pieces and cannot raise EPIPE. A write error
-/// comes at the flush. A run that ends in `core::go_fatal_newosproc` (the
-/// OS refuses a thread) loses the kept bytes.
+/// PORT: when fd 1 is a regular file at start (`init`), the writes of a
+/// thread inside a report (`keep_writes`) are kept. They go out together
+/// when the report ends, at 64 KiB, before a write outside a report or to
+/// `Stderr`, and in the panic hook and `throw`
+/// (`flush_cli_stdout_at_exit`). Each other write goes out at once, in
+/// Go's pieces, so a status line, a trace line or a `[watch]` line is in
+/// the file when Go's is. A report only formats and writes, so it ends in
+/// milliseconds. A process that dies inside one (SIGKILL, SIGHUP, an OOM
+/// kill, `core::go_fatal_newosproc`) loses the kept bytes, at most 64 KiB:
+/// Go's file has the pieces written so far. The reports ignore their write
+/// errors, as Go's do, so the error of a kept write changes nothing.
 pub struct CliStdout;
 
 /// Go `os.Stderr`.
@@ -60,18 +66,57 @@ pub struct Stderr;
 /// start, as Go makes `os.Stdout` before `main`; without the call the first
 /// write of `CliStdout` reads it.
 /// PORT: it also reads whether fd 1 is a regular file: then `CliStdout`
-/// keeps its writes (see there). Only a bin that calls `init` (tsgo) gets
-/// that, and it must flush at exit.
+/// keeps the writes of a report (see there). Only a bin that calls `init`
+/// (tsgo) gets that.
 pub fn init() {
     sys::init();
     COALESCE.store(sys::stdout_is_regular_file(), Ordering::Relaxed);
 }
 
-/// `CliStdout` keeps its writes (see `init`).
+/// fd 1 is a regular file: `CliStdout` keeps the writes of a report (see
+/// `init`).
 static COALESCE: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    /// The number of `KeepWrites` of this thread that are live.
+    static KEEPING: Cell<u32> = const { Cell::new(0) };
+}
+
+/// PORT: not in Go. One report: until the returned value drops, the writes
+/// of `CliStdout` from this thread to a regular file are kept and go out
+/// together (see `CliStdout`). The callers are reports that only format
+/// and write: the diagnostics of an emit with its file list (also
+/// `--explainFiles`) and error summary, the statistics table and the
+/// `--showConfig` value. Do not call it around work that can wait.
+#[must_use]
+pub fn keep_writes() -> KeepWrites {
+    KEEPING.with(|keeping| keeping.set(keeping.get() + 1));
+    KeepWrites(PhantomData)
+}
+
+/// A live report (`keep_writes`). It stays on its thread.
+pub struct KeepWrites(PhantomData<*const ()>);
+
+impl Drop for KeepWrites {
+    /// The last report of the thread writes the kept bytes.
+    fn drop(&mut self) {
+        let depth = KEEPING.with(|keeping| {
+            keeping.set(keeping.get() - 1);
+            keeping.get()
+        });
+        if depth == 0 && COALESCE.load(Ordering::Relaxed) {
+            let _ = write_kept(&mut cli_stdout_lock());
+        }
+    }
+}
+
+/// `CliStdout` keeps the writes of this thread (see `keep_writes`).
+fn keeping() -> bool {
+    COALESCE.load(Ordering::Relaxed) && KEEPING.with(Cell::get) > 0
+}
+
 /// The write lock of `CliStdout` (Go `poll.FD.writeLock`), with the bytes
-/// that it keeps when `COALESCE` is set.
+/// that it keeps (`keep_writes`).
 static CLI_STDOUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 /// The kept bytes of `CliStdout` go out at this size.
@@ -81,7 +126,7 @@ fn cli_stdout_lock() -> MutexGuard<'static, Vec<u8>> {
     CLI_STDOUT.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Writes the bytes that `CliStdout` keeps (see `init`).
+/// Writes the bytes that `CliStdout` keeps (see `keep_writes`).
 fn write_kept(kept: &mut Vec<u8>) -> io::Result<()> {
     if kept.is_empty() {
         return Ok(());
@@ -92,9 +137,9 @@ fn write_kept(kept: &mut Vec<u8>) -> io::Result<()> {
 }
 
 /// Writes the bytes that `CliStdout` keeps, before a write to stderr that
-/// does not go through `Stderr`: a thrown signal, which ends the run without
-/// its `flush`, and the panic hook. It does not wait for a writer that holds
-/// the lock: that writer can be the thread that the signal stops.
+/// does not go through `Stderr`: a thrown signal, which can end the run
+/// inside a report, and the panic hook. It does not wait for a writer that
+/// holds the lock: that writer can be the thread that the signal stops.
 pub fn flush_cli_stdout_at_exit() {
     if let Ok(mut kept) = CLI_STDOUT.try_lock() {
         let _ = write_kept(&mut kept);
@@ -135,23 +180,30 @@ impl io::Write for CliStdout {
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         let mut kept = cli_stdout_lock();
-        if !COALESCE.load(Ordering::Relaxed) {
-            return sys::write_cli_stdout(buf);
+        if keeping() {
+            kept.extend_from_slice(buf);
+            if kept.len() < COALESCE_LIMIT {
+                return Ok(());
+            }
+            return write_kept(&mut kept);
         }
-        kept.extend_from_slice(buf);
-        if kept.len() < COALESCE_LIMIT {
-            return Ok(());
-        }
-        write_kept(&mut kept)
+        // The bytes that a report of another thread keeps came first. Their
+        // error belongs to that report.
+        let _ = write_kept(&mut kept);
+        sys::write_cli_stdout(buf)
     }
 
+    /// It takes the lock only inside a report (`keep_writes`), where the
+    /// thread can have kept bytes.
     fn flush(&mut self) -> io::Result<()> {
-        write_kept(&mut cli_stdout_lock())?;
+        if keeping() {
+            write_kept(&mut cli_stdout_lock())?;
+        }
         sys::flush_cli_stdout()
     }
 }
 
-// PORT: each write first writes what `CliStdout` keeps (see `init`), so
+// PORT: each write first writes what `CliStdout` keeps (`keep_writes`), so
 // stdout and stderr keep their order in one file (`2>&1`).
 impl io::Write for Stderr {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
