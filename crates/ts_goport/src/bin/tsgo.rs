@@ -369,10 +369,10 @@ fn drop_go_signals() {
 /// The start of a process that runs the work, as the Go runtime and the Go
 /// `syscall` package start: the signals that Go drops get a handler that
 /// does nothing (`drop_go_signals`), a signal that Go throws (`GO_THROWN`)
-/// prints its name and exits 2 (`EXIT_GO_PANIC`, the exit code of a Go
-/// fatal error), and the soft open-file limit goes up to one below the hard
-/// limit (`gostd::rlimit::raise_open_file_limit`). The thread for the thrown
-/// signals waits on a pipe and allocates nothing until one comes.
+/// ends the process (`throw`), and the soft open-file limit goes up to one
+/// below the hard limit (`gostd::rlimit::raise_open_file_limit`). The thread
+/// for the thrown signals waits on a pipe and allocates nothing until one
+/// comes.
 /// PORT: other systems than Linux keep the default actions (Go's tables
 /// differ there).
 fn go_runtime_start() {
@@ -389,35 +389,63 @@ fn go_runtime_start() {
             .spawn(move || {
                 for signal in signals.forever() {
                     if let Some((_, name)) = GO_THROWN.iter().find(|(s, _)| s.as_raw() == signal) {
-                        eprintln!("{name}");
-                        exit(EXIT_GO_PANIC);
+                        throw(name);
                     }
                 }
             });
     }
 }
 
-/// Ends the process with `code`. A worker (see `launch`) first points its
-/// stdout and stderr at /dev/null, so a reader of the launcher's output
-/// gets its end of file, and sends the code.
+/// Ends the process after a signal that Go throws (`GO_THROWN`), as the Go
+/// runtime does: it writes `name` to fd 2 with a raw write, sends the code
+/// to the launcher in a worker (`send_code`) and exits 2 (`EXIT_GO_PANIC`,
+/// the exit code of a Go fatal error). An error of the write (a closed or
+/// broken stderr) is ignored, as in Go.
+/// It flushes nothing and takes no std lock, so it cannot wait for the work
+/// thread: that thread can hold the stdout or stderr lock in a write that
+/// blocks on a full pipe. Go flushes nothing either (`os.Stdout` has no
+/// buffer). So it ends with `_exit`: `std::process::exit` flushes the std
+/// stdout buffer when no other thread holds its lock, and waits when
+/// another thread is in its cleanup.
+#[cfg(target_os = "linux")]
+fn throw(name: &str) -> ! {
+    let line = format!("{name}\n");
+    let _ = rustix::io::write(rustix::stdio::stderr(), line.as_bytes());
+    if let Some(worker) = worker() {
+        send_code(worker, EXIT_GO_PANIC);
+    }
+    signal_hook::low_level::exit(EXIT_GO_PANIC)
+}
+
+/// Ends the process with `code` once the work has written its output. A
+/// worker (see `launch`) flushes stdout and sends the code (`send_code`).
 fn exit(code: i32) -> ! {
     #[cfg(target_os = "linux")]
     if let Some(worker) = worker() {
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
-        if let Ok(null) = std::fs::File::options().write(true).open("/dev/null") {
-            let _ = rustix::stdio::dup2_stdout(&null);
-            let _ = rustix::stdio::dup2_stderr(&null);
-        }
-        // The launcher's end of the pipe, opened for writing by its
-        // number. The new file has a close-on-exec flag. When it cannot
-        // open, the launcher takes the code from the worker's exit.
-        let pipe = format!("/proc/{}/fd/{}", worker.launcher.as_raw_pid(), worker.fd);
-        if let Ok(mut pipe) = std::fs::File::options().write(true).open(pipe) {
-            let _ = pipe.write_all(&code.to_le_bytes());
-        }
+        send_code(worker, code);
     }
     std::process::exit(code)
+}
+
+/// Sends `code` to the launcher of `worker` (see `launch`). First it points
+/// stdout and stderr at /dev/null, so a reader of the launcher's output gets
+/// its end of file when the launcher ends, while this process unmaps its
+/// memory. It takes no std lock (`throw`).
+#[cfg(target_os = "linux")]
+fn send_code(worker: Worker, code: i32) {
+    if let Ok(null) = std::fs::File::options().write(true).open("/dev/null") {
+        let _ = rustix::stdio::dup2_stdout(&null);
+        let _ = rustix::stdio::dup2_stderr(&null);
+    }
+    // The launcher's end of the pipe, opened for writing by its number. The
+    // new file has a close-on-exec flag. When it cannot open, the launcher
+    // takes the code from the worker's exit.
+    let pipe = format!("/proc/{}/fd/{}", worker.launcher.as_raw_pid(), worker.fd);
+    if let Ok(mut pipe) = std::fs::File::options().write(true).open(pipe) {
+        let _ = pipe.write_all(&code.to_le_bytes());
+    }
 }
 
 // Go: cmd/tsgo/main.go:18 runMain
