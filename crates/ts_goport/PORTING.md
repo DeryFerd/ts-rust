@@ -1070,8 +1070,9 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 - One dispatch thread (see "Threads"): the server answers requests in
   arrival order, where Go runs the async part of a request on a goroutine
   and answers in finish order. Timers and background tasks run at message
-  boundaries. For LSP requests the results are Go's; only order and
-  timing differ.
+  boundaries. Without an API session, the results of LSP requests are
+  Go's and only order and timing differ. With an API session, the limits
+  below also change which messages are answered and when.
 - API sessions of the LSP server (`custom/initializeAPISession`) are
   served on the dispatch thread too (`lsp/server.rs` `ApiConnProtocol`).
   LSP messages and API requests do not run at the same time. These
