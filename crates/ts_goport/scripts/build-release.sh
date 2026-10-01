@@ -152,11 +152,11 @@
 #                     edited file) runs in BOLT .cold code: 6.6% of an effect
 #                     edit (studies/lspeffect1).
 #   RELEASE_LSP_DIVISOR  the editor sessions weigh 1/N of their own run time
-#                     (default 4): PGO merges the CLI profile with weight N,
+#                     (default 8): PGO merges the CLI profile with weight N,
 #                     and BOLT samples the sessions at BOLT_PERF_FREQ / N. At
-#                     full weight (1) they were 36% of the PGO counts and 41%
-#                     of the tsgo BOLT samples, and zod check, zod check ST and
-#                     effect check lost 1.1 to 1.4% (pgolsp1).
+#                     8 they are about 6% of the PGO counts and 12% of the
+#                     tsgo BOLT samples. At 1 (36% and 41%) and at 4, zod and
+#                     effect check lost 1.1 to 2.2% (pgolsp1).
 #   BOLT_PERF_FREQ    perf sample frequency for BOLT (default 20000)
 #
 # Rules this script keeps:
@@ -221,7 +221,7 @@ glibc_floor="${RELEASE_GLIBC_FLOOR:-2.28}"
 bolt="${RELEASE_BOLT:-1}"
 corpus_step="${PGO_CORPUS_STEP:-60}"
 lsp_sessions="${RELEASE_LSP_SESSIONS-query-core:300 hono:200 effect:300}"
-lsp_div="${RELEASE_LSP_DIVISOR:-4}"
+lsp_div="${RELEASE_LSP_DIVISOR:-8}"
 [[ $lsp_div =~ ^[1-9][0-9]*$ ]] || { echo "error: RELEASE_LSP_DIVISOR is a positive integer, not $lsp_div" >&2; exit 1; }
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95.0}"
 # The training runs start no tsgo worker (bin/tsgo.rs `launch`): when the
