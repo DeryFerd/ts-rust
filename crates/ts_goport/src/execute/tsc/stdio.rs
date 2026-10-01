@@ -30,15 +30,15 @@ pub struct Stdin;
 /// `bufio.Writer` of their base protocol.
 pub struct Stdout;
 
-/// Go `os.Stdout` through std's line-buffered stdout: one write(2) per line,
-/// with the error handling of `Stdout`. The tsc system writer uses it.
+/// Go `os.Stdout` through std's line-buffered stdout, with the error
+/// handling of `Stdout`. The tsc system writer uses it.
 /// PORT: Go writes each `fmt.Fprint` at once, and a pretty diagnostic is
-/// many short pieces per line (37 writes per diagnostic in a Go run with
-/// 5,000 errors).
-/// Other port code (the trace output, the watch manager) writes whole lines
-/// to std's stdout, so both keep their order. The text at exit that has no
-/// newline yet goes out in std's flush at exit, which ignores errors; tsc
-/// output ends with a newline.
+/// many short pieces per line: in a run with 5,000 errors Go makes 37 writes
+/// per diagnostic, this 8 (R149 5, through `write_all`, whose error does not
+/// say how much it wrote). Other port code (the trace output, the watch
+/// manager) writes whole lines to std's stdout, so both keep their order.
+/// Text that has no newline yet at exit goes out in std's flush at exit,
+/// which ignores errors; tsc output ends with a newline.
 pub struct LineStdout;
 
 /// Go `os.Stderr`.
