@@ -2920,9 +2920,9 @@ impl LanguageService {
         };
 
         // PORT: `position` can cut a char (see `go_text_slice`). Go keeps
-        // the cut bytes at the end of `toComplete`. They are not quotes or
-        // separators, and the basename is not used, so the directory is the
-        // same as Go's.
+        // the cut bytes at the end of `text`. They are not white space,
+        // quotes or separators, and the basename of `toComplete` is not
+        // used, so the parse and the directory are Go's.
         let file_text = source_file_text(file);
         let text = go_text_slice(&file_text, found_range.pos(), position);
         let (prefix, kind, to_complete, ok) = parse_triple_slash_directive_fragment(&text);

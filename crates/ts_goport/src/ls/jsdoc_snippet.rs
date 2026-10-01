@@ -184,9 +184,9 @@ fn get_doc_comment_template_at_position(
         && !has_closing_doc_comment_at_position
     {
         let text = source_file_text(source_file);
-        // A doc comment at the position means that the line before it ends
-        // with "/**" and single-line white space, so `position` does not cut
-        // a char and the slices below are Go's byte slices.
+        // A doc comment at the position means that the line text before
+        // `position` ends with "/**" and single-line white space, so
+        // `position` does not cut a char and these slices are Go's.
         // The reparse is published for good (and its lazy JSDoc is cached
         // before that), so its nodes belong to the thread.
         let _base = crate::ast::enter_base_synthetic_owner();
