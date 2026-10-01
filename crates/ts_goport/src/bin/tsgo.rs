@@ -371,7 +371,7 @@ fn drop_go_signals() {
 /// does nothing (`drop_go_signals`), a signal that Go throws (`GO_THROWN`)
 /// ends the process (`throw`), the soft open-file limit goes up to one
 /// below the hard limit (`gostd::rlimit::raise_open_file_limit`), and fd 1
-/// is checked for O_NONBLOCK, as Go `os.NewFile` does at start
+/// is checked for `O_NONBLOCK`, as Go `os.NewFile` does at start
 /// (`stdio::init`). The thread for the thrown signals waits on a pipe until
 /// one comes.
 /// PORT: other systems than Linux keep the default actions (Go's tables
