@@ -313,7 +313,7 @@ fn forward_signals(worker: &std::process::Child) {
 
 /// Signals that the Go runtime catches and drops when no `signal.Notify`
 /// asks for them: `_SigNotify` alone or with `_SigUnblock` in
-/// runtime/sigtab_linux_generic.go (go1.27.1). The real-time signals 35 to
+/// `runtime/sigtab_linux_generic.go` (go1.27.1). The real-time signals 35 to
 /// 64 (`GO_DROPPED_RT`) are such signals too; Go leaves 32 to 34 to the C
 /// library. SIGPIPE is apart: Go has its own rule for stdout and stderr.
 #[cfg(target_os = "linux")]
@@ -337,9 +337,9 @@ const GO_DROPPED: [rustix::process::Signal; 9] = {
 const GO_DROPPED_RT: std::ops::RangeInclusive<i32> = 35..=64;
 
 /// Signals for which the Go runtime prints the name from its table and
-/// exits 2 (`_SigThrow` in runtime/sigtab_linux_generic.go), also when the
-/// signal was ignored at start: Go keeps an inherited SIG_IGN only for
-/// SIGHUP and SIGINT (runtime/signal_unix.go sigInstallGoHandler).
+/// exits 2 (`_SigThrow` in `runtime/sigtab_linux_generic.go`), also when the
+/// signal was ignored at start: Go keeps an inherited `SIG_IGN` only for
+/// SIGHUP and SIGINT (`runtime/signal_unix.go` `sigInstallGoHandler`).
 /// PORT: Go then prints the goroutines; the port prints only the name.
 /// PORT: SIGABRT and SIGTRAP keep their default actions: Rust's abort (a
 /// stack overflow too) raises SIGABRT, and debuggers use SIGTRAP.
@@ -354,7 +354,7 @@ const GO_THROWN: [(rustix::process::Signal, &str); 3] = {
 };
 
 /// Gives each signal that Go drops (`GO_DROPPED`, `GO_DROPPED_RT`) a handler
-/// that does nothing. Not SIG_IGN: an exec resets a caught signal to its
+/// that does nothing. Not `SIG_IGN`: an exec resets a caught signal to its
 /// default action, so a process that tsgo starts gets the default actions,
 /// as from Go.
 #[cfg(target_os = "linux")]
