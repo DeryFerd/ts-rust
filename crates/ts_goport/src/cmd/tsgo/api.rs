@@ -4,8 +4,10 @@ use crate::cmd::tsgo::prelude::*;
 
 use crate::cmd::tsgo::main::{ErrorHandling, must_getwd, new_flag_set, notify_context};
 use crate::contentmapper::{self, ProcessExitState};
+use crate::execute::tsc::stdio;
 use crate::frontend::bundled;
 use crate::gostd::context;
+use std::io::Write;
 use std::sync::Arc;
 
 // Go: cmd/tsgo/api.go:17 apiFlags (tsgo#4712)
@@ -107,7 +109,7 @@ pub fn run_api(args: &[String]) -> i32 {
     let mut options = crate::api::StdioServerOptions {
         in_: None,
         out: None,
-        err: Some(Box::new(std::io::stderr())),
+        err: Some(Box::new(stdio::Stderr)),
         cwd: flags.cwd,
         default_library_path,
         pipe_path: String::new(),
@@ -120,8 +122,9 @@ pub fn run_api(args: &[String]) -> i32 {
     if !flags.pipe_path.is_empty() {
         options.pipe_path = flags.pipe_path;
     } else {
-        options.in_ = Some(Box::new(std::io::stdin()));
-        options.out = Some(Box::new(std::io::stdout()));
+        // Go: os.Stdin and os.Stdout (see `execute::tsc::stdio`).
+        options.in_ = Some(Box::new(stdio::Stdin));
+        options.out = Some(Box::new(stdio::Stdout));
     }
 
     let mut s = crate::api::new_stdio_server(options);
@@ -133,7 +136,7 @@ pub fn run_api(args: &[String]) -> i32 {
     // Go: defer stop()
     stop();
     if let Err(err) = result {
-        eprintln!("{}", err.error());
+        let _ = writeln!(stdio::Stderr, "{}", err.error());
         return 1;
     }
     0

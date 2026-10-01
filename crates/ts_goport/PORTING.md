@@ -531,6 +531,43 @@ under a request), it runs `f` under `core::go_wait_group_goroutine`: a Go
 panic ends the process there, because Go's recover sees only its own
 goroutine.
 
+## Process start
+
+`tsgo` starts as the Go runtime and the Go `syscall` package start a Go
+process (bin/tsgo.rs `go_runtime_start`).
+
+- Signals (Linux, Go runtime/sigtab_linux_generic.go): the signals that Go
+  drops when nothing asks for them (USR1, USR2, ALRM, XCPU, XFSZ, VTALRM,
+  PROF, IO, PWR and the real-time signals 35 to 64) get a handler that
+  does nothing. It is not SIG_IGN, so a process that tsgo starts gets the
+  default actions, as from Go. SIGQUIT, SIGSTKFLT and SIGSYS print the Go
+  name (`SIGQUIT: quit`) and exit 2, also when they were ignored at start.
+  SIGINT and SIGTERM go to `notify_context`. PORT: Go then prints the
+  goroutines. SIGABRT and SIGTRAP keep their default actions. Other
+  systems keep the default actions.
+- The launcher (`launch`) drops the same signals and sends SIGINT, SIGTERM
+  and the thrown signals on to its worker. The worker gets no environment
+  variable and no file descriptor from the launcher, so its children get
+  none: its `arg0` names the launcher, and at exit it opens the launcher's
+  end of the pipe through /proc.
+- Open files (Go syscall/rlimit.go): the soft RLIMIT_NOFILE goes up to one
+  below the hard limit. The content mapper and npm starts
+  (execute/tsc/compile.rs, cmd/tsgo/lsp.rs) go through
+  `gostd::rlimit::spawn`, so the child gets the original limit, as from
+  Go. PORT: Go sets it in the child between fork and exec, which needs
+  `unsafe`; the port sets its own soft limit back for the length of the
+  start (Linux only; see there). The launcher does not raise its limit,
+  so its worker starts with the original limit, as a Go child does.
+- `GOMAXPROCS` (`gostd::runtime::gomaxprocs`): the variable, else the CPUs
+  of the affinity mask, lowered to the CPU limit of the process's cgroup
+  (rounded up, at least 2), as in Go 1.25 and later. It sizes the parse,
+  bind and emit pools (`program::available_cores`), the auto-import
+  checker pool and the search threads. PORT: the checker threads
+  (`--checkers`) all run at once; Go runs them on GOMAXPROCS threads. Go
+  reads the value again while it runs; the port reads it once.
+- `GOGC` and `GOMEMLIMIT` (the VS Code `goMemLimit` setting) do nothing:
+  the port has no garbage collector.
+
 ## Threads
 
 - `prog()` is the current program of the thread. A one-program process

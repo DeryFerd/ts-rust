@@ -1568,11 +1568,11 @@ pub(crate) fn note_program_load(root_tasks: usize) -> bool {
     large
 }
 
-/// The cores that this process may run on, read once: each read asks the
-/// kernel and the cgroup files, and a program load asks several times.
+/// The cores that this process may run on: Go `GOMAXPROCS`
+/// (`gostd::runtime::gomaxprocs`, read once), so the `GOMAXPROCS` variable
+/// and a cgroup CPU limit size the pools as they size Go's.
 pub fn available_cores() -> usize {
-    static CORES: OnceLock<usize> = OnceLock::new();
-    *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
+    crate::gostd::runtime::gomaxprocs()
 }
 
 /// From this many physical cores on (`wide_cores`), a large program load

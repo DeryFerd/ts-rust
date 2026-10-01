@@ -16,7 +16,6 @@
 use crate::execute::watchmanager::prelude::*;
 
 use std::io::Write;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -61,8 +60,6 @@ struct DirWatchUpdate {
 ///   - CloseAllWatches and handleWatchTerminated manage their own locking.
 pub struct WatchManager {
     pub backend: Option<Rc<dyn WatchBackend>>,
-    /// PORT: the receive side of Go `doCycleCh`.
-    pub do_cycle_ch: Receiver<()>,
 
     /// DebugLog receives verbose watch diagnostics when non-nil
     pub debug_log: Option<Writer>,
@@ -85,8 +82,8 @@ pub struct WatchManagerShared {
     /// Go `watchedDirs` (guarded by `mu` in Go; the `Mutex` is Rust's
     /// data lock, taken only for short reads and writes).
     pub watched_dirs: Mutex<FxHashMap<String, Arc<WatchedDir>>>,
-    /// PORT: the send side of Go `doCycleCh` (capacity 1).
-    pub do_cycle_ch: SyncSender<()>,
+    /// Go `doCycleCh` (see `DoCycleCh`).
+    pub do_cycle_ch: DoCycleCh,
 
     pub changed_mu: Mutex<WatchManagerChanged>,
 }
@@ -129,22 +126,75 @@ impl GoMutex {
     }
 }
 
+/// PORT: Go `doCycleCh`, a `chan struct{}` of capacity 1 that `RunLoop`
+/// receives from and `signalDoCycle` sends to without blocking. A Go send
+/// while the receiver waits hands the value to it and leaves the buffer
+/// empty, so a second send fits before the receiver runs. A std
+/// `sync_channel(1)` keeps the first value in its slot until the receiver
+/// thread runs, and then drops the second send.
+#[derive(Default)]
+pub struct DoCycleCh {
+    state: Mutex<DoCycleState>,
+    cond: Condvar,
+}
+
+#[derive(Default)]
+struct DoCycleState {
+    /// Values sent and not received yet: one handed to the waiting
+    /// receiver and one in the buffer at most.
+    pending: u8,
+    /// The receiver waits in `recv_timeout`.
+    waiting: bool,
+}
+
+impl DoCycleCh {
+    /// Go `select { case ch <- struct{}{}: default: }`. False when the
+    /// value does not fit.
+    pub fn try_send(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let capacity = if state.waiting { 2 } else { 1 };
+        if state.pending >= capacity {
+            return false;
+        }
+        state.pending += 1;
+        self.cond.notify_one();
+        true
+    }
+
+    /// Go `<-ch`, waiting at most `timeout`. True when a value came.
+    pub fn recv_timeout(&self, timeout: Duration) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.pending == 0 {
+            state.waiting = true;
+            state = self
+                .cond
+                .wait_timeout_while(state, timeout, |state| state.pending == 0)
+                .unwrap()
+                .0;
+            state.waiting = false;
+        }
+        if state.pending == 0 {
+            return false;
+        }
+        state.pending -= 1;
+        true
+    }
+}
+
 // Go: watchmanager.go:50 NewWatchManager
 pub fn new_watch_manager(
     warn_writer: Writer,
     dir_exists: Box<dyn Fn(&str) -> bool>,
 ) -> WatchManager {
-    let (do_cycle_tx, do_cycle_rx) = sync_channel::<()>(1);
     WatchManager {
         backend: None,
-        do_cycle_ch: do_cycle_rx,
         debug_log: None,
         warn_writer,
         dir_exists,
         shared: Arc::new(WatchManagerShared {
             mu: GoMutex::default(),
             watched_dirs: Mutex::new(FxHashMap::default()),
-            do_cycle_ch: do_cycle_tx,
+            do_cycle_ch: DoCycleCh::default(),
             changed_mu: Mutex::new(WatchManagerChanged::default()),
         }),
     }
@@ -186,8 +236,8 @@ impl WatchManager {
     }
 
     // Go: watchmanager.go:77 WatchManager.DoCycleCh
-    pub fn do_cycle_ch(&self) -> &Receiver<()> {
-        &self.do_cycle_ch
+    pub fn do_cycle_ch(&self) -> &DoCycleCh {
+        &self.shared.do_cycle_ch
     }
 
     // Go: watchmanager.go:79 WatchManager.DrainEvents
@@ -429,7 +479,11 @@ impl WatchManager {
     // Go: watchmanager.go:331 WatchManager.RunLoop
     // PORT: Go selects on `ctx.Done()` and `doCycleCh`. The port waits on
     // the channel with a timeout and checks `ctx.err()` (PORTING "Go
-    // runtime"). `doCycle` is the caller's DoCycle method value.
+    // runtime"). `doCycle` is the caller's DoCycle method value. After a
+    // signal, the cycle waits until the debouncer has delivered the fire
+    // that sent it (`fswatch::wait_for_fires`), as Go's does: otherwise it
+    // can drain a deleted directory's event before that fire's "watch
+    // terminated" overflow, and then build a second time.
     pub fn run_loop(&self, ctx: &Context, do_cycle: &mut dyn FnMut()) {
         const CTX_POLL_INTERVAL: Duration = Duration::from_millis(50);
         loop {
@@ -437,12 +491,9 @@ impl WatchManager {
                 self.close_all_watches();
                 return;
             }
-            match self.do_cycle_ch.recv_timeout(CTX_POLL_INTERVAL) {
-                Ok(()) => do_cycle(),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    // PORT: cannot happen; `shared` keeps the sender alive.
-                }
+            if self.shared.do_cycle_ch.recv_timeout(CTX_POLL_INTERVAL) {
+                fswatch::wait_for_fires();
+                do_cycle();
             }
         }
     }
@@ -451,14 +502,9 @@ impl WatchManager {
 impl WatchManagerShared {
     // Go: watchmanager.go:95 WatchManager.signalDoCycle
     pub fn signal_do_cycle(&self) {
-        match self.do_cycle_ch.try_send(()) {
-            Ok(()) => {
-                // Signal sent; the DoCycle loop will pick it up.
-            }
-            Err(_) => {
-                // A signal is already pending; coalesced.
-            }
-        }
+        // Signal sent; the DoCycle loop will pick it up. Or a signal is
+        // already pending; coalesced.
+        let _ = self.do_cycle_ch.try_send();
     }
 
     // Go: watchmanager.go:104 WatchManager.onWatchEvents
@@ -615,9 +661,40 @@ impl DirWatchSet {
 
 // PORT: Go `fmt.Fprintf(w, ...)` on the callback thread, where `w` is the
 // real system's `os.Stdout` (see the file comment). Errors are ignored as
-// in Go.
+// in Go. `text` is in the port form, so this writes its Go bytes.
 fn write_stdout(text: &str) {
     let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(text.as_bytes());
+    let _ = stdout.write_all(&crate::scanner_util::go_string_bytes(text));
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // PORT: not in Go. `DoCycleCh` keeps the Go channel rule: without a
+    // waiting receiver one value fits; a waiting receiver takes the first
+    // value, so a second one fits in the buffer.
+    #[test]
+    fn do_cycle_ch_hands_a_value_to_a_waiting_receiver() {
+        let ch = Arc::new(DoCycleCh::default());
+        assert!(ch.try_send());
+        assert!(!ch.try_send());
+        assert!(ch.recv_timeout(Duration::ZERO));
+        assert!(!ch.recv_timeout(Duration::ZERO));
+
+        let receiver = {
+            let ch = ch.clone();
+            std::thread::spawn(move || ch.recv_timeout(Duration::from_secs(60)))
+        };
+        while !ch.state.lock().unwrap().waiting {
+            std::thread::yield_now();
+        }
+        assert!(ch.try_send());
+        assert!(ch.try_send());
+        assert!(!ch.try_send());
+        assert!(receiver.join().unwrap());
+        assert!(ch.recv_timeout(Duration::ZERO));
+        assert!(!ch.recv_timeout(Duration::ZERO));
+    }
 }
