@@ -15,7 +15,11 @@
 //! PORT: the reads in `Call` are Go's `Run` reads. When one fails, the read
 //! loop ends there, as Go's `Run` would: `closePendingCalls` sets
 //! `terminal` (tsgo#4712), the call returns it, and a later `run` returns
-//! what Go's `Run` returned.
+//! what Go's `Run` returned. A panic in one of these reads is a panic in
+//! Go's `Run`, which the handler that made the call does not recover: the
+//! deferred function of `Run` closes the pending calls, the call returns
+//! `terminal`, and the panic leaves `run` once that handler returns (Go's
+//! deferred function waits for the handlers).
 
 use crate::ipc::prelude::*;
 
@@ -26,8 +30,9 @@ use crate::ipc::protocol::{Message, Protocol};
 use crate::ipc::protocol_jsonrpc::new_jsonrpc_protocol;
 use crate::ipc::transport::ReadWriteCloser;
 use crate::jsonrpc;
+use std::any::Any;
 use std::cell::Cell;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -63,6 +68,11 @@ pub struct AsyncConn {
     // PORT: how the read loop ended when a read in `call` ended it: the
     // value Go's `Run` returned. `run` returns it and reads no more.
     read_loop_end: RefCell<Option<Result<(), GoError>>>,
+    // PORT: the payload of a panic in a read in `call`, where Go's `Run`
+    // panicked. `run` resumes the panic.
+    read_panic: RefCell<Option<Box<dyn Any + Send>>>,
+    // PORT: true once `run` reads. A `call` then runs in a handler of `run`.
+    running: Cell<bool>,
 }
 
 // Go: ipc/conn_async.go:39 NewAsyncConn
@@ -91,6 +101,8 @@ pub fn new_async_conn_with_protocol(
         has_cause: Cell::new(false),
         request_errors: RefCell::new(None),
         read_loop_end: RefCell::new(None),
+        read_panic: RefCell::new(None),
+        running: Cell::new(false),
     })
 }
 
@@ -141,7 +153,13 @@ impl AsyncConn {
     /// The loop of Go `Run`, without its deferred function. Requests and
     /// notifications get `handler_ctx` (Go `handlerCtx`).
     fn run_loop(&self, ctx: &Context, handler_ctx: &Context) -> Result<(), GoError> {
+        self.running.set(true);
         loop {
+            // PORT: a read in `call` panicked. Go's `Run` panicked at that
+            // read, before it checked `ctx` again.
+            if let Some(payload) = self.read_panic.take() {
+                resume_unwind(payload);
+            }
             if let Some(err) = ctx.err() {
                 return Err(err);
             }
@@ -394,9 +412,10 @@ impl AsyncConn {
             .borrow_mut()
             .insert(id.clone(), response_chan.clone());
 
-        // Go: defer that drops the pending entry on every return.
-        let remove_pending = || {
-            self.pending.borrow_mut().remove(&id);
+        // Go: ipc/conn_async.go:271 defer func() { ... delete(c.pending, *id) }()
+        let _deferred = CallDefer {
+            conn: self,
+            id: &id,
         };
 
         // Send the request
@@ -406,7 +425,6 @@ impl AsyncConn {
             .write_request(Some(&id), method, params);
 
         if let Err(err) = err {
-            remove_pending();
             return Err(err);
         }
 
@@ -418,13 +436,11 @@ impl AsyncConn {
         // `Call` does when `closePendingCalls` closes its channel.
         loop {
             if let Some(err) = ctx.err() {
-                remove_pending();
                 return Err(err);
             }
 
             let resp = response_chan.borrow_mut().take();
             if let Some(resp) = resp {
-                remove_pending();
                 if let Some(error) = &resp.error {
                     return Err(errors::new(format!(
                         "ipc: remote error [{}]: {}",
@@ -434,14 +450,30 @@ impl AsyncConn {
                 return Ok(resp.result);
             }
 
-            let read = self.protocol.borrow_mut().read_message();
+            // PORT: a panic in this read is a panic in Go's `Run` (file
+            // header), so it does not unwind through the handler that made
+            // the call.
+            let read = catch_unwind(AssertUnwindSafe(|| {
+                self.protocol.borrow_mut().read_message()
+            }));
             let msg = match read {
-                Ok(msg) => msg,
-                Err(err) => {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(err)) => {
                     let end = read_loop_result(err);
                     self.close_pending_calls(end.as_ref().err());
                     *self.read_loop_end.borrow_mut() = Some(end);
-                    remove_pending();
+                    let terminal = self.terminal.borrow().clone();
+                    return Err(terminal.expect("closePendingCalls sets terminal"));
+                }
+                Err(payload) => {
+                    // Go: the deferred function of `Run` closes the pending
+                    // calls while the panic unwinds; its `err` is nil.
+                    self.close_pending_calls(None);
+                    if !self.running.get() {
+                        // No `run` can resume the panic, so it leaves here.
+                        resume_unwind(payload);
+                    }
+                    *self.read_panic.borrow_mut() = Some(payload);
                     let terminal = self.terminal.borrow().clone();
                     return Err(terminal.expect("closePendingCalls sets terminal"));
                 }
@@ -499,6 +531,20 @@ fn read_loop_result(err: GoError) -> Result<(), GoError> {
         return Ok(());
     }
     Err(err)
+}
+
+/// The deferred function of Go `Call`: close and delete the call's pending
+/// entry. Its `Drop` runs on every return and when the call panics (Go
+/// runs a deferred function while a panic unwinds).
+struct CallDefer<'a> {
+    conn: &'a AsyncConn,
+    id: &'a jsonrpc::ID,
+}
+
+impl Drop for CallDefer<'_> {
+    fn drop(&mut self) {
+        self.conn.pending.borrow_mut().remove(self.id);
+    }
 }
 
 impl Conn for AsyncConn {
@@ -1246,5 +1292,176 @@ pub(crate) mod tests {
             assert!(err.contains("ipc: failed to write response"), "{err}");
         }
         runner.join().expect("run thread");
+    }
+
+    /// A `QueuedProtocol` whose read panics when its queue is empty and
+    /// whose `write_request` panics when `write_request_panics` is set. It
+    /// keeps the message of each error response it writes.
+    struct PanickingProtocol {
+        queued: QueuedProtocol,
+        write_request_panics: bool,
+        error_messages: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Protocol for PanickingProtocol {
+        fn read_message(&mut self) -> Result<Message, GoError> {
+            if self.queued.messages.is_empty() {
+                panic!("read panicked");
+            }
+            self.queued.read_message()
+        }
+
+        fn write_request(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            if self.write_request_panics {
+                panic!("write request panicked");
+            }
+            self.queued.write_request(id, method, params)
+        }
+
+        fn write_notification(
+            &mut self,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.queued.write_notification(method, params)
+        }
+
+        fn write_response(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            result: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.queued.write_response(id, result)
+        }
+
+        fn write_error(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            err: &jsonrpc::ResponseError,
+        ) -> Result<(), GoError> {
+            self.error_messages.borrow_mut().push(err.message.clone());
+            self.queued.write_error(id, err)
+        }
+    }
+
+    fn panicking_conn(
+        messages: Vec<Message>,
+        write_request_panics: bool,
+        handler: Rc<dyn Handler>,
+    ) -> (Rc<AsyncConn>, Rc<RefCell<Vec<String>>>) {
+        let error_messages = Rc::new(RefCell::new(Vec::new()));
+        let protocol = PanickingProtocol {
+            queued: QueuedProtocol {
+                messages,
+                response_err: None,
+            },
+            write_request_panics,
+            error_messages: error_messages.clone(),
+        };
+        let conn =
+            new_async_conn_with_protocol(Arc::new(NilTransport), Box::new(protocol), handler);
+        (conn, error_messages)
+    }
+
+    // PORT: no Go test. Go's deferred function in `Call` deletes the pending
+    // entry also when `WriteRequest` panics. The read loop does not end.
+    #[test]
+    fn test_async_conn_call_deletes_pending_entry_when_write_request_panics() {
+        let (conn, _) = panicking_conn(Vec::new(), true, Rc::new(NoOpHandler));
+        let ctx = context::background();
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| conn.call(&ctx, "callback", None)));
+        assert!(outcome.is_err(), "call did not panic");
+        assert!(conn.pending.borrow().is_empty(), "the pending entry stays");
+        assert!(conn.notify(&ctx, "after", None).is_ok());
+    }
+
+    /// Makes a call while it handles a request, and keeps the call's error.
+    struct CallingHandler {
+        conn: std::cell::OnceCell<std::rc::Weak<AsyncConn>>,
+        call_err: RefCell<Option<GoError>>,
+    }
+
+    impl Handler for CallingHandler {
+        fn handle_request(
+            &self,
+            ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+            let conn = self.conn.get().and_then(std::rc::Weak::upgrade);
+            let conn = conn.expect("the connection is set");
+            let err = conn
+                .call(ctx, "callback", None)
+                .expect_err("the call fails");
+            *self.call_err.borrow_mut() = Some(err.clone());
+            Err(err)
+        }
+
+        fn handle_notification(
+            &self,
+            _ctx: &Context,
+            _method: &str,
+            _params: JsonValue,
+        ) -> Result<(), GoError> {
+            Ok(())
+        }
+    }
+
+    // PORT: no Go test. A read in `call` is a read of Go's `Run`. When it
+    // panics, Go's deferred function in `Run` closes the pending call, the
+    // call returns ErrConnClosed, the handler's response is written, and
+    // then the panic leaves `Run`.
+    #[test]
+    fn test_async_conn_call_read_panic_leaves_run() {
+        let handler = Rc::new(CallingHandler {
+            conn: std::cell::OnceCell::new(),
+            call_err: RefCell::new(None),
+        });
+        let (conn, error_messages) = panicking_conn(
+            vec![message(Some(jsonrpc::new_id_string("1")), "request")],
+            false,
+            handler.clone(),
+        );
+        let _ = handler.conn.set(Rc::downgrade(&conn));
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| conn.run(&context::background())));
+        let payload = outcome.expect_err("run did not panic");
+        assert_eq!(recovered_value(payload.as_ref()), "read panicked");
+        let call_err = handler.call_err.borrow().clone().expect("the handler ran");
+        assert!(
+            errors::is(&call_err, &ERR_CONN_CLOSED),
+            "expected ErrConnClosed, got {}",
+            call_err.error()
+        );
+        assert!(conn.pending.borrow().is_empty(), "the pending entry stays");
+        assert_eq!(*error_messages.borrow(), vec![call_err.error()]);
+    }
+
+    // PORT: no Go test. With no `run`, the panic of a read in `call` leaves
+    // the call after Go's deferred function in `Run` closed the pending
+    // calls.
+    #[test]
+    fn test_async_conn_call_read_panic_without_run() {
+        let (conn, _) = panicking_conn(Vec::new(), false, Rc::new(NoOpHandler));
+        let ctx = context::background();
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| conn.call(&ctx, "callback", None)));
+        let payload = outcome.expect_err("call did not panic");
+        assert_eq!(recovered_value(payload.as_ref()), "read panicked");
+        assert!(conn.pending.borrow().is_empty(), "the pending entry stays");
+        let err = conn
+            .notify(&ctx, "after", None)
+            .expect_err("the read loop ended");
+        assert!(
+            errors::is(&err, &ERR_CONN_CLOSED),
+            "expected ErrConnClosed, got {}",
+            err.error()
+        );
     }
 }
