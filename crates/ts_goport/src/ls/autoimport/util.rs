@@ -306,8 +306,8 @@ pub fn create_checker_pool(
     Box<dyn Fn()>,
     Box<dyn Fn() -> i32>,
 ) {
-    // PORT: Go `runtime.GOMAXPROCS(0)`.
-    let max_size = std::thread::available_parallelism().map_or(1, |n| n.get()) as i32;
+    // Go: runtime.GOMAXPROCS(0)
+    let max_size = crate::gostd::runtime::gomaxprocs() as i32;
     let pool: Rc<RefCell<VecDeque<Rc<RefCell<Checker>>>>> =
         Rc::new(RefCell::new(VecDeque::with_capacity(max_size as usize)));
     let closed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
