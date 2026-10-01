@@ -2,7 +2,7 @@
 //! `File.Write`, os/file_unix.go `NewFile` and `epipecheck`,
 //! internal/poll/fd_unix.go `FD.Read` and `FD.Write`.
 //!
-//! Go does not buffer these files. Each read or write:
+//! Each read or write of these files:
 //! - tries again after EINTR (internal/poll `ignoringEINTRIO`);
 //! - waits in the poller on EAGAIN, so a non-blocking fd (a Node or libuv
 //!   parent can set O_NONBLOCK on a shared pipe or tty) loses no output and
@@ -16,8 +16,9 @@
 //! also when a parent sets O_NONBLOCK later; Go then returns the EAGAIN
 //! error, which `fmt.Fprint` ignores. Rust ignores SIGPIPE, so a write here
 //! gets EPIPE and raises the signal as Go does. A write that writes 0 bytes
-//! gives `WriteZero` (Go `io.ErrUnexpectedEOF`). On Windows these are the
-//! std handles, as before.
+//! gives `WriteZero` (Go `io.ErrUnexpectedEOF`). Go does not buffer these
+//! files; `LineStdout` keeps std's line buffer (see there). On Windows these
+//! are the std handles, as before.
 
 use std::io;
 
@@ -25,8 +26,20 @@ use std::io;
 /// `bufio.Reader`.
 pub struct Stdin;
 
-/// Go `os.Stdout`.
+/// Go `os.Stdout`, not buffered. The LSP and API servers use it under the
+/// `bufio.Writer` of their base protocol.
 pub struct Stdout;
+
+/// Go `os.Stdout` through std's line-buffered stdout: one write(2) per line,
+/// with the error handling of `Stdout`. The tsc system writer uses it.
+/// PORT: Go writes each `fmt.Fprint` at once, and a pretty diagnostic is
+/// many short pieces per line (37 writes per diagnostic in a Go run with
+/// 5,000 errors).
+/// Other port code (the trace output, the watch manager) writes whole lines
+/// to std's stdout, so both keep their order. The text at exit that has no
+/// newline yet goes out in std's flush at exit, which ignores errors; tsc
+/// output ends with a newline.
+pub struct LineStdout;
 
 /// Go `os.Stderr`.
 pub struct Stderr;
@@ -57,6 +70,21 @@ impl io::Write for Stdout {
     }
 }
 
+impl io::Write for LineStdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        sys::write_line_stdout(buf)?;
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        sys::write_line_stdout(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        sys::flush_line_stdout()
+    }
+}
+
 impl io::Write for Stderr {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         sys::write_stderr(buf)?;
@@ -82,7 +110,7 @@ mod sys {
     use rustix::event::{PollFd, PollFlags, poll};
     use rustix::fd::BorrowedFd;
     use rustix::io::Errno;
-    use std::io;
+    use std::io::{self, Write};
 
     pub fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
         // Go: internal/poll/fd_unix.go FD.Read
@@ -105,26 +133,54 @@ mod sys {
         write(rustix::stdio::stderr(), buf)
     }
 
-    /// Nothing is buffered here. Other port code still writes whole lines
-    /// through std's line-buffered stdout, so a flush flushes that too.
     pub fn flush_stdout() -> io::Result<()> {
-        io::Write::flush(&mut io::stdout())
+        Ok(())
     }
 
-    // Go: internal/poll/fd_unix.go FD.Write, then os/file_unix.go
-    // epipecheck for fds 1 and 2.
+    // Go: internal/poll/fd_unix.go FD.Write
     fn write(fd: BorrowedFd<'static>, mut buf: &[u8]) -> io::Result<()> {
         while !buf.is_empty() {
             match rustix::io::write(fd, buf) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => buf = &buf[n..],
-                Err(Errno::INTR) => {}
-                Err(Errno::AGAIN) => wait(fd, PollFlags::OUT)?,
-                Err(Errno::PIPE) => sigpipe(),
-                Err(err) => return Err(err.into()),
+                Err(err) => after_write_error(fd, err.into())?,
             }
         }
         Ok(())
+    }
+
+    // A failed `write` of std's line writer consumed nothing of `buf`, and
+    // a failed flush keeps the bytes it did not write, so both try again.
+    pub fn write_line_stdout(mut buf: &[u8]) -> io::Result<()> {
+        let mut out = io::stdout().lock();
+        while !buf.is_empty() {
+            match out.write(buf) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => buf = &buf[n..],
+                Err(err) => after_write_error(rustix::stdio::stdout(), err)?,
+            }
+        }
+        Ok(())
+    }
+
+    pub fn flush_line_stdout() -> io::Result<()> {
+        let mut out = io::stdout().lock();
+        while let Err(err) = out.flush() {
+            after_write_error(rustix::stdio::stdout(), err)?;
+        }
+        Ok(())
+    }
+
+    /// Ok when the write to `fd` should be tried again (EINTR, or EAGAIN
+    /// once `fd` is writable), else `err`. EPIPE (fd 1 or 2 only) ends the
+    /// process: os/file_unix.go epipecheck.
+    fn after_write_error(fd: BorrowedFd<'static>, err: io::Error) -> io::Result<()> {
+        match Errno::from_io_error(&err) {
+            Some(Errno::INTR) => Ok(()),
+            Some(Errno::AGAIN) => wait(fd, PollFlags::OUT),
+            Some(Errno::PIPE) => sigpipe(),
+            _ => Err(err),
+        }
     }
 
     /// Go: the poller's `waitRead` and `waitWrite`. The caller tries the
@@ -160,11 +216,19 @@ mod sys {
         io::stdout().write_all(buf)
     }
 
-    pub fn write_stderr(buf: &[u8]) -> io::Result<()> {
-        io::stderr().write_all(buf)
-    }
-
     pub fn flush_stdout() -> io::Result<()> {
         io::stdout().flush()
+    }
+
+    pub fn write_line_stdout(buf: &[u8]) -> io::Result<()> {
+        io::stdout().write_all(buf)
+    }
+
+    pub fn flush_line_stdout() -> io::Result<()> {
+        io::stdout().flush()
+    }
+
+    pub fn write_stderr(buf: &[u8]) -> io::Result<()> {
+        io::stderr().write_all(buf)
     }
 }

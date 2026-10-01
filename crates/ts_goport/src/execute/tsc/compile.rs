@@ -51,20 +51,20 @@ pub fn write_go_output(out: &mut dyn std::io::Write, bytes: &[u8]) -> std::io::R
 }
 
 /// Go `os.Stdout` as the system writer: it writes the Go bytes of each port
-/// form write (see `write_go_output`) through `stdio::Stdout`, which does
-/// not buffer, waits on a non-blocking pipe and ends the process by SIGPIPE
-/// when the reader is gone, as Go does. `write_str` writes whole strings, so
-/// a write never splits a unit.
+/// form write (see `write_go_output`) through `stdio::LineStdout`, which
+/// waits on a non-blocking pipe and ends the process by SIGPIPE when the
+/// reader is gone, as Go does. `write_str` writes whole strings, so a write
+/// never splits a unit.
 pub struct GoOutput;
 
 impl std::io::Write for GoOutput {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        write_go_output(&mut stdio::Stdout, buf)?;
+        write_go_output(&mut stdio::LineStdout, buf)?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        stdio::Stdout.flush()
+        stdio::LineStdout.flush()
     }
 }
 
