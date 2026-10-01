@@ -9,7 +9,9 @@
 //! became ready: a job when it is queued, a timer when it is due.
 //!
 //! Contract with the dispatch loop: the server calls `set_waker(f)` once. A
-//! timer thread calls the waker when a `LocalTimer` becomes due. The
+//! timer thread calls the waker when a `LocalTimer` becomes due. Each
+//! thread that arms a `LocalTimer` gets one timer thread for all its timers,
+//! made at its first arm. It ends when that thread ends. The
 //! dispatch loop calls `run_pending()` after each message and after each
 //! wake-up. Go `WaitForBackgroundTasks` (`background::Queue::wait`) calls
 //! `run_pending()`, and `wait_pending()` while a queued task sleeps on a
@@ -36,7 +38,7 @@ use crate::prelude::*;
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -48,13 +50,75 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The waker the dispatch loop installs with `set_waker`.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
-/// The part of a thread's queue that timer threads can reach.
+/// The part of a thread's queue that its timer thread can reach.
 struct LocalShared {
     /// Ready work in the order it became ready.
     queue: Mutex<VecDeque<Entry>>,
-    /// Signalled when a timer thread adds to `queue` (for `wait_pending`).
+    /// Signalled when the timer thread adds to `queue` (for `wait_pending`).
     ready: Condvar,
     waker: Mutex<Option<Waker>>,
+    /// The timers of the thread. A thread that holds this lock can take
+    /// `queue`, not the other way round.
+    timers: Mutex<Timers>,
+    /// Signalled when a timer becomes the first due, and when the thread
+    /// ends (`Timers::closed`).
+    timers_changed: Condvar,
+}
+
+/// The `LocalTimer`s of one thread, for its timer thread
+/// (`run_local_timers`).
+// PERF (perfplan4 R6): one timer thread per thread, not one per timer. The
+// language server stops and makes two timers on each edit
+// (`schedule_idle_cache_clean`, `schedule_cleanup_locked`), which started
+// two threads per edit. Go `time.AfterFunc` starts no thread.
+#[derive(Default)]
+struct Timers {
+    /// Go `t.when` of each armed timer, by id.
+    when: FxHashMap<u64, Instant>,
+    /// The armed timers by `when`, then id.
+    due: BTreeSet<(Instant, u64)>,
+    /// Due entries of each timer in the queue that have not run yet.
+    queued: FxHashMap<u64, u32>,
+    /// Whether the timer thread runs.
+    thread_running: bool,
+    /// Set when the thread ends: its timer thread then ends too.
+    closed: bool,
+}
+
+impl Timers {
+    /// Arms timer `id` for `when`. Returns whether it was armed before.
+    fn arm(&mut self, id: u64, when: Instant) -> bool {
+        let old = self.when.insert(id, when);
+        if let Some(old) = old {
+            self.due.remove(&(old, id));
+        }
+        self.due.insert((when, id));
+        old.is_some()
+    }
+
+    /// Disarms timer `id`. Returns whether it was armed.
+    fn disarm(&mut self, id: u64) -> bool {
+        let old = self.when.remove(&id);
+        if let Some(old) = old {
+            self.due.remove(&(old, id));
+        }
+        old.is_some()
+    }
+
+    /// Whether timer `id` is neither armed nor queued.
+    fn idle(&self, id: u64) -> bool {
+        !self.when.contains_key(&id) && !self.queued.contains_key(&id)
+    }
+
+    /// Counts one run of a due entry of timer `id`.
+    fn unqueue(&mut self, id: u64) {
+        if let Some(count) = self.queued.get_mut(&id) {
+            *count -= 1;
+            if *count == 0 {
+                self.queued.remove(&id);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -78,12 +142,22 @@ struct LocalState {
     garbage: RefCell<Option<VecDeque<Box<dyn Any>>>>,
 }
 
+impl Drop for LocalState {
+    // The timer thread of this thread ends with it.
+    fn drop(&mut self) {
+        lock(&self.shared.timers).closed = true;
+        self.shared.timers_changed.notify_all();
+    }
+}
+
 thread_local! {
     static LOCAL: LocalState = LocalState {
         shared: Arc::new(LocalShared {
             queue: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
             waker: Mutex::new(None),
+            timers: Mutex::new(Timers::default()),
+            timers_changed: Condvar::new(),
         }),
         next_id: Cell::new(1),
         jobs: RefCell::new(FxHashMap::default()),
@@ -207,17 +281,12 @@ pub fn wait_pending() -> bool {
         if has_pending() {
             return true;
         }
-        // A timer state lock is not taken under the queue lock: the timer
+        // The timers lock is not taken under the queue lock: the timer
         // thread takes them in the other order.
-        let armed = LOCAL.with(|l| {
-            l.timers
-                .borrow()
-                .values()
-                .any(|t| lock(&t.core.state).when.is_some())
-        });
+        let armed = !lock(&shared.timers).when.is_empty();
         if !armed {
             // A timer that fired after the first check cleared `when` and
-            // queued its entry under one hold of its state lock, so the
+            // queued its entry under one hold of the timers lock, so the
             // entry is there now.
             return has_pending();
         }
@@ -247,14 +316,11 @@ pub fn run_pending() {
                 }
             }
             Entry::Timer(id) => {
+                lock(&shared.timers).unqueue(id);
                 let timer = LOCAL.with(|l| l.timers.borrow().get(&id).cloned());
                 let Some(timer) = timer else {
                     continue;
                 };
-                {
-                    let mut state = lock(&timer.core.state);
-                    state.queued -= 1;
-                }
                 // Go: the goroutine that the timer started runs f.
                 {
                     let mut f = timer.f.borrow_mut();
@@ -275,24 +341,8 @@ pub struct LocalTimer {
 struct LocalTimerInner {
     id: u64,
     f: RefCell<Box<dyn FnMut()>>,
-    core: Arc<LocalTimerCore>,
-}
-
-/// The `Send` part of a `LocalTimer`, shared with its waiting thread.
-struct LocalTimerCore {
-    id: u64,
-    state: Mutex<LocalTimerState>,
-    cond: Condvar,
+    /// The queues of the thread that made the timer.
     shared: Arc<LocalShared>,
-}
-
-struct LocalTimerState {
-    /// Go `t.when`; `None` is not armed.
-    when: Option<Instant>,
-    /// Whether a thread is waiting for `when`.
-    thread_running: bool,
-    /// Due entries of this timer in the queue that have not run yet.
-    queued: u32,
 }
 
 /// Go `time.AfterFunc(d, f)` when `f` touches dispatch-thread state. After
@@ -307,16 +357,7 @@ pub fn after_func(d: Duration, f: Box<dyn FnMut()>) -> LocalTimer {
     let inner = Rc::new(LocalTimerInner {
         id,
         f: RefCell::new(f),
-        core: Arc::new(LocalTimerCore {
-            id,
-            state: Mutex::new(LocalTimerState {
-                when: None,
-                thread_running: false,
-                queued: 0,
-            }),
-            cond: Condvar::new(),
-            shared,
-        }),
+        shared,
     });
     inner.arm(when(d));
     LOCAL.with(|l| {
@@ -330,13 +371,9 @@ impl LocalTimer {
     /// timer, false if the timer has already expired (its function is queued
     /// or has run) or been stopped. Stop does not remove a queued run.
     pub fn stop(&self) -> bool {
-        let pending = {
-            let mut state = lock(&self.inner.core.state);
-            let pending = state.when.is_some();
-            state.when = None;
-            self.inner.core.cond.notify_all();
-            pending
-        };
+        // The timer thread is not woken: at the old `when` it finds this
+        // timer gone and waits for the next one.
+        let pending = lock(&self.inner.shared.timers).disarm(self.inner.id);
         self.inner.forget_if_idle();
         pending
     }
@@ -361,27 +398,27 @@ impl std::fmt::Debug for LocalTimer {
         write!(
             f,
             "LocalTimer(when: {:?})",
-            lock(&self.inner.core.state).when
+            lock(&self.inner.shared.timers).when.get(&self.inner.id)
         )
     }
 }
 
 impl LocalTimerInner {
-    /// Sets `when` and makes sure a thread waits for it. Returns whether the
-    /// timer was armed before.
+    /// Sets `when` and makes sure the timer thread waits for it: starts the
+    /// thread at the first arm, or wakes it when this timer is now the first
+    /// due. Returns whether the timer was armed before.
     fn arm(&self, when: Instant) -> bool {
-        let mut state = lock(&self.core.state);
-        let pending = state.when.is_some();
-        state.when = Some(when);
-        if state.thread_running {
-            self.core.cond.notify_all();
-        } else {
-            state.thread_running = true;
-            let core = self.core.clone();
+        let mut timers = lock(&self.shared.timers);
+        let pending = timers.arm(self.id, when);
+        if !timers.thread_running {
+            timers.thread_running = true;
+            let shared = self.shared.clone();
             std::thread::Builder::new()
                 .name("local-timer".to_string())
-                .spawn(move || run_local_timer(core))
+                .spawn(move || run_local_timers(shared))
                 .expect("local: failed to start the timer thread");
+        } else if timers.due.first() == Some(&(when, self.id)) {
+            self.shared.timers_changed.notify_all();
         }
         pending
     }
@@ -389,10 +426,7 @@ impl LocalTimerInner {
     /// Drops this thread's reference when the timer is neither armed nor
     /// queued, so an unreferenced timer is freed.
     fn forget_if_idle(&self) {
-        let idle = {
-            let state = lock(&self.core.state);
-            state.when.is_none() && state.queued == 0
-        };
+        let idle = lock(&self.shared.timers).idle(self.id);
         if idle {
             LOCAL.with(|l| {
                 l.timers.borrow_mut().remove(&self.id);
@@ -401,35 +435,42 @@ impl LocalTimerInner {
     }
 }
 
-/// The waiting thread of one `LocalTimer`: when the timer is due it queues
-/// the timer on its thread and calls the waker, then exits unless the timer
-/// was armed again.
-fn run_local_timer(core: Arc<LocalTimerCore>) {
-    let mut state = lock(&core.state);
+/// The timer thread of one thread (`shared`): when the first armed timer
+/// is due, it queues the timer on that thread and calls the waker. It waits
+/// while no timer is armed, and ends when that thread ends.
+fn run_local_timers(shared: Arc<LocalShared>) {
+    let mut timers = lock(&shared.timers);
     loop {
-        let Some(w) = state.when else {
-            state.thread_running = false;
+        if timers.closed {
+            timers.thread_running = false;
             return;
+        }
+        let Some(&(w, id)) = timers.due.first() else {
+            timers = shared
+                .timers_changed
+                .wait(timers)
+                .unwrap_or_else(|e| e.into_inner());
+            continue;
         };
         let now = Instant::now();
         if now < w {
-            state = core
-                .cond
-                .wait_timeout(state, w - now)
+            timers = shared
+                .timers_changed
+                .wait_timeout(timers, w - now)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
             continue;
         }
-        state.when = None;
-        state.queued += 1;
-        lock(&core.shared.queue).push_back(Entry::Timer(core.id));
-        core.shared.ready.notify_all();
-        drop(state);
-        let waker = lock(&core.shared.waker).clone();
+        timers.disarm(id);
+        *timers.queued.entry(id).or_default() += 1;
+        lock(&shared.queue).push_back(Entry::Timer(id));
+        shared.ready.notify_all();
+        drop(timers);
+        let waker = lock(&shared.waker).clone();
         if let Some(waker) = waker {
             waker();
         }
-        state = lock(&core.state);
+        timers = lock(&shared.timers);
     }
 }
 
