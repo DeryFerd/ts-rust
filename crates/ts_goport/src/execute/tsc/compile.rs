@@ -17,6 +17,7 @@ use crate::contentmapper::{
     Logger as ContentMapperLogger, ProcessExitState, Spawner as ContentMapperSpawner,
 };
 use crate::emitter::program_emit::EmitResult;
+use crate::execute::tsc::stdio;
 use crate::frontend::tsoptions::ParseConfigHost;
 use crate::frontend::vfs::Fs;
 use crate::fswatch::syscall::io_error_text;
@@ -50,33 +51,36 @@ pub fn write_go_output(out: &mut dyn std::io::Write, bytes: &[u8]) -> std::io::R
 }
 
 /// Go `os.Stdout` as the system writer: it writes the Go bytes of each port
-/// form write (see `write_go_output`). `write_str` writes whole strings, so a
-/// write never splits a unit.
+/// form write (see `write_go_output`) through `stdio::Stdout`, which does
+/// not buffer, waits on a non-blocking pipe and ends the process by SIGPIPE
+/// when the reader is gone, as Go does. `write_str` writes whole strings, so
+/// a write never splits a unit.
 pub struct GoOutput;
 
 impl std::io::Write for GoOutput {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        write_go_output(&mut std::io::stdout().lock(), buf)?;
+        write_go_output(&mut stdio::Stdout, buf)?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        std::io::stdout().flush()
+        stdio::Stdout.flush()
     }
 }
 
 /// Go `os.Stderr` as the system error writer: it writes the Go bytes of
-/// each port form write, as `GoOutput` does for stdout.
+/// each port form write through `stdio::Stderr`, as `GoOutput` does for
+/// stdout.
 pub struct GoErrorOutput;
 
 impl std::io::Write for GoErrorOutput {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        write_go_output(&mut std::io::stderr().lock(), buf)?;
+        write_go_output(&mut stdio::Stderr, buf)?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        std::io::stderr().flush()
+        stdio::Stderr.flush()
     }
 }
 
