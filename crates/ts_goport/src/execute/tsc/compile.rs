@@ -507,7 +507,7 @@ pub fn spawn_process(
             cmd.stderr(Stdio::null());
         }
     }
-    let spawned = cmd.spawn();
+    let spawned = crate::gostd::rlimit::spawn(&mut cmd);
     // The command holds the child's ends; drop them so that a read sees the
     // end of the stream when the child exits.
     drop(cmd);
