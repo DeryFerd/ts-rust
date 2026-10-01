@@ -61,9 +61,10 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false";
 
 /// The `arg0` of a worker (see `launch`) is this word, the launcher's
-/// process id and the number of the launcher's end of the pipe that takes
-/// the exit code: `tsgo-worker 4242 3`. The arguments, not the environment,
-/// name a worker, so a process that the worker starts gets nothing of it.
+/// process id, and the number and inode of the launcher's end of the pipe
+/// that takes the exit code: `tsgo-worker 4242 3 81234`. The arguments, not
+/// the environment, name a worker, so a process that the worker starts gets
+/// nothing of it.
 #[cfg(target_os = "linux")]
 const WORKER_ARG0: &str = "tsgo-worker";
 
@@ -73,6 +74,8 @@ const WORKER_ARG0: &str = "tsgo-worker";
 struct Worker {
     /// The number of the launcher's end of the pipe that takes the exit code.
     fd: u32,
+    /// The inode of that pipe.
+    ino: u64,
     /// The launcher.
     launcher: rustix::process::Pid,
 }
@@ -202,8 +205,12 @@ fn launch(huge_pages: bool) -> Option<i32> {
     // worker.
     let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok()?;
     let launcher = rustix::process::getpid().as_raw_pid();
+    let ino = rustix::fs::fstat(&read).ok()?.st_ino;
     let mut worker = std::process::Command::new(exe)
-        .arg0(format!("{WORKER_ARG0} {launcher} {}", read.as_raw_fd()))
+        .arg0(format!(
+            "{WORKER_ARG0} {launcher} {} {ino}",
+            read.as_raw_fd()
+        ))
         .args(args)
         .spawn()
         .ok()?;
@@ -261,10 +268,14 @@ fn worker() -> Option<Worker> {
             .to_str()?
             .strip_prefix(WORKER_ARG0)?
             .strip_prefix(' ')?;
-        let (launcher, fd) = rest.split_once(' ')?;
-        let launcher = rustix::process::Pid::from_raw(launcher.parse().ok()?)?;
-        let fd = fd.parse().ok()?;
-        (rustix::process::getppid() == Some(launcher)).then_some(Worker { fd, launcher })
+        let mut fields = rest.split(' ');
+        let launcher = rustix::process::Pid::from_raw(fields.next()?.parse().ok()?)?;
+        let fd = fields.next()?.parse().ok()?;
+        let ino = fields.next()?.parse().ok()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        (rustix::process::getppid() == Some(launcher)).then_some(Worker { fd, ino, launcher })
     })
 }
 
@@ -437,15 +448,27 @@ fn exit(code: i32) -> ! {
 /// memory. It takes no std lock (`throw`).
 #[cfg(target_os = "linux")]
 fn send_code(worker: Worker, code: i32) {
+    use std::os::unix::fs::OpenOptionsExt;
     if let Ok(null) = std::fs::File::options().write(true).open("/dev/null") {
         let _ = rustix::stdio::dup2_stdout(&null);
         let _ = rustix::stdio::dup2_stderr(&null);
     }
     // The launcher's end of the pipe, opened for writing by its number. The
     // new file has a close-on-exec flag. When it cannot open, the launcher
-    // takes the code from the worker's exit.
+    // takes the code from the worker's exit. In a PID namespace whose /proc
+    // is not its own, the path names a file of another process: the code is
+    // written only to a FIFO with the inode that the launcher passed, and
+    // the open does not wait (`O_NONBLOCK`) for a reader of another FIFO.
     let pipe = format!("/proc/{}/fd/{}", worker.launcher.as_raw_pid(), worker.fd);
-    if let Ok(mut pipe) = std::fs::File::options().write(true).open(pipe) {
+    if let Ok(mut pipe) = std::fs::File::options()
+        .write(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(pipe)
+        && rustix::fs::fstat(&pipe).is_ok_and(|stat| {
+            rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Fifo
+                && stat.st_ino == worker.ino
+        })
+    {
         let _ = pipe.write_all(&code.to_le_bytes());
     }
 }
