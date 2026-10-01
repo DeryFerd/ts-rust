@@ -5031,8 +5031,10 @@ fn new_diagnostic_response_wrapped(d: diagnosticwriter::AstDiagnostic<'_>) -> Di
             resp.pos = position_map.utf8_to_utf16(pos);
             resp.end = position_map.utf8_to_utf16(end);
         } else {
-            resp.pos = utf16_len_of_prefix(&file.text(), pos);
-            resp.end = utf16_len_of_prefix(&file.text(), end);
+            // Go `int(core.UTF16Len(text[:pos]))`.
+            let text = file.text();
+            resp.pos = utf16_len_of_range(&text, 0, pos as usize);
+            resp.end = utf16_len_of_range(&text, 0, end as usize);
         }
         let (start_line, start_character) =
             diagnosticwriter::get_ecma_line_and_utf16_character_of_file_position(file, pos);
@@ -5069,17 +5071,6 @@ fn new_diagnostic_response_wrapped(d: diagnosticwriter::AstDiagnostic<'_>) -> Di
     }
 
     resp
-}
-
-/// Go `int(core.UTF16Len(text[:pos]))`. Go cuts the bytes at `pos`; a cut
-/// char reads as one RuneError per byte, one UTF-16 unit each.
-fn utf16_len_of_prefix(text: &str, pos: i32) -> i32 {
-    let end = pos as usize;
-    let mut boundary = end;
-    while !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    utf16_len(&text[..boundary]) + (end - boundary) as i32
 }
 
 // Go: proto.go:1042 NewDiagnosticResponses

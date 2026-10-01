@@ -7,7 +7,7 @@
 use std::rc::Rc;
 
 use rustc_hash::FxHashSet;
-use ts_goport::ast::ContentMapperSourceFileInfo;
+use ts_goport::ast::{ContentMapperSourceFileInfo, source_file_info, source_file_is_bound};
 use ts_goport::contentmapper::SourceFiles;
 use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::compiler::DuplicateSourceFile;
@@ -19,10 +19,11 @@ use ts_goport::lsp::lsproto;
 use ts_goport::options::Tristate;
 use ts_goport::project::{
     APICreateProgramRequest, APISnapshotRequest, ConfiguredProjectID, ContentMappedParseCache,
-    ContentMappedParseCacheKey, FileChangeSummary, HashedSourceFile, ParseCacheKey,
-    ProgramUpdateKind, RefCountCacheEntry, RefCountCacheOptions, ResourceRequest, Session,
-    SnapshotChange, UpdateReason, content_mapped_parse_cache_key_for_duplicate,
-    content_mapped_parse_cache_key_for_file, new_content_mapped_parse_cache, new_parse_cache_key,
+    ContentMappedParseCacheKey, FileChangeSummary, FileHandle, HashedSourceFile, ParseCache,
+    ParseCacheKey, ProgramUpdateKind, RefCountCacheEntry, RefCountCacheOptions, ResourceRequest,
+    Session, SnapshotChange, UpdateReason, acquire_bound,
+    content_mapped_parse_cache_key_for_duplicate, content_mapped_parse_cache_key_for_file,
+    new_content_mapped_parse_cache, new_overlay, new_parse_cache, new_parse_cache_key,
     set_source_file_hash,
 };
 
@@ -135,10 +136,37 @@ fn test_content_mapped_parse_cache_key_reconstruction() {
 }
 
 // Go: refcountcache_test.go:72 TestParseCacheBindsBeforePublishing (ts#63952)
-// PORT: not ported. Go binds a parse in the parse cache so programs that share
-// it do not race to bind it. The Rust binder binds each program version into
-// one arena on the dispatch thread (`program::bind_all`); a parse on its own
-// has no bound state (`IsBound`) or `CommonJSModuleIndicator` to check.
+// PORT: Go `cache.Acquire` is `acquire_bound`. The port's `acquire` does not
+// bind, because a program load binds its files later in file order
+// (`project::acquire_bound`). `acquire_bound` binds before it returns the
+// file, as Go binds before the entry is published.
+#[test]
+fn test_parse_cache_binds_before_publishing() {
+    const FILE_NAME: &str = "/index.js";
+    let file_handle: Rc<dyn FileHandle> = Rc::new(new_overlay(
+        FILE_NAME,
+        "module.exports = 0;".to_string(),
+        1,
+        ScriptKind::JS,
+    ));
+    let parse_options = SourceFileParseOptions {
+        file_name: FILE_NAME.to_string(),
+        path: Path(FILE_NAME.to_string()),
+        ..Default::default()
+    };
+    let key = new_parse_cache_key(&parse_options, file_handle.hash(), file_handle.kind());
+    let cache = new_parse_cache(RefCountCacheOptions::default());
+
+    let file = acquire_bound(&cache, key.clone(), file_handle, "/").file;
+
+    assert!(source_file_is_bound(file.root));
+    assert!(
+        source_file_info(file.root)
+            .common_js_module_indicator
+            .is_some()
+    );
+    ParseCache::deref(&cache, &key);
+}
 
 // Go: refcountcache_test.go:23 setup
 fn setup(files: FileMap) -> Rc<Session> {

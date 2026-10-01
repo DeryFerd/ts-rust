@@ -71,8 +71,10 @@ ALLOWED = ['**', '!docs/typechecker-state/**', '!docs/typechecker-batches/**', '
 # Evidence of one revision. open clears it, so a new revision never shows the last one's evidence.
 EVIDENCE = ['goportTests', 'gateCompare', 'gate', 'gateRuns', 'gateVerdict', 'languageServerOracle', 'apiOracle', 'quality',
             'qualityEvidence', 'ordinaryQuery', 'localCheck', 'acceptance']
-AUDITOR = {'role': 'audit_accepted_roster', 'agent': 'aae6dbb734c07335a', 'verdict': 'PENDING'}
-REVIEWER = {'role': 'independent_reviewer', 'agent': 'a0bc38f3370585da3', 'verdict': 'PENDING'}
+# A new batch gets a new auditor and reviewer (AGENTS.md). Root records their agent ids with
+# scripts/state record current before the verdicts; accept_revision.py refuses a pending id.
+AUDITOR = {'role': 'audit_accepted_roster', 'agent': 'pending-new-auditor', 'verdict': 'PENDING'}
+REVIEWER = {'role': 'independent_reviewer', 'agent': 'pending-new-reviewer', 'verdict': 'PENDING'}
 
 
 def sha(path):
