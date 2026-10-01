@@ -1023,7 +1023,7 @@ impl Orchestrator {
         // The file system without the build host's cache: that cache keeps
         // each lookup for the whole build, and this one looks up output
         // directories that do not exist yet.
-        outputs_overlap(&configs, &*self.opts.sys.fs(), &self.compare_paths_options)
+        outputs_overlap(&configs, &self.opts.sys.fs(), &self.compare_paths_options)
     }
 
     /// PORT: not in Go (perf). Keeps `released` to free later (see

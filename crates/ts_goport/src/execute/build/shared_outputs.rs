@@ -37,13 +37,20 @@ use crate::frontend::prelude::*;
 /// file is outside the directories above, its outputs are not in the area.
 pub(crate) fn outputs_overlap(
     configs: &[Option<Rc<ParsedCommandLine>>],
-    fs: &dyn Fs,
+    fs: &Rc<dyn Fs>,
     compare: &ComparePathsOptions,
 ) -> bool {
+    // The `Fs` trait (Go `vfs.FS`) cannot read a link, so links are read
+    // on the OS file system only (not in tests).
+    let read_link: fn(&str) -> Option<String> = if is_wrapped_os_fs(fs) {
+        os_read_link
+    } else {
+        |_| None
+    };
     let key = |file: &str| {
         let path = get_normalized_absolute_path(file, &compare.current_directory);
         to_path(
-            &real_path(fs, &path),
+            &real_path(&**fs, read_link, &path),
             "",
             compare.use_case_sensitive_file_names,
         )
@@ -57,28 +64,50 @@ pub(crate) fn outputs_overlap(
     areas_overlap(&areas)
 }
 
+/// The most links that `real_path` follows through names that do not
+/// exist yet (Linux MAXSYMLINKS).
+const MAX_LINKS: usize = 40;
+
 /// The real path (Go `vfs.FS.Realpath`) of the absolute path `path`, found
 /// through its longest prefix that exists. So a directory or file that the
-/// build has not written yet gets the place where it will be written. The
-/// file system must not cache lookups for the build: a directory that does
-/// not exist yet is looked up here.
-fn real_path(fs: &dyn Fs, path: &str) -> String {
-    let root = get_root_length(path);
-    let mut end = path.len();
-    loop {
-        let prefix = &path[..end];
-        if fs.stat(prefix).is_some() {
-            let real = fs.realpath(prefix);
-            if end == path.len() {
-                return real;
+/// build has not written yet gets the place where it will be written. A
+/// stat follows links, so a link to a place that does not exist yet (a
+/// dangling link) is not in that prefix. When the name after the prefix is
+/// such a link (`read_link` gives its target), the path goes on from the
+/// link target, as a write through the link does. The file system must not
+/// cache lookups for the build: a directory that does not exist yet is
+/// looked up here.
+fn real_path(fs: &dyn Fs, read_link: fn(&str) -> Option<String>, path: &str) -> String {
+    let mut path = path.to_string();
+    for _ in 0..=MAX_LINKS {
+        let root = get_root_length(&path);
+        // `path[..end]` exists, and `path[..next]` is the name after it.
+        let (mut end, mut next) = (path.len(), path.len());
+        while fs.stat(&path[..end]).is_none() {
+            match path[..end].rfind('/') {
+                Some(i) if i >= root => (end, next) = (i, end),
+                _ => return path,
             }
-            return format!("{}{}", real.trim_end_matches('/'), &path[end..]);
         }
-        match prefix.rfind('/') {
-            Some(i) if i >= root => end = i,
-            _ => return path.to_string(),
+        let real = fs.realpath(&path[..end]);
+        if end == path.len() {
+            return real;
+        }
+        match read_link(&path[..next]) {
+            Some(target) => {
+                path = get_normalized_absolute_path(&target, &real) + &path[next..];
+            }
+            None => return format!("{}{}", real.trim_end_matches('/'), &path[end..]),
         }
     }
+    path
+}
+
+/// The target of the link `path` on the OS file system, or None when
+/// `path` is not a link.
+fn os_read_link(path: &str) -> Option<String> {
+    let target = std::fs::read_link(os_path(&filepath_from_slash(path))).ok()?;
+    Some(normalize_slashes(&go_string_from_os(target)))
 }
 
 /// The output area and the root file directories of one task, as path
@@ -274,9 +303,21 @@ mod tests {
         }
     }
 
-    /// Writes the projects pX and pY (with `py_options`) and the links
-    /// `lnk -> .` and `lnkx -> pX` in a new temporary directory, and returns
-    /// whether their outputs overlap. No output is written.
+    /// (name, target) of each link that `overlap_on_disk` writes.
+    #[cfg(unix)]
+    const LINKS: [(&str, &str); 6] = [
+        ("lnk", "."),
+        ("lnkx", "pX"),
+        ("ylink.tsbuildinfo", "shared.tsbuildinfo"),
+        ("pY/dl", "../pX/dist"),
+        ("pY/elsewhere", "../other/dist"),
+        ("loop", "loop"),
+    ];
+
+    /// Writes the projects pX and pY (with `py_options`) and the links in
+    /// `LINKS` in a new temporary directory, and returns whether their
+    /// outputs overlap. No output is written, so the links to outputs
+    /// dangle.
     #[cfg(unix)]
     fn overlap_on_disk(label: &str, py_options: &str) -> bool {
         let dir = std::env::temp_dir().join(format!(
@@ -299,11 +340,12 @@ mod tests {
             )
             .unwrap();
         }
-        std::os::unix::fs::symlink(".", dir.join("lnk")).unwrap();
-        std::os::unix::fs::symlink("pX", dir.join("lnkx")).unwrap();
+        for (name, target) in LINKS {
+            std::os::unix::fs::symlink(target, dir.join(name)).unwrap();
+        }
         let cwd = dir.to_string_lossy().replace('\\', "/");
         let sys = System {
-            fs: osvfs_fs(),
+            fs: wrap_fs(osvfs_fs()),
             current_directory: cwd.clone(),
         };
         let configs: Vec<_> = ["pX", "pY"]
@@ -324,7 +366,7 @@ mod tests {
             current_directory: cwd,
             use_case_sensitive_file_names: true,
         };
-        let overlap = outputs_overlap(&configs, &*sys.fs, &compare);
+        let overlap = outputs_overlap(&configs, &sys.fs, &compare);
         std::fs::remove_dir_all(&dir).unwrap();
         overlap
     }
@@ -343,10 +385,32 @@ mod tests {
             "outdir",
             r#""outDir": "../lnkx/dist", "tsBuildInfoFile": "../y.tsbuildinfo""#,
         ));
-        // Separate outputs, each named through a link, do not overlap.
+        // The int22 skeptic's dbi: pY's build info is a dangling link to
+        // pX's build info.
+        assert!(overlap_on_disk(
+            "dbi",
+            r#""outDir": "dist", "tsBuildInfoFile": "../ylink.tsbuildinfo""#,
+        ));
+        // The int22 skeptic's dout: pY's outDir is a dangling link to pX's
+        // outDir.
+        assert!(overlap_on_disk(
+            "dout",
+            r#""outDir": "dl", "tsBuildInfoFile": "../y.tsbuildinfo""#,
+        ));
+        // Separate outputs, each named through a link, do not overlap: a
+        // link to the root, a dangling link to another place, and a link
+        // loop.
         assert!(!overlap_on_disk(
             "separate",
             r#""outDir": "../lnk/pY/dist", "tsBuildInfoFile": "../lnk/y.tsbuildinfo""#,
+        ));
+        assert!(!overlap_on_disk(
+            "elsewhere",
+            r#""outDir": "elsewhere", "tsBuildInfoFile": "../y.tsbuildinfo""#,
+        ));
+        assert!(!overlap_on_disk(
+            "loop",
+            r#""outDir": "../loop/dist", "tsBuildInfoFile": "../y.tsbuildinfo""#,
         ));
     }
 }
