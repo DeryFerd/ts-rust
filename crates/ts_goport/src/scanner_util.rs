@@ -457,7 +457,7 @@ pub fn compute_ecma_line_starts(text: &str) -> Vec<i32> {
     result
 }
 
-// Go: core/core.go:486 UTF16Len
+// Go: core/core.go:484 UTF16Len
 // UTF16Len returns the number of UTF-16 code units needed to
 // represent the given UTF-8 encoded string.
 // PORT: `s` is the port form of a Go string. Each unit counts as its Go bytes
@@ -495,27 +495,41 @@ pub fn utf16_len(s: &str) -> i32 {
 /// `utf16_len` counts them. So a range inside one char counts
 /// `end - start`. `start` must be at most `end` and `s.len()`; a byte past
 /// the end of `s` also counts 1.
-// PERF: source map ranges are mostly ASCII. `is_ascii` checks a word at a
-// time, and for ASCII the result is the byte length.
+// PORT: `s` is the port form (see `GO_STRING_MARKER`). An edge `k` bytes
+// into a unit of `g` Go bytes is Go offset `min(k, g)` in the unit, as
+// `go_byte_offset` maps it. So a cut start counts the `g - k` Go bytes
+// that are left, and a cut end counts `k` bytes, or the whole unit when
+// `k >= g`.
+// PERF: source map ranges are mostly ASCII. `go_unit_cut_at` returns after
+// one compare at an ASCII byte, `is_ascii` checks a word at a time, and for
+// ASCII the result is the byte length.
 pub fn utf16_len_of_range(s: &str, start: usize, end: usize) -> i32 {
+    let past = end.saturating_sub(s.len());
+    let end = end - past;
+    let mut n = past;
     let mut head = start;
-    while head < end && !s.is_char_boundary(head) {
-        head += 1;
-    }
-    if head == end {
-        // No char starts in the range (an empty range included).
-        return (end - start) as i32;
+    if let Some((at, unit, size)) = go_unit_cut_at(s, start) {
+        let (k, g) = (start - at, unit.go_len());
+        if end < at + size {
+            // The range is inside the unit, after its first Go byte: each
+            // Go byte is one RuneError.
+            return (n + (end - at).min(g).saturating_sub(k.min(g))) as i32;
+        }
+        n += g.saturating_sub(k);
+        head = at + size;
     }
     let mut tail = end;
-    while tail > head && !s.is_char_boundary(tail) {
-        tail -= 1;
+    if let Some((at, unit, _)) = go_unit_cut_at(s, end) {
+        let (k, g) = (end - at, unit.go_len());
+        n += if k < g { k } else { unit.go_utf16_len() };
+        tail = at;
     }
     let whole = &s[head..tail];
-    let cut = (head - start + end - tail) as i32;
+    let n = n as i32;
     if whole.is_ascii() {
-        cut + whole.len() as i32
+        n + whole.len() as i32
     } else {
-        cut + utf16_len(whole)
+        n + utf16_len(whole)
     }
 }
 
@@ -23451,7 +23465,7 @@ mod tests {
         decode_js_string_rune, encode_js_string_rune, fuse_surrogate_bytes, go_byte_offset,
         go_has_suffix, go_len, go_map_runes, go_runes, go_slice, go_string_bytes,
         go_string_from_bytes, go_string_from_utf8, go_to_valid_utf8, go_unit_at, go_unit_before,
-        go_value, go_value_from_bytes, is_line_break, port_byte_offset, utf16_len,
+        go_unit_cut_at, go_value, go_value_from_bytes, is_line_break, port_byte_offset, utf16_len,
         utf16_len_of_range,
     };
 
@@ -23586,6 +23600,30 @@ mod tests {
                 assert_eq!(port_byte_offset(&text, go), at as i32, "{text:?} at {at}");
                 assert_eq!(&*go_string_bytes(&text[..at]), &bytes[..go as usize]);
             }
+            // An offset `k` bytes into a unit of `g` Go bytes is Go offset
+            // `min(k, g)` in the unit, and each Go offset maps back.
+            for pos in 0..=text.len() {
+                let unit_start = *boundaries.iter().rfind(|&&b| b <= pos).unwrap();
+                let base = go_byte_offset(&text, unit_start as i32) as usize;
+                let cut = go_unit_cut_at(&text, pos);
+                let go = if unit_start == pos {
+                    assert_eq!(cut, None, "{text:?} at {pos}");
+                    base
+                } else {
+                    let (unit, size) = go_unit_at(&text, unit_start);
+                    assert_eq!(cut, Some((unit_start, unit, size)), "{text:?} at {pos}");
+                    base + (pos - unit_start).min(unit.go_len())
+                };
+                assert_eq!(
+                    go_byte_offset(&text, pos as i32),
+                    go as i32,
+                    "{text:?} at {pos}"
+                );
+            }
+            for go in 0..=bytes.len() as i32 {
+                let pos = port_byte_offset(&text, go);
+                assert_eq!(go_byte_offset(&text, pos), go, "{text:?} at Go {go}");
+            }
             values.push((bytes, text));
         }
         for pair in values.windows(2) {
@@ -23636,6 +23674,44 @@ mod tests {
                 }
             }
         }
+        // Port forms with marker units: a range edge in a unit is Go offset
+        // `go_byte_offset` there. The texts are the srcmap1 p3 repros
+        // (`switch` with an invalid byte, a WTF-8 surrogate or U+FDD0 where
+        // the printer writes a token) and random Go bytes.
+        let mut texts: Vec<Vec<u8>> = vec![
+            b"switch\xAC (e) {".to_vec(),
+            b"switch\xED\xA0\x80 (e) {".to_vec(),
+            "switch\u{FDD0} (e) { case 1: }".as_bytes().to_vec(),
+            "\u{FDD0}\u{FDD0}\u{FDD0}\u{10F780}\u{FDD0}\u{10F780}"
+                .as_bytes()
+                .to_vec(),
+        ];
+        let mut seed = 0x2B99_D1E0_5A73_C4F1u64;
+        texts.extend((0..1_000).map(|_| random_go_bytes(&mut seed)));
+        for bytes in texts {
+            let s = go_string_from_bytes(bytes.clone());
+            for start in 0..=s.len() {
+                let go_start = go_byte_offset(&s, start as i32) as usize;
+                for end in start..=s.len() + 1 {
+                    let go_end = go_byte_offset(&s, end as i32) as usize;
+                    let go = go_utf16_len(&bytes[go_start..go_end.min(bytes.len())])
+                        + go_end.saturating_sub(bytes.len()) as i32;
+                    assert_eq!(
+                        utf16_len_of_range(&s, start, end),
+                        go,
+                        "{s:?}[{start}:{end}]"
+                    );
+                }
+            }
+        }
+        // The p3 repro split, as the printer cache counts it: `[6:7]` then
+        // `[7:]` against Go `[6:7]` then `[7:]` (srcmap1 skeptic: Go source
+        // column 13 on l1, tsgo 17).
+        let s = go_string_from_bytes(b"switch\xAC (e) {".to_vec());
+        assert_eq!(
+            utf16_len_of_range(&s, 0, 7) + utf16_len_of_range(&s, 7, s.len()),
+            go_utf16_len(b"switch\xAC (e) {")
+        );
     }
 
     // A WTF-8 surrogate in source text is 3 invalid byte units. A string

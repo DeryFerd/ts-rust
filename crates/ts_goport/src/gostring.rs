@@ -717,34 +717,46 @@ fn go_unit_bytes(unit: GoUnit, buf: &mut [u8; 4]) -> &[u8] {
 }
 
 /// The Go byte offset of the port offset `pos` in the port form `text` (see
-/// `GO_STRING_MARKER`). Go writes byte offsets into build info and
-/// declaration signatures. A negative offset is kept.
+/// `GO_STRING_MARKER`). Go writes byte offsets into build info, declaration
+/// signatures, LSP UTF-8 columns and completion data. A `pos` that is `k`
+/// bytes into a unit of `g` Go bytes gives the unit's Go offset plus
+/// `min(k, g)`; `port_byte_offset` gives back `pos` for `k < g`. A negative
+/// offset is kept, and an offset past the end counts the bytes past it.
 pub fn go_byte_offset(text: &str, pos: i32) -> i32 {
     if pos <= 0 {
         return pos;
     }
     let bytes = text.as_bytes();
     let end = (pos as usize).min(bytes.len());
+    // A unit that `end` cuts can start inside its marker, so the search
+    // reads up to 2 bytes past `end`.
+    let window = &bytes[..(end + GO_STRING_MARKER_BYTES.len() - 1).min(bytes.len())];
+    let find = |from: usize| find_go_string_marker(window, from).filter(|&at| at < end);
     // The port bytes of the units before `end` that Go does not have.
     let mut extra = 0usize;
-    let mut next = find_go_string_marker(&bytes[..end], 0);
+    let mut next = find(0);
     while let Some(at) = next {
         let (unit, size) = go_unit_at(text, at);
         if at + size > end {
-            // `pos` is inside the unit. Go has no such offset; keep it in
-            // the unit.
+            // `pos` is inside the unit: count its first `min(k, g)` Go
+            // bytes.
             extra += (end - at).saturating_sub(unit.go_len());
             break;
         }
         extra += size - unit.go_len();
-        next = find_go_string_marker(&bytes[..end], at + size);
+        next = find(at + size);
     }
     pos - extra as i32
 }
 
 /// The port offset of the Go byte offset `go_pos` in the port form `text`,
-/// the inverse of `go_byte_offset`. An offset inside a unit's Go bytes gives
-/// the start of the unit. A negative offset is kept.
+/// the inverse of `go_byte_offset`. An offset `k` bytes into the Go bytes of
+/// a unit gives the unit's port offset plus `k`, so that `go_byte_offset`
+/// gives `go_pos` back. A negative offset is kept, and an offset past the
+/// end counts the bytes past it.
+// PORT: such an offset is inside the unit's first char. For a real U+FDD0
+// (M + M) the first M holds Go's 3 bytes, so a byte slice there cuts the
+// same bytes as Go.
 pub fn port_byte_offset(text: &str, go_pos: i32) -> i32 {
     if go_pos <= 0 {
         return go_pos;
@@ -760,12 +772,52 @@ pub fn port_byte_offset(text: &str, go_pos: i32) -> i32 {
         go += at - port;
         let (unit, size) = go_unit_at(text, at);
         if go + unit.go_len() > go_pos {
-            return at as i32;
+            return (at + (go_pos - go)) as i32;
         }
         go += unit.go_len();
         port = at + size;
     }
     (port + (go_pos - go)) as i32
+}
+
+/// The unit of the port form `s` that holds byte `pos` after its start
+/// (see `GO_STRING_MARKER`): the unit's start, the unit and its size in `s`.
+/// `None` when `pos` is a unit boundary or at or past the end. A char that
+/// is not in a marker unit is a unit, so a `pos` inside it gives it.
+// PERF: only a continuation byte, the marker's lead byte or a unit char's
+// lead byte (0xF4) can be inside a unit, so most calls return after one
+// compare.
+pub fn go_unit_cut_at(s: &str, pos: usize) -> Option<(usize, GoUnit, usize)> {
+    let marker_len = GO_STRING_MARKER_BYTES.len();
+    let bytes = s.as_bytes();
+    let &b = bytes.get(pos)?;
+    if pos == 0 || b < 0x80 || (b >= 0xC0 && b != GO_STRING_MARKER_BYTES[0] && b != 0xF4) {
+        return None;
+    }
+    let mut c = pos;
+    while !s.is_char_boundary(c) {
+        c -= 1;
+    }
+    // `c` starts a unit unless it is the second char of a marker unit: M or
+    // a unit char after a run of M chars of odd length (see
+    // `go_unit_before`).
+    let ch = s[c..].chars().next()?;
+    let mut at = c;
+    if ch == GO_STRING_MARKER || ch as u32 >= INVALID_BYTE_UNIT_BASE + 0x80 {
+        let mut run = 0usize;
+        while c >= marker_len * (run + 1) && go_string_marker_at(bytes, c - marker_len * (run + 1))
+        {
+            run += 1;
+        }
+        if run % 2 == 1 {
+            at = c - marker_len;
+        }
+    }
+    if at == pos {
+        return None;
+    }
+    let (unit, size) = go_unit_at(s, at);
+    Some((at, unit, size))
 }
 
 // Go: stringutil/util.go:352 CombineSurrogatePairs

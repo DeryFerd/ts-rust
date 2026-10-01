@@ -16,6 +16,7 @@ use crate::ls::prelude::*;
 
 use crate::flags_macros::{go_enum, go_flags};
 use crate::frontend::scanner::scanner_p1::{RUNE_ERROR, rune_to_char, utf8_decode_rune_in_string};
+use crate::scanner_util::go_byte_offset;
 use crate::spanmap::Feature;
 use std::sync::LazyLock;
 
@@ -174,7 +175,13 @@ pub struct CompletionList {
 
 // Go: ls/completions.go:123 ensureItemData
 // PORT: Go fills `item.Data` through the list pointer; the list is moved in
-// and returned.
+// and returned. `data.position` is a Go byte offset in Go, and the client
+// sends it back on resolve. Port offsets differ from Go offsets after a
+// marker unit (see `scanner_util::GO_STRING_MARKER`), so the list leaves
+// with Go offsets (`go_byte_offset`) and `resolve_completion_item` maps them
+// back. The items that `create_lsp_completion_item` makes hold the port
+// `pos` until here, so the text is scanned once for the list, not once for
+// each item.
 pub fn ensure_item_data(
     file: Node,
     pos: i32,
@@ -183,11 +190,19 @@ pub fn ensure_item_data(
     let Some(mut list) = list else {
         return None;
     };
+    let text = source_file_text(file);
+    let go_pos = go_byte_offset(&text, pos);
     for item in &mut list.items {
-        if item.data.is_none() {
+        if let Some(data) = &mut item.data {
+            data.position = if data.position == pos {
+                go_pos
+            } else {
+                go_byte_offset(&text, data.position)
+            };
+        } else {
             item.data = Some(lsproto::CompletionItemData {
                 file_name: source_file_original_file_name(file).to_string(),
-                position: pos,
+                position: go_pos,
                 supplemental_file_index: supplemental_file_index(file),
                 name: item.label.clone(),
                 ..Default::default()
