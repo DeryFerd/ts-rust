@@ -820,7 +820,7 @@ fn utf16_rune_len(r: i32) -> i32 {
 // line (`port_byte_offset`, `go_byte_offset`). Otherwise the decoder follows
 // Go `utf8.DecodeRuneInString`, also at a position inside a character.
 impl Converters {
-    // Go: ls/lsconv/converters.go:359 lineAndCharacterToPosition
+    // Go: ls/lsconv/converters.go:366 lineAndCharacterToPosition
     // PORT: Go passes the position by value; here by reference.
     // Private as in Go since tsgo#4712: the LS uses `from_lsp_position`,
     // `from_lsp_range` and their SourceFile forms.
@@ -901,7 +901,7 @@ impl Converters {
         pos as i32
     }
 
-    // Go: ls/lsconv/converters.go:410 positionToLineAndCharacter
+    // Go: ls/lsconv/converters.go:417 positionToLineAndCharacter
     // Private as in Go since tsgo#4712: the LS uses `to_lsp_position`.
     fn position_to_line_and_character(
         &self,

@@ -3687,7 +3687,7 @@ impl Server {
         Ok(())
     }
 
-    // Go: server.go:1296 handleShutdown
+    // Go: server.go:1788 handleShutdown
     pub fn handle_shutdown(
         self: &Rc<Self>,
         _ctx: &Context,
@@ -3702,7 +3702,7 @@ impl Server {
         Ok(lsproto::ShutdownResponse::default())
     }
 
-    // Go: server.go:1304 handleExit
+    // Go: server.go:1796 handleExit
     pub fn handle_exit(
         self: &Rc<Self>,
         _ctx: &Context,
@@ -4625,7 +4625,7 @@ impl Server {
         ls.provide_semantic_tokens_range(ctx, &params.text_document.uri, params.range)
     }
 
-    // Go: server.go:1725 handleInitializeAPISession
+    // Go: server.go:2280 handleInitializeAPISession
     // PORT: `apiSessionsMu` is dropped (dispatch thread).
     pub fn handle_initialize_api_session(
         self: &Rc<Self>,
