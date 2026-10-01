@@ -43,6 +43,14 @@ pub struct CliStdout;
 /// Go `os.Stderr`.
 pub struct Stderr;
 
+// Go: os/file.go:73 `Stdout = NewFile(...)`, at package init (go1.27.1)
+/// Reads whether fd 1 is non-blocking (see `CliStdout`). tsgo calls it at
+/// start, as Go makes `os.Stdout` before `main`; without the call the first
+/// write of `CliStdout` reads it.
+pub fn init() {
+    sys::init();
+}
+
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         sys::read_stdin(buf)
@@ -150,8 +158,12 @@ mod sys {
         Ok(())
     }
 
-    /// Go `NewFile`: fd 1 was non-blocking at start (checked at the first
-    /// write here), so its writes wait in the poller on EAGAIN.
+    pub fn init() {
+        stdout_nonblocking();
+    }
+
+    /// Go `NewFile`: fd 1 was non-blocking at start (`init`), so its writes
+    /// wait in the poller on EAGAIN.
     fn stdout_nonblocking() -> bool {
         static NONBLOCKING: OnceLock<bool> = OnceLock::new();
         *NONBLOCKING.get_or_init(|| {
@@ -216,6 +228,8 @@ mod sys {
 #[cfg(not(unix))]
 mod sys {
     use std::io::{self, Read, Write};
+
+    pub fn init() {}
 
     pub fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
         io::stdin().read(buf)
