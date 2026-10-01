@@ -159,7 +159,10 @@ pub fn parse_content_mapper(value: &CompilerOptionsValue) -> (Option<Mapper>, Ve
             // Go: `mapper.Options, _ = json.Marshal(options)` (compact JSON v2).
             let mut json = String::new();
             super::tsconfig_p2::stringify_json(options, &mut json);
-            mapper.definition.options = JsonValue(json.into_bytes());
+            // PORT: a `json.Value` holds Go bytes; the text is in the port
+            // form.
+            mapper.definition.options =
+                JsonValue(crate::scanner_util::go_string_bytes(&json).into_owned());
         }
     }
     if !errors.is_empty() {

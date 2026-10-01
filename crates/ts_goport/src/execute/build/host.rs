@@ -286,6 +286,12 @@ impl BuildHost {
         self.load_or_store_m_time(file, None, true)
     }
 
+    /// PORT: not in Go (perf). `get_m_time` of `file`, whose `toPath` is
+    /// `path`.
+    pub fn get_m_time_of_path(&self, file: &str, path: &Path) -> Option<SystemTime> {
+        self.load_or_store_m_time_of_path(file, path.clone(), None, true)
+    }
+
     // Go: build/host.go:98 (*host).SetMTime
     pub fn set_m_time(&self, file: &str, m_time: Option<SystemTime>) -> Result<(), FsError> {
         CompilerHost::fs(self).chtimes(file, None, m_time)
@@ -298,17 +304,25 @@ impl BuildHost {
         old_cache: Option<&FxHashMap<Path, Option<SystemTime>>>,
         store: bool,
     ) -> Option<SystemTime> {
-        let path = self.to_path(file);
+        self.load_or_store_m_time_of_path(file, self.to_path(file), old_cache, store)
+    }
+
+    // Go: build/host.go:102 (*host).loadOrStoreMTime, with
+    // `h.orchestrator.toPath(file)` computed by the caller.
+    fn load_or_store_m_time_of_path(
+        &self,
+        file: &str,
+        path: Path,
+        old_cache: Option<&FxHashMap<Path, Option<SystemTime>>>,
+        store: bool,
+    ) -> Option<SystemTime> {
         // PORT: Go `Load`, then `LoadOrStore` below. The lock is not held
-        // while `get_m_time` reads the file system.
-        let existing = self
-            .m_times
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&path)
-            .copied();
-        if let Some(existing) = existing {
-            return existing;
+        // while `get_m_time` reads the file system; else it is held from
+        // the load to the store.
+        let lock = || self.m_times.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut m_times = lock();
+        if let Some(existing) = m_times.get(&path) {
+            return *existing;
         }
         let mut found = false;
         let mut m_time = None;
@@ -328,16 +342,16 @@ impl BuildHost {
             });
             m_time = match prefetched {
                 Some(m_time) => m_time,
-                None => incremental::get_m_time(&*self.host, file),
+                None => {
+                    drop(m_times);
+                    let m_time = incremental::get_m_time(&*self.host, file);
+                    m_times = lock();
+                    m_time
+                }
             };
         }
         if store {
-            m_time = *self
-                .m_times
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .entry(path)
-                .or_insert(m_time);
+            m_time = *m_times.entry(path).or_insert(m_time);
         }
         m_time
     }
@@ -370,7 +384,7 @@ impl BuildHost {
     // PORT: Go reads the build info cache of the config's task
     // (`loadOrStoreBuildInfo`). Its only caller is `ReadBuildInfoProgram` in
     // `compileAndEmit`, with the config of the task that compiles, so
-    // `BuildTask::compile_and_emit_start` reads its own cache (`TaskBuildInfo`)
+    // `BuildTask::compile_and_emit_start` reads its own cache (`build_info_program`)
     // and the host does not implement `incremental.BuildInfoReader`.
 }
 

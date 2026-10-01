@@ -14,7 +14,7 @@
     non_snake_case
 )]
 
-pub use goport_util::{core, frontend, gostd, jsonrpc, unported};
+pub use goport_util::{core, frontend, gostd, jsonrpc, scanner_util, unported};
 
 /// The lsproto part of `crate::lsp`.
 pub mod lsp {

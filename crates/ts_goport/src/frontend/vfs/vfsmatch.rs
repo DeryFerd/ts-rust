@@ -868,7 +868,11 @@ impl GlobVisitor<'_> {
                 continue;
             }
             if let Some(idx) = self.file_matcher.matches_file_parts(&abs_prefix, file) {
-                self.results[idx].push(format!("{path_prefix}{file}"));
+                // PERF: `format!` without the formatter.
+                let mut name = String::with_capacity(path_prefix.len() + file.len());
+                name.push_str(&path_prefix);
+                name.push_str(file);
+                self.results[idx].push(name);
             }
         }
 

@@ -45,7 +45,10 @@ pub trait Resolver {
         redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
     ) -> (Rc<ResolvedTypeReferenceDirective>, Vec<DiagAndArgs>);
     fn get_package_scope_for_path(&self, directory: &str) -> Option<Rc<InfoCacheEntry>>;
-    fn package_json_cache_entries(&self, f: &mut dyn FnMut(&Path, &Rc<InfoCacheEntry>) -> bool);
+    fn package_json_cache_entries(
+        &self,
+        f: &mut dyn FnMut(&Path, PackageJsonCacheEntry<'_>) -> bool,
+    );
     fn resolve_package_directory(
         &self,
         module_name: &str,
@@ -132,7 +135,10 @@ impl Resolver for DefaultResolver {
         DefaultResolver::get_package_scope_for_path(self, directory)
     }
 
-    fn package_json_cache_entries(&self, f: &mut dyn FnMut(&Path, &Rc<InfoCacheEntry>) -> bool) {
+    fn package_json_cache_entries(
+        &self,
+        f: &mut dyn FnMut(&Path, PackageJsonCacheEntry<'_>) -> bool,
+    ) {
         DefaultResolver::package_json_cache_entries(self, f);
     }
 

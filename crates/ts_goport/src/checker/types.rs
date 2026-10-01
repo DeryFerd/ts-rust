@@ -69,7 +69,7 @@ enum InlineLen {
     Three = 3,
 }
 
-// A list must stay 24 bytes, or `Type` grows past 3 cache lines.
+// A list must stay 24 bytes, or `Type` grows past 2 cache lines.
 const _: () = assert!(std::mem::size_of::<SharedList<TypeId>>() == 24);
 const _: () = assert!(std::mem::size_of::<SharedList<SymbolId>>() == 24);
 const _: () = assert!(std::mem::size_of::<SharedList<SignatureId>>() == 24);
@@ -337,8 +337,8 @@ fn use_checker_arena() -> bool {
     !crate::core::is_multi_program()
 }
 
-/// This thread's leaked checker arena. The `&'static Bump` is taken out of
-/// the thread local first, so the allocation runs outside `with`.
+/// This thread's leaked checker arena. The `&'static LeakArena` is taken
+/// out of the thread local first, so the allocation runs outside `with`.
 #[inline]
 fn checker_arena() -> &'static LeakArena {
     CHECKER_ARENA.with(|arena| *arena)
