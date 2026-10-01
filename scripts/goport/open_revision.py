@@ -222,10 +222,12 @@ def main():
         b = old
         s['reason'] = f'R{a.revision} bound in batch {b["id"]}.'
     b.update({k: None for k in EVIDENCE})
+    # A later revision in the same batch keeps the batch's auditor and reviewer; only the verdict resets.
+    keep = lambda role, key: {**role, 'agent': (b.get(key) or {}).get('agent') or role['agent']} if not a.new_batch else dict(role)
     b.update({'recoveryRevision': a.revision, 'hypothesis': a.hypothesis, 'sourceFingerprint': a.fingerprint,
               'beforeEditingSourceFingerprint': previous_fp, 'sourceBindingStatus': 'SOURCE_BOUND',
               'commit': a.commit, 'completedRuns': [], 'compilerAccepted': False, 'passingCredit': False,
-              'auditor': dict(AUDITOR), 'reviewer': dict(REVIEWER),
+              'auditor': keep(AUDITOR, 'auditor'), 'reviewer': keep(REVIEWER, 'reviewer'),
               'nextPermittedAction': f'Run the R{a.revision} pipeline (candidate.sh side).'})
     row = {'revision': a.revision, 'hypothesis': a.hypothesis, 'hypothesisLabel': b['id'].replace('recovery-continuation-', ''),
            'phase': 'recovery-continuation', 'sourceFingerprint': a.fingerprint, 'beforeEditingSourceFingerprint': previous_fp,
