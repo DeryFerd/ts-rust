@@ -208,15 +208,39 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
             // auto-import entrypoint) must still publish its parser fields,
             // so a later version can share the file.
             crate::program::note_parsed_source_file(&file);
-            // Go: binder.BindSourceFile(file) (ts#63952). PORT: the Rust
-            // binder binds each program version into one arena on the
-            // dispatch thread (`program::bind_all`), not a parse on its own,
-            // so the Go race (two programs binding one shared file at once)
-            // does not exist here. Binding is idempotent in Go, so binding at
-            // program load gives the same result.
+            // Go: binder.BindSourceFile(file) (ts#63952). PORT: not here, see
+            // `acquire_bound`. The binder lineage gets each file when a
+            // program binds its files in file order (`program::bind_all`),
+            // or when the auto-import alias resolver reads it. A bind here
+            // would bind in parse order and change the lineage ids. There is
+            // one dispatch thread, so the Go race (two programs binding one
+            // shared file at once) does not exist here.
             HashedSourceFile { file, hash }
         },
     )
+}
+
+/// Go `ParseCache.Acquire` with the bind of Go `NewParseCache`
+/// (parsecache.go:80, ts#63952): the file is published with no program and
+/// bound into the binder lineage before it is returned, on a new entry and
+/// on a reused one. `current_directory` is the caller host's. Use it for a
+/// file that a caller reads outside a program load (Go
+/// `SnapshotHost.AcquireSourceFile`).
+// PORT: a program load and the auto-import registry use `acquire`, and
+// their files bind later in the order that keeps the lineage ids (see
+// `new_parse_cache`). A file that is bound already is not bound again (Go
+// `BindOnce`), so a later program that includes the file gives the same
+// result.
+pub fn acquire_bound(
+    cache: &ParseCache,
+    key: ParseCacheKey,
+    fh: Rc<dyn FileHandle>,
+    current_directory: &str,
+) -> HashedSourceFile {
+    let result = cache.acquire(key, fh);
+    crate::program::publish_parsed_files(current_directory);
+    crate::program::bind_file_outside_program(result.file.root);
+    result
 }
 
 // Go: project/parsecache.go:84 ContentMappedParseCache (tsgo#4712)
@@ -282,4 +306,134 @@ pub fn deref_program_file(
     let key = new_parse_cache_key(options, hash, script_kind);
     // PORT: called by path so `std::ops::Deref::deref` can not win.
     ParseCache::deref(cache, &key);
+}
+
+/// One slot of `ProgramFileRefs`, for one file of `program.source_files()`.
+enum FileRef {
+    /// Go takes no reference (a content-mapper failure stub or a
+    /// supplemental file).
+    None,
+    /// The parse cache entry of a plain file. The program holds one count
+    /// on it, so it stays the entry that the cache has for the file's key.
+    Entry(Rc<RefCountCacheEntry<HashedSourceFile>>),
+    /// A content-mapped file, or a plain file whose entry was not in the
+    /// cache: refs and derefs go through the key, as in Go.
+    Key,
+}
+
+/// Not in Go: the parse cache entries that one project program holds a
+/// count on, one slot per file of `program.source_files()`. Go (and the
+/// port before) builds a key, hashes it and looks it up for every program
+/// file twice per edit: once to ref the file in the cloned program
+/// (project.go CreateProgram) and once to deref it when the old snapshot is
+/// disposed (snapshot.go dispose). With the entry kept here, a file that the
+/// cloned program shares with the old program is counted through the old
+/// program's slot: only the changed files need a key. The counts stay as in
+/// Go. Duplicate source files still go through the key.
+pub struct ProgramFileRefs {
+    slots: Vec<FileRef>,
+}
+
+impl ProgramFileRefs {
+    /// Collects the entries of `files`. With `take_refs`, also refs each
+    /// file except `acquired` (Go CreateProgram for a cloned program:
+    /// `UpdateProgram` acquired only the changed file). Without it, the
+    /// program's own loads hold the counts already. `old` is the program
+    /// that this one was cloned from, with its refs: a file at the same
+    /// index that is the same parse uses the old entry.
+    pub fn new(
+        parse_cache: &ParseCache,
+        content_mapped_parse_cache: &ContentMappedParseCache,
+        files: &[Rc<parser::ParsedSourceFile>],
+        take_refs: bool,
+        acquired: Option<&Rc<parser::ParsedSourceFile>>,
+        old: Option<(&[Rc<parser::ParsedSourceFile>], &ProgramFileRefs)>,
+    ) -> ProgramFileRefs {
+        let slots = files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                if file.is_content_mapper_failure_stub() || file.is_content_mapper_supplemental() {
+                    return FileRef::None;
+                }
+                // Use pointer identity: `acquired` is the exact instance UpdateProgram acquired,
+                // and it is the only file whose refcount is already accounted for.
+                let take_ref = take_refs && !acquired.is_some_and(|f| Rc::ptr_eq(f, file));
+                if !file.content_mapper().is_empty() {
+                    if take_ref {
+                        content_mapped_parse_cache
+                            .ref_(&content_mapped_parse_cache_key_for_file(file));
+                    }
+                    return FileRef::Key;
+                }
+                let shared = old.and_then(|(old_files, old_refs)| {
+                    match (old_files.get(index), old_refs.slots.get(index)) {
+                        (Some(old_file), Some(FileRef::Entry(entry)))
+                            if Rc::ptr_eq(old_file, file) =>
+                        {
+                            Some(entry.clone())
+                        }
+                        _ => None,
+                    }
+                });
+                match shared {
+                    Some(entry) if take_ref && entry.ref_count.get() > 0 => {
+                        // Go: parseCache.Ref(key), with the entry found.
+                        entry.ref_count.set(entry.ref_count.get() + 1);
+                        FileRef::Entry(entry)
+                    }
+                    _ => {
+                        let key = parse_cache_key_for_file(file);
+                        if take_ref {
+                            parse_cache.ref_(&key);
+                        }
+                        match parse_cache.entries.borrow().get(&key) {
+                            Some(entry) => FileRef::Entry(entry.clone()),
+                            None => FileRef::Key,
+                        }
+                    }
+                }
+            })
+            .collect();
+        ProgramFileRefs { slots }
+    }
+
+    /// Go snapshot.go dispose: deref each file of the program. `files` is
+    /// `program.source_files()` of the program these refs were made for.
+    pub fn release(
+        &self,
+        parse_cache: &ParseCache,
+        content_mapped_parse_cache: &ContentMappedParseCache,
+        files: &[Rc<parser::ParsedSourceFile>],
+    ) {
+        for (file, slot) in files.iter().zip(&self.slots) {
+            match slot {
+                FileRef::None => {}
+                // Go: parseCache.Deref(key), with the entry found.
+                FileRef::Entry(entry) => {
+                    entry.ref_count.set(entry.ref_count.get() - 1);
+                    if entry.ref_count.get() <= 0 && !parse_cache.options.disable_deletion {
+                        parse_cache
+                            .entries
+                            .borrow_mut()
+                            .remove(&parse_cache_key_for_file(file));
+                    }
+                }
+                FileRef::Key if !file.content_mapper().is_empty() => {
+                    deref_content_mapped_file(
+                        content_mapped_parse_cache,
+                        &content_mapped_parse_cache_key_for_file(file),
+                    );
+                }
+                FileRef::Key => {
+                    deref_program_file(
+                        parse_cache,
+                        file.parse_options(),
+                        file.source_hash(),
+                        file.script_kind,
+                    );
+                }
+            }
+        }
+    }
 }

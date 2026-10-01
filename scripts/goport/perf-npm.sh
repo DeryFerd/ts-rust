@@ -15,7 +15,7 @@
 #   hono-noop   as hono, but composite with a .tsbuildinfo per side (in the output dir) that the
 #               warmup runs write: the no-change run that repeats in a watch-free dev loop
 # Timing on a loaded host is noise: the script refuses to start when the 1-minute load is over
-# PERF_MAX_LOAD (default 1.5). Run it on a quiet host (dbook-lan or a mini) through remote.sh, with
+# PERF_MAX_LOAD (default 1.5). Run it on a quiet host (mini-abf9 or mini-743d) through remote.sh, with
 # both projects pushed there. PERF_RUNS sets the runs per cell (default 30).
 #
 # usage: perf-npm.sh <label> <rs-proj> <go-proj>

@@ -5,8 +5,9 @@
 # side the same way. Compare binaries only within one perf.sh run.
 # Timing on a loaded host is noise: the script refuses to start when the 1-minute load
 # is over PERF_MAX_LOAD (default 1.5). PERF_WAIT=1 waits up to 30 minutes for a quiet
-# host instead. zbook is rarely quiet while agents build: run it on dbook-lan or
-# mini-abf9 through remote.sh, with every side on the same host.
+# host instead. zbook is rarely quiet while agents build: run it on mini-abf9 or
+# mini-743d through remote.sh (dbook-lan is kept for revision evidence), with every
+# side on the same host.
 # Output: target/continuation-r97-goport/perf/<label>/ (per-run .time files, load.txt).
 set -uo pipefail
 cd /home/theo/Code/sandbox/ts-rust
@@ -14,7 +15,7 @@ cd /home/theo/Code/sandbox/ts-rust
 # launcher. Measure the process that does the work.
 export GOPORT_LAUNCH=0
 if [[ $# -eq 2 && -x $1 && ! -x $2 ]]; then set -- "$2" "$1"; fi
-[[ $# -ge 2 ]] || { sed -n '2,10p' "$0"; exit 2; }
+[[ $# -ge 2 ]] || { sed -n '2,11p' "$0"; exit 2; }
 L=$1; shift; BINS=("$@")
 for b in "${BINS[@]}"; do [[ -x $b ]] || { echo "not executable: $b" >&2; exit 2; }; done
 O=target/continuation-r97-goport/perf/$L; mkdir -p "$O"; P=target/project-inputs

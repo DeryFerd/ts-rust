@@ -489,6 +489,36 @@ pub fn utf16_len(s: &str) -> i32 {
     s.len() as i32
 }
 
+/// Go `core.UTF16Len(s[start:end])`. Go slices bytes, so the range can cut a
+/// char at either end. Go `range` reads each byte of a cut char as one
+/// RuneError, which is one UTF-16 unit, and the whole chars count as
+/// `utf16_len` counts them. So a range inside one char counts
+/// `end - start`. `start` must be at most `end` and `s.len()`; a byte past
+/// the end of `s` also counts 1.
+// PERF: source map ranges are mostly ASCII. `is_ascii` checks a word at a
+// time, and for ASCII the result is the byte length.
+pub fn utf16_len_of_range(s: &str, start: usize, end: usize) -> i32 {
+    let mut head = start;
+    while head < end && !s.is_char_boundary(head) {
+        head += 1;
+    }
+    if head == end {
+        // No char starts in the range (an empty range included).
+        return (end - start) as i32;
+    }
+    let mut tail = end;
+    while tail > head && !s.is_char_boundary(tail) {
+        tail -= 1;
+    }
+    let whole = &s[head..tail];
+    let cut = (head - start + end - tail) as i32;
+    if whole.is_ascii() {
+        cut + whole.len() as i32
+    } else {
+        cut + utf16_len(whole)
+    }
+}
+
 // Go: core/core.go:559 GetSpellingSuggestion
 // Given a name and a list of candidates, returns the candidate whose name is
 // closest to `name`, or `T::default()` (Go zero value) when none is close
@@ -23422,6 +23452,7 @@ mod tests {
         go_has_suffix, go_len, go_map_runes, go_runes, go_slice, go_string_bytes,
         go_string_from_bytes, go_string_from_utf8, go_to_valid_utf8, go_unit_at, go_unit_before,
         go_value, go_value_from_bytes, is_line_break, port_byte_offset, utf16_len,
+        utf16_len_of_range,
     };
 
     /// Go (WTF-8) bytes of a rune, as Go `EncodeJSStringRune` writes it.
@@ -23562,6 +23593,48 @@ mod tests {
             let (gb, b) = &pair[1];
             assert_eq!(compare_go_strings(a, b), ga.cmp(gb), "{a:?} {b:?}");
             assert_eq!(a == b, ga == gb, "{a:?} {b:?}");
+        }
+    }
+
+    /// `utf16_len_of_range` is Go `core.UTF16Len(s[start:end])` when the
+    /// range cuts a char. The 9 slices and their Go counts are from the Go
+    /// model of the sweepN2 11133 panic (`utf16cut/main.go`, Go 1.27.1, the
+    /// pin N `UTF16Len`): the source map line of `parserSkippedTokens16.ts`
+    /// with its 2-byte char, and cuts of a 3-byte and a 4-byte char. Each
+    /// other range of the two texts must also count as Go counts its bytes.
+    #[test]
+    fn utf16_len_of_range_counts_cut_chars_as_go() {
+        let line = "function Foo      () \u{AC}   { }";
+        let text = "x\u{20AC}y\u{1F600}z";
+        let go_counts = [
+            (line, 0, 22, 22),
+            (line, 21, 22, 1),
+            (line, 22, 25, 3),
+            (line, 0, 25, 24),
+            (text, 0, 3, 3),
+            (text, 2, 4, 2),
+            (text, 0, 7, 5),
+            (text, 5, 9, 2),
+            (text, 3, 6, 3),
+        ];
+        for (s, start, end, go) in go_counts {
+            assert_eq!(
+                utf16_len_of_range(s, start, end),
+                go,
+                "{s:?}[{start}:{end}]"
+            );
+        }
+        for s in [line, text] {
+            for start in 0..=s.len() {
+                for end in start..=s.len() {
+                    let go = go_utf16_len(&s.as_bytes()[start..end]);
+                    assert_eq!(
+                        utf16_len_of_range(s, start, end),
+                        go,
+                        "{s:?}[{start}:{end}]"
+                    );
+                }
+            }
         }
     }
 

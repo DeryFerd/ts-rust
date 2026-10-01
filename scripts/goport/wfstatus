@@ -3,14 +3,20 @@
 
 usage: wfstatus [--all] [--session ID]   one line per workflow: state, name, agents done/started,
                                          running labels, age. Default: running ones and the last 8.
+                                         "stale": the journal says running, but no agent of the run
+                                         wrote for STALE_HOURS (its session ended); it is not counted.
        wfstatus <run-id> [--full]        each agent's label, phase and result (600 chars, or all),
                                          then the workflow's return value when it has finished.
+       wfstatus <run-id> --save FILE     write every agent result in full ("## label [phase]" sections)
+                                         and the workflow result to FILE, then print its section lines.
 Reads ~/.claude/projects/<ts-rust>/<session>/{workflows,subagents/workflows}. The newest session
 is the default; --session picks another (a prefix is enough).
 """
 import argparse, glob, json, os, sys, time
 
 PROJECT = os.path.expanduser('~/.claude/projects/-home-theo-Code-sandbox-ts-rust')
+# A live agent writes its transcript at least every 10 minutes (the Bash timeout is at most 600 s).
+STALE_HOURS = 2
 
 
 def sessions():
@@ -22,6 +28,7 @@ def load_run(session, run):
     """(summary dict, per-agent list) for one workflow run."""
     agents, results = {}, {}
     journal = f'{session}subagents/workflows/{run}/journal.jsonl'
+    last = max(os.path.getmtime(f) for f in glob.glob(f'{session}subagents/workflows/{run}/*.jsonl'))
     with open(journal) as f:
         for line in f:
             try:
@@ -39,12 +46,34 @@ def load_run(session, run):
     scripts = glob.glob(f'{PROJECT}*/{sid}/workflows/scripts/*{run}.js')
     name = meta.get('workflowName') or next((os.path.basename(p)[:-len(run) - 4] for p in scripts), '?')
     rows = [{**a, 'agentId': k, 'done': k in results, 'result': results.get(k)} for k, a in agents.items()]
-    return {'run': run, 'name': name, 'state': meta.get('status', 'running'), 'meta': meta,
+    state = meta.get('status', 'running')
+    if state == 'running' and time.time() - last > STALE_HOURS * 3600:
+        state = 'stale'
+    return {'run': run, 'name': name, 'state': state, 'meta': meta,
             'age': time.time() - os.path.getmtime(journal), 'started': os.path.getctime(journal)}, rows
 
 
 def fmt_age(s):
     return f'{s / 3600:.1f}h' if s >= 3600 else f'{s / 60:.0f}m'
+
+
+def text_of(v):
+    return v if isinstance(v, str) else json.dumps(v, indent=1)
+
+
+def save(info, rows, path):
+    """Writes every agent result and the workflow result to path; prints the section lines."""
+    parts = [f"## {r['label']} [{r['phase']}] ({r['agentId']})\n\n{text_of(r['result'])}\n" for r in rows if r['done']]
+    if info['meta'].get('result') is not None:
+        parts.append(f"## workflow result\n\n{text_of(info['meta']['result'])}\n")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    body = '\n'.join(parts)
+    with open(path, 'w') as f:
+        f.write(body)
+    print(f"{info['run']} {info['name']} {info['state']}: {len(parts)} sections, {len(body):,} chars in {path}")
+    for n, line in enumerate(body.splitlines(), 1):
+        if line.startswith('## '):
+            print(f'{n}:{line}')
 
 
 def main():
@@ -53,6 +82,7 @@ def main():
     ap.add_argument('--all', action='store_true')
     ap.add_argument('--full', action='store_true')
     ap.add_argument('--session')
+    ap.add_argument('--save', metavar='FILE')
     ap.add_argument('-h', '--help', action='store_true')
     a = ap.parse_args()
     if a.help:
@@ -70,6 +100,9 @@ def main():
         if len(match) != 1:
             sys.exit(f'wfstatus: {len(match)} runs match {a.run}')
         info, rows = load_run(session, match[0])
+        if a.save:
+            save(info, rows, a.save)
+            return
         print(f"{info['run']} {info['name']} {info['state']}, {sum(r['done'] for r in rows)}/{len(rows)} agents done")
         for r in rows:
             text = r['result'] if isinstance(r['result'], str) else json.dumps(r['result'])
@@ -83,8 +116,10 @@ def main():
         return
     infos = sorted((load_run(session, r) for r in runs), key=lambda x: x[0]['started'])
     running = [x for x in infos if x[0]['state'] == 'running']
-    shown = infos if a.all else [x for x in infos if x in running or x in infos[-8:]]
-    print(f'session {os.path.basename(session.rstrip("/"))}: {len(running)} running, {len(infos)} runs')
+    stale = [x for x in infos if x[0]['state'] == 'stale']
+    shown = infos if a.all else [x for x in infos if x in running or x in stale or x in infos[-8:]]
+    print(f'session {os.path.basename(session.rstrip("/"))}: {len(running)} running, {len(infos)} runs'
+          + (f', {len(stale)} stale (no agent wrote for {STALE_HOURS} h)' if stale else ''))
     for info, rows in shown:
         busy = [r['label'] for r in rows if not r['done']]
         tail = f" running: {', '.join(busy[:6])}{' ...' if len(busy) > 6 else ''}" if busy else ''

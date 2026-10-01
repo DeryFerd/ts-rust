@@ -94,3 +94,28 @@ Short polls went from 9.18 to 0.31 per subagent-hour. Most subagent waits now us
 - Also added: AGENTS.md "Workflow changes" (do not resume a workflow after changing a later phase; a resume on 2026-09-28 re-ran 9 finished port lanes), "Pin" (main-based work sets GOPORT_PIN until the default pin switch) and "Host locks" (a subagent ran a job over raw ssh on a locked host during a host move).
 - Not done: gate stages across hosts, more cargo concurrency, a symbol index, smaller contexts (as recommended).
 - Item 4 follow-up (root): the onboarding workflow (`4c3530ea2`) found that `run auto` never held its lock (ssh closed the fd) and that 0 of 41 new agents used `run auto`, mostly because root prompts named hosts and paraphrased the brief. Fixed: remote.sh `look`, `job`, `push`, `sync-pin`, `status`; `run <host>` locks itself; `scripts/goport/facts`; AGENTS.md now says to paste the brief word for word and name hosts only for timing. Target changed to rawSsh near 0.
+
+## Re-audit, 2026-09-30
+
+`scripts/audit/metrics.py --since 2026-09-28T08:10:00Z`: 868 subagents, 68,466 tool calls, 428 subagent-hours, 25 revisions (R125 to R149; 21 accepted, 0 lost tests in each).
+
+| metric | baseline | now | target |
+|---|---|---|---|
+| shortPollsPerSubagentHour | 9.18 | 0.02 | met |
+| askUserQuestions | 3 (4.3 h) | 0 | met |
+| formatOnlyRevisions | 1 | 0 real (the old regex also counted R127, "rustfmt and clippy clean") | met |
+| builds.goport hours | 36.7 | 3.2 | met |
+| rawSsh | 842 | 77 (3 after 2026-09-29 08:00) | met |
+| journalParses / wfstatus | 106 / 0 | 53 / 191 | missed |
+| medianCallsBeforeFirstEdit | 43 | 45 | missed |
+
+Findings and fixes (one line each):
+
+- Revision gate waits: the gate takes 11 minutes, but R148 and R149 waited 104 and 45 minutes for the dbook lock behind skeptic timing jobs. Fix: remote.sh keeps dbook-lan for revision evidence (`auto` skips it; `run` and `job` need `REMOTE_USE_RESERVED=1`, which candidate.sh sets); timing moves to mini-abf9 and mini-743d.
+- Journal parses: root parsed `journal.jsonl` to save workflow results to a file. Fix: `wfstatus <run> --save FILE`.
+- Ghost runs: two workflows from the 2026-09-29 session crash showed as running for 38 hours. Fix: wfstatus shows `stale` when no agent wrote for 2 hours and does not count it.
+- Calls before the first edit: agents read the headers of candidate.sh (629 times), remote.sh (381) and run-cargo-capped.sh (208) to learn their usage; none had `--help`. Fix: `help` on each, and the brief lists them.
+- Lib blobs: 97 commits touched the two blobs, with 38 binary merge conflicts and 96 failing stale-blob tests (59 agents). Fix: `scripts/goport/lib-blobs.sh` (`stale` without a build, `write`, `check`), `candidate.sh check` runs `stale`, and `.gitattributes` with `merge.lib-blob.driver true` keeps our blob in a merge. The static check matched every "write the lib blobs again" commit and had 0 false positives on 40 main commits.
+- Context size: 22.4 B context tokens. The 37 lane agents used 15% (some reached 999k and compacted); the reused R113 auditor and reviewer used 1.0 B at up to 997k. Fix: AGENTS.md starts a new auditor and reviewer when a batch opens, and sizes lanes under 500k.
+- Small retries (1.3% of calls fail): 74 `sleep N; cmd` blocks, 16 blocked report Writes (92 agents then wrote with a heredoc), 13 `rm -rf "$VAR"` safety blocks. Fix: one line each in the brief.
+- Not measured: whether the 190 skeptic and verify agents (about 12% of tokens) find problems that the auditor and reviewer would miss.

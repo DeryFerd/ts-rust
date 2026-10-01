@@ -8,7 +8,7 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
 - `measure.sh`, `measure-extra.sh`, `sweep.sh`: the project comparisons that `bound2.sh` and `gate.sh` use.
 - `perf.sh <label> <bin>...`: median of 3 wall time and peak RSS on Query, Hono, zod and effect,
   runs interleaved across the binaries. It refuses to start above load 1.5 (`PERF_WAIT=1` waits
-  for a quiet host). zbook is rarely quiet: run it on dbook-lan or mini-abf9.
+  for a quiet host). zbook is rarely quiet: run it on mini-abf9 or mini-743d.
 - `facts [section...]`: in one call, the paths and versions agents look up before their first edit: main
   against origin, the accepted revision (commit, bins checked against the gate manifest, gate, evidence),
   the Go pins with checkouts and oracles, the project tsconfigs, the newest lane bins, active `goport-*`
@@ -267,15 +267,17 @@ Do not use raw `ssh` or `rsync`. `look` reaches the host over the right route (t
 names) with zbook's paths (alvin through its `zbook-paths` wrapper, dbook with `HOME=/home/theo`).
 `pin.py sync <host>` uses the ssh config route, which is Tailscale for the minis: use `remote.sh sync-pin`.
 
-Root: name a host in an agent prompt only for timing that needs zbook-class hardware (dbook-lan). Other
-jobs use `auto`. Record each package install or other host change in
+Root: name a host in an agent prompt only for timing. Other jobs use `auto`. dbook-lan is kept for
+revision evidence (`remote.sh help`, "Reserved"): timing that needs zbook-class hardware runs there with
+`REMOTE_USE_RESERVED=1` only when root names it and no revision run waits for it. Record each package install or other host change in
 `target/continuation-r97-goport/remote/<host>-setup.md`.
 
 - alvin, cup2: cloud hosts for gates, corpus suites, sweeps and oracle checks. alvin has no sudo. cup2
   has `sudo -n` and `/usr/local/sbin/fleet-pkg-install`.
 - dbook (ssh host `dbook-lan`): LAN host with zbook's CPU (Ryzen AI Max+ 395, 32 threads) but
-  only 26 GB RAM. It runs gates and checks, and quiet timing on zbook-class hardware when no gate
-  runs. Every dbook job takes the same lock, timing included, so the two never overlap.
+  only 26 GB RAM. It is kept for revision evidence: `candidate.sh side` runs the gate and the
+  oracles there, `auto` skips it, and `run` and `job` refuse it without `REMOTE_USE_RESERVED=1`.
+  Every dbook job takes the same lock, timing included, so the two never overlap.
   dbook is on the same LAN as zbook: always use `dbook-lan` (dbook.local), never the Tailscale
   name `dbook`. `remote.sh` maps `dbook` to `dbook-lan`.
 - mini-743d (Ryzen 7 8845HS) and mini-abf9 (ssh alias `mini-abf9-1`, Ryzen 7 255): LAN minis with

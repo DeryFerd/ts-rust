@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build-time benchmark of ts_goport: one timed `cargo build -p ts_goport --bins` per call.
-# Run it on a quiet host (dbook-lan or a mini) under that host's lock. Compare numbers only
+# Run it on a quiet host (mini-abf9 or mini-743d) under that host's lock. Compare numbers only
 # within one host.
 #
 # usage: buildbench.sh <out-dir> <label> <toolchain> <profile> <action> [rustflags]

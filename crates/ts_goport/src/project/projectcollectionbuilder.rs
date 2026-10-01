@@ -2529,6 +2529,7 @@ impl ProjectCollectionBuilder {
                     p.content_mapper_watch = content_mapper_watch;
                     p.content_mapper_watched_files = Some(Rc::new(content_mapper_watched_files));
                     p.program = Some(Rc::clone(&result.program));
+                    p.program_file_refs = Some(Rc::clone(&result.file_refs));
                     p.checker_pool = Some(checker_pool);
                     p.program_update_kind = result.update_kind;
                     p.program_last_update = self.new_snapshot_id;
