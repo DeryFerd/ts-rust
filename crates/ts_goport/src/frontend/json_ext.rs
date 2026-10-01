@@ -866,6 +866,14 @@ impl MarshalerTo for i32 {
     }
 }
 
+// Go: arshal_default.go:470 makeIntArshaler (marshal), for Go `int`
+impl MarshalerTo for i64 {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        enc.push_str(&self.to_string());
+        Ok(())
+    }
+}
+
 // Go: arshal_default.go:569 makeUintArshaler (marshal)
 impl MarshalerTo for u32 {
     fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {

@@ -209,7 +209,10 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         );
     let mut max_node_module_js_depth = 0;
     if let Some(p) = opts.config.compiler_options().max_node_module_js_depth {
-        max_node_module_js_depth = p;
+        // PORT: Go `int` (64-bit). The loader depth is `i32`; the file depth
+        // is small and not negative, so a saturated limit compares the same.
+        max_node_module_js_depth =
+            i32::try_from(p).unwrap_or(if p < 0 { i32::MIN } else { i32::MAX });
     }
     let current_directory = opts.host.get_current_directory().to_string();
     let mut loader = FileLoader {
@@ -2086,20 +2089,21 @@ mod tests {
         }
     }
 
-    /// Loads a one-file project with `compilerOptions` and returns the base
-    /// names of the lib files in the program.
-    fn lib_file_names(label: &str, compiler_options: &str) -> Vec<String> {
+    /// Writes `files` (path, text) and a tsconfig.json with `tsconfig` to a
+    /// temp dir, loads the program and returns its file names in program
+    /// order: paths relative to the dir, or the base name for a lib file.
+    fn program_file_names(label: &str, tsconfig: &str, files: &[(&str, &str)]) -> Vec<String> {
         let dir = std::env::temp_dir().join(format!(
             "ts_goport_file_loader_{label}_{}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.ts"), "export const a = 1;\n").unwrap();
-        std::fs::write(
-            dir.join("tsconfig.json"),
-            format!(r#"{{ "compilerOptions": {compiler_options}, "files": ["a.ts"] }}"#),
-        )
-        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        std::fs::write(dir.join("tsconfig.json"), tsconfig).unwrap();
         let cwd = dir.to_string_lossy().replace('\\', "/");
         let fs = bundled::wrap_fs(osvfs_fs());
         let sys = System {
@@ -2129,11 +2133,35 @@ mod tests {
             true,
         );
         let _ = std::fs::remove_dir_all(&dir);
+        let prefix = format!("{cwd}/");
         processed
             .files
             .iter()
-            .map(|file| get_base_file_name(file.file_name()))
-            .filter(|name| name.starts_with("lib."))
+            .map(|file| match file.file_name().strip_prefix(&prefix) {
+                Some(relative) => relative.to_string(),
+                None => get_base_file_name(file.file_name()),
+            })
+            .collect()
+    }
+
+    /// Loads a one-file project with `compilerOptions` and returns the base
+    /// names of the lib files in the program.
+    fn lib_file_names(label: &str, compiler_options: &str) -> Vec<String> {
+        program_file_names(
+            label,
+            &format!(r#"{{ "compilerOptions": {compiler_options}, "files": ["a.ts"] }}"#),
+            &[("a.ts", "export const a = 1;\n")],
+        )
+        .into_iter()
+        .filter(|name| name.starts_with("lib."))
+        .collect()
+    }
+
+    /// Program files that are not lib files.
+    fn user_file_names(label: &str, tsconfig: &str, files: &[(&str, &str)]) -> Vec<String> {
+        program_file_names(label, tsconfig, files)
+            .into_iter()
+            .filter(|name| !name.starts_with("lib."))
             .collect()
     }
 
@@ -2151,5 +2179,54 @@ mod tests {
     fn absent_lib_loads_default_lib() {
         let names = lib_file_names("absent", r#"{ "target": "es2015" }"#);
         assert!(names.iter().any(|name| name == "lib.es6.d.ts"), "{names:?}");
+    }
+
+    // Go fileloader.go:839 adds the implicit jsx-runtime import only to a
+    // JS or JSX file (IsSourceFileJS reads the script kind) or a TSX file.
+    // A JSON file also has the JAVA_SCRIPT_FILE flag, but gets no import.
+    #[test]
+    fn json_file_gets_no_jsx_runtime_import() {
+        let names = user_file_names(
+            "json_jsx",
+            r#"{ "compilerOptions": { "jsx": "react-jsx", "jsxImportSource": "preact",
+                 "module": "esnext", "moduleResolution": "bundler",
+                 "resolveJsonModule": true, "types": [] },
+                 "files": ["a.ts"] }"#,
+            &[
+                (
+                    "a.ts",
+                    "import d from \"./d.json\";\nexport const x = d.a;\n",
+                ),
+                ("d.json", "{ \"a\": 1 }\n"),
+                (
+                    "node_modules/preact/package.json",
+                    "{ \"name\": \"preact\" }\n",
+                ),
+                ("node_modules/preact/jsx-runtime/index.d.ts", "export {};\n"),
+            ],
+        );
+        assert_eq!(names, ["d.json", "a.ts"]);
+    }
+
+    // Go fileloader.go:852 adds the importHelpers tslib import to a JS file
+    // or a non-declaration module, never to a JSON file.
+    #[test]
+    fn json_file_gets_no_tslib_import() {
+        let names = user_file_names(
+            "json_tslib",
+            r#"{ "compilerOptions": { "importHelpers": true, "module": "esnext",
+                 "moduleResolution": "bundler", "resolveJsonModule": true, "types": [] },
+                 "files": ["a.ts", "d.json"] }"#,
+            &[
+                ("a.ts", "const x = 1;\n"),
+                ("d.json", "{ \"a\": 1 }\n"),
+                (
+                    "node_modules/tslib/package.json",
+                    "{ \"name\": \"tslib\", \"types\": \"tslib.d.ts\" }\n",
+                ),
+                ("node_modules/tslib/tslib.d.ts", "export {};\n"),
+            ],
+        );
+        assert_eq!(names, ["a.ts", "d.json"]);
     }
 }

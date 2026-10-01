@@ -635,9 +635,9 @@ fn get_option_value(
     }
 }
 
-/// Go `strconv.Atoi`: an optional sign and decimal digits that fit an int.
-// PORT: Go `int` is 64-bit; the option values fit `i32`.
-fn go_atoi(value: &str) -> Option<i32> {
+/// Go `strconv.Atoi`: an optional sign and decimal digits that fit a
+/// 64-bit int.
+fn go_atoi(value: &str) -> Option<i64> {
     let digits = value
         .strip_prefix('+')
         .or_else(|| value.strip_prefix('-'))
@@ -645,7 +645,7 @@ fn go_atoi(value: &str) -> Option<i32> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    value.parse::<i32>().ok()
+    value.parse::<i64>().ok()
 }
 
 // Go: harnessutil.go:462 cachedCompilerHost
