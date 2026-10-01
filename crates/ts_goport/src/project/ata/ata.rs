@@ -8,21 +8,29 @@
 //! or `&Option<Rc<LogTree>>` (both implement the trait, as Go's nil-safe
 //! loggers do). Go `vfs.FS` parameters are `&dyn vfs::Fs`.
 //!
-//! npm runs through `ThrottleGroup` (`frontend::core_workgroup`), which runs
-//! each `tg.Go` body at once on the calling (dispatch) thread. The work does
-//! not go through `gostd::local::go`: `tg.Wait()` must see its result.
+//! PORT: Go runs each ATA request on a goroutine that blocks while npm runs.
+//! The port's request is a future (the Go functions that reach npm are
+//! `async fn`, and each Go blocking point is an `.await`). `run_task` polls
+//! it on the dispatch thread. An executor that gives `npm_install_func`
+//! (the LSP server) runs npm on a helper thread, so a slow npm does not delay
+//! requests; without it (the test mock) npm runs in the first poll and the
+//! whole request ends at once, as before.
 
 use crate::project::ata::prelude::*;
 
 use crate::frontend::core_ext::TypeAcquisition;
-use crate::frontend::core_workgroup;
 use crate::frontend::json::{self, JsonDecoder, JsonError, UnmarshalerFrom, json_unmarshal_decode};
 use crate::frontend::json_ext::{LspAny, unmarshal_struct_fields};
 use crate::frontend::{module, semver, tspath, vfs};
 use crate::gostd::{self, Context, GoError};
 use crate::project::logging::{self, Logger as _};
 use std::cell::Cell;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
+use std::task::{Poll, Waker};
+use std::time::Duration;
 
 // Go: project/ata/ata.go:21 TypingsInfo
 // PORT: the Go pointers are shared and read only, so they are `Rc`; nil is
@@ -83,6 +91,26 @@ pub trait NpmExecutor {
     // is non-nil (installWorker logs it), so the result is a pair, not a
     // `Result`. `None` is Go's nil error.
     fn npm_install(&self, cwd: &str, args: &[String]) -> (Vec<u8>, Option<GoError>);
+
+    /// PORT: no Go counterpart. A `Send` form of `npm_install` that ATA runs
+    /// on a helper thread (`TypingsInstaller::npm_install`), or `None` to run
+    /// `npm_install` on the calling thread.
+    fn npm_install_func(&self) -> Option<NpmInstallFunc> {
+        None
+    }
+}
+
+/// PORT: the `Send` form of `NpmExecutor::npm_install`.
+pub type NpmInstallFunc = Arc<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>) + Send + Sync>;
+
+/// PORT: Go `sync.Once` of `TypingsInstaller.initOnce`. `Running` while the
+/// first `init` waits for npm; Go blocks the other callers of `Do` until the
+/// body ends, and the port's callers wait for `Done`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnceState {
+    NotStarted,
+    Running,
+    Done,
 }
 
 // Go: project/ata/ata.go:47 TypingsInstallerHost
@@ -104,7 +132,7 @@ pub struct TypingsInstaller {
     pub typings_location: String,
     pub host: Rc<dyn TypingsInstallerHost>,
 
-    pub init_once: Cell<bool>,
+    pub init_once: Cell<OnceState>,
 
     pub package_name_to_typing_location: RefCell<IndexMap<String, Rc<CachedTyping>>>,
     pub missing_typings_set: RefCell<FxHashMap<String, bool>>,
@@ -123,7 +151,7 @@ pub fn new_typings_installer(
     Rc::new(TypingsInstaller {
         typings_location: options.typings_location.clone(),
         host,
-        init_once: Cell::new(false),
+        init_once: Cell::new(OnceState::NotStarted),
         package_name_to_typing_location: RefCell::new(IndexMap::default()),
         missing_typings_set: RefCell::new(FxHashMap::default()),
         types_registry: RefCell::new(FxHashMap::default()),
@@ -153,7 +181,13 @@ impl TypingsInstaller {
             return false;
         }
         // Strada did this lazily - is that needed here to not waiting on and returning false on first request
-        self.init(&project_id.string(), fs, logger);
+        // PORT: no Go caller at pin N. Go blocks in `initOnce.Do` while an
+        // ATA request runs init. That request goes on only on the dispatch
+        // thread, so the port panics instead of waiting forever.
+        if self.init_once.get() == OnceState::Running {
+            panic!("ata: IsKnownTypesPackageName waits for an init on the dispatch thread");
+        }
+        block_on(self.init(&project_id.string(), fs, logger));
         self.types_registry.borrow().contains_key(name)
     }
 }
@@ -191,12 +225,13 @@ impl TypingsInstaller {
     // PORT: Go also has the unexported `installTypings` on this type, so the
     // exported Go `InstallTypings` is `install_typings_exported` (PORTING
     // "Names"). Go returns `(*TypingsInstallResult, error)` with a nil
-    // result on error, so the result is a `Result`.
-    pub fn install_typings_exported(
+    // result on error, so the result is a `Result`. PORT: async (see the
+    // file comment).
+    pub async fn install_typings_exported(
         &self,
         request: &TypingsInstallRequest,
     ) -> Result<TypingsInstallResult, GoError> {
-        let mut result = self.discover_and_install_typings(request);
+        let mut result = self.discover_and_install_typings(request).await;
         if let Ok(result) = &mut result {
             result.typings_files.sort();
             result.files_to_watch.sort();
@@ -209,11 +244,12 @@ impl TypingsInstaller {
     }
 
     // Go: project/ata/ata.go:121 discoverAndInstallTypings
-    pub fn discover_and_install_typings(
+    pub async fn discover_and_install_typings(
         &self,
         request: &TypingsInstallRequest,
     ) -> Result<TypingsInstallResult, GoError> {
-        self.init(&request.project_id.string(), &*request.fs, &request.logger);
+        self.init(&request.project_id.string(), &*request.fs, &request.logger)
+            .await;
 
         let (cached_typing_paths, new_typing_names, files_to_watch) = discover_typings(
             &*request.fs,
@@ -231,12 +267,14 @@ impl TypingsInstaller {
         if !new_typing_names.is_empty() {
             let filtered_typings = self.filter_typings(&request.logger, &new_typing_names);
             if !filtered_typings.is_empty() {
-                let typings_files = self.install_typings(
-                    request_id,
-                    &cached_typing_paths,
-                    &filtered_typings,
-                    &request.logger,
-                )?;
+                let typings_files = self
+                    .install_typings(
+                        request_id,
+                        &cached_typing_paths,
+                        &filtered_typings,
+                        &request.logger,
+                    )
+                    .await?;
                 return Ok(TypingsInstallResult {
                     typings_files,
                     files_to_watch,
@@ -261,7 +299,7 @@ impl TypingsInstaller {
 
     // Go: project/ata/ata.go:161 installTypings
     // ts#64319: no project ID or typings info parameters.
-    pub fn install_typings(
+    pub async fn install_typings(
         &self,
         request_id: i32,
         currently_cached_typings: &[String],
@@ -289,7 +327,9 @@ impl TypingsInstaller {
             scoped_typings[i] = format!("@types/{package_name}@{TS_VERSION_TO_USE}"); // @tscore.VersionMajorMinor) // This is normally @tsVersionMajorMinor but for now lets use latest
         }
 
-        let (package_names, ok) = self.install_worker(request_id, &scoped_typings, logger);
+        let (package_names, ok) = self
+            .install_worker(request_id, &scoped_typings, logger)
+            .await;
         if ok {
             // PORT: Go `%v` of a slice; log text is not compared.
             logger.log(&format!("ATA:: Installed typings {package_names:?}"));
@@ -400,7 +440,7 @@ impl TypingsInstaller {
 
     // Go: project/ata/ata.go:261 installWorker
     // ts#64319: no project ID parameter.
-    pub fn install_worker(
+    pub async fn install_worker(
         &self,
         request_id: i32,
         package_names: &[String],
@@ -412,11 +452,11 @@ impl TypingsInstaller {
             self.typings_location
         ));
         let ctx = gostd::context::background();
-        let err = install_npm_packages(
+        let err = install_npm_packages_async(
             &ctx,
             package_names,
             &self.concurrency_semaphore,
-            &|package_names: &[String]| -> Result<(), GoError> {
+            |package_names| async move {
                 let mut npm_args: Vec<String> = Vec::new();
                 npm_args.extend(["install".to_string(), "--ignore-scripts".to_string()]);
                 npm_args.extend(package_names.iter().cloned());
@@ -424,7 +464,7 @@ impl TypingsInstaller {
                     "--save-dev".to_string(),
                     format!("--user-agent=\"typesInstaller/{}\"", crate::core::version()),
                 ]);
-                let (output, err) = self.host.npm_install(&self.typings_location, &npm_args);
+                let (output, err) = self.npm_install(&self.typings_location, &npm_args).await;
                 if let Some(err) = err {
                     // PORT: Go `%s` of a `[]byte`.
                     logger.log(&format!(
@@ -435,22 +475,82 @@ impl TypingsInstaller {
                 }
                 Ok(())
             },
-        );
+        )
+        .await;
         logger.log(&format!("TI:: npm install #{request_id} completed"));
         (package_names.to_vec(), err.is_ok())
+    }
+
+    /// PORT: Go `ti.host.NpmInstall(cwd, args)`. With the host's
+    /// `npm_install_func`, npm runs on a helper thread and the future is
+    /// ready when the thread has sent the result (Go: the goroutine blocks in
+    /// `exec.Cmd.Output`). Without it, npm runs in the first poll.
+    async fn npm_install(&self, cwd: &str, args: &[String]) -> (Vec<u8>, Option<GoError>) {
+        let Some(npm_install) = self.host.npm_install_func() else {
+            return self.host.npm_install(cwd, args);
+        };
+        let (cwd, args) = (cwd.to_string(), args.to_vec());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut start = Some(move |waker: Waker| {
+            std::thread::Builder::new()
+                .name("ata-npm".to_string())
+                .spawn(move || {
+                    let _ = tx.send(npm_install(&cwd, &args));
+                    waker.wake();
+                })
+                .expect("ata: failed to start the npm thread");
+        });
+        poll_fn(|cx| {
+            if let Some(start) = start.take() {
+                start(cx.waker().clone());
+            }
+            match rx.try_recv() {
+                Ok(result) => Poll::Ready(result),
+                Err(TryRecvError::Empty) => Poll::Pending,
+                // The npm function panicked on the helper thread.
+                Err(TryRecvError::Disconnected) => Poll::Ready((
+                    Vec::new(),
+                    Some(gostd::errors::new("npm install: the helper thread failed")),
+                )),
+            }
+        })
+        .await
     }
 }
 
 // Go: project/ata/ata.go:284 installNpmPackages
-// PORT: Go `concurrencySemaphore chan struct{}` is the `sync_channel` pair.
-// `ThrottleGroup::go` runs each body at once, in call order.
+// PORT: the Go test entry; it runs `install_npm_packages_async` to its end
+// with `install_packages` as each body.
 pub fn install_npm_packages(
     ctx: &Context,
     package_names: &[String],
     concurrency_semaphore: &(SyncSender<()>, Receiver<()>),
     install_packages: &dyn Fn(&[String]) -> Result<(), GoError>,
 ) -> Result<(), GoError> {
-    let tg = core_workgroup::new_throttle_group(ctx, concurrency_semaphore);
+    block_on(install_npm_packages_async(
+        ctx,
+        package_names,
+        concurrency_semaphore,
+        |packages| std::future::ready(install_packages(packages)),
+    ))
+}
+
+// Go: project/ata/ata.go:284 installNpmPackages
+// PORT: each `tg.Go` body is a future. The bodies run at the same time, each
+// while it holds a semaphore slot, and the result is the first error, as
+// `tg.Wait()` gives.
+pub async fn install_npm_packages_async<'a, Fut>(
+    ctx: &Context,
+    package_names: &'a [String],
+    concurrency_semaphore: &(SyncSender<()>, Receiver<()>),
+    install_packages: impl Fn(&'a [String]) -> Fut,
+) -> Result<(), GoError>
+where
+    Fut: Future<Output = Result<(), GoError>> + 'a,
+{
+    // Go: tg := core.NewThrottleGroup(ctx, concurrencySemaphore)
+    let _ = ctx;
+    let mut tg: Vec<Pin<Box<dyn Future<Output = Result<(), GoError>> + '_>>> = Vec::new();
 
     let mut current_command_start: usize = 0;
     let mut current_command_end: usize = 0;
@@ -462,7 +562,10 @@ pub fn install_npm_packages(
             current_command_end += 1;
         } else {
             let packages = &package_names[current_command_start..current_command_end];
-            tg.go(|| install_packages(packages));
+            tg.push(Box::pin(throttled(
+                concurrency_semaphore,
+                install_packages(packages),
+            )));
             current_command_start = current_command_end;
             current_command_size = 100 + package_name.len() + 1;
             current_command_end += 1;
@@ -472,10 +575,100 @@ pub fn install_npm_packages(
     // Handle the final batch
     if current_command_start < package_names.len() {
         let packages = &package_names[current_command_start..current_command_end];
-        tg.go(|| install_packages(packages));
+        tg.push(Box::pin(throttled(
+            concurrency_semaphore,
+            install_packages(packages),
+        )));
     }
 
-    tg.wait()
+    // Go: tg.Wait()
+    let mut first_err: Option<GoError> = None;
+    poll_fn(|cx| {
+        tg.retain_mut(|body| match body.as_mut().poll(cx) {
+            Poll::Ready(result) => {
+                if let Err(err) = result {
+                    first_err.get_or_insert(err);
+                }
+                false
+            }
+            Poll::Pending => true,
+        });
+        if tg.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// PORT: Go `ThrottleGroup.Go` takes a semaphore slot before the body
+/// starts and frees it when the body ends. A full semaphore (npm calls of
+/// other ATA requests) waits.
+async fn throttled<T>(
+    semaphore: &(SyncSender<()>, Receiver<()>),
+    body: impl Future<Output = T>,
+) -> T {
+    poll_fn(|_| match semaphore.0.try_send(()) {
+        Ok(()) => Poll::Ready(()),
+        Err(TrySendError::Full(())) => Poll::Pending,
+        Err(TrySendError::Disconnected(())) => panic!("ata: semaphore closed"),
+    })
+    .await;
+    let result = body.await;
+    let _ = semaphore.1.try_recv();
+    result
+}
+
+/// PORT: how often `run_task` polls a waiting ATA request.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// PORT: runs `task`, the rest of an ATA goroutine, on the dispatch thread.
+/// It polls `task` now and, while `task` waits (for npm on a helper thread,
+/// a semaphore slot or another request's `init`), again every
+/// `POLL_INTERVAL` in a `gostd::local::after_func` timer: a timer is the
+/// only wake-up of the dispatch thread. A `background::TaskHold` moved into
+/// `task` keeps the background task running until `task` ends. A later poll
+/// runs under `core::go_wait_group_task`, as the queue runs the task.
+pub fn run_task(mut task: Pin<Box<dyn Future<Output = ()>>>) {
+    let mut cx = std::task::Context::from_waker(Waker::noop());
+    if task.as_mut().poll(&mut cx).is_ready() {
+        return;
+    }
+    let mut task = Some(task);
+    gostd::local::after_func(
+        POLL_INTERVAL,
+        Box::new(move || {
+            if let Some(task) = task.take() {
+                crate::core::go_wait_group_task(|| run_task(task));
+            }
+        }),
+    );
+}
+
+/// PORT: runs `fut` to its end on this thread, for a Go caller that blocks
+/// (`IsKnownTypesPackageName`, the test entry `install_npm_packages`). It
+/// parks until the helper thread of an npm call wakes it.
+pub fn block_on<T>(fut: impl Future<Output = T>) -> T {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
+            return value;
+        }
+        std::thread::park();
+    }
 }
 
 impl TypingsInstaller {
@@ -538,13 +731,31 @@ impl TypingsInstaller {
     }
 
     // Go: project/ata/ata.go:354 init
-    // PORT: `initOnce.Do` is a `Cell<bool>` guard, set before the body runs
-    // (Go marks the Once done even if the body panics).
-    pub fn init(&self, project_id: &str, fs: &dyn vfs::Fs, logger: &dyn logging::Logger) {
-        if self.init_once.get() {
-            return;
+    // PORT: `initOnce.Do` is the `OnceState` cell. A caller that comes while
+    // another request's body waits for npm waits until it is `Done`, as Go's
+    // `Do` blocks. The body sets `Done` when it ends, also on a panic (Go
+    // marks the Once done even if the body panics).
+    pub async fn init(&self, project_id: &str, fs: &dyn vfs::Fs, logger: &dyn logging::Logger) {
+        match self.init_once.get() {
+            OnceState::Done => return,
+            OnceState::Running => {
+                poll_fn(|_| match self.init_once.get() {
+                    OnceState::Done => Poll::Ready(()),
+                    _ => Poll::Pending,
+                })
+                .await;
+                return;
+            }
+            OnceState::NotStarted => {}
         }
-        self.init_once.set(true);
+        self.init_once.set(OnceState::Running);
+        struct SetDone<'a>(&'a Cell<OnceState>);
+        impl Drop for SetDone<'_> {
+            fn drop(&mut self) {
+                self.0.set(OnceState::Done);
+            }
+        }
+        let _done = SetDone(&self.init_once);
 
         logger.log(&format!(
             "ATA:: Global cache location '{}'",
@@ -565,14 +776,16 @@ impl TypingsInstaller {
 
         self.ensure_typings_location_exists(fs, logger);
         logger.log("ATA:: Updating types-registry@latest npm package...");
-        let (_, err) = self.host.npm_install(
-            &self.typings_location,
-            &[
-                "install".to_string(),
-                "--ignore-scripts".to_string(),
-                "types-registry@latest".to_string(),
-            ],
-        );
+        let (_, err) = self
+            .npm_install(
+                &self.typings_location,
+                &[
+                    "install".to_string(),
+                    "--ignore-scripts".to_string(),
+                    "types-registry@latest".to_string(),
+                ],
+            )
+            .await;
         match err {
             None => {
                 logger.log("ATA:: Updated types-registry npm package");

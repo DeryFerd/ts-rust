@@ -125,7 +125,8 @@ fn write_lock<T>(m: &RwLock<T>, value: T) {
 // PORT: Go `In`, `Out` and `Err` move to the reader, writer and logging
 // threads, so they are `Send`. `NpmInstall` and `SetParentProcessID` are
 // nil-able Go funcs (`None`). `NpmInstall` returns Go's `([]byte, error)`
-// pair, as `ata::NpmExecutor` does.
+// pair, as `ata::NpmExecutor` does, and is `Send`: ATA runs it on a helper
+// thread (`ata::NpmExecutor::npm_install_func`).
 pub struct ServerOptions {
     pub in_: Box<dyn Reader + Send>,
     pub out: Box<dyn Writer + Send>,
@@ -136,7 +137,8 @@ pub struct ServerOptions {
     pub default_library_path: String,
     pub typings_location: String,
     pub parse_cache: Option<Rc<project::ParseCache>>,
-    pub npm_install: Option<Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>)>>,
+    pub npm_install:
+        Option<Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>) + Send + Sync>>,
     // Spawn launches a child process, returning its stdio as an io.ReadWriteCloser (Read is its stdout,
     // Write is its stdin). It is nil when the host cannot spawn processes. Currently used for content mappers.
     // PORT: tsgo#4712. The Go func returns an `io.ReadWriteCloser`; the
@@ -216,7 +218,7 @@ pub fn new_server(opts: ServerOptions) -> Rc<Server> {
         init_complete: Cell::new(false),
         compiler_options_for_inferred_projects: RefCell::new(None),
         parse_cache,
-        npm_install,
+        npm_install: npm_install.map(Arc::from),
         spawn,
         content_mapper_extensions_registered: Cell::new(false),
         cpu_profiler: crate::pprof::CpuProfiler::default(),
@@ -478,7 +480,7 @@ pub struct Server {
     // parseCache can be passed in so separate tests can share ASTs
     pub parse_cache: Option<Rc<project::ParseCache>>,
 
-    pub npm_install: Option<Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>)>>,
+    pub npm_install: Option<ata::NpmInstallFunc>,
     // tsgo#4712
     pub spawn: Option<Rc<contentmapper::SpawnFn>>,
 
@@ -4630,6 +4632,11 @@ impl ata::NpmExecutor for Server {
             .npm_install
             .as_ref()
             .unwrap_or_else(|| crate::core::go_nil_dereference()))(cwd, args)
+    }
+
+    // PORT: see `ata::NpmExecutor::npm_install_func`.
+    fn npm_install_func(&self) -> Option<ata::NpmInstallFunc> {
+        self.npm_install.clone()
     }
 }
 
