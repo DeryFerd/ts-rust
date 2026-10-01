@@ -108,13 +108,14 @@ fn main() {
     // The thread ends the process itself once `run_main` has written the
     // output, so the exit does not wait for the thread stacks (up to 1 GiB
     // each, `max_stack_size`) to unmap, the thread-local destructors or the
-    // join.
-    let work = std::thread::Builder::new()
+    // join. Go runs `runMain` on the main goroutine. A thread that cannot
+    // start ends the process as the Go runtime does (`GoThread`).
+    let work = ts_goport::core::GoThread::new()
         .name("tsgo".to_string())
         .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || exit(run_main(start)));
-    // Reached only when the thread cannot start or `run_main` panics.
-    let _ = work.map(std::thread::JoinHandle::join);
+    // Reached only when `run_main` panics.
+    let _ = work.join();
     eprintln!("tsgo: work thread failed");
     std::process::exit(EXIT_UNPORTED);
 }

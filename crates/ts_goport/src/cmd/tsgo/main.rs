@@ -39,23 +39,23 @@ pub fn run_main(args: &[String]) -> Option<i32> {
 }
 
 // PORT: runs `f` on a new thread with the Go maximum stack
-// (`gostd::stack::max_stack_size`) and returns its status.
+// (`gostd::stack::max_stack_size`) and returns its status. Go runs it on
+// the main goroutine. A thread that cannot start ends the process as the
+// Go runtime does (`GoThread`).
 // A panic that reaches the top of that thread ends Go with a crash. A Go
 // panic (`core::go_panic`) ends it as the Go runtime does, as `bin/tsgo.rs`
 // does: `panic: <message>` on stderr and `EXIT_GO_PANIC` (2). Any other
 // panic is a port gap: goport returns `EXIT_UNPORTED` (70), as
 // `bin/goport.rs` does for a failed worker.
 fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
-    let worker = std::thread::Builder::new()
+    let worker = crate::core::GoThread::new()
         .name("tsgo".to_string())
         .stack_size(crate::gostd::stack::max_stack_size())
         .spawn(move || f(args));
-    match worker.map(std::thread::JoinHandle::join) {
-        Ok(Ok(code)) => code,
-        Ok(Err(payload)) if crate::core::print_go_panic(payload.as_ref()) => {
-            crate::core::EXIT_GO_PANIC
-        }
-        _ => crate::execute::tsc::EXIT_UNPORTED,
+    match worker.join() {
+        Ok(code) => code,
+        Err(payload) if crate::core::print_go_panic(payload.as_ref()) => crate::core::EXIT_GO_PANIC,
+        Err(_) => crate::execute::tsc::EXIT_UNPORTED,
     }
 }
 
@@ -85,7 +85,7 @@ pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
             let _ = done.register_waker(move || handle.close());
         }
         let cancel = cancel.clone();
-        std::thread::Builder::new()
+        crate::core::GoThread::new()
             .name("signal.NotifyContext".to_string())
             .spawn(move || {
                 // Go: select { case s := <-c.ch: ...; case <-c.Done(): }
@@ -93,8 +93,7 @@ pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
                     let text = format!("{} signal received", signal_string(s));
                     cancel(Some(errors::from_value(SignalError(text))));
                 }
-            })
-            .expect("signal.NotifyContext: failed to start the goroutine");
+            });
     }
     // Go: signal.go:310 signalCtx.stop
     let stop: CancelFunc = Arc::new(move || {

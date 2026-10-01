@@ -522,7 +522,7 @@ pub fn spawn_process(
     // Go copies a non-file `cmd.Stderr` on a goroutine.
     let stderr = stderr_copy.map(|(stream, reader, mut writer)| {
         let (done_tx, done) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        crate::core::GoThread::new().spawn(move || {
             let _ = std::io::copy(&mut &reader, &mut writer);
             let _ = done_tx.send(());
         });
@@ -841,7 +841,7 @@ pub fn spawn_process(
     // Go copies a non-file `cmd.Stderr` on a goroutine.
     let stderr_done = stderr_copy.map(|(mut reader, mut writer)| {
         let (done_tx, done) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        crate::core::GoThread::new().spawn(move || {
             let _ = std::io::copy(&mut reader, &mut writer);
             let _ = done_tx.send(());
         });

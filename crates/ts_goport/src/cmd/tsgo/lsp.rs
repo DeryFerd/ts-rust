@@ -157,7 +157,7 @@ pub fn start_parent_process_watchdog(ctx: &Context, stop: &CancelFunc, parent_pi
     }
     let ctx = ctx.clone();
     let stop = stop.clone();
-    std::thread::Builder::new()
+    crate::core::GoThread::new()
         .name("lsp-watchdog".to_string())
         .spawn(move || {
             // Go: ticker := time.NewTicker(5 * time.Second); defer ticker.Stop()
@@ -184,8 +184,7 @@ pub fn start_parent_process_watchdog(ctx: &Context, stop: &CancelFunc, parent_pi
                     return;
                 }
             }
-        })
-        .expect("lsp: failed to start the parent watchdog goroutine");
+        });
 }
 
 // Go: vfs/osvfs/os.go:224 GetGlobalTypingsCacheLocation

@@ -742,7 +742,7 @@ fn flush_writes(
     };
     std::thread::scope(|scope| {
         for _ in 1..threads {
-            scope.spawn(&work);
+            crate::core::GoThread::new().spawn_scoped(scope, &work);
         }
         work();
     });

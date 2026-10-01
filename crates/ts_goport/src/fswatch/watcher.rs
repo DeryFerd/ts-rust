@@ -1185,8 +1185,8 @@ impl WatcherBase {
     // event for a new directory walks it (`walk_dir`), one call per level.
     pub fn run(&self) -> Result<(), GoError> {
         let self_impl = self.self_impl();
-        let thread = std::thread::Builder::new().stack_size(crate::gostd::stack::max_stack_size());
-        let spawned = thread.spawn(move || {
+        let thread = crate::core::GoThread::new().stack_size(crate::gostd::stack::max_stack_size());
+        thread.spawn(move || {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| self_impl.start()));
             match result {
                 Ok(Ok(())) => {}
@@ -1208,7 +1208,6 @@ impl WatcherBase {
                 }
             }
         });
-        spawned.expect("fswatch: failed to start the watcher goroutine");
         self.started.wait();
         let b = self.mu.lock().unwrap();
         match &b.start_err {

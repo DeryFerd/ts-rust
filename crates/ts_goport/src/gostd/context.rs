@@ -29,11 +29,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 // PORT: Go `go f()`.
 fn go(f: Box<dyn FnOnce() + Send>) {
-    std::thread::Builder::new()
+    crate::core::GoThread::new()
         .name("goroutine".to_string())
         .stack_size(crate::gostd::stack::max_stack_size())
-        .spawn(f)
-        .expect("context: failed to start a goroutine");
+        .spawn(f);
 }
 
 /// A Context carries a deadline, a cancellation signal, and other values
