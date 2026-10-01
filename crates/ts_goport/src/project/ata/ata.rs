@@ -1,7 +1,7 @@
 //! Go `internal/project/ata/ata.go`.
 //!
-//! PORT: one thread (see `project/dirty/interfaces.rs`). `sync.Once` is a
-//! `Cell<bool>` guard, `atomic.Int32` a `Cell<i32>`, and
+//! PORT: one thread (see `project/dirty/interfaces.rs`). `sync.Once` is an
+//! `OnceState` cell, `atomic.Int32` a `Cell<i32>`, and
 //! `collections.SyncMap` a `RefCell` map. `TypingsInstaller` methods take
 //! `&self` like the Go pointer receiver. Go `logging.Logger` parameters are
 //! `&dyn logging::Logger`, so a caller can pass `&Option<Rc<dyn Logger>>`
@@ -14,7 +14,7 @@
 //! it on the dispatch thread. An executor that gives `npm_install_func`
 //! (the LSP server) runs npm on a helper thread, so a slow npm does not delay
 //! requests; without it (the test mock) npm runs in the first poll and the
-//! whole request ends at once, as before.
+//! whole request ends in that poll.
 
 use crate::project::ata::prelude::*;
 
