@@ -211,7 +211,10 @@ pub fn go_fatal_newosproc(err: &std::io::Error) -> ! {
 /// `std::thread::Builder` for a thread that runs work Go runs on
 /// goroutines. A start that the OS refuses goes as a Go runtime thread
 /// start goes (`newosproc`): it tries again while the error is EAGAIN, then
-/// ends the process with Go's text (`go_fatal_newosproc`).
+/// ends the process with Go's text (`go_fatal_newosproc`). Do not start one
+/// while this thread holds a lock that one of its thread-local destructors
+/// takes: the exit runs those destructors (glibc `exit`), and the process
+/// hangs.
 #[derive(Default)]
 pub struct GoThread {
     name: Option<String>,

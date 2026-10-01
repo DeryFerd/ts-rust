@@ -468,11 +468,16 @@ impl LocalTimerInner {
         let mut timers = lock(&self.shared.timers);
         let pending = timers.arm(self.id, when);
         if !timers.thread_running {
+            // The start runs without the lock. A start that fails ends the
+            // process, and the exit drops this thread's `LocalState`, which
+            // takes the lock. Only this thread arms timers, so no other
+            // start can come between.
+            drop(timers);
             let shared = self.shared.clone();
             crate::core::GoThread::new()
                 .name("local-timer".to_string())
                 .spawn(move || run_local_timers(shared));
-            timers.thread_running = true;
+            lock(&self.shared.timers).thread_running = true;
         } else if timers.due.first() == Some(&(when, self.id)) {
             self.shared.timers_changed.notify_all();
         }
