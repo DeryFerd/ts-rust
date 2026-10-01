@@ -91,9 +91,10 @@ fn write_kept(kept: &mut Vec<u8>) -> io::Result<()> {
     result
 }
 
-/// Writes the bytes that `CliStdout` keeps, for a run that ends without its
-/// `flush` (a thrown signal). It does not wait for a writer that holds the
-/// lock: that writer can be the thread that the signal stops.
+/// Writes the bytes that `CliStdout` keeps, before a write to stderr that
+/// does not go through `Stderr`: a thrown signal, which ends the run without
+/// its `flush`, and the panic hook. It does not wait for a writer that holds
+/// the lock: that writer can be the thread that the signal stops.
 pub fn flush_cli_stdout_at_exit() {
     if let Ok(mut kept) = CLI_STDOUT.try_lock() {
         let _ = write_kept(&mut kept);
