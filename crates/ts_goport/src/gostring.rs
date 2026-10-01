@@ -692,9 +692,9 @@ pub fn compare_go_strings(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-/// The Go bytes of a unit that is not an invalid byte (see
-/// `compare_go_strings`).
-fn go_unit_bytes(unit: GoUnit, buf: &mut [u8; 4]) -> &[u8] {
+/// The Go bytes of a unit, written to `buf` (see `compare_go_strings` and
+/// ls `get_possible_symbol_reference_positions`).
+pub fn go_unit_bytes(unit: GoUnit, buf: &mut [u8; 4]) -> &[u8] {
     match unit {
         GoUnit::Surrogate(cp) => {
             *buf = [

@@ -4635,11 +4635,11 @@ pub fn to_api_text_edits(source_file: Node, edits: &[lsproto::TextEdit]) -> Opti
     let position_map = compute_position_map(&original_text);
     let mut result = Vec::with_capacity(edits.len());
     for edit in edits {
-        let (start, ok) = original_text_offset(&line_map, &edit.range.start, original_text.len());
+        let (start, ok) = original_text_offset(&line_map, &edit.range.start, &original_text);
         if !ok {
             return None;
         }
-        let (end, ok) = original_text_offset(&line_map, &edit.range.end, original_text.len());
+        let (end, ok) = original_text_offset(&line_map, &edit.range.end, &original_text);
         if !ok {
             return None;
         }
@@ -4653,20 +4653,38 @@ pub fn to_api_text_edits(source_file: Node, edits: &[lsproto::TextEdit]) -> Opti
 }
 
 // Go: api/session.go:2067 originalTextOffset (tsgo#4712)
-// PORT: Go `int` arithmetic is `i64` here; the offset is at most the text
-// length, so it fits the `i32` that `PositionMap` takes.
+// PORT: Go takes `len(originalText)`; the port takes the text. The API
+// session uses the UTF-8 encoding, so `position.character` counts Go bytes
+// after the line start. Port offsets differ from Go offsets after a marker
+// unit (see `scanner_util::GO_STRING_MARKER`), so the Go bytes after the
+// line start give the port offset (`port_byte_offset`), as
+// `Converters::line_and_character_to_position` does. Go does not stop at the
+// line end, and `port_byte_offset` counts the bytes past the end, so the
+// offset is past the port end exactly when Go's is past the Go end. A
+// unit has at least as many port bytes as Go bytes, so a `character` past
+// the port bytes after the line start is past the end without a scan (and
+// fits no `i32`). Go `int` arithmetic is `i64` here; the offset is at most
+// the text length, so it fits the `i32` that `PositionMap` takes.
 pub fn original_text_offset(
     line_map: &lsconv::LSPLineMap,
     position: &lsproto::Position,
-    text_length: usize,
+    text: &str,
 ) -> (i32, bool) {
     let line = i64::from(position.line);
     if line < 0 || line >= line_map.line_starts.len() as i64 {
         return (0, false);
     }
-    let line_start = i64::from(line_map.line_starts[line as usize]);
-    let offset = line_start + i64::from(position.character);
-    if offset < line_start || offset > text_length as i64 {
+    let line_start = line_map.line_starts[line as usize] as usize;
+    let rest = &text[line_start..];
+    if i64::from(position.character) > rest.len() as i64 {
+        return (0, false);
+    }
+    let offset = line_start as i64
+        + i64::from(crate::scanner_util::port_byte_offset(
+            rest,
+            position.character as i32,
+        ));
+    if offset < line_start as i64 || offset > text.len() as i64 {
         return (0, false);
     }
     (offset as i32, true)
@@ -4725,5 +4743,60 @@ mod textedit_tests {
                 new_text: "x".to_string(),
             }])
         );
+    }
+
+    // PORT: no Go test. The characters count Go bytes; marker units (an
+    // invalid byte, a WTF-8 lone surrogate, a real U+FDD0, see
+    // `scanner_util::GO_STRING_MARKER`) have more port bytes than Go bytes.
+    // Go reads `ab\xe9cd` on line 1 at Go offset 2: character 3 is `c` (Go
+    // offset 5, UTF-16 offset 5).
+    #[test]
+    fn to_api_text_edits_counts_go_bytes() {
+        let edit = |line: u32, start: u32, end: u32| lsproto::TextEdit {
+            range: lsproto::Range {
+                start: lsproto::Position {
+                    line,
+                    character: start,
+                },
+                end: lsproto::Position {
+                    line,
+                    character: end,
+                },
+            },
+            new_text: "x".to_string(),
+        };
+        // (Go bytes, line, start, end, UTF-16 pos and end; None past the end)
+        let cases: [(&[u8], u32, u32, u32, Option<(i32, i32)>); 6] = [
+            (b"\xe9\nab\xe9cd", 1, 3, 4, Some((5, 6))),
+            (b"\xe9\nab\xe9cd", 1, 5, 5, Some((7, 7))),
+            (b"\xe9\nab\xe9cd", 1, 6, 6, None),
+            // A WTF-8 lone surrogate is 3 Go bytes and one UTF-16 unit (Go
+            // `DecodeJSStringRune` in `ComputePositionMap`).
+            (b"a\xed\xa0\x80b\r\nc", 0, 4, 5, Some((2, 3))),
+            // A real U+FDD0 is 3 Go bytes and one UTF-16 unit.
+            ("\u{FDD0}\u{FDD0}x\ny".as_bytes(), 0, 6, 7, Some((2, 3))),
+            ("\u{FDD0}\u{FDD0}x\ny".as_bytes(), 1, 0, 1, Some((4, 5))),
+        ];
+        for (bytes, line, start, end, want) in cases {
+            let original_text = crate::scanner_util::go_string_from_bytes(bytes.to_vec());
+            let source_file = Rc::new(parser::parse_source_file(
+                &SourceFileParseOptions {
+                    file_name: "/app.vue".to_string(),
+                    path: tspath::Path("/app.vue".to_string()),
+                    ..Default::default()
+                },
+                "const transformed = true;",
+                ScriptKind::TS,
+            ));
+            crate::program::note_parsed_source_file(&source_file);
+            source_file.set_content_mapper_info(ContentMapperSourceFileInfo {
+                original_text,
+                content_mapper: "mapper".to_string(),
+                ..Default::default()
+            });
+            let edits = to_api_text_edits(source_file.root, &[edit(line, start, end)]);
+            let got = edits.map(|edits| (edits[0].pos, edits[0].end));
+            assert_eq!(got, want, "{bytes:?} line {line} {start}..{end}");
+        }
     }
 }

@@ -3,6 +3,7 @@
 use crate::ls::prelude::*;
 
 use crate::frontend::json::{MarshalerTo, json_marshal, json_unmarshal};
+use crate::scanner_util::{contains_go_string_marker, go_byte_offset, port_byte_offset};
 use crate::spanmap::Feature;
 
 impl LanguageService {
@@ -30,6 +31,7 @@ impl LanguageService {
         let mut projections = vec![file];
         projections.extend_from_slice(source_file_supplemental_source_files(file));
         for projection in projections {
+            let first = result.len();
             let mut visitor = CodeLensVisitor {
                 ls: self,
                 ctx,
@@ -45,6 +47,21 @@ impl LanguageService {
             visitor.visit(projection);
             result = visitor.result;
             seen = visitor.seen;
+            // PORT: Go writes `data.position` as a Go byte offset
+            // (`newCodeLensForNode`), and the client sends it back on
+            // resolve. Port offsets differ from Go offsets after a marker
+            // unit (see `scanner_util::GO_STRING_MARKER`), so the lenses of
+            // this projection leave with Go offsets (`go_byte_offset`) and
+            // `resolve_code_lens` maps them back. Text without a marker
+            // needs no scan for each lens.
+            let text = source_file_text(projection);
+            if contains_go_string_marker(&text) {
+                for code_lens in &mut result[first..] {
+                    if let Some(data) = &mut code_lens.data {
+                        data.position = go_byte_offset(&text, data.position);
+                    }
+                }
+            }
         }
 
         Ok(lsproto::CodeLensResponse {
@@ -170,17 +187,15 @@ impl LanguageService {
                 Vec::new(),
             ));
         }
+        // PORT: `data.position` is a Go byte offset (see
+        // `provide_code_lenses`).
+        let position = port_byte_offset(&source_file_text(file), data.position);
         let locale = locale::from_context(ctx);
         let mut locs: Vec<lsproto::Location> = Vec::new();
         let mut lens_title = String::new();
         if data.kind == lsproto::CodeLensKind::REFERENCES {
             let (symbol_data, _) = self.provide_symbols_and_entries_at_position(
-                ctx,
-                program,
-                file,
-                data.position,
-                false,
-                false,
+                ctx, program, file, position, false, false,
             );
             let references_resp = self.provide_references_from_data(
                 ctx,
@@ -214,14 +229,8 @@ impl LanguageService {
                 );
             }
         } else if data.kind == lsproto::CodeLensKind::IMPLEMENTATIONS {
-            let (symbol_data, _) = self.provide_symbols_and_entries_at_position(
-                ctx,
-                program,
-                file,
-                data.position,
-                false,
-                true,
-            );
+            let (symbol_data, _) = self
+                .provide_symbols_and_entries_at_position(ctx, program, file, position, false, true);
             let implementations = self.provide_implementations_from_data(
                 ctx,
                 &lsproto::ImplementationParams {
@@ -292,7 +301,9 @@ fn to_lsp_any<T: MarshalerTo + ?Sized>(value: &T) -> LspAny {
 
 impl LanguageService {
     // Go: ls/codelens.go:167 newCodeLensForNode
-    // PORT: Go returns `*lsproto.CodeLens`; nil is `None`.
+    // PORT: Go returns `*lsproto.CodeLens`; nil is `None`. `data.position`
+    // is the port offset here; `provide_code_lenses` maps it to the Go
+    // offset once for each projection.
     pub fn new_code_lens_for_node(
         &self,
         file_uri: &lsproto::DocumentUri,
