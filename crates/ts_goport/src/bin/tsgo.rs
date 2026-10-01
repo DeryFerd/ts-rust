@@ -422,6 +422,7 @@ fn go_runtime_start() {
 /// another thread is in its cleanup.
 #[cfg(target_os = "linux")]
 fn throw(name: &str) -> ! {
+    ts_goport::execute::tsc::stdio::flush_cli_stdout_at_exit();
     let line = format!("{name}\n");
     let _ = rustix::io::write(rustix::stdio::stderr(), line.as_bytes());
     if let Some(worker) = worker() {
