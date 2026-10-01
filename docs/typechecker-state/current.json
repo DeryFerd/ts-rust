@@ -785,12 +785,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "aae6dbb734c07335a",
+      "agent": "aa8aeb96011e4e4f6",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "a0bc38f3370585da3",
+      "agent": "ab50eb2835151f711",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R150 pipeline (candidate.sh side)."
