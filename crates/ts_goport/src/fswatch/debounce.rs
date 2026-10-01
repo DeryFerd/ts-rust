@@ -6,7 +6,7 @@
 
 use crate::fswatch::prelude::*;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 // Go: debounce.go:8 defaultMinWaitTime, defaultMaxWaitTime
@@ -17,6 +17,45 @@ pub const DEFAULT_MAX_WAIT_TIME: Duration = Duration::from_millis(500);
 // PORT: Go package vars that only tests change; statics here.
 pub static MIN_WAIT_TIME: Duration = DEFAULT_MIN_WAIT_TIME;
 pub static MAX_WAIT_TIME: Duration = DEFAULT_MAX_WAIT_TIME;
+
+/// PORT: not in Go. How many debouncers deliver a fire now
+/// (`fire_callbacks`). In Go a callback that sends on a channel
+/// (watchmanager `signalDoCycle`) makes the receiver the next goroutine of
+/// the sender's P, so the receiver nearly always runs after the debounce
+/// goroutine has delivered the whole fire. A port thread wakes at once on
+/// another CPU, so the receiver waits for the fire (`wait_for_fires`).
+static FIRING: Mutex<usize> = Mutex::new(0);
+static FIRES_DONE: Condvar = Condvar::new();
+
+/// PORT: not in Go. Waits until no debouncer delivers a fire (see `FIRING`).
+pub fn wait_for_fires() {
+    let mut firing = FIRING.lock().unwrap();
+    while *firing > 0 {
+        firing = FIRES_DONE.wait(firing).unwrap();
+    }
+}
+
+/// Counts one fire in `FIRING` while it lives, also when a callback panics.
+struct Firing;
+
+impl Firing {
+    fn start() -> Firing {
+        *FIRING.lock().unwrap() += 1;
+        Firing
+    }
+}
+
+impl Drop for Firing {
+    fn drop(&mut self) {
+        let mut firing = FIRING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *firing -= 1;
+        if *firing == 0 {
+            FIRES_DONE.notify_all();
+        }
+    }
+}
 
 // Go: debounce.go:28 debounce
 /// debounce batches filesystem events for one backend. Each *watcher
@@ -140,6 +179,7 @@ impl Debounce {
     // Go: debounce.go:109 debounce.fireCallbacks
     /// fireCallbacks snapshots and invokes all registered callbacks.
     pub fn fire_callbacks(&self) {
+        let _firing = Firing::start();
         let cbs: Vec<Arc<dyn Fn() + Send + Sync>> = {
             let mut d = self.mu.lock().unwrap();
             d.last_time = Some(Instant::now());

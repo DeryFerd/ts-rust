@@ -429,7 +429,11 @@ impl WatchManager {
     // Go: watchmanager.go:331 WatchManager.RunLoop
     // PORT: Go selects on `ctx.Done()` and `doCycleCh`. The port waits on
     // the channel with a timeout and checks `ctx.err()` (PORTING "Go
-    // runtime"). `doCycle` is the caller's DoCycle method value.
+    // runtime"). `doCycle` is the caller's DoCycle method value. After a
+    // signal, the cycle waits until the debouncer has delivered the fire
+    // that sent it (`fswatch::wait_for_fires`), as Go's does: otherwise it
+    // can drain a deleted directory's event before that fire's "watch
+    // terminated" overflow, and then build a second time.
     pub fn run_loop(&self, ctx: &Context, do_cycle: &mut dyn FnMut()) {
         const CTX_POLL_INTERVAL: Duration = Duration::from_millis(50);
         loop {
@@ -438,7 +442,10 @@ impl WatchManager {
                 return;
             }
             match self.do_cycle_ch.recv_timeout(CTX_POLL_INTERVAL) {
-                Ok(()) => do_cycle(),
+                Ok(()) => {
+                    fswatch::wait_for_fires();
+                    do_cycle();
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     // PORT: cannot happen; `shared` keeps the sender alive.
@@ -615,9 +622,9 @@ impl DirWatchSet {
 
 // PORT: Go `fmt.Fprintf(w, ...)` on the callback thread, where `w` is the
 // real system's `os.Stdout` (see the file comment). Errors are ignored as
-// in Go.
+// in Go. `text` is in the port form, so this writes its Go bytes.
 fn write_stdout(text: &str) {
     let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(text.as_bytes());
+    let _ = stdout.write_all(&crate::scanner_util::go_string_bytes(text));
     let _ = stdout.flush();
 }

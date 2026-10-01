@@ -11,8 +11,11 @@
 
 use crate::fswatch::prelude::*;
 
+use crate::frontend::vfs::osvfs::go_string_from_os;
 use crate::fswatch::unix;
 use crate::gostd::errors;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 
 // Go: walkdir_unix.go:14 walkState
 /// walkState carries state shared across the whole walk so we only
@@ -160,8 +163,10 @@ pub fn read_dir_entries(fd: i32, buf: &mut [u8]) -> Result<Vec<UnixDirent>, GoEr
             if let Some(i) = name_bytes.iter().position(|&b| b == 0) {
                 name_bytes = &name_bytes[..i];
             }
-            // PORT: Go names are bytes; a non-UTF-8 name is converted lossily.
-            let name = String::from_utf8_lossy(name_bytes).into_owned();
+            // PORT: Go names are bytes. The port form keeps the bytes of a
+            // non-UTF-8 name (`go_string_from_os`), and the `unix` shim
+            // passes them back to the OS.
+            let name = go_string_from_os(OsStr::from_bytes(name_bytes));
             if name != "." && name != ".." {
                 entries.push(UnixDirent {
                     name,

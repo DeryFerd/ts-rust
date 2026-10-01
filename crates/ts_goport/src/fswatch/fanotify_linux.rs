@@ -18,9 +18,12 @@ use crate::fswatch::prelude::*;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use crate::frontend::vfs::osvfs::go_string_from_os;
 use crate::fswatch::unix;
 use crate::fswatch::walkdir_unix::walk_dir;
 use crate::gostd::errors;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 
 // ---------------------------------------------------------------------------
 // fanotify_linux.go: Linux fanotify backend
@@ -1048,8 +1051,9 @@ pub fn parse_fanotify_fid_record(data: &[u8], has_name: bool) -> Option<Fanotify
             if let Some(i) = name_data.iter().position(|&c| c == 0) {
                 name_data = &name_data[..i];
             }
-            // PORT: Go names are bytes; a non-UTF-8 name is converted lossily.
-            name = String::from_utf8_lossy(name_data).into_owned();
+            // PORT: Go names are bytes; the port form keeps them (see
+            // walkdir_unix.rs `read_dir_entries`).
+            name = go_string_from_os(OsStr::from_bytes(name_data));
         }
     }
 
