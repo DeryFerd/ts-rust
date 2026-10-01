@@ -1060,3 +1060,30 @@ fn win_cut_path(path: &[u8]) -> Option<(&[u8], &[u8])> {
     let i = path.iter().position(|&c| win_is_path_separator(c))?;
     Some((&path[..i], &path[i + 1..]))
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // PORT: not in Go. Go `os.Chtimes` (utimensat on the path) sets the
+    // mtime of a file that its owner cannot read; so does `chtimes`.
+    #[test]
+    fn chtimes_without_read_permission() {
+        let dir = std::env::temp_dir().join(format!("ts_goport_chtimes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.js");
+        std::fs::write(&file, "x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let m_time = SystemTime::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 5);
+        let result = osvfs_fs().chtimes(file.to_str().unwrap(), None, Some(m_time));
+        let modified = std::fs::symlink_metadata(&file)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_ok());
+        assert_eq!(modified, m_time);
+    }
+}
