@@ -892,6 +892,7 @@ program version:
 | `err.Error()` | `err.error()` |
 | `go f()` that touches dispatch-thread state | `gostd::local::go(Box::new(f))`: FIFO on the dispatch thread, run by `local::run_pending()` |
 | `go f()` over `Send` data only | `std::thread::spawn` |
+| `go f()` that waits for other-thread work (a child process, a channel), then touches dispatch-thread state | the wait on a `std::thread::spawn` thread that calls `post()` on the handle of `gostd::local::post_later(Box::new(rest))` when it ends; `rest` then runs in `local::run_pending()`, with no poll before (ATA npm) |
 | `sync.WaitGroup`, `wg.Go`, `core.WorkGroup`, `errgroup` over dispatch-thread state | serial, in Go start order, like Go's single-threaded `WorkGroup`; keep the `ctx.err()` checks (the cross-project search is the one exception, see "Threads") |
 | `errgroup.WithContext` over `Send` loops | `gostd::errgroup` (real threads) |
 | `chan T` with capacity n / unbuffered | `std::sync::mpsc::sync_channel(n)` / `sync_channel(0)`; `select` with `default` is `try_send` / `try_recv`; `select` on `ctx.Done()` is a `recv_timeout` loop that checks `ctx.err()` (PORT note) |

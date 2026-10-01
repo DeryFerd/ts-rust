@@ -15,6 +15,11 @@
 //! `run_pending()`, and `wait_pending()` while a queued task sleeps on a
 //! timer, until the queue's tasks have finished.
 //!
+//! A job that waits for another thread is `post_later(f)`: the other
+//! thread posts the `Send` handle it returns once, when its work ends, and
+//! `f` then runs in `run_pending` like a `go` job (Go: a goroutine that a
+//! channel send makes runnable). Nothing runs or polls before the post.
+//!
 //! Idle work (`go_idle`) is a second, separate queue for long work that
 //! sends nothing to the client (the auto-import warm). The dispatch loop
 //! runs it with `run_idle()` only after a quiet period with no message, so
@@ -28,15 +33,16 @@
 //! after a message, so the free is not in the answer time. On other
 //! threads `drop_later` drops at once.
 //!
-//! The queues are per thread: `go`, `go_idle`, `after_func`, `run_pending`,
-//! `run_idle`, `drop_later` and `drop_garbage` act on the calling thread's
-//! queues.
+//! The queues are per thread: `go`, `post_later`, `go_idle`, `after_func`,
+//! `run_pending`, `run_idle`, `drop_later` and `drop_garbage` act on the
+//! calling thread's queues.
 
 use crate::prelude::*;
 
 use std::any::Any;
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -52,9 +58,13 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 struct LocalShared {
     /// Ready work in the order it became ready.
     queue: Mutex<VecDeque<Entry>>,
-    /// Signalled when a timer thread adds to `queue` (for `wait_pending`).
+    /// Signalled when a timer thread or a `Post` adds to `queue` (for
+    /// `wait_pending`).
     ready: Condvar,
     waker: Mutex<Option<Waker>>,
+    /// `Post` handles that have not posted yet. A post changes it while it
+    /// holds the `queue` lock, after it queues its job.
+    posts: AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -84,6 +94,7 @@ thread_local! {
             queue: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
             waker: Mutex::new(None),
+            posts: AtomicUsize::new(0),
         }),
         next_id: Cell::new(1),
         jobs: RefCell::new(FxHashMap::default()),
@@ -109,6 +120,48 @@ pub fn go(f: Box<dyn FnOnce()>) {
         l.jobs.borrow_mut().insert(id, f);
         lock(&l.shared.queue).push_back(Entry::Job(id));
     });
+}
+
+/// The `Send` handle of `post_later`.
+pub struct Post {
+    id: u64,
+    shared: Arc<LocalShared>,
+}
+
+/// Go `go f()` where `f` first waits for work on another thread (a
+/// goroutine that blocks on a channel or a child process, then touches
+/// dispatch-thread state). `f` waits on this thread until the other thread
+/// calls `post` on the handle; then it is queued like a `go` job and the
+/// waker is called. Until then `wait_pending` waits for it.
+pub fn post_later(f: Box<dyn FnOnce()>) -> Post {
+    let id = next_id();
+    let shared = LOCAL.with(|l| {
+        l.jobs.borrow_mut().insert(id, f);
+        l.shared.posts.fetch_add(1, Ordering::SeqCst);
+        l.shared.clone()
+    });
+    Post { id, shared }
+}
+
+impl Post {
+    /// Queues the job on its thread, once. Dropping the handle posts it
+    /// too, so the job also runs when the other thread panics.
+    pub fn post(self) {}
+}
+
+impl Drop for Post {
+    fn drop(&mut self) {
+        {
+            let mut queue = lock(&self.shared.queue);
+            queue.push_back(Entry::Job(self.id));
+            self.shared.posts.fetch_sub(1, Ordering::SeqCst);
+            self.shared.ready.notify_all();
+        }
+        let waker = lock(&self.shared.waker).clone();
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
 }
 
 /// Queues `f` as idle work on this thread. The dispatch loop runs it with
@@ -199,8 +252,9 @@ pub fn has_pending() -> bool {
 }
 
 /// Blocks until ready work waits for `run_pending`. Returns false at once
-/// when nothing is ready and no timer of this thread is armed, so nothing
-/// can become ready (only this thread arms timers).
+/// when nothing is ready, no timer of this thread is armed and no `Post`
+/// of this thread waits, so nothing can become ready (only this thread arms
+/// timers and makes posts).
 pub fn wait_pending() -> bool {
     let shared = LOCAL.with(|l| l.shared.clone());
     loop {
@@ -209,21 +263,24 @@ pub fn wait_pending() -> bool {
         }
         // A timer state lock is not taken under the queue lock: the timer
         // thread takes them in the other order.
-        let armed = LOCAL.with(|l| {
-            l.timers
-                .borrow()
-                .values()
-                .any(|t| lock(&t.core.state).when.is_some())
-        });
+        let armed = shared.posts.load(Ordering::SeqCst) > 0
+            || LOCAL.with(|l| {
+                l.timers
+                    .borrow()
+                    .values()
+                    .any(|t| lock(&t.core.state).when.is_some())
+            });
         if !armed {
             // A timer that fired after the first check cleared `when` and
-            // queued its entry under one hold of its state lock, so the
-            // entry is there now.
+            // queued its entry under one hold of its state lock, and a post
+            // queued its job before it counted down, so the entry is there
+            // now.
             return has_pending();
         }
         let queue = lock(&shared.queue);
         if queue.is_empty() {
-            // The timeout only bounds a missed signal; a due timer signals.
+            // The timeout only bounds a missed signal; a due timer and a
+            // post signal.
             drop(shared.ready.wait_timeout(queue, Duration::from_millis(50)));
         }
     }
