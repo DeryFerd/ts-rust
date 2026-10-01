@@ -655,14 +655,26 @@ pub(crate) struct ProgramState {
 // PORT: Go frees them with the program. `GoProgram` and `ProgramState`
 // stay leaked (checker code holds `&'static` borrows of them), so the
 // tables are behind an `Arc` that `release_program` drops.
+// PERF: a version that replaces files of the version it was updated from
+// in place (Go `ReuseProgram`) starts from that version's tables and
+// changes only the entries of the replaced files (`build_program` in
+// `go_frontend`). So the tables that hold paths are by slot, and the slot
+// of a replaced file does not change (editfast1).
 pub(crate) struct VersionTables {
     /// File ids in Go `Program.SourceFiles()` order
-    /// (`GoProgram::source_file_order`).
+    /// (`GoProgram::source_file_order`). The slot of a program file is its
+    /// position here.
     source_file_order: Vec<usize>,
-    file_by_path: FxHashMap<String, usize>,
-    /// The Go `SourceFile` fields that the program sets, by file id, for
-    /// each program file.
-    file_meta: FxHashMap<usize, FileProgramMeta>,
+    /// The ids of the files that `file_by_path` names and that are not
+    /// program files: slot `source_file_order.len() + i` is file
+    /// `other_files[i]`.
+    other_files: Vec<usize>,
+    /// The slot of the file at each path (`file_at_path`). Versions with
+    /// the same paths in the same slots share it.
+    file_by_path: Arc<FxHashMap<String, usize>>,
+    /// The Go `SourceFile` fields that the program sets, for each program
+    /// file, by slot. Versions share it while it is equal.
+    file_meta: Arc<Vec<FileProgramMeta>>,
     /// Checker index for each file index (Go `fileAssociations`). Set when
     /// the checker pool is made.
     file_associations: OnceLock<Vec<usize>>,
@@ -672,9 +684,10 @@ pub(crate) struct VersionTables {
     /// None for an alias resolver program. The frontend program itself is
     /// in `FRONTENDS`, on the loading thread only.
     go: Option<go_frontend::GoSharedState>,
-    /// The freeable file versions of the program files (lsshells M3a). A
-    /// thread that holds the tables keeps them alive, so a worker thread can
-    /// read its program files after the frontend program is freed.
+    /// The freeable file versions of the program files (lsshells M3a), in
+    /// no order. A thread that holds the tables keeps them alive, so a
+    /// worker thread can read its program files after the frontend program
+    /// is freed.
     file_versions: Vec<Arc<crate::ast::FileVersion>>,
     /// The binder symbols of the program (`bind_all`, `bound_symbols`): a
     /// copy of the binder lineage after the program files are bound. Each
@@ -686,11 +699,39 @@ pub(crate) struct VersionTables {
 
 impl VersionTables {
     /// Tables with only the file order and the files by path set.
-    fn new(source_file_order: Vec<usize>, file_by_path: FxHashMap<String, usize>) -> Self {
+    /// `file_by_path` gives the file id at each path; a later entry for a
+    /// path replaces an earlier one.
+    fn new(
+        source_file_order: Vec<usize>,
+        file_by_path: impl IntoIterator<Item = (String, usize)>,
+    ) -> Self {
+        let mut slots = SlotsBuilder::new(&source_file_order);
+        let file_by_path = file_by_path
+            .into_iter()
+            .map(|(path, file)| (path, slots.slot_of(file)))
+            .collect();
+        let other_files = slots.other_files;
+        Self::from_parts(
+            source_file_order,
+            other_files,
+            Arc::new(file_by_path),
+            Arc::default(),
+        )
+    }
+
+    /// Tables with the file order, the files by path and the program-set
+    /// fields set (see the fields).
+    fn from_parts(
+        source_file_order: Vec<usize>,
+        other_files: Vec<usize>,
+        file_by_path: Arc<FxHashMap<String, usize>>,
+        file_meta: Arc<Vec<FileProgramMeta>>,
+    ) -> Self {
         VersionTables {
             source_file_order,
+            other_files,
             file_by_path,
-            file_meta: FxHashMap::default(),
+            file_meta,
             file_associations: OnceLock::new(),
             declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
             go: None,
@@ -699,12 +740,64 @@ impl VersionTables {
         }
     }
 
+    /// The id of the file in `slot` of `file_by_path`.
+    fn file_at_slot(&self, slot: usize) -> usize {
+        match self.source_file_order.get(slot) {
+            Some(&file) => file,
+            None => self.other_files[slot - self.source_file_order.len()],
+        }
+    }
+
+    /// The id of the file at `path` (Go `filesByPath`), or None.
+    fn file_at_path(&self, path: &str) -> Option<usize> {
+        self.file_by_path
+            .get(path)
+            .map(|&slot| self.file_at_slot(slot))
+    }
+
     /// The program-set fields of the file at `path`, or None when `path` is
     /// not a program file.
     fn file_meta_by_path(&self, path: &str) -> Option<&FileProgramMeta> {
         self.file_by_path
             .get(path)
-            .and_then(|index| self.file_meta.get(index))
+            .and_then(|&slot| self.file_meta.get(slot))
+    }
+}
+
+/// Gives the files of `VersionTables::file_by_path` their slots: a program
+/// file its position in the file order, and any other file the next slot
+/// after the program files.
+struct SlotsBuilder<'a> {
+    source_file_order: &'a [usize],
+    /// The slot of each file id, made on first use.
+    slots: Option<FxHashMap<usize, usize>>,
+    /// `VersionTables::other_files`.
+    other_files: Vec<usize>,
+}
+
+impl<'a> SlotsBuilder<'a> {
+    fn new(source_file_order: &'a [usize]) -> Self {
+        SlotsBuilder {
+            source_file_order,
+            slots: None,
+            other_files: Vec::new(),
+        }
+    }
+
+    /// The slot of file `file`.
+    fn slot_of(&mut self, file: usize) -> usize {
+        let order = self.source_file_order;
+        let slots = self.slots.get_or_insert_with(|| {
+            order
+                .iter()
+                .enumerate()
+                .map(|(slot, &file)| (file, slot))
+                .collect()
+        });
+        *slots.entry(file).or_insert_with(|| {
+            self.other_files.push(file);
+            order.len() + self.other_files.len() - 1
+        })
     }
 }
 
@@ -985,6 +1078,7 @@ pub fn version_tables_probe(program: &'static GoProgram) -> Option<VersionTables
 
 /// Go `SourceFile.IsDefaultLibrary` (read through the program) and
 /// `SourceFile.Metadata` of one program file.
+#[derive(Clone, Debug, PartialEq)]
 struct FileProgramMeta {
     meta_data: SourceFileMetaData,
     is_default_library: bool,
@@ -1132,8 +1226,7 @@ pub fn new_alias_resolver_program(
 ) -> AliasResolverProgramScope {
     let file_by_path = files
         .iter()
-        .map(|&file| (source_file_info(file).path.clone(), file.file_index()))
-        .collect();
+        .map(|&file| (source_file_info(file).path.clone(), file.file_index()));
     let source_file_order = root_files.iter().map(|file| file.file_index()).collect();
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
         id: next_program_id(),
@@ -2696,7 +2789,7 @@ pub fn get_source_file(file_name: &str) -> Node {
 
 // Go: compiler/program.go:1812 GetSourceFileByPath
 pub fn get_source_file_by_path(path: &str) -> Node {
-    with_tables(|tables| tables.file_by_path.get(path).copied())
+    with_tables(|tables| tables.file_at_path(path))
         .map_or(Node::NIL, |index| crate::ast::go_file(index).root)
 }
 

@@ -1178,7 +1178,7 @@ pub(crate) fn calculate_indent(text: &str, mut pos: i32, end: i32) -> i32 {
     current_line_indent
 }
 
-// Go: printer/utilities.go:903 lineCharacterCache
+// Go: printer/utilities.go:894 lineCharacterCache
 // lineCharacterCache provides cached line/character lookups for a source file,
 // optimized for monotonically increasing positions (e.g., during source map emit).
 //
@@ -1206,7 +1206,7 @@ enum LineCharacterSource {
     Other(Rc<dyn crate::sourcemap::source::Source>),
 }
 
-// Go: printer/utilities.go:912 newLineCharacterCache
+// Go: printer/utilities.go:903 newLineCharacterCache
 // PORT: a node source must be a parsed source file; the printer passes the
 // original file of a transformed one (see `set_source_map_source`).
 pub(crate) fn new_line_character_cache(source: &SourceMapSource) -> LineCharacterCache {
@@ -1227,9 +1227,14 @@ pub(crate) fn new_line_character_cache(source: &SourceMapSource) -> LineCharacte
 }
 
 impl LineCharacterCache {
-    // Go: printer/utilities.go:921 getLineAndCharacter
+    // Go: printer/utilities.go:912 getLineAndCharacter
     // getLineAndCharacter returns the 0-based line number and UTF-16 code unit
     // offset from the start of that line for the given byte position.
+    // PORT: `pos` can be inside a char (a skipped token of a parse error can
+    // end there). Go slices the bytes and counts each byte of a cut char as
+    // one unit (`utf16_len_of_range`). The count depends on the cache split,
+    // as in Go: a char cut at the cached position counts its bytes on both
+    // sides.
     pub(crate) fn get_line_and_character(&mut self, pos: i32) -> (i32, i32) {
         let (line_map, text): (&[i32], &str) = match &self.source {
             LineCharacterSource::File { line_map, text } => (&**line_map, &**text),
@@ -1247,10 +1252,10 @@ impl LineCharacterCache {
         if self.has_cached && line == self.cached_line && end_pos >= self.cached_pos {
             // Incremental: only count UTF-16 code units from the last cached position.
             character = self.cached_char
-                + ascii_or_utf16_len(&text[self.cached_pos as usize..end_pos as usize]);
+                + utf16_len_of_range(text, self.cached_pos as usize, end_pos as usize);
         } else {
             // Full computation from line start.
-            character = ascii_or_utf16_len(&text[line_start as usize..end_pos as usize]);
+            character = utf16_len_of_range(text, line_start as usize, end_pos as usize);
         }
         let cached_char = character;
         character += pos - end_pos;
@@ -1280,17 +1285,6 @@ impl LineCharacterCache {
         };
         debug_assert_eq!(line, compute_line_of_position(map, pos));
         line
-    }
-}
-
-// PORT: `utf16_len` with a word-at-a-time ASCII check first. Source map
-// slices are mostly ASCII, and for ASCII the result is the byte length. The Go
-// string marker is not ASCII, so marked text still goes to `utf16_len`.
-fn ascii_or_utf16_len(s: &str) -> i32 {
-    if s.is_ascii() {
-        s.len() as i32
-    } else {
-        utf16_len(s)
     }
 }
 
@@ -1348,5 +1342,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A text source for `LineCharacterCache`.
+    struct TextSource {
+        text: String,
+        line_map: Vec<i32>,
+    }
+
+    impl crate::sourcemap::source::Source for TextSource {
+        fn text(&self) -> &str {
+            &self.text
+        }
+        fn file_name(&self) -> &str {
+            "parserSkippedTokens16.ts"
+        }
+        fn ecma_line_map(&self) -> &[i32] {
+            &self.line_map
+        }
+    }
+
+    /// A source map position inside a char counts as in Go
+    /// (`printer/utilities.go:912` at pin N): Go slices the bytes from the
+    /// cached position, so a cut char counts its bytes on both sides of the
+    /// split. The text is sweepN2 case 11133 (`parserSkippedTokens16.ts`).
+    /// Line 2 (0-based) starts at byte 36, and its `\u{AC}` is bytes 57 and
+    /// 58. Go maps pos 57 to column 21 and pos 58 to column 22.
+    #[test]
+    fn line_character_cache_counts_cut_chars_as_go() {
+        let text = "// @target: es2015\r\nfoo(): Bar { }\r\nfunction Foo      () \u{AC}   { }\r\n4+:5\r\nnamespace M {\r\nfunction a(\r\n    : T) { }\r\n}\r\nvar x       =";
+        let source = SourceMapSource::Other(Rc::new(TextSource {
+            line_map: compute_ecma_line_starts(text),
+            text: text.to_string(),
+        }));
+        let mut cache = new_line_character_cache(&source);
+        // Each call starts after the cached position: [57:58] counts 1 and
+        // [58:61] counts 3 (the cut byte and 2 spaces).
+        assert_eq!(cache.get_line_and_character(57), (2, 21));
+        assert_eq!(cache.get_line_and_character(58), (2, 22));
+        // The same position again: the empty range [58:58] counts 0.
+        assert_eq!(cache.get_line_and_character(58), (2, 22));
+        assert_eq!(cache.get_line_and_character(61), (2, 25));
+        // A position before the cached one counts from the line start
+        // ([36:56] counts 20). Then [56:61] has the whole char, which
+        // counts 1.
+        assert_eq!(cache.get_line_and_character(56), (2, 20));
+        assert_eq!(cache.get_line_and_character(61), (2, 24));
+        let mut fresh = new_line_character_cache(&source);
+        assert_eq!(fresh.get_line_and_character(58), (2, 22));
     }
 }

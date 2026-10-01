@@ -1308,25 +1308,18 @@ impl Snapshot {
                     if let Some(checker_pool) = &project.checker_pool {
                         checker_pool.discard();
                     }
-                    for file in program.source_files() {
-                        if !file.is_content_mapper_failure_stub()
-                            && !file.is_content_mapper_supplemental()
-                        {
-                            if !file.content_mapper().is_empty() {
-                                deref_content_mapped_file(
-                                    &store.content_mapped_parse_cache,
-                                    &content_mapped_parse_cache_key_for_file(file),
-                                );
-                            } else {
-                                deref_program_file(
-                                    &store.parse_cache,
-                                    file.parse_options(),
-                                    file.source_hash(),
-                                    file.script_kind,
-                                );
-                            }
-                        }
-                    }
+                    // PORT: through the entries the program holds a count on
+                    // (`ProgramFileRefs`), so no file builds a key unless its
+                    // entry goes.
+                    project
+                        .program_file_refs
+                        .as_ref()
+                        .expect("a project program has its file refs")
+                        .release(
+                            &store.parse_cache,
+                            &store.content_mapped_parse_cache,
+                            program.source_files(),
+                        );
                     for file in program.duplicate_source_files() {
                         if !file.is_content_mapper_failure_stub {
                             if !file.content_mapper.is_empty() {

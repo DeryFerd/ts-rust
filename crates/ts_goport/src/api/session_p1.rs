@@ -2965,25 +2965,16 @@ impl Session {
     }
 
     // Go: api/session.go acquireSourceFile (ts#64434)
-    // PORT: Go `ParseCache.Acquire` binds each parse (project/parsecache.go:80,
-    // ts#63952), so a leased file is bound and its encoded node flags have the
-    // binder bits. The port's parse cache leaves binding to the program load
-    // (`program::bind_all`), and the api is the only caller that takes a
-    // parse no program holds. So the lease is published with no program and
-    // bound here, as `ls/sourcedefinition.rs` does (Go `BindSourceFile`; a
-    // file that is bound already is not bound again).
+    // The leased file is bound, so its encoded node flags have the binder
+    // bits (`project::acquire_bound`, Go parsecache.go:80).
     pub fn acquire_source_file(
         &self,
         options: crate::frontend::parser::SourceFileParseOptions,
         source_text: &str,
         script_kind: ScriptKind,
     ) -> Rc<project::SourceFileLease> {
-        let lease = self
-            .snapshot_host
-            .acquire_source_file(options, source_text, script_kind);
-        crate::program::publish_parsed_files(&self.get_current_directory());
-        crate::program::bind_file_outside_program(lease.source_file());
-        lease
+        self.snapshot_host
+            .acquire_source_file(options, source_text, script_kind)
     }
 
     // Go: api/session.go encodeLeasedSourceFile (ts#64434)

@@ -257,6 +257,9 @@ pub struct Project {
     pub content_mapper_watched_files: Option<Rc<FxHashSet<tspath::Path>>>,
 
     pub checker_pool: Option<Rc<CheckerPool>>,
+    // Not in Go: the parse cache entries that `program` holds a count on
+    // (`ProgramFileRefs`). Set with `program`.
+    pub program_file_refs: Option<Rc<ProgramFileRefs>>,
 
     // ts#64299. PORT: a Go nil factory is `None`.
     pub module_resolver_factory: Option<Rc<dyn ModuleResolverFactory>>,
@@ -618,6 +621,7 @@ impl Project {
             content_mapper_watched_files: self.content_mapper_watched_files.clone(),
 
             checker_pool: self.checker_pool.clone(),
+            program_file_refs: self.program_file_refs.clone(),
 
             module_resolver_factory: self.module_resolver_factory.clone(),
             module_resolver_id: self.module_resolver_id,
@@ -721,6 +725,7 @@ impl Project {
         let mut update_kind = ProgramUpdateKind::NEW_FILES;
         let mut program_cloned = false;
         let new_program: Rc<compiler::NewProgram>;
+        let mut file_refs: Option<ProgramFileRefs> = None;
 
         let host = self
             .host
@@ -812,31 +817,21 @@ impl Project {
             if program_cloned {
                 update_kind = ProgramUpdateKind::CLONED;
                 let builder = builder();
-                for file in new_program.source_files() {
-                    // Use pointer identity: dirtyFile is the exact instance UpdateProgram acquired,
-                    // and it is the only file whose refcount is already accounted for.
-                    let is_dirty_file = dirty_file
-                        .as_ref()
-                        .is_some_and(|dirty_file| Rc::ptr_eq(dirty_file, file));
-                    if !is_dirty_file
-                        && !file.is_content_mapper_failure_stub()
-                        && !file.is_content_mapper_supplemental()
-                    {
-                        // UpdateProgram acquired the changed file only, so we need to ref everything else
-                        if !file.content_mapper().is_empty() {
-                            builder
-                                .content_mapped_parse_cache
-                                .ref_(&content_mapped_parse_cache_key_for_file(file));
-                        } else {
-                            ref_program_file(
-                                &builder.parse_cache,
-                                file.parse_options(),
-                                file.source_hash(),
-                                file.script_kind,
-                            );
-                        }
-                    }
-                }
+                // UpdateProgram acquired the changed file only, so we need to ref everything else
+                // PORT: through the old program's entries (`ProgramFileRefs`),
+                // so only the changed files build a key.
+                let old = self
+                    .program_file_refs
+                    .as_deref()
+                    .map(|old_refs| (program.source_files(), old_refs));
+                file_refs = Some(ProgramFileRefs::new(
+                    &builder.parse_cache,
+                    &builder.content_mapped_parse_cache,
+                    new_program.source_files(),
+                    true,
+                    dirty_file.as_ref(),
+                    old,
+                ));
                 for file in new_program.duplicate_source_files() {
                     if !file.is_content_mapper_failure_stub {
                         if !file.content_mapper.is_empty() {
@@ -916,11 +911,30 @@ impl Project {
             cleanup();
         }
 
+        // Not in Go: a program that is not cloned holds its counts through
+        // its own loads; collect their entries.
+        let file_refs = file_refs.unwrap_or_else(|| {
+            let builder = host
+                .builder
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| crate::core::go_nil_dereference());
+            ProgramFileRefs::new(
+                &builder.parse_cache,
+                &builder.content_mapped_parse_cache,
+                new_program.source_files(),
+                false,
+                None,
+                None,
+            )
+        });
+
         let checker_pool = created_checker_pool.borrow().clone();
         CreateProgramResult {
             program: new_program,
             update_kind,
             checker_pool,
+            file_refs: Rc::new(file_refs),
         }
     }
 
@@ -1109,4 +1123,6 @@ pub struct CreateProgramResult {
     pub program: Rc<compiler::NewProgram>,
     pub update_kind: ProgramUpdateKind,
     pub checker_pool: Option<Rc<CheckerPool>>,
+    // Not in Go: the parse cache entries that `program` holds a count on.
+    pub file_refs: Rc<ProgramFileRefs>,
 }

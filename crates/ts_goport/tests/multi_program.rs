@@ -163,6 +163,35 @@ fn cycles_free_file_versions_only_when_the_flag_is_on() {
     );
 }
 
+/// editfast1: with `GOPORT_CHECK_VERSION_TABLES=1`, `goport_multiprog`
+/// builds the tables of each version that replaces files of the old one in
+/// place (`go_frontend::reused_tables`) again from its files alone, and
+/// panics when they differ. A pair passes with it, and so do cycles, where
+/// each version starts from tables made that way and the file versions are
+/// freeable. The cycles still free every file version.
+// PORT: no Go counterpart.
+#[test]
+fn reused_version_tables_equal_a_full_build() {
+    const CHECK: (&str, &str) = ("GOPORT_CHECK_VERSION_TABLES", "1");
+    const CYCLES: usize = 4;
+    let pair = check_pair_with_env("tables-check", Some("edits/a.ts"), false, &[CHECK]);
+    assert!(
+        pair.reused,
+        "an edit with the same imports must reuse the other files"
+    );
+    assert_new_c_error(&pair);
+    let env = [FREE_FILE_VERSIONS[0], FREE_FILE_VERSIONS[1], CHECK];
+    let (made, dead) = run_cycles("tables-check-cycles", CYCLES, &env);
+    assert!(
+        made >= CYCLES,
+        "each cycle parses the changed file again, so it makes a file version (made {made})"
+    );
+    assert_eq!(
+        dead, made,
+        "a file version outlives every program that had it (a missed holder)"
+    );
+}
+
 /// Runs `goport_multiprog cycles` `count` times on a new copy of the fixture
 /// with `env` set, and gives the numbers of its last line,
 /// `file_versions made=<n> dead=<m>`. `GOPORT_FREE_FILE_VERSIONS` is unset
