@@ -25,8 +25,7 @@
 # Steps:
 #   0. Dynamic build: make the glibc 2.28 sysroot once (floor_sysroot).
 #   1. Instrumented build (-Cprofile-generate) of goport, tsgo and goport_emit.
-#   2. PGO training: the same runs as build-pgo.sh, and editor sessions
-#      (RELEASE_LSP_SESSIONS) of the instrumented tsgo in --lsp mode.
+#   2. PGO training: the same runs as build-pgo.sh.
 #   3. Merge the raw profiles with llvm-profdata.
 #   4. PGO use build of the shipped bins (tsgo, goport, goport_emit,
 #      goport_build, goport_typesyms), linked with --emit-relocs. BOLT needs
@@ -34,7 +33,7 @@
 #      Dynamic build: check that no bin needs a GLIBC_ symbol version above
 #      the floor (objdump -T).
 #   5. BOLT: record each bin with perf branch sampling on training runs
-#      (for tsgo, also the editor sessions of step 2), convert with
+#      (for tsgo, also editor sessions: RELEASE_LSP_SESSIONS), convert with
 #      perf2bolt, merge with merge-fdata, rewrite with llvm-bolt.
 #      Then check the program headers of the shipped bins (check_headers).
 #   6. Run tsgo in qemu on a CPU without AVX. A dynamic tsgo runs there on the
@@ -81,6 +80,19 @@
 #   - -Wl,-z,pack-relative-relocs with glibc: the bin needs GLIBC_ABI_DT_RELR
 #     (glibc 2.36), so it does not start on the floor glibc. Not used.
 # So the default stays dynamic glibc and PIE.
+# Measured on R148 source (pgolsp1, target/continuation-r97-goport/pgolsp1):
+# editor sessions in the training against none, every side in one job on
+# mini-743d (rounds 1 and 2 on dbook-lan). Output is byte-equal, and the LSP
+# oracle answers are the same.
+#   - Sessions in BOLT only, at 1/8 of the CLI sample rate (the default):
+#     editor edit medians (ls_edit_bench long) query-core -4.9%, effect -4.9%,
+#     hono -1.3%. No CLI cell (-p, --singleThreaded, tsc -b, watch) lost more
+#     than the noise of two builds of one source; query check peak RSS +1.6%.
+#   - Sessions in PGO and BOLT at 1/8: about 1 point more on effect and hono,
+#     but the bin text that a CLI run maps grows by 2 to 7 MiB (query check
+#     peak RSS +7.7%, hono +2.3%), most of it in the PGO layout.
+#   - Sessions in PGO and BOLT at full weight or 1/4: zod and effect check
+#     lost 1.1 to 2.2%.
 #
 # Environment:
 #   RUSTUP_TOOLCHAIN  default 1.95.0. Its LLVM 22 matches the system
@@ -140,7 +152,8 @@
 #   RELEASE_BOLT      1 (default). 0: skip step 5, for hosts without llvm-bolt
 #                     or perf branch sampling (Intel LBR, AMD LBR v2 or BRS).
 #   PGO_CORPUS_STEP   train on every Nth corpus case (default 60, about 200)
-#   RELEASE_LSP_SESSIONS  editor sessions of the PGO and BOLT training, as
+#   BOLT_PERF_FREQ    perf sample frequency for BOLT (default 20000)
+#   RELEASE_LSP_SESSIONS  editor sessions of the tsgo BOLT training, as
 #                     <project>:<edits> (default "query-core:300 hono:200
 #                     effect:300"; empty: none). Each is the long session of
 #                     scripts/goport/ls_edit_bench.py (typing, errfix, imports
@@ -151,15 +164,9 @@
 #                     (the LSP server, snapshot updates, node reads of the
 #                     edited file) runs in BOLT .cold code: 6.6% of an effect
 #                     edit (studies/lspeffect1).
-#   RELEASE_LSP_DIVISOR  the editor sessions weigh 1/N of their own run time
-#                     (default 8): PGO merges the CLI profile with weight N,
-#                     and BOLT samples the sessions at BOLT_PERF_FREQ / N. At
-#                     8 they are about 6% of the PGO counts and 12% of the
-#                     tsgo BOLT samples. At 1 (36% and 41%) and at 4, zod and
-#                     effect check lost 1.1 to 2.2% (pgolsp1).
-#   RELEASE_LSP_PGO   1 (default): the editor sessions train PGO and BOLT.
-#                     0: BOLT only.
-#   BOLT_PERF_FREQ    perf sample frequency for BOLT (default 20000)
+#   BOLT_LSP_PERF_FREQ  perf sample frequency of the editor sessions (default
+#                     2500, 1/8 of the CLI runs' rate, so they are about 12%
+#                     of the tsgo samples; see the pgolsp1 note above)
 #
 # Rules this script keeps:
 #   - Both cargo builds pass --target. The flags then reach only the shipped
@@ -223,11 +230,6 @@ glibc_floor="${RELEASE_GLIBC_FLOOR:-2.28}"
 bolt="${RELEASE_BOLT:-1}"
 corpus_step="${PGO_CORPUS_STEP:-60}"
 lsp_sessions="${RELEASE_LSP_SESSIONS-query-core:300 hono:200 effect:300}"
-lsp_div="${RELEASE_LSP_DIVISOR:-8}"
-lsp_pgo="${RELEASE_LSP_PGO:-1}"
-pgo_sessions=""
-[[ $lsp_pgo == 1 ]] && pgo_sessions=$lsp_sessions
-[[ $lsp_div =~ ^[1-9][0-9]*$ ]] || { echo "error: RELEASE_LSP_DIVISOR is a positive integer, not $lsp_div" >&2; exit 1; }
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95.0}"
 # The training runs start no tsgo worker (bin/tsgo.rs `launch`): when the
 # launcher exits, the parent death signal can kill the worker before it has
@@ -279,7 +281,7 @@ if [[ $bolt == 1 ]]; then
 fi
 
 command -v qemu-x86_64 > /dev/null || { echo "error: qemu-x86_64 not found (package qemu-user); step 6 needs it" >&2; exit 1; }
-if [[ -n $lsp_sessions ]]; then
+if [[ $bolt == 1 && -n $lsp_sessions ]]; then
   command -v python3 > /dev/null || { echo "error: python3 not found; the editor sessions need it (or set RELEASE_LSP_SESSIONS=)" >&2; exit 1; }
 fi
 
@@ -412,9 +414,8 @@ trap 'rm -rf "$tmp"' EXIT
 # 1. Instrumented build. Training runs only these three bins; the other two
 # share their code, so they use the same profile.
 profiles="$out/profiles"
-profiles_lsp="$out/profiles-lsp"
-rm -rf "$profiles" "$profiles_lsp"
-mkdir -p "$profiles" "$profiles_lsp"
+rm -rf "$profiles"
+mkdir -p "$profiles"
 build target-gen "-Cprofile-generate=$profiles $link_flags" goport tsgo goport_emit
 gen="$out/target-gen/$target/goport"
 libs_to "$gen"
@@ -447,18 +448,8 @@ for dir in "$cases"/*/; do
     n=$((n + 1))
   fi
 done
-# Editor sessions, in their own profile (see RELEASE_LSP_DIVISOR). A failed
-# session stops the build: a killed server writes no profile.
-lsp_trained="no editor sessions"
-if [[ -n $pgo_sessions ]]; then
-  # shellcheck disable=SC2086 # one argument per session
-  LLVM_PROFILE_FILE="$profiles_lsp/lsp_%m.profraw" python3 "$script_dir/lsp-train.py" "$gen/tsgo" "$P" $pgo_sessions > "$out/lsp-train-pgo.log" 2>&1 \
-    || { tail -5 "$out/lsp-train-pgo.log" >&2; echo "error: the editor training sessions failed (see $out/lsp-train-pgo.log)" >&2; exit 1; }
-  lsp_trained="editor sessions at weight 1/$lsp_div ($(sed -n 's/^lsp-train: \(.*\): [0-9]* of .*/\1/p' "$out/lsp-train-pgo.log" | paste -sd';' | sed 's/;/; /g'))"
-  [[ -n $(find "$profiles_lsp" -name '*.profraw') ]] || { echo "error: the editor sessions wrote no profile in $profiles_lsp" >&2; exit 1; }
-fi
 nprof=$(find "$profiles" -name '*.profraw' | wc -l)
-echo "trained on 5 projects, $n corpus cases and $lsp_trained, $nprof profraw files"
+echo "trained on 5 projects and $n corpus cases, $nprof profraw files"
 if ((killed > 0)); then
   echo "error: $killed PGO training runs were killed by a signal (see above)" >&2
   exit 1
@@ -471,13 +462,7 @@ fi
 # 3. Merge. The file name holds the profile hash: cargo does not track the
 # profile content, but it rebuilds when RUSTFLAGS change.
 rm -f "$out"/goport-*.profdata
-if [[ -n $pgo_sessions ]]; then
-  "$profdata" merge -o "$tmp/cli.profdata" "$profiles"
-  "$profdata" merge -o "$tmp/lsp.profdata" "$profiles_lsp"
-  "$profdata" merge -o "$tmp/merged.profdata" --weighted-input="$lsp_div,$tmp/cli.profdata" "$tmp/lsp.profdata"
-else
-  "$profdata" merge -o "$tmp/merged.profdata" "$profiles"
-fi
+"$profdata" merge -o "$tmp/merged.profdata" "$profiles"
 merged="$out/goport-$(sha256sum "$tmp/merged.profdata" | cut -c1-12).profdata"
 mv "$tmp/merged.profdata" "$merged"
 
@@ -570,11 +555,12 @@ bolt_dir="$out/bolt"
 declare -A reps=([query]=12 [hono]=6 [zod]=4 [effect]=3) # about 5 s of work per recording
 
 # rec <name> <reps> <cmd...>: one perf recording of <reps> runs, each without
-# old .tsbuildinfo or emit output in $tmp.
+# old .tsbuildinfo or emit output in $tmp. freq (default BOLT_PERF_FREQ) sets
+# the sample frequency.
 rec() {
   local name=$1 count=$2
   shift 2
-  perf record -q -e cycles:u -j any,u -F "${BOLT_PERF_FREQ:-20000}" -o "$bolt_dir/data/$name.data" -- bash -c \
+  perf record -q -e cycles:u -j any,u -F "${freq:-${BOLT_PERF_FREQ:-20000}}" -o "$bolt_dir/data/$name.data" -- bash -c \
     'n=$1; t=$2; shift 2; for ((i = 0; i < n; i++)); do rm -rf "$t"/*.tsbuildinfo "$t"/out-*; "$@"; done; true' \
     _ "$count" "$tmp" "$@" > "$bolt_dir/data/$name.out" 2>&1 || true
   [[ -s "$bolt_dir/data/$name.data" ]] || { echo "error: no perf data for $name" >&2; exit 1; }
@@ -591,11 +577,10 @@ bolt_train() {
       for name in query hono; do
         rec "tsgo-emit-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --pretty false --outDir "$tmp/out-$name" --tsBuildInfoFile "$tmp/emit-$name.tsbuildinfo"
       done
-      # The editor sessions of step 2, in one recording at 1/lsp_div of the
-      # sample frequency.
+      # The editor sessions, in one recording at a lower sample frequency.
       if [[ -n $lsp_sessions ]]; then
         # shellcheck disable=SC2086 # one argument per session
-        BOLT_PERF_FREQ=$((${BOLT_PERF_FREQ:-20000} / lsp_div)) rec tsgo-lsp 1 python3 "$script_dir/lsp-train.py" "$b" "$P" $lsp_sessions
+        freq=${BOLT_LSP_PERF_FREQ:-2500} rec tsgo-lsp 1 python3 "$script_dir/lsp-train.py" "$b" "$P" $lsp_sessions
         grep -qx 'lsp-train: ok' "$bolt_dir/data/tsgo-lsp.out" \
           || { tail -5 "$bolt_dir/data/tsgo-lsp.out" >&2; echo "error: the editor sessions of the BOLT training failed" >&2; exit 1; }
       fi ;;
@@ -723,10 +708,7 @@ done
 {
   echo "source: $(git -C "$repo" rev-parse HEAD)$(git -C "$repo" diff --quiet HEAD -- crates Cargo.toml Cargo.lock ':(exclude,glob)crates/*/scripts/**' || echo ' (dirty)')"
   echo "rustc: $(rustc -V), target $target, cargo profile goport"
-  echo "pgo: $merged, trained on 5 projects, $n corpus cases and $lsp_trained"
-  if [[ -n $lsp_sessions ]]; then
-    echo "editor sessions: lsp-train.py $lsp_sessions ($([[ -n $pgo_sessions ]] && echo "PGO")$([[ -n $pgo_sessions && $bolt == 1 ]] && echo " and ")$([[ $bolt == 1 ]] && echo "tsgo BOLT")) at weight 1/$lsp_div, ls_edit_bench.py sha256 $(sha256sum "$repo/scripts/goport/ls_edit_bench.py" | cut -c1-12)"
-  fi
+  echo "pgo: $merged, trained on 5 projects and $n corpus cases"
   echo "pie: $pie"
   if [[ $libc == musl ]]; then
     echo "libc: static musl (rustc self-contained)"
@@ -741,6 +723,9 @@ done
   echo "lib files: $([[ $noembed == 1 ]] && echo "next to the bins (noembed)" || echo "embedded")"
   if [[ $bolt == 1 ]]; then
     echo "bolt: $(llvm-bolt --version | grep -m1 'LLVM version' | xargs), ${bolt_opts[*]}"
+    if [[ -n $lsp_sessions ]]; then
+      echo "bolt editor sessions (tsgo, ${BOLT_LSP_PERF_FREQ:-2500} Hz): $(sed -n 's/^lsp-train: \(.*\): [0-9]* of .*/\1/p' "$bolt_dir/data/tsgo-lsp.out" | paste -sd';' | sed 's/;/; /g'); ls_edit_bench.py sha256 $(sha256sum "$repo/scripts/goport/ls_edit_bench.py" | cut -c1-12)"
+    fi
   else
     echo "bolt: off"
   fi
