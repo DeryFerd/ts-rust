@@ -4803,8 +4803,8 @@ fn start_api_reader(
 
 /// PORT: the protocol of an API connection of the LSP server. Writes go to
 /// the JSON-RPC protocol. A read takes the next message from the inbox.
-/// While the inbox is empty and no handler of the connection runs, the read
-/// runs the dispatch loop (`dispatch_next`), so LSP messages, exit, stdin
+/// While the inbox is empty and no call to the client waits, the read runs
+/// the dispatch loop (`dispatch_next`), so LSP messages, exit, stdin
 /// EOF, SIGTERM and the parent watchdog work while the connection waits,
 /// as in Go, where the connection has its own goroutine. A read for a call
 /// to the client (`AsyncConn::call` in a request handler) waits for the
