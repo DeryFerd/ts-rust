@@ -43,11 +43,14 @@ impl LanguageService {
 
         let (checker, done) = ls_program::get_type_checker_for_file(program, ctx, file);
         let mut checker_ref = checker.borrow_mut();
+        // PORT: `data.position` is a Go byte offset (see `ensure_item_data`).
+        let position =
+            crate::scanner_util::port_byte_offset(&source_file_text(file), data.position);
         let result = self.get_completion_item_details(
             ctx,
             program,
             &mut checker_ref,
-            data.position,
+            position,
             file,
             item,
             &data,

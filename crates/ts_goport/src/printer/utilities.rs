@@ -1232,9 +1232,11 @@ impl LineCharacterCache {
     // offset from the start of that line for the given byte position.
     // PORT: `pos` can be inside a char (a skipped token of a parse error can
     // end there). Go slices the bytes and counts each byte of a cut char as
-    // one unit (`utf16_len_of_range`). The count depends on the cache split,
-    // as in Go: a char cut at the cached position counts its bytes on both
-    // sides.
+    // one unit (`utf16_len_of_range`). In the port form `pos` can also be
+    // inside a marker unit, where it is the Go offset that `go_byte_offset`
+    // gives, and the count is of the Go bytes. The count depends on the
+    // cache split, as in Go: a char cut at the cached position counts its
+    // bytes on both sides.
     pub(crate) fn get_line_and_character(&mut self, pos: i32) -> (i32, i32) {
         let (line_map, text): (&[i32], &str) = match &self.source {
             LineCharacterSource::File { line_map, text } => (&**line_map, &**text),

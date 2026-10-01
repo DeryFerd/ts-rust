@@ -183,11 +183,13 @@ impl ParsedSourceFile {
         self.root.statement_list()
     }
 
-    // Go: ast/ast.go:2657 IsJS
+    // Go: ast/ast.go:2788 IsJS (IsSourceFileJS, ast/utilities.go:1294)
+    // Go tests the script kind, not the JAVA_SCRIPT_FILE flag: the parser
+    // also sets that flag on JSON files (parser.go:309), and a JSON file
+    // must not get the implicit jsx-runtime and tslib imports.
     #[must_use]
     pub fn is_js(&self) -> bool {
-        // Go: IsSourceFileJS
-        self.root.flags().intersects(NodeFlags::JAVA_SCRIPT_FILE)
+        self.script_kind == ScriptKind::JS || self.script_kind == ScriptKind::JSX
     }
 
     // ── Content mapper info (tsgo#4712) ────────────────────────────────

@@ -273,12 +273,13 @@ pub fn parse_own_config_of_json_source_file(
     let mut root_compiler_options: Vec<Node> = Vec::new();
     let mut errors: Vec<Diagnostic> = Vec::new();
     let on_property_set = |key_text: &str,
-                           value: CompilerOptionsValue,
+                           value: &CompilerOptionsValue,
                            property_assignment: Node,
                            parent_option: Option<&'static CommandLineOption>, // TsConfigOnlyOption,
                            option: Option<&'static CommandLineOption>|
-     -> (CompilerOptionsValue, Vec<Diagnostic>) {
+     -> Vec<Diagnostic> {
         let mut value = value;
+        let converted;
         let is_extends = |o: Option<&'static CommandLineOption>| {
             o.is_some_and(|o| std::ptr::eq(o, *EXTENDS_OPTION_DECLARATION))
         };
@@ -287,14 +288,15 @@ pub fn parse_own_config_of_json_source_file(
         if let Some(option) = option
             && !is_extends(Some(option))
         {
-            (value, property_set_errors) = convert_json_option(
+            (converted, property_set_errors) = convert_json_option(
                 option,
-                value,
+                value.clone(),
                 base_path,
                 property_assignment,
                 property_assignment.initializer(),
                 source_file,
             );
+            value = &converted;
         }
         if let Some(parent_option) = parent_option
             && parent_option.name != "undefined"
@@ -353,7 +355,7 @@ pub fn parse_own_config_of_json_source_file(
         } else if parent_option.is_some_and(|p| std::ptr::eq(p, *TSCONFIG_ROOT_OPTIONS_MAP)) {
             if is_extends(option) {
                 let (config_path, err) = get_extends_config_path_or_array(
-                    &value,
+                    value,
                     host,
                     base_path,
                     config_file_name,
@@ -380,7 +382,7 @@ pub fn parse_own_config_of_json_source_file(
                 }
             }
         }
-        (value, property_set_errors)
+        property_set_errors
     };
 
     let (json, err) = {
@@ -473,17 +475,20 @@ pub fn new_tsconfig_source_file_from_file_path(
 pub type OnPropertySet<'a> = Box<
     dyn FnMut(
             &str,
-            CompilerOptionsValue,
+            &CompilerOptionsValue,
             Node,
             Option<&'static CommandLineOption>,
             Option<&'static CommandLineOption>,
-        ) -> (CompilerOptionsValue, Vec<Diagnostic>)
+        ) -> Vec<Diagnostic>
         + 'a,
 >;
 
 // Go: tsoptions/tsconfigparsing.go:300 jsonConversionNotifier
 // PORT: Go func field is a boxed `FnMut`. Callers pass
 // `Option<&mut JsonConversionNotifier>` where Go passes a nilable pointer.
+// `on_property_set` borrows the value (Go passes the map pointer that the
+// result also holds) and returns only the diagnostics, because Go's only
+// caller drops the returned value.
 pub struct JsonConversionNotifier<'a> {
     pub root_options: &'static CommandLineOption,
     pub on_property_set: OnPropertySet<'a>,
@@ -1355,14 +1360,18 @@ pub fn convert_object_literal_expression_to_json(
         );
         errors.extend(err);
         if !key_text.is_empty() {
-            if let Some(result) = &mut result {
-                result.insert(key_text.clone(), value.clone());
-            }
+            // PORT: Go sets the map value first and passes the same map
+            // pointer to onPropertySet. Here the notifier borrows the value
+            // and then the result takes it. A copy per level made deeply
+            // nested objects quadratic.
             // Notify key value set, if user asked for it
             if let Some(notifier) = json_conversion_notifier.as_deref_mut() {
-                let (_, err) =
-                    (notifier.on_property_set)(&key_text, value, element, object_option, option);
+                let err =
+                    (notifier.on_property_set)(&key_text, &value, element, object_option, option);
                 errors.extend(err);
+            }
+            if let Some(result) = &mut result {
+                result.insert(key_text, value);
             }
         }
     }

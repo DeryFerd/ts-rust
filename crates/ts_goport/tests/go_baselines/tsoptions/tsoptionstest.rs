@@ -487,7 +487,7 @@ impl<'a> OmitZeroWriter<'a> {
     }
 
     // Go `*int`: only nil is zero.
-    fn int_ptr(&mut self, name: &str, v: Option<i32>) -> Result<(), JsonError> {
+    fn int_ptr(&mut self, name: &str, v: Option<i64>) -> Result<(), JsonError> {
         let Some(v) = v else {
             return Ok(());
         };

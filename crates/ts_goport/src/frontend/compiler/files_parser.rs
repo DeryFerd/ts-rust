@@ -466,9 +466,17 @@ impl FilesParser {
     }
 
     // Go: core/workgroup.go singleThreadedWorkGroup.RunAndWait
+    // PORT: Go runs each queued func through `core.WorkGroup.Queue`, on its
+    // own goroutine unless single threaded. The port runs them here in
+    // queue order. With `go_work_group_task`, a Go panic in a queued func
+    // ends the run as it does in Go.
     fn run_queue(&mut self, loader: &FileLoader) {
         while let Some(queued) = self.queue.pop() {
-            self.run_queued(loader, queued);
+            if self.single_threaded {
+                self.run_queued(loader, queued);
+            } else {
+                crate::core::go_work_group_task(|| self.run_queued(loader, queued));
+            }
         }
     }
 

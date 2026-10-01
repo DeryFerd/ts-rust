@@ -676,14 +676,19 @@ fn unmarshal_core_int(
         })
 }
 
-// Go v2 pointer arshaler for a `*int` member: `null` sets nil.
-// PORT: the port stores `Option<i32>`, so a value outside the `int32` range
-// fails here while Go (64-bit `int`) takes it. Errors name Go `int`.
-fn unmarshal_go_int_ptr(dec: &mut JsonDecoder<'_>, v: &mut Option<i32>) -> Result<(), JsonError> {
+// Go v2 pointer arshaler for a `*int` member: `null` sets nil. Go `int` is
+// 64-bit; errors name Go `int`.
+pub(crate) fn unmarshal_go_int_ptr(
+    dec: &mut JsonDecoder<'_>,
+    v: &mut Option<i64>,
+) -> Result<(), JsonError> {
     if dec.peek_kind() == b'n' {
         dec.read_token()?;
         *v = None;
         return Ok(());
     }
-    unmarshal_core_int(dec, v.get_or_insert(0), "int")
+    // Go allocates the int before it decodes into it.
+    let n = v.get_or_insert(0);
+    *n = crate::frontend::json_ext::unmarshal_int_as::<i64>(dec, "int")?;
+    Ok(())
 }
