@@ -157,6 +157,8 @@
 #                     8 they are about 6% of the PGO counts and 12% of the
 #                     tsgo BOLT samples. At 1 (36% and 41%) and at 4, zod and
 #                     effect check lost 1.1 to 2.2% (pgolsp1).
+#   RELEASE_LSP_PGO   1 (default): the editor sessions train PGO and BOLT.
+#                     0: BOLT only.
 #   BOLT_PERF_FREQ    perf sample frequency for BOLT (default 20000)
 #
 # Rules this script keeps:
@@ -222,6 +224,9 @@ bolt="${RELEASE_BOLT:-1}"
 corpus_step="${PGO_CORPUS_STEP:-60}"
 lsp_sessions="${RELEASE_LSP_SESSIONS-query-core:300 hono:200 effect:300}"
 lsp_div="${RELEASE_LSP_DIVISOR:-8}"
+lsp_pgo="${RELEASE_LSP_PGO:-1}"
+pgo_sessions=""
+[[ $lsp_pgo == 1 ]] && pgo_sessions=$lsp_sessions
 [[ $lsp_div =~ ^[1-9][0-9]*$ ]] || { echo "error: RELEASE_LSP_DIVISOR is a positive integer, not $lsp_div" >&2; exit 1; }
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95.0}"
 # The training runs start no tsgo worker (bin/tsgo.rs `launch`): when the
@@ -445,9 +450,9 @@ done
 # Editor sessions, in their own profile (see RELEASE_LSP_DIVISOR). A failed
 # session stops the build: a killed server writes no profile.
 lsp_trained="no editor sessions"
-if [[ -n $lsp_sessions ]]; then
+if [[ -n $pgo_sessions ]]; then
   # shellcheck disable=SC2086 # one argument per session
-  LLVM_PROFILE_FILE="$profiles_lsp/lsp_%m.profraw" python3 "$script_dir/lsp-train.py" "$gen/tsgo" "$P" $lsp_sessions > "$out/lsp-train-pgo.log" 2>&1 \
+  LLVM_PROFILE_FILE="$profiles_lsp/lsp_%m.profraw" python3 "$script_dir/lsp-train.py" "$gen/tsgo" "$P" $pgo_sessions > "$out/lsp-train-pgo.log" 2>&1 \
     || { tail -5 "$out/lsp-train-pgo.log" >&2; echo "error: the editor training sessions failed (see $out/lsp-train-pgo.log)" >&2; exit 1; }
   lsp_trained="editor sessions at weight 1/$lsp_div ($(sed -n 's/^lsp-train: \(.*\): [0-9]* of .*/\1/p' "$out/lsp-train-pgo.log" | paste -sd';' | sed 's/;/; /g'))"
   [[ -n $(find "$profiles_lsp" -name '*.profraw') ]] || { echo "error: the editor sessions wrote no profile in $profiles_lsp" >&2; exit 1; }
@@ -466,7 +471,7 @@ fi
 # 3. Merge. The file name holds the profile hash: cargo does not track the
 # profile content, but it rebuilds when RUSTFLAGS change.
 rm -f "$out"/goport-*.profdata
-if [[ -n $lsp_sessions ]]; then
+if [[ -n $pgo_sessions ]]; then
   "$profdata" merge -o "$tmp/cli.profdata" "$profiles"
   "$profdata" merge -o "$tmp/lsp.profdata" "$profiles_lsp"
   "$profdata" merge -o "$tmp/merged.profdata" --weighted-input="$lsp_div,$tmp/cli.profdata" "$tmp/lsp.profdata"
@@ -720,7 +725,7 @@ done
   echo "rustc: $(rustc -V), target $target, cargo profile goport"
   echo "pgo: $merged, trained on 5 projects, $n corpus cases and $lsp_trained"
   if [[ -n $lsp_sessions ]]; then
-    echo "editor sessions: lsp-train.py $lsp_sessions (PGO$([[ $bolt == 1 ]] && echo " and tsgo BOLT")) at weight 1/$lsp_div, ls_edit_bench.py sha256 $(sha256sum "$repo/scripts/goport/ls_edit_bench.py" | cut -c1-12)"
+    echo "editor sessions: lsp-train.py $lsp_sessions ($([[ -n $pgo_sessions ]] && echo "PGO")$([[ -n $pgo_sessions && $bolt == 1 ]] && echo " and ")$([[ $bolt == 1 ]] && echo "tsgo BOLT")) at weight 1/$lsp_div, ls_edit_bench.py sha256 $(sha256sum "$repo/scripts/goport/ls_edit_bench.py" | cut -c1-12)"
   fi
   echo "pie: $pie"
   if [[ $libc == musl ]]; then
