@@ -409,6 +409,21 @@ impl LspClient {
         self.write_msg(notification.message());
     }
 
+    /// Waits up to `timeout` for the server's `run` to return by itself,
+    /// as after an LSP `exit`. True when it returned.
+    pub fn wait_server_end(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.server.as_ref().is_none_or(JoinHandle::is_finished) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Go `closeClient()`: cancel, close the input and wait for the server.
     /// A context error is not an error (Go `errors.Is(err, context.Canceled)`).
     pub fn close(&mut self) -> Result<(), GoError> {
