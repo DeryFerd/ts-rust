@@ -20,6 +20,10 @@
 //! context; a plain compile goes on after a signal, as in Go.
 //! Not Go: when the run gets 4 KiB pages, a worker copy of the binary does
 //! the work, so the exit does not wait for its memory to unmap (`launch`).
+//!
+//! As the Go runtime does at start (`go_runtime_start`): the signals that Go
+//! drops get a handler that does nothing, SIGQUIT prints its name and exits
+//! 2, and the soft open-file limit goes up (PORTING.md "Process start").
 //! PORT: Go `core.ApplyDebugStackLimit` (`TS_GO_DEBUG_STACK_LIMIT`) is a
 //! debug setting and is skipped. The work runs on a thread with the stack
 //! size of `gostd::stack::max_stack_size` (1 GiB with no address space or
@@ -56,22 +60,20 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
 const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false";
 
-/// Set in a worker (see `launch`): the number of its end of the pipe that
-/// takes the exit code.
+/// The `arg0` of a worker (see `launch`) is this word, the launcher's
+/// process id and the number of the launcher's end of the pipe that takes
+/// the exit code: `tsgo-worker 4242 3`. The arguments, not the environment,
+/// name a worker, so a process that the worker starts gets nothing of it.
 #[cfg(target_os = "linux")]
-const WORKER_FD: &str = "GOPORT_WORKER_FD";
-
-/// Set in a worker (see `launch`): the process id of its launcher.
-#[cfg(target_os = "linux")]
-const LAUNCHER_PID: &str = "GOPORT_LAUNCHER_PID";
+const WORKER_ARG0: &str = "tsgo-worker";
 
 /// A worker's link to its launcher (see `launch`).
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 struct Worker {
-    /// The number of the pipe end that takes the exit code (`WORKER_FD`).
+    /// The number of the launcher's end of the pipe that takes the exit code.
     fd: u32,
-    /// The launcher (`LAUNCHER_PID`).
+    /// The launcher.
     launcher: rustix::process::Pid,
 }
 
@@ -96,6 +98,9 @@ fn main() {
     let budget = ThreadBudget::one_program(1);
     set_malloc_tunables(&budget);
     budget.install();
+    // After the exec in `set_malloc_tunables`: an exec resets the handlers,
+    // and a raised limit would read as the original one there.
+    go_runtime_start();
     // Go: `System.SinceStart` counts from the process start. The tunables
     // step above may exec the binary again, so the clock starts after it.
     let start = Instant::now();
@@ -168,10 +173,11 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
 /// `GOPORT_LAUNCH=0` never starts a worker and `GOPORT_LAUNCH=1` always
 /// does. None when this process runs the work: it is a worker, no worker is
 /// wanted, `--lsp`, `--api` or watch mode (`long_running`: they end on
-/// their own), or the worker cannot start. The launcher sends SIGINT and
-/// SIGTERM on to the worker (`forward_signals`). When a signal kills the
-/// worker, the launcher ends by the same signal, so the caller sees what a
-/// run without a worker would give.
+/// their own), or the worker cannot start. The launcher sends SIGINT,
+/// SIGTERM and the signals that Go throws on to the worker
+/// (`forward_signals`), and drops the signals that Go drops. When a signal
+/// kills the worker, the launcher ends by the same signal, so the caller
+/// sees what a run without a worker would give.
 #[cfg(target_os = "linux")]
 fn launch(huge_pages: bool) -> Option<i32> {
     use std::io::Read;
@@ -186,29 +192,35 @@ fn launch(huge_pages: bool) -> Option<i32> {
         return None;
     }
     let mut args = std::env::args_os();
-    let program = args.next()?;
+    args.next()?;
     let args: Vec<_> = args.collect();
     let exe = std::env::current_exe().ok()?;
-    // `read` keeps its close-on-exec flag, so the worker gets only `write`,
-    // at the same number. The worker's copy has no close-on-exec flag: it
-    // must stay open through the exec in `set_malloc_tunables`, and std and
-    // rustix have no safe call that sets the flag on an inherited number. A
-    // compile starts no process, and a process that a worker starts is not
-    // a worker (`worker`). THP off (`prctl`) stays off in the worker.
+    drop_go_signals();
+    // Both ends keep their close-on-exec flag, so the worker and the
+    // processes it starts get neither. The worker opens `write` again by
+    // the number of `read` (`exit`). THP off (`prctl`) stays off in the
+    // worker.
     let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok()?;
-    rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::empty()).ok()?;
+    let launcher = rustix::process::getpid().as_raw_pid();
     let mut worker = std::process::Command::new(exe)
-        .arg0(program)
+        .arg0(format!("{WORKER_ARG0} {launcher} {}", read.as_raw_fd()))
         .args(args)
-        .env(WORKER_FD, write.as_raw_fd().to_string())
-        .env(
-            LAUNCHER_PID,
-            rustix::process::getpid().as_raw_pid().to_string(),
-        )
         .spawn()
         .ok()?;
-    drop(write);
     forward_signals(&worker);
+    // `write` stays open until the worker ends, so the read below ends when
+    // the code comes or when the worker has ended without it. The thread
+    // does not reap the worker (`NOWAIT`): `wait` below does. When the
+    // thread cannot start, `write` closes now and the read ends at once.
+    let pid = rustix::process::Pid::from_child(&worker);
+    let _ = std::thread::Builder::new()
+        .name("worker-exit".to_string())
+        .spawn(move || {
+            use rustix::process::{WaitId, WaitIdOptions, waitid};
+            let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
+            while let Err(rustix::io::Errno::INTR) = waitid(WaitId::Pid(pid), options) {}
+            drop(write);
+        });
     let mut code = [0; 4];
     if std::fs::File::from(read).read_exact(&mut code).is_ok() {
         return Some(i32::from_le_bytes(code));
@@ -236,21 +248,22 @@ fn launch(huge_pages: bool) -> Option<i32> {
     })
 }
 
-/// This process as a worker (see `launch`): `WORKER_FD` and `LAUNCHER_PID`
-/// are set, and the parent is that launcher. A process that a worker starts
-/// inherits the variables, but its parent is the worker, so it runs as a
-/// plain tsgo and sends no code. So does a worker whose launcher ends
-/// before the first call. The first call decides, at the start of `main`.
+/// This process as a worker (see `launch`): its `arg0` is `WORKER_ARG0`
+/// with a launcher and a pipe number, and its parent is that launcher. A
+/// worker whose launcher ends before the first call runs as a plain tsgo.
+/// The first call decides, at the start of `main`.
 #[cfg(target_os = "linux")]
 fn worker() -> Option<Worker> {
     static WORKER: std::sync::OnceLock<Option<Worker>> = std::sync::OnceLock::new();
     *WORKER.get_or_init(|| {
-        let fd = std::env::var(WORKER_FD).ok()?.parse().ok()?;
-        let launcher = std::env::var(LAUNCHER_PID)
-            .ok()?
-            .parse()
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)?;
+        let arg0 = std::env::args_os().next()?;
+        let rest = arg0
+            .to_str()?
+            .strip_prefix(WORKER_ARG0)?
+            .strip_prefix(' ')?;
+        let (launcher, fd) = rest.split_once(' ')?;
+        let launcher = rustix::process::Pid::from_raw(launcher.parse().ok()?)?;
+        let fd = fd.parse().ok()?;
         (rustix::process::getppid() == Some(launcher)).then_some(Worker { fd, launcher })
     })
 }
@@ -270,16 +283,21 @@ fn end_with_launcher(launcher: rustix::process::Pid) {
     }
 }
 
-/// Sends each SIGINT and SIGTERM that the launcher gets on to `worker`, on
-/// a thread. So a signal reaches the work as in a run without a worker:
-/// `notify_context` catches it there, and a plain compile goes on, as in
-/// Go. Without this, the signal would end the launcher and then the parent
-/// death signal would kill the worker.
+/// Sends each SIGINT and SIGTERM and each signal that Go throws
+/// (`GO_THROWN`) that the launcher gets on to `worker`, on a thread. So a
+/// signal reaches the work as in a run without a worker: `notify_context`
+/// catches SIGINT and SIGTERM there, and a plain compile goes on, as in
+/// Go; SIGQUIT prints its name there once, also when it went to the whole
+/// process group. Without this, the signal would end the launcher and then
+/// the parent death signal would kill the worker.
 #[cfg(target_os = "linux")]
 fn forward_signals(worker: &std::process::Child) {
     use signal_hook::consts::{SIGINT, SIGTERM};
     let pid = rustix::process::Pid::from_child(worker);
-    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) else {
+    let thrown = GO_THROWN.iter().map(|(signal, _)| signal.as_raw());
+    let Ok(mut signals) =
+        signal_hook::iterator::Signals::new([SIGINT, SIGTERM].into_iter().chain(thrown))
+    else {
         return;
     };
     let _ = std::thread::Builder::new()
@@ -293,27 +311,141 @@ fn forward_signals(worker: &std::process::Child) {
         });
 }
 
-/// Ends the process with `code`. A worker (see `launch`) first points its
-/// stdout and stderr at /dev/null, so a reader of the launcher's output
-/// gets its end of file, and sends the code.
+/// Signals that the Go runtime catches and drops when no `signal.Notify`
+/// asks for them: `_SigNotify` alone or with `_SigUnblock` in
+/// `runtime/sigtab_linux_generic.go` (go1.27.1). The real-time signals 35 to
+/// 64 (`GO_DROPPED_RT`) are such signals too; Go leaves 32 to 34 to the C
+/// library. SIGPIPE is apart: Go has its own rule for stdout and stderr.
+#[cfg(target_os = "linux")]
+const GO_DROPPED: [rustix::process::Signal; 9] = {
+    use rustix::process::Signal;
+    [
+        Signal::USR1,
+        Signal::USR2,
+        Signal::ALARM,
+        Signal::XCPU,
+        Signal::XFSZ,
+        Signal::VTALARM,
+        Signal::PROF,
+        Signal::IO,
+        Signal::POWER,
+    ]
+};
+
+/// The real-time signals that Go drops (see `GO_DROPPED`).
+#[cfg(target_os = "linux")]
+const GO_DROPPED_RT: std::ops::RangeInclusive<i32> = 35..=64;
+
+/// Signals for which the Go runtime prints the name from its table and
+/// exits 2 (`_SigThrow` in `runtime/sigtab_linux_generic.go`), also when the
+/// signal was ignored at start: Go keeps an inherited `SIG_IGN` only for
+/// SIGHUP and SIGINT (`runtime/signal_unix.go` `sigInstallGoHandler`).
+/// PORT: Go then prints the goroutines; the port prints only the name.
+/// PORT: SIGABRT and SIGTRAP keep their default actions: Rust's abort (a
+/// stack overflow too) raises SIGABRT, and debuggers use SIGTRAP.
+#[cfg(target_os = "linux")]
+const GO_THROWN: [(rustix::process::Signal, &str); 3] = {
+    use rustix::process::Signal;
+    [
+        (Signal::QUIT, "SIGQUIT: quit"),
+        (Signal::STKFLT, "SIGSTKFLT: stack fault"),
+        (Signal::SYS, "SIGSYS: bad system call"),
+    ]
+};
+
+/// Gives each signal that Go drops (`GO_DROPPED`, `GO_DROPPED_RT`) a handler
+/// that does nothing. Not `SIG_IGN`: an exec resets a caught signal to its
+/// default action, so a process that tsgo starts gets the default actions,
+/// as from Go.
+#[cfg(target_os = "linux")]
+fn drop_go_signals() {
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signals = GO_DROPPED.iter().map(|signal| signal.as_raw());
+    for signal in signals.chain(GO_DROPPED_RT) {
+        let _ = signal_hook::flag::register(signal, dropped.clone());
+    }
+}
+
+/// The start of a process that runs the work, as the Go runtime and the Go
+/// `syscall` package start: the signals that Go drops get a handler that
+/// does nothing (`drop_go_signals`), a signal that Go throws (`GO_THROWN`)
+/// ends the process (`throw`), and the soft open-file limit goes up to one
+/// below the hard limit (`gostd::rlimit::raise_open_file_limit`). The thread
+/// for the thrown signals waits on a pipe and allocates nothing until one
+/// comes.
+/// PORT: other systems than Linux keep the default actions (Go's tables
+/// differ there).
+fn go_runtime_start() {
+    ts_goport::gostd::rlimit::raise_open_file_limit();
+    #[cfg(target_os = "linux")]
+    {
+        drop_go_signals();
+        let thrown = GO_THROWN.iter().map(|(signal, _)| signal.as_raw());
+        let Ok(mut signals) = signal_hook::iterator::Signals::new(thrown) else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("go-signals".to_string())
+            .spawn(move || {
+                for signal in signals.forever() {
+                    if let Some((_, name)) = GO_THROWN.iter().find(|(s, _)| s.as_raw() == signal) {
+                        throw(name);
+                    }
+                }
+            });
+    }
+}
+
+/// Ends the process after a signal that Go throws (`GO_THROWN`), as the Go
+/// runtime does: it writes `name` to fd 2 with a raw write, sends the code
+/// to the launcher in a worker (`send_code`) and exits 2 (`EXIT_GO_PANIC`,
+/// the exit code of a Go fatal error). An error of the write (a closed or
+/// broken stderr) is ignored, as in Go.
+/// It flushes nothing and takes no std lock, so it cannot wait for the work
+/// thread: that thread can hold the stdout or stderr lock in a write that
+/// blocks on a full pipe. Go flushes nothing either (`os.Stdout` has no
+/// buffer). So it ends with `_exit`: `std::process::exit` flushes the std
+/// stdout buffer when no other thread holds its lock, and waits when
+/// another thread is in its cleanup.
+#[cfg(target_os = "linux")]
+fn throw(name: &str) -> ! {
+    let line = format!("{name}\n");
+    let _ = rustix::io::write(rustix::stdio::stderr(), line.as_bytes());
+    if let Some(worker) = worker() {
+        send_code(worker, EXIT_GO_PANIC);
+    }
+    signal_hook::low_level::exit(EXIT_GO_PANIC)
+}
+
+/// Ends the process with `code` once the work has written its output. A
+/// worker (see `launch`) flushes stdout and sends the code (`send_code`).
 fn exit(code: i32) -> ! {
     #[cfg(target_os = "linux")]
     if let Some(worker) = worker() {
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
-        if let Ok(null) = std::fs::File::options().write(true).open("/dev/null") {
-            let _ = rustix::stdio::dup2_stdout(&null);
-            let _ = rustix::stdio::dup2_stderr(&null);
-        }
-        // The inherited end of the pipe, opened again by its number.
-        if let Ok(mut pipe) = std::fs::File::options()
-            .write(true)
-            .open(format!("/proc/self/fd/{}", worker.fd))
-        {
-            let _ = pipe.write_all(&code.to_le_bytes());
-        }
+        send_code(worker, code);
     }
     std::process::exit(code)
+}
+
+/// Sends `code` to the launcher of `worker` (see `launch`). First it points
+/// stdout and stderr at /dev/null, so a reader of the launcher's output gets
+/// its end of file when the launcher ends, while this process unmaps its
+/// memory. It takes no std lock (`throw`).
+#[cfg(target_os = "linux")]
+fn send_code(worker: Worker, code: i32) {
+    if let Ok(null) = std::fs::File::options().write(true).open("/dev/null") {
+        let _ = rustix::stdio::dup2_stdout(&null);
+        let _ = rustix::stdio::dup2_stderr(&null);
+    }
+    // The launcher's end of the pipe, opened for writing by its number. The
+    // new file has a close-on-exec flag. When it cannot open, the launcher
+    // takes the code from the worker's exit.
+    let pipe = format!("/proc/{}/fd/{}", worker.launcher.as_raw_pid(), worker.fd);
+    if let Ok(mut pipe) = std::fs::File::options().write(true).open(pipe) {
+        let _ = pipe.write_all(&code.to_le_bytes());
+    }
 }
 
 // Go: cmd/tsgo/main.go:18 runMain
