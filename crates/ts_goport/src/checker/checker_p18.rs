@@ -1248,8 +1248,8 @@ impl Checker {
         if symbol == self.require_symbol {
             return self.any_type;
         }
-        debug_assert!(self.sym(symbol).value_declaration.is_some());
         let declaration = self.sym(symbol).value_declaration;
+        go_assert!(declaration.is_some());
         if is_source_file(declaration) && is_json_source_file(declaration) {
             let statements = declaration.statements();
             if statements.is_empty() {

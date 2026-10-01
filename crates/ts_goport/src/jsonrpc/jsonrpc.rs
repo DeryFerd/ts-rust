@@ -60,11 +60,17 @@ impl MarshalerTo for JSONRPCVersion {
 }
 
 // Go v2 calls UnmarshalJSON with the raw value (`null` included).
+// A method error gets the v2 wrapping (`unmarshal_json_method_error`).
 impl UnmarshalerFrom for JSONRPCVersion {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let data = dec.read_value()?;
-        self.unmarshal_json(data)
-            .map_err(|e| JsonError { message: e.error() })
+        self.unmarshal_json(data).map_err(|e| {
+            crate::frontend::json_ext::unmarshal_json_method_error(
+                data,
+                "jsonrpc.JSONRPCVersion",
+                e.error(),
+            )
+        })
     }
 }
 
@@ -128,7 +134,10 @@ impl ID {
         } else {
             json_marshal(&self.int, &[])
         };
-        out.map(String::into_bytes).map_err(errors::from_value)
+        // PORT: Go returns bytes. The text is in the port form (see
+        // `scanner_util::GO_STRING_MARKER`), so its Go bytes are returned.
+        out.map(|text| crate::scanner_util::go_string_bytes(&text).into_owned())
+            .map_err(errors::from_value)
     }
 
     // Go: jsonrpc.go:69 UnmarshalJSON
@@ -178,11 +187,13 @@ impl MarshalerTo for ID {
 
 // Go v2 calls UnmarshalJSON with the raw value. A `*ID` field handles
 // `null` in the pointer arshaler (`Option<ID>`).
+// A method error gets the v2 wrapping (`unmarshal_json_method_error`).
 impl UnmarshalerFrom for ID {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let data = dec.read_value()?;
-        self.unmarshal_json(data)
-            .map_err(|e| JsonError { message: e.error() })
+        self.unmarshal_json(data).map_err(|e| {
+            crate::frontend::json_ext::unmarshal_json_method_error(data, "jsonrpc.ID", e.error())
+        })
     }
 }
 

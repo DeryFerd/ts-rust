@@ -267,9 +267,12 @@ impl LanguageService {
                 && !combined.changes.is_empty()
             {
                 let kind = lsproto::CodeActionKind::QUICK_FIX;
-                let mut changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> =
+                let mut changes: IndexMap<lsproto::DocumentUri, Vec<Option<lsproto::TextEdit>>> =
                     IndexMap::new();
-                changes.insert(uri.clone(), combined.changes);
+                changes.insert(
+                    uri.clone(),
+                    combined.changes.into_iter().map(Some).collect(),
+                );
                 actions.push(lsproto::CommandOrCodeAction {
                     code_action: Some(lsproto::CodeAction {
                         title: combined.description,
@@ -374,7 +377,7 @@ impl LanguageService {
         uri: &lsproto::DocumentUri,
     ) -> Result<Option<lsproto::CommandOrCodeAction>, GoError> {
         let kind = lsproto::CodeActionKind::SOURCE_FIX_ALL_TS;
-        let mut lsp_changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> =
+        let mut lsp_changes: IndexMap<lsproto::DocumentUri, Vec<Option<lsproto::TextEdit>>> =
             IndexMap::new();
 
         for provider in code_fix_providers() {
@@ -399,7 +402,7 @@ impl LanguageService {
                 lsp_changes
                     .entry(uri.clone())
                     .or_default()
-                    .extend(combined.changes);
+                    .extend(combined.changes.into_iter().map(Some));
             }
         }
 
@@ -496,11 +499,11 @@ impl LanguageService {
 
         // PORT: Go ranges over the `changes` map in random order; this uses
         // the tracker's insertion order.
-        let mut lsp_changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> =
+        let mut lsp_changes: IndexMap<lsproto::DocumentUri, Vec<Option<lsproto::TextEdit>>> =
             IndexMap::new();
         for (file_name, edits) in changes {
             let file_uri = lsconv::file_name_to_document_uri(&file_name);
-            lsp_changes.insert(file_uri, edits);
+            lsp_changes.insert(file_uri, edits.into_iter().map(Some).collect());
         }
 
         lsproto::CommandOrCodeAction {
@@ -532,8 +535,12 @@ fn convert_to_lsp_code_action(
     uri: &lsproto::DocumentUri,
 ) -> lsproto::CommandOrCodeAction {
     let kind = lsproto::CodeActionKind::QUICK_FIX;
-    let mut changes: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> = IndexMap::new();
-    changes.insert(uri.clone(), action.changes.clone());
+    let mut changes: IndexMap<lsproto::DocumentUri, Vec<Option<lsproto::TextEdit>>> =
+        IndexMap::new();
+    changes.insert(
+        uri.clone(),
+        action.changes.iter().cloned().map(Some).collect(),
+    );
     let diagnostics: Vec<Option<lsproto::Diagnostic>> = vec![Some(diag.clone())];
 
     lsproto::CommandOrCodeAction {

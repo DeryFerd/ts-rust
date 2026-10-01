@@ -1007,7 +1007,8 @@ pub fn combine_implementations(
 // order. It is an `IndexMap` in first-insert order. Go ranges over each
 // response's `Changes` map in random order; this uses its insertion order.
 pub fn combine_rename_response(results: &[lsproto::RenameResponse]) -> lsproto::RenameResponse {
-    let mut combined: IndexMap<lsproto::DocumentUri, Vec<lsproto::TextEdit>> = IndexMap::new();
+    let mut combined: IndexMap<lsproto::DocumentUri, Vec<Option<lsproto::TextEdit>>> =
+        IndexMap::new();
     let mut seen_changes: FxHashMap<lsproto::DocumentUri, FxHashSet<lsproto::Range>> =
         FxHashMap::default();
     let mut document_changes: Vec<lsproto::TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile> =
@@ -1039,8 +1040,13 @@ pub fn combine_rename_response(results: &[lsproto::RenameResponse]) -> lsproto::
                 let seen_set = seen_changes.entry(doc.clone()).or_default();
                 let mut changes_for_doc = combined.get(doc).cloned().unwrap_or_default();
                 for change in changes {
-                    if !seen_set.contains(&change.range) {
-                        seen_set.insert(change.range);
+                    // Go reads `change.Range` of a nil element.
+                    let range = change
+                        .as_ref()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference())
+                        .range;
+                    if !seen_set.contains(&range) {
+                        seen_set.insert(range);
                         changes_for_doc.push(change.clone());
                     }
                 }

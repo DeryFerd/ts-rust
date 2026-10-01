@@ -676,9 +676,10 @@ thread_local! {
 /// that the emit that it starts keeps its writes in memory
 /// (`WriteBuffer`) until `finish_emit_files` writes them (`flush_writes`).
 /// `tsc -b` starts a task's emit when it makes the task's program, so each
-/// program emits right after its check, and its outputs still reach the
-/// file system when the task finishes, in build order (see
-/// `BuildTask::compile_and_emit_start`).
+/// program emits right after its check, and its outputs reach the file
+/// system only when the orchestrator finishes the task
+/// (`BuildTask::compile_and_emit_start`; `build_all_tasks` gives the
+/// order).
 pub(crate) fn buffer_early_emit_writes(start: impl FnOnce()) {
     BUFFER_EARLY_EMIT_WRITES.set(true);
     start();

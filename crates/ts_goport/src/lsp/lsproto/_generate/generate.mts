@@ -2282,7 +2282,8 @@ const goIdentifier = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * goTypeToRust converts a Go type string from resolveType (or a field type
  * built from it) to the Rust type (map-lsproto.md section 3, PORTING.md
  * "Protocol types"). `*T` is Option<T>, `[]T` and `[]*T` are Vec<T>
- * (`[]*T` is Vec<Option<T>> in a type the server decodes: fieldGoTypeToRust),
+ * (`[]*T`, also as a map value, is Vec<Option<T>> in a type the server
+ * decodes: fieldGoTypeToRust),
  * `map[K]V` and `map[K]*V` are IndexMap<K, V>, `any` is LspAny, `struct{}`
  * is EmptyObject and `[2]uint32` is [u32; 2]. Named types keep their name.
  * Box for type cycles is added per field by the caller (see boxedEdges).
@@ -2537,10 +2538,11 @@ function generateCode(): Map<string, string> {
     // `Vec<T>`, because it never builds a nil element, except in the types
     // that the server decodes: the params of client-to-server methods and
     // the results of server-to-client requests, with the types they hold.
-    // There a `[]*T` is `Vec<Option<T>>`, so a null element decodes as Go's
-    // nil, and a nil element encodes as null, as in Go (a type such as
-    // CompletionItem goes back to the client). A list that holds no null
-    // encodes and decodes as before (PORTING.md "Protocol types").
+    // There a `[]*T` (also as a map value) is `Vec<Option<T>>`, so a null
+    // element decodes as Go's nil, and a nil element encodes as null, as in
+    // Go (a type such as CompletionItem goes back to the client). A list
+    // that holds no null encodes and decodes as before (PORTING.md
+    // "Protocol types").
     // ------------------------------------------------------------------
     function namedGoTypes(goType: string): string[] {
         if (goType.startsWith("*")) return namedGoTypes(goType.slice(1));
@@ -2582,12 +2584,22 @@ function generateCode(): Map<string, string> {
     })();
 
     // fieldGoTypeToRust is goTypeToRust for a field of `owner`, with the
-    // nil elements of a type the server decodes.
+    // nil elements of a type the server decodes: a `[]*T` field, or a map
+    // field whose values are `[]*T` (WorkspaceEdit.changes).
     function fieldGoTypeToRust(owner: string, goType: string): string {
-        const list = /^(\*?)\[\]\*(.*)$/.exec(goType);
-        if (!list || !decodedTypes.has(owner)) return goTypeToRust(goType);
-        const vec = `Vec<Option<${goTypeToRust(list[2])}>>`;
-        return list[1] ? `Option<${vec}>` : vec;
+        const field = /^(\*?)(.*)$/.exec(goType)!;
+        const nilElements = (list: string) => {
+            const element = /^\[\]\*(.*)$/.exec(list);
+            return element ? `Vec<Option<${goTypeToRust(element[1])}>>` : undefined;
+        };
+        let rust = decodedTypes.has(owner) ? nilElements(field[2]) : undefined;
+        if (!rust && decodedTypes.has(owner) && field[2].startsWith("map[")) {
+            const [key, value] = splitGoMapType(field[2]);
+            const values = nilElements(value);
+            if (values) rust = `IndexMap<${goTypeToRust(key)}, ${values}>`;
+        }
+        if (!rust) return goTypeToRust(goType);
+        return field[1] ? `Option<${rust}>` : rust;
     }
 
     const enumKinds = new Map(model.enumerations.map(e => [e.name, e.type.name === "string" ? "string" : "int"]));

@@ -22,10 +22,13 @@
 //! its check on the program's checker threads, so the checkers of the
 //! started tasks work at the same time, as the Go goroutines do. Each
 //! checker emits when its check ends, and the emit keeps its writes in
-//! memory. The started tasks write their outputs one at a time, the first
-//! taken first (`build_project_finish`). So a task that runs beside others
-//! in Go reads the file system before they write their outputs. Every task
-//! uses `o.host` and its caches (parsed `.d.ts` and
+//! memory. The started tasks write their outputs one at a time
+//! (`build_project_finish`), in the order their check and emit end, as each
+//! Go builder writes when its own task ends. PORT (determinism): when tasks
+//! can see each other's writes (shared_outputs.rs), all tasks finish in
+//! build order instead. Tasks start before a started task writes, so a task
+//! that runs beside others in Go reads the file system before they write
+//! their outputs. Every task uses `o.host` and its caches (parsed `.d.ts` and
 //! `.json` files, configs, the cached file system, the mtimes), as in Go.
 //! Outside tests each program is released when its task is built, as Go
 //! drops it there; in tests when its task reports. Its checker threads
@@ -48,6 +51,7 @@ use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::config_prefetch::ConfigPrefetch;
 use crate::execute::build::host::BuildHost;
+use crate::execute::build::shared_outputs::outputs_overlap;
 use crate::execute::incremental::build_info::{BuildInfo, is_build_info_file_name_default_library};
 use crate::execute::incremental::incremental::{new_build_info_reader, parse_build_info};
 use crate::execute::tsc::compile::{
@@ -63,6 +67,7 @@ use crate::frontend::prelude::*;
 use crate::gostd::Context;
 // PORT: testing
 use crate::execute::tsc::compile::CommandLineTesting;
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::SystemTime;
 
@@ -181,6 +186,16 @@ pub struct Orchestrator {
     // PORT: not in Go (perf). The build info files that threads read ahead
     // of the up-to-date checks of this build cycle (`BuildInfoPrefetch`).
     build_info_prefetch: RefCell<Option<BuildInfoPrefetch>>,
+    // PORT: not in Go (perf). The released programs of built tasks whose
+    // frontend programs are not freed yet (`release_task_program`), oldest
+    // first. Go's GC frees them in the background. Their `Rc` data frees on
+    // this thread: when it would wait for a task (`build_all_tasks`), or
+    // when more than `MAX_KEPT_RELEASED` wait.
+    released: RefCell<VecDeque<crate::program::ReleasedProgram>>,
+    // PORT: not in Go (perf). True when the process ends after this `tsc -b`
+    // build (`start_exported`, not in watch mode or a test), so what the
+    // build keeps is not freed.
+    ends_process: std::cell::Cell<bool>,
     // PORT: not in Go (perf). The check parts that a thread made from the
     // build info that `read_build_info_file` gave last, and its file name.
     status_prefetch: RefCell<Option<(String, StatusPrefetch)>>,
@@ -490,9 +505,18 @@ impl Orchestrator {
     // `Watch` blocks in the watch loop until `ctx` ends
     // (orchestrator_watch.rs).
     pub fn start_exported(mut self: Box<Self>, ctx: &Context) -> CommandLineResult {
+        // PORT: not in Go (perf). The process ends after `tsc -b`, and Go
+        // does not free at exit: the orchestrator, its caches and the kept
+        // released programs (`released`) are not freed. With a content
+        // mapper host the orchestrator drops, as its projects close then.
+        let ends_process =
+            !self.opts.command.compiler_options.watch.is_true() && self.opts.testing.is_none();
+        self.ends_process.set(ends_process);
         let mut result = self.start(ctx, "", false /*onlyReferences*/).result;
         if self.opts.command.compiler_options.watch.is_true() {
             result.watcher = Some(self as Box<dyn Watcher>);
+        } else if ends_process && self.content_mapper_host.is_none() {
+            std::mem::forget(self);
         }
         result
     }
@@ -833,6 +857,28 @@ impl Orchestrator {
             .map(|(i, p)| (p.clone(), i))
             .collect();
         let mut states = vec![State::NotTaken; paths.len()];
+        // PORT: perf. Each checker thread of a compiling task's program
+        // drops a `ReadySignal` of the task when the check and emit that it
+        // started are done (`BuildTask::notify_when_compiled`); `signals`
+        // counts the signals that each task still waits for. `compiled`
+        // holds the compiling tasks whose signals have all arrived, in the
+        // order their last signal arrived: the order in which their checks
+        // and emits ended.
+        let (ready, ready_calls) = std::sync::mpsc::channel::<usize>();
+        let mut signals = vec![0usize; paths.len()];
+        let mut compiled = VecDeque::new();
+        fn signal_arrived(signals: &mut [usize], compiled: &mut VecDeque<usize>, index: usize) {
+            signals[index] -= 1;
+            if signals[index] == 0 {
+                compiled.push_back(index);
+            }
+        }
+        // PORT: not in Go (determinism). True when the tasks can see each
+        // other's writes (`outputs_overlap`), so they finish in build order.
+        // It is found when the first task compiles: until then every task
+        // was done when it started. With one builder the order is the same.
+        let mut in_build_order = false;
+        let mut overlap_checked = false;
         // Tasks taken (Go `currentTaskIndex`), taken and not built, and
         // reported. The tasks before `next_report` are built.
         let mut next_take = 0;
@@ -880,12 +926,24 @@ impl Orchestrator {
                     task.build_project_finish(self, &paths[index]);
                     State::Done
                 } else {
+                    signals[index] = task.notify_when_compiled(|| ReadySignal {
+                        index,
+                        ready: ready.clone(),
+                    });
+                    if signals[index] == 0 {
+                        compiled.push_back(index);
+                    }
                     State::Compiling
                 };
                 if states[index] == State::Done {
                     self.task_built(&mut task);
                     in_flight -= 1;
                     progressed = true;
+                }
+                drop(task);
+                if states[index] == State::Compiling && !overlap_checked && num_routines > 1 {
+                    overlap_checked = true;
+                    in_build_order = self.outputs_overlap(&paths);
                 }
             }
             // Tasks report in order, each when it is built.
@@ -899,18 +957,39 @@ impl Orchestrator {
                 continue;
             }
             // No task can start or report, so a taken task compiles (the
-            // first taken task that is not built has its upstream tasks
-            // done). The first taken one that compiles emits now, before
-            // the other started tasks.
-            let index = (next_report..next_take)
-                .find(|&index| states[index] == State::Compiling)
-                .expect("a taken build task compiles");
+            // first task that is not built, `next_report`, has its upstream
+            // tasks done). A Go builder writes the outputs of its task
+            // when the task's check ends, and then takes the next task. So
+            // the task whose started check and emit ended first finishes
+            // now: it writes its outputs, and its builder takes the next
+            // task. When the outputs overlap, only the first task that is not
+            // built finishes, as in Go when the tasks end in build order.
+            // When no task can finish yet, this waits for a signal, and frees
+            // a kept released program first.
+            let index = loop {
+                while let Ok(index) = ready_calls.try_recv() {
+                    signal_arrived(&mut signals, &mut compiled, index);
+                }
+                let can_finish = |&index: &usize| !in_build_order || index == next_report;
+                if let Some(at) = compiled.iter().position(can_finish) {
+                    break compiled.remove(at).expect("the position is in the queue");
+                }
+                if !self.free_released() {
+                    let index = ready_calls.recv().expect("this thread keeps a sender");
+                    signal_arrived(&mut signals, &mut compiled, index);
+                }
+            };
             let task = self.get_task(&paths[index]);
             let mut task = task.borrow_mut();
             task.build_project_finish(self, &paths[index]);
             states[index] = State::Done;
             self.task_built(&mut task);
             in_flight -= 1;
+        }
+        // The kept released programs free now, unless the process ends
+        // after this build (`start_exported`).
+        if !self.ends_process.get() {
+            while self.free_released() {}
         }
         // A task that did not read its build info leaves its read unused.
         self.build_info_prefetch.borrow_mut().take();
@@ -929,15 +1008,46 @@ impl Orchestrator {
                 .as_mut()
                 .and_then(|result| result.program.take())
             {
-                release_task_program(program);
+                self.keep_released(release_task_program(program));
             }
         }
     }
 
+    /// PORT: not in Go (determinism). `outputs_overlap` for the tasks at
+    /// `paths` (the build order of `build_all_tasks`).
+    fn outputs_overlap(&self, paths: &[Path]) -> bool {
+        let configs: Vec<_> = paths
+            .iter()
+            .map(|path| self.get_task(path).borrow().resolved.clone())
+            .collect();
+        // The file system without the build host's cache: that cache keeps
+        // each lookup for the whole build, and this one looks up output
+        // directories that do not exist yet.
+        outputs_overlap(&configs, &self.opts.sys.fs(), &self.compare_paths_options)
+    }
+
+    /// PORT: not in Go (perf). Keeps `released` to free later (see
+    /// `released`).
+    fn keep_released(&self, released: crate::program::ReleasedProgram) {
+        let oldest = {
+            let mut kept = self.released.borrow_mut();
+            kept.push_back(released);
+            (kept.len() > MAX_KEPT_RELEASED).then(|| kept.pop_front())
+        };
+        drop(oldest);
+    }
+
+    /// PORT: not in Go (perf). Frees the oldest kept released program.
+    /// False when none is kept.
+    fn free_released(&self) -> bool {
+        let oldest = self.released.borrow_mut().pop_front();
+        oldest.is_some()
+    }
+
     /// PORT: not in Go (perf). Starts reading the build info files that the
     /// up-to-date checks of the tasks at `paths` will read (see
-    /// `BuildInfoPrefetch`), on up to `num_routines` threads. None when
-    /// there is nothing to gain or the read could differ from the task's
+    /// `BuildInfoPrefetch`), on up to `MAX_BUILD_INFO_THREADS` threads. None
+    /// when there is nothing to gain or the read could differ from the task's
     /// own read: one routine (`--singleThreaded` or `--builders 1`: Go
     /// checks one task at a time), `--force` (no check reads the build
     /// info), a file system other than the OS one (tests), or fewer than
@@ -981,6 +1091,7 @@ impl Orchestrator {
                     BuildInfoRead {
                         name,
                         input_files: resolved.file_names().to_vec(),
+                        check: StatusCheckOptions::new(resolved.compiler_options()),
                     },
                 ));
             }
@@ -992,13 +1103,16 @@ impl Orchestrator {
         if reads.len() < 2 {
             return None;
         }
+        // The checks store about this many mtimes; the map grows once.
+        let inputs: usize = reads.iter().map(|read| read.input_files.len()).sum();
+        self.host
+            .m_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reserve(inputs);
         let m_times: MTimePrefetch = Arc::default();
-        let prefetch = BuildInfoPrefetch::start(
-            reads,
-            num_routines,
-            self.compare_paths_options.clone(),
-            m_times.clone(),
-        )?;
+        let prefetch =
+            BuildInfoPrefetch::start(reads, self.compare_paths_options.clone(), m_times.clone())?;
         *self.host.m_time_prefetch.borrow_mut() = Some(m_times);
         Some(prefetch)
     }
@@ -1035,7 +1149,7 @@ impl Orchestrator {
         build_result.files_to_delete.extend(result.files_to_delete);
         // Go drops `t.result` here (`t.result = nil`).
         if let Some(program) = result.program {
-            release_task_program(program);
+            self.keep_released(release_task_program(program));
         }
     }
 
@@ -1134,6 +1248,10 @@ impl BuildTaskOrchestrator for Orchestrator {
         self.host.get_m_time(file)
     }
 
+    fn get_m_time_of_path(&self, file: &str, path: &Path) -> Option<SystemTime> {
+        self.host.get_m_time_of_path(file, path)
+    }
+
     fn set_m_time(&self, file: &str, m_time: SystemTime) -> Result<(), FsError> {
         self.host.set_m_time(file, Some(m_time))
     }
@@ -1195,16 +1313,20 @@ impl BuildTaskOrchestrator for Orchestrator {
 /// (`StatusPrefetch`), and the mtimes of the task's TypeScript sources
 /// that are not declaration files, the root files and the files of the
 /// build info (`MTimePrefetch`). No task of a build writes such a file, so
-/// the mtime is the one that the check would read later.
+/// the mtime is the one that the check would read later. When the build
+/// info shows that the check returns before these parts (errors, pending
+/// emit: `StatusCheckOptions::reads_input_times`), the thread skips them,
+/// as Go reads no input mtime there.
 struct BuildInfoPrefetch {
     slots: FxHashMap<String, Arc<BuildInfoSlot>>,
 }
 
-/// One build info file that the threads read, and the root files of its
-/// task (`resolved.FileNames()`).
+/// One build info file that the threads read, the root files of its task
+/// (`resolved.FileNames()`) and the options that its check reads.
 struct BuildInfoRead {
     name: String,
     input_files: Vec<String>,
+    check: StatusCheckOptions,
 }
 
 /// The mtimes that the build info threads read ahead of the checks, by
@@ -1235,16 +1357,33 @@ fn is_typescript_source(file_name: &str) -> bool {
     ) && !is_declaration_file_name(file_name)
 }
 
-/// The most threads that read build info files.
+/// The most released programs that `Orchestrator::released` keeps.
+const MAX_KEPT_RELEASED: usize = 4;
+
+/// PORT: not in Go (perf). Sends the build order index of its task when it
+/// drops (see `build_all_tasks`).
+struct ReadySignal {
+    index: usize,
+    ready: std::sync::mpsc::Sender<usize>,
+}
+
+impl Drop for ReadySignal {
+    fn drop(&mut self) {
+        let _ = self.ready.send(self.index);
+    }
+}
+
+/// The most threads that read build info files. The count is not Go's
+/// `numRoutines`: the threads only read, so their count changes no output,
+/// and a build info takes the port longer to parse than to check.
 const MAX_BUILD_INFO_THREADS: usize = 8;
 
 impl BuildInfoPrefetch {
     /// Starts the threads that read and parse the files of `reads`, in
-    /// order, at most `num_routines` (Go `numRoutines`), and put the
+    /// order, at most `MAX_BUILD_INFO_THREADS` and the cores, and put the
     /// mtimes they read into `m_times`. None when no thread starts.
     fn start(
         reads: Vec<BuildInfoRead>,
-        num_routines: usize,
         compare_paths_options: ComparePathsOptions,
         m_times: MTimePrefetch,
     ) -> Option<Self> {
@@ -1261,7 +1400,6 @@ impl BuildInfoPrefetch {
         ));
         let compare_paths_options = Arc::new(compare_paths_options);
         let threads = MAX_BUILD_INFO_THREADS
-            .min(num_routines)
             .min(crate::program::available_cores())
             .min(slots.len());
         let mut started = 0;
@@ -1287,16 +1425,21 @@ impl BuildInfoPrefetch {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let (data, ok) = fs.read_file(&read.name);
                             let build_info = if ok { parse_build_info(&data) } else { None };
-                            let status = build_info.as_ref().map(|build_info| {
-                                let status = StatusPrefetch::new(
-                                    build_info,
-                                    &read.name,
-                                    &read.input_files,
-                                    &compare_paths_options,
-                                );
-                                prefetch_m_times(&*fs, &read, &status, &m_times);
-                                status
-                            });
+                            // A check that returns before the input mtimes
+                            // reads neither the check parts nor the mtimes.
+                            let status = build_info
+                                .as_ref()
+                                .filter(|build_info| read.check.reads_input_times(build_info))
+                                .map(|build_info| {
+                                    let status = StatusPrefetch::new(
+                                        build_info,
+                                        &read.name,
+                                        &read.input_files,
+                                        &compare_paths_options,
+                                    );
+                                    prefetch_m_times(&*fs, &read, &status, &m_times);
+                                    status
+                                });
                             (build_info, status)
                         }));
                         *slot.result.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -1333,6 +1476,8 @@ impl BuildInfoPrefetch {
 /// Reads the mtimes of the TypeScript sources (`is_typescript_source`) of
 /// `read` (its root files and the files of its build info, `status`) into
 /// `m_times`, as `BuildHost::get_m_time` reads them (`incremental.GetMTime`).
+/// Each path is read once: the build info lists the root files too, and the
+/// check keeps the first mtime of a path.
 fn prefetch_m_times(
     fs: &dyn Fs,
     read: &BuildInfoRead,
@@ -1341,9 +1486,11 @@ fn prefetch_m_times(
 ) {
     let roots = read.input_files.iter().zip(&status.input_paths);
     let files = status.file_names.iter().map(|(file, path)| (file, path));
+    let mut seen: FxHashSet<&Path> =
+        FxHashSet::with_capacity_and_hasher(read.input_files.len(), Default::default());
     let read: Vec<(Path, Option<SystemTime>)> = roots
         .chain(files)
-        .filter(|(file, _)| is_typescript_source(file))
+        .filter(|(file, path)| is_typescript_source(file) && seen.insert(path))
         .map(|(file, path)| (path.clone(), fs.stat(file).and_then(|stat| stat.mod_time())))
         .collect();
     let mut m_times = m_times.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1384,6 +1531,8 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
         schedule_order: Vec::new(),
         graph_generated: false,
         build_info_prefetch: RefCell::new(None),
+        released: RefCell::default(),
+        ends_process: std::cell::Cell::new(false),
         status_prefetch: RefCell::new(None),
     };
     if orchestrator.opts.command.compiler_options.watch.is_true() {

@@ -41,10 +41,11 @@ fn unmarshal_int(dec: &mut JsonDecoder<'_>) -> Result<i64, JsonError> {
             Ok(0)
         }
         b'0' => {
-            let JsonToken::Number(raw) = dec.read_token()? else {
+            // PERF: the number text is borrowed (`read_token_ref`).
+            let JsonTokenRef::Number(raw) = dec.read_token_ref()? else {
                 unreachable!("peeked a number")
             };
-            parse_go_int(&raw)
+            parse_go_int(raw)
         }
         _ => {
             dec.skip_value()?;
@@ -152,7 +153,8 @@ fn unmarshal_object(
         b'{' => {
             dec.read_token()?;
             while dec.peek_kind() != b'}' {
-                let JsonToken::String(name) = dec.read_token()? else {
+                // PERF: the name is borrowed when it can be (`read_token_ref`).
+                let JsonTokenRef::String(name) = dec.read_token_ref()? else {
                     return Err(json_error("invalid object member name"));
                 };
                 if !field(&name, dec)? {
@@ -612,6 +614,67 @@ impl UnmarshalerFrom for BuildInfoFileInfoWithSignature {
     }
 }
 
+/// PORT: not in Go (perf). The members of both object forms of a
+/// `BuildInfoFileInfo`, decoded in one pass. When this decode succeeds,
+/// the Go decodes of `buildInfoFileInfoNoSignature` and
+/// `buildInfoFileInfoWithSignature` succeed too: each reads a subset of
+/// these members with the same decoders and skips the rest, and the value
+/// is valid JSON with no duplicate names. So the result is the one of
+/// Go's `UnmarshalJSON` for an object.
+#[derive(Default)]
+struct BuildInfoFileInfoMembers {
+    version: String,
+    signature: String,
+    no_signature: bool,
+    affects_global_scope: bool,
+    implied_node_format: ResolutionMode,
+}
+
+impl BuildInfoFileInfoMembers {
+    /// The `BuildInfoFileInfo` of the object `data`, or `None` when the
+    /// one-pass decode fails.
+    fn decode(data: &[u8]) -> Option<BuildInfoFileInfo> {
+        let members = unmarshal_bytes::<BuildInfoFileInfoMembers>(data).ok()?;
+        Some(if members.no_signature {
+            BuildInfoFileInfo {
+                no_signature: Some(BuildInfoFileInfoNoSignature {
+                    version: members.version,
+                    no_signature: true,
+                    affects_global_scope: members.affects_global_scope,
+                    implied_node_format: members.implied_node_format,
+                }),
+                ..Default::default()
+            }
+        } else {
+            BuildInfoFileInfo {
+                file_info: Some(BuildInfoFileInfoWithSignature {
+                    version: members.version,
+                    signature: members.signature,
+                    affects_global_scope: members.affects_global_scope,
+                    implied_node_format: members.implied_node_format,
+                }),
+                ..Default::default()
+            }
+        })
+    }
+}
+
+impl UnmarshalerFrom for BuildInfoFileInfoMembers {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        unmarshal_object(dec, |name, dec| {
+            match name {
+                "version" => self.version = unmarshal_string(dec)?,
+                "signature" => self.signature = unmarshal_string(dec)?,
+                "noSignature" => self.no_signature = unmarshal_bool(dec)?,
+                "affectsGlobalScope" => self.affects_global_scope = unmarshal_bool(dec)?,
+                "impliedNodeFormat" => self.implied_node_format = ModuleKind(unmarshal_i32(dec)?),
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })
+    }
+}
+
 // Go: incremental/buildInfo.go:90 BuildInfoFileInfo
 // PORT: Go unexported fields are plain `pub` fields. Go nil pointers are
 // `None`.
@@ -732,6 +795,15 @@ impl UnmarshalerFrom for BuildInfoFileInfo {
             return Err(json_error("PORT: null element for a Go pointer"));
         }
         let data = dec.read_value()?;
+        // PORT: perf. An object decodes once into the members of both
+        // forms; Go decodes it up to three times. A value that fails
+        // here takes the Go path below.
+        if data.first() == Some(&b'{')
+            && let Some(file_info) = BuildInfoFileInfoMembers::decode(data)
+        {
+            *self = file_info;
+            return Ok(());
+        }
         match unmarshal_bytes::<String>(data) {
             Err(_) => {
                 let no_signature = unmarshal_bytes::<BuildInfoFileInfoNoSignature>(data);
@@ -1788,6 +1860,51 @@ mod tests {
         let signatures = info.emit_signatures.as_ref().unwrap();
         assert!(signatures[2].differs_only_in_dts_map);
         assert!(signatures[3].differs_in_options);
+    }
+
+    // The one-pass object decode (`BuildInfoFileInfoMembers`) gives what Go's
+    // three decodes give, also where it fails and the Go path runs.
+    #[test]
+    fn file_info_object_decode_matches_go_order() {
+        fn go_order(data: &[u8]) -> Option<BuildInfoFileInfo> {
+            if let Ok(signature) = unmarshal_bytes::<String>(data) {
+                return Some(BuildInfoFileInfo {
+                    signature,
+                    ..Default::default()
+                });
+            }
+            if let Ok(no_signature) = unmarshal_bytes::<BuildInfoFileInfoNoSignature>(data)
+                && no_signature.no_signature
+            {
+                return Some(BuildInfoFileInfo {
+                    no_signature: Some(no_signature),
+                    ..Default::default()
+                });
+            }
+            let file_info = unmarshal_bytes::<BuildInfoFileInfoWithSignature>(data).ok()?;
+            Some(BuildInfoFileInfo {
+                file_info: Some(file_info),
+                ..Default::default()
+            })
+        }
+        for data in [
+            r#"{"version":"v","signature":"s","affectsGlobalScope":true,"impliedNodeFormat":1}"#,
+            r#"{"version":"v","noSignature":true,"impliedNodeFormat":99}"#,
+            r#"{"version":"v","noSignature":false}"#,
+            r#"{"version":"v","noSignature":true,"signature":"s"}"#,
+            r#"{"version":"v","signature":1,"noSignature":true}"#,
+            r#"{"version":"v","noSignature":"x","signature":"s"}"#,
+            r#"{"version":null,"extra":[1,{"a":2}],"impliedNodeFormat":null}"#,
+            r#"{"version":"v","version":"w"}"#,
+            r#"{"version":1}"#,
+            r#"{}"#,
+        ] {
+            let mut decoded = BuildInfoFileInfo::default();
+            let got = json_unmarshal(data.as_bytes(), &mut decoded, &[])
+                .ok()
+                .map(|()| decoded);
+            assert_eq!(got, go_order(data.as_bytes()), "{data}");
+        }
     }
 
     #[test]
