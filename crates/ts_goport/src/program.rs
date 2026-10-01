@@ -657,9 +657,9 @@ pub(crate) struct ProgramState {
 // tables are behind an `Arc` that `release_program` drops.
 // PERF: a version that replaces files of the version it was updated from
 // in place (Go `ReuseProgram`) starts from that version's tables and
-// changes only the entries of the replaced files (`go_frontend::
-// build_program`). So the tables that hold paths are by slot, and the
-// slot of a replaced file does not change (editfast1).
+// changes only the entries of the replaced files (`build_program` in
+// `go_frontend`). So the tables that hold paths are by slot, and the slot
+// of a replaced file does not change (editfast1).
 pub(crate) struct VersionTables {
     /// File ids in Go `Program.SourceFiles()` order
     /// (`GoProgram::source_file_order`). The slot of a program file is its
