@@ -581,9 +581,11 @@ impl SyntheticArena {
     }
 
     /// The node slot of synthetic handle `n`.
-    // PERF: emitast1 F3. Inline, with the panics out of line: every
-    // synthetic field read calls it.
-    #[inline]
+    // PERF: emitast1. Out of line, as before: inlined at every synthetic
+    // field read, it made `tsgo -p` effect check (16 threads) 0.9% to
+    // 1.5% slower on mini-743d with the same instruction count (runs t3,
+    // t5, t6); out of line it is +0.15% there, with the same emit gain.
+    #[inline(never)]
     fn node(&self, n: Node) -> &SyntheticNode {
         match self.slot(slot_index(n)) {
             Slot::Node(s) => s,
