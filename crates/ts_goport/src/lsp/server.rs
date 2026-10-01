@@ -1709,7 +1709,7 @@ impl Server {
             let ctx = ctx.clone();
             // The Go stack size: the read loop decodes the initialize
             // params, whose `LSPAny` values decode one call per level.
-            std::thread::Builder::new()
+            crate::core::GoThread::new()
                 .name("lsp-reader".to_string())
                 .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
@@ -1719,8 +1719,7 @@ impl Server {
                         }
                         Err(payload) => go_crash(payload),
                     }
-                })
-                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
+                });
         }
 
         let dispatch_result = self.dispatch_loop(&ctx);
@@ -4666,7 +4665,7 @@ impl Server {
         {
             let shared = self.shared.clone();
             let session_id = api_session.id();
-            std::thread::Builder::new()
+            crate::core::GoThread::new()
                 .name("api-accept".to_string())
                 .spawn(move || {
                     let accept_result = transport.accept();
@@ -4685,8 +4684,7 @@ impl Server {
                     let ctx = shared.background_ctx();
                     let accepted = ApiAccepted { session_id, rwc };
                     let _ = shared.queue_request(&ctx, QueuedRequest::ApiAccepted(accepted));
-                })
-                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
+                });
         }
 
         self.api_sessions
@@ -4865,7 +4863,7 @@ fn start_api_reader(
     let shared = shared.clone();
     let thread_inbox = inbox.clone();
     // The Go stack size, as the LSP reader thread has.
-    std::thread::Builder::new()
+    crate::core::GoThread::new()
         .name("api-reader".to_string())
         .stack_size(crate::gostd::stack::max_stack_size())
         .spawn(move || {
@@ -4879,8 +4877,7 @@ fn start_api_reader(
                     return;
                 }
             }
-        })
-        .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
+        });
     inbox
 }
 
