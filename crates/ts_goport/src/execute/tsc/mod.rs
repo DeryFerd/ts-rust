@@ -8,6 +8,7 @@ pub mod emit;
 pub mod help;
 pub mod init;
 pub mod statistics;
+pub mod stdio;
 
 pub use compile::*;
 pub use diagnostics::*;
