@@ -380,14 +380,15 @@ fn report_unported() -> bool {
 }
 
 /// Keeps unported panics quiet (they are counted) and prints other panics.
-/// The run prints a Go panic.
+/// The run prints a Go panic. A panic that a Go `recover()` catches
+/// (`core::go_recover`: an API request answers it) prints nothing, as in Go.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         if info.payload().is::<GoPanic>() {
             return;
         }
         let message = payload_message(info.payload());
-        if message.starts_with(UNPORTED_PREFIX) {
+        if message.starts_with(UNPORTED_PREFIX) || ts_goport::core::in_go_recover() {
             if std::env::var_os("GOPORT_TRACE").is_some() {
                 eprintln!(
                     "trace: {message}\n{}",

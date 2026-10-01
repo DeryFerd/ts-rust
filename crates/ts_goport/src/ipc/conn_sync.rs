@@ -2,13 +2,13 @@
 
 use crate::ipc::prelude::*;
 
+use crate::core::go_recover;
 use crate::frontend::json_ext::{AnyValue, JsonValue};
 use crate::gostd::{Context, GoError, errors, strconv};
 use crate::ipc::conn::{Conn, Handler, recovered_value};
 use crate::ipc::protocol::{Message, Protocol};
 use crate::ipc::transport::ReadWriteCloser;
 use crate::jsonrpc;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -95,7 +95,7 @@ impl SyncConn {
 
     // Go: ipc/conn_sync.go:84 handleRequest
     // handleRequest processes an incoming request.
-    // PORT: Go recovers panics in a deferred function; `catch_unwind` covers
+    // PORT: Go recovers panics in a deferred function; `go_recover` covers
     // the same body (the handler call and the response write). Go
     // `debug.Stack()` is the backtrace at the recover point.
     // ts#64142: write failures are returned, not panics.
@@ -144,7 +144,7 @@ impl SyncConn {
         let start = Instant::now();
 
         // Recover from panics and convert to error response with stack trace
-        let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), GoError> {
+        let outcome = go_recover(|| -> Result<(), GoError> {
             let (result, err) = match self.handler.handle_request(ctx, &msg.method, msg.params) {
                 Ok(result) => (result, None),
                 Err(err) => (None, Some(err)),
@@ -176,7 +176,7 @@ impl SyncConn {
                 ));
             }
             Ok(())
-        }));
+        });
 
         let r = match outcome {
             Ok(result) => return result,

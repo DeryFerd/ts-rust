@@ -67,7 +67,7 @@ pub fn new_callback_fs(base: Rc<dyn Fs>, callbacks: &[String]) -> Rc<CallbackFS>
         FxHashMap::with_capacity_and_hasher(callbacks.len(), Default::default());
     for cb in callbacks {
         if !is_callback_name(cb) {
-            panic!("unknown callback name: {cb}");
+            crate::core::go_panic(format!("unknown callback name: {cb}"));
         }
         enabled.insert(cb.clone(), true);
     }
@@ -193,9 +193,10 @@ impl CallbackFS {
     }
 }
 
-// PORT: Go panics with the error value; the panic message is its text.
+// Go `panic(err)`. The runtime prints an error value by its text.
+#[track_caller]
 fn panic_error(err: &GoError) -> ! {
-    panic!("{}", err.error())
+    crate::core::go_panic(err.error())
 }
 
 impl Fs for CallbackFS {

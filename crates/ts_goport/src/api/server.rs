@@ -65,7 +65,7 @@ pub struct StdioServer {
 // options here (they hold the stdin and stdout handles).
 pub fn new_stdio_server(options: StdioServerOptions) -> StdioServer {
     if options.cwd.is_empty() {
-        panic!("StdioServerOptions.Cwd is required");
+        crate::core::go_panic("StdioServerOptions.Cwd is required".to_string());
     }
 
     StdioServer { options }
