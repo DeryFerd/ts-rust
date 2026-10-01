@@ -687,8 +687,8 @@ pub(crate) fn unmarshal_go_int_ptr(
         *v = None;
         return Ok(());
     }
-    *v = Some(crate::frontend::json_ext::unmarshal_int_as::<i64>(
-        dec, "int",
-    )?);
+    // Go allocates the int before it decodes into it.
+    let n = v.get_or_insert(0);
+    *n = crate::frontend::json_ext::unmarshal_int_as::<i64>(dec, "int")?;
     Ok(())
 }

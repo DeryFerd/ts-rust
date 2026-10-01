@@ -725,8 +725,9 @@ impl Session {
     // outputs and this thread writes them after the emit, in the order they
     // came. A failed write adds the Go "Could not write file" diagnostic
     // (named after the output that a `.map` file belongs to, as Go does)
-    // at the end of the list, not in the file's own list, and the file
-    // leaves `emittedFiles`.
+    // to the result of the file that emitted it, sorted with that file's
+    // diagnostics as in Go (`program_emit::add_write_failures`), and the
+    // file leaves `emittedFiles`.
     pub fn handle_emit(
         &self,
         _ctx: &Context,
@@ -751,9 +752,8 @@ impl Session {
         // outputs (Go `outputFiles`) and writes nothing.
         let sd = self.get_snapshot_data(params.snapshot)?;
         let keep_outputs = requestfilesystem::has_full_file_system(sd.file_system.as_deref());
-        // PORT: Go `emitProgram` (see `emit_program`); the per-file results
-        // stay apart until the write failures are in
-        // (`program_emit::add_write_failures`).
+        // Go `emitProgram` (see `emit_program`), with the per-file results
+        // apart until the write failures are in.
         let mut results = program_emit::emit_file_results(options);
         let writes = std::mem::take(&mut *writes.lock().unwrap_or_else(PoisonError::into_inner));
         let mut output_files: Option<FxHashMap<String, String>> = None;
