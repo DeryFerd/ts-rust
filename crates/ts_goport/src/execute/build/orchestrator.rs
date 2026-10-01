@@ -51,7 +51,7 @@ use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::config_prefetch::ConfigPrefetch;
 use crate::execute::build::host::BuildHost;
-use crate::execute::build::shared_outputs::{outputs_overlap, real_path_keys};
+use crate::execute::build::shared_outputs::{PathKeys, outputs_overlap};
 use crate::execute::incremental::build_info::{BuildInfo, is_build_info_file_name_default_library};
 use crate::execute::incremental::incremental::{new_build_info_reader, parse_build_info};
 use crate::execute::tsc::compile::{
@@ -1055,9 +1055,12 @@ impl Orchestrator {
     /// that keeps the build info of an earlier cycle (watch) read nothing.
     /// A build info file that two tasks name is left out, so no task of the
     /// build writes a prefetched file before its task reads it. Names are
-    /// compared by real path (`real_path_keys`, as `outputs_overlap` does), so
-    /// two names of one file through a symbolic link, even one that does not
-    /// resolve before the build writes the file, are one file.
+    /// compared by key (`PathKeys::build_info_key`, as `outputs_overlap`
+    /// does), so two names of one file through a symbolic link, even one
+    /// that does not resolve before the build writes the file, are one file.
+    /// When a build info key cannot be trusted (a file with more than one
+    /// hard link, or a link target with `..` after a name), that file can
+    /// be any build info file of the build, so nothing is read.
     /// The threads also make the check parts of each build info
     /// (`StatusPrefetch`) and read the mtimes of its task's TypeScript
     /// sources (`BuildHost::m_time_prefetch`).
@@ -1072,7 +1075,7 @@ impl Orchestrator {
         // The file system without the build host's cache (see
         // `outputs_overlap`).
         let fs = self.opts.sys.fs();
-        let key = real_path_keys(&fs, &self.compare_paths_options);
+        let keys = PathKeys::new(&fs, &self.compare_paths_options);
         let mut named: FxHashMap<String, usize> = FxHashMap::default();
         let mut reads: Vec<(String, BuildInfoRead)> = Vec::new();
         for path in paths {
@@ -1085,7 +1088,7 @@ impl Orchestrator {
             if name.is_empty() {
                 continue;
             }
-            let build_info_key = key(&name);
+            let build_info_key = keys.build_info_key(&name)?;
             *named.entry(build_info_key.clone()).or_default() += 1;
             let build_info_path = self.to_path(&name);
             let solution = resolved.file_names().is_empty() && resolved.has_project_references();
