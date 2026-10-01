@@ -4654,6 +4654,7 @@ impl Server {
         // Create a cancellable context for the API connection
         let (api_ctx, api_cancel) = context::with_cancel(&self.shared.background_ctx());
         let handlers = Rc::new(Cell::new(0));
+        let serving_lsp = Rc::new(Cell::new(false));
         let lsp_panic = Rc::new(RefCell::new(None));
 
         // Run the connection with panic recovery
@@ -4663,6 +4664,7 @@ impl Server {
                 inbox: start_api_reader(&self.shared, rwc.clone()),
                 server: Rc::downgrade(self),
                 handlers: handlers.clone(),
+                serving_lsp: serving_lsp.clone(),
                 lsp_panic: lsp_panic.clone(),
             };
             let handler = Rc::new(ApiConnHandler {
@@ -4671,7 +4673,10 @@ impl Server {
             });
             let conn = ipc::new_async_conn_with_protocol(rwc.clone(), Box::new(protocol), handler);
             // ts#64299
-            api_session.set_connection(conn.clone());
+            api_session.set_connection(Rc::new(ApiSessionConn {
+                conn: conn.clone(),
+                serving_lsp: serving_lsp.clone(),
+            }));
             if let Err(api_err) = conn.run(&api_ctx) {
                 self.logger.errorf(&format!(
                     "API session {}: {}",
@@ -4812,16 +4817,16 @@ fn start_api_reader(
 /// Limits of the one dispatch thread: LSP messages wait while an API
 /// request runs (as they wait for a slow LSP request). A connection that
 /// is accepted while another waits runs inside the other's wait, so the
-/// first one's messages wait until the second one ends. A write to this
-/// connection from an LSP message served in its wait (a callback module
-/// resolver of a project that an LSP request rebuilds) panics, because
-/// `AsyncConn` holds its protocol during the read.
+/// first one's messages wait until the second one ends. A call to the
+/// client from an LSP message served in the wait fails (`ApiSessionConn`).
 struct ApiConnProtocol {
     inner: ipc::JSONRPCProtocol,
     inbox: Arc<ApiInbox>,
     server: Weak<Server>,
     /// The number of running handlers (`ApiConnHandler`).
     handlers: Rc<Cell<u32>>,
+    /// Whether a read runs the dispatch loop (`ApiSessionConn`).
+    serving_lsp: Rc<Cell<bool>>,
     /// The panic of an LSP message served in a read (`run_api_connection`).
     lsp_panic: Rc<RefCell<Option<Box<dyn Any + Send>>>>,
 }
@@ -4845,7 +4850,10 @@ impl ipc::Protocol for ApiConnProtocol {
                 self.inbox.wait(&ctx);
                 continue;
             }
-            match catch_unwind(AssertUnwindSafe(|| server.dispatch_next(&ctx, &lsp_exit))) {
+            self.serving_lsp.set(true);
+            let served = catch_unwind(AssertUnwindSafe(|| server.dispatch_next(&ctx, &lsp_exit)));
+            self.serving_lsp.set(false);
+            match served {
                 Ok(Ok(())) => {}
                 // The dispatch loop ended.
                 Ok(Err(_)) => return Err(errors::EOF.clone()),
@@ -4888,6 +4896,55 @@ impl ipc::Protocol for ApiConnProtocol {
         err: &jsonrpc::ResponseError,
     ) -> Result<(), GoError> {
         self.inner.write_error(id, err)
+    }
+}
+
+/// PORT: the connection of an API session of the LSP server
+/// (`apiSession.SetConnection(conn)`). While a read of the connection runs
+/// the dispatch loop, `AsyncConn` holds its protocol, so a call or
+/// notification to the client from an LSP message (a callback module
+/// resolver of a project that the API session opened, when an LSP request
+/// rebuilds it) returns an error here instead of a panic. Go makes the
+/// call.
+struct ApiSessionConn {
+    conn: Rc<ipc::AsyncConn>,
+    serving_lsp: Rc<Cell<bool>>,
+}
+
+impl ApiSessionConn {
+    fn check_idle(&self) -> Result<(), GoError> {
+        if self.serving_lsp.get() {
+            return Err(errors::new(
+                "ipc: the API connection cannot write while an LSP message runs in its read",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ipc::Conn for ApiSessionConn {
+    fn run(&self, ctx: &Context) -> Result<(), GoError> {
+        self.conn.run(ctx)
+    }
+
+    fn call(
+        &self,
+        ctx: &Context,
+        method: &str,
+        params: Option<Box<dyn AnyValue>>,
+    ) -> Result<json_ext::JsonValue, GoError> {
+        self.check_idle()?;
+        self.conn.call(ctx, method, params)
+    }
+
+    fn notify(
+        &self,
+        ctx: &Context,
+        method: &str,
+        params: Option<Box<dyn AnyValue>>,
+    ) -> Result<(), GoError> {
+        self.check_idle()?;
+        self.conn.notify(ctx, method, params)
     }
 }
 
