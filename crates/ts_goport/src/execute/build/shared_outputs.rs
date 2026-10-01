@@ -40,6 +40,24 @@ pub(crate) fn outputs_overlap(
     fs: &Rc<dyn Fs>,
     compare: &ComparePathsOptions,
 ) -> bool {
+    let key = real_path_keys(fs, compare);
+    let areas: Vec<Area> = configs
+        .iter()
+        .flatten()
+        .map(|config| Area::of(config, &key))
+        .collect();
+    areas_overlap(&areas)
+}
+
+/// The key of a file or directory name: `to_path` of its real path
+/// (`real_path`), so two names of one place through a symbolic link get one
+/// key. `fs` and `compare` are as in `outputs_overlap`. The build info
+/// prefetch (orchestrator.rs) uses these keys too, to find a build info
+/// file that two tasks name.
+pub(crate) fn real_path_keys<'a>(
+    fs: &'a Rc<dyn Fs>,
+    compare: &'a ComparePathsOptions,
+) -> impl Fn(&str) -> String + 'a {
     // The `Fs` trait (Go `vfs.FS`) cannot read a link, so links are read
     // on the OS file system only (not in tests).
     let read_link: fn(&str) -> Option<String> = if is_wrapped_os_fs(fs) {
@@ -47,7 +65,7 @@ pub(crate) fn outputs_overlap(
     } else {
         |_| None
     };
-    let key = |file: &str| {
+    move |file: &str| {
         let path = get_normalized_absolute_path(file, &compare.current_directory);
         to_path(
             &real_path(&**fs, read_link, &path),
@@ -55,13 +73,7 @@ pub(crate) fn outputs_overlap(
             compare.use_case_sensitive_file_names,
         )
         .0
-    };
-    let areas: Vec<Area> = configs
-        .iter()
-        .flatten()
-        .map(|config| Area::of(config, &key))
-        .collect();
-    areas_overlap(&areas)
+    }
 }
 
 /// The most links that `real_path` follows through names that do not
@@ -316,10 +328,11 @@ mod tests {
 
     /// Writes the projects pX and pY (with `py_options`) and the links in
     /// `LINKS` in a new temporary directory, and returns whether their
-    /// outputs overlap. No output is written, so the links to outputs
-    /// dangle.
+    /// outputs overlap and whether their build info files have one key
+    /// (`real_path_keys`, which the build info prefetch also uses). No
+    /// output is written, so the links to outputs dangle.
     #[cfg(unix)]
-    fn overlap_on_disk(label: &str, py_options: &str) -> bool {
+    fn overlap_on_disk(label: &str, py_options: &str) -> (bool, bool) {
         let dir = std::env::temp_dir().join(format!(
             "ts_goport_shared_outputs_{label}_{}",
             std::process::id()
@@ -367,50 +380,82 @@ mod tests {
             use_case_sensitive_file_names: true,
         };
         let overlap = outputs_overlap(&configs, &sys.fs, &compare);
+        let key = real_path_keys(&sys.fs, &compare);
+        let [x, y] = [0, 1].map(|i| key(&configs[i].as_ref().unwrap().get_build_info_file_name()));
         std::fs::remove_dir_all(&dir).unwrap();
-        overlap
+        (overlap, x == y)
     }
 
     #[cfg(unix)]
     #[test]
     fn outputs_overlap_through_symbolic_links() {
         // The skeptic's bi2link: one build info, named through a link to
-        // the root by pY. It does not exist yet.
-        assert!(overlap_on_disk(
-            "bi2link",
-            r#""outDir": "dist", "tsBuildInfoFile": "../lnk/shared.tsbuildinfo""#,
-        ));
+        // the root by pY. It does not exist yet. The R149 reviewer's case
+        // for the build info prefetch: the two names have one key.
+        assert_eq!(
+            overlap_on_disk(
+                "bi2link",
+                r#""outDir": "dist", "tsBuildInfoFile": "../lnk/shared.tsbuildinfo""#,
+            ),
+            (true, true)
+        );
+        // The same through the link twice.
+        assert_eq!(
+            overlap_on_disk(
+                "bi2link2",
+                r#""outDir": "dist", "tsBuildInfoFile": "../lnk/lnk/shared.tsbuildinfo""#,
+            ),
+            (true, true)
+        );
         // pY writes to pX's outDir through a link to pX.
-        assert!(overlap_on_disk(
-            "outdir",
-            r#""outDir": "../lnkx/dist", "tsBuildInfoFile": "../y.tsbuildinfo""#,
-        ));
+        assert_eq!(
+            overlap_on_disk(
+                "outdir",
+                r#""outDir": "../lnkx/dist", "tsBuildInfoFile": "../y.tsbuildinfo""#,
+            ),
+            (true, false)
+        );
         // The int22 skeptic's dbi: pY's build info is a dangling link to
         // pX's build info.
-        assert!(overlap_on_disk(
-            "dbi",
-            r#""outDir": "dist", "tsBuildInfoFile": "../ylink.tsbuildinfo""#,
-        ));
+        assert_eq!(
+            overlap_on_disk(
+                "dbi",
+                r#""outDir": "dist", "tsBuildInfoFile": "../ylink.tsbuildinfo""#,
+            ),
+            (true, true)
+        );
         // The int22 skeptic's dout: pY's outDir is a dangling link to pX's
         // outDir.
-        assert!(overlap_on_disk(
-            "dout",
-            r#""outDir": "dl", "tsBuildInfoFile": "../y.tsbuildinfo""#,
-        ));
+        assert_eq!(
+            overlap_on_disk(
+                "dout",
+                r#""outDir": "dl", "tsBuildInfoFile": "../y.tsbuildinfo""#,
+            ),
+            (true, false)
+        );
         // Separate outputs, each named through a link, do not overlap: a
         // link to the root, a dangling link to another place, and a link
         // loop.
-        assert!(!overlap_on_disk(
-            "separate",
-            r#""outDir": "../lnk/pY/dist", "tsBuildInfoFile": "../lnk/y.tsbuildinfo""#,
-        ));
-        assert!(!overlap_on_disk(
-            "elsewhere",
-            r#""outDir": "elsewhere", "tsBuildInfoFile": "../y.tsbuildinfo""#,
-        ));
-        assert!(!overlap_on_disk(
-            "loop",
-            r#""outDir": "../loop/dist", "tsBuildInfoFile": "../y.tsbuildinfo""#,
-        ));
+        assert_eq!(
+            overlap_on_disk(
+                "separate",
+                r#""outDir": "../lnk/pY/dist", "tsBuildInfoFile": "../lnk/y.tsbuildinfo""#,
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            overlap_on_disk(
+                "elsewhere",
+                r#""outDir": "elsewhere", "tsBuildInfoFile": "../y.tsbuildinfo""#,
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            overlap_on_disk(
+                "loop",
+                r#""outDir": "../loop/dist", "tsBuildInfoFile": "../y.tsbuildinfo""#,
+            ),
+            (false, false)
+        );
     }
 }
