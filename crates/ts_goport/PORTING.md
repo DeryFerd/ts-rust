@@ -1070,7 +1070,24 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 - One dispatch thread (see "Threads"): the server answers requests in
   arrival order, where Go runs the async part of a request on a goroutine
   and answers in finish order. Timers and background tasks run at message
-  boundaries. The results are Go's; only order and timing differ.
+  boundaries. For LSP requests the results are Go's; only order and
+  timing differ.
+- API sessions of the LSP server (`custom/initializeAPISession`) are
+  served on the dispatch thread too (`lsp/server.rs` `ApiConnProtocol`).
+  LSP messages and API requests do not run at the same time. These
+  limits are more than order and timing:
+  - While an API request waits for a client callback, other LSP messages
+    wait until the client answers. Only an LSP `shutdown` or `exit` that
+    no other LSP message comes before is served, so the server still
+    stops as Go's does.
+  - A second connected API session holds the first until it closes. A
+    client that waits for the first before it closes the second
+    deadlocks.
+  - A client callback from an LSP message served while an API connection
+    waits returns an error. Go makes the call.
+  - `--api --async` and the API sessions run requests one at a time
+    (`ipc/conn_async.rs`). A pipelined request sees the result of the one
+    before it. Go runs them at the same time.
 - Go runtime profiles (pprof) have no samples: the port writes Go's file
   names, errors and log lines and valid empty profiles. `runtime.GC` is a
   no-op. `runtime/metrics` reads as `KindBad`, so the Go runtime fields of
