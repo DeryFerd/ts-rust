@@ -81,16 +81,19 @@
 #     (glibc 2.36), so it does not start on the floor glibc. Not used.
 # So the default stays dynamic glibc and PIE.
 # Measured on R148 source (pgolsp1, target/continuation-r97-goport/pgolsp1):
-# editor sessions in the training against none, every side in one job on
-# mini-743d (rounds 1 and 2 on dbook-lan). Output is byte-equal, and the LSP
+# editor sessions in the training against none, every side in one job on a
+# mini (the first two rounds on dbook-lan). Output is byte-equal, and the LSP
 # oracle answers are the same.
-#   - Sessions in BOLT only, at 1/8 of the CLI sample rate (the default):
-#     editor edit medians (ls_edit_bench long) query-core -4.9%, effect -4.9%,
-#     hono -1.3%. No CLI cell (-p, --singleThreaded, tsc -b, watch) lost more
-#     than the noise of two builds of one source; query check peak RSS +1.6%.
-#   - Sessions in PGO and BOLT at 1/8: about 1 point more on effect and hono,
-#     but the bin text that a CLI run maps grows by 2 to 7 MiB (query check
-#     peak RSS +7.7%, hono +2.3%), most of it in the PGO layout.
+#   - Sessions in BOLT only at 2500 Hz (the default), on mini-abf9: editor
+#     edit medians (ls_edit_bench long) query-core -3.7%, effect -3.5%, hono
+#     -1.1% (another build of the same script on mini-743d: -4.9%, -4.9%,
+#     -1.3%). The CLI cells (-p, --singleThreaded, tsc -b, watch) moved
+#     -4.2 to +0.8% (hono watch api +1.4%, and -0.6% in a rerun with more
+#     reps). Peak RSS moved 0.3% at most (the other build: query +1.6%).
+#   - Sessions in PGO and BOLT at 1/8 of the CLI weight: about 1 point more
+#     on effect and hono, but the bin text that a CLI run maps grew by 2 to
+#     7 MiB (query check peak RSS +7.7% on mini-743d), most of it in the PGO
+#     layout.
 #   - Sessions in PGO and BOLT at full weight or 1/4: zod and effect check
 #     lost 1.1 to 2.2%.
 #
