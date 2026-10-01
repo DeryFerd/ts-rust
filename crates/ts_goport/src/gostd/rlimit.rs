@@ -48,7 +48,8 @@ pub fn raise_open_file_limit() {
 /// back for the length of the start and up again after it. Starts wait for
 /// each other here. In that time, another thread of this process that
 /// opens a file with more files open than the original limit gets EMFILE.
-/// When the start itself gets EMFILE (its pipes), it runs again with the
+/// When the start itself fails at the original limit (EMFILE for its pipes,
+/// or EBADF when an fd it passes is above that limit), it runs again with the
 /// raised limit, and the child keeps that limit.
 /// PORT: Linux only. Other systems start the child with the raised limit:
 /// there a kqueue watcher holds a file per watched path, more than the
@@ -71,7 +72,11 @@ pub fn spawn(cmd: &mut std::process::Command) -> std::io::Result<std::process::C
             let child = cmd.spawn();
             let _ = setrlimit(Resource::Nofile, now);
             return match child {
-                Err(err) if Errno::from_io_error(&err) == Some(Errno::MFILE) => cmd.spawn(),
+                Err(err)
+                    if matches!(Errno::from_io_error(&err), Some(Errno::MFILE | Errno::BADF)) =>
+                {
+                    cmd.spawn()
+                }
                 child => child,
             };
         }
