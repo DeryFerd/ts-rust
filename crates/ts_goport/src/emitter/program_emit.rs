@@ -130,11 +130,28 @@ pub fn emit_with(
     options: EmitOptions,
     wrap: fn(&dyn Fn() -> EmitResult) -> EmitResult,
 ) -> EmitResult {
+    // collect results from emit, preserving input order
+    combine_emit_results(emit_results_with(options, wrap))
+}
+
+/// `emit` without the final `combine_emit_results`: one result per file, in
+/// file order, or the one result of `handle_no_emit_options`. The API emit
+/// uses it to add its late write failures to the result of their file
+/// (`add_write_failures`).
+pub fn emit_file_results(options: EmitOptions) -> Vec<EmitResult> {
+    emit_results_with(options, |emit_file| emit_file())
+}
+
+/// `emit_with` before it combines the results (`emit_file_results`).
+fn emit_results_with(
+    options: EmitOptions,
+    wrap: fn(&dyn Fn() -> EmitResult) -> EmitResult,
+) -> Vec<EmitResult> {
     let _trace = trace_emit();
     if !options.force_emit && options.emit_only != EmitOnly::BuilderSignature {
         // #4407: Go `HandleNoEmitOptions(ctx, p, options.TargetSourceFiles, nil)`.
         if let Some(result) = handle_no_emit_options(options.target_source_files.as_deref()) {
-            return result;
+            return vec![result];
         }
     }
 
@@ -146,15 +163,54 @@ pub fn emit_with(
     );
     let pooled = start_emit_files_with_pool(&source_files, |_| target.clone(), wrap)
         .map(PendingPoolEmit::wait);
-    let results = match pooled {
+    match pooled {
         Some(results) => results,
         None => run_emit_jobs(source_files, move |source_file| {
             wrap(&|| emit_source_file(source_file, &target))
         }),
-    };
+    }
+}
 
-    // collect results from emit, preserving input order
-    combine_emit_results(results)
+/// PORT: not in Go. The API emit (`handle_emit`) writes the outputs after
+/// the emit, on its own thread, because its file system is not shared with
+/// the emit threads. In Go the write runs in the emitter, and its TS5033
+/// goes into that file's diagnostics, which `emitter.emit` sorts. This adds
+/// each failure `(output file name, diagnostic)` to the per-file result
+/// (`emit_file_results`) that emitted the file, removes the file from its
+/// emitted files and sorts its diagnostics again. A failure that no result
+/// emitted goes last.
+pub fn add_write_failures(results: &mut Vec<EmitResult>, failures: Vec<(String, Diagnostic)>) {
+    let mut touched = vec![false; results.len()];
+    let mut unmatched = Vec::new();
+    for (file_name, diagnostic) in failures {
+        let index = results
+            .iter()
+            .position(|result| result.emitted_files.contains(&file_name));
+        match index {
+            Some(index) => {
+                let result = &mut results[index];
+                result.emitted_files.retain(|emitted| *emitted != file_name);
+                result.diagnostics.push(diagnostic);
+                touched[index] = true;
+            }
+            None => unmatched.push(diagnostic),
+        }
+    }
+    for (result, touched) in results.iter_mut().zip(touched) {
+        if touched {
+            let mut diagnostics = DiagnosticsCollection::default();
+            for diagnostic in std::mem::take(&mut result.diagnostics) {
+                diagnostics.add(diagnostic);
+            }
+            result.diagnostics = diagnostics.get_diagnostics();
+        }
+    }
+    if !unmatched.is_empty() {
+        results.push(EmitResult {
+            diagnostics: unmatched,
+            ..EmitResult::default()
+        });
+    }
 }
 
 /// `emit` for many targets at once, one result per target in input order.

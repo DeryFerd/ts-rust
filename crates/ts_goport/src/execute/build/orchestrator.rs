@@ -815,7 +815,7 @@ impl Orchestrator {
     }
 
     // Go: build/orchestrator.go:924 the numRoutines part of (*Orchestrator).rangeTasks
-    pub(crate) fn num_routines(&self) -> i32 {
+    pub(crate) fn num_routines(&self) -> i64 {
         let mut num_routines = 4;
         if self.opts.command.compiler_options.single_threaded.is_true() {
             num_routines = 1;

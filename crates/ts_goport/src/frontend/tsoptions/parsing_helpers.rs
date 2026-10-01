@@ -62,15 +62,23 @@ pub fn parse_string(value: &CompilerOptionsValue) -> String {
     String::new()
 }
 
-// Go: tsoptions/parsinghelpers.go:62 parseNumber
-// PORT: Go `*int` is `Option<i32>`. Go `int(float64)` truncates toward zero;
-// `as i32` does the same for values in range.
-pub fn parse_number(value: &CompilerOptionsValue) -> Option<i32> {
+// Go: tsoptions/parsinghelpers.go:64 parseNumber
+// PORT: Go `*int` (64-bit) is `Option<i64>`. Go `int(float64)` truncates
+// toward zero, as `as i64` does in range. Out of range and NaN, Go leaves the
+// result to the platform: amd64 gives the min int64, and Rust `as` would
+// saturate, so the amd64 value is kept here.
+pub fn parse_number(value: &CompilerOptionsValue) -> Option<i64> {
     if let CompilerOptionsValue::Int(num) = value {
         return Some(*num);
     }
     if let CompilerOptionsValue::Number(num) = value {
-        return Some(*num as i32);
+        // 2^63 is exact in f64; -2^63 itself converts to i64::MIN.
+        const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+        return Some(if num.is_nan() || *num >= LIMIT || *num < -LIMIT {
+            i64::MIN
+        } else {
+            *num as i64
+        });
     }
     None
 }

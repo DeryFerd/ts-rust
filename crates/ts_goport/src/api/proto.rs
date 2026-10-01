@@ -2726,7 +2726,7 @@ fn unmarshal_build_options(
             "dry" => o.dry.unmarshal_json(dec.read_value()?),
             "force" => o.force.unmarshal_json(dec.read_value()?),
             "verbose" => o.verbose.unmarshal_json(dec.read_value()?),
-            "builders" => json_unmarshal_decode(dec, &mut o.builders)?,
+            "builders" => crate::options_json::unmarshal_go_int_ptr(dec, &mut o.builders)?,
             "stopBuildOnErrors" => o.stop_build_on_errors.unmarshal_json(dec.read_value()?),
             "clean" => o.clean.unmarshal_json(dec.read_value()?),
             _ => return Ok(false),
@@ -3051,9 +3051,15 @@ pub fn to_protocol_json_value(
 ) -> tsoptions::CompilerOptionsValue {
     use crate::frontend::tsoptions::CompilerOptionsValue;
     match value {
-        CompilerOptionsValue::WatchFileKind(value) => CompilerOptionsValue::Int(value.0 - 1),
-        CompilerOptionsValue::WatchDirectoryKind(value) => CompilerOptionsValue::Int(value.0 - 1),
-        CompilerOptionsValue::PollingKind(value) => CompilerOptionsValue::Int(value.0 - 1),
+        CompilerOptionsValue::WatchFileKind(value) => {
+            CompilerOptionsValue::Int(i64::from(value.0) - 1)
+        }
+        CompilerOptionsValue::WatchDirectoryKind(value) => {
+            CompilerOptionsValue::Int(i64::from(value.0) - 1)
+        }
+        CompilerOptionsValue::PollingKind(value) => {
+            CompilerOptionsValue::Int(i64::from(value.0) - 1)
+        }
         CompilerOptionsValue::Map(value) => {
             let mut result = IndexMap::with_capacity(value.len());
             for (key, child) in value {
