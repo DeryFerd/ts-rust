@@ -8,6 +8,7 @@ use crate::frontend::tspath;
 use crate::gostd;
 use crate::locale;
 use crate::lsp::lsproto;
+use crate::scanner_util::{go_byte_offset, port_byte_offset};
 use crate::spanmap::{self, Feature, Fidelity, SpanMap};
 use std::ops::Deref;
 use std::sync::LazyLock;
@@ -814,10 +815,10 @@ fn utf16_rune_len(r: i32) -> i32 {
 // a 7-byte unit, and a real U+FDD0 is a 6-byte unit.
 // `utf8_decode_rune_in_string` reads a unit as one rune (`RuneError` for an
 // invalid byte) with its size in the port text, so UTF-16 characters match
-// Go. Byte offsets after a unit are port offsets, not Go offsets, so with
-// the UTF-8 position encoding the character after a unit on a line differs
-// from Go. Otherwise the decoder follows Go `utf8.DecodeRuneInString`, also
-// at a position inside a character.
+// Go. Byte offsets after a unit are port offsets, not Go offsets, so the
+// UTF-8 position encoding converts a character to and from Go bytes in its
+// line (`port_byte_offset`, `go_byte_offset`). Otherwise the decoder follows
+// Go `utf8.DecodeRuneInString`, also at a position inside a character.
 impl Converters {
     // Go: ls/lsconv/converters.go:359 lineAndCharacterToPosition
     // PORT: Go passes the position by value; here by reference.
@@ -857,7 +858,18 @@ impl Converters {
         };
 
         if line_map.ascii_only || self.position_encoding == lsproto::PositionEncodingKind::UTF8 {
-            return start.max(start.wrapping_add(char).min(line_end));
+            let pos = start.max(start.wrapping_add(char).min(line_end));
+            if line_map.ascii_only || pos == start {
+                return pos;
+            }
+            // PORT: `char` counts Go bytes. A line holds whole units, so
+            // the Go bytes of the line give the port offset
+            // (`port_byte_offset`), at most the line end.
+            let text = script.text();
+            let Some(line_text) = text.get(start as usize..line_end as usize) else {
+                return pos;
+            };
+            return start + port_byte_offset(line_text, pos - start).min(line_end - start);
         }
 
         // Scan from line start counting UTF-16 code units to find the byte position.
@@ -923,8 +935,16 @@ impl Converters {
         let start = line_map.line_starts[line as usize];
 
         let mut character: i32 = 0;
-        if line_map.ascii_only || self.position_encoding == lsproto::PositionEncodingKind::UTF8 {
+        if line_map.ascii_only {
             character = position - start;
+        } else if self.position_encoding == lsproto::PositionEncodingKind::UTF8 {
+            // PORT: Go counts the Go bytes from the line start, which is a
+            // unit boundary (`go_byte_offset`).
+            let text = script.text();
+            character = match text.get(start as usize..) {
+                Some(line_text) => go_byte_offset(line_text, position - start),
+                None => position - start,
+            };
         } else {
             // We need to rescan the text as UTF-16 to find the character offset.
             // PORT: Go ranges over `text[start:position]`. A character cut by
@@ -1320,5 +1340,52 @@ mod tests {
         assert_eq!(positions[0].position, 1);
         assert!(positions[1].script == supplemental.root);
         assert_eq!(positions[1].position, 2);
+    }
+
+    /// A script that is the port form of some Go bytes.
+    #[derive(Clone)]
+    struct PortScript(String);
+
+    impl Script for PortScript {
+        fn file_name(&self) -> &str {
+            "/a.ts"
+        }
+        fn text(&self) -> ScriptText<'_> {
+            ScriptText::Borrowed(&self.0)
+        }
+    }
+
+    // With the UTF-8 position encoding a character is a Go byte column (Go
+    // `converters.go:393` `start+char` and `:437` `position - start`). The
+    // port form holds an invalid byte as 7 bytes and a real U+FDD0 as 6, so
+    // utf8cut `repro_latin1_lsp.py` gave column 25 where Go gives 19. Each
+    // Go offset converts to its column and back, and a column past the line
+    // end stops at the line end.
+    #[test]
+    fn utf8_columns_count_go_bytes() {
+        let go: &[u8] = b"a\xACb\xEF\xB7\x90c\nd\xED\xA0\x80e \xE2\x82\xACf";
+        let script = PortScript(crate::scanner_util::go_string_from_bytes(go.to_vec()));
+        let line_map = compute_lsp_line_starts(&script.0);
+        let converters = new_converters(lsproto::PositionEncodingKind::UTF8, move |_| {
+            Some(Rc::clone(&line_map))
+        });
+        let go_line_start = |g: usize| if g >= 8 { 8 } else { 0 };
+        for g in 0..=go.len() {
+            let port = port_byte_offset(&script.0, g as i32);
+            let lc = lsproto::Position {
+                line: u32::from(g >= 8),
+                character: (g - go_line_start(g)) as u32,
+            };
+            let (got, _) = converters.to_lsp_position(&script, port);
+            assert_eq!(got, lc, "Go offset {g} (port {port})");
+            let back = from_lsp_position(&converters, script.clone(), lc, Feature::ALL);
+            assert_eq!(back[0].position, port, "{lc:?}");
+        }
+        let past = lsproto::Position {
+            line: 0,
+            character: 40,
+        };
+        let back = from_lsp_position(&converters, script.clone(), past, Feature::ALL);
+        assert_eq!(back[0].position, port_byte_offset(&script.0, 8));
     }
 }

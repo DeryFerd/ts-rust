@@ -2712,12 +2712,18 @@ impl Session {
             self.setup_language_service(&sd.snapshot, Rc::clone(program), &params.project, "")?;
 
         let source_files: Vec<Node> = program.get_source_files().iter().map(|f| f.root).collect();
-        let entries = lang_svc.get_referenced_symbols_for_node_exported(
-            ctx,
-            params.position,
-            node,
-            &source_files,
-        );
+        // PORT: Go passes `params.Position` on unchanged. Its only use is a
+        // Go byte offset in `node` when `node` is a source file
+        // (`getReferenceAtPosition`). Port offsets differ from Go offsets
+        // after a marker unit (see `scanner_util::GO_STRING_MARKER`), so it
+        // is mapped there (`port_byte_offset`).
+        let position = if node.kind() == SyntaxKind::SourceFile {
+            crate::scanner_util::port_byte_offset(&source_file_text(node), params.position)
+        } else {
+            params.position
+        };
+        let entries =
+            lang_svc.get_referenced_symbols_for_node_exported(ctx, position, node, &source_files);
         // PORT: Go `entries == nil`; an empty result marshals as `[]` either way.
         if entries.is_empty() {
             return Ok(Vec::new());

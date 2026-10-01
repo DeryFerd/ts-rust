@@ -6,6 +6,11 @@ use crate::ls::prelude::*;
 
 use crate::astnav;
 use crate::gostd::Context;
+use crate::scanner_util::{
+    contains_go_string_marker, go_byte_offset, go_string_bytes, go_unit_at, go_unit_before,
+    go_unit_bytes, port_byte_offset,
+};
+use std::borrow::Cow;
 
 // PORT (whole file):
 // - The types of Go lines 29-473 (`ReferenceEntry`, `SymbolAndEntries`,
@@ -556,9 +561,27 @@ pub fn get_possible_symbol_reference_nodes(
 // PORT: Go indexes the text by byte. The search runs on the bytes, because
 // `position + symbolNameLength + 1` can fall inside a multi-byte character,
 // where a `&str` slice would panic.
+// PORT: Go searches the Go bytes. The text is in the source form and a
+// string literal's name in the value form (see
+// `scanner_util::GO_STRING_MARKER`): a lone surrogate is 3 invalid byte
+// units in the text and one surrogate unit in the name, so a port search
+// does not find it. A name with a marker unit, or with a char that can be
+// the second char of one (lead byte 0xF4), is searched on the Go bytes
+// (`go_string_bytes`) and the Go positions are mapped back
+// (`port_byte_offset`). So is any name in a text with a marker when the
+// container does not start the text: as in Go, the first index is relative
+// to the container start and is then used as an absolute position, which
+// is only the same position in both forms when the bytes before agree.
+// Otherwise the port search finds the same positions. When the container
+// starts the text, each is a match of whole units, and the bytes next to it
+// are read as Go bytes (`go_unit_before`, `go_unit_at`), since a marker
+// unit has other bytes than Go's. With another container the text has no
+// marker, so its bytes are Go's.
 // PERF: Go `strings.Index` is one `memmem::Finder`, built once per call. It
 // returns the same first index. A byte-by-byte compare cost 29% to 56% of
-// find-references time on large files such as lib.dom.d.ts.
+// find-references time on large files such as lib.dom.d.ts. The usual name
+// costs no scan for markers: a byte before a match is a unit's only when it
+// is not ASCII, and a byte after one only when it is the marker's lead byte.
 pub fn get_possible_symbol_reference_positions(
     source_file: Node,
     symbol_name: &str,
@@ -575,12 +598,6 @@ pub fn get_possible_symbol_reference_positions(
     }
 
     let text_text = source_file_text(source_file);
-    let text = text_text.as_bytes();
-    let source_length = text.len() as i32;
-    let symbol_name = symbol_name.as_bytes();
-    let symbol_name_length = symbol_name.len() as i32;
-    // Go `strings.Index(s, symbolName)` is `finder.find(s)`; -1 is `None`.
-    let finder = memchr::memmem::Finder::new(symbol_name);
 
     let container = if container.is_nil() {
         source_file
@@ -588,12 +605,59 @@ pub fn get_possible_symbol_reference_positions(
         container
     };
 
+    let go_search = contains_go_string_marker(symbol_name)
+        || symbol_name.as_bytes().contains(&0xF4)
+        || (container.pos() > 0 && contains_go_string_marker(&text_text));
+    let (text, symbol_name, container_pos, end_pos) = if go_search {
+        (
+            go_string_bytes(&text_text),
+            go_string_bytes(symbol_name),
+            go_byte_offset(&text_text, container.pos()),
+            go_byte_offset(&text_text, container.end()),
+        )
+    } else {
+        (
+            Cow::Borrowed(text_text.as_bytes()),
+            Cow::Borrowed(symbol_name.as_bytes()),
+            container.pos(),
+            container.end(),
+        )
+    };
+    // Go `text[position-1]` and `text[endPosition]`. The port search reads
+    // a unit next to a match only when the container starts the text. With
+    // another container the first position, relative to the container, can
+    // fall inside a char, and the text has no marker.
+    let units = !go_search && container.pos() == 0;
+    let go_byte_before = |position: usize| -> u8 {
+        let b = text[position - 1];
+        if !units || b < 0x80 {
+            return b;
+        }
+        let mut buf = [0u8; 4];
+        let (unit, _) = go_unit_before(&text_text, position);
+        *go_unit_bytes(unit, &mut buf)
+            .last()
+            .expect("a unit has Go bytes")
+    };
+    let go_byte_at = |position: usize| -> u8 {
+        let b = text[position];
+        if !units || b != 0xEF {
+            return b;
+        }
+        let mut buf = [0u8; 4];
+        let (unit, _) = go_unit_at(&text_text, position);
+        go_unit_bytes(unit, &mut buf)[0]
+    };
+    let source_length = text.len() as i32;
+    let symbol_name_length = symbol_name.len() as i32;
+    // Go `strings.Index(s, symbolName)` is `finder.find(s)`; -1 is `None`.
+    let finder = memchr::memmem::Finder::new(&symbol_name);
+
     // PORT: as in Go, the first index is relative to `container.Pos()` and is
     // compared with the absolute `container.End()`.
     let mut position = finder
-        .find(&text[container.pos() as usize..])
+        .find(&text[container_pos as usize..])
         .map_or(-1, |index| index as i32);
-    let end_pos = container.end();
     while position >= 0 && position < end_pos {
         // We found a match.  Make sure it's not part of a larger word (i.e. the char
         // before and after it have to be a non-identifier char).
@@ -601,9 +665,9 @@ pub fn get_possible_symbol_reference_positions(
 
         // PORT: Go `rune(text[i])` converts one byte to a rune; `char::from`
         // does the same for a `u8`.
-        if (position == 0 || !is_identifier_part(char::from(text[(position - 1) as usize])))
+        if (position == 0 || !is_identifier_part(char::from(go_byte_before(position as usize))))
             && (end_position == source_length
-                || !is_identifier_part(char::from(text[end_position as usize])))
+                || !is_identifier_part(char::from(go_byte_at(end_position as usize))))
         {
             // Found a real match.  Keep searching.
             positions.push(position);
@@ -622,6 +686,11 @@ pub fn get_possible_symbol_reference_positions(
         }
     }
 
+    if go_search {
+        for position in &mut positions {
+            *position = port_byte_offset(&text_text, *position);
+        }
+    }
     positions
 }
 
@@ -2430,5 +2499,86 @@ impl<'c, P: ProgramView> RefState<'c, P> {
         // Update cache with the actual result
         self.inherits_from_cache.insert(key, inherits);
         inherits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+    use crate::frontend::tspath::Path;
+    use crate::scanner_util::{go_string_from_bytes, push_js_string_rune};
+
+    // PORT: no Go test. Go searches the Go bytes of the text. The text is in
+    // the source form, where a lone surrogate is 3 invalid byte units, and a
+    // string literal's name in the value form, where it is one surrogate unit
+    // (see `scanner_util::GO_STRING_MARKER`). The bytes next to a match are
+    // Go bytes: 0xC5 (`Å`) and 0xFF (`ÿ`) are identifier parts, 0x80 is not.
+    #[test]
+    fn possible_reference_positions_search_go_bytes() {
+        let mut lone = String::new();
+        push_js_string_rune(&mut lone, 0xD800);
+        let cases: [(&[u8], &str, &[i32]); 3] = [
+            (
+                b"a = \"\xed\xa0\x80\"; b = \"\xed\xa0\x80\";",
+                &lone,
+                &[5, 16],
+            ),
+            (b"\xc5foo foo\x80 foo\xff", "foo", &[5]),
+            // A real U+FDD0 is M + M in both forms.
+            ("x\u{FDD0}y \u{FDD0}y".as_bytes(), "\u{FDD0}\u{FDD0}y", &[6]),
+        ];
+        for (bytes, name, want) in cases {
+            let text = go_string_from_bytes(bytes.to_vec());
+            let file = parse_source_file(
+                &SourceFileParseOptions {
+                    file_name: "/a.ts".to_string(),
+                    path: Path("/a.ts".to_string()),
+                    ..Default::default()
+                },
+                crate::ast::FileText::new(text.clone(), false),
+                ScriptKind::TS,
+            );
+            let got = get_possible_symbol_reference_positions(file.root, name, Node::NIL);
+            let want: Vec<i32> = want.iter().map(|&g| port_byte_offset(&text, g)).collect();
+            assert_eq!(got, want, "{bytes:?} {name:?}");
+        }
+        // A container that does not start the text: as in Go, the first
+        // index is relative to it and is used as an absolute position. Here
+        // that is Go offset 11, inside an `é` (0xC3 before it) or after an
+        // invalid byte 0xFF, both identifier parts, so it is no match.
+        let cases: [(&[u8], i32, &[i32]); 2] = [
+            (
+                "let ééééé = 1;function f(x = 1) { return x; }".as_bytes(),
+                19,
+                &[30, 46],
+            ),
+            (
+                b"let a = \"\xff\xff\xff\xff\xff\";function f(x = 1) { return x; }",
+                16,
+                &[27, 43],
+            ),
+        ];
+        for (bytes, go_container_pos, want) in cases {
+            let text = go_string_from_bytes(bytes.to_vec());
+            let file = parse_source_file(
+                &SourceFileParseOptions {
+                    file_name: "/a.ts".to_string(),
+                    path: Path("/a.ts".to_string()),
+                    ..Default::default()
+                },
+                crate::ast::FileText::new(text.clone(), false),
+                ScriptKind::TS,
+            );
+            let x = port_byte_offset(&text, go_container_pos + 11);
+            let function = astnav::get_touching_property_name(file.root, x)
+                .parent()
+                .parent();
+            assert_eq!(function.kind(), SyntaxKind::FunctionDeclaration);
+            assert_eq!(function.pos(), port_byte_offset(&text, go_container_pos));
+            let got = get_possible_symbol_reference_positions(file.root, "x", function);
+            let want: Vec<i32> = want.iter().map(|&g| port_byte_offset(&text, g)).collect();
+            assert_eq!(got, want, "{bytes:?}");
+        }
     }
 }
