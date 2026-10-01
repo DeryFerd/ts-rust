@@ -22,6 +22,10 @@
 //! - The writer thread owns the `Writer` and drains the outgoing queue.
 //! - The progress thread (`progress.rs`) and the parent watchdog
 //!   (`cmd/tsgo/lsp.rs`) touch only `Send` data.
+//! - An API session (`custom/initializeAPISession`) has an accept thread
+//!   and, once connected, a reader thread. They queue the connection and
+//!   wake-ups in the request queue; the dispatch thread serves the
+//!   connection (`ApiConnProtocol`).
 //!
 //! So Go `*Server` is split. `ServerShared` (`Arc`, `Send + Sync`) holds
 //! the queues, the pending maps, the atomics and the state that
@@ -44,6 +48,10 @@
 //! - A request that arrives while the auto-import warm runs waits for it,
 //!   unless it is a file event, which cancels the warm (below). Go runs
 //!   the request at the same time.
+//! - LSP messages wait while an API request runs, and API requests wait
+//!   while an LSP message runs. Go runs them at the same time. An API
+//!   connection that opens while another is connected holds the other's
+//!   requests until it closes (`ApiConnProtocol`).
 //!
 //! Background tasks and timers stay on the dispatch thread. A task that the
 //! sync part of a request queues (the snapshot update's logging, watch
@@ -93,14 +101,17 @@ use crate::frontend::tsoptions;
 use crate::gostd::context::{self, CancelCauseFunc, CancelFunc};
 use crate::gostd::errors;
 use crate::ipc;
+use crate::ipc::Protocol as _;
 use crate::lsp::lsproto::{ErrorCode, HasTextDocumentPosition, HasTextDocumentURI};
 use crate::program::ls_program;
 use crate::project::logging::{self, Logger as _};
 use crate::project::{Snapshot, ata};
 use std::any::Any;
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::rc::Weak;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
@@ -220,6 +231,8 @@ pub fn new_server(opts: ServerOptions) -> Rc<Server> {
         spawn,
         content_mapper_extensions_registered: Cell::new(false),
         cpu_profiler: crate::pprof::CpuProfiler::default(),
+        dispatch_ctx: RefCell::new(None),
+        free_since: Cell::new(Instant::now()),
     })
 }
 
@@ -371,10 +384,20 @@ pub fn to_writer(w: Box<dyn Write + Send>) -> Box<dyn Writer + Send> {
 
 /// PORT: an item of the request queue. Go queues `*lsproto.RequestMessage`.
 /// The port also queues `Wake` from `gostd::local` timers (the dispatch
-/// loop contract in PORTING.md "Go runtime").
+/// loop contract in PORTING.md "Go runtime") and from API reader threads,
+/// and `ApiAccepted` from API accept threads (`handle_initialize_api_session`).
 pub enum QueuedRequest {
     Request(lsproto::RequestMessage),
     Wake,
+    ApiAccepted(ApiAccepted),
+}
+
+/// PORT: the end of Go's `transport.Accept()` in the API session goroutine
+/// (`handle_initialize_api_session`). `rwc` is `None` when the accept
+/// failed (the accept thread logged it).
+pub struct ApiAccepted {
+    session_id: String,
+    rwc: Option<Arc<dyn ipc::ReadWriteCloser>>,
 }
 
 // Go: server.go:153 Server (the fields that other threads use)
@@ -488,6 +511,13 @@ pub struct Server {
     pub content_mapper_extensions_registered: Cell<bool>,
 
     pub cpu_profiler: crate::pprof::CpuProfiler,
+    // PORT: the dispatch loop's context and Go `lspExit`, set by
+    // `dispatch_loop`. An API connection that waits for its next message
+    // runs the dispatch loop with them (`ApiConnProtocol`).
+    pub dispatch_ctx: RefCell<Option<(Context, CancelCauseFunc)>>,
+    // PORT: when the dispatch loop last finished a message (see
+    // `IDLE_QUIET_PERIOD`).
+    pub free_since: Cell<Instant>,
     // PORT: Go `progressDelay` and `projectProgress` are in `ServerShared`,
     // `startWatchdog` is `ServerShared::start_watchdog`.
 }
@@ -1912,113 +1942,132 @@ impl Server {
             }));
         }
 
-        // PORT: when the loop last finished a message (see
-        // `IDLE_QUIET_PERIOD`).
-        let mut free_since = Instant::now();
+        *self.dispatch_ctx.borrow_mut() = Some((ctx.clone(), lsp_exit.clone()));
+        self.free_since.set(Instant::now());
         gostd::local::keep_garbage();
-        let busy = || self.shared.queued_requests.load(Ordering::SeqCst) != 0;
         loop {
-            // PORT: the frees that the last message or wake-up left
-            // (`gostd::local::drop_later`) run after its answer, while no
-            // message waits.
+            self.dispatch_next(&ctx, &lsp_exit)?;
+        }
+    }
+
+    /// PORT: one turn of the Go dispatch loop: waits for the next item of
+    /// the request queue and handles it. `dispatch_loop` calls it, and so
+    /// does an API connection while it waits for its next message
+    /// (`ApiConnProtocol`). An error is the end of the loop.
+    fn dispatch_next(
+        self: &Rc<Self>,
+        ctx: &Context,
+        lsp_exit: &CancelCauseFunc,
+    ) -> Result<(), GoError> {
+        let busy = || self.shared.queued_requests.load(Ordering::SeqCst) != 0;
+        // PORT: the frees that the last message or wake-up left
+        // (`gostd::local::drop_later`) run after its answer, while no
+        // message waits.
+        gostd::local::drop_garbage(busy);
+        // PORT: idle work (the auto-import warm) runs only after a
+        // quiet period with no message, so it does not delay a request
+        // that has arrived or that comes right after an answer. Work it
+        // queues runs right after it, as it did when the warm ran inside
+        // `run_pending`.
+        while ctx.err().is_none()
+            && gostd::local::has_idle()
+            && self
+                .shared
+                .wait_quiet(self.free_since.get() + IDLE_QUIET_PERIOD)
+            && gostd::local::run_idle()
+        {
+            gostd::local::run_pending();
             gostd::local::drop_garbage(busy);
-            // PORT: idle work (the auto-import warm) runs only after a
-            // quiet period with no message, so it does not delay a request
-            // that has arrived or that comes right after an answer. Work it
-            // queues runs right after it, as it did when the warm ran inside
-            // `run_pending`.
-            while ctx.err().is_none()
-                && gostd::local::has_idle()
-                && self.shared.wait_quiet(free_since + IDLE_QUIET_PERIOD)
-                && gostd::local::run_idle()
-            {
+        }
+
+        let item = self.shared.request_queue.get(ctx)?;
+        self.shared.queued_requests.fetch_sub(1, Ordering::SeqCst);
+        let req = match item {
+            QueuedRequest::Request(req) => Rc::new(req),
+            QueuedRequest::Wake => {
                 gostd::local::run_pending();
-                gostd::local::drop_garbage(busy);
+                return Ok(());
             }
-
-            let item = self.shared.request_queue.get(&ctx)?;
-            self.shared.queued_requests.fetch_sub(1, Ordering::SeqCst);
-            let req = match item {
-                QueuedRequest::Request(req) => Rc::new(req),
-                QueuedRequest::Wake => {
-                    gostd::local::run_pending();
-                    continue;
-                }
-            };
-
-            self.shared
-                .last_request_time_ms
-                .store(unix_milli_now(), Ordering::SeqCst);
-            // Go: locale.WithLocale(ctx, s.GetLocale())
-            let mut request_ctx = locale::with_locale(&ctx, self.shared.locale());
-            let mut cancel: Option<CancelFunc> = None;
-            if let Some(id) = &req.id {
-                let (c, f) = context::with_cancel(&crate::frontend::core_context::with_request_id(
-                    &request_ctx,
-                    &id.string(),
-                ));
-                request_ctx = c;
-                cancel = Some(f.clone());
-                lock(&self.shared.pending_client_requests).insert(
-                    id.clone(),
-                    PendingClientRequest {
-                        method: req.method.clone(),
-                        cancel: f,
-                    },
-                );
+            QueuedRequest::ApiAccepted(accepted) => {
+                self.serve_api_connection(accepted);
+                gostd::local::run_pending();
+                return Ok(());
             }
+        };
 
-            let handle_error = |err: GoError| {
-                if errors::is(&err, &context::CANCELED) {
-                    if let Err(err) = self.shared.send_error(
-                        req.id.clone(),
-                        errors::from_value(ErrorCode::REQUEST_CANCELLED),
-                    ) {
-                        lsp_exit(Some(err));
-                    }
-                } else if errors::is(&err, &errors::EOF) {
-                    lsp_exit(None);
-                } else if let Err(err) = self.shared.send_error(req.id.clone(), err) {
+        self.shared
+            .last_request_time_ms
+            .store(unix_milli_now(), Ordering::SeqCst);
+        // Go: locale.WithLocale(ctx, s.GetLocale())
+        let mut request_ctx = locale::with_locale(ctx, self.shared.locale());
+        let mut cancel: Option<CancelFunc> = None;
+        if let Some(id) = &req.id {
+            let (c, f) = context::with_cancel(&crate::frontend::core_context::with_request_id(
+                &request_ctx,
+                &id.string(),
+            ));
+            request_ctx = c;
+            cancel = Some(f.clone());
+            lock(&self.shared.pending_client_requests).insert(
+                id.clone(),
+                PendingClientRequest {
+                    method: req.method.clone(),
+                    cancel: f,
+                },
+            );
+        }
+
+        let handle_error = |err: GoError| {
+            if errors::is(&err, &context::CANCELED) {
+                if let Err(err) = self.shared.send_error(
+                    req.id.clone(),
+                    errors::from_value(ErrorCode::REQUEST_CANCELLED),
+                ) {
                     lsp_exit(Some(err));
                 }
-            };
-
-            let remove_request = || {
-                if let Some(id) = &req.id {
-                    lock(&self.shared.pending_client_requests).remove(id);
-                    // Go: defer cancel()
-                    if let Some(cancel) = &cancel {
-                        cancel();
-                    }
-                }
-            };
-
-            match self.handle_request_or_notification(&request_ctx, &req) {
-                Err(err) => {
-                    handle_error(err);
-                    remove_request();
-                }
-                Ok(Some(do_async_work)) => {
-                    // PORT: Go starts the background tasks that the sync
-                    // part queued (a snapshot update's logging, watch
-                    // updates and publishDiagnostics) before this goroutine,
-                    // and they usually end before its answer. Run them
-                    // first.
-                    gostd::local::run_pending();
-                    // PORT: Go runs the async work on a goroutine
-                    // (`go func() {...}()`); it runs here, on the dispatch
-                    // thread, before the next message.
-                    if let Err(ls_error) = do_async_work() {
-                        handle_error(ls_error);
-                    }
-                    remove_request();
-                }
-                Ok(None) => remove_request(),
+            } else if errors::is(&err, &errors::EOF) {
+                lsp_exit(None);
+            } else if let Err(err) = self.shared.send_error(req.id.clone(), err) {
+                lsp_exit(Some(err));
             }
+        };
 
-            gostd::local::run_pending();
-            free_since = Instant::now();
+        let remove_request = || {
+            if let Some(id) = &req.id {
+                lock(&self.shared.pending_client_requests).remove(id);
+                // Go: defer cancel()
+                if let Some(cancel) = &cancel {
+                    cancel();
+                }
+            }
+        };
+
+        match self.handle_request_or_notification(&request_ctx, &req) {
+            Err(err) => {
+                handle_error(err);
+                remove_request();
+            }
+            Ok(Some(do_async_work)) => {
+                // PORT: Go starts the background tasks that the sync
+                // part queued (a snapshot update's logging, watch
+                // updates and publishDiagnostics) before this goroutine,
+                // and they usually end before its answer. Run them
+                // first.
+                gostd::local::run_pending();
+                // PORT: Go runs the async work on a goroutine
+                // (`go func() {...}()`); it runs here, on the dispatch
+                // thread, before the next message.
+                if let Err(ls_error) = do_async_work() {
+                    handle_error(ls_error);
+                }
+                remove_request();
+            }
+            Ok(None) => remove_request(),
         }
+
+        gostd::local::run_pending();
+        self.free_since.set(Instant::now());
+        Ok(())
     }
 }
 
@@ -4513,64 +4562,34 @@ impl Server {
         };
 
         // Start accepting connections in the background
-        // PORT: the API connection reads the project session, which lives on
-        // the dispatch thread, so the Go goroutine is a `gostd::local::go`
-        // job. It runs after this request; while it waits in `Accept` and
-        // while the connection runs, the dispatch thread serves only the
-        // API connection.
+        // PORT: `transport.Accept()` runs on its own thread. The connection
+        // reads the project session, which lives on the dispatch thread, so
+        // the accepted connection goes back to the dispatch loop
+        // (`QueuedRequest::ApiAccepted`, `serve_api_connection`).
         {
-            let s = self.clone();
-            let api_session = api_session.clone();
-            gostd::local::go(Box::new(move || {
-                let accept_result = transport.accept();
-                let _ = transport.close();
-                match accept_result {
-                    Err(accept_err) => {
-                        s.logger.errorf(&format!(
-                            "API session {}: failed to accept connection: {}",
-                            api_session.id(),
-                            accept_err.error()
-                        ));
-                    }
-                    Ok(rwc) => {
-                        // Create a cancellable context for the API connection
-                        let (api_ctx, api_cancel) =
-                            context::with_cancel(&s.shared.background_ctx());
-
-                        // Run the connection with panic recovery
-                        let result = catch_unwind(AssertUnwindSafe(|| {
-                            let conn = ipc::new_async_conn(rwc.clone(), api_session.clone());
-                            // ts#64299
-                            api_session.set_connection(conn.clone());
-                            if let Err(api_err) = conn.run(&api_ctx) {
-                                s.logger.errorf(&format!(
-                                    "API session {}: {}",
-                                    api_session.id(),
-                                    api_err.error()
-                                ));
-                            }
-                        }));
-                        if let Err(r) = result {
-                            let stack = std::backtrace::Backtrace::capture().to_string();
-                            s.logger.errorf(&format!(
-                                "API session {}: panic: {}\n{}",
-                                api_session.id(),
-                                panic_value_string(r.as_ref()),
-                                stack
+            let shared = self.shared.clone();
+            let session_id = api_session.id();
+            std::thread::Builder::new()
+                .name("api-accept".to_string())
+                .spawn(move || {
+                    let accept_result = transport.accept();
+                    let _ = transport.close();
+                    let rwc = match accept_result {
+                        Ok(rwc) => Some(rwc),
+                        Err(accept_err) => {
+                            shared.logger.errorf(&format!(
+                                "API session {}: failed to accept connection: {}",
+                                session_id,
+                                accept_err.error()
                             ));
-                            // Cancel the context to shut down the connection
-                            api_cancel();
-                            // Close the underlying connection
-                            let _ = rwc.close();
+                            None
                         }
-                        // Go: defer apiCancel()
-                        api_cancel();
-                    }
-                }
-                // Go: defer { apiSession.Close(); s.removeAPISession(apiSession.ID()) }
-                api_session.close();
-                s.remove_api_session(&api_session.id());
-            }));
+                    };
+                    let ctx = shared.background_ctx();
+                    let accepted = ApiAccepted { session_id, rwc };
+                    let _ = shared.queue_request(&ctx, QueuedRequest::ApiAccepted(accepted));
+                })
+                .expect("lsp: failed to start the API accept goroutine");
         }
 
         self.api_sessions
@@ -4583,6 +4602,103 @@ impl Server {
             session_id: api_session.id(),
             pipe: pipe_path,
         }))
+    }
+
+    /// PORT: the rest of Go's API session goroutine after
+    /// `transport.Accept()` (`handle_initialize_api_session`), on the
+    /// dispatch thread. It returns when the connection ends. Meanwhile the
+    /// connection runs the dispatch loop whenever it waits for a message
+    /// (`ApiConnProtocol`), so LSP messages are served as in Go.
+    fn serve_api_connection(self: &Rc<Self>, accepted: ApiAccepted) {
+        let api_session = self
+            .api_sessions
+            .borrow()
+            .as_ref()
+            .and_then(|api_sessions| api_sessions.get(&accepted.session_id).cloned());
+        let Some(api_session) = api_session else {
+            if let Some(rwc) = accepted.rwc {
+                let _ = rwc.close();
+            }
+            return;
+        };
+        let lsp_panic = match accepted.rwc {
+            Some(rwc) => self.run_api_connection(&api_session, rwc),
+            None => None,
+        };
+        // PORT: when the server ends while the connection waits, Go's
+        // process exits and this defer never runs (the project session may
+        // be closed by then), so the port skips it too.
+        let ending = match self.dispatch_ctx.borrow().as_ref() {
+            Some((ctx, _)) => ctx.err().is_some(),
+            None => true,
+        };
+        if !ending {
+            // Go: defer { apiSession.Close(); s.removeAPISession(apiSession.ID()) }
+            api_session.close();
+            self.remove_api_session(&api_session.id());
+        }
+        if let Some(payload) = lsp_panic {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// PORT: Go's `conn.Run(apiCtx)` with its panic recovery. Returns the
+    /// panic of an LSP message that the connection's wait served
+    /// (`ApiConnProtocol`): it is not the API's, so the caller raises it
+    /// again after the cleanup.
+    fn run_api_connection(
+        self: &Rc<Self>,
+        api_session: &Rc<api::Session>,
+        rwc: Arc<dyn ipc::ReadWriteCloser>,
+    ) -> Option<Box<dyn Any + Send>> {
+        // Create a cancellable context for the API connection
+        let (api_ctx, api_cancel) = context::with_cancel(&self.shared.background_ctx());
+        let state = Rc::new(ApiConnState::default());
+        let lsp_panic = Rc::new(RefCell::new(None));
+
+        // Run the connection with panic recovery
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let protocol = ApiConnProtocol {
+                inner: ipc::new_jsonrpc_protocol(rwc.clone()),
+                inbox: start_api_reader(&self.shared, rwc.clone()),
+                server: Rc::downgrade(self),
+                state: state.clone(),
+                lsp_panic: lsp_panic.clone(),
+            };
+            let conn = ipc::new_async_conn_with_protocol(
+                rwc.clone(),
+                Box::new(protocol),
+                api_session.clone(),
+            );
+            // ts#64299
+            api_session.set_connection(Rc::new(ApiSessionConn {
+                conn: conn.clone(),
+                state: state.clone(),
+            }));
+            if let Err(api_err) = conn.run(&api_ctx) {
+                self.logger.errorf(&format!(
+                    "API session {}: {}",
+                    api_session.id(),
+                    api_err.error()
+                ));
+            }
+        }));
+        if let Err(r) = result {
+            let stack = std::backtrace::Backtrace::capture().to_string();
+            self.logger.errorf(&format!(
+                "API session {}: panic: {}\n{}",
+                api_session.id(),
+                panic_value_string(r.as_ref()),
+                stack
+            ));
+            // Cancel the context to shut down the connection
+            api_cancel();
+            // Close the underlying connection
+            let _ = rwc.close();
+        }
+        // Go: defer apiCancel()
+        api_cancel();
+        lsp_panic.take()
     }
 
     // Go: server.go:1793 generateAPIPipePath
@@ -4619,6 +4735,233 @@ impl Server {
         if let Some(session) = self.session() {
             session.did_change_compiler_options_for_inferred_projects(ctx, options);
         }
+    }
+}
+
+/// PORT: the messages that an API connection's `api-reader` thread read.
+/// Go's `conn.Run` goroutine reads them; here the reads stay off the
+/// dispatch thread, so a client that sends nothing does not stop the LSP.
+#[derive(Default)]
+struct ApiInbox {
+    messages: Mutex<VecDeque<Result<ipc::Message, GoError>>>,
+    ready: Condvar,
+}
+
+impl ApiInbox {
+    /// Waits until a message is in the inbox or `ctx` is done.
+    fn wait(self: &Arc<Self>, ctx: &Context) {
+        let done = ctx.done();
+        let waker = done.as_ref().and_then(|done| {
+            let inbox = self.clone();
+            done.register_waker(move || {
+                let _messages = lock(&inbox.messages);
+                inbox.ready.notify_all();
+            })
+        });
+        let mut messages = lock(&self.messages);
+        while messages.is_empty() && ctx.err().is_none() {
+            messages = self.ready.wait(messages).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(messages);
+        if let (Some(done), Some(id)) = (&done, waker) {
+            done.unregister_waker(id);
+        }
+    }
+}
+
+/// PORT: starts the thread that reads the messages of an API connection
+/// into an inbox, up to the first read error. After each message it queues
+/// a `Wake`, so a dispatch loop that waits for the request queue looks at
+/// the inbox again.
+fn start_api_reader(
+    shared: &Arc<ServerShared>,
+    rwc: Arc<dyn ipc::ReadWriteCloser>,
+) -> Arc<ApiInbox> {
+    let inbox = Arc::new(ApiInbox::default());
+    let shared = shared.clone();
+    let thread_inbox = inbox.clone();
+    // The Go stack size, as the LSP reader thread has.
+    std::thread::Builder::new()
+        .name("api-reader".to_string())
+        .stack_size(crate::gostd::stack::max_stack_size())
+        .spawn(move || {
+            let mut protocol = ipc::new_jsonrpc_protocol(rwc);
+            loop {
+                let read = protocol.read_message();
+                let end = read.is_err();
+                lock(&thread_inbox.messages).push_back(read);
+                thread_inbox.ready.notify_all();
+                let ctx = shared.background_ctx();
+                if shared.queue_request(&ctx, QueuedRequest::Wake).is_err() || end {
+                    return;
+                }
+            }
+        })
+        .expect("lsp: failed to start the API read goroutine");
+    inbox
+}
+
+/// PORT: the protocol of an API connection of the LSP server. Writes go to
+/// the JSON-RPC protocol. A read takes the next message from the inbox.
+/// While the inbox is empty and no call to the client waits, the read runs
+/// the dispatch loop (`dispatch_next`), so LSP messages, exit, stdin
+/// EOF, SIGTERM and the parent watchdog work while the connection waits,
+/// as in Go, where the connection has its own goroutine. A read for a call
+/// to the client (`AsyncConn::call` in a request handler) waits for the
+/// inbox only, because the handler is in the middle of its work on the
+/// session. When the dispatch loop ends, the read returns EOF, which ends
+/// the connection.
+///
+/// Limits of the one dispatch thread: LSP messages wait while an API
+/// request runs (as they wait for a slow LSP request). A connection that
+/// is accepted while another waits runs inside the other's wait, so the
+/// first one's messages wait until the second one ends. A call to the
+/// client from an LSP message served in the wait fails (`ApiSessionConn`).
+struct ApiConnProtocol {
+    inner: ipc::JSONRPCProtocol,
+    inbox: Arc<ApiInbox>,
+    server: Weak<Server>,
+    state: Rc<ApiConnState>,
+    /// The panic of an LSP message served in a read (`run_api_connection`).
+    lsp_panic: Rc<RefCell<Option<Box<dyn Any + Send>>>>,
+}
+
+impl ipc::Protocol for ApiConnProtocol {
+    fn read_message(&mut self) -> Result<ipc::Message, GoError> {
+        let Some(server) = self.server.upgrade() else {
+            return Err(errors::EOF.clone());
+        };
+        let Some((ctx, lsp_exit)) = server.dispatch_ctx.borrow().clone() else {
+            return Err(errors::EOF.clone());
+        };
+        loop {
+            if ctx.err().is_some() {
+                return Err(errors::EOF.clone());
+            }
+            if let Some(msg) = lock(&self.inbox.messages).pop_front() {
+                return msg;
+            }
+            if self.state.calls.get() > 0 {
+                self.inbox.wait(&ctx);
+                continue;
+            }
+            self.state.serving_lsp.set(true);
+            let served = catch_unwind(AssertUnwindSafe(|| server.dispatch_next(&ctx, &lsp_exit)));
+            self.state.serving_lsp.set(false);
+            match served {
+                Ok(Ok(())) => {}
+                // The dispatch loop ended.
+                Ok(Err(_)) => return Err(errors::EOF.clone()),
+                Err(payload) => {
+                    *self.lsp_panic.borrow_mut() = Some(payload);
+                    return Err(errors::EOF.clone());
+                }
+            }
+        }
+    }
+
+    fn write_request(
+        &mut self,
+        id: Option<&jsonrpc::ID>,
+        method: &str,
+        params: Option<Box<dyn AnyValue>>,
+    ) -> Result<(), GoError> {
+        self.inner.write_request(id, method, params)
+    }
+
+    fn write_notification(
+        &mut self,
+        method: &str,
+        params: Option<Box<dyn AnyValue>>,
+    ) -> Result<(), GoError> {
+        self.inner.write_notification(method, params)
+    }
+
+    fn write_response(
+        &mut self,
+        id: Option<&jsonrpc::ID>,
+        result: Option<Box<dyn AnyValue>>,
+    ) -> Result<(), GoError> {
+        self.inner.write_response(id, result)
+    }
+
+    fn write_error(
+        &mut self,
+        id: Option<&jsonrpc::ID>,
+        err: &jsonrpc::ResponseError,
+    ) -> Result<(), GoError> {
+        self.inner.write_error(id, err)
+    }
+}
+
+/// PORT: what an API connection of the LSP server is doing, for its
+/// protocol (`ApiConnProtocol`) and its session connection
+/// (`ApiSessionConn`).
+#[derive(Default)]
+struct ApiConnState {
+    /// The calls to the client that wait for their answer.
+    calls: Cell<u32>,
+    /// Whether a read runs the dispatch loop.
+    serving_lsp: Cell<bool>,
+}
+
+/// PORT: the connection of an API session of the LSP server
+/// (`apiSession.SetConnection(conn)`). It counts the calls to the client
+/// for `ApiConnProtocol`. While a read of the connection runs the dispatch
+/// loop, `AsyncConn` holds its protocol, so a call or notification to the
+/// client from an LSP message (a callback module resolver of a project
+/// that the API session opened, when an LSP request rebuilds it) returns
+/// an error here instead of a panic. Go makes the call.
+struct ApiSessionConn {
+    conn: Rc<ipc::AsyncConn>,
+    state: Rc<ApiConnState>,
+}
+
+impl ApiSessionConn {
+    fn check_idle(&self) -> Result<(), GoError> {
+        if self.state.serving_lsp.get() {
+            return Err(errors::new(
+                "ipc: the API connection cannot write while an LSP message runs in its read",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Counts one call to the client until it is dropped (also on a panic).
+struct PendingCall<'a>(&'a Cell<u32>);
+
+impl Drop for PendingCall<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+impl ipc::Conn for ApiSessionConn {
+    fn run(&self, ctx: &Context) -> Result<(), GoError> {
+        self.conn.run(ctx)
+    }
+
+    fn call(
+        &self,
+        ctx: &Context,
+        method: &str,
+        params: Option<Box<dyn AnyValue>>,
+    ) -> Result<json_ext::JsonValue, GoError> {
+        self.check_idle()?;
+        self.state.calls.set(self.state.calls.get() + 1);
+        let _pending = PendingCall(&self.state.calls);
+        self.conn.call(ctx, method, params)
+    }
+
+    fn notify(
+        &self,
+        ctx: &Context,
+        method: &str,
+        params: Option<Box<dyn AnyValue>>,
+    ) -> Result<(), GoError> {
+        self.check_idle()?;
+        self.conn.notify(ctx, method, params)
     }
 }
 

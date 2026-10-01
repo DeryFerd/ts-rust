@@ -2892,7 +2892,7 @@ fn parse_triple_slash_directive_fragment(text: &str) -> (&str, &'static str, &st
 }
 
 impl LanguageService {
-    // Go: ls/string_completions.go:2159 getTripleSlashReferenceCompletions
+    // Go: ls/string_completions.go:2188 getTripleSlashReferenceCompletions
     fn get_triple_slash_reference_completions(
         &self,
         file: Node,
@@ -2919,15 +2919,23 @@ impl LanguageService {
             return None;
         };
 
-        let text = &source_file_text(file)[found_range.pos() as usize..position as usize];
-        let (prefix, kind, to_complete, ok) = parse_triple_slash_directive_fragment(text);
+        // PORT: `position` can cut a char (see `go_text_slice`). Go keeps
+        // the cut bytes at the end of `text`. They are not white space,
+        // quotes or separators, and the basename of `toComplete` is not
+        // used, so the parse and the directory are Go's.
+        let file_text = source_file_text(file);
+        let text = go_text_slice(&file_text, found_range.pos(), position);
+        let (prefix, kind, to_complete, ok) = parse_triple_slash_directive_fragment(&text);
         if !ok {
             return None;
         }
-        let (replacement_span, ok) = self.path_completion_replacement_span(
-            file,
-            get_directory_fragment_range(to_complete, found_range.pos() + prefix.len() as i32),
-        );
+        // PORT: Go's range ends at `position`, the end of `text`. The invalid
+        // byte units of a cut char are longer than its Go bytes, so the end
+        // is `position`, not the end of `to_complete` in port bytes.
+        let fragment_range =
+            get_directory_fragment_range(to_complete, found_range.pos() + prefix.len() as i32)
+                .map(|range| TextRange::new(range.pos(), position));
+        let (replacement_span, ok) = self.path_completion_replacement_span(file, fragment_range);
         if !ok {
             return None;
         }
@@ -2990,7 +2998,8 @@ impl LanguageService {
 // Go: ls/string_completions_test.go (tsgo#4900)
 #[cfg(test)]
 mod tests {
-    use super::try_remove_directory_prefix;
+    use super::*;
+    use std::fmt::Write;
 
     // Go: ls/string_completions_test.go:17 TestTryRemoveDirectoryPrefixCaseFoldingShrinksPrefix
     // Each Kelvin sign '\u212A' below case-folds to the single-byte 'k', so the raw
@@ -3003,5 +3012,69 @@ mod tests {
         let actual =
             try_remove_directory_prefix(path, prefix, false /*useCaseSensitiveFileNames*/);
         assert_eq!(actual.as_deref(), Some("x.ts"));
+    }
+
+    /// The triple-slash fragment of `getTripleSlashReferenceCompletions`
+    /// is Go's when the position cuts a char, where Go slices the comment's
+    /// bytes and keeps the cut bytes in `toComplete`. The expected lines are
+    /// from a Go test at pin N with Go 1.27.1 (`utf8cmp1/tools/gomodel` in
+    /// the lane dir, an overlay test file in package `ls`) that runs, at
+    /// each position: `parseTripleSlashDirectiveFragment(text[:p])` (ok,
+    /// `len(prefix)`, kind and the `toComplete` bytes),
+    /// `getDirectoryFragmentRange(toComplete, len(prefix))` and the bytes of
+    /// `getFragmentDirectory(toComplete)`. Go's range always ends at the
+    /// position, as the port's range does.
+    #[test]
+    fn triple_slash_fragment_cut_chars_as_go() {
+        let go = "\
+T0 20 false 0 \"\"  nil \n\
+T0 21 true 21 \"path\"  nil \n\
+T0 22 true 21 \"path\" 2e 21-22 \n\
+T0 23 true 21 \"path\" 2e2f nil 2e2f\n\
+T0 24 true 21 \"path\" 2e2fc3 23-24 2e\n\
+T0 25 true 21 \"path\" 2e2fc3a9 23-25 2e\n\
+T0 26 true 21 \"path\" 2e2fc3a92f nil 2e2fc3a92f\n\
+T0 27 true 21 \"path\" 2e2fc3a92ff0 26-27 2e2fc3a9\n\
+T0 28 true 21 \"path\" 2e2fc3a92ff09f 26-28 2e2fc3a9\n\
+T0 29 true 21 \"path\" 2e2fc3a92ff09f98 26-29 2e2fc3a9\n\
+T0 30 true 21 \"path\" 2e2fc3a92ff09f9880 26-30 2e2fc3a9\n\
+T1 21 false 0 \"\"  nil \n\
+T1 22 true 22 \"types\"  nil \n\
+T1 23 true 22 \"types\" c3 22-23 \n\
+T1 24 true 22 \"types\" c3a9 22-24 \n\
+T2 3 false 0 \"\"  nil \n\
+T2 4 false 0 \"\"  nil \n\
+T2 5 false 0 \"\"  nil \n\
+T2 6 false 0 \"\"  nil \n\
+";
+        let cases = [
+            ("/// <reference path=\"./\u{E9}/\u{1F600}", 20, 30),
+            ("/// <reference types=\"\u{E9}", 21, 24),
+            ("///\u{3000}<reference path=\"a", 3, 6),
+        ];
+        let hex = |s: &str| {
+            go_string_bytes(s)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let mut port = String::new();
+        for (i, (text, from, to)) in cases.into_iter().enumerate() {
+            for p in from..=to {
+                let slice = go_text_slice(text, 0, p);
+                let (prefix, kind, to_complete, ok) = parse_triple_slash_directive_fragment(&slice);
+                let range = get_directory_fragment_range(to_complete, prefix.len() as i32)
+                    .map_or("nil".to_string(), |range| format!("{}-{p}", range.pos()));
+                writeln!(
+                    port,
+                    "T{i} {p} {ok} {} {kind:?} {} {range} {}",
+                    prefix.len(),
+                    hex(to_complete),
+                    hex(&get_fragment_directory(to_complete))
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(port, go);
     }
 }

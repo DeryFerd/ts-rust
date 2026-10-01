@@ -36,13 +36,13 @@ impl CommandLineOptionKind {
 // `StringList`, `Paths` and `IntPtr` are the typed `[]string`,
 // `*OrderedMap[string, []string]` and `*int` values of `core.CompilerOptions`
 // fields (a typed nil pointer is not Go untyped nil, so these keep their own
-// `None`).
+// `None`). Go `int` is 64-bit, so `Int` and `IntPtr` hold an `i64`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum CompilerOptionsValue {
     #[default]
     Nil,
     Bool(bool),
-    Int(i32),
+    Int(i64),
     Number(f64),
     String(String),
     Message(&'static Message),
@@ -68,7 +68,7 @@ pub enum CompilerOptionsValue {
     Map(IndexMap<String, CompilerOptionsValue>),
     StringList(Vec<String>),
     Paths(Option<IndexMap<String, Option<Vec<String>>>>),
-    IntPtr(Option<i32>),
+    IntPtr(Option<i64>),
     /// Go `struct{}{}`, returned by `convertToJson` for a missing root.
     EmptyStruct,
 }

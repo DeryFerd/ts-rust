@@ -128,7 +128,7 @@ pub struct PluginImport {
 // `Some(vec![])`. `mergeCompilerOptions` copies an empty non-nil slice (so
 // `"types": []` overrides the parent), and some readers test `!= nil`.
 // Go `*collections.OrderedMap` is `Option<IndexMap>` and Go `*int` is
-// `Option<i32>`.
+// `Option<i64>` (Go `int` is 64-bit).
 // PORT: the derived `==` ignores the `paths` key order, because `IndexMap`
 // equality does. Go `reflect.DeepEqual` sees it: use `deep_equal` for that.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -235,7 +235,7 @@ pub struct CompilerOptions {
     pub use_define_for_class_fields: Tristate,
     pub use_unknown_in_catch_variables: Tristate,
     pub verbatim_module_syntax: Tristate,
-    pub max_node_module_js_depth: Option<i32>,
+    pub max_node_module_js_depth: Option<i64>,
 
     // Deprecated: Do not use outside of options parsing and validation.
     pub allow_synthetic_default_imports: Tristate,
@@ -280,7 +280,7 @@ pub struct CompilerOptions {
     pub pprof_dir: String,
     pub single_threaded: Tristate,
     pub quiet: Tristate,
-    pub checkers: Option<i32>,
+    pub checkers: Option<i64>,
 }
 
 static EMPTY_COMPILER_OPTIONS: std::sync::OnceLock<CompilerOptions> = std::sync::OnceLock::new();

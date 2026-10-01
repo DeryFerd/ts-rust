@@ -11,6 +11,7 @@ use crate::ls::prelude::*;
 
 use crate::frontend::parser::ParsedSourceFile;
 use crate::spanmap::{Feature, Fidelity};
+use std::borrow::Cow;
 use std::cell::Cell;
 
 // Go: ls/utilities.go:25 quoteReplacer
@@ -1996,4 +1997,53 @@ pub fn get_ancestor_type_node(node: Node) -> Node {
 // Go: ls/utilities.go:1402 isSourceFileWithGlobalExports
 pub fn is_source_file_with_global_exports(node: Node) -> bool {
     node.is_some() && is_source_file(node) && file_bind_data(node).global_exports.is_some()
+}
+
+/// Go `text[lo:hi]` on the port form `text` (see `GO_STRING_MARKER`). Go
+/// slices bytes, so `lo` or `hi` can cut a char: Go keeps the cut bytes and
+/// reads each one as a RuneError of size 1. Here each cut byte is an invalid
+/// byte unit (`go_string_from_bytes`), so the result is longer than
+/// `hi - lo` at a cut. A slice at char boundaries is borrowed.
+// PORT: an out of range bound panics with the Go runtime text. Go checks
+// `hi` against the length first, then `lo` against `hi`; a negative bound is
+// printed alone. A content-mapped file reaches the JSDoc snippet checks with
+// empty text in Go at B too, and the LSP error response carries the text.
+pub fn go_text_slice(text: &str, lo: i32, hi: i32) -> Cow<'_, str> {
+    let len = text.len();
+    if hi < 0 {
+        crate::core::go_panic(format!("runtime error: slice bounds out of range [:{hi}]"));
+    }
+    if hi as usize > len {
+        crate::core::go_panic(format!(
+            "runtime error: slice bounds out of range [:{hi}] with length {len}"
+        ));
+    }
+    if lo < 0 {
+        crate::core::go_panic(format!("runtime error: slice bounds out of range [{lo}:]"));
+    }
+    if lo > hi {
+        crate::core::go_panic(format!(
+            "runtime error: slice bounds out of range [{lo}:{hi}]"
+        ));
+    }
+    let (lo, hi) = (lo as usize, hi as usize);
+    if let Some(whole) = text.get(lo..hi) {
+        return Cow::Borrowed(whole);
+    }
+    // The whole chars are `head..tail`; the bytes around them are cut.
+    let mut head = lo;
+    while head < hi && !text.is_char_boundary(head) {
+        head += 1;
+    }
+    let mut tail = hi;
+    while tail > head && !text.is_char_boundary(tail) {
+        tail -= 1;
+    }
+    let bytes = text.as_bytes();
+    let mut out = go_string_from_bytes(bytes[lo..head].to_vec());
+    if head < tail {
+        out.push_str(&text[head..tail]);
+    }
+    out.push_str(&go_string_from_bytes(bytes[tail..hi].to_vec()));
+    Cow::Owned(out)
 }

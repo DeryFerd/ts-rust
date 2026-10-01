@@ -349,14 +349,13 @@ impl CommandLineParser {
                         // !!! Make sure this parseInt matches JS parseInt
                         // PORT: Go `strconv.Atoi` parses a 64-bit int with an
                         // optional sign; Rust `i64` parsing accepts the same
-                        // text. The value is stored as `Int(i32)`, because Go
-                        // `int` is `i32` in this port; larger values wrap.
+                        // text, and `Int` holds the whole Go `int`.
                         match args[i].parse::<i64>() {
                             Ok(num) => {
                                 if num >= i64::from(opt.min_value) {
                                     self.options.insert(
                                         opt.name.to_string(),
-                                        CompilerOptionsValue::Int(num as i32),
+                                        CompilerOptionsValue::Int(num),
                                     );
                                 } else {
                                     self.errors.push(new_compiler_diagnostic(

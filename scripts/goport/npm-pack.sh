@@ -12,15 +12,20 @@
 #          --bin tsgo --features noembed; for a shipped one RELEASE_VERSION=<v>
 #          crates/ts_goport/scripts/build-release.sh. The package version is the version it reports.
 #        npm-pack.sh --go <version> <out-dir>
-#          Go. Builds tsgo at the pin as Go's release build does (Herebyfile.mjs getReleaseBuildFlags
-#          and buildTsgo: -trimpath, -ldflags "-s -w -X core.version=<version>", tag noembed,
-#          CGO_ENABLED=0; the Go toolchain of the pin's oracle) and packs it with Go's launcher only.
-# The pin is GOPORT_PIN, else the current pin (scripts/upstream/pin.py path goCheckout).
+#          Go. Builds the Go tsc at the pin as Go's release build does (Herebyfile.mjs
+#          getReleaseBuildFlags and buildTsc: -trimpath, -ldflags "-s -w -X core.version=<version>",
+#          tag noembed, CGO_ENABLED=0; the Go toolchain of the pin's oracle) and packs it with Go's
+#          launcher only.
+# The pin is GOPORT_PIN, else the current pin (scripts/upstream/pin.py path goCheckout). Both pin
+# layouts work. "typescript" (microsoft/TypeScript, pin N on): the Go module is <repo>/tsc
+# (./cmd/tsc, module github.com/microsoft/TypeScript/tsc) and the package input is
+# <repo>/packages/typescript. "typescript-go": the Go module is the checkout (./cmd/tsgo, module
+# github.com/microsoft/typescript-go) and the input is _packages/native-preview.
 # Output: <out-dir>/typescript, <out-dir>/typescript-linux-x64 and their tarballs
 # (<out-dir>/typescript-<v>.tgz, <out-dir>/typescript-typescript-linux-x64-<v>.tgz).
 set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-usage() { sed -n '9,19p' "$0" >&2; exit 2; }
+usage() { sed -n '9,24p' "$0" >&2; exit 2; }
 
 go_version=""
 if [[ ${1:-} == --go ]]; then
@@ -33,16 +38,26 @@ fi
 mkdir -p "$out"
 out=$(realpath "$out")
 go_dir=$("$repo/scripts/upstream/pin.py" path goCheckout)
+read -r pin layout go_toolchain < <("$repo/scripts/upstream/pin.py" show |
+  node -e 'const p = JSON.parse(require("fs").readFileSync(0, "utf8")); console.log(p.key, p.layout, p.oracle.go)')
+case $layout in
+  typescript)
+    root=$(dirname "$go_dir") && input=$root/packages/typescript input_modules=$root/node_modules
+    go_cmd=./cmd/tsc go_module=github.com/microsoft/TypeScript/tsc ;;
+  typescript-go)
+    root=$go_dir input=$go_dir/_packages/native-preview input_modules=$go_dir/_packages/native-preview/node_modules
+    go_cmd=./cmd/tsgo go_module=github.com/microsoft/typescript-go ;;
+  *) echo "unknown pin layout '$layout'" >&2; exit 1 ;;
+esac
 build="$out/.build"
 rm -rf "$build"
 mkdir -p "$build"
 
 if [[ -n $go_version ]]; then
-  go_toolchain=$("$repo/scripts/upstream/pin.py" show | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).oracle.go)')
   exe="$build/tsc"
   (cd "$go_dir" && CGO_ENABLED=0 GOTOOLCHAIN=$go_toolchain go build -trimpath \
-    "-ldflags=-s -w -X github.com/microsoft/typescript-go/internal/core.version=$go_version" \
-    -tags=noembed -o "$exe" ./cmd/tsgo)
+    "-ldflags=-s -w -X $go_module/internal/core.version=$go_version" \
+    -tags=noembed -o "$exe" "$go_cmd")
   libs="$go_dir/internal/bundled/libs"
   git_head=$(git -C "$go_dir" rev-parse HEAD 2>/dev/null || "$repo/scripts/upstream/pin.py" path commit)
 else
@@ -68,21 +83,22 @@ listed=$("$bin/tsc" --listFilesOnly --lib es5 "$build/a.ts")
 grep -q "^$bin/lib.es5.d.ts$" <<< "$listed" ||
   { echo "$exe is not a noembed build: it lists $(head -1 <<< "$listed")" >&2; exit 1; }
 
-# The JS API (dist), as Go's `npm run -w @typescript/native-preview build` makes it (tsc -b). npm
-# finds `tsc` in the root node_modules/.bin: @typescript/bundled-typescript, not the typescript
-# package (another version, whose source maps differ).
+# The JS API (dist), as Go's `npm run -w <input package> build` makes it (tsc -b), in a copy of the
+# input, so the checkout stays read-only. npm finds `tsc` in the root node_modules/.bin:
+# @typescript/bundled-typescript, not the typescript package (another version, whose source maps
+# differ). At N the input has no node_modules of its own (npm workspaces): it uses the root's.
 src="$build/dist-src"
 mkdir -p "$src"
-for f in "$go_dir"/_packages/native-preview/*; do
+for f in "$input"/*; do
   [[ $f == */node_modules || $f == */dist ]] || cp -r "$f" "$src/"
 done
-ln -s "$go_dir/_packages/native-preview/node_modules" "$src/node_modules"
-"$go_dir/node_modules/.bin/tsc" -b "$src"
+ln -s "$input_modules" "$src/node_modules"
+"$root/node_modules/.bin/tsc" -b "$src"
 
 native_bin=()
 [[ -n $go_version ]] || native_bin=(--native-bin)
-node "$repo/npm/pack.mjs" --go-dir "$go_dir" --exe "$bin/tsc" --libs "$libs" --dist "$src/dist" \
-  --version "$version" --git-head "$git_head" --out "$out/pkg" "${native_bin[@]}"
+node "$repo/npm/pack.mjs" --layout "$layout" --go-dir "$go_dir" --exe "$bin/tsc" --libs "$libs" \
+  --dist "$src/dist" --version "$version" --git-head "$git_head" --out "$out/pkg" "${native_bin[@]}"
 
 
 rm -rf "$out/typescript" "$out/typescript-linux-x64" "$out"/*.tgz
@@ -92,5 +108,5 @@ for d in typescript typescript-linux-x64; do
   (cd "$out/$d" && npm pack --silent --pack-destination "$out" > /dev/null)
 done
 rm -rf "$build"
-echo "packed $version ($([[ -n $go_version ]] && echo Go || echo Rust), pin $(basename "$go_dir")):"
+echo "packed $version ($([[ -n $go_version ]] && echo Go || echo Rust), pin $pin):"
 ls -1 "$out"/*.tgz

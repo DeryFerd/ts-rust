@@ -744,7 +744,7 @@ impl Checker {
         declaration.is_some() && get_containing_function(declaration).is_some()
     }
 
-    // Go: checker/checker.go:23572 getDeclaredTypeOfSymbol
+    // Go: checker/checker.go:24126 getDeclaredTypeOfSymbol
     pub fn get_declared_type_of_symbol(&mut self, symbol: SymbolId) -> TypeId {
         let mut result = self.try_get_declared_type_of_symbol(symbol);
         if result.is_nil() {
@@ -753,7 +753,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:23580 tryGetDeclaredTypeOfSymbol
+    // Go: checker/checker.go:24134 tryGetDeclaredTypeOfSymbol
     pub fn try_get_declared_type_of_symbol(&mut self, symbol: SymbolId) -> TypeId {
         if symbol.is_nil() {
             // Go reads `symbol.Flags` of a nil symbol: `getTypeOfNode` on a

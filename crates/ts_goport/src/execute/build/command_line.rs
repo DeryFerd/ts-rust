@@ -8,13 +8,13 @@ use std::cell::OnceCell;
 // that the frontend port left out.
 
 // Go: core/buildoptions.go:3 BuildOptions
-// PORT: Go `*int` is `Option<i32>`. The `noCopy` marker is dropped.
+// PORT: Go `*int` (64-bit) is `Option<i64>`. The `noCopy` marker is dropped.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BuildOptions {
     pub dry: Tristate,
     pub force: Tristate,
     pub verbose: Tristate,
-    pub builders: Option<i32>,
+    pub builders: Option<i64>,
     pub stop_build_on_errors: Tristate,
 
     // CompilerOptions are not parsed here and will be available on ParsedBuildCommandLine
