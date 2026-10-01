@@ -14,11 +14,12 @@
 //! PORT: Go waits on EAGAIN only for an fd that was non-blocking at start
 //! (`NewFile` gives only such an fd to the poller). Here every EAGAIN waits,
 //! also when a parent sets O_NONBLOCK later; Go then returns the EAGAIN
-//! error, which `fmt.Fprint` ignores. Rust ignores SIGPIPE, so a write here
-//! gets EPIPE and raises the signal as Go does. A write that writes 0 bytes
-//! gives `WriteZero` (Go `io.ErrUnexpectedEOF`). Go does not buffer these
-//! files; `LineStdout` keeps std's line buffer (see there). On Windows these
-//! are the std handles, as before.
+//! error, which `fmt.Fprint` ignores (`LineStdout` keeps the Go rule). Rust
+//! ignores SIGPIPE, so a write here gets EPIPE and raises the signal as Go
+//! does. A write that writes 0 bytes gives `WriteZero` (Go
+//! `io.ErrUnexpectedEOF`). Go does not buffer these files; `LineStdout`
+//! keeps std's line buffer (see there). On Windows these are the std
+//! handles, as before.
 
 use std::io;
 
@@ -34,11 +35,13 @@ pub struct Stdout;
 /// handling of `Stdout`. The tsc system writer uses it.
 /// PORT: Go writes each `fmt.Fprint` at once, and a pretty diagnostic is
 /// many short pieces per line: in a run with 5,000 errors Go makes 37 writes
-/// per diagnostic, this 8 (R149 5, through `write_all`, whose error does not
-/// say how much it wrote). Other port code (the trace output, the watch
-/// manager) writes whole lines to std's stdout, so both keep their order.
-/// Text that has no newline yet at exit goes out in std's flush at exit,
-/// which ignores errors; tsc output ends with a newline.
+/// per diagnostic, this 5 (8 on a non-blocking fd 1). Other port code (the
+/// trace output, the watch manager) writes whole lines to std's stdout, so
+/// both keep their order. As in Go, only an fd 1 that was non-blocking at
+/// start waits on EAGAIN; a later EAGAIN is the write's error, which the
+/// tsc writer ignores as Go does. tsgo flushes the system writer at the end
+/// (`--showConfig` has no trailing newline); other text without a newline
+/// at exit goes out in std's flush at exit, which ignores errors.
 pub struct LineStdout;
 
 /// Go `os.Stderr`.
@@ -109,8 +112,10 @@ impl io::Write for Stderr {
 mod sys {
     use rustix::event::{PollFd, PollFlags, poll};
     use rustix::fd::BorrowedFd;
+    use rustix::fs::OFlags;
     use rustix::io::Errno;
     use std::io::{self, Write};
+    use std::sync::OnceLock;
 
     pub fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
         // Go: internal/poll/fd_unix.go FD.Read
@@ -149,10 +154,30 @@ mod sys {
         Ok(())
     }
 
-    // A failed `write` of std's line writer consumed nothing of `buf`, and
-    // a failed flush keeps the bytes it did not write, so both try again.
+    /// Go `NewFile`: fd 1 was non-blocking at start (checked at the first
+    /// write here), so its writes wait in the poller on EAGAIN.
+    fn stdout_nonblocking() -> bool {
+        static NONBLOCKING: OnceLock<bool> = OnceLock::new();
+        *NONBLOCKING.get_or_init(|| {
+            rustix::fs::fcntl_getfl(rustix::stdio::stdout())
+                .is_ok_and(|flags| flags.contains(OFlags::NONBLOCK))
+        })
+    }
+
+    // A blocking fd 1 takes std's `write_all`, which joins the buffered text
+    // and the new lines in one write and tries again after EINTR itself. Its
+    // error does not say how much it wrote, so a non-blocking fd 1 takes
+    // `write`: a failed `write` of std's line writer consumed nothing of
+    // `buf`, and a failed flush keeps the bytes it did not write, so both
+    // try again after EAGAIN.
     pub fn write_line_stdout(mut buf: &[u8]) -> io::Result<()> {
         let mut out = io::stdout().lock();
+        if !stdout_nonblocking() {
+            return match out.write_all(buf) {
+                Err(err) if Errno::from_io_error(&err) == Some(Errno::PIPE) => sigpipe(),
+                result => result,
+            };
+        }
         while !buf.is_empty() {
             match out.write(buf) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
