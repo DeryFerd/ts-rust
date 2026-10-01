@@ -434,6 +434,23 @@ pub struct BuildTask {
     // PORT: not in Go. The compile between `build_project_start` and
     // `build_project_finish`.
     compile: Option<PendingCompile>,
+
+    // PORT: not in Go. A Go panic in this task's builder goroutine (see
+    // `build_project_start`).
+    go_panic: Option<TaskGoPanic>,
+}
+
+/// PORT: a Go panic in a builder goroutine of Go `rangeTasks`. In Go the
+/// report goroutine still writes the reports of the tasks that are built
+/// before the panic ends the process. The port reports on the thread that
+/// runs the tasks, so `build_project_start` keeps the panic and `report`
+/// raises it: the tasks before this one in `order` report first.
+enum TaskGoPanic {
+    /// The task panicked with this `go_panic` payload.
+    Panicked(Box<dyn std::any::Any + Send>),
+    /// An upstream task panicked. Go's builder of this task waits on it
+    /// (`waitOnUpstream`) until the process ends, so the task does nothing.
+    Upstream,
 }
 
 // The state of Go `compileAndEmit` from `NewProgram` to
@@ -479,6 +496,7 @@ impl BuildTask {
             content_mapper_project: None,
             content_mapper_project_err: None,
             compile: None,
+            go_panic: None,
         }
     }
 
@@ -562,7 +580,12 @@ impl BuildTask {
     //   - aggregate `result.statistics` into `buildResult.Statistics` when set,
     //   - count `result.build_kind` (ProjectsBuilt / TimestampUpdates),
     //   - append `result.files_to_delete` to `buildResult.FilesToDelete`.
+    // PORT: a Go panic that `build_project_start` kept ends the run here
+    // (see `TaskGoPanic`).
     pub fn report(&mut self) -> (TaskResult, Vec<Diagnostic>) {
+        if let Some(TaskGoPanic::Panicked(payload)) = self.go_panic.take() {
+            std::panic::resume_unwind(payload);
+        }
         let result = self.result.take().expect("task result is set");
         (result, self.errors.clone())
     }
@@ -576,7 +599,46 @@ impl BuildTask {
     // when the task compiles: then the caller must call
     // `build_project_finish`. When it returns false the task is done
     // (downstream unblocked).
+    // PORT: a `go_panic` in the task is kept for `report` (see
+    // `TaskGoPanic`). Other panics are port gaps and continue.
     pub fn build_project_start(
+        &mut self,
+        orchestrator: &dyn BuildTaskOrchestrator,
+        path: &Path,
+    ) -> bool {
+        if self
+            .up_stream
+            .iter()
+            .any(|upstream| upstream.task.borrow().go_panic.is_some())
+        {
+            self.go_panic = Some(TaskGoPanic::Upstream);
+            return false;
+        }
+        let mut payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.build_project_start_task(orchestrator, path)
+        })) {
+            Ok(compiles) => return compiles,
+            Err(payload) => payload,
+        };
+        let Some(panic) = payload.downcast_mut::<crate::core::GoPanic>() else {
+            std::panic::resume_unwind(payload);
+        };
+        // Go: orchestrator.go:944 `wg.Queue(runTask)` unless one builder
+        // runs (`numRoutines`, see `Orchestrator::num_routines`). The
+        // goroutine of `sync.WaitGroup.Go` panics again (see
+        // `go_wait_group_task`).
+        let command = orchestrator.command();
+        let num_routines = if command.compiler_options.single_threaded.is_true() {
+            1
+        } else {
+            command.build_options.builders.unwrap_or(4)
+        };
+        panic.repanicked = num_routines != 1;
+        self.go_panic = Some(TaskGoPanic::Panicked(payload));
+        false
+    }
+
+    fn build_project_start_task(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
         path: &Path,
@@ -1955,9 +2017,12 @@ impl BuildTask {
         if let Some(dts_time) = entry.dts_time {
             return dts_time;
         }
-        // PORT: Go reads `t.buildInfoEntry.buildInfo.LatestChangedDtsFile` and
-        // panics on a nil build info.
-        let build_info = entry.build_info.as_ref().expect("buildInfo is set");
+        // Go reads `t.buildInfoEntry.buildInfo.LatestChangedDtsFile` and
+        // panics on a nil build info (an upstream build info that cannot be
+        // read).
+        let Some(build_info) = entry.build_info.as_ref() else {
+            crate::core::go_nil_dereference()
+        };
         let dts_time = orchestrator.get_m_time(&get_normalized_absolute_path(
             &build_info.latest_changed_dts_file,
             &get_directory_path(entry.path.as_str()),

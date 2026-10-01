@@ -21,8 +21,10 @@
 //! kernel records. Those records (inotify_event, fanotify_event_metadata,
 //! linux_dirent64) have one layout on every Linux target. `Stat_t` and
 //! `Statfs_t` are filled from `std` and rustix, not cast, so the amd64
-//! field types hold the values of any target.
+//! field types hold the values of any target. A path is a Go string in the
+//! port form, so each call passes its Go bytes (`osvfs::os_path`).
 
+use crate::frontend::vfs::osvfs::os_path;
 use crate::fswatch::prelude::*;
 pub use crate::fswatch::syscall::*;
 use crate::gostd::errors;
@@ -462,7 +464,7 @@ pub fn close(fd: i32) -> Result<(), GoError> {
 // Go: syscall_linux.go:117 Open
 pub fn open(path: &str, mode: i32, perm: u32) -> Result<i32, GoError> {
     let fd = rustix::fs::open(
-        path,
+        &*os_path(path),
         rustix::fs::OFlags::from_bits_retain(mode as u32),
         rustix::fs::Mode::from_bits_retain(perm),
     )
@@ -474,6 +476,8 @@ pub fn open(path: &str, mode: i32, perm: u32) -> Result<i32, GoError> {
 pub fn openat(dirfd: i32, path: &str, flags: i32, mode: u32) -> Result<i32, GoError> {
     let flags = rustix::fs::OFlags::from_bits_retain(flags as u32);
     let mode = rustix::fs::Mode::from_bits_retain(mode);
+    let path = os_path(path);
+    let path = &*path;
     let fd = if dirfd == AT_FDCWD {
         rustix::fs::openat(rustix::fs::CWD, path, flags, mode)
     } else {
@@ -536,7 +540,7 @@ fn dirent_type(t: rustix::fs::FileType) -> u8 {
 /// PORT: `std::fs::symlink_metadata` makes the same lstat(2) call.
 pub fn lstat(path: &str, stat: &mut Stat_t) -> Result<(), GoError> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::symlink_metadata(path).map_err(io_error)?;
+    let m = std::fs::symlink_metadata(os_path(path)).map_err(io_error)?;
     *stat = Stat_t {
         dev: m.dev(),
         ino: m.ino(),
@@ -578,7 +582,7 @@ pub fn inotify_add_watch(fd: i32, pathname: &str, mask: u32) -> Result<i32, GoEr
     let f = lookup_fd(fd)?;
     rustix::fs::inotify::add_watch(
         &*f,
-        pathname,
+        &*os_path(pathname),
         rustix::fs::inotify::WatchFlags::from_bits_retain(mask),
     )
     .map_err(errno_error)
@@ -623,7 +627,8 @@ pub fn fanotify_mark(
     };
     let flags = MarkFlags::from_bits_retain(flags);
     let mask = MaskFlags::from_bits_retain(mask);
-    let pathname = (!pathname.is_empty()).then_some(pathname);
+    let pathname = os_path(pathname);
+    let pathname = (!pathname.as_os_str().is_empty()).then_some(&*pathname);
     let res = if dir_fd == AT_FDCWD {
         f.mark(flags, mask, rustix::fs::CWD, pathname)
     } else {
@@ -646,7 +651,8 @@ pub fn name_to_handle_at(dirfd: i32, path: &str, flags: i32) -> Result<(FileHand
     if path.contains('\0') {
         return Err(errors::from_value(EINVAL));
     }
-    let path = std::path::Path::new(path);
+    let path = os_path(path);
+    let path = &*path;
     let (handle, mount_id) = if dirfd == AT_FDCWD {
         ::name_to_handle_at::name_to_handle_at(&rustix::fs::CWD, path, flags)
     } else {
@@ -674,7 +680,7 @@ pub fn name_to_handle_at(dirfd: i32, path: &str, flags: i32) -> Result<(FileHand
 /// `f_type` or `f_spare`, so `type_` and `spare` stay zero; fswatch reads
 /// only `fsid`.
 pub fn statfs(path: &str, buf: &mut Statfs_t) -> Result<(), GoError> {
-    let st = rustix::fs::statvfs(path).map_err(errno_error)?;
+    let st = rustix::fs::statvfs(&*os_path(path)).map_err(errno_error)?;
     *buf = Statfs_t {
         type_: 0,
         bsize: st.f_bsize as i64,

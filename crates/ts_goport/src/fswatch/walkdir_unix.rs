@@ -11,8 +11,11 @@
 
 use crate::fswatch::prelude::*;
 
+use crate::frontend::vfs::osvfs::go_string_from_os;
 use crate::fswatch::unix;
 use crate::gostd::errors;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 
 // Go: walkdir_unix.go:14 walkState
 /// walkState carries state shared across the whole walk so we only
@@ -160,8 +163,10 @@ pub fn read_dir_entries(fd: i32, buf: &mut [u8]) -> Result<Vec<UnixDirent>, GoEr
             if let Some(i) = name_bytes.iter().position(|&b| b == 0) {
                 name_bytes = &name_bytes[..i];
             }
-            // PORT: Go names are bytes; a non-UTF-8 name is converted lossily.
-            let name = String::from_utf8_lossy(name_bytes).into_owned();
+            // PORT: Go names are bytes. The port form keeps the bytes of a
+            // non-UTF-8 name (`go_string_from_os`), and the `unix` shim
+            // passes them back to the OS.
+            let name = go_string_from_os(OsStr::from_bytes(name_bytes));
             if name != "." && name != ".." {
                 entries.push(UnixDirent {
                     name,
@@ -182,4 +187,41 @@ pub fn reclen_of(d: &unix::Dirent) -> u16 {
 // Go: walkdir_dirent_linux.go:8 inoOf
 pub fn ino_of(d: &unix::Dirent) -> u64 {
     d.ino
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    // PORT: not in Go. A directory name that is not UTF-8 keeps its bytes:
+    // the walk opens it and gives its entries, and each path names the file
+    // on disk.
+    #[test]
+    fn walk_dir_keeps_non_utf8_names() {
+        let dir = std::env::temp_dir().join(format!("ts_goport_walkdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bad = dir.join(std::ffi::OsString::from_vec(b"d\xfe".to_vec()));
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("q.ts"), "").unwrap();
+        let root = go_string_from_os(dir.clone().into_os_string());
+        let mut seen: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        let result = walk_dir(
+            &root,
+            true,
+            Some(&mut |path: &str, is_dir: bool| -> Result<(), GoError> {
+                seen.push((
+                    crate::frontend::vfs::osvfs::os_path(path).into_owned(),
+                    is_dir,
+                ));
+                Ok(())
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_ok());
+        assert_eq!(
+            seen,
+            vec![(dir, true), (bad.clone(), true), (bad.join("q.ts"), false)]
+        );
+    }
 }
