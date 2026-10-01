@@ -462,7 +462,7 @@ fn send_code(worker: Worker, code: i32) {
     let pipe = format!("/proc/{}/fd/{}", worker.launcher.as_raw_pid(), worker.fd);
     if let Ok(mut pipe) = std::fs::File::options()
         .write(true)
-        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed())
         .open(pipe)
         && rustix::fs::fstat(&pipe).is_ok_and(|stat| {
             rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Fifo
