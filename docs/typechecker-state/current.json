@@ -787,12 +787,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "a0d21b0ce683591a7",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "ab8d6a56c8f6adf2f",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R152 pipeline (candidate.sh side)."
