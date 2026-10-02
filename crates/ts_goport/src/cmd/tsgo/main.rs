@@ -1,4 +1,4 @@
-//! Go `cmd/tsgo/main.go`, and the parts of the Go standard library that
+//! Go `cmd/tsc/main.go`, and the parts of the Go standard library that
 //! package main needs and the crate does not have yet: `flag` (bool, int
 //! and string flags, `Parse`, the default usage text) and
 //! `signal.NotifyContext`.
@@ -15,11 +15,11 @@ use signal_hook::iterator::Signals;
 use std::cell::Cell;
 use std::sync::{Arc, LazyLock};
 
-// Go: cmd/tsgo/main.go:14 main
+// Go: cmd/tsc/main.go:14 main
 // PORT: `bin/goport.rs` `main` calls `run_main` before its own compile
 // path and exits with the status it returns.
 
-// Go: cmd/tsgo/main.go:18 runMain
+// Go: cmd/tsc/main.go:18 runMain
 // PORT: `args` is Go `osutil.Args()[1:]`. `None` means Go continues with
 // `execute.CommandLine`; goport continues with its own compile path, which
 // replaces it. Go `core.ApplyDebugStackLimit()` (the TS_GO_DEBUG_STACK_LIMIT

@@ -1,4 +1,4 @@
-//! Go `cmd/tsgo/lsp.go`.
+//! Go `cmd/tsc/lsp.go`.
 
 use crate::cmd::tsgo::prelude::*;
 
@@ -17,7 +17,7 @@ use crate::gostd::errors;
 use std::io::Write;
 use std::time::Duration;
 
-// Go: cmd/tsgo/lsp.go:20 runLSP
+// Go: cmd/tsc/lsp.go:20 runLSP
 pub fn run_lsp(args: &[String]) -> i32 {
     let mut flag = new_flag_set("lsp", ErrorHandling::ContinueOnError);
     let stdio = flag.bool("stdio", false, "use stdio for communication");
@@ -105,7 +105,7 @@ pub fn run_lsp(args: &[String]) -> i32 {
                 Err(err) => (Vec::new(), Some(errors::new(err.to_string()))),
             }
         })),
-        // Go: Spawn: spawnProcess (tsgo#4712; Go cmd/tsgo/sys.go spawnProcess is
+        // Go: Spawn: spawnProcess (tsgo#4712; Go cmd/tsc/sys.go spawnProcess is
         // ported in `execute::tsc::compile`).
         spawn: Some(Rc::new(spawn_process)),
         progress_delay: Duration::from_millis(250),
@@ -122,7 +122,7 @@ pub fn run_lsp(args: &[String]) -> i32 {
     0
 }
 
-// Go: cmd/tsgo/lsp.go:79 newParentProcessWatchdog
+// Go: cmd/tsc/lsp.go:79 newParentProcessWatchdog
 // newParentProcessWatchdog returns a SetParentProcessID callback if the platform
 // supports process-alive checking and no client process ID override was provided,
 // or nil otherwise.
@@ -147,7 +147,7 @@ pub fn new_parent_process_watchdog(
     }))
 }
 
-// Go: cmd/tsgo/lsp.go:95 startParentProcessWatchdog
+// Go: cmd/tsc/lsp.go:95 startParentProcessWatchdog
 // startParentProcessWatchdog starts a goroutine that monitors the parent process
 // and cancels the context if the parent dies. This prevents orphaned language
 // server processes when the editor crashes or is killed.

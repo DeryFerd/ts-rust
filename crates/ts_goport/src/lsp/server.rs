@@ -87,7 +87,7 @@
 //! checks it at each top-level statement and deferred node, like Go.
 //!
 //! When the `run` context ends (Go `signal.NotifyContext` in
-//! `cmd/tsgo/lsp.go`), every loop returns `context canceled`, as in Go. A
+//! `cmd/tsc/lsp.go`), every loop returns `context canceled`, as in Go. A
 //! request on the dispatch thread first runs to its next cancel check. Its
 //! answer is not written, because `send` uses the ended group context.
 

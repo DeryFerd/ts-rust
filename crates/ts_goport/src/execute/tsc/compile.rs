@@ -1,5 +1,5 @@
 //! Go: execute/tsc/compile.go (the `tsc` system interface, exit status and
-//! compile result types), plus the `osSys` system of cmd/tsgo/sys.go.
+//! compile result types), plus the `osSys` system of cmd/tsc/sys.go.
 //!
 //! PORT: Go `io.Writer` is `Writer` (a shared `std::io::Write`). The
 //! frontend file system is `Rc`, so the system and the writers are `Rc`
@@ -311,7 +311,7 @@ pub struct CompileAndEmitResult {
     pub(crate) times: Rc<RefCell<CompileTimes>>,
 }
 
-// Go: cmd/tsgo/sys.go:19 osSys
+// Go: cmd/tsc/sys.go:19 osSys
 // PORT: added here so the library and the bins share one system.
 pub struct OsSystem {
     writer: Writer,
@@ -321,7 +321,7 @@ pub struct OsSystem {
     start: std::time::Instant,
 }
 
-// Go: cmd/tsgo/sys.go:124 newSystem
+// Go: cmd/tsc/sys.go:124 newSystem
 // PORT: Go exits with `ExitStatusInvalidProject_OutputsSkipped` when the
 // current directory cannot be read; this returns that status instead.
 pub fn new_os_system() -> Result<OsSystem, ExitStatus> {
@@ -362,32 +362,32 @@ impl OsSystem {
 }
 
 impl System for OsSystem {
-    // Go: cmd/tsgo/sys.go:47 Writer
+    // Go: cmd/tsc/sys.go:47 Writer
     fn writer(&self) -> Writer {
         self.writer.clone()
     }
-    // Go: cmd/tsgo/sys.go:51 ErrorWriter (tsgo#4712)
+    // Go: cmd/tsc/sys.go:51 ErrorWriter (tsgo#4712)
     fn error_writer(&self) -> ErrorWriter {
         Arc::new(Mutex::new(GoErrorOutput))
     }
-    // Go: cmd/tsgo/sys.go:35 FS
+    // Go: cmd/tsc/sys.go:35 FS
     fn fs(&self) -> Rc<dyn Fs> {
         self.fs.clone()
     }
-    // Go: cmd/tsgo/sys.go:39 DefaultLibraryPath
+    // Go: cmd/tsc/sys.go:39 DefaultLibraryPath
     fn default_library_path(&self) -> String {
         self.default_library_path.clone()
     }
-    // Go: cmd/tsgo/sys.go:43 GetCurrentDirectory
+    // Go: cmd/tsc/sys.go:43 GetCurrentDirectory
     fn get_current_directory(&self) -> String {
         self.cwd.clone()
     }
-    // Go: cmd/tsgo/sys.go:55 WriteOutputIsTTY
+    // Go: cmd/tsc/sys.go:55 WriteOutputIsTTY
     fn write_output_is_tty(&self) -> bool {
         use std::io::IsTerminal;
         std::io::stdout().is_terminal()
     }
-    // Go: cmd/tsgo/sys.go:59 GetWidthOfTerminal
+    // Go: cmd/tsc/sys.go:59 GetWidthOfTerminal
     // Go `term.GetSize(int(os.Stdout.Fd()))` is the TIOCGWINSZ ioctl on
     // stdout, and gives width 0 on error (golang.org/x/term v0.44.0
     // term_unix.go:59 getSize).
@@ -415,7 +415,7 @@ impl System for OsSystem {
             None => (String::new(), false),
         }
     }
-    // Go: cmd/tsgo/sys.go:68 Spawn (tsgo#4712)
+    // Go: cmd/tsc/sys.go:68 Spawn (tsgo#4712)
     fn spawn(
         &self,
         command: &[String],
@@ -424,11 +424,11 @@ impl System for OsSystem {
     ) -> Result<Arc<dyn ProcessExitState>, GoError> {
         spawn_process(command, dir, stderr)
     }
-    // Go: cmd/tsgo/sys.go:31 Now
+    // Go: cmd/tsc/sys.go:31 Now
     fn now(&self) -> SystemTime {
         SystemTime::now()
     }
-    // Go: cmd/tsgo/sys.go:27 SinceStart
+    // Go: cmd/tsc/sys.go:27 SinceStart
     fn since_start(&self) -> Duration {
         self.start.elapsed()
     }
@@ -438,7 +438,7 @@ impl System for OsSystem {
 /// waits for the stderr copy after the process exits.
 const CHILD_PROCESS_WAIT_DELAY: Duration = Duration::from_secs(1);
 
-// Go: cmd/tsgo/sys.go:74 spawnProcess (tsgo#4712)
+// Go: cmd/tsc/sys.go:74 spawnProcess (tsgo#4712)
 // spawnProcess launches a process and adapts its stdio to an io.ReadWriteCloser (Read is its stdout,
 // Write is its stdin).
 // PORT: Go `exec.Command` looks a name without a slash up in PATH
@@ -537,7 +537,7 @@ pub fn spawn_process(
     }))
 }
 
-// Go: cmd/tsgo/sys.go:95 childProcess (tsgo#4712)
+// Go: cmd/tsc/sys.go:95 childProcess (tsgo#4712)
 // childProcess adapts a spawned process's stdout (read) and stdin (write) into one io.ReadWriteCloser.
 // Close kills and reaps the process.
 // PORT: Go `cmd.ProcessState` after `Wait` is `exit_code` (the Go
@@ -560,12 +560,12 @@ struct ChildStderr {
 
 #[cfg(unix)]
 impl crate::ipc::ReadWriteCloser for ChildProcess {
-    // Go: cmd/tsgo/sys.go:101 childProcess.Read
+    // Go: cmd/tsc/sys.go:101 childProcess.Read
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         std::io::Read::read(&mut &self.stdout, buf)
     }
 
-    // Go: cmd/tsgo/sys.go:102 childProcess.Write
+    // Go: cmd/tsc/sys.go:102 childProcess.Write
     fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         std::io::Write::write(&mut &self.stdin, buf)
     }
@@ -574,7 +574,7 @@ impl crate::ipc::ReadWriteCloser for ChildProcess {
         std::io::Write::flush(&mut &self.stdin)
     }
 
-    // Go: cmd/tsgo/sys.go:111 childProcess.Close
+    // Go: cmd/tsc/sys.go:111 childProcess.Close
     // PORT: Go `Wait` closes the stdout pipe after the process exits, and
     // waits up to `WaitDelay` for the stderr copy; then it closes that pipe
     // and returns `ErrWaitDelay`, which Close ignores. An `ExitError` is
@@ -620,7 +620,7 @@ impl crate::ipc::ReadWriteCloser for ChildProcess {
 }
 
 impl ProcessExitState for ChildProcess {
-    // Go: cmd/tsgo/sys.go:104 childProcess.ExitCode
+    // Go: cmd/tsc/sys.go:104 childProcess.ExitCode
     fn exit_code(&self) -> (i32, bool) {
         match *self
             .exit_code
@@ -749,7 +749,7 @@ fn go_path_clean(path: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-// Go: cmd/tsgo/sys.go:74 spawnProcess (tsgo#4712), on Windows
+// Go: cmd/tsc/sys.go:74 spawnProcess (tsgo#4712), on Windows
 // spawnProcess launches a process and adapts its stdio to an io.ReadWriteCloser (Read is its stdout,
 // Write is its stdin).
 // PORT: Go `exec.Command` and `Start` find the program with
@@ -856,7 +856,7 @@ pub fn spawn_process(
     }))
 }
 
-// Go: cmd/tsgo/sys.go:95 childProcess (tsgo#4712), on Windows
+// Go: cmd/tsc/sys.go:95 childProcess (tsgo#4712), on Windows
 // PORT: `stdin` is `None` after `Close`; a write that runs meanwhile keeps
 // its own reference, so `Close` never waits for it. `stderr_done` is the
 // end signal of the stderr copy.
@@ -871,12 +871,12 @@ struct ChildProcess {
 
 #[cfg(windows)]
 impl crate::ipc::ReadWriteCloser for ChildProcess {
-    // Go: cmd/tsgo/sys.go:101 childProcess.Read
+    // Go: cmd/tsc/sys.go:101 childProcess.Read
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         std::io::Read::read(&mut &self.stdout, buf)
     }
 
-    // Go: cmd/tsgo/sys.go:102 childProcess.Write
+    // Go: cmd/tsc/sys.go:102 childProcess.Write
     fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         let stdin = self
             .stdin
@@ -893,7 +893,7 @@ impl crate::ipc::ReadWriteCloser for ChildProcess {
         Ok(())
     }
 
-    // Go: cmd/tsgo/sys.go:111 childProcess.Close
+    // Go: cmd/tsc/sys.go:111 childProcess.Close
     // PORT: as on Unix (see there). Go's `Process.Kill` is TerminateProcess
     // with exit code 1, and so is std's `kill`.
     fn close(&self) -> Result<(), GoError> {

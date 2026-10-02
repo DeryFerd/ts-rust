@@ -1,13 +1,13 @@
-//! Go `cmd/tsgo/isprocessalive_unix.go` (`//go:build unix`; the module is
+//! Go `cmd/tsc/isprocessalive_unix.go` (`//go:build unix`; the module is
 //! declared under `#[cfg(unix)]`).
 
 use rustix::io::Errno;
 use rustix::process::{Pid, test_kill_process};
 
-// Go: cmd/tsgo/isprocessalive_unix.go:11 processAliveSupported
+// Go: cmd/tsc/isprocessalive_unix.go:11 processAliveSupported
 pub const PROCESS_ALIVE_SUPPORTED: bool = true;
 
-// Go: cmd/tsgo/isprocessalive_unix.go:18 isProcessAlive
+// Go: cmd/tsc/isprocessalive_unix.go:18 isProcessAlive
 // isProcessAlive checks if a process with the given PID is still running.
 // On Unix, FindProcess always succeeds, so we send signal 0 to probe the
 // process. If the signal returns nil or EPERM, the process exists (EPERM

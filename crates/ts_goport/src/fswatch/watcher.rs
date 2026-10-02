@@ -1175,10 +1175,10 @@ impl WatcherBase {
         }
     }
 
-    // Go: watcher.go:436 watcherBase.shutdown
+    // Go: watcher.go:678 watcherBase.shutdown
     pub fn shutdown(&self) {}
 
-    // Go: watcher.go:438 watcherBase.run
+    // Go: watcher.go:680 watcherBase.run
     // PORT: the goroutine is a `std::thread`; Go's `recover()` is
     // `catch_unwind`, so an `unported!` panic in `start` becomes the start
     // error, as a Go panic does. The thread gets the Go stack size: an

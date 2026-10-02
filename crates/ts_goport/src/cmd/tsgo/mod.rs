@@ -1,4 +1,4 @@
-//! Go package `cmd/tsgo` (package main).
+//! Go package `cmd/tsc` (package main; `cmd/tsgo` before pin N).
 
 pub mod api;
 #[cfg(not(unix))]

@@ -74,7 +74,7 @@ fn main() {
     // #4734: Go `osutil.Args()[1:]`.
     let args: Vec<String> = ts_goport::frontend::osutil::args()[1..].to_vec();
     install_panic_hook();
-    // Go: cmd/tsgo/main.go runMain sends `--lsp` and `--api` to their own
+    // Go: cmd/tsc/main.go runMain sends `--lsp` and `--api` to their own
     // entry points; everything else continues below. Nothing may write to
     // stdout before this point (stdout is the LSP channel). The panic hook
     // keeps recovered unported panics quiet. Exit: the Go status, or
@@ -270,7 +270,7 @@ fn guard<T: Default>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-// Go: cmd/tsgo/main.go runMain: `execute.CommandLine` with the process
+// Go: cmd/tsc/main.go runMain: `execute.CommandLine` with the process
 // system and arguments, then `os.Exit` with the status.
 // PORT: the report goes to a buffer that is written to stdout at the end,
 // also when a step panics. A panic ends the run; the steps inside

@@ -195,7 +195,7 @@ fn guard<T: Default>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-// Go: cmd/tsgo/main.go runMain: `execute.CommandLine` with the process
+// Go: cmd/tsc/main.go runMain: `execute.CommandLine` with the process
 // system and arguments, then `os.Exit` with the status.
 // PORT: the report goes to a buffer that is written to stdout at the end,
 // also when a step panics. A panic ends the run; the steps inside

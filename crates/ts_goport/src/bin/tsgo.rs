@@ -1,6 +1,6 @@
-//! `tsgo`: the Go port of cmd/tsgo.
+//! `tsgo`: the Go port of cmd/tsc.
 //!
-//! Go: cmd/tsgo/main.go `runMain`. Every command line other than `--lsp`
+//! Go: cmd/tsc/main.go `runMain`. Every command line other than `--lsp`
 //! and `--api` goes to `execute_tsc::command_line` (Go
 //! `execute.CommandLine`), which parses all arguments.
 //!
@@ -12,7 +12,7 @@
 //! `panic: <message>` on stderr and exit 2.
 //!
 //! `--lsp` and `--api` run `cmd::tsgo::lsp::run_lsp` and
-//! `cmd::tsgo::api::run_api` (Go cmd/tsgo/lsp.go and api.go), the entry
+//! `cmd::tsgo::api::run_api` (Go cmd/tsc/lsp.go and api.go), the entry
 //! points that `goport --lsp` and `goport --api` run too.
 //!
 //! Go `signal.NotifyContext(ctx, SIGINT, SIGTERM)` is
@@ -28,7 +28,7 @@
 //! debug setting and is skipped. The work runs on a thread with the stack
 //! size of `gostd::stack::max_stack_size` (1 GiB with no address space or
 //! data limit), like the other goport bins.
-//! PORT: Go `osSys` and `newSystem` (cmd/tsgo/sys.go) are ported as
+//! PORT: Go `osSys` and `newSystem` (cmd/tsc/sys.go) are ported as
 //! `OsSystem` and `new_os_system` in execute/tsc/compile.rs.
 //! PORT: `enablevtprocessing_windows.go` (the Windows console) is not
 //! ported.
@@ -77,7 +77,7 @@ struct Worker {
     launcher: rustix::process::Pid,
 }
 
-// Go: cmd/tsgo/main.go:14 main
+// Go: cmd/tsc/main.go:14 main
 fn main() {
     // First: it must run before the first heap allocation.
     let huge_pages = ts_goport::thp_guard::thp_guard();
@@ -451,7 +451,7 @@ fn send_code(worker: Worker, code: i32) {
     }
 }
 
-// Go: cmd/tsgo/main.go:18 runMain
+// Go: cmd/tsc/main.go:18 runMain
 // PORT: the arguments are the port form of the Go `osutil.Args()` bytes (see
 // `scanner_util::GO_STRING_MARKER`). The system writer writes the Go bytes
 // of the output (`GoOutput`).

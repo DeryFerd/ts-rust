@@ -185,7 +185,7 @@ pub fn thp_guard() -> bool {
 
 /// Whether this process lives on after its first build, so `thp_guard`
 /// starts no watcher and `bin/tsgo.rs` `launch` starts no worker: `--lsp` or
-/// `--api` as the first argument (Go cmd/tsgo `runMain`), or a watch option
+/// `--api` as the first argument (Go cmd/tsc `runMain`), or a watch option
 /// anywhere (`--watch` or `-w`; Go `getInputOptionName`: one or two leading
 /// '-', any case). It reads the process arguments, so it allocates.
 pub fn long_running() -> bool {
