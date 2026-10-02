@@ -963,12 +963,7 @@ pub fn get_is_deferred_context(location: Node, kind: SyntaxKind, last_location: 
             ) || kind == SyntaxKind::PropertyDeclaration && !is_static(location))
                 && (last_location.is_nil() || last_location != location.name());
     }
-    // PERF: chkA. An arrow function has no name (`name()` is nil), so only a
-    // function expression reads it.
-    if kind == SyntaxKind::FunctionExpression
-        && last_location.is_some()
-        && last_location == location.name()
-    {
+    if last_location.is_some() && last_location == location.name() {
         return false;
     }
     // generator functions and async functions are not inlined in control flow when immediately invoked
