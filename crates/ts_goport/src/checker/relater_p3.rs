@@ -1298,12 +1298,15 @@ impl Relater {
 
 impl Checker {
     // Go: checker/relater.go:2566 getRelater
+    // PORT: perf. The pool head and `next` are moved out, not cloned. Go
+    // leaves `r.next` set while `r` is in use; nothing reads it then, and
+    // `putRelater` sets it again.
     pub fn get_relater(&mut self) -> Rc<RefCell<Relater>> {
-        let r = match self.free_relater.clone() {
+        let r = match self.free_relater.take() {
             Some(r) => r,
             None => Rc::new(RefCell::new(Relater::default())),
         };
-        self.free_relater = r.borrow().next.clone();
+        self.free_relater = r.borrow_mut().next.take();
         r
     }
 
