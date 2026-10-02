@@ -797,12 +797,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "a59f313bc2ac59a59",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "a3c38e8119d9c2b56",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R154 pipeline (candidate.sh side)."
