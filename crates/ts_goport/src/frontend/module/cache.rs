@@ -549,8 +549,14 @@ pub struct SharedResolution<T> {
 // file system, which tracks the calls itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AheadCall {
-    /// `file_exists` of a name whose path is `path`.
-    FileExists { path: Path, exists: bool },
+    /// `file_exists` of a name whose path is `path`. `known`: the worker
+    /// took the answer from the files that the workers found in earlier
+    /// loads, not from the OS, so the loader checks it itself.
+    FileExists {
+        path: Path,
+        exists: bool,
+        known: bool,
+    },
     /// A `directory_exists` that gave false.
     MissingDirectory { path: Path },
     /// `read_file`: the xxh3 hash of the text, `None` when the file could
@@ -688,6 +694,7 @@ fn log_ahead_package_json(entry: &InfoCacheEntry) {
         calls.push(AheadCall::FileExists {
             path: to_path(&file_name),
             exists: entry.exists(),
+            known: false,
         });
         if entry.exists() {
             match reads.get(&file_name) {
@@ -811,6 +818,14 @@ impl SharedResolutionCache {
     #[must_use]
     pub fn get_module(&self, key: &dyn ModuleKey) -> Option<SharedResolution<Arc<ResolvedModule>>> {
         lock_shared(&self.modules).get(key).cloned()
+    }
+
+    /// Calls `f` with each module answer.
+    // PORT: not in Go (resolve ahead, compiler/resolve_ahead.rs).
+    pub fn for_each_module(&self, mut f: impl FnMut(&SharedResolution<Arc<ResolvedModule>>)) {
+        for value in lock_shared(&self.modules).values() {
+            f(value);
+        }
     }
 
     /// Go `moduleResolutionCache.Set` (`LoadOrStore`: the first value wins).

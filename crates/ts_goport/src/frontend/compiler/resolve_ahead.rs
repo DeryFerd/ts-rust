@@ -179,9 +179,15 @@ impl ResolveAhead {
             .filter(|keys| !keys.is_empty())
             .and_then(|keys| {
                 let workers = Workers::get()?;
+                let fresh = workers.fresh.swap(false, Ordering::Relaxed);
                 workers.post(Job {
                     queue: Arc::new(AheadQueue::new(keys)),
-                    fresh_package_jsons: workers.fresh_package_jsons.swap(false, Ordering::Relaxed),
+                    fresh_package_jsons: fresh,
+                    known_files: if fresh {
+                        Arc::default()
+                    } else {
+                        workers.known_files()
+                    },
                     closed: AtomicBool::new(false),
                     left: AtomicUsize::new(0),
                     answers: Arc::new(SharedResolutionCache::default()),
@@ -231,11 +237,15 @@ impl ResolveAhead {
     pub fn finish(mut self, resolver: &DefaultResolver) {
         let link = resolver.caches.ahead.borrow_mut().take();
         let Some(mut link) = link else {
-            self.end_job(None);
+            self.end_job(None, true);
             return;
         };
         // The workers free the answers and the queue with the job.
-        self.end_job(Some(Box::new((link.answers.take(), link.queue.take()))));
+        let rejected = link.stats.get().rejected > 0;
+        self.end_job(
+            Some(Box::new((link.answers.take(), link.queue.take()))),
+            rejected,
+        );
         let Some(keep_keys) = self.keep_keys.take() else {
             return;
         };
@@ -245,12 +255,13 @@ impl ResolveAhead {
             new_keys: keys.len(),
             loader: link.stats.get(),
         };
-        // A rejected answer can come from a kept package.json parse whose
-        // file changed: the workers of the next load parse again.
+        // A rejected answer can come from a kept package.json parse or a
+        // known file that changed: the workers of the next load start with
+        // neither.
         if stats.loader.rejected > 0
             && let Some(workers) = Workers::get()
         {
-            workers.fresh_package_jsons.store(true, Ordering::Relaxed);
+            workers.fresh.store(true, Ordering::Relaxed);
         }
         LAST_STATS.with(|last| last.set(Some(stats)));
         print_stats(&stats);
@@ -258,14 +269,20 @@ impl ResolveAhead {
     }
 
     /// Stops the workers of this load and gives its job and `shared`, the
-    /// loader's links to it, to them to free.
-    fn end_job(&mut self, shared: Option<Box<dyn Send>>) {
+    /// loader's links to it, to them to free. Unless the loader `rejected`
+    /// an answer, the workers keep the files that the job's answers found
+    /// for the next job (`Workers::known_files`).
+    fn end_job(&mut self, shared: Option<Box<dyn Send>>, rejected: bool) {
         let Some(job) = self.job.take() else {
             return;
         };
         if let Some(workers) = Workers::get() {
             workers.end(&job);
-            workers.free(Box::new((job, shared)));
+            workers.free(EndedJob {
+                job,
+                shared,
+                keep_known_files: !rejected,
+            });
         }
     }
 }
@@ -273,7 +290,7 @@ impl ResolveAhead {
 impl Drop for ResolveAhead {
     /// A load that ends with a panic stops its workers too.
     fn drop(&mut self) {
-        self.end_job(None);
+        self.end_job(None, true);
     }
 }
 
@@ -324,9 +341,13 @@ struct Workers {
     left: Condvar,
     /// The workers that started.
     count: AtomicUsize,
-    /// The next job drops the package.json parses that the workers keep
-    /// (`KeptPackageJsons`).
-    fresh_package_jsons: AtomicBool,
+    /// The next job drops what the workers keep: the package.json parses
+    /// (`KeptPackageJsons`) and the known files.
+    fresh: AtomicBool,
+    /// The files that the answers of the last ended job found
+    /// (`EndedJob::free`): a worker answers `file_exists` for them with no
+    /// OS call, and the loader checks those answers (`AheadCall::FileExists`).
+    known_files: Mutex<Arc<FxHashSet<Path>>>,
 }
 
 #[derive(Default)]
@@ -335,14 +356,57 @@ struct WorkerState {
     job: Option<Arc<Job>>,
     /// Counts the posted jobs, so that a worker runs each job once.
     generation: u64,
-    /// The data of ended loads, for the workers to free.
-    garbage: Vec<Box<dyn Send>>,
+    /// The jobs of ended loads, for the workers to free.
+    ended: Vec<EndedJob>,
 }
 
 /// What a worker does next.
 enum Task {
     Run(Arc<Job>),
-    Free(Box<dyn Send>),
+    Free(EndedJob),
+}
+
+/// The job of an ended load and the loader's links to it, which a worker
+/// frees (`Workers::free`).
+struct EndedJob {
+    job: Arc<Job>,
+    shared: Option<Box<dyn Send>>,
+    /// Keep the files that the job's answers found
+    /// (`Workers::known_files`).
+    keep_known_files: bool,
+}
+
+impl EndedJob {
+    /// Frees the job on this worker, after it keeps the files that the
+    /// job's answers found: the known files of the next job.
+    fn free(self, workers: &Workers) {
+        let EndedJob {
+            job,
+            shared,
+            keep_known_files,
+        } = self;
+        drop(shared);
+        if keep_known_files {
+            let mut found = FxHashSet::default();
+            job.answers.for_each_module(|answer| {
+                for call in answer.ahead.iter().flat_map(|calls| calls.iter()) {
+                    if let AheadCall::FileExists {
+                        path, exists: true, ..
+                    } = call
+                        && !job.view.open_files.contains(path)
+                        && !found.contains(path)
+                    {
+                        found.insert(path.clone());
+                    }
+                }
+            });
+            *workers
+                .known_files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(found);
+        }
+        drop(job);
+    }
 }
 
 fn lock_state(workers: &Workers) -> std::sync::MutexGuard<'_, WorkerState> {
@@ -367,7 +431,8 @@ impl Workers {
                 wake: Condvar::new(),
                 left: Condvar::new(),
                 count: AtomicUsize::new(0),
-                fresh_package_jsons: AtomicBool::new(false),
+                fresh: AtomicBool::new(false),
+                known_files: Mutex::default(),
             }));
             for _ in 0..count {
                 // A worker that cannot start only makes fewer answers.
@@ -412,10 +477,18 @@ impl Workers {
         }
     }
 
-    /// Gives `garbage` to a worker to free.
-    fn free(&self, garbage: Box<dyn Send>) {
-        lock_state(self).garbage.push(garbage);
+    /// Gives `ended` to a worker to free.
+    fn free(&self, ended: EndedJob) {
+        lock_state(self).ended.push(ended);
         self.wake.notify_one();
+    }
+
+    /// The files that the answers of the last ended job found.
+    fn known_files(&self) -> Arc<FxHashSet<Path>> {
+        self.known_files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Waits until every worker has left `job` (`Mode::Force`).
@@ -445,8 +518,8 @@ fn run_worker(workers: &'static Workers) {
                     ran = state.generation;
                     break Task::Run(job.clone());
                 }
-                if let Some(garbage) = state.garbage.pop() {
-                    break Task::Free(garbage);
+                if let Some(ended) = state.ended.pop() {
+                    break Task::Free(ended);
                 }
                 state = workers
                     .wake
@@ -455,7 +528,7 @@ fn run_worker(workers: &'static Workers) {
             }
         };
         match task {
-            Task::Free(garbage) => drop(garbage),
+            Task::Free(ended) => ended.free(workers),
             Task::Run(job) => {
                 run_job(&job);
                 job.left.fetch_add(1, Ordering::Release);
@@ -473,6 +546,8 @@ struct Job {
     queue: Arc<AheadQueue>,
     /// The workers drop the package.json parses that they keep.
     fresh_package_jsons: bool,
+    /// The files that earlier jobs found (`Workers::known_files`).
+    known_files: Arc<FxHashSet<Path>>,
     closed: AtomicBool,
     /// The workers that left this job.
     left: AtomicUsize,
@@ -548,7 +623,7 @@ thread_local! {
 /// each logged read by the hash of its text on the snapshot file system,
 /// so it never takes an answer from a parse whose file changed: it
 /// rejects the answer, and the next job starts with no kept parse
-/// (`Workers::fresh_package_jsons`). Only parses of files that the worker
+/// (`Workers::fresh`). Only parses of files that the worker
 /// read are kept: a directory or package.json that was missing can be
 /// there now, and the loader does not check that.
 // PORT: not in Go (perf).
@@ -634,18 +709,28 @@ impl Fs for AheadFs {
     }
 
     // Go: project/overlayfs.go:276 overlayFS.FileExists
+    // PORT: a file that earlier jobs found is known to exist with no OS
+    // call; the loader checks that answer (`AheadCall::FileExists`).
     fn file_exists(&self, path: &str) -> bool {
         let canonical = self.path(path);
         let view = &self.job.view;
-        let exists = view.open_files.contains(&canonical)
-            || !view.open_directories.contains(&canonical)
-                && self
-                    .job
-                    .stats
-                    .file_exists(path, || self.os.file_exists(path));
+        let (exists, known) = if view.open_files.contains(&canonical) {
+            (true, false)
+        } else if view.open_directories.contains(&canonical) {
+            (false, false)
+        } else if self.job.known_files.contains(&canonical) {
+            (true, true)
+        } else {
+            let exists = self
+                .job
+                .stats
+                .file_exists(path, || self.os.file_exists(path));
+            (exists, false)
+        };
         note_ahead_call(AheadCall::FileExists {
             path: canonical,
             exists,
+            known,
         });
         exists
     }

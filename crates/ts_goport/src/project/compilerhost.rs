@@ -437,7 +437,8 @@ impl compiler::CompilerHost for CompilerHost {
 ///   has one (`SnapshotFSBuilder::cached_file_state`). A cached file that
 ///   needs a reload fails the check: the loader's lookup would read it.
 ///   Else the layered file system decides, which the worker read the same
-///   way (open files over the OS).
+///   way (open files over the OS), unless the worker's answer is `known`
+///   (not read in this load): then the check asks the layered file system.
 /// - a read is the loader's own read (`SourceFS::get_file`: it tracks the
 ///   file, caches it and notes a `node_modules` realpath alias), made at
 ///   the moment the loader would make it, since every call before it gave
@@ -454,9 +455,18 @@ fn accept_ahead_answer(
 ) -> bool {
     for call in calls {
         match call {
-            AheadCall::FileExists { path, exists } => {
+            AheadCall::FileExists {
+                path,
+                exists,
+                known,
+            } => {
                 let same = match files.cached_file_state(path) {
-                    CachedFileState::Absent => true,
+                    // The worker asked the OS through the open files, as the
+                    // layered file system does; a known answer is checked
+                    // here (the same call as the loader's own lookup).
+                    CachedFileState::Absent => {
+                        !*known || vfs::Fs::file_exists(&*files.fs, path.as_str()) == *exists
+                    }
                     CachedFileState::Live => *exists,
                     CachedFileState::NoValue => !*exists,
                     CachedFileState::NeedsReload => false,
