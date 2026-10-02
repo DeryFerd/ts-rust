@@ -133,10 +133,9 @@ impl FlatKey for CacheHashKey {
 // PORT: perf. Not in Go. Go keys every relation result by the xxh3 hash of
 // the key bytes. A plain key has only 12 bytes of content (Go writes `'s'`,
 // the source and target ids and the intersection state), so the port keeps
-// those bytes as the key: it needs no xxh3, compares exactly, and its map
-// entry takes 16 bytes, so no entry spans two cache lines. A generic key
-// (`'g'`, with type references) stays Go's xxh3 hash. Go's xxh3 keys collide
-// with a chance of about 2^-128; plain keys here never do.
+// those values as the key: it needs no xxh3 and compares exactly. A generic
+// key (`'g'`, with type references) stays Go's xxh3 hash. Go's xxh3 keys
+// collide with a chance of about 2^-128; plain keys here never do.
 /// Go `getRelationKey` result: the key of a `Relation` result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelationKey {
@@ -155,16 +154,41 @@ pub struct PlainRelationKey {
     pub intersection_state: u32,
 }
 
+/// Bits of the source and of the target id in a packed plain key.
+const PACKED_ID_BITS: u32 = 28;
+
+impl PlainRelationKey {
+    /// The key in 58 bits for `PlainResultTable`: the source and target ids
+    /// in 28 bits each and the intersection state in 2. `None` when a value
+    /// does not fit, or when the packed key is 0 (an empty slot).
+    #[inline]
+    fn packed(&self) -> Option<u64> {
+        if (self.source | self.target) >> PACKED_ID_BITS != 0 || self.intersection_state >> 2 != 0 {
+            return None;
+        }
+        let p = u64::from(self.source)
+            | u64::from(self.target) << PACKED_ID_BITS
+            | u64::from(self.intersection_state) << (2 * PACKED_ID_BITS);
+        (p != 0).then_some(p)
+    }
+}
+
 impl FlatKey for PlainRelationKey {
     // A 64x64 to 128-bit multiply folded to 64 bits puts every key bit into
     // the low bits that pick the slot.
     #[inline]
     fn flat_hash(&self) -> u64 {
         let ids = u64::from(self.source) | u64::from(self.target) << 32;
-        let p = u128::from(ids ^ 0x243f_6a88_85a3_08d3)
-            * u128::from(0x9e37_79b9_7f4a_7c15 ^ u64::from(self.intersection_state));
-        (p >> 64) as u64 ^ p as u64
+        fold_mul(ids, u64::from(self.intersection_state))
     }
+}
+
+/// A 64x64 to 128-bit multiply of `x` and a constant changed by `y`, folded
+/// to 64 bits, so every bit of `x` reaches the low bits.
+#[inline]
+fn fold_mul(x: u64, y: u64) -> u64 {
+    let p = u128::from(x ^ 0x243f_6a88_85a3_08d3) * u128::from(0x9e37_79b9_7f4a_7c15 ^ y);
+    (p >> 64) as u64 ^ p as u64
 }
 
 // Only for `RelationKeySet`: `CacheKeyHasher` takes one `u64` as the hash.
@@ -182,13 +206,118 @@ impl std::hash::Hash for RelationKey {
 pub type RelationKeySet =
     std::collections::HashSet<RelationKey, std::hash::BuildHasherDefault<CacheKeyHasher>>;
 
+/// Bits of the result in a `PlainResultTable` entry.
+const RESULT_BITS: u32 = 6;
+const _: () = assert!(
+    (RelationComparisonResult::SUCCEEDED.bits()
+        | RelationComparisonResult::FAILED.bits()
+        | RelationComparisonResult::REPORTS_MASK.bits()
+        | RelationComparisonResult::OVERFLOW.bits())
+        >> RESULT_BITS
+        == 0
+);
+
+// PORT: perf. Not in Go. The plain results of one relation, each in one
+// `u64`: the packed key (`PlainRelationKey::packed`) in the high 58 bits and
+// the result in the low 6 bits, so a cache line holds 8 results (a table of
+// 12-byte keys and 4-byte results holds 4). Open addressing with linear
+// probing, a power-of-two slot count and a load of at most 1/2; 0 is an
+// empty slot. There is no iteration, so the layout cannot change any output.
+#[derive(Clone, Debug, Default)]
+pub struct PlainResultTable {
+    /// Empty (no allocation) until the first insert; else a power of two.
+    slots: Box<[u64]>,
+    used: usize,
+}
+
+impl PlainResultTable {
+    #[inline]
+    fn home(packed: u64, mask: usize) -> usize {
+        fold_mul(packed, 0) as usize & mask
+    }
+
+    #[inline]
+    fn get(&self, packed: u64) -> RelationComparisonResult {
+        if self.slots.is_empty() {
+            return RelationComparisonResult::NONE;
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = Self::home(packed, mask);
+        loop {
+            let entry = self.slots[i];
+            if entry >> RESULT_BITS == packed {
+                return RelationComparisonResult((entry & ((1 << RESULT_BITS) - 1)) as u32);
+            }
+            if entry == 0 {
+                return RelationComparisonResult::NONE;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, packed: u64, result: RelationComparisonResult) {
+        debug_assert!(result.bits() >> RESULT_BITS == 0);
+        let entry = packed << RESULT_BITS | u64::from(result.bits());
+        if !self.slots.is_empty() {
+            let mask = self.slots.len() - 1;
+            let mut i = Self::home(packed, mask);
+            loop {
+                let old = self.slots[i];
+                if old >> RESULT_BITS == packed {
+                    self.slots[i] = entry;
+                    return;
+                }
+                if old == 0 {
+                    if self.used < self.slots.len() / 2 {
+                        self.slots[i] = entry;
+                        self.used += 1;
+                        return;
+                    }
+                    break;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        // The key is absent and the table is empty or full to its load.
+        self.grow();
+        self.insert_absent(entry);
+        self.used += 1;
+    }
+
+    /// Doubles the slot count and puts every entry back.
+    #[cold]
+    fn grow(&mut self) {
+        let len = (self.slots.len() * 2).max(16);
+        let old = std::mem::replace(&mut self.slots, vec![0; len].into_boxed_slice());
+        for &entry in &*old {
+            if entry != 0 {
+                self.insert_absent(entry);
+            }
+        }
+    }
+
+    /// Writes an entry whose key is not in `slots` into its first empty slot.
+    #[inline]
+    fn insert_absent(&mut self, entry: u64) {
+        let mask = self.slots.len() - 1;
+        let mut i = Self::home(entry >> RESULT_BITS, mask);
+        while self.slots[i] != 0 {
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = entry;
+    }
+}
+
 // Go: checker/relater.go:99 Relation
-// PORT: Go has one map of xxh3 keys. Plain and generic keys are in two maps
-// here (see `RelationKey`). There is no iteration, so this cannot change any
-// output.
+// PORT: Go has one map of xxh3 keys. Here plain keys are in `plain` (or in
+// `plain_wide` when they do not pack) and generic keys in `generic` (see
+// `RelationKey`). There is no iteration, so this cannot change any output.
 #[derive(Clone, Debug, Default)]
 pub struct Relation {
-    pub plain: FlatMap<PlainRelationKey, RelationComparisonResult>,
+    pub plain: PlainResultTable,
+    /// Plain keys with an id of 2^28 or more.
+    pub plain_wide: FlatMap<PlainRelationKey, RelationComparisonResult>,
     pub generic: FlatMap<CacheHashKey, RelationComparisonResult>,
 }
 
@@ -197,25 +326,33 @@ impl Relation {
     #[inline]
     pub fn get(&self, key: RelationKey) -> RelationComparisonResult {
         match key {
-            RelationKey::Plain(key) => self.plain.get(&key),
-            RelationKey::Generic(key) => self.generic.get(&key),
+            RelationKey::Plain(key) => match key.packed() {
+                Some(packed) => self.plain.get(packed),
+                None => self.plain_wide.get(&key).copied().unwrap_or_default(),
+            },
+            RelationKey::Generic(key) => self.generic.get(&key).copied().unwrap_or_default(),
         }
-        .copied()
-        .unwrap_or_default()
     }
 
     // Go: checker/relater.go:107 Relation.set
     #[inline]
     pub fn set(&mut self, key: RelationKey, result: RelationComparisonResult) {
         match key {
-            RelationKey::Plain(key) => self.plain.insert(key, result),
-            RelationKey::Generic(key) => self.generic.insert(key, result),
-        };
+            RelationKey::Plain(key) => match key.packed() {
+                Some(packed) => self.plain.insert(packed, result),
+                None => {
+                    self.plain_wide.insert(key, result);
+                }
+            },
+            RelationKey::Generic(key) => {
+                self.generic.insert(key, result);
+            }
+        }
     }
 
     // Go: checker/relater.go:114 Relation.size
     pub fn size(&self) -> i32 {
-        (self.plain.len() + self.generic.len()) as i32
+        (self.plain.used + self.plain_wide.len() + self.generic.len()) as i32
     }
 }
 
@@ -2107,4 +2244,57 @@ impl Checker {
 // Go: checker/relater.go:750 isHyphenatedJsxName
 pub fn is_hyphenated_jsx_name(name: &str) -> bool {
     name.contains('-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Relation` against a `HashMap`, with plain keys that pack, plain keys
+    /// that do not, and generic keys, so all three tables grow and overwrite.
+    #[test]
+    fn relation_matches_hash_map() {
+        let mut relation = Relation::default();
+        let mut want = std::collections::HashMap::new();
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let results = [
+            RelationComparisonResult::SUCCEEDED,
+            RelationComparisonResult::FAILED,
+            RelationComparisonResult::FAILED | RelationComparisonResult::COMPLEXITY_OVERFLOW,
+            RelationComparisonResult::SUCCEEDED | RelationComparisonResult::REPORTS_MASK,
+        ];
+        for n in 0..20_000u64 {
+            let v = next();
+            let key = match v % 8 {
+                0 => RelationKey::Generic(CacheHashKey {
+                    hi: v >> 8 & 0xff,
+                    lo: v >> 16 & 0x3ff,
+                }),
+                1 => RelationKey::Plain(PlainRelationKey {
+                    source: (1 << PACKED_ID_BITS) + (v >> 8 & 0x3f) as u32,
+                    target: (v >> 16 & 0x3f) as u32,
+                    intersection_state: 0,
+                }),
+                _ => RelationKey::Plain(PlainRelationKey {
+                    source: (v >> 8 & 0x3f) as u32,
+                    target: (v >> 16 & 0x3f) as u32 | if v % 16 == 2 { 0xfff_ffc0 } else { 0 },
+                    intersection_state: (v >> 24 & 3) as u32,
+                }),
+            };
+            if n % 3 == 0 {
+                let result = results[(v >> 32) as usize % results.len()];
+                relation.set(key, result);
+                want.insert(key, result);
+                assert_eq!(relation.size() as usize, want.len());
+            }
+            let got = relation.get(key);
+            assert_eq!(got, want.get(&key).copied().unwrap_or_default());
+        }
+    }
 }
