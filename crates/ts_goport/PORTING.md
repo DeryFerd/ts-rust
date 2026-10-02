@@ -579,7 +579,7 @@ process (bin/tsgo.rs `go_runtime_start`).
     killed Go tsgo stops at once. A process whose `arg0` names a live
     launcher that is not its parent runs as a plain tsgo.
   - The launcher and the worker read /proc/<pid> only when /proc is the
-    one of their PID namespace (`own_proc`, the NSpid line of
+    one of their PID namespace (`own_proc`, the `NSpid` line of
     /proc/self/status). With the /proc of another namespace (`bwrap
     --unshare-pid` without `--proc`, `unshare -pf` without `--mount-proc`)
     /proc/<pid> is another process or none. There a signal goes on at once

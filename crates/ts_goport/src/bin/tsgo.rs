@@ -345,10 +345,10 @@ fn has_ended(pid: rustix::process::Pid) -> bool {
 /// of another one (`bwrap --unshare-pid` without `--proc`, `unshare -pf`
 /// without `--mount-proc`), /proc/<pid> is another process or none: for
 /// the pid of a worker it can be a kernel thread whose parent has the pid
-/// of the launcher. The NSpid line of /proc/self/status has this process's
+/// of the launcher. The `NSpid` line of /proc/self/status has this process's
 /// pid in each PID namespace from the one of /proc down to its own, so it
 /// is the one pid that `getpid` gives only in its own /proc. A kernel
-/// without that line (before 4.1) has the Pid line, the pid in the
+/// without that line (before 4.1) has the `Pid` line, the pid in the
 /// namespace of /proc. False without /proc. The first call reads the file;
 /// the later calls use its result.
 #[cfg(target_os = "linux")]
