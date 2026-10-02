@@ -621,10 +621,11 @@ pub(super) fn is_common_js_module_exports(node: Node) -> bool {
 /// expression of a source file statement, see `is_common_js_module_exports`)
 /// and its ancestors. One bit per slot.
 // PERF: aliaswalk1. Go walks every node of the file. The port did the
-// same, and in an edited file each node data read is a scoped read: about
-// 0.18 ms on effect Option.ts (a frame-pointer build) against 0.055 ms in
-// Go. A scan of the kind column (no node data read) finds the nodes that
-// the walk can act on, and their parent chains give the paths to them.
+// same, and in an edited file each node data read is a scoped read: on an
+// effect Option.ts edit the walk took 133 us against 56 us in Go (stable
+// build, mini-743d, bpftrace). A scan of the kind column (no node data
+// read) finds the nodes that the walk can act on, and their parent chains
+// give the paths to them: 17 us.
 // The Go parser sets the parent of each child of a node when it finishes
 // the node (`overrideParentInImmediateChildren`, `set_parent_in_store_children`
 // here), so the parent chain of a node of the tree is the path of
@@ -650,9 +651,13 @@ impl AliasWalkPaths {
             file: store,
             bits: vec![0; slots.div_ceil(64)],
         };
-        // Slot 0 is nil. Every other slot of an alias-free store is a node.
+        // Slot 0 is nil. Every other slot of an alias-free store is a node,
+        // whose `Node::new` is the slot handle (`core::Node`).
+        // PERF: the handle with no `Node::new`, so a slot costs one store
+        // lookup (the kind read), not two.
+        let base = (store as u64) << 32;
         for index in 1..slots {
-            let node = Node::new(store, crate::astdata::NodeId::new(index as u32));
+            let node = Node(base | (index as u64 + 1));
             let acts = match node.kind() {
                 SyntaxKind::ExportAssignment | SyntaxKind::ExportSpecifier => true,
                 // The tests of `is_common_js_module_exports` before the one
