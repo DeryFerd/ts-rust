@@ -2438,7 +2438,7 @@ pub fn go_frontend_program() -> Option<Rc<crate::frontend::compiler::NewProgram>
 }
 
 // Go: compiler/program.go:1841 ExplainFiles
-pub fn explain_files(w: &mut String, locale: &crate::locale::Locale) {
+pub fn explain_files(w: &mut dyn std::io::Write, locale: &crate::locale::Locale) {
     go_frontend()
         .expect("explain files of an alias resolver program")
         .explain_files(w, locale);

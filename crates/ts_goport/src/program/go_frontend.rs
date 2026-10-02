@@ -201,8 +201,10 @@ pub(super) fn try_load_with(
     // version (`try_load_version`) does not trace, as Go tsc starts tracing
     // only here.
     if let Some(warning) = crate::tracing::start_tracing_if_needed(&opts.config, false) {
-        let _ =
-            crate::execute::tsc::write_go_output(&mut std::io::stdout().lock(), warning.as_bytes());
+        let _ = crate::execute::tsc::write_go_output(
+            &mut crate::execute::tsc::stdio::CliStdout,
+            warning.as_bytes(),
+        );
     }
     // Go: tsc.go:305 times `NewProgram`. PORT: the port's `NewProgram` is
     // `install_new_program`, which also builds the Go files, as the build
@@ -1045,7 +1047,7 @@ fn trace_from_sys() -> TraceFn {
         // PORT: `text` is in the port form (see
         // `scanner_util::GO_STRING_MARKER`); stdout gets its Go bytes.
         let _ = crate::execute::tsc::write_go_output(
-            &mut std::io::stdout().lock(),
+            &mut crate::execute::tsc::stdio::CliStdout,
             format!("{text}\n").as_bytes(),
         );
     })
