@@ -341,7 +341,8 @@ fn has_ended(pid: rustix::process::Pid) -> bool {
 /// the parent-death signal would kill the worker.
 /// `launch` calls it before it starts the worker and sends the worker's pid
 /// to the returned sender; a signal that comes first waits for it. When no
-/// worker starts, `launch` drops the sender and the thread ends.
+/// worker starts, `launch` drops the sender and the thread ends. Each
+/// signal also waits until the worker catches it (`wait_until_caught`).
 /// The thread starts as a Go runtime thread does (`GoThread`): when the OS
 /// refuses it, the launcher ends with Go's text and exit 2, before there is
 /// a worker. Go has no launcher, so its process gets every signal; a
@@ -362,11 +363,47 @@ fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
             };
             for signal in signals.forever() {
                 if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
+                    wait_until_caught(pid, signal);
                     let _ = rustix::process::kill_process(pid, signal);
                 }
             }
         });
     Some(send)
+}
+
+/// Waits until the worker `pid` catches `signal`, so a forwarded signal
+/// finds the handlers that the worker sets at its start
+/// (`go_runtime_start`, `notify_context`) and does not end it by the
+/// default action. A signal that came before them (soon after the start,
+/// or while the start of `forward_signals` was tried again) waits here: Go
+/// sets its handlers before `main`, and `runMain` calls `NotifyContext`
+/// before any work (cmd/tsc/main.go:29).
+/// The kernel lists the caught signals in /proc/<pid>/status (`SigCgt`, a
+/// hex mask with bit N-1 for signal N). The wait ends when the worker has
+/// ended, and at once when that file does not show a live child of this
+/// process (no /proc, or the /proc of another PID namespace): the signal
+/// then goes on at once.
+#[cfg(target_os = "linux")]
+fn wait_until_caught(pid: rustix::process::Pid, signal: rustix::process::Signal) {
+    let path = format!("/proc/{}/status", pid.as_raw_pid());
+    let launcher = rustix::process::getpid().as_raw_pid().to_string();
+    let bit = 1u64 << (signal.as_raw() - 1).unsigned_abs();
+    while let Ok(status) = std::fs::read_to_string(&path) {
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+        };
+        let child = field("PPid:") == Some(launcher.as_str());
+        let live = field("State:").is_some_and(|state| !state.starts_with(['Z', 'X']));
+        match field("SigCgt:").and_then(|mask| u64::from_str_radix(mask, 16).ok()) {
+            Some(caught) if child && live && caught & bit == 0 => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            _ => return,
+        }
+    }
 }
 
 /// Signals that the Go runtime catches and drops when no `signal.Notify`
