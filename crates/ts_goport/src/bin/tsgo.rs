@@ -181,8 +181,9 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
 /// their own), or the worker cannot start. The launcher sends SIGINT,
 /// SIGTERM and the signals that Go throws on to the worker
 /// (`forward_signals`), and drops the signals that Go drops. When a signal
-/// kills the worker, the launcher ends by the same signal, so the caller
-/// sees what a run without a worker would give.
+/// kills the worker, the launcher ends by the same signal (`end_by_signal`;
+/// a pid 1 exits 128 + N, as Go does there), so the caller sees what a run
+/// without a worker would give.
 #[cfg(target_os = "linux")]
 fn launch(huge_pages: bool) -> Option<i32> {
     use std::io::Read;
@@ -251,17 +252,9 @@ fn launch(huge_pages: bool) -> Option<i32> {
     // The worker ended without sending a code.
     let status = worker.wait();
     if let Some(signal) = status.as_ref().ok().and_then(ExitStatusExt::signal) {
-        // End by the same signal. This sets the default action of the
-        // signal (the launcher catches SIGINT and SIGTERM, and Rust ignores
-        // SIGPIPE) and raises it. It returns for a signal that is not in its
-        // table (SIGPWR, SIGSTKFLT) or that it takes as ignored (SIGIO).
-        let _ = signal_hook::low_level::emulate_default_handler(signal);
-        // Such a signal has its default action here, so sending it ends
-        // this process. A real-time signal has no rustix name and falls
-        // through to 128 + N.
-        if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
-            let _ = rustix::process::kill_process(rustix::process::getpid(), signal);
-        }
+        // End by the same signal. Where that returns (a pid 1, or a
+        // signal that the launcher catches), exit 128 + N below.
+        end_by_signal(signal);
     }
     Some(match status {
         Ok(status) => status
@@ -479,6 +472,11 @@ const HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 fn restore_default_actions() {
     use signal_hook::consts::{SIGINT, SIGTERM};
     use signal_hook::flag::register_conditional_default;
+    // In a pid 1 the default actions do nothing (`end_by_signal`), as the
+    // handlers without actions do. signal-hook's would abort there.
+    if rustix::process::getpid().is_init() {
+        return;
+    }
     let set = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let notify = NOTIFY_DEFAULT.get_or_init(set);
     let thrown = THROWN_DEFAULT.get_or_init(set);
@@ -623,6 +621,28 @@ fn throw(name: &str) -> ! {
         send_code(worker, EXIT_GO_PANIC);
     }
     signal_hook::low_level::exit(EXIT_GO_PANIC)
+}
+
+/// Ends this process by `signal` with the default action of the signal, as
+/// Go `dieFromSignal` does, so the caller sees a process that the signal
+/// ended. It sets the default action, unblocks the signal and raises it.
+/// It returns in the pid 1 of a PID namespace (`docker run` without
+/// `--init`, `unshare -pf`, `bwrap --as-pid-1`): the kernel drops a signal
+/// with the default action that such a process sends itself. Go then exits
+/// 128 + N, as a shell reports a process that a signal ended, and so does
+/// each caller. It also returns for a signal that has no entry in
+/// signal-hook's table (SIGPWR, SIGSTKFLT, the real-time signals) or that
+/// the table takes as ignored (SIGIO).
+/// PORT: std and rustix have no safe `SIG_DFL`. signal-hook sets it, and
+/// it calls `abort` when the raise returns; in a pid 1, glibc's `abort`
+/// then ends the process by SIGSEGV (rc 139, maybe a core file). So a pid
+/// 1 does not raise the signal. Go raises it, and the kernel drops it.
+#[cfg(target_os = "linux")]
+fn end_by_signal(signal: i32) {
+    if rustix::process::getpid().is_init() {
+        return;
+    }
+    let _ = signal_hook::low_level::emulate_default_handler(signal);
 }
 
 /// Ends the process with `code` once the work has written its output. A

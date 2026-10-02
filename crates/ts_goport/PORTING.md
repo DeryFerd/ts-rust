@@ -545,6 +545,19 @@ process (bin/tsgo.rs `go_runtime_start`).
   SIGINT and SIGTERM go to `notify_context`. PORT: Go then prints the
   goroutines. SIGABRT and SIGTRAP keep their default actions. Other
   systems keep the default actions.
+- The pid 1 of a PID namespace (`docker run` without `--init`, `unshare
+  -pf`, `bwrap --as-pid-1`): the kernel drops each signal with the default
+  action that such a process gets from its namespace or sends itself. Go's
+  `dieFromSignal` raises the signal, and when that returns it exits
+  128 + N, as a shell reports a process that a signal ended. tsgo does the
+  same (bin/tsgo.rs `end_by_signal`): a launcher whose worker a signal
+  ended exits 128 + N. PORT: std and rustix have no safe `SIG_DFL`, and
+  signal-hook's default action calls `abort` when the raise returns, which
+  ends a pid 1 by SIGSEGV (rc 139). So a pid 1 does not raise the signal;
+  it exits 128 + N at once. PORT: the SIGPIPE of a broken stdout or stderr
+  (execute/tsc/stdio.rs `sigpipe`) still uses signal-hook's default action,
+  so a pid 1 that runs the work itself (no worker) ends there by SIGSEGV
+  (139) where Go exits 141.
 - PORT: SIGILL, SIGBUS, SIGFPE and SIGSEGV keep their default actions,
   also when another process sends them (`kill`). Go throws a sent one
   (`sigFromUser`) as it throws SIGQUIT: it prints the name (`SIGSEGV:
@@ -562,11 +575,13 @@ process (bin/tsgo.rs `go_runtime_start`).
   thrown signal or a fatal panic with SIGABRT (`crash`, a core dump) after
   the goroutines; the port exits 2 as with the default setting.
 - The launcher (`launch`) drops the same signals and sends SIGINT, SIGTERM
-  and the thrown signals on to its worker. The worker gets no environment
-  variable and no file descriptor from the launcher, so its children get
-  none: its `arg0` names the launcher, and at exit it opens the launcher's
-  end of the pipe through /proc (first with `O_PATH`, so the type, device
-  and inode check opens no file of another process).
+  and the thrown signals on to its worker. When a signal ends the worker,
+  the launcher ends by the same signal (a pid 1 exits 128 + N). The worker
+  gets no environment variable and no file descriptor from the launcher,
+  so its children get none: its `arg0` names the launcher, and at exit it
+  opens the launcher's end of the pipe through /proc (first with
+  `O_PATH`, so the type, device and inode check opens no file of another
+  process).
   - A forwarded signal waits until the worker catches it (its `SigCgt` in
     /proc), so a signal that comes before the worker's handlers does what
     it does in Go after the start: a plain compile goes on after SIGINT
@@ -591,7 +606,8 @@ process (bin/tsgo.rs `go_runtime_start`).
     SIGINT, SIGTERM, SIGQUIT and SIGSYS get their default actions back
     until the run sets its own handlers, as in a run that never was a
     launcher. PORT: SIGSTKFLT does nothing there (signal-hook has no
-    default action for it).
+    default action for it). In a pid 1 they do nothing there, as their
+    default actions do.
 - Stdout (execute/tsc/stdio.rs): each write of the tsc output is one write
   of fd 1, in Go's pieces (Go `fmt.Fprint` on the unbuffered
   `os.Stdout`). PORT: when fd 1 is a regular file, the writes of one report
