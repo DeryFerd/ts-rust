@@ -549,6 +549,24 @@ impl Checker {
         self.new_inference_context_worker(inferences, signature, flags, compare_types)
     }
 
+    /// Go `c.newInferenceContext(signature.TypeParameters(), signature, flags, nil)`.
+    /// PERF: the inference list is made from the signature's type parameters
+    /// in place, without a copy of the list.
+    pub fn new_inference_context_of_signature(
+        &mut self,
+        signature: SignatureId,
+        flags: InferenceFlags,
+    ) -> InferenceContextId {
+        let compare_types = self.compare_types_assignable.clone();
+        let inferences: Vec<InferenceInfo> = self
+            .sig(signature)
+            .type_parameters
+            .iter()
+            .map(|&tp| new_inference_info(tp))
+            .collect();
+        self.new_inference_context_worker(inferences, signature, flags, compare_types)
+    }
+
     // Go: checker/inference.go:1201 cloneInferenceContext
     pub fn clone_inference_context(
         &mut self,
@@ -886,6 +904,17 @@ impl Checker {
         result
     }
 
+    /// `get_inferred_types` in a list that lives on the stack up to 4 types.
+    /// PERF: for callers that only read the list.
+    pub fn get_inferred_type_list(&mut self, n: InferenceContextId) -> SmallVec<[TypeId; 4]> {
+        let count = self.inference_context(n).inferences.len();
+        let mut result: SmallVec<[TypeId; 4]> = SmallVec::with_capacity(count);
+        for i in 0..count {
+            result.push(self.get_inferred_type(n, i as i32));
+        }
+        result
+    }
+
     // Go: checker/inference.go:1357 getMapperFromContext
     pub fn get_mapper_from_context(&self, n: InferenceContextId) -> MapperId {
         if n.is_nil() {
@@ -940,7 +969,9 @@ impl Checker {
             && top_level
             && (is_fixed
                 || !self.is_type_parameter_at_top_level_in_return_type(signature, type_parameter));
-        let base_candidates: Vec<TypeId> = if primitive_constraint {
+        // PERF: the candidate lists are temporaries, so they live on the
+        // stack up to 8 types.
+        let base_candidates: SmallVec<[TypeId; 8]> = if primitive_constraint {
             candidates
                 .iter()
                 .map(|&t| self.get_regular_type_of_literal_type(t))
@@ -988,9 +1019,9 @@ impl Checker {
     pub fn union_object_and_array_literal_candidates(
         &mut self,
         candidates: &[TypeId],
-    ) -> Vec<TypeId> {
+    ) -> SmallVec<[TypeId; 8]> {
         if candidates.len() > 1 {
-            let object_literals: Vec<TypeId> = candidates
+            let object_literals: SmallVec<[TypeId; 8]> = candidates
                 .iter()
                 .copied()
                 .filter(|&t| self.is_object_or_array_literal_type(t))
@@ -1002,7 +1033,7 @@ impl Checker {
                     None,
                     TypeId::NIL,
                 );
-                let mut non_literal_types: Vec<TypeId> = candidates
+                let mut non_literal_types: SmallVec<[TypeId; 8]> = candidates
                     .iter()
                     .copied()
                     .filter(|&t| !self.is_object_or_array_literal_type(t))
@@ -1011,7 +1042,7 @@ impl Checker {
                 return non_literal_types;
             }
         }
-        candidates.to_vec()
+        SmallVec::from_slice(candidates)
     }
 
     // Go: checker/inference.go:1425 hasPrimitiveConstraint

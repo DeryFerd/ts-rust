@@ -241,22 +241,41 @@ pub struct InferenceState {
 impl Checker {
     // Go: checker/inference.go:32 getInferenceState
     pub fn get_inference_state(&mut self) -> Rc<RefCell<InferenceState>> {
-        let n = match self.freeinference_state.clone() {
-            Some(n) => n,
+        match self.freeinference_state.take() {
+            // PERF: the pool link moves to the pool head, without a clone.
+            Some(n) => {
+                self.freeinference_state = n.borrow_mut().next.take();
+                n
+            }
             None => Rc::new(RefCell::new(InferenceState::default())),
-        };
-        self.freeinference_state = n.borrow().next.clone();
-        n
+        }
     }
 
     // Go: checker/inference.go:41 putInferenceState
+    // PERF: the fields are reset in place, so the buffers stay where they
+    // are and no old value is dropped. The pattern lists every field, so a
+    // new field must be reset here too.
     pub fn put_inference_state(&mut self, n: Rc<RefCell<InferenceState>>) {
         {
-            let mut s = n.borrow_mut();
-            let mut visited = s.visited.take();
-            let max_visited_len = s
-                .max_visited_len
-                .max(visited.as_ref().map_or(0, InferenceVisitedMap::len));
+            let mut guard = n.borrow_mut();
+            let InferenceState {
+                inferences,
+                original_source,
+                original_target,
+                priority,
+                inference_priority,
+                contravariant,
+                bivariant,
+                expanding_flags,
+                propagation_type,
+                visited,
+                max_visited_len,
+                source_stack,
+                target_stack,
+                next,
+            } = &mut *guard;
+            *max_visited_len =
+                (*max_visited_len).max(visited.as_ref().map_or(0, InferenceVisitedMap::len));
             if let Some(v) = visited.as_mut() {
                 // PORT: Go `clear(n.visited)`. Clearing costs time in the map
                 // capacity, so a mostly empty large map is dropped instead.
@@ -266,21 +285,20 @@ impl Checker {
                     v.clear();
                 }
             }
-            let mut source_stack = std::mem::take(&mut s.source_stack);
             source_stack.clear();
-            let mut target_stack = std::mem::take(&mut s.target_stack);
             target_stack.clear();
             // PORT: Go `inferences: n.inferences[:0]` keeps only the slice
             // capacity; the context id has none, so it becomes nil.
-            *s = InferenceState {
-                inferences: InferenceContextId::NIL,
-                visited,
-                max_visited_len,
-                source_stack,
-                target_stack,
-                next: self.freeinference_state.take(),
-                ..InferenceState::default()
-            };
+            *inferences = InferenceContextId::NIL;
+            *original_source = TypeId::default();
+            *original_target = TypeId::default();
+            *priority = InferencePriority::default();
+            *inference_priority = InferencePriority::default();
+            *contravariant = false;
+            *bivariant = false;
+            *expanding_flags = ExpandingFlags::default();
+            *propagation_type = TypeId::default();
+            *next = self.freeinference_state.take();
         }
         self.freeinference_state = Some(n);
     }
@@ -347,9 +365,28 @@ impl Checker {
             if !sa.type_arguments.is_empty() || !ta.type_arguments.is_empty() {
                 // Source and target are types originating in the same generic type alias declaration.
                 // Simply infer from source type arguments to target type arguments, with defaults applied.
+                let params_len = self.type_alias_links.get(sa.symbol).type_parameters.len();
+                let node_is_in_js_file = is_in_js_file(self.sym(sa.symbol).value_declaration);
+                // PERF: when no argument is missing and the alias is not in a
+                // JS file, Go fillMissingTypeArguments returns its input and
+                // getMinTypeArgumentCount only reads declarations, so the
+                // argument lists are read in place, without the copies.
+                if params_len != 0
+                    && !node_is_in_js_file
+                    && sa.type_arguments.len() >= params_len
+                    && ta.type_arguments.len() >= params_len
+                {
+                    let variances = self.get_alias_variances(sa.symbol);
+                    self.infer_from_type_arguments(
+                        n,
+                        &sa.type_arguments,
+                        &ta.type_arguments,
+                        &variances,
+                    );
+                    return;
+                }
                 let params = self.type_alias_links.get(sa.symbol).type_parameters.clone();
                 let min_params = self.get_min_type_argument_count(&params);
-                let node_is_in_js_file = is_in_js_file(self.sym(sa.symbol).value_declaration);
                 let source_types = self.fill_missing_type_arguments(
                     &sa.type_arguments,
                     &params,
@@ -1071,7 +1108,9 @@ impl Checker {
                 single = [source];
                 &single
             };
-            let mut matched = vec![false; sources.len()];
+            // PERF: the flags and the unmatched list below are temporaries,
+            // so they live on the stack up to 16 and 8 entries.
+            let mut matched: SmallVec<[bool; 16]> = smallvec::smallvec![false; sources.len()];
             let mut inference_circularity = false;
             // First infer to types that are not naked type variables. For each source type we
             // track whether inferences were made from that particular type to some target with
@@ -1118,7 +1157,7 @@ impl Checker {
             // types from which no inferences have been made so far and infer from that union to the
             // naked type variable.
             if type_variable_count == 1 && !inference_circularity {
-                let mut unmatched: Vec<TypeId> = Vec::new();
+                let mut unmatched: SmallVec<[TypeId; 8]> = SmallVec::new();
                 for (i, &s) in sources.iter().enumerate() {
                     if !matched[i] {
                         unmatched.push(s);
@@ -1508,8 +1547,10 @@ impl Checker {
                 let source_arity = self.get_type_reference_arity(source);
                 let target_arity = self.get_type_reference_arity(target);
                 let element_types = self.get_type_arguments(target);
-                let element_infos: Vec<TupleElementInfo> =
-                    self.target_tuple_type(target).element_infos.clone();
+                // PERF: Go reads the element infos in place; the port reads
+                // their flags through `target_element_flags`, not a copy.
+                let target_element_flags =
+                    |c: &Checker, i: usize| c.target_tuple_type(target).element_infos[i].flags;
                 // When source and target are tuple types with the same structure (fixed, variadic, and rest are matched
                 // to the same kind in each position), simply infer between the element types.
                 if self.is_tuple_type(source)
@@ -1560,9 +1601,7 @@ impl Checker {
                     let rest_type = self.type_arguments_of(source)[start_length as usize];
                     for i in start_length..target_arity - end_length {
                         let mut t = rest_type;
-                        if element_infos[i as usize]
-                            .flags
-                            .intersects(ElementFlags::VARIADIC)
+                        if target_element_flags(self, i as usize).intersects(ElementFlags::VARIADIC)
                         {
                             t = self.create_array_type(t);
                         }
@@ -1572,7 +1611,7 @@ impl Checker {
                     let middle_length = target_arity - start_length - end_length;
                     let sl = start_length as usize;
                     if middle_length == 2 {
-                        if (element_infos[sl].flags & element_infos[sl + 1].flags)
+                        if (target_element_flags(self, sl) & target_element_flags(self, sl + 1))
                             .intersects(ElementFlags::VARIADIC)
                         {
                             // Middle of target is [...T, ...U] and source is tuple type
@@ -1599,13 +1638,12 @@ impl Checker {
                                     self.infer_from_types(n, slice, element_types[sl + 1]);
                                 }
                             }
-                        } else if element_infos[sl].flags.intersects(ElementFlags::VARIADIC)
-                            && element_infos[sl + 1].flags.intersects(ElementFlags::REST)
+                        } else if target_element_flags(self, sl).intersects(ElementFlags::VARIADIC)
+                            && target_element_flags(self, sl + 1).intersects(ElementFlags::REST)
                         {
                             // Middle of target is [...T, ...rest] and source is tuple type
                             // if T is constrained by a fixed-size tuple we might be able to use its arity to infer T
-                            let info =
-                                self.get_inference_info_for_type(n, element_types[sl]);
+                            let info = self.get_inference_info_for_type(n, element_types[sl]);
                             if let Some(info) = info {
                                 let ctx = n.inferences;
                                 let type_parameter =
@@ -1638,15 +1676,12 @@ impl Checker {
                                     }
                                 }
                             }
-                        } else if element_infos[sl].flags.intersects(ElementFlags::REST)
-                            && element_infos[sl + 1]
-                                .flags
-                                .intersects(ElementFlags::VARIADIC)
+                        } else if target_element_flags(self, sl).intersects(ElementFlags::REST)
+                            && target_element_flags(self, sl + 1).intersects(ElementFlags::VARIADIC)
                         {
                             // Middle of target is [...rest, ...T] and source is tuple type
                             // if T is constrained by a fixed-size tuple we might be able to use its arity to infer T
-                            let info = self
-                                .get_inference_info_for_type(n, element_types[sl + 1]);
+                            let info = self.get_inference_info_for_type(n, element_types[sl + 1]);
                             if let Some(info) = info {
                                 let ctx = n.inferences;
                                 let type_parameter =
@@ -1700,12 +1735,11 @@ impl Checker {
                             }
                         }
                     } else if middle_length == 1
-                        && element_infos[sl].flags.intersects(ElementFlags::VARIADIC)
+                        && target_element_flags(self, sl).intersects(ElementFlags::VARIADIC)
                     {
                         // Middle of target is exactly one variadic element. Infer the slice between the fixed parts in the source.
                         // If target ends in optional element(s), make a lower priority a speculative inference.
-                        let priority = if element_infos[(target_arity - 1) as usize]
-                            .flags
+                        let priority = if target_element_flags(self, (target_arity - 1) as usize)
                             .intersects(ElementFlags::OPTIONAL)
                         {
                             InferencePriority::SPECULATIVE_TUPLE
@@ -1715,7 +1749,7 @@ impl Checker {
                         let source_slice = self.slice_tuple_type(source, start_length, end_length);
                         self.infer_with_priority(n, source_slice, element_types[sl], priority);
                     } else if middle_length == 1
-                        && element_infos[sl].flags.intersects(ElementFlags::REST)
+                        && target_element_flags(self, sl).intersects(ElementFlags::REST)
                     {
                         // Middle of target is exactly one rest element. If middle of source is not empty, infer union of middle element types.
                         let rest_type = self.get_element_type_of_slice_of_tuple_type(
@@ -1944,7 +1978,8 @@ impl Checker {
             for &target_info in &index_infos {
                 let target_key_type = self.index_info(target_info).key_type;
                 let target_value_type = self.index_info(target_info).value_type;
-                let mut prop_types: Vec<TypeId> = Vec::new();
+                // PERF: a temporary list, on the stack up to 8 types.
+                let mut prop_types: SmallVec<[TypeId; 8]> = SmallVec::new();
                 for prop in self.get_properties_of_type(source) {
                     let literal = self.get_literal_type_from_property(
                         prop,
