@@ -588,30 +588,34 @@ fn exit(code: i32) -> ! {
 /// memory. It takes no std lock (`throw`).
 #[cfg(target_os = "linux")]
 fn send_code(worker: Worker, code: i32) {
-    use std::os::unix::fs::OpenOptionsExt;
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
+    use std::os::fd::AsRawFd;
     if let Ok(null) = std::fs::File::options().write(true).open("/dev/null") {
         let _ = rustix::stdio::dup2_stdout(&null);
         let _ = rustix::stdio::dup2_stderr(&null);
     }
-    // The launcher's end of the pipe, opened for writing by its number. The
-    // new file has a close-on-exec flag. When it cannot open, the launcher
-    // takes the code from the worker's exit. In a PID namespace whose /proc
-    // is not its own, the path names a file of another process: the code is
-    // written only to a FIFO with the device and inode that the launcher
-    // passed, and the open does not wait (`O_NONBLOCK`) for a reader of
-    // another FIFO.
-    let pipe = format!("/proc/{}/fd/{}", worker.launcher.as_raw_pid(), worker.fd);
-    if let Ok(mut pipe) = std::fs::File::options()
-        .write(true)
-        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed())
-        .open(pipe)
-        && rustix::fs::fstat(&pipe).is_ok_and(|stat| {
-            rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Fifo
-                && stat.st_dev == worker.dev
-                && stat.st_ino == worker.ino
-        })
-    {
-        let _ = pipe.write_all(&code.to_le_bytes());
+    // The launcher's end of the pipe, by its number. In a PID namespace
+    // whose /proc is not its own, the path names a file of another process:
+    // the code goes only to a FIFO with the device and inode that the
+    // launcher passed. The first open (`O_PATH`) only names the file and
+    // opens no FIFO or device, so it cannot wait or change a file of
+    // another process. The open for writing opens the checked file again
+    // through /proc/self/fd, not the path, and does not wait for a reader
+    // (`O_NONBLOCK`). Each new file has a close-on-exec flag. When an open
+    // fails, the launcher takes the code from the worker's exit.
+    let path = format!("/proc/{}/fd/{}", worker.launcher.as_raw_pid(), worker.fd);
+    let Ok(file) = open(path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()) else {
+        return;
+    };
+    let checked = fstat(&file).is_ok_and(|stat| {
+        FileType::from_raw_mode(stat.st_mode) == FileType::Fifo
+            && stat.st_dev == worker.dev
+            && stat.st_ino == worker.ino
+    });
+    let again = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let flags = OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if checked && let Ok(pipe) = open(again, flags, Mode::empty()) {
+        let _ = std::fs::File::from(pipe).write_all(&code.to_le_bytes());
     }
 }
 
