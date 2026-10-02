@@ -64,4 +64,4 @@ tsc's usual text.
 - The checker recurses deeply. Node runs each call in a worker thread with a 256 MB stack. In a
   browser, call it from a Web Worker.
 - Not supported: `--watch`, `--lsp`, `--api`, and plugins or content mappers that start
-  processes.
+  processes. `--locale` gives English: the module has no message catalogs, to keep it small.
