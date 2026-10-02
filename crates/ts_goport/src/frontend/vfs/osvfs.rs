@@ -461,7 +461,7 @@ impl OsFs {
 }
 
 // Go: os.go:224 GetGlobalTypingsCacheLocation
-// PORT: not ported. Only the language server (cmd/tsgo/lsp.go) calls it.
+// PORT: not ported. Only the language server (cmd/tsc/lsp.go) calls it.
 
 // Go: os/file.go DirFS
 // PORT: Go standard library. `os.DirFS(dir)` with the `Stat`, `ReadDir`

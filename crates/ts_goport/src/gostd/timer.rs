@@ -107,10 +107,9 @@ fn maybe_add(t: &Arc<TimerShared>, state: &mut TimerState) {
     }
     state.thread_running = true;
     let t = t.clone();
-    std::thread::Builder::new()
+    crate::core::GoThread::new()
         .name("timer".to_string())
-        .spawn(move || run_timer(t))
-        .expect("time: failed to start the timer thread");
+        .spawn(move || run_timer(t));
 }
 
 // Go: runtime/time.go unlockAndRun
@@ -159,7 +158,7 @@ fn run_timer(t: Arc<TimerShared>) {
             // Go: time/sleep.go:214 goFunc
             TimerFunc::GoFunc(f) => {
                 let f = f.clone();
-                std::thread::Builder::new()
+                crate::core::GoThread::new()
                     .name("goroutine".to_string())
                     .stack_size(crate::gostd::stack::max_stack_size())
                     .spawn(move || {
@@ -167,8 +166,7 @@ fn run_timer(t: Arc<TimerShared>) {
                         // Reset; here they take turns.
                         let mut f = lock(&f);
                         (*f)();
-                    })
-                    .expect("time: failed to start a goroutine");
+                    });
             }
         }
     }

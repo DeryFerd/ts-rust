@@ -428,7 +428,7 @@ fn is_unicode_case_ignorable(r: char) -> bool {
 // core/core.go
 // ---------------------------------------------------------------------------
 
-// Go: core/core.go:430 ComputeECMALineStarts
+// Go: core/core.go:428 ComputeECMALineStarts
 // PORT: Go `ECMALineStarts` ([]TextPos) -> `Vec<i32>`; `ComputeECMALineStartsSeq`
 // is inlined.
 pub fn compute_ecma_line_starts(text: &str) -> Vec<i32> {
@@ -538,7 +538,7 @@ pub fn utf16_len_of_range(s: &str, start: usize, end: usize) -> i32 {
     }
 }
 
-// Go: core/core.go:559 GetSpellingSuggestion
+// Go: core/core.go:582 GetSpellingSuggestion
 // Given a name and a list of candidates, returns the candidate whose name is
 // closest to `name`, or `T::default()` (Go zero value) when none is close
 // enough.
@@ -558,7 +558,7 @@ pub fn get_spelling_suggestion<T: Clone + Default, S: AsRef<str>>(
     )
 }
 
-// Go: core/core.go:588 GetSpellingSuggestionWithMaxCandidateCount
+// Go: core/core.go:586 GetSpellingSuggestionWithMaxCandidateCount
 pub fn get_spelling_suggestion_with_max_candidate_count<T: Clone + Default, S: AsRef<str>>(
     name: &str,
     candidates: impl IntoIterator<Item = T>,
@@ -569,7 +569,7 @@ pub fn get_spelling_suggestion_with_max_candidate_count<T: Clone + Default, S: A
     get_spelling_suggestion_unexported(name, candidates, get_name, compare, max_candidates)
 }
 
-// Go: core/core.go:592 getSpellingSuggestion
+// Go: core/core.go:590 getSpellingSuggestion
 // PORT: Go `getSpellingSuggestion` has the same snake name as the exported
 // `GetSpellingSuggestion`, which keeps the plain name because other packages
 // call it; this private one gets the `_unexported` suffix.
@@ -635,7 +635,7 @@ fn get_spelling_suggestion_unexported<T: Clone + Default, S: AsRef<str>>(
     best_candidate
 }
 
-// Go: core/core.go:598 GetSpellingSuggestionForStrings
+// Go: core/core.go:635 GetSpellingSuggestionForStrings
 pub fn get_spelling_suggestion_for_strings(
     name: &str,
     candidates: impl IntoIterator<Item = String>,
@@ -724,7 +724,7 @@ fn levenshtein_with_max(
     res
 }
 
-// Go: core/core.go:792 Deduplicate
+// Go: core/core.go:829 Deduplicate
 pub fn deduplicate<T: PartialEq + Clone>(slice: Vec<T>) -> Vec<T> {
     if slice.len() > 1 {
         for i in 0..slice.len() {
@@ -742,7 +742,7 @@ pub fn deduplicate<T: PartialEq + Clone>(slice: Vec<T>) -> Vec<T> {
     slice
 }
 
-// Go: core/core.go:830 CompareBooleans
+// Go: core/core.go:867 CompareBooleans
 // CompareBooleans treats true as greater than false.
 pub fn compare_booleans(a: bool, b: bool) -> i32 {
     if a && !b {
@@ -923,7 +923,7 @@ fn text_to_keyword(text: &str) -> SyntaxKind {
     crate::frontend::scanner::scanner_p1::text_to_keyword(text)
 }
 
-// Go: scanner/scanner.go:2227 GetIdentifierToken
+// Go: scanner/scanner.go:2213 GetIdentifierToken
 pub fn get_identifier_token(str: &str) -> SyntaxKind {
     let bytes = str.as_bytes();
     if str.len() >= 2 && str.len() <= 12 && bytes[0] >= b'a' && bytes[0] <= b'z' {
@@ -935,7 +935,7 @@ pub fn get_identifier_token(str: &str) -> SyntaxKind {
     SyntaxKind::Identifier
 }
 
-// Go: scanner/scanner.go:2237 IsValidIdentifier
+// Go: scanner/scanner.go:2223 IsValidIdentifier
 pub fn is_valid_identifier(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -948,13 +948,13 @@ pub fn is_valid_identifier(s: &str) -> bool {
     true
 }
 
-// Go: scanner/scanner.go:2250 isWordCharacter
+// Go: scanner/scanner.go:2236 isWordCharacter
 // Section 6.1.4
 fn is_word_character(ch: char) -> bool {
     is_ascii_letter(ch) || is_digit(ch) || ch == '_'
 }
 
-// Go: scanner/scanner.go:2254 IsIdentifierStart
+// Go: scanner/scanner.go:2240 IsIdentifierStart
 pub fn is_identifier_start(ch: char) -> bool {
     is_ascii_letter(ch)
         || ch == '_'
@@ -962,12 +962,12 @@ pub fn is_identifier_start(ch: char) -> bool {
         || (ch as u32) >= 0x80 && is_unicode_identifier_start(ch)
 }
 
-// Go: scanner/scanner.go:2258 IsIdentifierPart
+// Go: scanner/scanner.go:2244 IsIdentifierPart
 pub fn is_identifier_part(ch: char) -> bool {
     is_identifier_part_ex(ch, LanguageVariant::STANDARD)
 }
 
-// Go: scanner/scanner.go:2262 IsIdentifierPartEx
+// Go: scanner/scanner.go:2248 IsIdentifierPartEx
 pub fn is_identifier_part_ex(ch: char, language_variant: LanguageVariant) -> bool {
     is_word_character(ch)
         || ch == '$'
@@ -975,7 +975,7 @@ pub fn is_identifier_part_ex(ch: char, language_variant: LanguageVariant) -> boo
         || language_variant == LanguageVariant::JSX && ch == '-' // ":" is part of JSXNamespacedName, but not JSXIdentifier.
 }
 
-// Go: scanner/scanner.go:2276 TokenToString
+// Go: scanner/scanner.go:2262 TokenToString
 // PORT: returns `&'static str` (Go string from the `tokenToText` table);
 // empty for kinds without fixed text.
 pub fn token_to_string(token: SyntaxKind) -> &'static str {
@@ -990,7 +990,7 @@ pub fn token_to_string(token: SyntaxKind) -> &'static str {
     table[token as u16 as usize]
 }
 
-// Go: scanner/scanner.go:2280 StringToToken
+// Go: scanner/scanner.go:2266 StringToToken
 pub fn string_to_token(s: &str) -> SyntaxKind {
     if let Some(&(_, kind)) = TEXT_TO_PUNCTUATION.iter().find(|(text, _)| *text == s) {
         return kind;
@@ -1000,7 +1000,7 @@ pub fn string_to_token(s: &str) -> SyntaxKind {
 
 const MAX_ASCII_CHARACTER: u8 = 127;
 
-// Go: scanner/scanner.go:2298 couldStartTrivia
+// Go: scanner/scanner.go:2284 couldStartTrivia
 #[allow(dead_code)]
 fn could_start_trivia(text: &str, pos: usize) -> bool {
     // Keep in sync with skipTrivia
@@ -1024,12 +1024,12 @@ pub struct SkipTriviaOptions {
     pub in_js_doc: bool,
 }
 
-// Go: scanner/scanner.go:2320 SkipTrivia
+// Go: scanner/scanner.go:2306 SkipTrivia
 pub fn skip_trivia(text: &str, pos: i32) -> i32 {
     skip_trivia_ex(text, pos, None)
 }
 
-// Go: scanner/scanner.go:2324 SkipTriviaEx
+// Go: scanner/scanner.go:2310 SkipTriviaEx
 pub fn skip_trivia_ex(text: &str, pos: i32, options: Option<&SkipTriviaOptions>) -> i32 {
     if position_is_synthesized(pos) {
         return pos;
@@ -1129,7 +1129,7 @@ pub fn skip_trivia_ex(text: &str, pos: i32, options: Option<&SkipTriviaOptions>)
 // a <<<<<<< or >>>>>>> marker then it is also followed by a space.
 const MERGE_CONFLICT_MARKER_LENGTH: usize = "<<<<<<<".len();
 
-// Go: scanner/scanner.go:2422 isConflictMarkerTrivia
+// Go: scanner/scanner.go:2408 isConflictMarkerTrivia
 pub(crate) fn is_conflict_marker_trivia(text: &str, pos: usize) -> bool {
     let bytes = text.as_bytes();
 
@@ -1163,7 +1163,7 @@ pub(crate) fn is_conflict_marker_trivia(text: &str, pos: usize) -> bool {
     false
 }
 
-// Go: scanner/scanner.go:2457 scanConflictMarkerTrivia
+// Go: scanner/scanner.go:2443 scanConflictMarkerTrivia
 // PORT: `reportError` keeps the Go shape; only `SkipTriviaEx` calls this and
 // it passes nil.
 pub(crate) fn scan_conflict_marker_trivia(
@@ -1211,7 +1211,7 @@ pub(crate) fn scan_conflict_marker_trivia(
     pos
 }
 
-// Go: scanner/scanner.go:2488 isShebangTrivia
+// Go: scanner/scanner.go:2474 isShebangTrivia
 pub(crate) fn is_shebang_trivia(text: &str, pos: usize) -> bool {
     let bytes = text.as_bytes();
     if bytes.len() < 2 {
@@ -1224,7 +1224,7 @@ pub(crate) fn is_shebang_trivia(text: &str, pos: usize) -> bool {
     bytes[0] == b'#' && bytes[1] == b'!'
 }
 
-// Go: scanner/scanner.go:2498 scanShebangTrivia
+// Go: scanner/scanner.go:2484 scanShebangTrivia
 pub(crate) fn scan_shebang_trivia(text: &str, pos: usize) -> usize {
     let mut pos = pos + 2;
     while pos < text.len() {
@@ -1237,7 +1237,7 @@ pub(crate) fn scan_shebang_trivia(text: &str, pos: usize) -> usize {
     pos
 }
 
-// Go: scanner/scanner.go:2510 GetShebang
+// Go: scanner/scanner.go:2496 GetShebang
 pub fn get_shebang(text: &str) -> String {
     if !is_shebang_trivia(text, 0) {
         return String::new();
@@ -1247,21 +1247,21 @@ pub fn get_shebang(text: &str) -> String {
     text[..end].to_string()
 }
 
-// Go: scanner/scanner.go:2529 ScanTokenAtPosition
+// Go: scanner/scanner.go:2515 ScanTokenAtPosition
 pub fn scan_token_at_position(source_file: Node, pos: i32) -> SyntaxKind {
     let sf_text = source_file_text(source_file);
     let s = get_scanner_for_source_file(source_file, &sf_text, pos);
     s.token()
 }
 
-// Go: scanner/scanner.go:2534 GetRangeOfTokenAtPosition
+// Go: scanner/scanner.go:2520 GetRangeOfTokenAtPosition
 pub fn get_range_of_token_at_position(source_file: Node, pos: i32) -> TextRange {
     let sf_text = source_file_text(source_file);
     let s = get_scanner_for_source_file(source_file, &sf_text, pos);
     TextRange::new(s.token_start(), s.token_end())
 }
 
-// Go: scanner/scanner.go:2539 GetTokenPosOfNode
+// Go: scanner/scanner.go:2525 GetTokenPosOfNode
 pub fn get_token_pos_of_node(node: Node, source_file: Node, include_js_doc: bool) -> i32 {
     // With nodes that have no width (i.e. 'Missing' nodes), we actually *don't*
     // want to skip trivia because this will launch us forward to the next token.
@@ -1296,7 +1296,7 @@ pub fn get_token_pos_of_node(node: Node, source_file: Node, include_js_doc: bool
     )
 }
 
-// Go: scanner/scanner.go:2555 getErrorRangeForArrowFunction
+// Go: scanner/scanner.go:2541 getErrorRangeForArrowFunction
 fn get_error_range_for_arrow_function(source_file: Node, node: Node) -> TextRange {
     let pos = skip_trivia(&source_file_text(source_file), node.pos());
     let body = node.body();
@@ -1311,7 +1311,7 @@ fn get_error_range_for_arrow_function(source_file: Node, node: Node) -> TextRang
     TextRange::new(pos, node.end())
 }
 
-// Go: scanner/scanner.go:2569 findOriginatingJSDocSatisfiesTag
+// Go: scanner/scanner.go:2555 findOriginatingJSDocSatisfiesTag
 fn find_originating_js_doc_satisfies_tag(source_file: Node, node: Node) -> Node {
     let target_type = node.type_();
     if !target_type.flags().intersects(NodeFlags::REPARSED) {
@@ -1353,7 +1353,7 @@ fn find_originating_js_doc_satisfies_tag(source_file: Node, node: Node) -> Node 
     Node::NIL
 }
 
-// Go: scanner/scanner.go:2601 GetErrorRangeForNode
+// Go: scanner/scanner.go:2587 GetErrorRangeForNode
 pub fn get_error_range_for_node(source_file: Node, node: Node) -> TextRange {
     let mut error_node = node;
     // PORT: the Go `fallthrough` from FunctionDeclaration/MethodDeclaration
@@ -1456,7 +1456,7 @@ pub fn get_error_range_for_node(source_file: Node, node: Node) -> TextRange {
     TextRange::new(pos, error_node.end())
 }
 
-// Go: scanner/scanner.go:2669 ComputeLineOfPosition
+// Go: scanner/scanner.go:2655 ComputeLineOfPosition
 pub fn compute_line_of_position(line_starts: &[i32], pos: i32) -> i32 {
     let mut low: i32 = 0;
     let mut high: i32 = line_starts.len() as i32 - 1;
@@ -1482,7 +1482,7 @@ thread_local! {
     static SYNTHETIC_ECMA_LINE_MAPS: RefCell<FxHashMap<Node, &'static [i32]>> = RefCell::new(FxHashMap::default());
 }
 
-// Go: scanner/scanner.go:2686 GetECMALineStarts
+// Go: scanner/scanner.go:2672 GetECMALineStarts
 // PORT: Go reads the lazily computed `sourceFile.ECMALineMap()`. A frozen
 // store file has one shared map for all threads. Other files use a
 // per-thread cache keyed by the file index. A synthetic (transformed) source
@@ -1534,14 +1534,14 @@ fn with_ecma_line_starts<R>(source_file: Node, read: impl FnOnce(&[i32]) -> R) -
     read(&get_ecma_line_starts(source_file))
 }
 
-// Go: scanner/scanner.go:2690 GetECMALineOfPosition
+// Go: scanner/scanner.go:2676 GetECMALineOfPosition
 pub fn get_ecma_line_of_position(source_file: Node, pos: i32) -> i32 {
     with_ecma_line_starts(source_file, |line_map| {
         compute_line_of_position(line_map, pos)
     })
 }
 
-// Go: scanner/scanner.go:2698 GetECMALineAndUTF16CharacterOfPosition
+// Go: scanner/scanner.go:2684 GetECMALineAndUTF16CharacterOfPosition
 // GetECMALineAndUTF16CharacterOfPosition returns the 0-based line number and the
 // UTF-16 code unit offset from the start of that line for the given byte position.
 // Uses ECMAScript line separators (LF, CR, CRLF, LS, PS).
@@ -1564,7 +1564,7 @@ pub fn get_ecma_line_and_utf16_character_of_position(source_file: Node, pos: i32
     (line, character)
 }
 
-// Go: scanner/scanner.go:2709 GetECMALineAndByteOffsetOfPosition
+// Go: scanner/scanner.go:2695 GetECMALineAndByteOffsetOfPosition
 // GetECMALineAndByteOffsetOfPosition returns the 0-based line number and the
 // raw UTF-8 byte offset from the start of that line for the given byte position.
 pub fn get_ecma_line_and_byte_offset_of_position(source_file: Node, pos: i32) -> (i32, i32) {
@@ -1575,7 +1575,7 @@ pub fn get_ecma_line_and_byte_offset_of_position(source_file: Node, pos: i32) ->
     })
 }
 
-// Go: scanner/scanner.go:2716 GetECMAEndLinePosition
+// Go: scanner/scanner.go:2702 GetECMAEndLinePosition
 pub fn get_ecma_end_line_position(source_file: Node, line: i32) -> i32 {
     let text = source_file_text(source_file);
     let mut pos = get_ecma_line_starts(source_file)[line as usize] as usize;
@@ -1588,7 +1588,7 @@ pub fn get_ecma_end_line_position(source_file: Node, line: i32) -> i32 {
     }
 }
 
-// Go: scanner/scanner.go:2744 ComputePositionOfLineAndByteOffset
+// Go: scanner/scanner.go:2730 ComputePositionOfLineAndByteOffset
 // ComputePositionOfLineAndByteOffset computes a byte position from a line and
 // raw byte offset from the line start. This is a simple addition with validation.
 pub fn compute_position_of_line_and_byte_offset(
@@ -23499,7 +23499,10 @@ mod tests {
         go_unit_cut_at, go_value, go_value_from_bytes, is_line_break, port_byte_offset, utf16_len,
         utf16_len_of_range,
     };
-    use super::{LevenshteinBuffers, levenshtein_with_max};
+    use super::{
+        LevenshteinBuffers, get_spelling_suggestion_for_strings,
+        get_spelling_suggestion_with_max_candidate_count, levenshtein_with_max, unicode_to_lower,
+    };
 
     /// Go (WTF-8) bytes of a rune, as Go `EncodeJSStringRune` writes it.
     fn go_bytes(ch: u32) -> Vec<u8> {
@@ -23922,5 +23925,183 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Go core.go:590 getSpellingSuggestion as written, with
+    /// `strings.Compare`: a new rune slice and new Levenshtein buffers for
+    /// each candidate. Only for valid UTF-8, where Go's `len` is `str::len`
+    /// and `[]rune` is `chars`.
+    fn go_get_spelling_suggestion(name: &str, candidates: &[&str], max_candidates: i32) -> String {
+        let rune_name: Vec<char> = name.chars().collect();
+        let maximum_length_difference = 2.max((rune_name.len() as f64 * 0.34) as usize);
+        let mut best_distance = (rune_name.len() as f64 * 0.4).floor() + 0.9;
+        let mut best_candidate = String::new();
+        let mut has_best = false;
+        let mut checked_candidates = 0;
+        for &candidate_name in candidates {
+            checked_candidates += 1;
+            if max_candidates > 0 && checked_candidates > max_candidates {
+                return String::new();
+            }
+            let max_len = candidate_name.len().max(rune_name.len());
+            let min_len = candidate_name.len().min(rune_name.len());
+            if !candidate_name.is_empty() && max_len - min_len <= maximum_length_difference {
+                if candidate_name == name {
+                    continue;
+                }
+                if candidate_name.len() < 3 && !go_equal_fold(candidate_name, name) {
+                    continue;
+                }
+                let candidate_runes: Vec<char> = candidate_name.chars().collect();
+                let distance = go_levenshtein_with_max(&rune_name, &candidate_runes, best_distance);
+                if distance < 0.0 {
+                    continue;
+                }
+                if distance < best_distance {
+                    best_distance = distance;
+                    best_candidate = candidate_name.to_string();
+                    has_best = true;
+                } else if !has_best || candidate_name < best_candidate.as_str() {
+                    best_candidate = candidate_name.to_string();
+                    has_best = true;
+                }
+            }
+        }
+        best_candidate
+    }
+
+    /// Go `strings.EqualFold` for the words of the test (no rune with a
+    /// special fold).
+    fn go_equal_fold(a: &str, b: &str) -> bool {
+        a.chars().count() == b.chars().count()
+            && a.chars()
+                .zip(b.chars())
+                .all(|(x, y)| x == y || x.to_lowercase().eq(y.to_lowercase()))
+    }
+
+    /// Go core.go:650 levenshteinWithMax as written, on new buffers.
+    fn go_levenshtein_with_max(s1: &[char], s2: &[char], max_value: f64) -> f64 {
+        let mut previous = vec![0.0; s2.len() + 1];
+        let mut current = vec![0.0; s2.len() + 1];
+        let big = max_value + 0.01;
+        for (i, slot) in previous.iter_mut().enumerate() {
+            *slot = i as f64;
+        }
+        for i in 1..=s1.len() {
+            let c1 = s1[i - 1];
+            let min_j = ((i as f64 - max_value).ceil() as usize).max(1);
+            let max_j = ((max_value + i as f64).floor() as usize).min(s2.len());
+            let mut col_min = i as f64;
+            current[0] = col_min;
+            for slot in &mut current[1..min_j] {
+                *slot = big;
+            }
+            for j in min_j..=max_j {
+                let substitution_distance =
+                    if unicode_to_lower(s1[i - 1]) == unicode_to_lower(s2[j - 1]) {
+                        previous[j - 1] + 0.1
+                    } else {
+                        previous[j - 1] + 2.0
+                    };
+                let dist = if c1 == s2[j - 1] {
+                    previous[j - 1]
+                } else {
+                    (previous[j] + 1.0).min((current[j - 1] + 1.0).min(substitution_distance))
+                };
+                current[j] = dist;
+                col_min = col_min.min(dist);
+            }
+            for slot in &mut current[max_j + 1..] {
+                *slot = big;
+            }
+            if col_min > max_value {
+                return -1.0;
+            }
+            std::mem::swap(&mut previous, &mut current);
+        }
+        let res = previous[s2.len()];
+        if res > max_value { -1.0 } else { res }
+    }
+
+    /// One `get_spelling_suggestion` call reuses its rune buffer
+    /// (`candidate_runes`, clear and extend) and its Levenshtein buffers for
+    /// every candidate. With candidates of falling, rising and mixed length,
+    /// each call picks the candidate of Go's code, which makes both anew per
+    /// candidate.
+    #[test]
+    fn spelling_suggestion_with_reused_buffers_matches_go() {
+        let falling = [
+            "getSpellingSuggestionWithMaxCandidateCount",
+            "getSpellingSuggestionForStrings",
+            "getSpellingSuggestions",
+            "GETSPELLINGSUGGESTION",
+            "getSpellingSuggestion",
+            "getSpelingSugestion",
+            "spellingSuggestion",
+            "assertNevers",
+            "Spellings",
+            "spelings",
+            "Spelling",
+            "\u{e9}t\u{e9}s",
+            "\u{c9}T\u{c9}",
+            "spel",
+            "abd",
+            "Abc",
+            "ab",
+            "\u{c9}",
+            "X",
+            "x",
+        ];
+        let rising: Vec<&str> = falling.iter().rev().copied().collect();
+        // Long and short in turn: each candidate's runes and rows are
+        // longer or shorter than the ones before.
+        let mixed: Vec<&str> = (0..falling.len())
+            .map(|i| {
+                falling[if i % 2 == 0 {
+                    i / 2
+                } else {
+                    falling.len() - 1 - i / 2
+                }]
+            })
+            .collect();
+        let names = [
+            "getSpellingSuggestion",
+            "getSpelingSuggestion",
+            "getspellingsuggestions",
+            "spelling",
+            "Spellingz",
+            "assertNever",
+            "abc",
+            "\u{e9}t\u{e9}",
+            "\u{e9}",
+            "x",
+        ];
+        let mut found = 0;
+        for candidates in [&falling[..], &rising[..], &mixed[..]] {
+            for name in names {
+                // 5 stops at the 6th candidate (Go returns the zero value);
+                // 20 checks them all, as 0 does.
+                for max_candidates in [0, 5, 20] {
+                    let go = go_get_spelling_suggestion(name, candidates, max_candidates);
+                    let owned = candidates.iter().map(|c| c.to_string());
+                    let port = if max_candidates == 0 {
+                        get_spelling_suggestion_for_strings(name, owned)
+                    } else {
+                        get_spelling_suggestion_with_max_candidate_count(
+                            name,
+                            owned,
+                            |c| c.clone(),
+                            |a, b| a.cmp(b) as i32,
+                            max_candidates,
+                        )
+                    };
+                    assert_eq!(port, go, "{name:?} {max_candidates} {candidates:?}");
+                    found += usize::from(!go.is_empty());
+                }
+            }
+        }
+        // Every call with no limit or a limit of 20 finds a candidate, so the
+        // distances decide the answers.
+        assert_eq!(found, 60);
     }
 }

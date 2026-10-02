@@ -741,8 +741,16 @@ fn flush_writes(
         }
     };
     std::thread::scope(|scope| {
+        // Port-only threads: the caller writes too, so a thread that cannot
+        // start leaves its files to the threads that run (no exit, as for
+        // the parse and config prefetch threads).
         for _ in 1..threads {
-            scope.spawn(&work);
+            if std::thread::Builder::new()
+                .spawn_scoped(scope, &work)
+                .is_err()
+            {
+                break;
+            }
         }
         work();
     });

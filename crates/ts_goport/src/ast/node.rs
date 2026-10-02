@@ -2242,10 +2242,13 @@ thread_local! {
 /// so a column never holds more than 16 MiB.
 const FACTS_COLUMN_LIMIT: usize = 1 << 22;
 
-/// The index of non-nil node `n` in its file (`SUBTREE_FACTS`).
+/// The index of non-nil node `n` in its file (`SUBTREE_FACTS`). Nil wraps
+/// to the largest index, past `FACTS_COLUMN_LIMIT`: its facts are never
+/// cached, so `Node::subtree_facts` reads its data and panics with Go's nil
+/// dereference (`static_tier_ast_node`), in debug builds as in release.
 #[inline]
 fn facts_index(n: Node) -> usize {
-    ((n.0 & 0xffff_ffff) - 1) as usize
+    (n.0 & 0xffff_ffff).wrapping_sub(1) as usize
 }
 
 /// The `SUBTREE_FACTS` key of the file of `n`: the handle of index 0 of
@@ -6438,4 +6441,18 @@ pub fn get_declaration_name(declaration: Node) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Go `(*Node)(nil).SubtreeFacts()` dereferences nil. The facts index of
+    /// nil wraps (`facts_index`), so a debug build gives the panic of a
+    /// release build, not an overflow.
+    #[test]
+    #[should_panic(expected = "nil node dereference")]
+    fn subtree_facts_of_nil_is_a_nil_dereference() {
+        let _ = Node::NIL.subtree_facts();
+    }
 }
