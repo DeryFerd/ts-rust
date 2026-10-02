@@ -80,9 +80,19 @@ pub fn embedded_text_hash(text: &str) -> Option<u64> {
 /// The base name of bundled lib path `path` (`bundled:///libs/lib.dom.d.ts`
 /// gives `lib.dom.d.ts`). `None` for any other path. The lib parse and bind
 /// snapshots find a lib file by this name.
+///
+/// wasm: always `None`, so no lib loads a snapshot and the link drops the
+/// snapshot blobs (3 MB) and their decoders. The blobs store lib names by
+/// their stable ids (`Name::stable_id`), but on wasm32 the lib name table
+/// does not find most names: `intern::hash_str` is the 32-bit Fx hash
+/// there, and the table holds 64-bit hashes. A loaded snapshot would give
+/// its names other ids than the live names of the program.
 // PORT: not in Go.
 #[must_use]
 pub fn bundled_lib_name(path: &str) -> Option<&str> {
+    if cfg!(target_family = "wasm") {
+        return None;
+    }
     split_path(path)?.strip_prefix("libs/")
 }
 
