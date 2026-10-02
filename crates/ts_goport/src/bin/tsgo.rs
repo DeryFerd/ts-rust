@@ -322,19 +322,49 @@ fn worker() -> Option<Worker> {
 
 /// Whether the process `pid` has ended: it is gone, or it is a zombie (it
 /// has ended and its parent has not reaped it yet). The state is the field
-/// after the command name in /proc/<pid>/stat. Without that file (no
-/// /proc), `kill` with no signal tells only whether the process is gone.
+/// after the command name in /proc/<pid>/stat. Without that file, or
+/// without this process's own /proc (`own_proc`: there the file is of
+/// another process), `kill` with no signal tells only whether the process
+/// is gone: a zombie launcher then gives a plain tsgo.
 #[cfg(target_os = "linux")]
 fn has_ended(pid: rustix::process::Pid) -> bool {
-    match std::fs::read(format!("/proc/{}/stat", pid.as_raw_pid())) {
+    let path = format!("/proc/{}/stat", pid.as_raw_pid());
+    match own_proc().then(|| std::fs::read(path)) {
         // `<pid> (<name>) <state> ...`: the name can hold ") ".
-        Ok(stat) => {
+        Some(Ok(stat)) => {
             let name_end = stat.iter().rposition(|&b| b == b')');
             let state = name_end.and_then(|end| stat.get(end + 2));
             matches!(state, Some(b'Z' | b'X'))
         }
-        Err(_) => rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH),
+        _ => rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH),
     }
+}
+
+/// Whether /proc is the /proc of this process's PID namespace, so that
+/// /proc/<pid> is the process `pid`. In a PID namespace that has the /proc
+/// of another one (`bwrap --unshare-pid` without `--proc`, `unshare -pf`
+/// without `--mount-proc`), /proc/<pid> is another process or none: for
+/// the pid of a worker it can be a kernel thread whose parent has the pid
+/// of the launcher. The NSpid line of /proc/self/status has this process's
+/// pid in each PID namespace from the one of /proc down to its own, so it
+/// is the one pid that `getpid` gives only in its own /proc. A kernel
+/// without that line (before 4.1) has the Pid line, the pid in the
+/// namespace of /proc. False without /proc. The first call reads the file;
+/// the later calls use its result.
+#[cfg(target_os = "linux")]
+fn own_proc() -> bool {
+    static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OWN.get_or_init(|| {
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            return false;
+        };
+        let pid = rustix::process::getpid().as_raw_pid().to_string();
+        let field = |name: &str| status.lines().find_map(|line| line.strip_prefix(name));
+        match field("NSpid:") {
+            Some(pids) => pids.split_whitespace().eq([pid.as_str()]),
+            None => field("Pid:").map(str::trim) == Some(pid.as_str()),
+        }
+    })
 }
 
 /// Sends each SIGINT and SIGTERM and each signal that Go throws
@@ -347,7 +377,9 @@ fn has_ended(pid: rustix::process::Pid) -> bool {
 /// `launch` calls it before it starts the worker and sends the worker's pid
 /// to the returned sender; a signal that comes first waits for it. When no
 /// worker starts, `launch` drops the sender and the thread ends. Each
-/// signal also waits until the worker catches it (`wait_until_caught`).
+/// signal also waits until the worker catches it (`wait_until_caught`),
+/// only with this process's own /proc (`own_proc`). Otherwise it goes on
+/// at once.
 /// The thread starts as a Go runtime thread does (`GoThread`): when the OS
 /// refuses it, the launcher ends with Go's text and exit 2, before there is
 /// a worker. Go has no launcher, so its process gets every signal; a
@@ -366,9 +398,12 @@ fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
             let Ok(pid) = receive.recv() else {
                 return;
             };
+            let hold = own_proc();
             for signal in signals.forever() {
                 if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
-                    wait_until_caught(pid, signal);
+                    if hold {
+                        wait_until_caught(pid, signal);
+                    }
                     let _ = rustix::process::kill_process(pid, signal);
                 }
             }
@@ -384,10 +419,10 @@ fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
 /// sets its handlers before `main`, and `runMain` calls `NotifyContext`
 /// before any work (cmd/tsc/main.go:29).
 /// The kernel lists the caught signals in /proc/<pid>/status (`SigCgt`, a
-/// hex mask with bit N-1 for signal N). The wait ends when the worker has
+/// hex mask with bit N-1 for signal N). The caller calls it only with
+/// this process's own /proc (`own_proc`). The wait ends when the worker has
 /// ended, and at once when that file does not show a live child of this
-/// process (no /proc, or the /proc of another PID namespace): the signal
-/// then goes on at once.
+/// process: the signal then goes on at once.
 #[cfg(target_os = "linux")]
 fn wait_until_caught(pid: rustix::process::Pid, signal: rustix::process::Signal) {
     let path = format!("/proc/{}/status", pid.as_raw_pid());
@@ -596,15 +631,20 @@ fn send_code(worker: Worker, code: i32) {
         let _ = rustix::stdio::dup2_stdout(&null);
         let _ = rustix::stdio::dup2_stderr(&null);
     }
-    // The launcher's end of the pipe, by its number. In a PID namespace
-    // whose /proc is not its own, the path names a file of another process:
-    // the code goes only to a FIFO with the device and inode that the
-    // launcher passed. The first open (`O_PATH`) only names the file and
-    // opens no FIFO or device, so it cannot wait or change a file of
-    // another process. The open for writing opens the checked file again
-    // through /proc/self/fd, not the path, and does not wait for a reader
-    // (`O_NONBLOCK`). Each new file has a close-on-exec flag. When an open
-    // fails, the launcher takes the code from the worker's exit.
+    // The launcher's end of the pipe, by its number, through /proc. Only
+    // with this process's own /proc (`own_proc`): in another one,
+    // /proc/<launcher> is another process or none. The code goes only to a
+    // FIFO with the device and inode that the launcher passed. The first
+    // open (`O_PATH`) only names the file and opens no FIFO or device, so
+    // it cannot wait or change another file. The open for writing opens
+    // the checked file again through /proc/self/fd (this process's own
+    // files in any /proc that shows it), not the path, and does not wait
+    // for a reader (`O_NONBLOCK`). Each new file has a close-on-exec flag.
+    // Without its own /proc, or when an open fails, the launcher takes the
+    // code from the worker's exit.
+    if !own_proc() {
+        return;
+    }
     let path = format!("/proc/{}/fd/{}", worker.launcher.as_raw_pid(), worker.fd);
     let Ok(file) = open(path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()) else {
         return;

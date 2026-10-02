@@ -576,6 +576,15 @@ process (bin/tsgo.rs `go_runtime_start`).
     launcher, and the named launcher is gone or a zombie) kills itself. A
     killed Go tsgo stops at once. A process whose `arg0` names a live
     launcher that is not its parent runs as a plain tsgo.
+  - The launcher and the worker read /proc/<pid> only when /proc is the
+    one of their PID namespace (`own_proc`, the NSpid line of
+    /proc/self/status). With the /proc of another namespace (`bwrap
+    --unshare-pid` without `--proc`, `unshare -pf` without `--mount-proc`)
+    /proc/<pid> is another process or none. There a signal goes on at once
+    (no wait), the ended-launcher check uses `kill` with no signal (a gone
+    launcher ends the worker, a zombie one gives a plain tsgo), and the
+    launcher takes the code from the worker's exit, which waits for the
+    worker's memory to unmap.
   - When the worker cannot start, the launcher runs the work itself.
     SIGINT, SIGTERM, SIGQUIT and SIGSYS get their default actions back
     until the run sets its own handlers, as in a run that never was a
