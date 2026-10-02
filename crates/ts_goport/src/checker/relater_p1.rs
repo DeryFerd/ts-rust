@@ -219,17 +219,60 @@ impl Relation {
     }
 }
 
+// PORT: perf. Not in Go. Go tests a relation by pointer (`relation ==
+// c.identityRelation`). Hot code here tests a `RelationKind`, so it does not
+// clone the `Rc` of the relation to keep it while `self` is borrowed.
+/// One of the checker's five relations (see `Checker::relation_of`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RelationKind {
+    #[default]
+    Identity,
+    Subtype,
+    StrictSubtype,
+    Assignable,
+    Comparable,
+}
+
+impl Checker {
+    /// The relation of `kind`.
+    #[inline]
+    pub fn relation_of(&self, kind: RelationKind) -> &Rc<RefCell<Relation>> {
+        match kind {
+            RelationKind::Identity => &self.identity_relation,
+            RelationKind::Subtype => &self.subtype_relation,
+            RelationKind::StrictSubtype => &self.strict_subtype_relation,
+            RelationKind::Assignable => &self.assignable_relation,
+            RelationKind::Comparable => &self.comparable_relation,
+        }
+    }
+
+    /// The kind of `relation`, which is one of the checker's five relations.
+    #[inline]
+    pub fn relation_kind(&self, relation: &Rc<RefCell<Relation>>) -> RelationKind {
+        if Rc::ptr_eq(relation, &self.assignable_relation) {
+            RelationKind::Assignable
+        } else if Rc::ptr_eq(relation, &self.subtype_relation) {
+            RelationKind::Subtype
+        } else if Rc::ptr_eq(relation, &self.strict_subtype_relation) {
+            RelationKind::StrictSubtype
+        } else if Rc::ptr_eq(relation, &self.comparable_relation) {
+            RelationKind::Comparable
+        } else {
+            debug_assert!(Rc::ptr_eq(relation, &self.identity_relation));
+            RelationKind::Identity
+        }
+    }
+}
+
 impl Checker {
     // Go: checker/relater.go:118 isTypeIdenticalTo
     pub fn is_type_identical_to(&mut self, source: TypeId, target: TypeId) -> bool {
-        let relation = self.identity_relation.clone();
-        self.is_type_related_to(source, target, &relation)
+        self.is_type_related_to_kind(source, target, RelationKind::Identity)
     }
 
     // Go: checker/relater.go:122 compareTypesIdentical
     pub fn compare_types_identical(&mut self, source: TypeId, target: TypeId) -> Ternary {
-        let relation = self.identity_relation.clone();
-        if self.is_type_related_to(source, target, &relation) {
+        if self.is_type_related_to_kind(source, target, RelationKind::Identity) {
             return Ternary::TRUE;
         }
         Ternary::FALSE
@@ -237,8 +280,7 @@ impl Checker {
 
     // Go: checker/relater.go:129 compareTypesAssignableSimple
     pub fn compare_types_assignable_simple(&mut self, source: TypeId, target: TypeId) -> Ternary {
-        let relation = self.assignable_relation.clone();
-        if self.is_type_related_to(source, target, &relation) {
+        if self.is_type_related_to_kind(source, target, RelationKind::Assignable) {
             return Ternary::TRUE;
         }
         Ternary::FALSE
@@ -251,8 +293,7 @@ impl Checker {
         target: TypeId,
         report_errors: bool,
     ) -> Ternary {
-        let relation = self.assignable_relation.clone();
-        if self.is_type_related_to(source, target, &relation) {
+        if self.is_type_related_to_kind(source, target, RelationKind::Assignable) {
             return Ternary::TRUE;
         }
         Ternary::FALSE
@@ -260,8 +301,7 @@ impl Checker {
 
     // Go: checker/relater.go:143 compareTypesSubtypeOf
     pub fn compare_types_subtype_of(&mut self, source: TypeId, target: TypeId) -> Ternary {
-        let relation = self.subtype_relation.clone();
-        if self.is_type_related_to(source, target, &relation) {
+        if self.is_type_related_to_kind(source, target, RelationKind::Subtype) {
             return Ternary::TRUE;
         }
         Ternary::FALSE
@@ -269,26 +309,22 @@ impl Checker {
 
     // Go: checker/relater.go:150 isTypeAssignableTo
     pub fn is_type_assignable_to(&mut self, source: TypeId, target: TypeId) -> bool {
-        let relation = self.assignable_relation.clone();
-        self.is_type_related_to(source, target, &relation)
+        self.is_type_related_to_kind(source, target, RelationKind::Assignable)
     }
 
     // Go: checker/relater.go:154 isTypeSubtypeOf
     pub fn is_type_subtype_of(&mut self, source: TypeId, target: TypeId) -> bool {
-        let relation = self.subtype_relation.clone();
-        self.is_type_related_to(source, target, &relation)
+        self.is_type_related_to_kind(source, target, RelationKind::Subtype)
     }
 
     // Go: checker/relater.go:158 isTypeStrictSubtypeOf
     pub fn is_type_strict_subtype_of(&mut self, source: TypeId, target: TypeId) -> bool {
-        let relation = self.strict_subtype_relation.clone();
-        self.is_type_related_to(source, target, &relation)
+        self.is_type_related_to_kind(source, target, RelationKind::StrictSubtype)
     }
 
     // Go: checker/relater.go:162 isTypeComparableTo
     pub fn is_type_comparable_to(&mut self, source: TypeId, target: TypeId) -> bool {
-        let relation = self.comparable_relation.clone();
-        self.is_type_related_to(source, target, &relation)
+        self.is_type_related_to_kind(source, target, RelationKind::Comparable)
     }
 
     // Go: checker/relater.go:166 areTypesComparable
@@ -297,11 +333,23 @@ impl Checker {
     }
 
     // Go: checker/relater.go:170 isTypeRelatedTo
+    #[inline]
     pub fn is_type_related_to(
         &mut self,
         source: TypeId,
         target: TypeId,
         relation: &Rc<RefCell<Relation>>,
+    ) -> bool {
+        let kind = self.relation_kind(relation);
+        self.is_type_related_to_kind(source, target, kind)
+    }
+
+    // PORT: perf. Go isTypeRelatedTo with the relation as a `RelationKind`.
+    pub fn is_type_related_to_kind(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        kind: RelationKind,
     ) -> bool {
         let mut source = source;
         let mut target = target;
@@ -314,12 +362,12 @@ impl Checker {
         if source == target {
             return true;
         }
-        let is_identity = Rc::ptr_eq(relation, &self.identity_relation);
+        let is_identity = kind == RelationKind::Identity;
         if !is_identity {
-            if Rc::ptr_eq(relation, &self.comparable_relation)
+            if kind == RelationKind::Comparable
                 && !self.ty(target).flags.intersects(TypeFlags::NEVER)
-                && self.is_simple_type_related_to(target, source, relation, None)
-                || self.is_simple_type_related_to(source, target, relation, None)
+                && self.is_simple_type_related_to_kind(target, source, kind, None)
+                || self.is_simple_type_related_to_kind(source, target, kind, None)
             {
                 return true;
             }
@@ -342,7 +390,7 @@ impl Checker {
         {
             let (id, _) =
                 self.get_relation_key(source, target, IntersectionState::NONE, is_identity, false);
-            let related = relation.borrow().get(id);
+            let related = self.relation_of(kind).borrow().get(id);
             if related != RelationComparisonResult::NONE {
                 return related.intersects(RelationComparisonResult::SUCCEEDED);
             }
@@ -356,10 +404,11 @@ impl Checker {
                 .flags
                 .intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
         {
+            let relation = self.relation_of(kind).clone();
             return self.check_type_related_to(
                 source,
                 target,
-                relation,
+                &relation,
                 Node::NIL, /*errorNode*/
             );
         }
@@ -367,11 +416,25 @@ impl Checker {
     }
 
     // Go: checker/relater.go:205 isSimpleTypeRelatedTo
+    #[inline]
     pub fn is_simple_type_related_to(
         &mut self,
         source: TypeId,
         target: TypeId,
         relation: &Rc<RefCell<Relation>>,
+        error_reporter: Option<&mut dyn FnMut(&mut Checker, &'static Message, Vec<String>)>,
+    ) -> bool {
+        let kind = self.relation_kind(relation);
+        self.is_simple_type_related_to_kind(source, target, kind, error_reporter)
+    }
+
+    // PORT: perf. Go isSimpleTypeRelatedTo with the relation as a
+    // `RelationKind`.
+    pub fn is_simple_type_related_to_kind(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        kind: RelationKind,
         mut error_reporter: Option<&mut dyn FnMut(&mut Checker, &'static Message, Vec<String>)>,
     ) -> bool {
         let s = self.ty(source).flags;
@@ -383,8 +446,7 @@ impl Checker {
             return true;
         }
         if t.intersects(TypeFlags::UNKNOWN)
-            && !(Rc::ptr_eq(relation, &self.strict_subtype_relation)
-                && s.intersects(TypeFlags::ANY))
+            && !(kind == RelationKind::StrictSubtype && s.intersects(TypeFlags::ANY))
         {
             return true;
         }
@@ -475,7 +537,7 @@ impl Checker {
         }
         if s.intersects(TypeFlags::OBJECT)
             && t.intersects(TypeFlags::NON_PRIMITIVE)
-            && !(Rc::ptr_eq(relation, &self.strict_subtype_relation)
+            && !(kind == RelationKind::StrictSubtype
                 && self.is_empty_anonymous_object_type(source)
                 && !self
                     .ty(source)
@@ -484,9 +546,7 @@ impl Checker {
         {
             return true;
         }
-        if Rc::ptr_eq(relation, &self.assignable_relation)
-            || Rc::ptr_eq(relation, &self.comparable_relation)
-        {
+        if kind == RelationKind::Assignable || kind == RelationKind::Comparable {
             if s.intersects(TypeFlags::ANY) {
                 return true;
             }
@@ -737,9 +797,10 @@ impl Checker {
         let mut error_node = error_node;
         let r = self.get_relater();
         {
+            let kind = self.relation_kind(relation);
             let relation_size = relation.borrow().size();
             let mut rb = r.borrow_mut();
-            rb.relation = relation.clone();
+            rb.kind = kind;
             rb.error_node = error_node;
             rb.relation_count = (16_000_000 - relation_size) / 8;
         }
