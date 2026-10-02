@@ -1190,12 +1190,12 @@ pub struct Relater {
     pub error_node: Node,
     pub error_chain: Option<Rc<ErrorChain>>,
     pub related_info: Vec<Diagnostic>,
-    pub maybe_keys: Vec<CacheHashKey>,
+    pub maybe_keys: Vec<RelationKey>,
     // PORT: perf. Go keeps the set in sync with `maybeKeys` at all times.
     // Here it is empty while `maybe_keys.len() <= MAYBE_KEYS_SCAN_LIMIT` and
     // holds exactly the stack keys above that. Use `maybe_keys_contain`,
     // `push_maybe_key` and `truncate_maybe_keys`, not the fields directly.
-    pub maybe_keys_set: CacheKeySet,
+    pub maybe_keys_set: RelationKeySet,
     pub source_stack: Vec<TypeId>,
     pub target_stack: Vec<TypeId>,
     // PORT: perf. Not in Go. `stack_recursion_id` of a prefix of
@@ -1225,13 +1225,13 @@ const MAYBE_KEYS_SET_KEEP_CAPACITY: usize = 256;
 
 // Empties the maybe keys set. Drops a large allocation instead of keeping it,
 // so an empty set never holds more than the keep capacity.
-fn clear_maybe_keys_set(set: &mut CacheKeySet) {
+fn clear_maybe_keys_set(set: &mut RelationKeySet) {
     // Clearing an empty set still costs time in its capacity.
     if set.is_empty() {
         return;
     }
     if set.capacity() > MAYBE_KEYS_SET_KEEP_CAPACITY {
-        *set = CacheKeySet::default();
+        *set = RelationKeySet::default();
     } else {
         set.clear();
     }
@@ -1242,7 +1242,7 @@ impl Relater {
     // 3099) with the same result: the stack keys are unique (a key is pushed
     // only when absent), and the set mirrors them above the scan limit.
     #[inline]
-    pub fn maybe_keys_contain(&self, key: &CacheHashKey) -> bool {
+    pub fn maybe_keys_contain(&self, key: &RelationKey) -> bool {
         if self.maybe_keys.len() <= MAYBE_KEYS_SCAN_LIMIT {
             self.maybe_keys.contains(key)
         } else {
@@ -1254,7 +1254,7 @@ impl Relater {
     // (relater.go:3108). The set is written only above the scan limit. The
     // push that crosses the limit fills it with every stack key.
     #[inline]
-    pub fn push_maybe_key(&mut self, key: CacheHashKey) {
+    pub fn push_maybe_key(&mut self, key: RelationKey) {
         self.maybe_keys.push(key);
         let len = self.maybe_keys.len();
         if len == MAYBE_KEYS_SCAN_LIMIT + 1 {

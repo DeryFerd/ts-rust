@@ -121,10 +121,6 @@ impl std::hash::Hasher for CacheKeyHasher {
 pub type CacheKeyMap<V> =
     std::collections::HashMap<CacheHashKey, V, std::hash::BuildHasherDefault<CacheKeyHasher>>;
 
-/// A set of `CacheHashKey` that hashes with `CacheKeyHasher`.
-pub type CacheKeySet =
-    std::collections::HashSet<CacheHashKey, std::hash::BuildHasherDefault<CacheKeyHasher>>;
-
 // PORT: perf. `CacheHashKey` is already an xxh3 hash, so `FlatMap` uses its
 // low half as is (the same bits `CacheKeyHasher` uses).
 impl FlatKey for CacheHashKey {
@@ -134,30 +130,92 @@ impl FlatKey for CacheHashKey {
     }
 }
 
-/// The map type of `Relation::results`. For an A/B run against hashbrown,
-/// change it to `CacheKeyMap<RelationComparisonResult>`.
-pub type RelationResultsMap = FlatMap<CacheHashKey, RelationComparisonResult>;
+// PORT: perf. Not in Go. Go keys every relation result by the xxh3 hash of
+// the key bytes. A plain key has only 12 bytes of content (Go writes `'s'`,
+// the source and target ids and the intersection state), so the port keeps
+// those bytes as the key: it needs no xxh3, compares exactly, and its map
+// entry takes 16 bytes, so no entry spans two cache lines. A generic key
+// (`'g'`, with type references) stays Go's xxh3 hash. Go's xxh3 keys collide
+// with a chance of about 2^-128; plain keys here never do.
+/// Go `getRelationKey` result: the key of a `Relation` result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationKey {
+    /// A key without generic type references, as its key bytes.
+    Plain(PlainRelationKey),
+    /// Go's xxh3 hash of a key with generic type references.
+    Generic(CacheHashKey),
+}
+
+/// The content of a plain relation key (Go `getRelationKey` writes `'s'`,
+/// then these three values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlainRelationKey {
+    pub source: u32,
+    pub target: u32,
+    pub intersection_state: u32,
+}
+
+impl FlatKey for PlainRelationKey {
+    // A 64x64 to 128-bit multiply folded to 64 bits puts every key bit into
+    // the low bits that pick the slot.
+    #[inline]
+    fn flat_hash(&self) -> u64 {
+        let ids = u64::from(self.source) | u64::from(self.target) << 32;
+        let p = u128::from(ids ^ 0x243f_6a88_85a3_08d3)
+            * u128::from(0x9e37_79b9_7f4a_7c15 ^ u64::from(self.intersection_state));
+        (p >> 64) as u64 ^ p as u64
+    }
+}
+
+// Only for `RelationKeySet`: `CacheKeyHasher` takes one `u64` as the hash.
+impl std::hash::Hash for RelationKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(match self {
+            RelationKey::Plain(key) => key.flat_hash(),
+            RelationKey::Generic(key) => key.lo,
+        });
+    }
+}
+
+/// A set of `RelationKey` (the relater's maybe keys).
+pub type RelationKeySet =
+    std::collections::HashSet<RelationKey, std::hash::BuildHasherDefault<CacheKeyHasher>>;
 
 // Go: checker/relater.go:99 Relation
+// PORT: Go has one map of xxh3 keys. Plain and generic keys are in two maps
+// here (see `RelationKey`). There is no iteration, so this cannot change any
+// output.
 #[derive(Clone, Debug, Default)]
 pub struct Relation {
-    pub results: RelationResultsMap,
+    pub plain: FlatMap<PlainRelationKey, RelationComparisonResult>,
+    pub generic: FlatMap<CacheHashKey, RelationComparisonResult>,
 }
 
 impl Relation {
     // Go: checker/relater.go:103 Relation.get
-    pub fn get(&self, key: CacheHashKey) -> RelationComparisonResult {
-        self.results.get(&key).copied().unwrap_or_default()
+    #[inline]
+    pub fn get(&self, key: RelationKey) -> RelationComparisonResult {
+        match key {
+            RelationKey::Plain(key) => self.plain.get(&key),
+            RelationKey::Generic(key) => self.generic.get(&key),
+        }
+        .copied()
+        .unwrap_or_default()
     }
 
     // Go: checker/relater.go:107 Relation.set
-    pub fn set(&mut self, key: CacheHashKey, result: RelationComparisonResult) {
-        self.results.insert(key, result);
+    #[inline]
+    pub fn set(&mut self, key: RelationKey, result: RelationComparisonResult) {
+        match key {
+            RelationKey::Plain(key) => self.plain.insert(key, result),
+            RelationKey::Generic(key) => self.generic.insert(key, result),
+        };
     }
 
     // Go: checker/relater.go:114 Relation.size
     pub fn size(&self) -> i32 {
-        self.results.len() as i32
+        (self.plain.len() + self.generic.len()) as i32
     }
 }
 
