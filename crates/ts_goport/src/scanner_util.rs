@@ -23499,7 +23499,10 @@ mod tests {
         go_unit_cut_at, go_value, go_value_from_bytes, is_line_break, port_byte_offset, utf16_len,
         utf16_len_of_range,
     };
-    use super::{LevenshteinBuffers, levenshtein_with_max};
+    use super::{
+        LevenshteinBuffers, get_spelling_suggestion_for_strings,
+        get_spelling_suggestion_with_max_candidate_count, levenshtein_with_max, unicode_to_lower,
+    };
 
     /// Go (WTF-8) bytes of a rune, as Go `EncodeJSStringRune` writes it.
     fn go_bytes(ch: u32) -> Vec<u8> {
@@ -23922,5 +23925,180 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Go core.go:590 getSpellingSuggestion as written, with
+    /// `strings.Compare`: a new rune slice and new Levenshtein buffers for
+    /// each candidate. Only for valid UTF-8, where Go's `len` is `str::len`
+    /// and `[]rune` is `chars`.
+    fn go_get_spelling_suggestion(name: &str, candidates: &[&str], max_candidates: i32) -> String {
+        let rune_name: Vec<char> = name.chars().collect();
+        let maximum_length_difference = 2.max((rune_name.len() as f64 * 0.34) as usize);
+        let mut best_distance = (rune_name.len() as f64 * 0.4).floor() + 0.9;
+        let mut best_candidate = String::new();
+        let mut has_best = false;
+        let mut checked_candidates = 0;
+        for &candidate_name in candidates {
+            checked_candidates += 1;
+            if max_candidates > 0 && checked_candidates > max_candidates {
+                return String::new();
+            }
+            let max_len = candidate_name.len().max(rune_name.len());
+            let min_len = candidate_name.len().min(rune_name.len());
+            if !candidate_name.is_empty() && max_len - min_len <= maximum_length_difference {
+                if candidate_name == name {
+                    continue;
+                }
+                if candidate_name.len() < 3 && !go_equal_fold(candidate_name, name) {
+                    continue;
+                }
+                let candidate_runes: Vec<char> = candidate_name.chars().collect();
+                let distance = go_levenshtein_with_max(&rune_name, &candidate_runes, best_distance);
+                if distance < 0.0 {
+                    continue;
+                }
+                if distance < best_distance {
+                    best_distance = distance;
+                    best_candidate = candidate_name.to_string();
+                    has_best = true;
+                } else if !has_best || candidate_name < best_candidate.as_str() {
+                    best_candidate = candidate_name.to_string();
+                    has_best = true;
+                }
+            }
+        }
+        best_candidate
+    }
+
+    /// Go `strings.EqualFold` for the words of the test (no rune with a
+    /// special fold).
+    fn go_equal_fold(a: &str, b: &str) -> bool {
+        a.chars().count() == b.chars().count()
+            && a.chars()
+                .zip(b.chars())
+                .all(|(x, y)| x == y || x.to_lowercase().eq(y.to_lowercase()))
+    }
+
+    /// Go core.go:650 levenshteinWithMax as written, on new buffers.
+    fn go_levenshtein_with_max(s1: &[char], s2: &[char], max_value: f64) -> f64 {
+        let mut previous = vec![0.0; s2.len() + 1];
+        let mut current = vec![0.0; s2.len() + 1];
+        let big = max_value + 0.01;
+        for (i, slot) in previous.iter_mut().enumerate() {
+            *slot = i as f64;
+        }
+        for i in 1..=s1.len() {
+            let c1 = s1[i - 1];
+            let min_j = ((i as f64 - max_value).ceil() as usize).max(1);
+            let max_j = ((max_value + i as f64).floor() as usize).min(s2.len());
+            let mut col_min = i as f64;
+            current[0] = col_min;
+            for slot in &mut current[1..min_j] {
+                *slot = big;
+            }
+            for j in min_j..=max_j {
+                let substitution_distance =
+                    if unicode_to_lower(s1[i - 1]) == unicode_to_lower(s2[j - 1]) {
+                        previous[j - 1] + 0.1
+                    } else {
+                        previous[j - 1] + 2.0
+                    };
+                let dist = if c1 == s2[j - 1] {
+                    previous[j - 1]
+                } else {
+                    (previous[j] + 1.0).min((current[j - 1] + 1.0).min(substitution_distance))
+                };
+                current[j] = dist;
+                col_min = col_min.min(dist);
+            }
+            for slot in &mut current[max_j + 1..] {
+                *slot = big;
+            }
+            if col_min > max_value {
+                return -1.0;
+            }
+            std::mem::swap(&mut previous, &mut current);
+        }
+        let res = previous[s2.len()];
+        if res > max_value { -1.0 } else { res }
+    }
+
+    /// One `get_spelling_suggestion` call reuses its rune buffer
+    /// (`candidate_runes`, clear and extend) and its Levenshtein buffers for
+    /// every candidate. With candidates of falling, rising and mixed length,
+    /// each call picks the candidate of Go's code, which makes both anew per
+    /// candidate.
+    #[test]
+    fn spelling_suggestion_with_reused_buffers_matches_go() {
+        let falling = [
+            "getSpellingSuggestionWithMaxCandidateCount",
+            "getSpellingSuggestionForStrings",
+            "getSpellingSuggestions",
+            "GETSPELLINGSUGGESTION",
+            "getSpellingSuggestion",
+            "getSpelingSugestion",
+            "spellingSuggestion",
+            "assertNevers",
+            "Spellings",
+            "spelings",
+            "Spelling",
+            "\u{e9}t\u{e9}s",
+            "\u{c9}T\u{c9}",
+            "spel",
+            "abd",
+            "Abc",
+            "ab",
+            "\u{c9}",
+            "X",
+            "x",
+        ];
+        let rising: Vec<&str> = falling.iter().rev().copied().collect();
+        // Long and short in turn: each candidate's runes and rows are
+        // longer or shorter than the ones before.
+        let mixed: Vec<&str> = (0..falling.len())
+            .map(|i| {
+                falling[if i % 2 == 0 {
+                    i / 2
+                } else {
+                    falling.len() - 1 - i / 2
+                }]
+            })
+            .collect();
+        let names = [
+            "getSpellingSuggestion",
+            "getSpelingSuggestion",
+            "getspellingsuggestions",
+            "spelling",
+            "Spellingz",
+            "assertNever",
+            "abc",
+            "\u{e9}t\u{e9}",
+            "\u{e9}",
+            "x",
+        ];
+        let mut found = 0;
+        for candidates in [&falling[..], &rising[..], &mixed[..]] {
+            for name in names {
+                for max_candidates in [0, 5, 13] {
+                    let go = go_get_spelling_suggestion(name, candidates, max_candidates);
+                    let owned = candidates.iter().map(|c| c.to_string());
+                    let port = if max_candidates == 0 {
+                        get_spelling_suggestion_for_strings(name, owned)
+                    } else {
+                        get_spelling_suggestion_with_max_candidate_count(
+                            name,
+                            owned,
+                            |c| c.clone(),
+                            |a, b| a.cmp(b) as i32,
+                            max_candidates,
+                        )
+                    };
+                    assert_eq!(port, go, "{name:?} {max_candidates} {candidates:?}");
+                    found += usize::from(!go.is_empty());
+                }
+            }
+        }
+        // Most calls find a candidate, so the distances decide the answers.
+        assert!(found > 40, "{found}");
     }
 }
