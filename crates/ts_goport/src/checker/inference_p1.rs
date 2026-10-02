@@ -2,9 +2,11 @@ use crate::prelude::*;
 use smallvec::SmallVec;
 
 // PORT: Go `*InferenceState` is pooled on the checker
-// (`Checker::freeinference_state: Option<Rc<RefCell<InferenceState>>>`), so every
-// inference function takes `n: &Rc<RefCell<InferenceState>>`. Borrows of `n`
-// are never held across a call that can reach `n` again.
+// (`Checker::freeinference_state: Option<Rc<RefCell<InferenceState>>>`).
+// PERF: `infer_types` holds the one mutable borrow of the pooled state for
+// the whole inference, and every inference function takes
+// `n: &mut InferenceState`, so the hot paths make no `RefCell` checks. A
+// nested inference takes another state from the pool, never this one.
 
 // Go: checker/inference.go:11 InferenceKey
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -294,22 +296,23 @@ impl Checker {
     ) {
         let n = self.get_inference_state();
         {
-            let mut s = n.borrow_mut();
+            let mut state = n.borrow_mut();
+            let s = &mut *state;
             s.inferences = inferences;
             s.original_source = original_source;
             s.original_target = original_target;
             s.priority = priority;
             s.inference_priority = InferencePriority::MAX_VALUE;
             s.contravariant = contravariant;
+            self.infer_from_types(s, original_source, original_target);
         }
-        self.infer_from_types(&n, original_source, original_target);
         self.put_inference_state(n);
     }
 
     // Go: checker/inference.go:65 inferFromTypes
     pub fn infer_from_types(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
     ) {
@@ -322,10 +325,10 @@ impl Checker {
             // We are inferring from an 'any' type. We want to infer this type for every type parameter
             // referenced in the target type, so we record it as the propagation type and infer from the
             // target to itself. Then, as we find candidates we substitute the propagation type.
-            let save_propagation_type = n.borrow().propagation_type;
-            n.borrow_mut().propagation_type = source;
+            let save_propagation_type = n.propagation_type;
+            n.propagation_type = source;
             self.infer_from_types(n, target, target);
-            n.borrow_mut().propagation_type = save_propagation_type;
+            n.propagation_type = save_propagation_type;
             return;
         }
         // PORT: the aliases are compared by reference and cloned only when
@@ -470,7 +473,7 @@ impl Checker {
             if self.is_from_inference_blocked_source(source) {
                 return;
             }
-            let inference = self.get_inference_info_for_type(&n.borrow(), target);
+            let inference = self.get_inference_info_for_type(n, target);
             if let Some(inference) = inference {
                 // If target is a type parameter, make an inference, unless the source type contains
                 // a "non-inferrable" type. Types with this flag set are markers used to prevent inference.
@@ -496,9 +499,9 @@ impl Checker {
                 {
                     return;
                 }
-                let ctx = n.borrow().inferences;
+                let ctx = n.inferences;
                 if !self.inference_context(ctx).inferences[inference].is_fixed {
-                    let propagation_type = n.borrow().propagation_type;
+                    let propagation_type = n.propagation_type;
                     let candidate = if propagation_type.is_some() {
                         propagation_type
                     } else {
@@ -508,7 +511,7 @@ impl Checker {
                         return;
                     }
                     let (priority, contravariant, bivariant) = {
-                        let s = n.borrow();
+                        let s = &*n;
                         (s.priority, s.contravariant, s.bivariant)
                     };
                     {
@@ -547,7 +550,7 @@ impl Checker {
                         && self.ty(target).flags.intersects(TypeFlags::TYPE_PARAMETER)
                         && self.inference_context(ctx).inferences[inference].top_level
                     {
-                        let original_target = n.borrow().original_target;
+                        let original_target = n.original_target;
                         if !self.is_type_parameter_at_top_level(original_target, target, 0) {
                             self.inference_context_mut(ctx).inferences[inference].top_level = false;
                             self.clear_cached_inferences(ctx);
@@ -555,7 +558,7 @@ impl Checker {
                     }
                 }
                 {
-                    let mut s = n.borrow_mut();
+                    let s = &mut *n;
                     s.inference_priority = std::cmp::min(s.inference_priority, s.priority);
                 }
                 return;
@@ -684,7 +687,7 @@ impl Checker {
             if self.is_generic_mapped_type(source) && self.is_generic_mapped_type(target) {
                 self.invoke_once(n, source, target, Checker::infer_from_generic_mapped_types);
             }
-            let priority = n.borrow().priority;
+            let priority = n.priority;
             if !(priority.intersects(InferencePriority::NO_CONSTRAINTS)
                 && self
                     .ty(source)
@@ -719,7 +722,7 @@ impl Checker {
     // Go: checker/inference.go:284 inferFromTypeArguments
     pub fn infer_from_type_arguments(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source_types: &[TypeId],
         target_types: &[TypeId],
         variances: &[VarianceFlags],
@@ -738,45 +741,45 @@ impl Checker {
     // Go: checker/inference.go:294 inferWithPriority
     pub fn infer_with_priority(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
         new_priority: InferencePriority,
     ) {
-        let save_priority = n.borrow().priority;
-        n.borrow_mut().priority |= new_priority;
+        let save_priority = n.priority;
+        n.priority |= new_priority;
         self.infer_from_types(n, source, target);
-        n.borrow_mut().priority = save_priority;
+        n.priority = save_priority;
     }
 
     // Go: checker/inference.go:301 inferFromContravariantTypesWithPriority
     pub fn infer_from_contravariant_types_with_priority(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
         new_priority: InferencePriority,
     ) {
-        let save_priority = n.borrow().priority;
-        n.borrow_mut().priority |= new_priority;
+        let save_priority = n.priority;
+        n.priority |= new_priority;
         self.infer_from_contravariant_types(n, source, target);
-        n.borrow_mut().priority = save_priority;
+        n.priority = save_priority;
     }
 
     // Go: checker/inference.go:308 inferFromContravariantTypes
     pub fn infer_from_contravariant_types(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
     ) {
         {
-            let mut s = n.borrow_mut();
+            let s = &mut *n;
             s.contravariant = !s.contravariant;
         }
         self.infer_from_types(n, source, target);
         {
-            let mut s = n.borrow_mut();
+            let s = &mut *n;
             s.contravariant = !s.contravariant;
         }
     }
@@ -784,11 +787,11 @@ impl Checker {
     // Go: checker/inference.go:314 inferFromContravariantTypesIfStrictFunctionTypes
     pub fn infer_from_contravariant_types_if_strict_function_types(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
     ) {
-        let priority = n.borrow().priority;
+        let priority = n.priority;
         if self.strict_function_types || priority.intersects(InferencePriority::ALWAYS_STRICT) {
             self.infer_from_contravariant_types(n, source, target);
         } else {
@@ -812,10 +815,10 @@ impl Checker {
     // Go: checker/inference.go:335 invokeOnce
     pub fn invoke_once(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
-        action: fn(&mut Checker, &Rc<RefCell<InferenceState>>, TypeId, TypeId),
+        action: fn(&mut Checker, &mut InferenceState, TypeId, TypeId),
     ) {
         // PORT: a type handle equals its Go `id`, so the key needs no type read.
         let key = InferenceKey {
@@ -826,8 +829,7 @@ impl Checker {
         // and the miss path makes the map anyway, so the map contents are the
         // same. The insert after a miss finds the probed slots in cache.
         {
-            let mut guard = n.borrow_mut();
-            let s = &mut *guard;
+            let s = &mut *n;
             let visited = s.visited.get_or_insert_with(InferenceVisitedMap::default);
             if let Some(&p) = visited.get(&key) {
                 s.inference_priority = std::cmp::min(s.inference_priority, p);
@@ -852,7 +854,7 @@ impl Checker {
         let source_id = RecursionKey::new(self.stack_recursion_id(source));
         let target_id = RecursionKey::new(self.stack_recursion_id(target));
         {
-            let mut s = n.borrow_mut();
+            let s = &mut *n;
             save_inference_priority = s.inference_priority;
             s.inference_priority = InferencePriority::MAX_VALUE;
             // We stop inferring and report a circularity if we encounter duplicate recursion identities on both
@@ -861,31 +863,29 @@ impl Checker {
             s.source_stack.push(source, source_id);
             s.target_stack.push(target, target_id);
         }
-        // PORT: the stacks are read through a shared borrow of `n`, instead
-        // of cloned. Nothing reached from isDeeplyNestedType can use `n`; if
-        // that changes, the borrow check panics.
+        // PORT: the stacks are read in place through `n`, instead of cloned.
         let source_nested = {
-            let s = n.borrow();
+            let s = &*n;
             self.is_deeply_nested_inference_top(&s.source_stack, 2)
         };
         if source_nested {
-            n.borrow_mut().expanding_flags |= ExpandingFlags::SOURCE;
+            n.expanding_flags |= ExpandingFlags::SOURCE;
         }
         let target_nested = {
-            let s = n.borrow();
+            let s = &*n;
             self.is_deeply_nested_inference_top(&s.target_stack, 2)
         };
         if target_nested {
-            n.borrow_mut().expanding_flags |= ExpandingFlags::TARGET;
+            n.expanding_flags |= ExpandingFlags::TARGET;
         }
-        let expanding_flags = n.borrow().expanding_flags;
+        let expanding_flags = n.expanding_flags;
         if expanding_flags != ExpandingFlags::BOTH {
             action(self, n, source, target);
         } else {
-            n.borrow_mut().inference_priority = InferencePriority::CIRCULARITY;
+            n.inference_priority = InferencePriority::CIRCULARITY;
         }
         {
-            let mut s = n.borrow_mut();
+            let s = &mut *n;
             s.target_stack.pop();
             s.source_stack.pop();
             s.expanding_flags = save_expanding_flags;
@@ -930,7 +930,7 @@ impl Checker {
     // Go: checker/inference.go:370 inferFromMatchingTypes
     pub fn infer_from_matching_types(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         sources: &[TypeId],
         targets: &[TypeId],
         matches: &mut dyn FnMut(&mut Checker, TypeId, TypeId) -> bool,
@@ -1051,7 +1051,7 @@ impl Checker {
     // Go: checker/inference.go:391 inferToMultipleTypes
     pub fn infer_to_multiple_types(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         targets: &[TypeId],
         target_flags: TypeFlags,
@@ -1074,15 +1074,15 @@ impl Checker {
             // equal priority (i.e. of equal quality) to what we would infer for a naked type
             // parameter.
             for &t in targets {
-                if self.get_inference_info_for_type(&n.borrow(), t).is_some() {
+                if self.get_inference_info_for_type(n, t).is_some() {
                     naked_type_variable = t;
                     type_variable_count += 1;
                 } else {
                     for i in 0..sources.len() {
-                        let save_inference_priority = n.borrow().inference_priority;
-                        n.borrow_mut().inference_priority = InferencePriority::MAX_VALUE;
+                        let save_inference_priority = n.inference_priority;
+                        n.inference_priority = InferencePriority::MAX_VALUE;
                         self.infer_from_types(n, sources[i], t);
-                        let mut s = n.borrow_mut();
+                        let s = &mut *n;
                         if s.inference_priority == s.priority {
                             matched[i] = true;
                         }
@@ -1131,7 +1131,7 @@ impl Checker {
             // make from nested naked type variables and given slightly higher priority by virtue
             // of being first in the candidates array.
             for &t in targets {
-                if self.get_inference_info_for_type(&n.borrow(), t).is_some() {
+                if self.get_inference_info_for_type(n, t).is_some() {
                     type_variable_count += 1;
                 } else {
                     self.infer_from_types(n, source, t);
@@ -1146,7 +1146,7 @@ impl Checker {
             || !target_flags.intersects(TypeFlags::INTERSECTION) && type_variable_count > 0
         {
             for &t in targets {
-                if self.get_inference_info_for_type(&n.borrow(), t).is_some() {
+                if self.get_inference_info_for_type(n, t).is_some() {
                     self.infer_with_priority(n, source, t, InferencePriority::NAKED_TYPE_VARIABLE);
                 }
             }
@@ -1158,7 +1158,7 @@ impl Checker {
     // Go: checker/inference.go:475 getSingleTypeVariableFromIntersectionTypes
     pub fn get_single_type_variable_from_intersection_types(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         types: &[TypeId],
     ) -> TypeId {
         let mut type_variable = TypeId::NIL;
@@ -1167,12 +1167,12 @@ impl Checker {
                 return TypeId::NIL;
             }
             let v = {
-                let state = n.borrow();
+                let state = &*n;
                 self.ty(t)
                     .types()
                     .iter()
                     .copied()
-                    .find(|&t| self.get_inference_info_for_type(&state, t).is_some())
+                    .find(|&t| self.get_inference_info_for_type(state, t).is_some())
                     .unwrap_or(TypeId::NIL)
             };
             if v.is_nil() || type_variable.is_some() && v != type_variable {
@@ -1186,22 +1186,22 @@ impl Checker {
     // Go: checker/inference.go:490 inferToMultipleTypesWithPriority
     pub fn infer_to_multiple_types_with_priority(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         targets: &[TypeId],
         target_flags: TypeFlags,
         new_priority: InferencePriority,
     ) {
-        let save_priority = n.borrow().priority;
-        n.borrow_mut().priority |= new_priority;
+        let save_priority = n.priority;
+        n.priority |= new_priority;
         self.infer_to_multiple_types(n, source, targets, target_flags);
-        n.borrow_mut().priority = save_priority;
+        n.priority = save_priority;
     }
 
     // Go: checker/inference.go:497 inferToConditionalType
     pub fn infer_to_conditional_type(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
     ) {
@@ -1231,7 +1231,7 @@ impl Checker {
                 self.get_true_type_from_conditional_type(target),
                 self.get_false_type_from_conditional_type(target),
             ];
-            let priority = if n.borrow().contravariant {
+            let priority = if n.contravariant {
                 InferencePriority::CONTRAVARIANT_CONDITIONAL
             } else {
                 InferencePriority::NONE
@@ -1250,7 +1250,7 @@ impl Checker {
     // Go: checker/inference.go:509 inferToTemplateLiteralType
     pub fn infer_to_template_literal_type(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: &TemplateLiteralType,
     ) {
@@ -1279,9 +1279,9 @@ impl Checker {
                 if self.ty(source).flags.intersects(TypeFlags::STRING_LITERAL)
                     && self.ty(target).flags.intersects(TypeFlags::TYPE_VARIABLE)
                 {
-                    let inference_context = self.get_inference_info_for_type(&n.borrow(), target);
+                    let inference_context = self.get_inference_info_for_type(n, target);
                     if let Some(inference_context) = inference_context {
-                        let ctx = n.borrow().inferences;
+                        let ctx = n.inferences;
                         let type_parameter = self.inference_context(ctx).inferences
                             [inference_context]
                             .type_parameter;
@@ -1429,7 +1429,7 @@ impl Checker {
     // Go: checker/inference.go:630 inferFromGenericMappedTypes
     pub fn infer_from_generic_mapped_types(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
     ) {
@@ -1451,7 +1451,7 @@ impl Checker {
     // Go: checker/inference.go:642 inferFromObjectTypes
     pub fn infer_from_object_types(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
     ) {
@@ -1573,9 +1573,9 @@ impl Checker {
                         {
                             // Middle of target is [...T, ...U] and source is tuple type
                             let target_info =
-                                self.get_inference_info_for_type(&n.borrow(), element_types[sl]);
+                                self.get_inference_info_for_type(n, element_types[sl]);
                             if let Some(target_info) = target_info {
-                                let ctx = n.borrow().inferences;
+                                let ctx = n.inferences;
                                 let implied_arity = self.inference_context(ctx).inferences
                                     [target_info]
                                     .implied_arity;
@@ -1601,9 +1601,9 @@ impl Checker {
                             // Middle of target is [...T, ...rest] and source is tuple type
                             // if T is constrained by a fixed-size tuple we might be able to use its arity to infer T
                             let info =
-                                self.get_inference_info_for_type(&n.borrow(), element_types[sl]);
+                                self.get_inference_info_for_type(n, element_types[sl]);
                             if let Some(info) = info {
-                                let ctx = n.borrow().inferences;
+                                let ctx = n.inferences;
                                 let type_parameter =
                                     self.inference_context(ctx).inferences[info].type_parameter;
                                 let constraint = self.get_base_constraint_of_type(type_parameter);
@@ -1642,9 +1642,9 @@ impl Checker {
                             // Middle of target is [...rest, ...T] and source is tuple type
                             // if T is constrained by a fixed-size tuple we might be able to use its arity to infer T
                             let info = self
-                                .get_inference_info_for_type(&n.borrow(), element_types[sl + 1]);
+                                .get_inference_info_for_type(n, element_types[sl + 1]);
                             if let Some(info) = info {
-                                let ctx = n.borrow().inferences;
+                                let ctx = n.inferences;
                                 let type_parameter =
                                     self.inference_context(ctx).inferences[info].type_parameter;
                                 let constraint = self.get_base_constraint_of_type(type_parameter);
@@ -1747,7 +1747,7 @@ impl Checker {
     // Go: checker/inference.go:771 inferFromProperties
     pub fn infer_from_properties(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
     ) {
@@ -1787,7 +1787,7 @@ impl Checker {
     // Go: checker/inference.go:781 inferFromSignatures
     pub fn infer_from_signatures(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
         kind: SignatureKind,
@@ -1811,7 +1811,7 @@ impl Checker {
     // Go: checker/inference.go:796 inferFromSignature
     pub fn infer_from_signature(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: SignatureId,
         target: SignatureId,
     ) {
@@ -1820,7 +1820,7 @@ impl Checker {
             .flags
             .intersects(SignatureFlags::IS_NON_INFERRABLE)
         {
-            let save_bivariant = n.borrow().bivariant;
+            let save_bivariant = n.bivariant;
             let mut kind = SyntaxKind::Unknown;
             let declaration = self.sig(target).declaration;
             if declaration.is_some() {
@@ -1828,7 +1828,7 @@ impl Checker {
             }
             // Once we descend into a bivariant signature we remain bivariant for all nested inferences
             {
-                let mut s = n.borrow_mut();
+                let s = &mut *n;
                 s.bivariant = s.bivariant
                     || kind == SyntaxKind::MethodDeclaration
                     || kind == SyntaxKind::MethodSignature
@@ -1841,7 +1841,7 @@ impl Checker {
                     c.infer_from_contravariant_types_if_strict_function_types(n, s, t)
                 },
             );
-            n.borrow_mut().bivariant = save_bivariant;
+            n.bivariant = save_bivariant;
         }
         self.apply_to_return_types(
             source,
@@ -1924,7 +1924,7 @@ impl Checker {
     // Go: checker/inference.go:854 inferFromIndexTypes
     pub fn infer_from_index_types(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
     ) {
@@ -1981,7 +1981,7 @@ impl Checker {
     // Go: checker/inference.go:891 inferToMappedType
     pub fn infer_to_mapped_type(
         &mut self,
-        n: &Rc<RefCell<InferenceState>>,
+        n: &mut InferenceState,
         source: TypeId,
         target: TypeId,
         constraint_type: TypeId,
@@ -2005,9 +2005,9 @@ impl Checker {
             // type and then make a secondary inference from that type to T. We make a secondary inference
             // such that direct inferences to T get priority over inferences to Partial<T>, for example.
             let index_target = self.ty(constraint_type).as_index_type().target;
-            let inference = self.get_inference_info_for_type(&n.borrow(), index_target);
+            let inference = self.get_inference_info_for_type(n, index_target);
             if let Some(inference) = inference {
-                let ctx = n.borrow().inferences;
+                let ctx = n.inferences;
                 let (is_fixed, type_parameter) = {
                     let info = &self.inference_context(ctx).inferences[inference];
                     (info.is_fixed, info.type_parameter)
