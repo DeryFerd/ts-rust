@@ -131,7 +131,7 @@ fn run(args: &[String]) -> i32 {
     }
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        // Go: cmd/tsgo/main.go:29 `signal.NotifyContext(context.Background(), ...)`.
+        // Go: cmd/tsc/main.go:29 `signal.NotifyContext(context.Background(), ...)`.
         // PORT: no signal handling (plan D-W3), so the context never ends.
         tsc_build_compilation(&context::background(), sys.clone(), args, None)
     }));

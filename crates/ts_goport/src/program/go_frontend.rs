@@ -822,6 +822,14 @@ fn replaced_files<'a>(
         // redirect paths of its group, and a shared path-to-slot map would
         // give the new file there. So such a version takes the full build,
         // which keeps Go's map.
+        // The `redirect_files_by_path` half (Go :371) cannot hold here, and
+        // stays as in Go. A redirect path is the path of a package copy that
+        // the loader leaves out of the program files (Go
+        // filesparser.go:467-477, the `continue`), and `old_file` is a
+        // program file. A changed copy at a redirect path takes the full
+        // build in `reuse_program` (frontend/compiler/program_new.rs, Go
+        // program.go:371), so no reused version gets here with it. Test:
+        // `redirect_paths_are_not_program_files`.
         let in_redirect_group = old_np
             .redirect_files_by_path
             .as_ref()
@@ -1732,15 +1740,12 @@ mod tests {
         }
     }
 
-    // followups4 (R153 reviewer): editfast1 gives a full build when a
-    // replaced file is in a package redirect group (`replaced_files`). Go's
-    // ReuseProgram checks only the changed file, not the content-mapper
-    // supplemental files, so a reused program can still replace a file of
-    // a redirect group. Here the same pkg@1.0.0 is in two node_modules
-    // dirs, so one copy redirects to the other.
-    #[test]
-    fn replaced_file_in_redirect_group_takes_the_full_build() {
-        let dir = std::env::temp_dir().join(format!("goport-redirect-{}", std::process::id()));
+    /// A program whose `index.ts` imports two packages, each with its own
+    /// copy of pkg@1.0.0: a package redirect group. The second copy's path
+    /// is a redirect path, and the first copy is its target. `name` names
+    /// the fixture dir. The caller enters the program scope.
+    fn redirect_group_program(name: &str) -> NewProgram {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let pkg = r#"{"name":"pkg","version":"1.0.0","types":"index.d.ts"}"#;
         let files = [
@@ -1782,10 +1787,22 @@ mod tests {
             std::fs::write(path, text).unwrap();
         }
         let config = format!("{}/tsconfig.json", dir.to_string_lossy().replace('\\', "/"));
-        let _scope = crate::core::enter_program(None);
         let opts = load_config(&config, |_| {}, &mut CompileTimes::default()).unwrap();
         let np = new_program(opts);
         let _ = std::fs::remove_dir_all(&dir);
+        np
+    }
+
+    // followups4 (R153 reviewer): editfast1 gives a full build when a
+    // replaced file is in a package redirect group (`replaced_files`). Go's
+    // ReuseProgram checks only the changed file, not the content-mapper
+    // supplemental files, so a reused program can still replace a file of
+    // a redirect group. Here the same pkg@1.0.0 is in two node_modules
+    // dirs, so one copy redirects to the other.
+    #[test]
+    fn replaced_file_in_redirect_group_takes_the_full_build() {
+        let _scope = crate::core::enter_program(None);
+        let np = redirect_group_program("goport-redirect");
 
         let files = np.source_files();
         let old = VersionTables::new((0..files.len()).collect(), std::iter::empty());
@@ -1820,5 +1837,47 @@ mod tests {
         // A replaced file of the group takes the full build.
         let edited = replaced_in_place(&np, pkg);
         assert!(replaced_files(&edited, &np, &old).is_none());
+    }
+
+    // Why the `redirect_files_by_path` half of the bailout in
+    // `replaced_files` cannot hold: no program file has a redirect path,
+    // so a replaced program file is never at one.
+    #[test]
+    fn redirect_paths_are_not_program_files() {
+        let _scope = crate::core::enter_program(None);
+        let np = redirect_group_program("goport-redirect-paths");
+        let redirects = np
+            .redirect_files_by_path
+            .as_ref()
+            .expect("a redirect path for the second copy of pkg");
+        assert!(
+            redirects.keys().any(|path| path
+                .0
+                .ends_with("/node_modules/b/node_modules/pkg/index.d.ts")),
+            "the second copy of pkg is not a redirect path"
+        );
+        let files = np.source_files();
+        assert!(
+            files.iter().any(|file| file
+                .path()
+                .0
+                .ends_with("/node_modules/a/node_modules/pkg/index.d.ts")),
+            "the first copy of pkg is not a program file"
+        );
+        for file in files {
+            assert!(
+                !redirects.contains_key(file.path()),
+                "program file {} has a redirect path",
+                file.path().0
+            );
+        }
+        // Each redirect path still finds its target (Go `filesByPath`).
+        for (path, redirect) in redirects.iter() {
+            let target = np
+                .files_by_path()
+                .get(path)
+                .expect("a file at the redirect path");
+            assert_eq!(target.path(), &redirect.target);
+        }
     }
 }

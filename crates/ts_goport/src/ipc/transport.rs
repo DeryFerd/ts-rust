@@ -176,7 +176,7 @@ struct StdioConn {
 /// One file of a `StdioConn`: Go's nil interface, an open file, or a file
 /// after `Close`. Go reads, writes or closes a nil one and panics with a nil
 /// dereference; a closed `*os.File` gives an error.
-/// PORT: the error texts name the files that cmd/tsgo passes (`os.Stdin`
+/// PORT: the error texts name the files that cmd/tsc passes (`os.Stdin`
 /// and `os.Stdout`); the port's handles carry no name.
 enum StdioFile<T> {
     Nil,

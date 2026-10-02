@@ -1,6 +1,6 @@
-//! `tsgo`: the Go port of cmd/tsgo.
+//! `tsgo`: the Go port of cmd/tsc.
 //!
-//! Go: cmd/tsgo/main.go `runMain`. Every command line other than `--lsp`
+//! Go: cmd/tsc/main.go `runMain`. Every command line other than `--lsp`
 //! and `--api` goes to `execute_tsc::command_line` (Go
 //! `execute.CommandLine`), which parses all arguments.
 //!
@@ -12,7 +12,7 @@
 //! `panic: <message>` on stderr and exit 2.
 //!
 //! `--lsp` and `--api` run `cmd::tsgo::lsp::run_lsp` and
-//! `cmd::tsgo::api::run_api` (Go cmd/tsgo/lsp.go and api.go), the entry
+//! `cmd::tsgo::api::run_api` (Go cmd/tsc/lsp.go and api.go), the entry
 //! points that `goport --lsp` and `goport --api` run too.
 //!
 //! Go `signal.NotifyContext(ctx, SIGINT, SIGTERM)` is
@@ -28,7 +28,7 @@
 //! debug setting and is skipped. The work runs on a thread with the stack
 //! size of `gostd::stack::max_stack_size` (1 GiB with no address space or
 //! data limit), like the other goport bins.
-//! PORT: Go `osSys` and `newSystem` (cmd/tsgo/sys.go) are ported as
+//! PORT: Go `osSys` and `newSystem` (cmd/tsc/sys.go) are ported as
 //! `OsSystem` and `new_os_system` in execute/tsc/compile.rs.
 //! PORT: `enablevtprocessing_windows.go` (the Windows console) is not
 //! ported.
@@ -81,7 +81,7 @@ struct Worker {
     launcher: rustix::process::Pid,
 }
 
-// Go: cmd/tsgo/main.go:14 main
+// Go: cmd/tsc/main.go:14 main
 fn main() {
     // First: it must run before the first heap allocation.
     let huge_pages = ts_goport::thp_guard::thp_guard();
@@ -112,13 +112,14 @@ fn main() {
     // The thread ends the process itself once `run_main` has written the
     // output, so the exit does not wait for the thread stacks (up to 1 GiB
     // each, `max_stack_size`) to unmap, the thread-local destructors or the
-    // join.
-    let work = std::thread::Builder::new()
+    // join. Go runs `runMain` on the main goroutine. A thread that cannot
+    // start ends the process as the Go runtime does (`GoThread`).
+    let work = ts_goport::core::GoThread::new()
         .name("tsgo".to_string())
         .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || exit(run_main(start)));
-    // Reached only when the thread cannot start or `run_main` panics.
-    let _ = work.map(std::thread::JoinHandle::join);
+    // Reached only when `run_main` panics.
+    let _ = work.join();
     eprintln!("tsgo: work thread failed");
     std::process::exit(EXIT_UNPORTED);
 }
@@ -199,6 +200,8 @@ fn launch(huge_pages: bool) -> Option<i32> {
     args.next()?;
     let args: Vec<_> = args.collect();
     let exe = std::env::current_exe().ok()?;
+    // Before the worker starts, so a failed start leaves no worker behind.
+    let forward = forward_signals();
     drop_go_signals();
     // Both ends keep their close-on-exec flag, so the worker and the
     // processes it starts get neither. The worker opens `write` again by
@@ -217,11 +220,16 @@ fn launch(huge_pages: bool) -> Option<i32> {
         .args(args)
         .spawn()
         .ok()?;
-    forward_signals(&worker);
+    if let Some(forward) = forward {
+        let _ = forward.send(rustix::process::Pid::from_child(&worker));
+    }
     // `write` stays open until the worker ends, so the read below ends when
     // the code comes or when the worker has ended without it. The thread
     // does not reap the worker (`NOWAIT`): `wait` below does. When the
-    // thread cannot start, `write` closes now and the read ends at once.
+    // thread cannot start, `write` closes now and the read ends at once:
+    // the launcher then takes the code from the worker's exit, which waits
+    // for the worker's memory to unmap. No code or signal is lost, so this
+    // port-only thread falls back instead of ending the run (`GoThread`).
     let pid = rustix::process::Pid::from_child(&worker);
     let _ = std::thread::Builder::new()
         .name("worker-exit".to_string())
@@ -304,31 +312,41 @@ fn end_with_launcher(launcher: rustix::process::Pid) {
 }
 
 /// Sends each SIGINT and SIGTERM and each signal that Go throws
-/// (`GO_THROWN`) that the launcher gets on to `worker`, on a thread. So a
+/// (`GO_THROWN`) that the launcher gets on to the worker, on a thread. So a
 /// signal reaches the work as in a run without a worker: `notify_context`
 /// catches SIGINT and SIGTERM there, and a plain compile goes on, as in
 /// Go; SIGQUIT prints its name there once, also when it went to the whole
 /// process group. Without this, the signal would end the launcher and then
 /// the parent death signal would kill the worker.
+/// `launch` calls it before it starts the worker and sends the worker's pid
+/// to the returned sender; a signal that comes first waits for it. When no
+/// worker starts, `launch` drops the sender and the thread ends.
+/// The thread starts as a Go runtime thread does (`GoThread`): when the OS
+/// refuses it, the launcher ends with Go's text and exit 2, before there is
+/// a worker that could go on alone (a worker whose launcher has ended runs
+/// as a plain tsgo, see `worker`). Go has no launcher, so its process gets
+/// every signal; a launcher that went on without this thread would drop
+/// them (dropping `signals` removes their actions, not their handlers).
 #[cfg(target_os = "linux")]
-fn forward_signals(worker: &std::process::Child) {
+fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
     use signal_hook::consts::{SIGINT, SIGTERM};
-    let pid = rustix::process::Pid::from_child(worker);
     let thrown = GO_THROWN.iter().map(|(signal, _)| signal.as_raw());
-    let Ok(mut signals) =
-        signal_hook::iterator::Signals::new([SIGINT, SIGTERM].into_iter().chain(thrown))
-    else {
-        return;
-    };
-    let _ = std::thread::Builder::new()
+    let mut signals =
+        signal_hook::iterator::Signals::new([SIGINT, SIGTERM].into_iter().chain(thrown)).ok()?;
+    let (send, receive) = std::sync::mpsc::channel();
+    ts_goport::core::GoThread::new()
         .name("forward-signals".to_string())
         .spawn(move || {
+            let Ok(pid) = receive.recv() else {
+                return;
+            };
             for signal in signals.forever() {
                 if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
                     let _ = rustix::process::kill_process(pid, signal);
                 }
             }
         });
+    Some(send)
 }
 
 /// Signals that the Go runtime catches and drops when no `signal.Notify`
@@ -393,7 +411,11 @@ fn drop_go_signals() {
 /// below the hard limit (`gostd::rlimit::raise_open_file_limit`), and fd 1
 /// is checked for `O_NONBLOCK`, as Go `os.NewFile` does at start
 /// (`stdio::init`). The thread for the thrown signals waits on a pipe until
-/// one comes.
+/// one comes. Go throws in the signal handler, with no thread. The port's
+/// thread starts as a Go runtime thread does (`GoThread`): when the OS
+/// refuses it, the run ends with Go's text and exit 2. Going on without it
+/// would drop the thrown signals (dropping `signals` removes their actions,
+/// not their handlers).
 /// PORT: other systems than Linux keep the default actions (Go's tables
 /// differ there).
 fn go_runtime_start() {
@@ -406,7 +428,7 @@ fn go_runtime_start() {
         let Ok(mut signals) = signal_hook::iterator::Signals::new(thrown) else {
             return;
         };
-        let _ = std::thread::Builder::new()
+        ts_goport::core::GoThread::new()
             .name("go-signals".to_string())
             .spawn(move || {
                 for signal in signals.forever() {
@@ -485,7 +507,7 @@ fn send_code(worker: Worker, code: i32) {
     }
 }
 
-// Go: cmd/tsgo/main.go:18 runMain
+// Go: cmd/tsc/main.go:18 runMain
 // PORT: the arguments are the port form of the Go `osutil.Args()` bytes (see
 // `scanner_util::GO_STRING_MARKER`). The system writer writes the Go bytes
 // of the output (`GoOutput`).

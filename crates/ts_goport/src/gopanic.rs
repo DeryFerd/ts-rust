@@ -248,8 +248,7 @@ impl GoThread {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(f)));
-        newosproc(|| self.builder().spawn(take_once(&slot)))
+        self.start(f, std::thread::Builder::spawn, std::thread::sleep)
     }
 
     /// `std::thread::Builder::spawn_scoped`, with Go's retry and fatal
@@ -264,8 +263,32 @@ impl GoThread {
         F: FnOnce() -> T + Send + 'scope,
         T: Send + 'scope,
     {
+        self.start(
+            f,
+            |builder, run| builder.spawn_scoped(scope, run),
+            std::thread::sleep,
+        )
+    }
+
+    /// Starts a thread that runs `f`: `clone` is `Builder::spawn` or
+    /// `spawn_scoped`, and `sleep` is `std::thread::sleep`. The tests pass
+    /// a `clone` that fails and a `sleep` that records.
+    #[track_caller]
+    fn start<'a, F, T, H>(
+        &self,
+        f: F,
+        mut clone: impl FnMut(std::thread::Builder, ThreadMain<'a, T>) -> std::io::Result<H>,
+        sleep: impl FnMut(std::time::Duration),
+    ) -> H
+    where
+        F: FnOnce() -> T + Send + 'a,
+        T: 'a,
+    {
         let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(f)));
-        newosproc(|| self.builder().spawn_scoped(scope, take_once(&slot)))
+        match retry_on_eagain(|| clone(self.builder(), Box::new(take_once(&slot))), sleep) {
+            Ok(handle) => handle,
+            Err(err) => go_fatal_newosproc(&err),
+        }
     }
 
     fn builder(&self) -> std::thread::Builder {
@@ -279,6 +302,9 @@ impl GoThread {
         builder
     }
 }
+
+/// The function of one try to start a thread (`GoThread::start`).
+type ThreadMain<'a, T> = Box<dyn FnOnce() -> T + Send + 'a>;
 
 /// The function of one try to start a thread. `Builder::spawn` drops the
 /// function of a thread that it could not start, so each try takes `f`
@@ -296,27 +322,31 @@ fn take_once<F: FnOnce() -> T, T>(
     }
 }
 
-// Go: runtime/os_linux.go:170 newosproc (go1.27.1)
-// `retryOnEAGAIN` (runtime/retry.go:14) calls `clone` up to 20 times while
-// it fails with EAGAIN, and sleeps 1, 2, ... 20 ms after each failure.
-// Then, or at once for another error, the start throws.
-// PORT: Go on Windows tries again on ERROR_ACCESS_DENIED instead
+// Go: runtime/retry.go:14 retryOnEAGAIN (go1.27.1)
+// retryOnEAGAIN retries a function until it does not return EAGAIN.
+// It will use an increasing delay between calls, and retry up to 20 times.
+// The function argument is expected to return an errno value,
+// and retryOnEAGAIN will return any errno value other than EAGAIN.
+// If all retries return EAGAIN, then retryOnEAGAIN will return EAGAIN.
+// PORT: Go `newosproc` (runtime/os_linux.go:170) calls it with `clone`, and
+// throws on the error it returns (`GoThread::start`). `sleep` is Go
+// `usleep_no_g`. Go on Windows tries again on ERROR_ACCESS_DENIED instead
 // (runtime/os_windows.go:794 createThread); the port does not.
-#[track_caller]
-fn newosproc<H>(mut clone: impl FnMut() -> std::io::Result<H>) -> H {
+fn retry_on_eagain<H>(
+    mut f: impl FnMut() -> std::io::Result<H>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> std::io::Result<H> {
     let mut tries = 0;
     loop {
-        let err = match clone() {
-            Ok(handle) => return handle,
-            Err(err) => err,
-        };
-        if err.kind() != std::io::ErrorKind::WouldBlock {
-            go_fatal_newosproc(&err)
-        }
-        tries += 1;
-        std::thread::sleep(std::time::Duration::from_millis(tries));
-        if tries == 20 {
-            go_fatal_newosproc(&err)
+        match f() {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                tries += 1;
+                sleep(std::time::Duration::from_millis(tries)); // milliseconds
+                if tries == 20 {
+                    return Err(err);
+                }
+            }
+            result => return result,
         }
     }
 }
@@ -370,4 +400,117 @@ pub fn print_go_panic(payload: &(dyn std::any::Any + Send)) -> bool {
     use std::io::Write;
     let _ = std::io::stderr().write_all(&crate::scanner_util::go_string_bytes(&text));
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+    use std::time::Duration;
+
+    fn eagain() -> Error {
+        Error::from(ErrorKind::WouldBlock)
+    }
+
+    fn ms(range: std::ops::RangeInclusive<u64>) -> Vec<Duration> {
+        range.map(Duration::from_millis).collect()
+    }
+
+    // Go: runtime/retry.go:14 retryOnEAGAIN: 20 calls while the error is
+    // EAGAIN, with a sleep of 1, 2, ... 20 ms after each, then EAGAIN.
+    #[test]
+    fn retry_on_eagain_tries_20_times_with_growing_sleeps() {
+        let mut calls = 0;
+        let mut sleeps = Vec::new();
+        let result: std::io::Result<()> = retry_on_eagain(
+            || {
+                calls += 1;
+                Err(eagain())
+            },
+            |d| sleeps.push(d),
+        );
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert_eq!(calls, 20);
+        assert_eq!(sleeps, ms(1..=20));
+    }
+
+    #[test]
+    fn retry_on_eagain_returns_another_error_or_a_start_at_once() {
+        let mut sleeps = Vec::new();
+        let result: std::io::Result<()> = retry_on_eagain(
+            || Err(Error::from(ErrorKind::OutOfMemory)),
+            |d| sleeps.push(d),
+        );
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::OutOfMemory);
+        assert!(sleeps.is_empty());
+
+        let mut calls = 0;
+        let result = retry_on_eagain(
+            || {
+                calls += 1;
+                if calls < 20 { Err(eagain()) } else { Ok(calls) }
+            },
+            |d| sleeps.push(d),
+        );
+        assert_eq!(result.unwrap(), 20);
+        assert_eq!(sleeps, ms(1..=19));
+    }
+
+    // A failed `Builder::spawn` drops the function it was given. The
+    // function of the thread stays in the slot across the failed starts,
+    // and only the started thread runs it, once.
+    #[test]
+    fn go_thread_keeps_the_function_across_failed_starts() {
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = runs.clone();
+        let mut tries = 0;
+        let mut sleeps = Vec::new();
+        let handle = GoThread::new().name("retry-test".to_string()).start(
+            move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::current().name().map(str::to_string)
+            },
+            |builder, run| {
+                tries += 1;
+                if tries <= 5 {
+                    drop(run);
+                    return Err(eagain());
+                }
+                builder.spawn(run)
+            },
+            |d| sleeps.push(d),
+        );
+        assert_eq!(handle.join().unwrap().as_deref(), Some("retry-test"));
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(tries, 6);
+        assert_eq!(sleeps, ms(1..=5));
+    }
+
+    #[test]
+    fn go_thread_scoped_keeps_the_function_across_failed_starts() {
+        let mut value = 0;
+        let mut tries = 0;
+        let mut sleeps = Vec::new();
+        std::thread::scope(|scope| {
+            let handle = GoThread::new().start(
+                || {
+                    value += 1;
+                    value
+                },
+                |builder, run| {
+                    tries += 1;
+                    if tries <= 19 {
+                        drop(run);
+                        return Err(eagain());
+                    }
+                    builder.spawn_scoped(scope, run)
+                },
+                |d| sleeps.push(d),
+            );
+            assert_eq!(handle.join().unwrap(), 1);
+        });
+        assert_eq!(value, 1);
+        assert_eq!(tries, 20);
+        assert_eq!(sleeps, ms(1..=19));
+    }
 }

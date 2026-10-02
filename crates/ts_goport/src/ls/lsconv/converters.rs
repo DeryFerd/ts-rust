@@ -138,7 +138,7 @@ impl Script for Node {
         source_file_file_name(*self)
     }
 
-    // Go: ast/ast.go:2569 (*SourceFile).OriginalFileName
+    // Go: ast/ast.go:2556 (*SourceFile).OriginalFileName
     fn original_file_name(&self) -> &str {
         source_file_original_file_name(*self)
     }
@@ -147,12 +147,12 @@ impl Script for Node {
         ScriptText::File(source_file_text(*self))
     }
 
-    // Go: ast/ast.go:2579 (*SourceFile).SpanMap
+    // Go: ast/ast.go:2566 (*SourceFile).SpanMap
     fn span_map(&self) -> Option<&SpanMap> {
         source_file_span_map(*self)
     }
 
-    // Go: ast/ast.go:2561 (*SourceFile).OriginalText
+    // Go: ast/ast.go:2548 (*SourceFile).OriginalText
     fn original_text(&self) -> ScriptText<'_> {
         ScriptText::File(source_file_original_text(*self))
     }
@@ -418,7 +418,7 @@ fn lsp_range_to_virtual<T: Script + Clone>(
 }
 
 impl Converters {
-    // Go: ls/lsconv/converters.go:189 (*Converters).lspRangeToVirtual
+    // Go: ls/lsconv/converters.go:187 (*Converters).lspRangeToVirtual
     fn lsp_range_to_virtual(
         &self,
         script: &dyn Script,
@@ -505,7 +505,7 @@ pub fn from_lsp_range_to_original(
     )
 }
 
-// Go: ls/lsconv/converters.go:225 sourceFileProjections
+// Go: ls/lsconv/converters.go:232 sourceFileProjections
 fn source_file_projections(file: Node) -> Vec<Node> {
     let supplemental = source_file_supplemental_source_files(file);
     let mut files = Vec::with_capacity(1 + supplemental.len());
@@ -537,7 +537,7 @@ fn lsp_position_to_virtual<T: Script + Clone>(
 }
 
 impl Converters {
-    // Go: ls/lsconv/converters.go:242 (*Converters).lspPositionToVirtual
+    // Go: ls/lsconv/converters.go:249 (*Converters).lspPositionToVirtual
     fn lsp_position_to_virtual(
         &self,
         script: &dyn Script,
@@ -605,7 +605,7 @@ impl Script for ScriptOrOriginal<'_> {
     }
 }
 
-// Go: ls/lsconv/converters.go:254 virtualRangeToOriginal
+// Go: ls/lsconv/converters.go:261 virtualRangeToOriginal
 // virtualRangeToOriginal maps a content mapper's virtual range back to its original text.
 // A nil feature bypasses feature filtering for diagnostics and edits.
 // PORT: Go `feature *spanmap.Feature`; nil is `None`.
@@ -637,7 +637,7 @@ fn virtual_range_to_original(
     )
 }
 
-// Go: ls/lsconv/converters.go:269 virtualPositionToOriginal
+// Go: ls/lsconv/converters.go:276 virtualPositionToOriginal
 // virtualPositionToOriginal is the single-position analog of virtualRangeToOriginal.
 fn virtual_position_to_original(
     script: &dyn Script,
@@ -663,7 +663,7 @@ fn virtual_position_to_original(
     )
 }
 
-// Go: ls/lsconv/converters.go:589 originalTextScript
+// Go: ls/lsconv/converters.go:596 originalTextScript
 // originalTextScript presents a content-mapped file's original (untransformed) text as a Script, so that
 // ranges already mapped into that text convert to the correct line/character positions.
 // PORT: Go copies the two strings; here the script borrows them.
@@ -673,33 +673,33 @@ struct OriginalTextScript<'a> {
 }
 
 impl Script for OriginalTextScript<'_> {
-    // Go: ls/lsconv/converters.go:594 originalTextScript.FileName
+    // Go: ls/lsconv/converters.go:601 originalTextScript.FileName
     fn file_name(&self) -> &str {
         self.file_name
     }
 
-    // Go: ls/lsconv/converters.go:595 originalTextScript.OriginalFileName
+    // Go: ls/lsconv/converters.go:602 originalTextScript.OriginalFileName
     fn original_file_name(&self) -> &str {
         self.file_name
     }
 
-    // Go: ls/lsconv/converters.go:596 originalTextScript.Text
+    // Go: ls/lsconv/converters.go:603 originalTextScript.Text
     fn text(&self) -> ScriptText<'_> {
         ScriptText::Borrowed(&self.text)
     }
 
-    // Go: ls/lsconv/converters.go:597 originalTextScript.OriginalText
+    // Go: ls/lsconv/converters.go:604 originalTextScript.OriginalText
     fn original_text(&self) -> ScriptText<'_> {
         ScriptText::Borrowed(&self.text)
     }
 
-    // Go: ls/lsconv/converters.go:598 originalTextScript.SpanMap
+    // Go: ls/lsconv/converters.go:605 originalTextScript.SpanMap
     fn span_map(&self) -> Option<&SpanMap> {
         None
     }
 }
 
-// Go: ls/lsconv/converters.go:283 LanguageKindToScriptKind
+// Go: ls/lsconv/converters.go:290 LanguageKindToScriptKind
 // PORT: Go passes the string value; here by reference.
 #[must_use]
 pub fn language_kind_to_script_kind(language_id: &lsproto::LanguageKind) -> ScriptKind {
@@ -713,7 +713,7 @@ pub fn language_kind_to_script_kind(language_id: &lsproto::LanguageKind) -> Scri
     }
 }
 
-// Go: ls/lsconv/converters.go:301 extraEscapeReplacer
+// Go: ls/lsconv/converters.go:308 extraEscapeReplacer
 // https://github.com/microsoft/vscode-uri/blob/edfdccd976efaf4bb8fdeca87e97c47257721729/src/uri.ts#L455
 // PORT: Go `strings.NewReplacer` with one-byte old strings (Go picks its byte
 // replacer). The pairs are kept in Go order; `extra_escape_replacer_replace`
@@ -762,7 +762,7 @@ fn extra_escape_replacer_replace(s: &str) -> String {
     out
 }
 
-// Go: ls/lsconv/converters.go:325 FileNameToDocumentURI
+// Go: ls/lsconv/converters.go:332 FileNameToDocumentURI
 #[must_use]
 pub fn file_name_to_document_uri(file_name: &str) -> lsproto::DocumentUri {
     if is_bundled(file_name) {
@@ -979,7 +979,7 @@ impl Converters {
     }
 }
 
-// Go: ls/lsconv/converters.go:444 diagnosticOptions
+// Go: ls/lsconv/converters.go:451 diagnosticOptions
 struct DiagnosticOptions {
     report_style_checks_as_warnings: bool,
     related_information: bool,
@@ -987,7 +987,7 @@ struct DiagnosticOptions {
     visual_studio: bool,
 }
 
-// Go: ls/lsconv/converters.go:452 DiagnosticToLSPPull
+// Go: ls/lsconv/converters.go:459 DiagnosticToLSPPull
 // DiagnosticToLSPPull converts a diagnostic for pull diagnostics (textDocument/diagnostic)
 pub fn diagnostic_to_lsp_pull(
     ctx: &Context,
@@ -1010,7 +1010,7 @@ pub fn diagnostic_to_lsp_pull(
     )
 }
 
-// Go: ls/lsconv/converters.go:464 DiagnosticToLSPPush
+// Go: ls/lsconv/converters.go:471 DiagnosticToLSPPush
 // DiagnosticToLSPPush converts a diagnostic for push diagnostics (textDocument/publishDiagnostics)
 pub fn diagnostic_to_lsp_push(
     ctx: &Context,
@@ -1032,7 +1032,7 @@ pub fn diagnostic_to_lsp_push(
     )
 }
 
-// Go: ls/lsconv/converters.go:475 styleCheckDiagnostics
+// Go: ls/lsconv/converters.go:482 styleCheckDiagnostics
 // https://github.com/microsoft/vscode/blob/93e08afe0469712706ca4e268f778cfadf1a43ef/extensions/typescript-language-features/src/typeScriptServiceClientHost.ts#L40C7-L40C29
 static STYLE_CHECK_DIAGNOSTICS: LazyLock<FxHashSet<i32>> = LazyLock::new(|| {
     [
@@ -1049,7 +1049,7 @@ static STYLE_CHECK_DIAGNOSTICS: LazyLock<FxHashSet<i32>> = LazyLock::new(|| {
     .collect()
 });
 
-// Go: ls/lsconv/converters.go:486 diagnosticToLSP
+// Go: ls/lsconv/converters.go:493 diagnosticToLSP
 fn diagnostic_to_lsp(
     ctx: &Context,
     converters: &Converters,
@@ -1157,7 +1157,7 @@ fn diagnostic_to_lsp(
     }
 }
 
-// Go: ls/lsconv/converters.go:570 diagnosticScriptAndRange
+// Go: ls/lsconv/converters.go:577 diagnosticScriptAndRange
 // diagnosticScriptAndRange resolves the text basis and range to report a diagnostic against. For a
 // content-mapped file it maps the diagnostic's virtual range back to the original text so
 // the range lines up with what the editor shows; the original text's line map is already what
@@ -1192,7 +1192,7 @@ fn diagnostic_script_and_range<'a>(
     (ScriptOrOriginal::Original(original), mapped)
 }
 
-// Go: ls/lsconv/converters.go:601 diagnosticSeverity
+// Go: ls/lsconv/converters.go:608 diagnosticSeverity
 // diagnosticSeverity maps a diagnostic category to its LSP severity.
 fn diagnostic_severity(category: crate::diagnostics::Category) -> lsproto::DiagnosticSeverity {
     match category {
@@ -1203,7 +1203,7 @@ fn diagnostic_severity(category: crate::diagnostics::Category) -> lsproto::Diagn
     }
 }
 
-// Go: ls/lsconv/converters.go:614 messageChainToString
+// Go: ls/lsconv/converters.go:621 messageChainToString
 fn message_chain_to_string(diagnostic: &Diagnostic, locale: &locale::Locale) -> String {
     if diagnostic.message_chain().is_empty() {
         return diagnostic.localize(locale);
@@ -1213,7 +1213,7 @@ fn message_chain_to_string(diagnostic: &Diagnostic, locale: &locale::Locale) -> 
     b
 }
 
-// Go: ls/lsconv/converters.go:623 ptrToSliceIfNonEmpty
+// Go: ls/lsconv/converters.go:630 ptrToSliceIfNonEmpty
 fn ptr_to_slice_if_non_empty<T>(s: Vec<T>) -> Option<Vec<T>> {
     if s.is_empty() {
         return None;
@@ -1221,7 +1221,7 @@ fn ptr_to_slice_if_non_empty<T>(s: Vec<T>) -> Option<Vec<T>> {
     Some(s)
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:259 WriteFlattenedASTDiagnosticMessage
+// Go: diagnosticwriter/diagnosticwriter.go:354 WriteFlattenedASTDiagnosticMessage
 // PORT: Go package `diagnosticwriter`. The `String` writer version in
 // program.rs is private, and the execute/tsc version writes to its own
 // `Writer`, so the three Go functions are ported here for a `String`.
@@ -1237,7 +1237,7 @@ fn write_flattened_ast_diagnostic_message(
     write_flattened_diagnostic_message(writer, diagnostic, newline, locale);
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:263 WriteFlattenedDiagnosticMessage
+// Go: diagnosticwriter/diagnosticwriter.go:358 WriteFlattenedDiagnosticMessage
 fn write_flattened_diagnostic_message(
     writer: &mut String,
     diagnostic: &Diagnostic,
@@ -1251,7 +1251,7 @@ fn write_flattened_diagnostic_message(
     }
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:271 flattenDiagnosticMessageChain
+// Go: diagnosticwriter/diagnosticwriter.go:366 flattenDiagnosticMessageChain
 fn flatten_diagnostic_message_chain(
     writer: &mut String,
     chain: &Diagnostic,

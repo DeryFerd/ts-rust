@@ -1,4 +1,4 @@
-//! Go `cmd/tsgo/api.go`.
+//! Go `cmd/tsc/api.go`.
 
 use crate::cmd::tsgo::prelude::*;
 
@@ -10,7 +10,7 @@ use crate::gostd::context;
 use std::io::Write;
 use std::sync::Arc;
 
-// Go: cmd/tsgo/api.go:17 apiFlags (tsgo#4712)
+// Go: cmd/tsc/api.go:17 apiFlags (tsgo#4712)
 struct ApiFlags {
     cwd: String,
     pipe_path: String,
@@ -20,7 +20,7 @@ struct ApiFlags {
     run_external_code: bool,
 }
 
-// Go: cmd/tsgo/api.go:26 parseAPIFlags (tsgo#4712)
+// Go: cmd/tsc/api.go:26 parseAPIFlags (tsgo#4712)
 // PORT: Go `StringVar` and `BoolVar` write into `result` as the flags are
 // parsed. The port's flag set has only `String` and `Bool`, so the values
 // are read into the result after the parse. The flag order and texts are
@@ -69,7 +69,7 @@ fn parse_api_flags(args: &[String]) -> Result<ApiFlags, GoError> {
 struct OsSystemSpawner(tsc::OsSystem);
 
 impl contentmapper::Spawner for OsSystemSpawner {
-    // Go: cmd/tsgo/sys.go:68 osSys.Spawn
+    // Go: cmd/tsc/sys.go:68 osSys.Spawn
     fn spawn(
         &self,
         command: &[String],
@@ -80,7 +80,7 @@ impl contentmapper::Spawner for OsSystemSpawner {
     }
 }
 
-// Go: cmd/tsgo/api.go:41 runAPI
+// Go: cmd/tsc/api.go:41 runAPI
 pub fn run_api(args: &[String]) -> i32 {
     let Ok(flags) = parse_api_flags(args) else {
         return 2;
