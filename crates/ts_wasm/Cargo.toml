@@ -7,8 +7,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+# Only a cdylib: cargo does not run LTO for a lib that is also an rlib, so
+# the `wasm` profile's fat LTO needs this (270 KB smaller).
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 ts_goport = { path = "../ts_goport", default-features = false }
