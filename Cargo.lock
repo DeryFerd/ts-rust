@@ -141,6 +141,7 @@ name = "goport_util"
 version = "7.0.0-dev"
 dependencies = [
  "indexmap",
+ "lzma-rust2",
  "memchr",
  "name-to-handle-at",
  "nix",
@@ -269,6 +270,12 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
+name = "lzma-rust2"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fde178a3caf126c440fa15628147772d8ee590a39477d711353fbe2e58a73a5b"
 
 [[package]]
 name = "memchr"

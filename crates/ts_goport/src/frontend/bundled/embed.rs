@@ -5,6 +5,10 @@
 //! `bundled:///libs/lib.*.d.ts` (see the oracle `*.files.txt` lists). The
 //! lib texts come from `crates/ts_goport/libs`, a copy of the pinned
 //! `internal/bundled/libs` (see its PROVENANCE.md).
+//!
+//! PORT: the wasm build embeds the libs packed (LZMA, 0.48 MB in place of
+//! 3.79 MB; see `parts/goport_util/build.rs`) and unpacks each lib on its
+//! first read. The names and texts do not change.
 
 use super::{SNAPSHOT_TEXT_MIN, const_hash};
 use crate::frontend::prelude::*;
@@ -50,12 +54,27 @@ pub fn is_bundled(path: &str) -> bool {
 /// brought every page of lib.dom (2.3 MB of the binary) into the RSS of a
 /// program that uses it. With this hash a load reads no page of the text.
 // PORT: not in Go.
+#[cfg(not(target_family = "wasm"))]
 #[must_use]
 pub fn embedded_text_hash(text: &str) -> Option<u64> {
     EMBEDDED_CONTENTS
         .iter()
         .find(|&&(_, lib, hash)| hash != 0 && std::ptr::eq(lib, text))
         .map(|&(_, _, hash)| hash)
+}
+
+/// wasm: `embedded_text_hash` of a lib that `embedded_contents` unpacked.
+/// The hash is computed here: the text was not in the module to hash at
+/// compile time.
+// PORT: not in Go.
+#[cfg(target_family = "wasm")]
+#[must_use]
+pub fn embedded_text_hash(text: &str) -> Option<u64> {
+    EMBEDDED_CONTENTS
+        .iter()
+        .filter_map(|&(_, _, lib)| lib.get())
+        .find(|lib| lib.len() >= SNAPSHOT_TEXT_MIN && std::ptr::eq(lib.as_str(), text))
+        .map(|lib| const_hash(lib.as_bytes()))
 }
 
 /// The base name of bundled lib path `path` (`bundled:///libs/lib.dom.d.ts`
@@ -229,6 +248,7 @@ fn new_file_info(name: &str, mode: FileMode, size: i64) -> FileInfo {
 
 // Go: embed_generated.go:232 embeddedContents
 // PORT: the Go map is built once from `EMBEDDED_CONTENTS`.
+#[cfg(not(target_family = "wasm"))]
 fn embedded_contents(rest: &str) -> Option<&'static str> {
     static MAP: OnceLock<FxHashMap<&'static str, &'static str>> = OnceLock::new();
     MAP.get_or_init(|| {
@@ -241,12 +261,40 @@ fn embedded_contents(rest: &str) -> Option<&'static str> {
     .copied()
 }
 
+// Go: embed_generated.go:232 embeddedContents
+// PORT: wasm packs each lib (build.rs). The first read unpacks it into its
+// `OnceLock`, which keeps the text for the life of the process.
+#[cfg(target_family = "wasm")]
+fn embedded_contents(rest: &str) -> Option<&'static str> {
+    let &(_, packed, text) = EMBEDDED_CONTENTS.iter().find(|&&(path, ..)| path == rest)?;
+    Some(text.get_or_init(|| unpack(packed)))
+}
+
+/// wasm: the text of a lib that build.rs packed (an `.lzma` stream).
+#[cfg(target_family = "wasm")]
+fn unpack(packed: &[u8]) -> String {
+    use std::io::Read;
+    let mut text = Vec::new();
+    lzma_rust2::LzmaReader::new_mem_limit(packed, u32::MAX, None)
+        .and_then(|mut reader| reader.read_to_end(&mut text))
+        .expect("build.rs packs each lib");
+    String::from_utf8(text).expect("a lib is UTF-8")
+}
+
+/// One `EMBEDDED_CONTENTS` entry (see `bundled_lib!`).
+#[cfg(not(target_family = "wasm"))]
+type EmbeddedLib = (&'static str, &'static str, u64);
+/// wasm: the path, the packed text and the text once unpacked.
+#[cfg(target_family = "wasm")]
+type EmbeddedLib = (&'static str, &'static [u8], &'static OnceLock<String>);
+
 // PORT: one `EMBEDDED_CONTENTS` entry, from `crates/ts_goport/libs`: the
 // path, the text and its compile-time `snapshot_text_hash`. The include path
 // is relative to this file: this file builds in `goport_util`, whose
 // manifest dir is not `crates/ts_goport`.
 // `crates/ts_goport/scripts/copy-libs.sh` copies the same set for a noembed
 // build.
+#[cfg(not(target_family = "wasm"))]
 macro_rules! bundled_lib {
     ($name:literal) => {{
         const TEXT: &str = include_str!(concat!("../../../libs/", $name));
@@ -257,9 +305,22 @@ macro_rules! bundled_lib {
     }};
 }
 
+/// wasm: one `EMBEDDED_CONTENTS` entry: the path, the lib as build.rs
+/// packed it into `OUT_DIR`, and its own `OnceLock` for the text.
+// PORT: not in Go.
+#[cfg(target_family = "wasm")]
+macro_rules! bundled_lib {
+    ($name:literal) => {{
+        static TEXT: OnceLock<String> = OnceLock::new();
+        let packed: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libs/", $name, ".lzma"));
+        (concat!("libs/", $name), packed, &TEXT)
+    }};
+}
+
 /// `const_hash` of `text` for a snapshot lib (`SNAPSHOT_TEXT_MIN`), else 0.
 /// Only the three snapshot libs are hashed, so the compile-time evaluation
 /// stays short (about 3 s for 3.4 MB).
+#[cfg(not(target_family = "wasm"))]
 const fn snapshot_text_hash(text: &str) -> u64 {
     if text.len() >= SNAPSHOT_TEXT_MIN {
         const_hash(text.as_bytes())
@@ -269,7 +330,7 @@ const fn snapshot_text_hash(text: &str) -> u64 {
 }
 
 // Go: embed_generated.go:13 (the go:embed variables)
-static EMBEDDED_CONTENTS: &[(&str, &str, u64)] = &[
+static EMBEDDED_CONTENTS: &[EmbeddedLib] = &[
     bundled_lib!("lib.d.ts"),
     bundled_lib!("lib.decorators.d.ts"),
     bundled_lib!("lib.decorators.legacy.d.ts"),
