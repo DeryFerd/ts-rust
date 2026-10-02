@@ -265,6 +265,10 @@ pub struct AheadQueue {
     pub next: std::sync::atomic::AtomicUsize,
     /// Per key: `KEY_FREE`, `KEY_WORKER`, `KEY_DONE` or `KEY_LOADER`.
     states: Box<[std::sync::atomic::AtomicU8]>,
+    /// The key that the loader waits for on `done_cv`, or `usize::MAX`.
+    waiting: std::sync::atomic::AtomicUsize,
+    done_lock: std::sync::Mutex<()>,
+    done_cv: std::sync::Condvar,
 }
 
 const KEY_FREE: u8 = 0;
@@ -275,6 +279,10 @@ const KEY_WORKER: u8 = 1;
 const KEY_DONE: u8 = 2;
 /// The loader resolves the key itself.
 const KEY_LOADER: u8 = 3;
+
+/// How many times the loader checks a key that a worker resolves before
+/// it sleeps (`AheadQueue::wait_or_take`): about 2 to 4 microseconds.
+const WAIT_SPINS: u32 = 64;
 
 /// How many keys after the cursor `AheadQueue::find` looks at. The loader
 /// meets the keys of the previous load in its order, less removed keys
@@ -291,7 +299,16 @@ impl AheadQueue {
             keys,
             next: std::sync::atomic::AtomicUsize::new(0),
             states,
+            waiting: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            done_lock: std::sync::Mutex::new(()),
+            done_cv: std::sync::Condvar::new(),
         }
+    }
+
+    fn lock_done(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.done_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// A worker takes the next key that the loader did not take: its index
@@ -310,9 +327,15 @@ impl AheadQueue {
         }
     }
 
-    /// A worker ended key `index` (after it published the answer).
+    /// A worker ended key `index` (after it published the answer), and
+    /// wakes the loader when it waits for the key.
     pub fn done(&self, index: usize) {
-        self.states[index].store(KEY_DONE, std::sync::atomic::Ordering::Release);
+        use std::sync::atomic::Ordering;
+        self.states[index].store(KEY_DONE, Ordering::SeqCst);
+        if self.waiting.load(Ordering::SeqCst) == index {
+            let _done = self.lock_done();
+            self.done_cv.notify_all();
+        }
     }
 
     /// The index of the loader's key `key`, from `cursor` on, and moves
@@ -335,17 +358,24 @@ impl AheadQueue {
         match state.compare_exchange(KEY_FREE, KEY_LOADER, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) | Err(KEY_LOADER) => false,
             Err(_) => {
-                // A resolution takes some microseconds; the worker runs on
-                // another core.
-                let mut spins = 0u32;
-                while state.load(Ordering::Acquire) == KEY_WORKER {
-                    spins += 1;
-                    if spins % 256 == 0 {
-                        std::thread::yield_now();
-                    } else {
-                        std::hint::spin_loop();
+                // Most resolutions end within a few microseconds: spin a
+                // little, then sleep until the worker ends the key (`done`).
+                for _ in 0..WAIT_SPINS {
+                    if state.load(Ordering::Acquire) != KEY_WORKER {
+                        return true;
                     }
+                    std::hint::spin_loop();
                 }
+                self.waiting.store(index, Ordering::SeqCst);
+                let mut done = self.lock_done();
+                while state.load(Ordering::SeqCst) == KEY_WORKER {
+                    done = self
+                        .done_cv
+                        .wait(done)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                drop(done);
+                self.waiting.store(usize::MAX, Ordering::SeqCst);
                 true
             }
         }
@@ -552,10 +582,11 @@ struct AheadThread {
     calls: Option<Vec<AheadCall>>,
     /// False when the resolution made a call that the loader cannot check.
     shareable: bool,
-    /// The hash of each file that this thread read, by name. The
+    /// The hash of each file that this worker read, by name. The
     /// package.json cache of the worker's resolver keeps the parses of
-    /// these texts, and a later resolution that reads the cache logs the
-    /// read again (`Caches::log_package_json`).
+    /// these texts (from job to job, compiler/resolve_ahead.rs), and a
+    /// later resolution that reads the cache logs the read again
+    /// (`Caches::log_package_json`).
     reads: FxHashMap<String, Option<u128>>,
 }
 
@@ -567,22 +598,32 @@ thread_local! {
 /// Makes this thread a resolve-ahead worker: its resolutions log their file
 /// system calls (`note_ahead_call`). `current_directory` and
 /// `use_case_sensitive_file_names` make the paths, as the host's `to_path`.
-pub fn begin_ahead_thread(current_directory: &str, use_case_sensitive_file_names: bool) {
+/// `reads` has the hash of the text of each package.json that the
+/// worker's package.json cache has already.
+pub fn begin_ahead_thread(
+    current_directory: &str,
+    use_case_sensitive_file_names: bool,
+    reads: FxHashMap<String, Option<u128>>,
+) {
     AHEAD.with(|ahead| {
         *ahead.borrow_mut() = Some(AheadThread {
             current_directory: current_directory.to_string(),
             use_case_sensitive_file_names,
             calls: None,
             shareable: true,
-            reads: FxHashMap::default(),
+            reads,
         });
     });
 }
 
-/// Ends `begin_ahead_thread`.
-pub fn end_ahead_thread() {
-    let state = AHEAD.with(|ahead| ahead.borrow_mut().take());
-    drop(state);
+/// Ends `begin_ahead_thread`: the hashes of the files that the worker read
+/// (`AheadThread::reads`).
+#[must_use]
+pub fn end_ahead_thread() -> FxHashMap<String, Option<u128>> {
+    AHEAD
+        .with(|ahead| ahead.borrow_mut().take())
+        .map(|state| state.reads)
+        .unwrap_or_default()
 }
 
 /// Logs `call` in the resolution that runs on this thread, if it logs.

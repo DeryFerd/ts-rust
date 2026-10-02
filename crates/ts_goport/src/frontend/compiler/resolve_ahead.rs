@@ -127,8 +127,13 @@ struct ResolverConfig {
 }
 
 impl ResolverConfig {
-    /// A resolver with the loader resolver's options on `fs`.
-    fn new_resolver(&self, fs: Rc<dyn Fs>) -> DefaultResolver {
+    /// A resolver with the loader resolver's options on `fs`, with
+    /// `package_json_cache` or a new one.
+    fn new_resolver(
+        &self,
+        fs: Rc<dyn Fs>,
+        package_json_cache: Option<Rc<InfoCache>>,
+    ) -> DefaultResolver {
         new_resolver(ResolverOptions {
             host: Some(Rc::new(AheadResolutionHost {
                 fs,
@@ -138,7 +143,7 @@ impl ResolverConfig {
             typings_location: self.typings_location.clone(),
             project_name: self.project_name.clone(),
             extra_extensions: self.extra_extensions.clone(),
-            package_json_cache: None,
+            package_json_cache,
         })
     }
 }
@@ -173,8 +178,10 @@ impl ResolveAhead {
             .previous_keys
             .filter(|keys| !keys.is_empty())
             .and_then(|keys| {
-                Workers::get()?.post(Job {
+                let workers = Workers::get()?;
+                workers.post(Job {
                     queue: Arc::new(AheadQueue::new(keys)),
+                    fresh_package_jsons: workers.fresh_package_jsons.swap(false, Ordering::Relaxed),
                     closed: AtomicBool::new(false),
                     left: AtomicUsize::new(0),
                     answers: Arc::new(SharedResolutionCache::default()),
@@ -238,6 +245,13 @@ impl ResolveAhead {
             new_keys: keys.len(),
             loader: link.stats.get(),
         };
+        // A rejected answer can come from a kept package.json parse whose
+        // file changed: the workers of the next load parse again.
+        if stats.loader.rejected > 0
+            && let Some(workers) = Workers::get()
+        {
+            workers.fresh_package_jsons.store(true, Ordering::Relaxed);
+        }
         LAST_STATS.with(|last| last.set(Some(stats)));
         print_stats(&stats);
         keep_keys(keys);
@@ -310,6 +324,9 @@ struct Workers {
     left: Condvar,
     /// The workers that started.
     count: AtomicUsize,
+    /// The next job drops the package.json parses that the workers keep
+    /// (`KeptPackageJsons`).
+    fresh_package_jsons: AtomicBool,
 }
 
 #[derive(Default)]
@@ -350,6 +367,7 @@ impl Workers {
                 wake: Condvar::new(),
                 left: Condvar::new(),
                 count: AtomicUsize::new(0),
+                fresh_package_jsons: AtomicBool::new(false),
             }));
             for _ in 0..count {
                 // A worker that cannot start only makes fewer answers.
@@ -453,6 +471,8 @@ fn run_worker(workers: &'static Workers) {
 struct Job {
     /// The keys of the previous load, in its order.
     queue: Arc<AheadQueue>,
+    /// The workers drop the package.json parses that they keep.
+    fresh_package_jsons: bool,
     closed: AtomicBool,
     /// The workers that left this job.
     left: AtomicUsize,
@@ -471,12 +491,17 @@ struct Job {
 /// freed here, on the worker.
 fn run_job(job: &Arc<Job>) {
     let view = &job.view;
-    begin_ahead_thread(&view.current_directory, view.use_case_sensitive_file_names);
+    let (package_jsons, reads) = KeptPackageJsons::take(job);
+    begin_ahead_thread(
+        &view.current_directory,
+        view.use_case_sensitive_file_names,
+        reads,
+    );
     let fs: Rc<dyn Fs> = Rc::new(AheadFs {
         os: wrap_fs(osvfs_fs()),
         job: job.clone(),
     });
-    let mut resolver = job.config.new_resolver(fs);
+    let mut resolver = job.config.new_resolver(fs, Some(package_jsons.clone()));
     resolver.caches.shared = Some(SharedResolutionLink {
         cache: job.answers.clone(),
         publish: true,
@@ -501,8 +526,70 @@ fn run_job(job: &Arc<Job>) {
     if let Some(index) = current.get() {
         job.queue.done(index);
     }
-    end_ahead_thread();
+    let reads = end_ahead_thread();
     drop(resolver);
+    KEPT.with(|kept| {
+        *kept.borrow_mut() = Some(KeptPackageJsons {
+            current_directory: view.current_directory.clone(),
+            use_case_sensitive_file_names: view.use_case_sensitive_file_names,
+            cache: package_jsons,
+            reads,
+        });
+    });
+}
+
+thread_local! {
+    /// A worker's package.json cache from its last job.
+    static KEPT: RefCell<Option<KeptPackageJsons>> = const { RefCell::new(None) };
+}
+
+/// A worker's package.json cache, kept from job to job, so a worker does
+/// not parse the same package.json files at every load. The loader checks
+/// each logged read by the hash of its text on the snapshot file system,
+/// so it never takes an answer from a parse whose file changed: it
+/// rejects the answer, and the next job starts with no kept parse
+/// (`Workers::fresh_package_jsons`). Only parses of files that the worker
+/// read are kept: a directory or package.json that was missing can be
+/// there now, and the loader does not check that.
+// PORT: not in Go (perf).
+struct KeptPackageJsons {
+    current_directory: String,
+    use_case_sensitive_file_names: bool,
+    cache: Rc<InfoCache>,
+    /// The hash of each file that the worker read, by name
+    /// (`begin_ahead_thread`).
+    reads: FxHashMap<String, Option<u128>>,
+}
+
+impl KeptPackageJsons {
+    /// The package.json cache and read hashes for `job` on this worker:
+    /// the kept entries of files that the worker read, or none.
+    fn take(job: &Job) -> (Rc<InfoCache>, FxHashMap<String, Option<u128>>) {
+        let view = &job.view;
+        let cache = Rc::new(new_info_cache(
+            &view.current_directory,
+            view.use_case_sensitive_file_names,
+        ));
+        let mut reads = FxHashMap::default();
+        let kept = KEPT.with(|kept| kept.borrow_mut().take()).filter(|kept| {
+            !job.fresh_package_jsons
+                && kept.current_directory == view.current_directory
+                && kept.use_case_sensitive_file_names == view.use_case_sensitive_file_names
+        });
+        if let Some(mut kept) = kept {
+            kept.cache.range(|_, entry| {
+                if entry.directory_exists && entry.contents.is_some() {
+                    let file_name = combine_paths(&entry.package_directory, &["package.json"]);
+                    if let Some((file_name, Some(hash))) = kept.reads.remove_entry(&file_name) {
+                        cache.set(&file_name, entry.clone());
+                        reads.insert(file_name, Some(hash));
+                    }
+                }
+                true
+            });
+        }
+        (cache, reads)
+    }
 }
 
 /// Go `module.ResolutionHost` of a worker resolver.
@@ -654,7 +741,7 @@ fn debug_check_answer(
     calls: &[AheadCall],
 ) {
     let (containing_directory, module_name, mode, _) = key;
-    let resolver = config.new_resolver(scratch.fs.clone());
+    let resolver = config.new_resolver(scratch.fs.clone(), None);
     let (own, _, _) =
         resolver.resolve_module_name_from_directory(module_name, containing_directory, mode);
     assert_eq!(
