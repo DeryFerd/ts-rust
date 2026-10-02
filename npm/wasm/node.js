@@ -3,6 +3,7 @@
 // main thread's stack is about 1 MB. The worker makes a new instance of
 // the module, which is compiled once per process.
 
+import { statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { Worker } from "node:worker_threads";
 export { memoryFileSystem, runTsc } from "./core.js";
@@ -24,7 +25,8 @@ export function loadModule() {
  * Runs `tsc` with `args`.
  *
  * Without `options.files`, it reads and writes the real file system from
- * `options.cwd` (default `process.cwd()`). With `options.files` (path to
+ * `options.cwd` (default: the current directory as `getwd` gives it, the
+ * same path as the native tsgo). With `options.files` (path to
  * text, absolute paths), it reads only those files, and `result.files`
  * holds every file after the run, emitted ones included.
  *
@@ -43,7 +45,7 @@ export async function tsc(args, options = {}) {
         workerData: {
             module,
             args,
-            cwd: toPosix(options.cwd ?? process.cwd()),
+            cwd: toPosix(options.cwd ?? getwd()),
             files,
             env: options.env ?? {},
             diagnosticsJson: options.diagnostics === "json",
@@ -64,6 +66,26 @@ export async function tsc(args, options = {}) {
             else resolve(result);
         });
     });
+}
+
+/**
+ * The current directory as Go's `os.Getwd` gives it: `$PWD` when it is an
+ * absolute path to the current directory, else `process.cwd()`. The two
+ * differ when a shell entered the directory through a symlink (`/tmp` on
+ * macOS is `/private/tmp`). Then `process.cwd()` is the real path, and tsc
+ * would print other paths than the native tsgo.
+ */
+function getwd() {
+    const cwd = process.cwd();
+    const pwd = process.env.PWD;
+    if (process.platform === "win32" || !pwd?.startsWith("/") || pwd === cwd) return cwd;
+    try {
+        const dot = statSync(".");
+        const dir = statSync(pwd);
+        return dot.dev === dir.dev && dot.ino === dir.ino ? pwd : cwd;
+    } catch {
+        return cwd;
+    }
 }
 
 /** `C:\a\b` to `C:/a/b`: tsc paths use `/`. */

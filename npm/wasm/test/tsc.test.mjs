@@ -2,11 +2,16 @@
 // scripts/wasm/build.sh (WASM_PROFILE=release for a fast build).
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { tsc } from "../node.js";
+
+const cli = fileURLToPath(new URL("../bin/tsc-wasm.js", import.meta.url));
 
 const project = {
     "/p/tsconfig.json": JSON.stringify({
@@ -82,6 +87,57 @@ test("reads and writes the real file system", async () => {
         assert.equal(result.stdout, "");
         assert.equal(result.exitCode, 0);
         assert.equal(readFileSync(join(dir, "out", "b.js"), "utf8"), "export const answer = 42;\n");
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("keeps a symlinked current directory, as tsgo does", () => {
+    const real = mkdtempSync(join(tmpdir(), "ts-rust-wasm-"));
+    const link = `${real}-link`;
+    try {
+        symlinkSync(real, link);
+        writeFileSync(join(real, "a.ts"), "export {};\n");
+        // A shell that entered the link sets PWD to it.
+        const run = spawnSync(process.execPath, [cli, "--listFilesOnly", "--types", "", "--lib", "es5", "a.ts"], {
+            cwd: link,
+            env: { ...process.env, PWD: link },
+            encoding: "utf8",
+        });
+        assert.equal(run.status, 0);
+        assert.equal(run.stdout.trim().split("\n").at(-1), `${link}/a.ts`);
+    } finally {
+        rmSync(link, { force: true });
+        rmSync(real, { recursive: true, force: true });
+    }
+});
+
+test("writes all output to a slow non-blocking pipe", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ts-rust-wasm-"));
+    try {
+        // About 230 KB of diagnostics, more than a pipe buffer holds.
+        const lines = Array.from({ length: 3000 }, (_, i) => i + 1);
+        writeFileSync(join(dir, "a.ts"), lines.map(i => `export const x${i}: number = "";\n`).join(""));
+        const want = lines
+            .map(i => `a.ts(${i},14): error TS2322: Type 'string' is not assignable to type 'number'.\n`)
+            .join("");
+        // The preload opens process.stdout, which makes the pipe non-blocking,
+        // as a Node parent that shares the pipe does.
+        const preload = ["--import", "data:text/javascript,process.stdout.isTTY"];
+        const args = ["--types", "", "--lib", "es5", "a.ts", "--noEmit"];
+        const child = spawn(process.execPath, [...preload, cli, ...args], { cwd: dir });
+        const closed = once(child, "close");
+        const chunks = [];
+        child.stdout.on("data", chunk => chunks.push(chunk));
+        // Read nothing for a second, so the pipe fills up.
+        child.stdout.pause();
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        child.stdout.resume();
+        const [code] = await closed;
+        const stdout = Buffer.concat(chunks).toString();
+        assert.equal(code, 2);
+        assert.equal(stdout.length, want.length);
+        assert.ok(stdout === want, "stdout differs");
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

@@ -71,16 +71,27 @@ function caseInsensitive() {
     return swapped !== process.execPath && fs.existsSync(swapped);
 }
 
-/** Writes to fd `fd`, and drops the rest of the output once its reader has gone (EPIPE). */
+const pauseCell = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * Writes each chunk to fd `fd` in full, and drops the rest of the output
+ * once its reader has gone (EPIPE). The fd can be non-blocking: a Node
+ * process that opens `process.stdout` on a pipe makes it so, for every
+ * process that shares the pipe. Then a write can be short, or fail with
+ * EAGAIN while the reader is slow, and this waits 1 ms and writes again.
+ */
 function streamTo(fd) {
     let open = true;
     return chunk => {
-        if (!open) return;
-        try {
-            fs.writeSync(fd, chunk);
-        } catch (error) {
-            if (error.code !== "EPIPE") throw error;
-            open = false;
+        let at = 0;
+        while (open && at < chunk.length) {
+            try {
+                at += fs.writeSync(fd, chunk, at, chunk.length - at);
+            } catch (error) {
+                if (error.code === "EAGAIN") Atomics.wait(pauseCell, 0, 0, 1);
+                else if (error.code === "EPIPE") open = false;
+                else throw error;
+            }
         }
     };
 }
