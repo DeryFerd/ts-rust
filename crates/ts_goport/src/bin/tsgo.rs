@@ -378,8 +378,8 @@ fn own_proc() -> bool {
 /// to the returned sender; a signal that comes first waits for it. When no
 /// worker starts, `launch` drops the sender and the thread ends. Each
 /// signal also waits until the worker catches it (`wait_until_caught`),
-/// only with this process's own /proc (`own_proc`). Otherwise it goes on
-/// at once.
+/// for at most `HOLD_LIMIT` after the worker starts, and only with this
+/// process's own /proc (`own_proc`). Otherwise it goes on at once.
 /// The thread starts as a Go runtime thread does (`GoThread`): when the OS
 /// refuses it, the launcher ends with Go's text and exit 2, before there is
 /// a worker. Go has no launcher, so its process gets every signal; a
@@ -398,11 +398,12 @@ fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
             let Ok(pid) = receive.recv() else {
                 return;
             };
-            let hold = own_proc();
+            // The worker has started.
+            let hold = own_proc().then(|| Instant::now() + HOLD_LIMIT);
             for signal in signals.forever() {
                 if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
-                    if hold {
-                        wait_until_caught(pid, signal);
+                    if let Some(until) = hold {
+                        wait_until_caught(pid, signal, until);
                     }
                     let _ = rustix::process::kill_process(pid, signal);
                 }
@@ -420,15 +421,24 @@ fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
 /// before any work (cmd/tsc/main.go:29).
 /// The kernel lists the caught signals in /proc/<pid>/status (`SigCgt`, a
 /// hex mask with bit N-1 for signal N). The caller calls it only with
-/// this process's own /proc (`own_proc`). The wait ends when the worker has
-/// ended, and at once when that file does not show a live child of this
-/// process: the signal then goes on at once.
+/// this process's own /proc (`own_proc`). It reads the file at once, then
+/// after pauses of 1, 2, 4 and 8 ms, then every 8 ms. The wait ends when
+/// the worker catches the signal or has ended, when that file does not
+/// show a live child of this process, and at `until`.
 #[cfg(target_os = "linux")]
-fn wait_until_caught(pid: rustix::process::Pid, signal: rustix::process::Signal) {
+fn wait_until_caught(pid: rustix::process::Pid, signal: rustix::process::Signal, until: Instant) {
     let path = format!("/proc/{}/status", pid.as_raw_pid());
     let launcher = rustix::process::getpid().as_raw_pid().to_string();
     let bit = 1u64 << (signal.as_raw() - 1).unsigned_abs();
-    while let Ok(status) = std::fs::read_to_string(&path) {
+    let mut pause = std::time::Duration::from_millis(1);
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        let Ok(status) = std::fs::read_to_string(&path) else {
+            return;
+        };
         let field = |name: &str| {
             status
                 .lines()
@@ -437,14 +447,22 @@ fn wait_until_caught(pid: rustix::process::Pid, signal: rustix::process::Signal)
         };
         let child = field("PPid:") == Some(launcher.as_str());
         let live = field("State:").is_some_and(|state| !state.starts_with(['Z', 'X']));
-        match field("SigCgt:").and_then(|mask| u64::from_str_radix(mask, 16).ok()) {
-            Some(caught) if child && live && caught & bit == 0 => {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            _ => return,
+        let caught = field("SigCgt:").and_then(|mask| u64::from_str_radix(mask, 16).ok());
+        if !(child && live && caught.is_some_and(|caught| caught & bit == 0)) {
+            return;
         }
+        std::thread::sleep(pause.min(left));
+        pause = (pause * 2).min(std::time::Duration::from_millis(8));
     }
 }
+
+/// How long after the worker starts a forwarded signal can wait for the
+/// worker's handlers (`wait_until_caught`). The worker sets them a few
+/// milliseconds after its start. After this time a signal goes on at once,
+/// as without the wait, so no wait lasts the whole run (a worker that is
+/// stopped at its start, for example).
+#[cfg(target_os = "linux")]
+const HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Gives SIGINT, SIGTERM and the signals that Go throws (`GO_THROWN`) their
 /// default actions back when `launch` starts no worker after
