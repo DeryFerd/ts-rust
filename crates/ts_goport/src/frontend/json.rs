@@ -2204,7 +2204,7 @@ fn json_append_multiline_pieces(
 }
 
 // Go: json/json.go:49 MarshalIndentWrite
-// Used by execute/tsc.go:375 showConfig (prefix "", indent four spaces).
+// Used by execute/tsc.go:405 showConfig (prefix "", indent four spaces).
 // PORT: the indented output comes from `json_marshal_indent` (see the
 // PORT notes there and on `json_marshal_write`). There is no trailing
 // newline. It goes out in the writes of Go's streaming encoder
@@ -2491,16 +2491,58 @@ mod marshal_indent_tests {
         assert_eq!(json_marshal_indent("s", "", "  ").unwrap(), "\"s\"");
     }
 
-    // PORT: not in Go. The writes of Go's streaming encoder for a
-    // `--showConfig` with 31 files (one name needs an escape), recorded with
-    // strace from the pin N oracle: 83 149 178 299 294 46 bytes.
+    /// The compact `--showConfig` value of a config with 31 files (one name
+    /// needs an escape).
+    const SHOW_CONFIG_31: &str = r#"{"compilerOptions":{"lib":["es2022","dom"],"module":"nodenext","outDir":"./out","paths":{"@a/*":["./src/*"]},"strict":true,"target":"es2022","moduleResolution":"nodenext","moduleDetection":"force"},"files":["./m1.ts","./m10.ts","./m11.ts","./m12.ts","./m13.ts","./m14.ts","./m15.ts","./m16.ts","./m17.ts","./m18.ts","./m19.ts","./m2.ts","./m20.ts","./m21.ts","./m22.ts","./m23.ts","./m24.ts","./m25.ts","./m26.ts","./m27.ts","./m28.ts","./m29.ts","./m3.ts","./m30.ts","./m4.ts","./m5.ts","./m6.ts","./m7.ts","./m8.ts","./m9.ts","./q\"x.ts"],"exclude":["out"]}"#;
+
+    // PORT: not in Go. The writes of Go's streaming encoder for
+    // `SHOW_CONFIG_31`, recorded with strace from the pin N oracle: 83 149
+    // 178 299 294 46 bytes.
     #[test]
     fn json_stream_pieces_match_go_show_config_writes() {
-        let compact = r#"{"compilerOptions":{"lib":["es2022","dom"],"module":"nodenext","outDir":"./out","paths":{"@a/*":["./src/*"]},"strict":true,"target":"es2022","moduleResolution":"nodenext","moduleDetection":"force"},"files":["./m1.ts","./m10.ts","./m11.ts","./m12.ts","./m13.ts","./m14.ts","./m15.ts","./m16.ts","./m17.ts","./m18.ts","./m19.ts","./m2.ts","./m20.ts","./m21.ts","./m22.ts","./m23.ts","./m24.ts","./m25.ts","./m26.ts","./m27.ts","./m28.ts","./m29.ts","./m3.ts","./m30.ts","./m4.ts","./m5.ts","./m6.ts","./m7.ts","./m8.ts","./m9.ts","./q\"x.ts"],"exclude":["out"]}"#;
         let mut pieces = JsonStreamPieces::default();
-        let out = json_append_multiline_pieces(compact, "", "    ", Some(&mut pieces)).unwrap();
+        let out =
+            json_append_multiline_pieces(SHOW_CONFIG_31, "", "    ", Some(&mut pieces)).unwrap();
         assert_eq!(out.len(), 1049);
         assert_eq!(pieces.ends, [83, 232, 410, 709, 1003, 1049]);
+    }
+
+    // The write loop of `json_marshal_indent_write`: one write of the
+    // writer per piece, so `--showConfig` writes fd 1 in Go's pieces (the
+    // system writer writes each one at once, `stdio::CliStdout`).
+    #[test]
+    fn json_marshal_indent_write_writes_go_pieces() {
+        /// A value whose compact text is given.
+        struct Compact(&'static str);
+        impl MarshalerTo for Compact {
+            fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+                enc.push_str(self.0);
+                Ok(())
+            }
+        }
+        /// Keeps each write as one piece, an empty one too, as the system
+        /// writer writes each one (`GoOutput`).
+        #[derive(Default)]
+        struct Writes(Vec<Vec<u8>>);
+        impl std::io::Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.write_all(buf)?;
+                Ok(buf.len())
+            }
+            fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+                self.0.push(buf.to_vec());
+                Ok(())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writes = Writes::default();
+        json_marshal_indent_write(&mut writes, &Compact(SHOW_CONFIG_31), "", "    ").unwrap();
+        let sizes: Vec<usize> = writes.0.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [83, 149, 178, 299, 294, 46]);
+        let text = json_append_multiline(SHOW_CONFIG_31, "", "    ").unwrap();
+        assert_eq!(writes.0.concat(), text.into_bytes());
     }
 }
 
