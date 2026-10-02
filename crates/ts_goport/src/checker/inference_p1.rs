@@ -310,17 +310,21 @@ impl Checker {
     }
 
     // Go: checker/inference.go:65 inferFromTypes
-    pub fn infer_from_types(
-        &mut self,
-        n: &mut InferenceState,
-        source: TypeId,
-        target: TypeId,
-    ) {
-        let mut source = source;
-        let mut target = target;
+    // PERF: Go's first test runs inline in each caller, so the many calls
+    // that it ends skip the large frame of `infer_from_types_worker`.
+    #[inline]
+    pub fn infer_from_types(&mut self, n: &mut InferenceState, source: TypeId, target: TypeId) {
         if !self.could_contain_type_variables(target) || self.is_no_infer_type(target) {
             return;
         }
+        self.infer_from_types_worker(n, source, target);
+    }
+
+    // Go: checker/inference.go:65 inferFromTypes, after its first test
+    #[inline(never)]
+    fn infer_from_types_worker(&mut self, n: &mut InferenceState, source: TypeId, target: TypeId) {
+        let mut source = source;
+        let mut target = target;
         if source == self.wildcard_type || source == self.blocked_string_type {
             // We are inferring from an 'any' type. We want to infer this type for every type parameter
             // referenced in the target type, so we record it as the propagation type and infer from the
