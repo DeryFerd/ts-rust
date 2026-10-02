@@ -543,24 +543,28 @@ process (bin/tsgo.rs `go_runtime_start`).
   It is not SIG_IGN, so a process that tsgo starts gets the default
   actions, as from Go, and a wait for a child works when the caller
   ignored SIGCHLD (the kernel reaps the children of a process that
-  ignores it). SIGQUIT, SIGSTKFLT and SIGSYS print the Go
-  name (`SIGQUIT: quit`) and exit 2, also when they were ignored at start.
-  SIGINT and SIGTERM go to `notify_context`. PORT: Go then prints the
-  goroutines. SIGABRT and SIGTRAP keep their default actions. Other
-  systems keep the default actions.
+  ignores it). SIGQUIT, SIGSTKFLT and SIGSYS print the Go name (`SIGQUIT:
+  quit`) and exit 2, also when they were ignored at start (PORT: Go then
+  prints the goroutines). SIGINT and SIGTERM go to `notify_context`.
+  SIGHUP ends the process by SIGHUP, as Go's `dieFromSignal`, unless it
+  was ignored at start (the `SigIgn` line of /proc/self/status; Go then
+  keeps it ignored, so a process that tsgo starts gets it ignored too).
+  PORT: SIGABRT and SIGTRAP keep their default actions. Other systems keep
+  the default actions.
 - The pid 1 of a PID namespace (`docker run` without `--init`, `unshare
   -pf`, `bwrap --as-pid-1`): the kernel drops each signal with the default
-  action that such a process gets from its namespace or sends itself. Go's
+  action that such a process gets from its namespace or sends itself. Go
+  catches every signal above, so its SIGHUP still ends the run: Go's
   `dieFromSignal` raises the signal, and when that returns it exits
   128 + N, as a shell reports a process that a signal ended. tsgo does the
-  same (bin/tsgo.rs `end_by_signal`): a launcher whose worker a signal
-  ended exits 128 + N. PORT: std and rustix have no safe `SIG_DFL`, and
-  signal-hook's default action calls `abort` when the raise returns, which
-  ends a pid 1 by SIGSEGV (rc 139). So a pid 1 does not raise the signal;
-  it exits 128 + N at once. PORT: the SIGPIPE of a broken stdout or stderr
-  (execute/tsc/stdio.rs `sigpipe`) still uses signal-hook's default action,
-  so a pid 1 that runs the work itself (no worker) ends there by SIGSEGV
-  (139) where Go exits 141.
+  same (bin/tsgo.rs `end_by_signal`): SIGHUP exits 129, and a launcher
+  whose worker a signal ended exits 128 + N. PORT: std and rustix have no
+  safe `SIG_DFL`, and signal-hook's default action calls `abort` when the
+  raise returns, which ends a pid 1 by SIGSEGV (rc 139). So a pid 1 does
+  not raise the signal; it exits 128 + N at once. PORT: the SIGPIPE of a
+  broken stdout or stderr (execute/tsc/stdio.rs `sigpipe`) still uses
+  signal-hook's default action, so a pid 1 that runs the work itself
+  (no worker) ends there by SIGSEGV (139) where Go exits 141.
 - PORT: SIGILL, SIGBUS, SIGFPE and SIGSEGV keep their default actions,
   also when another process sends them (`kill`). Go throws a sent one
   (`sigFromUser`) as it throws SIGQUIT: it prints the name (`SIGSEGV:
@@ -577,9 +581,12 @@ process (bin/tsgo.rs `go_runtime_start`).
 - PORT: `GOTRACEBACK` does nothing. With `GOTRACEBACK=crash`, Go ends a
   thrown signal or a fatal panic with SIGABRT (`crash`, a core dump) after
   the goroutines; the port exits 2 as with the default setting.
-- The launcher (`launch`) drops the same signals and sends SIGINT, SIGTERM
-  and the thrown signals on to its worker. When a signal ends the worker,
-  the launcher ends by the same signal (a pid 1 exits 128 + N). The worker
+- The launcher (`launch`) drops the same signals and sends SIGINT,
+  SIGTERM, SIGHUP and the thrown signals on to its worker. It takes
+  SIGHUP only after the worker has started, so the worker gets the
+  caller's action for it (an exec keeps an ignored signal and gives a
+  caught one its default action). When a signal ends the worker, the
+  launcher ends by the same signal (a pid 1 exits 128 + N). The worker
   gets no environment variable and no file descriptor from the launcher,
   so its children get none: its `arg0` names the launcher, and at exit it
   opens the launcher's end of the pipe through /proc (first with
@@ -617,9 +624,9 @@ process (bin/tsgo.rs `go_runtime_start`).
   (the diagnostics of an emit with the file list, the statistics table,
   the `--showConfig` value) are kept and go out together, at most 64 KiB
   at a time: the same bytes in fewer writes. A process that ends inside a
-  report by SIGKILL, SIGHUP, an OOM kill or `core::go_fatal_newosproc`
-  loses the kept bytes (up to 64 KiB of that report); Go's file has the
-  pieces written so far. A thrown signal and a panic write them first.
+  report by SIGKILL, an OOM kill or `core::go_fatal_newosproc` loses the
+  kept bytes (up to 64 KiB of that report); Go's file has the pieces
+  written so far. A thrown signal, SIGHUP and a panic write them first.
 - Open files (Go syscall/rlimit.go): the soft RLIMIT_NOFILE goes up to one
   below the hard limit. The content mapper and npm starts
   (execute/tsc/compile.rs, cmd/tsgo/lsp.rs) go through

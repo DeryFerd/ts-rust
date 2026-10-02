@@ -23,7 +23,8 @@
 //!
 //! As the Go runtime does at start (`go_runtime_start`): the signals that Go
 //! drops get a handler that does nothing, SIGQUIT prints its name and exits
-//! 2, and the soft open-file limit goes up (PORTING.md "Process start").
+//! 2, SIGHUP ends the process by SIGHUP, and the soft open-file limit goes
+//! up (PORTING.md "Process start").
 //! PORT: Go `core.ApplyDebugStackLimit` (`TS_GO_DEBUG_STACK_LIMIT`) is a
 //! debug setting and is skipped. The work runs on a thread with the stack
 //! size of `gostd::stack::max_stack_size` (1 GiB with no address space or
@@ -179,7 +180,7 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
 /// does. None when this process runs the work: it is a worker, no worker is
 /// wanted, `--lsp`, `--api` or watch mode (`long_running`: they end on
 /// their own), or the worker cannot start. The launcher sends SIGINT,
-/// SIGTERM and the signals that Go throws on to the worker
+/// SIGTERM, SIGHUP and the signals that Go throws on to the worker
 /// (`forward_signals`), and drops the signals that Go drops, SIGCHLD too
 /// (`drop_go_signals`: an ignored SIGCHLD would make `wait` fail). When a
 /// signal kills the worker, the launcher ends by the same signal
@@ -343,31 +344,70 @@ fn has_ended(pid: rustix::process::Pid) -> bool {
 /// pid in each PID namespace from the one of /proc down to its own, so it
 /// is the one pid that `getpid` gives only in its own /proc. A kernel
 /// without that line (before 4.1) has the `Pid` line, the pid in the
-/// namespace of /proc. False without /proc. The first call reads the file;
-/// the later calls use its result.
+/// namespace of /proc. False without /proc (`own_status`).
 #[cfg(target_os = "linux")]
 fn own_proc() -> bool {
-    static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OWN.get_or_init(|| {
+    own_status().own_proc
+}
+
+/// Whether SIGHUP was ignored (`SIG_IGN`) when this process started, from
+/// the `SigIgn` line of /proc/self/status (a hex mask with bit N-1 for
+/// signal N). Go then keeps it ignored (`sigInstallGoHandler`), and so does
+/// tsgo: it sets no handler for it (`go_runtime_start`, `forward_signals`).
+/// /proc/self is this process in any /proc that shows it.
+/// PORT: std, rustix and signal-hook have no safe way to read an action.
+/// Without /proc, SIGHUP counts as not ignored.
+#[cfg(target_os = "linux")]
+fn hup_ignored() -> bool {
+    own_status().hup_ignored
+}
+
+/// What /proc/self/status says (`own_proc`, `hup_ignored`). The first call
+/// reads the file, before this process sets a handler for SIGHUP; the
+/// later calls use its result. All false without the file.
+#[cfg(target_os = "linux")]
+fn own_status() -> OwnStatus {
+    static STATUS: std::sync::OnceLock<OwnStatus> = std::sync::OnceLock::new();
+    *STATUS.get_or_init(|| {
         let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-            return false;
+            return OwnStatus::default();
         };
         let pid = rustix::process::getpid().as_raw_pid().to_string();
         let field = |name: &str| status.lines().find_map(|line| line.strip_prefix(name));
-        match field("NSpid:") {
+        let own_proc = match field("NSpid:") {
             Some(pids) => pids.split_whitespace().eq([pid.as_str()]),
             None => field("Pid:").map(str::trim) == Some(pid.as_str()),
+        };
+        let ignored = field("SigIgn:").and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok());
+        let hup = 1u64 << (signal_hook::consts::SIGHUP - 1);
+        OwnStatus {
+            own_proc,
+            hup_ignored: ignored.is_some_and(|ignored| ignored & hup != 0),
         }
     })
 }
 
-/// Sends each SIGINT and SIGTERM and each signal that Go throws
+/// See `own_status`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Default)]
+struct OwnStatus {
+    own_proc: bool,
+    hup_ignored: bool,
+}
+
+/// Sends each SIGINT, SIGTERM and SIGHUP and each signal that Go throws
 /// (`GO_THROWN`) that the launcher gets on to the worker, on a thread. So a
 /// signal reaches the work as in a run without a worker: `notify_context`
 /// catches SIGINT and SIGTERM there, and a plain compile goes on, as in
 /// Go; SIGQUIT prints its name there once, also when it went to the whole
-/// process group. Without this, the signal would end the launcher and then
-/// the parent-death signal would kill the worker.
+/// process group; SIGHUP ends the worker (`die_from_signal`) and then the
+/// launcher by the same signal. Without this, the signal would end the
+/// launcher and then the parent-death signal would kill the worker, and a
+/// launcher that is pid 1 would not get SIGHUP at all (`end_by_signal`).
+/// The thread takes SIGHUP only after the worker has started and only when
+/// it was not ignored at start (`hup_ignored`): an exec keeps an ignored
+/// signal but gives a caught one its default action, so the worker gets
+/// the caller's action for SIGHUP, as `go_runtime_start` needs.
 /// `launch` calls it before it starts the worker and sends the worker's pid
 /// to the returned sender; a signal that comes first waits for it. When no
 /// worker starts, `launch` drops the sender and the thread ends. Each
@@ -394,6 +434,9 @@ fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
             };
             // The worker has started.
             let hold = own_proc().then(|| Instant::now() + HOLD_LIMIT);
+            if !hup_ignored() {
+                let _ = signals.add_signal(signal_hook::consts::SIGHUP);
+            }
             for signal in signals.forever() {
                 if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
                     if let Some(until) = hold {
@@ -576,15 +619,18 @@ fn drop_go_signals() {
 /// The start of a process that runs the work, as the Go runtime and the Go
 /// `syscall` package start: the signals that Go drops get a handler that
 /// does nothing (`drop_go_signals`), a signal that Go throws (`GO_THROWN`)
-/// ends the process (`throw`), the soft open-file limit goes up to one
+/// ends the process (`throw`), SIGHUP ends it by SIGHUP, unless it was
+/// ignored at start (`die_from_signal`, `hup_ignored`; as a pid 1 it exits
+/// 129, where the default action would do nothing), the soft open-file
+/// limit goes up to one
 /// below the hard limit (`gostd::rlimit::raise_open_file_limit`), and fd 1
 /// is checked for `O_NONBLOCK`, as Go `os.NewFile` does at start
 /// (`stdio::init`). The thread for the thrown signals waits on a pipe until
 /// one comes. Go throws in the signal handler, with no thread. The port's
 /// thread starts as a Go runtime thread does (`GoThread`): when the OS
 /// refuses it, the run ends with Go's text and exit 2. Going on without it
-/// would drop the thrown signals (dropping `signals` removes their actions,
-/// not their handlers).
+/// would drop the thrown signals and SIGHUP (dropping `signals` removes
+/// their actions, not their handlers).
 /// PORT: other systems than Linux keep the default actions (Go's tables
 /// differ there).
 fn go_runtime_start() {
@@ -594,16 +640,19 @@ fn go_runtime_start() {
     {
         drop_go_signals();
         let thrown = GO_THROWN.iter().map(|(signal, _)| signal.as_raw());
-        let Ok(mut signals) = signal_hook::iterator::Signals::new(thrown) else {
+        let hup = (!hup_ignored()).then_some(signal_hook::consts::SIGHUP);
+        let Ok(mut signals) = signal_hook::iterator::Signals::new(thrown.chain(hup)) else {
             return;
         };
         end_default_actions(&THROWN_DEFAULT);
         ts_goport::core::GoThread::new()
             .name("go-signals".to_string())
             .spawn(move || {
-                for signal in signals.forever() {
-                    if let Some((_, name)) = GO_THROWN.iter().find(|(s, _)| s.as_raw() == signal) {
-                        throw(name);
+                // Each one ends the process.
+                if let Some(signal) = signals.forever().next() {
+                    match GO_THROWN.iter().find(|(s, _)| s.as_raw() == signal) {
+                        Some((_, name)) => throw(name),
+                        None => die_from_signal(signal),
                     }
                 }
             });
@@ -632,6 +681,21 @@ fn throw(name: &str) -> ! {
         send_code(worker, EXIT_GO_PANIC);
     }
     signal_hook::low_level::exit(EXIT_GO_PANIC)
+}
+
+/// Ends the process after SIGHUP as the Go runtime ends it after a signal
+/// with `_SigKill` in its table when no `signal.Notify` asks for it
+/// (`dieFromSignal`; tsgo asks only for SIGINT and SIGTERM). First it
+/// writes the kept stdout bytes, as `throw` does, so a file has the pieces
+/// written so far, as Go's has. Then it ends by the signal
+/// (`end_by_signal`), or, as a pid 1, exits 128 + N, as Go does there. It
+/// sends no code: a launcher takes the signal from the worker's exit and
+/// ends by it too. It ends with `_exit`, as `throw` does.
+#[cfg(target_os = "linux")]
+fn die_from_signal(signal: i32) -> ! {
+    ts_goport::execute::tsc::stdio::flush_cli_stdout_at_exit();
+    end_by_signal(signal);
+    signal_hook::low_level::exit(128 + signal)
 }
 
 /// Ends this process by `signal` with the default action of the signal, as
