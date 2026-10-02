@@ -92,10 +92,10 @@ fn main() {
     // Unused off Linux (`launch` is Linux only).
     #[cfg(not(target_os = "linux"))]
     let _ = huge_pages;
+    // A worker gets its parent-death signal here, or ends when its
+    // launcher has ended (`worker`).
     #[cfg(target_os = "linux")]
-    if let Some(worker) = worker() {
-        end_with_launcher(worker.launcher);
-    }
+    let _ = worker();
     // One budget sets the parse and bind threads and the malloc arenas.
     // tsgo has one more thread with an arena than goport: the
     // `notify_context` signal thread.
@@ -267,11 +267,21 @@ fn launch(huge_pages: bool) -> Option<i32> {
 }
 
 /// This process as a worker (see `launch`): its `arg0` is `WORKER_ARG0`
-/// with a launcher and its pipe, and its parent is that launcher. A
-/// worker whose launcher ends before the first call runs as a plain tsgo.
-/// The first call decides, at the start of `main`.
+/// with a launcher and its pipe, and its parent is that launcher. The
+/// first call decides, at the start of `main`. A worker gets a
+/// parent-death SIGKILL, so it ends when its launcher ends, as a killed Go
+/// tsgo stops at once.
+/// A process whose `arg0` names a launcher that is not its parent runs as
+/// a plain tsgo, unless that launcher has ended (`has_ended`). Then this
+/// process is the launcher's worker and the launcher died before the
+/// parent check (a SIGKILL soon after the start), so it kills itself, as
+/// the parent-death signal would have. std and rustix have no safe way to
+/// set that signal between fork and exec, so the launcher can also die
+/// after the check and before the signal is set: the second parent check
+/// finds that.
 #[cfg(target_os = "linux")]
 fn worker() -> Option<Worker> {
+    use rustix::process::{Signal, getpid, getppid, kill_process, set_parent_process_death_signal};
     static WORKER: std::sync::OnceLock<Option<Worker>> = std::sync::OnceLock::new();
     *WORKER.get_or_init(|| {
         let arg0 = std::env::args_os().next()?;
@@ -287,27 +297,38 @@ fn worker() -> Option<Worker> {
         if fields.next().is_some() {
             return None;
         }
-        (rustix::process::getppid() == Some(launcher)).then_some(Worker {
-            fd,
-            dev,
-            ino,
-            launcher,
-        })
+        if getppid() == Some(launcher) {
+            let _ = set_parent_process_death_signal(Some(Signal::KILL));
+            if getppid() == Some(launcher) {
+                return Some(Worker {
+                    fd,
+                    dev,
+                    ino,
+                    launcher,
+                });
+            }
+        } else if !has_ended(launcher) {
+            return None;
+        }
+        let _ = kill_process(getpid(), Signal::KILL);
+        std::process::exit(EXIT_UNPORTED)
     })
 }
 
-/// Makes a worker (see `launch`) end when `launcher` ends: it sets a
-/// parent-death SIGKILL. std and rustix have no safe way to set it between
-/// fork and exec, so the launcher can die after `worker` and before this
-/// runs. Then no signal comes and this process already has a new parent,
-/// so it kills itself as the signal would have.
+/// Whether the process `pid` has ended: it is gone, or it is a zombie (it
+/// has ended and its parent has not reaped it yet). The state is the field
+/// after the command name in /proc/<pid>/stat. Without that file (no
+/// /proc), `kill` with no signal tells only whether the process is gone.
 #[cfg(target_os = "linux")]
-fn end_with_launcher(launcher: rustix::process::Pid) {
-    use rustix::process::{Signal, getpid, getppid, kill_process, set_parent_process_death_signal};
-    let _ = set_parent_process_death_signal(Some(Signal::KILL));
-    if getppid() != Some(launcher) {
-        let _ = kill_process(getpid(), Signal::KILL);
-        std::process::exit(EXIT_UNPORTED);
+fn has_ended(pid: rustix::process::Pid) -> bool {
+    match std::fs::read(format!("/proc/{}/stat", pid.as_raw_pid())) {
+        // `<pid> (<name>) <state> ...`: the name can hold ") ".
+        Ok(stat) => {
+            let name_end = stat.iter().rposition(|&b| b == b')');
+            let state = name_end.and_then(|end| stat.get(end + 2));
+            matches!(state, Some(b'Z' | b'X'))
+        }
+        Err(_) => rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH),
     }
 }
 
@@ -317,16 +338,15 @@ fn end_with_launcher(launcher: rustix::process::Pid) {
 /// catches SIGINT and SIGTERM there, and a plain compile goes on, as in
 /// Go; SIGQUIT prints its name there once, also when it went to the whole
 /// process group. Without this, the signal would end the launcher and then
-/// the parent death signal would kill the worker.
+/// the parent-death signal would kill the worker.
 /// `launch` calls it before it starts the worker and sends the worker's pid
 /// to the returned sender; a signal that comes first waits for it. When no
 /// worker starts, `launch` drops the sender and the thread ends.
 /// The thread starts as a Go runtime thread does (`GoThread`): when the OS
 /// refuses it, the launcher ends with Go's text and exit 2, before there is
-/// a worker that could go on alone (a worker whose launcher has ended runs
-/// as a plain tsgo, see `worker`). Go has no launcher, so its process gets
-/// every signal; a launcher that went on without this thread would drop
-/// them (dropping `signals` removes their actions, not their handlers).
+/// a worker. Go has no launcher, so its process gets every signal; a
+/// launcher that went on without this thread would drop them (dropping
+/// `signals` removes their actions, not their handlers).
 #[cfg(target_os = "linux")]
 fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
     use signal_hook::consts::{SIGINT, SIGTERM};

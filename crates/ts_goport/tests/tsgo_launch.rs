@@ -3,9 +3,11 @@
 //! `tsgo-worker <launcher> <fd> <device> <inode>` and its parent is that
 //! launcher. A worker sends its exit code on the launcher's pipe, and only
 //! to a FIFO with that device and inode, which it opens without waiting
-//! for a reader. Any other tsgo, also one whose `arg0` names a launcher
-//! that is not its parent, runs as a plain tsgo: it gives its own output
-//! and exit code and sends nothing.
+//! for a reader. A tsgo whose `arg0` names a launcher that is not its
+//! parent runs as a plain tsgo: it gives its own output and exit code and
+//! sends nothing. When that launcher has ended (gone, or a zombie), the
+//! tsgo is a worker whose launcher died before the check: it kills itself
+//! before it does any work. Any other tsgo runs as a plain tsgo.
 //!
 //! This test process takes the place of the launcher: it holds the read
 //! end of a pipe, which the tsgo opens through /proc as a worker does.
@@ -14,10 +16,21 @@
 use std::io::{Read, Seek};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+/// What a tsgo run gives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Outcome {
+    /// The exit code and some stdout, and the code on the pipe.
+    Sends,
+    /// The exit code and some stdout, and nothing on the pipe.
+    Plain,
+    /// The end by SIGKILL, with no stdout and nothing on the pipe.
+    Killed,
+}
 
 #[test]
 fn a_tsgo_started_from_a_worker_is_not_a_worker() {
@@ -33,6 +46,10 @@ fn a_tsgo_started_from_a_worker_is_not_a_worker() {
     // reader (an anonymous pipe does not wait), so the worker must open it
     // without waiting, send nothing and end.
     let fifo = no_reader_fifo(&dir.0.join("fifo"));
+    // Launchers that have ended before the tsgo's parent check: one is
+    // reaped and its pid is free, one is a zombie of this process.
+    let reaped = ended_process(true);
+    let zombie = ended_process(false);
     // `--version` exits 0 and an unknown option exits 1, so the exit code
     // of each run shows that it did the work.
     let cases: [(&[&str], i32); 2] = [(&["--version"], 0), (&["--noSuchOption"], 1)];
@@ -43,32 +60,43 @@ fn a_tsgo_started_from_a_worker_is_not_a_worker() {
             drop(write);
             let stat = rustix::fs::fstat(&read).unwrap();
             let (dev, ino) = (stat.st_dev, stat.st_ino);
-            // (arg0, whether the tsgo sends `code` on the pipe)
             let runs = [
-                (worker_arg0(this, &read), true),
-                // The named launcher is not the parent.
-                (worker_arg0(parent, &read), false),
+                (worker_arg0(this, &read), Outcome::Sends),
+                // The named launcher is not the parent, and it is alive.
+                (worker_arg0(parent, &read), Outcome::Plain),
+                // The named launcher has ended. With both parent checks
+                // removed, these run as workers.
+                (worker_arg0(reaped.id(), &read), Outcome::Killed),
+                (worker_arg0(zombie.id(), &read), Outcome::Killed),
                 // The file at the number is not the launcher's pipe.
-                (fields_arg0(this, &read, dev, ino + 1), false),
-                (fields_arg0(this, &read, dev + 1, ino), false),
-                (worker_arg0(this, &file), false),
-                (worker_arg0(this, &fifo), false),
+                (fields_arg0(this, &read, dev, ino + 1), Outcome::Plain),
+                (fields_arg0(this, &read, dev + 1, ino), Outcome::Plain),
+                (worker_arg0(this, &file), Outcome::Plain),
+                (worker_arg0(this, &fifo), Outcome::Plain),
                 // The R152 form, without the device and inode.
-                (format!("tsgo-worker {this} {}", read.as_raw_fd()), false),
-                ("tsgo".to_string(), false),
+                (
+                    format!("tsgo-worker {this} {}", read.as_raw_fd()),
+                    Outcome::Plain,
+                ),
+                ("tsgo".to_string(), Outcome::Plain),
             ];
-            for (arg0, sends) in runs {
+            for (arg0, outcome) in runs {
                 let case = format!("{args:?} GOPORT_LAUNCH={launch} arg0 {arg0:?}");
                 let (status, stdout) = run(&arg0, args, launch, &case);
-                assert_eq!(status, Some(code), "{case}: {stdout}");
-                assert!(!stdout.is_empty(), "{case}: no output");
+                if outcome == Outcome::Killed {
+                    assert_eq!(status.signal(), Some(9), "{case}: {status} {stdout}");
+                    assert_eq!(stdout, "", "{case}: output");
+                } else {
+                    assert_eq!(status.code(), Some(code), "{case}: {stdout}");
+                    assert!(!stdout.is_empty(), "{case}: no output");
+                }
                 // The tsgo has ended and no process has the pipe open for
                 // writing (a worker of the tsgo never opens it), so this
                 // reads what the tsgo sent and then the end of file.
                 let mut sent = Vec::new();
                 let mut pipe = std::fs::File::from(read.try_clone().unwrap());
                 pipe.read_to_end(&mut sent).unwrap();
-                let expected = if sends {
+                let expected = if outcome == Outcome::Sends {
                     code.to_le_bytes().to_vec()
                 } else {
                     Vec::new()
@@ -80,6 +108,42 @@ fn a_tsgo_started_from_a_worker_is_not_a_worker() {
                 assert_eq!(sent, Vec::<u8>::new(), "{case}: sent to the file");
             }
         }
+    }
+    // Reaps the zombie.
+    zombie.wait();
+}
+
+/// A process that has ended: a tsgo `--version`. When `reap` is false, it
+/// stays a zombie until `EndedProcess::wait`.
+fn ended_process(reap: bool) -> EndedProcess {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tsgo"))
+        .arg("--version")
+        .env("GOPORT_LAUNCH", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    if reap {
+        child.wait().unwrap();
+    } else {
+        // Waits for the end without reaping (`NOWAIT`).
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
+        waitid(WaitId::Pid(Pid::from_child(&child)), options).unwrap();
+    }
+    EndedProcess(child)
+}
+
+/// A process of `ended_process`.
+struct EndedProcess(Child);
+
+impl EndedProcess {
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn wait(mut self) {
+        self.0.wait().unwrap();
     }
 }
 
@@ -100,10 +164,10 @@ impl Drop for TempDir {
     }
 }
 
-/// Runs tsgo with the `arg0` `name` and `args`, and returns its exit code
+/// Runs tsgo with the `arg0` `name` and `args`, and returns its exit status
 /// and stdout. A tsgo that has not ended after `LIMIT` fails the test: a
 /// worker whose open of the pipe waits for a reader never ends.
-fn run(name: &str, args: &[&str], launch: &str, case: &str) -> (Option<i32>, String) {
+fn run(name: &str, args: &[&str], launch: &str, case: &str) -> (ExitStatus, String) {
     const LIMIT: Duration = Duration::from_secs(60);
     let mut child = Command::new(env!("CARGO_BIN_EXE_tsgo"))
         .arg0(name)
@@ -132,7 +196,7 @@ fn run(name: &str, args: &[&str], launch: &str, case: &str) -> (Option<i32>, Str
         .unwrap()
         .read_to_string(&mut stdout)
         .unwrap();
-    (status.code(), stdout)
+    (status, stdout)
 }
 
 /// The `arg0` of a worker of `launcher` with the file at `fd`.
