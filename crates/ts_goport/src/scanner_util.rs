@@ -24079,7 +24079,9 @@ mod tests {
         let mut found = 0;
         for candidates in [&falling[..], &rising[..], &mixed[..]] {
             for name in names {
-                for max_candidates in [0, 5, 13] {
+                // 5 stops at the 6th candidate (Go returns the zero value);
+                // 20 checks them all, as 0 does.
+                for max_candidates in [0, 5, 20] {
                     let go = go_get_spelling_suggestion(name, candidates, max_candidates);
                     let owned = candidates.iter().map(|c| c.to_string());
                     let port = if max_candidates == 0 {
@@ -24098,7 +24100,8 @@ mod tests {
                 }
             }
         }
-        // Most calls find a candidate, so the distances decide the answers.
-        assert!(found > 40, "{found}");
+        // Every call with no limit or a limit of 20 finds a candidate, so the
+        // distances decide the answers.
+        assert_eq!(found, 60);
     }
 }
