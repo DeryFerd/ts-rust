@@ -1108,6 +1108,33 @@ impl Checker {
         self.is_matching_reference_kind(source, target, target.kind())
     }
 
+    /// True when the memo already shows that `is_matching_reference(source,
+    /// target)` is false for a variable or binding declaration `target` (see
+    /// the declaration test in `is_matching_reference_kind`): the memo holds
+    /// `source` with its export symbol, and `target` is not one of that
+    /// symbol's declarations. It only reads; any other case is false, and the
+    /// caller makes the full call.
+    // PERF: chkA. `get_type_at_flow_assignment` tests each assignment of a
+    // walk against one reference, so after the first call the memo holds it.
+    #[inline]
+    pub fn matching_reference_memo_says_no(
+        &self,
+        source: Node,
+        target: Node,
+        target_kind: SyntaxKind,
+    ) -> bool {
+        let memo = &self.matching_reference_memo;
+        matches!(
+            target_kind,
+            SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement
+        ) && memo.node == source
+            && source.is_some()
+            && !memo.this_in_type_query
+            && memo.export.is_some()
+            && memo.export_merge_version == self.merge_version
+            && !self.sym(memo.export).declarations.contains(&target)
+    }
+
     /// `is_matching_reference` for a caller that has read `target_kind`
     /// (`target.kind()`).
     pub fn is_matching_reference_kind(

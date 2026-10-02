@@ -387,7 +387,9 @@ impl Checker {
         let node_kind = node.kind();
         // Assignments only narrow the computed type if the declared type is a union type. Thus, we
         // only need to evaluate the assigned type if the declared type is a union type.
-        if self.is_matching_reference_kind(reference, node, node_kind) {
+        if !self.matching_reference_memo_says_no(reference, node, node_kind)
+            && self.is_matching_reference_kind(reference, node, node_kind)
+        {
             if !self.is_reachable_flow_node(flow) {
                 return FlowType {
                     t: self.unreachable_never_type,

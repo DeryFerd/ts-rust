@@ -1621,6 +1621,7 @@ impl Checker {
 /// The parent of `node` and the parent's kind: one store lookup for a node of
 /// a published store (`frozen_store_parent_kind`). The kind of a nil parent
 /// is `SyntaxKind::Unknown`.
+#[inline]
 pub fn node_parent_and_kind(node: Node) -> (Node, SyntaxKind) {
     match crate::ast::store::frozen_store_parent_kind(node) {
         Some(parent_and_kind) => parent_and_kind,
