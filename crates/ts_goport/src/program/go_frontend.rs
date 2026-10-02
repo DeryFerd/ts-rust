@@ -135,7 +135,7 @@ thread_local! {
     /// borrow. The parsed nodes are synthetic nodes of this thread, so each
     /// thread keeps its own entries (see `WorkerSeed`). The entries of a
     /// dead file version go, and so do its JSDoc nodes (a file scope,
-    /// `parse_lazy_js_doc`).
+    /// `resolve_lazy_js_doc`).
     static LAZY_JSDOC: RefCell<PerFileMap<&'static [Node]>> = const { RefCell::new(PerFileMap::new()) };
     /// The file system of a checker worker thread (Go `host.FS()`, without the cache).
     static WORKER_FS: Rc<dyn Fs> = bundled::wrap_fs(osvfs_fs());
