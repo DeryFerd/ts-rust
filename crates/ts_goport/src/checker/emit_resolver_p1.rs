@@ -255,21 +255,8 @@ impl EmitResolver {
         node: Node,
         paths: Option<&AliasWalkPaths>,
     ) -> bool {
-        match node.kind() {
-            SyntaxKind::BinaryExpression => {
-                if is_common_js_module_exports(node) && is_identifier(node.right()) {
-                    self.mark_linked_aliases(c, node.right());
-                }
-            }
-            SyntaxKind::ExportAssignment => {
-                if node.expression().kind() == SyntaxKind::Identifier {
-                    self.mark_linked_aliases(c, node.expression());
-                }
-            }
-            SyntaxKind::ExportSpecifier => {
-                self.mark_linked_aliases(c, node.property_name_or_name());
-            }
-            _ => {}
+        if let Some(target) = alias_marking_target(node) {
+            self.mark_linked_aliases(c, target);
         }
         self.alias_marking_visit_children(c, node, paths)
     }
@@ -640,6 +627,36 @@ struct AliasWalkPaths {
     bits: Vec<u64>,
 }
 
+/// The node that the alias marking walk passes to `mark_linked_aliases` at
+/// `node` (Go `aliasMarkingVisitorWorker`), if any.
+#[inline]
+fn alias_marking_target(node: Node) -> Option<Node> {
+    match node.kind() {
+        SyntaxKind::BinaryExpression => {
+            (is_common_js_module_exports(node) && is_identifier(node.right())).then(|| node.right())
+        }
+        SyntaxKind::ExportAssignment => {
+            (node.expression().kind() == SyntaxKind::Identifier).then(|| node.expression())
+        }
+        SyntaxKind::ExportSpecifier => Some(node.property_name_or_name()),
+        _ => None,
+    }
+}
+
+/// The `alias_marking_target`s of the walk under `node`, in walk order. It
+/// leaves out the children that are not on `paths`; `None` enters every
+/// child, as Go does. The debug check of `AliasWalkPaths` compares the two
+/// lists. It reads only syntax, so it changes nothing.
+fn alias_marking_targets(node: Node, paths: Option<&AliasWalkPaths>, targets: &mut Vec<Node>) {
+    node.for_each_child(|child| {
+        if paths.is_none_or(|paths| paths.enters(child)) {
+            targets.extend(alias_marking_target(child));
+            alias_marking_targets(child, paths, targets);
+        }
+        false
+    });
+}
+
 impl AliasWalkPaths {
     /// The paths of source file `file`, a node of a published, alias-free
     /// store with local parents. `common_js` is true when the file has a
@@ -658,6 +675,11 @@ impl AliasWalkPaths {
         let base = (store as u64) << 32;
         for index in 1..slots {
             let node = Node(base | (index as u64 + 1));
+            debug_assert_eq!(
+                node,
+                Node::new(store, crate::astdata::NodeId::new(index as u32)),
+                "the slot handle of an alias-free store is its node"
+            );
             let acts = match node.kind() {
                 SyntaxKind::ExportAssignment | SyntaxKind::ExportSpecifier => true,
                 // The tests of `is_common_js_module_exports` before the one
@@ -884,6 +906,24 @@ impl crate::printer::EmitResolver for EmitResolver {
             // TODO: Does this even *have* to be an upfront walk? If it's not possible for a
             // import a = a.b.c statement to chain into exposing a statement in a sibling scope,
             // it could at least be pushed into scope entry -  then it wouldn't need to be recursive.
+            if let Some(paths) = paths.as_ref() {
+                // The pruned walk marks the aliases of the full walk, in
+                // the same order (debug builds only).
+                debug_assert_eq!(
+                    {
+                        let mut targets = Vec::new();
+                        alias_marking_targets(file, Some(paths), &mut targets);
+                        targets
+                    },
+                    {
+                        let mut targets = Vec::new();
+                        alias_marking_targets(file, None, &mut targets);
+                        targets
+                    },
+                    "the alias walk paths of {} leave out a target",
+                    source_file_file_name(file)
+                );
+            }
             self.alias_marking_visit_children(c, file, paths.as_ref());
         })
     }
