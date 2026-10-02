@@ -212,7 +212,10 @@ fn launch(huge_pages: bool) -> Option<i32> {
     // `write` stays open until the worker ends, so the read below ends when
     // the code comes or when the worker has ended without it. The thread
     // does not reap the worker (`NOWAIT`): `wait` below does. When the
-    // thread cannot start, `write` closes now and the read ends at once.
+    // thread cannot start, `write` closes now and the read ends at once:
+    // the launcher then takes the code from the worker's exit, which waits
+    // for the worker's memory to unmap. No code or signal is lost, so this
+    // port-only thread falls back instead of ending the run (`GoThread`).
     let pid = rustix::process::Pid::from_child(&worker);
     let _ = std::thread::Builder::new()
         .name("worker-exit".to_string())
@@ -291,6 +294,11 @@ fn end_with_launcher(launcher: rustix::process::Pid) {
 /// Go; SIGQUIT prints its name there once, also when it went to the whole
 /// process group. Without this, the signal would end the launcher and then
 /// the parent death signal would kill the worker.
+/// The thread starts as a Go runtime thread does (`GoThread`): when the OS
+/// refuses it, the launcher ends with Go's text and exit 2, and the parent
+/// death signal kills the worker. Go has no launcher, so its process gets
+/// every signal; a launcher that went on without this thread would drop
+/// them (dropping `signals` removes their actions, not their handlers).
 #[cfg(target_os = "linux")]
 fn forward_signals(worker: &std::process::Child) {
     use signal_hook::consts::{SIGINT, SIGTERM};
@@ -301,7 +309,7 @@ fn forward_signals(worker: &std::process::Child) {
     else {
         return;
     };
-    let _ = std::thread::Builder::new()
+    ts_goport::core::GoThread::new()
         .name("forward-signals".to_string())
         .spawn(move || {
             for signal in signals.forever() {
@@ -374,7 +382,11 @@ fn drop_go_signals() {
 /// below the hard limit (`gostd::rlimit::raise_open_file_limit`), and fd 1
 /// is checked for `O_NONBLOCK`, as Go `os.NewFile` does at start
 /// (`stdio::init`). The thread for the thrown signals waits on a pipe until
-/// one comes.
+/// one comes. Go throws in the signal handler, with no thread. The port's
+/// thread starts as a Go runtime thread does (`GoThread`): when the OS
+/// refuses it, the run ends with Go's text and exit 2. Going on without it
+/// would drop the thrown signals (dropping `signals` removes their actions,
+/// not their handlers).
 /// PORT: other systems than Linux keep the default actions (Go's tables
 /// differ there).
 fn go_runtime_start() {
@@ -387,7 +399,7 @@ fn go_runtime_start() {
         let Ok(mut signals) = signal_hook::iterator::Signals::new(thrown) else {
             return;
         };
-        let _ = std::thread::Builder::new()
+        ts_goport::core::GoThread::new()
             .name("go-signals".to_string())
             .spawn(move || {
                 for signal in signals.forever() {
