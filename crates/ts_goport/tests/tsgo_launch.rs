@@ -210,7 +210,7 @@ fn a_tsgo_that_is_pid_1_of_a_pid_namespace() {
         ("1", 2, "pid 1, SIGHUP to the worker"),
         ("0", 1, "pid 1, SIGHUP to tsgo without a worker"),
     ] {
-        let (status, stderr, ended) = signal_run(unshare(), launch, depth, Signal::HUP, case);
+        let (status, stderr, ended) = signal_run(unshare(), launch, &[(depth, Signal::HUP)], case);
         // unshare exits with its child's exit code.
         assert_eq!(status.code(), Some(129), "{case}: {status} {stderr}");
         assert_eq!(stderr, "", "{case}: stderr");
@@ -262,8 +262,40 @@ fn a_tsgo_whose_caller_ignores_sigchld() {
     // env runs tsgo in its own process, the launcher; the worker is its
     // child.
     let case = "SIGCHLD ignored, SIGKILL to the worker";
-    let (status, stderr, _) = signal_run(command, "1", 1, Signal::KILL, case);
+    let (status, stderr, _) = signal_run(command, "1", &[(1, Signal::KILL)], case);
     assert_eq!(status.signal(), Some(9), "{case}: {status} {stderr}");
+}
+
+/// A tsgo whose caller ignores SIGHUP (`nohup`, here `env
+/// --ignore-signal=HUP`): Go keeps an ignored SIGHUP at start, so the run
+/// goes on after it, with and without a worker and also when the worker
+/// gets it; SIGQUIT then ends it with Go's text and exit 2. Where `env
+/// --ignore-signal` cannot run, the test says so and passes.
+#[test]
+fn a_tsgo_whose_caller_ignores_sighup() {
+    let probe = Command::new("env")
+        .args(["--ignore-signal=HUP", "true"])
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `env --ignore-signal=HUP` cannot run here");
+        return;
+    }
+    // env runs tsgo in its own process; the worker is its child.
+    let runs: [(&str, &[(usize, Signal)]); 2] = [
+        (
+            "1",
+            &[(0, Signal::HUP), (1, Signal::HUP), (0, Signal::QUIT)],
+        ),
+        ("0", &[(0, Signal::HUP), (0, Signal::QUIT)]),
+    ];
+    for (launch, signals) in runs {
+        let case = format!("SIGHUP ignored, GOPORT_LAUNCH={launch}");
+        let mut command = Command::new("env");
+        command.args(["--ignore-signal=HUP", env!("CARGO_BIN_EXE_tsgo")]);
+        let (status, stderr, _) = signal_run(command, launch, signals, &case);
+        assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+        assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+    }
 }
 
 /// Starts `command` with `--all` and `GOPORT_LAUNCH=1`, sends SIGQUIT to
@@ -271,7 +303,7 @@ fn a_tsgo_whose_caller_ignores_sigchld() {
 /// the run ends soon after with Go's text and exit 2. The launcher is the
 /// started process or its descendant `depth` levels down.
 fn quit_launcher(command: Command, depth: usize, case: &str) {
-    let (status, stderr, ended) = signal_run(command, "1", depth, Signal::QUIT, case);
+    let (status, stderr, ended) = signal_run(command, "1", &[(depth, Signal::QUIT)], case);
     assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
     assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
     assert!(
@@ -280,18 +312,18 @@ fn quit_launcher(command: Command, depth: usize, case: &str) {
     );
 }
 
-/// Starts `command` with `--all` and `GOPORT_LAUNCH=launch`, sends
-/// `signal` to the started process's descendant `depth` levels down once
-/// tsgo has written some output, and returns how the run ended, its stderr
-/// and the time from the signal to the end. The output is more than the
-/// stdout pipe holds and the test does not read it, so tsgo cannot end
-/// before the signal comes, and its handlers are set before it writes. A
-/// run that has not ended 60 s after the signal fails the test.
+/// Starts `command` with `--all` and `GOPORT_LAUNCH=launch`, sends each
+/// signal of `signals` to the started process's descendant `depth` levels
+/// down once tsgo has written some output, 300 ms apart, and returns how
+/// the run ended, its stderr and the time from the last signal to the end.
+/// The output is more than the stdout pipe holds and the test does not
+/// read it, so tsgo cannot end before the first signal comes, and its
+/// handlers are set before it writes. A run that ends before the last
+/// signal, or has not ended 60 s after it, fails the test.
 fn signal_run(
     mut command: Command,
     launch: &str,
-    depth: usize,
-    signal: Signal,
+    signals: &[(usize, Signal)],
     case: &str,
 ) -> (ExitStatus, String, Duration) {
     const LIMIT: Duration = Duration::from_secs(60);
@@ -317,12 +349,21 @@ fn signal_run(
         assert!(start.elapsed() < LIMIT, "{case}: no output in {LIMIT:?}");
         std::thread::sleep(Duration::from_millis(5));
     }
-    let mut target = child.id();
-    for _ in 0..depth {
-        target = child_of(target).unwrap_or_else(|| panic!("{case}: no process to signal"));
+    for (i, &(depth, signal)) in signals.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{case}: ended before {signal:?}"
+        );
+        let mut target = child.id();
+        for _ in 0..depth {
+            target = child_of(target).unwrap_or_else(|| panic!("{case}: no process to signal"));
+        }
+        let pid = rustix::process::Pid::from_raw(target.cast_signed()).unwrap();
+        rustix::process::kill_process(pid, signal).unwrap();
     }
-    let pid = rustix::process::Pid::from_raw(target.cast_signed()).unwrap();
-    rustix::process::kill_process(pid, signal).unwrap();
     let sent = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
