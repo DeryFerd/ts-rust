@@ -247,24 +247,32 @@ impl EmitResolver {
     }
 
     // Go: checker/emitresolver.go:260 EmitResolver.aliasMarkingVisitorWorker
-    fn alias_marking_visitor_worker(&self, c: &mut Checker, node: Node) -> bool {
-        match node.kind() {
-            SyntaxKind::BinaryExpression => {
-                if is_common_js_module_exports(node) && is_identifier(node.right()) {
-                    self.mark_linked_aliases(c, node.right());
-                }
-            }
-            SyntaxKind::ExportAssignment => {
-                if node.expression().kind() == SyntaxKind::Identifier {
-                    self.mark_linked_aliases(c, node.expression());
-                }
-            }
-            SyntaxKind::ExportSpecifier => {
-                self.mark_linked_aliases(c, node.property_name_or_name());
-            }
-            _ => {}
+    // PORT: `paths` (aliaswalk1): when set, the walk enters only the
+    // children on them (`AliasWalkPaths`). Go enters every child.
+    fn alias_marking_visitor_worker(
+        &self,
+        c: &mut Checker,
+        node: Node,
+        paths: Option<&AliasWalkPaths>,
+    ) -> bool {
+        if let Some(target) = alias_marking_target(node) {
+            self.mark_linked_aliases(c, target);
         }
-        node.for_each_child(|child| self.alias_marking_visitor_worker(c, child))
+        self.alias_marking_visit_children(c, node, paths)
+    }
+
+    // Go: `node.ForEachChild(r.aliasMarkingVisitor)`, with the children that
+    // are not on `paths` left out.
+    fn alias_marking_visit_children(
+        &self,
+        c: &mut Checker,
+        node: Node,
+        paths: Option<&AliasWalkPaths>,
+    ) -> bool {
+        node.for_each_child(|child| {
+            paths.is_none_or(|paths| paths.enters(child))
+                && self.alias_marking_visitor_worker(c, child, paths)
+        })
     }
 
     // Go: checker/emitresolver.go:278 EmitResolver.markLinkedAliases
@@ -593,6 +601,132 @@ pub(super) fn is_common_js_module_exports(node: Node) -> bool {
     false
 }
 
+/// The nodes that the alias marking walk (`alias_marking_visitor_worker`)
+/// must enter in a published, alias-free store with local parents: each
+/// node of the store that the walk can act on (an ExportAssignment, an
+/// ExportSpecifier, and in a CommonJS file a BinaryExpression that is the
+/// expression of a source file statement, see `is_common_js_module_exports`)
+/// and its ancestors. One bit per slot.
+// PERF: aliaswalk1. Go walks every node of the file. The port did the
+// same, and in an edited file each node data read is a scoped read: on an
+// effect Option.ts edit the walk took 133 us against 56 us in Go (stable
+// build, mini-743d, bpftrace). A scan of the kind column (no node data
+// read) finds the nodes that the walk can act on, and their parent chains
+// give the paths to them: 17 us.
+// The Go parser sets the parent of each child of a node when it finishes
+// the node (`overrideParentInImmediateChildren`, `set_parent_in_store_children`
+// here), so the parent chain of a node of the tree is the path of
+// `ForEachChild` calls that reaches it. The walk then enters the nodes on
+// those paths in Go order and leaves out only subtrees with no node to act
+// on: it marks the same aliases in the same order. A node that is not in
+// the tree (JSDoc, a discarded speculative parse) can add a path that the
+// walk never reaches.
+struct AliasWalkPaths {
+    /// The store id.
+    file: usize,
+    bits: Vec<u64>,
+}
+
+/// The node that the alias marking walk passes to `mark_linked_aliases` at
+/// `node` (Go `aliasMarkingVisitorWorker`), if any.
+#[inline]
+fn alias_marking_target(node: Node) -> Option<Node> {
+    match node.kind() {
+        SyntaxKind::BinaryExpression => {
+            (is_common_js_module_exports(node) && is_identifier(node.right())).then(|| node.right())
+        }
+        SyntaxKind::ExportAssignment => {
+            (node.expression().kind() == SyntaxKind::Identifier).then(|| node.expression())
+        }
+        SyntaxKind::ExportSpecifier => Some(node.property_name_or_name()),
+        _ => None,
+    }
+}
+
+/// The `alias_marking_target`s of the walk under `node`, in walk order. It
+/// leaves out the children that are not on `paths`; `None` enters every
+/// child, as Go does. The debug check of `AliasWalkPaths` compares the two
+/// lists. It reads only syntax, so it changes nothing.
+fn alias_marking_targets(node: Node, paths: Option<&AliasWalkPaths>, targets: &mut Vec<Node>) {
+    node.for_each_child(|child| {
+        if paths.is_none_or(|paths| paths.enters(child)) {
+            targets.extend(alias_marking_target(child));
+            alias_marking_targets(child, paths, targets);
+        }
+        false
+    });
+}
+
+impl AliasWalkPaths {
+    /// The paths of source file `file`, a node of a published, alias-free
+    /// store with local parents. `common_js` is true when the file has a
+    /// `common_js_module_indicator`.
+    fn new(file: Node, common_js: bool) -> Self {
+        let store = file.file_index();
+        let slots = file_store_slot_count(store);
+        let mut paths = Self {
+            file: store,
+            bits: vec![0; slots.div_ceil(64)],
+        };
+        // Slot 0 is nil. Every other slot of an alias-free store is a node,
+        // whose `Node::new` is the slot handle (`core::Node`).
+        // PERF: the handle with no `Node::new`, so a slot costs one store
+        // lookup (the kind read), not two.
+        let base = (store as u64) << 32;
+        for index in 1..slots {
+            let node = Node(base | (index as u64 + 1));
+            debug_assert_eq!(
+                node,
+                Node::new(store, crate::astdata::NodeId::new(index as u32)),
+                "the slot handle of an alias-free store is its node"
+            );
+            let acts = match node.kind() {
+                SyntaxKind::ExportAssignment | SyntaxKind::ExportSpecifier => true,
+                // The tests of `is_common_js_module_exports` before the one
+                // of the assignment kind. A node that is not in the tree can
+                // have a nil parent, which those tests do not read.
+                SyntaxKind::BinaryExpression => {
+                    common_js && {
+                        let statement = node.parent();
+                        statement.is_some()
+                            && is_expression_statement(statement)
+                            && statement.parent().is_some()
+                            && is_source_file(statement.parent())
+                    }
+                }
+                _ => false,
+            };
+            if acts {
+                paths.add_path(node);
+            }
+        }
+        paths
+    }
+
+    /// Adds `node` and its ancestors, up to the first one that is on a path.
+    fn add_path(&mut self, mut node: Node) {
+        while node.is_some() && node.file_index() == self.file {
+            let index = node.node_id().index();
+            let (word, bit) = (index / 64, 1u64 << (index % 64));
+            if self.bits[word] & bit != 0 {
+                return;
+            }
+            self.bits[word] |= bit;
+            node = node.parent();
+        }
+    }
+
+    /// False when the walk can leave `node` out: a node of the store that is
+    /// on no path. A node of another store is entered.
+    fn enters(&self, node: Node) -> bool {
+        if node.file_index() != self.file {
+            return true;
+        }
+        let index = node.node_id().index();
+        self.bits[index / 64] & (1u64 << (index % 64)) != 0
+    }
+}
+
 // Go: checker/emitresolver.go:311 getMeaningOfEntityNameReference
 fn get_meaning_of_entity_name_reference(entity_name: Node) -> SymbolFlags {
     let parent = entity_name.parent();
@@ -755,16 +889,42 @@ impl crate::printer::EmitResolver for EmitResolver {
             // the source file that test reads is this file. So when the
             // store has neither kind and the file has no indicator, the walk
             // does nothing. Synthetic files have no store facts and walk.
-            if frozen_node_store_facts(file).is_some_and(|facts| {
-                facts.alias_free && facts.parents_local && !facts.has_export_alias_kind
-            }) && with_source_file_info(file, |info| info.common_js_module_indicator).is_nil()
+            // aliaswalk1: otherwise it enters only the paths to the nodes
+            // it can act on (`AliasWalkPaths`).
+            let mut paths = None;
+            if let Some(facts) = frozen_node_store_facts(file)
+                && facts.alias_free
+                && facts.parents_local
             {
-                return;
+                let common_js =
+                    with_source_file_info(file, |info| info.common_js_module_indicator).is_some();
+                if !facts.has_export_alias_kind && !common_js {
+                    return;
+                }
+                paths = Some(AliasWalkPaths::new(file, common_js));
             }
             // TODO: Does this even *have* to be an upfront walk? If it's not possible for a
             // import a = a.b.c statement to chain into exposing a statement in a sibling scope,
             // it could at least be pushed into scope entry -  then it wouldn't need to be recursive.
-            file.for_each_child(|child| self.alias_marking_visitor_worker(c, child));
+            if let Some(paths) = paths.as_ref() {
+                // The pruned walk marks the aliases of the full walk, in
+                // the same order (debug builds only).
+                debug_assert_eq!(
+                    {
+                        let mut targets = Vec::new();
+                        alias_marking_targets(file, Some(paths), &mut targets);
+                        targets
+                    },
+                    {
+                        let mut targets = Vec::new();
+                        alias_marking_targets(file, None, &mut targets);
+                        targets
+                    },
+                    "the alias walk paths of {} leave out a target",
+                    source_file_file_name(file)
+                );
+            }
+            self.alias_marking_visit_children(c, file, paths.as_ref());
         })
     }
 

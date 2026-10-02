@@ -242,7 +242,7 @@ impl Group {
         F: FnOnce() -> Result<(), GoError> + Send + 'static,
     {
         let g = self.clone();
-        std::thread::Builder::new()
+        crate::core::GoThread::new()
             .name("errgroup".to_string())
             .stack_size(crate::gostd::stack::max_stack_size())
             .spawn(move || {
@@ -279,8 +279,7 @@ impl Group {
                 }
                 // Go: defer g.done()
                 g.done();
-            })
-            .expect("errgroup: failed to start a goroutine");
+            });
     }
 
     // Go: errgroup/errgroup.go:142 SetLimit

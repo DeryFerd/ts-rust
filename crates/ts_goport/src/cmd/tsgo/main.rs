@@ -1,4 +1,4 @@
-//! Go `cmd/tsgo/main.go`, and the parts of the Go standard library that
+//! Go `cmd/tsc/main.go`, and the parts of the Go standard library that
 //! package main needs and the crate does not have yet: `flag` (bool, int
 //! and string flags, `Parse`, the default usage text) and
 //! `signal.NotifyContext`.
@@ -15,11 +15,11 @@ use signal_hook::iterator::Signals;
 use std::cell::Cell;
 use std::sync::{Arc, LazyLock};
 
-// Go: cmd/tsgo/main.go:14 main
+// Go: cmd/tsc/main.go:14 main
 // PORT: `bin/goport.rs` `main` calls `run_main` before its own compile
 // path and exits with the status it returns.
 
-// Go: cmd/tsgo/main.go:18 runMain
+// Go: cmd/tsc/main.go:18 runMain
 // PORT: `args` is Go `osutil.Args()[1:]`. `None` means Go continues with
 // `execute.CommandLine`; goport continues with its own compile path, which
 // replaces it. Go `core.ApplyDebugStackLimit()` (the TS_GO_DEBUG_STACK_LIMIT
@@ -39,23 +39,23 @@ pub fn run_main(args: &[String]) -> Option<i32> {
 }
 
 // PORT: runs `f` on a new thread with the Go maximum stack
-// (`gostd::stack::max_stack_size`) and returns its status.
+// (`gostd::stack::max_stack_size`) and returns its status. Go runs it on
+// the main goroutine. A thread that cannot start ends the process as the
+// Go runtime does (`GoThread`).
 // A panic that reaches the top of that thread ends Go with a crash. A Go
 // panic (`core::go_panic`) ends it as the Go runtime does, as `bin/tsgo.rs`
 // does: `panic: <message>` on stderr and `EXIT_GO_PANIC` (2). Any other
 // panic is a port gap: goport returns `EXIT_UNPORTED` (70), as
 // `bin/goport.rs` does for a failed worker.
 fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
-    let worker = std::thread::Builder::new()
+    let worker = crate::core::GoThread::new()
         .name("tsgo".to_string())
         .stack_size(crate::gostd::stack::max_stack_size())
         .spawn(move || f(args));
-    match worker.map(std::thread::JoinHandle::join) {
-        Ok(Ok(code)) => code,
-        Ok(Err(payload)) if crate::core::print_go_panic(payload.as_ref()) => {
-            crate::core::EXIT_GO_PANIC
-        }
-        _ => crate::execute::tsc::EXIT_UNPORTED,
+    match worker.join() {
+        Ok(code) => code,
+        Err(payload) if crate::core::print_go_panic(payload.as_ref()) => crate::core::EXIT_GO_PANIC,
+        Err(_) => crate::execute::tsc::EXIT_UNPORTED,
     }
 }
 
@@ -85,7 +85,7 @@ pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
             let _ = done.register_waker(move || handle.close());
         }
         let cancel = cancel.clone();
-        std::thread::Builder::new()
+        crate::core::GoThread::new()
             .name("signal.NotifyContext".to_string())
             .spawn(move || {
                 // Go: select { case s := <-c.ch: ...; case <-c.Done(): }
@@ -93,8 +93,7 @@ pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
                     let text = format!("{} signal received", signal_string(s));
                     cancel(Some(errors::from_value(SignalError(text))));
                 }
-            })
-            .expect("signal.NotifyContext: failed to start the goroutine");
+            });
     }
     // Go: signal.go:310 signalCtx.stop
     let stop: CancelFunc = Arc::new(move || {
