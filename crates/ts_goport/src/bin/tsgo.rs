@@ -180,10 +180,11 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
 /// wanted, `--lsp`, `--api` or watch mode (`long_running`: they end on
 /// their own), or the worker cannot start. The launcher sends SIGINT,
 /// SIGTERM and the signals that Go throws on to the worker
-/// (`forward_signals`), and drops the signals that Go drops. When a signal
-/// kills the worker, the launcher ends by the same signal (`end_by_signal`;
-/// a pid 1 exits 128 + N, as Go does there), so the caller sees what a run
-/// without a worker would give.
+/// (`forward_signals`), and drops the signals that Go drops, SIGCHLD too
+/// (`drop_go_signals`: an ignored SIGCHLD would make `wait` fail). When a
+/// signal kills the worker, the launcher ends by the same signal
+/// (`end_by_signal`; a pid 1 exits 128 + N, as Go does there), so the
+/// caller sees what a run without a worker would give.
 #[cfg(target_os = "linux")]
 fn launch(huge_pages: bool) -> Option<i32> {
     use std::io::Read;
@@ -508,21 +509,28 @@ fn end_default_actions(flag: &std::sync::OnceLock<std::sync::Arc<std::sync::atom
 }
 
 /// Signals that the Go runtime catches and drops when no `signal.Notify`
-/// asks for them: `_SigNotify` alone or with `_SigUnblock` in
-/// `runtime/sigtab_linux_generic.go` (go1.27.1). The real-time signals 35 to
-/// 64 (`GO_DROPPED_RT`) are such signals too; Go leaves 32 to 34 to the C
-/// library. SIGPIPE is apart: Go has its own rule for stdout and stderr.
+/// asks for them: `_SigNotify` alone or with `_SigUnblock` or `_SigIgn`,
+/// without `_SigDefault`, in `runtime/sigtab_linux_generic.go` (go1.27.1).
+/// The default action of SIGCHLD, SIGURG and SIGWINCH (`_SigIgn`) does
+/// nothing too, but Go sets its handler also when they were ignored at
+/// start. The real-time signals 35 to 64 (`GO_DROPPED_RT`) are such
+/// signals too; Go leaves 32 to 34 to the C library. SIGPIPE is apart: Go
+/// has its own rule for stdout and stderr. Go sets no handler for SIGCONT
+/// and the stop signals (`_SigDefault`).
 #[cfg(target_os = "linux")]
-const GO_DROPPED: [rustix::process::Signal; 9] = {
+const GO_DROPPED: [rustix::process::Signal; 12] = {
     use rustix::process::Signal;
     [
         Signal::USR1,
         Signal::USR2,
         Signal::ALARM,
+        Signal::CHILD,
+        Signal::URG,
         Signal::XCPU,
         Signal::XFSZ,
         Signal::VTALARM,
         Signal::PROF,
+        Signal::WINCH,
         Signal::IO,
         Signal::POWER,
     ]
@@ -552,7 +560,10 @@ const GO_THROWN: [(rustix::process::Signal, &str); 3] = {
 /// Gives each signal that Go drops (`GO_DROPPED`, `GO_DROPPED_RT`) a handler
 /// that does nothing. Not `SIG_IGN`: an exec resets a caught signal to its
 /// default action, so a process that tsgo starts gets the default actions,
-/// as from Go.
+/// as from Go, also when tsgo got them ignored. An ignored SIGCHLD also
+/// changes tsgo itself: the kernel then reaps each child when it ends, so
+/// a wait for it fails (ECHILD). `launch` calls it before it starts the
+/// worker, and `go_runtime_start` before the run starts a process.
 #[cfg(target_os = "linux")]
 fn drop_go_signals() {
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

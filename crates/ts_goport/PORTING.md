@@ -537,10 +537,13 @@ goroutine.
 process (bin/tsgo.rs `go_runtime_start`).
 
 - Signals (Linux, Go runtime/sigtab_linux_generic.go): the signals that Go
-  drops when nothing asks for them (USR1, USR2, ALRM, XCPU, XFSZ, VTALRM,
-  PROF, IO, PWR and the real-time signals 35 to 64) get a handler that
-  does nothing. It is not SIG_IGN, so a process that tsgo starts gets the
-  default actions, as from Go. SIGQUIT, SIGSTKFLT and SIGSYS print the Go
+  drops when nothing asks for them (USR1, USR2, ALRM, CHLD, URG, XCPU,
+  XFSZ, VTALRM, PROF, WINCH, IO, PWR and the real-time signals 35 to 64)
+  get a handler that does nothing, also when they were ignored at start.
+  It is not SIG_IGN, so a process that tsgo starts gets the default
+  actions, as from Go, and a wait for a child works when the caller
+  ignored SIGCHLD (the kernel reaps the children of a process that
+  ignores it). SIGQUIT, SIGSTKFLT and SIGSYS print the Go
   name (`SIGQUIT: quit`) and exit 2, also when they were ignored at start.
   SIGINT and SIGTERM go to `notify_context`. PORT: Go then prints the
   goroutines. SIGABRT and SIGTRAP keep their default actions. Other
