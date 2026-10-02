@@ -378,13 +378,16 @@ impl compiler::CompilerHost for CompilerHost {
             return None;
         }
         let (open_files, open_directories) = files.open_files_over_os()?;
-        let reads = RefCell::new(FxHashMap::default());
+        let load = AheadCheck {
+            reads: RefCell::new(FxHashMap::default()),
+            package_jsons: RefCell::new(FxHashSet::default()),
+        };
         let accept = {
             let source_fs = self.source_fs.clone();
             let files = files.clone();
             Rc::new(
                 move |_key: ModuleKeyParts<'_>, _value: &ResolvedModule, calls: &[AheadCall]| {
-                    accept_ahead_answer(&source_fs, &files, &reads, calls)
+                    accept_ahead_answer(&source_fs, &files, &load, calls)
                 },
             )
         };
@@ -447,54 +450,95 @@ impl compiler::CompilerHost for CompilerHost {
 ///   only compares the hash.
 /// - then each `file_exists` path becomes a seen file and each missing
 ///   directory a missing directory, as the loader's calls would note them.
+/// - the calls of a package.json cache entry (`AheadCall::PackageJson`)
+///   are checked and replayed once per load: the snapshot does not change
+///   during the load, and the replay notes the same paths again.
+/// What `accept_ahead_answer` keeps during one load.
+struct AheadCheck {
+    /// The hash of each file that the check read, by name.
+    reads: RefCell<FxHashMap<String, Option<u128>>>,
+    /// The package.json call groups that passed the check and were
+    /// replayed, by address (the answers keep them for the whole load).
+    package_jsons: RefCell<FxHashSet<usize>>,
+}
+
 fn accept_ahead_answer(
     source_fs: &SourceFS,
     files: &SnapshotFSBuilder,
-    reads: &RefCell<FxHashMap<String, Option<u128>>>,
+    load: &AheadCheck,
     calls: &[AheadCall],
 ) -> bool {
-    for call in calls {
-        match call {
-            AheadCall::FileExists {
-                path,
-                exists,
-                known,
-            } => {
-                let same = match files.cached_file_state(path) {
-                    // The worker asked the OS through the open files, as the
-                    // layered file system does; a known answer is checked
-                    // here (the same call as the loader's own lookup).
-                    CachedFileState::Absent => {
-                        !*known || vfs::Fs::file_exists(&*files.fs, path.as_str()) == *exists
-                    }
-                    CachedFileState::Live => *exists,
-                    CachedFileState::NoValue => !*exists,
-                    CachedFileState::NeedsReload => false,
-                };
-                if !same {
-                    return false;
-                }
-            }
-            AheadCall::MissingDirectory { .. } => {}
-            AheadCall::Read { file_name, hash } => {
-                let known = reads.borrow().get(file_name).copied();
-                let read = known.unwrap_or_else(|| {
-                    let read = source_fs.get_file(file_name).map(|file| file.hash());
-                    reads.borrow_mut().insert(file_name.clone(), read);
-                    read
-                });
-                if read != *hash {
-                    return false;
-                }
-            }
-        }
+    if !calls
+        .iter()
+        .all(|call| check_ahead_call(source_fs, files, load, call))
+    {
+        return false;
     }
     for call in calls {
-        match call {
-            AheadCall::FileExists { path, .. } => source_fs.track_path(path),
-            AheadCall::MissingDirectory { path } => source_fs.note_missing_directory(path),
-            AheadCall::Read { .. } => {}
-        }
+        replay_ahead_call(source_fs, load, call);
     }
     true
+}
+
+/// True when `call` gives the same answer on this host's file system
+/// (`accept_ahead_answer`).
+fn check_ahead_call(
+    source_fs: &SourceFS,
+    files: &SnapshotFSBuilder,
+    load: &AheadCheck,
+    call: &AheadCall,
+) -> bool {
+    match call {
+        AheadCall::FileExists {
+            path,
+            exists,
+            known,
+        } => match files.cached_file_state(path) {
+            // The worker asked the OS through the open files, as the
+            // layered file system does; a known answer is checked here
+            // (the same call as the loader's own lookup).
+            CachedFileState::Absent => {
+                !*known || vfs::Fs::file_exists(&*files.fs, path.as_str()) == *exists
+            }
+            CachedFileState::Live => *exists,
+            CachedFileState::NoValue => !*exists,
+            CachedFileState::NeedsReload => false,
+        },
+        AheadCall::MissingDirectory { .. } => true,
+        AheadCall::Read { file_name, hash } => {
+            let known = load.reads.borrow().get(file_name).copied();
+            let read = known.unwrap_or_else(|| {
+                let read = source_fs.get_file(file_name).map(|file| file.hash());
+                load.reads.borrow_mut().insert(file_name.clone(), read);
+                read
+            });
+            read == *hash
+        }
+        AheadCall::PackageJson(group) => {
+            load.package_jsons.borrow().contains(&group_key(group))
+                || group
+                    .iter()
+                    .all(|call| check_ahead_call(source_fs, files, load, call))
+        }
+    }
+}
+
+/// Notes the side effects of `call` (`accept_ahead_answer`).
+fn replay_ahead_call(source_fs: &SourceFS, load: &AheadCheck, call: &AheadCall) {
+    match call {
+        AheadCall::FileExists { path, .. } => source_fs.track_path(path),
+        AheadCall::MissingDirectory { path } => source_fs.note_missing_directory(path),
+        AheadCall::Read { .. } => {}
+        AheadCall::PackageJson(group) => {
+            if load.package_jsons.borrow_mut().insert(group_key(group)) {
+                for call in group.iter() {
+                    replay_ahead_call(source_fs, load, call);
+                }
+            }
+        }
+    }
+}
+
+fn group_key(group: &Arc<[AheadCall]>) -> usize {
+    Arc::as_ptr(group).cast::<AheadCall>() as usize
 }

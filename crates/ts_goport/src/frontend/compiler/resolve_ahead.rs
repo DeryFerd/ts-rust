@@ -389,7 +389,7 @@ impl EndedJob {
         if keep_known_files {
             let mut found = FxHashSet::default();
             job.answers.for_each_module(|answer| {
-                for call in answer.ahead.iter().flat_map(|calls| calls.iter()) {
+                AheadCall::each(answer.ahead.as_deref().unwrap_or_default(), &mut |call| {
                     if let AheadCall::FileExists {
                         path, exists: true, ..
                     } = call
@@ -398,7 +398,7 @@ impl EndedJob {
                     {
                         found.insert(path.clone());
                     }
-                }
+                });
             });
             *workers
                 .known_files
@@ -836,19 +836,18 @@ fn debug_check_answer(
     );
     let mut seen = FxHashSet::default();
     let mut missing = FxHashSet::default();
-    for call in calls {
-        match call {
-            AheadCall::FileExists { path, .. } => {
-                seen.insert(path.clone());
-            }
-            AheadCall::MissingDirectory { path } => {
-                missing.insert(path.clone());
-            }
-            AheadCall::Read { file_name, .. } => {
-                seen.insert((scratch.to_path)(file_name));
-            }
+    AheadCall::each(calls, &mut |call| match call {
+        AheadCall::FileExists { path, .. } => {
+            seen.insert(path.clone());
         }
-    }
+        AheadCall::MissingDirectory { path } => {
+            missing.insert(path.clone());
+        }
+        AheadCall::Read { file_name, .. } => {
+            seen.insert((scratch.to_path)(file_name));
+        }
+        AheadCall::PackageJson(_) => {}
+    });
     let (own_seen, own_missing) = (scratch.tracked)();
     assert!(
         own_seen == seen && own_missing == missing,

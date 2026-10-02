@@ -565,6 +565,23 @@ pub enum AheadCall {
         file_name: String,
         hash: Option<u128>,
     },
+    /// The calls of Go `getPackageJsonInfo` for one package.json cache
+    /// entry (no `PackageJson` in them). One worker's answers that read the
+    /// entry share them, so the loader checks them once per load.
+    PackageJson(Arc<[AheadCall]>),
+}
+
+impl AheadCall {
+    /// Calls `f` with each call of `calls`, the calls of a `PackageJson`
+    /// in its place.
+    pub fn each(calls: &[AheadCall], f: &mut impl FnMut(&AheadCall)) {
+        for call in calls {
+            match call {
+                AheadCall::PackageJson(group) => AheadCall::each(group, f),
+                call => f(call),
+            }
+        }
+    }
 }
 
 /// How the resolve-ahead call log of a resolution ended
@@ -594,6 +611,11 @@ struct AheadThread {
     /// later resolution that reads the cache logs the read again
     /// (`Caches::log_package_json`).
     reads: FxHashMap<String, Option<u128>>,
+    /// The calls of each package.json cache entry of this job, by the
+    /// entry's address (the cache keeps each entry for the whole job).
+    /// `None`: the entry's file was not read from a file that the loader
+    /// can check.
+    package_jsons: FxHashMap<usize, Option<Arc<[AheadCall]>>>,
 }
 
 thread_local! {
@@ -618,6 +640,7 @@ pub fn begin_ahead_thread(
             calls: None,
             shareable: true,
             reads,
+            package_jsons: FxHashMap::default(),
         });
     });
 }
@@ -667,44 +690,60 @@ pub fn note_ahead_read(file_name: &str, hash: Option<u128>) {
 /// finds the entry in the worker's package.json cache makes no call, but
 /// the loader's own resolution makes them when its cache does not have the
 /// entry. So each resolution that reads the entry lists them, as
-/// `Caches::log_package_json` does for the `tsc -b` lookups. A call that
+/// `Caches::log_package_json` does for the `tsc -b` lookups, as one
+/// `AheadCall::PackageJson` that the worker's answers share. A call that
 /// the worker made for this entry is then listed twice, which the loader's
 /// check and replay allow.
 fn log_ahead_package_json(entry: &InfoCacheEntry) {
     AHEAD.with(|ahead| {
         let mut ahead = ahead.borrow_mut();
-        let Some(AheadThread {
-            current_directory,
-            use_case_sensitive_file_names,
-            calls: Some(calls),
-            shareable,
-            reads,
-        }) = ahead.as_mut()
-        else {
+        let Some(state) = ahead.as_mut().filter(|state| state.calls.is_some()) else {
             return;
         };
-        let to_path = |name: &str| to_path(name, current_directory, *use_case_sensitive_file_names);
-        if !entry.directory_exists {
-            calls.push(AheadCall::MissingDirectory {
-                path: to_path(&entry.package_directory),
-            });
-            return;
-        }
-        let file_name = combine_paths(&entry.package_directory, &["package.json"]);
-        calls.push(AheadCall::FileExists {
-            path: to_path(&file_name),
-            exists: entry.exists(),
-            known: false,
-        });
-        if entry.exists() {
-            match reads.get(&file_name) {
-                Some(&hash) => calls.push(AheadCall::Read { file_name, hash }),
-                // The worker did not read it from a file that the loader can
-                // check.
-                None => *shareable = false,
+        let key = std::ptr::from_ref(entry) as usize;
+        let group = match state.package_jsons.get(&key) {
+            Some(group) => group.clone(),
+            None => {
+                let group = package_json_calls(entry, state);
+                state.package_jsons.insert(key, group.clone());
+                group
             }
+        };
+        match (group, state.calls.as_mut()) {
+            (Some(group), Some(calls)) => calls.push(AheadCall::PackageJson(group)),
+            // The worker did not read the package.json from a file that the
+            // loader can check.
+            _ => state.shareable = false,
         }
     });
+}
+
+/// The calls of Go `getPackageJsonInfo` for `entry`. `None` when the worker
+/// did not read its package.json from a file that the loader can check.
+fn package_json_calls(entry: &InfoCacheEntry, state: &AheadThread) -> Option<Arc<[AheadCall]>> {
+    let to_path = |name: &str| {
+        to_path(
+            name,
+            &state.current_directory,
+            state.use_case_sensitive_file_names,
+        )
+    };
+    if !entry.directory_exists {
+        return Some(Arc::new([AheadCall::MissingDirectory {
+            path: to_path(&entry.package_directory),
+        }]));
+    }
+    let file_name = combine_paths(&entry.package_directory, &["package.json"]);
+    let exists = AheadCall::FileExists {
+        path: to_path(&file_name),
+        exists: entry.exists(),
+        known: false,
+    };
+    if !entry.exists() {
+        return Some(Arc::new([exists]));
+    }
+    let hash = *state.reads.get(&file_name)?;
+    Some(Arc::new([exists, AheadCall::Read { file_name, hash }]))
 }
 
 /// Marks the resolution that runs on this thread as not shareable: it made
