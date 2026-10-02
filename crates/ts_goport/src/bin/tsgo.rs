@@ -200,9 +200,6 @@ fn launch(huge_pages: bool) -> Option<i32> {
     args.next()?;
     let args: Vec<_> = args.collect();
     let exe = std::env::current_exe().ok()?;
-    // Before the worker starts, so a failed start leaves no worker behind.
-    let forward = forward_signals();
-    drop_go_signals();
     // Both ends keep their close-on-exec flag, so the worker and the
     // processes it starts get neither. The worker opens `write` again by
     // the number of `read` (`exit`). THP off (`prctl`) stays off in the
@@ -210,7 +207,10 @@ fn launch(huge_pages: bool) -> Option<i32> {
     let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok()?;
     let launcher = rustix::process::getpid().as_raw_pid();
     let stat = rustix::fs::fstat(&read).ok()?;
-    let mut worker = std::process::Command::new(exe)
+    // Before the worker starts, so a failed start leaves no worker behind.
+    let forward = forward_signals();
+    drop_go_signals();
+    let started = std::process::Command::new(exe)
         .arg0(format!(
             "{WORKER_ARG0} {launcher} {} {} {}",
             read.as_raw_fd(),
@@ -218,8 +218,13 @@ fn launch(huge_pages: bool) -> Option<i32> {
             stat.st_ino
         ))
         .args(args)
-        .spawn()
-        .ok()?;
+        .spawn();
+    let Ok(mut worker) = started else {
+        // No worker: this process runs the work. `forward` drops here, so
+        // its thread ends.
+        restore_default_actions();
+        return None;
+    };
     if let Some(forward) = forward {
         let _ = forward.send(rustix::process::Pid::from_child(&worker));
     }
@@ -406,6 +411,51 @@ fn wait_until_caught(pid: rustix::process::Pid, signal: rustix::process::Signal)
     }
 }
 
+/// Gives SIGINT, SIGTERM and the signals that Go throws (`GO_THROWN`) their
+/// default actions back when `launch` starts no worker after
+/// `forward_signals` took them: dropping its `Signals` removes their
+/// actions, not their handlers, so they would do nothing until the run
+/// sets its own handlers. A run that never was a launcher has the default
+/// actions there. Each one does its default action while its flag is set
+/// (`register_conditional_default`); `go_runtime_start` and `run_main`
+/// clear the flags once their handlers are set (`end_default_actions`).
+/// PORT: std and rustix have no safe `SIG_DFL`; signal-hook sets it and
+/// raises the signal again. SIGSTKFLT is not in signal-hook's table, so
+/// it does nothing there until `go_runtime_start`.
+#[cfg(target_os = "linux")]
+fn restore_default_actions() {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::flag::register_conditional_default;
+    let set = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let notify = NOTIFY_DEFAULT.get_or_init(set);
+    let thrown = THROWN_DEFAULT.get_or_init(set);
+    for signal in [SIGINT, SIGTERM] {
+        let _ = register_conditional_default(signal, notify.clone());
+    }
+    for (signal, _) in GO_THROWN {
+        let _ = register_conditional_default(signal.as_raw(), thrown.clone());
+    }
+}
+
+/// The flags of the default actions of SIGINT and SIGTERM
+/// (`NOTIFY_DEFAULT`) and of the signals that Go throws (`THROWN_DEFAULT`),
+/// set only by `restore_default_actions`.
+#[cfg(target_os = "linux")]
+static NOTIFY_DEFAULT: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+#[cfg(target_os = "linux")]
+static THROWN_DEFAULT: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+/// Ends the default actions of `restore_default_actions` that `flag` sets,
+/// once the run has set its own handlers for those signals.
+#[cfg(target_os = "linux")]
+fn end_default_actions(flag: &std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+    if let Some(flag) = flag.get() {
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Signals that the Go runtime catches and drops when no `signal.Notify`
 /// asks for them: `_SigNotify` alone or with `_SigUnblock` in
 /// `runtime/sigtab_linux_generic.go` (go1.27.1). The real-time signals 35 to
@@ -485,6 +535,7 @@ fn go_runtime_start() {
         let Ok(mut signals) = signal_hook::iterator::Signals::new(thrown) else {
             return;
         };
+        end_default_actions(&THROWN_DEFAULT);
         ts_goport::core::GoThread::new()
             .name("go-signals".to_string())
             .spawn(move || {
@@ -581,6 +632,8 @@ fn run_main(start: Instant) -> i32 {
 
     // Go: ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
     let (ctx, stop) = notify_context(&context::background());
+    #[cfg(target_os = "linux")]
+    end_default_actions(&NOTIFY_DEFAULT);
     // PORT: Go `newSystem()` calls `os.Exit` on this error, so `stop` does
     // not run there either.
     let sys = match new_os_system() {
