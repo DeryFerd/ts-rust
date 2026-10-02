@@ -950,7 +950,7 @@ fn append_helper_if_unique(helpers: &mut Vec<EmitHelperRef>, helper: EmitHelperR
 }
 
 impl EmitContext {
-    // Go: printer/emitcontext.go:552 EmitFlags
+    // Go: printer/emitcontext.go:576 EmitFlags
     #[must_use]
     pub fn emit_flags(&self, node: Node) -> EmitFlags {
         if let Some(emit_node) = self.emit_nodes.borrow().try_get(node) {
@@ -959,12 +959,12 @@ impl EmitContext {
         EmitFlags::NONE
     }
 
-    // Go: printer/emitcontext.go:559 SetEmitFlags
+    // Go: printer/emitcontext.go:583 SetEmitFlags
     pub fn set_emit_flags(&self, node: Node, flags: EmitFlags) {
         self.emit_nodes.borrow_mut().get(node).emit_flags = flags;
     }
 
-    // Go: printer/emitcontext.go:563 AddEmitFlags
+    // Go: printer/emitcontext.go:587 AddEmitFlags
     pub fn add_emit_flags(&self, node: Node, flags: EmitFlags) {
         let mut emit_nodes = self.emit_nodes.borrow_mut();
         let emit_node = emit_nodes.get(node);
@@ -985,7 +985,7 @@ impl EmitContext {
         self.emit_nodes.borrow_mut().get(node).snippet_element = Some(snippet_element);
     }
 
-    // Go: printer/emitcontext.go:568 CommentRange
+    // Go: printer/emitcontext.go:603 CommentRange
     // Gets the range to use for a node when emitting comments.
     #[must_use]
     pub fn comment_range(&self, node: Node) -> TextRange {
@@ -997,7 +997,7 @@ impl EmitContext {
         node.loc()
     }
 
-    // Go: printer/emitcontext.go:576 SetCommentRange
+    // Go: printer/emitcontext.go:611 SetCommentRange
     // Sets the range to use for a node when emitting comments.
     pub fn set_comment_range(&self, node: Node, loc: TextRange) {
         let mut emit_nodes = self.emit_nodes.borrow_mut();
@@ -1006,13 +1006,13 @@ impl EmitContext {
         emit_node.flags |= HAS_COMMENT_RANGE;
     }
 
-    // Go: printer/emitcontext.go:583 AssignCommentRange
+    // Go: printer/emitcontext.go:618 AssignCommentRange
     // Sets the range to use for a node when emitting comments.
     pub fn assign_comment_range(&self, to: Node, from: Node) {
         self.set_comment_range(to, self.comment_range(from));
     }
 
-    // Go: printer/emitcontext.go:588 SourceMapRange
+    // Go: printer/emitcontext.go:623 SourceMapRange
     // Gets the range to use for a node when emitting source maps.
     #[must_use]
     pub fn source_map_range(&self, node: Node) -> TextRange {
@@ -1024,7 +1024,7 @@ impl EmitContext {
         node.loc()
     }
 
-    // Go: printer/emitcontext.go:596 SetSourceMapRange
+    // Go: printer/emitcontext.go:631 SetSourceMapRange
     // Sets the range to use for a node when emitting source maps.
     pub fn set_source_map_range(&self, node: Node, loc: TextRange) {
         let mut emit_nodes = self.emit_nodes.borrow_mut();
@@ -1033,13 +1033,13 @@ impl EmitContext {
         emit_node.flags |= HAS_SOURCE_MAP_RANGE;
     }
 
-    // Go: printer/emitcontext.go:603 AssignSourceMapRange
+    // Go: printer/emitcontext.go:638 AssignSourceMapRange
     // Sets the range to use for a node when emitting source maps.
     pub fn assign_source_map_range(&self, to: Node, from: Node) {
         self.set_source_map_range(to, self.source_map_range(from));
     }
 
-    // Go: printer/emitcontext.go:608 AssignCommentAndSourceMapRanges
+    // Go: printer/emitcontext.go:643 AssignCommentAndSourceMapRanges
     // Sets the range to use for a node when emitting comments and source maps.
     pub fn assign_comment_and_source_map_ranges(&self, to: Node, from: Node) {
         // PORT: Go gets `emitNode` for `to` first. The Rust borrow is taken
@@ -1053,7 +1053,7 @@ impl EmitContext {
         emit_node.flags |= HAS_COMMENT_RANGE | HAS_SOURCE_MAP_RANGE;
     }
 
-    // Go: printer/emitcontext.go:618 TokenSourceMapRange
+    // Go: printer/emitcontext.go:653 TokenSourceMapRange
     // Gets the range for a token of a node when emitting source maps.
     #[must_use]
     pub fn token_source_map_range(&self, node: Node, kind: SyntaxKind) -> (TextRange, bool) {
@@ -1067,7 +1067,7 @@ impl EmitContext {
         (TextRange::new(0, 0), false)
     }
 
-    // Go: printer/emitcontext.go:628 SetTokenSourceMapRange
+    // Go: printer/emitcontext.go:663 SetTokenSourceMapRange
     // Sets the range for a token of a node when emitting source maps.
     pub fn set_token_source_map_range(&self, node: Node, kind: SyntaxKind, loc: TextRange) {
         let mut emit_nodes = self.emit_nodes.borrow_mut();
@@ -1078,7 +1078,7 @@ impl EmitContext {
             .insert(kind, loc);
     }
 
-    // Go: printer/emitcontext.go:636 AssignedName
+    // Go: printer/emitcontext.go:671 AssignedName
     #[must_use]
     pub fn assigned_name(&self, node: Node) -> Node {
         self.assigned_name
@@ -1088,7 +1088,7 @@ impl EmitContext {
             .unwrap_or(Node::NIL)
     }
 
-    // Go: printer/emitcontext.go:640 TextSource
+    // Go: printer/emitcontext.go:675 TextSource
     #[must_use]
     pub fn text_source(&self, node: Node) -> Node {
         self.text_source
@@ -1098,12 +1098,12 @@ impl EmitContext {
             .unwrap_or(Node::NIL)
     }
 
-    // Go: printer/emitcontext.go:644 SetAssignedName
+    // Go: printer/emitcontext.go:679 SetAssignedName
     pub fn set_assigned_name(&self, node: Node, name: Node) {
         self.assigned_name.borrow_mut().insert(node, name);
     }
 
-    // Go: printer/emitcontext.go:651 ClassThis
+    // Go: printer/emitcontext.go:686 ClassThis
     #[must_use]
     pub fn class_this(&self, node: Node) -> Node {
         self.class_this
@@ -1113,12 +1113,12 @@ impl EmitContext {
             .unwrap_or(Node::NIL)
     }
 
-    // Go: printer/emitcontext.go:655 SetClassThis
+    // Go: printer/emitcontext.go:690 SetClassThis
     pub fn set_class_this(&self, node: Node, class_this: Node) {
         self.class_this.borrow_mut().insert(node, class_this);
     }
 
-    // Go: printer/emitcontext.go:662 RequestEmitHelper
+    // Go: printer/emitcontext.go:697 RequestEmitHelper
     pub fn request_emit_helper(&self, helper: EmitHelperRef) {
         if helper.scoped {
             panic!("Cannot request a scoped emit helper");
@@ -1129,12 +1129,12 @@ impl EmitContext {
         append_helper_if_unique(&mut self.emit_helpers.borrow_mut(), helper);
     }
 
-    // Go: printer/emitcontext.go:672 ReadEmitHelpers
+    // Go: printer/emitcontext.go:707 ReadEmitHelpers
     pub fn read_emit_helpers(&self) -> Vec<EmitHelperRef> {
         std::mem::take(&mut *self.emit_helpers.borrow_mut())
     }
 
-    // Go: printer/emitcontext.go:678 AddEmitHelper
+    // Go: printer/emitcontext.go:713 AddEmitHelper
     pub fn add_emit_helper(&self, node: Node, helper: &[EmitHelperRef]) {
         let mut emit_nodes = self.emit_nodes.borrow_mut();
         let emit_node = emit_nodes.get(node);
@@ -1143,7 +1143,7 @@ impl EmitContext {
         }
     }
 
-    // Go: printer/emitcontext.go:685 MoveEmitHelpers
+    // Go: printer/emitcontext.go:720 MoveEmitHelpers
     pub fn move_emit_helpers(
         &self,
         source: Node,
@@ -1179,7 +1179,7 @@ impl EmitContext {
         }
     }
 
-    // Go: printer/emitcontext.go:713 GetEmitHelpers
+    // Go: printer/emitcontext.go:748 GetEmitHelpers
     #[must_use]
     pub fn get_emit_helpers(&self, node: Node) -> Vec<EmitHelperRef> {
         if let Some(emit_node) = self.emit_nodes.borrow().try_get(node) {
@@ -1188,7 +1188,7 @@ impl EmitContext {
         Vec::new()
     }
 
-    // Go: printer/emitcontext.go:721 GetExternalHelpersModuleName
+    // Go: printer/emitcontext.go:756 GetExternalHelpersModuleName
     #[must_use]
     pub fn get_external_helpers_module_name(&self, node: Node) -> Node {
         let parse_node = self.parse_node(node);
@@ -1200,7 +1200,7 @@ impl EmitContext {
         Node::NIL
     }
 
-    // Go: printer/emitcontext.go:730 SetExternalHelpersModuleName
+    // Go: printer/emitcontext.go:765 SetExternalHelpersModuleName
     pub fn set_external_helpers_module_name(&self, node: Node, name: Node) {
         let parse_node = self.parse_node(node);
         if parse_node.is_nil() {
@@ -1216,7 +1216,7 @@ impl EmitContext {
         self.emit_node_refs.set(true);
     }
 
-    // Go: printer/emitcontext.go:740 HasRecordedExternalHelpers
+    // Go: printer/emitcontext.go:775 HasRecordedExternalHelpers
     #[must_use]
     pub fn has_recorded_external_helpers(&self, node: Node) -> bool {
         let parse_node = self.parse_node(node);
@@ -1232,7 +1232,7 @@ impl EmitContext {
         false
     }
 
-    // Go: printer/emitcontext.go:748 IsCallToHelper
+    // Go: printer/emitcontext.go:783 IsCallToHelper
     #[must_use]
     pub fn is_call_to_helper(&self, first_segment: Node, helper_name: &str) -> bool {
         is_call_expression(first_segment)
@@ -1247,7 +1247,7 @@ impl EmitContext {
     // Visitor Hooks
     //
 
-    // Go: printer/emitcontext.go:759 VisitVariableEnvironment
+    // Go: printer/emitcontext.go:794 VisitVariableEnvironment
     pub fn visit_variable_environment<C>(
         &self,
         nodes: NodeList,
@@ -1258,7 +1258,7 @@ impl EmitContext {
         self.end_and_merge_variable_environment_list(visited)
     }
 
-    // Go: printer/emitcontext.go:764 VisitParameters
+    // Go: printer/emitcontext.go:799 VisitParameters
     pub fn visit_parameters<C>(
         &self,
         nodes: NodeList,
@@ -1290,7 +1290,7 @@ impl EmitContext {
         nodes
     }
 
-    // Go: printer/emitcontext.go:785 addDefaultValueAssignmentsIfNeeded
+    // Go: printer/emitcontext.go:820 addDefaultValueAssignmentsIfNeeded
     fn add_default_value_assignments_if_needed(&self, node_list: NodeList) -> NodeList {
         if node_list.is_nil() {
             return node_list;
@@ -1310,7 +1310,7 @@ impl EmitContext {
         node_list
     }
 
-    // Go: printer/emitcontext.go:808 addDefaultValueAssignmentIfNeeded
+    // Go: printer/emitcontext.go:843 addDefaultValueAssignmentIfNeeded
     fn add_default_value_assignment_if_needed(&self, parameter: Node) -> Node {
         // A rest parameter cannot have a binding pattern or an initializer,
         // so let's just ignore it.
@@ -1328,7 +1328,7 @@ impl EmitContext {
         parameter
     }
 
-    // Go: printer/emitcontext.go:821 addDefaultValueAssignmentForBindingPattern
+    // Go: printer/emitcontext.go:856 addDefaultValueAssignmentForBindingPattern
     fn add_default_value_assignment_for_binding_pattern(&self, parameter: Node) -> Node {
         let f = self.factory();
         let init_node = if parameter.initializer().is_some() {
@@ -1368,7 +1368,7 @@ impl EmitContext {
         )
     }
 
-    // Go: printer/emitcontext.go:857 addDefaultValueAssignmentForInitializer
+    // Go: printer/emitcontext.go:892 addDefaultValueAssignmentForInitializer
     fn add_default_value_assignment_for_initializer(
         &self,
         parameter: Node,
@@ -1413,7 +1413,7 @@ impl EmitContext {
         )
     }
 
-    // Go: printer/emitcontext.go:886 AddInitializationStatement
+    // Go: printer/emitcontext.go:921 AddInitializationStatement
     pub fn add_initialization_statement(&self, node: Node) {
         // PORT: Go `Peek` panics on an empty stack before the nil check.
         let scope = self
@@ -1442,7 +1442,7 @@ impl EmitContext {
         block
     }
 
-    // Go: printer/emitcontext.go:895 VisitFunctionBody
+    // Go: printer/emitcontext.go:943 VisitFunctionBody
     pub fn visit_function_body<C>(&self, node: Node, visitor: &mut NodeVisitor<'_, C>) -> Node {
         // !!! c.resumeVariableEnvironment()
         let updated = visitor.visit_node(node);
@@ -1473,7 +1473,7 @@ impl EmitContext {
         )
     }
 
-    // Go: printer/emitcontext.go:919 VisitIterationBody
+    // Go: printer/emitcontext.go:972 VisitIterationBody
     pub fn visit_iteration_body<C>(&self, body: Node, visitor: &mut NodeVisitor<'_, C>) -> Node {
         if body.is_nil() {
             return Node::NIL;
@@ -1501,7 +1501,7 @@ impl EmitContext {
         updated
     }
 
-    // Go: printer/emitcontext.go:945 VisitEmbeddedStatement
+    // Go: printer/emitcontext.go:998 VisitEmbeddedStatement
     pub fn visit_embedded_statement<C>(
         &self,
         node: Node,
@@ -1521,7 +1521,7 @@ impl EmitContext {
         embedded_statement
     }
 
-    // Go: printer/emitcontext.go:960 SetSyntheticLeadingComments
+    // Go: printer/emitcontext.go:1013 SetSyntheticLeadingComments
     pub fn set_synthetic_leading_comments(
         &self,
         node: Node,
@@ -1531,7 +1531,7 @@ impl EmitContext {
         node
     }
 
-    // Go: printer/emitcontext.go:965 AddSyntheticLeadingComment
+    // Go: printer/emitcontext.go:1018 AddSyntheticLeadingComment
     pub fn add_synthetic_leading_comment(
         &self,
         node: Node,
@@ -1553,7 +1553,7 @@ impl EmitContext {
         node
     }
 
-    // Go: printer/emitcontext.go:970 GetSyntheticLeadingComments
+    // Go: printer/emitcontext.go:1023 GetSyntheticLeadingComments
     #[must_use]
     pub fn get_synthetic_leading_comments(&self, node: Node) -> Vec<SynthesizedComment> {
         if let Some(emit_node) = self.emit_nodes.borrow().try_get(node) {
@@ -1562,7 +1562,7 @@ impl EmitContext {
         Vec::new()
     }
 
-    // Go: printer/emitcontext.go:977 SetSyntheticTrailingComments
+    // Go: printer/emitcontext.go:1030 SetSyntheticTrailingComments
     pub fn set_synthetic_trailing_comments(
         &self,
         node: Node,
@@ -1572,7 +1572,7 @@ impl EmitContext {
         node
     }
 
-    // Go: printer/emitcontext.go:982 AddSyntheticTrailingComment
+    // Go: printer/emitcontext.go:1035 AddSyntheticTrailingComment
     pub fn add_synthetic_trailing_comment(
         &self,
         node: Node,
@@ -1594,7 +1594,7 @@ impl EmitContext {
         node
     }
 
-    // Go: printer/emitcontext.go:987 GetSyntheticTrailingComments
+    // Go: printer/emitcontext.go:1040 GetSyntheticTrailingComments
     #[must_use]
     pub fn get_synthetic_trailing_comments(&self, node: Node) -> Vec<SynthesizedComment> {
         if let Some(emit_node) = self.emit_nodes.borrow().try_get(node) {
@@ -1603,7 +1603,7 @@ impl EmitContext {
         Vec::new()
     }
 
-    // Go: printer/emitcontext.go:996 SetTypeNode
+    // Go: printer/emitcontext.go:1049 SetTypeNode
     // SetTypeNode stores the original type node on a name node when the type is erased,
     // so the emitter can use the type's position for comment preservation.
     pub fn set_type_node(&self, node: Node, type_node: Node) {
@@ -1611,7 +1611,7 @@ impl EmitContext {
         self.emit_node_refs.set(true);
     }
 
-    // Go: printer/emitcontext.go:1001 GetTypeNode
+    // Go: printer/emitcontext.go:1054 GetTypeNode
     // GetTypeNode gets the type node stored on a name node by the type eraser.
     #[must_use]
     pub fn get_type_node(&self, node: Node) -> Node {
@@ -1621,7 +1621,7 @@ impl EmitContext {
         Node::NIL
     }
 
-    // Go: printer/emitcontext.go:1008 NewNotEmittedStatement
+    // Go: printer/emitcontext.go:1061 NewNotEmittedStatement
     pub fn new_not_emitted_statement(&self, node: Node) -> Node {
         let statement = self.factory().new_not_emitted_statement();
         set_node_loc(statement, node.loc());
