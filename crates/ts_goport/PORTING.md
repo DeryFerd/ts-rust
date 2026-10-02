@@ -570,7 +570,9 @@ process (bin/tsgo.rs `go_runtime_start`).
   (`sigFromUser`) as it throws SIGQUIT: it prints the name (`SIGSEGV:
   segmentation violation`), the PC line and the goroutines and exits 2. In
   the port the process ends by the signal (128 + N, a core dump where the
-  limit allows it).
+  limit allows it). A SIGILL, SIGBUS, SIGFPE, SIGABRT or SIGTRAP that was
+  ignored at start stays ignored, also in a process that tsgo starts; Go
+  catches it, so a process that Go starts gets the default action.
 - PORT: the signal mask. On each thread Go unblocks the signals that it
   must get (sigtab `_SigUnblock`, `_SigKill` or `_SigThrow`: SIGHUP,
   SIGINT, SIGTERM, SIGQUIT, SIGILL, SIGSEGV and others), and a process that
