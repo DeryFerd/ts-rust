@@ -1613,6 +1613,56 @@ pub fn count_file_stats(
     stats
 }
 
+// Go: project/session.go:1053 to :1083 (part of getSnapshot)
+/// The update reason of a request with no pending changes on `snapshot`.
+/// `UNKNOWN` when the request can use `snapshot`.
+// PORT: a function, because `get_snapshot` can ask twice (after a pending
+// auto-import warm).
+fn snapshot_update_reason(snapshot: &Snapshot, request: &ResourceRequest) -> UpdateReason {
+    let mut update_reason = UpdateReason::UNKNOWN;
+    if !request.projects.is_empty() {
+        update_reason = UpdateReason::REQUESTED_LANGUAGE_SERVICE_PROJECT_DIRTY;
+    } else if request.project_tree.is_some() {
+        update_reason = UpdateReason::REQUESTED_LOAD_PROJECT_TREE;
+    } else if !request.auto_imports.0.is_empty() {
+        update_reason = UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS;
+    } else {
+        for document in &request.documents {
+            match snapshot.get_default_project(document) {
+                None => {
+                    update_reason = UpdateReason::REQUESTED_LANGUAGE_SERVICE_PROJECT_NOT_LOADED;
+                }
+                Some(project) => {
+                    if project.borrow().dirty {
+                        update_reason = UpdateReason::REQUESTED_LANGUAGE_SERVICE_PROJECT_DIRTY;
+                    }
+                }
+            }
+        }
+        if update_reason == UpdateReason::UNKNOWN {
+            for document in &request.configured_project_documents {
+                if snapshot.is_open_file(&document.file_name()) {
+                    match snapshot.get_default_project(document) {
+                        None => {
+                            update_reason =
+                                UpdateReason::REQUESTED_LANGUAGE_SERVICE_PROJECT_NOT_LOADED;
+                        }
+                        Some(project) => {
+                            if project.borrow().dirty {
+                                update_reason =
+                                    UpdateReason::REQUESTED_LANGUAGE_SERVICE_PROJECT_DIRTY;
+                            }
+                        }
+                    }
+                } else {
+                    update_reason = UpdateReason::REQUESTED_LANGUAGE_SERVICE_FOR_FILE_NOT_OPEN;
+                }
+            }
+        }
+    }
+    update_reason
+}
+
 impl Session {
     // Go: project/session.go:894 Snapshot
     pub fn snapshot(&self) -> Rc<Snapshot> {
@@ -1656,47 +1706,19 @@ impl Session {
                 .expect("updateSnapshot without an API request returns the snapshot");
         }
         // If there are no pending file changes, we can try to use the current snapshot.
-        let snapshot = self.snapshot.borrow().clone();
-        let mut update_reason = UpdateReason::UNKNOWN;
-        if !request.projects.is_empty() {
-            update_reason = UpdateReason::REQUESTED_LANGUAGE_SERVICE_PROJECT_DIRTY;
-        } else if request.project_tree.is_some() {
-            update_reason = UpdateReason::REQUESTED_LOAD_PROJECT_TREE;
-        } else if !request.auto_imports.0.is_empty() {
-            update_reason = UpdateReason::REQUESTED_LANGUAGE_SERVICE_WITH_AUTO_IMPORTS;
-        } else {
-            for document in &request.documents {
-                match snapshot.get_default_project(document) {
-                    None => {
-                        update_reason = UpdateReason::REQUESTED_LANGUAGE_SERVICE_PROJECT_NOT_LOADED;
-                    }
-                    Some(project) => {
-                        if project.borrow().dirty {
-                            update_reason = UpdateReason::REQUESTED_LANGUAGE_SERVICE_PROJECT_DIRTY;
-                        }
-                    }
-                }
-            }
-            if update_reason == UpdateReason::UNKNOWN {
-                for document in &request.configured_project_documents {
-                    if snapshot.is_open_file(&document.file_name()) {
-                        match snapshot.get_default_project(document) {
-                            None => {
-                                update_reason =
-                                    UpdateReason::REQUESTED_LANGUAGE_SERVICE_PROJECT_NOT_LOADED;
-                            }
-                            Some(project) => {
-                                if project.borrow().dirty {
-                                    update_reason =
-                                        UpdateReason::REQUESTED_LANGUAGE_SERVICE_PROJECT_DIRTY;
-                                }
-                            }
-                        }
-                    } else {
-                        update_reason = UpdateReason::REQUESTED_LANGUAGE_SERVICE_FOR_FILE_NOT_OPEN;
-                    }
-                }
-            }
+        let mut snapshot = self.snapshot.borrow().clone();
+        let mut update_reason = snapshot_update_reason(&snapshot, &request);
+        // PORT: (editfuzz2 D1b, A1) Go starts the auto-import warm of a
+        // snapshot when it adopts it (session.go:1414), so the warm usually
+        // ends before the next request gets here, and that request starts
+        // from the warmed snapshot. The port runs the warm's clone as idle
+        // work (`warm_auto_import_cache`). A request that comes first and
+        // makes a new snapshot here would make the warm stale, and its clone
+        // would be discarded. So such a request runs a pending warm of the
+        // current snapshot first, as Go's order gives, then looks again.
+        if update_reason != UpdateReason::UNKNOWN && self.run_pending_warm_of(&snapshot) {
+            snapshot = self.snapshot.borrow().clone();
+            update_reason = snapshot_update_reason(&snapshot, &request);
         }
         if update_reason == UpdateReason::UNKNOWN {
             if caller_ref {
@@ -3596,6 +3618,22 @@ impl Session {
         self.adopt_snapshot_change(&new_snapshot, &cloned_snapshot);
         new_snapshot.deref();
         cancel();
+    }
+
+    /// PORT: runs the pending warm now when it warms `snapshot` and its
+    /// clone has not started (see `get_snapshot`). True when it ran. In Go
+    /// the warm is a goroutine, so a Go panic in it ends the process even
+    /// inside a request that recovers (`go_work_group_task`).
+    fn run_pending_warm_of(self: &Rc<Self>, snapshot: &Rc<Snapshot>) -> bool {
+        let pending = self
+            .warm_auto_import_pending
+            .borrow()
+            .as_ref()
+            .is_some_and(|warm| Rc::ptr_eq(&warm.new_snapshot, snapshot));
+        if pending {
+            crate::core::go_work_group_task(|| self.run_pending_warm());
+        }
+        pending
     }
 
     /// PORT: Go's deferred `newSnapshot.Deref(s)` and `cancel()` for a

@@ -1897,3 +1897,47 @@ child_test! {
         }
     }
 }
+
+child_test! {
+    // PORT: no Go counterpart (editfuzz2 D1b, A1). Go starts the
+    // auto-import warm of a snapshot when it adopts it (session.go:1414),
+    // so the next request usually starts from the warmed snapshot. The
+    // port's warm waits for idle time. A request that makes a new snapshot
+    // with no file change (here an update of the project, as references
+    // and a diagnostic of a dirty project do) runs the pending warm first,
+    // so its snapshot keeps the warmed registry, as Go's does.
+    fn request_that_updates_the_snapshot_runs_the_pending_auto_import_warm_first() {
+        const INDEX_URI: &str = "file:///home/projects/app/index.ts";
+        let session = bare_session(files(&[
+            ("/home/projects/app/tsconfig.json", "{}"),
+            ("/home/projects/app/index.ts", ""),
+            ("/home/projects/node_modules/foo/package.json", r#"{ "types": "index.d.ts" }"#),
+            ("/home/projects/node_modules/foo/index.d.ts", "export const foo = 0;"),
+        ]));
+        open(&session, INDEX_URI, "");
+        session.wait_for_background_tasks();
+        let project = default_project_id(&session, INDEX_URI);
+
+        // A change of one open file queues a warm when its snapshot is
+        // adopted. Its clone waits for idle time.
+        edit(&session, INDEX_URI, 2, (0, 0), (0, 0), "let a = 1;");
+        let _ = language_service(&session, INDEX_URI);
+        session.background_queue.wait();
+        let warmed = session.snapshot();
+        assert!(session.warm_auto_import_pending.borrow().is_some());
+
+        let snapshot = session.get_snapshot(
+            &bg(),
+            project::ResourceRequest {
+                projects: vec![project],
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(session.warm_auto_import_pending.borrow().is_none());
+        assert!(!Rc::ptr_eq(&snapshot, &warmed));
+        let names = node_modules_export_names(&session);
+        assert!(names.contains("foo"), "{names:?}");
+        session.close();
+    }
+}
