@@ -802,12 +802,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "a4dc8543f41ce6270",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "a4e4f4f7d97cf7a56",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R155 pipeline (candidate.sh side)."
