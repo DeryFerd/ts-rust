@@ -553,8 +553,11 @@ impl DefaultResolver {
                 return (cached, Vec::new());
             }
             // PERF: a parse worker may have resolved this key already (see
-            // `resolve_type_reference_directive`).
+            // `resolve_type_reference_directive`). A resolve-ahead worker
+            // resolves each key that no other worker takes
+            // (`AheadQueue::take_next`), so it does not look.
             if let Some(shared) = &self.caches.shared
+                && !(shared.publish && on_ahead_thread())
                 && let Some(found) = shared.cache.get_module(&key_parts)
             {
                 self.caches.note_worker_package_jsons(&found.package_jsons);

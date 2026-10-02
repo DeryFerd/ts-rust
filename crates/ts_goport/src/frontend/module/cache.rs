@@ -484,12 +484,14 @@ impl Caches {
         self.parsed_patterns_for_paths.clear();
         let worker_package_jsons = std::mem::take(&mut *self.worker_package_jsons.borrow_mut());
         let worker_lookups = std::mem::take(&mut *self.worker_lookups.borrow_mut());
-        drop((
+        drop(type_ref_directives);
+        // PERF: in the language server, resolve-ahead workers made most of
+        // these answers; they free them (with none, they drop here).
+        crate::frontend::compiler::resolve_ahead::drop_on_worker(Box::new((
             modules,
-            type_ref_directives,
             worker_package_jsons,
             worker_lookups,
-        ));
+        )));
         if Rc::strong_count(&self.package_json_info_cache) == 1 {
             self.package_json_info_cache.clear();
         }
@@ -655,6 +657,12 @@ pub fn begin_ahead_thread(
             directory_exists,
         });
     });
+}
+
+/// True on a resolve-ahead worker (`begin_ahead_thread`).
+#[must_use]
+pub fn on_ahead_thread() -> bool {
+    AHEAD.with(|ahead| ahead.borrow().is_some())
 }
 
 /// Ends `begin_ahead_thread`: the hashes of the files that the worker read

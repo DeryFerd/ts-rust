@@ -710,7 +710,13 @@ fn has_relative_path_segment(p: &str) -> bool {
 }
 
 /// True when a segment of `b` is "." or "..", or a slash follows a slash.
+/// Two SIMD searches, for "//" and for "/." (a dot that starts a segment,
+/// rare in a path), cost less than a search per slash.
 fn has_dot_or_empty_segment(b: &[u8]) -> bool {
+    static SLASH_SLASH: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+        std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"//"));
+    static SLASH_DOT: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+        std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"/."));
     // The segment that starts at `i` is "." or "..".
     let dot_segment = |i: usize| match b.get(i) {
         Some(b'.') => match b.get(i + 1) {
@@ -721,7 +727,8 @@ fn has_dot_or_empty_segment(b: &[u8]) -> bool {
         _ => false,
     };
     dot_segment(0)
-        || memchr::memchr_iter(b'/', b).any(|i| b.get(i + 1) == Some(&b'/') || dot_segment(i + 1))
+        || SLASH_SLASH.find(b).is_some()
+        || SLASH_DOT.find_iter(b).any(|i| dot_segment(i + 1))
 }
 
 // Go: tspath/path.go:531 hasRelativePathSegment (the debug check of

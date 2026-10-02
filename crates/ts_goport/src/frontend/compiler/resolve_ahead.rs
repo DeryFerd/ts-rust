@@ -192,7 +192,7 @@ impl ResolveAhead {
                     left: AtomicUsize::new(0),
                     answers: Arc::new(SharedResolutionCache::default()),
                     view: host.view,
-                    stats: StatCache::default(),
+                    stats: WorkerStats::default(),
                     config: config.clone(),
                 })
             });
@@ -327,6 +327,26 @@ fn worker_count() -> usize {
         })
 }
 
+/// The workers of the process, once a load started them
+/// (`Workers::get`).
+static WORKERS: std::sync::OnceLock<Option<&'static Workers>> = std::sync::OnceLock::new();
+
+/// Drops `value` on a resolve-ahead worker when a load started the workers
+/// (they wait between loads), else here. The language server's loads take
+/// most answers from the workers; the workers then also free a released
+/// program's resolutions (`module::Caches::release`), so the dispatch
+/// thread does not before its next request.
+// PORT: not in Go (Go's garbage collector frees in the background).
+pub fn drop_on_worker(value: Box<dyn Send>) {
+    match WORKERS.get().copied().flatten() {
+        Some(workers) => {
+            lock_state(workers).drops.push(value);
+            workers.wake.notify_one();
+        }
+        None => drop(value),
+    }
+}
+
 /// The resolve-ahead workers of the process. They start at the first load
 /// that resolves ahead and stay: between loads they wait on `wake` and
 /// use no CPU. One load at a time has them (`post`). After a load they free
@@ -344,9 +364,10 @@ struct Workers {
     /// The next job drops what the workers keep: the package.json parses
     /// (`KeptPackageJsons`) and the known files.
     fresh: AtomicBool,
-    /// The files that the answers of the last ended job found
-    /// (`EndedJob::free`): a worker answers `file_exists` for them with no
-    /// OS call, and the loader checks those answers (`AheadCall::FileExists`).
+    /// The files that the answers of earlier jobs found, since the last
+    /// rejected answer (`EndedJob::free`): a worker answers `file_exists`
+    /// for them with no OS call, and the loader checks those answers
+    /// (`AheadCall::FileExists`).
     known_files: Mutex<Arc<FxHashSet<Path>>>,
 }
 
@@ -358,12 +379,15 @@ struct WorkerState {
     generation: u64,
     /// The jobs of ended loads, for the workers to free.
     ended: Vec<EndedJob>,
+    /// Other values for the workers to free (`drop_on_worker`).
+    drops: Vec<Box<dyn Send>>,
 }
 
 /// What a worker does next.
 enum Task {
     Run(Arc<Job>),
     Free(EndedJob),
+    Drop(Box<dyn Send>),
 }
 
 /// The job of an ended load and the loader's links to it, which a worker
@@ -371,7 +395,7 @@ enum Task {
 struct EndedJob {
     job: Arc<Job>,
     shared: Option<Box<dyn Send>>,
-    /// Keep the files that the job's answers found
+    /// Keep the job's known files and the files that its answers found
     /// (`Workers::known_files`).
     keep_known_files: bool,
 }
@@ -386,24 +410,32 @@ impl EndedJob {
             keep_known_files,
         } = self;
         drop(shared);
+        // The files of the job's known set and the files that its answers
+        // found. A file that the answers did not use stays known: the loader
+        // checks each known answer, and a rejection starts a new set
+        // (`Workers::fresh`). Most loads find no new file, and the set is
+        // then kept as it is.
         if keep_known_files {
-            let mut found = FxHashSet::default();
+            let mut more: Option<FxHashSet<Path>> = None;
             job.answers.for_each_module(|answer| {
                 AheadCall::each(answer.ahead.as_deref().unwrap_or_default(), &mut |call| {
                     if let AheadCall::FileExists {
                         path, exists: true, ..
                     } = call
+                        && !job.known_files.contains(path)
                         && !job.view.open_files.contains(path)
-                        && !found.contains(path)
+                        && !more.as_ref().is_some_and(|more| more.contains(path))
                     {
-                        found.insert(path.clone());
+                        more.get_or_insert_with(|| (*job.known_files).clone())
+                            .insert(path.clone());
                     }
                 });
             });
+            let known = more.map_or_else(|| job.known_files.clone(), Arc::new);
             *workers
                 .known_files
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(found);
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = known;
         }
         drop(job);
     }
@@ -420,7 +452,6 @@ impl Workers {
     /// The workers, started at the first call. `None` when none could
     /// start or the count is 0.
     fn get() -> Option<&'static Workers> {
-        static WORKERS: std::sync::OnceLock<Option<&'static Workers>> = std::sync::OnceLock::new();
         *WORKERS.get_or_init(|| {
             let count = worker_count();
             if count == 0 {
@@ -521,6 +552,9 @@ fn run_worker(workers: &'static Workers) {
                 if let Some(ended) = state.ended.pop() {
                     break Task::Free(ended);
                 }
+                if let Some(value) = state.drops.pop() {
+                    break Task::Drop(value);
+                }
                 state = workers
                     .wake
                     .wait(state)
@@ -529,6 +563,7 @@ fn run_worker(workers: &'static Workers) {
         };
         match task {
             Task::Free(ended) => ended.free(workers),
+            Task::Drop(value) => drop(value),
             Task::Run(job) => {
                 run_job(&job);
                 job.left.fetch_add(1, Ordering::Release);
@@ -555,7 +590,7 @@ struct Job {
     view: WorkerView,
     /// The OS lookups of the workers, as the host's per-snapshot cache
     /// keeps the loader's.
-    stats: StatCache,
+    stats: WorkerStats,
     config: Arc<ResolverConfig>,
 }
 
@@ -681,6 +716,54 @@ impl KeptPackageJsons {
         }
         (cache, reads, kept_files)
     }
+}
+
+/// The OS lookups of a job's workers (`Job::stats`), as `StatCache`
+/// (files_parser.rs) keeps them, in shards by path, so the workers seldom
+/// wait for each other's lock.
+#[derive(Default)]
+struct WorkerStats {
+    file_exists: [Mutex<FxHashMap<String, bool>>; STAT_SHARDS],
+    directory_exists: [Mutex<FxHashMap<String, bool>>; STAT_SHARDS],
+    realpath: [Mutex<FxHashMap<String, String>>; STAT_SHARDS],
+}
+
+const STAT_SHARDS: usize = 16;
+
+impl WorkerStats {
+    fn file_exists(&self, path: &str, load: impl FnOnce() -> bool) -> bool {
+        cached(&self.file_exists, path, load)
+    }
+
+    fn directory_exists(&self, path: &str, load: impl FnOnce() -> bool) -> bool {
+        cached(&self.directory_exists, path, load)
+    }
+
+    fn realpath(&self, path: &str, load: impl FnOnce() -> String) -> String {
+        cached(&self.realpath, path, load)
+    }
+}
+
+/// The cached value of `path` in its shard, or `load()` stored as it. The
+/// lock is not held while `load` runs; the first stored value wins.
+fn cached<V: Clone>(
+    shards: &[Mutex<FxHashMap<String, V>>; STAT_SHARDS],
+    path: &str,
+    load: impl FnOnce() -> V,
+) -> V {
+    use std::hash::BuildHasher;
+    let hash = rustc_hash::FxBuildHasher.hash_one(path);
+    let shard = &shards[(hash >> 32) as usize % STAT_SHARDS];
+    let lock = || {
+        shard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some(value) = lock().get(path) {
+        return value.clone();
+    }
+    let value = load();
+    lock().entry(path.to_string()).or_insert(value).clone()
 }
 
 /// Go `module.ResolutionHost` of a worker resolver.
