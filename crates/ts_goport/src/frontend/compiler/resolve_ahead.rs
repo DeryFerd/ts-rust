@@ -17,6 +17,7 @@ use crate::frontend::prelude::*;
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use xxhash_rust::xxh3::xxh3_128;
 
 /// Whether program loads resolve ahead (`GOPORT_RESOLVE_AHEAD`).
@@ -92,13 +93,13 @@ pub struct WorkerView {
 pub struct ResolveAheadHost {
     /// The keys of the host's previous program load, in its order. `None`:
     /// no workers; the load only records its keys.
-    pub previous_keys: Option<Arc<[ModuleResolutionCacheKey]>>,
+    pub previous_keys: Option<Arc<KeyList>>,
     pub view: WorkerView,
     /// Checks the calls of a worker answer on the host's file system and
     /// replays their side effects (`AheadLink::accept`).
-    pub accept: Rc<dyn Fn(&ModuleResolutionCacheKey, &ResolvedModule, &[AheadCall]) -> bool>,
+    pub accept: AheadAccept,
     /// Keeps the keys of this load for the next load.
-    pub keep_keys: Box<dyn FnOnce(Arc<[ModuleResolutionCacheKey]>)>,
+    pub keep_keys: Box<dyn FnOnce(Arc<KeyList>)>,
     /// Debug builds: makes a new tracking view of the host's file system,
     /// to check that the calls of each taken answer list every side effect
     /// of its resolution (`debug_check_answer`).
@@ -144,8 +145,9 @@ impl ResolverConfig {
 
 /// Resolve ahead in one program load (`process_all_program_files`).
 pub struct ResolveAhead {
-    pool: Option<Pool>,
-    keep_keys: Box<dyn FnOnce(Arc<[ModuleResolutionCacheKey]>)>,
+    /// The workers' job of this load, until `finish`.
+    job: Option<Arc<Job>>,
+    keep_keys: Option<Box<dyn FnOnce(Arc<KeyList>)>>,
     previous_keys: usize,
 }
 
@@ -161,76 +163,103 @@ impl ResolveAhead {
             extra_extensions: resolver.extra_extensions.clone(),
             current_directory: resolver.host.get_current_directory().to_string(),
         });
-        let threads = worker_count();
         let previous_keys = host.previous_keys.as_ref().map_or(0, |keys| keys.len());
-        let pool = host
+        let keys = host
             .previous_keys
-            .filter(|keys| !keys.is_empty() && threads > 0)
-            .map(|keys| Pool::start(keys, host.view, config.clone(), threads));
+            .as_deref()
+            .map(KeyList::with_capacity_of)
+            .unwrap_or_default();
+        let job = host
+            .previous_keys
+            .filter(|keys| !keys.is_empty())
+            .and_then(|keys| {
+                Workers::get()?.post(Job {
+                    queue: Arc::new(AheadQueue::new(keys)),
+                    closed: AtomicBool::new(false),
+                    left: AtomicUsize::new(0),
+                    answers: Arc::new(SharedResolutionCache::default()),
+                    view: host.view,
+                    stats: StatCache::default(),
+                    config: config.clone(),
+                })
+            });
         let accept = match host.scratch.filter(|_| cfg!(debug_assertions)) {
             None => host.accept,
             Some(scratch) => {
                 let accept = host.accept;
                 Rc::new(
-                    move |key: &ModuleResolutionCacheKey,
-                          value: &ResolvedModule,
-                          calls: &[AheadCall]| {
+                    move |key: ModuleKeyParts<'_>, value: &ResolvedModule, calls: &[AheadCall]| {
                         let accepted = accept(key, value, calls);
                         if accepted {
                             debug_check_answer(&config, &scratch(), key, value, calls);
                         }
                         accepted
                     },
-                )
-                    as Rc<dyn Fn(&ModuleResolutionCacheKey, &ResolvedModule, &[AheadCall]) -> bool>
+                ) as AheadAccept
             }
         };
         *resolver.caches.ahead.borrow_mut() = Some(AheadLink {
-            answers: pool.as_ref().map(|pool| pool.shared.answers.clone()),
+            answers: job.as_ref().map(|job| job.answers.clone()),
             accept,
-            keys: RefCell::new(Vec::new()),
+            keys: RefCell::new(keys),
+            queue: job.as_ref().map(|job| job.queue.clone()),
+            cursor: Cell::new(0),
             stats: Cell::new(AheadStats::default()),
         });
         if mode() == Mode::Force
-            && let Some(pool) = &pool
+            && let Some((job, workers)) = job.as_ref().zip(Workers::get())
         {
-            pool.wait();
+            workers.wait_left(job);
         }
         ResolveAhead {
-            pool,
-            keep_keys: host.keep_keys,
+            job,
+            keep_keys: Some(host.keep_keys),
             previous_keys,
         }
     }
 
     /// Ends resolve ahead after the load of `resolver`: stops the workers,
     /// unlinks `resolver` from their answers and gives the keys of the
-    /// load to the host. The answers and the workers' caches are freed
-    /// later (`drop_later`).
-    pub fn finish(self, resolver: &DefaultResolver) {
-        let ResolveAhead {
-            pool,
-            keep_keys,
-            previous_keys,
-        } = self;
-        if let Some(pool) = &pool {
-            pool.stop();
-        }
-        let Some(link) = resolver.caches.ahead.borrow_mut().take() else {
+    /// load to the host. The workers free the answers and their caches.
+    pub fn finish(mut self, resolver: &DefaultResolver) {
+        let link = resolver.caches.ahead.borrow_mut().take();
+        let Some(mut link) = link else {
+            self.end_job(None);
             return;
         };
-        let keys: Arc<[ModuleResolutionCacheKey]> = link.keys.into_inner().into();
+        // The workers free the answers and the queue with the job.
+        self.end_job(Some(Box::new((link.answers.take(), link.queue.take()))));
+        let Some(keep_keys) = self.keep_keys.take() else {
+            return;
+        };
+        let keys = Arc::new(link.keys.into_inner());
         let stats = LoadStats {
-            keys: previous_keys,
+            keys: self.previous_keys,
             new_keys: keys.len(),
             loader: link.stats.get(),
         };
         LAST_STATS.with(|last| last.set(Some(stats)));
         print_stats(&stats);
         keep_keys(keys);
-        if let Some(pool) = pool {
-            crate::gostd::local::drop_later(Box::new(pool));
+    }
+
+    /// Stops the workers of this load and gives its job and `shared`, the
+    /// loader's links to it, to them to free.
+    fn end_job(&mut self, shared: Option<Box<dyn Send>>) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        if let Some(workers) = Workers::get() {
+            workers.end(&job);
+            workers.free(Box::new((job, shared)));
         }
+    }
+}
+
+impl Drop for ResolveAhead {
+    /// A load that ends with a panic stops its workers too.
+    fn drop(&mut self) {
+        self.end_job(None);
     }
 }
 
@@ -267,18 +296,166 @@ fn worker_count() -> usize {
         })
 }
 
-/// The workers of one load. Dropping it stops them.
-struct Pool {
-    shared: Arc<PoolShared>,
-    threads: RefCell<Vec<std::thread::JoinHandle<()>>>,
+/// The resolve-ahead workers of the process. They start at the first load
+/// that resolves ahead and stay: between loads they wait on `wake` and
+/// use no CPU. One load at a time has them (`post`). After a load they free
+/// its data (`free`), which they allocated, so the dispatch thread does not
+/// free it before its next request.
+struct Workers {
+    state: Mutex<WorkerState>,
+    /// Wakes the workers for a new job or for data to free.
+    wake: Condvar,
+    /// Wakes a loader that waits for the workers to leave its job
+    /// (`wait_left`).
+    left: Condvar,
+    /// The workers that started.
+    count: AtomicUsize,
 }
 
-/// What the workers of one load share.
-struct PoolShared {
-    keys: Arc<[ModuleResolutionCacheKey]>,
-    /// The index of the next key to resolve.
-    next: AtomicUsize,
+#[derive(Default)]
+struct WorkerState {
+    /// The job of the load that has the workers now.
+    job: Option<Arc<Job>>,
+    /// Counts the posted jobs, so that a worker runs each job once.
+    generation: u64,
+    /// The data of ended loads, for the workers to free.
+    garbage: Vec<Box<dyn Send>>,
+}
+
+/// What a worker does next.
+enum Task {
+    Run(Arc<Job>),
+    Free(Box<dyn Send>),
+}
+
+fn lock_state(workers: &Workers) -> std::sync::MutexGuard<'_, WorkerState> {
+    workers
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Workers {
+    /// The workers, started at the first call. `None` when none could
+    /// start or the count is 0.
+    fn get() -> Option<&'static Workers> {
+        static WORKERS: std::sync::OnceLock<Option<&'static Workers>> = std::sync::OnceLock::new();
+        *WORKERS.get_or_init(|| {
+            let count = worker_count();
+            if count == 0 {
+                return None;
+            }
+            let workers: &'static Workers = Box::leak(Box::new(Workers {
+                state: Mutex::default(),
+                wake: Condvar::new(),
+                left: Condvar::new(),
+                count: AtomicUsize::new(0),
+            }));
+            for _ in 0..count {
+                // A worker that cannot start only makes fewer answers.
+                let started = std::thread::Builder::new()
+                    .name("goport-resolve".to_string())
+                    .stack_size(crate::gostd::stack::max_stack_size())
+                    .spawn(move || run_worker(workers));
+                if started.is_ok() {
+                    workers.count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            (workers.count.load(Ordering::Relaxed) > 0).then_some(workers)
+        })
+    }
+
+    /// Gives `job` to the workers. `None` when another load has them now
+    /// (a load on another thread): this load then resolves every key
+    /// itself.
+    fn post(&self, job: Job) -> Option<Arc<Job>> {
+        let mut state = lock_state(self);
+        if state.job.is_some() {
+            return None;
+        }
+        let job = Arc::new(job);
+        state.job = Some(job.clone());
+        state.generation += 1;
+        drop(state);
+        self.wake.notify_all();
+        Some(job)
+    }
+
+    /// Stops `job`: each worker ends it after its current key.
+    fn end(&self, job: &Arc<Job>) {
+        job.closed.store(true, Ordering::Relaxed);
+        let mut state = lock_state(self);
+        if state
+            .job
+            .as_ref()
+            .is_some_and(|posted| Arc::ptr_eq(posted, job))
+        {
+            state.job = None;
+        }
+    }
+
+    /// Gives `garbage` to a worker to free.
+    fn free(&self, garbage: Box<dyn Send>) {
+        lock_state(self).garbage.push(garbage);
+        self.wake.notify_one();
+    }
+
+    /// Waits until every worker has left `job` (`Mode::Force`).
+    fn wait_left(&self, job: &Job) {
+        let count = self.count.load(Ordering::Relaxed);
+        let mut state = lock_state(self);
+        while job.left.load(Ordering::Acquire) < count {
+            state = self
+                .left
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// A worker: runs each posted job once and frees the data of ended loads.
+/// A new job goes before the data to free.
+fn run_worker(workers: &'static Workers) {
+    let mut ran = 0;
+    loop {
+        let task = {
+            let mut state = lock_state(workers);
+            loop {
+                if state.generation != ran
+                    && let Some(job) = &state.job
+                {
+                    ran = state.generation;
+                    break Task::Run(job.clone());
+                }
+                if let Some(garbage) = state.garbage.pop() {
+                    break Task::Free(garbage);
+                }
+                state = workers
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        };
+        match task {
+            Task::Free(garbage) => drop(garbage),
+            Task::Run(job) => {
+                run_job(&job);
+                job.left.fetch_add(1, Ordering::Release);
+                drop(job);
+                let _state = lock_state(workers);
+                workers.left.notify_all();
+            }
+        }
+    }
+}
+
+/// The workers' part of one load.
+struct Job {
+    /// The keys of the previous load, in its order.
+    queue: Arc<AheadQueue>,
     closed: AtomicBool,
+    /// The workers that left this job.
+    left: AtomicUsize,
     answers: Arc<SharedResolutionCache>,
     view: WorkerView,
     /// The OS lookups of the workers, as the host's per-snapshot cache
@@ -287,92 +464,45 @@ struct PoolShared {
     config: Arc<ResolverConfig>,
 }
 
-impl Pool {
-    fn start(
-        keys: Arc<[ModuleResolutionCacheKey]>,
-        view: WorkerView,
-        config: Arc<ResolverConfig>,
-        threads: usize,
-    ) -> Self {
-        let shared = Arc::new(PoolShared {
-            keys,
-            next: AtomicUsize::new(0),
-            closed: AtomicBool::new(false),
-            answers: Arc::new(SharedResolutionCache::default()),
-            view,
-            stats: StatCache::default(),
-            config,
-        });
-        let mut handles = Vec::with_capacity(threads);
-        for _ in 0..threads {
-            let shared = shared.clone();
-            // A worker that cannot start only makes fewer answers.
-            let spawned = std::thread::Builder::new()
-                .name("goport-resolve".to_string())
-                .stack_size(crate::gostd::stack::max_stack_size())
-                .spawn(move || run_worker(&shared));
-            handles.extend(spawned.ok());
-        }
-        Pool {
-            shared,
-            threads: RefCell::new(handles),
-        }
-    }
-
-    /// Waits until the workers resolved every key.
-    fn wait(&self) {
-        for thread in self.threads.borrow_mut().drain(..) {
-            let _ = thread.join();
-        }
-    }
-
-    /// Stops the workers after their current key and waits for them.
-    fn stop(&self) {
-        self.shared.closed.store(true, Ordering::Relaxed);
-        self.wait();
-    }
-}
-
-impl Drop for Pool {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// A worker: resolves the next key until none is left or the pool stops.
-/// A resolution that panics (a Go panic) panics on the loader too when it
-/// resolves the same key; the worker only stops.
-fn run_worker(shared: &Arc<PoolShared>) {
-    let view = &shared.view;
+/// A worker's part of `job`: resolves the next key until none is left or
+/// the job ends. A resolution that panics (a Go panic) panics on the loader
+/// too when it resolves the same key; the worker ends that key with no
+/// answer and leaves the job. The worker's resolver and its caches are
+/// freed here, on the worker.
+fn run_job(job: &Arc<Job>) {
+    let view = &job.view;
     begin_ahead_thread(&view.current_directory, view.use_case_sensitive_file_names);
     let fs: Rc<dyn Fs> = Rc::new(AheadFs {
         os: wrap_fs(osvfs_fs()),
-        shared: shared.clone(),
+        job: job.clone(),
     });
-    let mut resolver = shared.config.new_resolver(fs);
+    let mut resolver = job.config.new_resolver(fs);
     resolver.caches.shared = Some(SharedResolutionLink {
-        cache: shared.answers.clone(),
+        cache: job.answers.clone(),
         publish: true,
     });
+    let current = Cell::new(None);
     let _ = crate::core::go_recover(|| {
-        while !shared.closed.load(Ordering::Relaxed) {
-            let index = shared.next.fetch_add(1, Ordering::Relaxed);
-            let Some(key) = shared.keys.get(index) else {
+        while !job.closed.load(Ordering::Relaxed) {
+            let Some((index, (containing_directory, module_name, mode))) = job.queue.take_next()
+            else {
                 break;
             };
-            // A redirected key needs the project reference; the loader
-            // resolves it.
-            if !key.redirect_config_name.is_empty() {
-                continue;
-            }
+            current.set(Some(index));
             let _ = resolver.resolve_module_name_from_directory(
-                &key.module_name,
-                &key.containing_directory,
-                key.resolution_mode,
+                module_name,
+                containing_directory,
+                mode,
             );
+            job.queue.done(index);
+            current.set(None);
         }
     });
+    if let Some(index) = current.get() {
+        job.queue.done(index);
+    }
     end_ahead_thread();
+    drop(resolver);
 }
 
 /// Go `module.ResolutionHost` of a worker resolver.
@@ -397,12 +527,12 @@ impl ResolutionHost for AheadResolutionHost {
 /// the loader cannot check makes the answer unshareable.
 struct AheadFs {
     os: Rc<dyn Fs>,
-    shared: Arc<PoolShared>,
+    job: Arc<Job>,
 }
 
 impl AheadFs {
     fn path(&self, name: &str) -> Path {
-        let view = &self.shared.view;
+        let view = &self.job.view;
         to_path(
             name,
             &view.current_directory,
@@ -419,11 +549,11 @@ impl Fs for AheadFs {
     // Go: project/overlayfs.go:276 overlayFS.FileExists
     fn file_exists(&self, path: &str) -> bool {
         let canonical = self.path(path);
-        let view = &self.shared.view;
+        let view = &self.job.view;
         let exists = view.open_files.contains(&canonical)
             || !view.open_directories.contains(&canonical)
                 && self
-                    .shared
+                    .job
                     .stats
                     .file_exists(path, || self.os.file_exists(path));
         note_ahead_call(AheadCall::FileExists {
@@ -436,7 +566,7 @@ impl Fs for AheadFs {
     // Go: project/overlayfs.go:285 overlayFS.ReadFile
     fn read_file(&self, path: &str) -> (String, bool) {
         let canonical = self.path(path);
-        let view = &self.shared.view;
+        let view = &self.job.view;
         if view.open_files.contains(&canonical) {
             // The workers do not have the text of an open file.
             note_ahead_unshareable(Some(path));
@@ -479,11 +609,11 @@ impl Fs for AheadFs {
     // Go: project/overlayfs.go:302 overlayFS.DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {
         let canonical = self.path(path);
-        let view = &self.shared.view;
+        let view = &self.job.view;
         let exists = view.open_directories.contains(&canonical)
             || !view.open_files.contains(&canonical)
                 && self
-                    .shared
+                    .job
                     .stats
                     .directory_exists(path, || self.os.directory_exists(path));
         if !exists {
@@ -506,7 +636,7 @@ impl Fs for AheadFs {
 
     // Go: project/overlayfs.go:361 overlayFS.Realpath
     fn realpath(&self, path: &str) -> String {
-        self.shared.stats.realpath(path, || self.os.realpath(path))
+        self.job.stats.realpath(path, || self.os.realpath(path))
     }
 }
 
@@ -519,16 +649,14 @@ impl Fs for AheadFs {
 fn debug_check_answer(
     config: &ResolverConfig,
     scratch: &ScratchFs,
-    key: &ModuleResolutionCacheKey,
+    key: ModuleKeyParts<'_>,
     value: &ResolvedModule,
     calls: &[AheadCall],
 ) {
+    let (containing_directory, module_name, mode, _) = key;
     let resolver = config.new_resolver(scratch.fs.clone());
-    let (own, _, _) = resolver.resolve_module_name_from_directory(
-        &key.module_name,
-        &key.containing_directory,
-        key.resolution_mode,
-    );
+    let (own, _, _) =
+        resolver.resolve_module_name_from_directory(module_name, containing_directory, mode);
     assert_eq!(
         describe(&own),
         describe(value),

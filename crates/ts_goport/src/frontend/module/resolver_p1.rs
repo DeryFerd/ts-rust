@@ -536,42 +536,47 @@ impl DefaultResolver {
         resolution_mode: ResolutionMode,
         redirected_reference: Option<&dyn ModuleResolvedProjectReference>,
     ) -> (Arc<ResolvedModule>, Vec<DiagAndArgs>) {
-        let containing_directory = containing_directory.to_string();
         let trace_builder = self.new_trace_builder();
 
-        let cache_key = ModuleResolutionCacheKey {
-            containing_directory: containing_directory.clone(),
-            module_name: module_name.to_string(),
+        let redirect_config_name = get_redirect_config_name(redirected_reference);
+        // PORT: the cache lookups use the key's parts; the key itself is
+        // made only for a new entry (`ModuleKey`).
+        let key_parts = (
+            containing_directory,
+            module_name,
             resolution_mode,
-            redirect_config_name: get_redirect_config_name(redirected_reference),
-        };
+            redirect_config_name.as_str(),
+        );
 
         if trace_builder.is_none() {
-            if let Some(cached) = self.caches.module_resolution_cache.get(&cache_key) {
+            if let Some(cached) = self.caches.module_resolution_cache.get(&key_parts) {
                 return (cached, Vec::new());
             }
             // PERF: a parse worker may have resolved this key already (see
             // `resolve_type_reference_directive`).
             if let Some(shared) = &self.caches.shared
-                && let Some(found) = shared.cache.get_module(&cache_key)
+                && let Some(found) = shared.cache.get_module(&key_parts)
             {
                 self.caches.note_worker_package_jsons(&found.package_jsons);
                 self.caches.note_worker_lookups(&found.lookups);
-                self.caches
-                    .module_resolution_cache
-                    .set(cache_key, found.value.clone());
+                self.caches.module_resolution_cache.set(
+                    ModuleResolutionCacheKey::from_parts(key_parts),
+                    found.value.clone(),
+                );
                 return (found.value, Vec::new());
             }
             // PERF: a resolve-ahead worker may have resolved this key
             // (compiler/resolve_ahead.rs). The loader takes the answer only
             // after it checked it on its own file system.
-            if let Some(found) = self.caches.take_resolved_ahead(&cache_key) {
-                self.caches
-                    .module_resolution_cache
-                    .set(cache_key, found.clone());
+            if let Some(found) = self.caches.take_resolved_ahead(key_parts) {
+                self.caches.module_resolution_cache.set(
+                    ModuleResolutionCacheKey::from_parts(key_parts),
+                    found.clone(),
+                );
                 return (found, Vec::new());
             }
         }
+        let cache_key = ModuleResolutionCacheKey::from_parts(key_parts);
 
         self.caches.start_package_json_log();
         let compiler_options =
@@ -606,7 +611,7 @@ impl DefaultResolver {
         {
             let mut state = new_resolution_state(
                 module_name,
-                &containing_directory,
+                containing_directory,
                 false, /*isTypeReferenceDirective*/
                 resolution_mode,
                 &compiler_options,
@@ -644,7 +649,7 @@ impl DefaultResolver {
 
         let final_result = Arc::new(self.try_resolve_from_typings_location(
             module_name,
-            &containing_directory,
+            containing_directory,
             result,
             &trace_builder,
         ));

@@ -1397,8 +1397,11 @@ impl vfs::Fs for SourceFS {
     // Go: project/snapshotfs.go:724 sourceFS.FileExists
     // FileExists implements vfs.FS.
     fn file_exists(&self, path: &str) -> bool {
-        self.track(path);
-        self.source().file_exists(path, &(self.to_path)(path))
+        // PORT: Go makes the path twice (`Track` and the source call); the
+        // port makes it once, with the same `to_path`.
+        let file_path = (self.to_path)(path);
+        self.track_path(&file_path);
+        self.source().file_exists(path, &file_path)
     }
 
     // Go: project/snapshotfs.go:735 sourceFS.ReadFile

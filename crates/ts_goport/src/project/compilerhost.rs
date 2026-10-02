@@ -11,7 +11,7 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
-use crate::frontend::module::{AheadCall, ModuleResolutionCacheKey};
+use crate::frontend::module::{AheadCall, KeyList, ModuleKeyParts};
 use crate::frontend::parser;
 use std::cell::Cell;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ pub struct CompilerHost {
     /// or else of the project's host before it: the keys that the next load
     /// resolves ahead (`compiler::CompilerHost::resolve_ahead`).
     // PORT: not in Go (perf).
-    pub resolution_keys: Rc<RefCell<Option<Arc<[ModuleResolutionCacheKey]>>>>,
+    pub resolution_keys: Rc<RefCell<Option<Arc<KeyList>>>>,
 }
 
 // Go: project/compilerhost.go:29 newCompilerHost
@@ -383,9 +383,7 @@ impl compiler::CompilerHost for CompilerHost {
             let source_fs = self.source_fs.clone();
             let files = files.clone();
             Rc::new(
-                move |_key: &ModuleResolutionCacheKey,
-                      _value: &ResolvedModule,
-                      calls: &[AheadCall]| {
+                move |_key: ModuleKeyParts<'_>, _value: &ResolvedModule, calls: &[AheadCall]| {
                     accept_ahead_answer(&source_fs, &files, &reads, calls)
                 },
             )

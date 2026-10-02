@@ -8,12 +8,83 @@ use std::sync::Arc;
 pub type ModeAwareCache<T> = FxHashMap<ModeAwareCacheKey, T>;
 
 // Go: module/cache.go:11 moduleResolutionCacheKey
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModuleResolutionCacheKey {
     pub containing_directory: String,
     pub module_name: String,
     pub resolution_mode: ResolutionMode,
     pub redirect_config_name: String,
+}
+
+/// The fields of a `ModuleResolutionCacheKey`: containing directory,
+/// module name, resolution mode and redirect config name.
+pub type ModuleKeyParts<'a> = (&'a str, &'a str, ResolutionMode, &'a str);
+
+/// A module resolution cache key as its parts, so a lookup needs no new
+/// key (`ModuleResolutionCache::get`).
+// PORT: not in Go (perf). A Go key is a struct of string headers, which
+// costs no allocation; a Rust key owns its strings.
+pub trait ModuleKey {
+    fn parts(&self) -> ModuleKeyParts<'_>;
+}
+
+impl ModuleKey for ModuleResolutionCacheKey {
+    fn parts(&self) -> ModuleKeyParts<'_> {
+        (
+            &self.containing_directory,
+            &self.module_name,
+            self.resolution_mode,
+            &self.redirect_config_name,
+        )
+    }
+}
+
+impl ModuleKey for ModuleKeyParts<'_> {
+    fn parts(&self) -> ModuleKeyParts<'_> {
+        *self
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn ModuleKey + 'a> for ModuleResolutionCacheKey {
+    fn borrow(&self) -> &(dyn ModuleKey + 'a) {
+        self
+    }
+}
+
+// The same hash as a derived one (the fields in order), so the map order
+// does not change.
+impl std::hash::Hash for ModuleResolutionCacheKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
+    }
+}
+
+impl std::hash::Hash for dyn ModuleKey + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
+    }
+}
+
+impl PartialEq for dyn ModuleKey + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for dyn ModuleKey + '_ {}
+
+impl ModuleResolutionCacheKey {
+    /// The key of `parts`.
+    #[must_use]
+    pub fn from_parts(parts: ModuleKeyParts<'_>) -> Self {
+        let (containing_directory, module_name, resolution_mode, redirect_config_name) = parts;
+        ModuleResolutionCacheKey {
+            containing_directory: containing_directory.to_string(),
+            module_name: module_name.to_string(),
+            resolution_mode,
+            redirect_config_name: redirect_config_name.to_string(),
+        }
+    }
 }
 
 // Go: module/cache.go:18 moduleResolutionCache
@@ -29,7 +100,7 @@ pub struct ModuleResolutionCache {
 impl ModuleResolutionCache {
     // Go: module/cache.go:22 moduleResolutionCache.Get
     #[must_use]
-    pub fn get(&self, key: &ModuleResolutionCacheKey) -> Option<Arc<ResolvedModule>> {
+    pub fn get(&self, key: &dyn ModuleKey) -> Option<Arc<ResolvedModule>> {
         self.cache.borrow().get(key).cloned()
     }
 
@@ -170,11 +241,173 @@ pub struct AheadLink {
     /// Checks the calls of a worker answer for a key on the loader's file
     /// system and replays their side effects. False: a call gives another
     /// answer there, and the loader resolves the key itself.
-    pub accept: Rc<dyn Fn(&ModuleResolutionCacheKey, &ResolvedModule, &[AheadCall]) -> bool>,
+    pub accept: AheadAccept,
     /// The keys that the loader resolved or took in this load, in its
     /// order: the keys for the workers of the next load.
-    pub keys: RefCell<Vec<ModuleResolutionCacheKey>>,
+    pub keys: RefCell<KeyList>,
+    /// The workers' queue of the previous load's keys. `None` when no
+    /// worker runs.
+    pub queue: Option<Arc<AheadQueue>>,
+    /// The index in the queue after the last key of the loader that was
+    /// found there (`AheadQueue::find`).
+    pub cursor: Cell<usize>,
     pub stats: Cell<AheadStats>,
+}
+
+/// The keys of the previous load, which the resolve-ahead workers resolve
+/// in order, and who resolves each one: the loader takes a key that no
+/// worker has started, so no key is resolved twice, and it waits for a key
+/// that a worker resolves now.
+// PORT: not in Go (perf).
+pub struct AheadQueue {
+    pub keys: Arc<KeyList>,
+    /// The index of the next key for a worker.
+    pub next: std::sync::atomic::AtomicUsize,
+    /// Per key: `KEY_FREE`, `KEY_WORKER`, `KEY_DONE` or `KEY_LOADER`.
+    states: Box<[std::sync::atomic::AtomicU8]>,
+}
+
+const KEY_FREE: u8 = 0;
+/// A worker resolves the key now.
+const KEY_WORKER: u8 = 1;
+/// A worker ended the key: its answer is published, unless the
+/// resolution could not be shared or panicked.
+const KEY_DONE: u8 = 2;
+/// The loader resolves the key itself.
+const KEY_LOADER: u8 = 3;
+
+/// How many keys after the cursor `AheadQueue::find` looks at. The loader
+/// meets the keys of the previous load in its order, less removed keys
+/// and with new ones between them.
+const FIND_AHEAD: usize = 4;
+
+impl AheadQueue {
+    #[must_use]
+    pub fn new(keys: Arc<KeyList>) -> Self {
+        let states = (0..keys.len())
+            .map(|_| std::sync::atomic::AtomicU8::new(KEY_FREE))
+            .collect();
+        AheadQueue {
+            keys,
+            next: std::sync::atomic::AtomicUsize::new(0),
+            states,
+        }
+    }
+
+    /// A worker takes the next key that the loader did not take: its index
+    /// and parts. `None` when no key is left.
+    pub fn take_next(&self) -> Option<(usize, (&str, &str, ResolutionMode))> {
+        use std::sync::atomic::Ordering;
+        loop {
+            let index = self.next.fetch_add(1, Ordering::Relaxed);
+            let key = self.keys.get(index)?;
+            if self.states[index]
+                .compare_exchange(KEY_FREE, KEY_WORKER, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some((index, key));
+            }
+        }
+    }
+
+    /// A worker ended key `index` (after it published the answer).
+    pub fn done(&self, index: usize) {
+        self.states[index].store(KEY_DONE, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The index of the loader's key `key`, from `cursor` on, and moves
+    /// the cursor after it.
+    fn find(&self, cursor: &Cell<usize>, key: (&str, &str, ResolutionMode)) -> Option<usize> {
+        let start = cursor.get();
+        let index = (start..self.keys.len().min(start + FIND_AHEAD))
+            .find(|&index| self.keys.get(index) == Some(key))?;
+        cursor.set(index + 1);
+        Some(index)
+    }
+
+    /// For the loader's key `index` that has no answer: true when a worker
+    /// resolved it (it waits while a worker resolves it now), so the answer
+    /// may be published now. False: the loader resolves it itself, and no
+    /// worker starts it.
+    fn wait_or_take(&self, index: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let state = &self.states[index];
+        match state.compare_exchange(KEY_FREE, KEY_LOADER, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) | Err(KEY_LOADER) => false,
+            Err(_) => {
+                // A resolution takes some microseconds; the worker runs on
+                // another core.
+                let mut spins = 0u32;
+                while state.load(Ordering::Acquire) == KEY_WORKER {
+                    spins += 1;
+                    if spins % 256 == 0 {
+                        std::thread::yield_now();
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
+/// The check of a worker answer (`AheadLink::accept`): the key, the answer
+/// and the file system calls of its resolution.
+pub type AheadAccept = Rc<dyn Fn(ModuleKeyParts<'_>, &ResolvedModule, &[AheadCall]) -> bool>;
+
+/// The module resolution keys of one program load that have no redirect,
+/// in the load's order (`AheadLink::keys`). The keys share one text, so
+/// the loader records a key with no allocation of its own, and the list
+/// frees in two.
+// PORT: not in Go (perf).
+#[derive(Default)]
+pub struct KeyList {
+    text: String,
+    /// Per key: the end of its containing directory and of its module name
+    /// in `text`, and its resolution mode. A key starts where the one
+    /// before it ends.
+    ends: Vec<(usize, usize, ResolutionMode)>,
+}
+
+impl KeyList {
+    /// An empty list with room for the keys of `like`.
+    #[must_use]
+    pub fn with_capacity_of(like: &KeyList) -> Self {
+        KeyList {
+            text: String::with_capacity(like.text.len()),
+            ends: Vec::with_capacity(like.ends.len()),
+        }
+    }
+
+    pub fn push(&mut self, containing_directory: &str, module_name: &str, mode: ResolutionMode) {
+        self.text.push_str(containing_directory);
+        let directory_end = self.text.len();
+        self.text.push_str(module_name);
+        self.ends.push((directory_end, self.text.len(), mode));
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The containing directory, module name and mode of key `index`.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<(&str, &str, ResolutionMode)> {
+        let &(directory_end, end, mode) = self.ends.get(index)?;
+        let start = index.checked_sub(1).map_or(0, |before| self.ends[before].1);
+        Some((
+            &self.text[start..directory_end],
+            &self.text[directory_end..end],
+            mode,
+        ))
+    }
 }
 
 /// What the loader did with the keys of a resolve-ahead load that its own
@@ -187,6 +420,8 @@ pub struct AheadStats {
     pub rejected: usize,
     /// Keys with no worker answer (not resolved yet, new or not shareable).
     pub missing: usize,
+    /// Keys whose worker answer the loader waited for.
+    pub waited: usize,
 }
 
 impl Caches {
@@ -533,10 +768,7 @@ fn lock_shared<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl SharedResolutionCache {
     /// Go `moduleResolutionCache.Get`.
     #[must_use]
-    pub fn get_module(
-        &self,
-        key: &ModuleResolutionCacheKey,
-    ) -> Option<SharedResolution<Arc<ResolvedModule>>> {
+    pub fn get_module(&self, key: &dyn ModuleKey) -> Option<SharedResolution<Arc<ResolvedModule>>> {
         lock_shared(&self.modules).get(key).cloned()
     }
 
@@ -644,16 +876,31 @@ impl Caches {
     /// the next load (`AheadLink::keys`), and gives the worker answer for
     /// `key` when there is one and it passes the check
     /// (`AheadLink::accept`). `None`: the loader resolves the key itself.
-    pub fn take_resolved_ahead(
-        &self,
-        key: &ModuleResolutionCacheKey,
-    ) -> Option<Arc<ResolvedModule>> {
+    pub fn take_resolved_ahead(&self, key: ModuleKeyParts<'_>) -> Option<Arc<ResolvedModule>> {
         let ahead = self.ahead.borrow();
         let ahead = ahead.as_ref()?;
-        ahead.keys.borrow_mut().push(key.clone());
+        let (containing_directory, module_name, mode, redirect_config_name) = key;
+        // A key with a redirect needs its project reference; only the
+        // loader resolves it.
+        if redirect_config_name.is_empty() {
+            ahead
+                .keys
+                .borrow_mut()
+                .push(containing_directory, module_name, mode);
+        }
         let answers = ahead.answers.as_ref()?;
         let mut stats = ahead.stats.get();
-        let found = answers.get_module(key);
+        let mut found = answers.get_module(&key);
+        if redirect_config_name.is_empty()
+            && let Some(queue) = &ahead.queue
+            && let Some(index) =
+                queue.find(&ahead.cursor, (containing_directory, module_name, mode))
+            && found.is_none()
+            && queue.wait_or_take(index)
+        {
+            stats.waited += 1;
+            found = answers.get_module(&key);
+        }
         let accepted = match found
             .as_ref()
             .and_then(|found| Some((found, found.ahead.as_ref()?)))
