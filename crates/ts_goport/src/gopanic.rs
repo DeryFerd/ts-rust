@@ -184,6 +184,9 @@ pub fn go_work_group_task<R>(f: impl FnOnce() -> R) -> R {
 /// the place of the goroutine dump. `GoThread` calls it after Go's retry;
 /// use `GoThread` to start a thread for work that Go runs on goroutines,
 /// so the run fails as Go's does.
+/// PORT: unlike tsgo's `throw` and panic hook, it does not write the stdout
+/// bytes that a report keeps on a regular file (`stdio::CliStdout`), so a
+/// fatal start inside a report loses them.
 #[cold]
 #[inline(never)]
 #[track_caller]

@@ -648,7 +648,7 @@ fn serialize_implied_option_value(
 mod tests {
     use super::*;
 
-    // Expected bytes are tsgo `--showConfig` output (execute/tsc.go:375,
+    // Expected bytes are tsgo `--showConfig` output (execute/tsc.go:405,
     // prefix "", indent four spaces) for a solution config with two references.
     #[test]
     fn marshal_matches_tsgo_show_config() {
