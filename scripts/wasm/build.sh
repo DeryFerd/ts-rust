@@ -3,14 +3,24 @@
 # wasm32-wasip1 with the `wasm` size profile, then binaryen's wasm-opt.
 #
 # usage: scripts/wasm/build.sh [out.wasm]   (default npm/wasm/ts_rust.wasm)
-# env:   WASM_PROFILE   cargo profile (default wasm; release for a fast build)
-#        WASM_OPT       wasm-opt flags (default -Oz); "none" skips wasm-opt
+# env:   WASM_PROFILE    cargo profile (default wasm; release for a fast build)
+#        WASM_RUSTFLAGS  added to RUSTFLAGS (default
+#                        "-C llvm-args=-inlinehint-threshold=150"); "" for none
+#        WASM_OPT        wasm-opt flags (default "-Oz --converge"); "none"
+#                        skips wasm-opt
 # needs: rustup target add wasm32-wasip1; wasm-opt (binaryen 132 or later)
 set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 out="${1:-$repo/npm/wasm/ts_rust.wasm}"
 profile="${WASM_PROFILE:-wasm}"
-opt="${WASM_OPT:--Oz}"
+opt="${WASM_OPT:--Oz --converge}"
+
+# At opt-level "s", LLVM inlines `#[inline]` functions up to cost 325.
+# 150 made the module 1.4 MB (9%) smaller, and checks about 6% slower.
+rustflags="${WASM_RUSTFLAGS--C llvm-args=-inlinehint-threshold=150}"
+if [[ -n "$rustflags" ]]; then
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$rustflags"
+fi
 
 cargo_cmd=(cargo)
 # The capped runner needs systemd (Linux hosts such as zbook).
