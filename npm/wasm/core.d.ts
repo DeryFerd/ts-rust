@@ -34,6 +34,9 @@ export interface Diagnostic {
     relatedInformation?: Diagnostic[];
 }
 
+/** undefined or true: it worked. false or an error text: it failed. */
+export type WriteResult = boolean | string | void;
+
 /** A file system for `runTsc`. Paths are absolute, with `/` separators. */
 export interface HostFileSystem {
     readFile(path: string): Uint8Array | string | undefined;
@@ -41,11 +44,15 @@ export interface HostFileSystem {
     stat(path: string): { isDirectory: boolean; size?: number; mtimeMs?: number } | undefined;
     readDirectory(path: string): { name: string; kind: "file" | "directory" | "symlink" | "other" }[] | undefined;
     realpath?(path: string): string | undefined;
-    /** Returns false on failure. Makes missing parent directories. */
-    writeFile?(path: string, data: Uint8Array, append: boolean): boolean | void;
-    /** Removes a file or a directory tree. Returns false on failure. */
-    remove?(path: string): boolean | void;
-    chtimes?(path: string, atimeMs: number | undefined, mtimeMs: number | undefined): void;
+    /**
+     * Makes missing parent directories. On failure, returns false or Go's
+     * text of the error (for example `open /a.js: permission denied`),
+     * which tsc reports.
+     */
+    writeFile?(path: string, data: Uint8Array, append: boolean): WriteResult;
+    /** Removes a file or a directory tree. Failure as in `writeFile`. */
+    remove?(path: string): WriteResult;
+    chtimes?(path: string, atimeMs: number | undefined, mtimeMs: number | undefined): WriteResult;
 }
 
 export interface MemoryFileSystem extends HostFileSystem {
@@ -85,3 +92,13 @@ export function runTsc(
     module: WebAssembly.Module,
     options: RunOptions,
 ): { exitCode: number; diagnostics?: Diagnostic[] };
+
+/**
+ * `runTsc` as a promise. A page's main thread may call it too. Where the
+ * engine has JSPI (`WebAssembly.promising`), the run gets its own stack,
+ * which is deeper in a browser worker.
+ */
+export function runTscAsync(
+    module: WebAssembly.Module,
+    options: RunOptions,
+): Promise<{ exitCode: number; diagnostics?: Diagnostic[] }>;

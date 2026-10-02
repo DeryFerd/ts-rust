@@ -1,7 +1,7 @@
 import type { Diagnostic } from "./core.js";
 
 export type { Diagnostic, HostFileSystem, MemoryFileSystem, Position, RunOptions } from "./core.js";
-export { memoryFileSystem, runTsc } from "./core.js";
+export { memoryFileSystem, runTsc, runTscAsync } from "./core.js";
 
 export interface TscOptions {
     /**
@@ -9,7 +9,7 @@ export interface TscOptions {
      * it out to use the real file system.
      */
     files?: Map<string, string> | Record<string, string>;
-    /** The current directory. Default: `/`, or `process.cwd()` in Node without `files`. */
+    /** The current directory. Default: `/`, or in Node without `files`, `$PWD` when it names the current directory (as tsgo does), else `process.cwd()`. */
     cwd?: string;
     /** `"json"`: return the diagnostics as objects instead of printing them. */
     diagnostics?: "text" | "json";

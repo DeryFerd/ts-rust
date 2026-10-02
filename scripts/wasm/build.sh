@@ -4,27 +4,32 @@
 #
 # usage: scripts/wasm/build.sh [out.wasm]   (default npm/wasm/ts_rust.wasm)
 # env:   WASM_PROFILE    cargo profile (default wasm; release for a fast build)
-#        WASM_RUSTFLAGS  added to RUSTFLAGS (default
-#                        "-C llvm-args=-inlinehint-threshold=150"); "" for none
+#        WASM_RUSTFLAGS  added to RUSTFLAGS (default none)
 #        WASM_OPT        wasm-opt flags (default "-Oz --converge"); "none"
 #                        skips wasm-opt
 # needs: rustup target add wasm32-wasip1; wasm-opt (binaryen 132 or later)
+#
+# The default is the smallest module (opt-level z, 5.7 MB). For checks about
+# 18% faster at 6.9 MB:
+#   CARGO_PROFILE_WASM_OPT_LEVEL=s \
+#   WASM_RUSTFLAGS="-C llvm-args=-inlinehint-threshold=150" scripts/wasm/build.sh
 set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 out="${1:-$repo/npm/wasm/ts_rust.wasm}"
 profile="${WASM_PROFILE:-wasm}"
 opt="${WASM_OPT:--Oz --converge}"
 
-# At opt-level "s", LLVM inlines `#[inline]` functions up to cost 325.
-# 150 made the module 1.4 MB (9%) smaller, and checks about 6% slower.
-rustflags="${WASM_RUSTFLAGS--C llvm-args=-inlinehint-threshold=150}"
+# At opt-level "s", LLVM inlines `#[inline]` functions up to cost 325; the
+# faster build above lowers that to 150.
+rustflags="${WASM_RUSTFLAGS:-}"
 if [[ -n "$rustflags" ]]; then
   export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$rustflags"
 fi
 
 cargo_cmd=(cargo)
-# The capped runner needs systemd (Linux hosts such as zbook).
-if command -v systemd-run >/dev/null; then
+# The capped runner needs a systemd user session (Linux hosts such as
+# zbook). CI runners have systemd-run but no user session.
+if [[ -z "${CI:-}" ]] && command -v systemd-run >/dev/null; then
   cargo_cmd=("$repo/scripts/run-cargo-capped.sh")
 fi
 "${cargo_cmd[@]}" build --profile "$profile" -p ts_wasm --target wasm32-wasip1

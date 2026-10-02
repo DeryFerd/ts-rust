@@ -6,7 +6,7 @@
 import { statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { Worker } from "node:worker_threads";
-export { memoryFileSystem, runTsc } from "./core.js";
+export { memoryFileSystem, runTsc, runTscAsync } from "./core.js";
 
 const wasmUrl = new URL("./ts_rust.wasm", import.meta.url);
 
@@ -41,17 +41,24 @@ export async function tsc(args, options = {}) {
         : options.files instanceof Map
         ? options.files
         : new Map(Object.entries(options.files));
+    const request = {
+        module,
+        args,
+        cwd: toPosix(options.cwd ?? getwd()),
+        files,
+        env: options.env ?? {},
+        diagnosticsJson: options.diagnostics === "json",
+        tty: options.tty ?? false,
+        stream: options.stream ?? false,
+    };
+    // Bun ignores `stackSizeMb`, and its workers have less stack than its
+    // main thread, so the run stays on this thread there.
+    if (process.versions.bun) {
+        const { runRequest } = await import("./node-run.js");
+        return settle(runRequest(request));
+    }
     const worker = new Worker(new URL("./node-worker.js", import.meta.url), {
-        workerData: {
-            module,
-            args,
-            cwd: toPosix(options.cwd ?? getwd()),
-            files,
-            env: options.env ?? {},
-            diagnosticsJson: options.diagnostics === "json",
-            tty: options.tty ?? false,
-            stream: options.stream ?? false,
-        },
+        workerData: request,
         resourceLimits: { stackSizeMb: options.stackSizeMb ?? STACK_SIZE_MB },
         stdout: !options.stream,
         stderr: !options.stream,
@@ -61,11 +68,20 @@ export async function tsc(args, options = {}) {
         worker.on("message", message => (result = message));
         worker.on("error", reject);
         worker.on("exit", () => {
-            if (!result) reject(new Error("ts-rust worker ended without a result"));
-            else if (result.error) reject(Object.assign(new Error(result.error), { stderr: result.stderr }));
-            else resolve(result);
+            try {
+                if (!result) throw new Error("ts-rust worker ended without a result");
+                resolve(settle(result));
+            } catch (error) {
+                reject(error);
+            }
         });
     });
+}
+
+/** The result of `runRequest`, or its crash as a thrown error. */
+function settle(result) {
+    if (result.error) throw Object.assign(new Error(result.error), { stderr: result.stderr });
+    return result;
 }
 
 /**

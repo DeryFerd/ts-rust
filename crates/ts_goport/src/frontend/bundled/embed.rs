@@ -10,6 +10,7 @@
 //! 3.79 MB; see `parts/goport_util/build.rs`) and unpacks each lib on its
 //! first read. The names and texts do not change.
 
+#[cfg(not(target_family = "wasm"))]
 use super::{SNAPSHOT_TEXT_MIN, const_hash};
 use crate::frontend::prelude::*;
 use std::sync::OnceLock;
@@ -63,18 +64,13 @@ pub fn embedded_text_hash(text: &str) -> Option<u64> {
         .map(|&(_, _, hash)| hash)
 }
 
-/// wasm: `embedded_text_hash` of a lib that `embedded_contents` unpacked.
-/// The hash is computed here: the text was not in the module to hash at
-/// compile time.
+/// wasm: always `None`. The wasm build reads no snapshot
+/// (`bundled_lib_name`), so no key needs the hash.
 // PORT: not in Go.
 #[cfg(target_family = "wasm")]
 #[must_use]
-pub fn embedded_text_hash(text: &str) -> Option<u64> {
-    EMBEDDED_CONTENTS
-        .iter()
-        .filter_map(|&(_, _, lib)| lib.get())
-        .find(|lib| lib.len() >= SNAPSHOT_TEXT_MIN && std::ptr::eq(lib.as_str(), text))
-        .map(|lib| const_hash(lib.as_bytes()))
+pub fn embedded_text_hash(_text: &str) -> Option<u64> {
+    None
 }
 
 /// The base name of bundled lib path `path` (`bundled:///libs/lib.dom.d.ts`
@@ -82,11 +78,8 @@ pub fn embedded_text_hash(text: &str) -> Option<u64> {
 /// snapshots find a lib file by this name.
 ///
 /// wasm: always `None`, so no lib loads a snapshot and the link drops the
-/// snapshot blobs (3 MB) and their decoders. The blobs store lib names by
-/// their stable ids (`Name::stable_id`), but on wasm32 the lib name table
-/// does not find most names: `intern::hash_str` is the 32-bit Fx hash
-/// there, and the table holds 64-bit hashes. A loaded snapshot would give
-/// its names other ids than the live names of the program.
+/// snapshot blobs (3 MB) and their decoders. On wasm a snapshot load took
+/// as long as the live parse and bind of the lib.
 // PORT: not in Go.
 #[must_use]
 pub fn bundled_lib_name(path: &str) -> Option<&str> {

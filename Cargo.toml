@@ -34,12 +34,12 @@ codegen-units = 1
 # Size profile for the wasm build (crates/ts_wasm, scripts/wasm/build.sh):
 # `cargo build --profile wasm --target wasm32-wasip1`. wasm cannot unwind,
 # so panics abort. Panic messages stay.
-# opt-level "s", not "z": "z" ignores `#[inline]` hints. Its module was 8%
-# smaller, but it checked a mid-sized project 20% slower. build.sh lowers
-# the inline limit of "s" for `#[inline]` functions.
+# opt-level "z" is the smallest: 5.7 MB, where "s" with a lower inline
+# limit is 6.9 MB and checks about 18% faster (scripts/wasm/build.sh tells
+# how to build that one).
 [profile.wasm]
 inherits = "release"
-opt-level = "s"
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"

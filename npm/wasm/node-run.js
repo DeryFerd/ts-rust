@@ -1,9 +1,28 @@
-// The worker thread of one Node run (node.js `tsc`).
+// One Node run (node.js `tsc`), on the thread that calls `runRequest`:
+// node-worker.js, or the calling thread under Bun.
 
 import * as fs from "node:fs";
 import { dirname } from "node:path";
-import { parentPort, workerData } from "node:worker_threads";
 import { memoryFileSystem, runTsc } from "./core.js";
+
+/** Go's syscall error texts, by Node error code. */
+const ERRNO_TEXT = {
+    EACCES: "permission denied",
+    EEXIST: "file exists",
+    EISDIR: "is a directory",
+    ELOOP: "too many levels of symbolic links",
+    ENAMETOOLONG: "file name too long",
+    ENOENT: "no such file or directory",
+    ENOSPC: "no space left on device",
+    ENOTDIR: "not a directory",
+    EPERM: "operation not permitted",
+    EROFS: "read-only file system",
+};
+
+/** Go's `*fs.PathError` text: `open /a.js: permission denied`. */
+function goError(op, path, error) {
+    return `${op} ${path}: ${ERRNO_TEXT[error.code] ?? error.message}`;
+}
 
 /** The real file system through node:fs, for `runTsc`. */
 export function nodeFileSystem() {
@@ -39,12 +58,24 @@ export function nodeFileSystem() {
                 return undefined;
             }
         },
+        // As Go's osvfs writeFile: write, and when that fails, make the
+        // directory and write again.
         writeFile(path, data, append) {
+            const write = () => (append ? fs.appendFileSync : fs.writeFileSync)(path, data);
+            try {
+                return write();
+            } catch {
+                // Make the directory below.
+            }
             try {
                 fs.mkdirSync(dirname(path), { recursive: true });
-                (append ? fs.appendFileSync : fs.writeFileSync)(path, data);
-            } catch {
-                return false;
+            } catch (error) {
+                return goError("mkdir", error.path ?? dirname(path), error);
+            }
+            try {
+                return write();
+            } catch (error) {
+                return goError("open", path, error);
             }
         },
         remove(path) {
@@ -96,29 +127,35 @@ function streamTo(fd) {
     };
 }
 
-const { module, args, cwd, files, env, diagnosticsJson, tty, stream } = workerData;
-const memory = files ? memoryFileSystem(files) : undefined;
-const stdout = [];
-const stderr = [];
-try {
-    const { exitCode, diagnostics } = runTsc(module, {
-        args,
-        cwd,
-        fs: memory ?? nodeFileSystem(),
-        env,
-        diagnosticsJson,
-        caseInsensitive: memory ? false : caseInsensitive(),
-        tty,
-        stdout: stream ? streamTo(1) : chunk => stdout.push(chunk),
-        stderr: stream ? streamTo(2) : chunk => stderr.push(chunk),
-    });
-    parentPort.postMessage({
-        exitCode,
-        diagnostics,
-        stdout: Buffer.concat(stdout).toString(),
-        stderr: Buffer.concat(stderr).toString(),
-        files: memory?.files,
-    });
-} catch (error) {
-    parentPort.postMessage({ error: String(error?.message ?? error), stderr: error?.stderr ?? Buffer.concat(stderr).toString() });
+/**
+ * Runs one request of node.js `tsc` and returns its result: `{ exitCode,
+ * diagnostics, stdout, stderr, files }`, or `{ error, stderr }` when the run
+ * crashed.
+ */
+export function runRequest({ module, args, cwd, files, env, diagnosticsJson, tty, stream }) {
+    const memory = files ? memoryFileSystem(files) : undefined;
+    const stdout = [];
+    const stderr = [];
+    try {
+        const { exitCode, diagnostics } = runTsc(module, {
+            args,
+            cwd,
+            fs: memory ?? nodeFileSystem(),
+            env,
+            diagnosticsJson,
+            caseInsensitive: memory ? false : caseInsensitive(),
+            tty,
+            stdout: stream ? streamTo(1) : chunk => stdout.push(chunk),
+            stderr: stream ? streamTo(2) : chunk => stderr.push(chunk),
+        });
+        return {
+            exitCode,
+            diagnostics,
+            stdout: Buffer.concat(stdout).toString(),
+            stderr: Buffer.concat(stderr).toString(),
+            files: memory?.files,
+        };
+    } catch (error) {
+        return { error: String(error?.message ?? error), stderr: error?.stderr ?? Buffer.concat(stderr).toString() };
+    }
 }

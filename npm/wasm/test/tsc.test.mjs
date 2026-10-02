@@ -4,12 +4,12 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { tsc } from "../node.js";
+import { loadModule, memoryFileSystem, runTscAsync, tsc } from "../node.js";
 
 const cli = fileURLToPath(new URL("../bin/tsc-wasm.js", import.meta.url));
 
@@ -143,8 +143,40 @@ test("writes all output to a slow non-blocking pipe", async () => {
     }
 });
 
+test("reports a failed write with the OS error, as tsgo does", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ts-rust-wasm-"));
+    try {
+        writeFileSync(join(dir, "tsconfig.json"), JSON.stringify({ compilerOptions: { outDir: "out" }, files: ["a.ts"] }));
+        writeFileSync(join(dir, "a.ts"), "export {};\n");
+        mkdirSync(join(dir, "out"));
+        writeFileSync(join(dir, "out", "a.js"), "");
+        chmodSync(join(dir, "out", "a.js"), 0o444);
+        const result = await tsc(["-p", "."], { cwd: dir });
+        assert.equal(result.exitCode, 2);
+        assert.equal(
+            result.stdout,
+            `error TS5033: Could not write file '${dir}/out/a.js': open ${dir}/out/a.js: permission denied.\n`,
+        );
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("runs through runTscAsync", async () => {
+    const fs = memoryFileSystem({ "/q/a.ts": "export const s: string = 1;\n" });
+    const { exitCode, diagnostics } = await runTscAsync(await loadModule(), {
+        args: ["--noEmit", "/q/a.ts"],
+        fs,
+        diagnosticsJson: true,
+    });
+    assert.equal(exitCode, 2);
+    assert.deepEqual(diagnostics.map(d => d.code), [2322]);
+});
+
 test("refuses watch mode", async () => {
-    const result = await tsc(["--watch"], { files: project, cwd: "/p" });
-    assert.equal(result.exitCode, 1);
-    assert.match(result.stderr, /--watch is not supported/);
+    for (const flag of ["--watch", "-w", "-watch", "--WATCH"]) {
+        const result = await tsc([flag], { files: project, cwd: "/p" });
+        assert.equal(result.exitCode, 1, flag);
+        assert.match(result.stderr, /--watch is not supported/, flag);
+    }
 });

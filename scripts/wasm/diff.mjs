@@ -428,7 +428,10 @@ export const message = \`\${greet(user)} \${version}\`;
  * `steps` are the tsc argument lists, run in order in the same dir.
  * `buildInfo` adds --tsBuildInfoFile (composite configs). `link` runs in
  * the copy through a symlink. `noSt` leaves out the native-st side.
- * `stack` marks the cases of the worker stack sweep.
+ * `stack` marks the cases of the worker stack sweep. `nativeSteps` are the
+ * native sides' steps when the wasm output must equal another native run:
+ * the wasm build has no message catalogs, so its `--locale` output is the
+ * English one.
  */
 function cases(inputs) {
     const js = ["--emitDeclarationOnly", "false", "--sourceMap", "--declarationMap"];
@@ -461,7 +464,12 @@ function cases(inputs) {
         { name: "hono-js", ...hono, steps: [[...build, ...js]] },
         { name: "hono-showconfig", ...hono, steps: [[...build, "--showConfig"]] },
         { name: "hono-pretty", ...hono, steps: [[...build, "--noEmit", "--pretty"]] },
-        { name: "hono-locale", ...hono, steps: [[...build, "--noEmit", "--locale", "ja"]] },
+        {
+            name: "hono-locale",
+            ...hono,
+            steps: [[...build, "--noEmit", "--locale", "ja"]],
+            nativeSteps: [[...build, "--noEmit"]],
+        },
         // The second run reads the build info of the first.
         { name: "hono-incremental", ...hono, steps: [build, build] },
         // The fixtures as they are, then a check without emit: an emit
@@ -631,7 +639,8 @@ function runOnce(c, side, ctx, keep) {
     const steps = [];
     let ms = 0;
     let rss = 0;
-    for (const [i, step] of c.steps.entries()) {
+    const caseSteps = side === "wasm" ? c.steps : (c.nativeSteps ?? c.steps);
+    for (const [i, step] of caseSteps.entries()) {
         const args = stepArgs(c, step, out);
         const run = timed(command(side, ctx.native, args), cwd, runEnv(c, cwd), path.join(caseDir, "time.txt"));
         ms += run.ms;

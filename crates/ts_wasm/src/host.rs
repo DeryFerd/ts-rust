@@ -2,9 +2,11 @@
 //!
 //! Each file operation is one call of the import `ts_host.fs(op, ptr, len)`.
 //! The request is the UTF-8 bytes at `ptr..ptr + len`. The host keeps the
-//! result and returns its length, or -1 when the operation fails (for
-//! example a missing file). `ts_host.fs_take(ptr)` then copies the result to
-//! `ptr`. `npm/wasm/host.js` is the host side.
+//! result and returns its length. `ts_host.fs_take(ptr)` then copies the
+//! result to `ptr`. When the operation fails (for example a missing file),
+//! the host returns -1, or `-2 - n` when it keeps an error text of `n` bytes
+//! for `fs_take`: Go's text of the error, such as `open /a.js: permission
+//! denied`. `npm/wasm/core.js` is the host side.
 //!
 //! | op | request | result |
 //! | --- | --- | --- |
@@ -37,32 +39,44 @@ pub enum Op {
     Chtimes = 7,
 }
 
-/// Runs `op` on `request` in the host. `None` when the host reports a
-/// failure.
+/// Runs `op` on `request` in the host.
+///
+/// # Errors
+///
+/// When the host reports a failure. The error holds the host's error text,
+/// which is empty when the host gave none.
 #[cfg(target_family = "wasm")]
 #[allow(unsafe_code)]
-#[must_use]
-pub fn call(op: Op, request: &[u8]) -> Option<Vec<u8>> {
+pub fn call(op: Op, request: &[u8]) -> Result<Vec<u8>, String> {
     #[link(wasm_import_module = "ts_host")]
     unsafe extern "C" {
         fn fs(op: u32, ptr: *const u8, len: usize) -> i32;
         fn fs_take(ptr: *mut u8);
     }
     // SAFETY: the host only reads the `request.len()` bytes at the pointer.
-    let len = unsafe { fs(op as u32, request.as_ptr(), request.len()) };
-    let len = usize::try_from(len).ok()?;
-    let mut result = vec![0u8; len];
-    // SAFETY: the host writes exactly `len` bytes, the length it returned.
-    unsafe { fs_take(result.as_mut_ptr()) };
-    Some(result)
+    let status = unsafe { fs(op as u32, request.as_ptr(), request.len()) };
+    let take = |len: i32| {
+        let mut bytes = vec![0u8; usize::try_from(len).unwrap_or(0)];
+        // SAFETY: the host writes exactly `len` bytes, the length it gave.
+        unsafe { fs_take(bytes.as_mut_ptr()) };
+        bytes
+    };
+    match status {
+        -1 => Err(String::new()),
+        ..-1 => Err(String::from_utf8_lossy(&take(-2 - status)).into_owned()),
+        _ => Ok(take(status)),
+    }
 }
 
 /// Native builds (the crate's tests) have no JavaScript host: `test_host`
 /// answers in its place.
+///
+/// # Errors
+///
+/// When the test host has no such file or directory, with no error text.
 #[cfg(not(target_family = "wasm"))]
-#[must_use]
-pub fn call(op: Op, request: &[u8]) -> Option<Vec<u8>> {
-    test_host::call(op, request)
+pub fn call(op: Op, request: &[u8]) -> Result<Vec<u8>, String> {
+    test_host::call(op, request).ok_or_else(String::new)
 }
 
 /// Whether the host file system tells apart names that differ only in case.
@@ -107,8 +121,14 @@ fn bytes(text: &str) -> Vec<u8> {
     go_string_bytes(text).into_owned()
 }
 
-fn host_error(op: &'static str, path: &str) -> FsError {
-    FsError::path(op, path, std::io::Error::other("host file system error"))
+/// The error of a failed host write: the host's Go error text, or a
+/// general one when it gave none.
+fn host_error(op: &'static str, path: &str, text: String) -> FsError {
+    if text.is_empty() {
+        FsError::path(op, path, std::io::Error::other("host file system error"))
+    } else {
+        FsError::Other(text)
+    }
 }
 
 fn time_from_ms(ms: &str) -> Option<SystemTime> {
@@ -159,12 +179,13 @@ impl IoFs for HostRoot {
     fn stat(&self, name: &str) -> Result<FileInfo, FsError> {
         let base = name.rsplit('/').next().unwrap_or(name);
         call(Op::Stat, &bytes(&self.path(name)))
+            .ok()
             .and_then(|result| parse_stat(base, &result))
             .ok_or(FsError::NotExist)
     }
 
     fn read_dir(&self, name: &str) -> Result<Vec<DirEntry>, FsError> {
-        let result = call(Op::ReadDir, &bytes(&self.path(name))).ok_or(FsError::NotExist)?;
+        let result = call(Op::ReadDir, &bytes(&self.path(name))).map_err(|_| FsError::NotExist)?;
         let text = String::from_utf8_lossy(&result);
         let mut entries: Vec<DirEntry> = text
             .split('\0')
@@ -194,7 +215,7 @@ impl IoFs for HostRoot {
     }
 
     fn read_file(&self, name: &str) -> Result<Vec<u8>, FsError> {
-        call(Op::Read, &bytes(&self.path(name))).ok_or(FsError::NotExist)
+        call(Op::Read, &bytes(&self.path(name))).map_err(|_| FsError::NotExist)
     }
 }
 
@@ -228,19 +249,19 @@ impl Fs for HostFs {
     fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         call(Op::Write, &path_and_data(path, data))
             .map(drop)
-            .ok_or_else(|| host_error("open", path))
+            .map_err(|text| host_error("open", path, text))
     }
 
     fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         call(Op::Append, &path_and_data(path, data))
             .map(drop)
-            .ok_or_else(|| host_error("open", path))
+            .map_err(|text| host_error("open", path, text))
     }
 
     fn remove(&self, path: &str) -> Result<(), FsError> {
         call(Op::Remove, &bytes(path))
             .map(drop)
-            .ok_or_else(|| host_error("remove", path))
+            .map_err(|text| host_error("remove", path, text))
     }
 
     fn chtimes(
@@ -257,7 +278,7 @@ impl Fs for HostFs {
         );
         call(Op::Chtimes, request.as_bytes())
             .map(drop)
-            .ok_or_else(|| host_error("chtimes", path))
+            .map_err(|text| host_error("chtimes", path, text))
     }
 
     fn directory_exists(&self, path: &str) -> bool {
@@ -273,7 +294,7 @@ impl Fs for HostFs {
     }
 
     fn realpath(&self, path: &str) -> String {
-        call(Op::Realpath, &bytes(path)).map_or_else(
+        call(Op::Realpath, &bytes(path)).ok().map_or_else(
             || path.to_string(),
             ts_goport::scanner_util::go_string_from_bytes,
         )

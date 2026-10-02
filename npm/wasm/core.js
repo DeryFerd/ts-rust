@@ -36,8 +36,20 @@ const OP_CHTIMES = 7;
 const KIND_CHAR = { file: "f", directory: "d", symlink: "l", other: "o" };
 
 /**
- * Runs one host file operation of crates/ts_wasm/src/host.rs on `fs` and
- * returns the result bytes, or undefined when it fails.
+ * The result of a host write method: undefined or true when it worked,
+ * false when it failed, or a string with Go's text of its error (for
+ * example `open /a.js: permission denied`), which tsc then reports.
+ */
+function writeResult(result) {
+    if (result === false) return undefined;
+    if (typeof result === "string") return { error: result };
+    return new Uint8Array();
+}
+
+/**
+ * Runs one host file operation of crates/ts_wasm/src/host.rs on `fs`. It
+ * returns the result bytes, undefined when the operation fails, or
+ * `{ error }` when it fails with an error text.
  */
 function fsCall(fs, op, request) {
     const text = decoder.decode(request);
@@ -67,37 +79,22 @@ function fsCall(fs, op, request) {
             const path = decoder.decode(request.subarray(0, nul));
             const data = request.subarray(nul + 1);
             if (!fs.writeFile) return undefined;
-            return fs.writeFile(path, data, op === OP_APPEND) === false ? undefined : new Uint8Array();
+            return writeResult(fs.writeFile(path, data, op === OP_APPEND));
         }
         case OP_REMOVE:
             if (!fs.remove) return undefined;
-            return fs.remove(text) === false ? undefined : new Uint8Array();
+            return writeResult(fs.remove(text));
         case OP_CHTIMES: {
             const [path, atime, mtime] = text.split("\0");
-            if (fs.chtimes) fs.chtimes(path, atime ? Number(atime) : undefined, mtime ? Number(mtime) : undefined);
-            return new Uint8Array();
+            if (!fs.chtimes) return new Uint8Array();
+            return writeResult(fs.chtimes(path, atime ? Number(atime) : undefined, mtime ? Number(mtime) : undefined));
         }
     }
     return undefined;
 }
 
-/**
- * Runs `tsc` once in a new instance of `module` (a compiled ts-rust wasm
- * module).
- *
- * - `args`: the tsc arguments.
- * - `cwd`: the current directory, an absolute path with `/` separators.
- * - `fs`: the host file system (see `memoryFileSystem` and node.js).
- * - `env`: environment variables, for example `{ NO_COLOR: "1" }`.
- * - `stdout`, `stderr`: called with each chunk of output bytes.
- * - `diagnosticsJson`: return the diagnostics as objects, not as text.
- * - `caseInsensitive`: the file system ignores case.
- * - `tty`: stdout is a terminal (tsc then defaults to `--pretty`).
- *
- * Returns `{ exitCode, diagnostics }`. A crash (a trap or an out of memory
- * error) throws, with the stderr text so far in `error.stderr`.
- */
-export function runTsc(module, options) {
+/** The state and imports of one run (`runTsc`, `runTscAsync`). */
+function prepareRun(module, options) {
     const {
         args = [],
         cwd = "/",
@@ -138,7 +135,10 @@ export function runTsc(module, options) {
         environ_sizes_get: (countPtr, sizePtr) => sizes(envBytes, countPtr, sizePtr),
         environ_get: (ptrs, buf) => writeStrings(envBytes, ptrs, buf),
         clock_time_get: (id, _precision, out) => {
-            const ns = id === 0 ? BigInt(Date.now()) * 1000000n : BigInt(Math.round(performance.now() * 1e6));
+            // Wall time with sub-millisecond steps (not Date.now): tsc leaves
+            // out a statistics row whose time is zero.
+            const ms = id === 0 ? performance.timeOrigin + performance.now() : performance.now();
+            const ns = BigInt(Math.round(ms * 1e6));
             dv().setBigUint64(out, ns, true);
             return SUCCESS;
         },
@@ -193,41 +193,101 @@ export function runTsc(module, options) {
         if (name === "wasi_snapshot_preview1") imports[name][field] = wasi[field] ?? (() => ENOSYS);
     }
     imports.ts_host.fs = (op, ptr, len) => {
-        staged = fsCall(fs, op, u8().slice(ptr, ptr + len));
-        return staged === undefined ? -1 : staged.length;
+        const result = fsCall(fs, op, u8().slice(ptr, ptr + len));
+        if (result === undefined) return -1;
+        if (result.error !== undefined) {
+            staged = encoder.encode(result.error);
+            return -2 - staged.length;
+        }
+        staged = result;
+        return staged.length;
     };
     imports.ts_host.fs_take = ptr => {
         u8().set(staged, ptr);
         staged = undefined;
     };
 
-    const instance = new WebAssembly.Instance(module, imports);
-    const exports = instance.exports;
-    memory = exports.memory;
+    let exports;
+    return {
+        imports,
+        /** Writes the request into `instance` and returns its `ts_run`. */
+        start(instance) {
+            exports = instance.exports;
+            memory = exports.memory;
+            let flags = 0;
+            if (diagnosticsJson) flags |= FLAG_DIAGNOSTICS_JSON;
+            if (caseInsensitive) flags |= FLAG_CASE_INSENSITIVE;
+            const request = encoder.encode([cwd, String(flags), ...args].join("\0"));
+            u8().set(request, exports.ts_input(request.length));
+            return exports.ts_run;
+        },
+        /** The result of a `ts_run` call that returned `exitCode` or threw `error`. */
+        result(exitCode, error) {
+            if (error !== undefined) {
+                if (!(error instanceof WasiExit)) {
+                    error.stderr = stderrText;
+                    throw error;
+                }
+                exitCode = error.code;
+            }
+            let diagnostics;
+            if (diagnosticsJson) {
+                const ptr = exports.ts_output();
+                const len = exports.ts_output_len();
+                diagnostics = len ? JSON.parse(decoder.decode(u8().subarray(ptr, ptr + len))) : [];
+            }
+            return { exitCode, diagnostics };
+        },
+    };
+}
 
-    let flags = 0;
-    if (diagnosticsJson) flags |= FLAG_DIAGNOSTICS_JSON;
-    if (caseInsensitive) flags |= FLAG_CASE_INSENSITIVE;
-    const request = encoder.encode([cwd, String(flags), ...args].join("\0"));
-    u8().set(request, exports.ts_input(request.length));
-
+/**
+ * Runs `tsc` once in a new instance of `module` (a compiled ts-rust wasm
+ * module).
+ *
+ * - `args`: the tsc arguments.
+ * - `cwd`: the current directory, an absolute path with `/` separators.
+ * - `fs`: the host file system (see `memoryFileSystem` and node.js).
+ * - `env`: environment variables, for example `{ NO_COLOR: "1" }`.
+ * - `stdout`, `stderr`: called with each chunk of output bytes.
+ * - `diagnosticsJson`: return the diagnostics as objects, not as text.
+ * - `caseInsensitive`: the file system ignores case.
+ * - `tty`: stdout is a terminal (tsc then defaults to `--pretty`).
+ *
+ * Returns `{ exitCode, diagnostics }`. A crash (a trap or an out of memory
+ * error) throws, with the stderr text so far in `error.stderr`.
+ */
+export function runTsc(module, options) {
+    const run = prepareRun(module, options);
+    const tsRun = run.start(new WebAssembly.Instance(module, run.imports));
     let exitCode;
+    let error;
     try {
-        exitCode = exports.ts_run();
-    } catch (error) {
-        if (!(error instanceof WasiExit)) {
-            error.stderr = stderrText;
-            throw error;
-        }
-        exitCode = error.code;
+        exitCode = tsRun();
+    } catch (thrown) {
+        error = thrown;
     }
-    let diagnostics;
-    if (diagnosticsJson && exitCode !== undefined) {
-        const ptr = exports.ts_output();
-        const len = exports.ts_output_len();
-        diagnostics = len ? JSON.parse(decoder.decode(u8().subarray(ptr, ptr + len))) : [];
+    return run.result(exitCode, error);
+}
+
+/**
+ * `runTsc` as a promise, for browsers. It makes the instance with
+ * `WebAssembly.instantiate`, which a page's main thread may also do. Where
+ * JSPI is available (`WebAssembly.promising`), the run gets its own stack:
+ * in a Chrome worker that stack is about 3 times deeper.
+ */
+export async function runTscAsync(module, options) {
+    const run = prepareRun(module, options);
+    const tsRun = run.start(await WebAssembly.instantiate(module, run.imports));
+    const call = typeof WebAssembly.promising === "function" ? WebAssembly.promising(tsRun) : tsRun;
+    let exitCode;
+    let error;
+    try {
+        exitCode = await call();
+    } catch (thrown) {
+        error = thrown;
     }
-    return { exitCode, diagnostics };
+    return run.result(exitCode, error);
 }
 
 /**

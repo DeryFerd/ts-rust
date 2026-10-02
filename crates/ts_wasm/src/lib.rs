@@ -61,11 +61,21 @@ impl TscCompilationHooks for WasmTsc {
     }
 }
 
-/// True when `args` asks for watch mode, which needs threads and file
-/// events that wasm does not have.
-fn wants_watch(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg.to_ascii_lowercase().as_str(), "-w" | "--watch"))
+/// The first option of `args` that the wasm build cannot run: watch mode
+/// needs threads and file events, and `--pprofDir` profiles the process
+/// and writes with `std::fs`. tsc takes an option with one or two dashes,
+/// in any case.
+fn unsupported_option(args: &[String]) -> Option<&'static str> {
+    args.iter().find_map(|arg| {
+        if !arg.starts_with('-') {
+            return None;
+        }
+        match arg.trim_start_matches('-').to_ascii_lowercase().as_str() {
+            "w" | "watch" => Some("--watch"),
+            "pprofdir" => Some("--pprofDir"),
+            _ => None,
+        }
+    })
 }
 
 /// Runs one request (see the crate comment) and returns the exit status and
@@ -81,8 +91,8 @@ pub fn run(request: &str) -> (i32, String) {
     let args: Vec<String> = fields
         .map(|arg| go_string_from_utf8(arg.to_string()))
         .collect();
-    if wants_watch(&args) {
-        eprintln!("error: --watch is not supported by the wasm build");
+    if let Some(option) = unsupported_option(&args) {
+        eprintln!("error: {option} is not supported by the wasm build");
         return (1, String::new());
     }
 
@@ -190,5 +200,38 @@ mod exports {
             eprintln!("tsgo: panic{location}: {message}");
             std::process::exit(EXIT_UNPORTED);
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One run over the test host: the reply has the diagnostics as JSON,
+    /// and the emit writes to the host. A process runs one request, so this
+    /// is the crate's only test of `run`.
+    #[test]
+    fn run_checks_and_emits_through_the_host() {
+        host::test_host::set_files([
+            (
+                "/p/tsconfig.json".to_string(),
+                r#"{"compilerOptions":{"outDir":"out","types":[]},"files":["a.ts"]}"#.to_string(),
+            ),
+            (
+                "/p/a.ts".to_string(),
+                "export const n: number = 'one';\n".to_string(),
+            ),
+        ]);
+        let (status, reply) = run(&format!("/p\0{FLAG_DIAGNOSTICS_JSON}\0-p\0."));
+        assert_eq!(status, 2);
+        assert!(
+            reply.starts_with(r#"[{"fileName":"/p/a.ts","pos":13,"end":14,"#),
+            "{reply}"
+        );
+        assert!(reply.contains(r#""code":2322"#), "{reply}");
+        assert_eq!(
+            host::test_host::file("/p/out/a.js").as_deref(),
+            Some("export const n = 'one';\n")
+        );
     }
 }

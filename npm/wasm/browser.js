@@ -1,12 +1,12 @@
 // Browser, Deno and worker entry. Runs are in memory: the files are given
 // as a map from absolute path to text. In a browser, call `tsc` from a Web
-// Worker: Chrome does not let a page's main thread make an instance of a
-// module over 8 MB synchronously, and a run would block the page.
-// loadModule works on any thread.
+// Worker, so that a run does not block the page. Runs use JSPI where the
+// engine has it (`runTscAsync`), which gives the deeply recursive checker
+// more stack.
 
-import { memoryFileSystem, runTsc } from "./core.js";
+import { memoryFileSystem, runTsc, runTscAsync } from "./core.js";
 
-export { memoryFileSystem, runTsc };
+export { memoryFileSystem, runTsc, runTscAsync };
 
 let modulePromise;
 
@@ -48,24 +48,16 @@ export async function tsc(args, options = {}) {
     const fs = memoryFileSystem(options.files ?? {});
     const stdout = [];
     const stderr = [];
-    try {
-        const { exitCode, diagnostics } = runTsc(module, {
-            args,
-            cwd: options.cwd ?? "/",
-            fs,
-            env: options.env ?? {},
-            diagnosticsJson: options.diagnostics === "json",
-            stdout: chunk => stdout.push(chunk),
-            stderr: chunk => stderr.push(chunk),
-        });
-        return { exitCode, stdout: decode(stdout), stderr: decode(stderr), diagnostics, files: fs.files };
-    } catch (error) {
-        // Chrome: "WebAssembly.Instance is disallowed on the main thread".
-        if (error instanceof RangeError && typeof document !== "undefined" && /main thread/.test(error.message)) {
-            throw new Error("ts-rust: call tsc from a Web Worker, not from the page's main thread", { cause: error });
-        }
-        throw error;
-    }
+    const { exitCode, diagnostics } = await runTscAsync(module, {
+        args,
+        cwd: options.cwd ?? "/",
+        fs,
+        env: options.env ?? {},
+        diagnosticsJson: options.diagnostics === "json",
+        stdout: chunk => stdout.push(chunk),
+        stderr: chunk => stderr.push(chunk),
+    });
+    return { exitCode, stdout: decode(stdout), stderr: decode(stderr), diagnostics, files: fs.files };
 }
 
 function decode(chunks) {
