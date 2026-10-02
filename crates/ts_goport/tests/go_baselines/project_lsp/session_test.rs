@@ -1848,3 +1848,52 @@ child_test! {
         session.close();
     }
 }
+
+child_test! {
+    // PORT: no Go counterpart (editfuzz2 P1). The parser allows any
+    // expression as a module specifier or an import attribute value. Go's
+    // `Node.Text` panics for a kind with no text (ast.go:308): in
+    // coalesceExportsWorker (organizeimports.go:851) and in
+    // getImportAttributesKey (:380). The server answers that panic as Go's
+    // InternalError, so the port panics with Go's text.
+    fn organize_imports_panics_like_go_on_an_expression_with_no_text() {
+        const B_URI: &str = "file:///home/projects/app/b.ts";
+        let cases = [
+            ("export * as a.b from './a';\n", "PropertyAccessExpression"),
+            ("export * from this;\n", "KeywordExpression"),
+            (
+                "import { A } from './a' with { type: f() };\nexport const c = A;\n",
+                "CallExpression",
+            ),
+        ];
+        for (text, data) in cases {
+            let session = bare_session(files(&[
+                ("/home/projects/app/a.ts", "export class A {}\n"),
+                ("/home/projects/app/b.ts", text),
+            ]));
+            open(&session, B_URI, text);
+            let ls = language_service(&session, B_URI);
+            let params = lsproto::CodeActionParams {
+                text_document: lsproto::TextDocumentIdentifier { uri: uri(B_URI) },
+                context: Some(lsproto::CodeActionContext {
+                    only: Some(vec![lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ls.provide_code_actions(&bg(), &params)
+            }))
+            .expect_err("organize imports must panic as Go does");
+            let message = payload
+                .downcast_ref::<ts_goport::core::GoPanic>()
+                .map(|panic| panic.message.clone());
+            assert_eq!(
+                message.as_deref(),
+                Some(format!("Unhandled case in Node.Text: *ast.{data}").as_str()),
+                "{text:?}"
+            );
+            session.close();
+        }
+    }
+}
