@@ -15,6 +15,11 @@
 //! In a PID namespace that has the /proc of another one, /proc/<pid> is
 //! another process: the launcher and the worker do not read it there
 //! (`own_proc`).
+//!
+//! The ends by a signal: as the pid 1 of a PID namespace, where the kernel
+//! drops a signal with the default action, tsgo exits 128 + N where Go
+//! does (`end_by_signal`, `die_from_signal`); and a launcher whose caller
+//! ignores SIGCHLD still gets its worker's exit (`drop_go_signals`).
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Seek};
@@ -24,6 +29,8 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+use rustix::process::Signal;
 
 /// What a tsgo run gives.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -167,14 +174,158 @@ fn a_tsgo_with_the_proc_of_another_pid_namespace() {
     assert_eq!(output.stdout, b"", "worker check: output");
 }
 
+/// tsgo as the pid 1 of a PID namespace (`unshare -pf --mount-proc`, as
+/// `docker run` without `--init`): the kernel drops each signal with the
+/// default action that such a process gets or sends itself. As in Go N,
+/// SIGHUP ends the run with exit 129 (Go `dieFromSignal`: 128 + N): sent
+/// to tsgo with and without a worker, and sent to the worker, which the
+/// signal ends. A launcher that raised the worker's signal again in a pid 1
+/// went on to `abort`, which ends a pid 1 by SIGSEGV. And a launcher whose
+/// caller ignores SIGCHLD takes the exit code from the worker's exit in a
+/// PID namespace with the /proc of another one (`own_proc`), as Go gives
+/// it. Where `unshare -U` or `env --ignore-signal` cannot run, the test
+/// says so and passes.
+#[test]
+fn a_tsgo_that_is_pid_1_of_a_pid_namespace() {
+    const UNSHARE: [&str; 4] = ["-Upf", "--map-root-user", "--kill-child", "--mount-proc"];
+    let probe = Command::new("unshare")
+        .args(UNSHARE)
+        .arg("true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `unshare -Upf --map-root-user --mount-proc` cannot run here");
+        return;
+    }
+    let tsgo = env!("CARGO_BIN_EXE_tsgo");
+    let unshare = || {
+        let mut unshare = Command::new("unshare");
+        unshare.args(UNSHARE).arg(tsgo);
+        unshare
+    };
+    // unshare's child is tsgo, pid 1; the worker is its child.
+    for (launch, depth, case) in [
+        ("1", 1, "pid 1, SIGHUP to the launcher"),
+        ("1", 2, "pid 1, SIGHUP to the worker"),
+        ("0", 1, "pid 1, SIGHUP to tsgo without a worker"),
+    ] {
+        let (status, stderr, ended) = signal_run(unshare(), launch, &[(depth, Signal::HUP)], case);
+        // unshare exits with its child's exit code.
+        assert_eq!(status.code(), Some(129), "{case}: {status} {stderr}");
+        assert_eq!(stderr, "", "{case}: stderr");
+        assert!(
+            ended < Duration::from_secs(1),
+            "{case}: ended {ended:?} after the signal"
+        );
+    }
+    let ignored = Command::new("env")
+        .args(["--ignore-signal=CHLD", "true"])
+        .status();
+    if !ignored.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `env --ignore-signal=CHLD` cannot run here");
+        return;
+    }
+    // Without --mount-proc: the /proc of the test's namespace. The worker
+    // sends no code there.
+    let output = Command::new("unshare")
+        .args(&UNSHARE[..3])
+        .args(["env", "--ignore-signal=CHLD", tsgo, "--version"])
+        .env("GOPORT_LAUNCH", "1")
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "SIGCHLD ignored: {output:?}");
+    assert!(
+        output.stdout.starts_with(b"Version "),
+        "SIGCHLD ignored: {output:?}"
+    );
+}
+
+/// A launcher whose caller ignores SIGCHLD (`env --ignore-signal=CHLD`):
+/// without its own handler for SIGCHLD the kernel reaps the worker at its
+/// end and the launcher's wait fails, so a worker that a signal ends gave
+/// exit 70. Go gets the end of each child it starts, and so does the
+/// launcher: it ends by the worker's signal, as without a worker. Where
+/// `env --ignore-signal` cannot run, the test says so and passes.
+#[test]
+fn a_tsgo_whose_caller_ignores_sigchld() {
+    let probe = Command::new("env")
+        .args(["--ignore-signal=CHLD", "true"])
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `env --ignore-signal=CHLD` cannot run here");
+        return;
+    }
+    let mut command = Command::new("env");
+    command.args(["--ignore-signal=CHLD", env!("CARGO_BIN_EXE_tsgo")]);
+    // env runs tsgo in its own process, the launcher; the worker is its
+    // child.
+    let case = "SIGCHLD ignored, SIGKILL to the worker";
+    let (status, stderr, _) = signal_run(command, "1", &[(1, Signal::KILL)], case);
+    assert_eq!(status.signal(), Some(9), "{case}: {status} {stderr}");
+}
+
+/// A tsgo whose caller ignores SIGHUP (`nohup`, here `env
+/// --ignore-signal=HUP`): Go keeps an ignored SIGHUP at start, so the run
+/// goes on after it, with and without a worker and also when the worker
+/// gets it; SIGQUIT then ends it with Go's text and exit 2. Where `env
+/// --ignore-signal` cannot run, the test says so and passes.
+#[test]
+fn a_tsgo_whose_caller_ignores_sighup() {
+    let probe = Command::new("env")
+        .args(["--ignore-signal=HUP", "true"])
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `env --ignore-signal=HUP` cannot run here");
+        return;
+    }
+    // env runs tsgo in its own process; the worker is its child.
+    let runs: [(&str, &[(usize, Signal)]); 2] = [
+        (
+            "1",
+            &[(0, Signal::HUP), (1, Signal::HUP), (0, Signal::QUIT)],
+        ),
+        ("0", &[(0, Signal::HUP), (0, Signal::QUIT)]),
+    ];
+    for (launch, signals) in runs {
+        let case = format!("SIGHUP ignored, GOPORT_LAUNCH={launch}");
+        let mut command = Command::new("env");
+        command.args(["--ignore-signal=HUP", env!("CARGO_BIN_EXE_tsgo")]);
+        let (status, stderr, _) = signal_run(command, launch, signals, &case);
+        assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+        assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+    }
+}
+
 /// Starts `command` with `--all` and `GOPORT_LAUNCH=1`, sends SIGQUIT to
 /// its launcher once the worker has written some output, and checks that
 /// the run ends soon after with Go's text and exit 2. The launcher is the
-/// started process or its descendant `depth` levels down. The output is
-/// more than the stdout pipe holds and the test does not read it, so the
-/// worker cannot end before the signal comes, and its handlers are set
-/// before it writes.
-fn quit_launcher(mut command: Command, depth: usize, case: &str) {
+/// started process or its descendant `depth` levels down.
+fn quit_launcher(command: Command, depth: usize, case: &str) {
+    let (status, stderr, ended) = signal_run(command, "1", &[(depth, Signal::QUIT)], case);
+    assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+    assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+    assert!(
+        ended < Duration::from_secs(1),
+        "{case}: ended {ended:?} after SIGQUIT"
+    );
+}
+
+/// Starts `command` with `--all` and `GOPORT_LAUNCH=launch`, sends each
+/// signal of `signals` to the started process's descendant `depth` levels
+/// down once tsgo has written some output, 300 ms apart, and returns how
+/// the run ended, its stderr and the time from the last signal to the end.
+/// The output is more than the stdout pipe holds and the test does not
+/// read it, so tsgo cannot end before the first signal comes, and its
+/// handlers are set before it writes. A run that ends before the last
+/// signal, or has not ended 60 s after it, fails the test.
+fn signal_run(
+    mut command: Command,
+    launch: &str,
+    signals: &[(usize, Signal)],
+    case: &str,
+) -> (ExitStatus, String, Duration) {
     const LIMIT: Duration = Duration::from_secs(60);
     let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
     let size = rustix::pipe::fcntl_setpipe_size(&write, 4096).unwrap();
@@ -182,7 +333,7 @@ fn quit_launcher(mut command: Command, depth: usize, case: &str) {
     assert!(size <= 8192, "{case}: the pipe holds {size} bytes");
     let mut child = command
         .arg("--all")
-        .env("GOPORT_LAUNCH", "1")
+        .env("GOPORT_LAUNCH", launch)
         .stdout(Stdio::from(write))
         .stderr(Stdio::piped())
         .spawn()
@@ -198,12 +349,21 @@ fn quit_launcher(mut command: Command, depth: usize, case: &str) {
         assert!(start.elapsed() < LIMIT, "{case}: no output in {LIMIT:?}");
         std::thread::sleep(Duration::from_millis(5));
     }
-    let mut launcher = child.id();
-    for _ in 0..depth {
-        launcher = child_of(launcher).unwrap_or_else(|| panic!("{case}: no launcher"));
+    for (i, &(depth, signal)) in signals.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{case}: ended before {signal:?}"
+        );
+        let mut target = child.id();
+        for _ in 0..depth {
+            target = child_of(target).unwrap_or_else(|| panic!("{case}: no process to signal"));
+        }
+        let pid = rustix::process::Pid::from_raw(target.cast_signed()).unwrap();
+        rustix::process::kill_process(pid, signal).unwrap();
     }
-    let pid = rustix::process::Pid::from_raw(launcher.cast_signed()).unwrap();
-    rustix::process::kill_process(pid, rustix::process::Signal::QUIT).unwrap();
     let sent = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -212,7 +372,7 @@ fn quit_launcher(mut command: Command, depth: usize, case: &str) {
         if sent.elapsed() > LIMIT {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("{case}: the run did not end in {LIMIT:?} after SIGQUIT");
+            panic!("{case}: the run did not end in {LIMIT:?} after the signal");
         }
         std::thread::sleep(Duration::from_millis(5));
     };
@@ -224,12 +384,7 @@ fn quit_launcher(mut command: Command, depth: usize, case: &str) {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-    assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
-    assert!(
-        ended < Duration::from_secs(1),
-        "{case}: ended {ended:?} after SIGQUIT"
-    );
+    (status, stderr, ended)
 }
 
 /// The pid of a child of `pid`, from /proc.
