@@ -622,11 +622,11 @@ fn drop_go_signals() {
 /// ends the process (`throw`), SIGHUP ends it by SIGHUP, unless it was
 /// ignored at start (`die_from_signal`, `hup_ignored`; as a pid 1 it exits
 /// 129, where the default action would do nothing), the soft open-file
-/// limit goes up to one
-/// below the hard limit (`gostd::rlimit::raise_open_file_limit`), and fd 1
-/// is checked for `O_NONBLOCK`, as Go `os.NewFile` does at start
-/// (`stdio::init`). The thread for the thrown signals waits on a pipe until
-/// one comes. Go throws in the signal handler, with no thread. The port's
+/// limit goes up to one below the hard limit
+/// (`gostd::rlimit::raise_open_file_limit`), and fd 1 is checked for
+/// `O_NONBLOCK`, as Go `os.NewFile` does at start (`stdio::init`). The
+/// thread for the thrown signals and SIGHUP waits on a pipe until one
+/// comes. Go throws in the signal handler, with no thread. The port's
 /// thread starts as a Go runtime thread does (`GoThread`): when the OS
 /// refuses it, the run ends with Go's text and exit 2. Going on without it
 /// would drop the thrown signals and SIGHUP (dropping `signals` removes
