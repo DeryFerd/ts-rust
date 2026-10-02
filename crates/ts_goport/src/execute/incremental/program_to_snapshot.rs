@@ -257,29 +257,48 @@ impl ToProgramSnapshot<'_> {
         }
     }
 
-    // Go: incremental/programtosnapshot.go:152 handleFileDelete
+    // Go: incremental/programtosnapshot.go:162 handleFileDelete
+    // PORT: Go ranges over the old `fileInfos` `SyncMap` (random order) and
+    // stops at the first gone file. If that file affects global scope, all
+    // files change. Else Go only sets `buildInfoEmitPending`, and unchanged
+    // files keep their old semantic diagnostics. So Go's answer is random
+    // when a gone file affects global scope and another does not (a
+    // `target` or `lib` change removes libs that hold only
+    // `/// <reference lib>` lines). `file_infos` keeps insertion order, so
+    // stopping at the first gone file would always take the stale branch for
+    // such libs (missing errors). The port walks all gone files: if any one
+    // affects global scope it takes the global branch once (Go's answer when
+    // it meets that file first, and TypeScript JS `forEachEntry` without
+    // `outFile`). Else, if any file is gone, it sets
+    // `build_info_emit_pending`.
     fn handle_file_delete(&mut self) {
-        if let Some(old_program) = self.old_program {
-            let old_snapshot = old_program.snapshot.borrow();
-            // If the global file is removed, add all files as changed
-            for (file_path, old_info) in &old_snapshot.file_infos {
-                if !self.snapshot.file_infos.contains_key(file_path) {
-                    if old_info.affects_global_scope {
-                        let files = self
-                            .snapshot
-                            .get_all_files_excluding_default_library_file(Node::NIL)
-                            .to_vec();
-                        for file in files {
-                            self.snapshot
-                                .add_file_to_change_set(Path(source_file_info(file).path.clone()));
-                        }
-                        self.global_file_removed = true;
-                    } else {
-                        self.snapshot.build_info_emit_pending = true;
-                    }
+        let Some(old_program) = self.old_program else {
+            return;
+        };
+        let mut file_removed = false;
+        let mut global_file_removed = false;
+        for (file_path, old_info) in &old_program.snapshot.borrow().file_infos {
+            if !self.snapshot.file_infos.contains_key(file_path) {
+                file_removed = true;
+                if old_info.affects_global_scope {
+                    global_file_removed = true;
                     break;
                 }
             }
+        }
+        if global_file_removed {
+            // If the global file is removed, add all files as changed
+            let files = self
+                .snapshot
+                .get_all_files_excluding_default_library_file(Node::NIL)
+                .to_vec();
+            for file in files {
+                self.snapshot
+                    .add_file_to_change_set(Path(source_file_info(file).path.clone()));
+            }
+            self.global_file_removed = true;
+        } else if file_removed {
+            self.snapshot.build_info_emit_pending = true;
         }
     }
 
