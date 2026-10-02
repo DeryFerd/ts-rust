@@ -511,7 +511,7 @@ noEmit, a program with no emittable file (no inputs, or only `.d.ts`
 files) exits 2. `goport_build` returns the Go build status, which can also
 be 3 or 4. Unported code, any other panic and a worker-thread failure
 exit `execute::tsc::EXIT_UNPORTED` (70, `EX_SOFTWARE`). Go uses 0 to 5 (3
-in cmd/tsgo/sys.go:66, 4 in build mode, 5 NotImplemented), so a harness
+in cmd/tsc/sys.go:128, 4 in build mode, 5 NotImplemented), so a harness
 must treat a goport exit of 70 as a crash, never as a tsgo status.
 
 A site where the pinned Go panics on the same input uses
@@ -565,7 +565,42 @@ process (bin/tsgo.rs `go_runtime_start`).
   and the thrown signals on to its worker. The worker gets no environment
   variable and no file descriptor from the launcher, so its children get
   none: its `arg0` names the launcher, and at exit it opens the launcher's
-  end of the pipe through /proc.
+  end of the pipe through /proc (first with `O_PATH`, so the type, device
+  and inode check opens no file of another process).
+  - A forwarded signal waits until the worker catches it (its `SigCgt` in
+    /proc), so a signal that comes before the worker's handlers does what
+    it does in Go after the start: a plain compile goes on after SIGINT
+    and SIGTERM, and SIGQUIT prints its name and exits 2. The wait ends
+    2 s after the worker starts (`HOLD_LIMIT`); a later signal goes on at
+    once.
+  - The worker ends with its launcher: a parent-death SIGKILL, and a
+    worker whose launcher died before that (its parent is not the named
+    launcher, and the named launcher is gone or a zombie) kills itself. A
+    killed Go tsgo stops at once. A process whose `arg0` names a live
+    launcher that is not its parent runs as a plain tsgo.
+  - The launcher and the worker read /proc/<pid> only when /proc is the
+    one of their PID namespace (`own_proc`, the `NSpid` line of
+    /proc/self/status). With the /proc of another namespace (`bwrap
+    --unshare-pid` without `--proc`, `unshare -pf` without `--mount-proc`)
+    /proc/<pid> is another process or none. There a signal goes on at once
+    (no wait), the ended-launcher check uses `kill` with no signal (a gone
+    launcher ends the worker, a zombie one gives a plain tsgo), and the
+    launcher takes the code from the worker's exit, which waits for the
+    worker's memory to unmap.
+  - When the worker cannot start, the launcher runs the work itself.
+    SIGINT, SIGTERM, SIGQUIT and SIGSYS get their default actions back
+    until the run sets its own handlers, as in a run that never was a
+    launcher. PORT: SIGSTKFLT does nothing there (signal-hook has no
+    default action for it).
+- Stdout (execute/tsc/stdio.rs): each write of the tsc output is one write
+  of fd 1, in Go's pieces (Go `fmt.Fprint` on the unbuffered
+  `os.Stdout`). PORT: when fd 1 is a regular file, the writes of one report
+  (the diagnostics of an emit with the file list, the statistics table,
+  the `--showConfig` value) are kept and go out together, at most 64 KiB
+  at a time: the same bytes in fewer writes. A process that ends inside a
+  report by SIGKILL, SIGHUP, an OOM kill or `core::go_fatal_newosproc`
+  loses the kept bytes (up to 64 KiB of that report); Go's file has the
+  pieces written so far. A thrown signal and a panic write them first.
 - Open files (Go syscall/rlimit.go): the soft RLIMIT_NOFILE goes up to one
   below the hard limit. The content mapper and npm starts
   (execute/tsc/compile.rs, cmd/tsgo/lsp.rs) go through
@@ -781,10 +816,10 @@ process (bin/tsgo.rs `go_runtime_start`).
 
 These rules add to the rules above for the language-service port: Go
 `internal/{ls,lsp,project,format,astnav,api,fswatch,jsonrpc}`,
-`cmd/tsgo`, and the small parts of other packages they need. The wave plan
-is `target/continuation-r97-goport/ls-port/plan.md` in the main checkout.
-Where this section and a rule above differ, this section wins for these
-files.
+`cmd/tsc` (`cmd/tsgo` before pin N), and the small parts of other packages
+they need. The wave plan is `target/continuation-r97-goport/ls-port/plan.md`
+in the main checkout. Where this section and a rule above differ, this
+section wins for these files.
 
 The shared-shape sections of the area maps in the same directory are also
 binding, except where this section says otherwise: `map-lsproto.md` section
@@ -810,7 +845,8 @@ in `map-watch-api.md`.
 - A Go package becomes the Rust module at the same path:
   `internal/ls/lsutil` -> `crate::ls::lsutil`, `internal/lsp/lsproto` ->
   `crate::lsp::lsproto`, `internal/project/dirty` ->
-  `crate::project::dirty`, `cmd/tsgo` -> `crate::cmd::tsgo`.
+  `crate::project::dirty`. Go `cmd/tsc` (`cmd/tsgo` before pin N) is
+  `crate::cmd::tsgo`.
 - A Go file becomes one Rust file with the Go base name in snake case
   (`importTracker.go` -> `import_tracker.rs`, `box.go` -> `box_.rs`). A Go
   file split by line ranges uses `_p1`, `_p2`, ... in Go order.

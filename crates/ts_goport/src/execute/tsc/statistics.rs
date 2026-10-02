@@ -310,6 +310,56 @@ mod tests {
         );
     }
 
+    // Go `table.print` writes each row with one `fmt.Fprintf` on the
+    // unbuffered `os.Stdout`. strace of the pin N oracle with
+    // `--diagnostics` on a one-file project: these 14 writes of fd 1. The
+    // system writer writes each write of the table at once
+    // (`stdio::CliStdout`), so the table must give one write per row.
+    #[test]
+    fn table_print_writes_go_pieces() {
+        let go_writes = [
+            "Files:              91\n",
+            "Lines:           58774\n",
+            "Identifiers:     49870\n",
+            "Symbols:         59387\n",
+            "Types:           34675\n",
+            "Instantiations:  33953\n",
+            "Memory used:    59443K\n",
+            "Memory allocs:  271214\n",
+            "Config time:    0.004s\n",
+            "Parse time:     0.077s\n",
+            "Bind time:      0.041s\n",
+            "Check time:     0.387s\n",
+            "Emit time:      0.000s\n",
+            "Total time:     0.514s\n",
+        ];
+        let mut table = Table::default();
+        for write in go_writes {
+            let (name, value) = write.trim_end().split_once(':').unwrap();
+            table.add(name, value.trim_start());
+        }
+        /// Keeps each write as one piece, an empty one too, as the system
+        /// writer writes each one (`GoOutput`).
+        #[derive(Default)]
+        struct Writes(Vec<String>);
+        impl std::io::Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.write_all(buf)?;
+                Ok(buf.len())
+            }
+            fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+                self.0.push(String::from_utf8(buf.to_vec()).unwrap());
+                Ok(())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let writes = Rc::new(RefCell::new(Writes::default()));
+        table.print(&(writes.clone() as Writer));
+        assert_eq!(writes.take().0, go_writes);
+    }
+
     // The content mapper rows (tsgo#4712): identities in sorted order, and
     // only the operations that ran. Go's map order is random, so the sort
     // is what makes the rows stable.
