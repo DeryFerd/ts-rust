@@ -590,65 +590,58 @@ impl Checker {
         if t.intersects(TypeFlags::NEVER) {
             return false;
         }
-        if s.intersects(TypeFlags::STRING_LIKE) && t.intersects(TypeFlags::STRING) {
-            return true;
-        }
-        if s.intersects(TypeFlags::STRING_LITERAL)
-            && s.intersects(TypeFlags::ENUM_LITERAL)
-            && t.intersects(TypeFlags::STRING_LITERAL)
-            && !t.intersects(TypeFlags::ENUM_LITERAL)
-            && self.ty(source).as_literal_type().value == self.ty(target).as_literal_type().value
-        {
-            return true;
-        }
-        if s.intersects(TypeFlags::NUMBER_LIKE) && t.intersects(TypeFlags::NUMBER) {
-            return true;
-        }
-        if s.intersects(TypeFlags::NUMBER_LITERAL)
-            && s.intersects(TypeFlags::ENUM_LITERAL)
-            && t.intersects(TypeFlags::NUMBER_LITERAL)
-            && !t.intersects(TypeFlags::ENUM_LITERAL)
-            && self.ty(source).as_literal_type().value == self.ty(target).as_literal_type().value
-        {
-            return true;
-        }
-        if s.intersects(TypeFlags::BIG_INT_LIKE) && t.intersects(TypeFlags::BIG_INT) {
-            return true;
-        }
-        if s.intersects(TypeFlags::BOOLEAN_LIKE) && t.intersects(TypeFlags::BOOLEAN) {
-            return true;
-        }
-        if s.intersects(TypeFlags::ES_SYMBOL_LIKE) && t.intersects(TypeFlags::ES_SYMBOL) {
-            return true;
-        }
-        let source_symbol = self.ty(source).symbol;
-        let target_symbol = self.ty(target).symbol;
-        if s.intersects(TypeFlags::ENUM)
-            && t.intersects(TypeFlags::ENUM)
-            && self.sym(source_symbol).name == self.sym(target_symbol).name
-            && self.is_enum_type_related_to(
-                source_symbol,
-                target_symbol,
-                reborrow_error_reporter(&mut error_reporter),
-            )
-        {
-            return true;
-        }
-        if s.intersects(TypeFlags::ENUM_LITERAL) && t.intersects(TypeFlags::ENUM_LITERAL) {
-            if s.intersects(TypeFlags::UNION)
-                && t.intersects(TypeFlags::UNION)
-                && self.is_enum_type_related_to(
-                    source_symbol,
-                    target_symbol,
-                    reborrow_error_reporter(&mut error_reporter),
-                )
-            {
+        // PORT: perf. Every rule from here to the null rule needs one of
+        // these source flags, so one test skips them all for other sources.
+        const PRIMITIVE_RULE_SOURCE: TypeFlags = TypeFlags(
+            TypeFlags::STRING_LIKE.bits()
+                | TypeFlags::NUMBER_LIKE.bits()
+                | TypeFlags::BIG_INT_LIKE.bits()
+                | TypeFlags::BOOLEAN_LIKE.bits()
+                | TypeFlags::ES_SYMBOL_LIKE.bits()
+                | TypeFlags::ENUM.bits()
+                | TypeFlags::ENUM_LITERAL.bits()
+                | TypeFlags::UNDEFINED.bits()
+                | TypeFlags::NULL.bits(),
+        );
+        if s.intersects(PRIMITIVE_RULE_SOURCE) {
+            if s.intersects(TypeFlags::STRING_LIKE) && t.intersects(TypeFlags::STRING) {
                 return true;
             }
-            if s.intersects(TypeFlags::LITERAL)
-                && t.intersects(TypeFlags::LITERAL)
+            if s.intersects(TypeFlags::STRING_LITERAL)
+                && s.intersects(TypeFlags::ENUM_LITERAL)
+                && t.intersects(TypeFlags::STRING_LITERAL)
+                && !t.intersects(TypeFlags::ENUM_LITERAL)
                 && self.ty(source).as_literal_type().value
                     == self.ty(target).as_literal_type().value
+            {
+                return true;
+            }
+            if s.intersects(TypeFlags::NUMBER_LIKE) && t.intersects(TypeFlags::NUMBER) {
+                return true;
+            }
+            if s.intersects(TypeFlags::NUMBER_LITERAL)
+                && s.intersects(TypeFlags::ENUM_LITERAL)
+                && t.intersects(TypeFlags::NUMBER_LITERAL)
+                && !t.intersects(TypeFlags::ENUM_LITERAL)
+                && self.ty(source).as_literal_type().value
+                    == self.ty(target).as_literal_type().value
+            {
+                return true;
+            }
+            if s.intersects(TypeFlags::BIG_INT_LIKE) && t.intersects(TypeFlags::BIG_INT) {
+                return true;
+            }
+            if s.intersects(TypeFlags::BOOLEAN_LIKE) && t.intersects(TypeFlags::BOOLEAN) {
+                return true;
+            }
+            if s.intersects(TypeFlags::ES_SYMBOL_LIKE) && t.intersects(TypeFlags::ES_SYMBOL) {
+                return true;
+            }
+            let source_symbol = self.ty(source).symbol;
+            let target_symbol = self.ty(target).symbol;
+            if s.intersects(TypeFlags::ENUM)
+                && t.intersects(TypeFlags::ENUM)
+                && self.sym(source_symbol).name == self.sym(target_symbol).name
                 && self.is_enum_type_related_to(
                     source_symbol,
                     target_symbol,
@@ -657,20 +650,44 @@ impl Checker {
             {
                 return true;
             }
-        }
-        // In non-strictNullChecks mode, `undefined` and `null` are assignable to anything except `never`.
-        // Since unions and intersections may reduce to `never`, we exclude them here.
-        if s.intersects(TypeFlags::UNDEFINED)
-            && (!self.strict_null_checks && !t.intersects(TypeFlags::UNION_OR_INTERSECTION)
-                || t.intersects(TypeFlags::UNDEFINED | TypeFlags::VOID))
-        {
-            return true;
-        }
-        if s.intersects(TypeFlags::NULL)
-            && (!self.strict_null_checks && !t.intersects(TypeFlags::UNION_OR_INTERSECTION)
-                || t.intersects(TypeFlags::NULL))
-        {
-            return true;
+            if s.intersects(TypeFlags::ENUM_LITERAL) && t.intersects(TypeFlags::ENUM_LITERAL) {
+                if s.intersects(TypeFlags::UNION)
+                    && t.intersects(TypeFlags::UNION)
+                    && self.is_enum_type_related_to(
+                        source_symbol,
+                        target_symbol,
+                        reborrow_error_reporter(&mut error_reporter),
+                    )
+                {
+                    return true;
+                }
+                if s.intersects(TypeFlags::LITERAL)
+                    && t.intersects(TypeFlags::LITERAL)
+                    && self.ty(source).as_literal_type().value
+                        == self.ty(target).as_literal_type().value
+                    && self.is_enum_type_related_to(
+                        source_symbol,
+                        target_symbol,
+                        reborrow_error_reporter(&mut error_reporter),
+                    )
+                {
+                    return true;
+                }
+            }
+            // In non-strictNullChecks mode, `undefined` and `null` are assignable to anything except `never`.
+            // Since unions and intersections may reduce to `never`, we exclude them here.
+            if s.intersects(TypeFlags::UNDEFINED)
+                && (!self.strict_null_checks && !t.intersects(TypeFlags::UNION_OR_INTERSECTION)
+                    || t.intersects(TypeFlags::UNDEFINED | TypeFlags::VOID))
+            {
+                return true;
+            }
+            if s.intersects(TypeFlags::NULL)
+                && (!self.strict_null_checks && !t.intersects(TypeFlags::UNION_OR_INTERSECTION)
+                    || t.intersects(TypeFlags::NULL))
+            {
+                return true;
+            }
         }
         if s.intersects(TypeFlags::OBJECT)
             && t.intersects(TypeFlags::NON_PRIMITIVE)
