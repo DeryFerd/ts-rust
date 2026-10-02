@@ -566,16 +566,23 @@ struct Job {
 /// freed here, on the worker.
 fn run_job(job: &Arc<Job>) {
     let view = &job.view;
-    let (package_jsons, reads) = KeptPackageJsons::take(job);
+    let (package_jsons, reads, kept) = KeptPackageJsons::take(job);
+    let fs = Rc::new(AheadFs {
+        os: wrap_fs(osvfs_fs()),
+        job: job.clone(),
+    });
+    let directory_exists = {
+        let fs = fs.clone();
+        Rc::new(move |path: &str| fs.directory_exists_unlogged(path)) as Rc<dyn Fn(&str) -> bool>
+    };
     begin_ahead_thread(
         &view.current_directory,
         view.use_case_sensitive_file_names,
         reads,
+        kept,
+        directory_exists,
     );
-    let fs: Rc<dyn Fs> = Rc::new(AheadFs {
-        os: wrap_fs(osvfs_fs()),
-        job: job.clone(),
-    });
+    let fs: Rc<dyn Fs> = fs;
     let mut resolver = job.config.new_resolver(fs, Some(package_jsons.clone()));
     resolver.caches.shared = Some(SharedResolutionLink {
         cache: job.answers.clone(),
@@ -637,15 +644,23 @@ struct KeptPackageJsons {
 }
 
 impl KeptPackageJsons {
-    /// The package.json cache and read hashes for `job` on this worker:
-    /// the kept entries of files that the worker read, or none.
-    fn take(job: &Job) -> (Rc<InfoCache>, FxHashMap<String, Option<u128>>) {
+    /// The package.json cache, read hashes and kept file names for `job`
+    /// on this worker: the kept entries of files that the worker read, or
+    /// none.
+    fn take(
+        job: &Job,
+    ) -> (
+        Rc<InfoCache>,
+        FxHashMap<String, Option<u128>>,
+        FxHashSet<String>,
+    ) {
         let view = &job.view;
         let cache = Rc::new(new_info_cache(
             &view.current_directory,
             view.use_case_sensitive_file_names,
         ));
         let mut reads = FxHashMap::default();
+        let mut kept_files = FxHashSet::default();
         let kept = KEPT.with(|kept| kept.borrow_mut().take()).filter(|kept| {
             !job.fresh_package_jsons
                 && kept.current_directory == view.current_directory
@@ -657,13 +672,14 @@ impl KeptPackageJsons {
                     let file_name = combine_paths(&entry.package_directory, &["package.json"]);
                     if let Some((file_name, Some(hash))) = kept.reads.remove_entry(&file_name) {
                         cache.set(&file_name, entry.clone());
+                        kept_files.insert(file_name.clone());
                         reads.insert(file_name, Some(hash));
                     }
                 }
                 true
             });
         }
-        (cache, reads)
+        (cache, reads, kept_files)
     }
 }
 
@@ -693,6 +709,26 @@ struct AheadFs {
 }
 
 impl AheadFs {
+    /// `directory_exists` with no log: whether a kept package.json cache
+    /// entry's directory is still there (`begin_ahead_thread`).
+    fn directory_exists_unlogged(&self, path: &str) -> bool {
+        self.directory_lookup(path).0
+    }
+
+    /// Whether directory `path` exists, as `overlayFS.DirectoryExists`
+    /// answers it, and its path.
+    fn directory_lookup(&self, path: &str) -> (bool, Path) {
+        let canonical = self.path(path);
+        let view = &self.job.view;
+        let exists = view.open_directories.contains(&canonical)
+            || !view.open_files.contains(&canonical)
+                && self
+                    .job
+                    .stats
+                    .directory_exists(path, || self.os.directory_exists(path));
+        (exists, canonical)
+    }
+
     fn path(&self, name: &str) -> Path {
         let view = &self.job.view;
         to_path(
@@ -780,14 +816,7 @@ impl Fs for AheadFs {
 
     // Go: project/overlayfs.go:302 overlayFS.DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {
-        let canonical = self.path(path);
-        let view = &self.job.view;
-        let exists = view.open_directories.contains(&canonical)
-            || !view.open_files.contains(&canonical)
-                && self
-                    .job
-                    .stats
-                    .directory_exists(path, || self.os.directory_exists(path));
+        let (exists, canonical) = self.directory_lookup(path);
         if !exists {
             note_ahead_call(AheadCall::MissingDirectory { path: canonical });
         }

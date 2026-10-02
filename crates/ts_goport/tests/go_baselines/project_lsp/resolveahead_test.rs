@@ -301,6 +301,33 @@ os_child_test! {
 }
 
 os_child_test! {
+    env &[("GOPORT_RESOLVE_AHEAD_THREADS", "1")];
+    /// The one worker keeps the package.json parse of `@scope/lib` from
+    /// the second load. Its directory is removed with no watch event, so
+    /// the snapshot still has the package.json, but Go's lookup asks
+    /// whether the directory exists and finds no package: the worker must
+    /// not answer from the kept parse.
+    fn a_kept_package_json_of_a_removed_directory_is_not_used() {
+        let stats = same_with_and_without("keptgone", &|session, root| {
+            open_index(session, root);
+            add_import(session, root);
+            std::fs::remove_dir_all(format!("{root}/node_modules/@scope/lib")).unwrap();
+            let uri = file_uri(root, "src/index.ts");
+            edit(
+                session,
+                &uri,
+                3,
+                (0, 0),
+                (0, 0),
+                "import { b as b2 } from \"./sub/b\";\n",
+            );
+            program(session, &uri);
+        });
+        assert!(stats.loader.missing >= 1, "{stats:?}");
+    }
+}
+
+os_child_test! {
     /// The edit removes the import of `../lib/c`: the workers resolve its
     /// key, the loader never asks for it, and its file is not seen.
     fn an_untaken_answer_adds_no_seen_file() {

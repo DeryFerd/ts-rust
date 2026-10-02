@@ -616,6 +616,12 @@ struct AheadThread {
     /// `None`: the entry's file was not read from a file that the loader
     /// can check.
     package_jsons: FxHashMap<usize, Option<Arc<[AheadCall]>>>,
+    /// The package.json files whose cache entries the worker kept from an
+    /// earlier job (`begin_ahead_thread`).
+    kept: FxHashSet<String>,
+    /// Whether a directory exists now on the worker's file system, with
+    /// no log (`begin_ahead_thread`).
+    directory_exists: Rc<dyn Fn(&str) -> bool>,
 }
 
 thread_local! {
@@ -627,11 +633,15 @@ thread_local! {
 /// system calls (`note_ahead_call`). `current_directory` and
 /// `use_case_sensitive_file_names` make the paths, as the host's `to_path`.
 /// `reads` has the hash of the text of each package.json that the
-/// worker's package.json cache has already.
+/// worker's package.json cache has already; `kept` names those that the
+/// cache kept from an earlier job. `directory_exists` answers whether a
+/// directory exists now, as the worker's file system does, with no log.
 pub fn begin_ahead_thread(
     current_directory: &str,
     use_case_sensitive_file_names: bool,
     reads: FxHashMap<String, Option<u128>>,
+    kept: FxHashSet<String>,
+    directory_exists: Rc<dyn Fn(&str) -> bool>,
 ) {
     AHEAD.with(|ahead| {
         *ahead.borrow_mut() = Some(AheadThread {
@@ -641,6 +651,8 @@ pub fn begin_ahead_thread(
             shareable: true,
             reads,
             package_jsons: FxHashMap::default(),
+            kept,
+            directory_exists,
         });
     });
 }
@@ -719,8 +731,11 @@ fn log_ahead_package_json(entry: &InfoCacheEntry) {
 }
 
 /// The calls of Go `getPackageJsonInfo` for `entry`. `None` when the worker
-/// did not read its package.json from a file that the loader can check.
-fn package_json_calls(entry: &InfoCacheEntry, state: &AheadThread) -> Option<Arc<[AheadCall]>> {
+/// did not read its package.json from a file that the loader can check, or
+/// when the entry was kept from an earlier job and its directory is gone:
+/// Go's lookup asks whether the directory exists, and the loader does not
+/// check a directory that exists. The next job drops such an entry.
+fn package_json_calls(entry: &InfoCacheEntry, state: &mut AheadThread) -> Option<Arc<[AheadCall]>> {
     let to_path = |name: &str| {
         to_path(
             name,
@@ -741,6 +756,10 @@ fn package_json_calls(entry: &InfoCacheEntry, state: &AheadThread) -> Option<Arc
     };
     if !entry.exists() {
         return Some(Arc::new([exists]));
+    }
+    if state.kept.contains(&file_name) && !(state.directory_exists)(&entry.package_directory) {
+        state.reads.remove(&file_name);
+        return None;
     }
     let hash = *state.reads.get(&file_name)?;
     Some(Arc::new([exists, AheadCall::Read { file_name, hash }]))
