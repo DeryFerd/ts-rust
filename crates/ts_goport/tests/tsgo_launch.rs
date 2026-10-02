@@ -11,6 +11,10 @@
 //!
 //! This test process takes the place of the launcher: it holds the read
 //! end of a pipe, which the tsgo opens through /proc as a worker does.
+//!
+//! In a PID namespace that has the /proc of another one, /proc/<pid> is
+//! another process: the launcher and the worker do not read it there
+//! (`own_proc`).
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Seek};
@@ -111,6 +115,137 @@ fn a_tsgo_started_from_a_worker_is_not_a_worker() {
     }
     // Reaps the zombie.
     zombie.wait();
+}
+
+/// tsgo in a PID namespace that has the test's /proc, as with `unshare -pf`
+/// without `--mount-proc`. bash is the namespace's pid 1, so a tsgo that it
+/// starts is pid 2 and its worker pid 3. On a host, /proc/3 is then a
+/// kernel thread whose parent has pid 2, so it looks like a live worker
+/// that does not catch the signal. The launcher sends a signal on at once
+/// there: SIGQUIT ends the run with Go's text and exit 2 well before the
+/// launcher's wait limit (bin/tsgo.rs `HOLD_LIMIT`, 2 s), as with the
+/// test's own /proc. And a tsgo whose `arg0` names a launcher that is gone
+/// in its namespace (the test's pid, live in /proc) kills itself.
+/// `unshare -U` needs no privilege on most hosts. Where it cannot run, the
+/// test says so and passes.
+#[test]
+fn a_tsgo_with_the_proc_of_another_pid_namespace() {
+    const UNSHARE: [&str; 4] = ["-Upf", "--map-root-user", "--kill-child", "bash"];
+    let probe = Command::new("unshare")
+        .args(UNSHARE)
+        .args(["-c", "exit 0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `unshare -Upf --map-root-user bash` cannot run here");
+        return;
+    }
+    let tsgo = env!("CARGO_BIN_EXE_tsgo");
+    // The test's own /proc: the started process is the launcher.
+    quit_launcher(Command::new(tsgo), 0, "own /proc");
+    // The launcher is the child of bash, the child of unshare.
+    let mut unshare = Command::new("unshare");
+    unshare
+        .args(UNSHARE)
+        .args(["-c", "\"$0\" \"$@\"; exit $?", tsgo]);
+    quit_launcher(unshare, 2, "another /proc");
+    // The worker check. The subshell makes the tsgo pid 2, not pid 1 (the
+    // first process of a namespace does not get its own SIGKILL).
+    let this = std::process::id();
+    assert!(this > 2, "the test's pid {this} is a pid of the namespace");
+    let output = Command::new("unshare")
+        .args(UNSHARE)
+        .args(["-c", "(exec -a \"$1\" \"$0\" --version); exit $?", tsgo])
+        .arg(format!("tsgo-worker {this} 0 0 0"))
+        .env("GOPORT_LAUNCH", "0")
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    // bash gives 128 + 9 for a child that SIGKILL ended.
+    assert_eq!(output.status.code(), Some(137), "{output:?}");
+    assert_eq!(output.stdout, b"", "worker check: output");
+}
+
+/// Starts `command` with `--all` and `GOPORT_LAUNCH=1`, sends SIGQUIT to
+/// its launcher once the worker has written some output, and checks that
+/// the run ends soon after with Go's text and exit 2. The launcher is the
+/// started process or its descendant `depth` levels down. The output is
+/// more than the stdout pipe holds and the test does not read it, so the
+/// worker cannot end before the signal comes, and its handlers are set
+/// before it writes.
+fn quit_launcher(mut command: Command, depth: usize, case: &str) {
+    const LIMIT: Duration = Duration::from_secs(60);
+    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+    let size = rustix::pipe::fcntl_setpipe_size(&write, 4096).unwrap();
+    // `--all` writes about 19 KB.
+    assert!(size <= 8192, "{case}: the pipe holds {size} bytes");
+    let mut child = command
+        .arg("--all")
+        .env("GOPORT_LAUNCH", "1")
+        .stdout(Stdio::from(write))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Closes the test's copy of the write end.
+    drop(command);
+    let start = Instant::now();
+    while rustix::io::ioctl_fionread(&read).unwrap() == 0 {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{case}: ended before output"
+        );
+        assert!(start.elapsed() < LIMIT, "{case}: no output in {LIMIT:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut launcher = child.id();
+    for _ in 0..depth {
+        launcher = child_of(launcher).unwrap_or_else(|| panic!("{case}: no launcher"));
+    }
+    let pid = rustix::process::Pid::from_raw(launcher.cast_signed()).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::QUIT).unwrap();
+    let sent = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if sent.elapsed() > LIMIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{case}: the run did not end in {LIMIT:?} after SIGQUIT");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let ended = sent.elapsed();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+    assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+    assert!(
+        ended < Duration::from_secs(1),
+        "{case}: ended {ended:?} after SIGQUIT"
+    );
+}
+
+/// The pid of a child of `pid`, from /proc.
+fn child_of(pid: u32) -> Option<u32> {
+    std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let child = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let stat = std::fs::read(format!("/proc/{child}/stat")).ok()?;
+            // `<pid> (<name>) <state> <ppid> ...`: the name can hold ") ".
+            let name_end = stat.iter().rposition(|&b| b == b')')?;
+            let rest = std::str::from_utf8(stat.get(name_end + 2..)?).ok()?;
+            let parent = rest.split(' ').nth(1)?.parse::<u32>().ok()?;
+            (parent == pid).then_some(child)
+        })
 }
 
 /// A process that has ended: a tsgo `--version`. When `reap` is false, it
