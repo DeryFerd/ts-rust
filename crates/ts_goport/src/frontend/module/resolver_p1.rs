@@ -474,6 +474,8 @@ impl DefaultResolver {
                     value: Arc::new((*result).clone()),
                     package_jsons: self.caches.take_package_json_log(),
                     lookups: self.caches.take_worker_lookup_log(),
+                    // Resolve-ahead workers resolve only module names.
+                    ahead: None,
                 },
             );
         }
@@ -560,6 +562,15 @@ impl DefaultResolver {
                     .set(cache_key, found.value.clone());
                 return (found.value, Vec::new());
             }
+            // PERF: a resolve-ahead worker may have resolved this key
+            // (compiler/resolve_ahead.rs). The loader takes the answer only
+            // after it checked it on its own file system.
+            if let Some(found) = self.caches.take_resolved_ahead(&cache_key) {
+                self.caches
+                    .module_resolution_cache
+                    .set(cache_key, found.clone());
+                return (found, Vec::new());
+            }
         }
 
         self.caches.start_package_json_log();
@@ -638,14 +649,26 @@ impl DefaultResolver {
             &trace_builder,
         ));
         if let Some(shared) = self.caches.shared.as_ref().filter(|shared| shared.publish) {
-            shared.cache.set_module(
-                cache_key.clone(),
-                SharedResolution {
-                    value: Arc::clone(&final_result),
-                    package_jsons: self.caches.take_package_json_log(),
-                    lookups: self.caches.take_worker_lookup_log(),
-                },
-            );
+            let package_jsons = self.caches.take_package_json_log();
+            let lookups = self.caches.take_worker_lookup_log();
+            // A resolve-ahead answer that the loader cannot check is not
+            // published (`AheadLogEnd::Unshareable`).
+            let ahead = match self.caches.take_ahead_log() {
+                AheadLogEnd::NotLogged => Some(None),
+                AheadLogEnd::Unshareable => None,
+                AheadLogEnd::Logged(calls) => Some(Some(calls)),
+            };
+            if let Some(ahead) = ahead {
+                shared.cache.set_module(
+                    cache_key.clone(),
+                    SharedResolution {
+                        value: Arc::clone(&final_result),
+                        package_jsons,
+                        lookups,
+                        ahead,
+                    },
+                );
+            }
         }
         self.caches
             .module_resolution_cache

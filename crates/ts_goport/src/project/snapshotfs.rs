@@ -1067,6 +1067,69 @@ impl FileSource for SnapshotFSBuilder {
     }
 }
 
+/// The state of a `cache_files` entry that `FileSource::file_exists`
+/// reads (`SnapshotFSBuilder::cached_file_state`).
+// PORT: not in Go (resolve ahead, compiler/resolve_ahead.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachedFileState {
+    /// No entry: `file_exists` asks the layered file system.
+    Absent,
+    /// A live entry that needs no reload: `file_exists` is true.
+    Live,
+    /// An entry with no value (a deleted file): `file_exists` is false.
+    NoValue,
+    /// An entry that `file_exists` would reload first (a read).
+    NeedsReload,
+}
+
+// PORT: not in Go. What resolve ahead needs to check a worker's answer
+// on the snapshot file system (project/compilerhost.rs).
+impl SnapshotFSBuilder {
+    /// The state of the `cache_files` entry of `path`, as
+    /// `FileSource::file_exists` reads it, with no side effect (no reload,
+    /// no entry made for the dirty map).
+    pub fn cached_file_state(&self, path: &tspath::Path) -> CachedFileState {
+        let file = {
+            let dirty = self.cache_files.dirty.borrow();
+            match dirty.get(path) {
+                // `dirty::SyncMap::load` gives no entry for a deleted one.
+                Some(entry) if entry.map_entry.borrow().delete => return CachedFileState::Absent,
+                Some(entry) => entry.value(),
+                None => match self.cache_files.base.get(path) {
+                    Some(file) => Some(file.clone()),
+                    None => return CachedFileState::Absent,
+                },
+            }
+        };
+        match file {
+            None => CachedFileState::NoValue,
+            Some(file) if file.borrow().matches_disk_text() => CachedFileState::Live,
+            Some(_) => CachedFileState::NeedsReload,
+        }
+    }
+
+    /// When the layered file system is the overlay file system over the
+    /// OS file system of this thread (`bundled::is_wrapped_os_fs`), as in
+    /// the language server: the paths of its open files and of the
+    /// directories that have open files in them. Else `None`.
+    pub fn open_files_over_os(&self) -> Option<(FxHashSet<tspath::Path>, FxHashSet<tspath::Path>)> {
+        let cached = vfs::Fs::as_any(&*self.fs)?.downcast_ref::<CachedLayeredFileSystem>()?;
+        let layered: &dyn vfs::Fs = &*cached.layered;
+        let overlay = as_overlay_fs(layered)?;
+        if !crate::frontend::bundled::is_wrapped_os_fs(&overlay.host) {
+            return None;
+        }
+        let files = overlay.overlays.borrow().keys().cloned().collect();
+        let directories = overlay
+            .overlay_directories
+            .borrow()
+            .keys()
+            .cloned()
+            .collect();
+        Some((files, directories))
+    }
+}
+
 // Go: project/snapshotfs.go:616 isRelevantExtension
 // isRelevantExtension returns true if the given extension is a known TypeScript
 // or JavaScript extension that can affect the project.
@@ -1239,6 +1302,42 @@ impl SourceFS {
         drop(source);
         drop(seen_files);
         drop(missing_directories);
+    }
+}
+
+// PORT: not in Go. The replay of a resolve-ahead answer's calls
+// (project/compilerhost.rs): the side effects of `vfs::Fs::file_exists`
+// and `vfs::Fs::directory_exists` with the path made already.
+impl SourceFS {
+    /// `track` of a name whose path is `path`.
+    pub fn track_path(&self, path: &tspath::Path) {
+        if !self.tracking.get() {
+            return;
+        }
+        let seen_files = self.seen_files.borrow();
+        let mut seen_files = seen_files
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .borrow_mut();
+        if !seen_files.contains(path) {
+            seen_files.insert(path.clone());
+        }
+    }
+
+    /// What `directory_exists` notes when it gives false for a name whose
+    /// path is `path`.
+    pub fn note_missing_directory(&self, path: &tspath::Path) {
+        if !self.tracking.get() {
+            return;
+        }
+        let mut missing_directories = self
+            .missing_directories
+            .as_ref()
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
+            .borrow_mut();
+        if !missing_directories.contains(path) {
+            missing_directories.insert(path.clone());
+        }
     }
 }
 

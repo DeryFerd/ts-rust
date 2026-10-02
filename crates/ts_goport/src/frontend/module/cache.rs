@@ -153,6 +153,40 @@ pub struct Caches {
     /// The load adds them to the build host's cache at its end
     /// (`DefaultResolver::take_worker_lookups`, `BuildStatCache::end_load`).
     pub worker_lookups: RefCell<Vec<Arc<[StatLookup]>>>,
+
+    /// The loader's resolver during a resolve-ahead program load
+    /// (compiler/resolve_ahead.rs). The load removes it at its end.
+    pub ahead: RefCell<Option<AheadLink>>,
+}
+
+/// The loader's resolver in a resolve-ahead program load
+/// (compiler/resolve_ahead.rs): the answers of the workers, the check before
+/// the loader takes one, and the keys of the load.
+// PORT: not in Go (perf).
+pub struct AheadLink {
+    /// The answers of the resolve-ahead workers of this load. `None` when
+    /// no worker runs; the load then only records its keys.
+    pub answers: Option<Arc<SharedResolutionCache>>,
+    /// Checks the calls of a worker answer for a key on the loader's file
+    /// system and replays their side effects. False: a call gives another
+    /// answer there, and the loader resolves the key itself.
+    pub accept: Rc<dyn Fn(&ModuleResolutionCacheKey, &ResolvedModule, &[AheadCall]) -> bool>,
+    /// The keys that the loader resolved or took in this load, in its
+    /// order: the keys for the workers of the next load.
+    pub keys: RefCell<Vec<ModuleResolutionCacheKey>>,
+    pub stats: Cell<AheadStats>,
+}
+
+/// What the loader did with the keys of a resolve-ahead load that its own
+/// cache did not have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AheadStats {
+    /// Worker answers that passed the check.
+    pub taken: usize,
+    /// Worker answers that failed the check.
+    pub rejected: usize,
+    /// Keys with no worker answer (not resolved yet, new or not shareable).
+    pub missing: usize,
 }
 
 impl Caches {
@@ -169,6 +203,7 @@ impl Caches {
             package_json_log: RefCell::new(Vec::new()),
             worker_package_jsons: RefCell::new(Vec::new()),
             worker_lookups: RefCell::new(Vec::new()),
+            ahead: RefCell::new(None),
         }
     }
 
@@ -235,6 +270,173 @@ pub struct SharedResolution<T> {
     /// cache did not have (`note_worker_lookup`). `None` when the worker
     /// does not log them (no `tsc -b` host).
     pub lookups: Option<Arc<[StatLookup]>>,
+    /// The file system calls of a resolve-ahead worker's resolution, with
+    /// their answers (`AheadCall`). `None` from other parse workers. The
+    /// loader takes a resolve-ahead answer only with them.
+    pub ahead: Option<Arc<[AheadCall]>>,
+}
+
+/// One file system call of a resolve-ahead worker's resolution
+/// (compiler/resolve_ahead.rs), with its answer. Before the loader takes
+/// the answer, it checks each call on its own file system and replays the
+/// side effects of the call (`AheadLink::accept`).
+// PORT: not in Go (perf). Go resolves in each parse task on the host's
+// file system, which tracks the calls itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AheadCall {
+    /// `file_exists` of a name whose path is `path`.
+    FileExists { path: Path, exists: bool },
+    /// A `directory_exists` that gave false.
+    MissingDirectory { path: Path },
+    /// `read_file`: the xxh3 hash of the text, `None` when the file could
+    /// not be read.
+    Read {
+        file_name: String,
+        hash: Option<u128>,
+    },
+}
+
+/// How the resolve-ahead call log of a resolution ended
+/// (`Caches::take_ahead_log`).
+pub enum AheadLogEnd {
+    /// This thread does not log (it is no resolve-ahead worker).
+    NotLogged,
+    /// The resolution made a call that the loader cannot check (a read of
+    /// an open file, a directory listing, a stat). Its answer is not
+    /// published.
+    Unshareable,
+    Logged(Arc<[AheadCall]>),
+}
+
+/// The state of a resolve-ahead worker thread.
+struct AheadThread {
+    current_directory: String,
+    use_case_sensitive_file_names: bool,
+    /// The calls of the resolution that runs now. `None` between
+    /// resolutions.
+    calls: Option<Vec<AheadCall>>,
+    /// False when the resolution made a call that the loader cannot check.
+    shareable: bool,
+    /// The hash of each file that this thread read, by name. The
+    /// package.json cache of the worker's resolver keeps the parses of
+    /// these texts, and a later resolution that reads the cache logs the
+    /// read again (`Caches::log_package_json`).
+    reads: FxHashMap<String, Option<u128>>,
+}
+
+thread_local! {
+    /// Set on a resolve-ahead worker thread (`begin_ahead_thread`).
+    static AHEAD: RefCell<Option<AheadThread>> = const { RefCell::new(None) };
+}
+
+/// Makes this thread a resolve-ahead worker: its resolutions log their file
+/// system calls (`note_ahead_call`). `current_directory` and
+/// `use_case_sensitive_file_names` make the paths, as the host's `to_path`.
+pub fn begin_ahead_thread(current_directory: &str, use_case_sensitive_file_names: bool) {
+    AHEAD.with(|ahead| {
+        *ahead.borrow_mut() = Some(AheadThread {
+            current_directory: current_directory.to_string(),
+            use_case_sensitive_file_names,
+            calls: None,
+            shareable: true,
+            reads: FxHashMap::default(),
+        });
+    });
+}
+
+/// Ends `begin_ahead_thread`.
+pub fn end_ahead_thread() {
+    let state = AHEAD.with(|ahead| ahead.borrow_mut().take());
+    drop(state);
+}
+
+/// Logs `call` in the resolution that runs on this thread, if it logs.
+pub fn note_ahead_call(call: AheadCall) {
+    AHEAD.with(|ahead| {
+        if let Some(calls) = ahead
+            .borrow_mut()
+            .as_mut()
+            .and_then(|state| state.calls.as_mut())
+        {
+            calls.push(call);
+        }
+    });
+}
+
+/// Logs a read of `file_name` (`hash` of its text, `None` when it could not
+/// be read) in the resolution that runs on this thread, and keeps the hash
+/// for later reads of the same parse.
+pub fn note_ahead_read(file_name: &str, hash: Option<u128>) {
+    AHEAD.with(|ahead| {
+        if let Some(state) = ahead.borrow_mut().as_mut() {
+            state.reads.insert(file_name.to_string(), hash);
+            if let Some(calls) = state.calls.as_mut() {
+                calls.push(AheadCall::Read {
+                    file_name: file_name.to_string(),
+                    hash,
+                });
+            }
+        }
+    });
+}
+
+/// Logs the file system calls of Go `getPackageJsonInfo` for `entry` in
+/// the resolve-ahead resolution that runs on this thread. A resolution that
+/// finds the entry in the worker's package.json cache makes no call, but
+/// the loader's own resolution makes them when its cache does not have the
+/// entry. So each resolution that reads the entry lists them, as
+/// `Caches::log_package_json` does for the `tsc -b` lookups. A call that
+/// the worker made for this entry is then listed twice, which the loader's
+/// check and replay allow.
+fn log_ahead_package_json(entry: &InfoCacheEntry) {
+    AHEAD.with(|ahead| {
+        let mut ahead = ahead.borrow_mut();
+        let Some(AheadThread {
+            current_directory,
+            use_case_sensitive_file_names,
+            calls: Some(calls),
+            shareable,
+            reads,
+        }) = ahead.as_mut()
+        else {
+            return;
+        };
+        let to_path = |name: &str| to_path(name, current_directory, *use_case_sensitive_file_names);
+        if !entry.directory_exists {
+            calls.push(AheadCall::MissingDirectory {
+                path: to_path(&entry.package_directory),
+            });
+            return;
+        }
+        let file_name = combine_paths(&entry.package_directory, &["package.json"]);
+        calls.push(AheadCall::FileExists {
+            path: to_path(&file_name),
+            exists: entry.exists(),
+        });
+        if entry.exists() {
+            match reads.get(&file_name) {
+                Some(&hash) => calls.push(AheadCall::Read { file_name, hash }),
+                // The worker did not read it from a file that the loader can
+                // check.
+                None => *shareable = false,
+            }
+        }
+    });
+}
+
+/// Marks the resolution that runs on this thread as not shareable: it made
+/// a call that the loader cannot check. With `file_name`, it read that
+/// file from a source that the loader cannot check (an open file), so a
+/// later resolution that uses its parse is not shareable either.
+pub fn note_ahead_unshareable(file_name: Option<&str>) {
+    AHEAD.with(|ahead| {
+        if let Some(state) = ahead.borrow_mut().as_mut() {
+            state.shareable = false;
+            if let Some(file_name) = file_name {
+                state.reads.remove(file_name);
+            }
+        }
+    });
 }
 
 /// A lookup that Go `cachedvfs` caches (all but `Stat`).
@@ -398,6 +600,7 @@ impl Caches {
                     );
                 }
             }
+            log_ahead_package_json(entry);
         }
     }
 
@@ -412,7 +615,67 @@ impl Caches {
             if WORKER_LOOKUP_LOG.with(Cell::get) {
                 WORKER_LOOKUPS.with(|log| *log.borrow_mut() = Some(Vec::new()));
             }
+            AHEAD.with(|ahead| {
+                if let Some(state) = ahead.borrow_mut().as_mut() {
+                    state.calls = Some(Vec::new());
+                    state.shareable = true;
+                }
+            });
         }
+    }
+
+    /// Takes the resolve-ahead call log of the resolution that just ended
+    /// (`start_package_json_log` to here), and stops it.
+    pub fn take_ahead_log(&self) -> AheadLogEnd {
+        AHEAD.with(|ahead| {
+            let mut ahead = ahead.borrow_mut();
+            let Some(state) = ahead.as_mut() else {
+                return AheadLogEnd::NotLogged;
+            };
+            match state.calls.take() {
+                None => AheadLogEnd::NotLogged,
+                Some(calls) if state.shareable => AheadLogEnd::Logged(calls.into()),
+                Some(_) => AheadLogEnd::Unshareable,
+            }
+        })
+    }
+
+    /// The loader's resolver in a resolve-ahead load: records `key` for
+    /// the next load (`AheadLink::keys`), and gives the worker answer for
+    /// `key` when there is one and it passes the check
+    /// (`AheadLink::accept`). `None`: the loader resolves the key itself.
+    pub fn take_resolved_ahead(
+        &self,
+        key: &ModuleResolutionCacheKey,
+    ) -> Option<Arc<ResolvedModule>> {
+        let ahead = self.ahead.borrow();
+        let ahead = ahead.as_ref()?;
+        ahead.keys.borrow_mut().push(key.clone());
+        let answers = ahead.answers.as_ref()?;
+        let mut stats = ahead.stats.get();
+        let found = answers.get_module(key);
+        let accepted = match found
+            .as_ref()
+            .and_then(|found| Some((found, found.ahead.as_ref()?)))
+        {
+            None => {
+                stats.missing += 1;
+                false
+            }
+            Some((found, calls)) => {
+                let accepted = (ahead.accept)(key, &found.value, calls);
+                if accepted {
+                    stats.taken += 1;
+                } else {
+                    stats.rejected += 1;
+                }
+                accepted
+            }
+        };
+        ahead.stats.set(stats);
+        let found = found.filter(|_| accepted)?;
+        self.note_worker_package_jsons(&found.package_jsons);
+        Some(found.value)
     }
 
     /// Takes the package.json lookups of the resolution that just ended.
