@@ -69,11 +69,17 @@ enum InlineLen {
     Three = 3,
 }
 
-// A list must stay 24 bytes, or `Type` grows past 2 cache lines.
+// A list must stay 24 bytes, or `Type` grows past 2 cache lines. 32-bit
+// targets (wasm32) have smaller pointers and do not check this.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<SharedList<TypeId>>() == 24);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<SharedList<SymbolId>>() == 24);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<SharedList<SignatureId>>() == 24);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<SharedList<IndexInfoId>>() == 24);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<SharedList<VarianceFlags>>() == 24);
 
 impl<T> SharedList<T> {

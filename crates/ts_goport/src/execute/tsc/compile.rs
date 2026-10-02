@@ -619,6 +619,7 @@ impl crate::ipc::ReadWriteCloser for ChildProcess {
     }
 }
 
+#[cfg(any(unix, windows))]
 impl ProcessExitState for ChildProcess {
     // Go: cmd/tsc/sys.go:104 childProcess.ExitCode
     fn exit_code(&self) -> (i32, bool) {
@@ -631,6 +632,20 @@ impl ProcessExitState for ChildProcess {
             None => (0, false),
         }
     }
+}
+
+// PORT: not in Go. wasm cannot start processes, so `Spawn` fails with the
+// Go `exec.Command` error text for an unsupported platform.
+#[cfg(target_family = "wasm")]
+pub fn spawn_process(
+    command: &[String],
+    _dir: &str,
+    _stderr: Option<Box<dyn std::io::Write + Send>>,
+) -> Result<Arc<dyn ProcessExitState>, GoError> {
+    let name = command.first().map_or("", String::as_str);
+    Err(crate::gostd::errors::new(format!(
+        "fork/exec {name}: not supported by wasm"
+    )))
 }
 
 /// Go `exec.LookPath(file)` (os/exec/lp_unix.go, go1.26) for a name without

@@ -276,8 +276,15 @@ impl Deref for LateSourceFileInfo {
 /// queue of each worker. Only the loading thread has pools, one for each
 /// program version (`POOLS`).
 struct CheckerPool {
+    #[cfg(not(target_family = "wasm"))]
     workers: Vec<std::sync::mpsc::Sender<Job>>,
+    #[cfg(not(target_family = "wasm"))]
     threads: Vec<std::thread::JoinHandle<()>>,
+    /// wasm has one thread: the checkers stay on the loading thread, and
+    /// each job runs when it is sent (`send_thread_job`). A slot is empty
+    /// while its checker runs a job.
+    #[cfg(target_family = "wasm")]
+    checkers: Vec<Option<Checker>>,
     /// The program's emit pool, made on its first job
     /// (`send_emit_pool_jobs`). It stops with the checkers.
     emit: Option<EmitPool>,
@@ -304,6 +311,7 @@ impl CheckerPool {
     /// Sends each worker the job that drops its checker and frees its
     /// synthetic nodes, closes the job queues and returns the worker
     /// threads, with the threads of the emit pool.
+    #[cfg(not(target_family = "wasm"))]
     fn stop(self) -> Vec<std::thread::JoinHandle<()>> {
         let CheckerPool {
             workers,
@@ -326,6 +334,15 @@ impl CheckerPool {
             threads.extend(emit.stop());
         }
         threads
+    }
+
+    /// wasm: drops the checkers. Their synthetic nodes are in the loading
+    /// thread's arena, which stays.
+    #[cfg(target_family = "wasm")]
+    fn stop(self) -> Vec<std::thread::JoinHandle<()>> {
+        let CheckerPool { checkers, emit } = self;
+        drop(checkers);
+        emit.map(EmitPool::stop).unwrap_or_default()
     }
 }
 
@@ -381,6 +398,10 @@ const MAX_EMIT_THREADS: usize = 32;
 // cores 12 was neutral, so the rule leaves CPUs without siblings alone.
 // perf10 found a pool of 4 17 ms faster on mini-743d (16 threads, 8 cores).
 fn emit_thread_count() -> usize {
+    // wasm has one thread.
+    if cfg!(target_family = "wasm") {
+        return 0;
+    }
     static SET: OnceLock<Option<usize>> = OnceLock::new();
     let set = *SET.get_or_init(|| {
         std::env::var("GOPORT_EMIT_THREADS")
@@ -1524,6 +1545,10 @@ pub(crate) fn bind_thread_fingerprint() -> (usize, (u64, u64), usize) {
 // first program of the query chain build (`tsc -b`, 445 files, 27 root
 // tasks) bound in 5.6 ms less wall time on 16 bind threads than on 4.
 fn bind_thread_count(files: usize) -> usize {
+    // wasm has one thread.
+    if cfg!(target_family = "wasm") {
+        return 1;
+    }
     if let Some(count) = std::env::var("GOPORT_BIND_THREADS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -3058,6 +3083,13 @@ fn create_checkers() -> CheckerPool {
         with_tables(|tables| tables.file_associations.set(file_associations).is_ok()),
         "checker pool made twice"
     );
+    start_checkers(count)
+}
+
+/// Starts `count` checker workers, each on its own thread with its own
+/// checker, and returns the pool.
+#[cfg(not(target_family = "wasm"))]
+fn start_checkers(count: usize) -> CheckerPool {
     // PERF (perfplan4 R7): with `--singleThreaded` the one checker allocates
     // in the jemalloc arena of the loading thread, which waits for it. It
     // then reuses the pages that the parse and the bind freed, where it
@@ -3111,6 +3143,17 @@ fn create_checkers() -> CheckerPool {
     }
 }
 
+/// wasm has one thread: makes the `count` checkers on the loading thread.
+/// It already has the program state that a worker gets from its
+/// `WorkerSeed`.
+#[cfg(target_family = "wasm")]
+fn start_checkers(count: usize) -> CheckerPool {
+    CheckerPool {
+        checkers: (0..count).map(|index| Some(Checker::new(index))).collect(),
+        emit: None,
+    }
+}
+
 /// PORT: not in Go (perf). Sends each checker thread of the current
 /// program a job that borrows no checker and drops a value that `signal`
 /// makes. It runs after the jobs sent to that thread before, so when every
@@ -3119,6 +3162,7 @@ fn create_checkers() -> CheckerPool {
 /// the program has no checker pool on this thread. `tsc -b` learns this way
 /// that the check and emit that a task started are done
 /// (build/orchestrator.rs `build_all_tasks`).
+#[cfg(not(target_family = "wasm"))]
 pub fn send_checker_barrier<T: Send + 'static>(signal: impl Fn() -> T) -> usize {
     let id = prog().id;
     POOLS.with(|pools| {
@@ -3136,6 +3180,23 @@ pub fn send_checker_barrier<T: Send + 'static>(signal: impl Fn() -> T) -> usize 
     })
 }
 
+/// wasm: every job already ran when it was sent (`send_thread_job`), so
+/// each value drops at once.
+#[cfg(target_family = "wasm")]
+pub fn send_checker_barrier<T: Send + 'static>(signal: impl Fn() -> T) -> usize {
+    let id = prog().id;
+    POOLS.with(|pools| {
+        let pools = pools.borrow();
+        let Some(pool) = pools.get(&id) else {
+            return 0;
+        };
+        for _ in &pool.checkers {
+            drop(signal());
+        }
+        pool.checkers.len()
+    })
+}
+
 /// Starts `f` with checker `index` on its thread and returns where the
 /// result arrives. Jobs for one checker run in the order they are sent.
 fn send_job<R: Send + 'static>(
@@ -3147,6 +3208,7 @@ fn send_job<R: Send + 'static>(
 
 /// `send_job` for work that borrows the checker itself (`with_checker_at`)
 /// when it needs it.
+#[cfg(not(target_family = "wasm"))]
 fn send_thread_job<R: Send + 'static>(
     index: usize,
     f: impl FnOnce() -> R + Send + 'static,
@@ -3164,6 +3226,44 @@ fn send_thread_job<R: Send + 'static>(
             .send(job)
             .expect("checker thread stopped");
     });
+    receiver
+}
+
+/// wasm: runs `f` now, on the loading thread, as the worker of checker
+/// `index` would: the checker is this thread's worker checker for the call
+/// (`with_checker_at`). The result is already in the returned channel. A
+/// panic aborts on wasm, so there is no panic payload to keep.
+#[cfg(target_family = "wasm")]
+fn send_thread_job<R: Send + 'static>(
+    index: usize,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> std::sync::mpsc::Receiver<JobResult<R>> {
+    assert!(
+        worker_index().is_none(),
+        "checker job sent from a checker job"
+    );
+    let id = prog().id;
+    // The pool borrow ends before the job runs: a job reads the pool
+    // (`checker_index_for_file`).
+    let checker = POOLS.with(|pools| {
+        let mut pools = pools.borrow_mut();
+        let pool = pools.entry(id).or_insert_with(create_checkers);
+        pool.checkers[index].take().expect("checker in use")
+    });
+    WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
+    WORKER_INDEX.with(|slot| slot.set(Some(index)));
+    let result = f();
+    WORKER_INDEX.with(|slot| slot.set(None));
+    let checker = WORKER_CHECKER
+        .with(|slot| slot.borrow_mut().take())
+        .expect("worker checker");
+    POOLS.with(|pools| {
+        if let Some(pool) = pools.borrow_mut().get_mut(&id) {
+            pool.checkers[index] = Some(checker);
+        }
+    });
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let _ = sender.send(Ok(result));
     receiver
 }
 

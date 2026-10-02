@@ -253,6 +253,22 @@ impl ReadWriteCloser for StdioConn {
 #[cfg(unix)]
 use crate::ipc::transport_unix::new_pipe_listener;
 
+// PORT: not in Go. wasm has no sockets or named pipes, so `--pipe` fails
+// with this error (see crates/ts_wasm).
+#[cfg(target_family = "wasm")]
+pub fn new_pipe_listener(path: &str) -> Result<Box<dyn NetListener>, GoError> {
+    Err(errors::new(format!(
+        "listen {path}: pipes are not supported on wasm"
+    )))
+}
+
+// PORT: not in Go. A wasm build has no pipe paths; the listener above
+// rejects any path.
+#[cfg(target_family = "wasm")]
+pub fn generate_pipe_path(name: &str) -> String {
+    name.to_string()
+}
+
 // ---------------------------------------------------------------------------
 // transport_windows.go (//go:build windows)
 // ---------------------------------------------------------------------------

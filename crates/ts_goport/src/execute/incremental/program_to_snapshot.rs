@@ -438,7 +438,8 @@ fn start_text_hashes(files: &[Node], hash_with_text: bool) -> std::sync::mpsc::R
             }
         }
     };
-    if single_threaded() {
+    // wasm has one thread.
+    if single_threaded() || cfg!(target_family = "wasm") {
         hash_texts();
     } else {
         crate::core::GoThread::new()

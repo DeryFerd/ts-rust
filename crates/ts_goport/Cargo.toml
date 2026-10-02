@@ -17,13 +17,17 @@ bumpalo = "=3.20.3"
 xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 flate2 = "=1.1.10"
 jiff = { version = "=0.2.37", default-features = false, features = ["std"] }
+
+# Native only: wasm has no processes, signals, terminals or pipes (see
+# crates/ts_wasm).
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "stdio", "termios"] }
 # Go `os/signal` Notify for `signal.NotifyContext` in cmd/tsc (--watch, --lsp).
 signal-hook = "=0.4.4"
 
-# jemalloc does not build for Windows (msvc, or gnu through zig); the
+# jemalloc does not build for Windows (msvc, or gnu through zig) or wasm; the
 # `jemalloc` feature does nothing there.
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(not(any(windows, target_family = "wasm")))'.dependencies]
 tikv-jemallocator = { version = "=0.7.0", optional = true }
 # `thread.arena` through its safe `Access` API (program.rs
 # `jemalloc_thread_arena`): the one checker of `--singleThreaded` allocates

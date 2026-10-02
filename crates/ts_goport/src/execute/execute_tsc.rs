@@ -110,6 +110,16 @@ pub trait TscCompilationHooks {
     fn testing(&self) -> Option<Rc<dyn CommandLineTesting>> {
         None
     }
+
+    /// The reporter of each diagnostic in a compile that is not `-b`.
+    /// `reporter` is Go's (`CreateDiagnosticReporter`), which writes the
+    /// diagnostic text to the system writer. The default keeps it. The
+    /// wasm package (crates/ts_wasm) returns one that keeps the diagnostics
+    /// as data.
+    // PORT: not in Go.
+    fn diagnostic_reporter(&self, reporter: DiagnosticReporter) -> DiagnosticReporter {
+        reporter
+    }
 }
 
 /// Go `tsc`: no bin step, the Go program, and emit writes through the OS
@@ -251,12 +261,13 @@ pub fn tsc_compilation(
     let testing = hooks.testing();
     let mut config_file_name = String::new();
     let locale = command_line.locale();
-    let mut report_diagnostic: DiagnosticReporter = create_diagnostic_reporter(
-        &*sys,
-        sys.writer(),
-        &locale,
-        command_line.compiler_options(),
-    );
+    let mut report_diagnostic: DiagnosticReporter =
+        hooks.diagnostic_reporter(create_diagnostic_reporter(
+            &*sys,
+            sys.writer(),
+            &locale,
+            command_line.compiler_options(),
+        ));
 
     if !command_line.errors.is_empty() {
         for e in &command_line.errors {
@@ -406,12 +417,12 @@ pub fn tsc_compilation(
             return result(ExitStatus::DiagnosticsPresentOutputsGenerated);
         }
         // Updater to reflect pretty
-        report_diagnostic = create_diagnostic_reporter(
+        report_diagnostic = hooks.diagnostic_reporter(create_diagnostic_reporter(
             &*sys,
             sys.writer(),
             &locale,
             command_line.compiler_options(),
-        );
+        ));
         // PORT: Go returns a non-nil config whenever there are no errors.
         config_parse_result
             .expect("GetParsedCommandLineOfConfigFile returns a config without errors")

@@ -3,6 +3,7 @@ members = [
     "crates/ts_goport",
     "crates/ts_goport/parts/goport_lsproto",
     "crates/ts_goport/parts/goport_util",
+    "crates/ts_wasm",
     "tools/ts_ast_codegen",
     "tools/ts_diagnostics_codegen",
 ]
@@ -29,3 +30,14 @@ pedantic = { level = "warn", priority = -1 }
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+# Size profile for the wasm build (crates/ts_wasm, scripts/wasm/build.sh):
+# `cargo build --profile wasm --target wasm32-wasip1`. wasm cannot unwind,
+# so panics abort.
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

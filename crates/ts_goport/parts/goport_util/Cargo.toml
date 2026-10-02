@@ -19,6 +19,9 @@ memchr = "=2.8.2"
 num-bigint = "=0.4.6"
 num-traits = "=0.2.19"
 ryu-js = "=1.0.2"
+
+# Native only (see ts_goport's Cargo.toml).
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "termios"] }
 
 # fswatch/canonicalize_darwin.rs: NFC for macOS watch paths (Go calls
