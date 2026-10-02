@@ -594,10 +594,15 @@ impl Checker {
     // Go: checker/inference.go:1208 cloneInferredPartOfContext
     pub fn clone_inferred_part_of_context(&mut self, n: InferenceContextId) -> InferenceContextId {
         let count = self.inference_context(n).inferences.len();
+        // PERF: Go filters the info pointers, then clones each kept info.
+        // The port clones each kept info once (`clone_inference_info` is a
+        // field-by-field clone), with no second copy of the list.
         let mut inferences: Vec<InferenceInfo> = Vec::new();
         for i in 0..count {
             if self.has_inference_candidates(n, i) {
-                inferences.push(self.inference_context(n).inferences[i].clone());
+                inferences.push(clone_inference_info(
+                    &self.inference_context(n).inferences[i],
+                ));
             }
         }
         if inferences.is_empty() {
@@ -607,7 +612,6 @@ impl Checker {
             let ctx = self.inference_context(n);
             (ctx.signature, ctx.flags, ctx.compare_types.clone())
         };
-        let inferences: Vec<InferenceInfo> = inferences.iter().map(clone_inference_info).collect();
         self.new_inference_context_worker(inferences, signature, flags, compare_types)
     }
 
@@ -620,12 +624,20 @@ impl Checker {
         compare_types: TypeComparer,
     ) -> InferenceContextId {
         let n = InferenceContextId(self.inference_contexts.len() as u32);
+        // PERF: every field is set here. `..InferenceContext::default()`
+        // would allocate the nil comparer (an `Rc`) and drop it again.
         self.inference_contexts.push(InferenceContext {
             inferences,
             signature,
             flags,
             compare_types,
-            ..InferenceContext::default()
+            mapper: MapperId::NIL,
+            non_fixing_mapper: MapperId::NIL,
+            return_mapper: MapperId::NIL,
+            outer_return_mapper: MapperId::NIL,
+            inferred_type_parameters: Vec::new(),
+            inferred_type_parameters_origin: 0,
+            intra_expression_inference_sites: Vec::new(),
         });
         let mapper = self.new_inference_type_mapper(n, true /*fixing*/);
         self.inference_context_mut(n).mapper = mapper;
