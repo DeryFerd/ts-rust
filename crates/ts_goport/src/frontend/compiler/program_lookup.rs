@@ -115,7 +115,7 @@ impl NewProgram {
             .any(|missing_path| self.to_path(missing_path) == *path)
     }
 
-    // Go: program.go:1841 (*Program).ExplainFiles
+    // Go: program.go:2120 (*Program).ExplainFiles
     // Each line is one write, as Go's `fmt.Fprintln`; its errors are ignored.
     // Go `fmt.Fprintln(w, "  ", x)` puts one more space between the operands.
     // PORT: the Go `explainFile` closure increments `filesExplained`; here

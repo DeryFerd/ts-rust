@@ -2204,7 +2204,7 @@ fn json_append_multiline_pieces(
 }
 
 // Go: json/json.go:49 MarshalIndentWrite
-// Used by execute/tsc.go:375 showConfig (prefix "", indent four spaces).
+// Used by execute/tsc.go:405 showConfig (prefix "", indent four spaces).
 // PORT: the indented output comes from `json_marshal_indent` (see the
 // PORT notes there and on `json_marshal_write`). There is no trailing
 // newline. It goes out in the writes of Go's streaming encoder

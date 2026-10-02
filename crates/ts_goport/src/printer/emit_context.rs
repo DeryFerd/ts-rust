@@ -758,7 +758,7 @@ impl EmitContext {
         // PERF: emitast2. Copy only the fields that `copy_from` reads, not
         // the whole boxed emit node with its comment lists.
         if let Some(source) = emit_nodes.try_get(original).map(|e| e.copied_fields()) {
-            emit_nodes.get(node).copy_from(&source);
+            emit_nodes.get(node).copy_from(source);
         }
     }
 
@@ -924,15 +924,17 @@ impl EmitNode {
         }
     }
 
-    // Go: printer/emitcontext.go:542 copyFrom
+    // Go: printer/emitcontext.go:562 copyFrom
     // NOTE: This method is not guaranteed to be thread-safe
-    pub(crate) fn copy_from(&mut self, source: &EmitNode) {
+    // PORT: `source` is a copy (`copied_fields`), so its map and helper
+    // list move here; Go clones them (`maps.Clone`, `slices.Clone`).
+    pub(crate) fn copy_from(&mut self, source: EmitNode) {
         self.flags = source.flags;
         self.emit_flags = source.emit_flags;
         self.comment_range = source.comment_range;
         self.source_map_range = source.source_map_range;
-        self.token_source_map_ranges = source.token_source_map_ranges.clone();
-        self.helpers = source.helpers.clone();
+        self.token_source_map_ranges = source.token_source_map_ranges;
+        self.helpers = source.helpers;
         self.external_helpers_module_name = source.external_helpers_module_name;
         if let Some(snippet_element) = source.snippet_element {
             self.snippet_element = Some(snippet_element);

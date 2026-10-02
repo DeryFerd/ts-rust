@@ -553,12 +553,14 @@ fn go_runtime_start() {
 /// to the launcher in a worker (`send_code`) and exits 2 (`EXIT_GO_PANIC`,
 /// the exit code of a Go fatal error). An error of the write (a closed or
 /// broken stderr) is ignored, as in Go.
-/// It flushes nothing and takes no std lock, so it cannot wait for the work
-/// thread: that thread can hold the stdout or stderr lock in a write that
-/// blocks on a full pipe. Go flushes nothing either (`os.Stdout` has no
-/// buffer). So it ends with `_exit`: `std::process::exit` flushes the std
-/// stdout buffer when no other thread holds its lock, and waits when
-/// another thread is in its cleanup.
+/// First it writes the stdout bytes that a report keeps on a regular file
+/// (`stdio::flush_cli_stdout_at_exit`), so the file has the pieces written
+/// so far, as Go's has (`os.Stdout` has no buffer). It skips them when
+/// another thread holds their lock. It waits for no lock, so it cannot
+/// wait for the work thread: that thread can hold the stdout or stderr
+/// lock in a write that blocks on a full pipe. So it ends with `_exit`:
+/// `std::process::exit` flushes the std stdout buffer when no other thread
+/// holds its lock, and waits when another thread is in its cleanup.
 #[cfg(target_os = "linux")]
 fn throw(name: &str) -> ! {
     ts_goport::execute::tsc::stdio::flush_cli_stdout_at_exit();
