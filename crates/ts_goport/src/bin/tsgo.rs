@@ -196,6 +196,8 @@ fn launch(huge_pages: bool) -> Option<i32> {
     args.next()?;
     let args: Vec<_> = args.collect();
     let exe = std::env::current_exe().ok()?;
+    // Before the worker starts, so a failed start leaves no worker behind.
+    let forward = forward_signals();
     drop_go_signals();
     // Both ends keep their close-on-exec flag, so the worker and the
     // processes it starts get neither. The worker opens `write` again by
@@ -208,7 +210,9 @@ fn launch(huge_pages: bool) -> Option<i32> {
         .args(args)
         .spawn()
         .ok()?;
-    forward_signals(&worker);
+    if let Some(forward) = forward {
+        let _ = forward.send(rustix::process::Pid::from_child(&worker));
+    }
     // `write` stays open until the worker ends, so the read below ends when
     // the code comes or when the worker has ended without it. The thread
     // does not reap the worker (`NOWAIT`): `wait` below does. When the
@@ -288,36 +292,41 @@ fn end_with_launcher(launcher: rustix::process::Pid) {
 }
 
 /// Sends each SIGINT and SIGTERM and each signal that Go throws
-/// (`GO_THROWN`) that the launcher gets on to `worker`, on a thread. So a
+/// (`GO_THROWN`) that the launcher gets on to the worker, on a thread. So a
 /// signal reaches the work as in a run without a worker: `notify_context`
 /// catches SIGINT and SIGTERM there, and a plain compile goes on, as in
 /// Go; SIGQUIT prints its name there once, also when it went to the whole
 /// process group. Without this, the signal would end the launcher and then
 /// the parent death signal would kill the worker.
+/// `launch` calls it before it starts the worker and sends the worker's pid
+/// to the returned sender; a signal that comes first waits for it. When no
+/// worker starts, `launch` drops the sender and the thread ends.
 /// The thread starts as a Go runtime thread does (`GoThread`): when the OS
-/// refuses it, the launcher ends with Go's text and exit 2, and the parent
-/// death signal kills the worker. Go has no launcher, so its process gets
+/// refuses it, the launcher ends with Go's text and exit 2, before there is
+/// a worker that could go on alone (a worker whose launcher has ended runs
+/// as a plain tsgo, see `worker`). Go has no launcher, so its process gets
 /// every signal; a launcher that went on without this thread would drop
 /// them (dropping `signals` removes their actions, not their handlers).
 #[cfg(target_os = "linux")]
-fn forward_signals(worker: &std::process::Child) {
+fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
     use signal_hook::consts::{SIGINT, SIGTERM};
-    let pid = rustix::process::Pid::from_child(worker);
     let thrown = GO_THROWN.iter().map(|(signal, _)| signal.as_raw());
-    let Ok(mut signals) =
-        signal_hook::iterator::Signals::new([SIGINT, SIGTERM].into_iter().chain(thrown))
-    else {
-        return;
-    };
+    let mut signals =
+        signal_hook::iterator::Signals::new([SIGINT, SIGTERM].into_iter().chain(thrown)).ok()?;
+    let (send, receive) = std::sync::mpsc::channel();
     ts_goport::core::GoThread::new()
         .name("forward-signals".to_string())
         .spawn(move || {
+            let Ok(pid) = receive.recv() else {
+                return;
+            };
             for signal in signals.forever() {
                 if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
                     let _ = rustix::process::kill_process(pid, signal);
                 }
             }
         });
+    Some(send)
 }
 
 /// Signals that the Go runtime catches and drops when no `signal.Notify`
