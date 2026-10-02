@@ -50,6 +50,12 @@ const { exitCode, diagnostics, files } = await tsc(["-p", "/app"], {
 `DiagnosticResponse`, with UTF-16 positions) and does not print them. Without it, `stdout` has
 tsc's usual text.
 
+In a browser, call `tsc` from a module Web Worker, as `examples/browser` does: Chrome does not let
+a page's main thread make the instance, and a run blocks the page. Serve `ts_rust.wasm` as
+`application/wasm`, so that it compiles while it downloads. To try the example, run
+`python3 -m http.server -d npm/wasm` and open `http://localhost:8000/examples/browser/`. Very deep
+nesting overflows the stack: at about 350 to 550 levels in a Chrome worker, 6,000 in Node.
+
 ## How it works
 
 - `crates/ts_wasm` is the module: `tsc` from `ts_goport` for `wasm32-wasip1`, built with the
