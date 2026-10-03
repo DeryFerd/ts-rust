@@ -394,8 +394,9 @@ impl Fs for OsFs {
 /// through one open of the directory, so the OS walks the directory part of
 /// the path once. A path that this cannot stat so (no directory part, a
 /// directory that does not open, a failed stat, a path of `PATH_MAX` bytes
-/// or more) is stat'ed by its full path, as `stat` does.
-#[cfg(unix)]
+/// or more) is stat'ed by its full path, as `stat` does. Linux only:
+/// `statx` and `O_PATH` are not on macOS.
+#[cfg(target_os = "linux")]
 pub fn os_mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<SystemTime>> {
     use rustix::fs::{AtFlags, CWD, Mode, OFlags, StatxFlags, openat, statx};
     use std::os::fd::OwnedFd;
@@ -444,8 +445,8 @@ pub fn os_mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<
     m_times
 }
 
-/// PORT: not in Go (perf). Off unix, `stat` of each path.
-#[cfg(not(unix))]
+/// PORT: not in Go (perf). Off Linux, `stat` of each path.
+#[cfg(not(target_os = "linux"))]
 pub fn os_mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<SystemTime>> {
     let fs = osvfs_fs();
     paths
