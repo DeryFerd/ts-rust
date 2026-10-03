@@ -27,10 +27,11 @@
 //! The same threads read the build info file of each task ahead of its
 //! up-to-date check (`BuildInfoRead`; orchestrator.rs `BuildInfoPrefetch`).
 //! Go reads it in the check, on the builder goroutine of the task
-//! (buildtask.go `loadOrStoreBuildInfo`). A thread reads the build info
-//! file of a config when it has parsed it, and the orchestrator queues the
-//! read of a config that it parsed (`queue_read`), so the reads run while
-//! the graph is made. When the graph is made, the orchestrator keeps the reads that
+//! (buildtask.go `loadOrStoreBuildInfo`). A thread queues the read of the
+//! build info file of a config when it has parsed it, and the orchestrator
+//! queues the read of a config that it parsed (`queue_read`), so the reads
+//! run while the graph is made. The threads take the queued configs first:
+//! the orchestrator waits for each config before it makes the graph. When the graph is made, the orchestrator keeps the reads that
 //! its checks can use (`finish_reads`; the rules are in orchestrator.rs
 //! `start_build_info_prefetch`) and drops the others. A read only reads,
 //! and the build writes nothing before its graph is made. For those rules,
@@ -54,8 +55,11 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 /// The most threads of a `PrefetchPool`. The threads only read, so their
-/// count changes no output; it is not Go's `numRoutines`.
-const MAX_PREFETCH_THREADS: usize = 16;
+/// count changes no output; it is not Go's `numRoutines`. On 8 cores with
+/// 16 hardware threads, 12 or 16 threads made the noop of 48 small
+/// projects 1 ms slower than 8 (noop1, mini-abf9): the orchestrator thread
+/// shares a core with a prefetch thread.
+const MAX_PREFETCH_THREADS: usize = 8;
 
 /// What `get_file_names_from_config_specs` reads, other than the file
 /// system: two matches with equal inputs give the same file names.
@@ -631,7 +635,7 @@ fn run_thread(shared: &Arc<Shared>) {
                         TscExtendedConfigCache::default(),
                     )
                 });
-                let read = parse_config(
+                parse_config(
                     shared,
                     options,
                     host,
@@ -640,9 +644,6 @@ fn run_thread(shared: &Arc<Shared>) {
                     path,
                     &slot,
                 );
-                if let Some(read) = read {
-                    read_build_info(shared, &read);
-                }
             }
             Job::Read(job) => read_build_info(shared, &job),
         }
@@ -650,8 +651,9 @@ fn run_thread(shared: &Arc<Shared>) {
 }
 
 /// Parses `config` for its slot. Before the orchestrator can take the
-/// slot, queues its references and adds its build info read with the key
-/// of the file, which it gives to run next.
+/// slot, queues its references, and its build info read with the key of
+/// the file. It starts no thread for the read: this thread is free for it
+/// after the parse.
 fn parse_config(
     shared: &Arc<Shared>,
     options: &ParseOptions,
@@ -660,11 +662,11 @@ fn parse_config(
     config: String,
     path: Path,
     slot: &Slot,
-) -> Option<ReadJob> {
+) {
     {
         let mut state = lock(&slot.state);
         if !matches!(*state, SlotState::Queued) {
-            return None;
+            return;
         }
         *state = SlotState::Running;
     }
@@ -697,24 +699,28 @@ fn parse_config(
             .map(|(_, matched)| matched),
         Err(_) => None,
     };
-    let mut own_read = None;
     if let Ok(Some((references, read))) = parsed {
         queue_configs(shared, &references);
         if let Some(read) = read {
             let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
             let key = PathKeys::new(&fs, &shared.compare_paths_options).build_info_key(&read.name);
-            own_read = add_read(&mut lock(&shared.queue), &path, read, Some(key));
+            let mut queue = lock(&shared.queue);
+            if let Some(job) = add_read(&mut queue, &path, read, Some(key)) {
+                queue.reads.push_back(job);
+                drop(queue);
+                shared.ready.notify_one();
+            }
         }
     }
     *lock(&slot.state) = SlotState::Done(matched);
     slot.done.notify_all();
-    own_read
 }
 
 /// Reads and parses the build info file of `job` on this thread's OS file
 /// system, as the host does (`ReadBuildInfo`: read the file, then
 /// `parse_build_info`). Then makes the check parts (`StatusPrefetch`) with
-/// the mtimes of the task's TypeScript sources (`read_m_times`), unless the build info shows that the check returns before it reads them
+/// the mtimes of the task's TypeScript sources (`read_m_times`), unless
+/// the build info shows that the check returns before it reads them
 /// (errors, pending emit: `StatusCheckOptions::reads_input_times`), as Go
 /// reads no input mtime there.
 fn read_build_info(shared: &Shared, job: &ReadJob) {
