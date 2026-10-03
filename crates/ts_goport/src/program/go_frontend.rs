@@ -43,6 +43,9 @@ pub(super) struct GoSharedState {
     import_helpers_import_specifiers: FxHashMap<String, Node>,
     /// Go include processor diagnostics of each program file, by file index.
     include_diagnostics: FxHashMap<usize, Vec<Diagnostic>>,
+    /// The frontend `IncludeProcessor::diagnostics_read`: set where Go builds
+    /// the include processor diagnostics (`get_include_processor_diagnostics`).
+    include_diagnostics_read: Arc<std::sync::atomic::AtomicBool>,
     /// Go `GetParseFileRedirect` of each resolved module file name that is
     /// not a program file and has a redirect. Shared like `resolved_modules`.
     parse_file_redirects: Arc<FxHashMap<String, String>>,
@@ -1374,6 +1377,7 @@ impl GoSharedState {
             jsx_runtime_import_specifiers,
             import_helpers_import_specifiers,
             include_diagnostics,
+            include_diagnostics_read: Arc::clone(&p.include_processor.diagnostics_read),
             parse_file_redirects,
             redirect_targets,
             references,
@@ -1534,6 +1538,9 @@ impl GoSharedState {
     // Go: compiler/program.go:840 GetIncludeProcessorDiagnostics (the
     // include processor part)
     pub(super) fn get_include_processor_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        // Go builds the collection here (`includeProcessor.getDiagnostics`).
+        self.include_diagnostics_read
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.include_diagnostics
             .get(&file.file_index())
             .cloned()
