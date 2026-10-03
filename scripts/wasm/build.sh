@@ -11,8 +11,8 @@
 # needs: rustup target add wasm32-wasip1; wasm-opt (binaryen 132 or later);
 #        node
 #
-# The default is the smallest module (opt-level z, 4.4 MB). For checks 12 to
-# 18% faster at 5.4 MB:
+# The default is the smallest module (opt-level z, 4.2 MB). For checks 13 to
+# 18% faster at 5.2 MB:
 #   CARGO_PROFILE_WASM_OPT_LEVEL=s \
 #   WASM_RUSTFLAGS="-C llvm-args=-inlinehint-threshold=150" scripts/wasm/build.sh
 set -euo pipefail
