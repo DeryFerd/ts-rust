@@ -40,16 +40,18 @@ fi
 target_dir="${CARGO_TARGET_DIR:-$repo/target}"
 built="$target_dir/wasm32-wasip1/$profile/ts_wasm.wasm"
 mkdir -p "$(dirname "$out")"
+# Both paths use `cargo rustc`, so the capped runner builds with the default
+# toolchain, as CI and macOS do (it picks nightly only for `cargo build`).
+cargo_rustc=("${cargo_cmd[@]}" rustc --profile "$profile" -p ts_wasm --lib --target wasm32-wasip1)
 if [[ "$opt" == none ]]; then
-  "${cargo_cmd[@]}" build --profile "$profile" -p ts_wasm --target wasm32-wasip1
+  "${cargo_rustc[@]}"
   cp "$built" "$out"
 else
   # order-functions.mjs needs the function names, so the link keeps them
   # (-C strip=debuginfo). Only the final crate gets the flag: a profile
   # change would change every crate's hash, so every symbol name and some
   # of the code.
-  "${cargo_cmd[@]}" rustc --profile "$profile" -p ts_wasm --lib --target wasm32-wasip1 \
-    -- -C strip=debuginfo
+  "${cargo_rustc[@]}" -- -C strip=debuginfo
   # The features that rustc enables for wasm32-wasip1 by default.
   features=(--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext
     --enable-mutable-globals --enable-multivalue --enable-reference-types)
@@ -62,7 +64,7 @@ else
   # 2. wasm-opt -g: optimize, and keep those names.
   # 3. key: name each function with its position in the new order.
   # 4. Reorder, and strip the names. -s 2 runs no pass, but lets the writer
-  #    optimize the stack IR as the -Oz run did (else 8.8 KB larger).
+  #    optimize the stack IR as the -Oz run did (else about 8 KB larger).
   node "$repo/scripts/wasm/order-functions.mjs" hide "$built" "$tmp/hidden.wasm"
   # shellcheck disable=SC2086
   wasm-opt $opt "${features[@]}" -g "$tmp/hidden.wasm" -o "$tmp/opt.wasm"
