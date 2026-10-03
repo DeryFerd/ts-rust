@@ -64,8 +64,9 @@ To try the example, run `python3 -m http.server -d npm/wasm` and open
 ## How it works
 
 - `crates/ts_wasm` is the module: `tsc` from `ts_goport` for `wasm32-wasip1`. The `wasm` cargo
-  profile (opt-level z, fat LTO) and wasm-opt make it 4.2 MB (1.8 MB gzip, 1.5 MB brotli). The
-  libs are in it as one LZMA stream (0.31 MB), and the diagnostic message texts are packed too.
+  profile (opt-level z, fat LTO) and wasm-opt make it 4.2 MB (1.8 MB gzip, 1.5 MB brotli) with
+  Rust 1.98.1. Rust 1.93.0 makes it 2% bigger, with the same output. The libs are in it as one
+  LZMA stream (0.31 MB), and the diagnostic message texts are packed too.
   `scripts/wasm/order-functions.mjs` puts similar functions next to each other, so gzip and
   brotli find more matches. `scripts/wasm/build.sh` tells how to build a module that checks 13
   to 18% faster at 5.2 MB.
