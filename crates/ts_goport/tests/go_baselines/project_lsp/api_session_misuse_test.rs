@@ -1,6 +1,8 @@
 //! Port-only tests of API requests on input that Go does not expect
 //! (optapifuzz1). Go panics, and the API answers the panic text; the port
-//! must panic at the same request with the same text.
+//! must panic at the same request with the same text. The tests at the end
+//! read source text that is not valid UTF-8 (jsdocapi1 open items and
+//! residuals), where the answers must hold Go's numbers.
 //!
 //! PORT: the tests call the session handlers directly, as the Go session
 //! tests do, and catch the panic that the server would turn into the
@@ -12,16 +14,17 @@ use std::rc::Rc;
 use ts_goport::api::{
     self, CheckerNodeParams, CheckerSymbolParams, CheckerTypeParams, CreateSnapshotParams,
     GetCompletionsAtPositionParams, GetContextualTypeForArgumentParams, GetContextualTypeParams,
-    GetDefaultProjectForFileParams, GetSymbolAtPositionParams, GetTypeAtPositionParams,
-    GetTypeFromTypeNodeParams, GetTypePropertyParams, NodeHandle,
-    SignatureToSignatureDeclarationParams, SnapshotID, SnapshotRequestChangesParams,
-    TypeToTypeNodeParams,
+    GetDefaultProjectForFileParams, GetDiagnosticsParams, GetSourceFileParams,
+    GetSymbolAtPositionParams, GetTypeAtPositionParams, GetTypeFromTypeNodeParams,
+    GetTypePropertyParams, NodeHandle, SignatureToSignatureDeclarationParams, SnapshotID,
+    SnapshotRequestChangesParams, SourceFileResponse, TypeToTypeNodeParams,
 };
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::parser::{self, SourceFileParseOptions};
 use ts_goport::frontend::tspath::Path;
 use ts_goport::gostd::context::Context;
+use ts_goport::scanner_util::go_string_from_bytes;
 use ts_goport::{program, project};
 
 use super::api_util::{doc, nil_error};
@@ -431,4 +434,149 @@ fn project_types_have_go_package_names() {
         "project.SyntheticProjectID"
     );
     assert_eq!(go_type_name::<project::ID>(), "project.ID");
+}
+
+const B_TS: &str = "/home/projects/p/b.ts";
+const B_JS: &str = "/home/projects/p/b.js";
+
+/// An API session with `file` of the Go bytes `text` (in the port form) in
+/// a project with the compiler options `options`.
+fn api_b(file: &str, options: &str, text: &[u8]) -> Api {
+    let text = go_string_from_bytes(text.to_vec());
+    Api::new(
+        &[
+            (
+                "/home/projects/p/tsconfig.json",
+                &format!("{{\"compilerOptions\":{options}}}"),
+            ),
+            (file, &text),
+        ],
+        file,
+    )
+}
+
+/// Go's panic text of `getCompletionsAtPosition` at `position` of `file`,
+/// with the trigger character `trigger`.
+fn completions_panic_text(api: &Api, file: &str, position: u32, trigger: Option<&str>) -> String {
+    go_panic_text(|| {
+        api.session.handle_get_completions_at_position(
+            &api.ctx,
+            &GetCompletionsAtPositionParams {
+                snapshot: api.snapshot,
+                project: api.project.clone(),
+                file: doc(file),
+                position,
+                trigger_character: trigger.map(str::to_string),
+                ..Default::default()
+            },
+        )
+    })
+}
+
+child_test! {
+    // jsdocapi1 open item 3 (F4 residual): past the text, with a trigger character
+    // that passes Go's trigger check, Go's first read of the position is
+    // still the JSDoc snippet slice (jsdoc_snippet.go:77), and "*" reads it
+    // in the check (completions.go:3312). The port ran with i32::MAX there.
+    // In a text with an invalid byte, the port counted its port bytes in
+    // the position and the length. Each text is Go N's answer.
+    fn completions_past_the_text_panic_with_go_texts() {
+        let api = api_a();
+        for trigger in [".", "@", "*"] {
+            assert_eq!(
+                completions_panic_text(&api, A_TS, 1 << 31, Some(trigger)),
+                format!(
+                    "runtime error: slice bounds out of range [:2147483648] with length {}",
+                    A_TEXT.len()
+                ),
+                "{trigger}"
+            );
+        }
+        api.close();
+
+        let api = api_b(B_TS, "{}", b"const s = \"\xff\";\n");
+        for (position, trigger, bound) in [
+            (1000, None, 1000),
+            (2147483647, None, 2147483647),
+            (2147483647, Some("."), 2147483647),
+            (u32::MAX, Some("*"), u32::MAX),
+        ] {
+            assert_eq!(
+                completions_panic_text(&api, B_TS, position, trigger),
+                format!("runtime error: slice bounds out of range [:{bound}] with length 15"),
+                "{position} {trigger:?}"
+            );
+        }
+        api.close();
+    }
+}
+
+child_test! {
+    // jsdocapi1 open item 1: the content hash in the getSourceFile header
+    // (bytes 4-19) is Go's xxh3-128 of the Go bytes of the file
+    // (project/overlayfs.go:86). The port hashed the port form of an
+    // invalid byte, a WTF-8 surrogate and a real U+FDD0. The expected bytes
+    // are Go N's.
+    fn source_file_hash_is_the_hash_of_the_go_bytes() {
+        let api = api_b(B_TS, "{}", b"const s = \"\xff\xed\xa0\x80\xef\xb7\x90\";\n");
+        let response = nil_error(api.session.handle_get_source_file(
+            &api.ctx,
+            &GetSourceFileParams {
+                snapshot: api.snapshot,
+                project: api.project.clone(),
+                file: doc(B_TS),
+            },
+        ))
+        .expect("a source file");
+        let data = &response
+            .downcast_ref::<SourceFileResponse>()
+            .expect("a SourceFileResponse")
+            .data;
+        let encoded = nil_error(api::base64_std_encoding_decode_string(data));
+        let hash: String = encoded[4..20].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hash, "1751d260c9cc7ac5edbaf1f5e182f05f");
+        api.close();
+    }
+}
+
+child_test! {
+    // jsdocapi1 A residual: a JSDoc comment at the end of a JS file whose
+    // cut keeps 2 bytes of a real U+FDD0 followed by 1 byte. The cut text
+    // position after the first kept byte equals the comment end there, and
+    // the port kept it as the comment end. Go's TS1069 (an unexpected token
+    // at the first kept byte) ends 1 byte into the U+FDD0. Go N's answer:
+    // pos 45, end 46, 1:14 to 1:15.
+    fn jsdoc_diagnostic_inside_a_real_fdd0_at_the_cut() {
+        let api = api_b(
+            B_JS,
+            "{\"allowJs\":true,\"checkJs\":true}",
+            b"function f(a, b) { return a; }\n/** @template \xef\xb7\x90y",
+        );
+        let diagnostics = nil_error(api.session.handle_get_semantic_diagnostics(
+            &api.ctx,
+            &GetDiagnosticsParams {
+                snapshot: api.snapshot,
+                project: api.project.clone(),
+                files: Some(vec![doc(B_JS)]),
+            },
+        ));
+        let found: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == 1069)
+            .map(|d| {
+                let (start, end) = (
+                    d.start_position.as_ref().expect("a start position"),
+                    d.end_position.as_ref().expect("an end position"),
+                );
+                (
+                    d.pos,
+                    d.end,
+                    (start.line, start.character),
+                    (end.line, end.character),
+                )
+            })
+            .collect();
+        assert_eq!(found, [(45, 46, (1, 14), (1, 15))]);
+        api.close();
+    }
 }

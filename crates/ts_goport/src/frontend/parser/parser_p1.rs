@@ -190,8 +190,6 @@ pub struct Parser<'a> {
     /// list or diagnostic that ends there or later may need a map to the
     /// file (`jsdoc_tail_pos`).
     pub jsdoc_tail_first: i32,
-    /// The comment end of the JSDoc text in parse.
-    pub jsdoc_tail_end: i32,
 }
 
 // Go: parser.go:104 newParser
@@ -229,7 +227,6 @@ pub fn new_parser<'a>() -> Parser<'a> {
         store: 0,
         jsdoc_cut_text: None,
         jsdoc_tail_first: i32::MAX,
-        jsdoc_tail_end: 0,
     };
     res.initialize_closures();
     res

@@ -328,6 +328,12 @@ impl<T: Send + 'static> Drop for DropInBackground<T> {
 /// here when that thread cannot start. A value still queued at exit is not
 /// freed.
 fn drop_in_background<T: Send + 'static>(value: T) {
+    // wasm32-wasip1 has no threads, so the thread cannot start. Saying so
+    // leaves the thread out of the wasm module.
+    if cfg!(target_family = "wasm") {
+        drop(value);
+        return;
+    }
     type Garbage = Box<dyn Send>;
     static QUEUE: std::sync::OnceLock<Option<Mutex<std::sync::mpsc::Sender<Garbage>>>> =
         std::sync::OnceLock::new();

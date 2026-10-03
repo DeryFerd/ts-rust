@@ -14,8 +14,11 @@ use std::sync::OnceLock;
 /// Go `runtime.GOMAXPROCS(0)` at start: the `GOMAXPROCS` variable when it
 /// is a positive number, else the CPUs that this process may run on,
 /// lowered to the CPU limit of its cgroup (rounded up, at least 2). Read
-/// once.
+/// once. On wasm it is 1: there is one thread.
 pub fn gomaxprocs() -> usize {
+    if cfg!(target_family = "wasm") {
+        return 1;
+    }
     static PROCS: OnceLock<usize> = OnceLock::new();
     *PROCS.get_or_init(|| {
         // Go: proc.go:935 strconv.ParseInt(gogetenv("GOMAXPROCS"), 10, 32), n > 0

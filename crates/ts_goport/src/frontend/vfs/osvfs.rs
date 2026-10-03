@@ -201,13 +201,17 @@ pub struct OsFs {
 // Go: os.go:46 isFileSystemCaseSensitive
 // We do this right at startup to minimize the chance that executable gets moved or deleted.
 // PORT: Go computes this in package init. The port computes it on first use.
-// The wasm branch does not apply to the port.
 fn is_file_system_case_sensitive() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
     *VALUE.get_or_init(|| {
         // win32/win64 are case insensitive platforms
         if cfg!(windows) {
             return false;
+        }
+
+        if cfg!(target_family = "wasm") {
+            // !!! Who knows; this depends on the host implementation.
+            return true;
         }
 
         // As a proxy for case-insensitivity, we check if the current executable exists under a different case.

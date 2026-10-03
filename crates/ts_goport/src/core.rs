@@ -412,7 +412,29 @@ impl PartialEq<Name> for String {
 
 /// The names of the bundled lib files, made by
 /// `crates/ts_goport/scripts/gen-lib-names.py` (`intern::lib_name`).
+#[cfg(not(target_family = "wasm"))]
 mod lib_names;
+
+/// wasm: an empty lib name table, so a lib name goes through the shards
+/// like any other name. The table only makes interning faster. Only the lib
+/// snapshots need its stable ids (`Name::stable_id`), and wasm reads no
+/// snapshot (`bundled::bundled_lib_name`). No output depends on an id:
+/// `Name` hashes and orders by its text, and tables compare ids only for
+/// equality.
+// PERF: the table is 184 KB of data. Without it the module is 185 KB
+// smaller raw, 75 KB smaller with gzip -9 and 62 KB smaller with brotli
+// -q 11. `scripts/wasm/bench.mjs` (query core, hono, zod; 10 interleaved
+// rounds) put each warm and cold median within -2.1% to +0.9% of the
+// module with the table. Packing the names with LZMA and building the
+// same table on first use saved only 37 KB gzip, and was not faster.
+#[cfg(target_family = "wasm")]
+mod lib_names {
+    pub(super) const COUNT: usize = 0;
+    pub(super) const BUCKET_BITS: u32 = 0;
+    pub(super) static TEXT: &str = "";
+    pub(super) static OFFSETS: [u32; COUNT + 1] = [0];
+    pub(super) static BUCKETS: [u16; (1 << BUCKET_BITS) + 1] = [0, 0];
+}
 
 /// The process-wide string interner behind `Name`. Text is copied once into
 /// leaked blocks and never freed. A name id is `seq << 1 | internal`, where
@@ -572,9 +594,65 @@ mod intern {
     /// Fx hash of `s`. Symbol tables use it too.
     #[inline]
     pub(super) fn hash_str(s: &str) -> u64 {
-        let mut hasher = rustc_hash::FxHasher::default();
-        hasher.write(s.as_bytes());
-        hasher.finish()
+        #[cfg(target_pointer_width = "64")]
+        {
+            let mut hasher = rustc_hash::FxHasher::default();
+            hasher.write(s.as_bytes());
+            hasher.finish()
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        fx_hash_64(s.as_bytes())
+    }
+
+    /// `rustc_hash::FxHasher` (2.1.2) of `bytes` as it is on a 64-bit
+    /// target. On a 32-bit target (wasm32) FxHasher gives a 32-bit hash,
+    /// whose top 32 bits are 0. A shard map (`HashIsKey`) on a 32-bit
+    /// target reads only the top 32 bits, so it needs this full hash.
+    #[cfg(any(test, not(target_pointer_width = "64")))]
+    fn fx_hash_64(bytes: &[u8]) -> u64 {
+        const K: u64 = 0xf135_7aea_2e62_a9c5;
+        const SEED1: u64 = 0x243f_6a88_85a3_08d3;
+        const SEED2: u64 = 0x1319_8a2e_0370_7344;
+        const PREVENT_TRIVIAL_ZERO_COLLAPSE: u64 = 0xa409_3822_299f_31d0;
+        let multiply_mix = |x: u64, y: u64| {
+            let full = u128::from(x).wrapping_mul(u128::from(y));
+            (full as u64) ^ ((full >> 64) as u64)
+        };
+        let word = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8 bytes"));
+        let len = bytes.len();
+        let mut s0 = SEED1;
+        let mut s1 = SEED2;
+        if len <= 16 {
+            if len >= 8 {
+                s0 ^= word(&bytes[0..8]);
+                s1 ^= word(&bytes[len - 8..]);
+            } else if len >= 4 {
+                s0 ^= u64::from(u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")));
+                s1 ^= u64::from(u32::from_le_bytes(
+                    bytes[len - 4..].try_into().expect("4 bytes"),
+                ));
+            } else if len > 0 {
+                s0 ^= u64::from(bytes[0]);
+                s1 ^= (u64::from(bytes[len - 1]) << 8) | u64::from(bytes[len / 2]);
+            }
+        } else {
+            let mut bulk = &bytes[..len - 1];
+            while let Some((chunk, rest)) = bulk.split_first_chunk::<16>() {
+                let t = multiply_mix(
+                    s0 ^ word(&chunk[..8]),
+                    PREVENT_TRIVIAL_ZERO_COLLAPSE ^ word(&chunk[8..]),
+                );
+                s0 = s1;
+                s1 = t;
+                bulk = rest;
+            }
+            let suffix = &bytes[len - 16..];
+            s0 ^= word(&suffix[0..8]);
+            s1 ^= word(&suffix[8..16]);
+        }
+        // `FxHasher::write` adds the byte hash, and `finish` rotates.
+        let hash = multiply_mix(s0, s1) ^ (len as u64);
+        hash.wrapping_mul(K).rotate_left(26)
     }
 
     /// Chunk and slot of `id`, by its sequence number `id >> 1`.
@@ -832,6 +910,34 @@ mod intern {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// `fx_hash_64` gives the 64-bit FxHasher values of rustc-hash
+        /// 2.1.2's own `tests::bytes`, and the 64-bit `hash_str` for texts
+        /// of each length class of its byte hash.
+        #[test]
+        fn fx_hash_64_matches_fx_hasher() {
+            for (bytes, want) in [
+                (&b""[..], 17_606_491_139_363_777_937),
+                (b"\x00", 5_448_590_020_104_574_886),
+                (b"\x00\x00\x00\x00\x00\x00", 16_766_921_560_080_789_783),
+                (b"\x01", 5_922_447_956_811_044_110),
+                (b"\x02", 5_229_781_508_510_959_783),
+                (b"uwu", 7_168_164_714_682_931_527),
+                (
+                    b"These are some bytes for testing rustc_hash.",
+                    2_349_210_501_944_688_211,
+                ),
+            ] {
+                assert_eq!(fx_hash_64(bytes), want, "{bytes:?}");
+            }
+            #[cfg(target_pointer_width = "64")]
+            for len in 0..40u32 {
+                let text: String = (0..len)
+                    .map(|i| char::from(b'a' + (i * 7 % 26) as u8))
+                    .collect();
+                assert_eq!(fx_hash_64(text.as_bytes()), hash_str(&text), "{text:?}");
+            }
+        }
 
         /// Every lib name is found at its own index. A failure after a
         /// rustc-hash update means the `hash_str` copy in
