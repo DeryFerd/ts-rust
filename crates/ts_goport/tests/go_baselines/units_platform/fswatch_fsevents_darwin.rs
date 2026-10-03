@@ -179,7 +179,7 @@ fn test_fs_events_shared_stream_routes_events() {
     });
 }
 
-// Go: fsevents_darwin_shared_test.go:111 setupFSEventsConsolidatedParent
+// Go: fsevents_darwin_shared_test.go:113 setupFSEventsConsolidatedParent
 fn setup_fs_events_consolidated_parent(t: &T) -> (Arc<dyn Watcher>, String) {
     let watcher = new_test_fs_events_watcher();
     let parent = join(&new_t_tmp_dir(t), "parent");
