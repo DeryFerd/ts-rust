@@ -275,6 +275,16 @@ fn last_stats() -> LoadStats {
     resolve_ahead::last_stats().expect("no resolve-ahead load")
 }
 
+/// Ends this test process when the test has not ended after `seconds`, so
+/// a load that waits forever fails the test.
+fn watchdog(seconds: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(seconds));
+        eprintln!("watchdog: the test did not end in {seconds} s");
+        std::process::exit(3);
+    });
+}
+
 os_child_test! {
     /// An import edit: every key of the previous load is taken, and the
     /// load is the same as a serial one.
@@ -466,6 +476,29 @@ os_child_test! {
         resolve_ahead::set_mode(None);
         drop(session);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+os_child_test! {
+    /// A worker that panics outside a resolution (a port bug; a test hook
+    /// makes one) must not make a load that waits for the workers
+    /// (`Mode::Force`) wait forever, nor leave the pool: that load resolves
+    /// its keys itself, and the next load takes every answer again.
+    fn a_worker_panic_outside_a_resolution_makes_the_load_serial() {
+        watchdog(120);
+        let stats = same_with_and_without("panic", &|session, root| {
+            open_index(session, root);
+            resolve_ahead::inject_worker_panic(true);
+            add_import(session, root);
+            resolve_ahead::inject_worker_panic(false);
+            if let Some(stats) = resolve_ahead::last_stats() {
+                assert!(stats.worker_panic, "{stats:?}");
+                assert_eq!(stats.loader.taken, 0, "{stats:?}");
+            }
+            edit_index(session, root, 3, "import { b as b2 } from \"./sub/b\";\n");
+        });
+        assert!(!stats.worker_panic, "{stats:?}");
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
     }
 }
 

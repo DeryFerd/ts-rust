@@ -37,6 +37,8 @@ thread_local! {
     static MODE: Cell<Option<Mode>> = const { Cell::new(None) };
     /// The counts of the last resolve-ahead load on this thread.
     static LAST_STATS: Cell<Option<LoadStats>> = const { Cell::new(None) };
+    /// `inject_worker_panic` on this thread.
+    static INJECT_PANIC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Sets the mode of the program loads on this thread, in place of
@@ -69,12 +71,22 @@ pub struct LoadStats {
     /// The known files that the workers of this load started with
     /// (`WorkerState::known_files`). 0 when the load had no workers.
     pub known_files: usize,
+    /// A worker panicked outside a resolution during this load, and the
+    /// loader resolved the rest of the keys itself (`run_task`).
+    pub worker_panic: bool,
 }
 
 /// The counts of the last resolve-ahead load on this thread. For tests.
 #[must_use]
 pub fn last_stats() -> Option<LoadStats> {
     LAST_STATS.with(Cell::get)
+}
+
+/// Makes the workers of the loads on this thread panic outside a
+/// resolution, as a port bug would (`run_task`). For tests.
+#[doc(hidden)]
+pub fn inject_worker_panic(on: bool) {
+    INJECT_PANIC.with(|inject| inject.set(on));
 }
 
 /// Takes the workers, as a load on another thread does, until the guard
@@ -260,6 +272,7 @@ impl ResolveAhead {
                     view: host.view,
                     stats: WorkerStats::default(),
                     config: config.clone(),
+                    inject_panic: INJECT_PANIC.with(Cell::get),
                 })
             });
         if let Some(job) = &job {
@@ -311,6 +324,7 @@ impl ResolveAhead {
         };
         let loader = link.stats.get();
         let known_files = self.job.as_ref().map_or(0, |job| job.known_files.len());
+        let worker_panic = link.queue.as_ref().is_some_and(|queue| queue.failed());
         // A rejected answer can come from a kept package.json parse or a
         // known file that changed: the workers drop both now, so the next
         // job starts with neither, even when a load on another thread has
@@ -325,6 +339,11 @@ impl ResolveAhead {
             Some(Box::new((link.answers.take(), link.queue.take()))),
             loader.rejected > 0,
         );
+        if worker_panic {
+            debug_log(format_args!(
+                "resolve-ahead: a worker panicked; the load resolved its other keys itself"
+            ));
+        }
         let Some(keep_keys) = self.keep_keys.take() else {
             return;
         };
@@ -334,6 +353,7 @@ impl ResolveAhead {
             new_keys: keys.len(),
             loader,
             known_files,
+            worker_panic,
         };
         LAST_STATS.with(|last| last.set(Some(stats)));
         debug_log(format_args!("resolve-ahead: {stats:?}"));
@@ -671,27 +691,65 @@ fn run_worker(workers: &'static Workers) {
     }
 }
 
-/// Runs `task` on a worker.
+/// Runs `task` on a worker. A panic outside the `go_recover` of the
+/// resolutions (a port bug) would end the thread: a loader that waits for
+/// the workers to leave its job (`Mode::Force`) would then wait forever,
+/// and the pool would have one worker less with no word. The worker
+/// catches it and stays in the pool. A job that panicked fails: its loader
+/// resolves the rest of its keys itself (`AheadQueue::fail`). The panic
+/// hook of the bin prints the panic as for any other, and the debug log
+/// (`GOPORT_RESOLVE_AHEAD_STATS`) has a line for it.
+// PORT: not in Go (perf).
 fn run_task(workers: &Workers, task: Task) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     match task {
         Task::Run(job) => {
-            run_job(&job);
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| run_job(&job))) {
+                job.closed.store(true, Ordering::Relaxed);
+                job.queue.fail();
+                // The thread's resolve-ahead state holds the job.
+                drop(end_ahead_thread());
+                log_panic("job", payload.as_ref());
+            }
             job.left.fetch_add(1, Ordering::Release);
             drop(job);
             let _state = lock_state(workers);
             workers.left.notify_all();
         }
         Task::Free(ended) => {
-            ended.free(workers);
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| ended.free(workers))) {
+                log_panic("free", payload.as_ref());
+            }
             let mut state = lock_state(workers);
             state.frees -= 1;
             if state.frees == 0 {
                 workers.left.notify_all();
             }
         }
-        Task::Drop(value) => drop(value),
-        Task::Forget => drop(KEPT.with(|kept| kept.borrow_mut().take())),
+        Task::Drop(value) => {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
+                log_panic("drop", payload.as_ref());
+            }
+        }
+        Task::Forget => {
+            let kept = KEPT.with(|kept| kept.borrow_mut().take());
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(kept))) {
+                log_panic("forget", payload.as_ref());
+            }
+        }
     }
+}
+
+/// Writes a worker panic that `run_task` caught to the debug log.
+fn log_panic(task: &str, payload: &(dyn std::any::Any + Send)) {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or_default();
+    debug_log(format_args!(
+        "resolve-ahead: a worker panicked in a {task} task: {message}"
+    ));
 }
 
 /// The workers' part of one load.
@@ -713,13 +771,17 @@ struct Job {
     /// keeps the loader's.
     stats: WorkerStats,
     config: Arc<ResolverConfig>,
+    /// `inject_worker_panic` (tests): each worker panics in the job,
+    /// outside its resolutions.
+    inject_panic: bool,
 }
 
 /// A worker's part of `job`: resolves the next key until none is left or
 /// the job ends. A resolution that panics (a Go panic) panics on the loader
 /// too when it resolves the same key; the worker ends that key with no
-/// answer and leaves the job. The worker's resolver and its caches are
-/// freed here, on the worker.
+/// answer and leaves the job. A panic outside the resolutions fails the
+/// job (`run_task`). The worker's resolver and its caches are freed here,
+/// on the worker.
 fn run_job(job: &Arc<Job>) {
     let view = &job.view;
     let (package_jsons, reads, kept) = KeptPackageJsons::take(job);
@@ -738,6 +800,9 @@ fn run_job(job: &Arc<Job>) {
         kept,
         directory_exists,
     );
+    if job.inject_panic {
+        panic!("resolve ahead: a worker panic outside a resolution (inject_worker_panic)");
+    }
     let fs: Rc<dyn Fs> = fs;
     let mut resolver = job.config.new_resolver(fs, Some(package_jsons.clone()));
     resolver.caches.shared = Some(SharedResolutionLink {

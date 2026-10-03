@@ -269,6 +269,8 @@ pub struct AheadQueue {
     waiting: std::sync::atomic::AtomicUsize,
     done_lock: std::sync::Mutex<()>,
     done_cv: std::sync::Condvar,
+    /// A worker panicked outside a resolution (`fail`).
+    failed: std::sync::atomic::AtomicBool,
 }
 
 const KEY_FREE: u8 = 0;
@@ -302,7 +304,22 @@ impl AheadQueue {
             waiting: std::sync::atomic::AtomicUsize::new(usize::MAX),
             done_lock: std::sync::Mutex::new(()),
             done_cv: std::sync::Condvar::new(),
+            failed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// A worker panicked outside a resolution (compiler/resolve_ahead.rs
+    /// `run_task`): the loader takes no more answers of this load and
+    /// resolves the rest of its keys itself.
+    pub fn fail(&self) {
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `fail` was called.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn lock_done(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -448,7 +465,8 @@ pub struct AheadStats {
     pub taken: usize,
     /// Worker answers that failed the check.
     pub rejected: usize,
-    /// Keys with no worker answer (not resolved yet, new or not shareable).
+    /// Keys with no worker answer (not resolved yet, new or not shareable),
+    /// or after a worker panic (`AheadQueue::fail`).
     pub missing: usize,
     /// Keys whose worker answer the loader waited for.
     pub waited: usize,
@@ -1012,6 +1030,11 @@ impl Caches {
         }
         let answers = ahead.answers.as_ref()?;
         let mut stats = ahead.stats.get();
+        if ahead.queue.as_ref().is_some_and(|queue| queue.failed()) {
+            stats.missing += 1;
+            ahead.stats.set(stats);
+            return None;
+        }
         let mut found = answers.get_module(&key);
         if redirect_config_name.is_empty()
             && let Some(queue) = &ahead.queue
