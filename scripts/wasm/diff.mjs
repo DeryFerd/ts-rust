@@ -52,6 +52,13 @@ const json = value => `${JSON.stringify(value, null, 2)}\n`;
 // The small cases that this harness writes. Paths are relative to the case
 // dir, `links` maps a path to a symlink target.
 const inline = {
+    "external-diag": {
+        files: {
+            "tsconfig.json": json({ compilerOptions: { strict: true, incremental: true, noEmit: true, types: [] } }),
+            "index.ts": `export const a: number = "x";\n`,
+            "b.ts": "export const b = 1;\n",
+        },
+    },
     // Unique symbols of the same name in several files, in mapped types and
     // unions, across the checkers of a 4-checker program. Their member
     // names hold symbol ids (`__@key@<id>`), and members with no
@@ -454,7 +461,8 @@ export const message = \`\${greet(user)} \${version}\`;
  * `steps` are the tsc argument lists, run in order in the same dir.
  * `buildInfo` adds --tsBuildInfoFile (composite configs). `link` runs in
  * the copy through a symlink. `noSt` leaves out the native-st side.
- * `stack` marks the cases of the worker stack sweep. `nativeSteps` are the
+ * `stack` marks the cases of the worker stack sweep. `before[i](cwd)` edits
+ * the files before step i. `nativeSteps` are the
  * native sides' steps when the wasm output must equal another native run:
  * the wasm build has no message catalogs, so its `--locale` output is the
  * English one.
@@ -533,11 +541,32 @@ function cases(inputs) {
             input: "inline",
             steps: [["-b", "app"], ["-b", "app"], ["-b", "app", "--clean"]],
         },
+        // The second run reads a build info whose diagnostic is an external
+        // one (a content mapper's: no message key, a source and a text), and
+        // writes it again because b.ts changed.
+        {
+            name: "external-diag",
+            input: "inline",
+            steps: [["-p", "."], ["-p", "."]],
+            before: { 1: externalDiagnosticEdit },
+        },
     ];
     for (const c of list) {
         c.root = c.input === "query" || c.input === "hono" ? path.join(inputs, c.input, "repo") : undefined;
     }
     return list;
+}
+
+/** The edit of the `external-diag` case (see there). */
+function externalDiagnosticEdit(cwd) {
+    const file = path.join(cwd, "tsconfig.tsbuildinfo");
+    const info = JSON.parse(fs.readFileSync(file, "utf8"));
+    for (const entry of info.semanticDiagnosticsPerFile) {
+        if (!Array.isArray(entry)) continue;
+        entry[1] = [{ pos: 13, end: 14, code: 1001, category: 0, source: "vue", messageText: "mapper warning" }];
+    }
+    fs.writeFileSync(file, JSON.stringify(info));
+    fs.writeFileSync(path.join(cwd, "b.ts"), "export const b = 2;\n");
 }
 
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -668,6 +697,7 @@ function runOnce(c, side, ctx, keep) {
     let rss = 0;
     const caseSteps = side === "wasm" ? c.steps : (c.nativeSteps ?? c.steps);
     for (const [i, step] of caseSteps.entries()) {
+        c.before?.[i]?.(cwd);
         const args = stepArgs(c, step, out);
         const run = timed(command(side, ctx.native, args), cwd, runEnv(c, cwd), path.join(caseDir, "time.txt"));
         ms += run.ms;
@@ -729,6 +759,7 @@ async function stackSweep(c, ctx, want) {
         let ok = true;
         let note = "";
         for (const [i, step] of c.steps.entries()) {
+            c.before?.[i]?.(cwd);
             try {
                 const result = await tsc(stepArgs(c, step, out), { cwd, stackSizeMb, env: runEnv(c, cwd) });
                 const { exit, stdout } = want.steps[i];
@@ -758,7 +789,8 @@ async function shadowStack(c, ctx, module) {
     const cwd = prepare(c, caseDir, ctx.fixtures);
     fs.rmSync(out, { recursive: true, force: true });
     let high = 0;
-    for (const step of c.steps) {
+    for (const [i, step] of c.steps.entries()) {
+        c.before?.[i]?.(cwd);
         const worker = new Worker(new URL(import.meta.url), {
             workerData: {
                 module,

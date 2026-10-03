@@ -47,6 +47,11 @@ pub struct Message {
     /// wasm packs the texts (`text`).
     #[cfg(not(target_family = "wasm"))]
     text: &'static str,
+    /// wasm: the text of a message made outside the catalog (its key is
+    /// ""): `ast::NIL_MESSAGE` and the ad hoc messages. The catalog texts
+    /// are packed.
+    #[cfg(target_family = "wasm")]
+    own_text: Option<&'static str>,
     reports_unnecessary: bool,
     elided_in_compatibility_pyramid: bool,
     reports_deprecated: bool,
@@ -64,8 +69,6 @@ impl Message {
         elided_in_compatibility_pyramid: bool,
         reports_deprecated: bool,
     ) -> Self {
-        #[cfg(target_family = "wasm")]
-        let _ = (key, text);
         Self {
             code,
             category,
@@ -73,6 +76,8 @@ impl Message {
             key,
             #[cfg(not(target_family = "wasm"))]
             text,
+            #[cfg(target_family = "wasm")]
+            own_text: if key.is_empty() { Some(text) } else { None },
             reports_unnecessary,
             elided_in_compatibility_pyramid,
             reports_deprecated,
@@ -96,12 +101,16 @@ impl Message {
     }
 
     /// wasm: the key, made from the text as Go's generator makes it
-    /// (`message_key`), once per message.
+    /// (`message_key`), once per message. A message made outside the
+    /// catalog has the key "".
     #[cfg(target_family = "wasm")]
     #[must_use]
     pub fn key(self) -> &'static str {
         use std::collections::HashMap;
         use std::sync::{Mutex, PoisonError};
+        if self.own_text.is_some() {
+            return "";
+        }
         static KEYS: Mutex<Option<HashMap<u32, &'static str>>> = Mutex::new(None);
         let mut keys = KEYS.lock().unwrap_or_else(PoisonError::into_inner);
         keys.get_or_insert_with(HashMap::new)
@@ -120,6 +129,9 @@ impl Message {
     #[cfg(target_family = "wasm")]
     #[must_use]
     pub fn text(self) -> &'static str {
+        if let Some(text) = self.own_text {
+            return text;
+        }
         static TEXTS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
         let texts = TEXTS.get_or_init(|| {
             let packed = include_bytes!(concat!(env!("OUT_DIR"), "/diagnostic_texts.lzma"));
