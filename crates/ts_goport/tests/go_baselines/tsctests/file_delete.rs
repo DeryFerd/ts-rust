@@ -2,10 +2,10 @@
 //! handleFileDelete`).
 //!
 //! PORT: Go stops at the first gone file of a random-order `SyncMap`, so
-//! Go has no stable test for two gone files where only the later one (in
-//! build info order) affects global scope. The port takes the global
-//! branch when any gone file affects global scope (the PORT comment of
-//! `handle_file_delete`). This test fixes that answer.
+//! Go takes the global branch with chance (gone global files) / (gone
+//! files) and has no stable test for it. The port takes Go's more likely
+//! answer, and the global branch on a tie (the PORT comment of
+//! `handle_file_delete`). These tests fix those answers.
 
 use ts_goport::execute::tsc::ExitStatus;
 
@@ -22,7 +22,15 @@ fn config(lib: &str) -> String {
 
 /// `tsc -p tsconfig.json --pretty false` in a command child.
 fn build(sys: &TestSys) -> ExitStatus {
-    let args = ["-p", "tsconfig.json", "--pretty", "false"].map(String::from);
+    build_with(sys, &[])
+}
+
+/// `tsc -p tsconfig.json --pretty false` and `extra` in a command child.
+fn build_with(sys: &TestSys, extra: &[&str]) -> ExitStatus {
+    let mut args = ["-p", "tsconfig.json", "--pretty", "false"]
+        .map(String::from)
+        .to_vec();
+    args.extend(extra.iter().map(|arg| arg.to_string()));
     let result = run_command_in_child(sys, &args).unwrap_or_else(|err| panic!("tsgo: {err}"));
     assert!(result.unported.is_none(), "unported {:?}", result.unported);
     result.status
@@ -85,6 +93,60 @@ fn lib_change_rechecks_when_a_later_gone_file_affects_global_scope() {
     );
     assert!(
         output.contains("error TS2304: Cannot find name 'fromInclude'."),
+        "{output}"
+    );
+}
+
+// realworld3 docusaurus (incremental rebuild after a dependency change):
+// three files leave the program and only `g.d.ts` affects global scope.
+// Go meets a module file first in 2 of 3 runs (pin 673a5f17d713: 134 of
+// 200), takes the branch that only rewrites the build info, and does not
+// emit the unchanged `a.ts` again. The global branch re-emits every file
+// (docusaurus: 855 unchanged JS files where Go writes 3).
+#[test]
+fn gone_files_mostly_modules_do_not_change_all_files() {
+    let source = |name: &str| format!("{PROJECT}/src/{name}");
+    let input = TscInput {
+        files: [
+            (
+                format!("{PROJECT}/tsconfig.json"),
+                r#"{"compilerOptions":{"incremental":true,"rootDir":"src","outDir":"out"},"include":["src"]}"#
+                    .into(),
+            ),
+            (source("a.ts"), "export const a = 1;\n".into()),
+            (source("g.d.ts"), "declare const g: number;\n".into()),
+            (source("m1.d.ts"), "export declare const m1: number;\n".into()),
+            (source("m2.d.ts"), "export declare const m2: number;\n".into()),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let sys = new_test_sys(&input, false);
+    let fs = sys.fs_from_file_map();
+
+    let status = build_with(&sys, &["--listEmittedFiles"]);
+    let output = sys.output_text();
+    assert_eq!(status, ExitStatus::Success, "{output}");
+    assert!(
+        output.contains(&format!("TSFILE: {PROJECT}/out/a.js")),
+        "{output}"
+    );
+
+    for name in ["g.d.ts", "m1.d.ts", "m2.d.ts"] {
+        fs.remove(&source(name))
+            .unwrap_or_else(|err| panic!("remove {name}: {err:?}"));
+    }
+    sys.clear_output();
+    let status = build_with(&sys, &["--listEmittedFiles"]);
+    let output = sys.output_text();
+    assert_eq!(status, ExitStatus::Success, "{output}");
+    assert!(
+        !output.contains(&format!("TSFILE: {PROJECT}/out/a.js")),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!("TSFILE: {PROJECT}/tsconfig.tsbuildinfo")),
         "{output}"
     );
 }
