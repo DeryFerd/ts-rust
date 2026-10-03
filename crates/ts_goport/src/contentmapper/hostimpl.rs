@@ -2297,7 +2297,7 @@ impl Project for ProjectLease {
             }
             files.extend(entry.borrow().watched_files.iter().cloned());
         }
-        files.sort();
+        crate::gostd::slices::stable_sort_by(&mut files, Ord::cmp);
         files.dedup();
         Ok(files)
     }

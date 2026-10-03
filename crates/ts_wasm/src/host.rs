@@ -210,7 +210,7 @@ impl IoFs for HostRoot {
             })
             .collect();
         // Go's os.ReadDir sorts by name.
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        ts_goport::gostd::slices::stable_sort_by(&mut entries, |a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
 

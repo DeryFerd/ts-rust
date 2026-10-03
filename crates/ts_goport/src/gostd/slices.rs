@@ -8,21 +8,26 @@
 //!
 //! PORT: Go `int` indexes are `isize` here (some Go loops count down past
 //! zero); they are cast to `usize` only to index the slice.
+//!
+//! Also `stable_sort_by`, Rust's stable `sort_by` with one copy on wasm.
 
 use crate::prelude::*;
 
 #[cfg(target_family = "wasm")]
-pub use by_index::{sort_func, sort_slice, sort_stable_func};
+pub use by_index::{sort_func, sort_slice, sort_stable_func, stable_sort_by};
 
-/// wasm: `sort_func`, `sort_stable_func` and `sort_slice` with one copy of
-/// each algorithm for all element types. Each sorts the indexes of `x`
-/// (`u32`) with a `dyn` comparator, then puts `x` in that order. The Go
-/// algorithm makes the same comparisons, in the same order, and the same
-/// swaps on the indexes as on `x`, so the result is the same. One copy per
-/// element and comparator type was 49 KB of the module (123 copies).
+/// wasm: `sort_func`, `sort_stable_func`, `sort_slice` and `stable_sort_by`
+/// with one copy of each algorithm for all element types. Each sorts the
+/// indexes of `x` (`u32`) with a `dyn` comparator, then puts `x` in that
+/// order. The Go algorithms make the same comparisons, in the same order,
+/// and the same swaps on the indexes as on `x`, so the result is the same
+/// (for `stable_sort_by`, see there). One copy per element and comparator
+/// type was 49 KB of the module (123 copies) for the Go sorts, and 50 KB
+/// (15 copies) for std's stable sort.
 #[cfg(any(test, target_family = "wasm"))]
 mod by_index {
     use super::{LessSwap, bits_len, pdqsort_cmp_func, pdqsort_func, stable_cmp_func};
+    use std::cmp::Ordering;
 
     /// Go `slices.SortFunc` (see the native `sort_func`).
     pub fn sort_func<T, F: FnMut(&T, &T) -> i32>(x: &mut [T], mut cmp: F) {
@@ -58,6 +63,24 @@ mod by_index {
         put_in_order(x, &mut order);
     }
 
+    /// Rust's `x.sort_by(cmp)` (see the native `stable_sort_by`). std's sort
+    /// makes other comparisons on the indexes than on `x`. But with a strict
+    /// weak order, a stable sort has one correct result, so it is the same.
+    pub fn stable_sort_by<T, F: FnMut(&T, &T) -> Ordering>(x: &mut [T], mut cmp: F) {
+        let mut order = indexes(x);
+        sort_indexes(&mut order, &mut |a, b| {
+            cmp(&x[*a as usize], &x[*b as usize])
+        });
+        put_in_order(x, &mut order);
+    }
+
+    /// std's stable sort of `order`, in one function: `sort_by` inlines its
+    /// insertion sort for short slices into the caller.
+    #[inline(never)]
+    fn sort_indexes(order: &mut [u32], cmp: &mut dyn FnMut(&u32, &u32) -> Ordering) {
+        order.sort_by(cmp);
+    }
+
     /// The indexes of `x`, in order.
     fn indexes<T>(x: &[T]) -> Vec<u32> {
         (0..u32::try_from(x.len()).expect("a slice of under 4G elements")).collect()
@@ -79,6 +102,16 @@ mod by_index {
             }
         }
     }
+}
+
+/// Rust's stable `x.sort_by(cmp)`, for a `cmp` that is a strict weak order
+/// (for example a compare of plain keys). Use it in place of `sort`,
+/// `sort_by` and `sort_by_key` in code that the wasm module has: there all
+/// element types share one copy of std's sort (`by_index`), and that copy
+/// gives the same result only for a strict weak order.
+#[cfg(not(target_family = "wasm"))]
+pub fn stable_sort_by<T, F: FnMut(&T, &T) -> std::cmp::Ordering>(x: &mut [T], cmp: F) {
+    x.sort_by(cmp);
 }
 
 // Go: slices/sort.go:30 SortFunc
@@ -1508,6 +1541,24 @@ mod tests {
             let (mut want, mut got) = (input.clone(), input);
             sort_slice(&mut want, |_, _| a.next() % 2 == 0);
             by_index::sort_slice(&mut got, |_, _| b.next() % 2 == 0);
+            assert_eq!(ids(&got), ids(&want));
+        }
+    }
+
+    /// The wasm `stable_sort_by` gives the same order as std's `sort_by` for
+    /// strict weak orders with many equal keys, at sizes that reach std's
+    /// insertion sort and its driftsort.
+    #[test]
+    fn index_stable_sort_matches_sort_by() {
+        for n in [0, 1, 2, 19, 20, 21, 50, 64, 100, 300, 1000, 5000] {
+            let input = keys(n);
+            let (mut want, mut got) = (input.clone(), input.clone());
+            want.sort_by(|a, b| (a.file, a.pos).cmp(&(b.file, b.pos)));
+            by_index::stable_sort_by(&mut got, |a, b| (a.file, a.pos).cmp(&(b.file, b.pos)));
+            assert_eq!(ids(&got), ids(&want));
+            let (mut want, mut got) = (input.clone(), input);
+            want.sort_by(|a, b| b.file.cmp(&a.file));
+            by_index::stable_sort_by(&mut got, |a, b| b.file.cmp(&a.file));
             assert_eq!(ids(&got), ids(&want));
         }
     }

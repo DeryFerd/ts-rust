@@ -274,8 +274,8 @@ impl Orchestrator {
                 depth,
             });
         }
-        // Go `slices.SortStableFunc`; `sort_by` is stable.
-        entries.sort_by(|a, b| a.depth.cmp(&b.depth));
+        // Go `slices.SortStableFunc`; `stable_sort_by` is stable.
+        crate::gostd::slices::stable_sort_by(&mut entries, |a, b| a.depth.cmp(&b.depth));
         entries.into_iter().map(|entry| entry.config).collect()
     }
 
