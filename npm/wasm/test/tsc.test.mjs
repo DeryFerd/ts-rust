@@ -88,6 +88,31 @@ test("checks the DOM lib and a clean program", async () => {
     assert.equal(result.exitCode, 0);
 });
 
+test("its types need no lib dom", async () => {
+    // A consumer of the package, checked with and without lib dom, the
+    // package's .d.ts files included.
+    const files = {
+        "/c/package.json": '{ "type": "module" }',
+        "/c/a.ts": [
+            'import { loadModule, tsc } from "ts-rust-wasm";',
+            'import { memoryFileSystem, runTsc } from "ts-rust-wasm/core";',
+            "const module = await loadModule(new Uint8Array(8));",
+            "runTsc(module, { fs: memoryFileSystem() });",
+            'await tsc([], { wasm: "ts_rust.wasm" });',
+            "",
+        ].join("\n"),
+    };
+    for (const name of ["package.json", "index.d.ts", "core.d.ts"]) {
+        files[`/c/node_modules/ts-rust-wasm/${name}`] = readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
+    }
+    for (const lib of ["es2022", "es2022,dom"]) {
+        const args = ["--noEmit", "--strict", "--module", "nodenext", "--types", "", "--lib", lib, "a.ts"];
+        const result = await tsc(args, { files, cwd: "/c" });
+        assert.equal(result.stdout, "", lib);
+        assert.equal(result.exitCode, 0, lib);
+    }
+});
+
 test("reads and writes the real file system", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ts-rust-wasm-"));
     try {
