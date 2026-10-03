@@ -485,6 +485,7 @@ impl PrefetchPool {
 impl Drop for PrefetchPool {
     fn drop(&mut self) {
         let mut queue = lock(&self.shared.queue);
+        queue.configs_closed = true;
         queue.closed = true;
         queue.configs.clear();
         if !queue.reads_final {
