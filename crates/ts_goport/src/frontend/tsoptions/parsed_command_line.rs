@@ -630,8 +630,8 @@ impl ParsedCommandLine {
         )
     }
 
-    // Go: tsoptions/parsedcommandline.go:159 the `files` closure in
-    // (*ParsedCommandLine).CommonSourceDirectory
+    // The `files` closure of Go CommonSourceDirectory
+    // (tsoptions/parsedcommandline.go:159).
     fn common_source_directory_files(&self) -> Vec<String> {
         self.parsed_config
             .file_names

@@ -346,7 +346,7 @@ impl Orchestrator {
                 continue;
             }
             self.tasks.insert(path.clone(), task.clone());
-            // Go: orchestrator.go:178 runs this on a work group that is
+            // Go runs this on a work group (orchestrator.go:178) that is
             // parallel unless `--singleThreaded` (:263), so a Go panic in the
             // parse prints ` [recovered, repanicked]` there.
             let resolved = if self.opts.command.compiler_options.single_threaded.is_true() {

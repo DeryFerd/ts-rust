@@ -763,7 +763,7 @@ pub fn parse_json_config_file_content_worker(
                     "tsconfig.json"
                 };
                 let diagnostic_message = diag::The_files_list_in_config_file_0_is_empty;
-                // Go: tsconfigparsing.go:1300 `nodeValue` is nil when the top
+                // In Go (tsconfigparsing.go:1300) `nodeValue` is nil when the top
                 // level is not an object (`[{"files": []}]`), and
                 // CreateDiagnosticForNodeInSourceFile (errors.go:93) then
                 // dereferences it.
@@ -2122,7 +2122,7 @@ mod top_level_array_tests {
         }
     }
 
-    // Go: tsconfigparsing.go:1300 a top-level array that holds
+    // In Go (tsconfigparsing.go:1300) a top-level array that holds
     // `"files": []` has no `files` node, so CreateDiagnosticForNodeInSourceFile
     // (errors.go:93) dereferences nil. Go N panics with the runtime text and
     // exits 2 (projfuzz1 GO_CRASH_ARR).
