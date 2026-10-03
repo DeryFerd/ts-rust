@@ -346,7 +346,16 @@ impl Orchestrator {
                 continue;
             }
             self.tasks.insert(path.clone(), task.clone());
-            let resolved = self.host.get_resolved_project_reference(config, &path);
+            // Go runs this on a work group (orchestrator.go:178) that is
+            // parallel unless `--singleThreaded` (:263), so a Go panic in the
+            // parse prints ` [recovered, repanicked]` there.
+            let resolved = if self.opts.command.compiler_options.single_threaded.is_true() {
+                self.host.get_resolved_project_reference(config, &path)
+            } else {
+                crate::core::go_work_group_task(|| {
+                    self.host.get_resolved_project_reference(config, &path)
+                })
+            };
             {
                 let mut task = task.borrow_mut();
                 task.resolved = resolved.clone();
@@ -682,9 +691,9 @@ impl Orchestrator {
                 .collect();
             let project_outputs = resolved.get_output_file_names();
             let mut deleted = false;
-            for output_file in &project_outputs {
+            for output_file in project_outputs {
                 deleted = self.clean_project_output(
-                    output_file,
+                    &output_file,
                     &inputs,
                     dry,
                     &mut result.files_to_delete,
