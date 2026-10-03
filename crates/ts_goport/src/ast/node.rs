@@ -361,7 +361,7 @@ macro_rules! list_by_data {
 
 /// True when `d` is the data of parsed node `n` (the `_in` debug checks).
 fn is_data_of(d: &NodeData, n: Node) -> bool {
-    static_ast_node(n).is_some_and(|node| std::ptr::eq(d, &node.data))
+    static_ast_node(n).is_some_and(|data| std::ptr::eq(d, data))
 }
 
 /// Defines one Go field accessor as two `Node` methods from one arm list:
@@ -483,17 +483,17 @@ macro_rules! modifiers_accessor {
 macro_rules! store_node_modifier_bits_fn {
     ([$($v:ident),+ $(,)?]) => {
         /// U1 (b): `ModifierList::modifier_flags` of the own modifier list of
-        /// `node`, a store node of kind `kind`, as bits: the value
+        /// `data`, the data of a store node of kind `kind`, as bits: the value
         /// `Node::modifiers().modifier_flags()` gives for it (store lists hold
         /// their Go flags). 0 when the node has no list. The kind test comes
         /// first, so most nodes are not loaded (the `NodeKids` modifier word).
-        pub(crate) fn store_node_modifier_bits(kind: SyntaxKind, node: &crate::astdata::Node) -> u32 {
+        pub(crate) fn store_node_modifier_bits(kind: SyntaxKind, data: &NodeData) -> u32 {
             let mut has_list = false;
             $(has_list |= variant_has_kind!($v, kind);)+
             if !has_list {
                 return 0;
             }
-            match &node.data {
+            match data {
                 $(NodeData::$v(d) => d.modifiers.as_ref().map_or(0, |m| m.flags.0),)+
                 _ => 0,
             }
@@ -893,9 +893,9 @@ fn column_req_id(id: crate::astdata::NodeId) -> u32 {
 /// data.
 // PERF: called when the slot is made, while its data is hot (a few data
 // matches), so no pass over the node data is needed later.
-pub(crate) fn store_node_children(kind: SyntaxKind, node: &crate::astdata::Node) -> SlotChildren {
+pub(crate) fn store_node_children(kind: SyntaxKind, data: &NodeData) -> SlotChildren {
     debug_assert!(
-        node.data.matches_syntax_kind(kind),
+        data.matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
     );
     // PERF: about a third of the slots are identifiers, which have none of
@@ -903,10 +903,10 @@ pub(crate) fn store_node_children(kind: SyntaxKind, node: &crate::astdata::Node)
     if kind == SyntaxKind::Identifier {
         let none = SlotChildren::new(Some(0), Some((SlotChildren::TAG_EXPRESSION, 0)))
             .with_typed(Some((SlotChildren::TYPED_TYPE, 0)), true);
-        debug_assert_eq!(none, store_node_children_from_data(&node.data));
+        debug_assert_eq!(none, store_node_children_from_data(data));
         return none;
     }
-    store_node_children_from_data(&node.data)
+    store_node_children_from_data(data)
 }
 
 /// `store_node_children` for node data `data`.
@@ -2425,10 +2425,7 @@ impl Node {
         if let Some(h) = try_store_header(self) {
             return h.loc;
         }
-        let Some(r) = static_ast_node(self) else {
-            unreachable!("a synthetic node takes the slot path");
-        };
-        text_range_of(&r.range)
+        unreachable!("node {self:?} is not synthetic and has no store")
     }
 
     // Go: ast.go:192 Pos
@@ -2899,10 +2896,10 @@ impl Node {
     // accessor. Other kinds give "" instead of a panic.
     #[must_use]
     pub fn text(self) -> &'static str {
-        let Some(node) = static_ast_node(self) else {
+        let Some(data) = static_ast_node(self) else {
             return self.scoped_node_text();
         };
-        match &node.data {
+        match data {
             NodeData::Identifier(d) => name_node_text(self, &d.text),
             NodeData::PrivateIdentifier(d) => name_node_text(self, &d.text),
             NodeData::StringLiteral(d) => &d.text,
@@ -2955,7 +2952,7 @@ impl Node {
         }
         let file = self.file_index();
         let interned = |text: &str| -> &'static str { Name::from(text).as_str() };
-        let text = read_scoped_ast_node(self, |node| match &node.data {
+        let text = read_scoped_ast_node(self, |data| match data {
             // A store Identifier keeps its text in its name word
             // (`name_node_text`); a synthetic one in its data.
             NodeData::Identifier(d) => scoped_name_text(self, &d.text),
@@ -3087,7 +3084,7 @@ impl Node {
             }
         }
         match static_ast_node(self) {
-            Some(node) => raw_text_of(&node.data).unwrap_or(""),
+            Some(data) => raw_text_of(data).unwrap_or(""),
             None => synthetic_text(self, raw_text_of),
         }
     }
@@ -3749,7 +3746,7 @@ impl Node {
 }
 
 fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<ListHook>) -> bool {
-    let Some(node) = static_ast_node(n) else {
+    let Some(data) = static_ast_node(n) else {
         return for_each_scoped_child(n, v, lists);
     };
     let mut visit = NodeChildVisit {
@@ -3758,7 +3755,7 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<L
         v,
         lists,
     };
-    walk_children(&node.data, &mut visit)
+    walk_children(data, &mut visit)
 }
 
 /// `for_each_child_impl` for a node with no `'static` node (a factory node,
@@ -3772,9 +3769,9 @@ fn for_each_scoped_child(
     v: &mut dyn FnMut(Node) -> bool,
     lists: Option<ListHook>,
 ) -> bool {
-    with_scoped_ast_node(n, |node| {
+    with_scoped_ast_node(n, |data| {
         walk_children(
-            &node.data,
+            data,
             &mut ScopedChildVisit {
                 n,
                 file: n.file_index(),
@@ -3785,8 +3782,8 @@ fn for_each_scoped_child(
     })
 }
 
-/// R3-2: calls `v` with the slot index of each child id in the data of
-/// store node `node` (Go kind `kind`), in Go `ForEachChild` order, and
+/// R3-2: calls `v` with the slot index of each child id in `data`, the
+/// data of a store node of Go kind `kind`, in Go `ForEachChild` order, and
 /// stops when `v` returns true. It reads only the node data: no store and
 /// no node read. A nil single child field is skipped, as Go `visit` skips
 /// nil; list entries are all passed, so `v` sees slot 0 (nil) for a nil
@@ -3798,10 +3795,10 @@ fn for_each_scoped_child(
 // `Node::new_slow`), a store lookup each.
 pub(crate) fn for_each_store_child_id(
     kind: SyntaxKind,
-    node: &crate::astdata::Node,
+    data: &NodeData,
     v: impl FnMut(u32) -> bool,
 ) -> bool {
-    walk_children(&node.data, &mut StoreChildIds { kind, v })
+    walk_children(data, &mut StoreChildIds { kind, v })
 }
 
 /// R3-2: the fields that one arm of `walk_children` visits, in Go
