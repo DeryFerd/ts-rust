@@ -7,7 +7,7 @@
 use crate::prelude::*;
 
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use super::emitter::{DeclarationPrint, EmitOnly, Emitter, JsPrint, js_emit_needs_checker};
 use crate::frontend::outputpaths::{ForceEmitPaths, OutputPaths};
@@ -818,7 +818,7 @@ fn emit_declaration_part(
     }));
     match (dts, twin_print.into_inner()) {
         (Ok(_), Some(twin_print)) => {
-            CheckerOutput::Twin(send_twin_job(move || twin_print.run(js_part, wrap)))
+            CheckerOutput::Twin(send_dts_twin_job(move || twin_print.run(js_part, wrap)))
         }
         // Nothing to print, or a panic: the part ends here.
         (dts, _) => {
@@ -903,7 +903,7 @@ fn emit_on_twin(
         }
     });
     match twin_file.into_inner() {
-        Some(file) => CheckerOutput::Twin(send_twin_job(move || {
+        Some(file) => CheckerOutput::Twin(send_dts_twin_job(move || {
             let file = RefCell::new(Some(file));
             wrap(&|| {
                 file.borrow_mut()
@@ -913,54 +913,6 @@ fn emit_on_twin(
             })
         })),
         None => CheckerOutput::Done(here),
-    }
-}
-
-/// PORT: not in Go (perf). The most twin jobs of one checker thread that
-/// have not ended (`send_twin_job`). A job holds a copy of its trees and
-/// their side tables (`TwinPrint`) until its print ends, and the checker
-/// can make them faster than its twin prints them: without a limit, zod's
-/// emit had 75 jobs waiting.
-const TWIN_JOBS_IN_FLIGHT: usize = 4;
-
-/// The number of twin jobs of one checker thread that have not ended, and
-/// the signal of each end (`send_twin_job`).
-type TwinJobs = Arc<(Mutex<usize>, Condvar)>;
-
-thread_local! {
-    /// The twin jobs of this checker thread (`send_twin_job`).
-    static TWIN_JOBS: TwinJobs = TwinJobs::default();
-}
-
-/// `program::send_dts_twin_job` of `f`, after a wait while this checker
-/// thread has `TWIN_JOBS_IN_FLIGHT` twin jobs that have not ended. The twin
-/// runs its jobs in order and never waits for its checker, so the wait
-/// ends. Checker threads only.
-fn send_twin_job(f: impl FnOnce() -> EmitResult + Send + 'static) -> EmitPoolJob<EmitResult> {
-    let jobs = TWIN_JOBS.with(Arc::clone);
-    {
-        let (count, ended) = &*jobs;
-        let count = count.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut count = ended
-            .wait_while(count, |count| *count >= TWIN_JOBS_IN_FLIGHT)
-            .unwrap_or_else(PoisonError::into_inner);
-        *count += 1;
-    }
-    send_dts_twin_job(move || {
-        // Counts the end of the job, also when `f` panics.
-        let _end = TwinJobEnd(jobs);
-        f()
-    })
-}
-
-/// Counts one twin job of `send_twin_job` as ended when it drops.
-struct TwinJobEnd(TwinJobs);
-
-impl Drop for TwinJobEnd {
-    fn drop(&mut self) {
-        let (count, ended) = &*self.0;
-        *count.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
-        ended.notify_one();
     }
 }
 
