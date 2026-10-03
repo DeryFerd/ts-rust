@@ -762,6 +762,10 @@ pub(crate) struct VersionTables {
     file_associations: OnceLock<Vec<usize>>,
     /// Go `Program.declarationDiagnosticCache`.
     declaration_diagnostic_cache: Mutex<FxHashMap<Node, Vec<Diagnostic>>>,
+    /// The file system answers of Go `p.Host().FS()` and of the resolver's
+    /// package.json cache that module specifier generation reads on any
+    /// thread (`with_host_fs_cache`).
+    host_fs_cache: crate::modulespecifiers::host::HostFsCache,
     /// The thread-safe copy of the Go frontend data that the checker reads.
     /// None for an alias resolver program. The frontend program itself is
     /// in `FRONTENDS`, on the loading thread only.
@@ -816,6 +820,7 @@ impl VersionTables {
             file_meta,
             file_associations: OnceLock::new(),
             declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
+            host_fs_cache: Default::default(),
             go: None,
             file_versions: Vec::new(),
             bound_symbols: OnceLock::new(),
@@ -2230,6 +2235,14 @@ pub fn resolve_lazy_js_doc(file: Node, info: &SourceFileInfo, node: Node) -> &'s
 pub fn file_exists(path: &str) -> bool {
     alias_resolver_unimplemented();
     go_frontend::file_exists(path)
+}
+
+/// Runs `f` with the file system cache of the current program (`prog()`),
+/// which every thread of the program shares.
+pub(crate) fn with_host_fs_cache<R>(
+    f: impl FnOnce(&crate::modulespecifiers::host::HostFsCache) -> R,
+) -> R {
+    with_tables(|tables| f(&tables.host_fs_cache))
 }
 
 // Go: compiler/program.go:134 GetCurrentDirectory

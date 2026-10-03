@@ -11,13 +11,49 @@ use super::packagejson::{self, InfoCacheEntry, PackageJson};
 use super::symlinks::KnownSymlinks;
 use super::tspath;
 use super::types::ModuleSpecifierGenerationHost;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 /// The current program (`prog()`) as a `ModuleSpecifierGenerationHost`.
 /// The program state is reached through the current program, so the host has
 /// no fields.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProgramHost;
+
+/// The file system answers that module specifier generation reads, shared
+/// by every thread of one program version: Go `compilerHost.fs` (a
+/// `cachedvfs.FS`, compiler/host.go:52), which Go shares between its
+/// checker goroutines.
+// PORT: the frontend host cache is not thread-safe, so only the loading
+// thread can read it. The program version's tables hold this cache
+// (`program::with_host_fs_cache`) and free it with the program.
+#[derive(Default)]
+pub(crate) struct HostFsCache {
+    /// Go cachedvfs.go `fileExistsCache`, for `file_exists` off the
+    /// loading thread (`program::file_exists`).
+    file_exists: RwLock<FxHashMap<String, bool>>,
+}
+
+impl HostFsCache {
+    // Go: vfs/cachedvfs/cachedvfs.go:64 FileExists
+    /// The cached answer for `path`, or the answer of `probe`, which is then
+    /// cached.
+    pub(crate) fn file_exists(&self, path: &str, probe: impl FnOnce() -> bool) -> bool {
+        if let Some(&ret) = read(&self.file_exists).get(path) {
+            return ret;
+        }
+        let ret = probe();
+        write(&self.file_exists).insert(path.to_string(), ret);
+        ret
+    }
+}
+
+fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The caches that Go keeps on one program and its module resolver.
 #[derive(Default)]
