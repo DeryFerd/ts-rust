@@ -352,7 +352,7 @@ methods reach the AST through it.
 - Pooled node blocks and the owner check (AST node records step 4,
   `BlockPool` in `ast/store.rs`). The node shell of a freeable version
   copies its records and kids into a pooled block (a leaked block of
-  records and kids, 48 bytes per slot, with room for about 1/8 more slots
+  records and kids, 40 bytes per slot, with room for about 1/8 more slots
   and 64 more). The version gives the block back when it dies; it waits
   in a quarantine until 2 more program releases (`pin_epoch`), then a
   later node shell of a size it fits (`len` to `2 * len + 64` slots) takes
@@ -460,7 +460,7 @@ The batch that adds it is not accepted until Theo approves.
   `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The
   registry keeps a `Weak`. At publish the version takes its `FileStore`
   and its `GoFile` (M3b). Its node records and kids (`NodeRecord`,
-  `NodeKids`; 48 bytes per node, and 2 in the kind column) are in its node shell, the registry
+  `NodeKids`; 40 bytes per node, and 2 in the kind column) are in its node shell, the registry
   block of its id (a pooled block, AST node records step 4), so a header or child
   read of the edited file stays inline (a pinned read per node read made
   edits 3 to 4 ms slower); the child link column is dropped, and the
