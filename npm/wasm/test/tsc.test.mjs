@@ -4,7 +4,17 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+    chmodSync,
+    lstatSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    symlinkSync,
+    unlinkSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -107,7 +117,8 @@ test("keeps a symlinked current directory, as tsgo does", () => {
         assert.equal(run.status, 0);
         assert.equal(run.stdout.trim().split("\n").at(-1), `${link}/a.ts`);
     } finally {
-        rmSync(link, { force: true });
+        // Not rmSync: on Node 24.13 it throws ERR_FS_EISDIR for a link to a directory.
+        if (lstatSync(link, { throwIfNoEntry: false })) unlinkSync(link);
         rmSync(real, { recursive: true, force: true });
     }
 });
