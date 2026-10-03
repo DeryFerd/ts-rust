@@ -1041,25 +1041,47 @@ pub(crate) mod tests {
     }
 
     /// One end of Go `net.Pipe()`.
-    struct PipeEnd(UnixStream);
+    ///
+    /// PORT: Go's Close ends both directions of both ends: the peer reads
+    /// EOF and its writes fail. `close` shuts the socket down, which wakes a
+    /// blocked read, and then closes it. A shutdown alone is not enough on
+    /// macOS, where the peer can still write to a socket that only shut
+    /// down.
+    struct PipeEnd(std::sync::RwLock<Option<UnixStream>>);
+
+    impl PipeEnd {
+        fn new(stream: UnixStream) -> Self {
+            PipeEnd(std::sync::RwLock::new(Some(stream)))
+        }
+
+        fn with_stream<R>(
+            &self,
+            f: impl FnOnce(&UnixStream) -> std::io::Result<R>,
+        ) -> std::io::Result<R> {
+            match &*self.0.read().unwrap() {
+                Some(stream) => f(stream),
+                None => Err(std::io::ErrorKind::NotConnected.into()),
+            }
+        }
+    }
 
     impl ReadWriteCloser for PipeEnd {
         fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-            (&self.0).read(buf)
+            self.with_stream(|mut stream| stream.read(buf))
         }
 
         fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
-            (&self.0).write(buf)
+            self.with_stream(|mut stream| stream.write(buf))
         }
 
         fn flush(&self) -> std::io::Result<()> {
-            (&self.0).flush()
+            self.with_stream(|mut stream| stream.flush())
         }
 
         fn close(&self) -> Result<(), GoError> {
-            self.0
-                .shutdown(std::net::Shutdown::Both)
-                .map_err(|err| errors::new(err.to_string()))
+            let _ = self.with_stream(|stream| stream.shutdown(std::net::Shutdown::Both));
+            self.0.write().unwrap().take();
+            Ok(())
         }
     }
 
@@ -1067,7 +1089,7 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_call_returns_when_peer_closes() {
         let (client, server) = UnixStream::pair().expect("socket pair");
-        let client: Arc<dyn ReadWriteCloser> = Arc::new(PipeEnd(client));
+        let client: Arc<dyn ReadWriteCloser> = Arc::new(PipeEnd::new(client));
         let conn = new_async_conn(client.clone(), Rc::new(NoOpHandler));
         let ctx = context::background();
 
@@ -1144,7 +1166,7 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_call_handles_a_nested_request() {
         let (client, server) = UnixStream::pair().expect("socket pair");
-        let conn = new_async_conn(Arc::new(PipeEnd(client)), Rc::new(TrueHandler));
+        let conn = new_async_conn(Arc::new(PipeEnd::new(client)), Rc::new(TrueHandler));
         let peer = std::thread::spawn(move || {
             let call = read_framed(&server);
             write_framed(&server, r#"{"jsonrpc":"2.0","id":"n1","method":"nested"}"#);
@@ -1168,7 +1190,7 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_call_after_read_loop_failure_returns_immediately() {
         let (client, server) = UnixStream::pair().expect("socket pair");
-        let conn = new_async_conn(Arc::new(PipeEnd(client)), Rc::new(NoOpHandler));
+        let conn = new_async_conn(Arc::new(PipeEnd::new(client)), Rc::new(NoOpHandler));
         let background = context::background();
 
         (&server).write_all(b"oops\n").expect("server write");
@@ -1254,7 +1276,7 @@ pub(crate) mod tests {
                 started,
                 release: release_rx,
             };
-            let conn = new_async_conn(Arc::new(PipeEnd(server)), Rc::new(handler));
+            let conn = new_async_conn(Arc::new(PipeEnd::new(server)), Rc::new(handler));
             let ctx = context::background();
             let run = conn.run(&ctx).err().map(|err| err.error());
             // Go calls these after `Run` returns.
@@ -1269,7 +1291,7 @@ pub(crate) mod tests {
             run_done.send((run, call, notify)).expect("runDone");
         });
 
-        let client: Arc<dyn ReadWriteCloser> = Arc::new(PipeEnd(client));
+        let client: Arc<dyn ReadWriteCloser> = Arc::new(PipeEnd::new(client));
         let mut client_protocol = new_jsonrpc_protocol(client.clone());
         client_protocol
             .write_request(Some(&jsonrpc::new_id_int(1)), "transform", None)

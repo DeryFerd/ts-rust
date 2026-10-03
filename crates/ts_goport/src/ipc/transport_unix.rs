@@ -178,11 +178,16 @@ impl ReadWriteCloser for UnixConn {
 
     // PORT: Go closes the file descriptor. The stream is shared, so the port
     // shuts both directions down; the descriptor closes with the last owner.
-    // Go's error is "close unix <laddr>-><raddr>: <err>". The port's text
-    // has no addresses; callers ignore it.
+    // macOS reports ENOTCONN when the peer has closed, where Go's close
+    // succeeds, so that is not an error. Go's error is "close unix
+    // <laddr>-><raddr>: <err>". The port's text has no addresses; callers
+    // ignore it.
     fn close(&self) -> Result<(), GoError> {
-        self.stream
-            .shutdown(Shutdown::Both)
-            .map_err(|err| errors::new(format!("close unix: {}", io_error_text(&err))))
+        match self.stream.shutdown(Shutdown::Both) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotConnected => {
+                Err(errors::new(format!("close unix: {}", io_error_text(&err))))
+            }
+            _ => Ok(()),
+        }
     }
 }
