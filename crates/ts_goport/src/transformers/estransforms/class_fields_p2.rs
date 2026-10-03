@@ -32,7 +32,7 @@ use crate::transformers::utilities::{
 };
 
 impl ClassFieldsTransformer {
-    // Go: transformers/estransforms/classfields.go:1592 classFieldsTransformer.createPrivateIdentifierAssignment
+    // Go: transformers/estransforms/classfields.go:1627 classFieldsTransformer.createPrivateIdentifierAssignment
     pub(super) fn create_private_identifier_assignment(
         &mut self,
         info: &PrivateIdentifierInfoRef,
@@ -106,7 +106,7 @@ impl ClassFieldsTransformer {
         }
     }
 
-    // Go: transformers/estransforms/classfields.go:1653 classFieldsTransformer.getPrivateInstanceMethodsAndAccessors
+    // Go: transformers/estransforms/classfields.go:1686 classFieldsTransformer.getPrivateInstanceMethodsAndAccessors
     pub(super) fn get_private_instance_methods_and_accessors(&self, node: Node) -> Vec<Node> {
         node.members()
             .iter()
@@ -114,7 +114,7 @@ impl ClassFieldsTransformer {
             .collect()
     }
 
-    // Go: transformers/estransforms/classfields.go:1662 classFieldsTransformer.memberContainsConstructorReference
+    // Go: transformers/estransforms/classfields.go:1695 classFieldsTransformer.memberContainsConstructorReference
     /// memberContainsConstructorReference checks if a class member's body contains an identifier
     /// that resolves to the class declaration. Replaces Strada's resolver.hasNodeCheckFlag(member,
     /// NodeCheckFlags.ContainsConstructorReference) by walking the AST with the EmitResolver.
@@ -163,7 +163,7 @@ impl ClassFieldsTransformer {
         false
     }
 
-    // Go: transformers/estransforms/classfields.go:1705 classFieldsTransformer.classContainsConstructorReference
+    // Go: transformers/estransforms/classfields.go:1738 classFieldsTransformer.classContainsConstructorReference
     /// classContainsConstructorReference checks if any member of a class contains
     /// references to the class's own constructor. Replaces Strada's
     /// resolver.hasNodeCheckFlag(node, NodeCheckFlags.ContainsConstructorReference).
@@ -176,7 +176,7 @@ impl ClassFieldsTransformer {
         false
     }
 
-    // Go: transformers/estransforms/classfields.go:1714 classFieldsTransformer.getClassFacts
+    // Go: transformers/estransforms/classfields.go:1747 classFieldsTransformer.getClassFacts
     pub(super) fn get_class_facts(&self, node: Node) -> ClassFacts {
         let ec = &self.emit_context;
         let mut facts = CLASS_FACTS_NONE;
@@ -384,7 +384,7 @@ impl ClassFieldsTransformer {
         result
     }
 
-    // Go: transformers/estransforms/classfields.go:1895 classFieldsTransformer.visitClassDeclaration
+    // Go: transformers/estransforms/classfields.go:1889 classFieldsTransformer.visitClassDeclaration
     pub(super) fn visit_class_declaration(&mut self, node: Node) -> Node {
         self.visit_in_new_class_lexical_environment(
             node,
@@ -392,7 +392,7 @@ impl ClassFieldsTransformer {
         )
     }
 
-    // Go: transformers/estransforms/classfields.go:1899 classFieldsTransformer.visitClassDeclarationInNewClassLexicalEnvironment
+    // Go: transformers/estransforms/classfields.go:1893 classFieldsTransformer.visitClassDeclarationInNewClassLexicalEnvironment
     pub(super) fn visit_class_declaration_in_new_class_lexical_environment(
         &mut self,
         node: Node,
@@ -526,7 +526,7 @@ impl ClassFieldsTransformer {
         f.new_syntax_list(&result)
     }
 
-    // Go: transformers/estransforms/classfields.go:2011 classFieldsTransformer.visitClassExpression
+    // Go: transformers/estransforms/classfields.go:2003 classFieldsTransformer.visitClassExpression
     pub(super) fn visit_class_expression(&mut self, node: Node) -> Node {
         self.visit_in_new_class_lexical_environment(
             node,
@@ -534,7 +534,7 @@ impl ClassFieldsTransformer {
         )
     }
 
-    // Go: transformers/estransforms/classfields.go:2015 classFieldsTransformer.visitClassExpressionInNewClassLexicalEnvironment
+    // Go: transformers/estransforms/classfields.go:2007 classFieldsTransformer.visitClassExpressionInNewClassLexicalEnvironment
     pub(super) fn visit_class_expression_in_new_class_lexical_environment(
         &mut self,
         node: Node,
@@ -757,7 +757,7 @@ impl ClassFieldsTransformer {
         f.inline_expressions(&expressions)
     }
 
-    // Go: transformers/estransforms/classfields.go:2193 classFieldsTransformer.visitClassStaticBlockDeclaration
+    // Go: transformers/estransforms/classfields.go:2181 classFieldsTransformer.visitClassStaticBlockDeclaration
     pub(super) fn visit_class_static_block_declaration(&mut self, node: Node) -> Node {
         if !self.should_transform_private_elements_or_class_static_blocks {
             return self.visit_each_child(node);
@@ -766,7 +766,7 @@ impl ClassFieldsTransformer {
         Node::NIL
     }
 
-    // Go: transformers/estransforms/classfields.go:2206 classFieldsTransformer.visitThisExpression
+    // Go: transformers/estransforms/classfields.go:2194 classFieldsTransformer.visitThisExpression
     /// visitThisExpression replaces Strada's substituteThisExpression / onSubstituteNode.
     /// Strada substitutes `this` at emit time; we do it eagerly during transformation.
     ///
@@ -809,7 +809,7 @@ impl ClassFieldsTransformer {
         node
     }
 
-    // Go: transformers/estransforms/classfields.go:2236 classFieldsTransformer.transformClassMembers
+    // Go: transformers/estransforms/classfields.go:2223 classFieldsTransformer.transformClassMembers
     /// Returns `(members, prologue)`.
     pub(super) fn transform_class_members(&mut self, node: Node) -> (NodeList, Node) {
         let ec = self.ec();
@@ -975,7 +975,7 @@ impl ClassFieldsTransformer {
         (members, prologue)
     }
 
-    // Go: transformers/estransforms/classfields.go:2346 classFieldsTransformer.createBrandCheckWeakSetForPrivateMethods
+    // Go: transformers/estransforms/classfields.go:2348 classFieldsTransformer.createBrandCheckWeakSetForPrivateMethods
     pub(super) fn create_brand_check_weak_set_for_private_methods(&mut self) {
         let env = self.get_private_identifier_environment();
         let weak_set_name = env.borrow().data.weak_set_name;
@@ -996,7 +996,7 @@ impl ClassFieldsTransformer {
         )]);
     }
 
-    // Go: transformers/estransforms/classfields.go:2363 classFieldsTransformer.transformConstructor
+    // Go: transformers/estransforms/classfields.go:2365 classFieldsTransformer.transformConstructor
     pub(super) fn transform_constructor(&mut self, constructor: Node, container: Node) -> Node {
         // NOTE: The Strada reference pre-visits the constructor via `visitNode(constructor, visitor)` before
         // checking WillHoistInitializersToConstructor. This is not done here because Go's variable environment
@@ -1065,7 +1065,7 @@ impl ClassFieldsTransformer {
         result
     }
 
-    // Go: transformers/estransforms/classfields.go:2423 classFieldsTransformer.transformConstructorBodyWorker
+    // Go: transformers/estransforms/classfields.go:2424 classFieldsTransformer.transformConstructorBodyWorker
     #[allow(clippy::too_many_arguments)]
     pub(super) fn transform_constructor_body_worker(
         &mut self,
@@ -1332,7 +1332,7 @@ impl ClassFieldsTransformer {
         block
     }
 
-    // Go: transformers/estransforms/classfields.go:2632 classFieldsTransformer.addPropertyOrClassStaticBlockStatements
+    // Go: transformers/estransforms/classfields.go:2637 classFieldsTransformer.addPropertyOrClassStaticBlockStatements
     /// addPropertyOrClassStaticBlockStatements generates assignment statements for property initializers.
     pub(super) fn add_property_or_class_static_block_statements(
         &mut self,
@@ -1353,7 +1353,7 @@ impl ClassFieldsTransformer {
         statements
     }
 
-    // Go: transformers/estransforms/classfields.go:2645 classFieldsTransformer.transformPropertyOrClassStaticBlock
+    // Go: transformers/estransforms/classfields.go:2650 classFieldsTransformer.transformPropertyOrClassStaticBlock
     pub(super) fn transform_property_or_class_static_block(
         &mut self,
         property: Node,
@@ -1402,7 +1402,7 @@ impl ClassFieldsTransformer {
         statement
     }
 
-    // Go: transformers/estransforms/classfields.go:2684 classFieldsTransformer.generateInitializedPropertyExpressionsOrClassStaticBlock
+    // Go: transformers/estransforms/classfields.go:2690 classFieldsTransformer.generateInitializedPropertyExpressionsOrClassStaticBlock
     /// generateInitializedPropertyExpressionsOrClassStaticBlock generates assignment expressions for property initializers.
     pub(super) fn generate_initialized_property_expressions_or_class_static_block(
         &mut self,
@@ -1431,7 +1431,7 @@ impl ClassFieldsTransformer {
         expressions
     }
 
-    // Go: transformers/estransforms/classfields.go:2708 classFieldsTransformer.transformProperty
+    // Go: transformers/estransforms/classfields.go:2713 classFieldsTransformer.transformProperty
     /// transformProperty transforms a property initializer into an assignment expression.
     pub(super) fn transform_property(&mut self, property: Node, receiver: Node) -> Node {
         let ec = self.ec();
@@ -1454,7 +1454,7 @@ impl ClassFieldsTransformer {
         transformed
     }
 
-    // Go: transformers/estransforms/classfields.go:2725 classFieldsTransformer.transformPropertyWorker
+    // Go: transformers/estransforms/classfields.go:2729 classFieldsTransformer.transformPropertyWorker
     pub(super) fn transform_property_worker(&mut self, mut property: Node, receiver: Node) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -1622,7 +1622,7 @@ impl ClassFieldsTransformer {
         f.new_object_define_property_call(receiver, name, descriptor)
     }
 
-    // Go: transformers/estransforms/classfields.go:2834 classFieldsTransformer.addInstanceMethodStatements
+    // Go: transformers/estransforms/classfields.go:2836 classFieldsTransformer.addInstanceMethodStatements
     /// addInstanceMethodStatements generates brand-check initializer for private methods.
     pub(super) fn add_instance_method_statements(
         &mut self,
@@ -1653,7 +1653,7 @@ impl ClassFieldsTransformer {
         statements
     }
 
-    // Go: transformers/estransforms/classfields.go:2852 classFieldsTransformer.visitInvalidSuperProperty
+    // Go: transformers/estransforms/classfields.go:2853 classFieldsTransformer.visitInvalidSuperProperty
     pub(super) fn visit_invalid_super_property(&mut self, node: Node) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -1730,7 +1730,7 @@ impl ClassFieldsTransformer {
         expression
     }
 
-    // Go: transformers/estransforms/classfields.go:2913 classFieldsTransformer.startClassLexicalEnvironment
+    // Go: transformers/estransforms/classfields.go:2910 classFieldsTransformer.startClassLexicalEnvironment
     pub(super) fn start_class_lexical_environment(&mut self) {
         self.lexical_environment = Some(Rc::new(ClassLexicalEnv {
             previous: self.lexical_environment.take(),
@@ -1738,7 +1738,7 @@ impl ClassFieldsTransformer {
         }));
     }
 
-    // Go: transformers/estransforms/classfields.go:2917 classFieldsTransformer.endClassLexicalEnvironment
+    // Go: transformers/estransforms/classfields.go:2914 classFieldsTransformer.endClassLexicalEnvironment
     pub(super) fn end_class_lexical_environment(&mut self) {
         self.lexical_environment = self
             .lexical_environment
@@ -1746,7 +1746,7 @@ impl ClassFieldsTransformer {
             .and_then(|env| env.previous.clone());
     }
 
-    // Go: transformers/estransforms/classfields.go:2921 classFieldsTransformer.getClassLexicalEnvironment
+    // Go: transformers/estransforms/classfields.go:2918 classFieldsTransformer.getClassLexicalEnvironment
     pub(super) fn get_class_lexical_environment(&mut self) -> ClassLexicalEnvironmentRef {
         let env = self
             .lexical_environment
@@ -1758,7 +1758,7 @@ impl ClassFieldsTransformer {
             .clone()
     }
 
-    // Go: transformers/estransforms/classfields.go:2929 classFieldsTransformer.getPrivateIdentifierEnvironment
+    // Go: transformers/estransforms/classfields.go:2926 classFieldsTransformer.getPrivateIdentifierEnvironment
     pub(super) fn get_private_identifier_environment(&mut self) -> PrivateEnvironmentRef {
         let env = self
             .lexical_environment
@@ -1771,12 +1771,12 @@ impl ClassFieldsTransformer {
             .clone()
     }
 
-    // Go: transformers/estransforms/classfields.go:2939 classFieldsTransformer.addPendingExpressions
+    // Go: transformers/estransforms/classfields.go:2936 classFieldsTransformer.addPendingExpressions
     pub(super) fn add_pending_expressions(&mut self, exprs: &[Node]) {
         self.pending_expressions.extend_from_slice(exprs);
     }
 
-    // Go: transformers/estransforms/classfields.go:2943 classFieldsTransformer.addPrivateIdentifierPropertyDeclarationToEnvironment
+    // Go: transformers/estransforms/classfields.go:2940 classFieldsTransformer.addPrivateIdentifierPropertyDeclarationToEnvironment
     pub(super) fn add_private_identifier_property_declaration_to_environment(
         &mut self,
         node: Node,
@@ -1854,7 +1854,7 @@ impl ClassFieldsTransformer {
         }
     }
 
-    // Go: transformers/estransforms/classfields.go:2984 classFieldsTransformer.addPrivateIdentifierMethodToEnvironment
+    // Go: transformers/estransforms/classfields.go:2981 classFieldsTransformer.addPrivateIdentifierMethodToEnvironment
     pub(super) fn add_private_identifier_method_to_environment(
         &mut self,
         name: Node,
@@ -1878,7 +1878,7 @@ impl ClassFieldsTransformer {
         );
     }
 
-    // Go: transformers/estransforms/classfields.go:3004 classFieldsTransformer.addPrivateIdentifierGetAccessorToEnvironment
+    // Go: transformers/estransforms/classfields.go:3002 classFieldsTransformer.addPrivateIdentifierGetAccessorToEnvironment
     pub(super) fn add_private_identifier_get_accessor_to_environment(
         &mut self,
         name: Node,
@@ -1917,7 +1917,7 @@ impl ClassFieldsTransformer {
         }
     }
 
-    // Go: transformers/estransforms/classfields.go:3031 classFieldsTransformer.addPrivateIdentifierSetAccessorToEnvironment
+    // Go: transformers/estransforms/classfields.go:3029 classFieldsTransformer.addPrivateIdentifierSetAccessorToEnvironment
     pub(super) fn add_private_identifier_set_accessor_to_environment(
         &mut self,
         name: Node,
@@ -1956,7 +1956,7 @@ impl ClassFieldsTransformer {
         }
     }
 
-    // Go: transformers/estransforms/classfields.go:3058 classFieldsTransformer.addPrivateIdentifierAutoAccessorToEnvironment
+    // Go: transformers/estransforms/classfields.go:3056 classFieldsTransformer.addPrivateIdentifierAutoAccessorToEnvironment
     pub(super) fn add_private_identifier_auto_accessor_to_environment(
         &mut self,
         _node: Node,
@@ -1988,7 +1988,7 @@ impl ClassFieldsTransformer {
         );
     }
 
-    // Go: transformers/estransforms/classfields.go:3083 classFieldsTransformer.addPrivateIdentifierToEnvironment
+    // Go: transformers/estransforms/classfields.go:3081 classFieldsTransformer.addPrivateIdentifierToEnvironment
     pub(super) fn add_private_identifier_to_environment(&mut self, node: Node) {
         let lex = self.get_class_lexical_environment();
         let env = self.get_private_identifier_environment();
@@ -2028,7 +2028,7 @@ impl ClassFieldsTransformer {
         }
     }
 
-    // Go: transformers/estransforms/classfields.go:3104 classFieldsTransformer.setPrivateIdentifier
+    // Go: transformers/estransforms/classfields.go:3102 classFieldsTransformer.setPrivateIdentifier
     pub(super) fn set_private_identifier(
         &self,
         env: &PrivateEnvironmentRef,
@@ -2047,7 +2047,7 @@ impl ClassFieldsTransformer {
         }
     }
 
-    // Go: transformers/estransforms/classfields.go:3115 classFieldsTransformer.getPrivateIdentifier
+    // Go: transformers/estransforms/classfields.go:3113 classFieldsTransformer.getPrivateIdentifier
     pub(super) fn get_private_identifier(
         &self,
         env: &PrivateEnvironmentRef,
@@ -2070,7 +2070,7 @@ impl ClassFieldsTransformer {
         }
     }
 
-    // Go: transformers/estransforms/classfields.go:3124 classFieldsTransformer.createHoistedVariableForClass
+    // Go: transformers/estransforms/classfields.go:3122 classFieldsTransformer.createHoistedVariableForClass
     pub(super) fn create_hoisted_variable_for_class(
         &mut self,
         name_text: &str,
@@ -2096,7 +2096,7 @@ impl ClassFieldsTransformer {
         identifier
     }
 
-    // Go: transformers/estransforms/classfields.go:3146 classFieldsTransformer.createHoistedVariableForClassFromNode
+    // Go: transformers/estransforms/classfields.go:3145 classFieldsTransformer.createHoistedVariableForClassFromNode
     pub(super) fn create_hoisted_variable_for_class_from_node(
         &mut self,
         name: Node,
@@ -2122,7 +2122,7 @@ impl ClassFieldsTransformer {
         identifier
     }
 
-    // Go: transformers/estransforms/classfields.go:3168 classFieldsTransformer.createHoistedVariableForPrivateName
+    // Go: transformers/estransforms/classfields.go:3166 classFieldsTransformer.createHoistedVariableForPrivateName
     pub(super) fn create_hoisted_variable_for_private_name(
         &mut self,
         name: Node,
@@ -2140,7 +2140,7 @@ impl ClassFieldsTransformer {
         self.create_hoisted_variable_for_class(text, name, suffix)
     }
 
-    // Go: transformers/estransforms/classfields.go:3183 classFieldsTransformer.accessPrivateIdentifier
+    // Go: transformers/estransforms/classfields.go:3181 classFieldsTransformer.accessPrivateIdentifier
     /// accessPrivateIdentifier accesses an already defined PrivateIdentifier in the current
     /// PrivateIdentifierEnvironment.
     pub(super) fn access_private_identifier(&self, name: Node) -> Option<PrivateIdentifierInfoRef> {
@@ -2159,7 +2159,7 @@ impl ClassFieldsTransformer {
         None
     }
 
-    // Go: transformers/estransforms/classfields.go:3198 classFieldsTransformer.wrapPrivateIdentifierForDestructuringTarget
+    // Go: transformers/estransforms/classfields.go:3195 classFieldsTransformer.wrapPrivateIdentifierForDestructuringTarget
     pub(super) fn wrap_private_identifier_for_destructuring_target(&mut self, node: Node) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -2189,7 +2189,7 @@ impl ClassFieldsTransformer {
         f.new_assignment_target_wrapper(parameter, assign_expr)
     }
 
-    // Go: transformers/estransforms/classfields.go:3223 classFieldsTransformer.visitAssignmentElement
+    // Go: transformers/estransforms/classfields.go:3220 classFieldsTransformer.visitAssignmentElement
     pub(super) fn visit_assignment_element(&mut self, mut node: Node) -> Node {
         // 13.15.5.5 RS: IteratorDestructuringAssignmentEvaluation
         //   AssignmentElement : DestructuringAssignmentTarget Initializer?
@@ -2284,7 +2284,7 @@ impl ClassFieldsTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/classfields.go:3292 classFieldsTransformer.visitShorthandAssignmentProperty
+    // Go: transformers/estransforms/classfields.go:3294 classFieldsTransformer.visitShorthandAssignmentProperty
     pub(super) fn visit_shorthand_assignment_property(&mut self, mut node: Node) -> Node {
         // AssignmentProperty : IdentifierReference Initializer?
 
@@ -2307,7 +2307,7 @@ impl ClassFieldsTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/classfields.go:3308 classFieldsTransformer.visitAssignmentRestProperty
+    // Go: transformers/estransforms/classfields.go:3311 classFieldsTransformer.visitAssignmentRestProperty
     pub(super) fn visit_assignment_rest_property(&mut self, node: Node) -> Node {
         if is_left_hand_side_expression(node.expression()) {
             let expr = self.visit_destructuring_assignment_target(node.expression());
@@ -2316,7 +2316,7 @@ impl ClassFieldsTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/classfields.go:3317 classFieldsTransformer.visitObjectAssignmentElement
+    // Go: transformers/estransforms/classfields.go:3320 classFieldsTransformer.visitObjectAssignmentElement
     pub(super) fn visit_object_assignment_element(&mut self, node: Node) -> Node {
         go_assert!(node.is_some() && is_object_binding_or_assignment_element(node));
         if is_spread_assignment(node) {
@@ -2331,7 +2331,7 @@ impl ClassFieldsTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/classfields.go:3331 classFieldsTransformer.visitAssignmentPattern
+    // Go: transformers/estransforms/classfields.go:3334 classFieldsTransformer.visitAssignmentPattern
     pub(super) fn visit_assignment_pattern(&mut self, node: Node) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -2363,13 +2363,13 @@ impl ClassFieldsTransformer {
         f.update_object_literal_expression(node, properties, node.multi_line())
     }
 
-    // Go: transformers/estransforms/classfields.go:3382 classFieldsTransformer.isReservedPrivateName
+    // Go: transformers/estransforms/classfields.go:3391 classFieldsTransformer.isReservedPrivateName
     pub(super) fn is_reserved_private_name(&self, node: Node) -> bool {
         !(is_private_identifier(node) && self.emit_context.has_auto_generate_info(node))
             && node.text() == "#constructor"
     }
 
-    // Go: transformers/estransforms/classfields.go:3391 classFieldsTransformer.getProperties
+    // Go: transformers/estransforms/classfields.go:3400 classFieldsTransformer.getProperties
     pub(super) fn get_properties(
         &self,
         node: Node,
@@ -2388,7 +2388,7 @@ impl ClassFieldsTransformer {
         result
     }
 
-    // Go: transformers/estransforms/classfields.go:3403 classFieldsTransformer.getStaticPropertiesAndClassStaticBlock
+    // Go: transformers/estransforms/classfields.go:3412 classFieldsTransformer.getStaticPropertiesAndClassStaticBlock
     pub(super) fn get_static_properties_and_class_static_block(&self, node: Node) -> Vec<Node> {
         let mut result: Vec<Node> = Vec::new();
         for member in node.members().iter() {
@@ -2401,7 +2401,7 @@ impl ClassFieldsTransformer {
         result
     }
 
-    // Go: transformers/estransforms/classfields.go:3484 classFieldsTransformer.createCallBinding
+    // Go: transformers/estransforms/classfields.go:3457 classFieldsTransformer.createCallBinding
     /// Returns `(thisArg, target)`.
     pub(super) fn create_call_binding(&self, node: Node) -> (Node, Node) {
         let ec = &self.emit_context;
@@ -2431,7 +2431,7 @@ impl ClassFieldsTransformer {
         (this_arg, target)
     }
 
-    // Go: transformers/estransforms/classfields.go:3519 classFieldsTransformer.createAccessorPropertyGetRedirector
+    // Go: transformers/estransforms/classfields.go:3493 classFieldsTransformer.createAccessorPropertyGetRedirector
     pub(super) fn create_accessor_property_get_redirector(
         &self,
         node: Node,
@@ -2466,7 +2466,7 @@ impl ClassFieldsTransformer {
         )
     }
 
-    // Go: transformers/estransforms/classfields.go:3539 classFieldsTransformer.createAccessorPropertySetRedirector
+    // Go: transformers/estransforms/classfields.go:3514 classFieldsTransformer.createAccessorPropertySetRedirector
     pub(super) fn create_accessor_property_set_redirector(
         &self,
         node: Node,
@@ -2513,7 +2513,7 @@ impl ClassFieldsTransformer {
     }
 }
 
-// Go: transformers/estransforms/classfields.go:3356 createPrivateStaticFieldInitializer
+// Go: transformers/estransforms/classfields.go:3365 createPrivateStaticFieldInitializer
 fn create_private_static_field_initializer(
     factory: &NodeFactory,
     variable_name: Node,
@@ -2537,7 +2537,7 @@ fn create_private_static_field_initializer(
     )
 }
 
-// Go: transformers/estransforms/classfields.go:3371 createPrivateInstanceFieldInitializer
+// Go: transformers/estransforms/classfields.go:3380 createPrivateInstanceFieldInitializer
 fn create_private_instance_field_initializer(
     factory: &NodeFactory,
     receiver: Node,
@@ -2554,7 +2554,7 @@ fn create_private_instance_field_initializer(
     )
 }
 
-// Go: transformers/estransforms/classfields.go:3378 createPrivateInstanceMethodInitializer
+// Go: transformers/estransforms/classfields.go:3387 createPrivateInstanceMethodInitializer
 fn create_private_instance_method_initializer(
     factory: &NodeFactory,
     receiver: Node,
@@ -2563,7 +2563,7 @@ fn create_private_instance_method_initializer(
     factory.new_method_call(weak_set_name, factory.new_identifier("add"), &[receiver])
 }
 
-// Go: transformers/estransforms/classfields.go:3414 classHasClassThisAssignment
+// Go: transformers/estransforms/classfields.go:3423 classHasClassThisAssignment
 /// classHasClassThisAssignment checks if a class has a static block that is a class-this assignment.
 pub(super) fn class_has_class_this_assignment(emit_context: &EmitContext, node: Node) -> bool {
     for member in node.members().iter() {
@@ -2574,14 +2574,14 @@ pub(super) fn class_has_class_this_assignment(emit_context: &EmitContext, node: 
     false
 }
 
-// Go: transformers/estransforms/classfields.go:3423 isNonStaticMethodOrAccessorWithPrivateName
+// Go: transformers/estransforms/classfields.go:3432 isNonStaticMethodOrAccessorWithPrivateName
 fn is_non_static_method_or_accessor_with_private_name(member: Node) -> bool {
     !is_static(member)
         && (is_method_or_accessor(member) || is_auto_accessor_property_declaration(member))
         && is_private_identifier(member.name())
 }
 
-// Go: transformers/estransforms/classfields.go:3429 createMemberAccessForPropertyName
+// Go: transformers/estransforms/classfields.go:3438 createMemberAccessForPropertyName
 pub(super) fn create_member_access_for_property_name(
     factory: &NodeFactory,
     emit_context: &EmitContext,
@@ -2611,7 +2611,7 @@ pub(super) fn create_member_access_for_property_name(
     expression
 }
 
-// Go: transformers/estransforms/classfields.go:3509 shouldBeCapturedInTempVariable
+// Go: transformers/estransforms/classfields.go:3483 shouldBeCapturedInTempVariable
 pub(super) fn should_be_captured_in_temp_variable(node: Node) -> bool {
     let target = skip_parentheses(node);
     !matches!(

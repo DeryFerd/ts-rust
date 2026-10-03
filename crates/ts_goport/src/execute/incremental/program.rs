@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime};
 /// Go `func() time.Time`, the `nestedEmitNow` of `NewProgram` (`sys.Now`).
 pub type NestedEmitNow = Rc<dyn Fn() -> SystemTime>;
 
-// Go: incremental/program.go:20 SignatureUpdateKind
+// Go: incremental/program.go:23 SignatureUpdateKind
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum SignatureUpdateKind {
@@ -178,7 +178,7 @@ pub fn build_info_program(
     })
 }
 
-// Go: incremental/program.go:58 TestingData
+// Go: incremental/program.go:69 TestingData
 // PORT: testing. Go keeps pointers to the new snapshot's and the old
 // program's `semanticDiagnosticsPerFile`, and the Go test harness compares
 // the entry pointers. The entry identity is its `id` (see
@@ -264,14 +264,14 @@ impl Program {
             .map(|diagnostics| diagnostics.id)
     }
 
-    // Go: incremental/program.go:68 panicIfNoProgram
+    // Go: incremental/program.go:110 panicIfNoProgram
     fn panic_if_no_program(&self, method: &str) {
         if self.program.is_none() {
             panic!("{method}: should not be called without program");
         }
     }
 
-    // Go: incremental/program.go:74 GetProgram
+    // Go: incremental/program.go:116 GetProgram
     #[must_use]
     pub fn get_program(&self) -> &'static GoProgram {
         self.panic_if_no_program("GetProgram");
@@ -286,20 +286,20 @@ impl Program {
         Rc::try_unwrap(snapshot).ok().map(RefCell::into_inner)
     }
 
-    // Go: incremental/program.go:79 HasChangedDtsFile
+    // Go: incremental/program.go:121 HasChangedDtsFile
     #[must_use]
     pub fn has_changed_dts_file(&self) -> bool {
         self.snapshot.borrow().has_changed_dts_file
     }
 
-    // Go: incremental/program.go:84 Options
+    // Go: incremental/program.go:126 Options
     // Options implements compiler.AnyProgram interface.
     #[must_use]
     pub fn options(&self) -> &'static CompilerOptions {
         self.snapshot.borrow().options
     }
 
-    // Go: incremental/program.go:89 CommonSourceDirectory
+    // Go: incremental/program.go:131 CommonSourceDirectory
     // CommonSourceDirectory implements compiler.AnyProgram interface.
     #[must_use]
     pub fn common_source_directory(&self) -> &'static str {
@@ -307,7 +307,7 @@ impl Program {
         common_source_directory()
     }
 
-    // Go: incremental/program.go:95 Program
+    // Go: incremental/program.go:137 Program
     // Program implements compiler.AnyProgram interface.
     #[must_use]
     pub fn program(&self) -> &'static GoProgram {
@@ -315,7 +315,7 @@ impl Program {
         self.program.expect("program")
     }
 
-    // Go: incremental/program.go:101 IsSourceFileDefaultLibrary
+    // Go: incremental/program.go:143 IsSourceFileDefaultLibrary
     // IsSourceFileDefaultLibrary implements compiler.AnyProgram interface.
     #[must_use]
     pub fn is_source_file_default_library(&self, path: &Path) -> bool {
@@ -323,7 +323,7 @@ impl Program {
         is_source_file_default_library(path)
     }
 
-    // Go: incremental/program.go:107 GetSourceFiles
+    // Go: incremental/program.go:149 GetSourceFiles
     // GetSourceFiles implements compiler.AnyProgram interface.
     #[must_use]
     pub fn get_source_files(&self) -> Vec<Node> {
@@ -331,7 +331,7 @@ impl Program {
         source_files()
     }
 
-    // Go: incremental/program.go:113 GetSourceFile
+    // Go: incremental/program.go:155 GetSourceFile
     // GetSourceFile implements compiler.AnyProgram interface.
     #[must_use]
     pub fn get_source_file(&self, path: &str) -> Node {
@@ -339,7 +339,7 @@ impl Program {
         get_source_file(path)
     }
 
-    // Go: incremental/program.go:119 GetConfigFileParsingDiagnostics
+    // Go: incremental/program.go:161 GetConfigFileParsingDiagnostics
     // GetConfigFileParsingDiagnostics implements compiler.AnyProgram interface.
     #[must_use]
     pub fn get_config_file_parsing_diagnostics(&self) -> Vec<Diagnostic> {
@@ -347,7 +347,7 @@ impl Program {
         get_config_file_parsing_diagnostics()
     }
 
-    // Go: incremental/program.go:125 GetSyntacticDiagnostics
+    // Go: incremental/program.go:167 GetSyntacticDiagnostics
     // GetSyntacticDiagnostics implements compiler.AnyProgram interface.
     #[must_use]
     pub fn get_syntactic_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
@@ -355,7 +355,7 @@ impl Program {
         get_syntactic_diagnostics(file)
     }
 
-    // Go: incremental/program.go:131 GetBindDiagnostics
+    // Go: incremental/program.go:173 GetBindDiagnostics
     // GetBindDiagnostics implements compiler.AnyProgram interface.
     #[must_use]
     pub fn get_bind_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
@@ -363,14 +363,14 @@ impl Program {
         get_bind_diagnostics(file)
     }
 
-    // Go: incremental/program.go:136 GetProgramDiagnostics
+    // Go: incremental/program.go:178 GetProgramDiagnostics
     #[must_use]
     pub fn get_program_diagnostics(&self) -> Vec<Diagnostic> {
         self.panic_if_no_program("GetProgramDiagnostics");
         get_program_diagnostics()
     }
 
-    // Go: incremental/program.go:141 GetGlobalDiagnostics
+    // Go: incremental/program.go:183 GetGlobalDiagnostics
     // PORT: the first call returns what `start_check` read, if it ran.
     // Since ts#64452 Go `GetDiagnosticsOfAnyProgram` does not ask an
     // incremental program for them again after the check: each file's
@@ -491,7 +491,7 @@ impl Program {
         started.global_diagnostics.is_none() && started.check.is_none() && started.emit.is_none()
     }
 
-    // Go: incremental/program.go:147 GetSemanticDiagnostics
+    // Go: incremental/program.go:189 GetSemanticDiagnostics
     // GetSemanticDiagnostics implements compiler.AnyProgram interface.
     #[must_use]
     pub fn get_semantic_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
@@ -515,7 +515,7 @@ impl Program {
         diagnostics
     }
 
-    // Go: incremental/program.go:171 getSemanticDiagnosticsOfFile
+    // Go: incremental/program.go:213 getSemanticDiagnosticsOfFile
     fn get_semantic_diagnostics_of_file(&self, file: Node) -> Vec<Diagnostic> {
         let mut snapshot = self.snapshot.borrow_mut();
         let options = snapshot.options;
@@ -547,7 +547,7 @@ impl Program {
         result.diagnostics
     }
 
-    // Go: incremental/program.go:196 GetSuggestionDiagnostics
+    // Go: incremental/program.go:237 GetSuggestionDiagnostics
     // GetSuggestionDiagnostics implements compiler.AnyProgram interface.
     #[must_use]
     pub fn get_suggestion_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
@@ -594,7 +594,7 @@ impl Program {
         emit_files(self, options, false)
     }
 
-    // Go: incremental/program.go:229 collectSemanticDiagnosticsOfAffectedFiles (ts#64452)
+    // Go: incremental/program.go:276 collectSemanticDiagnosticsOfAffectedFiles (ts#64452)
     // Handle affected files and cache the semantic diagnostics for all of them or the file asked for
     // PORT: split in two (`semantic_diagnostics_files_to_check` and
     // `commit_semantic_diagnostics`), so `start_check` can send the check
@@ -685,7 +685,7 @@ impl Program {
         snapshot.build_info_emit_pending = true;
     }
 
-    // Go: incremental/program.go:278 emitBuildInfo
+    // Go: incremental/program.go:322 emitBuildInfo
     pub(crate) fn emit_build_info(&self, options: &EmitOptions) -> Option<EmitResult> {
         let _trace = crate::tracing::get().map(|tr| {
             tr.push(
@@ -779,7 +779,7 @@ impl Program {
         })
     }
 
-    // Go: incremental/program.go:320 ensureHasErrorsForState
+    // Go: incremental/program.go:387 ensureHasErrorsForState
     // PORT: Go `program` is the current program.
     fn ensure_has_errors_for_state(&self) {
         let files = source_files();
@@ -879,7 +879,7 @@ impl Program {
         }
     }
 
-    // Go: incremental/program.go:402 ensurePackageJsonsForState
+    // Go: incremental/program.go:454 ensurePackageJsonsForState
     // PORT: Go appends to the snapshot slices inside the callback. The
     // callback here fills local lists, so the snapshot is not borrowed while
     // the file system runs.
@@ -911,7 +911,7 @@ impl Program {
         snapshot.missing_package_jsons = Some(normalize_package_jsons(missing_package_jsons));
     }
 
-    // Go: incremental/program.go:433 PackageJsonLookupPaths
+    // Go: incremental/program.go:485 PackageJsonLookupPaths
     #[must_use]
     pub fn package_json_lookup_paths(&self) -> Vec<String> {
         let config = get_directory_path(command_line().config_name());
@@ -934,7 +934,7 @@ impl Program {
     }
 }
 
-// Go: incremental/program.go:425 normalizePackageJsons
+// Go: incremental/program.go:477 normalizePackageJsons
 // PORT: Go returns a new empty slice for nil. The list is sorted, so
 // `dedup` gives the same result as Go `core.Deduplicate`.
 fn normalize_package_jsons(mut package_jsons: Vec<String>) -> Vec<String> {
@@ -943,7 +943,7 @@ fn normalize_package_jsons(mut package_jsons: Vec<String>) -> Vec<String> {
     package_jsons
 }
 
-// Go: compiler/program.go:1905 HandleNoEmitOptions
+// Go: compiler/program.go:1976 HandleNoEmitOptions
 // HandleNoEmitOptions mirrors tsc's handleNoEmitOptions.
 // PORT: #4407 replaced Go `HandleNoEmitOnError`.
 // `emitter::program_emit::handle_no_emit_options` is the plain program form
@@ -995,7 +995,7 @@ pub fn handle_no_emit_options(
     Some(EmitResult::default())
 }
 
-// Go: compiler/program.go:1710 ProgramLike (var _ compiler.ProgramLike = (*Program)(nil))
+// Go: compiler/program.go:1957 ProgramLike (var _ compiler.ProgramLike = (*Program)(nil))
 impl ProgramLike for Program {
     fn options(&self) -> &'static CompilerOptions {
         Program::options(self)

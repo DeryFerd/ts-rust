@@ -28,7 +28,7 @@ impl CommandLineOptionKind {
 
 /// Go `any` in option code (`CompilerOptionsValue`, enum map values,
 /// `DefaultValueDescription`, and values read from tsconfig JSON).
-// Go: tsoptions/commandlineoption.go:200 CompilerOptionsValue
+// Go: tsoptions/commandlineoption.go:204 CompilerOptionsValue
 // PORT: Go `any` becomes a closed enum with one variant per dynamic type
 // that tsoptions stores in an `any`. `Nil` is Go untyped nil. `Int` is a Go
 // `int`, `Number` a JSON `float64`. `List` is a non-nil `[]any`, `NilList`
@@ -357,7 +357,7 @@ pub static COMMAND_LINE_OPTION_ELEMENTS: LazyLock<
 });
 
 // CommandLineOption.EnumMap()
-// Go: tsoptions/commandlineoption.go:179 commandLineOptionEnumMap
+// Go: tsoptions/commandlineoption.go:183 commandLineOptionEnumMap
 pub static COMMAND_LINE_OPTION_ENUM_MAP: LazyLock<
     FxHashMap<&'static str, &'static CommandLineOptionEnumMap>,
 > = LazyLock::new(|| {
@@ -377,7 +377,7 @@ pub static COMMAND_LINE_OPTION_ENUM_MAP: LazyLock<
 });
 
 // CommandLineOption.DeprecatedKeys()
-// Go: tsoptions/commandlineoption.go:193 commandLineOptionDeprecated
+// Go: tsoptions/commandlineoption.go:197 commandLineOptionDeprecated
 pub static COMMAND_LINE_OPTION_DEPRECATED: LazyLock<FxHashMap<&'static str, FxHashSet<String>>> =
     LazyLock::new(|| {
         let set = |items: &[&str]| {

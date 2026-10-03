@@ -10,7 +10,7 @@
 
 use crate::prelude::*;
 
-// Go: checker/checker.go:16048 ExportCollision
+// Go: checker/checker.go:16460 ExportCollision
 // PERF: Go stores `specifierText`, the text of the first export node's
 // module specifier. We store that export node and make the text only when a
 // TS2308 diagnostic uses it. Most entries never report, so this saves one
@@ -21,7 +21,7 @@ pub struct ExportCollision {
     pub exports_with_duplicate: Vec<Node>,
 }
 
-// Go: checker/checker.go:16053 ExportCollisionTable
+// Go: checker/checker.go:16465 ExportCollisionTable
 // PORT: Go `map[string]*ExportCollision`. Go iterates this map to report
 // diagnostics; Go map order is random, so we keep insertion order
 // (`IndexMap`) to be deterministic. Diagnostics are sorted later.
@@ -38,7 +38,7 @@ struct ExportsOfModuleVisitState {
     type_only_export_star_map: FxHashMap<String, Node>,
 }
 
-// Go: checker/utilities.go:195 entityNameToString
+// Go: checker/utilities.go:217 entityNameToString
 // PORT: the checker wrapper `entityNameToString(name)` has the same snake
 // name as the ast function `EntityNameToString(name, getTextOfNode)` that is
 // already ported as `entity_name_to_string(name, Option<..>)`. To avoid the
@@ -49,7 +49,7 @@ fn checker_entity_name_to_string(name: Node) -> String {
 }
 
 impl Checker {
-    // Go: checker/checker.go:15735 resolveQualifiedName
+    // Go: checker/checker.go:16147 resolveQualifiedName
     pub fn resolve_qualified_name(
         &mut self,
         name: Node,
@@ -168,7 +168,7 @@ impl Checker {
         symbol
     }
 
-    // Go: checker/checker.go:15798 tryGetQualifiedNameAsValue
+    // Go: checker/checker.go:16210 tryGetQualifiedNameAsValue
     pub fn try_get_qualified_name_as_value(&mut self, node: Node) -> SymbolId {
         let id = get_first_identifier(node);
         let mut symbol = self.resolve_name(
@@ -194,7 +194,7 @@ impl Checker {
         symbol
     }
 
-    // Go: checker/checker.go:15816 getSuggestedSymbolForNonexistentModule
+    // Go: checker/checker.go:16228 getSuggestedSymbolForNonexistentModule
     pub fn get_suggested_symbol_for_nonexistent_module(
         &mut self,
         name: Node,
@@ -205,7 +205,7 @@ impl Checker {
         self.get_spelling_suggestion_for_name(name.text(), &symbols, SymbolFlags::MODULE_MEMBER)
     }
 
-    // Go: checker/checker.go:15820 getFullyQualifiedName
+    // Go: checker/checker.go:16232 getFullyQualifiedName
     pub fn get_fully_qualified_name(
         &mut self,
         symbol: SymbolId,
@@ -224,7 +224,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:15827 getExportsOfSymbol
+    // Go: checker/checker.go:16239 getExportsOfSymbol
     pub fn get_exports_of_symbol(&mut self, symbol: SymbolId) -> SymbolTable {
         let flags = self.sym(symbol).flags;
         if flags.intersects(SymbolFlags::LATE_BINDING_CONTAINER) {
@@ -239,7 +239,7 @@ impl Checker {
         self.sym(symbol).exports
     }
 
-    // Go: checker/checker.go:15837 getResolvedMembersOrExportsOfSymbol
+    // Go: checker/checker.go:16249 getResolvedMembersOrExportsOfSymbol
     pub fn get_resolved_members_or_exports_of_symbol(
         &mut self,
         symbol: SymbolId,
@@ -298,7 +298,7 @@ impl Checker {
         self.members_and_exports_links.get(symbol)[kind]
     }
 
-    // Go: checker/checker.go:15912 lateBindMember
+    // Go: checker/checker.go:16324 lateBindMember
     // Performs late-binding of a dynamic member. This performs the same function for
     // late-bound members that `declareSymbol` in binder.ts performs for early-bound
     // members.
@@ -413,7 +413,7 @@ impl Checker {
         self.symbol_node_links.get(decl).resolved_symbol
     }
 
-    // Go: checker/checker.go:15975 lateBindIndexSignature
+    // Go: checker/checker.go:16387 lateBindIndexSignature
     pub fn late_bind_index_signature(
         &mut self,
         parent: SymbolId,
@@ -451,7 +451,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:15996 isNotReplacableByMethod
+    // Go: checker/checker.go:16408 isNotReplacableByMethod
     // PORT: Go package function; it reads symbol flags, so it is a Checker method.
     pub fn is_not_replacable_by_method(&self, decl: Node) -> bool {
         !self
@@ -460,7 +460,7 @@ impl Checker {
             .intersects(SymbolFlags::REPLACEABLE_BY_METHOD)
     }
 
-    // Go: checker/checker.go:16003 addDeclarationToLateBoundSymbol
+    // Go: checker/checker.go:16415 addDeclarationToLateBoundSymbol
     // Adds a declaration to a late-bound dynamic member. This performs the same function for
     // late-bound members that `addDeclarationToSymbol` in binder.ts performs for early-bound
     // members.
@@ -512,7 +512,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:16031 getMembersOfSymbol
+    // Go: checker/checker.go:16443 getMembersOfSymbol
     // Gets a SymbolTable containing both the early- and late-bound members of a symbol.
     //
     // For a description of late-binding, see `lateBindMember`.
@@ -530,7 +530,7 @@ impl Checker {
         self.sym(symbol).members
     }
 
-    // Go: checker/checker.go:16038 getExportsOfModule
+    // Go: checker/checker.go:16450 getExportsOfModule
     pub fn get_exports_of_module(&mut self, module_symbol: SymbolId) -> SymbolTable {
         if self
             .module_symbol_links
@@ -547,7 +547,7 @@ impl Checker {
         self.module_symbol_links.get(module_symbol).resolved_exports
     }
 
-    // Go: checker/checker.go:16055 getExportsOfModuleWorker
+    // Go: checker/checker.go:16467 getExportsOfModuleWorker
     pub fn get_exports_of_module_worker(
         &mut self,
         module_symbol: SymbolId,
@@ -609,7 +609,7 @@ impl Checker {
         (exports, state.type_only_export_star_map)
     }
 
-    // Go: checker/checker.go:16061 getExportsOfModuleWorker.visit
+    // Go: checker/checker.go:16473 getExportsOfModuleWorker.visit
     // PORT: the Go recursive closure `visit`; the captured variables live in
     // `state`.
     // The ES6 spec permits export * declarations in a module to circularly reference the module itself. For example,
@@ -718,7 +718,7 @@ impl Checker {
         symbols
     }
 
-    // Go: checker/checker.go:16142 extendExportSymbols
+    // Go: checker/checker.go:16554 extendExportSymbols
     // Extends one symbol table with another while collecting information on name collisions for error message generation into the `lookupTable` argument
     // Not passing `lookupTable` and `exportNode` disables this collection, and just extends the tables
     pub fn extend_export_symbols(
@@ -765,7 +765,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:16162 ResolveAlias
+    // Go: checker/checker.go:16574 ResolveAlias
     pub fn resolve_alias_exported(&mut self, symbol: SymbolId) -> (SymbolId, bool) {
         if symbol.is_nil() {
             return (SymbolId::NIL, false);
@@ -774,7 +774,7 @@ impl Checker {
         (resolved, resolved != self.unknown_symbol)
     }
 
-    // Go: checker/checker.go:16173 resolveAlias
+    // Go: checker/checker.go:16585 resolveAlias
     // Resolve an alias symbol to the first target symbol in the resolution chain that includes some other
     // meaning. Pure aliases are eagerly resolved and any type-only markers are back-propagated to the original
     // symbol. The function panics if the argument is not a symbol with an alias meaning.
@@ -825,7 +825,7 @@ impl Checker {
         self.alias_symbol_links.get(symbol).alias_target
     }
 
-    // Go: checker/checker.go:16200 resolveIndirectionAlias
+    // Go: checker/checker.go:16612 resolveIndirectionAlias
     pub fn resolve_indirection_alias(&mut self, source: SymbolId, target: SymbolId) -> SymbolId {
         let resolved = self.resolve_alias(target);
         let result = self.get_merged_symbol(resolved);
@@ -840,7 +840,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:16210 tryResolveAlias
+    // Go: checker/checker.go:16622 tryResolveAlias
     pub fn try_resolve_alias(&mut self, symbol: SymbolId) -> SymbolId {
         let alias_target = self.alias_symbol_links.get(symbol).alias_target;
         if alias_target.is_some()
@@ -854,7 +854,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:16218 resolveAliasWithDeprecationCheck
+    // Go: checker/checker.go:16630 resolveAliasWithDeprecationCheck
     pub fn resolve_alias_with_deprecation_check(
         &mut self,
         symbol: SymbolId,
@@ -897,7 +897,7 @@ impl Checker {
         target_symbol
     }
 
-    // Go: checker/checker.go:16270 getSymbolFlags
+    // Go: checker/checker.go:16682 getSymbolFlags
     // Gets combined flags of a `symbol` and all alias targets it resolves to. `resolveAlias`
     // is typically recursive over chains of aliases, but stops mid-chain if an alias is merged
     // with another exported symbol, e.g.
@@ -923,7 +923,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:16274 getSymbolFlagsEx
+    // Go: checker/checker.go:16686 getSymbolFlagsEx
     pub fn get_symbol_flags_ex(
         &mut self,
         symbol: SymbolId,
@@ -962,7 +962,7 @@ impl Checker {
         flags
     }
 
-    // Go: checker/checker.go:16304 getDeclarationOfAliasSymbol
+    // Go: checker/checker.go:16716 getDeclarationOfAliasSymbol
     pub fn get_declaration_of_alias_symbol(&self, symbol: SymbolId) -> Node {
         self.sym(symbol)
             .declarations
@@ -973,7 +973,7 @@ impl Checker {
             .unwrap_or(Node::NIL)
     }
 
-    // Go: checker/checker.go:16308 getTypeOfSymbolWithDeferredType
+    // Go: checker/checker.go:16720 getTypeOfSymbolWithDeferredType
     pub fn get_type_of_symbol_with_deferred_type(&mut self, symbol: SymbolId) -> TypeId {
         // One link lookup on the cached hit. The miss returns the value it
         // just stored, as Go returns links.resolvedType.
@@ -998,7 +998,7 @@ impl Checker {
         resolved_type
     }
 
-    // Go: checker/checker.go:16321 getWriteTypeOfSymbolWithDeferredType
+    // Go: checker/checker.go:16733 getWriteTypeOfSymbolWithDeferredType
     pub fn get_write_type_of_symbol_with_deferred_type(&mut self, symbol: SymbolId) -> TypeId {
         if self.value_symbol_links.get(symbol).write_type.is_nil() {
             let deferred = self.deferred_symbol_links.get(symbol);
@@ -1018,7 +1018,7 @@ impl Checker {
         self.value_symbol_links.get(symbol).write_type
     }
 
-    // Go: checker/checker.go:16341 getWriteTypeOfSymbol
+    // Go: checker/checker.go:16753 getWriteTypeOfSymbol
     // Distinct write types come only from set accessors, but synthetic union and intersection
     // properties deriving from set accessors will either pre-compute or defer the union or
     // intersection of the writeTypes of their constituents.
@@ -1055,7 +1055,7 @@ impl Checker {
         self.get_type_of_symbol(symbol)
     }
 
-    // Go: checker/checker.go:16361 GetTypeOfSymbolAtLocation
+    // Go: checker/checker.go:16773 GetTypeOfSymbolAtLocation
     pub fn get_type_of_symbol_at_location(&mut self, symbol: SymbolId, location: Node) -> TypeId {
         let symbol = self.get_export_symbol_of_value_symbol_if_exported(symbol);
         let mut location = location;
@@ -1113,7 +1113,7 @@ impl Checker {
         self.get_non_missing_type_of_symbol(symbol)
     }
 
-    // Go: checker/checker.go:16400 getTypeOfSymbol
+    // Go: checker/checker.go:16812 getTypeOfSymbol
     pub fn get_type_of_symbol(&mut self, symbol: SymbolId) -> TypeId {
         if symbol.is_nil() {
             // Go reads `symbol.CheckFlags` and panics on nil, for example
@@ -1159,14 +1159,14 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/checker.go:16431 getNonMissingTypeOfSymbol
+    // Go: checker/checker.go:16843 getNonMissingTypeOfSymbol
     pub fn get_non_missing_type_of_symbol(&mut self, symbol: SymbolId) -> TypeId {
         let t = self.get_type_of_symbol(symbol);
         let is_optional = self.sym(symbol).flags.intersects(SymbolFlags::OPTIONAL);
         self.remove_missing_type(t, is_optional)
     }
 
-    // Go: checker/checker.go:16435 getTypeOfInstantiatedSymbol
+    // Go: checker/checker.go:16847 getTypeOfInstantiatedSymbol
     pub fn get_type_of_instantiated_symbol(&mut self, symbol: SymbolId) -> TypeId {
         // One link lookup on the cached hit. The miss returns the value it
         // just stored, as Go returns links.resolvedType.
@@ -1181,7 +1181,7 @@ impl Checker {
         resolved_type
     }
 
-    // Go: checker/checker.go:16443 getWriteTypeOfInstantiatedSymbol
+    // Go: checker/checker.go:16855 getWriteTypeOfInstantiatedSymbol
     pub fn get_write_type_of_instantiated_symbol(&mut self, symbol: SymbolId) -> TypeId {
         // One link lookup on the cached hit, as in get_type_of_instantiated_symbol.
         let links = self.value_symbol_links.get(symbol);
@@ -1195,7 +1195,7 @@ impl Checker {
         write_type
     }
 
-    // Go: checker/checker.go:16451 getTypeOfVariableOrParameterOrProperty
+    // Go: checker/checker.go:16863 getTypeOfVariableOrParameterOrProperty
     pub fn get_type_of_variable_or_parameter_or_property(&mut self, symbol: SymbolId) -> TypeId {
         // One link lookup on the cached hit.
         let cached = self.value_symbol_links.get(symbol).resolved_type;
@@ -1220,7 +1220,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:16471 isParameterOfContextSensitiveSignature
+    // Go: checker/checker.go:16883 isParameterOfContextSensitiveSignature
     pub fn is_parameter_of_context_sensitive_signature(&mut self, symbol: SymbolId) -> bool {
         let mut decl = self.sym(symbol).value_declaration;
         if decl.is_nil() {
@@ -1235,7 +1235,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:16485 getTypeOfVariableOrParameterOrPropertyWorker
+    // Go: checker/checker.go:16897 getTypeOfVariableOrParameterOrPropertyWorker
     pub fn get_type_of_variable_or_parameter_or_property_worker(
         &mut self,
         symbol: SymbolId,
@@ -1333,7 +1333,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:16554 getWidenedTypeForVariableLikeDeclaration
+    // Go: checker/checker.go:16966 getWidenedTypeForVariableLikeDeclaration
     // Return the type associated with a variable, parameter, or property declaration. In the simple case this is the type
     // specified in a type annotation or inferred from an initializer. However, in the case of a destructuring declaration it
     // is a bit more involved. For example:
@@ -1356,7 +1356,7 @@ impl Checker {
         self.widen_type_for_variable_like_declaration(t, declaration, report_errors)
     }
 
-    // Go: checker/checker.go:16559 getTypeForVariableLikeDeclaration
+    // Go: checker/checker.go:16971 getTypeForVariableLikeDeclaration
     // Return the inferred type for a variable, parameter, or property declaration
     pub fn get_type_for_variable_like_declaration(
         &mut self,

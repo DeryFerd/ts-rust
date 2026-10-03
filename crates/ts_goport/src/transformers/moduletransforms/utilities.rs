@@ -48,7 +48,7 @@ pub(crate) fn rewrite_module_specifier(
     node
 }
 
-// Go: core/core.go:687 ShouldRewriteModuleSpecifier
+// Go: core/core.go:724 ShouldRewriteModuleSpecifier
 // PORT: the checker copy (`checker_p17::core_p17`) is private, so this unit
 // keeps its own copy of the Go `core` helper.
 pub(crate) fn should_rewrite_module_specifier(
@@ -63,7 +63,7 @@ pub(crate) fn should_rewrite_module_specifier(
         && tspath::has_ts_file_extension(specifier)
 }
 
-// Go: transformers/moduletransforms/utilities.go:37 createEmptyImports
+// Go: transformers/moduletransforms/utilities.go:36 createEmptyImports
 pub(crate) fn create_empty_imports(factory: &NodeFactory) -> Node {
     factory.new_export_declaration(
         ModifierList::NIL, /*modifiers*/
@@ -74,7 +74,7 @@ pub(crate) fn create_empty_imports(factory: &NodeFactory) -> Node {
     )
 }
 
-// Go: transformers/moduletransforms/utilities.go:55 getExternalModuleNameLiteral
+// Go: transformers/moduletransforms/utilities.go:53 getExternalModuleNameLiteral
 /// Get the name of a target module from an import/export declaration as should be written in the emitted output.
 /// The emitted output name can be different from the input if:
 ///  1. The module has a /// <amd-module name="<new name>" />
@@ -107,7 +107,7 @@ pub(crate) fn get_external_module_name_literal(
     Node::NIL
 }
 
-// Go: transformers/moduletransforms/utilities.go:77 tryGetModuleNameFromFile
+// Go: transformers/moduletransforms/utilities.go:74 tryGetModuleNameFromFile
 /// Get the name of a module as should be written in the emitted output.
 /// The emitted output name can be different from the input if:
 ///  1. The module has a /// <amd-module name="<new name>" />
@@ -129,7 +129,7 @@ pub(crate) fn try_get_module_name_from_file(
     Node::NIL
 }
 
-// Go: transformers/moduletransforms/utilities.go:88 tryGetModuleNameFromDeclaration
+// Go: transformers/moduletransforms/utilities.go:85 tryGetModuleNameFromDeclaration
 pub(crate) fn try_get_module_name_from_declaration(
     declaration: Node, /*ImportEqualsDeclaration | ImportDeclaration | ExportDeclaration | ImportCall*/
     factory: &NodeFactory,
@@ -146,7 +146,7 @@ pub(crate) fn try_get_module_name_from_declaration(
     )
 }
 
-// Go: transformers/moduletransforms/utilities.go:96 getExternalModuleNameFromPath
+// Go: transformers/moduletransforms/utilities.go:93 getExternalModuleNameFromPath
 /// Resolves a local path to a path which is absolute to the base of the emit
 pub(crate) fn get_external_module_name_from_path(
     _file_name: &str,
@@ -156,7 +156,7 @@ pub(crate) fn get_external_module_name_from_path(
     String::new()
 }
 
-// Go: transformers/moduletransforms/utilities.go:103 tryRenameExternalModule
+// Go: transformers/moduletransforms/utilities.go:100 tryRenameExternalModule
 /// Some bundlers (SystemJS builder) sometimes want to rename dependencies.
 /// Here we check if alternative name was provided for a given moduleName and return it if possible.
 pub(crate) fn try_rename_external_module(
@@ -168,7 +168,7 @@ pub(crate) fn try_rename_external_module(
     Node::NIL
 }
 
-// Go: transformers/moduletransforms/utilities.go:108 isFileLevelReservedGeneratedIdentifier
+// Go: transformers/moduletransforms/utilities.go:105 isFileLevelReservedGeneratedIdentifier
 pub(crate) fn is_file_level_reserved_generated_identifier(
     emit_context: &EmitContext,
     name: Node,
@@ -183,7 +183,7 @@ pub(crate) fn is_file_level_reserved_generated_identifier(
     }
 }
 
-// Go: transformers/moduletransforms/utilities.go:115 isSimpleInlineableExpression
+// Go: transformers/moduletransforms/utilities.go:116 isSimpleInlineableExpression
 /// A simple inlinable expression is an expression which can be copied into multiple locations
 /// without risk of repeating any sideeffects and whose value could not possibly change between
 /// any such locations

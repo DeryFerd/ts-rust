@@ -26,6 +26,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 mod go_frontend;
+pub(crate) use go_frontend::cached_lazy_js_doc;
 pub mod ls_program;
 
 // ---------------------------------------------------------------------------
@@ -1426,7 +1427,7 @@ pub fn lineage_live_chunks() -> usize {
     with_lineage(|lineage| lineage.symbols.live_chunk_count())
 }
 
-// Go: compiler/program.go:445 BindSourceFiles
+// Go: compiler/program.go:574 BindSourceFiles
 // PORT: Go binds files in parallel into per-file symbol tables. Here every
 // file binds into the shared `LINEAGE` arena, and the program's binder
 // symbols (`bound_symbols`, in its `VersionTables`) are a copy of it after
@@ -2030,7 +2031,7 @@ fn bind_files_parallel(lineage: &mut Lineage) {
 // Resolution modes (Go compiler/fileloader.go)
 // ---------------------------------------------------------------------------
 
-// Go: compiler/fileloader.go:718 getDefaultResolutionModeForFile
+// Go: compiler/fileloader.go:1041 getDefaultResolutionModeForFile
 fn get_default_resolution_mode_for_file_worker(
     file_name: &str,
     meta: &SourceFileMetaData,
@@ -2043,7 +2044,7 @@ fn get_default_resolution_mode_for_file_worker(
     }
 }
 
-// Go: compiler/fileloader.go:726 getModeForUsageLocation
+// Go: compiler/fileloader.go:1049 getModeForUsageLocation
 fn get_mode_for_usage_location_worker(
     file_name: &str,
     meta: &SourceFileMetaData,
@@ -2079,7 +2080,7 @@ fn get_mode_for_usage_location_worker(
     RESOLUTION_MODE_NONE
 }
 
-// Go: compiler/fileloader.go:758 importSyntaxAffectsModuleResolution
+// Go: compiler/fileloader.go:1081 importSyntaxAffectsModuleResolution
 fn import_syntax_affects_module_resolution(options: &CompilerOptions) -> bool {
     let module_resolution = options.get_module_resolution_kind();
     ModuleResolutionKind::NODE16 <= module_resolution
@@ -2088,7 +2089,7 @@ fn import_syntax_affects_module_resolution(options: &CompilerOptions) -> bool {
         || options.get_resolve_package_json_imports()
 }
 
-// Go: compiler/fileloader.go:764 getEmitSyntaxForUsageLocationWorker
+// Go: compiler/fileloader.go:1087 getEmitSyntaxForUsageLocationWorker
 fn get_emit_syntax_for_usage_location_worker(
     file_name: &str,
     meta: &SourceFileMetaData,
@@ -2142,31 +2143,31 @@ pub fn resolve_lazy_js_doc(file: Node, info: &SourceFileInfo, node: Node) -> &'s
     go_frontend::resolve_lazy_js_doc(file, info, node)
 }
 
-// Go: compiler/program.go:122 FileExists
-// Go: ls/autoimport/aliasresolver.go:158 FileExists (unimplemented)
+// Go: compiler/program.go:129 FileExists
+// Go: ls/autoimport/aliasresolver.go:163 FileExists (unimplemented)
 pub fn file_exists(path: &str) -> bool {
     alias_resolver_unimplemented();
     go_frontend::file_exists(path)
 }
 
-// Go: compiler/program.go:127 GetCurrentDirectory
+// Go: compiler/program.go:134 GetCurrentDirectory
 pub fn get_current_directory() -> &'static str {
     state().cwd
 }
 
-// Go: compiler/program.go:215 UseCaseSensitiveFileNames
+// Go: compiler/program.go:231 UseCaseSensitiveFileNames
 pub fn use_case_sensitive_file_names() -> bool {
     state().use_case_sensitive_file_names
 }
 
-// Go: compiler/program.go:219 UsesUriStyleNodeCoreModules
+// Go: compiler/program.go:235 UsesUriStyleNodeCoreModules
 // Go never assigns the program field (only UpdateProgram copies it), so the
 // value is always unknown.
 pub fn uses_uri_style_node_core_modules() -> Tristate {
     Tristate::Unknown
 }
 
-// Go: compiler/program.go:173 GetProjectReferenceFromSource
+// Go: compiler/program.go:189 GetProjectReferenceFromSource
 // PORT: the Go frontend program has the port.
 pub fn get_project_reference_from_source(
     path: &str,
@@ -2176,14 +2177,14 @@ pub fn get_project_reference_from_source(
     with_go(|go| go.get_project_reference_from_source(path))
 }
 
-// Go: compiler/program.go:178 IsSourceFromProjectReference
+// Go: compiler/program.go:194 IsSourceFromProjectReference
 pub fn is_source_from_project_reference(path: &str) -> bool {
     // Go: ls/autoimport/aliasresolver.go:223 (unimplemented)
     alias_resolver_unimplemented();
     with_go(|go| go.is_source_from_project_reference(path))
 }
 
-// Go: compiler/program.go:182 GetProjectReferenceFromOutputDts
+// Go: compiler/program.go:198 GetProjectReferenceFromOutputDts
 // PORT: see `get_project_reference_from_source`.
 pub fn get_project_reference_from_output_dts(
     path: &str,
@@ -2193,7 +2194,7 @@ pub fn get_project_reference_from_output_dts(
     with_go(|go| go.get_project_reference_from_output_dts(path))
 }
 
-// Go: compiler/program.go:190 GetRedirectForResolution
+// Go: compiler/program.go:206 GetRedirectForResolution
 // PORT: see `get_project_reference_from_source`.
 pub fn get_redirect_for_resolution(file: Node) -> Option<Arc<ResolvedProjectReference>> {
     // Go: ls/autoimport/aliasresolver.go:198 (unimplemented)
@@ -2202,8 +2203,8 @@ pub fn get_redirect_for_resolution(file: Node) -> Option<Arc<ResolvedProjectRefe
 }
 
 // Go: compiler/projectreferencefilemapper.go:80 getCompilerOptionsForFile
-// Go: module/resolver.go:145 GetCompilerOptionsWithRedirect
-// Go: compiler/program.go:1519 GetSourceFileMetaData
+// Go: module/resolver.go:138 GetCompilerOptionsWithRedirect
+// Go: compiler/program.go:1739 GetSourceFileMetaData
 // Runs `f` with the options of the project reference that owns the file
 // (else the root options) and the metadata of the file (the default
 // metadata when it is not a program file). The per-file mode queries below
@@ -2228,7 +2229,7 @@ fn with_file_options_and_meta<R>(
     })
 }
 
-// Go: compiler/program.go:199 GetResolvedProjectReferences
+// Go: compiler/program.go:215 GetResolvedProjectReferences
 // PORT: see `get_project_reference_from_source`. A reference that did not
 // load is None (Go nil).
 pub fn get_resolved_project_references() -> Vec<Option<Arc<ResolvedProjectReference>>> {
@@ -2241,7 +2242,7 @@ pub fn get_resolved_project_references() -> Vec<Option<Arc<ResolvedProjectRefere
     })
 }
 
-// Go: compiler/program.go:2017 GetSymlinkCache
+// Go: compiler/program.go:2300 GetSymlinkCache
 // PORT: the Go frontend program has the port, and this is its value.
 pub fn get_go_symlink_cache() -> Option<Arc<crate::modulespecifiers::symlinks::KnownSymlinks>> {
     // Go: ls/autoimport/aliasresolver.go:143 (unimplemented)
@@ -2249,7 +2250,7 @@ pub fn get_go_symlink_cache() -> Option<Arc<crate::modulespecifiers::symlinks::K
     Some(with_go(go_frontend::GoSharedState::known_symlinks))
 }
 
-// Go: compiler/program.go:165 GetSourceOfProjectReferenceIfOutputIncluded
+// Go: compiler/program.go:181 GetSourceOfProjectReferenceIfOutputIncluded
 pub fn get_source_of_project_reference_if_output_included(file: Node) -> String {
     // Go: ls/autoimport/aliasresolver.go:213 (unimplemented)
     alias_resolver_unimplemented();
@@ -2442,12 +2443,12 @@ pub fn explain_files(w: &mut dyn std::io::Write, locale: &crate::locale::Locale)
         .explain_files(w, locale);
 }
 
-// Go: compiler/program.go:397 SourceFiles
+// Go: compiler/program.go:511 SourceFiles
 pub fn source_files() -> Vec<Node> {
     prog().source_files().map(|file| file.root).collect()
 }
 
-// Go: compiler/program.go:399 Options
+// Go: compiler/program.go:513 Options
 pub fn options() -> &'static CompilerOptions {
     &prog().options
 }
@@ -2489,7 +2490,7 @@ fn content_mapper_option_diagnostics() -> Vec<Diagnostic> {
     })
 }
 
-// Go: compiler/program.go:403 GetConfigFileParsingDiagnostics
+// Go: compiler/program.go:532 GetConfigFileParsingDiagnostics
 // PORT: an alias resolver program has no config, so its list is empty. Go
 // has no such method on the alias resolver.
 pub fn get_config_file_parsing_diagnostics() -> Vec<Diagnostic> {
@@ -2499,12 +2500,12 @@ pub fn get_config_file_parsing_diagnostics() -> Vec<Diagnostic> {
     go.get_config_file_parsing_diagnostics()
 }
 
-// Go: compiler/program.go:441 SingleThreaded
+// Go: compiler/program.go:570 SingleThreaded
 pub fn single_threaded() -> bool {
     prog().options.single_threaded.is_true()
 }
 
-// Go: compiler/program.go:494 GetResolvedModule
+// Go: compiler/program.go:623 GetResolvedModule
 // PERF: the stored resolution is shared, not copied.
 pub fn get_resolved_module(
     file: Node,
@@ -2521,7 +2522,7 @@ pub fn get_resolved_module(
     })
 }
 
-// Go: compiler/program.go:503 GetResolvedModuleFromModuleSpecifier
+// Go: compiler/program.go:632 GetResolvedModuleFromModuleSpecifier
 pub fn get_resolved_module_from_module_specifier(
     file: Node,
     module_specifier: Node,
@@ -2535,7 +2536,7 @@ pub fn get_resolved_module_from_module_specifier(
     get_resolved_module(file, module_specifier.text(), mode).map(Arc::unwrap_or_clone)
 }
 
-// Go: compiler/program.go:511 GetResolvedModules
+// Go: compiler/program.go:640 GetResolvedModules
 // Go: ls/autoimport/aliasresolver.go:135 GetResolvedModules (nil)
 // PORT: only an alias resolver program reads this map, and it is empty. The
 // Go frontend program keeps its map in `GoSharedState` (`get_packages_map`).
@@ -2550,7 +2551,7 @@ pub fn get_resolved_modules()
     EMPTY.get_or_init(IndexMap::new)
 }
 
-// Go: compiler/program.go:1519 GetSourceFileMetaData
+// Go: compiler/program.go:1739 GetSourceFileMetaData
 pub fn get_source_file_meta_data(path: &str) -> SourceFileMetaData {
     // Go: ls/autoimport/aliasresolver.go:148 (unimplemented)
     alias_resolver_unimplemented();
@@ -2562,11 +2563,18 @@ pub fn get_source_file_meta_data(path: &str) -> SourceFileMetaData {
     })
 }
 
-// Go: compiler/program.go:1523 GetEmitModuleFormatOfFile
+// Go: compiler/program.go:1743 GetEmitModuleFormatOfFile
 pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
     // Go: ls/autoimport/aliasresolver.go:96 GetEmitModuleFormatOfFile
     if state().alias_resolver {
         return ModuleKind::ES_NEXT;
+    }
+    // PORT: Go `sourceFile.FileName()` dereferences a nil file, for example
+    // the context file of a node builder with no enclosing declaration
+    // (checker/nodebuilderimpl.go:686). The port's file info of nil has no
+    // name.
+    if source_file.is_nil() {
+        go_nil_dereference();
     }
     let info = source_file_info(source_file);
     with_file_options_and_meta(source_file, |options, meta| {
@@ -2574,7 +2582,7 @@ pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
     })
 }
 
-// Go: compiler/program.go:1527 GetEmitSyntaxForUsageLocation
+// Go: compiler/program.go:1747 GetEmitSyntaxForUsageLocation
 pub fn get_emit_syntax_for_usage_location(source_file: Node, location: Node) -> ResolutionMode {
     // Go: ls/autoimport/aliasresolver.go:101 GetEmitSyntaxForUsageLocation
     if state().alias_resolver {
@@ -2586,7 +2594,7 @@ pub fn get_emit_syntax_for_usage_location(source_file: Node, location: Node) -> 
     })
 }
 
-// Go: compiler/program.go:1531 GetImpliedNodeFormatForEmit
+// Go: compiler/program.go:1751 GetImpliedNodeFormatForEmit
 pub fn get_implied_node_format_for_emit(source_file: Node) -> ResolutionMode {
     // Go: ls/autoimport/aliasresolver.go:106 GetImpliedNodeFormatForEmit
     if state().alias_resolver {
@@ -2602,7 +2610,7 @@ pub fn get_implied_node_format_for_emit(source_file: Node) -> ResolutionMode {
     })
 }
 
-// Go: compiler/program.go:1535 GetModeForUsageLocation
+// Go: compiler/program.go:1755 GetModeForUsageLocation
 pub fn get_mode_for_usage_location(source_file: Node, location: Node) -> ResolutionMode {
     // Go: ls/autoimport/aliasresolver.go:111 GetModeForUsageLocation
     if state().alias_resolver {
@@ -2614,7 +2622,7 @@ pub fn get_mode_for_usage_location(source_file: Node, location: Node) -> Resolut
     })
 }
 
-// Go: compiler/program.go:1539 GetDefaultResolutionModeForFile
+// Go: compiler/program.go:1776 GetDefaultResolutionModeForFile
 pub fn get_default_resolution_mode_for_file(source_file: Node) -> ResolutionMode {
     // Go: ls/autoimport/aliasresolver.go:91 GetDefaultResolutionModeForFile
     if state().alias_resolver {
@@ -2626,7 +2634,7 @@ pub fn get_default_resolution_mode_for_file(source_file: Node) -> ResolutionMode
     })
 }
 
-// Go: compiler/program.go:1543 IsSourceFileDefaultLibrary
+// Go: compiler/program.go:1780 IsSourceFileDefaultLibrary
 pub fn is_source_file_default_library(path: &str) -> bool {
     with_tables(|tables| {
         tables
@@ -2635,7 +2643,7 @@ pub fn is_source_file_default_library(path: &str) -> bool {
     })
 }
 
-// Go: compiler/program.go:1562 CommonSourceDirectory
+// Go: compiler/program.go:1799 CommonSourceDirectory
 // PORT: the Go frontend sets it when it builds the program
 // (`go_frontend::common_source_directory_of`).
 pub fn common_source_directory() -> &'static str {
@@ -2646,13 +2654,13 @@ pub fn common_source_directory() -> &'static str {
         .expect("the Go frontend sets the common source directory")
 }
 
-// Go: compiler/program.go:1912 IsSourceFileFromExternalLibrary
+// Go: compiler/program.go:2195 IsSourceFileFromExternalLibrary
 pub fn is_source_file_from_external_library(file: Node) -> bool {
     let path = &source_file_info(file).path;
     with_go(|go| go.is_source_file_from_external_library(path))
 }
 
-// Go: compiler/program.go:1225 IsEmitBlocked
+// Go: compiler/program.go:1390 IsEmitBlocked
 pub fn is_emit_blocked(emit_file_name: &str) -> bool {
     with_go(|go| go.is_emit_blocked(emit_file_name))
 }
@@ -2772,7 +2780,7 @@ fn json_file_may_be_emitted(
     true
 }
 
-// Go: compiler/program.go:1792 GetSourceFile
+// Go: compiler/program.go:2071 GetSourceFile
 pub fn get_source_file(file_name: &str) -> Node {
     // Go: ls/autoimport/aliasresolver.go:80 GetSourceFile
     if let Some(resolver) = alias_resolver() {
@@ -2786,7 +2794,7 @@ pub fn get_source_file(file_name: &str) -> Node {
     get_source_file_by_path(path.as_str())
 }
 
-// Go: compiler/program.go:1812 GetSourceFileByPath
+// Go: compiler/program.go:2091 GetSourceFileByPath
 pub fn get_source_file_by_path(path: &str) -> Node {
     with_tables(|tables| tables.file_at_path(path))
         .map_or(Node::NIL, |index| crate::ast::go_file(index).root)
@@ -2810,7 +2818,7 @@ thread_local! {
     };
 }
 
-// Go: compiler/program.go:1797 GetSourceFileForResolvedModule
+// Go: compiler/program.go:2076 GetSourceFileForResolvedModule
 // PORT: the answer is memoized per thread and program. The files, their
 // paths and the redirects of a program do not change after load, so a name
 // always gives the same file. The checker asks again on each alias and
@@ -2845,14 +2853,14 @@ pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
     file
 }
 
-// Go: compiler/program.go:157 GetRedirectTargets
+// Go: compiler/program.go:173 GetRedirectTargets
 pub fn get_redirect_targets(path: &crate::frontend::tspath::Path) -> Vec<String> {
     // Go: ls/autoimport/aliasresolver.go:203 (unimplemented)
     alias_resolver_unimplemented();
     with_go(|go| go.get_redirect_targets(&path.0))
 }
 
-// Go: compiler/program.go:226 GetSourceFileFromReference
+// Go: compiler/program.go:242 GetSourceFileFromReference
 // PORT: the Go frontend program has the port, and its answers for the
 // preserved references are copied. Go has no such method on the alias
 // resolver.
@@ -2861,7 +2869,7 @@ pub fn get_source_file_from_reference(origin: Node, r: &FileReference) -> Node {
     with_go(|go| go.get_source_file_from_reference(origin, r))
 }
 
-// Go: outputpaths/outputpaths.go:42 GetOutputPathsFor, called by
+// Go: outputpaths/outputpaths.go:47 GetOutputPathsFor, called by
 // compiler/emitHost.go:94 emitHost.GetOutputPathsFor and Program.Emit with
 // the program options.
 // PORT: Go reads three fields of the source file (#4712: the content
@@ -2883,7 +2891,7 @@ pub fn get_output_paths_for_source_file(
     )
 }
 
-// Go: compiler/program.go:1916 GetJSXRuntimeImportSpecifier
+// Go: compiler/program.go:2199 GetJSXRuntimeImportSpecifier
 // Go: compiler/fileloader.go:550 (the value the loader records)
 // PORT: the Go frontend loader records the value and its synthetic import
 // (Go `createSyntheticImport`).
@@ -2896,7 +2904,7 @@ pub fn get_jsx_runtime_import_specifier(path: &str) -> (String, Node) {
     with_go(|go| go.get_jsx_runtime_import_specifier(path))
 }
 
-// Go: compiler/program.go:1923 GetImportHelpersImportSpecifier
+// Go: compiler/program.go:2206 GetImportHelpersImportSpecifier
 // PORT: the Go frontend loader records the synthetic imports.
 pub fn get_import_helpers_import_specifier(path: &str) -> Node {
     // Go: ls/autoimport/aliasresolver.go:168 (unimplemented)
@@ -2904,8 +2912,8 @@ pub fn get_import_helpers_import_specifier(path: &str) -> Node {
     with_go(|go| go.get_import_helpers_import_specifier(path))
 }
 
-// Go: compiler/program.go:517 GetPackagesMap
-// Go: checker/utilities.go:1645 getPackagesMap (the same body)
+// Go: compiler/program.go:650 GetPackagesMap
+// Go: checker/utilities.go:1722 getPackagesMap (the same body)
 // PORT: Go caches the map on the program (and on the checker); this builds
 // it on each call. Go ranges over `GetResolvedModules()`, the program's own
 // map. With the Go frontend that is the version's map in `GoSharedState`,
@@ -3017,7 +3025,7 @@ pub fn spawn_seeded_thread<R: Send + 'static>(
         })
 }
 
-// Go: compiler/checkerpool.go:40 newCheckerPoolWithTracing (the count)
+// Go: compiler/checkerpool.go:307 newCheckerPoolWithTracing (the count)
 fn checker_count() -> usize {
     let program = prog();
     let mut checker_count: i64 = 4;
@@ -3032,7 +3040,7 @@ fn checker_count() -> usize {
         .max(1) as usize
 }
 
-// Go: compiler/checkerpool.go:98 createCheckers
+// Go: compiler/checkerpool.go:365 createCheckers
 // PORT: binding runs first on this thread, so no worker binds and every
 // worker starts from the same bound program and thread-local state.
 // The file associations (#4313) come from the Go frontend program
@@ -3250,7 +3258,7 @@ fn checker_index_for_file(file: Node) -> usize {
     with_tables(index).expect("checker pool not made")
 }
 
-// Go: compiler/checkerpool.go:77 getCheckerForFileNonExclusive
+// Go: compiler/checkerpool.go:344 getCheckerForFileNonExclusive
 // PORT: Go returns the checker and a release function. Here the checker is
 // lent to `f` for the call, on the checker's own thread.
 pub fn with_type_checker_for_file<R: Send + 'static>(
@@ -3310,7 +3318,7 @@ pub fn with_checker_at<R>(index: usize, f: impl FnOnce(&mut Checker) -> R) -> R 
     WORKER_CHECKER.with(|slot| f(slot.borrow_mut().as_mut().expect("worker checker")))
 }
 
-// Go: compiler/checkerpool.go:123 forEachCheckerParallel
+// Go: compiler/checkerpool.go:449 forEachCheckerParallel
 pub fn for_each_checker_parallel<R: Send + 'static>(cb: fn(usize, &mut Checker) -> R) -> Vec<R> {
     let count = checker_count();
     let receivers = (0..count)
@@ -3327,7 +3335,7 @@ fn pool_get_global_diagnostics() -> Vec<Diagnostic> {
     sort_and_deduplicate_diagnostics(wait_jobs(receivers).into_iter().flatten().collect())
 }
 
-// Go: compiler/checkerpool.go:148 forEachCheckerGroupDo
+// Go: compiler/checkerpool.go:474 forEachCheckerGroupDo
 // PORT: returns the results of `cb` by file position instead of passing the
 // position to `cb`. A file with no result keeps an empty list.
 fn for_each_checker_group_do(
@@ -3396,7 +3404,7 @@ fn start_checker_group_do(
 // Diagnostics (Go compiler/program.go)
 // ---------------------------------------------------------------------------
 
-// Go: compiler/program.go:534 collectDiagnostics
+// Go: compiler/program.go:667 collectDiagnostics
 // PORT: the per-file work runs serially (see the checker pool note).
 fn collect_diagnostics(
     file: Node,
@@ -3414,7 +3422,7 @@ fn collect_diagnostics(
     filter_and_sort_diagnostics(result)
 }
 
-// Go: compiler/program.go:562 collectCheckerDiagnostics
+// Go: compiler/program.go:695 collectCheckerDiagnostics
 /// Collects diagnostics for one file (or all files when `file` is nil) with
 /// the checker that owns each file. The bin uses this to guard each file.
 pub fn collect_checker_diagnostics_with(
@@ -3453,7 +3461,7 @@ fn filter_and_sort_diagnostics(mut diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
     sort_and_deduplicate_diagnostics(diags)
 }
 
-// Go: compiler/program.go:576 collectCheckerDiagnosticsFromFiles
+// Go: compiler/program.go:720 collectCheckerDiagnosticsFromFiles
 fn collect_checker_diagnostics_from_files(
     source_files: &[Node],
     collect: fn(&mut Checker, Node) -> Vec<Diagnostic>,
@@ -3461,7 +3469,7 @@ fn collect_checker_diagnostics_from_files(
     for_each_checker_group_do(source_files, collect)
 }
 
-// Go: compiler/program.go:599 GetSyntacticDiagnostics
+// Go: compiler/program.go:743 GetSyntacticDiagnostics
 pub fn get_syntactic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
     let options = &prog().options;
     collect_diagnostics(source_file, &mut |file| {
@@ -3482,7 +3490,7 @@ pub fn get_syntactic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
     })
 }
 
-// Go: compiler/program.go:618 getAdditionalJSSyntacticDiagnostics
+// Go: compiler/program.go:762 getAdditionalJSSyntacticDiagnostics
 fn get_additional_js_syntactic_diagnostics(
     file: Node,
     options: &CompilerOptions,
@@ -3517,7 +3525,7 @@ fn get_additional_js_syntactic_diagnostics(
     diags
 }
 
-// Go: compiler/program.go:643 GetBindDiagnostics
+// Go: compiler/program.go:787 GetBindDiagnostics
 // PORT: Go binds one file when given one. The Rust binder binds every file
 // into one shared arena, so this always binds all files.
 pub fn get_bind_diagnostics(source_file: Node) -> Vec<Diagnostic> {
@@ -3527,7 +3535,7 @@ pub fn get_bind_diagnostics(source_file: Node) -> Vec<Diagnostic> {
     })
 }
 
-// Go: compiler/program.go:654 GetSemanticDiagnostics
+// Go: compiler/program.go:798 GetSemanticDiagnostics
 // PORT: the compile path has no context; Go tsc passes context.Background()
 // (execute/tsc/emit.go:75). The same holds for the two functions below.
 pub fn get_semantic_diagnostics(source_file: Node) -> Vec<Diagnostic> {
@@ -3587,14 +3595,14 @@ pub fn start_semantic_diagnostics_for_incremental(
     }))
 }
 
-// Go: compiler/program.go:667 GetSuggestionDiagnostics
+// Go: compiler/program.go:815 GetSuggestionDiagnostics
 pub fn get_suggestion_diagnostics(source_file: Node) -> Vec<Diagnostic> {
     collect_checker_diagnostics_with(source_file, |c, f| {
         get_suggestion_diagnostics_with_checker(&context::background(), c, f)
     })
 }
 
-// Go: compiler/program.go:671 GetProgramDiagnostics
+// Go: compiler/program.go:819 GetProgramDiagnostics
 // PORT: an alias resolver program has no frontend program, so its list is
 // empty. Go has no such method on the alias resolver.
 pub fn get_program_diagnostics() -> Vec<Diagnostic> {
@@ -3614,7 +3622,7 @@ pub fn get_program_diagnostics() -> Vec<Diagnostic> {
     sort_and_deduplicate_diagnostics(diagnostics)
 }
 
-// Go: compiler/program.go:678 GetIncludeProcessorDiagnostics
+// Go: compiler/program.go:840 GetIncludeProcessorDiagnostics
 // PORT: an alias resolver program has no include diagnostics.
 pub fn get_include_processor_diagnostics(source_file: Node) -> Vec<Diagnostic> {
     if skip_type_checking(source_file, false) {
@@ -3628,7 +3636,7 @@ pub fn get_include_processor_diagnostics(source_file: Node) -> Vec<Diagnostic> {
     filtered
 }
 
-// Go: compiler/program.go:686 SkipTypeChecking
+// Go: compiler/program.go:848 SkipTypeChecking
 pub fn skip_type_checking(source_file: Node, ignore_no_check: bool) -> bool {
     let options = &prog().options;
     let info = source_file_info(source_file);
@@ -3639,7 +3647,7 @@ pub fn skip_type_checking(source_file: Node, ignore_no_check: bool) -> bool {
         || !can_include_bind_and_check_diagnostics(source_file)
 }
 
-// Go: compiler/program.go:694 canIncludeBindAndCheckDiagnostics
+// Go: compiler/program.go:856 canIncludeBindAndCheckDiagnostics
 fn can_include_bind_and_check_diagnostics(source_file: Node) -> bool {
     let options = &prog().options;
     let info = source_file_info(source_file);
@@ -3671,7 +3679,7 @@ pub fn get_global_diagnostics() -> Vec<Diagnostic> {
     pool_get_global_diagnostics()
 }
 
-// Go: compiler/program.go:1302 GetDeclarationDiagnostics
+// Go: compiler/program.go:1467 GetDeclarationDiagnostics
 // PORT: each file's work runs on the thread of the file's checker, where its
 // emit resolver can reach that checker. Files of different checkers run in
 // parallel; the results merge in file order.
@@ -3713,7 +3721,7 @@ pub fn send_declaration_diagnostics_job(source_file: Node) -> CheckerJob<Vec<Dia
     ))
 }
 
-// Go: compiler/program.go:1394 getDeclarationDiagnosticsForFile
+// Go: compiler/program.go:1618 getDeclarationDiagnosticsForFile
 fn get_declaration_diagnostics_for_file(source_file: Node) -> Vec<Diagnostic> {
     if source_file_info(source_file).is_declaration_file {
         return Vec::new();
@@ -3745,7 +3753,7 @@ fn with_declaration_diagnostic_cache<R>(
     })
 }
 
-// Go: compiler/emitter.go:506 getSourceFilesToEmit
+// Go: compiler/emitter.go:553 getSourceFilesToEmit
 // PORT: Go takes a `SourceFileMayBeEmittedHost`; the program functions are that host.
 // Go `Program.getSourceFilesToEmit` caches the result for nil targets and no
 // force; this computes it each time. Go nil `targetSourceFiles` is `None`.
@@ -3766,12 +3774,12 @@ pub(crate) fn get_source_files_to_emit(
         .collect()
 }
 
-// Go: compiler/emitter.go:518 isSourceFileNotJson
+// Go: compiler/emitter.go:562 isSourceFileNotJson
 fn is_source_file_not_json(file: Node) -> bool {
     !is_json_source_file(file)
 }
 
-// Go: compiler/emitter.go:522 getDeclarationDiagnostics
+// Go: compiler/emitter.go:566 getDeclarationDiagnostics
 // PORT: renamed from Go `getDeclarationDiagnostics`, because the exported
 // `GetDeclarationDiagnostics` above already has the snake name.
 fn get_declaration_diagnostics_worker(host: Rc<EmitHost>, file: Node) -> Vec<Diagnostic> {
@@ -3966,7 +3974,7 @@ impl crate::printer::EmitHost for EmitHost {
     }
 }
 
-// Go: compiler/program.go:1306 FilterNoEmitSemanticDiagnostics
+// Go: compiler/program.go:1471 FilterNoEmitSemanticDiagnostics
 pub fn filter_no_emit_semantic_diagnostics(
     mut diagnostics: Vec<Diagnostic>,
     options: &CompilerOptions,
@@ -4164,7 +4172,7 @@ fn get_diagnostics_with_preceding_directives(
     (filtered, directives_by_line)
 }
 
-// Go: compiler/program.go:1410 getSuggestionDiagnosticsWithChecker
+// Go: compiler/program.go:1634 getSuggestionDiagnosticsWithChecker
 fn get_suggestion_diagnostics_with_checker(
     ctx: &Context,
     file_checker: &mut Checker,
@@ -4178,7 +4186,7 @@ fn get_suggestion_diagnostics_with_checker(
     file_checker.get_suggestion_diagnostics(ctx, source_file)
 }
 
-// Go: compiler/program.go:1422 isCommentOrBlankLine
+// Go: compiler/program.go:1642 isCommentOrBlankLine
 fn is_comment_or_blank_line(text: &str, mut pos: usize) -> bool {
     let text = text.as_bytes();
     while pos < text.len() && (text[pos] == b' ' || text[pos] == b'\t') {
@@ -4189,14 +4197,14 @@ fn is_comment_or_blank_line(text: &str, mut pos: usize) -> bool {
         || pos + 1 < text.len() && text[pos] == b'/' && text[pos + 1] == b'/'
 }
 
-// Go: compiler/program.go:1431 SortAndDeduplicateDiagnostics
+// Go: compiler/program.go:1651 SortAndDeduplicateDiagnostics
 pub fn sort_and_deduplicate_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
     // Go: compiler/program.go:1599 slices.SortFunc(diagnostics, ast.CompareDiagnostics)
     crate::gostd::slices::sort_func(&mut diagnostics, compare_diagnostics);
     compact_and_merge_related_infos(diagnostics)
 }
 
-// Go: compiler/program.go:1439 compactAndMergeRelatedInfos
+// Go: compiler/program.go:1659 compactAndMergeRelatedInfos
 // Remove duplicate diagnostics and, for sequences of diagnostics that differ only by related information,
 // create a single diagnostic with sorted and deduplicated related information.
 fn compact_and_merge_related_infos(diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
@@ -4233,7 +4241,7 @@ fn compact_and_merge_related_infos(diagnostics: Vec<Diagnostic>) -> Vec<Diagnost
     result
 }
 
-// Go: compiler/program.go:1470 LineCount
+// Go: compiler/program.go:1690 LineCount
 pub fn line_count() -> i32 {
     let mut count = 0;
     for file in prog().source_files() {
@@ -4242,7 +4250,7 @@ pub fn line_count() -> i32 {
     count
 }
 
-// Go: compiler/program.go:1478 IdentifierCount
+// Go: compiler/program.go:1698 IdentifierCount
 pub fn identifier_count() -> i32 {
     let go = go_frontend().expect("identifier count of an alias resolver program");
     let mut count = 0;
@@ -4252,7 +4260,7 @@ pub fn identifier_count() -> i32 {
     count
 }
 
-// Go: compiler/program.go:1486 SymbolCount
+// Go: compiler/program.go:1706 SymbolCount
 // PORT: an unbound file (the program had syntactic errors) has the Go zero
 // value.
 pub fn symbol_count() -> i32 {
@@ -4269,7 +4277,7 @@ pub fn symbol_count() -> i32 {
     count as i32
 }
 
-// Go: compiler/program.go:1499 TypeCount
+// Go: compiler/program.go:1719 TypeCount
 pub fn type_count() -> i32 {
     let mut val: u32 = 0;
     for value in for_each_checker_parallel(|_, c| c.type_count) {
@@ -4278,7 +4286,7 @@ pub fn type_count() -> i32 {
     val as i32
 }
 
-// Go: compiler/program.go:1507 InstantiationCount
+// Go: compiler/program.go:1727 InstantiationCount
 pub fn instantiation_count() -> i32 {
     let mut val: u32 = 0;
     for value in for_each_checker_parallel(|_, c| c.total_instantiation_count) {
@@ -4523,7 +4531,7 @@ pub fn format_diagnostic(diagnostic: &Diagnostic) -> String {
     output
 }
 
-// Go: diagnosticwriter/diagnosticwriter.go:83 resolvedLocation (#4712)
+// Go: diagnosticwriter/diagnosticwriter.go:87 resolvedLocation (#4712)
 // resolvedLocation describes how a diagnostic on a content-mapped file should be reported.
 struct ResolvedLocation {
     loc: TextRange,

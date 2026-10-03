@@ -14,13 +14,13 @@ const MAX_TEMPLATE_LITERAL_TYPE_LENGTH: usize = 50_000_000;
 const MAX_TEMPLATE_LITERAL_TYPE_SPANS: usize = 100_000;
 
 impl Checker {
-    // Go: checker/checker.go:28753 getTypeOfFirstParameterOfSignature
+    // Go: checker/checker.go:29466 getTypeOfFirstParameterOfSignature
     pub fn get_type_of_first_parameter_of_signature(&mut self, signature: SignatureId) -> TypeId {
         let never_type = self.never_type;
         self.get_type_of_first_parameter_of_signature_with_fallback(signature, never_type)
     }
 
-    // Go: checker/checker.go:28757 getTypeOfFirstParameterOfSignatureWithFallback
+    // Go: checker/checker.go:29470 getTypeOfFirstParameterOfSignatureWithFallback
     pub fn get_type_of_first_parameter_of_signature_with_fallback(
         &mut self,
         signature: SignatureId,
@@ -32,7 +32,7 @@ impl Checker {
         fallback_type
     }
 
-    // Go: checker/checker.go:28764 getMappedTypeModifiers
+    // Go: checker/checker.go:29477 getMappedTypeModifiers
     // PORT: Go package function; it reads type data, so it is a `Checker` method.
     pub fn get_mapped_type_modifiers(&self, t: TypeId) -> MappedTypeModifiers {
         let declaration = self.ty(t).as_mapped_type().declaration;
@@ -58,7 +58,7 @@ impl Checker {
         modifiers
     }
 
-    // Go: checker/checker.go:28778 getMappedTypeOptionality
+    // Go: checker/checker.go:29491 getMappedTypeOptionality
     // Return -1, 0, or 1, where -1 means optionality is stripped (i.e. -?), 0 means optionality is unchanged, and 1 means
     // optionality is added (i.e. +?).
     pub fn get_mapped_type_optionality(&self, t: TypeId) -> i32 {
@@ -72,7 +72,7 @@ impl Checker {
         0
     }
 
-    // Go: checker/checker.go:28792 getCombinedMappedTypeOptionality
+    // Go: checker/checker.go:29505 getCombinedMappedTypeOptionality
     // Return -1, 0, or 1, for stripped, unchanged, or added optionality respectively. When a homomorphic mapped type doesn't
     // modify optionality, recursively consult the optionality of the type being mapped over to see if it strips or adds optionality.
     // For intersections, return -1 or 1 when all constituents strip or add optionality, otherwise return 0.
@@ -98,7 +98,7 @@ impl Checker {
         0
     }
 
-    // Go: checker/checker.go:28812 isPartialMappedType
+    // Go: checker/checker.go:29525 isPartialMappedType
     pub fn is_partial_mapped_type(&self, t: TypeId) -> bool {
         self.ty(t).object_flags.intersects(ObjectFlags::MAPPED)
             && self
@@ -106,7 +106,7 @@ impl Checker {
                 .intersects(MappedTypeModifiers::INCLUDE_OPTIONAL)
     }
 
-    // Go: checker/checker.go:28816 getOptionalExpressionType
+    // Go: checker/checker.go:29529 getOptionalExpressionType
     pub fn get_optional_expression_type(&mut self, expr_type: TypeId, expression: Node) -> TypeId {
         if is_expression_of_optional_chain_root(expression) {
             return self.get_non_nullable_type(expr_type);
@@ -117,7 +117,7 @@ impl Checker {
         expr_type
     }
 
-    // Go: checker/checker.go:28827 removeOptionalTypeMarker
+    // Go: checker/checker.go:29540 removeOptionalTypeMarker
     pub fn remove_optional_type_marker(&mut self, t: TypeId) -> TypeId {
         if self.strict_null_checks {
             let optional_type = self.optional_type;
@@ -126,7 +126,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:28834 propagateOptionalTypeMarker
+    // Go: checker/checker.go:29547 propagateOptionalTypeMarker
     pub fn propagate_optional_type_marker(
         &mut self,
         t: TypeId,
@@ -142,7 +142,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:28844 removeMissingType
+    // Go: checker/checker.go:29557 removeMissingType
     pub fn remove_missing_type(&mut self, t: TypeId, is_optional: bool) -> TypeId {
         if self.exact_optional_property_types && is_optional {
             let missing_type = self.missing_type;
@@ -151,7 +151,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:28851 removeMissingOrUndefinedType
+    // Go: checker/checker.go:29564 removeMissingOrUndefinedType
     pub fn remove_missing_or_undefined_type(&mut self, t: TypeId) -> TypeId {
         if self.exact_optional_property_types {
             let missing_type = self.missing_type;
@@ -160,21 +160,21 @@ impl Checker {
         self.get_type_with_facts(t, TypeFacts::NE_UNDEFINED)
     }
 
-    // Go: checker/checker.go:28858 removeDefinitelyFalsyTypes
+    // Go: checker/checker.go:29571 removeDefinitelyFalsyTypes
     pub fn remove_definitely_falsy_types(&mut self, t: TypeId) -> TypeId {
         self.filter_type(t, &mut |c: &mut Checker, t: TypeId| {
             c.has_type_facts(t, TypeFacts::TRUTHY)
         })
     }
 
-    // Go: checker/checker.go:28862 extractDefinitelyFalsyTypes
+    // Go: checker/checker.go:29575 extractDefinitelyFalsyTypes
     pub fn extract_definitely_falsy_types(&mut self, t: TypeId) -> TypeId {
         self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
             c.get_definitely_falsy_part_of_type(t)
         })
     }
 
-    // Go: checker/checker.go:28866 getDefinitelyFalsyPartOfType
+    // Go: checker/checker.go:29579 getDefinitelyFalsyPartOfType
     pub fn get_definitely_falsy_part_of_type(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::STRING) {
@@ -205,7 +205,7 @@ impl Checker {
         self.never_type
     }
 
-    // Go: checker/checker.go:28884 getConstraintDeclaration
+    // Go: checker/checker.go:29597 getConstraintDeclaration
     pub fn get_constraint_declaration(&self, t: TypeId) -> Node {
         let symbol = self.ty(t).symbol;
         if symbol.is_some() {
@@ -221,7 +221,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:29579 getTemplateLiteralType
+    // Go: checker/checker.go:29618 getTemplateLiteralType
     pub fn get_template_literal_type(&mut self, texts: &[String], types: &[TypeId]) -> TypeId {
         let union_index = types
             .iter()
@@ -387,7 +387,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:28965 getTemplateStringForType
+    // Go: checker/checker.go:29697 getTemplateStringForType
     // PORT: appends the string to `out` instead of returning it, so
     // `get_template_literal_type` writes straight into its buffer. A string
     // literal is copied as is, which is what `any_to_string` returns for it.
@@ -417,7 +417,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:28975 getStringMappingType
+    // Go: checker/checker.go:29707 getStringMappingType
     pub fn get_string_mapping_type(&mut self, symbol: SymbolId, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::UNION | TypeFlags::NEVER) {
@@ -451,7 +451,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:28994 applyStringMapping
+    // Go: checker/checker.go:29726 applyStringMapping
     // PORT: Go package function; it reads the symbol name, so it is a `Checker` method.
     pub fn apply_string_mapping(&self, symbol: SymbolId, str: &str) -> String {
         let kind = INTRINSIC_TYPE_KINDS
@@ -475,7 +475,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:29010 applyTemplateStringMapping
+    // Go: checker/checker.go:29742 applyTemplateStringMapping
     pub fn apply_template_string_mapping(
         &mut self,
         symbol: SymbolId,
@@ -514,7 +514,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:29028 getStringMappingTypeForGenericType
+    // Go: checker/checker.go:29760 getStringMappingTypeForGenericType
     pub fn get_string_mapping_type_for_generic_type(
         &mut self,
         symbol: SymbolId,
@@ -533,7 +533,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:29043 substituteIndexedMappedType
+    // Go: checker/checker.go:29775 substituteIndexedMappedType
     // Given an indexed access on a mapped type of the form { [P in K]: E }[X], return an instantiation of E where P is
     // replaced with X. Since this simplification doesn't account for mapped type modifiers, add 'undefined' to the
     // resulting type if the mapped type includes a '?' modifier or if the modifiers type indicates that some properties
@@ -566,7 +566,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:29059 couldAccessOptionalProperty
+    // Go: checker/checker.go:29791 couldAccessOptionalProperty
     // Return true if an indexed access with the given object and index types could access an optional property.
     pub fn could_access_optional_property(
         &mut self,
@@ -593,7 +593,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:29066 getTypeOfPropertyOrIndexSignatureOfType
+    // Go: checker/checker.go:29798 getTypeOfPropertyOrIndexSignatureOfType
     pub fn get_type_of_property_or_index_signature_of_type(
         &mut self,
         t: TypeId,
@@ -616,7 +616,7 @@ impl Checker {
 }
 
 impl Checker {
-    // Go: checker/checker.go:29095 getContextualType
+    // Go: checker/checker.go:29827 getContextualType
     /**
      * Whoa! Do you really want to use this function?
      *
@@ -738,7 +738,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29175 getContextualTypeForInitializerExpression
+    // Go: checker/checker.go:29907 getContextualTypeForInitializerExpression
     // In a variable, parameter or property declaration with a type annotation,
     // the contextual type of an initializer expression is the type of the variable, parameter or property.
     //
@@ -777,7 +777,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29190 getContextualTypeForVariableLikeDeclaration
+    // Go: checker/checker.go:29922 getContextualTypeForVariableLikeDeclaration
     pub fn get_contextual_type_for_variable_like_declaration(
         &mut self,
         declaration: Node,
@@ -808,7 +808,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29210 getContextuallyTypedParameterType
+    // Go: checker/checker.go:29942 getContextuallyTypedParameterType
     // Return contextual type of parameter or undefined if no contextual type is available
     pub fn get_contextually_typed_parameter_type(&mut self, parameter: Node) -> TypeId {
         let fn_ = parameter.parent();
@@ -872,13 +872,13 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29248 isContextSensitiveFunctionOrObjectLiteralMethod
+    // Go: checker/checker.go:29980 isContextSensitiveFunctionOrObjectLiteralMethod
     pub fn is_context_sensitive_function_or_object_literal_method(&mut self, fn_: Node) -> bool {
         (is_function_expression_or_arrow_function(fn_) || is_object_literal_method(fn_))
             && self.is_context_sensitive_function_like_declaration(fn_)
     }
 
-    // Go: checker/checker.go:29252 getSpreadArgumentType
+    // Go: checker/checker.go:29984 getSpreadArgumentType
     pub fn get_spread_argument_type(
         &mut self,
         args: &[Node],
@@ -1013,7 +1013,7 @@ impl Checker {
         self.create_tuple_type_ex(&types, &infos, readonly)
     }
 
-    // Go: checker/checker.go:29323 getMutableArrayOrTupleType
+    // Go: checker/checker.go:30055 getMutableArrayOrTupleType
     pub fn get_mutable_array_or_tuple_type(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).flags.intersects(TypeFlags::UNION) {
             return self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
@@ -1046,7 +1046,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:29335 getContextualTypeForBindingElement
+    // Go: checker/checker.go:30067 getContextualTypeForBindingElement
     pub fn get_contextual_type_for_binding_element(
         &mut self,
         declaration: Node,
@@ -1093,7 +1093,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29364 getContextualTypeForStaticPropertyDeclaration
+    // Go: checker/checker.go:30096 getContextualTypeForStaticPropertyDeclaration
     pub fn get_contextual_type_for_static_property_declaration(
         &mut self,
         declaration: Node,
@@ -1110,7 +1110,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29373 getContextualTypeForReturnExpression
+    // Go: checker/checker.go:30105 getContextualTypeForReturnExpression
     pub fn get_contextual_type_for_return_expression(
         &mut self,
         node: Node,
@@ -1171,7 +1171,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29408 getContextualIterationType
+    // Go: checker/checker.go:30140 getContextualIterationType
     pub fn get_contextual_iteration_type(
         &mut self,
         kind: IterationTypeKind,
@@ -1190,7 +1190,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29417 getContextualReturnType
+    // Go: checker/checker.go:30149 getContextualReturnType
     pub fn get_contextual_return_type(
         &mut self,
         function_decl: Node,
@@ -1239,7 +1239,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29449 checkGeneratorInstantiationAssignabilityToReturnType
+    // Go: checker/checker.go:30181 checkGeneratorInstantiationAssignabilityToReturnType
     pub fn check_generator_instantiation_assignability_to_return_type(
         &mut self,
         return_type: TypeId,
@@ -1286,7 +1286,7 @@ impl Checker {
         self.check_type_assignable_to(generator_instantiation, return_type, error_node, None)
     }
 
-    // Go: checker/checker.go:29463 getContextualSignatureForFunctionLikeDeclaration
+    // Go: checker/checker.go:30195 getContextualSignatureForFunctionLikeDeclaration
     pub fn get_contextual_signature_for_function_like_declaration(
         &mut self,
         node: Node,
@@ -1298,7 +1298,7 @@ impl Checker {
         SignatureId::NIL
     }
 
-    // Go: checker/checker.go:29471 getContextualTypeForYieldOperand
+    // Go: checker/checker.go:30203 getContextualTypeForYieldOperand
     pub fn get_contextual_type_for_yield_operand(
         &mut self,
         node: Node,
@@ -1376,7 +1376,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29502 getContextualTypeForAwaitOperand
+    // Go: checker/checker.go:30234 getContextualTypeForAwaitOperand
     pub fn get_contextual_type_for_await_operand(
         &mut self,
         node: Node,
@@ -1393,7 +1393,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29514 getContextualTypeForArgument
+    // Go: checker/checker.go:30246 getContextualTypeForArgument
     // In a typed function call, an argument or substitution expression is contextually typed by the type of the corresponding parameter.
     pub fn get_contextual_type_for_argument(&mut self, call_target: Node, arg: Node) -> TypeId {
         let args = self.get_effective_call_arguments(call_target);
@@ -1405,7 +1405,7 @@ impl Checker {
         self.get_contextual_type_for_argument_at_index(call_target, arg_index)
     }
 
-    // Go: checker/checker.go:29524 getContextualTypeForArgumentAtIndex
+    // Go: checker/checker.go:30256 getContextualTypeForArgumentAtIndex
     pub fn get_contextual_type_for_argument_at_index(
         &mut self,
         call_target: Node,
@@ -1447,7 +1447,7 @@ impl Checker {
         self.get_type_at_position(signature, arg_index)
     }
 
-    // Go: checker/checker.go:29553 getContextualTypeForDecorator
+    // Go: checker/checker.go:30285 getContextualTypeForDecorator
     pub fn get_contextual_type_for_decorator(&mut self, decorator: Node) -> TypeId {
         let signature = self.get_decorator_call_signature(decorator);
         if signature.is_some() {
@@ -1456,7 +1456,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29561 getContextualTypeForBinaryOperand
+    // Go: checker/checker.go:30293 getContextualTypeForBinaryOperand
     pub fn get_contextual_type_for_binary_operand(
         &mut self,
         node: Node,
@@ -1515,7 +1515,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29595 getContextualTypeForAssignmentExpression
+    // Go: checker/checker.go:30327 getContextualTypeForAssignmentExpression
     // PORT: Go takes `*ast.BinaryExpression`; here it is the binary expression `Node`.
     pub fn get_contextual_type_for_assignment_expression(&mut self, binary: Node) -> TypeId {
         let left = binary.left();

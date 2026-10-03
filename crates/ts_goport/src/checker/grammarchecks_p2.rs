@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use crate::diagnostics::Message;
 
 impl Checker {
-    // Go: checker/grammarchecks.go:952 checkGrammarInterfaceDeclaration
+    // Go: checker/grammarchecks.go:935 checkGrammarInterfaceDeclaration
     pub fn check_grammar_interface_declaration(&mut self, node: Node) -> bool {
         let heritage_clauses = node.heritage_clauses();
         if !heritage_clauses.is_nil() {
@@ -43,7 +43,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:978 checkGrammarComputedPropertyName
+    // Go: checker/grammarchecks.go:961 checkGrammarComputedPropertyName
     pub fn check_grammar_computed_property_name(&mut self, node: Node) -> bool {
         // If node is not a computedPropertyName, just skip the grammar checking
         if node.kind() != SyntaxKind::ComputedPropertyName {
@@ -63,7 +63,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:991 checkGrammarForGenerator
+    // Go: checker/grammarchecks.go:974 checkGrammarForGenerator
     pub fn check_grammar_for_generator(&mut self, node: Node) -> bool {
         // PORT: Go `node.BodyData()` is non-nil exactly for the kinds that embed
         // `BodyBase` (directly or through `FunctionLikeWithBodyBase`). The body
@@ -106,7 +106,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1007 checkGrammarForInvalidQuestionMark
+    // Go: checker/grammarchecks.go:990 checkGrammarForInvalidQuestionMark
     pub fn check_grammar_for_invalid_question_mark(
         &mut self,
         postfix_token: Node,
@@ -117,7 +117,7 @@ impl Checker {
             && self.grammar_error_on_node(postfix_token, message, args![])
     }
 
-    // Go: checker/grammarchecks.go:1011 checkGrammarForInvalidExclamationToken
+    // Go: checker/grammarchecks.go:994 checkGrammarForInvalidExclamationToken
     pub fn check_grammar_for_invalid_exclamation_token(
         &mut self,
         postfix_token: Node,
@@ -128,7 +128,7 @@ impl Checker {
             && self.grammar_error_on_node(postfix_token, message, args![])
     }
 
-    // Go: checker/grammarchecks.go:1015 checkGrammarObjectLiteralExpression
+    // Go: checker/grammarchecks.go:998 checkGrammarObjectLiteralExpression
     pub fn check_grammar_object_literal_expression(
         &mut self,
         node: Node,
@@ -334,7 +334,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1155 checkGrammarJsxElement
+    // Go: checker/grammarchecks.go:1138 checkGrammarJsxElement
     pub fn check_grammar_jsx_element(&mut self, node: Node) -> bool {
         self.check_grammar_jsx_name(node.tag_name());
         self.check_grammar_type_arguments(node, node.type_argument_list());
@@ -370,7 +370,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1179 checkGrammarJsxName
+    // Go: checker/grammarchecks.go:1162 checkGrammarJsxName
     pub fn check_grammar_jsx_name(&mut self, node: Node) -> bool {
         if is_property_access_expression(node) && is_jsx_namespaced_name(node.expression()) {
             return self.grammar_error_on_node(
@@ -394,7 +394,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1191 checkGrammarJsxExpression
+    // Go: checker/grammarchecks.go:1174 checkGrammarJsxExpression
     pub fn check_grammar_jsx_expression(&mut self, node: Node) -> bool {
         let expression = node.expression();
         if expression.is_some() && is_comma_sequence(expression) {
@@ -408,7 +408,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1199 checkGrammarForInOrForOfStatement
+    // Go: checker/grammarchecks.go:1182 checkGrammarForInOrForOfStatement
     pub fn check_grammar_for_in_or_for_of_statement(
         &mut self,
         for_in_or_of_statement: Node,
@@ -590,7 +590,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1306 checkGrammarAccessor
+    // Go: checker/grammarchecks.go:1289 checkGrammarAccessor
     pub fn check_grammar_accessor(&mut self, accessor: Node) -> bool {
         let body = accessor.body();
         if !accessor.flags().intersects(NodeFlags::AMBIENT)
@@ -690,7 +690,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1362 doesAccessorHaveCorrectParameterCount
+    // Go: checker/grammarchecks.go:1345 doesAccessorHaveCorrectParameterCount
     // Does the accessor have the right number of parameters?
     //
     //	A `get` accessor has no parameters or a single `this` parameter.
@@ -707,7 +707,7 @@ impl Checker {
                 }
     }
 
-    // Go: checker/grammarchecks.go:1368 checkGrammarTypeOperatorNode
+    // Go: checker/grammarchecks.go:1351 checkGrammarTypeOperatorNode
     pub fn check_grammar_type_operator_node(&mut self, node: Node) -> bool {
         if node.operator() == SyntaxKind::UniqueKeyword {
             let inner_type = node.type_();
@@ -786,7 +786,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1408 checkGrammarForInvalidDynamicName
+    // Go: checker/grammarchecks.go:1391 checkGrammarForInvalidDynamicName
     pub fn check_grammar_for_invalid_dynamic_name(
         &mut self,
         node: Node,
@@ -808,13 +808,13 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1427 isNonBindableDynamicName
+    // Go: checker/grammarchecks.go:1410 isNonBindableDynamicName
     // Indicates whether a declaration name is a dynamic name that cannot be late-bound.
     pub fn is_non_bindable_dynamic_name(&mut self, node: Node) -> bool {
         is_dynamic_name(node) && !self.is_late_bindable_name(node)
     }
 
-    // Go: checker/grammarchecks.go:1431 checkGrammarMethod
+    // Go: checker/grammarchecks.go:1414 checkGrammarMethod
     pub fn check_grammar_method(
         &mut self,
         node: Node, /*Union[MethodDeclaration, MethodSignature]*/
@@ -898,7 +898,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1479 checkGrammarBreakOrContinueStatement
+    // Go: checker/grammarchecks.go:1462 checkGrammarBreakOrContinueStatement
     pub fn check_grammar_break_or_continue_statement(&mut self, node: Node) -> bool {
         let target_label = node.label();
         let mut current = node;
@@ -971,7 +971,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/grammarchecks.go:1535 checkGrammarBindingElement
+    // Go: checker/grammarchecks.go:1518 checkGrammarBindingElement
     pub fn check_grammar_binding_element(&mut self, node: Node) -> bool {
         if node.dot_dot_dot_token().is_some() {
             let elements = node.parent().element_list();
@@ -1017,7 +1017,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1556 checkGrammarVariableDeclaration
+    // Go: checker/grammarchecks.go:1539 checkGrammarVariableDeclaration
     pub fn check_grammar_variable_declaration(&mut self, node: Node) -> bool {
         let node_flags = self.get_combined_node_flags_cached(node);
         let block_scope_kind = node_flags & NodeFlags::BLOCK_SCOPED;
@@ -1111,7 +1111,7 @@ impl Checker {
             && self.check_grammar_name_in_let_or_const_declarations(node.name())
     }
 
-    // Go: checker/grammarchecks.go:1613 checkGrammarForEsModuleMarkerInBindingName
+    // Go: checker/grammarchecks.go:1596 checkGrammarForEsModuleMarkerInBindingName
     pub fn check_grammar_for_es_module_marker_in_binding_name(&mut self, name: Node) -> bool {
         if is_identifier(name) {
             if name.text() == "__esModule" {
@@ -1131,7 +1131,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1628 checkGrammarNameInLetOrConstDeclarations
+    // Go: checker/grammarchecks.go:1611 checkGrammarNameInLetOrConstDeclarations
     pub fn check_grammar_name_in_let_or_const_declarations(
         &mut self,
         name: Node, /*Union[Identifier, BindingPattern]*/
@@ -1156,7 +1156,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1645 checkGrammarVariableDeclarationList
+    // Go: checker/grammarchecks.go:1628 checkGrammarVariableDeclarationList
     pub fn check_grammar_variable_declaration_list(&mut self, declaration_list: Node) -> bool {
         let declarations = declaration_list.declarations();
         if self.check_grammar_for_disallowed_trailing_comma(
@@ -1223,7 +1223,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1675 checkGrammarAwaitOrAwaitUsing
+    // Go: checker/grammarchecks.go:1658 checkGrammarAwaitOrAwaitUsing
     pub fn check_grammar_await_or_await_using(&mut self, node: Node) -> bool {
         // Grammar checking
         let mut has_error = false;
@@ -1351,7 +1351,7 @@ impl Checker {
         has_error
     }
 
-    // Go: checker/grammarchecks.go:1776 checkGrammarYieldExpression
+    // Go: checker/grammarchecks.go:1759 checkGrammarYieldExpression
     pub fn check_grammar_yield_expression(&mut self, node: Node) -> bool {
         let mut has_error = false;
         if !node.flags().intersects(NodeFlags::YIELD_CONTEXT) {
@@ -1373,7 +1373,7 @@ impl Checker {
         has_error
     }
 
-    // Go: checker/grammarchecks.go:1789 checkGrammarForDisallowedBlockScopedVariableStatement
+    // Go: checker/grammarchecks.go:1772 checkGrammarForDisallowedBlockScopedVariableStatement
     pub fn check_grammar_for_disallowed_block_scoped_variable_statement(
         &mut self,
         node: Node,
@@ -1404,7 +1404,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1813 containerAllowsBlockScopedVariable
+    // Go: checker/grammarchecks.go:1796 containerAllowsBlockScopedVariable
     pub fn container_allows_block_scoped_variable(&self, parent: Node) -> bool {
         match parent.kind() {
             SyntaxKind::IfStatement
@@ -1423,7 +1423,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/grammarchecks.go:1830 checkGrammarMetaProperty
+    // Go: checker/grammarchecks.go:1813 checkGrammarMetaProperty
     pub fn check_grammar_meta_property(&mut self, node: Node) -> bool {
         let node_name = node.name();
         let name_text = node_name.text().to_string();

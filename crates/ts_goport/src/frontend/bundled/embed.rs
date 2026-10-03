@@ -153,7 +153,7 @@ impl Fs for WrappedFs {
         self.fs.get_accessible_entries(path)
     }
 
-    // Go: embed.go:88 Stat
+    // Go: embed.go:84 Stat
     fn stat(&self, path: &str) -> Option<FileInfo> {
         if let Some(rest) = split_path(path) {
             if rest.is_empty() || rest == "libs" {
@@ -168,7 +168,7 @@ impl Fs for WrappedFs {
         self.fs.stat(path)
     }
 
-    // Go: embed.go:148 Realpath
+    // Go: embed.go:98 Realpath
     fn realpath(&self, path: &str) -> String {
         if split_path(path).is_some() {
             return path.to_string();
@@ -176,7 +176,7 @@ impl Fs for WrappedFs {
         self.fs.realpath(path)
     }
 
-    // Go: embed.go:155 WriteFile
+    // Go: embed.go:105 WriteFile
     fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         if split_path(path).is_some() {
             panic!("cannot write to embedded file system");
@@ -184,7 +184,7 @@ impl Fs for WrappedFs {
         self.fs.write_file(path, data)
     }
 
-    // Go: embed.go:162 AppendFile
+    // Go: embed.go:112 AppendFile
     fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         if split_path(path).is_some() {
             panic!("cannot write to embedded file system");
@@ -192,7 +192,7 @@ impl Fs for WrappedFs {
         self.fs.append_file(path, data)
     }
 
-    // Go: embed.go:169 Remove
+    // Go: embed.go:119 Remove
     fn remove(&self, path: &str) -> Result<(), FsError> {
         if split_path(path).is_some() {
             panic!("cannot remove from embedded file system");
@@ -200,7 +200,7 @@ impl Fs for WrappedFs {
         self.fs.remove(path)
     }
 
-    // Go: embed.go:176 Chtimes
+    // Go: embed.go:126 Chtimes
     fn chtimes(
         &self,
         path: &str,
@@ -214,7 +214,7 @@ impl Fs for WrappedFs {
     }
 }
 
-// Go: embed.go:183 fileInfo
+// Go: embed.go:133 fileInfo
 // PORT: the Go `fileInfo` type is the shared `FileInfo` value. Its
 // `ModTime` is the Go zero time (`None`) and `Info()` returns itself
 // (`DirEntryInfo::Known`).
@@ -227,7 +227,7 @@ fn new_file_info(name: &str, mode: FileMode, size: i64) -> FileInfo {
     }
 }
 
-// Go: embed_generated.go:232 embeddedContents
+// Go: embed_generated.go:238 embeddedContents
 // PORT: the Go map is built once from `EMBEDDED_CONTENTS`.
 fn embedded_contents(rest: &str) -> Option<&'static str> {
     static MAP: OnceLock<FxHashMap<&'static str, &'static str>> = OnceLock::new();

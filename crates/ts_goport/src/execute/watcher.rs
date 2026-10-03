@@ -39,7 +39,7 @@ use crate::fswatch;
 use crate::gostd::{Context, GoError};
 use std::time::SystemTime;
 
-// Go: execute/watcher.go:24 cachedSourceFile
+// Go: execute/watcher.go:26 cachedSourceFile
 // PORT: Go `time.Time` is `Option<SystemTime>` (`None` = zero), as in
 // `vfs::FileInfo`.
 pub struct CachedSourceFile {
@@ -47,7 +47,7 @@ pub struct CachedSourceFile {
     pub mod_time: Option<SystemTime>,
 }
 
-// Go: execute/watcher.go:29 watchCompilerHost
+// Go: execute/watcher.go:31 watchCompilerHost
 // PORT: the embedded Go `compiler.CompilerHost` is the `compiler_host`
 // field; the trait impl below forwards to it. Go `*collections.SyncMap`
 // shared with the watcher is `Rc<RefCell<FxHashMap>>` (one thread).

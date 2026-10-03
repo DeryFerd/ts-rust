@@ -4,7 +4,7 @@ use crate::ls::prelude::*;
 // comment and JSDoc tags that the API returns, and the JSDoc lookup helpers
 // that tsgo#4893 moved here from `hover.go`.
 
-// Go: ls/jsdoc.go:17 JSDocTagInfo
+// Go: ls/jsdoc.go:18 JSDocTagInfo
 /// JSDocTagInfo mirrors Strada's `JSDocTagInfo`, but renders the tag's text as a
 /// plain string instead of `SymbolDisplayPart[]`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -13,7 +13,7 @@ pub struct JSDocTagInfo {
     pub text: String,
 }
 
-// Go: ls/jsdoc.go:27 GetSymbolDocumentationComment
+// Go: ls/jsdoc.go:28 GetSymbolDocumentationComment
 /// GetSymbolDocumentationComment renders a symbol's documentation comment as plain text.
 /// It backs the API's Symbol.getDocumentationComment and mirrors Strada's
 /// getJsDocCommentsFromDeclarations: comments are gathered from each unique declaration,
@@ -49,7 +49,7 @@ pub fn get_symbol_documentation_comment(c: &mut Checker, symbol: SymbolId) -> St
     parts.join("\n")
 }
 
-// Go: ls/jsdoc.go:50 GetSymbolJSDocTags
+// Go: ls/jsdoc.go:51 GetSymbolJSDocTags
 /// GetSymbolJSDocTags collects a symbol's JSDoc tags. It backs the API's Symbol.getJsDocTags
 /// and mirrors Strada's getJsDocTagsFromDeclarations, except each tag's text is rendered as a
 /// plain string rather than SymbolDisplayPart[]. Tags with no text have an empty Text field.
@@ -90,7 +90,7 @@ pub fn get_symbol_js_doc_tags(c: &Checker, symbol: SymbolId) -> Vec<JSDocTagInfo
     infos
 }
 
-// Go: ls/jsdoc.go:83 declarationJSDocTags
+// Go: ls/jsdoc.go:85 declarationJSDocTags
 /// declarationJSDocTags returns the JSDoc tags associated with a declaration, walking the
 /// JSDoc comment location chain like the checker's getAllJSDocTags.
 fn declaration_js_doc_tags(node: Node) -> Vec<Node> {
@@ -111,7 +111,7 @@ fn declaration_js_doc_tags(node: Node) -> Vec<Node> {
     Vec::new()
 }
 
-// Go: ls/jsdoc.go:101 getJSDocTagText
+// Go: ls/jsdoc.go:103 getJSDocTagText
 /// getJSDocTagText renders the text of a single JSDoc tag as a plain string, mirroring
 /// Strada's getCommentDisplayParts collapsed from SymbolDisplayPart[] to a string.
 fn get_js_doc_tag_text(tag: Node) -> String {
@@ -178,12 +178,12 @@ fn get_js_doc_tag_text(tag: Node) -> String {
     }
 }
 
-// Go: ls/jsdoc.go:163 getJSDoc
+// Go: ls/jsdoc.go:164 getJSDoc
 pub fn get_js_doc(node: Node) -> Node {
     node.js_doc(Node::NIL).last().unwrap_or(Node::NIL)
 }
 
-// Go: ls/jsdoc.go:167 getJSDocOrTag
+// Go: ls/jsdoc.go:168 getJSDocOrTag
 pub fn get_js_doc_or_tag(
     c: &mut Checker,
     node: Node,
@@ -315,7 +315,7 @@ pub fn get_js_doc_or_tag(
     Node::NIL
 }
 
-// Go: ls/jsdoc.go:238 getMatchingJSDocTag
+// Go: ls/jsdoc.go:239 getMatchingJSDocTag
 pub fn get_matching_js_doc_tag(
     c: &mut Checker,
     node: Node,
@@ -337,7 +337,7 @@ pub fn get_matching_js_doc_tag(
     Node::NIL
 }
 
-// Go: ls/jsdoc.go:253 getJSDocParameterTagByPosition
+// Go: ls/jsdoc.go:254 getJSDocParameterTagByPosition
 // getJSDocParameterTagByPosition finds a JSDoc @param tag for a binding pattern parameter by position.
 // Since binding patterns don't have a simple name, we match the @param tag at the same index as the parameter.
 pub fn get_js_doc_parameter_tag_by_position(c: &mut Checker, param: Node) -> Node {
@@ -383,12 +383,12 @@ pub fn get_js_doc_parameter_tag_by_position(c: &mut Checker, param: Node) -> Nod
     Node::NIL
 }
 
-// Go: ls/jsdoc.go:296 isMatchingParameterTag
+// Go: ls/jsdoc.go:297 isMatchingParameterTag
 pub fn is_matching_parameter_tag(tag: Node, name: &str) -> bool {
     tag.kind() == SyntaxKind::JsDocParameterTag && is_node_with_name(tag, name)
 }
 
-// Go: ls/jsdoc.go:300 isMatchingTemplateTag
+// Go: ls/jsdoc.go:301 isMatchingTemplateTag
 pub fn is_matching_template_tag(tag: Node, name: &str) -> bool {
     tag.kind() == SyntaxKind::JsDocTemplateTag
         && tag
@@ -397,7 +397,7 @@ pub fn is_matching_template_tag(tag: Node, name: &str) -> bool {
             .any(|tp| is_node_with_name(tp, name))
 }
 
-// Go: ls/jsdoc.go:304 isNodeWithName
+// Go: ls/jsdoc.go:305 isNodeWithName
 pub fn is_node_with_name(node: Node, name: &str) -> bool {
     let node_name = node.name();
     is_identifier(node_name) && node_name.text() == name

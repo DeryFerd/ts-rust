@@ -5,7 +5,7 @@ use crate::frontend::scanner::scanner_ls;
 use crate::ls::lsutil::prelude::*;
 use std::cell::Cell;
 
-// Go: ls/lsutil/children.go:11 GetLastChild
+// Go: ls/lsutil/children.go:13 GetLastChild
 /// Replaces last(node.getChildren(sourceFile))
 pub fn get_last_child(node: Node, source_file: Node) -> Node {
     let last_child_node = get_last_visited_child(node, source_file);
@@ -44,7 +44,7 @@ pub fn get_last_child(node: Node, source_file: Node) -> Node {
     }
 }
 
-// Go: ls/lsutil/children.go:35 GetLastToken
+// Go: ls/lsutil/children.go:37 GetLastToken
 pub fn get_last_token(node: Node, source_file: Node) -> Node {
     if node.is_nil() {
         return Node::NIL;
@@ -68,7 +68,7 @@ pub fn get_last_token(node: Node, source_file: Node) -> Node {
     }
 }
 
-// Go: ls/lsutil/children.go:60 GetLastVisitedChild
+// Go: ls/lsutil/children.go:62 GetLastVisitedChild
 /// Gets the last visited child of the given node.
 /// NOTE: This doesn't include unvisited tokens; for this, use `getLastChild` or `getLastToken`.
 pub fn get_last_visited_child(node: Node, source_file: Node) -> Node {
@@ -102,7 +102,7 @@ pub fn get_last_visited_child(node: Node, source_file: Node) -> Node {
     last_child.get()
 }
 
-// Go: ls/lsutil/children.go:85 GetFirstToken
+// Go: ls/lsutil/children.go:87 GetFirstToken
 pub fn get_first_token(node: Node, source_file: Node) -> Node {
     if is_identifier(node) || is_token_kind(node.kind()) {
         return Node::NIL;
@@ -152,7 +152,7 @@ pub fn get_first_token(node: Node, source_file: Node) -> Node {
     get_first_token(first_child, source_file)
 }
 
-// Go: ls/lsutil/children.go:126 AssertHasRealPosition
+// Go: ls/lsutil/children.go:128 AssertHasRealPosition
 pub fn assert_has_real_position(node: Node) {
     if position_is_synthesized(node.pos()) || position_is_synthesized(node.end()) {
         crate::core::go_panic("Node must have a real position for this operation.".to_string());

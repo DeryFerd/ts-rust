@@ -30,7 +30,7 @@ impl FileChangeKind {
     pub const WATCH_CHANGE: FileChangeKind = FileChangeKind(5);
     pub const WATCH_DELETE: FileChangeKind = FileChangeKind(6);
 
-    // Go: project/filechange.go:22 FileChangeKind.IsWatchKind
+    // Go: project/filechange.go:26 FileChangeKind.IsWatchKind
     pub fn is_watch_kind(self) -> bool {
         self == FileChangeKind::WATCH_CREATE
             || self == FileChangeKind::WATCH_CHANGE
@@ -38,7 +38,7 @@ impl FileChangeKind {
     }
 }
 
-// Go: project/filechange.go:26 FileChange
+// Go: project/filechange.go:30 FileChange
 #[derive(Clone, Debug, Default)]
 pub struct FileChange {
     pub kind: FileChangeKind,
@@ -49,7 +49,7 @@ pub struct FileChange {
     pub changes: Vec<lsproto::TextDocumentContentChangePartialOrWholeDocument>, // Only set for Change
 }
 
-// Go: project/filechange.go:35 FileChangeSummary
+// Go: project/filechange.go:39 FileChangeSummary
 // PORT: an empty `DocumentUri` is Go's "" (no file). Go `Clone`
 // (filechange.go:58, ts#64204) copies the four sets; the derived `Clone`
 // does the same.
@@ -74,7 +74,7 @@ pub struct FileChangeSummary {
 }
 
 impl FileChangeSummary {
-    // Go: project/filechange.go:54 FileChangeSummary.IsEmpty
+    // Go: project/filechange.go:66 FileChangeSummary.IsEmpty
     pub fn is_empty(&self) -> bool {
         !self.invalidate_all
             && self.opened.0.is_empty()
@@ -85,21 +85,21 @@ impl FileChangeSummary {
             && self.deleted.is_empty()
     }
 
-    // Go: project/filechange.go:58 FileChangeSummary.HasExcessiveWatchEvents
+    // Go: project/filechange.go:70 FileChangeSummary.HasExcessiveWatchEvents
     pub fn has_excessive_watch_events(&self) -> bool {
         self.invalidate_all
             || (self.created.len() + self.deleted.len() + self.changed.len()) as i32
                 > EXCESSIVE_CHANGE_THRESHOLD
     }
 
-    // Go: project/filechange.go:62 FileChangeSummary.HasExcessiveNonCreateWatchEvents
+    // Go: project/filechange.go:74 FileChangeSummary.HasExcessiveNonCreateWatchEvents
     pub fn has_excessive_non_create_watch_events(&self) -> bool {
         self.invalidate_all
             || (self.deleted.len() + self.changed.len()) as i32 > EXCESSIVE_CHANGE_THRESHOLD
     }
 }
 
-// Go: project/filechange.go:67 mergeFileChangeSummary
+// Go: project/filechange.go:79 mergeFileChangeSummary
 // mergeFileChangeSummary merges src into dst, combining their change sets.
 // PORT: Go passes `src` by value; here by reference.
 pub fn merge_file_change_summary(dst: &mut FileChangeSummary, src: &FileChangeSummary) {

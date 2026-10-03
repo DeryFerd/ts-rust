@@ -6,7 +6,7 @@ use crate::flags_macros::go_enum;
 use crate::frontend::tspath;
 use crate::ls::lsutil;
 
-// Go: ls/autoimport/export.go:18 ModuleID
+// Go: ls/autoimport/export.go:17 ModuleID
 // ModuleID uniquely identifies a module across multiple declarations.
 // If the export is from an ambient module declaration, this is the module name.
 // If the export is from a module augmentation, this is the Path() of the resolved module file.
@@ -14,14 +14,14 @@ use crate::ls::lsutil;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ModuleID(pub String);
 
-// Go: ls/autoimport/export.go:20 ExportID
+// Go: ls/autoimport/export.go:19 ExportID
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ExportID {
     pub module_id: ModuleID,
     pub export_name: String,
 }
 
-// Go: ls/autoimport/export.go:25 ExportSyntax
+// Go: ls/autoimport/export.go:24 ExportSyntax
 go_enum!(ExportSyntax, i32 {
     NONE = 0; // ExportSyntaxNone
     // export const x = {}
@@ -44,7 +44,7 @@ go_enum!(ExportSyntax, i32 {
     COMMON_JS_EXPORTS_PROPERTY = 9; // ExportSyntaxCommonJSExportsProperty
 });
 
-// Go: ls/autoimport/export.go:49 Export
+// Go: ls/autoimport/export.go:48 Export
 // PORT: Go embeds `ExportID`; it is the nested `export_id` field, and `Deref`
 // promotes its fields (`export.module_id`, `export.export_name`) as Go does.
 // Go `*Export` values are shared (`Rc<Export>`) once they are complete.
@@ -85,7 +85,7 @@ impl std::ops::DerefMut for Export {
 }
 
 impl Export {
-    // Go: ls/autoimport/export.go:72 Name
+    // Go: ls/autoimport/export.go:71 Name
     pub fn name(&self) -> String {
         if !self.local_name.is_empty() {
             return self.local_name.clone();
@@ -96,13 +96,13 @@ impl Export {
         self.export_id.export_name.clone()
     }
 
-    // Go: ls/autoimport/export.go:82 IsRenameable
+    // Go: ls/autoimport/export.go:81 IsRenameable
     pub fn is_renameable(&self) -> bool {
         self.export_id.export_name == INTERNAL_SYMBOL_NAME_EXPORT_EQUALS
             || self.export_id.export_name == INTERNAL_SYMBOL_NAME_DEFAULT
     }
 
-    // Go: ls/autoimport/export.go:86 AmbientModuleName
+    // Go: ls/autoimport/export.go:85 AmbientModuleName
     pub fn ambient_module_name(&self) -> String {
         if !tspath::is_external_module_name_relative(&self.export_id.module_id.0) {
             return self.export_id.module_id.0.clone();
@@ -110,13 +110,13 @@ impl Export {
         String::new()
     }
 
-    // Go: ls/autoimport/export.go:93 IsUnresolvedAlias
+    // Go: ls/autoimport/export.go:92 IsUnresolvedAlias
     pub fn is_unresolved_alias(&self) -> bool {
         self.flags == SymbolFlags::ALIAS
     }
 }
 
-// Go: ls/autoimport/export.go:97 SymbolToExport
+// Go: ls/autoimport/export.go:96 SymbolToExport
 // PORT: Go `*Export` result; nil is `None`.
 pub fn symbol_to_export(symbol: SymbolId, ch: &mut Checker) -> Option<Rc<Export>> {
     let parent = ch.sym(symbol).parent;
@@ -186,7 +186,7 @@ pub fn symbol_to_export(symbol: SymbolId, ch: &mut Checker) -> Option<Rc<Export>
     )
 }
 
-// Go: ls/autoimport/export.go:129 tryGetModuleExport
+// Go: ls/autoimport/export.go:128 tryGetModuleExport
 pub fn try_get_module_export(
     export_name: &str,
     target: SymbolId,
@@ -206,7 +206,7 @@ pub fn try_get_module_export(
     None
 }
 
-// Go: ls/autoimport/export.go:137 extractFirstExport
+// Go: ls/autoimport/export.go:136 extractFirstExport
 pub fn extract_first_export(
     symbol: SymbolId,
     ch: &mut Checker,

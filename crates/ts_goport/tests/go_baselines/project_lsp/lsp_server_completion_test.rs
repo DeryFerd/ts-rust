@@ -267,3 +267,77 @@ child_test! {
         );
     }
 }
+
+child_test! {
+    // PORT: no Go counterpart (optapifuzz1 A). The user types an
+    // unterminated JSDoc comment at the end of a file, and its last 2 bytes
+    // split a char. Go cuts the comment text 2 bytes before the end
+    // (parser/jsdoc.go:163) and reads the kept bytes as RuneError. The port
+    // panicked on that cut: the server exited 70 on the diagnostics of the JS
+    // file, which parses JSDoc at once, and the completion at the end of the
+    // TS file, which parses it lazily, answered an internal error. Go
+    // answers TS1010 at the end of the file and a null completion.
+    fn jsdoc_cut_inside_a_char_at_the_end_of_a_file() {
+        let client = init_completion_client(
+            "/home/projects",
+            &[
+                (
+                    "/home/projects/tsconfig.json",
+                    r#"{"compilerOptions": {"allowJs": true, "checkJs": true, "noEmit": true}}"#,
+                ),
+                ("/home/projects/a.js", "const a = 1;\n"),
+                ("/home/projects/b.ts", "const b = 1;\n"),
+            ],
+        );
+        let a_uri = lsconv::file_name_to_document_uri("/home/projects/a.js");
+        let b_uri = lsconv::file_name_to_document_uri("/home/projects/b.ts");
+        client.send_notification(
+            &lsproto::TEXT_DOCUMENT_DID_OPEN_INFO,
+            lsproto::DidOpenTextDocumentParams {
+                text_document: Some(lsproto::TextDocumentItem {
+                    uri: a_uri.clone(),
+                    language_id: lsproto::LanguageKind::JAVA_SCRIPT,
+                    text: "const a = 1;\n/** 日本語".to_string(),
+                    ..Default::default()
+                }),
+            },
+        );
+        open(&client, &b_uri, "const b = 1;\n/** Cafés");
+
+        let (msg, report) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_DIAGNOSTIC_INFO,
+            lsproto::DocumentDiagnosticParams {
+                text_document: lsproto::TextDocumentIdentifier { uri: a_uri.clone() },
+                ..Default::default()
+            },
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+        let items = report
+            .and_then(|report| report.full_document_diagnostic_report)
+            .expect("a full document diagnostic report")
+            .items;
+        let found: Vec<_> = items
+            .iter()
+            .map(|d| (d.code.as_ref().and_then(|c| c.integer), d.range.start.line, d.range.start.character))
+            .collect();
+        assert_eq!(found, [(Some(1010), 1, 7)]);
+
+        let (msg, resp) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_COMPLETION_INFO,
+            completion_params(&b_uri, 1, 9),
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+        assert!(resp.is_none_or(|resp| resp.items.is_none() && resp.list.is_none()));
+
+        // The server is alive.
+        let (msg, _) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_HOVER_INFO,
+            lsproto::HoverParams {
+                text_document: lsproto::TextDocumentIdentifier { uri: a_uri },
+                position: lsproto::Position { line: 0, character: 6 },
+                ..Default::default()
+            },
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+    }
+}

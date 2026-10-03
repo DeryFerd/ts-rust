@@ -72,7 +72,7 @@ pub fn get_scan_start_position(
     preceding_token.end()
 }
 
-// Go: format/span.go:88 getOwnOrInheritedDelta
+// Go: format/span.go:89 getOwnOrInheritedDelta
 /*
  * For cases like
  * if (a ||
@@ -112,12 +112,12 @@ pub fn get_own_or_inherited_delta(
     0
 }
 
-// Go: format/span.go:108 rangeHasNoErrors
+// Go: format/span.go:109 rangeHasNoErrors
 pub fn range_has_no_errors(_: TextRange) -> bool {
     false
 }
 
-// Go: format/span.go:112 prepareRangeContainsErrorFunction
+// Go: format/span.go:113 prepareRangeContainsErrorFunction
 // PORT: Go returns `func(r core.TextRange) bool`. The closure advances
 // `index`, so it is `FnMut`. It keeps the ranges of the errors it picks,
 // not the errors, so it does not borrow `errors` (a file version guard).
@@ -168,7 +168,7 @@ pub fn prepare_range_contains_error_function(
     })
 }
 
-// Go: format/span.go:154 formatSpanWorker
+// Go: format/span.go:155 formatSpanWorker
 // PORT: Go keeps the NodeVisitor built in `execute` in `w.visitor`. The Rust
 // visitor holds `&mut FormatSpanWorker<'t>` as its ctx, so it cannot live in the
 // worker; `execute_process_node_visitor` builds one per call with the same
@@ -207,7 +207,7 @@ pub struct FormatSpanWorker<'t> {
     pub current_rules: Vec<Arc<RuleImpl>>,
 }
 
-// Go: format/span.go:187 newFormatSpanWorker
+// Go: format/span.go:188 newFormatSpanWorker
 // PORT: `range_contains_error` is 'static: every caller passes a closure over
 // the file's parse diagnostics (`&'static`) or none.
 pub fn new_format_span_worker<'t>(
@@ -247,7 +247,7 @@ pub fn new_format_span_worker<'t>(
     }
 }
 
-// Go: format/span.go:210 getNonDecoratorTokenPosOfNode
+// Go: format/span.go:211 getNonDecoratorTokenPosOfNode
 pub fn get_non_decorator_token_pos_of_node(node: Node, mut file: Node) -> i32 {
     let mut last_decorator = Node::NIL;
     if has_decorators(node) {
@@ -351,7 +351,7 @@ impl<'t> FormatSpanWorker<'t> {
             .options
     }
 
-    // Go: format/span.go:224 execute
+    // Go: format/span.go:225 execute
     pub fn execute(&mut self, s: FormattingScanner<'t>) -> Vec<TextChange> {
         self.formatting_scanner = Some(s);
         self.indentation_on_last_indented_line = -1;
@@ -494,7 +494,7 @@ impl<'t> FormatSpanWorker<'t> {
         std::mem::take(&mut self.edits)
     }
 
-    // Go: format/span.go:333 processChildNode
+    // Go: format/span.go:334 processChildNode
     pub fn process_child_node(
         &mut self,
         node: Node,
@@ -653,7 +653,7 @@ impl<'t> FormatSpanWorker<'t> {
         inherited_indentation
     }
 
-    // Go: format/span.go:432 processChildNodes
+    // Go: format/span.go:439 processChildNodes
     pub fn process_child_nodes(
         &mut self,
         node: Node,
@@ -803,7 +803,7 @@ impl<'t> FormatSpanWorker<'t> {
         }
     }
 
-    // Go: format/span.go:522 executeProcessNodeVisitor
+    // Go: format/span.go:528 executeProcessNodeVisitor
     pub fn execute_process_node_visitor(
         &mut self,
         node: Node,
@@ -904,7 +904,7 @@ impl<'t> FormatSpanWorker<'t> {
         (inherited_indentation, delta)
     }
 
-    // Go: format/span.go:582 tryComputeIndentationForListItem
+    // Go: format/span.go:593 tryComputeIndentationForListItem
     /** Tries to compute the indentation for a list element.
      * If list element is not in range then
      * function will pick its actual indentation
@@ -942,7 +942,7 @@ impl<'t> FormatSpanWorker<'t> {
         -1
     }
 
-    // Go: format/span.go:605 processNode
+    // Go: format/span.go:615 processNode
     pub fn process_node(
         &mut self,
         node: Node,
@@ -1003,7 +1003,7 @@ impl<'t> FormatSpanWorker<'t> {
         }
     }
 
-    // Go: format/span.go:640 processPair
+    // Go: format/span.go:650 processPair
     pub fn process_pair(
         &mut self,
         current_item: TextRangeWithKind,
@@ -1108,7 +1108,7 @@ impl<'t> FormatSpanWorker<'t> {
         line_action
     }
 
-    // Go: format/span.go:690 applyRuleEdits
+    // Go: format/span.go:700 applyRuleEdits
     pub fn apply_rule_edits(
         &mut self,
         rule: &RuleImpl,
@@ -1194,7 +1194,7 @@ impl<'t> FormatSpanWorker<'t> {
     }
 }
 
-// Go: format/span.go:744 LineAction
+// Go: format/span.go:754 LineAction
 go_enum!(LineAction, i32 {
     NONE = 0; // LineActionNone
     LINE_ADDED = 1; // LineActionLineAdded
@@ -1202,7 +1202,7 @@ go_enum!(LineAction, i32 {
 });
 
 impl<'t> FormatSpanWorker<'t> {
-    // Go: format/span.go:752 processRange
+    // Go: format/span.go:762 processRange
     pub fn process_range(
         &mut self,
         r: TextRangeWithKind,
@@ -1246,7 +1246,7 @@ impl<'t> FormatSpanWorker<'t> {
         line_action
     }
 
-    // Go: format/span.go:773 processTrivia
+    // Go: format/span.go:783 processTrivia
     pub fn process_trivia(
         &mut self,
         trivia: &[TextRangeWithKind],
@@ -1273,7 +1273,7 @@ impl<'t> FormatSpanWorker<'t> {
         }
     }
 
-    // Go: format/span.go:786 trimTrailingWhitespacesForRemainingRange
+    // Go: format/span.go:796 trimTrailingWhitespacesForRemainingRange
     /**
      * Trimming will be done for lines after the previous range.
      * Exclude comments as they had been previously processed.
@@ -1309,7 +1309,7 @@ impl<'t> FormatSpanWorker<'t> {
         }
     }
 
-    // Go: format/span.go:807 trimTrailingWitespacesForPositions
+    // Go: format/span.go:817 trimTrailingWitespacesForPositions
     pub fn trim_trailing_witespaces_for_positions(
         &mut self,
         start_pos: i32,
@@ -1322,7 +1322,7 @@ impl<'t> FormatSpanWorker<'t> {
         self.trim_trailing_whitespaces_for_lines(start_line, end_line + 1, previous_range);
     }
 
-    // Go: format/span.go:814 trimTrailingWhitespacesForLines
+    // Go: format/span.go:824 trimTrailingWhitespacesForLines
     pub fn trim_trailing_whitespaces_for_lines(
         &mut self,
         line1: i32,
@@ -1359,7 +1359,7 @@ impl<'t> FormatSpanWorker<'t> {
         }
     }
 
-    // Go: format/span.go:840 getTrailingWhitespaceStartPosition
+    // Go: format/span.go:850 getTrailingWhitespaceStartPosition
     /**
      * @param start The position of the first character in range
      * @param end The position of the last character in range
@@ -1385,20 +1385,20 @@ impl<'t> FormatSpanWorker<'t> {
     }
 }
 
-// Go: format/span.go:860 isStringOrRegularExpressionOrTemplateLiteral
+// Go: format/span.go:870 isStringOrRegularExpressionOrTemplateLiteral
 pub fn is_string_or_regular_expression_or_template_literal(kind: SyntaxKind) -> bool {
     kind == SyntaxKind::StringLiteral
         || kind == SyntaxKind::RegularExpressionLiteral
         || is_template_literal_kind(kind)
 }
 
-// Go: format/span.go:864 isComment
+// Go: format/span.go:874 isComment
 pub fn is_comment(kind: SyntaxKind) -> bool {
     kind == SyntaxKind::SingleLineCommentTrivia || kind == SyntaxKind::MultiLineCommentTrivia
 }
 
 impl<'t> FormatSpanWorker<'t> {
-    // Go: format/span.go:868 insertIndentation
+    // Go: format/span.go:878 insertIndentation
     pub fn insert_indentation(&mut self, pos: i32, indentation: i32, line_added: bool) {
         let indentation_string = get_indentation_string(indentation, self.options());
         if line_added {
@@ -1422,7 +1422,7 @@ impl<'t> FormatSpanWorker<'t> {
         }
     }
 
-    // Go: format/span.go:883 characterToColumn
+    // Go: format/span.go:893 characterToColumn
     pub fn character_to_column(&self, start_line_position: i32, character_in_line: i32) -> i32 {
         let mut column = 0;
         let text_text = source_file_text(self.source_file);
@@ -1440,7 +1440,7 @@ impl<'t> FormatSpanWorker<'t> {
         column
     }
 
-    // Go: format/span.go:897 indentationIsDifferent
+    // Go: format/span.go:907 indentationIsDifferent
     pub fn indentation_is_different(
         &self,
         indentation_string: &str,
@@ -1455,7 +1455,7 @@ impl<'t> FormatSpanWorker<'t> {
         indentation_string.as_bytes() != &text[start_line_position as usize..end]
     }
 
-    // Go: format/span.go:906 indentTriviaItems
+    // Go: format/span.go:916 indentTriviaItems
     // PORT: Go `indentSingleLine` closes over the worker. Here the callback
     // gets the worker as its first argument.
     pub fn indent_trivia_items(
@@ -1494,7 +1494,7 @@ impl<'t> FormatSpanWorker<'t> {
         indent_next_token_or_trivia
     }
 
-    // Go: format/span.go:927 indentMultilineComment
+    // Go: format/span.go:937 indentMultilineComment
     pub fn indent_multiline_comment(
         &mut self,
         comment_range: TextRange,
@@ -1594,7 +1594,7 @@ fn strings_repeat(s: &str, count: i32) -> String {
     s.repeat(count as usize)
 }
 
-// Go: format/span.go:988 getIndentationString
+// Go: format/span.go:998 getIndentationString
 pub fn get_indentation_string(indentation: i32, options: &lsutil::FormatCodeSettings) -> String {
     // go's `strings.Repeat` already has static, global caching for repeated tabs and spaces, so there's no need to cache here like in strada
     if !options.editor_settings.convert_tabs_to_spaces.is_true() {
@@ -1615,7 +1615,7 @@ pub fn get_indentation_string(indentation: i32, options: &lsutil::FormatCodeSett
     }
 }
 
-// Go: format/span.go:1007 createTextChangeFromStartLength
+// Go: format/span.go:1017 createTextChangeFromStartLength
 pub fn create_text_change_from_start_length(start: i32, length: i32, new_text: &str) -> TextChange {
     TextChange {
         new_text: new_text.to_string(),
@@ -1624,7 +1624,7 @@ pub fn create_text_change_from_start_length(start: i32, length: i32, new_text: &
 }
 
 impl<'t> FormatSpanWorker<'t> {
-    // Go: format/span.go:1014 recordDelete
+    // Go: format/span.go:1024 recordDelete
     pub fn record_delete(&mut self, start: i32, length: i32) {
         if length != 0 {
             self.edits
@@ -1632,7 +1632,7 @@ impl<'t> FormatSpanWorker<'t> {
         }
     }
 
-    // Go: format/span.go:1020 recordReplace
+    // Go: format/span.go:1030 recordReplace
     pub fn record_replace(&mut self, start: i32, length: i32, new_text: &str) {
         if length != 0 || !new_text.is_empty() {
             self.edits.push(create_text_change_from_start_length(
@@ -1641,7 +1641,7 @@ impl<'t> FormatSpanWorker<'t> {
         }
     }
 
-    // Go: format/span.go:1026 recordInsert
+    // Go: format/span.go:1036 recordInsert
     pub fn record_insert(&mut self, start: i32, text: &str) {
         if !text.is_empty() {
             self.edits
@@ -1649,7 +1649,7 @@ impl<'t> FormatSpanWorker<'t> {
         }
     }
 
-    // Go: format/span.go:1032 consumeTokenAndAdvanceScanner
+    // Go: format/span.go:1042 consumeTokenAndAdvanceScanner
     pub fn consume_token_and_advance_scanner(
         &mut self,
         current_token_info: TokenInfo,
@@ -1797,7 +1797,7 @@ impl<'t> FormatSpanWorker<'t> {
     }
 }
 
-// Go: format/span.go:1111 dynamicIndenter
+// Go: format/span.go:1121 dynamicIndenter
 // PORT: Go shares `*dynamicIndenter` between the worker and its callers and
 // mutates `indentation` and `delta` through it (recomputeIndentation). Here
 // it is shared as `Rc<DynamicIndenter>` with those two fields in `Cell`s. It
@@ -1813,7 +1813,7 @@ pub struct DynamicIndenter {
 }
 
 impl DynamicIndenter {
-    // Go: format/span.go:1121 getIndentationForComment
+    // Go: format/span.go:1131 getIndentationForComment
     pub fn get_indentation_for_comment(
         &self,
         kind: SyntaxKind,
@@ -1838,7 +1838,7 @@ impl DynamicIndenter {
         self.indentation.get()
     }
 
-    // Go: format/span.go:1149 getIndentationForToken
+    // Go: format/span.go:1159 getIndentationForToken
     // if list end token is LessThanToken '>' then its delta should be explicitly suppressed
     // so that LessThanToken as a binary operator can still be indented.
     // foo.then
@@ -1865,12 +1865,12 @@ impl DynamicIndenter {
         self.indentation.get()
     }
 
-    // Go: format/span.go:1156 getIndentation
+    // Go: format/span.go:1166 getIndentation
     pub fn get_indentation(&self) -> i32 {
         self.indentation.get()
     }
 
-    // Go: format/span.go:1160 getDelta
+    // Go: format/span.go:1170 getDelta
     pub fn get_delta(&self, child: Node) -> i32 {
         // Delta value should be zero when the node explicitly prevents indentation of the child node
         if node_will_indent_child(&self.options, self.node, child, self.source_file, true) {
@@ -1879,7 +1879,7 @@ impl DynamicIndenter {
         0
     }
 
-    // Go: format/span.go:1168 recomputeIndentation
+    // Go: format/span.go:1178 recomputeIndentation
     pub fn recompute_indentation(&self, line_added: bool, parent: Node) {
         if should_indent_child_node(&self.options, parent, self.node, self.source_file, &[]) {
             if line_added {
@@ -1897,7 +1897,7 @@ impl DynamicIndenter {
         }
     }
 
-    // Go: format/span.go:1183 shouldAddDelta
+    // Go: format/span.go:1193 shouldAddDelta
     pub fn should_add_delta(&self, line: i32, kind: SyntaxKind, container: Node) -> bool {
         match kind {
             // open and close brace, 'else' and 'while' (in do statement) tokens has indentation of the parent
@@ -1931,7 +1931,7 @@ impl DynamicIndenter {
     }
 }
 
-// Go: format/span.go:1206 getFirstNonDecoratorTokenOfNode
+// Go: format/span.go:1214 getFirstNonDecoratorTokenOfNode
 pub fn get_first_non_decorator_token_of_node(node: Node) -> SyntaxKind {
     if can_have_modifiers(node) {
         let modifier_nodes = node.modifier_nodes();
@@ -1976,7 +1976,7 @@ pub fn get_first_non_decorator_token_of_node(node: Node) -> SyntaxKind {
 }
 
 impl<'t> FormatSpanWorker<'t> {
-    // Go: format/span.go:1243 getDynamicIndentation
+    // Go: format/span.go:1251 getDynamicIndentation
     pub fn get_dynamic_indentation(
         &self,
         node: Node,

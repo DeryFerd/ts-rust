@@ -84,7 +84,7 @@ impl AsyncTransformer {
         visited
     }
 
-    // Go: transformers/estransforms/async.go:57 asyncTransformer.setContextFlag
+    // Go: transformers/estransforms/async.go:58 asyncTransformer.setContextFlag
     fn set_context_flag(&mut self, flag: AsyncContextFlags, val: bool) {
         if val {
             self.context_flags |= flag;
@@ -93,22 +93,22 @@ impl AsyncTransformer {
         }
     }
 
-    // Go: transformers/estransforms/async.go:65 asyncTransformer.inContext
+    // Go: transformers/estransforms/async.go:66 asyncTransformer.inContext
     fn in_context(&self, flags: AsyncContextFlags) -> bool {
         self.context_flags & flags != 0
     }
 
-    // Go: transformers/estransforms/async.go:69 asyncTransformer.inTopLevelContext
+    // Go: transformers/estransforms/async.go:70 asyncTransformer.inTopLevelContext
     fn in_top_level_context(&self) -> bool {
         !self.in_context(ASYNC_CONTEXT_NON_TOP_LEVEL)
     }
 
-    // Go: transformers/estransforms/async.go:73 asyncTransformer.inHasLexicalThisContext
+    // Go: transformers/estransforms/async.go:74 asyncTransformer.inHasLexicalThisContext
     fn in_has_lexical_this_context(&self) -> bool {
         self.in_context(ASYNC_CONTEXT_HAS_LEXICAL_THIS)
     }
 
-    // Go: transformers/estransforms/async.go:77 asyncTransformer.doWithContext
+    // Go: transformers/estransforms/async.go:78 asyncTransformer.doWithContext
     fn do_with_context(
         &mut self,
         flags: AsyncContextFlags,
@@ -125,12 +125,12 @@ impl AsyncTransformer {
         cb(self, node)
     }
 
-    // Go: transformers/estransforms/async.go:88 asyncTransformer.visitDefault
+    // Go: transformers/estransforms/async.go:89 asyncTransformer.visitDefault
     fn visit_default(&mut self, node: Node) -> Node {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/async.go:92 asyncTransformer.fallbackVisitor
+    // Go: transformers/estransforms/async.go:93 asyncTransformer.fallbackVisitor
     fn fallback_visitor(&mut self, node: Node) -> Node {
         if self.super_access.captured_super_properties.is_none()
             && self.lexical_arguments.binding.is_nil()
@@ -165,12 +165,12 @@ impl AsyncTransformer {
         self.with_visitor(Self::visit_fallback, |v| v.visit_each_child(node))
     }
 
-    // Go: transformers/estransforms/async.go:121 asyncTransformer.visitFallback
+    // Go: transformers/estransforms/async.go:122 asyncTransformer.visitFallback
     fn visit_fallback(&mut self, node: Node) -> Node {
         self.fallback_visitor(node)
     }
 
-    // Go: transformers/estransforms/async.go:125 asyncTransformer.visit
+    // Go: transformers/estransforms/async.go:126 asyncTransformer.visit
     fn visit(&mut self, node: Node) -> Node {
         let ec = self.ec();
         if ec.emit_flags(node).intersects(EmitFlags::NO_LEXICAL_THIS)
@@ -252,7 +252,7 @@ impl AsyncTransformer {
         })
     }
 
-    // Go: transformers/estransforms/async.go:167 asyncTransformer.visitAsyncBodyNode
+    // Go: transformers/estransforms/async.go:165 asyncTransformer.visitAsyncBodyNode
     fn visit_async_body_node(&mut self, node: Node) -> Node {
         if is_node_with_possible_hoisted_declaration(node) {
             match node.kind() {
@@ -284,7 +284,7 @@ impl AsyncTransformer {
         self.visit(node)
     }
 
-    // Go: transformers/estransforms/async.go:197 asyncTransformer.visitCatchClauseInAsyncBody
+    // Go: transformers/estransforms/async.go:195 asyncTransformer.visitCatchClauseInAsyncBody
     fn visit_catch_clause_in_async_body(&mut self, node: Node) -> Node {
         let mut catch_clause_names: FxHashSet<String> = FxHashSet::default();
         if node.variable_declaration().is_some() {
@@ -318,7 +318,7 @@ impl AsyncTransformer {
         self.async_body_visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/async.go:224 asyncTransformer.visitVariableStatementInAsyncBody
+    // Go: transformers/estransforms/async.go:222 asyncTransformer.visitVariableStatementInAsyncBody
     fn visit_variable_statement_in_async_body(&mut self, node: Node) -> Node {
         let decl_list = node.declaration_list();
         if self.is_variable_declaration_list_with_colliding_name(decl_list) {
@@ -332,7 +332,7 @@ impl AsyncTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/async.go:236 asyncTransformer.visitForInStatementInAsyncBody
+    // Go: transformers/estransforms/async.go:234 asyncTransformer.visitForInStatementInAsyncBody
     fn visit_for_in_statement_in_async_body(&mut self, node: Node) -> Node {
         let visited_initializer =
             if self.is_variable_declaration_list_with_colliding_name(node.initializer()) {
@@ -352,7 +352,7 @@ impl AsyncTransformer {
         )
     }
 
-    // Go: transformers/estransforms/async.go:253 asyncTransformer.visitForOfStatementInAsyncBody
+    // Go: transformers/estransforms/async.go:251 asyncTransformer.visitForOfStatementInAsyncBody
     fn visit_for_of_statement_in_async_body(&mut self, node: Node) -> Node {
         let visited_initializer =
             if self.is_variable_declaration_list_with_colliding_name(node.initializer()) {
@@ -373,7 +373,7 @@ impl AsyncTransformer {
         )
     }
 
-    // Go: transformers/estransforms/async.go:270 asyncTransformer.visitForStatementInAsyncBody
+    // Go: transformers/estransforms/async.go:268 asyncTransformer.visitForStatementInAsyncBody
     fn visit_for_statement_in_async_body(&mut self, node: Node) -> Node {
         let initializer = node.initializer();
         let visited_initializer = if initializer.is_some()
@@ -396,7 +396,7 @@ impl AsyncTransformer {
         )
     }
 
-    // Go: transformers/estransforms/async.go:291 asyncTransformer.visitAwaitExpression
+    // Go: transformers/estransforms/async.go:289 asyncTransformer.visitAwaitExpression
     /// visitAwaitExpression visits an AwaitExpression node.
     ///
     /// This function will be called any time a ES2017 await expression is encountered.
@@ -415,7 +415,7 @@ impl AsyncTransformer {
         yield_expr
     }
 
-    // Go: transformers/estransforms/async.go:305 asyncTransformer.visitConstructorDeclaration
+    // Go: transformers/estransforms/async.go:303 asyncTransformer.visitConstructorDeclaration
     fn visit_constructor_declaration(&mut self, node: Node) -> Node {
         let saved_lexical_arguments = self.lexical_arguments;
         self.lexical_arguments = LexicalArgumentsInfo::default();
@@ -435,7 +435,7 @@ impl AsyncTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/async.go:325 asyncTransformer.visitMethodDeclaration
+    // Go: transformers/estransforms/async.go:324 asyncTransformer.visitMethodDeclaration
     /// visitMethodDeclaration visits a MethodDeclaration node.
     ///
     /// This function will be called when one of the following conditions are met:
@@ -493,7 +493,7 @@ impl AsyncTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/async.go:373 asyncTransformer.visitSetAccessorDeclaration
+    // Go: transformers/estransforms/async.go:374 asyncTransformer.visitSetAccessorDeclaration
     fn visit_set_accessor_declaration(&mut self, node: Node) -> Node {
         let saved_lexical_arguments = self.lexical_arguments;
         self.lexical_arguments = LexicalArgumentsInfo::default();
@@ -514,7 +514,7 @@ impl AsyncTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/async.go:394 asyncTransformer.visitFunctionDeclaration
+    // Go: transformers/estransforms/async.go:396 asyncTransformer.visitFunctionDeclaration
     /// visitFunctionDeclaration visits a FunctionDeclaration node.
     ///
     /// This function will be called when one of the following conditions are met:
@@ -551,7 +551,7 @@ impl AsyncTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/async.go:429 asyncTransformer.visitFunctionExpression
+    // Go: transformers/estransforms/async.go:431 asyncTransformer.visitFunctionExpression
     /// visitFunctionExpression visits a FunctionExpression node.
     ///
     /// This function will be called when one of the following conditions are met:
@@ -588,7 +588,7 @@ impl AsyncTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/async.go:464 asyncTransformer.visitArrowFunction
+    // Go: transformers/estransforms/async.go:466 asyncTransformer.visitArrowFunction
     /// visitArrowFunction visits an ArrowFunction.
     ///
     /// This function will be called when one of the following conditions are met:
@@ -703,14 +703,14 @@ impl AsyncTransformer {
         self.ec().factory().inline_expressions(&expressions)
     }
 
-    // Go: transformers/estransforms/async.go:554 asyncTransformer.hoistVariableDeclarationList
+    // Go: transformers/estransforms/async.go:556 asyncTransformer.hoistVariableDeclarationList
     fn hoist_variable_declaration_list(&self, node: Node) {
         for decl in node.declarations().nodes().iter() {
             self.hoist_variable(decl);
         }
     }
 
-    // Go: transformers/estransforms/async.go:560 asyncTransformer.hoistVariable
+    // Go: transformers/estransforms/async.go:562 asyncTransformer.hoistVariable
     fn hoist_variable(&self, node: Node) {
         let name = node.name();
         if name.is_nil() {
@@ -727,7 +727,7 @@ impl AsyncTransformer {
         }
     }
 
-    // Go: transformers/estransforms/async.go:576 asyncTransformer.transformInitializedVariable
+    // Go: transformers/estransforms/async.go:578 asyncTransformer.transformInitializedVariable
     fn transform_initialized_variable(&mut self, node: Node) -> Node {
         let ec = self.ec();
         let target = if is_binding_pattern(node.name()) {
@@ -742,7 +742,7 @@ impl AsyncTransformer {
         self.visit_node(converted)
     }
 
-    // Go: transformers/estransforms/async.go:588 asyncTransformer.collidesWithParameterName
+    // Go: transformers/estransforms/async.go:590 asyncTransformer.collidesWithParameterName
     fn collides_with_parameter_name(&self, node: Node) -> bool {
         let name = node.name();
         if name.is_nil() {
@@ -806,7 +806,7 @@ impl AsyncTransformer {
             .map_or(0, IndexSet::len)
     }
 
-    // Go: transformers/estransforms/async.go:607 asyncTransformer.transformMethodBody
+    // Go: transformers/estransforms/async.go:608 asyncTransformer.transformMethodBody
     fn transform_method_body(&mut self, node: Node) -> Node {
         let saved = self.save_super_access();
         self.reset_super_access();
@@ -852,7 +852,7 @@ impl AsyncTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/async.go:651 asyncTransformer.createCaptureArgumentsStatement
+    // Go: transformers/estransforms/async.go:658 asyncTransformer.createCaptureArgumentsStatement
     fn create_capture_arguments_statement(&self) -> Node {
         let ec = &self.emit_context;
         let f = ec.factory();
@@ -872,7 +872,7 @@ impl AsyncTransformer {
         statement
     }
 
-    // Go: transformers/estransforms/async.go:664 asyncTransformer.transformAsyncFunctionParameterList
+    // Go: transformers/estransforms/async.go:671 asyncTransformer.transformAsyncFunctionParameterList
     fn transform_async_function_parameter_list(&mut self, node: Node) -> NodeList {
         if is_simple_parameter_list(&node.parameters().to_vec()) {
             return self.visit_parameters(node.parameter_list());
@@ -924,7 +924,7 @@ impl AsyncTransformer {
         f.new_node_list_with_loc(&new_parameters, node.parameter_list().loc())
     }
 
-    // Go: transformers/estransforms/async.go:707 asyncTransformer.transformAsyncFunctionBody
+    // Go: transformers/estransforms/async.go:712 asyncTransformer.transformAsyncFunctionBody
     fn transform_async_function_body(&mut self, node: Node, outer_parameters: NodeList) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -1088,7 +1088,7 @@ impl AsyncTransformer {
         result
     }
 
-    // Go: transformers/estransforms/async.go:869 asyncTransformer.transformAsyncFunctionBodyWorker
+    // Go: transformers/estransforms/async.go:876 asyncTransformer.transformAsyncFunctionBodyWorker
     fn transform_async_function_body_worker(&mut self, body: Node) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -1108,7 +1108,7 @@ impl AsyncTransformer {
         block
     }
 
-    // Go: transformers/estransforms/async.go:954 asyncTransformer.getOriginalIfFunctionLike
+    // Go: transformers/estransforms/async.go:943 asyncTransformer.getOriginalIfFunctionLike
     fn get_original_if_function_like(&self, node: Node) -> Node {
         let original = self.emit_context.most_original(node);
         if original.is_some() && is_function_like_declaration(original) {
@@ -1118,7 +1118,7 @@ impl AsyncTransformer {
     }
 }
 
-// Go: transformers/estransforms/async.go:963 isSimpleParameterList
+// Go: transformers/estransforms/async.go:952 isSimpleParameterList
 /// isSimpleParameterList checks if every parameter has no initializer and an Identifier name.
 pub(super) fn is_simple_parameter_list(params: &[Node]) -> bool {
     for &param in params {
@@ -1129,7 +1129,7 @@ pub(super) fn is_simple_parameter_list(params: &[Node]) -> bool {
     true
 }
 
-// Go: transformers/estransforms/async.go:974 isNodeWithPossibleHoistedDeclaration
+// Go: transformers/estransforms/async.go:963 isNodeWithPossibleHoistedDeclaration
 /// isNodeWithPossibleHoistedDeclaration checks if a node could contain hoisted declarations.
 pub(super) fn is_node_with_possible_hoisted_declaration(node: Node) -> bool {
     matches!(
@@ -1153,7 +1153,7 @@ pub(super) fn is_node_with_possible_hoisted_declaration(node: Node) -> bool {
     )
 }
 
-// Go: transformers/estransforms/async.go:910 assignmentTargetContainsSuperProperty
+// Go: transformers/estransforms/async.go:899 assignmentTargetContainsSuperProperty
 pub(crate) fn assignment_target_contains_super_property(node: Node) -> bool {
     match node.kind() {
         SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
@@ -1194,7 +1194,7 @@ pub(crate) fn assignment_target_contains_super_property(node: Node) -> bool {
     }
 }
 
-// Go: transformers/estransforms/async.go:942 isUpdateExpression
+// Go: transformers/estransforms/async.go:931 isUpdateExpression
 pub(crate) fn is_update_expression(node: Node) -> bool {
     if is_prefix_unary_expression(node) {
         let op = node.operator();

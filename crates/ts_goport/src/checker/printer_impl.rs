@@ -105,7 +105,7 @@ pub fn create_printer_with_remove_comments_omit_trailing_semicolon_never_ascii_e
     )
 }
 
-// Go: checker/printer.go:29 createPrinterWithRemoveCommentsNeverAsciiEscape
+// Go: checker/printer.go:36 createPrinterWithRemoveCommentsNeverAsciiEscape
 pub fn create_printer_with_remove_comments_never_ascii_escape(
     emit_context: Rc<EmitContext>,
 ) -> Printer {
@@ -120,7 +120,7 @@ pub fn create_printer_with_remove_comments_never_ascii_escape(
     )
 }
 
-// Go: checker/printer.go:181 toNodeBuilderFlags
+// Go: checker/printer.go:51 toNodeBuilderFlags
 pub fn to_node_builder_flags(flags: TypeFormatFlags) -> NodeBuilderFlags {
     NodeBuilderFlags((flags & TypeFormatFlags::NODE_BUILDER_FLAGS_MASK).0)
 }
@@ -137,7 +137,7 @@ fn source_file_of_enclosing(enclosing_declaration: Node) -> Node {
 }
 
 impl Checker {
-    // Go: checker/printer.go:173 TypeToString
+    // Go: checker/printer.go:43 TypeToString
     pub fn type_to_string_exported(&mut self, t: TypeId) -> String {
         self.type_to_string_enclosing(t, Node::NIL)
     }
@@ -150,7 +150,7 @@ impl Checker {
         self.type_to_string_enclosing(t, Node::NIL)
     }
 
-    // Go: checker/printer.go:177 typeToString
+    // Go: checker/printer.go:47 typeToString
     pub fn type_to_string_enclosing(&mut self, t: TypeId, enclosing_declaration: Node) -> String {
         self.type_to_string_ex(
             t,
@@ -161,7 +161,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/printer.go:185 TypeToStringEx and checker/printer.go:189 typeToStringEx
+    // Go: checker/printer.go:55 TypeToStringEx and checker/printer.go:189 typeToStringEx
     pub fn type_to_string_ex(
         &mut self,
         t: TypeId,
@@ -254,12 +254,12 @@ impl Checker {
         result
     }
 
-    // Go: checker/printer.go:249 SymbolToString
+    // Go: checker/printer.go:120 SymbolToString
     pub fn symbol_to_string_exported(&mut self, symbol: SymbolId) -> String {
         self.symbol_to_string(symbol)
     }
 
-    // Go: checker/printer.go:253 symbolToString
+    // Go: checker/printer.go:124 symbolToString
     pub fn symbol_to_string(&mut self, symbol: SymbolId) -> String {
         self.symbol_to_string_ex(
             symbol,
@@ -269,7 +269,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/printer.go:257 SymbolToStringEx and checker/printer.go:261 symbolToStringEx
+    // Go: checker/printer.go:128 SymbolToStringEx and checker/printer.go:261 symbolToStringEx
     pub fn symbol_to_string_ex(
         &mut self,
         symbol: SymbolId,
@@ -341,12 +341,12 @@ impl Checker {
         text
     }
 
-    // Go: checker/printer.go:311 signatureToString
+    // Go: checker/printer.go:179 signatureToString
     pub fn signature_to_string(&mut self, signature: SignatureId) -> String {
         self.signature_to_string_ex(signature, Node::NIL, TypeFormatFlags::NONE, None)
     }
 
-    // Go: checker/printer.go:315 SignatureToStringEx and checker/printer.go:319 signatureToStringEx
+    // Go: checker/printer.go:183 SignatureToStringEx and checker/printer.go:319 signatureToStringEx
     pub fn signature_to_string_ex(
         &mut self,
         signature: SignatureId,
@@ -405,7 +405,7 @@ impl Checker {
         text
     }
 
-    // Go: checker/printer.go:362 typePredicateToString
+    // Go: checker/printer.go:229 typePredicateToString
     pub fn type_predicate_to_string(&mut self, type_predicate: TypePredicateId) -> String {
         self.type_predicate_to_string_ex(
             type_predicate,
@@ -414,7 +414,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/printer.go:366 typePredicateToStringEx
+    // Go: checker/printer.go:233 typePredicateToStringEx
     pub fn type_predicate_to_string_ex(
         &mut self,
         type_predicate: TypePredicateId,
@@ -448,7 +448,7 @@ impl Checker {
     // `ValueToString`; callers use the free fn `value_to_string`
     // (checker/utilities_p2.rs).
 
-    // Go: checker/printer.go:383 formatUnionTypes
+    // Go: checker/printer.go:253 formatUnionTypes
     pub fn format_union_types(&mut self, types: &[TypeId], expanding_enum: bool) -> Vec<TypeId> {
         let mut result = Vec::new();
         let mut flags = TypeFlags::NONE;
@@ -493,7 +493,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/printer.go:419 TypeToTypeNode
+    // Go: checker/printer.go:288 TypeToTypeNode
     // PORT: `_exported` suffix, because the node builder method
     // `typeToTypeNode` has the same snake name.
     pub fn type_to_type_node_exported(
@@ -514,7 +514,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/printer.go:424 SignatureToSignatureDeclaration
+    // Go: checker/printer.go:293 SignatureToSignatureDeclaration
     // PORT: `_exported` suffix, as for type_to_type_node_exported.
     pub fn signature_to_signature_declaration_exported(
         &mut self,
@@ -537,7 +537,7 @@ impl Checker {
     }
 
     /// Produces declaration strings for a symbol with verbosity support for expandable hover.
-    // Go: checker/printer.go:431 ExpandSymbolForHover
+    // Go: checker/printer.go:300 ExpandSymbolForHover
     // PORT: `_exported` suffix, because the node builder method
     // `expandSymbolForHover` has the same snake name.
     pub fn expand_symbol_for_hover_exported(
@@ -574,7 +574,7 @@ impl Checker {
     }
 
     /// Renders a type parameter declaration (e.g. "T extends Foo") with optional verbosity support.
-    // Go: checker/printer.go:457 TypeParameterToStringEx
+    // Go: checker/printer.go:328 TypeParameterToStringEx
     pub fn type_parameter_to_string_ex(
         &mut self,
         t: TypeId,
@@ -605,7 +605,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/printer.go:476 TypeToTypeNodeEx
+    // Go: checker/printer.go:348 TypeToTypeNodeEx
     pub fn type_to_type_node_ex_exported(
         &mut self,
         t: TypeId,
@@ -625,7 +625,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/printer.go:481 TypePredicateToTypePredicateNode
+    // Go: checker/printer.go:353 TypePredicateToTypePredicateNode
     // PORT: `_exported` suffix, as for type_to_type_node_exported.
     pub fn type_predicate_to_type_predicate_node_exported(
         &mut self,

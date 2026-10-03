@@ -135,7 +135,7 @@ pub fn create_unknown_option_error(
     )
 }
 
-// Go: tsoptions/errors.go:82 CreateDiagnosticForNodeInSourceFile
+// Go: tsoptions/errors.go:92 CreateDiagnosticForNodeInSourceFile
 pub fn create_diagnostic_for_node_in_source_file(
     source_file: Node,
     node: Node,
@@ -153,7 +153,7 @@ pub fn create_diagnostic_for_node_in_source_file(
     )
 }
 
-// Go: tsoptions/errors.go:86 CreateDiagnosticForNodeInSourceFileOrCompilerDiagnostic
+// Go: tsoptions/errors.go:96 CreateDiagnosticForNodeInSourceFileOrCompilerDiagnostic
 pub fn create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
     source_file: Node,
     node: Node,
@@ -166,7 +166,7 @@ pub fn create_diagnostic_for_node_in_source_file_or_compiler_diagnostic(
     new_compiler_diagnostic(message, args)
 }
 
-// Go: tsoptions/errors.go:93 extraKeyDiagnostics
+// Go: tsoptions/errors.go:103 extraKeyDiagnostics
 pub fn extra_key_diagnostics(s: &str) -> Option<&'static Message> {
     match s {
         "compilerOptions" => Some(diag::Unknown_compiler_option_0),
@@ -177,7 +177,7 @@ pub fn extra_key_diagnostics(s: &str) -> Option<&'static Message> {
     }
 }
 
-// Go: tsoptions/errors.go:107 extraKeyDidYouMeanDiagnostics
+// Go: tsoptions/errors.go:118 extraKeyDidYouMeanDiagnostics
 pub fn extra_key_did_you_mean_diagnostics(s: &str) -> Option<&'static Message> {
     match s {
         "compilerOptions" => Some(diag::Unknown_compiler_option_0_Did_you_mean_1),

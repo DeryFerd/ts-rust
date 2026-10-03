@@ -35,7 +35,7 @@ pub fn get_module_specifiers(
     )
 }
 
-// Go: modulespecifiers/specifiers.go:42 GetModuleSpecifiersWithInfo
+// Go: modulespecifiers/specifiers.go:41 GetModuleSpecifiersWithInfo
 #[allow(clippy::too_many_arguments)]
 pub fn get_module_specifiers_with_info(
     module_symbol: SymbolId,
@@ -210,7 +210,7 @@ fn try_get_module_name_from_ambient_module(
     AmbientModuleInfo::default()
 }
 
-// Go: modulespecifiers/specifiers.go:156 Info
+// Go: modulespecifiers/specifiers.go:162 Info
 #[derive(Clone, Debug, Default)]
 pub struct Info {
     pub use_case_sensitive_file_names: bool,
@@ -218,7 +218,7 @@ pub struct Info {
     pub source_directory: String,
 }
 
-// Go: modulespecifiers/specifiers.go:162 getInfo
+// Go: modulespecifiers/specifiers.go:168 getInfo
 pub(crate) fn get_info(
     importing_source_file_name: &str,
     host: &dyn ModuleSpecifierGenerationHost,
@@ -231,7 +231,7 @@ pub(crate) fn get_info(
     }
 }
 
-// Go: modulespecifiers/specifiers.go:174 getAllModulePaths
+// Go: modulespecifiers/specifiers.go:180 getAllModulePaths
 pub(crate) fn get_all_module_paths(
     info: &Info,
     imported_file_name: &str,
@@ -245,7 +245,7 @@ pub(crate) fn get_all_module_paths(
     get_all_module_paths_worker(info, imported_file_name, host, compiler_options, options)
 }
 
-// Go: modulespecifiers/specifiers.go:198 getAllModulePathsWorker
+// Go: modulespecifiers/specifiers.go:203 getAllModulePathsWorker
 // PORT: Go collects paths in a map with random iteration order and sorts
 // each group. The IndexMap keeps insertion order; the sort result is the
 // same because `compare_paths_by_redirect` ends with a path comparison.
@@ -306,20 +306,20 @@ fn get_all_module_paths_worker(
     sorted_paths
 }
 
-// Go: modulespecifiers/specifiers.go:246 containsIgnoredPath
+// Go: modulespecifiers/specifiers.go:252 containsIgnoredPath
 // containsIgnoredPath checks if a path contains patterns that should be ignored.
 // This is a local helper that duplicates tspath.ContainsIgnoredPath for performance.
 fn contains_ignored_path(s: &str) -> bool {
     s.contains("/node_modules/.") || s.contains("/.git") || s.contains(".#")
 }
 
-// Go: modulespecifiers/specifiers.go:253 ContainsNodeModules
+// Go: modulespecifiers/specifiers.go:259 ContainsNodeModules
 /// Checks if a path contains the node_modules directory.
 pub fn contains_node_modules(s: &str) -> bool {
     s.contains("/node_modules/")
 }
 
-// Go: modulespecifiers/specifiers.go:259 GetEachFileNameOfModule
+// Go: modulespecifiers/specifiers.go:265 GetEachFileNameOfModule
 /// Returns all possible file paths for a module, including symlink alternatives.
 pub fn get_each_file_name_of_module(
     importing_file_name: &str,
@@ -441,7 +441,7 @@ pub fn get_each_file_name_of_module(
     results
 }
 
-// Go: modulespecifiers/specifiers.go:367 computeModuleSpecifiers
+// Go: modulespecifiers/specifiers.go:364 computeModuleSpecifiers
 fn compute_module_specifiers(
     module_paths: &[ModulePath],
     compiler_options: &CompilerOptions,
@@ -612,7 +612,7 @@ fn compute_module_specifiers(
     (relative_specifiers, ResultKind::Relative)
 }
 
-// Go: modulespecifiers/specifiers.go:487 getLocalModuleSpecifier
+// Go: modulespecifiers/specifiers.go:490 getLocalModuleSpecifier
 fn get_local_module_specifier(
     module_file_name: &str,
     info: &Info,
@@ -806,7 +806,7 @@ fn get_local_module_specifier(
     maybe_non_relative
 }
 
-// Go: modulespecifiers/specifiers.go:648 processEnding
+// Go: modulespecifiers/specifiers.go:641 processEnding
 // PORT: Go checks `host != nil` before probing the file system. Every Go
 // caller passes a host, so `host` is not optional here.
 fn process_ending(
@@ -909,7 +909,7 @@ fn process_ending(
     }
 }
 
-// Go: modulespecifiers/specifiers.go:726 tryGetModuleNameFromRootDirs
+// Go: modulespecifiers/specifiers.go:712 tryGetModuleNameFromRootDirs
 fn try_get_module_name_from_root_dirs(
     root_dirs: &[String],
     module_file_name: &str,
@@ -959,7 +959,7 @@ fn try_get_module_name_from_root_dirs(
     process_ending(&shortest, allowed_endings, compiler_options, host)
 }
 
-// Go: modulespecifiers/specifiers.go:764 tryGetModuleNameAsNodeModule
+// Go: modulespecifiers/specifiers.go:748 tryGetModuleNameAsNodeModule
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_get_module_name_as_node_module(
     path_obj: &ModulePath,
@@ -1064,7 +1064,7 @@ pub(crate) fn try_get_module_name_as_node_module(
     deps::get_package_name_from_types_package_name(node_modules_directory_name)
 }
 
-// Go: modulespecifiers/specifiers.go:846 pkgJsonDirAttemptResult
+// Go: modulespecifiers/specifiers.go:830 pkgJsonDirAttemptResult
 #[derive(Clone, Debug, Default)]
 struct PkgJsonDirAttemptResult {
     module_file_to_try: String,
@@ -1073,7 +1073,7 @@ struct PkgJsonDirAttemptResult {
     verbatim_from_exports: bool,
 }
 
-// Go: modulespecifiers/specifiers.go:853 tryDirectoryWithPackageJson
+// Go: modulespecifiers/specifiers.go:837 tryDirectoryWithPackageJson
 fn try_directory_with_package_json(
     parts: NodeModulePathParts,
     path_obj: &ModulePath,
@@ -1288,7 +1288,7 @@ fn try_directory_with_package_json(
     }
 }
 
-// Go: modulespecifiers/specifiers.go:986 tryGetModuleNameFromExports
+// Go: modulespecifiers/specifiers.go:981 tryGetModuleNameFromExports
 fn try_get_module_name_from_exports(
     options: &CompilerOptions,
     host: &dyn ModuleSpecifierGenerationHost,
@@ -1346,7 +1346,7 @@ fn try_get_module_name_from_exports(
     )
 }
 
-// Go: modulespecifiers/specifiers.go:1030 tryGetModuleNameFromPackageJsonImports
+// Go: modulespecifiers/specifiers.go:1024 tryGetModuleNameFromPackageJsonImports
 fn try_get_module_name_from_package_json_imports(
     module_file_name: &str,
     source_directory: &str,
@@ -1423,14 +1423,14 @@ fn try_get_module_name_from_package_json_imports(
     String::new()
 }
 
-// Go: modulespecifiers/specifiers.go:1093 specPair
+// Go: modulespecifiers/specifiers.go:1089 specPair
 #[derive(Clone, Debug)]
 struct SpecPair {
     ending: ModuleSpecifierEnding,
     value: String,
 }
 
-// Go: modulespecifiers/specifiers.go:1098 tryGetModuleNameFromPaths
+// Go: modulespecifiers/specifiers.go:1094 tryGetModuleNameFromPaths
 fn try_get_module_name_from_paths(
     relative_to_base_url: &str,
     paths: &IndexMap<String, Option<Vec<String>>>,
@@ -1505,7 +1505,7 @@ fn try_get_module_name_from_paths(
     String::new()
 }
 
-// Go: modulespecifiers/specifiers.go:1203 validateEnding
+// Go: modulespecifiers/specifiers.go:1193 validateEnding
 fn validate_ending(
     c: &SpecPair,
     relative_to_base_url: &str,
@@ -1523,7 +1523,7 @@ fn validate_ending(
         || c.value == process_ending(relative_to_base_url, &[c.ending], compiler_options, host)
 }
 
-// Go: modulespecifiers/specifiers.go:1214 tryGetModuleNameFromExportsOrImports
+// Go: modulespecifiers/specifiers.go:1204 tryGetModuleNameFromExportsOrImports
 #[allow(clippy::too_many_arguments)]
 fn try_get_module_name_from_exports_or_imports(
     options: &CompilerOptions,
@@ -1812,7 +1812,7 @@ fn try_get_module_name_from_exports_or_imports(
     }
 }
 
-// Go: modulespecifiers/specifiers.go:1339 GetModuleSpecifier
+// Go: modulespecifiers/specifiers.go:1333 GetModuleSpecifier
 // `importingSourceFile` and `importingSourceFileName`? Why not just use `importingSourceFile.path`?
 // Because when this is called by the declaration emitter, `importingSourceFile` is the implementation
 // file, but `importingSourceFileName` and `toFileName` refer to declaration files (the former to the
@@ -1840,7 +1840,7 @@ pub fn get_module_specifier(
     )
 }
 
-// Go: modulespecifiers/specifiers.go:1360 UpdateModuleSpecifier
+// Go: modulespecifiers/specifiers.go:1354 UpdateModuleSpecifier
 #[allow(clippy::too_many_arguments)]
 pub fn update_module_specifier(
     compiler_options: &CompilerOptions,
@@ -1864,7 +1864,7 @@ pub fn update_module_specifier(
     )
 }
 
-// Go: modulespecifiers/specifiers.go:1381 getModuleSpecifierWithPreferences
+// Go: modulespecifiers/specifiers.go:1376 getModuleSpecifierWithPreferences
 #[allow(clippy::too_many_arguments)]
 fn get_module_specifier_with_preferences(
     compiler_options: &CompilerOptions,

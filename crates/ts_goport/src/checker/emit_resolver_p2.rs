@@ -25,7 +25,7 @@ use crate::printer::{
 };
 
 impl EmitResolver {
-    // Go: checker/emitresolver.go:601 requiresAddingImplicitUndefinedWorker
+    // Go: checker/emitresolver.go:605 requiresAddingImplicitUndefinedWorker
     pub fn requires_adding_implicit_undefined_worker(
         &self,
         c: &mut Checker,
@@ -37,7 +37,7 @@ impl EmitResolver {
             && !self.declared_parameter_type_contains_undefined(c, parameter)
     }
 
-    // Go: checker/emitresolver.go:605 declaredParameterTypeContainsUndefined
+    // Go: checker/emitresolver.go:609 declaredParameterTypeContainsUndefined
     pub fn declared_parameter_type_contains_undefined(
         &self,
         c: &mut Checker,
@@ -55,7 +55,7 @@ impl EmitResolver {
         c.is_error_type(t) || c.contains_undefined_type(t)
     }
 
-    // Go: checker/emitresolver.go:618 isOptionalUninitializedParameterProperty
+    // Go: checker/emitresolver.go:622 isOptionalUninitializedParameterProperty
     pub fn is_optional_uninitialized_parameter_property(
         &self,
         c: &mut Checker,
@@ -67,7 +67,7 @@ impl EmitResolver {
             && has_syntactic_modifier(parameter, ModifierFlags::PARAMETER_PROPERTY_MODIFIER)
     }
 
-    // Go: checker/emitresolver.go:625 isRequiredInitializedParameter
+    // Go: checker/emitresolver.go:629 isRequiredInitializedParameter
     pub fn is_required_initialized_parameter(
         &self,
         c: &mut Checker,
@@ -86,12 +86,12 @@ impl EmitResolver {
         true
     }
 
-    // Go: checker/emitresolver.go:635 isOptionalParameter
+    // Go: checker/emitresolver.go:639 isOptionalParameter
     pub fn is_optional_parameter(&self, c: &mut Checker, node: Node) -> bool {
         c.is_optional_parameter(node)
     }
 
-    // Go: checker/emitresolver.go:639 IsLiteralConstDeclaration
+    // Go: checker/emitresolver.go:643 IsLiteralConstDeclaration
     pub fn is_literal_const_declaration(&self, node: Node) -> bool {
         // node = r.emitContext.ParseNode(node)
         if !is_parse_tree_node(node) {
@@ -110,14 +110,14 @@ impl EmitResolver {
         false
     }
 
-    // Go: checker/emitresolver.go:652 IsExpandoFunctionDeclarationUnsafe
+    // Go: checker/emitresolver.go:660 IsExpandoFunctionDeclarationUnsafe
     // PORT: Go takes no lock because its callers already hold it. The trait signature has
     // no checker, so this borrows it. Callers that hold the checker use the `_worker` twin.
     pub fn is_expando_function_declaration_unsafe(&self, node: Node) -> bool {
         self.with_checker(|c| self.is_expando_function_declaration_unsafe_worker(c, node))
     }
 
-    // Go: checker/emitresolver.go:652 IsExpandoFunctionDeclarationUnsafe
+    // Go: checker/emitresolver.go:660 IsExpandoFunctionDeclarationUnsafe
     // PORT: body of Go `IsExpandoFunctionDeclarationUnsafe` with the checker passed in.
     pub fn is_expando_function_declaration_unsafe_worker(
         &self,
@@ -138,12 +138,12 @@ impl EmitResolver {
         false
     }
 
-    // Go: checker/emitresolver.go:667 IsExpandoFunctionDeclaration
+    // Go: checker/emitresolver.go:675 IsExpandoFunctionDeclaration
     pub fn is_expando_function_declaration(&self, node: Node) -> bool {
         self.with_checker(|c| self.is_expando_function_declaration_unsafe_worker(c, node))
     }
 
-    // Go: checker/emitresolver.go:673 isSymbolAccessible
+    // Go: checker/emitresolver.go:681 isSymbolAccessible
     pub fn is_symbol_accessible(
         &self,
         c: &mut Checker,
@@ -160,7 +160,7 @@ impl EmitResolver {
         )
     }
 
-    // Go: checker/emitresolver.go:677 IsSymbolAccessible
+    // Go: checker/emitresolver.go:685 IsSymbolAccessible
     // PORT: Go takes no lock. The trait signature has no checker, so this borrows it.
     // Callers that hold the checker call `is_symbol_accessible` (or the checker) directly.
     pub fn is_symbol_accessible_exported(
@@ -186,11 +186,11 @@ impl EmitResolver {
     }
 }
 
-// Go: checker/emitresolver.go:685 isConstEnumOrConstEnumOnlyModule
+// Go: checker/emitresolver.go:693 isConstEnumOrConstEnumOnlyModule
 // PORT: already ported as `Checker::is_const_enum_or_const_enum_only_module` in extras.rs.
 
 impl EmitResolver {
-    // Go: checker/emitresolver.go:689 IsReferencedAliasDeclaration
+    // Go: checker/emitresolver.go:697 IsReferencedAliasDeclaration
     pub fn is_referenced_alias_declaration(&self, node: Node) -> bool {
         // PORT: Go reads `r.checker.canCollectSymbolAliasAccessibilityData` before the lock.
         // Reading a checker field needs the checker, so it is read under `with_checker`.
@@ -221,7 +221,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:715 IsValueAliasDeclaration
+    // Go: checker/emitresolver.go:723 IsValueAliasDeclaration
     pub fn is_value_alias_declaration(&self, node: Node) -> bool {
         // PORT: see `is_referenced_alias_declaration` for the early field read.
         self.with_checker(|c| {
@@ -233,7 +233,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:727 isValueAliasDeclarationWorker
+    // Go: checker/emitresolver.go:735 isValueAliasDeclarationWorker
     pub fn is_value_alias_declaration_worker(&self, c: &mut Checker, node: Node) -> bool {
         match node.kind() {
             SyntaxKind::ImportEqualsDeclaration => {
@@ -285,7 +285,7 @@ impl EmitResolver {
         false
     }
 
-    // Go: checker/emitresolver.go:756 isAliasResolvedToValue
+    // Go: checker/emitresolver.go:764 isAliasResolvedToValue
     pub fn is_alias_resolved_to_value(
         &self,
         c: &mut Checker,
@@ -323,7 +323,7 @@ impl EmitResolver {
                 || !c.is_const_enum_or_const_enum_only_module(target))
     }
 
-    // Go: checker/emitresolver.go:781 IsTopLevelValueImportEqualsWithEntityName
+    // Go: checker/emitresolver.go:789 IsTopLevelValueImportEqualsWithEntityName
     pub fn is_top_level_value_import_equals_with_entity_name(&self, node: Node) -> bool {
         // PORT: see `is_referenced_alias_declaration` for the early field read. The checks
         // before Go's lock read only the AST, so running them under the lock is the same.
@@ -349,7 +349,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:800 MarkLinkedReferencesRecursively
+    // Go: checker/emitresolver.go:808 MarkLinkedReferencesRecursively
     pub fn mark_linked_references_recursively(&self, file: Node) {
         if !is_parse_tree_node(file) {
             return;
@@ -361,7 +361,7 @@ impl EmitResolver {
         });
     }
 
-    // Go: checker/emitresolver.go:821 GetExternalModuleFileFromDeclaration
+    // Go: checker/emitresolver.go:832 GetExternalModuleFileFromDeclaration
     pub fn get_external_module_file_from_declaration(&self, declaration: Node) -> Node {
         if !is_parse_tree_node(declaration) {
             return Node::NIL;
@@ -370,7 +370,7 @@ impl EmitResolver {
         self.with_checker(|c| c.get_external_module_file_from_declaration(declaration))
     }
 
-    // Go: checker/emitresolver.go:831 getReferenceResolver
+    // Go: checker/emitresolver.go:842 getReferenceResolver
     // PORT: Go caches the resolver in `r.referenceResolver`. The resolver only
     // holds the options, the hooks and a lazy name resolver that is used only
     // when `ResolveName` is nil. All hooks are set here, so a new resolver per
@@ -417,7 +417,7 @@ impl EmitResolver {
         )
     }
 
-    // Go: checker/emitresolver.go:847 GetReferencedExportContainer
+    // Go: checker/emitresolver.go:858 GetReferencedExportContainer
     pub fn get_referenced_export_container(&self, node: Node, prefix_locals: bool) -> Node /*SourceFile|ModuleDeclaration|EnumDeclaration*/
     {
         if !is_parse_tree_node(node) {
@@ -430,13 +430,13 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:858 SetReferencedImportDeclaration
+    // Go: checker/emitresolver.go:869 SetReferencedImportDeclaration
     pub fn set_referenced_import_declaration(&self, node: Node, ref_: Node) {
         // PORT: Go takes the lock only to guard `jsxLinks`; the links are in a `RefCell` here.
         self.jsx_links.borrow_mut().get(node).import_ref = ref_;
     }
 
-    // Go: checker/emitresolver.go:864 GetReferencedImportDeclaration
+    // Go: checker/emitresolver.go:875 GetReferencedImportDeclaration
     pub fn get_referenced_import_declaration(&self, node: Node) -> Node {
         self.with_checker(|c| {
             if !is_parse_tree_node(node) {
@@ -454,7 +454,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:878 GetReferencedValueDeclaration
+    // Go: checker/emitresolver.go:889 GetReferencedValueDeclaration
     pub fn get_referenced_value_declaration(&self, node: Node) -> Node {
         if !is_parse_tree_node(node) {
             return Node::NIL;
@@ -466,14 +466,14 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:889 GetReferencedValueDeclarationUnsafe
+    // Go: checker/emitresolver.go:900 GetReferencedValueDeclarationUnsafe
     // PORT: Go takes no lock because its callers already hold it. The trait signature has
     // no checker, so this borrows it. Callers that hold the checker use the `_worker` twin.
     pub fn get_referenced_value_declaration_unsafe(&self, node: Node) -> Node {
         self.with_checker(|c| self.get_referenced_value_declaration_unsafe_worker(c, node))
     }
 
-    // Go: checker/emitresolver.go:889 GetReferencedValueDeclarationUnsafe
+    // Go: checker/emitresolver.go:900 GetReferencedValueDeclarationUnsafe
     // PORT: body of Go `GetReferencedValueDeclarationUnsafe` with the checker passed in.
     pub fn get_referenced_value_declaration_unsafe_worker(
         &self,
@@ -484,7 +484,7 @@ impl EmitResolver {
             .get_referenced_value_declaration(c, node)
     }
 
-    // Go: checker/emitresolver.go:893 GetReferencedValueDeclarations
+    // Go: checker/emitresolver.go:904 GetReferencedValueDeclarations
     pub fn get_referenced_value_declarations(&self, node: Node) -> Vec<Node> {
         if !is_parse_tree_node(node) {
             return Vec::new();
@@ -496,7 +496,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:900 IsNameResolvable
+    // Go: checker/emitresolver.go:916 IsNameResolvable
     // IsNameResolvable returns `true` if the given `name` resolves to any symbol at `location`
     pub fn is_name_resolvable(&self, location: Node, name: &str) -> bool {
         self.with_checker(|c| {
@@ -512,7 +512,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:909 GetElementAccessExpressionName
+    // Go: checker/emitresolver.go:924 GetElementAccessExpressionName
     pub fn get_element_access_expression_name(&self, expression: Node) -> String {
         if !is_parse_tree_node(expression) {
             return String::new();
@@ -524,7 +524,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:920 GetReferencedMemberValueDeclaration
+    // Go: checker/emitresolver.go:935 GetReferencedMemberValueDeclaration
     pub fn get_referenced_member_value_declaration(&self, node: Node) -> Node {
         if !is_parse_tree_node(node) {
             return Node::NIL;
@@ -540,7 +540,7 @@ impl EmitResolver {
     // and requires giving it access to a lot of context it's otherwise not required to have, which also further complicates the API
     // and likely reduces performance. There's probably some refactoring that could be done here to simplify this.
 
-    // Go: checker/emitresolver.go:935 CreateReturnTypeOfSignatureDeclaration
+    // Go: checker/emitresolver.go:950 CreateReturnTypeOfSignatureDeclaration
     pub fn create_return_type_of_signature_declaration(
         &self,
         emit_context: &EmitContext,
@@ -573,7 +573,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:947 CreateTypeParametersOfSignatureDeclaration
+    // Go: checker/emitresolver.go:962 CreateTypeParametersOfSignatureDeclaration
     pub fn create_type_parameters_of_signature_declaration(
         &self,
         emit_context: &EmitContext,
@@ -604,7 +604,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:959 CreateTypeOfDeclaration
+    // Go: checker/emitresolver.go:974 CreateTypeOfDeclaration
     pub fn create_type_of_declaration(
         &self,
         emit_context: &EmitContext,
@@ -640,7 +640,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:973 CreateLiteralConstValue
+    // Go: checker/emitresolver.go:988 CreateLiteralConstValue
     pub fn create_literal_const_value(
         &self,
         emit_context: &EmitContext,
@@ -736,7 +736,7 @@ impl EmitResolver {
         }
     }
 
-    // Go: checker/emitresolver.go:1034 CreateTypeOfExpression
+    // Go: checker/emitresolver.go:1049 CreateTypeOfExpression
     pub fn create_type_of_expression(
         &self,
         emit_context: &EmitContext,
@@ -769,7 +769,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:1046 CreateLateBoundIndexSignatures
+    // Go: checker/emitresolver.go:1061 CreateLateBoundIndexSignatures
     pub fn create_late_bound_index_signatures(
         &self,
         emit_context: &EmitContext,
@@ -926,7 +926,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:1136 GetEffectiveDeclarationFlags
+    // Go: checker/emitresolver.go:1151 GetEffectiveDeclarationFlags
     pub fn get_effective_declaration_flags(
         &self,
         node: Node,
@@ -936,13 +936,13 @@ impl EmitResolver {
         self.with_checker(|c| c.get_effective_declaration_flags(node, flags))
     }
 
-    // Go: checker/emitresolver.go:1150 GetConstantValue
+    // Go: checker/emitresolver.go:1158 GetConstantValue
     pub fn get_constant_value(&self, node: Node) -> Option<LiteralValue> {
         // node = emitContext.ParseNode(node)
         self.with_checker(|c| c.get_constant_value(node))
     }
 
-    // Go: checker/emitresolver.go:1157 GetTypeReferenceSerializationKind
+    // Go: checker/emitresolver.go:1165 GetTypeReferenceSerializationKind
     pub fn get_type_reference_serialization_kind(
         &self,
         type_name: Node,
@@ -1061,13 +1061,13 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:1249 GetPropertiesOfContainerFunction
+    // Go: checker/emitresolver.go:1257 GetPropertiesOfContainerFunction
     // PORT: see `is_expando_function_declaration_unsafe`.
     pub fn get_properties_of_container_function(&self, node: Node) -> Vec<SymbolId> {
         self.with_checker(|c| self.get_properties_of_container_function_worker(c, node))
     }
 
-    // Go: checker/emitresolver.go:1249 GetPropertiesOfContainerFunction
+    // Go: checker/emitresolver.go:1257 GetPropertiesOfContainerFunction
     // PORT: body of Go `GetPropertiesOfContainerFunction` with the checker passed in.
     pub fn get_properties_of_container_function_worker(
         &self,
@@ -1089,7 +1089,7 @@ impl EmitResolver {
         c.get_properties_of_type(t).to_vec()
     }
 
-    // Go: checker/emitresolver.go:1264 TryJSTypeNodeToTypeNode
+    // Go: checker/emitresolver.go:1272 TryJSTypeNodeToTypeNode
     pub fn try_js_type_node_to_type_node(
         &self,
         emit_context: &EmitContext,
@@ -1116,7 +1116,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:1284 IsThisPropertyAssignmentDeclarationRedundant
+    // Go: checker/emitresolver.go:1292 IsThisPropertyAssignmentDeclarationRedundant
     /// IsThisPropertyAssignmentDeclarationRedundant reports whether a JS `this.<name> = ...` expando
     /// assignment should be omitted from declaration emit because the member it would synthesize is
     /// already provided by an `extends` base type. This mirrors the skip condition in the checker's
@@ -1197,7 +1197,7 @@ fn emit_context_rc(emit_context: &EmitContext) -> Rc<EmitContext> {
 }
 
 impl Checker {
-    // Go: checker/services.go:859 GetConstantValue
+    // Go: checker/services.go:870 GetConstantValue
     // PORT: Go `any` result is `Option<LiteralValue>` (`None` is Go nil). The
     // Go function lives in services.go; it is here because the emit resolver
     // is its only non-language-service caller in this crate.

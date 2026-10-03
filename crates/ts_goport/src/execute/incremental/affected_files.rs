@@ -143,7 +143,7 @@ impl<'a> AffectedFilesHandler<'a> {
         result
     }
 
-    // Go: incremental/affectedfileshandler.go:85 updateShapeSignature (ts#64026)
+    // Go: incremental/affectedfileshandler.go:87 updateShapeSignature (ts#64026)
     fn update_shape_signature(&mut self, file: Node, use_file_version_as_signature: bool) -> bool {
         let path = path_of(file);
         // If we have cached the result for this file, that means hence forth we should assume file shape is uptodate
@@ -180,7 +180,7 @@ impl<'a> AffectedFilesHandler<'a> {
         changed
     }
 
-    // Go: incremental/affectedfileshandler.go:112 getFilesAffectedBy
+    // Go: incremental/affectedfileshandler.go:114 getFilesAffectedBy
     fn get_files_affected_by(&mut self, path: &Path) -> Vec<Node> {
         let file = get_source_file_by_path(path);
         if file.is_nil() {
@@ -278,7 +278,7 @@ impl<'a> AffectedFilesHandler<'a> {
         seen_file_names_map
     }
 
-    // Go: incremental/affectedfileshandler.go:181 handleDtsMayChangeOfAffectedFile
+    // Go: incremental/affectedfileshandler.go:182 handleDtsMayChangeOfAffectedFile
     // Handles semantic diagnostics and dts emit for affectedFile and files, that are referencing modules that export entities from affected file
     // This is because even though js emit doesnt change, dts emit / type used can change resulting in need for dts emit and js change
     fn handle_dts_may_change_of_affected_file(
@@ -425,7 +425,7 @@ impl<'a> AffectedFilesHandler<'a> {
         }
     }
 
-    // Go: incremental/affectedfileshandler.go:275 handleDtsMayChangeOfFileAndReferences
+    // Go: incremental/affectedfileshandler.go:274 handleDtsMayChangeOfFileAndReferences
     fn handle_dts_may_change_of_file_and_references(
         &mut self,
         dts_may_change: usize,
@@ -475,7 +475,7 @@ impl<'a> AffectedFilesHandler<'a> {
         false
     }
 
-    // Go: incremental/affectedfileshandler.go:298 handleDtsMayChangeOfGlobalScope
+    // Go: incremental/affectedfileshandler.go:296 handleDtsMayChangeOfGlobalScope
     fn handle_dts_may_change_of_global_scope(
         &mut self,
         dts_may_change: usize,
@@ -506,7 +506,7 @@ impl<'a> AffectedFilesHandler<'a> {
         true
     }
 
-    // Go: incremental/affectedfileshandler.go:313 handleDtsMayChangeOf
+    // Go: incremental/affectedfileshandler.go:310 handleDtsMayChangeOf
     // Handle the dts may change, so they need to be added to pending emit if dts emit is enabled,
     // Also we need to make sure signature is updated for these files
     fn handle_dts_may_change_of(
@@ -551,7 +551,7 @@ impl<'a> AffectedFilesHandler<'a> {
         }
     }
 
-    // Go: incremental/affectedfileshandler.go:338 updateSnapshot
+    // Go: incremental/affectedfileshandler.go:333 updateSnapshot
     fn update_snapshot(self) {
         let mut snapshot = self.program.snapshot.borrow_mut();
         for (file_path, update) in &self.updated_signatures {
@@ -578,7 +578,7 @@ impl<'a> AffectedFilesHandler<'a> {
     }
 }
 
-// Go: incremental/affectedfileshandler.go:364 collectAllAffectedFiles
+// Go: incremental/affectedfileshandler.go:359 collectAllAffectedFiles
 pub fn collect_all_affected_files(program: &Program) {
     if program.snapshot.borrow().changed_files_set.is_empty() {
         return;

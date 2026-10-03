@@ -15,7 +15,7 @@
 use crate::frontend::prelude::*;
 
 impl<'a> Parser<'a> {
-    // Go: parser/parser.go:1409 parseDefaultClause
+    // Go: parser/parser.go:1407 parseDefaultClause
     pub fn parse_default_clause(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -35,7 +35,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1420 parseCaseOrDefaultClause
+    // Go: parser/parser.go:1418 parseCaseOrDefaultClause
     pub fn parse_case_or_default_clause(&mut self) -> Node {
         if self.token == SyntaxKind::CaseKeyword {
             return self.parse_case_clause();
@@ -43,7 +43,7 @@ impl<'a> Parser<'a> {
         self.parse_default_clause()
     }
 
-    // Go: parser/parser.go:1427 parseCaseBlock
+    // Go: parser/parser.go:1425 parseCaseBlock
     pub fn parse_case_block(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -59,7 +59,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1438 parseSwitchStatement
+    // Go: parser/parser.go:1436 parseSwitchStatement
     pub fn parse_switch_statement(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -74,7 +74,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1451 parseThrowStatement
+    // Go: parser/parser.go:1449 parseThrowStatement
     pub fn parse_throw_statement(&mut self) -> Node {
         // ThrowStatement[Yield] :
         //      throw [no LineTerminator here]Expression[In, ?Yield];
@@ -100,7 +100,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1477 parseTryStatement
+    // Go: parser/parser.go:1475 parseTryStatement
     // TODO: Review for error recovery
     pub fn parse_try_statement(&mut self) -> Node {
         let pos = self.node_pos();
@@ -130,7 +130,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1498 parseCatchClause
+    // Go: parser/parser.go:1496 parseCatchClause
     pub fn parse_catch_clause(&mut self) -> Node {
         let pos = self.node_pos();
         self.parse_expected(SyntaxKind::CatchKeyword);
@@ -144,7 +144,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:1511 parseDebuggerStatement
+    // Go: parser/parser.go:1509 parseDebuggerStatement
     pub fn parse_debugger_statement(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -156,7 +156,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1521 parseExpressionOrLabeledStatement
+    // Go: parser/parser.go:1519 parseExpressionOrLabeledStatement
     pub fn parse_expression_or_labeled_statement(&mut self) -> Node {
         // Avoiding having to do the lookahead for a labeled statement by just trying to parse
         // out an expression, seeing if it is identifier and then seeing if it is followed by
@@ -188,7 +188,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1547 parseVariableStatement
+    // Go: parser/parser.go:1545 parseVariableStatement
     pub fn parse_variable_statement(
         &mut self,
         pos: i32,
@@ -207,7 +207,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1556 parseVariableDeclarationList
+    // Go: parser/parser.go:1554 parseVariableDeclarationList
     pub fn parse_variable_declaration_list(&mut self, in_for_statement_initializer: bool) -> Node {
         let pos = self.node_pos();
         let mut flags = NodeFlags::default();
@@ -258,28 +258,28 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:1600 nextIsIdentifierAndCloseParen
+    // Go: parser/parser.go:1598 nextIsIdentifierAndCloseParen
     pub fn next_is_identifier_and_close_paren(&mut self) -> bool {
         self.next_token_is_identifier() && self.next_token() == SyntaxKind::CloseParenToken
     }
 
-    // Go: parser/parser.go:1604 nextTokenIsIdentifier
+    // Go: parser/parser.go:1602 nextTokenIsIdentifier
     pub fn next_token_is_identifier(&mut self) -> bool {
         self.next_token();
         self.is_identifier()
     }
 
-    // Go: parser/parser.go:1609 parseVariableDeclaration
+    // Go: parser/parser.go:1607 parseVariableDeclaration
     pub fn parse_variable_declaration(&mut self) -> Node {
         self.parse_variable_declaration_worker(false /*allowExclamation*/)
     }
 
-    // Go: parser/parser.go:1613 parseVariableDeclarationAllowExclamation
+    // Go: parser/parser.go:1611 parseVariableDeclarationAllowExclamation
     pub fn parse_variable_declaration_allow_exclamation(&mut self) -> Node {
         self.parse_variable_declaration_worker(true /*allowExclamation*/)
     }
 
-    // Go: parser/parser.go:1617 parseVariableDeclarationWorker
+    // Go: parser/parser.go:1615 parseVariableDeclarationWorker
     pub fn parse_variable_declaration_worker(&mut self, allow_exclamation: bool) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -308,12 +308,12 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1636 parseIdentifierOrPattern
+    // Go: parser/parser.go:1634 parseIdentifierOrPattern
     pub fn parse_identifier_or_pattern(&mut self) -> Node {
         self.parse_identifier_or_pattern_with_diagnostic(None)
     }
 
-    // Go: parser/parser.go:1640 parseIdentifierOrPatternWithDiagnostic
+    // Go: parser/parser.go:1638 parseIdentifierOrPatternWithDiagnostic
     pub fn parse_identifier_or_pattern_with_diagnostic(
         &mut self,
         private_identifier_diagnostic_message: Option<&'static Message>,
@@ -327,7 +327,7 @@ impl<'a> Parser<'a> {
         self.parse_binding_identifier_with_diagnostic(private_identifier_diagnostic_message)
     }
 
-    // Go: parser/parser.go:1650 parseArrayBindingPattern
+    // Go: parser/parser.go:1648 parseArrayBindingPattern
     pub fn parse_array_binding_pattern(&mut self) -> Node {
         let pos = self.node_pos();
         self.parse_expected(SyntaxKind::OpenBracketToken);
@@ -345,7 +345,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:1661 parseArrayBindingElement
+    // Go: parser/parser.go:1659 parseArrayBindingElement
     pub fn parse_array_binding_element(&mut self) -> Node {
         let pos = self.node_pos();
         let mut dot_dot_dot_token = Node::NIL;
@@ -366,7 +366,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:1675 parseObjectBindingPattern
+    // Go: parser/parser.go:1673 parseObjectBindingPattern
     pub fn parse_object_binding_pattern(&mut self) -> Node {
         let pos = self.node_pos();
         self.parse_expected(SyntaxKind::OpenBraceToken);
@@ -384,7 +384,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:1686 parseObjectBindingElement
+    // Go: parser/parser.go:1684 parseObjectBindingElement
     pub fn parse_object_binding_element(&mut self) -> Node {
         let pos = self.node_pos();
         let dot_dot_dot_token = self.parse_optional_token(SyntaxKind::DotDotDotToken);
@@ -405,7 +405,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:1703 parseInitializer
+    // Go: parser/parser.go:1701 parseInitializer
     pub fn parse_initializer(&mut self) -> Node {
         if self.parse_optional(SyntaxKind::EqualsToken) {
             return self.parse_assignment_expression_or_higher();
@@ -413,7 +413,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser/parser.go:1710 parseTypeAnnotation
+    // Go: parser/parser.go:1708 parseTypeAnnotation
     pub fn parse_type_annotation(&mut self) -> Node {
         if self.parse_optional(SyntaxKind::ColonToken) {
             return self.parse_type();
@@ -421,7 +421,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser/parser.go:1717 parseFunctionDeclaration
+    // Go: parser/parser.go:1715 parseFunctionDeclaration
     pub fn parse_function_declaration(
         &mut self,
         pos: i32,
@@ -477,7 +477,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1741 parseClassDeclaration
+    // Go: parser/parser.go:1739 parseClassDeclaration
     pub fn parse_class_declaration(
         &mut self,
         pos: i32,
@@ -492,7 +492,7 @@ impl<'a> Parser<'a> {
         )
     }
 
-    // Go: parser/parser.go:1745 parseClassExpression
+    // Go: parser/parser.go:1743 parseClassExpression
     pub fn parse_class_expression(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -504,7 +504,7 @@ impl<'a> Parser<'a> {
         )
     }
 
-    // Go: parser/parser.go:1749 parseClassDeclarationOrExpression
+    // Go: parser/parser.go:1747 parseClassDeclarationOrExpression
     pub fn parse_class_declaration_or_expression(
         &mut self,
         pos: i32,
@@ -578,7 +578,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1796 parseNameOfClassDeclarationOrExpression
+    // Go: parser/parser.go:1797 parseNameOfClassDeclarationOrExpression
     pub fn parse_name_of_class_declaration_or_expression(&mut self) -> Node {
         // implements is a future reserved word so
         // 'class implements' might mean either
@@ -595,25 +595,25 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser/parser.go:1811 isImplementsClause
+    // Go: parser/parser.go:1812 isImplementsClause
     pub fn is_implements_clause(&mut self) -> bool {
         self.token == SyntaxKind::ImplementsKeyword
             && self.look_ahead(Parser::next_token_is_identifier_or_keyword)
     }
 }
 
-// Go: parser/parser.go:1815 isExportModifier
+// Go: parser/parser.go:1816 isExportModifier
 pub fn is_export_modifier(modifier: Node) -> bool {
     modifier.kind() == SyntaxKind::ExportKeyword
 }
 
-// Go: parser/parser.go:1819 isAsyncModifier
+// Go: parser/parser.go:1820 isAsyncModifier
 pub fn is_async_modifier(modifier: Node) -> bool {
     modifier.kind() == SyntaxKind::AsyncKeyword
 }
 
 impl<'a> Parser<'a> {
-    // Go: parser/parser.go:1823 parseHeritageClauses
+    // Go: parser/parser.go:1824 parseHeritageClauses
     pub fn parse_heritage_clauses(&mut self, is_interface: bool) -> NodeList {
         // ClassTail[Yield,Await] : (Modified) See 14.5
         //      ClassHeritage[?Yield,?Await]opt { ClassBody[?Yield,?Await]opt }
@@ -625,7 +625,7 @@ impl<'a> Parser<'a> {
         NodeList::NIL
     }
 
-    // Go: parser/parser.go:1832 parseHeritageClause
+    // Go: parser/parser.go:1835 parseHeritageClause
     pub fn parse_heritage_clause(&mut self, is_interface: bool) -> Node {
         let pos = self.node_pos();
         let kind = self.token;
@@ -693,7 +693,7 @@ impl<'a> Parser<'a> {
         self.finish_node_with_end(result, node.pos(), node.end())
     }
 
-    // Go: parser/parser.go:1840 parseExpressionWithTypeArguments
+    // Go: parser/parser.go:1884 parseExpressionWithTypeArguments
     pub fn parse_expression_with_type_arguments(&mut self) -> Node {
         let pos = self.node_pos();
         let expression = self.parse_left_hand_side_expression_or_higher();
@@ -707,7 +707,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:1850 parseClassElement
+    // Go: parser/parser.go:1894 parseClassElement
     pub fn parse_class_element(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -798,7 +798,7 @@ impl<'a> Parser<'a> {
         panic!("Should not have attempted to parse class member declaration.");
     }
 
-    // Go: parser/parser.go:1905 parseClassStaticBlockDeclaration
+    // Go: parser/parser.go:1949 parseClassStaticBlockDeclaration
     pub fn parse_class_static_block_declaration(
         &mut self,
         pos: i32,
@@ -815,7 +815,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1913 parseClassStaticBlockBody
+    // Go: parser/parser.go:1957 parseClassStaticBlockBody
     pub fn parse_class_static_block_body(&mut self) -> Node {
         let save_context_flags = self.context_flags;
         self.set_context_flags(NodeFlags::YIELD_CONTEXT, false);
@@ -828,7 +828,7 @@ impl<'a> Parser<'a> {
         body
     }
 
-    // Go: parser/parser.go:1922 tryParseConstructorDeclaration
+    // Go: parser/parser.go:1966 tryParseConstructorDeclaration
     pub fn try_parse_constructor_declaration(
         &mut self,
         pos: i32,
@@ -864,12 +864,12 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser/parser.go:1939 nextTokenIsOpenParen
+    // Go: parser/parser.go:1983 nextTokenIsOpenParen
     pub fn next_token_is_open_paren(&mut self) -> bool {
         self.next_token() == SyntaxKind::OpenParenToken
     }
 
-    // Go: parser/parser.go:1943 parsePropertyOrMethodDeclaration
+    // Go: parser/parser.go:1987 parsePropertyOrMethodDeclaration
     pub fn parse_property_or_method_declaration(
         &mut self,
         pos: i32,
@@ -898,7 +898,7 @@ impl<'a> Parser<'a> {
         self.parse_property_declaration(pos, jsdoc, modifiers, name, question_token)
     }
 
-    // Go: parser/parser.go:1955 parseMethodDeclaration
+    // Go: parser/parser.go:1999 parseMethodDeclaration
     #[allow(clippy::too_many_arguments)]
     pub fn parse_method_declaration(
         &mut self,
@@ -941,13 +941,13 @@ impl<'a> Parser<'a> {
     }
 }
 
-// Go: parser/parser.go:1967 modifierListHasAsync
+// Go: parser/parser.go:2011 modifierListHasAsync
 pub fn modifier_list_has_async(modifiers: ModifierList) -> bool {
     modifiers.is_some() && modifiers.nodes().iter().any(is_async_modifier)
 }
 
 impl<'a> Parser<'a> {
-    // Go: parser/parser.go:1971 parsePropertyDeclaration
+    // Go: parser/parser.go:2015 parsePropertyDeclaration
     pub fn parse_property_declaration(
         &mut self,
         pos: i32,
@@ -980,7 +980,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:1985 parseSemicolonAfterPropertyName
+    // Go: parser/parser.go:2029 parseSemicolonAfterPropertyName
     pub fn parse_semicolon_after_property_name(
         &mut self,
         name: Node,
@@ -1026,7 +1026,7 @@ impl<'a> Parser<'a> {
         self.parse_error_for_missing_semicolon_after(name);
     }
 
-    // Go: parser/parser.go:2013 parseErrorForMissingSemicolonAfter
+    // Go: parser/parser.go:2057 parseErrorForMissingSemicolonAfter
     pub fn parse_error_for_missing_semicolon_after(&mut self, node: Node) {
         // Tagged template literals are sometimes used in places where only simple strings are allowed, i.e.:
         //   module `M1` {
@@ -1135,7 +1135,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-// Go: parser/parser.go:2069 getSpaceSuggestion
+// Go: parser/parser.go:2113 getSpaceSuggestion
 pub fn get_space_suggestion(expression_text: &str) -> String {
     for keyword in viable_keyword_suggestions().iter() {
         if expression_text.len() > keyword.len() + 2
@@ -1148,7 +1148,7 @@ pub fn get_space_suggestion(expression_text: &str) -> String {
 }
 
 impl<'a> Parser<'a> {
-    // Go: parser/parser.go:2078 parseErrorForInvalidName
+    // Go: parser/parser.go:2122 parseErrorForInvalidName
     pub fn parse_error_for_invalid_name(
         &mut self,
         name_diagnostic: &'static Message,
@@ -1163,7 +1163,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser/parser.go:2086 parseInterfaceDeclaration
+    // Go: parser/parser.go:2130 parseInterfaceDeclaration
     pub fn parse_interface_declaration(
         &mut self,
         pos: i32,
@@ -1188,7 +1188,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2098 parseTypeAliasDeclaration
+    // Go: parser/parser.go:2142 parseTypeAliasDeclaration
     pub fn parse_type_alias_declaration(
         &mut self,
         pos: i32,
@@ -1219,12 +1219,12 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2119 nextIsNotDot
+    // Go: parser/parser.go:2163 nextIsNotDot
     pub fn next_is_not_dot(&mut self) -> bool {
         self.next_token() != SyntaxKind::DotToken
     }
 
-    // Go: parser/parser.go:2127 parseEnumMember
+    // Go: parser/parser.go:2171 parseEnumMember
     // In an ambient declaration, the grammar only allows integer literals as initializers.
     // In a non-ambient declaration, the grammar allows uninitialized members only in a
     // ConstantEnumMemberSection, which starts at the beginning of an enum declaration
@@ -1244,7 +1244,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2137 parseEnumDeclaration
+    // Go: parser/parser.go:2181 parseEnumDeclaration
     pub fn parse_enum_declaration(
         &mut self,
         pos: i32,
@@ -1273,7 +1273,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2158 parseModuleDeclaration
+    // Go: parser/parser.go:2202 parseModuleDeclaration
     pub fn parse_module_declaration(
         &mut self,
         pos: i32,
@@ -1335,7 +1335,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2198 parseModuleBlock
+    // Go: parser/parser.go:2246 parseModuleBlock
     pub fn parse_module_block(&mut self) -> Node {
         let pos = self.node_pos();
         let statements;
@@ -1349,7 +1349,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:2210 parseModuleOrNamespaceDeclaration
+    // Go: parser/parser.go:2258 parseModuleOrNamespaceDeclaration
     pub fn parse_module_or_namespace_declaration(
         &mut self,
         pos: i32,
@@ -1394,7 +1394,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2235 parseImportDeclarationOrImportEqualsDeclaration
+    // Go: parser/parser.go:2283 parseImportDeclarationOrImportEqualsDeclaration
     pub fn parse_import_declaration_or_import_equals_declaration(
         &mut self,
         pos: i32,
@@ -1474,25 +1474,25 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2284 nextTokenIsFromKeywordOrEqualsToken
+    // Go: parser/parser.go:2332 nextTokenIsFromKeywordOrEqualsToken
     pub fn next_token_is_from_keyword_or_equals_token(&mut self) -> bool {
         self.next_token();
         self.token == SyntaxKind::FromKeyword || self.token == SyntaxKind::EqualsToken
     }
 
-    // Go: parser/parser.go:2289 tokenAfterImportDefinitelyProducesImportDeclaration
+    // Go: parser/parser.go:2337 tokenAfterImportDefinitelyProducesImportDeclaration
     pub fn token_after_import_definitely_produces_import_declaration(&self) -> bool {
         self.token == SyntaxKind::AsteriskToken || self.token == SyntaxKind::OpenBraceToken
     }
 
-    // Go: parser/parser.go:2293 tokenAfterImportedIdentifierDefinitelyProducesImportDeclaration
+    // Go: parser/parser.go:2341 tokenAfterImportedIdentifierDefinitelyProducesImportDeclaration
     pub fn token_after_imported_identifier_definitely_produces_import_declaration(&self) -> bool {
         // In `import id ___`, the current token decides whether to produce
         // an ImportDeclaration or ImportEqualsDeclaration.
         self.token == SyntaxKind::CommaToken || self.token == SyntaxKind::FromKeyword
     }
 
-    // Go: parser/parser.go:2299 parseImportEqualsDeclaration
+    // Go: parser/parser.go:2347 parseImportEqualsDeclaration
     pub fn parse_import_equals_declaration(
         &mut self,
         pos: i32,
@@ -1515,7 +1515,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2308 parseModuleReference
+    // Go: parser/parser.go:2356 parseModuleReference
     pub fn parse_module_reference(&mut self) -> Node {
         if self.token == SyntaxKind::RequireKeyword
             && self.look_ahead(Parser::next_token_is_open_paren)
@@ -1529,7 +1529,7 @@ impl<'a> Parser<'a> {
         )
     }
 
-    // Go: parser/parser.go:2315 parseExternalModuleReference
+    // Go: parser/parser.go:2363 parseExternalModuleReference
     pub fn parse_external_module_reference(&mut self) -> Node {
         let save_has_await_identifier = self.statement_has_await_identifier;
         let pos = self.node_pos();
@@ -1543,7 +1543,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2327 parseModuleSpecifier
+    // Go: parser/parser.go:2375 parseModuleSpecifier
     pub fn parse_module_specifier(&mut self) -> Node {
         if self.token == SyntaxKind::StringLiteral {
             return self.parse_literal_expression();
@@ -1554,7 +1554,7 @@ impl<'a> Parser<'a> {
         self.parse_expression()
     }
 
-    // Go: parser/parser.go:2338 tryParseImportClause
+    // Go: parser/parser.go:2385 tryParseImportClause
     pub fn try_parse_import_clause(
         &mut self,
         identifier: Node,
@@ -1581,7 +1581,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser/parser.go:2350 parseImportClause
+    // Go: parser/parser.go:2397 parseImportClause
     pub fn parse_import_clause(
         &mut self,
         identifier: Node,
@@ -1620,7 +1620,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2379 parseNamespaceImport
+    // Go: parser/parser.go:2426 parseNamespaceImport
     pub fn parse_namespace_import(&mut self) -> Node {
         // NameSpaceImport:
         //  * as ImportedBinding
@@ -1632,7 +1632,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:2389 parseNamedImports
+    // Go: parser/parser.go:2436 parseNamedImports
     pub fn parse_named_imports(&mut self) -> Node {
         let pos = self.node_pos();
         // NamedImports:
@@ -1649,7 +1649,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:2399 parseImportSpecifier
+    // Go: parser/parser.go:2446 parseImportSpecifier
     pub fn parse_import_specifier(&mut self) -> Node {
         let pos = self.node_pos();
         let (is_type_only, property_name, name) =
@@ -1670,7 +1670,7 @@ impl<'a> Parser<'a> {
         self.check_js_syntax(node)
     }
 
-    // Go: parser/parser.go:2414 parseImportOrExportSpecifier
+    // Go: parser/parser.go:2461 parseImportOrExportSpecifier
     pub fn parse_import_or_export_specifier(&mut self, kind: SyntaxKind) -> (bool, Node, Node) {
         // ImportSpecifier:
         //   BindingIdentifier
@@ -1745,12 +1745,12 @@ impl<'a> Parser<'a> {
         (is_type_only, property_name, name)
     }
 
-    // Go: parser/parser.go:2486 canParseModuleExportName
+    // Go: parser/parser.go:2533 canParseModuleExportName
     pub fn can_parse_module_export_name(&self) -> bool {
         token_is_identifier_or_keyword(self.token) || self.token == SyntaxKind::StringLiteral
     }
 
-    // Go: parser/parser.go:2490 parseModuleExportName
+    // Go: parser/parser.go:2537 parseModuleExportName
     pub fn parse_module_export_name(&mut self, disallow_keywords: bool) -> (Node, bool) {
         let mut name_ok = true;
 
@@ -1763,7 +1763,7 @@ impl<'a> Parser<'a> {
         (self.parse_identifier_name(), name_ok)
     }
 
-    // Go: parser/parser.go:2502 tryParseImportAttributes
+    // Go: parser/parser.go:2549 tryParseImportAttributes
     pub fn try_parse_import_attributes(&mut self) -> Node {
         if self.token == SyntaxKind::WithKeyword
             || (self.token == SyntaxKind::AssertKeyword && !self.has_preceding_line_break())
@@ -1780,7 +1780,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser/parser.go:2512 parseExportAssignment
+    // Go: parser/parser.go:2559 parseExportAssignment
     pub fn parse_export_assignment(
         &mut self,
         pos: i32,
@@ -1812,7 +1812,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2532 parseNamespaceExportDeclaration
+    // Go: parser/parser.go:2579 parseNamespaceExportDeclaration
     pub fn parse_namespace_export_declaration(
         &mut self,
         pos: i32,
@@ -1834,7 +1834,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2545 parseExportDeclaration
+    // Go: parser/parser.go:2592 parseExportDeclaration
     pub fn parse_export_declaration(
         &mut self,
         pos: i32,
@@ -1896,14 +1896,14 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser/parser.go:2585 parseNamespaceExport
+    // Go: parser/parser.go:2632 parseNamespaceExport
     pub fn parse_namespace_export(&mut self, pos: i32) -> Node {
         let (export_name, _) = self.parse_module_export_name(false /*disallowKeywords*/);
         let node = self.factory.new_namespace_export(export_name);
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:2590 parseNamedExports
+    // Go: parser/parser.go:2637 parseNamedExports
     pub fn parse_named_exports(&mut self) -> Node {
         let pos = self.node_pos();
         // NamedImports:
@@ -1920,7 +1920,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:2600 parseExportSpecifier
+    // Go: parser/parser.go:2647 parseExportSpecifier
     pub fn parse_export_specifier(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -1937,7 +1937,7 @@ impl<'a> Parser<'a> {
 
     // TYPES
 
-    // Go: parser/parser.go:2612 parseType
+    // Go: parser/parser.go:2659 parseType
     pub fn parse_type(&mut self) -> Node {
         let save_context_flags = self.context_flags;
         self.set_context_flags(NodeFlags::TYPE_EXCLUDES_FLAGS, false);
@@ -1983,7 +1983,7 @@ impl<'a> Parser<'a> {
         type_node
     }
 
-    // Go: parser/parser.go:2637 parseUnionTypeOrHigher
+    // Go: parser/parser.go:2684 parseUnionTypeOrHigher
     pub fn parse_union_type_or_higher(&mut self) -> Node {
         self.parse_union_or_intersection_type(
             SyntaxKind::BarToken,
@@ -1991,7 +1991,7 @@ impl<'a> Parser<'a> {
         )
     }
 
-    // Go: parser/parser.go:2641 parseIntersectionTypeOrHigher
+    // Go: parser/parser.go:2688 parseIntersectionTypeOrHigher
     pub fn parse_intersection_type_or_higher(&mut self) -> Node {
         self.parse_union_or_intersection_type(
             SyntaxKind::AmpersandToken,
@@ -1999,7 +1999,7 @@ impl<'a> Parser<'a> {
         )
     }
 
-    // Go: parser/parser.go:2645 parseUnionOrIntersectionType
+    // Go: parser/parser.go:2692 parseUnionOrIntersectionType
     pub fn parse_union_or_intersection_type(
         &mut self,
         operator: SyntaxKind,
@@ -2032,7 +2032,7 @@ impl<'a> Parser<'a> {
         type_node
     }
 
-    // Go: parser/parser.go:2667 createUnionOrIntersectionTypeNode
+    // Go: parser/parser.go:2714 createUnionOrIntersectionTypeNode
     pub fn create_union_or_intersection_type_node(
         &mut self,
         operator: SyntaxKind,
@@ -2045,7 +2045,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser/parser.go:2678 parseTypeOperatorOrHigher
+    // Go: parser/parser.go:2725 parseTypeOperatorOrHigher
     pub fn parse_type_operator_or_higher(&mut self) -> Node {
         let operator = self.token;
         match operator {
@@ -2064,7 +2064,7 @@ impl<'a> Parser<'a> {
         )
     }
 
-    // Go: parser/parser.go:2689 parseTypeOperator
+    // Go: parser/parser.go:2736 parseTypeOperator
     pub fn parse_type_operator(&mut self, operator: SyntaxKind) -> Node {
         let pos = self.node_pos();
         self.parse_expected(operator);
@@ -2073,7 +2073,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:2695 parseInferType
+    // Go: parser/parser.go:2742 parseInferType
     pub fn parse_infer_type(&mut self) -> Node {
         let pos = self.node_pos();
         self.parse_expected(SyntaxKind::InferKeyword);
@@ -2082,7 +2082,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:2701 parseTypeParameterOfInferType
+    // Go: parser/parser.go:2748 parseTypeParameterOfInferType
     pub fn parse_type_parameter_of_infer_type(&mut self) -> Node {
         let pos = self.node_pos();
         let name = self.parse_identifier();
@@ -2097,7 +2097,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser/parser.go:2708 tryParseConstraintOfInferType
+    // Go: parser/parser.go:2755 tryParseConstraintOfInferType
     pub fn try_parse_constraint_of_infer_type(&mut self) -> Node {
         let state = self.mark();
         if self.parse_optional(SyntaxKind::ExtendsKeyword) {
@@ -2116,7 +2116,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser/parser.go:2720 parsePostfixTypeOrHigher
+    // Go: parser/parser.go:2767 parsePostfixTypeOrHigher
     pub fn parse_postfix_type_or_higher(&mut self) -> Node {
         let pos = self.node_pos();
         let mut type_node = self.parse_non_array_type();
@@ -2157,13 +2157,13 @@ impl<'a> Parser<'a> {
         type_node
     }
 
-    // Go: parser/parser.go:2752 nextIsStartOfType
+    // Go: parser/parser.go:2799 nextIsStartOfType
     pub fn next_is_start_of_type(&mut self) -> bool {
         self.next_token();
         self.is_start_of_type(false /*inStartOfParameter*/)
     }
 
-    // Go: parser/parser.go:2757 parseNonArrayType
+    // Go: parser/parser.go:2804 parseNonArrayType
     pub fn parse_non_array_type(&mut self) -> Node {
         match self.token {
             SyntaxKind::AnyKeyword

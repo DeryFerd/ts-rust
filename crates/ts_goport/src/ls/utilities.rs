@@ -15,7 +15,7 @@ use crate::spanmap::{Feature, Fidelity};
 use std::borrow::Cow;
 use std::cell::Cell;
 
-// Go: ls/utilities.go:25 quoteReplacer
+// Go: ls/utilities.go:26 quoteReplacer
 // PORT: Go `strings.NewReplacer("'", `\'`, `\"`, `"`)`. The pairs are kept in
 // Go argument order; `quote_replacer_replace` is `Replace`.
 const QUOTE_REPLACER: [(&str, &str); 2] = [("'", "\\'"), ("\\\"", "\"")];
@@ -45,7 +45,7 @@ fn quote_replacer_replace(s: &str) -> String {
     out
 }
 
-// Go: ls/utilities.go:27 IsInString
+// Go: ls/utilities.go:28 IsInString
 pub fn is_in_string(source_file: Node, position: i32, previous_token: Node) -> bool {
     if previous_token.is_some() && is_string_text_containing_node(previous_token) {
         let start =
@@ -67,7 +67,7 @@ pub fn is_in_string(source_file: Node, position: i32, previous_token: Node) -> b
     false
 }
 
-// Go: ls/utilities.go:47 isModuleSpecifierLike
+// Go: ls/utilities.go:48 isModuleSpecifierLike
 pub fn is_module_specifier_like(node: Node) -> bool {
     if !is_string_literal_like(node) {
         return false;
@@ -86,7 +86,7 @@ pub fn is_module_specifier_like(node: Node) -> bool {
         || node.parent().kind() == SyntaxKind::JsImportDeclaration
 }
 
-// Go: ls/utilities.go:61 getNonModuleSymbolOfMergedModuleSymbol
+// Go: ls/utilities.go:62 getNonModuleSymbolOfMergedModuleSymbol
 pub fn get_non_module_symbol_of_merged_module_symbol(
     symbols: &SymbolArena,
     symbol: SymbolId,
@@ -111,7 +111,7 @@ pub fn get_non_module_symbol_of_merged_module_symbol(
     SymbolId::NIL
 }
 
-// Go: ls/utilities.go:72 getLocalSymbolForExportSpecifier
+// Go: ls/utilities.go:73 getLocalSymbolForExportSpecifier
 // PORT: Go `*ast.ExportSpecifier` is the `Node`.
 pub fn get_local_symbol_for_export_specifier(
     reference_location: Node,
@@ -128,7 +128,7 @@ pub fn get_local_symbol_for_export_specifier(
     reference_symbol
 }
 
-// Go: ls/utilities.go:81 isExportSpecifierAlias
+// Go: ls/utilities.go:82 isExportSpecifierAlias
 pub fn is_export_specifier_alias(reference_location: Node, export_specifier: Node) -> bool {
     debug_assert!(
         export_specifier.property_name() == reference_location
@@ -150,7 +150,7 @@ pub fn is_export_specifier_alias(reference_location: Node, export_specifier: Nod
     }
 }
 
-// Go: ls/utilities.go:94 isInComment
+// Go: ls/utilities.go:95 isInComment
 // PORT: Go `*ast.CommentRange` is `Option<CommentRange>`.
 pub fn is_in_comment(file: Node, position: i32, token_at_position: Node) -> Option<CommentRange> {
     get_range_of_enclosing_comment(
@@ -161,12 +161,12 @@ pub fn is_in_comment(file: Node, position: i32, token_at_position: Node) -> Opti
     )
 }
 
-// Go: ls/utilities.go:98 positionBelongsToNode
+// Go: ls/utilities.go:99 positionBelongsToNode
 pub fn position_belongs_to_node(candidate: Node, position: i32, file: Node) -> bool {
     lsutil::position_belongs_to_node(candidate, position, file)
 }
 
-// Go: ls/utilities.go:102 PossibleTypeArgumentInfo
+// Go: ls/utilities.go:103 PossibleTypeArgumentInfo
 // PORT: the Go fields are package-private; other `ls` files read them.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PossibleTypeArgumentInfo {
@@ -174,7 +174,7 @@ pub struct PossibleTypeArgumentInfo {
     pub n_type_arguments: i32,
 }
 
-// Go: ls/utilities.go:108 getPossibleTypeArgumentsInfo
+// Go: ls/utilities.go:109 getPossibleTypeArgumentsInfo
 // Get info for an expression like `f <` that may be the start of type arguments.
 // PORT: Go returns `*PossibleTypeArgumentInfo`; nil is `None`.
 pub fn get_possible_type_arguments_info(
@@ -286,7 +286,7 @@ pub fn get_possible_type_arguments_info(
     None
 }
 
-// Go: ls/utilities.go:190 isNameOfModuleDeclaration
+// Go: ls/utilities.go:191 isNameOfModuleDeclaration
 pub fn is_name_of_module_declaration(node: Node) -> bool {
     if node.parent().kind() != SyntaxKind::ModuleDeclaration {
         return false;
@@ -294,18 +294,18 @@ pub fn is_name_of_module_declaration(node: Node) -> bool {
     node.parent().name() == node
 }
 
-// Go: ls/utilities.go:197 isExpressionOfExternalModuleImportEqualsDeclaration
+// Go: ls/utilities.go:198 isExpressionOfExternalModuleImportEqualsDeclaration
 pub fn is_expression_of_external_module_import_equals_declaration(node: Node) -> bool {
     is_external_module_import_equals_declaration(node.parent().parent())
         && get_external_module_import_equals_declaration_expression(node.parent().parent()) == node
 }
 
-// Go: ls/utilities.go:201 isNamespaceReference
+// Go: ls/utilities.go:202 isNamespaceReference
 pub fn is_namespace_reference(node: Node) -> bool {
     is_qualified_name_namespace_reference(node) || is_property_access_namespace_reference(node)
 }
 
-// Go: ls/utilities.go:205 isQualifiedNameNamespaceReference
+// Go: ls/utilities.go:206 isQualifiedNameNamespaceReference
 pub fn is_qualified_name_namespace_reference(node: Node) -> bool {
     let mut root = node;
     let mut is_last_clause = true;
@@ -320,7 +320,7 @@ pub fn is_qualified_name_namespace_reference(node: Node) -> bool {
     root.parent().kind() == SyntaxKind::TypeReference && !is_last_clause
 }
 
-// Go: ls/utilities.go:219 isPropertyAccessNamespaceReference
+// Go: ls/utilities.go:220 isPropertyAccessNamespaceReference
 pub fn is_property_access_namespace_reference(node: Node) -> bool {
     let mut root = node;
     let mut is_last_clause = true;
@@ -348,7 +348,7 @@ pub fn is_property_access_namespace_reference(node: Node) -> bool {
     false
 }
 
-// Go: ls/utilities.go:239 isThis
+// Go: ls/utilities.go:240 isThis
 pub fn is_this(node: Node) -> bool {
     match node.kind() {
         SyntaxKind::ThisKeyword => {
@@ -363,7 +363,7 @@ pub fn is_this(node: Node) -> bool {
     }
 }
 
-// Go: ls/utilities.go:252 isTypeReference
+// Go: ls/utilities.go:253 isTypeReference
 pub fn is_type_reference(node: Node) -> bool {
     let mut node = node;
     if is_right_side_of_qualified_name_or_property_access(node) {
@@ -386,7 +386,7 @@ pub fn is_type_reference(node: Node) -> bool {
     false
 }
 
-// Go: ls/utilities.go:276 isInRightSideOfInternalImportEqualsDeclaration
+// Go: ls/utilities.go:277 isInRightSideOfInternalImportEqualsDeclaration
 pub fn is_in_right_side_of_internal_import_equals_declaration(node: Node) -> bool {
     let mut node = node;
     if node.parent().is_nil() {
@@ -458,7 +458,7 @@ impl<P: ProgramView> LanguageService<P> {
     }
 }
 
-// Go: ls/utilities.go:307 quote
+// Go: ls/utilities.go:312 quote
 // PORT: Go passes the preferences by value; here by reference.
 pub fn quote(file: Node, preferences: &lsutil::UserPreferences, text: &str) -> String {
     // Editors can pass in undefined or empty string - we want to infer the preference in those cases.
@@ -474,7 +474,7 @@ pub fn quote(file: Node, preferences: &lsutil::UserPreferences, text: &str) -> S
     quoted
 }
 
-// Go: ls/utilities.go:317 typeKeywords
+// Go: ls/utilities.go:322 typeKeywords
 // PORT: Go `*collections.Set[ast.Kind]`; membership is all that is read.
 pub static TYPE_KEYWORDS: [SyntaxKind; 20] = [
     SyntaxKind::AnyKeyword,
@@ -499,12 +499,12 @@ pub static TYPE_KEYWORDS: [SyntaxKind; 20] = [
     SyntaxKind::UnknownKeyword,
 ];
 
-// Go: ls/utilities.go:340 isTypeKeyword
+// Go: ls/utilities.go:345 isTypeKeyword
 pub fn is_type_keyword(kind: SyntaxKind) -> bool {
     TYPE_KEYWORDS.contains(&kind)
 }
 
-// Go: ls/utilities.go:344 isSeparator
+// Go: ls/utilities.go:349 isSeparator
 pub fn is_separator(node: Node, candidate: Node) -> bool {
     candidate.is_some()
         && node.parent().is_some()
@@ -513,7 +513,7 @@ pub fn is_separator(node: Node, candidate: Node) -> bool {
                 && node.parent().kind() == SyntaxKind::ObjectLiteralExpression))
 }
 
-// Go: ls/utilities.go:348 isLiteralNameOfPropertyDeclarationOrIndexAccess
+// Go: ls/utilities.go:353 isLiteralNameOfPropertyDeclarationOrIndexAccess
 pub fn is_literal_name_of_property_declaration_or_index_access(node: Node) -> bool {
     // utilities
     match node.parent().kind() {
@@ -533,7 +533,7 @@ pub fn is_literal_name_of_property_declaration_or_index_access(node: Node) -> bo
     }
 }
 
-// Go: ls/utilities.go:372 isObjectBindingElementWithoutPropertyName
+// Go: ls/utilities.go:377 isObjectBindingElementWithoutPropertyName
 pub fn is_object_binding_element_without_property_name(binding_element: Node) -> bool {
     binding_element.kind() == SyntaxKind::BindingElement
         && binding_element.parent().kind() == SyntaxKind::ObjectBindingPattern
@@ -541,14 +541,14 @@ pub fn is_object_binding_element_without_property_name(binding_element: Node) ->
         && binding_element.property_name().is_nil()
 }
 
-// Go: ls/utilities.go:379 isRightSideOfPropertyAccess
+// Go: ls/utilities.go:384 isRightSideOfPropertyAccess
 pub fn is_right_side_of_property_access(node: Node) -> bool {
     node.parent().is_some()
         && node.parent().kind() == SyntaxKind::PropertyAccessExpression
         && node.parent().name() == node
 }
 
-// Go: ls/utilities.go:383 isStaticSymbol
+// Go: ls/utilities.go:388 isStaticSymbol
 pub fn is_static_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
     let value_declaration = symbols.sym(symbol).value_declaration;
     if value_declaration.is_nil() {
@@ -558,7 +558,7 @@ pub fn is_static_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
     modifier_flags.intersects(ModifierFlags::STATIC)
 }
 
-// Go: ls/utilities.go:391 isImplementation
+// Go: ls/utilities.go:396 isImplementation
 pub fn is_implementation(node: Node) -> bool {
     if node.flags().intersects(NodeFlags::AMBIENT) {
         return !(node.kind() == SyntaxKind::InterfaceDeclaration
@@ -575,7 +575,7 @@ pub fn is_implementation(node: Node) -> bool {
     is_class_like(node) || is_module_or_enum_declaration(node)
 }
 
-// Go: ls/utilities.go:404 isImplementationExpression
+// Go: ls/utilities.go:409 isImplementationExpression
 pub fn is_implementation_expression(node: Node) -> bool {
     match node.kind() {
         SyntaxKind::ParenthesizedExpression => is_implementation_expression(node.expression()),
@@ -588,34 +588,34 @@ pub fn is_implementation_expression(node: Node) -> bool {
     }
 }
 
-// Go: ls/utilities.go:415 isReadonlyTypeOperator
+// Go: ls/utilities.go:420 isReadonlyTypeOperator
 pub fn is_readonly_type_operator(node: Node) -> bool {
     node.kind() == SyntaxKind::ReadonlyKeyword
         && node.parent().kind() == SyntaxKind::TypeOperator
         && node.parent().operator() == SyntaxKind::ReadonlyKeyword
 }
 
-// Go: ls/utilities.go:419 isJumpStatementTarget
+// Go: ls/utilities.go:424 isJumpStatementTarget
 pub fn is_jump_statement_target(node: Node) -> bool {
     node.kind() == SyntaxKind::Identifier
         && is_break_or_continue_statement(node.parent())
         && node.parent().label() == node
 }
 
-// Go: ls/utilities.go:423 isLabelOfLabeledStatement
+// Go: ls/utilities.go:428 isLabelOfLabeledStatement
 pub fn is_label_of_labeled_statement(node: Node) -> bool {
     node.kind() == SyntaxKind::Identifier
         && node.parent().kind() == SyntaxKind::LabeledStatement
         && node.parent().label() == node
 }
 
-// Go: ls/utilities.go:427 findReferenceInPosition
+// Go: ls/utilities.go:432 findReferenceInPosition
 // PORT: Go returns the `*ast.FileReference` element; nil is `None`.
 pub fn find_reference_in_position(refs: &[FileReference], pos: i32) -> Option<&FileReference> {
     refs.iter().find(|r| r.range.contains_inclusive(pos))
 }
 
-// Go: ls/utilities.go:431 getContainingNodeIfInHeritageClause
+// Go: ls/utilities.go:436 getContainingNodeIfInHeritageClause
 pub fn get_containing_node_if_in_heritage_clause(node: Node) -> Node {
     if node.kind() == SyntaxKind::Identifier
         || node.kind() == SyntaxKind::QualifiedName
@@ -634,7 +634,7 @@ pub fn get_containing_node_if_in_heritage_clause(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ls/utilities.go:441 getContainerNode
+// Go: ls/utilities.go:448 getContainerNode
 pub fn get_container_node(node: Node) -> Node {
     let mut parent = node.parent();
     while parent.is_some() {
@@ -657,7 +657,7 @@ pub fn get_container_node(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ls/utilities.go:452 getAdjustedLocation
+// Go: ls/utilities.go:459 getAdjustedLocation
 // PORT: Go `sourceFile` may be nil (`Node::NIL`).
 pub fn get_adjusted_location(node: Node, for_rename: bool, source_file: Node) -> Node {
     // todo: check if this function needs to be changed for jsdoc updates
@@ -942,7 +942,7 @@ pub fn get_adjusted_location(node: Node, for_rename: bool, source_file: Node) ->
     node
 }
 
-// Go: ls/utilities.go:689 getAdjustedLocationForDeclaration
+// Go: ls/utilities.go:696 getAdjustedLocationForDeclaration
 pub fn get_adjusted_location_for_declaration(
     node: Node,
     for_rename: bool,
@@ -978,7 +978,7 @@ pub fn get_adjusted_location_for_declaration(
     }
 }
 
-// Go: ls/utilities.go:713 getAdjustedLocationForImportDeclaration
+// Go: ls/utilities.go:720 getAdjustedLocationForImportDeclaration
 // PORT: Go `*ast.ImportDeclaration` is the `Node`.
 pub fn get_adjusted_location_for_import_declaration(node: Node, for_rename: bool) -> Node {
     let import_clause = node.import_clause();
@@ -1027,7 +1027,7 @@ pub fn get_adjusted_location_for_import_declaration(node: Node, for_rename: bool
     Node::NIL
 }
 
-// Go: ls/utilities.go:756 getAdjustedLocationForExportDeclaration
+// Go: ls/utilities.go:763 getAdjustedLocationForExportDeclaration
 // PORT: Go `*ast.ExportDeclaration` is the `Node`.
 pub fn get_adjusted_location_for_export_declaration(node: Node, for_rename: bool) -> Node {
     let export_clause = node.export_clause();
@@ -1061,7 +1061,7 @@ pub fn get_adjusted_location_for_export_declaration(node: Node, for_rename: bool
     Node::NIL
 }
 
-// Go: ls/utilities.go:784 symbolFlagsHaveMeaning
+// Go: ls/utilities.go:791 symbolFlagsHaveMeaning
 pub fn symbol_flags_have_meaning(flags: SymbolFlags, meaning: SemanticMeaning) -> bool {
     if meaning == SemanticMeaning::ALL {
         return true;
@@ -1078,7 +1078,7 @@ pub fn symbol_flags_have_meaning(flags: SymbolFlags, meaning: SemanticMeaning) -
     false
 }
 
-// Go: ls/utilities.go:800 getMeaningFromLocation
+// Go: ls/utilities.go:807 getMeaningFromLocation
 pub fn get_meaning_from_location(node: Node) -> SemanticMeaning {
     // todo: check if this function needs to be changed for jsdoc updates
     let node = get_adjusted_location(
@@ -1137,7 +1137,7 @@ pub fn get_meaning_from_location(node: Node) -> SemanticMeaning {
     }
 }
 
-// Go: ls/utilities.go:839 getMeaningFromDeclaration
+// Go: ls/utilities.go:846 getMeaningFromDeclaration
 pub fn get_meaning_from_declaration(node: Node) -> SemanticMeaning {
     match node.kind() {
         SyntaxKind::VariableDeclaration
@@ -1194,7 +1194,7 @@ pub fn get_meaning_from_declaration(node: Node) -> SemanticMeaning {
     }
 }
 
-// Go: ls/utilities.go:874 getIntersectingMeaningFromDeclarations
+// Go: ls/utilities.go:881 getIntersectingMeaningFromDeclarations
 pub fn get_intersecting_meaning_from_declarations(
     symbols: &SymbolArena,
     node: Node,
@@ -1240,7 +1240,7 @@ pub fn get_intersecting_meaning_from_declarations(
     meaning
 }
 
-// Go: ls/utilities.go:915 getAllSuperTypeNodes
+// Go: ls/utilities.go:922 getAllSuperTypeNodes
 // Returns the node in an `extends` or `implements` clause of a class or interface.
 // PORT: Go returns `[]*ast.HeritageClauseElement` (ExpressionWithTypeArguments
 // or TypeReference nodes, tsgo#4797).
@@ -1261,7 +1261,7 @@ pub fn get_all_super_type_nodes(node: Node) -> Vec<Node> {
     Vec::new()
 }
 
-// Go: ls/utilities.go:928 getParentSymbolsOfPropertyAccess
+// Go: ls/utilities.go:935 getParentSymbolsOfPropertyAccess
 pub fn get_parent_symbols_of_property_access(
     location: Node,
     symbol: SymbolId,
@@ -1302,7 +1302,7 @@ pub fn get_parent_symbols_of_property_access(
         .collect()
 }
 
-// Go: ls/utilities.go:956 getPropertySymbolsFromBaseTypes
+// Go: ls/utilities.go:963 getPropertySymbolsFromBaseTypes
 // Find symbol of the given property-name and add the symbol to the given result array
 // @param symbol a symbol to start searching for the given propertyName
 // @param propertyName a name of property to search for
@@ -1367,7 +1367,7 @@ pub fn get_property_symbols_from_base_types(
     recur(symbol, property_name, checker, cb, &mut seen)
 }
 
-// Go: ls/utilities.go:989 getPropertySymbolFromBindingElement
+// Go: ls/utilities.go:996 getPropertySymbolFromBindingElement
 pub fn get_property_symbol_from_binding_element(
     checker: &mut Checker,
     binding_element: Node,
@@ -1380,7 +1380,7 @@ pub fn get_property_symbol_from_binding_element(
     SymbolId::NIL
 }
 
-// Go: ls/utilities.go:996 getPropertySymbolOfObjectBindingPatternWithoutPropertyName
+// Go: ls/utilities.go:1003 getPropertySymbolOfObjectBindingPatternWithoutPropertyName
 pub fn get_property_symbol_of_object_binding_pattern_without_property_name(
     symbol: SymbolId,
     checker: &mut Checker,
@@ -1394,7 +1394,7 @@ pub fn get_property_symbol_of_object_binding_pattern_without_property_name(
     SymbolId::NIL
 }
 
-// Go: ls/utilities.go:1004 getTargetLabel
+// Go: ls/utilities.go:1011 getTargetLabel
 pub fn get_target_label(reference_node: Node, label_name: &str) -> Node {
     let mut reference_node = reference_node;
     // todo: rewrite as `ast.FindAncestor`
@@ -1409,7 +1409,7 @@ pub fn get_target_label(reference_node: Node, label_name: &str) -> Node {
     Node::NIL
 }
 
-// Go: ls/utilities.go:1015 skipConstraint
+// Go: ls/utilities.go:1022 skipConstraint
 pub fn skip_constraint(t: TypeId, type_checker: &mut Checker) -> TypeId {
     if type_checker.ty(t).is_type_parameter() {
         let c = type_checker.get_base_constraint_of_type_exported(t);
@@ -1420,7 +1420,7 @@ pub fn skip_constraint(t: TypeId, type_checker: &mut Checker) -> TypeId {
     t
 }
 
-// Go: ls/utilities.go:1025 caseClauseTrackerState
+// Go: ls/utilities.go:1032 caseClauseTrackerState
 // PORT: Go `collections.Set[jsnum.Number]` compares keys with float `==`:
 // -0 and +0 are one key and NaN is never found. `NumberKey` makes -0 and +0
 // one key; `has_value` returns false for NaN. `jsnum.PseudoBigInt` is not
@@ -1432,16 +1432,16 @@ pub struct CaseClauseTrackerState {
     pub existing_big_ints: FxHashSet<PseudoBigIntKey>,
 }
 
-// Go: ls/utilities.go:1032 trackerAddValue
+// Go: ls/utilities.go:1039 trackerAddValue
 // string | jsnum.Number
 // PORT: Go `any`; the literal values are `LiteralValue`.
 pub type TrackerAddValue = LiteralValue;
 
-// Go: ls/utilities.go:1035 trackerHasValue
+// Go: ls/utilities.go:1042 trackerHasValue
 // string | jsnum.Number | jsnum.PseudoBigInt
 pub type TrackerHasValue = LiteralValue;
 
-// Go: ls/utilities.go:1037 caseClauseTracker
+// Go: ls/utilities.go:1044 caseClauseTracker
 // PORT: the values are passed by reference, as other `LiteralValue`
 // parameters in package `ls` are.
 pub trait CaseClauseTracker {
@@ -1450,7 +1450,7 @@ pub trait CaseClauseTracker {
 }
 
 impl CaseClauseTracker for CaseClauseTrackerState {
-    // Go: ls/utilities.go:1042 addValue
+    // Go: ls/utilities.go:1049 addValue
     fn add_value(&mut self, value: &TrackerAddValue) {
         match value {
             LiteralValue::String(v) => {
@@ -1467,7 +1467,7 @@ impl CaseClauseTracker for CaseClauseTrackerState {
         }
     }
 
-    // Go: ls/utilities.go:1053 hasValue
+    // Go: ls/utilities.go:1060 hasValue
     fn has_value(&self, value: &TrackerHasValue) -> bool {
         match value {
             LiteralValue::String(v) => self.existing_strings.contains(v),
@@ -1484,7 +1484,7 @@ impl CaseClauseTracker for CaseClauseTrackerState {
     }
 }
 
-// Go: ls/utilities.go:1066 newCaseClauseTracker
+// Go: ls/utilities.go:1073 newCaseClauseTracker
 // PORT: Go returns the `caseClauseTracker` interface.
 pub fn new_case_clause_tracker(
     type_checker: &mut Checker,
@@ -1533,17 +1533,17 @@ pub fn new_case_clause_tracker(
     Box::new(c)
 }
 
-// Go: ls/utilities.go:1098 RangeContainsRange
+// Go: ls/utilities.go:1105 RangeContainsRange
 pub fn range_contains_range(r1: TextRange, r2: TextRange) -> bool {
     start_end_contains_range(r1.pos(), r1.end(), r2)
 }
 
-// Go: ls/utilities.go:1102 startEndContainsRange
+// Go: ls/utilities.go:1109 startEndContainsRange
 pub fn start_end_contains_range(start: i32, end: i32, text_range: TextRange) -> bool {
     start <= text_range.pos() && end >= text_range.end()
 }
 
-// Go: ls/utilities.go:1106 getPossibleGenericSignatures
+// Go: ls/utilities.go:1113 getPossibleGenericSignatures
 pub fn get_possible_generic_signatures(
     called: Node,
     type_argument_count: i32,
@@ -1579,7 +1579,7 @@ pub fn get_possible_generic_signatures(
         .collect()
 }
 
-// Go: ls/utilities.go:1122 removeOptionality
+// Go: ls/utilities.go:1129 removeOptionality
 pub fn remove_optionality(
     t: TypeId,
     is_optional_expression: bool,
@@ -1594,35 +1594,35 @@ pub fn remove_optionality(
     t
 }
 
-// Go: ls/utilities.go:1131 isNoSubstitutionTemplateLiteral
+// Go: ls/utilities.go:1138 isNoSubstitutionTemplateLiteral
 pub fn is_no_substitution_template_literal(node: Node) -> bool {
     node.kind() == SyntaxKind::NoSubstitutionTemplateLiteral
 }
 
-// Go: ls/utilities.go:1135 isTaggedTemplateExpression
+// Go: ls/utilities.go:1142 isTaggedTemplateExpression
 pub fn is_tagged_template_expression(node: Node) -> bool {
     node.kind() == SyntaxKind::TaggedTemplateExpression
 }
 
-// Go: ls/utilities.go:1139 isInsideTemplateLiteral
+// Go: ls/utilities.go:1146 isInsideTemplateLiteral
 pub fn is_inside_template_literal(node: Node, position: i32, source_file: Node) -> bool {
     is_template_literal_kind(node.kind())
         && (get_token_pos_of_node(node, source_file, false) < position && position < node.end()
             || (is_unterminated_literal(node) && position == node.end()))
 }
 
-// Go: ls/utilities.go:1144 isTemplateHead
+// Go: ls/utilities.go:1151 isTemplateHead
 // Pseudo-literals
 pub fn is_template_head(node: Node) -> bool {
     node.kind() == SyntaxKind::TemplateHead
 }
 
-// Go: ls/utilities.go:1148 isTemplateTail
+// Go: ls/utilities.go:1155 isTemplateTail
 pub fn is_template_tail(node: Node) -> bool {
     node.kind() == SyntaxKind::TemplateTail
 }
 
-// Go: ls/utilities.go:1152 findPrecedingMatchingToken
+// Go: ls/utilities.go:1159 findPrecedingMatchingToken
 pub fn find_preceding_matching_token(
     token: Node,
     matching_token_kind: SyntaxKind,
@@ -1665,7 +1665,7 @@ pub fn find_preceding_matching_token(
     }
 }
 
-// Go: ls/utilities.go:1188 findContainingList
+// Go: ls/utilities.go:1195 findContainingList
 // PORT: Go returns `*ast.NodeList`; nil is `NodeList::NIL`.
 pub fn find_containing_list(node: Node, file: Node) -> NodeList {
     // The node might be a list element (nonsynthetic) or a comma (synthetic). Either way, it will
@@ -1682,7 +1682,7 @@ pub fn find_containing_list(node: Node, file: Node) -> NodeList {
     list.get()
 }
 
-// Go: ls/utilities.go:1205 getLeadingCommentRangesOfNode
+// Go: ls/utilities.go:1212 getLeadingCommentRangesOfNode
 // PORT: Go returns an `iter.Seq` (nil for JSX text); here the collected
 // ranges.
 pub fn get_leading_comment_ranges_of_node(node: Node, file: Node) -> Vec<CommentRange> {
@@ -1696,7 +1696,7 @@ pub fn get_leading_comment_ranges_of_node(node: Node, file: Node) -> Vec<Comment
     )
 }
 
-// Go: ls/utilities.go:1213 getChildrenFromNonJSDocNode
+// Go: ls/utilities.go:1220 getChildrenFromNonJSDocNode
 // Equivalent to Strada's `node.getChildren()` for non-JSDoc nodes.
 pub fn get_children_from_non_js_doc_node(node: Node, source_file: Node) -> Vec<Node> {
     let mut child_nodes: Vec<Node> = Vec::new();
@@ -1753,7 +1753,7 @@ pub fn get_children_from_non_js_doc_node(node: Node, source_file: Node) -> Vec<N
     children
 }
 
-// Go: ls/utilities.go:1254 getContainingObjectLiteralElement
+// Go: ls/utilities.go:1261 getContainingObjectLiteralElement
 // Returns the containing object literal property declaration given a possible name node, e.g. "a" in x = { "a": 1 }
 pub fn get_containing_object_literal_element(node: Node) -> Node {
     let element = get_containing_object_literal_element_worker(node);
@@ -1765,7 +1765,7 @@ pub fn get_containing_object_literal_element(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ls/utilities.go:1262 getContainingObjectLiteralElementWorker
+// Go: ls/utilities.go:1269 getContainingObjectLiteralElementWorker
 pub fn get_containing_object_literal_element_worker(node: Node) -> Node {
     // Go: the `case ast.KindIdentifier` body, which the literal kinds reach
     // through `fallthrough`.
@@ -1797,19 +1797,19 @@ pub fn get_containing_object_literal_element_worker(node: Node) -> Node {
     }
 }
 
-// Go: ls/utilities.go:1280 isObjectLiteralOrJsxElement
+// Go: ls/utilities.go:1287 isObjectLiteralOrJsxElement
 pub fn is_object_literal_or_jsx_element(node: Node) -> bool {
     is_object_literal_element(node) || is_jsx_attribute(node) || is_jsx_spread_attribute(node)
 }
 
-// Go: ls/utilities.go:1285 nodeSeenTracker
+// Go: ls/utilities.go:1292 nodeSeenTracker
 // Return a function that returns true if the given node has not been seen
 pub fn node_seen_tracker() -> Box<dyn FnMut(Node) -> bool> {
     let mut seen: FxHashSet<Node> = FxHashSet::default();
     Box::new(move |node: Node| seen.insert(node))
 }
 
-// Go: ls/utilities.go:1293 toContextRange
+// Go: ls/utilities.go:1300 toContextRange
 // FindAllReferences.toContextSpan
 // PORT: Go `*core.TextRange` param and result are `Option<TextRange>`. Go
 // returns the same pointer when `context` is nil.
@@ -1841,7 +1841,7 @@ fn parsed_source_file(program: &compiler::NewProgram, file: Node) -> Rc<ParsedSo
         .expect("source file is not in the program")
 }
 
-// Go: ls/utilities.go:1305 getReferenceAtPosition
+// Go: ls/utilities.go:1312 getReferenceAtPosition
 // PORT: Go returns `*refInfo`; nil is `None`.
 pub fn get_reference_at_position(
     source_file: Node,
@@ -1933,7 +1933,7 @@ pub fn get_reference_at_position(
     None
 }
 
-// Go: ls/utilities.go:1355 getContextualTypeFromParent
+// Go: ls/utilities.go:1362 getContextualTypeFromParent
 pub fn get_contextual_type_from_parent(
     node: Node,
     type_checker: &mut Checker,
@@ -1959,7 +1959,7 @@ pub fn get_contextual_type_from_parent(
     }
 }
 
-// Go: ls/utilities.go:1374 getContextualTypeFromParentOrAncestorTypeNode
+// Go: ls/utilities.go:1381 getContextualTypeFromParentOrAncestorTypeNode
 pub fn get_contextual_type_from_parent_or_ancestor_type_node(
     node: Node,
     type_checker: &mut Checker,
@@ -1983,7 +1983,7 @@ pub fn get_contextual_type_from_parent_or_ancestor_type_node(
     TypeId::NIL
 }
 
-// Go: ls/utilities.go:1391 getAncestorTypeNode
+// Go: ls/utilities.go:1398 getAncestorTypeNode
 pub fn get_ancestor_type_node(node: Node) -> Node {
     let mut last_type_node = Node::NIL;
     find_ancestor(node, |n| {
@@ -1995,7 +1995,7 @@ pub fn get_ancestor_type_node(node: Node) -> Node {
     last_type_node
 }
 
-// Go: ls/utilities.go:1402 isSourceFileWithGlobalExports
+// Go: ls/utilities.go:1409 isSourceFileWithGlobalExports
 pub fn is_source_file_with_global_exports(node: Node) -> bool {
     node.is_some() && is_source_file(node) && file_bind_data(node).global_exports.is_some()
 }

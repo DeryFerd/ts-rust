@@ -24,7 +24,7 @@ use crate::frontend::tspath::Path;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-// Go: compiler/program.go:1710 ProgramLike
+// Go: compiler/program.go:1957 ProgramLike
 // PORT: only the methods that `EmitFilesAndReportErrors` and
 // `GetDiagnosticsOfAnyProgram` call. Config, syntactic and program
 // diagnostics are read from the current program by
@@ -56,7 +56,7 @@ impl ProgramLike for CompilerProgram {
     fn options(&self) -> &'static CompilerOptions {
         options()
     }
-    // Go: compiler/program.go:643 GetBindDiagnostics
+    // Go: compiler/program.go:787 GetBindDiagnostics
     fn get_bind_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
         get_bind_diagnostics(file)
     }
@@ -64,7 +64,7 @@ impl ProgramLike for CompilerProgram {
     fn get_global_diagnostics(&self) -> Vec<Diagnostic> {
         get_global_diagnostics()
     }
-    // Go: compiler/program.go:654 GetSemanticDiagnostics
+    // Go: compiler/program.go:798 GetSemanticDiagnostics
     fn get_semantic_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
         get_semantic_diagnostics(file)
     }
@@ -78,7 +78,7 @@ impl ProgramLike for CompilerProgram {
     }
 }
 
-// Go: execute/tsc/emit.go:20 GetTraceWithWriterFromSys
+// Go: execute/tsc/emit.go:21 GetTraceWithWriterFromSys
 pub fn get_trace_with_writer_from_sys(
     w: Writer,
     locale: Locale,
@@ -95,7 +95,7 @@ pub fn get_trace_with_writer_from_sys(
     )
 }
 
-// Go: execute/tsc/emit.go:30 EmitInput
+// Go: execute/tsc/emit.go:31 EmitInput
 // PORT: `Program` is the current program (see the module comment).
 // `Testing` and `TestingMTimesCache` are `None` outside Go tests; the cache
 // is the build host `m_times` (a `Mutex`, Go `SyncMap`). `Tracing` is the
@@ -135,7 +135,7 @@ impl EmitInput<'_> {
     }
 }
 
-// Go: execute/tsc/emit.go:45 EmitAndReportStatistics
+// Go: execute/tsc/emit.go:46 EmitAndReportStatistics
 pub fn emit_and_report_statistics(input: &EmitInput) -> (CompileAndEmitResult, Option<Statistics>) {
     let mut statistics = None;
     let mut result = emit_files_and_report_errors(input);
@@ -268,7 +268,7 @@ pub fn emit_files_and_report_errors(input: &EmitInput) -> CompileAndEmitResult {
     result
 }
 
-// Go: execute/tsc/emit.go:136 listFiles
+// Go: execute/tsc/emit.go:144 listFiles
 // PORT: Go `fmt.Fprintln(w, "TSFILE:", x)` puts a space between operands.
 fn list_files(input: &EmitInput, emit_result: &EmitResult) {
     // PORT: testing. Go `defer input.Testing.OnListFilesEnd(input.Writer)`

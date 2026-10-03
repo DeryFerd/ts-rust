@@ -182,10 +182,10 @@ pub static LIB_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
         .collect()
 });
 
-// Go: tsoptions/enummaps.go:128 Libs
+// Go: tsoptions/enummaps.go:136 Libs
 pub static LIBS: LazyLock<Vec<String>> = LazyLock::new(|| LIB_MAP.keys().cloned().collect());
 
-// Go: tsoptions/enummaps.go:129 LibFilesSet
+// Go: tsoptions/enummaps.go:137 LibFilesSet
 pub static LIB_FILES_SET: LazyLock<FxHashSet<String>> = LazyLock::new(|| {
     LIB_MAP
         .values()
@@ -196,7 +196,7 @@ pub static LIB_FILES_SET: LazyLock<FxHashSet<String>> = LazyLock::new(|| {
         .collect()
 });
 
-// Go: tsoptions/enummaps.go:132 GetLibFileName
+// Go: tsoptions/enummaps.go:140 GetLibFileName
 #[must_use]
 pub fn get_lib_file_name(lib_name: &str) -> (String, bool) {
     // checks if the libName is a valid lib name or file name and converts the lib name to the filename if needed
@@ -221,7 +221,7 @@ fn enum_map(entries: Vec<(&str, CompilerOptionsValue)>) -> CommandLineOptionEnum
         .collect()
 }
 
-// Go: tsoptions/enummaps.go:145 moduleResolutionOptionMap
+// Go: tsoptions/enummaps.go:153 moduleResolutionOptionMap
 pub static MODULE_RESOLUTION_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
     use CompilerOptionsValue::ModuleResolutionKind as V;
     enum_map(vec![
@@ -234,7 +234,7 @@ pub static MODULE_RESOLUTION_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = La
     ])
 });
 
-// Go: tsoptions/enummaps.go:154 targetOptionMap
+// Go: tsoptions/enummaps.go:162 targetOptionMap
 pub static TARGET_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
     use CompilerOptionsValue::ScriptTarget as V;
     enum_map(vec![
@@ -256,7 +256,7 @@ pub static TARGET_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new
     ])
 });
 
-// Go: tsoptions/enummaps.go:171 moduleOptionMap
+// Go: tsoptions/enummaps.go:180 moduleOptionMap
 pub static MODULE_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
     use CompilerOptionsValue::ModuleKind as V;
     enum_map(vec![
@@ -277,7 +277,7 @@ pub static MODULE_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new
     ])
 });
 
-// Go: tsoptions/enummaps.go:188 moduleDetectionOptionMap
+// Go: tsoptions/enummaps.go:197 moduleDetectionOptionMap
 pub static MODULE_DETECTION_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
     use CompilerOptionsValue::ModuleDetectionKind as V;
     enum_map(vec![
@@ -287,7 +287,7 @@ pub static MODULE_DETECTION_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = Laz
     ])
 });
 
-// Go: tsoptions/enummaps.go:194 jsxOptionMap
+// Go: tsoptions/enummaps.go:203 jsxOptionMap
 pub static JSX_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
     use CompilerOptionsValue::JsxEmit as V;
     enum_map(vec![
@@ -299,7 +299,7 @@ pub static JSX_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(||
     ])
 });
 
-// Go: tsoptions/enummaps.go:202 newLineOptionMap
+// Go: tsoptions/enummaps.go:211 newLineOptionMap
 pub static NEW_LINE_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
     use CompilerOptionsValue::NewLineKind as V;
     enum_map(vec![
@@ -308,7 +308,7 @@ pub static NEW_LINE_OPTION_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::n
     ])
 });
 
-// Go: tsoptions/enummaps.go:207 targetToLibMap
+// Go: tsoptions/enummaps.go:216 targetToLibMap
 pub static TARGET_TO_LIB_MAP: LazyLock<FxHashMap<ScriptTarget, String>> = LazyLock::new(|| {
     let entries: [(ScriptTarget, &str); 13] = [
         (ScriptTarget::ES_NEXT, "lib.esnext.full.d.ts"),
@@ -331,13 +331,13 @@ pub static TARGET_TO_LIB_MAP: LazyLock<FxHashMap<ScriptTarget, String>> = LazyLo
         .collect()
 });
 
-// Go: tsoptions/enummaps.go:222 TargetToLibMap
+// Go: tsoptions/enummaps.go:232 TargetToLibMap
 #[must_use]
 pub fn target_to_lib_map() -> &'static FxHashMap<ScriptTarget, String> {
     &TARGET_TO_LIB_MAP
 }
 
-// Go: tsoptions/enummaps.go:226 GetDefaultLibFileName
+// Go: tsoptions/enummaps.go:236 GetDefaultLibFileName
 #[must_use]
 pub fn get_default_lib_file_name(options: &CompilerOptions) -> String {
     let Some(name) = TARGET_TO_LIB_MAP.get(&options.get_emit_script_target()) else {
@@ -346,7 +346,7 @@ pub fn get_default_lib_file_name(options: &CompilerOptions) -> String {
     name.clone()
 }
 
-// Go: tsoptions/enummaps.go:234 watchFileEnumMap
+// Go: tsoptions/enummaps.go:244 watchFileEnumMap
 pub static WATCH_FILE_ENUM_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
     use CompilerOptionsValue::WatchFileKind as V;
     enum_map(vec![
@@ -374,7 +374,7 @@ pub static WATCH_FILE_ENUM_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::n
     ])
 });
 
-// Go: tsoptions/enummaps.go:243 watchDirectoryEnumMap
+// Go: tsoptions/enummaps.go:253 watchDirectoryEnumMap
 pub static WATCH_DIRECTORY_ENUM_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
     use CompilerOptionsValue::WatchDirectoryKind as V;
     enum_map(vec![
@@ -394,7 +394,7 @@ pub static WATCH_DIRECTORY_ENUM_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLo
     ])
 });
 
-// Go: tsoptions/enummaps.go:250 fallbackEnumMap
+// Go: tsoptions/enummaps.go:260 fallbackEnumMap
 pub static FALLBACK_ENUM_MAP: LazyLock<CommandLineOptionEnumMap> = LazyLock::new(|| {
     use CompilerOptionsValue::PollingKind as V;
     enum_map(vec![

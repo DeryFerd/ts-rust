@@ -118,7 +118,7 @@ fn run(args: &[String]) -> i32 {
 
     let sys: Rc<dyn System> = Rc::new(sys.with_writer(Rc::new(RefCell::new(StreamingStdout))));
 
-    // Go: execute/tsc.go:52 CommandLine
+    // Go: execute/tsc.go:53 CommandLine
     let is_build = args.first().is_some_and(|arg| {
         matches!(
             arg.to_lowercase().as_str(),

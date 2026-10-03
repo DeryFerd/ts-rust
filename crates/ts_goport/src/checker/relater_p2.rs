@@ -4,7 +4,7 @@
 use crate::prelude::*;
 
 impl Checker {
-    // Go: checker/relater.go:916 findBestTypeForInvokable
+    // Go: checker/relater.go:909 findBestTypeForInvokable
     pub fn find_best_type_for_invokable(
         &mut self,
         source: TypeId,
@@ -23,7 +23,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/relater.go:923 findMostOverlappyType
+    // Go: checker/relater.go:916 findMostOverlappyType
     pub fn find_most_overlappy_type(&mut self, source: TypeId, union_target: TypeId) -> TypeId {
         let mut best_match = TypeId::NIL;
         if !self
@@ -71,7 +71,7 @@ impl Checker {
         best_match
     }
 
-    // Go: checker/relater.go:951 findBestTypeForObjectLiteral
+    // Go: checker/relater.go:945 findBestTypeForObjectLiteral
     pub fn find_best_type_for_object_literal(
         &mut self,
         source: TypeId,
@@ -96,7 +96,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/relater.go:958 shouldReportUnmatchedPropertyError
+    // Go: checker/relater.go:952 shouldReportUnmatchedPropertyError
     pub fn should_report_unmatched_property_error(
         &mut self,
         source: TypeId,
@@ -127,7 +127,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/relater.go:973 getUnmatchedProperty
+    // Go: checker/relater.go:967 getUnmatchedProperty
     pub fn get_unmatched_property(
         &mut self,
         source: TypeId,
@@ -144,7 +144,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/relater.go:977 getUnmatchedProperties
+    // Go: checker/relater.go:971 getUnmatchedProperties
     pub fn get_unmatched_properties(
         &mut self,
         source: TypeId,
@@ -164,7 +164,7 @@ impl Checker {
     }
 
     // PORT: Go `propsOut *[]*ast.Symbol` (nil or not) is `Option<&mut Vec<SymbolId>>`.
-    // Go: checker/relater.go:983 getUnmatchedPropertiesWorker
+    // Go: checker/relater.go:977 getUnmatchedPropertiesWorker
     pub fn get_unmatched_properties_worker(
         &mut self,
         source: TypeId,
@@ -216,7 +216,7 @@ impl Checker {
 
     // PORT: Go package function `excludeProperties` reads symbol names, so it
     // is a `Checker` method. Go `collections.Set[string]` is `FxHashSet<String>`.
-    // Go: checker/relater.go:1015 excludeProperties
+    // Go: checker/relater.go:1008 excludeProperties
     // PORT: takes the list by value and returns it unchanged when nothing is
     // excluded, instead of copying it.
     pub fn exclude_properties(
@@ -249,7 +249,7 @@ impl Checker {
 // PORT: Go interface `Discriminator`. The Go implementations hold a
 // `*Checker`; here the checker is passed to `matches` instead. Go `int`
 // indexes are `i32`.
-// Go: checker/relater.go:1206 Discriminator
+// Go: checker/relater.go:1199 Discriminator
 pub trait Discriminator {
     /// Number of discriminant properties
     fn len(&self) -> i32;
@@ -262,24 +262,24 @@ pub trait Discriminator {
 // PORT: Go `TypeDiscriminator{c, props, isRelatedTo}`. The `c` field is
 // dropped (the checker is passed to each method). `isRelatedTo` is the
 // borrowed Go func param.
-// Go: checker/relater.go:1035 TypeDiscriminator
+// Go: checker/relater.go:1030 TypeDiscriminator
 pub struct TypeDiscriminator<'a> {
     pub props: Vec<SymbolId>,
     pub is_related_to: &'a mut dyn FnMut(&mut Checker, TypeId, TypeId) -> Ternary,
 }
 
 impl<'a> Discriminator for TypeDiscriminator<'a> {
-    // Go: checker/relater.go:1041 TypeDiscriminator.len
+    // Go: checker/relater.go:1036 TypeDiscriminator.len
     fn len(&self) -> i32 {
         self.props.len() as i32
     }
 
-    // Go: checker/relater.go:1045 TypeDiscriminator.name
+    // Go: checker/relater.go:1040 TypeDiscriminator.name
     fn name(&self, c: &Checker, index: i32) -> String {
         c.sym(self.props[index as usize]).name.to_string()
     }
 
-    // Go: checker/relater.go:1049 TypeDiscriminator.matches
+    // Go: checker/relater.go:1044 TypeDiscriminator.matches
     fn matches(&mut self, c: &mut Checker, index: i32, t: TypeId) -> bool {
         let prop_type = c.get_type_of_symbol(self.props[index as usize]);
         for s in c.ty(prop_type).distributed() {
@@ -293,7 +293,7 @@ impl<'a> Discriminator for TypeDiscriminator<'a> {
 
 impl Checker {
     // Keep this up-to-date with the same logic within `getApparentTypeOfContextualType`, since they should behave similarly
-    // Go: checker/relater.go:1060 findMatchingDiscriminantType
+    // Go: checker/relater.go:1055 findMatchingDiscriminantType
     pub fn find_matching_discriminant_type(
         &mut self,
         source: TypeId,
@@ -328,7 +328,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/relater.go:1075 findDiscriminantProperties
+    // Go: checker/relater.go:1070 findDiscriminantProperties
     pub fn find_discriminant_properties(
         &mut self,
         source_properties: &[SymbolId],
@@ -344,7 +344,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/relater.go:1085 isDiscriminantProperty
+    // Go: checker/relater.go:1080 isDiscriminantProperty
     pub fn is_discriminant_property(&mut self, t: TypeId, name: &str) -> bool {
         if t.is_some() && self.ty(t).flags.intersects(TypeFlags::UNION) {
             let prop = self.get_union_or_intersection_property(
@@ -383,7 +383,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/relater.go:1101 getMatchingUnionConstituentForType
+    // Go: checker/relater.go:1096 getMatchingUnionConstituentForType
     pub fn get_matching_union_constituent_for_type(
         &mut self,
         union_type: TypeId,
@@ -403,7 +403,7 @@ impl Checker {
     // Return the name of a discriminant property for which it was possible and feasible to construct a map of
     // constituent types keyed by the literal types of the property by that name in each constituent type. Return
     // an empty string if no such discriminant property exists.
-    // Go: checker/relater.go:1116 getKeyPropertyName
+    // Go: checker/relater.go:1111 getKeyPropertyName
     pub fn get_key_property_name(&mut self, t: TypeId) -> String {
         if self.ty(t).as_union_type().key_property_name.is_empty() {
             let (key_property_name, constituent_map) = self.compute_key_property_name_and_map(t);
@@ -420,7 +420,7 @@ impl Checker {
 
     // Given a union type for which getKeyPropertyName returned a non-empty string, return the constituent
     // that corresponds to the given key type for that property name.
-    // Go: checker/relater.go:1129 getConstituentTypeForKeyType
+    // Go: checker/relater.go:1124 getConstituentTypeForKeyType
     pub fn get_constituent_type_for_key_type(&mut self, t: TypeId, key_type: TypeId) -> TypeId {
         let key = self.get_regular_type_of_literal_type(key_type);
         let result = self
@@ -436,7 +436,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/relater.go:1137 computeKeyPropertyNameAndMap
+    // Go: checker/relater.go:1132 computeKeyPropertyNameAndMap
     pub fn compute_key_property_name_and_map(
         &mut self,
         t: TypeId,
@@ -467,14 +467,14 @@ impl Checker {
     }
 
     // PORT: Go package function; reads type data, so it is a `Checker` method.
-    // Go: checker/relater.go:1153 isObjectOrInstantiableNonPrimitive
+    // Go: checker/relater.go:1148 isObjectOrInstantiableNonPrimitive
     pub fn is_object_or_instantiable_non_primitive(&self, t: TypeId) -> bool {
         self.ty(t)
             .flags
             .intersects(TypeFlags::OBJECT | TypeFlags::INSTANTIABLE_NON_PRIMITIVE)
     }
 
-    // Go: checker/relater.go:1157 getKeyPropertyCandidateName
+    // Go: checker/relater.go:1152 getKeyPropertyCandidateName
     pub fn get_key_property_candidate_name(&mut self, types: &[TypeId]) -> String {
         for &t in types {
             if self
@@ -497,7 +497,7 @@ impl Checker {
     // types of the property by that name in each constituent type. No map is returned if some key property
     // has a non-literal type or if less than 10 or less than 50% of the constituents have a unique key.
     // Entries with duplicate keys have unknownType as the value.
-    // Go: checker/relater.go:1174 mapTypesByKeyProperty
+    // Go: checker/relater.go:1169 mapTypesByKeyProperty
     pub fn map_types_by_key_property(
         &mut self,
         types: &[TypeId],
@@ -535,7 +535,7 @@ impl Checker {
         None
     }
 
-    // Go: checker/relater.go:1212 discriminateTypeByDiscriminableItems
+    // Go: checker/relater.go:1205 discriminateTypeByDiscriminableItems
     pub fn discriminate_type_by_discriminable_items(
         &mut self,
         target: TypeId,
@@ -597,7 +597,7 @@ impl Checker {
         target
     }
 
-    // Go: checker/relater.go:1265 filterPrimitivesIfContainsNonPrimitive
+    // Go: checker/relater.go:1256 filterPrimitivesIfContainsNonPrimitive
     pub fn filter_primitives_if_contains_non_primitive(&mut self, union_type: TypeId) -> TypeId {
         if self.maybe_type_of_kind(union_type, TypeFlags::NON_PRIMITIVE) {
             let result = self.filter_type(union_type, &mut |c: &mut Checker, t: TypeId| {
@@ -611,12 +611,12 @@ impl Checker {
     }
 
     // PORT: Go package function; reads type data, so it is a `Checker` method.
-    // Go: checker/relater.go:1275 isNonPrimitiveType
+    // Go: checker/relater.go:1266 isNonPrimitiveType
     pub fn is_non_primitive_type(&self, t: TypeId) -> bool {
         !self.ty(t).flags.intersects(TypeFlags::PRIMITIVE)
     }
 
-    // Go: checker/relater.go:1279 getTypeNamesForErrorDisplay
+    // Go: checker/relater.go:1270 getTypeNamesForErrorDisplay
     pub fn get_type_names_for_error_display(
         &mut self,
         left: TypeId,
@@ -645,7 +645,7 @@ impl Checker {
         (left_str, right_str)
     }
 
-    // Go: checker/relater.go:1296 getTypeNameForErrorDisplay
+    // Go: checker/relater.go:1290 getTypeNameForErrorDisplay
     pub fn get_type_name_for_error_display(&mut self, t: TypeId) -> String {
         self.type_to_string_ex(
             t,
@@ -655,7 +655,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/relater.go:1300 symbolValueDeclarationIsContextSensitive
+    // Go: checker/relater.go:1294 symbolValueDeclarationIsContextSensitive
     pub fn symbol_value_declaration_is_context_sensitive(&mut self, symbol: SymbolId) -> bool {
         if symbol.is_nil() {
             return false;
@@ -666,7 +666,7 @@ impl Checker {
             && !self.is_context_sensitive(value_declaration)
     }
 
-    // Go: checker/relater.go:1304 typeCouldHaveTopLevelSingletonTypes
+    // Go: checker/relater.go:1298 typeCouldHaveTopLevelSingletonTypes
     pub fn type_could_have_top_level_singleton_types(&mut self, t: TypeId) -> bool {
         // Okay, yes, 'boolean' is a union of 'true | false', but that's not useful
         // in error reporting scenarios. If you need to use this function but that detail matters,
@@ -698,7 +698,7 @@ impl Checker {
             || self.ty(t).flags.intersects(TypeFlags::STRING_MAPPING)
     }
 
-    // Go: checker/relater.go:1323 getVariances
+    // Go: checker/relater.go:1317 getVariances
     pub fn get_variances(&mut self, t: TypeId) -> SharedList<VarianceFlags> {
         // Arrays and tuples are known to be covariant, no need to spend time computing this.
         if t == self.global_array_type
@@ -717,7 +717,7 @@ impl Checker {
         self.get_variances_worker(symbol, &type_parameters)
     }
 
-    // Go: checker/relater.go:1331 getAliasVariances
+    // Go: checker/relater.go:1325 getAliasVariances
     pub fn get_alias_variances(&mut self, symbol: SymbolId) -> SharedList<VarianceFlags> {
         let type_parameters = self.type_alias_links.get(symbol).type_parameters.clone();
         self.get_variances_worker(symbol, &type_parameters)
@@ -897,7 +897,7 @@ impl Checker {
             .position(|entry| entry.symbol == symbol)
     }
 
-    // Go: checker/relater.go:1412 createMarkerType
+    // Go: checker/relater.go:1446 createMarkerType
     pub fn create_marker_type(
         &mut self,
         symbol: SymbolId,
@@ -923,12 +923,12 @@ impl Checker {
         result
     }
 
-    // Go: checker/relater.go:1429 isMarkerType
+    // Go: checker/relater.go:1462 isMarkerType
     pub fn is_marker_type(&self, t: TypeId) -> bool {
         self.marker_types.contains(&t)
     }
 
-    // Go: checker/relater.go:1433 getTypeParameterModifiers
+    // Go: checker/relater.go:1466 getTypeParameterModifiers
     pub fn get_type_parameter_modifiers(&mut self, tp: TypeId) -> ModifierFlags {
         let mut flags = ModifierFlags::default();
         let symbol = self.ty(tp).symbol;
@@ -943,7 +943,7 @@ impl Checker {
 
     // Return true if the given type reference has a 'void' type argument for a covariant type parameter.
     // See comment at call in recursiveTypeRelatedTo for when this case matters.
-    // Go: checker/relater.go:1445 hasCovariantVoidArgument
+    // Go: checker/relater.go:1478 hasCovariantVoidArgument
     pub fn has_covariant_void_argument(
         &self,
         type_arguments: &[TypeId],
@@ -959,7 +959,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/relater.go:1454 isSignatureAssignableTo
+    // Go: checker/relater.go:1487 isSignatureAssignableTo
     pub fn is_signature_assignable_to(
         &mut self,
         source: SignatureId,
@@ -984,7 +984,7 @@ impl Checker {
 
     // PORT: a nil Go `ErrorReporter` is `None`. Go only calls it when
     // `reportErrors` is true, and then it is never nil.
-    // Go: checker/relater.go:1458 compareSignaturesRelated
+    // Go: checker/relater.go:1491 compareSignaturesRelated
     pub fn compare_signatures_related(
         &mut self,
         source: SignatureId,
@@ -1297,7 +1297,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/relater.go:1642 compareTypePredicateRelatedTo
+    // Go: checker/relater.go:1675 compareTypePredicateRelatedTo
     pub fn compare_type_predicate_related_to(
         &mut self,
         source: TypePredicateId,
@@ -1365,7 +1365,7 @@ impl Checker {
     }
 
     // Returns true if `s` is `(...args: A) => R` where `A` is `any`, `any[]`, `never`, or `never[]`, and `R` is `any` or `unknown`.
-    // Go: checker/relater.go:1675 isTopSignature
+    // Go: checker/relater.go:1708 isTopSignature
     pub fn is_top_signature(&mut self, s: SignatureId) -> bool {
         let this_parameter = self.sig(s).this_parameter;
         if self.sig(s).type_parameters.is_empty()
@@ -1401,7 +1401,7 @@ impl Checker {
     // parameter. For example, the parameter count of (x: number, y: number, ...z: string[]) is 3 and
     // the parameter count of (x: number, ...args: [number, ...string[], boolean])) is also 3. In the
     // latter example, the effective rest type is [...string[], boolean].
-    // Go: checker/relater.go:1693 getParameterCount
+    // Go: checker/relater.go:1726 getParameterCount
     pub fn get_parameter_count(&mut self, signature: SignatureId) -> i32 {
         let length = self.sig(signature).parameters.len() as i32;
         if self.signature_has_rest_parameter(signature) {
@@ -1420,12 +1420,12 @@ impl Checker {
         length
     }
 
-    // Go: checker/relater.go:1704 getMinArgumentCount
+    // Go: checker/relater.go:1737 getMinArgumentCount
     pub fn get_min_argument_count(&mut self, signature: SignatureId) -> i32 {
         self.get_min_argument_count_ex(signature, MinArgumentCountFlags::NONE)
     }
 
-    // Go: checker/relater.go:1708 getMinArgumentCountEx
+    // Go: checker/relater.go:1741 getMinArgumentCountEx
     pub fn get_min_argument_count_ex(
         &mut self,
         signature: SignatureId,
@@ -1486,7 +1486,7 @@ impl Checker {
         self.sig(signature).resolved_min_argument_count
     }
 
-    // Go: checker/relater.go:1749 hasEffectiveRestParameter
+    // Go: checker/relater.go:1782 hasEffectiveRestParameter
     pub fn has_effective_rest_parameter(&mut self, signature: SignatureId) -> bool {
         if self.signature_has_rest_parameter(signature) {
             let parameters_len = self.sig(signature).parameters.len();
@@ -1501,7 +1501,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/relater.go:1757 getTypeAtPosition
+    // Go: checker/relater.go:1790 getTypeAtPosition
     pub fn get_type_at_position(&mut self, signature: SignatureId, pos: i32) -> TypeId {
         let t = self.try_get_type_at_position(signature, pos);
         if t.is_some() {
@@ -1510,7 +1510,7 @@ impl Checker {
         self.any_type
     }
 
-    // Go: checker/relater.go:1765 tryGetTypeAtPosition
+    // Go: checker/relater.go:1798 tryGetTypeAtPosition
     pub fn try_get_type_at_position(&mut self, signature: SignatureId, pos: i32) -> TypeId {
         let param_count = self.sig(signature).parameters.len() as i32
             - if self.signature_has_rest_parameter(signature) {
@@ -1519,6 +1519,11 @@ impl Checker {
                 0
             };
         if pos < param_count {
+            // PORT: Go indexes with the int `pos`, so a negative one (an API
+            // argument index) panics with the runtime text.
+            if pos < 0 {
+                crate::core::go_panic(format!("runtime error: index out of range [{pos}]"));
+            }
             let parameter = self.sig(signature).parameters[pos as usize];
             return self.get_type_of_parameter(parameter);
         }
@@ -1546,7 +1551,7 @@ impl Checker {
     // Return the rest type at the given position, transforming `any[]` into just `any`. We do this because
     // in signatures we want `any[]` in a rest position to be compatible with anything, but `any[]` isn't
     // assignable to tuple types with required elements.
-    // Go: checker/relater.go:1786 getRestOrAnyTypeAtPosition
+    // Go: checker/relater.go:1819 getRestOrAnyTypeAtPosition
     pub fn get_rest_or_any_type_at_position(&mut self, source: SignatureId, pos: i32) -> TypeId {
         let rest_type = self.get_rest_type_at_position(source, pos, false);
         if rest_type.is_some() {
@@ -1558,7 +1563,7 @@ impl Checker {
         rest_type
     }
 
-    // Go: checker/relater.go:1796 getRestTypeAtPosition
+    // Go: checker/relater.go:1829 getRestTypeAtPosition
     pub fn get_rest_type_at_position(
         &mut self,
         source: SignatureId,

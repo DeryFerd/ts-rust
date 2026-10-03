@@ -9,7 +9,7 @@ use crate::frontend::prelude::*;
 // argument is moved into a local first, in the Go order.
 
 impl<'a> Parser<'a> {
-    // Go: parser.go:4184 parseYieldExpression
+    // Go: parser.go:4230 parseYieldExpression
     pub fn parse_yield_expression(&mut self) -> Node {
         let pos = self.node_pos();
         // YieldExpression[In] :
@@ -37,7 +37,7 @@ impl<'a> Parser<'a> {
         self.finish_node(result, pos)
     }
 
-    // Go: parser.go:4202 isParenthesizedArrowFunctionExpression
+    // Go: parser.go:4248 isParenthesizedArrowFunctionExpression
     pub fn is_parenthesized_arrow_function_expression(&mut self) -> Tristate {
         if self.token == SyntaxKind::OpenParenToken
             || self.token == SyntaxKind::LessThanToken
@@ -58,7 +58,7 @@ impl<'a> Parser<'a> {
         Tristate::False
     }
 
-    // Go: parser.go:4219 nextIsParenthesizedArrowFunctionExpression
+    // Go: parser.go:4265 nextIsParenthesizedArrowFunctionExpression
     pub fn next_is_parenthesized_arrow_function_expression(&mut self) -> Tristate {
         if self.token == SyntaxKind::AsyncKeyword {
             self.next_token();
@@ -180,7 +180,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:4327 tryParseParenthesizedArrowFunctionExpression
+    // Go: parser.go:4373 tryParseParenthesizedArrowFunctionExpression
     pub fn try_parse_parenthesized_arrow_function_expression(
         &mut self,
         allow_return_type_in_arrow_function: bool,
@@ -210,7 +210,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:4348 parseParenthesizedArrowFunctionExpression
+    // Go: parser.go:4394 parseParenthesizedArrowFunctionExpression
     pub fn parse_parenthesized_arrow_function_expression(
         &mut self,
         allow_ambiguity: bool,
@@ -337,7 +337,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:4446 parseModifiersForArrowFunction
+    // Go: parser.go:4492 parseModifiersForArrowFunction
     pub fn parse_modifiers_for_arrow_function(&mut self) -> ModifierList {
         if self.token == SyntaxKind::AsyncKeyword {
             let pos = self.node_pos();
@@ -350,7 +350,7 @@ impl<'a> Parser<'a> {
         ModifierList::NIL
     }
 
-    // Go: parser.go:4469 parseArrowFunctionExpressionBody
+    // Go: parser.go:4515 parseArrowFunctionExpressionBody
     pub fn parse_arrow_function_expression_body(
         &mut self,
         is_async: bool,
@@ -405,7 +405,7 @@ impl<'a> Parser<'a> {
         node
     }
 
-    // Go: parser.go:4498 isStartOfExpressionStatement
+    // Go: parser.go:4544 isStartOfExpressionStatement
     pub fn is_start_of_expression_statement(&mut self) -> bool {
         // As per the grammar, none of '{' or 'function' or 'class' can start an expression statement.
         self.token != SyntaxKind::OpenBraceToken
@@ -415,7 +415,7 @@ impl<'a> Parser<'a> {
             && self.is_start_of_expression()
     }
 
-    // Go: parser.go:4503 parsePossibleParenthesizedArrowFunctionExpression
+    // Go: parser.go:4549 parsePossibleParenthesizedArrowFunctionExpression
     pub fn parse_possible_parenthesized_arrow_function_expression(
         &mut self,
         allow_return_type_in_arrow_function: bool,
@@ -434,7 +434,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:4515 tryParseAsyncSimpleArrowFunctionExpression
+    // Go: parser.go:4561 tryParseAsyncSimpleArrowFunctionExpression
     pub fn try_parse_async_simple_arrow_function_expression(
         &mut self,
         allow_return_type_in_arrow_function: bool,
@@ -458,7 +458,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser.go:4527 nextIsUnParenthesizedAsyncArrowFunction
+    // Go: parser.go:4573 nextIsUnParenthesizedAsyncArrowFunction
     pub fn next_is_un_parenthesized_async_arrow_function(&mut self) -> bool {
         // AsyncArrowFunctionExpression:
         //      1) async[no LineTerminator here]AsyncArrowBindingIdentifier[?Yield][no LineTerminator here]=>AsyncConciseBody[?In]
@@ -481,7 +481,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    // Go: parser.go:4547 parseSimpleArrowFunctionExpression
+    // Go: parser.go:4594 parseSimpleArrowFunctionExpression
     pub fn parse_simple_arrow_function_expression(
         &mut self,
         pos: i32,
@@ -524,7 +524,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:4558 parseConditionalExpressionRest
+    // Go: parser.go:4605 parseConditionalExpressionRest
     pub fn parse_conditional_expression_rest(
         &mut self,
         left_operand: Node,
@@ -560,14 +560,14 @@ impl<'a> Parser<'a> {
         self.finish_node(conditional, pos)
     }
 
-    // Go: parser.go:4580 parseBinaryExpressionOrHigher
+    // Go: parser.go:4627 parseBinaryExpressionOrHigher
     pub fn parse_binary_expression_or_higher(&mut self, precedence: OperatorPrecedence) -> Node {
         let pos = self.node_pos();
         let left_operand = self.parse_unary_expression_or_higher();
         self.parse_binary_expression_rest(precedence, left_operand, pos)
     }
 
-    // Go: parser.go:4586 parseBinaryExpressionRest
+    // Go: parser.go:4642 parseBinaryExpressionRest
     pub fn parse_binary_expression_rest(
         &mut self,
         precedence: OperatorPrecedence,
@@ -654,21 +654,21 @@ impl<'a> Parser<'a> {
         left_operand
     }
 
-    // Go: parser.go:4662 makeSatisfiesExpression
+    // Go: parser.go:4713 makeSatisfiesExpression
     pub fn make_satisfies_expression(&mut self, expression: Node, type_node: Node) -> Node {
         let node = self.factory.new_satisfies_expression(expression, type_node);
         let node = self.finish_node(node, expression.pos());
         self.check_js_syntax(node)
     }
 
-    // Go: parser.go:4666 makeAsExpression
+    // Go: parser.go:4717 makeAsExpression
     pub fn make_as_expression(&mut self, left: Node, right: Node) -> Node {
         let node = self.factory.new_as_expression(left, right);
         let node = self.finish_node(node, left.pos());
         self.check_js_syntax(node)
     }
 
-    // Go: parser.go:4670 makeBinaryExpression
+    // Go: parser.go:4721 makeBinaryExpression
     pub fn make_binary_expression(
         &mut self,
         left: Node,
@@ -686,7 +686,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:4674 parseUnaryExpressionOrHigher
+    // Go: parser.go:4725 parseUnaryExpressionOrHigher
     pub fn parse_unary_expression_or_higher(&mut self) -> Node {
         // ES7 UpdateExpression:
         //      1) LeftHandSideExpression[?Yield]
@@ -740,7 +740,7 @@ impl<'a> Parser<'a> {
         simple_unary_expression
     }
 
-    // Go: parser.go:4713 isUpdateExpression
+    // Go: parser.go:4764 isUpdateExpression
     pub fn is_update_expression(&self) -> bool {
         match self.token {
             SyntaxKind::PlusToken
@@ -756,7 +756,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:4723 parseUpdateExpression
+    // Go: parser.go:4774 parseUpdateExpression
     pub fn parse_update_expression(&mut self) -> Node {
         let pos = self.node_pos();
         if self.token == SyntaxKind::PlusPlusToken || self.token == SyntaxKind::MinusMinusToken {
@@ -791,7 +791,7 @@ impl<'a> Parser<'a> {
         expression
     }
 
-    // Go: parser.go:4742 parseJsxElementOrSelfClosingElementOrFragment
+    // Go: parser.go:4793 parseJsxElementOrSelfClosingElementOrFragment
     pub fn parse_jsx_element_or_self_closing_element_or_fragment(
         &mut self,
         in_expression_context: bool,
@@ -956,7 +956,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:4822 parseJsxChildren
+    // Go: parser.go:4873 parseJsxChildren
     pub fn parse_jsx_children(&mut self, opening_tag: Node) -> NodeList {
         let pos = self.node_pos();
         let save_parsing_contexts = self.parsing_contexts;
@@ -991,7 +991,7 @@ impl<'a> Parser<'a> {
         self.new_node_list(TextRange::new(pos, end), &list)
     }
 
-    // Go: parser.go:4845 parseJsxChild
+    // Go: parser.go:4896 parseJsxChild
     pub fn parse_jsx_child(&mut self, opening_tag: Node, token: SyntaxKind) -> Node {
         match token {
             SyntaxKind::EndOfFile => {
@@ -1038,7 +1038,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:4873 parseJsxText
+    // Go: parser.go:4924 parseJsxText
     pub fn parse_jsx_text(&mut self) -> Node {
         let pos = self.node_pos();
         let text = self.scanner.token_value();
@@ -1049,7 +1049,7 @@ impl<'a> Parser<'a> {
         self.finish_node(result, pos)
     }
 
-    // Go: parser.go:4880 parseJsxExpression
+    // Go: parser.go:4931 parseJsxExpression
     pub fn parse_jsx_expression(&mut self, in_expression_context: bool) -> Node {
         let pos = self.node_pos();
         if !self.parse_expected(SyntaxKind::OpenBraceToken) {
@@ -1077,25 +1077,25 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:4904 scanJsxText
+    // Go: parser.go:4955 scanJsxText
     pub fn scan_jsx_text(&mut self) -> SyntaxKind {
         self.token = self.scanner.scan_jsx_token();
         self.token
     }
 
-    // Go: parser.go:4909 scanJsxIdentifier
+    // Go: parser.go:4960 scanJsxIdentifier
     pub fn scan_jsx_identifier(&mut self) -> SyntaxKind {
         self.token = self.scanner.scan_jsx_identifier();
         self.token
     }
 
-    // Go: parser.go:4914 scanJsxAttributeValue
+    // Go: parser.go:4965 scanJsxAttributeValue
     pub fn scan_jsx_attribute_value(&mut self) -> SyntaxKind {
         self.token = self.scanner.scan_jsx_attribute_value();
         self.token
     }
 
-    // Go: parser.go:4919 parseJsxClosingElement
+    // Go: parser.go:4970 parseJsxClosingElement
     pub fn parse_jsx_closing_element(&mut self, open: Node, in_expression_context: bool) -> Node {
         let pos = self.node_pos();
         self.parse_expected(SyntaxKind::LessThanSlashToken);
@@ -1116,7 +1116,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:4934 parseJsxOpeningOrSelfClosingElementOrOpeningFragment
+    // Go: parser.go:4985 parseJsxOpeningOrSelfClosingElementOrOpeningFragment
     pub fn parse_jsx_opening_or_self_closing_element_or_opening_fragment(
         &mut self,
         in_expression_context: bool,
@@ -1160,7 +1160,7 @@ impl<'a> Parser<'a> {
         self.finish_node(result, pos)
     }
 
-    // Go: parser.go:4969 parseJsxElementName
+    // Go: parser.go:5020 parseJsxElementName
     pub fn parse_jsx_element_name(&mut self) -> Node {
         let pos = self.node_pos();
         // JsxElement can have name in the form of
@@ -1190,7 +1190,7 @@ impl<'a> Parser<'a> {
         expression
     }
 
-    // Go: parser.go:4987 parseJsxTagName
+    // Go: parser.go:5038 parseJsxTagName
     pub fn parse_jsx_tag_name(&mut self) -> Node {
         let pos = self.node_pos();
         self.scan_jsx_identifier();
@@ -1209,7 +1209,7 @@ impl<'a> Parser<'a> {
         tag_name
     }
 
-    // Go: parser.go:5003 parseJsxAttributes
+    // Go: parser.go:5054 parseJsxAttributes
     pub fn parse_jsx_attributes(&mut self) -> Node {
         let pos = self.node_pos();
         let properties =
@@ -1218,7 +1218,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5008 parseJsxAttribute
+    // Go: parser.go:5059 parseJsxAttribute
     pub fn parse_jsx_attribute(&mut self) -> Node {
         if self.token == SyntaxKind::OpenBraceToken {
             return self.parse_jsx_spread_attribute();
@@ -1230,7 +1230,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5016 parseJsxSpreadAttribute
+    // Go: parser.go:5067 parseJsxSpreadAttribute
     pub fn parse_jsx_spread_attribute(&mut self) -> Node {
         let pos = self.node_pos();
         self.parse_expected(SyntaxKind::OpenBraceToken);
@@ -1241,7 +1241,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5025 parseJsxAttributeName
+    // Go: parser.go:5076 parseJsxAttributeName
     pub fn parse_jsx_attribute_name(&mut self) -> Node {
         let pos = self.node_pos();
         self.scan_jsx_identifier();
@@ -1255,7 +1255,7 @@ impl<'a> Parser<'a> {
         attr_name
     }
 
-    // Go: parser.go:5036 parseJsxAttributeValue
+    // Go: parser.go:5087 parseJsxAttributeValue
     pub fn parse_jsx_attribute_value(&mut self) -> Node {
         if self.token == SyntaxKind::EqualsToken {
             if self.scan_jsx_attribute_value() == SyntaxKind::StringLiteral {
@@ -1279,7 +1279,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser.go:5052 parseJsxClosingFragment
+    // Go: parser.go:5105 parseJsxClosingFragment
     pub fn parse_jsx_closing_fragment(&mut self, in_expression_context: bool) -> Node {
         let pos = self.node_pos();
         self.parse_expected(SyntaxKind::LessThanSlashToken);
@@ -1299,7 +1299,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5066 parseSimpleUnaryExpression
+    // Go: parser.go:5119 parseSimpleUnaryExpression
     pub fn parse_simple_unary_expression(&mut self) -> Node {
         match { self.token } {
             SyntaxKind::PlusToken
@@ -1331,7 +1331,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:5096 parsePrefixUnaryExpression
+    // Go: parser.go:5149 parsePrefixUnaryExpression
     pub fn parse_prefix_unary_expression(&mut self) -> Node {
         let pos = self.node_pos();
         let operator = self.token;
@@ -1341,7 +1341,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5103 parseDeleteExpression
+    // Go: parser.go:5156 parseDeleteExpression
     pub fn parse_delete_expression(&mut self) -> Node {
         let pos = self.node_pos();
         self.next_token();
@@ -1350,7 +1350,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5109 parseTypeOfExpression
+    // Go: parser.go:5162 parseTypeOfExpression
     pub fn parse_type_of_expression(&mut self) -> Node {
         let pos = self.node_pos();
         self.next_token();
@@ -1359,7 +1359,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5115 parseVoidExpression
+    // Go: parser.go:5168 parseVoidExpression
     pub fn parse_void_expression(&mut self) -> Node {
         let pos = self.node_pos();
         self.next_token();
@@ -1368,7 +1368,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5121 isAwaitExpression
+    // Go: parser.go:5174 isAwaitExpression
     pub fn is_await_expression(&mut self) -> bool {
         if self.token == SyntaxKind::AwaitKeyword {
             if self.in_await_context() {
@@ -1381,7 +1381,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    // Go: parser.go:5132 parseAwaitExpression
+    // Go: parser.go:5185 parseAwaitExpression
     pub fn parse_await_expression(&mut self) -> Node {
         let pos = self.node_pos();
         self.next_token();
@@ -1390,7 +1390,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5138 parseTypeAssertion
+    // Go: parser.go:5191 parseTypeAssertion
     pub fn parse_type_assertion(&mut self) -> Node {
         debug_assert!(
             self.language_variant != LanguageVariant::JSX,
@@ -1405,7 +1405,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5148 parseLeftHandSideExpressionOrHigher
+    // Go: parser.go:5201 parseLeftHandSideExpressionOrHigher
     pub fn parse_left_hand_side_expression_or_higher(&mut self) -> Node {
         // Original Ecma:
         // LeftHandSideExpression: See 11.2
@@ -1483,12 +1483,12 @@ impl<'a> Parser<'a> {
         self.parse_call_expression_rest(pos, expression)
     }
 
-    // Go: parser.go:5217 nextTokenIsDot
+    // Go: parser.go:5270 nextTokenIsDot
     pub fn next_token_is_dot(&mut self) -> bool {
         self.next_token() == SyntaxKind::DotToken
     }
 
-    // Go: parser.go:5221 parseSuperExpression
+    // Go: parser.go:5274 parseSuperExpression
     pub fn parse_super_expression(&mut self) -> Node {
         let pos = self.node_pos();
         let mut expression = self.parse_keyword_expression();
@@ -1538,13 +1538,13 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5244 isTemplateStartOfTaggedTemplate
+    // Go: parser.go:5297 isTemplateStartOfTaggedTemplate
     pub fn is_template_start_of_tagged_template(&self) -> bool {
         self.token == SyntaxKind::NoSubstitutionTemplateLiteral
             || self.token == SyntaxKind::TemplateHead
     }
 
-    // Go: parser.go:5247 tryParseTypeArgumentsInExpression
+    // Go: parser.go:5301 tryParseTypeArgumentsInExpression
     pub fn try_parse_type_arguments_in_expression(&mut self) -> NodeList {
         // TypeArguments must not be parsed in JavaScript files to avoid ambiguity with binary operators.
         // Check the cheap preconditions before saving the parser state: unless the current token is `<`
@@ -1577,7 +1577,7 @@ impl<'a> Parser<'a> {
         NodeList::NIL
     }
 
-    // Go: parser.go:5270 canFollowTypeArgumentsInExpression
+    // Go: parser.go:5329 canFollowTypeArgumentsInExpression
     pub fn can_follow_type_arguments_in_expression(&mut self) -> bool {
         match self.token {
             // These tokens can follow a type argument list in a call expression:
@@ -1603,7 +1603,7 @@ impl<'a> Parser<'a> {
             || !self.is_start_of_expression()
     }
 
-    // Go: parser.go:5289 parseMemberExpressionOrHigher
+    // Go: parser.go:5348 parseMemberExpressionOrHigher
     pub fn parse_member_expression_or_higher(&mut self) -> Node {
         // Note: to make our lives simpler, we decompose the NewExpression productions and
         // place ObjectCreationExpression and FunctionExpression into PrimaryExpression.
@@ -1657,7 +1657,7 @@ impl<'a> Parser<'a> {
         self.parse_member_expression_rest(pos, expression, true /*allowOptionalChain*/)
     }
 
-    // Go: parser.go:5342 parseMemberExpressionRest
+    // Go: parser.go:5401 parseMemberExpressionRest
     pub fn parse_member_expression_rest(
         &mut self,
         pos: i32,
@@ -1736,14 +1736,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:5388 isStartOfOptionalPropertyOrElementAccessChain
+    // Go: parser.go:5447 isStartOfOptionalPropertyOrElementAccessChain
     pub fn is_start_of_optional_property_or_element_access_chain(&mut self) -> bool {
         self.token == SyntaxKind::QuestionDotToken
             && self
                 .look_ahead(Parser::next_token_is_identifier_or_keyword_or_open_bracket_or_template)
     }
 
-    // Go: parser.go:5392 nextTokenIsIdentifierOrKeywordOrOpenBracketOrTemplate
+    // Go: parser.go:5451 nextTokenIsIdentifierOrKeywordOrOpenBracketOrTemplate
     pub fn next_token_is_identifier_or_keyword_or_open_bracket_or_template(&mut self) -> bool {
         self.next_token();
         token_is_identifier_or_keyword(self.token)
@@ -1751,7 +1751,7 @@ impl<'a> Parser<'a> {
             || self.is_template_start_of_tagged_template()
     }
 
-    // Go: parser.go:5397 parsePropertyAccessExpressionRest
+    // Go: parser.go:5456 parsePropertyAccessExpressionRest
     pub fn parse_property_access_expression_rest(
         &mut self,
         pos: i32,
@@ -1800,7 +1800,7 @@ impl<'a> Parser<'a> {
         self.finish_node(property_access, pos)
     }
 
-    // Go: parser.go:5414 tryReparseOptionalChain
+    // Go: parser.go:5473 tryReparseOptionalChain
     pub fn try_reparse_optional_chain(&mut self, mut node: Node) -> bool {
         if node.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
             return true;
@@ -1825,7 +1825,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    // Go: parser.go:5436 parseElementAccessExpressionRest
+    // Go: parser.go:5495 parseElementAccessExpressionRest
     pub fn parse_element_access_expression_rest(
         &mut self,
         pos: i32,
@@ -1860,7 +1860,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5458 parseCallExpressionRest
+    // Go: parser.go:5507 parseCallExpressionRest
     pub fn parse_call_expression_rest(&mut self, pos: i32, mut expression: Node) -> Node {
         loop {
             expression = self
@@ -1924,7 +1924,7 @@ impl<'a> Parser<'a> {
         expression
     }
 
-    // Go: parser.go:5494 parseArgumentList
+    // Go: parser.go:5543 parseArgumentList
     pub fn parse_argument_list(&mut self) -> NodeList {
         self.parse_expected(SyntaxKind::OpenParenToken);
         let result = self.parse_delimited_list(
@@ -1935,7 +1935,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:5501 parseArgumentExpression
+    // Go: parser.go:5550 parseArgumentExpression
     pub fn parse_argument_expression(&mut self) -> Node {
         self.do_in_context(
             NodeFlags::DISALLOW_IN_CONTEXT | NodeFlags::DECORATOR_CONTEXT,
@@ -1944,7 +1944,7 @@ impl<'a> Parser<'a> {
         )
     }
 
-    // Go: parser.go:5505 parseArgumentOrArrayLiteralElement
+    // Go: parser.go:5554 parseArgumentOrArrayLiteralElement
     pub fn parse_argument_or_array_literal_element(&mut self) -> Node {
         match self.token {
             SyntaxKind::DotDotDotToken => self.parse_spread_element(),
@@ -1957,7 +1957,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:5515 parseSpreadElement
+    // Go: parser.go:5564 parseSpreadElement
     pub fn parse_spread_element(&mut self) -> Node {
         let pos = self.node_pos();
         self.parse_expected(SyntaxKind::DotDotDotToken);
@@ -1966,7 +1966,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5522 parseTaggedTemplateRest
+    // Go: parser.go:5571 parseTaggedTemplateRest
     pub fn parse_tagged_template_rest(
         &mut self,
         pos: i32,
@@ -1999,7 +1999,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-// Go: parser.go:4457 typeHasArrowFunctionBlockingParseError
+// Go: parser.go:4503 typeHasArrowFunctionBlockingParseError
 // If true, we should abort parsing an error function.
 pub fn type_has_arrow_function_blocking_parse_error(node: Node) -> bool {
     match node.kind() {
@@ -2013,7 +2013,7 @@ pub fn type_has_arrow_function_blocking_parse_error(node: Node) -> bool {
     }
 }
 
-// Go: parser.go:4631 shouldConsumeBinaryOperator
+// Go: parser.go:4635 shouldConsumeBinaryOperator
 // shouldConsumeBinaryOperator reports whether an operator binds before the operator represented by currentPrecedence.
 // At equal precedence, only the right-associative exponentiation operator binds first.
 #[must_use]

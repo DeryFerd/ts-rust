@@ -95,7 +95,7 @@ fn typings_location() -> Rc<str> {
     location
 }
 
-// Go: module/resolver.go:1757 getPackageJsonInfo
+// Go: module/resolver.go:1755 getPackageJsonInfo
 // PORT: Go returns `existing.WithPackageDirectory(packageDirectory)`. The
 // cache key is `<packageDirectory>/package.json`, so the directory already
 // matches and the cached entry is returned as is. Tracing is not ported.
@@ -148,7 +148,7 @@ fn get_package_json_info_for_directory(package_directory: &str) -> Option<Rc<Inf
     None
 }
 
-// Go: module/resolver.go:497 getPackageScopeForPath
+// Go: module/resolver.go:485 getPackageScopeForPath
 fn get_package_scope_for_path(directory: &str) -> Option<Rc<InfoCacheEntry>> {
     tspath::for_each_ancestor_directory_stopping_at_global_cache(
         &typings_location(),
@@ -182,7 +182,7 @@ impl OutputPathsHost for ProgramHost {
 }
 
 impl ModuleSpecifierGenerationHost for ProgramHost {
-    // Go: compiler/program.go:2017 GetSymlinkCache
+    // Go: compiler/program.go:2300 GetSymlinkCache
     fn get_symlink_cache(&self) -> Option<Rc<KnownSymlinks>> {
         if let Some(cached) = with_program_caches(|c| c.known_symlinks.clone()) {
             return Some(cached);
@@ -197,12 +197,12 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
         crate::program::common_source_directory().to_string()
     }
 
-    // Go: compiler/program.go:508 ContentMapperExtensions (tsgo#4712)
+    // Go: compiler/program.go:528 ContentMapperExtensions (tsgo#4712)
     fn content_mapper_extensions(&self) -> Vec<String> {
         crate::program::content_mapper_extensions()
     }
 
-    // Go: compiler/program.go:132 GetGlobalTypingsCacheLocation
+    // Go: compiler/program.go:143 GetGlobalTypingsCacheLocation
     fn get_global_typings_cache_location(&self) -> String {
         typings_location().to_string()
     }
@@ -215,7 +215,7 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
         crate::program::get_current_directory().to_string()
     }
 
-    // Go: compiler/program.go:173 GetProjectReferenceFromSource
+    // Go: compiler/program.go:189 GetProjectReferenceFromSource
     fn get_project_reference_from_source(
         &self,
         path: &tspath::Path,
@@ -223,12 +223,12 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
         crate::program::get_project_reference_from_source(path)
     }
 
-    // Go: compiler/program.go:157 GetRedirectTargets
+    // Go: compiler/program.go:173 GetRedirectTargets
     fn get_redirect_targets(&self, path: &tspath::Path) -> Vec<String> {
         crate::program::get_redirect_targets(path)
     }
 
-    // Go: compiler/program.go:165 GetSourceOfProjectReferenceIfOutputIncluded
+    // Go: compiler/program.go:181 GetSourceOfProjectReferenceIfOutputIncluded
     fn get_source_of_project_reference_if_output_included(&self, file: Node) -> String {
         crate::program::get_source_of_project_reference_if_output_included(file)
     }
@@ -237,7 +237,7 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
         crate::program::file_exists(path)
     }
 
-    // Go: compiler/program.go:137 GetNearestAncestorDirectoryWithPackageJson
+    // Go: compiler/program.go:148 GetNearestAncestorDirectoryWithPackageJson
     fn get_nearest_ancestor_directory_with_package_json(&self, dirname: &str) -> String {
         match get_package_scope_for_path(dirname) {
             Some(scoped) if scoped.exists() => scoped.package_directory.clone(),
@@ -245,7 +245,7 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
         }
     }
 
-    // Go: compiler/program.go:146 GetPackageJsonInfo
+    // Go: compiler/program.go:157 GetPackageJsonInfo
     fn get_package_json_info(&self, pkg_json_path: &str) -> Option<Rc<InfoCacheEntry>> {
         let directory = tspath::get_directory_path(pkg_json_path);
         match get_package_scope_for_path(&directory) {

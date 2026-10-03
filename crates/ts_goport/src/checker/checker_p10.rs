@@ -12,7 +12,7 @@ use smallvec::SmallVec;
 // PORT: Go `diagnosticOutput *[]*ast.Diagnostic` is `Option<&mut Vec<Diagnostic>>`.
 // PORT: a nullable Go `*diagnostics.Message` is `Option<&'static crate::diagnostics::Message>`.
 
-// Go: checker/checker.go:8804 CallState
+// Go: checker/checker.go:9014 CallState
 // PERF: callcopy1. `type_arguments` and `args` hold most lists inline, so a
 // call copies each list once and allocates only for a long one. Go shares
 // `node.TypeArguments()` and `node.Arguments()`; the port needs a `[Node]`
@@ -33,7 +33,7 @@ pub struct CallState {
     pub candidate_for_type_argument_error: SignatureId,
 }
 
-// Go: checker/checker.go:8822 constructorAccessibilityError
+// Go: checker/checker.go:8829 constructorAccessibilityError
 #[derive(Clone, Copy, Debug)]
 pub struct ConstructorAccessibilityError {
     pub kind: ModifierFlags,
@@ -49,7 +49,7 @@ fn set_candidates_out(out: Option<&mut Vec<SignatureId>>, s: &mut CallState) {
 }
 
 impl Checker {
-    // Go: checker/checker.go:8445 resolveCallExpression
+    // Go: checker/checker.go:8645 resolveCallExpression
     pub fn resolve_call_expression(
         &mut self,
         node: Node,
@@ -223,7 +223,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:8549 resolveNewExpression
+    // Go: checker/checker.go:8749 resolveNewExpression
     pub fn resolve_new_expression(
         &mut self,
         node: Node,
@@ -373,7 +373,7 @@ impl Checker {
         self.resolve_error_call(node)
     }
 
-    // Go: checker/checker.go:8827 getConstructorAccessibilityError
+    // Go: checker/checker.go:8834 getConstructorAccessibilityError
     // PORT: Go returns a nil `*constructorAccessibilityError` for no error; here `None`.
     pub fn get_constructor_accessibility_error(
         &mut self,
@@ -416,7 +416,7 @@ impl Checker {
         None
     }
 
-    // Go: checker/checker.go:8654 typeHasProtectedAccessibleBase
+    // Go: checker/checker.go:8864 typeHasProtectedAccessibleBase
     pub fn type_has_protected_accessible_base(&mut self, target: SymbolId, t: TypeId) -> bool {
         let target_type = self.get_target_type(t);
         let base_types = self.get_base_types(target_type);
@@ -462,7 +462,7 @@ impl Checker {
         self.type_has_protected_accessible_base(target, first_base)
     }
 
-    // Go: checker/checker.go:8684 someSignature
+    // Go: checker/checker.go:8894 someSignature
     // PORT: Go package-level func; it reads signature data, so it is a Checker method.
     pub fn some_signature(
         &mut self,
@@ -491,7 +491,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:8693 resolveTaggedTemplateExpression
+    // Go: checker/checker.go:8903 resolveTaggedTemplateExpression
     pub fn resolve_tagged_template_expression(
         &mut self,
         node: Node,
@@ -539,7 +539,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:8717 resolveDecorator
+    // Go: checker/checker.go:8927 resolveDecorator
     pub fn resolve_decorator(
         &mut self,
         node: Node,
@@ -610,7 +610,7 @@ impl Checker {
     // Sometimes, we have a decorator that could accept zero arguments,
     // but is receiving too many arguments as part of the decorator invocation.
     // In those cases, a user may have meant to *call* the expression before using it as a decorator.
-    // Go: checker/checker.go:8753 isPotentiallyUncalledDecorator
+    // Go: checker/checker.go:8963 isPotentiallyUncalledDecorator
     pub fn is_potentially_uncalled_decorator(
         &mut self,
         decorator: Node,
@@ -632,7 +632,7 @@ impl Checker {
     }
 
     // Gets the localized diagnostic head message to use for errors when resolving a decorator as a call expression.
-    // Go: checker/checker.go:8760 getDiagnosticHeadMessageForDecoratorResolution
+    // Go: checker/checker.go:8970 getDiagnosticHeadMessageForDecoratorResolution
     pub fn get_diagnostic_head_message_for_decorator_resolution(
         &mut self,
         node: Node,
@@ -654,7 +654,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:8774 resolveInstanceofExpression
+    // Go: checker/checker.go:8984 resolveInstanceofExpression
     pub fn resolve_instanceof_expression(
         &mut self,
         node: Node,
@@ -712,7 +712,7 @@ impl Checker {
         self.any_signature
     }
 
-    // Go: checker/checker.go:8817 resolveCall
+    // Go: checker/checker.go:9028 resolveCall
     pub fn resolve_call(
         &mut self,
         node: Node,
@@ -881,7 +881,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:8931 reorderCandidates
+    // Go: checker/checker.go:9145 reorderCandidates
     pub fn reorder_candidates(
         &mut self,
         signatures: &[SignatureId],
@@ -938,7 +938,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:8981 signatureHasLiteralTypes
+    // Go: checker/checker.go:9195 signatureHasLiteralTypes
     // PORT: Go package-level func; it reads signature data, so it is a Checker method.
     pub fn signature_has_literal_types(&self, s: SignatureId) -> bool {
         self.sig(s)
@@ -946,7 +946,7 @@ impl Checker {
             .intersects(SignatureFlags::HAS_LITERAL_TYPES)
     }
 
-    // Go: checker/checker.go:8985 getOptionalCallSignature
+    // Go: checker/checker.go:9199 getOptionalCallSignature
     pub fn get_optional_call_signature(
         &mut self,
         signature: SignatureId,
@@ -974,7 +974,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:8999 chooseOverload
+    // Go: checker/checker.go:9213 chooseOverload
     pub fn choose_overload(
         &mut self,
         s: &mut CallState,
@@ -1161,7 +1161,7 @@ impl Checker {
         SignatureId::NIL
     }
 
-    // Go: checker/checker.go:9081 hasCorrectArity
+    // Go: checker/checker.go:9299 hasCorrectArity
     pub fn has_correct_arity(
         &mut self,
         node: Node,
@@ -1256,13 +1256,13 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:9153 acceptsVoid
+    // Go: checker/checker.go:9371 acceptsVoid
     // PORT: Go package-level func; it reads type data, so it is a Checker method.
     pub fn accepts_void(&self, t: TypeId) -> bool {
         self.ty(t).flags.intersects(TypeFlags::VOID)
     }
 
-    // Go: checker/checker.go:9157 getDecoratorArgumentCount
+    // Go: checker/checker.go:9375 getDecoratorArgumentCount
     pub fn get_decorator_argument_count(&mut self, node: Node, signature: SignatureId) -> i32 {
         if self.compiler_options.experimental_decorators.is_true() {
             return self.get_legacy_decorator_argument_count(node, signature);
@@ -1273,7 +1273,7 @@ impl Checker {
     /**
      * Returns the argument count for a decorator node that works like a function invocation.
      */
-    // Go: checker/checker.go:9167 getLegacyDecoratorArgumentCount
+    // Go: checker/checker.go:9385 getLegacyDecoratorArgumentCount
     pub fn get_legacy_decorator_argument_count(
         &mut self,
         node: Node,
@@ -1299,7 +1299,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:9188 hasCorrectTypeArgumentArity
+    // Go: checker/checker.go:9406 hasCorrectTypeArgumentArity
     pub fn has_correct_type_argument_arity(
         &mut self,
         signature: SignatureId,
@@ -1320,7 +1320,7 @@ impl Checker {
         len >= min_type_argument_count && len <= num_type_parameters
     }
 
-    // Go: checker/checker.go:9196 checkTypeArguments
+    // Go: checker/checker.go:9414 checkTypeArguments
     // PORT: Go returns a nil slice on failure; the port returns `None`.
     pub fn check_type_arguments(
         &mut self,
@@ -1388,7 +1388,7 @@ impl Checker {
         Some(type_argument_types)
     }
 
-    // Go: checker/checker.go:9230 isSignatureApplicable
+    // Go: checker/checker.go:9448 isSignatureApplicable
     pub fn is_signature_applicable(
         &mut self,
         node: Node,
@@ -1543,7 +1543,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:9305 maybeAddMissingAwaitInfo
+    // Go: checker/checker.go:9523 maybeAddMissingAwaitInfo
     pub fn maybe_add_missing_await_info(
         &mut self,
         error_node: Node,
@@ -1574,7 +1574,7 @@ impl Checker {
     }
 
     // Returns the `this` argument node in calls like `x.f(...)` and `x[f](...)`. `nil` otherwise.
-    // Go: checker/checker.go:9319 getThisArgumentOfCall
+    // Go: checker/checker.go:9537 getThisArgumentOfCall
     pub fn get_this_argument_of_call(&self, node: Node) -> Node {
         if is_binary_expression(node) {
             return node.right();
@@ -1596,7 +1596,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:9341 getThisArgumentType
+    // Go: checker/checker.go:9559 getThisArgumentType
     pub fn get_this_argument_type(&mut self, node: Node) -> TypeId {
         if node.is_nil() {
             return self.void_type;

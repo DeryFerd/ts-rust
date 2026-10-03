@@ -251,7 +251,7 @@ impl ChangeTrackerWriter {
         new_node
     }
 
-    // Go: printer/changetrackerwriter.go:151 assignPositionsToNodeArray
+    // Go: printer/changetrackerwriter.go:154 assignPositionsToNodeArray
     fn assign_positions_to_node_array(
         &self,
         nodes: NodeList,
@@ -280,145 +280,145 @@ impl ChangeTrackerWriter {
 }
 
 impl EmitTextWriter for ChangeTrackerWriter {
-    // Go: printer/changetrackerwriter.go:173 Write
+    // Go: printer/changetrackerwriter.go:176 Write
     fn write(&mut self, text: &str) {
         self.text_writer.write(text);
         self.set_last_non_trivia_position(text, false);
     }
 
-    // Go: printer/changetrackerwriter.go:178 WriteTrailingSemicolon
+    // Go: printer/changetrackerwriter.go:181 WriteTrailingSemicolon
     fn write_trailing_semicolon(&mut self, text: &str) {
         self.text_writer.write_trailing_semicolon(text);
         self.set_last_non_trivia_position(text, false);
     }
 
-    // Go: printer/changetrackerwriter.go:182 WriteComment
+    // Go: printer/changetrackerwriter.go:185 WriteComment
     fn write_comment(&mut self, text: &str) {
         self.text_writer.write_comment(text);
     }
 
-    // Go: printer/changetrackerwriter.go:183 WriteKeyword
+    // Go: printer/changetrackerwriter.go:186 WriteKeyword
     fn write_keyword(&mut self, text: &str) {
         self.text_writer.write_keyword(text);
         self.set_last_non_trivia_position(text, false);
     }
 
-    // Go: printer/changetrackerwriter.go:188 WriteOperator
+    // Go: printer/changetrackerwriter.go:191 WriteOperator
     fn write_operator(&mut self, text: &str) {
         self.text_writer.write_operator(text);
         self.set_last_non_trivia_position(text, false);
     }
 
-    // Go: printer/changetrackerwriter.go:193 WritePunctuation
+    // Go: printer/changetrackerwriter.go:196 WritePunctuation
     fn write_punctuation(&mut self, text: &str) {
         self.text_writer.write_punctuation(text);
         self.set_last_non_trivia_position(text, false);
     }
 
-    // Go: printer/changetrackerwriter.go:198 WriteSpace
+    // Go: printer/changetrackerwriter.go:201 WriteSpace
     fn write_space(&mut self, text: &str) {
         self.text_writer.write_space(text);
         self.set_last_non_trivia_position(text, false);
     }
 
-    // Go: printer/changetrackerwriter.go:203 WriteStringLiteral
+    // Go: printer/changetrackerwriter.go:206 WriteStringLiteral
     fn write_string_literal(&mut self, text: &str) {
         self.text_writer.write_string_literal(text);
         self.set_last_non_trivia_position(text, false);
     }
 
-    // Go: printer/changetrackerwriter.go:208 WriteParameter
+    // Go: printer/changetrackerwriter.go:211 WriteParameter
     fn write_parameter(&mut self, text: &str) {
         self.text_writer.write_parameter(text);
         self.set_last_non_trivia_position(text, false);
     }
 
-    // Go: printer/changetrackerwriter.go:213 WriteProperty
+    // Go: printer/changetrackerwriter.go:216 WriteProperty
     fn write_property(&mut self, text: &str) {
         self.text_writer.write_property(text);
         self.set_last_non_trivia_position(text, false);
     }
 
-    // Go: printer/changetrackerwriter.go:218 WriteSymbol
+    // Go: printer/changetrackerwriter.go:221 WriteSymbol
     fn write_symbol(&mut self, text: &str, symbol: SymbolId) {
         self.text_writer.write_symbol(text, symbol);
         self.set_last_non_trivia_position(text, false);
     }
 
-    // Go: printer/changetrackerwriter.go:222 WriteLine
+    // Go: printer/changetrackerwriter.go:225 WriteLine
     fn write_line(&mut self) {
         self.text_writer.write_line();
     }
 
-    // Go: printer/changetrackerwriter.go:223 WriteLineForce
+    // Go: printer/changetrackerwriter.go:226 WriteLineForce
     fn write_line_force(&mut self, force: bool) {
         self.text_writer.write_line_force(force);
     }
 
-    // Go: printer/changetrackerwriter.go:224 IncreaseIndent
+    // Go: printer/changetrackerwriter.go:227 IncreaseIndent
     fn increase_indent(&mut self) {
         self.text_writer.increase_indent();
     }
 
-    // Go: printer/changetrackerwriter.go:225 DecreaseIndent
+    // Go: printer/changetrackerwriter.go:228 DecreaseIndent
     fn decrease_indent(&mut self) {
         self.text_writer.decrease_indent();
     }
 
-    // Go: printer/changetrackerwriter.go:226 Clear
+    // Go: printer/changetrackerwriter.go:229 Clear
     fn clear(&mut self) {
         self.text_writer.clear();
         self.positions.borrow_mut().last_non_trivia_position = 0;
     }
 
-    // Go: printer/changetrackerwriter.go:227 String
+    // Go: printer/changetrackerwriter.go:230 String
     fn string(&self) -> String {
         self.text_writer.string()
     }
 
-    // Go: printer/changetrackerwriter.go:228 RawWrite
+    // Go: printer/changetrackerwriter.go:231 RawWrite
     fn raw_write(&mut self, s: &str) {
         self.text_writer.raw_write(s);
         self.set_last_non_trivia_position(s, false);
     }
 
-    // Go: printer/changetrackerwriter.go:233 WriteLiteral
+    // Go: printer/changetrackerwriter.go:236 WriteLiteral
     fn write_literal(&mut self, s: &str) {
         self.text_writer.write_literal(s);
         self.set_last_non_trivia_position(s, true);
     }
 
-    // Go: printer/changetrackerwriter.go:237 GetTextPos
+    // Go: printer/changetrackerwriter.go:240 GetTextPos
     fn get_text_pos(&self) -> i32 {
         self.text_writer.get_text_pos()
     }
 
-    // Go: printer/changetrackerwriter.go:238 GetLine
+    // Go: printer/changetrackerwriter.go:241 GetLine
     fn get_line(&self) -> i32 {
         self.text_writer.get_line()
     }
 
-    // Go: printer/changetrackerwriter.go:239 GetColumn
+    // Go: printer/changetrackerwriter.go:242 GetColumn
     fn get_column(&self) -> i32 {
         self.text_writer.get_column()
     }
 
-    // Go: printer/changetrackerwriter.go:240 GetIndent
+    // Go: printer/changetrackerwriter.go:243 GetIndent
     fn get_indent(&self) -> i32 {
         self.text_writer.get_indent()
     }
 
-    // Go: printer/changetrackerwriter.go:241 IsAtStartOfLine
+    // Go: printer/changetrackerwriter.go:244 IsAtStartOfLine
     fn is_at_start_of_line(&self) -> bool {
         self.text_writer.is_at_start_of_line()
     }
 
-    // Go: printer/changetrackerwriter.go:243 HasTrailingComment
+    // Go: printer/changetrackerwriter.go:246 HasTrailingComment
     fn has_trailing_comment(&self) -> bool {
         self.text_writer.has_trailing_comment()
     }
 
-    // Go: printer/changetrackerwriter.go:245 HasTrailingWhitespace
+    // Go: printer/changetrackerwriter.go:248 HasTrailingWhitespace
     fn has_trailing_whitespace(&self) -> bool {
         self.text_writer.has_trailing_whitespace()
     }

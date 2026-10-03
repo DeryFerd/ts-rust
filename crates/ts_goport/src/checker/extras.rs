@@ -38,7 +38,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/emitresolver.go:685 isConstEnumOrConstEnumOnlyModule
+    // Go: checker/emitresolver.go:693 isConstEnumOrConstEnumOnlyModule
     pub fn is_const_enum_or_const_enum_only_module(&self, s: SymbolId) -> bool {
         self.is_const_enum_symbol(s)
             || self
@@ -63,7 +63,7 @@ impl Checker {
     }
 }
 
-// Go: checker/nodebuilderimpl.go:1176 TryGetModuleSpecifierFromDeclaration
+// Go: checker/nodebuilderimpl.go:1193 TryGetModuleSpecifierFromDeclaration
 pub fn try_get_module_specifier_from_declaration(node: Node) -> Node {
     let res = try_get_module_specifier_from_declaration_worker(node);
     if res.is_nil() || !is_string_literal(res) {
@@ -72,7 +72,7 @@ pub fn try_get_module_specifier_from_declaration(node: Node) -> Node {
     res
 }
 
-// Go: checker/nodebuilderimpl.go:1184 tryGetModuleSpecifierFromDeclarationWorker
+// Go: checker/nodebuilderimpl.go:1201 tryGetModuleSpecifierFromDeclarationWorker
 fn try_get_module_specifier_from_declaration_worker(node: Node) -> Node {
     match node.kind() {
         SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement => {

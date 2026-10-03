@@ -275,7 +275,7 @@ impl WatchManager {
         }
     }
 
-    // Go: watchmanager.go:195 WatchManager.createDirWatchRequest
+    // Go: watchmanager.go:180 WatchManager.createDirWatchRequest
     fn create_dir_watch_request(
         &self,
         dir: &str,
@@ -304,7 +304,7 @@ impl WatchManager {
         }
     }
 
-    // Go: watchmanager.go:210 WatchManager.ResolveDesiredDirs
+    // Go: watchmanager.go:195 WatchManager.ResolveDesiredDirs
     pub fn resolve_desired_dirs(
         &self,
         desired_dirs: &FxHashMap<String, bool>,
@@ -348,7 +348,7 @@ impl WatchManager {
         resolved
     }
 
-    // Go: watchmanager.go:241 WatchManager.ReconcileWatches
+    // Go: watchmanager.go:226 WatchManager.ReconcileWatches
     // PORT: Go ranges over `wm.watchedDirs` while the callbacks delete
     // entries (Go allows that). The port passes a copy of the map and the
     // callbacks change the live map.
@@ -465,7 +465,7 @@ impl WatchManager {
         Err(err)
     }
 
-    // Go: watchmanager.go:322 WatchManager.IsPathUnderWatch
+    // Go: watchmanager.go:345 WatchManager.IsPathUnderWatch
     pub fn is_path_under_watch(&self, path: &str, opts: &tspath::ComparePathsOptions) -> bool {
         let watched_dirs = self.shared.watched_dirs.lock().unwrap();
         for dir in watched_dirs.keys() {
@@ -476,7 +476,7 @@ impl WatchManager {
         false
     }
 
-    // Go: watchmanager.go:331 WatchManager.RunLoop
+    // Go: watchmanager.go:354 WatchManager.RunLoop
     // PORT: Go selects on `ctx.Done()` and `doCycleCh`. The port waits on
     // the channel with a timeout and checks `ctx.err()` (PORTING "Go
     // runtime"). `doCycle` is the caller's DoCycle method value. After a

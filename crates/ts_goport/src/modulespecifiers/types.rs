@@ -93,7 +93,7 @@ pub struct ModulePath {
     pub is_redirect: bool,
 }
 
-// Go: modulespecifiers/types.go:42 ModuleSpecifierGenerationHost
+// Go: modulespecifiers/types.go:48 ModuleSpecifierGenerationHost
 // PORT: methods that take `ast.HasFileName` or `*ast.StringLiteralLike`
 // take a `Node`. Package.json entries are shared through `Rc`, as Go
 // shares the `*packagejson.InfoCacheEntry` pointer.
@@ -133,7 +133,7 @@ pub trait ModuleSpecifierGenerationHost {
     fn as_output_paths_host(&self) -> &dyn super::deps::OutputPathsHost;
 }
 
-// Go: modulespecifiers/types.go:64 ImportModuleSpecifierPreference
+// Go: modulespecifiers/types.go:71 ImportModuleSpecifierPreference
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ImportModuleSpecifierPreference {
     #[default]
@@ -144,7 +144,7 @@ pub enum ImportModuleSpecifierPreference {
     NonRelative,     // "non-relative"
 }
 
-// Go: modulespecifiers/types.go:74 ImportModuleSpecifierEndingPreference
+// Go: modulespecifiers/types.go:81 ImportModuleSpecifierEndingPreference
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ImportModuleSpecifierEndingPreference {
     #[default]
@@ -155,7 +155,7 @@ pub enum ImportModuleSpecifierEndingPreference {
     Js,      // "js"
 }
 
-// Go: modulespecifiers/types.go:84 UserPreferences
+// Go: modulespecifiers/types.go:91 UserPreferences
 #[derive(Clone, Debug, Default)]
 pub struct UserPreferences {
     pub import_module_specifier_preference: ImportModuleSpecifierPreference,
@@ -163,13 +163,13 @@ pub struct UserPreferences {
     pub auto_import_specifier_exclude_regexes: Vec<String>,
 }
 
-// Go: modulespecifiers/types.go:90 ModuleSpecifierOptions
+// Go: modulespecifiers/types.go:97 ModuleSpecifierOptions
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ModuleSpecifierOptions {
     pub override_import_mode: ResolutionMode,
 }
 
-// Go: modulespecifiers/types.go:94 RelativePreferenceKind
+// Go: modulespecifiers/types.go:101 RelativePreferenceKind
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelativePreferenceKind {
     Relative,
@@ -178,7 +178,7 @@ pub enum RelativePreferenceKind {
     ExternalNonRelative,
 }
 
-// Go: modulespecifiers/types.go:103 ModuleSpecifierEnding
+// Go: modulespecifiers/types.go:110 ModuleSpecifierEnding
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModuleSpecifierEnding {
     Minimal,
@@ -187,7 +187,7 @@ pub enum ModuleSpecifierEnding {
     TsExtension,
 }
 
-// Go: modulespecifiers/types.go:112 MatchingMode
+// Go: modulespecifiers/types.go:119 MatchingMode
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatchingMode {
     Exact,

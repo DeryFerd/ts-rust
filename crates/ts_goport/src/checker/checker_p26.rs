@@ -7,7 +7,7 @@ use crate::jsnum::Number;
 use crate::prelude::*;
 
 impl Checker {
-    // Go: checker/checker.go:23118 getTypeArgumentsFromNode
+    // Go: checker/checker.go:23672 getTypeArgumentsFromNode
     pub fn get_type_arguments_from_node(&mut self, node: Node) -> Vec<TypeId> {
         let mut result = Vec::new();
         for n in node.type_arguments() {
@@ -16,7 +16,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:23122 checkNoTypeArguments
+    // Go: checker/checker.go:23676 checkNoTypeArguments
     pub fn check_no_type_arguments(&mut self, node: Node, symbol: SymbolId) -> bool {
         if node.type_arguments().len() != 0 {
             let type_name = if symbol.is_some() {
@@ -32,7 +32,7 @@ impl Checker {
 
     // Return true if the given type reference node is directly aliased or if it needs to be deferred
     // because it is possibly contained in a circular chain of eagerly resolved types.
-    // Go: checker/checker.go:23138 isDeferredTypeReferenceNode
+    // Go: checker/checker.go:23692 isDeferredTypeReferenceNode
     pub fn is_deferred_type_reference_node(
         &mut self,
         node: Node,
@@ -75,7 +75,7 @@ impl Checker {
     // Return true when the given node is transitively contained in type constructs that eagerly
     // resolve their constituent types. We include SyntaxKind.TypeReference because type arguments
     // of type aliases are eagerly resolved.
-    // Go: checker/checker.go:23159 isResolvedByTypeAlias
+    // Go: checker/checker.go:23713 isResolvedByTypeAlias
     pub fn is_resolved_by_type_alias(&self, node: Node) -> bool {
         let parent = node.parent();
         match parent.kind() {
@@ -96,7 +96,7 @@ impl Checker {
 
     // Return true if resolving the given node (i.e. getTypeFromTypeNode) possibly causes resolution
     // of a type alias.
-    // Go: checker/checker.go:23173 mayResolveTypeAlias
+    // Go: checker/checker.go:23727 mayResolveTypeAlias
     pub fn may_resolve_type_alias(&mut self, node: Node) -> bool {
         match node.kind() {
             SyntaxKind::TypeReference => {
@@ -137,7 +137,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:23198 createNormalizedTypeReference
+    // Go: checker/checker.go:23752 createNormalizedTypeReference
     pub fn create_normalized_type_reference(
         &mut self,
         target: TypeId,
@@ -149,7 +149,7 @@ impl Checker {
         self.create_type_reference(target, type_arguments)
     }
 
-    // Go: checker/checker.go:23205 createNormalizedTupleTypeEx
+    // Go: checker/checker.go:23759 createNormalizedTupleTypeEx
     pub fn create_normalized_tuple_type_ex(
         &mut self,
         target: TypeId,
@@ -222,7 +222,7 @@ impl Checker {
         tuple_target
     }
 
-    // Go: checker/checker.go:23253 createNormalizedTupleType
+    // Go: checker/checker.go:23807 createNormalizedTupleType
     pub fn create_normalized_tuple_type(
         &mut self,
         target: TypeId,
@@ -235,7 +235,7 @@ impl Checker {
 // PORT: Go `TupleNormalizer` stores the checker in field `c`. Here the
 // checker is passed to `normalize` and `add` instead, because the normalizer
 // lives on the stack while the checker is mutably borrowed.
-// Go: checker/checker.go:23257 TupleNormalizer
+// Go: checker/checker.go:23811 TupleNormalizer
 #[derive(Clone, Debug, Default)]
 pub struct TupleNormalizer {
     pub types: Vec<TypeId>,
@@ -246,7 +246,7 @@ pub struct TupleNormalizer {
 }
 
 impl TupleNormalizer {
-    // Go: checker/checker.go:23266 TupleNormalizer.normalize
+    // Go: checker/checker.go:23820 TupleNormalizer.normalize
     pub fn normalize(
         &mut self,
         c: &mut Checker,
@@ -343,7 +343,7 @@ impl TupleNormalizer {
         true
     }
 
-    // Go: checker/checker.go:23332 TupleNormalizer.add
+    // Go: checker/checker.go:23886 TupleNormalizer.add
     pub fn add(&mut self, c: &mut Checker, t: TypeId, info: TupleElementInfo) {
         if info.flags.intersects(ElementFlags::REQUIRED) {
             self.last_required_index = self.types.len() as i32;
@@ -368,7 +368,7 @@ impl TupleNormalizer {
 }
 
 // Return count of starting consecutive tuple elements of the given kind(s)
-// Go: checker/checker.go:23347 getStartElementCount
+// Go: checker/checker.go:23901 getStartElementCount
 pub fn get_start_element_count(t: &TupleType, flags: ElementFlags) -> i32 {
     for (i, info) in t.element_infos.iter().enumerate() {
         if !info.flags.intersects(flags) {
@@ -379,7 +379,7 @@ pub fn get_start_element_count(t: &TupleType, flags: ElementFlags) -> i32 {
 }
 
 // Return count of ending consecutive tuple elements of the given kind(s)
-// Go: checker/checker.go:23357 getEndElementCount
+// Go: checker/checker.go:23911 getEndElementCount
 pub fn get_end_element_count(t: &TupleType, flags: ElementFlags) -> i32 {
     let mut i = t.element_infos.len();
     while i > 0 {
@@ -391,13 +391,13 @@ pub fn get_end_element_count(t: &TupleType, flags: ElementFlags) -> i32 {
     t.element_infos.len() as i32
 }
 
-// Go: checker/checker.go:23366 getTotalFixedElementCount
+// Go: checker/checker.go:23920 getTotalFixedElementCount
 pub fn get_total_fixed_element_count(t: &TupleType) -> i32 {
     t.fixed_length + get_end_element_count(t, ElementFlags::FIXED)
 }
 
 impl Checker {
-    // Go: checker/checker.go:23370 getElementTypes
+    // Go: checker/checker.go:23924 getElementTypes
     pub fn get_element_types(&mut self, t: TypeId) -> SharedList<TypeId> {
         let type_arguments = self.get_type_arguments(t);
         let arity = self.get_type_reference_arity(t) as usize;
@@ -407,12 +407,12 @@ impl Checker {
         type_arguments.slice(0..arity)
     }
 
-    // Go: checker/checker.go:23379 getTypeReferenceArity
+    // Go: checker/checker.go:23933 getTypeReferenceArity
     pub fn get_type_reference_arity(&self, t: TypeId) -> i32 {
         self.target_interface_type(t).type_parameters().len() as i32
     }
 
-    // Go: checker/checker.go:23383 isArrayType
+    // Go: checker/checker.go:23937 isArrayType
     pub fn is_array_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         ty.object_flags.intersects(ObjectFlags::REFERENCE)
@@ -420,7 +420,7 @@ impl Checker {
                 || ty.target() == self.global_readonly_array_type)
     }
 
-    // Go: checker/checker.go:23387 isReadonlyArrayType
+    // Go: checker/checker.go:23941 isReadonlyArrayType
     pub fn is_readonly_array_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         ty.object_flags.intersects(ObjectFlags::REFERENCE)
@@ -429,7 +429,7 @@ impl Checker {
 
     // PORT: Go package function `isTupleType` reads type data, so it is a
     // `Checker` method (see the PORT note in types.rs).
-    // Go: checker/checker.go:23391 isTupleType
+    // Go: checker/checker.go:23945 isTupleType
     // PERF: most types with REFERENCE are `TypeReference` data (instances
     // such as `T[]` and `[A, B]`), so the target is read from that variant
     // directly. `Type::target` (a jump table over the object kinds) takes
@@ -448,28 +448,28 @@ impl Checker {
         self.ty(target).object_flags.intersects(ObjectFlags::TUPLE)
     }
 
-    // Go: checker/checker.go:23395 isMutableTupleType
+    // Go: checker/checker.go:23949 isMutableTupleType
     pub fn is_mutable_tuple_type(&self, t: TypeId) -> bool {
         self.is_tuple_type(t) && !self.target_tuple_type(t).readonly
     }
 
-    // Go: checker/checker.go:23403 isSingleElementGenericTupleType
+    // Go: checker/checker.go:23957 isSingleElementGenericTupleType
     pub fn is_single_element_generic_tuple_type(&self, t: TypeId) -> bool {
         self.is_generic_tuple_type(t) && self.target_tuple_type(t).element_infos.len() == 1
     }
 
-    // Go: checker/checker.go:23407 isArrayOrTupleType
+    // Go: checker/checker.go:23961 isArrayOrTupleType
     pub fn is_array_or_tuple_type(&self, t: TypeId) -> bool {
         self.is_array_type(t) || self.is_tuple_type(t)
     }
 
-    // Go: checker/checker.go:23411 isMutableArrayOrTuple
+    // Go: checker/checker.go:23965 isMutableArrayOrTuple
     pub fn is_mutable_array_or_tuple(&self, t: TypeId) -> bool {
         self.is_array_type(t) && !self.is_readonly_array_type(t)
             || self.is_tuple_type(t) && !self.target_tuple_type(t).readonly
     }
 
-    // Go: checker/checker.go:23415 getElementTypeOfArrayType
+    // Go: checker/checker.go:23969 getElementTypeOfArrayType
     pub fn get_element_type_of_array_type(&mut self, t: TypeId) -> TypeId {
         if self.is_array_type(t) {
             return self.type_arguments_of(t)[0];
@@ -477,7 +477,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:23422 isArrayLikeType
+    // Go: checker/checker.go:23976 isArrayLikeType
     pub fn is_array_like_type(&mut self, t: TypeId) -> bool {
         // A type is array-like if it is a reference to the global Array or global ReadonlyArray type,
         // or if it is not the undefined or null type and if it is assignable to ReadonlyArray<any>
@@ -491,7 +491,7 @@ impl Checker {
         self.is_type_assignable_to(t, any_readonly_array_type)
     }
 
-    // Go: checker/checker.go:23428 isMutableArrayLikeType
+    // Go: checker/checker.go:23982 isMutableArrayLikeType
     pub fn is_mutable_array_like_type(&mut self, t: TypeId) -> bool {
         // A type is mutable-array-like if it is a reference to the global Array type, or if it is not the
         // any, undefined, null or never type and if it is assignable to Array<any>
@@ -509,13 +509,13 @@ impl Checker {
         self.is_type_assignable_to(t, any_array_type)
     }
 
-    // Go: checker/checker.go:23434 isEmptyArrayLiteralType
+    // Go: checker/checker.go:23988 isEmptyArrayLiteralType
     pub fn is_empty_array_literal_type(&mut self, t: TypeId) -> bool {
         let element_type = self.get_element_type_of_array_type(t);
         element_type.is_some() && self.is_empty_literal_type(element_type)
     }
 
-    // Go: checker/checker.go:23439 isEmptyLiteralType
+    // Go: checker/checker.go:23993 isEmptyLiteralType
     pub fn is_empty_literal_type(&self, t: TypeId) -> bool {
         if self.strict_null_checks {
             return t == self.implicit_never_type;
@@ -523,7 +523,7 @@ impl Checker {
         t == self.undefined_widening_type
     }
 
-    // Go: checker/checker.go:23446 isTupleLikeType
+    // Go: checker/checker.go:24000 isTupleLikeType
     pub fn is_tuple_like_type(&mut self, t: TypeId) -> bool {
         if self.is_tuple_type(t) || self.get_property_of_type(t, "0").is_some() {
             return true;
@@ -539,19 +539,19 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:23458 isArrayOrTupleLikeType
+    // Go: checker/checker.go:24012 isArrayOrTupleLikeType
     pub fn is_array_or_tuple_like_type(&mut self, t: TypeId) -> bool {
         self.is_array_like_type(t) || self.is_tuple_like_type(t)
     }
 
-    // Go: checker/checker.go:23462 isArrayOrTupleOrIntersection
+    // Go: checker/checker.go:24016 isArrayOrTupleOrIntersection
     pub fn is_array_or_tuple_or_intersection(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         ty.flags.intersects(TypeFlags::INTERSECTION)
             && ty.types().iter().all(|&t| self.is_array_or_tuple_type(t))
     }
 
-    // Go: checker/checker.go:23466 getTupleElementType
+    // Go: checker/checker.go:24020 getTupleElementType
     pub fn get_tuple_element_type(&mut self, t: TypeId, index: i32) -> TypeId {
         let prop_type = self.get_type_of_property_of_type(t, &index.to_string());
         if prop_type.is_some() {
@@ -578,7 +578,7 @@ impl Checker {
      * references to the type parameters of the alias. We replace those with the actual type arguments by instantiating the
      * declared type. Instantiations are cached using the type identities of the type arguments as the key.
      */
-    // Go: checker/checker.go:23482 getTypeFromTypeAliasReference
+    // Go: checker/checker.go:24036 getTypeFromTypeAliasReference
     pub fn get_type_from_type_alias_reference(&mut self, node: Node, symbol: SymbolId) -> TypeId {
         let type_arguments = node.type_arguments();
         if self
@@ -676,7 +676,7 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/checker.go:23543 getTypeAliasInstantiation
+    // Go: checker/checker.go:24097 getTypeAliasInstantiation
     pub fn get_type_alias_instantiation(
         &mut self,
         symbol: SymbolId,
@@ -732,7 +732,7 @@ impl Checker {
 
     // PORT: Go package function `isLocalTypeAlias` reads symbol data, so it
     // is a `Checker` method.
-    // Go: checker/checker.go:23567 isLocalTypeAlias
+    // Go: checker/checker.go:24121 isLocalTypeAlias
     pub fn is_local_type_alias(&self, symbol: SymbolId) -> bool {
         let declaration = self
             .sym(symbol)
@@ -779,7 +779,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:23598 getTypeReferenceName
+// Go: checker/checker.go:24152 getTypeReferenceName
 pub fn get_type_reference_name(node: Node) -> Node {
     match node.kind() {
         SyntaxKind::TypeReference => {
@@ -799,7 +799,7 @@ pub fn get_type_reference_name(node: Node) -> Node {
 }
 
 impl Checker {
-    // Go: checker/checker.go:23613 getAliasForTypeNode
+    // Go: checker/checker.go:24167 getAliasForTypeNode
     pub fn get_alias_for_type_node(&mut self, node: Node) -> Option<Rc<TypeAlias>> {
         let symbol = self.get_alias_symbol_for_type_node(node);
         if symbol.is_some() {
@@ -812,7 +812,7 @@ impl Checker {
         None
     }
 
-    // Go: checker/checker.go:23621 getAliasSymbolForTypeNode
+    // Go: checker/checker.go:24175 getAliasSymbolForTypeNode
     pub fn get_alias_symbol_for_type_node(&mut self, node: Node) -> SymbolId {
         let mut host = node.parent();
         while is_parenthesized_type_node(host)
@@ -826,7 +826,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:23632 getTypeArgumentsForAliasSymbol
+    // Go: checker/checker.go:24186 getTypeArgumentsForAliasSymbol
     pub fn get_type_arguments_for_alias_symbol(&mut self, symbol: SymbolId) -> Vec<TypeId> {
         if symbol.is_some() {
             return self.get_local_type_parameters_of_class_or_interface_or_type_alias(symbol);
@@ -834,7 +834,7 @@ impl Checker {
         Vec::new()
     }
 
-    // Go: checker/checker.go:23639 getOuterTypeParametersOfClassOrInterface
+    // Go: checker/checker.go:24193 getOuterTypeParametersOfClassOrInterface
     pub fn get_outer_type_parameters_of_class_or_interface(
         &mut self,
         symbol: SymbolId,
@@ -847,7 +847,7 @@ impl Checker {
         self.get_outer_type_parameters(declaration, false /*includeThisTypes*/)
     }
 
-    // Go: checker/checker.go:23760 getClassOrInterfaceLikeDeclaration
+    // Go: checker/checker.go:24200 getClassOrInterfaceLikeDeclaration
     // Returns the declaration used to obtain a class, interface, or function symbol's outer type parameters.
     pub fn get_class_or_interface_like_declaration(&self, symbol: SymbolId) -> Node {
         if self
@@ -874,14 +874,14 @@ impl Checker {
             .unwrap_or_default()
     }
 
-    // Go: checker/checker.go:23776 canGetTypeParametersOfClassOrInterface
+    // Go: checker/checker.go:24216 canGetTypeParametersOfClassOrInterface
     pub fn can_get_type_parameters_of_class_or_interface(&self, symbol: SymbolId) -> bool {
         self.get_class_or_interface_like_declaration(symbol)
             .is_some()
     }
 
     // Return the outer type parameters of a node or undefined if the node has no outer type parameters.
-    // Go: checker/checker.go:23658 getOuterTypeParameters
+    // Go: checker/checker.go:24221 getOuterTypeParameters
     pub fn get_outer_type_parameters(
         &mut self,
         node: Node,
@@ -965,7 +965,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:23696 getInferTypeParameters
+    // Go: checker/checker.go:24259 getInferTypeParameters
     pub fn get_infer_type_parameters(&mut self, node: Node) -> Vec<TypeId> {
         let mut result = Vec::new();
         // PORT: Go ranges over the locals map (random order). We use the
@@ -985,7 +985,7 @@ impl Checker {
 
     // The local type parameters are the combined set of type parameters from all declarations of the class,
     // interface, or type alias.
-    // Go: checker/checker.go:23708 getLocalTypeParametersOfClassOrInterfaceOrTypeAlias
+    // Go: checker/checker.go:24271 getLocalTypeParametersOfClassOrInterfaceOrTypeAlias
     pub fn get_local_type_parameters_of_class_or_interface_or_type_alias(
         &mut self,
         symbol: SymbolId,
@@ -993,7 +993,7 @@ impl Checker {
         self.append_local_type_parameters_of_class_or_interface_or_type_alias(Vec::new(), symbol)
     }
 
-    // Go: checker/checker.go:23712 appendLocalTypeParametersOfClassOrInterfaceOrTypeAlias
+    // Go: checker/checker.go:24275 appendLocalTypeParametersOfClassOrInterfaceOrTypeAlias
     pub fn append_local_type_parameters_of_class_or_interface_or_type_alias(
         &mut self,
         types: Vec<TypeId>,
@@ -1019,7 +1019,7 @@ impl Checker {
     // Appends the type parameters given by a list of declarations to a set of type parameters and returns the resulting set.
     // The function allocates a new array if the input type parameter set is undefined, but otherwise it modifies the set
     // in-place and returns the same array.
-    // Go: checker/checker.go:23724 appendTypeParameters
+    // Go: checker/checker.go:24287 appendTypeParameters
     pub fn append_type_parameters(
         &mut self,
         type_parameters: Vec<TypeId>,
@@ -1037,7 +1037,7 @@ impl Checker {
         type_parameters
     }
 
-    // Go: checker/checker.go:23731 getDeclaredTypeOfTypeParameter
+    // Go: checker/checker.go:24294 getDeclaredTypeOfTypeParameter
     pub fn get_declared_type_of_type_parameter(&mut self, symbol: SymbolId) -> TypeId {
         // One link lookup on the cached hit. The miss returns the type it
         // just stored, as Go returns links.declaredType.
@@ -1050,7 +1050,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:23739 getDeclaredTypeOfTypeAlias
+    // Go: checker/checker.go:24302 getDeclaredTypeOfTypeAlias
     pub fn get_declared_type_of_type_alias(&mut self, symbol: SymbolId) -> TypeId {
         if self.type_alias_links.get(symbol).declared_type.is_nil() {
             // Note that we use the links object as the target here because the symbol object is used as the unique
@@ -1109,7 +1109,7 @@ impl Checker {
         self.type_alias_links.get(symbol).declared_type
     }
 
-    // Go: checker/checker.go:23777 getDeclaredTypeOfEnum
+    // Go: checker/checker.go:24340 getDeclaredTypeOfEnum
     pub fn get_declared_type_of_enum(&mut self, symbol: SymbolId) -> TypeId {
         if !(self.declared_type_links.get(symbol).declared_type.is_some()) {
             let mut member_type_list = Vec::new();
@@ -1154,13 +1154,13 @@ impl Checker {
         self.declared_type_links.get(symbol).declared_type
     }
 
-    // Go: checker/checker.go:23814 getEnumMemberValue
+    // Go: checker/checker.go:24377 getEnumMemberValue
     pub fn get_enum_member_value(&mut self, node: Node) -> EvaluatorResult {
         self.compute_enum_member_values(node.parent());
         self.enum_member_links.get(node).value.clone()
     }
 
-    // Go: checker/checker.go:23819 createComputedEnumType
+    // Go: checker/checker.go:24382 createComputedEnumType
     pub fn create_computed_enum_type(&mut self, symbol: SymbolId) -> TypeId {
         let regular_type = self.new_literal_type(TypeFlags::ENUM, None, TypeId::NIL);
         self.ty_mut(regular_type).symbol = symbol;
@@ -1171,7 +1171,7 @@ impl Checker {
         regular_type
     }
 
-    // Go: checker/checker.go:23829 getDeclaredTypeOfEnumMember
+    // Go: checker/checker.go:24392 getDeclaredTypeOfEnumMember
     pub fn get_declared_type_of_enum_member(&mut self, symbol: SymbolId) -> TypeId {
         if !(self.declared_type_links.get(symbol).declared_type.is_some()) {
             let parent = self.get_parent_of_symbol(symbol);
@@ -1184,7 +1184,7 @@ impl Checker {
         self.declared_type_links.get(symbol).declared_type
     }
 
-    // Go: checker/checker.go:23840 computeEnumMemberValues
+    // Go: checker/checker.go:24403 computeEnumMemberValues
     pub fn compute_enum_member_values(&mut self, node: Node) {
         let node_links = self.node_links.get(node);
         if !(node_links
@@ -1212,7 +1212,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:23860 computeEnumMemberValue
+    // Go: checker/checker.go:24423 computeEnumMemberValue
     pub fn compute_enum_member_value(
         &mut self,
         member: Node,
@@ -1279,7 +1279,7 @@ impl Checker {
         new_result(Some(LiteralValue::Number(auto_value)), false, false, false)
     }
 
-    // Go: checker/checker.go:23897 computeConstantEnumMemberValue
+    // Go: checker/checker.go:24460 computeConstantEnumMemberValue
     pub fn compute_constant_enum_member_value(&mut self, member: Node) -> EvaluatorResult {
         let is_const_enum = is_enum_const(member.parent());
         let initializer = member.initializer();
@@ -1340,7 +1340,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:23926 evaluateEntity
+    // Go: checker/checker.go:24489 evaluateEntity
     pub fn evaluate_entity(&mut self, expr: Node, location: Node) -> EvaluatorResult {
         match expr.kind() {
             SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression => {
@@ -1445,7 +1445,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:23979 evaluateEnumMember
+    // Go: checker/checker.go:24542 evaluateEnumMember
     pub fn evaluate_enum_member(
         &mut self,
         expr: Node,
@@ -1487,7 +1487,7 @@ impl Checker {
         value
     }
 
-    // Go: checker/checker.go:23996 getDeclaredTypeOfAlias
+    // Go: checker/checker.go:24559 getDeclaredTypeOfAlias
     pub fn get_declared_type_of_alias(&mut self, symbol: SymbolId) -> TypeId {
         if self.declared_type_links.get(symbol).declared_type.is_nil() {
             let resolved = self.resolve_alias(symbol);
@@ -1497,7 +1497,7 @@ impl Checker {
         self.declared_type_links.get(symbol).declared_type
     }
 
-    // Go: checker/checker.go:24004 getTypeFromTypeQueryNode
+    // Go: checker/checker.go:24567 getTypeFromTypeQueryNode
     pub fn get_type_from_type_query_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             // TypeScript 1.0 spec (April 2014): 3.6.3
@@ -1512,7 +1512,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:24017 getTypeFromArrayOrTupleTypeNode
+    // Go: checker/checker.go:24580 getTypeFromArrayOrTupleTypeNode
     pub fn get_type_from_array_or_tuple_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let target = self.get_array_or_tuple_target_type(node);

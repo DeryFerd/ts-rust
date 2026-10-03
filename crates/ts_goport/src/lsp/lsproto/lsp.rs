@@ -289,7 +289,7 @@ fn json_kind_string(k: u8) -> String {
     }
 }
 
-// Go: lsp.go:125 errNotObject
+// Go: lsp.go:87 errNotObject
 // Generated methods return it before they read the value.
 pub fn err_not_object(k: u8) -> JsonError {
     SemanticError::method(
@@ -301,7 +301,7 @@ pub fn err_not_object(k: u8) -> JsonError {
     )
 }
 
-// Go: lsp.go:129 errNull
+// Go: lsp.go:91 errNull
 // Generated methods return it after the member name.
 pub fn err_null(field: &str) -> JsonError {
     SemanticError::method(
@@ -313,7 +313,7 @@ pub fn err_null(field: &str) -> JsonError {
     )
 }
 
-// Go: lsp.go:133 errMissing
+// Go: lsp.go:95 errMissing
 // Generated methods return it after the closing `}`.
 pub fn err_missing<I, S>(props: I) -> JsonError
 where
@@ -327,7 +327,7 @@ where
     )
 }
 
-// Go: lsp.go:137 errInvalidKind
+// Go: lsp.go:99 errInvalidKind
 // Generated methods return it after a peek, before they read the value.
 pub fn err_invalid_kind(type_name: &str, got: u8) -> JsonError {
     SemanticError::method(
@@ -336,7 +336,7 @@ pub fn err_invalid_kind(type_name: &str, got: u8) -> JsonError {
     )
 }
 
-// Go: lsp.go:141 errInvalidValue
+// Go: lsp.go:103 errInvalidValue
 // Generated methods return it after they read the value.
 pub fn err_invalid_value(type_name: &str, data: impl AsRef<[u8]>) -> JsonError {
     SemanticError::method(
@@ -349,7 +349,7 @@ pub fn err_invalid_value(type_name: &str, data: impl AsRef<[u8]>) -> JsonError {
     )
 }
 
-// Go: lsp.go:145 errLiteralMismatch
+// Go: lsp.go:107 errLiteralMismatch
 // Generated methods return it after they read the value.
 pub fn err_literal_mismatch(type_name: &str, expected: &str, got: impl AsRef<[u8]>) -> JsonError {
     SemanticError::method(
@@ -363,27 +363,27 @@ pub fn err_literal_mismatch(type_name: &str, expected: &str, got: impl AsRef<[u8
     )
 }
 
-// Go: lsp.go:149 assertOnlyOne
+// Go: lsp.go:111 assertOnlyOne
 pub fn assert_only_one(message: &str, count: i32) {
     if count != 1 {
         crate::core::go_panic(message.to_string());
     }
 }
 
-// Go: lsp.go:155 assertAtMostOne
+// Go: lsp.go:117 assertAtMostOne
 pub fn assert_at_most_one(message: &str, count: i32) {
     if count > 1 {
         crate::core::go_panic(message.to_string());
     }
 }
 
-// Go: lsp.go:162 jsonKeyCheck
+// Go: lsp.go:124 jsonKeyCheck
 // jsonKeyCheck compares a raw JSON key token (including quotes) against a Go string.
 pub fn json_key_check(name: &[u8], key: &str) -> bool {
     name.len() == key.len() + 2 && name[0] == b'"' && &name[1..name.len() - 1] == key.as_bytes()
 }
 
-// Go: lsp.go:169 jsonObjectRawField
+// Go: lsp.go:131 jsonObjectRawField
 // jsonObjectRawField scans the top-level keys of a JSON object looking for the
 // given field name, and returns its raw JSON value (e.g. `"full"` with quotes).
 // Returns nil if the field is not found.
@@ -535,7 +535,7 @@ pub fn unmarshal_discriminated_arm<T: UnmarshalerFrom + Default>(
     Ok(target)
 }
 
-// Go: lsp.go:199 jsonObjectHasKey
+// Go: lsp.go:161 jsonObjectHasKey
 // jsonObjectHasKey scans the top-level keys of a JSON object looking for any of the
 // given keys. Returns the index of the first key found, or -1 if none match.
 // Bails early on first match without decoding any values.
@@ -565,7 +565,7 @@ pub fn json_object_has_key(data: &[u8], keys: &[&str]) -> i32 {
 
 // Inspired by https://www.youtube.com/watch?v=dab3I-HcTVk
 
-// Go: lsp.go:226 RequestInfo
+// Go: lsp.go:188 RequestInfo
 // PORT: Go `_ [0]Params` / `_ [0]Resp` are `PhantomData`. Go builds the
 // value with a struct literal; `new` is the const constructor the
 // generated `*_INFO` consts use.
@@ -608,7 +608,7 @@ impl<P, R: UnmarshalerFrom + Default> RequestInfo<P, R> {
 }
 
 impl<P: AnyValue, R> RequestInfo<P, R> {
-    // Go: lsp.go:249 NewRequestMessage
+    // Go: lsp.go:207 NewRequestMessage
     pub fn new_request_message(&self, id: Option<crate::jsonrpc::ID>, params: P) -> RequestMessage {
         RequestMessage {
             id,
@@ -633,7 +633,7 @@ impl<P, R> std::fmt::Debug for RequestInfo<P, R> {
     }
 }
 
-// Go: lsp.go:257 NotificationInfo
+// Go: lsp.go:215 NotificationInfo
 pub struct NotificationInfo<P> {
     _params: PhantomData<fn() -> P>,
     pub method: Method,
@@ -649,7 +649,7 @@ impl<P> NotificationInfo<P> {
 }
 
 impl<P: AnyValue> NotificationInfo<P> {
-    // Go: lsp.go:262 NewNotificationMessage
+    // Go: lsp.go:220 NewNotificationMessage
     pub fn new_notification_message(&self, params: P) -> RequestMessage {
         RequestMessage {
             method: self.method.clone(),
@@ -673,7 +673,7 @@ impl<P> std::fmt::Debug for NotificationInfo<P> {
     }
 }
 
-// Go: lsp.go:269 Null
+// Go: lsp.go:266 Null
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Null;
 
@@ -770,7 +770,7 @@ pub fn unmarshal_params<T: UnmarshalerFrom + Default + 'static>(
     Ok(params)
 }
 
-// Go: lsp.go:286 NoParams
+// Go: lsp.go:283 NoParams
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NoParams;
 
@@ -799,18 +799,18 @@ impl UnmarshalerFrom for NoParams {
     }
 }
 
-// Go: lsp.go:290 clientCapabilitiesKey
+// Go: lsp.go:287 clientCapabilitiesKey
 static CLIENT_CAPABILITIES_KEY: gostd::context::ContextKey<Arc<ResolvedClientCapabilities>> =
     gostd::context::ContextKey::new("clientCapabilitiesKey");
 
-// Go: lsp.go:292 WithClientCapabilities
+// Go: lsp.go:289 WithClientCapabilities
 // PORT: Go stores the `*ResolvedClientCapabilities` pointer; the context
 // holds an `Arc` to it.
 pub fn with_client_capabilities(ctx: &Context, caps: Arc<ResolvedClientCapabilities>) -> Context {
     gostd::context::with_value(ctx, &CLIENT_CAPABILITIES_KEY, caps)
 }
 
-// Go: lsp.go:296 GetClientCapabilities
+// Go: lsp.go:293 GetClientCapabilities
 pub fn get_client_capabilities(ctx: &Context) -> Arc<ResolvedClientCapabilities> {
     if let Some(caps) = ctx.value(&CLIENT_CAPABILITIES_KEY) {
         return (*caps).clone();
@@ -818,7 +818,7 @@ pub fn get_client_capabilities(ctx: &Context) -> Arc<ResolvedClientCapabilities>
     Arc::new(ResolvedClientCapabilities::default())
 }
 
-// Go: lsp.go:305 PreferredMarkupKind
+// Go: lsp.go:302 PreferredMarkupKind
 // PreferredMarkupKind returns the first (most preferred) markup kind from the given formats,
 // or MarkupKindPlainText if the slice is empty.
 pub fn preferred_markup_kind(formats: &[MarkupKind]) -> MarkupKind {

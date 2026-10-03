@@ -422,7 +422,7 @@ pub struct SourceAndOutputMaps {
     pub output_dts_to_project_reference: FxHashMap<Path, Rc<SourceOutputAndProjectReference>>,
 }
 
-// Go: tsoptions/parsedcommandline.go:27 ParsedCommandLine
+// Go: tsoptions/parsedcommandline.go:45 ParsedCommandLine
 // PORT: all fields are `pub`, because Go code in the same package (the
 // tsconfig parser) writes the unexported fields.
 // PORT: Go `ConfigFile *TsConfigSourceFile` is `Option<Rc<...>>`, because
@@ -458,7 +458,7 @@ pub struct ParsedCommandLine {
     pub locale: OnceCell<crate::locale::Locale>,
 }
 
-// Go: tsoptions/parsedcommandline.go:60 NewParsedCommandLine
+// Go: tsoptions/parsedcommandline.go:77 NewParsedCommandLine
 // PORT: Go returns a new pointer; this returns the value. A nil
 // `projectReferences` slice is `None`.
 pub fn new_parsed_command_line(
@@ -504,7 +504,7 @@ impl ParsedCommandLine {
     }
 }
 
-// Go: tsoptions/parsedcommandline.go:74 SourceOutputAndProjectReference
+// Go: tsoptions/parsedcommandline.go:109 SourceOutputAndProjectReference
 // PORT: Go `Resolved *ParsedCommandLine` points back at the command line
 // that owns the map. An `Rc` would make a reference cycle, so this is a
 // `Weak`. `ParsedCommandLine::parse_input_output_names` takes `&Rc<Self>`.

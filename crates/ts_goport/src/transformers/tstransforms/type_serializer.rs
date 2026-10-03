@@ -90,7 +90,7 @@ impl MetadataSerializer {
         self.ec.factory()
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:91 metadataSerializer.serializeTypeOfNode
+    // Go: transformers/tstransforms/typeserializer.go:93 metadataSerializer.serializeTypeOfNode
     /// Serializes the type of a node for use with decorator type metadata.
     /// @param node The node that should have its type serialized.
     fn serialize_type_of_node(&mut self, node: Node, container: Node) -> Node {
@@ -108,7 +108,7 @@ impl MetadataSerializer {
         }
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:108 metadataSerializer.serializeParameterTypesOfNode
+    // Go: transformers/tstransforms/typeserializer.go:110 metadataSerializer.serializeParameterTypesOfNode
     /// Serializes the type of a node for use with decorator type metadata.
     /// @param node The node that should have its type serialized.
     fn serialize_parameter_types_of_node(&mut self, node: Node, container: Node) -> Node {
@@ -142,7 +142,7 @@ impl MetadataSerializer {
         f.new_array_literal_expression(f.new_node_list(&expressions), false)
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:147 metadataSerializer.serializeReturnTypeOfNode
+    // Go: transformers/tstransforms/typeserializer.go:151 metadataSerializer.serializeReturnTypeOfNode
     /// Serializes the return type of a node for use with decorator type metadata.
     /// @param node The node that should have its return type serialized.
     fn serialize_return_type_of_node(&mut self, node: Node) -> Node {
@@ -154,7 +154,7 @@ impl MetadataSerializer {
         self.f().new_void_zero_expression()
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:175 metadataSerializer.serializeTypeNode
+    // Go: transformers/tstransforms/typeserializer.go:178 metadataSerializer.serializeTypeNode
     /// Serializes a type node for use with decorator type metadata.
     ///
     /// Types are serialized in the following fashion:
@@ -256,7 +256,7 @@ impl MetadataSerializer {
         self.f().new_identifier("Object")
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:243 metadataSerializer.serializeUnionOrIntersectionConstituents
+    // Go: transformers/tstransforms/typeserializer.go:242 metadataSerializer.serializeUnionOrIntersectionConstituents
     fn serialize_union_or_intersection_constituents(
         &mut self,
         types: &[Node],
@@ -318,7 +318,7 @@ impl MetadataSerializer {
         self.f().new_void_zero_expression() // Fallback is only hit if all union constituents are null/undefined/never
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:300 metadataSerializer.serializeLiteralOfLiteralTypeNode
+    // Go: transformers/tstransforms/typeserializer.go:295 metadataSerializer.serializeLiteralOfLiteralTypeNode
     fn serialize_literal_of_literal_type_node(&mut self, node: Node) -> Node {
         match node.kind() {
             SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral => {
@@ -343,7 +343,7 @@ impl MetadataSerializer {
         }
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:332 metadataSerializer.serializeTypeReferenceNode
+    // Go: transformers/tstransforms/typeserializer.go:326 metadataSerializer.serializeTypeReferenceNode
     /// Serializes a TypeReferenceNode to an appropriate JS constructor value for use with decorator type metadata.
     /// @param node The type reference node.
     fn serialize_type_reference_node(&mut self, node: Node) -> Node {
@@ -413,7 +413,7 @@ impl MetadataSerializer {
         }
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:392 metadataSerializer.serializeBigIntConstructor
+    // Go: transformers/tstransforms/typeserializer.go:388 metadataSerializer.serializeBigIntConstructor
     fn serialize_big_int_constructor(&self) -> Node {
         let f = self.f();
         if self.language_version >= ScriptTarget::ES2020 {
@@ -428,7 +428,7 @@ impl MetadataSerializer {
         )
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:409 metadataSerializer.serializeEntityNameAsExpression
+    // Go: transformers/tstransforms/typeserializer.go:405 metadataSerializer.serializeEntityNameAsExpression
     /// Serializes an entity name as an expression for decorator type metadata.
     /// @param node The entity name to serialize.
     fn serialize_entity_name_as_expression(&self, node: Node) -> Node {
@@ -448,7 +448,7 @@ impl MetadataSerializer {
         }
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:428 metadataSerializer.serializeQualifiedNameAsExpression
+    // Go: transformers/tstransforms/typeserializer.go:425 metadataSerializer.serializeQualifiedNameAsExpression
     /// Serializes an qualified name as an expression for decorator type metadata.
     /// @param node The qualified name to serialize.
     fn serialize_qualified_name_as_expression(&self, node: Node) -> Node {
@@ -460,7 +460,7 @@ impl MetadataSerializer {
         )
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:436 metadataSerializer.serializeEntityNameAsExpressionFallback
+    // Go: transformers/tstransforms/typeserializer.go:433 metadataSerializer.serializeEntityNameAsExpressionFallback
     /// Serializes an entity name which may not exist at runtime, but whose access shouldn't throw
     /// @param node The entity name to serialize.
     fn serialize_entity_name_as_expression_fallback(&self, node: Node) -> Node {
@@ -493,7 +493,7 @@ impl MetadataSerializer {
         )
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:471 metadataSerializer.createCheckedValue
+    // Go: transformers/tstransforms/typeserializer.go:467 metadataSerializer.createCheckedValue
     /// Produces an expression that results in `right` if `left` is not undefined at runtime:
     ///
     /// ```text
@@ -514,7 +514,7 @@ impl MetadataSerializer {
         )
     }
 
-    // Go: transformers/tstransforms/typeserializer.go:478 metadataSerializer.equateSerializedTypeNodes
+    // Go: transformers/tstransforms/typeserializer.go:474 metadataSerializer.equateSerializedTypeNodes
     fn equate_serialized_type_nodes(&self, left: Node, right: Node) -> bool {
         // temp vars used in fallback
         if is_generated_identifier(&self.ec, left) {
@@ -605,7 +605,7 @@ fn get_accessor_type_node(node: Node, container: Node) -> Node {
     Node::NIL
 }
 
-// Go: transformers/tstransforms/typeserializer.go:136 getParametersOfDecoratedDeclaration
+// Go: transformers/tstransforms/typeserializer.go:137 getParametersOfDecoratedDeclaration
 fn get_parameters_of_decorated_declaration(node: Node, container: Node) -> NodeList {
     if container.is_some() && node.kind() == SyntaxKind::GetAccessor {
         let acc = get_all_accessor_declarations(&container.members().to_vec(), node);

@@ -142,7 +142,7 @@ pub fn get_vs_hover_image_id(
     }
 }
 
-// Go: ls/hovericon.go:135 buildVSHoverRawContent
+// Go: ls/hovericon.go:132 buildVSHoverRawContent
 // buildVSHoverRawContent assembles the VS-specific rich hover content (symbol icon + colorized
 // declaration line, plus an optional colorized documentation block) matching the shape that
 // TypeScript-VS's legacy HoverService.cs builds from TSServer's quickinfo-full response

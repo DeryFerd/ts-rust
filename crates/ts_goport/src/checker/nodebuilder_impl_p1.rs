@@ -248,7 +248,7 @@ fn p1_add_length(b: &Rc<RefCell<NodeBuilderImpl>>, n: usize) {
     ctx.borrow_mut().approximate_length += i32::try_from(n).unwrap_or(i32::MAX);
 }
 
-// Go: checker/nodebuilderimpl.go:260 getAccessStack
+// Go: checker/nodebuilderimpl.go:325 getAccessStack
 fn get_access_stack(ref_: Node) -> Vec<Node> {
     let mut state = ref_.type_name();
     let mut ids: Vec<Node> = Vec::new();
@@ -260,12 +260,12 @@ fn get_access_stack(ref_: Node) -> Vec<Node> {
     ids
 }
 
-// Go: checker/nodebuilderimpl.go:451 isIdentifierTypeReference
+// Go: checker/nodebuilderimpl.go:463 isIdentifierTypeReference
 fn is_identifier_type_reference(node: Node) -> bool {
     is_type_reference_node(node) && is_identifier(node.type_name())
 }
 
-// Go: checker/nodebuilderimpl.go:455 arrayIsHomogeneous
+// Go: checker/nodebuilderimpl.go:467 arrayIsHomogeneous
 fn array_is_homogeneous<T>(array: &[T], comparer: impl Fn(&T, &T) -> bool) -> bool {
     if array.len() < 2 {
         return true;
@@ -279,7 +279,7 @@ fn array_is_homogeneous<T>(array: &[T], comparer: impl Fn(&T, &T) -> bool) -> bo
     true
 }
 
-// Go: checker/nodebuilderimpl.go:730 getTopmostIndexedAccessType
+// Go: checker/nodebuilderimpl.go:745 getTopmostIndexedAccessType
 fn get_topmost_indexed_access_type(node: Node) -> Node {
     if is_indexed_access_type_node(node.object_type()) {
         return get_topmost_indexed_access_type(node.object_type());
@@ -287,7 +287,7 @@ fn get_topmost_indexed_access_type(node: Node) -> Node {
     node
 }
 
-// Go: checker/nodebuilderimpl.go:892 canUsePropertyAccess
+// Go: checker/nodebuilderimpl.go:912 canUsePropertyAccess
 fn can_use_property_access(name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -300,17 +300,17 @@ fn can_use_property_access(name: &str) -> bool {
     is_identifier_text(name, LanguageVariant::STANDARD)
 }
 
-// Go: checker/nodebuilderimpl.go:904 startsWithSingleOrDoubleQuote
+// Go: checker/nodebuilderimpl.go:924 startsWithSingleOrDoubleQuote
 fn starts_with_single_or_double_quote(str: &str) -> bool {
     str.starts_with('\'') || str.starts_with('"')
 }
 
-// Go: checker/nodebuilderimpl.go:908 startsWithSquareBracket
+// Go: checker/nodebuilderimpl.go:928 startsWithSquareBracket
 fn starts_with_square_bracket(str: &str) -> bool {
     str.starts_with('[')
 }
 
-// Go: checker/nodebuilderimpl.go:912 isDefaultBindingContext
+// Go: checker/nodebuilderimpl.go:932 isDefaultBindingContext
 fn is_default_binding_context(location: Node) -> bool {
     location.kind() == SyntaxKind::SourceFile || is_ambient_module(location)
 }
@@ -499,7 +499,7 @@ impl Checker {
         ctx.borrow_mut().type_stack.pop();
     }
 
-    // Go: checker/nodebuilderimpl.go:260 appendReferenceToType
+    // Go: checker/nodebuilderimpl.go:272 appendReferenceToType
     pub fn append_reference_to_type(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -559,7 +559,7 @@ impl Checker {
         expr
     }
 
-    // Go: checker/nodebuilderimpl.go:325 isClassInstanceSide
+    // Go: checker/nodebuilderimpl.go:337 isClassInstanceSide
     // PORT: a free function that takes the checker in Go.
     pub fn is_class_instance_side(&mut self, t: TypeId) -> bool {
         let (symbol, flags, object_flags) = {
@@ -573,7 +573,7 @@ impl Checker {
                     && object_flags.intersects(ObjectFlags::IS_CLASS_INSTANCE_CLONE)))
     }
 
-    // Go: checker/nodebuilderimpl.go:329 createElidedInformationPlaceholder
+    // Go: checker/nodebuilderimpl.go:341 createElidedInformationPlaceholder
     pub fn create_elided_information_placeholder(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -595,7 +595,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/nodebuilderimpl.go:337 mapToTypeNodes
+    // Go: checker/nodebuilderimpl.go:349 mapToTypeNodes
     pub fn map_to_type_nodes(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -722,7 +722,7 @@ impl Checker {
         f.new_node_list(&result)
     }
 
-    // Go: checker/nodebuilderimpl.go:430 serializeTypeName
+    // Go: checker/nodebuilderimpl.go:442 serializeTypeName
     pub fn serialize_type_name(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -756,7 +756,7 @@ impl Checker {
         self.symbol_to_type_node(b, resolved_symbol, meaning, type_arguments)
     }
 
-    // Go: checker/nodebuilderimpl.go:469 typesAreSameReference
+    // Go: checker/nodebuilderimpl.go:481 typesAreSameReference
     // PORT: a free function in Go. It reads type data, so it is a Checker
     // method here. Go compares `*TypeAlias` pointers; `Rc::ptr_eq` does the same.
     pub fn types_are_same_reference(&self, a: TypeId, b: TypeId) -> bool {
@@ -769,7 +769,7 @@ impl Checker {
             }
     }
 
-    // Go: checker/nodebuilderimpl.go:473 setCommentRange
+    // Go: checker/nodebuilderimpl.go:485 setCommentRange
     pub fn set_comment_range(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -786,7 +786,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/nodebuilderimpl.go:480 typeNodeIsEquivalentToType
+    // Go: checker/nodebuilderimpl.go:492 typeNodeIsEquivalentToType
     pub fn type_node_is_equivalent_to_type(
         &mut self,
         _b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -808,7 +808,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/nodebuilderimpl.go:495 canReuseExistingJSTypeNode
+    // Go: checker/nodebuilderimpl.go:507 canReuseExistingJSTypeNode
     pub fn can_reuse_existing_js_type_node(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -819,7 +819,7 @@ impl Checker {
             && self.existing_type_node_is_not_reference_or_is_reference_with_compatible_type_argument_count(b, existing, t)
     }
 
-    // Go: checker/nodebuilderimpl.go:499 tryGetResolvedSymbolFromTypeNode
+    // Go: checker/nodebuilderimpl.go:511 tryGetResolvedSymbolFromTypeNode
     pub fn try_get_resolved_symbol_from_type_node(
         &mut self,
         _b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -836,7 +836,7 @@ impl Checker {
         links.resolved_symbol
     }
 
-    // Go: checker/nodebuilderimpl.go:512 existingTypeNodeIsNotReferenceOrIsReferenceWithCompatibleTypeArgumentCount
+    // Go: checker/nodebuilderimpl.go:524 existingTypeNodeIsNotReferenceOrIsReferenceWithCompatibleTypeArgumentCount
     pub fn existing_type_node_is_not_reference_or_is_reference_with_compatible_type_argument_count(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -873,7 +873,7 @@ impl Checker {
         existing.type_arguments().len() as i64 >= i64::from(min)
     }
 
-    // Go: checker/nodebuilderimpl.go:522 tryReuseExistingNonParameterTypeNode
+    // Go: checker/nodebuilderimpl.go:548 tryReuseExistingNonParameterTypeNode
     pub fn try_reuse_existing_non_parameter_type_node(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -900,7 +900,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/nodebuilderimpl.go:538 getResolvedTypeWithoutAbstractConstructSignatures
+    // Go: checker/nodebuilderimpl.go:564 getResolvedTypeWithoutAbstractConstructSignatures
     // PORT: Go takes the `*StructuredType`; here it is the type id.
     pub fn get_resolved_type_without_abstract_construct_signatures(
         &mut self,
@@ -952,7 +952,7 @@ impl Checker {
         type_copy
     }
 
-    // Go: checker/nodebuilderimpl.go:558 symbolToNode
+    // Go: checker/nodebuilderimpl.go:584 symbolToNode
     pub fn symbol_to_node(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -994,7 +994,7 @@ impl Checker {
         self.symbol_to_expression(b, symbol, meaning)
     }
 
-    // Go: checker/nodebuilderimpl.go:580 symbolToName
+    // Go: checker/nodebuilderimpl.go:606 symbolToName
     pub fn symbol_to_name(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -1020,7 +1020,7 @@ impl Checker {
         self.create_entity_name_from_symbol_chain(b, &chain, chain.len() - 1)
     }
 
-    // Go: checker/nodebuilderimpl.go:588 createEntityNameFromSymbolChain
+    // Go: checker/nodebuilderimpl.go:614 createEntityNameFromSymbolChain
     pub fn create_entity_name_from_symbol_chain(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -1054,7 +1054,7 @@ impl Checker {
         identifier
     }
 
-    // Go: checker/nodebuilderimpl.go:616 symbolToEntityNameNode
+    // Go: checker/nodebuilderimpl.go:642 symbolToEntityNameNode
     // TODO: Audit usages of symbolToEntityNameNode - they should probably all be symbolToName
     pub fn symbol_to_entity_name_node(
         &mut self,
@@ -1071,7 +1071,7 @@ impl Checker {
         identifier
     }
 
-    // Go: checker/nodebuilderimpl.go:624 symbolToTypeNode
+    // Go: checker/nodebuilderimpl.go:650 symbolToTypeNode
     pub fn symbol_to_type_node(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -1228,7 +1228,7 @@ impl Checker {
         entity_name
     }
 
-    // Go: checker/nodebuilderimpl.go:737 createAccessFromSymbolChain
+    // Go: checker/nodebuilderimpl.go:752 createAccessFromSymbolChain
     pub fn create_access_from_symbol_chain(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -1387,7 +1387,7 @@ impl Checker {
         identifier
     }
 
-    // Go: checker/nodebuilderimpl.go:833 symbolToExpression
+    // Go: checker/nodebuilderimpl.go:848 symbolToExpression
     pub fn symbol_to_expression(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -1415,7 +1415,7 @@ impl Checker {
         self.create_expression_from_symbol_chain(b, &chain, chain.len() - 1)
     }
 
-    // Go: checker/nodebuilderimpl.go:838 createExpressionFromSymbolChain
+    // Go: checker/nodebuilderimpl.go:858 createExpressionFromSymbolChain
     pub fn create_expression_from_symbol_chain(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -1495,7 +1495,7 @@ impl Checker {
         self.create_expression_with_type_arguments(b, access, type_parameter_nodes)
     }
 
-    // Go: checker/nodebuilderimpl.go:916 getNameOfSymbolFromNameType
+    // Go: checker/nodebuilderimpl.go:936 getNameOfSymbolFromNameType
     pub fn get_name_of_symbol_from_name_type(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -1536,7 +1536,7 @@ impl Checker {
         String::new()
     }
 
-    // Go: checker/nodebuilderimpl.go:953 getNameOfSymbolAsWritten
+    // Go: checker/nodebuilderimpl.go:973 getNameOfSymbolAsWritten
     /**
      * Gets a human-readable name for a symbol.
      * Should *not* be used for the right-hand side of a `.` -- use `symbolName(symbol)` for that instead.
@@ -1639,7 +1639,7 @@ impl Checker {
         escape_internal_symbol_name(self.sym(symbol).name.as_str())
     }
 
-    // Go: checker/nodebuilderimpl.go:1012 getTypeParametersOfClassOrInterface
+    // Go: checker/nodebuilderimpl.go:1029 getTypeParametersOfClassOrInterface
     // The full set of type parameters for a generic class or interface type consists of its outer type parameters plus
     // its locally declared type parameters.
     pub fn get_type_parameters_of_class_or_interface(

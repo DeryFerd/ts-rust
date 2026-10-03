@@ -45,7 +45,7 @@ impl<T: UnmarshalerFrom + Any> Target for T {
     }
 }
 
-// Go: lsp_json_test.go:11 TestUnmarshalRejectsNullForOptionalNonNullableFields
+// Go: lsp_json_test.go:12 TestUnmarshalRejectsNullForOptionalNonNullableFields
 #[test]
 fn test_unmarshal_rejects_null_for_optional_non_nullable_fields() {
     struct Test {
@@ -148,7 +148,7 @@ fn test_unmarshal_rejects_null_for_optional_non_nullable_fields() {
     }
 }
 
-// Go: lsp_json_test.go:115 TestUnmarshalAcceptsNullForNullableFields
+// Go: lsp_json_test.go:116 TestUnmarshalAcceptsNullForNullableFields
 #[test]
 fn test_unmarshal_accepts_null_for_nullable_fields() {
     struct Test {
@@ -191,7 +191,7 @@ fn test_unmarshal_accepts_null_for_nullable_fields() {
     }
 }
 
-// Go: lsp_json_test.go:159 TestUnmarshalAcceptsOmittedOptionalFields
+// Go: lsp_json_test.go:160 TestUnmarshalAcceptsOmittedOptionalFields
 #[test]
 fn test_unmarshal_accepts_omitted_optional_fields() {
     struct Test {
@@ -245,7 +245,7 @@ fn test_unmarshal_accepts_omitted_optional_fields() {
     }
 }
 
-// Go: lsp_json_test.go:212 TestUnmarshalRejectsIncompleteObjects
+// Go: lsp_json_test.go:213 TestUnmarshalRejectsIncompleteObjects
 #[test]
 fn test_unmarshal_rejects_incomplete_objects() {
     struct Test {
@@ -311,7 +311,7 @@ impl MarshalerTo for RoundTripValue {
     }
 }
 
-// Go: lsp_json_test.go:256 TestMarshalUnmarshalRoundTrip
+// Go: lsp_json_test.go:257 TestMarshalUnmarshalRoundTrip
 #[test]
 fn test_marshal_unmarshal_round_trip() {
     struct Test {
@@ -426,7 +426,7 @@ fn test_marshal_unmarshal_round_trip() {
     }
 }
 
-// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "IntegerOrString with integer"
+// Go: lsp_json_test.go:345 TestUnmarshalUnionTypes, "IntegerOrString with integer"
 #[test]
 fn test_unmarshal_union_types_integer_or_string_with_integer() {
     let mut v = IntegerOrString::default();
@@ -437,7 +437,7 @@ fn test_unmarshal_union_types_integer_or_string_with_integer() {
     assert!(v.string.is_none());
 }
 
-// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "IntegerOrString with string"
+// Go: lsp_json_test.go:345 TestUnmarshalUnionTypes, "IntegerOrString with string"
 #[test]
 fn test_unmarshal_union_types_integer_or_string_with_string() {
     let mut v = IntegerOrString::default();
@@ -448,7 +448,7 @@ fn test_unmarshal_union_types_integer_or_string_with_string() {
     assert!(v.integer.is_none());
 }
 
-// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "IntegerOrNull with integer"
+// Go: lsp_json_test.go:345 TestUnmarshalUnionTypes, "IntegerOrNull with integer"
 #[test]
 fn test_unmarshal_union_types_integer_or_null_with_integer() {
     let mut v = IntegerOrNull::default();
@@ -458,7 +458,7 @@ fn test_unmarshal_union_types_integer_or_null_with_integer() {
     assert_eq!(v.integer.unwrap(), 42i32);
 }
 
-// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "IntegerOrNull with null"
+// Go: lsp_json_test.go:345 TestUnmarshalUnionTypes, "IntegerOrNull with null"
 #[test]
 fn test_unmarshal_union_types_integer_or_null_with_null() {
     let mut v = IntegerOrNull::default();
@@ -467,7 +467,7 @@ fn test_unmarshal_union_types_integer_or_null_with_null() {
     assert!(v.integer.is_none());
 }
 
-// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "DocumentUriOrNull with string"
+// Go: lsp_json_test.go:345 TestUnmarshalUnionTypes, "DocumentUriOrNull with string"
 #[test]
 fn test_unmarshal_union_types_document_uri_or_null_with_string() {
     let mut v = DocumentUriOrNull::default();
@@ -480,7 +480,7 @@ fn test_unmarshal_union_types_document_uri_or_null_with_string() {
     );
 }
 
-// Go: lsp_json_test.go:344 TestUnmarshalUnionTypes, "DocumentUriOrNull with null"
+// Go: lsp_json_test.go:345 TestUnmarshalUnionTypes, "DocumentUriOrNull with null"
 #[test]
 fn test_unmarshal_union_types_document_uri_or_null_with_null() {
     let mut v = DocumentUriOrNull::default();
@@ -489,7 +489,7 @@ fn test_unmarshal_union_types_document_uri_or_null_with_null() {
     assert!(v.document_uri.is_none());
 }
 
-// Go: lsp_json_test.go:402 TestMarshalUnionTypes, "IntegerOrNull with value"
+// Go: lsp_json_test.go:403 TestMarshalUnionTypes, "IntegerOrNull with value"
 #[test]
 fn test_marshal_union_types_integer_or_null_with_value() {
     let v = IntegerOrNull {
@@ -500,7 +500,7 @@ fn test_marshal_union_types_integer_or_null_with_value() {
     assert_eq!(data.unwrap(), "42");
 }
 
-// Go: lsp_json_test.go:402 TestMarshalUnionTypes, "IntegerOrNull with null"
+// Go: lsp_json_test.go:403 TestMarshalUnionTypes, "IntegerOrNull with null"
 #[test]
 fn test_marshal_union_types_integer_or_null_with_null() {
     let v = IntegerOrNull::default();
@@ -509,7 +509,7 @@ fn test_marshal_union_types_integer_or_null_with_null() {
     assert_eq!(data.unwrap(), "null");
 }
 
-// Go: lsp_json_test.go:402 TestMarshalUnionTypes, "IntegerOrString with integer"
+// Go: lsp_json_test.go:403 TestMarshalUnionTypes, "IntegerOrString with integer"
 #[test]
 fn test_marshal_union_types_integer_or_string_with_integer() {
     let v = IntegerOrString {
@@ -521,7 +521,7 @@ fn test_marshal_union_types_integer_or_string_with_integer() {
     assert_eq!(data.unwrap(), "7");
 }
 
-// Go: lsp_json_test.go:402 TestMarshalUnionTypes, "IntegerOrString with string"
+// Go: lsp_json_test.go:403 TestMarshalUnionTypes, "IntegerOrString with string"
 #[test]
 fn test_marshal_union_types_integer_or_string_with_string() {
     let v = IntegerOrString {
@@ -533,7 +533,7 @@ fn test_marshal_union_types_integer_or_string_with_string() {
     assert_eq!(data.unwrap(), r#""tok""#);
 }
 
-// Go: lsp_json_test.go:438 TestUnmarshalIgnoresUnknownFields, "Location with extra fields"
+// Go: lsp_json_test.go:439 TestUnmarshalIgnoresUnknownFields, "Location with extra fields"
 #[test]
 fn test_unmarshal_ignores_unknown_fields_location_with_extra_fields() {
     let mut loc = Location::default();
@@ -551,7 +551,7 @@ fn test_unmarshal_ignores_unknown_fields_location_with_extra_fields() {
     assert_eq!(loc.uri, DocumentUri("file:///test.ts".to_string()));
 }
 
-// Go: lsp_json_test.go:438 TestUnmarshalIgnoresUnknownFields, "InlayHint with extra fields"
+// Go: lsp_json_test.go:439 TestUnmarshalIgnoresUnknownFields, "InlayHint with extra fields"
 #[test]
 fn test_unmarshal_ignores_unknown_fields_inlay_hint_with_extra_fields() {
     let mut hint = InlayHint::default();
@@ -567,7 +567,7 @@ fn test_unmarshal_ignores_unknown_fields_inlay_hint_with_extra_fields() {
     assert_nil_error("InlayHint with extra fields", &err);
 }
 
-// Go: lsp_json_test.go:466 TestUnmarshalRejectsWrongTypes
+// Go: lsp_json_test.go:467 TestUnmarshalRejectsWrongTypes
 #[test]
 fn test_unmarshal_rejects_wrong_types() {
     struct Test {
@@ -615,7 +615,7 @@ fn test_unmarshal_rejects_wrong_types() {
     }
 }
 
-// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects boolean"
+// Go: lsp_json_test.go:511 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects boolean"
 #[test]
 fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_boolean() {
     let mut v = IntegerOrString::default();
@@ -623,7 +623,7 @@ fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_boolean() {
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects null"
+// Go: lsp_json_test.go:511 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects null"
 #[test]
 fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_null() {
     let mut v = IntegerOrString::default();
@@ -631,7 +631,7 @@ fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_null() {
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects object"
+// Go: lsp_json_test.go:511 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects object"
 #[test]
 fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_object() {
     let mut v = IntegerOrString::default();
@@ -639,7 +639,7 @@ fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_object() {
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects array"
+// Go: lsp_json_test.go:511 TestUnmarshalUnionTypeWrongKind, "IntegerOrString rejects array"
 #[test]
 fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_array() {
     let mut v = IntegerOrString::default();
@@ -647,7 +647,7 @@ fn test_unmarshal_union_type_wrong_kind_integer_or_string_rejects_array() {
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "StringOrInlayHintLabelParts rejects number"
+// Go: lsp_json_test.go:511 TestUnmarshalUnionTypeWrongKind, "StringOrInlayHintLabelParts rejects number"
 #[test]
 fn test_unmarshal_union_type_wrong_kind_string_or_inlay_hint_label_parts_rejects_number() {
     let mut v = StringOrInlayHintLabelParts::default();
@@ -655,7 +655,7 @@ fn test_unmarshal_union_type_wrong_kind_string_or_inlay_hint_label_parts_rejects
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:510 TestUnmarshalUnionTypeWrongKind, "StringOrInlayHintLabelParts rejects boolean"
+// Go: lsp_json_test.go:511 TestUnmarshalUnionTypeWrongKind, "StringOrInlayHintLabelParts rejects boolean"
 #[test]
 fn test_unmarshal_union_type_wrong_kind_string_or_inlay_hint_label_parts_rejects_boolean() {
     let mut v = StringOrInlayHintLabelParts::default();
@@ -663,7 +663,7 @@ fn test_unmarshal_union_type_wrong_kind_string_or_inlay_hint_label_parts_rejects
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:556 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions with true"
+// Go: lsp_json_test.go:557 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions with true"
 #[test]
 fn test_unmarshal_boolean_union_types_boolean_or_hover_options_with_true() {
     let mut v = BooleanOrHoverOptions::default();
@@ -674,7 +674,7 @@ fn test_unmarshal_boolean_union_types_boolean_or_hover_options_with_true() {
     assert!(v.hover_options.is_none());
 }
 
-// Go: lsp_json_test.go:556 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions with false"
+// Go: lsp_json_test.go:557 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions with false"
 #[test]
 fn test_unmarshal_boolean_union_types_boolean_or_hover_options_with_false() {
     let mut v = BooleanOrHoverOptions::default();
@@ -685,7 +685,7 @@ fn test_unmarshal_boolean_union_types_boolean_or_hover_options_with_false() {
     assert!(v.hover_options.is_none());
 }
 
-// Go: lsp_json_test.go:556 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions with object"
+// Go: lsp_json_test.go:557 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions with object"
 #[test]
 fn test_unmarshal_boolean_union_types_boolean_or_hover_options_with_object() {
     let mut v = BooleanOrHoverOptions::default();
@@ -695,7 +695,7 @@ fn test_unmarshal_boolean_union_types_boolean_or_hover_options_with_object() {
     assert!(v.hover_options.is_some());
 }
 
-// Go: lsp_json_test.go:556 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions rejects string"
+// Go: lsp_json_test.go:557 TestUnmarshalBooleanUnionTypes, "BooleanOrHoverOptions rejects string"
 #[test]
 fn test_unmarshal_boolean_union_types_boolean_or_hover_options_rejects_string() {
     let mut v = BooleanOrHoverOptions::default();
@@ -703,7 +703,7 @@ fn test_unmarshal_boolean_union_types_boolean_or_hover_options_rejects_string() 
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:596 TestUnmarshalDiscriminatorUnion, "WorkDoneProgressBegin"
+// Go: lsp_json_test.go:602 TestUnmarshalDiscriminatorUnion, "WorkDoneProgressBegin"
 #[test]
 fn test_unmarshal_discriminator_union_work_done_progress_begin() {
     let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
@@ -715,7 +715,7 @@ fn test_unmarshal_discriminator_union_work_done_progress_begin() {
     assert_eq!(v.begin.as_ref().unwrap().title, "Indexing");
 }
 
-// Go: lsp_json_test.go:596 TestUnmarshalDiscriminatorUnion, "WorkDoneProgressReport"
+// Go: lsp_json_test.go:602 TestUnmarshalDiscriminatorUnion, "WorkDoneProgressReport"
 #[test]
 fn test_unmarshal_discriminator_union_work_done_progress_report() {
     let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
@@ -731,7 +731,7 @@ fn test_unmarshal_discriminator_union_work_done_progress_report() {
     );
 }
 
-// Go: lsp_json_test.go:596 TestUnmarshalDiscriminatorUnion, "WorkDoneProgressEnd"
+// Go: lsp_json_test.go:602 TestUnmarshalDiscriminatorUnion, "WorkDoneProgressEnd"
 #[test]
 fn test_unmarshal_discriminator_union_work_done_progress_end() {
     let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
@@ -742,7 +742,7 @@ fn test_unmarshal_discriminator_union_work_done_progress_end() {
     assert!(v.end.is_some());
 }
 
-// Go: lsp_json_test.go:596 TestUnmarshalDiscriminatorUnion, "invalid discriminator"
+// Go: lsp_json_test.go:602 TestUnmarshalDiscriminatorUnion, "invalid discriminator"
 #[test]
 fn test_unmarshal_discriminator_union_invalid_discriminator() {
     let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
@@ -750,7 +750,7 @@ fn test_unmarshal_discriminator_union_invalid_discriminator() {
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:638 TestUnmarshalDiscriminatorUnion, "discriminator after variant fields"
+// Go: lsp_json_test.go:602 TestUnmarshalDiscriminatorUnion, "discriminator after variant fields"
 #[test]
 fn test_unmarshal_discriminator_union_discriminator_after_variant_fields() {
     let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
@@ -771,7 +771,7 @@ fn test_unmarshal_discriminator_union_discriminator_after_variant_fields() {
 // it is not ported; the generated arms keep the discriminator (the tests
 // above read the arm that it picks).
 
-// Go: lsp_json_test.go:668 TestUnmarshalDiscriminatorUnion, "non-string discriminator"
+// Go: lsp_json_test.go:602 TestUnmarshalDiscriminatorUnion, "non-string discriminator"
 #[test]
 fn test_unmarshal_discriminator_union_non_string_discriminator() {
     let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
@@ -779,7 +779,7 @@ fn test_unmarshal_discriminator_union_non_string_discriminator() {
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:675 TestUnmarshalDiscriminatorUnion, "missing discriminator"
+// Go: lsp_json_test.go:602 TestUnmarshalDiscriminatorUnion, "missing discriminator"
 #[test]
 fn test_unmarshal_discriminator_union_missing_discriminator() {
     let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
@@ -791,7 +791,7 @@ fn test_unmarshal_discriminator_union_missing_discriminator() {
     );
 }
 
-// Go: lsp_json_test.go:640 TestUnmarshalPresenceDiscriminatorUnion, "TextEdit via range field"
+// Go: lsp_json_test.go:683 TestUnmarshalPresenceDiscriminatorUnion, "TextEdit via range field"
 #[test]
 fn test_unmarshal_presence_discriminator_union_text_edit_via_range_field() {
     let mut v = TextEditOrInsertReplaceEdit::default();
@@ -809,7 +809,7 @@ fn test_unmarshal_presence_discriminator_union_text_edit_via_range_field() {
     assert_eq!(v.text_edit.as_ref().unwrap().new_text, "x");
 }
 
-// Go: lsp_json_test.go:640 TestUnmarshalPresenceDiscriminatorUnion, "InsertReplaceEdit via insert field"
+// Go: lsp_json_test.go:683 TestUnmarshalPresenceDiscriminatorUnion, "InsertReplaceEdit via insert field"
 #[test]
 fn test_unmarshal_presence_discriminator_union_insert_replace_edit_via_insert_field() {
     let mut v = TextEditOrInsertReplaceEdit::default();
@@ -828,7 +828,7 @@ fn test_unmarshal_presence_discriminator_union_insert_replace_edit_via_insert_fi
     assert_eq!(v.insert_replace_edit.as_ref().unwrap().new_text, "y");
 }
 
-// Go: lsp_json_test.go:671 TestUnmarshalStringOrArrayUnion, "StringOrInlayHintLabelParts with string"
+// Go: lsp_json_test.go:714 TestUnmarshalStringOrArrayUnion, "StringOrInlayHintLabelParts with string"
 #[test]
 fn test_unmarshal_string_or_array_union_string_or_inlay_hint_label_parts_with_string() {
     let mut v = StringOrInlayHintLabelParts::default();
@@ -839,7 +839,7 @@ fn test_unmarshal_string_or_array_union_string_or_inlay_hint_label_parts_with_st
     assert!(v.inlay_hint_label_parts.is_none());
 }
 
-// Go: lsp_json_test.go:671 TestUnmarshalStringOrArrayUnion, "StringOrInlayHintLabelParts with array"
+// Go: lsp_json_test.go:714 TestUnmarshalStringOrArrayUnion, "StringOrInlayHintLabelParts with array"
 #[test]
 fn test_unmarshal_string_or_array_union_string_or_inlay_hint_label_parts_with_array() {
     let mut v = StringOrInlayHintLabelParts::default();
@@ -859,7 +859,7 @@ fn test_unmarshal_string_or_array_union_string_or_inlay_hint_label_parts_with_ar
     assert_eq!(first.value, "param");
 }
 
-// Go: lsp_json_test.go:696 TestUnmarshalDocumentEditUnion, "TextDocumentEdit without kind"
+// Go: lsp_json_test.go:739 TestUnmarshalDocumentEditUnion, "TextDocumentEdit without kind"
 #[test]
 fn test_unmarshal_document_edit_union_text_document_edit_without_kind() {
     let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
@@ -878,7 +878,7 @@ fn test_unmarshal_document_edit_union_text_document_edit_without_kind() {
     assert!(v.delete_file.is_none());
 }
 
-// Go: lsp_json_test.go:756 TestUnmarshalDocumentEditUnion, "TextDocumentEdit with non-string kind"
+// Go: lsp_json_test.go:739 TestUnmarshalDocumentEditUnion, "TextDocumentEdit with non-string kind"
 #[test]
 fn test_unmarshal_document_edit_union_text_document_edit_with_non_string_kind() {
     let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
@@ -898,7 +898,7 @@ fn test_unmarshal_document_edit_union_text_document_edit_with_non_string_kind() 
     assert!(v.delete_file.is_none());
 }
 
-// Go: lsp_json_test.go:696 TestUnmarshalDocumentEditUnion, "CreateFile with kind create"
+// Go: lsp_json_test.go:739 TestUnmarshalDocumentEditUnion, "CreateFile with kind create"
 #[test]
 fn test_unmarshal_document_edit_union_create_file_with_kind_create() {
     let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
@@ -916,7 +916,7 @@ fn test_unmarshal_document_edit_union_create_file_with_kind_create() {
     );
 }
 
-// Go: lsp_json_test.go:781 TestUnmarshalDocumentEditUnion, "CreateFile with kind after fields"
+// Go: lsp_json_test.go:739 TestUnmarshalDocumentEditUnion, "CreateFile with kind after fields"
 #[test]
 fn test_unmarshal_document_edit_union_create_file_with_kind_after_fields() {
     let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
@@ -933,7 +933,7 @@ fn test_unmarshal_document_edit_union_create_file_with_kind_after_fields() {
     );
 }
 
-// Go: lsp_json_test.go:696 TestUnmarshalDocumentEditUnion, "RenameFile with kind rename"
+// Go: lsp_json_test.go:739 TestUnmarshalDocumentEditUnion, "RenameFile with kind rename"
 #[test]
 fn test_unmarshal_document_edit_union_rename_file_with_kind_rename() {
     let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
@@ -950,7 +950,7 @@ fn test_unmarshal_document_edit_union_rename_file_with_kind_rename() {
     );
 }
 
-// Go: lsp_json_test.go:696 TestUnmarshalDocumentEditUnion, "DeleteFile with kind delete"
+// Go: lsp_json_test.go:739 TestUnmarshalDocumentEditUnion, "DeleteFile with kind delete"
 #[test]
 fn test_unmarshal_document_edit_union_delete_file_with_kind_delete() {
     let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
@@ -967,7 +967,7 @@ fn test_unmarshal_document_edit_union_delete_file_with_kind_delete() {
     );
 }
 
-// Go: lsp_json_test.go:742 TestUnmarshalFieldOrdering, "Location with reversed field order"
+// Go: lsp_json_test.go:809 TestUnmarshalFieldOrdering, "Location with reversed field order"
 #[test]
 fn test_unmarshal_field_ordering_location_with_reversed_field_order() {
     let mut loc = Location::default();
@@ -984,7 +984,7 @@ fn test_unmarshal_field_ordering_location_with_reversed_field_order() {
     assert_eq!(loc.range.start.line, 1u32);
 }
 
-// Go: lsp_json_test.go:742 TestUnmarshalFieldOrdering, "InlayHint with kind before label"
+// Go: lsp_json_test.go:809 TestUnmarshalFieldOrdering, "InlayHint with kind before label"
 #[test]
 fn test_unmarshal_field_ordering_inlay_hint_with_kind_before_label() {
     let mut hint = InlayHint::default();
@@ -1002,7 +1002,7 @@ fn test_unmarshal_field_ordering_inlay_hint_with_kind_before_label() {
     assert_eq!(hint.kind.unwrap(), InlayHintKind::TYPE);
 }
 
-// Go: lsp_json_test.go:771 TestUnmarshalEmptyObject, "WorkDoneProgressOptions empty"
+// Go: lsp_json_test.go:838 TestUnmarshalEmptyObject, "WorkDoneProgressOptions empty"
 #[test]
 fn test_unmarshal_empty_object_work_done_progress_options_empty() {
     let mut v = WorkDoneProgressOptions::default();
@@ -1011,7 +1011,7 @@ fn test_unmarshal_empty_object_work_done_progress_options_empty() {
     assert!(v.work_done_progress.is_none());
 }
 
-// Go: lsp_json_test.go:771 TestUnmarshalEmptyObject, "InitializationOptions empty"
+// Go: lsp_json_test.go:838 TestUnmarshalEmptyObject, "InitializationOptions empty"
 #[test]
 fn test_unmarshal_empty_object_initialization_options_empty() {
     let mut v = InitializationOptions::default();
@@ -1019,7 +1019,7 @@ fn test_unmarshal_empty_object_initialization_options_empty() {
     assert_nil_error("InitializationOptions empty", &err);
 }
 
-// Go: lsp_json_test.go:771 TestUnmarshalEmptyObject, "ClientCapabilities empty"
+// Go: lsp_json_test.go:838 TestUnmarshalEmptyObject, "ClientCapabilities empty"
 #[test]
 fn test_unmarshal_empty_object_client_capabilities_empty() {
     let mut v = ClientCapabilities::default();
@@ -1027,7 +1027,7 @@ fn test_unmarshal_empty_object_client_capabilities_empty() {
     assert_nil_error("ClientCapabilities empty", &err);
 }
 
-// Go: lsp_json_test.go:771 TestUnmarshalEmptyObject, "ServerCapabilities empty"
+// Go: lsp_json_test.go:838 TestUnmarshalEmptyObject, "ServerCapabilities empty"
 #[test]
 fn test_unmarshal_empty_object_server_capabilities_empty() {
     let mut v = ServerCapabilities::default();
@@ -1035,7 +1035,7 @@ fn test_unmarshal_empty_object_server_capabilities_empty() {
     assert_nil_error("ServerCapabilities empty", &err);
 }
 
-// Go: lsp_json_test.go:804 TestMarshalOmitsZeroOptionalFields, "InlayHint omits nil fields"
+// Go: lsp_json_test.go:871 TestMarshalOmitsZeroOptionalFields, "InlayHint omits nil fields"
 #[test]
 fn test_marshal_omits_zero_optional_fields_inlay_hint_omits_nil_fields() {
     let hint = InlayHint {
@@ -1068,7 +1068,7 @@ fn test_marshal_omits_zero_optional_fields_inlay_hint_omits_nil_fields() {
     assert!(s.contains("label"), "should contain 'label', got: {s}");
 }
 
-// Go: lsp_json_test.go:804 TestMarshalOmitsZeroOptionalFields, "FoldingRange omits nil optional fields"
+// Go: lsp_json_test.go:871 TestMarshalOmitsZeroOptionalFields, "FoldingRange omits nil optional fields"
 #[test]
 fn test_marshal_omits_zero_optional_fields_folding_range_omits_nil_optional_fields() {
     let fr = FoldingRange {
@@ -1091,7 +1091,7 @@ fn test_marshal_omits_zero_optional_fields_folding_range_omits_nil_optional_fiel
     assert!(s.contains("endLine"), "should contain 'endLine', got: {s}");
 }
 
-// Go: lsp_json_test.go:836 TestLiteralTypes, "StringLiteralCreate marshal"
+// Go: lsp_json_test.go:903 TestLiteralTypes, "StringLiteralCreate marshal"
 #[test]
 fn test_literal_types_string_literal_create_marshal() {
     let v = StringLiteralCreate;
@@ -1100,7 +1100,7 @@ fn test_literal_types_string_literal_create_marshal() {
     assert_eq!(data.unwrap(), r#""create""#);
 }
 
-// Go: lsp_json_test.go:836 TestLiteralTypes, "StringLiteralCreate unmarshal"
+// Go: lsp_json_test.go:903 TestLiteralTypes, "StringLiteralCreate unmarshal"
 #[test]
 fn test_literal_types_string_literal_create_unmarshal() {
     let mut v = StringLiteralCreate;
@@ -1108,7 +1108,7 @@ fn test_literal_types_string_literal_create_unmarshal() {
     assert_nil_error("StringLiteralCreate unmarshal", &err);
 }
 
-// Go: lsp_json_test.go:836 TestLiteralTypes, "StringLiteralCreate rejects wrong value"
+// Go: lsp_json_test.go:903 TestLiteralTypes, "StringLiteralCreate rejects wrong value"
 #[test]
 fn test_literal_types_string_literal_create_rejects_wrong_value() {
     let mut v = StringLiteralCreate;
@@ -1116,7 +1116,7 @@ fn test_literal_types_string_literal_create_rejects_wrong_value() {
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:836 TestLiteralTypes, "StringLiteralCreate rejects wrong type"
+// Go: lsp_json_test.go:903 TestLiteralTypes, "StringLiteralCreate rejects wrong type"
 #[test]
 fn test_literal_types_string_literal_create_rejects_wrong_type() {
     let mut v = StringLiteralCreate;
@@ -1124,14 +1124,14 @@ fn test_literal_types_string_literal_create_rejects_wrong_type() {
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:869 TestEnumStringValues, "InlayHintKind values"
+// Go: lsp_json_test.go:936 TestEnumStringValues, "InlayHintKind values"
 #[test]
 fn test_enum_string_values_inlay_hint_kind_values() {
     assert_eq!(InlayHintKind::TYPE.string(), "Type");
     assert_eq!(InlayHintKind::PARAMETER.string(), "Parameter");
 }
 
-// Go: lsp_json_test.go:869 TestEnumStringValues, "SymbolKind values"
+// Go: lsp_json_test.go:936 TestEnumStringValues, "SymbolKind values"
 #[test]
 fn test_enum_string_values_symbol_kind_values() {
     assert_eq!(SymbolKind::FILE.string(), "File");
@@ -1139,7 +1139,7 @@ fn test_enum_string_values_symbol_kind_values() {
     assert_eq!(SymbolKind::VARIABLE.string(), "Variable");
 }
 
-// Go: lsp_json_test.go:869 TestEnumStringValues, "unknown enum value"
+// Go: lsp_json_test.go:936 TestEnumStringValues, "unknown enum value"
 #[test]
 fn test_enum_string_values_unknown_enum_value() {
     let v = InlayHintKind(999);
@@ -1165,7 +1165,7 @@ fn check_round_trip<T: MarshalerTo + UnmarshalerFrom + Default>(name: &str, valu
     assert_eq!(data, again.expect("checked"), "{name}: re-marshal differs");
 }
 
-// Go: lsp_json_test.go:900 TestRoundTrip
+// Go: lsp_json_test.go:966 TestRoundTrip
 // TestRoundTrip locks the generated codecs: every value must survive
 // marshal -> unmarshal unchanged. This guards fidelity so codec changes
 // (e.g. pruning or table-driving them) cannot silently corrupt the wire
@@ -1261,7 +1261,7 @@ fn test_round_trip() {
     );
 }
 
-// Go: lsp_json_test.go:951 TestStrictnessMissingRequired
+// Go: lsp_json_test.go:1017 TestStrictnessMissingRequired
 // TestStrictnessMissingRequired confirms required fields are still enforced;
 // default reflective decoding would silently accept these.
 #[test]
@@ -1291,7 +1291,7 @@ fn test_strictness_missing_required() {
     );
 }
 
-// Go: lsp_json_test.go:973 TestStrictnessNotObject
+// Go: lsp_json_test.go:1039 TestStrictnessNotObject
 // TestStrictnessNotObject confirms a non-object where an object is required
 // is rejected rather than coerced.
 #[test]
@@ -1320,7 +1320,7 @@ fn is_invalid_params(err: &GoError) -> bool {
     gostd::errors::is(err, &gostd::errors::from_value(ErrorCode::INVALID_PARAMS))
 }
 
-// Go: lsp_json_test.go:983 TestUnmarshalParamsRequiresParams
+// Go: lsp_json_test.go:1049 TestUnmarshalParamsRequiresParams
 // TestUnmarshalParamsRequiresParams verifies that a NoParams method must be
 // given no params while every other method must be given params, and that a
 // mismatch (including a null value either way) is an InvalidParams error.

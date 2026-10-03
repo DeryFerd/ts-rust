@@ -27,7 +27,7 @@ impl_es_transformer!(ObjectRestSpreadTransformer);
 type OldParamScope = Option<FxHashSet<Node>>;
 
 impl ObjectRestSpreadTransformer {
-    // Go: transformers/estransforms/objectrestspread.go:19 objectRestSpreadTransformer.visit
+    // Go: transformers/estransforms/objectrestspread.go:20 objectRestSpreadTransformer.visit
     fn visit(&mut self, node: Node) -> Node {
         if !node
             .subtree_facts()
@@ -79,7 +79,7 @@ impl ObjectRestSpreadTransformer {
         }
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:69 objectRestSpreadTransformer.visitSourceFile
+    // Go: transformers/estransforms/objectrestspread.go:71 objectRestSpreadTransformer.visitSourceFile
     fn visit_source_file(&mut self, node: Node) -> Node {
         let visited = self.visit_each_child(node);
         let ec = self.ec();
@@ -87,7 +87,7 @@ impl ObjectRestSpreadTransformer {
         visited
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:75 objectRestSpreadTransformer.visitParameter
+    // Go: transformers/estransforms/objectrestspread.go:77 objectRestSpreadTransformer.visitParameter
     fn visit_parameter(&mut self, node: Node) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -129,7 +129,7 @@ impl ObjectRestSpreadTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:109 objectRestSpreadTransformer.collectParametersWithPrecedingObjectRestOrSpread
+    // Go: transformers/estransforms/objectrestspread.go:111 objectRestSpreadTransformer.collectParametersWithPrecedingObjectRestOrSpread
     fn collect_parameters_with_preceding_object_rest_or_spread(
         &self,
         node: Node,
@@ -148,7 +148,7 @@ impl ObjectRestSpreadTransformer {
         result
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:123 objectRestSpreadTransformer.enterParameterListContext
+    // Go: transformers/estransforms/objectrestspread.go:125 objectRestSpreadTransformer.enterParameterListContext
     fn enter_parameter_list_context(&mut self, node: Node) -> OldParamScope {
         let old = self.parameters_with_preceding_object_rest_or_spread.take();
         self.parameters_with_preceding_object_rest_or_spread =
@@ -156,12 +156,12 @@ impl ObjectRestSpreadTransformer {
         old
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:129 objectRestSpreadTransformer.exitParameterListContext
+    // Go: transformers/estransforms/objectrestspread.go:131 objectRestSpreadTransformer.exitParameterListContext
     fn exit_parameter_list_context(&mut self, scope: OldParamScope) {
         self.parameters_with_preceding_object_rest_or_spread = scope;
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:133 objectRestSpreadTransformer.visitContructorDeclaration
+    // Go: transformers/estransforms/objectrestspread.go:135 objectRestSpreadTransformer.visitContructorDeclaration
     fn visit_contructor_declaration(&mut self, node: Node) -> Node {
         let old = self.enter_parameter_list_context(node);
         let parameters = self.visit_nodes(node.parameter_list());
@@ -179,7 +179,7 @@ impl ObjectRestSpreadTransformer {
         result
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:147 objectRestSpreadTransformer.visitGetAccessorDeclaration
+    // Go: transformers/estransforms/objectrestspread.go:149 objectRestSpreadTransformer.visitGetAccessorDeclaration
     fn visit_get_accessor_declaration(&mut self, node: Node) -> Node {
         let old = self.enter_parameter_list_context(node);
         let name = self.visit_node(node.name());
@@ -199,7 +199,7 @@ impl ObjectRestSpreadTransformer {
         result
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:162 objectRestSpreadTransformer.visitSetAccessorDeclaration
+    // Go: transformers/estransforms/objectrestspread.go:164 objectRestSpreadTransformer.visitSetAccessorDeclaration
     fn visit_set_accessor_declaration(&mut self, node: Node) -> Node {
         let old = self.enter_parameter_list_context(node);
         let name = self.visit_node(node.name());
@@ -219,7 +219,7 @@ impl ObjectRestSpreadTransformer {
         result
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:177 objectRestSpreadTransformer.visitMethodDeclaration
+    // Go: transformers/estransforms/objectrestspread.go:179 objectRestSpreadTransformer.visitMethodDeclaration
     fn visit_method_declaration(&mut self, node: Node) -> Node {
         let old = self.enter_parameter_list_context(node);
         let name = self.visit_node(node.name());
@@ -241,7 +241,7 @@ impl ObjectRestSpreadTransformer {
         result
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:194 objectRestSpreadTransformer.visitFunctionDeclaration
+    // Go: transformers/estransforms/objectrestspread.go:196 objectRestSpreadTransformer.visitFunctionDeclaration
     fn visit_function_declaration(&mut self, node: Node) -> Node {
         let old = self.enter_parameter_list_context(node);
         let name = self.visit_node(node.name());
@@ -262,7 +262,7 @@ impl ObjectRestSpreadTransformer {
         result
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:210 objectRestSpreadTransformer.visitArrowFunction
+    // Go: transformers/estransforms/objectrestspread.go:212 objectRestSpreadTransformer.visitArrowFunction
     fn visit_arrow_function(&mut self, node: Node) -> Node {
         let old = self.enter_parameter_list_context(node);
         let parameters = self.visit_nodes(node.parameter_list());
@@ -281,7 +281,7 @@ impl ObjectRestSpreadTransformer {
         result
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:225 objectRestSpreadTransformer.visitFunctionExpression
+    // Go: transformers/estransforms/objectrestspread.go:227 objectRestSpreadTransformer.visitFunctionExpression
     fn visit_function_expression(&mut self, node: Node) -> Node {
         let old = self.enter_parameter_list_context(node);
         let name = self.visit_node(node.name());
@@ -302,7 +302,7 @@ impl ObjectRestSpreadTransformer {
         result
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:241 objectRestSpreadTransformer.transformFunctionBody
+    // Go: transformers/estransforms/objectrestspread.go:243 objectRestSpreadTransformer.transformFunctionBody
     fn transform_function_body(&mut self, node: Node) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -397,7 +397,7 @@ impl ObjectRestSpreadTransformer {
         statement
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:284 objectRestSpreadTransformer.collectObjectRestAssignments
+    // Go: transformers/estransforms/objectrestspread.go:288 objectRestSpreadTransformer.collectObjectRestAssignments
     fn collect_object_rest_assignments(&mut self, node: Node) -> Vec<Node> {
         let ec = self.ec();
         let f = ec.factory();
@@ -499,7 +499,7 @@ impl ObjectRestSpreadTransformer {
         results
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:376 objectRestSpreadTransformer.visitCatchClause
+    // Go: transformers/estransforms/objectrestspread.go:378 objectRestSpreadTransformer.visitCatchClause
     fn visit_catch_clause(&mut self, node: Node) -> Node {
         let variable_declaration = node.variable_declaration();
         if variable_declaration.is_some()
@@ -559,7 +559,7 @@ impl ObjectRestSpreadTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:410 objectRestSpreadTransformer.visitVariableStatement
+    // Go: transformers/estransforms/objectrestspread.go:412 objectRestSpreadTransformer.visitVariableStatement
     fn visit_variable_statement(&mut self, node: Node) -> Node {
         if has_syntactic_modifier(node, ModifierFlags::EXPORT) {
             let old_in_exported_variable_statement = self.in_exported_variable_statement;
@@ -571,7 +571,7 @@ impl ObjectRestSpreadTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:421 objectRestSpreadTransformer.visitVariableDeclaration
+    // Go: transformers/estransforms/objectrestspread.go:423 objectRestSpreadTransformer.visitVariableDeclaration
     fn visit_variable_declaration(&mut self, node: Node) -> Node {
         if self.in_exported_variable_statement {
             self.in_exported_variable_statement = false;
@@ -582,7 +582,7 @@ impl ObjectRestSpreadTransformer {
         self.visit_variable_declaration_worker(node, false)
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:431 objectRestSpreadTransformer.visitVariableDeclarationWorker
+    // Go: transformers/estransforms/objectrestspread.go:433 objectRestSpreadTransformer.visitVariableDeclarationWorker
     fn visit_variable_declaration_worker(&mut self, node: Node, exported: bool) -> Node {
         // If we are here it is because the name contains a binding pattern with a rest somewhere in it.
         if is_binding_pattern(node.name())
@@ -601,7 +601,7 @@ impl ObjectRestSpreadTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:443 objectRestSpreadTransformer.visitForOftatement
+    // Go: transformers/estransforms/objectrestspread.go:445 objectRestSpreadTransformer.visitForOftatement
     fn visit_for_oftatement(&mut self, node: Node) -> Node {
         let initializer = node.initializer();
         if initializer
@@ -670,7 +670,7 @@ impl ObjectRestSpreadTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:500 objectRestSpreadTransformer.visitBinaryExpression
+    // Go: transformers/estransforms/objectrestspread.go:498 objectRestSpreadTransformer.visitBinaryExpression
     fn visit_binary_expression(&mut self, node: Node, expression_result_is_unused: bool) -> Node {
         if is_destructuring_assignment(node) && contains_object_rest_or_spread(node.left()) {
             let ec = self.ec();
@@ -702,7 +702,7 @@ impl ObjectRestSpreadTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/objectrestspread.go:518 objectRestSpreadTransformer.visitObjectLiteralExpression
+    // Go: transformers/estransforms/objectrestspread.go:516 objectRestSpreadTransformer.visitObjectLiteralExpression
     fn visit_object_literal_expression(&mut self, node: Node) -> Node {
         if !node
             .subtree_facts()

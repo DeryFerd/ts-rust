@@ -362,7 +362,7 @@ impl NewProgram {
     }
 }
 
-// Go: program.go:269 NewProgram
+// Go: program.go:285 NewProgram
 pub fn new_program(opts: ProgramOptions) -> NewProgram {
     let _trace = crate::tracing::get().map(|tr| {
         tr.push(
@@ -741,24 +741,24 @@ impl NewProgram {
     }
 }
 
-// Go: program.go:381 equalModuleSpecifiers
+// Go: program.go:495 equalModuleSpecifiers
 pub fn equal_module_specifiers(n1: Node, n2: Node) -> bool {
     n1.kind() == n2.kind() && (!is_string_literal(n1) || n1.text() == n2.text())
 }
 
-// Go: program.go:385 equalModuleAugmentationNames
+// Go: program.go:499 equalModuleAugmentationNames
 pub fn equal_module_augmentation_names(n1: Node, n2: Node) -> bool {
     n1.kind() == n2.kind() && n1.text() == n2.text()
 }
 
-// Go: program.go:389 equalFileReferences
+// Go: program.go:503 equalFileReferences
 pub fn equal_file_references(f1: &FileReference, f2: &FileReference) -> bool {
     f1.file_name == f2.file_name
         && f1.resolution_mode == f2.resolution_mode
         && f1.preserve == f2.preserve
 }
 
-// Go: program.go:393 equalCheckJSDirectives
+// Go: program.go:507 equalCheckJSDirectives
 pub fn equal_check_js_directives(
     d1: Option<&CheckJsDirective>,
     d2: Option<&CheckJsDirective>,

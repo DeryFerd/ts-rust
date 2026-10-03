@@ -182,7 +182,7 @@ fn is_leftmost_jsx_tag_name(node: Node) -> bool {
 }
 
 impl<'t> FormattingScanner<'t> {
-    // Go: format/scanner.go:126 shouldRescanJsxText
+    // Go: format/scanner.go:144 shouldRescanJsxText
     pub fn should_rescan_jsx_text(&self, node: Node) -> bool {
         if is_jsx_text(node) {
             return true;
@@ -195,29 +195,29 @@ impl<'t> FormattingScanner<'t> {
     }
 }
 
-// Go: format/scanner.go:137 shouldRescanSlashToken
+// Go: format/scanner.go:155 shouldRescanSlashToken
 pub fn should_rescan_slash_token(container: Node) -> bool {
     container.kind() == SyntaxKind::RegularExpressionLiteral
 }
 
-// Go: format/scanner.go:141 shouldRescanTemplateToken
+// Go: format/scanner.go:159 shouldRescanTemplateToken
 pub fn should_rescan_template_token(container: Node) -> bool {
     container.kind() == SyntaxKind::TemplateMiddle || container.kind() == SyntaxKind::TemplateTail
 }
 
-// Go: format/scanner.go:146 shouldRescanJsxAttributeValue
+// Go: format/scanner.go:164 shouldRescanJsxAttributeValue
 pub fn should_rescan_jsx_attribute_value(node: Node) -> bool {
     node.parent().is_some()
         && is_jsx_attribute(node.parent())
         && node.parent().initializer() == node
 }
 
-// Go: format/scanner.go:150 startsWithSlashToken
+// Go: format/scanner.go:168 startsWithSlashToken
 pub fn starts_with_slash_token(t: SyntaxKind) -> bool {
     t == SyntaxKind::SlashToken || t == SyntaxKind::SlashEqualsToken
 }
 
-// Go: format/scanner.go:154 scanAction
+// Go: format/scanner.go:172 scanAction
 go_enum!(ScanAction, i32 {
     ACTION_SCAN = 0; // actionScan
     ACTION_RESCAN_GREATER_THAN_TOKEN = 1; // actionRescanGreaterThanToken
@@ -228,7 +228,7 @@ go_enum!(ScanAction, i32 {
     ACTION_RESCAN_JSX_ATTRIBUTE_VALUE = 6; // actionRescanJsxAttributeValue
 });
 
-// Go: format/scanner.go:166 fixTokenKind
+// Go: format/scanner.go:184 fixTokenKind
 pub fn fix_token_kind(mut token_info: TokenInfo, container: Node) -> TokenInfo {
     if is_token_kind(container.kind()) && token_info.token.kind != container.kind() {
         token_info.token.kind = container.kind();
@@ -237,7 +237,7 @@ pub fn fix_token_kind(mut token_info: TokenInfo, container: Node) -> TokenInfo {
 }
 
 impl<'t> FormattingScanner<'t> {
-    // Go: format/scanner.go:173 readTokenInfo
+    // Go: format/scanner.go:191 readTokenInfo
     // PORT: Go returns the struct by value (the trivia slices are shared);
     // this returns a clone.
     pub fn read_token_info(&mut self, n: Node) -> TokenInfo {
@@ -317,7 +317,7 @@ impl<'t> FormattingScanner<'t> {
         self.last_token_info.clone()
     }
 
-    // Go: format/scanner.go:254 getNextToken
+    // Go: format/scanner.go:272 getNextToken
     pub fn get_next_token(&mut self, n: Node, expected_scan_action: ScanAction) -> SyntaxKind {
         let token = self.s.token();
         self.last_scan_action = ScanAction::ACTION_SCAN;
@@ -368,7 +368,7 @@ impl<'t> FormattingScanner<'t> {
         token
     }
 
-    // Go: format/scanner.go:294 readEOFTokenRange
+    // Go: format/scanner.go:312 readEOFTokenRange
     pub fn read_eof_token_range(&self) -> TextRangeWithKind {
         crate::go_assert!(self.is_on_eof());
         new_text_range_with_kind(
@@ -378,7 +378,7 @@ impl<'t> FormattingScanner<'t> {
         )
     }
 
-    // Go: format/scanner.go:303 isOnToken
+    // Go: format/scanner.go:321 isOnToken
     pub fn is_on_token(&self) -> bool {
         let mut current = self.s.token();
         if self.has_last_token_info {
@@ -387,7 +387,7 @@ impl<'t> FormattingScanner<'t> {
         current != SyntaxKind::EndOfFile && !is_trivia(current)
     }
 
-    // Go: format/scanner.go:311 isOnEOF
+    // Go: format/scanner.go:329 isOnEOF
     pub fn is_on_eof(&self) -> bool {
         let mut current = self.s.token();
         if self.has_last_token_info {
@@ -396,7 +396,7 @@ impl<'t> FormattingScanner<'t> {
         current == SyntaxKind::EndOfFile
     }
 
-    // Go: format/scanner.go:319 skipToEndOf
+    // Go: format/scanner.go:337 skipToEndOf
     pub fn skip_to_end_of(&mut self, r: &TextRange) {
         self.s.reset_token_state(r.end());
         self.saved_pos = self.s.token_full_start();
@@ -407,7 +407,7 @@ impl<'t> FormattingScanner<'t> {
         self.trailing_trivia = Vec::new();
     }
 
-    // Go: format/scanner.go:329 skipToStartOf
+    // Go: format/scanner.go:347 skipToStartOf
     pub fn skip_to_start_of(&mut self, r: &TextRange) {
         self.s.reset_token_state(r.pos());
         self.saved_pos = self.s.token_full_start();
@@ -418,17 +418,17 @@ impl<'t> FormattingScanner<'t> {
         self.trailing_trivia = Vec::new();
     }
 
-    // Go: format/scanner.go:339 getCurrentLeadingTrivia
+    // Go: format/scanner.go:357 getCurrentLeadingTrivia
     pub fn get_current_leading_trivia(&self) -> &[TextRangeWithKind] {
         &self.leading_trivia
     }
 
-    // Go: format/scanner.go:343 lastTrailingTriviaWasNewLine
+    // Go: format/scanner.go:361 lastTrailingTriviaWasNewLine
     pub fn last_trailing_trivia_was_new_line(&self) -> bool {
         self.was_new_line
     }
 
-    // Go: format/scanner.go:347 getTokenFullStart
+    // Go: format/scanner.go:365 getTokenFullStart
     pub fn get_token_full_start(&self) -> i32 {
         if self.has_last_token_info {
             return self.last_token_info.token.loc.pos();
@@ -436,7 +436,7 @@ impl<'t> FormattingScanner<'t> {
         self.s.token_full_start()
     }
 
-    // Go: format/scanner.go:354 getStartPos
+    // Go: format/scanner.go:372 getStartPos
     pub fn get_start_pos(&self) -> i32 {
         // TODO: redundant?
         self.get_token_full_start()
