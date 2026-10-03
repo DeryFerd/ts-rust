@@ -412,7 +412,29 @@ impl PartialEq<Name> for String {
 
 /// The names of the bundled lib files, made by
 /// `crates/ts_goport/scripts/gen-lib-names.py` (`intern::lib_name`).
+#[cfg(not(target_family = "wasm"))]
 mod lib_names;
+
+/// wasm: an empty lib name table, so a lib name goes through the shards
+/// like any other name. The table only makes interning faster. Only the lib
+/// snapshots need its stable ids (`Name::stable_id`), and wasm reads no
+/// snapshot (`bundled::bundled_lib_name`). No output depends on an id:
+/// `Name` hashes and orders by its text, and tables compare ids only for
+/// equality.
+// PERF: the table is 184 KB of data. Without it the module is 185 KB
+// smaller raw, 75 KB smaller with gzip -9 and 62 KB smaller with brotli
+// -q 11. `scripts/wasm/bench.mjs` (query core, hono, zod; 10 interleaved
+// rounds) put each warm and cold median within -2.1% to +0.9% of the
+// module with the table. Packing the names with LZMA and building the
+// same table on first use saved only 37 KB gzip, and was not faster.
+#[cfg(target_family = "wasm")]
+mod lib_names {
+    pub(super) const COUNT: usize = 0;
+    pub(super) const BUCKET_BITS: u32 = 0;
+    pub(super) static TEXT: &str = "";
+    pub(super) static OFFSETS: [u32; COUNT + 1] = [0];
+    pub(super) static BUCKETS: [u16; (1 << BUCKET_BITS) + 1] = [0, 0];
+}
 
 /// The process-wide string interner behind `Name`. Text is copied once into
 /// leaked blocks and never freed. A name id is `seq << 1 | internal`, where
@@ -583,9 +605,9 @@ mod intern {
     }
 
     /// `rustc_hash::FxHasher` (2.1.2) of `bytes` as it is on a 64-bit
-    /// target. On a 32-bit target (wasm32) FxHasher is another hash, and
-    /// the lib name table (`lib_names`, made on a 64-bit host) holds the
-    /// 64-bit hashes, so this keeps its lookups working there.
+    /// target. On a 32-bit target (wasm32) FxHasher gives a 32-bit hash,
+    /// whose top 32 bits are 0. A shard map (`HashIsKey`) on a 32-bit
+    /// target reads only the top 32 bits, so it needs this full hash.
     #[cfg(any(test, not(target_pointer_width = "64")))]
     fn fx_hash_64(bytes: &[u8]) -> u64 {
         const K: u64 = 0xf135_7aea_2e62_a9c5;
