@@ -131,12 +131,16 @@ variant that embeds `X` (panic otherwise). Every other Go method on `*Type`
   symbols, `program::bound_symbols()`).
   Access: `self.symbols.sym(s)`, `self.symbols.sym_mut(s)`; shorthand
   methods `self.sym(s) -> &Symbol` and `self.sym_mut(s)`.
-- `types: Vec<Type>` -> `self.ty(t) -> &Type`, `self.ty_mut(t) -> &mut Type`.
+- `types: ChunkedArena<Type>` -> `self.ty(t) -> &Type`, `self.ty_mut(t) -> &mut Type`.
 - `signatures: Vec<Signature>` -> `self.sig(s)`, `self.sig_mut(s)`.
 - `index_infos: Vec<IndexInfo>` -> `self.index_info(i)`, `self.index_info_mut(i)`.
 - `type_predicates: Vec<TypePredicate>` -> `self.pred(p)`, `self.pred_mut(p)`.
-- `mappers: Vec<TypeMapper>` -> `self.mapper(m)`, `self.mapper_mut(m)`.
-- `inference_contexts: Vec<InferenceContext>` -> `self.inference_context(c)`, `self.inference_context_mut(c)`.
+- `mappers: ChunkedArena<TypeMapper>` -> `self.mapper(m)`, `self.mapper_mut(m)`.
+- `inference_contexts: ChunkedArena<InferenceContext>` -> `self.inference_context(c)`, `self.inference_context_mut(c)`.
+A `ChunkedArena` (`checker/types.rs`) keeps its entries in chunks of
+8,192, so it does not copy every entry when it grows, as a doubling `Vec`
+does (infermem1: the `inference_contexts` `Vec` kept buffers of 512 and
+256 MiB on typebox).
 Each arena has a dummy entry at index 0. New entries are pushed; ids are
 `TypeId(len as u32)` etc. Go `c.newType`, `c.newSignature`,
 `newIndexInfo`, `newTypePredicate`, mapper constructors push into these.
@@ -150,6 +154,24 @@ keys have, goes in a `Box` (`type_node_links: LinkStore<Node, Box<TypeNodeLinks>
 and its constructors. Go `m.Map(t)` -> `self.mapper_map(m, t)`,
 `m.Kind()` -> `self.mapper(m).kind()`, `m.MapsThisOnly()` ->
 `self.mapper(m).maps_this_only()`.
+
+The port keeps every mapper and inference context of a run (typebox: 21.4M
+mappers, about 3.9M contexts), so these types are small (infermem1). A
+compile-time assert holds each size on 64-bit targets. Keep the asserts: a
+new field that few values set goes in the box.
+- `TypeMapper` is 16 bytes. The `Array`, `ArrayToSingle`, `Deferred` and
+  `Function` payloads are boxed. The `Array` bool (the cached Go
+  `MapsThisOnly`) is outside its box, so the box is 48 bytes. Mapper ids
+  and their order do not change.
+- `InferenceContext` is 56 bytes. The fields that only signature inference
+  sets (the return mappers, the inferred type parameters and their origin,
+  the intra-expression inference sites) are in `rare`, a box made on the
+  first write (`rare_mut`). Their accessors (`return_mapper()` and the
+  others) give Go's zero values while it is absent. `inferences` is a boxed
+  slice: its length never changes.
+- `InferenceInfo` is 32 bytes. Its two candidate lists are in one box
+  (`candidate_lists`) that the first candidate makes. `candidates()` and
+  `contra_candidates()` give Go's nil lists while it is absent.
 
 ## AST (owned by ast/node.rs, ast/fields.rs, ast/misc.rs, ast/utilities_*)
 
@@ -275,9 +297,10 @@ methods reach the AST through it.
   calls: a call there made `Node::parent` go out of line (AST node records
   step 2b). A node shell has no link column, so `frozen_store_children`
   gives `None` and the caller reads the node data.
-- Node records (AST node records plan steps 1 to 4, `ast/store.rs`).
-  Each store slot has one 32-byte `NodeRecord` (bits, flags, loc,
-  `up` and `bind`), a `SyntaxKind` in the kind column (`FileStore::kinds`)
+- Node records (AST node records plan steps 1 to 4 and astmem1 P3,
+  `ast/store.rs`).
+  Each store slot has one 24-byte `NodeRecord` (`flags`, `bind`, `loc`
+  and `up`), a `SyntaxKind` in the kind column (`FileStore::kinds`)
   and one 16-byte `NodeKids` (the U4 and C2 child ids,
   and a word with the U1 name of an identifier or the U1 (b) modifier
   bits of any other slot). They replace the header, kind, name, modifier
@@ -285,13 +308,24 @@ methods reach the AST through it.
   code (0 nil, slot + 1 for a parent in the store, the top bit and an
   index into the store's foreign parent table for any other parent) and
   the Go symbol; `up` of the nil slot or an alias slot holds its target.
-  `bind` holds the low half of the flow node (always in the same file)
-  and the index + 1 of the node's `NodeBindExtra` (local symbol, locals,
-  next container, end and return flow nodes) in `GoFile::node_bind`. The
-  record flags are the parser flags, and after the bind also the
-  binder-added bits (`BINDER_ADDED_FLAGS`), so `parser_flags(mask)` stays
-  exact for a mask without them, and the parser flags of a published file
-  are the ones in its `GoFile`. The words are atomics that the reads load
+  `bind` is 32 bits: the low half of the flow node (always in the same
+  file), or with `BIND_EXTRA` (bit 31) the index + 1 of the node's
+  `NodeBindExtra` (flow node, local symbol, locals, next container, end
+  and return flow nodes) in `GoFile::node_bind`. About 6% of the slots
+  have extras (locals containers, exported declarations, function-like
+  nodes), so the flow read of every other node is one load. The record
+  flags are the parser flags, and after the bind also the binder-added
+  bits (`BINDER_ADDED_FLAGS`), so `parser_flags(mask)` stays exact for a
+  mask without them, and the parser flags of a published file are the
+  ones in its `GoFile`. The record bits (`SOURCE_FILE_ROOT`,
+  `TEXT_IS_KEYWORD`, `NO_NODE`) are bits 29 to 31 of `flags`: Go
+  `NodeFlags` ends at bit 28. `NodeRecord::flags` masks them, and a parse
+  flags write checks that no Go flag is in them (`checked_flags`). The
+  node column (`FileStore::nodes`, `BlockFile`) names a leaked `NodeData`
+  (16 bytes) for each node slot, not a whole `astdata::Node` (astmem1
+  P1): the kind is in the kind column and the header in the record, so no
+  read needs the rest. The node reads (`static_ast_node`,
+  `frozen_store_ast_node`) give `&NodeData`. The words are atomics that the reads load
   with `Relaxed`. The parse writes them through `get_mut`; after the
   publish only `BoundFile::install` writes a record (`bind_store_records`:
   symbol, added flags, `bind`), through a shared ref, before any other
@@ -747,6 +781,25 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   With `noEmit` or `emitDeclarationOnly` no JS part moves. An emit that
   moves no JS part runs as with the pool off and makes no pool. The
   language server does not emit through `program_emit`.
+- While the emit pool is on, each checker thread also has a twin (not in
+  Go; `program::send_dts_twin_job`): a thread with no checker that prints
+  and writes the parts whose transforms ran on the checker, so the
+  checker goes on with its next file. The d.ts part of a split file prints
+  there. So do both parts of a file whose JS transforms call the checker
+  (jstwin1, `program_emit::emit_on_twin`): the checker runs the JS
+  transforms, then the declaration transforms, as before, and the twin
+  prints and writes the JS part, then the d.ts part, in Go's order (map,
+  JS, declaration map, d.ts). Each job brings the transformed tree, a copy
+  of the synthetic nodes that it reaches (`PrintPack`) and the side
+  tables of its emit context. The twin's emit host has no checker, so a
+  checker call in a print ends the run (exit 70). A panic in the
+  declaration transforms goes on after the twin wrote the JS part, as in
+  Go. A panic in the JS print on the twin comes after the checker ran the
+  declaration transforms, which Go does not run then (`emit_on_twin` says
+  what differs). A forced emit and a builder signature emit stay on the
+  checker. `GOPORT_DTS_TWIN=0` turns the twins off.
+  `GOPORT_DTS_TWIN_CHECK=1` also prints each part on the checker, and the
+  twin panics when its writes differ.
 - A thread that runs Go code (the work thread of a binary, the parse,
   bind, checker, emit, search and goroutine threads, the `tsc -b` config
   and build info threads, the file watcher thread and the LSP read thread)
