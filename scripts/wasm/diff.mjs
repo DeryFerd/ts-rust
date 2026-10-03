@@ -667,7 +667,8 @@ function prepare(c, caseDir, fixtures) {
     }
     if (!c.link) return proj;
     const link = path.join(caseDir, "link");
-    fs.rmSync(link, { force: true });
+    // Not rmSync: on Node 24.13 it throws ERR_FS_EISDIR for a link to a directory.
+    if (fs.lstatSync(link, { throwIfNoEntry: false })) fs.unlinkSync(link);
     fs.symlinkSync("proj", link);
     return link;
 }

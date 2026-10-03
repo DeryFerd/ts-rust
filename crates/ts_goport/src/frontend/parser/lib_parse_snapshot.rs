@@ -1777,7 +1777,7 @@ fn encode_section(
         if view.shared_name {
             body.u8(SHARED_NAME);
         } else {
-            encode_payload(&mut body, &view.node.data)?;
+            encode_payload(&mut body, view.data)?;
         }
     }
     let mut out = Vec::with_capacity(body.out.len() + 16 * names.len() + 1024);

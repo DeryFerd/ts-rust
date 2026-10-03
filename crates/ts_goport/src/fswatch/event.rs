@@ -155,6 +155,16 @@ impl EventList {
         EventList::get_or_create(&mut el, path).included_watch_root = true;
     }
 
+    /// `update_watch_root_at` with the list's own sequence.
+    // PORT: not in Go. The FSEvents backend gets no event IDs from `notify`
+    // (see fsevents_darwin.rs).
+    pub fn update_watch_root(&self, path: &str) {
+        let mut el = self.mu.lock().unwrap();
+        let seq = EventList::next_seq_locked(&mut el);
+        EventList::update_locked(&mut el, path, seq);
+        EventList::get_or_create(&mut el, path).included_watch_root = true;
+    }
+
     // Go: event.go:103 eventList.updateLocked
     pub fn update_locked(el: &mut EventListLocked, path: &str, seq: u64) {
         EventList::get_or_create(el, path).updated_seq = seq;
@@ -189,6 +199,16 @@ impl EventList {
         EventList::advance_seq_locked(&mut el, seq);
         EventList::remove_locked(&mut el, path, seq);
         EventList::get_or_create(&mut el, path).included_watch_root = true;
+    }
+
+    /// `remove_watch_root_at` with the list's own sequence, which it returns.
+    // PORT: not in Go (see `update_watch_root`).
+    pub fn remove_watch_root_and_get_sequence(&self, path: &str) -> u64 {
+        let mut el = self.mu.lock().unwrap();
+        let seq = EventList::next_seq_locked(&mut el);
+        EventList::remove_locked(&mut el, path, seq);
+        EventList::get_or_create(&mut el, path).included_watch_root = true;
+        seq
     }
 
     // Go: event.go:138 eventList.removeLocked

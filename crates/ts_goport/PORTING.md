@@ -1181,15 +1181,18 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 
 ### Not ported (plan level)
 
-- The FSEvents file watcher (macOS). There `fswatch::default()` picks
-  kqueue, which is Go's choice when FSEvents is not available. The other
-  watchers are ported with safe crates (D-W1, no `libc`, no `unsafe`):
-  inotify and fanotify (`src/fswatch/{inotify,fanotify}_linux.rs` on the
-  `unix.rs` shim: `nix::sys::fanotify`, `name-to-handle-at`, `rustix`,
-  `std`), kqueue (`kqueue.rs` on `unix_bsd.rs`) and Windows (`windows.rs`
-  on the `notify` crate). The server makes the in-process LSP watcher
-  (`lsp/lspwatcher`) only when the default watcher has a fast recursive
-  backend, so on Linux it is never made (as in Go).
+- Go's FSEvents FFI (macOS). The file watchers are ported with safe crates
+  (D-W1, no `libc`, no `unsafe`): inotify and fanotify
+  (`src/fswatch/{inotify,fanotify}_linux.rs` on the `unix.rs` shim:
+  `nix::sys::fanotify`, `name-to-handle-at`, `rustix`, `std`), kqueue
+  (`kqueue.rs` on `unix_bsd.rs`), FSEvents (`fsevents_darwin.rs` on the
+  `notify` crate's `FsEventWatcher`) and Windows (`windows.rs` on the
+  `notify` crate). `fsevents_darwin.rs` lists what `notify` changes: its
+  stream flags and latency, no event IDs (the event list's own sequence),
+  one event per flag (every remove and rename checks with lstat) and no
+  stream for a root that is gone. The server makes the in-process LSP
+  watcher (`lsp/lspwatcher`) only when the default watcher has a fast
+  recursive backend: on macOS and Windows, never on Linux (as in Go).
 - Native path folding in fswatch (ts#64210, `pathcompare.rs`). Go ignores
   case only for fsevents and kqueue watches on a darwin volume that
   `pathconf` reports as case-insensitive, and folds with CoreFoundation.

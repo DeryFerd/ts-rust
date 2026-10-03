@@ -276,8 +276,12 @@ pub struct TempDir {
     path: PathBuf,
 }
 
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_TMP: &str =
     "/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/go-baseline-tests/tmp";
+/// macOS: `/home` is an autofs mount there, so the default is under /tmp.
+#[cfg(target_os = "macos")]
+const DEFAULT_TMP: &str = "/tmp/ts-rust-go-baseline-tests/tmp";
 
 impl TempDir {
     pub fn new() -> TempDir {

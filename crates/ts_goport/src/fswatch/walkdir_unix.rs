@@ -189,7 +189,9 @@ pub fn ino_of(d: &unix::Dirent) -> u64 {
     d.ino
 }
 
-#[cfg(test)]
+// macOS file systems reject a name that is not UTF-8 (EILSEQ), so the test
+// cannot make its directory there.
+#[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;

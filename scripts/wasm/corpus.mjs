@@ -55,7 +55,9 @@
 // the other in the same dir, which it writes fresh before each side. Both
 // sides get the same arguments, cwd (a real path) and an empty environment.
 // It compares the exit status, stdout, stderr and each file that the run
-// adds, changes or removes.
+// adds, changes or removes. One expected difference is taken out first: wasm
+// cannot start a content mapper process, and gives Go's wasip1 error for it
+// (`goWasmSpawnText`).
 //
 // Statuses: same, differ, wasm-crash (a trap, a dead worker or an exit
 // status above 5), native-crash, both-crash, wasm-timeout, native-timeout,
@@ -530,6 +532,16 @@ function describeDiff(native, wasm) {
     return parts.join("; ");
 }
 
+/**
+ * Native's text with each content mapper start error as Go's wasip1 build
+ * gives it. Go: cmd/tsc/sys.go spawnProcess calls cmd.StdinPipe() first, and
+ * wasip1 os.Pipe fails, so every start gives "pipe: Not implemented on
+ * wasip1" (execute/tsc/compile.rs `spawn_process`). Native gives the real
+ * start error, such as a LookPath error.
+ */
+const goWasmSpawnText = text =>
+    text.replace(/(The content mapper command '[^'\n]*' could not be started: ).*$/gm, "$1pipe: Not implemented on wasip1");
+
 const crashed = side => side.error !== undefined || side.signal || side.exitCode > MAX_EXIT_STATUS;
 
 /** Runs one planned case on both sides and returns its result record. */
@@ -541,6 +553,8 @@ async function runCase(opts, plan, root, slot) {
     const before = snapshot(root);
     const native = await runNative(opts.native, args, cwd, timeoutMs);
     native.files = changes(before, snapshot(root));
+    native.stdout = goWasmSpawnText(native.stdout);
+    native.stderr = goWasmSpawnText(native.stderr);
     materialize(root, plan, opts.corpus);
     const memory = opts.fs === "memory";
     const wasm = await slot.run(args, cwd, timeoutMs, memory ? root : undefined);

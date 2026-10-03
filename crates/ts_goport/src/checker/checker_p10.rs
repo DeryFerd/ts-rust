@@ -1063,8 +1063,8 @@ impl Checker {
                 let mut inferred_type_parameters_origin = 0;
                 if inference_context.is_some() {
                     let context = self.inference_context(inference_context);
-                    inferred_type_parameters = context.inferred_type_parameters.clone();
-                    inferred_type_parameters_origin = context.inferred_type_parameters_origin;
+                    inferred_type_parameters = context.inferred_type_parameters().to_vec();
+                    inferred_type_parameters_origin = context.inferred_type_parameters_origin();
                 }
                 let candidate_declaration = self.sig(candidate).declaration;
                 check_candidate = self.get_signature_instantiation(
@@ -1117,8 +1117,8 @@ impl Checker {
                         inference_context,
                     );
                     let context = self.inference_context(inference_context);
-                    let inferred_type_parameters = context.inferred_type_parameters.clone();
-                    let inferred_type_parameters_origin = context.inferred_type_parameters_origin;
+                    let inferred_type_parameters = context.inferred_type_parameters().to_vec();
+                    let inferred_type_parameters_origin = context.inferred_type_parameters_origin();
                     let candidate_declaration = self.sig(candidate).declaration;
                     check_candidate = self.get_signature_instantiation(
                         candidate,

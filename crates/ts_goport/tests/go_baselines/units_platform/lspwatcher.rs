@@ -83,10 +83,6 @@ fn collector() -> (Got, Box<dyn Fn(Vec<FileEvent>)>) {
     (got, Box::new(move |changes| g.borrow_mut().extend(changes)))
 }
 
-fn realpath(fs: &Rc<dyn Fs>, p: &str) -> String {
-    tspath::normalize_slashes(&fs.realpath(&tspath::normalize_slashes(p)))
-}
-
 /// Go `filepath.Join`.
 fn join(parts: &[&str]) -> String {
     let mut p = std::path::PathBuf::new();
@@ -368,7 +364,7 @@ fn test_watcher_non_recursive_glob_is_not_recursive() {
 
     let fs = wrapped_os_fs();
     let (backend, b) = new_fake_backend();
-    let w = new_with_backend(fs.clone(), b, Box::new(|_| {}), None);
+    let w = new_with_backend(fs, b, Box::new(|_| {}), None);
     let _close = CloseOnDrop(w.clone());
 
     let recursive = format!("{dir_norm}/**/*");
@@ -376,16 +372,14 @@ fn test_watcher_non_recursive_glob_is_not_recursive() {
     w.watch_files("id", &[fsw(&recursive, None), fsw(&non_recursive, None)])
         .unwrap_or_else(|e| panic!("{}", e.error()));
 
-    let real_dir = tspath::normalize_slashes(&fs.realpath(&dir_norm));
-    let real_sub = tspath::normalize_slashes(&fs.realpath(&sub_norm));
     let opt_count = backend.opt_count.borrow();
     assert_eq!(
-        opt_count.get(&real_dir).copied().unwrap_or(0),
+        opt_count.get(&dir_norm).copied().unwrap_or(0),
         1,
         "recursive glob {recursive:?}: expected 1 watch option (WithRecursive)"
     );
     assert_eq!(
-        opt_count.get(&real_sub).copied().unwrap_or(0),
+        opt_count.get(&sub_norm).copied().unwrap_or(0),
         0,
         "non-recursive glob {non_recursive:?}: expected 0 watch options"
     );
@@ -429,11 +423,11 @@ fn test_watcher_real_backend_missing_then_create() {
 fn test_watcher_missing_directory_tracks_ancestor() {
     let fs = wrapped_os_fs();
     let (backend, b) = new_fake_backend();
-    let w = new_with_backend(fs.clone(), b, Box::new(|_| {}), None);
+    let w = new_with_backend(fs, b, Box::new(|_| {}), None);
     let _close = CloseOnDrop(w.clone());
 
     let (_guard, base) = temp_dir();
-    let base_real = realpath(&fs, &base);
+    let base_norm = tspath::normalize_slashes(&base);
     let target = tspath::normalize_slashes(&join(&[&base, "pkg"]));
     let pattern = format!("{target}/*");
 
@@ -441,8 +435,8 @@ fn test_watcher_missing_directory_tracks_ancestor() {
         .unwrap_or_else(|e| panic!("{}", e.error()));
 
     assert!(
-        backend.is_watching(&base_real),
-        "expected ancestor watch on ancestor {base_real:?}, watched: {:?}",
+        backend.is_watching(&base_norm),
+        "expected ancestor watch on ancestor {base_norm:?}, watched: {:?}",
         backend.watched_dirs()
     );
     let dirs = backend.watched_dirs();
@@ -467,11 +461,11 @@ fn test_watcher_missing_directory_promotes_on_create() {
     let fs = wrapped_os_fs();
     let (got, on_changes) = collector();
     let (backend, b) = new_fake_backend();
-    let w = new_with_backend(fs.clone(), b, on_changes, None);
+    let w = new_with_backend(fs, b, on_changes, None);
     let _close = CloseOnDrop(w.clone());
 
     let (_guard, base) = temp_dir();
-    let base_real = realpath(&fs, &base);
+    let base_norm = tspath::normalize_slashes(&base);
     let target = tspath::normalize_slashes(&join(&[&base, "pkg"]));
     let pattern = format!("{target}/*");
 
@@ -481,16 +475,12 @@ fn test_watcher_missing_directory_promotes_on_create() {
     std::fs::create_dir_all(join(&[&base, "pkg"])).unwrap();
     std::fs::write(join(&[&base, "pkg", "index.ts"]), "export {}").unwrap();
     backend.emit(
-        &base_real,
+        &base_norm,
         vec![ev(EventKind::Update, &join(&[&base, "pkg"]))],
         None,
     );
 
-    let target_real = tspath::normalize_slashes(&fs.realpath(&target));
-    wait_for(
-        || backend.is_watching(&target_real),
-        "promotion to target watch",
-    );
+    wait_for(|| backend.is_watching(&target), "promotion to target watch");
 
     wait_for(
         || {
@@ -513,53 +503,53 @@ fn test_watcher_missing_directory_promotes_on_create() {
 fn test_watcher_multi_level_descend() {
     let fs = wrapped_os_fs();
     let (backend, b) = new_fake_backend();
-    let w = new_with_backend(fs.clone(), b, Box::new(|_| {}), None);
+    let w = new_with_backend(fs, b, Box::new(|_| {}), None);
     let _close = CloseOnDrop(w.clone());
 
     let (_guard, base) = temp_dir();
-    let base_real = realpath(&fs, &base);
+    let base_norm = tspath::normalize_slashes(&base);
     let target = tspath::normalize_slashes(&join(&[&base, "a", "b", "c"]));
     let pattern = format!("{target}/*");
 
     w.watch_files("id", &[fsw(&pattern, None)])
         .unwrap_or_else(|e| panic!("{}", e.error()));
     assert!(
-        backend.is_watching(&base_real),
-        "expected initial ancestor watch on {base_real:?}, got {:?}",
+        backend.is_watching(&base_norm),
+        "expected initial ancestor watch on {base_norm:?}, got {:?}",
         backend.watched_dirs()
     );
 
-    let mkdir_and_realpath = |rel: &[&str]| -> String {
+    let mkdir_and_path = |rel: &[&str]| -> String {
         let mut parts = vec![base.as_str()];
         parts.extend_from_slice(rel);
         let p = join(&parts);
         std::fs::create_dir_all(&p).unwrap();
-        realpath(&fs, &p)
+        tspath::normalize_slashes(&p)
     };
 
-    let a_real = mkdir_and_realpath(&["a"]);
+    let a_dir = mkdir_and_path(&["a"]);
     backend.emit(
-        &base_real,
+        &base_norm,
         vec![ev(EventKind::Update, &join(&[&base, "a"]))],
         None,
     );
-    wait_for(|| backend.is_watching(&a_real), "descend to a");
+    wait_for(|| backend.is_watching(&a_dir), "descend to a");
 
-    let ab_real = mkdir_and_realpath(&["a", "b"]);
+    let ab_dir = mkdir_and_path(&["a", "b"]);
     backend.emit(
-        &a_real,
+        &a_dir,
         vec![ev(EventKind::Update, &join(&[&base, "a", "b"]))],
         None,
     );
-    wait_for(|| backend.is_watching(&ab_real), "descend to a/b");
+    wait_for(|| backend.is_watching(&ab_dir), "descend to a/b");
 
-    let abc_real = mkdir_and_realpath(&["a", "b", "c"]);
+    let abc_dir = mkdir_and_path(&["a", "b", "c"]);
     backend.emit(
-        &ab_real,
+        &ab_dir,
         vec![ev(EventKind::Update, &join(&[&base, "a", "b", "c"]))],
         None,
     );
-    wait_for(|| backend.is_watching(&abc_real), "promote to target a/b/c");
+    wait_for(|| backend.is_watching(&abc_dir), "promote to target a/b/c");
 }
 
 // Go: lspwatcher_test.go:535 TestWatcher_AtomicTreeCreateRace
@@ -567,11 +557,11 @@ fn test_watcher_multi_level_descend() {
 fn test_watcher_atomic_tree_create_race() {
     let fs = wrapped_os_fs();
     let (backend, b) = new_fake_backend();
-    let w = new_with_backend(fs.clone(), b, Box::new(|_| {}), None);
+    let w = new_with_backend(fs, b, Box::new(|_| {}), None);
     let _close = CloseOnDrop(w.clone());
 
     let (_guard, base) = temp_dir();
-    let base_real = realpath(&fs, &base);
+    let base_norm = tspath::normalize_slashes(&base);
     let target = tspath::normalize_slashes(&join(&[&base, "a", "b", "c"]));
     let pattern = format!("{target}/*");
 
@@ -580,14 +570,13 @@ fn test_watcher_atomic_tree_create_race() {
 
     std::fs::create_dir_all(join(&[&base, "a", "b", "c"])).unwrap();
     backend.emit(
-        &base_real,
+        &base_norm,
         vec![ev(EventKind::Update, &join(&[&base, "a"]))],
         None,
     );
 
-    let target_real = tspath::normalize_slashes(&fs.realpath(&target));
     wait_for(
-        || backend.is_watching(&target_real),
+        || backend.is_watching(&target),
         "promote to target in one pass",
     );
 }
@@ -604,11 +593,11 @@ fn test_watcher_synthetic_create_depth() {
         let fs = wrapped_os_fs();
         let (got, on_changes) = collector();
         let (backend, b) = new_fake_backend();
-        let w = new_with_backend(fs.clone(), b, on_changes, None);
+        let w = new_with_backend(fs, b, on_changes, None);
         let _close = CloseOnDrop(w.clone());
 
         let (_guard, base) = temp_dir();
-        let base_real = realpath(&fs, &base);
+        let base_norm = tspath::normalize_slashes(&base);
         let target = tspath::normalize_slashes(&join(&[&base, "pkg"]));
         let pattern = if recursive {
             format!("{target}/**/*")
@@ -622,13 +611,12 @@ fn test_watcher_synthetic_create_depth() {
         std::fs::write(join(&[&base, "pkg", "top.ts"]), "export {}").unwrap();
         std::fs::write(join(&[&base, "pkg", "sub", "deep.ts"]), "export {}").unwrap();
         backend.emit(
-            &base_real,
+            &base_norm,
             vec![ev(EventKind::Update, &join(&[&base, "pkg"]))],
             None,
         );
 
-        let target_real = tspath::normalize_slashes(&fs.realpath(&target));
-        wait_for(|| backend.is_watching(&target_real), "promotion");
+        wait_for(|| backend.is_watching(&target), "promotion");
 
         let created = |suffix: &str| {
             got.borrow()
@@ -675,27 +663,26 @@ fn test_watcher_terminated_falls_back_and_recovers() {
     let fs = wrapped_os_fs();
     let (got, on_changes) = collector();
     let (backend, b) = new_fake_backend();
-    let w = new_with_backend(fs.clone(), b, on_changes, None);
+    let w = new_with_backend(fs, b, on_changes, None);
     let _close = CloseOnDrop(w.clone());
 
     let (_guard, base) = temp_dir();
-    let base_real = realpath(&fs, &base);
+    let base_norm = tspath::normalize_slashes(&base);
     let target = tspath::normalize_slashes(&join(&[&base, "pkg"]));
     std::fs::create_dir_all(join(&[&base, "pkg"])).unwrap();
-    let target_real = tspath::normalize_slashes(&fs.realpath(&target));
     let pattern = format!("{target}/*");
 
     w.watch_files("id", &[fsw(&pattern, Some(all_kinds()))])
         .unwrap_or_else(|e| panic!("{}", e.error()));
     assert!(
-        backend.is_watching(&target_real),
-        "expected target watch on {target_real:?}, got {:?}",
+        backend.is_watching(&target),
+        "expected target watch on {target:?}, got {:?}",
         backend.watched_dirs()
     );
 
     std::fs::remove_dir_all(join(&[&base, "pkg"])).unwrap();
     backend.emit(
-        &target_real,
+        &target,
         vec![ev(EventKind::Delete, &join(&[&base, "pkg"]))],
         errors::join(vec![ERR_WATCH_TERMINATED.clone(), errors::new("removed")]),
     );
@@ -709,19 +696,18 @@ fn test_watcher_terminated_falls_back_and_recovers() {
         "forwarded delete of terminated dir",
     );
     wait_for(
-        || backend.is_watching(&base_real) && !backend.is_watching(&target_real),
+        || backend.is_watching(&base_norm) && !backend.is_watching(&target),
         "fallback to ancestor watch",
     );
 
     std::fs::create_dir_all(join(&[&base, "pkg"])).unwrap();
-    let recreated_real = tspath::normalize_slashes(&fs.realpath(&target));
     backend.emit(
-        &base_real,
+        &base_norm,
         vec![ev(EventKind::Update, &join(&[&base, "pkg"]))],
         None,
     );
     wait_for(
-        || backend.is_watching(&recreated_real),
+        || backend.is_watching(&target),
         "recovery to target watch after recreation",
     );
 }
@@ -731,31 +717,31 @@ fn test_watcher_terminated_falls_back_and_recovers() {
 fn test_watcher_genuine_failure_rolls_back_for_retry() {
     let fs = wrapped_os_fs();
     let (backend, b) = new_fake_backend();
-    let w = new_with_backend(fs.clone(), b, Box::new(|_| {}), None);
+    let w = new_with_backend(fs, b, Box::new(|_| {}), None);
     let _close = CloseOnDrop(w.clone());
 
     let (_guard, dir) = temp_dir();
-    let dir_real = realpath(&fs, &dir);
-    let pattern = format!("{}/*", tspath::normalize_slashes(&dir));
+    let dir_norm = tspath::normalize_slashes(&dir);
+    let pattern = format!("{dir_norm}/*");
 
     backend
         .fail_dirs
         .borrow_mut()
-        .insert(dir_real.clone(), errors::new("too many open files"));
+        .insert(dir_norm.clone(), errors::new("too many open files"));
 
     assert!(
         w.watch_files("id", &[fsw(&pattern, None)]).is_err(),
         "expected error from genuine backend failure"
     );
 
-    backend.fail_dirs.borrow_mut().remove(&dir_real);
+    backend.fail_dirs.borrow_mut().remove(&dir_norm);
 
     if let Err(err) = w.watch_files("id", &[fsw(&pattern, None)]) {
         panic!("retry after rollback should succeed, got {}", err.error());
     }
     assert!(
-        backend.is_watching(&dir_real),
-        "expected watch on {dir_real:?} after successful retry, got {:?}",
+        backend.is_watching(&dir_norm),
+        "expected watch on {dir_norm:?} after successful retry, got {:?}",
         backend.watched_dirs()
     );
 }

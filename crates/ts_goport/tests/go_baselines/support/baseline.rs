@@ -35,8 +35,12 @@ use super::patience;
 /// The pinned typescript-go checkout.
 pub const DEFAULT_GO_REPO: &str = "/home/theo/.explore/repos/microsoft__typescript-go";
 /// The local baseline root for `TS_GOPORT_BASELINE_LOCAL=1`.
+#[cfg(not(target_os = "macos"))]
 pub const DEFAULT_LOCAL_ROOT: &str =
     "/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/go-baseline-tests/local";
+/// macOS: `/home` is an autofs mount there, so the default is under /tmp.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_LOCAL_ROOT: &str = "/tmp/ts-rust-go-baseline-tests/local";
 pub const GO_REPO_ENV: &str = "TS_GO_REPO";
 pub const LOCAL_ENV: &str = "TS_GOPORT_BASELINE_LOCAL";
 pub const TRACK_ENV: &str = "TS_GOPORT_BASELINE_TRACK";

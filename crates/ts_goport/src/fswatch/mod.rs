@@ -2,8 +2,8 @@
 //! explicit path (`fswatch::unix`, `fswatch::walkdir_unix::walk_dir`,
 //! `fswatch::{inotify_linux, fanotify_linux, kqueue, windows}::init`); they
 //! are not globbed. walkdir_unix.go and kqueue.go build on darwin and the BSDs
-//! (`fswatch::unix` is unix_bsd.rs there), windows.go on Windows. The
-//! FSEvents backend (fsevents_darwin*.go) is not ported.
+//! (`fswatch::unix` is unix_bsd.rs there), fsevents_darwin.go on macOS (on the
+//! `notify` crate) and windows.go on Windows.
 
 pub mod canonicalize_darwin;
 #[cfg(not(all(
@@ -15,6 +15,8 @@ pub mod debounce;
 pub mod event;
 #[cfg(target_os = "linux")]
 pub mod fanotify_linux;
+#[cfg(target_os = "macos")]
+pub mod fsevents_darwin;
 #[cfg(target_os = "linux")]
 pub mod inotify_linux;
 #[cfg(any(
