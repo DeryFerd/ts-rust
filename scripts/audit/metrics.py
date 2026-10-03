@@ -71,7 +71,7 @@ def main():
     m = dict(transcripts=0, subagents=0, toolCalls=0, subagentHours=0.0, pollCalls=0, shortPollCalls=0, pollHours=0.0,
              waitGuardDenials=0, goalNoAskDenials=0, askUserQuestions=0, askBlockedHours=0.0,
              rawSsh=0, rawRsync=0, remoteShRun=0, remoteShLook=0, remoteShJob=0, journalParses=0, wfstatus=0,
-             facts=0, perfSh=0, candidateSh=0)
+             facts=0, perfSh=0, candidateSh=0, hostWaits=0, acceptedRevisions=0)
     builds, first_edit, first_action = {}, [], []
     for name, path in files.items():
         calls, active = scan(path, lo, hi)
@@ -98,6 +98,8 @@ def main():
                 # A wait cut into chunks of 2 minutes or less: one model turn per chunk.
                 m['shortPollCalls'] += isinstance(inp.get('timeout'), (int, float)) and inp['timeout'] <= 120000
             m['waitGuardDenials'] += err and 'wait-guard:' in res
+            # remote.sh prints one of these when a job waits for a host lock or for any free host.
+            m['hostWaits'] += len(re.findall(r'remote\.sh: (?:waiting for the [\w-]+ lock|no free, quiet host)', res))
             m['goalNoAskDenials'] += err and 'goal-no-ask:' in res
             if tool == 'AskUserQuestion':
                 m['askUserQuestions'] += 1
@@ -128,6 +130,9 @@ def main():
         if d.get('kind') == 'revision' and lo <= ts(d.get('recordedUtc', '1970-01-01T00:00:00Z')) <= hi:
             revs[v['revision']] = v  # the last line for a revision is its current row
     m['revisions'] = len(revs)
+    m['acceptedRevisions'] = sum(v.get('status') == 'full_measured' for v in revs.values())
+    # Share of subagent time spent in wait loops (job, build or host queue). 0.25 from 2026-09-28 to 10-01, 0.60 from 10-01 to 10-03.
+    m['pollShare'] = round(m['pollHours'] / m['subagentHours'], 2) if m['subagentHours'] else None
     m['formatOnlyRevisions'] = sum(bool(re.search(r"format.only|rustfmt.only", v.get("hypothesis", ""), re.I)) for v in revs.values())
     m['carryForwardRevisions'] = sum(bool(v.get('rosterCarryForward')) for v in revs.values())
     for k in ('subagentHours', 'pollHours', 'askBlockedHours'):

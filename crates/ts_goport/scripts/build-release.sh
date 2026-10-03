@@ -207,6 +207,15 @@
 # tsgo writes .tsbuildinfo to a temp file, goport_build runs on a temp copy.
 set -euo pipefail
 
+# `help` (or -h, --help) prints the header. Without this, the word became the
+# out-dir and started a real build, outside the build lock.
+case "${1:-}" in
+  help | -h | --help)
+    sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"
+    exit 0
+    ;;
+esac
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$script_dir/../../.." && pwd)"
 data_root="${GOPORT_DATA_ROOT:-$(cd -- "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)}"

@@ -137,7 +137,7 @@ pub fn generate_rust(entries: &[Entry], provenance: &str) -> String {
     output.push_str(provenance);
     output.push_str("\n\nuse super::{Category, Message};\n\npub static CATALOG: &[Message] = &[\n");
     for entry in entries {
-        output.push_str("    Message::new(\n        ");
+        output.push_str("    Message::catalog(\n        ");
         output.push_str(&rust_number(entry.code));
         output.push_str(",\n        Category::");
         output.push_str(entry.category.rust_name());
@@ -667,7 +667,7 @@ var Gone = &Message{code: 1463, category: CategoryError, key: "Gone_1463", text:
         .unwrap();
         let entries = read_json_catalog(&[input]).unwrap();
         let output = generate_rust(&entries, "pinned input");
-        assert!(output.contains("Message::new(\n        1_003,\n        Category::Error"));
+        assert!(output.contains("Message::catalog(\n        1_003,\n        Category::Error"));
         assert!(output.contains("Identifier_expected_1003"));
         fs::remove_dir_all(directory).unwrap();
     }

@@ -1117,7 +1117,7 @@ impl ResolutionState<'_> {
         );
         let mut names: Vec<String> = peer_dependencies.value.keys().cloned().collect();
         // PORT: Go sorts by the bytes of the names (see `compare_go_bytes`).
-        names.sort_by(|a, b| compare_go_bytes(a, b));
+        crate::gostd::slices::stable_sort_by(&mut names, |a, b| compare_go_bytes(a, b));
         let mut builder = String::new();
         for name in &names {
             let peer_package_json = self.get_package_json_info(&format!("{node_modules}{name}"));

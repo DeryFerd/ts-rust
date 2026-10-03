@@ -28,11 +28,11 @@ Where things are:
 
 Remote hosts (all through `scripts/goport/remote.sh`, never raw `ssh` or `rsync`):
 
-- Hosts: alvin and cup2 (cloud), mini-743d and mini-abf9 (LAN). dbook-lan (LAN) is kept for revision gates and oracles: `auto` skips it, and `run` and `job` refuse it. `remote.sh status` shows each host's lock holder, load and free RAM.
+- Hosts: alvin and cup2 (cloud), mini-743d and mini-abf9 (LAN). dbook-lan (LAN) is kept for `candidate.sh side` (the gates and oracles of revisions and integration checks): `auto` skips it, and `run` and `job` refuse it. `remote.sh status` shows each host's lock holder, load and free RAM.
 - To look (logs, files, hashes, tools): `remote.sh look <host> <command>`. It takes no lock and stops after 120 s.
 - To run a job: `remote.sh run auto <command>`. It picks a free, quiet host, waits when none is free, and holds that host's lock until the command ends. For several steps on one host (sync, run, fetch), write a zbook script that uses `$REMOTE_HOST` and start it with `remote.sh job auto <script>`. The script must not take the lock itself. Name a host only when your prompt names one.
 - To copy: `remote.sh sync-bins <host> <dir>` (top-level files), `push <host> <path>` (files or trees), `sync-pin <host> <pin>`, and `fetch <host> <dir>` for results.
-- Release builds: run `crates/ts_goport/scripts/build-release.sh` one at a time on a host. Two at once break its perf branch sampling check (PGO and BOLT).
+- Release builds: run `crates/ts_goport/scripts/build-release.sh` one at a time on a host. Two at once break its perf branch sampling check (PGO and BOLT). On zbook run it under `flock /home/theo/Code/sandbox/ts-rust/target/locks/build-release.lock`: zbook now runs two Cargo builds at once, so the Cargo lock no longer keeps two release builds apart.
 - Measuring `tsgo` RSS or CPU through wait4 (`/usr/bin/time`, hyperfine user and sys, `perf stat` on the command): set `GOPORT_LAUNCH=0`. Since R137, `tsgo` on 4 KiB pages runs the compile in a worker, and wait4 sees only the launcher. `perf.sh` sets it.
 - Timing: `scripts/goport/perf.sh <label> <bin>...` on a quiet host (mini-abf9 or mini-743d), every side in one run on one host. It refuses above load 1.5. Do not time on zbook.
 - Time like against like: every Rust side of a timing is a stable build (`TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 scripts/run-cargo-capped.sh build --release ...`, or `--profile goport`). Edit-loop bins (nightly, incremental) run 2 to 7% slower.

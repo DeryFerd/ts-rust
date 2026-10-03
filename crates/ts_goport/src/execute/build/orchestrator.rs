@@ -274,8 +274,8 @@ impl Orchestrator {
                 depth,
             });
         }
-        // Go `slices.SortStableFunc`; `sort_by` is stable.
-        entries.sort_by(|a, b| a.depth.cmp(&b.depth));
+        // Go `slices.SortStableFunc`; `stable_sort_by` is stable.
+        crate::gostd::slices::stable_sort_by(&mut entries, |a, b| a.depth.cmp(&b.depth));
         entries.into_iter().map(|entry| entry.config).collect()
     }
 
@@ -513,7 +513,10 @@ impl Orchestrator {
             !self.opts.command.compiler_options.watch.is_true() && self.opts.testing.is_none();
         self.ends_process.set(ends_process);
         let mut result = self.start(ctx, "", false /*onlyReferences*/).result;
-        if self.opts.command.compiler_options.watch.is_true() {
+        // PORT: the wasm test is not in Go. A wasm build ends a watch build
+        // before this (execute_tsc.rs `wasm_unsupported`), so the wasm
+        // module leaves the watch code out.
+        if !cfg!(target_family = "wasm") && self.opts.command.compiler_options.watch.is_true() {
             result.watcher = Some(self as Box<dyn Watcher>);
         } else if ends_process && self.content_mapper_host.is_none() {
             std::mem::forget(self);
@@ -577,7 +580,8 @@ impl Orchestrator {
                 order.pop();
             }
             let result = self.build_or_clean_order(&order);
-            if self.opts.command.compiler_options.watch.is_true() {
+            // PORT: the wasm test is not in Go (see `start_exported`).
+            if !cfg!(target_family = "wasm") && self.opts.command.compiler_options.watch.is_true() {
                 self.watch(ctx);
             }
             result
@@ -1398,6 +1402,11 @@ impl BuildInfoPrefetch {
         compare_paths_options: ComparePathsOptions,
         m_times: MTimePrefetch,
     ) -> Option<Self> {
+        // wasm32-wasip1 has no threads, so no thread can start. Saying so
+        // leaves the threads out of the wasm module.
+        if cfg!(target_family = "wasm") {
+            return None;
+        }
         let slots: Vec<(String, Arc<BuildInfoSlot>)> = reads
             .iter()
             .map(|read| (read.name.clone(), Arc::default()))
@@ -1546,7 +1555,8 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
         ends_process: std::cell::Cell::new(false),
         status_prefetch: RefCell::new(None),
     };
-    if orchestrator.opts.command.compiler_options.watch.is_true() {
+    // PORT: the wasm test is not in Go (see `Orchestrator::start_exported`).
+    if !cfg!(target_family = "wasm") && orchestrator.opts.command.compiler_options.watch.is_true() {
         orchestrator.watch_status_reporter = Some(create_watch_status_reporter(
             orchestrator.opts.sys.clone(),
             &orchestrator.opts.command.locale(),

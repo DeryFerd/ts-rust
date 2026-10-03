@@ -118,14 +118,14 @@ impl<'a> Parser<'a> {
     // PORT: after the split char starts at `tail`, a position of the cut
     // text is `tail + 7k`: k invalid byte units of 7 bytes. Go's position
     // is `tail + k`, k bytes into the split char, and the port's file
-    // offsets of that char are its Go bytes. The other positions past
-    // `tail` are file positions: a mapped one (`tail + 1..=3`) and the
-    // comment end. The end can equal `tail + 7` only after a real U+FDD0
-    // (6 bytes in the port form); then a position after the first kept
-    // byte stays unmapped.
+    // offsets of that char are its Go bytes. A mapped position
+    // (`tail + 1..=3`) is before `tail + 7`. The only other file position
+    // is the comment end, which can equal `tail + 7` (after a real U+FDD0,
+    // 6 bytes in the port form, and 1 more byte). The worker gives it to
+    // the JSDoc node only, without this map.
     #[cold]
     pub(crate) fn jsdoc_tail_pos(&self, pos: i32) -> i32 {
-        if pos >= self.jsdoc_tail_first && pos != self.jsdoc_tail_end {
+        if pos >= self.jsdoc_tail_first {
             let tail = self.jsdoc_tail_first - INVALID_BYTE_UNIT_LEN;
             tail + (pos - tail) / INVALID_BYTE_UNIT_LEN
         } else {
@@ -277,7 +277,6 @@ impl<'a> Parser<'a> {
             &save_source_text[..cut]
         } else {
             self.jsdoc_tail_first = cut as i32 + INVALID_BYTE_UNIT_LEN;
-            self.jsdoc_tail_end = end;
             let text = || {
                 let mut text = save_source_text[..cut].to_string();
                 text.push_str(&crate::scanner_util::go_string_from_bytes(kept));
@@ -544,7 +543,12 @@ impl<'a> Parser<'a> {
 
         let comment_list = self.new_node_list(TextRange::new(start, comments_pos), &comment_parts);
         let jsdoc_comment = self.factory.new_js_doc(comment_list, tags_node_list);
-        self.finish_node_with_end(jsdoc_comment, full_start, end)
+        // PORT: `end` is a file position, not a position of a cut text, so
+        // it is not mapped (see `jsdoc_tail_pos`).
+        let tail_first = std::mem::replace(&mut self.jsdoc_tail_first, i32::MAX);
+        let jsdoc_comment = self.finish_node_with_end(jsdoc_comment, full_start, end);
+        self.jsdoc_tail_first = tail_first;
+        jsdoc_comment
     }
 
     // Go: jsdoc.go:406 isNextNonwhitespaceTokenEndOfFile

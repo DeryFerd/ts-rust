@@ -16,6 +16,10 @@
     non_snake_case
 )]
 
+// jemalloc does not build for wasm (see Cargo.toml).
+#[cfg(all(feature = "jemalloc", target_family = "wasm"))]
+compile_error!("build ts_goport for wasm with --no-default-features, as crates/ts_wasm does");
+
 pub mod ast;
 pub use goport_util::astdata;
 pub mod baseline;

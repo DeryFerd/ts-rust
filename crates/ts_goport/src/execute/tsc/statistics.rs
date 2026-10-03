@@ -207,7 +207,7 @@ impl Statistics {
             );
         }
         let mut identities: Vec<&String> = timings.mappers.keys().collect();
-        identities.sort();
+        crate::gostd::slices::stable_sort_by(&mut identities, Ord::cmp);
         for identity in identities {
             let mapper = &timings.mappers[identity];
             let initialization_count = mapper.spawn.count;

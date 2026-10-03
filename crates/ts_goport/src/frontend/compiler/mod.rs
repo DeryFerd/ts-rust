@@ -8,6 +8,7 @@ pub mod processing_diagnostic;
 pub mod program_lookup;
 pub mod program_new;
 pub mod project_references;
+pub mod resolve_ahead;
 pub mod verify;
 pub use file_include::*;
 pub use file_loader::*;

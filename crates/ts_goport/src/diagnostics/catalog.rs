@@ -4,7 +4,7 @@
 use super::{Category, Message};
 
 pub static CATALOG: &[Message] = &[
-    Message::new(
+    Message::catalog(
         1_002,
         Category::Error,
         "Unterminated_string_literal_1002",
@@ -13,7 +13,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_003,
         Category::Error,
         "Identifier_expected_1003",
@@ -22,7 +22,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_005,
         Category::Error,
         "_0_expected_1005",
@@ -31,7 +31,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_006,
         Category::Error,
         "A_file_cannot_have_a_reference_to_itself_1006",
@@ -40,7 +40,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_007,
         Category::Error,
         "The_parser_expected_to_find_a_1_to_match_the_0_token_here_1007",
@@ -49,7 +49,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_009,
         Category::Error,
         "Trailing_comma_not_allowed_1009",
@@ -58,7 +58,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_010,
         Category::Error,
         "Asterisk_Slash_expected_1010",
@@ -67,7 +67,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_011,
         Category::Error,
         "An_element_access_expression_should_take_an_argument_1011",
@@ -76,7 +76,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_012,
         Category::Error,
         "Unexpected_token_1012",
@@ -85,7 +85,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_013,
         Category::Error,
         "A_rest_parameter_or_binding_pattern_may_not_have_a_trailing_comma_1013",
@@ -94,7 +94,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_014,
         Category::Error,
         "A_rest_parameter_must_be_last_in_a_parameter_list_1014",
@@ -103,7 +103,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_015,
         Category::Error,
         "Parameter_cannot_have_question_mark_and_initializer_1015",
@@ -112,7 +112,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_016,
         Category::Error,
         "A_required_parameter_cannot_follow_an_optional_parameter_1016",
@@ -121,7 +121,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_017,
         Category::Error,
         "An_index_signature_cannot_have_a_rest_parameter_1017",
@@ -130,7 +130,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_018,
         Category::Error,
         "An_index_signature_parameter_cannot_have_an_accessibility_modifier_1018",
@@ -139,7 +139,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_019,
         Category::Error,
         "An_index_signature_parameter_cannot_have_a_question_mark_1019",
@@ -148,7 +148,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_020,
         Category::Error,
         "An_index_signature_parameter_cannot_have_an_initializer_1020",
@@ -157,7 +157,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_021,
         Category::Error,
         "An_index_signature_must_have_a_type_annotation_1021",
@@ -166,7 +166,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_022,
         Category::Error,
         "An_index_signature_parameter_must_have_a_type_annotation_1022",
@@ -175,7 +175,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_024,
         Category::Error,
         "readonly_modifier_can_only_appear_on_a_property_declaration_or_index_signature_1024",
@@ -184,7 +184,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_025,
         Category::Error,
         "An_index_signature_cannot_have_a_trailing_comma_1025",
@@ -193,7 +193,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_028,
         Category::Error,
         "Accessibility_modifier_already_seen_1028",
@@ -202,7 +202,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_029,
         Category::Error,
         "_0_modifier_must_precede_1_modifier_1029",
@@ -211,7 +211,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_030,
         Category::Error,
         "_0_modifier_already_seen_1030",
@@ -220,7 +220,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_031,
         Category::Error,
         "_0_modifier_cannot_appear_on_class_elements_of_this_kind_1031",
@@ -229,7 +229,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_034,
         Category::Error,
         "super_must_be_followed_by_an_argument_list_or_member_access_1034",
@@ -238,7 +238,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_035,
         Category::Error,
         "Only_ambient_modules_can_use_quoted_names_1035",
@@ -247,7 +247,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_036,
         Category::Error,
         "Statements_are_not_allowed_in_ambient_contexts_1036",
@@ -256,7 +256,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_038,
         Category::Error,
         "A_declare_modifier_cannot_be_used_in_an_already_ambient_context_1038",
@@ -265,7 +265,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_039,
         Category::Error,
         "Initializers_are_not_allowed_in_ambient_contexts_1039",
@@ -274,7 +274,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_040,
         Category::Error,
         "_0_modifier_cannot_be_used_in_an_ambient_context_1040",
@@ -283,7 +283,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_042,
         Category::Error,
         "_0_modifier_cannot_be_used_here_1042",
@@ -292,7 +292,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_044,
         Category::Error,
         "_0_modifier_cannot_appear_on_a_module_or_namespace_element_1044",
@@ -301,7 +301,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_046,
         Category::Error,
         "Top_level_declarations_in_d_ts_files_must_start_with_either_a_declare_or_export_modifier_1046",
@@ -310,7 +310,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_047,
         Category::Error,
         "A_rest_parameter_cannot_be_optional_1047",
@@ -319,7 +319,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_048,
         Category::Error,
         "A_rest_parameter_cannot_have_an_initializer_1048",
@@ -328,7 +328,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_049,
         Category::Error,
         "A_set_accessor_must_have_exactly_one_parameter_1049",
@@ -337,7 +337,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_051,
         Category::Error,
         "A_set_accessor_cannot_have_an_optional_parameter_1051",
@@ -346,7 +346,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_052,
         Category::Error,
         "A_set_accessor_parameter_cannot_have_an_initializer_1052",
@@ -355,7 +355,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_053,
         Category::Error,
         "A_set_accessor_cannot_have_rest_parameter_1053",
@@ -364,7 +364,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_054,
         Category::Error,
         "A_get_accessor_cannot_have_parameters_1054",
@@ -373,7 +373,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_055,
         Category::Error,
         "Type_0_is_not_a_valid_async_function_return_type_in_ES5_because_it_does_not_refer_to_a_Promise_compa_1055",
@@ -382,7 +382,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_056,
         Category::Error,
         "Accessors_are_only_available_when_targeting_ECMAScript_5_and_higher_1056",
@@ -391,7 +391,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_058,
         Category::Error,
         "The_return_type_of_an_async_function_must_either_be_a_valid_promise_or_must_not_contain_a_callable_t_1058",
@@ -400,7 +400,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_059,
         Category::Error,
         "A_promise_must_have_a_then_method_1059",
@@ -409,7 +409,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_060,
         Category::Error,
         "The_first_parameter_of_the_then_method_of_a_promise_must_be_a_callback_1060",
@@ -418,7 +418,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_061,
         Category::Error,
         "Enum_member_must_have_initializer_1061",
@@ -427,7 +427,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_062,
         Category::Error,
         "Type_is_referenced_directly_or_indirectly_in_the_fulfillment_callback_of_its_own_then_method_1062",
@@ -436,7 +436,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_063,
         Category::Error,
         "An_export_assignment_cannot_be_used_in_a_namespace_1063",
@@ -445,7 +445,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_064,
         Category::Error,
         "The_return_type_of_an_async_function_or_method_must_be_the_global_Promise_T_type_Did_you_mean_to_wri_1064",
@@ -454,7 +454,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_065,
         Category::Error,
         "The_return_type_of_an_async_function_or_method_must_be_the_global_Promise_T_type_1065",
@@ -463,7 +463,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_066,
         Category::Error,
         "In_ambient_enum_declarations_member_initializer_must_be_constant_expression_1066",
@@ -472,7 +472,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_068,
         Category::Error,
         "Unexpected_token_A_constructor_method_accessor_or_property_was_expected_1068",
@@ -481,7 +481,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_069,
         Category::Error,
         "Unexpected_token_A_type_parameter_name_was_expected_without_curly_braces_1069",
@@ -490,7 +490,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_070,
         Category::Error,
         "_0_modifier_cannot_appear_on_a_type_member_1070",
@@ -499,7 +499,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_071,
         Category::Error,
         "_0_modifier_cannot_appear_on_an_index_signature_1071",
@@ -508,7 +508,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_079,
         Category::Error,
         "A_0_modifier_cannot_be_used_with_an_import_declaration_1079",
@@ -517,7 +517,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_084,
         Category::Error,
         "Invalid_reference_directive_syntax_1084",
@@ -526,7 +526,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_089,
         Category::Error,
         "_0_modifier_cannot_appear_on_a_constructor_declaration_1089",
@@ -535,7 +535,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_090,
         Category::Error,
         "_0_modifier_cannot_appear_on_a_parameter_1090",
@@ -544,7 +544,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_091,
         Category::Error,
         "Only_a_single_variable_declaration_is_allowed_in_a_for_in_statement_1091",
@@ -553,7 +553,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_092,
         Category::Error,
         "Type_parameters_cannot_appear_on_a_constructor_declaration_1092",
@@ -562,7 +562,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_093,
         Category::Error,
         "Type_annotation_cannot_appear_on_a_constructor_declaration_1093",
@@ -571,7 +571,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_094,
         Category::Error,
         "An_accessor_cannot_have_type_parameters_1094",
@@ -580,7 +580,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_095,
         Category::Error,
         "A_set_accessor_cannot_have_a_return_type_annotation_1095",
@@ -589,7 +589,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_096,
         Category::Error,
         "An_index_signature_must_have_exactly_one_parameter_1096",
@@ -598,7 +598,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_097,
         Category::Error,
         "_0_list_cannot_be_empty_1097",
@@ -607,7 +607,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_098,
         Category::Error,
         "Type_parameter_list_cannot_be_empty_1098",
@@ -616,7 +616,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_099,
         Category::Error,
         "Type_argument_list_cannot_be_empty_1099",
@@ -625,7 +625,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_100,
         Category::Error,
         "Invalid_use_of_0_in_strict_mode_1100",
@@ -634,7 +634,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_101,
         Category::Error,
         "with_statements_are_not_allowed_in_strict_mode_1101",
@@ -643,7 +643,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_102,
         Category::Error,
         "delete_cannot_be_called_on_an_identifier_in_strict_mode_1102",
@@ -652,7 +652,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_103,
         Category::Error,
         "for_await_loops_are_only_allowed_within_async_functions_and_at_the_top_levels_of_modules_1103",
@@ -661,7 +661,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_104,
         Category::Error,
         "A_continue_statement_can_only_be_used_within_an_enclosing_iteration_statement_1104",
@@ -670,7 +670,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_105,
         Category::Error,
         "A_break_statement_can_only_be_used_within_an_enclosing_iteration_or_switch_statement_1105",
@@ -679,7 +679,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_106,
         Category::Error,
         "The_left_hand_side_of_a_for_of_statement_may_not_be_async_1106",
@@ -688,7 +688,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_107,
         Category::Error,
         "Jump_target_cannot_cross_function_boundary_1107",
@@ -697,7 +697,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_108,
         Category::Error,
         "A_return_statement_can_only_be_used_within_a_function_body_1108",
@@ -706,7 +706,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_109,
         Category::Error,
         "Expression_expected_1109",
@@ -715,7 +715,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_110,
         Category::Error,
         "Type_expected_1110",
@@ -724,7 +724,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_111,
         Category::Error,
         "Private_field_0_must_be_declared_in_an_enclosing_class_1111",
@@ -733,7 +733,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_113,
         Category::Error,
         "A_default_clause_cannot_appear_more_than_once_in_a_switch_statement_1113",
@@ -742,7 +742,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_114,
         Category::Error,
         "Duplicate_label_0_1114",
@@ -751,7 +751,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_115,
         Category::Error,
         "A_continue_statement_can_only_jump_to_a_label_of_an_enclosing_iteration_statement_1115",
@@ -760,7 +760,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_116,
         Category::Error,
         "A_break_statement_can_only_jump_to_a_label_of_an_enclosing_statement_1116",
@@ -769,7 +769,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_117,
         Category::Error,
         "An_object_literal_cannot_have_multiple_properties_with_the_same_name_1117",
@@ -778,7 +778,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_118,
         Category::Error,
         "An_object_literal_cannot_have_multiple_get_Slashset_accessors_with_the_same_name_1118",
@@ -787,7 +787,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_119,
         Category::Error,
         "An_object_literal_cannot_have_property_and_accessor_with_the_same_name_1119",
@@ -796,7 +796,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_120,
         Category::Error,
         "An_export_assignment_cannot_have_modifiers_1120",
@@ -805,7 +805,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_121,
         Category::Error,
         "Octal_literals_are_not_allowed_Use_the_syntax_0_1121",
@@ -814,7 +814,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_123,
         Category::Error,
         "Variable_declaration_list_cannot_be_empty_1123",
@@ -823,7 +823,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_124,
         Category::Error,
         "Digit_expected_1124",
@@ -832,7 +832,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_125,
         Category::Error,
         "Hexadecimal_digit_expected_1125",
@@ -841,7 +841,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_126,
         Category::Error,
         "Unexpected_end_of_text_1126",
@@ -850,7 +850,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_127,
         Category::Error,
         "Invalid_character_1127",
@@ -859,7 +859,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_128,
         Category::Error,
         "Declaration_or_statement_expected_1128",
@@ -868,7 +868,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_129,
         Category::Error,
         "Statement_expected_1129",
@@ -877,7 +877,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_130,
         Category::Error,
         "case_or_default_expected_1130",
@@ -886,7 +886,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_131,
         Category::Error,
         "Property_or_signature_expected_1131",
@@ -895,7 +895,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_132,
         Category::Error,
         "Enum_member_expected_1132",
@@ -904,7 +904,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_134,
         Category::Error,
         "Variable_declaration_expected_1134",
@@ -913,7 +913,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_135,
         Category::Error,
         "Argument_expression_expected_1135",
@@ -922,7 +922,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_136,
         Category::Error,
         "Property_assignment_expected_1136",
@@ -931,7 +931,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_137,
         Category::Error,
         "Expression_or_comma_expected_1137",
@@ -940,7 +940,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_138,
         Category::Error,
         "Parameter_declaration_expected_1138",
@@ -949,7 +949,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_139,
         Category::Error,
         "Type_parameter_declaration_expected_1139",
@@ -958,7 +958,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_140,
         Category::Error,
         "Type_argument_expected_1140",
@@ -967,7 +967,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_141,
         Category::Error,
         "String_literal_expected_1141",
@@ -976,7 +976,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_142,
         Category::Error,
         "Line_break_not_permitted_here_1142",
@@ -985,7 +985,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_144,
         Category::Error,
         "or_expected_1144",
@@ -994,7 +994,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_145,
         Category::Error,
         "or_JSX_element_expected_1145",
@@ -1003,7 +1003,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_146,
         Category::Error,
         "Declaration_expected_1146",
@@ -1012,7 +1012,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_147,
         Category::Error,
         "Import_declarations_in_a_namespace_cannot_reference_a_module_1147",
@@ -1021,7 +1021,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_148,
         Category::Error,
         "Cannot_use_imports_exports_or_module_augmentations_when_module_is_none_1148",
@@ -1030,7 +1030,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_149,
         Category::Error,
         "File_name_0_differs_from_already_included_file_name_1_only_in_casing_1149",
@@ -1039,7 +1039,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_155,
         Category::Error,
         "_0_declarations_must_be_initialized_1155",
@@ -1048,7 +1048,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_156,
         Category::Error,
         "_0_declarations_can_only_be_declared_inside_a_block_1156",
@@ -1057,7 +1057,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_160,
         Category::Error,
         "Unterminated_template_literal_1160",
@@ -1066,7 +1066,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_161,
         Category::Error,
         "Unterminated_regular_expression_literal_1161",
@@ -1075,7 +1075,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_162,
         Category::Error,
         "An_object_member_cannot_be_declared_optional_1162",
@@ -1084,7 +1084,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_163,
         Category::Error,
         "A_yield_expression_is_only_allowed_in_a_generator_body_1163",
@@ -1093,7 +1093,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_164,
         Category::Error,
         "Computed_property_names_are_not_allowed_in_enums_1164",
@@ -1102,7 +1102,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_165,
         Category::Error,
         "A_computed_property_name_in_an_ambient_context_must_refer_to_an_expression_whose_type_is_a_literal_t_1165",
@@ -1111,7 +1111,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_166,
         Category::Error,
         "A_computed_property_name_in_a_class_property_declaration_must_have_a_simple_literal_type_or_a_unique_1166",
@@ -1120,7 +1120,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_168,
         Category::Error,
         "A_computed_property_name_in_a_method_overload_must_refer_to_an_expression_whose_type_is_a_literal_ty_1168",
@@ -1129,7 +1129,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_169,
         Category::Error,
         "A_computed_property_name_in_an_interface_must_refer_to_an_expression_whose_type_is_a_literal_type_or_1169",
@@ -1138,7 +1138,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_170,
         Category::Error,
         "A_computed_property_name_in_a_type_literal_must_refer_to_an_expression_whose_type_is_a_literal_type__1170",
@@ -1147,7 +1147,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_171,
         Category::Error,
         "A_comma_expression_is_not_allowed_in_a_computed_property_name_1171",
@@ -1156,7 +1156,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_172,
         Category::Error,
         "extends_clause_already_seen_1172",
@@ -1165,7 +1165,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_173,
         Category::Error,
         "extends_clause_must_precede_implements_clause_1173",
@@ -1174,7 +1174,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_174,
         Category::Error,
         "Classes_can_only_extend_a_single_class_1174",
@@ -1183,7 +1183,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_175,
         Category::Error,
         "implements_clause_already_seen_1175",
@@ -1192,7 +1192,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_176,
         Category::Error,
         "Interface_declaration_cannot_have_implements_clause_1176",
@@ -1201,7 +1201,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_177,
         Category::Error,
         "Binary_digit_expected_1177",
@@ -1210,7 +1210,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_178,
         Category::Error,
         "Octal_digit_expected_1178",
@@ -1219,7 +1219,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_179,
         Category::Error,
         "Unexpected_token_expected_1179",
@@ -1228,7 +1228,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_180,
         Category::Error,
         "Property_destructuring_pattern_expected_1180",
@@ -1237,7 +1237,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_181,
         Category::Error,
         "Array_element_destructuring_pattern_expected_1181",
@@ -1246,7 +1246,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_182,
         Category::Error,
         "A_destructuring_declaration_must_have_an_initializer_1182",
@@ -1255,7 +1255,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_183,
         Category::Error,
         "An_implementation_cannot_be_declared_in_ambient_contexts_1183",
@@ -1264,7 +1264,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_184,
         Category::Error,
         "Modifiers_cannot_appear_here_1184",
@@ -1273,7 +1273,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_185,
         Category::Error,
         "Merge_conflict_marker_encountered_1185",
@@ -1282,7 +1282,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_186,
         Category::Error,
         "A_rest_element_cannot_have_an_initializer_1186",
@@ -1291,7 +1291,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_187,
         Category::Error,
         "A_parameter_property_may_not_be_declared_using_a_binding_pattern_1187",
@@ -1300,7 +1300,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_188,
         Category::Error,
         "Only_a_single_variable_declaration_is_allowed_in_a_for_of_statement_1188",
@@ -1309,7 +1309,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_189,
         Category::Error,
         "The_variable_declaration_of_a_for_in_statement_cannot_have_an_initializer_1189",
@@ -1318,7 +1318,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_190,
         Category::Error,
         "The_variable_declaration_of_a_for_of_statement_cannot_have_an_initializer_1190",
@@ -1327,7 +1327,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_191,
         Category::Error,
         "An_import_declaration_cannot_have_modifiers_1191",
@@ -1336,7 +1336,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_192,
         Category::Error,
         "Module_0_has_no_default_export_1192",
@@ -1345,7 +1345,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_193,
         Category::Error,
         "An_export_declaration_cannot_have_modifiers_1193",
@@ -1354,7 +1354,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_194,
         Category::Error,
         "Export_declarations_are_not_permitted_in_a_namespace_1194",
@@ -1363,7 +1363,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_195,
         Category::Error,
         "export_Asterisk_does_not_re_export_a_default_1195",
@@ -1372,7 +1372,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_196,
         Category::Error,
         "Catch_clause_variable_type_annotation_must_be_any_or_unknown_if_specified_1196",
@@ -1381,7 +1381,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_197,
         Category::Error,
         "Catch_clause_variable_cannot_have_an_initializer_1197",
@@ -1390,7 +1390,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_198,
         Category::Error,
         "An_extended_Unicode_escape_value_must_be_between_0x0_and_0x10FFFF_inclusive_1198",
@@ -1399,7 +1399,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_199,
         Category::Error,
         "Unterminated_Unicode_escape_sequence_1199",
@@ -1408,7 +1408,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_200,
         Category::Error,
         "Line_terminator_not_permitted_before_arrow_1200",
@@ -1417,7 +1417,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_202,
         Category::Error,
         "Import_assignment_cannot_be_used_when_targeting_ECMAScript_modules_Consider_using_import_Asterisk_as_1202",
@@ -1426,7 +1426,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_203,
         Category::Error,
         "Export_assignment_cannot_be_used_when_targeting_ECMAScript_modules_Consider_using_export_default_or__1203",
@@ -1435,7 +1435,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_205,
         Category::Error,
         "Re_exporting_a_type_when_0_is_enabled_requires_using_export_type_1205",
@@ -1444,7 +1444,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_206,
         Category::Error,
         "Decorators_are_not_valid_here_1206",
@@ -1453,7 +1453,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_207,
         Category::Error,
         "Decorators_cannot_be_applied_to_multiple_get_Slashset_accessors_of_the_same_name_1207",
@@ -1462,7 +1462,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_209,
         Category::Error,
         "Invalid_optional_chain_from_new_expression_Did_you_mean_to_call_0_1209",
@@ -1471,7 +1471,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_210,
         Category::Error,
         "Code_contained_in_a_class_is_evaluated_in_JavaScript_s_strict_mode_which_does_not_allow_this_use_of__1210",
@@ -1480,7 +1480,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_211,
         Category::Error,
         "A_class_declaration_without_the_default_modifier_must_have_a_name_1211",
@@ -1489,7 +1489,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_212,
         Category::Error,
         "Identifier_expected_0_is_a_reserved_word_in_strict_mode_1212",
@@ -1498,7 +1498,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_213,
         Category::Error,
         "Identifier_expected_0_is_a_reserved_word_in_strict_mode_Class_definitions_are_automatically_in_stric_1213",
@@ -1507,7 +1507,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_214,
         Category::Error,
         "Identifier_expected_0_is_a_reserved_word_in_strict_mode_Modules_are_automatically_in_strict_mode_1214",
@@ -1516,7 +1516,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_215,
         Category::Error,
         "Invalid_use_of_0_Modules_are_automatically_in_strict_mode_1215",
@@ -1525,7 +1525,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_216,
         Category::Error,
         "Identifier_expected_esModule_is_reserved_as_an_exported_marker_when_transforming_ECMAScript_modules_1216",
@@ -1534,7 +1534,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_218,
         Category::Error,
         "Export_assignment_is_not_supported_when_module_flag_is_system_1218",
@@ -1543,7 +1543,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_221,
         Category::Error,
         "Generators_are_not_allowed_in_an_ambient_context_1221",
@@ -1552,7 +1552,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_222,
         Category::Error,
         "An_overload_signature_cannot_be_declared_as_a_generator_1222",
@@ -1561,7 +1561,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_223,
         Category::Error,
         "_0_tag_already_specified_1223",
@@ -1570,7 +1570,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_224,
         Category::Error,
         "Signature_0_must_be_a_type_predicate_1224",
@@ -1579,7 +1579,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_225,
         Category::Error,
         "Cannot_find_parameter_0_1225",
@@ -1588,7 +1588,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_226,
         Category::Error,
         "Type_predicate_0_is_not_assignable_to_1_1226",
@@ -1597,7 +1597,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_227,
         Category::Error,
         "Parameter_0_is_not_in_the_same_position_as_parameter_1_1227",
@@ -1606,7 +1606,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_228,
         Category::Error,
         "A_type_predicate_is_only_allowed_in_return_type_position_for_functions_and_methods_1228",
@@ -1615,7 +1615,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_229,
         Category::Error,
         "A_type_predicate_cannot_reference_a_rest_parameter_1229",
@@ -1624,7 +1624,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_230,
         Category::Error,
         "A_type_predicate_cannot_reference_element_0_in_a_binding_pattern_1230",
@@ -1633,7 +1633,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_231,
         Category::Error,
         "An_export_assignment_must_be_at_the_top_level_of_a_file_or_module_declaration_1231",
@@ -1642,7 +1642,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_232,
         Category::Error,
         "An_import_declaration_can_only_be_used_at_the_top_level_of_a_namespace_or_module_1232",
@@ -1651,7 +1651,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_233,
         Category::Error,
         "An_export_declaration_can_only_be_used_at_the_top_level_of_a_namespace_or_module_1233",
@@ -1660,7 +1660,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_234,
         Category::Error,
         "An_ambient_module_declaration_is_only_allowed_at_the_top_level_in_a_file_1234",
@@ -1669,7 +1669,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_235,
         Category::Error,
         "A_namespace_declaration_is_only_allowed_at_the_top_level_of_a_namespace_or_module_1235",
@@ -1678,7 +1678,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_236,
         Category::Error,
         "The_return_type_of_a_property_decorator_function_must_be_either_void_or_any_1236",
@@ -1687,7 +1687,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_237,
         Category::Error,
         "The_return_type_of_a_parameter_decorator_function_must_be_either_void_or_any_1237",
@@ -1696,7 +1696,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_238,
         Category::Error,
         "Unable_to_resolve_signature_of_class_decorator_when_called_as_an_expression_1238",
@@ -1705,7 +1705,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_239,
         Category::Error,
         "Unable_to_resolve_signature_of_parameter_decorator_when_called_as_an_expression_1239",
@@ -1714,7 +1714,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_240,
         Category::Error,
         "Unable_to_resolve_signature_of_property_decorator_when_called_as_an_expression_1240",
@@ -1723,7 +1723,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_241,
         Category::Error,
         "Unable_to_resolve_signature_of_method_decorator_when_called_as_an_expression_1241",
@@ -1732,7 +1732,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_242,
         Category::Error,
         "abstract_modifier_can_only_appear_on_a_class_method_or_property_declaration_1242",
@@ -1741,7 +1741,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_243,
         Category::Error,
         "_0_modifier_cannot_be_used_with_1_modifier_1243",
@@ -1750,7 +1750,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_244,
         Category::Error,
         "Abstract_methods_can_only_appear_within_an_abstract_class_1244",
@@ -1759,7 +1759,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_245,
         Category::Error,
         "Method_0_cannot_have_an_implementation_because_it_is_marked_abstract_1245",
@@ -1768,7 +1768,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_246,
         Category::Error,
         "An_interface_property_cannot_have_an_initializer_1246",
@@ -1777,7 +1777,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_247,
         Category::Error,
         "A_type_literal_property_cannot_have_an_initializer_1247",
@@ -1786,7 +1786,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_248,
         Category::Error,
         "A_class_member_cannot_have_the_0_keyword_1248",
@@ -1795,7 +1795,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_249,
         Category::Error,
         "A_decorator_can_only_decorate_a_method_implementation_not_an_overload_1249",
@@ -1804,7 +1804,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_250,
         Category::Error,
         "Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5_1250",
@@ -1813,7 +1813,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_251,
         Category::Error,
         "Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5_Class_definiti_1251",
@@ -1822,7 +1822,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_252,
         Category::Error,
         "Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5_Modules_are_au_1252",
@@ -1831,7 +1831,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_253,
         Category::Error,
         "Abstract_properties_can_only_appear_within_an_abstract_class_1253",
@@ -1840,7 +1840,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_254,
         Category::Error,
         "A_const_initializer_in_an_ambient_context_must_be_a_string_or_numeric_literal_or_literal_enum_refere_1254",
@@ -1849,7 +1849,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_255,
         Category::Error,
         "A_definite_assignment_assertion_is_not_permitted_in_this_context_1255",
@@ -1858,7 +1858,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_257,
         Category::Error,
         "A_required_element_cannot_follow_an_optional_element_1257",
@@ -1867,7 +1867,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_258,
         Category::Error,
         "A_default_export_must_be_at_the_top_level_of_a_file_or_module_declaration_1258",
@@ -1876,7 +1876,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_259,
         Category::Error,
         "Module_0_can_only_be_default_imported_using_the_1_flag_1259",
@@ -1885,7 +1885,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_260,
         Category::Error,
         "Keywords_cannot_contain_escape_characters_1260",
@@ -1894,7 +1894,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_261,
         Category::Error,
         "Already_included_file_name_0_differs_from_file_name_1_only_in_casing_1261",
@@ -1903,7 +1903,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_262,
         Category::Error,
         "Identifier_expected_0_is_a_reserved_word_at_the_top_level_of_a_module_1262",
@@ -1912,7 +1912,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_263,
         Category::Error,
         "Declarations_with_initializers_cannot_also_have_definite_assignment_assertions_1263",
@@ -1921,7 +1921,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_264,
         Category::Error,
         "Declarations_with_definite_assignment_assertions_must_also_have_type_annotations_1264",
@@ -1930,7 +1930,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_265,
         Category::Error,
         "A_rest_element_cannot_follow_another_rest_element_1265",
@@ -1939,7 +1939,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_266,
         Category::Error,
         "An_optional_element_cannot_follow_a_rest_element_1266",
@@ -1948,7 +1948,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_267,
         Category::Error,
         "Property_0_cannot_have_an_initializer_because_it_is_marked_abstract_1267",
@@ -1957,7 +1957,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_268,
         Category::Error,
         "An_index_signature_parameter_type_must_be_string_number_symbol_or_a_template_literal_type_1268",
@@ -1966,7 +1966,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_269,
         Category::Error,
         "Cannot_use_export_import_on_a_type_or_type_only_namespace_when_0_is_enabled_1269",
@@ -1975,7 +1975,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_270,
         Category::Error,
         "Decorator_function_return_type_0_is_not_assignable_to_type_1_1270",
@@ -1984,7 +1984,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_271,
         Category::Error,
         "Decorator_function_return_type_is_0_but_is_expected_to_be_void_or_any_1271",
@@ -1993,7 +1993,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_272,
         Category::Error,
         "A_type_referenced_in_a_decorated_signature_must_be_imported_with_import_type_or_a_namespace_import_w_1272",
@@ -2002,7 +2002,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_273,
         Category::Error,
         "_0_modifier_cannot_appear_on_a_type_parameter_1273",
@@ -2011,7 +2011,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_274,
         Category::Error,
         "_0_modifier_can_only_appear_on_a_type_parameter_of_a_class_interface_or_type_alias_1274",
@@ -2020,7 +2020,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_275,
         Category::Error,
         "accessor_modifier_can_only_appear_on_a_property_declaration_1275",
@@ -2029,7 +2029,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_276,
         Category::Error,
         "An_accessor_property_cannot_be_declared_optional_1276",
@@ -2038,7 +2038,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_277,
         Category::Error,
         "_0_modifier_can_only_appear_on_a_type_parameter_of_a_function_method_or_class_1277",
@@ -2047,7 +2047,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_278,
         Category::Error,
         "The_runtime_will_invoke_the_decorator_with_1_arguments_but_the_decorator_expects_0_1278",
@@ -2056,7 +2056,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_279,
         Category::Error,
         "The_runtime_will_invoke_the_decorator_with_1_arguments_but_the_decorator_expects_at_least_0_1279",
@@ -2065,7 +2065,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_280,
         Category::Error,
         "Namespaces_are_not_allowed_in_global_script_files_when_0_is_enabled_If_this_file_is_not_intended_to__1280",
@@ -2074,7 +2074,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_281,
         Category::Error,
         "Cannot_access_0_from_another_file_without_qualification_when_1_is_enabled_Use_2_instead_1281",
@@ -2083,7 +2083,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_282,
         Category::Error,
         "An_export_declaration_must_reference_a_value_when_verbatimModuleSyntax_is_enabled_but_0_only_refers__1282",
@@ -2092,7 +2092,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_283,
         Category::Error,
         "An_export_declaration_must_reference_a_real_value_when_verbatimModuleSyntax_is_enabled_but_0_resolve_1283",
@@ -2101,7 +2101,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_284,
         Category::Error,
         "An_export_default_must_reference_a_value_when_verbatimModuleSyntax_is_enabled_but_0_only_refers_to_a_1284",
@@ -2110,7 +2110,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_285,
         Category::Error,
         "An_export_default_must_reference_a_real_value_when_verbatimModuleSyntax_is_enabled_but_0_resolves_to_1285",
@@ -2119,7 +2119,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_286,
         Category::Error,
         "ECMAScript_imports_and_exports_cannot_be_written_in_a_CommonJS_file_under_verbatimModuleSyntax_1286",
@@ -2128,7 +2128,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_287,
         Category::Error,
         "A_top_level_export_modifier_cannot_be_used_on_value_declarations_in_a_CommonJS_module_when_verbatimM_1287",
@@ -2137,7 +2137,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_288,
         Category::Error,
         "An_import_alias_cannot_resolve_to_a_type_or_type_only_declaration_when_verbatimModuleSyntax_is_enabl_1288",
@@ -2146,7 +2146,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_289,
         Category::Error,
         "_0_resolves_to_a_type_only_declaration_and_must_be_marked_type_only_in_this_file_before_re_exporting_1289",
@@ -2155,7 +2155,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_290,
         Category::Error,
         "_0_resolves_to_a_type_only_declaration_and_must_be_marked_type_only_in_this_file_before_re_exporting_1290",
@@ -2164,7 +2164,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_291,
         Category::Error,
         "_0_resolves_to_a_type_and_must_be_marked_type_only_in_this_file_before_re_exporting_when_1_is_enable_1291",
@@ -2173,7 +2173,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_292,
         Category::Error,
         "_0_resolves_to_a_type_and_must_be_marked_type_only_in_this_file_before_re_exporting_when_1_is_enable_1292",
@@ -2182,7 +2182,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_293,
         Category::Error,
         "ECMAScript_module_syntax_is_not_allowed_in_a_CommonJS_module_when_module_is_set_to_preserve_1293",
@@ -2191,7 +2191,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_294,
         Category::Error,
         "This_syntax_is_not_allowed_when_erasableSyntaxOnly_is_enabled_1294",
@@ -2200,7 +2200,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_295,
         Category::Error,
         "ECMAScript_imports_and_exports_cannot_be_written_in_a_CommonJS_file_under_verbatimModuleSyntax_Adjus_1295",
@@ -2209,7 +2209,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_300,
         Category::Error,
         "with_statements_are_not_allowed_in_an_async_function_block_1300",
@@ -2218,7 +2218,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_308,
         Category::Error,
         "await_expressions_are_only_allowed_within_async_functions_and_at_the_top_levels_of_modules_1308",
@@ -2227,7 +2227,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_309,
         Category::Error,
         "The_current_file_is_a_CommonJS_module_and_cannot_use_await_at_the_top_level_1309",
@@ -2236,7 +2236,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_312,
         Category::Error,
         "Did_you_mean_to_use_a_Colon_An_can_only_follow_a_property_name_when_the_containing_object_literal_is_1312",
@@ -2245,7 +2245,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_313,
         Category::Error,
         "The_body_of_an_if_statement_cannot_be_the_empty_statement_1313",
@@ -2254,7 +2254,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_314,
         Category::Error,
         "Global_module_exports_may_only_appear_in_module_files_1314",
@@ -2263,7 +2263,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_315,
         Category::Error,
         "Global_module_exports_may_only_appear_in_declaration_files_1315",
@@ -2272,7 +2272,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_316,
         Category::Error,
         "Global_module_exports_may_only_appear_at_top_level_1316",
@@ -2281,7 +2281,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_317,
         Category::Error,
         "A_parameter_property_cannot_be_declared_using_a_rest_parameter_1317",
@@ -2290,7 +2290,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_318,
         Category::Error,
         "An_abstract_accessor_cannot_have_an_implementation_1318",
@@ -2299,7 +2299,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_319,
         Category::Error,
         "A_default_export_can_only_be_used_in_an_ECMAScript_style_module_1319",
@@ -2308,7 +2308,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_320,
         Category::Error,
         "Type_of_await_operand_must_either_be_a_valid_promise_or_must_not_contain_a_callable_then_member_1320",
@@ -2317,7 +2317,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_321,
         Category::Error,
         "Type_of_yield_operand_in_an_async_generator_must_either_be_a_valid_promise_or_must_not_contain_a_cal_1321",
@@ -2326,7 +2326,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_322,
         Category::Error,
         "Type_of_iterated_elements_of_a_yield_Asterisk_operand_must_either_be_a_valid_promise_or_must_not_con_1322",
@@ -2335,7 +2335,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_323,
         Category::Error,
         "Dynamic_imports_are_only_supported_when_the_module_flag_is_set_to_es2020_es2022_esnext_commonjs_amd__1323",
@@ -2344,7 +2344,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_324,
         Category::Error,
         "Dynamic_imports_only_support_a_second_argument_when_the_module_option_is_set_to_esnext_node16_node18_1324",
@@ -2353,7 +2353,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_325,
         Category::Error,
         "Argument_of_dynamic_import_cannot_be_spread_element_1325",
@@ -2362,7 +2362,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_326,
         Category::Error,
         "This_use_of_import_is_invalid_import_calls_can_be_written_but_they_must_have_parentheses_and_cannot__1326",
@@ -2371,7 +2371,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_327,
         Category::Error,
         "String_literal_with_double_quotes_expected_1327",
@@ -2380,7 +2380,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_328,
         Category::Error,
         "Property_value_can_only_be_string_literal_numeric_literal_true_false_null_object_literal_or_array_li_1328",
@@ -2389,7 +2389,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_329,
         Category::Error,
         "_0_accepts_too_few_arguments_to_be_used_as_a_decorator_here_Did_you_mean_to_call_it_first_and_write__1329",
@@ -2398,7 +2398,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_330,
         Category::Error,
         "A_property_of_an_interface_or_type_literal_whose_type_is_a_unique_symbol_type_must_be_readonly_1330",
@@ -2407,7 +2407,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_331,
         Category::Error,
         "A_property_of_a_class_whose_type_is_a_unique_symbol_type_must_be_both_static_and_readonly_1331",
@@ -2416,7 +2416,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_332,
         Category::Error,
         "A_variable_whose_type_is_a_unique_symbol_type_must_be_const_1332",
@@ -2425,7 +2425,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_333,
         Category::Error,
         "unique_symbol_types_may_not_be_used_on_a_variable_declaration_with_a_binding_name_1333",
@@ -2434,7 +2434,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_334,
         Category::Error,
         "unique_symbol_types_are_only_allowed_on_variables_in_a_variable_statement_1334",
@@ -2443,7 +2443,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_335,
         Category::Error,
         "unique_symbol_types_are_not_allowed_here_1335",
@@ -2452,7 +2452,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_337,
         Category::Error,
         "An_index_signature_parameter_type_cannot_be_a_literal_type_or_generic_type_Consider_using_a_mapped_o_1337",
@@ -2461,7 +2461,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_338,
         Category::Error,
         "infer_declarations_are_only_permitted_in_the_extends_clause_of_a_conditional_type_1338",
@@ -2470,7 +2470,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_339,
         Category::Error,
         "Module_0_does_not_refer_to_a_value_but_is_used_as_a_value_here_1339",
@@ -2479,7 +2479,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_340,
         Category::Error,
         "Module_0_does_not_refer_to_a_type_but_is_used_as_a_type_here_Did_you_mean_typeof_import_0_1340",
@@ -2488,7 +2488,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_341,
         Category::Error,
         "Class_constructor_may_not_be_an_accessor_1341",
@@ -2497,7 +2497,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_343,
         Category::Error,
         "The_import_meta_meta_property_is_only_allowed_when_the_module_option_is_es2020_es2022_esnext_system__1343",
@@ -2506,7 +2506,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_344,
         Category::Error,
         "A_label_is_not_allowed_here_1344",
@@ -2515,7 +2515,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_345,
         Category::Error,
         "An_expression_of_type_void_cannot_be_tested_for_truthiness_1345",
@@ -2524,7 +2524,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_346,
         Category::Error,
         "This_parameter_is_not_allowed_with_use_strict_directive_1346",
@@ -2533,7 +2533,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_347,
         Category::Error,
         "use_strict_directive_cannot_be_used_with_non_simple_parameter_list_1347",
@@ -2542,7 +2542,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_348,
         Category::Error,
         "Non_simple_parameter_declared_here_1348",
@@ -2551,7 +2551,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_349,
         Category::Error,
         "use_strict_directive_used_here_1349",
@@ -2560,7 +2560,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_350,
         Category::Message,
         "Print_the_final_configuration_instead_of_building_1350",
@@ -2569,7 +2569,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_351,
         Category::Error,
         "An_identifier_or_keyword_cannot_immediately_follow_a_numeric_literal_1351",
@@ -2578,7 +2578,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_352,
         Category::Error,
         "A_bigint_literal_cannot_use_exponential_notation_1352",
@@ -2587,7 +2587,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_353,
         Category::Error,
         "A_bigint_literal_must_be_an_integer_1353",
@@ -2596,7 +2596,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_354,
         Category::Error,
         "readonly_type_modifier_is_only_permitted_on_array_and_tuple_literal_types_1354",
@@ -2605,7 +2605,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_355,
         Category::Error,
         "A_const_assertion_can_only_be_applied_to_references_to_enum_members_or_string_number_boolean_array_o_1355",
@@ -2614,7 +2614,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_356,
         Category::Error,
         "Did_you_mean_to_mark_this_function_as_async_1356",
@@ -2623,7 +2623,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_357,
         Category::Error,
         "An_enum_member_name_must_be_followed_by_a_or_1357",
@@ -2632,7 +2632,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_358,
         Category::Error,
         "Tagged_template_expressions_are_not_permitted_in_an_optional_chain_1358",
@@ -2641,7 +2641,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_359,
         Category::Error,
         "Identifier_expected_0_is_a_reserved_word_that_cannot_be_used_here_1359",
@@ -2650,7 +2650,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_360,
         Category::Error,
         "Type_0_does_not_satisfy_the_expected_type_1_1360",
@@ -2659,7 +2659,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_361,
         Category::Error,
         "_0_cannot_be_used_as_a_value_because_it_was_imported_using_import_type_1361",
@@ -2668,7 +2668,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_362,
         Category::Error,
         "_0_cannot_be_used_as_a_value_because_it_was_exported_using_export_type_1362",
@@ -2677,7 +2677,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_363,
         Category::Error,
         "A_type_only_import_can_specify_a_default_import_or_named_bindings_but_not_both_1363",
@@ -2686,7 +2686,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_364,
         Category::Message,
         "Convert_to_type_only_export_1364",
@@ -2695,7 +2695,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_365,
         Category::Message,
         "Convert_all_re_exported_types_to_type_only_exports_1365",
@@ -2704,7 +2704,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_366,
         Category::Message,
         "Split_into_two_separate_import_declarations_1366",
@@ -2713,7 +2713,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_367,
         Category::Message,
         "Split_all_invalid_type_only_imports_1367",
@@ -2722,7 +2722,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_368,
         Category::Error,
         "Class_constructor_may_not_be_a_generator_1368",
@@ -2731,7 +2731,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_369,
         Category::Message,
         "Did_you_mean_0_1369",
@@ -2740,7 +2740,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_375,
         Category::Error,
         "await_expressions_are_only_allowed_at_the_top_level_of_a_file_when_that_file_is_a_module_but_this_fi_1375",
@@ -2749,7 +2749,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_376,
         Category::Message,
         "_0_was_imported_here_1376",
@@ -2758,7 +2758,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_377,
         Category::Message,
         "_0_was_exported_here_1377",
@@ -2767,7 +2767,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_378,
         Category::Error,
         "Top_level_await_expressions_are_only_allowed_when_the_module_option_is_set_to_es2022_esnext_system_n_1378",
@@ -2776,7 +2776,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_379,
         Category::Error,
         "An_import_alias_cannot_reference_a_declaration_that_was_exported_using_export_type_1379",
@@ -2785,7 +2785,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_380,
         Category::Error,
         "An_import_alias_cannot_reference_a_declaration_that_was_imported_using_import_type_1380",
@@ -2794,7 +2794,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_381,
         Category::Error,
         "Unexpected_token_Did_you_mean_or_rbrace_1381",
@@ -2803,7 +2803,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_382,
         Category::Error,
         "Unexpected_token_Did_you_mean_or_gt_1382",
@@ -2812,7 +2812,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_385,
         Category::Error,
         "Function_type_notation_must_be_parenthesized_when_used_in_a_union_type_1385",
@@ -2821,7 +2821,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_386,
         Category::Error,
         "Constructor_type_notation_must_be_parenthesized_when_used_in_a_union_type_1386",
@@ -2830,7 +2830,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_387,
         Category::Error,
         "Function_type_notation_must_be_parenthesized_when_used_in_an_intersection_type_1387",
@@ -2839,7 +2839,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_388,
         Category::Error,
         "Constructor_type_notation_must_be_parenthesized_when_used_in_an_intersection_type_1388",
@@ -2848,7 +2848,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_389,
         Category::Error,
         "_0_is_not_allowed_as_a_variable_declaration_name_1389",
@@ -2857,7 +2857,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_390,
         Category::Error,
         "_0_is_not_allowed_as_a_parameter_name_1390",
@@ -2866,7 +2866,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_392,
         Category::Error,
         "An_import_alias_cannot_use_import_type_1392",
@@ -2875,7 +2875,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_393,
         Category::Message,
         "Imported_via_0_from_file_1_1393",
@@ -2884,7 +2884,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_394,
         Category::Message,
         "Imported_via_0_from_file_1_with_packageId_2_1394",
@@ -2893,7 +2893,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_395,
         Category::Message,
         "Imported_via_0_from_file_1_to_import_importHelpers_as_specified_in_compilerOptions_1395",
@@ -2902,7 +2902,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_396,
         Category::Message,
         "Imported_via_0_from_file_1_with_packageId_2_to_import_importHelpers_as_specified_in_compilerOptions_1396",
@@ -2911,7 +2911,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_397,
         Category::Message,
         "Imported_via_0_from_file_1_to_import_jsx_and_jsxs_factory_functions_1397",
@@ -2920,7 +2920,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_398,
         Category::Message,
         "Imported_via_0_from_file_1_with_packageId_2_to_import_jsx_and_jsxs_factory_functions_1398",
@@ -2929,7 +2929,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_399,
         Category::Message,
         "File_is_included_via_import_here_1399",
@@ -2938,7 +2938,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_400,
         Category::Message,
         "Referenced_via_0_from_file_1_1400",
@@ -2947,7 +2947,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_401,
         Category::Message,
         "File_is_included_via_reference_here_1401",
@@ -2956,7 +2956,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_402,
         Category::Message,
         "Type_library_referenced_via_0_from_file_1_1402",
@@ -2965,7 +2965,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_403,
         Category::Message,
         "Type_library_referenced_via_0_from_file_1_with_packageId_2_1403",
@@ -2974,7 +2974,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_404,
         Category::Message,
         "File_is_included_via_type_library_reference_here_1404",
@@ -2983,7 +2983,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_405,
         Category::Message,
         "Library_referenced_via_0_from_file_1_1405",
@@ -2992,7 +2992,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_406,
         Category::Message,
         "File_is_included_via_library_reference_here_1406",
@@ -3001,7 +3001,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_407,
         Category::Message,
         "Matched_by_include_pattern_0_in_1_1407",
@@ -3010,7 +3010,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_408,
         Category::Message,
         "File_is_matched_by_include_pattern_specified_here_1408",
@@ -3019,7 +3019,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_409,
         Category::Message,
         "Part_of_files_list_in_tsconfig_json_1409",
@@ -3028,7 +3028,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_410,
         Category::Message,
         "File_is_matched_by_files_list_specified_here_1410",
@@ -3037,7 +3037,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_411,
         Category::Message,
         "Output_from_referenced_project_0_included_because_1_specified_1411",
@@ -3046,7 +3046,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_412,
         Category::Message,
         "Output_from_referenced_project_0_included_because_module_is_specified_as_none_1412",
@@ -3055,7 +3055,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_413,
         Category::Message,
         "File_is_output_from_referenced_project_specified_here_1413",
@@ -3064,7 +3064,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_414,
         Category::Message,
         "Source_from_referenced_project_0_included_because_1_specified_1414",
@@ -3073,7 +3073,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_415,
         Category::Message,
         "Source_from_referenced_project_0_included_because_module_is_specified_as_none_1415",
@@ -3082,7 +3082,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_416,
         Category::Message,
         "File_is_source_from_referenced_project_specified_here_1416",
@@ -3091,7 +3091,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_417,
         Category::Message,
         "Entry_point_of_type_library_0_specified_in_compilerOptions_1417",
@@ -3100,7 +3100,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_418,
         Category::Message,
         "Entry_point_of_type_library_0_specified_in_compilerOptions_with_packageId_1_1418",
@@ -3109,7 +3109,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_419,
         Category::Message,
         "File_is_entry_point_of_type_library_specified_here_1419",
@@ -3118,7 +3118,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_420,
         Category::Message,
         "Entry_point_for_implicit_type_library_0_1420",
@@ -3127,7 +3127,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_421,
         Category::Message,
         "Entry_point_for_implicit_type_library_0_with_packageId_1_1421",
@@ -3136,7 +3136,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_422,
         Category::Message,
         "Library_0_specified_in_compilerOptions_1422",
@@ -3145,7 +3145,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_423,
         Category::Message,
         "File_is_library_specified_here_1423",
@@ -3154,7 +3154,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_424,
         Category::Message,
         "Default_library_1424",
@@ -3163,7 +3163,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_425,
         Category::Message,
         "Default_library_for_target_0_1425",
@@ -3172,7 +3172,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_426,
         Category::Message,
         "File_is_default_library_for_target_specified_here_1426",
@@ -3181,7 +3181,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_427,
         Category::Message,
         "Root_file_specified_for_compilation_1427",
@@ -3190,7 +3190,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_428,
         Category::Message,
         "File_is_output_of_project_reference_source_0_1428",
@@ -3199,7 +3199,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_429,
         Category::Message,
         "File_redirects_to_file_0_1429",
@@ -3208,7 +3208,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_430,
         Category::Message,
         "The_file_is_in_the_program_because_Colon_1430",
@@ -3217,7 +3217,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_431,
         Category::Error,
         "for_await_loops_are_only_allowed_at_the_top_level_of_a_file_when_that_file_is_a_module_but_this_file_1431",
@@ -3226,7 +3226,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_432,
         Category::Error,
         "Top_level_for_await_loops_are_only_allowed_when_the_module_option_is_set_to_es2022_esnext_system_nod_1432",
@@ -3235,7 +3235,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_433,
         Category::Error,
         "Neither_decorators_nor_modifiers_may_be_applied_to_this_parameters_1433",
@@ -3244,7 +3244,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_434,
         Category::Error,
         "Unexpected_keyword_or_identifier_1434",
@@ -3253,7 +3253,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_435,
         Category::Error,
         "Unknown_keyword_or_identifier_Did_you_mean_0_1435",
@@ -3262,7 +3262,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_436,
         Category::Error,
         "Decorators_must_precede_the_name_and_all_keywords_of_property_declarations_1436",
@@ -3271,7 +3271,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_437,
         Category::Error,
         "Namespace_must_be_given_a_name_1437",
@@ -3280,7 +3280,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_438,
         Category::Error,
         "Interface_must_be_given_a_name_1438",
@@ -3289,7 +3289,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_439,
         Category::Error,
         "Type_alias_must_be_given_a_name_1439",
@@ -3298,7 +3298,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_440,
         Category::Error,
         "Variable_declaration_not_allowed_at_this_location_1440",
@@ -3307,7 +3307,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_441,
         Category::Error,
         "Cannot_start_a_function_call_in_a_type_annotation_1441",
@@ -3316,7 +3316,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_442,
         Category::Error,
         "Expected_for_property_initializer_1442",
@@ -3325,7 +3325,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_443,
         Category::Error,
         "Module_declaration_names_may_only_use_or_quoted_strings_1443",
@@ -3334,7 +3334,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_448,
         Category::Error,
         "_0_resolves_to_a_type_only_declaration_and_must_be_re_exported_using_a_type_only_re_export_when_1_is_1448",
@@ -3343,7 +3343,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_449,
         Category::Message,
         "Preserve_unused_imported_values_in_the_JavaScript_output_that_would_otherwise_be_removed_1449",
@@ -3352,7 +3352,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_450,
         Category::Message,
         "Dynamic_imports_can_only_accept_a_module_specifier_and_an_optional_set_of_attributes_as_arguments_1450",
@@ -3361,7 +3361,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_451,
         Category::Error,
         "Private_identifiers_are_only_allowed_in_class_bodies_and_may_only_be_used_as_part_of_a_class_member__1451",
@@ -3370,7 +3370,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_453,
         Category::Error,
         "resolution_mode_should_be_either_require_or_import_1453",
@@ -3379,7 +3379,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_454,
         Category::Error,
         "resolution_mode_can_only_be_set_for_type_only_imports_1454",
@@ -3388,7 +3388,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_455,
         Category::Error,
         "resolution_mode_is_the_only_valid_key_for_type_import_assertions_1455",
@@ -3397,7 +3397,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_456,
         Category::Error,
         "Type_import_assertions_should_have_exactly_one_key_resolution_mode_with_value_import_or_require_1456",
@@ -3406,7 +3406,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_457,
         Category::Message,
         "Matched_by_default_include_pattern_Asterisk_Asterisk_Slash_Asterisk_1457",
@@ -3415,7 +3415,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_458,
         Category::Message,
         "File_is_ECMAScript_module_because_0_has_field_type_with_value_module_1458",
@@ -3424,7 +3424,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_459,
         Category::Message,
         "File_is_CommonJS_module_because_0_has_field_type_whose_value_is_not_module_1459",
@@ -3433,7 +3433,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_460,
         Category::Message,
         "File_is_CommonJS_module_because_0_does_not_have_field_type_1460",
@@ -3442,7 +3442,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_461,
         Category::Message,
         "File_is_CommonJS_module_because_package_json_was_not_found_1461",
@@ -3451,7 +3451,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_470,
         Category::Error,
         "The_import_meta_meta_property_is_not_allowed_in_files_which_will_build_into_CommonJS_output_1470",
@@ -3460,7 +3460,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_471,
         Category::Error,
         "Module_0_cannot_be_imported_using_this_construct_The_specifier_only_resolves_to_an_ES_module_which_c_1471",
@@ -3469,7 +3469,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_472,
         Category::Error,
         "catch_or_finally_expected_1472",
@@ -3478,7 +3478,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_473,
         Category::Error,
         "An_import_declaration_can_only_be_used_at_the_top_level_of_a_module_1473",
@@ -3487,7 +3487,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_474,
         Category::Error,
         "An_export_declaration_can_only_be_used_at_the_top_level_of_a_module_1474",
@@ -3496,7 +3496,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_475,
         Category::Message,
         "Control_what_method_is_used_to_detect_module_format_JS_files_1475",
@@ -3505,7 +3505,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_476,
         Category::Message,
         "auto_Colon_Treat_files_with_imports_exports_import_meta_jsx_with_jsx_Colon_react_jsx_or_esm_format_w_1476",
@@ -3514,7 +3514,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_477,
         Category::Error,
         "An_instantiation_expression_cannot_be_followed_by_a_property_access_1477",
@@ -3523,7 +3523,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_478,
         Category::Error,
         "Identifier_or_string_literal_expected_1478",
@@ -3532,7 +3532,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_479,
         Category::Error,
         "The_current_file_is_a_CommonJS_module_whose_imports_will_produce_require_calls_however_the_reference_1479",
@@ -3541,7 +3541,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_480,
         Category::Message,
         "To_convert_this_file_to_an_ECMAScript_module_change_its_file_extension_to_0_or_create_a_local_packag_1480",
@@ -3550,7 +3550,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_481,
         Category::Message,
         "To_convert_this_file_to_an_ECMAScript_module_change_its_file_extension_to_0_or_add_the_field_type_Co_1481",
@@ -3559,7 +3559,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_482,
         Category::Message,
         "To_convert_this_file_to_an_ECMAScript_module_add_the_field_type_Colon_module_to_0_1482",
@@ -3568,7 +3568,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_483,
         Category::Message,
         "To_convert_this_file_to_an_ECMAScript_module_create_a_local_package_json_file_with_type_Colon_module_1483",
@@ -3577,7 +3577,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_484,
         Category::Error,
         "_0_is_a_type_and_must_be_imported_using_a_type_only_import_when_verbatimModuleSyntax_is_enabled_1484",
@@ -3586,7 +3586,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_485,
         Category::Error,
         "_0_resolves_to_a_type_only_declaration_and_must_be_imported_using_a_type_only_import_when_verbatimMo_1485",
@@ -3595,7 +3595,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_486,
         Category::Error,
         "Decorator_used_before_export_here_1486",
@@ -3604,7 +3604,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_487,
         Category::Error,
         "Octal_escape_sequences_are_not_allowed_Use_the_syntax_0_1487",
@@ -3613,7 +3613,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_488,
         Category::Error,
         "Escape_sequence_0_is_not_allowed_1488",
@@ -3622,7 +3622,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_489,
         Category::Error,
         "Decimals_with_leading_zeros_are_not_allowed_1489",
@@ -3631,7 +3631,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_490,
         Category::Error,
         "File_appears_to_be_binary_1490",
@@ -3640,7 +3640,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_491,
         Category::Error,
         "_0_modifier_cannot_appear_on_a_using_declaration_1491",
@@ -3649,7 +3649,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_492,
         Category::Error,
         "_0_declarations_may_not_have_binding_patterns_1492",
@@ -3658,7 +3658,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_493,
         Category::Error,
         "The_left_hand_side_of_a_for_in_statement_cannot_be_a_using_declaration_1493",
@@ -3667,7 +3667,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_494,
         Category::Error,
         "The_left_hand_side_of_a_for_in_statement_cannot_be_an_await_using_declaration_1494",
@@ -3676,7 +3676,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_495,
         Category::Error,
         "_0_modifier_cannot_appear_on_an_await_using_declaration_1495",
@@ -3685,7 +3685,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_496,
         Category::Error,
         "Identifier_string_literal_or_number_literal_expected_1496",
@@ -3694,7 +3694,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_497,
         Category::Error,
         "Expression_must_be_enclosed_in_parentheses_to_be_used_as_a_decorator_1497",
@@ -3703,7 +3703,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_498,
         Category::Error,
         "Invalid_syntax_in_decorator_1498",
@@ -3712,7 +3712,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_499,
         Category::Error,
         "Unknown_regular_expression_flag_1499",
@@ -3721,7 +3721,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_500,
         Category::Error,
         "Duplicate_regular_expression_flag_1500",
@@ -3730,7 +3730,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_501,
         Category::Error,
         "This_regular_expression_flag_is_only_available_when_targeting_0_or_later_1501",
@@ -3739,7 +3739,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_502,
         Category::Error,
         "The_Unicode_u_flag_and_the_Unicode_Sets_v_flag_cannot_be_set_simultaneously_1502",
@@ -3748,7 +3748,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_503,
         Category::Error,
         "Named_capturing_groups_are_only_available_when_targeting_ES2018_or_later_1503",
@@ -3757,7 +3757,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_504,
         Category::Error,
         "Subpattern_flags_must_be_present_when_there_is_a_minus_sign_1504",
@@ -3766,7 +3766,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_505,
         Category::Error,
         "Incomplete_quantifier_Digit_expected_1505",
@@ -3775,7 +3775,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_506,
         Category::Error,
         "Numbers_out_of_order_in_quantifier_1506",
@@ -3784,7 +3784,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_507,
         Category::Error,
         "There_is_nothing_available_for_repetition_1507",
@@ -3793,7 +3793,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_508,
         Category::Error,
         "Unexpected_0_Did_you_mean_to_escape_it_with_backslash_1508",
@@ -3802,7 +3802,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_509,
         Category::Error,
         "This_regular_expression_flag_cannot_be_toggled_within_a_subpattern_1509",
@@ -3811,7 +3811,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_510,
         Category::Error,
         "k_must_be_followed_by_a_capturing_group_name_enclosed_in_angle_brackets_1510",
@@ -3820,7 +3820,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_511,
         Category::Error,
         "q_is_only_available_inside_character_class_1511",
@@ -3829,7 +3829,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_512,
         Category::Error,
         "c_must_be_followed_by_an_ASCII_letter_1512",
@@ -3838,7 +3838,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_513,
         Category::Error,
         "Undetermined_character_escape_1513",
@@ -3847,7 +3847,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_514,
         Category::Error,
         "Expected_a_capturing_group_name_1514",
@@ -3856,7 +3856,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_515,
         Category::Error,
         "Named_capturing_groups_with_the_same_name_must_be_mutually_exclusive_to_each_other_1515",
@@ -3865,7 +3865,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_516,
         Category::Error,
         "A_character_class_range_must_not_be_bounded_by_another_character_class_1516",
@@ -3874,7 +3874,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_517,
         Category::Error,
         "Range_out_of_order_in_character_class_1517",
@@ -3883,7 +3883,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_518,
         Category::Error,
         "Anything_that_would_possibly_match_more_than_a_single_character_is_invalid_inside_a_negated_characte_1518",
@@ -3892,7 +3892,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_519,
         Category::Error,
         "Operators_must_not_be_mixed_within_a_character_class_Wrap_it_in_a_nested_class_instead_1519",
@@ -3901,7 +3901,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_520,
         Category::Error,
         "Expected_a_class_set_operand_1520",
@@ -3910,7 +3910,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_521,
         Category::Error,
         "q_must_be_followed_by_string_alternatives_enclosed_in_braces_1521",
@@ -3919,7 +3919,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_522,
         Category::Error,
         "A_character_class_must_not_contain_a_reserved_double_punctuator_Did_you_mean_to_escape_it_with_backs_1522",
@@ -3928,7 +3928,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_523,
         Category::Error,
         "Expected_a_Unicode_property_name_1523",
@@ -3937,7 +3937,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_524,
         Category::Error,
         "Unknown_Unicode_property_name_1524",
@@ -3946,7 +3946,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_525,
         Category::Error,
         "Expected_a_Unicode_property_value_1525",
@@ -3955,7 +3955,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_526,
         Category::Error,
         "Unknown_Unicode_property_value_1526",
@@ -3964,7 +3964,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_527,
         Category::Error,
         "Expected_a_Unicode_property_name_or_value_1527",
@@ -3973,7 +3973,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_528,
         Category::Error,
         "Any_Unicode_property_that_would_possibly_match_more_than_a_single_character_is_only_available_when_t_1528",
@@ -3982,7 +3982,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_529,
         Category::Error,
         "Unknown_Unicode_property_name_or_value_1529",
@@ -3991,7 +3991,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_530,
         Category::Error,
         "Unicode_property_value_expressions_are_only_available_when_the_Unicode_u_flag_or_the_Unicode_Sets_v__1530",
@@ -4000,7 +4000,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_531,
         Category::Error,
         "_0_must_be_followed_by_a_Unicode_property_value_expression_enclosed_in_braces_1531",
@@ -4009,7 +4009,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_532,
         Category::Error,
         "There_is_no_capturing_group_named_0_in_this_regular_expression_1532",
@@ -4018,7 +4018,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_533,
         Category::Error,
         "This_backreference_refers_to_a_group_that_does_not_exist_There_are_only_0_capturing_groups_in_this_r_1533",
@@ -4027,7 +4027,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_534,
         Category::Error,
         "This_backreference_refers_to_a_group_that_does_not_exist_There_are_no_capturing_groups_in_this_regul_1534",
@@ -4036,7 +4036,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_535,
         Category::Error,
         "This_character_cannot_be_escaped_in_a_regular_expression_1535",
@@ -4045,7 +4045,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_536,
         Category::Error,
         "Octal_escape_sequences_and_backreferences_are_not_allowed_in_a_character_class_If_this_was_intended__1536",
@@ -4054,7 +4054,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_537,
         Category::Error,
         "Decimal_escape_sequences_and_backreferences_are_not_allowed_in_a_character_class_1537",
@@ -4063,7 +4063,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_538,
         Category::Error,
         "Unicode_escape_sequences_are_only_available_when_the_Unicode_u_flag_or_the_Unicode_Sets_v_flag_is_se_1538",
@@ -4072,7 +4072,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_539,
         Category::Error,
         "A_bigint_literal_cannot_be_used_as_a_property_name_1539",
@@ -4081,7 +4081,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_540,
         Category::Error,
         "A_namespace_declaration_should_not_be_declared_using_the_module_keyword_Please_use_the_namespace_key_1540",
@@ -4090,7 +4090,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_541,
         Category::Error,
         "Type_only_import_of_an_ECMAScript_module_from_a_CommonJS_module_must_have_a_resolution_mode_attribut_1541",
@@ -4099,7 +4099,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_542,
         Category::Error,
         "Type_import_of_an_ECMAScript_module_from_a_CommonJS_module_must_have_a_resolution_mode_attribute_1542",
@@ -4108,7 +4108,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_543,
         Category::Error,
         "Importing_a_JSON_file_into_an_ECMAScript_module_requires_a_type_Colon_json_import_attribute_when_mod_1543",
@@ -4117,7 +4117,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_544,
         Category::Error,
         "Named_imports_from_a_JSON_file_into_an_ECMAScript_module_are_not_allowed_when_module_is_set_to_0_1544",
@@ -4126,7 +4126,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_545,
         Category::Error,
         "using_declarations_are_not_allowed_in_ambient_contexts_1545",
@@ -4135,7 +4135,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_546,
         Category::Error,
         "await_using_declarations_are_not_allowed_in_ambient_contexts_1546",
@@ -4144,7 +4144,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_547,
         Category::Error,
         "using_declarations_are_not_allowed_in_case_or_default_clauses_unless_contained_within_a_block_1547",
@@ -4153,7 +4153,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_548,
         Category::Error,
         "await_using_declarations_are_not_allowed_in_case_or_default_clauses_unless_contained_within_a_block_1548",
@@ -4162,7 +4162,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_549,
         Category::Message,
         "Ignore_the_tsconfig_found_and_build_with_commandline_options_and_files_1549",
@@ -4171,7 +4171,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_550,
         Category::Error,
         "An_ambient_module_declaration_with_import_attributes_must_use_a_pattern_name_with_an_Asterisk_charac_1550",
@@ -4180,7 +4180,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_551,
         Category::Error,
         "Import_attributes_are_not_allowed_on_a_module_augmentation_1551",
@@ -4189,7 +4189,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_552,
         Category::Error,
         "An_import_attributes_type_may_only_contain_property_signatures_1552",
@@ -4198,7 +4198,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_553,
         Category::Error,
         "An_import_attributes_property_must_have_a_type_annotation_1553",
@@ -4207,7 +4207,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_554,
         Category::Error,
         "An_import_attributes_property_must_have_a_string_literal_or_identifier_name_1554",
@@ -4216,7 +4216,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_555,
         Category::Error,
         "An_import_attributes_property_must_have_a_string_literal_type_annotation_1555",
@@ -4225,7 +4225,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_556,
         Category::Error,
         "An_import_attributes_property_cannot_be_optional_1556",
@@ -4234,7 +4234,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_557,
         Category::Error,
         "_0_is_not_a_valid_key_for_an_import_attributes_type_1557",
@@ -4243,7 +4243,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         1_558,
         Category::Error,
         "An_import_attributes_property_cannot_have_a_readonly_modifier_1558",
@@ -4252,7 +4252,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_200,
         Category::Error,
         "The_types_of_0_are_incompatible_between_these_types_2200",
@@ -4261,7 +4261,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_201,
         Category::Error,
         "The_types_returned_by_0_are_incompatible_between_these_types_2201",
@@ -4270,7 +4270,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_202,
         Category::Error,
         "Call_signature_return_types_0_and_1_are_incompatible_2202",
@@ -4279,7 +4279,7 @@ pub static CATALOG: &[Message] = &[
         true,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_203,
         Category::Error,
         "Construct_signature_return_types_0_and_1_are_incompatible_2203",
@@ -4288,7 +4288,7 @@ pub static CATALOG: &[Message] = &[
         true,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_204,
         Category::Error,
         "Call_signatures_with_no_arguments_have_incompatible_return_types_0_and_1_2204",
@@ -4297,7 +4297,7 @@ pub static CATALOG: &[Message] = &[
         true,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_205,
         Category::Error,
         "Construct_signatures_with_no_arguments_have_incompatible_return_types_0_and_1_2205",
@@ -4306,7 +4306,7 @@ pub static CATALOG: &[Message] = &[
         true,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_206,
         Category::Error,
         "The_type_modifier_cannot_be_used_on_a_named_import_when_import_type_is_used_on_its_import_statement_2206",
@@ -4315,7 +4315,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_207,
         Category::Error,
         "The_type_modifier_cannot_be_used_on_a_named_export_when_export_type_is_used_on_its_export_statement_2207",
@@ -4324,7 +4324,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_208,
         Category::Error,
         "This_type_parameter_might_need_an_extends_0_constraint_2208",
@@ -4333,7 +4333,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_209,
         Category::Error,
         "The_project_root_is_ambiguous_but_is_required_to_resolve_export_map_entry_0_in_file_1_Supply_the_roo_2209",
@@ -4342,7 +4342,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_210,
         Category::Error,
         "The_project_root_is_ambiguous_but_is_required_to_resolve_import_map_entry_0_in_file_1_Supply_the_roo_2210",
@@ -4351,7 +4351,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_211,
         Category::Message,
         "Add_extends_constraint_2211",
@@ -4360,7 +4360,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_212,
         Category::Message,
         "Add_extends_constraint_to_all_type_parameters_2212",
@@ -4369,7 +4369,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_300,
         Category::Error,
         "Duplicate_identifier_0_2300",
@@ -4378,7 +4378,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_301,
         Category::Error,
         "Initializer_of_instance_member_variable_0_cannot_reference_identifier_1_declared_in_the_constructor_2301",
@@ -4387,7 +4387,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_302,
         Category::Error,
         "Static_members_cannot_reference_class_type_parameters_2302",
@@ -4396,7 +4396,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_303,
         Category::Error,
         "Circular_definition_of_import_alias_0_2303",
@@ -4405,7 +4405,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_304,
         Category::Error,
         "Cannot_find_name_0_2304",
@@ -4414,7 +4414,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_305,
         Category::Error,
         "Module_0_has_no_exported_member_1_2305",
@@ -4423,7 +4423,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_306,
         Category::Error,
         "File_0_is_not_a_module_2306",
@@ -4432,7 +4432,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_307,
         Category::Error,
         "Cannot_find_module_0_or_its_corresponding_type_declarations_2307",
@@ -4441,7 +4441,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_308,
         Category::Error,
         "Module_0_has_already_exported_a_member_named_1_Consider_explicitly_re_exporting_to_resolve_the_ambig_2308",
@@ -4450,7 +4450,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_309,
         Category::Error,
         "An_export_assignment_cannot_be_used_in_a_module_with_other_exported_elements_2309",
@@ -4459,7 +4459,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_310,
         Category::Error,
         "Type_0_recursively_references_itself_as_a_base_type_2310",
@@ -4468,7 +4468,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_311,
         Category::Error,
         "Cannot_find_name_0_Did_you_mean_to_write_this_in_an_async_function_2311",
@@ -4477,7 +4477,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_312,
         Category::Error,
         "An_interface_can_only_extend_an_object_type_or_intersection_of_object_types_with_statically_known_me_2312",
@@ -4486,7 +4486,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_313,
         Category::Error,
         "Type_parameter_0_has_a_circular_constraint_2313",
@@ -4495,7 +4495,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_314,
         Category::Error,
         "Generic_type_0_requires_1_type_argument_s_2314",
@@ -4504,7 +4504,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_315,
         Category::Error,
         "Type_0_is_not_generic_2315",
@@ -4513,7 +4513,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_316,
         Category::Error,
         "Global_type_0_must_be_a_class_or_interface_type_2316",
@@ -4522,7 +4522,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_317,
         Category::Error,
         "Global_type_0_must_have_1_type_parameter_s_2317",
@@ -4531,7 +4531,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_318,
         Category::Error,
         "Cannot_find_global_type_0_2318",
@@ -4540,7 +4540,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_319,
         Category::Error,
         "Named_property_0_of_types_1_and_2_are_not_identical_2319",
@@ -4549,7 +4549,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_320,
         Category::Error,
         "Interface_0_cannot_simultaneously_extend_types_1_and_2_2320",
@@ -4558,7 +4558,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_321,
         Category::Error,
         "Excessive_stack_depth_comparing_types_0_and_1_2321",
@@ -4567,7 +4567,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_322,
         Category::Error,
         "Type_0_is_not_assignable_to_type_1_2322",
@@ -4576,7 +4576,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_323,
         Category::Error,
         "Cannot_redeclare_exported_variable_0_2323",
@@ -4585,7 +4585,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_324,
         Category::Error,
         "Property_0_is_missing_in_type_1_2324",
@@ -4594,7 +4594,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_325,
         Category::Error,
         "Property_0_is_private_in_type_1_but_not_in_type_2_2325",
@@ -4603,7 +4603,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_326,
         Category::Error,
         "Types_of_property_0_are_incompatible_2326",
@@ -4612,7 +4612,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_327,
         Category::Error,
         "Property_0_is_optional_in_type_1_but_required_in_type_2_2327",
@@ -4621,7 +4621,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_328,
         Category::Error,
         "Types_of_parameters_0_and_1_are_incompatible_2328",
@@ -4630,7 +4630,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_329,
         Category::Error,
         "Index_signature_for_type_0_is_missing_in_type_1_2329",
@@ -4639,7 +4639,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_330,
         Category::Error,
         "_0_and_1_index_signatures_are_incompatible_2330",
@@ -4648,7 +4648,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_331,
         Category::Error,
         "this_cannot_be_referenced_in_a_module_or_namespace_body_2331",
@@ -4657,7 +4657,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_332,
         Category::Error,
         "this_cannot_be_referenced_in_current_location_2332",
@@ -4666,7 +4666,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_334,
         Category::Error,
         "this_cannot_be_referenced_in_a_static_property_initializer_2334",
@@ -4675,7 +4675,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_335,
         Category::Error,
         "super_can_only_be_referenced_in_a_derived_class_2335",
@@ -4684,7 +4684,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_336,
         Category::Error,
         "super_cannot_be_referenced_in_constructor_arguments_2336",
@@ -4693,7 +4693,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_337,
         Category::Error,
         "Super_calls_are_not_permitted_outside_constructors_or_in_nested_functions_inside_constructors_2337",
@@ -4702,7 +4702,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_338,
         Category::Error,
         "super_property_access_is_permitted_only_in_a_constructor_member_function_or_member_accessor_of_a_der_2338",
@@ -4711,7 +4711,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_339,
         Category::Error,
         "Property_0_does_not_exist_on_type_1_2339",
@@ -4720,7 +4720,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_340,
         Category::Error,
         "Only_public_and_protected_methods_of_the_base_class_are_accessible_via_the_super_keyword_2340",
@@ -4729,7 +4729,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_341,
         Category::Error,
         "Property_0_is_private_and_only_accessible_within_class_1_2341",
@@ -4738,7 +4738,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_343,
         Category::Error,
         "This_syntax_requires_an_imported_helper_named_1_which_does_not_exist_in_0_Consider_upgrading_your_ve_2343",
@@ -4747,7 +4747,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_344,
         Category::Error,
         "Type_0_does_not_satisfy_the_constraint_1_2344",
@@ -4756,7 +4756,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_345,
         Category::Error,
         "Argument_of_type_0_is_not_assignable_to_parameter_of_type_1_2345",
@@ -4765,7 +4765,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_346,
         Category::Error,
         "Call_target_does_not_contain_any_signatures_2346",
@@ -4774,7 +4774,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_347,
         Category::Error,
         "Untyped_function_calls_may_not_accept_type_arguments_2347",
@@ -4783,7 +4783,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_348,
         Category::Error,
         "Value_of_type_0_is_not_callable_Did_you_mean_to_include_new_2348",
@@ -4792,7 +4792,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_349,
         Category::Error,
         "This_expression_is_not_callable_2349",
@@ -4801,7 +4801,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_350,
         Category::Error,
         "Only_a_void_function_can_be_called_with_the_new_keyword_2350",
@@ -4810,7 +4810,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_351,
         Category::Error,
         "This_expression_is_not_constructable_2351",
@@ -4819,7 +4819,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_352,
         Category::Error,
         "Conversion_of_type_0_to_type_1_may_be_a_mistake_because_neither_type_sufficiently_overlaps_with_the__2352",
@@ -4828,7 +4828,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_353,
         Category::Error,
         "Object_literal_may_only_specify_known_properties_and_0_does_not_exist_in_type_1_2353",
@@ -4837,7 +4837,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_354,
         Category::Error,
         "This_syntax_requires_an_imported_helper_but_module_0_cannot_be_found_2354",
@@ -4846,7 +4846,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_355,
         Category::Error,
         "A_function_whose_declared_type_is_neither_undefined_void_nor_any_must_return_a_value_2355",
@@ -4855,7 +4855,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_356,
         Category::Error,
         "An_arithmetic_operand_must_be_of_type_any_number_bigint_or_an_enum_type_2356",
@@ -4864,7 +4864,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_357,
         Category::Error,
         "The_operand_of_an_increment_or_decrement_operator_must_be_a_variable_or_a_property_access_2357",
@@ -4873,7 +4873,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_358,
         Category::Error,
         "The_left_hand_side_of_an_instanceof_expression_must_be_of_type_any_an_object_type_or_a_type_paramete_2358",
@@ -4882,7 +4882,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_359,
         Category::Error,
         "The_right_hand_side_of_an_instanceof_expression_must_be_either_of_type_any_a_class_function_or_other_2359",
@@ -4891,7 +4891,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_362,
         Category::Error,
         "The_left_hand_side_of_an_arithmetic_operation_must_be_of_type_any_number_bigint_or_an_enum_type_2362",
@@ -4900,7 +4900,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_363,
         Category::Error,
         "The_right_hand_side_of_an_arithmetic_operation_must_be_of_type_any_number_bigint_or_an_enum_type_2363",
@@ -4909,7 +4909,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_364,
         Category::Error,
         "The_left_hand_side_of_an_assignment_expression_must_be_a_variable_or_a_property_access_2364",
@@ -4918,7 +4918,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_365,
         Category::Error,
         "Operator_0_cannot_be_applied_to_types_1_and_2_2365",
@@ -4927,7 +4927,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_366,
         Category::Error,
         "Function_lacks_ending_return_statement_and_return_type_does_not_include_undefined_2366",
@@ -4936,7 +4936,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_367,
         Category::Error,
         "This_comparison_appears_to_be_unintentional_because_the_types_0_and_1_have_no_overlap_2367",
@@ -4945,7 +4945,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_368,
         Category::Error,
         "Type_parameter_name_cannot_be_0_2368",
@@ -4954,7 +4954,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_369,
         Category::Error,
         "A_parameter_property_is_only_allowed_in_a_constructor_implementation_2369",
@@ -4963,7 +4963,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_370,
         Category::Error,
         "A_rest_parameter_must_be_of_an_array_type_2370",
@@ -4972,7 +4972,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_371,
         Category::Error,
         "A_parameter_initializer_is_only_allowed_in_a_function_or_constructor_implementation_2371",
@@ -4981,7 +4981,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_372,
         Category::Error,
         "Parameter_0_cannot_reference_itself_2372",
@@ -4990,7 +4990,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_373,
         Category::Error,
         "Parameter_0_cannot_reference_identifier_1_declared_after_it_2373",
@@ -4999,7 +4999,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_374,
         Category::Error,
         "Duplicate_index_signature_for_type_0_2374",
@@ -5008,7 +5008,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_375,
         Category::Error,
         "Type_0_is_not_assignable_to_type_1_with_exactOptionalPropertyTypes_Colon_true_Consider_adding_undefi_2375",
@@ -5017,7 +5017,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_376,
         Category::Error,
         "A_super_call_must_be_the_first_statement_in_the_constructor_to_refer_to_super_or_this_when_a_derived_2376",
@@ -5026,7 +5026,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_377,
         Category::Error,
         "Constructors_for_derived_classes_must_contain_a_super_call_2377",
@@ -5035,7 +5035,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_378,
         Category::Error,
         "A_get_accessor_must_return_a_value_2378",
@@ -5044,7 +5044,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_379,
         Category::Error,
         "Argument_of_type_0_is_not_assignable_to_parameter_of_type_1_with_exactOptionalPropertyTypes_Colon_tr_2379",
@@ -5053,7 +5053,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_383,
         Category::Error,
         "Overload_signatures_must_all_be_exported_or_non_exported_2383",
@@ -5062,7 +5062,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_384,
         Category::Error,
         "Overload_signatures_must_all_be_ambient_or_non_ambient_2384",
@@ -5071,7 +5071,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_385,
         Category::Error,
         "Overload_signatures_must_all_be_public_private_or_protected_2385",
@@ -5080,7 +5080,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_386,
         Category::Error,
         "Overload_signatures_must_all_be_optional_or_required_2386",
@@ -5089,7 +5089,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_387,
         Category::Error,
         "Function_overload_must_be_static_2387",
@@ -5098,7 +5098,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_388,
         Category::Error,
         "Function_overload_must_not_be_static_2388",
@@ -5107,7 +5107,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_389,
         Category::Error,
         "Function_implementation_name_must_be_0_2389",
@@ -5116,7 +5116,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_390,
         Category::Error,
         "Constructor_implementation_is_missing_2390",
@@ -5125,7 +5125,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_391,
         Category::Error,
         "Function_implementation_is_missing_or_not_immediately_following_the_declaration_2391",
@@ -5134,7 +5134,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_392,
         Category::Error,
         "Multiple_constructor_implementations_are_not_allowed_2392",
@@ -5143,7 +5143,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_393,
         Category::Error,
         "Duplicate_function_implementation_2393",
@@ -5152,7 +5152,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_394,
         Category::Error,
         "This_overload_signature_is_not_compatible_with_its_implementation_signature_2394",
@@ -5161,7 +5161,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_395,
         Category::Error,
         "Individual_declarations_in_merged_declaration_0_must_be_all_exported_or_all_local_2395",
@@ -5170,7 +5170,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_396,
         Category::Error,
         "Duplicate_identifier_arguments_Compiler_uses_arguments_to_initialize_rest_parameters_2396",
@@ -5179,7 +5179,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_397,
         Category::Error,
         "Declaration_name_conflicts_with_built_in_global_identifier_0_2397",
@@ -5188,7 +5188,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_398,
         Category::Error,
         "constructor_cannot_be_used_as_a_parameter_property_name_2398",
@@ -5197,7 +5197,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_399,
         Category::Error,
         "Duplicate_identifier_this_Compiler_uses_variable_declaration_this_to_capture_this_reference_2399",
@@ -5206,7 +5206,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_400,
         Category::Error,
         "Expression_resolves_to_variable_declaration_this_that_compiler_uses_to_capture_this_reference_2400",
@@ -5215,7 +5215,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_401,
         Category::Error,
         "A_super_call_must_be_a_root_level_statement_within_a_constructor_of_a_derived_class_that_contains_in_2401",
@@ -5224,7 +5224,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_402,
         Category::Error,
         "Expression_resolves_to_super_that_compiler_uses_to_capture_base_class_reference_2402",
@@ -5233,7 +5233,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_403,
         Category::Error,
         "Subsequent_variable_declarations_must_have_the_same_type_Variable_0_must_be_of_type_1_but_here_has_t_2403",
@@ -5242,7 +5242,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_404,
         Category::Error,
         "The_left_hand_side_of_a_for_in_statement_cannot_use_a_type_annotation_2404",
@@ -5251,7 +5251,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_405,
         Category::Error,
         "The_left_hand_side_of_a_for_in_statement_must_be_of_type_string_or_any_2405",
@@ -5260,7 +5260,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_406,
         Category::Error,
         "The_left_hand_side_of_a_for_in_statement_must_be_a_variable_or_a_property_access_2406",
@@ -5269,7 +5269,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_407,
         Category::Error,
         "The_right_hand_side_of_a_for_in_statement_must_be_of_type_any_an_object_type_or_a_type_parameter_but_2407",
@@ -5278,7 +5278,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_408,
         Category::Error,
         "Setters_cannot_return_a_value_2408",
@@ -5287,7 +5287,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_409,
         Category::Error,
         "Return_type_of_constructor_signature_must_be_assignable_to_the_instance_type_of_the_class_2409",
@@ -5296,7 +5296,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_410,
         Category::Error,
         "The_with_statement_is_not_supported_All_symbols_in_a_with_block_will_have_type_any_2410",
@@ -5305,7 +5305,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_411,
         Category::Error,
         "Property_0_of_type_1_is_not_assignable_to_2_index_type_3_2411",
@@ -5314,7 +5314,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_412,
         Category::Error,
         "Type_0_is_not_assignable_to_type_1_with_exactOptionalPropertyTypes_Colon_true_Consider_adding_undefi_2412",
@@ -5323,7 +5323,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_413,
         Category::Error,
         "_0_index_type_1_is_not_assignable_to_2_index_type_3_2413",
@@ -5332,7 +5332,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_414,
         Category::Error,
         "Class_name_cannot_be_0_2414",
@@ -5341,7 +5341,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_415,
         Category::Error,
         "Class_0_incorrectly_extends_base_class_1_2415",
@@ -5350,7 +5350,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_416,
         Category::Error,
         "Property_0_in_type_1_is_not_assignable_to_the_same_property_in_base_type_2_2416",
@@ -5359,7 +5359,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_417,
         Category::Error,
         "Class_static_side_0_incorrectly_extends_base_class_static_side_1_2417",
@@ -5368,7 +5368,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_418,
         Category::Error,
         "Type_of_computed_property_s_value_is_0_which_is_not_assignable_to_type_1_2418",
@@ -5377,7 +5377,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_419,
         Category::Error,
         "Types_of_construct_signatures_are_incompatible_2419",
@@ -5386,7 +5386,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_420,
         Category::Error,
         "Class_0_incorrectly_implements_interface_1_2420",
@@ -5395,7 +5395,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_422,
         Category::Error,
         "A_class_can_only_implement_an_object_type_or_intersection_of_object_types_with_statically_known_memb_2422",
@@ -5404,7 +5404,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_423,
         Category::Error,
         "Class_0_defines_instance_member_function_1_but_extended_class_2_defines_it_as_instance_member_access_2423",
@@ -5413,7 +5413,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_425,
         Category::Error,
         "Class_0_defines_instance_member_property_1_but_extended_class_2_defines_it_as_instance_member_functi_2425",
@@ -5422,7 +5422,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_426,
         Category::Error,
         "Class_0_defines_instance_member_accessor_1_but_extended_class_2_defines_it_as_instance_member_functi_2426",
@@ -5431,7 +5431,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_427,
         Category::Error,
         "Interface_name_cannot_be_0_2427",
@@ -5440,7 +5440,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_428,
         Category::Error,
         "All_declarations_of_0_must_have_identical_type_parameters_2428",
@@ -5449,7 +5449,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_430,
         Category::Error,
         "Interface_0_incorrectly_extends_interface_1_2430",
@@ -5458,7 +5458,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_431,
         Category::Error,
         "Enum_name_cannot_be_0_2431",
@@ -5467,7 +5467,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_432,
         Category::Error,
         "In_an_enum_with_multiple_declarations_only_one_declaration_can_omit_an_initializer_for_its_first_enu_2432",
@@ -5476,7 +5476,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_433,
         Category::Error,
         "A_namespace_declaration_cannot_be_in_a_different_file_from_a_class_or_function_with_which_it_is_merg_2433",
@@ -5485,7 +5485,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_434,
         Category::Error,
         "A_namespace_declaration_cannot_be_located_prior_to_a_class_or_function_with_which_it_is_merged_2434",
@@ -5494,7 +5494,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_435,
         Category::Error,
         "Ambient_modules_cannot_be_nested_in_other_modules_or_namespaces_2435",
@@ -5503,7 +5503,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_436,
         Category::Error,
         "Ambient_module_declaration_cannot_specify_relative_module_name_2436",
@@ -5512,7 +5512,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_437,
         Category::Error,
         "Module_0_is_hidden_by_a_local_declaration_with_the_same_name_2437",
@@ -5521,7 +5521,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_438,
         Category::Error,
         "Import_name_cannot_be_0_2438",
@@ -5530,7 +5530,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_439,
         Category::Error,
         "Import_or_export_declaration_in_an_ambient_module_declaration_cannot_reference_module_through_relati_2439",
@@ -5539,7 +5539,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_440,
         Category::Error,
         "Import_declaration_conflicts_with_local_declaration_of_0_2440",
@@ -5548,7 +5548,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_441,
         Category::Error,
         "Duplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module_2441",
@@ -5557,7 +5557,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_442,
         Category::Error,
         "Types_have_separate_declarations_of_a_private_property_0_2442",
@@ -5566,7 +5566,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_443,
         Category::Error,
         "Property_0_is_protected_but_type_1_is_not_a_class_derived_from_2_2443",
@@ -5575,7 +5575,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_444,
         Category::Error,
         "Property_0_is_protected_in_type_1_but_public_in_type_2_2444",
@@ -5584,7 +5584,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_445,
         Category::Error,
         "Property_0_is_protected_and_only_accessible_within_class_1_and_its_subclasses_2445",
@@ -5593,7 +5593,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_446,
         Category::Error,
         "Property_0_is_protected_and_only_accessible_through_an_instance_of_class_1_This_is_an_instance_of_cl_2446",
@@ -5602,7 +5602,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_447,
         Category::Error,
         "The_0_operator_is_not_allowed_for_boolean_types_Consider_using_1_instead_2447",
@@ -5611,7 +5611,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_448,
         Category::Error,
         "Block_scoped_variable_0_used_before_its_declaration_2448",
@@ -5620,7 +5620,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_449,
         Category::Error,
         "Class_0_used_before_its_declaration_2449",
@@ -5629,7 +5629,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_450,
         Category::Error,
         "Enum_0_used_before_its_declaration_2450",
@@ -5638,7 +5638,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_451,
         Category::Error,
         "Cannot_redeclare_block_scoped_variable_0_2451",
@@ -5647,7 +5647,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_452,
         Category::Error,
         "An_enum_member_cannot_have_a_numeric_name_2452",
@@ -5656,7 +5656,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_454,
         Category::Error,
         "Variable_0_is_used_before_being_assigned_2454",
@@ -5665,7 +5665,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_456,
         Category::Error,
         "Type_alias_0_circularly_references_itself_2456",
@@ -5674,7 +5674,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_457,
         Category::Error,
         "Type_alias_name_cannot_be_0_2457",
@@ -5683,7 +5683,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_458,
         Category::Error,
         "An_AMD_module_cannot_have_multiple_name_assignments_2458",
@@ -5692,7 +5692,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_459,
         Category::Error,
         "Module_0_declares_1_locally_but_it_is_not_exported_2459",
@@ -5701,7 +5701,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_460,
         Category::Error,
         "Module_0_declares_1_locally_but_it_is_exported_as_2_2460",
@@ -5710,7 +5710,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_461,
         Category::Error,
         "Type_0_is_not_an_array_type_2461",
@@ -5719,7 +5719,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_462,
         Category::Error,
         "A_rest_element_must_be_last_in_a_destructuring_pattern_2462",
@@ -5728,7 +5728,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_463,
         Category::Error,
         "A_binding_pattern_parameter_cannot_be_optional_in_an_implementation_signature_2463",
@@ -5737,7 +5737,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_464,
         Category::Error,
         "A_computed_property_name_must_be_of_type_string_number_symbol_or_any_2464",
@@ -5746,7 +5746,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_465,
         Category::Error,
         "this_cannot_be_referenced_in_a_computed_property_name_2465",
@@ -5755,7 +5755,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_466,
         Category::Error,
         "super_cannot_be_referenced_in_a_computed_property_name_2466",
@@ -5764,7 +5764,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_467,
         Category::Error,
         "A_computed_property_name_cannot_reference_a_type_parameter_from_its_containing_type_2467",
@@ -5773,7 +5773,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_468,
         Category::Error,
         "Cannot_find_global_value_0_2468",
@@ -5782,7 +5782,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_469,
         Category::Error,
         "The_0_operator_cannot_be_applied_to_type_symbol_2469",
@@ -5791,7 +5791,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_472,
         Category::Error,
         "Spread_operator_in_new_expressions_is_only_available_when_targeting_ECMAScript_5_and_higher_2472",
@@ -5800,7 +5800,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_473,
         Category::Error,
         "Enum_declarations_must_all_be_const_or_non_const_2473",
@@ -5809,7 +5809,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_474,
         Category::Error,
         "const_enum_member_initializers_must_be_constant_expressions_2474",
@@ -5818,7 +5818,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_475,
         Category::Error,
         "const_enums_can_only_be_used_in_property_or_index_access_expressions_or_the_right_hand_side_of_an_im_2475",
@@ -5827,7 +5827,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_476,
         Category::Error,
         "A_const_enum_member_can_only_be_accessed_using_a_string_literal_2476",
@@ -5836,7 +5836,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_477,
         Category::Error,
         "const_enum_member_initializer_was_evaluated_to_a_non_finite_value_2477",
@@ -5845,7 +5845,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_478,
         Category::Error,
         "const_enum_member_initializer_was_evaluated_to_disallowed_value_NaN_2478",
@@ -5854,7 +5854,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_480,
         Category::Error,
         "let_is_not_allowed_to_be_used_as_a_name_in_let_or_const_declarations_2480",
@@ -5863,7 +5863,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_481,
         Category::Error,
         "Cannot_initialize_outer_scoped_variable_0_in_the_same_scope_as_block_scoped_declaration_1_2481",
@@ -5872,7 +5872,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_483,
         Category::Error,
         "The_left_hand_side_of_a_for_of_statement_cannot_use_a_type_annotation_2483",
@@ -5881,7 +5881,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_484,
         Category::Error,
         "Export_declaration_conflicts_with_exported_declaration_of_0_2484",
@@ -5890,7 +5890,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_487,
         Category::Error,
         "The_left_hand_side_of_a_for_of_statement_must_be_a_variable_or_a_property_access_2487",
@@ -5899,7 +5899,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_488,
         Category::Error,
         "Type_0_must_have_a_Symbol_iterator_method_that_returns_an_iterator_2488",
@@ -5908,7 +5908,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_489,
         Category::Error,
         "An_iterator_must_have_a_next_method_2489",
@@ -5917,7 +5917,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_490,
         Category::Error,
         "The_type_returned_by_the_0_method_of_an_iterator_must_have_a_value_property_2490",
@@ -5926,7 +5926,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_491,
         Category::Error,
         "The_left_hand_side_of_a_for_in_statement_cannot_be_a_destructuring_pattern_2491",
@@ -5935,7 +5935,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_492,
         Category::Error,
         "Cannot_redeclare_identifier_0_in_catch_clause_2492",
@@ -5944,7 +5944,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_493,
         Category::Error,
         "Tuple_type_0_of_length_1_has_no_element_at_index_2_2493",
@@ -5953,7 +5953,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_494,
         Category::Error,
         "Using_a_string_in_a_for_of_statement_is_only_supported_in_ECMAScript_5_and_higher_2494",
@@ -5962,7 +5962,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_495,
         Category::Error,
         "Type_0_is_not_an_array_type_or_a_string_type_2495",
@@ -5971,7 +5971,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_496,
         Category::Error,
         "The_arguments_object_cannot_be_referenced_in_an_arrow_function_in_ES5_Consider_using_a_standard_func_2496",
@@ -5980,7 +5980,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_497,
         Category::Error,
         "This_module_can_only_be_referenced_with_ECMAScript_imports_Slashexports_by_turning_on_the_0_flag_and_2497",
@@ -5989,7 +5989,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_498,
         Category::Error,
         "Module_0_uses_export_and_cannot_be_used_with_export_Asterisk_2498",
@@ -5998,7 +5998,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_499,
         Category::Error,
         "An_interface_can_only_extend_an_identifier_Slashqualified_name_with_optional_type_arguments_2499",
@@ -6007,7 +6007,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_500,
         Category::Error,
         "A_class_can_only_implement_an_identifier_Slashqualified_name_with_optional_type_arguments_2500",
@@ -6016,7 +6016,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_501,
         Category::Error,
         "A_rest_element_cannot_contain_a_binding_pattern_2501",
@@ -6025,7 +6025,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_502,
         Category::Error,
         "_0_is_referenced_directly_or_indirectly_in_its_own_type_annotation_2502",
@@ -6034,7 +6034,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_503,
         Category::Error,
         "Cannot_find_namespace_0_2503",
@@ -6043,7 +6043,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_504,
         Category::Error,
         "Type_0_must_have_a_Symbol_asyncIterator_method_that_returns_an_async_iterator_2504",
@@ -6052,7 +6052,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_505,
         Category::Error,
         "A_generator_cannot_have_a_void_type_annotation_2505",
@@ -6061,7 +6061,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_506,
         Category::Error,
         "_0_is_referenced_directly_or_indirectly_in_its_own_base_expression_2506",
@@ -6070,7 +6070,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_507,
         Category::Error,
         "Type_0_is_not_a_constructor_function_type_2507",
@@ -6079,7 +6079,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_508,
         Category::Error,
         "No_base_constructor_has_the_specified_number_of_type_arguments_2508",
@@ -6088,7 +6088,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_509,
         Category::Error,
         "Base_constructor_return_type_0_is_not_an_object_type_or_intersection_of_object_types_with_statically_2509",
@@ -6097,7 +6097,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_510,
         Category::Error,
         "Base_constructors_must_all_have_the_same_return_type_2510",
@@ -6106,7 +6106,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_511,
         Category::Error,
         "Cannot_create_an_instance_of_an_abstract_class_2511",
@@ -6115,7 +6115,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_512,
         Category::Error,
         "Overload_signatures_must_all_be_abstract_or_non_abstract_2512",
@@ -6124,7 +6124,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_513,
         Category::Error,
         "Abstract_method_0_in_class_1_cannot_be_accessed_via_super_expression_2513",
@@ -6133,7 +6133,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_514,
         Category::Error,
         "A_tuple_type_cannot_be_indexed_with_a_negative_value_2514",
@@ -6142,7 +6142,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_515,
         Category::Error,
         "Non_abstract_class_0_does_not_implement_inherited_abstract_member_1_from_class_2_2515",
@@ -6151,7 +6151,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_516,
         Category::Error,
         "All_declarations_of_an_abstract_method_must_be_consecutive_2516",
@@ -6160,7 +6160,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_517,
         Category::Error,
         "Cannot_assign_an_abstract_constructor_type_to_a_non_abstract_constructor_type_2517",
@@ -6169,7 +6169,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_518,
         Category::Error,
         "A_this_based_type_guard_is_not_compatible_with_a_parameter_based_type_guard_2518",
@@ -6178,7 +6178,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_519,
         Category::Error,
         "An_async_iterator_must_have_a_next_method_2519",
@@ -6187,7 +6187,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_520,
         Category::Error,
         "Duplicate_identifier_0_Compiler_uses_declaration_1_to_support_async_functions_2520",
@@ -6196,7 +6196,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_522,
         Category::Error,
         "The_arguments_object_cannot_be_referenced_in_an_async_function_or_method_in_ES5_Consider_using_a_sta_2522",
@@ -6205,7 +6205,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_523,
         Category::Error,
         "yield_expressions_cannot_be_used_in_a_parameter_initializer_2523",
@@ -6214,7 +6214,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_524,
         Category::Error,
         "await_expressions_cannot_be_used_in_a_parameter_initializer_2524",
@@ -6223,7 +6223,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_526,
         Category::Error,
         "A_this_type_is_available_only_in_a_non_static_member_of_a_class_or_interface_2526",
@@ -6232,7 +6232,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_527,
         Category::Error,
         "The_inferred_type_of_0_references_an_inaccessible_1_type_A_type_annotation_is_necessary_2527",
@@ -6241,7 +6241,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_528,
         Category::Error,
         "A_module_cannot_have_multiple_default_exports_2528",
@@ -6250,7 +6250,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_529,
         Category::Error,
         "Duplicate_identifier_0_Compiler_reserves_name_1_in_top_level_scope_of_a_module_containing_async_func_2529",
@@ -6259,7 +6259,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_530,
         Category::Error,
         "Property_0_is_incompatible_with_index_signature_2530",
@@ -6268,7 +6268,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_531,
         Category::Error,
         "Object_is_possibly_null_2531",
@@ -6277,7 +6277,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_532,
         Category::Error,
         "Object_is_possibly_undefined_2532",
@@ -6286,7 +6286,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_533,
         Category::Error,
         "Object_is_possibly_null_or_undefined_2533",
@@ -6295,7 +6295,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_534,
         Category::Error,
         "A_function_returning_never_cannot_have_a_reachable_end_point_2534",
@@ -6304,7 +6304,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_536,
         Category::Error,
         "Type_0_cannot_be_used_to_index_type_1_2536",
@@ -6313,7 +6313,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_537,
         Category::Error,
         "Type_0_has_no_matching_index_signature_for_type_1_2537",
@@ -6322,7 +6322,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_538,
         Category::Error,
         "Type_0_cannot_be_used_as_an_index_type_2538",
@@ -6331,7 +6331,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_539,
         Category::Error,
         "Cannot_assign_to_0_because_it_is_not_a_variable_2539",
@@ -6340,7 +6340,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_540,
         Category::Error,
         "Cannot_assign_to_0_because_it_is_a_read_only_property_2540",
@@ -6349,7 +6349,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_542,
         Category::Error,
         "Index_signature_in_type_0_only_permits_reading_2542",
@@ -6358,7 +6358,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_543,
         Category::Error,
         "Duplicate_identifier_newTarget_Compiler_uses_variable_declaration_newTarget_to_capture_new_target_me_2543",
@@ -6367,7 +6367,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_544,
         Category::Error,
         "Expression_resolves_to_variable_declaration_newTarget_that_compiler_uses_to_capture_new_target_meta__2544",
@@ -6376,7 +6376,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_545,
         Category::Error,
         "A_mixin_class_must_have_a_constructor_with_a_single_rest_parameter_of_type_any_2545",
@@ -6385,7 +6385,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_547,
         Category::Error,
         "The_type_returned_by_the_0_method_of_an_async_iterator_must_be_a_promise_for_a_type_with_a_value_pro_2547",
@@ -6394,7 +6394,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_548,
         Category::Error,
         "Type_0_is_not_an_array_type_or_does_not_have_a_Symbol_iterator_method_that_returns_an_iterator_2548",
@@ -6403,7 +6403,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_549,
         Category::Error,
         "Type_0_is_not_an_array_type_or_a_string_type_or_does_not_have_a_Symbol_iterator_method_that_returns__2549",
@@ -6412,7 +6412,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_550,
         Category::Error,
         "Property_0_does_not_exist_on_type_1_Do_you_need_to_change_your_target_library_Try_changing_the_lib_c_2550",
@@ -6421,7 +6421,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_551,
         Category::Error,
         "Property_0_does_not_exist_on_type_1_Did_you_mean_2_2551",
@@ -6430,7 +6430,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_552,
         Category::Error,
         "Cannot_find_name_0_Did_you_mean_1_2552",
@@ -6439,7 +6439,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_553,
         Category::Error,
         "Computed_values_are_not_permitted_in_an_enum_with_string_valued_members_2553",
@@ -6448,7 +6448,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_554,
         Category::Error,
         "Expected_0_arguments_but_got_1_2554",
@@ -6457,7 +6457,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_555,
         Category::Error,
         "Expected_at_least_0_arguments_but_got_1_2555",
@@ -6466,7 +6466,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_556,
         Category::Error,
         "A_spread_argument_must_either_have_a_tuple_type_or_be_passed_to_a_rest_parameter_2556",
@@ -6475,7 +6475,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_558,
         Category::Error,
         "Expected_0_type_arguments_but_got_1_2558",
@@ -6484,7 +6484,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_559,
         Category::Error,
         "Type_0_has_no_properties_in_common_with_type_1_2559",
@@ -6493,7 +6493,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_560,
         Category::Error,
         "Value_of_type_0_has_no_properties_in_common_with_type_1_Did_you_mean_to_call_it_2560",
@@ -6502,7 +6502,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_561,
         Category::Error,
         "Object_literal_may_only_specify_known_properties_but_0_does_not_exist_in_type_1_Did_you_mean_to_writ_2561",
@@ -6511,7 +6511,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_562,
         Category::Error,
         "Base_class_expressions_cannot_reference_class_type_parameters_2562",
@@ -6520,7 +6520,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_563,
         Category::Error,
         "The_containing_function_or_module_body_is_too_large_for_control_flow_analysis_2563",
@@ -6529,7 +6529,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_564,
         Category::Error,
         "Property_0_has_no_initializer_and_is_not_definitely_assigned_in_the_constructor_2564",
@@ -6538,7 +6538,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_565,
         Category::Error,
         "Property_0_is_used_before_being_assigned_2565",
@@ -6547,7 +6547,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_566,
         Category::Error,
         "A_rest_element_cannot_have_a_property_name_2566",
@@ -6556,7 +6556,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_567,
         Category::Error,
         "Enum_declarations_can_only_merge_with_namespace_or_other_enum_declarations_2567",
@@ -6565,7 +6565,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_568,
         Category::Error,
         "Property_0_may_not_exist_on_type_1_Did_you_mean_2_2568",
@@ -6574,7 +6574,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_570,
         Category::Error,
         "Could_not_find_name_0_Did_you_mean_1_2570",
@@ -6583,7 +6583,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_571,
         Category::Error,
         "Object_is_of_type_unknown_2571",
@@ -6592,7 +6592,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_574,
         Category::Error,
         "A_rest_element_type_must_be_an_array_type_2574",
@@ -6601,7 +6601,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_575,
         Category::Error,
         "No_overload_expects_0_arguments_but_overloads_do_exist_that_expect_either_1_or_2_arguments_2575",
@@ -6610,7 +6610,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_576,
         Category::Error,
         "Property_0_does_not_exist_on_type_1_Did_you_mean_to_access_the_static_member_2_instead_2576",
@@ -6619,7 +6619,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_577,
         Category::Error,
         "Return_type_annotation_circularly_references_itself_2577",
@@ -6628,7 +6628,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_578,
         Category::Error,
         "Unused_ts_expect_error_directive_2578",
@@ -6637,7 +6637,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_580,
         Category::Error,
         "Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_node_Try_npm_i_save_dev_types_Slashno_2580",
@@ -6646,7 +6646,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_581,
         Category::Error,
         "Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_jQuery_Try_npm_i_save_dev_types_Slash_2581",
@@ -6655,7 +6655,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_582,
         Category::Error,
         "Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_a_test_runner_Try_npm_i_save_dev_type_2582",
@@ -6664,7 +6664,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_583,
         Category::Error,
         "Cannot_find_name_0_Do_you_need_to_change_your_target_library_Try_changing_the_lib_compiler_option_to_2583",
@@ -6673,7 +6673,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_584,
         Category::Error,
         "Cannot_find_name_0_Do_you_need_to_change_your_target_library_Try_changing_the_lib_compiler_option_to_2584",
@@ -6682,7 +6682,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_585,
         Category::Error,
         "_0_only_refers_to_a_type_but_is_being_used_as_a_value_here_Do_you_need_to_change_your_target_library_2585",
@@ -6691,7 +6691,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_588,
         Category::Error,
         "Cannot_assign_to_0_because_it_is_a_constant_2588",
@@ -6700,7 +6700,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_589,
         Category::Error,
         "Type_instantiation_is_excessively_deep_and_possibly_infinite_2589",
@@ -6709,7 +6709,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_590,
         Category::Error,
         "Expression_produces_a_union_type_that_is_too_complex_to_represent_2590",
@@ -6718,7 +6718,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_591,
         Category::Error,
         "Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_node_Try_npm_i_save_dev_types_Slashno_2591",
@@ -6727,7 +6727,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_592,
         Category::Error,
         "Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_jQuery_Try_npm_i_save_dev_types_Slash_2592",
@@ -6736,7 +6736,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_593,
         Category::Error,
         "Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_a_test_runner_Try_npm_i_save_dev_type_2593",
@@ -6745,7 +6745,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_594,
         Category::Error,
         "This_module_is_declared_with_export_and_can_only_be_used_with_a_default_import_when_using_the_0_flag_2594",
@@ -6754,7 +6754,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_595,
         Category::Error,
         "_0_can_only_be_imported_by_using_a_default_import_2595",
@@ -6763,7 +6763,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_596,
         Category::Error,
         "_0_can_only_be_imported_by_turning_on_the_esModuleInterop_flag_and_using_a_default_import_2596",
@@ -6772,7 +6772,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_597,
         Category::Error,
         "_0_can_only_be_imported_by_using_a_require_call_or_by_using_a_default_import_2597",
@@ -6781,7 +6781,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_598,
         Category::Error,
         "_0_can_only_be_imported_by_using_a_require_call_or_by_turning_on_the_esModuleInterop_flag_and_using__2598",
@@ -6790,7 +6790,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_602,
         Category::Error,
         "JSX_element_implicitly_has_type_any_because_the_global_type_JSX_Element_does_not_exist_2602",
@@ -6799,7 +6799,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_603,
         Category::Error,
         "Property_0_in_type_1_is_not_assignable_to_type_2_2603",
@@ -6808,7 +6808,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_604,
         Category::Error,
         "JSX_element_type_0_does_not_have_any_construct_or_call_signatures_2604",
@@ -6817,7 +6817,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_606,
         Category::Error,
         "Property_0_of_JSX_spread_attribute_is_not_assignable_to_target_property_2606",
@@ -6826,7 +6826,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_607,
         Category::Error,
         "JSX_element_class_does_not_support_attributes_because_it_does_not_have_a_0_property_2607",
@@ -6835,7 +6835,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_608,
         Category::Error,
         "The_global_type_JSX_0_may_not_have_more_than_one_property_2608",
@@ -6844,7 +6844,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_609,
         Category::Error,
         "JSX_spread_child_must_be_an_array_type_2609",
@@ -6853,7 +6853,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_610,
         Category::Error,
         "_0_is_defined_as_an_accessor_in_class_1_but_is_overridden_here_in_2_as_an_instance_property_2610",
@@ -6862,7 +6862,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_611,
         Category::Error,
         "_0_is_defined_as_a_property_in_class_1_but_is_overridden_here_in_2_as_an_accessor_2611",
@@ -6871,7 +6871,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_612,
         Category::Error,
         "Property_0_will_overwrite_the_base_property_in_1_If_this_is_intentional_add_an_initializer_Otherwise_2612",
@@ -6880,7 +6880,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_613,
         Category::Error,
         "Module_0_has_no_default_export_Did_you_mean_to_use_import_1_from_0_instead_2613",
@@ -6889,7 +6889,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_614,
         Category::Error,
         "Module_0_has_no_exported_member_1_Did_you_mean_to_use_import_1_from_0_instead_2614",
@@ -6898,7 +6898,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_615,
         Category::Error,
         "Type_of_property_0_circularly_references_itself_in_mapped_type_1_2615",
@@ -6907,7 +6907,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_616,
         Category::Error,
         "_0_can_only_be_imported_by_using_import_1_require_2_or_a_default_import_2616",
@@ -6916,7 +6916,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_617,
         Category::Error,
         "_0_can_only_be_imported_by_using_import_1_require_2_or_by_turning_on_the_esModuleInterop_flag_and_us_2617",
@@ -6925,7 +6925,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_618,
         Category::Error,
         "Source_has_0_element_s_but_target_requires_1_2618",
@@ -6934,7 +6934,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_619,
         Category::Error,
         "Source_has_0_element_s_but_target_allows_only_1_2619",
@@ -6943,7 +6943,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_620,
         Category::Error,
         "Target_requires_0_element_s_but_source_may_have_fewer_2620",
@@ -6952,7 +6952,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_621,
         Category::Error,
         "Target_allows_only_0_element_s_but_source_may_have_more_2621",
@@ -6961,7 +6961,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_623,
         Category::Error,
         "Source_provides_no_match_for_required_element_at_position_0_in_target_2623",
@@ -6970,7 +6970,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_624,
         Category::Error,
         "Source_provides_no_match_for_variadic_element_at_position_0_in_target_2624",
@@ -6979,7 +6979,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_625,
         Category::Error,
         "Variadic_element_at_position_0_in_source_does_not_match_element_at_position_1_in_target_2625",
@@ -6988,7 +6988,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_626,
         Category::Error,
         "Type_at_position_0_in_source_is_not_compatible_with_type_at_position_1_in_target_2626",
@@ -6997,7 +6997,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_627,
         Category::Error,
         "Type_at_positions_0_through_1_in_source_is_not_compatible_with_type_at_position_2_in_target_2627",
@@ -7006,7 +7006,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_628,
         Category::Error,
         "Cannot_assign_to_0_because_it_is_an_enum_2628",
@@ -7015,7 +7015,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_629,
         Category::Error,
         "Cannot_assign_to_0_because_it_is_a_class_2629",
@@ -7024,7 +7024,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_630,
         Category::Error,
         "Cannot_assign_to_0_because_it_is_a_function_2630",
@@ -7033,7 +7033,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_631,
         Category::Error,
         "Cannot_assign_to_0_because_it_is_a_namespace_2631",
@@ -7042,7 +7042,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_632,
         Category::Error,
         "Cannot_assign_to_0_because_it_is_an_import_2632",
@@ -7051,7 +7051,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_633,
         Category::Error,
         "JSX_property_access_expressions_cannot_include_JSX_namespace_names_2633",
@@ -7060,7 +7060,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_634,
         Category::Error,
         "_0_index_signatures_are_incompatible_2634",
@@ -7069,7 +7069,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_635,
         Category::Error,
         "Type_0_has_no_signatures_for_which_the_type_argument_list_is_applicable_2635",
@@ -7078,7 +7078,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_636,
         Category::Error,
         "Type_0_is_not_assignable_to_type_1_as_implied_by_variance_annotation_2636",
@@ -7087,7 +7087,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_637,
         Category::Error,
         "Variance_annotations_are_only_supported_in_type_aliases_for_object_function_constructor_and_mapped_t_2637",
@@ -7096,7 +7096,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_638,
         Category::Error,
         "Type_0_may_represent_a_primitive_value_which_is_not_permitted_as_the_right_operand_of_the_in_operato_2638",
@@ -7105,7 +7105,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_639,
         Category::Error,
         "React_components_cannot_include_JSX_namespace_names_2639",
@@ -7114,7 +7114,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_649,
         Category::Error,
         "Cannot_augment_module_0_with_value_exports_because_it_resolves_to_a_non_module_entity_2649",
@@ -7123,7 +7123,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_650,
         Category::Error,
         "Non_abstract_class_expression_is_missing_implementations_for_the_following_members_of_0_Colon_1_and__2650",
@@ -7132,7 +7132,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_651,
         Category::Error,
         "A_member_initializer_in_a_enum_declaration_cannot_reference_members_declared_after_it_including_memb_2651",
@@ -7141,7 +7141,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_652,
         Category::Error,
         "Merged_declaration_0_cannot_include_a_default_export_declaration_Consider_adding_a_separate_export_d_2652",
@@ -7150,7 +7150,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_653,
         Category::Error,
         "Non_abstract_class_expression_does_not_implement_inherited_abstract_member_0_from_class_1_2653",
@@ -7159,7 +7159,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_654,
         Category::Error,
         "Non_abstract_class_0_is_missing_implementations_for_the_following_members_of_1_Colon_2_2654",
@@ -7168,7 +7168,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_655,
         Category::Error,
         "Non_abstract_class_0_is_missing_implementations_for_the_following_members_of_1_Colon_2_and_3_more_2655",
@@ -7177,7 +7177,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_656,
         Category::Error,
         "Non_abstract_class_expression_is_missing_implementations_for_the_following_members_of_0_Colon_1_2656",
@@ -7186,7 +7186,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_657,
         Category::Error,
         "JSX_expressions_must_have_one_parent_element_2657",
@@ -7195,7 +7195,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_658,
         Category::Error,
         "Type_0_provides_no_match_for_the_signature_1_2658",
@@ -7204,7 +7204,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_659,
         Category::Error,
         "super_is_only_allowed_in_members_of_object_literal_expressions_when_option_target_is_ES2015_or_highe_2659",
@@ -7213,7 +7213,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_660,
         Category::Error,
         "super_can_only_be_referenced_in_members_of_derived_classes_or_object_literal_expressions_2660",
@@ -7222,7 +7222,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_661,
         Category::Error,
         "Cannot_export_0_Only_local_declarations_can_be_exported_from_a_module_2661",
@@ -7231,7 +7231,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_662,
         Category::Error,
         "Cannot_find_name_0_Did_you_mean_the_static_member_1_0_2662",
@@ -7240,7 +7240,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_663,
         Category::Error,
         "Cannot_find_name_0_Did_you_mean_the_instance_member_this_0_2663",
@@ -7249,7 +7249,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_664,
         Category::Error,
         "Invalid_module_name_in_augmentation_module_0_cannot_be_found_2664",
@@ -7258,7 +7258,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_665,
         Category::Error,
         "Invalid_module_name_in_augmentation_Module_0_resolves_to_an_untyped_module_at_1_which_cannot_be_augm_2665",
@@ -7267,7 +7267,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_666,
         Category::Error,
         "Exports_and_export_assignments_are_not_permitted_in_module_augmentations_2666",
@@ -7276,7 +7276,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_667,
         Category::Error,
         "Imports_are_not_permitted_in_module_augmentations_Consider_moving_them_to_the_enclosing_external_mod_2667",
@@ -7285,7 +7285,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_668,
         Category::Error,
         "export_modifier_cannot_be_applied_to_ambient_modules_and_module_augmentations_since_they_are_always__2668",
@@ -7294,7 +7294,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_669,
         Category::Error,
         "Augmentations_for_the_global_scope_can_only_be_directly_nested_in_external_modules_or_ambient_module_2669",
@@ -7303,7 +7303,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_670,
         Category::Error,
         "Augmentations_for_the_global_scope_should_have_declare_modifier_unless_they_appear_in_already_ambien_2670",
@@ -7312,7 +7312,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_671,
         Category::Error,
         "Cannot_augment_module_0_because_it_resolves_to_a_non_module_entity_2671",
@@ -7321,7 +7321,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_672,
         Category::Error,
         "Cannot_assign_a_0_constructor_type_to_a_1_constructor_type_2672",
@@ -7330,7 +7330,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_673,
         Category::Error,
         "Constructor_of_class_0_is_private_and_only_accessible_within_the_class_declaration_2673",
@@ -7339,7 +7339,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_674,
         Category::Error,
         "Constructor_of_class_0_is_protected_and_only_accessible_within_the_class_declaration_2674",
@@ -7348,7 +7348,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_675,
         Category::Error,
         "Cannot_extend_a_class_0_Class_constructor_is_marked_as_private_2675",
@@ -7357,7 +7357,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_676,
         Category::Error,
         "Accessors_must_both_be_abstract_or_non_abstract_2676",
@@ -7366,7 +7366,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_677,
         Category::Error,
         "A_type_predicate_s_type_must_be_assignable_to_its_parameter_s_type_2677",
@@ -7375,7 +7375,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_678,
         Category::Error,
         "Type_0_is_not_comparable_to_type_1_2678",
@@ -7384,7 +7384,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_679,
         Category::Error,
         "A_function_that_is_called_with_the_new_keyword_cannot_have_a_this_type_that_is_void_2679",
@@ -7393,7 +7393,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_680,
         Category::Error,
         "A_0_parameter_must_be_the_first_parameter_2680",
@@ -7402,7 +7402,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_681,
         Category::Error,
         "A_constructor_cannot_have_a_this_parameter_2681",
@@ -7411,7 +7411,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_683,
         Category::Error,
         "this_implicitly_has_type_any_because_it_does_not_have_a_type_annotation_2683",
@@ -7420,7 +7420,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_684,
         Category::Error,
         "The_this_context_of_type_0_is_not_assignable_to_method_s_this_of_type_1_2684",
@@ -7429,7 +7429,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_685,
         Category::Error,
         "The_this_types_of_each_signature_are_incompatible_2685",
@@ -7438,7 +7438,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_686,
         Category::Error,
         "_0_refers_to_a_UMD_global_but_the_current_file_is_a_module_Consider_adding_an_import_instead_2686",
@@ -7447,7 +7447,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_687,
         Category::Error,
         "All_declarations_of_0_must_have_identical_modifiers_2687",
@@ -7456,7 +7456,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_688,
         Category::Error,
         "Cannot_find_type_definition_file_for_0_2688",
@@ -7465,7 +7465,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_689,
         Category::Error,
         "Cannot_extend_an_interface_0_Did_you_mean_implements_2689",
@@ -7474,7 +7474,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_690,
         Category::Error,
         "_0_only_refers_to_a_type_but_is_being_used_as_a_value_here_Did_you_mean_to_use_1_in_0_2690",
@@ -7483,7 +7483,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_692,
         Category::Error,
         "_0_is_a_primitive_but_1_is_a_wrapper_object_Prefer_using_0_when_possible_2692",
@@ -7492,7 +7492,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_693,
         Category::Error,
         "_0_only_refers_to_a_type_but_is_being_used_as_a_value_here_2693",
@@ -7501,7 +7501,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_694,
         Category::Error,
         "Namespace_0_has_no_exported_member_1_2694",
@@ -7510,7 +7510,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_695,
         Category::Error,
         "Left_side_of_comma_operator_is_unused_and_has_no_side_effects_2695",
@@ -7519,7 +7519,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_696,
         Category::Error,
         "The_Object_type_is_assignable_to_very_few_other_types_Did_you_mean_to_use_the_any_type_instead_2696",
@@ -7528,7 +7528,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_697,
         Category::Error,
         "An_async_function_or_method_must_return_a_Promise_Make_sure_you_have_a_declaration_for_Promise_or_in_2697",
@@ -7537,7 +7537,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_698,
         Category::Error,
         "Spread_types_may_only_be_created_from_object_types_2698",
@@ -7546,7 +7546,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_699,
         Category::Error,
         "Static_property_0_conflicts_with_built_in_property_Function_0_of_constructor_function_1_2699",
@@ -7555,7 +7555,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_700,
         Category::Error,
         "Rest_types_may_only_be_created_from_object_types_2700",
@@ -7564,7 +7564,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_701,
         Category::Error,
         "The_target_of_an_object_rest_assignment_must_be_a_variable_or_a_property_access_2701",
@@ -7573,7 +7573,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_702,
         Category::Error,
         "_0_only_refers_to_a_type_but_is_being_used_as_a_namespace_here_2702",
@@ -7582,7 +7582,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_703,
         Category::Error,
         "The_operand_of_a_delete_operator_must_be_a_property_reference_2703",
@@ -7591,7 +7591,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_704,
         Category::Error,
         "The_operand_of_a_delete_operator_cannot_be_a_read_only_property_2704",
@@ -7600,7 +7600,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_705,
         Category::Error,
         "An_async_function_or_method_in_ES5_requires_the_Promise_constructor_Make_sure_you_have_a_declaration_2705",
@@ -7609,7 +7609,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_706,
         Category::Error,
         "Required_type_parameters_may_not_follow_optional_type_parameters_2706",
@@ -7618,7 +7618,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_707,
         Category::Error,
         "Generic_type_0_requires_between_1_and_2_type_arguments_2707",
@@ -7627,7 +7627,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_708,
         Category::Error,
         "Cannot_use_namespace_0_as_a_value_2708",
@@ -7636,7 +7636,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_709,
         Category::Error,
         "Cannot_use_namespace_0_as_a_type_2709",
@@ -7645,7 +7645,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_710,
         Category::Error,
         "_0_are_specified_twice_The_attribute_named_0_will_be_overwritten_2710",
@@ -7654,7 +7654,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_711,
         Category::Error,
         "A_dynamic_import_call_returns_a_Promise_Make_sure_you_have_a_declaration_for_Promise_or_include_ES20_2711",
@@ -7663,7 +7663,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_712,
         Category::Error,
         "A_dynamic_import_call_in_ES5_requires_the_Promise_constructor_Make_sure_you_have_a_declaration_for_t_2712",
@@ -7672,7 +7672,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_713,
         Category::Error,
         "Cannot_access_0_1_because_0_is_a_type_but_not_a_namespace_Did_you_mean_to_retrieve_the_type_of_the_p_2713",
@@ -7681,7 +7681,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_714,
         Category::Error,
         "The_expression_of_an_export_assignment_must_be_an_identifier_or_qualified_name_in_an_ambient_context_2714",
@@ -7690,7 +7690,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_715,
         Category::Error,
         "Abstract_property_0_in_class_1_cannot_be_accessed_in_the_constructor_2715",
@@ -7699,7 +7699,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_716,
         Category::Error,
         "Type_parameter_0_has_a_circular_default_2716",
@@ -7708,7 +7708,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_717,
         Category::Error,
         "Subsequent_property_declarations_must_have_the_same_type_Property_0_must_be_of_type_1_but_here_has_t_2717",
@@ -7717,7 +7717,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_718,
         Category::Error,
         "Duplicate_property_0_2718",
@@ -7726,7 +7726,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_719,
         Category::Error,
         "Type_0_is_not_assignable_to_type_1_Two_different_types_with_this_name_exist_but_they_are_unrelated_2719",
@@ -7735,7 +7735,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_720,
         Category::Error,
         "Class_0_incorrectly_implements_class_1_Did_you_mean_to_extend_1_and_inherit_its_members_as_a_subclas_2720",
@@ -7744,7 +7744,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_721,
         Category::Error,
         "Cannot_invoke_an_object_which_is_possibly_null_2721",
@@ -7753,7 +7753,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_722,
         Category::Error,
         "Cannot_invoke_an_object_which_is_possibly_undefined_2722",
@@ -7762,7 +7762,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_723,
         Category::Error,
         "Cannot_invoke_an_object_which_is_possibly_null_or_undefined_2723",
@@ -7771,7 +7771,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_724,
         Category::Error,
         "_0_has_no_exported_member_named_1_Did_you_mean_2_2724",
@@ -7780,7 +7780,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_725,
         Category::Error,
         "Class_name_cannot_be_Object_when_targeting_ES5_and_above_with_module_0_2725",
@@ -7789,7 +7789,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_726,
         Category::Error,
         "Cannot_find_lib_definition_for_0_2726",
@@ -7798,7 +7798,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_727,
         Category::Error,
         "Cannot_find_lib_definition_for_0_Did_you_mean_1_2727",
@@ -7807,7 +7807,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_728,
         Category::Message,
         "_0_is_declared_here_2728",
@@ -7816,7 +7816,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_729,
         Category::Error,
         "Property_0_is_used_before_its_initialization_2729",
@@ -7825,7 +7825,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_730,
         Category::Error,
         "An_arrow_function_cannot_have_a_this_parameter_2730",
@@ -7834,7 +7834,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_731,
         Category::Error,
         "Implicit_conversion_of_a_symbol_to_a_string_will_fail_at_runtime_Consider_wrapping_this_expression_i_2731",
@@ -7843,7 +7843,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_732,
         Category::Error,
         "Cannot_find_module_0_Consider_using_resolveJsonModule_to_import_module_with_json_extension_2732",
@@ -7852,7 +7852,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_733,
         Category::Error,
         "Property_0_was_also_declared_here_2733",
@@ -7861,7 +7861,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_734,
         Category::Error,
         "Are_you_missing_a_semicolon_2734",
@@ -7870,7 +7870,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_735,
         Category::Error,
         "Did_you_mean_for_0_to_be_constrained_to_type_new_args_Colon_any_1_2735",
@@ -7879,7 +7879,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_736,
         Category::Error,
         "Operator_0_cannot_be_applied_to_type_1_2736",
@@ -7888,7 +7888,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_737,
         Category::Error,
         "BigInt_literals_are_not_available_when_targeting_lower_than_ES2020_2737",
@@ -7897,7 +7897,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_738,
         Category::Message,
         "An_outer_value_of_this_is_shadowed_by_this_container_2738",
@@ -7906,7 +7906,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_739,
         Category::Error,
         "Type_0_is_missing_the_following_properties_from_type_1_Colon_2_2739",
@@ -7915,7 +7915,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_740,
         Category::Error,
         "Type_0_is_missing_the_following_properties_from_type_1_Colon_2_and_3_more_2740",
@@ -7924,7 +7924,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_741,
         Category::Error,
         "Property_0_is_missing_in_type_1_but_required_in_type_2_2741",
@@ -7933,7 +7933,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_742,
         Category::Error,
         "The_inferred_type_of_0_cannot_be_named_without_a_reference_to_1_This_is_likely_not_portable_A_type_a_2742",
@@ -7942,7 +7942,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_743,
         Category::Error,
         "No_overload_expects_0_type_arguments_but_overloads_do_exist_that_expect_either_1_or_2_type_arguments_2743",
@@ -7951,7 +7951,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_744,
         Category::Error,
         "Type_parameter_defaults_can_only_reference_previously_declared_type_parameters_2744",
@@ -7960,7 +7960,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_745,
         Category::Error,
         "This_JSX_tag_s_0_prop_expects_type_1_which_requires_multiple_children_but_only_a_single_child_was_pr_2745",
@@ -7969,7 +7969,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_746,
         Category::Error,
         "This_JSX_tag_s_0_prop_expects_a_single_child_of_type_1_but_multiple_children_were_provided_2746",
@@ -7978,7 +7978,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_747,
         Category::Error,
         "_0_components_don_t_accept_text_as_child_elements_Text_in_JSX_has_the_type_string_but_the_expected_t_2747",
@@ -7987,7 +7987,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_748,
         Category::Error,
         "Cannot_access_ambient_const_enums_when_0_is_enabled_2748",
@@ -7996,7 +7996,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_749,
         Category::Error,
         "_0_refers_to_a_value_but_is_being_used_as_a_type_here_Did_you_mean_typeof_0_2749",
@@ -8005,7 +8005,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_750,
         Category::Error,
         "The_implementation_signature_is_declared_here_2750",
@@ -8014,7 +8014,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_751,
         Category::Error,
         "Circularity_originates_in_type_at_this_location_2751",
@@ -8023,7 +8023,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_752,
         Category::Error,
         "The_first_export_default_is_here_2752",
@@ -8032,7 +8032,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_753,
         Category::Error,
         "Another_export_default_is_here_2753",
@@ -8041,7 +8041,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_754,
         Category::Error,
         "super_may_not_use_type_arguments_2754",
@@ -8050,7 +8050,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_755,
         Category::Error,
         "No_constituent_of_type_0_is_callable_2755",
@@ -8059,7 +8059,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_756,
         Category::Error,
         "Not_all_constituents_of_type_0_are_callable_2756",
@@ -8068,7 +8068,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_757,
         Category::Error,
         "Type_0_has_no_call_signatures_2757",
@@ -8077,7 +8077,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_758,
         Category::Error,
         "Each_member_of_the_union_type_0_has_signatures_but_none_of_those_signatures_are_compatible_with_each_2758",
@@ -8086,7 +8086,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_759,
         Category::Error,
         "No_constituent_of_type_0_is_constructable_2759",
@@ -8095,7 +8095,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_760,
         Category::Error,
         "Not_all_constituents_of_type_0_are_constructable_2760",
@@ -8104,7 +8104,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_761,
         Category::Error,
         "Type_0_has_no_construct_signatures_2761",
@@ -8113,7 +8113,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_762,
         Category::Error,
         "Each_member_of_the_union_type_0_has_construct_signatures_but_none_of_those_signatures_are_compatible_2762",
@@ -8122,7 +8122,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_763,
         Category::Error,
         "Cannot_iterate_value_because_the_next_method_of_its_iterator_expects_type_1_but_for_of_will_always_s_2763",
@@ -8131,7 +8131,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_764,
         Category::Error,
         "Cannot_iterate_value_because_the_next_method_of_its_iterator_expects_type_1_but_array_spread_will_al_2764",
@@ -8140,7 +8140,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_765,
         Category::Error,
         "Cannot_iterate_value_because_the_next_method_of_its_iterator_expects_type_1_but_array_destructuring__2765",
@@ -8149,7 +8149,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_766,
         Category::Error,
         "Cannot_delegate_iteration_to_value_because_the_next_method_of_its_iterator_expects_type_1_but_the_co_2766",
@@ -8158,7 +8158,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_767,
         Category::Error,
         "The_0_property_of_an_iterator_must_be_a_method_2767",
@@ -8167,7 +8167,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_768,
         Category::Error,
         "The_0_property_of_an_async_iterator_must_be_a_method_2768",
@@ -8176,7 +8176,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_769,
         Category::Error,
         "No_overload_matches_this_call_2769",
@@ -8185,7 +8185,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_770,
         Category::Error,
         "The_last_overload_gave_the_following_error_2770",
@@ -8194,7 +8194,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_771,
         Category::Error,
         "The_last_overload_is_declared_here_2771",
@@ -8203,7 +8203,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_772,
         Category::Error,
         "Overload_0_of_1_2_gave_the_following_error_2772",
@@ -8212,7 +8212,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_773,
         Category::Error,
         "Did_you_forget_to_use_await_2773",
@@ -8221,7 +8221,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_774,
         Category::Error,
         "This_condition_will_always_return_true_since_this_function_is_always_defined_Did_you_mean_to_call_it_2774",
@@ -8230,7 +8230,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_775,
         Category::Error,
         "Assertions_require_every_name_in_the_call_target_to_be_declared_with_an_explicit_type_annotation_2775",
@@ -8239,7 +8239,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_776,
         Category::Error,
         "Assertions_require_the_call_target_to_be_an_identifier_or_qualified_name_2776",
@@ -8248,7 +8248,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_777,
         Category::Error,
         "The_operand_of_an_increment_or_decrement_operator_may_not_be_an_optional_property_access_2777",
@@ -8257,7 +8257,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_778,
         Category::Error,
         "The_target_of_an_object_rest_assignment_may_not_be_an_optional_property_access_2778",
@@ -8266,7 +8266,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_779,
         Category::Error,
         "The_left_hand_side_of_an_assignment_expression_may_not_be_an_optional_property_access_2779",
@@ -8275,7 +8275,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_780,
         Category::Error,
         "The_left_hand_side_of_a_for_in_statement_may_not_be_an_optional_property_access_2780",
@@ -8284,7 +8284,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_781,
         Category::Error,
         "The_left_hand_side_of_a_for_of_statement_may_not_be_an_optional_property_access_2781",
@@ -8293,7 +8293,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_782,
         Category::Message,
         "_0_needs_an_explicit_type_annotation_2782",
@@ -8302,7 +8302,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_783,
         Category::Error,
         "_0_is_specified_more_than_once_so_this_usage_will_be_overwritten_2783",
@@ -8311,7 +8311,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_784,
         Category::Error,
         "get_and_set_accessors_cannot_declare_this_parameters_2784",
@@ -8320,7 +8320,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_785,
         Category::Error,
         "This_spread_always_overwrites_this_property_2785",
@@ -8329,7 +8329,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_786,
         Category::Error,
         "_0_cannot_be_used_as_a_JSX_component_2786",
@@ -8338,7 +8338,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_787,
         Category::Error,
         "Its_return_type_0_is_not_a_valid_JSX_element_2787",
@@ -8347,7 +8347,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_788,
         Category::Error,
         "Its_instance_type_0_is_not_a_valid_JSX_element_2788",
@@ -8356,7 +8356,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_789,
         Category::Error,
         "Its_element_type_0_is_not_a_valid_JSX_element_2789",
@@ -8365,7 +8365,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_790,
         Category::Error,
         "The_operand_of_a_delete_operator_must_be_optional_2790",
@@ -8374,7 +8374,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_791,
         Category::Error,
         "Exponentiation_cannot_be_performed_on_bigint_values_unless_the_target_option_is_set_to_es2016_or_lat_2791",
@@ -8383,7 +8383,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_792,
         Category::Error,
         "Cannot_find_module_0_Did_you_mean_to_set_the_moduleResolution_option_to_nodenext_or_to_add_aliases_t_2792",
@@ -8392,7 +8392,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_793,
         Category::Error,
         "The_call_would_have_succeeded_against_this_implementation_but_implementation_signatures_of_overloads_2793",
@@ -8401,7 +8401,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_794,
         Category::Error,
         "Expected_0_arguments_but_got_1_Did_you_forget_to_include_void_in_your_type_argument_to_Promise_2794",
@@ -8410,7 +8410,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_795,
         Category::Error,
         "The_intrinsic_keyword_can_only_be_used_to_declare_compiler_provided_intrinsic_types_2795",
@@ -8419,7 +8419,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_796,
         Category::Error,
         "It_is_likely_that_you_are_missing_a_comma_to_separate_these_two_template_expressions_They_form_a_tag_2796",
@@ -8428,7 +8428,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_797,
         Category::Error,
         "A_mixin_class_that_extends_from_a_type_variable_containing_an_abstract_construct_signature_must_also_2797",
@@ -8437,7 +8437,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_798,
         Category::Error,
         "The_declaration_was_marked_as_deprecated_here_2798",
@@ -8446,7 +8446,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_799,
         Category::Error,
         "Type_produces_a_tuple_type_that_is_too_large_to_represent_2799",
@@ -8455,7 +8455,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_800,
         Category::Error,
         "Expression_produces_a_tuple_type_that_is_too_large_to_represent_2800",
@@ -8464,7 +8464,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_801,
         Category::Error,
         "This_condition_will_always_return_true_since_this_0_is_always_defined_2801",
@@ -8473,7 +8473,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_802,
         Category::Error,
         "Type_0_can_only_be_iterated_through_when_using_the_downlevelIteration_flag_or_with_a_target_of_es201_2802",
@@ -8482,7 +8482,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_803,
         Category::Error,
         "Cannot_assign_to_private_method_0_Private_methods_are_not_writable_2803",
@@ -8491,7 +8491,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_804,
         Category::Error,
         "Duplicate_identifier_0_Static_and_instance_elements_cannot_share_the_same_private_name_2804",
@@ -8500,7 +8500,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_806,
         Category::Error,
         "Private_accessor_was_defined_without_a_getter_2806",
@@ -8509,7 +8509,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_807,
         Category::Error,
         "This_syntax_requires_an_imported_helper_named_1_with_2_parameters_which_is_not_compatible_with_the_o_2807",
@@ -8518,7 +8518,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_808,
         Category::Error,
         "A_get_accessor_must_be_at_least_as_accessible_as_the_setter_2808",
@@ -8527,7 +8527,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_809,
         Category::Error,
         "Declaration_or_statement_expected_This_follows_a_block_of_statements_so_if_you_intended_to_write_a_d_2809",
@@ -8536,7 +8536,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_810,
         Category::Error,
         "Expected_1_argument_but_got_0_new_Promise_needs_a_JSDoc_hint_to_produce_a_resolve_that_can_be_called_2810",
@@ -8545,7 +8545,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_811,
         Category::Error,
         "Initializer_for_property_0_2811",
@@ -8554,7 +8554,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_812,
         Category::Error,
         "Property_0_does_not_exist_on_type_1_Try_changing_the_lib_compiler_option_to_include_dom_2812",
@@ -8563,7 +8563,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_813,
         Category::Error,
         "Class_declaration_cannot_implement_overload_list_for_0_2813",
@@ -8572,7 +8572,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_814,
         Category::Error,
         "Function_with_bodies_can_only_merge_with_classes_that_are_ambient_2814",
@@ -8581,7 +8581,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_815,
         Category::Error,
         "arguments_cannot_be_referenced_in_property_initializers_or_class_static_initialization_blocks_2815",
@@ -8590,7 +8590,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_816,
         Category::Error,
         "Cannot_use_this_in_a_static_property_initializer_of_a_decorated_class_2816",
@@ -8599,7 +8599,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_817,
         Category::Error,
         "Property_0_has_no_initializer_and_is_not_definitely_assigned_in_a_class_static_block_2817",
@@ -8608,7 +8608,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_818,
         Category::Error,
         "Duplicate_identifier_0_Compiler_reserves_name_1_when_emitting_super_references_in_static_initializer_2818",
@@ -8617,7 +8617,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_819,
         Category::Error,
         "Namespace_name_cannot_be_0_2819",
@@ -8626,7 +8626,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_820,
         Category::Error,
         "Type_0_is_not_assignable_to_type_1_Did_you_mean_2_2820",
@@ -8635,7 +8635,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_821,
         Category::Error,
         "Import_assertions_are_only_supported_when_the_module_option_is_set_to_esnext_node18_node20_nodenext__2821",
@@ -8644,7 +8644,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_822,
         Category::Error,
         "Import_assertions_cannot_be_used_with_type_only_imports_or_exports_2822",
@@ -8653,7 +8653,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_823,
         Category::Error,
         "Import_attributes_are_only_supported_when_the_module_option_is_set_to_esnext_node18_node20_nodenext__2823",
@@ -8662,7 +8662,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_833,
         Category::Error,
         "Cannot_find_namespace_0_Did_you_mean_1_2833",
@@ -8671,7 +8671,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_834,
         Category::Error,
         "Relative_import_paths_need_explicit_file_extensions_in_ECMAScript_imports_when_moduleResolution_is_n_2834",
@@ -8680,7 +8680,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_835,
         Category::Error,
         "Relative_import_paths_need_explicit_file_extensions_in_ECMAScript_imports_when_moduleResolution_is_n_2835",
@@ -8689,7 +8689,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_836,
         Category::Error,
         "Import_assertions_are_not_allowed_on_statements_that_compile_to_CommonJS_require_calls_2836",
@@ -8698,7 +8698,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_837,
         Category::Error,
         "Import_assertion_values_must_be_string_literal_expressions_2837",
@@ -8707,7 +8707,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_838,
         Category::Error,
         "All_declarations_of_0_must_have_identical_constraints_2838",
@@ -8716,7 +8716,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_839,
         Category::Error,
         "This_condition_will_always_return_0_since_JavaScript_compares_objects_by_reference_not_value_2839",
@@ -8725,7 +8725,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_840,
         Category::Error,
         "An_interface_cannot_extend_a_primitive_type_like_0_It_can_only_extend_other_named_object_types_2840",
@@ -8734,7 +8734,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_842,
         Category::Error,
         "_0_is_an_unused_renaming_of_1_Did_you_intend_to_use_it_as_a_type_annotation_2842",
@@ -8743,7 +8743,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_843,
         Category::Error,
         "We_can_only_write_a_type_for_0_by_adding_a_type_for_the_entire_parameter_here_2843",
@@ -8752,7 +8752,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_844,
         Category::Error,
         "Type_of_instance_member_variable_0_cannot_reference_identifier_1_declared_in_the_constructor_2844",
@@ -8761,7 +8761,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_845,
         Category::Error,
         "This_condition_will_always_return_0_2845",
@@ -8770,7 +8770,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_846,
         Category::Error,
         "A_declaration_file_cannot_be_imported_without_import_type_Did_you_mean_to_import_an_implementation_f_2846",
@@ -8779,7 +8779,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_848,
         Category::Error,
         "The_right_hand_side_of_an_instanceof_expression_must_not_be_an_instantiation_expression_2848",
@@ -8788,7 +8788,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_849,
         Category::Error,
         "Target_signature_provides_too_few_arguments_Expected_0_or_more_but_got_1_2849",
@@ -8797,7 +8797,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_850,
         Category::Error,
         "The_initializer_of_a_using_declaration_must_be_either_an_object_with_a_Symbol_dispose_method_or_be_n_2850",
@@ -8806,7 +8806,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_851,
         Category::Error,
         "The_initializer_of_an_await_using_declaration_must_be_either_an_object_with_a_Symbol_asyncDispose_or_2851",
@@ -8815,7 +8815,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_852,
         Category::Error,
         "await_using_statements_are_only_allowed_within_async_functions_and_at_the_top_levels_of_modules_2852",
@@ -8824,7 +8824,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_853,
         Category::Error,
         "await_using_statements_are_only_allowed_at_the_top_level_of_a_file_when_that_file_is_a_module_but_th_2853",
@@ -8833,7 +8833,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_854,
         Category::Error,
         "Top_level_await_using_statements_are_only_allowed_when_the_module_option_is_set_to_es2022_esnext_sys_2854",
@@ -8842,7 +8842,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_855,
         Category::Error,
         "Class_field_0_defined_by_the_parent_class_is_not_accessible_in_the_child_class_via_super_2855",
@@ -8851,7 +8851,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_856,
         Category::Error,
         "Import_attributes_are_not_allowed_on_statements_that_compile_to_CommonJS_require_calls_2856",
@@ -8860,7 +8860,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_857,
         Category::Error,
         "Import_attributes_cannot_be_used_with_type_only_imports_or_exports_2857",
@@ -8869,7 +8869,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_858,
         Category::Error,
         "Import_attribute_values_must_be_string_literal_expressions_2858",
@@ -8878,7 +8878,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_859,
         Category::Error,
         "Excessive_complexity_comparing_types_0_and_1_2859",
@@ -8887,7 +8887,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_860,
         Category::Error,
         "The_left_hand_side_of_an_instanceof_expression_must_be_assignable_to_the_first_argument_of_the_right_2860",
@@ -8896,7 +8896,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_861,
         Category::Error,
         "An_object_s_Symbol_hasInstance_method_must_return_a_boolean_value_for_it_to_be_used_on_the_right_han_2861",
@@ -8905,7 +8905,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_862,
         Category::Error,
         "Type_0_is_generic_and_can_only_be_indexed_for_reading_2862",
@@ -8914,7 +8914,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_863,
         Category::Error,
         "A_class_cannot_extend_a_primitive_type_like_0_Classes_can_only_extend_constructable_values_2863",
@@ -8923,7 +8923,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_864,
         Category::Error,
         "A_class_cannot_implement_a_primitive_type_like_0_It_can_only_implement_other_named_object_types_2864",
@@ -8932,7 +8932,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_865,
         Category::Error,
         "Import_0_conflicts_with_local_value_so_must_be_declared_with_a_type_only_import_when_isolatedModules_2865",
@@ -8941,7 +8941,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_866,
         Category::Error,
         "Import_0_conflicts_with_global_value_used_in_this_file_so_must_be_declared_with_a_type_only_import_w_2866",
@@ -8950,7 +8950,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_867,
         Category::Error,
         "Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_Bun_Try_npm_i_save_dev_types_Slashbun_2867",
@@ -8959,7 +8959,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_868,
         Category::Error,
         "Cannot_find_name_0_Do_you_need_to_install_type_definitions_for_Bun_Try_npm_i_save_dev_types_Slashbun_2868",
@@ -8968,7 +8968,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_869,
         Category::Error,
         "Right_operand_of_is_unreachable_because_the_left_operand_is_never_nullish_2869",
@@ -8977,7 +8977,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_870,
         Category::Error,
         "This_binary_expression_is_never_nullish_Are_you_missing_parentheses_2870",
@@ -8986,7 +8986,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_871,
         Category::Error,
         "This_expression_is_always_nullish_2871",
@@ -8995,7 +8995,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_872,
         Category::Error,
         "This_kind_of_expression_is_always_truthy_2872",
@@ -9004,7 +9004,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_873,
         Category::Error,
         "This_kind_of_expression_is_always_falsy_2873",
@@ -9013,7 +9013,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_874,
         Category::Error,
         "This_JSX_tag_requires_0_to_be_in_scope_but_it_could_not_be_found_2874",
@@ -9022,7 +9022,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_875,
         Category::Error,
         "This_JSX_tag_requires_the_module_path_0_to_exist_but_none_could_be_found_Make_sure_you_have_types_fo_2875",
@@ -9031,7 +9031,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_876,
         Category::Error,
         "This_relative_import_path_is_unsafe_to_rewrite_because_it_looks_like_a_file_name_but_actually_resolv_2876",
@@ -9040,7 +9040,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_877,
         Category::Error,
         "This_import_uses_a_0_extension_to_resolve_to_an_input_TypeScript_file_but_will_not_be_rewritten_duri_2877",
@@ -9049,7 +9049,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_878,
         Category::Error,
         "This_import_path_is_unsafe_to_rewrite_because_it_resolves_to_another_project_and_the_relative_path_b_2878",
@@ -9058,7 +9058,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_879,
         Category::Error,
         "Using_JSX_fragments_requires_fragment_factory_0_to_be_in_scope_but_it_could_not_be_found_2879",
@@ -9067,7 +9067,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_880,
         Category::Error,
         "Import_assertions_have_been_replaced_by_import_attributes_Use_with_instead_of_assert_2880",
@@ -9076,7 +9076,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_881,
         Category::Error,
         "This_expression_is_never_nullish_2881",
@@ -9085,7 +9085,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_882,
         Category::Error,
         "Cannot_find_module_or_type_declarations_for_side_effect_import_of_0_2882",
@@ -9094,7 +9094,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         2_883,
         Category::Error,
         "The_inferred_type_of_0_cannot_be_named_without_a_reference_to_2_from_1_This_is_likely_not_portable_A_2883",
@@ -9103,7 +9103,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_000,
         Category::Error,
         "Import_declaration_0_is_using_private_name_1_4000",
@@ -9112,7 +9112,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_002,
         Category::Error,
         "Type_parameter_0_of_exported_class_has_or_is_using_private_name_1_4002",
@@ -9121,7 +9121,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_004,
         Category::Error,
         "Type_parameter_0_of_exported_interface_has_or_is_using_private_name_1_4004",
@@ -9130,7 +9130,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_006,
         Category::Error,
         "Type_parameter_0_of_constructor_signature_from_exported_interface_has_or_is_using_private_name_1_4006",
@@ -9139,7 +9139,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_008,
         Category::Error,
         "Type_parameter_0_of_call_signature_from_exported_interface_has_or_is_using_private_name_1_4008",
@@ -9148,7 +9148,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_010,
         Category::Error,
         "Type_parameter_0_of_public_static_method_from_exported_class_has_or_is_using_private_name_1_4010",
@@ -9157,7 +9157,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_012,
         Category::Error,
         "Type_parameter_0_of_public_method_from_exported_class_has_or_is_using_private_name_1_4012",
@@ -9166,7 +9166,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_014,
         Category::Error,
         "Type_parameter_0_of_method_from_exported_interface_has_or_is_using_private_name_1_4014",
@@ -9175,7 +9175,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_016,
         Category::Error,
         "Type_parameter_0_of_exported_function_has_or_is_using_private_name_1_4016",
@@ -9184,7 +9184,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_019,
         Category::Error,
         "Implements_clause_of_exported_class_0_has_or_is_using_private_name_1_4019",
@@ -9193,7 +9193,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_020,
         Category::Error,
         "extends_clause_of_exported_class_0_has_or_is_using_private_name_1_4020",
@@ -9202,7 +9202,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_021,
         Category::Error,
         "extends_clause_of_exported_class_has_or_is_using_private_name_0_4021",
@@ -9211,7 +9211,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_022,
         Category::Error,
         "extends_clause_of_exported_interface_0_has_or_is_using_private_name_1_4022",
@@ -9220,7 +9220,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_023,
         Category::Error,
         "Exported_variable_0_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named_4023",
@@ -9229,7 +9229,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_024,
         Category::Error,
         "Exported_variable_0_has_or_is_using_name_1_from_private_module_2_4024",
@@ -9238,7 +9238,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_025,
         Category::Error,
         "Exported_variable_0_has_or_is_using_private_name_1_4025",
@@ -9247,7 +9247,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_026,
         Category::Error,
         "Public_static_property_0_of_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot__4026",
@@ -9256,7 +9256,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_027,
         Category::Error,
         "Public_static_property_0_of_exported_class_has_or_is_using_name_1_from_private_module_2_4027",
@@ -9265,7 +9265,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_028,
         Category::Error,
         "Public_static_property_0_of_exported_class_has_or_is_using_private_name_1_4028",
@@ -9274,7 +9274,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_029,
         Category::Error,
         "Public_property_0_of_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_name_4029",
@@ -9283,7 +9283,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_030,
         Category::Error,
         "Public_property_0_of_exported_class_has_or_is_using_name_1_from_private_module_2_4030",
@@ -9292,7 +9292,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_031,
         Category::Error,
         "Public_property_0_of_exported_class_has_or_is_using_private_name_1_4031",
@@ -9301,7 +9301,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_032,
         Category::Error,
         "Property_0_of_exported_interface_has_or_is_using_name_1_from_private_module_2_4032",
@@ -9310,7 +9310,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_033,
         Category::Error,
         "Property_0_of_exported_interface_has_or_is_using_private_name_1_4033",
@@ -9319,7 +9319,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_034,
         Category::Error,
         "Parameter_type_of_public_static_setter_0_from_exported_class_has_or_is_using_name_1_from_private_mod_4034",
@@ -9328,7 +9328,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_035,
         Category::Error,
         "Parameter_type_of_public_static_setter_0_from_exported_class_has_or_is_using_private_name_1_4035",
@@ -9337,7 +9337,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_036,
         Category::Error,
         "Parameter_type_of_public_setter_0_from_exported_class_has_or_is_using_name_1_from_private_module_2_4036",
@@ -9346,7 +9346,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_037,
         Category::Error,
         "Parameter_type_of_public_setter_0_from_exported_class_has_or_is_using_private_name_1_4037",
@@ -9355,7 +9355,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_038,
         Category::Error,
         "Return_type_of_public_static_getter_0_from_exported_class_has_or_is_using_name_1_from_external_modul_4038",
@@ -9364,7 +9364,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_039,
         Category::Error,
         "Return_type_of_public_static_getter_0_from_exported_class_has_or_is_using_name_1_from_private_module_4039",
@@ -9373,7 +9373,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_040,
         Category::Error,
         "Return_type_of_public_static_getter_0_from_exported_class_has_or_is_using_private_name_1_4040",
@@ -9382,7 +9382,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_041,
         Category::Error,
         "Return_type_of_public_getter_0_from_exported_class_has_or_is_using_name_1_from_external_module_2_but_4041",
@@ -9391,7 +9391,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_042,
         Category::Error,
         "Return_type_of_public_getter_0_from_exported_class_has_or_is_using_name_1_from_private_module_2_4042",
@@ -9400,7 +9400,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_043,
         Category::Error,
         "Return_type_of_public_getter_0_from_exported_class_has_or_is_using_private_name_1_4043",
@@ -9409,7 +9409,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_044,
         Category::Error,
         "Return_type_of_constructor_signature_from_exported_interface_has_or_is_using_name_0_from_private_mod_4044",
@@ -9418,7 +9418,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_045,
         Category::Error,
         "Return_type_of_constructor_signature_from_exported_interface_has_or_is_using_private_name_0_4045",
@@ -9427,7 +9427,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_046,
         Category::Error,
         "Return_type_of_call_signature_from_exported_interface_has_or_is_using_name_0_from_private_module_1_4046",
@@ -9436,7 +9436,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_047,
         Category::Error,
         "Return_type_of_call_signature_from_exported_interface_has_or_is_using_private_name_0_4047",
@@ -9445,7 +9445,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_048,
         Category::Error,
         "Return_type_of_index_signature_from_exported_interface_has_or_is_using_name_0_from_private_module_1_4048",
@@ -9454,7 +9454,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_049,
         Category::Error,
         "Return_type_of_index_signature_from_exported_interface_has_or_is_using_private_name_0_4049",
@@ -9463,7 +9463,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_050,
         Category::Error,
         "Return_type_of_public_static_method_from_exported_class_has_or_is_using_name_0_from_external_module__4050",
@@ -9472,7 +9472,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_051,
         Category::Error,
         "Return_type_of_public_static_method_from_exported_class_has_or_is_using_name_0_from_private_module_1_4051",
@@ -9481,7 +9481,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_052,
         Category::Error,
         "Return_type_of_public_static_method_from_exported_class_has_or_is_using_private_name_0_4052",
@@ -9490,7 +9490,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_053,
         Category::Error,
         "Return_type_of_public_method_from_exported_class_has_or_is_using_name_0_from_external_module_1_but_c_4053",
@@ -9499,7 +9499,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_054,
         Category::Error,
         "Return_type_of_public_method_from_exported_class_has_or_is_using_name_0_from_private_module_1_4054",
@@ -9508,7 +9508,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_055,
         Category::Error,
         "Return_type_of_public_method_from_exported_class_has_or_is_using_private_name_0_4055",
@@ -9517,7 +9517,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_056,
         Category::Error,
         "Return_type_of_method_from_exported_interface_has_or_is_using_name_0_from_private_module_1_4056",
@@ -9526,7 +9526,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_057,
         Category::Error,
         "Return_type_of_method_from_exported_interface_has_or_is_using_private_name_0_4057",
@@ -9535,7 +9535,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_058,
         Category::Error,
         "Return_type_of_exported_function_has_or_is_using_name_0_from_external_module_1_but_cannot_be_named_4058",
@@ -9544,7 +9544,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_059,
         Category::Error,
         "Return_type_of_exported_function_has_or_is_using_name_0_from_private_module_1_4059",
@@ -9553,7 +9553,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_060,
         Category::Error,
         "Return_type_of_exported_function_has_or_is_using_private_name_0_4060",
@@ -9562,7 +9562,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_061,
         Category::Error,
         "Parameter_0_of_constructor_from_exported_class_has_or_is_using_name_1_from_external_module_2_but_can_4061",
@@ -9571,7 +9571,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_062,
         Category::Error,
         "Parameter_0_of_constructor_from_exported_class_has_or_is_using_name_1_from_private_module_2_4062",
@@ -9580,7 +9580,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_063,
         Category::Error,
         "Parameter_0_of_constructor_from_exported_class_has_or_is_using_private_name_1_4063",
@@ -9589,7 +9589,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_064,
         Category::Error,
         "Parameter_0_of_constructor_signature_from_exported_interface_has_or_is_using_name_1_from_private_mod_4064",
@@ -9598,7 +9598,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_065,
         Category::Error,
         "Parameter_0_of_constructor_signature_from_exported_interface_has_or_is_using_private_name_1_4065",
@@ -9607,7 +9607,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_066,
         Category::Error,
         "Parameter_0_of_call_signature_from_exported_interface_has_or_is_using_name_1_from_private_module_2_4066",
@@ -9616,7 +9616,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_067,
         Category::Error,
         "Parameter_0_of_call_signature_from_exported_interface_has_or_is_using_private_name_1_4067",
@@ -9625,7 +9625,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_068,
         Category::Error,
         "Parameter_0_of_public_static_method_from_exported_class_has_or_is_using_name_1_from_external_module__4068",
@@ -9634,7 +9634,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_069,
         Category::Error,
         "Parameter_0_of_public_static_method_from_exported_class_has_or_is_using_name_1_from_private_module_2_4069",
@@ -9643,7 +9643,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_070,
         Category::Error,
         "Parameter_0_of_public_static_method_from_exported_class_has_or_is_using_private_name_1_4070",
@@ -9652,7 +9652,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_071,
         Category::Error,
         "Parameter_0_of_public_method_from_exported_class_has_or_is_using_name_1_from_external_module_2_but_c_4071",
@@ -9661,7 +9661,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_072,
         Category::Error,
         "Parameter_0_of_public_method_from_exported_class_has_or_is_using_name_1_from_private_module_2_4072",
@@ -9670,7 +9670,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_073,
         Category::Error,
         "Parameter_0_of_public_method_from_exported_class_has_or_is_using_private_name_1_4073",
@@ -9679,7 +9679,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_074,
         Category::Error,
         "Parameter_0_of_method_from_exported_interface_has_or_is_using_name_1_from_private_module_2_4074",
@@ -9688,7 +9688,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_075,
         Category::Error,
         "Parameter_0_of_method_from_exported_interface_has_or_is_using_private_name_1_4075",
@@ -9697,7 +9697,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_076,
         Category::Error,
         "Parameter_0_of_exported_function_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named_4076",
@@ -9706,7 +9706,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_077,
         Category::Error,
         "Parameter_0_of_exported_function_has_or_is_using_name_1_from_private_module_2_4077",
@@ -9715,7 +9715,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_078,
         Category::Error,
         "Parameter_0_of_exported_function_has_or_is_using_private_name_1_4078",
@@ -9724,7 +9724,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_081,
         Category::Error,
         "Exported_type_alias_0_has_or_is_using_private_name_1_4081",
@@ -9733,7 +9733,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_082,
         Category::Error,
         "Default_export_of_the_module_has_or_is_using_private_name_0_4082",
@@ -9742,7 +9742,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_083,
         Category::Error,
         "Type_parameter_0_of_exported_type_alias_has_or_is_using_private_name_1_4083",
@@ -9751,7 +9751,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_084,
         Category::Error,
         "Exported_type_alias_0_has_or_is_using_private_name_1_from_module_2_4084",
@@ -9760,7 +9760,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_085,
         Category::Error,
         "Extends_clause_for_inferred_type_0_has_or_is_using_private_name_1_4085",
@@ -9769,7 +9769,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_091,
         Category::Error,
         "Parameter_0_of_index_signature_from_exported_interface_has_or_is_using_name_1_from_private_module_2_4091",
@@ -9778,7 +9778,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_092,
         Category::Error,
         "Parameter_0_of_index_signature_from_exported_interface_has_or_is_using_private_name_1_4092",
@@ -9787,7 +9787,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_094,
         Category::Error,
         "Property_0_of_exported_anonymous_class_type_may_not_be_private_or_protected_4094",
@@ -9796,7 +9796,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_095,
         Category::Error,
         "Public_static_method_0_of_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_4095",
@@ -9805,7 +9805,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_096,
         Category::Error,
         "Public_static_method_0_of_exported_class_has_or_is_using_name_1_from_private_module_2_4096",
@@ -9814,7 +9814,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_097,
         Category::Error,
         "Public_static_method_0_of_exported_class_has_or_is_using_private_name_1_4097",
@@ -9823,7 +9823,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_098,
         Category::Error,
         "Public_method_0_of_exported_class_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named_4098",
@@ -9832,7 +9832,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_099,
         Category::Error,
         "Public_method_0_of_exported_class_has_or_is_using_name_1_from_private_module_2_4099",
@@ -9841,7 +9841,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_100,
         Category::Error,
         "Public_method_0_of_exported_class_has_or_is_using_private_name_1_4100",
@@ -9850,7 +9850,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_101,
         Category::Error,
         "Method_0_of_exported_interface_has_or_is_using_name_1_from_private_module_2_4101",
@@ -9859,7 +9859,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_102,
         Category::Error,
         "Method_0_of_exported_interface_has_or_is_using_private_name_1_4102",
@@ -9868,7 +9868,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_103,
         Category::Error,
         "Type_parameter_0_of_exported_mapped_object_type_is_using_private_name_1_4103",
@@ -9877,7 +9877,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_104,
         Category::Error,
         "The_type_0_is_readonly_and_cannot_be_assigned_to_the_mutable_type_1_4104",
@@ -9886,7 +9886,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_105,
         Category::Error,
         "Private_or_protected_member_0_cannot_be_accessed_on_a_type_parameter_4105",
@@ -9895,7 +9895,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_106,
         Category::Error,
         "Parameter_0_of_accessor_has_or_is_using_private_name_1_4106",
@@ -9904,7 +9904,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_107,
         Category::Error,
         "Parameter_0_of_accessor_has_or_is_using_name_1_from_private_module_2_4107",
@@ -9913,7 +9913,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_108,
         Category::Error,
         "Parameter_0_of_accessor_has_or_is_using_name_1_from_external_module_2_but_cannot_be_named_4108",
@@ -9922,7 +9922,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_109,
         Category::Error,
         "Type_arguments_for_0_circularly_reference_themselves_4109",
@@ -9931,7 +9931,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_110,
         Category::Error,
         "Tuple_type_arguments_circularly_reference_themselves_4110",
@@ -9940,7 +9940,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_111,
         Category::Error,
         "Property_0_comes_from_an_index_signature_so_it_must_be_accessed_with_0_4111",
@@ -9949,7 +9949,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_112,
         Category::Error,
         "This_member_cannot_have_an_override_modifier_because_its_containing_class_0_does_not_extend_another__4112",
@@ -9958,7 +9958,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_113,
         Category::Error,
         "This_member_cannot_have_an_override_modifier_because_it_is_not_declared_in_the_base_class_0_4113",
@@ -9967,7 +9967,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_114,
         Category::Error,
         "This_member_must_have_an_override_modifier_because_it_overrides_a_member_in_the_base_class_0_4114",
@@ -9976,7 +9976,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_115,
         Category::Error,
         "This_parameter_property_must_have_an_override_modifier_because_it_overrides_a_member_in_base_class_0_4115",
@@ -9985,7 +9985,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_116,
         Category::Error,
         "This_member_must_have_an_override_modifier_because_it_overrides_an_abstract_method_that_is_declared__4116",
@@ -9994,7 +9994,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_117,
         Category::Error,
         "This_member_cannot_have_an_override_modifier_because_it_is_not_declared_in_the_base_class_0_Did_you__4117",
@@ -10003,7 +10003,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_118,
         Category::Error,
         "The_type_of_this_node_cannot_be_serialized_because_its_property_0_cannot_be_serialized_4118",
@@ -10012,7 +10012,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_119,
         Category::Error,
         "This_member_must_have_a_JSDoc_comment_with_an_override_tag_because_it_overrides_a_member_in_the_base_4119",
@@ -10021,7 +10021,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_120,
         Category::Error,
         "This_parameter_property_must_have_a_JSDoc_comment_with_an_override_tag_because_it_overrides_a_member_4120",
@@ -10030,7 +10030,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_121,
         Category::Error,
         "This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_its_containing_class_0_does_not_4121",
@@ -10039,7 +10039,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_122,
         Category::Error,
         "This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_it_is_not_declared_in_the_base__4122",
@@ -10048,7 +10048,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_123,
         Category::Error,
         "This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_it_is_not_declared_in_the_base__4123",
@@ -10057,7 +10057,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_124,
         Category::Error,
         "Compiler_option_0_of_value_1_is_unstable_Use_nightly_TypeScript_to_silence_this_error_Try_updating_w_4124",
@@ -10066,7 +10066,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_125,
         Category::Error,
         "Each_declaration_of_0_1_differs_in_its_value_where_2_was_expected_but_3_was_given_4125",
@@ -10075,7 +10075,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_126,
         Category::Error,
         "One_value_of_0_1_is_the_string_2_and_the_other_is_assumed_to_be_an_unknown_numeric_value_4126",
@@ -10084,7 +10084,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_127,
         Category::Error,
         "This_member_cannot_have_an_override_modifier_because_its_name_is_dynamic_4127",
@@ -10093,7 +10093,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         4_128,
         Category::Error,
         "This_member_cannot_have_a_JSDoc_comment_with_an_override_tag_because_its_name_is_dynamic_4128",
@@ -10102,7 +10102,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_001,
         Category::Error,
         "The_current_host_does_not_support_the_0_option_5001",
@@ -10111,7 +10111,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_002,
         Category::Error,
         "Option_0_requires_value_to_be_greater_than_1_5002",
@@ -10120,7 +10120,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_009,
         Category::Error,
         "Cannot_find_the_common_subdirectory_path_for_the_input_files_5009",
@@ -10129,7 +10129,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_010,
         Category::Error,
         "File_specification_cannot_end_in_a_recursive_directory_wildcard_Asterisk_Asterisk_Colon_0_5010",
@@ -10138,7 +10138,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_011,
         Category::Error,
         "The_common_source_directory_of_0_is_1_The_rootDir_setting_must_be_explicitly_set_to_this_or_another__5011",
@@ -10147,7 +10147,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_012,
         Category::Error,
         "Cannot_read_file_0_Colon_1_5012",
@@ -10156,7 +10156,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_023,
         Category::Error,
         "Unknown_compiler_option_0_5023",
@@ -10165,7 +10165,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_024,
         Category::Error,
         "Compiler_option_0_requires_a_value_of_type_1_5024",
@@ -10174,7 +10174,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_025,
         Category::Error,
         "Unknown_compiler_option_0_Did_you_mean_1_5025",
@@ -10183,7 +10183,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_033,
         Category::Error,
         "Could_not_write_file_0_Colon_1_5033",
@@ -10192,7 +10192,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_042,
         Category::Error,
         "Option_project_cannot_be_mixed_with_source_files_on_a_command_line_5042",
@@ -10201,7 +10201,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_047,
         Category::Error,
         "Option_isolatedModules_can_only_be_used_when_either_option_module_is_provided_or_option_target_is_ES_5047",
@@ -10210,7 +10210,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_051,
         Category::Error,
         "Option_0_can_only_be_used_when_either_option_inlineSourceMap_or_option_sourceMap_is_provided_5051",
@@ -10219,7 +10219,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_052,
         Category::Error,
         "Option_0_cannot_be_specified_without_specifying_option_1_5052",
@@ -10228,7 +10228,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_053,
         Category::Error,
         "Option_0_cannot_be_specified_with_option_1_5053",
@@ -10237,7 +10237,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_054,
         Category::Error,
         "A_tsconfig_json_file_is_already_defined_at_Colon_0_5054",
@@ -10246,7 +10246,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_055,
         Category::Error,
         "Cannot_write_file_0_because_it_would_overwrite_input_file_5055",
@@ -10255,7 +10255,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_056,
         Category::Error,
         "Cannot_write_file_0_because_it_would_be_overwritten_by_multiple_input_files_5056",
@@ -10264,7 +10264,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_057,
         Category::Error,
         "Cannot_find_a_tsconfig_json_file_at_the_specified_directory_Colon_0_5057",
@@ -10273,7 +10273,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_058,
         Category::Error,
         "The_specified_path_does_not_exist_Colon_0_5058",
@@ -10282,7 +10282,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_059,
         Category::Error,
         "Invalid_value_for_reactNamespace_0_is_not_a_valid_identifier_5059",
@@ -10291,7 +10291,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_061,
         Category::Error,
         "Pattern_0_can_have_at_most_one_Asterisk_character_5061",
@@ -10300,7 +10300,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_062,
         Category::Error,
         "Substitution_0_in_pattern_1_can_have_at_most_one_Asterisk_character_5062",
@@ -10309,7 +10309,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_063,
         Category::Error,
         "Substitutions_for_pattern_0_should_be_an_array_5063",
@@ -10318,7 +10318,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_064,
         Category::Error,
         "Substitution_0_for_pattern_1_has_incorrect_type_expected_string_got_2_5064",
@@ -10327,7 +10327,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_065,
         Category::Error,
         "File_specification_cannot_contain_a_parent_directory_that_appears_after_a_recursive_directory_wildca_5065",
@@ -10336,7 +10336,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_066,
         Category::Error,
         "Substitutions_for_pattern_0_shouldn_t_be_an_empty_array_5066",
@@ -10345,7 +10345,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_067,
         Category::Error,
         "Invalid_value_for_jsxFactory_0_is_not_a_valid_identifier_or_qualified_name_5067",
@@ -10354,7 +10354,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_068,
         Category::Error,
         "Adding_a_tsconfig_json_file_will_help_organize_projects_that_contain_both_TypeScript_and_JavaScript__5068",
@@ -10363,7 +10363,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_069,
         Category::Error,
         "Option_0_cannot_be_specified_without_specifying_option_1_or_option_2_5069",
@@ -10372,7 +10372,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_070,
         Category::Error,
         "Option_resolveJsonModule_cannot_be_specified_when_moduleResolution_is_set_to_classic_5070",
@@ -10381,7 +10381,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_071,
         Category::Error,
         "Option_resolveJsonModule_cannot_be_specified_when_module_is_set_to_none_system_or_umd_5071",
@@ -10390,7 +10390,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_072,
         Category::Error,
         "Unknown_build_option_0_5072",
@@ -10399,7 +10399,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_073,
         Category::Error,
         "Build_option_0_requires_a_value_of_type_1_5073",
@@ -10408,7 +10408,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_074,
         Category::Error,
         "Option_incremental_is_only_valid_with_a_known_configuration_file_like_tsconfig_json_or_when_tsBuildI_5074",
@@ -10417,7 +10417,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_075,
         Category::Error,
         "_0_is_assignable_to_the_constraint_of_type_1_but_1_could_be_instantiated_with_a_different_subtype_of_5075",
@@ -10426,7 +10426,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_076,
         Category::Error,
         "_0_and_1_operations_cannot_be_mixed_without_parentheses_5076",
@@ -10435,7 +10435,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_077,
         Category::Error,
         "Unknown_build_option_0_Did_you_mean_1_5077",
@@ -10444,7 +10444,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_078,
         Category::Error,
         "Unknown_watch_option_0_5078",
@@ -10453,7 +10453,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_079,
         Category::Error,
         "Unknown_watch_option_0_Did_you_mean_1_5079",
@@ -10462,7 +10462,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_080,
         Category::Error,
         "Watch_option_0_requires_a_value_of_type_1_5080",
@@ -10471,7 +10471,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_081,
         Category::Error,
         "Cannot_find_a_tsconfig_json_file_at_the_current_directory_Colon_0_5081",
@@ -10480,7 +10480,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_082,
         Category::Error,
         "_0_could_be_instantiated_with_an_arbitrary_type_which_could_be_unrelated_to_1_5082",
@@ -10489,7 +10489,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_083,
         Category::Error,
         "Cannot_read_file_0_5083",
@@ -10498,7 +10498,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_085,
         Category::Error,
         "A_tuple_member_cannot_be_both_optional_and_rest_5085",
@@ -10507,7 +10507,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_086,
         Category::Error,
         "A_labeled_tuple_element_is_declared_as_optional_with_a_question_mark_after_the_name_and_before_the_c_5086",
@@ -10516,7 +10516,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_087,
         Category::Error,
         "A_labeled_tuple_element_is_declared_as_rest_with_a_before_the_name_rather_than_before_the_type_5087",
@@ -10525,7 +10525,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_088,
         Category::Error,
         "The_inferred_type_of_0_references_a_type_with_a_cyclic_structure_which_cannot_be_trivially_serialize_5088",
@@ -10534,7 +10534,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_089,
         Category::Error,
         "Option_0_cannot_be_specified_when_option_jsx_is_1_5089",
@@ -10543,7 +10543,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_090,
         Category::Error,
         "Non_relative_paths_are_not_allowed_Did_you_forget_a_leading_Slash_5090",
@@ -10552,7 +10552,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_091,
         Category::Error,
         "Option_preserveConstEnums_cannot_be_disabled_when_0_is_enabled_5091",
@@ -10561,7 +10561,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_092,
         Category::Error,
         "The_root_value_of_a_0_file_must_be_an_object_5092",
@@ -10570,7 +10570,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_093,
         Category::Error,
         "Compiler_option_0_may_only_be_used_with_build_5093",
@@ -10579,7 +10579,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_094,
         Category::Error,
         "Compiler_option_0_may_not_be_used_with_build_5094",
@@ -10588,7 +10588,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_095,
         Category::Error,
         "Option_0_can_only_be_used_when_module_is_set_to_preserve_commonjs_or_es2015_or_later_5095",
@@ -10597,7 +10597,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_096,
         Category::Error,
         "Option_allowImportingTsExtensions_can_only_be_used_when_one_of_noEmit_emitDeclarationOnly_or_rewrite_5096",
@@ -10606,7 +10606,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_097,
         Category::Error,
         "An_import_path_can_only_end_with_a_0_extension_when_allowImportingTsExtensions_is_enabled_5097",
@@ -10615,7 +10615,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_098,
         Category::Error,
         "Option_0_can_only_be_used_when_moduleResolution_is_set_to_node16_nodenext_or_bundler_5098",
@@ -10624,7 +10624,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_101,
         Category::Error,
         "Option_0_is_deprecated_and_will_stop_functioning_in_TypeScript_1_Specify_compilerOption_ignoreDeprec_5101",
@@ -10633,7 +10633,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_102,
         Category::Error,
         "Option_0_has_been_removed_Please_remove_it_from_your_configuration_5102",
@@ -10642,7 +10642,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_103,
         Category::Error,
         "Invalid_value_for_ignoreDeprecations_5103",
@@ -10651,7 +10651,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_104,
         Category::Error,
         "Option_0_is_redundant_and_cannot_be_specified_with_option_1_5104",
@@ -10660,7 +10660,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_105,
         Category::Error,
         "Option_verbatimModuleSyntax_cannot_be_used_when_module_is_set_to_UMD_AMD_or_System_5105",
@@ -10669,7 +10669,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_106,
         Category::Message,
         "Use_0_instead_5106",
@@ -10678,7 +10678,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_107,
         Category::Error,
         "Option_0_1_is_deprecated_and_will_stop_functioning_in_TypeScript_2_Specify_compilerOption_ignoreDepr_5107",
@@ -10687,7 +10687,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_108,
         Category::Error,
         "Option_0_1_has_been_removed_Please_remove_it_from_your_configuration_5108",
@@ -10696,7 +10696,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_109,
         Category::Error,
         "Option_moduleResolution_must_be_set_to_0_or_left_unspecified_when_option_module_is_set_to_1_5109",
@@ -10705,7 +10705,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_110,
         Category::Error,
         "Option_module_must_be_set_to_0_when_option_moduleResolution_is_set_to_1_5110",
@@ -10714,7 +10714,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_111,
         Category::Message,
         "Visit_https_Colon_Slash_Slashaka_ms_Slashts6_for_migration_information_5111",
@@ -10723,7 +10723,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_112,
         Category::Error,
         "tsconfig_json_is_present_but_will_not_be_loaded_if_files_are_specified_on_commandline_Use_ignoreConf_5112",
@@ -10732,7 +10732,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_113,
         Category::Error,
         "_0_is_only_assignable_to_the_non_distributed_1_but_1_has_been_distributed_here_5113",
@@ -10741,7 +10741,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_114,
         Category::Error,
         "Instantiations_of_type_0_appear_infinitely_circular_5114",
@@ -10750,7 +10750,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         5_115,
         Category::Error,
         "Instantiations_of_the_following_types_appear_infinitely_circular_Colon_0_5115",
@@ -10759,7 +10759,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_000,
         Category::Message,
         "Generates_a_sourcemap_for_each_corresponding_d_ts_file_6000",
@@ -10768,7 +10768,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_001,
         Category::Message,
         "Concatenate_and_emit_output_to_single_file_6001",
@@ -10777,7 +10777,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_002,
         Category::Message,
         "Generates_corresponding_d_ts_file_6002",
@@ -10786,7 +10786,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_004,
         Category::Message,
         "Specify_the_location_where_debugger_should_locate_TypeScript_files_instead_of_source_locations_6004",
@@ -10795,7 +10795,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_005,
         Category::Message,
         "Watch_input_files_6005",
@@ -10804,7 +10804,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_006,
         Category::Message,
         "Redirect_output_structure_to_the_directory_6006",
@@ -10813,7 +10813,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_007,
         Category::Message,
         "Do_not_erase_const_enum_declarations_in_generated_code_6007",
@@ -10822,7 +10822,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_008,
         Category::Message,
         "Do_not_emit_outputs_if_any_errors_were_reported_6008",
@@ -10831,7 +10831,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_009,
         Category::Message,
         "Do_not_emit_comments_to_output_6009",
@@ -10840,7 +10840,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_010,
         Category::Message,
         "Do_not_emit_outputs_6010",
@@ -10849,7 +10849,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_011,
         Category::Message,
         "Allow_default_imports_from_modules_with_no_default_export_This_does_not_affect_code_emit_just_typech_6011",
@@ -10858,7 +10858,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_012,
         Category::Message,
         "Skip_type_checking_of_declaration_files_6012",
@@ -10867,7 +10867,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_013,
         Category::Message,
         "Do_not_resolve_the_real_path_of_symlinks_6013",
@@ -10876,7 +10876,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_014,
         Category::Message,
         "Only_emit_d_ts_declaration_files_6014",
@@ -10885,7 +10885,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_015,
         Category::Message,
         "Specify_ECMAScript_target_version_6015",
@@ -10894,7 +10894,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_016,
         Category::Message,
         "Specify_module_code_generation_6016",
@@ -10903,7 +10903,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_017,
         Category::Message,
         "Print_this_message_6017",
@@ -10912,7 +10912,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_019,
         Category::Message,
         "Print_the_compiler_s_version_6019",
@@ -10921,7 +10921,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_020,
         Category::Message,
         "Compile_the_project_given_the_path_to_its_configuration_file_or_to_a_folder_with_a_tsconfig_json_6020",
@@ -10930,7 +10930,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_023,
         Category::Message,
         "Syntax_Colon_0_6023",
@@ -10939,7 +10939,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_024,
         Category::Message,
         "options_6024",
@@ -10948,7 +10948,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_025,
         Category::Message,
         "file_6025",
@@ -10957,7 +10957,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_026,
         Category::Message,
         "Examples_Colon_0_6026",
@@ -10966,7 +10966,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_027,
         Category::Message,
         "Options_Colon_6027",
@@ -10975,7 +10975,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_029,
         Category::Message,
         "Version_0_6029",
@@ -10984,7 +10984,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_030,
         Category::Message,
         "Insert_command_line_options_and_files_from_a_file_6030",
@@ -10993,7 +10993,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_031,
         Category::Message,
         "Starting_compilation_in_watch_mode_6031",
@@ -11002,7 +11002,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_032,
         Category::Message,
         "File_change_detected_Starting_incremental_compilation_6032",
@@ -11011,7 +11011,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_034,
         Category::Message,
         "KIND_6034",
@@ -11020,7 +11020,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_035,
         Category::Message,
         "FILE_6035",
@@ -11029,7 +11029,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_036,
         Category::Message,
         "VERSION_6036",
@@ -11038,7 +11038,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_037,
         Category::Message,
         "LOCATION_6037",
@@ -11047,7 +11047,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_038,
         Category::Message,
         "DIRECTORY_6038",
@@ -11056,7 +11056,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_039,
         Category::Message,
         "STRATEGY_6039",
@@ -11065,7 +11065,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_040,
         Category::Message,
         "FILE_OR_DIRECTORY_6040",
@@ -11074,7 +11074,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_041,
         Category::Message,
         "Errors_Files_6041",
@@ -11083,7 +11083,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_043,
         Category::Message,
         "Generates_corresponding_map_file_6043",
@@ -11092,7 +11092,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_044,
         Category::Error,
         "Compiler_option_0_expects_an_argument_6044",
@@ -11101,7 +11101,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_045,
         Category::Error,
         "Unterminated_quoted_string_in_response_file_0_6045",
@@ -11110,7 +11110,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_046,
         Category::Error,
         "Argument_for_0_option_must_be_Colon_1_6046",
@@ -11119,7 +11119,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_048,
         Category::Error,
         "Locale_must_be_an_IETF_BCP_47_language_tag_Examples_Colon_0_1_6048",
@@ -11128,7 +11128,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_050,
         Category::Error,
         "Unable_to_open_file_0_6050",
@@ -11137,7 +11137,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_051,
         Category::Error,
         "Corrupted_locale_file_0_6051",
@@ -11146,7 +11146,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_052,
         Category::Message,
         "Raise_error_on_expressions_and_declarations_with_an_implied_any_type_6052",
@@ -11155,7 +11155,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_053,
         Category::Error,
         "File_0_not_found_6053",
@@ -11164,7 +11164,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_054,
         Category::Error,
         "File_0_has_an_unsupported_extension_The_only_supported_extensions_are_1_6054",
@@ -11173,7 +11173,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_055,
         Category::Message,
         "Suppress_noImplicitAny_errors_for_indexing_objects_lacking_index_signatures_6055",
@@ -11182,7 +11182,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_056,
         Category::Message,
         "Do_not_emit_declarations_for_code_that_has_an_internal_annotation_6056",
@@ -11191,7 +11191,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_058,
         Category::Message,
         "Specify_the_root_directory_of_input_files_Use_to_control_the_output_directory_structure_with_outDir_6058",
@@ -11200,7 +11200,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_059,
         Category::Error,
         "File_0_is_not_under_rootDir_1_rootDir_is_expected_to_contain_all_source_files_6059",
@@ -11209,7 +11209,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_060,
         Category::Message,
         "Specify_the_end_of_line_sequence_to_be_used_when_emitting_files_Colon_CRLF_dos_or_LF_unix_6060",
@@ -11218,7 +11218,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_061,
         Category::Message,
         "NEWLINE_6061",
@@ -11227,7 +11227,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_064,
         Category::Error,
         "Option_0_can_only_be_specified_in_tsconfig_json_file_or_set_to_null_on_command_line_6064",
@@ -11236,7 +11236,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_065,
         Category::Message,
         "Enables_experimental_support_for_ES7_decorators_6065",
@@ -11245,7 +11245,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_066,
         Category::Message,
         "Enables_experimental_support_for_emitting_type_metadata_for_decorators_6066",
@@ -11254,7 +11254,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_070,
         Category::Message,
         "Initializes_a_TypeScript_project_and_creates_a_tsconfig_json_file_6070",
@@ -11263,7 +11263,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_071,
         Category::Message,
         "Successfully_created_a_tsconfig_json_file_6071",
@@ -11272,7 +11272,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_072,
         Category::Message,
         "Suppress_excess_property_checks_for_object_literals_6072",
@@ -11281,7 +11281,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_073,
         Category::Message,
         "Stylize_errors_and_messages_using_color_and_context_experimental_6073",
@@ -11290,7 +11290,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_074,
         Category::Message,
         "Do_not_report_errors_on_unused_labels_6074",
@@ -11299,7 +11299,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_075,
         Category::Message,
         "Report_error_when_not_all_code_paths_in_function_return_a_value_6075",
@@ -11308,7 +11308,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_076,
         Category::Message,
         "Report_errors_for_fallthrough_cases_in_switch_statement_6076",
@@ -11317,7 +11317,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_077,
         Category::Message,
         "Do_not_report_errors_on_unreachable_code_6077",
@@ -11326,7 +11326,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_078,
         Category::Message,
         "Disallow_inconsistently_cased_references_to_the_same_file_6078",
@@ -11335,7 +11335,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_079,
         Category::Message,
         "Specify_library_files_to_be_included_in_the_compilation_6079",
@@ -11344,7 +11344,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_080,
         Category::Message,
         "Specify_JSX_code_generation_6080",
@@ -11353,7 +11353,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_082,
         Category::Error,
         "Only_amd_and_system_modules_are_supported_alongside_0_6082",
@@ -11362,7 +11362,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_083,
         Category::Message,
         "Base_directory_to_resolve_non_absolute_module_names_6083",
@@ -11371,7 +11371,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_084,
         Category::Message,
         "Deprecated_Use_jsxFactory_instead_Specify_the_object_invoked_for_createElement_when_targeting_react__6084",
@@ -11380,7 +11380,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_085,
         Category::Message,
         "Enable_tracing_of_the_name_resolution_process_6085",
@@ -11389,7 +11389,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_086,
         Category::Message,
         "Resolving_module_0_from_1_6086",
@@ -11398,7 +11398,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_087,
         Category::Message,
         "Explicitly_specified_module_resolution_kind_Colon_0_6087",
@@ -11407,7 +11407,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_088,
         Category::Message,
         "Module_resolution_kind_is_not_specified_using_0_6088",
@@ -11416,7 +11416,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_089,
         Category::Message,
         "Module_name_0_was_successfully_resolved_to_1_6089",
@@ -11425,7 +11425,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_090,
         Category::Message,
         "Module_name_0_was_not_resolved_6090",
@@ -11434,7 +11434,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_091,
         Category::Message,
         "paths_option_is_specified_looking_for_a_pattern_to_match_module_name_0_6091",
@@ -11443,7 +11443,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_092,
         Category::Message,
         "Module_name_0_matched_pattern_1_6092",
@@ -11452,7 +11452,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_093,
         Category::Message,
         "Trying_substitution_0_candidate_module_location_Colon_1_6093",
@@ -11461,7 +11461,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_094,
         Category::Message,
         "Resolving_module_name_0_relative_to_base_url_1_2_6094",
@@ -11470,7 +11470,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_095,
         Category::Message,
         "Loading_module_as_file_Slash_folder_candidate_module_location_0_target_file_types_Colon_1_6095",
@@ -11479,7 +11479,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_096,
         Category::Message,
         "File_0_does_not_exist_6096",
@@ -11488,7 +11488,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_097,
         Category::Message,
         "File_0_exists_use_it_as_a_name_resolution_result_6097",
@@ -11497,7 +11497,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_098,
         Category::Message,
         "Loading_module_0_from_node_modules_folder_target_file_types_Colon_1_6098",
@@ -11506,7 +11506,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_099,
         Category::Message,
         "Found_package_json_at_0_6099",
@@ -11515,7 +11515,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_100,
         Category::Message,
         "package_json_does_not_have_a_0_field_6100",
@@ -11524,7 +11524,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_101,
         Category::Message,
         "package_json_has_0_field_1_that_references_2_6101",
@@ -11533,7 +11533,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_102,
         Category::Message,
         "Allow_javascript_files_to_be_compiled_6102",
@@ -11542,7 +11542,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_104,
         Category::Message,
         "Checking_if_0_is_the_longest_matching_prefix_for_1_2_6104",
@@ -11551,7 +11551,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_105,
         Category::Message,
         "Expected_type_of_0_field_in_package_json_to_be_1_got_2_6105",
@@ -11560,7 +11560,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_106,
         Category::Message,
         "baseUrl_option_is_set_to_0_using_this_value_to_resolve_non_relative_module_name_1_6106",
@@ -11569,7 +11569,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_107,
         Category::Message,
         "rootDirs_option_is_set_using_it_to_resolve_relative_module_name_0_6107",
@@ -11578,7 +11578,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_108,
         Category::Message,
         "Longest_matching_prefix_for_0_is_1_6108",
@@ -11587,7 +11587,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_109,
         Category::Message,
         "Loading_0_from_the_root_dir_1_candidate_location_2_6109",
@@ -11596,7 +11596,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_110,
         Category::Message,
         "Trying_other_entries_in_rootDirs_6110",
@@ -11605,7 +11605,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_111,
         Category::Message,
         "Module_resolution_using_rootDirs_has_failed_6111",
@@ -11614,7 +11614,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_112,
         Category::Message,
         "Do_not_emit_use_strict_directives_in_module_output_6112",
@@ -11623,7 +11623,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_113,
         Category::Message,
         "Enable_strict_null_checks_6113",
@@ -11632,7 +11632,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_114,
         Category::Error,
         "Unknown_option_excludes_Did_you_mean_exclude_6114",
@@ -11641,7 +11641,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_115,
         Category::Message,
         "Raise_error_on_this_expressions_with_an_implied_any_type_6115",
@@ -11650,7 +11650,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_116,
         Category::Message,
         "Resolving_type_reference_directive_0_containing_file_1_root_directory_2_6116",
@@ -11659,7 +11659,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_119,
         Category::Message,
         "Type_reference_directive_0_was_successfully_resolved_to_1_primary_Colon_2_6119",
@@ -11668,7 +11668,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_120,
         Category::Message,
         "Type_reference_directive_0_was_not_resolved_6120",
@@ -11677,7 +11677,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_121,
         Category::Message,
         "Resolving_with_primary_search_path_0_6121",
@@ -11686,7 +11686,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_122,
         Category::Message,
         "Root_directory_cannot_be_determined_skipping_primary_search_paths_6122",
@@ -11695,7 +11695,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_123,
         Category::Message,
         "Resolving_type_reference_directive_0_containing_file_1_root_directory_not_set_6123",
@@ -11704,7 +11704,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_124,
         Category::Message,
         "Type_declaration_files_to_be_included_in_compilation_6124",
@@ -11713,7 +11713,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_125,
         Category::Message,
         "Looking_up_in_node_modules_folder_initial_location_0_6125",
@@ -11722,7 +11722,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_126,
         Category::Message,
         "Containing_file_is_not_specified_and_root_directory_cannot_be_determined_skipping_lookup_in_node_mod_6126",
@@ -11731,7 +11731,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_127,
         Category::Message,
         "Resolving_type_reference_directive_0_containing_file_not_set_root_directory_1_6127",
@@ -11740,7 +11740,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_128,
         Category::Message,
         "Resolving_type_reference_directive_0_containing_file_not_set_root_directory_not_set_6128",
@@ -11749,7 +11749,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_130,
         Category::Message,
         "Resolving_real_path_for_0_result_1_6130",
@@ -11758,7 +11758,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_131,
         Category::Error,
         "Cannot_compile_modules_using_option_0_unless_the_module_flag_is_amd_or_system_6131",
@@ -11767,7 +11767,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_132,
         Category::Message,
         "File_name_0_has_a_1_extension_stripping_it_6132",
@@ -11776,7 +11776,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_133,
         Category::Error,
         "_0_is_declared_but_its_value_is_never_read_6133",
@@ -11785,7 +11785,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_134,
         Category::Message,
         "Report_errors_on_unused_locals_6134",
@@ -11794,7 +11794,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_135,
         Category::Message,
         "Report_errors_on_unused_parameters_6135",
@@ -11803,7 +11803,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_136,
         Category::Message,
         "The_maximum_dependency_depth_to_search_under_node_modules_and_load_JavaScript_files_6136",
@@ -11812,7 +11812,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_137,
         Category::Error,
         "Cannot_import_type_declaration_files_Consider_importing_0_instead_of_1_6137",
@@ -11821,7 +11821,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_138,
         Category::Error,
         "Property_0_is_declared_but_its_value_is_never_read_6138",
@@ -11830,7 +11830,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_139,
         Category::Message,
         "Import_emit_helpers_from_tslib_6139",
@@ -11839,7 +11839,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_140,
         Category::Error,
         "Auto_discovery_for_typings_is_enabled_in_project_0_Running_extra_resolution_pass_for_module_1_using__6140",
@@ -11848,7 +11848,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_141,
         Category::Message,
         "Parse_in_strict_mode_and_emit_use_strict_for_each_source_file_6141",
@@ -11857,7 +11857,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_142,
         Category::Error,
         "Module_0_was_resolved_to_1_but_jsx_is_not_set_6142",
@@ -11866,7 +11866,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_144,
         Category::Message,
         "Module_0_was_resolved_as_locally_declared_ambient_module_in_file_1_6144",
@@ -11875,7 +11875,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_146,
         Category::Message,
         "Specify_the_JSX_factory_function_to_use_when_targeting_react_JSX_emit_e_g_React_createElement_or_h_6146",
@@ -11884,7 +11884,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_147,
         Category::Message,
         "Resolution_for_module_0_was_found_in_cache_from_location_1_6147",
@@ -11893,7 +11893,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_148,
         Category::Message,
         "Directory_0_does_not_exist_skipping_all_lookups_in_it_6148",
@@ -11902,7 +11902,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_149,
         Category::Message,
         "Show_diagnostic_information_6149",
@@ -11911,7 +11911,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_150,
         Category::Message,
         "Show_verbose_diagnostic_information_6150",
@@ -11920,7 +11920,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_151,
         Category::Message,
         "Emit_a_single_file_with_source_maps_instead_of_having_a_separate_file_6151",
@@ -11929,7 +11929,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_152,
         Category::Message,
         "Emit_the_source_alongside_the_sourcemaps_within_a_single_file_requires_inlineSourceMap_or_sourceMap__6152",
@@ -11938,7 +11938,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_153,
         Category::Message,
         "Transpile_each_file_as_a_separate_module_similar_to_ts_transpileModule_6153",
@@ -11947,7 +11947,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_154,
         Category::Message,
         "Print_names_of_generated_files_part_of_the_compilation_6154",
@@ -11956,7 +11956,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_155,
         Category::Message,
         "Print_names_of_files_part_of_the_compilation_6155",
@@ -11965,7 +11965,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_156,
         Category::Message,
         "The_locale_used_when_displaying_messages_to_the_user_e_g_en_us_6156",
@@ -11974,7 +11974,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_157,
         Category::Message,
         "Do_not_generate_custom_helper_functions_like_extends_in_compiled_output_6157",
@@ -11983,7 +11983,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_158,
         Category::Message,
         "Do_not_include_the_default_library_file_lib_d_ts_6158",
@@ -11992,7 +11992,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_159,
         Category::Message,
         "Do_not_add_triple_slash_references_or_imported_modules_to_the_list_of_compiled_files_6159",
@@ -12001,7 +12001,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_160,
         Category::Message,
         "Deprecated_Use_skipLibCheck_instead_Skip_type_checking_of_default_library_declaration_files_6160",
@@ -12010,7 +12010,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_161,
         Category::Message,
         "List_of_folders_to_include_type_definitions_from_6161",
@@ -12019,7 +12019,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_162,
         Category::Message,
         "Disable_size_limitations_on_JavaScript_projects_6162",
@@ -12028,7 +12028,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_163,
         Category::Message,
         "The_character_set_of_the_input_files_6163",
@@ -12037,7 +12037,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_164,
         Category::Message,
         "Skipping_module_0_that_looks_like_an_absolute_URI_target_file_types_Colon_1_6164",
@@ -12046,7 +12046,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_165,
         Category::Message,
         "Do_not_truncate_error_messages_6165",
@@ -12055,7 +12055,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_166,
         Category::Message,
         "Output_directory_for_generated_declaration_files_6166",
@@ -12064,7 +12064,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_167,
         Category::Message,
         "A_series_of_entries_which_re_map_imports_to_lookup_locations_relative_to_the_baseUrl_6167",
@@ -12073,7 +12073,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_168,
         Category::Message,
         "List_of_root_folders_whose_combined_content_represents_the_structure_of_the_project_at_runtime_6168",
@@ -12082,7 +12082,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_169,
         Category::Message,
         "Show_all_compiler_options_6169",
@@ -12091,7 +12091,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_170,
         Category::Message,
         "Deprecated_Use_outFile_instead_Concatenate_and_emit_output_to_single_file_6170",
@@ -12100,7 +12100,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_171,
         Category::Message,
         "Command_line_Options_6171",
@@ -12109,7 +12109,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_179,
         Category::Message,
         "Provide_full_support_for_iterables_in_for_of_spread_and_destructuring_when_targeting_ES5_6179",
@@ -12118,7 +12118,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_180,
         Category::Message,
         "Enable_all_strict_type_checking_options_6180",
@@ -12127,7 +12127,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_182,
         Category::Message,
         "Scoped_package_detected_looking_in_0_6182",
@@ -12136,7 +12136,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_183,
         Category::Message,
         "Reusing_resolution_of_module_0_from_1_of_old_program_it_was_successfully_resolved_to_2_6183",
@@ -12145,7 +12145,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_184,
         Category::Message,
         "Reusing_resolution_of_module_0_from_1_of_old_program_it_was_successfully_resolved_to_2_with_Package__6184",
@@ -12154,7 +12154,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_186,
         Category::Message,
         "Enable_strict_checking_of_function_types_6186",
@@ -12163,7 +12163,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_187,
         Category::Message,
         "Enable_strict_checking_of_property_initialization_in_classes_6187",
@@ -12172,7 +12172,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_188,
         Category::Error,
         "Numeric_separators_are_not_allowed_here_6188",
@@ -12181,7 +12181,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_189,
         Category::Error,
         "Multiple_consecutive_numeric_separators_are_not_permitted_6189",
@@ -12190,7 +12190,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_191,
         Category::Message,
         "Whether_to_keep_outdated_console_output_in_watch_mode_instead_of_clearing_the_screen_6191",
@@ -12199,7 +12199,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_192,
         Category::Error,
         "All_imports_in_import_declaration_are_unused_6192",
@@ -12208,7 +12208,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_193,
         Category::Message,
         "Found_1_error_Watching_for_file_changes_6193",
@@ -12217,7 +12217,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_194,
         Category::Message,
         "Found_0_errors_Watching_for_file_changes_6194",
@@ -12226,7 +12226,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_195,
         Category::Message,
         "Resolve_keyof_to_string_valued_property_names_only_no_numbers_or_symbols_6195",
@@ -12235,7 +12235,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_196,
         Category::Error,
         "_0_is_declared_but_never_used_6196",
@@ -12244,7 +12244,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_197,
         Category::Message,
         "Include_modules_imported_with_json_extension_6197",
@@ -12253,7 +12253,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_198,
         Category::Error,
         "All_destructured_elements_are_unused_6198",
@@ -12262,7 +12262,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_199,
         Category::Error,
         "All_variables_are_unused_6199",
@@ -12271,7 +12271,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_200,
         Category::Error,
         "Definitions_of_the_following_identifiers_conflict_with_those_in_another_file_Colon_0_6200",
@@ -12280,7 +12280,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_201,
         Category::Message,
         "Conflicts_are_in_this_file_6201",
@@ -12289,7 +12289,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_202,
         Category::Error,
         "Project_references_may_not_form_a_circular_graph_Cycle_detected_Colon_0_6202",
@@ -12298,7 +12298,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_203,
         Category::Message,
         "_0_was_also_declared_here_6203",
@@ -12307,7 +12307,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_204,
         Category::Message,
         "and_here_6204",
@@ -12316,7 +12316,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_205,
         Category::Error,
         "All_type_parameters_are_unused_6205",
@@ -12325,7 +12325,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_206,
         Category::Message,
         "package_json_has_a_typesVersions_field_with_version_specific_path_mappings_6206",
@@ -12334,7 +12334,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_207,
         Category::Message,
         "package_json_does_not_have_a_typesVersions_entry_that_matches_version_0_6207",
@@ -12343,7 +12343,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_208,
         Category::Message,
         "package_json_has_a_typesVersions_entry_0_that_matches_compiler_version_1_looking_for_a_pattern_to_ma_6208",
@@ -12352,7 +12352,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_209,
         Category::Message,
         "package_json_has_a_typesVersions_entry_0_that_is_not_a_valid_semver_range_6209",
@@ -12361,7 +12361,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_210,
         Category::Message,
         "An_argument_for_0_was_not_provided_6210",
@@ -12370,7 +12370,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_211,
         Category::Message,
         "An_argument_matching_this_binding_pattern_was_not_provided_6211",
@@ -12379,7 +12379,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_212,
         Category::Message,
         "Did_you_mean_to_call_this_expression_6212",
@@ -12388,7 +12388,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_213,
         Category::Message,
         "Did_you_mean_to_use_new_with_this_expression_6213",
@@ -12397,7 +12397,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_214,
         Category::Message,
         "Enable_strict_bind_call_and_apply_methods_on_functions_6214",
@@ -12406,7 +12406,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_215,
         Category::Message,
         "Using_compiler_options_of_project_reference_redirect_0_6215",
@@ -12415,7 +12415,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_216,
         Category::Message,
         "Found_1_error_6216",
@@ -12424,7 +12424,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_217,
         Category::Message,
         "Found_0_errors_6217",
@@ -12433,7 +12433,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_218,
         Category::Message,
         "Module_name_0_was_successfully_resolved_to_1_with_Package_ID_2_6218",
@@ -12442,7 +12442,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_219,
         Category::Message,
         "Type_reference_directive_0_was_successfully_resolved_to_1_with_Package_ID_2_primary_Colon_3_6219",
@@ -12451,7 +12451,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_220,
         Category::Message,
         "package_json_had_a_falsy_0_field_6220",
@@ -12460,7 +12460,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_221,
         Category::Message,
         "Disable_use_of_source_files_instead_of_declaration_files_from_referenced_projects_6221",
@@ -12469,7 +12469,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_222,
         Category::Message,
         "Emit_class_fields_with_Define_instead_of_Set_6222",
@@ -12478,7 +12478,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_223,
         Category::Message,
         "Generates_a_CPU_profile_6223",
@@ -12487,7 +12487,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_224,
         Category::Message,
         "Disable_solution_searching_for_this_project_6224",
@@ -12496,7 +12496,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_225,
         Category::Message,
         "Specify_strategy_for_watching_file_Colon_FixedPollingInterval_default_PriorityPollingInterval_Dynami_6225",
@@ -12505,7 +12505,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_226,
         Category::Message,
         "Specify_strategy_for_watching_directory_on_platforms_that_don_t_support_recursive_watching_natively__6226",
@@ -12514,7 +12514,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_227,
         Category::Message,
         "Specify_strategy_for_creating_a_polling_watch_when_it_fails_to_create_using_file_system_events_Colon_6227",
@@ -12523,7 +12523,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_229,
         Category::Error,
         "Tag_0_expects_at_least_1_arguments_but_the_JSX_factory_2_provides_at_most_3_6229",
@@ -12532,7 +12532,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_230,
         Category::Error,
         "Option_0_can_only_be_specified_in_tsconfig_json_file_or_set_to_false_or_null_on_command_line_6230",
@@ -12541,7 +12541,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_231,
         Category::Error,
         "Could_not_resolve_the_path_0_with_the_extensions_Colon_1_6231",
@@ -12550,7 +12550,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_232,
         Category::Error,
         "Declaration_augments_declaration_in_another_file_This_cannot_be_serialized_6232",
@@ -12559,7 +12559,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_233,
         Category::Error,
         "This_is_the_declaration_being_augmented_Consider_moving_the_augmenting_declaration_into_the_same_fil_6233",
@@ -12568,7 +12568,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_234,
         Category::Error,
         "This_expression_is_not_callable_because_it_is_a_get_accessor_Did_you_mean_to_use_it_without_6234",
@@ -12577,7 +12577,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_235,
         Category::Message,
         "Disable_loading_referenced_projects_6235",
@@ -12586,7 +12586,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_236,
         Category::Error,
         "Arguments_for_the_rest_parameter_0_were_not_provided_6236",
@@ -12595,7 +12595,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_237,
         Category::Message,
         "Generates_an_event_trace_and_a_list_of_types_6237",
@@ -12604,7 +12604,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_238,
         Category::Error,
         "Specify_the_module_specifier_to_be_used_to_import_the_jsx_and_jsxs_factory_functions_from_eg_react_6238",
@@ -12613,7 +12613,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_239,
         Category::Message,
         "File_0_exists_according_to_earlier_cached_lookups_6239",
@@ -12622,7 +12622,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_240,
         Category::Message,
         "File_0_does_not_exist_according_to_earlier_cached_lookups_6240",
@@ -12631,7 +12631,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_241,
         Category::Message,
         "Resolution_for_type_reference_directive_0_was_found_in_cache_from_location_1_6241",
@@ -12640,7 +12640,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_242,
         Category::Message,
         "Resolving_type_reference_directive_0_containing_file_1_6242",
@@ -12649,7 +12649,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_243,
         Category::Message,
         "Interpret_optional_property_types_as_written_rather_than_adding_undefined_6243",
@@ -12658,7 +12658,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_244,
         Category::Message,
         "Modules_6244",
@@ -12667,7 +12667,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_245,
         Category::Message,
         "File_Management_6245",
@@ -12676,7 +12676,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_246,
         Category::Message,
         "Emit_6246",
@@ -12685,7 +12685,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_247,
         Category::Message,
         "JavaScript_Support_6247",
@@ -12694,7 +12694,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_248,
         Category::Message,
         "Type_Checking_6248",
@@ -12703,7 +12703,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_249,
         Category::Message,
         "Editor_Support_6249",
@@ -12712,7 +12712,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_250,
         Category::Message,
         "Watch_and_Build_Modes_6250",
@@ -12721,7 +12721,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_251,
         Category::Message,
         "Compiler_Diagnostics_6251",
@@ -12730,7 +12730,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_252,
         Category::Message,
         "Interop_Constraints_6252",
@@ -12739,7 +12739,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_253,
         Category::Message,
         "Backwards_Compatibility_6253",
@@ -12748,7 +12748,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_254,
         Category::Message,
         "Language_and_Environment_6254",
@@ -12757,7 +12757,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_255,
         Category::Message,
         "Projects_6255",
@@ -12766,7 +12766,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_256,
         Category::Message,
         "Output_Formatting_6256",
@@ -12775,7 +12775,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_257,
         Category::Message,
         "Completeness_6257",
@@ -12784,7 +12784,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_258,
         Category::Error,
         "_0_should_be_set_inside_the_compilerOptions_object_of_the_config_json_file_6258",
@@ -12793,7 +12793,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_259,
         Category::Message,
         "Found_1_error_in_0_6259",
@@ -12802,7 +12802,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_260,
         Category::Message,
         "Found_0_errors_in_the_same_file_starting_at_Colon_1_6260",
@@ -12811,7 +12811,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_261,
         Category::Message,
         "Found_0_errors_in_1_files_6261",
@@ -12820,7 +12820,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_262,
         Category::Message,
         "File_name_0_has_a_1_extension_looking_up_2_instead_6262",
@@ -12829,7 +12829,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_263,
         Category::Error,
         "Module_0_was_resolved_to_1_but_allowArbitraryExtensions_is_not_set_6263",
@@ -12838,7 +12838,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_264,
         Category::Message,
         "Enable_importing_files_with_any_extension_provided_a_declaration_file_is_present_6264",
@@ -12847,7 +12847,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_265,
         Category::Message,
         "Resolving_type_reference_directive_for_program_that_specifies_custom_typeRoots_skipping_lookup_in_no_6265",
@@ -12856,7 +12856,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_266,
         Category::Error,
         "Option_0_can_only_be_specified_on_command_line_6266",
@@ -12865,7 +12865,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_270,
         Category::Message,
         "Directory_0_has_no_containing_package_json_scope_Imports_will_not_resolve_6270",
@@ -12874,7 +12874,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_271,
         Category::Message,
         "Import_specifier_0_does_not_exist_in_package_json_scope_at_path_1_6271",
@@ -12883,7 +12883,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_272,
         Category::Message,
         "Invalid_import_specifier_0_has_no_possible_resolutions_6272",
@@ -12892,7 +12892,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_273,
         Category::Message,
         "package_json_scope_0_has_no_imports_defined_6273",
@@ -12901,7 +12901,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_274,
         Category::Message,
         "package_json_scope_0_explicitly_maps_specifier_1_to_null_6274",
@@ -12910,7 +12910,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_275,
         Category::Message,
         "package_json_scope_0_has_invalid_type_for_target_of_specifier_1_6275",
@@ -12919,7 +12919,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_276,
         Category::Message,
         "Export_specifier_0_does_not_exist_in_package_json_scope_at_path_1_6276",
@@ -12928,7 +12928,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_277,
         Category::Message,
         "Resolution_of_non_relative_name_failed_trying_with_modern_Node_resolution_features_disabled_to_see_i_6277",
@@ -12937,7 +12937,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_278,
         Category::Message,
         "There_are_types_at_0_but_this_result_could_not_be_resolved_when_respecting_package_json_exports_The__6278",
@@ -12946,7 +12946,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_279,
         Category::Message,
         "Resolution_of_non_relative_name_failed_trying_with_moduleResolution_bundler_to_see_if_project_may_ne_6279",
@@ -12955,7 +12955,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_280,
         Category::Message,
         "There_are_types_at_0_but_this_result_could_not_be_resolved_under_your_current_moduleResolution_setti_6280",
@@ -12964,7 +12964,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_281,
         Category::Message,
         "package_json_has_a_peerDependencies_field_6281",
@@ -12973,7 +12973,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_282,
         Category::Message,
         "Found_peerDependency_0_with_1_version_6282",
@@ -12982,7 +12982,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_283,
         Category::Message,
         "Failed_to_find_peerDependency_0_6283",
@@ -12991,7 +12991,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_284,
         Category::Message,
         "File_Layout_6284",
@@ -13000,7 +13000,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_285,
         Category::Message,
         "Environment_Settings_6285",
@@ -13009,7 +13009,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_286,
         Category::Message,
         "See_also_https_Colon_Slash_Slashaka_ms_Slashtsconfig_Slashmodule_6286",
@@ -13018,7 +13018,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_287,
         Category::Message,
         "For_nodejs_Colon_6287",
@@ -13027,7 +13027,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_290,
         Category::Message,
         "and_npm_install_D_types_Slashnode_6290",
@@ -13036,7 +13036,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_291,
         Category::Message,
         "Other_Outputs_6291",
@@ -13045,7 +13045,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_292,
         Category::Message,
         "Stricter_Typechecking_Options_6292",
@@ -13054,7 +13054,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_293,
         Category::Message,
         "Style_Options_6293",
@@ -13063,7 +13063,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_294,
         Category::Message,
         "Recommended_Options_6294",
@@ -13072,7 +13072,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_302,
         Category::Message,
         "Enable_project_compilation_6302",
@@ -13081,7 +13081,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_304,
         Category::Error,
         "Composite_projects_may_not_disable_declaration_emit_6304",
@@ -13090,7 +13090,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_305,
         Category::Error,
         "Output_file_0_has_not_been_built_from_source_file_1_6305",
@@ -13099,7 +13099,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_306,
         Category::Error,
         "Referenced_project_0_must_have_setting_composite_Colon_true_6306",
@@ -13108,7 +13108,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_307,
         Category::Error,
         "File_0_is_not_listed_within_the_file_list_of_project_1_Projects_must_list_all_files_or_use_an_includ_6307",
@@ -13117,7 +13117,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_310,
         Category::Error,
         "Referenced_project_0_may_not_disable_emit_6310",
@@ -13126,7 +13126,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_350,
         Category::Message,
         "Project_0_is_out_of_date_because_output_1_is_older_than_input_2_6350",
@@ -13135,7 +13135,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_351,
         Category::Message,
         "Project_0_is_up_to_date_because_newest_input_1_is_older_than_output_2_6351",
@@ -13144,7 +13144,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_352,
         Category::Message,
         "Project_0_is_out_of_date_because_output_file_1_does_not_exist_6352",
@@ -13153,7 +13153,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_353,
         Category::Message,
         "Failed_to_delete_file_0_6353",
@@ -13162,7 +13162,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_354,
         Category::Message,
         "Project_0_is_up_to_date_with_d_ts_files_from_its_dependencies_6354",
@@ -13171,7 +13171,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_355,
         Category::Message,
         "Projects_in_this_build_Colon_0_6355",
@@ -13180,7 +13180,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_356,
         Category::Message,
         "A_non_dry_build_would_delete_the_following_files_Colon_0_6356",
@@ -13189,7 +13189,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_357,
         Category::Message,
         "A_non_dry_build_would_build_project_0_6357",
@@ -13198,7 +13198,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_358,
         Category::Message,
         "Building_project_0_6358",
@@ -13207,7 +13207,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_359,
         Category::Message,
         "Updating_output_timestamps_of_project_0_6359",
@@ -13216,7 +13216,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_361,
         Category::Message,
         "Project_0_is_up_to_date_6361",
@@ -13225,7 +13225,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_362,
         Category::Message,
         "Skipping_build_of_project_0_because_its_dependency_1_has_errors_6362",
@@ -13234,7 +13234,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_363,
         Category::Message,
         "Project_0_can_t_be_built_because_its_dependency_1_has_errors_6363",
@@ -13243,7 +13243,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_364,
         Category::Message,
         "Build_one_or_more_projects_and_their_dependencies_if_out_of_date_6364",
@@ -13252,7 +13252,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_365,
         Category::Message,
         "Delete_the_outputs_of_all_projects_6365",
@@ -13261,7 +13261,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_367,
         Category::Message,
         "Show_what_would_be_built_or_deleted_if_specified_with_clean_6367",
@@ -13270,7 +13270,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_369,
         Category::Error,
         "Option_build_must_be_the_first_command_line_argument_6369",
@@ -13279,7 +13279,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_370,
         Category::Error,
         "Options_0_and_1_cannot_be_combined_6370",
@@ -13288,7 +13288,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_371,
         Category::Message,
         "Updating_unchanged_output_timestamps_of_project_0_6371",
@@ -13297,7 +13297,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_374,
         Category::Message,
         "A_non_dry_build_would_update_timestamps_for_output_of_project_0_6374",
@@ -13306,7 +13306,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_377,
         Category::Error,
         "Cannot_write_file_0_because_it_will_overwrite_tsbuildinfo_file_generated_by_referenced_project_1_6377",
@@ -13315,7 +13315,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_379,
         Category::Error,
         "Composite_projects_may_not_disable_incremental_compilation_6379",
@@ -13324,7 +13324,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_380,
         Category::Message,
         "Specify_file_to_store_incremental_compilation_information_6380",
@@ -13333,7 +13333,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_381,
         Category::Message,
         "Project_0_is_out_of_date_because_output_for_it_was_generated_with_version_1_that_differs_with_curren_6381",
@@ -13342,7 +13342,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_382,
         Category::Message,
         "Skipping_build_of_project_0_because_its_dependency_1_was_not_built_6382",
@@ -13351,7 +13351,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_383,
         Category::Message,
         "Project_0_can_t_be_built_because_its_dependency_1_was_not_built_6383",
@@ -13360,7 +13360,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_384,
         Category::Message,
         "Have_recompiles_in_incremental_and_watch_assume_that_changes_within_a_file_will_only_affect_files_di_6384",
@@ -13369,7 +13369,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_385,
         Category::Suggestion,
         "_0_is_deprecated_6385",
@@ -13378,7 +13378,7 @@ pub static CATALOG: &[Message] = &[
         false,
         true,
     ),
-    Message::new(
+    Message::catalog(
         6_386,
         Category::Message,
         "Performance_timings_for_diagnostics_or_extendedDiagnostics_are_not_available_in_this_session_A_nativ_6386",
@@ -13387,7 +13387,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_387,
         Category::Suggestion,
         "The_signature_0_of_1_is_deprecated_6387",
@@ -13396,7 +13396,7 @@ pub static CATALOG: &[Message] = &[
         false,
         true,
     ),
-    Message::new(
+    Message::catalog(
         6_388,
         Category::Message,
         "Project_0_is_being_forcibly_rebuilt_6388",
@@ -13405,7 +13405,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_389,
         Category::Message,
         "Reusing_resolution_of_module_0_from_1_of_old_program_it_was_not_resolved_6389",
@@ -13414,7 +13414,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_390,
         Category::Message,
         "Reusing_resolution_of_type_reference_directive_0_from_1_of_old_program_it_was_successfully_resolved__6390",
@@ -13423,7 +13423,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_391,
         Category::Message,
         "Reusing_resolution_of_type_reference_directive_0_from_1_of_old_program_it_was_successfully_resolved__6391",
@@ -13432,7 +13432,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_392,
         Category::Message,
         "Reusing_resolution_of_type_reference_directive_0_from_1_of_old_program_it_was_not_resolved_6392",
@@ -13441,7 +13441,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_393,
         Category::Message,
         "Reusing_resolution_of_module_0_from_1_found_in_cache_from_location_2_it_was_successfully_resolved_to_6393",
@@ -13450,7 +13450,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_394,
         Category::Message,
         "Reusing_resolution_of_module_0_from_1_found_in_cache_from_location_2_it_was_successfully_resolved_to_6394",
@@ -13459,7 +13459,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_395,
         Category::Message,
         "Reusing_resolution_of_module_0_from_1_found_in_cache_from_location_2_it_was_not_resolved_6395",
@@ -13468,7 +13468,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_396,
         Category::Message,
         "Reusing_resolution_of_type_reference_directive_0_from_1_found_in_cache_from_location_2_it_was_succes_6396",
@@ -13477,7 +13477,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_397,
         Category::Message,
         "Reusing_resolution_of_type_reference_directive_0_from_1_found_in_cache_from_location_2_it_was_succes_6397",
@@ -13486,7 +13486,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_398,
         Category::Message,
         "Reusing_resolution_of_type_reference_directive_0_from_1_found_in_cache_from_location_2_it_was_not_re_6398",
@@ -13495,7 +13495,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_399,
         Category::Message,
         "Project_0_is_out_of_date_because_buildinfo_file_1_indicates_that_some_of_the_changes_were_not_emitte_6399",
@@ -13504,7 +13504,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_400,
         Category::Message,
         "Project_0_is_up_to_date_but_needs_to_update_timestamps_of_output_files_that_are_older_than_input_fil_6400",
@@ -13513,7 +13513,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_401,
         Category::Message,
         "Project_0_is_out_of_date_because_config_file_does_not_exist_6401",
@@ -13522,7 +13522,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_402,
         Category::Message,
         "Resolving_in_0_mode_with_conditions_1_6402",
@@ -13531,7 +13531,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_403,
         Category::Message,
         "Matched_0_condition_1_6403",
@@ -13540,7 +13540,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_404,
         Category::Message,
         "Using_0_subpath_1_with_target_2_6404",
@@ -13549,7 +13549,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_405,
         Category::Message,
         "Saw_non_matching_condition_0_6405",
@@ -13558,7 +13558,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_406,
         Category::Message,
         "Project_0_is_out_of_date_because_buildinfo_file_1_indicates_there_is_change_in_compilerOptions_6406",
@@ -13567,7 +13567,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_407,
         Category::Message,
         "Allow_imports_to_include_TypeScript_file_extensions_Requires_moduleResolution_bundler_and_either_noE_6407",
@@ -13576,7 +13576,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_408,
         Category::Message,
         "Use_the_package_json_exports_field_when_resolving_package_imports_6408",
@@ -13585,7 +13585,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_409,
         Category::Message,
         "Use_the_package_json_imports_field_when_resolving_imports_6409",
@@ -13594,7 +13594,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_410,
         Category::Message,
         "Conditions_to_set_in_addition_to_the_resolver_specific_defaults_when_resolving_imports_6410",
@@ -13603,7 +13603,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_411,
         Category::Message,
         "true_when_moduleResolution_is_node16_nodenext_or_bundler_otherwise_false_6411",
@@ -13612,7 +13612,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_412,
         Category::Message,
         "Project_0_is_out_of_date_because_buildinfo_file_1_indicates_that_file_2_was_root_file_of_compilation_6412",
@@ -13621,7 +13621,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_413,
         Category::Message,
         "Entering_conditional_exports_6413",
@@ -13630,7 +13630,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_414,
         Category::Message,
         "Resolved_under_condition_0_6414",
@@ -13639,7 +13639,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_415,
         Category::Message,
         "Failed_to_resolve_under_condition_0_6415",
@@ -13648,7 +13648,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_416,
         Category::Message,
         "Exiting_conditional_exports_6416",
@@ -13657,7 +13657,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_417,
         Category::Message,
         "Searching_all_ancestor_node_modules_directories_for_preferred_extensions_Colon_0_6417",
@@ -13666,7 +13666,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_418,
         Category::Message,
         "Searching_all_ancestor_node_modules_directories_for_fallback_extensions_Colon_0_6418",
@@ -13675,7 +13675,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_419,
         Category::Message,
         "Project_0_is_out_of_date_because_buildinfo_file_1_indicates_that_program_needs_to_report_errors_6419",
@@ -13684,7 +13684,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_420,
         Category::Message,
         "Project_0_is_out_of_date_because_input_1_does_not_exist_6420",
@@ -13693,7 +13693,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_421,
         Category::Message,
         "Rewrite_ts_tsx_mts_and_cts_file_extensions_in_relative_import_paths_to_their_JavaScript_equivalent_i_6421",
@@ -13702,7 +13702,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_423,
         Category::Message,
         "Project_0_is_out_of_date_because_it_has_errors_6423",
@@ -13711,7 +13711,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_424,
         Category::Error,
         "Multiple_module_exports_assignments_cannot_be_serialized_for_declaration_emit_6424",
@@ -13720,7 +13720,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_425,
         Category::Error,
         "Nested_CommonJS_export_constructs_cannot_be_serialized_for_declaration_emit_6425",
@@ -13729,7 +13729,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_500,
         Category::Message,
         "The_expected_type_comes_from_property_0_which_is_declared_here_on_type_1_6500",
@@ -13738,7 +13738,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_501,
         Category::Message,
         "The_expected_type_comes_from_this_index_signature_6501",
@@ -13747,7 +13747,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_502,
         Category::Message,
         "The_expected_type_comes_from_the_return_type_of_this_signature_6502",
@@ -13756,7 +13756,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_503,
         Category::Message,
         "Print_names_of_files_that_are_part_of_the_compilation_and_then_stop_processing_6503",
@@ -13765,7 +13765,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_504,
         Category::Error,
         "File_0_is_a_JavaScript_file_Did_you_mean_to_enable_the_allowJs_option_6504",
@@ -13774,7 +13774,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_505,
         Category::Message,
         "Print_names_of_files_and_the_reason_they_are_part_of_the_compilation_6505",
@@ -13783,7 +13783,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_506,
         Category::Message,
         "Consider_adding_a_declare_modifier_to_this_class_6506",
@@ -13792,7 +13792,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_600,
         Category::Message,
         "Allow_JavaScript_files_to_be_a_part_of_your_program_Use_the_checkJs_option_to_get_errors_from_these__6600",
@@ -13801,7 +13801,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_601,
         Category::Message,
         "Allow_import_x_from_y_when_a_module_doesn_t_have_a_default_export_6601",
@@ -13810,7 +13810,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_602,
         Category::Message,
         "Allow_accessing_UMD_globals_from_modules_6602",
@@ -13819,7 +13819,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_603,
         Category::Message,
         "Disable_error_reporting_for_unreachable_code_6603",
@@ -13828,7 +13828,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_604,
         Category::Message,
         "Disable_error_reporting_for_unused_labels_6604",
@@ -13837,7 +13837,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_605,
         Category::Message,
         "Ensure_use_strict_is_always_emitted_6605",
@@ -13846,7 +13846,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_606,
         Category::Message,
         "Have_recompiles_in_projects_that_use_incremental_and_watch_mode_assume_that_changes_within_a_file_wi_6606",
@@ -13855,7 +13855,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_607,
         Category::Message,
         "Specify_the_base_directory_to_resolve_non_relative_module_names_6607",
@@ -13864,7 +13864,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_608,
         Category::Message,
         "No_longer_supported_In_early_versions_manually_set_the_text_encoding_for_reading_files_6608",
@@ -13873,7 +13873,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_609,
         Category::Message,
         "Enable_error_reporting_in_type_checked_JavaScript_files_6609",
@@ -13882,7 +13882,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_611,
         Category::Message,
         "Enable_constraints_that_allow_a_TypeScript_project_to_be_used_with_project_references_6611",
@@ -13891,7 +13891,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_612,
         Category::Message,
         "Generate_d_ts_files_from_TypeScript_and_JavaScript_files_in_your_project_6612",
@@ -13900,7 +13900,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_613,
         Category::Message,
         "Specify_the_output_directory_for_generated_declaration_files_6613",
@@ -13909,7 +13909,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_614,
         Category::Message,
         "Create_sourcemaps_for_d_ts_files_6614",
@@ -13918,7 +13918,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_615,
         Category::Message,
         "Output_compiler_performance_information_after_building_6615",
@@ -13927,7 +13927,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_616,
         Category::Message,
         "Disables_inference_for_type_acquisition_by_looking_at_filenames_in_a_project_6616",
@@ -13936,7 +13936,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_617,
         Category::Message,
         "Reduce_the_number_of_projects_loaded_automatically_by_TypeScript_6617",
@@ -13945,7 +13945,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_618,
         Category::Message,
         "Remove_the_20mb_cap_on_total_source_code_size_for_JavaScript_files_in_the_TypeScript_language_server_6618",
@@ -13954,7 +13954,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_619,
         Category::Message,
         "Opt_a_project_out_of_multi_project_reference_checking_when_editing_6619",
@@ -13963,7 +13963,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_620,
         Category::Message,
         "Disable_preferring_source_files_instead_of_declaration_files_when_referencing_composite_projects_6620",
@@ -13972,7 +13972,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_621,
         Category::Message,
         "Emit_more_compliant_but_verbose_and_less_performant_JavaScript_for_iteration_6621",
@@ -13981,7 +13981,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_622,
         Category::Message,
         "Emit_a_UTF_8_Byte_Order_Mark_BOM_in_the_beginning_of_output_files_6622",
@@ -13990,7 +13990,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_623,
         Category::Message,
         "Only_output_d_ts_files_and_not_JavaScript_files_6623",
@@ -13999,7 +13999,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_624,
         Category::Message,
         "Emit_design_type_metadata_for_decorated_declarations_in_source_files_6624",
@@ -14008,7 +14008,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_625,
         Category::Message,
         "Disable_the_type_acquisition_for_JavaScript_projects_6625",
@@ -14017,7 +14017,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_626,
         Category::Message,
         "Emit_additional_JavaScript_to_ease_support_for_importing_CommonJS_modules_This_enables_allowSyntheti_6626",
@@ -14026,7 +14026,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_627,
         Category::Message,
         "Filters_results_from_the_include_option_6627",
@@ -14035,7 +14035,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_628,
         Category::Message,
         "Remove_a_list_of_directories_from_the_watch_process_6628",
@@ -14044,7 +14044,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_629,
         Category::Message,
         "Remove_a_list_of_files_from_the_watch_mode_s_processing_6629",
@@ -14053,7 +14053,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_630,
         Category::Message,
         "Enable_experimental_support_for_legacy_experimental_decorators_6630",
@@ -14062,7 +14062,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_631,
         Category::Message,
         "Print_files_read_during_the_compilation_including_why_it_was_included_6631",
@@ -14071,7 +14071,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_632,
         Category::Message,
         "Output_more_detailed_compiler_performance_information_after_building_6632",
@@ -14080,7 +14080,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_633,
         Category::Message,
         "Specify_one_or_more_path_or_node_module_references_to_base_configuration_files_from_which_settings_a_6633",
@@ -14089,7 +14089,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_634,
         Category::Message,
         "Specify_what_approach_the_watcher_should_use_if_the_system_runs_out_of_native_file_watchers_6634",
@@ -14098,7 +14098,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_635,
         Category::Message,
         "Include_a_list_of_files_This_does_not_support_glob_patterns_as_opposed_to_include_6635",
@@ -14107,7 +14107,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_636,
         Category::Message,
         "Build_all_projects_including_those_that_appear_to_be_up_to_date_6636",
@@ -14116,7 +14116,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_637,
         Category::Message,
         "Ensure_that_casing_is_correct_in_imports_6637",
@@ -14125,7 +14125,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_638,
         Category::Message,
         "Emit_a_v8_CPU_profile_of_the_compiler_run_for_debugging_6638",
@@ -14134,7 +14134,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_639,
         Category::Message,
         "Allow_importing_helper_functions_from_tslib_once_per_project_instead_of_including_them_per_file_6639",
@@ -14143,7 +14143,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_640,
         Category::Message,
         "Skip_building_downstream_projects_on_error_in_upstream_project_6640",
@@ -14152,7 +14152,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_641,
         Category::Message,
         "Specify_a_list_of_glob_patterns_that_match_files_to_be_included_in_compilation_6641",
@@ -14161,7 +14161,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_642,
         Category::Message,
         "Save_tsbuildinfo_files_to_allow_for_incremental_compilation_of_projects_6642",
@@ -14170,7 +14170,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_643,
         Category::Message,
         "Include_sourcemap_files_inside_the_emitted_JavaScript_6643",
@@ -14179,7 +14179,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_644,
         Category::Message,
         "Include_source_code_in_the_sourcemaps_inside_the_emitted_JavaScript_6644",
@@ -14188,7 +14188,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_645,
         Category::Message,
         "Ensure_that_each_file_can_be_safely_transpiled_without_relying_on_other_imports_6645",
@@ -14197,7 +14197,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_646,
         Category::Message,
         "Specify_what_JSX_code_is_generated_6646",
@@ -14206,7 +14206,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_647,
         Category::Message,
         "Specify_the_JSX_factory_function_used_when_targeting_React_JSX_emit_e_g_React_createElement_or_h_6647",
@@ -14215,7 +14215,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_648,
         Category::Message,
         "Specify_the_JSX_Fragment_reference_used_for_fragments_when_targeting_React_JSX_emit_e_g_React_Fragme_6648",
@@ -14224,7 +14224,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_649,
         Category::Message,
         "Specify_module_specifier_used_to_import_the_JSX_factory_functions_when_using_jsx_Colon_react_jsx_Ast_6649",
@@ -14233,7 +14233,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_650,
         Category::Message,
         "Make_keyof_only_return_strings_instead_of_string_numbers_or_symbols_Legacy_option_6650",
@@ -14242,7 +14242,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_651,
         Category::Message,
         "Specify_a_set_of_bundled_library_declaration_files_that_describe_the_target_runtime_environment_6651",
@@ -14251,7 +14251,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_652,
         Category::Message,
         "Print_the_names_of_emitted_files_after_a_compilation_6652",
@@ -14260,7 +14260,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_653,
         Category::Message,
         "Print_all_of_the_files_read_during_the_compilation_6653",
@@ -14269,7 +14269,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_654,
         Category::Message,
         "Set_the_language_of_the_messaging_from_TypeScript_This_does_not_affect_emit_6654",
@@ -14278,7 +14278,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_655,
         Category::Message,
         "Specify_the_location_where_debugger_should_locate_map_files_instead_of_generated_locations_6655",
@@ -14287,7 +14287,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_656,
         Category::Message,
         "Specify_the_maximum_folder_depth_used_for_checking_JavaScript_files_from_node_modules_Only_applicabl_6656",
@@ -14296,7 +14296,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_657,
         Category::Message,
         "Specify_what_module_code_is_generated_6657",
@@ -14305,7 +14305,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_658,
         Category::Message,
         "Specify_how_TypeScript_looks_up_a_file_from_a_given_module_specifier_6658",
@@ -14314,7 +14314,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_659,
         Category::Message,
         "Set_the_newline_character_for_emitting_files_6659",
@@ -14323,7 +14323,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_660,
         Category::Message,
         "Disable_emitting_files_from_a_compilation_6660",
@@ -14332,7 +14332,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_661,
         Category::Message,
         "Disable_generating_custom_helper_functions_like_extends_in_compiled_output_6661",
@@ -14341,7 +14341,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_662,
         Category::Message,
         "Disable_emitting_files_if_any_type_checking_errors_are_reported_6662",
@@ -14350,7 +14350,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_663,
         Category::Message,
         "Disable_truncating_types_in_error_messages_6663",
@@ -14359,7 +14359,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_664,
         Category::Message,
         "Enable_error_reporting_for_fallthrough_cases_in_switch_statements_6664",
@@ -14368,7 +14368,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_665,
         Category::Message,
         "Enable_error_reporting_for_expressions_and_declarations_with_an_implied_any_type_6665",
@@ -14377,7 +14377,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_666,
         Category::Message,
         "Ensure_overriding_members_in_derived_classes_are_marked_with_an_override_modifier_6666",
@@ -14386,7 +14386,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_667,
         Category::Message,
         "Enable_error_reporting_for_codepaths_that_do_not_explicitly_return_in_a_function_6667",
@@ -14395,7 +14395,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_668,
         Category::Message,
         "Enable_error_reporting_when_this_is_given_the_type_any_6668",
@@ -14404,7 +14404,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_669,
         Category::Message,
         "Disable_adding_use_strict_directives_in_emitted_JavaScript_files_6669",
@@ -14413,7 +14413,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_670,
         Category::Message,
         "Disable_including_any_library_files_including_the_default_lib_d_ts_6670",
@@ -14422,7 +14422,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_671,
         Category::Message,
         "Enforces_using_indexed_accessors_for_keys_declared_using_an_indexed_type_6671",
@@ -14431,7 +14431,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_672,
         Category::Message,
         "Disallow_import_s_require_s_or_reference_s_from_expanding_the_number_of_files_TypeScript_should_add__6672",
@@ -14440,7 +14440,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_673,
         Category::Message,
         "Disable_strict_checking_of_generic_signatures_in_function_types_6673",
@@ -14449,7 +14449,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_674,
         Category::Message,
         "Add_undefined_to_a_type_when_accessed_using_an_index_6674",
@@ -14458,7 +14458,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_675,
         Category::Message,
         "Enable_error_reporting_when_local_variables_aren_t_read_6675",
@@ -14467,7 +14467,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_676,
         Category::Message,
         "Raise_an_error_when_a_function_parameter_isn_t_read_6676",
@@ -14476,7 +14476,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_677,
         Category::Message,
         "Deprecated_setting_Use_outFile_instead_6677",
@@ -14485,7 +14485,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_678,
         Category::Message,
         "Specify_an_output_folder_for_all_emitted_files_6678",
@@ -14494,7 +14494,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_679,
         Category::Message,
         "Specify_a_file_that_bundles_all_outputs_into_one_JavaScript_file_If_declaration_is_true_also_designa_6679",
@@ -14503,7 +14503,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_680,
         Category::Message,
         "Specify_a_set_of_entries_that_re_map_imports_to_additional_lookup_locations_6680",
@@ -14512,7 +14512,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_681,
         Category::Message,
         "Specify_a_list_of_language_service_plugins_to_include_6681",
@@ -14521,7 +14521,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_682,
         Category::Message,
         "Disable_erasing_const_enum_declarations_in_generated_code_6682",
@@ -14530,7 +14530,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_683,
         Category::Message,
         "Disable_resolving_symlinks_to_their_realpath_This_correlates_to_the_same_flag_in_node_6683",
@@ -14539,7 +14539,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_684,
         Category::Message,
         "Disable_wiping_the_console_in_watch_mode_6684",
@@ -14548,7 +14548,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_685,
         Category::Message,
         "Enable_color_and_formatting_in_TypeScript_s_output_to_make_compiler_errors_easier_to_read_6685",
@@ -14557,7 +14557,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_686,
         Category::Message,
         "Specify_the_object_invoked_for_createElement_This_only_applies_when_targeting_react_JSX_emit_6686",
@@ -14566,7 +14566,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_687,
         Category::Message,
         "Specify_an_array_of_objects_that_specify_paths_for_projects_Used_in_project_references_6687",
@@ -14575,7 +14575,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_688,
         Category::Message,
         "Disable_emitting_comments_6688",
@@ -14584,7 +14584,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_689,
         Category::Message,
         "Enable_importing_json_files_6689",
@@ -14593,7 +14593,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_690,
         Category::Message,
         "Specify_the_root_folder_within_your_source_files_6690",
@@ -14602,7 +14602,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_691,
         Category::Message,
         "Allow_multiple_folders_to_be_treated_as_one_when_resolving_modules_6691",
@@ -14611,7 +14611,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_692,
         Category::Message,
         "Skip_type_checking_d_ts_files_that_are_included_with_TypeScript_6692",
@@ -14620,7 +14620,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_693,
         Category::Message,
         "Skip_type_checking_all_d_ts_files_6693",
@@ -14629,7 +14629,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_694,
         Category::Message,
         "Create_source_map_files_for_emitted_JavaScript_files_6694",
@@ -14638,7 +14638,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_695,
         Category::Message,
         "Specify_the_root_path_for_debuggers_to_find_the_reference_source_code_6695",
@@ -14647,7 +14647,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_697,
         Category::Message,
         "Check_that_the_arguments_for_bind_call_and_apply_methods_match_the_original_function_6697",
@@ -14656,7 +14656,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_698,
         Category::Message,
         "When_assigning_functions_check_to_ensure_parameters_and_the_return_values_are_subtype_compatible_6698",
@@ -14665,7 +14665,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_699,
         Category::Message,
         "When_type_checking_take_into_account_null_and_undefined_6699",
@@ -14674,7 +14674,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_700,
         Category::Message,
         "Check_for_class_properties_that_are_declared_but_not_set_in_the_constructor_6700",
@@ -14683,7 +14683,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_701,
         Category::Message,
         "Disable_emitting_declarations_that_have_internal_in_their_JSDoc_comments_6701",
@@ -14692,7 +14692,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_702,
         Category::Message,
         "Disable_reporting_of_excess_property_errors_during_the_creation_of_object_literals_6702",
@@ -14701,7 +14701,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_703,
         Category::Message,
         "Suppress_noImplicitAny_errors_when_indexing_objects_that_lack_index_signatures_6703",
@@ -14710,7 +14710,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_704,
         Category::Message,
         "Synchronously_call_callbacks_and_update_the_state_of_directory_watchers_on_platforms_that_don_t_supp_6704",
@@ -14719,7 +14719,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_705,
         Category::Message,
         "Set_the_JavaScript_language_version_for_emitted_JavaScript_and_include_compatible_library_declaratio_6705",
@@ -14728,7 +14728,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_706,
         Category::Message,
         "Log_paths_used_during_the_moduleResolution_process_6706",
@@ -14737,7 +14737,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_707,
         Category::Message,
         "Specify_the_path_to_tsbuildinfo_incremental_compilation_file_6707",
@@ -14746,7 +14746,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_709,
         Category::Message,
         "Specify_options_for_automatic_acquisition_of_declaration_files_6709",
@@ -14755,7 +14755,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_710,
         Category::Message,
         "Specify_multiple_folders_that_act_like_Slashnode_modules_Slash_types_6710",
@@ -14764,7 +14764,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_711,
         Category::Message,
         "Specify_type_package_names_to_be_included_without_being_referenced_in_a_source_file_6711",
@@ -14773,7 +14773,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_712,
         Category::Message,
         "Emit_ECMAScript_standard_compliant_class_fields_6712",
@@ -14782,7 +14782,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_713,
         Category::Message,
         "Enable_verbose_logging_6713",
@@ -14791,7 +14791,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_714,
         Category::Message,
         "Specify_how_directories_are_watched_on_systems_that_lack_recursive_file_watching_functionality_6714",
@@ -14800,7 +14800,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_715,
         Category::Message,
         "Specify_how_the_TypeScript_watch_mode_works_6715",
@@ -14809,7 +14809,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_717,
         Category::Message,
         "Require_undeclared_properties_from_index_signatures_to_use_element_accesses_6717",
@@ -14818,7 +14818,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_718,
         Category::Message,
         "Specify_emit_Slashchecking_behavior_for_imports_that_are_only_used_for_types_6718",
@@ -14827,7 +14827,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_719,
         Category::Message,
         "Require_sufficient_annotation_on_exports_so_other_tools_can_trivially_generate_declaration_files_6719",
@@ -14836,7 +14836,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_720,
         Category::Message,
         "Built_in_iterators_are_instantiated_with_a_TReturn_type_of_undefined_instead_of_any_6720",
@@ -14845,7 +14845,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_721,
         Category::Message,
         "Do_not_allow_runtime_constructs_that_are_not_part_of_ECMAScript_6721",
@@ -14854,7 +14854,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_803,
         Category::Message,
         "Default_catch_clause_variables_as_unknown_instead_of_any_6803",
@@ -14863,7 +14863,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_804,
         Category::Message,
         "Do_not_transform_or_elide_any_imports_or_exports_not_marked_as_type_only_ensuring_they_are_written_i_6804",
@@ -14872,7 +14872,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_805,
         Category::Message,
         "Disable_full_type_checking_only_critical_parse_and_emit_errors_will_be_reported_6805",
@@ -14881,7 +14881,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_806,
         Category::Message,
         "Check_side_effect_imports_6806",
@@ -14890,7 +14890,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_807,
         Category::Error,
         "This_operation_can_be_simplified_This_shift_is_identical_to_0_1_2_6807",
@@ -14899,7 +14899,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_808,
         Category::Message,
         "Enable_lib_replacement_6808",
@@ -14908,7 +14908,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_809,
         Category::Message,
         "Ensure_types_are_ordered_stably_and_deterministically_across_compilations_6809",
@@ -14917,7 +14917,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_900,
         Category::Message,
         "one_of_Colon_6900",
@@ -14926,7 +14926,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_901,
         Category::Message,
         "one_or_more_Colon_6901",
@@ -14935,7 +14935,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_902,
         Category::Message,
         "type_Colon_6902",
@@ -14944,7 +14944,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_903,
         Category::Message,
         "default_Colon_6903",
@@ -14953,7 +14953,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_905,
         Category::Message,
         "true_unless_strict_is_false_6905",
@@ -14962,7 +14962,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_906,
         Category::Message,
         "false_unless_composite_is_set_6906",
@@ -14971,7 +14971,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_907,
         Category::Message,
         "node_modules_bower_components_jspm_packages_plus_the_value_of_outDir_if_one_is_specified_6907",
@@ -14980,7 +14980,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_908,
         Category::Message,
         "if_files_is_specified_otherwise_Asterisk_Asterisk_Slash_Asterisk_6908",
@@ -14989,7 +14989,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_909,
         Category::Message,
         "true_if_composite_false_otherwise_6909",
@@ -14998,7 +14998,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_911,
         Category::Message,
         "Computed_from_the_list_of_input_files_6911",
@@ -15007,7 +15007,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_912,
         Category::Message,
         "Platform_specific_6912",
@@ -15016,7 +15016,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_913,
         Category::Message,
         "You_can_learn_about_all_of_the_compiler_options_at_0_6913",
@@ -15025,7 +15025,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_914,
         Category::Message,
         "Including_watch_w_will_start_watching_the_current_project_for_the_file_changes_Once_set_you_can_conf_6914",
@@ -15034,7 +15034,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_915,
         Category::Message,
         "Using_build_b_will_make_tsc_behave_more_like_a_build_orchestrator_than_a_compiler_This_is_used_to_tr_6915",
@@ -15043,7 +15043,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_916,
         Category::Message,
         "COMMON_COMMANDS_6916",
@@ -15052,7 +15052,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_917,
         Category::Message,
         "ALL_COMPILER_OPTIONS_6917",
@@ -15061,7 +15061,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_918,
         Category::Message,
         "WATCH_OPTIONS_6918",
@@ -15070,7 +15070,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_919,
         Category::Message,
         "BUILD_OPTIONS_6919",
@@ -15079,7 +15079,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_920,
         Category::Message,
         "COMMON_COMPILER_OPTIONS_6920",
@@ -15088,7 +15088,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_921,
         Category::Message,
         "COMMAND_LINE_FLAGS_6921",
@@ -15097,7 +15097,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_922,
         Category::Message,
         "tsc_Colon_The_TypeScript_Compiler_6922",
@@ -15106,7 +15106,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_923,
         Category::Message,
         "Compiles_the_current_project_tsconfig_json_in_the_working_directory_6923",
@@ -15115,7 +15115,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_924,
         Category::Message,
         "Ignoring_tsconfig_json_compiles_the_specified_files_with_default_compiler_options_6924",
@@ -15124,7 +15124,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_925,
         Category::Message,
         "Build_a_composite_project_in_the_working_directory_6925",
@@ -15133,7 +15133,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_926,
         Category::Message,
         "Creates_a_tsconfig_json_with_the_recommended_settings_in_the_working_directory_6926",
@@ -15142,7 +15142,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_927,
         Category::Message,
         "Compiles_the_TypeScript_project_located_at_the_specified_path_6927",
@@ -15151,7 +15151,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_928,
         Category::Message,
         "An_expanded_version_of_this_information_showing_all_possible_compiler_options_6928",
@@ -15160,7 +15160,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_929,
         Category::Message,
         "Compiles_the_current_project_with_additional_settings_6929",
@@ -15169,7 +15169,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_930,
         Category::Message,
         "true_for_ES2022_and_above_including_ESNext_6930",
@@ -15178,7 +15178,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_931,
         Category::Error,
         "List_of_file_name_suffixes_to_search_when_resolving_a_module_6931",
@@ -15187,7 +15187,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_932,
         Category::Message,
         "false_unless_checkJs_is_set_6932",
@@ -15196,7 +15196,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_933,
         Category::Message,
         "Do_not_print_diagnostics_6933",
@@ -15205,7 +15205,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_934,
         Category::Message,
         "Run_in_single_threaded_mode_6934",
@@ -15214,7 +15214,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_935,
         Category::Message,
         "Generate_pprof_CPU_Slashmemory_profiles_to_the_given_directory_6935",
@@ -15223,7 +15223,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_936,
         Category::Message,
         "Set_the_number_of_checkers_per_project_6936",
@@ -15232,7 +15232,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_937,
         Category::Message,
         "4_unless_singleThreaded_is_passed_6937",
@@ -15241,7 +15241,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_938,
         Category::Message,
         "Set_the_number_of_projects_to_build_concurrently_6938",
@@ -15250,7 +15250,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_939,
         Category::Message,
         "Deduplicate_packages_with_the_same_name_and_version_6939",
@@ -15259,7 +15259,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         6_940,
         Category::Message,
         "Allow_loading_external_content_mapper_plugins_that_execute_code_during_compilation_6940",
@@ -15268,7 +15268,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_005,
         Category::Error,
         "Variable_0_implicitly_has_an_1_type_7005",
@@ -15277,7 +15277,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_006,
         Category::Error,
         "Parameter_0_implicitly_has_an_1_type_7006",
@@ -15286,7 +15286,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_008,
         Category::Error,
         "Member_0_implicitly_has_an_1_type_7008",
@@ -15295,7 +15295,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_009,
         Category::Error,
         "new_expression_whose_target_lacks_a_construct_signature_implicitly_has_an_any_type_7009",
@@ -15304,7 +15304,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_010,
         Category::Error,
         "_0_which_lacks_return_type_annotation_implicitly_has_an_1_return_type_7010",
@@ -15313,7 +15313,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_011,
         Category::Error,
         "Function_expression_which_lacks_return_type_annotation_implicitly_has_an_0_return_type_7011",
@@ -15322,7 +15322,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_012,
         Category::Error,
         "This_overload_implicitly_returns_the_type_0_because_it_lacks_a_return_type_annotation_7012",
@@ -15331,7 +15331,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_013,
         Category::Error,
         "Construct_signature_which_lacks_return_type_annotation_implicitly_has_an_any_return_type_7013",
@@ -15340,7 +15340,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_014,
         Category::Error,
         "Function_type_which_lacks_return_type_annotation_implicitly_has_an_0_return_type_7014",
@@ -15349,7 +15349,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_015,
         Category::Error,
         "Element_implicitly_has_an_any_type_because_index_expression_is_not_of_type_number_7015",
@@ -15358,7 +15358,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_016,
         Category::Error,
         "Could_not_find_a_declaration_file_for_module_0_1_implicitly_has_an_any_type_7016",
@@ -15367,7 +15367,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_017,
         Category::Error,
         "Element_implicitly_has_an_any_type_because_type_0_has_no_index_signature_7017",
@@ -15376,7 +15376,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_018,
         Category::Error,
         "Object_literal_s_property_0_implicitly_has_an_1_type_7018",
@@ -15385,7 +15385,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_019,
         Category::Error,
         "Rest_parameter_0_implicitly_has_an_any_type_7019",
@@ -15394,7 +15394,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_020,
         Category::Error,
         "Call_signature_which_lacks_return_type_annotation_implicitly_has_an_any_return_type_7020",
@@ -15403,7 +15403,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_022,
         Category::Error,
         "_0_implicitly_has_type_any_because_it_does_not_have_a_type_annotation_and_is_referenced_directly_or__7022",
@@ -15412,7 +15412,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_023,
         Category::Error,
         "_0_implicitly_has_return_type_any_because_it_does_not_have_a_return_type_annotation_and_is_reference_7023",
@@ -15421,7 +15421,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_024,
         Category::Error,
         "Function_implicitly_has_return_type_any_because_it_does_not_have_a_return_type_annotation_and_is_ref_7024",
@@ -15430,7 +15430,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_025,
         Category::Error,
         "Generator_implicitly_has_yield_type_0_Consider_supplying_a_return_type_annotation_7025",
@@ -15439,7 +15439,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_026,
         Category::Error,
         "JSX_element_implicitly_has_type_any_because_no_interface_JSX_0_exists_7026",
@@ -15448,7 +15448,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_027,
         Category::Error,
         "Unreachable_code_detected_7027",
@@ -15457,7 +15457,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_028,
         Category::Error,
         "Unused_label_7028",
@@ -15466,7 +15466,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_029,
         Category::Error,
         "Fallthrough_case_in_switch_7029",
@@ -15475,7 +15475,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_030,
         Category::Error,
         "Not_all_code_paths_return_a_value_7030",
@@ -15484,7 +15484,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_031,
         Category::Error,
         "Binding_element_0_implicitly_has_an_1_type_7031",
@@ -15493,7 +15493,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_032,
         Category::Error,
         "Property_0_implicitly_has_type_any_because_its_set_accessor_lacks_a_parameter_type_annotation_7032",
@@ -15502,7 +15502,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_033,
         Category::Error,
         "Property_0_implicitly_has_type_any_because_its_get_accessor_lacks_a_return_type_annotation_7033",
@@ -15511,7 +15511,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_034,
         Category::Error,
         "Variable_0_implicitly_has_type_1_in_some_locations_where_its_type_cannot_be_determined_7034",
@@ -15520,7 +15520,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_035,
         Category::Error,
         "Try_npm_i_save_dev_types_Slash_1_if_it_exists_or_add_a_new_declaration_d_ts_file_containing_declare__7035",
@@ -15529,7 +15529,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_036,
         Category::Error,
         "Dynamic_import_s_specifier_must_be_of_type_string_but_here_has_type_0_7036",
@@ -15538,7 +15538,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_037,
         Category::Message,
         "Enables_emit_interoperability_between_CommonJS_and_ES_Modules_via_creation_of_namespace_objects_for__7037",
@@ -15547,7 +15547,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_038,
         Category::Message,
         "Type_originates_at_this_import_A_namespace_style_import_cannot_be_called_or_constructed_and_will_cau_7038",
@@ -15556,7 +15556,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_039,
         Category::Error,
         "Mapped_object_type_implicitly_has_an_any_template_type_7039",
@@ -15565,7 +15565,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_040,
         Category::Error,
         "If_the_0_package_actually_exposes_this_module_consider_sending_a_pull_request_to_amend_https_Colon_S_7040",
@@ -15574,7 +15574,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_041,
         Category::Error,
         "The_containing_arrow_function_captures_the_global_value_of_this_7041",
@@ -15583,7 +15583,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_042,
         Category::Error,
         "Module_0_was_resolved_to_1_but_resolveJsonModule_is_not_used_7042",
@@ -15592,7 +15592,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_043,
         Category::Suggestion,
         "Variable_0_implicitly_has_an_1_type_but_a_better_type_may_be_inferred_from_usage_7043",
@@ -15601,7 +15601,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_044,
         Category::Suggestion,
         "Parameter_0_implicitly_has_an_1_type_but_a_better_type_may_be_inferred_from_usage_7044",
@@ -15610,7 +15610,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_045,
         Category::Suggestion,
         "Member_0_implicitly_has_an_1_type_but_a_better_type_may_be_inferred_from_usage_7045",
@@ -15619,7 +15619,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_046,
         Category::Suggestion,
         "Variable_0_implicitly_has_type_1_in_some_locations_but_a_better_type_may_be_inferred_from_usage_7046",
@@ -15628,7 +15628,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_047,
         Category::Suggestion,
         "Rest_parameter_0_implicitly_has_an_any_type_but_a_better_type_may_be_inferred_from_usage_7047",
@@ -15637,7 +15637,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_048,
         Category::Suggestion,
         "Property_0_implicitly_has_type_any_but_a_better_type_for_its_get_accessor_may_be_inferred_from_usage_7048",
@@ -15646,7 +15646,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_049,
         Category::Suggestion,
         "Property_0_implicitly_has_type_any_but_a_better_type_for_its_set_accessor_may_be_inferred_from_usage_7049",
@@ -15655,7 +15655,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_050,
         Category::Suggestion,
         "_0_implicitly_has_an_1_return_type_but_a_better_type_may_be_inferred_from_usage_7050",
@@ -15664,7 +15664,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_051,
         Category::Error,
         "Parameter_has_a_name_but_no_type_Did_you_mean_0_Colon_1_7051",
@@ -15673,7 +15673,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_052,
         Category::Error,
         "Element_implicitly_has_an_any_type_because_type_0_has_no_index_signature_Did_you_mean_to_call_1_7052",
@@ -15682,7 +15682,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_053,
         Category::Error,
         "Element_implicitly_has_an_any_type_because_expression_of_type_0_can_t_be_used_to_index_type_1_7053",
@@ -15691,7 +15691,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_054,
         Category::Error,
         "No_index_signature_with_a_parameter_of_type_0_was_found_on_type_1_7054",
@@ -15700,7 +15700,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_055,
         Category::Error,
         "_0_which_lacks_return_type_annotation_implicitly_has_an_1_yield_type_7055",
@@ -15709,7 +15709,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_056,
         Category::Error,
         "The_inferred_type_of_this_node_exceeds_the_maximum_length_the_compiler_will_serialize_An_explicit_ty_7056",
@@ -15718,7 +15718,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_057,
         Category::Error,
         "yield_expression_implicitly_results_in_an_any_type_because_its_containing_generator_lacks_a_return_t_7057",
@@ -15727,7 +15727,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_058,
         Category::Error,
         "If_the_0_package_actually_exposes_this_module_try_adding_a_new_declaration_d_ts_file_containing_decl_7058",
@@ -15736,7 +15736,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_059,
         Category::Error,
         "This_syntax_is_reserved_in_files_with_the_mts_or_cts_extension_Use_an_as_expression_instead_7059",
@@ -15745,7 +15745,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_060,
         Category::Error,
         "This_syntax_is_reserved_in_files_with_the_mts_or_cts_extension_Add_a_trailing_comma_or_explicit_cons_7060",
@@ -15754,7 +15754,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_061,
         Category::Error,
         "A_mapped_type_may_not_declare_properties_or_methods_7061",
@@ -15763,7 +15763,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         7_080,
         Category::Error,
         "Declaration_emit_elides_private_members_but_0_refers_to_a_private_member_Write_an_explicit_type_here_7080",
@@ -15772,7 +15772,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_000,
         Category::Error,
         "You_cannot_rename_this_element_8000",
@@ -15781,7 +15781,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_001,
         Category::Error,
         "You_cannot_rename_elements_that_are_defined_in_the_standard_TypeScript_library_8001",
@@ -15790,7 +15790,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_002,
         Category::Error,
         "import_can_only_be_used_in_TypeScript_files_8002",
@@ -15799,7 +15799,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_003,
         Category::Error,
         "export_can_only_be_used_in_TypeScript_files_8003",
@@ -15808,7 +15808,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_004,
         Category::Error,
         "Type_parameter_declarations_can_only_be_used_in_TypeScript_files_8004",
@@ -15817,7 +15817,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_005,
         Category::Error,
         "implements_clauses_can_only_be_used_in_TypeScript_files_8005",
@@ -15826,7 +15826,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_006,
         Category::Error,
         "_0_declarations_can_only_be_used_in_TypeScript_files_8006",
@@ -15835,7 +15835,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_008,
         Category::Error,
         "Type_aliases_can_only_be_used_in_TypeScript_files_8008",
@@ -15844,7 +15844,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_009,
         Category::Error,
         "The_0_modifier_can_only_be_used_in_TypeScript_files_8009",
@@ -15853,7 +15853,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_010,
         Category::Error,
         "Type_annotations_can_only_be_used_in_TypeScript_files_8010",
@@ -15862,7 +15862,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_011,
         Category::Error,
         "Type_arguments_can_only_be_used_in_TypeScript_files_8011",
@@ -15871,7 +15871,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_012,
         Category::Error,
         "Parameter_modifiers_can_only_be_used_in_TypeScript_files_8012",
@@ -15880,7 +15880,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_013,
         Category::Error,
         "Non_null_assertions_can_only_be_used_in_TypeScript_files_8013",
@@ -15889,7 +15889,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_016,
         Category::Error,
         "Type_assertion_expressions_can_only_be_used_in_TypeScript_files_8016",
@@ -15898,7 +15898,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_017,
         Category::Error,
         "Signature_declarations_can_only_be_used_in_TypeScript_files_8017",
@@ -15907,7 +15907,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_019,
         Category::Message,
         "Report_errors_in_js_files_8019",
@@ -15916,7 +15916,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_020,
         Category::Error,
         "JSDoc_types_can_only_be_used_inside_documentation_comments_8020",
@@ -15925,7 +15925,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_021,
         Category::Error,
         "JSDoc_typedef_tag_should_either_have_a_type_annotation_or_be_followed_by_property_or_member_tags_8021",
@@ -15934,7 +15934,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_022,
         Category::Error,
         "JSDoc_0_is_not_attached_to_a_class_8022",
@@ -15943,7 +15943,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_023,
         Category::Error,
         "JSDoc_0_1_does_not_match_the_extends_2_clause_8023",
@@ -15952,7 +15952,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_024,
         Category::Error,
         "JSDoc_param_tag_has_name_0_but_there_is_no_parameter_with_that_name_8024",
@@ -15961,7 +15961,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_025,
         Category::Error,
         "Class_declarations_cannot_have_more_than_one_augments_or_extends_tag_8025",
@@ -15970,7 +15970,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_026,
         Category::Error,
         "Expected_0_type_arguments_provide_these_with_an_extends_tag_8026",
@@ -15979,7 +15979,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_027,
         Category::Error,
         "Expected_0_1_type_arguments_provide_these_with_an_extends_tag_8027",
@@ -15988,7 +15988,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_028,
         Category::Error,
         "JSDoc_may_only_appear_in_the_last_parameter_of_a_signature_8028",
@@ -15997,7 +15997,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_029,
         Category::Error,
         "JSDoc_param_tag_has_name_0_but_there_is_no_parameter_with_that_name_It_would_match_arguments_if_it_h_8029",
@@ -16006,7 +16006,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_030,
         Category::Error,
         "A_JSDoc_type_tag_on_a_function_must_have_a_signature_with_the_correct_number_of_arguments_8030",
@@ -16015,7 +16015,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_031,
         Category::Error,
         "You_cannot_rename_a_module_via_a_global_import_8031",
@@ -16024,7 +16024,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_032,
         Category::Error,
         "Qualified_name_0_is_not_allowed_without_a_leading_param_object_1_8032",
@@ -16033,7 +16033,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_033,
         Category::Error,
         "A_JSDoc_typedef_comment_may_not_contain_multiple_type_tags_8033",
@@ -16042,7 +16042,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_034,
         Category::Error,
         "The_tag_was_first_specified_here_8034",
@@ -16051,7 +16051,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_035,
         Category::Error,
         "You_cannot_rename_elements_that_are_defined_in_a_node_modules_folder_8035",
@@ -16060,7 +16060,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_036,
         Category::Error,
         "You_cannot_rename_elements_that_are_defined_in_another_node_modules_folder_8036",
@@ -16069,7 +16069,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_037,
         Category::Error,
         "Type_satisfaction_expressions_can_only_be_used_in_TypeScript_files_8037",
@@ -16078,7 +16078,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_038,
         Category::Error,
         "Decorators_may_not_appear_after_export_or_export_default_if_they_also_appear_before_export_8038",
@@ -16087,7 +16087,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_039,
         Category::Error,
         "A_JSDoc_template_tag_may_not_follow_a_typedef_callback_or_overload_tag_8039",
@@ -16096,7 +16096,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         8_040,
         Category::Error,
         "File_rename_is_not_supported_by_the_editor_8040",
@@ -16105,7 +16105,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_005,
         Category::Error,
         "Declaration_emit_for_this_file_requires_using_private_name_0_An_explicit_type_annotation_may_unblock_9005",
@@ -16114,7 +16114,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_006,
         Category::Error,
         "Declaration_emit_for_this_file_requires_using_private_name_0_from_module_1_An_explicit_type_annotati_9006",
@@ -16123,7 +16123,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_007,
         Category::Error,
         "Function_must_have_an_explicit_return_type_annotation_with_isolatedDeclarations_9007",
@@ -16132,7 +16132,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_008,
         Category::Error,
         "Method_must_have_an_explicit_return_type_annotation_with_isolatedDeclarations_9008",
@@ -16141,7 +16141,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_009,
         Category::Error,
         "At_least_one_accessor_must_have_an_explicit_type_annotation_with_isolatedDeclarations_9009",
@@ -16150,7 +16150,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_010,
         Category::Error,
         "Variable_must_have_an_explicit_type_annotation_with_isolatedDeclarations_9010",
@@ -16159,7 +16159,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_011,
         Category::Error,
         "Parameter_must_have_an_explicit_type_annotation_with_isolatedDeclarations_9011",
@@ -16168,7 +16168,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_012,
         Category::Error,
         "Property_must_have_an_explicit_type_annotation_with_isolatedDeclarations_9012",
@@ -16177,7 +16177,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_013,
         Category::Error,
         "Expression_type_can_t_be_inferred_with_isolatedDeclarations_9013",
@@ -16186,7 +16186,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_014,
         Category::Error,
         "Computed_properties_must_be_number_or_string_literals_variables_or_dotted_expressions_with_isolatedD_9014",
@@ -16195,7 +16195,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_015,
         Category::Error,
         "Objects_that_contain_spread_assignments_can_t_be_inferred_with_isolatedDeclarations_9015",
@@ -16204,7 +16204,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_016,
         Category::Error,
         "Objects_that_contain_shorthand_properties_can_t_be_inferred_with_isolatedDeclarations_9016",
@@ -16213,7 +16213,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_017,
         Category::Error,
         "Only_const_arrays_can_be_inferred_with_isolatedDeclarations_9017",
@@ -16222,7 +16222,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_018,
         Category::Error,
         "Arrays_with_spread_elements_can_t_inferred_with_isolatedDeclarations_9018",
@@ -16231,7 +16231,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_019,
         Category::Error,
         "Binding_elements_with_initializers_can_t_be_exported_directly_with_isolatedDeclarations_9019",
@@ -16240,7 +16240,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_020,
         Category::Error,
         "Enum_member_initializers_must_be_computable_without_references_to_external_symbols_with_isolatedDecl_9020",
@@ -16249,7 +16249,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_021,
         Category::Error,
         "Extends_clause_can_t_contain_an_expression_with_isolatedDeclarations_9021",
@@ -16258,7 +16258,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_022,
         Category::Error,
         "Inference_from_class_expressions_is_not_supported_with_isolatedDeclarations_9022",
@@ -16267,7 +16267,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_023,
         Category::Error,
         "Assigning_properties_to_functions_without_declaring_them_is_not_supported_with_isolatedDeclarations__9023",
@@ -16276,7 +16276,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_025,
         Category::Error,
         "Declaration_emit_for_this_parameter_requires_implicitly_adding_undefined_to_its_type_This_is_not_sup_9025",
@@ -16285,7 +16285,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_026,
         Category::Error,
         "Declaration_emit_for_this_file_requires_preserving_this_import_for_augmentations_This_is_not_support_9026",
@@ -16294,7 +16294,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_027,
         Category::Error,
         "Add_a_type_annotation_to_the_variable_0_9027",
@@ -16303,7 +16303,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_028,
         Category::Error,
         "Add_a_type_annotation_to_the_parameter_0_9028",
@@ -16312,7 +16312,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_029,
         Category::Error,
         "Add_a_type_annotation_to_the_property_0_9029",
@@ -16321,7 +16321,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_030,
         Category::Error,
         "Add_a_return_type_to_the_function_expression_9030",
@@ -16330,7 +16330,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_031,
         Category::Error,
         "Add_a_return_type_to_the_function_declaration_9031",
@@ -16339,7 +16339,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_032,
         Category::Error,
         "Add_a_return_type_to_the_get_accessor_declaration_9032",
@@ -16348,7 +16348,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_033,
         Category::Error,
         "Add_a_type_to_parameter_of_the_set_accessor_declaration_9033",
@@ -16357,7 +16357,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_034,
         Category::Error,
         "Add_a_return_type_to_the_method_9034",
@@ -16366,7 +16366,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_035,
         Category::Error,
         "Add_satisfies_and_a_type_assertion_to_this_expression_satisfies_T_as_T_to_make_the_type_explicit_9035",
@@ -16375,7 +16375,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_036,
         Category::Error,
         "Move_the_expression_in_default_export_to_a_variable_and_add_a_type_annotation_to_it_9036",
@@ -16384,7 +16384,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_037,
         Category::Error,
         "Default_exports_can_t_be_inferred_with_isolatedDeclarations_9037",
@@ -16393,7 +16393,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_038,
         Category::Error,
         "Computed_property_names_on_class_or_object_literals_cannot_be_inferred_with_isolatedDeclarations_9038",
@@ -16402,7 +16402,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         9_039,
         Category::Error,
         "Type_containing_private_name_0_can_t_be_used_with_isolatedDeclarations_9039",
@@ -16411,7 +16411,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_000,
         Category::Error,
         "JSX_attributes_must_only_be_assigned_a_non_empty_expression_17000",
@@ -16420,7 +16420,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_001,
         Category::Error,
         "JSX_elements_cannot_have_multiple_attributes_with_the_same_name_17001",
@@ -16429,7 +16429,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_002,
         Category::Error,
         "Expected_corresponding_JSX_closing_tag_for_0_17002",
@@ -16438,7 +16438,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_004,
         Category::Error,
         "Cannot_use_JSX_unless_the_jsx_flag_is_provided_17004",
@@ -16447,7 +16447,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_005,
         Category::Error,
         "A_constructor_cannot_contain_a_super_call_when_its_class_extends_null_17005",
@@ -16456,7 +16456,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_006,
         Category::Error,
         "An_unary_expression_with_the_0_operator_is_not_allowed_in_the_left_hand_side_of_an_exponentiation_ex_17006",
@@ -16465,7 +16465,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_007,
         Category::Error,
         "A_type_assertion_expression_is_not_allowed_in_the_left_hand_side_of_an_exponentiation_expression_Con_17007",
@@ -16474,7 +16474,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_008,
         Category::Error,
         "JSX_element_0_has_no_corresponding_closing_tag_17008",
@@ -16483,7 +16483,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_009,
         Category::Error,
         "super_must_be_called_before_accessing_this_in_the_constructor_of_a_derived_class_17009",
@@ -16492,7 +16492,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_010,
         Category::Error,
         "Unknown_type_acquisition_option_0_17010",
@@ -16501,7 +16501,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_011,
         Category::Error,
         "super_must_be_called_before_accessing_a_property_of_super_in_the_constructor_of_a_derived_class_17011",
@@ -16510,7 +16510,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_012,
         Category::Error,
         "_0_is_not_a_valid_meta_property_for_keyword_1_Did_you_mean_2_17012",
@@ -16519,7 +16519,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_013,
         Category::Error,
         "Meta_property_0_is_only_allowed_in_the_body_of_a_function_declaration_function_expression_or_constru_17013",
@@ -16528,7 +16528,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_014,
         Category::Error,
         "JSX_fragment_has_no_corresponding_closing_tag_17014",
@@ -16537,7 +16537,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_015,
         Category::Error,
         "Expected_corresponding_closing_tag_for_JSX_fragment_17015",
@@ -16546,7 +16546,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_016,
         Category::Error,
         "The_jsxFragmentFactory_compiler_option_must_be_provided_to_use_JSX_fragments_with_the_jsxFactory_com_17016",
@@ -16555,7 +16555,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_017,
         Category::Error,
         "An_jsxFrag_pragma_is_required_when_using_an_jsx_pragma_with_JSX_fragments_17017",
@@ -16564,7 +16564,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_018,
         Category::Error,
         "Unknown_type_acquisition_option_0_Did_you_mean_1_17018",
@@ -16573,7 +16573,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_019,
         Category::Error,
         "_0_at_the_end_of_a_type_is_not_valid_TypeScript_syntax_Did_you_mean_to_write_1_17019",
@@ -16582,7 +16582,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_020,
         Category::Error,
         "_0_at_the_start_of_a_type_is_not_valid_TypeScript_syntax_Did_you_mean_to_write_1_17020",
@@ -16591,7 +16591,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         17_021,
         Category::Error,
         "Unicode_escape_sequence_cannot_appear_here_17021",
@@ -16600,7 +16600,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_000,
         Category::Error,
         "Circularity_detected_while_resolving_configuration_Colon_0_18000",
@@ -16609,7 +16609,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_002,
         Category::Error,
         "The_files_list_in_config_file_0_is_empty_18002",
@@ -16618,7 +16618,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_003,
         Category::Error,
         "No_inputs_were_found_in_config_file_0_Specified_include_paths_were_1_and_exclude_paths_were_2_18003",
@@ -16627,7 +16627,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_004,
         Category::Error,
         "No_value_exists_in_scope_for_the_shorthand_property_0_Either_declare_one_or_provide_an_initializer_18004",
@@ -16636,7 +16636,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_006,
         Category::Error,
         "Classes_may_not_have_a_field_named_constructor_18006",
@@ -16645,7 +16645,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_007,
         Category::Error,
         "JSX_expressions_may_not_use_the_comma_operator_Did_you_mean_to_write_an_array_18007",
@@ -16654,7 +16654,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_009,
         Category::Error,
         "Private_identifiers_cannot_be_used_as_parameters_18009",
@@ -16663,7 +16663,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_010,
         Category::Error,
         "An_accessibility_modifier_cannot_be_used_with_a_private_identifier_18010",
@@ -16672,7 +16672,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_011,
         Category::Error,
         "The_operand_of_a_delete_operator_cannot_be_a_private_identifier_18011",
@@ -16681,7 +16681,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_012,
         Category::Error,
         "constructor_is_a_reserved_word_18012",
@@ -16690,7 +16690,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_013,
         Category::Error,
         "Property_0_is_not_accessible_outside_class_1_because_it_has_a_private_identifier_18013",
@@ -16699,7 +16699,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_014,
         Category::Error,
         "The_property_0_cannot_be_accessed_on_type_1_within_this_class_because_it_is_shadowed_by_another_priv_18014",
@@ -16708,7 +16708,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_015,
         Category::Error,
         "Property_0_in_type_1_refers_to_a_different_member_that_cannot_be_accessed_from_within_type_2_18015",
@@ -16717,7 +16717,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_016,
         Category::Error,
         "Private_identifiers_are_not_allowed_outside_class_bodies_18016",
@@ -16726,7 +16726,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_017,
         Category::Error,
         "The_shadowing_declaration_of_0_is_defined_here_18017",
@@ -16735,7 +16735,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_018,
         Category::Error,
         "The_declaration_of_0_that_you_probably_intended_to_use_is_defined_here_18018",
@@ -16744,7 +16744,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_019,
         Category::Error,
         "_0_modifier_cannot_be_used_with_a_private_identifier_18019",
@@ -16753,7 +16753,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_024,
         Category::Error,
         "An_enum_member_cannot_be_named_with_a_private_identifier_18024",
@@ -16762,7 +16762,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_026,
         Category::Error,
         "can_only_be_used_at_the_start_of_a_file_18026",
@@ -16771,7 +16771,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_027,
         Category::Error,
         "Compiler_reserves_name_0_when_emitting_private_identifier_downlevel_18027",
@@ -16780,7 +16780,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_028,
         Category::Error,
         "Private_identifiers_are_only_available_when_targeting_ECMAScript_2015_and_higher_18028",
@@ -16789,7 +16789,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_029,
         Category::Error,
         "Private_identifiers_are_not_allowed_in_variable_declarations_18029",
@@ -16798,7 +16798,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_030,
         Category::Error,
         "An_optional_chain_cannot_contain_private_identifiers_18030",
@@ -16807,7 +16807,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_031,
         Category::Error,
         "The_intersection_0_was_reduced_to_never_because_property_1_has_conflicting_types_in_some_constituent_18031",
@@ -16816,7 +16816,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_032,
         Category::Error,
         "The_intersection_0_was_reduced_to_never_because_property_1_exists_in_multiple_constituents_and_is_pr_18032",
@@ -16825,7 +16825,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_033,
         Category::Error,
         "Type_0_is_not_assignable_to_type_1_as_required_for_computed_enum_member_values_18033",
@@ -16834,7 +16834,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_034,
         Category::Message,
         "Specify_the_JSX_fragment_factory_function_to_use_when_targeting_react_JSX_emit_with_jsxFactory_compi_18034",
@@ -16843,7 +16843,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_035,
         Category::Error,
         "Invalid_value_for_jsxFragmentFactory_0_is_not_a_valid_identifier_or_qualified_name_18035",
@@ -16852,7 +16852,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_036,
         Category::Error,
         "Class_decorators_can_t_be_used_with_static_private_identifier_Consider_removing_the_experimental_dec_18036",
@@ -16861,7 +16861,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_037,
         Category::Error,
         "await_expression_cannot_be_used_inside_a_class_static_block_18037",
@@ -16870,7 +16870,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_038,
         Category::Error,
         "for_await_loops_cannot_be_used_inside_a_class_static_block_18038",
@@ -16879,7 +16879,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_039,
         Category::Error,
         "Invalid_use_of_0_It_cannot_be_used_inside_a_class_static_block_18039",
@@ -16888,7 +16888,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_041,
         Category::Error,
         "A_return_statement_cannot_be_used_inside_a_class_static_block_18041",
@@ -16897,7 +16897,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_042,
         Category::Error,
         "_0_is_a_type_and_cannot_be_imported_in_JavaScript_files_Use_1_in_a_JSDoc_type_annotation_18042",
@@ -16906,7 +16906,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_043,
         Category::Error,
         "Types_cannot_appear_in_export_declarations_in_JavaScript_files_18043",
@@ -16915,7 +16915,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_044,
         Category::Message,
         "_0_is_automatically_exported_here_18044",
@@ -16924,7 +16924,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_045,
         Category::Error,
         "Properties_with_the_accessor_modifier_are_only_available_when_targeting_ECMAScript_2015_and_higher_18045",
@@ -16933,7 +16933,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_046,
         Category::Error,
         "_0_is_of_type_unknown_18046",
@@ -16942,7 +16942,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_047,
         Category::Error,
         "_0_is_possibly_null_18047",
@@ -16951,7 +16951,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_048,
         Category::Error,
         "_0_is_possibly_undefined_18048",
@@ -16960,7 +16960,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_049,
         Category::Error,
         "_0_is_possibly_null_or_undefined_18049",
@@ -16969,7 +16969,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_050,
         Category::Error,
         "The_value_0_cannot_be_used_here_18050",
@@ -16978,7 +16978,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_051,
         Category::Error,
         "Compiler_option_0_cannot_be_given_an_empty_string_18051",
@@ -16987,7 +16987,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_053,
         Category::Error,
         "Its_type_0_is_not_a_valid_JSX_element_type_18053",
@@ -16996,7 +16996,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_054,
         Category::Error,
         "await_using_statements_cannot_be_used_inside_a_class_static_block_18054",
@@ -17005,7 +17005,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_055,
         Category::Error,
         "_0_has_a_string_type_but_must_have_syntactically_recognizable_string_syntax_when_isolatedModules_is__18055",
@@ -17014,7 +17014,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_056,
         Category::Error,
         "Enum_member_following_a_non_literal_numeric_member_must_have_an_initializer_when_isolatedModules_is__18056",
@@ -17023,7 +17023,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_057,
         Category::Error,
         "String_literal_import_and_export_names_are_not_supported_when_the_module_flag_is_set_to_es2015_or_es_18057",
@@ -17032,7 +17032,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_058,
         Category::Error,
         "Default_imports_are_not_allowed_in_a_deferred_import_18058",
@@ -17041,7 +17041,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_059,
         Category::Error,
         "Named_imports_are_not_allowed_in_a_deferred_import_18059",
@@ -17050,7 +17050,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_060,
         Category::Error,
         "Deferred_imports_are_only_supported_when_the_module_flag_is_set_to_esnext_or_preserve_18060",
@@ -17059,7 +17059,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_061,
         Category::Error,
         "_0_is_not_a_valid_meta_property_for_keyword_import_Did_you_mean_meta_or_defer_18061",
@@ -17068,7 +17068,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_062,
         Category::Error,
         "Regular_expression_pattern_modifiers_are_only_available_when_targeting_0_or_later_18062",
@@ -17077,7 +17077,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_063,
         Category::Error,
         "Duplicate_named_capturing_groups_are_only_available_when_targeting_0_or_later_18063",
@@ -17086,7 +17086,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_064,
         Category::Error,
         "Private_identifiers_cannot_be_used_in_destructuring_patterns_18064",
@@ -17095,7 +17095,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_065,
         Category::Error,
         "Content_mapper_file_extension_0_must_begin_with_a_18065",
@@ -17104,7 +17104,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_066,
         Category::Error,
         "Content_mapper_file_extension_0_is_a_built_in_extension_and_cannot_be_registered_by_a_content_mapper_18066",
@@ -17113,7 +17113,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_067,
         Category::Error,
         "Content_mapper_file_extension_0_is_registered_by_more_than_one_content_mapper_18067",
@@ -17122,7 +17122,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_068,
         Category::Error,
         "Content_mappers_require_the_runExternalCode_command_line_flag_to_be_enabled_18068",
@@ -17131,7 +17131,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_069,
         Category::Error,
         "The_content_mapper_0_failed_to_transform_this_file_18069",
@@ -17140,7 +17140,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_070,
         Category::Error,
         "The_content_mapper_0_failed_1_times_and_will_not_be_used_18070",
@@ -17149,7 +17149,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_071,
         Category::Error,
         "The_content_mapper_0_did_not_provide_the_required_position_mappings_18071",
@@ -17158,7 +17158,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_072,
         Category::Error,
         "The_content_mapper_0_produced_a_position_mapping_that_points_outside_the_original_content_original_o_18072",
@@ -17167,7 +17167,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_073,
         Category::Error,
         "The_content_mapper_0_produced_a_verbatim_mapping_that_does_not_match_the_original_content_virtual_of_18073",
@@ -17176,7 +17176,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_074,
         Category::Message,
         "This_location_is_in_virtual_code_produced_by_the_content_mapper_0_and_has_no_corresponding_location__18074",
@@ -17185,7 +17185,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_075,
         Category::Error,
         "The_content_mapper_package_0_could_not_be_resolved_18075",
@@ -17194,7 +17194,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_076,
         Category::Error,
         "The_package_json_of_the_content_mapper_package_0_could_not_be_parsed_18076",
@@ -17203,7 +17203,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_077,
         Category::Error,
         "The_package_json_of_the_content_mapper_package_0_does_not_specify_a_name_18077",
@@ -17212,7 +17212,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_078,
         Category::Error,
         "The_package_json_of_the_content_mapper_package_0_does_not_declare_a_typescript_contentMapper_object_18078",
@@ -17221,7 +17221,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_079,
         Category::Error,
         "The_typescript_contentMapper_exec_of_the_content_mapper_package_0_must_be_a_non_empty_array_of_strin_18079",
@@ -17230,7 +17230,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_080,
         Category::Error,
         "Virtual_code_produced_by_the_content_mapper_0_has_problems_with_no_corresponding_location_in_this_fi_18080",
@@ -17239,7 +17239,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_081,
         Category::Error,
         "The_content_mapper_0_produced_overlapping_or_out_of_order_position_mappings_near_virtual_offset_1_18081",
@@ -17248,7 +17248,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_082,
         Category::Error,
         "The_content_mapper_0_produced_invalid_mapping_features_near_original_offset_1_18082",
@@ -17257,7 +17257,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_083,
         Category::Error,
         "The_content_mapper_0_produced_a_position_mapping_with_an_invalid_kind_near_virtual_offset_1_18083",
@@ -17266,7 +17266,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_084,
         Category::Message,
         "The_content_mapper_process_could_not_be_started_or_initialized_18084",
@@ -17275,7 +17275,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_085,
         Category::Message,
         "The_content_mapper_process_failed_while_handling_the_transform_request_18085",
@@ -17284,7 +17284,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_086,
         Category::Message,
         "The_content_mapper_returned_an_invalid_transform_response_18086",
@@ -17293,7 +17293,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_087,
         Category::Message,
         "The_content_mapper_selected_unsupported_position_encoding_0_18087",
@@ -17302,7 +17302,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_088,
         Category::Message,
         "The_content_mapper_diagnostic_source_must_not_be_empty_18088",
@@ -17311,7 +17311,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_089,
         Category::Message,
         "The_content_mapper_diagnostic_source_0_is_reserved_by_TypeScript_18089",
@@ -17320,7 +17320,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_090,
         Category::Message,
         "The_content_mapper_returned_a_project_response_that_could_not_be_decoded_18090",
@@ -17329,7 +17329,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_091,
         Category::Message,
         "The_content_mapper_process_failed_while_handling_the_project_request_18091",
@@ -17338,7 +17338,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_092,
         Category::Message,
         "The_content_mapper_did_not_return_configIdentity_which_is_required_when_the_content_mapper_has_dynam_18092",
@@ -17347,7 +17347,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_093,
         Category::Message,
         "The_content_mapper_returned_a_non_absolute_path_in_watchedFiles_18093",
@@ -17356,7 +17356,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_094,
         Category::Message,
         "The_content_mapper_returned_configIdentity_which_is_only_allowed_when_it_declares_dynamicConfig_Colo_18094",
@@ -17365,7 +17365,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_095,
         Category::Message,
         "The_content_mapper_returned_watchedFiles_which_is_only_allowed_when_it_declares_dynamicConfig_Colon__18095",
@@ -17374,7 +17374,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_096,
         Category::Message,
         "Content_mapper_supplemental_output_file_0_conflicts_with_an_existing_file_18096",
@@ -17383,7 +17383,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_097,
         Category::Message,
         "Supplemental_virtual_file_produced_by_the_content_mapper_for_file_0_18097",
@@ -17392,7 +17392,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_098,
         Category::Message,
         "The_content_mapper_returned_an_output_with_unsupported_virtual_extension_0_18098",
@@ -17401,7 +17401,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_099,
         Category::Error,
         "The_content_mapper_0_could_not_be_initialized_18099",
@@ -17410,7 +17410,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_100,
         Category::Message,
         "The_content_mapper_command_0_could_not_be_started_Colon_1_18100",
@@ -17419,7 +17419,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_101,
         Category::Message,
         "The_content_mapper_process_exited_before_responding_to_the_initialize_request_exit_code_0_18101",
@@ -17428,7 +17428,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_102,
         Category::Message,
         "The_content_mapper_did_not_respond_to_the_initialize_request_within_0_seconds_18102",
@@ -17437,7 +17437,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_103,
         Category::Message,
         "The_content_mapper_returned_an_initialize_response_that_could_not_be_decoded_Colon_0_18103",
@@ -17446,7 +17446,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_104,
         Category::Message,
         "The_content_mapper_s_initialize_request_failed_Colon_0_18104",
@@ -17455,7 +17455,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_105,
         Category::Message,
         "Diagnostic_directive_0_returned_by_the_content_mapper_has_an_invalid_range_18105",
@@ -17464,7 +17464,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_106,
         Category::Message,
         "The_content_mapper_returned_a_diagnostic_directive_with_invalid_policy_0_18106",
@@ -17473,7 +17473,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_107,
         Category::Message,
         "Diagnostic_directive_0_returned_by_the_content_mapper_must_specify_unusedExpectDirectiveIndex_when_t_18107",
@@ -17482,7 +17482,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_108,
         Category::Message,
         "The_content_mapper_returned_diagnostic_directives_with_overlapping_virtual_ranges_18108",
@@ -17491,7 +17491,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_109,
         Category::Message,
         "The_invalid_diagnostic_directive_is_in_supplemental_output_0_returned_by_the_content_mapper_18109",
@@ -17500,7 +17500,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         18_110,
         Category::Message,
         "Diagnostic_directive_0_returned_by_the_content_mapper_has_an_invalid_unusedExpectDirectiveIndex_18110",
@@ -17509,7 +17509,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         69_010,
         Category::Message,
         "nodenext_if_module_is_nodenext_node16_if_module_is_node16_or_node18_otherwise_bundler_69010",
@@ -17518,7 +17518,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         80_001,
         Category::Suggestion,
         "File_is_a_CommonJS_module_it_may_be_converted_to_an_ES_module_80001",
@@ -17527,7 +17527,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         80_002,
         Category::Suggestion,
         "This_constructor_function_may_be_converted_to_a_class_declaration_80002",
@@ -17536,7 +17536,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         80_003,
         Category::Suggestion,
         "Import_may_be_converted_to_a_default_import_80003",
@@ -17545,7 +17545,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         80_004,
         Category::Suggestion,
         "JSDoc_types_may_be_moved_to_TypeScript_types_80004",
@@ -17554,7 +17554,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         80_005,
         Category::Suggestion,
         "require_call_may_be_converted_to_an_import_80005",
@@ -17563,7 +17563,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         80_006,
         Category::Suggestion,
         "This_may_be_converted_to_an_async_function_80006",
@@ -17572,7 +17572,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         80_007,
         Category::Suggestion,
         "await_has_no_effect_on_the_type_of_this_expression_80007",
@@ -17581,7 +17581,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         80_008,
         Category::Suggestion,
         "Numeric_literals_with_absolute_values_equal_to_2_53_or_greater_are_too_large_to_be_represented_accur_80008",
@@ -17590,7 +17590,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         80_009,
         Category::Suggestion,
         "JSDoc_typedef_may_be_converted_to_TypeScript_type_80009",
@@ -17599,7 +17599,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         80_010,
         Category::Suggestion,
         "JSDoc_typedefs_may_be_converted_to_TypeScript_types_80010",
@@ -17608,7 +17608,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_001,
         Category::Message,
         "Add_missing_super_call_90001",
@@ -17617,7 +17617,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_002,
         Category::Message,
         "Make_super_call_the_first_statement_in_the_constructor_90002",
@@ -17626,7 +17626,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_003,
         Category::Message,
         "Change_extends_to_implements_90003",
@@ -17635,7 +17635,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_004,
         Category::Message,
         "Remove_unused_declaration_for_Colon_0_90004",
@@ -17644,7 +17644,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_005,
         Category::Message,
         "Remove_import_from_0_90005",
@@ -17653,7 +17653,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_006,
         Category::Message,
         "Implement_interface_0_90006",
@@ -17662,7 +17662,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_007,
         Category::Message,
         "Implement_inherited_abstract_class_90007",
@@ -17671,7 +17671,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_008,
         Category::Message,
         "Add_0_to_unresolved_variable_90008",
@@ -17680,7 +17680,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_010,
         Category::Message,
         "Remove_variable_statement_90010",
@@ -17689,7 +17689,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_011,
         Category::Message,
         "Remove_template_tag_90011",
@@ -17698,7 +17698,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_012,
         Category::Message,
         "Remove_type_parameters_90012",
@@ -17707,7 +17707,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_013,
         Category::Message,
         "Import_0_from_1_90013",
@@ -17716,7 +17716,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_014,
         Category::Message,
         "Change_0_to_1_90014",
@@ -17725,7 +17725,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_016,
         Category::Message,
         "Declare_property_0_90016",
@@ -17734,7 +17734,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_017,
         Category::Message,
         "Add_index_signature_for_property_0_90017",
@@ -17743,7 +17743,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_018,
         Category::Message,
         "Disable_checking_for_this_file_90018",
@@ -17752,7 +17752,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_019,
         Category::Message,
         "Ignore_this_error_message_90019",
@@ -17761,7 +17761,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_020,
         Category::Message,
         "Initialize_property_0_in_the_constructor_90020",
@@ -17770,7 +17770,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_021,
         Category::Message,
         "Initialize_static_property_0_90021",
@@ -17779,7 +17779,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_022,
         Category::Message,
         "Change_spelling_to_0_90022",
@@ -17788,7 +17788,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_023,
         Category::Message,
         "Declare_method_0_90023",
@@ -17797,7 +17797,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_024,
         Category::Message,
         "Declare_static_method_0_90024",
@@ -17806,7 +17806,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_025,
         Category::Message,
         "Prefix_0_with_an_underscore_90025",
@@ -17815,7 +17815,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_026,
         Category::Message,
         "Rewrite_as_the_indexed_access_type_0_90026",
@@ -17824,7 +17824,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_027,
         Category::Message,
         "Declare_static_property_0_90027",
@@ -17833,7 +17833,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_028,
         Category::Message,
         "Call_decorator_expression_90028",
@@ -17842,7 +17842,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_029,
         Category::Message,
         "Add_async_modifier_to_containing_function_90029",
@@ -17851,7 +17851,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_030,
         Category::Message,
         "Replace_infer_0_with_unknown_90030",
@@ -17860,7 +17860,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_031,
         Category::Message,
         "Replace_all_unused_infer_with_unknown_90031",
@@ -17869,7 +17869,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_034,
         Category::Message,
         "Add_parameter_name_90034",
@@ -17878,7 +17878,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_035,
         Category::Message,
         "Declare_private_property_0_90035",
@@ -17887,7 +17887,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_036,
         Category::Message,
         "Replace_0_with_Promise_1_90036",
@@ -17896,7 +17896,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_037,
         Category::Message,
         "Fix_all_incorrect_return_type_of_an_async_functions_90037",
@@ -17905,7 +17905,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_038,
         Category::Message,
         "Declare_private_method_0_90038",
@@ -17914,7 +17914,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_039,
         Category::Message,
         "Remove_unused_destructuring_declaration_90039",
@@ -17923,7 +17923,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_041,
         Category::Message,
         "Remove_unused_declarations_for_Colon_0_90041",
@@ -17932,7 +17932,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_053,
         Category::Message,
         "Declare_a_private_field_named_0_90053",
@@ -17941,7 +17941,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_054,
         Category::Message,
         "Includes_imports_of_types_referenced_by_0_90054",
@@ -17950,7 +17950,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_055,
         Category::Message,
         "Remove_type_from_import_declaration_from_0_90055",
@@ -17959,7 +17959,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_056,
         Category::Message,
         "Remove_type_from_import_of_0_from_1_90056",
@@ -17968,7 +17968,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_057,
         Category::Message,
         "Add_import_from_0_90057",
@@ -17977,7 +17977,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_058,
         Category::Message,
         "Update_import_from_0_90058",
@@ -17986,7 +17986,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_059,
         Category::Message,
         "Export_0_from_module_1_90059",
@@ -17995,7 +17995,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_060,
         Category::Message,
         "Export_all_referenced_locals_90060",
@@ -18004,7 +18004,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_061,
         Category::Message,
         "Update_modifiers_of_0_90061",
@@ -18013,7 +18013,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_062,
         Category::Message,
         "Add_annotation_of_type_0_90062",
@@ -18022,7 +18022,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_063,
         Category::Message,
         "Add_return_type_0_90063",
@@ -18031,7 +18031,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_064,
         Category::Message,
         "Extract_base_class_to_variable_90064",
@@ -18040,7 +18040,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_065,
         Category::Message,
         "Extract_default_export_to_variable_90065",
@@ -18049,7 +18049,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_066,
         Category::Message,
         "Extract_binding_expressions_to_variable_90066",
@@ -18058,7 +18058,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_067,
         Category::Message,
         "Add_all_missing_type_annotations_90067",
@@ -18067,7 +18067,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_068,
         Category::Message,
         "Add_satisfies_and_an_inline_type_assertion_with_0_90068",
@@ -18076,7 +18076,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_069,
         Category::Message,
         "Extract_to_variable_and_replace_with_0_as_typeof_0_90069",
@@ -18085,7 +18085,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_070,
         Category::Message,
         "Mark_array_literal_as_const_90070",
@@ -18094,7 +18094,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         90_071,
         Category::Message,
         "Annotate_types_of_properties_expando_function_in_a_namespace_90071",
@@ -18103,7 +18103,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_001,
         Category::Message,
         "Convert_function_to_an_ES2015_class_95001",
@@ -18112,7 +18112,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_003,
         Category::Message,
         "Convert_0_to_1_in_0_95003",
@@ -18121,7 +18121,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_004,
         Category::Message,
         "Extract_to_0_in_1_95004",
@@ -18130,7 +18130,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_005,
         Category::Message,
         "Extract_function_95005",
@@ -18139,7 +18139,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_006,
         Category::Message,
         "Extract_constant_95006",
@@ -18148,7 +18148,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_007,
         Category::Message,
         "Extract_to_0_in_enclosing_scope_95007",
@@ -18157,7 +18157,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_008,
         Category::Message,
         "Extract_to_0_in_1_scope_95008",
@@ -18166,7 +18166,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_009,
         Category::Message,
         "Annotate_with_type_from_JSDoc_95009",
@@ -18175,7 +18175,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_011,
         Category::Message,
         "Infer_type_of_0_from_usage_95011",
@@ -18184,7 +18184,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_012,
         Category::Message,
         "Infer_parameter_types_from_usage_95012",
@@ -18193,7 +18193,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_013,
         Category::Message,
         "Convert_to_default_import_95013",
@@ -18202,7 +18202,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_014,
         Category::Message,
         "Install_0_95014",
@@ -18211,7 +18211,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_015,
         Category::Message,
         "Replace_import_with_0_95015",
@@ -18220,7 +18220,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_016,
         Category::Message,
         "Use_synthetic_default_member_95016",
@@ -18229,7 +18229,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_017,
         Category::Message,
         "Convert_to_ES_module_95017",
@@ -18238,7 +18238,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_018,
         Category::Message,
         "Add_undefined_type_to_property_0_95018",
@@ -18247,7 +18247,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_019,
         Category::Message,
         "Add_initializer_to_property_0_95019",
@@ -18256,7 +18256,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_020,
         Category::Message,
         "Add_definite_assignment_assertion_to_property_0_95020",
@@ -18265,7 +18265,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_021,
         Category::Message,
         "Convert_all_type_literals_to_mapped_type_95021",
@@ -18274,7 +18274,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_022,
         Category::Message,
         "Add_all_missing_members_95022",
@@ -18283,7 +18283,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_023,
         Category::Message,
         "Infer_all_types_from_usage_95023",
@@ -18292,7 +18292,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_024,
         Category::Message,
         "Delete_all_unused_declarations_95024",
@@ -18301,7 +18301,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_025,
         Category::Message,
         "Prefix_all_unused_declarations_with_where_possible_95025",
@@ -18310,7 +18310,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_026,
         Category::Message,
         "Fix_all_detected_spelling_errors_95026",
@@ -18319,7 +18319,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_027,
         Category::Message,
         "Add_initializers_to_all_uninitialized_properties_95027",
@@ -18328,7 +18328,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_028,
         Category::Message,
         "Add_definite_assignment_assertions_to_all_uninitialized_properties_95028",
@@ -18337,7 +18337,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_029,
         Category::Message,
         "Add_undefined_type_to_all_uninitialized_properties_95029",
@@ -18346,7 +18346,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_030,
         Category::Message,
         "Change_all_jsdoc_style_types_to_TypeScript_95030",
@@ -18355,7 +18355,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_031,
         Category::Message,
         "Change_all_jsdoc_style_types_to_TypeScript_and_add_undefined_to_nullable_types_95031",
@@ -18364,7 +18364,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_032,
         Category::Message,
         "Implement_all_unimplemented_interfaces_95032",
@@ -18373,7 +18373,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_033,
         Category::Message,
         "Install_all_missing_types_packages_95033",
@@ -18382,7 +18382,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_034,
         Category::Message,
         "Rewrite_all_as_indexed_access_types_95034",
@@ -18391,7 +18391,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_035,
         Category::Message,
         "Convert_all_to_default_imports_95035",
@@ -18400,7 +18400,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_036,
         Category::Message,
         "Make_all_super_calls_the_first_statement_in_their_constructor_95036",
@@ -18409,7 +18409,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_037,
         Category::Message,
         "Add_qualifier_to_all_unresolved_variables_matching_a_member_name_95037",
@@ -18418,7 +18418,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_038,
         Category::Message,
         "Change_all_extended_interfaces_to_implements_95038",
@@ -18427,7 +18427,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_039,
         Category::Message,
         "Add_all_missing_super_calls_95039",
@@ -18436,7 +18436,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_040,
         Category::Message,
         "Implement_all_inherited_abstract_classes_95040",
@@ -18445,7 +18445,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_041,
         Category::Message,
         "Add_all_missing_async_modifiers_95041",
@@ -18454,7 +18454,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_042,
         Category::Message,
         "Add_ts_ignore_to_all_error_messages_95042",
@@ -18463,7 +18463,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_043,
         Category::Message,
         "Annotate_everything_with_types_from_JSDoc_95043",
@@ -18472,7 +18472,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_044,
         Category::Message,
         "Add_to_all_uncalled_decorators_95044",
@@ -18481,7 +18481,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_045,
         Category::Message,
         "Convert_all_constructor_functions_to_classes_95045",
@@ -18490,7 +18490,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_046,
         Category::Message,
         "Generate_get_and_set_accessors_95046",
@@ -18499,7 +18499,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_047,
         Category::Message,
         "Convert_require_to_import_95047",
@@ -18508,7 +18508,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_048,
         Category::Message,
         "Convert_all_require_to_import_95048",
@@ -18517,7 +18517,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_049,
         Category::Message,
         "Move_to_a_new_file_95049",
@@ -18526,7 +18526,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_050,
         Category::Message,
         "Remove_unreachable_code_95050",
@@ -18535,7 +18535,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_051,
         Category::Message,
         "Remove_all_unreachable_code_95051",
@@ -18544,7 +18544,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_052,
         Category::Message,
         "Add_missing_typeof_95052",
@@ -18553,7 +18553,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_053,
         Category::Message,
         "Remove_unused_label_95053",
@@ -18562,7 +18562,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_054,
         Category::Message,
         "Remove_all_unused_labels_95054",
@@ -18571,7 +18571,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_055,
         Category::Message,
         "Convert_0_to_mapped_object_type_95055",
@@ -18580,7 +18580,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_056,
         Category::Message,
         "Convert_namespace_import_to_named_imports_95056",
@@ -18589,7 +18589,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_057,
         Category::Message,
         "Convert_named_imports_to_namespace_import_95057",
@@ -18598,7 +18598,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_058,
         Category::Message,
         "Add_or_remove_braces_in_an_arrow_function_95058",
@@ -18607,7 +18607,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_059,
         Category::Message,
         "Add_braces_to_arrow_function_95059",
@@ -18616,7 +18616,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_060,
         Category::Message,
         "Remove_braces_from_arrow_function_95060",
@@ -18625,7 +18625,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_061,
         Category::Message,
         "Convert_default_export_to_named_export_95061",
@@ -18634,7 +18634,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_062,
         Category::Message,
         "Convert_named_export_to_default_export_95062",
@@ -18643,7 +18643,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_063,
         Category::Message,
         "Add_missing_enum_member_0_95063",
@@ -18652,7 +18652,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_064,
         Category::Message,
         "Add_all_missing_imports_95064",
@@ -18661,7 +18661,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_065,
         Category::Message,
         "Convert_to_async_function_95065",
@@ -18670,7 +18670,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_066,
         Category::Message,
         "Convert_all_to_async_functions_95066",
@@ -18679,7 +18679,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_067,
         Category::Message,
         "Add_missing_call_parentheses_95067",
@@ -18688,7 +18688,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_068,
         Category::Message,
         "Add_all_missing_call_parentheses_95068",
@@ -18697,7 +18697,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_069,
         Category::Message,
         "Add_unknown_conversion_for_non_overlapping_types_95069",
@@ -18706,7 +18706,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_070,
         Category::Message,
         "Add_unknown_to_all_conversions_of_non_overlapping_types_95070",
@@ -18715,7 +18715,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_071,
         Category::Message,
         "Add_missing_new_operator_to_call_95071",
@@ -18724,7 +18724,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_072,
         Category::Message,
         "Add_missing_new_operator_to_all_calls_95072",
@@ -18733,7 +18733,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_073,
         Category::Message,
         "Add_names_to_all_parameters_without_names_95073",
@@ -18742,7 +18742,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_074,
         Category::Message,
         "Enable_the_experimentalDecorators_option_in_your_configuration_file_95074",
@@ -18751,7 +18751,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_075,
         Category::Message,
         "Convert_parameters_to_destructured_object_95075",
@@ -18760,7 +18760,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_077,
         Category::Message,
         "Extract_type_95077",
@@ -18769,7 +18769,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_078,
         Category::Message,
         "Extract_to_type_alias_95078",
@@ -18778,7 +18778,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_079,
         Category::Message,
         "Extract_to_typedef_95079",
@@ -18787,7 +18787,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_080,
         Category::Message,
         "Infer_this_type_of_0_from_usage_95080",
@@ -18796,7 +18796,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_081,
         Category::Message,
         "Add_const_to_unresolved_variable_95081",
@@ -18805,7 +18805,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_082,
         Category::Message,
         "Add_const_to_all_unresolved_variables_95082",
@@ -18814,7 +18814,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_083,
         Category::Message,
         "Add_await_95083",
@@ -18823,7 +18823,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_084,
         Category::Message,
         "Add_await_to_initializer_for_0_95084",
@@ -18832,7 +18832,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_085,
         Category::Message,
         "Fix_all_expressions_possibly_missing_await_95085",
@@ -18841,7 +18841,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_086,
         Category::Message,
         "Remove_unnecessary_await_95086",
@@ -18850,7 +18850,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_087,
         Category::Message,
         "Remove_all_unnecessary_uses_of_await_95087",
@@ -18859,7 +18859,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_088,
         Category::Message,
         "Enable_the_jsx_flag_in_your_configuration_file_95088",
@@ -18868,7 +18868,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_089,
         Category::Message,
         "Add_await_to_initializers_95089",
@@ -18877,7 +18877,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_090,
         Category::Message,
         "Extract_to_interface_95090",
@@ -18886,7 +18886,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_091,
         Category::Message,
         "Convert_to_a_bigint_numeric_literal_95091",
@@ -18895,7 +18895,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_092,
         Category::Message,
         "Convert_all_to_bigint_numeric_literals_95092",
@@ -18904,7 +18904,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_093,
         Category::Message,
         "Convert_const_to_let_95093",
@@ -18913,7 +18913,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_094,
         Category::Message,
         "Prefix_with_declare_95094",
@@ -18922,7 +18922,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_095,
         Category::Message,
         "Prefix_all_incorrect_property_declarations_with_declare_95095",
@@ -18931,7 +18931,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_096,
         Category::Message,
         "Convert_to_template_string_95096",
@@ -18940,7 +18940,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_097,
         Category::Message,
         "Add_export_to_make_this_file_into_a_module_95097",
@@ -18949,7 +18949,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_098,
         Category::Message,
         "Set_the_target_option_in_your_configuration_file_to_0_95098",
@@ -18958,7 +18958,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_099,
         Category::Message,
         "Set_the_module_option_in_your_configuration_file_to_0_95099",
@@ -18967,7 +18967,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_100,
         Category::Message,
         "Convert_invalid_character_to_its_html_entity_code_95100",
@@ -18976,7 +18976,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_101,
         Category::Message,
         "Convert_all_invalid_characters_to_HTML_entity_code_95101",
@@ -18985,7 +18985,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_102,
         Category::Message,
         "Convert_all_const_to_let_95102",
@@ -18994,7 +18994,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_105,
         Category::Message,
         "Convert_function_expression_0_to_arrow_function_95105",
@@ -19003,7 +19003,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_106,
         Category::Message,
         "Convert_function_declaration_0_to_arrow_function_95106",
@@ -19012,7 +19012,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_107,
         Category::Message,
         "Fix_all_implicit_this_errors_95107",
@@ -19021,7 +19021,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_108,
         Category::Message,
         "Wrap_invalid_character_in_an_expression_container_95108",
@@ -19030,7 +19030,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_109,
         Category::Message,
         "Wrap_all_invalid_characters_in_an_expression_container_95109",
@@ -19039,7 +19039,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_110,
         Category::Message,
         "Visit_https_Colon_Slash_Slashaka_ms_Slashtsconfig_to_read_more_about_this_file_95110",
@@ -19048,7 +19048,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_111,
         Category::Message,
         "Add_a_return_statement_95111",
@@ -19057,7 +19057,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_112,
         Category::Message,
         "Remove_braces_from_arrow_function_body_95112",
@@ -19066,7 +19066,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_113,
         Category::Message,
         "Wrap_the_following_body_with_parentheses_which_should_be_an_object_literal_95113",
@@ -19075,7 +19075,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_114,
         Category::Message,
         "Add_all_missing_return_statement_95114",
@@ -19084,7 +19084,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_115,
         Category::Message,
         "Remove_braces_from_all_arrow_function_bodies_with_relevant_issues_95115",
@@ -19093,7 +19093,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_116,
         Category::Message,
         "Wrap_all_object_literal_with_parentheses_95116",
@@ -19102,7 +19102,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_117,
         Category::Message,
         "Move_labeled_tuple_element_modifiers_to_labels_95117",
@@ -19111,7 +19111,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_118,
         Category::Message,
         "Convert_overload_list_to_single_signature_95118",
@@ -19120,7 +19120,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_119,
         Category::Message,
         "Generate_get_and_set_accessors_for_all_overriding_properties_95119",
@@ -19129,7 +19129,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_120,
         Category::Message,
         "Wrap_in_JSX_fragment_95120",
@@ -19138,7 +19138,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_121,
         Category::Message,
         "Wrap_all_unparented_JSX_in_JSX_fragment_95121",
@@ -19147,7 +19147,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_122,
         Category::Message,
         "Convert_arrow_function_or_function_expression_95122",
@@ -19156,7 +19156,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_123,
         Category::Message,
         "Convert_to_anonymous_function_95123",
@@ -19165,7 +19165,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_124,
         Category::Message,
         "Convert_to_named_function_95124",
@@ -19174,7 +19174,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_125,
         Category::Message,
         "Convert_to_arrow_function_95125",
@@ -19183,7 +19183,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_126,
         Category::Message,
         "Remove_parentheses_95126",
@@ -19192,7 +19192,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_127,
         Category::Message,
         "Could_not_find_a_containing_arrow_function_95127",
@@ -19201,7 +19201,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_128,
         Category::Message,
         "Containing_function_is_not_an_arrow_function_95128",
@@ -19210,7 +19210,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_129,
         Category::Message,
         "Could_not_find_export_statement_95129",
@@ -19219,7 +19219,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_130,
         Category::Message,
         "This_file_already_has_a_default_export_95130",
@@ -19228,7 +19228,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_131,
         Category::Message,
         "Could_not_find_import_clause_95131",
@@ -19237,7 +19237,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_132,
         Category::Message,
         "Could_not_find_namespace_import_or_named_imports_95132",
@@ -19246,7 +19246,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_133,
         Category::Message,
         "Selection_is_not_a_valid_type_node_95133",
@@ -19255,7 +19255,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_134,
         Category::Message,
         "No_type_could_be_extracted_from_this_type_node_95134",
@@ -19264,7 +19264,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_135,
         Category::Message,
         "Could_not_find_property_for_which_to_generate_accessor_95135",
@@ -19273,7 +19273,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_136,
         Category::Message,
         "Name_is_not_valid_95136",
@@ -19282,7 +19282,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_137,
         Category::Message,
         "Can_only_convert_property_with_modifier_95137",
@@ -19291,7 +19291,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_138,
         Category::Message,
         "Switch_each_misused_0_to_1_95138",
@@ -19300,7 +19300,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_139,
         Category::Message,
         "Convert_to_optional_chain_expression_95139",
@@ -19309,7 +19309,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_140,
         Category::Message,
         "Could_not_find_convertible_access_expression_95140",
@@ -19318,7 +19318,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_141,
         Category::Message,
         "Could_not_find_matching_access_expressions_95141",
@@ -19327,7 +19327,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_142,
         Category::Message,
         "Can_only_convert_logical_AND_access_chains_95142",
@@ -19336,7 +19336,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_143,
         Category::Message,
         "Add_void_to_Promise_resolved_without_a_value_95143",
@@ -19345,7 +19345,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_144,
         Category::Message,
         "Add_void_to_all_Promises_resolved_without_a_value_95144",
@@ -19354,7 +19354,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_145,
         Category::Message,
         "Use_element_access_for_0_95145",
@@ -19363,7 +19363,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_146,
         Category::Message,
         "Use_element_access_for_all_undeclared_properties_95146",
@@ -19372,7 +19372,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_147,
         Category::Message,
         "Delete_all_unused_imports_95147",
@@ -19381,7 +19381,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_148,
         Category::Message,
         "Infer_function_return_type_95148",
@@ -19390,7 +19390,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_149,
         Category::Message,
         "Return_type_must_be_inferred_from_a_function_95149",
@@ -19399,7 +19399,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_150,
         Category::Message,
         "Could_not_determine_function_return_type_95150",
@@ -19408,7 +19408,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_151,
         Category::Message,
         "Could_not_convert_to_arrow_function_95151",
@@ -19417,7 +19417,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_152,
         Category::Message,
         "Could_not_convert_to_named_function_95152",
@@ -19426,7 +19426,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_153,
         Category::Message,
         "Could_not_convert_to_anonymous_function_95153",
@@ -19435,7 +19435,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_154,
         Category::Message,
         "Can_only_convert_string_concatenations_and_string_literals_95154",
@@ -19444,7 +19444,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_155,
         Category::Message,
         "Selection_is_not_a_valid_statement_or_statements_95155",
@@ -19453,7 +19453,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_156,
         Category::Message,
         "Add_missing_function_declaration_0_95156",
@@ -19462,7 +19462,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_157,
         Category::Message,
         "Add_all_missing_function_declarations_95157",
@@ -19471,7 +19471,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_158,
         Category::Message,
         "Method_not_implemented_95158",
@@ -19480,7 +19480,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_159,
         Category::Message,
         "Function_not_implemented_95159",
@@ -19489,7 +19489,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_160,
         Category::Message,
         "Add_override_modifier_95160",
@@ -19498,7 +19498,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_161,
         Category::Message,
         "Remove_override_modifier_95161",
@@ -19507,7 +19507,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_162,
         Category::Message,
         "Add_all_missing_override_modifiers_95162",
@@ -19516,7 +19516,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_163,
         Category::Message,
         "Remove_all_unnecessary_override_modifiers_95163",
@@ -19525,7 +19525,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_164,
         Category::Message,
         "Can_only_convert_named_export_95164",
@@ -19534,7 +19534,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_165,
         Category::Message,
         "Add_missing_properties_95165",
@@ -19543,7 +19543,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_166,
         Category::Message,
         "Add_all_missing_properties_95166",
@@ -19552,7 +19552,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_167,
         Category::Message,
         "Add_missing_attributes_95167",
@@ -19561,7 +19561,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_168,
         Category::Message,
         "Add_all_missing_attributes_95168",
@@ -19570,7 +19570,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_169,
         Category::Message,
         "Add_undefined_to_optional_property_type_95169",
@@ -19579,7 +19579,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_170,
         Category::Message,
         "Convert_named_imports_to_default_import_95170",
@@ -19588,7 +19588,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_171,
         Category::Message,
         "Delete_unused_param_tag_0_95171",
@@ -19597,7 +19597,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_172,
         Category::Message,
         "Delete_all_unused_param_tags_95172",
@@ -19606,7 +19606,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_173,
         Category::Message,
         "Rename_param_tag_name_0_to_1_95173",
@@ -19615,7 +19615,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_174,
         Category::Message,
         "Use_0_95174",
@@ -19624,7 +19624,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_175,
         Category::Message,
         "Use_Number_isNaN_in_all_conditions_95175",
@@ -19633,7 +19633,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_176,
         Category::Message,
         "Convert_typedef_to_TypeScript_type_95176",
@@ -19642,7 +19642,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_177,
         Category::Message,
         "Convert_all_typedef_to_TypeScript_types_95177",
@@ -19651,7 +19651,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_178,
         Category::Message,
         "Move_to_file_95178",
@@ -19660,7 +19660,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_179,
         Category::Message,
         "Cannot_move_to_file_selected_file_is_invalid_95179",
@@ -19669,7 +19669,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_180,
         Category::Message,
         "Use_import_type_95180",
@@ -19678,7 +19678,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_181,
         Category::Message,
         "Use_type_0_95181",
@@ -19687,7 +19687,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_182,
         Category::Message,
         "Fix_all_with_type_only_imports_95182",
@@ -19696,7 +19696,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_183,
         Category::Message,
         "Cannot_move_statements_to_the_selected_file_95183",
@@ -19705,7 +19705,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_184,
         Category::Message,
         "Inline_variable_95184",
@@ -19714,7 +19714,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_185,
         Category::Message,
         "Could_not_find_variable_to_inline_95185",
@@ -19723,7 +19723,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_186,
         Category::Message,
         "Variables_with_multiple_declarations_cannot_be_inlined_95186",
@@ -19732,7 +19732,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_187,
         Category::Message,
         "Add_missing_comma_for_object_member_completion_0_95187",
@@ -19741,7 +19741,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_188,
         Category::Message,
         "Add_missing_parameter_to_0_95188",
@@ -19750,7 +19750,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_189,
         Category::Message,
         "Add_missing_parameters_to_0_95189",
@@ -19759,7 +19759,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_190,
         Category::Message,
         "Add_all_missing_parameters_95190",
@@ -19768,7 +19768,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_191,
         Category::Message,
         "Add_optional_parameter_to_0_95191",
@@ -19777,7 +19777,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_192,
         Category::Message,
         "Add_optional_parameters_to_0_95192",
@@ -19786,7 +19786,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_193,
         Category::Message,
         "Add_all_optional_parameters_95193",
@@ -19795,7 +19795,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_194,
         Category::Message,
         "Wrap_in_parentheses_95194",
@@ -19804,7 +19804,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_195,
         Category::Message,
         "Wrap_all_invalid_decorator_expressions_in_parentheses_95195",
@@ -19813,7 +19813,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_196,
         Category::Message,
         "Add_resolution_mode_import_attribute_95196",
@@ -19822,7 +19822,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_197,
         Category::Message,
         "Add_resolution_mode_import_attribute_to_all_type_only_imports_that_need_it_95197",
@@ -19831,7 +19831,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_198,
         Category::Message,
         "_0_references_95198",
@@ -19840,7 +19840,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_199,
         Category::Message,
         "1_reference_95199",
@@ -19849,7 +19849,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_200,
         Category::Message,
         "_0_implementations_95200",
@@ -19858,7 +19858,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_201,
         Category::Message,
         "1_implementation_95201",
@@ -19867,7 +19867,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_202,
         Category::Message,
         "Loading_95202",
@@ -19876,7 +19876,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_203,
         Category::Message,
         "Installing_types_for_0_95203",
@@ -19885,7 +19885,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_204,
         Category::Message,
         "Project_0_95204",
@@ -19894,7 +19894,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_205,
         Category::Message,
         "Fix_All_95205",
@@ -19903,7 +19903,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_206,
         Category::Message,
         "Organize_Imports_95206",
@@ -19912,7 +19912,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_207,
         Category::Message,
         "Remove_Unused_Imports_95207",
@@ -19921,7 +19921,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_208,
         Category::Message,
         "Sort_Imports_95208",
@@ -19930,7 +19930,7 @@ pub static CATALOG: &[Message] = &[
         false,
         false,
     ),
-    Message::new(
+    Message::catalog(
         95_209,
         Category::Message,
         "JSDoc_comment_95209",

@@ -300,6 +300,44 @@ pub fn install_id_seed(seed: IdSeed) {
     OWN_SYMBOL_IDS.with(|own| *own.borrow_mut() = OwnSymbolIds::new());
 }
 
+/// wasm: the ids of one checker of the inline checker pool
+/// (`program::WorkerState`), which a native checker worker keeps in its
+/// own thread. A job swaps them in (`swap_id_state`).
+// PORT: not in Go.
+#[cfg(target_family = "wasm")]
+pub struct IdState {
+    next_node_id: u64,
+    next_symbol_id: u64,
+    node_ids: PerFileMap<u64>,
+    symbol_ids: LineageIds,
+    own_symbol_ids: OwnSymbolIds,
+}
+
+#[cfg(target_family = "wasm")]
+impl From<IdSeed> for IdState {
+    /// The ids of a new worker, as `install_id_seed` sets them.
+    fn from(seed: IdSeed) -> Self {
+        IdState {
+            next_node_id: seed.next_node_id,
+            next_symbol_id: seed.next_symbol_id,
+            node_ids: seed.node_ids,
+            symbol_ids: seed.symbol_ids,
+            own_symbol_ids: OwnSymbolIds::new(),
+        }
+    }
+}
+
+/// wasm: swaps the ids of this thread with `state`.
+// PORT: not in Go.
+#[cfg(target_family = "wasm")]
+pub fn swap_id_state(state: &mut IdState) {
+    NEXT_NODE_ID.with(|next| state.next_node_id = next.replace(state.next_node_id));
+    NEXT_SYMBOL_ID.with(|next| state.next_symbol_id = next.replace(state.next_symbol_id));
+    NODE_IDS.with(|ids| std::mem::swap(&mut *ids.borrow_mut(), &mut state.node_ids));
+    SYMBOL_IDS.with(|ids| std::mem::swap(&mut *ids.borrow_mut(), &mut state.symbol_ids));
+    OWN_SYMBOL_IDS.with(|own| std::mem::swap(&mut *own.borrow_mut(), &mut state.own_symbol_ids));
+}
+
 /// The next symbol id of this thread (Go `nextSymbolId.Add(1)`).
 fn next_symbol_id() -> u64 {
     NEXT_SYMBOL_ID.with(|next| {

@@ -276,6 +276,7 @@ impl GoThread {
     /// Starts a thread that runs `f`: `clone` is `Builder::spawn` or
     /// `spawn_scoped`, and `sleep` is `std::thread::sleep`. The tests pass
     /// a `clone` that fails and a `sleep` that records.
+    #[cfg(not(target_family = "wasm"))]
     #[track_caller]
     fn start<'a, F, T, H>(
         &self,
@@ -292,6 +293,26 @@ impl GoThread {
             Ok(handle) => handle,
             Err(err) => go_fatal_newosproc(&err),
         }
+    }
+
+    /// wasm32-wasip1 has no threads: `Builder::spawn` always fails there
+    /// with an `Unsupported` error, which is not EAGAIN, so the start ends
+    /// the process at once with the same text. This leaves std's thread
+    /// start and the thread functions out of the wasm module.
+    // PORT: not in Go.
+    #[cfg(target_family = "wasm")]
+    #[track_caller]
+    fn start<'a, F, T, H>(
+        &self,
+        _f: F,
+        _clone: impl FnMut(std::thread::Builder, ThreadMain<'a, T>) -> std::io::Result<H>,
+        _sleep: impl FnMut(std::time::Duration),
+    ) -> H
+    where
+        F: FnOnce() -> T + Send + 'a,
+        T: 'a,
+    {
+        go_fatal_newosproc(&std::io::ErrorKind::Unsupported.into())
     }
 
     fn builder(&self) -> std::thread::Builder {

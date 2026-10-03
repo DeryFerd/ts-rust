@@ -9,6 +9,7 @@ use crate::cmd::tsgo::api::run_api;
 use crate::cmd::tsgo::lsp::run_lsp;
 use crate::gostd::context::{self, CancelFunc};
 use crate::gostd::errors;
+#[cfg(not(target_family = "wasm"))]
 use signal_hook::consts::{SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::Signals;
@@ -117,9 +118,11 @@ pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
 // Go: os/signal/signal.go:340 signalError
 // PORT: Go `Is(target error) bool` (true for `context.Canceled`) has no
 // port form. No port code reads the cause.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, PartialEq)]
 struct SignalError(String);
 
+#[cfg(not(target_family = "wasm"))]
 impl std::fmt::Display for SignalError {
     // Go: signal.go:342 signalError.Error
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -129,6 +132,7 @@ impl std::fmt::Display for SignalError {
 
 // Go: syscall/syscall_unix.go Signal.String, with the Linux `signalList`
 // names of the two signals that `notify_context` registers.
+#[cfg(not(target_family = "wasm"))]
 fn signal_string(s: i32) -> String {
     match s {
         SIGINT => "interrupt".to_string(),

@@ -27,6 +27,7 @@ use crate::emitter::program_emit::{
 };
 use crate::execute::tsc::emit::ProgramLike;
 use crate::frontend::prelude::*;
+use crate::gostd::slices::stable_sort_by;
 use std::cell::Cell;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -928,7 +929,7 @@ impl Program {
             package_jsons.push(package_json);
             true
         });
-        package_jsons.sort();
+        stable_sort_by(&mut package_jsons, Ord::cmp);
         package_jsons.dedup();
         package_jsons
     }
@@ -938,7 +939,7 @@ impl Program {
 // PORT: Go returns a new empty slice for nil. The list is sorted, so
 // `dedup` gives the same result as Go `core.Deduplicate`.
 fn normalize_package_jsons(mut package_jsons: Vec<String>) -> Vec<String> {
-    package_jsons.sort();
+    stable_sort_by(&mut package_jsons, Ord::cmp);
     package_jsons.dedup();
     package_jsons
 }

@@ -596,7 +596,9 @@ impl Checker {
         }
         // PORT: Go `strings.Compare` on the names; the port form compares the
         // same way for these names.
-        properties.sort_by(|&x, &y| self.sym(x).name.as_str().cmp(self.sym(y).name.as_str()));
+        crate::gostd::slices::stable_sort_by(&mut properties, |&x, &y| {
+            self.sym(x).name.as_str().cmp(self.sym(y).name.as_str())
+        });
         let e = nb_e(b);
         let f = &e.factory;
         let mut attributes: Vec<Node> = Vec::with_capacity(properties.len() + 1);

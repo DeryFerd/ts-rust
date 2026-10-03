@@ -411,6 +411,7 @@ const MAX_FILE_SIZE: usize = 10 << 20;
 // PORT: the path is raw bytes, as in Go. Go stops reading past
 // `maxFileSize` and fails; this reads the file and then checks the size.
 // Off unix a path must be UTF-8; another path fails, as a missing file.
+#[cfg(not(target_family = "wasm"))]
 fn read_file(name: &[u8]) -> Option<Vec<u8>> {
     #[cfg(unix)]
     let path = {
@@ -424,6 +425,16 @@ fn read_file(name: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(data)
+}
+
+/// The wasm build reads no zone file: its hosts (npm/wasm/core.js) give the
+/// module no preopened directory (`fd_prestat_get`), so `std::fs` cannot
+/// open one, and `time.Local` is UTC, as in Go when no zone file is found.
+/// This leaves the zone file parser out of the wasm module.
+// PORT: not in Go.
+#[cfg(target_family = "wasm")]
+fn read_file(_name: &[u8]) -> Option<Vec<u8>> {
+    None
 }
 
 // ---------------------------------------------------------------------------

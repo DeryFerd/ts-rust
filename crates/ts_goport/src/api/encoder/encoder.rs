@@ -321,6 +321,31 @@ struct Uint128 {
     lo: u64,
 }
 
+/// Go's value of the hash `h` of the file `parsed`: `h`, or the content hash
+/// of the Go bytes of its text when `h` is the content hash of its port form.
+// PORT: Go hashes the Go bytes of the file content (`xxh3.HashString128`,
+// project/overlayfs.go:86 newCachedFile, :134 newOverlay, and
+// project/snapshotfs.go:411, :441 and :567), and the parse cache sets
+// `file.Hash = fh.Hash()` (project/parsecache.go:79). The port's file handles
+// hash the port form (project/overlayfs.rs, snapshotfs.rs), which is the same
+// identity for the parse cache keys. The two differ only for a text with a
+// marker unit (an invalid byte, a WTF-8 surrogate or a real U+FDD0, see
+// `scanner_util::GO_STRING_MARKER`), and the API header is the only place
+// where Go shows the value. So the hash is made again here, for such a text
+// only. A content-mapped file's hash is the hash of its cache key, not of
+// its text, so it is kept: Go's key holds Go's hash of the raw content
+// (project/parsecache.go:44), which the port does not give for a raw
+// content with a marker unit.
+fn go_content_hash(parsed: &ParsedSourceFile, h: u128) -> u128 {
+    let text = parsed.text();
+    if !crate::scanner_util::contains_go_string_marker(text)
+        || h != xxhash_rust::xxh3::xxh3_128(text.as_bytes())
+    {
+        return h;
+    }
+    xxhash_rust::xxh3::xxh3_128(&crate::scanner_util::go_string_bytes(text))
+}
+
 /// Go `sourceFile.Hash`.
 // PORT: Go `SourceFile.Hash` is `ParsedSourceFile::hash`. At pin B only the
 // two project parse caches set it:
@@ -350,13 +375,15 @@ fn source_file_content_hash(source_file: Node) -> Uint128 {
         return Uint128::default();
     }
     let h = match crate::program::ls_program::program_parsed_source_file(source_file) {
-        Some(parsed) => parsed.source_hash(),
+        Some(parsed) => go_content_hash(&parsed, parsed.source_hash()),
         None => {
-            let Some(h) = parsed_source_file_of(source_file).and_then(|parsed| parsed.hash.get())
-            else {
+            let Some(parsed) = parsed_source_file_of(source_file) else {
                 return Uint128::default();
             };
-            h
+            let Some(h) = parsed.hash.get() else {
+                return Uint128::default();
+            };
+            go_content_hash(&parsed, h)
         }
     };
     Uint128 {

@@ -19,6 +19,24 @@ memchr = "=2.8.2"
 num-bigint = "=0.4.6"
 num-traits = "=0.2.19"
 ryu-js = "=1.0.2"
+
+# wasm only: frontend/bundled/embed.rs unpacks the libs that build.rs packs.
+# Its LZMA decoder is about twice as fast as lzma-rs's on wasm (lib.dom and
+# lib.es5: about 20 ms, not 45 ms) and 7 KB larger.
+[target.'cfg(target_family = "wasm")'.dependencies]
+lzma-rust2 = { version = "=0.21.0", default-features = false, features = ["std"] }
+# wasm only: ryu-js's smaller tables for number to string (jsnum.rs). It
+# gives the same digits, a little slower, and the module is 10 KB smaller
+# with gzip.
+ryu-js = { version = "=1.0.2", features = ["small"] }
+
+# build.rs packs the libs of the wasm build. Native builds run build.rs too,
+# but it does nothing for them.
+[build-dependencies]
+lzma-rust2 = { version = "=0.21.0", default-features = false, features = ["std", "encoder", "optimization"] }
+
+# Native only (see ts_goport's Cargo.toml).
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 rustix = { version = "=1.1.5", features = ["event", "fs", "pipe", "process", "termios"] }
 
 # fswatch/canonicalize_darwin.rs: NFC for macOS watch paths (Go calls

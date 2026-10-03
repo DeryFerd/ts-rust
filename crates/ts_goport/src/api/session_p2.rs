@@ -2613,24 +2613,32 @@ impl Session {
                 self.setup_language_service(snapshot, Rc::clone(program), &params.project, "")?;
             // PORT: Go converts the uint32 position to a 64-bit int, and
             // UTF16ToUTF8 adds the delta of the last entry to a position past
-            // all entries. A position past i32::MAX is past any text. With no
-            // trigger character, Go's first read of it is the JSDoc snippet
-            // slice `text[lineStart:position]` (ls/jsdoc_snippet.go:77).
-            // Otherwise the port runs with i32::MAX, which takes the same
-            // branches, but a panic there names that bound.
+            // all entries. A port position past i32::MAX is past any text.
+            // Then Go's position is the port position less the port bytes of
+            // the text that Go does not have (`go_len`), and the port runs
+            // with i32::MAX, which takes the same branches as Go. Go's first
+            // read of the position is the JSDoc snippet slice
+            // `text[lineStart:position]` (ls/jsdoc_snippet.go:77), which
+            // panics, so the port panics with Go's numbers there (see
+            // `past_text_reads_jsdoc_snippet`). Past that read, a panic
+            // would name the port's bound.
             let position_map = source_file_get_position_map(source_file);
-            let go_position = i64::from(params.position)
+            let port_position = i64::from(params.position)
                 + i64::from(position_map.entries.last().map_or(0, |e| e.delta));
-            let internal_pos = match i32::try_from(go_position) {
+            let internal_pos = match i32::try_from(port_position) {
                 Ok(_) => position_map.utf16_to_utf8(params.position as i32),
                 Err(_) => {
-                    if params.trigger_character.is_none()
-                        && !lang_svc
+                    if past_text_reads_jsdoc_snippet(
+                        source_file,
+                        params.trigger_character.as_deref(),
+                        !lang_svc
                             .user_preferences()
                             .enable_js_doc_completions
-                            .is_false()
-                    {
-                        let len = crate::scanner_util::go_len(&source_file_text(source_file));
+                            .is_false(),
+                    ) {
+                        let text = source_file_text(source_file);
+                        let len = crate::scanner_util::go_len(&text);
+                        let go_position = port_position - (text.len() - len) as i64;
                         crate::core::go_panic(format!(
                             "runtime error: slice bounds out of range [:{go_position}] with length {len}"
                         ));
@@ -3062,4 +3070,32 @@ fn new_printer(params: &PrintNodeParams) -> crate::printer::Printer {
         PrintHandlers::default(),
         None,
     )
+}
+
+/// Whether Go's `getCompletionsAtPosition` (ls/completions.go:402) reads
+/// a position past the text of `file` first in the JSDoc snippet slice
+/// (ls/jsdoc_snippet.go:77), with the trigger character `trigger` and
+/// JSDoc completions `jsdoc_on`.
+// PORT: the checks before that slice read no position past the text, so
+// the port runs them with i32::MAX, as `get_completions_at_position` does:
+// - `IsInString` (completions.go:410) is false past every token, so the
+//   trigger check is `isValidTrigger`.
+// - `isValidTrigger` reads the slice for "*" (completions.go:3312), and
+//   panics for an unknown trigger character as the port's does.
+// - A valid " " returns before the snippet (completions.go:414).
+// - `getJSDocSnippetCompletion` reads the slice when JSDoc completions are
+//   on (jsdoc_snippet.go:30).
+fn past_text_reads_jsdoc_snippet(file: Node, trigger: Option<&str>, jsdoc_on: bool) -> bool {
+    let Some(trigger) = trigger else {
+        return jsdoc_on;
+    };
+    match trigger {
+        "*" => true,
+        " " => false,
+        _ => {
+            let (_, previous_token) = ls::completions_p2::get_relevant_tokens(i32::MAX, file);
+            ls::completions_p2::is_valid_trigger(file, trigger, previous_token, i32::MAX)
+                && jsdoc_on
+        }
+    }
 }
