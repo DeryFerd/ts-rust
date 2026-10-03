@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Builds the wasm module of the npm package npm/wasm: crates/ts_wasm for
-# wasm32-wasip1 with the `wasm` size profile, then binaryen's wasm-opt.
+# wasm32-wasip1 with the `wasm` size profile, then binaryen's wasm-opt, then
+# a new function order for better compression (order-functions.mjs).
 #
 # usage: scripts/wasm/build.sh [out.wasm]   (default npm/wasm/ts_rust.wasm)
 # env:   WASM_PROFILE    cargo profile (default wasm; release for a fast build)
 #        WASM_RUSTFLAGS  added to RUSTFLAGS (default none)
 #        WASM_OPT        wasm-opt flags (default "--flatten --rereloop -Oz -Oz");
-#                        "none" skips wasm-opt
-# needs: rustup target add wasm32-wasip1; wasm-opt (binaryen 132 or later)
+#                        "none" skips wasm-opt and the function order
+# needs: rustup target add wasm32-wasip1; wasm-opt (binaryen 132 or later);
+#        node
 #
 # The default is the smallest module (opt-level z, 5.1 MB). For checks 17 to
 # 20% faster at 6.2 MB:
@@ -35,20 +37,38 @@ cargo_cmd=(cargo)
 if [[ -z "${CI:-}" ]] && command -v systemd-run >/dev/null; then
   cargo_cmd=("$repo/scripts/run-cargo-capped.sh")
 fi
-"${cargo_cmd[@]}" build --profile "$profile" -p ts_wasm --target wasm32-wasip1
-
 target_dir="${CARGO_TARGET_DIR:-$repo/target}"
 built="$target_dir/wasm32-wasip1/$profile/ts_wasm.wasm"
 mkdir -p "$(dirname "$out")"
 if [[ "$opt" == none ]]; then
+  "${cargo_cmd[@]}" build --profile "$profile" -p ts_wasm --target wasm32-wasip1
   cp "$built" "$out"
 else
+  # order-functions.mjs needs the function names, so the link keeps them
+  # (-C strip=debuginfo). Only the final crate gets the flag: a profile
+  # change would change every crate's hash, so every symbol name and some
+  # of the code.
+  "${cargo_cmd[@]}" rustc --profile "$profile" -p ts_wasm --lib --target wasm32-wasip1 \
+    -- -C strip=debuginfo
   # The features that rustc enables for wasm32-wasip1 by default.
+  features=(--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext
+    --enable-mutable-globals --enable-multivalue --enable-reference-types)
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  # The order of the functions changes the compressed size a lot: at
+  # 107d120d the order below saves 40 KB raw, 96 KB gzip and 22 KB brotli
+  # (see order-functions.mjs). wasm-opt --reorder-functions made it worse.
+  # 1. hide: names that keep wasm-opt's code the same as with no names.
+  # 2. wasm-opt -g: optimize, and keep those names.
+  # 3. key: name each function with its position in the new order.
+  # 4. Reorder, and strip the names. -s 2 runs no pass, but lets the writer
+  #    optimize the stack IR as the -Oz run did (else 8.8 KB larger).
+  node "$repo/scripts/wasm/order-functions.mjs" hide "$built" "$tmp/hidden.wasm"
   # shellcheck disable=SC2086
-  wasm-opt $opt --enable-bulk-memory --enable-nontrapping-float-to-int \
-    --enable-sign-ext --enable-mutable-globals --enable-multivalue \
-    --enable-reference-types --strip-debug --strip-producers \
-    "$built" -o "$out"
+  wasm-opt $opt "${features[@]}" -g "$tmp/hidden.wasm" -o "$tmp/opt.wasm"
+  node "$repo/scripts/wasm/order-functions.mjs" key "$tmp/opt.wasm" "$built" "$tmp/keyed.wasm"
+  wasm-opt -s 2 --reorder-functions-by-name "${features[@]}" --strip-debug --strip-producers \
+    "$tmp/keyed.wasm" -o "$out"
 fi
 
 size() { wc -c <"$1" | tr -d ' '; }
