@@ -91,14 +91,25 @@ fn byte_suffix(s: &str, i: usize) -> String {
 // `scanner_util::GO_STRING_MARKER`). Go keeps the bytes of that char before
 // the cut, and its scanner reads each one as a RuneError of size 1. Then the
 // offset is the start of the split char.
+// PERF: this runs for every JSDoc comment. A closed comment ends in `*/`,
+// and an ASCII byte is a unit of its own in both forms, so 2 ASCII bytes
+// before `end` are Go's 2 bytes: no walk and no allocation. A cut at a unit
+// boundary keeps no bytes and allocates nothing either.
 fn jsdoc_text_cut(text: &str, end: usize) -> (usize, Vec<u8>) {
+    let bytes = text.as_bytes();
+    if bytes[end - 1].is_ascii() && bytes[end - 2].is_ascii() {
+        return (end - 2, Vec::new());
+    }
     let mut cut = end;
     let mut drop = 2;
     loop {
         let (unit, size) = crate::scanner_util::go_unit_before(text, cut);
         cut -= size;
         let len = unit.go_len();
-        if len >= drop {
+        if len == drop {
+            return (cut, Vec::new());
+        }
+        if len > drop {
             let mut kept = Vec::new();
             unit.push_go_bytes(&mut kept);
             kept.truncate(len - drop);
@@ -1939,4 +1950,28 @@ fn texts_equal(mut a: Node, mut b: Node) -> bool {
         }
     }
     a.text() == b.text()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jsdoc_text_cut;
+    use crate::scanner_util::go_string_from_bytes;
+
+    /// The cut of a closed comment keeps no bytes and allocates nothing
+    /// (the R159 reviewer: it ran 2 walks and 1 allocation per JSDoc
+    /// comment). A cut inside a char keeps Go's bytes of it.
+    #[test]
+    fn jsdoc_text_cut_allocates_only_for_a_cut_char() {
+        let text = "/** a */";
+        let (cut, kept) = jsdoc_text_cut(text, text.len());
+        assert_eq!((cut, kept.capacity()), (text.len() - 2, 0));
+        // `日` is 3 Go bytes: the cut keeps its first byte.
+        let text = "/** \u{65E5}";
+        assert_eq!(jsdoc_text_cut(text, text.len()), (4, vec![0xE6]));
+        // The invalid byte FF and `y` (1 Go byte each, 8 port bytes): the cut
+        // is at the unit, with nothing kept.
+        let text = go_string_from_bytes(b"/** \xFFy".to_vec());
+        let (cut, kept) = jsdoc_text_cut(&text, text.len());
+        assert_eq!((cut, kept.capacity()), (4, 0));
+    }
 }
