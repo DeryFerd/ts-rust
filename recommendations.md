@@ -119,3 +119,29 @@ Findings and fixes (one line each):
 - Context size: 22.4 B context tokens. The 37 lane agents used 15% (some reached 999k and compacted); the reused R113 auditor and reviewer used 1.0 B at up to 997k. Fix: AGENTS.md starts a new auditor and reviewer when a batch opens, and sizes lanes under 500k.
 - Small retries (1.3% of calls fail): 74 `sleep N; cmd` blocks, 16 blocked report Writes (92 agents then wrote with a heredoc), 13 `rm -rf "$VAR"` safety blocks. Fix: one line each in the brief.
 - Not measured: whether the 190 skeptic and verify agents (about 12% of tokens) find problems that the auditor and reviewer would miss.
+
+## Re-audit, 2026-10-03
+
+Window 2026-10-01T02:44Z (the 09-30 fixes) to 2026-10-03T05:20Z, against 2026-09-28T08:10Z to 10-01T02:44Z. `scripts/audit/metrics.py` now also prints `hostWaits`, `pollShare` and `acceptedRevisions`.
+
+| metric | before | after |
+|---|---|---|
+| revision open to accept | 60 to 150 min | 35 to 67 min |
+| lib blob merge conflicts | 65 | 0 |
+| tool source reads per day | 532 | 138 |
+| agents over 500k context | 29 | 13 |
+| time with under 3 workflows running | 22% | 1% |
+| lanes landed per day | 15.2 | 16.1 |
+| accepted revisions per day | 7.6 | 4.3 (2 to 5 lanes each, 0 unaccepted) |
+| context tokens per day | 8.9 B | 5.8 B |
+| pollShare (subagent time in wait loops) | 0.25 | 0.60 |
+| hostWaits per day | about 180 | about 860 |
+
+Findings and fixes (one line each):
+
+- Integration was 74% of each revision cycle (3.4 h average: merge 28 min, checks 111, skeptic 62). Its checks ran the oracles and np-suite by hand before `side` ran them again, and since int27 each integration also timed two PGO+BOLT builds per side on both minis (+40 min); int31's one flagged cost did not repeat. Fix: AGENTS.md "Integration" (checks start `candidate.sh side int<N> --checkout`; timing only for perf lanes or hot-path changes). `candidate.sh side` now compares a reused tests or gate run again when the base changed, and keeps the old compare as `tests-base-<sha>.json` or `gate-compare-base-<label>.json` (before, a reused compare could name an older base).
+- Host queue: all 4 shared hosts held by one workflow with 3 jobs waiting while dbook idled; dbook ran only about 30 minutes of revision evidence per revision. Fix: integration side runs use dbook (above).
+- Cargo: one Cargo at a time across all worktrees (a June rule) made builds wait 1.9 min on average (p90 6.4) behind 20-minute PGO builds. No Cargo scope peaked above 11.6 GB. Fix: `TS_CARGO_SLOTS` (2 on zbook) in run-cargo-capped.sh, with a per-slot sccache socket; the brief puts build-release.sh under `target/locks/build-release.lock`.
+- After each accept, the reviewer follow-up lane waited for the extra LSP batteries (72 to 101 min), and the next integration waited for lanes that started after the accept: int31 and int32 started 3 and 4.3 h after their base was accepted. Fix: AGENTS.md "After an accept".
+- tscbpar1 ran 6 rounds (about 26 workflow hours) and loaderorder1 2, both not taken: the skeptic found a design that does not follow Go only after a full round. Fix: AGENTS.md "Rounds" (a Go model note checked before code; root decides again after 3 rounds).
+- Not changed: the findings ledger (the three open S1 items were fixed in R151 and R152, but followups9b found another SIGPIPE bug); lane agents over 500k (13, most of their time in waits).
