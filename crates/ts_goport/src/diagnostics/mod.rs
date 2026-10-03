@@ -66,7 +66,10 @@ impl Message {
         reports_deprecated: bool,
     ) -> Self {
         // The wasm build tells catalog entries by their code with no key.
-        assert!(code == 0 || !key.is_empty(), "a message with a code has a key");
+        assert!(
+            code == 0 || !key.is_empty(),
+            "a message with a code has a key"
+        );
         Self {
             code,
             category,
@@ -164,7 +167,11 @@ impl Message {
             let texts: &'static str =
                 Box::leak(crate::frontend::bundled::unpack(packed).into_boxed_str());
             let texts: Vec<&'static str> = texts.split_terminator('\0').collect();
-            assert_eq!(texts.len(), CATALOG.len(), "a packed text for each catalog entry");
+            assert_eq!(
+                texts.len(),
+                CATALOG.len(),
+                "a packed text for each catalog entry"
+            );
             texts
         });
         let index = CATALOG

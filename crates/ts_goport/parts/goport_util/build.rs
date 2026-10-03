@@ -43,8 +43,9 @@ fn pack_libs() {
         .filter_map(|name| name.into_string().ok())
         .filter(|name| name.starts_with("lib.") && name.ends_with(".d.ts"))
         .collect();
-    let webworker =
-        |name: &str| name.starts_with("lib.webworker.") && name != "lib.webworker.importscripts.d.ts";
+    let webworker = |name: &str| {
+        name.starts_with("lib.webworker.") && name != "lib.webworker.importscripts.d.ts"
+    };
     names.sort_by(|a, b| (webworker(a), a).cmp(&(webworker(b), b)));
     let mut texts = Vec::new();
     let mut index = String::from("static PACKED_LIBS: &[(&str, usize)] = &[\n");
