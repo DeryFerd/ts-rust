@@ -108,7 +108,7 @@ fn get_output_file_names_excludes_mapper_owned_outputs() {
     command_line.parsed_config.content_mappers = vec![mapper];
 
     assert_eq!(
-        command_line.get_output_file_names(),
+        command_line.get_output_file_names().collect::<Vec<_>>(),
         vec!["/dist/Component.d.vue.ts".to_string()]
     );
 }

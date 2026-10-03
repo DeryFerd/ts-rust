@@ -3792,6 +3792,8 @@ pub fn get_program_diagnostics() -> Vec<Diagnostic> {
     let Some(go) = go_frontend() else {
         return Vec::new();
     };
+    // Go builds the include processor diagnostics here.
+    go.include_processor.mark_diagnostics_read();
     let mut diagnostics = go.program_diagnostics.clone();
     // #4712
     diagnostics.extend(content_mapper_diagnostics());

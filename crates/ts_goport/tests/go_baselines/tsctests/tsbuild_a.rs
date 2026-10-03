@@ -2749,7 +2749,7 @@ fn check_output_file_names(input: &TscInput, expected_dts_names: &[&str]) -> Res
             input.sub_scenario
         ));
     };
-    let actual = config.get_output_file_names();
+    let actual: Vec<String> = config.get_output_file_names().collect();
     if actual != expected_dts_names {
         return Err(format!(
             "GetOutputFileNames/{}:\n  actual:   {actual:?}\n  expected: {expected_dts_names:?}",

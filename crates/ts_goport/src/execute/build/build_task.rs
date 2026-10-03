@@ -1093,11 +1093,7 @@ impl BuildTask {
         } else {
             let oldest_output_file_name = match emitted_files.first() {
                 Some(first) => first.clone(),
-                None => resolved
-                    .get_output_file_names()
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default(),
+                None => resolved.get_output_file_names().next().unwrap_or_default(),
             };
             self.status = Some(UpToDateStatus::with_data(
                 UpToDateStatusType::UpToDate,
@@ -1863,7 +1859,8 @@ impl BuildTask {
         };
 
         if self.can_update_js_dts_output_timestamps() {
-            for output_file in self.resolved().get_output_file_names() {
+            let resolved = self.resolved().clone();
+            for output_file in resolved.get_output_file_names() {
                 update_time_stamp(self, &output_file);
             }
         }
