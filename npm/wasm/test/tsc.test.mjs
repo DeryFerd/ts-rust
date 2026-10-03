@@ -173,6 +173,16 @@ test("runs through runTscAsync", async () => {
     assert.deepEqual(diagnostics.map(d => d.code), [2322]);
 });
 
+test("keeps the BOM of an emitted file in memory (--emitBOM)", async () => {
+    const result = await tsc(["--emitBOM", "--declaration", "--outDir", "out", "a.ts"], {
+        files: { "/b/a.ts": "export const n = 1;\n" },
+        cwd: "/b",
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.files.get("/b/out/a.js"), "\uFEFFexport const n = 1;\n");
+    assert.equal(result.files.get("/b/out/a.d.ts"), "\uFEFFexport declare const n = 1;\n");
+});
+
 test("refuses watch mode", async () => {
     for (const flag of ["--watch", "-w", "-watch", "--WATCH"]) {
         const result = await tsc([flag], { files: project, cwd: "/p" });

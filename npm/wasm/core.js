@@ -5,6 +5,8 @@
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+// For file text: keeps a leading BOM (--emitBOM), which `decoder` drops.
+const fileDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 // crates/ts_wasm FLAG_* bits.
 const FLAG_DIAGNOSTICS_JSON = 1;
@@ -325,7 +327,7 @@ export function memoryFileSystem(files = new Map()) {
         },
         realpath: path => (map.has(path) || isDir(path) ? path : undefined),
         writeFile(path, data, append) {
-            const text = decoder.decode(data);
+            const text = fileDecoder.decode(data);
             map.set(path, append ? (map.get(path) ?? "") + text : text);
         },
         remove(path) {
