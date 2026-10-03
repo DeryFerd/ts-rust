@@ -1299,7 +1299,7 @@ pub fn is_in_top_level_context(mut node: Node) -> bool {
     is_source_file(container)
 }
 
-// Go: ast/utilities.go:1771 GetThisContainer
+// Go: ast/utilities.go:1829 GetThisContainer
 pub fn get_this_container(
     mut node: Node,
     include_arrow_functions: bool,

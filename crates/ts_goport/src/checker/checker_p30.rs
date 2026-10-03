@@ -695,7 +695,7 @@ impl Checker {
             ) == constructor
     }
 
-    // Go: checker/checker.go:27198 isAutoTypedProperty
+    // Go: checker/checker.go:27803 isAutoTypedProperty
     pub fn is_auto_typed_property(&mut self, symbol: SymbolId) -> bool {
         // A property is auto-typed when its declaration has no type annotation or initializer and we're in
         // noImplicitAny mode or a .js file.
@@ -707,7 +707,7 @@ impl Checker {
             && self.no_implicit_any
     }
 
-    // Go: checker/checker.go:27205 getDeclaringConstructor
+    // Go: checker/checker.go:27810 getDeclaringConstructor
     pub fn get_declaring_constructor(&mut self, symbol: SymbolId) -> Node {
         let declarations = self.sym(symbol).declarations.clone();
         for &declaration in declarations.iter() {
@@ -723,7 +723,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:27215 getPropertyNameFromIndex
+    // Go: checker/checker.go:27820 getPropertyNameFromIndex
     pub fn get_property_name_from_index(
         &mut self,
         index_type: TypeId,
@@ -754,7 +754,7 @@ impl Checker {
         Name::from(INTERNAL_SYMBOL_NAME_MISSING)
     }
 
-    // Go: checker/checker.go:27225 isStringIndexSignatureOnlyTypeWorker
+    // Go: checker/checker.go:27830 isStringIndexSignatureOnlyTypeWorker
     pub fn is_string_index_signature_only_type_worker(&mut self, t: TypeId) -> bool {
         let flags = self.ty(t).flags;
         (flags.intersects(TypeFlags::OBJECT)
