@@ -1,3 +1,4 @@
+mod checker_common_source_directory;
 mod contentmapper_watch;
 mod explain_files_cache;
 mod file_delete;
