@@ -1286,9 +1286,37 @@ pub fn read_ast_node_miss<R>(n: Node, read: impl FnOnce(&crate::astdata::Node) -
 }
 
 /// `read_ast_node_miss` for a node that is not of the hot file version.
+#[cfg(not(target_family = "wasm"))]
 #[cold]
 #[inline(never)]
 fn read_ast_node_cold<R>(n: Node, read: impl FnOnce(&crate::astdata::Node) -> R) -> R {
+    if n.file_index() == SYNTHETIC_NODE_FILE {
+        return read(&synthetic_ast_node(n));
+    }
+    crate::ast::store::read_store_node_miss(n, read)
+}
+
+/// wasm: `read_ast_node_miss` for a node that is not of the hot file
+/// version, with the miss code once (`read_ast_node_cold_dyn`): `read` runs
+/// through `&mut dyn FnMut`. One copy per reader type was 119 KB of the
+/// module (101 copies).
+#[cfg(target_family = "wasm")]
+#[cold]
+#[inline(never)]
+fn read_ast_node_cold<R>(n: Node, read: impl FnOnce(&crate::astdata::Node) -> R) -> R {
+    let mut read = Some(read);
+    let mut result = None;
+    read_ast_node_cold_dyn(n, &mut |node| {
+        result = Some((read.take().expect("the node is read once"))(node));
+    });
+    result.expect("the node is read once")
+}
+
+/// wasm: `read_ast_node_cold` with one copy for all readers.
+#[cfg(target_family = "wasm")]
+#[cold]
+#[inline(never)]
+fn read_ast_node_cold_dyn(n: Node, read: &mut dyn FnMut(&crate::astdata::Node)) {
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return read(&synthetic_ast_node(n));
     }
