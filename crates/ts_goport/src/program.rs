@@ -509,15 +509,15 @@ impl<R> EmitPoolJob<R> {
     }
 }
 
-/// PORT: not in Go (perf). The d.ts twin of a checker worker: a thread that
-/// prints the d.ts parts whose declaration transforms ran on the checker
+/// PORT: not in Go (perf). The twin of a checker worker: a thread that
+/// prints the JS and d.ts parts whose transforms ran on the checker
 /// (`program_emit`), so the checker can go on with its next file. The
 /// transforms call the emit resolver, so they stay on the checker, and each
-/// checker's d.ts text depends on its own check. The print needs no checker:
-/// the only print handler of Go `emitDeclarationFile` maps declaration map
-/// positions through the span map of a content-mapped source file. Go runs
-/// each file's emit on its own goroutine and locks the checker only for each
-/// resolver call.
+/// checker's d.ts text depends on its own check. The prints need no checker:
+/// Go `emitJSFile` gives its printer no handlers, and the only print handler
+/// of Go `emitDeclarationFile` maps declaration map positions through the
+/// span map of a content-mapped source file. Go runs each file's emit on its
+/// own goroutine and locks the checker only for each resolver call.
 ///
 /// The twin shares the checker's synthetic chunk numbers
 /// (`share_synthetic_chunks`), so a handle names the same node on both

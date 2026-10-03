@@ -1,5 +1,5 @@
-//! Print packs: the synthetic entries that a d.ts print reads, copied from a
-//! checker thread to its d.ts twin (`program::send_dts_twin_job`).
+//! Print packs: the synthetic entries that a JS or d.ts print reads, copied
+//! from a checker thread to its twin (`program::send_dts_twin_job`).
 //!
 //! PORT: not in Go (perf). Go prints on any goroutine, because factory nodes
 //! are shared pointers. Here the checker keeps its nodes (a copy, not a
