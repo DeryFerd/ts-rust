@@ -144,10 +144,37 @@ pub struct ResolveAheadHost {
     pub accept: AheadAccept,
     /// Keeps the keys of this load for the next load.
     pub keep_keys: Box<dyn FnOnce(Arc<KeyList>)>,
+    /// The project's share in what the workers keep from job to job.
+    pub share: Rc<KeptShare>,
     /// Debug builds: makes a new tracking view of the host's file system,
     /// to check that the calls of each taken answer list every side effect
     /// of its resolution (`debug_check_answer`).
     pub scratch: Option<Rc<dyn Fn() -> ScratchFs>>,
+}
+
+/// A project's share in what the workers keep from job to job: the known
+/// files and the package.json parses. Each host of the project's loads
+/// gives it to the next one (project/compilerhost.rs). When the last one
+/// drops it (the project's programs are released) after a load of the
+/// project gave the workers a job, the workers drop what they keep
+/// (`Workers::forget`). So the kept state holds only what the loads of
+/// live projects found, and the next loads find it again.
+// PORT: not in Go (perf).
+#[derive(Default)]
+pub struct KeptShare {
+    /// The epoch of the kept state (`WorkerState::epoch`) when a load of
+    /// the project last gave the workers a job.
+    epoch: Cell<Option<u64>>,
+}
+
+impl Drop for KeptShare {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.epoch.get()
+            && let Some(workers) = Workers::started()
+        {
+            workers.forget(epoch);
+        }
+    }
 }
 
 /// A view of a host's file system that tracks its seen files and missing
@@ -235,6 +262,9 @@ impl ResolveAhead {
                     config: config.clone(),
                 })
             });
+        if let Some(job) = &job {
+            host.share.epoch.set(Some(job.epoch));
+        }
         let accept = match host.scratch.filter(|_| cfg!(debug_assertions)) {
             None => host.accept,
             Some(scratch) => {

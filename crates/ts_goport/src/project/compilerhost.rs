@@ -44,6 +44,13 @@ pub struct CompilerHost {
     /// resolves ahead (`compiler::CompilerHost::resolve_ahead`).
     // PORT: not in Go (perf).
     pub resolution_keys: Rc<RefCell<Option<Arc<KeyList>>>>,
+
+    /// The project's share in what the resolve-ahead workers keep from
+    /// load to load, from the project's host before this one. `release`
+    /// drops it; when no host of the project has it, the workers drop
+    /// what they keep (`compiler::resolve_ahead::KeptShare`).
+    // PORT: not in Go (perf).
+    pub kept_share: RefCell<Option<Rc<compiler::resolve_ahead::KeptShare>>>,
 }
 
 // Go: project/compilerhost.go:29 newCompilerHost
@@ -56,15 +63,14 @@ pub fn new_compiler_host(
     builder: &Rc<ProjectCollectionBuilder>,
     logger: Option<Rc<logging::LogTree>>,
 ) -> Rc<CompilerHost> {
-    let (config_file_path, first_load, resolution_keys) = {
+    let (config_file_path, first_load, resolution_keys, kept_share) = {
         let project = project.borrow();
+        let host = project.host.as_ref();
         (
             project.config_file_path.clone(),
             project.program.is_none(),
-            project
-                .host
-                .as_ref()
-                .and_then(|host| host.resolution_keys.borrow().clone()),
+            host.and_then(|host| host.resolution_keys.borrow().clone()),
+            host.and_then(|host| host.kept_share.borrow().clone()),
         )
     };
     let source_fs = new_source_fs(true, builder.fs.clone(), builder.to_path.clone());
@@ -84,6 +90,7 @@ pub fn new_compiler_host(
 
         first_load,
         resolution_keys: Rc::new(RefCell::new(resolution_keys)),
+        kept_share: RefCell::new(Some(kept_share.unwrap_or_default())),
     })
 }
 
@@ -333,15 +340,17 @@ impl compiler::CompilerHost for CompilerHost {
     // host when the last program that uses it is freed. The port keeps the
     // program shell (multiprog M2), so the host drops its data here: the
     // snapshot file system (disk file map copy, overlays, cachedvfs
-    // results), the seen files and missing directories, and the config
-    // registry. A later file read panics, like a use after `freeze` does
-    // for the builder.
+    // results), the seen files and missing directories, the config
+    // registry, and the resolve-ahead keys and share. A later file read
+    // panics, like a use after `freeze` does for the builder.
     fn release(&self) {
         self.source_fs.release();
         let config_file_registry = self.config_file_registry.borrow_mut().take();
         drop(config_file_registry);
         let resolution_keys = self.resolution_keys.borrow_mut().take();
         drop(resolution_keys);
+        let kept_share = self.kept_share.borrow_mut().take();
+        drop(kept_share);
     }
 
     // PORT: not in Go (perf, see `compiler::CompilerHost::resolve_ahead`).
@@ -425,6 +434,7 @@ impl compiler::CompilerHost for CompilerHost {
             },
             accept,
             keep_keys: Box::new(move |new_keys| *keys.borrow_mut() = Some(new_keys)),
+            share: self.kept_share.borrow().clone()?,
             scratch,
         })
     }

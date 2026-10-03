@@ -20,7 +20,7 @@ use ts_goport::lsp::lsproto;
 use ts_goport::project::{self, Session, SessionInit, SessionOptions};
 
 use super::projecttestutil;
-use super::util::{CHANGED, bg, edit, generate_file_events, open, program, uri};
+use super::util::{CHANGED, bg, close, edit, generate_file_events, open, program, uri};
 
 /// A test in a child process with no OS override, with the environment
 /// variables `$env` set.
@@ -460,6 +460,71 @@ os_child_test! {
         assert_eq!(stats.loader.taken, 0, "the workers ran: {stats:?}");
         drop(held);
         edit_index(&session, &root, 5, "import { c as c2 } from \"../lib/c\";\n");
+        let stats = last_stats();
+        assert!(stats.loader.taken > 0, "{stats:?}");
+        assert_eq!(stats.known_files, 0, "{stats:?}");
+        resolve_ahead::set_mode(None);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// The project of `a_released_project_drops_the_kept_state` in `other/`,
+/// with its own package.
+const OTHER_MAIN: &str =
+    "import { q } from \"./q\";\nimport { r } from \"opkg\";\nexport const both = [q, r];\n";
+const OTHER_FILES: &[(&str, &str)] = &[
+    (
+        "other/tsconfig.json",
+        r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler", "noLib": true, "strict": true }, "include": ["src"] }"#,
+    ),
+    ("other/src/main.ts", OTHER_MAIN),
+    ("other/src/q.ts", "export const q = 1;"),
+    (
+        "other/node_modules/opkg/package.json",
+        r#"{ "name": "opkg", "version": "1.0.0", "types": "index.d.ts" }"#,
+    ),
+    (
+        "other/node_modules/opkg/index.d.ts",
+        "export declare const r: number;",
+    ),
+];
+
+os_child_test! {
+    /// The workers keep the files that the answers of a project's loads
+    /// found, from load to load of the project. When the project's
+    /// programs are released (its only open file is closed and the file of
+    /// another project opens), they drop them: the next job, of the other
+    /// project, starts with no known file.
+    fn a_released_project_drops_the_kept_state() {
+        let root = make_project("released");
+        for (name, text) in OTHER_FILES {
+            write(&root, name, text);
+        }
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        open_index(&session, &root);
+        add_import(&session, &root);
+        resolve_ahead::wait_for_frees();
+        edit_index(&session, &root, 3, "import { b as b2 } from \"./sub/b\";\n");
+        let stats = last_stats();
+        assert!(stats.known_files > 0, "{stats:?}");
+        close(&session, &file_uri(&root, "src/index.ts"));
+        let main = file_uri(&root, "other/src/main.ts");
+        open(&session, &main, OTHER_MAIN);
+        program(&session, &main);
+        let config = tspath::to_path(&format!("{root}/tsconfig.json"), &root, true);
+        assert!(
+            session
+                .snapshot()
+                .project_collection
+                .configured_project(&config)
+                .is_none(),
+            "the first project is still open"
+        );
+        resolve_ahead::wait_for_frees();
+        edit(&session, &main, 2, (0, 0), (0, 0), "import { q as q2 } from \"./q\";\n");
+        program(&session, &main);
         let stats = last_stats();
         assert!(stats.loader.taken > 0, "{stats:?}");
         assert_eq!(stats.known_files, 0, "{stats:?}");
