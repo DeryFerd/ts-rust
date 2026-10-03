@@ -525,6 +525,10 @@ pub struct NodeRecord {
 
 const _: () = assert!(std::mem::size_of::<NodeRecord>() == 24);
 
+// The bind ORs only `BINDER_ADDED_FLAGS` into a record's `flags`
+// (`bind_store_records` checks it), so it keeps the record bits.
+const _: () = assert!(super::node::BINDER_ADDED_FLAGS.0 & NodeRecord::RECORD_BITS == 0);
+
 /// The bit of a `NodeRecord::bind` word that holds an extras index
 /// (`NodeBindExtra`), not a flow node.
 pub const BIND_EXTRA: u32 = 1 << 31;
@@ -555,7 +559,9 @@ impl NodeRecord {
     /// in `up`.
     const NO_NODE: u32 = 1 << 31;
     /// The record bits in the `flags` word. Go `NodeFlags` ends at bit 28
-    /// (`REPARSER_TRANSFORMED_LITERAL`); a flags write checks it.
+    /// (`REPARSER_TRANSFORMED_LITERAL`); a flags write checks it: the parse
+    /// writes in `checked_flags`, the bind writes in `bind_store_records`
+    /// (`BINDER_ADDED_FLAGS`, which has no record bit).
     const RECORD_BITS: u32 = Self::SOURCE_FILE_ROOT | Self::TEXT_IS_KEYWORD | Self::NO_NODE;
 
     /// The record of a new node slot: Go `newNode` (undefined loc, nil
@@ -787,7 +793,10 @@ impl NodeRecord {
     /// a published store (`bind_store_records`): the symbol into `up`, the
     /// added flags into `flags` (the record bits stay), and the `bind` word.
     /// The bind is the only writer of a published record, and it writes
-    /// each record once.
+    /// each record once. `added` has no record bit: `bind_store_records`
+    /// checks each data entry against `BINDER_ADDED_FLAGS` in release
+    /// builds too, and those flags have none (const assert after
+    /// `NodeRecord`).
     #[inline]
     fn write_bind(&self, symbol: SymbolId, added: NodeFlags, bind: u32) {
         debug_assert_eq!(added.0 & Self::RECORD_BITS, 0);
@@ -4354,7 +4363,10 @@ pub fn bind_store_records<'d>(
             continue;
         };
         if last.0 != entry {
-            debug_assert!(
+            // Once per data entry, in release builds too: a flag outside
+            // `BINDER_ADDED_FLAGS` could set a record bit (`write_bind`).
+            // One mask compare per entry, not per record.
+            assert!(
                 super::node::BINDER_ADDED_FLAGS.contains(data.added_flags),
                 "binder added {:#x}, outside BINDER_ADDED_FLAGS",
                 data.added_flags
@@ -6879,6 +6891,43 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    // astmem1 P3: the bind ORs its added flags into the `flags` word of a
+    // record, whose top bits are the record bits (`RECORD_BITS`). A flag
+    // outside `BINDER_ADDED_FLAGS` (a binder bug) stops the bind in every
+    // build, before it writes the record. It publishes, so no other test
+    // may build or publish stores while it runs (the runner uses one
+    // thread).
+    #[test]
+    fn a_bind_flag_outside_binder_added_flags_panics_in_every_build() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let file = new_file_store("/bindflags/a.ts", "x;");
+        let x = NodeFactory::for_file(file).new_identifier("x");
+        freeze_file_store(file);
+        crate::program::publish_parsed_files("/");
+        let data = NodeBindData {
+            added_flags: NodeFlags(NodeRecord::SOURCE_FILE_ROOT),
+            ..NodeBindData::default()
+        };
+        let record = || &file_block(file).expect("a is published").records[slot_index(x)];
+        let bits = record().bits();
+        let bind = || {
+            bind_store_records(
+                file,
+                std::iter::once((slot_index(x), 0, Some(&data), FlowNodeId::NIL)),
+            )
+        };
+        let payload = catch_unwind(AssertUnwindSafe(bind)).expect_err("the bind must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(
+            message.contains("outside BINDER_ADDED_FLAGS"),
+            "{message:?}"
+        );
+        assert_eq!(record().bits(), bits, "the bind changed the record bits");
     }
 
     // AST node records, step 4: the node shell of a freeable file version

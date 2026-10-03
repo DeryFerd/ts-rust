@@ -17,108 +17,19 @@ pub fn identifier_to_keyword_kind(node: Node) -> SyntaxKind {
 }
 
 // Go: scanner/utilities.go:22 GetSourceTextOfNodeFromSourceFile
+// PORT: Go scanner/utilities.go:72 GetTextOfNodeFromSourceText and its
+// helpers are in `crate::scanner_util` only (one copy, which cuts a node
+// inside a char as Go does).
 pub fn get_source_text_of_node_from_source_file(
     source_file: Node,
     node: Node,
     include_trivia: bool,
 ) -> String {
-    get_text_of_node_from_source_text(&source_file_text(source_file), node, include_trivia)
-}
-
-// Go: scanner/utilities.go:26 isJSDocTypeExpressionOrChild
-fn is_js_doc_type_expression_or_child(node: Node) -> bool {
-    if is_js_doc_type_expression(node) {
-        return true;
-    }
-    if !node
-        .flags()
-        .intersects(NodeFlags::JS_DOC | NodeFlags::REPARSED)
-    {
-        return false;
-    }
-    let mut current = node;
-    while current.is_some() {
-        if is_type_node(current) {
-            return true;
-        }
-        current = current.parent();
-    }
-    false
-}
-
-// Go: scanner/utilities.go:41 normalizeJSDocTypeSourceText
-fn normalize_js_doc_type_source_text(text: &str) -> String {
-    let line_starts = compute_ecma_line_starts(text);
-    if line_starts.len() == 1 {
-        return strip_leading_js_doc_comment(text).to_string();
-    }
-
-    let mut result = String::with_capacity(text.len());
-    let new_line = NewLineKind::LF.get_new_line_character();
-    for (i, &line_start) in line_starts.iter().enumerate() {
-        if i > 0 {
-            result.push_str(new_line);
-        }
-        let mut line_end = text.len();
-        if i + 1 < line_starts.len() {
-            line_end = line_starts[i + 1] as usize;
-        }
-        let line = text[line_start as usize..line_end].trim_end_matches(is_line_break);
-        result.push_str(strip_leading_js_doc_comment(line));
-    }
-    result
-}
-
-// Go: scanner/utilities.go:64 stripLeadingJSDocComment
-fn strip_leading_js_doc_comment(line: &str) -> &str {
-    let mut line = line.trim_start_matches(is_white_space_like);
-    if let Some(rest) = line.strip_prefix('*') {
-        line = rest;
-    }
-    line.trim_start_matches(is_white_space_like)
-}
-
-// Go: scanner/utilities.go:72 GetTextOfNodeFromSourceText
-pub fn get_text_of_node_from_source_text(
-    source_text: &str,
-    node: Node,
-    include_trivia: bool,
-) -> String {
-    if node_is_missing(node) {
-        return String::new();
-    }
-    let mut pos = node.pos();
-    if !include_trivia {
-        pos = skip_trivia(source_text, pos);
-    }
-    let mut text: std::borrow::Cow<'_, str> =
-        std::borrow::Cow::Borrowed(&source_text[pos as usize..node.end() as usize]);
-    if is_js_doc_type_expression_or_child(node) {
-        text = std::borrow::Cow::Owned(normalize_js_doc_type_source_text(&text));
-    }
-    if node
-        .flags()
-        .intersects(NodeFlags::REPARSER_TRANSFORMED_LITERAL)
-    {
-        // This is similar to `getLiteralTextOfNode` in the printer, but without the context of an `emitContext` to provide overrides
-        if is_string_literal(node) {
-            if node.token_flags().intersects(TokenFlags::SINGLE_QUOTE) {
-                return format!("'{text}'");
-            }
-            return format!("\"{text}\"");
-        } else if is_identifier(node) {
-            return node.text().to_string();
-        }
-        // Only the above node kinds are currently transformed into one another by the reparser, requiring the textual remapping.
-        // (Any reamppings done by emit transforms are handled by `getLiteralTextOfNode` in the printer)
-        // Fail on any other kinds.
-        // PORT: Go `debug.FailBadSyntaxKind` panics.
-        panic!(
-            "Unexpected reparser-transformed node kind: {:?}",
-            node.kind()
-        );
-    }
-    text.into_owned()
+    crate::scanner_util::get_text_of_node_from_source_text(
+        &source_file_text(source_file),
+        node,
+        include_trivia,
+    )
 }
 
 // Go: scanner/utilities.go:102 GetTextOfNode
