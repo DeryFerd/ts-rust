@@ -6,13 +6,15 @@
 //! lib texts come from `crates/ts_goport/libs`, a copy of the pinned
 //! `internal/bundled/libs` (see its PROVENANCE.md).
 //!
-//! PORT: the wasm build embeds the libs packed (LZMA, 0.48 MB in place of
-//! 3.79 MB; see `parts/goport_util/build.rs`) and unpacks each lib on its
-//! first read. The names and texts do not change.
+//! PORT: the wasm build embeds the libs packed (one LZMA stream, 0.31 MB in
+//! place of 3.79 MB; see `parts/goport_util/build.rs`) and unpacks the
+//! stream up to each lib on its first read. The names and texts do not
+//! change.
 
 #[cfg(not(target_family = "wasm"))]
 use super::{SNAPSHOT_TEXT_MIN, const_hash};
 use crate::frontend::prelude::*;
+#[cfg(not(target_family = "wasm"))]
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
@@ -134,7 +136,7 @@ impl Fs for WrappedFs {
     // Go: embed.go:49 FileExists
     fn file_exists(&self, path: &str) -> bool {
         if let Some(rest) = split_path(path) {
-            return embedded_contents(rest).is_some();
+            return embedded_len(rest).is_some();
         }
         self.fs.file_exists(path)
     }
@@ -181,9 +183,9 @@ impl Fs for WrappedFs {
             if rest.is_empty() || rest == "libs" {
                 return Some(new_file_info(rest, FileMode::DIR, 0));
             }
-            if let Some(lib) = embedded_contents(rest) {
+            if let Some(len) = embedded_len(rest) {
                 let lib_name = rest.strip_prefix("libs/").unwrap_or(rest);
-                return Some(new_file_info(lib_name, FileMode(0), lib.len() as i64));
+                return Some(new_file_info(lib_name, FileMode(0), len as i64));
             }
             return None;
         }
@@ -265,16 +267,69 @@ fn embedded_contents(rest: &str) -> Option<&'static str> {
 }
 
 // Go: embed_generated.go:232 embeddedContents
-// PORT: wasm packs each lib (build.rs). The first read unpacks it into its
-// `OnceLock`, which keeps the text for the life of the process.
+// PORT: wasm unpacks the one stream of build.rs (`libs.lzma`, the libs in
+// `PACKED_LIBS` order) up to lib `rest`, and keeps each text it unpacks for
+// the life of the process.
 #[cfg(target_family = "wasm")]
 fn embedded_contents(rest: &str) -> Option<&'static str> {
-    let &(_, packed, text) = EMBEDDED_CONTENTS.iter().find(|&&(path, ..)| path == rest)?;
-    Some(text.get_or_init(|| unpack(packed)))
+    use std::io::Read;
+    use std::sync::{Mutex, PoisonError};
+    struct Unpacked {
+        reader: lzma_rust2::LzmaReader<&'static [u8]>,
+        texts: Vec<&'static str>,
+    }
+    static UNPACKED: Mutex<Option<Unpacked>> = Mutex::new(None);
+    let index = packed_lib_index(rest)?;
+    let mut unpacked = UNPACKED.lock().unwrap_or_else(PoisonError::into_inner);
+    let unpacked = unpacked.get_or_insert_with(|| {
+        let packed: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libs.lzma"));
+        Unpacked {
+            reader: lzma_rust2::LzmaReader::new_mem_limit(packed, u32::MAX, None)
+                .expect("build.rs packs the libs"),
+            texts: Vec::new(),
+        }
+    });
+    while unpacked.texts.len() <= index {
+        let mut text = vec![0; PACKED_LIBS[unpacked.texts.len()].1];
+        unpacked
+            .reader
+            .read_exact(&mut text)
+            .expect("build.rs packs the libs");
+        let text = String::from_utf8(text).expect("a lib is UTF-8");
+        unpacked.texts.push(Box::leak(text.into_boxed_str()));
+    }
+    Some(unpacked.texts[index])
 }
 
+/// The size of lib `rest` (`embedded_contents`) in bytes.
+#[cfg(not(target_family = "wasm"))]
+fn embedded_len(rest: &str) -> Option<usize> {
+    embedded_contents(rest).map(str::len)
+}
+
+/// wasm: the size of lib `rest`, which unpacks nothing.
+#[cfg(target_family = "wasm")]
+fn embedded_len(rest: &str) -> Option<usize> {
+    packed_lib_index(rest).map(|index| PACKED_LIBS[index].1)
+}
+
+/// wasm: the position of lib `rest` in `PACKED_LIBS`, when it is one of the
+/// bundled libs (`EMBEDDED_CONTENTS`).
+#[cfg(target_family = "wasm")]
+fn packed_lib_index(rest: &str) -> Option<usize> {
+    if !EMBEDDED_CONTENTS.contains(&rest) {
+        return None;
+    }
+    let index = PACKED_LIBS.iter().position(|&(path, _)| path == rest);
+    Some(index.expect("build.rs packs each bundled lib"))
+}
+
+// wasm: `PACKED_LIBS`, the path and size of each lib in `libs.lzma` order.
+#[cfg(target_family = "wasm")]
+include!(concat!(env!("OUT_DIR"), "/libs.rs"));
+
 /// wasm: the text that `parts/goport_util/build.rs` packed (an `.lzma`
-/// stream): a lib, or the diagnostic message texts.
+/// stream): the diagnostic message texts.
 #[cfg(target_family = "wasm")]
 pub(crate) fn unpack(packed: &[u8]) -> String {
     use std::io::Read;
@@ -288,9 +343,9 @@ pub(crate) fn unpack(packed: &[u8]) -> String {
 /// One `EMBEDDED_CONTENTS` entry (see `bundled_lib!`).
 #[cfg(not(target_family = "wasm"))]
 type EmbeddedLib = (&'static str, &'static str, u64);
-/// wasm: the path, the packed text and the text once unpacked.
+/// wasm: the path. The texts are in one stream (`embedded_contents`).
 #[cfg(target_family = "wasm")]
-type EmbeddedLib = (&'static str, &'static [u8], &'static OnceLock<String>);
+type EmbeddedLib = &'static str;
 
 // PORT: one `EMBEDDED_CONTENTS` entry, from `crates/ts_goport/libs`: the
 // path, the text and its compile-time `snapshot_text_hash`. The include path
@@ -309,16 +364,13 @@ macro_rules! bundled_lib {
     }};
 }
 
-/// wasm: one `EMBEDDED_CONTENTS` entry: the path, the lib as build.rs
-/// packed it into `OUT_DIR`, and its own `OnceLock` for the text.
+/// wasm: one `EMBEDDED_CONTENTS` entry: the path.
 // PORT: not in Go.
 #[cfg(target_family = "wasm")]
 macro_rules! bundled_lib {
-    ($name:literal) => {{
-        static TEXT: OnceLock<String> = OnceLock::new();
-        let packed: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libs/", $name, ".lzma"));
-        (concat!("libs/", $name), packed, &TEXT)
-    }};
+    ($name:literal) => {
+        concat!("libs/", $name)
+    };
 }
 
 /// `const_hash` of `text` for a snapshot lib (`SNAPSHOT_TEXT_MIN`), else 0.
