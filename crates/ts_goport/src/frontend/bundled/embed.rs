@@ -266,7 +266,7 @@ fn embedded_contents(rest: &str) -> Option<&'static str> {
     .copied()
 }
 
-// Go: embed_generated.go:232 embeddedContents
+// Go: embed_generated.go:238 embeddedContents
 // PORT: wasm unpacks the one stream of build.rs (`libs.lzma`, the libs in
 // `PACKED_LIBS` order) up to lib `rest`, and keeps each text it unpacks for
 // the life of the process. The reader stays too, with its 3.8 MB window

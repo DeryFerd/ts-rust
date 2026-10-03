@@ -295,10 +295,17 @@ pub struct FlowLoopInfo {
 // InferenceContext
 
 // Go: checker/checker.go:276 InferenceContext
+// PERF (infermem1): 56 bytes (asserted below), not 120. The port keeps every context
+// of a run (typebox: about 3.9M, almost all from conditional types with
+// `infer`), so the fields that those contexts never set are in `rare`, a box
+// that is made on the first write. The accessors give Go's zero values while
+// it is absent.
 #[derive(Clone)]
 pub struct InferenceContext {
     /// Inferences made for each type parameter
-    pub inferences: Vec<InferenceInfo>,
+    // PERF (infermem1): a boxed slice, 8 bytes less than a `Vec`. The list
+    // never changes its length after the context is made.
+    pub inferences: Box<[InferenceInfo]>,
     /// Generic signature for which inferences are made (if any)
     pub signature: SignatureId,
     /// Inference flags
@@ -309,6 +316,17 @@ pub struct InferenceContext {
     pub mapper: MapperId,
     /// Mapper that doesn't fix inferences
     pub non_fixing_mapper: MapperId,
+    /// The other Go fields, or `None` while all of them are Go zero values.
+    pub rare: Option<Box<InferenceContextRare>>,
+}
+
+// 32-bit targets (wasm32) have smaller pointers and do not check this.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<InferenceContext>() == 56);
+
+/// The fields of Go `InferenceContext` that only signature inference sets.
+#[derive(Clone, Default)]
+pub struct InferenceContextRare {
     /// Type mapper for inferences from return types (if any)
     pub return_mapper: MapperId,
     /// Type mapper for inferences from return types of outer function (if any)
@@ -321,37 +339,82 @@ pub struct InferenceContext {
     pub intra_expression_inference_sites: Vec<IntraExpressionInferenceSite>,
 }
 
+impl InferenceContext {
+    /// Go `n.returnMapper`.
+    #[must_use]
+    pub fn return_mapper(&self) -> MapperId {
+        self.rare
+            .as_ref()
+            .map_or(MapperId::NIL, |r| r.return_mapper)
+    }
+
+    /// Go `n.outerReturnMapper`.
+    #[must_use]
+    pub fn outer_return_mapper(&self) -> MapperId {
+        self.rare
+            .as_ref()
+            .map_or(MapperId::NIL, |r| r.outer_return_mapper)
+    }
+
+    /// Go `n.inferredTypeParameters`.
+    #[must_use]
+    pub fn inferred_type_parameters(&self) -> &[TypeId] {
+        self.rare
+            .as_ref()
+            .map_or(&[], |r| &r.inferred_type_parameters)
+    }
+
+    /// The slice identity of `inferred_type_parameters` (0 while empty).
+    #[must_use]
+    pub fn inferred_type_parameters_origin(&self) -> u32 {
+        self.rare
+            .as_ref()
+            .map_or(0, |r| r.inferred_type_parameters_origin)
+    }
+
+    /// Go `n.intraExpressionInferenceSites`.
+    #[must_use]
+    pub fn intra_expression_inference_sites(&self) -> &[IntraExpressionInferenceSite] {
+        self.rare
+            .as_ref()
+            .map_or(&[], |r| &r.intra_expression_inference_sites)
+    }
+
+    /// The rare fields for a write. Makes the box on the first write.
+    pub fn rare_mut(&mut self) -> &mut InferenceContextRare {
+        self.rare.get_or_insert_default()
+    }
+}
+
 // PORT: `Default` exists only for the dummy entry at index 0 of
 // `Checker::inference_contexts`. Go never has a nil `compareTypes`, so the
 // placeholder comparer panics like a call of a nil Go func.
 impl Default for InferenceContext {
     fn default() -> Self {
         InferenceContext {
-            inferences: Vec::new(),
+            inferences: Box::default(),
             signature: SignatureId::NIL,
             flags: InferenceFlags::NONE,
             compare_types: nil_type_comparer(),
             mapper: MapperId::NIL,
             non_fixing_mapper: MapperId::NIL,
-            return_mapper: MapperId::NIL,
-            outer_return_mapper: MapperId::NIL,
-            inferred_type_parameters: Vec::new(),
-            inferred_type_parameters_origin: 0,
-            intra_expression_inference_sites: Vec::new(),
+            rare: None,
         }
     }
 }
 
 // Go: checker/checker.go:289 InferenceInfo
 // PORT: Go `*InferenceInfo` is an index into `InferenceContext::inferences`.
+// PERF (infermem1): 32 bytes (asserted below), not 72. The two candidate
+// lists are in one box that the first candidate makes (typebox: about 6M
+// infos, under a third of them with candidates). `candidates()` and
+// `contra_candidates()` give Go's nil lists while it is absent.
 #[derive(Clone, Debug, Default)]
 pub struct InferenceInfo {
     /// Type parameter for which inferences are being made
     pub type_parameter: TypeId,
-    /// Candidates in covariant positions in decreasing depth order
-    pub candidates: Vec<TypeId>,
-    /// Candidates in contravariant positions
-    pub contra_candidates: Vec<TypeId>,
+    /// Go `candidates` and `contraCandidates`, or `None` while both are nil.
+    pub candidate_lists: Option<Box<InferenceCandidates>>,
     /// Cache for resolved inferred type
     pub inferred_type: TypeId,
     /// Priority of current inference set
@@ -362,6 +425,40 @@ pub struct InferenceInfo {
     pub is_fixed: bool,
     /// Implied arity (or -1)
     pub implied_arity: i32,
+}
+
+// 32-bit targets (wasm32) have smaller pointers and do not check this.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<InferenceInfo>() == 32);
+
+/// The candidate lists of an `InferenceInfo`.
+#[derive(Clone, Debug, Default)]
+pub struct InferenceCandidates {
+    /// Candidates in covariant positions in decreasing depth order
+    pub candidates: Vec<TypeId>,
+    /// Candidates in contravariant positions
+    pub contra_candidates: Vec<TypeId>,
+}
+
+impl InferenceInfo {
+    /// Go `info.candidates`.
+    #[must_use]
+    pub fn candidates(&self) -> &[TypeId] {
+        self.candidate_lists.as_ref().map_or(&[], |l| &l.candidates)
+    }
+
+    /// Go `info.contraCandidates`.
+    #[must_use]
+    pub fn contra_candidates(&self) -> &[TypeId] {
+        self.candidate_lists
+            .as_ref()
+            .map_or(&[], |l| &l.contra_candidates)
+    }
+
+    /// The candidate lists for a write. Makes the box on the first write.
+    pub fn candidate_lists_mut(&mut self) -> &mut InferenceCandidates {
+        self.candidate_lists.get_or_insert_default()
+    }
 }
 
 // Go: checker/checker.go:321 IntraExpressionInferenceSite
@@ -1053,7 +1150,10 @@ pub struct Checker {
     pub index_infos: Vec<IndexInfo>,
     pub type_predicates: Vec<TypePredicate>,
     pub mappers: ChunkedArena<TypeMapper>,
-    pub inference_contexts: Vec<InferenceContext>,
+    // PERF (infermem1): a `ChunkedArena`, not a `Vec`: a doubling `Vec` kept
+    // up to half its room unused and copied every context when it grew
+    // (typebox: buffers of 512 and 256 MiB).
+    pub inference_contexts: ChunkedArena<InferenceContext>,
 
     /// Go `tracer *Tracer` (checker.go:897): optional tracer for trace
     /// events and type recording (for --generateTrace). None is Go nil.
@@ -1512,7 +1612,7 @@ impl Checker {
             index_infos: vec![IndexInfo::default()],
             type_predicates: vec![TypePredicate::default()],
             mappers: ChunkedArena::with_nil(TypeMapper::default()),
-            inference_contexts: vec![InferenceContext::default()],
+            inference_contexts: ChunkedArena::with_nil(InferenceContext::default()),
             // Go: compiler/checkerpool.go:104 makes the tracer when the pool
             // has a tracing session; NewChecker stores it (checker.go:905).
             tracer: crate::tracing::new_checker_tracer(checker_index),

@@ -7,7 +7,7 @@ use crate::prelude::*;
 // helper on the Rust `InferenceInfo` value, because the Go `[]*InferenceInfo`
 // slices used here are not all owned by one inference context.
 fn info_has_inference_candidates(info: &InferenceInfo) -> bool {
-    !info.candidates.is_empty() || !info.contra_candidates.is_empty()
+    !info.candidates().is_empty() || !info.contra_candidates().is_empty()
 }
 
 impl Checker {
@@ -202,7 +202,7 @@ impl Checker {
             // `inferences`, so the fresh list lives in a scratch context cloned from
             // `context`. `inferTypes` reads only the inference list.
             let mut scratch = self.inference_context(context).clone();
-            scratch.inferences = fresh_inferences;
+            scratch.inferences = fresh_inferences.into_boxed_slice();
             let inferences = InferenceContextId(self.inference_contexts.len() as u32);
             self.inference_contexts.push(scratch);
             self.apply_to_parameter_types(
@@ -262,14 +262,15 @@ impl Checker {
                     // PORT: Go `core.Concatenate` returns a new slice whenever
                     // `uniqueTypeParameters` is not empty (the fresh slice from
                     // getUniqueTypeParameters itself, or a copy).
+                    // An empty append leaves the list as it is, so it makes no
+                    // `rare` box.
                     if !unique_type_parameters.is_empty() {
                         let origin = self.new_type_parameters_origin();
-                        self.inference_context_mut(context)
-                            .inferred_type_parameters_origin = origin;
+                        let rare = self.inference_context_mut(context).rare_mut();
+                        rare.inferred_type_parameters_origin = origin;
+                        rare.inferred_type_parameters
+                            .extend(unique_type_parameters.iter().copied());
                     }
-                    self.inference_context_mut(context)
-                        .inferred_type_parameters
-                        .extend(unique_type_parameters.iter().copied());
                     return self.get_or_create_type_from_signature(instantiated_signature);
                 }
             }
@@ -314,8 +315,8 @@ impl Checker {
             let name = self.sym(self.ty(tp).symbol).name.clone();
             let inferred_type_parameters = self
                 .inference_context(context)
-                .inferred_type_parameters
-                .clone();
+                .inferred_type_parameters()
+                .to_vec();
             if self.has_type_parameter_by_name(&inferred_type_parameters, &name)
                 || self.has_type_parameter_by_name(&result, &name)
             {

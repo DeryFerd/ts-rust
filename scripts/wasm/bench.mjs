@@ -5,14 +5,15 @@
 // in that process ("warm"). It also gives the module size raw, gzip -9 and
 // brotli -q 11.
 //
-// usage: node scripts/wasm/bench.mjs [--wasm FILE] [--runs N] [--cold N] [case-regex]
+// usage: node scripts/wasm/bench.mjs [--wasm FILE] [--runs N] [--cold N] [--inputs DIR] [--zod DIR] [case-regex]
 //   --wasm   the module to time (default npm/wasm/ts_rust.wasm). It runs in
 //            a copy of the package, so the checkout is not changed.
 //   --runs   warm calls per case (default 5)
 //   --cold   new processes per case; the cold time is their median (default 3)
-// Inputs (see scripts/wasm/diff.mjs for how they are installed):
-//   ~/Library/Caches/ts-rust-wasm-inputs/{query,hono}/repo
-//   ~/Library/Caches/ts-rust-wasm-bench/zod-*/  (zod v4 sources with tsconfig.bench.json)
+//   --inputs the input cache with {query,hono}/repo, as in scripts/wasm/diff.mjs
+//            (default ~/Library/Caches/ts-rust-wasm-inputs)
+//   --zod    zod v4 sources with packages/zod/tsconfig.bench.json (default the
+//            first zod-* dir in ~/Library/Caches/ts-rust-wasm-bench)
 // A case whose input is missing is skipped.
 
 import { execFileSync } from "node:child_process";
@@ -24,41 +25,50 @@ import { fileURLToPath } from "node:url";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const caches = path.join(os.homedir(), "Library/Caches");
-const zod = fs.readdirSync(path.join(caches, "ts-rust-wasm-bench"), { withFileTypes: true })
-    .find(e => e.isDirectory() && e.name.startsWith("zod-"));
 
-const CASES = [
-    {
-        name: "tiny",
-        args: ["-p", "/p", "--noEmit"],
-        files: {
-            "/p/tsconfig.json": '{"compilerOptions":{"strict":true}}',
-            "/p/a.ts": "export const n: number = 1;\n",
+/** The first `zod-*` dir of the default bench cache, or undefined. */
+function defaultZod() {
+    const dir = path.join(caches, "ts-rust-wasm-bench");
+    if (!fs.existsSync(dir)) return undefined;
+    const entry = fs.readdirSync(dir, { withFileTypes: true }).find(e => e.isDirectory() && e.name.startsWith("zod-"));
+    return entry && path.join(dir, entry.name);
+}
+
+/** The cases. A case with a `cwd` key is skipped when that dir is missing. */
+function cases(inputs, zod) {
+    return [
+        {
+            name: "tiny",
+            args: ["-p", "/p", "--noEmit"],
+            files: {
+                "/p/tsconfig.json": '{"compilerOptions":{"strict":true}}',
+                "/p/a.ts": "export const n: number = 1;\n",
+            },
         },
-    },
-    {
-        name: "zod",
-        cwd: zod && path.join(caches, "ts-rust-wasm-bench", zod.name, "packages/zod"),
-        args: ["-p", "tsconfig.bench.json", "--noEmit"],
-    },
-    {
-        name: "query-core",
-        cwd: path.join(caches, "ts-rust-wasm-inputs/query/repo/packages/query-core"),
-        args: ["-p", "tsconfig.prod.json", "--noEmit"],
-    },
-    {
-        name: "hono",
-        cwd: path.join(caches, "ts-rust-wasm-inputs/hono/repo"),
-        args: ["-p", "tsconfig.build.json", "--noEmit", "--tsBuildInfoFile", path.join(os.tmpdir(), "bench-hono.tsbuildinfo")],
-    },
-];
+        {
+            name: "zod",
+            cwd: zod && path.join(zod, "packages/zod"),
+            args: ["-p", "tsconfig.bench.json", "--noEmit"],
+        },
+        {
+            name: "query-core",
+            cwd: path.join(inputs, "query/repo/packages/query-core"),
+            args: ["-p", "tsconfig.prod.json", "--noEmit"],
+        },
+        {
+            name: "hono",
+            cwd: path.join(inputs, "hono/repo"),
+            args: ["-p", "tsconfig.build.json", "--noEmit", "--tsBuildInfoFile", path.join(os.tmpdir(), "bench-hono.tsbuildinfo")],
+        },
+    ];
+}
 
 const median = values => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
 
-/** Child mode: time `runs` calls of one case in this process and print them as JSON. */
-async function child(pkg, name, runs) {
+/** Child mode: time `runs` calls of one case (as JSON) in this process and print them as JSON. */
+async function child(pkg, caseJson, runs) {
     const { tsc } = await import(path.join(pkg, "node.js"));
-    const c = CASES.find(c => c.name === name);
+    const c = JSON.parse(caseJson);
     const times = [];
     let exitCode;
     for (let i = 0; i < runs; i++) {
@@ -70,13 +80,23 @@ async function child(pkg, name, runs) {
 }
 
 function parseArgs(argv) {
-    const opts = { wasm: path.join(repo, "npm/wasm/ts_rust.wasm"), runs: 5, cold: 3, filter: undefined };
+    const opts = {
+        wasm: path.join(repo, "npm/wasm/ts_rust.wasm"),
+        runs: 5,
+        cold: 3,
+        inputs: path.join(caches, "ts-rust-wasm-inputs"),
+        zod: undefined,
+        filter: undefined,
+    };
     for (let i = 0; i < argv.length; i++) {
         if (argv[i] === "--wasm") opts.wasm = path.resolve(argv[++i]);
         else if (argv[i] === "--runs") opts.runs = Number(argv[++i]);
         else if (argv[i] === "--cold") opts.cold = Number(argv[++i]);
+        else if (argv[i] === "--inputs") opts.inputs = path.resolve(argv[++i]);
+        else if (argv[i] === "--zod") opts.zod = path.resolve(argv[++i]);
         else opts.filter = new RegExp(argv[i]);
     }
+    opts.zod ??= defaultZod();
     return opts;
 }
 
@@ -93,10 +113,10 @@ if (process.argv[2] === "--child") {
     const brotli = brotliCompressSync(bytes, { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
     console.log(`module ${opts.wasm}: raw ${bytes.length}, gzip ${gzipSync(bytes, { level: 9 }).length}, brotli ${brotli}`);
     console.log("case        exit   cold ms   warm ms");
-    for (const c of CASES) {
+    for (const c of cases(opts.inputs, opts.zod)) {
         if (opts.filter && !opts.filter.test(c.name)) continue;
-        if (c.cwd && !fs.existsSync(c.cwd)) {
-            console.log(`${c.name.padEnd(11)} skipped (no input at ${c.cwd})`);
+        if ("cwd" in c && !(c.cwd && fs.existsSync(c.cwd))) {
+            console.log(`${c.name.padEnd(11)} skipped (no input at ${c.cwd ?? "--zod"})`);
             continue;
         }
         const cold = [];
@@ -105,7 +125,7 @@ if (process.argv[2] === "--child") {
         for (let i = 0; i < opts.cold; i++) {
             // The first process also gives the warm calls.
             const runs = i === 0 ? 1 + opts.runs : 1;
-            const out = execFileSync(process.execPath, [fileURLToPath(import.meta.url), "--child", pkg, c.name, String(runs)], {
+            const out = execFileSync(process.execPath, [fileURLToPath(import.meta.url), "--child", pkg, JSON.stringify(c), String(runs)], {
                 maxBuffer: 1 << 26,
             });
             const result = JSON.parse(out.toString());

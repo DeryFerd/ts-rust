@@ -1554,7 +1554,7 @@ impl Checker {
                         }
                     }
                 }
-                let return_mapper = self.inference_context(inference_context).return_mapper;
+                let return_mapper = self.inference_context(inference_context).return_mapper();
                 if return_mapper.is_some() {
                     // For other purposes (e.g. determining whether to produce literal types) we only
                     // incorporate inferences made from the return type in a function call. We remove

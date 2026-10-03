@@ -265,17 +265,20 @@ pub type WatcherFactory = fn() -> Arc<dyn WatcherImpl>;
 //
 // PORT: Go package vars set up by the platform `init()` functions. The
 // port builds each one on first use and calls the platform `init` there
-// (inotify and fanotify on Linux, kqueue on darwin and the BSDs, windows on
-// Windows). The FSEvents backend is not ported: its factory stays `None`, as
-// on Linux in Go.
+// (inotify and fanotify on Linux, FSEvents on macOS, kqueue on darwin and
+// the BSDs, windows on Windows).
 pub static INOTIFY_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(|| {
     new_watcher("inotify", |w| {
         #[cfg(target_os = "linux")]
         crate::fswatch::inotify_linux::init(w);
     })
 });
-pub static FSEVENTS_WATCHER: LazyLock<Arc<WatcherStruct>> =
-    LazyLock::new(|| new_watcher("fsevents", |_| {}));
+pub static FSEVENTS_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(|| {
+    new_watcher("fsevents", |_w| {
+        #[cfg(target_os = "macos")]
+        crate::fswatch::fsevents_darwin::init(_w);
+    })
+});
 pub static KQUEUE_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(|| {
     new_watcher("kqueue", |_w| {
         #[cfg(any(
@@ -378,8 +381,8 @@ pub fn fanotify() -> Arc<dyn Watcher> {
 ///
 /// PORT: Go `runtime.GOOS` is `std::env::consts::OS` ("macos" for Go
 /// "darwin"). On Linux this returns fanotify when the `fanotify_init` probe
-/// succeeds and inotify when it fails, as Go does. On macOS Go picks FSEvents,
-/// which is not ported, so the port returns kqueue there (Go's fallback).
+/// succeeds and inotify when it fails, as Go does. On macOS it returns
+/// FSEvents (fsevents_darwin.rs, on the `notify` crate).
 pub fn default() -> Arc<dyn Watcher> {
     match std::env::consts::OS {
         "linux" => {
@@ -519,8 +522,9 @@ impl Watcher for FallbackWatcher {
 /// struct `watcher` have the same Rust name. Go `mu` guards the fields in
 /// `WatcherStructLocked`. `factory` is set once, before the watcher is
 /// shared. Go `sequence` is set only by the FSEvents backend
-/// (fsevents_darwin.go), which is not ported, so it is always nil and is
-/// not a field here.
+/// (fsevents_darwin.go), to the FSEvents event ID. The port's FSEvents
+/// backend gets no event IDs from `notify`, so it is always nil and is not a
+/// field here.
 pub struct WatcherStruct {
     pub name: String,
     pub mu: Mutex<WatcherStructLocked>,
@@ -1063,6 +1067,12 @@ pub trait WatcherImpl: Send + Sync {
     fn subscribe(&self, w: &Arc<DirWatch>) -> Result<(), GoError>;
     fn close_watch(&self, w: &Arc<DirWatch>) -> Result<(), GoError>;
 
+    /// Go: the optional `subscribeMany` method that `watchAddMany` looks
+    /// for (only the FSEvents backend has it). `None`: the backend has none.
+    fn subscribe_many(&self, _watches: &[Arc<DirWatch>]) -> Option<Result<(), GoError>> {
+        None
+    }
+
     /// PORT: the embedded Go `watcherBase`.
     fn base(&self) -> &WatcherBase;
 }
@@ -1239,8 +1249,6 @@ impl WatcherBase {
     }
 
     // Go: watcher.go:719 watcherBase.watchAddMany
-    // PORT: Go first checks for an optional `subscribeMany` method on
-    // `b.self`. Only the FSEvents backend has it, and it is not ported.
     pub fn watch_add_many(&self, watches: &[Arc<DirWatch>]) -> Result<(), GoError> {
         let mut b = self.mu.lock().unwrap();
         let mut to_add: Vec<&Arc<DirWatch>> = Vec::with_capacity(watches.len());
@@ -1255,6 +1263,14 @@ impl WatcherBase {
         }
 
         let self_impl = self.self_impl();
+        let batch: Vec<Arc<DirWatch>> = to_add.iter().map(|w| (*w).clone()).collect();
+        if let Some(result) = self_impl.subscribe_many(&batch) {
+            result?;
+            for w in batch {
+                b.subscriptions.insert(Arc::as_ptr(&w) as usize, w);
+            }
+            return Ok(());
+        }
         let mut added: Vec<&Arc<DirWatch>> = Vec::with_capacity(to_add.len());
         for w in to_add {
             if let Err(err) = self_impl.subscribe(w) {
@@ -1373,7 +1389,7 @@ impl PartialEq for DirWatchError {
 /// and a reference to the shared debouncer. Each watched directory has one.
 ///
 /// PORT: Go `mu` guards the fields in `DirWatchLocked`. `state` is only
-/// used by the fsevents (not ported) and Windows backends. Go
+/// used by the fsevents and Windows backends. Go
 /// `sequence` is always nil here (see `WatcherStruct`), so it is not a field.
 /// Go sets `comparer`, `dirFold` and `physicalDirFold` with `setComparer`
 /// before the dirWatch is shared; the port sets them in `new_dir_watch`.

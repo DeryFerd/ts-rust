@@ -1556,10 +1556,11 @@ impl Checker {
         if inference_context.is_some()
             && !self
                 .inference_context(inference_context)
-                .intra_expression_inference_sites
+                .intra_expression_inference_sites()
                 .is_empty()
         {
             self.inference_context_mut(inference_context)
+                .rare_mut()
                 .intra_expression_inference_sites = Vec::new();
         }
         // We strip literal freshness when an appropriate contextual type is present such that contextually typed
