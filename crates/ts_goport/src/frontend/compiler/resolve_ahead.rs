@@ -388,21 +388,30 @@ impl Drop for ResolveAhead {
 
 /// Writes `line` (the counts of a load, a worker panic) when
 /// `GOPORT_RESOLVE_AHEAD_STATS` is set: to stderr for `1`, else appended to
-/// the file that it names.
+/// the file that it names (`write_debug_line`).
 fn debug_log(line: std::fmt::Arguments<'_>) {
-    use std::io::Write;
     static TO: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let Some(to) = TO.get_or_init(|| std::env::var("GOPORT_RESOLVE_AHEAD_STATS").ok()) else {
         return;
     };
+    write_debug_line(to, line);
+}
+
+/// Writes `line` and a newline to stderr (`to` is `1`) or to the end of
+/// file `to`. The workers (`log_panic`) and the loader write at the same
+/// time, so the line is built first and goes out in one write: a write
+/// per part of the format let the lines of two threads interleave.
+fn write_debug_line(to: &str, line: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let line = format!("{line}\n");
     if to == "1" {
-        eprintln!("{line}");
+        let _ = std::io::stderr().write_all(line.as_bytes());
     } else if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(to)
     {
-        let _ = writeln!(file, "{line}");
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
@@ -1186,4 +1195,61 @@ fn describe(module: &ResolvedModule) -> String {
         module.alternate_result,
         module.resolution_diagnostics,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_debug_line;
+
+    // PORT: not in Go (the resolve-ahead debug log). The workers' panic
+    // lines and the loader's counts go to one file at the same time
+    // (followups13b skeptic: 1,917 of 12,288 lines garbled).
+    #[test]
+    fn debug_log_lines_of_parallel_writers_do_not_interleave() {
+        let to = std::env::temp_dir().join(format!(
+            "goport-resolve-ahead-log-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&to);
+        let to_text = to.to_str().expect("a UTF-8 temp path").to_string();
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let to_text = &to_text;
+                scope.spawn(move || {
+                    for line in 0..500 {
+                        write_debug_line(
+                            to_text,
+                            format_args!(
+                                "resolve-ahead: a worker panicked in a {} task: {} {}",
+                                "job", thread, line
+                            ),
+                        );
+                    }
+                });
+            }
+        });
+        let text = std::fs::read_to_string(&to).expect("the log");
+        std::fs::remove_file(&to).expect("remove the log");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 8 * 500);
+        let bad = lines
+            .iter()
+            .filter(|line| {
+                let Some(rest) =
+                    line.strip_prefix("resolve-ahead: a worker panicked in a job task: ")
+                else {
+                    return true;
+                };
+                let mut parts = rest.split(' ');
+                !(parts
+                    .next()
+                    .is_some_and(|t| t.parse::<u32>().is_ok_and(|t| t < 8))
+                    && parts
+                        .next()
+                        .is_some_and(|l| l.parse::<u32>().is_ok_and(|l| l < 500))
+                    && parts.next().is_none())
+            })
+            .count();
+        assert_eq!(bad, 0, "{bad} lines garbled");
+    }
 }
