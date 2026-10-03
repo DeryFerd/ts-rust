@@ -94,6 +94,30 @@ impl DeclarationPrint {
     }
 }
 
+/// PORT: not in Go (perf). The second half of Go `emitJSFile`: the print of
+/// a transformed JS tree (`Emitter::transform_js_file`). With twins on, a
+/// file whose JS transforms ran on its checker thread hands it to the twin
+/// of its checker (`program_emit`).
+pub struct JsPrint {
+    /// The transformed SourceFile.
+    pub source_file: Node,
+    pub emit_context: Rc<EmitContext>,
+    /// The Go `emitJsFileOrBundle` trace event, which ends after the print.
+    trace: Option<crate::tracing::Pop>,
+}
+
+impl JsPrint {
+    /// A print with no trace event, for another thread.
+    #[must_use]
+    pub fn new(source_file: Node, emit_context: Rc<EmitContext>) -> Self {
+        Self {
+            source_file,
+            emit_context,
+            trace: None,
+        }
+    }
+}
+
 // Go: compiler/emitter.go:55 declarationTransformer (#4712)
 // PORT: renamed, because `DeclarationTransformer` is the declarations
 // transformer struct.
@@ -235,13 +259,46 @@ impl Emitter {
 
     // Go: compiler/emitter.go:181 emitter.emitJSFile
     fn emit_js_file(&mut self, source_file: Node, js_file_path: &str, source_map_file_path: &str) {
+        if let Some(print) = self.transform_js_file(source_file, js_file_path) {
+            self.print_js_file(print, js_file_path, source_map_file_path);
+        }
+    }
+
+    /// PORT: not in Go. The JS part of a file (`emit_only` is `Js`) up to
+    /// its print: the script transforms, which may call the emit resolver,
+    /// so they run on the file's checker thread. It returns the print, or
+    /// `None` when the part has nothing to print (skipped or blocked).
+    /// `finish_js_part` runs the rest.
+    pub fn transform_js_part(&mut self) -> Option<JsPrint> {
+        debug_assert!(self.emit_only == EmitOnly::Js, "not a JS part");
+        let js_file_path = self.paths.js_file_path().to_string();
+        let print = self.transform_js_file(self.source_file, &js_file_path);
+        if print.is_none() {
+            self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
+        }
+        print
+    }
+
+    /// PORT: not in Go. The rest of `emit` after `transform_js_part`
+    /// returned `print`. It needs no checker: Go `emitJSFile` gives its
+    /// printer no handlers.
+    pub fn finish_js_part(&mut self, print: JsPrint) {
+        let js_file_path = self.paths.js_file_path().to_string();
+        let source_map_file_path = self.paths.source_map_file_path().to_string();
+        self.print_js_file(print, &js_file_path, &source_map_file_path);
+        self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
+    }
+
+    /// The part of Go `emitJSFile` up to its printer: the script
+    /// transforms. None when it returns before the print.
+    fn transform_js_file(&mut self, source_file: Node, js_file_path: &str) -> Option<JsPrint> {
         let options = options();
 
         if source_file.is_nil()
             || self.emit_only != EmitOnly::All && self.emit_only != EmitOnly::Js
             || js_file_path.is_empty()
         {
-            return;
+            return None;
         }
 
         if !self.force_emit
@@ -249,10 +306,10 @@ impl Emitter {
                 || crate::printer::EmitHost::is_emit_blocked(self.host.as_ref(), js_file_path))
         {
             self.emit_result.emit_skipped = true;
-            return;
+            return None;
         }
 
-        let _trace = crate::tracing::get().map(|tr| {
+        let trace = crate::tracing::get().map(|tr| {
             tr.push(
                 crate::tracing::Phase::Emit,
                 "emitJsFileOrBundle",
@@ -261,9 +318,25 @@ impl Emitter {
             )
         });
 
-        let (emit_context, put_emit_context) = get_emit_context();
+        // Go `putEmitContext()` is the `reset` at the end of `print_js_file`.
+        let (emit_context, _) = get_emit_context();
 
         let source_file = self.run_script_transformers(&emit_context, source_file);
+        Some(JsPrint {
+            source_file,
+            emit_context,
+            trace,
+        })
+    }
+
+    /// The rest of Go `emitJSFile`: the printer and the print of `print`.
+    fn print_js_file(&mut self, print: JsPrint, js_file_path: &str, source_map_file_path: &str) {
+        let options = options();
+        let JsPrint {
+            source_file,
+            emit_context,
+            trace: _trace,
+        } = print;
 
         let printer_options = PrinterOptions {
             remove_comments: options.remove_comments.is_true(),
@@ -303,7 +376,8 @@ impl Emitter {
             options,
             should_emit_source_maps,
         );
-        put_emit_context();
+        // Go `putEmitContext()`.
+        emit_context.reset();
     }
 
     /// PORT: not in Go. The d.ts part of a split file (`emit_only` is
