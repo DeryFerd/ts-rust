@@ -21,7 +21,7 @@ use ts_goport::frontend::tspath::Path;
 use ts_goport::prelude::*;
 use ts_goport::program::{note_parsed_source_file, publish_parsed_files};
 
-// Go: scanner/scanner_test.go:11 TestScanStringPreservesLoneSurrogates
+// Go: scanner/scanner_test.go:13 TestScanStringPreservesLoneSurrogates
 // PORT: Go strings hold lone surrogates as WTF-8 bytes. The port keeps them
 // in its Go string form (`scanner_util::GO_STRING_MARKER`), which
 // `encode_js_string_rune` also writes.
@@ -38,7 +38,7 @@ fn test_scan_string_preserves_lone_surrogates() {
     assert_eq!(s.token_value(), expected);
 }
 
-// Go: parser/parser_test.go:166 TestHeritageClauseElementKinds
+// Go: parser/parser_test.go:158 TestHeritageClauseElementKinds
 #[test]
 fn test_heritage_clause_element_kinds() {
     let source_text = r#"
@@ -104,7 +104,7 @@ class MissingImplements implements B. {}
     );
 }
 
-// Go: parser/parser_test.go:164 TestJSDocImportTypeParentChain
+// Go: parser/parser_test.go:189 TestJSDocImportTypeParentChain
 // PORT: `GetSourceFileOfNode` reads the Go file data of the file, which
 // exists once its node store is published. Publishing is process-wide, so
 // the test runs in a child process of its own.
@@ -176,7 +176,7 @@ test("", async function () {
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
-// Go: parser/parser_test.go:244 TestJSDocTypeSourceSurvivesReparse
+// Go: parser/parser_test.go:236 TestJSDocTypeSourceSurvivesReparse
 // PORT: `GetTextOfNode` reads the source file of the node, which exists once
 // its node store is published, so the test runs in a child process (see
 // `test_js_doc_import_type_parent_chain`).
@@ -301,7 +301,7 @@ fn test_missing_typedef_name_error_starts_one_go_byte_back() {
     assert_eq!(found, [(15, 22)]);
 }
 
-// Go: parser/parser_test.go:292 TestJSDocTypeSourcePropagatesToConstructedReparse
+// Go: parser/parser_test.go:284 TestJSDocTypeSourcePropagatesToConstructedReparse
 #[test]
 fn test_js_doc_type_source_propagates_to_constructed_reparse() {
     in_child(
@@ -399,7 +399,7 @@ fn check_lazy_js_doc_calls(file: Node) {
     assert_eq!(f.eager_js_doc(file).to_vec(), first);
 }
 
-// Go: parser/parser_test.go:319 TestSourceFilePositionMapWithNonASCIIStringLiteral
+// Go: parser/parser_test.go:311 TestSourceFilePositionMapWithNonASCIIStringLiteral
 // PORT: renamed from TestSourceFileContainsNonASCIIInStringLiteralFastPath
 // (old Rust name `test_source_file_contains_non_ascii_in_string_literal_fast_path`)
 // by tsgo#4776, which also dropped the `ContainsNonASCII` assert.

@@ -161,7 +161,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/printer.go:55 TypeToStringEx and checker/printer.go:189 typeToStringEx
+    // Go: checker/printer.go:55 TypeToStringEx and checker/printer.go:59 typeToStringEx
     pub fn type_to_string_ex(
         &mut self,
         t: TypeId,
@@ -269,7 +269,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/printer.go:128 SymbolToStringEx and checker/printer.go:261 symbolToStringEx
+    // Go: checker/printer.go:128 SymbolToStringEx and checker/printer.go:132 symbolToStringEx
     pub fn symbol_to_string_ex(
         &mut self,
         symbol: SymbolId,
@@ -346,7 +346,7 @@ impl Checker {
         self.signature_to_string_ex(signature, Node::NIL, TypeFormatFlags::NONE, None)
     }
 
-    // Go: checker/printer.go:183 SignatureToStringEx and checker/printer.go:319 signatureToStringEx
+    // Go: checker/printer.go:183 SignatureToStringEx and checker/printer.go:187 signatureToStringEx
     pub fn signature_to_string_ex(
         &mut self,
         signature: SignatureId,

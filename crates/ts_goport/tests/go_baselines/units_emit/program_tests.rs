@@ -161,7 +161,7 @@ type ProgramTest = (
     ScriptTarget,
 );
 
-// Go: compiler/program_test.go:129 programTestCases
+// Go: compiler/program_test.go:133 programTestCases
 #[rustfmt::skip]
 const PROGRAM_TEST_CASES: &[ProgramTest] = &[
     (
@@ -217,7 +217,7 @@ const PROGRAM_TEST_CASES: &[ProgramTest] = &[
     ),
 ];
 
-// Go: compiler/program_test.go:225 TestProgram
+// Go: compiler/program_test.go:229 TestProgram
 // PORT: the Go subtests run on one map file system each. Here they run in
 // one child process with one map file system (the OS override is set once
 // per process); each subtest writes its files over the previous ones, and
@@ -275,7 +275,7 @@ fn test_program() {
     });
 }
 
-// Go: compiler/program_test.go:267 TestIncludeProcessorDiagnosticsWithMissingFileCasing
+// Go: compiler/program_test.go:271 TestIncludeProcessorDiagnosticsWithMissingFileCasing
 #[test]
 fn test_include_processor_diagnostics_with_missing_file_casing() {
     in_child(
@@ -325,7 +325,7 @@ fn test_include_processor_diagnostics_with_missing_file_casing() {
     );
 }
 
-// Go: checker/checker_test.go:19 TestGetSymbolAtLocation
+// Go: checker/checker_test.go:20 TestGetSymbolAtLocation
 #[test]
 fn test_get_symbol_at_location() {
     in_child(module_path!(), "test_get_symbol_at_location", || {
