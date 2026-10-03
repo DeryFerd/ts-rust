@@ -1,8 +1,10 @@
 // Browser, Deno and worker entry. Runs are in memory: the files are given
 // as a map from absolute path to text. In a browser, call `tsc` from a Web
-// Worker, so that a run does not block the page. Runs use JSPI where the
-// engine has it (`runTscAsync`), which gives the deeply recursive checker
-// more stack.
+// Worker, so that a run does not block the page. It also works on the
+// page's main thread. Runs use JSPI where the engine has it
+// (`runTscAsync`), which gives the deeply recursive checker about 2 times
+// more stack in a Chrome worker. Safari has no JSPI, and its workers have
+// a small stack (see README.md).
 
 import { memoryFileSystem, runTsc, runTscAsync } from "./core.js";
 

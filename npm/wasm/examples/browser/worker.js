@@ -1,5 +1,5 @@
-// Runs tsc for main.js, off the page's main thread: Chrome does not let the
-// main thread make the instance, and a run would block the page.
+// Runs tsc for main.js, off the page's main thread, so that a run does not
+// block the page.
 
 import { loadModule, tsc } from "../../browser.js";
 

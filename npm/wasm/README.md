@@ -51,7 +51,10 @@ const { exitCode, diagnostics, files } = await tsc(["-p", "/app"], {
 tsc's usual text.
 
 In a browser, call `tsc` from a module Web Worker, as `examples/browser` does, so that a run does not
-block the page. Serve `ts_rust.wasm` as `application/wasm`, so that it compiles while it downloads.
+block the page. It also works on the page's main thread. A Safari worker has a small stack and no
+JSPI: a run there fails at about 230 terms of `1 + 1 + ...`, or at a chain of 200 method calls.
+Chrome and Firefox workers reach about 1,000 to 1,500 terms, and Safari's main thread about 7,000.
+Serve `ts_rust.wasm` as `application/wasm`, so that it compiles while it downloads.
 To try the example, run `python3 -m http.server -d npm/wasm` and open
 `http://localhost:8000/examples/browser/`.
 
