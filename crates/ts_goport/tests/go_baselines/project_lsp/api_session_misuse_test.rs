@@ -14,22 +14,26 @@ use std::rc::Rc;
 use ts_goport::api::{
     self, CheckerNodeParams, CheckerSymbolParams, CheckerTypeParams, CreateSnapshotParams,
     GetCompletionsAtPositionParams, GetContextualTypeForArgumentParams, GetContextualTypeParams,
-    GetDefaultProjectForFileParams, GetDiagnosticsParams, GetSourceFileParams,
-    GetSymbolAtPositionParams, GetTypeAtPositionParams, GetTypeFromTypeNodeParams,
-    GetTypePropertyParams, NodeHandle, SignatureToSignatureDeclarationParams, SnapshotID,
-    SnapshotRequestChangesParams, SourceFileResponse, TypeToTypeNodeParams,
+    GetCurrentLanguageServerSnapshotParams, GetDefaultProjectForFileParams, GetDiagnosticsParams,
+    GetSourceFileParams, GetSymbolAtPositionParams, GetTypeAtPositionParams,
+    GetTypeFromTypeNodeParams, GetTypePropertyParams, NodeHandle,
+    SignatureToSignatureDeclarationParams, SnapshotID, SnapshotRequestChangesParams,
+    SourceFileResponse, TypeToTypeNodeParams,
 };
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::parser::{self, SourceFileParseOptions};
 use ts_goport::frontend::tspath::Path;
 use ts_goport::gostd::context::Context;
+use ts_goport::ls::lsutil;
+use ts_goport::lsp::lsproto;
+use ts_goport::options::Tristate;
 use ts_goport::scanner_util::go_string_from_bytes;
 use ts_goport::{program, project};
 
 use super::api_util::{doc, nil_error};
 use super::projecttestutil::{self, files};
-use super::util::bg;
+use super::util::{bg, uri};
 
 /// Go's runtime text for a nil pointer dereference.
 const NIL_DEREFERENCE: &str = "runtime error: invalid memory address or nil pointer dereference";
@@ -94,6 +98,56 @@ impl Api {
     fn close(self) {
         self.session.close();
         self.project_session.close();
+    }
+
+    /// An API session in an LSP server with the workspace preferences
+    /// `preferences` (Go `session.Configure`, as `didChangeConfiguration`
+    /// sets them) and the valid UTF-8 file `open` open, on the server's
+    /// current snapshot (`getCurrentLanguageServerSnapshot`), with the
+    /// default project of `file`. An API snapshot (`createSnapshot`) does
+    /// not read the server's preferences.
+    fn in_language_server(
+        entries: &[(&str, &str)],
+        open: (&str, &str),
+        file: &str,
+        preferences: lsutil::UserPreferences,
+    ) -> Self {
+        let (project_session, _) = projecttestutil::setup(files(entries));
+        project_session.configure(preferences);
+        let ctx = bg();
+        let open_uri = uri(&format!("file://{}", open.0));
+        project_session.did_open_file(
+            &ctx,
+            &open_uri,
+            1,
+            open.1,
+            &lsproto::LanguageKind::TYPE_SCRIPT,
+        );
+        // A server request takes the new preferences into the snapshot
+        // (Go `flushChanges`); `APIUpdate` drops them.
+        nil_error(project_session.get_language_service(&ctx, &open_uri));
+        let session = api::new_lsp_session(project_session.clone(), None);
+        let snapshot = nil_error(session.handle_get_current_language_server_snapshot(
+            &ctx,
+            &GetCurrentLanguageServerSnapshotParams::default(),
+        ))
+        .snapshot;
+        let project = nil_error(session.handle_get_default_project_for_file(
+            &ctx,
+            &GetDefaultProjectForFileParams {
+                snapshot,
+                file: doc(file),
+            },
+        ))
+        .expect("a default project")
+        .id;
+        Self {
+            project_session,
+            session,
+            ctx,
+            snapshot,
+            project,
+        }
     }
 }
 
@@ -504,6 +558,47 @@ child_test! {
             assert_eq!(
                 completions_panic_text(&api, B_TS, position, trigger),
                 format!("runtime error: slice bounds out of range [:{bound}] with length 15"),
+                "{position} {trigger:?}"
+            );
+        }
+        api.close();
+    }
+}
+
+child_test! {
+    // followups12 skeptic problem 1: with JSDoc completions off, Go reads a
+    // position past the text first in `text[:position]` of
+    // `getWordLengthAndStart` (completions.go:2885). The port indexed past
+    // the text there (a Rust panic text), and above i32::MAX it named its
+    // own bound, less the port bytes of the invalid byte. Each text is Go
+    // N's answer (followups13a probe c5).
+    fn completions_past_the_text_with_jsdoc_completions_off_panic_with_go_texts() {
+        const O_TS: &str = "/home/projects/p/o.ts";
+        const O_TEXT: &str = "export const b = 1;\n";
+        let text = go_string_from_bytes(b"const s = \"\xff\";\n".to_vec());
+        let api = Api::in_language_server(
+            &[
+                ("/home/projects/p/tsconfig.json", "{}"),
+                (B_TS, &text),
+                (O_TS, O_TEXT),
+            ],
+            (O_TS, O_TEXT),
+            B_TS,
+            lsutil::UserPreferences {
+                enable_js_doc_completions: Tristate::False,
+                ..lsutil::new_default_user_preferences()
+            },
+        );
+        for (position, trigger) in [
+            (16, None),
+            (1000, Some(".")),
+            (2147483641, None),
+            (2147483647, Some(".")),
+            (u32::MAX, Some("@")),
+        ] {
+            assert_eq!(
+                completions_panic_text(&api, B_TS, position, trigger),
+                format!("runtime error: slice bounds out of range [:{position}] with length 15"),
                 "{position} {trigger:?}"
             );
         }

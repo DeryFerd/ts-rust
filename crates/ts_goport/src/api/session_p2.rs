@@ -2620,14 +2620,24 @@ impl Session {
             // read of the position is the JSDoc snippet slice
             // `text[lineStart:position]` (ls/jsdoc_snippet.go:77), which
             // panics, so the port panics with Go's numbers there (see
-            // `past_text_reads_jsdoc_snippet`). Past that read, a panic
-            // would name the port's bound.
+            // `past_text_reads_jsdoc_snippet`). Past that read, the next
+            // read is the slice `text[:position]` of `getWordLengthAndStart`
+            // (completions.go:2885), and the port's panic there names the
+            // port's bound (`past_text`): the port gives Go's numbers.
             let position_map = source_file_get_position_map(source_file);
             let port_position = i64::from(params.position)
                 + i64::from(position_map.entries.last().map_or(0, |e| e.delta));
+            let mut past_text = None;
             let internal_pos = match i32::try_from(port_position) {
                 Ok(_) => position_map.utf16_to_utf8(params.position as i32),
                 Err(_) => {
+                    let text = source_file_text(source_file);
+                    let len = crate::scanner_util::go_len(&text);
+                    let extra = (text.len() - len) as i64;
+                    let go_position = port_position - extra;
+                    let go_text = format!(
+                        "runtime error: slice bounds out of range [:{go_position}] with length {len}"
+                    );
                     if past_text_reads_jsdoc_snippet(
                         source_file,
                         params.trigger_character.as_deref(),
@@ -2636,24 +2646,42 @@ impl Session {
                             .enable_js_doc_completions
                             .is_false(),
                     ) {
-                        let text = source_file_text(source_file);
-                        let len = crate::scanner_util::go_len(&text);
-                        let go_position = port_position - (text.len() - len) as i64;
-                        crate::core::go_panic(format!(
-                            "runtime error: slice bounds out of range [:{go_position}] with length {len}"
-                        ));
+                        crate::core::go_panic(go_text);
                     }
+                    let port_text = format!(
+                        "runtime error: slice bounds out of range [:{}] with length {len}",
+                        i64::from(i32::MAX) - extra
+                    );
+                    past_text = Some((port_text, go_text));
                     i32::MAX
                 }
             };
             drop(position_map);
-            let result = lang_svc.get_completions_at_position_exported(
-                ctx,
-                source_file,
-                internal_pos,
-                params.trigger_character.clone(),
-                params.include_symbol,
-            )?;
+            let complete = || {
+                lang_svc.get_completions_at_position_exported(
+                    ctx,
+                    source_file,
+                    internal_pos,
+                    params.trigger_character.clone(),
+                    params.include_symbol,
+                )
+            };
+            let result = match past_text {
+                None => complete()?,
+                Some((port_text, go_text)) => {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(complete)) {
+                        Ok(result) => result?,
+                        Err(mut payload) => {
+                            if let Some(panic) = payload.downcast_mut::<crate::core::GoPanic>()
+                                && panic.message == port_text
+                            {
+                                panic.message = go_text;
+                            }
+                            std::panic::resume_unwind(payload)
+                        }
+                    }
+                }
+            };
             Ok((result, source_file))
         };
 
