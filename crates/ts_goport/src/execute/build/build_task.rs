@@ -82,7 +82,7 @@ pub struct BuildInfoEntry {
     pub dts_time: Option<Option<SystemTime>>,
     // PORT: not in Go (perf). What a prefetch thread made from
     // `build_info` for the up-to-date check (`StatusPrefetch`), until the
-    // check takes it.
+    // check takes it or the build ends (`BuildTask::drop_status_prefetch`).
     pub status_prefetch: Option<Arc<StatusPrefetch>>,
 }
 
@@ -243,7 +243,9 @@ impl StatusPrefetch {
     /// build info that are TypeScript sources (`is_typescript_source`), as
     /// `BuildHost::get_m_time` reads them (`incremental.GetMTime`) on `fs`.
     /// No task of a build writes such a file, so the mtime is the one that
-    /// the check would read later. Each path is read once: the build info
+    /// the check of the same build would read later. The build drops what
+    /// its checks did not take (`BuildTask::drop_status_prefetch`), so a
+    /// later build reads the file system. Each path is read once: the build info
     /// lists the root files too. `os_fs`: `fs` is the wrapped OS file
     /// system (`is_wrapped_os_fs`), so the OS paths are read together
     /// (`os_mod_times`).
@@ -2009,6 +2011,26 @@ impl BuildTask {
 
     // Go: build/buildtask.go:821 (*BuildTask).updateWatch
     // PORT: in orchestrator_watch.rs.
+
+    /// PORT: not in Go (perf). Drops what a prefetch thread made for the
+    /// check of this task (`BuildInfoEntry::status_prefetch`) when the check
+    /// did not take it: it returned before (a content mapper error, errors
+    /// in the build info), or only the compile read the build info. The
+    /// entry can outlive the build (watch reuses it when the compile writes
+    /// no build info), and the mtimes in it are of this build: the check of
+    /// a later build reads the file system, as Go's does
+    /// (build/host.go:102 loadOrStoreMTime, with the new mtime cache of
+    /// build/orchestrator.go:498 updateWatch). The orchestrator calls this
+    /// for each task at the end of a build.
+    pub fn drop_status_prefetch(&mut self) {
+        if let Some(prefetch) = self
+            .build_info_entry
+            .as_mut()
+            .and_then(|entry| entry.status_prefetch.take())
+        {
+            drop_in_background(prefetch);
+        }
+    }
 
     // Go: build/buildtask.go:831 (*BuildTask).resetStatus
     pub fn reset_status(&mut self) {

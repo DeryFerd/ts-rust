@@ -485,6 +485,7 @@ impl PrefetchPool {
 impl Drop for PrefetchPool {
     fn drop(&mut self) {
         let mut queue = lock(&self.shared.queue);
+        queue.configs_closed = true;
         queue.closed = true;
         queue.configs.clear();
         if !queue.reads_final {
@@ -605,12 +606,16 @@ fn run_thread(shared: &Arc<Shared>) {
     // Go: sys.FS() is bundled.WrapFS(osvfs.FS()), and the build host
     // caches it (`cachedvfs.From`). Made at the first config.
     let mut config_host: Option<(ThreadConfigHost, TscExtendedConfigCache)> = None;
-    let mut ran_job = false;
+    let mut thread = ThreadEnd {
+        shared,
+        busy: false,
+    };
     loop {
         let job = {
             let mut queue = lock(&shared.queue);
-            if ran_job {
+            if thread.busy {
                 queue.busy -= 1;
+                thread.busy = false;
             }
             loop {
                 let job = match queue.configs.pop_front() {
@@ -630,7 +635,7 @@ fn run_thread(shared: &Arc<Shared>) {
                     .unwrap_or_else(PoisonError::into_inner);
             }
         };
-        ran_job = true;
+        thread.busy = true;
         match job {
             Job::Config(config, path, slot) => {
                 let Some(options) = &shared.options else {
@@ -662,6 +667,29 @@ fn run_thread(shared: &Arc<Shared>) {
                 );
             }
             Job::Read(job) => read_build_info(shared, &job),
+        }
+    }
+}
+
+/// A pool thread's count in the queue. A panic outside the `catch_unwind`
+/// of a job (the config host of `run_thread`) ends the thread: it then
+/// counts as ended (`Queue::threads`), and its job as done (`Queue::busy`),
+/// so `threads_to_start` starts threads in its place. Its config slot stays
+/// `Queued`, and the orchestrator parses that config (`PrefetchPool::take`).
+struct ThreadEnd<'a> {
+    shared: &'a Shared,
+    /// The thread runs a job, which `Queue::busy` counts.
+    busy: bool,
+}
+
+impl Drop for ThreadEnd<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let mut queue = lock(&self.shared.queue);
+            queue.threads -= 1;
+            if self.busy {
+                queue.busy -= 1;
+            }
         }
     }
 }
@@ -974,5 +1002,32 @@ mod tests {
             taken,
             Ok(Err(format!("test panic after the parse of {config}")))
         );
+    }
+
+    // A pool thread that a panic outside the catch_unwind of a job ends
+    // (the config host of `run_thread`) counts as ended, and its job as
+    // done. Before, it stayed counted as a busy thread, and a pool whose
+    // threads all ended so started no thread for the build info reads,
+    // whose checks then waited forever.
+    #[test]
+    fn thread_ended_by_a_panic_is_not_counted() {
+        let pool = PrefetchPool::new(None, &ComparePathsOptions::default(), false);
+        {
+            let mut queue = lock(&pool.shared.queue);
+            queue.threads = 1;
+            queue.busy = 1;
+        }
+        let shared = pool.shared.clone();
+        let ended = std::thread::spawn(move || {
+            let _thread = ThreadEnd {
+                shared: &shared,
+                busy: true,
+            };
+            panic!("test panic in the config host");
+        })
+        .join();
+        assert!(ended.is_err());
+        let queue = lock(&pool.shared.queue);
+        assert_eq!((queue.threads, queue.busy), (0, 0));
     }
 }
