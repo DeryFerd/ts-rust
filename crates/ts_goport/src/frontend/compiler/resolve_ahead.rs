@@ -440,7 +440,10 @@ fn debug_log(line: std::fmt::Arguments<'_>) {
 /// Writes `line` and a newline to stderr (`to` is `1`) or to the end of
 /// file `to`. The workers (`log_panic`) and the loader write at the same
 /// time, so the line is built first and goes out in one write: a write
-/// per part of the format let the lines of two threads interleave.
+/// per part of the format let the lines of two threads interleave. A
+/// failed write is dropped, never a panic: a worker logs a caught panic
+/// before it counts itself out of the job (`run_task`), so a panic here
+/// (`eprintln!` on a closed stderr) made a force load wait forever.
 fn write_debug_line(to: &str, line: std::fmt::Arguments<'_>) {
     use std::io::Write;
     let line = format!("{line}\n");

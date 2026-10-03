@@ -434,7 +434,7 @@ impl dirty::Cloneable for CachedDirectory {
     }
 }
 
-// Go: project/snapshotfs.go:143 mergeCachedDirectoryEntries (ts#64291)
+// Go: project/snapshotfs.go:144 mergeCachedDirectoryEntries (ts#64291)
 // PORT: Go ranges over the cached entries map (random order); insertion
 // order here (`CachedDirectory`).
 pub fn merge_cached_directory_entries(

@@ -931,6 +931,9 @@ fn report_unported() -> bool {
 /// Keeps unported panics quiet (they are counted) and prints other panics.
 /// The run prints a Go panic. A panic that a Go `recover()` catches
 /// (`core::go_recover`: an API request answers it) prints nothing, as in Go.
+/// The writes drop their errors: `eprintln!` panics when stderr is a pipe
+/// with no reader, and a panic inside the hook aborts the process, also for
+/// a panic that a caller catches (`tests/tsgo_panic_hook.rs`).
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         if info.payload().is::<GoPanic>() {
@@ -939,7 +942,8 @@ fn install_panic_hook() {
         let message = payload_message(info.payload());
         if message.starts_with(UNPORTED_PREFIX) || ts_goport::core::in_go_recover() {
             if std::env::var_os("GOPORT_TRACE").is_some() {
-                eprintln!(
+                let _ = writeln!(
+                    std::io::stderr(),
                     "trace: {message}\n{}",
                     std::backtrace::Backtrace::force_capture()
                 );
@@ -952,9 +956,13 @@ fn install_panic_hook() {
             .unwrap_or_default();
         // The output so far comes first, also in one file with stderr.
         ts_goport::execute::tsc::stdio::flush_cli_stdout_at_exit();
-        eprintln!("tsgo: panic{location}: {message}");
+        let _ = writeln!(std::io::stderr(), "tsgo: panic{location}: {message}");
         if std::env::var_os("GOPORT_TRACE").is_some() {
-            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}",
+                std::backtrace::Backtrace::force_capture()
+            );
         }
     }));
 }

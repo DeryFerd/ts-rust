@@ -278,9 +278,14 @@ fn last_stats() -> LoadStats {
 /// Ends this test process when the test has not ended after `seconds`, so
 /// a load that waits forever fails the test.
 fn watchdog(seconds: u64) {
+    use std::io::Write;
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(seconds));
-        eprintln!("watchdog: the test did not end in {seconds} s");
+        // stdout: a test can close stderr, and `eprintln!` panics there.
+        let _ = writeln!(
+            std::io::stdout(),
+            "watchdog: the test did not end in {seconds} s"
+        );
         std::process::exit(3);
     });
 }
@@ -502,6 +507,49 @@ os_child_test! {
         assert!(!stats.worker_panic, "{stats:?}");
         assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
     }
+}
+
+os_child_test! {
+    env &[("GOPORT_RESOLVE_AHEAD_STATS", "1")];
+    /// The debug log (`GOPORT_RESOLVE_AHEAD_STATS=1`) writes to stderr. When
+    /// stderr is a pipe with no reader, each write fails (EPIPE). A worker
+    /// that caught a panic logs it before it counts itself out of the job
+    /// (`run_task`), so a write that panics (R162: `eprintln!`) ends the
+    /// worker there, and a load that waits for the workers (`Mode::Force`)
+    /// waits forever. The load must resolve its keys itself, and the next
+    /// load must take every answer, so no worker left the pool.
+    #[cfg(unix)]
+    fn a_worker_panic_logs_to_a_closed_stderr_and_the_load_goes_on() {
+        watchdog(120);
+        close_stderr();
+        let root = make_project("closedstderr");
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        open_index(&session, &root);
+        resolve_ahead::inject_worker_panic(true);
+        add_import(&session, &root);
+        resolve_ahead::inject_worker_panic(false);
+        let stats = last_stats();
+        assert!(stats.worker_panic, "{stats:?}");
+        assert_eq!(stats.loader.taken, 0, "{stats:?}");
+        edit_index(&session, &root, 3, "import { b as b2 } from \"./sub/b\";\n");
+        let stats = last_stats();
+        assert!(!stats.worker_panic, "{stats:?}");
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+        resolve_ahead::set_mode(None);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// Makes stderr a pipe with no reader, so each write to it fails with EPIPE
+/// (a Rust program ignores SIGPIPE). A closed fd 2 would not do: the
+/// standard library drops writes to it (EBADF) with no error.
+#[cfg(unix)]
+fn close_stderr() {
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+    rustix::stdio::dup2_stderr(&writer).expect("stderr to the pipe");
 }
 
 /// The project of `a_released_project_drops_the_kept_state` in `other/`,
