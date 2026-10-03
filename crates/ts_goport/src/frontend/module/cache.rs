@@ -228,6 +228,25 @@ pub struct Caches {
     /// The loader's resolver during a resolve-ahead program load
     /// (compiler/resolve_ahead.rs). The load removes it at its end.
     pub ahead: RefCell<Option<AheadLink>>,
+
+    /// The loader's resolver after a resolve-ahead load: the package.json
+    /// lookups of the worker answers that it took, by the path of the
+    /// package.json: whether its directory and the file exist. Go has them
+    /// in the one package.json cache of the load's resolutions; here a
+    /// later lookup of the resolver makes its cache entry from them, with
+    /// no file system call (`ahead_package_json`).
+    // PORT: not in Go (perf). The worker's parse stays on the worker.
+    pub ahead_package_jsons: RefCell<FxHashMap<Path, AheadPackageJson>>,
+}
+
+/// A package.json lookup of a worker answer that the loader took
+/// (`Caches::ahead_package_jsons`).
+// PORT: not in Go (perf).
+#[derive(Clone, Copy, Debug)]
+pub struct AheadPackageJson {
+    pub directory_exists: bool,
+    /// The package.json file exists.
+    pub exists: bool,
 }
 
 /// The loader's resolver in a resolve-ahead program load
@@ -252,6 +271,9 @@ pub struct AheadLink {
     /// found there (`AheadQueue::find`).
     pub cursor: Cell<usize>,
     pub stats: Cell<AheadStats>,
+    /// The package.json call groups (`AheadCall::PackageJson`) of the taken
+    /// answers that `Caches::ahead_package_jsons` has, by address.
+    pub package_jsons: RefCell<FxHashSet<usize>>,
 }
 
 /// The keys of the previous load, which the resolve-ahead workers resolve
@@ -487,6 +509,7 @@ impl Caches {
             worker_package_jsons: RefCell::new(Vec::new()),
             worker_lookups: RefCell::new(Vec::new()),
             ahead: RefCell::new(None),
+            ahead_package_jsons: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -502,7 +525,9 @@ impl Caches {
         self.parsed_patterns_for_paths.clear();
         let worker_package_jsons = std::mem::take(&mut *self.worker_package_jsons.borrow_mut());
         let worker_lookups = std::mem::take(&mut *self.worker_lookups.borrow_mut());
+        let ahead_package_jsons = std::mem::take(&mut *self.ahead_package_jsons.borrow_mut());
         drop(type_ref_directives);
+        drop(ahead_package_jsons);
         // PERF: in the language server, resolve-ahead workers made most of
         // these answers; they free them (with none, they drop here).
         crate::frontend::compiler::resolve_ahead::drop_on_worker(Box::new((
@@ -1082,7 +1107,69 @@ impl Caches {
         ahead.stats.set(stats);
         let found = found.filter(|_| accepted)?;
         self.note_worker_package_jsons(&found.package_jsons);
+        if let Some(calls) = &found.ahead {
+            self.note_ahead_package_jsons(ahead, calls);
+        }
         Some(found.value)
+    }
+
+    /// Keeps the package.json lookups of a taken answer's calls in
+    /// `ahead_package_jsons`, once per call group and load. A group is the
+    /// `directory_exists` of the package directory and, when it exists, the
+    /// `file_exists` of its package.json (`package_json_calls`).
+    fn note_ahead_package_jsons(&self, ahead: &AheadLink, calls: &[AheadCall]) {
+        for call in calls {
+            let AheadCall::PackageJson(group) = call else {
+                continue;
+            };
+            let address = Arc::as_ptr(group).cast::<AheadCall>() as usize;
+            if !ahead.package_jsons.borrow_mut().insert(address) {
+                continue;
+            }
+            let (path, lookup) = match &group[..] {
+                [
+                    AheadCall::DirectoryExists {
+                        path,
+                        exists: false,
+                    },
+                ] => (
+                    Path(combine_paths(path.as_str(), &["package.json"])),
+                    AheadPackageJson {
+                        directory_exists: false,
+                        exists: false,
+                    },
+                ),
+                [
+                    AheadCall::DirectoryExists { exists: true, .. },
+                    AheadCall::FileExists { path, exists, .. },
+                    ..,
+                ] => (
+                    path.clone(),
+                    AheadPackageJson {
+                        directory_exists: true,
+                        exists: *exists,
+                    },
+                ),
+                _ => continue,
+            };
+            self.ahead_package_jsons
+                .borrow_mut()
+                .entry(path)
+                .or_insert(lookup);
+        }
+    }
+
+    /// The lookup of `package_json_path` by a worker answer that the loader
+    /// took (`ahead_package_jsons`), if one made it.
+    #[must_use]
+    pub fn ahead_package_json(&self, package_json_path: &str) -> Option<AheadPackageJson> {
+        let lookups = self.ahead_package_jsons.borrow();
+        if lookups.is_empty() {
+            return None;
+        }
+        lookups
+            .get(&self.package_json_info_cache.key(package_json_path))
+            .copied()
     }
 
     /// Takes the package.json lookups of the resolution that just ended.

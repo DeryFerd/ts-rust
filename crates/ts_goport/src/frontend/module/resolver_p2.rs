@@ -1017,8 +1017,25 @@ impl ResolutionState<'_> {
             }
         }
 
-        let directory_exists = self.resolver.host.fs().directory_exists(package_directory);
-        if directory_exists && self.resolver.host.fs().file_exists(&package_json_path) {
+        // PORT: when a resolve-ahead load took a worker answer that looked
+        // this package.json up (compiler/resolve_ahead.rs), the lookup
+        // answers come from that answer with no file system call, as Go's
+        // one cache of the load's resolutions has them. The load replayed
+        // their side effects when it took the answer, and the snapshot has
+        // the text.
+        let (directory_exists, file_exists) =
+            match self.resolver.caches.ahead_package_json(&package_json_path) {
+                Some(lookup) => (lookup.directory_exists, lookup.exists),
+                None => {
+                    let directory_exists =
+                        self.resolver.host.fs().directory_exists(package_directory);
+                    (
+                        directory_exists,
+                        directory_exists && self.resolver.host.fs().file_exists(&package_json_path),
+                    )
+                }
+            };
+        if directory_exists && file_exists {
             // Ignore error
             let (contents, _) = self.resolver.host.fs().read_file(&package_json_path);
             // PORT: Go `packagejson.Parse` returns zero `Fields` and an error for an invalid file.

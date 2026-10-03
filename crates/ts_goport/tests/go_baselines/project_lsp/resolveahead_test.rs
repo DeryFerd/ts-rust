@@ -684,3 +684,98 @@ os_child_test! {
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
+
+os_child_test! {
+    /// A load takes the answers of the workers, and the workers' parses of
+    /// the package.json files stay on the workers. A later lookup of the
+    /// program's resolver (`Program::get_package_json_info`, as auto-imports
+    /// make) must find the package.json lookups of the taken answers, as Go's
+    /// one cache of the load's resolutions has them, with no file system
+    /// call: here the disk changed after the load and the snapshot's lookup
+    /// cache is empty, so a call would find the new disk. `broken` has a
+    /// package.json but no types file, and `not-installed` has no directory;
+    /// no file of the program is in them, so the loader did not look them up
+    /// itself.
+    fn a_later_package_json_lookup_uses_the_taken_answers() {
+        let root = make_project("pjlookup");
+        write(
+            &root,
+            "node_modules/broken/package.json",
+            r#"{ "name": "broken", "version": "1.0.0", "types": "gone.d.ts" }"#,
+        );
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        let uri = file_uri(&root, "src/index.ts");
+        open(
+            &session,
+            &uri,
+            &format!("{INDEX}import {{ z }} from \"broken\";\n"),
+        );
+        program(&session, &uri);
+        edit_index(&session, &root, 2, "import { d } from \"./sub/d\";\n");
+        let stats = last_stats();
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+        let program = program(&session, &uri);
+        let broken = format!("{root}/node_modules/broken/package.json");
+        let not_installed = format!("{root}/node_modules/not-installed/package.json");
+        let resolver = program
+            .processed_files
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.as_default_resolver())
+            .expect("the default resolver");
+        for name in [&broken, &not_installed] {
+            assert!(
+                resolver.caches.package_json_info_cache.get(name).is_none(),
+                "the loader looked up {name} itself"
+            );
+        }
+        std::fs::remove_dir_all(format!("{root}/node_modules/broken")).unwrap();
+        write(
+            &root,
+            "node_modules/not-installed/package.json",
+            r#"{ "name": "not-installed", "version": "1.0.0" }"#,
+        );
+        let snapshot = session.snapshot();
+        let config = tspath::to_path(&format!("{root}/tsconfig.json"), &root, true);
+        let project = snapshot
+            .project_collection
+            .configured_project(&config)
+            .expect("configured project");
+        let source = project
+            .borrow()
+            .host
+            .as_ref()
+            .expect("host")
+            .source_fs
+            .source
+            .borrow()
+            .clone();
+        let lookups = source.fs();
+        ts_goport::frontend::vfs::Fs::as_any(&*lookups)
+            .and_then(|fs| fs.downcast_ref::<project::snapshotfs::CachedLayeredFileSystem>())
+            .expect("the snapshot's lookup cache")
+            .fs
+            .clear_cache();
+        let info = program
+            .get_package_json_info(&broken)
+            .expect("the package.json of broken");
+        let (name, _) = info
+            .get_contents()
+            .expect("contents")
+            .header_fields
+            .name
+            .get_value();
+        assert_eq!(name, "broken");
+        assert!(
+            program.get_package_json_info(&not_installed).is_none(),
+            "a package.json in a directory that the load found missing"
+        );
+        resolve_ahead::set_mode(None);
+        drop(program);
+        drop(project);
+        drop(snapshot);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
