@@ -1482,7 +1482,19 @@ pub struct PositionMap {
     /// cumulative delta (utf8Offset - utf16Offset) through it. This allows
     /// O(log n) conversion in either direction.
     pub entries: Vec<PositionMapEntry>,
+    /// PORT: the port offset of each rune whose Go bytes are in more than
+    /// one unit of the port form (`SPLIT_RUNE_LEN`). Usually empty.
+    split_runes: Vec<i32>,
 }
+
+/// PORT: the port size of the only Go rune that is more than one unit of the
+/// port form: a WTF-8 lone surrogate in source text, which is 3 invalid byte
+/// units of 7 bytes (see `scanner_util::GO_STRING_MARKER`). Every other
+/// rune is at most one unit of at most 7 bytes. Go reads its 3 bytes as one
+/// rune (`DecodeJSStringRune`), and a position k bytes into it is the end of
+/// its k-th unit here.
+const SPLIT_RUNE_UNIT_LEN: i32 = 7;
+const SPLIT_RUNE_LEN: i32 = 3 * SPLIT_RUNE_UNIT_LEN;
 
 /// Go `ast.positionMapEntry`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1498,7 +1510,8 @@ pub struct PositionMapEntry {
 // it. `decode_go_js_string_rune` reads one Go `DecodeJSStringRune` rune and
 // gives its size in the port form, so each entry holds a port offset and the
 // UTF-16 length of the Go rune. An invalid byte and a WTF-8 lone surrogate
-// are each one UTF-16 unit, as in Go.
+// are each one UTF-16 unit, as in Go. A WTF-8 lone surrogate is 3 units
+// here; `split_runes` keeps its offset for the positions inside it.
 #[must_use]
 pub fn compute_position_map(text: &str) -> PositionMap {
     let mut pm = PositionMap::default();
@@ -1512,6 +1525,9 @@ pub fn compute_position_map(text: &str) -> PositionMap {
         }
         let (r, size, _) = decode_go_js_string_rune(&text[i..]);
         let utf16_size: i32 = if r >= 0x10000 { 2 } else { 1 };
+        if size as i32 > SPLIT_RUNE_UNIT_LEN {
+            pm.split_runes.push(i as i32);
+        }
         delta += size as i32 - utf16_size;
         pm.entries.push(PositionMapEntry {
             utf8_pos: (i + size) as i32,
@@ -1551,9 +1567,29 @@ impl PositionMap {
         }
         if lo == 0 {
             // Before any multi-byte character
-            return utf8_offset;
+            return self.split_rune_utf16(utf8_offset, 0);
         }
-        utf8_offset - self.entries[lo - 1].delta
+        self.split_rune_utf16(utf8_offset, self.entries[lo - 1].delta)
+    }
+
+    /// `utf8_offset - delta`, the Go result for an offset after the last
+    /// multi-byte character before it, whose cumulative delta is `delta`.
+    // PORT: an offset inside a split rune (`SPLIT_RUNE_LEN`) is k units into
+    // it, and Go's offset is k bytes into it: Go's result is the UTF-16
+    // offset of the rune plus k.
+    #[inline]
+    fn split_rune_utf16(&self, utf8_offset: i32, delta: i32) -> i32 {
+        if !self.split_runes.is_empty() {
+            let i = self
+                .split_runes
+                .partition_point(|&start| start < utf8_offset);
+            if let Some(&start) = i.checked_sub(1).and_then(|i| self.split_runes.get(i))
+                && utf8_offset - start < SPLIT_RUNE_LEN
+            {
+                return start - delta + (utf8_offset - start) / SPLIT_RUNE_UNIT_LEN;
+            }
+        }
+        utf8_offset - delta
     }
 
     // Go: ast/positionmap.go:91 UTF16ToUTF8

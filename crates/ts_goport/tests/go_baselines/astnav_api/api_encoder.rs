@@ -331,6 +331,88 @@ fn test_encode_source_file_jsdoc_cut_inside_a_char() {
     }
 }
 
+// PORT: no Go counterpart (jsdocapi1 t18). Go reads the 3 WTF-8 bytes of a
+// lone surrogate as one rune of one UTF-16 unit, and a position k bytes
+// into it is its UTF-16 offset plus k (ast/positionmap.go). Source text
+// holds the 3 bytes as 3 units of the port form, so the JSDoc cut 2 bytes
+// before the end leaves a position after the first unit. The port counted
+// the port bytes of that unit. Each expected list is Go N's getSourceFile
+// answer for the same text.
+#[test]
+fn test_encode_source_file_position_inside_a_wtf8_surrogate() {
+    let cases: [(&str, ScriptKind, &[u8], &[&str]); 4] = [
+        (
+            "/a.js",
+            ScriptKind::JS,
+            b"/** x \xed\xa0\x80",
+            &[
+                "KindEndOfFile [30, 38)",
+                "KindJSDoc [30, 38)",
+                "NodeList [31, 38)",
+                "KindJSDocText [31, 38) \"x \\xed\"",
+            ],
+        ),
+        (
+            "/a.ts",
+            ScriptKind::TS,
+            b"/** x \xed\xa0\x80",
+            &[
+                "KindEndOfFile [30, 38)",
+                "KindJSDoc [30, 38)",
+                "NodeList [31, 38)",
+                "KindJSDocText [31, 38) \"x \\xed\"",
+            ],
+        ),
+        (
+            "/b.js",
+            ScriptKind::JS,
+            b"/** x \xed\xa0\x80\xed\xb0\x80",
+            &[
+                "KindEndOfFile [30, 39)",
+                "KindJSDoc [30, 39)",
+                "NodeList [31, 39)",
+                "KindJSDocText [31, 39) \"x \\xed\\xa0\\x80\\xed\"",
+            ],
+        ),
+        (
+            "/c.js",
+            ScriptKind::JS,
+            b"/** @param {\xed\xa0\x80y",
+            &[
+                "KindEndOfFile [30, 45)",
+                "KindJSDoc [30, 45)",
+                "NodeList [31, 35)",
+                "NodeList [35, 45)",
+                "KindJSDocParameterTag [35, 45)",
+                "KindIdentifier [36, 41) \"param\"",
+                "KindIdentifier [43, 43) \"\"",
+                "KindJSDocTypeExpression [42, 43)",
+                "KindTypeReference [43, 43)",
+                "KindIdentifier [43, 43) \"\"",
+                "NodeList [43, 45)",
+                "KindJSDocText [43, 45) \"\\xed\\xa0\"",
+            ],
+        ),
+    ];
+    for (name, script_kind, comment, want) in cases {
+        let mut bytes = b"function f(a, b) { return a; }\n".to_vec();
+        bytes.extend_from_slice(comment);
+        let text: &'static str = Box::leak(go_string_from_bytes(bytes).into_boxed_str());
+        let file = Rc::new(parser::parse_source_file(
+            &SourceFileParseOptions {
+                file_name: name.to_string(),
+                path: Path(name.to_string()),
+                ..Default::default()
+            },
+            text,
+            script_kind,
+        ));
+        program::note_parsed_source_file(&file);
+        let (buf, _) = encode_source_file(file.root).expect("assert.NilError");
+        assert_eq!(encoded_nodes_from_end_of_file(&buf), want, "{name}");
+    }
+}
+
 // Go: api/encoder/encoder_test.go:112 TestBuildNodeIndexTableMatchesEncode
 #[test]
 fn test_build_node_index_table_matches_encode() {
