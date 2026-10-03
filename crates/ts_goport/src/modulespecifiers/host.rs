@@ -21,16 +21,21 @@ pub struct ProgramHost;
 
 /// The file system answers that module specifier generation reads, shared
 /// by every thread of one program version: Go `compilerHost.fs` (a
-/// `cachedvfs.FS`, compiler/host.go:52), which Go shares between its
-/// checker goroutines.
-// PORT: the frontend host cache is not thread-safe, so only the loading
-// thread can read it. The program version's tables hold this cache
-// (`program::with_host_fs_cache`) and free it with the program.
+/// `cachedvfs.FS`, compiler/host.go:52) and the package.json entries of the
+/// program's resolver (module/resolver.go `packageJsonInfoCache`). Go
+/// shares both between its checker goroutines.
+// PORT: the frontend host and resolver caches are not thread-safe, so only
+// the loading thread can read them. The program version's tables hold this
+// cache (`program::with_host_fs_cache`) and free it with the program.
 #[derive(Default)]
 pub(crate) struct HostFsCache {
     /// Go cachedvfs.go `fileExistsCache`, for `file_exists` off the
     /// loading thread (`program::file_exists`).
     file_exists: RwLock<FxHashMap<String, bool>>,
+    /// Go module/resolver.go `packageJsonInfoCache`: the entries of the
+    /// module specifier lookups (`get_package_json_info_for_directory`), by
+    /// the `Path` of the package.json (Go `InfoCache.Get`).
+    package_json_info: RwLock<FxHashMap<tspath::Path, Arc<InfoCacheEntry>>>,
 }
 
 impl HostFsCache {
@@ -45,6 +50,43 @@ impl HostFsCache {
         write(&self.file_exists).insert(path.to_string(), ret);
         ret
     }
+
+    // Go: packagejson/cache.go:182 Get
+    fn get_package_json_info(&self, key: &tspath::Path) -> Option<Arc<InfoCacheEntry>> {
+        read(&self.package_json_info).get(key).cloned()
+    }
+
+    // Go: packagejson/cache.go:190 Set (the first stored value stays)
+    fn set_package_json_info(
+        &self,
+        key: tspath::Path,
+        entry: InfoCacheEntry,
+    ) -> Arc<InfoCacheEntry> {
+        write(&self.package_json_info)
+            .entry(key)
+            .or_insert_with(|| Arc::new(entry))
+            .clone()
+    }
+
+    /// Calls `f` with the key, package directory, `DirectoryExists` and
+    /// `Exists()` of each package.json entry, in no order (Go
+    /// `InfoCache.Range`, packagejson/cache.go:196). `f` returns false to
+    /// stop.
+    pub(crate) fn package_json_entries(
+        &self,
+        mut f: impl FnMut(&tspath::Path, &str, bool, bool) -> bool,
+    ) {
+        for (key, entry) in read(&self.package_json_info).iter() {
+            if !f(
+                key,
+                &entry.package_directory,
+                entry.directory_exists,
+                entry.exists(),
+            ) {
+                return;
+            }
+        }
+    }
 }
 
 fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -55,11 +97,9 @@ fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The caches that Go keeps on one program and its module resolver.
+/// The caches that Go keeps on one program.
 #[derive(Default)]
 struct ProgramCaches {
-    /// Go: module/resolver.go packageJsonInfoCache. Keyed by package.json path.
-    package_json_info: FxHashMap<String, Rc<InfoCacheEntry>>,
     /// Go: compiler/program.go knownSymlinks (a lazily computed value).
     known_symlinks: Option<Rc<KnownSymlinks>>,
     /// Go: compiler/program.go opts.TypingsLocation, which is also the
@@ -135,11 +175,19 @@ fn typings_location() -> Rc<str> {
 // PORT: Go returns `existing.WithPackageDirectory(packageDirectory)`. The
 // cache key is `<packageDirectory>/package.json`, so the directory already
 // matches and the cached entry is returned as is. Tracing is not ported.
-fn get_package_json_info_for_directory(package_directory: &str) -> Option<Rc<InfoCacheEntry>> {
+// The entries are in the program's `HostFsCache`, not in the frontend
+// resolver's cache; the build info reads both
+// (`incremental::checker_access::package_json_cache_entries`).
+fn get_package_json_info_for_directory(package_directory: &str) -> Option<Arc<InfoCacheEntry>> {
     let package_json_path = tspath::combine_paths(package_directory, &["package.json"]);
+    let key = tspath::to_path(
+        &package_json_path,
+        crate::program::get_current_directory(),
+        crate::program::use_case_sensitive_file_names(),
+    );
 
     if let Some(existing) =
-        with_program_caches(|c| c.package_json_info.get(&package_json_path).cloned())
+        crate::program::with_host_fs_cache(|cache| cache.get_package_json_info(&key))
     {
         if existing.contents.is_some() {
             return Some(existing);
@@ -156,36 +204,30 @@ fn get_package_json_info_for_directory(package_directory: &str) -> Option<Rc<Inf
         let (contents, _) = fs.read_file(&package_json_path);
         let parsed = packagejson::parse(&crate::scanner_util::go_string_bytes(&contents));
         let parseable = parsed.is_ok();
-        let result = Rc::new(InfoCacheEntry {
+        let result = InfoCacheEntry {
             package_directory: package_directory.to_string(),
             directory_exists: true,
             contents: Some(PackageJson::new(parsed.unwrap_or_default(), parseable)),
-        });
-        // Go: packageJsonInfoCache.Set keeps the first stored value.
-        let result = with_program_caches(|c| {
-            c.package_json_info
-                .entry(package_json_path)
-                .or_insert(result)
-                .clone()
-        });
+        };
+        let result =
+            crate::program::with_host_fs_cache(|cache| cache.set_package_json_info(key, result));
         return Some(result);
     }
-    with_program_caches(|c| {
-        c.package_json_info
-            .entry(package_json_path)
-            .or_insert_with(|| {
-                Rc::new(InfoCacheEntry {
-                    package_directory: package_directory.to_string(),
-                    directory_exists,
-                    contents: None,
-                })
-            });
+    crate::program::with_host_fs_cache(|cache| {
+        cache.set_package_json_info(
+            key,
+            InfoCacheEntry {
+                package_directory: package_directory.to_string(),
+                directory_exists,
+                contents: None,
+            },
+        )
     });
     None
 }
 
 // Go: module/resolver.go:485 getPackageScopeForPath
-fn get_package_scope_for_path(directory: &str) -> Option<Rc<InfoCacheEntry>> {
+fn get_package_scope_for_path(directory: &str) -> Option<Arc<InfoCacheEntry>> {
     tspath::for_each_ancestor_directory_stopping_at_global_cache(
         &typings_location(),
         directory,
@@ -282,7 +324,7 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
     }
 
     // Go: compiler/program.go:157 GetPackageJsonInfo
-    fn get_package_json_info(&self, pkg_json_path: &str) -> Option<Rc<InfoCacheEntry>> {
+    fn get_package_json_info(&self, pkg_json_path: &str) -> Option<Arc<InfoCacheEntry>> {
         let directory = tspath::get_directory_path(pkg_json_path);
         match get_package_scope_for_path(&directory) {
             Some(scoped) if scoped.exists() && scoped.package_directory == directory => {
