@@ -3033,7 +3033,10 @@ pub fn new_config_file_response(
     }
     let compiler_options = parsed_command_line.compiler_options();
     // PORT: Go replaces a nil slice with an empty one; a `Vec` is never nil.
-    let errors = new_diagnostic_responses(&parsed_command_line.errors);
+    // Go `p.Errors` holds the TS6059 errors of `CommonSourceDirectory` so
+    // far (`errors_with_common_source_directory_errors`).
+    let errors =
+        new_diagnostic_responses(&parsed_command_line.errors_with_common_source_directory_errors());
     Some(ConfigFileResponse {
         file_names: parsed_command_line.file_names().to_vec(),
         options: Some((**compiler_options).clone()),
@@ -5138,6 +5141,48 @@ pub fn no_params(data: &[u8]) -> Result<Option<Box<dyn AnyValue>>, GoError> {
 // side (content mappers) does not depend on `api`. Go keeps them in `core`
 // (struct tags) and in the json package.
 pub use crate::options_json::{CompilerOptionsJSON, TypeAcquisitionJSON, marshal_field_omitempty};
+
+#[cfg(test)]
+mod config_file_response_tests {
+    use super::*;
+    use crate::frontend::tsoptions::new_parsed_command_line;
+    use crate::frontend::tspath::ComparePathsOptions;
+    use std::rc::Rc;
+
+    // Go: api/proto.go:996 NewConfigFileResponse reads `p.Errors`, where
+    // tsoptions/parsedcommandline.go:181 checkSourceFilesBelongToPath
+    // appended TS6059 when the project's program read
+    // `CommonSourceDirectory` (projfix1 skeptic: a referenced project with
+    // outDir, `rootDir: src` and a file outside src gives
+    // `parsedCommandLine.errors: [TS6059]` in Go N's createSnapshot).
+    #[test]
+    fn errors_hold_the_common_source_directory_errors_like_go() {
+        let command_line = new_parsed_command_line(
+            Rc::new(CompilerOptions {
+                root_dir: "/p/src".to_string(),
+                out_dir: "/p/out".to_string(),
+                ..Default::default()
+            }),
+            vec!["/p/src/a.ts".to_string(), "/p/extra.ts".to_string()],
+            None,
+            ComparePathsOptions {
+                use_case_sensitive_file_names: true,
+                current_directory: "/p".to_string(),
+            },
+        );
+        let codes = |command_line| {
+            new_config_file_response(Some(command_line))
+                .expect("a response")
+                .errors
+                .iter()
+                .map(|error| error.code)
+                .collect::<Vec<_>>()
+        };
+        assert!(codes(&command_line).is_empty());
+        assert_eq!(command_line.common_source_directory(), "/p/src/");
+        assert_eq!(codes(&command_line), [6059]);
+    }
+}
 
 #[cfg(test)]
 mod unmarshal_error_tests {
