@@ -6,7 +6,7 @@ use crate::frontend::stringutil_ls;
 use crate::spanmap::Feature;
 
 impl LanguageService {
-    // Go: ls/inlay_hints.go:24 ProvideInlayHint
+    // Go: ls/inlay_hints.go:25 ProvideInlayHint
     pub fn provide_inlay_hint(
         &self,
         ctx: &Context,
@@ -56,7 +56,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/inlay_hints.go:52 inlayHintState
+// Go: ls/inlay_hints.go:59 inlayHintState
 // PORT: Go `checker *checker.Checker` is the leased checker, borrowed for the
 // request (`&mut Checker`).
 struct InlayHintState<'a> {
@@ -70,7 +70,7 @@ struct InlayHintState<'a> {
     result: Vec<lsproto::InlayHint>,
 }
 
-// Go: ls/inlay_hints.go:805 parameterInfo
+// Go: ls/inlay_hints.go:828 parameterInfo
 struct ParameterInfo {
     parameter: Node,
     name: String,
@@ -78,7 +78,7 @@ struct ParameterInfo {
 }
 
 impl InlayHintState<'_> {
-    // Go: ls/inlay_hints.go:63 inlayHintState.visit
+    // Go: ls/inlay_hints.go:70 inlayHintState.visit
     fn visit(&mut self, node: Node) -> bool {
         if node.is_nil()
             || node.end() - node.pos() == 0
@@ -155,7 +155,7 @@ impl InlayHintState<'_> {
         node.for_each_child(|child| self.visit(child))
     }
 
-    // Go: ls/inlay_hints.go:108 inlayHintState.visitFunctionDeclarationLikeForReturnType
+    // Go: ls/inlay_hints.go:115 inlayHintState.visitFunctionDeclarationLikeForReturnType
     // FunctionDeclaration | MethodDeclaration | GetAccessor | FunctionExpression | ArrowFunction
     fn visit_function_declaration_like_for_return_type(&mut self, decl: Node) {
         if is_arrow_function(decl) {
@@ -197,7 +197,7 @@ impl InlayHintState<'_> {
         self.add_type_hints(hint_parts, position);
     }
 
-    // Go: ls/inlay_hints.go:142 inlayHintState.visitCallOrNewExpression
+    // Go: ls/inlay_hints.go:149 inlayHintState.visitCallOrNewExpression
     fn visit_call_or_new_expression(&mut self, expr: Node) {
         let args = expr.arguments();
         if args.is_empty() {
@@ -280,7 +280,7 @@ impl InlayHintState<'_> {
         }
     }
 
-    // Go: ls/inlay_hints.go:208 inlayHintState.visitEnumMember
+    // Go: ls/inlay_hints.go:215 inlayHintState.visitEnumMember
     fn visit_enum_member(&mut self, member: Node) {
         if member.initializer().is_some() {
             return;
@@ -292,7 +292,7 @@ impl InlayHintState<'_> {
         }
     }
 
-    // Go: ls/inlay_hints.go:219 inlayHintState.visitVariableLikeDeclaration
+    // Go: ls/inlay_hints.go:226 inlayHintState.visitVariableLikeDeclaration
     fn visit_variable_like_declaration(&mut self, decl: Node) {
         if decl.initializer().is_nil()
             && !(is_property_declaration(decl) && {
@@ -342,7 +342,7 @@ impl InlayHintState<'_> {
         self.add_type_hints(hint_parts, decl.name().end());
     }
 
-    // Go: ls/inlay_hints.go:255 inlayHintState.visitFunctionLikeForParameterType
+    // Go: ls/inlay_hints.go:262 inlayHintState.visitFunctionLikeForParameterType
     fn visit_function_like_for_parameter_type(&mut self, node: Node) {
         let signature = self.checker.get_signature_from_declaration_exported(node);
         if signature.is_nil() {
@@ -367,7 +367,7 @@ impl InlayHintState<'_> {
         }
     }
 
-    // Go: ls/inlay_hints.go:279 inlayHintState.addParameterTypeHint
+    // Go: ls/inlay_hints.go:286 inlayHintState.addParameterTypeHint
     fn add_parameter_type_hint(&mut self, node: Node, symbol: SymbolId) {
         let type_annotation = node.type_();
         if type_annotation.is_some() || symbol.is_nil() {
@@ -386,7 +386,7 @@ impl InlayHintState<'_> {
         self.add_type_hints(type_hints, pos);
     }
 
-    // Go: ls/inlay_hints.go:297 inlayHintState.getParameterDeclarationTypeHints
+    // Go: ls/inlay_hints.go:304 inlayHintState.getParameterDeclarationTypeHints
     fn get_parameter_declaration_type_hints(
         &mut self,
         symbol: SymbolId,
@@ -406,7 +406,7 @@ impl InlayHintState<'_> {
         Some(self.type_to_inlay_hint_parts(signature_param_type))
     }
 
-    // Go: ls/inlay_hints.go:311 inlayHintState.typeToInlayHintParts
+    // Go: ls/inlay_hints.go:318 inlayHintState.typeToInlayHintParts
     // PORT: Go `c.TypeToTypeNode(t, nil, flags, idToSymbol)` shares
     // `idToSymbol` with the node builder, which fills it. The Rust builder owns
     // its map, so this inlines the wrapper body (`getNodeBuilderEx` plus
@@ -435,7 +435,7 @@ impl InlayHintState<'_> {
         }
     }
 
-    // Go: ls/inlay_hints.go:323 inlayHintState.typePredicateToInlayHintParts
+    // Go: ls/inlay_hints.go:330 inlayHintState.typePredicateToInlayHintParts
     // PORT: see type_to_inlay_hint_parts about `idToSymbol`.
     fn type_predicate_to_inlay_hint_parts(
         &mut self,
@@ -465,7 +465,7 @@ impl InlayHintState<'_> {
         }
     }
 
-    // Go: ls/inlay_hints.go:335 inlayHintState.addTypeHints
+    // Go: ls/inlay_hints.go:342 inlayHintState.addTypeHints
     fn add_type_hints(&mut self, hint: lsproto::StringOrInlayHintLabelParts, position: i32) {
         let (lsp_position, fidelity) =
             self.converters
@@ -498,7 +498,7 @@ impl InlayHintState<'_> {
         });
     }
 
-    // Go: ls/inlay_hints.go:349 inlayHintState.addEnumMemberValueHints
+    // Go: ls/inlay_hints.go:360 inlayHintState.addEnumMemberValueHints
     fn add_enum_member_value_hints(&mut self, text: &str, position: i32) {
         let (lsp_position, fidelity) =
             self.converters
@@ -517,7 +517,7 @@ impl InlayHintState<'_> {
         });
     }
 
-    // Go: ls/inlay_hints.go:359 inlayHintState.addParameterHints
+    // Go: ls/inlay_hints.go:374 inlayHintState.addParameterHints
     fn add_parameter_hints(
         &mut self,
         text: &str,
@@ -561,7 +561,7 @@ impl InlayHintState<'_> {
         });
     }
 
-    // Go: ls/inlay_hints.go:422 inlayHintState.getInlayHintLabelParts
+    // Go: ls/inlay_hints.go:441 inlayHintState.getInlayHintLabelParts
     // PORT: the Go closures `visitForDisplayParts`, `visitDisplayPartList` and
     // `visitParametersAndTypeParameters` are methods below. They take the
     // captured `parts` and `idToSymbol` as parameters. Go returns
@@ -577,7 +577,7 @@ impl InlayHintState<'_> {
         parts.into_iter().map(Some).collect()
     }
 
-    // Go: ls/inlay_hints.go:429 visitForDisplayParts (closure in getInlayHintLabelParts)
+    // Go: ls/inlay_hints.go:448 visitForDisplayParts (closure in getInlayHintLabelParts)
     fn visit_for_display_parts(
         &self,
         node: Node,
@@ -925,7 +925,7 @@ impl InlayHintState<'_> {
         }
     }
 
-    // Go: ls/inlay_hints.go:744 visitDisplayPartList (closure in getInlayHintLabelParts)
+    // Go: ls/inlay_hints.go:763 visitDisplayPartList (closure in getInlayHintLabelParts)
     fn visit_display_part_list(
         &self,
         nodes: NodeSlice,
@@ -941,7 +941,7 @@ impl InlayHintState<'_> {
         }
     }
 
-    // Go: ls/inlay_hints.go:753 visitParametersAndTypeParameters (closure in getInlayHintLabelParts)
+    // Go: ls/inlay_hints.go:772 visitParametersAndTypeParameters (closure in getInlayHintLabelParts)
     fn visit_parameters_and_type_parameters(
         &self,
         node: Node,
@@ -958,7 +958,7 @@ impl InlayHintState<'_> {
         parts.push(label_part(")"));
     }
 
-    // Go: ls/inlay_hints.go:768 inlayHintState.getNodeDisplayPart
+    // Go: ls/inlay_hints.go:787 inlayHintState.getNodeDisplayPart
     fn get_node_display_part(&self, text: &str, node: Node) -> lsproto::InlayHintLabelPart {
         let file = get_source_file_of_node(node);
         let pos = astnav::get_start_of_node(node, file, false /*includeJSDoc*/);
@@ -984,7 +984,7 @@ impl InlayHintState<'_> {
         part
     }
 
-    // Go: ls/inlay_hints.go:781 inlayHintState.getLiteralText
+    // Go: ls/inlay_hints.go:804 inlayHintState.getLiteralText
     fn get_literal_text(&self, node: Node) -> String {
         match node.kind() {
             SyntaxKind::StringLiteral => {
@@ -1013,7 +1013,7 @@ impl InlayHintState<'_> {
         node.text().to_string()
     }
 
-    // Go: ls/inlay_hints.go:811 inlayHintState.getParameterIdentifierInfoAtPosition
+    // Go: ls/inlay_hints.go:834 inlayHintState.getParameterIdentifierInfoAtPosition
     fn get_parameter_identifier_info_at_position(
         &mut self,
         signature: SignatureId,
@@ -1095,7 +1095,7 @@ impl InlayHintState<'_> {
         None
     }
 
-    // Go: ls/inlay_hints.go:893 inlayHintState.leadingCommentsContainsParameterName
+    // Go: ls/inlay_hints.go:916 inlayHintState.leadingCommentsContainsParameterName
     fn leading_comments_contains_parameter_name(&self, node: Node, name: &str) -> bool {
         if !is_identifier_text(name, source_file_info(self.file).language_variant) {
             return false;
@@ -1116,7 +1116,7 @@ impl InlayHintState<'_> {
         false
     }
 
-    // Go: ls/inlay_hints.go:912 inlayHintState.getTypeAnnotationPosition
+    // Go: ls/inlay_hints.go:935 inlayHintState.getTypeAnnotationPosition
     fn get_type_annotation_position(&self, decl: Node) -> i32 {
         let close_paren_token =
             astnav::find_child_of_kind(decl, SyntaxKind::CloseParenToken, self.file);
@@ -1136,7 +1136,7 @@ fn label_part(value: &str) -> lsproto::InlayHintLabelPart {
     }
 }
 
-// Go: ls/inlay_hints.go:377 shouldShowParameterNameHints
+// Go: ls/inlay_hints.go:396 shouldShowParameterNameHints
 fn should_show_parameter_name_hints(preferences: &lsutil::InlayHintsPreferences) -> bool {
     preferences.include_inlay_parameter_name_hints
         == lsutil::IncludeInlayParameterNameHints::LITERALS
@@ -1144,7 +1144,7 @@ fn should_show_parameter_name_hints(preferences: &lsutil::InlayHintsPreferences)
             == lsutil::IncludeInlayParameterNameHints::ALL
 }
 
-// Go: ls/inlay_hints.go:382 shouldShowLiteralParameterNameHintsOnly
+// Go: ls/inlay_hints.go:401 shouldShowLiteralParameterNameHintsOnly
 fn should_show_literal_parameter_name_hints_only(
     preferences: &lsutil::InlayHintsPreferences,
 ) -> bool {
@@ -1152,7 +1152,7 @@ fn should_show_literal_parameter_name_hints_only(
         == lsutil::IncludeInlayParameterNameHints::LITERALS
 }
 
-// Go: ls/inlay_hints.go:387 isSignatureSupportingReturnAnnotation
+// Go: ls/inlay_hints.go:406 isSignatureSupportingReturnAnnotation
 // node is FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration | GetAccessor
 fn is_signature_supporting_return_annotation(node: Node) -> bool {
     is_arrow_function(node)
@@ -1162,7 +1162,7 @@ fn is_signature_supporting_return_annotation(node: Node) -> bool {
         || is_get_accessor_declaration(node)
 }
 
-// Go: ls/inlay_hints.go:392 isHintableDeclaration
+// Go: ls/inlay_hints.go:411 isHintableDeclaration
 fn is_hintable_declaration(node: Node) -> bool {
     if (is_part_of_parameter_declaration(node)
         || is_variable_declaration(node) && is_var_const(node))
@@ -1177,7 +1177,7 @@ fn is_hintable_declaration(node: Node) -> bool {
     true
 }
 
-// Go: ls/inlay_hints.go:402 isHintableLiteral
+// Go: ls/inlay_hints.go:421 isHintableLiteral
 // PORT: Go calls `ast.IsInfinityOrNaNString`, which has no ast port; the
 // checker port `is_infinity_or_nan_string` has the same body.
 fn is_hintable_literal(node: Node) -> bool {
@@ -1204,14 +1204,14 @@ fn is_hintable_literal(node: Node) -> bool {
     is_literal_expression(node)
 }
 
-// Go: ls/inlay_hints.go:417 isModuleReferenceType
+// Go: ls/inlay_hints.go:436 isModuleReferenceType
 // PORT: types and symbols live in the checker arenas, so the checker is a parameter.
 fn is_module_reference_type(c: &Checker, t: TypeId) -> bool {
     let symbol = c.ty(t).symbol();
     symbol.is_some() && c.sym(symbol).flags.intersects(SymbolFlags::MODULE)
 }
 
-// Go: ls/inlay_hints.go:876 getParameterDeclarationIdentifier
+// Go: ls/inlay_hints.go:899 getParameterDeclarationIdentifier
 // PORT: symbols live in the checker arena, so it is a parameter (PORTING
 // "Names": functions that take a symbol get `symbols: &SymbolArena`).
 fn get_parameter_declaration_identifier(symbols: &SymbolArena, symbol: SymbolId) -> Node {
@@ -1225,7 +1225,7 @@ fn get_parameter_declaration_identifier(symbols: &SymbolArena, symbol: SymbolId)
     Node::NIL
 }
 
-// Go: ls/inlay_hints.go:883 identifierOrAccessExpressionPostfixMatchesParameterName
+// Go: ls/inlay_hints.go:906 identifierOrAccessExpressionPostfixMatchesParameterName
 fn identifier_or_access_expression_postfix_matches_parameter_name(
     expr: Node,
     parameter_name: &str,
@@ -1239,7 +1239,7 @@ fn identifier_or_access_expression_postfix_matches_parameter_name(
     false
 }
 
-// Go: ls/inlay_hints.go:920 isAnyInlayHintEnabled
+// Go: ls/inlay_hints.go:943 isAnyInlayHintEnabled
 fn is_any_inlay_hint_enabled(preferences: &lsutil::InlayHintsPreferences) -> bool {
     preferences.include_inlay_parameter_name_hints != lsutil::IncludeInlayParameterNameHints::NONE
         || preferences

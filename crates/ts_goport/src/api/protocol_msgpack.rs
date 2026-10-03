@@ -16,7 +16,7 @@ use crate::jsonrpc;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 
-// Go: protocol_msgpack.go:14 MessageType
+// Go: protocol_msgpack.go:15 MessageType
 // MessageType represents the type of message in the msgpack protocol.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageType(pub u8);
@@ -31,7 +31,7 @@ impl MessageType {
     pub const ERROR: MessageType = MessageType(5);
     pub const CALL: MessageType = MessageType(6);
 
-    // Go: protocol_msgpack.go:26 IsValid
+    // Go: protocol_msgpack.go:27 IsValid
     pub fn is_valid(self) -> bool {
         self >= MessageType::REQUEST && self <= MessageType::CALL
     }
@@ -45,7 +45,7 @@ const MSGPACK_BIN16: u8 = 0xC5;
 const MSGPACK_BIN32: u8 = 0xC6;
 const MSGPACK_U8: u8 = 0xCC;
 
-// Go: protocol_msgpack.go:41 MessagePackProtocol
+// Go: protocol_msgpack.go:42 MessagePackProtocol
 // MessagePackProtocol implements the Protocol interface using a custom
 // msgpack-based tuple format: [MessageType, method, payload].
 pub struct MessagePackProtocol {
@@ -56,7 +56,7 @@ pub struct MessagePackProtocol {
 // Go: protocol_msgpack.go:46
 // var _ Protocol = (*MessagePackProtocol)(nil) is the `impl Protocol` below.
 
-// Go: protocol_msgpack.go:49 NewMessagePackProtocol
+// Go: protocol_msgpack.go:50 NewMessagePackProtocol
 // NewMessagePackProtocol creates a new msgpack protocol handler.
 // PORT: Go takes an `io.ReadWriter`; the port takes the shared connection.
 pub fn new_message_pack_protocol(rw: Arc<dyn ReadWriteCloser>) -> MessagePackProtocol {
@@ -67,7 +67,7 @@ pub fn new_message_pack_protocol(rw: Arc<dyn ReadWriteCloser>) -> MessagePackPro
 }
 
 impl Protocol for MessagePackProtocol {
-    // Go: protocol_msgpack.go:57 ReadMessage
+    // Go: protocol_msgpack.go:58 ReadMessage
     // ReadMessage implements Protocol.
     fn read_message(&mut self) -> Result<Message, GoError> {
         let (msg_type, method, payload) = self.read_tuple()?;
@@ -115,7 +115,7 @@ impl Protocol for MessagePackProtocol {
         Ok(msg)
     }
 
-    // Go: protocol_msgpack.go:183 WriteRequest
+    // Go: protocol_msgpack.go:184 WriteRequest
     // WriteRequest implements Protocol.
     fn write_request(
         &mut self,
@@ -138,7 +138,7 @@ impl Protocol for MessagePackProtocol {
         )
     }
 
-    // Go: protocol_msgpack.go:193 WriteNotification
+    // Go: protocol_msgpack.go:194 WriteNotification
     // WriteNotification implements Protocol.
     fn write_notification(
         &mut self,
@@ -149,7 +149,7 @@ impl Protocol for MessagePackProtocol {
         self.write_request(None, method, params)
     }
 
-    // Go: protocol_msgpack.go:199 WriteResponse
+    // Go: protocol_msgpack.go:200 WriteResponse
     // WriteResponse implements Protocol.
     fn write_response(
         &mut self,
@@ -181,7 +181,7 @@ impl Protocol for MessagePackProtocol {
         self.write_tuple(MessageType::RESPONSE, &method, &payload)
     }
 
-    // Go: protocol_msgpack.go:222 WriteError
+    // Go: protocol_msgpack.go:223 WriteError
     // WriteError implements Protocol.
     fn write_error(
         &mut self,
@@ -200,7 +200,7 @@ impl Protocol for MessagePackProtocol {
 // `Protocol` impl; Go has readTuple and readBin between ReadMessage and
 // WriteRequest.
 impl MessagePackProtocol {
-    // Go: protocol_msgpack.go:96 readTuple
+    // Go: protocol_msgpack.go:97 readTuple
     fn read_tuple(&mut self) -> Result<(MessageType, String, Vec<u8>), GoError> {
         // Read fixed array marker (0x93 = 3-element array)
         let t = read_byte(&mut self.r)?;
@@ -243,7 +243,7 @@ impl MessagePackProtocol {
         Ok((msg_type, method, payload))
     }
 
-    // Go: protocol_msgpack.go:145 readBin
+    // Go: protocol_msgpack.go:146 readBin
     fn read_bin(&mut self) -> Result<Vec<u8>, GoError> {
         let t = read_byte(&mut self.r)?;
 
@@ -276,7 +276,7 @@ impl MessagePackProtocol {
         Ok(payload)
     }
 
-    // Go: protocol_msgpack.go:230 writeTuple
+    // Go: protocol_msgpack.go:231 writeTuple
     fn write_tuple(
         &mut self,
         msg_type: MessageType,
@@ -294,7 +294,7 @@ impl MessagePackProtocol {
         self.w.flush().map_err(io_error)
     }
 
-    // Go: protocol_msgpack.go:250 writeBin
+    // Go: protocol_msgpack.go:251 writeBin
     fn write_bin(&mut self, data: &[u8]) -> Result<(), GoError> {
         let length = data.len();
         if length < 256 {
@@ -363,7 +363,7 @@ fn write_all<W: Write>(w: &mut W, data: &[u8]) -> Result<(), GoError> {
     w.write_all(data).map_err(io_error)
 }
 
-// Go: protocol_msgpack.go:280 RawBinary
+// Go: protocol_msgpack.go:281 RawBinary
 // RawBinary is a marker type for binary data that should be written
 // directly by MessagePackProtocol instead of being JSON-encoded.
 #[derive(Clone, Debug, Default, PartialEq)]

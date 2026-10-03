@@ -299,7 +299,7 @@ fn get_changes(
     file_changes
 }
 
-// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:144 insertInterfaceMemberNode
+// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:148 insertInterfaceMemberNode
 fn insert_interface_member_node(
     change_tracker: &mut change::Tracker,
     source_file: Node,
@@ -314,7 +314,7 @@ fn insert_interface_member_node(
     }
 }
 
-// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:152 getClass
+// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:156 getClass
 fn get_class(source_file: Node, span: TextRange) -> Node {
     let token = astnav::get_token_at_position(source_file, span.pos());
     if token.is_nil() {
@@ -323,7 +323,7 @@ fn get_class(source_file: Node, span: TextRange) -> Node {
     get_containing_class(token)
 }
 
-// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:160 getConstructor
+// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:164 getConstructor
 fn get_constructor(class_declaration: Node) -> Node {
     if class_declaration.is_nil() || class_declaration.member_list().is_nil() {
         return Node::NIL;
@@ -336,7 +336,7 @@ fn get_constructor(class_declaration: Node) -> Node {
     Node::NIL
 }
 
-// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:172 getMissingMembers
+// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:176 getMissingMembers
 fn get_missing_members(
     type_checker: &mut Checker,
     class_declaration: Node,
@@ -375,7 +375,7 @@ fn get_missing_members(
     missing_members
 }
 
-// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:203 getInheritedMembers
+// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:207 getInheritedMembers
 // PORT: Go returns a new `ast.SymbolTable` that only `getMissingMembers`
 // reads by name. A local `FxHashMap<String, SymbolId>` stands for it, so no
 // table is added to the checker's symbol arena.
@@ -406,7 +406,7 @@ fn get_inherited_members(
     inherited_members
 }
 
-// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:227 createImportAdder
+// Go: ls/codeactions_fixclassincorrectlyimplementsinterface.go:231 createImportAdder
 // PORT: Go also takes `typeChecker` and passes it to `NewImportAdder`. The
 // pinned w3 `new_import_adder` has no checker parameter, so this drops it.
 fn create_import_adder(

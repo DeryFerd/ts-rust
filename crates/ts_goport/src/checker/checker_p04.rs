@@ -21,7 +21,7 @@ fn element_or_nil_p04(nodes: &[Node], i: usize) -> Node {
 }
 
 impl Checker {
-    // Go: checker/checker.go:2968 checkTypeReferenceNode
+    // Go: checker/checker.go:3028 checkTypeReferenceNode
     pub fn check_type_reference_node(&mut self, node: Node) {
         self.check_grammar_type_arguments(node, node.type_argument_list());
         if is_type_reference_node(node) && !node.flags().intersects(NodeFlags::JS_DOC) {
@@ -47,7 +47,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2984 checkTypeReferenceOrImport
+    // Go: checker/checker.go:3046 checkTypeReferenceOrImport
     pub fn check_type_reference_or_import(&mut self, node: Node) {
         let t = self.get_type_from_type_node(node);
         if !self.is_error_type(t) {
@@ -76,7 +76,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3002 checkTypeArgumentConstraints
+    // Go: checker/checker.go:3064 checkTypeArgumentConstraints
     pub fn check_type_argument_constraints(
         &mut self,
         node: Node,
@@ -111,7 +111,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:3019 getDeprecatedSuggestionNode
+    // Go: checker/checker.go:3081 getDeprecatedSuggestionNode
     pub fn get_deprecated_suggestion_node(&mut self, node: Node) -> Node {
         let node = skip_parentheses(node);
         match node.kind() {
@@ -141,7 +141,7 @@ impl Checker {
         node
     }
 
-    // Go: checker/checker.go:3041 checkTypePredicate
+    // Go: checker/checker.go:3103 checkTypePredicate
     pub fn check_type_predicate(&mut self, node: Node) {
         // Always check the predicate's type so nested type errors are reported even when the
         // predicate is in an invalid position, keeping diagnostics stable.
@@ -218,7 +218,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3083 getTypePredicateParent
+    // Go: checker/checker.go:3147 getTypePredicateParent
     pub fn get_type_predicate_parent(&self, node: Node) -> Node {
         let parent = node.parent();
         match parent.kind() {
@@ -238,7 +238,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:3095 checkIfTypePredicateVariableIsDeclaredInBindingPattern
+    // Go: checker/checker.go:3159 checkIfTypePredicateVariableIsDeclaredInBindingPattern
     pub fn check_if_type_predicate_variable_is_declared_in_binding_pattern(
         &mut self,
         pattern: Node,
@@ -271,12 +271,12 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:3114 checkTypeQuery
+    // Go: checker/checker.go:3178 checkTypeQuery
     pub fn check_type_query(&mut self, node: Node) {
         self.get_type_from_type_query_node(node);
     }
 
-    // Go: checker/checker.go:3118 checkTypeLiteral
+    // Go: checker/checker.go:3182 checkTypeLiteral
     pub fn check_type_literal(&mut self, node: Node) {
         self.check_source_elements(node.members());
         let t = self.get_type_from_type_literal_or_function_or_constructor_type_node(node);
@@ -286,7 +286,7 @@ impl Checker {
         self.check_object_type_for_duplicate_declarations(node, false /*checkPrivateNames*/);
     }
 
-    // Go: checker/checker.go:3126 checkObjectTypeForDuplicateDeclarations
+    // Go: checker/checker.go:3190 checkObjectTypeForDuplicateDeclarations
     pub fn check_object_type_for_duplicate_declarations(
         &mut self,
         node: Node,
@@ -427,7 +427,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3197 reportDuplicateMemberErrors
+    // Go: checker/checker.go:3261 reportDuplicateMemberErrors
     pub fn report_duplicate_member_errors(
         &mut self,
         node: Node,
@@ -462,12 +462,12 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3213 checkArrayType
+    // Go: checker/checker.go:3277 checkArrayType
     pub fn check_array_type(&mut self, node: Node) {
         self.check_source_element(node.element_type());
     }
 
-    // Go: checker/checker.go:3217 checkTupleType
+    // Go: checker/checker.go:3281 checkTupleType
     pub fn check_tuple_type(&mut self, node: Node) {
         let mut seen_optional_element = false;
         let mut seen_rest_element = false;
@@ -526,29 +526,29 @@ impl Checker {
         self.get_type_from_type_node(node);
     }
 
-    // Go: checker/checker.go:3254 checkUnionOrIntersectionType
+    // Go: checker/checker.go:3318 checkUnionOrIntersectionType
     pub fn check_union_or_intersection_type(&mut self, node: Node) {
         node.for_each_child(&mut |child: Node| self.check_source_element(child));
         self.get_type_from_type_node(node);
     }
 
-    // Go: checker/checker.go:3259 checkThisType
+    // Go: checker/checker.go:3323 checkThisType
     pub fn check_this_type(&mut self, node: Node) {
         self.get_type_from_this_type_node(node);
     }
 
-    // Go: checker/checker.go:3263 checkTypeOperator
+    // Go: checker/checker.go:3327 checkTypeOperator
     pub fn check_type_operator(&mut self, node: Node) {
         self.check_grammar_type_operator_node(node);
         self.check_source_element(node.type_());
     }
 
-    // Go: checker/checker.go:3268 checkConditionalType
+    // Go: checker/checker.go:3332 checkConditionalType
     pub fn check_conditional_type(&mut self, node: Node) {
         node.for_each_child(&mut |child: Node| self.check_source_element(child));
     }
 
-    // Go: checker/checker.go:3272 checkInferType
+    // Go: checker/checker.go:3336 checkInferType
     pub fn check_infer_type(&mut self, node: Node) {
         if find_ancestor(node, |n: Node| {
             n.parent().is_some()
@@ -591,7 +591,7 @@ impl Checker {
         self.register_for_unused_identifiers_check(node);
     }
 
-    // Go: checker/checker.go:3299 checkTemplateLiteralType
+    // Go: checker/checker.go:3363 checkTemplateLiteralType
     pub fn check_template_literal_type(&mut self, node: Node) {
         for span in node.template_spans().nodes() {
             self.check_source_element(span.type_());
@@ -602,7 +602,7 @@ impl Checker {
         self.get_type_from_type_node(node);
     }
 
-    // Go: checker/checker.go:3368 checkImportType
+    // Go: checker/checker.go:3372 checkImportType
     pub fn check_import_type(&mut self, node: Node) {
         self.check_source_element(node.argument());
         let attributes = node.attributes();
@@ -615,7 +615,7 @@ impl Checker {
         self.check_import_attributes(node);
     }
 
-    // Go: checker/checker.go:3377 getResolutionModeOverride
+    // Go: checker/checker.go:3383 getResolutionModeOverride
     // PORT: Go passes `c.grammarErrorOnNode` as the callback, or nil.
     pub fn get_resolution_mode_override(
         &mut self,
@@ -635,7 +635,7 @@ impl Checker {
         mode
     }
 
-    // Go: checker/checker.go:3349 checkNamedTupleMember
+    // Go: checker/checker.go:3392 checkNamedTupleMember
     pub fn check_named_tuple_member(&mut self, node: Node) {
         let member_type = node.type_();
         if node.dot_dot_dot_token().is_some() && node.question_token().is_some() {
@@ -663,14 +663,14 @@ impl Checker {
         self.get_type_from_type_node(node);
     }
 
-    // Go: checker/checker.go:3364 checkIndexedAccessType
+    // Go: checker/checker.go:3407 checkIndexedAccessType
     pub fn check_indexed_access_type(&mut self, node: Node) {
         node.for_each_child(&mut |child: Node| self.check_source_element(child));
         let t = self.get_type_from_indexed_access_type_node(node);
         self.check_indexed_access_index_type(t, node);
     }
 
-    // Go: checker/checker.go:3369 checkMappedType
+    // Go: checker/checker.go:3412 checkMappedType
     pub fn check_mapped_type(&mut self, node: Node) {
         self.check_grammar_mapped_type(node);
         self.check_source_element(node.type_parameter());
@@ -701,14 +701,14 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3388 checkFunctionDeclaration
+    // Go: checker/checker.go:3431 checkFunctionDeclaration
     pub fn check_function_declaration(&mut self, node: Node) {
         self.check_function_or_method_declaration(node);
         self.check_grammar_for_generator(node);
         self.check_collisions_for_declaration_name(node, node.name());
     }
 
-    // Go: checker/checker.go:3394 checkFunctionOrMethodDeclaration
+    // Go: checker/checker.go:3437 checkFunctionOrMethodDeclaration
     pub fn check_function_or_method_declaration(&mut self, node: Node) {
         self.check_decorators(node);
         self.check_signature_declaration(node);
@@ -775,7 +775,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3445 checkFunctionOrConstructorSymbol
+    // Go: checker/checker.go:3489 checkFunctionOrConstructorSymbol
     pub fn check_function_or_constructor_symbol(&mut self, symbol: SymbolId) {
         // Only check the symbol once
         if !self
@@ -790,7 +790,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3453 checkFunctionOrConstructorSymbolWorker
+    // Go: checker/checker.go:3497 checkFunctionOrConstructorSymbolWorker
     pub fn check_function_or_constructor_symbol_worker(&mut self, symbol: SymbolId) {
         let flags_to_check = ModifierFlags::EXPORT
             | ModifierFlags::AMBIENT
@@ -1178,7 +1178,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3685 getEffectiveDeclarationFlags
+    // Go: checker/checker.go:3729 getEffectiveDeclarationFlags
     pub fn get_effective_declaration_flags(
         &mut self,
         n: Node,
@@ -1207,7 +1207,7 @@ impl Checker {
         flags & flags_to_check
     }
 
-    // Go: checker/checker.go:3700 isImplementationCompatibleWithOverload
+    // Go: checker/checker.go:3744 isImplementationCompatibleWithOverload
     pub fn is_implementation_compatible_with_overload(
         &mut self,
         implementation: SignatureId,
@@ -1237,7 +1237,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:3712 checkAllCodePathsInNonVoidFunctionReturnOrThrow
+    // Go: checker/checker.go:3756 checkAllCodePathsInNonVoidFunctionReturnOrThrow
     pub fn check_all_code_paths_in_non_void_function_return_or_throw(
         &mut self,
         fn_: Node,
@@ -1315,7 +1315,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3764 isUnwrappedReturnTypeUndefinedVoidOrAny
+    // Go: checker/checker.go:3808 isUnwrappedReturnTypeUndefinedVoidOrAny
     pub fn is_unwrapped_return_type_undefined_void_or_any(
         &mut self,
         fn_: Node,
@@ -1330,7 +1330,7 @@ impl Checker {
                     .intersects(TypeFlags::ANY | TypeFlags::UNDEFINED))
     }
 
-    // Go: checker/checker.go:3769 checkBlock
+    // Go: checker/checker.go:3813 checkBlock
     pub fn check_block(&mut self, node: Node) {
         // Grammar checking for SyntaxKind.Block
         if node.kind() == SyntaxKind::Block {
@@ -1348,7 +1348,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3786 checkIfStatement
+    // Go: checker/checker.go:3830 checkIfStatement
     pub fn check_if_statement(&mut self, node: Node) {
         self.check_grammar_statement_in_ambient_context(node);
         let t = self.check_truthiness_expression(node.expression(), CheckMode::NORMAL);
@@ -1369,7 +1369,7 @@ impl Checker {
         self.check_source_element(node.else_statement());
     }
 
-    // Go: checker/checker.go:3798 checkTestingKnownTruthyCallableOrAwaitableOrEnumMemberType
+    // Go: checker/checker.go:3842 checkTestingKnownTruthyCallableOrAwaitableOrEnumMemberType
     pub fn check_testing_known_truthy_callable_or_awaitable_or_enum_member_type(
         &mut self,
         cond_expr: Node,
@@ -1382,7 +1382,7 @@ impl Checker {
         self.check_testing_known_truthy_types(cond_expr, cond_type, body);
     }
 
-    // Go: checker/checker.go:3805 checkTestingKnownTruthyTypes
+    // Go: checker/checker.go:3849 checkTestingKnownTruthyTypes
     pub fn check_testing_known_truthy_types(
         &mut self,
         cond_expr: Node,
@@ -1400,7 +1400,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3814 checkTestingKnownTruthyType
+    // Go: checker/checker.go:3858 checkTestingKnownTruthyType
     pub fn check_testing_known_truthy_type(
         &mut self,
         cond_expr: Node,

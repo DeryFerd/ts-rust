@@ -313,7 +313,7 @@ pub static COMMON_OPTIONS_WITH_BUILD: LazyLock<Vec<&'static CommandLineOption>> 
     },
 );
 
-// Go: tsoptions/declscompiler.go:255 optionsForCompiler
+// Go: tsoptions/declscompiler.go:263 optionsForCompiler
 pub static OPTIONS_FOR_COMPILER: LazyLock<Vec<&'static CommandLineOption>> = LazyLock::new(|| {
     vec![
     //******* compilerOptions not common with --build *******
@@ -1361,7 +1361,7 @@ pub static OPTIONS_FOR_COMPILER: LazyLock<Vec<&'static CommandLineOption>> = Laz
     ]
 });
 
-// Go: tsoptions/declscompiler.go:1203 optionsType
+// Go: tsoptions/declscompiler.go:1211 optionsType
 // PORT: Go reads `core.CompilerOptions` fields by reflection. This returns
 // the exported fields in Go declaration order, as (Go field name, value).
 // The Go field index `i` is the index in this list (the unexported
@@ -1638,7 +1638,7 @@ pub fn compiler_options_field_values(
     ]
 }
 
-// Go: tsoptions/declscompiler.go:1205 optionsHaveChanges
+// Go: tsoptions/declscompiler.go:1213 optionsHaveChanges
 #[must_use]
 pub fn options_have_changes(
     old_options: Option<&CompilerOptions>,
@@ -1675,7 +1675,7 @@ pub fn options_have_changes(
     })
 }
 
-// Go: tsoptions/declscompiler.go:1226 ForEachCompilerOptionValue
+// Go: tsoptions/declscompiler.go:1234 ForEachCompilerOptionValue
 pub fn for_each_compiler_option_value(
     options: &CompilerOptions,
     decl_filter: &dyn Fn(&CommandLineOption) -> bool,
@@ -1694,7 +1694,7 @@ pub fn for_each_compiler_option_value(
     false
 }
 
-// Go: tsoptions/declscompiler.go:1242 CompilerOptionsAffectSemanticDiagnostics
+// Go: tsoptions/declscompiler.go:1250 CompilerOptionsAffectSemanticDiagnostics
 #[must_use]
 pub fn compiler_options_affect_semantic_diagnostics(
     old_options: Option<&CompilerOptions>,
@@ -1705,7 +1705,7 @@ pub fn compiler_options_affect_semantic_diagnostics(
     })
 }
 
-// Go: tsoptions/declscompiler.go:1251 CompilerOptionsAffectDeclarationPath
+// Go: tsoptions/declscompiler.go:1259 CompilerOptionsAffectDeclarationPath
 #[must_use]
 pub fn compiler_options_affect_declaration_path(
     old_options: Option<&CompilerOptions>,
@@ -1716,7 +1716,7 @@ pub fn compiler_options_affect_declaration_path(
     })
 }
 
-// Go: tsoptions/declscompiler.go:1260 CompilerOptionsAffectEmit
+// Go: tsoptions/declscompiler.go:1268 CompilerOptionsAffectEmit
 #[must_use]
 pub fn compiler_options_affect_emit(
     old_options: Option<&CompilerOptions>,
@@ -1739,7 +1739,7 @@ pub static BUILD_NAME_MAP: LazyLock<NameMap> =
 pub static WATCH_NAME_MAP: LazyLock<NameMap> =
     LazyLock::new(|| get_name_map_from_list(&OPTIONS_FOR_WATCH));
 
-// Go: tsoptions/namemap.go:14 GetNameMapFromList
+// Go: tsoptions/namemap.go:15 GetNameMapFromList
 #[must_use]
 pub fn get_name_map_from_list(opt_decls: &[&'static CommandLineOption]) -> NameMap {
     let mut options_names: IndexMap<String, &'static CommandLineOption> =
@@ -1757,7 +1757,7 @@ pub fn get_name_map_from_list(opt_decls: &[&'static CommandLineOption]) -> NameM
     }
 }
 
-// Go: tsoptions/namemap.go:29 NameMap
+// Go: tsoptions/namemap.go:30 NameMap
 // PORT: Go `OrderedMap.Set` on an existing key keeps the first position and
 // replaces the value. `IndexMap::insert` does the same.
 #[derive(Clone, Debug, Default)]
@@ -1767,13 +1767,13 @@ pub struct NameMap {
 }
 
 impl NameMap {
-    // Go: tsoptions/namemap.go:34 Get
+    // Go: tsoptions/namemap.go:35 Get
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&'static CommandLineOption> {
         self.options_names.get(&name.to_lowercase()).copied()
     }
 
-    // Go: tsoptions/namemap.go:38 GetFromShort
+    // Go: tsoptions/namemap.go:39 GetFromShort
     #[must_use]
     pub fn get_from_short(&self, short_name: &str) -> Option<&'static CommandLineOption> {
         // returns option only if shortName is a valid short option
@@ -1783,7 +1783,7 @@ impl NameMap {
         self.get(name)
     }
 
-    // Go: tsoptions/namemap.go:47 GetOptionDeclarationFromName
+    // Go: tsoptions/namemap.go:48 GetOptionDeclarationFromName
     #[must_use]
     pub fn get_option_declaration_from_name(
         &self,

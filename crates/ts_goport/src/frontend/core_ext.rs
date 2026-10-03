@@ -45,12 +45,12 @@ impl MarshalerTo for ProjectReference {
     }
 }
 
-// Go: core/projectreference.go:11 ResolveProjectReferencePath
+// Go: core/projectreference.go:14 ResolveProjectReferencePath
 pub fn resolve_project_reference_path(r: &ProjectReference) -> String {
     resolve_config_file_name_of_project_reference(&r.path)
 }
 
-// Go: core/projectreference.go:15 ResolveConfigFileNameOfProjectReference
+// Go: core/projectreference.go:18 ResolveConfigFileNameOfProjectReference
 pub fn resolve_config_file_name_of_project_reference(path: &str) -> String {
     if file_extension_is(path, EXTENSION_JSON) {
         return path.to_string();
@@ -83,7 +83,7 @@ impl HasFileName for ParsedSourceFile {
     }
 }
 
-// Go: core/core.go:527 GetScriptKindFromFileName
+// Go: core/core.go:525 GetScriptKindFromFileName
 pub fn get_script_kind_from_file_name(file_name: &str) -> ScriptKind {
     if let Some(dot_pos) = file_name.rfind('.') {
         let ext = file_name[dot_pos..].to_lowercase();
@@ -99,7 +99,7 @@ pub fn get_script_kind_from_file_name(file_name: &str) -> ScriptKind {
     ScriptKind::UNKNOWN
 }
 
-// Go: core/core.go:546 GetDefaultExtensionForScriptKind (tsgo#4712)
+// Go: core/core.go:544 GetDefaultExtensionForScriptKind (tsgo#4712)
 #[must_use]
 pub fn get_default_extension_for_script_kind(script_kind: ScriptKind) -> &'static str {
     match script_kind {
@@ -114,7 +114,7 @@ pub fn get_default_extension_for_script_kind(script_kind: ScriptKind) -> &'stati
 // EnsureScriptKindFromFileName is like GetScriptKindFromFileName, but defaults to
 // ScriptKindTS when the file name has no recognized extension (e.g. files included
 // with allowNonTsExtensions), so the result is always safe to hand to the parser.
-// Go: core/core.go:564 EnsureScriptKindFromFileName
+// Go: core/core.go:562 EnsureScriptKindFromFileName
 pub fn ensure_script_kind_from_file_name(file_name: &str) -> ScriptKind {
     let kind = get_script_kind_from_file_name(file_name);
     if kind != ScriptKind::UNKNOWN {

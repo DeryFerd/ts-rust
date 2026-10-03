@@ -22,20 +22,20 @@ pub struct Replacements {
     pub realpath: Option<Box<dyn Fn(&str) -> String>>,
 }
 
-// Go: wrapvfs.go:24 Wrap
+// Go: wrapvfs.go:23 Wrap
 // PORT: the Go package function `wrapvfs.Wrap` is `wrapvfs_wrap`.
 pub fn wrapvfs_wrap(fs: Rc<dyn Fs>, replacements: Replacements) -> Rc<dyn Fs> {
     Rc::new(WrappedFs { fs, replacements })
 }
 
-// Go: wrapvfs.go:31 wrappedFS
+// Go: wrapvfs.go:30 wrappedFS
 struct WrappedFs {
     fs: Rc<dyn Fs>,
     replacements: Replacements,
 }
 
 impl Fs for WrappedFs {
-    // Go: wrapvfs.go:37 UseCaseSensitiveFileNames
+    // Go: wrapvfs.go:36 UseCaseSensitiveFileNames
     // UseCaseSensitiveFileNames implements [vfs.FS].
     fn use_case_sensitive_file_names(&self) -> bool {
         if let Some(f) = &self.replacements.use_case_sensitive_file_names {
@@ -44,7 +44,7 @@ impl Fs for WrappedFs {
         self.fs.use_case_sensitive_file_names()
     }
 
-    // Go: wrapvfs.go:45 FileExists
+    // Go: wrapvfs.go:44 FileExists
     // FileExists implements [vfs.FS].
     fn file_exists(&self, path: &str) -> bool {
         if let Some(f) = &self.replacements.file_exists {
@@ -53,7 +53,7 @@ impl Fs for WrappedFs {
         self.fs.file_exists(path)
     }
 
-    // Go: wrapvfs.go:53 ReadFile
+    // Go: wrapvfs.go:52 ReadFile
     // ReadFile implements [vfs.FS].
     fn read_file(&self, path: &str) -> (String, bool) {
         if let Some(f) = &self.replacements.read_file {
@@ -62,7 +62,7 @@ impl Fs for WrappedFs {
         self.fs.read_file(path)
     }
 
-    // Go: wrapvfs.go:61 WriteFile
+    // Go: wrapvfs.go:60 WriteFile
     // WriteFile implements [vfs.FS].
     fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         if let Some(f) = &self.replacements.write_file {
@@ -71,7 +71,7 @@ impl Fs for WrappedFs {
         self.fs.write_file(path, data)
     }
 
-    // Go: wrapvfs.go:69 AppendFile
+    // Go: wrapvfs.go:68 AppendFile
     // AppendFile implements [vfs.FS].
     fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         if let Some(f) = &self.replacements.append_file {
@@ -80,7 +80,7 @@ impl Fs for WrappedFs {
         self.fs.append_file(path, data)
     }
 
-    // Go: wrapvfs.go:77 Remove
+    // Go: wrapvfs.go:76 Remove
     // Remove implements [vfs.FS].
     fn remove(&self, path: &str) -> Result<(), FsError> {
         if let Some(f) = &self.replacements.remove {
@@ -89,7 +89,7 @@ impl Fs for WrappedFs {
         self.fs.remove(path)
     }
 
-    // Go: wrapvfs.go:85 Chtimes
+    // Go: wrapvfs.go:84 Chtimes
     // Chtimes implements [vfs.FS].
     fn chtimes(
         &self,
@@ -103,7 +103,7 @@ impl Fs for WrappedFs {
         self.fs.chtimes(path, a_time, m_time)
     }
 
-    // Go: wrapvfs.go:93 DirectoryExists
+    // Go: wrapvfs.go:92 DirectoryExists
     // DirectoryExists implements [vfs.FS].
     fn directory_exists(&self, path: &str) -> bool {
         if let Some(f) = &self.replacements.directory_exists {
@@ -112,7 +112,7 @@ impl Fs for WrappedFs {
         self.fs.directory_exists(path)
     }
 
-    // Go: wrapvfs.go:101 GetAccessibleEntries
+    // Go: wrapvfs.go:100 GetAccessibleEntries
     // GetAccessibleEntries implements [vfs.FS].
     fn get_accessible_entries(&self, path: &str) -> Entries {
         if let Some(f) = &self.replacements.get_accessible_entries {
@@ -121,7 +121,7 @@ impl Fs for WrappedFs {
         self.fs.get_accessible_entries(path)
     }
 
-    // Go: wrapvfs.go:109 Stat
+    // Go: wrapvfs.go:108 Stat
     // Stat implements [vfs.FS].
     fn stat(&self, path: &str) -> Option<FileInfo> {
         if let Some(f) = &self.replacements.stat {
@@ -130,7 +130,7 @@ impl Fs for WrappedFs {
         self.fs.stat(path)
     }
 
-    // Go: wrapvfs.go:125 Realpath
+    // Go: wrapvfs.go:116 Realpath
     // Realpath implements [vfs.FS].
     fn realpath(&self, path: &str) -> String {
         if let Some(f) = &self.replacements.realpath {

@@ -14,6 +14,7 @@ use crate::frontend::scanner::scanner_p1::{
     ErrorCallback, Scanner, ScannerState, TEXT_TO_KEYWORD, new_scanner,
 };
 use smallvec::SmallVec;
+use std::cell::OnceCell;
 use std::sync::LazyLock;
 
 // Go: parser.go:19 ParsingContext
@@ -112,7 +113,7 @@ pub struct ParseDiagnostics {
 }
 
 impl ParseDiagnostics {
-    // Go: parser.go:329 parseErrorAtRange
+    // Go: parser.go:330 parseErrorAtRange
     /// Returns the index of the new diagnostic, or `None` when Go returns nil.
     // PORT: Go returns the `*ast.Diagnostic`. Rust diagnostics are owned
     // values, so the index in `diagnostics` is returned.
@@ -180,9 +181,20 @@ pub struct Parser<'a> {
     pub reparsed_clones: Vec<Node>,
 
     pub store: usize,
+
+    /// The owner of a JSDoc text whose cut splits a char, given by the
+    /// caller of the parse (see `parse_js_doc_comment`).
+    pub jsdoc_cut_text: Option<&'a OnceCell<String>>,
+    /// When the cut of the JSDoc text in parse splits a char: the position
+    /// after the first kept byte in the cut text, else `i32::MAX`. A node,
+    /// list or diagnostic that ends there or later may need a map to the
+    /// file (`jsdoc_tail_pos`).
+    pub jsdoc_tail_first: i32,
+    /// The comment end of the JSDoc text in parse.
+    pub jsdoc_tail_end: i32,
 }
 
-// Go: parser.go:106 newParser
+// Go: parser.go:104 newParser
 // PORT: Go keeps parsers in a `sync.Pool` (`getParser`/`putParser`). A new
 // parser is made for each parse here.
 #[must_use]
@@ -215,12 +227,15 @@ pub fn new_parser<'a>() -> Parser<'a> {
         current_parent: Node::NIL,
         reparsed_clones: Vec::new(),
         store: 0,
+        jsdoc_cut_text: None,
+        jsdoc_tail_first: i32::MAX,
+        jsdoc_tail_end: 0,
     };
     res.initialize_closures();
     res
 }
 
-// Go: parser.go:112 viableKeywordSuggestions
+// Go: parser.go:110 viableKeywordSuggestions
 // PORT: Go calls `scanner.GetViableKeywordSuggestions()` (scanner.go:2288),
 // which ranges over the `textToKeyword` map. Go map order is random. Here the
 // order is the keyword table order.
@@ -238,7 +253,7 @@ pub fn viable_keyword_suggestions() -> &'static [String] {
     &VIABLE_KEYWORD_SUGGESTIONS
 }
 
-// Go: parser.go:118 isMissingNodeList
+// Go: parser.go:116 isMissingNodeList
 // PORT: Go marks a missing list by its shared `missingListNodes` backing
 // array. Rust lists do not share backing arrays, so `create_missing_list`
 // marks the list with the astdata `has_trailing_comma` bit on an empty list.
@@ -249,7 +264,7 @@ pub fn is_missing_node_list(list: NodeList) -> bool {
     !list.is_nil() && list.nodes().is_empty() && list.stored_trailing_comma()
 }
 
-// Go: parser.go:137 ParseSourceFile
+// Go: parser.go:135 ParseSourceFile
 // PORT: Go `NewSourceFile` makes a heap node. Here the parse makes a node
 // store for the file first and freezes it at the end. The store keeps the
 // file name as `&'static str`, so the name is leaked once per file. The
@@ -262,8 +277,10 @@ pub fn parse_source_file(
     script_kind: ScriptKind,
 ) -> ParsedSourceFile {
     let source_text: FileText = source_text.into();
+    let jsdoc_cut_text = OnceCell::new();
     let mut p = new_parser();
     p.initialize_state(opts, &source_text, script_kind);
+    p.jsdoc_cut_text = Some(&jsdoc_cut_text);
     // lsshells M3c: each version of an edited file is a new parse, so a
     // freeable parse (`crate::ast::is_freeable_parse`) interns the name,
     // which all its versions share, instead of leaking it again.
@@ -322,8 +339,10 @@ pub fn parse_source_file_detached(
     script_kind: ScriptKind,
 ) -> DetachedParse {
     let source_text: FileText = source_text.into();
+    let jsdoc_cut_text = OnceCell::new();
     let mut p = new_parser();
     p.initialize_state(opts, &source_text, script_kind);
+    p.jsdoc_cut_text = Some(&jsdoc_cut_text);
     let file_name: &'static str = Box::leak(opts.file_name.clone().into_boxed_str());
     // Drop what a parse that panicked left on this thread.
     let _ = take_detached_file_store();
@@ -389,19 +408,19 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:148 initializeClosures
+    // Go: parser.go:146 initializeClosures
     // PORT: Go sets the `setParentFromContext` closure field. Rust closures
     // cannot borrow the parser that owns them, so p5
     // `override_parent_in_immediate_children` reads `current_parent` directly.
     pub fn initialize_closures(&mut self) {}
 
-    // Go: parser.go:155 isJavaScript
+    // Go: parser.go:153 isJavaScript
     #[must_use]
     pub fn is_javascript(&self) -> bool {
         self.script_kind == ScriptKind::JS || self.script_kind == ScriptKind::JSX
     }
 
-    // Go: parser.go:159 parseJSONText
+    // Go: parser.go:157 parseJSONText
     pub fn parse_json_text(&mut self) -> ParsedSourceFile {
         let pos = self.node_pos();
         let statements;
@@ -483,7 +502,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:234 validateJsonValue
+    // Go: parser.go:235 validateJsonValue
     pub fn validate_json_value(&mut self, source_file: &ParsedSourceFile, value_expression: Node) {
         if value_expression.is_nil() {
             return;
@@ -536,7 +555,7 @@ impl<'a> Parser<'a> {
         self.diagnostics.borrow_mut().diagnostics.push(d);
     }
 
-    // Go: parser.go:268 validateJsonObjectLiteral
+    // Go: parser.go:269 validateJsonObjectLiteral
     /// validateJsonObjectLiteral validates properties of a JSON object literal.
     pub fn validate_json_object_literal(&mut self, source_file: &ParsedSourceFile, node: Node) {
         for element in node.properties().iter() {
@@ -564,7 +583,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:290 initializeState
+    // Go: parser.go:291 initializeState
     pub fn initialize_state(
         &mut self,
         opts: &SourceFileParseOptions,
@@ -600,7 +619,7 @@ impl<'a> Parser<'a> {
         self.scanner.set_language_variant(self.language_variant);
     }
 
-    // Go: parser.go:321 parseErrorAt
+    // Go: parser.go:322 parseErrorAt
     pub fn parse_error_at(
         &mut self,
         pos: i32,
@@ -611,7 +630,7 @@ impl<'a> Parser<'a> {
         self.parse_error_at_range(TextRange::new(pos, end), message, args)
     }
 
-    // Go: parser.go:325 parseErrorAtCurrentToken
+    // Go: parser.go:326 parseErrorAtCurrentToken
     pub fn parse_error_at_current_token(
         &mut self,
         message: &'static crate::diagnostics::Message,
@@ -621,7 +640,7 @@ impl<'a> Parser<'a> {
         self.parse_error_at_range(range, message, args)
     }
 
-    // Go: parser.go:329 parseErrorAtRange
+    // Go: parser.go:330 parseErrorAtRange
     // PORT: see `ParseDiagnostics::parse_error_at_range`.
     pub fn parse_error_at_range(
         &mut self,
@@ -647,7 +666,7 @@ impl<'a> Parser<'a> {
         self.diagnostics.borrow_mut().has_parse_error = value;
     }
 
-    // Go: parser.go:351 mark
+    // Go: parser.go:352 mark
     #[must_use]
     pub fn mark(&self) -> ParserState<'a> {
         let diagnostics = self.diagnostics.borrow();
@@ -663,7 +682,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:364 rewind
+    // Go: parser.go:365 rewind
     pub fn rewind(&mut self, state: ParserState<'a>) {
         self.scanner.rewind(state.scanner_state);
         self.token = self.scanner.token();
@@ -679,7 +698,7 @@ impl<'a> Parser<'a> {
         self.statement_has_await_identifier = state.statement_has_await_identifier;
     }
 
-    // Go: parser.go:376 lookAhead
+    // Go: parser.go:377 lookAhead
     pub fn look_ahead(&mut self, callback: impl FnOnce(&mut Parser<'a>) -> bool) -> bool {
         let state = self.mark();
         let result = callback(self);
@@ -687,7 +706,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:383 nextToken
+    // Go: parser.go:384 nextToken
     pub fn next_token(&mut self) -> SyntaxKind {
         // if the keyword had an escape
         // PERF: U1 (c). The escape flags are tested first. Both tests are
@@ -706,37 +725,37 @@ impl<'a> Parser<'a> {
         self.token
     }
 
-    // Go: parser.go:393 nextTokenWithoutCheck
+    // Go: parser.go:394 nextTokenWithoutCheck
     pub fn next_token_without_check(&mut self) -> SyntaxKind {
         self.token = self.scanner.scan();
         self.token
     }
 
-    // Go: parser.go:398 nextTokenJSDoc
+    // Go: parser.go:399 nextTokenJSDoc
     pub fn next_token_js_doc(&mut self) -> SyntaxKind {
         self.token = self.scanner.scan_js_doc_token();
         self.token
     }
 
-    // Go: parser.go:403 nextJSDocCommentTextToken
+    // Go: parser.go:404 nextJSDocCommentTextToken
     pub fn next_js_doc_comment_text_token(&mut self, in_backticks: bool) -> SyntaxKind {
         self.token = self.scanner.scan_js_doc_comment_text_token(in_backticks);
         self.token
     }
 
-    // Go: parser.go:408 nodePos
+    // Go: parser.go:409 nodePos
     #[must_use]
     pub fn node_pos(&self) -> i32 {
         self.scanner.token_full_start()
     }
 
-    // Go: parser.go:412 hasPrecedingLineBreak
+    // Go: parser.go:413 hasPrecedingLineBreak
     #[must_use]
     pub fn has_preceding_line_break(&self) -> bool {
         self.scanner.has_preceding_line_break()
     }
 
-    // Go: parser.go:416 jsdocScannerInfo
+    // Go: parser.go:417 jsdocScannerInfo
     #[must_use]
     pub fn jsdoc_scanner_info(&self) -> JsdocScannerInfo {
         if !self.scanner.has_preceding_js_doc_comment() {
@@ -752,7 +771,7 @@ impl<'a> Parser<'a> {
         info
     }
 
-    // Go: parser.go:430 parseSourceFileWorker
+    // Go: parser.go:431 parseSourceFileWorker
     pub fn parse_source_file_worker(&mut self) -> ParsedSourceFile {
         let is_declaration_file = is_declaration_file_name(&self.opts.file_name);
         if is_declaration_file {
@@ -811,7 +830,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:465 finishSourceFile
+    // Go: parser.go:466 finishSourceFile
     pub fn finish_source_file(&mut self, result: &mut ParsedSourceFile, is_declaration_file: bool) {
         result.comment_directives = self.scanner.comment_directives().to_vec();
         result.pragmas = get_comment_pragmas(&self.factory, self.source_text);
@@ -845,7 +864,7 @@ impl<'a> Parser<'a> {
         set_external_module_indicator(result, self.opts.external_module_indicator_options);
     }
 
-    // Go: parser.go:491 createJSDocCache
+    // Go: parser.go:489 createJSDocCache
     // PORT: Go returns a nil map when there is no JSDoc. An empty map here.
     #[must_use]
     pub fn create_js_doc_cache(&self) -> FxHashMap<Node, Vec<Node>> {
@@ -860,7 +879,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:502 parseToplevelStatement
+    // Go: parser.go:500 parseToplevelStatement
     pub fn parse_toplevel_statement(&mut self, i: i32) -> Node {
         self.statement_has_await_identifier = false;
         let statement = self.parse_statement();
@@ -881,7 +900,7 @@ impl<'a> Parser<'a> {
         statement
     }
 
-    // Go: parser.go:519 reparseTopLevelAwait
+    // Go: parser.go:517 reparseTopLevelAwait
     pub fn reparse_top_level_await(&mut self, source_file: &ParsedSourceFile) -> Node {
         if self.possible_await_spans.len() % 2 == 1 {
             panic!("possibleAwaitSpans malformed: odd number of indices, not paired into spans.");
@@ -991,7 +1010,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:615 parseListIndex
+    // Go: parser.go:613 parseListIndex
     pub fn parse_list_index(
         &mut self,
         kind: ParsingContext,
@@ -1029,7 +1048,7 @@ impl<'a> Parser<'a> {
         list
     }
 
-    // Go: parser.go:647 parseList
+    // Go: parser.go:645 parseList
     pub fn parse_list(
         &mut self,
         kind: ParsingContext,
@@ -1041,7 +1060,7 @@ impl<'a> Parser<'a> {
         self.new_node_list(TextRange::new(pos, end), &nodes)
     }
 
-    // Go: parser.go:654 parseDelimitedList
+    // Go: parser.go:652 parseDelimitedList
     /// Return a non-nil (but possibly empty) list if parsing was successful, or nil if parseElement returned nil
     pub fn parse_delimited_list(
         &mut self,
@@ -1114,7 +1133,7 @@ impl<'a> Parser<'a> {
         self.new_node_list(TextRange::new(pos, end), &list)
     }
 
-    // Go: parser.go:713 parseBracketedList
+    // Go: parser.go:711 parseBracketedList
     /// Return a non-nil (but possibly empty) NodeList if parsing was successful, a missing NodeList if the opening
     /// token wasn't found, or nil if parseElement returned nil.
     pub fn parse_bracketed_list(
@@ -1132,13 +1151,13 @@ impl<'a> Parser<'a> {
         self.create_missing_list()
     }
 
-    // Go: parser.go:722 parseEmptyNodeList
+    // Go: parser.go:720 parseEmptyNodeList
     pub fn parse_empty_node_list(&mut self) -> NodeList {
         let pos = self.node_pos();
         self.new_node_list(TextRange::new(pos, pos), &[])
     }
 
-    // Go: parser.go:726 createMissingList
+    // Go: parser.go:724 createMissingList
     // PORT: see `is_missing_node_list`. The empty list is copied with the
     // marker bit set and leaked like every other list
     // (`NodeList::with_missing_marker`).
@@ -1146,7 +1165,7 @@ impl<'a> Parser<'a> {
         self.parse_empty_node_list().with_missing_marker()
     }
 
-    // Go: parser.go:733 abortParsingListOrMoveToNextToken
+    // Go: parser.go:731 abortParsingListOrMoveToNextToken
     /// Returns true if we should abort parsing.
     pub fn abort_parsing_list_or_move_to_next_token(&mut self, kind: ParsingContext) -> bool {
         self.parsing_context_errors(kind);
@@ -1157,7 +1176,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    // Go: parser.go:743 isInSomeParsingContext
+    // Go: parser.go:741 isInSomeParsingContext
     /// True if positioned at element or terminator of the current list or any enclosing list
     pub fn is_in_some_parsing_context(&mut self) -> bool {
         // We should be in at least one parsing context, be it SourceElements while parsing
@@ -1174,7 +1193,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    // Go: parser.go:757 parsingContextErrors
+    // Go: parser.go:755 parsingContextErrors
     pub fn parsing_context_errors(&mut self, context: ParsingContext) {
         use ParsingContext as PC;
         match context {
@@ -1294,7 +1313,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:826 isListElement
+    // Go: parser.go:824 isListElement
     pub fn is_list_element(
         &mut self,
         parsing_context: ParsingContext,
@@ -1412,7 +1431,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:918 isListTerminator
+    // Go: parser.go:916 isListTerminator
     pub fn is_list_terminator(&mut self, kind: ParsingContext) -> bool {
         use ParsingContext as PC;
         if self.token == SyntaxKind::EndOfFile {
@@ -1492,7 +1511,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:964 parseExpectedJSDoc
+    // Go: parser.go:962 parseExpectedJSDoc
     pub fn parse_expected_js_doc(&mut self, kind: SyntaxKind) -> bool {
         if self.token == kind {
             self.next_token_js_doc();
@@ -1505,7 +1524,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    // Go: parser.go:976 parseExpectedMatchingBrackets
+    // Go: parser.go:974 parseExpectedMatchingBrackets
     pub fn parse_expected_matching_brackets(
         &mut self,
         open_kind: SyntaxKind,
@@ -1533,7 +1552,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:991 parseOptional
+    // Go: parser.go:989 parseOptional
     pub fn parse_optional(&mut self, token: SyntaxKind) -> bool {
         if self.token == token {
             self.next_token();
@@ -1542,17 +1561,17 @@ impl<'a> Parser<'a> {
         false
     }
 
-    // Go: parser.go:999 parseExpected
+    // Go: parser.go:997 parseExpected
     pub fn parse_expected(&mut self, kind: SyntaxKind) -> bool {
         self.parse_expected_with_diagnostic(kind, None, true)
     }
 
-    // Go: parser.go:1003 parseExpectedWithoutAdvancing
+    // Go: parser.go:1001 parseExpectedWithoutAdvancing
     pub fn parse_expected_without_advancing(&mut self, kind: SyntaxKind) -> bool {
         self.parse_expected_with_diagnostic(kind, None, false)
     }
 
-    // Go: parser.go:1007 parseExpectedWithDiagnostic
+    // Go: parser.go:1005 parseExpectedWithDiagnostic
     pub fn parse_expected_with_diagnostic(
         &mut self,
         kind: SyntaxKind,
@@ -1577,7 +1596,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    // Go: parser.go:1023 parseTokenNode
+    // Go: parser.go:1021 parseTokenNode
     pub fn parse_token_node(&mut self) -> Node {
         let pos = self.node_pos();
         let kind = self.token;
@@ -1586,7 +1605,7 @@ impl<'a> Parser<'a> {
         self.finish_node(token, pos)
     }
 
-    // Go: parser.go:1030 parseExpectedToken
+    // Go: parser.go:1028 parseExpectedToken
     pub fn parse_expected_token(&mut self, kind: SyntaxKind) -> Node {
         let mut token = self.parse_optional_token(kind);
         if token.is_nil() {
@@ -1598,7 +1617,7 @@ impl<'a> Parser<'a> {
         token
     }
 
-    // Go: parser.go:1039 parseOptionalToken
+    // Go: parser.go:1037 parseOptionalToken
     pub fn parse_optional_token(&mut self, kind: SyntaxKind) -> Node {
         if self.token == kind {
             return self.parse_token_node();
@@ -1606,7 +1625,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser.go:1046 parseExpectedTokenJSDoc
+    // Go: parser.go:1044 parseExpectedTokenJSDoc
     pub fn parse_expected_token_js_doc(&mut self, kind: SyntaxKind) -> Node {
         let mut optional = self.parse_optional_token_js_doc(kind);
         if optional.is_nil() {
@@ -1621,7 +1640,7 @@ impl<'a> Parser<'a> {
         optional
     }
 
-    // Go: parser.go:1058 parseOptionalTokenJSDoc
+    // Go: parser.go:1056 parseOptionalTokenJSDoc
     pub fn parse_optional_token_js_doc(&mut self, kind: SyntaxKind) -> Node {
         if self.token == kind {
             return self.parse_token_node();
@@ -1629,7 +1648,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser.go:1065 parseStatement
+    // Go: parser.go:1063 parseStatement
     pub fn parse_statement(&mut self) -> Node {
         match self.token {
             SyntaxKind::SemicolonToken => return self.parse_empty_statement(),
@@ -1732,7 +1751,7 @@ impl<'a> Parser<'a> {
         self.parse_expression_or_labeled_statement()
     }
 
-    // Go: parser.go:1126 parseDeclaration
+    // Go: parser.go:1124 parseDeclaration
     pub fn parse_declaration(&mut self) -> Node {
         // `parseListElement` attempted to get the reused node at this position,
         // but the ambient context flag was not yet set, so the node appeared
@@ -1764,7 +1783,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser.go:1153 parseDeclarationWorker
+    // Go: parser.go:1151 parseDeclarationWorker
     pub fn parse_declaration_worker(
         &mut self,
         pos: i32,
@@ -1828,14 +1847,14 @@ impl<'a> Parser<'a> {
         panic!("Unhandled case in parseDeclarationWorker");
     }
 
-    // Go: parser.go:1199 isLetDeclaration
+    // Go: parser.go:1197 isLetDeclaration
     pub fn is_let_declaration(&mut self) -> bool {
         // In ES6 'let' always starts a lexical declaration if followed by an identifier or {
         // or [.
         self.look_ahead(Parser::next_token_is_binding_identifier_or_start_of_destructuring)
     }
 
-    // Go: parser.go:1205 nextTokenIsBindingIdentifierOrStartOfDestructuring
+    // Go: parser.go:1203 nextTokenIsBindingIdentifierOrStartOfDestructuring
     pub fn next_token_is_binding_identifier_or_start_of_destructuring(&mut self) -> bool {
         self.next_token();
         self.is_binding_identifier()
@@ -1843,7 +1862,7 @@ impl<'a> Parser<'a> {
             || self.token == SyntaxKind::OpenBracketToken
     }
 
-    // Go: parser.go:1210 parseBlock
+    // Go: parser.go:1208 parseBlock
     pub fn parse_block(
         &mut self,
         ignore_missing_open_brace: bool,
@@ -1884,7 +1903,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:1233 parseEmptyStatement
+    // Go: parser.go:1231 parseEmptyStatement
     pub fn parse_empty_statement(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -1895,7 +1914,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:1242 parseIfStatement
+    // Go: parser.go:1240 parseIfStatement
     pub fn parse_if_statement(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -1922,7 +1941,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:1260 parseDoStatement
+    // Go: parser.go:1258 parseDoStatement
     pub fn parse_do_statement(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -1949,7 +1968,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:1280 parseWhileStatement
+    // Go: parser.go:1278 parseWhileStatement
     pub fn parse_while_statement(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -1970,7 +1989,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:1294 parseForOrForInOrForOfStatement
+    // Go: parser.go:1292 parseForOrForInOrForOfStatement
     pub fn parse_for_or_for_in_or_for_of_statement(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -2045,7 +2064,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:1340 parseBreakStatement
+    // Go: parser.go:1338 parseBreakStatement
     pub fn parse_break_statement(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -2058,7 +2077,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:1351 parseContinueStatement
+    // Go: parser.go:1349 parseContinueStatement
     pub fn parse_continue_statement(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -2071,7 +2090,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:1362 parseIdentifierUnlessAtSemicolon
+    // Go: parser.go:1360 parseIdentifierUnlessAtSemicolon
     pub fn parse_identifier_unless_at_semicolon(&mut self) -> Node {
         if !self.can_parse_semicolon() {
             return self.parse_identifier();
@@ -2079,7 +2098,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: parser.go:1369 parseReturnStatement
+    // Go: parser.go:1367 parseReturnStatement
     pub fn parse_return_statement(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -2095,7 +2114,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:1383 parseWithStatement
+    // Go: parser.go:1381 parseWithStatement
     pub fn parse_with_statement(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -2117,7 +2136,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    // Go: parser.go:1397 parseCaseClause
+    // Go: parser.go:1395 parseCaseClause
     pub fn parse_case_clause(&mut self) -> Node {
         let pos = self.node_pos();
         let jsdoc = self.jsdoc_scanner_info();
@@ -2137,7 +2156,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-// Go: parser.go:317 scanError
+// Go: parser.go:318 scanError
 // PORT: Go `p.scanError` is a method. The scanner callback cannot borrow the
 // parser, so it writes the shared `ParseDiagnostics` (see there).
 fn scan_error(
@@ -2152,7 +2171,7 @@ fn scan_error(
         .parse_error_at_range(TextRange::new(pos, pos + length), message, args);
 }
 
-// Go: parser.go:229 getErrorSpanForNode
+// Go: parser.go:227 getErrorSpanForNode
 #[must_use]
 pub fn get_error_span_for_node(source_text: &str, node: Node) -> TextRange {
     let mut pos = node.pos();
@@ -2162,13 +2181,13 @@ pub fn get_error_span_for_node(source_text: &str, node: Node) -> TextRange {
     TextRange::new(pos, node.end())
 }
 
-// Go: parser.go:263 isDoubleQuotedString
+// Go: parser.go:264 isDoubleQuotedString
 #[must_use]
 pub fn is_double_quoted_string(node: Node) -> bool {
     is_string_literal(node) && !node.token_flags().intersects(TokenFlags::SINGLE_QUOTE)
 }
 
-// Go: parser.go:281 ParseIsolatedEntityName
+// Go: parser.go:282 ParseIsolatedEntityName
 // PORT: the nodes use the synthetic factory of `new_parser`, as there is
 // no source file.
 #[must_use]
@@ -2184,7 +2203,7 @@ pub fn parse_isolated_entity_name(text: &str) -> Node {
     }
 }
 
-// Go: parser.go:340 ParserState
+// Go: parser.go:341 ParserState
 #[derive(Clone, Copy, Debug)]
 pub struct ParserState<'a> {
     pub scanner_state: ScannerState<'a>,
@@ -2197,7 +2216,7 @@ pub struct ParserState<'a> {
     pub has_parse_error: bool,
 }
 
-// Go: parser.go:1195 isDeclareModifier
+// Go: parser.go:1193 isDeclareModifier
 #[must_use]
 pub fn is_declare_modifier(modifier: Node) -> bool {
     modifier.kind() == SyntaxKind::DeclareKeyword

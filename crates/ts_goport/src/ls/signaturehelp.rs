@@ -11,19 +11,19 @@ pub const SIGNATURE_HELP_TRIGGER_CHARACTERS: &[&str] = &["(", ",", "<"];
 // Go: ls/signaturehelp.go:26 SignatureHelpRetriggerCharacters
 pub const SIGNATURE_HELP_RETRIGGER_CHARACTERS: &[&str] = &[")"];
 
-// Go: ls/signaturehelp.go:30 callInvocation
+// Go: ls/signaturehelp.go:29 callInvocation
 #[derive(Clone, Copy, Debug)]
 pub struct CallInvocation {
     pub node: Node,
 }
 
-// Go: ls/signaturehelp.go:24 typeArgsInvocation
+// Go: ls/signaturehelp.go:33 typeArgsInvocation
 #[derive(Clone, Copy, Debug)]
 pub struct TypeArgsInvocation {
     pub called: Node,
 }
 
-// Go: ls/signaturehelp.go:28 contextualInvocation
+// Go: ls/signaturehelp.go:37 contextualInvocation
 #[derive(Clone, Copy, Debug)]
 pub struct ContextualInvocation {
     pub signature: SignatureId,
@@ -31,7 +31,7 @@ pub struct ContextualInvocation {
     pub symbol: SymbolId,
 }
 
-// Go: ls/signaturehelp.go:34 invocation
+// Go: ls/signaturehelp.go:43 invocation
 // PORT: Go `*callInvocation` (and the other two) are nil-able pointers; here `Option`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Invocation {
@@ -47,7 +47,7 @@ const SIGNATURE_HELP_TRIGGER_REASON_KIND_CHARACTER_TYPED: i32 = 2; // was "chara
 const SIGNATURE_HELP_TRIGGER_REASON_KIND_RETRIGGERED: i32 = 3; // was "retrigger"
 
 impl LanguageService {
-    // Go: ls/signaturehelp.go:40 ProvideSignatureHelp
+    // Go: ls/signaturehelp.go:49 ProvideSignatureHelp
     // PORT: Go passes `documentURI` by value and `context` as a nil-able
     // pointer; here a reference and an `Option` reference.
     pub fn provide_signature_help(
@@ -84,7 +84,7 @@ impl LanguageService {
         Ok(lsproto::SignatureHelpOrNull::default())
     }
 
-    // Go: ls/signaturehelp.go:57 GetSignatureHelpItems
+    // Go: ls/signaturehelp.go:75 GetSignatureHelpItems
     pub fn get_signature_help_items(
         &self,
         ctx: &Context,
@@ -204,7 +204,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/signaturehelp.go:151 createTypeHelpItems
+// Go: ls/signaturehelp.go:169 createTypeHelpItems
 pub fn create_type_help_items(
     ctx: &Context,
     symbol: SymbolId,
@@ -269,7 +269,7 @@ pub fn create_type_help_items(
     Some(help)
 }
 
-// Go: ls/signaturehelp.go:193 getTypeHelpItem
+// Go: ls/signaturehelp.go:211 getTypeHelpItem
 pub fn get_type_help_item(
     symbol: SymbolId,
     type_parameter: &[TypeId],
@@ -328,7 +328,7 @@ pub fn get_type_help_item(
 }
 
 impl LanguageService {
-    // Go: ls/signaturehelp.go:226 createJSSignatureHelpItems
+    // Go: ls/signaturehelp.go:244 createJSSignatureHelpItems
     // createJSSignatureHelpItems is a fallback for JavaScript files when normal signature help
     // doesn't produce results. It searches all source files for declarations with matching names
     // that have call signatures.
@@ -367,7 +367,7 @@ impl LanguageService {
         None
     }
 
-    // Go: ls/signaturehelp.go:249 findSignatureHelpFromNamedDeclarations
+    // Go: ls/signaturehelp.go:267 findSignatureHelpFromNamedDeclarations
     pub fn find_signature_help_from_named_declarations(
         &self,
         ctx: &Context,
@@ -434,7 +434,7 @@ impl LanguageService {
         result
     }
 
-    // Go: ls/signaturehelp.go:277 createSignatureHelpItems
+    // Go: ls/signaturehelp.go:295 createSignatureHelpItems
     #[allow(clippy::too_many_arguments)]
     pub fn create_signature_help_items(
         &self,
@@ -615,7 +615,7 @@ impl LanguageService {
         Some(help)
     }
 
-    // Go: ls/signaturehelp.go:396 computeActiveParameter
+    // Go: ls/signaturehelp.go:419 computeActiveParameter
     // computeActiveParameter calculates the active parameter index for a signature,
     // handling variadic signatures and null support appropriately.
     pub fn compute_active_parameter(
@@ -659,7 +659,7 @@ impl LanguageService {
         })
     }
 
-    // Go: ls/signaturehelp.go:426 getSignatureHelpItem
+    // Go: ls/signaturehelp.go:449 getSignatureHelpItem
     #[allow(clippy::too_many_arguments)]
     pub fn get_signature_help_item(
         &self,
@@ -747,7 +747,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/signaturehelp.go:465 returnTypeToDisplayParts
+// Go: ls/signaturehelp.go:488 returnTypeToDisplayParts
 pub fn return_type_to_display_parts(
     candidate_signature: SignatureId,
     c: &mut Checker,
@@ -794,7 +794,7 @@ pub fn return_type_to_display_parts(
 }
 
 impl LanguageService {
-    // Go: ls/signaturehelp.go:490 itemInfoForTypeParameters
+    // Go: ls/signaturehelp.go:513 itemInfoForTypeParameters
     pub fn item_info_for_type_parameters(
         &self,
         candidate_signature: SignatureId,
@@ -923,7 +923,7 @@ impl LanguageService {
         result
     }
 
-    // Go: ls/signaturehelp.go:565 itemInfoForParameters
+    // Go: ls/signaturehelp.go:588 itemInfoForParameters
     pub fn item_info_for_parameters(
         &self,
         candidate_signature: SignatureId,
@@ -1055,14 +1055,14 @@ impl LanguageService {
     }
 }
 
-// Go: ls/signaturehelp.go:643 signatureHelpNodeBuilderFlags
+// Go: ls/signaturehelp.go:666 signatureHelpNodeBuilderFlags
 pub const SIGNATURE_HELP_NODE_BUILDER_FLAGS: NodeBuilderFlags =
     NodeBuilderFlags::OMIT_PARAMETER_MODIFIERS
         .union(NodeBuilderFlags::IGNORE_ERRORS)
         .union(NodeBuilderFlags::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE);
 
 impl LanguageService {
-    // Go: ls/signaturehelp.go:646 createSignatureHelpParameterFromLabel
+    // Go: ls/signaturehelp.go:669 createSignatureHelpParameterFromLabel
     // createSignatureHelpParameterFromLabel creates a signatureHelpParameter from a pre-computed label string.
     pub fn create_signature_help_parameter_from_label(
         &self,
@@ -1109,7 +1109,7 @@ impl LanguageService {
         }
     }
 
-    // Go: ls/signaturehelp.go:671 createSignatureHelpParameterForParameter
+    // Go: ls/signaturehelp.go:694 createSignatureHelpParameterForParameter
     pub fn create_signature_help_parameter_for_parameter(
         &self,
         parameter: SymbolId,
@@ -1133,7 +1133,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/signaturehelp.go:676 createSignatureHelpParameterForTypeParameter
+// Go: ls/signaturehelp.go:699 createSignatureHelpParameterForTypeParameter
 pub fn create_signature_help_parameter_for_type_parameter(
     t: TypeId,
     source_file: Node,
@@ -1164,7 +1164,7 @@ pub fn create_signature_help_parameter_for_type_parameter(
     }
 }
 
-// Go: ls/signaturehelp.go:690 signatureInformation
+// Go: ls/signaturehelp.go:713 signatureInformation
 // Represents the signature of something callable. A signature
 // can have a label, like a function-name, a doc-comment, and
 // a set of parameters.
@@ -1184,14 +1184,14 @@ pub struct SignatureInformation {
     pub colorized_runs: Vec<lsproto::VSClassifiedTextRun>,
 }
 
-// Go: ls/signaturehelp.go:705 signatureHelpItemInfo
+// Go: ls/signaturehelp.go:728 signatureHelpItemInfo
 pub struct SignatureHelpItemInfo {
     pub is_variadic: bool,
     pub parameters: Vec<SignatureHelpParameter>,
     pub writer: Rc<RefCell<DisplayPartsWriter>>,
 }
 
-// Go: ls/signaturehelp.go:711 signatureHelpParameter
+// Go: ls/signaturehelp.go:734 signatureHelpParameter
 // PORT: Go shares the `*lsproto.ParameterInformation` pointer between copies;
 // nothing mutates it after creation, so a value is used.
 #[derive(Clone, Debug, Default)]
@@ -1201,7 +1201,7 @@ pub struct SignatureHelpParameter {
     pub is_optional: bool,
 }
 
-// Go: ls/signaturehelp.go:717 getEnclosingDeclarationFromInvocation
+// Go: ls/signaturehelp.go:740 getEnclosingDeclarationFromInvocation
 pub fn get_enclosing_declaration_from_invocation(invocation: &Invocation) -> Node {
     if let Some(call_invocation) = &invocation.call_invocation {
         call_invocation.node
@@ -1216,7 +1216,7 @@ pub fn get_enclosing_declaration_from_invocation(invocation: &Invocation) -> Nod
     }
 }
 
-// Go: ls/signaturehelp.go:727 getExpressionFromInvocation
+// Go: ls/signaturehelp.go:750 getExpressionFromInvocation
 pub fn get_expression_from_invocation(argument_info: &ArgumentListInfo) -> Node {
     if let Some(call_invocation) = &argument_info.invocation.call_invocation {
         return get_invoked_expression(call_invocation.node);
@@ -1229,21 +1229,21 @@ pub fn get_expression_from_invocation(argument_info: &ArgumentListInfo) -> Node 
         .called
 }
 
-// Go: ls/signaturehelp.go:734 candidateInfo
+// Go: ls/signaturehelp.go:757 candidateInfo
 #[derive(Clone, Debug, Default)]
 pub struct CandidateInfo {
     pub candidates: Vec<SignatureId>,
     pub resolved_signature: SignatureId,
 }
 
-// Go: ls/signaturehelp.go:739 CandidateOrTypeInfo
+// Go: ls/signaturehelp.go:762 CandidateOrTypeInfo
 #[derive(Clone, Debug, Default)]
 pub struct CandidateOrTypeInfo {
     pub candidate_info: Option<CandidateInfo>,
     pub type_info: SymbolId,
 }
 
-// Go: ls/signaturehelp.go:744 getCandidateOrTypeInfo
+// Go: ls/signaturehelp.go:767 getCandidateOrTypeInfo
 pub fn get_candidate_or_type_info(
     info: &ArgumentListInfo,
     c: &mut Checker,
@@ -1323,7 +1323,7 @@ pub fn get_candidate_or_type_info(
     crate::gostd::debug::assert_never("&{<nil> <nil> <nil>}", None);
 }
 
-// Go: ls/signaturehelp.go:805 isSyntacticOwner
+// Go: ls/signaturehelp.go:828 isSyntacticOwner
 pub fn is_syntactic_owner(starting_token: Node, node: Node, source_file: Node) -> bool {
     if !is_call_or_new_expression(node) {
         return false;
@@ -1340,7 +1340,7 @@ pub fn is_syntactic_owner(starting_token: Node, node: Node, source_file: Node) -
     }
 }
 
-// Go: ls/signaturehelp.go:820 containsPrecedingToken
+// Go: ls/signaturehelp.go:843 containsPrecedingToken
 pub fn contains_preceding_token(starting_token: Node, source_file: Node, container: Node) -> bool {
     let pos = starting_token.pos();
     // There's a possibility that `startingToken.parent` contains only `startingToken` and
@@ -1364,7 +1364,7 @@ pub fn contains_preceding_token(starting_token: Node, source_file: Node, contain
     false
 }
 
-// Go: ls/signaturehelp.go:838 getContainingArgumentInfo
+// Go: ls/signaturehelp.go:861 getContainingArgumentInfo
 pub fn get_containing_argument_info(
     node: Node,
     source_file: Node,
@@ -1426,7 +1426,7 @@ pub fn get_containing_argument_info(
     first_argument_info
 }
 
-// Go: ls/signaturehelp.go:881 getImmediatelyContainingArgumentOrContextualParameterInfo
+// Go: ls/signaturehelp.go:904 getImmediatelyContainingArgumentOrContextualParameterInfo
 pub fn get_immediately_containing_argument_or_contextual_parameter_info(
     node: Node,
     position: i32,
@@ -1440,7 +1440,7 @@ pub fn get_immediately_containing_argument_or_contextual_parameter_info(
     result
 }
 
-// Go: ls/signaturehelp.go:889 argumentListInfo
+// Go: ls/signaturehelp.go:912 argumentListInfo
 // PORT: Go `*invocation` is a pointer that nothing mutates after creation; a value here.
 #[derive(Clone, Copy, Debug)]
 pub struct ArgumentListInfo {
@@ -1452,7 +1452,7 @@ pub struct ArgumentListInfo {
     pub argument_count: i32,
 }
 
-// Go: ls/signaturehelp.go:900 getImmediatelyContainingArgumentInfo
+// Go: ls/signaturehelp.go:923 getImmediatelyContainingArgumentInfo
 // Returns relevant information for the argument list and the current argument if we are
 // in the argument of an invocation; returns undefined otherwise.
 pub fn get_immediately_containing_argument_info(
@@ -1577,7 +1577,7 @@ pub fn get_immediately_containing_argument_info(
     None
 }
 
-// Go: ls/signaturehelp.go:1006 getArgumentIndexForTemplatePiece
+// Go: ls/signaturehelp.go:1029 getArgumentIndexForTemplatePiece
 // spanIndex is either the index for a given template span.
 // This does not give appropriate results for a NoSubstitutionTemplateLiteral
 pub fn get_argument_index_for_template_piece(
@@ -1610,7 +1610,7 @@ pub fn get_argument_index_for_template_piece(
     span_index + 1
 }
 
-// Go: ls/signaturehelp.go:1028 getAdjustedNode
+// Go: ls/signaturehelp.go:1051 getAdjustedNode
 pub fn get_adjusted_node(node: Node) -> Node {
     match node.kind() {
         SyntaxKind::OpenParenToken | SyntaxKind::CommaToken => node,
@@ -1629,7 +1629,7 @@ pub fn get_adjusted_node(node: Node) -> Node {
     }
 }
 
-// Go: ls/signaturehelp.go:1044 contextualSignatureLocationInfo
+// Go: ls/signaturehelp.go:1067 contextualSignatureLocationInfo
 #[derive(Clone, Copy, Debug)]
 pub struct ContextualSignatureLocationInfo {
     pub contextual_type: TypeId,
@@ -1638,7 +1638,7 @@ pub struct ContextualSignatureLocationInfo {
     pub arguments_span: TextRange,
 }
 
-// Go: ls/signaturehelp.go:1051 getSpreadElementCount
+// Go: ls/signaturehelp.go:1074 getSpreadElementCount
 pub fn get_spread_element_count(node: Node, c: &mut Checker) -> i32 {
     let spread_type = c.get_type_at_location(node.expression());
     if c.is_tuple_type_exported(spread_type) {
@@ -1664,7 +1664,7 @@ pub fn get_spread_element_count(node: Node, c: &mut Checker) -> i32 {
     0
 }
 
-// Go: ls/signaturehelp.go:1075 getArgumentIndex
+// Go: ls/signaturehelp.go:1098 getArgumentIndex
 pub fn get_argument_index(
     node: Node,
     arguments: NodeList,
@@ -1678,7 +1678,7 @@ pub fn get_argument_index(
     )
 }
 
-// Go: ls/signaturehelp.go:1079 getArgumentCount
+// Go: ls/signaturehelp.go:1102 getArgumentCount
 pub fn get_argument_count(
     node: Node,
     arguments: NodeList,
@@ -1692,7 +1692,7 @@ pub fn get_argument_count(
     )
 }
 
-// Go: ls/signaturehelp.go:1083 getArgumentIndexOrCount
+// Go: ls/signaturehelp.go:1106 getArgumentIndexOrCount
 pub fn get_argument_index_or_count(arguments: &[Node], node: Node, c: &mut Checker) -> i32 {
     let mut argument_index: i32 = 0;
     let mut skip_comma = false;
@@ -1735,7 +1735,7 @@ pub fn get_argument_index_or_count(arguments: &[Node], node: Node, c: &mut Check
     argument_count
 }
 
-// Go: ls/signaturehelp.go:1125 argumentOrParameterListInfo
+// Go: ls/signaturehelp.go:1148 argumentOrParameterListInfo
 #[derive(Clone, Copy, Debug)]
 pub struct ArgumentOrParameterListInfo {
     pub list: NodeList,
@@ -1744,7 +1744,7 @@ pub struct ArgumentOrParameterListInfo {
     pub arguments_span: TextRange,
 }
 
-// Go: ls/signaturehelp.go:1132 getArgumentOrParameterListInfo
+// Go: ls/signaturehelp.go:1155 getArgumentOrParameterListInfo
 pub fn get_argument_or_parameter_list_info(
     node: Node,
     source_file: Node,
@@ -1763,7 +1763,7 @@ pub fn get_argument_or_parameter_list_info(
     })
 }
 
-// Go: ls/signaturehelp.go:1149 getApplicableSpanForArguments
+// Go: ls/signaturehelp.go:1172 getApplicableSpanForArguments
 pub fn get_applicable_span_for_arguments(
     argument_list: NodeList,
     node: Node,
@@ -1797,7 +1797,7 @@ pub fn get_applicable_span_for_arguments(
     TextRange::new(applicable_span_start, applicable_span_end)
 }
 
-// Go: ls/signaturehelp.go:1181 ensureMinimumSpanSize
+// Go: ls/signaturehelp.go:1204 ensureMinimumSpanSize
 // ensureMinimumSpanSize ensures that a span includes at least one position.
 // TextRange.Contains uses a half-open interval, so an empty span would not contain
 // the cursor immediately after typing an opening paren in a call like foo(bar(|)).
@@ -1808,14 +1808,14 @@ pub fn ensure_minimum_span_size(start: i32, end: i32) -> i32 {
     end
 }
 
-// Go: ls/signaturehelp.go:1188 argumentOrParameterListAndIndex
+// Go: ls/signaturehelp.go:1211 argumentOrParameterListAndIndex
 #[derive(Clone, Copy, Debug)]
 pub struct ArgumentOrParameterListAndIndex {
     pub list: NodeList,
     pub argument_index: i32,
 }
 
-// Go: ls/signaturehelp.go:1193 getArgumentOrParameterListAndIndex
+// Go: ls/signaturehelp.go:1216 getArgumentOrParameterListAndIndex
 pub fn get_argument_or_parameter_list_and_index(
     node: Node,
     source_file: Node,
@@ -1848,7 +1848,7 @@ pub fn get_argument_or_parameter_list_and_index(
     }
 }
 
-// Go: ls/signaturehelp.go:1221 getChildListThatStartsWithOpenerToken
+// Go: ls/signaturehelp.go:1244 getChildListThatStartsWithOpenerToken
 pub fn get_child_list_that_starts_with_opener_token(parent: Node, opener_token: Node) -> NodeList {
     if is_call_expression(parent) {
         let parent_call_expression = parent;
@@ -1866,7 +1866,7 @@ pub fn get_child_list_that_starts_with_opener_token(parent: Node, opener_token: 
     NodeList::NIL
 }
 
-// Go: ls/signaturehelp.go:1238 tryGetParameterInfo
+// Go: ls/signaturehelp.go:1261 tryGetParameterInfo
 pub fn try_get_parameter_info(
     starting_token: Node,
     source_file: Node,
@@ -1913,7 +1913,7 @@ pub fn try_get_parameter_info(
     })
 }
 
-// Go: ls/signaturehelp.go:1279 chooseBetterSymbol
+// Go: ls/signaturehelp.go:1302 chooseBetterSymbol
 // PORT: symbol data lives in the checker arena, so the arena is the first parameter.
 pub fn choose_better_symbol(symbols: &SymbolArena, s: SymbolId) -> SymbolId {
     if symbols.sym(s).name.as_str() == INTERNAL_SYMBOL_NAME_TYPE {
@@ -1926,7 +1926,7 @@ pub fn choose_better_symbol(symbols: &SymbolArena, s: SymbolId) -> SymbolId {
     s
 }
 
-// Go: ls/signaturehelp.go:1290 getContextualSignatureLocationInfo
+// Go: ls/signaturehelp.go:1313 getContextualSignatureLocationInfo
 pub fn get_contextual_signature_location_info(
     node: Node,
     source_file: Node,
@@ -1984,7 +1984,7 @@ pub fn get_contextual_signature_location_info(
     }
 }
 
-// Go: ls/signaturehelp.go:1338 getHighestBinary
+// Go: ls/signaturehelp.go:1361 getHighestBinary
 pub fn get_highest_binary(b: Node) -> Node {
     if is_binary_expression(b.parent()) {
         return get_highest_binary(b.parent());
@@ -1992,7 +1992,7 @@ pub fn get_highest_binary(b: Node) -> Node {
     b
 }
 
-// Go: ls/signaturehelp.go:1345 countBinaryExpressionParameters
+// Go: ls/signaturehelp.go:1368 countBinaryExpressionParameters
 pub fn count_binary_expression_parameters(b: Node) -> i32 {
     if is_binary_expression(b.left()) {
         return count_binary_expression_parameters(b.left()) + 1;
@@ -2000,7 +2000,7 @@ pub fn count_binary_expression_parameters(b: Node) -> i32 {
     2
 }
 
-// Go: ls/signaturehelp.go:1352 getTokenFromNodeList
+// Go: ls/signaturehelp.go:1375 getTokenFromNodeList
 pub fn get_token_from_node_list(
     node_list: NodeList,
     node_list_parent: Node,
@@ -2038,7 +2038,7 @@ pub fn get_token_from_node_list(
     tokens
 }
 
-// Go: ls/signaturehelp.go:1376 getArgumentListInfoForTemplate
+// Go: ls/signaturehelp.go:1399 getArgumentListInfoForTemplate
 pub fn get_argument_list_info_for_template(
     tag_expression: Node,
     argument_index: i32,
@@ -2066,7 +2066,7 @@ pub fn get_argument_list_info_for_template(
     })
 }
 
-// Go: ls/signaturehelp.go:1394 getApplicableRangeForTaggedTemplate
+// Go: ls/signaturehelp.go:1417 getApplicableRangeForTaggedTemplate
 pub fn get_applicable_range_for_tagged_template(
     tagged_template: Node,
     source_file: Node,

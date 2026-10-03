@@ -48,7 +48,7 @@ pub fn print_and_position_node(
     (text, positioned)
 }
 
-// Go: printer/syntheticfile.go:40 CreateSyntheticSourceFile
+// Go: printer/syntheticfile.go:39 CreateSyntheticSourceFile
 // CreateSyntheticSourceFile wraps a positioned node in a synthetic source file
 // suitable for use with the formatter. The node must already have valid source
 // positions assigned (e.g. via PrintAndPositionNode or AssignPositionsToNode).

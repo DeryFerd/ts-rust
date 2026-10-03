@@ -25,37 +25,37 @@ pub enum Tristate {
 }
 
 impl Tristate {
-    // Go: core/tristate.go:16 IsTrue
+    // Go: core/tristate.go:15 IsTrue
     #[must_use]
     pub fn is_true(self) -> bool {
         self == Tristate::True
     }
 
-    // Go: core/tristate.go:20 IsTrueOrUnknown
+    // Go: core/tristate.go:19 IsTrueOrUnknown
     #[must_use]
     pub fn is_true_or_unknown(self) -> bool {
         self == Tristate::True || self == Tristate::Unknown
     }
 
-    // Go: core/tristate.go:24 IsFalse
+    // Go: core/tristate.go:23 IsFalse
     #[must_use]
     pub fn is_false(self) -> bool {
         self == Tristate::False
     }
 
-    // Go: core/tristate.go:28 IsFalseOrUnknown
+    // Go: core/tristate.go:27 IsFalseOrUnknown
     #[must_use]
     pub fn is_false_or_unknown(self) -> bool {
         self == Tristate::False || self == Tristate::Unknown
     }
 
-    // Go: core/tristate.go:32 IsUnknown
+    // Go: core/tristate.go:31 IsUnknown
     #[must_use]
     pub fn is_unknown(self) -> bool {
         self == Tristate::Unknown
     }
 
-    // Go: core/tristate.go:36 DefaultIfUnknown
+    // Go: core/tristate.go:35 DefaultIfUnknown
     #[must_use]
     pub fn default_if_unknown(self, value: Tristate) -> Tristate {
         if self == Tristate::Unknown {
@@ -64,7 +64,7 @@ impl Tristate {
         self
     }
 
-    // Go: core/tristate.go:43 UnmarshalJSON
+    // Go: core/tristate.go:42 UnmarshalJSON
     pub fn unmarshal_json(&mut self, data: &[u8]) {
         *self = match data {
             b"true" => Tristate::True,
@@ -73,7 +73,7 @@ impl Tristate {
         };
     }
 
-    // Go: core/tristate.go:55 MarshalJSON
+    // Go: core/tristate.go:54 MarshalJSON
     #[must_use]
     pub fn marshal_json(self) -> &'static [u8] {
         match self {
@@ -101,7 +101,7 @@ impl std::fmt::Display for Tristate {
     }
 }
 
-// Go: core/tristate.go:66 BoolToTristate
+// Go: core/tristate.go:65 BoolToTristate
 #[must_use]
 pub fn bool_to_tristate(b: bool) -> Tristate {
     if b {
@@ -122,7 +122,7 @@ pub struct PluginImport {
 
 /// Go `core.CompilerOptions`. Field names are the Go names in snake case.
 /// CompilerOptions contains the compiler options exposed by the API.
-// Go: core/compileroptions.go:16 CompilerOptions
+// Go: core/compileroptions.go:19 CompilerOptions
 // PORT: Go `noCopy` is dropped. Go `[]string` fields are
 // `Option<Vec<String>>`: a nil slice is `None` and an empty non-nil slice is
 // `Some(vec![])`. `mergeCompilerOptions` copies an empty non-nil slice (so
@@ -285,14 +285,14 @@ pub struct CompilerOptions {
 
 static EMPTY_COMPILER_OPTIONS: std::sync::OnceLock<CompilerOptions> = std::sync::OnceLock::new();
 
-// Go: core/compileroptions.go:172 EmptyCompilerOptions
+// Go: core/compileroptions.go:178 EmptyCompilerOptions
 #[must_use]
 pub fn empty_compiler_options() -> &'static CompilerOptions {
     EMPTY_COMPILER_OPTIONS.get_or_init(CompilerOptions::default)
 }
 
 impl CompilerOptions {
-    // Go: core/compileroptions.go:177 Clone
+    // Go: core/compileroptions.go:183 Clone
     // Clone creates a shallow copy of the CompilerOptions.
     // PORT: Go copies every exported field by reflection. The derived
     // `Clone::clone` copies every field, which is the same set, so Go
@@ -308,7 +308,7 @@ impl CompilerOptions {
                 == other.paths.as_ref().map(IndexMap::as_slice)
     }
 
-    // Go: core/compileroptions.go:193 GetEmitScriptTarget
+    // Go: core/compileroptions.go:199 GetEmitScriptTarget
     #[must_use]
     pub fn get_emit_script_target(&self) -> ScriptTarget {
         if self.target != ScriptTarget::NONE {
@@ -317,7 +317,7 @@ impl CompilerOptions {
         ScriptTarget::LATEST_STANDARD
     }
 
-    // Go: core/compileroptions.go:200 GetEmitModuleKind
+    // Go: core/compileroptions.go:206 GetEmitModuleKind
     #[must_use]
     pub fn get_emit_module_kind(&self) -> ModuleKind {
         if self.module != ModuleKind::NONE {
@@ -340,7 +340,7 @@ impl CompilerOptions {
         ModuleKind::COMMON_JS
     }
 
-    // Go: core/compileroptions.go:221 GetModuleResolutionKind
+    // Go: core/compileroptions.go:227 GetModuleResolutionKind
     #[must_use]
     pub fn get_module_resolution_kind(&self) -> ModuleResolutionKind {
         match self.module_resolution {
@@ -357,7 +357,7 @@ impl CompilerOptions {
         }
     }
 
-    // Go: core/compileroptions.go:237 GetEmitModuleDetectionKind
+    // Go: core/compileroptions.go:243 GetEmitModuleDetectionKind
     #[must_use]
     pub fn get_emit_module_detection_kind(&self) -> ModuleDetectionKind {
         if self.module_detection != ModuleDetectionKind::NONE {
@@ -370,32 +370,32 @@ impl CompilerOptions {
         ModuleDetectionKind::AUTO
     }
 
-    // Go: core/compileroptions.go:248 GetResolvePackageJsonExports
+    // Go: core/compileroptions.go:254 GetResolvePackageJsonExports
     #[must_use]
     pub fn get_resolve_package_json_exports(&self) -> bool {
         self.resolve_package_json_exports.is_true_or_unknown()
     }
 
-    // Go: core/compileroptions.go:252 GetResolvePackageJsonImports
+    // Go: core/compileroptions.go:258 GetResolvePackageJsonImports
     #[must_use]
     pub fn get_resolve_package_json_imports(&self) -> bool {
         self.resolve_package_json_imports.is_true_or_unknown()
     }
 
-    // Go: core/compileroptions.go:256 GetAllowImportingTsExtensions
+    // Go: core/compileroptions.go:262 GetAllowImportingTsExtensions
     #[must_use]
     pub fn get_allow_importing_ts_extensions(&self) -> bool {
         self.allow_importing_ts_extensions.is_true()
             || self.rewrite_relative_import_extensions.is_true()
     }
 
-    // Go: core/compileroptions.go:260 AllowImportingTsExtensionsFrom
+    // Go: core/compileroptions.go:266 AllowImportingTsExtensionsFrom
     #[must_use]
     pub fn allow_importing_ts_extensions_from(&self, file_name: &str) -> bool {
         self.get_allow_importing_ts_extensions() || tspath_is_declaration_file_name(file_name)
     }
 
-    // Go: core/compileroptions.go:264 GetResolveJsonModule
+    // Go: core/compileroptions.go:270 GetResolveJsonModule
     #[must_use]
     pub fn get_resolve_json_module(&self) -> bool {
         if self.resolve_json_module != Tristate::Unknown {
@@ -409,13 +409,13 @@ impl CompilerOptions {
         self.get_module_resolution_kind() == ModuleResolutionKind::BUNDLER
     }
 
-    // Go: core/compileroptions.go:276 ShouldPreserveConstEnums
+    // Go: core/compileroptions.go:282 ShouldPreserveConstEnums
     #[must_use]
     pub fn should_preserve_const_enums(&self) -> bool {
         self.preserve_const_enums == Tristate::True || self.get_isolated_modules()
     }
 
-    // Go: core/compileroptions.go:280 GetAllowJS
+    // Go: core/compileroptions.go:286 GetAllowJS
     #[must_use]
     pub fn get_allow_js(&self) -> bool {
         if self.allow_js != Tristate::Unknown {
@@ -424,14 +424,14 @@ impl CompilerOptions {
         self.check_js == Tristate::True
     }
 
-    // Go: core/compileroptions.go:287 GetJSXTransformEnabled
+    // Go: core/compileroptions.go:293 GetJSXTransformEnabled
     #[must_use]
     pub fn get_jsx_transform_enabled(&self) -> bool {
         let jsx = self.jsx;
         jsx == JsxEmit::REACT || jsx == JsxEmit::REACT_JSX || jsx == JsxEmit::REACT_JSX_DEV
     }
 
-    // Go: core/compileroptions.go:292 GetStrictOptionValue
+    // Go: core/compileroptions.go:298 GetStrictOptionValue
     #[must_use]
     pub fn get_strict_option_value(&self, value: Tristate) -> bool {
         if value != Tristate::Unknown {
@@ -440,7 +440,7 @@ impl CompilerOptions {
         self.strict != Tristate::False
     }
 
-    // Go: core/compileroptions.go:299 GetEffectiveTypeRoots
+    // Go: core/compileroptions.go:305 GetEffectiveTypeRoots
     /// Returns `(result, fromConfig)`.
     #[must_use]
     pub fn get_effective_type_roots(&self, current_directory: &str) -> (Vec<String>, bool) {
@@ -469,33 +469,33 @@ impl CompilerOptions {
         (type_roots, false)
     }
 
-    // Go: core/compileroptions.go:324 UsesWildcardTypes
+    // Go: core/compileroptions.go:330 UsesWildcardTypes
     // UsesWildcardTypes returns true if this option's types array includes "*"
     #[must_use]
     pub fn uses_wildcard_types(&self) -> bool {
         self.types.iter().flatten().any(|t| t == "*")
     }
 
-    // Go: core/compileroptions.go:328 GetIsolatedModules
+    // Go: core/compileroptions.go:334 GetIsolatedModules
     #[must_use]
     pub fn get_isolated_modules(&self) -> bool {
         self.isolated_modules == Tristate::True || self.verbatim_module_syntax == Tristate::True
     }
 
-    // Go: core/compileroptions.go:332 IsIncremental
+    // Go: core/compileroptions.go:338 IsIncremental
     #[must_use]
     pub fn is_incremental(&self) -> bool {
         self.incremental.is_true() || self.composite.is_true()
     }
 
-    // Go: core/compileroptions.go:336 GetEmitStandardClassFields
+    // Go: core/compileroptions.go:342 GetEmitStandardClassFields
     #[must_use]
     pub fn get_emit_standard_class_fields(&self) -> bool {
         self.use_define_for_class_fields != Tristate::False
             && self.get_emit_script_target() >= ScriptTarget::ES2022
     }
 
-    // Go: core/compileroptions.go:340 GetUseDefineForClassFields
+    // Go: core/compileroptions.go:346 GetUseDefineForClassFields
     #[must_use]
     pub fn get_use_define_for_class_fields(&self) -> bool {
         if self.use_define_for_class_fields == Tristate::Unknown {
@@ -504,19 +504,19 @@ impl CompilerOptions {
         self.use_define_for_class_fields == Tristate::True
     }
 
-    // Go: core/compileroptions.go:347 GetEmitDeclarations
+    // Go: core/compileroptions.go:353 GetEmitDeclarations
     #[must_use]
     pub fn get_emit_declarations(&self) -> bool {
         self.declaration.is_true() || self.composite.is_true()
     }
 
-    // Go: core/compileroptions.go:351 GetAreDeclarationMapsEnabled
+    // Go: core/compileroptions.go:357 GetAreDeclarationMapsEnabled
     #[must_use]
     pub fn get_are_declaration_maps_enabled(&self) -> bool {
         self.declaration_map == Tristate::True && self.get_emit_declarations()
     }
 
-    // Go: core/compileroptions.go:355 HasJsonModuleEmitEnabled
+    // Go: core/compileroptions.go:361 HasJsonModuleEmitEnabled
     #[must_use]
     pub fn has_json_module_emit_enabled(&self) -> bool {
         match self.get_emit_module_kind() {
@@ -526,7 +526,7 @@ impl CompilerOptions {
         true
     }
 
-    // Go: core/compileroptions.go:363 GetPathsBasePath
+    // Go: core/compileroptions.go:369 GetPathsBasePath
     #[must_use]
     pub fn get_paths_base_path(&self, current_directory: &str) -> String {
         // Go `Paths.Size()` is 0 for a nil map.
@@ -541,20 +541,20 @@ impl CompilerOptions {
 }
 
 impl ModuleKind {
-    // Go: core/compileroptions.go:424 ResolutionModeESM
+    // Go: core/compileroptions.go:430 ResolutionModeESM
     // PORT: Go `ResolutionMode` is an alias of `ModuleKind`, so
     // `core.ResolutionModeESM` is also reachable as `ResolutionMode::ESM`.
     // `ResolutionModeNone` and `ResolutionModeCommonJS` are
     // `ResolutionMode::NONE` and `ResolutionMode::COMMON_JS`.
     pub const ESM: Self = Self::ES_NEXT;
 
-    // Go: core/compileroptions.go:409 IsNonNodeESM
+    // Go: core/compileroptions.go:415 IsNonNodeESM
     #[must_use]
     pub fn is_non_node_esm(self) -> bool {
         self >= ModuleKind::ES2015 && self <= ModuleKind::ES_NEXT
     }
 
-    // Go: core/compileroptions.go:413 SupportsImportAttributes
+    // Go: core/compileroptions.go:419 SupportsImportAttributes
     #[must_use]
     pub fn supports_import_attributes(self) -> bool {
         ModuleKind::NODE18 <= self && self <= ModuleKind::NODE_NEXT
@@ -593,17 +593,17 @@ impl std::fmt::Display for ModuleKind {
 }
 
 /// Go `core.ResolutionMode` (`ModuleKindNone | ModuleKindCommonJS | ModuleKindESNext`).
-// Go: core/compileroptions.go:419 ResolutionMode
+// Go: core/compileroptions.go:425 ResolutionMode
 pub type ResolutionMode = ModuleKind;
 
-// Go: core/compileroptions.go:422 ResolutionModeNone
+// Go: core/compileroptions.go:428 ResolutionModeNone
 pub const RESOLUTION_MODE_NONE: ResolutionMode = ModuleKind::NONE;
-// Go: core/compileroptions.go:423 ResolutionModeCommonJS
+// Go: core/compileroptions.go:429 ResolutionModeCommonJS
 pub const RESOLUTION_MODE_COMMON_JS: ResolutionMode = ModuleKind::COMMON_JS;
-// Go: core/compileroptions.go:424 ResolutionModeESM
+// Go: core/compileroptions.go:430 ResolutionModeESM
 pub const RESOLUTION_MODE_ESM: ResolutionMode = ModuleKind::ES_NEXT;
 
-// Go: core/compileroptions.go:445 ModuleKindToModuleResolutionKind
+// Go: core/compileroptions.go:451 ModuleKindToModuleResolutionKind
 /// Go map lookup `ModuleKindToModuleResolutionKind[kind]` as `(value, ok)`.
 #[must_use]
 pub fn module_kind_to_module_resolution_kind(kind: ModuleKind) -> (ModuleResolutionKind, bool) {
@@ -645,7 +645,7 @@ impl std::fmt::Display for ModuleResolutionKind {
     }
 }
 
-// Go: core/compileroptions.go:484 GetNewLineKind
+// Go: core/compileroptions.go:490 GetNewLineKind
 #[must_use]
 pub fn get_new_line_kind(s: &str) -> NewLineKind {
     match s {
@@ -656,7 +656,7 @@ pub fn get_new_line_kind(s: &str) -> NewLineKind {
 }
 
 impl NewLineKind {
-    // Go: core/compileroptions.go:495 GetNewLineCharacter
+    // Go: core/compileroptions.go:501 GetNewLineCharacter
     #[must_use]
     pub fn get_new_line_character(self) -> &'static str {
         match self {
@@ -746,7 +746,7 @@ impl std::fmt::Display for LanguageVariant {
 }
 
 impl ScriptKind {
-    // Go: core/scriptkind_stringer_generated.go:25 String
+    // Go: core/scriptkind_stringer_generated.go:26 String
     // tsgo#4712: values 5 (formerly ScriptKindExternal) and 7 (formerly
     // ScriptKindDeferred) are reserved and print as "ScriptKind(5)" and
     // "ScriptKind(7)".
@@ -777,7 +777,7 @@ impl std::fmt::Display for ScriptKind {
 // `frontend::tspath` ports.
 // ---------------------------------------------------------------------------
 
-// Go: tspath/extension.go:111 GetDeclarationFileExtension
+// Go: tspath/extension.go:121 GetDeclarationFileExtension
 fn tspath_get_declaration_file_extension(file_name: &str) -> String {
     let base = tspath::get_base_file_name(file_name);
     // Go: tspath.SupportedDeclarationExtensions
@@ -794,12 +794,12 @@ fn tspath_get_declaration_file_extension(file_name: &str) -> String {
     String::new()
 }
 
-// Go: tspath/extension.go:103 IsDeclarationFileName
+// Go: tspath/extension.go:113 IsDeclarationFileName
 fn tspath_is_declaration_file_name(file_name: &str) -> bool {
     !tspath_get_declaration_file_extension(file_name).is_empty()
 }
 
-// Go: tspath/path.go:1066 ForEachAncestorDirectory
+// Go: tspath/path.go:1116 ForEachAncestorDirectory
 // PORT: the callback returns only `stop`; the only caller here has no result.
 fn tspath_for_each_ancestor_directory(
     directory: &str,

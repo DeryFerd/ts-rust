@@ -15,7 +15,7 @@ struct InstantiationExpressionTypeState {
 }
 
 impl Checker {
-    // Go: checker/checker.go:10269 createUnionSignature
+    // Go: checker/checker.go:10492 createUnionSignature
     pub fn create_union_signature(
         &mut self,
         sig: SignatureId,
@@ -34,7 +34,7 @@ impl Checker {
 
     // If the given type is an object or union type with a single signature, and if that signature has at
     // least as many parameters as the given function, return the signature. Otherwise return undefined.
-    // Go: checker/checker.go:10279 getContextualCallSignature
+    // Go: checker/checker.go:10502 getContextualCallSignature
     pub fn get_contextual_call_signature(&mut self, t: TypeId, node: Node) -> SignatureId {
         let signatures = self.get_signatures_of_type(t, SignatureKind::CALL);
         let mut applicable_by_arity: Vec<SignatureId> = Vec::new();
@@ -49,7 +49,7 @@ impl Checker {
         self.get_intersected_signatures(&applicable_by_arity)
     }
 
-    // Go: checker/checker.go:10288 getIntersectedSignatures
+    // Go: checker/checker.go:10511 getIntersectedSignatures
     pub fn get_intersected_signatures(&mut self, signatures: &[SignatureId]) -> SignatureId {
         if !self.no_implicit_any {
             return SignatureId::NIL;
@@ -77,7 +77,7 @@ impl Checker {
     }
 
     /** If the contextual signature has fewer parameters than the function expression, do not use it */
-    // Go: checker/checker.go:10307 isAritySmaller
+    // Go: checker/checker.go:10530 isAritySmaller
     pub fn is_arity_smaller(&mut self, signature: SignatureId, target: Node) -> bool {
         let parameters = target.parameters();
         let mut target_parameter_count: i32 = 0;
@@ -98,7 +98,7 @@ impl Checker {
             && self.get_parameter_count(signature) < target_parameter_count
     }
 
-    // Go: checker/checker.go:10323 assignContextualParameterTypes
+    // Go: checker/checker.go:10546 assignContextualParameterTypes
     pub fn assign_contextual_parameter_types(&mut self, sig: SignatureId, context: SignatureId) {
         if !self.sig(context).type_parameters.is_empty() {
             if !self.sig(sig).type_parameters.is_empty() {
@@ -172,7 +172,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10371 assignNonContextualParameterTypes
+    // Go: checker/checker.go:10592 assignNonContextualParameterTypes
     pub fn assign_non_contextual_parameter_types(&mut self, signature: SignatureId) {
         let this_parameter = self.sig(signature).this_parameter;
         if this_parameter.is_some() {
@@ -184,7 +184,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10380 assignParameterType
+    // Go: checker/checker.go:10601 assignParameterType
     pub fn assign_parameter_type(&mut self, parameter: SymbolId, contextual_type: TypeId) {
         if self
             .value_symbol_links
@@ -225,7 +225,7 @@ impl Checker {
 
     // When contextual typing assigns a type to a parameter that contains a binding pattern, we also need to push
     // the destructured type into the contained binding elements.
-    // Go: checker/checker.go:10404 assignBindingElementTypes
+    // Go: checker/checker.go:10627 assignBindingElementTypes
     pub fn assign_binding_element_types(&mut self, pattern: Node, parent_type: TypeId) {
         for element in pattern.elements().iter() {
             let name = element.name();
@@ -245,7 +245,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10418 checkCollisionsForDeclarationName
+    // Go: checker/checker.go:10641 checkCollisionsForDeclarationName
     pub fn check_collisions_for_declaration_name(&mut self, node: Node, name: Node) {
         if name.is_nil() {
             return;
@@ -265,7 +265,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10437 checkCollisionWithRequireExportsInGeneratedCode
+    // Go: checker/checker.go:10660 checkCollisionWithRequireExportsInGeneratedCode
     pub fn check_collision_with_require_exports_in_generated_code(
         &mut self,
         node: Node,
@@ -299,7 +299,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10457 checkCollisionWithGlobalObjectInGeneratedCode
+    // Go: checker/checker.go:10680 checkCollisionWithGlobalObjectInGeneratedCode
     pub fn check_collision_with_global_object_in_generated_code(&mut self, node: Node, name: Node) {
         if name.is_nil()
             || is_class_like(node)
@@ -328,7 +328,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10473 needCollisionCheckForIdentifier
+    // Go: checker/checker.go:10696 needCollisionCheckForIdentifier
     pub fn need_collision_check_for_identifier(
         &mut self,
         node: Node,
@@ -370,7 +370,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:10500 setNodeLinksForPrivateIdentifierScope
+    // Go: checker/checker.go:10724 setNodeLinksForPrivateIdentifierScope
     pub fn set_node_links_for_private_identifier_scope(&mut self, node: Node) {
         let name = node.name();
         if is_private_identifier(name) {
@@ -390,7 +390,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10512 recordPotentialCollisionWithWeakMapSetInGeneratedCode
+    // Go: checker/checker.go:10736 recordPotentialCollisionWithWeakMapSetInGeneratedCode
     pub fn record_potential_collision_with_weak_map_set_in_generated_code(
         &mut self,
         node: Node,
@@ -406,7 +406,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10521 checkWeakMapSetCollision
+    // Go: checker/checker.go:10745 checkWeakMapSetCollision
     pub fn check_weak_map_set_collision(&mut self, node: Node) {
         let enclosing_block_scope = get_enclosing_block_scope_container(node);
         if self
@@ -426,7 +426,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10531 checkCollisionWithGlobalPromiseInGeneratedCode
+    // Go: checker/checker.go:10755 checkCollisionWithGlobalPromiseInGeneratedCode
     pub fn check_collision_with_global_promise_in_generated_code(
         &mut self,
         node: Node,
@@ -459,7 +459,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10547 recordPotentialCollisionWithReflectInGeneratedCode
+    // Go: checker/checker.go:10771 recordPotentialCollisionWithReflectInGeneratedCode
     pub fn record_potential_collision_with_reflect_in_generated_code(
         &mut self,
         node: Node,
@@ -475,7 +475,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10555 checkReflectCollision
+    // Go: checker/checker.go:10779 checkReflectCollision
     pub fn check_reflect_collision(&mut self, node: Node) {
         let mut has_collision = false;
         if is_class_expression(node) {
@@ -525,7 +525,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10585 checkClassNameCollisionWithObject
+    // Go: checker/checker.go:10808 checkClassNameCollisionWithObject
     pub fn check_class_name_collision_with_object(&mut self, name: Node) {
         if name.text() == "Object"
             && get_emit_module_format_of_file(get_source_file_of_node(name)) < ModuleKind::ES2015
@@ -539,13 +539,13 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10591 checkTypeOfExpression
+    // Go: checker/checker.go:10814 checkTypeOfExpression
     pub fn check_type_of_expression(&mut self, node: Node) -> TypeId {
         self.check_expression(node.expression());
         self.typeof_type
     }
 
-    // Go: checker/checker.go:10596 checkNonNullAssertion
+    // Go: checker/checker.go:10819 checkNonNullAssertion
     pub fn check_non_null_assertion(&mut self, node: Node) -> TypeId {
         if node.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
             // checkNonNullChain checks the same operand expression (node.Expression()),
@@ -556,7 +556,7 @@ impl Checker {
         self.get_non_nullable_type(t)
     }
 
-    // Go: checker/checker.go:10603 checkNonNullChain
+    // Go: checker/checker.go:10828 checkNonNullChain
     pub fn check_non_null_chain(&mut self, node: Node) -> TypeId {
         let left_type = self.check_expression(node.expression());
         let non_optional_type = self.get_optional_expression_type(left_type, node.expression());
@@ -564,7 +564,7 @@ impl Checker {
         self.propagate_optional_type_marker(non_nullable, node, non_optional_type != left_type)
     }
 
-    // Go: checker/checker.go:10609 checkExpressionWithTypeArguments
+    // Go: checker/checker.go:10834 checkExpressionWithTypeArguments
     pub fn check_expression_with_type_arguments(&mut self, node: Node) -> TypeId {
         self.check_grammar_expression_with_type_arguments(node);
         self.check_source_elements(node.type_arguments());
@@ -595,7 +595,7 @@ impl Checker {
         self.get_instantiation_expression_type(expr_type, node)
     }
 
-    // Go: checker/checker.go:10633 getInstantiationExpressionType
+    // Go: checker/checker.go:10857 getInstantiationExpressionType
     pub fn get_instantiation_expression_type(&mut self, expr_type: TypeId, node: Node) -> TypeId {
         let type_arguments = node.type_argument_list();
         if expr_type == self.silent_never_type
@@ -647,7 +647,7 @@ impl Checker {
     // Go `core.Filter` + `core.SameMap` return the input slice when nothing
     // changed; callers compare with `core.Same`, which here is content
     // equality (a changed result always differs in length or content).
-    // Go: checker/checker.go:10643 getInstantiationExpressionType.getInstantiatedSignatures
+    // Go: checker/checker.go:10868 getInstantiationExpressionType.getInstantiatedSignatures
     fn instantiation_expression_get_instantiated_signatures(
         &mut self,
         state: &mut InstantiationExpressionTypeState,
@@ -683,7 +683,7 @@ impl Checker {
     }
 
     // PORT: Go closure `getInstantiatedType` inside getInstantiationExpressionType.
-    // Go: checker/checker.go:10655 getInstantiationExpressionType.getInstantiatedType
+    // Go: checker/checker.go:10880 getInstantiationExpressionType.getInstantiatedType
     fn instantiation_expression_get_instantiated_type(
         &mut self,
         state: &mut InstantiationExpressionTypeState,
@@ -710,7 +710,7 @@ impl Checker {
     // PORT: Go closure `getInstantiatedTypePart` inside getInstantiatedType.
     // `has_signatures` and `has_applicable_signature` are the enclosing
     // getInstantiatedType call's locals.
-    // Go: checker/checker.go:10659 getInstantiationExpressionType.getInstantiatedTypePart
+    // Go: checker/checker.go:10884 getInstantiationExpressionType.getInstantiatedTypePart
     fn instantiation_expression_get_instantiated_type_part(
         &mut self,
         state: &mut InstantiationExpressionTypeState,
@@ -815,7 +815,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:10712 checkSatisfiesExpression
+    // Go: checker/checker.go:10941 checkSatisfiesExpression
     pub fn check_satisfies_expression(&mut self, node: Node) -> TypeId {
         let type_node = node.type_();
         self.check_source_element(type_node);
@@ -835,7 +835,7 @@ impl Checker {
         expr_type
     }
 
-    // Go: checker/checker.go:10724 checkMetaProperty
+    // Go: checker/checker.go:10953 checkMetaProperty
     pub fn check_meta_property(&mut self, node: Node) -> TypeId {
         self.check_grammar_meta_property(node);
         match node.keyword_token() {
@@ -857,7 +857,7 @@ impl Checker {
         panic!("Unhandled case in checkMetaProperty");
     }
 
-    // Go: checker/checker.go:10738 checkNewTargetMetaProperty
+    // Go: checker/checker.go:10968 checkNewTargetMetaProperty
     pub fn check_new_target_meta_property(&mut self, node: Node) -> TypeId {
         let container = get_new_target_container(node);
         if container.is_nil() {
@@ -876,7 +876,7 @@ impl Checker {
         self.get_type_of_symbol(symbol)
     }
 
-    // Go: checker/checker.go:10752 checkImportMetaProperty
+    // Go: checker/checker.go:10982 checkImportMetaProperty
     pub fn check_import_meta_property(&mut self, node: Node) -> TypeId {
         if ModuleKind::NODE16 <= self.module_kind && self.module_kind <= ModuleKind::NODE_NEXT {
             // PORT: Go `ast.GetSourceFileOfNode(node).Path()` is the SourceFile
@@ -909,13 +909,13 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/checker.go:10771 checkMetaPropertyKeyword
+    // Go: checker/checker.go:10999 checkMetaPropertyKeyword
     pub fn check_meta_property_keyword(&mut self, node: Node) -> TypeId {
         // !!! This is effectively a helper for GetSymbolAtLocation and GetTypeAtLocation
         self.error_type
     }
 
-    // Go: checker/checker.go:10776 checkDeleteExpression
+    // Go: checker/checker.go:11004 checkDeleteExpression
     pub fn check_delete_expression(&mut self, node: Node) -> TypeId {
         self.check_expression(node.expression());
         let expr = skip_parentheses(node.expression());
@@ -950,7 +950,7 @@ impl Checker {
         self.boolean_type
     }
 
-    // Go: checker/checker.go:10797 checkDeleteExpressionMustBeOptional
+    // Go: checker/checker.go:11025 checkDeleteExpressionMustBeOptional
     pub fn check_delete_expression_must_be_optional(&mut self, expr: Node, symbol: SymbolId) {
         let t = self.get_type_of_symbol(symbol);
         if self.strict_null_checks
@@ -975,13 +975,13 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10812 checkVoidExpression
+    // Go: checker/checker.go:11040 checkVoidExpression
     pub fn check_void_expression(&mut self, node: Node) -> TypeId {
         self.check_node_deferred(node);
         self.undefined_widening_type
     }
 
-    // Go: checker/checker.go:10817 checkAwaitExpression
+    // Go: checker/checker.go:11045 checkAwaitExpression
     pub fn check_await_expression(&mut self, node: Node) -> TypeId {
         self.check_grammar_await_or_await_using(node);
         let operand_type = self.check_expression(node.expression());
@@ -1010,7 +1010,7 @@ impl Checker {
         awaited_type
     }
 
-    // Go: checker/checker.go:10827 checkPrefixUnaryExpression
+    // Go: checker/checker.go:11055 checkPrefixUnaryExpression
     pub fn check_prefix_unary_expression(&mut self, node: Node) -> TypeId {
         let operand = node.operand();
         let operator = node.operator();
@@ -1108,7 +1108,7 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/checker.go:10881 checkPostfixUnaryExpression
+    // Go: checker/checker.go:11109 checkPostfixUnaryExpression
     pub fn check_postfix_unary_expression(&mut self, node: Node) -> TypeId {
         let operand = node.operand();
         let operand_type = self.check_expression(operand);
@@ -1133,7 +1133,7 @@ impl Checker {
         self.get_unary_result_type(operand_type)
     }
 
-    // Go: checker/checker.go:10895 getUnaryResultType
+    // Go: checker/checker.go:11123 getUnaryResultType
     pub fn get_unary_result_type(&mut self, operand_type: TypeId) -> TypeId {
         if self.maybe_type_of_kind(operand_type, TypeFlags::BIG_INT_LIKE) {
             if self.is_type_assignable_to_kind(operand_type, TypeFlags::ANY_OR_UNKNOWN)
@@ -1147,7 +1147,7 @@ impl Checker {
         self.number_type
     }
 
-    // Go: checker/checker.go:10906 checkConditionalExpression
+    // Go: checker/checker.go:11134 checkConditionalExpression
     pub fn check_conditional_expression(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         let condition = node.condition();
         let when_true = node.when_true();
@@ -1161,13 +1161,13 @@ impl Checker {
         self.get_union_type_ex(&[type1, type2], UnionReduction::SUBTYPE, None, TypeId::NIL)
     }
 
-    // Go: checker/checker.go:10915 checkTruthinessExpression
+    // Go: checker/checker.go:11143 checkTruthinessExpression
     pub fn check_truthiness_expression(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         let t = self.check_expression_ex(node, check_mode);
         self.check_truthiness_of_type(t, node)
     }
 
-    // Go: checker/checker.go:10919 checkSpreadExpression
+    // Go: checker/checker.go:11147 checkSpreadExpression
     pub fn check_spread_expression(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         let array_or_iterable_type = self.check_expression_ex(node.expression(), check_mode);
         let undefined_type = self.undefined_type;
@@ -1179,7 +1179,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:10924 checkYieldExpression
+    // Go: checker/checker.go:11152 checkYieldExpression
     pub fn check_yield_expression(&mut self, node: Node) -> TypeId {
         self.check_grammar_yield_expression(node);
         // Always check the operand so its identifiers are resolved even when the yield is
@@ -1299,7 +1299,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:10988 getYieldedTypeOfYieldExpression
+    // Go: checker/checker.go:11218 getYieldedTypeOfYieldExpression
     pub fn get_yielded_type_of_yield_expression(
         &mut self,
         node: Node,
@@ -1338,7 +1338,7 @@ impl Checker {
         self.get_awaited_type_ex(yielded_type, error_node, Some(message), args![])
     }
 
-    // Go: checker/checker.go:11004 checkSyntheticExpression
+    // Go: checker/checker.go:11234 checkSyntheticExpression
     pub fn check_synthetic_expression(&mut self, node: Node) -> TypeId {
         // PORT: Go `node.AsSyntheticExpression().Type.(*Type)` is kept in the
         // synthetic node slot and read with `synthetic_expression_type`.
@@ -1350,7 +1350,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:11012 checkIdentifier
+    // Go: checker/checker.go:11242 checkIdentifier
     pub fn check_identifier(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         if is_this_in_type_query(node) {
             return self.check_this_expression(node);

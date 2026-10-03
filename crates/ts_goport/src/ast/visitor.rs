@@ -237,7 +237,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         nodes
     }
 
-    // Go: ast/visitor.go:117 VisitModifiers
+    // Go: ast/visitor.go:116 VisitModifiers
     /// Visits a ModifierList, possibly returning a new ModifierList in its place.
     ///
     ///   - If the input ModifierList is nil, the output is nil.
@@ -261,7 +261,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         nodes
     }
 
-    // Go: ast/visitor.go:138 VisitSlice
+    // Go: ast/visitor.go:137 VisitSlice
     /// Visits a slice of Nodes, returning the resulting slice and a value indicating whether the slice was changed.
     ///
     ///   - If the input slice is nil, the output is nil.
@@ -337,7 +337,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         None
     }
 
-    // Go: ast/visitor.go:188 VisitEachChild
+    // Go: ast/visitor.go:186 VisitEachChild
     /// Visits each child of a Node, possibly returning a new Node of the same kind in its place.
     pub fn visit_each_child(&mut self, node: Node) -> Node {
         if node.is_nil() || self.visit.is_none() {
@@ -347,7 +347,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         node.visit_each_child(self)
     }
 
-    // Go: ast/visitor.go:196 visitNode
+    // Go: ast/visitor.go:194 visitNode
     pub(crate) fn visit_node_hooked(&mut self, node: Node) -> Node {
         if let Some(hook) = self.hooks.visit_node.clone() {
             return hook(node, self);
@@ -355,7 +355,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         self.visit_node(node)
     }
 
-    // Go: ast/visitor.go:203 visitEmbeddedStatement
+    // Go: ast/visitor.go:201 visitEmbeddedStatement
     pub(crate) fn visit_embedded_statement_hooked(&mut self, node: Node) -> Node {
         if let Some(hook) = self.hooks.visit_embedded_statement.clone() {
             return hook(node, self);
@@ -370,7 +370,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         self.visit_embedded_statement(node)
     }
 
-    // Go: ast/visitor.go:213 visitIterationBody
+    // Go: ast/visitor.go:211 visitIterationBody
     pub(crate) fn visit_iteration_body(&mut self, node: Node) -> Node {
         if let Some(hook) = self.hooks.visit_iteration_body.clone() {
             return hook(node, self);
@@ -381,7 +381,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         self.visit_embedded_statement_hooked(node)
     }
 
-    // Go: ast/visitor.go:220 visitFunctionBody
+    // Go: ast/visitor.go:218 visitFunctionBody
     pub(crate) fn visit_function_body(&mut self, node: Node) -> Node {
         if let Some(hook) = self.hooks.visit_function_body.clone() {
             return hook(node, self);
@@ -392,7 +392,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         self.visit_node_hooked(node)
     }
 
-    // Go: ast/visitor.go:227 visitToken
+    // Go: ast/visitor.go:225 visitToken
     pub(crate) fn visit_token(&mut self, node: Node) -> Node {
         if let Some(hook) = self.hooks.visit_token.clone() {
             return hook(node, self);
@@ -400,7 +400,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         self.visit_node(node)
     }
 
-    // Go: ast/visitor.go:234 visitNodes
+    // Go: ast/visitor.go:232 visitNodes
     pub(crate) fn visit_nodes_hooked(&mut self, nodes: NodeList) -> NodeList {
         if let Some(hook) = self.hooks.visit_nodes.clone() {
             return hook(nodes, self);
@@ -408,7 +408,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         self.visit_nodes(nodes)
     }
 
-    // Go: ast/visitor.go:241 visitModifiers
+    // Go: ast/visitor.go:239 visitModifiers
     pub(crate) fn visit_modifiers_hooked(&mut self, nodes: ModifierList) -> ModifierList {
         if let Some(hook) = self.hooks.visit_modifiers.clone() {
             return hook(nodes, self);
@@ -416,7 +416,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         self.visit_modifiers(nodes)
     }
 
-    // Go: ast/visitor.go:248 visitParameters
+    // Go: ast/visitor.go:246 visitParameters
     pub(crate) fn visit_parameters(&mut self, nodes: NodeList) -> NodeList {
         if let Some(hook) = self.hooks.visit_parameters.clone() {
             return hook(nodes, self);
@@ -427,7 +427,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         self.visit_nodes_hooked(nodes)
     }
 
-    // Go: ast/visitor.go:255 visitTopLevelStatements
+    // Go: ast/visitor.go:253 visitTopLevelStatements
     pub(crate) fn visit_top_level_statements(&mut self, nodes: NodeList) -> NodeList {
         if let Some(hook) = self.hooks.visit_top_level_statements.clone() {
             return hook(nodes, self);
@@ -438,7 +438,7 @@ impl<'a, C> NodeVisitor<'a, C> {
         self.visit_nodes_hooked(nodes)
     }
 
-    // Go: ast/visitor.go:262 liftToBlock
+    // Go: ast/visitor.go:260 liftToBlock
     fn lift_to_block(&mut self, node: Node) -> Node {
         let mut nodes: Vec<Node> = Vec::new();
         if node.is_some() {
@@ -708,7 +708,7 @@ fn visit_each_child_source_file<C>(node: Node, v: &mut NodeVisitor<'_, C>) -> No
         .update_source_file(node, statements, end_of_file_token)
 }
 
-// Go: ast/ast.go:3051 visitEachChild_JSDocParameterOrPropertyTag
+// Go: ast/ast.go:3179 visitEachChild_JSDocParameterOrPropertyTag
 fn visit_each_child_js_doc_parameter_or_property_tag_impl<C>(
     node: Node,
     v: &mut NodeVisitor<'_, C>,

@@ -268,7 +268,7 @@ impl ParseTask {
     }
 }
 
-// Go: filesparser.go:184 resolvedRef
+// Go: filesparser.go:208 resolvedRef
 #[derive(Clone, Default)]
 pub struct ResolvedRef {
     pub file_name: String,
@@ -287,7 +287,7 @@ pub(crate) struct QueuedParseTask {
     depth: i32,
 }
 
-// Go: filesparser.go:205 filesParser
+// Go: filesparser.go:229 filesParser
 // PORT: Go `core.WorkGroup` is single threaded here (contract 10). Go
 // `singleThreadedWorkGroup` keeps queued functions in a slice and
 // `RunAndWait` pops the last one first, so `queue` is a stack with the same
@@ -341,7 +341,7 @@ impl Drop for ParseTaskLinks {
     }
 }
 
-// Go: filesparser.go:219 getParseTaskData
+// Go: filesparser.go:243 getParseTaskData
 // PORT: Go takes the value from `parseTaskDataPool`; `putParseTaskData`
 // (filesparser.go:226) returns an unused one. No pool is needed here.
 fn get_parse_task_data(task: &ParseTaskRef) -> Rc<RefCell<ParseTaskData>> {
@@ -356,7 +356,7 @@ fn get_parse_task_data(task: &ParseTaskRef) -> Rc<RefCell<ParseTaskData>> {
     }))
 }
 
-// Go: filesparser.go:231 parseTaskData
+// Go: filesparser.go:255 parseTaskData
 // PORT: Go iterates `tasks` (a Go map) in random order. `IndexMap` keeps
 // insertion order. The map holds more than one task only when one path is
 // reached through file names that differ in casing.
@@ -815,7 +815,7 @@ impl FilesParser {
         }
 
         impl Collector<'_> {
-            // Go: filesparser.go:355 collectFiles
+            // Go: filesparser.go:379 collectFiles
             fn collect_files(&mut self, tasks: &[ParseTaskRef]) {
                 let loader = self.loader;
                 for task in tasks {
@@ -2339,7 +2339,7 @@ impl WorkerResolver {
             if shared.is_closed() {
                 return;
             }
-            // Go: fileloader.go:710 getModeForTypeReferenceDirectiveInFile
+            // Go: fileloader.go:1033 getModeForTypeReferenceDirectiveInFile
             let mode = if reference.resolution_mode != RESOLUTION_MODE_NONE {
                 reference.resolution_mode
             } else {

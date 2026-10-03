@@ -196,8 +196,10 @@ struct FileStore {
     /// Go `file.hasLazyJSDoc`, set by `finishSourceFile` for a non-JS file,
     /// with the inputs that Go `parseJSDocForNode` reads from the file
     /// (`ParseOptions()` and `ScriptKind`; the text is `text`). Node reads
-    /// use it until the file is published (the program then keeps the
-    /// inputs), so `publish_file_stores` drops it.
+    /// use it until the file is published. Then the `SourceFileInfo` of the
+    /// file keeps the options and the script kind, and the store keeps the
+    /// text (`program::resolve_lazy_js_doc`), so `publish_file_stores` drops
+    /// it.
     lazy_js_doc: Option<(SourceFileParseOptions, ScriptKind)>,
     /// Go `file.jsdocCache` entries that `resolveJSDoc` adds before the file
     /// is published.
@@ -3430,7 +3432,7 @@ pub fn set_file_store_lazy_js_doc(
     with_store_mut(file, |s| s.lazy_js_doc = lazy);
 }
 
-// Go: ast/ast.go:2614 (*SourceFile).resolveJSDoc
+// Go: ast/ast.go:2745 (*SourceFile).resolveJSDoc
 /// Go `node.JSDoc(file)` of a store file whose program is not installed
 /// yet: the cache, then, in a lazy file (`set_file_store_lazy_js_doc`), Go
 /// `parseJSDocForNode`, whose result the cache keeps. None on a cache miss

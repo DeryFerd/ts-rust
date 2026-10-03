@@ -101,7 +101,7 @@ impl LegacyDecoratorsTransformer {
             .and_then(|aliases| aliases.get(&node).copied())
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:69 LegacyDecoratorsTransformer.visitIdentifier
+    // Go: transformers/tstransforms/legacydecorators.go:73 LegacyDecoratorsTransformer.visitIdentifier
     fn visit_identifier(&mut self, node: Node) -> Node {
         // takes the place of `substituteIdentifier` in the strada transform
         let ec = &self.emit_context;
@@ -119,7 +119,7 @@ impl LegacyDecoratorsTransformer {
         node
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:79 LegacyDecoratorsTransformer.visitPropertyAccessExpression
+    // Go: transformers/tstransforms/legacydecorators.go:83 LegacyDecoratorsTransformer.visitPropertyAccessExpression
     fn visit_property_access_expression(&mut self, node: Node) -> Node {
         // Visit the expression but not the name, since property access names should not be substituted.
         // Strada's onSubstituteNode only fires for EmitHint.Expression, which excludes the
@@ -140,7 +140,7 @@ impl LegacyDecoratorsTransformer {
         node
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:113 LegacyDecoratorsTransformer.finishClassElement
+    // Go: transformers/tstransforms/legacydecorators.go:118 LegacyDecoratorsTransformer.finishClassElement
     fn finish_class_element(&self, updated: Node, original: Node) -> Node {
         if updated != original {
             // While we emit the source map for the node after skipping decorators and modifiers,
@@ -152,7 +152,7 @@ impl LegacyDecoratorsTransformer {
         updated
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:123 LegacyDecoratorsTransformer.visitParamerDeclaration
+    // Go: transformers/tstransforms/legacydecorators.go:128 LegacyDecoratorsTransformer.visitParamerDeclaration
     fn visit_paramer_declaration(&mut self, node: Node) -> Node {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -180,7 +180,7 @@ impl LegacyDecoratorsTransformer {
         updated
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:147 LegacyDecoratorsTransformer.visitPropertyNameOfClassElement
+    // Go: transformers/tstransforms/legacydecorators.go:153 LegacyDecoratorsTransformer.visitPropertyNameOfClassElement
     /// visitPropertyNameOfClassElement visits the property name of a class element,
     /// for use when emitting property initializers. For a computed property on a node
     /// with decorators, a temporary value is stored for later use.
@@ -203,7 +203,7 @@ impl LegacyDecoratorsTransformer {
         self.visit_node(name)
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:161 LegacyDecoratorsTransformer.visitPropertyDeclaration
+    // Go: transformers/tstransforms/legacydecorators.go:167 LegacyDecoratorsTransformer.visitPropertyDeclaration
     fn visit_property_declaration(&mut self, node: Node) -> Node {
         if node.flags().intersects(NodeFlags::AMBIENT) {
             return Node::NIL;
@@ -226,7 +226,7 @@ impl LegacyDecoratorsTransformer {
         self.finish_class_element(updated, node)
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:182 LegacyDecoratorsTransformer.visitGetAccessorDeclaration
+    // Go: transformers/tstransforms/legacydecorators.go:188 LegacyDecoratorsTransformer.visitGetAccessorDeclaration
     fn visit_get_accessor_declaration(&mut self, node: Node) -> Node {
         let modifiers = self.visit_modifiers(node.modifiers());
         let name = self.visit_property_name_of_class_element(node);
@@ -245,7 +245,7 @@ impl LegacyDecoratorsTransformer {
         self.finish_class_element(updated, node)
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:198 LegacyDecoratorsTransformer.visitSetAccessorDeclaration
+    // Go: transformers/tstransforms/legacydecorators.go:204 LegacyDecoratorsTransformer.visitSetAccessorDeclaration
     fn visit_set_accessor_declaration(&mut self, node: Node) -> Node {
         let modifiers = self.visit_modifiers(node.modifiers());
         let name = self.visit_property_name_of_class_element(node);
@@ -264,7 +264,7 @@ impl LegacyDecoratorsTransformer {
         self.finish_class_element(updated, node)
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:214 LegacyDecoratorsTransformer.visitMethodDeclaration
+    // Go: transformers/tstransforms/legacydecorators.go:220 LegacyDecoratorsTransformer.visitMethodDeclaration
     fn visit_method_declaration(&mut self, node: Node) -> Node {
         let modifiers = self.visit_modifiers(node.modifiers());
         let name = self.visit_property_name_of_class_element(node);
@@ -285,7 +285,7 @@ impl LegacyDecoratorsTransformer {
         self.finish_class_element(updated, node)
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:232 LegacyDecoratorsTransformer.visitConstructorDeclaration
+    // Go: transformers/tstransforms/legacydecorators.go:238 LegacyDecoratorsTransformer.visitConstructorDeclaration
     fn visit_constructor_declaration(&mut self, node: Node) -> Node {
         let modifiers = self.visit_modifiers(node.modifiers());
         let parameters = self.visit_nodes(node.parameter_list());
@@ -301,7 +301,7 @@ impl LegacyDecoratorsTransformer {
         )
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:244 LegacyDecoratorsTransformer.visitClassExpression
+    // Go: transformers/tstransforms/legacydecorators.go:250 LegacyDecoratorsTransformer.visitClassExpression
     fn visit_class_expression(&mut self, node: Node) -> Node {
         // Legacy decorators were not supported on class expressions
         let modifiers = self.visit_modifiers(node.modifiers());
@@ -317,7 +317,7 @@ impl LegacyDecoratorsTransformer {
         )
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:256 LegacyDecoratorsTransformer.visitClassDeclaration
+    // Go: transformers/tstransforms/legacydecorators.go:262 LegacyDecoratorsTransformer.visitClassDeclaration
     fn visit_class_declaration(&mut self, node: Node) -> Node {
         let decorated = class_or_constructor_parameter_is_decorated(true, node);
         if !(decorated || child_is_decorated(true, node, Node::NIL)) {
@@ -330,7 +330,7 @@ impl LegacyDecoratorsTransformer {
         self.transform_class_declaration_without_class_decorators(node, node.name())
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:274 LegacyDecoratorsTransformer.transformClassDeclarationWithoutClassDecorators
+    // Go: transformers/tstransforms/legacydecorators.go:280 LegacyDecoratorsTransformer.transformClassDeclarationWithoutClassDecorators
     /// Transforms a non-decorated class declaration.
     ///
     /// @param node A ClassDeclaration node.
@@ -373,17 +373,17 @@ impl LegacyDecoratorsTransformer {
         f.new_syntax_list(&statements)
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:303 LegacyDecoratorsTransformer.popEnclosingClass
+    // Go: transformers/tstransforms/legacydecorators.go:308 LegacyDecoratorsTransformer.popEnclosingClass
     fn pop_enclosing_class(&mut self) {
         self.enclosing_classes.pop();
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:307 LegacyDecoratorsTransformer.pushEnclosingClass
+    // Go: transformers/tstransforms/legacydecorators.go:312 LegacyDecoratorsTransformer.pushEnclosingClass
     fn push_enclosing_class(&mut self, cls: Node) {
         self.enclosing_classes.push(cls);
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:315 LegacyDecoratorsTransformer.transformClassDeclarationWithClassDecorators
+    // Go: transformers/tstransforms/legacydecorators.go:320 LegacyDecoratorsTransformer.transformClassDeclarationWithClassDecorators
     /// Transforms a decorated class declaration and appends the resulting statements. If
     /// the class requires an alias to avoid issues with double-binding, the alias is returned.
     fn transform_class_declaration_with_class_decorators(
@@ -636,7 +636,7 @@ impl LegacyDecoratorsTransformer {
         f.new_syntax_list(&statements)
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:500 LegacyDecoratorsTransformer.hasInternalStaticReference
+    // Go: transformers/tstransforms/legacydecorators.go:512 LegacyDecoratorsTransformer.hasInternalStaticReference
     fn has_internal_static_reference(&self, node: Node) -> bool {
         let ec = &self.emit_context;
         let resolver = &*self.reference_resolver;
@@ -651,7 +651,7 @@ impl LegacyDecoratorsTransformer {
         false
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:527 LegacyDecoratorsTransformer.getClassAliasIfNeeded
+    // Go: transformers/tstransforms/legacydecorators.go:539 LegacyDecoratorsTransformer.getClassAliasIfNeeded
     /// Gets a local alias for a class declaration if it is a decorated class with an internal
     /// reference to the static side of the class. This is necessary to avoid issues with
     /// double-binding semantics for the class name.
@@ -675,7 +675,7 @@ impl LegacyDecoratorsTransformer {
         class_alias
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:549 LegacyDecoratorsTransformer.getConstructorDecorationStatement
+    // Go: transformers/tstransforms/legacydecorators.go:560 LegacyDecoratorsTransformer.getConstructorDecorationStatement
     /// Generates a __decorate helper call for a class constructor.
     ///
     /// @param node The class node.
@@ -692,7 +692,7 @@ impl LegacyDecoratorsTransformer {
         Node::NIL
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:564 LegacyDecoratorsTransformer.generateConstructorDecorationExpression
+    // Go: transformers/tstransforms/legacydecorators.go:575 LegacyDecoratorsTransformer.generateConstructorDecorationExpression
     /// Generates a __decorate helper call for a class constructor.
     ///
     /// @param node The class node.
@@ -741,7 +741,7 @@ impl LegacyDecoratorsTransformer {
         expression
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:762 LegacyDecoratorsTransformer.transformDecoratorsOfClassElements
+    // Go: transformers/tstransforms/legacydecorators.go:793 LegacyDecoratorsTransformer.transformDecoratorsOfClassElements
     fn transform_decorators_of_class_elements(
         &mut self,
         node: Node,
@@ -768,7 +768,7 @@ impl LegacyDecoratorsTransformer {
         (members, decoration_statements)
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:792 LegacyDecoratorsTransformer.getClassElementDecorationStatements
+    // Go: transformers/tstransforms/legacydecorators.go:822 LegacyDecoratorsTransformer.getClassElementDecorationStatements
     /// Generates statements used to apply decorators to either the static or instance members
     /// of a class.
     ///
@@ -789,7 +789,7 @@ impl LegacyDecoratorsTransformer {
         statements
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:838 LegacyDecoratorsTransformer.generateClassElementDecorationExpressions
+    // Go: transformers/tstransforms/legacydecorators.go:870 LegacyDecoratorsTransformer.generateClassElementDecorationExpressions
     /// Generates expressions used to apply decorators to either the static or instance members
     /// of a class.
     ///
@@ -812,7 +812,7 @@ impl LegacyDecoratorsTransformer {
         expressions
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:856 LegacyDecoratorsTransformer.generateClassElementDecorationExpression
+    // Go: transformers/tstransforms/legacydecorators.go:888 LegacyDecoratorsTransformer.generateClassElementDecorationExpression
     /// Generates an expression used to evaluate class element decorators at runtime.
     ///
     /// @param node The class node that contains the member.
@@ -879,13 +879,13 @@ impl LegacyDecoratorsTransformer {
         helper
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:913 LegacyDecoratorsTransformer.isSyntheticMetadataDecorator
+    // Go: transformers/tstransforms/legacydecorators.go:951 LegacyDecoratorsTransformer.isSyntheticMetadataDecorator
     fn is_synthetic_metadata_decorator(&self, node: Node) -> bool {
         self.emit_context
             .is_call_to_helper(node.expression(), "__metadata")
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:922 LegacyDecoratorsTransformer.transformAllDecoratorsOfDeclaration
+    // Go: transformers/tstransforms/legacydecorators.go:960 LegacyDecoratorsTransformer.transformAllDecoratorsOfDeclaration
     /// Transforms all of the decorators for a declaration into an array of expressions.
     ///
     /// @param allDecorators An object containing all of the decorators for the declaration.
@@ -912,7 +912,7 @@ impl LegacyDecoratorsTransformer {
         decorator_expressions
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:940 LegacyDecoratorsTransformer.transformDecoratorsOfParameters
+    // Go: transformers/tstransforms/legacydecorators.go:977 LegacyDecoratorsTransformer.transformDecoratorsOfParameters
     fn transform_decorators_of_parameters(&mut self, parameters: &[Vec<Node>]) -> Vec<Node> {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -931,7 +931,7 @@ impl LegacyDecoratorsTransformer {
         results
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:963 LegacyDecoratorsTransformer.transformDecorators
+    // Go: transformers/tstransforms/legacydecorators.go:1000 LegacyDecoratorsTransformer.transformDecorators
     /// Transforms a list of decorators into an expression.
     ///
     /// @param decorator The decorator node.
@@ -943,7 +943,7 @@ impl LegacyDecoratorsTransformer {
         results
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:971 LegacyDecoratorsTransformer.getClassMemberPrefix
+    // Go: transformers/tstransforms/legacydecorators.go:1008 LegacyDecoratorsTransformer.getClassMemberPrefix
     fn get_class_member_prefix(&self, node: Node, member: Node) -> Node {
         if is_static(member) {
             return self.emit_context.factory().get_declaration_name(node);
@@ -951,7 +951,7 @@ impl LegacyDecoratorsTransformer {
         self.get_class_prototype(node)
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:978 LegacyDecoratorsTransformer.getClassPrototype
+    // Go: transformers/tstransforms/legacydecorators.go:1015 LegacyDecoratorsTransformer.getClassPrototype
     fn get_class_prototype(&self, node: Node) -> Node {
         let f = self.emit_context.factory();
         f.new_property_access_expression(
@@ -962,7 +962,7 @@ impl LegacyDecoratorsTransformer {
         )
     }
 
-    // Go: transformers/tstransforms/legacydecorators.go:987 LegacyDecoratorsTransformer.getExpressionForPropertyName
+    // Go: transformers/tstransforms/legacydecorators.go:1024 LegacyDecoratorsTransformer.getExpressionForPropertyName
     fn get_expression_for_property_name(
         &self,
         member: Node,
@@ -987,7 +987,7 @@ impl LegacyDecoratorsTransformer {
     }
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:91 elideNodes
+// Go: transformers/tstransforms/legacydecorators.go:94 elideNodes
 fn elide_nodes(f: &PrinterNodeFactory, nodes: NodeList) -> NodeList {
     if nodes.is_nil() {
         return NodeList::NIL;
@@ -998,7 +998,7 @@ fn elide_nodes(f: &PrinterNodeFactory, nodes: NodeList) -> NodeList {
     f.new_node_list_with_loc(&[], nodes.loc())
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:102 elideModifiers
+// Go: transformers/tstransforms/legacydecorators.go:106 elideModifiers
 fn elide_modifiers(f: &PrinterNodeFactory, nodes: ModifierList) -> ModifierList {
     if nodes.is_nil() {
         return ModifierList::NIL;
@@ -1030,27 +1030,27 @@ fn is_or_contains_static_self_reference(
     n.for_each_child(|child| is_or_contains_static_self_reference(ec, resolver, class_node, child))
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:593 isClassStaticBlockDeclarationOrStaticProperty
+// Go: transformers/tstransforms/legacydecorators.go:614 isClassStaticBlockDeclarationOrStaticProperty
 fn is_class_static_block_declaration_or_static_property(node: Node) -> bool {
     is_class_static_block_declaration(node)
         || (is_property_declaration(node) && has_static_modifier(node))
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:597 isNotExportOrDefaultOrDecorator
+// Go: transformers/tstransforms/legacydecorators.go:618 isNotExportOrDefaultOrDecorator
 fn is_not_export_or_default_or_decorator(node: Node) -> bool {
     !(is_decorator(node)
         || node.kind() == SyntaxKind::ExportKeyword
         || node.kind() == SyntaxKind::DefaultKeyword)
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:601 decoratorContainsPrivateIdentifierInExpression
+// Go: transformers/tstransforms/legacydecorators.go:622 decoratorContainsPrivateIdentifierInExpression
 fn decorator_contains_private_identifier_in_expression(decorator: Node) -> bool {
     decorator
         .subtree_facts()
         .intersects(SubtreeFacts::SUBTREE_CONTAINS_PRIVATE_IDENTIFIER_IN_EXPRESSION)
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:605 parameterDecoratorsContainPrivateIdentifierInExpression
+// Go: transformers/tstransforms/legacydecorators.go:626 parameterDecoratorsContainPrivateIdentifierInExpression
 fn parameter_decorators_contain_private_identifier_in_expression(
     parameter_decorators: &[Node],
 ) -> bool {
@@ -1059,7 +1059,7 @@ fn parameter_decorators_contain_private_identifier_in_expression(
         .any(|&d| decorator_contains_private_identifier_in_expression(d))
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:609 hasClassElementWithDecoratorContainingPrivateIdentifierInExpression
+// Go: transformers/tstransforms/legacydecorators.go:630 hasClassElementWithDecoratorContainingPrivateIdentifierInExpression
 fn has_class_element_with_decorator_containing_private_identifier_in_expression(
     node: Node,
 ) -> bool {
@@ -1091,13 +1091,13 @@ fn has_class_element_with_decorator_containing_private_identifier_in_expression(
     false
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:631 allDecorators
+// Go: transformers/tstransforms/legacydecorators.go:652 allDecorators
 pub(super) struct AllDecorators {
     pub(super) decorators: Vec<Node>,
     pub(super) parameters: Vec<Vec<Node>>,
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:644 getAllDecoratorsOfClass
+// Go: transformers/tstransforms/legacydecorators.go:665 getAllDecoratorsOfClass
 /// Gets an allDecorators object containing the decorators for the class and the decorators for the
 /// parameters of the constructor of the class.
 ///
@@ -1119,7 +1119,7 @@ fn get_all_decorators_of_class(node: Node, use_legacy_decorators: bool) -> Optio
     })
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:665 getAllDecoratorsOfClassElement
+// Go: transformers/tstransforms/legacydecorators.go:685 getAllDecoratorsOfClassElement
 /// Gets an allDecorators object containing the decorators for the member and its parameters.
 ///
 /// @param parent The class node that contains the member.
@@ -1146,7 +1146,7 @@ fn get_all_decorators_of_class_element(
     }
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:688 getAllDecoratorsOfAccessors
+// Go: transformers/tstransforms/legacydecorators.go:707 getAllDecoratorsOfAccessors
 /// Gets an allDecorators object containing the decorators for the accessor and its parameters.
 ///
 /// @param parent The class node that contains the accessor.
@@ -1187,7 +1187,7 @@ fn get_all_decorators_of_accessors(
     })
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:720 getAllDecoratorsOfProperty
+// Go: transformers/tstransforms/legacydecorators.go:739 getAllDecoratorsOfProperty
 fn get_all_decorators_of_property(property: Node) -> Option<AllDecorators> {
     let decorators = property.decorators().to_vec();
     if decorators.is_empty() {
@@ -1199,7 +1199,7 @@ fn get_all_decorators_of_property(property: Node) -> Option<AllDecorators> {
     })
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:728 getAllDecoratorsOfMethod
+// Go: transformers/tstransforms/legacydecorators.go:747 getAllDecoratorsOfMethod
 fn get_all_decorators_of_method(
     method: Node,
     use_legacy_decorators: bool,
@@ -1221,7 +1221,7 @@ fn get_all_decorators_of_method(
     })
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:748 getDecoratorsOfParameters
+// Go: transformers/tstransforms/legacydecorators.go:768 getDecoratorsOfParameters
 /// Gets an array of arrays of decorators for the parameters of a function-like node.
 /// The offset into the result array should correspond to the offset of the parameter.
 ///
@@ -1251,7 +1251,7 @@ pub(super) fn get_decorators_of_parameters(node: Node) -> Vec<Vec<Node>> {
     decorators
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:813 isDecoratedClassElement
+// Go: transformers/tstransforms/legacydecorators.go:837 isDecoratedClassElement
 /// Determines whether a class member is either a static or an instance member of a class
 /// that is decorated, or has parameters that are decorated.
 ///
@@ -1261,7 +1261,7 @@ fn is_decorated_class_element(member: Node, is_static_element: bool, parent: Nod
         && node_or_child_is_decorated(true, member, parent, Node::NIL)
 }
 
-// Go: transformers/tstransforms/legacydecorators.go:825 getDecoratedClassElements
+// Go: transformers/tstransforms/legacydecorators.go:849 getDecoratedClassElements
 /// Gets either the static or instance members of a class that are decorated, or have
 /// parameters that are decorated.
 ///

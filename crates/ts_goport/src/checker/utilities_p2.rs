@@ -4,7 +4,7 @@ use crate::jsnum::PseudoBigInt;
 use crate::prelude::*;
 use std::cell::Cell;
 
-// Go: checker/utilities.go:904 isValidNumberString
+// Go: checker/utilities.go:970 isValidNumberString
 pub fn is_valid_number_string(s: &str, round_trip_only: bool) -> bool {
     if s.is_empty() {
         return false;
@@ -13,7 +13,7 @@ pub fn is_valid_number_string(s: &str, round_trip_only: bool) -> bool {
     !n.is_nan() && !n.is_infinite() && (!round_trip_only || n.to_string() == s)
 }
 
-// Go: checker/utilities.go:912 isValidBigIntString
+// Go: checker/utilities.go:978 isValidBigIntString
 pub fn is_valid_big_int_string(s: &str, round_trip_only: bool) -> bool {
     if s.is_empty() {
         return false;
@@ -54,7 +54,7 @@ pub fn is_valid_big_int_string(s: &str, round_trip_only: bool) -> bool {
             )))
 }
 
-// Go: checker/utilities.go:938 isValidESSymbolDeclaration
+// Go: checker/utilities.go:1004 isValidESSymbolDeclaration
 pub fn is_valid_es_symbol_declaration(node: Node) -> bool {
     if is_variable_declaration(node) {
         return is_var_const(node)
@@ -67,18 +67,18 @@ pub fn is_valid_es_symbol_declaration(node: Node) -> bool {
     is_property_signature_declaration(node) && has_readonly_modifier(node)
 }
 
-// Go: checker/utilities.go:948 isVariableDeclarationInVariableStatement
+// Go: checker/utilities.go:1014 isVariableDeclarationInVariableStatement
 pub fn is_variable_declaration_in_variable_statement(node: Node) -> bool {
     is_variable_declaration_list(node.parent()) && is_variable_statement(node.parent().parent())
 }
 
 impl Checker {
-    // Go: checker/utilities.go:952 IsKnownSymbol
+    // Go: checker/utilities.go:1018 IsKnownSymbol
     pub fn is_known_symbol(&self, symbol: SymbolId) -> bool {
         is_late_bound_name(&self.sym(symbol).name)
     }
 
-    // Go: checker/utilities.go:956 IsPrivateIdentifierSymbol
+    // Go: checker/utilities.go:1022 IsPrivateIdentifierSymbol
     pub fn is_private_identifier_symbol(&self, symbol: SymbolId) -> bool {
         if symbol.is_nil() {
             return false;
@@ -89,7 +89,7 @@ impl Checker {
     }
 }
 
-// Go: checker/utilities.go:963 isLateBoundName
+// Go: checker/utilities.go:1029 isLateBoundName
 // PORT: Go checks `name[0] == '\xfe' && name[1] == '@'`. The byte 0xFE is
 // INTERNAL_SYMBOL_NAME_PREFIX in the port form (see `ast::misc`), so this
 // checks for that prefix followed by the byte '@'.
@@ -101,7 +101,7 @@ pub fn is_late_bound_name(name: &str) -> bool {
 }
 
 impl Checker {
-    // Go: checker/utilities.go:967 isObjectOrArrayLiteralType
+    // Go: checker/utilities.go:1033 isObjectOrArrayLiteralType
     pub fn is_object_or_array_literal_type(&self, t: TypeId) -> bool {
         self.ty(t)
             .object_flags
@@ -109,7 +109,7 @@ impl Checker {
     }
 }
 
-// Go: checker/utilities.go:971 getContainingClassExcludingClassDecorators
+// Go: checker/utilities.go:1037 getContainingClassExcludingClassDecorators
 pub fn get_containing_class_excluding_class_decorators(node: Node) -> Node {
     let decorator = find_ancestor_or_quit(node.parent(), |n: Node| {
         if is_class_like(n) {
@@ -130,14 +130,14 @@ pub fn get_containing_class_excluding_class_decorators(node: Node) -> Node {
 }
 
 impl Checker {
-    // Go: checker/utilities.go:990 isThisTypeParameter
+    // Go: checker/utilities.go:1056 isThisTypeParameter
     pub fn is_this_type_parameter(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         ty.flags.intersects(TypeFlags::TYPE_PARAMETER) && ty.as_type_parameter().is_this_type
     }
 }
 
-// Go: checker/utilities.go:994 isClassInstanceProperty
+// Go: checker/utilities.go:1060 isClassInstanceProperty
 pub fn is_class_instance_property(node: Node) -> bool {
     if is_in_js_file(node) && is_expando_property_declaration(node) {
         let left = node.left();
@@ -151,7 +151,7 @@ pub fn is_class_instance_property(node: Node) -> bool {
         && !has_accessor_modifier(node)
 }
 
-// Go: checker/utilities.go:1003 isThisInitializedObjectBindingExpression
+// Go: checker/utilities.go:1069 isThisInitializedObjectBindingExpression
 pub fn is_this_initialized_object_binding_expression(node: Node) -> bool {
     node.is_some()
         && (is_shorthand_property_assignment(node) || is_property_assignment(node))
@@ -160,7 +160,7 @@ pub fn is_this_initialized_object_binding_expression(node: Node) -> bool {
         && node.parent().parent().right().kind() == SyntaxKind::ThisKeyword
 }
 
-// Go: checker/utilities.go:1009 isThisInitializedDeclaration
+// Go: checker/utilities.go:1075 isThisInitializedDeclaration
 pub fn is_this_initialized_declaration(node: Node) -> bool {
     node.is_some()
         && is_variable_declaration(node)
@@ -168,13 +168,13 @@ pub fn is_this_initialized_declaration(node: Node) -> bool {
         && node.initializer().kind() == SyntaxKind::ThisKeyword
 }
 
-// Go: checker/utilities.go:1013 isInfinityOrNaNString
+// Go: checker/utilities.go:1079 isInfinityOrNaNString
 pub fn is_infinity_or_nan_string(name: &str) -> bool {
     name == "Infinity" || name == "-Infinity" || name == "NaN"
 }
 
 impl Checker {
-    // Go: checker/utilities.go:1017 isConstantVariable
+    // Go: checker/utilities.go:1083 isConstantVariable
     pub fn is_constant_variable(&mut self, symbol: SymbolId) -> bool {
         self.sym(symbol).flags.intersects(SymbolFlags::VARIABLE)
             && self
@@ -182,7 +182,7 @@ impl Checker {
                 .intersects(NodeFlags::CONSTANT)
     }
 
-    // Go: checker/utilities.go:1021 isParameterOrMutableLocalVariable
+    // Go: checker/utilities.go:1087 isParameterOrMutableLocalVariable
     pub fn is_parameter_or_mutable_local_variable(&self, symbol: SymbolId) -> bool {
         // Return true if symbol is a parameter, a catch clause variable, or a mutable local variable
         let value_declaration = self.sym(symbol).value_declaration;
@@ -197,7 +197,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/utilities.go:1030 isMutableLocalVariableDeclaration
+    // Go: checker/utilities.go:1096 isMutableLocalVariableDeclaration
     pub fn is_mutable_local_variable_declaration(&self, declaration: Node) -> bool {
         // Return true if symbol is a non-exported and non-global `let` variable
         !declaration.parent().parser_flags(NodeFlags::LET).is_empty()
@@ -207,7 +207,7 @@ impl Checker {
     }
 }
 
-// Go: checker/utilities.go:1035 isInAmbientOrTypeNode
+// Go: checker/utilities.go:1101 isInAmbientOrTypeNode
 // PERF: U4 (CH7), as `Checker::is_in_ambient_or_type_node`.
 pub fn is_in_ambient_or_type_node(node: Node) -> bool {
     !node.parser_flags(NodeFlags::AMBIENT).is_empty()
@@ -223,7 +223,7 @@ pub fn is_in_ambient_or_type_node(node: Node) -> bool {
         .is_some()
 }
 
-// Go: checker/utilities.go:1041 isLiteralExpressionOfObject
+// Go: checker/utilities.go:1107 isLiteralExpressionOfObject
 pub fn is_literal_expression_of_object(node: Node) -> bool {
     matches!(
         node.kind(),
@@ -235,7 +235,7 @@ pub fn is_literal_expression_of_object(node: Node) -> bool {
     )
 }
 
-// Go: checker/utilities.go:1050 canHaveFlowNode
+// Go: checker/utilities.go:1116 canHaveFlowNode
 // PORT: Go `node.FlowNodeData() != nil`. That is non-nil exactly for node
 // kinds whose Go data struct embeds `FlowNodeBase` (directly or through
 // StatementBase, IterationStatementBase or AccessorDeclarationBase, see
@@ -303,23 +303,23 @@ pub fn can_have_flow_node(node: Node) -> bool {
     )
 }
 
-// Go: checker/utilities.go:1054 isNonNullAccess
+// Go: checker/utilities.go:1120 isNonNullAccess
 pub fn is_non_null_access(node: Node) -> bool {
     is_access_expression(node) && is_non_null_expression(node.expression())
 }
 
-// Go: checker/utilities.go:1058 getBindingElementPropertyName
+// Go: checker/utilities.go:1124 getBindingElementPropertyName
 pub fn get_binding_element_property_name(node: Node) -> Node {
     node.property_name_or_name()
 }
 
-// Go: checker/utilities.go:1062 isCallChain
+// Go: checker/utilities.go:1128 isCallChain
 pub fn is_call_chain(node: Node) -> bool {
     is_call_expression(node) && !node.parser_flags(NodeFlags::OPTIONAL_CHAIN).is_empty()
 }
 
 impl Checker {
-    // Go: checker/utilities.go:1066 callLikeExpressionMayHaveTypeArguments
+    // Go: checker/utilities.go:1132 callLikeExpressionMayHaveTypeArguments
     pub fn call_like_expression_may_have_type_arguments(&self, node: Node) -> bool {
         is_call_or_new_expression(node)
             || is_tagged_template_expression(node)
@@ -327,7 +327,7 @@ impl Checker {
     }
 }
 
-// Go: checker/utilities.go:1070 isSuperCall
+// Go: checker/utilities.go:1136 isSuperCall
 // PORT: identical to `ast.IsSuperCall`, which is already the public
 // `is_super_call` in `crate::ast`. A second public item with the same name
 // would make the prelude glob ambiguous, so this copy stays private and
@@ -337,7 +337,7 @@ fn is_super_call(n: Node) -> bool {
     is_call_expression(n) && n.expression().kind() == SyntaxKind::SuperKeyword
 }
 
-// Go: checker/utilities.go:1074 getMembersOfDeclaration
+// Go: checker/utilities.go:1140 getMembersOfDeclaration
 pub fn get_members_of_declaration(node: Node) -> Vec<Node> {
     match node.kind() {
         SyntaxKind::InterfaceDeclaration
@@ -349,7 +349,7 @@ pub fn get_members_of_declaration(node: Node) -> Vec<Node> {
     }
 }
 
-// Go: checker/utilities.go:1084 isInRightSideOfImportOrExportAssignment
+// Go: checker/utilities.go:1150 isInRightSideOfImportOrExportAssignment
 pub fn is_in_right_side_of_import_or_export_assignment(mut node: Node) -> bool {
     while node.parent().kind() == SyntaxKind::QualifiedName {
         node = node.parent();
@@ -361,13 +361,13 @@ pub fn is_in_right_side_of_import_or_export_assignment(mut node: Node) -> bool {
             && node.parent().expression() == node
 }
 
-// Go: checker/utilities.go:1093 isJsxIntrinsicTagName
+// Go: checker/utilities.go:1159 isJsxIntrinsicTagName
 pub fn is_jsx_intrinsic_tag_name(tag_name: Node) -> bool {
     is_identifier(tag_name) && is_intrinsic_jsx_name(&tag_name.text())
         || is_jsx_namespaced_name(tag_name)
 }
 
-// Go: checker/utilities.go:1097 getContainingObjectLiteral
+// Go: checker/utilities.go:1163 getContainingObjectLiteral
 pub fn get_containing_object_literal(f: Node) -> Node {
     if (f.kind() == SyntaxKind::MethodDeclaration
         || f.kind() == SyntaxKind::GetAccessor
@@ -383,7 +383,7 @@ pub fn get_containing_object_literal(f: Node) -> Node {
     Node::NIL
 }
 
-// Go: checker/utilities.go:1108 isImportTypeQualifierPart
+// Go: checker/utilities.go:1174 isImportTypeQualifierPart
 pub fn is_import_type_qualifier_part(mut node: Node) -> Node {
     let mut parent = node.parent();
     while is_qualified_name(parent) {
@@ -398,7 +398,7 @@ pub fn is_import_type_qualifier_part(mut node: Node) -> Node {
     Node::NIL
 }
 
-// Go: checker/utilities.go:1145 isInNameOfExpressionWithTypeArgumentsOrHeritageTypeReference
+// Go: checker/utilities.go:1188 isInNameOfExpressionWithTypeArgumentsOrHeritageTypeReference
 pub fn is_in_name_of_expression_with_type_arguments_or_heritage_type_reference(
     mut node: Node,
 ) -> bool {
@@ -413,13 +413,13 @@ pub fn is_in_name_of_expression_with_type_arguments_or_heritage_type_reference(
 }
 
 impl Checker {
-    // Go: checker/utilities.go:1130 getIndexSymbolFromSymbolTable
+    // Go: checker/utilities.go:1197 getIndexSymbolFromSymbolTable
     pub fn get_index_symbol_from_symbol_table(&self, symbol_table: SymbolTable) -> SymbolId {
         self.symbols.get(symbol_table, INTERNAL_SYMBOL_NAME_INDEX)
     }
 }
 
-// Go: checker/utilities.go:1136 expressionResultIsUnused
+// Go: checker/utilities.go:1203 expressionResultIsUnused
 // Indicates whether the result of an `Expression` will be unused.
 // NOTE: This requires a node with a valid `parent` pointer.
 pub fn expression_result_is_unused(mut node: Node) -> bool {
@@ -452,12 +452,12 @@ pub fn expression_result_is_unused(mut node: Node) -> bool {
     }
 }
 
-// Go: checker/utilities.go:1161 pseudoBigIntToString
+// Go: checker/utilities.go:1228 pseudoBigIntToString
 pub fn pseudo_big_int_to_string(value: &PseudoBigInt) -> String {
     value.to_string()
 }
 
-// Go: checker/utilities.go:1165 getSuperContainer
+// Go: checker/utilities.go:1232 getSuperContainer
 // PORT: identical to `ast.GetSuperContainer`, which is already the public
 // `get_super_container` in `crate::ast`. This copy stays private to keep the
 // prelude glob unambiguous; checker callers resolve to the identical ast
@@ -511,7 +511,7 @@ fn get_super_container(mut node: Node, stop_on_functions: bool) -> Node {
     }
 }
 
-// Go: checker/utilities.go:1197 forEachYieldExpression
+// Go: checker/utilities.go:1264 forEachYieldExpression
 pub fn for_each_yield_expression(body: Node, visitor: &mut dyn FnMut(Node) -> bool) -> bool {
     fn traverse(node: Node, visitor: &mut dyn FnMut(Node) -> bool) -> bool {
         match node.kind() {
@@ -551,7 +551,7 @@ pub fn for_each_yield_expression(body: Node, visitor: &mut dyn FnMut(Node) -> bo
     traverse(body, visitor)
 }
 
-// Go: checker/utilities.go:1231 getEnclosingContainer
+// Go: checker/utilities.go:1298 getEnclosingContainer
 pub fn get_enclosing_container(node: Node) -> Node {
     find_ancestor(node.parent(), |n: Node| {
         get_container_flags(n).intersects(ContainerFlags::IS_CONTAINER)
@@ -559,7 +559,7 @@ pub fn get_enclosing_container(node: Node) -> Node {
 }
 
 impl Checker {
-    // Go: checker/utilities.go:1237 getDeclarationsOfKind
+    // Go: checker/utilities.go:1304 getDeclarationsOfKind
     pub fn get_declarations_of_kind(&self, symbol: SymbolId, kind: SyntaxKind) -> Vec<Node> {
         self.sym(symbol)
             .declarations
@@ -570,13 +570,13 @@ impl Checker {
     }
 }
 
-// Go: checker/utilities.go:1241 hasType
+// Go: checker/utilities.go:1308 hasType
 pub fn has_type(node: Node) -> bool {
     node.type_().is_some()
 }
 
 impl Checker {
-    // Go: checker/utilities.go:1245 getNonRestParameterCount
+    // Go: checker/utilities.go:1312 getNonRestParameterCount
     pub fn get_non_rest_parameter_count(&self, sig: SignatureId) -> i32 {
         self.sig(sig).parameters.len() as i32
             - if self.signature_has_rest_parameter(sig) {
@@ -587,7 +587,7 @@ impl Checker {
     }
 }
 
-// Go: checker/utilities.go:1249 minAndMax
+// Go: checker/utilities.go:1316 minAndMax
 pub fn min_and_max<T: Copy>(slice: &[T], mut get_value: impl FnMut(T) -> i32) -> (i32, i32) {
     let mut min_value = 0;
     let mut max_value = 0;
@@ -604,14 +604,14 @@ pub fn min_and_max<T: Copy>(slice: &[T], mut get_value: impl FnMut(T) -> i32) ->
     (min_value, max_value)
 }
 
-// Go: checker/utilities.go:1264 FeatureMapEntry
+// Go: checker/utilities.go:1331 FeatureMapEntry
 #[derive(Clone, Debug)]
 pub struct FeatureMapEntry {
     pub lib: &'static str,
     pub props: Vec<&'static str>,
 }
 
-// Go: checker/utilities.go:1269 getFeatureMap
+// Go: checker/utilities.go:1336 getFeatureMap
 // PORT: Go `sync.OnceValue` becomes a `OnceLock`. The map keys and entry
 // order are copied from Go.
 pub fn get_feature_map() -> &'static FxHashMap<&'static str, Vec<FeatureMapEntry>> {
@@ -1138,7 +1138,7 @@ pub fn get_feature_map() -> &'static FxHashMap<&'static str, Vec<FeatureMapEntry
     })
 }
 
-// Go: checker/utilities.go:1531 rangeOfTypeParameters
+// Go: checker/utilities.go:1609 rangeOfTypeParameters
 pub fn range_of_type_parameters(source_file: Node, type_parameters: NodeList) -> TextRange {
     let text = source_file_text(source_file);
     TextRange::new(
@@ -1147,7 +1147,7 @@ pub fn range_of_type_parameters(source_file: Node, type_parameters: NodeList) ->
     )
 }
 
-// Go: checker/utilities.go:1535 tryGetPropertyAccessOrIdentifierToString
+// Go: checker/utilities.go:1613 tryGetPropertyAccessOrIdentifierToString
 // PORT: Go `entityNameToString` here is the checker package function
 // (utilities.go), which is `ast.EntityNameToString(name, scanner.GetTextOfNode)`.
 // The ast version is called directly with the same text getter.
@@ -1175,7 +1175,7 @@ pub fn try_get_property_access_or_identifier_to_string(expr: Node) -> String {
 }
 
 impl Checker {
-    // Go: checker/utilities.go:1555 allDeclarationsInSameSourceFile
+    // Go: checker/utilities.go:1633 allDeclarationsInSameSourceFile
     pub fn all_declarations_in_same_source_file(&self, symbol: SymbolId) -> bool {
         let declarations = &self.sym(symbol).declarations;
         if declarations.len() > 1 {
@@ -1191,7 +1191,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/utilities.go:1569 containsNonMissingUndefinedType
+    // Go: checker/utilities.go:1647 containsNonMissingUndefinedType
     pub fn contains_non_missing_undefined_type(&self, t: TypeId) -> bool {
         let candidate = if self.ty(t).flags.intersects(TypeFlags::UNION) {
             self.ty(t).types()[0]
@@ -1202,7 +1202,7 @@ impl Checker {
     }
 }
 
-// Go: checker/utilities.go:1579 getAnyImportSyntax
+// Go: checker/utilities.go:1657 getAnyImportSyntax
 pub fn get_any_import_syntax(node: Node) -> Node {
     let import_node = match node.kind() {
         SyntaxKind::ImportEqualsDeclaration => node,
@@ -1214,7 +1214,7 @@ pub fn get_any_import_syntax(node: Node) -> Node {
     import_node
 }
 
-// Go: checker/utilities.go:1599 isReservedMemberName
+// Go: checker/utilities.go:1677 isReservedMemberName
 // A reserved member name consists of the byte 0xFE (which is an invalid UTF-8 encoding) followed by one or more
 // characters where the first character is not '@' or '#'. The '@' character indicates that the name is denoted by
 // a well known ES Symbol instance and the '#' character indicates that the name is a PrivateIdentifier.
@@ -1228,7 +1228,7 @@ pub fn is_reserved_member_name(name: &str) -> bool {
     }
 }
 
-// Go: checker/utilities.go:1603 introducesArgumentsExoticObject
+// Go: checker/utilities.go:1681 introducesArgumentsExoticObject
 pub fn introduces_arguments_exotic_object(node: Node) -> bool {
     matches!(
         node.kind(),
@@ -1243,7 +1243,7 @@ pub fn introduces_arguments_exotic_object(node: Node) -> bool {
 }
 
 impl Checker {
-    // Go: checker/utilities.go:1612 symbolsToArray
+    // Go: checker/utilities.go:1690 symbolsToArray
     // PORT: Go ranges over a map (random order). The port returns the
     // symbols in table insertion order.
     pub fn symbols_to_array(&self, symbols: SymbolTable) -> Vec<SymbolId> {
@@ -1256,7 +1256,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/utilities.go:1622 SkipAlias
+    // Go: checker/utilities.go:1700 SkipAlias
     pub fn skip_alias(&mut self, symbol: SymbolId) -> SymbolId {
         if self.sym(symbol).flags.intersects(SymbolFlags::ALIAS) {
             return self.get_aliased_symbol(symbol);
@@ -1264,25 +1264,25 @@ impl Checker {
         symbol
     }
 
-    // Go: checker/utilities.go:1630 IsExternalModuleSymbol
+    // Go: checker/utilities.go:1708 IsExternalModuleSymbol
     // True if the symbol is for an external module, as opposed to a namespace.
     pub fn is_external_module_symbol(&self, module_symbol: SymbolId) -> bool {
         self.sym(module_symbol).is_external_module()
     }
 
-    // Go: checker/utilities.go:1635 isCanceled
+    // Go: checker/utilities.go:1712 isCanceled
     pub fn is_canceled(&self) -> bool {
         self.ctx.as_ref().is_some_and(|ctx| ctx.err().is_some())
     }
 
-    // Go: checker/utilities.go:1639 checkNotCanceled
+    // Go: checker/utilities.go:1716 checkNotCanceled
     pub fn check_not_canceled(&self) {
         if self.was_canceled {
             panic!("Checker was previously cancelled");
         }
     }
 
-    // Go: checker/utilities.go:1645 getPackagesMap
+    // Go: checker/utilities.go:1722 getPackagesMap
     // PORT: the Go field is a nil-able map. The Rust field is a plain
     // `FxHashMap`, so an empty map means "not computed yet". An empty computed
     // map is recomputed to the same empty result, so behavior is the same.
@@ -1293,20 +1293,20 @@ impl Checker {
         &self.packages_map
     }
 
-    // Go: checker/utilities.go:1660 typesPackageExists
+    // Go: checker/utilities.go:1737 typesPackageExists
     pub fn types_package_exists(&mut self, package_name: &str) -> bool {
         let packages_map = self.get_packages_map();
         packages_map.contains_key(&tspath_up2::get_types_package_name(package_name))
     }
 
-    // Go: checker/utilities.go:1666 packageBundlesTypes
+    // Go: checker/utilities.go:1743 packageBundlesTypes
     pub fn package_bundles_types(&mut self, package_name: &str) -> bool {
         let packages_map = self.get_packages_map();
         packages_map.get(package_name).copied().unwrap_or(false)
     }
 }
 
-// Go: checker/utilities.go:1672 ValueToString
+// Go: checker/utilities.go:1749 ValueToString
 // PORT: Go takes `any` and panics on other types. `LiteralValue` is closed
 // over the four handled types, so the panic case cannot happen.
 pub fn value_to_string(value: &LiteralValue) -> String {
@@ -1320,7 +1320,7 @@ pub fn value_to_string(value: &LiteralValue) -> String {
     }
 }
 
-// Go: checker/utilities.go:1686 nodeStartsNewLexicalEnvironment
+// Go: checker/utilities.go:1763 nodeStartsNewLexicalEnvironment
 pub fn node_starts_new_lexical_environment(node: Node) -> bool {
     matches!(
         node.kind(),
@@ -1337,7 +1337,7 @@ pub fn node_starts_new_lexical_environment(node: Node) -> bool {
 }
 
 impl Checker {
-    // Go: checker/utilities.go:1700 isUncheckedJSSuggestion
+    // Go: checker/utilities.go:1777 isUncheckedJSSuggestion
     // Determines whether a did-you-mean error should be a suggestion in an unchecked JS file.
     // Only applies to unchecked JS files without checkJS, // @ts-check or // @ts-nocheck
     // It does not suggest when the suggestion:
@@ -1388,7 +1388,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/utilities.go:1730 isJSLiteralType
+    // Go: checker/utilities.go:1807 isJSLiteralType
     // Returns if a type is or consists of a JSLiteral object type
     // In addition to objects which are directly literals,
     // * unions where every element is a jsliteral
@@ -1420,7 +1420,7 @@ impl Checker {
     }
 }
 
-// Go: checker/utilities.go:1753 DiagnosticDetails
+// Go: checker/utilities.go:1830 DiagnosticDetails
 // DiagnosticDetails holds a resolved diagnostic message and its arguments,
 // used for sharing diagnostic chain computation between the checker and incremental builder.
 // PORT: Go `Args []any` holds only strings here, so the port uses
@@ -1431,7 +1431,7 @@ pub struct DiagnosticDetails {
     pub args: Vec<String>,
 }
 
-// Go: checker/utilities.go:1762 CreateModuleNotFoundChain
+// Go: checker/utilities.go:1839 CreateModuleNotFoundChain
 // CreateModuleNotFoundChain computes the diagnostic message and arguments for a module-not-found
 // error chain entry. This is shared between the checker (initial diagnostic creation) and the
 // incremental builder (repopulation of cached diagnostics).
@@ -1488,7 +1488,7 @@ pub fn create_module_not_found_chain(
     }
 }
 
-// Go: checker/utilities.go:1798 CreateModeMismatchDetails
+// Go: checker/utilities.go:1875 CreateModeMismatchDetails
 // CreateModeMismatchDetails computes the diagnostic message and arguments for a mode-mismatch
 // error chain entry. This is shared between the checker (initial diagnostic creation) and the
 // incremental builder (repopulation of cached diagnostics).
@@ -1532,7 +1532,7 @@ pub fn create_mode_mismatch_details(_program: &GoProgram, file: Node) -> Diagnos
     }
 }
 
-// Go: checker/utilities.go:1829 walkUpOuterExpressions
+// Go: checker/utilities.go:1906 walkUpOuterExpressions
 pub fn walk_up_outer_expressions(node: Node) -> Node {
     let mut parent = node.parent();
     while parent.is_some() && is_outer_expression(parent, OuterExpressionKinds::OEK_ALL) {
@@ -1541,7 +1541,7 @@ pub fn walk_up_outer_expressions(node: Node) -> Node {
     parent
 }
 
-// Go: checker/utilities.go:1837 GetSetAccessorValueParameter
+// Go: checker/utilities.go:1914 GetSetAccessorValueParameter
 pub fn get_set_accessor_value_parameter(accessor: Node) -> Node {
     let parameters = accessor.parameters();
     if !parameters.is_empty() {
@@ -1585,12 +1585,12 @@ mod tspath_up2 {
         EXTENSION_JSON,
     ];
 
-    // Go: tspath/path.go:1045 FileExtensionIs
+    // Go: tspath/path.go:1095 FileExtensionIs
     fn file_extension_is(path: &str, extension: &str) -> bool {
         path.len() > extension.len() && path.ends_with(extension)
     }
 
-    // Go: tspath/extension.go:56 TryGetExtensionFromPath
+    // Go: tspath/extension.go:66 TryGetExtensionFromPath
     pub fn try_get_extension_from_path(p: &str) -> &'static str {
         for ext in EXTENSIONS_TO_REMOVE {
             if file_extension_is(p, ext) {

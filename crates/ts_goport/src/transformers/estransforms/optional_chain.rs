@@ -97,7 +97,7 @@ impl OptionalChainTransformer {
         f.update_parenthesized_expression(node, expr)
     }
 
-    // Go: transformers/estransforms/optionalchain.go:71 optionalChainTransformer.visitPropertyOrElementAccessExpression
+    // Go: transformers/estransforms/optionalchain.go:70 optionalChainTransformer.visitPropertyOrElementAccessExpression
     fn visit_property_or_element_access_expression(
         &mut self,
         node: Node,
@@ -152,7 +152,7 @@ impl OptionalChainTransformer {
         expression
     }
 
-    // Go: transformers/estransforms/optionalchain.go:106 optionalChainTransformer.visitDeleteExpression
+    // Go: transformers/estransforms/optionalchain.go:105 optionalChainTransformer.visitDeleteExpression
     fn visit_delete_expression(&mut self, node: Node) -> Node {
         let unwrapped = skip_parentheses(node.expression());
         if unwrapped.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
@@ -161,7 +161,7 @@ impl OptionalChainTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/optionalchain.go:114 optionalChainTransformer.visitNonOptionalExpression
+    // Go: transformers/estransforms/optionalchain.go:113 optionalChainTransformer.visitNonOptionalExpression
     fn visit_non_optional_expression(
         &mut self,
         node: Node,
@@ -180,7 +180,7 @@ impl OptionalChainTransformer {
         }
     }
 
-    // Go: transformers/estransforms/optionalchain.go:153 optionalChainTransformer.visitOptionalExpression
+    // Go: transformers/estransforms/optionalchain.go:150 optionalChainTransformer.visitOptionalExpression
     fn visit_optional_expression(
         &mut self,
         node: Node,
@@ -303,12 +303,12 @@ impl OptionalChainTransformer {
     }
 }
 
-// Go: transformers/estransforms/optionalchain.go:132 isNonNullChain
+// Go: transformers/estransforms/optionalchain.go:131 isNonNullChain
 fn is_non_null_chain(node: Node) -> bool {
     is_non_null_expression(node) && node.flags().intersects(NodeFlags::OPTIONAL_CHAIN)
 }
 
-// Go: transformers/estransforms/optionalchain.go:136 flattenChain
+// Go: transformers/estransforms/optionalchain.go:135 flattenChain
 /// Returns Go `flattenResult{expression, chain}`.
 fn flatten_chain(mut chain: Node) -> (Node, Vec<Node>) {
     go_assert!(!is_non_null_chain(chain));
@@ -321,7 +321,7 @@ fn flatten_chain(mut chain: Node) -> (Node, Vec<Node>) {
     (chain.expression(), links)
 }
 
-// Go: transformers/estransforms/optionalchain.go:147 isCallChain
+// Go: transformers/estransforms/optionalchain.go:146 isCallChain
 fn is_call_chain(node: Node) -> bool {
     is_call_expression(node) && node.flags().intersects(NodeFlags::OPTIONAL_CHAIN)
 }

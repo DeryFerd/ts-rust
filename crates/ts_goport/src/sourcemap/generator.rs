@@ -16,7 +16,7 @@ const NAME_INDEX_NOT_SET: NameIndex = -1;
 const NOT_SET: i32 = -1;
 const NOT_SET_UTF16: i32 = -1;
 
-// Go: sourcemap/generator.go:25 Generator
+// Go: sourcemap/generator.go:26 Generator
 // PORT: Go `int` lines and `core.UTF16Offset` characters are `i32`, like the
 // printer writer. Go `[]*string` sources content is `Vec<Option<String>>`.
 #[derive(Debug, Default)]
@@ -185,7 +185,7 @@ fn append_json_string_array(out: &mut String, values: &[String]) {
     out.push(']');
 }
 
-// Go: sourcemap/generator.go:65 NewGenerator
+// Go: sourcemap/generator.go:66 NewGenerator
 #[must_use]
 pub fn new_generator(
     file: &str,
@@ -208,13 +208,13 @@ pub fn new_generator(
 const MAPPINGS_INITIAL_CAPACITY: usize = 1024;
 
 impl Generator {
-    // Go: sourcemap/generator.go:74 Sources
+    // Go: sourcemap/generator.go:75 Sources
     #[must_use]
     pub fn sources(&self) -> Vec<String> {
         self.raw_sources.clone()
     }
 
-    // Go: sourcemap/generator.go:77 AddSource
+    // Go: sourcemap/generator.go:78 AddSource
     // Adds a source to the source map
     pub fn add_source(&mut self, file_name: &str) -> SourceIndex {
         let source = get_relative_path_to_directory_or_url(
@@ -234,7 +234,7 @@ impl Generator {
         source_index
     }
 
-    // Go: sourcemap/generator.go:99 SetSourceContent
+    // Go: sourcemap/generator.go:101 SetSourceContent
     // Sets the content for a source
     pub fn set_source_content(
         &mut self,
@@ -251,7 +251,7 @@ impl Generator {
         Ok(())
     }
 
-    // Go: sourcemap/generator.go:111 AddName
+    // Go: sourcemap/generator.go:113 AddName
     // Declares a name in the source map, returning the index of the name
     pub fn add_name(&mut self, name: &str) -> NameIndex {
         if let Some(&name_index) = self.name_to_name_index_map.get(name) {
@@ -264,14 +264,14 @@ impl Generator {
         name_index
     }
 
-    // Go: sourcemap/generator.go:124 isNewGeneratedPosition
+    // Go: sourcemap/generator.go:126 isNewGeneratedPosition
     fn is_new_generated_position(&self, generated_line: i32, generated_character: i32) -> bool {
         !self.has_pending
             || self.pending_generated_line != generated_line
             || self.pending_generated_character != generated_character
     }
 
-    // Go: sourcemap/generator.go:130 isBacktrackingSourcePosition
+    // Go: sourcemap/generator.go:132 isBacktrackingSourcePosition
     fn is_backtracking_source_position(
         &self,
         source_index: SourceIndex,
@@ -287,7 +287,7 @@ impl Generator {
                     && self.pending_source_character > source_character)
     }
 
-    // Go: sourcemap/generator.go:139 shouldCommitMapping
+    // Go: sourcemap/generator.go:141 shouldCommitMapping
     fn should_commit_mapping(&self) -> bool {
         self.has_pending
             && (!self.has_last
@@ -299,7 +299,7 @@ impl Generator {
                 || self.last_name_index != self.pending_name_index)
     }
 
-    // Go: sourcemap/generator.go:149 appendMappingCharCode
+    // Go: sourcemap/generator.go:151 appendMappingCharCode
     // PORT: takes an ASCII byte. The `& 0x7F` changes no caller's value; it
     // tells the compiler the char is ASCII, so `push` writes one byte.
     fn append_mapping_char_code(&mut self, char_code: u8) {
@@ -307,7 +307,7 @@ impl Generator {
         self.mappings.push(char::from(char_code & 0x7F));
     }
 
-    // Go: sourcemap/generator.go:153 appendBase64VLQ
+    // Go: sourcemap/generator.go:155 appendBase64VLQ
     fn append_base64_vlq(&mut self, in_value: i32) {
         // Add a new least significant bit that has the sign of the value.
         // if negative number the least significant bit that gets added to the number has value 1
@@ -337,7 +337,7 @@ impl Generator {
         }
     }
 
-    // Go: sourcemap/generator.go:180 commitPendingMapping
+    // Go: sourcemap/generator.go:182 commitPendingMapping
     fn commit_pending_mapping(&mut self) {
         if !self.should_commit_mapping() {
             return;
@@ -393,7 +393,7 @@ impl Generator {
         self.has_last = true;
     }
 
-    // Go: sourcemap/generator.go:231 addMapping
+    // Go: sourcemap/generator.go:237 addMapping
     fn add_mapping(
         &mut self,
         generated_line: i32,
@@ -429,7 +429,7 @@ impl Generator {
         }
     }
 
-    // Go: sourcemap/generator.go:256 AddGeneratedMapping
+    // Go: sourcemap/generator.go:261 AddGeneratedMapping
     // Adds a mapping without source information
     pub fn add_generated_mapping(
         &mut self,
@@ -455,7 +455,7 @@ impl Generator {
         Ok(())
     }
 
-    // Go: sourcemap/generator.go:268 AddSourceMapping
+    // Go: sourcemap/generator.go:275 AddSourceMapping
     // Adds a mapping with source information
     pub fn add_source_mapping(
         &mut self,
@@ -497,7 +497,7 @@ impl Generator {
         Ok(())
     }
 
-    // Go: sourcemap/generator.go:290 AddNamedSourceMapping
+    // Go: sourcemap/generator.go:299 AddNamedSourceMapping
     // Adds a mapping with source and name information
     pub fn add_named_source_mapping(
         &mut self,
@@ -563,7 +563,7 @@ impl Generator {
         }
     }
 
-    // Go: sourcemap/generator.go:337 bytes
+    // Go: sourcemap/generator.go:347 bytes
     // PORT: Go marshals the cloned `RawSourceMap()`. This writes the same
     // JSON from the fields in place, after the same commit.
     fn bytes(&mut self) -> String {
@@ -585,13 +585,13 @@ impl Generator {
         .write(append_vlq_quote)
     }
 
-    // Go: sourcemap/generator.go:346 String
+    // Go: sourcemap/generator.go:356 String
     // Gets the string representation of the source map
     pub fn string(&mut self) -> String {
         self.bytes()
     }
 
-    // Go: sourcemap/generator.go:350 Base64DataURL
+    // Go: sourcemap/generator.go:360 Base64DataURL
     pub fn base64_data_url(&mut self) -> String {
         const PREFIX: &str = "data:application/json;base64,";
         let data = self.bytes();
@@ -632,7 +632,7 @@ fn base64_std_encode(out: &mut String, data: &[u8]) {
     }
 }
 
-// Go: sourcemap/generator.go:363 base64FormatEncode
+// Go: sourcemap/generator.go:372 base64FormatEncode
 // PORT: a table lookup that returns the ASCII byte. A value past 63 panics
 // on the index, as Go panics.
 fn base64_format_encode(value: usize) -> u8 {

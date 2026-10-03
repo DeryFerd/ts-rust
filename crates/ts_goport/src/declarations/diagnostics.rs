@@ -510,7 +510,7 @@ fn get_parameter_declaration_type_visibility_diagnostic_message(
     }
 }
 
-// Go: transformers/declarations/diagnostics.go:435 getTypeParameterConstraintVisibilityDiagnosticMessage
+// Go: transformers/declarations/diagnostics.go:436 getTypeParameterConstraintVisibilityDiagnosticMessage
 fn get_type_parameter_constraint_visibility_diagnostic_message(
     node: Node,
     _r: &SymbolAccessibilityResult,
@@ -546,7 +546,7 @@ fn get_type_parameter_constraint_visibility_diagnostic_message(
     })
 }
 
-// Go: transformers/declarations/diagnostics.go:470 getRelatedSuggestionByDeclarationKind
+// Go: transformers/declarations/diagnostics.go:471 getRelatedSuggestionByDeclarationKind
 fn get_related_suggestion_by_declaration_kind(kind: SyntaxKind) -> Option<&'static Message> {
     Some(match kind {
         SyntaxKind::ArrowFunction => diag::Add_a_return_type_to_the_function_expression,
@@ -567,7 +567,7 @@ fn get_related_suggestion_by_declaration_kind(kind: SyntaxKind) -> Option<&'stat
     })
 }
 
-// Go: transformers/declarations/diagnostics.go:501 getErrorByDeclarationKind
+// Go: transformers/declarations/diagnostics.go:502 getErrorByDeclarationKind
 fn get_error_by_declaration_kind(kind: SyntaxKind) -> Option<&'static Message> {
     Some(match kind {
         SyntaxKind::FunctionExpression | SyntaxKind::FunctionDeclaration | SyntaxKind::ArrowFunction => {
@@ -598,7 +598,7 @@ fn get_error_by_declaration_kind(kind: SyntaxKind) -> Option<&'static Message> {
     })
 }
 
-// Go: transformers/declarations/diagnostics.go:542 isDeclarationEnoughForErrors
+// Go: transformers/declarations/diagnostics.go:543 isDeclarationEnoughForErrors
 fn is_declaration_enough_for_errors(node: Node) -> bool {
     is_export_assignment(node)
         || is_statement(node)
@@ -607,12 +607,12 @@ fn is_declaration_enough_for_errors(node: Node) -> bool {
         || is_parameter_declaration(node)
 }
 
-// Go: transformers/declarations/diagnostics.go:546 isFunctionLikeAndNotConstructor
+// Go: transformers/declarations/diagnostics.go:547 isFunctionLikeAndNotConstructor
 fn is_function_like_and_not_constructor(node: Node) -> bool {
     is_function_like_declaration(node) && !is_constructor_declaration(node)
 }
 
-// Go: transformers/declarations/diagnostics.go:550 findNearestDeclaration
+// Go: transformers/declarations/diagnostics.go:551 findNearestDeclaration
 fn find_nearest_declaration(node: Node) -> Node {
     let result = find_ancestor(node, is_declaration_enough_for_errors);
     if result.is_nil() {
@@ -638,7 +638,7 @@ fn message(message: Option<&'static Message>) -> &'static Message {
     message.expect("nil diagnostic message")
 }
 
-// Go: transformers/declarations/diagnostics.go:567 createEntityInTypeNodeError
+// Go: transformers/declarations/diagnostics.go:568 createEntityInTypeNodeError
 fn create_entity_in_type_node_error(node: Node) -> Diagnostic {
     let mut diag = create_diagnostic_for_node(
         node,
@@ -649,7 +649,7 @@ fn create_entity_in_type_node_error(node: Node) -> Diagnostic {
     diag
 }
 
-// Go: transformers/declarations/diagnostics.go:573 addParentDeclarationRelatedInfo
+// Go: transformers/declarations/diagnostics.go:574 addParentDeclarationRelatedInfo
 fn add_parent_declaration_related_info(node: Node, diag: &mut Diagnostic) {
     let parent_declaration = find_nearest_declaration(node);
     if parent_declaration.is_nil() {
@@ -668,7 +668,7 @@ fn add_parent_declaration_related_info(node: Node, diag: &mut Diagnostic) {
     )));
 }
 
-// Go: transformers/declarations/diagnostics.go:585 createAccessorTypeError
+// Go: transformers/declarations/diagnostics.go:586 createAccessorTypeError
 // PORT: Go reads `node.Symbol().Declarations`. The declarations module has no
 // checker, so it reads the binder symbol from the program's binder symbols
 // (`program::bound_symbols`).
@@ -715,7 +715,7 @@ pub(crate) fn bound_symbol_declarations(symbol: SymbolId) -> Vec<Node> {
         .to_vec()
 }
 
-// Go: transformers/declarations/diagnostics.go:603 createObjectLiteralError
+// Go: transformers/declarations/diagnostics.go:604 createObjectLiteralError
 fn create_object_literal_error(node: Node) -> Diagnostic {
     let mut diag = create_diagnostic_for_node(
         node,
@@ -726,7 +726,7 @@ fn create_object_literal_error(node: Node) -> Diagnostic {
     diag
 }
 
-// Go: transformers/declarations/diagnostics.go:609 createArrayLiteralError
+// Go: transformers/declarations/diagnostics.go:610 createArrayLiteralError
 fn create_array_literal_error(node: Node) -> Diagnostic {
     let mut diag = create_diagnostic_for_node(
         node,
@@ -737,7 +737,7 @@ fn create_array_literal_error(node: Node) -> Diagnostic {
     diag
 }
 
-// Go: transformers/declarations/diagnostics.go:615 createReturnTypeError
+// Go: transformers/declarations/diagnostics.go:616 createReturnTypeError
 fn create_return_type_error(node: Node) -> Diagnostic {
     let mut diag = create_diagnostic_for_node(
         node,
@@ -753,7 +753,7 @@ fn create_return_type_error(node: Node) -> Diagnostic {
     diag
 }
 
-// Go: transformers/declarations/diagnostics.go:622 createBindingElementError
+// Go: transformers/declarations/diagnostics.go:623 createBindingElementError
 fn create_binding_element_error(node: Node) -> Diagnostic {
     create_diagnostic_for_node(
         node,
@@ -762,7 +762,7 @@ fn create_binding_element_error(node: Node) -> Diagnostic {
     )
 }
 
-// Go: transformers/declarations/diagnostics.go:626 createVariableOrPropertyError
+// Go: transformers/declarations/diagnostics.go:627 createVariableOrPropertyError
 fn create_variable_or_property_error(node: Node) -> Diagnostic {
     let mut diag = create_diagnostic_for_node(
         node,
@@ -777,12 +777,12 @@ fn create_variable_or_property_error(node: Node) -> Diagnostic {
     diag
 }
 
-// Go: transformers/declarations/diagnostics.go:632 createExpressionError
+// Go: transformers/declarations/diagnostics.go:633 createExpressionError
 fn create_expression_error(node: Node) -> Diagnostic {
     create_expression_error_ex(node, None)
 }
 
-// Go: transformers/declarations/diagnostics.go:636 createClassExpressionError
+// Go: transformers/declarations/diagnostics.go:637 createClassExpressionError
 fn create_class_expression_error(node: Node) -> Diagnostic {
     create_expression_error_ex(
         node,
@@ -790,7 +790,7 @@ fn create_class_expression_error(node: Node) -> Diagnostic {
     )
 }
 
-// Go: transformers/declarations/diagnostics.go:640 isParentForIDDIagnostic
+// Go: transformers/declarations/diagnostics.go:641 isParentForIDDIagnostic
 fn is_parent_for_idd_iagnostic(node: Node) -> FindAncestorResult {
     if is_export_assignment(node) {
         return FindAncestorResult::FIND_ANCESTOR_TRUE;
@@ -801,7 +801,7 @@ fn is_parent_for_idd_iagnostic(node: Node) -> FindAncestorResult {
     to_find_ancestor_result(!is_parenthesized_expression(node) && !is_assertion_expression(node))
 }
 
-// Go: transformers/declarations/diagnostics.go:650 createExpressionErrorEx
+// Go: transformers/declarations/diagnostics.go:651 createExpressionErrorEx
 fn create_expression_error_ex(
     node: Node,
     mut diagnostic_message: Option<&'static Message>,
@@ -856,7 +856,7 @@ fn create_expression_error_ex(
 /// (inside a node builder call), or `None` when no checker is lent out.
 pub type GetIsolatedDeclarationError = Box<dyn Fn(Option<&mut Checker>, Node) -> Diagnostic>;
 
-// Go: transformers/declarations/diagnostics.go:682 createGetIsolatedDeclarationErrors
+// Go: transformers/declarations/diagnostics.go:683 createGetIsolatedDeclarationErrors
 pub fn create_get_isolated_declaration_errors(
     resolver: Rc<dyn EmitResolver>,
 ) -> GetIsolatedDeclarationError {
@@ -938,7 +938,7 @@ pub fn create_get_isolated_declaration_errors(
     })
 }
 
-// Go: transformers/declarations/tracker.go:207 createDiagnosticForNode
+// Go: transformers/declarations/tracker.go:235 createDiagnosticForNode
 pub(crate) fn create_diagnostic_for_node(
     node: Node,
     message: &'static Message,

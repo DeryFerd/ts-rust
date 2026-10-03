@@ -79,7 +79,7 @@ impl Iterator for EffectiveArgsIter<'_> {
 impl ExactSizeIterator for EffectiveArgsIter<'_> {}
 
 impl Checker {
-    // Go: checker/checker.go:29672 getContextualTypeForObjectLiteralElement
+    // Go: checker/checker.go:30404 getContextualTypeForObjectLiteralElement
     pub fn get_contextual_type_for_object_literal_element(
         &mut self,
         element: Node,
@@ -137,7 +137,7 @@ impl Checker {
     // In an object literal contextually typed by a type T, the contextual type of a property assignment is the type of
     // the matching property in T, if one exists. Otherwise, it is the type of the numeric index signature in T, if one
     // exists. Otherwise, it is the type of the string index signature in T, if one exists.
-    // Go: checker/checker.go:29716 getContextualTypeForObjectLiteralMethod
+    // Go: checker/checker.go:30448 getContextualTypeForObjectLiteralMethod
     pub fn get_contextual_type_for_object_literal_method(
         &mut self,
         node: Node,
@@ -150,7 +150,7 @@ impl Checker {
         self.get_contextual_type_for_object_literal_element(node, context_flags)
     }
 
-    // Go: checker/checker.go:29724 getContextualTypeForElementExpression
+    // Go: checker/checker.go:30456 getContextualTypeForElementExpression
     pub fn get_contextual_type_for_element_expression(
         &mut self,
         t: TypeId,
@@ -238,7 +238,7 @@ impl Checker {
     }
 
     // In a contextually typed conditional expression, the true/false expressions are contextually typed by the same type.
-    // Go: checker/checker.go:29774 getContextualTypeForConditionalOperand
+    // Go: checker/checker.go:30506 getContextualTypeForConditionalOperand
     pub fn get_contextual_type_for_conditional_operand(
         &mut self,
         node: Node,
@@ -251,7 +251,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29782 getContextualTypeForSubstitutionExpression
+    // Go: checker/checker.go:30514 getContextualTypeForSubstitutionExpression
     pub fn get_contextual_type_for_substitution_expression(
         &mut self,
         template: Node,
@@ -264,7 +264,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:29789 getContextualImportAttributeType
+    // Go: checker/checker.go:30521 getContextualImportAttributeType
     pub fn get_contextual_import_attribute_type(&mut self, node: Node) -> TypeId {
         let get_global_import_attributes_type = self.get_global_import_attributes_type.clone();
         let import_attributes_type = get_global_import_attributes_type(self);
@@ -272,7 +272,7 @@ impl Checker {
     }
 
     // Returns the effective arguments for an expression that works like a function invocation.
-    // Go: checker/checker.go:29794 getEffectiveCallArguments
+    // Go: checker/checker.go:30526 getEffectiveCallArguments
     pub fn get_effective_call_arguments(&mut self, node: Node) -> EffectiveArgs {
         if is_jsx_opening_fragment(node) {
             // This attributes Type does not include a children property yet, the same way a fragment created with <React.Fragment> does not at this stage
@@ -363,7 +363,7 @@ impl Checker {
         EffectiveArgs::Slice(args)
     }
 
-    // Go: checker/checker.go:29860 getSpreadArgumentIndex
+    // Go: checker/checker.go:30592 getSpreadArgumentIndex
     pub fn get_spread_argument_index(&self, args: &[Node]) -> i32 {
         match args.iter().position(|&arg| is_spread_argument(arg)) {
             Some(i) => i as i32,
@@ -372,13 +372,13 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:29864 isSpreadArgument
+// Go: checker/checker.go:30596 isSpreadArgument
 pub fn is_spread_argument(arg: Node) -> bool {
     is_spread_element(arg) || is_synthetic_expression(arg) && arg.is_spread()
 }
 
 impl Checker {
-    // Go: checker/checker.go:29868 createSyntheticExpression
+    // Go: checker/checker.go:30600 createSyntheticExpression
     pub fn create_synthetic_expression(
         &mut self,
         parent: Node,
@@ -394,7 +394,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:29875 getSpreadIndices
+    // Go: checker/checker.go:30607 getSpreadIndices
     pub fn get_spread_indices(&mut self, node: Node) -> (i32, i32) {
         if !self.array_literal_links.get(node).indices_computed {
             let (mut first, mut last) = (-1i32, -1i32);
@@ -416,7 +416,7 @@ impl Checker {
     }
 
     // Returns the synthetic argument list for a decorator invocation.
-    // Go: checker/checker.go:29894 getEffectiveDecoratorArguments
+    // Go: checker/checker.go:30626 getEffectiveDecoratorArguments
     pub fn get_effective_decorator_arguments(&mut self, node: Node) -> Vec<Node> {
         let expr = node.expression();
         let signature = self.get_decorator_call_signature(node);
@@ -432,7 +432,7 @@ impl Checker {
         panic!("Decorator signature not found")
     }
 
-    // Go: checker/checker.go:29907 getDecoratorCallSignature
+    // Go: checker/checker.go:30639 getDecoratorCallSignature
     pub fn get_decorator_call_signature(&mut self, decorator: Node) -> SignatureId {
         if self.legacy_decorators {
             return self.get_legacy_decorator_call_signature(decorator);
@@ -440,7 +440,7 @@ impl Checker {
         self.get_es_decorator_call_signature(decorator)
     }
 
-    // Go: checker/checker.go:29914 getLegacyDecoratorCallSignature
+    // Go: checker/checker.go:30646 getLegacyDecoratorCallSignature
     pub fn get_legacy_decorator_call_signature(&mut self, decorator: Node) -> SignatureId {
         let node = decorator.parent();
         if self.signature_links.get(node).decorator_signature.is_nil() {
@@ -562,7 +562,7 @@ impl Checker {
         decorator_signature
     }
 
-    // Go: checker/checker.go:29981 getESDecoratorCallSignature
+    // Go: checker/checker.go:30713 getESDecoratorCallSignature
     pub fn get_es_decorator_call_signature(&mut self, decorator: Node) -> SignatureId {
         // We are considering a future change that would allow the type of a decorator to affect the type of the
         // class and its members, such as a `@Stringify` decorator changing the type of a `number` field to `string`, or
@@ -768,14 +768,14 @@ impl Checker {
         decorator_signature
     }
 
-    // Go: checker/checker.go:30159 newClassDecoratorContextType
+    // Go: checker/checker.go:30891 newClassDecoratorContextType
     pub fn new_class_decorator_context_type(&mut self, class_type: TypeId) -> TypeId {
         let f = self.get_global_class_decorator_context_type.clone();
         let target = f(self);
         self.try_create_type_reference(target, &[class_type])
     }
 
-    // Go: checker/checker.go:30163 newClassMethodDecoratorContextType
+    // Go: checker/checker.go:30895 newClassMethodDecoratorContextType
     pub fn new_class_method_decorator_context_type(
         &mut self,
         class_type: TypeId,
@@ -786,7 +786,7 @@ impl Checker {
         self.try_create_type_reference(target, &[class_type, value_type])
     }
 
-    // Go: checker/checker.go:30167 newClassGetterDecoratorContextType
+    // Go: checker/checker.go:30899 newClassGetterDecoratorContextType
     pub fn new_class_getter_decorator_context_type(
         &mut self,
         class_type: TypeId,
@@ -797,7 +797,7 @@ impl Checker {
         self.try_create_type_reference(target, &[class_type, value_type])
     }
 
-    // Go: checker/checker.go:30171 newClassSetterDecoratorContextType
+    // Go: checker/checker.go:30903 newClassSetterDecoratorContextType
     pub fn new_class_setter_decorator_context_type(
         &mut self,
         class_type: TypeId,
@@ -808,7 +808,7 @@ impl Checker {
         self.try_create_type_reference(target, &[class_type, value_type])
     }
 
-    // Go: checker/checker.go:30175 newClassAccessorDecoratorContextType
+    // Go: checker/checker.go:30907 newClassAccessorDecoratorContextType
     pub fn new_class_accessor_decorator_context_type(
         &mut self,
         this_type: TypeId,
@@ -821,7 +821,7 @@ impl Checker {
         self.try_create_type_reference(target, &[this_type, value_type])
     }
 
-    // Go: checker/checker.go:30179 newClassFieldDecoratorContextType
+    // Go: checker/checker.go:30911 newClassFieldDecoratorContextType
     pub fn new_class_field_decorator_context_type(
         &mut self,
         this_type: TypeId,
@@ -834,7 +834,7 @@ impl Checker {
 
     // Gets a type like `{ name: "foo", private: false, static: true }` that is used to provided member-specific
     // details that will be intersected with a decorator context type.
-    // Go: checker/checker.go:30185 getClassMemberDecoratorContextOverrideType
+    // Go: checker/checker.go:30917 getClassMemberDecoratorContextOverrideType
     pub fn get_class_member_decorator_context_override_type(
         &mut self,
         name_type: TypeId,
@@ -883,7 +883,7 @@ impl Checker {
         override_type
     }
 
-    // Go: checker/checker.go:30204 newClassMemberDecoratorContextTypeForNode
+    // Go: checker/checker.go:30936 newClassMemberDecoratorContextTypeForNode
     pub fn new_class_member_decorator_context_type_for_node(
         &mut self,
         node: Node,
@@ -915,7 +915,7 @@ impl Checker {
         self.get_intersection_type(&[context_type, override_type])
     }
 
-    // Go: checker/checker.go:30232 newClassAccessorDecoratorTargetType
+    // Go: checker/checker.go:30964 newClassAccessorDecoratorTargetType
     pub fn new_class_accessor_decorator_target_type(
         &mut self,
         this_type: TypeId,
@@ -926,7 +926,7 @@ impl Checker {
         self.try_create_type_reference(target, &[this_type, value_type])
     }
 
-    // Go: checker/checker.go:30236 newClassAccessorDecoratorResultType
+    // Go: checker/checker.go:30968 newClassAccessorDecoratorResultType
     pub fn new_class_accessor_decorator_result_type(
         &mut self,
         this_type: TypeId,
@@ -937,7 +937,7 @@ impl Checker {
         self.try_create_type_reference(target, &[this_type, value_type])
     }
 
-    // Go: checker/checker.go:30240 newClassFieldDecoratorInitializerMutatorType
+    // Go: checker/checker.go:30972 newClassFieldDecoratorInitializerMutatorType
     pub fn new_class_field_decorator_initializer_mutator_type(
         &mut self,
         this_type: TypeId,
@@ -950,7 +950,7 @@ impl Checker {
 
     // Creates a call signature for an ES Decorator. This method is used by the semantics of
     // `getESDecoratorCallSignature`, which you should probably be using instead.
-    // Go: checker/checker.go:30248 newESDecoratorCallSignature
+    // Go: checker/checker.go:30980 newESDecoratorCallSignature
     pub fn new_es_decorator_call_signature(
         &mut self,
         target_type: TypeId,
@@ -970,7 +970,7 @@ impl Checker {
     }
 
     // Creates a synthetic `FunctionType`
-    // Go: checker/checker.go:30256 newFunctionType
+    // Go: checker/checker.go:30988 newFunctionType
     pub fn new_function_type(
         &mut self,
         type_parameters: &[TypeId],
@@ -983,12 +983,12 @@ impl Checker {
         self.get_or_create_type_from_signature(signature)
     }
 
-    // Go: checker/checker.go:30261 newGetterFunctionType
+    // Go: checker/checker.go:30993 newGetterFunctionType
     pub fn new_getter_function_type(&mut self, t: TypeId) -> TypeId {
         self.new_function_type(&[], SymbolId::NIL /*thisParameter*/, &[], t)
     }
 
-    // Go: checker/checker.go:30265 newSetterFunctionType
+    // Go: checker/checker.go:30997 newSetterFunctionType
     pub fn new_setter_function_type(&mut self, t: TypeId) -> TypeId {
         let value_param = self.new_parameter("value", t);
         let void_type = self.void_type;
@@ -1001,7 +1001,7 @@ impl Checker {
     }
 
     // Creates a synthetic `Signature` corresponding to a call signature.
-    // Go: checker/checker.go:30271 newCallSignature
+    // Go: checker/checker.go:31003 newCallSignature
     pub fn new_call_signature(
         &mut self,
         type_parameters: &[TypeId],
@@ -1025,14 +1025,14 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:30276 newTypedPropertyDescriptorType
+    // Go: checker/checker.go:31008 newTypedPropertyDescriptorType
     pub fn new_typed_property_descriptor_type(&mut self, property_type: TypeId) -> TypeId {
         let f = self.get_global_typed_property_descriptor_type.clone();
         let generic_global_type = f(self);
         self.create_type_from_generic_global_type(generic_global_type, &[property_type])
     }
 
-    // Go: checker/checker.go:30280 getParentTypeOfClassElement
+    // Go: checker/checker.go:31012 getParentTypeOfClassElement
     pub fn get_parent_type_of_class_element(&mut self, node: Node) -> TypeId {
         let class_symbol = self.get_symbol_of_node(node.parent());
         if is_static(node) {
@@ -1041,7 +1041,7 @@ impl Checker {
         self.get_declared_type_of_symbol(class_symbol)
     }
 
-    // Go: checker/checker.go:30288 getClassElementPropertyKeyType
+    // Go: checker/checker.go:31020 getClassElementPropertyKeyType
     pub fn get_class_element_property_key_type(&mut self, element: Node) -> TypeId {
         let name = element.name();
         match name.kind() {
@@ -1060,12 +1060,12 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/checker.go:30303 getTypeOfPropertyOfContextualType
+    // Go: checker/checker.go:31035 getTypeOfPropertyOfContextualType
     pub fn get_type_of_property_of_contextual_type(&mut self, t: TypeId, name: &str) -> TypeId {
         self.get_type_of_property_of_contextual_type_ex(t, name, TypeId::NIL)
     }
 
-    // Go: checker/checker.go:30307 getTypeOfPropertyOfContextualTypeEx
+    // Go: checker/checker.go:31039 getTypeOfPropertyOfContextualTypeEx
     pub fn get_type_of_property_of_contextual_type_ex(
         &mut self,
         t: TypeId,
@@ -1149,7 +1149,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:30359 getIndexedMappedTypeSubstitutedTypeOfContextualType
+    // Go: checker/checker.go:31091 getIndexedMappedTypeSubstitutedTypeOfContextualType
     pub fn get_indexed_mapped_type_substituted_type_of_contextual_type(
         &mut self,
         t: TypeId,
@@ -1176,7 +1176,7 @@ impl Checker {
         self.substitute_indexed_mapped_type(t, property_name_type)
     }
 
-    // Go: checker/checker.go:30376 isExcludedMappedPropertyName
+    // Go: checker/checker.go:31108 isExcludedMappedPropertyName
     pub fn is_excluded_mapped_property_name(
         &mut self,
         t: TypeId,
@@ -1214,7 +1214,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:30390 getTypeOfConcretePropertyOfContextualType
+    // Go: checker/checker.go:31122 getTypeOfConcretePropertyOfContextualType
     pub fn get_type_of_concrete_property_of_contextual_type(
         &mut self,
         t: TypeId,
@@ -1229,7 +1229,7 @@ impl Checker {
         self.remove_missing_type(prop_type, is_optional)
     }
 
-    // Go: checker/checker.go:30398 getTypeFromIndexInfosOfContextualType
+    // Go: checker/checker.go:31130 getTypeFromIndexInfosOfContextualType
     pub fn get_type_from_index_infos_of_contextual_type(
         &mut self,
         t: TypeId,
@@ -1264,7 +1264,7 @@ impl Checker {
         self.index_info(index_info).value_type
     }
 
-    // Go: checker/checker.go:30415 isCircularMappedProperty
+    // Go: checker/checker.go:31147 isCircularMappedProperty
     pub fn is_circular_mapped_property(&mut self, symbol: SymbolId) -> bool {
         if self.sym(symbol).check_flags.intersects(CheckFlags::MAPPED) {
             let resolved_type = self.value_symbol_links.get(symbol).resolved_type;
@@ -1277,7 +1277,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:30423 appendContextualPropertyTypeConstituent
+    // Go: checker/checker.go:31155 appendContextualPropertyTypeConstituent
     pub fn append_contextual_property_type_constituent(
         &self,
         mut types: Vec<TypeId>,
@@ -1299,7 +1299,7 @@ impl Checker {
 
     // Return the contextual type for a given expression node. During overload resolution, a contextual type may temporarily
     // be "pushed" onto a node using the contextualType property.
-    // Go: checker/checker.go:30438 getApparentTypeOfContextualType
+    // Go: checker/checker.go:31170 getApparentTypeOfContextualType
     pub fn get_apparent_type_of_contextual_type(
         &mut self,
         node: Node,
@@ -1345,7 +1345,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:30465 ObjectLiteralDiscriminator
+// Go: checker/checker.go:31197 ObjectLiteralDiscriminator
 // PORT: Go keeps a `c *Checker` field. The Rust `Discriminator` trait
 // methods receive the checker instead, so the struct only holds the items.
 #[derive(Clone, Debug, Default)]
@@ -1355,12 +1355,12 @@ pub struct ObjectLiteralDiscriminator {
 }
 
 impl Discriminator for ObjectLiteralDiscriminator {
-    // Go: checker/checker.go:30471 ObjectLiteralDiscriminator.len
+    // Go: checker/checker.go:31203 ObjectLiteralDiscriminator.len
     fn len(&self) -> i32 {
         (self.props.len() + self.members.len()) as i32
     }
 
-    // Go: checker/checker.go:30475 ObjectLiteralDiscriminator.name
+    // Go: checker/checker.go:31207 ObjectLiteralDiscriminator.name
     fn name(&self, c: &Checker, index: i32) -> String {
         let index = index as usize;
         if index < self.props.len() {
@@ -1371,7 +1371,7 @@ impl Discriminator for ObjectLiteralDiscriminator {
             .to_string()
     }
 
-    // Go: checker/checker.go:30482 ObjectLiteralDiscriminator.matches
+    // Go: checker/checker.go:31214 ObjectLiteralDiscriminator.matches
     fn matches(&mut self, c: &mut Checker, index: i32, t: TypeId) -> bool {
         let index = index as usize;
         let prop_type;
@@ -1400,7 +1400,7 @@ impl Discriminator for ObjectLiteralDiscriminator {
 }
 
 impl Checker {
-    // Go: checker/checker.go:30507 discriminateContextualTypeByObjectMembers
+    // Go: checker/checker.go:31239 discriminateContextualTypeByObjectMembers
     pub fn discriminate_contextual_type_by_object_members(
         &mut self,
         node: Node,
@@ -1460,7 +1460,7 @@ impl Checker {
         discriminated
     }
 
-    // Go: checker/checker.go:30537 getMatchingUnionConstituentForObjectLiteral
+    // Go: checker/checker.go:31269 getMatchingUnionConstituentForObjectLiteral
     pub fn get_matching_union_constituent_for_object_literal(
         &mut self,
         union_type: TypeId,
@@ -1490,7 +1490,7 @@ impl Checker {
     // Return true if the given expression is possibly a discriminant value. We limit the kinds of
     // expressions we check to those that don't depend on their contextual type in order not to cause
     // recursive (and possibly infinite) invocations of getContextualType.
-    // Go: checker/checker.go:30554 isPossiblyDiscriminantValue
+    // Go: checker/checker.go:31286 isPossiblyDiscriminantValue
     pub fn is_possibly_discriminant_value(&self, node: Node) -> bool {
         match node.kind() {
             SyntaxKind::StringLiteral
@@ -1517,7 +1517,7 @@ impl Checker {
 
     // If the given contextual type contains instantiable types and if a mapper representing
     // return type inferences is available, instantiate those types using that mapper.
-    // Go: checker/checker.go:30569 instantiateContextualType
+    // Go: checker/checker.go:31301 instantiateContextualType
     pub fn instantiate_contextual_type(
         &mut self,
         contextual_type: TypeId,

@@ -76,7 +76,7 @@ pub struct AsyncConn {
     running: Cell<bool>,
 }
 
-// Go: ipc/conn_async.go:39 NewAsyncConn
+// Go: ipc/conn_async.go:41 NewAsyncConn
 // NewAsyncConn creates a new async connection with the given transport and handler.
 // It uses JSONRPCProtocol (LSP-style Content-Length framing) by default.
 pub fn new_async_conn(rwc: Arc<dyn ReadWriteCloser>, handler: Rc<dyn Handler>) -> Rc<AsyncConn> {
@@ -84,7 +84,7 @@ pub fn new_async_conn(rwc: Arc<dyn ReadWriteCloser>, handler: Rc<dyn Handler>) -
     new_async_conn_with_protocol(rwc, Box::new(protocol), handler)
 }
 
-// Go: ipc/conn_async.go:44 NewAsyncConnWithProtocol
+// Go: ipc/conn_async.go:46 NewAsyncConnWithProtocol
 // NewAsyncConnWithProtocol creates a new async connection with a custom protocol.
 pub fn new_async_conn_with_protocol(
     rwc: Arc<dyn ReadWriteCloser>,
@@ -110,7 +110,7 @@ pub fn new_async_conn_with_protocol(
 // PORT: the Go methods are inherent methods; `impl Conn` below forwards to
 // them, so callers need not import `Conn`.
 impl AsyncConn {
-    // Go: ipc/conn_async.go:56 SetCollectTiming
+    // Go: ipc/conn_async.go:58 SetCollectTiming
     // SetCollectTiming enables or disables per-request server processing-time
     // measurement. When enabled, the connection accumulates timing that clients can
     // retrieve via a getServerTiming request.
@@ -122,7 +122,7 @@ impl AsyncConn {
         }
     }
 
-    // Go: ipc/conn_async.go:66 Run
+    // Go: ipc/conn_async.go:68 Run
     // Run starts processing messages on the connection.
     // It blocks until the context is cancelled or an error occurs.
     pub fn run(&self, ctx: &Context) -> Result<(), GoError> {
@@ -199,7 +199,7 @@ impl AsyncConn {
         }
     }
 
-    // Go: ipc/conn_async.go:92 closePendingCalls
+    // Go: ipc/conn_async.go:116 closePendingCalls
     // closePendingCalls records that the read loop has exited and unblocks requests waiting for a response.
     // PORT: Go closes each pending response channel, and the `Call` that
     // waits on it returns `terminal`. Here the only call that can wait is the
@@ -253,7 +253,7 @@ impl AsyncConn {
         self.pending.borrow_mut().clear();
     }
 
-    // Go: ipc/conn_async.go:108 handleResponse
+    // Go: ipc/conn_async.go:158 handleResponse
     // handleResponse matches a response to a pending request.
     fn handle_response(&self, msg: Message) {
         let Some(id) = msg.id.clone() else {
@@ -267,7 +267,7 @@ impl AsyncConn {
         }
     }
 
-    // Go: ipc/conn_async.go:123 handleRequest
+    // Go: ipc/conn_async.go:173 handleRequest
     // handleRequest processes an incoming request.
     // PORT: Go recovers panics in a deferred function; `go_recover` covers
     // the same body (the handler call and the response write). Go
@@ -383,7 +383,7 @@ impl AsyncConn {
         Ok(())
     }
 
-    // Go: ipc/conn_async.go:200 handleNotification
+    // Go: ipc/conn_async.go:251 handleNotification
     // handleNotification processes an incoming notification.
     fn handle_notification(&self, ctx: &Context, msg: Message) {
         let _ = self
@@ -391,7 +391,7 @@ impl AsyncConn {
             .handle_notification(ctx, &msg.method, msg.params);
     }
 
-    // Go: ipc/conn_async.go:205 Call
+    // Go: ipc/conn_async.go:256 Call
     // Call sends a request to the client and waits for a response.
     pub fn call(
         &self,
@@ -493,7 +493,7 @@ impl AsyncConn {
         }
     }
 
-    // Go: ipc/conn_async.go:256 Notify
+    // Go: ipc/conn_async.go:307 Notify
     // Notify sends a notification to the client (no response expected).
     pub fn notify(
         &self,
@@ -706,7 +706,7 @@ pub(crate) mod tests {
         }
     }
 
-    // Go: ipc/conn_async_test.go:58 blockingHandler
+    // Go: ipc/conn_async_test.go:59 blockingHandler
     // PORT: Go `started` is a buffered channel. Go `<-h.release` returns when
     // the test closes `release`; here the test drops the sender, and `recv`
     // returns.
@@ -739,7 +739,7 @@ pub(crate) mod tests {
         }
     }
 
-    // Go: ipc/conn_async_test.go:75 contextHandler
+    // Go: ipc/conn_async_test.go:76 contextHandler
     // PORT: Go waits for the handler context to be done and returns its
     // error. The Rust handler runs inline, before `run` reads the EOF that
     // cancels the context, so a wait would never end. The handler keeps its
@@ -961,7 +961,7 @@ pub(crate) mod tests {
         );
     }
 
-    // Go: ipc/conn_async_test.go:154 closeSignal
+    // Go: ipc/conn_async_test.go:153 closeSignal
     // PORT: Go closes the `closed` channel once; here `close` drops the
     // sender once, and the receiver's `recv` returns.
     struct CloseSignal {
@@ -988,7 +988,7 @@ pub(crate) mod tests {
         }
     }
 
-    // Go: ipc/conn_async_test.go:173 failingResponseProtocol
+    // Go: ipc/conn_async_test.go:171 failingResponseProtocol
     struct FailingResponseProtocol {
         closed: Receiver<()>,
         request_read: bool,

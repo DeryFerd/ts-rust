@@ -34,12 +34,12 @@ use crate::gostd::context::{self, Context, ContextKey};
 // Go: locale/locale.go:9 contextKey
 static CONTEXT_KEY: ContextKey<Locale> = ContextKey::new("contextKey(0)");
 
-// Go: locale/locale.go:15 WithLocale
+// Go: locale/locale.go:22 WithLocale
 pub fn with_locale(ctx: &Context, locale: Locale) -> Context {
     context::with_value(ctx, &CONTEXT_KEY, locale)
 }
 
-// Go: locale/locale.go:19 FromContext
+// Go: locale/locale.go:26 FromContext
 pub fn from_context(ctx: &Context) -> Locale {
     match ctx.value(&CONTEXT_KEY) {
         Some(locale) => (*locale).clone(),
@@ -74,7 +74,7 @@ impl Locale {
     }
 }
 
-// Go: locale/locale.go:24 Parse
+// Go: locale/locale.go:36 Parse
 pub fn parse(locale_str: &str) -> (Locale, bool) {
     // Parse gracefully fails.
     let (tag, err) = language::parse(locale_str);

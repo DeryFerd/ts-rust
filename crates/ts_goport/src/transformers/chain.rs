@@ -42,7 +42,7 @@ impl Transformer for ChainedTransformer {
     }
 }
 
-// Go: transformers/chain.go:37 Chain
+// Go: transformers/chain.go:38 Chain
 // Chains transforms in left-to-right order, running them one at a time in order (as opposed to interleaved at each node)
 // - the resulting combined transform only operates on SourceFile nodes
 // PORT: Go returns a new factory. Rust closures cannot be named in a

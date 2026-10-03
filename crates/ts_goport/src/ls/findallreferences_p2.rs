@@ -92,7 +92,7 @@ impl<P: ProgramView> LanguageService<P> {
     }
 }
 
-// Go: ls/findallreferences.go:1286 isStringLiteralPropertyReference
+// Go: ls/findallreferences.go:1394 isStringLiteralPropertyReference
 pub fn is_string_literal_property_reference(
     node: Node, /*StringLiteralLike*/
     checker: &mut Checker,
@@ -180,7 +180,7 @@ impl<P: ProgramView> LanguageService<P> {
     }
 }
 
-// Go: ls/findallreferences.go:1313 getReferencedSymbolsSpecial
+// Go: ls/findallreferences.go:1421 getReferencedSymbolsSpecial
 // PORT: every non-nil Go result has one element, so an empty `Vec` is Go nil.
 pub fn get_referenced_symbols_special(
     node: Node,
@@ -254,7 +254,7 @@ pub fn get_referenced_symbols_special(
     Vec::new()
 }
 
-// Go: ls/findallreferences.go:1369 getLabelReferencesInNode
+// Go: ls/findallreferences.go:1477 getLabelReferencesInNode
 pub fn get_label_references_in_node(
     container: Node,
     target_label: Node,
@@ -284,7 +284,7 @@ pub fn get_label_references_in_node(
     )]
 }
 
-// Go: ls/findallreferences.go:1382 getReferencesForThisKeyword
+// Go: ls/findallreferences.go:1490 getReferencesForThisKeyword
 pub fn get_references_for_this_keyword(
     this_or_super_keyword: Node,
     source_files: &[Node],
@@ -297,7 +297,7 @@ pub fn get_references_for_this_keyword(
 
     // Whether 'this' occurs in a static context within a class.
     let mut static_flag = ModifierFlags::STATIC;
-    // Go: ls/findallreferences.go:1387 isParameterName (closure)
+    // Go: ls/findallreferences.go:1495 isParameterName (closure)
     fn is_parameter_name(node: Node) -> bool {
         node.kind() == SyntaxKind::Identifier
             && node.parent().kind() == SyntaxKind::Parameter
@@ -417,7 +417,7 @@ pub fn get_references_for_this_keyword(
     )]
 }
 
-// Go: ls/findallreferences.go:1460 getReferencesForSuperKeyword
+// Go: ls/findallreferences.go:1568 getReferencesForSuperKeyword
 pub fn get_references_for_super_keyword(super_keyword: Node) -> Vec<Rc<RefCell<SymbolAndEntries>>> {
     let mut search_space_node = get_super_container(super_keyword, false /*stopOnFunctions*/);
     if search_space_node.is_nil() {
@@ -473,7 +473,7 @@ pub fn get_references_for_super_keyword(super_keyword: Node) -> Vec<Rc<RefCell<S
     )]
 }
 
-// Go: ls/findallreferences.go:1496 getAllReferencesForImportMeta
+// Go: ls/findallreferences.go:1604 getAllReferencesForImportMeta
 pub fn get_all_references_for_import_meta(
     source_files: &[Node],
 ) -> Vec<Rc<RefCell<SymbolAndEntries>>> {
@@ -502,7 +502,7 @@ pub fn get_all_references_for_import_meta(
     }))]
 }
 
-// Go: ls/findallreferences.go:1512 getAllReferencesForKeyword
+// Go: ls/findallreferences.go:1620 getAllReferencesForKeyword
 pub fn get_all_references_for_keyword(
     source_files: &[Node],
     keyword_kind: SyntaxKind,
@@ -538,7 +538,7 @@ pub fn get_all_references_for_keyword(
     )]
 }
 
-// Go: ls/findallreferences.go:1529 getPossibleSymbolReferenceNodes
+// Go: ls/findallreferences.go:1637 getPossibleSymbolReferenceNodes
 // PORT: the crate prelude also exports the checker/services.go function of
 // this name; this file uses its own, as Go package `ls` does.
 pub fn get_possible_symbol_reference_nodes(
@@ -696,10 +696,10 @@ pub fn get_possible_symbol_reference_positions(
     positions
 }
 
-// Go: ls/findallreferences.go:1584 findFirstJsxNode
+// Go: ls/findallreferences.go:1692 findFirstJsxNode
 // findFirstJsxNode recursively searches for the first JSX element, self-closing element, or fragment
 pub fn find_first_jsx_node(root: Node) -> Node {
-    // Go: ls/findallreferences.go:1586 visit (closure)
+    // Go: ls/findallreferences.go:1694 visit (closure)
     fn visit(node: Node) -> Node {
         // Check if this is a JSX node we're looking for
         match node.kind() {
@@ -731,7 +731,7 @@ pub fn find_first_jsx_node(root: Node) -> Node {
     visit(root)
 }
 
-// Go: ls/findallreferences.go:1610 getReferencesForNonModule
+// Go: ls/findallreferences.go:1718 getReferencesForNonModule
 pub fn get_references_for_non_module<P: ProgramView>(
     _referenced_file: Node,
     _program: &P,
@@ -740,7 +740,7 @@ pub fn get_references_for_non_module<P: ProgramView>(
     Vec::new()
 }
 
-// Go: ls/findallreferences.go:1615 getMergedAliasedSymbolOfNamespaceExportDeclaration
+// Go: ls/findallreferences.go:1723 getMergedAliasedSymbolOfNamespaceExportDeclaration
 pub fn get_merged_aliased_symbol_of_namespace_export_declaration(
     node: Node,
     symbol: SymbolId,
@@ -933,7 +933,7 @@ impl<P: ProgramView> LanguageService<P> {
 
 // -- Core algorithm for find all references --
 
-// Go: ls/findallreferences.go:1730 getSpecialSearchKind
+// Go: ls/findallreferences.go:1838 getSpecialSearchKind
 pub fn get_special_search_kind(node: Node) -> &'static str {
     if node.is_nil() {
         return "none";
@@ -952,7 +952,7 @@ pub fn get_special_search_kind(node: Node) -> &'static str {
     }
 }
 
-// Go: ls/findallreferences.go:1748 getReferencedSymbolsForSymbol
+// Go: ls/findallreferences.go:1856 getReferencedSymbolsForSymbol
 #[allow(clippy::too_many_arguments)]
 pub fn get_referenced_symbols_for_symbol<P: ProgramView>(
     ctx: &Context,
@@ -1065,7 +1065,7 @@ pub fn get_referenced_symbols_for_symbol<P: ProgramView>(
     state.result
 }
 
-// Go: ls/findallreferences.go:1780 refSearch
+// Go: ls/findallreferences.go:1888 refSearch
 // Symbol that is currently being searched for.
 // This will be replaced if we find an alias for the symbol.
 // PORT: Go `includes` is a closure over `allSearchSymbols`; here it owns a
@@ -1088,14 +1088,14 @@ pub struct RefSearch {
     pub includes: Rc<dyn Fn(SymbolId) -> bool>,
 }
 
-// Go: ls/findallreferences.go:1798 inheritKey
+// Go: ls/findallreferences.go:1906 inheritKey
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct InheritKey {
     pub symbol: SymbolId,
     pub parent: SymbolId,
 }
 
-// Go: ls/findallreferences.go:1803 refState
+// Go: ls/findallreferences.go:1911 refState
 // PORT: the state borrows the checker, the context and the source file list
 // and set for the whole search (`'c`). Go `collections.Set[*ast.Node]` node
 // seen trackers are `FxHashSet<Node>`. `symbolToReferences` and
@@ -1118,7 +1118,7 @@ pub struct RefState<'c, P> {
     pub source_file_to_seen_symbols: FxHashMap<Node, FxHashSet<SymbolId>>,
 }
 
-// Go: ls/findallreferences.go:1821 newState
+// Go: ls/findallreferences.go:1929 newState
 // PORT: Go returns `*refState`; the state is returned by value.
 #[allow(clippy::too_many_arguments)]
 pub fn new_state<'c, P: ProgramView>(
@@ -1282,7 +1282,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
     }
 }
 
-// Go: ls/findallreferences.go:1907 getReferenceEntriesForShorthandPropertyAssignment
+// Go: ls/findallreferences.go:2020 getReferenceEntriesForShorthandPropertyAssignment
 pub fn get_reference_entries_for_shorthand_property_assignment(
     node: Node,
     checker: &mut Checker,
@@ -1308,21 +1308,21 @@ pub fn get_reference_entries_for_shorthand_property_assignment(
     }
 }
 
-// Go: ls/findallreferences.go:1922 isMethodOrAccessor
+// Go: ls/findallreferences.go:2035 isMethodOrAccessor
 pub fn is_method_or_accessor(node: Node) -> bool {
     node.kind() == SyntaxKind::MethodDeclaration
         || node.kind() == SyntaxKind::GetAccessor
         || node.kind() == SyntaxKind::SetAccessor
 }
 
-// Go: ls/findallreferences.go:1926 tryGetClassByExtendingIdentifier
+// Go: ls/findallreferences.go:2039 tryGetClassByExtendingIdentifier
 pub fn try_get_class_by_extending_identifier(node: Node) -> Node /*ClassLikeDeclaration*/ {
     try_get_class_extending_expression_with_type_arguments(
         climb_past_property_access(node).parent(),
     )
 }
 
-// Go: ls/findallreferences.go:1930 getClassConstructorSymbol
+// Go: ls/findallreferences.go:2043 getClassConstructorSymbol
 // PORT: Go reads the symbol fields directly; they are in the checker's arena.
 pub fn get_class_constructor_symbol(symbols: &SymbolArena, class_symbol: SymbolId) -> SymbolId {
     let members = symbols.sym(class_symbol).members;
@@ -1332,7 +1332,7 @@ pub fn get_class_constructor_symbol(symbols: &SymbolArena, class_symbol: SymbolI
     symbols.get(members, INTERNAL_SYMBOL_NAME_CONSTRUCTOR)
 }
 
-// Go: ls/findallreferences.go:1937 hasOwnConstructor
+// Go: ls/findallreferences.go:2050 hasOwnConstructor
 pub fn has_own_constructor(
     symbols: &SymbolArena,
     class_declaration: Node, /*ClassLikeDeclaration*/
@@ -1340,7 +1340,7 @@ pub fn has_own_constructor(
     get_class_constructor_symbol(symbols, class_declaration.symbol()).is_some()
 }
 
-// Go: ls/findallreferences.go:1941 findOwnConstructorReferences
+// Go: ls/findallreferences.go:2054 findOwnConstructorReferences
 pub fn find_own_constructor_references(
     symbols: &SymbolArena,
     class_symbol: SymbolId,
@@ -1383,7 +1383,7 @@ pub fn find_own_constructor_references(
     }
 }
 
-// Go: ls/findallreferences.go:1970 findSuperConstructorAccesses
+// Go: ls/findallreferences.go:2083 findSuperConstructorAccesses
 pub fn find_super_constructor_accesses(
     symbols: &SymbolArena,
     class_declaration: Node, /*ClassLikeDeclaration*/
@@ -1408,7 +1408,7 @@ pub fn find_super_constructor_accesses(
     }
 }
 
-// Go: ls/findallreferences.go:1990 forEachDescendantOfKind
+// Go: ls/findallreferences.go:2103 forEachDescendantOfKind
 pub fn for_each_descendant_of_kind(node: Node, kind: SyntaxKind, action: &mut dyn FnMut(Node)) {
     node.for_each_child(|child| {
         if child.kind() == kind {
@@ -1467,7 +1467,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
                 .seen_containing_type_references
                 .insert(type_having_node)
         {
-            // Go: ls/findallreferences.go:2035 addIfImplementation (closure)
+            // Go: ls/findallreferences.go:2148 addIfImplementation (closure)
             let mut add_if_implementation = |e: Node /*Expression*/| {
                 if is_implementation_expression(e) {
                     add_ref(e);
@@ -1694,7 +1694,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
             self.add_reference(reference_location, symbol, EntryKind::NODE);
         }
 
-        // Go: ls/findallreferences.go:2184 pusher (closure)
+        // Go: ls/findallreferences.go:2297 pusher (closure)
         let pusher = |state: &mut Self| state.reference_adder(search.symbol);
 
         if is_class_like(reference_location.parent()) {
@@ -1749,7 +1749,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
             // Go: `members == nil`; an empty list has no members to walk either.
             return;
         }
-        // Go: ls/findallreferences.go:2227 cb (closure)
+        // Go: ls/findallreferences.go:2340 cb (closure)
         fn cb(node: Node, add_ref: &dyn Fn(Node, EntryKind)) {
             if node.kind() == SyntaxKind::ThisKeyword {
                 add_ref(node, EntryKind::NODE);
@@ -2155,7 +2155,7 @@ impl<'c, P: ProgramView> RefState<'c, P> {
         )
     }
 
-    // Go: ls/findallreferences.go:2490 fromRoot (closure in forEachRelatedSymbol)
+    // Go: ls/findallreferences.go:2603 fromRoot (closure in forEachRelatedSymbol)
     // PORT: the closure captures `cbSymbol` and `allowBaseTypes`, which
     // `forEachRelatedSymbol` also calls directly, so it is a method that takes
     // them as arguments.

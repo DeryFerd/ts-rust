@@ -1,13 +1,13 @@
 use crate::format::prelude::*;
 
-// Go: format/util.go:12 rangeIsOnOneLine
+// Go: format/util.go:10 rangeIsOnOneLine
 pub fn range_is_on_one_line(node: TextRange, file: Node) -> bool {
     let start_line = get_ecma_line_of_position(file, node.pos());
     let end_line = get_ecma_line_of_position(file, node.end());
     start_line == end_line
 }
 
-// Go: format/util.go:18 getOpenTokenForList
+// Go: format/util.go:16 getOpenTokenForList
 pub fn get_open_token_for_list(node: Node, list: NodeList) -> SyntaxKind {
     match node.kind() {
         SyntaxKind::Constructor
@@ -61,7 +61,7 @@ pub fn get_open_token_for_list(node: Node, list: NodeList) -> SyntaxKind {
     SyntaxKind::Unknown
 }
 
-// Go: format/util.go:65 getCloseTokenForOpenToken
+// Go: format/util.go:63 getCloseTokenForOpenToken
 pub fn get_close_token_for_open_token(kind: SyntaxKind) -> SyntaxKind {
     // TODO: matches strada - seems like it could handle more pairs of braces, though? [] notably missing
     match kind {
@@ -73,7 +73,7 @@ pub fn get_close_token_for_open_token(kind: SyntaxKind) -> SyntaxKind {
     SyntaxKind::Unknown
 }
 
-// Go: format/util.go:78 GetLineStartPositionForPosition
+// Go: format/util.go:76 GetLineStartPositionForPosition
 pub fn get_line_start_position_for_position(position: i32, source_file: Node) -> i32 {
     let line_starts = &*get_ecma_line_starts(source_file);
     let line = get_ecma_line_of_position(source_file, position);
@@ -84,7 +84,7 @@ pub fn get_line_start_position_for_position(position: i32, source_file: Node) ->
  * Validating `expectedTokenKind` ensures the token was typed in the context we expect (eg: not a comment).
  * @param expectedTokenKind The kind of the last token constituting the desired parent node.
  */
-// Go: format/util.go:141 findImmediatelyPrecedingTokenOfKind
+// Go: format/util.go:86 findImmediatelyPrecedingTokenOfKind
 pub fn find_immediately_preceding_token_of_kind(
     end: i32,
     expected_token_kind: SyntaxKind,
@@ -113,7 +113,7 @@ pub fn find_immediately_preceding_token_of_kind(
  * Upon typing the closing curly, we want to format the entire `while`-statement, but not the preceding
  * variable declaration.
  */
-// Go: format/util.go:162 findOutermostNodeWithinListLevel
+// Go: format/util.go:107 findOutermostNodeWithinListLevel
 pub fn find_outermost_node_within_list_level(node: Node) -> Node {
     let mut current = node;
     while current.is_some()
@@ -129,7 +129,7 @@ pub fn find_outermost_node_within_list_level(node: Node) -> Node {
 
 // Returns true if node is a element in some list in parent
 // i.e. parent is class declaration with the list of members and node is one of members.
-// Go: format/util.go:176 isListElement
+// Go: format/util.go:121 isListElement
 pub fn is_list_element(parent: Node, node: Node) -> bool {
     match parent.kind() {
         SyntaxKind::ClassDeclaration | SyntaxKind::InterfaceDeclaration => {

@@ -654,7 +654,7 @@ impl ResolutionHost for CompilerResolutionHost {
     }
 }
 
-// Go: projectreferencedtsfakinghost.go:17 projectReferenceDtsFakingHost
+// Go: projectreferencedtsfakinghost.go:16 projectReferenceDtsFakingHost
 // PORT: `current_directory` caches Go `h.host.GetCurrentDirectory()`,
 // because `ResolutionHost` returns `&str`. The host value does not change.
 pub struct ProjectReferenceDtsFakingHost {
@@ -663,7 +663,7 @@ pub struct ProjectReferenceDtsFakingHost {
     pub current_directory: String,
 }
 
-// Go: projectreferencedtsfakinghost.go:24 newProjectReferenceDtsFakingHost
+// Go: projectreferencedtsfakinghost.go:23 newProjectReferenceDtsFakingHost
 // PORT: Go copies `loader.dtsDirectories` by value. The set is complete
 // when this runs (end of `initMapper`), so a clone is the same.
 #[must_use]
@@ -694,7 +694,7 @@ impl ResolutionHost for ProjectReferenceDtsFakingHost {
     }
 }
 
-// Go: projectreferencedtsfakinghost.go:47 projectReferenceDtsFakingVfs
+// Go: projectreferencedtsfakinghost.go:46 projectReferenceDtsFakingVfs
 // PORT: the mapper is shared (`Rc<RefCell<..>>`). The loader clears
 // `mapper.host` after loading, which breaks the mapper -> host -> vfs ->
 // mapper cycle as in Go. `known_symlinks` is mutated from `&self` methods,

@@ -24,7 +24,7 @@ use std::sync::LazyLock;
 // `MarshalJSONTo` (nil is skipped) sees the difference. A Rust `Vec` has no
 // nil, so an empty `Vec` counts as nil there.
 
-// Go: ls/lsutil/userpreferences.go:15 NewDefaultUserPreferences
+// Go: ls/lsutil/userpreferences.go:16 NewDefaultUserPreferences
 pub fn new_default_user_preferences() -> UserPreferences {
     UserPreferences {
         format_code_settings: get_default_format_code_settings(),
@@ -49,7 +49,7 @@ pub fn new_default_user_preferences() -> UserPreferences {
     }
 }
 
-// Go: ls/lsutil/userpreferences.go:40 UserPreferences
+// Go: ls/lsutil/userpreferences.go:47 UserPreferences
 // UserPreferences represents TypeScript language service preferences.
 //
 // Fields are populated using two tags:
@@ -216,7 +216,7 @@ impl UserPreferences {
     }
 }
 
-// Go: ls/lsutil/userpreferences.go:196 InlayHintsPreferences
+// Go: ls/lsutil/userpreferences.go:209 InlayHintsPreferences
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InlayHintsPreferences {
     pub include_inlay_parameter_name_hints: IncludeInlayParameterNameHints,
@@ -229,7 +229,7 @@ pub struct InlayHintsPreferences {
     pub include_inlay_enum_member_value_hints: Tristate,
 }
 
-// Go: ls/lsutil/userpreferences.go:207 CodeLensUserPreferences
+// Go: ls/lsutil/userpreferences.go:220 CodeLensUserPreferences
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodeLensUserPreferences {
     pub references_code_lens_enabled: Tristate,
@@ -241,7 +241,7 @@ pub struct CodeLensUserPreferences {
 
 // --- Enum Types ---
 
-// Go: ls/lsutil/userpreferences.go:217 QuotePreference
+// Go: ls/lsutil/userpreferences.go:230 QuotePreference
 // PORT: a Go string type. The value is always one of the Go constants, so a
 // `&'static str` holds it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -267,7 +267,7 @@ impl WorkspaceSymbolsScope {
         WorkspaceSymbolsScope(Cow::Borrowed("currentProject"));
 }
 
-// Go: ls/lsutil/userpreferences.go:226 JsxAttributeCompletionStyle
+// Go: ls/lsutil/userpreferences.go:246 JsxAttributeCompletionStyle
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct JsxAttributeCompletionStyle(pub &'static str);
 
@@ -278,7 +278,7 @@ impl JsxAttributeCompletionStyle {
     pub const NONE: JsxAttributeCompletionStyle = JsxAttributeCompletionStyle("none");
 }
 
-// Go: ls/lsutil/userpreferences.go:235 IncludeInlayParameterNameHints
+// Go: ls/lsutil/userpreferences.go:255 IncludeInlayParameterNameHints
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct IncludeInlayParameterNameHints(pub &'static str);
 
@@ -288,7 +288,7 @@ impl IncludeInlayParameterNameHints {
     pub const LITERALS: IncludeInlayParameterNameHints = IncludeInlayParameterNameHints("literals");
 }
 
-// Go: ls/lsutil/userpreferences.go:252 OrganizeImportsSort
+// Go: ls/lsutil/userpreferences.go:263 OrganizeImportsSort
 go_enum!(OrganizeImportsSort, i32 {
     AUTO = 0;
     ORDINAL = 1;
@@ -297,7 +297,7 @@ go_enum!(OrganizeImportsSort, i32 {
     NATURAL_IGNORE_CASE = 4;
 });
 
-// Go: ls/lsutil/userpreferences.go:243 OrganizeImportsCollation
+// Go: ls/lsutil/userpreferences.go:273 OrganizeImportsCollation
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct OrganizeImportsCollation(pub bool);
 
@@ -306,14 +306,14 @@ impl OrganizeImportsCollation {
     pub const UNICODE: OrganizeImportsCollation = OrganizeImportsCollation(true);
 }
 
-// Go: ls/lsutil/userpreferences.go:250 OrganizeImportsCaseFirst
+// Go: ls/lsutil/userpreferences.go:280 OrganizeImportsCaseFirst
 go_enum!(OrganizeImportsCaseFirst, i32 {
     FALSE = 0;
     LOWER = 1;
     UPPER = 2;
 });
 
-// Go: ls/lsutil/userpreferences.go:258 OrganizeImportsTypeOrder
+// Go: ls/lsutil/userpreferences.go:288 OrganizeImportsTypeOrder
 go_enum!(OrganizeImportsTypeOrder, i32 {
     AUTO = 0;
     LAST = 1;
@@ -519,7 +519,7 @@ impl FieldValue {
     }
 }
 
-// Go: ls/lsutil/userpreferences.go:270 typeParsers
+// Go: ls/lsutil/userpreferences.go:300 typeParsers
 // typeParsers maps reflect.Type to a function that parses a value into that type.
 // PORT: the Go map is a match on the field type.
 fn type_parsers(t: FieldType) -> Option<fn(&LspAny) -> FieldValue> {
@@ -711,7 +711,7 @@ fn type_parsers(t: FieldType) -> Option<fn(&LspAny) -> FieldValue> {
     }
 }
 
-// Go: ls/lsutil/userpreferences.go:415 typeSerializers
+// Go: ls/lsutil/userpreferences.go:426 typeSerializers
 // typeSerializers maps reflect.Type to a function that serializes a value of that type.
 // For types which do not serialize as-is (tristate, enums, etc).
 // PORT: the Go map is a match on the field type. The Go type assertion
@@ -843,7 +843,7 @@ fn type_serializers(t: FieldType) -> Option<fn(&FieldValue) -> LspAny> {
     }
 }
 
-// Go: ls/lsutil/userpreferences.go:424 configPathParsers
+// Go: ls/lsutil/userpreferences.go:525 configPathParsers
 // configPathParsers provides field-specific config value parsers that override the default
 // type-based parser when the VS Code config value format differs from the Go field type.
 // PORT: the Go map is a match on the config path.
@@ -1504,7 +1504,7 @@ static USER_PREFERENCES_FIELDS: &[StructField] = &[
     ),
 ];
 
-// Go: ls/lsutil/userpreferences.go:536 fieldInfo
+// Go: ls/lsutil/userpreferences.go:547 fieldInfo
 #[derive(Clone)]
 struct FieldInfo {
     raw_name: &'static str, // raw name for unstable section lookup (e.g., "quotePreference")
@@ -1518,18 +1518,18 @@ struct FieldInfo {
     config_invert: bool, // whether to invert boolean values for config path
 }
 
-// Go: ls/lsutil/userpreferences.go:545 configPathInfo
+// Go: ls/lsutil/userpreferences.go:556 configPathInfo
 #[derive(Clone, Copy)]
 struct ConfigPathInfo {
     path: &'static str,
     invert: bool,
 }
 
-// Go: ls/lsutil/userpreferences.go:454 fieldInfoCache
+// Go: ls/lsutil/userpreferences.go:561 fieldInfoCache
 static FIELD_INFO_CACHE: LazyLock<Vec<FieldInfo>> =
     LazyLock::new(|| collect_field_infos(USER_PREFERENCES_FIELDS));
 
-// Go: ls/lsutil/userpreferences.go:459 unstableNameIndex
+// Go: ls/lsutil/userpreferences.go:566 unstableNameIndex
 // unstableNameIndex maps raw names to fieldInfo index for unstable section lookup.
 static UNSTABLE_NAME_INDEX: LazyLock<FxHashMap<&'static str, usize>> = LazyLock::new(|| {
     let infos = &*FIELD_INFO_CACHE;
@@ -1542,7 +1542,7 @@ static UNSTABLE_NAME_INDEX: LazyLock<FxHashMap<&'static str, usize>> = LazyLock:
     index
 });
 
-// Go: ls/lsutil/userpreferences.go:470 collectFieldInfos
+// Go: ls/lsutil/userpreferences.go:577 collectFieldInfos
 // PORT: Go takes a `reflect.Type` and an index path and recurses into
 // untagged struct fields. The field table is already flat, so every entry
 // is a tagged field; the Go panic for an untagged non-struct field stays.
@@ -1599,7 +1599,7 @@ fn collect_field_infos(fields: &'static [StructField]) -> Vec<FieldInfo> {
     infos
 }
 
-// Go: ls/lsutil/userpreferences.go:617 parseConfigPathTag
+// Go: ls/lsutil/userpreferences.go:628 parseConfigPathTag
 fn parse_config_path_tag(tag: &'static str) -> ConfigPathInfo {
     let mut parts = tag.split(',');
     let mut info = ConfigPathInfo {
@@ -1614,7 +1614,7 @@ fn parse_config_path_tag(tag: &'static str) -> ConfigPathInfo {
     info
 }
 
-// Go: ls/lsutil/userpreferences.go:519 getNestedValue
+// Go: ls/lsutil/userpreferences.go:639 getNestedValue
 // PORT: Go starts from `any(config)`. `current` is `None` only for that root
 // map, before the first part is read.
 fn get_nested_value(config: &IndexMap<String, LspAny>, path: &str) -> (LspAny, bool) {
@@ -1634,7 +1634,7 @@ fn get_nested_value(config: &IndexMap<String, LspAny>, path: &str) -> (LspAny, b
     (current.cloned().unwrap_or(LspAny::Null), true)
 }
 
-// Go: ls/lsutil/userpreferences.go:535 setNestedValue
+// Go: ls/lsutil/userpreferences.go:655 setNestedValue
 fn set_nested_value(config: &mut IndexMap<String, LspAny>, path: &str, value: LspAny) {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = config;
@@ -1650,7 +1650,7 @@ fn set_nested_value(config: &mut IndexMap<String, LspAny>, path: &str, value: Ls
     current.insert(parts[parts.len() - 1].to_string(), value);
 }
 
-// Go: ls/lsutil/userpreferences.go:658 setRawFieldsFromConfig
+// Go: ls/lsutil/userpreferences.go:669 setRawFieldsFromConfig
 // PORT: Go takes the struct as a `reflect.Value`; here it is `p`.
 fn set_raw_fields_from_config(
     p: &mut UserPreferences,
@@ -1743,11 +1743,11 @@ impl UserPreferences {
     }
 }
 
-// Go: ls/lsutil/userpreferences.go:609 getFieldByPath
+// Go: ls/lsutil/userpreferences.go:746 getFieldByPath
 // PORT: not ported. `FieldInfo.get` and `FieldInfo.set` stand for the field
 // that Go finds by its index path.
 
-// Go: ls/lsutil/userpreferences.go:616 setFieldFromValue
+// Go: ls/lsutil/userpreferences.go:753 setFieldFromValue
 // PORT: Go takes the field as a `reflect.Value`. Here the field is `info` on
 // `p`. Go also accepts a Go `int` for an int field; an `LspAny` number is
 // always the Go `float64` case. Go `int64(float64)` keeps 64 bits; the Rust
@@ -1863,7 +1863,7 @@ fn sort_any_keys_deterministic(v: &mut LspAny) {
     }
 }
 
-// Go: ls/lsutil/userpreferences.go:815 serializeField
+// Go: ls/lsutil/userpreferences.go:826 serializeField
 // PORT: Go `nil` is `LspAny::Null`. A Go `int` is written as a JSON number;
 // `LspAny::Number` is an `f64`, which holds every `i32` exactly.
 fn serialize_field(field: &FieldValue) -> LspAny {
@@ -1960,7 +1960,7 @@ impl UserPreferences {
     }
 }
 
-// Go: ls/lsutil/userpreferences.go:882 ParseUserPreferences
+// Go: ls/lsutil/userpreferences.go:893 ParseUserPreferences
 pub fn parse_user_preferences(items: &IndexMap<String, LspAny>) -> UserPreferences {
     let mut prefs = new_default_user_preferences();
     // Apply editor settings first (tabSize, indentSize, etc.) as raw-name defaults,

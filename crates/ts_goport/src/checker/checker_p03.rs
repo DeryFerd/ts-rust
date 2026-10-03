@@ -3,7 +3,7 @@
 use crate::gostd::Context;
 use crate::prelude::*;
 
-// Go: checker/checker.go:2056 isImmediatelyUsedInInitializerOfBlockScopedVariable
+// Go: checker/checker.go:2113 isImmediatelyUsedInInitializerOfBlockScopedVariable
 pub fn is_immediately_used_in_initializer_of_block_scoped_variable(
     declaration: Node,
     usage: Node,
@@ -26,7 +26,7 @@ pub fn is_immediately_used_in_initializer_of_block_scoped_variable(
         && is_same_scope_descendent_of(usage, grandparent.expression(), decl_container)
 }
 
-// Go: checker/checker.go:2074 isSameScopeDescendentOf
+// Go: checker/checker.go:2131 isSameScopeDescendentOf
 // Starting from 'initial' node walk up the parent chain until 'stopAt' node is reached.
 // If at any point current node is equal to 'parent' node - return true.
 // If current node is an IIFE, continue walking up.
@@ -52,7 +52,7 @@ pub fn is_same_scope_descendent_of(initial: Node, parent: Node, stop_at: Node) -
     found
 }
 
-// Go: checker/checker.go:2090 isPropertyImmediatelyReferencedWithinDeclaration
+// Go: checker/checker.go:2147 isPropertyImmediatelyReferencedWithinDeclaration
 // isPropertyImmediatelyReferencedWithinDeclaration is used for detecting ES-standard class field use-before-def errors
 pub fn is_property_immediately_referenced_within_declaration(
     declaration: Node,
@@ -104,7 +104,7 @@ fn type_parameter_declaration_expression(node: Node) -> Node {
 }
 
 impl Checker {
-    // Go: checker/checker.go:2117 getTypeOnlyAliasDeclaration
+    // Go: checker/checker.go:2174 getTypeOnlyAliasDeclaration
     // Return the type-only declaration node (if any) for the given alias symbol (non-transitively)
     pub fn get_type_only_alias_declaration(&mut self, symbol: SymbolId) -> Node {
         if self.sym(symbol).flags.intersects(SymbolFlags::ALIAS) {
@@ -114,7 +114,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:2127 getTypeOnlyAliasDeclarationEx
+    // Go: checker/checker.go:2184 getTypeOnlyAliasDeclarationEx
     // Return the first type-only alias declaration node (if any) in the resolution chain that affects
     // the symbol for the given meaning
     pub fn get_type_only_alias_declaration_ex(
@@ -136,7 +136,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:2139 getImmediateAliasedSymbol
+    // Go: checker/checker.go:2196 getImmediateAliasedSymbol
     pub fn get_immediate_aliased_symbol(&mut self, symbol: SymbolId) -> SymbolId {
         debug_assert!(
             self.sym(symbol).flags.intersects(SymbolFlags::ALIAS),
@@ -158,7 +158,7 @@ impl Checker {
         self.alias_symbol_links.get(symbol).immediate_target
     }
 
-    // Go: checker/checker.go:2152 addTypeOnlyDeclarationRelatedInfo
+    // Go: checker/checker.go:2209 addTypeOnlyDeclarationRelatedInfo
     // PORT: Go mutates the `*ast.Diagnostic` in place and returns it. Here the
     // owned diagnostic is taken by value and returned with the related info added.
     pub fn add_type_only_declaration_related_info(
@@ -186,7 +186,7 @@ impl Checker {
         diagnostic
     }
 
-    // Go: checker/checker.go:2160 getSymbol
+    // Go: checker/checker.go:2217 getSymbol
     pub fn get_symbol(
         &mut self,
         symbols: SymbolTable,
@@ -224,7 +224,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:2180 checkSourceFile
+    // Go: checker/checker.go:2237 checkSourceFile
     pub fn check_source_file(&mut self, ctx: &Context, source_file: Node, check_unused: bool) {
         self.ctx = Some(ctx.clone());
         // Go `defer tr.Push(...)()` inside the block: the event ends when the
@@ -277,7 +277,7 @@ impl Checker {
         self.ctx = None;
     }
 
-    // Go: checker/checker.go:2218 checkSourceElements
+    // Go: checker/checker.go:2273 checkSourceElements
     // PERF: takes the nodes by value (a `NodeSlice` of program data, or
     // copied ids), so callers do not copy a node list into a `Vec` first.
     pub fn check_source_elements(&mut self, nodes: impl IntoIterator<Item = Node>) {
@@ -289,7 +289,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2227 checkSourceElement
+    // Go: checker/checker.go:2282 checkSourceElement
     pub fn check_source_element(&mut self, node: Node) -> bool {
         if node.is_some() {
             let save_current_node = self.current_node;
@@ -303,7 +303,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:2240 checkSourceElementWorker
+    // Go: checker/checker.go:2295 checkSourceElementWorker
     pub fn check_source_element_worker(&mut self, node: Node) {
         for jsdoc in node.eager_js_doc(Node::NIL) {
             self.check_js_doc_comments(jsdoc);
@@ -500,7 +500,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2378 checkSourceElementUnreachable
+    // Go: checker/checker.go:2433 checkSourceElementUnreachable
     pub fn check_source_element_unreachable(&mut self, node: Node) -> bool {
         if !is_potentially_executable_node(node) {
             return false;
@@ -562,7 +562,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:2439 isSourceElementUnreachable
+    // Go: checker/checker.go:2494 isSourceElementUnreachable
     pub fn is_source_element_unreachable(&mut self, node: Node) -> bool {
         // Precondition: ast.IsPotentiallyExecutableNode is true
         if node.flags().intersects(NodeFlags::UNREACHABLE) {
@@ -588,7 +588,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:2470 checkNodeDeferred
+    // Go: checker/checker.go:2525 checkNodeDeferred
     // Function and class expression bodies are checked after all statements in the enclosing body. This is
     // to ensure constructs like the following are permitted:
     //
@@ -608,7 +608,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2478 checkDeferredNodes
+    // Go: checker/checker.go:2533 checkDeferredNodes
     // PORT: Go iterates the OrderedSet by index so nodes added during iteration are
     // visited too; the index loop below re-reads the set each step to match.
     pub fn check_deferred_nodes(&mut self, context: Node) {
@@ -633,7 +633,7 @@ impl Checker {
         self.source_file_links.get(context).deferred_nodes = IndexSet::default();
     }
 
-    // Go: checker/checker.go:2489 checkDeferredNode
+    // Go: checker/checker.go:2544 checkDeferredNode
     pub fn check_deferred_node(&mut self, node: Node) {
         let _trace = self.tracer.map(|tr| {
             tr.push(
@@ -696,14 +696,14 @@ impl Checker {
         self.current_node = save_current_node;
     }
 
-    // Go: checker/checker.go:2525 checkJSDocComments
+    // Go: checker/checker.go:2582 checkJSDocComments
     pub fn check_js_doc_comments(&mut self, node: Node) {
         for comment in node.comments() {
             self.check_js_doc_comment(comment);
         }
     }
 
-    // Go: checker/checker.go:2531 checkJSDocComment
+    // Go: checker/checker.go:2588 checkJSDocComment
     pub fn check_js_doc_comment(&mut self, node: Node) {
         // This performs minimal checking of JSDoc nodes to ensure that @link references to entities are recorded
         // for purposes of checking unused identifiers.
@@ -715,7 +715,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2540 resolveJSDocMemberName
+    // Go: checker/checker.go:2597 resolveJSDocMemberName
     pub fn resolve_js_doc_member_name(&mut self, name: Node) -> SymbolId {
         if name.is_some() && is_entity_name(name) {
             let meaning = SymbolFlags::TYPE | SymbolFlags::NAMESPACE | SymbolFlags::VALUE;
@@ -750,13 +750,13 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:2565 checkJSDocType
+    // Go: checker/checker.go:2622 checkJSDocType
     pub fn check_js_doc_type(&mut self, node: Node) {
         self.check_js_doc_type_is_in_js_file(node);
         node.for_each_child(&mut |child: Node| self.check_source_element(child));
     }
 
-    // Go: checker/checker.go:2570 checkJSDocTypeIsInJsFile
+    // Go: checker/checker.go:2627 checkJSDocTypeIsInJsFile
     pub fn check_js_doc_type_is_in_js_file(&mut self, node: Node) {
         if !is_in_js_file(node) {
             if is_js_doc_non_nullable_type(node) || is_js_doc_nullable_type(node) {
@@ -794,7 +794,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2589 checkTypeParameter
+    // Go: checker/checker.go:2646 checkTypeParameter
     pub fn check_type_parameter(&mut self, node: Node) {
         // Grammar Checking
         self.check_grammar_modifiers(node);
@@ -836,7 +836,7 @@ impl Checker {
         self.check_node_deferred(node);
     }
 
-    // Go: checker/checker.go:2613 checkTypeParameterDeferred
+    // Go: checker/checker.go:2670 checkTypeParameterDeferred
     pub fn check_type_parameter_deferred(&mut self, node: Node) {
         let parent = node.parent();
         if is_interface_declaration(parent)
@@ -903,12 +903,12 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2636 shouldCheckErasableSyntax
+    // Go: checker/checker.go:2693 shouldCheckErasableSyntax
     pub fn should_check_erasable_syntax(&self, node: Node) -> bool {
         self.compiler_options.erasable_syntax_only.is_true() && !is_in_js_file(node)
     }
 
-    // Go: checker/checker.go:2640 checkParameter
+    // Go: checker/checker.go:2697 checkParameter
     pub fn check_parameter(&mut self, node: Node) {
         // Grammar checking
         // It is a SyntaxError if the Identifier "eval" or the Identifier "arguments" occurs as the
@@ -1004,7 +1004,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2687 checkPropertyDeclaration
+    // Go: checker/checker.go:2744 checkPropertyDeclaration
     pub fn check_property_declaration(&mut self, node: Node) {
         // Grammar checking
         if !self.check_grammar_modifiers(node) && !self.check_grammar_property(node) {
@@ -1024,7 +1024,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2702 checkPropertySignature
+    // Go: checker/checker.go:2759 checkPropertySignature
     pub fn check_property_signature(&mut self, node: Node) {
         if is_private_identifier(node.name()) {
             self.error(
@@ -1036,7 +1036,7 @@ impl Checker {
         self.check_property_declaration(node);
     }
 
-    // Go: checker/checker.go:2709 checkSignatureDeclaration
+    // Go: checker/checker.go:2766 checkSignatureDeclaration
     pub fn check_signature_declaration(&mut self, node: Node) {
         // Grammar checking
         match node.kind() {
@@ -1123,7 +1123,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2768 checkAsyncFunctionReturnType
+    // Go: checker/checker.go:2825 checkAsyncFunctionReturnType
     // Checks the return type of an async function to ensure it is a compatible
     // Promise implementation.
     //
@@ -1166,7 +1166,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/checker.go:2783 checkMethodDeclaration
+    // Go: checker/checker.go:2840 checkMethodDeclaration
     pub fn check_method_declaration(&mut self, node: Node) {
         // Grammar checking
         if !self.check_grammar_method(node) {
@@ -1207,7 +1207,7 @@ impl Checker {
         self.set_node_links_for_private_identifier_scope(node);
     }
 
-    // Go: checker/checker.go:2804 checkClassStaticBlockDeclaration
+    // Go: checker/checker.go:2861 checkClassStaticBlockDeclaration
     pub fn check_class_static_block_declaration(&mut self, node: Node) {
         // Grammar checking
         self.check_grammar_modifiers(node);
@@ -1217,7 +1217,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2810 checkConstructorDeclaration
+    // Go: checker/checker.go:2870 checkConstructorDeclaration
     pub fn check_constructor_declaration(&mut self, node: Node) {
         // Grammar check on signature of constructor and modifier of the constructor is done in checkSignatureDeclaration function.
         self.check_signature_declaration(node);
@@ -1307,7 +1307,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:2875 findFirstSuperCall
+    // Go: checker/checker.go:2935 findFirstSuperCall
     pub fn find_first_super_call(&self, node: Node) -> Node {
         fn visit(node: Node, super_call: &mut Node) -> bool {
             if is_super_call(node) {
@@ -1325,19 +1325,19 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:2892 isInstancePropertyWithInitializerOrPrivateIdentifierProperty
+// Go: checker/checker.go:2952 isInstancePropertyWithInitializerOrPrivateIdentifierProperty
 pub fn is_instance_property_with_initializer_or_private_identifier_property(n: Node) -> bool {
     is_private_identifier_class_element_declaration(n)
         || is_property_declaration(n) && !is_static(n) && n.initializer().is_some()
 }
 
-// Go: checker/checker.go:2896 superCallIsRootLevelInConstructor
+// Go: checker/checker.go:2956 superCallIsRootLevelInConstructor
 pub fn super_call_is_root_level_in_constructor(super_call: Node, body: Node) -> bool {
     let super_call_parent = walk_up_parenthesized_expressions(super_call.parent());
     is_expression_statement(super_call_parent) && super_call_parent.parent() == body
 }
 
-// Go: checker/checker.go:2901 nodeImmediatelyReferencesSuperOrThis
+// Go: checker/checker.go:2961 nodeImmediatelyReferencesSuperOrThis
 pub fn node_immediately_references_super_or_this(node: Node) -> bool {
     match node.kind() {
         SyntaxKind::SuperKeyword | SyntaxKind::ThisKeyword => return true,
@@ -1358,7 +1358,7 @@ pub fn node_immediately_references_super_or_this(node: Node) -> bool {
 }
 
 impl Checker {
-    // Go: checker/checker.go:2916 checkAccessorDeclaration
+    // Go: checker/checker.go:2976 checkAccessorDeclaration
     pub fn check_accessor_declaration(&mut self, node: Node) {
         // Grammar checking accessors
         if !self.check_grammar_function_like_declaration(node) && !self.check_grammar_accessor(node)

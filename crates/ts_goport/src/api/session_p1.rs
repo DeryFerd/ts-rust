@@ -57,10 +57,10 @@ use crate::transpile;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// Go: api/session.go:29 sessionIDCounter
+// Go: api/session.go:47 sessionIDCounter
 pub static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-// Go: api/session.go:31 snapshotData
+// Go: api/session.go:53 snapshotData
 // snapshotData holds the per-snapshot state including the snapshot itself
 // and symbol/type registries scoped to this snapshot.
 // Multiple clients may hold references to the same snapshot via ref counting;
@@ -94,7 +94,7 @@ pub struct SnapshotData {
     pub project_registries: RefCell<FxHashMap<project::ID, Rc<ProjectRegistryData>>>,
 }
 
-// Go: api/session.go:64 projectRegistryData
+// Go: api/session.go:91 projectRegistryData
 // projectRegistryData holds per-project type and signature registries.
 // Types and signatures use per-checker sequential IDs, so the same local ID
 // can appear in multiple projects. Separate maps per project prevent collisions
@@ -106,7 +106,7 @@ pub struct ProjectRegistryData {
 }
 
 impl SnapshotData {
-    // Go: api/session.go:49 getProgram
+    // Go: api/session.go:100 getProgram
     // getProgram looks up a program from a project handle within this snapshot.
     pub fn get_program(
         &self,
@@ -125,7 +125,7 @@ impl SnapshotData {
         Ok(program)
     }
 
-    // Go: api/session.go:88 getProject
+    // Go: api/session.go:115 getProject
     // getProject looks up a project from a project handle within this snapshot.
     // ts#64319: looked up by project ID.
     pub fn get_project(
@@ -145,7 +145,7 @@ impl SnapshotData {
         Ok(proj)
     }
 
-    // Go: api/session.go:66 nodeHandleFrom
+    // Go: api/session.go:125 nodeHandleFrom
     // nodeHandleFrom creates an index-based node handle (index.kind.path), building a node index table
     // for the file on-demand if needed.
     pub fn node_handle_from(&self, node: Node) -> NodeHandle {
@@ -156,7 +156,7 @@ impl SnapshotData {
         NodeHandle(format!("{}.{}.{}", idx, node.kind() as i16, path))
     }
 
-    // Go: api/session.go:108 getOrCreateProjectRegistry
+    // Go: api/session.go:134 getOrCreateProjectRegistry
     // getOrCreateProjectRegistry returns the registry for the given project, creating it if needed.
     pub fn get_or_create_project_registry(
         &self,
@@ -230,7 +230,7 @@ impl SnapshotData {
         Some(resp)
     }
 
-    // Go: api/session.go:176 registerSymbol
+    // Go: api/session.go:202 registerSymbol
     // registerSymbol registers a symbol in the snapshot's registry and returns its handle along with
     // its canonical project. The canonical project is the project the symbol was first observed in
     // (first writer wins for stability) and is always non-empty: every symbol handed to a client must
@@ -274,7 +274,7 @@ impl SnapshotData {
         (id, project)
     }
 
-    // Go: api/session.go:129 newTypeResponse
+    // Go: api/session.go:229 newTypeResponse
     // newTypeResponse registers a type in the project's registry and returns the response.
     pub fn new_type_response(
         &self,
@@ -349,7 +349,7 @@ impl SnapshotData {
         Some(resp)
     }
 
-    // Go: api/session.go:136 registerType
+    // Go: api/session.go:256 registerType
     pub fn register_type(
         &self,
         project_id: &project::ID,
@@ -549,7 +549,7 @@ impl SnapshotData {
         Some(resp)
     }
 
-    // Go: api/session.go:240 registerSignature
+    // Go: api/session.go:382 registerSignature
     pub fn register_signature(
         &self,
         project_id: &project::ID,
@@ -695,7 +695,7 @@ pub fn checker_signature(
     sig
 }
 
-// Go: api/session.go:265 Session
+// Go: api/session.go:407 Session
 // Session represents an API session that provides programmatic access
 // to TypeScript language services through the LSP server.
 // It implements the Handler interface to process incoming API requests.
@@ -770,7 +770,7 @@ pub struct BatchResponsePage {
 // Ensure Session implements Handler
 // PORT: the `impl Handler for Session` below.
 
-// Go: api/session.go:287 SessionOptions
+// Go: api/session.go:467 SessionOptions
 // SessionOptions configures an API session.
 #[derive(Clone, Debug, Default)]
 pub struct SessionOptions {
@@ -900,13 +900,13 @@ pub struct SnapshotOpenState {
     pub open_files: FxHashSet<tspath::Path>,
 }
 
-// Go: api/session.go:317 snapshotHandle
+// Go: api/session.go:544 snapshotHandle
 // snapshotHandle creates a snapshot handle from a snapshot's ID.
 pub fn snapshot_handle(snapshot: &project::Snapshot) -> SnapshotID {
     SnapshotID(snapshot.id())
 }
 
-// Go: api/session.go:333 checkerSetup
+// Go: api/session.go:592 checkerSetup
 // checkerSetup holds the common context needed by handlers that require a type checker.
 // PORT: Go `done func()` is the `Release` guard; it runs when the setup drops.
 pub struct CheckerSetup {
@@ -921,13 +921,13 @@ impl CheckerSetup {
     // ts#64397: Go `checkerSetup.newTypeResponse` is gone; callers use
     // `setup.sd.new_type_response(&setup.project_id, &setup.checker, t)`.
 
-    // Go: api/session.go:468 checkerSetup.newSymbolResponse
+    // Go: api/session.go:600 checkerSetup.newSymbolResponse
     pub fn new_symbol_response(&self, sym: SymbolId) -> Option<SymbolResponse> {
         self.sd
             .new_symbol_response(&self.checker, sym, &self.project_id)
     }
 
-    // Go: api/session.go:472 checkerSetup.newSignatureResponse
+    // Go: api/session.go:604 checkerSetup.newSignatureResponse
     pub fn new_signature_response(&self, sig: SignatureId) -> Option<SignatureResponse> {
         self.sd
             .new_signature_response(&self.project_id, &self.checker, sig)
@@ -968,7 +968,7 @@ impl CheckerSetup {
         Some(result)
     }
 
-    // Go: api/session.go:476 checkerSetup.resolveTypeHandle
+    // Go: api/session.go:623 checkerSetup.resolveTypeHandle
     pub fn resolve_type_handle(
         &self,
         id: TypeID,
@@ -976,7 +976,7 @@ impl CheckerSetup {
         self.sd.resolve_type_handle(&self.project_id, id)
     }
 
-    // Go: api/session.go:480 checkerSetup.resolveSymbolHandle
+    // Go: api/session.go:627 checkerSetup.resolveSymbolHandle
     pub fn resolve_symbol_handle(
         &self,
         id: SymbolID,
@@ -984,7 +984,7 @@ impl CheckerSetup {
         self.sd.resolve_symbol_handle(id)
     }
 
-    // Go: api/session.go:484 checkerSetup.resolveSignatureHandle
+    // Go: api/session.go:631 checkerSetup.resolveSignatureHandle
     pub fn resolve_signature_handle(
         &self,
         id: SignatureID,
@@ -992,7 +992,7 @@ impl CheckerSetup {
         self.sd.resolve_signature_handle(&self.project_id, id)
     }
 
-    // Go: api/session.go:525 checkerSetup.resolveLocation
+    // Go: api/session.go:637 checkerSetup.resolveLocation
     // resolveLocation resolves an optional location, given either as a node handle or as a
     // file and position. Returns nil when neither is provided.
     pub fn resolve_location(
@@ -1048,7 +1048,7 @@ fn assert_params<T: 'static>(parsed: &Option<Box<dyn AnyValue>>) -> &T {
 }
 
 impl Session {
-    // Go: api/session.go:307 ID
+    // Go: api/session.go:513 ID
     // ID returns the unique identifier for this session.
     pub fn id(&self) -> String {
         self.id.clone()
@@ -1085,7 +1085,7 @@ impl Session {
         self.snapshot_host.fs().use_case_sensitive_file_names()
     }
 
-    // Go: api/session.go:322 getSnapshotData
+    // Go: api/session.go:549 getSnapshotData
     // getSnapshotData looks up snapshot data by handle.
     pub fn get_snapshot_data(&self, handle: SnapshotID) -> Result<Rc<SnapshotData>, GoError> {
         let sd = self.snapshots.borrow().get(&handle).cloned();
@@ -1098,7 +1098,7 @@ impl Session {
         Ok(sd)
     }
 
-    // Go: api/session.go:463 retainSnapshotData (tsgo#4642)
+    // Go: api/session.go:560 retainSnapshotData (tsgo#4642)
     // retainSnapshotData pins snapshot data while an operation builds a derived snapshot.
     pub fn retain_snapshot_data(&self, handle: SnapshotID) -> Result<Rc<SnapshotData>, GoError> {
         let sd = self.snapshots.borrow().get(&handle).cloned();
@@ -1112,7 +1112,7 @@ impl Session {
         Ok(sd)
     }
 
-    // Go: api/session.go:474 releaseSnapshot (tsgo#4642)
+    // Go: api/session.go:571 releaseSnapshot (tsgo#4642)
     pub fn release_snapshot(&self, handle: SnapshotID) -> Result<(), GoError> {
         let sd = self.snapshots.borrow().get(&handle).cloned();
         let Some(sd) = sd else {
@@ -1130,7 +1130,7 @@ impl Session {
         Ok(())
     }
 
-    // Go: api/session.go:342 setupChecker
+    // Go: api/session.go:653 setupChecker
     // setupChecker resolves snapshot, program, and type checker for a project.
     // Callers must defer setup.done() to release the checker.
     pub fn setup_checker(
@@ -1156,7 +1156,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:365 setupLanguageService
+    // Go: api/session.go:685 setupLanguageService
     // setupLanguageService creates a LanguageService for the given snapshot/project.
     // Unlike setupChecker, this does NOT acquire a checker from the pool, so callers that
     // only need an LS (and not a Checker) can avoid blocking on / holding a pooled checker.
@@ -1201,7 +1201,7 @@ impl Session {
 }
 
 impl ipc::Handler for Session {
-    // Go: api/session.go:375 HandleRequest
+    // Go: api/session.go:694 HandleRequest
     // HandleRequest implements Handler.
     fn handle_request(
         &self,
@@ -1767,7 +1767,7 @@ impl ipc::Handler for Session {
         }
     }
 
-    // Go: api/session.go:609 HandleNotification
+    // Go: api/session.go:1213 HandleNotification
     // HandleNotification implements Handler.
     fn handle_notification(
         &self,
@@ -1949,7 +1949,7 @@ pub fn new_batch_response_page(responses: &[BatchResponse]) -> Result<BatchRespo
 }
 
 impl Session {
-    // Go: api/session.go:579 handleStartCPUProfile
+    // Go: api/session.go:1183 handleStartCPUProfile
     pub fn handle_start_cpu_profile(
         &self,
         _ctx: &Context,
@@ -1973,7 +1973,7 @@ impl Session {
         Ok(None)
     }
 
-    // Go: api/session.go:589 handleStopCPUProfile
+    // Go: api/session.go:1193 handleStopCPUProfile
     pub fn handle_stop_cpu_profile(&self, _ctx: &Context) -> Result<ProfileResult, GoError> {
         match self.cpu_profiler.stop_cpu_profile() {
             Ok(file_path) => Ok(ProfileResult { file: file_path }),
@@ -1984,7 +1984,7 @@ impl Session {
         }
     }
 
-    // Go: api/session.go:597 handleSaveHeapProfile
+    // Go: api/session.go:1201 handleSaveHeapProfile
     pub fn handle_save_heap_profile(
         &self,
         _ctx: &Context,
@@ -2008,7 +2008,7 @@ impl Session {
         }
     }
 
-    // Go: api/session.go:614 handleInitialize
+    // Go: api/session.go:1218 handleInitialize
     pub fn handle_initialize(&self, _ctx: &Context) -> Result<InitializeResponse, GoError> {
         Ok(InitializeResponse {
             use_case_sensitive_file_names: self.use_case_sensitive_file_names(),
@@ -2721,7 +2721,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:699 handleRelease
+    // Go: api/session.go:1592 handleRelease
     // handleRelease decrements the ref count for a snapshot.
     // The snapshot and its registries are only cleaned up when the ref count reaches zero.
     pub fn handle_release(
@@ -2740,7 +2740,7 @@ impl Session {
         Ok(to_any(true))
     }
 
-    // Go: api/session.go:997 handleGetDefaultProjectForFile
+    // Go: api/session.go:1606 handleGetDefaultProjectForFile
     // handleGetDefaultProjectForFile returns the default project for a given file,
     // or nil if no project currently contains the file.
     pub fn handle_get_default_project_for_file(
@@ -2759,7 +2759,7 @@ impl Session {
         Ok(Some(new_project_response(&proj.borrow())))
     }
 
-    // Go: api/session.go:1161 handleParseCommandLine
+    // Go: api/session.go:1749 handleParseCommandLine
     // handleParseCommandLine parses command-line arguments.
     pub fn handle_parse_command_line(
         &self,
@@ -2771,7 +2771,7 @@ impl Session {
         )))
     }
 
-    // Go: api/session.go:1166 handleReadConfigFile
+    // Go: api/session.go:1754 handleReadConfigFile
     // handleReadConfigFile reads and parses a JSON configuration file.
     pub fn handle_read_config_file(
         &self,
@@ -2807,7 +2807,7 @@ impl Session {
         Ok(response)
     }
 
-    // Go: api/session.go:1189 handleParseJsonConfigFileContent
+    // Go: api/session.go:1777 handleParseJsonConfigFileContent
     // handleParseJsonConfigFileContent parses an in-memory JSON configuration.
     pub fn handle_parse_json_config_file_content(
         &self,
@@ -2852,7 +2852,7 @@ impl Session {
         Ok(new_config_file_response(Some(&parsed_command_line)))
     }
 
-    // Go: api/session.go:737 handleParseConfigFile
+    // Go: api/session.go:1804 handleParseConfigFile
     // handleParseConfigFile parses a tsconfig.json file and returns its contents.
     pub fn handle_parse_config_file(
         &self,
@@ -3043,7 +3043,7 @@ impl Session {
         }
     }
 
-    // Go: api/session.go:1242 handleTranspile (tsgo#4849)
+    // Go: api/session.go:1830 handleTranspile (tsgo#4849)
     pub fn handle_transpile(
         &self,
         ctx: &Context,
@@ -3053,7 +3053,7 @@ impl Session {
         transpile_output(ctx, &params.input, &params.options, declaration)
     }
 
-    // Go: api/session.go:1246 handleTranspileFromFile (tsgo#4849)
+    // Go: api/session.go:1932 handleTranspileFromFile (tsgo#4849)
     pub fn handle_transpile_from_file(
         &self,
         ctx: &Context,
@@ -3162,7 +3162,7 @@ impl tsoptions::ParseConfigHost for ApiBuildSystem {
     }
 }
 
-// Go: api/session.go:1257 transpileOutput (tsgo#4849)
+// Go: api/session.go:1943 transpileOutput (tsgo#4849)
 fn transpile_output(
     ctx: &Context,
     input: &str,
@@ -3193,7 +3193,7 @@ fn transpile_output(
 }
 
 impl Session {
-    // Go: api/session.go:769 handleGetSourceFile
+    // Go: api/session.go:1971 handleGetSourceFile
     // handleGetSourceFile returns a source file from a project within a snapshot.
     pub fn handle_get_source_file(
         &self,
@@ -3213,7 +3213,7 @@ impl Session {
         )
     }
 
-    // Go: api/session.go:1301 handleGetConfigFileNames
+    // Go: api/session.go:1987 handleGetConfigFileNames
     // handleGetConfigFileNames returns tsconfig file names associated with the project's command line.
     // PORT: Go `program.CommandLine()` is never nil in the port.
     pub fn handle_get_config_file_names(
@@ -3241,7 +3241,7 @@ impl Session {
         Ok(config_files)
     }
 
-    // Go: api/session.go:1327 handleGetConfigSourceFile
+    // Go: api/session.go:2013 handleGetConfigSourceFile
     // handleGetConfigSourceFile returns a tsconfig source file associated with the project's command line.
     pub fn handle_get_config_source_file(
         &self,
@@ -3298,7 +3298,7 @@ impl Session {
         self.encode_source_file_response(Node::NIL)
     }
 
-    // Go: api/session.go:1366 encodeSourceFileResponse
+    // Go: api/session.go:2052 encodeSourceFileResponse
     // PORT: Go `*ast.SourceFile` is the root node; `Node::NIL` is nil.
     pub fn encode_source_file_response(
         &self,
@@ -3330,7 +3330,7 @@ impl Session {
         }))
     }
 
-    // Go: api/session.go:1080 handleGetSourceFileNames
+    // Go: api/session.go:2075 handleGetSourceFileNames
     // handleGetSourceFileNames returns file names of all source files in a project.
     pub fn handle_get_source_file_names(
         &self,
@@ -3349,7 +3349,7 @@ impl Session {
         Ok(result)
     }
 
-    // Go: api/session.go:1068 handleGetSourceFileMetadata
+    // Go: api/session.go:2097 handleGetSourceFileMetadata
     // handleGetSourceFileMetadata returns program-stored metadata for a single source file.
     // The client fetches this lazily per file and caches it.
     pub fn handle_get_source_file_metadata(
@@ -3574,7 +3574,7 @@ impl Session {
         ))
     }
 
-    // Go: api/session.go:804 handleGetSymbolAtPosition
+    // Go: api/session.go:2288 handleGetSymbolAtPosition
     // handleGetSymbolAtPosition returns the symbol at a position in a file.
     pub fn handle_get_symbol_at_position(
         &self,
@@ -3618,7 +3618,7 @@ impl Session {
         Ok(setup.new_symbol_response(symbol))
     }
 
-    // Go: api/session.go:1468 handleGetSymbolOfSourceFile
+    // Go: api/session.go:2317 handleGetSymbolOfSourceFile
     // handleGetSymbolOfSourceFile returns the module symbol for a source file, if any.
     // For non-module (script) files, returns nil.
     pub fn handle_get_symbol_of_source_file(
@@ -3653,7 +3653,7 @@ impl Session {
         Ok(setup.new_symbol_response(symbol))
     }
 
-    // Go: api/session.go:1488 handleGetSymbolsOfSourceFiles
+    // Go: api/session.go:2337 handleGetSymbolsOfSourceFiles
     // handleGetSymbolsOfSourceFiles returns the module symbols for multiple source files.
     pub fn handle_get_symbols_of_source_files(
         &self,
@@ -3690,7 +3690,7 @@ impl Session {
         Ok(results)
     }
 
-    // Go: api/session.go:831 handleGetSymbolsAtPositions
+    // Go: api/session.go:2359 handleGetSymbolsAtPositions
     // handleGetSymbolsAtPositions returns symbols at multiple positions in a file.
     pub fn handle_get_symbols_at_positions(
         &self,
@@ -3737,7 +3737,7 @@ impl Session {
         Ok(results)
     }
 
-    // Go: api/session.go:860 handleGetSymbolAtLocation
+    // Go: api/session.go:2389 handleGetSymbolAtLocation
     // handleGetSymbolAtLocation returns the symbol at a node location.
     pub fn handle_get_symbol_at_location(
         &self,
@@ -3764,7 +3764,7 @@ impl Session {
         Ok(setup.new_symbol_response(symbol))
     }
 
-    // Go: api/session.go:884 handleGetSymbolsAtLocations
+    // Go: api/session.go:2413 handleGetSymbolsAtLocations
     // handleGetSymbolsAtLocations returns symbols at multiple node locations.
     pub fn handle_get_symbols_at_locations(
         &self,
@@ -3792,7 +3792,7 @@ impl Session {
         Ok(results)
     }
 
-    // Go: api/session.go:910 handleGetTypeOfSymbol
+    // Go: api/session.go:2439 handleGetTypeOfSymbol
     // handleGetTypeOfSymbol returns the type of a symbol.
     pub fn handle_get_type_of_symbol(
         &self,
@@ -3813,7 +3813,7 @@ impl Session {
             .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
-    // Go: api/session.go:934 handleGetTypesOfSymbols
+    // Go: api/session.go:2455 handleGetTypesOfSymbols
     // handleGetTypesOfSymbols returns the types of multiple symbols.
     pub fn handle_get_types_of_symbols(
         &self,
@@ -3841,7 +3841,7 @@ impl Session {
         Ok(results)
     }
 
-    // Go: api/session.go:960 handleGetDeclaredTypeOfSymbol
+    // Go: api/session.go:2477 handleGetDeclaredTypeOfSymbol
     // handleGetDeclaredTypeOfSymbol returns the declared type of a symbol (e.g. the type alias body for type alias symbols).
     pub fn handle_get_declared_type_of_symbol(
         &self,
@@ -3883,7 +3883,7 @@ impl Session {
             .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
-    // Go: api/session.go:984 handleResolveName
+    // Go: api/session.go:2510 handleResolveName
     // handleResolveName resolves a name to a symbol at a given location.
     pub fn handle_resolve_name(
         &self,
@@ -3909,7 +3909,7 @@ impl Session {
         Ok(setup.new_symbol_response(symbol))
     }
 
-    // Go: api/session.go:1667 handleGetSymbolsInScope
+    // Go: api/session.go:2532 handleGetSymbolsInScope
     // handleGetSymbolsInScope returns all symbols with the given meaning that are visible at a location.
     // PORT: Go builds the list from Go maps, so its order is random; the
     // port's order is stable (`Checker::get_symbols_in_scope`).
@@ -3944,7 +3944,7 @@ impl Session {
         Ok(results)
     }
 
-    // Go: api/session.go:1015 handleGetSignaturesOfType
+    // Go: api/session.go:2557 handleGetSignaturesOfType
     // handleGetSignaturesOfType returns the call or construct signatures of a type.
     pub fn handle_get_signatures_of_type(
         &self,
@@ -3968,7 +3968,7 @@ impl Session {
         Ok(results)
     }
 
-    // Go: api/session.go:1037 handleGetResolvedSignature
+    // Go: api/session.go:2579 handleGetResolvedSignature
     // handleGetResolvedSignature returns the resolved signature of a call-like expression.
     pub fn handle_get_resolved_signature(
         &self,
@@ -3988,7 +3988,7 @@ impl Session {
         Ok(setup.new_signature_response(sig))
     }
 
-    // Go: api/session.go:1057 handleGetTypeAtLocation
+    // Go: api/session.go:2595 handleGetTypeAtLocation
     // handleGetTypeAtLocation returns the type at a node location.
     pub fn handle_get_type_at_location(
         &self,
@@ -4007,7 +4007,7 @@ impl Session {
             .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
-    // Go: api/session.go:1081 handleGetTypeAtLocations
+    // Go: api/session.go:2611 handleGetTypeAtLocations
     // handleGetTypeAtLocations returns types at multiple node locations.
     pub fn handle_get_type_at_locations(
         &self,
@@ -4031,7 +4031,7 @@ impl Session {
         Ok(results)
     }
 
-    // Go: api/session.go:1107 handleGetTypeAtPosition
+    // Go: api/session.go:2634 handleGetTypeAtPosition
     // handleGetTypeAtPosition returns the type at a position in a file.
     pub fn handle_get_type_at_position(
         &self,
@@ -4074,7 +4074,7 @@ impl Session {
             .new_type_response(&setup.project_id, &setup.checker, t))
     }
 
-    // Go: api/session.go:1134 handleGetTypesAtPositions
+    // Go: api/session.go:2661 handleGetTypesAtPositions
     // handleGetTypesAtPositions returns types at multiple positions in a file.
     pub fn handle_get_types_at_positions(
         &self,
@@ -4120,7 +4120,7 @@ impl Session {
         Ok(results)
     }
 
-    // Go: api/session.go:1162 handleGetParentOfSymbol
+    // Go: api/session.go:2690 handleGetParentOfSymbol
     pub fn handle_get_parent_of_symbol(
         &self,
         _ctx: &Context,
@@ -4131,7 +4131,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1166 handleGetMembersOfSymbol
+    // Go: api/session.go:2695 handleGetMembersOfSymbol
     pub fn handle_get_members_of_symbol(
         &self,
         ctx: &Context,
@@ -4144,7 +4144,7 @@ impl Session {
         )
     }
 
-    // Go: api/session.go:1172 handleGetExportsOfSymbol
+    // Go: api/session.go:2702 handleGetExportsOfSymbol
     pub fn handle_get_exports_of_symbol(
         &self,
         ctx: &Context,
@@ -4157,7 +4157,7 @@ impl Session {
         )
     }
 
-    // Go: api/session.go:1178 handleGetExportSymbolOfSymbol
+    // Go: api/session.go:2709 handleGetExportSymbolOfSymbol
     pub fn handle_get_export_symbol_of_symbol(
         &self,
         _ctx: &Context,
@@ -4168,7 +4168,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1182 handleGetSymbolOfType
+    // Go: api/session.go:2714 handleGetSymbolOfType
     pub fn handle_get_symbol_of_type(
         &self,
         _ctx: &Context,
@@ -4177,7 +4177,7 @@ impl Session {
         self.resolve_symbol_property_of_type(params, &|c: &Checker, t: TypeId| c.ty(t).symbol())
     }
 
-    // Go: api/session.go:1186 handleGetTargetOfType
+    // Go: api/session.go:2718 handleGetTargetOfType
     pub fn handle_get_target_of_type(
         &self,
         ctx: &Context,
@@ -4186,7 +4186,7 @@ impl Session {
         self.resolve_type_property_of_type(ctx, params, &|c: &Checker, t: TypeId| c.ty(t).target())
     }
 
-    // Go: api/session.go:1190 handleGetFreshTypeOfType
+    // Go: api/session.go:2723 handleGetFreshTypeOfType
     pub fn handle_get_fresh_type_of_type(
         &self,
         ctx: &Context,
@@ -4197,7 +4197,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1194 handleGetRegularTypeOfType
+    // Go: api/session.go:2728 handleGetRegularTypeOfType
     pub fn handle_get_regular_type_of_type(
         &self,
         ctx: &Context,
@@ -4208,7 +4208,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1198 handleGetTypesOfType
+    // Go: api/session.go:2733 handleGetTypesOfType
     pub fn handle_get_types_of_type(
         &self,
         ctx: &Context,
@@ -4219,7 +4219,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1202 handleGetTypeParametersOfType
+    // Go: api/session.go:2738 handleGetTypeParametersOfType
     pub fn handle_get_type_parameters_of_type(
         &self,
         ctx: &Context,
@@ -4230,7 +4230,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1206 handleGetOuterTypeParametersOfType
+    // Go: api/session.go:2743 handleGetOuterTypeParametersOfType
     pub fn handle_get_outer_type_parameters_of_type(
         &self,
         ctx: &Context,
@@ -4241,7 +4241,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1210 handleGetLocalTypeParametersOfType
+    // Go: api/session.go:2748 handleGetLocalTypeParametersOfType
     pub fn handle_get_local_type_parameters_of_type(
         &self,
         ctx: &Context,
@@ -4264,7 +4264,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1214 handleGetAliasTypeArgumentsOfType
+    // Go: api/session.go:2758 handleGetAliasTypeArgumentsOfType
     pub fn handle_get_alias_type_arguments_of_type(
         &self,
         ctx: &Context,
@@ -4278,7 +4278,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1223 handleGetAliasSymbolOfType
+    // Go: api/session.go:2768 handleGetAliasSymbolOfType
     pub fn handle_get_alias_symbol_of_type(
         &self,
         _ctx: &Context,
@@ -4292,7 +4292,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1232 handleGetObjectTypeOfType
+    // Go: api/session.go:2777 handleGetObjectTypeOfType
     pub fn handle_get_object_type_of_type(
         &self,
         ctx: &Context,
@@ -4303,7 +4303,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1236 handleGetIndexTypeOfType
+    // Go: api/session.go:2781 handleGetIndexTypeOfType
     pub fn handle_get_index_type_of_type(
         &self,
         ctx: &Context,
@@ -4314,7 +4314,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1240 handleGetCheckTypeOfType
+    // Go: api/session.go:2785 handleGetCheckTypeOfType
     pub fn handle_get_check_type_of_type(
         &self,
         ctx: &Context,
@@ -4325,7 +4325,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1244 handleGetExtendsTypeOfType
+    // Go: api/session.go:2789 handleGetExtendsTypeOfType
     pub fn handle_get_extends_type_of_type(
         &self,
         ctx: &Context,
@@ -4336,7 +4336,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1248 handleGetBaseTypeOfType
+    // Go: api/session.go:2793 handleGetBaseTypeOfType
     pub fn handle_get_base_type_of_type(
         &self,
         ctx: &Context,
@@ -4347,7 +4347,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1252 handleGetConstraintOfType
+    // Go: api/session.go:2799 handleGetConstraintOfType
     // handleGetConstraintOfType returns the constraint of a substitution type.
     // Type parameter constraints are handled by handleGetConstraintOfTypeParameter.
     pub fn handle_get_constraint_of_type(
@@ -4405,7 +4405,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1256 handleGetTypeParametersOfSignature
+    // Go: api/session.go:2821 handleGetTypeParametersOfSignature
     pub fn handle_get_type_parameters_of_signature(
         &self,
         ctx: &Context,
@@ -4418,7 +4418,7 @@ impl Session {
         )
     }
 
-    // Go: api/session.go:1260 handleGetParametersOfSignature
+    // Go: api/session.go:2826 handleGetParametersOfSignature
     pub fn handle_get_parameters_of_signature(
         &self,
         _ctx: &Context,
@@ -4429,7 +4429,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1264 handleGetThisParameterOfSignature
+    // Go: api/session.go:2831 handleGetThisParameterOfSignature
     pub fn handle_get_this_parameter_of_signature(
         &self,
         _ctx: &Context,
@@ -4440,7 +4440,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1268 handleGetTargetOfSignature
+    // Go: api/session.go:2836 handleGetTargetOfSignature
     pub fn handle_get_target_of_signature(
         &self,
         _ctx: &Context,
@@ -4451,7 +4451,7 @@ impl Session {
         })
     }
 
-    // Go: api/session.go:1953 handleGetImportAdderEdits (tsgo#3881, tsgo#4712)
+    // Go: api/session.go:2840 handleGetImportAdderEdits (tsgo#3881, tsgo#4712)
     // PORT: Go returns `[]*TextEdit`, and `toAPITextEdits` can return nil
     // (JSON `null`); nil is `None`.
     // PORT: Go `defer preparedSnapshot.Deref(s.projectSession)` is the
@@ -4617,7 +4617,7 @@ impl Session {
     }
 }
 
-// Go: api/session.go:2044 toAPITextEdits (tsgo#3881, tsgo#4712)
+// Go: api/session.go:2935 toAPITextEdits (tsgo#3881, tsgo#4712)
 // PORT: Go returns nil when an edit position is outside the original text;
 // nil is `None`.
 pub fn to_api_text_edits(source_file: Node, edits: &[lsproto::TextEdit]) -> Option<Vec<TextEdit>> {
@@ -4643,7 +4643,7 @@ pub fn to_api_text_edits(source_file: Node, edits: &[lsproto::TextEdit]) -> Opti
     Some(result)
 }
 
-// Go: api/session.go:2067 originalTextOffset (tsgo#4712)
+// Go: api/session.go:2958 originalTextOffset (tsgo#4712)
 // PORT: Go takes `len(originalText)`; the port takes the text. The API
 // session uses the UTF-8 encoding, so `position.character` counts Go bytes
 // after the line start. Port offsets differ from Go offsets after a marker

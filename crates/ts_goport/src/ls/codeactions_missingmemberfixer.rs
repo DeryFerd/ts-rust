@@ -884,7 +884,7 @@ impl<'a> MissingMemberFixer<'a> {
         body
     }
 
-    // Go: ls/codeactions_missingmemberfixer.go:418 createStubbedMethodBody
+    // Go: ls/codeactions_missingmemberfixer.go:434 createStubbedMethodBody
     fn create_stubbed_method_body(&self, quote_preference: lsutil::QuotePreference) -> Node {
         let mut token_flags = TokenFlags::NONE;
         if quote_preference == lsutil::QuotePreference::SINGLE {
@@ -910,7 +910,7 @@ impl<'a> MissingMemberFixer<'a> {
     }
 }
 
-// Go: ls/codeactions_missingmemberfixer.go:435 createDummyParameters
+// Go: ls/codeactions_missingmemberfixer.go:451 createDummyParameters
 fn create_dummy_parameters(
     factory: &NodeFactory,
     arg_count: i32,
@@ -965,7 +965,7 @@ fn create_dummy_parameters(
     factory.new_node_list(&parameters)
 }
 
-// Go: ls/codeactions_missingmemberfixer.go:473 createDeclarationName
+// Go: ls/codeactions_missingmemberfixer.go:489 createDeclarationName
 fn create_declaration_name(
     factory: &NodeFactory,
     type_checker: &mut Checker,
@@ -993,7 +993,7 @@ fn create_declaration_name(
     Node::NIL
 }
 
-// Go: ls/codeactions_missingmemberfixer.go:489 createPropertyName
+// Go: ls/codeactions_missingmemberfixer.go:505 createPropertyName
 fn create_property_name(
     factory: &NodeFactory,
     node: Node,

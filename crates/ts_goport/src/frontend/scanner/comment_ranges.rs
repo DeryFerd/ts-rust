@@ -9,13 +9,13 @@ use crate::scanner_util::{is_shebang_trivia, scan_shebang_trivia};
 
 use super::scanner_p1::{rune_to_char, utf8_decode_rune_in_string};
 
-// Go: scanner/scanner.go:2813 GetLeadingCommentRanges
+// Go: scanner/scanner.go:2799 GetLeadingCommentRanges
 // PORT: Go returns an `iter.Seq`. All callers collect it, so this returns a Vec.
 pub fn get_leading_comment_ranges(f: &NodeFactory, text: &str, pos: i32) -> Vec<CommentRange> {
     iterate_comment_ranges(f, text, pos, false)
 }
 
-// Go: scanner/scanner.go:2817 GetTrailingCommentRanges
+// Go: scanner/scanner.go:2803 GetTrailingCommentRanges
 pub fn get_trailing_comment_ranges(f: &NodeFactory, text: &str, pos: i32) -> Vec<CommentRange> {
     iterate_comment_ranges(f, text, pos, true)
 }
@@ -26,7 +26,7 @@ pub fn get_trailing_comment_ranges(f: &NodeFactory, text: &str, pos: i32) -> Vec
 static BLOCK_COMMENT_END: LazyLock<memmem::Finder<'static>> =
     LazyLock::new(|| memmem::Finder::new("*/"));
 
-// Go: scanner/scanner.go:2827 iterateCommentRanges
+// Go: scanner/scanner.go:2813 iterateCommentRanges
 fn iterate_comment_ranges(
     f: &NodeFactory,
     text: &str,

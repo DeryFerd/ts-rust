@@ -161,7 +161,7 @@ impl CommonJSModuleTransformer {
             .expect("currentModuleInfo is nil")
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:47 CommonJSModuleTransformer.pushNode
+    // Go: transformers/moduletransforms/commonjsmodule.go:46 CommonJSModuleTransformer.pushNode
     /// Pushes a new child node onto the ancestor tracking stack, returning the grandparent node to be restored later via `popNode`.
     pub(super) fn push_node(&mut self, node: Node) -> Node {
         let grandparent_node = self.parent_node;
@@ -170,14 +170,14 @@ impl CommonJSModuleTransformer {
         grandparent_node
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:55 CommonJSModuleTransformer.popNode
+    // Go: transformers/moduletransforms/commonjsmodule.go:54 CommonJSModuleTransformer.popNode
     /// Pops the last child node off the ancestor tracking stack, restoring the grandparent node.
     pub(super) fn pop_node(&mut self, grandparent_node: Node) {
         self.current_node = self.parent_node;
         self.parent_node = grandparent_node;
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:61 CommonJSModuleTransformer.visitTopLevel
+    // Go: transformers/moduletransforms/commonjsmodule.go:60 CommonJSModuleTransformer.visitTopLevel
     /// Visits a node at the top level of the source file.
     fn visit_top_level(&mut self, node: Node) -> Node {
         let grandparent_node = self.push_node(node);
@@ -198,7 +198,7 @@ impl CommonJSModuleTransformer {
         result
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:87 CommonJSModuleTransformer.visitTopLevelNested
+    // Go: transformers/moduletransforms/commonjsmodule.go:86 CommonJSModuleTransformer.visitTopLevelNested
     /// Visits nested elements at the top-level of a module.
     fn visit_top_level_nested(&mut self, node: Node) -> Node {
         let grandparent_node = self.push_node(node);
@@ -207,7 +207,7 @@ impl CommonJSModuleTransformer {
         result
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:95 CommonJSModuleTransformer.visitTopLevelNestedNoStack
+    // Go: transformers/moduletransforms/commonjsmodule.go:94 CommonJSModuleTransformer.visitTopLevelNestedNoStack
     /// Visits nested elements at the top-level of a module without ancestor tracking.
     fn visit_top_level_nested_no_stack(&mut self, node: Node) -> Node {
         match node.kind() {
@@ -233,7 +233,7 @@ impl CommonJSModuleTransformer {
         }
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:133 CommonJSModuleTransformer.visit
+    // Go: transformers/moduletransforms/commonjsmodule.go:131 CommonJSModuleTransformer.visit
     /// Visits source elements that are not top-level or top-level nested statements.
     fn visit(&mut self, node: Node) -> Node {
         let grandparent_node = self.push_node(node);
@@ -242,7 +242,7 @@ impl CommonJSModuleTransformer {
         result
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:141 CommonJSModuleTransformer.visitNoStack
+    // Go: transformers/moduletransforms/commonjsmodule.go:139 CommonJSModuleTransformer.visitNoStack
     /// Visits source elements that are not top-level or top-level nested statements without ancestor tracking.
     pub(super) fn visit_no_stack(&mut self, node: Node, result_is_discarded: bool) -> Node {
         // This visitor does not need to descend into the tree if there are no dynamic imports or identifiers in the subtree
@@ -286,7 +286,7 @@ impl CommonJSModuleTransformer {
         }
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:183 CommonJSModuleTransformer.visitDiscardedValue
+    // Go: transformers/moduletransforms/commonjsmodule.go:182 CommonJSModuleTransformer.visitDiscardedValue
     /// Visits source elements whose value is discarded if they are expressions.
     fn visit_discarded_value(&mut self, node: Node) -> Node {
         let grandparent_node = self.push_node(node);
@@ -295,7 +295,7 @@ impl CommonJSModuleTransformer {
         result
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:190 CommonJSModuleTransformer.visitAssignmentPattern
+    // Go: transformers/moduletransforms/commonjsmodule.go:189 CommonJSModuleTransformer.visitAssignmentPattern
     fn visit_assignment_pattern(&mut self, node: Node) -> Node {
         let grandparent_node = self.push_node(node);
         let result = self.visit_assignment_pattern_no_stack(node);
@@ -303,7 +303,7 @@ impl CommonJSModuleTransformer {
         result
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:197 CommonJSModuleTransformer.visitAssignmentPatternNoStack
+    // Go: transformers/moduletransforms/commonjsmodule.go:196 CommonJSModuleTransformer.visitAssignmentPatternNoStack
     pub(super) fn visit_assignment_pattern_no_stack(&mut self, node: Node) -> Node {
         match node.kind() {
             // AssignmentPattern
@@ -358,7 +358,7 @@ impl CommonJSModuleTransformer {
         updated
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:244 CommonJSModuleTransformer.shouldEmitUnderscoreUnderscoreESModule
+    // Go: transformers/moduletransforms/commonjsmodule.go:243 CommonJSModuleTransformer.shouldEmitUnderscoreUnderscoreESModule
     fn should_emit_underscore_underscore_es_module(&self) -> bool {
         let file = self.current_source_file;
         if tspath::file_extension_is_one_of(
@@ -379,7 +379,7 @@ impl CommonJSModuleTransformer {
         false
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:256 CommonJSModuleTransformer.createUnderscoreUnderscoreESModule
+    // Go: transformers/moduletransforms/commonjsmodule.go:255 CommonJSModuleTransformer.createUnderscoreUnderscoreESModule
     fn create_underscore_underscore_es_module(&self) -> Node {
         let ec = &self.emit_context;
         let f = ec.factory();
@@ -412,7 +412,7 @@ impl CommonJSModuleTransformer {
         statement
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:290 CommonJSModuleTransformer.transformCommonJSModule
+    // Go: transformers/moduletransforms/commonjsmodule.go:289 CommonJSModuleTransformer.transformCommonJSModule
     fn transform_common_js_module(&mut self, node: Node) -> Node {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -524,7 +524,7 @@ impl CommonJSModuleTransformer {
         result
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:388 CommonJSModuleTransformer.appendExportEqualsIfNeeded
+    // Go: transformers/moduletransforms/commonjsmodule.go:386 CommonJSModuleTransformer.appendExportEqualsIfNeeded
     /// Adds the down-level representation of `export=` to the statement list if one exists in the source file.
     ///
     /// - The `statements` parameter is a statement list to which the down-level export statements are to be appended.
@@ -553,7 +553,7 @@ impl CommonJSModuleTransformer {
         statements
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:412 CommonJSModuleTransformer.visitExportEquals
+    // Go: transformers/moduletransforms/commonjsmodule.go:410 CommonJSModuleTransformer.visitExportEquals
     fn visit_export_equals(&mut self, node: Node) -> Node {
         let grandparent_node = self.push_node(node);
         let result = self.visit_node_with(VisitorKind::Root, node.expression());
@@ -561,7 +561,7 @@ impl CommonJSModuleTransformer {
         result
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:422 CommonJSModuleTransformer.appendExportsOfImportDeclaration
+    // Go: transformers/moduletransforms/commonjsmodule.go:420 CommonJSModuleTransformer.appendExportsOfImportDeclaration
     /// Appends the exports of an ImportDeclaration to a statement list, returning the statement list.
     ///
     ///   - The `statements` parameter is a statement list to which the down-level export statements are to be appended.
@@ -619,7 +619,7 @@ impl CommonJSModuleTransformer {
         statements
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:458 CommonJSModuleTransformer.appendExportsOfVariableStatement
+    // Go: transformers/moduletransforms/commonjsmodule.go:455 CommonJSModuleTransformer.appendExportsOfVariableStatement
     /// Appends the exports of a VariableStatement to a statement list, returning the statement list.
     ///
     ///   - The `statements` parameter is a statement list to which the down-level export statements are to be appended.
@@ -636,7 +636,7 @@ impl CommonJSModuleTransformer {
         )
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:466 CommonJSModuleTransformer.appendExportsOfVariableDeclarationList
+    // Go: transformers/moduletransforms/commonjsmodule.go:463 CommonJSModuleTransformer.appendExportsOfVariableDeclarationList
     /// Appends the exports of a VariableDeclarationList to a statement list, returning the statement list.
     ///
     ///   - The `statements` parameter is a statement list to which the down-level export statements are to be appended.
@@ -662,7 +662,7 @@ impl CommonJSModuleTransformer {
         statements
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:482 CommonJSModuleTransformer.appendExportsOfBindingElement
+    // Go: transformers/moduletransforms/commonjsmodule.go:479 CommonJSModuleTransformer.appendExportsOfBindingElement
     /// Appends the exports of a VariableDeclaration or BindingElement to a statement list, returning the statement list.
     ///
     ///   - The `statements` parameter is a statement list to which the down-level export statements are to be appended.
@@ -701,7 +701,7 @@ impl CommonJSModuleTransformer {
         statements
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:505 CommonJSModuleTransformer.appendExportsOfClassOrFunctionDeclaration
+    // Go: transformers/moduletransforms/commonjsmodule.go:502 CommonJSModuleTransformer.appendExportsOfClassOrFunctionDeclaration
     /// Appends the exports of a ClassDeclaration or FunctionDeclaration to a statement list, returning the statement list.
     ///
     ///   - The `statements` parameter is a statement list to which the down-level export statements are to be appended.
@@ -749,7 +749,7 @@ impl CommonJSModuleTransformer {
         statements
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:535 CommonJSModuleTransformer.appendExportsOfDeclaration
+    // Go: transformers/moduletransforms/commonjsmodule.go:531 CommonJSModuleTransformer.appendExportsOfDeclaration
     /// Appends the exports of a declaration to a statement list, returning the statement list.
     ///
     ///   - The `statements` parameter is a statement list to which the down-level export statements are to be appended.
@@ -795,7 +795,7 @@ impl CommonJSModuleTransformer {
         statements
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:567 CommonJSModuleTransformer.appendExportStatement
+    // Go: transformers/moduletransforms/commonjsmodule.go:561 CommonJSModuleTransformer.appendExportStatement
     /// Appends the down-level representation of an export to a statement list, returning the statement list.
     ///
     ///   - The `statements` parameter is a statement list to which the down-level export statements are to be appended.
@@ -830,7 +830,7 @@ impl CommonJSModuleTransformer {
         statements
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:584 CommonJSModuleTransformer.createExportStatement
+    // Go: transformers/moduletransforms/commonjsmodule.go:578 CommonJSModuleTransformer.createExportStatement
     /// Creates a call to the current file's export function to export a value.
     ///
     ///   - The `name` parameter is the bound name of the export.
@@ -864,7 +864,7 @@ impl CommonJSModuleTransformer {
         statement
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:601 CommonJSModuleTransformer.createExportExpression
+    // Go: transformers/moduletransforms/commonjsmodule.go:595 CommonJSModuleTransformer.createExportExpression
     /// Creates a call to the current file's export function to export a value.
     ///
     ///   - The `name` parameter is the bound name of the export.
@@ -957,7 +957,7 @@ impl CommonJSModuleTransformer {
         expression
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:681 CommonJSModuleTransformer.createRequireCall
+    // Go: transformers/moduletransforms/commonjsmodule.go:679 CommonJSModuleTransformer.createRequireCall
     /// Creates a `require()` call to import an external module.
     fn create_require_call(
         &self,
@@ -989,7 +989,7 @@ impl CommonJSModuleTransformer {
         )
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:695 CommonJSModuleTransformer.getHelperExpressionForExport
+    // Go: transformers/moduletransforms/commonjsmodule.go:694 CommonJSModuleTransformer.getHelperExpressionForExport
     fn get_helper_expression_for_export(&mut self, node: Node, inner_expr: Node) -> Node {
         if get_export_needs_import_star_helper(node) {
             let helper = self
@@ -1001,7 +1001,7 @@ impl CommonJSModuleTransformer {
         inner_expr
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:702 CommonJSModuleTransformer.getHelperExpressionForImport
+    // Go: transformers/moduletransforms/commonjsmodule.go:701 CommonJSModuleTransformer.getHelperExpressionForImport
     fn get_helper_expression_for_import(&mut self, node: Node, inner_expr: Node) -> Node {
         if get_import_needs_import_star_helper(node) {
             let helper = self
@@ -1020,7 +1020,7 @@ impl CommonJSModuleTransformer {
         inner_expr
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:712 CommonJSModuleTransformer.visitTopLevelImportDeclaration
+    // Go: transformers/moduletransforms/commonjsmodule.go:711 CommonJSModuleTransformer.visitTopLevelImportDeclaration
     fn visit_top_level_import_declaration(&mut self, node: Node) -> Node {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -1133,7 +1133,7 @@ impl CommonJSModuleTransformer {
         single_or_many(Some(&statements), f)
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:825 CommonJSModuleTransformer.visitTopLevelExportDeclaration
+    // Go: transformers/moduletransforms/commonjsmodule.go:823 CommonJSModuleTransformer.visitTopLevelExportDeclaration
     fn visit_top_level_export_declaration(&mut self, node: Node) -> Node {
         if node.module_specifier().is_nil() {
             // Elide export declarations with no module specifier as they are handled
@@ -1238,7 +1238,7 @@ impl CommonJSModuleTransformer {
         statement
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:925 CommonJSModuleTransformer.visitTopLevelExportAssignment
+    // Go: transformers/moduletransforms/commonjsmodule.go:926 CommonJSModuleTransformer.visitTopLevelExportAssignment
     fn visit_top_level_export_assignment(&mut self, node: Node) -> Node {
         if node.is_export_equals() {
             return Node::NIL;
@@ -1255,7 +1255,7 @@ impl CommonJSModuleTransformer {
         )
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:939 CommonJSModuleTransformer.visitTopLevelFunctionDeclaration
+    // Go: transformers/moduletransforms/commonjsmodule.go:940 CommonJSModuleTransformer.visitTopLevelFunctionDeclaration
     fn visit_top_level_function_declaration(&mut self, node: Node) -> Node {
         if has_syntactic_modifier(node, ModifierFlags::EXPORT) {
             let ec = self.emit_context.clone();
@@ -1281,7 +1281,7 @@ impl CommonJSModuleTransformer {
         }
     }
 
-    // Go: transformers/moduletransforms/commonjsmodule.go:957 CommonJSModuleTransformer.visitTopLevelClassDeclaration
+    // Go: transformers/moduletransforms/commonjsmodule.go:958 CommonJSModuleTransformer.visitTopLevelClassDeclaration
     fn visit_top_level_class_declaration(&mut self, node: Node) -> Node {
         let ec = self.emit_context.clone();
         let f = ec.factory();

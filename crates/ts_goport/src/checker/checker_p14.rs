@@ -14,7 +14,7 @@ use crate::diagnostics::Message;
 use crate::prelude::*;
 
 impl Checker {
-    // Go: checker/checker.go:12101 tryGetThisTypeAt
+    // Go: checker/checker.go:12336 tryGetThisTypeAt
     pub fn try_get_this_type_at(&mut self, node: Node) -> TypeId {
         self.try_get_this_type_at_ex(
             node,
@@ -23,7 +23,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:12105 TryGetThisTypeAtEx
+    // Go: checker/checker.go:12340 TryGetThisTypeAtEx
     // PORT: exported and unexported Go methods share the snake name
     // `try_get_this_type_at_ex`, so the exported one gets `_exported`.
     pub fn try_get_this_type_at_ex_exported(
@@ -45,7 +45,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:12113 tryGetThisTypeAtEx
+    // Go: checker/checker.go:12348 tryGetThisTypeAtEx
     pub fn try_get_this_type_at_ex(
         &mut self,
         node: Node,
@@ -101,7 +101,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:12155 getThisContainer
+    // Go: checker/checker.go:12390 getThisContainer
     pub fn get_this_container(
         &self,
         node: Node,
@@ -176,7 +176,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:12202 isInParameterInitializerBeforeContainingFunction
+    // Go: checker/checker.go:12437 isInParameterInitializerBeforeContainingFunction
     pub fn is_in_parameter_initializer_before_containing_function(&self, node: Node) -> bool {
         let mut node = node;
         let mut in_binding_initializer = false;
@@ -197,7 +197,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:12221 checkThisInStaticClassFieldInitializerInDecoratedClass
+    // Go: checker/checker.go:12456 checkThisInStaticClassFieldInitializerInDecoratedClass
     pub fn check_this_in_static_class_field_initializer_in_decorated_class(
         &mut self,
         this_expression: Node,
@@ -221,7 +221,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:12230 checkThisBeforeSuper
+    // Go: checker/checker.go:12465 checkThisBeforeSuper
     pub fn check_this_before_super(
         &mut self,
         node: Node,
@@ -245,7 +245,7 @@ impl Checker {
     // Check if the given class-declaration extends null then return true.
     // Otherwise, return false
     // @param classDecl a class declaration to check if it extends null
-    // Go: checker/checker.go:12247 classDeclarationExtendsNull
+    // Go: checker/checker.go:12482 classDeclarationExtendsNull
     pub fn class_declaration_extends_null(&mut self, class_decl: Node) -> bool {
         let class_symbol = self.get_symbol_of_declaration(class_decl);
         let class_instance_type = self.get_declared_type_of_symbol(class_symbol);
@@ -253,7 +253,7 @@ impl Checker {
         base_constructor_type == self.null_widening_type
     }
 
-    // Go: checker/checker.go:12254 checkAssertion
+    // Go: checker/checker.go:12489 checkAssertion
     pub fn check_assertion(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         if node.kind() == SyntaxKind::TypeAssertionExpression {
             let file = get_source_file_of_node(node);
@@ -306,7 +306,7 @@ impl Checker {
         self.get_type_from_type_node(type_node)
     }
 
-    // Go: checker/checker.go:12275 checkAssertionDeferred
+    // Go: checker/checker.go:12517 checkAssertionDeferred
     pub fn check_assertion_deferred(&mut self, node: Node) {
         let type_node = node.type_();
         let links_expr_type = self.assertion_links.get(node).expr_type;
@@ -330,7 +330,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:12291 checkBinaryExpression
+    // Go: checker/checker.go:12533 checkBinaryExpression
     pub fn check_binary_expression(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         self.check_binary_like_expression(
             node.left(),
@@ -341,7 +341,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:12296 checkBinaryLikeExpression
+    // Go: checker/checker.go:12538 checkBinaryLikeExpression
     pub fn check_binary_like_expression(
         &mut self,
         left: Node,
@@ -763,7 +763,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:12512 checkDestructuringAssignment
+    // Go: checker/checker.go:12754 checkDestructuringAssignment
     pub fn check_destructuring_assignment(
         &mut self,
         node: Node,
@@ -815,7 +815,7 @@ impl Checker {
         self.check_reference_assignment(target, source_type, check_mode)
     }
 
-    // Go: checker/checker.go:12545 checkObjectLiteralAssignment
+    // Go: checker/checker.go:12787 checkObjectLiteralAssignment
     pub fn check_object_literal_assignment(
         &mut self,
         node: Node,
@@ -839,7 +839,7 @@ impl Checker {
     }
 
     // Note: If property cannot be a SpreadAssignment, then allProperties does not need to be provided
-    // Go: checker/checker.go:12557 checkObjectLiteralDestructuringPropertyAssignment
+    // Go: checker/checker.go:12799 checkObjectLiteralDestructuringPropertyAssignment
     pub fn check_object_literal_destructuring_property_assignment(
         &mut self,
         node: Node,
@@ -933,7 +933,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:12603 checkArrayLiteralAssignment
+    // Go: checker/checker.go:12850 checkArrayLiteralAssignment
     pub fn check_array_literal_assignment(
         &mut self,
         node: Node,
@@ -991,7 +991,7 @@ impl Checker {
         source_type
     }
 
-    // Go: checker/checker.go:12623 checkArrayLiteralDestructuringElementAssignment
+    // Go: checker/checker.go:12870 checkArrayLiteralDestructuringElementAssignment
     pub fn check_array_literal_destructuring_element_assignment(
         &mut self,
         node: Node,
@@ -1087,7 +1087,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:12664 checkReferenceAssignment
+    // Go: checker/checker.go:12911 checkReferenceAssignment
     pub fn check_reference_assignment(
         &mut self,
         target: Node,
@@ -1118,7 +1118,7 @@ impl Checker {
         source_type
     }
 
-    // Go: checker/checker.go:12678 reportOperatorError
+    // Go: checker/checker.go:12925 reportOperatorError
     pub fn report_operator_error(
         &mut self,
         left_type: TypeId,
@@ -1170,7 +1170,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:12699 reportOperatorErrorUnless
+    // Go: checker/checker.go:12946 reportOperatorErrorUnless
     pub fn report_operator_error_unless(
         &mut self,
         left_type: TypeId,
@@ -1190,7 +1190,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:12705 getBaseTypesIfUnrelated
+    // Go: checker/checker.go:12952 getBaseTypesIfUnrelated
     pub fn get_base_types_if_unrelated(
         &mut self,
         left_type: TypeId,
@@ -1208,7 +1208,7 @@ impl Checker {
         (effective_left, effective_right)
     }
 
-    // Go: checker/checker.go:12717 checkAssignmentOperator
+    // Go: checker/checker.go:12964 checkAssignmentOperator
     pub fn check_assignment_operator(
         &mut self,
         left: Node,
@@ -1262,13 +1262,13 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:12743 bothAreBigIntLike
+    // Go: checker/checker.go:12990 bothAreBigIntLike
     pub fn both_are_big_int_like(&mut self, left: TypeId, right: TypeId) -> bool {
         self.is_type_assignable_to_kind(left, TypeFlags::BIG_INT_LIKE)
             && self.is_type_assignable_to_kind(right, TypeFlags::BIG_INT_LIKE)
     }
 
-    // Go: checker/checker.go:12747 getSuggestedBooleanOperator
+    // Go: checker/checker.go:12994 getSuggestedBooleanOperator
     pub fn get_suggested_boolean_operator(&self, operator: SyntaxKind) -> SyntaxKind {
         match operator {
             SyntaxKind::BarToken | SyntaxKind::BarEqualsToken => SyntaxKind::BarBarToken,
@@ -1282,7 +1282,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:12759 checkArithmeticOperandType
+    // Go: checker/checker.go:13006 checkArithmeticOperandType
     pub fn check_arithmetic_operand_type(
         &mut self,
         operand: Node,
@@ -1305,7 +1305,7 @@ impl Checker {
     }
 
     // Return true if there was no error, false if there was an error.
-    // Go: checker/checker.go:12772 checkForDisallowedESSymbolOperand
+    // Go: checker/checker.go:13019 checkForDisallowedESSymbolOperand
     pub fn check_for_disallowed_es_symbol_operand(
         &mut self,
         left: Node,
@@ -1334,7 +1334,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:12787 checkNaNEquality
+    // Go: checker/checker.go:13034 checkNaNEquality
     pub fn check_na_n_equality(
         &mut self,
         error_node: Node,
@@ -1391,7 +1391,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:12813 isGlobalNaN
+    // Go: checker/checker.go:13060 isGlobalNaN
     pub fn is_global_na_n(&mut self, expr: Node) -> bool {
         if is_identifier(expr) && expr.text() == "NaN" {
             let global_na_n_symbol = (self.get_global_na_n_symbol_or_nil.clone())(self);
@@ -1401,13 +1401,13 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:12821 isTypeEqualityComparableTo
+    // Go: checker/checker.go:13068 isTypeEqualityComparableTo
     pub fn is_type_equality_comparable_to(&mut self, source: TypeId, target: TypeId) -> bool {
         self.ty(target).flags.intersects(TypeFlags::NULLABLE)
             || self.is_type_comparable_to(source, target)
     }
 
-    // Go: checker/checker.go:12825 checkTruthinessOfType
+    // Go: checker/checker.go:13072 checkTruthinessOfType
     pub fn check_truthiness_of_type(&mut self, t: TypeId, node: Node) -> TypeId {
         if self.ty(t).flags.intersects(TypeFlags::VOID) {
             self.error(
@@ -1434,7 +1434,7 @@ impl Checker {
 
     // PORT: Go `type PredicateSemantics` and its consts live in `flags.rs`.
 
-    // Go: checker/checker.go:12846 getSyntacticTruthySemantics
+    // Go: checker/checker.go:13093 getSyntacticTruthySemantics
     pub fn get_syntactic_truthy_semantics(&mut self, node: Node) -> PredicateSemantics {
         let node = skip_outer_expressions(node, OuterExpressionKinds::OEK_ALL);
         match node.kind() {
@@ -1479,7 +1479,7 @@ impl Checker {
         PredicateSemantics::SOMETIMES
     }
 
-    // Go: checker/checker.go:12875 checkNullishCoalesceOperands
+    // Go: checker/checker.go:13122 checkNullishCoalesceOperands
     pub fn check_nullish_coalesce_operands(&mut self, left: Node, right: Node) {
         if is_binary_expression(left.parent().parent()) {
             let grandparent_left = left.parent().parent().left();
@@ -1526,7 +1526,7 @@ impl Checker {
         self.check_nullish_coalesce_operand_left(left);
     }
 
-    // Go: checker/checker.go:12896 checkNullishCoalesceOperandLeft
+    // Go: checker/checker.go:13143 checkNullishCoalesceOperandLeft
     pub fn check_nullish_coalesce_operand_left(&mut self, left: Node) {
         let left_target = skip_outer_expressions(left, OuterExpressionKinds::OEK_ALL);
         let nullish_semantics = self.get_syntactic_nullishness_semantics(left_target);
@@ -1547,7 +1547,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:12908 getSyntacticNullishnessSemantics
+    // Go: checker/checker.go:13155 getSyntacticNullishnessSemantics
     pub fn get_syntactic_nullishness_semantics(&mut self, node: Node) -> PredicateSemantics {
         let node = skip_outer_expressions(node, OuterExpressionKinds::OEK_ALL);
         match node.kind() {
@@ -1610,7 +1610,7 @@ impl Checker {
     // does not have side effects.
     // The intent is to "smell test" an expression for correctness in positions where
     // its value is discarded (e.g. the left side of the comma operator).
-    // Go: checker/checker.go:12959 isSideEffectFree
+    // Go: checker/checker.go:13218 isSideEffectFree
     pub fn is_side_effect_free(&self, node: Node) -> bool {
         let node = skip_parentheses(node);
         match node.kind() {
@@ -1661,7 +1661,7 @@ impl Checker {
     }
 
     // Return true for "indirect calls", (i.e. `(0, x.f)(...)` or `(0, eval)(...)`), which prevents passing `this`.
-    // Go: checker/checker.go:12987 isIndirectCall
+    // Go: checker/checker.go:13246 isIndirectCall
     pub fn is_indirect_call(&self, node: Node) -> bool {
         let left = node.left();
         let right = node.right();
@@ -1674,7 +1674,7 @@ impl Checker {
             && (is_access_expression(right) || is_identifier(right) && right.text() == "eval")
     }
 
-    // Go: checker/checker.go:12995 checkInstanceOfExpression
+    // Go: checker/checker.go:13254 checkInstanceOfExpression
     pub fn check_instance_of_expression(
         &mut self,
         left: Node,

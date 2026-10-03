@@ -385,7 +385,7 @@ impl Watcher {
         Ok(())
     }
 
-    // Go: lsp/lspwatcher/lspwatcher.go:174 Watcher.UnwatchFiles
+    // Go: lsp/lspwatcher/lspwatcher.go:179 Watcher.UnwatchFiles
     // UnwatchFiles tears down all subscriptions associated with id.
     pub fn unwatch_files(&self, id: &str) -> Result<(), GoError> {
         let watches = self.watches.borrow_mut().shift_remove(id);
@@ -401,7 +401,7 @@ impl Watcher {
         Ok(())
     }
 
-    // Go: lsp/lspwatcher/lspwatcher.go:190 Watcher.Close
+    // Go: lsp/lspwatcher/lspwatcher.go:195 Watcher.Close
     // Close removes every subscription. Safe to call multiple times.
     pub fn close(&self) {
         if self.closed.get() {
@@ -420,7 +420,7 @@ impl Watcher {
         }
     }
 
-    // Go: lsp/lspwatcher/lspwatcher.go:392 Watcher.forwardEvents
+    // Go: lsp/lspwatcher/lspwatcher.go:396 Watcher.forwardEvents
     // forwardEvents translates fswatch events into LSP file events and enqueues
     // them for the next debounced flush.
     pub fn forward_events(self: &Rc<Self>, kind: lsproto::WatchKind, events: &[fswatch::Event]) {
@@ -467,7 +467,7 @@ impl Watcher {
         self.schedule_flush_locked();
     }
 
-    // Go: lsp/lspwatcher/lspwatcher.go:439 Watcher.emitSyntheticCreates
+    // Go: lsp/lspwatcher/lspwatcher.go:442 Watcher.emitSyntheticCreates
     // emitSyntheticCreates enqueues synthetic create events after a target watch is
     // (re)installed following a missing→present transition, so the session
     // re-resolves files that appeared before the real watch existed. The target
@@ -511,7 +511,7 @@ impl Watcher {
         self.enqueue_synthetic_creates(&paths);
     }
 
-    // Go: lsp/lspwatcher/lspwatcher.go:472 Watcher.enqueueSyntheticCreates
+    // Go: lsp/lspwatcher/lspwatcher.go:469 Watcher.enqueueSyntheticCreates
     // enqueueSyntheticCreates adds synthetic create events for paths, without
     // clobbering a more specific event already pending for the same path (e.g. a
     // real delete).
@@ -539,7 +539,7 @@ impl Watcher {
         self.schedule_flush_locked();
     }
 
-    // Go: lsp/lspwatcher/lspwatcher.go:497 Watcher.scheduleFlushLocked
+    // Go: lsp/lspwatcher/lspwatcher.go:494 Watcher.scheduleFlushLocked
     // scheduleFlushLocked arms the debounce flush timer if it isn't already armed.
     // Callers must hold w.mu.
     pub fn schedule_flush_locked(self: &Rc<Self>) {
@@ -550,7 +550,7 @@ impl Watcher {
         }
     }
 
-    // Go: lsp/lspwatcher/lspwatcher.go:521 Watcher.flush
+    // Go: lsp/lspwatcher/lspwatcher.go:500 Watcher.flush
     pub fn flush(&self) {
         if self.closed.get() {
             return;
@@ -572,7 +572,7 @@ impl Watcher {
 }
 
 impl Watch {
-    // Go: lsp/lspwatcher/lspwatcher.go:214 watch.close
+    // Go: lsp/lspwatcher/lspwatcher.go:219 watch.close
     // close tears down the watch's current subscription and prevents any in-flight
     // reconcile from reinstalling one.
     pub fn close(&self) {
@@ -584,7 +584,7 @@ impl Watch {
         }
     }
 
-    // Go: lsp/lspwatcher/lspwatcher.go:239 watch.reconcile
+    // Go: lsp/lspwatcher/lspwatcher.go:244 watch.reconcile
     // reconcile installs or advances this watch toward the target directory based
     // on the current filesystem state. It is called at registration, whenever a
     // ancestor watch observes activity, and after a target watch is terminated by
@@ -668,7 +668,7 @@ impl Watch {
         }
     }
 
-    // Go: lsp/lspwatcher/lspwatcher.go:313 watch.targetCallback
+    // Go: lsp/lspwatcher/lspwatcher.go:318 watch.targetCallback
     // targetCallback returns the fswatch callback for a target watch rooted at
     // watchedReal. It forwards events to the session and, on ErrWatchTerminated
     // (the watched directory was deleted), falls back to watching the nearest
@@ -712,7 +712,7 @@ impl Watch {
         })
     }
 
-    // Go: lsp/lspwatcher/lspwatcher.go:346 watch.handleTerminated
+    // Go: lsp/lspwatcher/lspwatcher.go:351 watch.handleTerminated
     // handleTerminated clears the dead target watch (the backend has already
     // removed it) and re-evaluates, falling back to an ancestor watch on the nearest
     // existing ancestor so the watch re-attaches when the directory reappears.
@@ -733,7 +733,7 @@ impl Watch {
         let _ = self.reconcile(true /*emitSyntheticCreates*/);
     }
 
-    // Go: lsp/lspwatcher/lspwatcher.go:367 watch.ancestorCallback
+    // Go: lsp/lspwatcher/lspwatcher.go:372 watch.ancestorCallback
     // ancestorCallback returns the fswatch callback for an ancestor watch. Ancestor
     // watches exist only to detect the target — or an intermediate path component —
     // being created; their events are about ancestor directories the session
@@ -746,7 +746,7 @@ impl Watch {
     }
 }
 
-// Go: lsp/lspwatcher/lspwatcher.go:376 nearestExistingAncestor
+// Go: lsp/lspwatcher/lspwatcher.go:381 nearestExistingAncestor
 // nearestExistingAncestor returns the deepest existing directory that is dir or
 // an ancestor of dir, walking upward. ok is false only if nothing in the chain
 // (including the root) exists.
@@ -764,7 +764,7 @@ pub fn nearest_existing_ancestor(fs: &dyn vfs::Fs, dir: &str) -> (String, bool) 
     }
 }
 
-// Go: lsp/lspwatcher/lspwatcher.go:552 watchRoot
+// Go: lsp/lspwatcher/lspwatcher.go:531 watchRoot
 // watchRoot extracts the directory the fswatch subscription should be
 // rooted at from a FileSystemWatcher. The patterns the project layer
 // produces are of the form `<dir>/**/*` (recursive) or `<dir>/*`
@@ -790,7 +790,7 @@ pub fn watch_root(file_system_watcher: &lsproto::FileSystemWatcher) -> (String, 
     (String::new(), false)
 }
 
-// Go: lsp/lspwatcher/lspwatcher.go:569 rootFromGlob
+// Go: lsp/lspwatcher/lspwatcher.go:548 rootFromGlob
 pub fn root_from_glob(pattern: &str) -> String {
     let pattern = tspath::normalize_slashes(pattern);
     let mut meta_index: i32 = -1;
@@ -812,7 +812,7 @@ pub fn root_from_glob(pattern: &str) -> String {
     tspath::normalize_path(directory)
 }
 
-// Go: lsp/lspwatcher/lspwatcher.go:591 watchPatternString
+// Go: lsp/lspwatcher/lspwatcher.go:570 watchPatternString
 pub fn watch_pattern_string(file_system_watcher: &lsproto::FileSystemWatcher) -> String {
     if let Some(pattern) = &file_system_watcher.glob_pattern.pattern {
         return pattern.clone();
@@ -827,7 +827,7 @@ pub fn watch_pattern_string(file_system_watcher: &lsproto::FileSystemWatcher) ->
     String::new()
 }
 
-// Go: lsp/lspwatcher/lspwatcher.go:608 isRecursiveGlob
+// Go: lsp/lspwatcher/lspwatcher.go:587 isRecursiveGlob
 // isRecursiveGlob reports whether a FileSystemWatcher's pattern requests
 // recursive watching (contains a `**` segment). Granular watch mode emits
 // non-recursive `<dir>/*` patterns, which watch only the immediate directory.
@@ -835,7 +835,7 @@ pub fn is_recursive_glob(file_system_watcher: &lsproto::FileSystemWatcher) -> bo
     watch_pattern_string(file_system_watcher).contains("**")
 }
 
-// Go: lsp/lspwatcher/lspwatcher.go:612 effectiveKind
+// Go: lsp/lspwatcher/lspwatcher.go:591 effectiveKind
 pub fn effective_kind(file_system_watcher: &lsproto::FileSystemWatcher) -> lsproto::WatchKind {
     if let Some(kind) = file_system_watcher.kind {
         return kind;

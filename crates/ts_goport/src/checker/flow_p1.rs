@@ -205,7 +205,7 @@ impl Checker {
         result_type
     }
 
-    // Go: checker/flow.go:118 getTypeAtFlowNode
+    // Go: checker/flow.go:117 getTypeAtFlowNode
     pub fn get_type_at_flow_node(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -344,7 +344,7 @@ impl Checker {
     }
 }
 
-// Go: checker/flow.go:204 getBranchLabelAntecedents
+// Go: checker/flow.go:208 getBranchLabelAntecedents
 // PORT: Go returns the `*ast.FlowList`; here it is the antecedent slice of a
 // flow node (see `core::FlowNode::antecedents` and `ReduceLabel`): borrowed
 // from `flow_data`, or a copy of a reduce label's list (the caller changes
@@ -367,7 +367,7 @@ pub fn get_branch_label_antecedents<'a>(
 }
 
 impl Checker {
-    // Go: checker/flow.go:216 getTypeAtFlowAssignment
+    // Go: checker/flow.go:220 getTypeAtFlowAssignment
     // PERF: `flow_data` is `flow.get_flow()`, which the caller has read
     // (perf14), so a freeable file version is not pinned again (lsshells M3
     // repair).
@@ -484,7 +484,7 @@ impl Checker {
         FlowType::default()
     }
 
-    // Go: checker/flow.go:280 getInitialOrAssignedType
+    // Go: checker/flow.go:276 getInitialOrAssignedType
     // PORT: takes `flow.Node` (`node`), the only part of the flow node it reads.
     pub fn get_initial_or_assigned_type(
         &mut self,
@@ -504,7 +504,7 @@ impl Checker {
         self.get_narrowable_type_for_reference(assigned_type, reference, CheckMode::NORMAL)
     }
 
-    // Go: checker/flow.go:287 isEmptyArrayAssignment
+    // Go: checker/flow.go:283 isEmptyArrayAssignment
     pub fn is_empty_array_assignment(&self, node: Node) -> bool {
         is_variable_declaration(node)
             && node.initializer().is_some()
@@ -514,7 +514,7 @@ impl Checker {
                 && is_empty_array_literal(node.parent().right())
     }
 
-    // Go: checker/flow.go:292 getTypeAtFlowCall
+    // Go: checker/flow.go:288 getTypeAtFlowCall
     // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_flow_call(
         &mut self,
@@ -571,7 +571,7 @@ impl Checker {
         FlowType::default()
     }
 
-    // Go: checker/flow.go:320 narrowTypeByTypePredicate
+    // Go: checker/flow.go:316 narrowTypeByTypePredicate
     pub fn narrow_type_by_type_predicate(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -648,7 +648,7 @@ impl Checker {
         self.narrow_type(f, t, node, true /*assumeTrue*/)
     }
 
-    // Go: checker/flow.go:353 getTypeAtFlowCondition
+    // Go: checker/flow.go:354 getTypeAtFlowCondition
     // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_flow_condition(
         &mut self,
@@ -675,7 +675,7 @@ impl Checker {
         self.new_flow_type(narrowed_type, flow_type.incomplete)
     }
 
-    // Go: checker/flow.go:376 narrowType
+    // Go: checker/flow.go:377 narrowType
     // Narrow the given type based on the given expression having the assumed boolean value. The returned type
     // will be a subtype or the same type as the argument.
     pub fn narrow_type(
@@ -753,7 +753,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/flow.go:418 narrowTypeByOptionality
+    // Go: checker/flow.go:415 narrowTypeByOptionality
     pub fn narrow_type_by_optionality(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -788,7 +788,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/flow.go:431 narrowTypeByTruthiness
+    // Go: checker/flow.go:428 narrowTypeByTruthiness
     pub fn narrow_type_by_truthiness(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -830,7 +830,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/flow.go:447 narrowTypeByCallExpression
+    // Go: checker/flow.go:444 narrowTypeByCallExpression
     pub fn narrow_type_by_call_expression(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -888,7 +888,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/flow.go:472 narrowTypeByBinaryExpression
+    // Go: checker/flow.go:469 narrowTypeByBinaryExpression
     // PORT: Go takes `*ast.BinaryExpression`; this takes the node.
     pub fn narrow_type_by_binary_expression(
         &mut self,
@@ -1062,7 +1062,7 @@ impl Checker {
 }
 
 impl Checker {
-    // Go: checker/flow.go:563 narrowTypeByEquality
+    // Go: checker/flow.go:556 narrowTypeByEquality
     pub fn narrow_type_by_equality(
         &mut self,
         t: TypeId,
@@ -1150,7 +1150,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/flow.go:602 narrowTypeByTypeof
+    // Go: checker/flow.go:614 narrowTypeByTypeof
     // PORT: Go takes `*ast.TypeOfExpression`; this takes the node.
     pub fn narrow_type_by_typeof(
         &mut self,
@@ -1190,7 +1190,7 @@ impl Checker {
     }
 }
 
-// Go: checker/flow.go:623 typeofNEFacts
+// Go: checker/flow.go:635 typeofNEFacts
 // PORT: Go package map var; read with `TYPEOF_NE_FACTS.get(name)`.
 pub static TYPEOF_NE_FACTS: LazyLock<FxHashMap<&'static str, TypeFacts>> = LazyLock::new(|| {
     let mut m = FxHashMap::default();
@@ -1206,7 +1206,7 @@ pub static TYPEOF_NE_FACTS: LazyLock<FxHashMap<&'static str, TypeFacts>> = LazyL
 });
 
 impl Checker {
-    // Go: checker/flow.go:634 narrowTypeByLiteralExpression
+    // Go: checker/flow.go:646 narrowTypeByLiteralExpression
     pub fn narrow_type_by_literal_expression(
         &mut self,
         t: TypeId,
@@ -1223,7 +1223,7 @@ impl Checker {
         self.get_adjusted_type_with_facts(t, facts)
     }
 
-    // Go: checker/flow.go:645 narrowTypeByTypeName
+    // Go: checker/flow.go:657 narrowTypeByTypeName
     pub fn narrow_type_by_type_name(&mut self, t: TypeId, type_name: &str) -> TypeId {
         match type_name {
             "string" => {
@@ -1277,7 +1277,7 @@ impl Checker {
         self.narrow_type_by_type_facts(t, implied, TypeFacts::TYPEOF_EQ_HOST_OBJECT)
     }
 
-    // Go: checker/flow.go:673 narrowTypeByTypeFacts
+    // Go: checker/flow.go:685 narrowTypeByTypeFacts
     pub fn narrow_type_by_type_facts(
         &mut self,
         t: TypeId,
@@ -1300,7 +1300,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/flow.go:690 narrowTypeByDiscriminantProperty
+    // Go: checker/flow.go:702 narrowTypeByDiscriminantProperty
     pub fn narrow_type_by_discriminant_property(
         &mut self,
         t: TypeId,
@@ -1340,7 +1340,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/flow.go:715 narrowTypeByDiscriminant
+    // Go: checker/flow.go:725 narrowTypeByDiscriminant
     pub fn narrow_type_by_discriminant(
         &mut self,
         t: TypeId,
@@ -1379,7 +1379,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/flow.go:740 isMatchingConstructorReference
+    // Go: checker/flow.go:750 isMatchingConstructorReference
     pub fn is_matching_constructor_reference(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -1399,7 +1399,7 @@ impl Checker {
             && self.is_matching_reference(reference, expr.expression())
     }
 
-    // Go: checker/flow.go:749 narrowTypeByConstructor
+    // Go: checker/flow.go:760 narrowTypeByConstructor
     pub fn narrow_type_by_constructor(
         &mut self,
         t: TypeId,
@@ -1447,7 +1447,7 @@ impl Checker {
         self.filter_type(t, &mut |c, t| c.is_constructed_by(t, candidate))
     }
 
-    // Go: checker/flow.go:785 isConstructedBy
+    // Go: checker/flow.go:794 isConstructedBy
     pub fn is_constructed_by(&mut self, source: TypeId, target: TypeId) -> bool {
         // If either the source or target type are a class type then we need to check that they are the same exact type.
         // This is because you may have a class `A` that defines some set of properties, and another class `B`
@@ -1472,7 +1472,7 @@ impl Checker {
         self.is_type_subtype_of(source, target)
     }
 
-    // Go: checker/flow.go:797 narrowTypeByBooleanComparison
+    // Go: checker/flow.go:806 narrowTypeByBooleanComparison
     pub fn narrow_type_by_boolean_comparison(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -1488,7 +1488,7 @@ impl Checker {
         self.narrow_type(f, t, expr, assume_true)
     }
 
-    // Go: checker/flow.go:802 narrowTypeByInstanceof
+    // Go: checker/flow.go:811 narrowTypeByInstanceof
     // PORT: Go takes `*ast.BinaryExpression`; this takes the node.
     pub fn narrow_type_by_instanceof(
         &mut self,
@@ -1548,7 +1548,7 @@ impl Checker {
         self.get_narrowed_type(t, instance_type, assume_true, true /*checkDerived*/)
     }
 
-    // Go: checker/flow.go:837 getNarrowedType
+    // Go: checker/flow.go:846 getNarrowedType
     pub fn get_narrowed_type(
         &mut self,
         t: TypeId,
@@ -1573,7 +1573,7 @@ impl Checker {
         narrowed_type
     }
 
-    // Go: checker/flow.go:850 getNarrowedTypeWorker
+    // Go: checker/flow.go:859 getNarrowedTypeWorker
     pub fn get_narrowed_type_worker(
         &mut self,
         t: TypeId,

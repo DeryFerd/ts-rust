@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::sync::LazyLock;
 
 impl Checker {
-    // Go: checker/flow.go:953 getInstanceType
+    // Go: checker/flow.go:966 getInstanceType
     pub fn get_instance_type(&mut self, constructor_type: TypeId) -> TypeId {
         let prototype_property_type =
             self.get_type_of_property_of_type(constructor_type, "prototype");
@@ -32,7 +32,7 @@ impl Checker {
         self.empty_object_type
     }
 
-    // Go: checker/flow.go:969 narrowTypeByPrivateIdentifierInInExpression
+    // Go: checker/flow.go:982 narrowTypeByPrivateIdentifierInInExpression
     // PORT: Go `*ast.BinaryExpression` is the binary expression `Node`.
     pub fn narrow_type_by_private_identifier_in_in_expression(
         &mut self,
@@ -60,7 +60,7 @@ impl Checker {
         self.get_narrowed_type(t, target_type, assume_true, true /*checkDerived*/)
     }
 
-    // Go: checker/flow.go:988 narrowTypeByInKeyword
+    // Go: checker/flow.go:1001 narrowTypeByInKeyword
     pub fn narrow_type_by_in_keyword(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -97,7 +97,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/flow.go:1011 isTypePresencePossible
+    // Go: checker/flow.go:1024 isTypePresencePossible
     pub fn is_type_presence_possible(
         &mut self,
         t: TypeId,
@@ -115,7 +115,7 @@ impl Checker {
             || !assume_true
     }
 
-    // Go: checker/flow.go:1019 narrowTypeByOptionalChainContainment
+    // Go: checker/flow.go:1032 narrowTypeByOptionalChainContainment
     pub fn narrow_type_by_optional_chain_containment(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -160,7 +160,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/flow.go:1046 getTypeAtSwitchClause
+    // Go: checker/flow.go:1059 getTypeAtSwitchClause
     // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_switch_clause(
         &mut self,
@@ -214,7 +214,7 @@ impl Checker {
         self.new_flow_type(t, flow_type.incomplete)
     }
 
-    // Go: checker/flow.go:1078 narrowTypeBySwitchOnDiscriminant
+    // Go: checker/flow.go:1091 narrowTypeBySwitchOnDiscriminant
     pub fn narrow_type_by_switch_on_discriminant(
         &mut self,
         t: TypeId,
@@ -308,7 +308,7 @@ impl Checker {
         self.get_union_type(&[case_type, default_type])
     }
 
-    // Go: checker/flow.go:1136 narrowTypeBySwitchOnTypeOf
+    // Go: checker/flow.go:1157 narrowTypeBySwitchOnTypeOf
     pub fn narrow_type_by_switch_on_type_of(
         &mut self,
         t: TypeId,
@@ -359,7 +359,7 @@ impl Checker {
         self.get_union_type(&types)
     }
 
-    // Go: checker/flow.go:1166 narrowTypeBySwitchOnTrue
+    // Go: checker/flow.go:1187 narrowTypeBySwitchOnTrue
     pub fn narrow_type_by_switch_on_true(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -411,7 +411,7 @@ impl Checker {
         self.get_union_type(&types)
     }
 
-    // Go: checker/flow.go:1202 narrowTypeBySwitchOptionalChainContainment
+    // Go: checker/flow.go:1223 narrowTypeBySwitchOptionalChainContainment
     pub fn narrow_type_by_switch_optional_chain_containment(
         &mut self,
         t: TypeId,
@@ -435,7 +435,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/flow.go:1210 narrowTypeBySwitchOnDiscriminantProperty
+    // Go: checker/flow.go:1231 narrowTypeBySwitchOnDiscriminantProperty
     pub fn narrow_type_by_switch_on_discriminant_property(
         &mut self,
         t: TypeId,
@@ -469,7 +469,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/flow.go:1232 getTypeAtFlowBranchLabel
+    // Go: checker/flow.go:1253 getTypeAtFlowBranchLabel
     // PORT: Go `*ast.FlowList` is the antecedent slice in list order. Go's
     // `flow` parameter is not read, so it is left out.
     pub fn get_type_at_flow_branch_label(
@@ -574,7 +574,7 @@ impl Checker {
     // At flow control branch or loop junctions, if the type along every antecedent code path
     // is an evolving array type, we construct a combined evolving array type. Otherwise we
     // finalize all evolving array types.
-    // Go: checker/flow.go:1293 getUnionOrEvolvingArrayType
+    // Go: checker/flow.go:1314 getUnionOrEvolvingArrayType
     pub fn get_union_or_evolving_array_type(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -605,7 +605,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/flow.go:1304 getTypeAtFlowLoopLabel
+    // Go: checker/flow.go:1325 getTypeAtFlowLoopLabel
     // PERF: `flow_data` is `flow.get_flow()`, which the caller has read.
     pub fn get_type_at_flow_loop_label(
         &mut self,
@@ -744,7 +744,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/flow.go:1383 getTypeAtFlowArrayMutation
+    // Go: checker/flow.go:1404 getTypeAtFlowArrayMutation
     // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_flow_array_mutation(
         &mut self,
@@ -793,7 +793,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/flow.go:1415 getDiscriminantPropertyAccess
+    // Go: checker/flow.go:1436 getDiscriminantPropertyAccess
     pub fn get_discriminant_property_access(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -826,7 +826,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/flow.go:1436 getCandidateDiscriminantPropertyAccess
+    // Go: checker/flow.go:1457 getCandidateDiscriminantPropertyAccess
     pub fn get_candidate_discriminant_property_access(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -888,7 +888,7 @@ impl Checker {
     }
 }
 
-// Go: checker/flow.go:1475 getCandidateVariableDeclarationInitializer
+// Go: checker/flow.go:1496 getCandidateVariableDeclarationInitializer
 pub fn get_candidate_variable_declaration_initializer(node: Node) -> Node {
     if is_variable_declaration(node) && node.type_().is_nil() {
         let initializer = node.initializer();
@@ -904,7 +904,7 @@ impl Checker {
     // 'x.push(value)' or 'x[n] = value' operation along the control flow graph. Evolving
     // array types are ultimately converted into manifest array types (using getFinalArrayType)
     // and never escape the getFlowTypeOfReference function.
-    // Go: checker/flow.go:1488 getEvolvingArrayType
+    // Go: checker/flow.go:1509 getEvolvingArrayType
     pub fn get_evolving_array_type(&mut self, element_type: TypeId) -> TypeId {
         let key = CachedTypeKey {
             kind: CachedTypeKind::EVOLVING_ARRAY_TYPE,
@@ -921,7 +921,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/flow.go:1499 getElementTypeOfEvolvingArrayType
+    // Go: checker/flow.go:1520 getElementTypeOfEvolvingArrayType
     pub fn get_element_type_of_evolving_array_type(&mut self, t: TypeId) -> TypeId {
         if self
             .ty(t)
@@ -933,7 +933,7 @@ impl Checker {
         self.never_type
     }
 
-    // Go: checker/flow.go:1506 isEvolvingArrayTypeList
+    // Go: checker/flow.go:1527 isEvolvingArrayTypeList
     // PORT: Go package function that reads type data; a `Checker` method here.
     pub fn is_evolving_array_type_list(&self, types: &[TypeId]) -> bool {
         let mut has_evolving_array_type = false;
@@ -954,7 +954,7 @@ impl Checker {
 
     // Return true if the given node is 'x' in an 'x.length', x.push(value)', 'x.unshift(value)' or
     // 'x[n] = value' operation, where 'n' is an expression of type any, undefined, or a number-like type.
-    // Go: checker/flow.go:1521 isEvolvingArrayOperationTarget
+    // Go: checker/flow.go:1542 isEvolvingArrayOperationTarget
     pub fn is_evolving_array_operation_target(&mut self, node: Node) -> bool {
         let root = self.get_reference_root(node);
         let parent = root.parent();
@@ -988,7 +988,7 @@ impl Checker {
     // When adding evolving array element types we do not perform subtype reduction. Instead,
     // we defer subtype reduction until the evolving array type is finalized into a manifest
     // array type.
-    // Go: checker/flow.go:1536 addEvolvingArrayElementType
+    // Go: checker/flow.go:1557 addEvolvingArrayElementType
     pub fn add_evolving_array_element_type(
         &mut self,
         evolving_array_type: TypeId,
@@ -1008,7 +1008,7 @@ impl Checker {
         self.get_evolving_array_type(union)
     }
 
-    // Go: checker/flow.go:1545 finalizeEvolvingArrayType
+    // Go: checker/flow.go:1566 finalizeEvolvingArrayType
     pub fn finalize_evolving_array_type(&mut self, t: TypeId) -> TypeId {
         if self
             .ty(t)
@@ -1020,7 +1020,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/flow.go:1552 getFinalArrayType
+    // Go: checker/flow.go:1573 getFinalArrayType
     // PORT: Go takes `*EvolvingArrayType`; this takes the evolving array `TypeId`.
     pub fn get_final_array_type(&mut self, t: TypeId) -> TypeId {
         if self
@@ -1036,7 +1036,7 @@ impl Checker {
         self.ty(t).as_evolving_array_type().final_array_type
     }
 
-    // Go: checker/flow.go:1559 createFinalArrayType
+    // Go: checker/flow.go:1580 createFinalArrayType
     pub fn create_final_array_type(&mut self, element_type: TypeId) -> TypeId {
         let flags = self.ty(element_type).flags;
         if flags.intersects(TypeFlags::NEVER) {
@@ -1050,7 +1050,7 @@ impl Checker {
         self.create_array_type(element_type)
     }
 
-    // Go: checker/flow.go:1569 reportFlowControlError
+    // Go: checker/flow.go:1590 reportFlowControlError
     pub fn report_flow_control_error(&mut self, node: Node) {
         let block = find_ancestor(node, is_function_or_module_block);
         let source_file = get_source_file_of_node(node);
@@ -1101,7 +1101,7 @@ impl Checker {
         export
     }
 
-    // Go: checker/flow.go:1576 isMatchingReference
+    // Go: checker/flow.go:1597 isMatchingReference
     // PERF: the kind of `target` is read once (`target_kind`). This runs
     // about 2.2M times on effect, mostly with an identifier `source`.
     pub fn is_matching_reference(&mut self, source: Node, target: Node) -> bool {
@@ -1351,7 +1351,7 @@ pub struct MatchingReferenceMemo {
     pub export_merge_version: u64,
 }
 
-// Go: checker/flow.go:1634 nonDottedNameCacheKey
+// Go: checker/flow.go:1651 nonDottedNameCacheKey
 // PORT: Go package var `CacheHashKey(xxh3.HashString128("?"))`, computed through
 // `KeyBuilder` like `SIGNATURE_KEY_*` in checker_p01. Read with `*NON_DOTTED_NAME_CACHE_KEY`.
 pub static NON_DOTTED_NAME_CACHE_KEY: LazyLock<CacheHashKey> = LazyLock::new(|| {
@@ -1365,7 +1365,7 @@ impl Checker {
     // separated by dots). The key consists of the id of the symbol referenced by the
     // leftmost identifier followed by zero or more property names separated by dots.
     // The result is nonDottedNameCacheKey if the reference isn't a dotted name.
-    // Go: checker/flow.go:1636 getFlowReferenceKey
+    // Go: checker/flow.go:1657 getFlowReferenceKey
     pub fn get_flow_reference_key(&mut self, f: &Rc<RefCell<FlowState>>) -> CacheHashKey {
         let (reference, declared_type, initial_type, flow_container) = {
             let fs = f.borrow();
@@ -1389,7 +1389,7 @@ impl Checker {
         *NON_DOTTED_NAME_CACHE_KEY // Reference isn't a dotted name
     }
 
-    // Go: checker/flow.go:1644 writeFlowCacheKey
+    // Go: checker/flow.go:1665 writeFlowCacheKey
     pub fn write_flow_cache_key(
         &mut self,
         b: &mut KeyBuilder,
@@ -1496,7 +1496,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/flow.go:1706 getAccessedPropertyName
+    // Go: checker/flow.go:1727 getAccessedPropertyName
     // PERF: returns a `Cow`. Node text lives for the program, so identifier
     // and literal names borrow it; only computed names allocate.
     pub fn get_accessed_property_name(&mut self, access: Node) -> (Cow<'static, str>, bool) {
@@ -1522,7 +1522,7 @@ impl Checker {
         (Cow::Borrowed(""), false)
     }
 
-    // Go: checker/flow.go:1722 tryGetElementAccessExpressionName
+    // Go: checker/flow.go:1743 tryGetElementAccessExpressionName
     // PORT: Go `*ast.ElementAccessExpression` is the element access `Node`.
     pub fn try_get_element_access_expression_name(
         &mut self,
@@ -1538,7 +1538,7 @@ impl Checker {
         (Cow::Borrowed(""), false)
     }
 
-    // Go: checker/flow.go:1732 tryGetNameFromEntityNameExpression
+    // Go: checker/flow.go:1753 tryGetNameFromEntityNameExpression
     pub fn try_get_name_from_entity_name_expression(
         &mut self,
         node: Node,
@@ -1589,7 +1589,7 @@ impl Checker {
     }
 }
 
-// Go: checker/flow.go:1761 tryGetNameFromType
+// Go: checker/flow.go:1782 tryGetNameFromType
 // PORT: Go package function that reads type data. The contract makes such
 // functions `Checker` methods, but `Checker::try_get_name_from_type` already
 // exists (Go method `(*Checker).tryGetNameFromType`, checker.go:18621, which
@@ -1613,7 +1613,7 @@ pub fn try_get_name_from_type(c: &Checker, t: TypeId) -> (String, bool) {
 }
 
 impl Checker {
-    // Go: checker/flow.go:1771 getDestructuringPropertyName
+    // Go: checker/flow.go:1792 getDestructuringPropertyName
     pub fn get_destructuring_property_name(&mut self, node: Node) -> (Cow<'static, str>, bool) {
         let parent = node.parent();
         if is_binding_element(node) && is_object_binding_pattern(parent) {
@@ -1634,7 +1634,7 @@ impl Checker {
         (Cow::Borrowed(""), false)
     }
 
-    // Go: checker/flow.go:1785 getLiteralPropertyNameText
+    // Go: checker/flow.go:1806 getLiteralPropertyNameText
     pub fn get_literal_property_name_text(&mut self, name: Node) -> (Cow<'static, str>, bool) {
         let t = self.get_literal_type_from_property_name(name);
         if self
@@ -1667,7 +1667,7 @@ impl Checker {
         (Cow::Borrowed(""), false)
     }
 
-    // Go: checker/flow.go:1793 isConstantReference
+    // Go: checker/flow.go:1814 isConstantReference
     pub fn is_constant_reference(&mut self, node: Node) -> bool {
         match node.kind() {
             SyntaxKind::ThisKeyword => {
@@ -1710,7 +1710,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/flow.go:1820 containsMatchingReference
+    // Go: checker/flow.go:1841 containsMatchingReference
     pub fn contains_matching_reference(&mut self, mut source: Node, target: Node) -> bool {
         while is_access_expression(source) {
             source = source.expression();
@@ -1721,7 +1721,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/flow.go:1830 optionalChainContainsReference
+    // Go: checker/flow.go:1851 optionalChainContainsReference
     pub fn optional_chain_contains_reference(&mut self, mut source: Node, target: Node) -> bool {
         while is_optional_chain(source) {
             source = source.expression();
@@ -1732,7 +1732,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/flow.go:1840 getReferenceCandidate
+    // Go: checker/flow.go:1861 getReferenceCandidate
     pub fn get_reference_candidate(&mut self, node: Node) -> Node {
         match node.kind() {
             SyntaxKind::ParenthesizedExpression => {

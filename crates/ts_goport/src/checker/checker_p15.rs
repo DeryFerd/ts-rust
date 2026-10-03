@@ -22,7 +22,7 @@ struct ObjectLiteralBuildState {
 }
 
 impl Checker {
-    // Go: checker/checker.go:13025 checkInExpression
+    // Go: checker/checker.go:13284 checkInExpression
     pub fn check_in_expression(
         &mut self,
         left: Node,
@@ -82,7 +82,7 @@ impl Checker {
         self.boolean_type
     }
 
-    // Go: checker/checker.go:13059 hasEmptyObjectIntersection
+    // Go: checker/checker.go:13318 hasEmptyObjectIntersection
     pub fn has_empty_object_intersection(&mut self, t: TypeId) -> bool {
         self.some_type(t, &mut |c: &mut Checker, t: TypeId| {
             if t == c.unknown_empty_object_type {
@@ -96,7 +96,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:13065 getExactOptionalUnassignableProperties
+    // Go: checker/checker.go:13324 getExactOptionalUnassignableProperties
     pub fn get_exact_optional_unassignable_properties(
         &mut self,
         source: TypeId,
@@ -118,7 +118,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:13074 isExactOptionalPropertyMismatch
+    // Go: checker/checker.go:13333 isExactOptionalPropertyMismatch
     pub fn is_exact_optional_property_mismatch(&mut self, source: TypeId, target: TypeId) -> bool {
         if source.is_nil() || target.is_nil() {
             return false;
@@ -130,7 +130,7 @@ impl Checker {
         contains_missing_type(self, target)
     }
 
-    // Go: checker/checker.go:13078 checkReferenceExpression
+    // Go: checker/checker.go:13337 checkReferenceExpression
     pub fn check_reference_expression(
         &mut self,
         expr: Node,
@@ -153,7 +153,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:13092 checkObjectLiteral
+    // Go: checker/checker.go:13351 checkObjectLiteral
     pub fn check_object_literal(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         // Expando object literals have empty properties but filled exports
         let node_symbol = node.symbol();
@@ -457,7 +457,7 @@ impl Checker {
         self.check_object_literal_create_type(&st)
     }
 
-    // Go: checker/checker.go:13138 checkObjectLiteral.createObjectLiteralType
+    // Go: checker/checker.go:13400 checkObjectLiteral.createObjectLiteralType
     // PORT: the Go closure `createObjectLiteralType` inside `checkObjectLiteral`.
     // Go slices `propertiesArray[offset:]`, which panics when `offset` is past
     // the end; the Rust slice panics in the same case.
@@ -510,7 +510,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:13447 checkContextualDeprecations
+    // Go: checker/checker.go:13563 checkContextualDeprecations
     // Runs as a deferred check of an object literal or JSX attributes node, so
     // each property is checked once and not on every inference pass.
     pub fn check_contextual_deprecations(&mut self, node: Node) {
@@ -526,7 +526,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:13459 checkDeprecatedProperty
+    // Go: checker/checker.go:13575 checkDeprecatedProperty
     pub fn check_deprecated_property(&mut self, name: Node, contextual_type: TypeId) {
         if contextual_type.is_nil() {
             return;
@@ -541,7 +541,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:13301 checkSpreadPropOverrides
+    // Go: checker/checker.go:13588 checkSpreadPropOverrides
     pub fn check_spread_prop_overrides(&mut self, t: TypeId, props: SymbolTable, spread: Node) {
         for right in self.get_properties_of_type(t) {
             let (right_flags, right_check_flags, right_name) = {
@@ -582,7 +582,7 @@ impl Checker {
      * this function should be called in a left folding style, with left = previous result of getSpreadType
      * and right = the new element to be spread.
      */
-    // Go: checker/checker.go:13317 getSpreadType
+    // Go: checker/checker.go:13604 getSpreadType
     pub fn get_spread_type(
         &mut self,
         left: TypeId,
@@ -742,7 +742,7 @@ impl Checker {
         spread
     }
 
-    // Go: checker/checker.go:13427 getIndexInfoWithReadonly
+    // Go: checker/checker.go:13714 getIndexInfoWithReadonly
     pub fn get_index_info_with_readonly(
         &mut self,
         info: IndexInfoId,
@@ -763,7 +763,7 @@ impl Checker {
         info
     }
 
-    // Go: checker/checker.go:13434 isValidSpreadType
+    // Go: checker/checker.go:13721 isValidSpreadType
     pub fn is_valid_spread_type(&mut self, t: TypeId) -> bool {
         let mapped = self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
             c.get_base_constraint_or_type(t)
@@ -790,7 +790,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:13440 getUnionIndexInfos
+    // Go: checker/checker.go:13727 getUnionIndexInfos
     pub fn get_union_index_infos(&mut self, types: &[TypeId]) -> Vec<IndexInfoId> {
         let source_infos = self.get_index_infos_of_type(types[0]);
         let mut result: Vec<IndexInfoId> = Vec::new();
@@ -826,12 +826,12 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:13456 isNonGenericObjectType
+    // Go: checker/checker.go:13743 isNonGenericObjectType
     pub fn is_non_generic_object_type(&mut self, t: TypeId) -> bool {
         self.ty(t).flags.intersects(TypeFlags::OBJECT) && !self.is_generic_mapped_type(t)
     }
 
-    // Go: checker/checker.go:13460 tryMergeUnionOfObjectTypeAndEmptyObject
+    // Go: checker/checker.go:13747 tryMergeUnionOfObjectTypeAndEmptyObject
     pub fn try_merge_union_of_object_type_and_empty_object(
         &mut self,
         t: TypeId,
@@ -932,7 +932,7 @@ impl Checker {
     }
 
     // We approximate own properties as non-methods plus methods that are inside the object literal
-    // Go: checker/checker.go:13510 isSpreadableProperty
+    // Go: checker/checker.go:13797 isSpreadableProperty
     pub fn is_spreadable_property(&self, prop: SymbolId) -> bool {
         let p = self.sym(prop);
         !p.declarations
@@ -947,7 +947,7 @@ impl Checker {
                 .any(|&d| d.parent().is_some() && is_class_like(d.parent()))
     }
 
-    // Go: checker/checker.go:13515 getSpreadSymbol
+    // Go: checker/checker.go:13802 getSpreadSymbol
     pub fn get_spread_symbol(&mut self, prop: SymbolId, readonly: bool) -> SymbolId {
         let (prop_flags, prop_check_flags, prop_name) = {
             let p = self.sym(prop);
@@ -981,7 +981,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:13534 isEmptyObjectTypeOrSpreadsIntoEmptyObject
+    // Go: checker/checker.go:13821 isEmptyObjectTypeOrSpreadsIntoEmptyObject
     pub fn is_empty_object_type_or_spreads_into_empty_object(&mut self, t: TypeId) -> bool {
         self.is_empty_object_type(t)
             || self.ty(t).flags.intersects(
@@ -997,7 +997,7 @@ impl Checker {
             )
     }
 
-    // Go: checker/checker.go:13538 hasDefaultValue
+    // Go: checker/checker.go:13825 hasDefaultValue
     pub fn has_default_value(&self, node: Node) -> bool {
         is_binding_element(node) && node.initializer().is_some()
             || is_property_assignment(node) && self.has_default_value(node.initializer())
@@ -1006,7 +1006,7 @@ impl Checker {
             || is_binary_expression(node) && node.operator_token().kind() == SyntaxKind::EqualsToken
     }
 
-    // Go: checker/checker.go:13545 isConstContext
+    // Go: checker/checker.go:13832 isConstContext
     pub fn is_const_context(&mut self, node: Node) -> bool {
         let parent = node.parent();
         if is_const_assertion(parent) {
@@ -1034,7 +1034,7 @@ impl Checker {
             && self.is_const_context(parent.parent())
     }
 
-    // Go: checker/checker.go:13806 isInlineImportAttributes
+    // Go: checker/checker.go:13841 isInlineImportAttributes
     pub fn is_inline_import_attributes(&self, node: Node) -> bool {
         if !is_object_literal_expression(node)
             || !is_property_assignment(node.parent())
@@ -1058,7 +1058,7 @@ impl Checker {
             && skip_parentheses(import_call.arguments().get(1)) == options
     }
 
-    // Go: checker/checker.go:13553 isValidConstAssertionArgument
+    // Go: checker/checker.go:13857 isValidConstAssertionArgument
     pub fn is_valid_const_assertion_argument(&mut self, node: Node) -> bool {
         match node.kind() {
             SyntaxKind::StringLiteral
@@ -1099,7 +1099,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:13575 isConstTypeVariable
+    // Go: checker/checker.go:13879 isConstTypeVariable
     pub fn is_const_type_variable(&mut self, t: TypeId, depth: i32) -> bool {
         if depth >= 5 || t.is_nil() {
             return false;
@@ -1148,7 +1148,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:13603 checkPropertyAssignment
+    // Go: checker/checker.go:13907 checkPropertyAssignment
     pub fn check_property_assignment(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         // Do not use hasDynamicName here, because that returns false for well known symbols.
         // We want to perform checkComputedPropertyName for all computed properties, including
@@ -1173,7 +1173,7 @@ impl Checker {
         initializer_type
     }
 
-    // Go: checker/checker.go:13619 checkShorthandPropertyAssignment
+    // Go: checker/checker.go:13923 checkShorthandPropertyAssignment
     pub fn check_shorthand_property_assignment(
         &mut self,
         node: Node,
@@ -1203,7 +1203,7 @@ impl Checker {
         expression_type
     }
 
-    // Go: checker/checker.go:13636 isInPropertyInitializerOrClassStaticBlock
+    // Go: checker/checker.go:13940 isInPropertyInitializerOrClassStaticBlock
     pub fn is_in_property_initializer_or_class_static_block(
         &self,
         node: Node,
@@ -1237,7 +1237,7 @@ impl Checker {
         .is_some()
     }
 
-    // Go: checker/checker.go:13653 getNarrowedTypeOfSymbol
+    // Go: checker/checker.go:13957 getNarrowedTypeOfSymbol
     pub fn get_narrowed_type_of_symbol(&mut self, symbol: SymbolId, location: Node) -> TypeId {
         let mut t = self.get_type_of_symbol(symbol);
         let declaration = self.sym(symbol).value_declaration;
@@ -1425,7 +1425,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:13751 isReadonlyAssignmentDeclaration
+    // Go: checker/checker.go:14063 isReadonlyAssignmentDeclaration
     pub fn is_readonly_assignment_declaration(&mut self, node: Node) -> bool {
         if !is_call_expression(node) {
             return false;
@@ -1454,7 +1454,7 @@ impl Checker {
             .is_nil()
     }
 
-    // Go: checker/checker.go:13771 isReadonlySymbol
+    // Go: checker/checker.go:14083 isReadonlySymbol
     pub fn is_readonly_symbol(&mut self, symbol: SymbolId) -> bool {
         // The following symbols are considered read-only:
         // Properties with a 'readonly' modifier
@@ -1506,7 +1506,7 @@ impl Checker {
             .any(|&d| self.is_readonly_assignment_declaration(d))
     }
 
-    // Go: checker/checker.go:13787 checkObjectLiteralMethod
+    // Go: checker/checker.go:14099 checkObjectLiteralMethod
     pub fn check_object_literal_method(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         // Grammar checking
         self.check_grammar_method(node);
@@ -1525,7 +1525,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:13800 checkExpressionForMutableLocation
+    // Go: checker/checker.go:14112 checkExpressionForMutableLocation
     pub fn check_expression_for_mutable_location(
         &mut self,
         node: Node,
@@ -1544,7 +1544,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:13812 getResolvedSymbol
+    // Go: checker/checker.go:14124 getResolvedSymbol
     pub fn get_resolved_symbol(&mut self, node: Node) -> SymbolId {
         // One link lookup on the cached hit. The miss returns the value it
         // just stored, as Go returns links.resolvedSymbol.
@@ -1581,12 +1581,12 @@ impl Checker {
         resolved
     }
 
-    // Go: checker/checker.go:13825 getResolvedSymbolOrNil
+    // Go: checker/checker.go:14137 getResolvedSymbolOrNil
     pub fn get_resolved_symbol_or_nil(&mut self, node: Node) -> SymbolId {
         self.symbol_node_links.get(node).resolved_symbol
     }
 
-    // Go: checker/checker.go:13829 getReferencedValueOrAliasSymbol
+    // Go: checker/checker.go:14141 getReferencedValueOrAliasSymbol
     pub fn get_referenced_value_or_alias_symbol(&mut self, reference: Node) -> SymbolId {
         let resolved_symbol = self.symbol_node_links.get(reference).resolved_symbol;
         if resolved_symbol.is_some() && resolved_symbol != self.unknown_symbol {
@@ -1605,7 +1605,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:13837 getCannotFindNameDiagnosticForName
+    // Go: checker/checker.go:14149 getCannotFindNameDiagnosticForName
     pub fn get_cannot_find_name_diagnostic_for_name(&self, node: Node) -> &'static Message {
         let text = node.text();
         let uses_wildcard_types = self.compiler_options.uses_wildcard_types();
@@ -1660,7 +1660,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:13873 GetDiagnostics
+    // Go: checker/checker.go:14185 GetDiagnostics
     pub fn get_diagnostics_exported(
         &mut self,
         ctx: &Context,
@@ -1669,7 +1669,7 @@ impl Checker {
         self.get_diagnostics(ctx, source_file, false)
     }
 
-    // Go: checker/checker.go:13877 GetSuggestionDiagnostics
+    // Go: checker/checker.go:14189 GetSuggestionDiagnostics
     pub fn get_suggestion_diagnostics(
         &mut self,
         ctx: &Context,
@@ -1678,7 +1678,7 @@ impl Checker {
         self.get_diagnostics(ctx, source_file, true)
     }
 
-    // Go: checker/checker.go:13881 getDiagnostics
+    // Go: checker/checker.go:14193 getDiagnostics
     // PORT: the Go `collection *ast.DiagnosticsCollection` pointer is `is_suggestion`
     // (true selects `suggestion_diagnostics`, false selects `diagnostics`).
     pub fn get_diagnostics(
@@ -1704,19 +1704,19 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:13891 GetGlobalDiagnostics
+    // Go: checker/checker.go:14203 GetGlobalDiagnostics
     pub fn get_global_diagnostics(&mut self) -> Vec<Diagnostic> {
         self.check_not_canceled();
         self.produce_deferred_diagnostics();
         self.diagnostics.get_global_diagnostics()
     }
 
-    // Go: checker/checker.go:13896 addDeferredDiagnostic
+    // Go: checker/checker.go:14209 addDeferredDiagnostic
     pub fn add_deferred_diagnostic(&mut self, callback: Rc<dyn Fn(&mut Checker)>) {
         self.deferred_diagnostic_callbacks.push(callback);
     }
 
-    // Go: checker/checker.go:13902 produceDeferredDiagnostics
+    // Go: checker/checker.go:14213 produceDeferredDiagnostics
     pub fn produce_deferred_diagnostics(&mut self) {
         let callbacks = self.deferred_diagnostic_callbacks.clone();
         for cb in callbacks {
@@ -1725,7 +1725,7 @@ impl Checker {
         self.deferred_diagnostic_callbacks = Vec::new();
     }
 
-    // Go: checker/checker.go:13909 addDiagnostic
+    // Go: checker/checker.go:14220 addDiagnostic
     // PORT: Go (#4825) returns the stored `*ast.Diagnostic`: an equal one that is
     // already in the collection, or this one. A caller that changes the result
     // changes the stored diagnostic. Here `Some` is the stored diagnostic. `None`
@@ -1739,7 +1739,7 @@ impl Checker {
         None
     }
 
-    // Go: checker/checker.go:13916 addSuggestionDiagnostic
+    // Go: checker/checker.go:14228 addSuggestionDiagnostic
     // PORT: the stored diagnostic, or `None` when discarded (see `add_diagnostic`).
     pub fn add_suggestion_diagnostic(&mut self, diagnostic: Diagnostic) -> Option<&mut Diagnostic> {
         // Discard diagnostics created while at the maximum number of recursive TypeToString invocations.
@@ -1749,7 +1749,7 @@ impl Checker {
         None
     }
 
-    // Go: checker/checker.go:13923 error
+    // Go: checker/checker.go:14236 error
     // PORT: Go (#4825) returns `c.addDiagnostic(...)`, the stored diagnostic or the
     // discarded one. Here the result is a clone of it. A caller that changes the
     // stored diagnostic calls `add_diagnostic` and changes the one it returns.

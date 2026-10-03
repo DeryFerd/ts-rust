@@ -7,7 +7,7 @@ use crate::frontend::prelude::*;
 // slices and decodes runes like Go `utf8.DecodeRuneInString` (see
 // `decode_rune`).
 
-// Go: vfs/vfsmatch/vfsmatch.go:20 Usage
+// Go: vfs/vfsmatch/vfsmatch.go:19 Usage
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Usage {
     Files,
@@ -15,7 +15,7 @@ pub enum Usage {
     Exclude,
 }
 
-// Go: vfs/vfsmatch/stringer_generated.go:19 Usage.String
+// Go: vfs/vfsmatch/stringer_generated.go:20 Usage.String
 // PORT: a Rust enum has no out-of-range values, so the `Usage(%d)` branch
 // is not needed.
 impl std::fmt::Display for Usage {
@@ -29,12 +29,12 @@ impl std::fmt::Display for Usage {
     }
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:29 UnlimitedDepth
+// Go: vfs/vfsmatch/vfsmatch.go:28 UnlimitedDepth
 // PORT: Go `math.MaxInt`. Go `int` is `i32` in this port.
 /// Pass as the depth argument to indicate there is no depth limit.
 pub const UNLIMITED_DEPTH: i32 = i32::MAX;
 
-// Go: vfs/vfsmatch/vfsmatch.go:31 ReadDirectory
+// Go: vfs/vfsmatch/vfsmatch.go:30 ReadDirectory
 pub fn read_directory(
     host: &dyn Fs,
     current_dir: &str,
@@ -56,7 +56,7 @@ pub fn read_directory(
     )
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:38 IsImplicitGlob
+// Go: vfs/vfsmatch/vfsmatch.go:37 IsImplicitGlob
 /// Checks if a path component is implicitly a glob.
 /// An "includes" path "foo" is implicitly a glob "foo/**/*" if its last component has no extension,
 /// and does not contain any glob characters itself.
@@ -64,10 +64,10 @@ pub fn is_implicit_glob(last_path_component: &str) -> bool {
     !last_path_component.contains(['.', '*', '?'])
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:42 wildcardCharCodes
+// Go: vfs/vfsmatch/vfsmatch.go:41 wildcardCharCodes
 const WILDCARD_CHAR_CODES: [char; 2] = ['*', '?'];
 
-// Go: vfs/vfsmatch/vfsmatch.go:44 getIncludeBasePath
+// Go: vfs/vfsmatch/vfsmatch.go:43 getIncludeBasePath
 fn get_include_base_path(absolute: &str) -> String {
     let Some(wildcard_offset) = absolute.find(WILDCARD_CHAR_CODES) else {
         // No "*" or "?" in the path
@@ -82,7 +82,7 @@ fn get_include_base_path(absolute: &str) -> String {
     absolute[..end].to_string()
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:58 getBasePaths
+// Go: vfs/vfsmatch/vfsmatch.go:57 getBasePaths
 /// Computes the unique non-wildcard base paths amongst the provided include patterns.
 fn get_base_paths(
     path: &str,
@@ -133,7 +133,7 @@ fn get_base_paths(
     base_paths
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:99 globPattern
+// Go: vfs/vfsmatch/vfsmatch.go:98 globPattern
 /// A compiled glob pattern for matching file paths without regex.
 #[derive(Clone, Debug, Default)]
 struct GlobPattern {
@@ -146,7 +146,7 @@ struct GlobPattern {
     exclude_min_js: bool,
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:108 component
+// Go: vfs/vfsmatch/vfsmatch.go:107 component
 /// A single path segment in a glob pattern.
 /// Examples: "src" (literal), "*" (wildcard), "*.ts" (wildcard), "**" (recursive)
 #[derive(Clone, Debug)]
@@ -160,7 +160,7 @@ struct Component {
     skip_package_folders: bool,
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:116 componentKind
+// Go: vfs/vfsmatch/vfsmatch.go:115 componentKind
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ComponentKind {
     /// exact match (e.g., "src")
@@ -171,7 +171,7 @@ enum ComponentKind {
     DoubleAsterisk,
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:126 segment
+// Go: vfs/vfsmatch/vfsmatch.go:125 segment
 /// A piece of a wildcard component.
 /// Example: "*.ts" becomes [Star, Literal(".ts")]
 #[derive(Clone, Debug)]
@@ -181,7 +181,7 @@ struct Segment {
     literal: String,
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:131 segmentKind
+// Go: vfs/vfsmatch/vfsmatch.go:130 segmentKind
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SegmentKind {
     /// exact text
@@ -192,7 +192,7 @@ enum SegmentKind {
     Question,
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:141 compileGlobPattern
+// Go: vfs/vfsmatch/vfsmatch.go:140 compileGlobPattern
 /// Compiles a glob spec (e.g., "src/**/*.ts") into a pattern.
 /// Returns `None` if the pattern would match nothing.
 fn compile_glob_pattern(
@@ -232,7 +232,7 @@ fn compile_glob_pattern(
     Some(p)
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:172 parseComponent
+// Go: vfs/vfsmatch/vfsmatch.go:171 parseComponent
 /// Converts a path segment string into a component.
 fn parse_component(s: &str, is_include: bool) -> Component {
     if s == "**" {
@@ -259,7 +259,7 @@ fn parse_component(s: &str, is_include: bool) -> Component {
     }
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:187 parseSegments
+// Go: vfs/vfsmatch/vfsmatch.go:186 parseSegments
 /// Breaks "*.ts" into [Star, Literal(".ts")]
 fn parse_segments(s: &str) -> Vec<Segment> {
     // Preallocate based on wildcard count: each wildcard contributes 1 segment,
@@ -397,7 +397,7 @@ impl GlobPattern {
     }
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:295 nextPathPartSingle
+// Go: vfs/vfsmatch/vfsmatch.go:294 nextPathPartSingle
 /// Extracts the next path component from path starting at offset.
 /// PORT: Go returns `(part, nextOffset, ok)`; `None` is `ok == false`.
 fn next_path_part_single(s: &str, mut offset: usize) -> Option<(&str, usize)> {
@@ -421,7 +421,7 @@ fn next_path_part_single(s: &str, mut offset: usize) -> Option<(&str, usize)> {
     Some((rest, b.len()))
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:315 nextPathPartParts
+// Go: vfs/vfsmatch/vfsmatch.go:314 nextPathPartParts
 /// PORT: Go returns `(part, nextOffset, ok)`; `None` is `ok == false`.
 fn next_path_part_parts<'a>(
     prefix: &'a str,
@@ -634,7 +634,7 @@ impl GlobPattern {
     }
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:488 isHiddenPath
+// Go: vfs/vfsmatch/vfsmatch.go:487 isHiddenPath
 /// Checks if a path component is hidden (starts with dot).
 fn is_hidden_path(name: &str) -> bool {
     is_hidden_path_bytes(name.as_bytes())
@@ -645,7 +645,7 @@ fn is_hidden_path_bytes(name: &[u8]) -> bool {
     !name.is_empty() && name[0] == b'.'
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:493 isPackageFolder
+// Go: vfs/vfsmatch/vfsmatch.go:492 isPackageFolder
 /// Checks if name is a common package folder (node_modules, etc.)
 fn is_package_folder(name: &str) -> bool {
     let b = name.as_bytes();
@@ -659,7 +659,7 @@ fn is_package_folder(name: &str) -> bool {
     }
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:505 ensureTrailingSlash
+// Go: vfs/vfsmatch/vfsmatch.go:504 ensureTrailingSlash
 fn ensure_trailing_slash(s: &str) -> String {
     if !s.is_empty() && !s.ends_with('/') {
         return format!("{s}/");
@@ -738,7 +738,7 @@ pub fn equal_fold(a: &[u8], b: &[u8]) -> bool {
     i == a.len() && j == b.len()
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:513 globMatcher
+// Go: vfs/vfsmatch/vfsmatch.go:512 globMatcher
 /// Combines include and exclude patterns for file matching.
 struct GlobMatcher {
     includes: Vec<GlobPattern>,
@@ -747,7 +747,7 @@ struct GlobMatcher {
     had_includes: bool,
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:519 newGlobMatcher
+// Go: vfs/vfsmatch/vfsmatch.go:518 newGlobMatcher
 fn new_glob_matcher(
     include_specs: &[String],
     exclude_specs: &[String],
@@ -819,7 +819,7 @@ impl GlobMatcher {
     }
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:580 globVisitor
+// Go: vfs/vfsmatch/vfsmatch.go:579 globVisitor
 /// Traverses directories matching files against glob patterns.
 /// PORT: Go `vfs.FS` is a borrowed `&dyn Fs` for the length of the walk.
 struct GlobVisitor<'a> {
@@ -911,7 +911,7 @@ impl GlobVisitor<'_> {
     }
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:648 matchFiles
+// Go: vfs/vfsmatch/vfsmatch.go:647 matchFiles
 #[allow(clippy::too_many_arguments)]
 fn match_files(
     path: &str,
@@ -965,7 +965,7 @@ fn match_files(
     v.results.into_iter().flatten().collect()
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:677 SpecMatcher
+// Go: vfs/vfsmatch/vfsmatch.go:676 SpecMatcher
 /// Wraps multiple glob patterns for matching paths.
 #[derive(Clone, Debug)]
 pub struct SpecMatcher {
@@ -991,7 +991,7 @@ impl SpecMatcher {
     }
 }
 
-// Go: vfs/vfsmatch/vfsmatch.go:703 NewSpecMatcher
+// Go: vfs/vfsmatch/vfsmatch.go:702 NewSpecMatcher
 /// Creates a matcher for one or more glob specs.
 /// It returns a matcher that can test if paths match any of the patterns.
 /// PORT: Go returns a nil pointer for no patterns; that is `None`.

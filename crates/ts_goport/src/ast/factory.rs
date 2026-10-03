@@ -115,7 +115,7 @@ impl NodeFactory {
         }
     }
 
-    // Go: ast/ast.go:67 NewNodeFactory
+    // Go: ast/ast.go:71 NewNodeFactory
     #[must_use]
     pub fn new_with_hooks(hooks: NodeFactoryHooks) -> Self {
         Self {
@@ -187,13 +187,13 @@ impl NodeFactory {
         node
     }
 
-    // Go: ast/ast.go:89 NodeCount
+    // Go: ast/ast.go:91 NodeCount
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.node_count.get()
     }
 
-    // Go: ast/ast.go:93 TextCount
+    // Go: ast/ast.go:95 TextCount
     #[must_use]
     pub fn text_count(&self) -> usize {
         self.text_count.get()
@@ -201,7 +201,7 @@ impl NodeFactory {
 
     // ── Source files ───────────────────────────────────────────────────
 
-    // Go: ast/ast.go:2549 NewSourceFile
+    // Go: ast/ast.go:2526 NewSourceFile
     // PORT: Go takes `opts SourceFileParseOptions`; only its `FileName` and
     // `Path` are kept (see `SyntheticSourceFileData`). A synthetic
     // SourceFile keeps the Go fields in its slot. A store SourceFile (the
@@ -270,7 +270,7 @@ impl NodeFactory {
 
     // ── Lists ──────────────────────────────────────────────────────────
 
-    // Go: ast/ast.go:127 NewNodeList
+    // Go: ast/ast.go:129 NewNodeList
     #[must_use]
     pub fn new_node_list(&self, nodes: &[Node]) -> NodeList {
         self.new_node_list_with_loc(nodes, TextRange::undefined())
@@ -288,7 +288,7 @@ impl NodeFactory {
         }
     }
 
-    // Go: ast/ast.go:158 NewModifierList
+    // Go: ast/ast.go:160 NewModifierList
     #[must_use]
     pub fn new_modifier_list(&self, nodes: &[Node]) -> ModifierList {
         self.new_modifier_list_with_loc(nodes, TextRange::undefined())
@@ -306,7 +306,7 @@ impl NodeFactory {
 
     // ── Tokens, names and literals ─────────────────────────────────────
 
-    // Go: ast/ast_generated.go:599 NewToken
+    // Go: ast/ast_generated.go:600 NewToken
     pub fn new_token(&self, kind: SyntaxKind) -> Node {
         self.new_node(kind, D::Token(Box::new(crate::astdata::TokenData)))
     }
@@ -316,7 +316,7 @@ impl NodeFactory {
         self.new_token(kind)
     }
 
-    // Go: ast/ast_generated.go:792 NewIdentifier
+    // Go: ast/ast_generated.go:627 NewIdentifier
     pub fn new_identifier(&self, text: impl AsRef<str> + Into<String>) -> Node {
         self.new_name_node(SyntaxKind::Identifier, text, |text| {
             D::Identifier(Box::new(crate::astdata::IdentifierData {
@@ -326,14 +326,14 @@ impl NodeFactory {
         })
     }
 
-    // Go: ast/ast_generated.go:816 NewPrivateIdentifier
+    // Go: ast/ast_generated.go:651 NewPrivateIdentifier
     pub fn new_private_identifier(&self, text: impl AsRef<str> + Into<String>) -> Node {
         self.new_name_node(SyntaxKind::PrivateIdentifier, text, |text| {
             D::PrivateIdentifier(Box::new(crate::astdata::PrivateIdentifierData { text }))
         })
     }
 
-    // Go: ast/ast_generated.go:843 NewQualifiedName
+    // Go: ast/ast_generated.go:678 NewQualifiedName
     pub fn new_qualified_name(&self, left: Node, right: Node) -> Node {
         self.new_node(
             SyntaxKind::QualifiedName,
@@ -346,7 +346,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:888 NewComputedPropertyName
+    // Go: ast/ast_generated.go:723 NewComputedPropertyName
     pub fn new_computed_property_name(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ComputedPropertyName,
@@ -357,7 +357,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3764 NewStringLiteral
+    // Go: ast/ast_generated.go:3601 NewStringLiteral
     pub fn new_string_literal(&self, text: impl Into<String>, flags: TokenFlags) -> Node {
         self.new_text_node(
             SyntaxKind::StringLiteral,
@@ -368,7 +368,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3788 NewNumericLiteral
+    // Go: ast/ast_generated.go:3625 NewNumericLiteral
     pub fn new_numeric_literal(&self, text: impl Into<String>, flags: TokenFlags) -> Node {
         self.new_text_node(
             SyntaxKind::NumericLiteral,
@@ -379,7 +379,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3812 NewBigIntLiteral
+    // Go: ast/ast_generated.go:3649 NewBigIntLiteral
     pub fn new_big_int_literal(&self, text: impl Into<String>, flags: TokenFlags) -> Node {
         self.new_text_node(
             SyntaxKind::BigIntLiteral,
@@ -390,7 +390,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3836 NewRegularExpressionLiteral
+    // Go: ast/ast_generated.go:3673 NewRegularExpressionLiteral
     pub fn new_regular_expression_literal(
         &self,
         text: impl Into<String>,
@@ -405,7 +405,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3862 NewNoSubstitutionTemplateLiteral
+    // Go: ast/ast_generated.go:3699 NewNoSubstitutionTemplateLiteral
     // PORT: Go sets no `RawText`; ts_ast stores an empty string for it.
     pub fn new_no_substitution_template_literal(
         &self,
@@ -428,7 +428,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6287 NewTemplateHead
+    // Go: ast/ast_generated.go:6111 NewTemplateHead
     pub fn new_template_head(
         &self,
         text: impl Into<String>,
@@ -448,7 +448,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6313 NewTemplateMiddle
+    // Go: ast/ast_generated.go:6137 NewTemplateMiddle
     pub fn new_template_middle(
         &self,
         text: impl Into<String>,
@@ -468,7 +468,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6339 NewTemplateTail
+    // Go: ast/ast_generated.go:6163 NewTemplateTail
     pub fn new_template_tail(
         &self,
         text: impl Into<String>,
@@ -490,7 +490,7 @@ impl NodeFactory {
 
     // ── Type nodes ─────────────────────────────────────────────────────
 
-    // Go: ast/ast_generated.go:5271 NewKeywordTypeNode
+    // Go: ast/ast_generated.go:5110 NewKeywordTypeNode
     pub fn new_keyword_type_node(&self, kind: SyntaxKind) -> Node {
         self.new_node(
             kind,
@@ -498,7 +498,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5308 NewUnionTypeNode
+    // Go: ast/ast_generated.go:5135 NewUnionTypeNode
     pub fn new_union_type_node(&self, types: NodeList) -> Node {
         self.new_node(
             SyntaxKind::UnionType,
@@ -508,7 +508,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5346 NewIntersectionTypeNode
+    // Go: ast/ast_generated.go:5172 NewIntersectionTypeNode
     pub fn new_intersection_type_node(&self, types: NodeList) -> Node {
         self.new_node(
             SyntaxKind::IntersectionType,
@@ -518,7 +518,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5388 NewConditionalTypeNode
+    // Go: ast/ast_generated.go:5214 NewConditionalTypeNode
     pub fn new_conditional_type_node(
         &self,
         check_type: Node,
@@ -539,7 +539,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5433 NewTypeOperatorNode
+    // Go: ast/ast_generated.go:5259 NewTypeOperatorNode
     pub fn new_type_operator_node(&self, operator: SyntaxKind, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::TypeOperator,
@@ -550,7 +550,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5472 NewInferTypeNode
+    // Go: ast/ast_generated.go:5298 NewInferTypeNode
     pub fn new_infer_type_node(&self, type_parameter: Node) -> Node {
         self.new_node(
             SyntaxKind::InferType,
@@ -560,7 +560,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5510 NewArrayTypeNode
+    // Go: ast/ast_generated.go:5336 NewArrayTypeNode
     pub fn new_array_type_node(&self, element_type: Node) -> Node {
         self.new_node(
             SyntaxKind::ArrayType,
@@ -570,7 +570,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5549 NewIndexedAccessTypeNode
+    // Go: ast/ast_generated.go:5375 NewIndexedAccessTypeNode
     pub fn new_indexed_access_type_node(&self, object_type: Node, index_type: Node) -> Node {
         self.new_node(
             SyntaxKind::IndexedAccessType,
@@ -581,7 +581,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5588 NewTypeReferenceNode
+    // Go: ast/ast_generated.go:5414 NewTypeReferenceNode
     pub fn new_type_reference_node(&self, type_name: Node, type_arguments: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TypeReference,
@@ -592,7 +592,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5629 NewExpressionWithTypeArguments
+    // Go: ast/ast_generated.go:5455 NewExpressionWithTypeArguments
     pub fn new_expression_with_type_arguments(
         &self,
         expression: Node,
@@ -610,7 +610,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5668 NewLiteralTypeNode
+    // Go: ast/ast_generated.go:5494 NewLiteralTypeNode
     pub fn new_literal_type_node(&self, literal: Node) -> Node {
         self.new_node(
             SyntaxKind::LiteralType,
@@ -620,7 +620,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5705 NewThisTypeNode
+    // Go: ast/ast_generated.go:5531 NewThisTypeNode
     pub fn new_this_type_node(&self) -> Node {
         self.new_node(
             SyntaxKind::ThisType,
@@ -628,7 +628,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5729 NewTypePredicateNode
+    // Go: ast/ast_generated.go:5555 NewTypePredicateNode
     pub fn new_type_predicate_node(
         &self,
         asserts_modifier: Node,
@@ -645,7 +645,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5866 NewTypeQueryNode
+    // Go: ast/ast_generated.go:5692 NewTypeQueryNode
     pub fn new_type_query_node(&self, expr_name: Node, type_arguments: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TypeQuery,
@@ -656,7 +656,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5912 NewMappedTypeNode
+    // Go: ast/ast_generated.go:5738 NewMappedTypeNode
     pub fn new_mapped_type_node(
         &self,
         readonly_token: Node,
@@ -682,7 +682,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5961 NewTypeLiteralNode
+    // Go: ast/ast_generated.go:5787 NewTypeLiteralNode
     pub fn new_type_literal_node(&self, members: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TypeLiteral,
@@ -693,7 +693,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5999 NewTupleTypeNode
+    // Go: ast/ast_generated.go:5825 NewTupleTypeNode
     pub fn new_tuple_type_node(&self, elements: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TupleType,
@@ -703,7 +703,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6041 NewNamedTupleMember
+    // Go: ast/ast_generated.go:5867 NewNamedTupleMember
     pub fn new_named_tuple_member(
         &self,
         dot_dot_dot_token: Node,
@@ -723,7 +723,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6089 NewOptionalTypeNode
+    // Go: ast/ast_generated.go:5915 NewOptionalTypeNode
     pub fn new_optional_type_node(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::OptionalType,
@@ -733,7 +733,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6127 NewRestTypeNode
+    // Go: ast/ast_generated.go:5953 NewRestTypeNode
     pub fn new_rest_type_node(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::RestType,
@@ -743,7 +743,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6165 NewParenthesizedTypeNode
+    // Go: ast/ast_generated.go:5991 NewParenthesizedTypeNode
     pub fn new_parenthesized_type_node(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::ParenthesizedType,
@@ -753,7 +753,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6203 NewFunctionTypeNode
+    // Go: ast/ast_generated.go:6028 NewFunctionTypeNode
     pub fn new_function_type_node(
         &self,
         type_parameters: NodeList,
@@ -775,7 +775,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6243 NewConstructorTypeNode
+    // Go: ast/ast_generated.go:6067 NewConstructorTypeNode
     pub fn new_constructor_type_node(
         &self,
         modifiers: ModifierList,
@@ -798,7 +798,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6366 NewTemplateLiteralTypeNode
+    // Go: ast/ast_generated.go:6190 NewTemplateLiteralTypeNode
     pub fn new_template_literal_type_node(&self, head: Node, template_spans: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TemplateLiteralType,
@@ -809,7 +809,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6406 NewTemplateLiteralTypeSpan
+    // Go: ast/ast_generated.go:6230 NewTemplateLiteralTypeSpan
     pub fn new_template_literal_type_span(&self, type_node: Node, literal: Node) -> Node {
         self.new_node(
             SyntaxKind::TemplateLiteralTypeSpan,
@@ -820,7 +820,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:8372 NewImportTypeNode
+    // Go: ast/ast_generated.go:8203 NewImportTypeNode
     pub fn new_import_type_node(
         &self,
         is_type_of: bool,
@@ -843,7 +843,7 @@ impl NodeFactory {
 
     // ── Signatures and type elements ───────────────────────────────────
 
-    // Go: ast/ast_generated.go:8676 NewTypeParameterDeclaration
+    // Go: ast/ast_generated.go:8507 NewTypeParameterDeclaration
     pub fn new_type_parameter_declaration(
         &self,
         modifiers: ModifierList,
@@ -865,7 +865,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2013 NewParameterDeclaration
+    // Go: ast/ast_generated.go:1848 NewParameterDeclaration
     pub fn new_parameter_declaration(
         &self,
         modifiers: ModifierList,
@@ -890,7 +890,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3132 NewCallSignatureDeclaration
+    // Go: ast/ast_generated.go:2970 NewCallSignatureDeclaration
     pub fn new_call_signature_declaration(
         &self,
         type_parameters: NodeList,
@@ -911,7 +911,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3175 NewConstructSignatureDeclaration
+    // Go: ast/ast_generated.go:3013 NewConstructSignatureDeclaration
     pub fn new_construct_signature_declaration(
         &self,
         type_parameters: NodeList,
@@ -934,7 +934,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3220 NewConstructorDeclaration
+    // Go: ast/ast_generated.go:3058 NewConstructorDeclaration
     pub fn new_constructor_declaration(
         &self,
         modifiers: ModifierList,
@@ -964,7 +964,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3267 NewGetAccessorDeclaration
+    // Go: ast/ast_generated.go:3105 NewGetAccessorDeclaration
     #[allow(clippy::too_many_arguments)]
     pub fn new_get_accessor_declaration(
         &self,
@@ -998,7 +998,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3320 NewSetAccessorDeclaration
+    // Go: ast/ast_generated.go:3158 NewSetAccessorDeclaration
     #[allow(clippy::too_many_arguments)]
     pub fn new_set_accessor_declaration(
         &self,
@@ -1032,7 +1032,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3379 NewIndexSignatureDeclaration
+    // Go: ast/ast_generated.go:3217 NewIndexSignatureDeclaration
     // PORT: Go keeps a nil `Type`; ts_ast requires one, so nil is stored in
     // the nil slot and `type_node()` still reads nil.
     pub fn new_index_signature_declaration(
@@ -1056,7 +1056,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3422 NewMethodSignatureDeclaration
+    // Go: ast/ast_generated.go:3261 NewMethodSignatureDeclaration
     pub fn new_method_signature_declaration(
         &self,
         modifiers: ModifierList,
@@ -1085,7 +1085,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3479 NewMethodDeclaration
+    // Go: ast/ast_generated.go:3319 NewMethodDeclaration
     #[allow(clippy::too_many_arguments)]
     pub fn new_method_declaration(
         &self,
@@ -1121,7 +1121,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3541 NewPropertySignatureDeclaration
+    // Go: ast/ast_generated.go:3382 NewPropertySignatureDeclaration
     // PORT: ts_ast requires `Type` and `Initializer`; Go nil goes to the nil
     // slot, so `type_node()` and `initializer()` still read nil.
     pub fn new_property_signature_declaration(
@@ -1147,7 +1147,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3595 NewPropertyDeclaration
+    // Go: ast/ast_generated.go:3437 NewPropertyDeclaration
     pub fn new_property_declaration(
         &self,
         modifiers: ModifierList,
@@ -1170,7 +1170,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2660 NewNotEmittedTypeElement
+    // Go: ast/ast_generated.go:2498 NewNotEmittedTypeElement
     pub fn new_not_emitted_type_element(&self) -> Node {
         self.new_node(
             SyntaxKind::NotEmittedTypeElement,
@@ -1180,7 +1180,7 @@ impl NodeFactory {
 
     // ── Declarations ───────────────────────────────────────────────────
 
-    // Go: ast/ast_generated.go:2504 NewEnumMember
+    // Go: ast/ast_generated.go:2341 NewEnumMember
     pub fn new_enum_member(&self, name: Node, initializer: Node) -> Node {
         self.new_node(
             SyntaxKind::EnumMember,
@@ -1195,7 +1195,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2552 NewEnumDeclaration
+    // Go: ast/ast_generated.go:2389 NewEnumDeclaration
     pub fn new_enum_declaration(
         &self,
         modifiers: ModifierList,
@@ -1216,7 +1216,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2165 NewFunctionDeclaration
+    // Go: ast/ast_generated.go:2000 NewFunctionDeclaration
     #[allow(clippy::too_many_arguments)]
     pub fn new_function_declaration(
         &self,
@@ -1252,7 +1252,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2222 NewClassDeclaration
+    // Go: ast/ast_generated.go:2057 NewClassDeclaration
     pub fn new_class_declaration(
         &self,
         modifiers: ModifierList,
@@ -1279,7 +1279,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2272 NewClassExpression
+    // Go: ast/ast_generated.go:2108 NewClassExpression
     pub fn new_class_expression(
         &self,
         modifiers: ModifierList,
@@ -1305,7 +1305,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2324 NewHeritageClause
+    // Go: ast/ast_generated.go:2160 NewHeritageClause
     pub fn new_heritage_clause(&self, token: SyntaxKind, types: NodeList) -> Node {
         self.new_node(
             SyntaxKind::HeritageClause,
@@ -1317,7 +1317,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2370 NewInterfaceDeclaration
+    // Go: ast/ast_generated.go:2206 NewInterfaceDeclaration
     pub fn new_interface_declaration(
         &self,
         modifiers: ModifierList,
@@ -1341,7 +1341,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2427 NewTypeAliasDeclaration
+    // Go: ast/ast_generated.go:2263 NewTypeAliasDeclaration
     pub fn new_type_alias_declaration(
         &self,
         modifiers: ModifierList,
@@ -1394,7 +1394,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2597 NewModuleBlock
+    // Go: ast/ast_generated.go:2434 NewModuleBlock
     pub fn new_module_block(&self, statements: NodeList) -> Node {
         self.new_node(
             SyntaxKind::ModuleBlock,
@@ -1406,7 +1406,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5771 NewImportAttribute
+    // Go: ast/ast_generated.go:5597 NewImportAttribute
     pub fn new_import_attribute(&self, name: Node, value: Node) -> Node {
         self.new_node(
             SyntaxKind::ImportAttribute,
@@ -1418,7 +1418,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5822 NewImportAttributes
+    // Go: ast/ast_generated.go:5648 NewImportAttributes
     pub fn new_import_attributes(
         &self,
         token: SyntaxKind,
@@ -1436,7 +1436,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2903 NewExportAssignment
+    // Go: ast/ast_generated.go:2741 NewExportAssignment
     pub fn new_export_assignment(
         &self,
         modifiers: ModifierList,
@@ -1458,7 +1458,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3038 NewNamedExports
+    // Go: ast/ast_generated.go:2876 NewNamedExports
     pub fn new_named_exports(&self, elements: NodeList) -> Node {
         self.new_node(
             SyntaxKind::NamedExports,
@@ -1469,7 +1469,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3085 NewExportSpecifier
+    // Go: ast/ast_generated.go:2923 NewExportSpecifier
     pub fn new_export_specifier(
         &self,
         is_type_only: bool,
@@ -1489,7 +1489,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:8324 NewExportDeclaration
+    // Go: ast/ast_generated.go:8155 NewExportDeclaration
     pub fn new_export_declaration(
         &self,
         modifiers: ModifierList,
@@ -1513,7 +1513,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2687 NewImportDeclaration
+    // Go: ast/ast_generated.go:2525 NewImportDeclaration
     pub fn new_import_declaration(
         &self,
         modifiers: ModifierList,
@@ -1535,7 +1535,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2765 NewExternalModuleReference
+    // Go: ast/ast_generated.go:2603 NewExternalModuleReference
     pub fn new_external_module_reference(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ExternalModuleReference,
@@ -1545,7 +1545,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2856 NewNamedImports
+    // Go: ast/ast_generated.go:2694 NewNamedImports
     pub fn new_named_imports(&self, elements: NodeList) -> Node {
         self.new_node(
             SyntaxKind::NamedImports,
@@ -1556,7 +1556,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:7017 NewSyntaxList
+    // Go: ast/ast_generated.go:6842 NewSyntaxList
     pub fn new_syntax_list(&self, children: &[Node]) -> Node {
         let children = children.iter().map(|&n| self.id(n)).collect();
         self.new_node(
@@ -1565,7 +1565,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:8273 NewImportEqualsDeclaration
+    // Go: ast/ast_generated.go:8104 NewImportEqualsDeclaration
     pub fn new_import_equals_declaration(
         &self,
         modifiers: ModifierList,
@@ -1588,7 +1588,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:8422 NewImportClause
+    // Go: ast/ast_generated.go:8253 NewImportClause
     // PORT: Go KindUnknown for `phaseModifier` is `None` in the data.
     pub fn new_import_clause(
         &self,
@@ -1613,7 +1613,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:8471 NewImportSpecifier
+    // Go: ast/ast_generated.go:8302 NewImportSpecifier
     pub fn new_import_specifier(
         &self,
         is_type_only: bool,
@@ -1635,7 +1635,7 @@ impl NodeFactory {
 
     // ── Expressions ────────────────────────────────────────────────────
 
-    // Go: ast/ast_generated.go:3734 NewKeywordExpression
+    // Go: ast/ast_generated.go:3576 NewKeywordExpression
     pub fn new_keyword_expression(&self, kind: SyntaxKind) -> Node {
         self.new_node(
             kind,
@@ -1645,7 +1645,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4327 NewPropertyAccessExpression
+    // Go: ast/ast_generated.go:4164 NewPropertyAccessExpression
     pub fn new_property_access_expression(
         &self,
         expression: Node,
@@ -1666,7 +1666,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4377 NewElementAccessExpression
+    // Go: ast/ast_generated.go:4214 NewElementAccessExpression
     pub fn new_element_access_expression(
         &self,
         expression: Node,
@@ -1687,7 +1687,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4430 NewCallExpression
+    // Go: ast/ast_generated.go:4267 NewCallExpression
     pub fn new_call_expression(
         &self,
         expression: Node,
@@ -1710,7 +1710,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4479 NewNewExpression
+    // Go: ast/ast_generated.go:4316 NewNewExpression
     pub fn new_new_expression(
         &self,
         expression: Node,
@@ -1728,7 +1728,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4565 NewNonNullExpression
+    // Go: ast/ast_generated.go:4402 NewNonNullExpression
     pub fn new_non_null_expression(&self, expression: Node, flags: NodeFlags) -> Node {
         self.new_chain_node(
             SyntaxKind::NonNullExpression,
@@ -1739,7 +1739,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4738 NewTaggedTemplateExpression
+    // Go: ast/ast_generated.go:4575 NewTaggedTemplateExpression
     pub fn new_tagged_template_expression(
         &self,
         tag: Node,
@@ -1761,7 +1761,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3940 NewPrefixUnaryExpression
+    // Go: ast/ast_generated.go:3777 NewPrefixUnaryExpression
     pub fn new_prefix_unary_expression(&self, operator: SyntaxKind, operand: Node) -> Node {
         self.new_node(
             SyntaxKind::PrefixUnaryExpression,
@@ -1772,7 +1772,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:3893 NewBinaryExpression
+    // Go: ast/ast_generated.go:3730 NewBinaryExpression
     pub fn new_binary_expression(
         &self,
         modifiers: ModifierList,
@@ -1795,7 +1795,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4269 NewConditionalExpression
+    // Go: ast/ast_generated.go:4106 NewConditionalExpression
     pub fn new_conditional_expression(
         &self,
         condition: Node,
@@ -1817,7 +1817,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4784 NewParenthesizedExpression
+    // Go: ast/ast_generated.go:4621 NewParenthesizedExpression
     pub fn new_parenthesized_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ParenthesizedExpression,
@@ -1827,7 +1827,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4128 NewFunctionExpression
+    // Go: ast/ast_generated.go:3965 NewFunctionExpression
     #[allow(clippy::too_many_arguments)]
     pub fn new_function_expression(
         &self,
@@ -1862,7 +1862,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4072 NewArrowFunction
+    // Go: ast/ast_generated.go:3909 NewArrowFunction
     #[allow(clippy::too_many_arguments)]
     pub fn new_arrow_function(
         &self,
@@ -1895,7 +1895,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:6447 NewSyntheticExpression
+    // Go: ast/ast_generated.go:6271 NewSyntheticExpression
     // PORT: Go `Type any` holds a `*checker.Type`; here it is a `TypeId`,
     // read back with `synthetic_expression_type`.
     pub fn new_synthetic_expression(
@@ -1916,7 +1916,7 @@ impl NodeFactory {
         node
     }
 
-    // Go: ast/ast_generated.go:4605 NewSpreadElement
+    // Go: ast/ast_generated.go:4442 NewSpreadElement
     pub fn new_spread_element(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::SpreadElement,
@@ -1926,7 +1926,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4828 NewArrayLiteralExpression
+    // Go: ast/ast_generated.go:4665 NewArrayLiteralExpression
     pub fn new_array_literal_expression(&self, elements: NodeList, multi_line: bool) -> Node {
         self.new_node(
             SyntaxKind::ArrayLiteralExpression,
@@ -1938,7 +1938,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4874 NewObjectLiteralExpression
+    // Go: ast/ast_generated.go:4711 NewObjectLiteralExpression
     pub fn new_object_literal_expression(&self, properties: NodeList, multi_line: bool) -> Node {
         self.new_node(
             SyntaxKind::ObjectLiteralExpression,
@@ -1951,7 +1951,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4961 NewPropertyAssignment
+    // Go: ast/ast_generated.go:4799 NewPropertyAssignment
     pub fn new_property_assignment(
         &self,
         modifiers: ModifierList,
@@ -1974,7 +1974,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4185 NewAsExpression
+    // Go: ast/ast_generated.go:4022 NewAsExpression
     pub fn new_as_expression(&self, expression: Node, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::AsExpression,
@@ -1985,7 +1985,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4225 NewSatisfiesExpression
+    // Go: ast/ast_generated.go:4062 NewSatisfiesExpression
     pub fn new_satisfies_expression(&self, expression: Node, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::SatisfiesExpression,
@@ -1996,7 +1996,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5233 NewTypeAssertion
+    // Go: ast/ast_generated.go:5072 NewTypeAssertion
     pub fn new_type_assertion(&self, type_node: Node, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::TypeAssertionExpression,
@@ -2007,7 +2007,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5068 NewDeleteExpression
+    // Go: ast/ast_generated.go:4907 NewDeleteExpression
     pub fn new_delete_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::DeleteExpression,
@@ -2017,7 +2017,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5110 NewTypeOfExpression
+    // Go: ast/ast_generated.go:4949 NewTypeOfExpression
     pub fn new_type_of_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::TypeOfExpression,
@@ -2027,7 +2027,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5152 NewVoidExpression
+    // Go: ast/ast_generated.go:4991 NewVoidExpression
     pub fn new_void_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::VoidExpression,
@@ -2037,7 +2037,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:5194 NewAwaitExpression
+    // Go: ast/ast_generated.go:5033 NewAwaitExpression
     pub fn new_await_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::AwaitExpression,
@@ -2047,7 +2047,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:4028 NewYieldExpression
+    // Go: ast/ast_generated.go:3865 NewYieldExpression
     pub fn new_yield_expression(&self, asterisk_token: Node, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::YieldExpression,
@@ -2058,7 +2058,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:931 NewDecorator
+    // Go: ast/ast_generated.go:766 NewDecorator
     pub fn new_decorator(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::Decorator,
@@ -2071,7 +2071,7 @@ impl NodeFactory {
 
     // ── Statements ─────────────────────────────────────────────────────
 
-    // Go: ast/ast_generated.go:1784 NewBlock
+    // Go: ast/ast_generated.go:1619 NewBlock
     pub fn new_block(&self, statements: NodeList, multi_line: bool) -> Node {
         self.new_node(
             SyntaxKind::Block,
@@ -2086,7 +2086,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:1829 NewVariableStatement
+    // Go: ast/ast_generated.go:1664 NewVariableStatement
     pub fn new_variable_statement(&self, modifiers: ModifierList, declaration_list: Node) -> Node {
         self.new_node(
             SyntaxKind::VariableStatement,
@@ -2099,7 +2099,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:1874 NewVariableDeclaration
+    // Go: ast/ast_generated.go:1709 NewVariableDeclaration
     pub fn new_variable_declaration(
         &self,
         name: Node,
@@ -2121,7 +2121,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:1923 NewVariableDeclarationList
+    // Go: ast/ast_generated.go:1758 NewVariableDeclarationList
     pub fn new_variable_declaration_list(&self, declarations: NodeList, flags: NodeFlags) -> Node {
         let node = self.new_node(
             SyntaxKind::VariableDeclarationList,
@@ -2134,7 +2134,7 @@ impl NodeFactory {
         node
     }
 
-    // Go: ast/ast_generated.go:1739 NewExpressionStatement
+    // Go: ast/ast_generated.go:1574 NewExpressionStatement
     pub fn new_expression_statement(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ExpressionStatement,
@@ -2145,7 +2145,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:1314 NewReturnStatement
+    // Go: ast/ast_generated.go:1149 NewReturnStatement
     pub fn new_return_statement(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ReturnStatement,
@@ -2157,7 +2157,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:993 NewIfStatement
+    // Go: ast/ast_generated.go:828 NewIfStatement
     pub fn new_if_statement(
         &self,
         expression: Node,
@@ -2176,7 +2176,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:968 NewEmptyStatement
+    // Go: ast/ast_generated.go:803 NewEmptyStatement
     pub fn new_empty_statement(&self) -> Node {
         self.new_node(
             SyntaxKind::EmptyStatement,
@@ -2186,7 +2186,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast_generated.go:2638 NewNotEmittedStatement
+    // Go: ast/ast_generated.go:2475 NewNotEmittedStatement
     pub fn new_not_emitted_statement(&self) -> Node {
         self.new_node(
             SyntaxKind::NotEmittedStatement,

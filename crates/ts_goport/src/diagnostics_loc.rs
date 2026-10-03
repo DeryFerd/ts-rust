@@ -22,7 +22,7 @@ use std::sync::{LazyLock, Mutex, OnceLock, PoisonError};
 /// A localized message catalog: message key to localized text.
 pub type LocaleMessages = FxHashMap<String, String>;
 
-// Go: diagnostics/loc_generated.go:14 matcher
+// Go: diagnostics/loc_generated.go:15 matcher
 static MATCHER: LazyLock<language::Matcher> = LazyLock::new(|| {
     language::new_matcher(&[
         language::english(),
@@ -42,7 +42,7 @@ static MATCHER: LazyLock<language::Matcher> = LazyLock::new(|| {
     ])
 });
 
-// Go: diagnostics/loc_generated.go:31 localeFuncs
+// Go: diagnostics/loc_generated.go:32 localeFuncs
 static LOCALE_FUNCS: [Option<fn() -> &'static LocaleMessages>; 14] = [
     None, // English (default)
     Some(zh_cn),
@@ -60,7 +60,7 @@ static LOCALE_FUNCS: [Option<fn() -> &'static LocaleMessages>; 14] = [
     Some(tr_tr),
 ];
 
-// Go: diagnostics/loc_generated.go:48 loadLocaleData
+// Go: diagnostics/loc_generated.go:49 loadLocaleData
 /// PORT: Go creates the gzip reader first and panics if the header is bad.
 /// `flate2` reads the header lazily, so a bad header panics with the first
 /// message. Go `gzip.Reader` reads concatenated members, like
@@ -91,31 +91,31 @@ macro_rules! locale_data {
     };
 }
 
-// Go: diagnostics/loc_generated.go:62 zhCNData, zhCN
+// Go: diagnostics/loc_generated.go:63 zhCNData, zhCN
 locale_data!(ZH_CN_DATA, zh_cn, "zh-CN.json.gz");
-// Go: diagnostics/loc_generated.go:69 zhTWData, zhTW
+// Go: diagnostics/loc_generated.go:70 zhTWData, zhTW
 locale_data!(ZH_TW_DATA, zh_tw, "zh-TW.json.gz");
-// Go: diagnostics/loc_generated.go:76 csCZData, csCZ
+// Go: diagnostics/loc_generated.go:77 csCZData, csCZ
 locale_data!(CS_CZ_DATA, cs_cz, "cs-CZ.json.gz");
-// Go: diagnostics/loc_generated.go:83 deDEData, deDE
+// Go: diagnostics/loc_generated.go:84 deDEData, deDE
 locale_data!(DE_DE_DATA, de_de, "de-DE.json.gz");
-// Go: diagnostics/loc_generated.go:90 esESData, esES
+// Go: diagnostics/loc_generated.go:91 esESData, esES
 locale_data!(ES_ES_DATA, es_es, "es-ES.json.gz");
-// Go: diagnostics/loc_generated.go:97 frFRData, frFR
+// Go: diagnostics/loc_generated.go:98 frFRData, frFR
 locale_data!(FR_FR_DATA, fr_fr, "fr-FR.json.gz");
-// Go: diagnostics/loc_generated.go:104 itITData, itIT
+// Go: diagnostics/loc_generated.go:105 itITData, itIT
 locale_data!(IT_IT_DATA, it_it, "it-IT.json.gz");
-// Go: diagnostics/loc_generated.go:111 jaJPData, jaJP
+// Go: diagnostics/loc_generated.go:112 jaJPData, jaJP
 locale_data!(JA_JP_DATA, ja_jp, "ja-JP.json.gz");
-// Go: diagnostics/loc_generated.go:118 koKRData, koKR
+// Go: diagnostics/loc_generated.go:119 koKRData, koKR
 locale_data!(KO_KR_DATA, ko_kr, "ko-KR.json.gz");
-// Go: diagnostics/loc_generated.go:125 plPLData, plPL
+// Go: diagnostics/loc_generated.go:126 plPLData, plPL
 locale_data!(PL_PL_DATA, pl_pl, "pl-PL.json.gz");
-// Go: diagnostics/loc_generated.go:132 ptBRData, ptBR
+// Go: diagnostics/loc_generated.go:133 ptBRData, ptBR
 locale_data!(PT_BR_DATA, pt_br, "pt-BR.json.gz");
-// Go: diagnostics/loc_generated.go:139 ruRUData, ruRU
+// Go: diagnostics/loc_generated.go:140 ruRUData, ruRU
 locale_data!(RU_RU_DATA, ru_ru, "ru-RU.json.gz");
-// Go: diagnostics/loc_generated.go:146 trTRData, trTR
+// Go: diagnostics/loc_generated.go:147 trTRData, trTR
 locale_data!(TR_TR_DATA, tr_tr, "tr-TR.json.gz");
 
 // Go: diagnostics/diagnostics.go:67 (*Message).Localize
@@ -125,7 +125,7 @@ pub fn message_localize(m: &'static Message, locale: &Locale, args: &[String]) -
     localize(locale, Some(m), "", args)
 }
 
-// Go: diagnostics/diagnostics.go:71 Localize
+// Go: diagnostics/diagnostics.go:83 Localize
 /// PORT: Go `message *Message` is an `Option`; `None` looks the message up
 /// by `key`.
 pub fn localize(
@@ -152,12 +152,12 @@ pub fn localize(
     format(text, args)
 }
 
-// Go: diagnostics/diagnostics.go:89 localizedMessagesCache
+// Go: diagnostics/diagnostics.go:99 localizedMessagesCache
 static LOCALIZED_MESSAGES_CACHE: LazyLock<
     Mutex<FxHashMap<language::Tag, Option<&'static LocaleMessages>>>,
 > = LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
-// Go: diagnostics/diagnostics.go:91 getLocalizedMessages
+// Go: diagnostics/diagnostics.go:101 getLocalizedMessages
 /// PORT: `pub` for the TestLocaleFiles port
 /// (tests/go_baselines/units_platform/diagnostics_locale.rs); Go tests it
 /// from inside the package.
@@ -191,8 +191,8 @@ pub fn get_localized_messages(loc: &language::Tag) -> Option<&'static LocaleMess
     messages
 }
 
-// Go: diagnostics/diagnostics.go:114 placeholderRegexp
-// Go: diagnostics/diagnostics.go:116 Format
+// Go: diagnostics/diagnostics.go:127 placeholderRegexp
+// Go: diagnostics/diagnostics.go:129 Format
 /// PORT: Go replaces `{(\d+)}` with `regexp.ReplaceAllStringFunc`. The loop
 /// below finds the same leftmost, non-overlapping matches (`\d` is ASCII in
 /// Go regexp).
@@ -249,7 +249,7 @@ pub fn format(text: &str, args: &[String]) -> String {
     result
 }
 
-// Go: diagnostics/diagnostics.go:137 StringifyArgs
+// Go: diagnostics/diagnostics.go:148 StringifyArgs
 // PORT: not ported; Rust callers pass `String` args (see `message_localize`).
 
 #[cfg(test)]

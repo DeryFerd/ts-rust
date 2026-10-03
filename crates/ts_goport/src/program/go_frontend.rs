@@ -345,7 +345,7 @@ pub(super) fn resolve_lazy_js_doc(
     info: &SourceFileInfo,
     node: Node,
 ) -> &'static [Node] {
-    if let Some(jsdocs) = LAZY_JSDOC.with(|cache| cache.borrow().get(&node).copied()) {
+    if let Some(jsdocs) = cached_lazy_js_doc(node) {
         return jsdocs;
     }
     let parse_options = SourceFileParseOptions {
@@ -370,7 +370,14 @@ pub(super) fn resolve_lazy_js_doc(
     jsdocs
 }
 
-// Go: compiler/program.go:122 FileExists (the Go frontend program)
+/// The entry that `resolve_lazy_js_doc` cached for `node` on this thread,
+/// or `None`. It never parses (Go `EagerJSDoc` reads `jsdocCache`, which
+/// holds such entries; `Node::eager_js_doc`).
+pub(crate) fn cached_lazy_js_doc(node: Node) -> Option<&'static [Node]> {
+    LAZY_JSDOC.with(|cache| cache.borrow().get(&node).copied())
+}
+
+// Go: compiler/program.go:129 FileExists (the Go frontend program)
 // PORT: the loading thread asks the program host (with its cache). A
 // checker worker asks its own uncached copy of the same file system.
 pub(super) fn file_exists(path: &str) -> bool {
@@ -470,7 +477,7 @@ fn load_config(
         config_abs = tspath::combine_paths(&config_abs, &["tsconfig.json"]);
     }
 
-    // Go: tsc.go:213 GetParsedCommandLineOfConfigFile with the command line
+    // Go: tsc.go:214 GetParsedCommandLineOfConfigFile with the command line
     // options. PORT: the command line raw map only marks explicit nulls,
     // and the command line here has none, so it is nil.
     let mut command_line_options = CompilerOptions::default();
@@ -1385,7 +1392,7 @@ impl GoSharedState {
         &self.content_mapper_option_diagnostics
     }
 
-    // Go: compiler/program.go:165 GetSourceOfProjectReferenceIfOutputIncluded
+    // Go: compiler/program.go:181 GetSourceOfProjectReferenceIfOutputIncluded
     // (the map lookup; the caller falls back to the file name)
     pub(super) fn get_source_of_project_reference_if_output_included(
         &self,
@@ -1417,7 +1424,7 @@ impl GoSharedState {
         self.can_use_project_reference_source && self.source_to_project_reference.contains_key(path)
     }
 
-    // Go: compiler/program.go:190 GetRedirectForResolution (for program files)
+    // Go: compiler/program.go:206 GetRedirectForResolution (for program files)
     pub(super) fn get_redirect_for_resolution(
         &self,
         file: Node,
@@ -1425,30 +1432,30 @@ impl GoSharedState {
         self.redirects_for_resolution.get(&file.file_index())
     }
 
-    // Go: compiler/program.go:199 GetResolvedProjectReferences
+    // Go: compiler/program.go:215 GetResolvedProjectReferences
     pub(super) fn get_resolved_project_references(
         &self,
     ) -> Vec<Option<Arc<ResolvedProjectReference>>> {
         self.resolved_project_references.clone()
     }
 
-    // Go: compiler/program.go:2017 GetSymlinkCache
+    // Go: compiler/program.go:2300 GetSymlinkCache
     pub(crate) fn known_symlinks(&self) -> Arc<crate::modulespecifiers::symlinks::KnownSymlinks> {
         Arc::clone(&self.known_symlinks)
     }
 
-    // Go: compiler/program.go:195 GetParseFileRedirect (for resolved module
+    // Go: compiler/program.go:211 GetParseFileRedirect (for resolved module
     // file names)
     pub(super) fn get_parse_file_redirect(&self, file_name: &str) -> Option<&str> {
         self.parse_file_redirects.get(file_name).map(String::as_str)
     }
 
-    // Go: compiler/program.go:157 GetRedirectTargets
+    // Go: compiler/program.go:173 GetRedirectTargets
     pub(super) fn get_redirect_targets(&self, path: &str) -> Vec<String> {
         self.redirect_targets.get(path).cloned().unwrap_or_default()
     }
 
-    // Go: compiler/program.go:226 GetSourceFileFromReference (for the
+    // Go: compiler/program.go:242 GetSourceFileFromReference (for the
     // preserved references of a program file)
     pub(super) fn get_source_file_from_reference(&self, origin: Node, r: &FileReference) -> Node {
         self.references
@@ -1457,7 +1464,7 @@ impl GoSharedState {
             .expect("not a preserved reference of a program file")
     }
 
-    // Go: compiler/program.go:494 GetResolvedModule
+    // Go: compiler/program.go:623 GetResolvedModule
     // PERF: returns a borrow, and looks the name up as `&str`. A name has at
     // most one entry per mode, so the mode scan finds the Go map entry.
     pub(super) fn get_resolved_module(
@@ -1473,7 +1480,7 @@ impl GoSharedState {
             .get(&(module_reference, mode) as &dyn crate::frontend::module::ModeAwareKey)
     }
 
-    // Go: compiler/program.go:516 GetResolvedModules (ranged over: every
+    // Go: compiler/program.go:640 GetResolvedModules (ranged over: every
     // resolution of every file)
     // PERF: borrows the version's own map, as Go returns `p.resolvedModules`
     // with no copy. The order is the map order; Go ranges over maps in a
@@ -1485,7 +1492,7 @@ impl GoSharedState {
             .map(|resolved| &**resolved)
     }
 
-    // Go: compiler/program.go:1916 GetJSXRuntimeImportSpecifier
+    // Go: compiler/program.go:2199 GetJSXRuntimeImportSpecifier
     pub(super) fn get_jsx_runtime_import_specifier(&self, path: &str) -> (String, Node) {
         self.jsx_runtime_import_specifiers
             .get(path)
@@ -1493,7 +1500,7 @@ impl GoSharedState {
             .unwrap_or((String::new(), Node::NIL))
     }
 
-    // Go: compiler/program.go:1225 IsEmitBlocked
+    // Go: compiler/program.go:1390 IsEmitBlocked
     pub(super) fn is_emit_blocked(&self, emit_file_name: &str) -> bool {
         let path = crate::frontend::tspath::to_path(
             emit_file_name,
@@ -1503,13 +1510,13 @@ impl GoSharedState {
         self.has_emit_blocking_diagnostics.contains(&path.0)
     }
 
-    // Go: compiler/program.go:1912 IsSourceFileFromExternalLibrary
+    // Go: compiler/program.go:2195 IsSourceFileFromExternalLibrary
     pub(super) fn is_source_file_from_external_library(&self, path: &str) -> bool {
         self.source_files_found_searching_node_modules
             .contains(path)
     }
 
-    // Go: compiler/program.go:1922 GetImportHelpersImportSpecifier
+    // Go: compiler/program.go:2206 GetImportHelpersImportSpecifier
     pub(super) fn get_import_helpers_import_specifier(&self, path: &str) -> Node {
         self.import_helpers_import_specifiers
             .get(path)
@@ -1517,7 +1524,7 @@ impl GoSharedState {
             .unwrap_or(Node::NIL)
     }
 
-    // Go: compiler/program.go:678 GetIncludeProcessorDiagnostics (the
+    // Go: compiler/program.go:840 GetIncludeProcessorDiagnostics (the
     // include processor part)
     pub(super) fn get_include_processor_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
         self.include_diagnostics

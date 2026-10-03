@@ -9,7 +9,7 @@
 
 use crate::project::prelude::*;
 
-// Go: project/configfileregistry.go:13 ConfigFileRegistry
+// Go: project/configfileregistry.go:15 ConfigFileRegistry
 #[derive(Clone, Default)]
 pub struct ConfigFileRegistry {
     // configs is a map of config file paths to their entries.
@@ -50,7 +50,7 @@ pub fn collect_configured_content_mappers<'a>(
     Rc::new(ConfiguredContentMappers { extensions })
 }
 
-// Go: project/configfileregistry.go:25 configFileEntry
+// Go: project/configfileregistry.go:61 configFileEntry
 pub struct ConfigFileEntry {
     pub file_name: String,
     pub pending_reload: PendingReload,
@@ -79,7 +79,7 @@ pub struct ConfigFileEntry {
     pub root_files_watch: Option<Rc<WatchedFiles<PatternsAndIgnored>>>,
 }
 
-// Go: project/configfileregistry.go:52 newConfigFileEntry
+// Go: project/configfileregistry.go:88 newConfigFileEntry
 pub fn new_config_file_entry(
     has_relative_pattern_capability: bool,
     file_name: &str,
@@ -107,7 +107,7 @@ pub fn new_config_file_entry(
     }))
 }
 
-// Go: project/configfileregistry.go:65 newExtendedConfigFileEntry
+// Go: project/configfileregistry.go:101 newExtendedConfigFileEntry
 pub fn new_extended_config_file_entry(
     file_name: &str,
     extending_config_path: tspath::Path,
@@ -126,7 +126,7 @@ pub fn new_extended_config_file_entry(
 }
 
 impl ConfigFileEntry {
-    // Go: project/configfileregistry.go:73 configFileEntry.Clone
+    // Go: project/configfileregistry.go:109 configFileEntry.Clone
     // PORT: Go `Clone()` is `clone_` (dirty decision 3).
     pub fn clone_(&self) -> Rc<RefCell<ConfigFileEntry>> {
         Rc::new(RefCell::new(ConfigFileEntry {
@@ -143,7 +143,7 @@ impl ConfigFileEntry {
     }
 }
 
-// Go: project/configfileregistry.go:73 configFileEntry.Clone (dirty.Cloneable)
+// Go: project/configfileregistry.go:109 configFileEntry.Clone (dirty.Cloneable)
 impl dirty::Cloneable for Rc<RefCell<ConfigFileEntry>> {
     fn clone_(&self) -> Self {
         self.borrow().clone_()
@@ -151,7 +151,7 @@ impl dirty::Cloneable for Rc<RefCell<ConfigFileEntry>> {
 }
 
 impl ConfigFileRegistry {
-    // Go: project/configfileregistry.go:87 ConfigFileRegistry.GetConfig
+    // Go: project/configfileregistry.go:123 ConfigFileRegistry.GetConfig
     pub fn get_config(&self, path: &tspath::Path) -> Option<Rc<tsoptions::ParsedCommandLine>> {
         if let Some(entry) = self.configs.get(path) {
             return entry.borrow().command_line.clone();
@@ -164,7 +164,7 @@ impl ConfigFileRegistry {
         self.configs.contains_key(path)
     }
 
-    // Go: project/configfileregistry.go:94 ConfigFileRegistry.GetConfigFileName
+    // Go: project/configfileregistry.go:135 ConfigFileRegistry.GetConfigFileName
     pub fn get_config_file_name(&self, path: &tspath::Path) -> String {
         if let Some(entry) = self.config_file_names.get(path) {
             return entry.borrow().nearest_config_file_name.clone();
@@ -172,7 +172,7 @@ impl ConfigFileRegistry {
         String::new()
     }
 
-    // Go: project/configfileregistry.go:101 ConfigFileRegistry.GetAncestorConfigFileName
+    // Go: project/configfileregistry.go:142 ConfigFileRegistry.GetAncestorConfigFileName
     pub fn get_ancestor_config_file_name(
         &self,
         path: &tspath::Path,
@@ -189,7 +189,7 @@ impl ConfigFileRegistry {
         String::new()
     }
 
-    // Go: project/configfileregistry.go:109 ConfigFileRegistry.clone
+    // Go: project/configfileregistry.go:150 ConfigFileRegistry.clone
     // clone creates a shallow copy of the configFileRegistry.
     // PORT: named `clone_` like the Go `Clone` methods, so it is not taken
     // for `std::clone::Clone::clone`.
@@ -217,7 +217,7 @@ impl ConfigFileRegistry {
         collect_configured_content_mappers(command_lines.iter().map(|c| &**c))
     }
 
-    // Go: project/configfileregistry.go:126 ConfigFileRegistry.ForEachTestConfigEntry
+    // Go: project/configfileregistry.go:168 ConfigFileRegistry.ForEachTestConfigEntry
     // For testing
     // PORT: Go checks for a nil receiver, so `c` is an `Option`.
     pub fn for_each_test_config_entry(
@@ -240,7 +240,7 @@ impl ConfigFileRegistry {
         }
     }
 
-    // Go: project/configfileregistry.go:140 ConfigFileRegistry.GetTestConfigEntry
+    // Go: project/configfileregistry.go:182 ConfigFileRegistry.GetTestConfigEntry
     // For testing
     // PORT: Go checks for a nil receiver, so `c` is an `Option`.
     pub fn get_test_config_entry(
@@ -261,7 +261,7 @@ impl ConfigFileRegistry {
         None
     }
 
-    // Go: project/configfileregistry.go:160 ConfigFileRegistry.ForEachTestConfigFileNamesEntry
+    // Go: project/configfileregistry.go:202 ConfigFileRegistry.ForEachTestConfigFileNamesEntry
     // For testing
     // PORT: Go checks for a nil receiver, so `c` is an `Option`.
     pub fn for_each_test_config_file_names_entry(
@@ -282,7 +282,7 @@ impl ConfigFileRegistry {
         }
     }
 
-    // Go: project/configfileregistry.go:172 ConfigFileRegistry.GetTestConfigFileNamesEntry
+    // Go: project/configfileregistry.go:214 ConfigFileRegistry.GetTestConfigFileNamesEntry
     // For testing
     // PORT: Go checks for a nil receiver, so `c` is an `Option`.
     pub fn get_test_config_file_names_entry(
@@ -302,7 +302,7 @@ impl ConfigFileRegistry {
     }
 }
 
-// Go: project/configfileregistry.go:118 TestConfigEntry
+// Go: project/configfileregistry.go:160 TestConfigEntry
 // For testing
 // PORT: Go `iter.Seq[tspath.Path]` over a live map is the collected keys.
 #[derive(Clone, Debug, Default)]
@@ -313,7 +313,7 @@ pub struct TestConfigEntry {
     pub retaining_configs: Vec<tspath::Path>,
 }
 
-// Go: project/configfileregistry.go:154 TestConfigFileNamesEntry
+// Go: project/configfileregistry.go:196 TestConfigFileNamesEntry
 // PORT: Go shares the entry's `ancestors` map; the port copies it.
 #[derive(Clone, Debug, Default)]
 pub struct TestConfigFileNamesEntry {
@@ -321,7 +321,7 @@ pub struct TestConfigFileNamesEntry {
     pub ancestors: FxHashMap<String, String>,
 }
 
-// Go: project/configfileregistry.go:184 configFileNames
+// Go: project/configfileregistry.go:226 configFileNames
 #[derive(Clone, Debug, Default)]
 pub struct ConfigFileNames {
     // nearestConfigFileName is the file name of the nearest ancestor config file.
@@ -338,7 +338,7 @@ pub struct ConfigFileNames {
 }
 
 impl ConfigFileNames {
-    // Go: project/configfileregistry.go:197 configFileNames.Clone
+    // Go: project/configfileregistry.go:239 configFileNames.Clone
     // PORT: Go `Clone()` is `clone_` (dirty decision 3).
     pub fn clone_(&self) -> Rc<RefCell<ConfigFileNames>> {
         Rc::new(RefCell::new(ConfigFileNames {
@@ -348,7 +348,7 @@ impl ConfigFileNames {
     }
 }
 
-// Go: project/configfileregistry.go:197 configFileNames.Clone (dirty.Cloneable)
+// Go: project/configfileregistry.go:239 configFileNames.Clone (dirty.Cloneable)
 impl dirty::Cloneable for Rc<RefCell<ConfigFileNames>> {
     fn clone_(&self) -> Self {
         self.borrow().clone_()

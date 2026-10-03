@@ -60,7 +60,7 @@ fn emit_tracker(tx: &DeclarationTransformer) -> EmitSymbolTracker {
     Some(tracker)
 }
 
-// Go: transformers/declarations/transform.go:2639 DeclarationTransformer.visitCJSExportAssignments
+// Go: transformers/declarations/transform.go:2680 DeclarationTransformer.visitCJSExportAssignments
 /// The body of `visit_cjs_export_assignments` and the callback of its walk
 /// visitor `v` (Go `tx.cjsExportAssignmentVisitor`). `v.ctx` is `tx`.
 fn visit_cjs_export_assignments_in(
@@ -97,7 +97,7 @@ fn visit_cjs_export_assignments_in(
     Node::NIL
 }
 
-// Go: transformers/declarations/transform.go:2659 DeclarationTransformer.visitNestedExpression
+// Go: transformers/declarations/transform.go:2700 DeclarationTransformer.visitNestedExpression
 /// The body of `visit_nested_expression` and the callback of its walk
 /// visitor `v` (Go `tx.expressionVisitor`). `v.ctx` is `tx`.
 fn visit_nested_expression_in(
@@ -170,7 +170,7 @@ fn has_full_signature(node: Node) -> bool {
 }
 
 impl DeclarationTransformer {
-    // Go: transformers/declarations/transform.go:2153 DeclarationTransformer.walkBindingPattern
+    // Go: transformers/declarations/transform.go:2194 DeclarationTransformer.walkBindingPattern
     pub(crate) fn walk_binding_pattern(&mut self, pattern: Node, param: Node) -> Vec<Node> {
         let mut elems: Vec<Node> = Vec::new();
         for elem in pattern.elements().iter() {
@@ -196,7 +196,7 @@ impl DeclarationTransformer {
         elems
     }
 
-    // Go: transformers/declarations/transform.go:2174 DeclarationTransformer.transformVariableStatement
+    // Go: transformers/declarations/transform.go:2215 DeclarationTransformer.transformVariableStatement
     pub(crate) fn transform_variable_statement(&mut self, input: Node) -> Node {
         let mut visible = false;
         for decl in input.declaration_list().declarations().nodes().iter() {
@@ -269,7 +269,7 @@ impl DeclarationTransformer {
         res
     }
 
-    // Go: transformers/declarations/transform.go:2229 DeclarationTransformer.transformEnumDeclaration
+    // Go: transformers/declarations/transform.go:2270 DeclarationTransformer.transformEnumDeclaration
     pub(crate) fn transform_enum_declaration(&mut self, input: Node) -> Node {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -333,7 +333,7 @@ impl DeclarationTransformer {
         f.update_enum_declaration(input, modifiers, name, f.new_node_list(&members))
     }
 
-    // Go: transformers/declarations/transform.go:2280 DeclarationTransformer.ensureModifiers
+    // Go: transformers/declarations/transform.go:2321 DeclarationTransformer.ensureModifiers
     pub(crate) fn ensure_modifiers(&mut self, node: Node) -> ModifierList {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -359,7 +359,7 @@ impl DeclarationTransformer {
         f.new_modifier_list(&result)
     }
 
-    // Go: transformers/declarations/transform.go:2300 DeclarationTransformer.ensureModifierFlags
+    // Go: transformers/declarations/transform.go:2341 DeclarationTransformer.ensureModifierFlags
     pub(crate) fn ensure_modifier_flags(&mut self, node: Node) -> ModifierFlags {
         // PORT: Go `All ^ (Public | Async | Override)`; those bits are in All, so XOR clears them.
         let mut mask = ModifierFlags::ALL
@@ -380,7 +380,7 @@ impl DeclarationTransformer {
         mask_modifier_flags(node, mask, additions)
     }
 
-    // Go: transformers/declarations/transform.go:2317 DeclarationTransformer.ensureTypeParams
+    // Go: transformers/declarations/transform.go:2358 DeclarationTransformer.ensureTypeParams
     pub(crate) fn ensure_type_params(&mut self, node: Node, params: NodeList) -> NodeList {
         let ec = self.emit_context.clone();
         if !self
@@ -437,7 +437,7 @@ impl DeclarationTransformer {
         type_parameters
     }
 
-    // Go: transformers/declarations/transform.go:2351 DeclarationTransformer.updateParamList
+    // Go: transformers/declarations/transform.go:2392 DeclarationTransformer.updateParamList
     pub(crate) fn update_param_list(&mut self, node: Node, params: NodeList) -> NodeList {
         let ec = self.emit_context.clone();
         if !self
@@ -455,7 +455,7 @@ impl DeclarationTransformer {
         ec.factory().new_node_list(&results)
     }
 
-    // Go: transformers/declarations/transform.go:2362 DeclarationTransformer.ensureParameter
+    // Go: transformers/declarations/transform.go:2403 DeclarationTransformer.ensureParameter
     pub(crate) fn ensure_parameter(&mut self, p: Node) -> Node {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -494,7 +494,7 @@ impl DeclarationTransformer {
         result
     }
 
-    // Go: transformers/declarations/transform.go:2388 DeclarationTransformer.ensureNoInitializer
+    // Go: transformers/declarations/transform.go:2429 DeclarationTransformer.ensureNoInitializer
     pub(crate) fn ensure_no_initializer(&mut self, node: Node) -> Node {
         if self.should_print_with_initializer(node) {
             let unwrapped_initializer = unwrap_parenthesized_expression(node.initializer());
@@ -511,7 +511,7 @@ impl DeclarationTransformer {
         Node::NIL
     }
 
-    // Go: transformers/declarations/transform.go:2399 DeclarationTransformer.visitBindingName
+    // Go: transformers/declarations/transform.go:2440 DeclarationTransformer.visitBindingName
     pub(crate) fn visit_binding_name(&mut self, node: Node) -> Node {
         match node.kind() {
             SyntaxKind::Identifier | SyntaxKind::OmittedExpression => node,
@@ -546,7 +546,7 @@ impl DeclarationTransformer {
         }
     }
 
-    // Go: transformers/declarations/transform.go:2415 DeclarationTransformer.transformImportEqualsDeclaration
+    // Go: transformers/declarations/transform.go:2456 DeclarationTransformer.transformImportEqualsDeclaration
     pub(crate) fn transform_import_equals_declaration(&mut self, decl: Node) -> Node {
         if !self.resolver.is_declaration_visible(decl) {
             return Node::NIL;
@@ -578,7 +578,7 @@ impl DeclarationTransformer {
         }
     }
 
-    // Go: transformers/declarations/transform.go:2438 DeclarationTransformer.transformImportDeclaration
+    // Go: transformers/declarations/transform.go:2479 DeclarationTransformer.transformImportDeclaration
     pub(crate) fn transform_import_declaration(&mut self, decl: Node) -> Node {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -711,12 +711,12 @@ impl DeclarationTransformer {
         Node::NIL
     }
 
-    // Go: transformers/declarations/transform.go:2543 DeclarationTransformer.transformJSDocTypeExpression
+    // Go: transformers/declarations/transform.go:2584 DeclarationTransformer.transformJSDocTypeExpression
     pub(crate) fn transform_js_doc_type_expression(&mut self, input: Node) -> Node {
         self.visit(input.type_())
     }
 
-    // Go: transformers/declarations/transform.go:2547 DeclarationTransformer.transformJSDocTypeLiteral
+    // Go: transformers/declarations/transform.go:2588 DeclarationTransformer.transformJSDocTypeLiteral
     pub(crate) fn transform_js_doc_type_literal(&mut self, input: Node) -> Node {
         let tags = input.js_doc_property_tags();
         let members = with_tx_visitor(self, DeclarationTransformer::visit, |v| {
@@ -730,7 +730,7 @@ impl DeclarationTransformer {
         replacement
     }
 
-    // Go: transformers/declarations/transform.go:2554 DeclarationTransformer.transformJSDocPropertyTag
+    // Go: transformers/declarations/transform.go:2595 DeclarationTransformer.transformJSDocPropertyTag
     pub(crate) fn transform_js_doc_property_tag(&mut self, input: Node) -> Node {
         let name = self.visit(input.tag_name());
         let type_node = self.visit(input.type_expression());
@@ -746,7 +746,7 @@ impl DeclarationTransformer {
         replacement
     }
 
-    // Go: transformers/declarations/transform.go:2566 DeclarationTransformer.transformJSDocAllType
+    // Go: transformers/declarations/transform.go:2607 DeclarationTransformer.transformJSDocAllType
     pub(crate) fn transform_js_doc_all_type(&mut self, input: Node) -> Node {
         let ec = self.emit_context.clone();
         let replacement = ec.factory().new_keyword_type_node(SyntaxKind::AnyKeyword);
@@ -754,7 +754,7 @@ impl DeclarationTransformer {
         replacement
     }
 
-    // Go: transformers/declarations/transform.go:2572 DeclarationTransformer.transformJSDocNullableType
+    // Go: transformers/declarations/transform.go:2613 DeclarationTransformer.transformJSDocNullableType
     pub(crate) fn transform_js_doc_nullable_type(&mut self, input: Node) -> Node {
         let type_node = self.visit(input.type_());
         let ec = self.emit_context.clone();
@@ -767,12 +767,12 @@ impl DeclarationTransformer {
         replacement
     }
 
-    // Go: transformers/declarations/transform.go:2581 DeclarationTransformer.transformJSDocNonNullableType
+    // Go: transformers/declarations/transform.go:2622 DeclarationTransformer.transformJSDocNonNullableType
     pub(crate) fn transform_js_doc_non_nullable_type(&mut self, input: Node) -> Node {
         self.visit(input.type_())
     }
 
-    // Go: transformers/declarations/transform.go:2585 DeclarationTransformer.transformJSDocVariadicType
+    // Go: transformers/declarations/transform.go:2626 DeclarationTransformer.transformJSDocVariadicType
     pub(crate) fn transform_js_doc_variadic_type(&mut self, input: Node) -> Node {
         let type_node = self.visit(input.type_());
         let ec = self.emit_context.clone();
@@ -781,7 +781,7 @@ impl DeclarationTransformer {
         replacement
     }
 
-    // Go: transformers/declarations/transform.go:2591 DeclarationTransformer.transformJSDocOptionalType
+    // Go: transformers/declarations/transform.go:2632 DeclarationTransformer.transformJSDocOptionalType
     pub(crate) fn transform_js_doc_optional_type(&mut self, input: Node) -> Node {
         let type_node = self.visit(input.type_());
         let ec = self.emit_context.clone();
@@ -794,7 +794,7 @@ impl DeclarationTransformer {
         replacement
     }
 
-    // Go: transformers/declarations/transform.go:2600 DeclarationTransformer.getNameExpressionPreferringIdentifier
+    // Go: transformers/declarations/transform.go:2641 DeclarationTransformer.getNameExpressionPreferringIdentifier
     pub(crate) fn get_name_expression_preferring_identifier(
         &mut self,
         mut name_expr: Node,
@@ -822,7 +822,7 @@ impl DeclarationTransformer {
         name_expr
     }
 
-    // Go: transformers/declarations/transform.go:2624 DeclarationTransformer.stripDeclareModifiers
+    // Go: transformers/declarations/transform.go:2665 DeclarationTransformer.stripDeclareModifiers
     pub(crate) fn strip_declare_modifiers(&mut self, node: Node) -> Node {
         if node.is_nil() {
             return Node::NIL;
@@ -845,7 +845,7 @@ impl DeclarationTransformer {
         node // no need to recur into children, only strip at top-level
     }
 
-    // Go: transformers/declarations/transform.go:2639 DeclarationTransformer.visitCJSExportAssignments
+    // Go: transformers/declarations/transform.go:2680 DeclarationTransformer.visitCJSExportAssignments
     // PERF: Go recurses through the one `tx.cjsExportAssignmentVisitor`. This
     // entry makes one visitor for the whole walk; its callback
     // `visit_cjs_export_assignments_in` recurses through the visitor it gets,
@@ -856,7 +856,7 @@ impl DeclarationTransformer {
         visit_cjs_export_assignments_in(expression, &mut v)
     }
 
-    // Go: transformers/declarations/transform.go:2659 DeclarationTransformer.visitNestedExpression
+    // Go: transformers/declarations/transform.go:2700 DeclarationTransformer.visitNestedExpression
     // PERF: one visitor per walk, like `visit_cjs_export_assignments`. Go
     // keeps it in `tx.expressionVisitor`.
     pub(crate) fn visit_nested_expression(&mut self, expression: Node) -> Node {
@@ -865,7 +865,7 @@ impl DeclarationTransformer {
         visit_nested_expression_in(expression, &mut v)
     }
 
-    // Go: transformers/declarations/transform.go:2686 DeclarationTransformer.transformExpandoAssignment
+    // Go: transformers/declarations/transform.go:2727 DeclarationTransformer.transformExpandoAssignment
     #[allow(unreachable_code)] // Code after the unported `GetReferencedValueDeclaration`.
     pub(crate) fn transform_expando_assignment(&mut self, node: Node) {
         let left = node.left();
@@ -1057,7 +1057,7 @@ impl DeclarationTransformer {
         cleanup.run(self);
     }
 
-    // Go: transformers/declarations/transform.go:2815 DeclarationTransformer.getExpandoHostId
+    // Go: transformers/declarations/transform.go:2861 DeclarationTransformer.getExpandoHostId
     // PORT: Go returns `ast.GetNodeId(mostOriginal)`. The Rust maps are keyed
     // by `Node`, so this returns the node. `get_node_id` still runs for its
     // id assignment side effect.
@@ -1072,7 +1072,7 @@ impl DeclarationTransformer {
         original
     }
 
-    // Go: transformers/declarations/transform.go:2821 DeclarationTransformer.transformExpandoHost
+    // Go: transformers/declarations/transform.go:2867 DeclarationTransformer.transformExpandoHost
     pub(crate) fn transform_expando_host(&mut self, name: Node, declaration: Node) {
         let root = if is_variable_declaration(declaration) {
             declaration.parent().parent()
@@ -1192,7 +1192,7 @@ impl DeclarationTransformer {
         cleanup.run(self);
     }
 
-    // Go: transformers/declarations/transform.go:2878 DeclarationTransformer.createFullExpandoBlock
+    // Go: transformers/declarations/transform.go:2924 DeclarationTransformer.createFullExpandoBlock
     pub(crate) fn create_full_expando_block(&mut self, id: Node) -> Node {
         // Process any expando assignments on this host that were skipped because it wasn't
         // visible when they were collected - if it's still not visible, they simply get
@@ -1244,7 +1244,7 @@ impl DeclarationTransformer {
         n
     }
 
-    // Go: transformers/declarations/transform.go:2931 DeclarationTransformer.tryGetPropertyName
+    // Go: transformers/declarations/transform.go:2987 DeclarationTransformer.tryGetPropertyName
     pub(crate) fn try_get_property_name(&mut self, node: Node) -> String {
         if is_element_access_expression(node) {
             return self.resolver.get_element_access_expression_name(node);
@@ -1256,12 +1256,12 @@ impl DeclarationTransformer {
     }
 }
 
-// Go: transformers/declarations/transform.go:2620 isNotDeclareModifier
+// Go: transformers/declarations/transform.go:2661 isNotDeclareModifier
 fn is_not_declare_modifier(m: Node) -> bool {
     m.kind() != SyntaxKind::DeclareKeyword
 }
 
-// Go: transformers/declarations/transform.go:2917 extractExpandoHostParams
+// Go: transformers/declarations/transform.go:2973 extractExpandoHostParams
 // Returns (typeParameters, parameters, asteriskToken).
 fn extract_expando_host_params(node: Node) -> (NodeList, NodeList, Node) {
     // PORT: Go switches on FunctionExpression, ArrowFunction and (default)

@@ -15,7 +15,7 @@ use super::leak;
 use ts_goport::ast::{
     get_reparsed_node_for_node, get_source_file_of_node, source_file_get_position_map,
 };
-use ts_goport::frontend::parser::{SourceFileParseOptions, parse_source_file};
+use ts_goport::frontend::parser::{ParsedSourceFile, SourceFileParseOptions, parse_source_file};
 use ts_goport::frontend::scanner::new_scanner;
 use ts_goport::frontend::tspath::Path;
 use ts_goport::prelude::*;
@@ -283,6 +283,62 @@ function foo(options) {}"#;
         get_token_pos_of_node(type_node, file.root, false /*includeJSDoc*/),
         (source_text.find("{{").unwrap() + 1) as i32
     );
+}
+
+// PORT: no Go counterpart. Go `JSDoc` of a TS file parses a comment
+// without `@see` or `@link` at the first call and keeps the nodes in
+// `jsdocCache` (ast.go:2745 resolveJSDoc). So a second call gives the same
+// nodes, and `EagerJSDoc` (ast.go:1581), which never parses, gives them from
+// then on. The file is published (see `test_js_doc_import_type_parent_chain`),
+// so the lazy parse is `program::resolve_lazy_js_doc`.
+#[test]
+fn test_lazy_js_doc_second_call_gives_the_same_nodes() {
+    in_child(
+        module_path!(),
+        "test_lazy_js_doc_second_call_gives_the_same_nodes",
+        || {
+            let file = Rc::new(parse_lazy_js_doc_file());
+            note_parsed_source_file(&file);
+            publish_parsed_files("/");
+            check_lazy_js_doc_calls(file.root);
+        },
+    );
+}
+
+// PORT: no Go counterpart. `test_lazy_js_doc_second_call_gives_the_same_nodes`
+// for a file that is not published, as after Go `parser.ParseSourceFile`
+// outside a program. Its lazy parse is `ast::resolve_file_store_js_doc`.
+#[test]
+fn test_lazy_js_doc_before_publish_second_call_gives_the_same_nodes() {
+    let file = parse_lazy_js_doc_file();
+    check_lazy_js_doc_calls(file.root);
+}
+
+/// A TS file with one lazy JSDoc comment (on `f`) and one that the parser
+/// parses at once (on `g`, Go `withJSDoc`: it has `{@link}`).
+fn parse_lazy_js_doc_file() -> ParsedSourceFile {
+    let source_text = "/** Lazy. */\nfunction f() {}\n/** See {@link f}. */\nfunction g() {}\n";
+    let opts = SourceFileParseOptions {
+        file_name: "/index.ts".to_string(),
+        path: Path("/index.ts".to_string()),
+        ..Default::default()
+    };
+    parse_source_file(&opts, leak(source_text), ScriptKind::TS)
+}
+
+fn check_lazy_js_doc_calls(file: Node) {
+    let statements = file.statements();
+    let (f, g) = (statements.get(0), statements.get(1));
+    assert!(f.eager_js_doc(file).is_empty());
+    let eager_g = g.eager_js_doc(file).to_vec();
+    assert_eq!(eager_g.len(), 1);
+    assert_eq!(g.js_doc(file).to_vec(), eager_g);
+
+    let first = f.js_doc(file).to_vec();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].parent(), f);
+    assert_eq!(f.js_doc(file).to_vec(), first);
+    assert_eq!(f.eager_js_doc(file).to_vec(), first);
 }
 
 // Go: parser/parser_test.go:319 TestSourceFilePositionMapWithNonASCIIStringLiteral

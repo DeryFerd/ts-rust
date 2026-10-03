@@ -378,7 +378,7 @@ fn test_comment_formatting_single_line_comment_inside_block_that_opens_on_first_
     assert!(!formatted.is_empty(), "formatted text should not be empty");
 }
 
-// Go: format/comment_test.go:265 TestFormatSelectionPreservesComments, "format selection should not delete block comment when selection ends inside comment"
+// Go: format/comment_test.go:251 TestFormatSelectionPreservesComments, "format selection should not delete block comment when selection ends inside comment"
 #[test]
 fn test_format_selection_preserves_comments_format_selection_should_not_delete_block_comment_when_selection_ends_inside_comment()
  {
@@ -430,7 +430,7 @@ fn test_format_selection_preserves_comments_format_selection_should_not_delete_b
     );
 }
 
-// Go: format/comment_test.go:265 TestFormatSelectionPreservesComments, "format selection should not delete block comment when selection starts inside comment"
+// Go: format/comment_test.go:251 TestFormatSelectionPreservesComments, "format selection should not delete block comment when selection starts inside comment"
 #[test]
 fn test_format_selection_preserves_comments_format_selection_should_not_delete_block_comment_when_selection_starts_inside_comment()
  {
@@ -484,7 +484,7 @@ fn test_format_selection_preserves_comments_format_selection_should_not_delete_b
     );
 }
 
-// Go: format/comment_test.go:265 TestFormatSelectionPreservesComments, "full document format should preserve block comment and add spaces"
+// Go: format/comment_test.go:251 TestFormatSelectionPreservesComments, "full document format should preserve block comment and add spaces"
 #[test]
 fn test_format_selection_preserves_comments_full_document_format_should_preserve_block_comment_and_add_spaces()
  {
@@ -529,7 +529,7 @@ fn test_format_selection_preserves_comments_full_document_format_should_preserve
     );
 }
 
-// Go: format/comment_test.go:365 TestSliceBoundsPanic, "format code with trailing semicolon should not panic"
+// Go: format/comment_test.go:345 TestSliceBoundsPanic, "format code with trailing semicolon should not panic"
 #[test]
 fn test_slice_bounds_panic_format_code_with_trailing_semicolon_should_not_panic() {
     let ctx = with_format_code_settings(

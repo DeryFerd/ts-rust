@@ -11,7 +11,7 @@
 use crate::project::background::prelude::*;
 use std::cell::Cell;
 
-// Go: project/background/queue.go:8 Queue
+// Go: project/background/queue.go:9 Queue
 // Queue manages background tasks execution
 pub struct Queue {
     // PORT: Go `wg sync.WaitGroup`: the number of enqueued tasks that have
@@ -20,7 +20,7 @@ pub struct Queue {
     closed: Cell<bool>,
 }
 
-// Go: project/background/queue.go:15 NewQueue
+// Go: project/background/queue.go:16 NewQueue
 // NewQueue creates a new background queue for managing background tasks execution.
 pub fn new_queue() -> Rc<Queue> {
     Rc::new(Queue {
@@ -83,7 +83,7 @@ impl Queue {
         }
     }
 
-    // Go: project/background/queue.go:42 Wait
+    // Go: project/background/queue.go:44 Wait
     // Wait waits for all active tasks to complete.
     // It does not prevent new tasks from being enqueued while waiting.
     pub fn wait(&self) {
