@@ -619,19 +619,20 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   - A forwarded signal waits until the worker catches it (its `SigCgt` in
     /proc), so a signal that comes before the worker's handlers does what
     it does in Go after the start: a plain compile goes on after SIGINT
-    and SIGTERM, and SIGQUIT prints its name and exits 2. signal-hook sets
-    the handler (the bit) a moment before it publishes the action that the
-    handler runs, and a signal in between does nothing, so the wait also
-    needs the thread that the worker starts after it has registered the
-    signal (`ready_thread`: `signal.NotifyContext` for SIGINT and SIGTERM,
-    `go-signals` for the others). A signal that the worker was seen to
-    catch goes on at once after that. The wait ends 2 s after the worker
-    starts (`HOLD_LIMIT`); a later signal goes on at once. Each signal
-    waits on its own, so one that waits does not hold a later one: after a
-    SIGINT to the process group (a terminal's Ctrl-C) the worker's
-    `notify_context` thread has ended at its own copy, and the launcher's
-    copy waits until `HOLD_LIMIT`; a SIGQUIT or SIGHUP to the launcher only
-    then goes on at once, as in Go (followups9 round b held it up to 1.5 s).
+    and SIGTERM, and SIGQUIT prints its name and exits 2. The wait ends
+    2 s after the worker starts (`HOLD_LIMIT`); a later signal goes on at
+    once. Each signal waits on its own, so one that waits does not hold a
+    later one: a SIGQUIT that comes after a SIGINT that came before the
+    worker's `notify_context` goes on once the worker catches SIGQUIT.
+    PORT: signal-hook sets the handler (the bit) a moment before it
+    publishes the action that the handler runs, so a signal sent on in
+    between does nothing. Followups9 round b also waited for the worker's
+    thread that starts after the registration (`go-signals`,
+    `signal.NotifyContext`). A thread gets its name only when it first
+    runs, so that wait held signals longer: with a launcher, an up-to-date
+    `tsgo -b` under CPU load (zbook) lost 110 and 134 of 1000 SIGQUIT and
+    SIGHUP that came in its first 9 or 19 ms, where the same build without
+    that wait (goport-int35) lost 81 and 90 (followups9e).
   - The worker ends with its launcher: a parent-death SIGKILL, and a
     worker whose launcher died before that (its parent is not the named
     launcher, and the named launcher is gone or a zombie) kills itself. A

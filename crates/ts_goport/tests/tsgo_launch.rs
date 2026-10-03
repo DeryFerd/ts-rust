@@ -393,8 +393,8 @@ fn a_tsgo_whose_caller_ignores_sighup() {
 /// worker's), sends SIGTERM to the launcher, checks that it did not reach
 /// the worker (`ShdPnd` in /proc), and lets the worker go on. The thread of
 /// `notify_context` must then end well before the wait's limit
-/// (`HOLD_LIMIT`, 2 s after the worker's start), so a wait for another
-/// thread (`ready_thread`) fails the test. SIGQUIT to the launcher then
+/// (`HOLD_LIMIT`, 2 s after the worker's start), so a hold that lasts until
+/// that limit fails the test. SIGQUIT to the launcher then
 /// ends the run with Go's text and exit 2. A worker that the test stopped
 /// too late (it catches SIGTERM) ends with its launcher and the run starts
 /// again, up to `ATTEMPTS` times; where no attempt is in time, the test
@@ -478,13 +478,14 @@ fn a_launcher_holds_a_signal_until_its_worker_catches_it() {
 }
 
 /// A SIGINT to the whole process group (a terminal's Ctrl-C) reaches the
-/// launcher and its worker. The worker's `notify_context` thread ends at its
-/// own copy, so the launcher's copy waits for that thread until the wait's
-/// limit (bin/tsgo.rs `HOLD_LIMIT`, 2 s after the worker's start). A signal
-/// that then comes to the launcher only does not wait behind it: SIGQUIT
-/// ends the run at once with Go's text and exit 2, and SIGHUP ends it by
-/// SIGHUP, as in Go. Where `env --default-signal` cannot run, the test says
-/// so and passes.
+/// launcher and its worker: the worker's `notify_context` takes its own
+/// copy, and the launcher sends its copy on. A signal that then comes to
+/// the launcher only does not wait behind it (bin/tsgo.rs
+/// `forward_signals`): SIGQUIT ends the run at once with Go's text and exit
+/// 2, and SIGHUP ends it by SIGHUP, as in Go. (Followups9 round b held the
+/// launcher's copy until its limit, and a SIGQUIT behind it ended the run
+/// 1.5 s late.) Where `env --default-signal` cannot run, the test says so
+/// and passes.
 #[test]
 fn a_launcher_does_not_hold_a_signal_behind_another() {
     let probe = Command::new("env").args(DEFAULT_HUP).arg("true").status();
