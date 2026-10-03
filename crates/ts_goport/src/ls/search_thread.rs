@@ -135,7 +135,8 @@ pub enum HostQuery {
 
 /// The dispatch thread's answer to a `HostQuery`.
 pub enum HostAnswer {
-    File(String, bool),
+    /// The file text is shared, not copied (`FileText`).
+    File(FileText, bool),
     Bool(bool),
     Strings(Vec<String>),
     FileReferences(Vec<FileReference>),
@@ -539,7 +540,7 @@ struct JobHost {
     query: QueryFn,
     /// Files outside the program that the job read through the dispatch
     /// thread (the item's snapshot does not change during the job).
-    files: RefCell<FxHashMap<String, (String, bool)>>,
+    files: RefCell<FxHashMap<String, (FileText, bool)>>,
 }
 
 impl SearchView {
@@ -602,16 +603,16 @@ impl SearchView {
     }
 
     // Go: project/snapshot.go ReadFile
-    fn read_file(&self, file_name: &str) -> (String, bool) {
+    fn read_file(&self, file_name: &str) -> (FileText, bool) {
         let root = self.program_file(file_name);
         if root.is_some() {
-            return (source_file_text(root).to_string(), true);
+            return (source_file_text(root), true);
         }
         self.read_other_file(file_name)
     }
 
     /// A file outside the program, from the item's snapshot.
-    fn read_other_file(&self, file_name: &str) -> (String, bool) {
+    fn read_other_file(&self, file_name: &str) -> (FileText, bool) {
         if let Some(job) = &*self.job.borrow()
             && let Some(file) = job.files.borrow().get(file_name)
         {
@@ -619,7 +620,7 @@ impl SearchView {
         }
         let file = match self.query(HostQuery::ReadFile(file_name.to_string())) {
             HostAnswer::File(text, ok) => (text, ok),
-            _ => (String::new(), false),
+            _ => (FileText::default(), false),
         };
         if let Some(job) = &*self.job.borrow() {
             job.files
@@ -802,7 +803,7 @@ impl Host for WorkerHost {
         self.use_case_sensitive_file_names
     }
 
-    fn read_file(&self, path: &str) -> (String, bool) {
+    fn read_file(&self, path: &str) -> (FileText, bool) {
         self.view.read_file(path)
     }
 

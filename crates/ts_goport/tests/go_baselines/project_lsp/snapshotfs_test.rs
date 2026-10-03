@@ -222,7 +222,7 @@ fn overlay(name: &str, content: &str) -> Rc<Overlay> {
     Rc::new(Overlay {
         file_base: FileBase {
             file_name: name.to_string(),
-            content: content.to_string(),
+            content: content.into(),
             ..FileBase::default()
         },
         version: Cell::new(0),

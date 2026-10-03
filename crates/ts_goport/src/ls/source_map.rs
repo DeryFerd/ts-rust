@@ -86,10 +86,12 @@ impl<P: ProgramView> LanguageService<P> {
 }
 
 // Go: ls/source_map.go:65 script
+// PORT: `text` is shared with the host's file (`Host::read_file`), as the Go
+// string is.
 #[derive(Clone, Debug, Default)]
 pub struct Script {
     pub file_name: String,
-    pub text: String,
+    pub text: FileText,
 }
 
 impl lsconv::Script for Script {
