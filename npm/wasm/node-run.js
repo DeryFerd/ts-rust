@@ -24,6 +24,46 @@ function goError(op, path, error) {
     return `${op} ${path}: ${ERRNO_TEXT[error.code] ?? error.message}`;
 }
 
+/**
+ * Go's `os.MkdirAll` (go1.27 os/path.go:19): makes `path` and its missing
+ * parents. Returns undefined, or Go's error text. The text names the part
+ * of the path that failed: `mkdir /p/f: not a directory` when `/p/f` is a
+ * file. Node's recursive mkdir names the whole path, and gives `file exists`
+ * when `path` is a file.
+ */
+function mkdirAll(path) {
+    const stat = statOrUndefined(fs.statSync, path);
+    if (stat) return stat.isDirectory() ? undefined : `mkdir ${path}: ${ERRNO_TEXT.ENOTDIR}`;
+    // Any stat error: make the parent, then the directory.
+    let i = path.length - 1;
+    while (i >= 0 && path[i] === "/") i--;
+    while (i >= 0 && path[i] !== "/") i--;
+    const parent = path.slice(0, Math.max(i, 0));
+    // A Windows path keeps its volume name (`C:`).
+    const volume = /^[A-Za-z]:/.test(path) ? 2 : 0;
+    if (parent.length > volume) {
+        const error = mkdirAll(parent);
+        if (error) return error;
+    }
+    try {
+        fs.mkdirSync(path);
+    } catch (error) {
+        // For arguments like "foo/.": the directory is there after all.
+        if (statOrUndefined(fs.lstatSync, path)?.isDirectory()) return undefined;
+        return goError("mkdir", path, error);
+    }
+    return undefined;
+}
+
+/** `stat(path)`, or undefined on any error, as Go's `err != nil`. */
+function statOrUndefined(stat, path) {
+    try {
+        return stat(path);
+    } catch {
+        return undefined;
+    }
+}
+
 /** The real file system through node:fs, for `runTsc`. */
 export function nodeFileSystem() {
     const kind = entry =>
@@ -63,8 +103,8 @@ export function nodeFileSystem() {
                 return undefined;
             }
         },
-        // As Go's osvfs writeFile: write, and when that fails, make the
-        // directory and write again.
+        // As Go's osvfs writeFileEnsuringDir (internal/vfs/osvfs/os.go:163):
+        // write, and when that fails, make the directory and write again.
         writeFile(path, data, append) {
             const write = () => (append ? fs.appendFileSync : fs.writeFileSync)(path, data);
             try {
@@ -72,11 +112,8 @@ export function nodeFileSystem() {
             } catch {
                 // Make the directory below.
             }
-            try {
-                fs.mkdirSync(dirname(path), { recursive: true });
-            } catch (error) {
-                return goError("mkdir", error.path ?? dirname(path), error);
-            }
+            const mkdirError = mkdirAll(dirname(path));
+            if (mkdirError) return mkdirError;
             try {
                 return write();
             } catch (error) {

@@ -1,3 +1,12 @@
+/**
+ * A compiled module: `WebAssembly.Module` when the program has the
+ * `WebAssembly` types (lib `dom` or `webworker`), else `object`. So these
+ * types need no lib `dom`.
+ */
+export type WasmModule = typeof globalThis extends { WebAssembly: { Module: abstract new (...args: never) => infer M } }
+    ? M
+    : object;
+
 /** A position: zero-based line, and UTF-16 character in that line. */
 export interface Position {
     line: number;
@@ -95,7 +104,7 @@ export class WasiExit extends Error {
  * stderr text so far in `error.stderr`.
  */
 export function runTsc(
-    module: WebAssembly.Module,
+    module: WasmModule,
     options: RunOptions,
 ): { exitCode: number; diagnostics?: Diagnostic[] };
 
@@ -105,6 +114,6 @@ export function runTsc(
  * gets its own stack, which is about 2 times deeper in a Chrome worker.
  */
 export function runTscAsync(
-    module: WebAssembly.Module,
+    module: WasmModule,
     options: RunOptions,
 ): Promise<{ exitCode: number; diagnostics?: Diagnostic[] }>;

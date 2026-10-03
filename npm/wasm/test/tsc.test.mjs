@@ -88,6 +88,31 @@ test("checks the DOM lib and a clean program", async () => {
     assert.equal(result.exitCode, 0);
 });
 
+test("its types need no lib dom", async () => {
+    // A consumer of the package, checked with and without lib dom, the
+    // package's .d.ts files included.
+    const files = {
+        "/c/package.json": '{ "type": "module" }',
+        "/c/a.ts": [
+            'import { loadModule, tsc } from "ts-rust-wasm";',
+            'import { memoryFileSystem, runTsc } from "ts-rust-wasm/core";',
+            "const module = await loadModule(new Uint8Array(8));",
+            "runTsc(module, { fs: memoryFileSystem() });",
+            'await tsc([], { wasm: "ts_rust.wasm" });',
+            "",
+        ].join("\n"),
+    };
+    for (const name of ["package.json", "index.d.ts", "core.d.ts"]) {
+        files[`/c/node_modules/ts-rust-wasm/${name}`] = readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
+    }
+    for (const lib of ["es2022", "es2022,dom"]) {
+        const args = ["--noEmit", "--strict", "--module", "nodenext", "--types", "", "--lib", lib, "a.ts"];
+        const result = await tsc(args, { files, cwd: "/c" });
+        assert.equal(result.stdout, "", lib);
+        assert.equal(result.exitCode, 0, lib);
+    }
+});
+
 test("reads and writes the real file system", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ts-rust-wasm-"));
     try {
@@ -168,6 +193,25 @@ test("reports a failed write with the OS error, as tsgo does", async () => {
             result.stdout,
             `error TS5033: Could not write file '${dir}/out/a.js': open ${dir}/out/a.js: permission denied.\n`,
         );
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("reports a failed mkdir with Go's error, as tsgo does", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ts-rust-wasm-"));
+    try {
+        writeFileSync(join(dir, "a.ts"), "export {};\n");
+        writeFileSync(join(dir, "f"), "");
+        // Go's os.MkdirAll names the file in the path, with ENOTDIR's text.
+        for (const outDir of ["f", "f/x/y"]) {
+            const result = await tsc(["--outDir", outDir, "--types", "", "a.ts"], { cwd: dir });
+            assert.equal(result.exitCode, 2, outDir);
+            assert.equal(
+                result.stdout,
+                `error TS5033: Could not write file '${dir}/${outDir}/a.js': mkdir ${dir}/f: not a directory.\n`,
+            );
+        }
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
