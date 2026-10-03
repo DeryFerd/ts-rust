@@ -52,6 +52,32 @@ const json = value => `${JSON.stringify(value, null, 2)}\n`;
 // The small cases that this harness writes. Paths are relative to the case
 // dir, `links` maps a path to a symlink target.
 const inline = {
+    // Unique symbols of the same name in several files, in mapped types and
+    // unions, across the checkers of a 4-checker program. Their member
+    // names hold symbol ids (`__@key@<id>`), and members with no
+    // declaration sort by name, so the printed order depends on the ids that
+    // each checker gives.
+    "unique-symbols": {
+        files: {
+            "tsconfig.json": json({
+                compilerOptions: { strict: true, target: "es2022", declaration: true, outDir: "out", types: [] },
+                files: ["a.ts", "b.ts", "c.ts", "d.ts", "use.ts"],
+            }),
+            ...Object.fromEntries(
+                ["a", "b", "c", "d"].map(m => [
+                    `${m}.ts`,
+                    `export declare const key: unique symbol;\nexport declare const other: unique symbol;\n` +
+                        `export type T${m} = { [key]: "${m}"; [other]: number };\n`,
+                ]),
+            ),
+            "use.ts": `import * as a from "./a";\nimport * as b from "./b";\nimport * as c from "./c";\nimport * as d from "./d";\n` +
+                `type Keys = typeof d.key | typeof c.other | typeof a.key | typeof b.other | typeof c.key | typeof b.key;\n` +
+                `export type M = { [K in Keys]: K };\n` +
+                `export const m = null! as M;\n` +
+                `export const all = [a.key, b.key, c.key, d.key] as const;\n` +
+                `export const wrong: M = { [a.key]: b.key };\n`,
+        },
+    },
     jsx: {
         files: {
             "tsconfig.json": json({
@@ -488,6 +514,7 @@ function cases(inputs) {
         },
         { name: "jsx", input: "inline", steps: [["-p", "."]] },
         { name: "decorators", input: "inline", steps: [["-p", "."]] },
+        { name: "unique-symbols", input: "inline", steps: [["-p", "."], ["-p", ".", "--checkers", "1"]] },
         { name: "decl-maps", input: "inline", steps: [["-p", ".", ...maps]] },
         // decl-maps from a cwd that is a symlink, with PWD set as a shell sets it.
         {

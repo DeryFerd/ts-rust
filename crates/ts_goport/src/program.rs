@@ -285,11 +285,11 @@ struct CheckerPool {
     workers: Vec<std::sync::mpsc::Sender<Job>>,
     #[cfg(not(target_family = "wasm"))]
     threads: Vec<std::thread::JoinHandle<()>>,
-    /// wasm has one thread: the checkers stay on the loading thread, and
-    /// each job runs when it is sent (`send_thread_job`). A slot is empty
-    /// while its checker runs a job.
+    /// wasm has one thread: the checkers stay on the loading thread, each
+    /// with the ids of a worker, and each job runs when it is sent
+    /// (`send_thread_job`). A slot is empty while its checker runs a job.
     #[cfg(target_family = "wasm")]
-    checkers: Vec<Option<Checker>>,
+    checkers: Vec<Option<(Checker, WorkerIds)>>,
     /// The program's emit pool, made on its first job
     /// (`send_emit_pool_jobs`). It stops with the checkers.
     emit: Option<EmitPool>,
@@ -341,12 +341,15 @@ impl CheckerPool {
         threads
     }
 
-    /// wasm: drops the checkers. Their synthetic nodes are in the loading
-    /// thread's arena, which stays.
+    /// wasm: drops each checker with its own ids, as its worker would. Its
+    /// synthetic nodes are in the loading thread's arena, which keeps them
+    /// until the process (the wasm instance) ends.
     #[cfg(target_family = "wasm")]
     fn stop(self) -> Vec<std::thread::JoinHandle<()>> {
         let CheckerPool { checkers, emit } = self;
-        drop(checkers);
+        for (checker, mut ids) in checkers.into_iter().flatten() {
+            ids.run(|| drop(checker));
+        }
         emit.map(EmitPool::stop).unwrap_or_default()
     }
 }
@@ -3144,14 +3147,43 @@ fn start_checkers(count: usize) -> CheckerPool {
     }
 }
 
-/// wasm has one thread: makes the `count` checkers on the loading thread.
-/// It already has the program state that a worker gets from its
-/// `WorkerSeed`.
+/// wasm has one thread: makes the `count` checkers on the loading thread,
+/// each with its own `WorkerIds`, as a worker would make it.
 #[cfg(target_family = "wasm")]
 fn start_checkers(count: usize) -> CheckerPool {
+    let checkers = (0..count)
+        .map(|index| {
+            let mut ids = WorkerIds(id_seed().into());
+            let checker = ids.run(|| Checker::new(index));
+            Some((checker, ids))
+        })
+        .collect();
     CheckerPool {
-        checkers: (0..count).map(|index| Some(Checker::new(index))).collect(),
+        checkers,
         emit: None,
+    }
+}
+
+/// wasm: the ids of one checker of the inline pool. A native checker
+/// worker starts from a copy of the loading thread's ids (`WorkerSeed`) and
+/// counts on its own from then on, so the ids that one checker gives do not
+/// move the ids of another (some names hold symbol ids, and members with
+/// no declaration sort by name). The checkers share the loading thread's
+/// synthetic nodes and lazy JSDoc: those keep each node's handle, which
+/// thread-local caches key on.
+#[cfg(target_family = "wasm")]
+struct WorkerIds(crate::ast::IdState);
+
+#[cfg(target_family = "wasm")]
+impl WorkerIds {
+    /// Runs `f` with these ids as the thread's, and keeps the ids that `f`
+    /// leaves. A panic aborts on wasm, so nothing restores the ids after
+    /// one.
+    fn run<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        crate::ast::swap_id_state(&mut self.0);
+        let result = f();
+        crate::ast::swap_id_state(&mut self.0);
+        result
     }
 }
 
@@ -3231,9 +3263,10 @@ fn send_thread_job<R: Send + 'static>(
 }
 
 /// wasm: runs `f` now, on the loading thread, as the worker of checker
-/// `index` would: the checker is this thread's worker checker for the call
-/// (`with_checker_at`). The result is already in the returned channel. A
-/// panic aborts on wasm, so there is no panic payload to keep.
+/// `index` would: with the worker's ids (`WorkerIds`), and with the checker
+/// as this thread's worker checker (`with_checker_at`). The
+/// result is already in the returned channel. A panic aborts on wasm, so
+/// there is no panic payload to keep.
 #[cfg(target_family = "wasm")]
 fn send_thread_job<R: Send + 'static>(
     index: usize,
@@ -3246,21 +3279,24 @@ fn send_thread_job<R: Send + 'static>(
     let id = prog().id;
     // The pool borrow ends before the job runs: a job reads the pool
     // (`checker_index_for_file`).
-    let checker = POOLS.with(|pools| {
+    let (checker, mut ids) = POOLS.with(|pools| {
         let mut pools = pools.borrow_mut();
         let pool = pools.entry(id).or_insert_with(create_checkers);
         pool.checkers[index].take().expect("checker in use")
     });
-    WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
-    WORKER_INDEX.with(|slot| slot.set(Some(index)));
-    let result = f();
-    WORKER_INDEX.with(|slot| slot.set(None));
-    let checker = WORKER_CHECKER
-        .with(|slot| slot.borrow_mut().take())
-        .expect("worker checker");
+    let (result, checker) = ids.run(|| {
+        WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
+        WORKER_INDEX.with(|slot| slot.set(Some(index)));
+        let result = f();
+        WORKER_INDEX.with(|slot| slot.set(None));
+        let checker = WORKER_CHECKER
+            .with(|slot| slot.borrow_mut().take())
+            .expect("worker checker");
+        (result, checker)
+    });
     POOLS.with(|pools| {
         if let Some(pool) = pools.borrow_mut().get_mut(&id) {
-            pool.checkers[index] = Some(checker);
+            pool.checkers[index] = Some((checker, ids));
         }
     });
     let (sender, receiver) = std::sync::mpsc::channel();
