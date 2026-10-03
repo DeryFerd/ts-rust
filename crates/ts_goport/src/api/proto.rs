@@ -5149,8 +5149,8 @@ mod config_file_response_tests {
     use crate::frontend::tspath::ComparePathsOptions;
     use std::rc::Rc;
 
-    // Go: api/proto.go:996 NewConfigFileResponse reads `p.Errors`, where
-    // tsoptions/parsedcommandline.go:181 checkSourceFilesBelongToPath
+    // Go NewConfigFileResponse reads `p.Errors` (api/proto.go:996), where
+    // checkSourceFilesBelongToPath (tsoptions/parsedcommandline.go:181)
     // appended TS6059 when the project's program read
     // `CommonSourceDirectory` (projfix1 skeptic: a referenced project with
     // outDir, `rootDir: src` and a file outside src gives
