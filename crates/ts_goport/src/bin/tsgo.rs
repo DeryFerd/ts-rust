@@ -21,10 +21,11 @@
 //! Not Go: when the run gets 4 KiB pages, a worker copy of the binary does
 //! the work, so the exit does not wait for its memory to unmap (`launch`).
 //!
-//! As the Go runtime does at start (`go_runtime_start`): the signals that Go
-//! drops get a handler that does nothing, SIGQUIT prints its name and exits
-//! 2, SIGHUP ends the process by SIGHUP, and the soft open-file limit goes
-//! up (PORTING.md "Process start").
+//! As the Go runtime does at start: each thread unblocks the signals that
+//! Go must get (`GO_UNBLOCKED`), the signals that Go drops get a handler
+//! that does nothing, SIGQUIT prints its name and exits 2, SIGHUP ends the
+//! process by SIGHUP, and the soft open-file limit goes up
+//! (`go_runtime_start`; PORTING.md "Process start").
 //! PORT: Go `core.ApplyDebugStackLimit` (`TS_GO_DEBUG_STACK_LIMIT`) is a
 //! debug setting and is skipped. The work runs on a thread with the stack
 //! size of `gostd::stack::max_stack_size` (1 GiB with no address space or
@@ -84,7 +85,11 @@ struct Worker {
 
 // Go: cmd/tsc/main.go:14 main
 fn main() {
-    // First: it must run before the first heap allocation.
+    // First: before any thread starts (`thp_guard` can start one), so each
+    // thread gets Go's mask. It allocates nothing.
+    #[cfg(target_os = "linux")]
+    unblock_go_signals();
+    // Next: it must run before the first heap allocation.
     let huge_pages = ts_goport::thp_guard::thp_guard();
     #[cfg(target_os = "linux")]
     if let Some(code) = launch(huge_pages) {
@@ -164,8 +169,17 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
         if let Some(arg0) = args.next() {
             command.arg0(arg0);
         }
-        // `exec` returns only when it fails.
+        // `exec` returns only when it fails (a binary that is gone, for
+        // example). It has given SIGPIPE its default action for the new
+        // image (std `Command`), so a write to a closed pipe or socket
+        // would end this process, as the second SIGINT or SIGTERM did
+        // (`notify_context` writes to its closed self-pipe). std ignores
+        // SIGPIPE at start, and Go gets EPIPE there. A handler that does
+        // nothing gives this process EPIPE again.
+        // PORT: std and rustix have no safe `SIG_IGN`.
         let _ = command.args(args).envs(vars).exec();
+        let ignore = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGPIPE, ignore);
     }
 }
 
@@ -410,10 +424,14 @@ struct OwnStatus {
 /// the caller's action for SIGHUP, as `go_runtime_start` needs.
 /// `launch` calls it before it starts the worker and sends the worker's pid
 /// to the returned sender; a signal that comes first waits for it. When no
-/// worker starts, `launch` drops the sender and the thread ends. Each
-/// signal also waits until the worker catches it (`wait_until_caught`),
-/// for at most `HOLD_LIMIT` after the worker starts, and only with this
-/// process's own /proc (`own_proc`). Otherwise it goes on at once.
+/// worker starts, `launch` drops the sender and the thread ends.
+/// Each signal also waits until the worker catches it (`caught`), for at
+/// most `HOLD_LIMIT` after the worker starts, and only with this process's
+/// own /proc (`own_proc`). Otherwise it goes on at once. Each signal waits
+/// on its own, so one that waits does not hold a later one: a SIGQUIT that
+/// comes after a SIGINT that came before the worker's `notify_context` goes
+/// on once the worker catches SIGQUIT (`go_runtime_start`), not once it
+/// catches SIGINT.
 /// The thread starts as a Go runtime thread does (`GoThread`): when the OS
 /// refuses it, the launcher ends with Go's text and exit 2, before there is
 /// a worker. Go has no launcher, so its process gets every signal; a
@@ -433,71 +451,92 @@ fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
                 return;
             };
             // The worker has started.
-            let hold = own_proc().then(|| Instant::now() + HOLD_LIMIT);
+            let limit = own_proc().then(|| Instant::now() + HOLD_LIMIT);
             if !hup_ignored() {
                 let _ = signals.add_signal(signal_hook::consts::SIGHUP);
             }
-            for signal in signals.forever() {
-                if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
-                    if let Some(until) = hold {
-                        wait_until_caught(pid, signal, until);
+            // The signals that wait, in the order they came, each once.
+            let mut held: Vec<rustix::process::Signal> = Vec::new();
+            // The files are read at once, then after pauses of 1, 2, 4
+            // and 8 ms, then every 8 ms.
+            let mut pause = std::time::Duration::from_millis(1);
+            loop {
+                let came = if held.is_empty() {
+                    signals.wait()
+                } else {
+                    signals.pending()
+                };
+                for signal in came.filter_map(rustix::process::Signal::from_named_raw) {
+                    if !held.contains(&signal) {
+                        held.push(signal);
+                        pause = std::time::Duration::from_millis(1);
                     }
-                    let _ = rustix::process::kill_process(pid, signal);
+                }
+                held.retain(|&signal| {
+                    let wait = limit.is_some_and(|until| caught(pid, signal, until) == Some(false));
+                    if !wait {
+                        let _ = rustix::process::kill_process(pid, signal);
+                    }
+                    wait
+                });
+                if !held.is_empty() {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(8));
                 }
             }
         });
     Some(send)
 }
 
-/// Waits until the worker `pid` catches `signal`, so a forwarded signal
-/// finds the handlers that the worker sets at its start
+/// Whether the worker `pid` catches `signal` now (`forward_signals`), so a
+/// forwarded signal finds the handlers that the worker sets at its start
 /// (`go_runtime_start`, `notify_context`) and does not end it by the
 /// default action. A signal that came before them (soon after the start,
-/// or while the start of `forward_signals` was tried again) waits here: Go
+/// or while the start of `forward_signals` was tried again) waits: Go
 /// sets its handlers before `main`, and `runMain` calls `NotifyContext`
 /// before any work (cmd/tsc/main.go:29).
 /// The kernel lists the caught signals in /proc/<pid>/status (`SigCgt`, a
-/// hex mask with bit N-1 for signal N). The caller calls it only with
-/// this process's own /proc (`own_proc`). It reads the file at once, then
-/// after pauses of 1, 2, 4 and 8 ms, then every 8 ms. The wait ends when
-/// the worker catches the signal or has ended, when that file does not
-/// show a live child of this process, and at `until`.
+/// hex mask with bit N-1 for signal N). The caller calls it only with this
+/// process's own /proc (`own_proc`). None when the signal must not wait
+/// any longer: the worker has ended, that file does not show a live child
+/// of this process, or it is `until`.
+/// PORT: signal-hook sets the handler (the bit) a moment before it
+/// publishes the action that the handler runs (signal-hook-registry 1.4.8
+/// `register_unchecked_impl`), so a signal sent on in between does nothing.
+/// Followups9 round b also waited for the thread that the worker starts
+/// after it has registered the signal. That thread gets its name only when
+/// it first runs, so the wait held signals longer, and under CPU load a
+/// short run with a launcher lost more of them (PORTING.md "Process start").
 #[cfg(target_os = "linux")]
-fn wait_until_caught(pid: rustix::process::Pid, signal: rustix::process::Signal, until: Instant) {
-    let path = format!("/proc/{}/status", pid.as_raw_pid());
-    let launcher = rustix::process::getpid().as_raw_pid().to_string();
-    let bit = 1u64 << (signal.as_raw() - 1).unsigned_abs();
-    let mut pause = std::time::Duration::from_millis(1);
-    loop {
-        let left = until.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return;
-        }
-        let Ok(status) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let field = |name: &str| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix(name))
-                .map(str::trim)
-        };
-        let child = field("PPid:") == Some(launcher.as_str());
-        let live = field("State:").is_some_and(|state| !state.starts_with(['Z', 'X']));
-        let caught = field("SigCgt:").and_then(|mask| u64::from_str_radix(mask, 16).ok());
-        if !(child && live && caught.is_some_and(|caught| caught & bit == 0)) {
-            return;
-        }
-        std::thread::sleep(pause.min(left));
-        pause = (pause * 2).min(std::time::Duration::from_millis(8));
+fn caught(
+    pid: rustix::process::Pid,
+    signal: rustix::process::Signal,
+    until: Instant,
+) -> Option<bool> {
+    if Instant::now() >= until {
+        return None;
     }
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid.as_raw_pid())).ok()?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(str::trim)
+    };
+    let launcher = rustix::process::getpid().as_raw_pid().to_string();
+    let child = field("PPid:") == Some(launcher.as_str());
+    let live = field("State:").is_some_and(|state| !state.starts_with(['Z', 'X']));
+    let mask = field("SigCgt:").and_then(|mask| u64::from_str_radix(mask, 16).ok());
+    let mask = mask.filter(|_| child && live)?;
+    let bit = 1u64 << (signal.as_raw() - 1).unsigned_abs();
+    Some(mask & bit != 0)
 }
 
 /// How long after the worker starts a forwarded signal can wait for the
-/// worker's handlers (`wait_until_caught`). The worker sets them a few
-/// milliseconds after its start. After this time a signal goes on at once,
-/// as without the wait, so no wait lasts the whole run (a worker that is
-/// stopped at its start, for example).
+/// worker's handlers (`caught`). The worker sets them a few milliseconds
+/// after its start. After this time a signal goes on at once, as without
+/// the wait, so no wait lasts the whole run (a worker that is stopped at
+/// its start, for example).
 #[cfg(target_os = "linux")]
 const HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -599,6 +638,56 @@ const GO_THROWN: [(rustix::process::Signal, &str); 3] = {
         (Signal::SYS, "SIGSYS: bad system call"),
     ]
 };
+
+/// The signals that the Go runtime unblocks on each of its threads, so a
+/// caller cannot block them (`runtime/signal_unix.go` `minitSignalMask` and
+/// `blockableSig`, go1.27.1): `_SigUnblock`, `_SigKill` or `_SigThrow` in
+/// `runtime/sigtab_linux_generic.go`, and SIGURG, its preemption signal
+/// (`unblock_go_signals`).
+/// PORT: Go also unblocks the signals 32 to 34 (`_SigUnblock`). nix's
+/// `SigSet` has no real-time signals, so tsgo keeps them as the caller set
+/// them (glibc does not block 32 and 33, its own signals).
+/// PORT: with `GODEBUG=asyncpreemptoff=1` Go lets a caller block SIGURG.
+/// tsgo does not read `GODEBUG`; both drop SIGURG (`GO_DROPPED`).
+#[cfg(target_os = "linux")]
+const GO_UNBLOCKED: [nix::sys::signal::Signal; 15] = {
+    use nix::sys::signal::Signal;
+    [
+        Signal::SIGHUP,
+        Signal::SIGINT,
+        Signal::SIGQUIT,
+        Signal::SIGILL,
+        Signal::SIGTRAP,
+        Signal::SIGABRT,
+        Signal::SIGBUS,
+        Signal::SIGFPE,
+        Signal::SIGSEGV,
+        Signal::SIGTERM,
+        Signal::SIGSTKFLT,
+        Signal::SIGCHLD,
+        Signal::SIGURG,
+        Signal::SIGPROF,
+        Signal::SIGSYS,
+    ]
+};
+
+// Go: runtime/signal_unix.go minitSignalMask (go1.27.1)
+/// Unblocks the signals that Go unblocks on each of its threads
+/// (`GO_UNBLOCKED`). `main` calls it first, before any thread starts, so
+/// each thread gets the new mask: in tsgo, in a launcher and in its worker.
+/// A process that tsgo starts gets the mask of the thread that starts it
+/// (std `Command` keeps it), so the caller's mask without these signals,
+/// as from Go: Go saves the mask of the thread before the fork and the
+/// child sets it (runtime/proc.go `syscall_runtime_BeforeFork`,
+/// `syscall_runtime_AfterForkInChild`).
+#[cfg(target_os = "linux")]
+fn unblock_go_signals() {
+    use nix::sys::signal::SigSet;
+    let _ = GO_UNBLOCKED
+        .into_iter()
+        .collect::<SigSet>()
+        .thread_unblock();
+}
 
 /// Gives each signal that Go drops (`GO_DROPPED`, `GO_DROPPED_RT`) a handler
 /// that does nothing. Not `SIG_IGN`: an exec resets a caught signal to its

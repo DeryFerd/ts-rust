@@ -534,7 +534,7 @@ goroutine.
 ## Process start
 
 `tsgo` starts as the Go runtime and the Go `syscall` package start a Go
-process (bin/tsgo.rs `go_runtime_start`).
+process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
 
 - Signals (Linux, Go runtime/sigtab_linux_generic.go): the signals that Go
   drops when nothing asks for them (USR1, USR2, ALRM, CHLD, URG, XCPU,
@@ -551,6 +551,14 @@ process (bin/tsgo.rs `go_runtime_start`).
   keeps it ignored, so a process that tsgo starts gets it ignored too).
   PORT: SIGABRT and SIGTRAP keep their default actions. Other systems keep
   the default actions.
+- A failed exec of `set_malloc_tunables` (a binary that is gone, for
+  example) leaves SIGPIPE with its default action (std `Command` sets it
+  for the new image). tsgo then gives SIGPIPE a handler that does nothing,
+  so a write to a closed pipe or socket gets EPIPE again, as after std's
+  start and as in Go (a write to fd 1 or 2 still ends the run,
+  execute/tsc/stdio.rs `sigpipe`). Before, a second SIGINT or SIGTERM
+  ended such a run by SIGPIPE: `notify_context` writes to its closed
+  self-pipe.
 - The pid 1 of a PID namespace (`docker run` without `--init`, `unshare
   -pf`, `bwrap --as-pid-1`): the kernel drops each signal with the default
   action that such a process gets from its namespace or sends itself. Go
@@ -561,10 +569,9 @@ process (bin/tsgo.rs `go_runtime_start`).
   whose worker a signal ended exits 128 + N. PORT: std and rustix have no
   safe `SIG_DFL`, and signal-hook's default action calls `abort` when the
   raise returns, which ends a pid 1 by SIGSEGV (rc 139). So a pid 1 does
-  not raise the signal; it exits 128 + N at once. PORT: the SIGPIPE of a
-  broken stdout or stderr (execute/tsc/stdio.rs `sigpipe`) still uses
-  signal-hook's default action, so a pid 1 that runs the work itself
-  (no worker) ends there by SIGSEGV (139) where Go exits 141.
+  not raise the signal; it exits 128 + N at once. So does the SIGPIPE of
+  a broken stdout or stderr (execute/tsc/stdio.rs `sigpipe`): a pid 1 that
+  runs the work itself (no worker) exits 141, as Go does.
 - PORT: SIGILL, SIGBUS, SIGFPE and SIGSEGV keep their default actions,
   also when another process sends them (`kill`). Go throws a sent one
   (`sigFromUser`) as it throws SIGQUIT: it prints the name (`SIGSEGV:
@@ -572,14 +579,29 @@ process (bin/tsgo.rs `go_runtime_start`).
   the port the process ends by the signal (128 + N, a core dump where the
   limit allows it). A SIGILL, SIGBUS, SIGFPE, SIGABRT or SIGTRAP that was
   ignored at start stays ignored, also in a process that tsgo starts; Go
-  catches it, so a process that Go starts gets the default action.
-- PORT: the signal mask. On each thread Go unblocks the signals that it
-  must get (sigtab `_SigUnblock`, `_SigKill` or `_SigThrow`: SIGHUP,
-  SIGINT, SIGTERM, SIGQUIT, SIGILL, SIGSEGV and others), and a process that
-  it starts gets the mask that Go inherited. The port does not change the
-  mask: an inherited blocked SIGINT or SIGTERM stays blocked in tsgo, and a
-  process that the port starts with std `Command` (the content mapper, npm,
-  the launcher's worker) gets an empty mask.
+  catches it, so a process that Go starts gets the default action. There
+  is no safe way to give the child the default actions: std `Command` has
+  no attribute for them (it resets only SIGPIPE), rustix has no
+  `posix_spawn`, a `pre_exec` hook is `unsafe`, and signal-hook refuses a
+  handler for SIGILL and SIGFPE (and a handler that returns from a real
+  fault runs the fault again). nix's `posix_spawn` (with
+  `PosixSpawnAttr::set_sigdefault`) is safe, but its file actions have no
+  `chdir`, which the content mapper start needs (Go `cmd.Dir`).
+- The signal mask. At start, before any thread, tsgo unblocks the signals
+  that Go unblocks on each of its threads (`GO_UNBLOCKED`: sigtab
+  `_SigUnblock`, `_SigKill` or `_SigThrow`, and SIGURG: SIGHUP, SIGINT,
+  SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGTERM,
+  SIGSTKFLT, SIGCHLD, SIGURG, SIGPROF and SIGSYS), so every thread of a
+  launcher and of its worker gets them, as Go's threads do. Other blocked
+  signals stay blocked. A process that tsgo starts gets the mask of the
+  thread that starts it (std `Command` keeps it): the caller's mask
+  without these signals, as Go gives its children the mask of the thread
+  before the fork (`syscall_runtime_BeforeFork`). PORT: Go also unblocks
+  the signals 32 to 34; nix's `SigSet` has no real-time signals, so a
+  caller's blocked signal 34 stays blocked in tsgo and its children
+  (glibc does not block 32 and 33). PORT: Go lets a caller block SIGURG
+  under `GODEBUG=asyncpreemptoff=1`; tsgo does not read `GODEBUG`, and
+  both drop SIGURG.
 - PORT: `GOTRACEBACK` does nothing. With `GOTRACEBACK=crash`, Go ends a
   thrown signal or a fatal panic with SIGABRT (`crash`, a core dump) after
   the goroutines; the port exits 2 as with the default setting.
@@ -599,7 +621,18 @@ process (bin/tsgo.rs `go_runtime_start`).
     it does in Go after the start: a plain compile goes on after SIGINT
     and SIGTERM, and SIGQUIT prints its name and exits 2. The wait ends
     2 s after the worker starts (`HOLD_LIMIT`); a later signal goes on at
-    once.
+    once. Each signal waits on its own, so one that waits does not hold a
+    later one: a SIGQUIT that comes after a SIGINT that came before the
+    worker's `notify_context` goes on once the worker catches SIGQUIT.
+    PORT: signal-hook sets the handler (the bit) a moment before it
+    publishes the action that the handler runs, so a signal sent on in
+    between does nothing. Followups9 round b also waited for the worker's
+    thread that starts after the registration (`go-signals`,
+    `signal.NotifyContext`). A thread gets its name only when it first
+    runs, so that wait held signals longer: with a launcher, an up-to-date
+    `tsgo -b` under CPU load (zbook) lost 110 and 134 of 1000 SIGQUIT and
+    SIGHUP that came in its first 9 or 19 ms, where the same build without
+    that wait (goport-int35) lost 81 and 90 (followups9e).
   - The worker ends with its launcher: a parent-death SIGKILL, and a
     worker whose launcher died before that (its parent is not the named
     launcher, and the named launcher is gone or a zombie) kills itself. A
