@@ -667,7 +667,7 @@ impl SnapshotFSBuilder {
         path: &tspath::Path,
         source: &Rc<dyn FileHandle>,
     ) -> Option<Rc<dyn FileHandle>> {
-        let file = new_cached_file(file_name, source.content());
+        let file = new_cached_file(file_name, source.shared_content());
         file.borrow().file_base.hash.set(source.hash());
         let (entry, loaded) = self.cache_files.load_or_store(path.clone(), file);
         let entry = entry?;
@@ -758,7 +758,7 @@ impl SnapshotFSBuilder {
             if ok {
                 e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                     let mut file = file.borrow_mut();
-                    file.file_base.content = content.clone();
+                    file.file_base.content = content.as_str().into();
                     file.file_base.hash.set(xxh3_128(content.as_bytes()));
                     file.needs_reload = false;
                 });
@@ -796,7 +796,7 @@ impl SnapshotFSBuilder {
                 if ok {
                     e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                         let mut file = file.borrow_mut();
-                        file.file_base.content = content.clone();
+                        file.file_base.content = content.as_str().into();
                         file.file_base.hash.set(xxh3_128(content.as_bytes()));
                         file.needs_reload = false;
                     });
@@ -924,7 +924,7 @@ impl SnapshotFSBuilder {
                 e.delete();
                 return;
             }
-            if content == cur.borrow().file_base.content {
+            if *content == *cur.borrow().file_base.content {
                 changed = false;
                 if !cur.borrow().matches_disk_text() {
                     e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
@@ -935,7 +935,7 @@ impl SnapshotFSBuilder {
             }
             e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                 let mut file = file.borrow_mut();
-                file.file_base.content = content.clone();
+                file.file_base.content = content.as_str().into();
                 file.file_base.hash.set(xxh3_128(content.as_bytes()));
                 file.needs_reload = false;
             });
