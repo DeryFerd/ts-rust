@@ -440,7 +440,11 @@ fn debug_log(line: std::fmt::Arguments<'_>) {
 
 /// The number of workers: the parse threads of a program that is not
 /// large, less the loading thread (`GOPORT_RESOLVE_AHEAD_THREADS` sets it).
+/// 0 on wasm, which has one thread.
 fn worker_count() -> usize {
+    if cfg!(target_family = "wasm") {
+        return 0;
+    }
     std::env::var("GOPORT_RESOLVE_AHEAD_THREADS")
         .ok()
         .and_then(|value| value.parse().ok())
