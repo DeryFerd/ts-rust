@@ -9,7 +9,7 @@ browsers. Nothing here publishes.
 ```sh
 rustup target add wasm32-wasip1
 brew install binaryen          # or a binaryen 132+ release: wasm-opt
-scripts/wasm/build.sh          # writes npm/wasm/ts_rust.wasm
+scripts/wasm/build.sh          # writes npm/wasm/ts_rust.wasm (needs Node)
 cd npm/wasm && npm test
 ```
 
@@ -64,9 +64,11 @@ To try the example, run `python3 -m http.server -d npm/wasm` and open
 ## How it works
 
 - `crates/ts_wasm` is the module: `tsc` from `ts_goport` for `wasm32-wasip1`. The `wasm` cargo
-  profile (opt-level z, fat LTO) and wasm-opt make it 5.1 MB (2.2 MB gzip, 1.8 MB brotli). The
-  libs are in it, packed with LZMA. `scripts/wasm/build.sh` tells how to build a module that
-  checks 17 to 20% faster at 6.2 MB. The diagnostic message texts are packed too.
+  profile (opt-level z, fat LTO) and wasm-opt make it 4.4 MB (1.9 MB gzip, 1.5 MB brotli). The
+  libs are in it as one LZMA stream (0.31 MB), and the diagnostic message texts are packed too.
+  `scripts/wasm/order-functions.mjs` puts similar functions next to each other, so gzip and
+  brotli find more matches. `scripts/wasm/build.sh` tells how to build a module that checks 12
+  to 18% faster at 5.4 MB.
 - The host (`core.js`) gives the file system through two imports (`ts_host.fs`, `fs_take`), and a
   small WASI shim gives clocks, random bytes, stdout and stderr. There is no WASI file system and
   no `node:wasi`.
