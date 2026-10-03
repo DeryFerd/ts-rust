@@ -763,11 +763,15 @@ pub fn parse_json_config_file_content_worker(
                     "tsconfig.json"
                 };
                 let diagnostic_message = diag::The_files_list_in_config_file_0_is_empty;
+                // In Go (tsconfigparsing.go:1300) `nodeValue` is nil when the top
+                // level is not an object (`[{"files": []}]`), and
+                // CreateDiagnosticForNodeInSourceFile (errors.go:93) then
+                // dereferences it.
                 let node_value =
                     for_each_tsconfig_prop_array(source_file.source_file, "files", |property| {
                         Some(property.initializer())
                     })
-                    .unwrap_or(Node::NIL);
+                    .unwrap_or_else(|| crate::core::go_nil_dereference());
                 errors.push(create_diagnostic_for_node_in_source_file(
                     source_file.source_file,
                     node_value,
@@ -2099,5 +2103,55 @@ mod extension_priority_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod top_level_array_tests {
+    use super::*;
+    use crate::frontend::vfs::osvfs_fs;
+
+    struct Host;
+
+    impl ParseConfigHost for Host {
+        fn fs(&self) -> Rc<dyn Fs> {
+            osvfs_fs()
+        }
+        fn get_current_directory(&self) -> String {
+            "/p".to_string()
+        }
+    }
+
+    // In Go (tsconfigparsing.go:1300) a top-level array that holds
+    // `"files": []` has no `files` node, so CreateDiagnosticForNodeInSourceFile
+    // (errors.go:93) dereferences nil. Go N panics with the runtime text and
+    // exits 2 (projfuzz1 GO_CRASH_ARR).
+    #[test]
+    fn empty_files_in_a_top_level_array_panics_like_go() {
+        let source_file = new_tsconfig_source_file_from_file_path(
+            "/p/tsconfig.json",
+            to_path("/p/tsconfig.json", "", true),
+            r#"[{"files": []}]"#,
+        );
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parse_json_source_file_config_file_content(
+                source_file,
+                &Host,
+                "/p",
+                None,
+                None,
+                "/p/tsconfig.json",
+                &[],
+                None,
+            )
+        }))
+        .expect_err("Go N panics");
+        let panic = payload
+            .downcast_ref::<crate::core::GoPanic>()
+            .expect("a Go panic, not a port panic");
+        assert_eq!(
+            panic.message,
+            "runtime error: invalid memory address or nil pointer dereference"
+        );
     }
 }

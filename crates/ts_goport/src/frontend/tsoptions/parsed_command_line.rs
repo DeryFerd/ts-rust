@@ -445,7 +445,9 @@ pub struct ParsedCommandLine {
     pub source_and_output_maps: OnceCell<SourceAndOutputMaps>,
 
     pub common_source_directory: OnceCell<String>,
-    /// Go appends these to `Errors` from `CommonSourceDirectory`.
+    /// Go appends these to `Errors` from `CommonSourceDirectory`. Readers of
+    /// Go `Errors` read `errors` and then these
+    /// (`errors_with_common_source_directory_errors`).
     pub common_source_directory_errors: RefCell<Vec<Diagnostic>>,
 
     pub resolved_project_reference_paths: OnceCell<Vec<String>>,
@@ -480,11 +482,12 @@ pub fn new_parsed_command_line(
 }
 
 impl ParsedCommandLine {
-    // Go: tsoptions/parsedcommandline.go:91 (*ParsedCommandLine).WithFileNames (tsgo#4712)
+    // Go: tsoptions/parsedcommandline.go:93 (*ParsedCommandLine).WithFileNames (tsgo#4712)
     // PORT: Go returns a new pointer; this returns the value. Go copies the
     // cached `wildcardDirectories` map and `includeGlobs` slice but not their
     // `sync.Once`; this clones both cache cells, as
-    // `reload_file_names_of_parsed_command_line` does.
+    // `reload_file_names_of_parsed_command_line` does. Go `p.Errors` holds
+    // the common source directory errors so far, so the copy's `errors` do.
     #[must_use]
     pub fn with_file_names(&self, file_names: Vec<String>) -> ParsedCommandLine {
         let mut parsed_config = self.parsed_config.clone();
@@ -492,7 +495,7 @@ impl ParsedCommandLine {
         ParsedCommandLine {
             parsed_config,
             config_file: self.config_file.clone(),
-            errors: self.errors.clone(),
+            errors: self.errors_with_common_source_directory_errors(),
             raw: self.raw.clone(),
             compile_on_save: self.compile_on_save,
             compare_paths_options: self.compare_paths_options.clone(),
@@ -586,34 +589,22 @@ impl ParsedCommandLine {
         });
     }
 
-    // Go: tsoptions/parsedcommandline.go:122 (*ParsedCommandLine).CommonSourceDirectory
+    // Go: tsoptions/parsedcommandline.go:157 (*ParsedCommandLine).CommonSourceDirectory
     // PORT: Go passes `checkSourceFilesBelongToPath`, which appends to
     // `Errors`. This method takes `&self`, so those diagnostics go to
-    // `common_source_directory_errors` instead.
+    // `common_source_directory_errors` instead, and the readers of Go
+    // `Errors` read both (`errors_with_common_source_directory_errors`).
+    // Call it only where Go calls `CommonSourceDirectory`: an extra call
+    // adds TS6059 errors that Go does not report
+    // (`common_source_directory_unchecked` reads the value without them).
     pub fn common_source_directory(&self) -> &str {
         self.common_source_directory.get_or_init(|| {
-            let files = || -> Vec<String> {
-                self.parsed_config
-                    .file_names
-                    .iter()
-                    .filter(|file| {
-                        !(self
-                            .parsed_config
-                            .compiler_options
-                            .no_emit_for_js_files
-                            .is_true()
-                            && has_js_file_extension(file))
-                            && !is_declaration_file_name(file)
-                    })
-                    .cloned()
-                    .collect()
-            };
             let mut check = |source_files: &[String], root_directory: &str| -> bool {
                 self.check_source_files_belong_to_path(source_files, root_directory)
             };
             get_common_source_directory(
                 &self.parsed_config.compiler_options,
-                files,
+                || self.common_source_directory_files(),
                 self.get_current_directory(),
                 self.use_case_sensitive_file_names(),
                 Some(&mut check),
@@ -621,7 +612,44 @@ impl ParsedCommandLine {
         })
     }
 
-    // Go: tsoptions/parsedcommandline.go:141 (*ParsedCommandLine).checkSourceFilesBelongToPath
+    /// The value of `common_source_directory` without its TS6059 check, so
+    /// no error is recorded. Not in Go: the port reads it where it copies a
+    /// referenced project for the checker threads
+    /// (`ProjectReferenceCopies::resolved`), which Go does not do. The check
+    /// does not change the value.
+    pub fn common_source_directory_unchecked(&self) -> String {
+        if let Some(common_source_directory) = self.common_source_directory.get() {
+            return common_source_directory.clone();
+        }
+        get_common_source_directory(
+            &self.parsed_config.compiler_options,
+            || self.common_source_directory_files(),
+            self.get_current_directory(),
+            self.use_case_sensitive_file_names(),
+            None,
+        )
+    }
+
+    // The `files` closure of Go CommonSourceDirectory
+    // (tsoptions/parsedcommandline.go:159).
+    fn common_source_directory_files(&self) -> Vec<String> {
+        self.parsed_config
+            .file_names
+            .iter()
+            .filter(|file| {
+                !(self
+                    .parsed_config
+                    .compiler_options
+                    .no_emit_for_js_files
+                    .is_true()
+                    && has_js_file_extension(file))
+                    && !is_declaration_file_name(file)
+            })
+            .cloned()
+            .collect()
+    }
+
+    // Go: tsoptions/parsedcommandline.go:176 (*ParsedCommandLine).checkSourceFilesBelongToPath
     pub fn check_source_files_belong_to_path(
         &self,
         source_files: &[String],
@@ -674,46 +702,49 @@ impl ParsedCommandLine {
         result
     }
 
-    // Go: tsoptions/parsedcommandline.go:176 (*ParsedCommandLine).GetOutputFileNames
-    // PORT: Go `iter.Seq[string]` is an eager `Vec`.
-    pub fn get_output_file_names(&self) -> Vec<String> {
-        let mut result: Vec<String> = Vec::new();
-        for file_name in &self.parsed_config.file_names {
-            if is_declaration_file_name(file_name) {
-                continue;
-            }
-            let opts = &self.parsed_config.compiler_options;
-            let js_file_name = get_output_js_file_name(file_name, opts, self);
-            let is_json = file_extension_is(file_name, EXTENSION_JSON);
-            if !js_file_name.is_empty() {
-                if !is_json {
-                    let source_map = get_source_map_file_path(&js_file_name, opts);
-                    result.push(js_file_name);
-                    if !source_map.is_empty() {
-                        result.push(source_map);
+    // Go: tsoptions/parsedcommandline.go:211 (*ParsedCommandLine).GetOutputFileNames
+    // PORT: Go `iter.Seq[string]` is a lazy iterator, and so is this: each
+    // name is made when the caller asks for it. A caller that stops early
+    // (the `-b` up-to-date check, `FirstOrNilSeq`) makes no later name, so
+    // it does not call `CommonSourceDirectory` (and record its TS6059 errors)
+    // where Go does not.
+    pub fn get_output_file_names(&self) -> impl Iterator<Item = String> + '_ {
+        let opts = &self.parsed_config.compiler_options;
+        self.parsed_config
+            .file_names
+            .iter()
+            .filter(|file_name| !is_declaration_file_name(file_name))
+            .flat_map(move |file_name| {
+                let is_json = file_extension_is(file_name, EXTENSION_JSON);
+                let js =
+                    std::iter::once_with(move || get_output_js_file_name(file_name, opts, self))
+                        .filter(|js_file_name| !js_file_name.is_empty())
+                        .flat_map(move |js_file_name| {
+                            let source_map = if is_json {
+                                String::new()
+                            } else {
+                                get_source_map_file_path(&js_file_name, opts)
+                            };
+                            std::iter::once(js_file_name)
+                                .chain((!source_map.is_empty()).then_some(source_map))
+                        });
+                let dts = std::iter::once_with(move || {
+                    if is_json || !opts.get_emit_declarations() {
+                        return String::new();
                     }
-                } else {
-                    result.push(js_file_name);
-                }
-            }
-            if is_json {
-                continue;
-            }
-            if opts.get_emit_declarations() {
-                let dts_file_name = get_output_declaration_file_name_worker(file_name, opts, self);
-                if !dts_file_name.is_empty() {
+                    get_output_declaration_file_name_worker(file_name, opts, self)
+                })
+                .filter(|dts_file_name| !dts_file_name.is_empty())
+                .flat_map(move |dts_file_name| {
                     // tsgo#4712: no declaration map for a content-mapped file.
-                    let are_maps = self.get_content_mapper_for_file_name(file_name).is_none()
-                        && opts.get_are_declaration_maps_enabled();
-                    let declaration_map = format!("{dts_file_name}.map");
-                    result.push(dts_file_name);
-                    if are_maps {
-                        result.push(declaration_map);
-                    }
-                }
-            }
-        }
-        result
+                    let declaration_map =
+                        (self.get_content_mapper_for_file_name(file_name).is_none()
+                            && opts.get_are_declaration_maps_enabled())
+                        .then(|| format!("{dts_file_name}.map"));
+                    std::iter::once(dts_file_name).chain(declaration_map)
+                });
+                js.chain(dts)
+            })
     }
 
     // Go: tsoptions/parsedcommandline.go:218 (*ParsedCommandLine).GetBuildInfoFileName
@@ -901,15 +932,26 @@ impl ParsedCommandLine {
         }
     }
 
-    // Go: tsoptions/parsedcommandline.go:327 (*ParsedCommandLine).GetConfigFileParsingDiagnostics
+    // Go: tsoptions/parsedcommandline.go:393 (*ParsedCommandLine).GetConfigFileParsingDiagnostics
+    // PORT: Go `p.Errors` is `errors_with_common_source_directory_errors`.
     pub fn get_config_file_parsing_diagnostics(&self) -> Vec<Diagnostic> {
         if let Some(config_file) = &self.config_file {
             // todo: !!! should be ConfigFile.ParseDiagnostics, check if they are the same
             let mut result = parsed_source_file_diagnostics(config_file.source_file).to_vec();
-            result.extend(self.errors.iter().cloned());
+            result.extend(self.errors_with_common_source_directory_errors());
             return result;
         }
-        self.errors.clone()
+        self.errors_with_common_source_directory_errors()
+    }
+
+    /// Go `p.Errors` as it is now: `errors`, then the TS6059 errors that
+    /// `CommonSourceDirectory` appended (Go appends them to `Errors`, so they
+    /// come last). Go reads `p.Errors` when it is called, so a reader after
+    /// `CommonSourceDirectory` sees them and a reader before it does not.
+    pub fn errors_with_common_source_directory_errors(&self) -> Vec<Diagnostic> {
+        let mut errors = self.errors.clone();
+        errors.extend(self.common_source_directory_errors.borrow().iter().cloned());
+        errors
     }
 
     // Go: tsoptions/parsedcommandline.go:337 (*ParsedCommandLine).PossiblyMatchesFileName
@@ -1011,9 +1053,11 @@ impl ParsedCommandLine {
             .expect("nil pointer dereference: ConfigFile.configFileSpecs")
     }
 
-    // Go: tsoptions/parsedcommandline.go:393 (*ParsedCommandLine).ReloadFileNamesOfParsedCommandLine
+    // Go: tsoptions/parsedcommandline.go:465 (*ParsedCommandLine).ReloadFileNamesOfParsedCommandLine
     // PORT: Go copies the cached `wildcardDirectories` map pointer and the
-    // `includeGlobs` slice; this clones both cache cells.
+    // `includeGlobs` slice; this clones both cache cells. Go `p.Errors`
+    // holds the common source directory errors so far, so the copy's
+    // `errors` do.
     pub fn reload_file_names_of_parsed_command_line(&self, fs: &dyn Fs) -> ParsedCommandLine {
         let mut parsed_config = self.parsed_config.clone();
         let (file_names, literal_file_names_len) = get_file_names_from_config_specs(
@@ -1027,7 +1071,7 @@ impl ParsedCommandLine {
         ParsedCommandLine {
             parsed_config,
             config_file: self.config_file.clone(),
-            errors: self.errors.clone(),
+            errors: self.errors_with_common_source_directory_errors(),
             raw: self.raw.clone(),
             compile_on_save: self.compile_on_save,
             compare_paths_options: self.compare_paths_options.clone(),
@@ -1128,5 +1172,74 @@ mod glob_tests {
         // Go ignores the negation when matching.
         assert!(m("[!a-c]", "b"));
         assert!(!m("[!a-c]", "é"));
+    }
+}
+
+#[cfg(test)]
+mod common_source_directory_tests {
+    use super::*;
+
+    fn command_line(options: CompilerOptions) -> ParsedCommandLine {
+        new_parsed_command_line(
+            Rc::new(options),
+            vec!["/p/src/a.ts".to_string(), "/p/other/b.ts".to_string()],
+            None,
+            ComparePathsOptions {
+                use_case_sensitive_file_names: true,
+                current_directory: "/p".to_string(),
+            },
+        )
+    }
+
+    fn codes(command_line: &ParsedCommandLine) -> Vec<i32> {
+        command_line
+            .get_config_file_parsing_diagnostics()
+            .iter()
+            .map(Diagnostic::code)
+            .collect()
+    }
+
+    // Go: tsoptions/parsedcommandline.go:176 checkSourceFilesBelongToPath
+    // appends TS6059 to `p.Errors`, which GetConfigFileParsingDiagnostics
+    // (:393) and WithFileNames (:93) read. GetOutputFileNames (:211) is
+    // lazy: only a name under outDir or declarationDir reads
+    // CommonSourceDirectory (outputpaths.go:166).
+    #[test]
+    fn common_source_directory_errors_are_config_errors_like_go() {
+        let out_dir = command_line(CompilerOptions {
+            root_dir: "/p/src".to_string(),
+            out_dir: "/p/out".to_string(),
+            ..Default::default()
+        });
+        assert!(codes(&out_dir).is_empty());
+        assert_eq!(
+            out_dir.get_output_file_names().next().as_deref(),
+            Some("/p/out/a.js")
+        );
+        assert_eq!(codes(&out_dir), [6059]);
+        assert_eq!(codes(&out_dir.with_file_names(Vec::new())), [6059]);
+
+        // The first name (a.js next to a.ts) does not read the directory.
+        let declaration_dir = command_line(CompilerOptions {
+            root_dir: "/p/src".to_string(),
+            declaration: Tristate::True,
+            declaration_dir: "/p/types".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(
+            declaration_dir.get_output_file_names().next().as_deref(),
+            Some("/p/src/a.js")
+        );
+        assert!(codes(&declaration_dir).is_empty());
+        assert_eq!(
+            declaration_dir.get_output_file_names().collect::<Vec<_>>(),
+            [
+                "/p/src/a.js",
+                "/p/types/a.d.ts",
+                "/p/other/b.js",
+                "/p/other/b.d.ts"
+            ]
+        );
+        assert_eq!(codes(&declaration_dir), [6059]);
     }
 }

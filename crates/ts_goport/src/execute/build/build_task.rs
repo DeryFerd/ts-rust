@@ -80,14 +80,14 @@ pub struct BuildInfoEntry {
     pub path: Path,
     pub m_time: Option<SystemTime>,
     pub dts_time: Option<Option<SystemTime>>,
-    // PORT: not in Go (perf). What a build info thread made from
+    // PORT: not in Go (perf). What a prefetch thread made from
     // `build_info` for the up-to-date check (`StatusPrefetch`), until the
     // check takes it.
     pub status_prefetch: Option<Arc<StatusPrefetch>>,
 }
 
-/// PORT: not in Go (perf). The parts of `getUpToDateStatus` that a build
-/// info thread computes from the build info it read, ahead of the check
+/// PORT: not in Go (perf). The parts of `getUpToDateStatus` that a
+/// prefetch thread computes from the build info it read, ahead of the check
 /// (see `BuildInfoPrefetch` in orchestrator.rs). Go computes them in the
 /// check, on the task's builder goroutine. The check uses them only when
 /// they were made for its build info directory and file lists.
@@ -111,13 +111,20 @@ pub struct StatusPrefetch {
     /// `GetMissingPackageJsons`, collected. The check takes them.
     pub package_jsons: Vec<String>,
     pub missing_package_jsons: Vec<String>,
+    /// The mtime (`incremental.GetMTime`) of each root file, by its index
+    /// in `input_paths`, and of each file of `file_names`, by its index
+    /// there, that the thread read (`read_m_times`); None for a file that
+    /// it did not read. The check takes them where it would read the file
+    /// system (`BuildTaskOrchestrator::get_m_time_of_path`).
+    pub input_m_times: Vec<Option<Option<SystemTime>>>,
+    pub file_m_times: Vec<Option<Option<SystemTime>>>,
 }
 
 /// PORT: not in Go (perf). The options of a task that decide whether its
 /// up-to-date check returns before it reads the mtimes of its inputs. A
-/// build info thread reads for the check only what the check reads
+/// prefetch thread reads for the check only what the check reads
 /// (`reads_input_times`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct StatusCheckOptions {
     is_incremental: bool,
     emit_declarations: bool,
@@ -226,8 +233,72 @@ impl StatusPrefetch {
             resolved_roots,
             package_jsons,
             missing_package_jsons,
+            input_m_times: Vec::new(),
+            file_m_times: Vec::new(),
         }
     }
+
+    /// Reads the mtimes (`input_m_times`, `file_m_times`) of the root files
+    /// (`input_files`, the names of `input_paths`) and the files of the
+    /// build info that are TypeScript sources (`is_typescript_source`), as
+    /// `BuildHost::get_m_time` reads them (`incremental.GetMTime`) on `fs`.
+    /// No task of a build writes such a file, so the mtime is the one that
+    /// the check would read later. Each path is read once: the build info
+    /// lists the root files too. `os_fs`: `fs` is the wrapped OS file
+    /// system (`is_wrapped_os_fs`), so the OS paths are read together
+    /// (`os_mod_times`).
+    pub fn read_m_times(&mut self, fs: &dyn Fs, os_fs: bool, input_files: &[String]) {
+        /// The index in `files` of the mtime of `file`, when it is read.
+        fn index_of<'a>(
+            files: &mut Vec<&'a str>,
+            indexes: &mut FxHashMap<&'a Path, usize>,
+            file: &'a str,
+            path: &'a Path,
+        ) -> Option<usize> {
+            is_typescript_source(file).then(|| {
+                *indexes.entry(path).or_insert_with(|| {
+                    files.push(file);
+                    files.len() - 1
+                })
+            })
+        }
+        let mut files = Vec::with_capacity(input_files.len());
+        let mut indexes =
+            FxHashMap::with_capacity_and_hasher(input_files.len(), Default::default());
+        let input_indexes: Vec<Option<usize>> = input_files
+            .iter()
+            .zip(&self.input_paths)
+            .map(|(file, path)| index_of(&mut files, &mut indexes, file, path))
+            .collect();
+        let file_indexes: Vec<Option<usize>> = self
+            .file_names
+            .iter()
+            .map(|(file, path)| index_of(&mut files, &mut indexes, file, path))
+            .collect();
+        drop(indexes);
+        let m_times: Vec<Option<SystemTime>> =
+            if os_fs && files.iter().all(|file| file.starts_with('/')) {
+                os_mod_times(files)
+            } else {
+                files
+                    .iter()
+                    .map(|file| fs.stat(file).and_then(|stat| stat.mod_time()))
+                    .collect()
+            };
+        let m_time_at = |index: &Option<usize>| index.map(|index| m_times[index]);
+        self.input_m_times = input_indexes.iter().map(m_time_at).collect();
+        self.file_m_times = file_indexes.iter().map(m_time_at).collect();
+    }
+}
+
+/// True for a TypeScript file that is not a declaration file. A build
+/// never writes one (its outputs are JavaScript, declaration, map, JSON
+/// and build info files).
+fn is_typescript_source(file_name: &str) -> bool {
+    file_extension_is_one_of(
+        file_name,
+        &[EXTENSION_TS, EXTENSION_TSX, EXTENSION_MTS, EXTENSION_CTS],
+    ) && !is_declaration_file_name(file_name)
 }
 
 // Go: tsc/diagnostics.go:23 DiagnosticReporter, bound to the task's writer.
@@ -381,7 +452,14 @@ pub trait BuildTaskOrchestrator {
     fn get_m_time(&self, file: &str) -> Option<SystemTime>;
     /// PORT: not in Go (perf). `get_m_time` of `file`, whose `toPath` is
     /// `path`.
-    fn get_m_time_of_path(&self, file: &str, path: &Path) -> Option<SystemTime>;
+    /// `prefetched`: the mtime that a prefetch thread read for `file`
+    /// (`StatusPrefetch`), taken where the host would read the file system.
+    fn get_m_time_of_path(
+        &self,
+        file: &str,
+        path: &Path,
+        prefetched: Option<Option<SystemTime>>,
+    ) -> Option<SystemTime>;
     // Go: build/host.go (*host).SetMTime
     fn set_m_time(&self, file: &str, m_time: SystemTime) -> Result<(), FsError>;
     // Go: build/host.go (*host).storeMTime
@@ -390,7 +468,7 @@ pub trait BuildTaskOrchestrator {
     // (uncached read from disk).
     fn read_build_info_file(&self, config: &ParsedCommandLine) -> Option<Rc<BuildInfo>>;
 
-    /// PORT: not in Go (perf). What a build info thread made for the check
+    /// PORT: not in Go (perf). What a prefetch thread made for the check
     /// from the build info that `read_build_info_file` just gave for
     /// `build_info_file_name` (`StatusPrefetch`).
     fn take_status_prefetch(&self, _build_info_file_name: &str) -> Option<StatusPrefetch> {
@@ -1093,11 +1171,7 @@ impl BuildTask {
         } else {
             let oldest_output_file_name = match emitted_files.first() {
                 Some(first) => first.clone(),
-                None => resolved
-                    .get_output_file_names()
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default(),
+                None => resolved.get_output_file_names().next().unwrap_or_default(),
             };
             self.status = Some(UpToDateStatus::with_data(
                 UpToDateStatusType::UpToDate,
@@ -1289,7 +1363,7 @@ impl BuildTask {
             &build_info_path,
             &orchestrator.compare_paths_options().current_directory,
         ));
-        // PORT: perf. The parts that a build info thread computed, when
+        // PORT: perf. The parts that a prefetch thread computed, when
         // they are for this directory and these file lists. They free on a
         // thread when the check returns (`DropInBackground`).
         let mut prefetched = DropInBackground(
@@ -1350,7 +1424,7 @@ impl BuildTask {
             time: build_info_time,
         };
         let mut newest_input_file_and_time = FileAndTime::default();
-        // PORT: perf. With a prefetch, the build info thread made the set
+        // PORT: perf. With a prefetch, the prefetch thread made the set
         // (`StatusPrefetch::input_path_set`).
         let mut own_seen_roots: FxHashSet<Path> = FxHashSet::default();
         // Go `getBuildInfoRootInfoReader`, made once.
@@ -1374,7 +1448,11 @@ impl BuildTask {
                     &owned_path
                 }
             };
-            let input_time = orchestrator.get_m_time_of_path(input_file, input_path);
+            let prefetched_time = prefetched
+                .as_ref()
+                .and_then(|prefetched| prefetched.input_m_times.get(index).copied().flatten());
+            let input_time =
+                orchestrator.get_m_time_of_path(input_file, input_path, prefetched_time);
             if input_time.is_none() {
                 return UpToDateStatus::with_data(
                     UpToDateStatusType::InputFileMissing,
@@ -1497,7 +1575,11 @@ impl BuildTask {
                 {
                     continue;
                 }
-                let input_time = orchestrator.get_m_time_of_path(input_file, input_path);
+                let prefetched_time = prefetched
+                    .as_ref()
+                    .and_then(|prefetched| prefetched.file_m_times.get(index).copied().flatten());
+                let input_time =
+                    orchestrator.get_m_time_of_path(input_file, input_path, prefetched_time);
                 if input_time.is_none() {
                     // Input file that was part of the program is missing (eg: dependency was removed)
                     return UpToDateStatus::with_data(
@@ -1650,7 +1732,7 @@ impl BuildTask {
         }
 
         // PORT: perf. Go normalizes each list twice, for the checks and for
-        // `t.packageJsons`; here once, or on the build info thread.
+        // `t.packageJsons`; here once, or on a prefetch thread.
         let (package_jsons, missing_package_jsons) =
             match prefetched.as_mut().and_then(Arc::get_mut) {
                 Some(prefetched) => (
@@ -1863,7 +1945,8 @@ impl BuildTask {
         };
 
         if self.can_update_js_dts_output_timestamps() {
-            for output_file in self.resolved().get_output_file_names() {
+            let resolved = self.resolved().clone();
+            for output_file in resolved.get_output_file_names() {
                 update_time_stamp(self, &output_file);
             }
         }
