@@ -32,8 +32,10 @@ pub fn parse_js_doc_for_node(
     script_kind: ScriptKind,
     node: Node,
 ) -> Vec<Node> {
+    let jsdoc_cut_text = std::cell::OnceCell::new();
     let mut p = new_parser();
     p.initialize_state(opts, source_text, script_kind);
+    p.jsdoc_cut_text = Some(&jsdoc_cut_text);
     p.factory = NodeFactory::new();
     let ranges = get_js_doc_comment_ranges(&p.factory, Vec::new(), node, p.source_text);
     if ranges.is_empty() {
@@ -80,7 +82,57 @@ fn byte_suffix(s: &str, i: usize) -> String {
     }
 }
 
+/// Go `text[:end-2]` in `parseJSDocComment`: the comment text without its
+/// closing `*/`. Returns the port offset of the cut and the Go bytes that
+/// the cut keeps of a char that it splits (empty when it splits none).
+// PORT: Go cuts 2 bytes. Before a `*/` they are 2 ASCII bytes. An
+// unterminated comment runs to the end of the file and can end in any char,
+// so the cut can split a char or a unit of the port form (see
+// `scanner_util::GO_STRING_MARKER`). Go keeps the bytes of that char before
+// the cut, and its scanner reads each one as a RuneError of size 1. Then the
+// offset is the start of the split char.
+fn jsdoc_text_cut(text: &str, end: usize) -> (usize, Vec<u8>) {
+    let mut cut = end;
+    let mut drop = 2;
+    loop {
+        let (unit, size) = crate::scanner_util::go_unit_before(text, cut);
+        cut -= size;
+        let len = unit.go_len();
+        if len >= drop {
+            let mut kept = Vec::new();
+            unit.push_go_bytes(&mut kept);
+            kept.truncate(len - drop);
+            return (cut, kept);
+        }
+        drop -= len;
+    }
+}
+
+/// The size of an invalid byte unit of the port form: the marker U+FDD0 (3
+/// bytes) and a char of U+10F780..U+10F7FF (4 bytes).
+const INVALID_BYTE_UNIT_LEN: i32 = 7;
+
 impl<'a> Parser<'a> {
+    /// The file position of the position `pos` of a JSDoc text with a cut
+    /// tail (see `parse_js_doc_comment`).
+    // PORT: after the split char starts at `tail`, a position of the cut
+    // text is `tail + 7k`: k invalid byte units of 7 bytes. Go's position
+    // is `tail + k`, k bytes into the split char, and the port's file
+    // offsets of that char are its Go bytes. The other positions past
+    // `tail` are file positions: a mapped one (`tail + 1..=3`) and the
+    // comment end. The end can equal `tail + 7` only after a real U+FDD0
+    // (6 bytes in the port form); then a position after the first kept
+    // byte stays unmapped.
+    #[cold]
+    pub(crate) fn jsdoc_tail_pos(&self, pos: i32) -> i32 {
+        if pos >= self.jsdoc_tail_first && pos != self.jsdoc_tail_end {
+            let tail = self.jsdoc_tail_first - INVALID_BYTE_UNIT_LEN;
+            tail + (pos - tail) / INVALID_BYTE_UNIT_LEN
+        } else {
+            pos
+        }
+    }
+
     // Go: jsdoc.go:56 withJSDoc
     pub(crate) fn with_js_doc(&mut self, node: Node, info: JsdocScannerInfo) -> Vec<Node> {
         if info & JSDOC_SCANNER_INFO_HAS_JS_DOC == 0 {
@@ -215,7 +267,30 @@ impl<'a> Parser<'a> {
             .map_or(-1, |i| i as i32);
         let initial_indent = start + 4 - (last_newline + 1);
         // -2 for trailing `*/`
-        self.source_text = &save_source_text[..(end - 2) as usize];
+        // PORT: see `jsdoc_text_cut`. A text that ends in the kept bytes of
+        // a split char is a new string, with one invalid byte unit for each
+        // kept byte. Its owner is `jsdoc_cut_text`, which outlives the
+        // parse. The positions after the split char differ from Go's, so
+        // the nodes, lists and diagnostics map them (`jsdoc_tail_pos`).
+        let (cut, kept) = jsdoc_text_cut(save_source_text, end as usize);
+        self.source_text = if kept.is_empty() {
+            &save_source_text[..cut]
+        } else {
+            self.jsdoc_tail_first = cut as i32 + INVALID_BYTE_UNIT_LEN;
+            self.jsdoc_tail_end = end;
+            let text = || {
+                let mut text = save_source_text[..cut].to_string();
+                text.push_str(&crate::scanner_util::go_string_from_bytes(kept));
+                text
+            };
+            match self.jsdoc_cut_text {
+                // Only an unterminated comment, which ends the file, has a
+                // tail, so a parse cuts one text at most.
+                Some(owner) => owner.get_or_init(text).as_str(),
+                // PORT: a parse that gives no owner leaks the text.
+                None => Box::leak(text().into_boxed_str()),
+            }
+        };
         self.scanner.set_text(self.source_text);
         // +3 for leading `/**`
         self.scanner.reset_pos(start + 3);
@@ -224,11 +299,18 @@ impl<'a> Parser<'a> {
 
         let comment = self.parse_js_doc_comment_worker(start, end, full_start, initial_indent);
         // move jsdoc diagnostics to jsdocDiagnostics -- for JS files only
-        let moved = self
+        let mut moved = self
             .diagnostics
             .borrow_mut()
             .diagnostics
             .split_off(save_diagnostics_length);
+        if self.jsdoc_tail_first != i32::MAX {
+            for d in &mut moved {
+                d.pos = self.jsdoc_tail_pos(d.pos);
+                d.end = self.jsdoc_tail_pos(d.end);
+            }
+            self.jsdoc_tail_first = i32::MAX;
+        }
         if self.context_flags.intersects(NodeFlags::JAVA_SCRIPT_FILE) {
             self.jsdoc_diagnostics.extend(moved);
         }
