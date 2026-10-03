@@ -1,0 +1,155 @@
+//! The tsgo panic hook (bin/tsgo.rs `install_panic_hook`) with stderr a pipe
+//! that has no reader, so each write gets EPIPE. With `eprintln!` the hook
+//! panicked again, and a panic inside the hook aborts the process (SIGABRT),
+//! also for a panic that a caller catches (a resolve-ahead worker panic in
+//! `run_task`). The hook must drop its write errors, and the run then ends
+//! as it does with a reader.
+//!
+//! The panic: tsgo reads the current directory again when it installs the
+//! program (`execute_tsc::install_program`), and a removed directory panics
+//! there ("cannot load program: getwd: ..."). Go reads it once, in
+//! `newSystem`, so this is a port gap; the test uses it only as a panic that
+//! the hook prints. The config is a FIFO: tsgo opens it after its first read
+//! of the directory, and the test removes the directory before it writes the
+//! config. When a change removes this panic, the control run fails: then use
+//! another panic that the hook prints.
+#![cfg(target_os = "linux")]
+
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+use ts_goport::execute::tsc::EXIT_UNPORTED;
+
+/// The longest wait for each step of a run.
+const LIMIT: Duration = Duration::from_secs(60);
+
+#[test]
+fn a_printed_panic_with_no_stderr_reader_does_not_abort() {
+    // Control: with a reader, the hook prints the panic and the run ends
+    // with the unported exit code.
+    let (status, stderr) = run("control", Stdio::piped(), false);
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert_eq!(
+        status.code(),
+        Some(EXIT_UNPORTED),
+        "control: {status} {stderr}"
+    );
+    assert!(
+        stderr.starts_with("tsgo: panic at ") && stderr.contains("cannot load program"),
+        "control: the hook must print the panic:\n{stderr}"
+    );
+    // No reader: the same exit, not SIGABRT. GOPORT_TRACE adds the
+    // backtrace write.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let (status, _) = run("closed", Stdio::from(writer), true);
+    assert_eq!(status.signal(), None, "closed stderr: {status}");
+    assert_eq!(
+        status.code(),
+        Some(EXIT_UNPORTED),
+        "closed stderr: {status}"
+    );
+}
+
+/// Runs `tsgo -p <FIFO>` in a directory that the test removes while tsgo
+/// waits on the config, and returns the exit status and the stderr (empty
+/// when `stderr` is not a pipe to this process).
+fn run(case: &str, stderr: Stdio, trace: bool) -> (ExitStatus, Vec<u8>) {
+    let dir = TempDir::new(
+        std::env::temp_dir().join(format!("tsgo_panic_hook-{}-{case}", std::process::id())),
+    );
+    let project = dir.0.join("p");
+    let cwd = dir.0.join("cwd");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::write(project.join("a.ts"), "export {};\n").unwrap();
+    let config = project.join("tsconfig.json");
+    let mode = rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR;
+    rustix::fs::mkfifoat(rustix::fs::CWD, &config, mode).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tsgo"));
+    command
+        .arg("-p")
+        .arg(&config)
+        .current_dir(&cwd)
+        .env_remove("PWD")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr);
+    if trace {
+        command.env("GOPORT_TRACE", "1");
+    } else {
+        command.env_remove("GOPORT_TRACE");
+    }
+    let mut child = command.spawn().unwrap();
+    let mut fifo = open_fifo_writer(&config, &mut child, case);
+    std::fs::remove_dir(&cwd).unwrap();
+    fifo.write_all(br#"{"compilerOptions": {"noLib": true, "types": []}, "files": ["a.ts"]}"#)
+        .unwrap();
+    drop(fifo);
+    let status = wait(&mut child, case);
+    let mut out = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        std::io::Read::read_to_end(&mut pipe, &mut out).unwrap();
+    }
+    (status, out)
+}
+
+/// Opens the FIFO `path` for writing once `child` has opened it for reading.
+fn open_fifo_writer(path: &Path, child: &mut Child, case: &str) -> std::fs::File {
+    let until = Instant::now() + LIMIT;
+    loop {
+        // Without a reader, a nonblocking open for writing fails with ENXIO.
+        match std::fs::File::options()
+            .write(true)
+            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed())
+            .open(path)
+        {
+            Ok(file) => return file,
+            Err(err) if err.raw_os_error() == Some(rustix::io::Errno::NXIO.raw_os_error()) => {}
+            Err(err) => panic!("{case}: open the config FIFO: {err}"),
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("{case}: tsgo ended before it read the config: {status}");
+        }
+        if Instant::now() > until {
+            let _ = child.kill();
+            panic!("{case}: tsgo did not open the config FIFO");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Waits for `child`; a tsgo that has not ended after `LIMIT` fails the test.
+fn wait(child: &mut Child, case: &str) -> ExitStatus {
+    let until = Instant::now() + LIMIT;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() > until {
+            let _ = child.kill();
+            panic!("{case}: tsgo did not end");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(path: PathBuf) -> Self {
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).unwrap();
+        TempDir(path)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
