@@ -57,6 +57,9 @@ jobs:
     env:
       # One test thread, as goport-tests.sh runs them.
       RUST_TEST_THREADS: 1
+      # The emit pool is off when the cores are not more than the checkers (program.rs
+      # emit_thread_count), and these runners have 2 or 3 cores. tests/emit_pool.rs needs it on.
+      GOPORT_EMIT_THREADS: 2
     steps:
       - uses: actions/checkout@v5
       # main's Go pin is the saved state's batch.upstreamPin.to. UPSTREAM.json "current" can be an older
@@ -87,9 +90,9 @@ jobs:
           cargo test --release --locked --workspace --no-run
           cargo test --release --locked -p ts_goport --test go_baselines --no-run
       - name: Unit and integration tests
-        run: cargo test --release --locked --workspace
+        run: cargo test --release --locked --workspace --no-fail-fast
       # go_baselines has `test = false`, so --workspace skips it. TestLocal (about 12,700 compiler
       # cases) runs in 4 shards in goport-tests.sh and is too slow for these runners; the rest of the
       # default go_baselines set runs here.
       - name: Go baselines
-        run: cargo test --release --locked -p ts_goport --test go_baselines -- --exact --skip compiler_runner::test_local
+        run: cargo test --release --locked --no-fail-fast -p ts_goport --test go_baselines -- --exact --skip compiler_runner::test_local
