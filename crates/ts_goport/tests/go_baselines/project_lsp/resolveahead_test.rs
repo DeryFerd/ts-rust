@@ -259,16 +259,20 @@ fn open_index(session: &Rc<Session>, root: &str) {
 /// Adds an import at the top of `src/index.ts` (version 2), which makes a
 /// new program load.
 fn add_import(session: &Rc<Session>, root: &str) {
+    edit_index(session, root, 2, "import { d } from \"./sub/d\";\n");
+}
+
+/// Puts `text` at the top of `src/index.ts` as `version`, and loads the
+/// program.
+fn edit_index(session: &Rc<Session>, root: &str, version: i32, text: &str) {
     let uri = file_uri(root, "src/index.ts");
-    edit(
-        session,
-        &uri,
-        2,
-        (0, 0),
-        (0, 0),
-        "import { d } from \"./sub/d\";\n",
-    );
+    edit(session, &uri, version, (0, 0), (0, 0), text);
     program(session, &uri);
+}
+
+/// The counts of the last resolve-ahead load on this thread.
+fn last_stats() -> LoadStats {
+    resolve_ahead::last_stats().expect("no resolve-ahead load")
 }
 
 os_child_test! {
@@ -425,5 +429,42 @@ os_child_test! {
         });
         assert!(stats.loader.taken > 0, "{stats:?}");
         assert!(stats.loader.missing > 0, "{stats:?}");
+    }
+}
+
+os_child_test! {
+    /// A rejected answer makes the workers drop what they keep (the known
+    /// files and the package.json parses). When a load on another thread
+    /// has the workers at the next load, the next load that has them must
+    /// still start with none.
+    fn a_rejected_answer_drops_the_kept_state_while_the_workers_are_taken() {
+        let root = make_project("heldreject");
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        open_index(&session, &root);
+        add_import(&session, &root);
+        resolve_ahead::wait_for_frees();
+        // An npm install: the cached node_modules files need a reload, so
+        // the check rejects the answers that look them up.
+        let events =
+            generate_file_events(1001, &file_uri(&root, "node_modules/pkg/f%d.d.ts"), CHANGED);
+        session.did_change_watched_files(&bg(), &events);
+        edit_index(&session, &root, 3, "import { b as b2 } from \"./sub/b\";\n");
+        let stats = last_stats();
+        assert!(stats.loader.rejected >= 1, "{stats:?}");
+        assert!(stats.known_files > 0, "{stats:?}");
+        resolve_ahead::wait_for_frees();
+        let held = resolve_ahead::hold_workers();
+        edit_index(&session, &root, 4, "import { a as a2 } from \"./a\";\n");
+        let stats = last_stats();
+        assert_eq!(stats.loader.taken, 0, "the workers ran: {stats:?}");
+        drop(held);
+        edit_index(&session, &root, 5, "import { c as c2 } from \"../lib/c\";\n");
+        let stats = last_stats();
+        assert!(stats.loader.taken > 0, "{stats:?}");
+        assert_eq!(stats.known_files, 0, "{stats:?}");
+        resolve_ahead::set_mode(None);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

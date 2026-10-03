@@ -66,12 +66,56 @@ pub struct LoadStats {
     /// Keys that this load resolved or took.
     pub new_keys: usize,
     pub loader: AheadStats,
+    /// The known files that the workers of this load started with
+    /// (`WorkerState::known_files`). 0 when the load had no workers.
+    pub known_files: usize,
 }
 
 /// The counts of the last resolve-ahead load on this thread. For tests.
 #[must_use]
 pub fn last_stats() -> Option<LoadStats> {
     LAST_STATS.with(Cell::get)
+}
+
+/// Takes the workers, as a load on another thread does, until the guard
+/// drops: the loads find them taken and resolve every key themselves.
+/// For tests.
+#[doc(hidden)]
+#[must_use]
+pub fn hold_workers() -> HeldWorkers {
+    if let Some(workers) = Workers::get() {
+        lock_state(workers).held = true;
+    }
+    HeldWorkers(())
+}
+
+/// The guard of `hold_workers`.
+#[doc(hidden)]
+pub struct HeldWorkers(());
+
+impl Drop for HeldWorkers {
+    fn drop(&mut self) {
+        if let Some(workers) = Workers::started() {
+            lock_state(workers).held = false;
+        }
+    }
+}
+
+/// Waits until the workers have freed the jobs of the ended loads, so the
+/// next load starts with the files that they found (`EndedJob::free`).
+/// For tests.
+#[doc(hidden)]
+pub fn wait_for_frees() {
+    let Some(workers) = Workers::started() else {
+        return;
+    };
+    let mut state = lock_state(workers);
+    while state.frees > 0 {
+        state = workers
+            .left
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
 }
 
 /// The workers' view of a host's file system: the OS file system with the
@@ -178,16 +222,11 @@ impl ResolveAhead {
             .previous_keys
             .filter(|keys| !keys.is_empty())
             .and_then(|keys| {
-                let workers = Workers::get()?;
-                let fresh = workers.fresh.swap(false, Ordering::Relaxed);
-                workers.post(Job {
+                Workers::get()?.post(Job {
                     queue: Arc::new(AheadQueue::new(keys)),
-                    fresh_package_jsons: fresh,
-                    known_files: if fresh {
-                        Arc::default()
-                    } else {
-                        workers.known_files()
-                    },
+                    // `post` sets the epoch and the known files.
+                    epoch: 0,
+                    known_files: Arc::default(),
                     closed: AtomicBool::new(false),
                     left: AtomicUsize::new(0),
                     answers: Arc::new(SharedResolutionCache::default()),
@@ -240,11 +279,21 @@ impl ResolveAhead {
             self.end_job(None, true);
             return;
         };
+        let loader = link.stats.get();
+        let known_files = self.job.as_ref().map_or(0, |job| job.known_files.len());
+        // A rejected answer can come from a kept package.json parse or a
+        // known file that changed: the workers drop both now, so the next
+        // job starts with neither, even when a load on another thread has
+        // the workers first.
+        if loader.rejected > 0
+            && let Some((job, workers)) = self.job.as_ref().zip(Workers::started())
+        {
+            workers.forget(job.epoch);
+        }
         // The workers free the answers and the queue with the job.
-        let rejected = link.stats.get().rejected > 0;
         self.end_job(
             Some(Box::new((link.answers.take(), link.queue.take()))),
-            rejected,
+            loader.rejected > 0,
         );
         let Some(keep_keys) = self.keep_keys.take() else {
             return;
@@ -253,25 +302,18 @@ impl ResolveAhead {
         let stats = LoadStats {
             keys: self.previous_keys,
             new_keys: keys.len(),
-            loader: link.stats.get(),
+            loader,
+            known_files,
         };
-        // A rejected answer can come from a kept package.json parse or a
-        // known file that changed: the workers of the next load start with
-        // neither.
-        if stats.loader.rejected > 0
-            && let Some(workers) = Workers::get()
-        {
-            workers.fresh.store(true, Ordering::Relaxed);
-        }
         LAST_STATS.with(|last| last.set(Some(stats)));
-        print_stats(&stats);
+        debug_log(format_args!("resolve-ahead: {stats:?}"));
         keep_keys(keys);
     }
 
     /// Stops the workers of this load and gives its job and `shared`, the
     /// loader's links to it, to them to free. Unless the loader `rejected`
     /// an answer, the workers keep the files that the job's answers found
-    /// for the next job (`Workers::known_files`).
+    /// for the next job (`WorkerState::known_files`).
     fn end_job(&mut self, shared: Option<Box<dyn Send>>, rejected: bool) {
         let Some(job) = self.job.take() else {
             return;
@@ -294,15 +336,15 @@ impl Drop for ResolveAhead {
     }
 }
 
-/// Prints the counts of a load when `GOPORT_RESOLVE_AHEAD_STATS` is set:
-/// to stderr for `1`, else appended to the file that it names.
-fn print_stats(stats: &LoadStats) {
+/// Writes `line` (the counts of a load, a worker panic) when
+/// `GOPORT_RESOLVE_AHEAD_STATS` is set: to stderr for `1`, else appended to
+/// the file that it names.
+fn debug_log(line: std::fmt::Arguments<'_>) {
     use std::io::Write;
     static TO: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let Some(to) = TO.get_or_init(|| std::env::var("GOPORT_RESOLVE_AHEAD_STATS").ok()) else {
         return;
     };
-    let line = format!("resolve-ahead: {stats:?}");
     if to == "1" {
         eprintln!("{line}");
     } else if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -338,7 +380,7 @@ static WORKERS: std::sync::OnceLock<Option<&'static Workers>> = std::sync::OnceL
 /// thread does not before its next request.
 // PORT: not in Go (Go's garbage collector frees in the background).
 pub fn drop_on_worker(value: Box<dyn Send>) {
-    match WORKERS.get().copied().flatten() {
+    match Workers::started() {
         Some(workers) => {
             lock_state(workers).drops.push(value);
             workers.wake.notify_one();
@@ -354,21 +396,14 @@ pub fn drop_on_worker(value: Box<dyn Send>) {
 /// free it before its next request.
 struct Workers {
     state: Mutex<WorkerState>,
-    /// Wakes the workers for a new job or for data to free.
+    /// Wakes the workers for a new job, for data to free or to drop what
+    /// they keep (`forget`).
     wake: Condvar,
     /// Wakes a loader that waits for the workers to leave its job
-    /// (`wait_left`).
+    /// (`wait_left`), and `wait_for_frees`.
     left: Condvar,
     /// The workers that started.
     count: AtomicUsize,
-    /// The next job drops what the workers keep: the package.json parses
-    /// (`KeptPackageJsons`) and the known files.
-    fresh: AtomicBool,
-    /// The files that the answers of earlier jobs found, since the last
-    /// rejected answer (`EndedJob::free`): a worker answers `file_exists`
-    /// for them with no OS call, and the loader checks those answers
-    /// (`AheadCall::FileExists`).
-    known_files: Mutex<Arc<FxHashSet<Path>>>,
 }
 
 #[derive(Default)]
@@ -379,8 +414,22 @@ struct WorkerState {
     generation: u64,
     /// The jobs of ended loads, for the workers to free.
     ended: Vec<EndedJob>,
+    /// The jobs of ended loads that no worker has freed yet.
+    frees: usize,
     /// Other values for the workers to free (`drop_on_worker`).
     drops: Vec<Box<dyn Send>>,
+    /// Counts the times the workers dropped what they keep from job to job
+    /// (`forget`). A job, the known files and each worker's package.json
+    /// parses (`KeptPackageJsons`) belong to one epoch: a job uses only
+    /// what its epoch kept.
+    epoch: u64,
+    /// The files that the answers of the earlier jobs of this epoch found
+    /// (`EndedJob::free`): a worker answers `file_exists` for them with no
+    /// OS call, and the loader checks those answers
+    /// (`AheadCall::FileExists`).
+    known_files: Arc<FxHashSet<Path>>,
+    /// `hold_workers` (tests): the loads find the workers taken.
+    held: bool,
 }
 
 /// What a worker does next.
@@ -388,6 +437,8 @@ enum Task {
     Run(Arc<Job>),
     Free(EndedJob),
     Drop(Box<dyn Send>),
+    /// Drop this worker's package.json parses of an earlier epoch.
+    Forget,
 }
 
 /// The job of an ended load and the loader's links to it, which a worker
@@ -396,13 +447,14 @@ struct EndedJob {
     job: Arc<Job>,
     shared: Option<Box<dyn Send>>,
     /// Keep the job's known files and the files that its answers found
-    /// (`Workers::known_files`).
+    /// (`WorkerState::known_files`).
     keep_known_files: bool,
 }
 
 impl EndedJob {
     /// Frees the job on this worker, after it keeps the files that the
-    /// job's answers found: the known files of the next job.
+    /// job's answers found: the known files of the next job, unless the
+    /// workers dropped what they keep since the job started (`forget`).
     fn free(self, workers: &Workers) {
         let EndedJob {
             job,
@@ -412,8 +464,8 @@ impl EndedJob {
         drop(shared);
         // The files of the job's known set and the files that its answers
         // found. A file that the answers did not use stays known: the loader
-        // checks each known answer, and a rejection starts a new set
-        // (`Workers::fresh`). Most loads find no new file, and the set is
+        // checks each known answer, and a rejection starts a new epoch
+        // (`Workers::forget`). Most loads find no new file, and the set is
         // then kept as it is.
         if keep_known_files {
             let mut more: Option<FxHashSet<Path>> = None;
@@ -432,10 +484,14 @@ impl EndedJob {
                 });
             });
             let known = more.map_or_else(|| job.known_files.clone(), Arc::new);
-            *workers
-                .known_files
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = known;
+            let mut state = lock_state(workers);
+            if state.epoch == job.epoch {
+                // The set it replaces is the job's set or an older one,
+                // which the job or a later free drops.
+                let older = std::mem::replace(&mut state.known_files, known);
+                drop(state);
+                drop(older);
+            }
         }
         drop(job);
     }
@@ -462,8 +518,6 @@ impl Workers {
                 wake: Condvar::new(),
                 left: Condvar::new(),
                 count: AtomicUsize::new(0),
-                fresh: AtomicBool::new(false),
-                known_files: Mutex::default(),
             }));
             for _ in 0..count {
                 // A worker that cannot start only makes fewer answers.
@@ -479,14 +533,21 @@ impl Workers {
         })
     }
 
-    /// Gives `job` to the workers. `None` when another load has them now
-    /// (a load on another thread): this load then resolves every key
-    /// itself.
-    fn post(&self, job: Job) -> Option<Arc<Job>> {
+    /// The workers when a load started them; never starts them.
+    fn started() -> Option<&'static Workers> {
+        WORKERS.get().copied().flatten()
+    }
+
+    /// Gives `job` to the workers, with the epoch and the known files of
+    /// what they keep now. `None` when another load has them now (a load
+    /// on another thread): this load then resolves every key itself.
+    fn post(&self, mut job: Job) -> Option<Arc<Job>> {
         let mut state = lock_state(self);
-        if state.job.is_some() {
+        if state.job.is_some() || state.held {
             return None;
         }
+        job.epoch = state.epoch;
+        job.known_files = state.known_files.clone();
         let job = Arc::new(job);
         state.job = Some(job.clone());
         state.generation += 1;
@@ -510,16 +571,28 @@ impl Workers {
 
     /// Gives `ended` to a worker to free.
     fn free(&self, ended: EndedJob) {
-        lock_state(self).ended.push(ended);
+        let mut state = lock_state(self);
+        state.ended.push(ended);
+        state.frees += 1;
+        drop(state);
         self.wake.notify_one();
     }
 
-    /// The files that the answers of the last ended job found.
-    fn known_files(&self) -> Arc<FxHashSet<Path>> {
-        self.known_files
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    /// Drops what the workers keep from job to job, if it is still of
+    /// `epoch`: the known files now (a worker frees them), and each
+    /// worker's package.json parses when it wakes (`Task::Forget`). The
+    /// next job starts a new epoch with neither. It acts at once, also
+    /// while a load on another thread has the workers.
+    fn forget(&self, epoch: u64) {
+        let mut state = lock_state(self);
+        if state.epoch != epoch {
+            return;
+        }
+        state.epoch += 1;
+        let known_files = std::mem::take(&mut state.known_files);
+        state.drops.push(Box::new(known_files));
+        drop(state);
+        self.wake.notify_all();
     }
 
     /// Waits until every worker has left `job` (`Mode::Force`).
@@ -549,6 +622,9 @@ fn run_worker(workers: &'static Workers) {
                     ran = state.generation;
                     break Task::Run(job.clone());
                 }
+                if KeptPackageJsons::epoch().is_some_and(|epoch| epoch != state.epoch) {
+                    break Task::Forget;
+                }
                 if let Some(ended) = state.ended.pop() {
                     break Task::Free(ended);
                 }
@@ -561,17 +637,30 @@ fn run_worker(workers: &'static Workers) {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         };
-        match task {
-            Task::Free(ended) => ended.free(workers),
-            Task::Drop(value) => drop(value),
-            Task::Run(job) => {
-                run_job(&job);
-                job.left.fetch_add(1, Ordering::Release);
-                drop(job);
-                let _state = lock_state(workers);
+        run_task(workers, task);
+    }
+}
+
+/// Runs `task` on a worker.
+fn run_task(workers: &Workers, task: Task) {
+    match task {
+        Task::Run(job) => {
+            run_job(&job);
+            job.left.fetch_add(1, Ordering::Release);
+            drop(job);
+            let _state = lock_state(workers);
+            workers.left.notify_all();
+        }
+        Task::Free(ended) => {
+            ended.free(workers);
+            let mut state = lock_state(workers);
+            state.frees -= 1;
+            if state.frees == 0 {
                 workers.left.notify_all();
             }
         }
+        Task::Drop(value) => drop(value),
+        Task::Forget => drop(KEPT.with(|kept| kept.borrow_mut().take())),
     }
 }
 
@@ -579,9 +668,11 @@ fn run_worker(workers: &'static Workers) {
 struct Job {
     /// The keys of the previous load, in its order.
     queue: Arc<AheadQueue>,
-    /// The workers drop the package.json parses that they keep.
-    fresh_package_jsons: bool,
-    /// The files that earlier jobs found (`Workers::known_files`).
+    /// The epoch of what the workers keep when the job was posted
+    /// (`WorkerState::epoch`).
+    epoch: u64,
+    /// The files that earlier jobs of the epoch found
+    /// (`WorkerState::known_files`).
     known_files: Arc<FxHashSet<Path>>,
     closed: AtomicBool,
     /// The workers that left this job.
@@ -647,6 +738,7 @@ fn run_job(job: &Arc<Job>) {
     drop(resolver);
     KEPT.with(|kept| {
         *kept.borrow_mut() = Some(KeptPackageJsons {
+            epoch: job.epoch,
             current_directory: view.current_directory.clone(),
             use_case_sensitive_file_names: view.use_case_sensitive_file_names,
             cache: package_jsons,
@@ -664,12 +756,15 @@ thread_local! {
 /// not parse the same package.json files at every load. The loader checks
 /// each logged read by the hash of its text on the snapshot file system,
 /// so it never takes an answer from a parse whose file changed: it
-/// rejects the answer, and the next job starts with no kept parse
-/// (`Workers::fresh`). Only parses of files that the worker
+/// rejects the answer, and the workers drop their kept parses
+/// (`Workers::forget`). Only parses of files that the worker
 /// read are kept: a directory or package.json that was missing can be
 /// there now, and the loader does not check that.
 // PORT: not in Go (perf).
 struct KeptPackageJsons {
+    /// The epoch of the job that kept it (`WorkerState::epoch`). A job of
+    /// another epoch does not use it.
+    epoch: u64,
     current_directory: String,
     use_case_sensitive_file_names: bool,
     cache: Rc<InfoCache>,
@@ -679,6 +774,11 @@ struct KeptPackageJsons {
 }
 
 impl KeptPackageJsons {
+    /// The epoch of this worker's kept parses, if it has any.
+    fn epoch() -> Option<u64> {
+        KEPT.with(|kept| kept.borrow().as_ref().map(|kept| kept.epoch))
+    }
+
     /// The package.json cache, read hashes and kept file names for `job`
     /// on this worker: the kept entries of files that the worker read, or
     /// none.
@@ -697,7 +797,7 @@ impl KeptPackageJsons {
         let mut reads = FxHashMap::default();
         let mut kept_files = FxHashSet::default();
         let kept = KEPT.with(|kept| kept.borrow_mut().take()).filter(|kept| {
-            !job.fresh_package_jsons
+            kept.epoch == job.epoch
                 && kept.current_directory == view.current_directory
                 && kept.use_case_sensitive_file_names == view.use_case_sensitive_file_names
         });
