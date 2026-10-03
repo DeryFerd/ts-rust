@@ -111,6 +111,13 @@ pub struct StatusPrefetch {
     /// `GetMissingPackageJsons`, collected. The check takes them.
     pub package_jsons: Vec<String>,
     pub missing_package_jsons: Vec<String>,
+    /// The mtime (`incremental.GetMTime`) of each root file, by its index
+    /// in `input_paths`, and of each file of `file_names`, by its index
+    /// there, that the thread read (`read_m_times`); None for a file that
+    /// it did not read. The check takes them where it would read the file
+    /// system (`BuildTaskOrchestrator::get_m_time_of_path`).
+    pub input_m_times: Vec<Option<Option<SystemTime>>>,
+    pub file_m_times: Vec<Option<Option<SystemTime>>>,
 }
 
 /// PORT: not in Go (perf). The options of a task that decide whether its
@@ -226,8 +233,56 @@ impl StatusPrefetch {
             resolved_roots,
             package_jsons,
             missing_package_jsons,
+            input_m_times: Vec::new(),
+            file_m_times: Vec::new(),
         }
     }
+
+    /// Reads the mtimes (`input_m_times`, `file_m_times`) of the root files
+    /// (`input_files`, the names of `input_paths`) and the files of the
+    /// build info that are TypeScript sources (`is_typescript_source`), as
+    /// `BuildHost::get_m_time` reads them (`incremental.GetMTime`). No task
+    /// of a build writes such a file, so the mtime is the one that the
+    /// check would read later. Each path is read once: the build info
+    /// lists the root files too.
+    pub fn read_m_times(&mut self, fs: &dyn Fs, input_files: &[String]) {
+        fn m_time<'a>(
+            fs: &dyn Fs,
+            read: &mut FxHashMap<&'a Path, Option<SystemTime>>,
+            file: &str,
+            path: &'a Path,
+        ) -> Option<Option<SystemTime>> {
+            is_typescript_source(file).then(|| {
+                *read
+                    .entry(path)
+                    .or_insert_with(|| fs.stat(file).and_then(|stat| stat.mod_time()))
+            })
+        }
+        let mut read = FxHashMap::with_capacity_and_hasher(input_files.len(), Default::default());
+        let input_m_times = input_files
+            .iter()
+            .zip(&self.input_paths)
+            .map(|(file, path)| m_time(fs, &mut read, file, path))
+            .collect();
+        let file_m_times = self
+            .file_names
+            .iter()
+            .map(|(file, path)| m_time(fs, &mut read, file, path))
+            .collect();
+        drop(read);
+        self.input_m_times = input_m_times;
+        self.file_m_times = file_m_times;
+    }
+}
+
+/// True for a TypeScript file that is not a declaration file. A build
+/// never writes one (its outputs are JavaScript, declaration, map, JSON
+/// and build info files).
+fn is_typescript_source(file_name: &str) -> bool {
+    file_extension_is_one_of(
+        file_name,
+        &[EXTENSION_TS, EXTENSION_TSX, EXTENSION_MTS, EXTENSION_CTS],
+    ) && !is_declaration_file_name(file_name)
 }
 
 // Go: tsc/diagnostics.go:23 DiagnosticReporter, bound to the task's writer.
@@ -375,7 +430,14 @@ pub trait BuildTaskOrchestrator {
     fn get_m_time(&self, file: &str) -> Option<SystemTime>;
     /// PORT: not in Go (perf). `get_m_time` of `file`, whose `toPath` is
     /// `path`.
-    fn get_m_time_of_path(&self, file: &str, path: &Path) -> Option<SystemTime>;
+    /// `prefetched`: the mtime that a prefetch thread read for `file`
+    /// (`StatusPrefetch`), taken where the host would read the file system.
+    fn get_m_time_of_path(
+        &self,
+        file: &str,
+        path: &Path,
+        prefetched: Option<Option<SystemTime>>,
+    ) -> Option<SystemTime>;
     // Go: build/host.go (*host).SetMTime
     fn set_m_time(&self, file: &str, m_time: SystemTime) -> Result<(), FsError>;
     // Go: build/host.go (*host).storeMTime
@@ -1368,7 +1430,11 @@ impl BuildTask {
                     &owned_path
                 }
             };
-            let input_time = orchestrator.get_m_time_of_path(input_file, input_path);
+            let prefetched_time = prefetched
+                .as_ref()
+                .and_then(|prefetched| prefetched.input_m_times.get(index).copied().flatten());
+            let input_time =
+                orchestrator.get_m_time_of_path(input_file, input_path, prefetched_time);
             if input_time.is_none() {
                 return UpToDateStatus::with_data(
                     UpToDateStatusType::InputFileMissing,
@@ -1491,7 +1557,11 @@ impl BuildTask {
                 {
                     continue;
                 }
-                let input_time = orchestrator.get_m_time_of_path(input_file, input_path);
+                let prefetched_time = prefetched
+                    .as_ref()
+                    .and_then(|prefetched| prefetched.file_m_times.get(index).copied().flatten());
+                let input_time =
+                    orchestrator.get_m_time_of_path(input_file, input_path, prefetched_time);
                 if input_time.is_none() {
                     // Input file that was part of the program is missing (eg: dependency was removed)
                     return UpToDateStatus::with_data(

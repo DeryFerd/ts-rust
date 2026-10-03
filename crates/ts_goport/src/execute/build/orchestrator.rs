@@ -1017,7 +1017,6 @@ impl Orchestrator {
         // A task that did not read its build info leaves its read unused.
         self.build_info_prefetch.borrow_mut().take();
         self.status_prefetch.borrow_mut().take();
-        self.host.m_time_prefetch.borrow_mut().take();
     }
 
     // Go: build/orchestrator.go:959 (*Orchestrator).buildOrCleanProject,
@@ -1085,9 +1084,8 @@ impl Orchestrator {
     /// When a build info key cannot be trusted (a file with more than one
     /// hard link, or a link target with `..` after a name), that file can
     /// be any build info file of the build, so nothing is read.
-    /// The threads also make the check parts of each build info
-    /// (`StatusPrefetch`) and read the mtimes of its task's TypeScript
-    /// sources (`BuildHost::m_time_prefetch`).
+    /// The threads also make the check parts of each build info, with the
+    /// mtimes of its task's TypeScript sources (`StatusPrefetch`).
     fn start_build_info_prefetch(
         &self,
         paths: &[Path],
@@ -1142,8 +1140,7 @@ impl Orchestrator {
             .unwrap_or_else(PoisonError::into_inner)
             .reserve(inputs);
         let pool = pool.unwrap_or_else(|| PrefetchPool::start_reads(&self.compare_paths_options));
-        let (slots, m_times) = pool.finish_reads(reads)?;
-        *self.host.m_time_prefetch.borrow_mut() = Some(m_times);
+        let slots = pool.finish_reads(reads)?;
         Some(BuildInfoPrefetch { slots })
     }
 
@@ -1278,8 +1275,13 @@ impl BuildTaskOrchestrator for Orchestrator {
         self.host.get_m_time(file)
     }
 
-    fn get_m_time_of_path(&self, file: &str, path: &Path) -> Option<SystemTime> {
-        self.host.get_m_time_of_path(file, path)
+    fn get_m_time_of_path(
+        &self,
+        file: &str,
+        path: &Path,
+        prefetched: Option<Option<SystemTime>>,
+    ) -> Option<SystemTime> {
+        self.host.get_m_time_of_path(file, path, prefetched)
     }
 
     fn set_m_time(&self, file: &str, m_time: SystemTime) -> Result<(), FsError> {
@@ -1338,11 +1340,11 @@ impl BuildTaskOrchestrator for Orchestrator {
 /// has not finished it.
 ///
 /// After the parse, the thread does the other parts of the check that need
-/// no task state: the root info reader and the paths of the file names
-/// (`StatusPrefetch`), and the mtimes of the task's TypeScript sources
-/// that are not declaration files, the root files and the files of the
-/// build info (`MTimePrefetch`). No task of a build writes such a file, so
-/// the mtime is the one that the check would read later. A build info file
+/// no task state (`StatusPrefetch`): the root info reader, the paths of the
+/// file names, and the mtimes of the task's TypeScript sources that are not
+/// declaration files, the root files and the files of the build info. No
+/// task of a build writes such a file, so the mtime is the one that the
+/// check would read later. A build info file
 /// is read for one task only (`start_build_info_prefetch`), so no task
 /// writes it before its task's check takes the read.
 struct BuildInfoPrefetch {

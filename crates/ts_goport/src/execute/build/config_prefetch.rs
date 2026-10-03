@@ -47,7 +47,6 @@ use crate::execute::incremental::incremental::parse_build_info;
 use crate::frontend::prelude::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::SystemTime;
 
 /// The most threads of a `PrefetchPool`. The threads only read, so their
 /// count changes no output; it is not Go's `numRoutines`.
@@ -174,11 +173,6 @@ impl BuildInfoSlot {
     }
 }
 
-/// The mtimes that the threads read ahead of the checks, by path.
-/// `BuildHost::load_or_store_m_time` takes an mtime from here where it
-/// would read it from the file system.
-pub(crate) type MTimePrefetch = Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>;
-
 /// A queued build info read.
 #[derive(Clone)]
 struct ReadJob {
@@ -226,7 +220,6 @@ struct Shared {
     /// True when a thread queues the build info read of each config that
     /// it parses.
     reads_build_info: bool,
-    m_times: MTimePrefetch,
     /// `MAX_PREFETCH_THREADS`, at most the cores.
     max_threads: usize,
 }
@@ -265,7 +258,6 @@ impl PrefetchPool {
                 options,
                 compare_paths_options: compare_paths_options.clone(),
                 reads_build_info,
-                m_times: Arc::default(),
                 max_threads: MAX_PREFETCH_THREADS.min(crate::program::available_cores()),
             }),
         }
@@ -339,12 +331,11 @@ impl PrefetchPool {
     /// for each other read. The other queued reads are dropped. The kept
     /// reads that no thread has started run in build order. No job is
     /// queued after this, and each thread ends when the queue is empty.
-    /// Gives each read's slot by file name and the mtimes that the reads
-    /// read, or None when no thread runs.
+    /// Gives each read's slot by file name, or None when no thread runs.
     pub(crate) fn finish_reads(
         &self,
         reads: Vec<(Path, BuildInfoRead)>,
-    ) -> Option<(FxHashMap<String, Arc<BuildInfoSlot>>, MTimePrefetch)> {
+    ) -> Option<FxHashMap<String, Arc<BuildInfoSlot>>> {
         let mut slots = FxHashMap::default();
         let spawn = {
             let mut queue = lock(&self.shared.queue);
@@ -382,7 +373,7 @@ impl PrefetchPool {
         self.shared.ready.notify_all();
         spawn_threads(&self.shared, spawn);
         let runs = lock(&self.shared.queue).threads > 0;
-        runs.then(|| (slots, self.shared.m_times.clone()))
+        runs.then_some(slots)
     }
 
     /// The match of a thread for the config at `path`, when its inputs
@@ -692,9 +683,8 @@ fn parse_config(
 
 /// Reads and parses the build info file of `job` on this thread's OS file
 /// system, as the host does (`ReadBuildInfo`: read the file, then
-/// `parse_build_info`). Then makes the check parts (`StatusPrefetch`) and
-/// reads the mtimes of the task's TypeScript sources (`prefetch_m_times`),
-/// unless the build info shows that the check returns before it reads them
+/// `parse_build_info`). Then makes the check parts (`StatusPrefetch`) with
+/// the mtimes of the task's TypeScript sources (`read_m_times`), unless the build info shows that the check returns before it reads them
 /// (errors, pending emit: `StatusCheckOptions::reads_input_times`), as Go
 /// reads no input mtime there.
 fn read_build_info(shared: &Shared, job: &ReadJob) {
@@ -708,56 +698,19 @@ fn read_build_info(shared: &Shared, job: &ReadJob) {
             .as_ref()
             .filter(|build_info| read.check.reads_input_times(build_info))
             .map(|build_info| {
-                let status = StatusPrefetch::new(
+                let mut status = StatusPrefetch::new(
                     build_info,
                     &read.name,
                     &read.input_files,
                     &shared.compare_paths_options,
                 );
-                prefetch_m_times(&*fs, read, &status, &shared.m_times);
+                status.read_m_times(&*fs, &read.input_files);
                 status
             });
         (build_info, status)
     }));
     *lock(&job.slot.result) = Some(result.ok());
     job.slot.done.notify_all();
-}
-
-/// True for a TypeScript file that is not a declaration file. A build
-/// never writes one (its outputs are JavaScript, declaration, map, JSON
-/// and build info files).
-fn is_typescript_source(file_name: &str) -> bool {
-    file_extension_is_one_of(
-        file_name,
-        &[EXTENSION_TS, EXTENSION_TSX, EXTENSION_MTS, EXTENSION_CTS],
-    ) && !is_declaration_file_name(file_name)
-}
-
-/// Reads the mtimes of the TypeScript sources (`is_typescript_source`) of
-/// `read` (its root files and the files of its build info, `status`) into
-/// `m_times`, as `BuildHost::get_m_time` reads them (`incremental.GetMTime`).
-/// No task of a build writes such a file, so the mtime is the one that the
-/// check would read later. Each path is read once: the build info lists the
-/// root files too, and the check keeps the first mtime of a path.
-fn prefetch_m_times(
-    fs: &dyn Fs,
-    read: &BuildInfoRead,
-    status: &StatusPrefetch,
-    m_times: &MTimePrefetch,
-) {
-    let roots = read.input_files.iter().zip(&status.input_paths);
-    let files = status.file_names.iter().map(|(file, path)| (file, path));
-    let mut seen: FxHashSet<&Path> =
-        FxHashSet::with_capacity_and_hasher(read.input_files.len(), Default::default());
-    let read: Vec<(Path, Option<SystemTime>)> = roots
-        .chain(files)
-        .filter(|(file, path)| is_typescript_source(file) && seen.insert(path))
-        .map(|(file, path)| (path.clone(), fs.stat(file).and_then(|stat| stat.mod_time())))
-        .collect();
-    let mut m_times = lock(m_times);
-    for (path, m_time) in read {
-        m_times.entry(path).or_insert(m_time);
-    }
 }
 
 /// The parse config host of a pool thread: records the match of the

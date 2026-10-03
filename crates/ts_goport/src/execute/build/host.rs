@@ -12,7 +12,7 @@
 
 use crate::contentmapper::{self, Mapper, Project, SourceFiles};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
-use crate::execute::build::config_prefetch::{MTimePrefetch, PrefetchPool};
+use crate::execute::build::config_prefetch::PrefetchPool;
 use crate::execute::build::parse_cache::ParseCache;
 use crate::execute::incremental::incremental;
 use crate::execute::tsc::compile::System;
@@ -209,11 +209,6 @@ pub struct BuildHost {
     // PORT: Go `*collections.SyncMap`. The task `writeFile` stores into it
     // from the checker threads.
     pub m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
-    // PORT: not in Go (perf). The mtimes that the prefetch threads read
-    // for the up-to-date checks of this build cycle (orchestrator.rs
-    // `BuildInfoPrefetch`). `load_or_store_m_time` takes one where it would
-    // read the file system.
-    pub m_time_prefetch: RefCell<Option<MTimePrefetch>>,
 }
 
 impl BuildHost {
@@ -251,7 +246,6 @@ impl BuildHost {
             resolved_references: ParseCache::default(),
             config_prefetch: RefCell::new(None),
             m_times: Arc::default(),
-            m_time_prefetch: RefCell::new(None),
         }
     }
 
@@ -287,9 +281,16 @@ impl BuildHost {
     }
 
     /// PORT: not in Go (perf). `get_m_time` of `file`, whose `toPath` is
-    /// `path`.
-    pub fn get_m_time_of_path(&self, file: &str, path: &Path) -> Option<SystemTime> {
-        self.load_or_store_m_time_of_path(file, path.clone(), None, true)
+    /// `path`. `prefetched` is the mtime that a prefetch thread read for it
+    /// (orchestrator.rs `BuildInfoPrefetch`), taken where this would read
+    /// the file system.
+    pub fn get_m_time_of_path(
+        &self,
+        file: &str,
+        path: &Path,
+        prefetched: Option<Option<SystemTime>>,
+    ) -> Option<SystemTime> {
+        self.load_or_store_m_time_of_path(file, path.clone(), None, true, prefetched)
     }
 
     // Go: build/host.go:98 (*host).SetMTime
@@ -304,17 +305,19 @@ impl BuildHost {
         old_cache: Option<&FxHashMap<Path, Option<SystemTime>>>,
         store: bool,
     ) -> Option<SystemTime> {
-        self.load_or_store_m_time_of_path(file, self.to_path(file), old_cache, store)
+        self.load_or_store_m_time_of_path(file, self.to_path(file), old_cache, store, None)
     }
 
     // Go: build/host.go:102 (*host).loadOrStoreMTime, with
-    // `h.orchestrator.toPath(file)` computed by the caller.
+    // `h.orchestrator.toPath(file)` computed by the caller, and the mtime
+    // that a prefetch thread read (`prefetched`) in place of `GetMTime`.
     fn load_or_store_m_time_of_path(
         &self,
         file: &str,
         path: Path,
         old_cache: Option<&FxHashMap<Path, Option<SystemTime>>>,
         store: bool,
+        prefetched: Option<Option<SystemTime>>,
     ) -> Option<SystemTime> {
         // PORT: Go `Load`, then `LoadOrStore` below. The lock is not held
         // while `get_m_time` reads the file system; else it is held from
@@ -333,13 +336,6 @@ impl BuildHost {
             }
         }
         if !found {
-            // PORT: perf. An mtime that a prefetch thread read.
-            let prefetched = self.m_time_prefetch.borrow().as_ref().and_then(|m_times| {
-                m_times
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&path)
-            });
             m_time = match prefetched {
                 Some(m_time) => m_time,
                 None => {
