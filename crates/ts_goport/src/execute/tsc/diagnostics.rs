@@ -1333,10 +1333,32 @@ pub(super) fn go_pad(s: &str, width: i32, left: bool) -> String {
     }
 }
 
+// Go: strings/strings.go:597 Repeat (go1.27.1)
 /// Go `strings.Repeat`, which panics on a negative count.
+// PORT: the Go panic ends the run with Go's exit code 2 (`core::go_panic`),
+// not the port crash code 70. `--pretty` reaches it in Go too
+// (diagnosticwriter.go:335), when a squiggle ends before it starts.
 pub(super) fn go_repeat(s: &str, count: i32) -> String {
     match usize::try_from(count) {
         Ok(count) => s.repeat(count),
-        Err(_) => panic!("strings: negative Repeat count"),
+        Err(_) => crate::core::go_panic("strings: negative Repeat count".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Go `strings.Repeat` panics on a negative count. `--pretty` reaches it
+    /// when a squiggle ends before it starts (diagnosticwriter.go:335), and
+    /// Go ends the run with exit code 2. It is a Go panic, not a port gap
+    /// (exit 70).
+    #[test]
+    fn go_repeat_with_a_negative_count_is_a_go_panic() {
+        assert_eq!(super::go_repeat("~", 2), "~~");
+        let payload = std::panic::catch_unwind(|| super::go_repeat("~", -1))
+            .expect_err("a negative count panics");
+        let panic = payload
+            .downcast_ref::<crate::core::GoPanic>()
+            .expect("a Go panic");
+        assert_eq!(panic.message, "strings: negative Repeat count");
     }
 }
