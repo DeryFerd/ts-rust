@@ -41,6 +41,8 @@ impl fmt::Display for Category {
 pub struct Message {
     code: u32,
     category: Category,
+    /// wasm leaves the keys out (144 KB): `key` makes them from the text.
+    #[cfg(not(target_family = "wasm"))]
     key: &'static str,
     text: &'static str,
     reports_unnecessary: bool,
@@ -60,9 +62,12 @@ impl Message {
         elided_in_compatibility_pyramid: bool,
         reports_deprecated: bool,
     ) -> Self {
+        #[cfg(target_family = "wasm")]
+        let _ = key;
         Self {
             code,
             category,
+            #[cfg(not(target_family = "wasm"))]
             key,
             text,
             reports_unnecessary,
@@ -81,9 +86,24 @@ impl Message {
         self.category
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[must_use]
     pub const fn key(self) -> &'static str {
         self.key
+    }
+
+    /// wasm: the key, made from the text as Go's generator makes it
+    /// (`message_key`), once per message.
+    #[cfg(target_family = "wasm")]
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, PoisonError};
+        static KEYS: Mutex<Option<HashMap<u32, &'static str>>> = Mutex::new(None);
+        let mut keys = KEYS.lock().unwrap_or_else(PoisonError::into_inner);
+        keys.get_or_insert_with(HashMap::new)
+            .entry(self.code)
+            .or_insert_with(|| Box::leak(message_key(self.text, self.code).into_boxed_str()))
     }
 
     #[must_use]
@@ -238,12 +258,74 @@ pub fn message_by_code(code: u32) -> Option<&'static Message> {
 /// Looks up a diagnostic message by its generated localization key.
 #[must_use]
 pub fn message_by_key(key: &str) -> Option<&'static Message> {
-    CATALOG.iter().find(|message| message.key() == key)
+    #[cfg(not(target_family = "wasm"))]
+    return CATALOG.iter().find(|message| message.key() == key);
+    // wasm makes keys on demand, so it finds the message by the code that
+    // ends every key.
+    #[cfg(target_family = "wasm")]
+    key.rsplit_once('_')
+        .and_then(|(_, code)| message_by_code(code.parse().ok()?))
+        .filter(|message| message.key() == key)
+}
+
+/// The key of a message with `text` and `code`: Go's
+/// `internal/diagnostics/generate.go` `convertPropertyName`. Each `*`,
+/// `/` and `:` becomes a word, each other character that is not a letter
+/// or digit becomes `_`; runs of `_` become one; leading `_` before a
+/// non-digit and one trailing `_` go; the result is cut to 100 bytes and
+/// gets `_<code>`.
+// PORT: not in Go at run time. The wasm build makes its keys with it.
+#[cfg(any(test, target_family = "wasm"))]
+fn message_key(text: &str, code: u32) -> String {
+    let mut name = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '*' => name.push_str("_Asterisk"),
+            '/' => name.push_str("_Slash"),
+            ':' => name.push_str("_Colon"),
+            c if c.is_alphabetic() || c.is_numeric() => name.push(c),
+            _ => name.push('_'),
+        }
+    }
+    // `_+` -> `_`
+    let mut collapsed = String::with_capacity(name.len());
+    for c in name.chars() {
+        if !(c == '_' && collapsed.ends_with('_')) {
+            collapsed.push(c);
+        }
+    }
+    // `^_+(\D)` -> `$1` (after the collapse there is at most one `_`)
+    let mut key = match collapsed.strip_prefix('_') {
+        Some(rest) if rest.chars().next().is_some_and(|c| !c.is_ascii_digit()) => rest.to_string(),
+        _ => collapsed,
+    };
+    // `_$` -> ``
+    if key.ends_with('_') {
+        key.pop();
+    }
+    if key.len() > 100 {
+        key.truncate(100);
+    }
+    format!("{key}_{code}")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CATALOG, Category, Diagnostic, message_by_code, message_by_key};
+    use super::{CATALOG, Category, Diagnostic, message_by_code, message_by_key, message_key};
+
+    /// The wasm build makes each key from its text (`message_key`); it
+    /// must give the generated key of every message.
+    #[test]
+    fn message_key_makes_every_generated_key() {
+        for message in CATALOG {
+            assert_eq!(
+                message_key(message.text(), message.code()),
+                message.key(),
+                "{}",
+                message.code()
+            );
+        }
+    }
 
     #[test]
     fn generated_catalog_is_complete_and_sorted() {
