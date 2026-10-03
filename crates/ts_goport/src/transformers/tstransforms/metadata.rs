@@ -106,17 +106,17 @@ impl TransformerVisit for MetadataTransformer {
 }
 
 impl MetadataTransformer {
-    // Go: transformers/tstransforms/metadata.go:74 MetadataTransformer.setParent
+    // Go: transformers/tstransforms/metadata.go:71 MetadataTransformer.setParent
     fn set_parent(&mut self, node: Node) {
         self.parent = node;
     }
 
-    // Go: transformers/tstransforms/metadata.go:78 MetadataTransformer.setCurrentLexicalScope
+    // Go: transformers/tstransforms/metadata.go:75 MetadataTransformer.setCurrentLexicalScope
     fn set_current_lexical_scope(&mut self, node: Node) {
         self.current_lexical_scope = node;
     }
 
-    // Go: transformers/tstransforms/metadata.go:82 MetadataTransformer.visitClassExpression
+    // Go: transformers/tstransforms/metadata.go:79 MetadataTransformer.visitClassExpression
     fn visit_class_expression(&mut self, node: Node) -> Node {
         let old_parent = self.parent;
         self.parent = node;
@@ -146,7 +146,7 @@ impl MetadataTransformer {
         )
     }
 
-    // Go: transformers/tstransforms/metadata.go:101 MetadataTransformer.visitClassDeclaration
+    // Go: transformers/tstransforms/metadata.go:98 MetadataTransformer.visitClassDeclaration
     fn visit_class_declaration(&mut self, node: Node) -> Node {
         let old_parent = self.parent;
         self.parent = node;
@@ -176,7 +176,7 @@ impl MetadataTransformer {
         )
     }
 
-    // Go: transformers/tstransforms/metadata.go:120 MetadataTransformer.visitPropertyDeclaration
+    // Go: transformers/tstransforms/metadata.go:117 MetadataTransformer.visitPropertyDeclaration
     fn visit_property_declaration(&mut self, node: Node) -> Node {
         if !has_decorators(node) {
             return self.visit_each_child(node);
@@ -199,7 +199,7 @@ impl MetadataTransformer {
         )
     }
 
-    // Go: transformers/tstransforms/metadata.go:136 MetadataTransformer.visitMethodDeclaration
+    // Go: transformers/tstransforms/metadata.go:133 MetadataTransformer.visitMethodDeclaration
     fn visit_method_declaration(&mut self, node: Node) -> Node {
         if !has_decorators(node) && get_decorators_of_parameters(node).is_empty() {
             return self.visit_each_child(node);
@@ -230,7 +230,7 @@ impl MetadataTransformer {
         )
     }
 
-    // Go: transformers/tstransforms/metadata.go:156 MetadataTransformer.visitSetAccessor
+    // Go: transformers/tstransforms/metadata.go:153 MetadataTransformer.visitSetAccessor
     fn visit_set_accessor(&mut self, node: Node) -> Node {
         if !has_decorators(node) && get_decorators_of_parameters(node).is_empty() {
             return self.visit_each_child(node);
@@ -257,7 +257,7 @@ impl MetadataTransformer {
         )
     }
 
-    // Go: transformers/tstransforms/metadata.go:174 MetadataTransformer.visitGetAccessor
+    // Go: transformers/tstransforms/metadata.go:171 MetadataTransformer.visitGetAccessor
     fn visit_get_accessor(&mut self, node: Node) -> Node {
         if !has_decorators(node) {
             return self.visit_each_child(node);
@@ -284,7 +284,7 @@ impl MetadataTransformer {
         )
     }
 
-    // Go: transformers/tstransforms/metadata.go:192 MetadataTransformer.injectClassTypeMetadata
+    // Go: transformers/tstransforms/metadata.go:189 MetadataTransformer.injectClassTypeMetadata
     fn inject_class_type_metadata(&mut self, list: ModifierList, node: Node) -> ModifierList {
         let metadata = self.get_type_metadata(node, node);
         if !metadata.is_empty() {
@@ -326,7 +326,7 @@ impl MetadataTransformer {
         list
     }
 
-    // Go: transformers/tstransforms/metadata.go:227 MetadataTransformer.injectClassElementTypeMetadata
+    // Go: transformers/tstransforms/metadata.go:223 MetadataTransformer.injectClassElementTypeMetadata
     fn inject_class_element_type_metadata(
         &mut self,
         list: ModifierList,
@@ -365,7 +365,7 @@ impl MetadataTransformer {
         list
     }
 
-    // Go: transformers/tstransforms/metadata.go:263 MetadataTransformer.getTypeMetadata
+    // Go: transformers/tstransforms/metadata.go:261 MetadataTransformer.getTypeMetadata
     /// Gets optional type metadata for a declaration.
     ///
     /// @param node The declaration node.
@@ -396,7 +396,7 @@ impl MetadataTransformer {
             .expect("MetadataTransformer.serializer is nil")
     }
 
-    // Go: transformers/tstransforms/metadata.go:274 MetadataTransformer.getOldTypeMetadata
+    // Go: transformers/tstransforms/metadata.go:272 MetadataTransformer.getOldTypeMetadata
     fn get_old_type_metadata(&mut self, node: Node, container: Node) -> Vec<Node> {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -428,7 +428,7 @@ impl MetadataTransformer {
         decorators
     }
 
-    // Go: transformers/tstransforms/metadata.go:292 MetadataTransformer.getNewTypeMetadata
+    // Go: transformers/tstransforms/metadata.go:289 MetadataTransformer.getNewTypeMetadata
     fn get_new_type_metadata(&mut self, node: Node, container: Node) -> Vec<Node> {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -506,7 +506,7 @@ impl MetadataTransformer {
         Vec::new()
     }
 
-    // Go: transformers/tstransforms/metadata.go:360 MetadataTransformer.shouldAddTypeMetadata
+    // Go: transformers/tstransforms/metadata.go:356 MetadataTransformer.shouldAddTypeMetadata
     /// Determines whether to emit the "design:type" metadata based on the node's kind.
     /// The caller should have already tested whether the node has decorators and whether the
     /// emitDecoratorMetadata compiler option is set.
@@ -522,7 +522,7 @@ impl MetadataTransformer {
         )
     }
 
-    // Go: transformers/tstransforms/metadata.go:376 MetadataTransformer.shouldAddReturnTypeMetadata
+    // Go: transformers/tstransforms/metadata.go:371 MetadataTransformer.shouldAddReturnTypeMetadata
     /// Determines whether to emit the "design:returntype" metadata based on the node's kind.
     /// The caller should have already tested whether the node has decorators and whether the
     /// emitDecoratorMetadata compiler option is set.
@@ -532,7 +532,7 @@ impl MetadataTransformer {
         node.kind() == SyntaxKind::MethodDeclaration
     }
 
-    // Go: transformers/tstransforms/metadata.go:388 MetadataTransformer.shouldAddParamTypesMetadata
+    // Go: transformers/tstransforms/metadata.go:382 MetadataTransformer.shouldAddParamTypesMetadata
     /// Determines whether to emit the "design:paramtypes" metadata based on the node's kind.
     /// The caller should have already tested whether the node has decorators and whether the
     /// emitDecoratorMetadata compiler option is set.

@@ -470,14 +470,14 @@ impl LanguageService {
     }
 }
 
-// Go: ls/definition.go:297 lspRangeContains
+// Go: ls/definition.go:281 lspRangeContains
 #[must_use]
 pub fn lsp_range_contains(outer: lsproto::Range, inner: lsproto::Range) -> bool {
     lsproto::compare_positions(outer.start, inner.start) <= 0
         && lsproto::compare_positions(inner.end, outer.end) <= 0
 }
 
-// Go: ls/definition.go:302 createLocationsFromLinks
+// Go: ls/definition.go:286 createLocationsFromLinks
 pub fn create_locations_from_links(links: &[lsproto::LocationLink]) -> lsproto::DefinitionResponse {
     let locations: Vec<lsproto::Location> = links
         .iter()
@@ -493,7 +493,7 @@ pub fn create_locations_from_links(links: &[lsproto::LocationLink]) -> lsproto::
 }
 
 impl LanguageService {
-    // Go: ls/definition.go:312 createLocationFromFileAndRange
+    // Go: ls/definition.go:296 createLocationFromFileAndRange
     pub fn create_location_from_file_and_range(
         &self,
         file: Node,
@@ -512,7 +512,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/definition.go:322 getDeclarationsFromLocation
+// Go: ls/definition.go:306 getDeclarationsFromLocation
 pub fn get_declarations_from_location(c: &mut Checker, node: Node) -> Vec<Node> {
     if is_identifier(node) && is_shorthand_property_assignment(node.parent()) {
         // Because name in short-hand property assignment has two different meanings: property name and property value,
@@ -610,7 +610,7 @@ pub fn get_declarations_from_location(c: &mut Checker, node: Node) -> Vec<Node> 
     Vec::new()
 }
 
-// Go: ls/definition.go:396 getDeclarationsFromObjectLiteralElement
+// Go: ls/definition.go:380 getDeclarationsFromObjectLiteralElement
 // getDeclarationsFromObjectLiteralElement returns declarations from the contextual type
 // of an object literal element, if available.
 pub fn get_declarations_from_object_literal_element(c: &mut Checker, node: Node) -> Vec<Node> {
@@ -657,7 +657,7 @@ pub fn get_declarations_from_object_literal_element(c: &mut Checker, node: Node)
     result
 }
 
-// Go: ls/definition.go:426 getAncestorCallLikeExpression
+// Go: ls/definition.go:410 getAncestorCallLikeExpression
 // Returns a CallLikeExpression where `node` is the target being invoked.
 pub fn get_ancestor_call_like_expression(node: Node) -> Node {
     // PORT: Go calls `ast.IsRightSideOfPropertyAccess`; the ls prelude picks
@@ -673,7 +673,7 @@ pub fn get_ancestor_call_like_expression(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ls/definition.go:437 tryGetSignatureDeclaration
+// Go: ls/definition.go:421 tryGetSignatureDeclaration
 pub fn try_get_signature_declaration(type_checker: &mut Checker, node: Node) -> Node {
     let mut signature = SignatureId::NIL;
     let call_like = get_ancestor_call_like_expression(node);
@@ -690,7 +690,7 @@ pub fn try_get_signature_declaration(type_checker: &mut Checker, node: Node) -> 
     Node::NIL
 }
 
-// Go: ls/definition.go:454 isJsxConstructorLike
+// Go: ls/definition.go:438 isJsxConstructorLike
 pub fn is_jsx_constructor_like(node: Node) -> bool {
     is_constructor_declaration(node)
         || is_constructor_type_node(node)
@@ -698,7 +698,7 @@ pub fn is_jsx_constructor_like(node: Node) -> bool {
         || is_construct_signature_declaration(node)
 }
 
-// Go: ls/definition.go:466 symbolMatchesSignature
+// Go: ls/definition.go:450 symbolMatchesSignature
 // PORT: Go reads symbol fields without a checker; the symbol arena is the
 // first parameter, as for ast helpers that take a symbol.
 pub fn symbol_matches_signature(
@@ -723,7 +723,7 @@ pub fn symbol_matches_signature(
                 && symbol == parent.symbol())
 }
 
-// Go: ls/definition.go:479 getSymbolForOverriddenMember
+// Go: ls/definition.go:463 getSymbolForOverriddenMember
 pub fn get_symbol_for_overridden_member(type_checker: &mut Checker, node: Node) -> SymbolId {
     let class_element = find_ancestor(node, is_class_element);
     if class_element.is_nil() || class_element.name().is_nil() {
@@ -755,7 +755,7 @@ pub fn get_symbol_for_overridden_member(type_checker: &mut Checker, node: Node) 
     type_checker.get_property_of_type_exported(t, &name)
 }
 
-// Go: ls/definition.go:509 getTypeOfSymbolAtLocation
+// Go: ls/definition.go:493 getTypeOfSymbolAtLocation
 // PORT: a free function; `Checker::get_type_of_symbol_at_location` is the
 // checker method it calls (a method and a free fn do not clash).
 pub fn get_type_of_symbol_at_location(c: &mut Checker, symbol: SymbolId, node: Node) -> TypeId {
@@ -778,7 +778,7 @@ pub fn get_type_of_symbol_at_location(c: &mut Checker, symbol: SymbolId, node: N
     t
 }
 
-// Go: ls/definition.go:522 getDeclarationsFromType
+// Go: ls/definition.go:506 getDeclarationsFromType
 // PORT: Go reads type and symbol fields without a checker; the checker is
 // the first parameter.
 pub fn get_declarations_from_type(c: &Checker, t: TypeId) -> Vec<Node> {

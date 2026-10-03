@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::sync::LazyLock;
 
-// Go: api/encoder/encoder.go:15 init
+// Go: api/encoder/encoder.go:16 init
 // PORT: the Go `init()` guard is a compile-time assertion.
 const _: () = assert!(
     (SyntaxKind::LAST_UNARY_OPERATOR as u32) <= 0x3f,
@@ -73,7 +73,7 @@ pub const HEADER_OFFSET_SOURCE_FILE_LEASE: usize = 52;
 pub const HEADER_OFFSET_BINDER_DATA: usize = 60;
 pub const HEADER_SIZE: usize = 64;
 
-// Go: api/encoder/encoder.go:66 ProtocolVersion
+// Go: api/encoder/encoder.go:71 ProtocolVersion
 // ts#63957: 7 -> 8. ts#64434: 8 -> 9.
 pub const PROTOCOL_VERSION: u8 = 9;
 
@@ -484,14 +484,14 @@ pub fn go_kind_string(kind: i16) -> String {
     format!("Kind({kind})")
 }
 
-// Go: api/encoder/encoder.go:286 SourceFileHash
+// Go: api/encoder/encoder.go:312 SourceFileHash
 /// SourceFileHash returns the 128-bit content hash for a source file as a hex string.
 pub fn source_file_hash(source_file: Node) -> String {
     let h = source_file_content_hash(source_file);
     format!("{:016x}{:016x}", h.hi, h.lo)
 }
 
-// Go: api/encoder/encoder.go:292 encodeParseOptions
+// Go: api/encoder/encoder.go:318 encodeParseOptions
 /// encodeParseOptions encodes the per-file ExternalModuleIndicatorOptions as a uint32 bitmask.
 fn encode_parse_options(opts: ExternalModuleIndicatorOptions) -> u32 {
     let mut bits: u32 = 0;
@@ -504,7 +504,7 @@ fn encode_parse_options(opts: ExternalModuleIndicatorOptions) -> u32 {
     bits
 }
 
-// Go: api/encoder/encoder.go:304 NodeIndexTable
+// Go: api/encoder/encoder.go:330 NodeIndexTable
 /// NodeIndexTable maps between AST nodes and their encoder indices for O(1) node handle resolution.
 // PORT: Go `sortedOnce sync.Once` and `sortedIdx []uint32` are one `OnceCell`.
 pub struct NodeIndexTable {
@@ -514,7 +514,7 @@ pub struct NodeIndexTable {
     sorted_idx: OnceCell<Vec<u32>>,
 }
 
-// Go: api/encoder/encoder.go:310 nodeIndexTableKey
+// Go: api/encoder/encoder.go:336 nodeIndexTableKey
 static NODE_INDEX_TABLE_KEY: LazyLock<SourceFileDataKey<Rc<NodeIndexTable>>> =
     LazyLock::new(new_source_file_data_key::<Rc<NodeIndexTable>>);
 
@@ -557,7 +557,7 @@ struct BuildNodeIndexTableState {
     source_file: Node,
 }
 
-// Go: api/encoder/encoder.go:344 BuildNodeIndexTable
+// Go: api/encoder/encoder.go:370 BuildNodeIndexTable
 /// BuildNodeIndexTable walks the AST in the same order as encodeTree and builds
 /// a NodeIndexTable without performing the full binary encoding. This is used to
 /// eagerly create index tables for files that need node handles before getSourceFile
@@ -638,7 +638,7 @@ pub fn build_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
     })
 }
 
-// Go: api/encoder/encoder.go:390 GetNodeIndexTable
+// Go: api/encoder/encoder.go:416 GetNodeIndexTable
 pub fn get_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
     crate::ast::source_file_ls::source_file_get_or_compute_data(
         source_file,
@@ -647,7 +647,7 @@ pub fn get_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
     )
 }
 
-// Go: api/encoder/encoder.go:396 EncodeSourceFile
+// Go: api/encoder/encoder.go:422 EncodeSourceFile
 /// EncodeSourceFile encodes an entire source file AST into the binary format.
 /// Returns the encoded bytes and a NodeIndexTable mapping encoder indices to AST nodes.
 pub fn encode_source_file(source_file: Node) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
@@ -667,7 +667,7 @@ pub fn set_source_file_lease(data: &mut [u8], lease: u64) {
         .copy_from_slice(&lease.to_le_bytes());
 }
 
-// Go: api/encoder/encoder.go:411 EncodeNode
+// Go: api/encoder/encoder.go:442 EncodeNode
 /// EncodeNode encodes an arbitrary AST node and its descendants into the binary format.
 /// The sourceFile is needed to provide the source text for efficient string encoding.
 /// When encoding a non-SourceFile node, the header hash and parse options fields will be zero.
@@ -704,7 +704,7 @@ impl EncodeTreeState {
     }
 }
 
-// Go: api/encoder/encoder.go:415 encodeTree
+// Go: api/encoder/encoder.go:446 encodeTree
 fn encode_tree(
     root_node: Node,
     source_file: Node,
@@ -1070,7 +1070,7 @@ fn encode_tree(
     ))
 }
 
-// Go: api/encoder/encoder.go:621 appendUint32s
+// Go: api/encoder/encoder.go:655 appendUint32s
 pub fn append_uint32s(buf: &mut Vec<u8>, values: &[u32]) {
     for &value in values {
         buf.extend_from_slice(&value.to_le_bytes());
@@ -1082,7 +1082,7 @@ fn put_uint32(buf: &mut [u8], offset: usize, value: u32) {
     buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-// Go: api/encoder/encoder.go:628 getNodeData
+// Go: api/encoder/encoder.go:662 getNodeData
 pub fn get_node_data(
     node: Node,
     strs: &mut StringTable,
@@ -1104,10 +1104,10 @@ pub fn get_node_data(
     }
 }
 
-// Go: api/encoder/encoder.go:659 noStructuredData
+// Go: api/encoder/encoder.go:676 noStructuredData
 const NO_STRUCTURED_DATA: u32 = 0xFFFFFFFF;
 
-// Go: api/encoder/encoder.go:661 recordExtendedData_SourceFile
+// Go: api/encoder/encoder.go:678 recordExtendedData_SourceFile
 pub fn record_extended_data_source_file(
     node: Node,
     strs: &mut StringTable,
@@ -1213,7 +1213,7 @@ pub fn record_extended_data_source_file(
     );
 }
 
-// Go: api/encoder/encoder.go:657 recordExtendedData_TemplateHead
+// Go: api/encoder/encoder.go:714 recordExtendedData_TemplateHead
 pub fn record_extended_data_template_head(
     node: Node,
     strs: &mut StringTable,
@@ -1230,7 +1230,7 @@ pub fn record_extended_data_template_head(
     );
 }
 
-// Go: api/encoder/encoder.go:664 recordExtendedData_TemplateMiddle
+// Go: api/encoder/encoder.go:721 recordExtendedData_TemplateMiddle
 pub fn record_extended_data_template_middle(
     node: Node,
     strs: &mut StringTable,
@@ -1247,7 +1247,7 @@ pub fn record_extended_data_template_middle(
     );
 }
 
-// Go: api/encoder/encoder.go:671 recordExtendedData_TemplateTail
+// Go: api/encoder/encoder.go:728 recordExtendedData_TemplateTail
 pub fn record_extended_data_template_tail(
     node: Node,
     strs: &mut StringTable,
@@ -1264,7 +1264,7 @@ pub fn record_extended_data_template_tail(
     );
 }
 
-// Go: api/encoder/encoder.go:678 boolToByte
+// Go: api/encoder/encoder.go:735 boolToByte
 pub fn bool_to_byte(b: bool) -> u8 {
     if b {
         return 1;
@@ -1272,13 +1272,13 @@ pub fn bool_to_byte(b: bool) -> u8 {
     0
 }
 
-// Go: api/encoder/encoder.go:686 hasModifiers
+// Go: api/encoder/encoder.go:743 hasModifiers
 /// hasModifiers returns true if the modifier list is non-nil and has at least one modifier.
 pub fn has_modifiers(modifiers: ModifierList) -> bool {
     modifiers.is_some() && !modifiers.nodes().is_empty()
 }
 
-// Go: api/encoder/encoder.go:693 encodeFileReferences
+// Go: api/encoder/encoder.go:750 encodeFileReferences
 /// encodeFileReferences encodes a slice of FileReferences as a msgpack array of tuples
 /// into the structured data buffer. Returns the byte offset into the buffer, or
 /// noStructuredData (0xFFFFFFFF) if the slice is empty.
@@ -1304,7 +1304,7 @@ fn encode_file_references(
     offset
 }
 
-// Go: api/encoder/encoder.go:714 encodeNodeIndexArray
+// Go: api/encoder/encoder.go:771 encodeNodeIndexArray
 /// encodeNodeIndexArray encodes a slice of LiteralLikeNodes as a msgpack array of
 /// uint node indices. Returns the byte offset into the buffer, or noStructuredData
 /// if the slice is empty.
@@ -1330,7 +1330,7 @@ fn encode_node_index_array(
     offset
 }
 
-// Go: api/encoder/encoder.go:729 encodeModuleAugmentations
+// Go: api/encoder/encoder.go:786 encodeModuleAugmentations
 /// encodeModuleAugmentations encodes a slice of ModuleName nodes as a msgpack array
 /// of uint node indices. Returns the byte offset into the buffer, or noStructuredData
 /// if the slice is empty.
@@ -1356,7 +1356,7 @@ fn encode_module_augmentations(
     offset
 }
 
-// Go: api/encoder/encoder.go:743 encodeStringArray
+// Go: api/encoder/encoder.go:800 encodeStringArray
 /// encodeStringArray encodes a slice of strings as a msgpack array of strings.
 /// Returns the byte offset into the buffer, or noStructuredData if the slice is empty.
 fn encode_string_array(strs: &[String], buf: &mut Vec<u8>) -> u32 {
@@ -1371,7 +1371,7 @@ fn encode_string_array(strs: &[String], buf: &mut Vec<u8>) -> u32 {
     offset
 }
 
-// Go: api/encoder/encoder.go:795 encodeSpanMap
+// Go: api/encoder/encoder.go:812 encodeSpanMap
 fn encode_span_map(
     m: Option<&spanmap::SpanMap>,
     virtual_positions: &PositionMap,
@@ -1406,7 +1406,7 @@ fn encode_span_map(
     offset
 }
 
-// Go: api/encoder/encoder.go:824 encodeDiagnosticDirectives
+// Go: api/encoder/encoder.go:841 encodeDiagnosticDirectives
 fn encode_diagnostic_directives(
     directives: &[MappedDiagnosticDirective],
     virtual_positions: &PositionMap,
@@ -1436,7 +1436,7 @@ fn encode_diagnostic_directives(
 
 // Minimal msgpack writers for the structured data section.
 
-// Go: api/encoder/encoder.go:757 msgpackWriteArrayHeader
+// Go: api/encoder/encoder.go:865 msgpackWriteArrayHeader
 fn msgpack_write_array_header(buf: &mut Vec<u8>, length: usize) {
     if length <= 0x0f {
         buf.push(0x90 | length as u8);
@@ -1455,7 +1455,7 @@ fn msgpack_write_array_header(buf: &mut Vec<u8>, length: usize) {
     ]);
 }
 
-// Go: api/encoder/encoder.go:767 msgpackWriteUint
+// Go: api/encoder/encoder.go:875 msgpackWriteUint
 fn msgpack_write_uint(buf: &mut Vec<u8>, value: u32) {
     if value <= 0x7f {
         buf.push(value as u8);
@@ -1478,7 +1478,7 @@ fn msgpack_write_uint(buf: &mut Vec<u8>, value: u32) {
     ]);
 }
 
-// Go: api/encoder/encoder.go:780 msgpackWriteString
+// Go: api/encoder/encoder.go:888 msgpackWriteString
 fn msgpack_write_string(buf: &mut Vec<u8>, s: &str) {
     let n = s.len();
     if n <= 0x1f {
@@ -1499,7 +1499,7 @@ fn msgpack_write_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
 }
 
-// Go: api/encoder/encoder.go:794 msgpackWriteBool
+// Go: api/encoder/encoder.go:902 msgpackWriteBool
 fn msgpack_write_bool(buf: &mut Vec<u8>, value: bool) {
     if value {
         buf.push(0xc3);
@@ -1513,7 +1513,7 @@ fn msgpack_write_bool(buf: &mut Vec<u8>, value: bool) {
 // packs relevant fields into the 6-bit commonData area (bits 24-29) of the
 // 32-bit node data word.
 
-// Go: api/encoder/encoder.go:806 getNodeCommonData_SyntheticExpression
+// Go: api/encoder/encoder.go:914 getNodeCommonData_SyntheticExpression
 pub fn get_node_common_data_synthetic_expression(_node: Node) -> u32 {
     // SyntheticExpression is an internal compiler node that is never part of a parsed AST.
     // It should never be encoded.
@@ -1523,7 +1523,7 @@ pub fn get_node_common_data_synthetic_expression(_node: Node) -> u32 {
 // Hand-written extended data encoding functions for literal nodes that were
 // previously string-type but whose TokenFlags/TemplateFlags cannot fit in 6 bits.
 
-// Go: api/encoder/encoder.go:815 recordExtendedData_StringLiteral
+// Go: api/encoder/encoder.go:923 recordExtendedData_StringLiteral
 pub fn record_extended_data_string_literal(
     node: Node,
     strs: &mut StringTable,
@@ -1536,7 +1536,7 @@ pub fn record_extended_data_string_literal(
     append_uint32s(extended_data, &[text_index, n.token_flags().0 as u32]);
 }
 
-// Go: api/encoder/encoder.go:821 recordExtendedData_NumericLiteral
+// Go: api/encoder/encoder.go:929 recordExtendedData_NumericLiteral
 pub fn record_extended_data_numeric_literal(
     node: Node,
     strs: &mut StringTable,
@@ -1549,7 +1549,7 @@ pub fn record_extended_data_numeric_literal(
     append_uint32s(extended_data, &[text_index, n.token_flags().0 as u32]);
 }
 
-// Go: api/encoder/encoder.go:827 recordExtendedData_BigIntLiteral
+// Go: api/encoder/encoder.go:935 recordExtendedData_BigIntLiteral
 pub fn record_extended_data_big_int_literal(
     node: Node,
     strs: &mut StringTable,
@@ -1562,7 +1562,7 @@ pub fn record_extended_data_big_int_literal(
     append_uint32s(extended_data, &[text_index, n.token_flags().0 as u32]);
 }
 
-// Go: api/encoder/encoder.go:833 recordExtendedData_RegularExpressionLiteral
+// Go: api/encoder/encoder.go:941 recordExtendedData_RegularExpressionLiteral
 pub fn record_extended_data_regular_expression_literal(
     node: Node,
     strs: &mut StringTable,
@@ -1575,7 +1575,7 @@ pub fn record_extended_data_regular_expression_literal(
     append_uint32s(extended_data, &[text_index, n.token_flags().0 as u32]);
 }
 
-// Go: api/encoder/encoder.go:839 recordExtendedData_NoSubstitutionTemplateLiteral
+// Go: api/encoder/encoder.go:947 recordExtendedData_NoSubstitutionTemplateLiteral
 pub fn record_extended_data_no_substitution_template_literal(
     node: Node,
     strs: &mut StringTable,

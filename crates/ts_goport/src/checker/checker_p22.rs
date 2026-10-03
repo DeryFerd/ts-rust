@@ -19,7 +19,7 @@ fn or_else_type_p22(t: TypeId, fallback: TypeId) -> TypeId {
 }
 
 impl Checker {
-    // Go: checker/checker.go:19436 isValidBaseType
+    // Go: checker/checker.go:19874 isValidBaseType
     pub fn is_valid_base_type(&mut self, t: TypeId) -> bool {
         if self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER) {
             let constraint = self.get_base_constraint_of_type(t);
@@ -43,7 +43,7 @@ impl Checker {
     }
 
     // TODO: GH#18217 If `checkBase` is undefined, we should not call this because this will always return false.
-    // Go: checker/checker.go:19450 hasBaseType
+    // Go: checker/checker.go:19888 hasBaseType
     pub fn has_base_type(&mut self, t: TypeId, check_base: TypeId) -> bool {
         // PORT: the Go recursive closure `check` is a nested fn.
         fn check(c: &mut Checker, t: TypeId, check_base: TypeId) -> bool {
@@ -67,7 +67,7 @@ impl Checker {
         check(self, t, check_base)
     }
 
-    // Go: checker/checker.go:19465 getTargetType
+    // Go: checker/checker.go:19903 getTargetType
     pub fn get_target_type(&self, t: TypeId) -> TypeId {
         if self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE) {
             return self.ty(t).target();
@@ -75,7 +75,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:19472 getTypeWithThisArgument
+    // Go: checker/checker.go:19910 getTypeWithThisArgument
     pub fn get_type_with_this_argument(
         &mut self,
         t: TypeId,
@@ -126,7 +126,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:19497 addInheritedMembers
+    // Go: checker/checker.go:19935 addInheritedMembers
     pub fn add_inherited_members(
         &mut self,
         symbols: SymbolTable,
@@ -153,7 +153,7 @@ impl Checker {
         symbols
     }
 
-    // Go: checker/checker.go:19511 resolveDeclaredMembers
+    // Go: checker/checker.go:19949 resolveDeclaredMembers
     // PORT: returns `t.AsInterfaceType()` borrowed from the type arena.
     pub fn resolve_declared_members(&mut self, t: TypeId) -> &InterfaceType {
         if !self.ty(t).as_interface_type().declared_members_resolved {
@@ -180,7 +180,7 @@ impl Checker {
         self.ty(t).as_interface_type()
     }
 
-    // Go: checker/checker.go:19524 getIndexInfosOfSymbol
+    // Go: checker/checker.go:19962 getIndexInfosOfSymbol
     pub fn get_index_infos_of_symbol(&mut self, symbol: SymbolId) -> Vec<IndexInfoId> {
         let index_symbol = self.get_index_symbol(symbol);
         if index_symbol.is_some() {
@@ -193,7 +193,7 @@ impl Checker {
     }
 
     // note intentional similarities to index signature building in `checkObjectLiteral` for parity
-    // Go: checker/checker.go:19533 getIndexInfosOfIndexSymbol
+    // Go: checker/checker.go:19971 getIndexInfosOfIndexSymbol
     pub fn get_index_infos_of_index_symbol(
         &mut self,
         index_symbol: SymbolId,
@@ -323,7 +323,7 @@ impl Checker {
     }
 
     // NOTE: currently does not make pattern literal indexers, eg `${number}px`
-    // Go: checker/checker.go:19620 getObjectLiteralIndexInfo
+    // Go: checker/checker.go:20058 getObjectLiteralIndexInfo
     pub fn get_object_literal_index_info(
         &mut self,
         is_readonly: bool,
@@ -358,7 +358,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:19640 isSymbolWithSymbolName
+    // Go: checker/checker.go:20078 isSymbolWithSymbolName
     pub fn is_symbol_with_symbol_name(&mut self, symbol: SymbolId) -> bool {
         if self.is_known_symbol(symbol) {
             return true;
@@ -374,7 +374,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:19651 isSymbolWithNumericName
+    // Go: checker/checker.go:20089 isSymbolWithNumericName
     pub fn is_symbol_with_numeric_name(&mut self, symbol: SymbolId) -> bool {
         if is_numeric_literal_name(&self.sym(symbol).name) {
             return true;
@@ -386,7 +386,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:19662 isSymbolWithComputedName
+    // Go: checker/checker.go:20100 isSymbolWithComputedName
     pub fn is_symbol_with_computed_name(&self, symbol: SymbolId) -> bool {
         if let Some(&decl) = self.sym(symbol).declarations.first() {
             let name = decl.name();
@@ -395,7 +395,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:19670 isNumericName
+    // Go: checker/checker.go:20108 isNumericName
     pub fn is_numeric_name(&mut self, name: Node) -> bool {
         match name.kind() {
             SyntaxKind::ComputedPropertyName => return self.is_numeric_computed_name(name),
@@ -407,7 +407,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:19680 isNumericComputedName
+    // Go: checker/checker.go:20118 isNumericComputedName
     pub fn is_numeric_computed_name(&mut self, name: Node) -> bool {
         // It seems odd to consider an expression of type Any to result in a numeric name,
         // but this behavior is consistent with checkIndexedAccess
@@ -415,7 +415,7 @@ impl Checker {
         self.is_type_assignable_to_kind(t, TypeFlags::NUMBER_LIKE)
     }
 
-    // Go: checker/checker.go:19686 isValidIndexKeyType
+    // Go: checker/checker.go:20124 isValidIndexKeyType
     pub fn is_valid_index_key_type(&mut self, t: TypeId) -> bool {
         if self
             .ty(t)
@@ -434,7 +434,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:19692 findIndexInfo
+    // Go: checker/checker.go:20130 findIndexInfo
     // PORT: Go has both a package-level `findIndexInfo` (checker.go:19057,
     // ported elsewhere as `Checker::find_index_info`) and this `*Checker`
     // method with the same body. Both would be `find_index_info`, so this
@@ -452,13 +452,13 @@ impl Checker {
         IndexInfoId::NIL
     }
 
-    // Go: checker/checker.go:19701 getIndexSymbol
+    // Go: checker/checker.go:20139 getIndexSymbol
     pub fn get_index_symbol(&mut self, symbol: SymbolId) -> SymbolId {
         let members = self.get_members_of_symbol(symbol);
         self.symbols.get(members, INTERNAL_SYMBOL_NAME_INDEX)
     }
 
-    // Go: checker/checker.go:19705 getSignaturesOfSymbol
+    // Go: checker/checker.go:20143 getSignaturesOfSymbol
     pub fn get_signatures_of_symbol(&mut self, symbol: SymbolId) -> Vec<SignatureId> {
         if symbol.is_nil() {
             return Vec::new();
@@ -493,11 +493,18 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:19735 getSignatureFromDeclaration
+    // Go: checker/checker.go:20173 getSignatureFromDeclaration
     pub fn get_signature_from_declaration(&mut self, declaration: Node) -> SignatureId {
         let resolved = self.signature_links.get(declaration).resolved_signature;
         if resolved.is_some() {
             return resolved;
+        }
+        // PORT: Go `declaration.Parameters()` dereferences nil for a node
+        // that is not function-like (the API can pass any node). The port's
+        // nil list reads as empty, so it would make and register a
+        // signature. Nothing before Go's first read has a side effect.
+        if declaration.parameter_list().is_nil() {
+            crate::core::go_nil_dereference();
         }
         let mut parameters: Vec<SymbolId> = Vec::new();
         let mut flags = SignatureFlags::NONE;
@@ -631,7 +638,7 @@ impl Checker {
         sig
     }
 
-    // Go: checker/checker.go:19811 getTypeParametersFromDeclaration
+    // Go: checker/checker.go:20249 getTypeParametersFromDeclaration
     pub fn get_type_parameters_from_declaration(&mut self, declaration: Node) -> Vec<TypeId> {
         self.get_type_parameters_from_declaration_ex(declaration).0
     }
@@ -656,7 +663,7 @@ impl Checker {
         (result, 0)
     }
 
-    // Go: checker/checker.go:19822 getAnnotatedAccessorThisParameter
+    // Go: checker/checker.go:20260 getAnnotatedAccessorThisParameter
     pub fn get_annotated_accessor_this_parameter(&mut self, accessor: Node) -> SymbolId {
         let parameter = self.get_accessor_this_parameter(accessor);
         if parameter.is_some() {
@@ -665,7 +672,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:19830 getAccessorThisParameter
+    // Go: checker/checker.go:20268 getAccessorThisParameter
     pub fn get_accessor_this_parameter(&self, accessor: Node) -> Node {
         let expected = if is_get_accessor_declaration(accessor) {
             1
@@ -681,7 +688,7 @@ impl Checker {
     /**
      * Indicates whether a declaration has an early-bound name or a dynamic name that can be late-bound.
      */
-    // Go: checker/checker.go:19840 hasBindableName
+    // Go: checker/checker.go:20278 hasBindableName
     pub fn has_bindable_name(&mut self, node: Node) -> bool {
         !has_dynamic_name(node) || self.has_late_bindable_name(node)
     }
@@ -689,7 +696,7 @@ impl Checker {
     /**
      * Indicates whether a declaration has a late-bindable dynamic name.
      */
-    // Go: checker/checker.go:19847 hasLateBindableName
+    // Go: checker/checker.go:20285 hasLateBindableName
     pub fn has_late_bindable_name(&mut self, node: Node) -> bool {
         let name = get_name_of_declaration(node);
         name.is_some() && self.is_late_bindable_name(name)
@@ -703,7 +710,7 @@ impl Checker {
      * `ElementAccessExpression` consisting only of these same three types of nodes.
      * - The type of its expression is a string or numeric literal type, or is a `unique symbol` type.
      */
-    // Go: checker/checker.go:19860 isLateBindableName
+    // Go: checker/checker.go:20298 isLateBindableName
     pub fn is_late_bindable_name(&mut self, node: Node) -> bool {
         if !is_late_bindable_ast(node) {
             return false;
@@ -716,13 +723,13 @@ impl Checker {
         self.is_type_usable_as_property_name(t)
     }
 
-    // Go: checker/checker.go:19870 hasLateBindableIndexSignature
+    // Go: checker/checker.go:20308 hasLateBindableIndexSignature
     pub fn has_late_bindable_index_signature(&mut self, node: Node) -> bool {
         let name = get_name_of_declaration(node);
         name.is_some() && self.is_late_bindable_index_signature(name)
     }
 
-    // Go: checker/checker.go:19875 isLateBindableIndexSignature
+    // Go: checker/checker.go:20313 isLateBindableIndexSignature
     pub fn is_late_bindable_index_signature(&mut self, node: Node) -> bool {
         if !is_late_bindable_ast(node) {
             return false;
@@ -735,14 +742,14 @@ impl Checker {
         self.is_type_usable_as_index_signature_declaration(t)
     }
 
-    // Go: checker/checker.go:19885 isTypeUsableAsIndexSignatureDeclaration
+    // Go: checker/checker.go:20323 isTypeUsableAsIndexSignatureDeclaration
     pub fn is_type_usable_as_index_signature_declaration(&mut self, t: TypeId) -> bool {
         let string_number_symbol_type = self.string_number_symbol_type;
         self.is_type_assignable_to(t, string_number_symbol_type)
     }
 }
 
-// Go: checker/checker.go:19889 isLateBindableAST
+// Go: checker/checker.go:20327 isLateBindableAST
 pub fn is_late_bindable_ast(node: Node) -> bool {
     let mut expr = Node::NIL;
     if is_computed_property_name(node) {
@@ -754,7 +761,7 @@ pub fn is_late_bindable_ast(node: Node) -> bool {
 }
 
 impl Checker {
-    // Go: checker/checker.go:19900 getReturnTypeOfSignature
+    // Go: checker/checker.go:20338 getReturnTypeOfSignature
     pub fn get_return_type_of_signature(&mut self, sig: SignatureId) -> TypeId {
         if self.sig(sig).resolved_return_type.is_some() {
             return self.sig(sig).resolved_return_type;
@@ -834,7 +841,7 @@ impl Checker {
         self.sig(sig).resolved_return_type
     }
 
-    // Go: checker/checker.go:19950 getNonCircularReturnTypeOfSignature
+    // Go: checker/checker.go:20388 getNonCircularReturnTypeOfSignature
     pub fn get_non_circular_return_type_of_signature(&mut self, sig: SignatureId) -> TypeId {
         if self.is_resolving_return_type_of_signature(sig) {
             return self.any_type;
@@ -842,7 +849,7 @@ impl Checker {
         self.get_return_type_of_signature(sig)
     }
 
-    // Go: checker/checker.go:19957 getReturnTypeFromAnnotation
+    // Go: checker/checker.go:20395 getReturnTypeFromAnnotation
     pub fn get_return_type_from_annotation(&mut self, declaration: Node) -> TypeId {
         if is_constructor_declaration(declaration) {
             let merged = self.get_merged_symbol(declaration.parent().symbol());
@@ -861,7 +868,7 @@ impl Checker {
         self.get_return_type_of_full_signature(declaration)
     }
 
-    // Go: checker/checker.go:19971 getSignatureOfFullSignatureType
+    // Go: checker/checker.go:20409 getSignatureOfFullSignatureType
     pub fn get_signature_of_full_signature_type(&mut self, node: Node) -> SignatureId {
         if is_in_js_file(node)
             && (is_function_declaration(node)
@@ -875,7 +882,7 @@ impl Checker {
         SignatureId::NIL
     }
 
-    // Go: checker/checker.go:19978 getParameterTypeOfFullSignature
+    // Go: checker/checker.go:20416 getParameterTypeOfFullSignature
     pub fn get_parameter_type_of_full_signature(&mut self, node: Node, parameter: Node) -> TypeId {
         let signature = self.get_signature_of_full_signature_type(node);
         if signature.is_some() {
@@ -893,7 +900,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:19990 getReturnTypeOfFullSignature
+    // Go: checker/checker.go:20428 getReturnTypeOfFullSignature
     pub fn get_return_type_of_full_signature(&mut self, node: Node) -> TypeId {
         let signature = self.get_signature_of_full_signature_type(node);
         if signature.is_some() {
@@ -902,7 +909,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:19997 getAnnotatedAccessorType
+    // Go: checker/checker.go:20435 getAnnotatedAccessorType
     pub fn get_annotated_accessor_type(&mut self, accessor: Node) -> TypeId {
         let node = self.get_annotated_accessor_type_node(accessor);
         if node.is_some() {
@@ -911,7 +918,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:20005 getAnnotatedAccessorTypeNode
+    // Go: checker/checker.go:20443 getAnnotatedAccessorTypeNode
     pub fn get_annotated_accessor_type_node(&self, accessor: Node) -> Node {
         if accessor.is_some() {
             match accessor.kind() {
@@ -928,7 +935,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:20017 getEffectiveSetAccessorTypeAnnotationNode
+// Go: checker/checker.go:20455 getEffectiveSetAccessorTypeAnnotationNode
 pub fn get_effective_set_accessor_type_annotation_node(node: Node) -> Node {
     let param = get_set_accessor_value_parameter(node);
     if param.is_some() {
@@ -938,7 +945,7 @@ pub fn get_effective_set_accessor_type_annotation_node(node: Node) -> Node {
 }
 
 impl Checker {
-    // Go: checker/checker.go:20025 getReturnTypeFromBody
+    // Go: checker/checker.go:20463 getReturnTypeFromBody
     pub fn get_return_type_from_body(&mut self, fn_: Node, check_mode: CheckMode) -> TypeId {
         let body = fn_.body();
         if body.is_nil() {
@@ -1133,7 +1140,7 @@ impl Checker {
     }
 
     // Returns the aggregated list of return types, plus a bool indicating a never-returning function.
-    // Go: checker/checker.go:20158 checkAndAggregateReturnExpressionTypes
+    // Go: checker/checker.go:20596 checkAndAggregateReturnExpressionTypes
     pub fn check_and_aggregate_return_expression_types(
         &mut self,
         fn_: Node,
@@ -1212,14 +1219,14 @@ impl Checker {
         (aggregated_types, false)
     }
 
-    // Go: checker/checker.go:20206 functionHasImplicitReturn
+    // Go: checker/checker.go:20644 functionHasImplicitReturn
     pub fn function_has_implicit_return(&mut self, fn_: Node) -> bool {
         let end_flow_node = fn_.end_flow_node();
         end_flow_node.is_some() && self.is_reachable_flow_node(end_flow_node)
     }
 }
 
-// Go: checker/checker.go:20211 mayReturnNever
+// Go: checker/checker.go:20649 mayReturnNever
 pub fn may_return_never(fn_: Node) -> bool {
     match fn_.kind() {
         SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction => return true,
@@ -1230,7 +1237,7 @@ pub fn may_return_never(fn_: Node) -> bool {
 }
 
 impl Checker {
-    // Go: checker/checker.go:20221 checkAndAggregateYieldOperandTypes
+    // Go: checker/checker.go:20659 checkAndAggregateYieldOperandTypes
     pub fn check_and_aggregate_yield_operand_types(
         &mut self,
         fn_: Node,
@@ -1282,7 +1289,7 @@ impl Checker {
         (yield_types, next_types)
     }
 
-    // Go: checker/checker.go:20247 createPromiseType
+    // Go: checker/checker.go:20685 createPromiseType
     pub fn create_promise_type(&mut self, promised_type: TypeId) -> TypeId {
         // creates a `Promise<T>` type where `T` is the promisedType argument
         let get_global_promise_type_checked = self.get_global_promise_type_checked.clone();
@@ -1298,7 +1305,7 @@ impl Checker {
         self.unknown_type
     }
 
-    // Go: checker/checker.go:20259 createPromiseLikeType
+    // Go: checker/checker.go:20697 createPromiseLikeType
     pub fn create_promise_like_type(&mut self, promised_type: TypeId) -> TypeId {
         // creates a `PromiseLike<T>` type where `T` is the promisedType argument
         let get_global_promise_like_type = self.get_global_promise_like_type.clone();
@@ -1314,7 +1321,7 @@ impl Checker {
         self.unknown_type
     }
 
-    // Go: checker/checker.go:20271 createPromiseReturnType
+    // Go: checker/checker.go:20709 createPromiseReturnType
     pub fn create_promise_return_type(&mut self, fn_: Node, promised_type: TypeId) -> TypeId {
         let promise_type = self.create_promise_type(promised_type);
         if promise_type == self.unknown_type {
@@ -1339,7 +1346,7 @@ impl Checker {
         promise_type
     }
 
-    // Go: checker/checker.go:20287 unwrapReturnType
+    // Go: checker/checker.go:20725 unwrapReturnType
     pub fn unwrap_return_type(
         &mut self,
         return_type: TypeId,
@@ -1369,7 +1376,7 @@ impl Checker {
         return_type
     }
 
-    // Go: checker/checker.go:20306 getWidenedLiteralLikeTypeForContextualReturnTypeIfNeeded
+    // Go: checker/checker.go:20744 getWidenedLiteralLikeTypeForContextualReturnTypeIfNeeded
     pub fn get_widened_literal_like_type_for_contextual_return_type_if_needed(
         &mut self,
         t: TypeId,
@@ -1392,7 +1399,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:20322 getWidenedLiteralLikeTypeForContextualIterationTypeIfNeeded
+    // Go: checker/checker.go:20760 getWidenedLiteralLikeTypeForContextualIterationTypeIfNeeded
     pub fn get_widened_literal_like_type_for_contextual_iteration_type_if_needed(
         &mut self,
         t: TypeId,
@@ -1415,7 +1422,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:20333 createGeneratorType
+    // Go: checker/checker.go:20771 createGeneratorType
     pub fn create_generator_type(
         &mut self,
         yield_type: TypeId,

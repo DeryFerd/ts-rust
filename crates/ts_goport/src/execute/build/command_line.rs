@@ -23,7 +23,7 @@ pub struct BuildOptions {
     pub clean: Tristate,
 }
 
-// Go: tsoptions/parsinghelpers.go:176 buildOptionsParser
+// Go: tsoptions/parsinghelpers.go:252 buildOptionsParser
 // PORT: the embedded Go `*core.BuildOptions` is a mutable borrow, as in
 // `CompilerOptionsParser`.
 pub struct BuildOptionsParser<'a> {
@@ -47,7 +47,7 @@ impl OptionParser for BuildOptionsParser<'_> {
     }
 }
 
-// Go: tsoptions/parsinghelpers.go:538 ParseBuildOptions
+// Go: tsoptions/parsinghelpers.go:626 ParseBuildOptions
 // PORT: Go `allOptions` can be nil; the Rust caller always has options, so
 // that nil check is dropped (as in `parse_compiler_options`).
 pub fn parse_build_options(
@@ -126,7 +126,7 @@ impl ParsedBuildCommandLine {
     }
 }
 
-// Go: tsoptions/commandlineparser.go:63 ParseBuildCommandLine
+// Go: tsoptions/commandlineparser.go:64 ParseBuildCommandLine
 // PORT: Go nil `commandLine` is an empty slice here already. The
 // `WatchOptions` conversion is left out (see `ParsedBuildCommandLine`).
 pub fn parse_build_command_line(

@@ -32,7 +32,7 @@ pub struct SymbolTrackerImpl {
 }
 
 impl SymbolTrackerImpl {
-    // Go: transformers/declarations/tracker.go:61 SymbolTrackerImpl.ReportInferenceFallback
+    // Go: transformers/declarations/tracker.go:87 SymbolTrackerImpl.ReportInferenceFallback
     // PORT: the transformer calls this outside any checker call, so there is
     // no checker in hand. The resolver trait methods borrow the checker
     // themselves. The checker `SymbolTracker` trait method is the in-checker
@@ -97,7 +97,7 @@ impl SymbolTrackerImpl {
         }
     }
 
-    // Go: transformers/declarations/tracker.go:71 SymbolTrackerImpl.isChildOfBoundExpando
+    // Go: transformers/declarations/tracker.go:77 SymbolTrackerImpl.isChildOfBoundExpando
     fn is_child_of_bound_expando(&self, mut c: Option<&mut Checker>, node: Node) -> bool {
         find_ancestor_or_quit(node, |n| {
             if is_source_file(n) || is_block(n) {
@@ -127,7 +127,7 @@ impl SymbolTrackerImpl {
         self.state.borrow_mut().add_diagnostic(diag);
     }
 
-    // Go: transformers/declarations/tracker.go:129 SymbolTrackerImpl.errorFallbackNode
+    // Go: transformers/declarations/tracker.go:157 SymbolTrackerImpl.errorFallbackNode
     fn error_fallback_node(&self) -> Node {
         self.fallback_stack
             .borrow()
@@ -136,7 +136,7 @@ impl SymbolTrackerImpl {
             .unwrap_or(Node::NIL)
     }
 
-    // Go: transformers/declarations/tracker.go:136 SymbolTrackerImpl.errorLocation
+    // Go: transformers/declarations/tracker.go:164 SymbolTrackerImpl.errorLocation
     fn error_location(&self) -> Node {
         let mut location = self.state.borrow().error_name_node;
         if location.is_nil() {
@@ -145,7 +145,7 @@ impl SymbolTrackerImpl {
         location
     }
 
-    // Go: transformers/declarations/tracker.go:144 SymbolTrackerImpl.errorDeclarationNameWithFallback
+    // Go: transformers/declarations/tracker.go:172 SymbolTrackerImpl.errorDeclarationNameWithFallback
     fn error_declaration_name_with_fallback(&self) -> String {
         let error_name_node = self.state.borrow().error_name_node;
         if error_name_node.is_some() {
@@ -164,7 +164,7 @@ impl SymbolTrackerImpl {
         "(Missing)".to_string() // same fallback declarationNameToString uses when node is zero-width (ie, nameless)
     }
 
-    // Go: transformers/declarations/tracker.go:176 SymbolTrackerImpl.handleSymbolAccessibilityError
+    // Go: transformers/declarations/tracker.go:204 SymbolTrackerImpl.handleSymbolAccessibilityError
     pub(crate) fn handle_symbol_accessibility_error(
         &self,
         symbol_accessibility_result: SymbolAccessibilityResult,
@@ -273,7 +273,7 @@ impl SymbolTracker for SymbolTrackerImpl {
         }
     }
 
-    // Go: transformers/declarations/tracker.go:61 SymbolTrackerImpl.ReportInferenceFallback
+    // Go: transformers/declarations/tracker.go:87 SymbolTrackerImpl.ReportInferenceFallback
     fn report_inference_fallback(&self, c: &mut Checker, node: Node) {
         let (isolated_declarations, current_source_file) = {
             let state = self.state.borrow();
@@ -309,7 +309,7 @@ impl SymbolTracker for SymbolTrackerImpl {
         }
     }
 
-    // Go: transformers/declarations/tracker.go:75 SymbolTrackerImpl.ReportLikelyUnsafeImportRequiredError
+    // Go: transformers/declarations/tracker.go:103 SymbolTrackerImpl.ReportLikelyUnsafeImportRequiredError
     fn report_likely_unsafe_import_required_error(
         &self,
         _c: &mut Checker,
@@ -334,7 +334,7 @@ impl SymbolTracker for SymbolTrackerImpl {
         }
     }
 
-    // Go: transformers/declarations/tracker.go:87 SymbolTrackerImpl.ReportNonSerializableProperty
+    // Go: transformers/declarations/tracker.go:115 SymbolTrackerImpl.ReportNonSerializableProperty
     fn report_non_serializable_property(&self, _c: &mut Checker, property_name: &str) {
         let location = self.error_location();
         if location.is_some() {
@@ -346,7 +346,7 @@ impl SymbolTracker for SymbolTrackerImpl {
         }
     }
 
-    // Go: transformers/declarations/tracker.go:95 SymbolTrackerImpl.ReportNonlocalAugmentation
+    // Go: transformers/declarations/tracker.go:123 SymbolTrackerImpl.ReportNonlocalAugmentation
     fn report_nonlocal_augmentation(
         &self,
         c: &mut Checker,
@@ -386,7 +386,7 @@ impl SymbolTracker for SymbolTrackerImpl {
         }
     }
 
-    // Go: transformers/declarations/tracker.go:109 SymbolTrackerImpl.ReportPrivateInBaseOfClassExpression
+    // Go: transformers/declarations/tracker.go:137 SymbolTrackerImpl.ReportPrivateInBaseOfClassExpression
     fn report_private_in_base_of_class_expression(&self, _c: &mut Checker, property_name: &str) {
         let location = self.error_location();
         if location.is_some() {
@@ -407,7 +407,7 @@ impl SymbolTracker for SymbolTrackerImpl {
         }
     }
 
-    // Go: transformers/declarations/tracker.go:122 SymbolTrackerImpl.ReportTruncationError
+    // Go: transformers/declarations/tracker.go:150 SymbolTrackerImpl.ReportTruncationError
     fn report_truncation_error(&self, _c: &mut Checker) {
         let location = self.error_location();
         if location.is_some() {
@@ -419,7 +419,7 @@ impl SymbolTracker for SymbolTrackerImpl {
         }
     }
 
-    // Go: transformers/declarations/tracker.go:161 SymbolTrackerImpl.TrackSymbol
+    // Go: transformers/declarations/tracker.go:189 SymbolTrackerImpl.TrackSymbol
     fn track_symbol(
         &self,
         c: &mut Checker,
@@ -450,7 +450,7 @@ impl SymbolTracker for SymbolTrackerImpl {
     }
 }
 
-// Go: transformers/declarations/tracker.go:211 SymbolTrackerSharedState
+// Go: transformers/declarations/tracker.go:239 SymbolTrackerSharedState
 pub struct SymbolTrackerSharedState {
     pub(crate) late_marked_statements: Vec<Node>,
     pub(crate) diagnostics: Vec<Diagnostic>,
@@ -467,7 +467,7 @@ pub struct SymbolTrackerSharedState {
 }
 
 impl SymbolTrackerSharedState {
-    // Go: transformers/declarations/tracker.go:223 SymbolTrackerSharedState.addDiagnostic
+    // Go: transformers/declarations/tracker.go:251 SymbolTrackerSharedState.addDiagnostic
     pub(crate) fn add_diagnostic(&mut self, diag: Diagnostic) {
         self.diagnostics.push(diag);
     }
@@ -503,7 +503,7 @@ impl SymbolTrackerSharedState {
     }
 }
 
-// Go: transformers/declarations/tracker.go:227 NewSymbolTracker
+// Go: transformers/declarations/tracker.go:255 NewSymbolTracker
 pub fn new_symbol_tracker(
     host: Rc<dyn DeclarationEmitHost>,
     resolver: Rc<dyn EmitResolver>,

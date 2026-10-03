@@ -6,7 +6,7 @@
 
 use crate::prelude::*;
 
-// Go: checker/nodebuilder_hover.go:15 isExpanding
+// Go: checker/nodebuilder_hover.go:16 isExpanding
 pub fn is_expanding(ctx: &NodeBuilderContext) -> bool {
     ctx.max_expansion_depth != -1
 }
@@ -25,7 +25,7 @@ fn hv_ctx(b: &Rc<RefCell<NodeBuilderImpl>>) -> Rc<RefCell<NodeBuilderContext>> {
 }
 
 impl Checker {
-    // Go: checker/nodebuilder_hover.go:24 expandSymbolForHover
+    // Go: checker/nodebuilder_hover.go:25 expandSymbolForHover
     pub fn expand_symbol_for_hover(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -61,7 +61,7 @@ impl Checker {
         results
     }
 
-    // Go: checker/nodebuilder_hover.go:50 expandEnumDecl
+    // Go: checker/nodebuilder_hover.go:52 expandEnumDecl
     pub(crate) fn expand_enum_decl(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -139,7 +139,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/nodebuilder_hover.go:88 enumMemberInitializer
+    // Go: checker/nodebuilder_hover.go:92 enumMemberInitializer
     pub(crate) fn enum_member_initializer(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -168,7 +168,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/nodebuilder_hover.go:108 expandClassDecl
+    // Go: checker/nodebuilder_hover.go:111 expandClassDecl
     pub(crate) fn expand_class_decl(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -299,7 +299,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/nodebuilder_hover.go:185 addClassModifiers
+    // Go: checker/nodebuilder_hover.go:187 addClassModifiers
     pub(crate) fn add_class_modifiers(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -337,7 +337,7 @@ impl Checker {
         members
     }
 
-    // Go: checker/nodebuilder_hover.go:233 expandInterfaceDecl
+    // Go: checker/nodebuilder_hover.go:234 expandInterfaceDecl
     pub(crate) fn expand_interface_decl(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -417,7 +417,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/nodebuilder_hover.go:273 hoverHeritageClauses
+    // Go: checker/nodebuilder_hover.go:275 hoverHeritageClauses
     // PORT: no Checker call is needed, so `&self` is enough.
     pub(crate) fn hover_heritage_clauses(
         &self,
@@ -452,7 +452,7 @@ impl Checker {
         heritage_clauses
     }
 
-    // Go: checker/nodebuilder_hover.go:296 serializePropertiesWithTruncation
+    // Go: checker/nodebuilder_hover.go:299 serializePropertiesWithTruncation
     pub(crate) fn serialize_properties_with_truncation(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -490,7 +490,7 @@ impl Checker {
         elements
     }
 
-    // Go: checker/nodebuilder_hover.go:316 serializeConstructors
+    // Go: checker/nodebuilder_hover.go:317 serializeConstructors
     pub(crate) fn serialize_constructors(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -588,7 +588,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/nodebuilder_hover.go:367 serializeIndexSignaturesOfType
+    // Go: checker/nodebuilder_hover.go:369 serializeIndexSignaturesOfType
     pub(crate) fn serialize_index_signatures_of_type(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -613,7 +613,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/nodebuilder_hover.go:382 serializeNamespaceMember
+    // Go: checker/nodebuilder_hover.go:385 serializeNamespaceMember
     pub(crate) fn serialize_namespace_member(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -653,7 +653,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/nodebuilder_hover.go:410 expandModuleDecl
+    // Go: checker/nodebuilder_hover.go:413 expandModuleDecl
     pub(crate) fn expand_module_decl(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -904,7 +904,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/nodebuilder_hover.go:530 serializeTypeAliasForNamespace
+    // Go: checker/nodebuilder_hover.go:558 serializeTypeAliasForNamespace
     pub(crate) fn serialize_type_alias_for_namespace(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -944,7 +944,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/nodebuilder_hover.go:543 filterInheritedProperties
+    // Go: checker/nodebuilder_hover.go:571 filterInheritedProperties
     // PORT: the builder is not used, so no `b` parameter.
     pub(crate) fn filter_inherited_properties(
         &mut self,
@@ -984,7 +984,7 @@ impl Checker {
             .collect()
     }
 
-    // Go: checker/nodebuilder_hover.go:571 isNamespaceMember
+    // Go: checker/nodebuilder_hover.go:598 isNamespaceMember
     // PORT: the builder is not used, so no `b` parameter.
     pub(crate) fn is_namespace_member(&self, p: SymbolId) -> bool {
         let s = self.sym(p);
@@ -998,7 +998,7 @@ impl Checker {
     }
 }
 
-// Go: checker/nodebuilder_hover.go:215 typeElementsToClassElements
+// Go: checker/nodebuilder_hover.go:217 typeElementsToClassElements
 pub fn type_elements_to_class_elements(f: &NodeFactory, mut members: Vec<Node>) -> Vec<Node> {
     for m in members.iter_mut() {
         let node = *m;
@@ -1031,7 +1031,7 @@ pub fn type_elements_to_class_elements(f: &NodeFactory, mut members: Vec<Node>) 
     members
 }
 
-// Go: checker/nodebuilder_hover.go:576 isHashPrivate
+// Go: checker/nodebuilder_hover.go:603 isHashPrivate
 pub fn is_hash_private(symbols: &SymbolArena, s: SymbolId) -> bool {
     let value_declaration = symbols.sym(s).value_declaration;
     value_declaration.is_some()

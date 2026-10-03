@@ -44,7 +44,7 @@ pub fn get() -> Option<&'static Tracing> {
     TRACING.get()
 }
 
-// Go: tracing/tracing.go:70 TraceRecord
+// Go: tracing/tracing.go:72 TraceRecord
 #[derive(Clone, Debug, Default)]
 pub struct TraceRecord {
     pub config_file_path: String,
@@ -53,7 +53,7 @@ pub struct TraceRecord {
     pub checker_id: i64,
 }
 
-// Go: tracing/tracing.go:77 traceEvent
+// Go: tracing/tracing.go:79 traceEvent
 struct TraceEvent<'a> {
     pid: i64,
     tid: i64,
@@ -70,10 +70,10 @@ struct TraceEvent<'a> {
 // sampleInterval matches TypeScript's 10ms sampling interval.
 // Events with separateBeginAndEnd=false are only recorded if their
 // duration crosses a 10ms sampling boundary.
-// Go: tracing/tracing.go:92 sampleInterval
+// Go: tracing/tracing.go:94 sampleInterval
 const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
-// Go: tracing/tracing.go:94 traceFileName
+// Go: tracing/tracing.go:96 traceFileName
 const TRACE_FILE_NAME: &str = "trace.json";
 
 // Go: tracing/tracing.go:96
@@ -82,7 +82,7 @@ const FIRST_SYNTHETIC_THREAD_ID: i64 = 2;
 const FIRST_FILE_THREAD_ID: i64 = 1_000_000;
 const FILE_THREAD_ID_HASH_RANGE: u64 = 1_000_000_000;
 
-// Go: tracing/tracing.go:103 traceThreadArgKeys
+// Go: tracing/tracing.go:105 traceThreadArgKeys
 const TRACE_THREAD_ARG_KEYS: [&str; 5] = [
     "path",
     "fileName",
@@ -94,10 +94,10 @@ const TRACE_THREAD_ARG_KEYS: [&str; 5] = [
 // flushThreshold is the size at which buffered trace content is flushed to disk
 // via AppendFile. Keeps peak memory bounded for long-running compilations while
 // avoiding a syscall per event.
-// Go: tracing/tracing.go:108 flushThreshold
+// Go: tracing/tracing.go:110 flushThreshold
 const FLUSH_THRESHOLD: usize = 256 * 1024;
 
-// Go: tracing/tracing.go:111 Tracing
+// Go: tracing/tracing.go:113 Tracing
 // Tracing manages the overall tracing session including all checkers.
 // PORT: the Go fields that `mu` guards are in `TracingState`. Go `fs` is
 // `std::fs`, or `osvfs_fs()` in a test process (see the module comment).
@@ -129,7 +129,7 @@ struct TracingState {
     flush_err: Option<String>,
 }
 
-// Go: tracing/tracing.go:133 Phase
+// Go: tracing/tracing.go:137 Phase
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
     Parse,
@@ -251,7 +251,7 @@ pub fn node_args(node: Node) -> Args {
     ]
 }
 
-// Go: tracing/tracing.go:149 StartTracing
+// Go: tracing/tracing.go:152 StartTracing
 // StartTracing creates a new tracing session.
 // When deterministic is true, timestamps use a monotonic counter instead of
 // real wall-clock time, producing stable output for test baselines.
@@ -371,7 +371,7 @@ fn micros(d: std::time::Duration) -> f64 {
     d.as_nanos() as f64 / 1000.0
 }
 
-// Go: tracing/tracing.go:195 writeEventTo
+// Go: tracing/tracing.go:201 writeEventTo
 fn write_event(buf: &mut String, event: &TraceEvent<'_>) {
     let _ = write!(buf, "{{\"pid\":{},\"tid\":{},\"ph\":", event.pid, event.tid);
     write_json_string(buf, event.ph);
@@ -797,7 +797,7 @@ impl Drop for Pop {
     }
 }
 
-// Go: tracing/tracing.go:351 traceThreadKind
+// Go: tracing/tracing.go:353 traceThreadKind
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TraceThreadKind {
     Checker,
@@ -813,7 +813,7 @@ impl TraceThreadKind {
     }
 }
 
-// Go: tracing/tracing.go:358 traceThreadKey
+// Go: tracing/tracing.go:360 traceThreadKey
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct TraceThreadKey {
     kind: TraceThreadKind,
@@ -822,7 +822,7 @@ struct TraceThreadKey {
     has_index: bool,
 }
 
-// Go: tracing/tracing.go:365 traceThreadKeyFromArgs
+// Go: tracing/tracing.go:367 traceThreadKeyFromArgs
 fn trace_thread_key_from_args(args: &[(&'static str, Arg)]) -> Option<TraceThreadKey> {
     if args.is_empty() {
         return None;
@@ -854,7 +854,7 @@ fn trace_thread_key_from_args(args: &[(&'static str, Arg)]) -> Option<TraceThrea
 }
 
 impl TraceThreadKey {
-    // Go: tracing/tracing.go:385 traceThreadKey.defaultThreadID
+    // Go: tracing/tracing.go:387 traceThreadKey.defaultThreadID
     fn default_thread_id(&self) -> i64 {
         if self.kind == TraceThreadKind::Checker && self.has_index && self.index >= 0 {
             return FIRST_SYNTHETIC_THREAD_ID + self.index;
@@ -862,7 +862,7 @@ impl TraceThreadKey {
         stable_trace_thread_id(self)
     }
 
-    // Go: tracing/tracing.go:392 traceThreadKey.displayName
+    // Go: tracing/tracing.go:394 traceThreadKey.displayName
     fn display_name(&self) -> String {
         if self.has_index {
             return format!("{}:{}", self.kind.as_str(), self.index);
@@ -871,7 +871,7 @@ impl TraceThreadKey {
     }
 }
 
-// Go: tracing/tracing.go:399 stableTraceThreadID
+// Go: tracing/tracing.go:401 stableTraceThreadID
 // PORT: Go writes the parts into a streaming xxh3 hasher (seed 0); the hash
 // of the joined bytes is the same.
 fn stable_trace_thread_id(key: &TraceThreadKey) -> i64 {
@@ -921,7 +921,7 @@ fn marshal_legend(legend: &[TraceRecord]) -> String {
 // Type tracer
 // ---------------------------------------------------------------------------
 
-// Go: tracing/tracing.go:487 typeTracer
+// Go: tracing/tracing.go:485 typeTracer
 // typeTracer is the per-checker tracer implementation
 // PORT: Go keeps `*TracedType` values; the port keeps the type ids, which
 // index the checker's arena.
@@ -989,7 +989,7 @@ fn dump_checker_types(index: usize, checker: &mut Checker) -> Result<(), String>
         .map_err(|err| format!("failed to dump types for checker {index}: {err}"))
 }
 
-// Go: tracing/tracing.go:538 TypeDescriptor
+// Go: tracing/tracing.go:534 TypeDescriptor
 // TypeDescriptor represents a type in the output JSON
 // PORT: Go `omitzero` fields: an empty `Vec`, an empty `String` and `None`
 // are left out.
@@ -1028,7 +1028,7 @@ struct TypeDescriptor {
     display: String,
 }
 
-// Go: tracing/tracing.go:573 Location
+// Go: tracing/tracing.go:569 Location
 // Location represents a source code location
 struct Location {
     path: String,
@@ -1036,7 +1036,7 @@ struct Location {
     end: Option<LineAndChar>,
 }
 
-// Go: tracing/tracing.go:580 LineAndChar
+// Go: tracing/tracing.go:576 LineAndChar
 // LineAndChar represents a line and character position (1-indexed)
 struct LineAndChar {
     line: i32,
@@ -1181,14 +1181,14 @@ fn build_type_descriptor(
         let ty = checker.ty(t);
         (ty.flags, ty.object_flags, ty.symbol)
     };
-    // Go: checker/tracer.go:96 AliasSymbol
+    // Go: checker/tracer.go:97 AliasSymbol
     let alias_symbol = checker
         .ty(t)
         .alias
         .as_ref()
         .map_or(SymbolId::NIL, |alias| alias.symbol());
 
-    // Go: checker/tracer.go:80 Id and :84 FormatFlags
+    // Go: checker/tracer.go:81 Id and :84 FormatFlags
     let mut desc = TypeDescriptor {
         id: t.0,
         flags: format_type_flags(flags),
@@ -1197,7 +1197,7 @@ fn build_type_descriptor(
 
     // Assign a unique integer token per recursion identity, matching TypeScript's behavior.
     // This lets trace analysis tools detect which types share the same recursion identity.
-    // Go: checker/tracer.go:335 RecursionIdentity
+    // Go: checker/tracer.go:326 RecursionIdentity
     // PORT: Go `getRecursionIdentity(t).value` is never nil, so every type
     // gets a token.
     let identity = checker.get_recursion_identity(t);
@@ -1221,7 +1221,7 @@ fn build_type_descriptor(
     }
 
     // Tuple flag
-    // Go: checker/tracer.go:325 IsTuple
+    // Go: checker/tracer.go:315 IsTuple
     if object_flags.intersects(ObjectFlags::TUPLE) {
         desc.is_tuple = true;
     }
@@ -1265,7 +1265,7 @@ fn build_type_descriptor(
     }
 
     // Conditional type
-    // Go: checker/tracer.go:88 IsConditional and :169-:211 Conditional*Type
+    // Go: checker/tracer.go:89 IsConditional and :169-:211 Conditional*Type
     if flags.intersects(TypeFlags::CONDITIONAL) {
         let data = checker.ty(t).as_conditional_type();
         desc.conditional_check_type = opt_id(data.check_type);
@@ -1322,7 +1322,7 @@ fn build_type_descriptor(
     }
 
     // Pattern (destructuring)
-    // Go: checker/tracer.go:328 Pattern
+    // Go: checker/tracer.go:319 Pattern
     if let Some(&pattern) = checker.pattern_for_type.get(&t) {
         if pattern.is_some() {
             desc.destructuring_pattern = get_location(pattern);
@@ -1347,7 +1347,7 @@ fn build_type_descriptor(
     desc
 }
 
-// Go: checker/tracer.go:339 Display
+// Go: checker/tracer.go:330 Display
 // Compute display text for types where it's valuable for trace analysis.
 // TypeScript only does this for Anonymous|Literal types, but we extend to
 // unions, intersections, and template literals since they often lack
@@ -1378,7 +1378,7 @@ fn display(
     String::new()
 }
 
-// Go: tracing/tracing.go:720 mapTypeIds
+// Go: tracing/tracing.go:726 mapTypeIds
 fn map_type_ids(types: &[TypeId]) -> Vec<u32> {
     // Go: a nil type maps to 0, which is `TypeId::NIL.0`.
     types.iter().map(|t| t.0).collect()
@@ -1389,7 +1389,7 @@ fn opt_id(t: TypeId) -> Option<i64> {
     t.is_some().then_some(i64::from(t.0))
 }
 
-// Go: tracing/tracing.go:733 getLocation
+// Go: tracing/tracing.go:739 getLocation
 fn get_location(node: Node) -> Option<Location> {
     if node.is_nil() {
         return None;
@@ -1483,7 +1483,7 @@ impl Tracer {
 // execute/tsc.go helpers
 // ---------------------------------------------------------------------------
 
-// Go: execute/tsc.go:27 startTracingIfNeeded
+// Go: execute/tsc.go:28 startTracingIfNeeded
 // PORT: Go prints the warning to `sys.Writer()` and returns the session.
 // The session is the process global here, and the warning text (with its
 // newline) is returned for the caller to print. `testing` is Go
@@ -1508,7 +1508,7 @@ pub fn start_tracing_if_needed(
     }
 }
 
-// Go: execute/tsc.go:43 stopTracing
+// Go: execute/tsc.go:44 stopTracing
 // PORT: the warning text is returned, as for `start_tracing_if_needed`.
 // Call it on the thread that loaded the program (it reaches the checkers).
 pub fn stop_tracing() -> Option<String> {

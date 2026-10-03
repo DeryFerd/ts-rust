@@ -937,7 +937,7 @@ impl Checker {
     // from `InferenceStack` with no scan (debug builds also scan and
     // compare). Else the scan runs as in Go, with
     // `has_matching_recursion_identity` for the same types in the same order.
-    // Go: checker/relater.go:773 isDeeplyNestedType
+    // Go: checker/relater.go:766 isDeeplyNestedType
     #[inline]
     fn is_deeply_nested_inference_top(&mut self, stack: &InferenceStack, max_depth: i32) -> bool {
         let fast = stack.top_deeply_nested(max_depth);
@@ -1080,7 +1080,7 @@ impl Checker {
         depth
     }
 
-    // Go: checker/inference.go:391 inferToMultipleTypes
+    // Go: checker/inference.go:448 inferToMultipleTypes
     pub fn infer_to_multiple_types(
         &mut self,
         n: &mut InferenceState,
@@ -1189,7 +1189,7 @@ impl Checker {
 
     // PORT: Go package function; it reads the inference list through the
     // checker, so it is a `Checker` method.
-    // Go: checker/inference.go:475 getSingleTypeVariableFromIntersectionTypes
+    // Go: checker/inference.go:532 getSingleTypeVariableFromIntersectionTypes
     pub fn get_single_type_variable_from_intersection_types(
         &mut self,
         n: &mut InferenceState,
@@ -1217,7 +1217,7 @@ impl Checker {
         type_variable
     }
 
-    // Go: checker/inference.go:490 inferToMultipleTypesWithPriority
+    // Go: checker/inference.go:547 inferToMultipleTypesWithPriority
     pub fn infer_to_multiple_types_with_priority(
         &mut self,
         n: &mut InferenceState,
@@ -1232,7 +1232,7 @@ impl Checker {
         n.priority = save_priority;
     }
 
-    // Go: checker/inference.go:497 inferToConditionalType
+    // Go: checker/inference.go:554 inferToConditionalType
     pub fn infer_to_conditional_type(
         &mut self,
         n: &mut InferenceState,
@@ -1281,7 +1281,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/inference.go:509 inferToTemplateLiteralType
+    // Go: checker/inference.go:566 inferToTemplateLiteralType
     pub fn infer_to_template_literal_type(
         &mut self,
         n: &mut InferenceState,
@@ -1460,7 +1460,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/inference.go:630 inferFromGenericMappedTypes
+    // Go: checker/inference.go:687 inferFromGenericMappedTypes
     pub fn infer_from_generic_mapped_types(
         &mut self,
         n: &mut InferenceState,
@@ -1482,7 +1482,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/inference.go:642 inferFromObjectTypes
+    // Go: checker/inference.go:699 inferFromObjectTypes
     pub fn infer_from_object_types(
         &mut self,
         n: &mut InferenceState,
@@ -1773,7 +1773,7 @@ impl Checker {
         self.infer_from_index_types(n, source, target);
     }
 
-    // Go: checker/inference.go:771 inferFromProperties
+    // Go: checker/inference.go:828 inferFromProperties
     pub fn infer_from_properties(
         &mut self,
         n: &mut InferenceState,
@@ -1813,7 +1813,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/inference.go:781 inferFromSignatures
+    // Go: checker/inference.go:838 inferFromSignatures
     pub fn infer_from_signatures(
         &mut self,
         n: &mut InferenceState,
@@ -1837,7 +1837,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/inference.go:796 inferFromSignature
+    // Go: checker/inference.go:853 inferFromSignature
     pub fn infer_from_signature(
         &mut self,
         n: &mut InferenceState,
@@ -1881,7 +1881,7 @@ impl Checker {
 
     // PORT: Go `callback func(s, t *Type)` closes over the checker; the Rust
     // callback receives it as its first argument.
-    // Go: checker/inference.go:811 applyToParameterTypes
+    // Go: checker/inference.go:868 applyToParameterTypes
     pub fn apply_to_parameter_types(
         &mut self,
         source: SignatureId,
@@ -1922,7 +1922,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/inference.go:839 applyToReturnTypes
+    // Go: checker/inference.go:896 applyToReturnTypes
     pub fn apply_to_return_types(
         &mut self,
         source: SignatureId,
@@ -1950,7 +1950,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/inference.go:854 inferFromIndexTypes
+    // Go: checker/inference.go:911 inferFromIndexTypes
     pub fn infer_from_index_types(
         &mut self,
         n: &mut InferenceState,
@@ -2008,7 +2008,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/inference.go:891 inferToMappedType
+    // Go: checker/inference.go:948 inferToMappedType
     pub fn infer_to_mapped_type(
         &mut self,
         n: &mut InferenceState,

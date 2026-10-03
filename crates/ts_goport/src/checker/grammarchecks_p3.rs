@@ -1,7 +1,7 @@
 use crate::prelude::*;
 
 impl Checker {
-    // Go: checker/grammarchecks.go:1858 checkGrammarConstructorTypeParameters
+    // Go: checker/grammarchecks.go:1841 checkGrammarConstructorTypeParameters
     pub fn check_grammar_constructor_type_parameters(&mut self, node: Node) -> bool {
         // PORT: Go reads the `TypeParameters` *NodeList field; the Node method
         // `TypeParameterList()` returns that same list.
@@ -28,7 +28,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1873 checkGrammarConstructorTypeAnnotation
+    // Go: checker/grammarchecks.go:1856 checkGrammarConstructorTypeAnnotation
     pub fn check_grammar_constructor_type_annotation(&mut self, node: Node) -> bool {
         let t = node.type_();
         if t.is_some() {
@@ -41,7 +41,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1881 checkGrammarProperty
+    // Go: checker/grammarchecks.go:1864 checkGrammarProperty
     pub fn check_grammar_property(
         &mut self,
         node: Node, /*Union[PropertyDeclaration, PropertySignature]*/
@@ -155,7 +155,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:1942 checkAmbientInitializer
+    // Go: checker/grammarchecks.go:1925 checkAmbientInitializer
     pub fn check_ambient_initializer(&mut self, node: Node) -> bool {
         let initializer: Node;
         let type_node: Node;
@@ -205,7 +205,7 @@ impl Checker {
     }
 }
 
-// Go: checker/grammarchecks.go:1977 isInitializerStringOrNumberLiteralExpression
+// Go: checker/grammarchecks.go:1960 isInitializerStringOrNumberLiteralExpression
 pub fn is_initializer_string_or_number_literal_expression(expr: Node) -> bool {
     is_string_or_numeric_literal_like(expr)
         || expr.kind() == SyntaxKind::PrefixUnaryExpression
@@ -213,7 +213,7 @@ pub fn is_initializer_string_or_number_literal_expression(expr: Node) -> bool {
             && expr.operand().kind() == SyntaxKind::NumericLiteral
 }
 
-// Go: checker/grammarchecks.go:1982 isInitializerBigIntLiteralExpression
+// Go: checker/grammarchecks.go:1965 isInitializerBigIntLiteralExpression
 pub fn is_initializer_big_int_literal_expression(expr: Node) -> bool {
     if expr.kind() == SyntaxKind::BigIntLiteral {
         return true;
@@ -228,7 +228,7 @@ pub fn is_initializer_big_int_literal_expression(expr: Node) -> bool {
 }
 
 impl Checker {
-    // Go: checker/grammarchecks.go:1995 isInitializerSimpleLiteralEnumReference
+    // Go: checker/grammarchecks.go:1978 isInitializerSimpleLiteralEnumReference
     pub fn is_initializer_simple_literal_enum_reference(&mut self, expr: Node) -> bool {
         if is_property_access_expression(expr) {
             let t = self.check_expression_cached(expr);
@@ -247,7 +247,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:2011 checkGrammarTopLevelElementForRequiredDeclareModifier
+    // Go: checker/grammarchecks.go:1994 checkGrammarTopLevelElementForRequiredDeclareModifier
     pub fn check_grammar_top_level_element_for_required_declare_modifier(
         &mut self,
         node: Node,
@@ -288,7 +288,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/grammarchecks.go:2031 checkGrammarTopLevelElementsForRequiredDeclareModifier
+    // Go: checker/grammarchecks.go:2014 checkGrammarTopLevelElementsForRequiredDeclareModifier
     pub fn check_grammar_top_level_elements_for_required_declare_modifier(
         &mut self,
         file: Node,
@@ -303,13 +303,13 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:2042 checkGrammarSourceFile
+    // Go: checker/grammarchecks.go:2025 checkGrammarSourceFile
     pub fn check_grammar_source_file(&mut self, node: Node) -> bool {
         node.flags().intersects(NodeFlags::AMBIENT)
             && self.check_grammar_top_level_elements_for_required_declare_modifier(node)
     }
 
-    // Go: checker/grammarchecks.go:2046 checkGrammarStatementInAmbientContext
+    // Go: checker/grammarchecks.go:2029 checkGrammarStatementInAmbientContext
     pub fn check_grammar_statement_in_ambient_context(&mut self, node: Node) -> bool {
         if node.flags().intersects(NodeFlags::AMBIENT) {
             // Find containing block which is either Block, ModuleBlock, SourceFile
@@ -364,7 +364,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:2076 checkGrammarNumericLiteral
+    // Go: checker/grammarchecks.go:2059 checkGrammarNumericLiteral
     pub fn check_grammar_numeric_literal(&mut self, node: Node) {
         let node_text = get_text_of_node(node);
 
@@ -400,7 +400,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/grammarchecks.go:2104 checkGrammarBigIntLiteral
+    // Go: checker/grammarchecks.go:2087 checkGrammarBigIntLiteral
     pub fn check_grammar_big_int_literal(&mut self, node: Node) -> bool {
         let literal_type = is_literal_type_node(node.parent())
             || is_prefix_unary_expression(node.parent())
@@ -422,7 +422,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:2117 checkGrammarImportClause
+    // Go: checker/grammarchecks.go:2100 checkGrammarImportClause
     pub fn check_grammar_import_clause(&mut self, node: Node) -> bool {
         match node.phase_modifier() {
             SyntaxKind::TypeKeyword => {
@@ -475,7 +475,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:2140 checkGrammarTypeOnlyNamedImportsOrExports
+    // Go: checker/grammarchecks.go:2136 checkGrammarTypeOnlyNamedImportsOrExports
     pub fn check_grammar_type_only_named_imports_or_exports(
         &mut self,
         named_bindings: Node,
@@ -500,7 +500,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:2161 checkGrammarImportCallExpression
+    // Go: checker/grammarchecks.go:2157 checkGrammarImportCallExpression
     pub fn check_grammar_import_call_expression(&mut self, node: Node) -> bool {
         if self.compiler_options.verbatim_module_syntax == Tristate::True
             && self.module_kind == ModuleKind::COMMON_JS

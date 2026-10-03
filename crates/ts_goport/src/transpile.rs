@@ -24,7 +24,7 @@ use crate::gostd::Context;
 use crate::gostd::strconv::quote;
 use crate::program;
 
-// Go: transpile/transpile.go:18 Options
+// Go: transpile/transpile.go:17 Options
 /// Options configures single-file transpilation.
 // PORT: Go `CompilerOptions *core.CompilerOptions` is an owned value. The
 // Go worker clones it, so the caller's options stay unchanged either way.
@@ -50,7 +50,7 @@ pub struct Options {
     pub report_diagnostics: bool,
 }
 
-// Go: transpile/transpile.go:40 Output
+// Go: transpile/transpile.go:39 Output
 /// Output contains the emitted text and any requested diagnostics.
 // PORT: an empty `diagnostics` is also the Go nil slice.
 #[derive(Clone, Debug, Default)]
@@ -60,17 +60,17 @@ pub struct Output {
     pub source_map_text: String,
 }
 
-// Go: transpile/transpile.go:48 inputDirectory
+// Go: transpile/transpile.go:47 inputDirectory
 // inputDirectory is the synthetic current directory used to root the
 // single input file created for transpilation.
 const INPUT_DIRECTORY: &str = "/";
 
-// Go: transpile/transpile.go:52 libDirectory
+// Go: transpile/transpile.go:51 libDirectory
 // libDirectory is the synthetic directory that the barebones default library
 // file is placed in for declaration transpilation. See [barebonesLibContent].
 const LIB_DIRECTORY: &str = "/lib";
 
-// Go: transpile/transpile.go:60 barebonesLibContent
+// Go: transpile/transpile.go:59 barebonesLibContent
 // Declaration emit works without a `lib`, but some local inferences you'd
 // expect to work won't without at least a minimal `lib` available, since the
 // checker will type inferred declarations as `any` without these defined.

@@ -188,7 +188,7 @@ pub fn osvfs_fs() -> Rc<dyn Fs> {
     OS_VFS.with(Rc::clone)
 }
 
-// Go: os.go:174 isReparsePoint
+// Go: os.go:138 isReparsePoint
 fn is_reparse_point(path: &str) -> bool {
     crate::frontend::nativepath::is_symlink_or_reparse_point(&filepath_from_slash(path))
 }
@@ -300,7 +300,7 @@ impl Fs for OsFs {
         self.common.stat(path)
     }
 
-    // Go: os.go:152 Realpath
+    // Go: os.go:117 Realpath
     fn realpath(&self, path: &str) -> String {
         os_fs_realpath(path)
     }
@@ -315,13 +315,13 @@ impl Fs for OsFs {
         self.write_file_ensuring_dir(path, content, WriteFlag::Append)
     }
 
-    // Go: os.go:213 Remove
+    // Go: os.go:182 Remove
     fn remove(&self, path: &str) -> Result<(), FsError> {
         // todo: #701 add retry mechanism?
         os_remove_all(path)
     }
 
-    // Go: os.go:219 Chtimes
+    // Go: os.go:188 Chtimes
     // PORT: Go `os.Chtimes` is utimensat(AT_FDCWD, path, times, 0) on unix,
     // so it works on a file without read permission; a zero Go time
     // (`None` here) is UTIME_OMIT. Off unix, Rust std sets times through an
@@ -396,7 +396,7 @@ enum WriteFlag {
     Append,
 }
 
-// Go: os.go:157 osFSRealpath
+// Go: os.go:122 osFSRealpath
 pub fn os_fs_realpath(path: &str) -> String {
     let _ = root_length(path); // Assert path is rooted
 
@@ -414,7 +414,7 @@ pub fn os_fs_realpath(path: &str) -> String {
 }
 
 impl OsFs {
-    // Go: os.go:173 writeFileWithFlag
+    // Go: os.go:142 writeFileWithFlag
     fn write_file_with_flag(
         &self,
         path: &str,
@@ -441,12 +441,12 @@ impl OsFs {
         Ok(())
     }
 
-    // Go: os.go:189 ensureDirectoryExists
+    // Go: os.go:158 ensureDirectoryExists
     fn ensure_directory_exists(&self, directory_path: &str) -> Result<(), FsError> {
         os_mkdir_all(directory_path, 0o777)
     }
 
-    // Go: os.go:194 writeFileEnsuringDir
+    // Go: os.go:163 writeFileEnsuringDir
     fn write_file_ensuring_dir(
         &self,
         path: &str,
@@ -464,7 +464,7 @@ impl OsFs {
     }
 }
 
-// Go: os.go:224 GetGlobalTypingsCacheLocation
+// Go: os.go:193 GetGlobalTypingsCacheLocation
 // PORT: not ported. Only the language server (cmd/tsc/lsp.go) calls it.
 
 // Go: os/file.go DirFS

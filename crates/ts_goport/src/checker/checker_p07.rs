@@ -19,7 +19,7 @@ use crate::diagnostics::Message;
 use crate::prelude::*;
 
 impl Checker {
-    // Go: checker/checker.go:5715 hasExportedMembersOfKind
+    // Go: checker/checker.go:5903 hasExportedMembersOfKind
     pub fn has_exported_members_of_kind(
         &mut self,
         module_symbol: SymbolId,
@@ -36,7 +36,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:5724 hasShadowedNamespace
+    // Go: checker/checker.go:5912 hasShadowedNamespace
     pub fn has_shadowed_namespace(&mut self, symbol: SymbolId) -> bool {
         let flags = self.sym(symbol).flags;
         if flags.intersects(SymbolFlags::NAMESPACE_MODULE) && flags.intersects(SymbolFlags::ALIAS) {
@@ -54,18 +54,18 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:5733 isNotOverload
+// Go: checker/checker.go:5921 isNotOverload
 pub fn is_not_overload(node: Node) -> bool {
     !is_function_declaration(node) && !is_method_declaration(node) || node.body().is_some()
 }
 
 impl Checker {
-    // Go: checker/checker.go:5737 checkMissingDeclaration
+    // Go: checker/checker.go:5925 checkMissingDeclaration
     pub fn check_missing_declaration(&mut self, node: Node) {
         self.check_decorators(node);
     }
 
-    // Go: checker/checker.go:5741 checkVariableStatement
+    // Go: checker/checker.go:5929 checkVariableStatement
     pub fn check_variable_statement(&mut self, node: Node) {
         let declaration_list = node.declaration_list();
         if !self.check_grammar_modifiers(node)
@@ -76,7 +76,7 @@ impl Checker {
         self.check_variable_declaration_list(declaration_list);
     }
 
-    // Go: checker/checker.go:5750 checkVariableDeclarationList
+    // Go: checker/checker.go:5938 checkVariableDeclarationList
     pub fn check_variable_declaration_list(&mut self, node: Node) {
         let block_scope_kind = get_combined_node_flags(node) & NodeFlags::BLOCK_SCOPED;
         if (block_scope_kind == NodeFlags::USING || block_scope_kind == NodeFlags::AWAIT_USING)
@@ -90,7 +90,7 @@ impl Checker {
         self.check_source_elements(node.declarations().nodes());
     }
 
-    // Go: checker/checker.go:5758 checkVariableDeclaration
+    // Go: checker/checker.go:5946 checkVariableDeclaration
     pub fn check_variable_declaration(&mut self, node: Node) {
         let _trace = self.tracer.map(|tr| {
             tr.push(
@@ -105,7 +105,7 @@ impl Checker {
     }
 
     // Check variable, parameter, or property declaration
-    // Go: checker/checker.go:5767 checkVariableLikeDeclaration
+    // Go: checker/checker.go:5955 checkVariableLikeDeclaration
     pub fn check_variable_like_declaration(&mut self, node: Node) {
         self.check_decorators(node);
         let name = node.name();
@@ -406,7 +406,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5926 errorNextVariableOrPropertyDeclarationMustHaveSameType
+    // Go: checker/checker.go:6119 errorNextVariableOrPropertyDeclarationMustHaveSameType
     pub fn error_next_variable_or_property_declaration_must_have_same_type(
         &mut self,
         first_declaration: Node,
@@ -445,7 +445,7 @@ impl Checker {
         self.add_diagnostic(err);
     }
 
-    // Go: checker/checker.go:5938 checkVarDeclaredNamesNotShadowed
+    // Go: checker/checker.go:6131 checkVarDeclaredNamesNotShadowed
     pub fn check_var_declared_names_not_shadowed(&mut self, node: Node) {
         // - ScriptBody : StatementList
         // It is a Syntax Error if any element of the LexicallyDeclaredNames of StatementList
@@ -544,7 +544,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5999 checkDecorators
+    // Go: checker/checker.go:6192 checkDecorators
     pub fn check_decorators(&mut self, node: Node) {
         // skip this check for nodes that cannot have decorators. These should have already had an error reported by
         // checkGrammarModifiers.
@@ -618,7 +618,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:6038 checkDecorator
+    // Go: checker/checker.go:6231 checkDecorator
     pub fn check_decorator(&mut self, node: Node) {
         self.check_grammar_decorator(node);
         let signature = self.get_resolved_signature(node, None, CheckMode::NORMAL);
@@ -659,7 +659,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/checker.go:6072 checkIteratedTypeOrElementType
+    // Go: checker/checker.go:6265 checkIteratedTypeOrElementType
     pub fn check_iterated_type_or_element_type(
         &mut self,
         use_: IterationUse,
@@ -679,7 +679,7 @@ impl Checker {
         self.any_type
     }
 
-    // Go: checker/checker.go:6083 getIteratedTypeOrElementType
+    // Go: checker/checker.go:6276 getIteratedTypeOrElementType
     pub fn get_iterated_type_or_element_type(
         &mut self,
         use_: IterationUse,
@@ -851,7 +851,7 @@ impl Checker {
     // Gets the requested "iteration type" from a type that is either `Iterable`-like, `Iterator`-like,
     // `IterableIterator`-like, or `Generator`-like (for a non-async generator); or `AsyncIterable`-like,
     // `AsyncIterator`-like, `AsyncIterableIterator`-like, or `AsyncGenerator`-like (for an async generator).
-    // Go: checker/checker.go:6193 getIterationTypeOfGeneratorFunctionReturnType
+    // Go: checker/checker.go:6386 getIterationTypeOfGeneratorFunctionReturnType
     pub fn get_iteration_type_of_generator_function_return_type(
         &mut self,
         type_kind: IterationTypeKind,
@@ -866,7 +866,7 @@ impl Checker {
         iteration_types.get_type(type_kind)
     }
 
-    // Go: checker/checker.go:6201 getIterationTypesOfGeneratorFunctionReturnType
+    // Go: checker/checker.go:6394 getIterationTypesOfGeneratorFunctionReturnType
     pub fn get_iteration_types_of_generator_function_return_type(
         &mut self,
         t: TypeId,
@@ -902,7 +902,7 @@ impl Checker {
     }
 
     // Gets the requested "iteration type" from an `Iterable`-like or `AsyncIterable`-like type.
-    // Go: checker/checker.go:6215 getIterationTypeOfIterable
+    // Go: checker/checker.go:6408 getIterationTypeOfIterable
     pub fn get_iteration_type_of_iterable(
         &mut self,
         use_: IterationUse,
@@ -936,7 +936,7 @@ impl Checker {
     //
     // For a **for-await-of** statement or a `yield*` in an async generator we will look for
     // the `[Symbol.asyncIterator]()` method first, and then the `[Symbol.iterator]()` method.
-    // Go: checker/checker.go:6242 getIterationTypesOfIterable
+    // Go: checker/checker.go:6435 getIterationTypesOfIterable
     pub fn get_iteration_types_of_iterable(
         &mut self,
         t: TypeId,
@@ -971,7 +971,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:6264 getIterationTypesOfIterableWorker
+    // Go: checker/checker.go:6457 getIterationTypesOfIterableWorker
     pub fn get_iteration_types_of_iterable_worker(
         &mut self,
         t: TypeId,
@@ -1094,7 +1094,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:6334 getIterationTypesOfIterableFast
+    // Go: checker/checker.go:6527 getIterationTypesOfIterableFast
     pub fn get_iteration_types_of_iterable_fast(
         &mut self,
         t: TypeId,
@@ -1145,7 +1145,7 @@ impl Checker {
 }
 
 impl IterationTypesResolver {
-    // Go: checker/checker.go:6361 IterationTypesResolver.getResolvedIterationTypes
+    // Go: checker/checker.go:6554 IterationTypesResolver.getResolvedIterationTypes
     pub fn get_resolved_iteration_types(
         &self,
         c: &mut Checker,
@@ -1174,21 +1174,21 @@ impl IterationTypesResolver {
 }
 
 impl Checker {
-    // Go: checker/checker.go:6369 isReferenceToType
+    // Go: checker/checker.go:6562 isReferenceToType
     pub fn is_reference_to_type(&self, t: TypeId, target: TypeId) -> bool {
         t.is_some()
             && self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE)
             && self.ty(t).target() == target
     }
 
-    // Go: checker/checker.go:6373 isReferenceToSomeType
+    // Go: checker/checker.go:6566 isReferenceToSomeType
     pub fn is_reference_to_some_type(&self, t: TypeId, targets: &[TypeId]) -> bool {
         t.is_some()
             && self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE)
             && targets.contains(&self.ty(t).target())
     }
 
-    // Go: checker/checker.go:6377 getBuiltinIteratorReturnType
+    // Go: checker/checker.go:6570 getBuiltinIteratorReturnType
     pub fn get_builtin_iterator_return_type(&self) -> TypeId {
         if self.strict_builtin_iterator_return {
             self.undefined_type
@@ -1199,12 +1199,12 @@ impl Checker {
 }
 
 impl IterationTypes {
-    // Go: checker/checker.go:6381 IterationTypes.hasTypes
+    // Go: checker/checker.go:6574 IterationTypes.hasTypes
     pub fn has_types(&self) -> bool {
         self.yield_type.is_some() || self.return_type.is_some() || self.next_type.is_some()
     }
 
-    // Go: checker/checker.go:6385 IterationTypes.getType
+    // Go: checker/checker.go:6578 IterationTypes.getType
     pub fn get_type(&self, type_kind: IterationTypeKind) -> TypeId {
         match type_kind {
             IterationTypeKind::YIELD => self.yield_type,
@@ -1216,7 +1216,7 @@ impl IterationTypes {
 }
 
 impl Checker {
-    // Go: checker/checker.go:6397 combineIterationTypes
+    // Go: checker/checker.go:6590 combineIterationTypes
     pub fn combine_iteration_types(
         &mut self,
         iteration_types: &[IterationTypes],
@@ -1228,7 +1228,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:6405 getIterationTypeUnion
+    // Go: checker/checker.go:6598 getIterationTypeUnion
     pub fn get_iteration_type_union(
         &mut self,
         iteration_types: &[IterationTypes],
@@ -1245,7 +1245,7 @@ impl Checker {
         self.get_union_type(&types)
     }
 
-    // Go: checker/checker.go:6413 getAsyncFromSyncIterationTypes
+    // Go: checker/checker.go:6606 getAsyncFromSyncIterationTypes
     pub fn get_async_from_sync_iteration_types(
         &mut self,
         iteration_types: IterationTypes,
@@ -1289,7 +1289,7 @@ impl Checker {
     //
     // NOTE: You probably don't want to call this directly and should be calling
     // `getIterationTypesOfIterable` instead.
-    // Go: checker/checker.go:6437 getIterationTypesOfIterableSlow
+    // Go: checker/checker.go:6630 getIterationTypesOfIterableSlow
     pub fn get_iteration_types_of_iterable_slow(
         &mut self,
         t: TypeId,
@@ -1347,7 +1347,7 @@ impl Checker {
     //
     // If we successfully found the *yield*, *return*, and *next* types, an `IterationTypes` with non-nil
     // members is returned. Otherwise, a default `IterationTypes{}` is returned.
-    // Go: checker/checker.go:6462 getIterationTypesOfIterator
+    // Go: checker/checker.go:6655 getIterationTypesOfIterator
     pub fn get_iteration_types_of_iterator(
         &mut self,
         t: TypeId,
@@ -1364,7 +1364,7 @@ impl Checker {
     // members is returned. Otherwise, a default `IterationTypes{}` is returned.
     //
     // NOTE: You probably don't want to call this directly and should be calling `getIterationTypesOfIterator` instead.
-    // Go: checker/checker.go:6472 getIterationTypesOfIteratorWorker
+    // Go: checker/checker.go:6665 getIterationTypesOfIteratorWorker
     pub fn get_iteration_types_of_iterator_worker(
         &mut self,
         t: TypeId,
@@ -1386,7 +1386,7 @@ impl Checker {
         self.get_iteration_types_of_iterator_slow(t, r, error_node, diagnostic_output)
     }
 
-    // Go: checker/checker.go:6483 getIterationTypesOfIteratorFast
+    // Go: checker/checker.go:6676 getIterationTypesOfIteratorFast
     pub fn get_iteration_types_of_iterator_fast(
         &mut self,
         t: TypeId,
@@ -1435,7 +1435,7 @@ impl Checker {
         IterationTypes::default()
     }
 
-    // Go: checker/checker.go:6510 getIterationTypesOfIteratorSlow
+    // Go: checker/checker.go:6703 getIterationTypesOfIteratorSlow
     pub fn get_iteration_types_of_iterator_slow(
         &mut self,
         t: TypeId,
@@ -1467,7 +1467,7 @@ impl Checker {
         self.combine_iteration_types(&[next, return_, throw])
     }
 
-    // Go: checker/checker.go:6518 getIterationTypesOfMethod
+    // Go: checker/checker.go:6711 getIterationTypesOfMethod
     pub fn get_iteration_types_of_method(
         &mut self,
         t: TypeId,

@@ -564,7 +564,7 @@ pub struct Scanner<'a> {
     pub(crate) comment_directives: Vec<CommentDirective>,
 }
 
-// Go: scanner/scanner.go:217 defaultScanner
+// Go: scanner/scanner.go:225 defaultScanner
 pub(crate) fn default_scanner<'a>() -> Scanner<'a> {
     // Using a function rather than a global is intentional; this function is
     // inlined as pure code (zeroing + moves), whereas a global requires write
@@ -584,13 +584,13 @@ pub(crate) fn default_scanner<'a>() -> Scanner<'a> {
     }
 }
 
-// Go: scanner/scanner.go:225 NewScanner
+// Go: scanner/scanner.go:232 NewScanner
 pub fn new_scanner<'a>() -> Scanner<'a> {
     default_scanner()
 }
 
 impl<'a> Scanner<'a> {
-    // Go: scanner/scanner.go:230 Reset
+    // Go: scanner/scanner.go:237 Reset
     pub fn reset(&mut self) {
         let number_cache = cleared(std::mem::take(&mut self.number_cache));
         let hex_number_cache = cleared(std::mem::take(&mut self.hex_number_cache));
@@ -602,49 +602,49 @@ impl<'a> Scanner<'a> {
     }
 }
 
-// Go: scanner/scanner.go:240 cleared
+// Go: scanner/scanner.go:247 cleared
 pub(crate) fn cleared<K, V>(mut m: FxHashMap<K, V>) -> FxHashMap<K, V> {
     m.clear();
     m
 }
 
 impl<'a> Scanner<'a> {
-    // Go: scanner/scanner.go:245 Text
+    // Go: scanner/scanner.go:252 Text
     pub fn text(&self) -> &'a str {
         self.text
     }
 
-    // Go: scanner/scanner.go:249 Token
+    // Go: scanner/scanner.go:256 Token
     pub fn token(&self) -> SyntaxKind {
         self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:253 TokenFlags
+    // Go: scanner/scanner.go:260 TokenFlags
     pub fn token_flags(&self) -> TokenFlags {
         self.scanner_state.token_flags
     }
 
-    // Go: scanner/scanner.go:257 TokenFullStart
+    // Go: scanner/scanner.go:264 TokenFullStart
     pub fn token_full_start(&self) -> i32 {
         self.scanner_state.full_start_pos
     }
 
-    // Go: scanner/scanner.go:261 TokenStart
+    // Go: scanner/scanner.go:268 TokenStart
     pub fn token_start(&self) -> i32 {
         self.scanner_state.token_start
     }
 
-    // Go: scanner/scanner.go:265 TokenEnd
+    // Go: scanner/scanner.go:272 TokenEnd
     pub fn token_end(&self) -> i32 {
         self.scanner_state.pos
     }
 
-    // Go: scanner/scanner.go:269 TokenText
+    // Go: scanner/scanner.go:276 TokenText
     pub fn token_text(&self) -> &str {
         &self.text[self.scanner_state.token_start as usize..self.scanner_state.pos as usize]
     }
 
-    // Go: scanner/scanner.go:273 TokenValue
+    // Go: scanner/scanner.go:280 TokenValue
     pub fn token_value(&self) -> &'a str {
         self.scanner_state.token_value
     }
@@ -662,27 +662,27 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token_value = intern_token_value(value);
     }
 
-    // Go: scanner/scanner.go:277 TokenRange
+    // Go: scanner/scanner.go:284 TokenRange
     pub fn token_range(&self) -> TextRange {
         TextRange::new(self.scanner_state.token_start, self.scanner_state.pos)
     }
 
-    // Go: scanner/scanner.go:281 CommentDirectives
+    // Go: scanner/scanner.go:288 CommentDirectives
     pub fn comment_directives(&self) -> &[CommentDirective] {
         &self.comment_directives[..self.scanner_state.comment_directives_len]
     }
 
-    // Go: scanner/scanner.go:285 Mark
+    // Go: scanner/scanner.go:292 Mark
     pub fn mark(&self) -> ScannerState<'a> {
         self.scanner_state
     }
 
-    // Go: scanner/scanner.go:289 Rewind
+    // Go: scanner/scanner.go:296 Rewind
     pub fn rewind(&mut self, state: ScannerState<'a>) {
         self.scanner_state = state;
     }
 
-    // Go: scanner/scanner.go:293 ResetPos
+    // Go: scanner/scanner.go:300 ResetPos
     pub fn reset_pos(&mut self, pos: i32) {
         if pos < 0 {
             panic!("Cannot reset token state to negative position");
@@ -692,7 +692,7 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token_start = pos;
     }
 
-    // Go: scanner/scanner.go:302 ResetTokenState
+    // Go: scanner/scanner.go:309 ResetTokenState
     pub fn reset_token_state(&mut self, pos: i32) {
         self.reset_pos(pos);
         self.scanner_state.token = SyntaxKind::Unknown;
@@ -700,7 +700,7 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token_flags = TokenFlags::NONE;
     }
 
-    // Go: scanner/scanner.go:309 SetSkipJSDocLeadingAsterisks
+    // Go: scanner/scanner.go:316 SetSkipJSDocLeadingAsterisks
     pub fn set_skip_js_doc_leading_asterisks(&mut self, skip: bool) {
         if skip {
             self.scanner_state.skip_js_doc_leading_asterisks += 1;
@@ -709,12 +709,12 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    // Go: scanner/scanner.go:317 SetSkipTrivia
+    // Go: scanner/scanner.go:324 SetSkipTrivia
     pub fn set_skip_trivia(&mut self, skip: bool) {
         self.skip_trivia = skip;
     }
 
-    // Go: scanner/scanner.go:321 HasUnicodeEscape
+    // Go: scanner/scanner.go:328 HasUnicodeEscape
     pub fn has_unicode_escape(&self) -> bool {
         self.scanner_state
             .token_flags
@@ -896,7 +896,7 @@ impl<'a> Scanner<'a> {
         -1
     }
 
-    // Go: scanner/scanner.go:441 charAndSize
+    // Go: scanner/scanner.go:449 charAndSize
     pub(crate) fn char_and_size(&mut self) -> (i32, i32) {
         // Fast path: a single ASCII byte. The vast majority of source bytes are
         // ASCII; handling them here avoids constructing a string slice header and
@@ -934,7 +934,7 @@ impl<'a> Scanner<'a> {
         body.is_ascii().then_some(body.len() as i32)
     }
 
-    // Go: scanner/scanner.go:468 scanASCIIWhile
+    // Go: scanner/scanner.go:464 scanASCIIWhile
     // scanASCIIWhile advances s.pos over the longest run of ASCII bytes for which
     // pred returns true. It stops at end-of-text, the first non-ASCII byte, or the
     // first byte where pred is false.
@@ -967,7 +967,7 @@ impl<'a> Scanner<'a> {
         scan_conflict_marker_trivia(text, self.scanner_state.pos as usize, Some(&mut report)) as i32
     }
 
-    // Go: scanner/scanner.go:481 Scan
+    // Go: scanner/scanner.go:477 Scan
     pub fn scan(&mut self) -> SyntaxKind {
         self.scanner_state.full_start_pos = self.scanner_state.pos;
         self.scanner_state.token_flags = TokenFlags::NONE;
@@ -1585,7 +1585,7 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    // Go: scanner/scanner.go:984 processCommentDirective
+    // Go: scanner/scanner.go:968 processCommentDirective
     pub(crate) fn process_comment_directive(&mut self, start: i32, end: i32, multiline: bool) {
         let text = self.text.as_bytes();
         let start_u = start as usize;
@@ -1636,7 +1636,7 @@ impl<'a> Scanner<'a> {
         self.scanner_state.comment_directives_len = len + 1;
     }
 
-    // Go: scanner/scanner.go:1025 ReScanLessThanToken
+    // Go: scanner/scanner.go:1009 ReScanLessThanToken
     pub fn re_scan_less_than_token(&mut self) -> SyntaxKind {
         if self.scanner_state.token == SyntaxKind::LessThanLessThanToken {
             self.scanner_state.pos = self.scanner_state.token_start + 1;
@@ -1645,7 +1645,7 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:1033 ReScanGreaterThanToken
+    // Go: scanner/scanner.go:1017 ReScanGreaterThanToken
     pub fn re_scan_greater_than_token(&mut self) -> SyntaxKind {
         if self.scanner_state.token == SyntaxKind::GreaterThanToken {
             self.re_scan_greater_than_token_inner();
@@ -1653,7 +1653,7 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:1040 reScanGreaterThanTokenInner
+    // Go: scanner/scanner.go:1024 reScanGreaterThanTokenInner
     pub(crate) fn re_scan_greater_than_token_inner(&mut self) {
         self.scanner_state.pos = self.scanner_state.token_start + 1;
         if self.char() == i32::from(b'>') {
@@ -1679,14 +1679,14 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    // Go: scanner/scanner.go:1064 ReScanTemplateToken
+    // Go: scanner/scanner.go:1048 ReScanTemplateToken
     pub fn re_scan_template_token(&mut self, is_tagged_template: bool) -> SyntaxKind {
         self.scanner_state.pos = self.scanner_state.token_start;
         self.scanner_state.token = self.scan_template_and_set_token_value(!is_tagged_template);
         self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:1070 ReScanAsteriskEqualsToken
+    // Go: scanner/scanner.go:1054 ReScanAsteriskEqualsToken
     pub fn re_scan_asterisk_equals_token(&mut self) -> SyntaxKind {
         if self.scanner_state.token != SyntaxKind::AsteriskEqualsToken {
             panic!("'ReScanAsteriskEqualsToken' should only be called on a '*='");
@@ -1696,7 +1696,7 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:1079 ReScanSlashToken
+    // Go: scanner/scanner.go:1063 ReScanSlashToken
     // PORT: Go takes `reportErrors ...bool` and reads only the first value.
     pub fn re_scan_slash_token(&mut self, report_errors: bool) -> SyntaxKind {
         let should_report_errors = report_errors;

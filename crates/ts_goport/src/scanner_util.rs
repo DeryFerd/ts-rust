@@ -4436,4 +4436,70 @@ mod tests {
             assert_eq!(special_casing_mapping(r), expected, "{r:?}");
         }
     }
+
+    /// In a string value, the 3 bytes of a lone surrogate are one fused unit
+    /// (`GoUnit::Surrogate`, `go_value_from_bytes`), not 3 invalid byte units
+    /// as in source text. Go reads the 3 bytes as 3 runes U+FFFD, counts 3
+    /// bytes in `len` and compares them as bytes (80 < ED < FF). The answers
+    /// come from Go core.go:635 GetSpellingSuggestionForStrings at pin N, run
+    /// on the same Go strings (the Go test `target/continuation-r97-goport/
+    /// followups11/go/spelling_fused_test.go`, run with `go test -overlay`).
+    #[test]
+    fn spelling_suggestion_reads_fused_surrogate_units() {
+        let value = |bytes: &[u8]| go_value_from_bytes(bytes).into_owned();
+        // The value form of "ab" U+D800 "cd" has a fused unit at byte 2.
+        assert_eq!(
+            go_unit_at(&value(b"ab\xed\xa0\x80cd"), 2).0,
+            GoUnit::Surrogate(0xD800)
+        );
+        let fffd3 = "ab\u{FFFD}\u{FFFD}\u{FFFD}cd".as_bytes();
+        // (name, candidates, Go answer), all as Go bytes.
+        let cases: [(&[u8], &[&[u8]], &[u8]); 8] = [
+            // 3 runes U+FFFD on each side: distance 0.
+            (fffd3, &[b"ab\xed\xa0\x80cd"], b"ab\xed\xa0\x80cd"),
+            // A tie with 3 invalid bytes. Go bytes put ED before FF, in both
+            // orders. In `str` order the port form of the unit (marker,
+            // U+10F800) comes after that of FF (marker, U+10F7FF).
+            (
+                fffd3,
+                &[b"ab\xff\xfe\xfdcd", b"ab\xed\xa0\x80cd"],
+                b"ab\xed\xa0\x80cd",
+            ),
+            (
+                fffd3,
+                &[b"ab\xed\xa0\x80cd", b"ab\xff\xfe\xfdcd"],
+                b"ab\xed\xa0\x80cd",
+            ),
+            // Go bytes put 80 before ED.
+            (
+                fffd3,
+                &[b"ab\x80\x81\x82cd", b"ab\xed\xa0\x80cd"],
+                b"ab\x80\x81\x82cd",
+            ),
+            // Go `len` of the unit is 3, as the name has 3 runes. The port
+            // form has 7 bytes, which is over the length limit 2.
+            (
+                "\u{FFFD}\u{FFFD}\u{FFFD}".as_bytes(),
+                &[b"\xed\xa0\x80"],
+                b"\xed\xa0\x80",
+            ),
+            // A fused name: U+DC00 is also 3 runes U+FFFD, distance 0.
+            (
+                b"ab\xed\xa0\x80cd",
+                &[b"ab\xed\xb0\x80cd", b"abXcd"],
+                b"ab\xed\xb0\x80cd",
+            ),
+            // The name itself is not a suggestion: the Go zero value.
+            (b"ab\xed\xa0\x80cd", &[b"ab\xed\xa0\x80cd"], b""),
+            // Go `len` 7 against 4 runes is over the length limit 2.
+            (b"abcd", &[b"ab\xed\xa0\x80cd"], b""),
+        ];
+        for (name, candidates, go) in cases {
+            let answer = get_spelling_suggestion_for_strings(
+                &value(name),
+                candidates.iter().map(|candidate| value(candidate)),
+            );
+            assert_eq!(answer, value(go), "{name:?} {candidates:?}");
+        }
+    }
 }

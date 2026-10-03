@@ -2,7 +2,7 @@
 
 use crate::frontend::prelude::*;
 
-// Go: outputpaths/outputpaths.go:11 OutputPathsHost
+// Go: outputpaths/outputpaths.go:9 OutputPathsHost
 pub trait OutputPathsHost {
     fn common_source_directory(&self) -> String;
     /// #4712: the file extensions of the configured content mappers.
@@ -11,7 +11,7 @@ pub trait OutputPathsHost {
     fn use_case_sensitive_file_names(&self) -> bool;
 }
 
-// Go: outputpaths/outputpaths.go:17 OutputPaths
+// Go: outputpaths/outputpaths.go:16 OutputPaths
 #[derive(Clone, Debug, Default)]
 pub struct OutputPaths {
     js_file_path: String,
@@ -64,7 +64,7 @@ pub struct ForceEmitPaths {
     pub declaration_map: bool,
 }
 
-// Go: outputpaths/outputpaths.go:42 GetOutputPathsFor
+// Go: outputpaths/outputpaths.go:47 GetOutputPathsFor
 pub fn get_output_paths_for(
     source_file: &ParsedSourceFile,
     options: &CompilerOptions,
@@ -135,7 +135,7 @@ pub fn get_output_paths_for_file(
     paths
 }
 
-// Go: outputpaths/outputpaths.go:67 ForEachEmittedFile
+// Go: outputpaths/outputpaths.go:72 ForEachEmittedFile
 pub fn for_each_emitted_file(
     host: &dyn OutputPathsHost,
     options: &CompilerOptions,
@@ -163,7 +163,7 @@ pub fn for_each_emitted_file(
     false
 }
 
-// Go: outputpaths/outputpaths.go:76 GetOutputJSFileName
+// Go: outputpaths/outputpaths.go:81 GetOutputJSFileName
 pub fn get_output_js_file_name(
     input_file_name: &str,
     options: &CompilerOptions,
@@ -200,7 +200,7 @@ fn is_content_mapped_file_name(file_name: &str, host: &dyn OutputPathsHost) -> b
     .is_empty()
 }
 
-// Go: outputpaths/outputpaths.go:91 GetOutputJSFileNameWorker
+// Go: outputpaths/outputpaths.go:101 GetOutputJSFileNameWorker
 pub fn get_output_js_file_name_worker(
     input_file_name: &str,
     options: &CompilerOptions,
@@ -212,7 +212,7 @@ pub fn get_output_js_file_name_worker(
     )
 }
 
-// Go: outputpaths/outputpaths.go:98 GetOutputDeclarationFileNameWorker
+// Go: outputpaths/outputpaths.go:108 GetOutputDeclarationFileNameWorker
 pub fn get_output_declaration_file_name_worker(
     input_file_name: &str,
     options: &CompilerOptions,
@@ -229,7 +229,7 @@ pub fn get_output_declaration_file_name_worker(
     )
 }
 
-// Go: outputpaths/outputpaths.go:109 GetOutputExtension
+// Go: outputpaths/outputpaths.go:116 GetOutputExtension
 pub fn get_output_extension(file_name: &str, jsx: JsxEmit) -> &'static str {
     if file_extension_is(file_name, EXTENSION_JSON) {
         EXTENSION_JSON
@@ -246,7 +246,7 @@ pub fn get_output_extension(file_name: &str, jsx: JsxEmit) -> &'static str {
     }
 }
 
-// Go: outputpaths/outputpaths.go:124 GetDeclarationEmitOutputFilePath
+// Go: outputpaths/outputpaths.go:131 GetDeclarationEmitOutputFilePath
 pub fn get_declaration_emit_output_file_path(
     file: &str,
     options: &CompilerOptions,
@@ -315,7 +315,7 @@ pub fn get_source_file_path_in_new_dir(
     )
 }
 
-// Go: outputpaths/outputpaths.go:155 getOutputPathWithoutChangingExtension
+// Go: outputpaths/outputpaths.go:165 getOutputPathWithoutChangingExtension
 fn get_output_path_without_changing_extension(
     input_file_name: &str,
     output_directory: &str,
@@ -358,7 +358,7 @@ pub fn get_source_file_path_in_new_dir_worker(
     }
 }
 
-// Go: outputpaths/outputpaths.go:177 getOwnEmitOutputFilePath
+// Go: outputpaths/outputpaths.go:183 getOwnEmitOutputFilePath
 fn get_own_emit_output_file_path(
     file_name: &str,
     options: &CompilerOptions,
@@ -381,7 +381,7 @@ fn get_own_emit_output_file_path(
     emit_output_file_path_without_extension + extension
 }
 
-// Go: outputpaths/outputpaths.go:194 GetSourceMapFilePath
+// Go: outputpaths/outputpaths.go:200 GetSourceMapFilePath
 pub fn get_source_map_file_path(js_file_path: &str, options: &CompilerOptions) -> String {
     if options.source_map.is_true() && !options.inline_source_map.is_true() {
         return format!("{js_file_path}.map");
@@ -389,7 +389,7 @@ pub fn get_source_map_file_path(js_file_path: &str, options: &CompilerOptions) -
     String::new()
 }
 
-// Go: outputpaths/outputpaths.go:201 GetBuildInfoFileName
+// Go: outputpaths/outputpaths.go:207 GetBuildInfoFileName
 pub fn get_build_info_file_name(options: &CompilerOptions, opts: &ComparePathsOptions) -> String {
     if !options.is_incremental() && !options.build.is_true() {
         return String::new();

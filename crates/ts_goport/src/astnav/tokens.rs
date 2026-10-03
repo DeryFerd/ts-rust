@@ -12,7 +12,7 @@ use crate::frontend::scanner::Scanner;
 use crate::frontend::scanner::scanner_ls;
 use std::cell::Cell;
 
-// Go: astnav/tokens.go:11 shouldRescanLessThanLessThanToken
+// Go: astnav/tokens.go:12 shouldRescanLessThanLessThanToken
 fn should_rescan_less_than_less_than_token(
     s: &Scanner,
     containing_node: Node,
@@ -21,7 +21,7 @@ fn should_rescan_less_than_less_than_token(
     token == SyntaxKind::LessThanLessThanToken && is_jsx_child(containing_node)
 }
 
-// Go: astnav/tokens.go:15 scanNavigationToken
+// Go: astnav/tokens.go:16 scanNavigationToken
 fn scan_navigation_token(s: &mut Scanner, containing_node: Node) -> SyntaxKind {
     let token = s.token();
     if should_rescan_less_than_less_than_token(s, containing_node, token) {
@@ -30,7 +30,7 @@ fn scan_navigation_token(s: &mut Scanner, containing_node: Node) -> SyntaxKind {
     token
 }
 
-// Go: astnav/tokens.go:23 GetTouchingPropertyName
+// Go: astnav/tokens.go:24 GetTouchingPropertyName
 pub fn get_touching_property_name(source_file: Node, position: i32) -> Node {
     get_token_at_position_unexported(
         source_file,
@@ -44,7 +44,7 @@ pub fn get_touching_property_name(source_file: Node, position: i32) -> Node {
     )
 }
 
-// Go: astnav/tokens.go:29 GetTouchingToken
+// Go: astnav/tokens.go:30 GetTouchingToken
 pub fn get_touching_token(source_file: Node, position: i32) -> Node {
     get_token_at_position_unexported(
         source_file,
@@ -54,7 +54,7 @@ pub fn get_touching_token(source_file: Node, position: i32) -> Node {
     )
 }
 
-// Go: astnav/tokens.go:33 GetTokenAtPosition
+// Go: astnav/tokens.go:34 GetTokenAtPosition
 pub fn get_token_at_position(source_file: Node, position: i32) -> Node {
     get_token_at_position_unexported(
         source_file,
@@ -89,7 +89,7 @@ fn binary_search_node_slice(x: NodeSlice, mut cmp: impl FnMut(i32, Node) -> i32)
 // PORT: Go `getTokenAtPosition` has the same snake name as the exported
 // `GetTokenAtPosition`. The exported one keeps the plain name because other
 // packages call it; this private one gets the `_unexported` suffix.
-// Go: astnav/tokens.go:37 getTokenAtPosition
+// Go: astnav/tokens.go:38 getTokenAtPosition
 fn get_token_at_position_unexported(
     source_file: Node,
     position: i32,
@@ -394,7 +394,7 @@ fn get_token_at_position_unexported(
     }
 }
 
-// Go: astnav/tokens.go:265 getPosition
+// Go: astnav/tokens.go:276 getPosition
 fn get_position(node: Node, source_file: Node, allow_position_in_leading_trivia: bool) -> i32 {
     if allow_position_in_leading_trivia {
         return node.pos();
@@ -402,7 +402,7 @@ fn get_position(node: Node, source_file: Node, allow_position_in_leading_trivia:
     get_token_pos_of_node(node, source_file, true /*includeJSDoc*/)
 }
 
-// Go: astnav/tokens.go:272 findRightmostNode
+// Go: astnav/tokens.go:283 findRightmostNode
 fn find_rightmost_node(node: Node) -> Node {
     let next: Cell<Node> = Cell::new(Node::NIL);
     let mut current = node;
@@ -433,7 +433,7 @@ fn find_rightmost_node(node: Node) -> Node {
     }
 }
 
-// Go: astnav/tokens.go:301 VisitEachChildAndJSDoc
+// Go: astnav/tokens.go:312 VisitEachChildAndJSDoc
 // PORT: Go `func(*ast.Node, *ast.NodeVisitor) *ast.Node` callbacks (nil
 // allowed) are `Option<&dyn Fn>`. Keep callback state in `Cell`/`RefCell`.
 pub fn visit_each_child_and_js_doc<'a>(
@@ -453,14 +453,14 @@ pub fn visit_each_child_and_js_doc<'a>(
     node.visit_each_child(&mut visitor);
 }
 
-// Go: astnav/tokens.go:319 comparisonLessThan
+// Go: astnav/tokens.go:330 comparisonLessThan
 const COMPARISON_LESS_THAN: i32 = -1;
-// Go: astnav/tokens.go:320 comparisonEqualTo
+// Go: astnav/tokens.go:331 comparisonEqualTo
 const COMPARISON_EQUAL_TO: i32 = 0;
-// Go: astnav/tokens.go:321 comparisonGreaterThan
+// Go: astnav/tokens.go:332 comparisonGreaterThan
 const COMPARISON_GREATER_THAN: i32 = 1;
 
-// Go: astnav/tokens.go:328 FindPrecedingToken
+// Go: astnav/tokens.go:339 FindPrecedingToken
 /// Finds the leftmost token satisfying `position < token.End()`.
 /// If the leftmost token satisfying `position < token.End()` is invalid, or if position
 /// is in the trivia of that leftmost token,
@@ -469,7 +469,7 @@ pub fn find_preceding_token(source_file: Node, position: i32) -> Node {
     find_preceding_token_ex(source_file, position, Node::NIL, false)
 }
 
-// Go: astnav/tokens.go:332 FindPrecedingTokenEx
+// Go: astnav/tokens.go:343 FindPrecedingTokenEx
 pub fn find_preceding_token_ex(
     source_file: Node,
     position: i32,
@@ -637,7 +637,7 @@ pub fn find_preceding_token_ex(
     result
 }
 
-// Go: astnav/tokens.go:454 isValidPrecedingNode
+// Go: astnav/tokens.go:465 isValidPrecedingNode
 fn is_valid_preceding_node(node: Node, source_file: Node) -> bool {
     if node.kind() == SyntaxKind::EndOfFile {
         return node.js_doc(source_file).len() > 0;
@@ -647,12 +647,12 @@ fn is_valid_preceding_node(node: Node, source_file: Node) -> bool {
     !(is_whitespace_only_jsx_text(node) || width == 0)
 }
 
-// Go: astnav/tokens.go:463 GetStartOfNode
+// Go: astnav/tokens.go:474 GetStartOfNode
 pub fn get_start_of_node(node: Node, file: Node, include_js_doc: bool) -> i32 {
     get_token_pos_of_node(node, file, include_js_doc)
 }
 
-// Go: astnav/tokens.go:469 findRightmostValidToken
+// Go: astnav/tokens.go:480 findRightmostValidToken
 /// Looks for rightmost valid token in the range [startPos, endPos).
 /// If position is >= 0, looks for rightmost valid token that precedes or touches that position.
 fn find_rightmost_valid_token(
@@ -850,7 +850,7 @@ fn find_rightmost_valid_token(
     )
 }
 
-// Go: astnav/tokens.go:611 FindNextToken
+// Go: astnav/tokens.go:622 FindNextToken
 pub fn find_next_token(previous_token: Node, parent: Node, file: Node) -> Node {
     // Go: the recursive closure `find` (tokens.go:613).
     fn find(n: Node, previous_token: Node, file: Node) -> Node {
@@ -939,7 +939,7 @@ pub fn find_next_token(previous_token: Node, parent: Node, file: Node) -> Node {
     find(parent, previous_token, file)
 }
 
-// Go: astnav/tokens.go:680 getNodeVisitor
+// Go: astnav/tokens.go:691 getNodeVisitor
 // PORT: Go `ast.NewNodeVisitor(core.Identity, nil, hooks)`: the visit
 // callback is the identity and the factory is the visitor's default one.
 fn get_node_visitor<'a>(
@@ -998,7 +998,7 @@ fn get_node_visitor<'a>(
     )
 }
 
-// Go: astnav/tokens.go:717 shouldSkipChild
+// Go: astnav/tokens.go:728 shouldSkipChild
 fn should_skip_child(node: Node) -> bool {
     node.kind() == SyntaxKind::JsDoc
         || node.kind() == SyntaxKind::JsDocText
@@ -1008,7 +1008,7 @@ fn should_skip_child(node: Node) -> bool {
         || is_js_doc_tag(node)
 }
 
-// Go: astnav/tokens.go:728 FindChildOfKind
+// Go: astnav/tokens.go:739 FindChildOfKind
 /// FindChildOfKind searches for a child node or token of the specified kind within a containing node.
 /// This function scans through both AST nodes and intervening tokens to find the first match.
 pub fn find_child_of_kind(containing_node: Node, kind: SyntaxKind, source_file: Node) -> Node {

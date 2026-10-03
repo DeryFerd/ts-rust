@@ -49,7 +49,7 @@ const FOR_AWAIT_HIERARCHY_FACTS_ITERATION_STATEMENT_INCLUDES: ForAwaitHierarchyF
 const FOR_AWAIT_HIERARCHY_FACTS_ITERATION_STATEMENT_EXCLUDES: ForAwaitHierarchyFacts =
     FOR_AWAIT_HIERARCHY_FACTS_NONE;
 
-// Go: transformers/estransforms/forawait.go:44 forawaitTransformer
+// Go: transformers/estransforms/forawait.go:43 forawaitTransformer
 pub struct ForawaitTransformer {
     emit_context: Rc<EmitContext>,
     /// Go embedded `superAccessState`.
@@ -441,7 +441,7 @@ impl ForawaitTransformer {
         block
     }
 
-    // Go: transformers/estransforms/forawait.go:374 forawaitTransformer.createDownlevelAwait
+    // Go: transformers/estransforms/forawait.go:376 forawaitTransformer.createDownlevelAwait
     fn create_downlevel_await(&self, expression: Node) -> Node {
         let f = self.emit_context.factory();
         if self.is_generator() {
@@ -453,7 +453,7 @@ impl ForawaitTransformer {
         f.new_await_expression(expression)
     }
 
-    // Go: transformers/estransforms/forawait.go:384 forawaitTransformer.transformForAwaitOfStatement
+    // Go: transformers/estransforms/forawait.go:386 forawaitTransformer.transformForAwaitOfStatement
     fn transform_for_await_of_statement(
         &mut self,
         node: Node,
@@ -643,7 +643,7 @@ impl ForawaitTransformer {
         f.new_try_statement(try_block, catch_clause, finally_block)
     }
 
-    // Go: transformers/estransforms/forawait.go:512 forawaitTransformer.visitConstructorDeclaration
+    // Go: transformers/estransforms/forawait.go:531 forawaitTransformer.visitConstructorDeclaration
     fn visit_constructor_declaration(&mut self, node: Node) -> Node {
         let saved_enclosing_function_flags = self.enclosing_function_flags;
         self.enclosing_function_flags = get_function_flags(node);
@@ -662,7 +662,7 @@ impl ForawaitTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/forawait.go:529 forawaitTransformer.visitGetAccessorDeclaration
+    // Go: transformers/estransforms/forawait.go:548 forawaitTransformer.visitGetAccessorDeclaration
     fn visit_get_accessor_declaration(&mut self, node: Node) -> Node {
         let saved_enclosing_function_flags = self.enclosing_function_flags;
         self.enclosing_function_flags = get_function_flags(node);
@@ -683,7 +683,7 @@ impl ForawaitTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/forawait.go:547 forawaitTransformer.visitSetAccessorDeclaration
+    // Go: transformers/estransforms/forawait.go:566 forawaitTransformer.visitSetAccessorDeclaration
     fn visit_set_accessor_declaration(&mut self, node: Node) -> Node {
         let saved_enclosing_function_flags = self.enclosing_function_flags;
         self.enclosing_function_flags = get_function_flags(node);
@@ -734,7 +734,7 @@ impl ForawaitTransformer {
         (modifiers, asterisk_token, parameters, body)
     }
 
-    // Go: transformers/estransforms/forawait.go:565 forawaitTransformer.visitMethodDeclaration
+    // Go: transformers/estransforms/forawait.go:584 forawaitTransformer.visitMethodDeclaration
     fn visit_method_declaration(&mut self, node: Node) -> Node {
         let saved_enclosing_function_flags = self.enclosing_function_flags;
         self.enclosing_function_flags = get_function_flags(node);
@@ -759,7 +759,7 @@ impl ForawaitTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/forawait.go:607 forawaitTransformer.visitFunctionDeclaration
+    // Go: transformers/estransforms/forawait.go:629 forawaitTransformer.visitFunctionDeclaration
     fn visit_function_declaration(&mut self, node: Node) -> Node {
         let saved_enclosing_function_flags = self.enclosing_function_flags;
         self.enclosing_function_flags = get_function_flags(node);
@@ -782,7 +782,7 @@ impl ForawaitTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/forawait.go:648 forawaitTransformer.visitArrowFunction
+    // Go: transformers/estransforms/forawait.go:673 forawaitTransformer.visitArrowFunction
     fn visit_arrow_function(&mut self, node: Node) -> Node {
         let saved_enclosing_function_flags = self.enclosing_function_flags;
         self.enclosing_function_flags = get_function_flags(node);
@@ -802,7 +802,7 @@ impl ForawaitTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/forawait.go:666 forawaitTransformer.visitFunctionExpression
+    // Go: transformers/estransforms/forawait.go:691 forawaitTransformer.visitFunctionExpression
     fn visit_function_expression(&mut self, node: Node) -> Node {
         let saved_enclosing_function_flags = self.enclosing_function_flags;
         self.enclosing_function_flags = get_function_flags(node);
@@ -825,7 +825,7 @@ impl ForawaitTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/forawait.go:707 forawaitTransformer.transformAsyncGeneratorFunctionParameterList
+    // Go: transformers/estransforms/forawait.go:735 forawaitTransformer.transformAsyncGeneratorFunctionParameterList
     fn transform_async_generator_function_parameter_list(&mut self, node: Node) -> NodeList {
         if is_simple_parameter_list(&node.parameters().to_vec()) {
             return self.visit_parameters(node.parameter_list());
@@ -850,7 +850,7 @@ impl ForawaitTransformer {
         f.new_node_list_with_loc(&new_parameters, node.parameter_list().loc())
     }
 
-    // Go: transformers/estransforms/forawait.go:733 forawaitTransformer.transformAsyncGeneratorFunctionBody
+    // Go: transformers/estransforms/forawait.go:761 forawaitTransformer.transformAsyncGeneratorFunctionBody
     fn transform_async_generator_function_body(&mut self, node: Node) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -958,7 +958,7 @@ impl ForawaitTransformer {
     }
 }
 
-// Go: transformers/estransforms/forawait.go:307 unwrapInnermostStatementOfLabel
+// Go: transformers/estransforms/forawait.go:308 unwrapInnermostStatementOfLabel
 /// unwrapInnermostStatementOfLabel follows LabeledStatement chains to find the innermost statement.
 fn unwrap_innermost_statement_of_label(mut node: Node) -> Node {
     loop {

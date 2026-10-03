@@ -42,7 +42,7 @@ impl JSONValueType {
     }
 }
 
-// Go: packagejson/jsonvalue.go:40 JSONValue
+// Go: packagejson/jsonvalue.go:41 JSONValue
 // PORT: Go keeps `Type` plus `Value any`. The Rust enum holds both.
 // `ExportsOrImports` is the same tree (see below).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -99,22 +99,22 @@ impl JSONValue {
         }
     }
 
-    // Go: packagejson/exportsorimports.go:44 IsSubpaths
+    // Go: packagejson/exportsorimports.go:43 IsSubpaths
     pub fn is_subpaths(&self) -> bool {
         self.object_kind() == ObjectKind::Subpaths
     }
 
-    // Go: packagejson/exportsorimports.go:49 IsImports
+    // Go: packagejson/exportsorimports.go:48 IsImports
     pub fn is_imports(&self) -> bool {
         self.object_kind() == ObjectKind::Imports
     }
 
-    // Go: packagejson/exportsorimports.go:54 IsConditions
+    // Go: packagejson/exportsorimports.go:53 IsConditions
     pub fn is_conditions(&self) -> bool {
         self.object_kind() == ObjectKind::Conditions
     }
 
-    // Go: packagejson/exportsorimports.go:59 initObjectKind
+    // Go: packagejson/exportsorimports.go:58 initObjectKind
     // PORT: Go caches the kind on a copy of the value, so it is computed on
     // every call there too.
     fn object_kind(&self) -> ObjectKind {
@@ -212,7 +212,7 @@ impl Fields {
     }
 }
 
-// Go: packagejson/packagejson.go:116 Parse
+// Go: packagejson/packagejson.go:127 Parse
 // PORT: `data` is the file's Go bytes. Go fails on invalid UTF-8 in a
 // string. Each string value is in the port form (see
 // `scanner_util::GO_STRING_MARKER`).
@@ -384,7 +384,7 @@ impl VersionPaths {
     }
 }
 
-// Go: packagejson/cache.go:124 InfoCacheEntry
+// Go: packagejson/cache.go:123 InfoCacheEntry
 #[derive(Debug, Default)]
 pub struct InfoCacheEntry {
     pub package_directory: String,
@@ -398,12 +398,12 @@ impl InfoCacheEntry {
         self.contents.is_some()
     }
 
-    // Go: packagejson/cache.go:134 GetContents
+    // Go: packagejson/cache.go:133 GetContents
     pub fn get_contents(&self) -> Option<&PackageJson> {
         self.contents.as_ref()
     }
 
-    // Go: packagejson/cache.go:141 GetDirectory
+    // Go: packagejson/cache.go:140 GetDirectory
     pub fn get_directory(&self) -> &str {
         &self.package_directory
     }

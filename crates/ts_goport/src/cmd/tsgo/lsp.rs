@@ -187,7 +187,7 @@ pub fn start_parent_process_watchdog(ctx: &Context, stop: &CancelFunc, parent_pi
         });
 }
 
-// Go: vfs/osvfs/os.go:224 GetGlobalTypingsCacheLocation
+// Go: vfs/osvfs/os.go:193 GetGlobalTypingsCacheLocation
 // PORT: ported here; `vfs/osvfs` is an accepted compiler file.
 pub fn get_global_typings_cache_location() -> String {
     let cache_dir = match user_cache_dir() {

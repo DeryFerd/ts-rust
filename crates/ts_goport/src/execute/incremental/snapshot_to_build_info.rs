@@ -73,7 +73,7 @@ pub fn snapshot_to_build_info(
     Ok(to.build_info)
 }
 
-// Go: incremental/snapshottobuildinfo.go:57 toBuildInfo
+// Go: incremental/snapshottobuildinfo.go:64 toBuildInfo
 // PORT: Go `roots map[*ast.SourceFile]tspath.Path` is an `FxIndexMap`; Go
 // sorts its keys before use.
 struct ToBuildInfo<'a> {
@@ -89,7 +89,7 @@ struct ToBuildInfo<'a> {
 }
 
 impl ToBuildInfo<'_> {
-    // Go: incremental/snapshottobuildinfo.go:68 relativeToBuildInfo
+    // Go: incremental/snapshottobuildinfo.go:75 relativeToBuildInfo
     fn relative_to_build_info(&self, path: &str) -> String {
         ensure_path_is_non_module_name(&get_relative_path_from_directory(
             &self.build_info_directory,
@@ -98,7 +98,7 @@ impl ToBuildInfo<'_> {
         ))
     }
 
-    // Go: incremental/snapshottobuildinfo.go:72 toFileId
+    // Go: incremental/snapshottobuildinfo.go:79 toFileId
     fn to_file_id(&mut self, path: &Path) -> BuildInfoFileId {
         let mut file_id = self
             .file_name_to_file_id
@@ -118,7 +118,7 @@ impl ToBuildInfo<'_> {
         file_id
     }
 
-    // Go: incremental/snapshottobuildinfo.go:86 toFileIdListId
+    // Go: incremental/snapshottobuildinfo.go:93 toFileIdListId
     fn to_file_id_list_id(&mut self, set: &FxIndexSet<Path>) -> BuildInfoFileIdListId {
         let mut file_ids: Vec<BuildInfoFileId> =
             set.iter().map(|path| self.to_file_id(path)).collect();
@@ -139,7 +139,7 @@ impl ToBuildInfo<'_> {
         file_id_list_id
     }
 
-    // Go: incremental/snapshottobuildinfo.go:103 toRelativeToBuildInfoCompilerOptionValue
+    // Go: incremental/snapshottobuildinfo.go:109 toRelativeToBuildInfoCompilerOptionValue
     fn to_relative_to_build_info_compiler_option_value(
         &self,
         option: &CommandLineOption,
@@ -168,7 +168,7 @@ impl ToBuildInfo<'_> {
         v
     }
 
-    // Go: incremental/snapshottobuildinfo.go:118 toBuildInfoDiagnosticsFromFileNameDiagnostics
+    // Go: incremental/snapshottobuildinfo.go:124 toBuildInfoDiagnosticsFromFileNameDiagnostics
     fn to_build_info_diagnostics_from_file_name_diagnostics(
         &mut self,
         diagnostics: &[BuildInfoDiagnosticWithFileName],
@@ -208,7 +208,7 @@ impl ToBuildInfo<'_> {
             .collect()
     }
 
-    // Go: incremental/snapshottobuildinfo.go:143 toBuildInfoDiagnosticsFromDiagnostics
+    // Go: incremental/snapshottobuildinfo.go:151 toBuildInfoDiagnosticsFromDiagnostics
     fn to_build_info_diagnostics_from_diagnostics(
         &mut self,
         file_path: &Path,
@@ -258,7 +258,7 @@ impl ToBuildInfo<'_> {
             .collect()
     }
 
-    // Go: incremental/snapshottobuildinfo.go:183 toBuildInfoDiagnosticsOfFile
+    // Go: incremental/snapshottobuildinfo.go:193 toBuildInfoDiagnosticsOfFile
     fn to_build_info_diagnostics_of_file(
         &mut self,
         file_path: &Path,
@@ -282,7 +282,7 @@ impl ToBuildInfo<'_> {
         None
     }
 
-    // Go: incremental/snapshottobuildinfo.go:199 collectRootFiles
+    // Go: incremental/snapshottobuildinfo.go:209 collectRootFiles
     fn collect_root_files(&mut self) {
         for file_name in command_line().file_names() {
             let redirect = get_parse_file_redirect(file_name);
@@ -304,7 +304,7 @@ impl ToBuildInfo<'_> {
         }
     }
 
-    // Go: incremental/snapshottobuildinfo.go:213 setFileInfoAndEmitSignatures
+    // Go: incremental/snapshottobuildinfo.go:223 setFileInfoAndEmitSignatures
     fn set_file_info_and_emit_signatures(&mut self) {
         let snapshot = self.snapshot;
         let mut file_infos = Vec::new();
@@ -387,7 +387,7 @@ impl ToBuildInfo<'_> {
         self.build_info.file_infos = Some(file_infos);
     }
 
-    // Go: incremental/snapshottobuildinfo.go:246 setRootOfIncrementalProgram
+    // Go: incremental/snapshottobuildinfo.go:259 setRootOfIncrementalProgram
     fn set_root_of_incremental_program(&mut self) {
         let mut keys: Vec<(Node, BuildInfoFileId)> = Vec::with_capacity(self.roots.len());
         let files: Vec<Node> = self.roots.keys().copied().collect();
@@ -434,7 +434,7 @@ impl ToBuildInfo<'_> {
         }
     }
 
-    // Go: incremental/snapshottobuildinfo.go:278 setCompilerOptions
+    // Go: incremental/snapshottobuildinfo.go:291 setCompilerOptions
     // PORT: Go tests each option field with `reflect.Value.IsZero`; see
     // `is_zero_compiler_option_value`.
     fn set_compiler_options(&mut self) {
@@ -462,7 +462,7 @@ impl ToBuildInfo<'_> {
         }
     }
 
-    // Go: incremental/snapshottobuildinfo.go:297 setReferencedMap
+    // Go: incremental/snapshottobuildinfo.go:311 setReferencedMap
     fn set_referenced_map(&mut self) {
         let snapshot = self.snapshot;
         let mut keys = snapshot.referenced_map.get_paths_with_references();
@@ -484,7 +484,7 @@ impl ToBuildInfo<'_> {
         self.build_info.referenced_map = non_empty(entries);
     }
 
-    // Go: incremental/snapshottobuildinfo.go:309 setChangeFileSet
+    // Go: incremental/snapshottobuildinfo.go:323 setChangeFileSet
     fn set_change_file_set(&mut self) {
         let mut files: Vec<Path> = self.snapshot.changed_files_set.iter().cloned().collect();
         stable_sort_by(&mut files, |a, b| compare_go_bytes(a.as_str(), b.as_str()));
@@ -492,7 +492,7 @@ impl ToBuildInfo<'_> {
         self.build_info.change_file_set = non_empty(ids);
     }
 
-    // Go: incremental/snapshottobuildinfo.go:315 setSemanticDiagnostics
+    // Go: incremental/snapshottobuildinfo.go:329 setSemanticDiagnostics
     fn set_semantic_diagnostics(&mut self) {
         let snapshot = self.snapshot;
         for file in source_files() {
@@ -526,7 +526,7 @@ impl ToBuildInfo<'_> {
         }
     }
 
-    // Go: incremental/snapshottobuildinfo.go:339 setEmitDiagnostics
+    // Go: incremental/snapshottobuildinfo.go:349 setEmitDiagnostics
     // PORT: Go `core.Map` keeps a nil entry for a file whose cached lists are
     // both empty. It marshals as `null` (`BuildInfoDiagnosticsOfFilePtr`).
     fn set_emit_diagnostics(&mut self) {
@@ -543,7 +543,7 @@ impl ToBuildInfo<'_> {
         self.build_info.emit_diagnostics_per_file = non_empty(entries);
     }
 
-    // Go: incremental/snapshottobuildinfo.go:344 setAffectedFilesPendingEmit
+    // Go: incremental/snapshottobuildinfo.go:358 setAffectedFilesPendingEmit
     fn set_affected_files_pending_emit(&mut self) {
         let snapshot = self.snapshot;
         let mut files: Vec<Path> = snapshot
@@ -574,7 +574,7 @@ impl ToBuildInfo<'_> {
         }
     }
 
-    // Go: incremental/snapshottobuildinfo.go:363 setRootOfNonIncrementalProgram
+    // Go: incremental/snapshottobuildinfo.go:375 setRootOfNonIncrementalProgram
     fn set_root_of_non_incremental_program(&mut self) {
         let roots = command_line()
             .file_names()
@@ -591,7 +591,7 @@ impl ToBuildInfo<'_> {
         self.build_info.root = Some(roots);
     }
 
-    // Go: incremental/snapshottobuildinfo.go:374 setPackageJsons
+    // Go: incremental/snapshottobuildinfo.go:383 setPackageJsons
     fn set_package_jsons(&mut self) {
         let snapshot = self.snapshot;
         if let Some(package_jsons) = &snapshot.package_jsons
@@ -615,7 +615,7 @@ impl ToBuildInfo<'_> {
     }
 }
 
-// Go: incremental/snapshottobuildinfo.go:165 toBuildInfoRepopulateInfo
+// Go: incremental/snapshottobuildinfo.go:181 toBuildInfoRepopulateInfo
 #[must_use]
 pub fn to_build_info_repopulate_info(
     info: Option<&RepopulateDiagnosticInfo>,

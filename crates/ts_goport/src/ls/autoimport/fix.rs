@@ -76,7 +76,7 @@ pub struct AddToExistingImportFix {
 }
 
 impl Fix {
-    // Go: ls/autoimport/fix.go:53 Edits
+    // Go: ls/autoimport/fix.go:56 Edits
     // Edits produces the text edits and a human-readable description for the fix. The returned bool is false
     // when the fix targets a content-mapped file and any edit could not be placed within a single verbatim
     // span, meaning it cannot be safely applied to the original text and the caller should discard it.
@@ -268,7 +268,7 @@ fn file_edits(tracker: &mut change::Tracker, file: Node) -> (Vec<lsproto::TextEd
     (edits, unmappable.is_empty())
 }
 
-// Go: ls/autoimport/fix.go:121 addImportType
+// Go: ls/autoimport/fix.go:138 addImportType
 pub fn add_import_type(
     f: &Fix,
     file: Node,
@@ -296,7 +296,7 @@ pub fn add_import_type(
     )
 }
 
-// Go: ls/autoimport/fix.go:135 addNamespaceQualifier
+// Go: ls/autoimport/fix.go:152 addNamespaceQualifier
 pub fn add_namespace_qualifier(
     f: &Fix,
     tracker: &mut change::Tracker,
@@ -312,7 +312,7 @@ pub fn add_namespace_qualifier(
     crate::diagnostics_loc::message_localize(diag::Change_0_to_1, locale, &args![f.name, qualified])
 }
 
-// Go: ls/autoimport/fix.go:144 getAddToExistingImportFix
+// Go: ls/autoimport/fix.go:161 getAddToExistingImportFix
 pub fn get_add_to_existing_import_fix(file: Node, fix: &Fix) -> AddToExistingImportFix {
     if fix.kind != lsproto::AutoImportFixKind::ADD_TO_EXISTING {
         crate::core::go_panic("expected add to existing import fix".to_string());
@@ -377,7 +377,7 @@ pub fn get_add_to_existing_import_fix(file: Node, fix: &Fix) -> AddToExistingImp
     }
 }
 
-// Go: ls/autoimport/fix.go:181 addToExistingImport
+// Go: ls/autoimport/fix.go:198 addToExistingImport
 pub fn add_to_existing_import(
     ct: &mut change::Tracker,
     file: Node,
@@ -560,7 +560,7 @@ pub fn add_to_existing_import(
     }
 }
 
-// Go: ls/autoimport/fix.go:304 getTypeKeywordOfTypeOnlyImport
+// Go: ls/autoimport/fix.go:321 getTypeKeywordOfTypeOnlyImport
 fn get_type_keyword_of_type_only_import(import_clause: Node, source_file: Node) -> Node {
     debug_assert!(
         import_clause.is_type_only(),
@@ -578,7 +578,7 @@ fn get_type_keyword_of_type_only_import(import_clause: Node, source_file: Node) 
     type_keyword
 }
 
-// Go: ls/autoimport/fix.go:314 addElementToBindingPattern
+// Go: ls/autoimport/fix.go:331 addElementToBindingPattern
 // PORT: Go `core.IfElse` evaluates both arguments, so the property name
 // identifier is made even when `propertyName` is empty (and then unused).
 // Go passes that identifier as the binding element's initializer.
@@ -614,7 +614,7 @@ fn add_element_to_binding_pattern(
     }
 }
 
-// Go: ls/autoimport/fix.go:329 getNewImports
+// Go: ls/autoimport/fix.go:346 getNewImports
 pub fn get_new_imports(
     ct: &mut change::Tracker,
     module_specifier: &str,
@@ -733,7 +733,7 @@ pub fn get_new_imports(
     statements
 }
 
-// Go: ls/autoimport/fix.go:398 getNewRequires
+// Go: ls/autoimport/fix.go:415 getNewRequires
 // PORT: Go does not read `compilerOptions`.
 pub fn get_new_requires(
     change_tracker: &mut change::Tracker,
@@ -815,7 +815,7 @@ pub fn get_new_requires(
     statements
 }
 
-// Go: ls/autoimport/fix.go:463 createConstEqualsRequireDeclaration
+// Go: ls/autoimport/fix.go:480 createConstEqualsRequireDeclaration
 fn create_const_equals_require_declaration(
     change_tracker: &mut change::Tracker,
     name: Node,
@@ -842,7 +842,7 @@ fn create_const_equals_require_declaration(
     factory.new_variable_statement(/*modifiers*/ ModifierList::NIL, declaration_list)
 }
 
-// Go: ls/autoimport/fix.go:486 insertImports
+// Go: ls/autoimport/fix.go:503 insertImports
 // PORT: Go `comparer` is a func value that is never nil here
 // (`detectCaseSensitivityBySort` falls back to the first comparer); a nil
 // value panics when called, as in Go.
@@ -918,7 +918,7 @@ pub fn insert_imports(
     }
 }
 
-// Go: ls/autoimport/fix.go:525 makeImport
+// Go: ls/autoimport/fix.go:542 makeImport
 fn make_import(
     ct: &mut change::Tracker,
     default_import: Node,
@@ -978,7 +978,7 @@ fn unicode_to_upper(c: char) -> char {
 }
 
 impl View {
-    // Go: ls/autoimport/fix.go:537 GetFixes
+    // Go: ls/autoimport/fix.go:554 GetFixes
     // PORT: `ch` is the request checker (see the file header). Go
     // `usagePosition *lsproto.Position` is `Option<lsproto::Position>`.
     pub fn get_fixes(
@@ -1079,7 +1079,7 @@ impl View {
     }
 }
 
-// Go: ls/autoimport/fix.go:606 getAddAsTypeOnly
+// Go: ls/autoimport/fix.go:623 getAddAsTypeOnly
 // getAddAsTypeOnly determines if an import should be type-only based on usage context
 fn get_add_as_type_only(
     is_valid_type_only_use_site: bool,
@@ -1101,7 +1101,7 @@ fn get_add_as_type_only(
 }
 
 impl View {
-    // Go: ls/autoimport/fix.go:619 tryUseExistingNamespaceImport
+    // Go: ls/autoimport/fix.go:636 tryUseExistingNamespaceImport
     pub fn try_use_existing_namespace_import(
         &self,
         ch: &mut Checker,
@@ -1152,7 +1152,7 @@ impl View {
     }
 }
 
-// Go: ls/autoimport/fix.go:652 getNamespaceLikeImportText
+// Go: ls/autoimport/fix.go:669 getNamespaceLikeImportText
 fn get_namespace_like_import_text(declaration: Node) -> String {
     match declaration.kind() {
         SyntaxKind::VariableDeclaration => {
@@ -1178,7 +1178,7 @@ fn get_namespace_like_import_text(declaration: Node) -> String {
 }
 
 impl View {
-    // Go: ls/autoimport/fix.go:673 tryAddToExistingImport
+    // Go: ls/autoimport/fix.go:690 tryAddToExistingImport
     pub fn try_add_to_existing_import(
         &self,
         ch: &mut Checker,
@@ -1319,7 +1319,7 @@ impl View {
     }
 }
 
-// Go: ls/autoimport/fix.go:797 GetImportKindForImportStatement
+// Go: ls/autoimport/fix.go:796 GetImportKindForImportStatement
 // The completions of an import statement (`import F|`) call this. It always
 // writes an `import` keyword, so an `export =` module in a JS file without an
 // external module indicator gives a default import, not `require`.
@@ -1336,7 +1336,7 @@ pub fn get_import_kind_for_import_statement(
     )
 }
 
-// Go: ls/autoimport/fix.go:801 getImportKind
+// Go: ls/autoimport/fix.go:800 getImportKind
 // PORT: Go `fallthrough` from the Named case into the Modifier case is the
 // shared `NAMED` result.
 fn get_import_kind(
@@ -1400,7 +1400,7 @@ fn get_import_kind(
     }
 }
 
-// Go: ls/autoimport/fix.go:820 existingImport
+// Go: ls/autoimport/fix.go:840 existingImport
 #[derive(Clone, Debug, Default)]
 pub struct ExistingImport {
     pub node: Node,
@@ -1409,7 +1409,7 @@ pub struct ExistingImport {
 }
 
 impl View {
-    // Go: ls/autoimport/fix.go:826 getExistingImports
+    // Go: ls/autoimport/fix.go:846 getExistingImports
     // PORT: `ch` is Go `v.checker`, passed by the caller (see the file
     // header). Go `collections.MultiMap` is
     // `IndexMap<ModuleID, Vec<ExistingImport>>`.
@@ -1475,7 +1475,7 @@ impl View {
         result
     }
 
-    // Go: ls/autoimport/fix.go:857 shouldUseRequire
+    // Go: ls/autoimport/fix.go:875 shouldUseRequire
     pub fn should_use_require(&self) -> bool {
         if let Some(should_use_require_for_fixes) = self.should_use_require_for_fixes.get() {
             return should_use_require_for_fixes;
@@ -1487,7 +1487,7 @@ impl View {
     }
 }
 
-// Go: ls/autoimport/fix.go:867 fileSyntaxKind
+// Go: ls/autoimport/fix.go:885 fileSyntaxKind
 // fileSyntaxKind represents the detected module syntax of a source file.
 go_enum!(FileSyntaxKind, i32 {
     AMBIGUOUS = 0; // fileSyntaxKindAmbiguous
@@ -1495,7 +1495,7 @@ go_enum!(FileSyntaxKind, i32 {
     CJS = 2; // fileSyntaxKindCJS
 });
 
-// Go: ls/autoimport/fix.go:879 detectSyntax
+// Go: ls/autoimport/fix.go:897 detectSyntax
 // detectSyntax returns whether a source file has unambiguous ESM or CJS syntax.
 // When moduleDetection is "force", ExternalModuleIndicator may be set to the
 // source file node itself rather than a genuine syntax indicator, so we fall back
@@ -1511,7 +1511,7 @@ fn detect_syntax(file: Node, options: &CompilerOptions) -> FileSyntaxKind {
     }
 }
 
-// Go: ls/autoimport/fix.go:895 detectSyntaxIndicators
+// Go: ls/autoimport/fix.go:913 detectSyntaxIndicators
 // detectSyntaxIndicators checks whether a source file contains genuine ESM
 // and/or CJS syntax. Under moduleDetection "force", the cached
 // ExternalModuleIndicator may be the source file itself rather than a real
@@ -1558,7 +1558,7 @@ fn detect_syntax_indicators(file: Node, options: &CompilerOptions) -> (bool, boo
 }
 
 impl View {
-    // Go: ls/autoimport/fix.go:929 computeShouldUseRequire
+    // Go: ls/autoimport/fix.go:947 computeShouldUseRequire
     // PORT: Go `v.program.GetSourceFiles()` gives `*ast.SourceFile` values;
     // here they are `ParsedSourceFile`s and the node is `file.root`.
     pub fn compute_should_use_require(&self) -> bool {
@@ -1612,12 +1612,12 @@ impl View {
     }
 }
 
-// Go: ls/autoimport/fix.go:975 needsTypeOnly
+// Go: ls/autoimport/fix.go:993 needsTypeOnly
 fn needs_type_only(add_as_type_only: lsproto::AddAsTypeOnly) -> bool {
     add_as_type_only == lsproto::AddAsTypeOnly::REQUIRED
 }
 
-// Go: ls/autoimport/fix.go:979 shouldUseTypeOnly
+// Go: ls/autoimport/fix.go:997 shouldUseTypeOnly
 fn should_use_type_only(
     add_as_type_only: lsproto::AddAsTypeOnly,
     preferences: &lsutil::UserPreferences,
@@ -1628,7 +1628,7 @@ fn should_use_type_only(
 }
 
 impl View {
-    // Go: ls/autoimport/fix.go:987 CompareFixesForSorting
+    // Go: ls/autoimport/fix.go:1005 CompareFixesForSorting
     // CompareFixesForSorting returns negative if `a` is better than `b`.
     // Sorting with this comparator will place the best fix first.
     // After rank sorting, fixes will be sorted by arbitrary but stable criteria
@@ -1641,7 +1641,7 @@ impl View {
         self.compare_module_specifiers_for_sorting(a, b)
     }
 
-    // Go: ls/autoimport/fix.go:997 CompareFixesForRanking
+    // Go: ls/autoimport/fix.go:1015 CompareFixesForRanking
     // CompareFixesForRanking returns negative if `a` is better than `b`.
     // Sorting with this comparator will place the best fix first.
     // Fixes of equal desirability will be considered equal.
@@ -1654,13 +1654,13 @@ impl View {
     }
 }
 
-// Go: ls/autoimport/fix.go:1004 compareFixKinds
+// Go: ls/autoimport/fix.go:1022 compareFixKinds
 fn compare_fix_kinds(a: lsproto::AutoImportFixKind, b: lsproto::AutoImportFixKind) -> i32 {
     a.0 - b.0
 }
 
 impl View {
-    // Go: ls/autoimport/fix.go:1008 compareModuleSpecifiersForRanking
+    // Go: ls/autoimport/fix.go:1026 compareModuleSpecifiersForRanking
     pub fn compare_module_specifiers_for_ranking(&self, a: &Fix, b: &Fix) -> i32 {
         let comparison = compare_module_specifier_relativity(a, b, &self.preferences);
         if comparison != 0 {
@@ -1706,7 +1706,7 @@ impl View {
         0
     }
 
-    // Go: ls/autoimport/fix.go:1031 compareModuleSpecifiersForSorting
+    // Go: ls/autoimport/fix.go:1049 compareModuleSpecifiersForSorting
     pub fn compare_module_specifiers_for_sorting(&self, a: &Fix, b: &Fix) -> i32 {
         let res = self.compare_module_specifiers_for_ranking(a, b);
         if res != 0 {
@@ -1736,7 +1736,7 @@ impl View {
         0
     }
 
-    // Go: ls/autoimport/fix.go:1052 compareNodeCoreModuleSpecifiers
+    // Go: ls/autoimport/fix.go:1070 compareNodeCoreModuleSpecifiers
     // PORT: Go does not read `importingFile` or `program`.
     pub fn compare_node_core_module_specifiers(
         &self,
@@ -1764,7 +1764,7 @@ impl View {
     }
 }
 
-// Go: ls/autoimport/fix.go:1076 isFixPossiblyReExportingImportingFile
+// Go: ls/autoimport/fix.go:1094 isFixPossiblyReExportingImportingFile
 // This is a simple heuristic to try to avoid creating an import cycle with a barrel re-export.
 // E.g., do not `import { Foo } from ".."` when you could `import { Foo } from "../Foo"`.
 // This can produce false positives or negatives if re-exports cross into sibling directories
@@ -1779,7 +1779,7 @@ fn is_fix_possibly_re_exporting_importing_file(fix: &Fix, importing_file_name: &
     false
 }
 
-// Go: ls/autoimport/fix.go:1084 isIndexFileName
+// Go: ls/autoimport/fix.go:1102 isIndexFileName
 fn is_index_file_name(file_name: &str) -> bool {
     let Some(last_slash) = file_name.rfind('/') else {
         return false;
@@ -1794,7 +1794,7 @@ fn is_index_file_name(file_name: &str) -> bool {
     )
 }
 
-// Go: ls/autoimport/fix.go:1097 promoteFromTypeOnly
+// Go: ls/autoimport/fix.go:1115 promoteFromTypeOnly
 fn promote_from_type_only(
     changes: &mut change::Tracker,
     alias_declaration: Node,
@@ -1943,7 +1943,7 @@ fn promote_from_type_only(
     }
 }
 
-// Go: ls/autoimport/fix.go:1190 promoteImportClause
+// Go: ls/autoimport/fix.go:1208 promoteImportClause
 // promoteImportClause removes the type keyword from an import clause
 fn promote_import_clause(
     changes: &mut change::Tracker,
@@ -2035,7 +2035,7 @@ fn promote_import_clause(
     }
 }
 
-// Go: ls/autoimport/fix.go:1271 deleteTypeKeyword
+// Go: ls/autoimport/fix.go:1289 deleteTypeKeyword
 // deleteTypeKeyword deletes the 'type' keyword token starting at the given position,
 // including any trailing whitespace.
 fn delete_type_keyword(changes: &mut change::Tracker, source_file: Node, start_pos: i32) {
@@ -2057,7 +2057,7 @@ fn delete_type_keyword(changes: &mut change::Tracker, source_file: Node, start_p
     changes.delete_range(source_file, TextRange::new(type_start, type_end));
 }
 
-// Go: ls/autoimport/fix.go:1286 getModuleSpecifierText
+// Go: ls/autoimport/fix.go:1304 getModuleSpecifierText
 fn get_module_specifier_text(promoted_declaration: Node) -> String {
     if promoted_declaration.kind() == SyntaxKind::ImportEqualsDeclaration {
         let import_equals_declaration = promoted_declaration;
@@ -2079,7 +2079,7 @@ fn get_module_specifier_text(promoted_declaration: Node) -> String {
     get_text_of_node(module_specifier)
 }
 
-// Go: ls/autoimport/fix.go:1308 compareModuleSpecifierRelativity
+// Go: ls/autoimport/fix.go:1326 compareModuleSpecifierRelativity
 // returns `-1` if `a` is better than `b`
 fn compare_module_specifier_relativity(
     a: &Fix,

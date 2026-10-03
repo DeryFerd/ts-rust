@@ -126,7 +126,7 @@ pub fn new_logger(output: Box<dyn Write>) -> Option<Rc<dyn Logger>> {
     }))
 }
 
-// Go: project/logging/logger.go:127 NewNopLogger
+// Go: project/logging/logger.go:129 NewNopLogger
 // NewNopLogger returns a no-op Logger that discards all log messages.
 // It is safe to call any method on the returned Logger.
 // PORT: Go returns a nil `*logger`; the port returns `None`.

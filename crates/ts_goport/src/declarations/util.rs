@@ -147,12 +147,12 @@ pub(crate) fn is_enclosing_declaration_kind(kind: SyntaxKind) -> bool {
     ) || is_function_like_kind(kind)
 }
 
-// Go: transformers/declarations/util.go:121 isAlwaysType
+// Go: transformers/declarations/util.go:122 isAlwaysType
 pub(crate) fn is_always_type(node: Node) -> bool {
     node.kind() == SyntaxKind::InterfaceDeclaration
 }
 
-// Go: transformers/declarations/util.go:128 maskModifierFlags
+// Go: transformers/declarations/util.go:129 maskModifierFlags
 pub(crate) fn mask_modifier_flags(
     node: Node,
     modifier_mask: ModifierFlags,
@@ -172,7 +172,7 @@ pub(crate) fn mask_modifier_flags(
     flags
 }
 
-// Go: transformers/declarations/util.go:141 unwrapParenthesizedExpression
+// Go: transformers/declarations/util.go:142 unwrapParenthesizedExpression
 pub(crate) fn unwrap_parenthesized_expression(mut o: Node) -> Node {
     while o.kind() == SyntaxKind::ParenthesizedExpression {
         o = o.expression();
@@ -180,7 +180,7 @@ pub(crate) fn unwrap_parenthesized_expression(mut o: Node) -> Node {
     o
 }
 
-// Go: transformers/declarations/util.go:148 isPrivateMethodTypeParameter
+// Go: transformers/declarations/util.go:149 isPrivateMethodTypeParameter
 pub(crate) fn is_private_method_type_parameter(host: &dyn DeclarationEmitHost, node: Node) -> bool {
     node.parent().kind() == SyntaxKind::MethodDeclaration
         && !host
@@ -188,7 +188,7 @@ pub(crate) fn is_private_method_type_parameter(host: &dyn DeclarationEmitHost, n
             .is_empty()
 }
 
-// Go: transformers/declarations/util.go:154 shouldEmitFunctionProperties
+// Go: transformers/declarations/util.go:155 shouldEmitFunctionProperties
 // Returns true if expando properties should be emitted for this function.
 // Properties are emitted if any overload in the symbol has a body (implementation).
 // PORT: `input.Symbol.Declarations` is the binder symbol, read from the
@@ -202,7 +202,7 @@ pub(crate) fn should_emit_function_properties(input: Node) -> bool {
         .all(|&decl| !is_function_declaration(decl) || decl.body().is_nil())
 }
 
-// Go: transformers/declarations/util.go:163 getEffectiveBaseTypeNode
+// Go: transformers/declarations/util.go:164 getEffectiveBaseTypeNode
 pub(crate) fn get_effective_base_type_node(node: Node) -> Node {
     // !!! TODO: JSDoc support
     // if (baseType && isInJSFile(node)) {
@@ -215,12 +215,12 @@ pub(crate) fn get_effective_base_type_node(node: Node) -> Node {
     get_class_extends_heritage_element(node)
 }
 
-// Go: transformers/declarations/util.go:176 isScopeMarker
+// Go: transformers/declarations/util.go:177 isScopeMarker
 pub(crate) fn is_scope_marker(node: Node) -> bool {
     is_export_assignment(node) || is_export_declaration(node)
 }
 
-// Go: transformers/declarations/util.go:180 hasScopeMarker
+// Go: transformers/declarations/util.go:181 hasScopeMarker
 // PORT: Go `*ast.StatementList` (nil allowed) is `Option<&[Node]>`.
 pub(crate) fn has_scope_marker(statements: Option<&[Node]>) -> bool {
     match statements {

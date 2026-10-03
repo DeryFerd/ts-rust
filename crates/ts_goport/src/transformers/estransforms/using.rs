@@ -76,7 +76,7 @@ impl UsingDeclarationTransformer {
         }
     }
 
-    // Go: transformers/estransforms/using.go:53 usingDeclarationTransformer.visitSourceFile
+    // Go: transformers/estransforms/using.go:54 usingDeclarationTransformer.visitSourceFile
     fn visit_source_file(&mut self, node: Node) -> Node {
         if source_file_is_declaration_file(node) {
             return node;
@@ -226,7 +226,7 @@ impl UsingDeclarationTransformer {
         visited
     }
 
-    // Go: transformers/estransforms/using.go:183 usingDeclarationTransformer.visitBlock
+    // Go: transformers/estransforms/using.go:192 usingDeclarationTransformer.visitBlock
     fn visit_block(&mut self, node: Node) -> Node {
         let node_statements = node.statements().to_vec();
         let using_kind = get_using_kind_of_statements(&node_statements);
@@ -253,7 +253,7 @@ impl UsingDeclarationTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/using.go:202 usingDeclarationTransformer.visitForStatement
+    // Go: transformers/estransforms/using.go:211 usingDeclarationTransformer.visitForStatement
     fn visit_for_statement(&mut self, node: Node) -> Node {
         if node.initializer().is_some() && is_using_variable_declaration_list(node.initializer()) {
             // given:
@@ -291,7 +291,7 @@ impl UsingDeclarationTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/using.go:230 usingDeclarationTransformer.visitForOfStatement
+    // Go: transformers/estransforms/using.go:241 usingDeclarationTransformer.visitForOfStatement
     fn visit_for_of_statement(&mut self, node: Node) -> Node {
         if is_using_variable_declaration_list(node.initializer()) {
             // given:
@@ -400,7 +400,7 @@ impl UsingDeclarationTransformer {
         }
     }
 
-    // Go: transformers/estransforms/using.go:296 usingDeclarationTransformer.transformUsingDeclarations
+    // Go: transformers/estransforms/using.go:306 usingDeclarationTransformer.transformUsingDeclarations
     fn transform_using_declarations(
         &mut self,
         statements_in: &[Node],
@@ -506,7 +506,7 @@ impl UsingDeclarationTransformer {
         statements
     }
 
-    // Go: transformers/estransforms/using.go:385 usingDeclarationTransformer.hoistImportOrExportOrHoistedDeclaration
+    // Go: transformers/estransforms/using.go:397 usingDeclarationTransformer.hoistImportOrExportOrHoistedDeclaration
     fn hoist_import_or_export_or_hoisted_declaration(
         &mut self,
         node: Node,
@@ -516,7 +516,7 @@ impl UsingDeclarationTransformer {
         top_level_statements.push(node);
     }
 
-    // Go: transformers/estransforms/using.go:390 usingDeclarationTransformer.hoistExportAssignment
+    // Go: transformers/estransforms/using.go:402 usingDeclarationTransformer.hoistExportAssignment
     fn hoist_export_assignment(&mut self, node: Node) -> Node {
         if node.is_export_equals() {
             self.hoist_export_equals(node)
@@ -525,7 +525,7 @@ impl UsingDeclarationTransformer {
         }
     }
 
-    // Go: transformers/estransforms/using.go:398 usingDeclarationTransformer.hoistExportDefault
+    // Go: transformers/estransforms/using.go:410 usingDeclarationTransformer.hoistExportDefault
     fn hoist_export_default(&mut self, node: Node) -> Node {
         // NOTE: `node` has already been visited
         if self.default_export_binding.is_some() {
@@ -579,7 +579,7 @@ impl UsingDeclarationTransformer {
         f.new_expression_statement(assignment)
     }
 
-    // Go: transformers/estransforms/using.go:442 usingDeclarationTransformer.hoistExportEquals
+    // Go: transformers/estransforms/using.go:445 usingDeclarationTransformer.hoistExportEquals
     fn hoist_export_equals(&mut self, node: Node) -> Node {
         // NOTE: `node` has already been visited
         if self.export_equals_binding.is_some() {
@@ -615,7 +615,7 @@ impl UsingDeclarationTransformer {
         f.new_expression_statement(assignment)
     }
 
-    // Go: transformers/estransforms/using.go:474 usingDeclarationTransformer.hoistClassDeclaration
+    // Go: transformers/estransforms/using.go:477 usingDeclarationTransformer.hoistClassDeclaration
     fn hoist_class_declaration(&mut self, node: Node) -> Node {
         // NOTE: `node` has already been visited
         if node.name().is_nil() && self.default_export_binding.is_some() {
@@ -720,7 +720,7 @@ impl UsingDeclarationTransformer {
         f.new_expression_statement(expression)
     }
 
-    // Go: transformers/estransforms/using.go:567 usingDeclarationTransformer.hoistVariableStatement
+    // Go: transformers/estransforms/using.go:562 usingDeclarationTransformer.hoistVariableStatement
     fn hoist_variable_statement(&mut self, node: Node) -> Node {
         // NOTE: `node` has already been visited
         let ec = self.ec();
@@ -743,7 +743,7 @@ impl UsingDeclarationTransformer {
         Node::NIL
     }
 
-    // Go: transformers/estransforms/using.go:587 usingDeclarationTransformer.hoistInitializedVariable
+    // Go: transformers/estransforms/using.go:582 usingDeclarationTransformer.hoistInitializedVariable
     fn hoist_initialized_variable(&mut self, node: Node) -> Node {
         // NOTE: `node` has already been visited
         if node.initializer().is_nil() {
@@ -770,7 +770,7 @@ impl UsingDeclarationTransformer {
         assignment
     }
 
-    // Go: transformers/estransforms/using.go:607 usingDeclarationTransformer.hoistBindingElement
+    // Go: transformers/estransforms/using.go:602 usingDeclarationTransformer.hoistBindingElement
     fn hoist_binding_element(
         &mut self,
         node: Node, /*VariableDeclaration|BindingElement*/
@@ -794,7 +794,7 @@ impl UsingDeclarationTransformer {
         }
     }
 
-    // Go: transformers/estransforms/using.go:620 usingDeclarationTransformer.hoistBindingIdentifier
+    // Go: transformers/estransforms/using.go:615 usingDeclarationTransformer.hoistBindingIdentifier
     fn hoist_binding_identifier(
         &mut self,
         node: Node,
@@ -844,12 +844,12 @@ impl UsingDeclarationTransformer {
         ec.add_variable_declaration(name);
     }
 
-    // Go: transformers/estransforms/using.go:661 usingDeclarationTransformer.createEnvBinding
+    // Go: transformers/estransforms/using.go:654 usingDeclarationTransformer.createEnvBinding
     fn create_env_binding(&self) -> Node {
         self.emit_context.factory().new_unique_name("env")
     }
 
-    // Go: transformers/estransforms/using.go:665 usingDeclarationTransformer.createDownlevelUsingStatements
+    // Go: transformers/estransforms/using.go:658 usingDeclarationTransformer.createDownlevelUsingStatements
     fn create_downlevel_using_statements(
         &self,
         body_statements: &[Node],
@@ -1005,13 +1005,13 @@ impl UsingDeclarationTransformer {
     }
 }
 
-// Go: transformers/estransforms/using.go:760 isUsingVariableDeclarationList
+// Go: transformers/estransforms/using.go:761 isUsingVariableDeclarationList
 pub(super) fn is_using_variable_declaration_list(node: Node) -> bool {
     is_variable_declaration_list(node)
         && get_using_kind_of_variable_declaration_list(node) != UsingKind::None
 }
 
-// Go: transformers/estransforms/using.go:764 getUsingKindOfVariableDeclarationList
+// Go: transformers/estransforms/using.go:765 getUsingKindOfVariableDeclarationList
 pub(super) fn get_using_kind_of_variable_declaration_list(node: Node) -> UsingKind {
     let block_scoped = node.flags() & NodeFlags::BLOCK_SCOPED;
     if block_scoped == NodeFlags::AWAIT_USING {
@@ -1023,12 +1023,12 @@ pub(super) fn get_using_kind_of_variable_declaration_list(node: Node) -> UsingKi
     }
 }
 
-// Go: transformers/estransforms/using.go:775 getUsingKindOfVariableStatement
+// Go: transformers/estransforms/using.go:776 getUsingKindOfVariableStatement
 pub(super) fn get_using_kind_of_variable_statement(node: Node) -> UsingKind {
     get_using_kind_of_variable_declaration_list(node.declaration_list())
 }
 
-// Go: transformers/estransforms/using.go:779 getUsingKind
+// Go: transformers/estransforms/using.go:780 getUsingKind
 pub(super) fn get_using_kind(statement: Node) -> UsingKind {
     if is_variable_statement(statement) {
         return get_using_kind_of_variable_statement(statement);
@@ -1036,7 +1036,7 @@ pub(super) fn get_using_kind(statement: Node) -> UsingKind {
     UsingKind::None
 }
 
-// Go: transformers/estransforms/using.go:786 getUsingKindOfStatements
+// Go: transformers/estransforms/using.go:787 getUsingKindOfStatements
 pub(super) fn get_using_kind_of_statements(statements: &[Node]) -> UsingKind {
     let mut result = UsingKind::None;
     for &statement in statements {

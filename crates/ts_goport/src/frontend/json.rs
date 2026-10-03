@@ -1679,11 +1679,11 @@ impl<T: MarshalerTo + ?Sized> MarshalerTo for &T {
     }
 }
 
-// Go: json/json.go:12 allowInvalid
+// Go: json/json.go:11 allowInvalid
 // PORT: the Go slice of options is a constant list.
 const ALLOW_INVALID: &[JsonOption] = &[JsonOption::AllowInvalidUtf8(true)];
 
-// Go: json/json.go:14 Marshal
+// Go: json/json.go:13 Marshal
 // PORT: named `json_marshal` so the glob export stays unambiguous. Go returns
 // bytes; the output here is always UTF-8 text. With `AllowInvalidUTF8`, Go
 // writes U+FFFD for each invalid byte of a string, which the string
@@ -1746,10 +1746,10 @@ fn json_check_nesting_depth(compact: &str) -> Result<(), JsonError> {
     Ok(())
 }
 
-// Go: json/json.go:23 MarshalEncode
+// Go: json/json.go:22 MarshalEncode
 // PORT: not ported. Only the LSP, API and build-info writers use it.
 
-// Go: json/json.go:32 MarshalWrite
+// Go: json/json.go:31 MarshalWrite
 // PORT: Go writes through a streaming `jsontext.Encoder` that flushes as it
 // goes, so a marshal error can leave partial output. This marshals the whole
 // value first (`json_marshal`) and writes nothing on a marshal error. Like Go
@@ -1765,7 +1765,7 @@ pub fn json_marshal_write<T: MarshalerTo + ?Sized>(
         .map_err(|err| JsonError::new(err.to_string()))
 }
 
-// Go: json/json.go:41 MarshalIndent
+// Go: json/json.go:40 MarshalIndent
 // PORT: the Rust marshalers write compact output. Go passes
 // `jsontext.WithIndentPrefix` and `jsontext.WithIndent`, which make the
 // encoder add whitespace before each token as it writes it
@@ -2203,7 +2203,7 @@ fn json_append_multiline_pieces(
     Ok(b)
 }
 
-// Go: json/json.go:49 MarshalIndentWrite
+// Go: json/json.go:48 MarshalIndentWrite
 // Used by execute/tsc.go:405 showConfig (prefix "", indent four spaces).
 // PORT: the indented output comes from `json_marshal_indent` (see the
 // PORT notes there and on `json_marshal_write`). There is no trailing
@@ -2235,7 +2235,7 @@ pub fn json_marshal_indent_write<T: MarshalerTo + ?Sized>(
     Ok(())
 }
 
-// Go: json/json.go:57 Unmarshal
+// Go: json/json.go:56 Unmarshal
 // PORT: `out` implements `UnmarshalerFrom` in place of Go reflection. Like
 // Go, `out` is not reset on error, and the input must hold exactly one value.
 pub fn json_unmarshal<T: UnmarshalerFrom + ?Sized>(
@@ -2248,7 +2248,7 @@ pub fn json_unmarshal<T: UnmarshalerFrom + ?Sized>(
     dec.check_eof()
 }
 
-// Go: json/json.go:61 UnmarshalDecode
+// Go: json/json.go:60 UnmarshalDecode
 // PORT: Go merges `opts` into the decoder options; callers here pass none,
 // so the decoder options apply. The v2 method arshaler is kept: a plain
 // error of the `UnmarshalerFrom` of `T` gets the Go type of `T`
@@ -2271,21 +2271,21 @@ pub fn json_unmarshal_decode<T: UnmarshalerFrom + ?Sized>(
     Ok(())
 }
 
-// Go: json/json.go:65 UnmarshalRead
+// Go: json/json.go:64 UnmarshalRead
 // PORT: not ported. Only the LSP and API readers use it.
 
-// Go: json/json.go:69 AllowDuplicateNames
+// Go: json/json.go:68 AllowDuplicateNames
 #[must_use]
 pub fn json_allow_duplicate_names(allow: bool) -> JsonOption {
     JsonOption::AllowDuplicateNames(allow)
 }
 
-// Go: json/json.go:73 Deterministic
-// Go: json/json.go:77 WithIndent
+// Go: json/json.go:72 Deterministic
+// Go: json/json.go:76 WithIndent
 // PORT: not ported. Map output order is only needed by build-info and
 // baseline writers. Indentation is available through `json_marshal_indent`.
 
-// Go: json/json.go:81 NewDecoder
+// Go: json/json.go:80 NewDecoder
 // PORT: Go reads from an `io.Reader`; the Rust decoder reads a complete
 // buffer with default options.
 #[must_use]
@@ -2306,7 +2306,7 @@ pub fn json_new_port_form_decoder(r: &[u8]) -> JsonDecoder<'_> {
     )
 }
 
-// Go: json/json.go:85 type aliases (Value, Kind, UnmarshalerFrom,
+// Go: json/json.go:84 type aliases (Value, Kind, UnmarshalerFrom,
 // MarshalerTo, Decoder, Encoder) and json/json.go:94 token values
 // (BeginObject, EndObject, Null, BeginArray, EndArray).
 // PORT: `JsonToken` variants and `JsonToken::kind` stand in for the token

@@ -637,7 +637,7 @@ fn stack_pointer(stack: &[StackEntry], pos: ErrorPos) -> String {
 }
 
 /// Go `reflect.Type.String()` of the Go type that the Rust type `T` stands
-/// for: api and lsproto types get their package name, `Vec<T>` is `[]T`,
+/// for: api, lsproto and project types get their package name, `Vec<T>` is `[]T`,
 /// `Option<T>` is `*T`, `Box<T>` is `T`, a map is `map[K]V`, and the Rust
 /// number types are the Go ones of the same size.
 ///
@@ -676,6 +676,8 @@ fn go_type_string(rust: &str) -> String {
         ("LspAny", []) => "interface {}".to_string(),
         _ if path.contains("::lsproto::") => format!("lsproto.{name}"),
         _ if path.contains("::api::") => format!("api.{name}"),
+        // Go package project (project.ID, project.SyntheticProjectID).
+        _ if path.rsplit("::").nth(1) == Some("project") => format!("project.{name}"),
         _ => name.to_string(),
     }
 }
@@ -1519,7 +1521,7 @@ pub fn unmarshal_struct_fields(
     }
 }
 
-// Go: internal/json/json.go:41 MarshalIndent with
+// Go: internal/json/json.go:40 MarshalIndent with
 // jsontext.WithIndentPrefix(prefix) and jsontext.WithIndent(indent):
 // multiline output, a space after each colon, no space after commas, no
 // newline inside an empty object or array, no trailing newline.

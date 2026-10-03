@@ -30,44 +30,44 @@ pub const HR: &str = "-----------------------------------------------";
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ID(pub String);
 
-// Go: project/project.go:33 ConfiguredProjectID (ts#64319)
+// Go: project/project.go:34 ConfiguredProjectID (ts#64319)
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConfiguredProjectID(pub tspath::Path);
 
 impl ConfiguredProjectID {
-    // Go: project/project.go:35 ConfiguredProjectID.Path
+    // Go: project/project.go:36 ConfiguredProjectID.Path
     pub fn path(&self) -> tspath::Path {
         self.0.clone()
     }
 
-    // Go: project/project.go:53 ConfiguredProjectID.AsID
+    // Go: project/project.go:54 ConfiguredProjectID.AsID
     pub fn as_id(&self) -> ID {
         ID(self.0.0.clone())
     }
 }
 
-// Go: project/project.go:39 InferredProjectID (ts#64319)
+// Go: project/project.go:40 InferredProjectID (ts#64319)
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InferredProjectID(pub String);
 
-// Go: project/project.go:41 inferredProjectID
+// Go: project/project.go:42 inferredProjectID
 // PORT: Go `const inferredProjectID InferredProjectID = inferredProjectName`.
 pub fn inferred_project_id() -> InferredProjectID {
     InferredProjectID(INFERRED_PROJECT_NAME.to_string())
 }
 
 impl InferredProjectID {
-    // Go: project/project.go:54 InferredProjectID.AsID
+    // Go: project/project.go:55 InferredProjectID.AsID
     pub fn as_id(&self) -> ID {
         ID(self.0.clone())
     }
 }
 
-// Go: project/project.go:43 SyntheticProjectID (ts#64319)
+// Go: project/project.go:44 SyntheticProjectID (ts#64319)
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SyntheticProjectID(pub String);
 
-// Go: project/project.go:45 NewSyntheticProjectID (ts#64319)
+// Go: project/project.go:46 NewSyntheticProjectID (ts#64319)
 pub fn new_synthetic_project_id(id: i32) -> SyntheticProjectID {
     if id <= 0 {
         crate::core::go_panic(format!("invalid synthetic project ID: {id}"));
@@ -76,7 +76,7 @@ pub fn new_synthetic_project_id(id: i32) -> SyntheticProjectID {
 }
 
 impl SyntheticProjectID {
-    // Go: project/project.go:55 SyntheticProjectID.AsID
+    // Go: project/project.go:56 SyntheticProjectID.AsID
     pub fn as_id(&self) -> ID {
         ID(self.0.clone())
     }
@@ -102,17 +102,17 @@ impl std::fmt::Display for SyntheticProjectID {
 }
 
 impl ID {
-    // Go: project/project.go:52 ID.String
+    // Go: project/project.go:53 ID.String
     pub fn string(&self) -> String {
         self.0.clone()
     }
 
-    // Go: project/project.go:57 ID.Configured
+    // Go: project/project.go:58 ID.Configured
     pub fn configured(&self) -> (ConfiguredProjectID, bool) {
         parse_configured_project_id(&tspath::Path(self.0.clone()))
     }
 
-    // Go: project/project.go:75 ID.Inferred
+    // Go: project/project.go:76 ID.Inferred
     pub fn inferred(&self) -> (InferredProjectID, bool) {
         (
             inferred_project_id(),
@@ -120,7 +120,7 @@ impl ID {
         )
     }
 
-    // Go: project/project.go:79 ID.Synthetic
+    // Go: project/project.go:80 ID.Synthetic
     pub fn synthetic(&self) -> (SyntheticProjectID, bool) {
         parse_synthetic_project_id(&self.0)
     }
@@ -140,7 +140,7 @@ impl ata::ProjectID for ID {
     }
 }
 
-// Go: project/project.go:61 ParseConfiguredProjectID (ts#64319)
+// Go: project/project.go:62 ParseConfiguredProjectID (ts#64319)
 pub fn parse_configured_project_id(value: &tspath::Path) -> (ConfiguredProjectID, bool) {
     let id = ID(value.0.clone());
     if id.0.is_empty() {
@@ -155,11 +155,11 @@ pub fn parse_configured_project_id(value: &tspath::Path) -> (ConfiguredProjectID
     (ConfiguredProjectID(value.clone()), true)
 }
 
-// Go: project/project.go:83 SyntheticProjectID.UnmarshalJSONFrom (ts#64319)
+// Go: project/project.go:84 SyntheticProjectID.UnmarshalJSONFrom (ts#64319)
 // PORT: the JSON impls of the project ID types are in src/api/proto.rs, with
 // the other API JSON impls.
 
-// Go: project/project.go:96 ParseSyntheticProjectID (ts#64319)
+// Go: project/project.go:97 ParseSyntheticProjectID (ts#64319)
 // PORT: Go `strconv.Atoi` accepts a leading sign; `str::parse::<i32>` does
 // too.
 pub fn parse_synthetic_project_id(value: &str) -> (SyntheticProjectID, bool) {
@@ -172,49 +172,49 @@ pub fn parse_synthetic_project_id(value: &str) -> (SyntheticProjectID, bool) {
     }
 }
 
-// Go: project/project.go:29 Kind
+// Go: project/project.go:111 Kind
 // PORT: Go `type Kind int` with iota consts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Kind(pub i32);
 
 impl Kind {
-    // Go: project/project.go:32 KindInferred
+    // Go: project/project.go:114 KindInferred
     pub const INFERRED: Kind = Kind(0);
-    // Go: project/project.go:33 KindConfigured
+    // Go: project/project.go:115 KindConfigured
     pub const CONFIGURED: Kind = Kind(1);
     // Go: project/project.go:51 KindSynthetic (ts#64204)
     pub const SYNTHETIC: Kind = Kind(2);
 }
 
-// Go: project/project.go:36 ProgramUpdateKind
+// Go: project/project.go:119 ProgramUpdateKind
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProgramUpdateKind(pub i32);
 
 impl ProgramUpdateKind {
-    // Go: project/project.go:39 ProgramUpdateKindNone
+    // Go: project/project.go:122 ProgramUpdateKindNone
     pub const NONE: ProgramUpdateKind = ProgramUpdateKind(0);
-    // Go: project/project.go:40 ProgramUpdateKindCloned
+    // Go: project/project.go:123 ProgramUpdateKindCloned
     pub const CLONED: ProgramUpdateKind = ProgramUpdateKind(1);
-    // Go: project/project.go:41 ProgramUpdateKindSameFileNames
+    // Go: project/project.go:124 ProgramUpdateKindSameFileNames
     pub const SAME_FILE_NAMES: ProgramUpdateKind = ProgramUpdateKind(2);
-    // Go: project/project.go:42 ProgramUpdateKindNewFiles
+    // Go: project/project.go:125 ProgramUpdateKindNewFiles
     pub const NEW_FILES: ProgramUpdateKind = ProgramUpdateKind(3);
 }
 
-// Go: project/project.go:45 PendingReload
+// Go: project/project.go:128 PendingReload
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PendingReload(pub i32);
 
 impl PendingReload {
-    // Go: project/project.go:48 PendingReloadNone
+    // Go: project/project.go:131 PendingReloadNone
     pub const NONE: PendingReload = PendingReload(0);
-    // Go: project/project.go:49 PendingReloadFileNames
+    // Go: project/project.go:132 PendingReloadFileNames
     pub const FILE_NAMES: PendingReload = PendingReload(1);
-    // Go: project/project.go:50 PendingReloadFull
+    // Go: project/project.go:133 PendingReloadFull
     pub const FULL: PendingReload = PendingReload(2);
 }
 
-// Go: project/project.go:55 Project
+// Go: project/project.go:138 Project
 // Project represents a TypeScript project.
 // If changing struct fields, also update the Clone method.
 // PORT: `commandLineWithTypingsFiles` and its `sync.Once` are written by
@@ -272,7 +272,7 @@ pub struct Project {
     pub typings_files: Vec<String>,
 }
 
-// Go: project/project.go:91 NewConfiguredProject
+// Go: project/project.go:180 NewConfiguredProject
 // PORT: Go `*ProjectCollectionBuilder` is only read here, so it is a borrow.
 pub fn new_configured_project(
     config_file_name: &str,
@@ -300,7 +300,7 @@ pub fn new_configured_project(
     project
 }
 
-// Go: project/project.go:100 NewInferredProject
+// Go: project/project.go:196 NewInferredProject
 // PORT: Go `*core.CompilerOptions` (nil-able) is `Option<Rc<CompilerOptions>>`.
 // PORT: Go `[]*core.ProjectReference` is `Option<Vec<ProjectReference>>`
 // (the `ParsedOptions` field type; nil is `None`).
@@ -352,7 +352,7 @@ pub fn new_inferred_project(
     p
 }
 
-// Go: project/project.go:158 newSyntheticProject (ts#64204)
+// Go: project/project.go:234 newSyntheticProject (ts#64204)
 // PORT: Go `*core.CompilerOptions` can be nil; the Rust command line needs a
 // value, so a nil one is the zero options.
 #[allow(clippy::too_many_arguments)]
@@ -387,7 +387,7 @@ pub fn new_synthetic_project(
     project
 }
 
-// Go: project/project.go:140 newInferredProjectCommandLine (tsgo#4712)
+// Go: project/project.go:258 newInferredProjectCommandLine (tsgo#4712)
 pub fn new_inferred_project_command_line(
     compiler_options: Rc<CompilerOptions>,
     root_file_names: Vec<String>,
@@ -405,7 +405,7 @@ pub fn new_inferred_project_command_line(
     command_line
 }
 
-// Go: project/project.go:134 NewProject
+// Go: project/project.go:270 NewProject
 // ts#64319: takes the project ID; a configured project sets its config file
 // name and path after (NewConfiguredProject).
 pub fn new_project(
@@ -486,12 +486,12 @@ pub fn new_project(
 }
 
 impl Project {
-    // Go: project/project.go:198 Project.CurrentDirectory (ts#63935)
+    // Go: project/project.go:312 Project.CurrentDirectory (ts#63935)
     pub fn current_directory(&self) -> String {
         self.current_directory.clone()
     }
 
-    // Go: project/project.go:177 Project.DisplayName
+    // Go: project/project.go:320 Project.DisplayName
     // DisplayName returns a short, human-readable name for the project,
     // relative to the given workspace root directory.
     // For configured projects, this is the config file path made relative.
@@ -521,7 +521,7 @@ impl Project {
         self.id.clone()
     }
 
-    // Go: project/project.go:191 Project.ConfigFileName
+    // Go: project/project.go:338 Project.ConfigFileName
     // ConfigFileName panics if Kind() is not KindConfigured.
     pub fn config_file_name(&self) -> String {
         if self.kind != Kind::CONFIGURED {
@@ -530,7 +530,7 @@ impl Project {
         self.config_file_name.clone()
     }
 
-    // Go: project/project.go:199 Project.ConfigFilePath
+    // Go: project/project.go:346 Project.ConfigFilePath
     // ConfigFilePath panics if Kind() is not KindConfigured.
     pub fn config_file_path(&self) -> tspath::Path {
         if self.kind != Kind::CONFIGURED {
@@ -539,19 +539,19 @@ impl Project {
         self.config_file_path.clone()
     }
 
-    // Go: project/project.go:210 Project.GetProgram
+    // Go: project/project.go:357 Project.GetProgram
     // PORT: Go returns a nil program as nil; the `ls::Project` impl below
     // (which returns a program handle) panics on it.
     pub fn get_program(&self) -> Option<Rc<compiler::NewProgram>> {
         self.program.clone()
     }
 
-    // Go: project/project.go:286 Project.IsDirty (ts#64204)
+    // Go: project/project.go:361 Project.IsDirty (ts#64204)
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
-    // Go: project/project.go:217 Project.GetProjectDiagnostics
+    // Go: project/project.go:368 Project.GetProjectDiagnostics
     // GetProjectDiagnostics returns program diagnostics combined with any global
     // diagnostics discovered during checking. These are the diagnostics reported on
     // the tsconfig.json file.
@@ -571,26 +571,26 @@ impl Project {
         sort_and_deduplicate_diagnostics(diagnostics)
     }
 
-    // Go: project/project.go:228 Project.HasFile
+    // Go: project/project.go:380 Project.HasFile
     pub fn has_file(&self, file_name: &str) -> bool {
         self.contains_file(&self.to_path(file_name))
     }
 
-    // Go: project/project.go:232 Project.containsFile
+    // Go: project/project.go:384 Project.containsFile
     pub fn contains_file(&self, path: &tspath::Path) -> bool {
         self.program
             .as_ref()
             .is_some_and(|program| program.get_source_file_by_path(path).is_some())
     }
 
-    // Go: project/project.go:236 Project.IsSourceFromProjectReference
+    // Go: project/project.go:388 Project.IsSourceFromProjectReference
     pub fn is_source_from_project_reference(&self, path: &tspath::Path) -> bool {
         self.program
             .as_ref()
             .is_some_and(|program| program.is_source_from_project_reference(path))
     }
 
-    // Go: project/project.go:240 Project.Clone
+    // Go: project/project.go:392 Project.Clone
     // PORT: Go `Clone()` is `clone_` (dirty decision 3). The `sync.Once` is
     // not copied (Go leaves the zero value).
     pub fn clone_(&self) -> Rc<RefCell<Project>> {
@@ -631,7 +631,7 @@ impl Project {
         }))
     }
 
-    // Go: project/project.go:275 Project.SetCommandLine
+    // Go: project/project.go:433 Project.SetCommandLine
     // SetCommandLine reassigns the project's command line and resets all state derived
     // from it. Changing the command line always requires a full program rebuild, so the
     // project is marked fully dirty. It also resets:
@@ -648,7 +648,7 @@ impl Project {
         self.dirty_file_path = tspath::Path::default();
     }
 
-    // Go: project/project.go:285 Project.getCommandLineWithTypingsFiles
+    // Go: project/project.go:443 Project.getCommandLineWithTypingsFiles
     // getCommandLineWithTypingsFiles returns the command line augmented with typing files if ATA is enabled.
     pub fn get_command_line_with_typings_files(&self) -> Option<Rc<tsoptions::ParsedCommandLine>> {
         if self.typings_files.is_empty() {
@@ -684,7 +684,7 @@ impl Project {
         self.command_line_with_typings_files.borrow().clone()
     }
 
-    // Go: project/project.go:318 Project.setPotentialProjectReference
+    // Go: project/project.go:468 Project.setPotentialProjectReference
     pub fn set_potential_project_reference(&mut self, config_file_path: &tspath::Path) {
         let mut potential_project_references = match &self.potential_project_references {
             None => FxHashSet::default(),
@@ -695,7 +695,7 @@ impl Project {
         self.potential_project_references = Some(Rc::new(potential_project_references));
     }
 
-    // Go: project/project.go:327 Project.hasPotentialProjectReference
+    // Go: project/project.go:477 Project.hasPotentialProjectReference
     pub fn has_potential_project_reference(
         &self,
         project_tree_request: &ProjectTreeRequest,
@@ -938,7 +938,7 @@ impl Project {
         }
     }
 
-    // Go: project/project.go:415 Project.CloneWatchers
+    // Go: project/project.go:593 Project.CloneWatchers
     pub fn clone_watchers(
         &self,
     ) -> Option<Rc<WatchedFiles<Option<Rc<RefCell<FxHashSet<tspath::Path>>>>>>> {
@@ -950,12 +950,12 @@ impl Project {
         WatchedFiles::clone_(self.program_files_watch.as_deref(), seen_files)
     }
 
-    // Go: project/project.go:419 Project.log
+    // Go: project/project.go:597 Project.log
     pub fn log(&self, _msg: &str) {
         // !!!
     }
 
-    // Go: project/project.go:423 Project.toPath
+    // Go: project/project.go:601 Project.toPath
     pub fn to_path(&self, file_name: &str) -> tspath::Path {
         let host = self
             .host
@@ -968,7 +968,7 @@ impl Project {
         )
     }
 
-    // Go: project/project.go:427 Project.print
+    // Go: project/project.go:605 Project.print
     pub fn print(
         &self,
         write_file_names: bool,
@@ -998,7 +998,7 @@ impl Project {
         builder.clone()
     }
 
-    // Go: project/project.go:449 Project.GetTypeAcquisition
+    // Go: project/project.go:627 Project.GetTypeAcquisition
     // GetTypeAcquisition returns the type acquisition settings for this project.
     // PORT: Go returns a pointer (nil-able); the command line's value is
     // copied into a new `Rc`.
@@ -1022,7 +1022,7 @@ impl Project {
         None
     }
 
-    // Go: project/project.go:468 Project.GetUnresolvedImports
+    // Go: project/project.go:646 Project.GetUnresolvedImports
     // GetUnresolvedImports extracts unresolved imports from this project's program.
     // PORT: Go returns the program's cached set; the port copies it into an `Rc`.
     pub fn get_unresolved_imports(&self) -> Option<Rc<FxHashSet<String>>> {
@@ -1031,7 +1031,7 @@ impl Project {
         Some(Rc::new(program.get_unresolved_imports().clone()))
     }
 
-    // Go: project/project.go:477 Project.ShouldTriggerATA
+    // Go: project/project.go:655 Project.ShouldTriggerATA
     // ShouldTriggerATA determines if ATA should be triggered for this project.
     pub fn should_trigger_ata(&self, snapshot_id: u64) -> bool {
         if self.program.is_none() || self.command_line.is_none() {
@@ -1056,7 +1056,7 @@ impl Project {
         !installed_typings_info.equals(&self.compute_typings_info())
     }
 
-    // Go: project/project.go:494 Project.ComputeTypingsInfo
+    // Go: project/project.go:672 Project.ComputeTypingsInfo
     pub fn compute_typings_info(&self) -> ata::TypingsInfo {
         ata::TypingsInfo {
             // Go: p.CommandLine.CompilerOptions() (nil receiver gives nil)
@@ -1070,7 +1070,7 @@ impl Project {
     }
 }
 
-// Go: project/project.go:240 Project.Clone (dirty.Cloneable)
+// Go: project/project.go:392 Project.Clone (dirty.Cloneable)
 impl dirty::Cloneable for Rc<RefCell<Project>> {
     fn clone_(&self) -> Self {
         self.borrow().clone_()
@@ -1084,7 +1084,7 @@ impl ls::Project for Project {
         Project::id(self).0
     }
 
-    // Go: project/project.go:210 Project.GetProgram
+    // Go: project/project.go:357 Project.GetProgram
     // PORT: `ls::Project` returns a program handle; Go returns nil for a
     // project without a program, which the port can not represent.
     fn get_program(&self) -> Rc<compiler::NewProgram> {
@@ -1093,7 +1093,7 @@ impl ls::Project for Project {
             .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
-    // Go: project/project.go:228 Project.HasFile
+    // Go: project/project.go:380 Project.HasFile
     fn has_file(&self, file_name: &str) -> bool {
         Project::has_file(self, file_name)
     }
@@ -1115,7 +1115,7 @@ impl ls::Project for RefCell<Project> {
     }
 }
 
-// Go: project/project.go:344 CreateProgramResult
+// Go: project/project.go:494 CreateProgramResult
 // PORT: `checker_pool` is the pool that the CreateCheckerPool closure made
 // for `program` (Go `result.Program.GetCheckerPool().(*checkerPool)`).
 #[derive(Clone)]

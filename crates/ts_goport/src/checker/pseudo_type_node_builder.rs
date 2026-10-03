@@ -13,7 +13,7 @@ use crate::pseudochecker::{
 
 use super::nodebuilder_impl_p3::{nb_ctx, nb_ctx_mut, nb_e, tracker_report_inference_fallback};
 
-// Go: checker/pseudotypenodebuilder.go:626 isStructuralPseudoType
+// Go: checker/pseudotypenodebuilder.go:632 isStructuralPseudoType
 pub fn is_structural_pseudo_type(t: &PseudoType) -> bool {
     match t.kind {
         PseudoTypeKind::OBJECT_LITERAL
@@ -457,7 +457,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/pseudotypenodebuilder.go:324 pseudoParametersToNodeList
+    // Go: checker/pseudotypenodebuilder.go:327 pseudoParametersToNodeList
     pub fn pseudo_parameters_to_node_list(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -470,7 +470,7 @@ impl Checker {
         nb_e(b).factory().new_node_list(&res)
     }
 
-    // Go: checker/pseudotypenodebuilder.go:332 pseudoParameterToNode
+    // Go: checker/pseudotypenodebuilder.go:335 pseudoParameterToNode
     pub fn pseudo_parameter_to_node(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -511,7 +511,7 @@ impl Checker {
     /// see `typeNodeIsEquivalentToType` in strada, but applied more broadly here, so is setup to handle more equivalences - strada only used it via
     /// the `canReuseTypeNodeAnnotation` host hook and not the `canReuseTypeNode` hook, which meant locations using the later were reliant on
     /// over-invalidation by the ID inference engine to not emit incorrect types.
-    // Go: checker/pseudotypenodebuilder.go:359 pseudoTypeEquivalentToType
+    // Go: checker/pseudotypenodebuilder.go:362 pseudoTypeEquivalentToType
     pub fn pseudo_type_equivalent_to_type(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -848,7 +848,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/pseudotypenodebuilder.go:579 pseudoParametersEquivalentToParameters
+    // Go: checker/pseudotypenodebuilder.go:585 pseudoParametersEquivalentToParameters
     pub fn pseudo_parameters_equivalent_to_parameters(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -914,7 +914,7 @@ impl Checker {
 
     /// pseudoReturnTypeMatchesPredicate checks if a pseudo return type (which should be a Direct type
     /// wrapping a TypePredicate) matches the given type predicate from the checker.
-    // Go: checker/pseudotypenodebuilder.go:639 pseudoReturnTypeMatchesPredicate
+    // Go: checker/pseudotypenodebuilder.go:645 pseudoReturnTypeMatchesPredicate
     pub fn pseudo_return_type_matches_predicate(
         &mut self,
         _b: &Rc<RefCell<NodeBuilderImpl>>,
@@ -969,7 +969,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/pseudotypenodebuilder.go:683 pseudoTypeToType
+    // Go: checker/pseudotypenodebuilder.go:689 pseudoTypeToType
     pub fn pseudo_type_to_type(
         &mut self,
         b: &Rc<RefCell<NodeBuilderImpl>>,

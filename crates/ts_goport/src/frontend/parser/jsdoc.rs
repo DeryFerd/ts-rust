@@ -32,8 +32,10 @@ pub fn parse_js_doc_for_node(
     script_kind: ScriptKind,
     node: Node,
 ) -> Vec<Node> {
+    let jsdoc_cut_text = std::cell::OnceCell::new();
     let mut p = new_parser();
     p.initialize_state(opts, source_text, script_kind);
+    p.jsdoc_cut_text = Some(&jsdoc_cut_text);
     p.factory = NodeFactory::new();
     let ranges = get_js_doc_comment_ranges(&p.factory, Vec::new(), node, p.source_text);
     if ranges.is_empty() {
@@ -80,7 +82,57 @@ fn byte_suffix(s: &str, i: usize) -> String {
     }
 }
 
+/// Go `text[:end-2]` in `parseJSDocComment`: the comment text without its
+/// closing `*/`. Returns the port offset of the cut and the Go bytes that
+/// the cut keeps of a char that it splits (empty when it splits none).
+// PORT: Go cuts 2 bytes. Before a `*/` they are 2 ASCII bytes. An
+// unterminated comment runs to the end of the file and can end in any char,
+// so the cut can split a char or a unit of the port form (see
+// `scanner_util::GO_STRING_MARKER`). Go keeps the bytes of that char before
+// the cut, and its scanner reads each one as a RuneError of size 1. Then the
+// offset is the start of the split char.
+fn jsdoc_text_cut(text: &str, end: usize) -> (usize, Vec<u8>) {
+    let mut cut = end;
+    let mut drop = 2;
+    loop {
+        let (unit, size) = crate::scanner_util::go_unit_before(text, cut);
+        cut -= size;
+        let len = unit.go_len();
+        if len >= drop {
+            let mut kept = Vec::new();
+            unit.push_go_bytes(&mut kept);
+            kept.truncate(len - drop);
+            return (cut, kept);
+        }
+        drop -= len;
+    }
+}
+
+/// The size of an invalid byte unit of the port form: the marker U+FDD0 (3
+/// bytes) and a char of U+10F780..U+10F7FF (4 bytes).
+const INVALID_BYTE_UNIT_LEN: i32 = 7;
+
 impl<'a> Parser<'a> {
+    /// The file position of the position `pos` of a JSDoc text with a cut
+    /// tail (see `parse_js_doc_comment`).
+    // PORT: after the split char starts at `tail`, a position of the cut
+    // text is `tail + 7k`: k invalid byte units of 7 bytes. Go's position
+    // is `tail + k`, k bytes into the split char, and the port's file
+    // offsets of that char are its Go bytes. The other positions past
+    // `tail` are file positions: a mapped one (`tail + 1..=3`) and the
+    // comment end. The end can equal `tail + 7` only after a real U+FDD0
+    // (6 bytes in the port form); then a position after the first kept
+    // byte stays unmapped.
+    #[cold]
+    pub(crate) fn jsdoc_tail_pos(&self, pos: i32) -> i32 {
+        if pos >= self.jsdoc_tail_first && pos != self.jsdoc_tail_end {
+            let tail = self.jsdoc_tail_first - INVALID_BYTE_UNIT_LEN;
+            tail + (pos - tail) / INVALID_BYTE_UNIT_LEN
+        } else {
+            pos
+        }
+    }
+
     // Go: jsdoc.go:56 withJSDoc
     pub(crate) fn with_js_doc(&mut self, node: Node, info: JsdocScannerInfo) -> Vec<Node> {
         if info & JSDOC_SCANNER_INFO_HAS_JS_DOC == 0 {
@@ -215,7 +267,30 @@ impl<'a> Parser<'a> {
             .map_or(-1, |i| i as i32);
         let initial_indent = start + 4 - (last_newline + 1);
         // -2 for trailing `*/`
-        self.source_text = &save_source_text[..(end - 2) as usize];
+        // PORT: see `jsdoc_text_cut`. A text that ends in the kept bytes of
+        // a split char is a new string, with one invalid byte unit for each
+        // kept byte. Its owner is `jsdoc_cut_text`, which outlives the
+        // parse. The positions after the split char differ from Go's, so
+        // the nodes, lists and diagnostics map them (`jsdoc_tail_pos`).
+        let (cut, kept) = jsdoc_text_cut(save_source_text, end as usize);
+        self.source_text = if kept.is_empty() {
+            &save_source_text[..cut]
+        } else {
+            self.jsdoc_tail_first = cut as i32 + INVALID_BYTE_UNIT_LEN;
+            self.jsdoc_tail_end = end;
+            let text = || {
+                let mut text = save_source_text[..cut].to_string();
+                text.push_str(&crate::scanner_util::go_string_from_bytes(kept));
+                text
+            };
+            match self.jsdoc_cut_text {
+                // Only an unterminated comment, which ends the file, has a
+                // tail, so a parse cuts one text at most.
+                Some(owner) => owner.get_or_init(text).as_str(),
+                // PORT: a parse that gives no owner leaks the text.
+                None => Box::leak(text().into_boxed_str()),
+            }
+        };
         self.scanner.set_text(self.source_text);
         // +3 for leading `/**`
         self.scanner.reset_pos(start + 3);
@@ -224,11 +299,18 @@ impl<'a> Parser<'a> {
 
         let comment = self.parse_js_doc_comment_worker(start, end, full_start, initial_indent);
         // move jsdoc diagnostics to jsdocDiagnostics -- for JS files only
-        let moved = self
+        let mut moved = self
             .diagnostics
             .borrow_mut()
             .diagnostics
             .split_off(save_diagnostics_length);
+        if self.jsdoc_tail_first != i32::MAX {
+            for d in &mut moved {
+                d.pos = self.jsdoc_tail_pos(d.pos);
+                d.end = self.jsdoc_tail_pos(d.end);
+            }
+            self.jsdoc_tail_first = i32::MAX;
+        }
         if self.context_flags.intersects(NodeFlags::JAVA_SCRIPT_FILE) {
             self.jsdoc_diagnostics.extend(moved);
         }
@@ -811,7 +893,7 @@ impl<'a> Parser<'a> {
         NodeList::NIL
     }
 
-    // Go: jsdoc.go:713 parseJSDocLink
+    // Go: jsdoc.go:714 parseJSDocLink
     fn parse_js_doc_link(&mut self, start: i32) -> Node {
         let state = self.mark();
         let Some(link_type) = self.parse_js_doc_link_prefix() else {
@@ -839,7 +921,7 @@ impl<'a> Parser<'a> {
         self.finish_node_with_end(create, start, end)
     }
 
-    // Go: jsdoc.go:741 parseJSDocLinkName
+    // Go: jsdoc.go:742 parseJSDocLinkName
     fn parse_js_doc_link_name(&mut self) -> Node {
         if token_is_identifier_or_keyword(self.token) {
             let pos = self.node_pos();
@@ -865,7 +947,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: jsdoc.go:764 parseJSDocLinkPrefix
+    // Go: jsdoc.go:765 parseJSDocLinkPrefix
     // PORT: Go returns `(string, bool)`; `false` (with the kind "NONE") is `None`.
     fn parse_js_doc_link_prefix(&mut self) -> Option<String> {
         self.skip_whitespace_or_asterisk();
@@ -881,7 +963,7 @@ impl<'a> Parser<'a> {
         None
     }
 
-    // Go: jsdoc.go:779 parseUnknownTag
+    // Go: jsdoc.go:780 parseUnknownTag
     fn parse_unknown_tag(
         &mut self,
         start: i32,
@@ -895,7 +977,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, start)
     }
 
-    // Go: jsdoc.go:783 tryParseTypeExpression
+    // Go: jsdoc.go:784 tryParseTypeExpression
     fn try_parse_type_expression(&mut self) -> Node {
         self.skip_whitespace_or_asterisk();
         if self.token == SyntaxKind::OpenBraceToken {
@@ -905,7 +987,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: jsdoc.go:792 parseBracketNameInPropertyAndParamTag
+    // Go: jsdoc.go:793 parseBracketNameInPropertyAndParamTag
     /// Returns `(name, is_bracketed)`.
     fn parse_bracket_name_in_property_and_param_tag(
         &mut self,
@@ -939,7 +1021,7 @@ impl<'a> Parser<'a> {
         (name, is_bracketed)
     }
 
-    // Go: jsdoc.go:832 parseParameterOrPropertyTag
+    // Go: jsdoc.go:833 parseParameterOrPropertyTag
     fn parse_parameter_or_property_tag(
         &mut self,
         start: i32,
@@ -986,7 +1068,7 @@ impl<'a> Parser<'a> {
         self.finish_node(result, start)
     }
 
-    // Go: jsdoc.go:857 parseNestedTypeLiteral
+    // Go: jsdoc.go:858 parseNestedTypeLiteral
     fn parse_nested_type_literal(
         &mut self,
         type_expression: Node,
@@ -1034,7 +1116,7 @@ impl<'a> Parser<'a> {
         Node::NIL
     }
 
-    // Go: jsdoc.go:883 parseReturnTag
+    // Go: jsdoc.go:884 parseReturnTag
     fn parse_return_tag(
         &mut self,
         previous_tags: &[Node],
@@ -1062,7 +1144,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, start)
     }
 
-    // Go: jsdoc.go:893 parseTypeTag
+    // Go: jsdoc.go:894 parseTypeTag
     /// Pass `indent = -1` to skip parsing trailing comments (as when a type tag
     /// is nested in a typedef).
     fn parse_type_tag(
@@ -1095,7 +1177,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, start)
     }
 
-    // Go: jsdoc.go:906 parseSeeTag
+    // Go: jsdoc.go:907 parseSeeTag
     fn parse_see_tag(
         &mut self,
         start: i32,
@@ -1119,7 +1201,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, start)
     }
 
-    // Go: jsdoc.go:917 parseImplementsTag
+    // Go: jsdoc.go:918 parseImplementsTag
     fn parse_implements_tag(
         &mut self,
         start: i32,
@@ -1136,7 +1218,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, start)
     }
 
-    // Go: jsdoc.go:922 parseAugmentsTag
+    // Go: jsdoc.go:923 parseAugmentsTag
     fn parse_augments_tag(
         &mut self,
         start: i32,
@@ -1153,7 +1235,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, start)
     }
 
-    // Go: jsdoc.go:927 parseSatisfiesTag
+    // Go: jsdoc.go:928 parseSatisfiesTag
     fn parse_satisfies_tag(
         &mut self,
         start: i32,
@@ -1170,7 +1252,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, start)
     }
 
-    // Go: jsdoc.go:933 parseThrowsTag
+    // Go: jsdoc.go:934 parseThrowsTag
     fn parse_throws_tag(
         &mut self,
         start: i32,
@@ -1187,7 +1269,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, start)
     }
 
-    // Go: jsdoc.go:939 parseImportTag
+    // Go: jsdoc.go:940 parseImportTag
     fn parse_import_tag(
         &mut self,
         start: i32,
@@ -1223,7 +1305,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, start)
     }
 
-    // Go: jsdoc.go:955 parseExpressionWithTypeArgumentsForAugments
+    // Go: jsdoc.go:956 parseExpressionWithTypeArgumentsForAugments
     fn parse_expression_with_type_arguments_for_augments(&mut self) -> Node {
         let used_brace = self.parse_optional(SyntaxKind::OpenBraceToken);
         let pos = self.node_pos();
@@ -1242,7 +1324,7 @@ impl<'a> Parser<'a> {
         node
     }
 
-    // Go: jsdoc.go:970 parsePropertyAccessEntityNameExpression
+    // Go: jsdoc.go:971 parsePropertyAccessEntityNameExpression
     fn parse_property_access_entity_name_expression(&mut self) -> Node {
         let pos = self.node_pos();
         let mut node = self.parse_js_doc_identifier_name(Some(diag::Identifier_expected));
@@ -1256,7 +1338,7 @@ impl<'a> Parser<'a> {
         node
     }
 
-    // Go: jsdoc.go:980 parseSimpleTag
+    // Go: jsdoc.go:981 parseSimpleTag
     // PORT: Go passes a closure over `p.factory`. Here `create_tag` is a
     // `NodeFactory` method, called with `self.factory`.
     fn parse_simple_tag(
@@ -1273,7 +1355,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, start)
     }
 
-    // Go: jsdoc.go:984 parseThisTag
+    // Go: jsdoc.go:985 parseThisTag
     fn parse_this_tag(
         &mut self,
         start: i32,
@@ -1291,7 +1373,7 @@ impl<'a> Parser<'a> {
         self.finish_node(result, start)
     }
 
-    // Go: jsdoc.go:991 parseJSDocTypeNameWithNamespace
+    // Go: jsdoc.go:992 parseJSDocTypeNameWithNamespace
     fn parse_js_doc_type_name_with_namespace(&mut self, nested: bool) -> Node {
         let start = self.scanner.token_start();
         if !token_is_identifier_or_keyword(self.token) {
@@ -1324,7 +1406,7 @@ impl<'a> Parser<'a> {
         type_name_or_namespace_name
     }
 
-    // Go: jsdoc.go:1016 parseTypedefTag
+    // Go: jsdoc.go:1018 parseTypedefTag
     fn parse_typedef_tag(
         &mut self,
         start: i32,
@@ -1449,7 +1531,7 @@ impl<'a> Parser<'a> {
         typedef_tag
     }
 
-    // Go: jsdoc.go:1100 parseCallbackTagParameters
+    // Go: jsdoc.go:1102 parseCallbackTagParameters
     fn parse_callback_tag_parameters(&mut self, indent: i32) -> NodeList {
         let mut parameters: Vec<Node> = Vec::new();
         let pos = self.node_pos();
@@ -1478,7 +1560,7 @@ impl<'a> Parser<'a> {
         self.new_node_list(TextRange::new(pos, end), &parameters)
     }
 
-    // Go: jsdoc.go:1120 parseJSDocSignature
+    // Go: jsdoc.go:1122 parseJSDocSignature
     fn parse_js_doc_signature(&mut self, start: i32, indent: i32) -> Node {
         let parameters = self.parse_callback_tag_parameters(indent);
         let mut return_tag = Node::NIL;
@@ -1498,7 +1580,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, start)
     }
 
-    // Go: jsdoc.go:1136 parseCallbackTag
+    // Go: jsdoc.go:1138 parseCallbackTag
     fn parse_callback_tag(
         &mut self,
         start: i32,
@@ -1529,7 +1611,7 @@ impl<'a> Parser<'a> {
         self.finish_node_with_end(n, start, end)
     }
 
-    // Go: jsdoc.go:1156 parseOverloadTag
+    // Go: jsdoc.go:1158 parseOverloadTag
     fn parse_overload_tag(
         &mut self,
         start: i32,
@@ -1555,12 +1637,12 @@ impl<'a> Parser<'a> {
         self.finish_node_with_end(n, start, end)
     }
 
-    // Go: jsdoc.go:1184 parseChildPropertyTag
+    // Go: jsdoc.go:1186 parseChildPropertyTag
     fn parse_child_property_tag(&mut self, indent: i32) -> Node {
         self.parse_child_parameter_or_property_tag(PROPERTY_LIKE_PARSE_PROPERTY, indent, Node::NIL)
     }
 
-    // Go: jsdoc.go:1188 parseChildParameterOrPropertyTag
+    // Go: jsdoc.go:1190 parseChildParameterOrPropertyTag
     fn parse_child_parameter_or_property_tag(
         &mut self,
         target: PropertyLikeParse,
@@ -1608,7 +1690,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: jsdoc.go:1220 tryParseChildTag
+    // Go: jsdoc.go:1222 tryParseChildTag
     fn try_parse_child_tag(&mut self, target: PropertyLikeParse, indent: i32) -> Node {
         assert!(
             self.token == SyntaxKind::AtToken,
@@ -1642,7 +1724,7 @@ impl<'a> Parser<'a> {
         self.parse_parameter_or_property_tag(start, tag_name, target, indent)
     }
 
-    // Go: jsdoc.go:1252 parseTemplateTagTypeParameter
+    // Go: jsdoc.go:1254 parseTemplateTagTypeParameter
     fn parse_template_tag_type_parameter(&mut self) -> Node {
         let type_parameter_pos = self.node_pos();
         let is_bracketed = self.parse_optional_jsdoc(SyntaxKind::OpenBracketToken);
@@ -1678,7 +1760,7 @@ impl<'a> Parser<'a> {
         self.finish_node(n, type_parameter_pos)
     }
 
-    // Go: jsdoc.go:1278 parseTemplateTagTypeParameters
+    // Go: jsdoc.go:1280 parseTemplateTagTypeParameters
     // PORT: Go builds a zero-value `ast.TypeParameterList{}` (not through the
     // factory), so its `Loc` is {0, 0}. The list is made at the end with that
     // range.
@@ -1699,7 +1781,7 @@ impl<'a> Parser<'a> {
         self.new_node_list(TextRange::new(0, 0), &nodes)
     }
 
-    // Go: jsdoc.go:1291 parseTemplateTag
+    // Go: jsdoc.go:1293 parseTemplateTag
     fn parse_template_tag(
         &mut self,
         start: i32,
@@ -1731,7 +1813,7 @@ impl<'a> Parser<'a> {
         self.finish_node(result, start)
     }
 
-    // Go: jsdoc.go:1312 parseOptionalJsdoc
+    // Go: jsdoc.go:1314 parseOptionalJsdoc
     pub(crate) fn parse_optional_jsdoc(&mut self, t: SyntaxKind) -> bool {
         if self.token == t {
             self.next_token_js_doc();
@@ -1740,7 +1822,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    // Go: jsdoc.go:1320 parseJSDocEntityName
+    // Go: jsdoc.go:1322 parseJSDocEntityName
     fn parse_js_doc_entity_name(&mut self, diagnostic_message: Option<&'static Message>) -> Node {
         let mut entity = self.parse_js_doc_identifier_name(diagnostic_message);
         if self.parse_optional(SyntaxKind::OpenBracketToken) {
@@ -1761,7 +1843,7 @@ impl<'a> Parser<'a> {
         entity
     }
 
-    // Go: jsdoc.go:1339 parseJSDocIdentifierName
+    // Go: jsdoc.go:1341 parseJSDocIdentifierName
     fn parse_js_doc_identifier_name(
         &mut self,
         diagnostic_message: Option<&'static Message>,
@@ -1820,12 +1902,12 @@ fn remove_trailing_whitespace(comments: &mut Vec<String>) {
     comments.truncate(end);
 }
 
-// Go: jsdoc.go:775 isJSDocLinkTag
+// Go: jsdoc.go:776 isJSDocLinkTag
 fn is_js_doc_link_tag(kind: &str) -> bool {
     kind == "link" || kind == "linkcode" || kind == "linkplain"
 }
 
-// Go: jsdoc.go:817 isObjectOrObjectArrayTypeReference
+// Go: jsdoc.go:818 isObjectOrObjectArrayTypeReference
 fn is_object_or_object_array_type_reference(node: Node) -> bool {
     match node.kind() {
         SyntaxKind::ObjectKeyword => true,
@@ -1842,7 +1924,7 @@ fn is_object_or_object_array_type_reference(node: Node) -> bool {
     }
 }
 
-// Go: jsdoc.go:1172 textsEqual
+// Go: jsdoc.go:1174 textsEqual
 fn texts_equal(mut a: Node, mut b: Node) -> bool {
     while !is_identifier(a) || !is_identifier(b) {
         if !is_identifier(a) && !is_identifier(b) && a.right().text() == b.right().text() {

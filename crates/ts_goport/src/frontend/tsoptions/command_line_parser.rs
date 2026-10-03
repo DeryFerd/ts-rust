@@ -48,7 +48,7 @@ pub struct CommandLineParser {
     pub response_file_stack: FxHashSet<Path>,
 }
 
-// Go: tsoptions/commandlineparser.go:42 ParseCommandLine
+// Go: tsoptions/commandlineparser.go:43 ParseCommandLine
 // PORT: the plan names the entry point `parse_command_line(args, fs)`; Go
 // takes a `ParseConfigHost`, so this does too.
 // PORT: Go also converts the options with `watchOptionsParser` and stores the
@@ -94,11 +94,11 @@ pub fn parse_command_line(
     result
 }
 
-// Go: tsoptions/commandlineparser.go:63 ParseBuildCommandLine
+// Go: tsoptions/commandlineparser.go:64 ParseBuildCommandLine
 // PORT: ported with the other build mode types in
 // `execute/build/command_line.rs` (`parse_build_command_line`).
 
-// Go: tsoptions/commandlineparser.go:114 parseCommandLineWorker
+// Go: tsoptions/commandlineparser.go:115 parseCommandLineWorker
 // PORT: `fs` is passed down instead of stored (see `CommandLineParser`).
 // Go nil `vfs.FS` is `None`.
 pub fn parse_command_line_worker(
@@ -176,7 +176,7 @@ impl CommandLineParser {
     }
 }
 
-// Go: tsoptions/commandlineparser.go:163 getInputOptionName
+// Go: tsoptions/commandlineparser.go:164 getInputOptionName
 pub fn get_input_option_name(input: &str) -> &str {
     // removes at most two leading '-' from the input string
     let input = input.strip_prefix('-').unwrap_or(input);
@@ -256,7 +256,7 @@ impl CommandLineParser {
     }
 }
 
-// Go: tsoptions/commandlineparser.go:216 tryReadFile
+// Go: tsoptions/commandlineparser.go:224 tryReadFile
 pub fn try_read_file(
     file_name: &str,
     read_file: &mut dyn FnMut(&str) -> (String, bool),
@@ -454,7 +454,7 @@ impl CommandLineParser {
     }
 }
 
-// Go: tsoptions/commandlineparser.go:339 ParseListTypeOption
+// Go: tsoptions/commandlineparser.go:347 ParseListTypeOption
 // PORT: Go returns `[]any`: a `List`, or a `NilList` when `core.MapFiltered`
 // keeps no element (for example `--types ,`), so the option stays unset.
 pub fn parse_list_type_option(
@@ -552,7 +552,7 @@ fn map_filtered_list(values: Vec<CompilerOptionsValue>) -> CompilerOptionsValue 
     }
 }
 
-// Go: tsoptions/commandlineparser.go:384 convertJsonOptionOfEnumType
+// Go: tsoptions/commandlineparser.go:392 convertJsonOptionOfEnumType
 pub fn convert_json_option_of_enum_type(
     opt: &CommandLineOption,
     value: &str,

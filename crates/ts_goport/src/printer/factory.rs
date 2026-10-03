@@ -73,7 +73,7 @@ impl NodeFactory {
             .expect("a printer factory outlived its EmitContext")
     }
 
-    // Go: ast/ast.go:97 AsNodeFactory (promoted from the embedded ast.NodeFactory)
+    // Go: ast/ast.go:99 AsNodeFactory (promoted from the embedded ast.NodeFactory)
     #[must_use]
     pub fn as_node_factory(&self) -> &crate::ast::NodeFactory {
         &self.ast

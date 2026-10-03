@@ -5,7 +5,7 @@
 use crate::prelude::*;
 
 impl Checker {
-    // Go: checker/flow.go:1855 getReferenceRoot
+    // Go: checker/flow.go:1876 getReferenceRoot
     // PERF: chkA. The parent, its kind and its operator are read once
     // (`node_parent_and_kind`).
     pub fn get_reference_root(&mut self, node: Node) -> Node {
@@ -22,7 +22,7 @@ impl Checker {
         node
     }
 
-    // Go: checker/flow.go:1865 hasMatchingArgument
+    // Go: checker/flow.go:1886 hasMatchingArgument
     pub fn has_matching_argument(&mut self, expression: Node, reference: Node) -> bool {
         // PERF: the argument list is program data (`NodeSlice` is `Copy`), so
         // the loop reads it in place with no copy.
@@ -42,7 +42,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/flow.go:1877 isOrContainsMatchingReference
+    // Go: checker/flow.go:1898 isOrContainsMatchingReference
     pub fn is_or_contains_matching_reference(&mut self, source: Node, target: Node) -> bool {
         self.is_matching_reference(source, target)
             || self.contains_matching_reference(source, target)
@@ -53,7 +53,7 @@ impl Checker {
     // from typeWithLiterals. This is essentially a limited form of intersection between the two types. We avoid a
     // true intersection because it is more costly and, when applied to union types, generates a large number of
     // types we don't actually care about.
-    // Go: checker/flow.go:1886 replacePrimitivesWithLiterals
+    // Go: checker/flow.go:1907 replacePrimitivesWithLiterals
     pub fn replace_primitives_with_literals(
         &mut self,
         type_with_primitives: TypeId,
@@ -112,7 +112,7 @@ impl Checker {
         type_with_primitives
     }
 
-    // Go: checker/flow.go:1907 isCoercibleUnderDoubleEquals
+    // Go: checker/flow.go:1928 isCoercibleUnderDoubleEquals
     // PORT: Go package function on `*Type`; a `Checker` method here so it can
     // read the type arena.
     pub fn is_coercible_under_double_equals(&self, source: TypeId, target: TypeId) -> bool {
@@ -125,7 +125,7 @@ impl Checker {
                 .intersects(TypeFlags::NUMBER | TypeFlags::STRING | TypeFlags::BOOLEAN)
     }
 
-    // Go: checker/flow.go:1912 isExhaustiveSwitchStatement
+    // Go: checker/flow.go:1933 isExhaustiveSwitchStatement
     pub fn is_exhaustive_switch_statement(&mut self, node: Node) -> bool {
         let state = self.switch_statement_links.get(node).exhaustive_state;
         if state == ExhaustiveState::UNKNOWN {
@@ -147,7 +147,7 @@ impl Checker {
         self.switch_statement_links.get(node).exhaustive_state == ExhaustiveState::TRUE
     }
 
-    // Go: checker/flow.go:1928 computeExhaustiveSwitchStatement
+    // Go: checker/flow.go:1949 computeExhaustiveSwitchStatement
     pub fn compute_exhaustive_switch_statement(&mut self, node: Node) -> bool {
         if is_type_of_expression(node.expression()) {
             let witnesses = self.get_switch_clause_type_of_witnesses(node);
@@ -196,7 +196,7 @@ impl Checker {
         self.each_type_contained_in(mapped, &switch_types)
     }
 
-    // Go: checker/flow.go:1957 eachTypeContainedIn
+    // Go: checker/flow.go:1978 eachTypeContainedIn
     pub fn each_type_contained_in(&self, source: TypeId, types: &[TypeId]) -> bool {
         if self.ty(source).flags.intersects(TypeFlags::UNION) {
             return !self.ty(source).types().iter().any(|t| !types.contains(t));
@@ -206,7 +206,7 @@ impl Checker {
 
     // Get the type names from all cases in a switch on `typeof`. The default clause and/or duplicate type names are
     // represented as empty strings. Return nil if one or more case clause expressions are not string literals.
-    // Go: checker/flow.go:1968 getSwitchClauseTypeOfWitnesses
+    // Go: checker/flow.go:1989 getSwitchClauseTypeOfWitnesses
     // PORT: Go nil is an empty `Vec` (see computeExhaustiveSwitchStatement).
     pub fn get_switch_clause_type_of_witnesses(&mut self, node: Node) -> Vec<String> {
         if !self.switch_statement_links.get(node).witnesses_computed {
@@ -232,7 +232,7 @@ impl Checker {
     }
 
     // Return the combined not-equal type facts for all cases except those between the start and end indices.
-    // Go: checker/flow.go:1991 getNotEqualFactsFromTypeofSwitch
+    // Go: checker/flow.go:2012 getNotEqualFactsFromTypeofSwitch
     pub fn get_not_equal_facts_from_typeof_switch(
         &mut self,
         start: i32,
@@ -255,7 +255,7 @@ impl Checker {
         facts
     }
 
-    // Go: checker/flow.go:2005 getSwitchClauseTypes
+    // Go: checker/flow.go:2026 getSwitchClauseTypes
     pub fn get_switch_clause_types(&mut self, node: Node) -> Vec<TypeId> {
         if !self.switch_statement_links.get(node).switch_types_computed {
             let clauses = node.case_block().clauses().nodes().to_vec();
@@ -270,7 +270,7 @@ impl Checker {
         self.switch_statement_links.get(node).switch_types.clone()
     }
 
-    // Go: checker/flow.go:2019 getTypeOfSwitchClause
+    // Go: checker/flow.go:2040 getTypeOfSwitchClause
     pub fn get_type_of_switch_clause(&mut self, clause: Node) -> TypeId {
         if clause.kind() == SyntaxKind::CaseClause {
             let t = self.get_type_of_expression(clause.expression());
@@ -279,7 +279,7 @@ impl Checker {
         self.never_type
     }
 
-    // Go: checker/flow.go:2026 getEffectsSignature
+    // Go: checker/flow.go:2047 getEffectsSignature
     pub fn get_effects_signature(&mut self, node: Node) -> SignatureId {
         let mut signature = self.signature_links.get(node).effects_signature;
         if signature.is_nil() {
@@ -336,7 +336,7 @@ impl Checker {
     /**
      * Get the type of the `[Symbol.hasInstance]` method of an object type.
      */
-    // Go: checker/flow.go:2072 getSymbolHasInstanceMethodOfObjectType
+    // Go: checker/flow.go:2093 getSymbolHasInstanceMethodOfObjectType
     pub fn get_symbol_has_instance_method_of_object_type(&mut self, t: TypeId) -> TypeId {
         let has_instance_property_name =
             self.get_property_name_for_known_symbol_name("hasInstance");
@@ -356,7 +356,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/flow.go:2086 getPropertyNameForKnownSymbolName
+    // Go: checker/flow.go:2107 getPropertyNameForKnownSymbolName
     pub fn get_property_name_for_known_symbol_name(&mut self, symbol_name: &str) -> String {
         let get_ctor = self.get_global_es_symbol_constructor_symbol_or_nil.clone();
         let ctor_type = get_ctor(self);
@@ -374,7 +374,7 @@ impl Checker {
     // that reference function, method, class or value module symbols; or variable, property or
     // parameter symbols with declarations that have explicit type annotations. Such references are
     // resolvable with no possibility of triggering circularities in control flow analysis.
-    // Go: checker/flow.go:2101 getTypeOfDottedName
+    // Go: checker/flow.go:2122 getTypeOfDottedName
     // PORT: Go passes the `*ast.Diagnostic` that `c.error` returned, so
     // `getExplicitTypeOfSymbol` can add related info to the stored diagnostic.
     // The stored `&mut Diagnostic` cannot be kept across the checker calls here,
@@ -431,7 +431,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/flow.go:2134 getExplicitTypeOfSymbol
+    // Go: checker/flow.go:2155 getExplicitTypeOfSymbol
     // PORT: `diagnostic` collects the related info (see `get_type_of_dotted_name`).
     pub fn get_explicit_type_of_symbol(
         &mut self,
@@ -518,7 +518,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/flow.go:2172 isDeclarationWithExplicitTypeAnnotation
+    // Go: checker/flow.go:2197 isDeclarationWithExplicitTypeAnnotation
     pub fn is_declaration_with_explicit_type_annotation(&mut self, node: Node) -> bool {
         (is_variable_declaration(node)
             || is_property_declaration(node)
@@ -528,7 +528,7 @@ impl Checker {
             || self.is_expando_property_function_with_return_type_annotation(node)
     }
 
-    // Go: checker/flow.go:2177 isExpandoPropertyFunctionWithReturnTypeAnnotation
+    // Go: checker/flow.go:2202 isExpandoPropertyFunctionWithReturnTypeAnnotation
     pub fn is_expando_property_function_with_return_type_annotation(&mut self, node: Node) -> bool {
         if is_binary_expression(node) {
             let expr = node.right();
@@ -539,7 +539,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/flow.go:2186 hasTypePredicateOrNeverReturnType
+    // Go: checker/flow.go:2211 hasTypePredicateOrNeverReturnType
     pub fn has_type_predicate_or_never_return_type(&mut self, sig: SignatureId) -> bool {
         if self.get_type_predicate_of_signature(sig).is_some() {
             return true;
@@ -555,7 +555,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/flow.go:2190 getExplicitThisType
+    // Go: checker/flow.go:2215 getExplicitThisType
     pub fn get_explicit_this_type(&mut self, node: Node) -> TypeId {
         let container = get_this_container(
             node, false, /*includeArrowFunctions*/
@@ -580,7 +580,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/flow.go:2209 getInitialType
+    // Go: checker/flow.go:2234 getInitialType
     pub fn get_initial_type(&mut self, node: Node) -> TypeId {
         match node.kind() {
             SyntaxKind::VariableDeclaration => {
@@ -592,7 +592,7 @@ impl Checker {
         panic!("Unhandled case in getInitialType")
     }
 
-    // Go: checker/flow.go:2219 getInitialTypeOfVariableDeclaration
+    // Go: checker/flow.go:2244 getInitialTypeOfVariableDeclaration
     pub fn get_initial_type_of_variable_declaration(&mut self, node: Node) -> TypeId {
         if node.initializer().is_some() {
             return self.get_type_of_initializer(node.initializer());
@@ -609,7 +609,7 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/flow.go:2235 getTypeOfInitializer
+    // Go: checker/flow.go:2260 getTypeOfInitializer
     pub fn get_type_of_initializer(&mut self, node: Node) -> TypeId {
         // Return the cached type if one is available. If the type of the variable was inferred
         // from its initializer, we'll already have cached the type. Otherwise we compute it now
@@ -623,7 +623,7 @@ impl Checker {
         self.get_type_of_expression(node)
     }
 
-    // Go: checker/flow.go:2248 getInitialTypeOfBindingElement
+    // Go: checker/flow.go:2273 getInitialTypeOfBindingElement
     pub fn get_initial_type_of_binding_element(&mut self, node: Node) -> TypeId {
         let pattern = node.parent();
         let parent_type = self.get_initial_type(pattern.parent());
@@ -645,7 +645,7 @@ impl Checker {
         self.get_type_with_default(t, node.initializer())
     }
 
-    // Go: checker/flow.go:2263 getAssignedType
+    // Go: checker/flow.go:2288 getAssignedType
     pub fn get_assigned_type(&mut self, node: Node) -> TypeId {
         let parent = node.parent();
         match parent.kind() {
@@ -677,7 +677,7 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/flow.go:2289 getAssignedTypeOfBinaryExpression
+    // Go: checker/flow.go:2314 getAssignedTypeOfBinaryExpression
     pub fn get_assigned_type_of_binary_expression(&mut self, node: Node) -> TypeId {
         let is_destructuring_default_assignment = is_array_literal_expression(node.parent())
             && self.is_destructuring_assignment_target(node.parent())
@@ -690,7 +690,7 @@ impl Checker {
         self.get_type_of_expression(node.right())
     }
 
-    // Go: checker/flow.go:2298 getAssignedTypeOfArrayLiteralElement
+    // Go: checker/flow.go:2323 getAssignedTypeOfArrayLiteralElement
     pub fn get_assigned_type_of_array_literal_element(
         &mut self,
         node: Node,
@@ -705,7 +705,7 @@ impl Checker {
         self.get_type_of_destructured_array_element(t, index)
     }
 
-    // Go: checker/flow.go:2302 getTypeOfDestructuredArrayElement
+    // Go: checker/flow.go:2327 getTypeOfDestructuredArrayElement
     pub fn get_type_of_destructured_array_element(&mut self, t: TypeId, index: i32) -> TypeId {
         if self.every_type(t, &mut |c: &mut Checker, t: TypeId| c.is_tuple_like_type(t)) {
             let element_type = self.get_tuple_element_type(t, index);
@@ -726,7 +726,7 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/flow.go:2314 includeUndefinedInIndexSignature
+    // Go: checker/flow.go:2339 includeUndefinedInIndexSignature
     pub fn include_undefined_in_index_signature(&mut self, t: TypeId) -> TypeId {
         if t.is_nil() {
             return TypeId::NIL;
@@ -738,13 +738,13 @@ impl Checker {
         t
     }
 
-    // Go: checker/flow.go:2324 getAssignedTypeOfSpreadExpression
+    // Go: checker/flow.go:2349 getAssignedTypeOfSpreadExpression
     pub fn get_assigned_type_of_spread_expression(&mut self, node: Node) -> TypeId {
         let t = self.get_assigned_type(node.parent());
         self.get_type_of_destructured_spread_expression(t)
     }
 
-    // Go: checker/flow.go:2328 getTypeOfDestructuredSpreadExpression
+    // Go: checker/flow.go:2353 getTypeOfDestructuredSpreadExpression
     pub fn get_type_of_destructured_spread_expression(&mut self, t: TypeId) -> TypeId {
         let undefined_type = self.undefined_type;
         let mut element_type = self.check_iterated_type_or_element_type(
@@ -759,13 +759,13 @@ impl Checker {
         self.create_array_type(element_type)
     }
 
-    // Go: checker/flow.go:2336 getAssignedTypeOfPropertyAssignment
+    // Go: checker/flow.go:2361 getAssignedTypeOfPropertyAssignment
     pub fn get_assigned_type_of_property_assignment(&mut self, node: Node) -> TypeId {
         let t = self.get_assigned_type(node.parent());
         self.get_type_of_destructured_property(t, node.name())
     }
 
-    // Go: checker/flow.go:2340 getTypeOfDestructuredProperty
+    // Go: checker/flow.go:2365 getTypeOfDestructuredProperty
     pub fn get_type_of_destructured_property(&mut self, t: TypeId, name: Node) -> TypeId {
         let name_type = self.get_literal_type_from_property_name(name);
         if !self.is_type_usable_as_property_name(name_type) {
@@ -784,19 +784,19 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/flow.go:2355 getAssignedTypeOfShorthandPropertyAssignment
+    // Go: checker/flow.go:2380 getAssignedTypeOfShorthandPropertyAssignment
     pub fn get_assigned_type_of_shorthand_property_assignment(&mut self, node: Node) -> TypeId {
         let t = self.get_assigned_type_of_property_assignment(node);
         self.get_type_with_default(t, node.object_assignment_initializer())
     }
 
-    // Go: checker/flow.go:2359 isDestructuringAssignmentTarget
+    // Go: checker/flow.go:2384 isDestructuringAssignmentTarget
     pub fn is_destructuring_assignment_target(&mut self, parent: Node) -> bool {
         is_binary_expression(parent.parent()) && parent.parent().left() == parent
             || is_for_of_statement(parent.parent()) && parent.parent().initializer() == parent
     }
 
-    // Go: checker/flow.go:2364 getTypeWithDefault
+    // Go: checker/flow.go:2389 getTypeWithDefault
     pub fn get_type_with_default(&mut self, t: TypeId, default_expression: Node) -> TypeId {
         if default_expression.is_some() {
             let non_undefined = self.get_non_undefined_type(t);
@@ -809,7 +809,7 @@ impl Checker {
     // Remove those constituent types of declaredType to which no constituent type of assignedType is assignable.
     // For example, when a variable of type number | string | boolean is assigned a value of type number | boolean,
     // we remove type string.
-    // Go: checker/flow.go:2374 getAssignmentReducedType
+    // Go: checker/flow.go:2399 getAssignmentReducedType
     pub fn get_assignment_reduced_type(
         &mut self,
         declared_type: TypeId,
@@ -837,7 +837,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/flow.go:2390 getAssignmentReducedTypeWorker
+    // Go: checker/flow.go:2415 getAssignmentReducedTypeWorker
     pub fn get_assignment_reduced_type_worker(
         &mut self,
         declared_type: TypeId,
@@ -869,7 +869,7 @@ impl Checker {
         declared_type
     }
 
-    // Go: checker/flow.go:2409 typeMaybeAssignableTo
+    // Go: checker/flow.go:2434 typeMaybeAssignableTo
     pub fn type_maybe_assignable_to(&mut self, source: TypeId, target: TypeId) -> bool {
         if !self.ty(source).flags.intersects(TypeFlags::UNION) {
             return self.is_type_assignable_to(source, target);
@@ -887,7 +887,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/flow.go:2421 getTypePredicateArgument
+    // Go: checker/flow.go:2451 getTypePredicateArgument
     pub fn get_type_predicate_argument(
         &mut self,
         predicate: TypePredicateId,
@@ -909,7 +909,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/flow.go:2436 getFlowTypeInConstructor
+    // Go: checker/flow.go:2466 getFlowTypeInConstructor
     pub fn get_flow_type_in_constructor(&mut self, symbol: SymbolId, constructor: Node) -> TypeId {
         let name = self.sym(symbol).name.clone();
         let access_name = if name.starts_with(&format!("{}#", INTERNAL_SYMBOL_NAME_PREFIX)) {
@@ -951,7 +951,7 @@ impl Checker {
         self.convert_auto_to_any(flow_type)
     }
 
-    // Go: checker/flow.go:2458 getFlowTypeInStaticBlocks
+    // Go: checker/flow.go:2488 getFlowTypeInStaticBlocks
     pub fn get_flow_type_in_static_blocks(
         &mut self,
         symbol: SymbolId,
@@ -1000,7 +1000,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/flow.go:2483 isReachableFlowNode
+    // Go: checker/flow.go:2513 isReachableFlowNode
     pub fn is_reachable_flow_node(&mut self, flow: FlowNodeId) -> bool {
         let f = self.get_flow_state();
         let result = self.is_reachable_flow_node_worker(&f, flow, false /*noCacheCheck*/);
@@ -1010,7 +1010,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/flow.go:2492 isReachableFlowNodeWorker
+    // Go: checker/flow.go:2522 isReachableFlowNodeWorker
     pub fn is_reachable_flow_node_worker(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -1113,7 +1113,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/flow.go:2559 isFalseExpression
+    // Go: checker/flow.go:2589 isFalseExpression
     pub fn is_false_expression(&mut self, expr: Node) -> bool {
         let node = skip_parentheses(expr);
         if node.kind() == SyntaxKind::FalseKeyword {
@@ -1133,7 +1133,7 @@ impl Checker {
 
     // Return true if the given flow node is preceded by a 'super(...)' call in every possible code path
     // leading to the node.
-    // Go: checker/flow.go:2574 isPostSuperFlowNode
+    // Go: checker/flow.go:2604 isPostSuperFlowNode
     pub fn is_post_super_flow_node(&mut self, flow: FlowNodeId, no_cache_check: bool) -> bool {
         let f = self.get_flow_state();
         let result = self.is_post_super_flow_node_worker(&f, flow, no_cache_check);
@@ -1141,7 +1141,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/flow.go:2581 isPostSuperFlowNodeWorker
+    // Go: checker/flow.go:2611 isPostSuperFlowNodeWorker
     pub fn is_post_super_flow_node_worker(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
@@ -1213,7 +1213,7 @@ impl Checker {
     }
 
     // Check if a parameter, catch variable, or mutable local variable is definitely assigned anywhere
-    // Go: checker/flow.go:2625 isSymbolAssignedDefinitely
+    // Go: checker/flow.go:2655 isSymbolAssignedDefinitely
     pub fn is_symbol_assigned_definitely(&mut self, symbol: SymbolId) -> bool {
         self.ensure_assignments_marked(symbol);
         self.marked_assignment_symbol_links
@@ -1222,7 +1222,7 @@ impl Checker {
     }
 
     // Check if a parameter, catch variable, or mutable local variable is assigned anywhere
-    // Go: checker/flow.go:2631 isSymbolAssigned
+    // Go: checker/flow.go:2661 isSymbolAssigned
     pub fn is_symbol_assigned(&mut self, symbol: SymbolId) -> bool {
         self.ensure_assignments_marked(symbol);
         self.marked_assignment_symbol_links
@@ -1233,7 +1233,7 @@ impl Checker {
 
     // Return true if there are no assignments to the given symbol or if the given location
     // is past the last assignment to the symbol.
-    // Go: checker/flow.go:2638 isPastLastAssignment
+    // Go: checker/flow.go:2668 isPastLastAssignment
     pub fn is_past_last_assignment(&mut self, symbol: SymbolId, location: Node) -> bool {
         self.ensure_assignments_marked(symbol);
         let last_assignment_pos = self
@@ -1243,7 +1243,7 @@ impl Checker {
         last_assignment_pos == 0 || location.is_some() && last_assignment_pos < location.pos()
     }
 
-    // Go: checker/flow.go:2644 ensureAssignmentsMarked
+    // Go: checker/flow.go:2674 ensureAssignmentsMarked
     pub fn ensure_assignments_marked(&mut self, symbol: SymbolId) {
         let parent = find_ancestor(
             self.sym(symbol).value_declaration,
@@ -1262,7 +1262,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/flow.go:2661 hasParentWithAssignmentsMarked
+    // Go: checker/flow.go:2688 hasParentWithAssignmentsMarked
     pub fn has_parent_with_assignments_marked(&mut self, node: Node) -> bool {
         find_ancestor(node.parent(), |node: Node| -> bool {
             is_function_or_source_file(node)
@@ -1281,7 +1281,7 @@ impl Checker {
     // assignments occur in compound statements, record the ending source position of the compound statement
     // as the assignment position (this is more conservative than full control flow analysis, but requires
     // only a single walk over the AST).
-    // Go: checker/flow.go:2673 markNodeAssignmentsWorker
+    // Go: checker/flow.go:2700 markNodeAssignmentsWorker
     // PERF: the kind is read once, and the walk calls this worker directly.
     // `c.markNodeAssignments` is always this worker (`checker_p02`), so the
     // `Rc` closure clone and call per node are not needed.
@@ -1361,7 +1361,7 @@ impl Checker {
     // Extend the position of the given assignment target node to the end of any intervening variable statement,
     // expression statement, compound statement, or class declaration occurring between the node and the given
     // declaration node.
-    // Go: checker/flow.go:2722 extendAssignmentPosition
+    // Go: checker/flow.go:2749 extendAssignmentPosition
     pub fn extend_assignment_position(&mut self, node: Node, declaration: Node) -> i32 {
         let mut node = node;
         let mut pos = node.pos();

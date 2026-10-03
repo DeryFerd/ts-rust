@@ -16,7 +16,7 @@ use crate::spanmap::Feature;
 //   order. Go map order is random; the oracle compares those outputs
 //   without order.
 
-// Go: ls/codeactions.go:20 CodeFixProvider
+// Go: ls/codeactions.go:21 CodeFixProvider
 // CodeFixProvider represents a provider for a specific type of code fix
 // PORT: Go func fields are plain `fn` pointers, so the statics are `Sync`.
 // A nil Go `GetAllCodeActions` is `None`.
@@ -33,7 +33,7 @@ pub struct CodeFixProvider {
     >,
 }
 
-// Go: ls/codeactions.go:28 CodeFixContext
+// Go: ls/codeactions.go:29 CodeFixContext
 // CodeFixContext contains the context needed to generate code fixes
 // PORT: Go nil `Diagnostic` and `Params` are `None`. Go leaves `Span` and
 // `ErrorCode` at their zero values in the fix-all contexts; Rust callers
@@ -48,7 +48,7 @@ pub struct CodeFixContext<'a> {
     pub params: Option<&'a lsproto::CodeActionParams>,
 }
 
-// Go: ls/codeactions.go:39 CodeAction
+// Go: ls/codeactions.go:40 CodeAction
 // CodeAction represents a single code action fix
 #[derive(Clone, Debug, Default)]
 pub struct CodeAction {
@@ -83,7 +83,7 @@ impl CodeAction {
     }
 }
 
-// Go: ls/codeactions.go:64 CombinedCodeActions
+// Go: ls/codeactions.go:65 CombinedCodeActions
 // CombinedCodeActions represents combined code actions for fix-all scenarios
 #[derive(Clone, Debug, Default)]
 pub struct CombinedCodeActions {
@@ -91,7 +91,7 @@ pub struct CombinedCodeActions {
     pub changes: Vec<lsproto::TextEdit>,
 }
 
-// Go: ls/codeactions.go:70 codeFixProviders
+// Go: ls/codeactions.go:71 codeFixProviders
 // codeFixProviders is the list of all registered code fix providers
 // PORT: a Go package var; the list is rebuilt from the provider statics on
 // each call, in Go order.
@@ -105,7 +105,7 @@ fn code_fix_providers() -> [&'static CodeFixProvider; 3] {
 }
 
 impl LanguageService {
-    // Go: ls/codeactions.go:78 ProvideCodeActions
+    // Go: ls/codeactions.go:79 ProvideCodeActions
     // ProvideCodeActions returns code actions for the given range and context
     pub fn provide_code_actions(
         &self,
@@ -220,7 +220,7 @@ impl LanguageService {
         })
     }
 
-    // Go: ls/codeactions.go:162 getFixAllQuickFixes
+    // Go: ls/codeactions.go:163 getFixAllQuickFixes
     // getFixAllQuickFixes returns per-provider "Fix all in file" quickfix entries for providers
     // that matched at least 2 diagnostics in the full file.
     // PORT: Go ranges over the `fixIdSeen` map in random order; this uses
@@ -292,7 +292,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/codeactions.go:217 hasMultipleFixableDiagnostics
+// Go: ls/codeactions.go:218 hasMultipleFixableDiagnostics
 // hasMultipleFixableDiagnostics returns true if the file has at least 2 diagnostics
 // matching the given error codes. Checks all diagnostic sources (semantic,
 // syntactic, suggestion, declaration) to match ProvideDiagnostics.
@@ -339,13 +339,13 @@ pub fn is_fixable_diagnostic(diagnostic: &Diagnostic, error_codes: &[i32]) -> bo
     diagnostic.source().is_empty() && contains_error_code(error_codes, diagnostic.code())
 }
 
-// Go: ls/codeactions.go:241 isFixAllKind
+// Go: ls/codeactions.go:244 isFixAllKind
 // isFixAllKind returns true if the requested kind matches source.fixAll
 fn is_fix_all_kind(kind: &lsproto::CodeActionKind) -> bool {
     kind.contains(&lsproto::CodeActionKind::SOURCE_FIX_ALL_TS)
 }
 
-// Go: ls/codeactions.go:247 wantsQuickFixes
+// Go: ls/codeactions.go:250 wantsQuickFixes
 // wantsQuickFixes returns true if the Only filter is nil/empty (meaning all kinds are wanted)
 // or explicitly includes the quickfix kind.
 // PORT: Go `*[]lsproto.CodeActionKind`; nil is `None`.
@@ -365,7 +365,7 @@ fn wants_quick_fixes(only: Option<&[lsproto::CodeActionKind]>) -> bool {
 }
 
 impl LanguageService {
-    // Go: ls/codeactions.go:261 createFixAllAction
+    // Go: ls/codeactions.go:264 createFixAllAction
     // createFixAllAction creates a source.fixAll code action that applies all auto-fixable
     // code fixes across the file.
     // PORT: Go returns a nil `*lsproto.CommandOrCodeAction` as `None`.
@@ -429,7 +429,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/codeactions.go:304 getOrganizeImportsActionTitle
+// Go: ls/codeactions.go:307 getOrganizeImportsActionTitle
 // getOrganizeImportsActionTitle returns the appropriate title for the given organize imports kind
 fn get_organize_imports_action_title(ctx: &Context, kind: &lsproto::CodeActionKind) -> String {
     let loc = locale::from_context(ctx);
@@ -442,7 +442,7 @@ fn get_organize_imports_action_title(ctx: &Context, kind: &lsproto::CodeActionKi
     }
 }
 
-// Go: ls/codeactions.go:318 getOrganizeImportsActionsForKind
+// Go: ls/codeactions.go:321 getOrganizeImportsActionsForKind
 // getOrganizeImportsActionsForKind returns the organize imports code action kinds that should be
 // returned for the given requested kind.
 fn get_organize_imports_actions_for_kind(
@@ -469,7 +469,7 @@ fn get_organize_imports_actions_for_kind(
 }
 
 impl LanguageService {
-    // Go: ls/codeactions.go:340 createOrganizeImportsAction
+    // Go: ls/codeactions.go:343 createOrganizeImportsAction
     // createOrganizeImportsAction creates the organize imports code action
     // PORT: Go returns a `*lsproto.CommandOrCodeAction` that is never nil;
     // here the value.
@@ -521,13 +521,13 @@ impl LanguageService {
     }
 }
 
-// Go: ls/codeactions.go:379 containsErrorCode
+// Go: ls/codeactions.go:382 containsErrorCode
 // containsErrorCode checks if the error code is in the list
 pub fn contains_error_code(codes: &[i32], code: i32) -> bool {
     codes.contains(&code)
 }
 
-// Go: ls/codeactions.go:384 convertToLSPCodeAction
+// Go: ls/codeactions.go:387 convertToLSPCodeAction
 // convertToLSPCodeAction converts an internal CodeAction to an LSP CodeAction
 fn convert_to_lsp_code_action(
     action: &CodeAction,

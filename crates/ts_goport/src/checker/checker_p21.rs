@@ -8,12 +8,12 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 
 impl Checker {
-    // Go: checker/checker.go:18536 addOptionality
+    // Go: checker/checker.go:18969 addOptionality
     pub fn add_optionality(&mut self, t: TypeId) -> TypeId {
         self.add_optionality_ex(t, false /*isProperty*/, true /*isOptional*/)
     }
 
-    // Go: checker/checker.go:18540 addOptionalityEx
+    // Go: checker/checker.go:18973 addOptionalityEx
     pub fn add_optionality_ex(
         &mut self,
         t: TypeId,
@@ -26,7 +26,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:18547 getOptionalType
+    // Go: checker/checker.go:18980 getOptionalType
     pub fn get_optional_type(&mut self, t: TypeId, is_property: bool) -> TypeId {
         debug_assert!(self.strict_null_checks);
         let missing_or_undefined = if is_property {
@@ -43,7 +43,7 @@ impl Checker {
         self.get_union_type(&[t, missing_or_undefined])
     }
 
-    // Go: checker/checker.go:18557 getNullableType
+    // Go: checker/checker.go:18990 getNullableType
     // Add undefined or null or both to a type if they are missing.
     pub fn get_nullable_type(&mut self, t: TypeId, flags: TypeFlags) -> TypeId {
         let missing = (flags & !self.ty(t).flags) & (TypeFlags::UNDEFINED | TypeFlags::NULL);
@@ -61,7 +61,7 @@ impl Checker {
         self.get_union_type(&[t, undefined_type, null_type])
     }
 
-    // Go: checker/checker.go:18570 GetNonNullableType
+    // Go: checker/checker.go:19003 GetNonNullableType
     pub fn get_non_nullable_type(&mut self, t: TypeId) -> TypeId {
         if self.strict_null_checks {
             return self.get_adjusted_type_with_facts(t, TypeFacts::NE_UNDEFINED_OR_NULL);
@@ -69,12 +69,12 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:18577 IsNullableType
+    // Go: checker/checker.go:19010 IsNullableType
     pub fn is_nullable_type(&mut self, t: TypeId) -> bool {
         self.has_type_facts(t, TypeFacts::IS_UNDEFINED_OR_NULL)
     }
 
-    // Go: checker/checker.go:18581 getNonNullableTypeIfNeeded
+    // Go: checker/checker.go:19014 getNonNullableTypeIfNeeded
     pub fn get_non_nullable_type_if_needed(&mut self, t: TypeId) -> TypeId {
         if self.is_nullable_type(t) {
             return self.get_non_nullable_type(t);
@@ -82,7 +82,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:18588 getDeclarationNodeFlagsFromSymbol
+    // Go: checker/checker.go:19021 getDeclarationNodeFlagsFromSymbol
     pub fn get_declaration_node_flags_from_symbol(&mut self, s: SymbolId) -> NodeFlags {
         let value_declaration = self.sym(s).value_declaration;
         if value_declaration.is_some() {
@@ -91,7 +91,7 @@ impl Checker {
         NodeFlags::NONE
     }
 
-    // Go: checker/checker.go:18595 getCombinedNodeFlagsCached
+    // Go: checker/checker.go:19028 getCombinedNodeFlagsCached
     // PORT: the result has no binder-added bit (`BINDER_ADDED_FLAGS`). Every
     // caller (and `get_declaration_node_flags_from_symbol`) tests parser
     // bits only: block scope, `CONSTANT`, `AMBIENT` and the deprecated tag.
@@ -111,7 +111,7 @@ impl Checker {
         self.last_get_combined_node_flags_result
     }
 
-    // Go: checker/checker.go:18605 isVarConstLike
+    // Go: checker/checker.go:19038 isVarConstLike
     pub fn is_var_const_like(&mut self, node: Node) -> bool {
         let block_scope_kind = self.get_combined_node_flags_cached(node) & NodeFlags::BLOCK_SCOPED;
         block_scope_kind == NodeFlags::CONST
@@ -119,7 +119,7 @@ impl Checker {
             || block_scope_kind == NodeFlags::AWAIT_USING
     }
 
-    // Go: checker/checker.go:18610 getEffectivePropertyNameForPropertyNameNode
+    // Go: checker/checker.go:19043 getEffectivePropertyNameForPropertyNameNode
     // PERF: a name read from the tree is borrowed (`property_name_text`), so
     // most calls make no String.
     pub fn get_effective_property_name_for_property_name_node(
@@ -145,7 +145,7 @@ impl Checker {
         (Cow::Borrowed(""), false)
     }
 
-    // Go: checker/checker.go:18621 tryGetNameFromType
+    // Go: checker/checker.go:19062 tryGetNameFromType
     pub fn try_get_name_from_type(&mut self, t: TypeId) -> (String, bool) {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL) {
@@ -161,7 +161,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:18636 getCombinedModifierFlagsCached
+    // Go: checker/checker.go:19077 getCombinedModifierFlagsCached
     pub fn get_combined_modifier_flags_cached(&mut self, node: Node) -> ModifierFlags {
         // we hold onto the last node and result to speed up repeated lookups against the same node.
         if self.last_get_combined_modifier_flags_node == node {
@@ -172,7 +172,7 @@ impl Checker {
         self.last_get_combined_modifier_flags_result
     }
 
-    // Go: checker/checker.go:18657 pushTypeResolution
+    // Go: checker/checker.go:19098 pushTypeResolution
     /// Push an entry on the type resolution stack. If an entry with the given target and the given property name
     /// is already on the stack, and no entries in between already have a type, then a circularity has occurred.
     /// In this case, the result values of the existing entry and all entries pushed after it are changed to false,
@@ -204,7 +204,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:18674 popTypeResolution
+    // Go: checker/checker.go:19115 popTypeResolution
     /// Pop an entry from the type resolution stack and return its associated result value. The result value will
     /// be true if no circularities were detected, or false if a circularity was found.
     pub fn pop_type_resolution(&mut self) -> bool {
@@ -215,7 +215,7 @@ impl Checker {
         last.result
     }
 
-    // Go: checker/checker.go:18682 findResolutionCycleStartIndex
+    // Go: checker/checker.go:19123 findResolutionCycleStartIndex
     pub fn find_resolution_cycle_start_index(
         &mut self,
         target: TypeSystemEntity,
@@ -235,7 +235,7 @@ impl Checker {
         -1
     }
 
-    // Go: checker/checker.go:18695 typeResolutionHasProperty
+    // Go: checker/checker.go:19136 typeResolutionHasProperty
     pub fn type_resolution_has_property(&mut self, r: &TypeResolution) -> bool {
         let as_symbol = |e: TypeSystemEntity| match e {
             TypeSystemEntity::Symbol(s) => s,
@@ -306,7 +306,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:18721 reportCircularityError
+    // Go: checker/checker.go:19162 reportCircularityError
     pub fn report_circularity_error(&mut self, symbol: SymbolId) -> TypeId {
         let declaration = self.sym(symbol).value_declaration;
         // Check if variable has type annotation that circularly references the variable itself
@@ -348,7 +348,7 @@ impl Checker {
         self.any_type
     }
 
-    // Go: checker/checker.go:18745 getPropertiesOfType
+    // Go: checker/checker.go:19186 getPropertiesOfType
     pub fn get_properties_of_type(&mut self, t: TypeId) -> SharedList<SymbolId> {
         let t = self.get_reduced_apparent_type(t);
         if self
@@ -382,7 +382,7 @@ impl Checker {
         0
     }
 
-    // Go: checker/checker.go:18753 getPropertiesOfObjectType
+    // Go: checker/checker.go:19194 getPropertiesOfObjectType
     pub fn get_properties_of_object_type(&mut self, t: TypeId) -> SharedList<SymbolId> {
         if self.ty(t).flags.intersects(TypeFlags::OBJECT) {
             return self.resolve_structured_type_members(t).properties.clone();
@@ -390,7 +390,7 @@ impl Checker {
         SharedList::default()
     }
 
-    // Go: checker/checker.go:18760 getPropertiesOfUnionOrIntersectionType
+    // Go: checker/checker.go:19201 getPropertiesOfUnionOrIntersectionType
     pub fn get_properties_of_union_or_intersection_type(
         &mut self,
         t: TypeId,
@@ -453,7 +453,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:18786 getPropertyOfType
+    // Go: checker/checker.go:19227 getPropertyOfType
     pub fn get_property_of_type(&mut self, t: TypeId, name: &str) -> SymbolId {
         self.get_property_of_type_ex(
             t, name, false, /*skipObjectFunctionPropertyAugment*/
@@ -470,7 +470,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:18798 getPropertyOfTypeEx
+    // Go: checker/checker.go:19239 getPropertyOfTypeEx
     /// Return the symbol for the property with the given name in the given type. Creates synthetic union properties when
     /// necessary, maps primitive types and type parameters are to their apparent types, and augments with properties from
     /// Object and Function as appropriate.
@@ -567,7 +567,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:18850 getTypeOfPropertyOfType
+    // Go: checker/checker.go:19291 getTypeOfPropertyOfType
     // Return the type of the given property in the given type, or nil if no such property exists
     pub fn get_type_of_property_of_type(&mut self, t: TypeId, name: &str) -> TypeId {
         let prop = self.get_property_of_type(t, name);
@@ -577,7 +577,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:18858 getSignaturesOfType
+    // Go: checker/checker.go:19299 getSignaturesOfType
     pub fn get_signatures_of_type(
         &mut self,
         t: TypeId,
@@ -587,7 +587,7 @@ impl Checker {
         self.get_signatures_of_structured_type(reduced, kind)
     }
 
-    // Go: checker/checker.go:18862 getSignaturesOfStructuredType
+    // Go: checker/checker.go:19303 getSignaturesOfStructuredType
     pub fn get_signatures_of_structured_type(
         &mut self,
         t: TypeId,
@@ -634,13 +634,13 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:18873 getIndexInfosOfType
+    // Go: checker/checker.go:19314 getIndexInfosOfType
     pub fn get_index_infos_of_type(&mut self, t: TypeId) -> SharedList<IndexInfoId> {
         let reduced = self.get_reduced_apparent_type(t);
         self.get_index_infos_of_structured_type(reduced)
     }
 
-    // Go: checker/checker.go:18877 getIndexInfosOfStructuredType
+    // Go: checker/checker.go:19318 getIndexInfosOfStructuredType
     pub fn get_index_infos_of_structured_type(&mut self, t: TypeId) -> SharedList<IndexInfoId> {
         if self.ty(t).flags.intersects(TypeFlags::STRUCTURED_TYPE) {
             return self.resolve_structured_type_members(t).index_infos_list();
@@ -648,7 +648,7 @@ impl Checker {
         SharedList::default()
     }
 
-    // Go: checker/checker.go:18886 getIndexInfoOfType
+    // Go: checker/checker.go:19327 getIndexInfoOfType
     // Return the indexing info of the given kind in the given type. Creates synthetic union index types when necessary and
     // maps primitive types and type parameters are to their apparent types.
     pub fn get_index_info_of_type(&mut self, t: TypeId, key_type: TypeId) -> IndexInfoId {
@@ -656,7 +656,7 @@ impl Checker {
         self.find_index_info(&index_infos, key_type)
     }
 
-    // Go: checker/checker.go:18892 getIndexTypeOfType
+    // Go: checker/checker.go:19333 getIndexTypeOfType
     // Return the index type of the given kind in the given type. Creates synthetic union index types when necessary and
     // maps primitive types and type parameters are to their apparent types.
     pub fn get_index_type_of_type(&mut self, t: TypeId, key_type: TypeId) -> TypeId {
@@ -667,7 +667,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:18900 getIndexTypeOfTypeEx
+    // Go: checker/checker.go:19341 getIndexTypeOfTypeEx
     pub fn get_index_type_of_type_ex(
         &mut self,
         t: TypeId,
@@ -681,13 +681,13 @@ impl Checker {
         default_type
     }
 
-    // Go: checker/checker.go:18907 getApplicableIndexInfo
+    // Go: checker/checker.go:19348 getApplicableIndexInfo
     pub fn get_applicable_index_info(&mut self, t: TypeId, key_type: TypeId) -> IndexInfoId {
         let index_infos = self.get_index_infos_of_type(t);
         self.find_applicable_index_info(&index_infos, key_type)
     }
 
-    // Go: checker/checker.go:18911 getApplicableIndexInfoForName
+    // Go: checker/checker.go:19352 getApplicableIndexInfoForName
     pub fn get_applicable_index_info_for_name(&mut self, t: TypeId, name: &str) -> IndexInfoId {
         if is_late_bound_name(name) {
             let es_symbol_type = self.es_symbol_type;
@@ -697,7 +697,7 @@ impl Checker {
         self.get_applicable_index_info(t, key_type)
     }
 
-    // Go: checker/checker.go:18918 findApplicableIndexInfo
+    // Go: checker/checker.go:19359 findApplicableIndexInfo
     pub fn find_applicable_index_info(
         &mut self,
         index_infos: &[IndexInfoId],
@@ -747,7 +747,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:18953 isApplicableIndexType
+    // Go: checker/checker.go:19394 isApplicableIndexType
     pub fn is_applicable_index_type(&mut self, source: TypeId, target: TypeId) -> bool {
         // A 'string' index signature applies to types assignable to 'string' or 'number', and a 'number' index
         // signature applies to types assignable to 'number', `${number}` and numeric string literal types.
@@ -766,7 +766,7 @@ impl Checker {
                     && is_numeric_literal_name(self.get_string_literal_value_ref(source)))
     }
 
-    // Go: checker/checker.go:18961 resolveStructuredTypeMembers
+    // Go: checker/checker.go:19402 resolveStructuredTypeMembers
     // PORT: Go returns `*StructuredType`. Rust returns a shared borrow of the
     // resolved type's `StructuredType`; callers that need to call other
     // checker methods copy what they need out of it first.
@@ -817,12 +817,12 @@ impl Checker {
         self.ty(t).as_structured_type()
     }
 
-    // Go: checker/checker.go:18990 resolveClassOrInterfaceMembers
+    // Go: checker/checker.go:19431 resolveClassOrInterfaceMembers
     pub fn resolve_class_or_interface_members(&mut self, t: TypeId) {
         self.resolve_object_type_members(t, t, &[], &[]);
     }
 
-    // Go: checker/checker.go:18994 resolveTypeReferenceMembers
+    // Go: checker/checker.go:19435 resolveTypeReferenceMembers
     pub fn resolve_type_reference_members(&mut self, t: TypeId) {
         let source = self.ty(t).target();
         let type_parameters = self
@@ -845,7 +845,7 @@ impl Checker {
         self.resolve_object_type_members(t, source, &type_parameters, &padded_type_arguments);
     }
 
-    // Go: checker/checker.go:19005 resolveObjectTypeMembers
+    // Go: checker/checker.go:19446 resolveObjectTypeMembers
     // PERF: the declared lists are `SharedList`s. A type without
     // instantiation stores them without a copy, and an instantiated list
     // that does not change is the declared list, as in Go.
@@ -989,7 +989,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:19057 findIndexInfo
+// Go: checker/checker.go:19495 findIndexInfo
 // PORT: package-level Go function that reads index info data, so it is a
 // `Checker` method (`&self`).
 impl Checker {
@@ -1002,7 +1002,7 @@ impl Checker {
         IndexInfoId::NIL
     }
 
-    // Go: checker/checker.go:19066 getBaseTypes
+    // Go: checker/checker.go:19504 getBaseTypes
     pub fn get_base_types(&mut self, t: TypeId) -> Vec<TypeId> {
         self.get_base_types_shared(t).to_vec()
     }
@@ -1071,7 +1071,7 @@ impl Checker {
         self.ty(t).as_interface_type().resolved_base_types.clone()
     }
 
-    // Go: checker/checker.go:19105 getTupleBaseType
+    // Go: checker/checker.go:19543 getTupleBaseType
     pub fn get_tuple_base_type(&mut self, t: TypeId) -> TypeId {
         let type_parameters = self.ty(t).as_interface_type().type_parameters().to_vec();
         let element_flags: Vec<ElementFlags> = self
@@ -1095,7 +1095,7 @@ impl Checker {
         self.create_array_type_ex(element_type, readonly)
     }
 
-    // Go: checker/checker.go:19119 resolveBaseTypesOfClass
+    // Go: checker/checker.go:19557 resolveBaseTypesOfClass
     pub fn resolve_base_types_of_class(&mut self, t: TypeId) {
         let base_constructor_type_of_class = self.get_base_constructor_type_of_class(t);
         let base_constructor_type = self.get_apparent_type(base_constructor_type_of_class);
@@ -1184,7 +1184,7 @@ impl Checker {
             SharedList::from(&[reduced_base_type][..]);
     }
 
-    // Go: checker/checker.go:19166 getBaseTypeNodeOfClass
+    // Go: checker/checker.go:19604 getBaseTypeNodeOfClass
     // PORT: package-level Go function that reads type data, so it is a
     // `Checker` method.
     pub fn get_base_type_node_of_class(&self, t: TypeId) -> Node {
@@ -1195,7 +1195,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:19174 getInstantiatedConstructorsForTypeArguments
+    // Go: checker/checker.go:19612 getInstantiatedConstructorsForTypeArguments
     pub fn get_instantiated_constructors_for_type_arguments(
         &mut self,
         t: TypeId,
@@ -1224,7 +1224,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:19185 getConstructorsForTypeArguments
+    // Go: checker/checker.go:19623 getConstructorsForTypeArguments
     pub fn get_constructors_for_type_arguments(
         &mut self,
         t: TypeId,
@@ -1245,7 +1245,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:19192 getSignatureInstantiation
+    // Go: checker/checker.go:19630 getSignatureInstantiation
     pub fn get_signature_instantiation(
         &mut self,
         sig: SignatureId,
@@ -1286,7 +1286,7 @@ impl Checker {
         instantiated_signature
     }
 
-    // Go: checker/checker.go:19209 cloneSignature
+    // Go: checker/checker.go:19647 cloneSignature
     pub fn clone_signature(&mut self, sig: SignatureId) -> SignatureId {
         let s = self.sig(sig);
         let flags = s.flags & SignatureFlags::PROPAGATING_FLAGS;
@@ -1318,7 +1318,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:19217 getSignatureInstantiationWithoutFillingInTypeArguments
+    // Go: checker/checker.go:19655 getSignatureInstantiationWithoutFillingInTypeArguments
     pub fn get_signature_instantiation_without_filling_in_type_arguments(
         &mut self,
         sig: SignatureId,
@@ -1340,7 +1340,7 @@ impl Checker {
         instantiation
     }
 
-    // Go: checker/checker.go:19227 createSignatureInstantiation
+    // Go: checker/checker.go:19665 createSignatureInstantiation
     pub fn create_signature_instantiation(
         &mut self,
         sig: SignatureId,
@@ -1350,7 +1350,7 @@ impl Checker {
         self.instantiate_signature_ex(sig, mapper, true /*eraseTypeParameters*/)
     }
 
-    // Go: checker/checker.go:19231 createSignatureTypeMapper
+    // Go: checker/checker.go:19669 createSignatureTypeMapper
     pub fn create_signature_type_mapper(
         &mut self,
         sig: SignatureId,
@@ -1360,7 +1360,7 @@ impl Checker {
         self.new_type_mapper(&type_parameters, type_arguments)
     }
 
-    // Go: checker/checker.go:19235 getTypeParametersForMapper
+    // Go: checker/checker.go:19673 getTypeParametersForMapper
     pub fn get_type_parameters_for_mapper(&mut self, sig: SignatureId) -> Vec<TypeId> {
         let type_parameters = self.sig(sig).type_parameters.clone();
         let mut result = Vec::with_capacity(type_parameters.len());
@@ -1371,13 +1371,13 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:19240 getSingleCallSignature
+    // Go: checker/checker.go:19678 getSingleCallSignature
     // If type has a single call signature and no other members, return that signature. Otherwise, return nil.
     pub fn get_single_call_signature(&mut self, t: TypeId) -> SignatureId {
         self.get_single_signature(t, SignatureKind::CALL, false /*allowMembers*/)
     }
 
-    // Go: checker/checker.go:19244 getSingleCallOrConstructSignature
+    // Go: checker/checker.go:19682 getSingleCallOrConstructSignature
     pub fn get_single_call_or_construct_signature(&mut self, t: TypeId) -> SignatureId {
         let call_sig =
             self.get_single_signature(t, SignatureKind::CALL, false /*allowMembers*/);
@@ -1387,7 +1387,7 @@ impl Checker {
         self.get_single_signature(t, SignatureKind::CONSTRUCT, false /*allowMembers*/)
     }
 
-    // Go: checker/checker.go:19252 getSingleSignature
+    // Go: checker/checker.go:19690 getSingleSignature
     pub fn get_single_signature(
         &mut self,
         t: TypeId,
@@ -1415,7 +1415,7 @@ impl Checker {
         SignatureId::NIL
     }
 
-    // Go: checker/checker.go:19267 getOrCreateTypeFromSignature
+    // Go: checker/checker.go:19705 getOrCreateTypeFromSignature
     pub fn get_or_create_type_from_signature(&mut self, sig: SignatureId) -> TypeId {
         // There are two ways to declare a construct signature, one is by declaring a class constructor
         // using the constructor keyword, and the other is declaring a bare construct signature in an
@@ -1453,7 +1453,7 @@ impl Checker {
         self.sig(sig).isolated_signature_type
     }
 
-    // Go: checker/checker.go:19295 getErasedSignature
+    // Go: checker/checker.go:19733 getErasedSignature
     pub fn get_erased_signature(&mut self, signature: SignatureId) -> SignatureId {
         if self.sig(signature).type_parameters.is_empty() {
             return signature;
@@ -1478,7 +1478,7 @@ impl Checker {
         erased
     }
 
-    // Go: checker/checker.go:19308 getCanonicalSignature
+    // Go: checker/checker.go:19746 getCanonicalSignature
     pub fn get_canonical_signature(&mut self, signature: SignatureId) -> SignatureId {
         if self.sig(signature).type_parameters.is_empty() {
             return signature;
@@ -1499,7 +1499,7 @@ impl Checker {
         canonical
     }
 
-    // Go: checker/checker.go:19321 createCanonicalSignature
+    // Go: checker/checker.go:19759 createCanonicalSignature
     pub fn create_canonical_signature(&mut self, signature: SignatureId) -> SignatureId {
         // Create an instantiation of the signature where each unconstrained type parameter is replaced with
         // its original. When a generic class or interface is instantiated, each generic method in the class or
@@ -1527,7 +1527,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:19337 getBaseSignature
+    // Go: checker/checker.go:19775 getBaseSignature
     pub fn get_base_signature(&mut self, signature: SignatureId) -> SignatureId {
         if self.sig(signature).type_parameters.is_empty() {
             return signature;
@@ -1587,7 +1587,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:19365 instantiateSignatureInContextOf
+    // Go: checker/checker.go:19803 instantiateSignatureInContextOf
     // Instantiate a generic signature in the context of a non-generic signature (section 3.8.5 in TypeScript spec)
     pub fn instantiate_signature_in_context_of(
         &mut self,
@@ -1659,7 +1659,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:19397 resolveBaseTypesOfInterface
+    // Go: checker/checker.go:19835 resolveBaseTypesOfInterface
     pub fn resolve_base_types_of_interface(&mut self, t: TypeId) {
         let declarations = self.sym(self.ty(t).symbol).declarations.clone();
         for &declaration in declarations.iter() {
@@ -1696,7 +1696,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:19419 areAllOuterTypeParametersApplied
+    // Go: checker/checker.go:19857 areAllOuterTypeParametersApplied
     pub fn are_all_outer_type_parameters_applied(&mut self, t: TypeId) -> bool {
         // An unapplied type parameter has its symbol still the same as the matching argument symbol.
         // Since parameters are applied outer-to-inner, only the last outer parameter needs to be checked.
@@ -1714,7 +1714,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:19431 reportCircularBaseType
+    // Go: checker/checker.go:19869 reportCircularBaseType
     pub fn report_circular_base_type(&mut self, node: Node, t: TypeId) {
         let type_string = self.type_to_string_ex(
             t,

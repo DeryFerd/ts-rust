@@ -48,7 +48,7 @@ pub fn flatten_destructuring_assignment<'a, C>(
     f.flatten_destructuring_assignment(v, node, needs_value)
 }
 
-// Go: transformers/destructuring.go:45 pendingDecl
+// Go: transformers/destructuring.go:46 pendingDecl
 // pendingDecl tracks a pending variable declaration during binding flattening.
 struct PendingDecl {
     pending_expressions: Vec<Node>,
@@ -58,7 +58,7 @@ struct PendingDecl {
     original: Node,
 }
 
-// Go: transformers/destructuring.go:56 FlattenDestructuringBinding
+// Go: transformers/destructuring.go:57 FlattenDestructuringBinding
 /// FlattenDestructuringBinding flattens a binding pattern in a variable declaration or parameter
 /// into individual variable declarations. Returns a single VariableDeclaration, a SyntaxList of
 /// declarations, or nil.
@@ -87,7 +87,7 @@ enum Mode {
     Binding,
 }
 
-// Go: transformers/destructuring.go:75 flattener
+// Go: transformers/destructuring.go:77 flattener
 // flattener encapsulates the state and logic for flattening destructuring patterns.
 // It is equivalent to TypeScript's FlattenContext in destructuring.ts.
 struct Flattener<'e, 'f, 'a, C> {
@@ -105,7 +105,7 @@ struct Flattener<'e, 'f, 'a, C> {
     mode: Mode,
 }
 
-// Go: transformers/destructuring.go:95 newFlattener
+// Go: transformers/destructuring.go:96 newFlattener
 fn new_flattener<'e, 'f, 'a, C>(
     emit_context: &'e EmitContext,
     level: FlattenLevel,
@@ -169,24 +169,24 @@ impl<'a, C> Flattener<'_, '_, 'a, C> {
 
     // --- Assignment mode callbacks ---
 
-    // Go: transformers/destructuring.go:104 flattener.createArrayAssignmentPattern
+    // Go: transformers/destructuring.go:105 flattener.createArrayAssignmentPattern
     fn create_array_assignment_pattern(&self, elements: &[Node]) -> Node {
         let f = self.factory();
         f.new_array_literal_expression(f.new_node_list(elements), false)
     }
 
-    // Go: transformers/destructuring.go:108 flattener.createObjectAssignmentPattern
+    // Go: transformers/destructuring.go:109 flattener.createObjectAssignmentPattern
     fn create_object_assignment_pattern(&self, elements: &[Node]) -> Node {
         let f = self.factory();
         f.new_object_literal_expression(f.new_node_list(elements), false)
     }
 
-    // Go: transformers/destructuring.go:112 flattener.createArrayAssignmentElement
+    // Go: transformers/destructuring.go:113 flattener.createArrayAssignmentElement
     fn create_array_assignment_element(&self, expr: Node) -> Node {
         expr
     }
 
-    // Go: transformers/destructuring.go:116 flattener.emitAssignment
+    // Go: transformers/destructuring.go:117 flattener.emitAssignment
     fn emit_assignment(
         &mut self,
         v: &mut NodeVisitor<'a, C>,
@@ -213,25 +213,25 @@ impl<'a, C> Flattener<'_, '_, 'a, C> {
 
     // --- Binding mode callbacks ---
 
-    // Go: transformers/destructuring.go:130 flattener.createArrayBindingPattern
+    // Go: transformers/destructuring.go:131 flattener.createArrayBindingPattern
     fn create_array_binding_pattern(&self, elements: &[Node]) -> Node {
         let f = self.factory();
         f.new_binding_pattern(SyntaxKind::ArrayBindingPattern, f.new_node_list(elements))
     }
 
-    // Go: transformers/destructuring.go:134 flattener.createObjectBindingPattern
+    // Go: transformers/destructuring.go:135 flattener.createObjectBindingPattern
     fn create_object_binding_pattern(&self, elements: &[Node]) -> Node {
         let f = self.factory();
         f.new_binding_pattern(SyntaxKind::ObjectBindingPattern, f.new_node_list(elements))
     }
 
-    // Go: transformers/destructuring.go:138 flattener.createArrayBindingElement
+    // Go: transformers/destructuring.go:139 flattener.createArrayBindingElement
     fn create_array_binding_element(&self, expr: Node) -> Node {
         self.factory()
             .new_binding_element(Node::NIL, Node::NIL, expr, Node::NIL)
     }
 
-    // Go: transformers/destructuring.go:142 flattener.emitBinding
+    // Go: transformers/destructuring.go:143 flattener.emitBinding
     fn emit_binding(&mut self, target: Node, mut value: Node, location: TextRange, original: Node) {
         if !self.expressions.is_empty() {
             let mut expressions = std::mem::take(&mut self.expressions);
@@ -249,12 +249,12 @@ impl<'a, C> Flattener<'_, '_, 'a, C> {
 
     // --- Shared helpers ---
 
-    // Go: transformers/destructuring.go:157 flattener.emitExpression
+    // Go: transformers/destructuring.go:158 flattener.emitExpression
     fn emit_expression(&mut self, expr: Node) {
         self.expressions.push(expr);
     }
 
-    // Go: transformers/destructuring.go:161 flattener.ensureIdentifier
+    // Go: transformers/destructuring.go:162 flattener.ensureIdentifier
     fn ensure_identifier(
         &mut self,
         v: &mut NodeVisitor<'a, C>,
@@ -277,7 +277,7 @@ impl<'a, C> Flattener<'_, '_, 'a, C> {
         temp
     }
 
-    // Go: transformers/destructuring.go:176 flattener.createDefaultValueCheck
+    // Go: transformers/destructuring.go:178 flattener.createDefaultValueCheck
     fn create_default_value_check(
         &mut self,
         v: &mut NodeVisitor<'a, C>,
@@ -296,7 +296,7 @@ impl<'a, C> Flattener<'_, '_, 'a, C> {
         )
     }
 
-    // Go: transformers/destructuring.go:187 flattener.createDestructuringPropertyAccess
+    // Go: transformers/destructuring.go:189 flattener.createDestructuringPropertyAccess
     fn create_destructuring_property_access(
         &mut self,
         v: &mut NodeVisitor<'a, C>,
@@ -332,7 +332,7 @@ impl<'a, C> Flattener<'_, '_, 'a, C> {
 
     // --- Entry points ---
 
-    // Go: transformers/destructuring.go:202 flattener.flattenDestructuringAssignment
+    // Go: transformers/destructuring.go:204 flattener.flattenDestructuringAssignment
     fn flatten_destructuring_assignment(
         &mut self,
         v: &mut NodeVisitor<'a, C>,
@@ -390,7 +390,7 @@ impl<'a, C> Flattener<'_, '_, 'a, C> {
         self.factory().new_omitted_expression()
     }
 
-    // Go: transformers/destructuring.go:245 flattener.flattenDestructuringBinding
+    // Go: transformers/destructuring.go:247 flattener.flattenDestructuringBinding
     fn flatten_destructuring_binding(
         &mut self,
         v: &mut NodeVisitor<'a, C>,
@@ -473,7 +473,7 @@ impl<'a, C> Flattener<'_, '_, 'a, C> {
 
     // --- Core flattening ---
 
-    // Go: transformers/destructuring.go:295 flattener.flattenBindingOrAssignmentElement
+    // Go: transformers/destructuring.go:298 flattener.flattenBindingOrAssignmentElement
     fn flatten_binding_or_assignment_element(
         &mut self,
         v: &mut NodeVisitor<'a, C>,
@@ -527,7 +527,7 @@ impl<'a, C> Flattener<'_, '_, 'a, C> {
         }
     }
 
-    // Go: transformers/destructuring.go:325 flattener.flattenObjectBindingOrAssignmentPattern
+    // Go: transformers/destructuring.go:328 flattener.flattenObjectBindingOrAssignmentPattern
     fn flatten_object_binding_or_assignment_pattern(
         &mut self,
         v: &mut NodeVisitor<'a, C>,
@@ -608,7 +608,7 @@ impl<'a, C> Flattener<'_, '_, 'a, C> {
         }
     }
 
-    // Go: transformers/destructuring.go:377 flattener.flattenArrayBindingOrAssignmentPattern
+    // Go: transformers/destructuring.go:375 flattener.flattenArrayBindingOrAssignmentPattern
     fn flatten_array_binding_or_assignment_pattern(
         &mut self,
         v: &mut NodeVisitor<'a, C>,
@@ -687,7 +687,7 @@ impl<'a, C> Flattener<'_, '_, 'a, C> {
 
 // --- Exported helper functions ---
 
-// Go: transformers/destructuring.go:428 BindingOrAssignmentElementAssignsToName
+// Go: transformers/destructuring.go:420 BindingOrAssignmentElementAssignsToName
 // BindingOrAssignmentElementAssignsToName checks if any target in a binding/assignment pattern assigns to the given name.
 pub fn binding_or_assignment_element_assigns_to_name(element: Node, name: &str) -> bool {
     let target = get_target_of_binding_or_assignment_element(element);
@@ -702,14 +702,14 @@ pub fn binding_or_assignment_element_assigns_to_name(element: Node, name: &str) 
     false
 }
 
-// Go: transformers/destructuring.go:441 bindingOrAssignmentPatternAssignsToName
+// Go: transformers/destructuring.go:433 bindingOrAssignmentPatternAssignsToName
 fn binding_or_assignment_pattern_assigns_to_name(pattern: Node, name: &str) -> bool {
     get_elements_of_binding_or_assignment_pattern(pattern)
         .into_iter()
         .any(|element| binding_or_assignment_element_assigns_to_name(element, name))
 }
 
-// Go: transformers/destructuring.go:452 BindingOrAssignmentElementContainsNonLiteralComputedName
+// Go: transformers/destructuring.go:444 BindingOrAssignmentElementContainsNonLiteralComputedName
 // BindingOrAssignmentElementContainsNonLiteralComputedName checks if any element has a non-literal computed property name.
 pub fn binding_or_assignment_element_contains_non_literal_computed_name(element: Node) -> bool {
     let property_name = try_get_property_name_of_binding_or_assignment_element(element);
@@ -725,14 +725,14 @@ pub fn binding_or_assignment_element_contains_non_literal_computed_name(element:
         && binding_or_assignment_pattern_contains_non_literal_computed_name(target)
 }
 
-// Go: transformers/destructuring.go:461 bindingOrAssignmentPatternContainsNonLiteralComputedName
+// Go: transformers/destructuring.go:453 bindingOrAssignmentPatternContainsNonLiteralComputedName
 fn binding_or_assignment_pattern_contains_non_literal_computed_name(pattern: Node) -> bool {
     get_elements_of_binding_or_assignment_pattern(pattern)
         .into_iter()
         .any(binding_or_assignment_element_contains_non_literal_computed_name)
 }
 
-// Go: transformers/destructuring.go:467 GetInitializerOfBindingOrAssignmentElement
+// Go: transformers/destructuring.go:459 GetInitializerOfBindingOrAssignmentElement
 // GetInitializerOfBindingOrAssignmentElement returns the initializer/default value of a binding or assignment element.
 pub fn get_initializer_of_binding_or_assignment_element(binding_element: Node) -> Node {
     if binding_element.is_nil() {
@@ -760,21 +760,21 @@ pub fn get_initializer_of_binding_or_assignment_element(binding_element: Node) -
     Node::NIL
 }
 
-// Go: transformers/destructuring.go:493 isObjectBindingOrAssignmentPattern
+// Go: transformers/destructuring.go:485 isObjectBindingOrAssignmentPattern
 fn is_object_binding_or_assignment_pattern(node: Node) -> bool {
     node.is_some()
         && (node.kind() == SyntaxKind::ObjectBindingPattern
             || node.kind() == SyntaxKind::ObjectLiteralExpression)
 }
 
-// Go: transformers/destructuring.go:497 isArrayBindingOrAssignmentPattern
+// Go: transformers/destructuring.go:489 isArrayBindingOrAssignmentPattern
 fn is_array_binding_or_assignment_pattern(node: Node) -> bool {
     node.is_some()
         && (node.kind() == SyntaxKind::ArrayBindingPattern
             || node.kind() == SyntaxKind::ArrayLiteralExpression)
 }
 
-// Go: transformers/destructuring.go:501 isSimpleBindingOrAssignmentElement
+// Go: transformers/destructuring.go:493 isSimpleBindingOrAssignmentElement
 fn is_simple_binding_or_assignment_element(element: Node) -> bool {
     let target = get_target_of_binding_or_assignment_element(element);
     if target.is_nil() || is_omitted_expression(target) {

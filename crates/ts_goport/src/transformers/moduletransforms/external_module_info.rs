@@ -238,7 +238,7 @@ impl ExternalModuleInfoCollector<'_> {
         self.output
     }
 
-    // Go: transformers/moduletransforms/externalmoduleinfo.go:175 externalModuleInfoCollector.addUniqueExport
+    // Go: transformers/moduletransforms/externalmoduleinfo.go:167 externalModuleInfoCollector.addUniqueExport
     fn add_unique_export(&mut self, name: &str) -> bool {
         if !self.unique_exports.contains(name) {
             self.unique_exports.insert(name.to_string());
@@ -247,14 +247,14 @@ impl ExternalModuleInfoCollector<'_> {
         false
     }
 
-    // Go: transformers/moduletransforms/externalmoduleinfo.go:183 externalModuleInfoCollector.addExportedBinding
+    // Go: transformers/moduletransforms/externalmoduleinfo.go:175 externalModuleInfoCollector.addExportedBinding
     fn add_exported_binding(&mut self, decl: Node, name: Node) {
         self.output
             .exported_bindings
             .add(self.emit_context.most_original(decl), name);
     }
 
-    // Go: transformers/moduletransforms/externalmoduleinfo.go:187 externalModuleInfoCollector.addExternalImport
+    // Go: transformers/moduletransforms/externalmoduleinfo.go:179 externalModuleInfoCollector.addExternalImport
     fn add_external_import(
         &mut self,
         node: Node, /*ImportDeclaration | ImportEqualsDeclaration | ExportDeclaration*/
@@ -262,12 +262,12 @@ impl ExternalModuleInfoCollector<'_> {
         self.output.external_imports.push(node);
     }
 
-    // Go: transformers/moduletransforms/externalmoduleinfo.go:191 externalModuleInfoCollector.addExportedName
+    // Go: transformers/moduletransforms/externalmoduleinfo.go:183 externalModuleInfoCollector.addExportedName
     fn add_exported_name(&mut self, name: Node) {
         self.output.exported_names.push(name);
     }
 
-    // Go: transformers/moduletransforms/externalmoduleinfo.go:195 externalModuleInfoCollector.addExportedNamesForExportDeclaration
+    // Go: transformers/moduletransforms/externalmoduleinfo.go:187 externalModuleInfoCollector.addExportedNamesForExportDeclaration
     fn add_exported_names_for_export_declaration(&mut self, node: Node) {
         for specifier in node.export_clause().elements().iter() {
             let specifier_name_text = specifier.name().text();
@@ -307,7 +307,7 @@ impl ExternalModuleInfoCollector<'_> {
         }
     }
 
-    // Go: transformers/moduletransforms/externalmoduleinfo.go:225 externalModuleInfoCollector.addExportedFunctionDeclaration
+    // Go: transformers/moduletransforms/externalmoduleinfo.go:216 externalModuleInfoCollector.addExportedFunctionDeclaration
     fn add_exported_function_declaration(&mut self, node: Node, mut name: Node, is_default: bool) {
         self.output
             .exported_functions
@@ -338,7 +338,7 @@ impl ExternalModuleInfoCollector<'_> {
         }
     }
 
-    // Go: transformers/moduletransforms/externalmoduleinfo.go:250 externalModuleInfoCollector.collectExportedVariableInfo
+    // Go: transformers/moduletransforms/externalmoduleinfo.go:241 externalModuleInfoCollector.collectExportedVariableInfo
     fn collect_exported_variable_info(
         &mut self,
         decl: Node, /*VariableDeclaration | BindingElement*/
@@ -364,7 +364,7 @@ impl ExternalModuleInfoCollector<'_> {
 
 const EXTERNAL_HELPERS_MODULE_NAME_TEXT: &str = "tslib";
 
-// Go: transformers/moduletransforms/externalmoduleinfo.go:270 createExternalHelpersImportDeclarationIfNeeded
+// Go: transformers/moduletransforms/externalmoduleinfo.go:262 createExternalHelpersImportDeclarationIfNeeded
 pub(crate) fn create_external_helpers_import_declaration_if_needed(
     emit_context: &EmitContext,
     source_file: Node,
@@ -474,7 +474,7 @@ pub(crate) fn create_external_helpers_import_declaration_if_needed(
     Node::NIL
 }
 
-// Go: transformers/moduletransforms/externalmoduleinfo.go:328 getImportedHelpers
+// Go: transformers/moduletransforms/externalmoduleinfo.go:320 getImportedHelpers
 pub(crate) fn get_imported_helpers(
     emit_context: &EmitContext,
     source_file: Node,
@@ -488,7 +488,7 @@ pub(crate) fn get_imported_helpers(
     helpers
 }
 
-// Go: transformers/moduletransforms/externalmoduleinfo.go:338 getOrCreateExternalHelpersModuleNameIfNeeded
+// Go: transformers/moduletransforms/externalmoduleinfo.go:330 getOrCreateExternalHelpersModuleNameIfNeeded
 pub(crate) fn get_or_create_external_helpers_module_name_if_needed(
     emit_context: &EmitContext,
     node: Node,
@@ -517,12 +517,12 @@ pub(crate) fn get_or_create_external_helpers_module_name_if_needed(
     external_helpers_module_name
 }
 
-// Go: transformers/moduletransforms/externalmoduleinfo.go:356 isNamedDefaultReference
+// Go: transformers/moduletransforms/externalmoduleinfo.go:348 isNamedDefaultReference
 pub(crate) fn is_named_default_reference(e: Node, /*ImportSpecifier | ExportSpecifier*/) -> bool {
     module_export_name_is_default(e.property_name_or_name())
 }
 
-// Go: transformers/moduletransforms/externalmoduleinfo.go:360 containsDefaultReference
+// Go: transformers/moduletransforms/externalmoduleinfo.go:352 containsDefaultReference
 pub(crate) fn contains_default_reference(
     node: Node, /*NamedImportBindings | NamedExportBindings*/
 ) -> bool {
@@ -531,12 +531,12 @@ pub(crate) fn contains_default_reference(
         && node.elements().iter().any(is_named_default_reference)
 }
 
-// Go: transformers/moduletransforms/externalmoduleinfo.go:364 getExportNeedsImportStarHelper
+// Go: transformers/moduletransforms/externalmoduleinfo.go:356 getExportNeedsImportStarHelper
 pub(crate) fn get_export_needs_import_star_helper(node: Node) -> bool {
     get_namespace_declaration_node(node).is_some()
 }
 
-// Go: transformers/moduletransforms/externalmoduleinfo.go:368 getImportNeedsImportStarHelper
+// Go: transformers/moduletransforms/externalmoduleinfo.go:360 getImportNeedsImportStarHelper
 pub(crate) fn get_import_needs_import_star_helper(node: Node) -> bool {
     if get_namespace_declaration_node(node).is_some() {
         return true;
@@ -564,7 +564,7 @@ pub(crate) fn get_import_needs_import_star_helper(node: Node) -> bool {
         || ((elements.len() - default_ref_count) != 0 && is_default_import(node))
 }
 
-// Go: transformers/moduletransforms/externalmoduleinfo.go:387 getImportNeedsImportDefaultHelper
+// Go: transformers/moduletransforms/externalmoduleinfo.go:385 getImportNeedsImportDefaultHelper
 pub(crate) fn get_import_needs_import_default_helper(node: Node) -> bool {
     // Import default is needed if there's a default import or a default ref and no other refs (meaning an import star helper wasn't requested)
     !get_import_needs_import_star_helper(node)

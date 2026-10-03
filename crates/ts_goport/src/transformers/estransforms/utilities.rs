@@ -219,7 +219,7 @@ pub(crate) fn create_not_null_condition(
     )
 }
 
-// Go: transformers/estransforms/utilities.go:53 superAccessState
+// Go: transformers/estransforms/utilities.go:55 superAccessState
 /// superAccessState tracks super property/element accesses and super property assignments
 /// within async function or async generator bodies. It is embedded by both asyncTransformer
 /// and forawaitTransformer to share the tracking logic.
@@ -247,7 +247,7 @@ impl SuperAccessState {
             .factory()
     }
 
-    // Go: transformers/estransforms/utilities.go:68 superAccessState.initSuperAccessVisitor
+    // Go: transformers/estransforms/utilities.go:69 superAccessState.initSuperAccessVisitor
     pub(crate) fn init_super_access_visitor(&mut self, emit_context: &Rc<EmitContext>) {
         self.emit_context = Some(emit_context.clone());
     }
@@ -270,7 +270,7 @@ impl SuperAccessState {
         f(&mut visitor)
     }
 
-    // Go: transformers/estransforms/utilities.go:76 superAccessState.visitSuperAccessNode
+    // Go: transformers/estransforms/utilities.go:77 superAccessState.visitSuperAccessNode
     /// visitSuperAccessNode walks the async/generator body and replaces super property/element
     /// accesses with _super/_superIndex references. This is necessary because the async body
     /// ends up inside a generator function where `super` is not valid.
@@ -316,7 +316,7 @@ impl SuperAccessState {
         }
     }
 
-    // Go: transformers/estransforms/utilities.go:110 superAccessState.substituteSuperAccessesInBody
+    // Go: transformers/estransforms/utilities.go:111 superAccessState.substituteSuperAccessesInBody
     pub(crate) fn substitute_super_accesses_in_body(&mut self, body: Node) -> Node {
         self.with_super_access_visitor(|v| v.visit_node(body))
     }
@@ -326,7 +326,7 @@ impl SuperAccessState {
         self.with_super_access_visitor(|v| v.visit_nodes(nodes))
     }
 
-    // Go: transformers/estransforms/utilities.go:115 superAccessState.substituteCallExpressionWithSuperAccess
+    // Go: transformers/estransforms/utilities.go:116 superAccessState.substituteCallExpressionWithSuperAccess
     /// substituteCallExpressionWithSuperAccess handles super.x(args) and super[x](args).
     // PORT: Go passes `s.superAccessVisitor` as `visitor`; it is built here.
     fn substitute_call_expression_with_super_access(&mut self, call: Node) -> Node {
@@ -381,7 +381,7 @@ impl SuperAccessState {
         result
     }
 
-    // Go: transformers/estransforms/utilities.go:157 superAccessState.createSuperElementAccessInAsyncMethod
+    // Go: transformers/estransforms/utilities.go:158 superAccessState.createSuperElementAccessInAsyncMethod
     /// createSuperElementAccessInAsyncMethod creates _superIndex(x) or _superIndex(x).value.
     pub(crate) fn create_super_element_access_in_async_method(
         &self,
@@ -406,7 +406,7 @@ impl SuperAccessState {
         super_index_call
     }
 
-    // Go: transformers/estransforms/utilities.go:185 superAccessState.createSuperAccessVariableStatement
+    // Go: transformers/estransforms/utilities.go:182 superAccessState.createSuperAccessVariableStatement
     /// createSuperAccessVariableStatement creates a variable named `_super` with accessor
     /// properties for the given property names.
     ///
@@ -531,7 +531,7 @@ impl SuperAccessState {
         f.new_variable_statement(ModifierList::NIL, decl_list)
     }
 
-    // Go: transformers/estransforms/utilities.go:258 superAccessState.trackSuperAccess
+    // Go: transformers/estransforms/utilities.go:251 superAccessState.trackSuperAccess
     /// trackSuperAccess records super property/element accesses and super property assignments
     /// for the enclosing async method body. Called from both the main visitor and auxiliary
     /// visitors to ensure super accesses are tracked regardless of whether the node has
@@ -570,7 +570,7 @@ impl SuperAccessState {
     }
 }
 
-// Go: transformers/estransforms/utilities.go:281 createAccessorPropertyBackingField
+// Go: transformers/estransforms/utilities.go:280 createAccessorPropertyBackingField
 /// createAccessorPropertyBackingField creates a private backing field for an `accessor` PropertyDeclaration.
 pub(crate) fn create_accessor_property_backing_field(
     f: &NodeFactory,

@@ -86,7 +86,7 @@ fn visit_condition_body_child(
 }
 
 impl Checker {
-    // Go: checker/checker.go:3874 isSymbolUsedInBinaryExpressionChain
+    // Go: checker/checker.go:3918 isSymbolUsedInBinaryExpressionChain
     pub fn is_symbol_used_in_binary_expression_chain(
         &mut self,
         node: Node,
@@ -108,7 +108,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:3895 isSymbolUsedInConditionBody
+    // Go: checker/checker.go:3939 isSymbolUsedInConditionBody
     pub fn is_symbol_used_in_condition_body(
         &mut self,
         expr: Node,
@@ -121,21 +121,21 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:3931 checkDoStatement
+    // Go: checker/checker.go:3975 checkDoStatement
     pub fn check_do_statement(&mut self, node: Node) {
         self.check_grammar_statement_in_ambient_context(node);
         self.check_source_element(node.statement());
         self.check_truthiness_expression(node.expression(), CheckMode::NORMAL);
     }
 
-    // Go: checker/checker.go:3937 checkWhileStatement
+    // Go: checker/checker.go:3981 checkWhileStatement
     pub fn check_while_statement(&mut self, node: Node) {
         self.check_grammar_statement_in_ambient_context(node);
         self.check_truthiness_expression(node.expression(), CheckMode::NORMAL);
         self.check_source_element(node.statement());
     }
 
-    // Go: checker/checker.go:3943 checkForStatement
+    // Go: checker/checker.go:3987 checkForStatement
     pub fn check_for_statement(&mut self, node: Node) {
         if !self.check_grammar_statement_in_ambient_context(node) {
             let init = node.initializer();
@@ -166,7 +166,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:3969 checkForInStatement
+    // Go: checker/checker.go:4013 checkForInStatement
     pub fn check_for_in_statement(&mut self, node: Node) {
         // PORT: Go passes `node.AsForInOrOfStatement()`; the Rust callee takes the node.
         self.check_grammar_for_in_or_for_of_statement(node);
@@ -241,7 +241,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4011 getIndexTypeOrString
+    // Go: checker/checker.go:4055 getIndexTypeOrString
     pub fn get_index_type_or_string(&mut self, t: TypeId) -> TypeId {
         let index = self.get_index_type(t);
         let index_type = self.get_extract_string_type(index);
@@ -252,7 +252,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4016 checkForOfStatement
+    // Go: checker/checker.go:4060 checkForOfStatement
     pub fn check_for_of_statement(&mut self, node: Node) {
         // PORT: Go passes `node.AsForInOrOfStatement()`; the Rust callee takes the node.
         self.check_grammar_for_in_or_for_of_statement(node);
@@ -330,14 +330,14 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4064 checkBreakOrContinueStatement
+    // Go: checker/checker.go:4108 checkBreakOrContinueStatement
     pub fn check_break_or_continue_statement(&mut self, node: Node) {
         if !self.check_grammar_statement_in_ambient_context(node) {
             self.check_grammar_break_or_continue_statement(node);
         }
     }
 
-    // Go: checker/checker.go:4070 checkReturnStatement
+    // Go: checker/checker.go:4114 checkReturnStatement
     pub fn check_return_statement(&mut self, node: Node) {
         // Always check the return expression so its identifiers are resolved even when the
         // return statement is misplaced (grammar error), keeping diagnostics stable
@@ -418,7 +418,7 @@ impl Checker {
 
     // When checking an arrow expression such as `(x) => exp`, then `node` is the expression `exp`.
     // Otherwise, `node` is a return statement.
-    // Go: checker/checker.go:4112 checkReturnExpression
+    // Go: checker/checker.go:4159 checkReturnExpression
     pub fn check_return_expression(
         &mut self,
         container: Node,
@@ -484,7 +484,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/checker.go:4137 checkWithStatement
+    // Go: checker/checker.go:4184 checkWithStatement
     pub fn check_with_statement(&mut self, node: Node) {
         if !self.check_grammar_statement_in_ambient_context(node) {
             if node.flags().intersects(NodeFlags::AWAIT_CONTEXT) {
@@ -510,7 +510,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4152 checkSwitchStatement
+    // Go: checker/checker.go:4199 checkSwitchStatement
     pub fn check_switch_statement(&mut self, node: Node) {
         // Grammar checking
         self.check_grammar_statement_in_ambient_context(node);
@@ -561,7 +561,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4188 checkLabeledStatement
+    // Go: checker/checker.go:4235 checkLabeledStatement
     pub fn check_labeled_statement(&mut self, node: Node) {
         let label_node = node.label();
         let label_text = label_node.text();
@@ -588,7 +588,7 @@ impl Checker {
         self.check_source_element(node.statement());
     }
 
-    // Go: checker/checker.go:4206 checkThrowStatement
+    // Go: checker/checker.go:4253 checkThrowStatement
     pub fn check_throw_statement(&mut self, node: Node) {
         let throw_expr = node.expression();
         if !self.check_grammar_statement_in_ambient_context(node) {
@@ -605,7 +605,7 @@ impl Checker {
         self.check_expression(throw_expr);
     }
 
-    // Go: checker/checker.go:4216 checkTryStatement
+    // Go: checker/checker.go:4263 checkTryStatement
     pub fn check_try_statement(&mut self, node: Node) {
         self.check_grammar_statement_in_ambient_context(node);
         self.check_block(node.try_block());
@@ -619,7 +619,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4228 checkCatchClause
+    // Go: checker/checker.go:4275 checkCatchClause
     pub fn check_catch_clause(&mut self, node: Node) {
         let declaration = node.variable_declaration();
         if declaration.is_some() {
@@ -666,14 +666,14 @@ impl Checker {
         self.check_block(node.block());
     }
 
-    // Go: checker/checker.go:4254 checkBindingElement
+    // Go: checker/checker.go:4301 checkBindingElement
     pub fn check_binding_element(&mut self, node: Node) {
         // PORT: Go passes `node.AsBindingElement()`; the Rust callee takes the node.
         self.check_grammar_binding_element(node);
         self.check_variable_like_declaration(node);
     }
 
-    // Go: checker/checker.go:4259 checkClassDeclaration
+    // Go: checker/checker.go:4306 checkClassDeclaration
     pub fn check_class_declaration(&mut self, node: Node) {
         let first_decorator = node
             .modifier_nodes()
@@ -704,7 +704,7 @@ impl Checker {
         self.register_for_unused_identifiers_check(node);
     }
 
-    // Go: checker/checker.go:4274 checkClassLikeDeclaration
+    // Go: checker/checker.go:4321 checkClassLikeDeclaration
     pub fn check_class_like_declaration(&mut self, node: Node) {
         self.check_grammar_class_like_declaration(node);
         self.check_decorators(node);
@@ -896,7 +896,7 @@ impl Checker {
         self.check_property_initialization(node);
     }
 
-    // Go: checker/checker.go:4404 checkJSDocAugmentsTagMatchesExtends
+    // Go: checker/checker.go:4424 checkJSDocAugmentsTagMatchesExtends
     pub fn check_js_doc_augments_tag_matches_extends(
         &mut self,
         node: Node,
@@ -940,7 +940,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4374 checkClassForStaticPropertyNameConflicts
+    // Go: checker/checker.go:4450 checkClassForStaticPropertyNameConflicts
     pub fn check_class_for_static_property_name_conflicts(&mut self, node: Node) {
         if self.compiler_options.get_use_define_for_class_fields() {
             return;
@@ -968,7 +968,7 @@ impl Checker {
     }
 
     // Check that type parameter lists are identical across multiple declarations
-    // Go: checker/checker.go:4397 checkTypeParameterListsIdentical
+    // Go: checker/checker.go:4473 checkTypeParameterListsIdentical
     pub fn check_type_parameter_lists_identical(&mut self, symbol: SymbolId) {
         if self.sym(symbol).declarations.len() == 1 {
             return;
@@ -1004,7 +1004,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4419 getClassOrInterfaceDeclarationsOfSymbol
+    // Go: checker/checker.go:4495 getClassOrInterfaceDeclarationsOfSymbol
     pub fn get_class_or_interface_declarations_of_symbol(&self, symbol: SymbolId) -> Vec<Node> {
         self.sym(symbol)
             .declarations
@@ -1014,7 +1014,7 @@ impl Checker {
             .collect()
     }
 
-    // Go: checker/checker.go:4425 areTypeParametersIdentical
+    // Go: checker/checker.go:4501 areTypeParametersIdentical
     // PORT: Go `getTypeParameterDeclarations func(node *ast.Node) []*ast.Node`
     // is `&dyn Fn(Node) -> Vec<Node>`.
     pub fn are_type_parameters_identical(
@@ -1068,7 +1068,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:4462 checkBaseTypeAccessibility
+    // Go: checker/checker.go:4538 checkBaseTypeAccessibility
     pub fn check_base_type_accessibility(&mut self, t: TypeId, node: Node) {
         let signatures = self.get_signatures_of_type(t, SignatureKind::CONSTRUCT);
         let accessibility_error =
@@ -1084,7 +1084,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4475 issueMemberSpecificError
+    // Go: checker/checker.go:4546 issueMemberSpecificError
     pub fn issue_member_specific_error(
         &mut self,
         node: Node,
@@ -1141,7 +1141,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4500 getTypeWithoutSignatures
+    // Go: checker/checker.go:4571 getTypeWithoutSignatures
     pub fn get_type_without_signatures(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::OBJECT) {
@@ -1176,7 +1176,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:4517 checkKindsOfPropertyMemberOverrides
+    // Go: checker/checker.go:4588 checkKindsOfPropertyMemberOverrides
     pub fn check_kinds_of_property_member_overrides(&mut self, t: TypeId, base_type: TypeId) {
         // TypeScript 1.0 spec (April 2014): 8.2.3
         // A derived class inherits all members from its base class it doesn't override.
@@ -1437,7 +1437,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4673 arePropertiesAbstractOrInterface
+    // Go: checker/checker.go:4744 arePropertiesAbstractOrInterface
     pub fn are_properties_abstract_or_interface(
         &self,
         base: SymbolId,
@@ -1456,7 +1456,7 @@ impl Checker {
             .all(|&d| self.is_property_abstract_or_interface(d, base_declaration_flags))
     }
 
-    // Go: checker/checker.go:4680 isPropertyAbstractOrInterface
+    // Go: checker/checker.go:4751 isPropertyAbstractOrInterface
     pub fn is_property_abstract_or_interface(
         &self,
         declaration: Node,
@@ -1467,7 +1467,7 @@ impl Checker {
                 && (!is_property_declaration(declaration) || declaration.initializer().is_nil())
     }
 
-    // Go: checker/checker.go:4685 checkMembersForOverrideModifier
+    // Go: checker/checker.go:4756 checkMembersForOverrideModifier
     pub fn check_members_for_override_modifier(
         &mut self,
         node: Node,
@@ -1516,7 +1516,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4738 checkMemberForOverrideModifier
+    // Go: checker/checker.go:4781 checkMemberForOverrideModifier
     pub fn check_member_for_override_modifier(
         &mut self,
         node: Node,
@@ -1548,7 +1548,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/checker.go:4747 getMemberOverrideModifierStatus
+    // Go: checker/checker.go:4790 getMemberOverrideModifierStatus
     pub fn get_member_override_modifier_status(
         &mut self,
         node: Node,
@@ -1594,7 +1594,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:4775 checkMemberForOverrideModifierWorker
+    // Go: checker/checker.go:4815 checkMemberForOverrideModifierWorker
     #[allow(clippy::too_many_arguments)]
     pub fn check_member_for_override_modifier_worker(
         &mut self,
@@ -1735,7 +1735,7 @@ impl Checker {
         MemberOverrideStatus::NONE
     }
 
-    // Go: checker/checker.go:4763 getSuggestedSymbolForNonexistentClassMember
+    // Go: checker/checker.go:4873 getSuggestedSymbolForNonexistentClassMember
     pub fn get_suggested_symbol_for_nonexistent_class_member(
         &mut self,
         name: &str,
@@ -1746,7 +1746,7 @@ impl Checker {
         self.get_spelling_suggestion_for_name(name, &properties, SymbolFlags::CLASS_MEMBER)
     }
 
-    // Go: checker/checker.go:4767 checkIndexConstraints
+    // Go: checker/checker.go:4877 checkIndexConstraints
     pub fn check_index_constraints(&mut self, t: TypeId, symbol: SymbolId, is_static_index: bool) {
         let index_infos = self.get_index_infos_of_type(t);
         if index_infos.is_empty() {

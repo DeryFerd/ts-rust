@@ -59,7 +59,7 @@ use crate::transformers::utilities::{
     move_range_past_decorators, single_or_many,
 };
 
-// Go: transformers/estransforms/esdecorator.go:47 lexicalEntryKind
+// Go: transformers/estransforms/esdecorator.go:48 lexicalEntryKind
 /// lexicalEntryKind discriminates the kind of lexical scope entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LexicalEntryKind {
@@ -69,7 +69,7 @@ pub(super) enum LexicalEntryKind {
     Other,
 }
 
-// Go: transformers/estransforms/esdecorator.go:58 lexicalEntry
+// Go: transformers/estransforms/esdecorator.go:59 lexicalEntry
 /// lexicalEntry represents a single entry in the lexical scope stack used to track
 /// nested class declarations and their state during transformation.
 pub(super) struct LexicalEntry {
@@ -96,7 +96,7 @@ impl LexicalEntry {
     }
 }
 
-// Go: transformers/estransforms/esdecorator.go:69 memberInfo
+// Go: transformers/estransforms/esdecorator.go:70 memberInfo
 /// memberInfo stores decoration-related data for a single class element.
 #[derive(Clone, Copy, Default)]
 pub(super) struct MemberInfo {
@@ -106,7 +106,7 @@ pub(super) struct MemberInfo {
     pub(super) member_descriptor_name: Node,
 }
 
-// Go: transformers/estransforms/esdecorator.go:77 classInfo
+// Go: transformers/estransforms/esdecorator.go:78 classInfo
 /// classInfo stores all transformation data for a single decorated class.
 #[derive(Default)]
 pub(super) struct ClassInfo {
@@ -134,7 +134,7 @@ pub(super) struct ClassInfo {
 /// Go `*classInfo`.
 pub(super) type ClassInfoRef = Rc<RefCell<ClassInfo>>;
 
-// Go: transformers/estransforms/esdecorator.go:99 esDecoratorTransformer
+// Go: transformers/estransforms/esdecorator.go:100 esDecoratorTransformer
 pub struct EsDecoratorTransformer {
     pub(super) emit_context: Rc<EmitContext>,
     pub(super) compiler_options: &'static CompilerOptions,
@@ -176,7 +176,7 @@ pub fn new_es_decorator_transformer(opts: &TransformOptions) -> Option<Transform
 /// `createDescriptorFunc`.
 pub(super) type CreateDescriptorFunc = fn(&mut EsDecoratorTransformer, Node, ModifierList) -> Node;
 
-// Go: transformers/estransforms/esdecorator.go:1231 partialResult
+// Go: transformers/estransforms/esdecorator.go:1232 partialResult
 #[derive(Clone, Copy)]
 pub(super) struct PartialResult {
     pub(super) modifiers: ModifierList,
@@ -252,7 +252,7 @@ impl EsDecoratorTransformer {
         }
     }
 
-    // Go: transformers/estransforms/esdecorator.go:190 esDecoratorTransformer.enterClass
+    // Go: transformers/estransforms/esdecorator.go:189 esDecoratorTransformer.enterClass
     pub(super) fn enter_class(&mut self, ci: Option<ClassInfoRef>) {
         let mut entry = LexicalEntry::new(LexicalEntryKind::Class, self.top.take());
         entry.class_info_data = ci;
@@ -261,7 +261,7 @@ impl EsDecoratorTransformer {
         self.update_state();
     }
 
-    // Go: transformers/estransforms/esdecorator.go:201 esDecoratorTransformer.exitClass
+    // Go: transformers/estransforms/esdecorator.go:200 esDecoratorTransformer.exitClass
     pub(super) fn exit_class(&mut self) {
         // Go evaluates the message args first: a nil `tx.top` is a nil dereference.
         let top = self.top.take().unwrap_or_else(|| go_nil_dereference());
@@ -276,7 +276,7 @@ impl EsDecoratorTransformer {
         self.update_state();
     }
 
-    // Go: transformers/estransforms/esdecorator.go:208 esDecoratorTransformer.enterClassElement
+    // Go: transformers/estransforms/esdecorator.go:207 esDecoratorTransformer.enterClassElement
     pub(super) fn enter_class_element(&mut self, node: Node) {
         let top_kind = self
             .top
@@ -302,7 +302,7 @@ impl EsDecoratorTransformer {
         self.update_state();
     }
 
-    // Go: transformers/estransforms/esdecorator.go:223 esDecoratorTransformer.exitClassElement
+    // Go: transformers/estransforms/esdecorator.go:222 esDecoratorTransformer.exitClassElement
     pub(super) fn exit_class_element(&mut self) {
         let top = self.top.take().unwrap_or_else(|| go_nil_dereference());
         go_assert!(
@@ -324,7 +324,7 @@ impl EsDecoratorTransformer {
         self.update_state();
     }
 
-    // Go: transformers/estransforms/esdecorator.go:230 esDecoratorTransformer.enterName
+    // Go: transformers/estransforms/esdecorator.go:229 esDecoratorTransformer.enterName
     pub(super) fn enter_name(&mut self) {
         let top_kind = self
             .top
@@ -341,7 +341,7 @@ impl EsDecoratorTransformer {
         self.update_state();
     }
 
-    // Go: transformers/estransforms/esdecorator.go:239 esDecoratorTransformer.exitName
+    // Go: transformers/estransforms/esdecorator.go:238 esDecoratorTransformer.exitName
     pub(super) fn exit_name(&mut self) {
         let top = self.top.take().unwrap_or_else(|| go_nil_dereference());
         go_assert!(
@@ -353,7 +353,7 @@ impl EsDecoratorTransformer {
         self.update_state();
     }
 
-    // Go: transformers/estransforms/esdecorator.go:245 esDecoratorTransformer.enterOther
+    // Go: transformers/estransforms/esdecorator.go:244 esDecoratorTransformer.enterOther
     pub(super) fn enter_other(&mut self) {
         if let Some(top) = self.top.as_mut()
             && top.kind == LexicalEntryKind::Other
@@ -507,7 +507,7 @@ impl EsDecoratorTransformer {
         }
     }
 
-    // Go: transformers/estransforms/esdecorator.go:368 esDecoratorTransformer.modifierVisitorVisit
+    // Go: transformers/estransforms/esdecorator.go:369 esDecoratorTransformer.modifierVisitorVisit
     pub(super) fn modifier_visitor_visit(&mut self, node: Node) -> Node {
         if node.kind() == SyntaxKind::Decorator {
             return Node::NIL;
@@ -525,7 +525,7 @@ impl EsDecoratorTransformer {
         })
     }
 
-    // Go: transformers/estransforms/esdecorator.go:375 esDecoratorTransformer.classElementVisitorVisit
+    // Go: transformers/estransforms/esdecorator.go:376 esDecoratorTransformer.classElementVisitorVisit
     pub(super) fn class_element_visitor_visit(&mut self, node: Node) -> Node {
         match node.kind() {
             SyntaxKind::Constructor => self.visit_constructor_declaration(node),
@@ -540,7 +540,7 @@ impl EsDecoratorTransformer {
         }
     }
 
-    // Go: transformers/estransforms/esdecorator.go:394 esDecoratorTransformer.discardedValueVisit
+    // Go: transformers/estransforms/esdecorator.go:395 esDecoratorTransformer.discardedValueVisit
     pub(super) fn discarded_value_visit(&mut self, node: Node) -> Node {
         match node.kind() {
             SyntaxKind::PrefixUnaryExpression | SyntaxKind::PostfixUnaryExpression => {
@@ -564,7 +564,7 @@ impl EsDecoratorTransformer {
         self.with_visitor(Self::discarded_value_visit, |v| v.visit_node(node))
     }
 
-    // Go: transformers/estransforms/esdecorator.go:409 esDecoratorTransformer.nonConstructorClassElementVisit
+    // Go: transformers/estransforms/esdecorator.go:410 esDecoratorTransformer.nonConstructorClassElementVisit
     pub(super) fn non_constructor_class_element_visit(&mut self, node: Node) -> Node {
         if is_constructor_declaration(node) {
             return node; // skip constructors in pass 1
@@ -572,7 +572,7 @@ impl EsDecoratorTransformer {
         self.class_element_visitor_visit(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:416 esDecoratorTransformer.constructorClassElementVisit
+    // Go: transformers/estransforms/esdecorator.go:417 esDecoratorTransformer.constructorClassElementVisit
     pub(super) fn constructor_class_element_visit(&mut self, node: Node) -> Node {
         if is_constructor_declaration(node) {
             return self.class_element_visitor_visit(node);
@@ -580,7 +580,7 @@ impl EsDecoratorTransformer {
         node
     }
 
-    // Go: transformers/estransforms/esdecorator.go:423 esDecoratorTransformer.exportStrippingModifierVisit
+    // Go: transformers/estransforms/esdecorator.go:424 esDecoratorTransformer.exportStrippingModifierVisit
     pub(super) fn export_stripping_modifier_visit(&mut self, node: Node) -> Node {
         if node.kind() == SyntaxKind::ExportKeyword {
             return Node::NIL;
@@ -612,7 +612,7 @@ impl EsDecoratorTransformer {
         node
     }
 
-    // Go: transformers/estransforms/esdecorator.go:467 esDecoratorTransformer.createHelperVariable
+    // Go: transformers/estransforms/esdecorator.go:464 esDecoratorTransformer.createHelperVariable
     pub(super) fn create_helper_variable(&self, node: Node, suffix: &str) -> Node {
         let ec = &self.emit_context;
         ec.factory().new_unique_name_ex(
@@ -625,7 +625,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:474 esDecoratorTransformer.createLet
+    // Go: transformers/estransforms/esdecorator.go:471 esDecoratorTransformer.createLet
     pub(super) fn create_let(&self, name: Node, initializer: Node) -> Node {
         let f = self.emit_context.factory();
         f.new_variable_statement(
@@ -642,7 +642,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:487 esDecoratorTransformer.createClassInfo
+    // Go: transformers/estransforms/esdecorator.go:483 esDecoratorTransformer.createClassInfo
     pub(super) fn create_class_info(&self, node: Node) -> ClassInfo {
         let ec = &self.emit_context;
         let f = ec.factory();
@@ -761,7 +761,7 @@ impl EsDecoratorTransformer {
         ci
     }
 
-    // Go: transformers/estransforms/esdecorator.go:584 esDecoratorTransformer.transformClassLike
+    // Go: transformers/estransforms/esdecorator.go:577 esDecoratorTransformer.transformClassLike
     pub(super) fn transform_class_like(&mut self, mut node: Node) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -1291,7 +1291,7 @@ impl EsDecoratorTransformer {
         f.new_immediately_invoked_arrow_function(&merged_statements)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:979 esDecoratorTransformer.emitMemberInfoDeclarations
+    // Go: transformers/estransforms/esdecorator.go:993 esDecoratorTransformer.emitMemberInfoDeclarations
     /// Generates let declarations for member decorator info variables, filtered by static/non-static.
     pub(super) fn emit_member_info_declarations(
         &self,
@@ -1324,7 +1324,7 @@ impl EsDecoratorTransformer {
         stmts
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1006 esDecoratorTransformer.visitClassDeclaration
+    // Go: transformers/estransforms/esdecorator.go:1019 esDecoratorTransformer.visitClassDeclaration
     pub(super) fn visit_class_declaration(&mut self, node: Node) -> Node {
         if is_decorated_class_like(node) {
             let ec = self.ec();
@@ -1452,7 +1452,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1098 esDecoratorTransformer.visitClassExpression
+    // Go: transformers/estransforms/esdecorator.go:1107 esDecoratorTransformer.visitClassExpression
     pub(super) fn visit_class_expression(&mut self, node: Node) -> Node {
         if is_decorated_class_like(node) {
             let iife = self.transform_class_like(node);
@@ -1477,7 +1477,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1113 esDecoratorTransformer.prepareConstructor
+    // Go: transformers/estransforms/esdecorator.go:1122 esDecoratorTransformer.prepareConstructor
     pub(super) fn prepare_constructor(&self, ci: &ClassInfoRef) -> Vec<Node> {
         // Decorated instance members can add "extra" initializers to the instance. If a class contains any instance
         // fields, we'll inject the `__runInitializers()` call for these extra initializers into the initializer of
@@ -1491,7 +1491,7 @@ impl EsDecoratorTransformer {
         vec![f.new_expression_statement(f.inline_expressions(&pending))]
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1129 esDecoratorTransformer.transformConstructorBodyWorker
+    // Go: transformers/estransforms/esdecorator.go:1138 esDecoratorTransformer.transformConstructorBodyWorker
     pub(super) fn transform_constructor_body_worker(
         &mut self,
         mut statements_out: Vec<Node>,
@@ -1555,7 +1555,7 @@ impl EsDecoratorTransformer {
         statements_out
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1177 esDecoratorTransformer.visitConstructorDeclaration
+    // Go: transformers/estransforms/esdecorator.go:1184 esDecoratorTransformer.visitConstructorDeclaration
     pub(super) fn visit_constructor_declaration(&mut self, node: Node) -> Node {
         self.enter_class_element(node);
         let ec = self.ec();
@@ -1614,7 +1614,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1220 esDecoratorTransformer.finishClassElement
+    // Go: transformers/estransforms/esdecorator.go:1222 esDecoratorTransformer.finishClassElement
     pub(super) fn finish_class_element(&self, updated: Node, original: Node) -> Node {
         if updated != original {
             // While we emit the source map for the node after skipping decorators and modifiers,
@@ -1626,7 +1626,7 @@ impl EsDecoratorTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1243 esDecoratorTransformer.partialTransformClassElement
+    // Go: transformers/estransforms/esdecorator.go:1244 esDecoratorTransformer.partialTransformClassElement
     pub(super) fn partial_transform_class_element(
         &mut self,
         member: Node,
@@ -1871,7 +1871,7 @@ impl EsDecoratorTransformer {
         result
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1436 esDecoratorTransformer.appendDecorationStatement
+    // Go: transformers/estransforms/esdecorator.go:1447 esDecoratorTransformer.appendDecorationStatement
     /// appendDecorationStatement appends an __esDecorate statement to the appropriate
     /// decoration statement list on classInfo based on the member's kind and static-ness.
     pub(super) fn append_decoration_statement(&self, ci: &ClassInfoRef, member: Node, stmt: Node) {
@@ -1894,7 +1894,7 @@ impl EsDecoratorTransformer {
         }
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1454 esDecoratorTransformer.visitMethodDeclaration
+    // Go: transformers/estransforms/esdecorator.go:1465 esDecoratorTransformer.visitMethodDeclaration
     pub(super) fn visit_method_declaration(&mut self, node: Node) -> Node {
         self.enter_class_element(node);
         let result = self.partial_transform_class_element(
@@ -1929,7 +1929,7 @@ impl EsDecoratorTransformer {
         self.finish_class_element(updated, node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1471 esDecoratorTransformer.visitGetAccessorDeclaration
+    // Go: transformers/estransforms/esdecorator.go:1482 esDecoratorTransformer.visitGetAccessorDeclaration
     pub(super) fn visit_get_accessor_declaration(&mut self, node: Node) -> Node {
         self.enter_class_element(node);
         let result = self.partial_transform_class_element(
@@ -1962,7 +1962,7 @@ impl EsDecoratorTransformer {
         self.finish_class_element(updated, node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1488 esDecoratorTransformer.visitSetAccessorDeclaration
+    // Go: transformers/estransforms/esdecorator.go:1499 esDecoratorTransformer.visitSetAccessorDeclaration
     pub(super) fn visit_set_accessor_declaration(&mut self, node: Node) -> Node {
         self.enter_class_element(node);
         let result = self.partial_transform_class_element(
@@ -1995,7 +1995,7 @@ impl EsDecoratorTransformer {
         self.finish_class_element(updated, node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1505 esDecoratorTransformer.visitClassStaticBlockDeclaration
+    // Go: transformers/estransforms/esdecorator.go:1516 esDecoratorTransformer.visitClassStaticBlockDeclaration
     pub(super) fn visit_class_static_block_declaration(&mut self, node: Node) -> Node {
         self.enter_class_element(node);
         let ec = self.ec();
@@ -2060,7 +2060,7 @@ impl EsDecoratorTransformer {
         result
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1565 esDecoratorTransformer.visitPropertyDeclaration
+    // Go: transformers/estransforms/esdecorator.go:1574 esDecoratorTransformer.visitPropertyDeclaration
     pub(super) fn visit_property_declaration(&mut self, mut node: Node) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -2261,7 +2261,7 @@ impl EsDecoratorTransformer {
     }
 }
 
-// Go: transformers/estransforms/esdecorator.go:430 getHelperVariableName
+// Go: transformers/estransforms/esdecorator.go:431 getHelperVariableName
 pub(super) fn get_helper_variable_name(ec: &EmitContext, node: Node) -> String {
     let name = node.name();
     let mut declaration_name =
@@ -2301,18 +2301,18 @@ pub(super) fn get_helper_variable_name(ec: &EmitContext, node: Node) -> String {
     format!("_{declaration_name}")
 }
 
-// Go: transformers/estransforms/esdecorator.go:1000 isDecoratedClassLike
+// Go: transformers/estransforms/esdecorator.go:1014 isDecoratedClassLike
 pub(super) fn is_decorated_class_like(node: Node) -> bool {
     class_or_constructor_parameter_is_decorated(false, node)
         || child_is_decorated(false, node, Node::NIL)
 }
 
-// Go: transformers/estransforms/esdecorator.go:1872 isAnonymousClassNeedingAssignedName
+// Go: transformers/estransforms/esdecorator.go:1877 isAnonymousClassNeedingAssignedName
 pub(super) fn is_anonymous_class_needing_assigned_name(node: Node) -> bool {
     is_class_expression(node) && node.name().is_nil() && is_decorated_class_like(node)
 }
 
-// Go: transformers/estransforms/esdecorator.go:1880 canIgnoreEmptyStringLiteralInAssignedName
+// Go: transformers/estransforms/esdecorator.go:1885 canIgnoreEmptyStringLiteralInAssignedName
 /// The IIFE produced for `(@dec class {})` will result in an assigned name of the form
 /// `var class_1 = class { };`, and thus the empty string cannot be ignored. However, The IIFE
 /// produced for `(class { @dec x; })` will not result in an assigned name since it
@@ -2327,7 +2327,7 @@ pub(super) fn can_ignore_empty_string_literal_in_assigned_name(node: Node) -> bo
         && !class_or_constructor_parameter_is_decorated(false, inner_expression)
 }
 
-// Go: transformers/estransforms/esdecorator.go:2720 injectClassThisAssignmentIfMissing
+// Go: transformers/estransforms/esdecorator.go:2719 injectClassThisAssignmentIfMissing
 pub(super) fn inject_class_this_assignment_if_missing(
     ec: &EmitContext,
     f: &crate::printer::factory::NodeFactory,

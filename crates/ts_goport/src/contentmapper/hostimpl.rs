@@ -3153,13 +3153,13 @@ mod tests {
         }
     }
 
-    // Go: host_test.go:161 invalidDiagnosticMapper
+    // Go: host_test.go:160 invalidDiagnosticMapper
     struct InvalidDiagnosticMapper {
         encoding: PositionEncoding,
     }
 
     impl MapperHandler for InvalidDiagnosticMapper {
-        // Go: host_test.go:165 invalidDiagnosticMapper.HandleRequest
+        // Go: host_test.go:164 invalidDiagnosticMapper.HandleRequest
         fn handle_request(
             &self,
             method: &str,
@@ -3469,7 +3469,7 @@ mod tests {
         let _ = host.close();
     }
 
-    // Go: host_test.go:402 exitedReadWriteCloser
+    // Go: host_test.go:401 exitedReadWriteCloser
     struct ExitedReadWriteCloser {
         inner: Arc<PipeEnd>,
         exit_code: i32,
@@ -3494,13 +3494,13 @@ mod tests {
     }
 
     impl ProcessExitState for ExitedReadWriteCloser {
-        // Go: host_test.go:407 exitedReadWriteCloser.ExitCode
+        // Go: host_test.go:406 exitedReadWriteCloser.ExitCode
         fn exit_code(&self) -> (i32, bool) {
             (self.exit_code, true)
         }
     }
 
-    // Go: host_test.go:411 exitOnCloseReadWriteCloser
+    // Go: host_test.go:410 exitOnCloseReadWriteCloser
     struct ExitOnCloseReadWriteCloser {
         inner: Arc<PipeEnd>,
         exited: AtomicBool,
@@ -3519,7 +3519,7 @@ mod tests {
             self.inner.flush()
         }
 
-        // Go: host_test.go:416 exitOnCloseReadWriteCloser.Close
+        // Go: host_test.go:415 exitOnCloseReadWriteCloser.Close
         fn close(&self) -> std::result::Result<(), GoError> {
             self.exited.store(true, Ordering::SeqCst);
             self.inner.close()
@@ -3527,13 +3527,13 @@ mod tests {
     }
 
     impl ProcessExitState for ExitOnCloseReadWriteCloser {
-        // Go: host_test.go:421 exitOnCloseReadWriteCloser.ExitCode
+        // Go: host_test.go:420 exitOnCloseReadWriteCloser.ExitCode
         fn exit_code(&self) -> (i32, bool) {
             (1, self.exited.load(Ordering::SeqCst))
         }
     }
 
-    // Go: host_test.go:425 closeSignalReadWriteCloser
+    // Go: host_test.go:424 closeSignalReadWriteCloser
     struct CloseSignalReadWriteCloser {
         inner: Arc<PipeEnd>,
         closed: mpsc::SyncSender<()>,
@@ -3553,7 +3553,7 @@ mod tests {
             self.inner.flush()
         }
 
-        // Go: host_test.go:431 closeSignalReadWriteCloser.Close
+        // Go: host_test.go:430 closeSignalReadWriteCloser.Close
         fn close(&self) -> std::result::Result<(), GoError> {
             let err = self.inner.close();
             self.once.call_once(|| {
@@ -3603,7 +3603,7 @@ mod tests {
         let _ = host.close();
     }
 
-    // Go: host_test.go:365 TestHostReportsInitializationTimeoutBeforeClosingProcess
+    // Go: host_test.go:364 TestHostReportsInitializationTimeoutBeforeClosingProcess
     // PORT: Go's mapper waits for the test context. This one reads until the
     // host closes its end, which it does at the initialize deadline.
     #[test]
@@ -3643,7 +3643,7 @@ mod tests {
         let _ = host.close();
     }
 
-    // Go: host_test.go:385 TestHostReportsProcessExitBeforeInitialization
+    // Go: host_test.go:384 TestHostReportsProcessExitBeforeInitialization
     #[test]
     fn test_host_reports_process_exit_before_initialization() {
         let spawner = SpawnerFunc(Box::new(
@@ -3670,7 +3670,7 @@ mod tests {
         let _ = host.close();
     }
 
-    // Go: host_test.go:437 TestRunnerTransformDiagnosticDirectives
+    // Go: host_test.go:436 TestRunnerTransformDiagnosticDirectives
     #[test]
     fn test_runner_transform_diagnostic_directives() {
         let mapper = vue_mapper_with_extension();
@@ -3877,7 +3877,7 @@ mod tests {
         }
     }
 
-    // Go: host_test.go:580 TestMappedDiagnosticDirectiveJSON
+    // Go: host_test.go:579 TestMappedDiagnosticDirectiveJSON
     #[test]
     fn test_mapped_diagnostic_directive_json() {
         let tests: [(&str, MappedDiagnosticDirective, &str); 2] = [
@@ -3954,7 +3954,7 @@ mod tests {
         assert_eq!(decoded, diagnostic_directives);
     }
 
-    // Go: host_test.go:647 TestRunnerTransformSupplementalOutputs
+    // Go: host_test.go:646 TestRunnerTransformSupplementalOutputs
     #[test]
     fn test_runner_transform_supplemental_outputs() {
         let host = new_host(
@@ -4015,7 +4015,7 @@ mod tests {
         let _ = host.close();
     }
 
-    // Go: host_test.go:678 TestRunnerTransformInvalidSupplementalDiagnosticDirective
+    // Go: host_test.go:677 TestRunnerTransformInvalidSupplementalDiagnosticDirective
     #[test]
     fn test_runner_transform_invalid_supplemental_diagnostic_directive() {
         let host = new_host(
@@ -4071,7 +4071,7 @@ mod tests {
         let _ = host.close();
     }
 
-    // Go: host_test.go:706 TestRunnerRejectsInvalidVirtualExtension
+    // Go: host_test.go:703 TestRunnerRejectsInvalidVirtualExtension
     #[test]
     fn test_runner_rejects_invalid_virtual_extension() {
         for supplemental in [false, true] {
@@ -4113,7 +4113,7 @@ mod tests {
         }
     }
 
-    // Go: host_test.go:733 TestRunnerPositionEncodings
+    // Go: host_test.go:730 TestRunnerPositionEncodings
     #[test]
     fn test_runner_position_encodings() {
         for encoding in [PositionEncoding::UTF8, PositionEncoding::UTF16] {
@@ -4152,7 +4152,7 @@ mod tests {
         }
     }
 
-    // Go: host_test.go:768 TestRunnerRejectsUnsupportedPositionEncoding
+    // Go: host_test.go:765 TestRunnerRejectsUnsupportedPositionEncoding
     #[test]
     fn test_runner_rejects_unsupported_position_encoding() {
         let r = new_host(
@@ -4171,7 +4171,7 @@ mod tests {
         let _ = r.close();
     }
 
-    // Go: host_test.go:777 TestRunnerRejectsInvalidDiagnosticSource
+    // Go: host_test.go:774 TestRunnerRejectsInvalidDiagnosticSource
     #[test]
     fn test_runner_rejects_invalid_diagnostic_source() {
         for source in [
@@ -4206,7 +4206,7 @@ mod tests {
         }
     }
 
-    // Go: host_test.go:796 TestRunnerRejectsPositionsInsideUnicodeCharacters
+    // Go: host_test.go:793 TestRunnerRejectsPositionsInsideUnicodeCharacters
     #[test]
     fn test_runner_rejects_positions_inside_unicode_characters() {
         for (encoding, content) in [
@@ -4229,7 +4229,7 @@ mod tests {
         }
     }
 
-    // Go: host_test.go:816 TestRunnerConsolidatesByIdentity
+    // Go: host_test.go:813 TestRunnerConsolidatesByIdentity
     #[test]
     fn test_runner_consolidates_by_identity() {
         let spawner = Rc::new(FakeSpawner::default());
@@ -4259,7 +4259,7 @@ mod tests {
         let _ = r.close();
     }
 
-    // Go: host_test.go:836 TestRunnerLeaseLifecycle
+    // Go: host_test.go:833 TestRunnerLeaseLifecycle
     #[test]
     fn test_runner_lease_lifecycle() {
         let spawner = Rc::new(FakeSpawner::default());
@@ -4309,7 +4309,7 @@ mod tests {
         let _ = r.close();
     }
 
-    // Go: host_test.go:872 recordingMapper
+    // Go: host_test.go:869 recordingMapper
     // recordingMapper captures project configuration and lifecycle requests for host protocol tests.
     #[derive(Default)]
     struct RecordingState {
@@ -4336,12 +4336,12 @@ mod tests {
     }
 
     impl MapperHandler for RecordingMapper {
-        // Go: host_test.go:893 recordingMapper.handlesProjects
+        // Go: host_test.go:890 recordingMapper.handlesProjects
         fn handles_projects(&self) -> bool {
             true
         }
 
-        // Go: host_test.go:903 recordingMapper.HandleRequest
+        // Go: host_test.go:900 recordingMapper.HandleRequest
         fn handle_request(
             &self,
             method: &str,
@@ -4466,7 +4466,7 @@ mod tests {
         }
     }
 
-    // Go: host_test.go:974 TestProjectLifecycle
+    // Go: host_test.go:971 TestProjectLifecycle
     #[test]
     fn test_project_lifecycle() {
         let mapper_process = Arc::new(RecordingMapper {
@@ -4602,7 +4602,7 @@ mod tests {
         let _ = host.close();
     }
 
-    // Go: host_test.go:1077 TestProjectMethodsAfterHostClose
+    // Go: host_test.go:1074 TestProjectMethodsAfterHostClose
     #[test]
     fn test_project_methods_after_host_close() {
         let mapper_process = Arc::new(RecordingMapper {
@@ -4663,7 +4663,7 @@ mod tests {
             .kind
     }
 
-    // Go: host_test.go:1115 TestProjectRejectsRelativeWatchedFiles
+    // Go: host_test.go:1112 TestProjectRejectsRelativeWatchedFiles
     #[test]
     fn test_project_rejects_relative_watched_files() {
         let mapper_process = Arc::new(RecordingMapper {
@@ -4702,7 +4702,7 @@ mod tests {
         let _ = host.close();
     }
 
-    // Go: host_test.go:1138 TestDynamicProjectRequiresConfigIdentity
+    // Go: host_test.go:1135 TestDynamicProjectRequiresConfigIdentity
     #[test]
     fn test_dynamic_project_requires_config_identity() {
         let mapper_process = Arc::new(RecordingMapper {
@@ -4741,7 +4741,7 @@ mod tests {
         let _ = host.close();
     }
 
-    // Go: host_test.go:1162 TestStaticMapperRejectsDynamicProjectResponseFields
+    // Go: host_test.go:1159 TestStaticMapperRejectsDynamicProjectResponseFields
     #[test]
     fn test_static_mapper_rejects_dynamic_project_response_fields() {
         let tests: [(&str, RecordingMapper, ProjectErrorKind); 2] = [
@@ -4786,7 +4786,7 @@ mod tests {
         }
     }
 
-    // Go: host_test.go:1194 TestProjectRejectsInvalidOptionDiagnosticPath
+    // Go: host_test.go:1191 TestProjectRejectsInvalidOptionDiagnosticPath
     #[test]
     fn test_project_rejects_invalid_option_diagnostic_path() {
         let mapper_process = Arc::new(RecordingMapper {
@@ -4822,7 +4822,7 @@ mod tests {
         let _ = host.close();
     }
 
-    // Go: host_test.go:1217 TestRunnerForwardsProjectOptions
+    // Go: host_test.go:1215 TestRunnerForwardsProjectOptions
     #[test]
     fn test_runner_forwards_project_options() {
         let mapper_process = Arc::new(RecordingMapper::default());
@@ -4877,7 +4877,7 @@ mod tests {
         let _ = r.close();
     }
 
-    // Go: host_test.go:1249 TestHostSetLocaleRestartsMapper
+    // Go: host_test.go:1247 TestHostSetLocaleRestartsMapper
     #[test]
     fn test_host_set_locale_restarts_mapper() {
         let mapper_process = Arc::new(RecordingMapper::default());
@@ -4905,7 +4905,7 @@ mod tests {
         let _ = r.close();
     }
 
-    // Go: host_test.go:1277 TestHostSetLocaleWaitsForTransform
+    // Go: host_test.go:1275 TestHostSetLocaleWaitsForTransform
     // PORT: Go runs the transform and SetLocale on two goroutines and checks
     // that SetLocale waits for the transform. The port's host is
     // dispatch-thread state, so a transform and SetLocale cannot overlap;

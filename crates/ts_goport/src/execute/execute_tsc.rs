@@ -159,7 +159,7 @@ fn wasm_unsupported(option: &str) -> CommandLineResult {
     result(ExitStatus::DiagnosticsPresentOutputsSkipped)
 }
 
-// Go: execute/tsc.go:27 startTracingIfNeeded, the warning part. The session
+// Go: execute/tsc.go:28 startTracingIfNeeded, the warning part. The session
 // is the process session in `crate::tracing`.
 // PORT: testing. `testing` is Go `testing != nil`.
 fn start_tracing_if_needed(sys: &dyn System, config: &ParsedCommandLine, testing: bool) {
@@ -168,14 +168,14 @@ fn start_tracing_if_needed(sys: &dyn System, config: &ParsedCommandLine, testing
     }
 }
 
-// Go: execute/tsc.go:43 stopTracing
+// Go: execute/tsc.go:44 stopTracing
 fn stop_tracing(sys: &dyn System) {
     if let Some(warning) = crate::tracing::stop_tracing() {
         write_str(&sys.writer(), &warning);
     }
 }
 
-// Go: execute/tsc.go:52 CommandLine
+// Go: execute/tsc.go:53 CommandLine
 // PORT: Go parses the build command line here and passes it on; the port
 // passes the arguments, because `goport_build` calls
 // `tsc_build_compilation` with them too. `hooks.build_mode` and
@@ -205,11 +205,11 @@ pub fn command_line(
     tsc_compilation(ctx, sys, parsed, hooks)
 }
 
-// Go: execute/tsc.go:65 fmtMain
+// Go: execute/tsc.go:66 fmtMain
 // PORT: not ported. Its only call (the `-f` case in `CommandLine`) is
 // commented out in Go, so it is dead code, and the formatter is not ported.
 
-// Go: execute/tsc.go:90 tscBuildCompilation
+// Go: execute/tsc.go:91 tscBuildCompilation
 // PORT: Go `CommandLine` parses the build command line and passes it in;
 // here it is the first step, which runs in the same order.
 // `command_line_args` is the full command line (Go `commandLineArgs`).
@@ -275,7 +275,7 @@ pub fn tsc_build_compilation(
     orchestrator.start_exported(ctx)
 }
 
-// Go: execute/tsc.go:121 tscCompilation
+// Go: execute/tsc.go:122 tscCompilation
 // PORT: `hooks.prepare_compilation` is the bin's step (not in Go).
 pub fn tsc_compilation(
     ctx: &Context,
@@ -531,7 +531,7 @@ pub fn tsc_compilation(
     )
 }
 
-// Go: execute/tsc.go:266 findConfigFile
+// Go: execute/tsc.go:269 findConfigFile
 fn find_config_file(
     search_path: &str,
     file_exists: impl Fn(&str) -> bool,
@@ -550,7 +550,7 @@ fn find_config_file(
     result
 }
 
-// Go: execute/tsc.go:280 getTraceFromSys
+// Go: execute/tsc.go:283 getTraceFromSys
 pub(crate) fn get_trace_from_sys(
     sys: &dyn System,
     locale: crate::locale::Locale,
@@ -832,7 +832,7 @@ fn get_content_mapper_project(
     })
 }
 
-// Go: execute/tsc.go:373 showConfig
+// Go: execute/tsc.go:405 showConfig
 fn show_config(sys: &dyn System, config: &ParsedCommandLine, config_file_name: &str) {
     let ts_config = convert_to_ts_config(config, config_file_name);
     let writer = sys.writer();

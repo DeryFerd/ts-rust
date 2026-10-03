@@ -84,7 +84,7 @@ fn binder_is_external_or_common_js_module(b: &Binder) -> bool {
 }
 
 impl Binder {
-    // Go: ast/utilities.go:4164 IsImplicitlyExportedJSDocDeclaration
+    // Go: ast/utilities.go:4226 IsImplicitlyExportedJSDocDeclaration
     // PORT: while binding, the CommonJS indicator of the file is binder
     // state, so the Go `ast.IsExternalOrCommonJSModule(node.Parent)` test
     // reads it from the binder. The parent is always the file being bound.
@@ -122,7 +122,7 @@ fn has_body_data(node: Node) -> bool {
 }
 
 impl Binder {
-    // Go: binder/binder.go:911 bindFunctionExpression
+    // Go: binder/binder.go:914 bindFunctionExpression
     pub fn bind_function_expression(&mut self, node: Node) {
         if !with_source_file_info(self.file, |info| info.is_declaration_file)
             && !node_flags(self, node).intersects(NodeFlags::AMBIENT)
@@ -140,7 +140,7 @@ impl Binder {
         self.bind_anonymous_declaration(node, SymbolFlags::FUNCTION, &binding_name);
     }
 
-    // Go: binder/binder.go:924 bindCallExpression
+    // Go: binder/binder.go:927 bindCallExpression
     pub fn bind_call_expression(&mut self, node: Node) {
         // We're only inspecting call expressions to detect CommonJS modules, so we can skip
         // this check if we've already seen the module indicator
@@ -151,7 +151,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:932 setCommonJSModuleIndicator
+    // Go: binder/binder.go:935 setCommonJSModuleIndicator
     pub fn set_common_js_module_indicator(&mut self, node: Node) -> bool {
         let external_module_indicator =
             with_source_file_info(self.file, |info| info.external_module_indicator);
@@ -167,7 +167,7 @@ impl Binder {
         true
     }
 
-    // Go: binder/binder.go:945 bindClassLikeDeclaration
+    // Go: binder/binder.go:948 bindClassLikeDeclaration
     pub fn bind_class_like_declaration(&mut self, node: Node) {
         let name = node.name();
         match node.kind() {
@@ -212,7 +212,7 @@ impl Binder {
         self.symbols.sym_mut(prototype_symbol).parent = symbol;
     }
 
-    // Go: binder/binder.go:977 bindPropertyOrMethodOrAccessor
+    // Go: binder/binder.go:979 bindPropertyOrMethodOrAccessor
     // PERF: query Q7-3. `d` is the data of `node`, which the caller already
     // loaded with `parsed_node_data`.
     pub fn bind_property_or_method_or_accessor(
@@ -241,7 +241,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:991 bindFunctionOrConstructorType
+    // Go: binder/binder.go:993 bindFunctionOrConstructorType
     pub fn bind_function_or_constructor_type(&mut self, node: Node) {
         // For a given function symbol "<...>(...) => T" we want to generate a symbol identical
         // to the one we would get for: { <...>(...): T }
@@ -261,7 +261,7 @@ impl Binder {
         self.symbols.set(members, member_name, symbol);
     }
 
-    // Go: binder/binder.go:1006 addLateBoundAssignmentDeclarationToSymbol
+    // Go: binder/binder.go:1008 addLateBoundAssignmentDeclarationToSymbol
     pub fn add_late_bound_assignment_declaration_to_symbol(
         &mut self,
         node: Node,
@@ -288,7 +288,7 @@ impl Binder {
             .push(node);
     }
 
-    // Go: binder/binder.go:1016 bindModuleExportsAssignment
+    // Go: binder/binder.go:1018 bindModuleExportsAssignment
     pub fn bind_module_exports_assignment(&mut self, node: Node) {
         if self.set_common_js_module_indicator(node) {
             let container = self.file;
@@ -305,7 +305,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1025 bindExpandoPropertyAssignment
+    // Go: binder/binder.go:1027 bindExpandoPropertyAssignment
     pub fn bind_expando_property_assignment(&mut self, node: Node) {
         self.expando_assignments.push(ExpandoAssignmentInfo {
             node,
@@ -314,7 +314,7 @@ impl Binder {
         });
     }
 
-    // Go: binder/binder.go:1033 bindDeferredExpandoAssignments
+    // Go: binder/binder.go:1035 bindDeferredExpandoAssignments
     pub fn bind_deferred_expando_assignments(&mut self) {
         let count = self.expando_assignments.len();
         for i in 0..count {
@@ -327,7 +327,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1044 bindCommonJSTypeExports
+    // Go: binder/binder.go:1046 bindCommonJSTypeExports
     // If the given module symbol has an export= symbol, promote exports with a type or namespace meaning
     // from the module symbol onto the export= symbol and, if any such exports exist, mark the export=
     // symbol as a namespace module.
@@ -353,7 +353,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1056 bindDeferredExpandoAssignment
+    // Go: binder/binder.go:1058 bindDeferredExpandoAssignment
     pub fn bind_deferred_expando_assignment(&mut self, node: Node) {
         let parent = get_parent_of_property_assignment(node);
         let block_scope_container = self.block_scope_container;
@@ -399,7 +399,7 @@ impl Binder {
     }
 }
 
-// Go: binder/binder.go:1076 getParentOfPropertyAssignment
+// Go: binder/binder.go:1078 getParentOfPropertyAssignment
 pub fn get_parent_of_property_assignment(node: Node) -> Node {
     match node.kind() {
         SyntaxKind::BinaryExpression => return node.left().expression(),
@@ -410,7 +410,7 @@ pub fn get_parent_of_property_assignment(node: Node) -> Node {
 }
 
 impl Binder {
-    // Go: binder/binder.go:1086 bindExportsOrObjectDefineProperty
+    // Go: binder/binder.go:1088 bindExportsOrObjectDefineProperty
     pub fn bind_exports_or_object_define_property(&mut self, node: Node) {
         if self.set_common_js_module_indicator(node) {
             let container = self.file;
@@ -432,7 +432,7 @@ impl Binder {
     }
 }
 
-// Go: binder/binder.go:1094 getInitializerSymbol
+// Go: binder/binder.go:1096 getInitializerSymbol
 // PORT: Go reads `initializer.Symbol()` from the node; during binding that lives in
 // the binder, so this takes the binder instead of only the symbol arena.
 pub fn get_initializer_symbol(b: &Binder, symbol: SymbolId) -> SymbolId {
@@ -466,7 +466,7 @@ pub fn get_initializer_symbol(b: &Binder, symbol: SymbolId) -> SymbolId {
 }
 
 impl Binder {
-    // Go: binder/binder.go:1121 bindThisPropertyAssignment
+    // Go: binder/binder.go:1123 bindThisPropertyAssignment
     pub fn bind_this_property_assignment(&mut self, node: Node) {
         if !is_in_js_file(node) {
             return;
@@ -512,7 +512,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1143 getThisClassAndSymbolTable
+    // Go: binder/binder.go:1145 getThisClassAndSymbolTable
     pub fn get_this_class_and_symbol_table(&mut self) -> (SymbolId, SymbolTable) {
         let mut class_symbol = SymbolId::NIL;
         let mut symbol_table = SymbolTable::NIL;
@@ -543,7 +543,7 @@ impl Binder {
         (class_symbol, symbol_table)
     }
 
-    // Go: binder/binder.go:1162 bindEnumDeclaration
+    // Go: binder/binder.go:1164 bindEnumDeclaration
     pub fn bind_enum_declaration(&mut self, node: Node) {
         if is_enum_const(node) {
             self.bind_block_scoped_declaration(
@@ -560,7 +560,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1170 bindVariableDeclarationOrBindingElement
+    // Go: binder/binder.go:1172 bindVariableDeclarationOrBindingElement
     pub fn bind_variable_declaration_or_binding_element(&mut self, node: Node) {
         self.check_strict_mode_eval_or_arguments(node, node.name());
         let name = node.name();
@@ -602,7 +602,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1195 bindParameter
+    // Go: binder/binder.go:1197 bindParameter
     pub fn bind_parameter(&mut self, node: Node) {
         // PERF: query Q7-3. The node data is looked up once, and the field
         // reads below (name, modifiers, question token) use it.
@@ -659,7 +659,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1217 bindFunctionDeclaration
+    // Go: binder/binder.go:1219 bindFunctionDeclaration
     pub fn bind_function_declaration(&mut self, node: Node) {
         if !with_source_file_info(self.file, |info| info.is_declaration_file)
             && !node_flags(self, node).intersects(NodeFlags::AMBIENT)
@@ -675,7 +675,7 @@ impl Binder {
         );
     }
 
-    // Go: binder/binder.go:1225 getInferTypeContainer
+    // Go: binder/binder.go:1227 getInferTypeContainer
     pub fn get_infer_type_container(&self, node: Node) -> Node {
         // PORT: Go `ast.FindAncestor(node, callback)` inlined (same walk up the parent chain).
         let mut extends_type = Node::NIL;
@@ -694,7 +694,7 @@ impl Binder {
         Node::NIL
     }
 
-    // Go: binder/binder.go:1236 bindAnonymousDeclaration
+    // Go: binder/binder.go:1238 bindAnonymousDeclaration
     pub fn bind_anonymous_declaration(
         &mut self,
         node: Node,
@@ -710,7 +710,7 @@ impl Binder {
         self.add_declaration_to_symbol(symbol, node, symbol_flags);
     }
 
-    // Go: binder/binder.go:1244 bindBlockScopedDeclaration
+    // Go: binder/binder.go:1246 bindBlockScopedDeclaration
     pub fn bind_block_scoped_declaration(
         &mut self,
         node: Node,
@@ -745,7 +745,7 @@ impl Binder {
         );
     }
 
-    // Go: binder/binder.go:1259 bindTypeParameter
+    // Go: binder/binder.go:1261 bindTypeParameter
     pub fn bind_type_parameter(&mut self, node: Node) {
         if node.parent().kind() == SyntaxKind::InferType {
             let container = self.get_infer_type_container(node.parent());
@@ -775,7 +775,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1272 lookupEntity
+    // Go: binder/binder.go:1274 lookupEntity
     pub fn lookup_entity(&mut self, node: Node, container: Node) -> SymbolId {
         if is_identifier(node) {
             return self.lookup_name(node.text(), container);
@@ -802,7 +802,7 @@ impl Binder {
         SymbolId::NIL
     }
 
-    // Go: binder/binder.go:1292 lookupName
+    // Go: binder/binder.go:1294 lookupName
     pub fn lookup_name(&self, name: &str, container: Node) -> SymbolId {
         // PORT: Go checks `LocalsContainerData() != nil` and `DeclarationData() != nil`; every
         // node has a NodeBindData here, and nodes without that Go data keep nil locals/symbol.
@@ -826,7 +826,7 @@ impl Binder {
         SymbolId::NIL
     }
 
-    // Go: binder/binder.go:1307 checkContextualIdentifier
+    // Go: binder/binder.go:1309 checkContextualIdentifier
     // The binder visits every node in the syntax tree so it is a convenient place to perform a single localized
     // check for reserved words used as identifiers in strict mode code, as well as `yield` or `await` in
     // [Yield] or [Await] contexts, respectively.
@@ -886,7 +886,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1329 checkPrivateIdentifier
+    // Go: binder/binder.go:1331 checkPrivateIdentifier
     pub fn check_private_identifier(&mut self, node: Node) {
         if node.text() == "#constructor" {
             // Report error only if there are no parse errors in file
@@ -900,7 +900,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1338 getStrictModeIdentifierMessage
+    // Go: binder/binder.go:1340 getStrictModeIdentifierMessage
     pub fn get_strict_mode_identifier_message(
         &self,
         node: Node,
@@ -917,7 +917,7 @@ impl Binder {
     }
 }
 
-// Go: binder/binder.go:1351 isUseStrictPrologueDirective
+// Go: binder/binder.go:1353 isUseStrictPrologueDirective
 // Should be called only on prologue directives (ast.IsPrologueDirective(node) should be true)
 pub fn is_use_strict_prologue_directive(source_file: Node, node: Node) -> bool {
     let node_text = get_source_text_of_node_from_source_file(
@@ -930,7 +930,7 @@ pub fn is_use_strict_prologue_directive(source_file: Node, node: Node) -> bool {
     node_text == "\"use strict\"" || node_text == "'use strict'"
 }
 
-// Go: binder/binder.go:1358 FindUseStrictPrologue
+// Go: binder/binder.go:1360 FindUseStrictPrologue
 pub fn find_use_strict_prologue(source_file: Node, statements: &[Node]) -> Node {
     for &statement in statements {
         if is_prologue_directive(statement) {
@@ -945,7 +945,7 @@ pub fn find_use_strict_prologue(source_file: Node, statements: &[Node]) -> Node 
 }
 
 impl Binder {
-    // Go: binder/binder.go:1372 checkStrictModeFunctionName
+    // Go: binder/binder.go:1374 checkStrictModeFunctionName
     pub fn check_strict_mode_function_name(&mut self, node: Node) {
         if !node_flags(self, node).intersects(NodeFlags::AMBIENT) {
             // It is a SyntaxError if the identifier eval or arguments appears within a FormalParameterList of a strict mode FunctionDeclaration or FunctionExpression (13.1))
@@ -953,7 +953,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1379 getStrictModeBlockScopeFunctionDeclarationMessage
+    // Go: binder/binder.go:1381 getStrictModeBlockScopeFunctionDeclarationMessage
     pub fn get_strict_mode_block_scope_function_declaration_message(
         &self,
         node: Node,
@@ -968,7 +968,7 @@ impl Binder {
         diag::Function_declarations_are_not_allowed_inside_blocks_in_strict_mode_when_targeting_ES5
     }
 
-    // Go: binder/binder.go:1390 checkStrictModeBinaryExpression
+    // Go: binder/binder.go:1392 checkStrictModeBinaryExpression
     pub fn check_strict_mode_binary_expression(&mut self, node: Node) {
         let left = node.left();
         if is_left_hand_side_expression(left)
@@ -980,7 +980,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1399 checkStrictModeCatchClause
+    // Go: binder/binder.go:1401 checkStrictModeCatchClause
     pub fn check_strict_mode_catch_clause(&mut self, node: Node) {
         // It is a SyntaxError if a TryStatement with a Catch occurs within strict code and the Identifier of the
         // Catch production is eval or arguments
@@ -990,7 +990,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1408 checkStrictModeDeleteExpression
+    // Go: binder/binder.go:1410 checkStrictModeDeleteExpression
     pub fn check_strict_mode_delete_expression(&mut self, node: Node) {
         // Grammar checking
         let expression = node.expression();
@@ -1005,7 +1005,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1418 checkStrictModePostfixUnaryExpression
+    // Go: binder/binder.go:1420 checkStrictModePostfixUnaryExpression
     pub fn check_strict_mode_postfix_unary_expression(&mut self, node: Node) {
         // Grammar checking
         // The identifier eval or arguments may not appear as the LeftHandSideExpression of an
@@ -1014,7 +1014,7 @@ impl Binder {
         self.check_strict_mode_eval_or_arguments(node, node.operand());
     }
 
-    // Go: binder/binder.go:1426 checkStrictModePrefixUnaryExpression
+    // Go: binder/binder.go:1428 checkStrictModePrefixUnaryExpression
     pub fn check_strict_mode_prefix_unary_expression(&mut self, node: Node) {
         // Grammar checking
         let operator = node.operator();
@@ -1023,7 +1023,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1434 checkStrictModeWithStatement
+    // Go: binder/binder.go:1436 checkStrictModeWithStatement
     pub fn check_strict_mode_with_statement(&mut self, node: Node) {
         // Grammar checking for withStatement
         self.error_on_first_token(
@@ -1033,7 +1033,7 @@ impl Binder {
         );
     }
 
-    // Go: binder/binder.go:1439 checkStrictModeLabeledStatement
+    // Go: binder/binder.go:1441 checkStrictModeLabeledStatement
     pub fn check_strict_mode_labeled_statement(&mut self, node: Node) {
         // Grammar checking for labeledStatement
         let statement = node.statement();
@@ -1048,7 +1048,7 @@ static EVAL_NAME: std::sync::LazyLock<Name> = std::sync::LazyLock::new(|| Name::
 static ARGUMENTS_NAME: std::sync::LazyLock<Name> =
     std::sync::LazyLock::new(|| Name::from("arguments"));
 
-// Go: binder/binder.go:1447 isEvalOrArgumentsIdentifier
+// Go: binder/binder.go:1449 isEvalOrArgumentsIdentifier
 // PERF: U1 (a). Compares name ids (`Node::text_is`), with no text load.
 pub fn is_eval_or_arguments_identifier(node: Node) -> bool {
     if is_identifier(node) {
@@ -1058,7 +1058,7 @@ pub fn is_eval_or_arguments_identifier(node: Node) -> bool {
 }
 
 impl Binder {
-    // Go: binder/binder.go:1455 checkStrictModeEvalOrArguments
+    // Go: binder/binder.go:1457 checkStrictModeEvalOrArguments
     pub fn check_strict_mode_eval_or_arguments(&mut self, context_node: Node, name: Node) {
         if name.is_some() && is_eval_or_arguments_identifier(name) {
             // We check first if the name is inside class declaration or class expression; if so give explicit message
@@ -1068,7 +1068,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1463 getStrictModeEvalOrArgumentsMessage
+    // Go: binder/binder.go:1465 getStrictModeEvalOrArgumentsMessage
     pub fn get_strict_mode_eval_or_arguments_message(
         &self,
         node: Node,
@@ -1085,7 +1085,7 @@ impl Binder {
 }
 
 impl Binder {
-    // Go: binder/binder.go:1477 bindContainer
+    // Go: binder/binder.go:1479 bindContainer
     // All container nodes are kept on a linked list in declaration order. This list is used by
     // the getLocalNameOfContainer function in the type checker to validate that the local name
     // used for a container is unique.
@@ -1276,7 +1276,7 @@ impl Binder {
         self.block_scope_container = saved_block_scope_container;
     }
 
-    // Go: binder/binder.go:1627 declareCommonJSVariable
+    // Go: binder/binder.go:1628 declareCommonJSVariable
     pub fn declare_common_js_variable(&mut self, name: &str) {
         let file = self.file;
         let locals = binder_get_locals(self, file);
@@ -1311,7 +1311,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1645 bindChildren
+    // Go: binder/binder.go:1646 bindChildren
     pub fn bind_children(&mut self, node: Node) {
         self.bind_children_of_kind(node, node.kind());
     }
@@ -1405,7 +1405,7 @@ impl Binder {
         self.in_assignment_pattern = save_in_assignment_pattern;
     }
 
-    // Go: binder/binder.go:1744 bindEachChild
+    // Go: binder/binder.go:1745 bindEachChild
     // PERF: R2-5. A published store node walks its child links
     // (`frozen_store_children`): the same children in the same order as
     // `for_each_child`, from the first child and next sibling of each slot,
@@ -1430,14 +1430,14 @@ impl Binder {
         node.for_each_child(&mut |child: Node| self.bind(child));
     }
 
-    // Go: binder/binder.go:1748 bindEach
+    // Go: binder/binder.go:1749 bindEach
     pub fn bind_each(&mut self, nodes: &[Node]) {
         for &node in nodes {
             self.bind(node);
         }
     }
 
-    // Go: binder/binder.go:1754 bindNodeList
+    // Go: binder/binder.go:1755 bindNodeList
     pub fn bind_node_list(&mut self, node_list: NodeList) {
         if !node_list.is_nil() {
             for node in node_list.nodes() {
@@ -1446,7 +1446,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1760 bindModifiers
+    // Go: binder/binder.go:1761 bindModifiers
     pub fn bind_modifiers(&mut self, modifiers: ModifierList) {
         if !modifiers.is_nil() {
             for node in modifiers.nodes() {
@@ -1455,7 +1455,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1766 bindEachStatementFunctionsFirst
+    // Go: binder/binder.go:1767 bindEachStatementFunctionsFirst
     pub fn bind_each_statement_functions_first(&mut self, statements: NodeList) {
         let nodes = statements.nodes();
         for node in nodes.iter() {
@@ -1470,7 +1470,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1779 setContinueTarget
+    // Go: binder/binder.go:1780 setContinueTarget
     pub fn set_continue_target(&mut self, node: Node, target: FlowNodeId) -> FlowNodeId {
         let mut label = self.active_label_list.clone();
         let mut node = node;
@@ -1485,7 +1485,7 @@ impl Binder {
         target
     }
 
-    // Go: binder/binder.go:1789 doWithConditionalBranches
+    // Go: binder/binder.go:1790 doWithConditionalBranches
     pub fn do_with_conditional_branches(
         &mut self,
         action: &mut dyn FnMut(&mut Binder, Node) -> bool,
@@ -1502,7 +1502,7 @@ impl Binder {
         self.current_false_target = saved_false_target;
     }
 
-    // Go: binder/binder.go:1799 bindCondition
+    // Go: binder/binder.go:1800 bindCondition
     pub fn bind_condition(
         &mut self,
         node: Node,
@@ -1531,7 +1531,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1807 bindIterativeStatement
+    // Go: binder/binder.go:1808 bindIterativeStatement
     pub fn bind_iterative_statement(
         &mut self,
         node: Node,

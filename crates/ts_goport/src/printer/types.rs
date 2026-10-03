@@ -173,7 +173,7 @@ pub trait EmitTextWriter {
 // emitresolver.go
 // ──────────────────────────────────────────────────────────────────────
 
-// Go: printer/emitresolver.go:11 SymbolAccessibility
+// Go: printer/emitresolver.go:10 SymbolAccessibility
 go_enum!(SymbolAccessibility, i32 {
     ACCESSIBLE = 0; // SymbolAccessibilityAccessible
     NOT_ACCESSIBLE = 1; // SymbolAccessibilityNotAccessible
@@ -182,7 +182,7 @@ go_enum!(SymbolAccessibility, i32 {
 });
 
 /// Go `printer.SymbolAccessibilityResult`.
-// Go: printer/emitresolver.go:20 SymbolAccessibilityResult
+// Go: printer/emitresolver.go:19 SymbolAccessibilityResult
 #[derive(Clone, Debug, Default)]
 pub struct SymbolAccessibilityResult {
     pub accessibility: SymbolAccessibility,
@@ -192,7 +192,7 @@ pub struct SymbolAccessibilityResult {
     pub error_module_name: String, // Optional - If the symbol is not visible from module, module's name
 }
 
-// Go: printer/emitresolver.go:33 TypeReferenceSerializationKind
+// Go: printer/emitresolver.go:32 TypeReferenceSerializationKind
 // Indicates how to serialize the name for a TypeReferenceNode when emitting decorator metadata
 go_enum!(TypeReferenceSerializationKind, i32 {
     // The TypeReferenceNode could not be resolved.
@@ -238,7 +238,7 @@ pub type EmitSymbolTracker = Option<Rc<dyn SymbolTracker>>;
 // PORT: Go `GetConstantValue` returns `any` (string, float64 or nil); that is
 // `Option<LiteralValue>`. Go `*ast.SourceFile` results are `Node`
 // (`Node::NIL` for nil).
-// Go: printer/emitresolver.go:79 EmitResolver
+// Go: printer/emitresolver.go:76 EmitResolver
 pub trait EmitResolver {
     // Go binder.ReferenceResolver (embedded)
     fn get_referenced_export_container(&self, node: Node, prefix_locals: bool) -> Node;

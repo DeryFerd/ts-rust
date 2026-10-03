@@ -129,7 +129,7 @@ impl CodeLensVisitor<'_> {
     }
 }
 
-// Go: ls/codelens.go:67 codeLensKey
+// Go: ls/codelens.go:68 codeLensKey
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CodeLensKey {
     kind: lsproto::CodeLensKind,
@@ -139,7 +139,7 @@ struct CodeLensKey {
     end_character: u32,
 }
 
-// Go: ls/codelens.go:72 keyForCodeLens
+// Go: ls/codelens.go:73 keyForCodeLens
 fn key_for_code_lens(code_lens: &lsproto::CodeLens) -> CodeLensKey {
     // PORT: Go dereferences `codeLens.Data`; every lens made here sets it.
     let data = code_lens
@@ -156,7 +156,7 @@ fn key_for_code_lens(code_lens: &lsproto::CodeLens) -> CodeLensKey {
 }
 
 impl LanguageService {
-    // Go: ls/codelens.go:82 ResolveCodeLens
+    // Go: ls/codelens.go:83 ResolveCodeLens
     // PORT: Go mutates `*codeLens` and returns the same pointer; here the
     // lens is taken by value and returned. Go `*string` is `Option<String>`.
     pub fn resolve_code_lens(
@@ -300,7 +300,7 @@ fn to_lsp_any<T: MarshalerTo + ?Sized>(value: &T) -> LspAny {
 }
 
 impl LanguageService {
-    // Go: ls/codelens.go:167 newCodeLensForNode
+    // Go: ls/codelens.go:165 newCodeLensForNode
     // PORT: Go returns `*lsproto.CodeLens`; nil is `None`. `data.position`
     // is the port offset here; `provide_code_lenses` maps it to the Go
     // offset once for each projection.
@@ -339,7 +339,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/codelens.go:152 isValidImplementationsCodeLensNode
+// Go: ls/codelens.go:188 isValidImplementationsCodeLensNode
 pub fn is_valid_implementations_code_lens_node(
     node: Node,
     user_prefs: lsutil::CodeLensUserPreferences,
@@ -386,7 +386,7 @@ pub fn is_valid_implementations_code_lens_node(
     false
 }
 
-// Go: ls/codelens.go:179 isValidReferenceLensNode
+// Go: ls/codelens.go:215 isValidReferenceLensNode
 pub fn is_valid_reference_lens_node(
     node: Node,
     user_prefs: lsutil::CodeLensUserPreferences,

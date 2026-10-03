@@ -2,7 +2,7 @@
 
 use crate::ls::prelude::*;
 
-// Go: ls/languageservice.go:15 LanguageService
+// Go: ls/languageservice.go:16 LanguageService
 // PORT: plan contract C4. Go `*compiler.Program` is `Rc<compiler::NewProgram>`:
 // the language service keeps its program alive. Go `Host` is `Rc<dyn Host>`, Go
 // `*lsconv.Converters` is shared (`Rc`). All methods take `&self`, so the
@@ -34,7 +34,7 @@ pub struct LanguageService<P = compiler::NewProgram> {
     _program_guard: ls_program::ProgramGuard,
 }
 
-// Go: ls/languageservice.go:24 NewLanguageService
+// Go: ls/languageservice.go:25 NewLanguageService
 // PORT: Go returns `*LanguageService`; the caller owns the value here.
 pub fn new_language_service(
     project_id: autoimport::ProjectID,
@@ -89,7 +89,7 @@ impl LanguageService {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/languageservice.go:40 toPath
+    // Go: ls/languageservice.go:41 toPath
     pub fn to_path(&self, file_name: &str) -> tspath::Path {
         tspath::to_path(
             file_name,
@@ -98,24 +98,24 @@ impl<P: ProgramView> LanguageService<P> {
         )
     }
 
-    // Go: ls/languageservice.go:44 GetProgram
+    // Go: ls/languageservice.go:45 GetProgram
     pub fn get_program(&self) -> &P {
         &self.program
     }
 
-    // Go: ls/languageservice.go:48 UserPreferences
+    // Go: ls/languageservice.go:49 UserPreferences
     // PORT: Go returns the struct by value (a copy).
     pub fn user_preferences(&self) -> lsutil::UserPreferences {
         self.active_config.clone()
     }
 
-    // Go: ls/languageservice.go:52 FormatOptions
+    // Go: ls/languageservice.go:53 FormatOptions
     // PORT: Go returns the struct by value (a copy).
     pub fn format_options(&self) -> lsutil::FormatCodeSettings {
         self.active_config.format_code_settings.clone()
     }
 
-    // Go: ls/languageservice.go:56 tryGetProgramAndFile
+    // Go: ls/languageservice.go:57 tryGetProgramAndFile
     // PORT: Go `*ast.SourceFile` is the file root `Node` (`Node::NIL` when the
     // program has no such file).
     pub fn try_get_program_and_file(&self, file_name: &str) -> (&P, Node) {
@@ -124,7 +124,7 @@ impl<P: ProgramView> LanguageService<P> {
         (program, file)
     }
 
-    // Go: ls/languageservice.go:62 getProgramAndFile
+    // Go: ls/languageservice.go:63 getProgramAndFile
     // PORT: Go passes the URI by value; here by reference.
     pub fn get_program_and_file(&self, document_uri: &lsproto::DocumentUri) -> (&P, Node) {
         let file_name = document_uri.file_name();
@@ -135,7 +135,7 @@ impl<P: ProgramView> LanguageService<P> {
         (program, file)
     }
 
-    // Go: ls/languageservice.go:71 GetDocumentPositionMapper
+    // Go: ls/languageservice.go:72 GetDocumentPositionMapper
     // PORT: Go returns `*sourcemap.DocumentPositionMapper`; nil is `None`. See
     // the `document_position_mappers` field for the nil cache entry.
     pub fn get_document_position_mapper(
@@ -159,17 +159,17 @@ impl<P: ProgramView> LanguageService<P> {
         d
     }
 
-    // Go: ls/languageservice.go:80 ReadFile
+    // Go: ls/languageservice.go:81 ReadFile
     pub fn read_file(&self, file_name: &str) -> (String, bool) {
         self.host.read_file(file_name)
     }
 
-    // Go: ls/languageservice.go:84 UseCaseSensitiveFileNames
+    // Go: ls/languageservice.go:85 UseCaseSensitiveFileNames
     pub fn use_case_sensitive_file_names(&self) -> bool {
         self.host.use_case_sensitive_file_names()
     }
 
-    // Go: ls/languageservice.go:88 GetECMALineInfo
+    // Go: ls/languageservice.go:89 GetECMALineInfo
     pub fn get_ecma_line_info(
         &self,
         file_name: &str,
@@ -217,7 +217,7 @@ impl LanguageService {
         Ok(Some(Rc::new(view)))
     }
 
-    // Go: ls/languageservice.go:110 getCurrentAutoImportView
+    // Go: ls/languageservice.go:111 getCurrentAutoImportView
     // getCurrentAutoImportView returns an auto-import view for the given file, based on the current state
     // of the auto-import registry, which may or may not be up-to-date.
     // PORT: Go builds a view with a nil registry and panics only when a view
@@ -239,13 +239,13 @@ impl LanguageService {
         ))
     }
 
-    // Go: ls/languageservice.go:121 DirectoryExists
+    // Go: ls/languageservice.go:123 DirectoryExists
     // Used for module specifier completions.
     pub fn directory_exists(&self, path: &str) -> bool {
         self.host.directory_exists(path)
     }
 
-    // Go: ls/languageservice.go:126 ReadDirectory
+    // Go: ls/languageservice.go:128 ReadDirectory
     // Used for module specifier completions.
     pub fn read_directory(
         &self,
@@ -263,7 +263,7 @@ impl LanguageService {
         )
     }
 
-    // Go: ls/languageservice.go:130 GetDirectories
+    // Go: ls/languageservice.go:132 GetDirectories
     pub fn get_directories(&self, path: &str) -> Vec<String> {
         self.host.get_directories(path)
     }

@@ -7,7 +7,7 @@ use crate::spanmap::{Feature, Fidelity};
 use crate::frontend::scanner::get_leading_comment_ranges;
 
 impl LanguageService {
-    // Go: ls/folding.go:18 ProvideFoldingRange
+    // Go: ls/folding.go:22 ProvideFoldingRange
     pub fn provide_folding_range(
         &self,
         ctx: &Context,
@@ -66,7 +66,7 @@ impl LanguageService {
         })
     }
 
-    // Go: ls/folding.go:84 adjustFoldingEnd
+    // Go: ls/folding.go:86 adjustFoldingEnd
     // adjustFoldingEnd adjusts the end line of folding ranges when the client signals lineFoldingOnly.
     // This mirrors the behavior of VS Code's built-in TypeScript extension (workaround for vscode#47240).
     // When lineFoldingOnly is true, we hide lines from startLine+1 to endLine. And to keep closing
@@ -121,7 +121,7 @@ impl LanguageService {
         result
     }
 
-    // Go: ls/folding.go:61 addNodeOutliningSpans
+    // Go: ls/folding.go:117 addNodeOutliningSpans
     fn add_node_outlining_spans(
         &self,
         ctx: &Context,
@@ -194,7 +194,7 @@ impl LanguageService {
         folding_range
     }
 
-    // Go: ls/folding.go:101 addRegionOutliningSpans
+    // Go: ls/folding.go:160 addRegionOutliningSpans
     fn add_region_outlining_spans(
         &self,
         ctx: &Context,
@@ -275,7 +275,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/folding.go:146 visitNode
+// Go: ls/folding.go:203 visitNode
 fn visit_node(
     ctx: &Context,
     n: Node,
@@ -428,7 +428,7 @@ fn visit_node(
     folding_range
 }
 
-// Go: ls/folding.go:238 addOutliningForLeadingCommentsForNode
+// Go: ls/folding.go:295 addOutliningForLeadingCommentsForNode
 fn add_outlining_for_leading_comments_for_node(
     ctx: &Context,
     n: Node,
@@ -441,7 +441,7 @@ fn add_outlining_for_leading_comments_for_node(
     add_outlining_for_leading_comments_for_pos(ctx, n.pos(), source_file, l)
 }
 
-// Go: ls/folding.go:245 addOutliningForLeadingCommentsForPos
+// Go: ls/folding.go:302 addOutliningForLeadingCommentsForPos
 fn add_outlining_for_leading_comments_for_pos(
     ctx: &Context,
     pos: i32,
@@ -549,13 +549,13 @@ fn add_outlining_for_leading_comments_for_pos(
     folding_range
 }
 
-// Go: ls/folding.go:309 regionDelimiterResult
+// Go: ls/folding.go:367 regionDelimiterResult
 struct RegionDelimiterResult {
     is_start: bool,
     name: String,
 }
 
-// Go: ls/folding.go:314 parseRegionDelimiter
+// Go: ls/folding.go:372 parseRegionDelimiter
 fn parse_region_delimiter(line_text: &str) -> Option<RegionDelimiterResult> {
     // We trim the leading whitespace and // without the regex since the
     // multiple potential whitespace matches can make for some gnarly backtracking behavior
@@ -586,7 +586,7 @@ fn parse_region_delimiter(line_text: &str) -> Option<RegionDelimiterResult> {
     })
 }
 
-// Go: ls/folding.go:342 getOutliningSpanForNode
+// Go: ls/folding.go:400 getOutliningSpanForNode
 fn get_outlining_span_for_node(
     ctx: &Context,
     n: Node,
@@ -776,7 +776,7 @@ fn get_outlining_span_for_node(
     None
 }
 
-// Go: ls/folding.go:402 spanForImportExportElements
+// Go: ls/folding.go:464 spanForImportExportElements
 fn span_for_import_export_elements(
     ctx: &Context,
     node: Node,
@@ -815,7 +815,7 @@ fn span_for_import_export_elements(
     )
 }
 
-// Go: ls/folding.go:423 spanForParenthesizedExpression
+// Go: ls/folding.go:485 spanForParenthesizedExpression
 fn span_for_parenthesized_expression(
     ctx: &Context,
     node: Node,
@@ -838,7 +838,7 @@ fn span_for_parenthesized_expression(
     ))
 }
 
-// Go: ls/folding.go:432 spanForCallExpression
+// Go: ls/folding.go:497 spanForCallExpression
 fn span_for_call_expression(
     ctx: &Context,
     node: Node,
@@ -871,7 +871,7 @@ fn span_for_call_expression(
     )
 }
 
-// Go: ls/folding.go:445 spanForArrowFunction
+// Go: ls/folding.go:510 spanForArrowFunction
 fn span_for_arrow_function(
     ctx: &Context,
     node: Node,
@@ -905,7 +905,7 @@ fn span_for_arrow_function(
     ))
 }
 
-// Go: ls/folding.go:454 spanForTemplateLiteral
+// Go: ls/folding.go:522 spanForTemplateLiteral
 fn span_for_template_literal(
     ctx: &Context,
     node: Node,
@@ -925,7 +925,7 @@ fn span_for_template_literal(
     )
 }
 
-// Go: ls/folding.go:486 spanForJSXElement
+// Go: ls/folding.go:529 spanForJSXElement
 // PORT: Go returns `*FoldingRange`; nil is `None`.
 fn span_for_jsx_element(
     ctx: &Context,
@@ -978,7 +978,7 @@ fn span_for_jsx_element(
     ))
 }
 
-// Go: ls/folding.go:475 spanForJSXAttributes
+// Go: ls/folding.go:549 spanForJSXAttributes
 fn span_for_jsx_attributes(
     ctx: &Context,
     node: Node,
@@ -1004,7 +1004,7 @@ fn span_for_jsx_attributes(
     )
 }
 
-// Go: ls/folding.go:488 spanForNodeArray
+// Go: ls/folding.go:562 spanForNodeArray
 fn span_for_node_array(
     ctx: &Context,
     statements: NodeList,
@@ -1027,7 +1027,7 @@ fn span_for_node_array(
     None
 }
 
-// Go: ls/folding.go:495 spanForNode
+// Go: ls/folding.go:573 spanForNode
 fn span_for_node(
     ctx: &Context,
     node: Node,
@@ -1048,7 +1048,7 @@ fn span_for_node(
     None
 }
 
-// Go: ls/folding.go:543 rangeBetweenTokens
+// Go: ls/folding.go:586 rangeBetweenTokens
 // PORT: Go returns `*FoldingRange`; nil is `None`.
 fn range_between_tokens(
     ctx: &Context,
@@ -1078,7 +1078,7 @@ fn range_between_tokens(
     ))
 }
 
-// Go: ls/folding.go:518 supportsCollapsedText
+// Go: ls/folding.go:600 supportsCollapsedText
 fn supports_collapsed_text(ctx: &Context) -> bool {
     lsproto::get_client_capabilities(ctx)
         .text_document
@@ -1087,7 +1087,7 @@ fn supports_collapsed_text(ctx: &Context) -> bool {
         .collapsed_text
 }
 
-// Go: ls/folding.go:522 createFoldingRange
+// Go: ls/folding.go:604 createFoldingRange
 // PORT: Go returns a `*FoldingRange` that is never nil, so this returns the
 // value. The Go empty kind `""` is `FoldingRangeKind::default()`.
 fn create_folding_range(
@@ -1114,7 +1114,7 @@ fn create_folding_range(
     result
 }
 
-// Go: ls/folding.go:579 createFoldingRangeFromBounds
+// Go: ls/folding.go:622 createFoldingRangeFromBounds
 // PORT: Go returns `*FoldingRange`; nil is `None`.
 fn create_folding_range_from_bounds(
     ctx: &Context,
@@ -1152,7 +1152,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/folding.go:544 functionSpan
+// Go: ls/folding.go:634 functionSpan
 fn function_span(
     ctx: &Context,
     node: Node,
@@ -1175,7 +1175,7 @@ fn function_span(
     None
 }
 
-// Go: ls/folding.go:553 tryGetFunctionOpenToken
+// Go: ls/folding.go:643 tryGetFunctionOpenToken
 fn try_get_function_open_token(node: Node, body: Node, source_file: Node) -> Node {
     if is_node_array_multi_line(&node.parameters().to_vec(), source_file) {
         let open_paren_token =
@@ -1187,7 +1187,7 @@ fn try_get_function_open_token(node: Node, body: Node, source_file: Node) -> Nod
     astnav::find_child_of_kind(body, SyntaxKind::OpenBraceToken, source_file)
 }
 
-// Go: ls/folding.go:563 isNodeArrayMultiLine
+// Go: ls/folding.go:653 isNodeArrayMultiLine
 fn is_node_array_multi_line(list: &[Node], source_file: Node) -> bool {
     if list.is_empty() {
         return false;
@@ -1199,7 +1199,7 @@ fn is_node_array_multi_line(list: &[Node], source_file: Node) -> bool {
     )
 }
 
-// Go: ls/folding.go:55 foldingRangeKey
+// Go: ls/folding.go:53 foldingRangeKey
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct FoldingRangeKey {
     start_line: u32,
@@ -1214,7 +1214,7 @@ struct FoldingRangeKey {
     has_collapsed_text: bool,
 }
 
-// Go: ls/folding.go:63 keyForFoldingRange
+// Go: ls/folding.go:61 keyForFoldingRange
 fn key_for_folding_range(folding_range: &lsproto::FoldingRange) -> FoldingRangeKey {
     let mut key = FoldingRangeKey {
         start_line: folding_range.start_line,

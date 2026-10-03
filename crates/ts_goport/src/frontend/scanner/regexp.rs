@@ -38,7 +38,7 @@ go_flags!(RegularExpressionFlags, i32 {
     MODIFIERS = (1 << 2) | (1 << 3) | (1 << 4); // regularExpressionFlagsIgnoreCase | regularExpressionFlagsMultiline | regularExpressionFlagsDotAll
 });
 
-// Go: scanner/regexp.go:33 charCodeToRegExpFlag
+// Go: scanner/regexp.go:34 charCodeToRegExpFlag
 // PORT: Go map lookup `charCodeToRegExpFlag[ch]` -> `(flag, ok)` as `Option`.
 pub fn char_code_to_reg_exp_flag(ch: i32) -> Option<RegularExpressionFlags> {
     match rune(ch) {
@@ -54,7 +54,7 @@ pub fn char_code_to_reg_exp_flag(ch: i32) -> Option<RegularExpressionFlags> {
     }
 }
 
-// Go: scanner/regexp.go:44 regExpFlagToFirstAvailableLanguageVersion
+// Go: scanner/regexp.go:45 regExpFlagToFirstAvailableLanguageVersion
 // PORT: Go map lookup as `Option`.
 pub fn reg_exp_flag_to_first_available_language_version(
     flag: RegularExpressionFlags,
@@ -68,7 +68,7 @@ pub fn reg_exp_flag_to_first_available_language_version(
 }
 
 impl<'a> Scanner<'a> {
-    // Go: scanner/regexp.go:50 checkRegularExpressionFlagAvailability
+    // Go: scanner/regexp.go:51 checkRegularExpressionFlagAvailability
     pub fn check_regular_expression_flag_availability(
         &mut self,
         flag: RegularExpressionFlags,
@@ -95,7 +95,7 @@ go_enum!(ClassSetExpressionType, i32 {
     CLASS_SUBTRACTION = 3; // classSetExpressionTypeClassSubtraction
 });
 
-// Go: scanner/regexp.go:65 groupNameReference
+// Go: scanner/regexp.go:66 groupNameReference
 #[derive(Clone, Debug, Default)]
 pub struct GroupNameReference {
     pub pos: i32,
@@ -103,7 +103,7 @@ pub struct GroupNameReference {
     pub name: String,
 }
 
-// Go: scanner/regexp.go:71 decimalEscapeValue
+// Go: scanner/regexp.go:72 decimalEscapeValue
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DecimalEscapeValue {
     pub pos: i32,
@@ -111,7 +111,7 @@ pub struct DecimalEscapeValue {
     pub value: i32,
 }
 
-// Go: scanner/regexp.go:77 regExpParser
+// Go: scanner/regexp.go:78 regExpParser
 pub struct RegExpParser<'a, 't> {
     pub scanner: &'a mut Scanner<'t>,
     pub end: i32,
@@ -175,34 +175,34 @@ pub fn new_reg_exp_parser<'a, 't>(
 }
 
 impl<'a, 't> RegExpParser<'a, 't> {
-    // Go: scanner/regexp.go:108 pos
+    // Go: scanner/regexp.go:109 pos
     fn pos(&self) -> i32 {
         self.scanner.scanner_state.pos
     }
 
-    // Go: scanner/regexp.go:112 setPos
+    // Go: scanner/regexp.go:113 setPos
     // PORT: Go never calls this method either.
     #[allow(dead_code)]
     fn set_pos(&mut self, v: i32) {
         self.scanner.scanner_state.pos = v;
     }
 
-    // Go: scanner/regexp.go:116 incPos
+    // Go: scanner/regexp.go:117 incPos
     fn inc_pos(&mut self, n: i32) {
         self.scanner.scanner_state.pos += n;
     }
 
-    // Go: scanner/regexp.go:120 char
+    // Go: scanner/regexp.go:121 char
     fn char(&self) -> i32 {
         self.scanner.char()
     }
 
-    // Go: scanner/regexp.go:124 charAt
+    // Go: scanner/regexp.go:125 charAt
     fn char_at(&self, pos: i32) -> i32 {
         self.scanner.char_at(pos - self.pos())
     }
 
-    // Go: scanner/regexp.go:128 error
+    // Go: scanner/regexp.go:129 error
     fn error(
         &mut self,
         msg: &'static crate::diagnostics::Message,
@@ -213,7 +213,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         self.scanner.error_at(msg, pos, length, args);
     }
 
-    // Go: scanner/regexp.go:132 text
+    // Go: scanner/regexp.go:133 text
     fn text(&self) -> &str {
         self.scanner.text()
     }
@@ -231,7 +231,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
     }
 }
 
-// Go: scanner/regexp.go:136 compareDecimalStrings
+// Go: scanner/regexp.go:137 compareDecimalStrings
 pub fn compare_decimal_strings(a: &str, b: &str) -> i32 {
     let mut a = a.trim_start_matches('0');
     let mut b = b.trim_start_matches('0');
@@ -255,7 +255,7 @@ pub fn compare_decimal_strings(a: &str, b: &str) -> i32 {
 }
 
 impl<'a, 't> RegExpParser<'a, 't> {
-    // Go: scanner/regexp.go:155 scanDisjunction
+    // Go: scanner/regexp.go:156 scanDisjunction
     // Disjunction ::= Alternative ('|' Alternative)*
     fn scan_disjunction(&mut self, is_in_group: bool) {
         // Names defined by any of this disjunction's alternatives. Since exactly one
@@ -286,7 +286,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         }
     }
 
-    // Go: scanner/regexp.go:205 scanAlternative
+    // Go: scanner/regexp.go:224 scanAlternative
     // Alternative ::= Term*
     // Term ::=
     //
@@ -556,7 +556,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         }
     }
 
-    // Go: scanner/regexp.go:354 scanPatternModifiers
+    // Go: scanner/regexp.go:377 scanPatternModifiers
     fn scan_pattern_modifiers(
         &mut self,
         mut curr_flags: RegularExpressionFlags,
@@ -593,7 +593,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         curr_flags
     }
 
-    // Go: scanner/regexp.go:382 scanAtomEscape
+    // Go: scanner/regexp.go:406 scanAtomEscape
     // AtomEscape ::=
     //
     //	| DecimalEscape
@@ -642,7 +642,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         }
     }
 
-    // Go: scanner/regexp.go:410 scanDecimalEscape
+    // Go: scanner/regexp.go:434 scanDecimalEscape
     // DecimalEscape ::= [1-9] [0-9]*
     fn scan_decimal_escape(&mut self) -> bool {
         debug_assert!(self.pos() > 0 && self.text().as_bytes()[self.pos() as usize - 1] == b'\\');
@@ -670,7 +670,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         false
     }
 
-    // Go: scanner/regexp.go:436 scanCharacterEscape
+    // Go: scanner/regexp.go:460 scanCharacterEscape
     // CharacterEscape ::=
     //
     //	| `c` ControlLetter
@@ -736,7 +736,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         }
     }
 
-    // Go: scanner/regexp.go:476 scanGroupName
+    // Go: scanner/regexp.go:500 scanGroupName
     fn scan_group_name(&mut self, is_reference: bool) {
         debug_assert!(self.pos() > 0 && self.text().as_bytes()[self.pos() as usize - 1] == b'<');
         self.scanner.scanner_state.token_start = self.pos();
@@ -790,7 +790,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         }
     }
 
-    // Go: scanner/regexp.go:494 namedCapturingGroupsContains
+    // Go: scanner/regexp.go:524 namedCapturingGroupsContains
     fn named_capturing_groups_contains(&self, name: &str) -> bool {
         for group in &self.named_capturing_groups {
             if group.get(name).copied().unwrap_or(false) {
@@ -800,12 +800,12 @@ impl<'a, 't> RegExpParser<'a, 't> {
         false
     }
 
-    // Go: scanner/regexp.go:503 isClassContentExit
+    // Go: scanner/regexp.go:533 isClassContentExit
     fn is_class_content_exit(&self, ch: i32) -> bool {
         ch == ']' as i32 || self.pos() >= self.end
     }
 
-    // Go: scanner/regexp.go:508 scanClassRanges
+    // Go: scanner/regexp.go:538 scanClassRanges
     // ClassRanges ::= '^'? (ClassAtom ('-' ClassAtom)?)*
     fn scan_class_ranges(&mut self) {
         debug_assert!(self.pos() > 0 && self.text().as_bytes()[self.pos() as usize - 1] == b'[');
@@ -868,7 +868,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         }
     }
 
-    // Go: scanner/regexp.go:563 scanClassSetExpression
+    // Go: scanner/regexp.go:593 scanClassSetExpression
     // Static Semantics: MayContainStrings
     //     ClassUnion: ClassSetOperands.some(ClassSetOperand => ClassSetOperand.MayContainStrings)
     //     ClassIntersection: ClassSetOperands.every(ClassSetOperand => ClassSetOperand.MayContainStrings)
@@ -1102,7 +1102,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         self.may_contain_strings = !is_character_complement && expression_may_contain_strings;
     }
 
-    // Go: scanner/regexp.go:689 scanClassSetSubExpression
+    // Go: scanner/regexp.go:718 scanClassSetSubExpression
     fn scan_class_set_sub_expression(&mut self, expression_type: ClassSetExpressionType) {
         let mut expression_may_contain_strings = self.may_contain_strings;
         while self.pos() < self.end {
@@ -1194,7 +1194,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         self.may_contain_strings = expression_may_contain_strings;
     }
 
-    // Go: scanner/regexp.go:748 scanClassSetOperand
+    // Go: scanner/regexp.go:777 scanClassSetOperand
     // ClassSetOperand ::=
     //
     //	| '[' ClassSetExpression ']'
@@ -1240,7 +1240,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         }
     }
 
-    // Go: scanner/regexp.go:780 scanClassStringDisjunctionContents
+    // Go: scanner/regexp.go:809 scanClassStringDisjunctionContents
     // ClassStringDisjunctionContents ::= ClassSetCharacter* ('|' ClassSetCharacter*)*
     fn scan_class_string_disjunction_contents(&mut self) {
         debug_assert!(self.pos() > 0 && self.text().as_bytes()[self.pos() as usize - 1] == b'{');
@@ -1269,7 +1269,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         }
     }
 
-    // Go: scanner/regexp.go:808 scanClassSetCharacter
+    // Go: scanner/regexp.go:837 scanClassSetCharacter
     // ClassSetCharacter ::=
     //
     //	| SourceCharacter -- ClassSetSyntaxCharacter -- ClassSetReservedDoublePunctuator
@@ -1331,7 +1331,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         self.scan_source_character()
     }
 
-    // Go: scanner/regexp.go:851 scanClassAtom
+    // Go: scanner/regexp.go:880 scanClassAtom
     // ClassAtom ::=
     //
     //	| SourceCharacter but not one of '\' or ']'
@@ -1368,7 +1368,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         }
     }
 
-    // Go: scanner/regexp.go:877 scanCharacterClassEscape
+    // Go: scanner/regexp.go:906 scanCharacterClassEscape
     // CharacterClassEscape ::=
     //
     //	| 'd' | 'D' | 's' | 'S' | 'w' | 'W'
@@ -1534,7 +1534,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         }
     }
 
-    // Go: scanner/regexp.go:955 getSpellingSuggestionForUnicodePropertyName
+    // Go: scanner/regexp.go:984 getSpellingSuggestionForUnicodePropertyName
     fn get_spelling_suggestion_for_unicode_property_name(&self, name: &str) -> String {
         get_spelling_suggestion_for_strings(
             name,
@@ -1544,7 +1544,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         )
     }
 
-    // Go: scanner/regexp.go:959 getSpellingSuggestionForUnicodePropertyValue
+    // Go: scanner/regexp.go:988 getSpellingSuggestionForUnicodePropertyValue
     fn get_spelling_suggestion_for_unicode_property_value(
         &self,
         property_name: &str,
@@ -1556,7 +1556,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         get_spelling_suggestion_for_strings(value, values.iter().map(|v| v.to_string()))
     }
 
-    // Go: scanner/regexp.go:967 getSpellingSuggestionForUnicodePropertyNameOrValue
+    // Go: scanner/regexp.go:996 getSpellingSuggestionForUnicodePropertyNameOrValue
     fn get_spelling_suggestion_for_unicode_property_name_or_value(&self, name: &str) -> String {
         get_spelling_suggestion_for_strings(
             name,
@@ -1568,12 +1568,12 @@ impl<'a, 't> RegExpParser<'a, 't> {
         )
     }
 
-    // Go: scanner/regexp.go:975 scanWordCharacters
+    // Go: scanner/regexp.go:1004 scanWordCharacters
     fn scan_word_characters(&mut self) -> String {
         let start = self.pos();
         while self.pos() < self.end {
             let ch = self.char();
-            // Go: scanner/scanner.go:2250 isWordCharacter
+            // Go: scanner/scanner.go:2236 isWordCharacter
             // PORT: inlined; the scanner_util.rs copy is private and takes `char`.
             if !rune(ch).is_some_and(|c| is_ascii_letter(c) || is_digit(c) || c == '_') {
                 break;
@@ -1584,7 +1584,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         self.text()[start as usize..self.pos() as usize].to_string()
     }
 
-    // Go: scanner/regexp.go:987 scanSourceCharacter
+    // Go: scanner/regexp.go:1016 scanSourceCharacter
     fn scan_source_character(&mut self) -> Vec<u8> {
         if self.pos() >= self.end {
             return Vec::new();
@@ -1640,7 +1640,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         rune_to_bytes(ch)
     }
 
-    // Go: scanner/regexp.go:1030 scanExpectedChar
+    // Go: scanner/regexp.go:1059 scanExpectedChar
     fn scan_expected_char(&mut self, ch: i32) {
         if self.char() == ch {
             self.inc_pos(1);
@@ -1650,7 +1650,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         }
     }
 
-    // Go: scanner/regexp.go:1038 scanDigits
+    // Go: scanner/regexp.go:1067 scanDigits
     fn scan_digits(&mut self) {
         let start = self.pos();
         while self.pos() < self.end && rune(self.char()).is_some_and(is_digit) {
@@ -1660,7 +1660,7 @@ impl<'a, 't> RegExpParser<'a, 't> {
         self.scanner.set_token_value(&value);
     }
 
-    // Go: scanner/regexp.go:1046 run
+    // Go: scanner/regexp.go:1075 run
     pub fn run(&mut self) {
         // Regular expressions are checked more strictly when either in 'u' or 'v' mode, or
         // when not using the looser interpretation of the syntax from ECMA-262 Annex B.

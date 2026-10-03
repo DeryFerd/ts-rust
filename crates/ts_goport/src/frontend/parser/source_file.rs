@@ -143,7 +143,7 @@ impl ParsedSourceFile {
             .collect();
     }
 
-    // Go: ast/ast.go:2562 ParseOptions
+    // Go: ast/ast.go:2539 ParseOptions
     #[must_use]
     pub fn parse_options(&self) -> &SourceFileParseOptions {
         &self.parse_options
@@ -165,13 +165,13 @@ impl ParsedSourceFile {
             .unwrap_or_else(|| xxhash_rust::xxh3::xxh3_128(self.text.as_bytes()))
     }
 
-    // Go: ast/ast.go:2570 FileName
+    // Go: ast/ast.go:2701 FileName
     #[must_use]
     pub fn file_name(&self) -> &str {
         &self.parse_options.file_name
     }
 
-    // Go: ast/ast.go:2574 Path
+    // Go: ast/ast.go:2705 Path
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.parse_options.path
@@ -201,7 +201,7 @@ impl ParsedSourceFile {
     // on its thread). A clone of a `ParsedSourceFile` has the same store, so
     // it has the same info, as a Go copy of the pointer does.
 
-    // Go: ast/ast.go:2561 OriginalText
+    // Go: ast/ast.go:2548 OriginalText
     // OriginalText returns the untransformed source text for content-mapped files, or Text() otherwise.
     #[must_use]
     pub fn original_text(&self) -> &str {
@@ -211,7 +211,7 @@ impl ParsedSourceFile {
         }
     }
 
-    // Go: ast/ast.go:2569 OriginalFileName
+    // Go: ast/ast.go:2556 OriginalFileName
     // OriginalFileName returns the canonical filename associated with a supplemental source file, or FileName() otherwise.
     // PORT: reads the canonical SourceFile node, so it does not depend on
     // the canonical `ParsedSourceFile` being alive (see
@@ -225,7 +225,7 @@ impl ParsedSourceFile {
         self.file_name()
     }
 
-    // Go: ast/ast.go:2579 SpanMap
+    // Go: ast/ast.go:2566 SpanMap
     // SpanMap returns the span map that maps positions in this file's transformed Text() back to its
     // original, untransformed content, or nil if the file is not content-mapped (or is a failure stub).
     // The returned map is nil-safe: a nil map maps positions identically.
@@ -234,7 +234,7 @@ impl ParsedSourceFile {
         source_file_span_map(self.root)
     }
 
-    // Go: ast/ast.go:2588 ContentMapper
+    // Go: ast/ast.go:2575 ContentMapper
     // ContentMapper returns the identity of the content mapper that produced this file, or "" if the file
     // was not produced by a content mapper (or the mapper did not identify itself).
     #[must_use]
@@ -242,7 +242,7 @@ impl ParsedSourceFile {
         source_file_content_mapper(self.root)
     }
 
-    // Go: ast/ast.go:2597 IsContentMapperFailureStub
+    // Go: ast/ast.go:2584 IsContentMapperFailureStub
     // IsContentMapperFailureStub reports whether this file is the empty placeholder produced when a content
     // mapper's transform failed.
     #[must_use]
@@ -250,26 +250,26 @@ impl ParsedSourceFile {
         source_file_is_content_mapper_failure_stub(self.root)
     }
 
-    // Go: ast/ast.go:2601 ContentMapperTransformIdentity
+    // Go: ast/ast.go:2588 ContentMapperTransformIdentity
     #[must_use]
     pub fn content_mapper_transform_identity(&self) -> &'static str {
         source_file_content_mapper_transform_identity(self.root)
     }
 
-    // Go: ast/ast.go:2608 VirtualFileName
+    // Go: ast/ast.go:2595 VirtualFileName
     #[must_use]
     pub fn virtual_file_name(&self) -> &'static str {
         source_file_virtual_file_name(self.root)
     }
 
-    // Go: ast/ast.go:2644 ContentMapperParseOptions
+    // Go: ast/ast.go:2631 ContentMapperParseOptions
     // ContentMapperParseOptions returns the parse options used to acquire this file from the mapped parse cache.
     #[must_use]
     pub fn content_mapper_parse_options(&self) -> &'static SourceFileParseOptions {
         source_file_content_mapper_parse_options(self.root)
     }
 
-    // Go: ast/ast.go:2652 SetContentMapperInfo
+    // Go: ast/ast.go:2639 SetContentMapperInfo
     // SetContentMapperInfo initializes all content-mapper metadata before the source file is published.
     // PORT: takes `&self`, because callers hold the file in an `Rc`. Panics
     // when the info is already set, as Go does.
@@ -316,13 +316,13 @@ impl ParsedSourceFile {
         CONTENT_MAPPER_LINKS.with(|m| m.borrow_mut().insert(self.root.file_index(), links));
     }
 
-    // Go: ast/ast.go:2659 DiagnosticDirectives
+    // Go: ast/ast.go:2646 DiagnosticDirectives
     #[must_use]
     pub fn diagnostic_directives(&self) -> &'static [MappedDiagnosticDirective] {
         source_file_diagnostic_directives(self.root)
     }
 
-    // Go: ast/ast.go:2667 SupplementalSourceFiles
+    // Go: ast/ast.go:2654 SupplementalSourceFiles
     // SupplementalSourceFiles returns the additional outputs produced from this canonical source file.
     // PORT: returns a copy of the `Rc` list (the list is in a thread table).
     #[must_use]
@@ -335,7 +335,7 @@ impl ParsedSourceFile {
         })
     }
 
-    // Go: ast/ast.go:2675 CanonicalSourceFile
+    // Go: ast/ast.go:2662 CanonicalSourceFile
     // CanonicalSourceFile returns the canonical output associated with this supplemental source file.
     // PORT: the link is a `Weak` (see `set_content_mapper_info`), so this is
     // `None` after the canonical file is dropped. A supplemental file is
@@ -350,7 +350,7 @@ impl ParsedSourceFile {
         })
     }
 
-    // Go: ast/ast.go:2683 IsContentMapperSupplemental
+    // Go: ast/ast.go:2670 IsContentMapperSupplemental
     // IsContentMapperSupplemental reports whether this is an unnamed supplemental mapper output.
     // PORT: reads the canonical SourceFile node (see `original_file_name`).
     #[must_use]

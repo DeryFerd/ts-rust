@@ -6,12 +6,12 @@ use crate::prelude::*;
 use crate::printer::EmitContext;
 use crate::printer::factory::NodeFactory;
 
-// Go: transformers/estransforms/taggedtemplate.go:12 newlineNormalizer
+// Go: transformers/estransforms/taggedtemplate.go:13 newlineNormalizer
 fn newline_normalizer_replace(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-// Go: transformers/estransforms/taggedtemplate.go:14 taggedTemplateTransformer
+// Go: transformers/estransforms/taggedtemplate.go:15 taggedTemplateTransformer
 pub struct TaggedTemplateTransformer {
     emit_context: Rc<EmitContext>,
     current_source_file: Node,
@@ -21,7 +21,7 @@ pub struct TaggedTemplateTransformer {
 
 impl_es_transformer!(TaggedTemplateTransformer);
 
-// Go: transformers/estransforms/taggedtemplate.go:21 newTaggedTemplateLiftRestrictionTransformer
+// Go: transformers/estransforms/taggedtemplate.go:22 newTaggedTemplateLiftRestrictionTransformer
 pub fn new_tagged_template_lift_restriction_transformer(
     opts: &TransformOptions,
 ) -> Option<TransformerBox> {
@@ -33,7 +33,7 @@ pub fn new_tagged_template_lift_restriction_transformer(
 }
 
 impl TaggedTemplateTransformer {
-    // Go: transformers/estransforms/taggedtemplate.go:26 taggedTemplateTransformer.visit
+    // Go: transformers/estransforms/taggedtemplate.go:27 taggedTemplateTransformer.visit
     fn visit(&mut self, node: Node) -> Node {
         if !node
             .subtree_facts()
@@ -48,7 +48,7 @@ impl TaggedTemplateTransformer {
         }
     }
 
-    // Go: transformers/estransforms/taggedtemplate.go:40 taggedTemplateTransformer.visitSourceFile
+    // Go: transformers/estransforms/taggedtemplate.go:41 taggedTemplateTransformer.visitSourceFile
     fn visit_source_file(&mut self, node: Node) -> Node {
         self.current_source_file = node;
         self.tagged_template_string_declarations = Vec::new();
@@ -73,12 +73,12 @@ impl TaggedTemplateTransformer {
         visited
     }
 
-    // Go: transformers/estransforms/taggedtemplate.go:65 taggedTemplateTransformer.visitTaggedTemplateExpression
+    // Go: transformers/estransforms/taggedtemplate.go:67 taggedTemplateTransformer.visitTaggedTemplateExpression
     fn visit_tagged_template_expression(&mut self, node: Node) -> Node {
         self.process_tagged_template_expression(node)
     }
 
-    // Go: transformers/estransforms/taggedtemplate.go:69 taggedTemplateTransformer.processTaggedTemplateExpression
+    // Go: transformers/estransforms/taggedtemplate.go:71 taggedTemplateTransformer.processTaggedTemplateExpression
     fn process_tagged_template_expression(&mut self, node: Node) -> Node {
         let tag = self.visit_node(node.tag());
         let template = node.template();

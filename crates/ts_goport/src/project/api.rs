@@ -7,7 +7,7 @@
 use crate::project::prelude::*;
 
 impl Session {
-    // Go: project/api.go:25 APIUpdate
+    // Go: project/api.go:18 APIUpdate
     // APIUpdate creates a new snapshot incorporating the given file changes and the
     // supplied API open/close request. The apiRequest may open or close projects and
     // files; opens are tracked in the snapshot (ref-counted) so they persist across
@@ -75,7 +75,7 @@ impl Session {
         Ok(new_snapshot)
     }
 
-    // Go: project/api.go:30 TryAdoptSnapshotInBackground (ts#64163)
+    // Go: project/api.go:59 TryAdoptSnapshotInBackground (ts#64163)
     // TryAdoptSnapshotInBackground retains a derived snapshot and attempts to adopt it
     // as the session's current snapshot without blocking the caller.
     pub fn try_adopt_snapshot_in_background(
