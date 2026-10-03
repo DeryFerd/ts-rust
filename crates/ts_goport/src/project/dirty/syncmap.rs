@@ -414,7 +414,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMap<K, V> {
         (None, false)
     }
 
-    // Go: project/dirty/syncmap.go:228 LoadOrStore
+    // Go: project/dirty/syncmap.go:226 LoadOrStore
     pub fn load_or_store(&self, key: K, value: V) -> (Option<Rc<SyncMapEntry<K, V>>>, bool) {
         // Check for existence in the base map first so the sync map access is atomic.
         if let Some(base_value) = self.base.get(&key) {
@@ -478,7 +478,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMap<K, V> {
         }
     }
 
-    // Go: project/dirty/syncmap.go:282 Range
+    // Go: project/dirty/syncmap.go:274 Range
     // PORT: the entries are copied out first so `fn_` can change the map
     // (Go sync.Map.Range may or may not see entries stored meanwhile). Go
     // keeps going with the base map after `fn_` stops the dirty Range; the
@@ -518,7 +518,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMap<K, V> {
         }
     }
 
-    // Go: project/dirty/syncmap.go:315 finalize
+    // Go: project/dirty/syncmap.go:308 finalize
     // PORT: returns an owned map for callers that keep a plain `FxHashMap`.
     // When nothing changed, that is a copy of the base map.
     // `finalize_shared` returns the base map itself, as Go does.
@@ -527,7 +527,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMap<K, V> {
         (Rc::unwrap_or_clone(result), changed)
     }
 
-    // Go: project/dirty/syncmap.go:315 finalize
+    // Go: project/dirty/syncmap.go:308 finalize
     // PORT: when nothing changed, the result is the base map (an `Rc` clone),
     // as in Go. When an entry changed, it is a new map. No borrow is held
     // while a hook runs.
@@ -589,19 +589,19 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> SyncMap<K, V> {
         }
     }
 
-    // Go: project/dirty/syncmap.go:356 Finalize
+    // Go: project/dirty/syncmap.go:349 Finalize
     // PORT: `_exported`, because Go also has the unexported `finalize`.
     pub fn finalize_exported(&self) -> (FxHashMap<K, V>, bool) {
         self.finalize(FinalizationHooks::default())
     }
 
-    // Go: project/dirty/syncmap.go:360 FinalizeWith
+    // Go: project/dirty/syncmap.go:353 FinalizeWith
     pub fn finalize_with(&self, hooks: FinalizationHooks<'_, K, V>) -> (FxHashMap<K, V>, bool) {
         self.finalize(hooks)
     }
 }
 
-// Go: project/dirty/syncmap.go:309 FinalizationHooks
+// Go: project/dirty/syncmap.go:302 FinalizationHooks
 // PORT: Go func fields; nil is `None`. Values are `Option<&V>` because Go can
 // pass the zero value (nil).
 pub struct FinalizationHooks<'a, K, V> {

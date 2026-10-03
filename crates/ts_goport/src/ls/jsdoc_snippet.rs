@@ -336,7 +336,7 @@ fn skip_whitespace(text: &str, mut position: i32) -> i32 {
     position
 }
 
-// Go: ls/jsdoc_snippet.go:204 getCommentOwnerInfo
+// Go: ls/jsdoc_snippet.go:208 getCommentOwnerInfo
 fn get_comment_owner_info(
     token_at_pos: Node,
     generate_return_in_doc_template: bool,
@@ -352,7 +352,7 @@ fn get_comment_owner_info(
     None
 }
 
-// Go: ls/jsdoc_snippet.go:214 getCommentOwnerInfoWorker
+// Go: ls/jsdoc_snippet.go:218 getCommentOwnerInfoWorker
 fn get_comment_owner_info_worker(
     comment_owner: Node,
     generate_return_in_doc_template: bool,
@@ -438,7 +438,7 @@ fn get_comment_owner_info_worker(
     }
 }
 
-// Go: ls/jsdoc_snippet.go:268 hasReturn
+// Go: ls/jsdoc_snippet.go:270 hasReturn
 fn has_return(node: Node, generate_return_in_doc_template: bool) -> bool {
     if !generate_return_in_doc_template {
         return false;
@@ -458,7 +458,7 @@ fn has_return(node: Node, generate_return_in_doc_template: bool) -> bool {
         && for_each_return_statement(node.body(), |_| true)
 }
 
-// Go: ls/jsdoc_snippet.go:285 getRightHandSideOfAssignment
+// Go: ls/jsdoc_snippet.go:287 getRightHandSideOfAssignment
 fn get_right_hand_side_of_assignment(right_hand_side: Node) -> Node {
     if right_hand_side.is_nil() {
         return Node::NIL;
@@ -478,7 +478,7 @@ fn get_right_hand_side_of_assignment(right_hand_side: Node) -> Node {
     }
 }
 
-// Go: ls/jsdoc_snippet.go:301 parameterDocComments
+// Go: ls/jsdoc_snippet.go:304 parameterDocComments
 fn parameter_doc_comments(
     parameters: &[Node],
     is_java_script_file: bool,
@@ -508,12 +508,12 @@ fn parameter_doc_comments(
     b
 }
 
-// Go: ls/jsdoc_snippet.go:325 returnsDocComment
+// Go: ls/jsdoc_snippet.go:328 returnsDocComment
 fn returns_doc_comment(indentation: &str, new_line: &str) -> String {
     format!("{indentation} * @returns{new_line}")
 }
 
-// Go: ls/jsdoc_snippet.go:329 getIndentationStringAtPosition
+// Go: ls/jsdoc_snippet.go:332 getIndentationStringAtPosition
 fn get_indentation_string_at_position(source_file: Node, position: i32) -> String {
     let text = source_file_text(source_file);
     let line_start = crate::format::get_line_start_position_for_position(position, source_file);
@@ -531,7 +531,7 @@ fn get_indentation_string_at_position(source_file: Node, position: i32) -> Strin
     text[line_start as usize..pos as usize].to_string()
 }
 
-// Go: ls/jsdoc_snippet.go:346 isNonEmptyJSDoc
+// Go: ls/jsdoc_snippet.go:349 isNonEmptyJSDoc
 fn is_non_empty_js_doc(jsdoc: Node) -> bool {
     if jsdoc.is_nil() {
         return false;
@@ -541,7 +541,7 @@ fn is_non_empty_js_doc(jsdoc: Node) -> bool {
     comment.is_some() && !comment.nodes().is_empty() || tags.is_some() && !tags.nodes().is_empty()
 }
 
-// Go: ls/jsdoc_snippet.go:354 hasJSDocTags
+// Go: ls/jsdoc_snippet.go:357 hasJSDocTags
 fn has_js_doc_tags(node: Node, file: Node) -> bool {
     let jsdocs = node.js_doc(file);
     if jsdocs.is_empty() {
@@ -551,7 +551,7 @@ fn has_js_doc_tags(node: Node, file: Node) -> bool {
     tags.is_some() && !tags.nodes().is_empty()
 }
 
-// Go: ls/jsdoc_snippet.go:363 templateToSnippet
+// Go: ls/jsdoc_snippet.go:366 templateToSnippet
 fn template_to_snippet(template: &str, new_line: &str) -> String {
     if template == "/** */" {
         return format!("/**{new_line} * $0{new_line} */");
@@ -563,7 +563,7 @@ fn template_to_snippet(template: &str, new_line: &str) -> String {
     transform_js_doc_template_lines(&template, new_line, &mut snippet_index)
 }
 
-// Go: ls/jsdoc_snippet.go:374 stripJSDocTemplateIndentation
+// Go: ls/jsdoc_snippet.go:377 stripJSDocTemplateIndentation
 fn strip_js_doc_template_indentation(template: &str, new_line: &str) -> String {
     let mut lines: Vec<String> = template.split(new_line).map(str::to_string).collect();
     for line in &mut lines {
@@ -577,7 +577,7 @@ fn strip_js_doc_template_indentation(template: &str, new_line: &str) -> String {
     lines.join(new_line)
 }
 
-// Go: ls/jsdoc_snippet.go:387 transformJSDocTemplateLines
+// Go: ls/jsdoc_snippet.go:390 transformJSDocTemplateLines
 fn transform_js_doc_template_lines(
     template: &str,
     new_line: &str,
@@ -600,13 +600,13 @@ fn transform_js_doc_template_lines(
     lines.join(new_line)
 }
 
-// Go: ls/jsdoc_snippet.go:405 lineHasOnlyJSDocAsterisk
+// Go: ls/jsdoc_snippet.go:408 lineHasOnlyJSDocAsterisk
 fn line_has_only_js_doc_asterisk(line: &str) -> bool {
     let line = line.trim_start_matches([' ', '\t']);
     line.starts_with('*') && is_only_spaces_or_tabs(&line[1..])
 }
 
-// Go: ls/jsdoc_snippet.go:410 transformJSDocParamLine
+// Go: ls/jsdoc_snippet.go:413 transformJSDocParamLine
 fn transform_js_doc_param_line(line: &str, snippet_index: &mut i32) -> Option<String> {
     let mut prefix = "";
     let mut rest = line;
@@ -652,7 +652,7 @@ fn transform_js_doc_param_line(line: &str, snippet_index: &mut i32) -> Option<St
     Some(out)
 }
 
-// Go: ls/jsdoc_snippet.go:454 transformJSDocReturnsLine
+// Go: ls/jsdoc_snippet.go:460 transformJSDocReturnsLine
 fn transform_js_doc_returns_line(line: &str, snippet_index: &mut i32) -> Option<String> {
     let mut prefix = "";
     let mut rest = line;
@@ -668,7 +668,7 @@ fn transform_js_doc_returns_line(line: &str, snippet_index: &mut i32) -> Option<
     Some(text)
 }
 
-// Go: ls/jsdoc_snippet.go:469 scanNonWhitespace
+// Go: ls/jsdoc_snippet.go:475 scanNonWhitespace
 fn scan_non_whitespace(text: &str) -> (&str, &str, bool) {
     if text.is_empty() {
         return ("", "", false);
@@ -687,7 +687,7 @@ fn scan_non_whitespace(text: &str) -> (&str, &str, bool) {
     (text, "", true)
 }
 
-// Go: ls/jsdoc_snippet.go:485 isJSDocSnippetPrefix
+// Go: ls/jsdoc_snippet.go:492 isJSDocSnippetPrefix
 fn is_js_doc_snippet_prefix(prefix: &str) -> bool {
     let trimmed = trim_right_single_line_whitespace(prefix);
     if trimmed.ends_with("/**") {
@@ -709,7 +709,7 @@ fn is_js_doc_snippet_prefix(prefix: &str) -> bool {
     bytes.len() - start >= 3
 }
 
-// Go: ls/jsdoc_snippet.go:504 getJSDocSnippetPrefixStart
+// Go: ls/jsdoc_snippet.go:512 getJSDocSnippetPrefixStart
 // PORT: Go returns `(int, bool)`; `None` is `false`.
 fn get_js_doc_snippet_prefix_start(prefix: &str) -> Option<usize> {
     let trimmed = trim_right_single_line_whitespace(prefix).as_bytes();
@@ -727,7 +727,7 @@ fn get_js_doc_snippet_prefix_start(prefix: &str) -> Option<usize> {
     None
 }
 
-// Go: ls/jsdoc_snippet.go:517 isJSDocSnippetSuffix
+// Go: ls/jsdoc_snippet.go:525 isJSDocSnippetSuffix
 fn is_js_doc_snippet_suffix(suffix: &str) -> bool {
     let trimmed =
         trim_right_single_line_whitespace(&suffix[skip_single_line_whitespace(suffix, 0)..]);
@@ -742,7 +742,7 @@ fn is_js_doc_snippet_suffix(suffix: &str) -> bool {
         .all(|&b| b == b'*')
 }
 
-// Go: ls/jsdoc_snippet.go:533 getJSDocSnippetSuffixEnd
+// Go: ls/jsdoc_snippet.go:541 getJSDocSnippetSuffixEnd
 // PORT: Go returns `(int, bool)`; `None` is `(0, false)`.
 fn get_js_doc_snippet_suffix_end(suffix: &str) -> Option<usize> {
     let bytes = suffix.as_bytes();
@@ -756,7 +756,7 @@ fn get_js_doc_snippet_suffix_end(suffix: &str) -> Option<usize> {
     None
 }
 
-// Go: ls/jsdoc_snippet.go:545 trimRightSingleLineWhitespace
+// Go: ls/jsdoc_snippet.go:552 trimRightSingleLineWhitespace
 fn trim_right_single_line_whitespace(text: &str) -> &str {
     let mut end = 0usize;
     let mut pos = 0usize;
@@ -773,7 +773,7 @@ fn trim_right_single_line_whitespace(text: &str) -> &str {
     &text[..end]
 }
 
-// Go: ls/jsdoc_snippet.go:560 skipSingleLineWhitespace
+// Go: ls/jsdoc_snippet.go:567 skipSingleLineWhitespace
 fn skip_single_line_whitespace(text: &str, mut pos: usize) -> usize {
     while pos < text.len() {
         let (ch, size) = decode_js_string_rune(&text[pos..]);
@@ -785,12 +785,12 @@ fn skip_single_line_whitespace(text: &str, mut pos: usize) -> usize {
     pos
 }
 
-// Go: ls/jsdoc_snippet.go:571 isOnlySingleLineWhitespace
+// Go: ls/jsdoc_snippet.go:578 isOnlySingleLineWhitespace
 fn is_only_single_line_whitespace(text: &str) -> bool {
     skip_single_line_whitespace(text, 0) == text.len()
 }
 
-// Go: ls/jsdoc_snippet.go:575 startsWithSingleLineWhitespace
+// Go: ls/jsdoc_snippet.go:582 startsWithSingleLineWhitespace
 fn starts_with_single_line_whitespace(text: &str) -> bool {
     if text.is_empty() {
         return false;
@@ -799,7 +799,7 @@ fn starts_with_single_line_whitespace(text: &str) -> bool {
     size != 0 && char::from_u32(ch).is_some_and(is_white_space_single_line)
 }
 
-// Go: ls/jsdoc_snippet.go:583 isOnlySpacesOrTabs
+// Go: ls/jsdoc_snippet.go:590 isOnlySpacesOrTabs
 fn is_only_spaces_or_tabs(text: &str) -> bool {
     text.bytes().all(|b| b == b' ' || b == b'\t')
 }

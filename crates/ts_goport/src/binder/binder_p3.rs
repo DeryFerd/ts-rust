@@ -115,13 +115,13 @@ fn p3_has_flow_node_data(node: Node) -> bool {
     )
 }
 
-// Go: binder/binder.go:1817 isLogicalAssignmentExpression
+// Go: binder/binder.go:1818 isLogicalAssignmentExpression
 pub fn is_logical_assignment_expression(node: Node) -> bool {
     is_logical_or_coalescing_assignment_expression(skip_parentheses(node))
 }
 
 impl Binder {
-    // Go: binder/binder.go:1821 bindAssignmentTargetFlow
+    // Go: binder/binder.go:1822 bindAssignmentTargetFlow
     pub fn bind_assignment_target_flow(&mut self, node: Node) {
         match node.kind() {
             SyntaxKind::ArrayLiteralExpression => {
@@ -158,7 +158,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1849 bindDestructuringTargetFlow
+    // Go: binder/binder.go:1850 bindDestructuringTargetFlow
     pub fn bind_destructuring_target_flow(&mut self, node: Node) {
         if is_binary_expression(node) && node.operator_token().kind() == SyntaxKind::EqualsToken {
             self.bind_assignment_target_flow(node.left());
@@ -167,7 +167,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1857 bindWhileStatement
+    // Go: binder/binder.go:1858 bindWhileStatement
     pub fn bind_while_statement(&mut self, node: Node) {
         let loop_label = self.create_loop_label();
         let pre_while_label = self.set_continue_target(node, loop_label);
@@ -182,7 +182,7 @@ impl Binder {
         self.current_flow = self.finish_flow_label(post_while_label);
     }
 
-    // Go: binder/binder.go:1871 bindDoStatement
+    // Go: binder/binder.go:1872 bindDoStatement
     pub fn bind_do_statement(&mut self, node: Node) {
         let pre_do_label = self.create_loop_label();
         let branch_label = self.create_branch_label();
@@ -197,7 +197,7 @@ impl Binder {
         self.current_flow = self.finish_flow_label(post_do_label);
     }
 
-    // Go: binder/binder.go:1885 bindForStatement
+    // Go: binder/binder.go:1886 bindForStatement
     pub fn bind_for_statement(&mut self, node: Node) {
         self.bind(node.initializer());
         if self.current_flow == self.unreachable_flow {
@@ -228,7 +228,7 @@ impl Binder {
         self.current_flow = self.finish_flow_label(post_loop_label);
     }
 
-    // Go: binder/binder.go:1904 bindForInOrForOfStatement
+    // Go: binder/binder.go:1916 bindForInOrForOfStatement
     pub fn bind_for_in_or_for_of_statement(&mut self, node: Node) {
         self.bind(node.expression());
         if self.current_flow == self.unreachable_flow {
@@ -260,7 +260,7 @@ impl Binder {
         self.current_flow = self.finish_flow_label(post_loop_label);
     }
 
-    // Go: binder/binder.go:1924 bindIfStatement
+    // Go: binder/binder.go:1946 bindIfStatement
     pub fn bind_if_statement(&mut self, node: Node) {
         let then_label = self.create_branch_label();
         let else_label = self.create_branch_label();
@@ -275,7 +275,7 @@ impl Binder {
         self.current_flow = self.finish_flow_label(post_if_label);
     }
 
-    // Go: binder/binder.go:1939 bindReturnStatement
+    // Go: binder/binder.go:1961 bindReturnStatement
     pub fn bind_return_statement(&mut self, node: Node) {
         self.bind(node.expression());
         if self.current_return_target.is_some() {
@@ -286,14 +286,14 @@ impl Binder {
         self.has_flow_effects = true;
     }
 
-    // Go: binder/binder.go:1949 bindThrowStatement
+    // Go: binder/binder.go:1971 bindThrowStatement
     pub fn bind_throw_statement(&mut self, node: Node) {
         self.bind(node.expression());
         self.current_flow = self.unreachable_flow;
         self.has_flow_effects = true;
     }
 
-    // Go: binder/binder.go:1955 bindBreakStatement
+    // Go: binder/binder.go:1977 bindBreakStatement
     pub fn bind_break_statement(&mut self, node: Node) {
         self.bind_break_or_continue_statement(
             node.label(),
@@ -302,7 +302,7 @@ impl Binder {
         );
     }
 
-    // Go: binder/binder.go:1959 bindContinueStatement
+    // Go: binder/binder.go:1981 bindContinueStatement
     pub fn bind_continue_statement(&mut self, node: Node) {
         self.bind_break_or_continue_statement(
             node.label(),
@@ -311,7 +311,7 @@ impl Binder {
         );
     }
 
-    // Go: binder/binder.go:1963 bindBreakOrContinueStatement
+    // Go: binder/binder.go:1985 bindBreakOrContinueStatement
     pub fn bind_break_or_continue_statement(
         &mut self,
         label: Node,
@@ -331,7 +331,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1976 findActiveLabel
+    // Go: binder/binder.go:1998 findActiveLabel
     pub fn find_active_label(&self, name: &str) -> Option<Rc<RefCell<ActiveLabel>>> {
         let mut label = self.active_label_list.clone();
         while let Some(l) = label {
@@ -343,7 +343,7 @@ impl Binder {
         None
     }
 
-    // Go: binder/binder.go:1985 bindBreakOrContinueFlow
+    // Go: binder/binder.go:2007 bindBreakOrContinueFlow
     pub fn bind_break_or_continue_flow(&mut self, flow_label: FlowNodeId) {
         if flow_label.is_some() {
             self.add_antecedent(flow_label, self.current_flow);
@@ -352,7 +352,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:1993 bindTryStatement
+    // Go: binder/binder.go:2015 bindTryStatement
     pub fn bind_try_statement(&mut self, node: Node) {
         // We conservatively assume that *any* code in the try block can cause an exception, but we only need
         // to track code that causes mutations (because only mutations widen the possible control flow type of
@@ -457,7 +457,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2074 bindSwitchStatement
+    // Go: binder/binder.go:2096 bindSwitchStatement
     pub fn bind_switch_statement(&mut self, node: Node) {
         let post_switch_label = self.create_branch_label();
         self.bind(node.expression());
@@ -482,7 +482,7 @@ impl Binder {
         self.current_flow = self.finish_flow_label(post_switch_label);
     }
 
-    // Go: binder/binder.go:2095 bindCaseBlock
+    // Go: binder/binder.go:2117 bindCaseBlock
     pub fn bind_case_block(&mut self, node: Node) {
         let switch_statement = node.parent();
         let clauses = node.clauses().nodes();
@@ -530,7 +530,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2126 bindCaseOrDefaultClause
+    // Go: binder/binder.go:2148 bindCaseOrDefaultClause
     pub fn bind_case_or_default_clause(&mut self, node: Node) {
         let expression = node.expression();
         if expression.is_some() {
@@ -542,14 +542,14 @@ impl Binder {
         self.bind_each(&node.statements().to_vec());
     }
 
-    // Go: binder/binder.go:2137 bindExpressionStatement
+    // Go: binder/binder.go:2159 bindExpressionStatement
     pub fn bind_expression_statement(&mut self, node: Node) {
         let expression = node.expression();
         self.bind(expression);
         self.maybe_bind_expression_flow_if_call(expression);
     }
 
-    // Go: binder/binder.go:2143 maybeBindExpressionFlowIfCall
+    // Go: binder/binder.go:2165 maybeBindExpressionFlowIfCall
     pub fn maybe_bind_expression_flow_if_call(&mut self, node: Node) {
         // A top level or comma expression call expression with a dotted function name and at least one argument
         // is potentially an assertion and is therefore included in the control flow.
@@ -562,7 +562,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2153 bindLabeledStatement
+    // Go: binder/binder.go:2175 bindLabeledStatement
     pub fn bind_labeled_statement(&mut self, node: Node) {
         let label = node.label();
         let post_statement_label = self.create_branch_label();
@@ -585,7 +585,7 @@ impl Binder {
         self.current_flow = self.finish_flow_label(post_statement_label);
     }
 
-    // Go: binder/binder.go:2174 bindPrefixUnaryExpressionFlow
+    // Go: binder/binder.go:2196 bindPrefixUnaryExpressionFlow
     pub fn bind_prefix_unary_expression_flow(&mut self, node: Node) {
         let operator = node.operator();
         if operator == SyntaxKind::ExclamationToken {
@@ -603,7 +603,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2191 bindPostfixUnaryExpressionFlow
+    // Go: binder/binder.go:2213 bindPostfixUnaryExpressionFlow
     pub fn bind_postfix_unary_expression_flow(&mut self, node: Node) {
         let operator = node.operator();
         self.bind_each_child(node);
@@ -612,7 +612,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2199 bindDestructuringAssignmentFlow
+    // Go: binder/binder.go:2221 bindDestructuringAssignmentFlow
     pub fn bind_destructuring_assignment_flow(&mut self, node: Node) {
         if self.in_assignment_pattern {
             self.in_assignment_pattern = false;
@@ -632,7 +632,7 @@ impl Binder {
         self.bind_assignment_target_flow(node.left());
     }
 
-    // Go: binder/binder.go:2219 bindBinaryExpressionFlow
+    // Go: binder/binder.go:2241 bindBinaryExpressionFlow
     pub fn bind_binary_expression_flow(&mut self, node: Node) {
         let operator = node.operator_token().kind();
         if is_logical_or_coalescing_binary_operator(operator)
@@ -691,7 +691,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2261 bindLogicalLikeExpression
+    // Go: binder/binder.go:2283 bindLogicalLikeExpression
     pub fn bind_logical_like_expression(
         &mut self,
         node: Node,
@@ -728,7 +728,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2281 bindDeleteExpressionFlow
+    // Go: binder/binder.go:2303 bindDeleteExpressionFlow
     pub fn bind_delete_expression_flow(&mut self, node: Node) {
         self.bind_each_child(node);
         if node.expression().kind() == SyntaxKind::PropertyAccessExpression {
@@ -736,7 +736,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2289 bindConditionalExpressionFlow
+    // Go: binder/binder.go:2311 bindConditionalExpressionFlow
     pub fn bind_conditional_expression_flow(&mut self, node: Node) {
         let true_label = self.create_branch_label();
         let false_label = self.create_branch_label();
@@ -761,7 +761,7 @@ impl Binder {
         self.has_flow_effects = self.has_flow_effects || save_has_flow_effects;
     }
 
-    // Go: binder/binder.go:2314 bindVariableDeclarationFlow
+    // Go: binder/binder.go:2336 bindVariableDeclarationFlow
     pub fn bind_variable_declaration_flow(&mut self, node: Node) {
         self.bind_each_child(node);
         if node.initializer().is_some() || is_for_in_or_of_statement(node.parent().parent()) {
@@ -769,7 +769,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2321 bindInitializedVariableFlow
+    // Go: binder/binder.go:2343 bindInitializedVariableFlow
     pub fn bind_initialized_variable_flow(&mut self, node: Node) {
         let mut name = Node::NIL;
         match node.kind() {
@@ -791,7 +791,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2338 bindAccessExpressionFlow
+    // Go: binder/binder.go:2360 bindAccessExpressionFlow
     pub fn bind_access_expression_flow(&mut self, node: Node) {
         if is_optional_chain(node) {
             self.bind_optional_chain_flow(node);
@@ -800,7 +800,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2346 bindOptionalChainFlow
+    // Go: binder/binder.go:2368 bindOptionalChainFlow
     pub fn bind_optional_chain_flow(&mut self, node: Node) {
         if is_top_level_logical_expression(node) {
             let post_expression_label = self.create_branch_label();
@@ -818,7 +818,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2363 bindOptionalChain
+    // Go: binder/binder.go:2385 bindOptionalChain
     pub fn bind_optional_chain(
         &mut self,
         node: Node,
@@ -865,7 +865,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2390 bindOptionalExpression
+    // Go: binder/binder.go:2412 bindOptionalExpression
     pub fn bind_optional_expression(
         &mut self,
         node: Node,
@@ -883,7 +883,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2398 bindOptionalChainRest
+    // Go: binder/binder.go:2420 bindOptionalChainRest
     pub fn bind_optional_chain_rest(&mut self, node: Node) -> bool {
         match node.kind() {
             SyntaxKind::PropertyAccessExpression => {
@@ -904,7 +904,7 @@ impl Binder {
         false
     }
 
-    // Go: binder/binder.go:2414 bindCallExpressionFlow
+    // Go: binder/binder.go:2436 bindCallExpressionFlow
     pub fn bind_call_expression_flow(&mut self, node: Node) {
         let call_expression = node.expression();
         if is_optional_chain(node) {
@@ -939,7 +939,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2442 bindNonNullExpressionFlow
+    // Go: binder/binder.go:2464 bindNonNullExpressionFlow
     pub fn bind_non_null_expression_flow(&mut self, node: Node) {
         if is_optional_chain(node) {
             self.bind_optional_chain_flow(node);
@@ -948,7 +948,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2450 bindBindingElementFlow
+    // Go: binder/binder.go:2472 bindBindingElementFlow
     pub fn bind_binding_element_flow(&mut self, node: Node) {
         // When evaluating a binding pattern, the initializer is evaluated before the binding pattern, per:
         // - https://tc39.es/ecma262/#sec-destructuring-binding-patterns-runtime-semantics-iteratorbindinginitialization
@@ -961,7 +961,7 @@ impl Binder {
         self.bind(node.name());
     }
 
-    // Go: binder/binder.go:2463 bindParameterFlow
+    // Go: binder/binder.go:2485 bindParameterFlow
     pub fn bind_parameter_flow(&mut self, node: Node) {
         // PERF: query Q7-3. The node data is looked up once for the
         // `_in` field reads. Binding never changes node data.
@@ -974,7 +974,7 @@ impl Binder {
         self.bind(node.name_in(d));
     }
 
-    // Go: binder/binder.go:2474 bindInitializer
+    // Go: binder/binder.go:2496 bindInitializer
     // a BindingElement/Parameter does not have side effects if initializers are not evaluated and used. (see GH#49759)
     pub fn bind_initializer(&mut self, node: Node) {
         if node.is_nil() {
@@ -991,7 +991,7 @@ impl Binder {
         self.current_flow = self.finish_flow_label(exit_flow);
     }
 
-    // Go: binder/binder.go:2489 setFlowNode
+    // Go: binder/binder.go:2511 setFlowNode
     // PORT: Go package function that writes to the node. Binder output lives
     // in the binder until the file is bound, so this is a `Binder` method.
     pub fn set_flow_node(&mut self, node: Node, flow_node: FlowNodeId) {
@@ -1000,7 +1000,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:2496 setReturnFlowNode
+    // Go: binder/binder.go:2518 setReturnFlowNode
     // PORT: Binder method for the same reason as `set_flow_node`.
     pub fn set_return_flow_node(&mut self, node: Node, return_flow_node: FlowNodeId) {
         match node.kind() {
@@ -1015,13 +1015,13 @@ impl Binder {
     }
 }
 
-// Go: binder/binder.go:2509 isGeneratorFunctionExpression
+// Go: binder/binder.go:2531 isGeneratorFunctionExpression
 pub fn is_generator_function_expression(node: Node) -> bool {
     is_function_expression(node) && node.asterisk_token().is_some()
 }
 
 impl Binder {
-    // Go: binder/binder.go:2513 addToContainerChain
+    // Go: binder/binder.go:2535 addToContainerChain
     pub fn add_to_container_chain(&mut self, next: Node) {
         if self.last_container.is_some() {
             let last_container = self.last_container;
@@ -1030,7 +1030,7 @@ impl Binder {
         self.last_container = next;
     }
 
-    // Go: binder/binder.go:2520 addDeclarationToSymbol
+    // Go: binder/binder.go:2542 addDeclarationToSymbol
     pub fn add_declaration_to_symbol(
         &mut self,
         symbol: SymbolId,
@@ -1065,7 +1065,7 @@ impl Binder {
     }
 }
 
-// Go: binder/binder.go:2538 SetValueDeclaration
+// Go: binder/binder.go:2560 SetValueDeclaration
 pub fn set_value_declaration(symbols: &mut SymbolArena, symbol: SymbolId, node: Node) {
     let value_declaration = symbols.sym(symbol).value_declaration;
     if value_declaration.is_nil()
@@ -1079,7 +1079,7 @@ pub fn set_value_declaration(symbols: &mut SymbolArena, symbol: SymbolId, node: 
     }
 }
 
-// Go: binder/binder.go:2558 GetContainerFlags
+// Go: binder/binder.go:2580 GetContainerFlags
 pub fn get_container_flags(node: Node) -> ContainerFlags {
     get_container_flags_of_kind(node, node.kind())
 }
@@ -1192,7 +1192,7 @@ pub fn get_container_flags_of_kind(node: Node, kind: SyntaxKind) -> ContainerFla
     ContainerFlags::NONE
 }
 
-// Go: binder/binder.go:2602 isNarrowingExpression
+// Go: binder/binder.go:2624 isNarrowingExpression
 pub fn is_narrowing_expression(expr: Node) -> bool {
     match expr.kind() {
         SyntaxKind::Identifier | SyntaxKind::ThisKeyword => true,
@@ -1212,7 +1212,7 @@ pub fn is_narrowing_expression(expr: Node) -> bool {
     }
 }
 
-// Go: binder/binder.go:2620 containsNarrowableReference
+// Go: binder/binder.go:2642 containsNarrowableReference
 pub fn contains_narrowable_reference(expr: Node) -> bool {
     if is_narrowable_reference(expr) {
         return true;
@@ -1231,7 +1231,7 @@ pub fn contains_narrowable_reference(expr: Node) -> bool {
     false
 }
 
-// Go: binder/binder.go:2633 isNarrowableReference
+// Go: binder/binder.go:2655 isNarrowableReference
 pub fn is_narrowable_reference(node: Node) -> bool {
     match node.kind() {
         SyntaxKind::Identifier
@@ -1256,7 +1256,7 @@ pub fn is_narrowable_reference(node: Node) -> bool {
     }
 }
 
-// Go: binder/binder.go:2651 hasNarrowableArgument
+// Go: binder/binder.go:2673 hasNarrowableArgument
 pub fn has_narrowable_argument(expr: Node) -> bool {
     for argument in expr.arguments().iter() {
         if contains_narrowable_reference(argument) {
@@ -1272,7 +1272,7 @@ pub fn has_narrowable_argument(expr: Node) -> bool {
     false
 }
 
-// Go: binder/binder.go:2666 isNarrowingBinaryExpression
+// Go: binder/binder.go:2688 isNarrowingBinaryExpression
 // PORT: Go takes `*ast.BinaryExpression`; this takes the BinaryExpression node.
 pub fn is_narrowing_binary_expression(expr: Node) -> bool {
     match expr.operator_token().kind() {
@@ -1300,7 +1300,7 @@ pub fn is_narrowing_binary_expression(expr: Node) -> bool {
     }
 }
 
-// Go: binder/binder.go:2686 isNarrowableOperand
+// Go: binder/binder.go:2708 isNarrowableOperand
 pub fn is_narrowable_operand(expr: Node) -> bool {
     match expr.kind() {
         SyntaxKind::ParenthesizedExpression => {
@@ -1320,7 +1320,7 @@ pub fn is_narrowable_operand(expr: Node) -> bool {
     contains_narrowable_reference(expr)
 }
 
-// Go: binder/binder.go:2702 isNarrowingTypeOfOperands
+// Go: binder/binder.go:2724 isNarrowingTypeOfOperands
 pub fn is_narrowing_type_of_operands(expr1: Node, expr2: Node) -> bool {
     is_type_of_expression(expr1)
         && is_narrowable_operand(expr1.expression())
@@ -1328,7 +1328,7 @@ pub fn is_narrowing_type_of_operands(expr1: Node, expr2: Node) -> bool {
 }
 
 impl Binder {
-    // Go: binder/binder.go:2706 errorOnNode
+    // Go: binder/binder.go:2728 errorOnNode
     pub fn error_on_node(
         &mut self,
         node: Node,
@@ -1339,7 +1339,7 @@ impl Binder {
         self.add_diagnostic(diagnostic);
     }
 
-    // Go: binder/binder.go:2710 errorOnFirstToken
+    // Go: binder/binder.go:2732 errorOnFirstToken
     pub fn error_on_first_token(
         &mut self,
         node: Node,
@@ -1350,7 +1350,7 @@ impl Binder {
         self.add_diagnostic(new_diagnostic(self.file, span, message, args));
     }
 
-    // Go: binder/binder.go:2733 createDiagnosticForNode
+    // Go: binder/binder.go:2740 createDiagnosticForNode
     // Inside the binder, we may create a diagnostic for an as-yet unbound node (with potentially no parent pointers, implying no accessible source file)
     // If so, the node _must_ be in the current file (as that's the only way anything could have traversed to it to yield it as the error node)
     // This version of `createDiagnosticForNode` uses the binder's context to account for this, and always yields correct diagnostics even in these situations.
@@ -1368,13 +1368,13 @@ impl Binder {
         )
     }
 
-    // Go: binder/binder.go:2737 addDiagnostic
+    // Go: binder/binder.go:2744 addDiagnostic
     pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
         self.file_bind.bind_diagnostics.push(diagnostic);
     }
 }
 
-// Go: binder/binder.go:2749 getOptionalSymbolFlagForNode
+// Go: binder/binder.go:2756 getOptionalSymbolFlagForNode
 // PERF: query Q7-3. `d` is the data of `node`, which the caller already
 // loaded with `parsed_node_data`.
 pub fn get_optional_symbol_flag_for_node(node: Node, d: LoadedData) -> SymbolFlags {
@@ -1386,7 +1386,7 @@ pub fn get_optional_symbol_flag_for_node(node: Node, d: LoadedData) -> SymbolFla
     }
 }
 
-// Go: binder/binder.go:2754 isFunctionSymbol
+// Go: binder/binder.go:2761 isFunctionSymbol
 pub fn is_function_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
     let d = symbols.sym(symbol).value_declaration;
     if d.is_some() {
@@ -1403,7 +1403,7 @@ pub fn is_function_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
     false
 }
 
-// Go: binder/binder.go:2770 isStatementCondition
+// Go: binder/binder.go:2777 isStatementCondition
 pub fn is_statement_condition(node: Node) -> bool {
     let parent = node.parent();
     match parent.kind() {
@@ -1416,7 +1416,7 @@ pub fn is_statement_condition(node: Node) -> bool {
     }
 }
 
-// Go: binder/binder.go:2782 isTopLevelLogicalExpression
+// Go: binder/binder.go:2789 isTopLevelLogicalExpression
 pub fn is_top_level_logical_expression(node: Node) -> bool {
     let mut node = node;
     while is_parenthesized_expression(node.parent())
@@ -1430,7 +1430,7 @@ pub fn is_top_level_logical_expression(node: Node) -> bool {
         && !(is_optional_chain(node.parent()) && node.parent().expression() == node)
 }
 
-// Go: binder/binder.go:2789 isAssignmentDeclaration
+// Go: binder/binder.go:2796 isAssignmentDeclaration
 pub fn is_assignment_declaration(decl: Node) -> bool {
     is_binary_expression(decl)
         || is_access_expression(decl)
@@ -1438,7 +1438,7 @@ pub fn is_assignment_declaration(decl: Node) -> bool {
         || is_call_expression(decl)
 }
 
-// Go: binder/binder.go:2793 isEffectiveModuleDeclaration
+// Go: binder/binder.go:2800 isEffectiveModuleDeclaration
 pub fn is_effective_module_declaration(node: Node) -> bool {
     is_module_declaration(node) || is_identifier(node)
 }

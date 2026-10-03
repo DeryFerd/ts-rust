@@ -13,7 +13,7 @@ use crate::frontend::prelude::*;
 const NO_TOKEN_FLAGS: crate::astdata::TokenFlags = crate::astdata::TokenFlags(0);
 
 impl NodeFactory {
-    // Go: ast/ast.go:2549 NewSourceFile
+    // Go: ast/ast.go:2526 NewSourceFile
     // PORT: Go stores `fileName`, `parseOptions` and `text` on the
     // SourceFile data. Here the file name and text live in the node store
     // (`new_file_store`) and the parse options in `ParsedSourceFile`, so only
@@ -49,7 +49,7 @@ impl NodeFactory {
         )
     }
 
-    // Go: ast/ast.go:2987 NewCommentRange
+    // Go: ast/ast.go:3115 NewCommentRange
     #[must_use]
     pub fn new_comment_range(
         &self,

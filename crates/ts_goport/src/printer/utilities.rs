@@ -855,7 +855,7 @@ pub(crate) fn greatest_end(mut end: i32, nodes: &[&dyn EndLike]) -> i32 {
     end
 }
 
-// Go: printer/utilities.go:615 skipSynthesizedParentheses
+// Go: printer/utilities.go:614 skipSynthesizedParentheses
 pub(crate) fn skip_synthesized_parentheses(mut node: Node) -> Node {
     while node.kind() == SyntaxKind::ParenthesizedExpression && node_is_synthesized(node) {
         node = node.expression();
@@ -863,18 +863,18 @@ pub(crate) fn skip_synthesized_parentheses(mut node: Node) -> Node {
     node
 }
 
-// Go: printer/utilities.go:622 isNewExpressionWithoutArguments
+// Go: printer/utilities.go:621 isNewExpressionWithoutArguments
 pub(crate) fn is_new_expression_without_arguments(node: Node) -> bool {
     node.kind() == SyntaxKind::NewExpression && node.argument_list().is_nil()
 }
 
-// Go: printer/utilities.go:626 isBinaryOperation
+// Go: printer/utilities.go:625 isBinaryOperation
 pub(crate) fn is_binary_operation(node: Node, token: SyntaxKind) -> bool {
     let node = skip_partially_emitted_expressions(node);
     node.kind() == SyntaxKind::BinaryExpression && node.operator_token().kind() == token
 }
 
-// Go: printer/utilities.go:632 mixingBinaryOperatorsRequiresParentheses
+// Go: printer/utilities.go:631 mixingBinaryOperatorsRequiresParentheses
 pub(crate) fn mixing_binary_operators_requires_parentheses(a: SyntaxKind, b: SyntaxKind) -> bool {
     if a == SyntaxKind::QuestionQuestionToken {
         return b == SyntaxKind::AmpersandAmpersandToken || b == SyntaxKind::BarBarToken;
@@ -885,7 +885,7 @@ pub(crate) fn mixing_binary_operators_requires_parentheses(a: SyntaxKind, b: Syn
     false
 }
 
-// Go: printer/utilities.go:642 isImmediatelyInvokedFunctionExpressionOrArrowFunction
+// Go: printer/utilities.go:641 isImmediatelyInvokedFunctionExpressionOrArrowFunction
 pub(crate) fn is_immediately_invoked_function_expression_or_arrow_function(node: Node) -> bool {
     let node = skip_partially_emitted_expressions(node);
     if !is_call_expression(node) {
@@ -895,12 +895,12 @@ pub(crate) fn is_immediately_invoked_function_expression_or_arrow_function(node:
     is_function_expression(node) || is_arrow_function(node)
 }
 
-// Go: printer/utilities.go:659 hasLeadingHash
+// Go: printer/utilities.go:650 hasLeadingHash
 fn has_leading_hash(text: &str) -> bool {
     !text.is_empty() && text.as_bytes()[0] == b'#'
 }
 
-// Go: printer/utilities.go:663 removeLeadingHash
+// Go: printer/utilities.go:654 removeLeadingHash
 pub(crate) fn remove_leading_hash(text: &str) -> &str {
     if has_leading_hash(text) {
         &text[1..]
@@ -909,7 +909,7 @@ pub(crate) fn remove_leading_hash(text: &str) -> &str {
     }
 }
 
-// Go: printer/utilities.go:671 ensureLeadingHash
+// Go: printer/utilities.go:662 ensureLeadingHash
 pub(crate) fn ensure_leading_hash(text: &str) -> String {
     if has_leading_hash(text) {
         text.to_string()
@@ -918,7 +918,7 @@ pub(crate) fn ensure_leading_hash(text: &str) -> String {
     }
 }
 
-// Go: printer/utilities.go:679 FormatGeneratedName
+// Go: printer/utilities.go:670 FormatGeneratedName
 pub fn format_generated_name(private_name: bool, prefix: &str, base: &str, suffix: &str) -> String {
     let name = format!(
         "{}{}{}",
@@ -932,12 +932,12 @@ pub fn format_generated_name(private_name: bool, prefix: &str, base: &str, suffi
     name
 }
 
-// Go: printer/utilities.go:687 isASCIIWordCharacter
+// Go: printer/utilities.go:678 isASCIIWordCharacter
 fn is_ascii_word_character(ch: char) -> bool {
     is_ascii_letter(ch) || is_digit(ch) || ch == '_'
 }
 
-// Go: printer/utilities.go:691 makeIdentifierFromModuleName
+// Go: printer/utilities.go:682 makeIdentifierFromModuleName
 // PORT: Go reads the bytes of the Go string. `module_name` is a port form
 // (see `scanner_util::GO_STRING_MARKER`), so this reads its Go bytes. Each
 // byte that is not ASCII becomes '_', so the kept bytes are ASCII.
@@ -970,7 +970,7 @@ pub(crate) fn make_identifier_from_module_name(module_name: &str) -> String {
     builder
 }
 
-// Go: printer/utilities.go:715 findSpanEndWithEmitContext
+// Go: printer/utilities.go:706 findSpanEndWithEmitContext
 pub(crate) fn find_span_end_with_emit_context<T: Copy>(
     c: &EmitContext,
     array: &[T],
@@ -984,7 +984,7 @@ pub(crate) fn find_span_end_with_emit_context<T: Copy>(
     i
 }
 
-// Go: printer/utilities.go:723 findSpanEnd
+// Go: printer/utilities.go:714 findSpanEnd
 pub(crate) fn find_span_end<T: Copy>(array: &[T], test: impl Fn(T) -> bool, start: i32) -> i32 {
     let mut i = start;
     while (i as usize) < array.len() && test(array[i as usize]) {
@@ -1002,7 +1002,7 @@ fn decode_rune_in_string(text: &str, pos: usize) -> (char, usize) {
     }
 }
 
-// Go: printer/utilities.go:731 skipWhiteSpaceSingleLine
+// Go: printer/utilities.go:722 skipWhiteSpaceSingleLine
 // PORT: byte positions are `usize` in these private scanning helpers.
 fn skip_white_space_single_line(text: &str, pos: &mut usize) {
     while *pos < text.len() {
@@ -1014,14 +1014,14 @@ fn skip_white_space_single_line(text: &str, pos: &mut usize) {
     }
 }
 
-// Go: printer/utilities.go:741 matchWhiteSpaceSingleLine
+// Go: printer/utilities.go:732 matchWhiteSpaceSingleLine
 fn match_white_space_single_line(text: &str, pos: &mut usize) -> bool {
     let start_pos = *pos;
     skip_white_space_single_line(text, pos);
     *pos != start_pos
 }
 
-// Go: printer/utilities.go:747 matchRune
+// Go: printer/utilities.go:738 matchRune
 fn match_rune(text: &str, pos: &mut usize, expected: char) -> bool {
     let (ch, size) = decode_rune_in_string(text, *pos);
     if ch == expected {
@@ -1031,7 +1031,7 @@ fn match_rune(text: &str, pos: &mut usize, expected: char) -> bool {
     false
 }
 
-// Go: printer/utilities.go:756 matchString
+// Go: printer/utilities.go:747 matchString
 fn match_string(text: &str, pos: &mut usize, expected: &str) -> bool {
     let mut text_pos = *pos;
     let mut expected_pos = 0usize;
@@ -1052,7 +1052,7 @@ fn match_string(text: &str, pos: &mut usize, expected: &str) -> bool {
     true
 }
 
-// Go: printer/utilities.go:776 matchQuotedString
+// Go: printer/utilities.go:767 matchQuotedString
 fn match_quoted_string(text: &str, pos: &mut usize) -> bool {
     let mut text_pos = *pos;
     let quote_char;
@@ -1074,7 +1074,7 @@ fn match_quoted_string(text: &str, pos: &mut usize) -> bool {
     false
 }
 
-// Go: printer/utilities.go:804 IsRecognizedTripleSlashComment
+// Go: printer/utilities.go:795 IsRecognizedTripleSlashComment
 // /// <reference path="..." />
 // /// <reference types="..." />
 // /// <reference lib="..." />
@@ -1140,7 +1140,7 @@ pub fn is_recognized_triple_slash_comment(text: &str, comment_range: CommentRang
     false
 }
 
-// Go: printer/utilities.go:861 isJSDocLikeText
+// Go: printer/utilities.go:852 isJSDocLikeText
 pub(crate) fn is_js_doc_like_text(text: &str, comment: CommentRange) -> bool {
     let bytes = text.as_bytes();
     comment.kind == SyntaxKind::MultiLineCommentTrivia
@@ -1149,14 +1149,14 @@ pub(crate) fn is_js_doc_like_text(text: &str, comment: CommentRange) -> bool {
         && bytes[(comment.pos() + 3) as usize] != b'/'
 }
 
-// Go: printer/utilities.go:868 IsPinnedComment
+// Go: printer/utilities.go:859 IsPinnedComment
 pub fn is_pinned_comment(text: &str, comment: CommentRange) -> bool {
     comment.kind == SyntaxKind::MultiLineCommentTrivia
         && comment.len() > 5
         && text.as_bytes()[(comment.pos() + 2) as usize] == b'!'
 }
 
-// Go: printer/utilities.go:874 calculateIndent
+// Go: printer/utilities.go:865 calculateIndent
 pub(crate) fn calculate_indent(text: &str, mut pos: i32, end: i32) -> i32 {
     let mut current_line_indent = 0;
     let indent_size = get_default_indent_size();

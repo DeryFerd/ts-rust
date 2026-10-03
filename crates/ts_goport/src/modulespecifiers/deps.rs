@@ -51,7 +51,7 @@ pub fn mangle_scoped_package_name(package_name: &str) -> String {
     package_name.to_string()
 }
 
-// Go: module/util.go:178 TryGetJSExtensionForFile
+// Go: module/util.go:182 TryGetJSExtensionForFile
 // TryGetJSExtensionForFile maps TS/JS/DTS extensions to the output JS-side extension.
 // Returns an empty string if the extension is unsupported.
 pub fn try_get_js_extension_for_file(file_name: &str, options: &CompilerOptions) -> &'static str {
@@ -75,7 +75,7 @@ pub fn try_get_js_extension_for_file(file_name: &str, options: &CompilerOptions)
     }
 }
 
-// Go: module/resolver.go:1918 GetConditions
+// Go: module/resolver.go:1916 GetConditions
 pub fn get_conditions(
     options: &CompilerOptions,
     mut resolution_mode: ResolutionMode,
@@ -170,14 +170,14 @@ pub fn find_best_pattern_match(values: &[Pattern], candidate: &str) -> Pattern {
     best_pattern
 }
 
-// Go: module/resolver.go:1976 ParsedPatterns
+// Go: module/resolver.go:1977 ParsedPatterns
 #[derive(Clone, Debug, Default)]
 pub struct ParsedPatterns {
     matchable_string_set: FxHashSet<String>,
     patterns: Vec<Pattern>,
 }
 
-// Go: module/resolver.go:1988 TryParsePatterns
+// Go: module/resolver.go:1986 TryParsePatterns
 pub fn try_parse_patterns(
     path_mappings: Option<&IndexMap<String, Option<Vec<String>>>>,
 ) -> ParsedPatterns {
@@ -198,7 +198,7 @@ pub fn try_parse_patterns(
     result
 }
 
-// Go: module/resolver.go:2023 MatchPatternOrExact
+// Go: module/resolver.go:2025 MatchPatternOrExact
 pub fn match_pattern_or_exact(patterns: &ParsedPatterns, candidate: &str) -> Pattern {
     if patterns.matchable_string_set.contains(candidate) {
         return Pattern {
@@ -212,7 +212,7 @@ pub fn match_pattern_or_exact(patterns: &ParsedPatterns, candidate: &str) -> Pat
     find_best_pattern_match(&patterns.patterns, candidate)
 }
 
-// Go: core/core.go:678 IndexAfter
+// Go: core/core.go:715 IndexAfter
 pub fn index_after(s: &str, pattern: &str, start_index: usize) -> isize {
     match s.get(start_index..).and_then(|rest| rest.find(pattern)) {
         None => -1,
@@ -220,7 +220,7 @@ pub fn index_after(s: &str, pattern: &str, start_index: usize) -> isize {
     }
 }
 
-// Go: core/core.go:830 CompareBooleans
+// Go: core/core.go:867 CompareBooleans
 // CompareBooleans treats true as greater than false.
 pub fn compare_booleans(a: bool, b: bool) -> i32 {
     if a && !b {
@@ -274,7 +274,7 @@ pub fn has_prefix_and_suffix_without_overlap(
     has_prefix(s, prefix, case_sensitive) && has_suffix(s, suffix, case_sensitive)
 }
 
-// Go: outputpaths/outputpaths.go:11 OutputPathsHost
+// Go: outputpaths/outputpaths.go:9 OutputPathsHost
 pub trait OutputPathsHost {
     fn common_source_directory(&self) -> String;
     /// #4712: the file extensions of the configured content mappers.
@@ -283,7 +283,7 @@ pub trait OutputPathsHost {
     fn use_case_sensitive_file_names(&self) -> bool;
 }
 
-// Go: outputpaths/outputpaths.go:91 GetOutputJSFileNameWorker
+// Go: outputpaths/outputpaths.go:101 GetOutputJSFileNameWorker
 pub fn get_output_js_file_name_worker(
     input_file_name: &str,
     options: &CompilerOptions,
@@ -295,7 +295,7 @@ pub fn get_output_js_file_name_worker(
     )
 }
 
-// Go: outputpaths/outputpaths.go:98 GetOutputDeclarationFileNameWorker
+// Go: outputpaths/outputpaths.go:108 GetOutputDeclarationFileNameWorker
 pub fn get_output_declaration_file_name_worker(
     input_file_name: &str,
     options: &CompilerOptions,
@@ -339,7 +339,7 @@ pub fn change_to_declaration_extension(path: &str, host: &dyn OutputPathsHost) -
     )
 }
 
-// Go: outputpaths/outputpaths.go:109 GetOutputExtension
+// Go: outputpaths/outputpaths.go:116 GetOutputExtension
 pub fn get_output_extension(file_name: &str, jsx: JsxEmit) -> &'static str {
     if tspath::file_extension_is(file_name, tspath::EXTENSION_JSON) {
         tspath::EXTENSION_JSON
@@ -365,7 +365,7 @@ pub fn get_output_extension(file_name: &str, jsx: JsxEmit) -> &'static str {
     }
 }
 
-// Go: outputpaths/outputpaths.go:155 getOutputPathWithoutChangingExtension
+// Go: outputpaths/outputpaths.go:165 getOutputPathWithoutChangingExtension
 fn get_output_path_without_changing_extension(
     input_file_name: &str,
     output_directory: &str,

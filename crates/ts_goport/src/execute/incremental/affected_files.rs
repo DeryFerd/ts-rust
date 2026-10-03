@@ -143,7 +143,7 @@ impl<'a> AffectedFilesHandler<'a> {
         result
     }
 
-    // Go: incremental/affectedfileshandler.go:85 updateShapeSignature (ts#64026)
+    // Go: incremental/affectedfileshandler.go:87 updateShapeSignature (ts#64026)
     fn update_shape_signature(&mut self, file: Node, use_file_version_as_signature: bool) -> bool {
         let path = path_of(file);
         // If we have cached the result for this file, that means hence forth we should assume file shape is uptodate
@@ -180,7 +180,7 @@ impl<'a> AffectedFilesHandler<'a> {
         changed
     }
 
-    // Go: incremental/affectedfileshandler.go:112 getFilesAffectedBy
+    // Go: incremental/affectedfileshandler.go:114 getFilesAffectedBy
     fn get_files_affected_by(&mut self, path: &Path) -> Vec<Node> {
         let file = get_source_file_by_path(path);
         if file.is_nil() {

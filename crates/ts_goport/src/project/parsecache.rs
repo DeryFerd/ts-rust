@@ -7,7 +7,7 @@ use crate::frontend::core_ext::ensure_script_kind_from_file_name;
 use crate::frontend::parser;
 use xxhash_rust::xxh3::xxh3_128;
 
-// Go: project/parsecache.go:10 ParseCacheKey
+// Go: project/parsecache.go:16 ParseCacheKey
 // PORT: Go embeds `ast.SourceFileParseOptions` (with its
 // `ExternalModuleIndicatorOptions`). The parser structs do not derive `Hash`
 // and the plan keeps the parser unchanged, so the key copies their fields:
@@ -38,7 +38,7 @@ impl ParseCacheKey {
     }
 }
 
-// Go: project/parsecache.go:16 NewParseCacheKey
+// Go: project/parsecache.go:22 NewParseCacheKey
 // PORT: Go passes the options by value; here by reference.
 pub fn new_parse_cache_key(
     options: &parser::SourceFileParseOptions,
@@ -58,7 +58,7 @@ pub fn new_parse_cache_key(
     }
 }
 
-// Go: project/parsecache.go:36 ContentMappedParseCacheKey (tsgo#4712)
+// Go: project/parsecache.go:39 ContentMappedParseCacheKey (tsgo#4712)
 // ContentMappedParseCacheKey identifies the complete output bundle for one mapped input. Hash folds the
 // original content, mapper transform identity, and diagnostic locale together.
 // PORT: the embedded `ast.SourceFileParseOptions` is copied field by field,
@@ -97,7 +97,7 @@ impl ContentMappedParseCacheKey {
     }
 }
 
-// Go: project/parsecache.go:43 contentMappedParseCacheKey (tsgo#4712)
+// Go: project/parsecache.go:44 contentMappedParseCacheKey (tsgo#4712)
 // PORT: Go `xxh3.Uint128` `Hi` is the high 64 bits of the `u128`, `Lo` the
 // low 64 bits.
 pub fn content_mapped_parse_cache_key(
@@ -116,26 +116,26 @@ pub fn content_mapped_parse_cache_key(
     ContentMappedParseCacheKey::new(options, xxh3_128(&buf))
 }
 
-// Go: project/parsecache.go:54 parseCacheKeyForFile (tsgo#4712)
+// Go: project/parsecache.go:55 parseCacheKeyForFile (tsgo#4712)
 // parseCacheKeyForFile reconstructs the ordinary parse-cache key for a source file held by a program.
 pub fn parse_cache_key_for_file(file: &parser::ParsedSourceFile) -> ParseCacheKey {
     new_parse_cache_key(file.parse_options(), file.source_hash(), file.script_kind)
 }
 
-// Go: project/parsecache.go:58 contentMappedParseCacheKeyForFile (tsgo#4712)
+// Go: project/parsecache.go:59 contentMappedParseCacheKeyForFile (tsgo#4712)
 pub fn content_mapped_parse_cache_key_for_file(
     file: &parser::ParsedSourceFile,
 ) -> ContentMappedParseCacheKey {
     ContentMappedParseCacheKey::new(file.content_mapper_parse_options(), file.source_hash())
 }
 
-// Go: project/parsecache.go:63 parseCacheKeyForDuplicate (tsgo#4712)
+// Go: project/parsecache.go:64 parseCacheKeyForDuplicate (tsgo#4712)
 // parseCacheKeyForDuplicate reconstructs an ordinary parse-cache key for a deduplicated source file.
 pub fn parse_cache_key_for_duplicate(file: &compiler::DuplicateSourceFile) -> ParseCacheKey {
     new_parse_cache_key(&file.parse_options, file.source_hash(), file.script_kind)
 }
 
-// Go: project/parsecache.go:67 contentMappedParseCacheKeyForDuplicate (tsgo#4712)
+// Go: project/parsecache.go:68 contentMappedParseCacheKeyForDuplicate (tsgo#4712)
 pub fn content_mapped_parse_cache_key_for_duplicate(
     file: &compiler::DuplicateSourceFile,
 ) -> ContentMappedParseCacheKey {
@@ -151,10 +151,10 @@ pub struct HashedSourceFile {
     pub hash: u128,
 }
 
-// Go: project/parsecache.go:28 ParseCache
+// Go: project/parsecache.go:72 ParseCache
 pub type ParseCache = RefCountCache<ParseCacheKey, HashedSourceFile, Rc<dyn FileHandle>>;
 
-// Go: project/parsecache.go:30 NewParseCache
+// Go: project/parsecache.go:74 NewParseCache
 pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
     new_ref_count_cache(
         options,
@@ -243,7 +243,7 @@ pub fn acquire_bound(
     result
 }
 
-// Go: project/parsecache.go:84 ContentMappedParseCache (tsgo#4712)
+// Go: project/parsecache.go:86 ContentMappedParseCache (tsgo#4712)
 // PORT: Go embeds `*RefCountCache`; the type alias gives the same methods.
 // One reference owns the canonical file and all supplemental files as a
 // bundle (`contentmapper::SourceFiles`). Callers ref and deref the
@@ -251,7 +251,7 @@ pub fn acquire_bound(
 pub type ContentMappedParseCache =
     RefCountCache<ContentMappedParseCacheKey, contentmapper::SourceFiles, ()>;
 
-// Go: project/parsecache.go:90 NewContentMappedParseCache (tsgo#4712)
+// Go: project/parsecache.go:92 NewContentMappedParseCache (tsgo#4712)
 pub fn new_content_mapped_parse_cache(
     options: RefCountCacheOptions,
 ) -> Rc<ContentMappedParseCache> {

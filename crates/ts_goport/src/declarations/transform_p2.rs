@@ -73,7 +73,7 @@ impl DeclarationTransformer {
         f(&mut visitor)
     }
 
-    // Go: transformers/declarations/transform.go:753 DeclarationTransformer.transformImportTypeNode
+    // Go: transformers/declarations/transform.go:761 DeclarationTransformer.transformImportTypeNode
     pub(super) fn transform_import_type_node(&mut self, input: Node) -> Node {
         if !is_literal_import_type_node(input) {
             return input;
@@ -94,7 +94,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:770 DeclarationTransformer.transformConstructorTypeNode
+    // Go: transformers/declarations/transform.go:778 DeclarationTransformer.transformConstructorTypeNode
     pub(super) fn transform_constructor_type_node(&mut self, input: Node) -> Node {
         let ec = self.emit_context.clone();
         let modifiers = self.ensure_modifiers(input);
@@ -110,7 +110,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:780 DeclarationTransformer.transformFunctionTypeNode
+    // Go: transformers/declarations/transform.go:788 DeclarationTransformer.transformFunctionTypeNode
     pub(super) fn transform_function_type_node(&mut self, input: Node) -> Node {
         let ec = self.emit_context.clone();
         let type_parameters = self.with_visitor(|v| v.visit_nodes(input.type_parameter_list()));
@@ -120,7 +120,7 @@ impl DeclarationTransformer {
             .update_function_type_node(input, type_parameters, parameters, type_node)
     }
 
-    // Go: transformers/declarations/transform.go:789 DeclarationTransformer.transformConditionalTypeNode
+    // Go: transformers/declarations/transform.go:797 DeclarationTransformer.transformConditionalTypeNode
     pub(super) fn transform_conditional_type_node(&mut self, input: Node) -> Node {
         let check_type = self.visit(input.check_type());
         let extends_type = self.visit(input.extends_type());
@@ -140,13 +140,13 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:807 DeclarationTransformer.transformTypeReference
+    // Go: transformers/declarations/transform.go:815 DeclarationTransformer.transformTypeReference
     pub(super) fn transform_type_reference(&mut self, input: Node) -> Node {
         self.check_entity_name_visibility(input.type_name(), self.enclosing_declaration);
         self.with_visitor(|v| v.visit_each_child(input))
     }
 
-    // Go: transformers/declarations/transform.go:812 DeclarationTransformer.transformExpressionWithTypeArguments
+    // Go: transformers/declarations/transform.go:820 DeclarationTransformer.transformExpressionWithTypeArguments
     pub(super) fn transform_expression_with_type_arguments(&mut self, input: Node) -> Node {
         if is_entity_name(input.expression()) || is_entity_name_expression(input.expression()) {
             self.check_entity_name_visibility(input.expression(), self.enclosing_declaration);
@@ -154,7 +154,7 @@ impl DeclarationTransformer {
         self.with_visitor(|v| v.visit_each_child(input))
     }
 
-    // Go: transformers/declarations/transform.go:819 DeclarationTransformer.transformTypeParameterDeclaration
+    // Go: transformers/declarations/transform.go:827 DeclarationTransformer.transformTypeParameterDeclaration
     pub(super) fn transform_type_parameter_declaration(&mut self, input: Node) -> Node {
         if is_private_method_type_parameter(&*self.host, input)
             && (input.default_type().is_some() || input.constraint().is_some())
@@ -172,7 +172,7 @@ impl DeclarationTransformer {
         self.with_visitor(|v| v.visit_each_child(input))
     }
 
-    // Go: transformers/declarations/transform.go:833 DeclarationTransformer.transformVariableDeclaration
+    // Go: transformers/declarations/transform.go:841 DeclarationTransformer.transformVariableDeclaration
     pub(super) fn transform_variable_declaration(&mut self, input: Node) -> Node {
         let current_source_file = self.state.borrow().current_source_file;
         if source_file_info(current_source_file)
@@ -205,7 +205,7 @@ impl DeclarationTransformer {
             .update_variable_declaration(input, name, Node::NIL, type_node, initializer)
     }
 
-    // Go: transformers/declarations/transform.go:851 DeclarationTransformer.transformCjsRequireVariableDeclaration
+    // Go: transformers/declarations/transform.go:875 DeclarationTransformer.transformCjsRequireVariableDeclaration
     pub(super) fn transform_cjs_require_variable_declaration(&mut self, input: Node) -> Node {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -251,7 +251,7 @@ impl DeclarationTransformer {
         }
     }
 
-    // Go: transformers/declarations/transform.go:883 DeclarationTransformer.recreateBindingPattern
+    // Go: transformers/declarations/transform.go:907 DeclarationTransformer.recreateBindingPattern
     pub(super) fn recreate_binding_pattern(&mut self, input: Node) -> Node {
         let mut results: Vec<Node> = Vec::new();
         for elem in input.elements().iter() {
@@ -275,7 +275,7 @@ impl DeclarationTransformer {
         ec.factory().new_syntax_list(&results)
     }
 
-    // Go: transformers/declarations/transform.go:905 DeclarationTransformer.recreateBindingElement
+    // Go: transformers/declarations/transform.go:929 DeclarationTransformer.recreateBindingElement
     pub(super) fn recreate_binding_element(&mut self, e: Node) -> Node {
         if e.name().is_nil() {
             return Node::NIL;
@@ -296,7 +296,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:923 DeclarationTransformer.transformIndexSignatureDeclaration
+    // Go: transformers/declarations/transform.go:947 DeclarationTransformer.transformIndexSignatureDeclaration
     pub(super) fn transform_index_signature_declaration(&mut self, input: Node) -> Node {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -309,7 +309,7 @@ impl DeclarationTransformer {
         f.update_index_signature_declaration(input, modifiers, parameters, t)
     }
 
-    // Go: transformers/declarations/transform.go:936 DeclarationTransformer.transformCallSignatureDeclaration
+    // Go: transformers/declarations/transform.go:960 DeclarationTransformer.transformCallSignatureDeclaration
     pub(super) fn transform_call_signature_declaration(&mut self, input: Node) -> Node {
         let ec = self.emit_context.clone();
         let type_parameters = self.ensure_type_params(input, input.type_parameter_list());
@@ -323,7 +323,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:945 DeclarationTransformer.transformPropertySignatureDeclaration
+    // Go: transformers/declarations/transform.go:969 DeclarationTransformer.transformPropertySignatureDeclaration
     pub(super) fn transform_property_signature_declaration(&mut self, input: Node) -> Node {
         if is_private_identifier(input.name()) {
             return Node::NIL;
@@ -344,7 +344,7 @@ impl DeclarationTransformer {
         result
     }
 
-    // Go: transformers/declarations/transform.go:961 DeclarationTransformer.transformPropertyDeclaration
+    // Go: transformers/declarations/transform.go:985 DeclarationTransformer.transformPropertyDeclaration
     pub(super) fn transform_property_declaration(&mut self, input: Node) -> Node {
         if is_private_identifier(input.name()) {
             return Node::NIL;
@@ -368,7 +368,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:980 DeclarationTransformer.transformSetAccessorDeclaration
+    // Go: transformers/declarations/transform.go:1004 DeclarationTransformer.transformSetAccessorDeclaration
     pub(super) fn transform_set_accessor_declaration(&mut self, input: Node) -> Node {
         if is_private_identifier(input.name()) {
             return Node::NIL;
@@ -393,7 +393,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:997 DeclarationTransformer.transformGetAccesorDeclaration
+    // Go: transformers/declarations/transform.go:1021 DeclarationTransformer.transformGetAccesorDeclaration
     pub(super) fn transform_get_accesor_declaration(&mut self, input: Node) -> Node {
         if is_private_identifier(input.name()) {
             return Node::NIL;
@@ -418,7 +418,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:1013 DeclarationTransformer.updateAccessorParamList
+    // Go: transformers/declarations/transform.go:1037 DeclarationTransformer.updateAccessorParamList
     pub(super) fn update_accessor_param_list(&mut self, input: Node, is_private: bool) -> NodeList {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -459,7 +459,7 @@ impl DeclarationTransformer {
         f.new_node_list(&new_params)
     }
 
-    // Go: transformers/declarations/transform.go:1050 DeclarationTransformer.transformConstructorDeclaration
+    // Go: transformers/declarations/transform.go:1074 DeclarationTransformer.transformConstructorDeclaration
     pub(super) fn transform_constructor_declaration(&mut self, input: Node) -> Node {
         let ec = self.emit_context.clone();
         let modifiers = self.ensure_modifiers(input);
@@ -476,7 +476,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:1063 DeclarationTransformer.transformConstructSignatureDeclaration
+    // Go: transformers/declarations/transform.go:1087 DeclarationTransformer.transformConstructSignatureDeclaration
     pub(super) fn transform_construct_signature_declaration(&mut self, input: Node) -> Node {
         let ec = self.emit_context.clone();
         let type_parameters = self.ensure_type_params(input, input.type_parameter_list());
@@ -490,7 +490,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:1072 DeclarationTransformer.omitPrivateMethodType
+    // Go: transformers/declarations/transform.go:1096 DeclarationTransformer.omitPrivateMethodType
     pub(super) fn omit_private_method_type(&mut self, input: Node) -> Node {
         let symbol = input.symbol();
         if symbol.is_some() {
@@ -524,7 +524,7 @@ impl DeclarationTransformer {
         result
     }
 
-    // Go: transformers/declarations/transform.go:1087 DeclarationTransformer.transformMethodSignatureDeclaration
+    // Go: transformers/declarations/transform.go:1122 DeclarationTransformer.transformMethodSignatureDeclaration
     pub(super) fn transform_method_signature_declaration(&mut self, input: Node) -> Node {
         let ec = self.emit_context.clone();
         if !self
@@ -552,7 +552,7 @@ impl DeclarationTransformer {
         }
     }
 
-    // Go: transformers/declarations/transform.go:1105 DeclarationTransformer.transformMethodDeclaration
+    // Go: transformers/declarations/transform.go:1140 DeclarationTransformer.transformMethodDeclaration
     pub(super) fn transform_method_declaration(&mut self, input: Node) -> Node {
         let ec = self.emit_context.clone();
         if !self
@@ -583,7 +583,7 @@ impl DeclarationTransformer {
         }
     }
 
-    // Go: transformers/declarations/transform.go:1126 DeclarationTransformer.visitDeclarationStatements
+    // Go: transformers/declarations/transform.go:1161 DeclarationTransformer.visitDeclarationStatements
     pub(super) fn visit_declaration_statements(&mut self, input: Node) -> Node {
         if self.should_strip_internal(input) {
             return Node::NIL;
@@ -630,7 +630,7 @@ impl DeclarationTransformer {
         }
     }
 
-    // Go: transformers/declarations/transform.go:1157 DeclarationTransformer.tryGetNameOfAssignedExpression
+    // Go: transformers/declarations/transform.go:1192 DeclarationTransformer.tryGetNameOfAssignedExpression
     pub(super) fn try_get_name_of_assigned_expression(&mut self, unwrapped: Node) -> Node {
         let mut name_node = Node::NIL;
         let mut name_text = "";
@@ -655,7 +655,7 @@ impl DeclarationTransformer {
         name_node
     }
 
-    // Go: transformers/declarations/transform.go:1177 DeclarationTransformer.getNameOfExportedAssignedExpression
+    // Go: transformers/declarations/transform.go:1212 DeclarationTransformer.getNameOfExportedAssignedExpression
     pub(super) fn get_name_of_exported_assigned_expression(
         &mut self,
         unwrapped: Node,
@@ -677,7 +677,7 @@ impl DeclarationTransformer {
         name_node
     }
 
-    // Go: transformers/declarations/transform.go:1192 DeclarationTransformer.transformExportAssignment
+    // Go: transformers/declarations/transform.go:1227 DeclarationTransformer.transformExportAssignment
     pub(super) fn transform_export_assignment(
         &mut self,
         input: Node,
@@ -777,7 +777,7 @@ impl DeclarationTransformer {
         f.new_syntax_list(&[statement, export_assignment])
     }
 
-    // Go: transformers/declarations/transform.go:1262 DeclarationTransformer.transformFunctionLikeToDeclaration
+    // Go: transformers/declarations/transform.go:1298 DeclarationTransformer.transformFunctionLikeToDeclaration
     pub(super) fn transform_function_like_to_declaration(
         &mut self,
         unwrapped: Node,
@@ -826,7 +826,7 @@ impl DeclarationTransformer {
         }
     }
 
-    // Go: transformers/declarations/transform.go:1276 DeclarationTransformer.transformBinaryExpressionToExportDeclaration
+    // Go: transformers/declarations/transform.go:1324 DeclarationTransformer.transformBinaryExpressionToExportDeclaration
     pub(super) fn transform_binary_expression_to_export_declaration(
         &mut self,
         input: Node,
@@ -859,7 +859,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:1295 DeclarationTransformer.transformCommonJSExport
+    // Go: transformers/declarations/transform.go:1343 DeclarationTransformer.transformCommonJSExport
     pub(super) fn transform_common_js_export(&mut self, input: Node, name: Node) -> Node {
         let res = self.transform_common_js_export_worker(input, name);
         if res.is_nil() {
@@ -868,7 +868,7 @@ impl DeclarationTransformer {
         self.wrap_in_cjs_export_namespace(res)
     }
 
-    // Go: transformers/declarations/transform.go:1303 DeclarationTransformer.transformCommonJSExportWorker
+    // Go: transformers/declarations/transform.go:1351 DeclarationTransformer.transformCommonJSExportWorker
     pub(super) fn transform_common_js_export_worker(&mut self, input: Node, name: Node) -> Node {
         let ec = self.emit_context.clone();
         let f = ec.factory();
@@ -1108,7 +1108,7 @@ impl DeclarationTransformer {
     }
 }
 
-// Go: transformers/declarations/transform.go:860 hasAnyBindingInitializers
+// Go: transformers/declarations/transform.go:859 hasAnyBindingInitializers
 fn has_any_binding_initializers(binding_pattern: Node) -> bool {
     for elem in binding_pattern.elements().iter() {
         if !is_binding_element(elem) {

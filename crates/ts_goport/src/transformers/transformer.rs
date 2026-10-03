@@ -59,7 +59,7 @@ impl TransformReferenceResolver for EmitResolverReferenceResolver {
     }
 }
 
-// Go: transformers/chain.go:27 TransformOptions
+// Go: transformers/chain.go:26 TransformOptions
 // PORT: Go `GetEmitModuleFormatOfFile func(file ast.HasFileName)` takes the
 // source file node here.
 #[derive(Clone)]
@@ -85,7 +85,7 @@ pub trait Transformer {
 /// A constructed transformer (Go `*transformers.Transformer`).
 pub type TransformerBox = Box<dyn Transformer>;
 
-// Go: transformers/chain.go:35 TransformerFactory
+// Go: transformers/chain.go:34 TransformerFactory
 /// Go `TransformerFactory`. `None` is Go nil.
 pub type TransformerFactory = dyn Fn(&TransformOptions) -> Option<TransformerBox>;
 

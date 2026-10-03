@@ -15,7 +15,7 @@ use std::cell::{Cell, OnceCell};
 use std::panic::AssertUnwindSafe;
 use std::time::Instant;
 
-// Go: project/snapshot.go:29 Snapshot
+// Go: project/snapshot.go:31 Snapshot
 pub struct Snapshot {
     pub host: Rc<SnapshotHost>,
     pub id: u64,
@@ -54,7 +54,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    // Go: project/snapshot.go:57 contentMapperWatchState (tsgo#4712)
+    // Go: project/snapshot.go:62 contentMapperWatchState (tsgo#4712)
     pub fn content_mapper_watch_state(&self) -> (Vec<String>, Rc<FxHashSet<tspath::Path>>) {
         self.content_mapper_watch_state
             .get_or_init(|| {
@@ -99,7 +99,7 @@ fn lsp_line_map_of(fs: &SnapshotFS, file_name: &str) -> Option<Rc<lsconv::LSPLin
     None
 }
 
-// Go: project/snapshot.go:77 SnapshotHost.newSnapshot (ts#64163)
+// Go: project/snapshot.go:84 SnapshotHost.newSnapshot (ts#64163)
 // PORT: Go `NewSnapshot` became this host method; the snapshot starts with
 // refCount 1 and keeps the host.
 impl SnapshotHost {
@@ -182,7 +182,7 @@ fn new_snapshot_with_host(
     })
 }
 
-// Go: project/snapshot.go:194 overlayFileHandles (ts#64291)
+// Go: project/snapshot.go:193 overlayFileHandles (ts#64291)
 // PORT: Go `map[tspath.Path]FileHandle` keeps the overlay map's order here.
 pub fn overlay_file_handles(
     overlays: &IndexMap<tspath::Path, Rc<Overlay>>,
@@ -195,23 +195,23 @@ pub fn overlay_file_handles(
     files
 }
 
-// Go: project/snapshot.go:108 snapshotOverlays (ts#64291)
+// Go: project/snapshot.go:111 snapshotOverlays (ts#64291)
 pub fn snapshot_overlays(fs: &SnapshotFS) -> Rc<IndexMap<tspath::Path, Rc<Overlay>>> {
     fs.fs.overlays()
 }
 
 impl Snapshot {
-    // Go: project/snapshot.go:112 overlays (ts#64291)
+    // Go: project/snapshot.go:115 overlays (ts#64291)
     pub fn overlays(&self) -> Rc<IndexMap<tspath::Path, Rc<Overlay>>> {
         snapshot_overlays(&self.fs)
     }
 
-    // Go: project/snapshot.go:118 CreatedPrograms (ts#64204)
+    // Go: project/snapshot.go:119 CreatedPrograms (ts#64204)
     pub fn created_programs(&self) -> Vec<Rc<RefCell<Project>>> {
         self.created_programs.clone()
     }
 
-    // Go: project/snapshot.go:122 resourceRequestForDocument (ts#64204)
+    // Go: project/snapshot.go:123 resourceRequestForDocument (ts#64204)
     pub fn resource_request_for_document(&self, uri: &lsproto::DocumentUri) -> ResourceRequest {
         let path = uri.path(self.use_case_sensitive_file_names());
         let mut request = ResourceRequest {
@@ -232,7 +232,7 @@ impl Snapshot {
         request
     }
 
-    // Go: project/snapshot.go:139 processFileChanges (ts#63950, ts#64291)
+    // Go: project/snapshot.go:134 processFileChanges (ts#63950, ts#64291)
     pub fn process_file_changes(
         &self,
         fs: &Rc<SnapshotFSBuilder>,
@@ -320,13 +320,13 @@ impl Snapshot {
         file_changes
     }
 
-    // Go: project/snapshot.go:82 GetDefaultProject
+    // Go: project/snapshot.go:201 GetDefaultProject
     pub fn get_default_project(&self, uri: &lsproto::DocumentUri) -> Option<Rc<RefCell<Project>>> {
         self.project_collection
             .get_default_project(&uri.path(self.use_case_sensitive_file_names()))
     }
 
-    // Go: project/snapshot.go:204 GetLanguageServiceProjectsContainingFile (ts#64204: was GetProjectsContainingFile)
+    // Go: project/snapshot.go:207 GetLanguageServiceProjectsContainingFile (ts#64204: was GetProjectsContainingFile)
     // GetLanguageServiceProjectsContainingFile does not consider synthetic projects
     // (ones created by API via createProgram).
     pub fn get_language_service_projects_containing_file(
@@ -340,12 +340,12 @@ impl Snapshot {
             .get_language_service_projects_containing_file(&path)
     }
 
-    // Go: project/snapshot.go:93 GetFile
+    // Go: project/snapshot.go:214 GetFile
     pub fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>> {
         self.fs.get_file(file_name)
     }
 
-    // Go: project/snapshot.go:97 LSPLineMap
+    // Go: project/snapshot.go:218 LSPLineMap
     pub fn lsp_line_map(&self, file_name: &str) -> Option<Rc<lsconv::LSPLineMap>> {
         if let Some(file) = self.fs.get_file(file_name) {
             return Some(file.lsp_line_map());
@@ -353,7 +353,7 @@ impl Snapshot {
         None
     }
 
-    // Go: project/snapshot.go:104 GetECMALineInfo
+    // Go: project/snapshot.go:225 GetECMALineInfo
     pub fn get_ecma_line_info(
         &self,
         file_name: &str,
@@ -364,42 +364,42 @@ impl Snapshot {
         None
     }
 
-    // Go: project/snapshot.go:111 GetPreferences
+    // Go: project/snapshot.go:232 GetPreferences
     pub fn get_preferences(&self, _active_file: &str) -> lsutil::UserPreferences {
         self.user_preferences.clone()
     }
 
-    // Go: project/snapshot.go:115 UserPreferences
+    // Go: project/snapshot.go:236 UserPreferences
     pub fn user_preferences(&self) -> lsutil::UserPreferences {
         self.user_preferences.clone()
     }
 
-    // Go: project/snapshot.go:119 Converters
+    // Go: project/snapshot.go:240 Converters
     pub fn converters(&self) -> Rc<lsconv::Converters> {
         self.converters.clone()
     }
 
-    // Go: project/snapshot.go:123 AutoImportRegistry
+    // Go: project/snapshot.go:244 AutoImportRegistry
     pub fn auto_import_registry(&self) -> Option<Rc<autoimport::Registry>> {
         self.auto_imports.clone()
     }
 
-    // Go: project/snapshot.go:127 ID
+    // Go: project/snapshot.go:248 ID
     pub fn id(&self) -> u64 {
         self.id
     }
 
-    // Go: project/snapshot.go:367 toPath (ts#64163)
+    // Go: project/snapshot.go:252 toPath (ts#64163)
     pub fn to_path(&self, file_name: &str) -> tspath::Path {
         (self.host.to_path)(file_name)
     }
 
-    // Go: project/snapshot.go:257 isOpenFile (ts#64291)
+    // Go: project/snapshot.go:256 isOpenFile (ts#64291)
     pub fn is_open_file(&self, file_name: &str) -> bool {
         self.overlays().contains_key(&self.to_path(file_name))
     }
 
-    // Go: project/snapshot.go:262 hasOverlayWithin (ts#64291)
+    // Go: project/snapshot.go:261 hasOverlayWithin (ts#64291)
     pub fn has_overlay_within(&self, path: &tspath::Path) -> bool {
         for overlay_path in self.overlays().keys() {
             if path.contains_path(overlay_path) {
@@ -409,25 +409,25 @@ impl Snapshot {
         false
     }
 
-    // Go: project/snapshot.go:131 UseCaseSensitiveFileNames
+    // Go: project/snapshot.go:270 UseCaseSensitiveFileNames
     pub fn use_case_sensitive_file_names(&self) -> bool {
         self.fs.fs.use_case_sensitive_file_names()
     }
 
-    // Go: project/snapshot.go:390 FileSystem (ts#64115)
+    // Go: project/snapshot.go:275 FileSystem (ts#64115)
     // FileSystem returns the filesystem backing this snapshot.
     pub fn file_system(&self) -> Rc<dyn vfs::Fs> {
         self.fs.fs.clone()
     }
 
-    // Go: project/snapshot.go:396 HasFileSystemOverride (ts#64115)
+    // Go: project/snapshot.go:281 HasFileSystemOverride (ts#64115)
     // HasFileSystemOverride reports whether this snapshot uses an API-supplied
     // filesystem instead of the session host filesystem.
     pub fn has_file_system_override(&self) -> bool {
         self.file_system_override
     }
 
-    // Go: project/snapshot.go:135 ReadFile
+    // Go: project/snapshot.go:285 ReadFile
     pub fn read_file(&self, file_name: &str) -> (String, bool) {
         let Some(handle) = self.get_file(file_name) else {
             return (String::new(), false);
@@ -435,22 +435,22 @@ impl Snapshot {
         (handle.content(), true)
     }
 
-    // Go: project/snapshot.go:143 DirectoryExists
+    // Go: project/snapshot.go:293 DirectoryExists
     pub fn directory_exists(&self, path: &str) -> bool {
         self.fs.fs.directory_exists(path)
     }
 
-    // Go: project/snapshot.go:147 FileExists
+    // Go: project/snapshot.go:297 FileExists
     pub fn file_exists(&self, path: &str) -> bool {
         self.fs.fs.file_exists(path)
     }
 
-    // Go: project/snapshot.go:151 GetDirectories
+    // Go: project/snapshot.go:301 GetDirectories
     pub fn get_directories(&self, path: &str) -> Vec<String> {
         self.fs.fs.get_accessible_entries(path).directories
     }
 
-    // Go: project/snapshot.go:155 ReadDirectory
+    // Go: project/snapshot.go:305 ReadDirectory
     pub fn read_directory(
         &self,
         current_dir: &str,
@@ -549,7 +549,7 @@ impl ls::Host for Snapshot {
     }
 }
 
-// Go: project/snapshot.go:308 APICreateProgramRequest (ts#64204)
+// Go: project/snapshot.go:322 APICreateProgramRequest (ts#64204)
 // PORT: Go `*core.CompilerOptions` is `Rc<CompilerOptions>`: every Go
 // caller (the API session) sets it. A Go nil `[]*core.ProjectReference` is
 // an empty `Vec`.
@@ -573,7 +573,7 @@ pub trait ModuleResolverFactory {
     ) -> (Rc<dyn crate::frontend::module::Resolver>, Box<dyn FnOnce()>);
 }
 
-// Go: project/snapshot.go:315 APIReconfigureProgramRequest (ts#64204)
+// Go: project/snapshot.go:335 APIReconfigureProgramRequest (ts#64204)
 // PORT: Go embeds `APICreateProgramRequest`; here it is the field
 // `api_create_program_request`.
 #[derive(Clone, Default)]
@@ -583,7 +583,7 @@ pub struct APIReconfigureProgramRequest {
     pub api_create_program_request: APICreateProgramRequest,
 }
 
-// Go: project/snapshot.go:159 APISnapshotRequest
+// Go: project/snapshot.go:340 APISnapshotRequest
 // PORT: Go `*collections.Set[T]` is `Option<FxHashSet<T>>` (nil is `None`).
 // Go `map[tspath.Path]string` (`open_files`, `ensure_files`, ts#64391) is
 // `Option<IndexMap>`, so API-opened files enter the API state in request
@@ -628,7 +628,7 @@ impl std::fmt::Debug for APISnapshotRequest {
     }
 }
 
-// Go: project/snapshot.go:164 ProjectTreeRequest
+// Go: project/snapshot.go:357 ProjectTreeRequest
 #[derive(Clone, Debug, Default)]
 pub struct ProjectTreeRequest {
     // If null, all project trees need to be loaded, otherwise only those that are referenced
@@ -636,12 +636,12 @@ pub struct ProjectTreeRequest {
 }
 
 impl ProjectTreeRequest {
-    // Go: project/snapshot.go:169 IsAllProjects
+    // Go: project/snapshot.go:362 IsAllProjects
     pub fn is_all_projects(&self) -> bool {
         self.referenced_projects.is_none()
     }
 
-    // Go: project/snapshot.go:173 IsProjectReferenced
+    // Go: project/snapshot.go:366 IsProjectReferenced
     // PORT: Go `Set.Has` returns false on a nil set.
     pub fn is_project_referenced(&self, project_id: &tspath::Path) -> bool {
         self.referenced_projects
@@ -649,7 +649,7 @@ impl ProjectTreeRequest {
             .is_some_and(|referenced_projects| referenced_projects.contains(project_id))
     }
 
-    // Go: project/snapshot.go:177 Projects
+    // Go: project/snapshot.go:370 Projects
     // PORT: a Go nil slice is empty. Go map order is random; FxHashSet order here.
     pub fn projects(&self) -> Vec<tspath::Path> {
         let Some(referenced_projects) = &self.referenced_projects else {
@@ -659,7 +659,7 @@ impl ProjectTreeRequest {
     }
 }
 
-// Go: project/snapshot.go:184 ResourceRequest
+// Go: project/snapshot.go:377 ResourceRequest
 // PORT: Go `*ProjectTreeRequest` is `Option<ProjectTreeRequest>` (nil is `None`).
 #[derive(Clone, Debug, Default)]
 pub struct ResourceRequest {
@@ -683,7 +683,7 @@ pub struct ResourceRequest {
     pub auto_imports: lsproto::DocumentUri,
 }
 
-// Go: project/snapshot.go:204 SnapshotChange
+// Go: project/snapshot.go:397 SnapshotChange
 // PORT: Go embeds `ResourceRequest`; here it is the field
 // `resource_request`. Go `*core.CompilerOptions` is
 // `Option<Rc<CompilerOptions>>`, Go `*lsutil.UserPreferences` is
@@ -717,7 +717,7 @@ pub struct SnapshotChange {
     pub clean_file_cache: bool,
 }
 
-// Go: project/snapshot.go:222 ATAStateChange
+// Go: project/snapshot.go:421 ATAStateChange
 // ATAStateChange represents a change to a project's ATA state.
 // PORT: Go `*ata.TypingsInfo` is `Option<Rc<ata::TypingsInfo>>`.
 #[derive(Clone, Default)]
@@ -744,7 +744,7 @@ fn fmt_uris(uris: &[lsproto::DocumentUri]) -> String {
 }
 
 impl Snapshot {
-    // Go: project/snapshot.go:477 Clone
+    // Go: project/snapshot.go:431 Clone
     // PORT: Go `Clone` is `clone_` (Rust `Clone::clone` copies a value).
     // The deferred `recover()` is `catch_unwind` around the body
     // (`clone_body`); the panic is logged and raised again, as in Go
@@ -786,7 +786,7 @@ impl Snapshot {
         self.clone_body(ctx, change, overlays, false, client, &mut logger)
     }
 
-    // Go: project/snapshot.go:477 Clone (the body after the deferred recover)
+    // Go: project/snapshot.go:431 Clone (the body after the deferred recover)
     // PORT: split out of `clone_` so the recover can wrap it; `logger` is
     // the Go local that the deferred function reads. `make_logger` is Go
     // `store.options.LoggingEnabled && sessionLogger != nil`.
@@ -1242,7 +1242,7 @@ impl Snapshot {
         new_snapshot
     }
 
-    // Go: project/snapshot.go:502 ref
+    // Go: project/snapshot.go:732 ref
     // ref increments the snapshot's reference count, preventing it from being
     // disposed until a corresponding Deref is called. The snapshot must still
     // be alive (refCount > 0) when ref is called.
@@ -1258,7 +1258,7 @@ impl Snapshot {
         }
     }
 
-    // Go: project/snapshot.go:511 tryRef
+    // Go: project/snapshot.go:741 tryRef
     // tryRef attempts to increment the snapshot's reference count. If the
     // snapshot is already disposed (refCount == 0), it returns false without
     // modifying the count. On success the caller must eventually call Deref.
@@ -1272,7 +1272,7 @@ impl Snapshot {
         true
     }
 
-    // Go: project/snapshot.go:782 Deref
+    // Go: project/snapshot.go:755 Deref
     // Deref decrements the snapshot's reference count. When the count reaches
     // zero, the snapshot is disposed and its store-owned resources are released.
     pub fn deref(&self) {
@@ -1290,7 +1290,7 @@ impl Snapshot {
         }
     }
 
-    // Go: project/snapshot.go:792 dispose
+    // Go: project/snapshot.go:765 dispose
     pub fn dispose(&self) {
         let store = &self.host;
         for project in self.project_collection.projects() {

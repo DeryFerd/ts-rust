@@ -192,7 +192,7 @@ pub struct PseudoTypeNoResult {
     pub declaration: Node,
 }
 
-// Go: pseudochecker/type.go:123 NewPseudoTypeNoResult
+// Go: pseudochecker/type.go:124 NewPseudoTypeNoResult
 pub fn new_pseudo_type_no_result(decl: Node) -> Rc<PseudoType> {
     new_pseudo_type(
         PseudoTypeKind::NO_RESULT,
@@ -217,7 +217,7 @@ pub struct PseudoTypeMaybeConstLocation {
     pub regular_type: Rc<PseudoType>,
 }
 
-// Go: pseudochecker/type.go:146 NewPseudoTypeMaybeConstLocation
+// Go: pseudochecker/type.go:147 NewPseudoTypeMaybeConstLocation
 pub fn new_pseudo_type_maybe_const_location(
     loc: Node,
     ct: Rc<PseudoType>,
@@ -239,7 +239,7 @@ pub struct PseudoTypeUnion {
     pub types: Vec<Rc<PseudoType>>,
 }
 
-// Go: pseudochecker/type.go:160 NewPseudoTypeUnion
+// Go: pseudochecker/type.go:161 NewPseudoTypeUnion
 pub fn new_pseudo_type_union(types: Vec<Rc<PseudoType>>) -> Rc<PseudoType> {
     new_pseudo_type(
         PseudoTypeKind::UNION,
@@ -256,7 +256,7 @@ pub struct PseudoParameter {
     pub type_: Rc<PseudoType>,
 }
 
-// Go: pseudochecker/type.go:175 NewPseudoParameter
+// Go: pseudochecker/type.go:176 NewPseudoParameter
 pub fn new_pseudo_parameter(
     is_rest: bool,
     name: Node,
@@ -281,7 +281,7 @@ pub struct PseudoTypeSingleCallSignature {
     pub return_type: Rc<PseudoType>,
 }
 
-// Go: pseudochecker/type.go:188 NewPseudoTypeSingleCallSignature
+// Go: pseudochecker/type.go:189 NewPseudoTypeSingleCallSignature
 pub fn new_pseudo_type_single_call_signature(
     signature: Node,
     parameters: Vec<Rc<PseudoParameter>>,
@@ -305,7 +305,7 @@ pub struct PseudoTypeTuple {
     pub elements: Vec<Rc<PseudoType>>,
 }
 
-// Go: pseudochecker/type.go:207 NewPseudoTypeTuple
+// Go: pseudochecker/type.go:208 NewPseudoTypeTuple
 pub fn new_pseudo_type_tuple(elements: Vec<Rc<PseudoType>>) -> Rc<PseudoType> {
     new_pseudo_type(
         PseudoTypeKind::TUPLE,
@@ -319,7 +319,7 @@ pub struct PseudoTypeObjectLiteral {
     pub elements: Vec<Rc<PseudoObjectElement>>,
 }
 
-// Go: pseudochecker/type.go:339 NewPseudoTypeObjectLiteral
+// Go: pseudochecker/type.go:340 NewPseudoTypeObjectLiteral
 pub fn new_pseudo_type_object_literal(elements: Vec<Rc<PseudoObjectElement>>) -> Rc<PseudoType> {
     new_pseudo_type(
         PseudoTypeKind::OBJECT_LITERAL,
@@ -333,7 +333,7 @@ pub struct PseudoTypeLiteral {
     pub node: Node,
 }
 
-// Go: pseudochecker/type.go:355 NewPseudoTypeStringLiteral
+// Go: pseudochecker/type.go:356 NewPseudoTypeStringLiteral
 pub fn new_pseudo_type_string_literal(node: Node) -> Rc<PseudoType> {
     new_pseudo_type(
         PseudoTypeKind::STRING_LITERAL,
@@ -341,7 +341,7 @@ pub fn new_pseudo_type_string_literal(node: Node) -> Rc<PseudoType> {
     )
 }
 
-// Go: pseudochecker/type.go:361 NewPseudoTypeNumericLiteral
+// Go: pseudochecker/type.go:362 NewPseudoTypeNumericLiteral
 pub fn new_pseudo_type_numeric_literal(node: Node) -> Rc<PseudoType> {
     new_pseudo_type(
         PseudoTypeKind::NUMERIC_LITERAL,
@@ -349,7 +349,7 @@ pub fn new_pseudo_type_numeric_literal(node: Node) -> Rc<PseudoType> {
     )
 }
 
-// Go: pseudochecker/type.go:367 NewPseudoTypeBigIntLiteral
+// Go: pseudochecker/type.go:368 NewPseudoTypeBigIntLiteral
 pub fn new_pseudo_type_big_int_literal(node: Node) -> Rc<PseudoType> {
     new_pseudo_type(
         PseudoTypeKind::BIG_INT_LITERAL,
@@ -366,7 +366,7 @@ impl PseudoType {
         }
     }
 
-    // Go: pseudochecker/type.go:113 AsPseudoTypeInferred
+    // Go: pseudochecker/type.go:114 AsPseudoTypeInferred
     pub fn as_pseudo_type_inferred(&self) -> &PseudoTypeInferred {
         match &self.data {
             PseudoTypeData::Inferred(d) => d,
@@ -374,7 +374,7 @@ impl PseudoType {
         }
     }
 
-    // Go: pseudochecker/type.go:127 AsPseudoTypeNoResult
+    // Go: pseudochecker/type.go:128 AsPseudoTypeNoResult
     pub fn as_pseudo_type_no_result(&self) -> &PseudoTypeNoResult {
         match &self.data {
             PseudoTypeData::NoResult(d) => d,
@@ -382,7 +382,7 @@ impl PseudoType {
         }
     }
 
-    // Go: pseudochecker/type.go:150 AsPseudoTypeMaybeConstLocation
+    // Go: pseudochecker/type.go:151 AsPseudoTypeMaybeConstLocation
     pub fn as_pseudo_type_maybe_const_location(&self) -> &PseudoTypeMaybeConstLocation {
         match &self.data {
             PseudoTypeData::MaybeConstLocation(d) => d,
@@ -393,7 +393,7 @@ impl PseudoType {
         }
     }
 
-    // Go: pseudochecker/type.go:164 AsPseudoTypeUnion
+    // Go: pseudochecker/type.go:165 AsPseudoTypeUnion
     pub fn as_pseudo_type_union(&self) -> &PseudoTypeUnion {
         match &self.data {
             PseudoTypeData::Union(d) => d,
@@ -401,7 +401,7 @@ impl PseudoType {
         }
     }
 
-    // Go: pseudochecker/type.go:197 AsPseudoTypeSingleCallSignature
+    // Go: pseudochecker/type.go:198 AsPseudoTypeSingleCallSignature
     pub fn as_pseudo_type_single_call_signature(&self) -> &PseudoTypeSingleCallSignature {
         match &self.data {
             PseudoTypeData::SingleCallSignature(d) => d,
@@ -412,7 +412,7 @@ impl PseudoType {
         }
     }
 
-    // Go: pseudochecker/type.go:213 AsPseudoTypeTuple
+    // Go: pseudochecker/type.go:214 AsPseudoTypeTuple
     pub fn as_pseudo_type_tuple(&self) -> &PseudoTypeTuple {
         match &self.data {
             PseudoTypeData::Tuple(d) => d,
@@ -420,7 +420,7 @@ impl PseudoType {
         }
     }
 
-    // Go: pseudochecker/type.go:345 AsPseudoTypeObjectLiteral
+    // Go: pseudochecker/type.go:346 AsPseudoTypeObjectLiteral
     pub fn as_pseudo_type_object_literal(&self) -> &PseudoTypeObjectLiteral {
         match &self.data {
             PseudoTypeData::ObjectLiteral(d) => d,
@@ -428,7 +428,7 @@ impl PseudoType {
         }
     }
 
-    // Go: pseudochecker/type.go:373 AsPseudoTypeLiteral
+    // Go: pseudochecker/type.go:374 AsPseudoTypeLiteral
     pub fn as_pseudo_type_literal(&self) -> &PseudoTypeLiteral {
         match &self.data {
             PseudoTypeData::Literal(d) => d,
@@ -464,7 +464,7 @@ pub enum PseudoObjectElementData {
 }
 
 impl PseudoObjectElement {
-    // Go: pseudochecker/type.go:226 Signature
+    // Go: pseudochecker/type.go:227 Signature
     pub fn signature(&self) -> Node {
         match self.kind {
             PseudoObjectElementKind::METHOD => self.as_pseudo_object_method().signature,
@@ -474,7 +474,7 @@ impl PseudoObjectElement {
         }
     }
 
-    // Go: pseudochecker/type.go:278 AsPseudoObjectMethod
+    // Go: pseudochecker/type.go:279 AsPseudoObjectMethod
     pub fn as_pseudo_object_method(&self) -> &PseudoObjectMethod {
         match &self.data {
             PseudoObjectElementData::Method(d) => d,
@@ -485,7 +485,7 @@ impl PseudoObjectElement {
         }
     }
 
-    // Go: pseudochecker/type.go:295 AsPseudoPropertyAssignment
+    // Go: pseudochecker/type.go:296 AsPseudoPropertyAssignment
     pub fn as_pseudo_property_assignment(&self) -> &PseudoPropertyAssignment {
         match &self.data {
             PseudoObjectElementData::PropertyAssignment(d) => d,
@@ -496,7 +496,7 @@ impl PseudoObjectElement {
         }
     }
 
-    // Go: pseudochecker/type.go:312 AsPseudoSetAccessor
+    // Go: pseudochecker/type.go:313 AsPseudoSetAccessor
     pub fn as_pseudo_set_accessor(&self) -> &PseudoSetAccessor {
         match &self.data {
             PseudoObjectElementData::SetAccessor(d) => d,
@@ -507,7 +507,7 @@ impl PseudoObjectElement {
         }
     }
 
-    // Go: pseudochecker/type.go:329 AsPseudoGetAccessor
+    // Go: pseudochecker/type.go:330 AsPseudoGetAccessor
     pub fn as_pseudo_get_accessor(&self) -> &PseudoGetAccessor {
         match &self.data {
             PseudoObjectElementData::GetAccessor(d) => d,
@@ -519,7 +519,7 @@ impl PseudoObjectElement {
     }
 }
 
-// Go: pseudochecker/type.go:252 newPseudoObjectElement
+// Go: pseudochecker/type.go:253 newPseudoObjectElement
 fn new_pseudo_object_element(
     kind: PseudoObjectElementKind,
     name: Node,
@@ -543,7 +543,7 @@ pub struct PseudoObjectMethod {
     pub return_type: Rc<PseudoType>,
 }
 
-// Go: pseudochecker/type.go:269 NewPseudoObjectMethod
+// Go: pseudochecker/type.go:270 NewPseudoObjectMethod
 pub fn new_pseudo_object_method(
     signature: Node,
     name: Node,
@@ -571,7 +571,7 @@ pub struct PseudoPropertyAssignment {
     pub type_: Rc<PseudoType>,
 }
 
-// Go: pseudochecker/type.go:288 NewPseudoPropertyAssignment
+// Go: pseudochecker/type.go:289 NewPseudoPropertyAssignment
 pub fn new_pseudo_property_assignment(
     readonly: bool,
     name: Node,
@@ -595,7 +595,7 @@ pub struct PseudoSetAccessor {
     pub parameter: Rc<PseudoParameter>,
 }
 
-// Go: pseudochecker/type.go:305 NewPseudoSetAccessor
+// Go: pseudochecker/type.go:306 NewPseudoSetAccessor
 pub fn new_pseudo_set_accessor(
     signature: Node,
     name: Node,
@@ -619,7 +619,7 @@ pub struct PseudoGetAccessor {
     pub type_: Rc<PseudoType>,
 }
 
-// Go: pseudochecker/type.go:322 NewPseudoGetAccessor
+// Go: pseudochecker/type.go:323 NewPseudoGetAccessor
 pub fn new_pseudo_get_accessor(
     signature: Node,
     name: Node,

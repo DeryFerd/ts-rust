@@ -241,7 +241,7 @@ impl ImportAdder for ImportAdderImpl {
             .unwrap_or_default()
     }
 
-    // Go: ls/autoimport/import_adder.go:186 AddImportFix
+    // Go: ls/autoimport/import_adder.go:189 AddImportFix
     // AddImportFix adds a fix to the import adder, accumulating it with other fixes
     // so that multiple imports from the same module are coalesced into a single import statement.
     fn add_import_fix(&mut self, fix: Rc<Fix>) {
@@ -448,7 +448,7 @@ impl ImportAdder for ImportAdderImpl {
     }
 }
 
-// Go: ls/autoimport/import_adder.go:175 sortedNamedImports
+// Go: ls/autoimport/import_adder.go:178 sortedNamedImports
 // PORT: a Go nil map is `None`. Go `slices.Sorted` on string keys is byte
 // order, as `String` ordering.
 fn sorted_named_imports(m: Option<&FxHashMap<String, NewImportBinding>>) -> Vec<NewImportBinding> {
@@ -464,7 +464,7 @@ fn sorted_named_imports(m: Option<&FxHashMap<String, NewImportBinding>>) -> Vec<
     result
 }
 
-// Go: ls/autoimport/import_adder.go:327 reduceAddAsTypeOnlyValues
+// Go: ls/autoimport/import_adder.go:330 reduceAddAsTypeOnlyValues
 // `NotAllowed` overrides `Required` because one addition of a new import might be required to be type-only
 // because of `--importsNotUsedAsValues=error`, but if a second addition of the same import is `NotAllowed`
 // to be type-only, the reason the first one was `Required` - the unused runtime dependency - is now moot.
@@ -482,7 +482,7 @@ fn reduce_add_as_type_only_values(
 }
 
 impl ImportAdderImpl {
-    // Go: ls/autoimport/import_adder.go:334 getNewImportEntry
+    // Go: ls/autoimport/import_adder.go:337 getNewImportEntry
     pub fn get_new_import_entry(
         &mut self,
         module_specifier: &str,
@@ -533,7 +533,7 @@ impl ImportAdderImpl {
         new_entry
     }
 
-    // Go: ls/autoimport/import_adder.go:372 getAllExportsForSymbol
+    // Go: ls/autoimport/import_adder.go:375 getAllExportsForSymbol
     // PORT: `ch` is the Go `adder.checker` (pinned decision).
     pub fn get_all_exports_for_symbol(
         &self,
@@ -547,7 +547,7 @@ impl ImportAdderImpl {
     }
 }
 
-// Go: ls/autoimport/import_adder.go:381 TypeToAutoImportableTypeNode
+// Go: ls/autoimport/import_adder.go:382 TypeToAutoImportableTypeNode
 // PORT: Go shares `idToSymbol` with the node builder through
 // `c.TypeToTypeNode`. The port builds the node builder as
 // `Checker::type_to_type_node_exported` does and reads the filled map back
@@ -575,7 +575,7 @@ pub fn type_to_auto_importable_type_node(
     type_node_to_auto_importable_type_node(c, type_node, import_adder, &id_to_symbol)
 }
 
-// Go: ls/autoimport/import_adder.go:397 TypeNodeToAutoImportableTypeNode
+// Go: ls/autoimport/import_adder.go:398 TypeNodeToAutoImportableTypeNode
 // TypeNodeToAutoImportableTypeNode converts import type references in a type node to
 // simple type references and registers needed imports with the import adder.
 // PORT: `c` is added first (the adder's `AddImportFromExportedSymbol` takes
@@ -600,7 +600,7 @@ pub fn type_node_to_auto_importable_type_node(
     type_node
 }
 
-// Go: ls/autoimport/import_adder.go:414 importSymbols
+// Go: ls/autoimport/import_adder.go:415 importSymbols
 fn import_symbols(c: &mut Checker, import_adder: &mut dyn ImportAdder, symbols: &[SymbolId]) {
     for &symbol in symbols {
         import_adder
@@ -608,7 +608,7 @@ fn import_symbols(c: &mut Checker, import_adder: &mut dyn ImportAdder, symbols: 
     }
 }
 
-// Go: ls/autoimport/import_adder.go:426 TryGetAutoImportableReferenceFromTypeNode
+// Go: ls/autoimport/import_adder.go:427 TryGetAutoImportableReferenceFromTypeNode
 // Given a type node containing 'import("./a").SomeType<import("./b").OtherType<...>>',
 // returns an equivalent type reference node with any nested ImportTypeNodes also replaced
 // with type references, and a list of symbols that must be imported to use the type reference.
@@ -673,7 +673,7 @@ pub fn try_get_auto_importable_reference_from_type_node(
     (type_node, symbols_to_import)
 }
 
-// Go: ls/autoimport/import_adder.go:464 getNameForExportedSymbol
+// Go: ls/autoimport/import_adder.go:465 getNameForExportedSymbol
 // If a type checker and multiple files are available, consider using `forEachNameOfDefaultExport`
 // instead, which searches for names of re-exported defaults/namespaces in target files.
 fn get_name_for_exported_symbol(
@@ -706,7 +706,7 @@ fn get_name_for_exported_symbol(
     symbol_name.to_string()
 }
 
-// Go: ls/autoimport/import_adder.go:480 replaceFirstIdentifierOfEntityName
+// Go: ls/autoimport/import_adder.go:481 replaceFirstIdentifierOfEntityName
 fn replace_first_identifier_of_entity_name(
     factory: &NodeFactory,
     name: Node,
@@ -720,7 +720,7 @@ fn replace_first_identifier_of_entity_name(
 }
 
 impl ImportAdderImpl {
-    // Go: ls/autoimport/import_adder.go:490 getImportFixForSymbol
+    // Go: ls/autoimport/import_adder.go:491 getImportFixForSymbol
     // PORT: `ch` is the Go `adder.checker` (Go `view.checker`, the same
     // checker) that `View.GetFixes` reads (pinned decision).
     pub fn get_import_fix_for_symbol(

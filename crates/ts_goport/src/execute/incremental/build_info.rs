@@ -323,7 +323,7 @@ pub fn marshal_any(enc: &mut String, v: &CompilerOptionsValue) -> Result<(), Jso
                 "json: cannot marshal from Go diagnostics.Message: Go struct has no exported fields",
             ));
         }
-        // Go: core/tristate.go:55 MarshalJSON
+        // Go: core/tristate.go:54 MarshalJSON
         CompilerOptionsValue::Tristate(t) => {
             enc.push_str(std::str::from_utf8(t.marshal_json()).expect("ascii"));
         }

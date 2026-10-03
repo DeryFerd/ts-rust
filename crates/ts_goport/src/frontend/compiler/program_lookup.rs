@@ -5,7 +5,7 @@
 use crate::frontend::prelude::*;
 use std::sync::{Arc, OnceLock};
 
-// Go: program.go:73 packageNamesInfo
+// Go: program.go:79 packageNamesInfo
 // PORT: U21 dropped the `packageNames` field and this type. It is here
 // because only `collectPackageNames` uses it. Go `*collections.Set[string]`
 // is an `FxHashSet<String>`.
@@ -570,7 +570,7 @@ pub fn for_each_resolution<T>(
     }
 }
 
-// Go: program.go:2095 plainJSErrors
+// Go: program.go:2373 plainJSErrors
 // PORT: Go package-level set; built once on first use.
 pub fn plain_js_errors() -> &'static FxHashSet<i32> {
     static PLAIN_JS_ERRORS: OnceLock<FxHashSet<i32>> = OnceLock::new();
@@ -900,7 +900,7 @@ impl NewProgram {
     }
 }
 
-// Go: emitter.go:451 sourceFileMayBeEmitted
+// Go: emitter.go:493 sourceFileMayBeEmitted
 // PORT: the Go host is `SourceFileMayBeEmittedHost`; the program is the only
 // host the frontend uses.
 pub fn source_file_may_be_emitted(
@@ -999,7 +999,7 @@ pub fn source_file_may_be_emitted(
     true
 }
 
-// Go: emitter.go:506 getSourceFilesToEmit
+// Go: emitter.go:553 getSourceFilesToEmit
 // PORT: Go nil `targetSourceFiles` is `None` (#4699: a slice of targets and
 // `forceJsEmit`).
 pub fn get_source_files_to_emit(

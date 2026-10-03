@@ -8,7 +8,7 @@ use crate::ls::prelude::*;
 
 use crate::frontend::scanner::scanner_p1::utf8_decode_last_rune_in_string;
 
-// Go: completions.go:3499 computeCommitCharactersAndIsNewIdentifier
+// Go: completions.go:4094 computeCommitCharactersAndIsNewIdentifier
 // PORT: Go returns one of the shared package slices (`allCommitCharacters`,
 // `noCommaCommitCharacters`, `emptyCommitCharacters`); Rust returns an owned
 // copy. None of them is nil in Go, so the result is a plain `Vec`.
@@ -193,7 +193,7 @@ pub fn compute_commit_characters_and_is_new_identifier(
     (false, all_commit_characters())
 }
 
-// Go: completions.go:3627 keywordForNode
+// Go: completions.go:4222 keywordForNode
 pub fn keyword_for_node(node: Node) -> SyntaxKind {
     if is_identifier(node) {
         return identifier_to_keyword_kind(node);
@@ -201,7 +201,7 @@ pub fn keyword_for_node(node: Node) -> SyntaxKind {
     node.kind()
 }
 
-// Go: completions.go:3636 getScopeNode
+// Go: completions.go:4231 getScopeNode
 // Finds the first node that "embraces" the position, so that one may
 // accurately aggregate locals from the closest containing scope.
 pub fn get_scope_node(initial_token: Node, position: i32, file: Node) -> Node {
@@ -212,7 +212,7 @@ pub fn get_scope_node(initial_token: Node, position: i32, file: Node) -> Node {
     scope
 }
 
-// Go: completions.go:3644 isSnippetScope
+// Go: completions.go:4239 isSnippetScope
 pub fn is_snippet_scope(scope_node: Node) -> bool {
     match scope_node.kind() {
         SyntaxKind::SourceFile
@@ -223,7 +223,7 @@ pub fn is_snippet_scope(scope_node: Node) -> bool {
     }
 }
 
-// Go: completions.go:3657 isProbablyGlobalType
+// Go: completions.go:4252 isProbablyGlobalType
 // Determines if a type is exactly the same type resolved by the global 'self', 'global', or 'globalThis'.
 pub fn is_probably_global_type(t: TypeId, file: Node, type_checker: &mut Checker) -> bool {
     // The type of `self` and `window` is the same in lib.dom.d.ts, but `window` does not exist in
@@ -260,7 +260,7 @@ pub fn is_probably_global_type(t: TypeId, file: Node, type_checker: &mut Checker
     false
 }
 
-// Go: completions.go:3675 tryGetTypeLiteralNode
+// Go: completions.go:4270 tryGetTypeLiteralNode
 pub fn try_get_type_literal_node(node: Node) -> Node {
     if node.is_nil() {
         return Node::NIL;
@@ -286,7 +286,7 @@ pub fn try_get_type_literal_node(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: completions.go:3695 getConstraintOfTypeArgumentProperty
+// Go: completions.go:4290 getConstraintOfTypeArgumentProperty
 pub fn get_constraint_of_type_argument_property(node: Node, type_checker: &mut Checker) -> TypeId {
     if node.is_nil() {
         return TypeId::NIL;
@@ -343,7 +343,7 @@ pub fn get_constraint_of_type_argument_property(node: Node, type_checker: &mut C
     TypeId::NIL
 }
 
-// Go: completions.go:3743 tryGetObjectLikeCompletionContainer
+// Go: completions.go:4338 tryGetObjectLikeCompletionContainer
 pub fn try_get_object_like_completion_container(
     context_token: Node,
     position: i32,
@@ -420,7 +420,7 @@ pub fn try_get_object_like_completion_container(
     Node::NIL
 }
 
-// Go: completions.go:3801 tryGetObjectLiteralContextualType
+// Go: completions.go:4396 tryGetObjectLiteralContextualType
 pub fn try_get_object_literal_contextual_type(node: Node, type_checker: &mut Checker) -> TypeId {
     let t = type_checker.get_contextual_type_exported(node, ContextFlags::NONE);
     if t.is_some() {
@@ -443,7 +443,7 @@ pub fn try_get_object_literal_contextual_type(node: Node, type_checker: &mut Che
     TypeId::NIL
 }
 
-// Go: completions.go:3822 getPropertiesForObjectExpression
+// Go: completions.go:4417 getPropertiesForObjectExpression
 pub fn get_properties_for_object_expression(
     contextual_type: TypeId,
     completions_type: TypeId,
@@ -501,7 +501,7 @@ pub fn get_properties_for_object_expression(
     }
 }
 
-// Go: completions.go:3868 getApparentProperties
+// Go: completions.go:4463 getApparentProperties
 // PORT: the ls package function, not the checker method of the same name.
 pub fn get_apparent_properties(t: TypeId, node: Node, type_checker: &mut Checker) -> Vec<SymbolId> {
     if !type_checker.ty(t).is_union() {
@@ -528,7 +528,7 @@ pub fn get_apparent_properties(t: TypeId, node: Node, type_checker: &mut Checker
     type_checker.get_all_possible_properties_of_types(&filtered)
 }
 
-// Go: completions.go:3881 containsNonPublicProperties
+// Go: completions.go:4476 containsNonPublicProperties
 // PORT: Go calls the package function `checker.GetDeclarationModifierFlagsFromSymbol`;
 // in Rust it is a `Checker` method (symbols live in the checker arena), so
 // the checker is an extra first parameter.
@@ -540,7 +540,7 @@ pub fn contains_non_public_properties(type_checker: &mut Checker, props: &[Symbo
     })
 }
 
-// Go: completions.go:3889 filterObjectMembersList
+// Go: completions.go:4484 filterObjectMembersList
 // Filters out members that are already declared in the object literal or binding pattern.
 // Also computes the set of existing members declared by spread assignment.
 pub fn filter_object_members_list(
@@ -611,13 +611,13 @@ pub fn filter_object_members_list(
     (filtered_symbols, members_declared_by_spread_assignment)
 }
 
-// Go: completions.go:3950 isCurrentlyEditingNode
+// Go: completions.go:4545 isCurrentlyEditingNode
 pub fn is_currently_editing_node(node: Node, file: Node, position: i32) -> bool {
     let start = astnav::get_start_of_node(node, file, false /*includeJSDoc*/);
     start <= position && position <= node.end()
 }
 
-// Go: completions.go:3955 setMemberDeclaredBySpreadAssignment
+// Go: completions.go:4550 setMemberDeclaredBySpreadAssignment
 pub fn set_member_declared_by_spread_assignment(
     declaration: Node,
     members: &mut FxHashSet<String>,
@@ -647,7 +647,7 @@ pub fn set_member_declared_by_spread_assignment(
     }
 }
 
-// Go: completions.go:3973 tryGetConstructorLikeCompletionContainer
+// Go: completions.go:4568 tryGetConstructorLikeCompletionContainer
 // Returns the immediate owning class declaration of a context token,
 // on the condition that one exists and that the context implies completion should be given.
 pub fn try_get_constructor_like_completion_container(context_token: Node) -> Node {
@@ -672,7 +672,7 @@ pub fn try_get_constructor_like_completion_container(context_token: Node) -> Nod
     Node::NIL
 }
 
-// Go: completions.go:3993 isConstructorParameterCompletion
+// Go: completions.go:4588 isConstructorParameterCompletion
 pub fn is_constructor_parameter_completion(node: Node) -> bool {
     node.parent().is_some()
         && is_parameter_declaration(node.parent())
@@ -680,7 +680,7 @@ pub fn is_constructor_parameter_completion(node: Node) -> bool {
         && (is_parameter_property_modifier(node.kind()) || is_declaration_name(node))
 }
 
-// Go: completions.go:4000 tryGetObjectTypeDeclarationCompletionContainer
+// Go: completions.go:4595 tryGetObjectTypeDeclarationCompletionContainer
 // Returns the immediate owning class declaration of a context token,
 // on the condition that one exists and that the context implies completion should be given.
 pub fn try_get_object_type_declaration_completion_container(
@@ -801,14 +801,14 @@ pub fn try_get_object_type_declaration_completion_container(
     }
 }
 
-// Go: completions.go:4097 isFromObjectTypeDeclaration
+// Go: completions.go:4692 isFromObjectTypeDeclaration
 pub fn is_from_object_type_declaration(node: Node) -> bool {
     node.parent().is_some()
         && is_class_or_type_element(node.parent())
         && is_object_type_declaration(node.parent().parent())
 }
 
-// Go: completions.go:4102 filterClassMembersList
+// Go: completions.go:4697 filterClassMembersList
 // Filters out completion suggestions for class elements.
 // PORT: Go reads the symbols through pointers and calls the package function
 // `checker.GetDeclarationModifierFlagsFromSymbol`. In Rust both need the
@@ -873,7 +873,7 @@ pub fn filter_class_members_list(
         .collect()
 }
 
-// Go: completions.go:4148 tryGetContainingJsxElement
+// Go: completions.go:4743 tryGetContainingJsxElement
 pub fn try_get_containing_jsx_element(context_token: Node, file: Node) -> Node {
     if context_token.is_nil() {
         return Node::NIL;
@@ -961,7 +961,7 @@ pub fn try_get_containing_jsx_element(context_token: Node, file: Node) -> Node {
     Node::NIL
 }
 
-// Go: completions.go:4209 filterJsxAttributes
+// Go: completions.go:4807 filterJsxAttributes
 // Filters out completion suggestions from 'symbols' according to existing JSX attributes.
 // @returns Symbols to be suggested in a JSX element, barring those whose attributes
 // do not occur at the current position and have not otherwise been typed.
@@ -1003,14 +1003,14 @@ pub fn filter_jsx_attributes(
     )
 }
 
-// Go: completions.go:4235 isTypeKeywordTokenOrIdentifier
+// Go: completions.go:4833 isTypeKeywordTokenOrIdentifier
 pub fn is_type_keyword_token_or_identifier(node: Node) -> bool {
     is_type_keyword_token(node)
         || is_identifier(node) && identifier_to_keyword_kind(node) == SyntaxKind::TypeKeyword
 }
 
 impl LanguageService {
-    // Go: completions.go:4242 setItemDefaults
+    // Go: completions.go:4840 setItemDefaults
     // Returns the item defaults for completion items, if that capability is supported.
     // Otherwise, if some item default is not supported by client, sets that property on each item.
     // PORT: Go shares one `*[]string` between the defaults and every item;
@@ -1105,7 +1105,7 @@ impl LanguageService {
         item_defaults
     }
 
-    // Go: completions.go:4311 specificKeywordCompletionInfo
+    // Go: completions.go:4913 specificKeywordCompletionInfo
     pub fn specific_keyword_completion_info(
         &self,
         ctx: &Context,
@@ -1133,7 +1133,7 @@ impl LanguageService {
         })
     }
 
-    // Go: completions.go:4335 getJsxClosingTagCompletion
+    // Go: completions.go:4937 getJsxClosingTagCompletion
     pub fn get_jsx_closing_tag_completion(
         &self,
         ctx: &Context,
@@ -1226,7 +1226,7 @@ impl LanguageService {
         })
     }
 
-    // Go: completions.go:4417 createLSPCompletionItem
+    // Go: completions.go:5023 createLSPCompletionItem
     pub fn create_lsp_completion_item(
         &self,
         _ctx: &Context,
@@ -1346,7 +1346,7 @@ impl LanguageService {
         }
     }
 
-    // Go: completions.go:4510 getLabelCompletionsAtPosition
+    // Go: completions.go:5119 getLabelCompletionsAtPosition
     pub fn get_label_completions_at_position(
         &self,
         ctx: &Context,
@@ -1377,7 +1377,7 @@ impl LanguageService {
         })
     }
 
-    // Go: completions.go:4537 getLabelStatementCompletions
+    // Go: completions.go:5146 getLabelStatementCompletions
     pub fn get_label_statement_completions(
         &self,
         ctx: &Context,
@@ -1430,7 +1430,7 @@ impl LanguageService {
     }
 }
 
-// Go: completions.go:4585 isCompletionListBlocker
+// Go: completions.go:5195 isCompletionListBlocker
 pub fn is_completion_list_blocker(
     context_token: Node,
     previous_token: Node,
@@ -1452,7 +1452,7 @@ pub fn is_completion_list_blocker(
         || is_big_int_literal(context_token)
 }
 
-// Go: completions.go:4600 isInStringOrRegularExpressionOrTemplateLiteral
+// Go: completions.go:5210 isInStringOrRegularExpressionOrTemplateLiteral
 pub fn is_in_string_or_regular_expression_or_template_literal(
     context_token: Node,
     position: i32,
@@ -1468,7 +1468,7 @@ pub fn is_in_string_or_regular_expression_or_template_literal(
                 || is_regular_expression_literal(context_token))
 }
 
-// Go: completions.go:4612 isSolelyIdentifierDefinitionLocation
+// Go: completions.go:5222 isSolelyIdentifierDefinitionLocation
 // true if we are certain that the currently edited location must define a new location; false otherwise.
 pub fn is_solely_identifier_definition_location(
     context_token: Node,
@@ -1673,7 +1673,7 @@ pub fn is_solely_identifier_definition_location(
             && (context_token != previous_token || position > previous_token.end()))
 }
 
-// Go: completions.go:4756 isVariableDeclarationListButNotTypeArgument
+// Go: completions.go:5366 isVariableDeclarationListButNotTypeArgument
 pub fn is_variable_declaration_list_but_not_type_argument(
     node: Node,
     file: Node,
@@ -1683,12 +1683,12 @@ pub fn is_variable_declaration_list_but_not_type_argument(
         && !is_possibly_type_argument_position(node, file, type_checker)
 }
 
-// Go: completions.go:4761 isFunctionLikeButNotConstructor
+// Go: completions.go:5371 isFunctionLikeButNotConstructor
 pub fn is_function_like_but_not_constructor(kind: SyntaxKind) -> bool {
     is_function_like_kind(kind) && kind != SyntaxKind::Constructor
 }
 
-// Go: completions.go:4765 isPreviousPropertyDeclarationTerminated
+// Go: completions.go:5375 isPreviousPropertyDeclarationTerminated
 pub fn is_previous_property_declaration_terminated(
     context_token: Node,
     file: Node,
@@ -1700,7 +1700,7 @@ pub fn is_previous_property_declaration_terminated(
                 != get_line_of_position(file, position))
 }
 
-// Go: completions.go:4771 isDotOfNumericLiteral
+// Go: completions.go:5381 isDotOfNumericLiteral
 pub fn is_dot_of_numeric_literal(context_token: Node, file: Node) -> bool {
     if context_token.kind() == SyntaxKind::NumericLiteral {
         let text =
@@ -1712,7 +1712,7 @@ pub fn is_dot_of_numeric_literal(context_token: Node, file: Node) -> bool {
     false
 }
 
-// Go: completions.go:4781 isInJsxText
+// Go: completions.go:5391 isInJsxText
 pub fn is_in_jsx_text(context_token: Node, location: Node) -> bool {
     if context_token.kind() == SyntaxKind::JsxText {
         return true;
@@ -1747,7 +1747,7 @@ pub fn is_in_jsx_text(context_token: Node, location: Node) -> bool {
     false
 }
 
-// Go: completions.go:4813 clientSupportsItemLabelDetails
+// Go: completions.go:5423 clientSupportsItemLabelDetails
 pub fn client_supports_item_label_details(ctx: &Context) -> bool {
     lsproto::get_client_capabilities(ctx)
         .text_document
@@ -1756,7 +1756,7 @@ pub fn client_supports_item_label_details(ctx: &Context) -> bool {
         .label_details_support
 }
 
-// Go: completions.go:4817 clientSupportsItemSnippet
+// Go: completions.go:5427 clientSupportsItemSnippet
 pub fn client_supports_item_snippet(ctx: &Context) -> bool {
     lsproto::get_client_capabilities(ctx)
         .text_document
@@ -1765,7 +1765,7 @@ pub fn client_supports_item_snippet(ctx: &Context) -> bool {
         .snippet_support
 }
 
-// Go: completions.go:4821 clientSupportsItemCommitCharacters
+// Go: completions.go:5431 clientSupportsItemCommitCharacters
 pub fn client_supports_item_commit_characters(ctx: &Context) -> bool {
     lsproto::get_client_capabilities(ctx)
         .text_document
@@ -1774,7 +1774,7 @@ pub fn client_supports_item_commit_characters(ctx: &Context) -> bool {
         .commit_characters_support
 }
 
-// Go: completions.go:4825 clientSupportsItemInsertReplace
+// Go: completions.go:5435 clientSupportsItemInsertReplace
 pub fn client_supports_item_insert_replace(ctx: &Context) -> bool {
     lsproto::get_client_capabilities(ctx)
         .text_document
@@ -1783,7 +1783,7 @@ pub fn client_supports_item_insert_replace(ctx: &Context) -> bool {
         .insert_replace_support
 }
 
-// Go: completions.go:4829 clientSupportsDefaultCommitCharacters
+// Go: completions.go:5439 clientSupportsDefaultCommitCharacters
 pub fn client_supports_default_commit_characters(ctx: &Context) -> bool {
     lsproto::get_client_capabilities(ctx)
         .text_document
@@ -1794,7 +1794,7 @@ pub fn client_supports_default_commit_characters(ctx: &Context) -> bool {
         .any(|s| s == "commitCharacters")
 }
 
-// Go: completions.go:4833 clientSupportsDefaultEditRange
+// Go: completions.go:5443 clientSupportsDefaultEditRange
 pub fn client_supports_default_edit_range(ctx: &Context) -> bool {
     lsproto::get_client_capabilities(ctx)
         .text_document
@@ -1805,7 +1805,7 @@ pub fn client_supports_default_edit_range(ctx: &Context) -> bool {
         .any(|s| s == "editRange")
 }
 
-// Go: completions.go:4837 argumentInfoForCompletions
+// Go: completions.go:5447 argumentInfoForCompletions
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ArgumentInfoForCompletions {
     pub invocation: Node,
@@ -1813,7 +1813,7 @@ pub struct ArgumentInfoForCompletions {
     pub argument_count: i32,
 }
 
-// Go: completions.go:4843 getArgumentInfoForCompletions
+// Go: completions.go:5453 getArgumentInfoForCompletions
 pub fn get_argument_info_for_completions(
     node: Node,
     position: i32,

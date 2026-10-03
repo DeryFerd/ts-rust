@@ -46,7 +46,7 @@ impl TransformerVisit for TypeEraserTransformer {
         self.emit_context.clone()
     }
 
-    // Go: transformers/tstransforms/typeeraser.go:44 TypeEraserTransformer.visit
+    // Go: transformers/tstransforms/typeeraser.go:43 TypeEraserTransformer.visit
     fn visit(&mut self, node: Node) -> Node {
         if !node
             .subtree_facts()
@@ -67,7 +67,7 @@ impl TransformerVisit for TypeEraserTransformer {
 }
 
 impl TypeEraserTransformer {
-    // Go: transformers/tstransforms/typeeraser.go:25 TypeEraserTransformer.pushNode
+    // Go: transformers/tstransforms/typeeraser.go:26 TypeEraserTransformer.pushNode
     /// Pushes a new child node onto the ancestor tracking stack, returning the grandparent node to be restored later via `popNode`.
     fn push_node(&mut self, node: Node) -> Node {
         let grandparent_node = self.parent_node;
@@ -76,14 +76,14 @@ impl TypeEraserTransformer {
         grandparent_node
     }
 
-    // Go: transformers/tstransforms/typeeraser.go:33 TypeEraserTransformer.popNode
+    // Go: transformers/tstransforms/typeeraser.go:34 TypeEraserTransformer.popNode
     /// Pops the last child node off the ancestor tracking stack, restoring the grandparent node.
     fn pop_node(&mut self, grandparent_node: Node) {
         self.current_node = self.parent_node;
         self.parent_node = grandparent_node;
     }
 
-    // Go: transformers/tstransforms/typeeraser.go:38 TypeEraserTransformer.elide
+    // Go: transformers/tstransforms/typeeraser.go:39 TypeEraserTransformer.elide
     fn elide(&self, node: Node) -> Node {
         self.emit_context.new_not_emitted_statement(node)
     }

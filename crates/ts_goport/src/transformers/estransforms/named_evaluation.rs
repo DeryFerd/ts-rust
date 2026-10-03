@@ -26,7 +26,7 @@ pub(crate) fn is_class_named_evaluation_helper_block(
     false
 }
 
-// Go: transformers/estransforms/namedevaluation.go:37 classHasExplicitlyAssignedName
+// Go: transformers/estransforms/namedevaluation.go:38 classHasExplicitlyAssignedName
 /// Gets whether a `ClassLikeDeclaration` has a `static {}` block containing only a single call to the
 /// `__setFunctionName` helper.
 pub(crate) fn class_has_explicitly_assigned_name(emit_context: &EmitContext, node: Node) -> bool {
@@ -41,7 +41,7 @@ pub(crate) fn class_has_explicitly_assigned_name(emit_context: &EmitContext, nod
     false
 }
 
-// Go: transformers/estransforms/namedevaluation.go:53 classHasDeclaredOrExplicitlyAssignedName
+// Go: transformers/estransforms/namedevaluation.go:54 classHasDeclaredOrExplicitlyAssignedName
 /// Gets whether a `ClassLikeDeclaration` has a declared name or contains a `static {}` block containing only a single
 /// call to the `__setFunctionName` helper.
 pub(crate) fn class_has_declared_or_explicitly_assigned_name(
@@ -54,7 +54,7 @@ pub(crate) fn class_has_declared_or_explicitly_assigned_name(
 /// Go `func(*anonymousFunctionDefinition) bool`.
 pub(crate) type AnonymousFunctionDefinitionCallback<'a> = &'a mut dyn FnMut(Node) -> bool;
 
-// Go: transformers/estransforms/namedevaluation.go:62 isAnonymousFunctionDefinition
+// Go: transformers/estransforms/namedevaluation.go:63 isAnonymousFunctionDefinition
 /// Indicates whether an expression is an anonymous function definition.
 ///
 /// See https://tc39.es/ecma262/#sec-isanonymousfunctiondefinition
@@ -86,12 +86,12 @@ pub(crate) fn is_anonymous_function_definition(
     true
 }
 
-// Go: transformers/estransforms/namedevaluation.go:87 isNamedEvaluation
+// Go: transformers/estransforms/namedevaluation.go:85 isNamedEvaluation
 pub(crate) fn is_named_evaluation(emit_context: &EmitContext, node: Node) -> bool {
     is_named_evaluation_and(emit_context, node, None)
 }
 
-// Go: transformers/estransforms/namedevaluation.go:91 isNamedEvaluationAnd
+// Go: transformers/estransforms/namedevaluation.go:89 isNamedEvaluationAnd
 pub(crate) fn is_named_evaluation_and(
     emit_context: &EmitContext,
     node: Node,
@@ -121,7 +121,7 @@ pub(crate) fn is_named_evaluation_and(
     }
 }
 
-// Go: transformers/estransforms/namedevaluation.go:112 getAssignedNameOfIdentifier
+// Go: transformers/estransforms/namedevaluation.go:109 getAssignedNameOfIdentifier
 /// Gets a string literal to use as the assigned name of an anonymous class or function declaration.
 pub(crate) fn get_assigned_name_of_identifier(
     emit_context: &EmitContext,
@@ -143,7 +143,7 @@ pub(crate) fn get_assigned_name_of_identifier(
     emit_context.factory().new_string_literal_from_node(name)
 }
 
-// Go: transformers/estransforms/namedevaluation.go:121 getAssignedNameOfPropertyName
+// Go: transformers/estransforms/namedevaluation.go:118 getAssignedNameOfPropertyName
 /// Returns `(assignedName, updatedName)`.
 pub(crate) fn get_assigned_name_of_property_name(
     emit_context: &EmitContext,
@@ -219,7 +219,7 @@ pub(crate) fn create_class_named_evaluation_helper_block(
     block
 }
 
-// Go: transformers/estransforms/namedevaluation.go:177 injectClassNamedEvaluationHelperBlockIfMissing
+// Go: transformers/estransforms/namedevaluation.go:176 injectClassNamedEvaluationHelperBlockIfMissing
 /// Injects a class `static {}` block used to dynamically set the name of a class, if one does not already exist.
 pub(crate) fn inject_class_named_evaluation_helper_block_if_missing(
     emit_context: &EmitContext,
@@ -425,7 +425,7 @@ pub(crate) fn transform_named_evaluation_of_shorthand_assignment_property(
     )
 }
 
-// Go: transformers/estransforms/namedevaluation.go:316 transformNamedEvaluationOfVariableDeclaration
+// Go: transformers/estransforms/namedevaluation.go:315 transformNamedEvaluationOfVariableDeclaration
 pub(crate) fn transform_named_evaluation_of_variable_declaration(
     emit_context: &EmitContext,
     node: Node, /*NamedEvaluation & VariableDeclaration*/
@@ -468,7 +468,7 @@ pub(crate) fn transform_named_evaluation_of_variable_declaration(
     )
 }
 
-// Go: transformers/estransforms/namedevaluation.go:349 transformNamedEvaluationOfParameterDeclaration
+// Go: transformers/estransforms/namedevaluation.go:347 transformNamedEvaluationOfParameterDeclaration
 pub(crate) fn transform_named_evaluation_of_parameter_declaration(
     emit_context: &EmitContext,
     node: Node, /*NamedEvaluation & ParameterDeclaration*/
@@ -515,7 +515,7 @@ pub(crate) fn transform_named_evaluation_of_parameter_declaration(
     )
 }
 
-// Go: transformers/estransforms/namedevaluation.go:384 transformNamedEvaluationOfBindingElement
+// Go: transformers/estransforms/namedevaluation.go:383 transformNamedEvaluationOfBindingElement
 pub(crate) fn transform_named_evaluation_of_binding_element(
     emit_context: &EmitContext,
     node: Node, /*NamedEvaluation & BindingElement*/
@@ -560,7 +560,7 @@ pub(crate) fn transform_named_evaluation_of_binding_element(
     )
 }
 
-// Go: transformers/estransforms/namedevaluation.go:418 transformNamedEvaluationOfPropertyDeclaration
+// Go: transformers/estransforms/namedevaluation.go:417 transformNamedEvaluationOfPropertyDeclaration
 pub(crate) fn transform_named_evaluation_of_property_declaration(
     emit_context: &EmitContext,
     node: Node, /*NamedEvaluation & PropertyDeclaration*/
@@ -645,7 +645,7 @@ pub(crate) fn transform_named_evaluation_of_assignment_expression(
     )
 }
 
-// Go: transformers/estransforms/namedevaluation.go:485 transformNamedEvaluationOfExportAssignment
+// Go: transformers/estransforms/namedevaluation.go:483 transformNamedEvaluationOfExportAssignment
 pub(crate) fn transform_named_evaluation_of_export_assignment(
     emit_context: &EmitContext,
     node: Node, /*NamedEvaluation & ExportAssignment*/
@@ -684,7 +684,7 @@ pub(crate) fn transform_named_evaluation_of_export_assignment(
     )
 }
 
-// Go: transformers/estransforms/namedevaluation.go:517 transformNamedEvaluation
+// Go: transformers/estransforms/namedevaluation.go:513 transformNamedEvaluation
 /// Performs a shallow transformation of a `NamedEvaluation` node, such that a valid name will be assigned.
 pub(crate) fn transform_named_evaluation(
     context: &EmitContext,

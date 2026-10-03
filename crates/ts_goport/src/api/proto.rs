@@ -97,7 +97,7 @@ pub static ERR_INVALID_REQUEST: LazyLock<GoError> =
     LazyLock::new(|| errors::new("api: invalid request"));
 pub static ERR_CLIENT_ERROR: LazyLock<GoError> = LazyLock::new(|| errors::new("api: client error"));
 
-// Go: proto.go:25 Method
+// Go: proto.go:36 Method
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Method(pub Cow<'static, str>);
 
@@ -265,7 +265,7 @@ impl IsZero for project::SyntheticProjectID {
     }
 }
 
-// Go: proto.go:40 SymbolHandle
+// Go: proto.go:55 SymbolHandle
 // PORT: `symbols` is the arena that holds `symbol` (the rule for `ast`
 // functions that take a symbol). Go dereferences a nil symbol and panics.
 pub fn symbol_handle(symbols: &SymbolArena, symbol: SymbolId) -> SymbolID {
@@ -275,7 +275,7 @@ pub fn symbol_handle(symbols: &SymbolArena, symbol: SymbolId) -> SymbolID {
     SymbolID(get_symbol_id(symbols, symbol))
 }
 
-// Go: proto.go:44 TypeHandle
+// Go: proto.go:59 TypeHandle
 // PORT: Go reads `t.Id()`. A `TypeId` is the checker arena index, which
 // equals the Go type id, so no checker is needed.
 pub fn type_handle(t: TypeId) -> TypeID {
@@ -285,7 +285,7 @@ pub fn type_handle(t: TypeId) -> TypeID {
     TypeID(t.0)
 }
 
-// Go: proto.go:48 SignatureHandle
+// Go: proto.go:63 SignatureHandle
 // PORT: Go reads `sig.Id()`. A `SignatureId` is the checker arena index,
 // which equals the Go signature id (`newSignature` numbers them from 1).
 pub fn signature_handle(sig: SignatureId) -> SignatureID {
@@ -576,7 +576,7 @@ impl Method {
 }
 
 // InitializeResponse is returned by the initialize method.
-// Go: proto.go:171 InitializeResponse
+// Go: proto.go:265 InitializeResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InitializeResponse {
     // UseCaseSensitiveFileNames indicates whether the host file system is case-sensitive.
@@ -602,7 +602,7 @@ proto_json!(marshal InitializeResponse {
 // Using a URI:
 //
 //	project.program.getSourceFile({ uri: "file:///path/to/file.ts" });
-// Go: proto.go:180 DocumentIdentifier
+// Go: proto.go:284 DocumentIdentifier
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DocumentIdentifier {
     pub file_name: String,
@@ -687,7 +687,7 @@ fn kind_string(k: u8) -> String {
 }
 
 impl DocumentIdentifier {
-    // Go: proto.go:223 ToFileName
+    // Go: proto.go:327 ToFileName
     pub fn to_file_name(&self) -> String {
         if !self.uri.0.is_empty() {
             return self.uri.file_name();
@@ -695,7 +695,7 @@ impl DocumentIdentifier {
         self.file_name.clone()
     }
 
-    // Go: proto.go:268 ToURI
+    // Go: proto.go:337 ToURI
     // ToURI returns the document URI for this identifier. An explicitly provided URI
     // is returned as-is; a file name is first normalized to an absolute path against
     // cwd before being converted to a URI.
@@ -709,7 +709,7 @@ impl DocumentIdentifier {
         ))
     }
 
-    // Go: proto.go:237 ToAbsoluteFileName
+    // Go: proto.go:344 ToAbsoluteFileName
     pub fn to_absolute_file_name(&self, cwd: &str) -> String {
         if !self.uri.0.is_empty() {
             return self.uri.file_name();
@@ -717,7 +717,7 @@ impl DocumentIdentifier {
         tspath::get_normalized_absolute_path(&self.file_name, cwd)
     }
 
-    // Go: proto.go:244 String
+    // Go: proto.go:351 String
     pub fn string(&self) -> String {
         if !self.uri.0.is_empty() {
             return self.uri.0.clone();
@@ -1513,7 +1513,7 @@ proto_json!(marshal ResolveModuleNameResult {
 });
 
 // ProjectFileChanges describes what source files changed within a single project.
-// Go: proto.go:278 ProjectFileChanges
+// Go: proto.go:528 ProjectFileChanges
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProjectFileChanges {
     // ChangedFiles lists source file paths whose content differs.
@@ -1643,7 +1643,7 @@ proto_json!(marshal OpenedFileOperationResult {
 /// Go `func([]byte) (any, error)` in `unmarshalers`.
 pub type Unmarshaler = fn(&[u8]) -> Result<Option<Box<dyn AnyValue>>, GoError>;
 
-// Go: proto.go:308 unmarshalers
+// Go: proto.go:569 unmarshalers
 pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::new(|| {
     let mut m: FxHashMap<Method, Unmarshaler> = FxHashMap::default();
     // ts#63937
@@ -2313,7 +2313,7 @@ pub static UNMARSHALERS: LazyLock<FxHashMap<Method, Unmarshaler>> = LazyLock::ne
     m
 });
 
-// Go: proto.go:405 ParseConfigFileParams
+// Go: proto.go:746 ParseConfigFileParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParseConfigFileParams {
     pub file: DocumentIdentifier,
@@ -2323,7 +2323,7 @@ proto_json!(both ParseConfigFileParams {
     file: "file" plain,
 });
 
-// Go: proto.go:550 ParseCommandLineParams
+// Go: proto.go:750 ParseCommandLineParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParseCommandLineParams {
     pub command_line: Vec<String>,
@@ -2333,7 +2333,7 @@ proto_json!(both ParseCommandLineParams {
     command_line: "commandLine" plain,
 });
 
-// Go: proto.go:554 ReadConfigFileParams
+// Go: proto.go:754 ReadConfigFileParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReadConfigFileParams {
     pub file: DocumentIdentifier,
@@ -2343,7 +2343,7 @@ proto_json!(both ReadConfigFileParams {
     file: "file" plain,
 });
 
-// Go: proto.go:558 ParseJsonConfigFileContentParams
+// Go: proto.go:758 ParseJsonConfigFileContentParams
 // PORT: Go `JSON packagejson.JSONValue` is `LspAny`. A decoded request value
 // must be `Send` (`AnyValue`), and `packagejson::JSONValue` holds `Rc`.
 // Both decode a JSON value to the same tree: null, bool, float64, string,
@@ -2361,7 +2361,7 @@ proto_json!(both ParseJsonConfigFileContentParams {
     config_file_name: "configFileName" omitempty,
 });
 
-// Go: proto.go:564 jsonValueToAny
+// Go: proto.go:764 jsonValueToAny
 // PORT: Go `any` from the tsoptions JSON code is `CompilerOptionsValue`
 // (nil, string, float64, bool, `[]any`, `*collections.OrderedMap`). The
 // input is the `LspAny` that stands for `packagejson.JSONValue` (see
@@ -2390,7 +2390,7 @@ pub fn json_value_to_any(value: &LspAny) -> tsoptions::CompilerOptionsValue {
     }
 }
 
-// Go: proto.go:589 TranspileOptions (tsgo#4849)
+// Go: proto.go:789 TranspileOptions (tsgo#4849)
 // PORT: Go `*core.CompilerOptions` is `Option<CompilerOptions>` (nil is
 // `None`). Its JSON form is the Go struct default (`CompilerOptionsJSON` to
 // write, the `CompilerOptions` `UnmarshalerFrom` below to read).
@@ -2477,7 +2477,7 @@ proto_json!(both CreateSourceFileFromFileParams {
     options: "options" plain,
 });
 
-// Go: proto.go:595 TranspileParams (tsgo#4849)
+// Go: proto.go:810 TranspileParams (tsgo#4849)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TranspileParams {
     pub input: String,
@@ -2489,7 +2489,7 @@ proto_json!(both TranspileParams {
     options: "options" plain,
 });
 
-// Go: proto.go:600 TranspileFromFileParams (tsgo#4849)
+// Go: proto.go:815 TranspileFromFileParams (tsgo#4849)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TranspileFromFileParams {
     pub file_name: String,
@@ -2501,7 +2501,7 @@ proto_json!(both TranspileFromFileParams {
     options: "options" plain,
 });
 
-// Go: proto.go:605 TranspileOutputResponse (tsgo#4849)
+// Go: proto.go:820 TranspileOutputResponse (tsgo#4849)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TranspileOutputResponse {
     pub output_text: String,
@@ -2597,7 +2597,7 @@ proto_json!(marshal BatchResponse {
 });
 
 // ReleaseParams are the parameters for the release method.
-// Go: proto.go:410 ReleaseParams
+// Go: proto.go:889 ReleaseParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReleaseParams {
     pub snapshot: SnapshotID,
@@ -2869,7 +2869,7 @@ proto_json!(both ReleaseSourceFileParams {
     lease: "lease" plain,
 });
 
-// Go: proto.go:414 ProfileParams
+// Go: proto.go:897 ProfileParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProfileParams {
     pub dir: String,
@@ -2879,7 +2879,7 @@ proto_json!(both ProfileParams {
     dir: "dir" plain,
 });
 
-// Go: proto.go:418 ProfileResult
+// Go: proto.go:901 ProfileResult
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProfileResult {
     pub file: String,
@@ -2889,7 +2889,7 @@ proto_json!(marshal ProfileResult {
     file: "file" plain,
 });
 
-// Go: proto.go:422 ConfigFileResponse
+// Go: proto.go:950 ConfigFileResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ConfigFileResponse {
     pub file_names: Vec<String>,
@@ -2932,7 +2932,7 @@ impl MarshalerTo for ConfigFileResponse {
     }
 }
 
-// Go: proto.go:634 ReadConfigFileResponse
+// Go: proto.go:961 ReadConfigFileResponse
 // PORT: Go `Config any` is `CompilerOptionsValue` (see `json_value_to_any`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReadConfigFileResponse {
@@ -2961,7 +2961,7 @@ impl MarshalerTo for AnyJSON<'_> {
     }
 }
 
-// Go: proto.go:427 GetDefaultProjectForFileParams
+// Go: proto.go:966 GetDefaultProjectForFileParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetDefaultProjectForFileParams {
     pub snapshot: SnapshotID,
@@ -2973,7 +2973,7 @@ proto_json!(both GetDefaultProjectForFileParams {
     file: "file" plain,
 });
 
-// Go: proto.go:432 ProjectResponse
+// Go: proto.go:971 ProjectResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProjectResponse {
     pub id: project::ID,
@@ -3015,7 +3015,7 @@ impl MarshalerTo for ProjectResponse {
     }
 }
 
-// Go: proto.go:654 NewConfigFileResponse
+// Go: proto.go:983 NewConfigFileResponse
 // PORT: Go shares the `*core.CompilerOptions`, `*core.TypeAcquisition` and
 // project reference pointers; the response keeps copies (see
 // `new_project_response`). Go `Raw.(*collections.OrderedMap[string, any])`
@@ -3045,7 +3045,7 @@ pub fn new_config_file_response(
     })
 }
 
-// Go: proto.go:682 toProtocolJSONValue
+// Go: proto.go:1011 toProtocolJSONValue
 pub fn to_protocol_json_value(
     value: &tsoptions::CompilerOptionsValue,
 ) -> tsoptions::CompilerOptionsValue {
@@ -3080,7 +3080,7 @@ pub fn to_protocol_json_value(
     }
 }
 
-// Go: proto.go:707 NewProjectResponse
+// Go: proto.go:1036 NewProjectResponse
 // PORT: Go shares the `*core.CompilerOptions` pointer; the response keeps
 // a copy (responses cross into `Box<dyn AnyValue>`, which is `Send`).
 pub fn new_project_response(p: &project::Project) -> ProjectResponse {
@@ -3105,7 +3105,7 @@ pub fn new_project_response(p: &project::Project) -> ProjectResponse {
     }
 }
 
-// Go: proto.go:448 GetSymbolAtPositionParams
+// Go: proto.go:1055 GetSymbolAtPositionParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolAtPositionParams {
     pub snapshot: SnapshotID,
@@ -3121,7 +3121,7 @@ proto_json!(both GetSymbolAtPositionParams {
     position: "position" plain,
 });
 
-// Go: proto.go:455 GetSymbolsAtPositionsParams
+// Go: proto.go:1062 GetSymbolsAtPositionsParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolsAtPositionsParams {
     pub snapshot: SnapshotID,
@@ -3137,7 +3137,7 @@ proto_json!(both GetSymbolsAtPositionsParams {
     positions: "positions" plain,
 });
 
-// Go: proto.go:734 GetSymbolOfSourceFileParams
+// Go: proto.go:1069 GetSymbolOfSourceFileParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolOfSourceFileParams {
     pub snapshot: SnapshotID,
@@ -3151,7 +3151,7 @@ proto_json!(both GetSymbolOfSourceFileParams {
     file: "file" plain,
 });
 
-// Go: proto.go:740 GetSymbolsOfSourceFilesParams
+// Go: proto.go:1075 GetSymbolsOfSourceFilesParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolsOfSourceFilesParams {
     pub snapshot: SnapshotID,
@@ -3165,7 +3165,7 @@ proto_json!(both GetSymbolsOfSourceFilesParams {
     files: "files" plain,
 });
 
-// Go: proto.go:462 GetSymbolAtLocationParams
+// Go: proto.go:1081 GetSymbolAtLocationParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolAtLocationParams {
     pub snapshot: SnapshotID,
@@ -3179,7 +3179,7 @@ proto_json!(both GetSymbolAtLocationParams {
     location: "location" plain,
 });
 
-// Go: proto.go:468 GetSymbolsAtLocationsParams
+// Go: proto.go:1087 GetSymbolsAtLocationsParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolsAtLocationsParams {
     pub snapshot: SnapshotID,
@@ -3193,7 +3193,7 @@ proto_json!(both GetSymbolsAtLocationsParams {
     locations: "locations" plain,
 });
 
-// Go: proto.go:474 SymbolResponse
+// Go: proto.go:1093 SymbolResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SymbolResponse {
     pub id: SymbolID,
@@ -3221,7 +3221,7 @@ proto_json!(marshal SymbolResponse {
     export_symbol: "exportSymbol" omitzero,
 });
 
-// Go: proto.go:485 symbolHandles
+// Go: proto.go:1107 symbolHandles
 pub fn symbol_handles(symbols: &SymbolArena, symbol_list: &[SymbolId]) -> Vec<SymbolID> {
     if symbol_list.is_empty() {
         return Vec::new();
@@ -3233,7 +3233,7 @@ pub fn symbol_handles(symbols: &SymbolArena, symbol_list: &[SymbolId]) -> Vec<Sy
     handles
 }
 
-// Go: proto.go:496 GetTypeOfSymbolParams
+// Go: proto.go:1118 GetTypeOfSymbolParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeOfSymbolParams {
     pub snapshot: SnapshotID,
@@ -3247,7 +3247,7 @@ proto_json!(both GetTypeOfSymbolParams {
     symbol: "symbol" plain,
 });
 
-// Go: proto.go:502 GetTypesOfSymbolsParams
+// Go: proto.go:1124 GetTypesOfSymbolsParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypesOfSymbolsParams {
     pub snapshot: SnapshotID,
@@ -3261,7 +3261,7 @@ proto_json!(both GetTypesOfSymbolsParams {
     symbols: "symbols" plain,
 });
 
-// Go: proto.go:508 TypeResponse
+// Go: proto.go:1130 TypeResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TypeResponse {
     pub id: TypeID,
@@ -3394,7 +3394,7 @@ impl MarshalerTo for TypeResponse {
     }
 }
 
-// Go: proto.go:562 newTypeResponse
+// Go: proto.go:1196 newTypeResponse
 // PORT: Go reads the type through its pointer; the port reads it from the
 // checker arena that owns `t`.
 pub fn new_type_response(c: &Checker, t: TypeId, id: TypeID) -> TypeResponse {
@@ -3491,7 +3491,7 @@ pub fn new_type_response(c: &Checker, t: TypeId, id: TypeID) -> TypeResponse {
     resp
 }
 
-// Go: proto.go:648 typeHandles
+// Go: proto.go:1283 typeHandles
 pub fn type_handles(types: &[TypeId]) -> Vec<TypeID> {
     if types.is_empty() {
         return Vec::new();
@@ -3503,7 +3503,7 @@ pub fn type_handles(types: &[TypeId]) -> Vec<TypeID> {
     handles
 }
 
-// Go: proto.go:659 literalValueToJSON
+// Go: proto.go:1294 literalValueToJSON
 // PORT: the Go `any` value is `Option<&LiteralValue>` (nil is `None`); the
 // result holds the same JSON primitive as `LspAny`.
 pub fn literal_value_to_json(value: Option<&LiteralValue>) -> LspAny {
@@ -3543,7 +3543,7 @@ proto_json!(marshal ConstantValueResponse {
     value: "value" plain,
 });
 
-// Go: proto.go:674 SignatureResponse
+// Go: proto.go:1325 SignatureResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SignatureResponse {
     pub id: SignatureID,
@@ -3565,7 +3565,7 @@ proto_json!(marshal SignatureResponse {
     target: "target" omitzero,
 });
 
-// Go: proto.go:684 GetSourceFileParams
+// Go: proto.go:1335 GetSourceFileParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSourceFileParams {
     pub snapshot: SnapshotID,
@@ -3579,7 +3579,7 @@ proto_json!(both GetSourceFileParams {
     file: "file" plain,
 });
 
-// Go: proto.go:770 GetSourceFileNamesParams
+// Go: proto.go:1341 GetSourceFileNamesParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSourceFileNamesParams {
     pub snapshot: SnapshotID,
@@ -3824,7 +3824,7 @@ proto_json!(marshal SourceFileMetadata {
     implied_node_format: "impliedNodeFormat" plain,
 });
 
-// Go: proto.go:690 ResolveNameParams
+// Go: proto.go:1438 ResolveNameParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResolveNameParams {
     pub snapshot: SnapshotID,
@@ -3850,7 +3850,7 @@ proto_json!(both ResolveNameParams {
 
 // GetSymbolsInScopeParams are parameters for getSymbolsInScope, which returns
 // all symbols visible at a given location.
-// Go: proto.go:1007 GetSymbolsInScopeParams
+// Go: proto.go:1451 GetSymbolsInScopeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolsInScopeParams {
     pub snapshot: SnapshotID,
@@ -3871,7 +3871,7 @@ proto_json!(both GetSymbolsInScopeParams {
 });
 
 // GetTypePropertyParams is used for all type sub-property endpoints.
-// Go: proto.go:702 GetTypePropertyParams
+// Go: proto.go:1461 GetTypePropertyParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypePropertyParams {
     pub snapshot: SnapshotID,
@@ -3886,7 +3886,7 @@ proto_json!(both GetTypePropertyParams {
 });
 
 // GetSymbolPropertyParams is used for all symbol sub-property endpoints.
-// Go: proto.go:708 GetSymbolPropertyParams
+// Go: proto.go:1468 GetSymbolPropertyParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSymbolPropertyParams {
     pub snapshot: SnapshotID,
@@ -3901,7 +3901,7 @@ proto_json!(both GetSymbolPropertyParams {
 });
 
 // GetSignaturePropertyParams is used for all signature sub-property endpoints.
-// Go: proto.go:714 GetSignaturePropertyParams
+// Go: proto.go:1475 GetSignaturePropertyParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSignaturePropertyParams {
     pub snapshot: SnapshotID,
@@ -3916,7 +3916,7 @@ proto_json!(both GetSignaturePropertyParams {
 });
 
 // GetContextualTypeParams returns the contextual type for a node.
-// Go: proto.go:720 GetContextualTypeParams
+// Go: proto.go:1482 GetContextualTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetContextualTypeParams {
     pub snapshot: SnapshotID,
@@ -3947,7 +3947,7 @@ proto_json!(both GetContextualTypeForArgumentParams {
 });
 
 // GetTypeOfSymbolAtLocationParams returns the narrowed type of a symbol at a specific location.
-// Go: proto.go:727 GetTypeOfSymbolAtLocationParams
+// Go: proto.go:1496 GetTypeOfSymbolAtLocationParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeOfSymbolAtLocationParams {
     pub snapshot: SnapshotID,
@@ -3964,7 +3964,7 @@ proto_json!(both GetTypeOfSymbolAtLocationParams {
 });
 
 // GetReferencesToSymbolInFileParams are the parameters for the getReferencesToSymbolInFile method.
-// Go: proto.go:735 GetReferencesToSymbolInFileParams
+// Go: proto.go:1504 GetReferencesToSymbolInFileParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetReferencesToSymbolInFileParams {
     pub snapshot: SnapshotID,
@@ -3981,7 +3981,7 @@ proto_json!(both GetReferencesToSymbolInFileParams {
 });
 
 // GetReferencedSymbolsForNodeParams are the parameters for the getReferencedSymbolsForNode method.
-// Go: proto.go:743 GetReferencedSymbolsForNodeParams
+// Go: proto.go:1512 GetReferencedSymbolsForNodeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetReferencedSymbolsForNodeParams {
     pub snapshot: SnapshotID,
@@ -3998,7 +3998,7 @@ proto_json!(both GetReferencedSymbolsForNodeParams {
 });
 
 // ReferencedSymbolEntry represents a symbol definition and its references.
-// Go: proto.go:751 ReferencedSymbolEntry
+// Go: proto.go:1520 ReferencedSymbolEntry
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReferencedSymbolEntry {
     pub definition: NodeHandle,
@@ -4013,7 +4013,7 @@ proto_json!(marshal ReferencedSymbolEntry {
 });
 
 // GetSignatureUsagesParams are the parameters for the getSignatureUsages method.
-// Go: proto.go:758 GetSignatureUsagesParams
+// Go: proto.go:1527 GetSignatureUsagesParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSignatureUsagesParams {
     pub snapshot: SnapshotID,
@@ -4028,7 +4028,7 @@ proto_json!(both GetSignatureUsagesParams {
 });
 
 // SignatureUsageResponse represents a single usage of a signature as a name-call pair.
-// Go: proto.go:765 SignatureUsageResponse
+// Go: proto.go:1534 SignatureUsageResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SignatureUsageResponse {
     pub name: NodeHandle,
@@ -4041,7 +4041,7 @@ proto_json!(marshal SignatureUsageResponse {
 });
 
 // GetCompletionsAtPositionParams are the parameters for the getCompletionsAtPosition method.
-// Go: proto.go:771 GetCompletionsAtPositionParams
+// Go: proto.go:1540 GetCompletionsAtPositionParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetCompletionsAtPositionParams {
     pub snapshot: SnapshotID,
@@ -4062,7 +4062,7 @@ proto_json!(both GetCompletionsAtPositionParams {
 });
 
 // CompletionEntryLabelDetailsResponse holds additional label display text for a completion entry.
-// Go: proto.go:781 CompletionEntryLabelDetailsResponse
+// Go: proto.go:1550 CompletionEntryLabelDetailsResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CompletionEntryLabelDetailsResponse {
     pub detail: Option<String>,
@@ -4075,7 +4075,7 @@ proto_json!(marshal CompletionEntryLabelDetailsResponse {
 });
 
 // CompletionEntryResponse represents a single completion item.
-// Go: proto.go:787 CompletionEntryResponse
+// Go: proto.go:1556 CompletionEntryResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CompletionEntryResponse {
     pub name: String,
@@ -4100,7 +4100,7 @@ proto_json!(marshal CompletionEntryResponse {
 });
 
 // CompletionInfoResponse wraps a list of completion entries.
-// Go: proto.go:799 CompletionInfoResponse
+// Go: proto.go:1568 CompletionInfoResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CompletionInfoResponse {
     pub is_incomplete: bool,
@@ -4113,7 +4113,7 @@ proto_json!(marshal CompletionInfoResponse {
 });
 
 // GetIntrinsicTypeParams is used for intrinsic type getters (anyType, stringType, etc.).
-// Go: proto.go:805 GetIntrinsicTypeParams
+// Go: proto.go:1574 GetIntrinsicTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetIntrinsicTypeParams {
     pub snapshot: SnapshotID,
@@ -4145,7 +4145,7 @@ proto_json!(marshal WellKnownSymbolsResponse {
 // WellKnownSignaturesResponse carries the handle id of the per-checker singleton
 // unknown signature (the signature the checker yields when a call cannot be
 // resolved) so the client can identify it by id without a round-trip on every check.
-// Go: proto.go:1140 WellKnownSignaturesResponse
+// Go: proto.go:1591 WellKnownSignaturesResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WellKnownSignaturesResponse {
     pub unknown: SignatureID,
@@ -4156,7 +4156,7 @@ proto_json!(marshal WellKnownSignaturesResponse {
 });
 
 // GetBaseTypeOfLiteralTypeParams returns the base type of a literal type.
-// Go: proto.go:811 GetBaseTypeOfLiteralTypeParams
+// Go: proto.go:1596 GetBaseTypeOfLiteralTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetBaseTypeOfLiteralTypeParams {
     pub snapshot: SnapshotID,
@@ -4171,7 +4171,7 @@ proto_json!(both GetBaseTypeOfLiteralTypeParams {
 });
 
 // GetNonNullableTypeParams are the parameters for the getNonNullableType method.
-// Go: proto.go:818 GetNonNullableTypeParams
+// Go: proto.go:1603 GetNonNullableTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetNonNullableTypeParams {
     pub snapshot: SnapshotID,
@@ -4186,7 +4186,7 @@ proto_json!(both GetNonNullableTypeParams {
 });
 
 // GetTypeFromTypeNodeParams are the parameters for the getTypeFromTypeNode method.
-// Go: proto.go:825 GetTypeFromTypeNodeParams
+// Go: proto.go:1610 GetTypeFromTypeNodeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeFromTypeNodeParams {
     pub snapshot: SnapshotID,
@@ -4201,7 +4201,7 @@ proto_json!(both GetTypeFromTypeNodeParams {
 });
 
 // GetWidenedTypeParams are the parameters for the getWidenedType method.
-// Go: proto.go:832 GetWidenedTypeParams
+// Go: proto.go:1617 GetWidenedTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetWidenedTypeParams {
     pub snapshot: SnapshotID,
@@ -4216,7 +4216,7 @@ proto_json!(both GetWidenedTypeParams {
 });
 
 // GetParameterTypeParams are the parameters for the getParameterType method.
-// Go: proto.go:839 GetParameterTypeParams
+// Go: proto.go:1624 GetParameterTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetParameterTypeParams {
     pub snapshot: SnapshotID,
@@ -4233,7 +4233,7 @@ proto_json!(both GetParameterTypeParams {
 });
 
 // IsArrayLikeTypeParams checks whether a type is array-like.
-// Go: proto.go:847 IsArrayLikeTypeParams
+// Go: proto.go:1632 IsArrayLikeTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IsArrayLikeTypeParams {
     pub snapshot: SnapshotID,
@@ -4248,7 +4248,7 @@ proto_json!(both IsArrayLikeTypeParams {
 });
 
 // IsTypeAssignableToParams checks assignability between two types.
-// Go: proto.go:854 IsTypeAssignableToParams
+// Go: proto.go:1639 IsTypeAssignableToParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IsTypeAssignableToParams {
     pub snapshot: SnapshotID,
@@ -4264,7 +4264,7 @@ proto_json!(both IsTypeAssignableToParams {
     target: "target" plain,
 });
 
-// Go: proto.go:861 GetSignaturesOfTypeParams
+// Go: proto.go:1646 GetSignaturesOfTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetSignaturesOfTypeParams {
     pub snapshot: SnapshotID,
@@ -4280,7 +4280,7 @@ proto_json!(both GetSignaturesOfTypeParams {
     kind: "kind" plain,
 });
 
-// Go: proto.go:868 GetResolvedSignatureParams
+// Go: proto.go:1653 GetResolvedSignatureParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetResolvedSignatureParams {
     pub snapshot: SnapshotID,
@@ -4294,7 +4294,7 @@ proto_json!(both GetResolvedSignatureParams {
     location: "location" plain,
 });
 
-// Go: proto.go:874 GetTypeAtLocationParams
+// Go: proto.go:1659 GetTypeAtLocationParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeAtLocationParams {
     pub snapshot: SnapshotID,
@@ -4308,7 +4308,7 @@ proto_json!(both GetTypeAtLocationParams {
     location: "location" plain,
 });
 
-// Go: proto.go:880 GetTypeAtLocationsParams
+// Go: proto.go:1665 GetTypeAtLocationsParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeAtLocationsParams {
     pub snapshot: SnapshotID,
@@ -4322,7 +4322,7 @@ proto_json!(both GetTypeAtLocationsParams {
     locations: "locations" plain,
 });
 
-// Go: proto.go:886 GetTypeAtPositionParams
+// Go: proto.go:1671 GetTypeAtPositionParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypeAtPositionParams {
     pub snapshot: SnapshotID,
@@ -4338,7 +4338,7 @@ proto_json!(both GetTypeAtPositionParams {
     position: "position" plain,
 });
 
-// Go: proto.go:893 GetTypesAtPositionsParams
+// Go: proto.go:1678 GetTypesAtPositionsParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetTypesAtPositionsParams {
     pub snapshot: SnapshotID,
@@ -4354,17 +4354,17 @@ proto_json!(both GetTypesAtPositionsParams {
     positions: "positions" plain,
 });
 
-// Go: proto.go:1234 ImportAdderActionKind (tsgo#3881)
+// Go: proto.go:1685 ImportAdderActionKind (tsgo#3881)
 // PORT: a Go string type, a newtype as the handles are (see `handle_json!`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ImportAdderActionKind(pub String);
 
 handle_json!(string: ImportAdderActionKind);
 
-// Go: proto.go:1237 ImportAdderActionKindImportSymbol (tsgo#3881)
+// Go: proto.go:1688 ImportAdderActionKindImportSymbol (tsgo#3881)
 pub const IMPORT_ADDER_ACTION_KIND_IMPORT_SYMBOL: &str = "importSymbol";
 
-// Go: proto.go:1240 ImportAdderAction (tsgo#3881)
+// Go: proto.go:1691 ImportAdderAction (tsgo#3881)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ImportAdderAction {
     pub kind: ImportAdderActionKind,
@@ -4378,7 +4378,7 @@ proto_json!(both ImportAdderAction {
     is_valid_type_only_use_site: "isValidTypeOnlyUseSite" omitempty,
 });
 
-// Go: proto.go:1246 GetImportAdderEditsParams (tsgo#3881)
+// Go: proto.go:1697 GetImportAdderEditsParams (tsgo#3881)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetImportAdderEditsParams {
     pub snapshot: SnapshotID,
@@ -4394,7 +4394,7 @@ proto_json!(both GetImportAdderEditsParams {
     actions: "actions" plain,
 });
 
-// Go: proto.go:1253 TextEdit (tsgo#3881)
+// Go: proto.go:1704 TextEdit (tsgo#3881)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TextEdit {
     pub pos: i32,
@@ -4409,7 +4409,7 @@ proto_json!(marshal TextEdit {
 });
 
 // TypeToTypeNodeParams are the parameters for the typeToTypeNode method.
-// Go: proto.go:901 TypeToTypeNodeParams
+// Go: proto.go:1711 TypeToTypeNodeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TypeToTypeNodeParams {
     pub snapshot: SnapshotID,
@@ -4428,7 +4428,7 @@ proto_json!(both TypeToTypeNodeParams {
 });
 
 // SignatureToSignatureDeclarationParams are the parameters for the signatureToSignatureDeclaration method.
-// Go: proto.go:910 SignatureToSignatureDeclarationParams
+// Go: proto.go:1720 SignatureToSignatureDeclarationParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SignatureToSignatureDeclarationParams {
     pub snapshot: SnapshotID,
@@ -4449,7 +4449,7 @@ proto_json!(both SignatureToSignatureDeclarationParams {
 });
 
 // PrintNodeParams are the parameters for the printNode method.
-// Go: proto.go:920 PrintNodeParams
+// Go: proto.go:1730 PrintNodeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PrintNodeParams {
     pub data: String, // base64-encoded binary AST data
@@ -4465,7 +4465,7 @@ proto_json!(both PrintNodeParams {
     terminate_unterminated_literals: "terminateUnterminatedLiterals" omitempty,
 });
 
-// Go: proto.go:1286 EmitParams (tsgo#4699)
+// Go: proto.go:1737 EmitParams (tsgo#4699)
 // PORT: Go `*uint32` is `Option<u32>`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EmitParams {
@@ -4480,7 +4480,7 @@ proto_json!(both EmitParams {
     emit_only: "emitOnly" omitempty,
 });
 
-// Go: proto.go:1292 SelectedFilesEmitParams (tsgo#4699)
+// Go: proto.go:1743 SelectedFilesEmitParams (tsgo#4699)
 // PORT: Go tells a nil `Files` (absent or `null`) from an empty one, so it
 // is `Option<Vec>`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -4496,7 +4496,7 @@ proto_json!(both SelectedFilesEmitParams {
     files: "files" plain,
 });
 
-// Go: proto.go:1298 EmitResponse (tsgo#4699)
+// Go: proto.go:1749 EmitResponse (tsgo#4699)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EmitResponse {
     pub emit_skipped: bool,
@@ -4515,7 +4515,7 @@ proto_json!(marshal EmitResponse {
     emitted_files_contents: "emittedFilesContents" plain,
 });
 
-// Go: proto.go:1304 EmitOutputFile (tsgo#4699)
+// Go: proto.go:1758 EmitOutputFile (tsgo#4699)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EmitOutputFile {
     pub file_name: String,
@@ -4529,7 +4529,7 @@ proto_json!(marshal EmitOutputFile {
     source_file_name: "sourceFileName" omitempty,
 });
 
-// Go: proto.go:1310 EmitOutputResponse (tsgo#4699)
+// Go: proto.go:1764 EmitOutputResponse (tsgo#4699)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EmitOutputResponse {
     pub emit_skipped: bool,
@@ -4544,7 +4544,7 @@ proto_json!(marshal EmitOutputResponse {
 });
 
 // FormatNodeForInsertionParams are the parameters for the formatNodeForInsertion method.
-// Go: proto.go:1317 FormatNodeForInsertionParams
+// Go: proto.go:1771 FormatNodeForInsertionParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FormatNodeForInsertionParams {
     pub snapshot: SnapshotID,
@@ -4563,7 +4563,7 @@ proto_json!(both FormatNodeForInsertionParams {
 });
 
 // CheckerTypeParams are parameters for checker methods that operate on a type.
-// Go: proto.go:928 CheckerTypeParams
+// Go: proto.go:1780 CheckerTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CheckerTypeParams {
     pub snapshot: SnapshotID,
@@ -4626,7 +4626,7 @@ proto_json!(both CheckerNodeParams {
 });
 
 // GetMemberInModuleExportsParams are parameters for getMemberInModuleExports.
-// Go: proto.go:1049 GetMemberInModuleExportsParams
+// Go: proto.go:1802 GetMemberInModuleExportsParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetMemberInModuleExportsParams {
     pub snapshot: SnapshotID,
@@ -4643,7 +4643,7 @@ proto_json!(both GetMemberInModuleExportsParams {
 });
 
 // CheckerSymbolParams are parameters for checker methods that operate on a symbol.
-// Go: proto.go:1064 CheckerSymbolParams
+// Go: proto.go:1817 CheckerSymbolParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CheckerSymbolParams {
     pub snapshot: SnapshotID,
@@ -4672,7 +4672,7 @@ proto_json!(marshal JSDocTagInfo {
 });
 
 // CheckerSignatureParams are parameters for checker methods that operate on a signature.
-// Go: proto.go:935 CheckerSignatureParams
+// Go: proto.go:1831 CheckerSignatureParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CheckerSignatureParams {
     pub snapshot: SnapshotID,
@@ -4687,7 +4687,7 @@ proto_json!(both CheckerSignatureParams {
 });
 
 // TypePredicateResponse is the response for getTypePredicateOfSignature.
-// Go: proto.go:942 TypePredicateResponse
+// Go: proto.go:1838 TypePredicateResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TypePredicateResponse {
     pub kind: i32,
@@ -4704,7 +4704,7 @@ proto_json!(marshal TypePredicateResponse {
 });
 
 // IndexInfoResponse represents a single index signature.
-// Go: proto.go:950 IndexInfoResponse
+// Go: proto.go:1846 IndexInfoResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IndexInfoResponse {
     pub key_type: TypeResponse,
@@ -4722,7 +4722,7 @@ proto_json!(marshal IndexInfoResponse {
 
 // SourceFileResponse contains the binary-encoded AST data for a source file.
 // The Data field is base64-encoded binary data in the encoder's format.
-// Go: proto.go:959 SourceFileResponse
+// Go: proto.go:1855 SourceFileResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SourceFileResponse {
     // Data is the base64-encoded binary AST data in the encoder's format.
@@ -4734,7 +4734,7 @@ proto_json!(marshal SourceFileResponse {
 });
 
 // GetDiagnosticsParams are parameters for per-file diagnostic methods.
-// Go: proto.go:964 GetDiagnosticsParams
+// Go: proto.go:1861 GetDiagnosticsParams
 #[derive(Clone, Debug, Default, PartialEq)]
 // PORT: Go `Files []DocumentIdentifier` is `Option`: `None` is a nil slice
 // (no `files`, or `null`) and `Some(vec![])` is `[]`. `getDiagnostics`
@@ -4752,7 +4752,7 @@ proto_json!(both GetDiagnosticsParams {
 });
 
 // GetProjectDiagnosticsParams are parameters for project-wide diagnostic methods.
-// Go: proto.go:971 GetProjectDiagnosticsParams
+// Go: proto.go:1868 GetProjectDiagnosticsParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetProjectDiagnosticsParams {
     pub snapshot: SnapshotID,
@@ -4765,7 +4765,7 @@ proto_json!(both GetProjectDiagnosticsParams {
 });
 
 // DiagnosticResponse is the API response for a single diagnostic.
-// Go: proto.go:977 DiagnosticResponse
+// Go: proto.go:1874 DiagnosticResponse
 // PORT: `Default` is written below; `diagnostics.Category` has none in the
 // port.
 #[derive(Clone, Debug, PartialEq)]
@@ -4996,7 +4996,7 @@ fn diagnostic_source_lines(
     result
 }
 
-// Go: proto.go:1001 NewDiagnosticResponse
+// Go: proto.go:1944 NewDiagnosticResponse
 // NewDiagnosticResponse converts an ast.Diagnostic to a DiagnosticResponse.
 pub fn new_diagnostic_response(d: &Diagnostic) -> DiagnosticResponse {
     new_diagnostic_response_wrapped(diagnosticwriter::wrap_ast_diagnostic(d))
@@ -5079,7 +5079,7 @@ fn new_diagnostic_response_wrapped(d: diagnosticwriter::AstDiagnostic<'_>) -> Di
     resp
 }
 
-// Go: proto.go:1042 NewDiagnosticResponses
+// Go: proto.go:2015 NewDiagnosticResponses
 // NewDiagnosticResponses converts a slice of ast.Diagnostics to DiagnosticResponses.
 pub fn new_diagnostic_responses(diags: &[Diagnostic]) -> Vec<DiagnosticResponse> {
     if diags.is_empty() {
@@ -5092,7 +5092,7 @@ pub fn new_diagnostic_responses(diags: &[Diagnostic]) -> Vec<DiagnosticResponse>
     result
 }
 
-// Go: proto.go:1053 unmarshalPayload
+// Go: proto.go:2026 unmarshalPayload
 pub fn unmarshal_payload(
     method: &str,
     payload: impl AsRef<[u8]>,
@@ -5106,7 +5106,7 @@ pub fn unmarshal_payload(
     unmarshaler(payload.as_ref())
 }
 
-// Go: proto.go:1061 unmarshallerFor
+// Go: proto.go:2034 unmarshallerFor
 // `unmarshal_root` is Go `json.Unmarshal` with the v2 error text.
 pub fn unmarshaller_for<T: UnmarshalerFrom + Default + AnyValue>(
     data: &[u8],
@@ -5126,7 +5126,7 @@ pub fn unmarshaller_for<T: UnmarshalerFrom + Default + AnyValue>(
     Ok(Some(Box::new(v)))
 }
 
-// Go: proto.go:1069 noParams
+// Go: proto.go:2042 noParams
 pub fn no_params(data: &[u8]) -> Result<Option<Box<dyn AnyValue>>, GoError> {
     let _ = data;
     Ok(None)

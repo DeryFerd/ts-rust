@@ -108,7 +108,7 @@ pub fn is_identifier_reference(name: Node, parent: Node) -> bool {
     }
 }
 
-// Go: transformers/utilities.go:113 convertBindingElementToArrayAssignmentElement
+// Go: transformers/utilities.go:112 convertBindingElementToArrayAssignmentElement
 fn convert_binding_element_to_array_assignment_element(
     emit_context: &EmitContext,
     element: Node,
@@ -183,7 +183,7 @@ fn convert_binding_element_to_object_assignment_element(
     assignment
 }
 
-// Go: transformers/utilities.go:171 ConvertBindingPatternToAssignmentPattern
+// Go: transformers/utilities.go:169 ConvertBindingPatternToAssignmentPattern
 pub fn convert_binding_pattern_to_assignment_pattern(
     emit_context: &EmitContext,
     element: Node,
@@ -199,7 +199,7 @@ pub fn convert_binding_pattern_to_assignment_pattern(
     }
 }
 
-// Go: transformers/utilities.go:182 convertBindingElementToObjectAssignmentPattern
+// Go: transformers/utilities.go:180 convertBindingElementToObjectAssignmentPattern
 fn convert_binding_element_to_object_assignment_pattern(
     emit_context: &EmitContext,
     element: Node,
@@ -217,7 +217,7 @@ fn convert_binding_element_to_object_assignment_pattern(
     object
 }
 
-// Go: transformers/utilities.go:195 convertBindingElementToArrayAssignmentPattern
+// Go: transformers/utilities.go:193 convertBindingElementToArrayAssignmentPattern
 fn convert_binding_element_to_array_assignment_pattern(
     emit_context: &EmitContext,
     element: Node,
@@ -235,7 +235,7 @@ fn convert_binding_element_to_array_assignment_pattern(
     object
 }
 
-// Go: transformers/utilities.go:208 convertBindingNameToAssignmentElementTarget
+// Go: transformers/utilities.go:206 convertBindingNameToAssignmentElementTarget
 fn convert_binding_name_to_assignment_element_target(
     emit_context: &EmitContext,
     element: Node,
@@ -246,7 +246,7 @@ fn convert_binding_name_to_assignment_element_target(
     element
 }
 
-// Go: transformers/utilities.go:215 ConvertVariableDeclarationToAssignmentExpression
+// Go: transformers/utilities.go:213 ConvertVariableDeclarationToAssignmentExpression
 pub fn convert_variable_declaration_to_assignment_expression(
     emit_context: &EmitContext,
     element: Node,
@@ -264,7 +264,7 @@ pub fn convert_variable_declaration_to_assignment_expression(
     assignment
 }
 
-// Go: transformers/utilities.go:226 SingleOrMany
+// Go: transformers/utilities.go:224 SingleOrMany
 // PORT: Go distinguishes a nil slice (result nil) from an empty one (an
 // empty SyntaxList). `None` is the nil slice.
 pub fn single_or_many(nodes: Option<&[Node]>, factory: &NodeFactory) -> Node {
@@ -277,7 +277,7 @@ pub fn single_or_many(nodes: Option<&[Node]>, factory: &NodeFactory) -> Node {
     factory.new_syntax_list(nodes)
 }
 
-// Go: transformers/utilities.go:243 IsSimpleCopiableExpression
+// Go: transformers/utilities.go:241 IsSimpleCopiableExpression
 // Used in the module transformer to check if an expression is reasonably without sideeffect,
 //
 //	and thus better to copy into multiple places rather than to cache in a temporary variable
@@ -292,7 +292,7 @@ pub fn is_simple_copiable_expression(expression: Node) -> bool {
         || is_identifier(expression)
 }
 
-// Go: transformers/utilities.go:250 IsOriginalNodeSingleLine
+// Go: transformers/utilities.go:248 IsOriginalNodeSingleLine
 pub fn is_original_node_single_line(emit_context: &EmitContext, node: Node) -> bool {
     if node.is_nil() {
         return false;
@@ -310,7 +310,7 @@ pub fn is_original_node_single_line(emit_context: &EmitContext, node: Node) -> b
     start_line == end_line
 }
 
-// Go: transformers/utilities.go:271 IsSimpleInlineableExpression
+// Go: transformers/utilities.go:270 IsSimpleInlineableExpression
 /// A simple inlinable expression is an expression which can be copied into multiple locations
 /// without risk of repeating any sideeffects and whose value could not possibly change between
 /// any such locations
@@ -318,7 +318,7 @@ pub fn is_simple_inlineable_expression(expression: Node) -> bool {
     !is_identifier(expression) && is_simple_copiable_expression(expression)
 }
 
-// Go: transformers/utilities.go:276 FindSuperStatementIndexPath
+// Go: transformers/utilities.go:275 FindSuperStatementIndexPath
 // FindSuperStatementIndexPath finds a path of indices to a statement containing a `super()` call.
 // PORT: Go returns a nil slice when there is no `super()` call; that is an
 // empty `Vec` here (Go callers only check `len`).
@@ -329,7 +329,7 @@ pub fn find_super_statement_index_path(statements: &[Node], start: usize) -> Vec
     indices
 }
 
-// Go: transformers/utilities.go:282 findSuperStatementIndexPathWorker
+// Go: transformers/utilities.go:281 findSuperStatementIndexPathWorker
 fn find_super_statement_index_path_worker(
     statements: &[Node],
     start: usize,
@@ -353,7 +353,7 @@ fn find_super_statement_index_path_worker(
     None
 }
 
-// Go: transformers/utilities.go:297 GetSuperCallFromStatement
+// Go: transformers/utilities.go:296 GetSuperCallFromStatement
 // GetSuperCallFromStatement extracts the super() call expression from an expression statement, if any.
 pub fn get_super_call_from_statement(statement: Node) -> Node {
     if !is_expression_statement(statement) {
@@ -366,7 +366,7 @@ pub fn get_super_call_from_statement(statement: Node) -> Node {
     Node::NIL
 }
 
-// Go: transformers/utilities.go:309 MoveRangePastModifiers
+// Go: transformers/utilities.go:308 MoveRangePastModifiers
 // MoveRangePastModifiers returns a text range that starts past any modifiers on the node.
 pub fn move_range_past_modifiers(node: Node) -> TextRange {
     if is_property_declaration(node) || is_method_declaration(node) {
@@ -384,7 +384,7 @@ pub fn move_range_past_modifiers(node: Node) -> TextRange {
     move_range_past_decorators(node)
 }
 
-// Go: transformers/utilities.go:326 MoveRangePastDecorators
+// Go: transformers/utilities.go:325 MoveRangePastDecorators
 // MoveRangePastDecorators returns a text range that starts past any decorators on the node.
 pub fn move_range_past_decorators(node: Node) -> TextRange {
     let mut last_decorator = Node::NIL;
@@ -403,7 +403,7 @@ pub fn move_range_past_decorators(node: Node) -> TextRange {
     node.loc()
 }
 
-// Go: transformers/utilities.go:342 GetNonAssignmentOperatorForCompoundAssignment
+// Go: transformers/utilities.go:341 GetNonAssignmentOperatorForCompoundAssignment
 // GetNonAssignmentOperatorForCompoundAssignment returns the non-assignment operator for a compound assignment.
 pub fn get_non_assignment_operator_for_compound_assignment(kind: SyntaxKind) -> SyntaxKind {
     match kind {

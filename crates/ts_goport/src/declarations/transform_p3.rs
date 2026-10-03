@@ -63,7 +63,7 @@ fn emit_tracker(tx: &DeclarationTransformer) -> EmitSymbolTracker {
 }
 
 impl DeclarationTransformer {
-    // Go: transformers/declarations/transform.go:1487 DeclarationTransformer.wrapInCJSExportNamespace
+    // Go: transformers/declarations/transform.go:1536 DeclarationTransformer.wrapInCJSExportNamespace
     pub(crate) fn wrap_in_cjs_export_namespace(&mut self, content: Node) -> Node {
         if self.cjs_export_assignment_name.is_nil() {
             return content;
@@ -94,7 +94,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:1524 DeclarationTransformer.transformClassExpressionToDeclaration
+    // Go: transformers/declarations/transform.go:1574 DeclarationTransformer.transformClassExpressionToDeclaration
     // transformClassExpressionToDeclaration converts a class expression into a class declaration
     // for use in CJS export declarations (e.g., exports.K = class K {} or module.exports = class Thing {}).
     // This delegates to the shared buildClassMembers helper to stay in sync with transformClassDeclaration.
@@ -131,7 +131,7 @@ impl DeclarationTransformer {
         result
     }
 
-    // Go: transformers/declarations/transform.go:1551 DeclarationTransformer.rewriteModuleSpecifier
+    // Go: transformers/declarations/transform.go:1601 DeclarationTransformer.rewriteModuleSpecifier
     pub(crate) fn rewrite_module_specifier(&mut self, parent: Node, input: Node) -> Node {
         if input.is_nil() {
             return Node::NIL;
@@ -142,13 +142,13 @@ impl DeclarationTransformer {
         input
     }
 
-    // Go: transformers/declarations/transform.go:1570 DeclarationTransformer.preserveJsDoc
+    // Go: transformers/declarations/transform.go:1609 DeclarationTransformer.preserveJsDoc
     pub(crate) fn preserve_js_doc(&mut self, updated: Node, original: Node) {
         // Copy comment range from original to updated node so JSDoc comments are preserved
         self.emit_context.assign_comment_range(updated, original);
     }
 
-    // Go: transformers/declarations/transform.go:1575 DeclarationTransformer.preservePartialJsDoc
+    // Go: transformers/declarations/transform.go:1614 DeclarationTransformer.preservePartialJsDoc
     pub(crate) fn preserve_partial_js_doc(&mut self, updated: Node, original: Node) {
         if !original.flags().intersects(NodeFlags::REPARSED) {
             return;
@@ -173,7 +173,7 @@ impl DeclarationTransformer {
         );
     }
 
-    // Go: transformers/declarations/transform.go:1591 DeclarationTransformer.removeAllComments
+    // Go: transformers/declarations/transform.go:1630 DeclarationTransformer.removeAllComments
     pub(crate) fn remove_all_comments(&mut self, node: Node) {
         self.emit_context
             .add_emit_flags(node, EmitFlags::NO_COMMENTS);
@@ -182,7 +182,7 @@ impl DeclarationTransformer {
         // emitNode.trailingComments = undefined;
     }
 
-    // Go: transformers/declarations/transform.go:1598 DeclarationTransformer.ensureType
+    // Go: transformers/declarations/transform.go:1637 DeclarationTransformer.ensureType
     pub(crate) fn ensure_type(&mut self, node: Node, ignore_private: bool) -> Node {
         let ec = self.emit_context.clone();
         if !ignore_private
@@ -289,7 +289,7 @@ impl DeclarationTransformer {
         type_node
     }
 
-    // Go: transformers/declarations/transform.go:1662 DeclarationTransformer.shouldPrintWithInitializer
+    // Go: transformers/declarations/transform.go:1701 DeclarationTransformer.shouldPrintWithInitializer
     pub(crate) fn should_print_with_initializer(&mut self, node: Node) -> bool {
         can_have_literal_initializer(&*self.host, node)
             && node.initializer().is_some()
@@ -298,7 +298,7 @@ impl DeclarationTransformer {
                 .is_literal_const_declaration(self.emit_context.most_original(node))
     }
 
-    // Go: transformers/declarations/transform.go:1666 DeclarationTransformer.checkEntityNameVisibility
+    // Go: transformers/declarations/transform.go:1705 DeclarationTransformer.checkEntityNameVisibility
     pub(crate) fn check_entity_name_visibility(
         &mut self,
         entity_name: Node,
@@ -311,7 +311,7 @@ impl DeclarationTransformer {
             .handle_symbol_accessibility_error(visibility_result);
     }
 
-    // Go: transformers/declarations/transform.go:1672 DeclarationTransformer.transformTopLevelDeclaration
+    // Go: transformers/declarations/transform.go:1711 DeclarationTransformer.transformTopLevelDeclaration
     // Transforms the direct child of a source file into zero or more replacement statements
     pub(crate) fn transform_top_level_declaration(&mut self, input: Node) -> Node {
         {
@@ -406,7 +406,7 @@ impl DeclarationTransformer {
         result
     }
 
-    // Go: transformers/declarations/transform.go:1750 DeclarationTransformer.transformTypeAliasDeclaration
+    // Go: transformers/declarations/transform.go:1791 DeclarationTransformer.transformTypeAliasDeclaration
     pub(crate) fn transform_type_alias_declaration(&mut self, input: Node) -> Node {
         self.needs_declare = false;
         let modifiers = self.ensure_modifiers(input);
@@ -423,7 +423,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:1761 DeclarationTransformer.transformInterfaceDeclaration
+    // Go: transformers/declarations/transform.go:1802 DeclarationTransformer.transformInterfaceDeclaration
     pub(crate) fn transform_interface_declaration(&mut self, input: Node) -> Node {
         let modifiers = self.ensure_modifiers(input);
         let name = input.name();
@@ -441,7 +441,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:1772 DeclarationTransformer.transformFunctionDeclaration
+    // Go: transformers/declarations/transform.go:1813 DeclarationTransformer.transformFunctionDeclaration
     pub(crate) fn transform_function_declaration(&mut self, input: Node) -> Node {
         if self.resolver.is_expando_function_declaration(input) {
             // PORT: Go `p.ValueDeclaration` goes through the resolver, which
@@ -478,7 +478,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:1789 DeclarationTransformer.transformModuleDeclaration
+    // Go: transformers/declarations/transform.go:1830 DeclarationTransformer.transformModuleDeclaration
     pub(crate) fn transform_module_declaration(&mut self, input: Node) -> Node {
         // !!! TODO: module declarations are now parsed into nested module objects with export modifiers
         // It'd be good to collapse those back in the declaration output, but the AST can't represent the
@@ -579,7 +579,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:1862 DeclarationTransformer.stripExportModifiers
+    // Go: transformers/declarations/transform.go:1907 DeclarationTransformer.stripExportModifiers
     pub(crate) fn strip_export_modifiers(&mut self, statement: Node) -> Node {
         if statement.is_nil() {
             return Node::NIL;
@@ -614,7 +614,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:1885 DeclarationTransformer.buildClassMembers
+    // Go: transformers/declarations/transform.go:1930 DeclarationTransformer.buildClassMembers
     // buildClassMembers builds the member list for a class-like node (ClassDeclaration or ClassExpression).
     // It handles parameter properties, private identifiers, late-bound index signatures, and visited members.
     // Extra members (e.g., this-property assignments from JS files) can be passed via extraMembers.
@@ -704,7 +704,7 @@ impl DeclarationTransformer {
         ec.factory().new_node_list(&member_nodes)
     }
 
-    // Go: transformers/declarations/transform.go:1945 DeclarationTransformer.transformClassDeclaration
+    // Go: transformers/declarations/transform.go:1990 DeclarationTransformer.transformClassDeclaration
     pub(crate) fn transform_class_declaration(&mut self, input: Node) -> Node {
         let previous_enclosing_declaration = self.enclosing_declaration;
         self.enclosing_declaration = input;
@@ -827,7 +827,7 @@ impl DeclarationTransformer {
         result
     }
 
-    // Go: transformers/declarations/transform.go:2038 DeclarationTransformer.visitThisPropertyAssignments
+    // Go: transformers/declarations/transform.go:2084 DeclarationTransformer.visitThisPropertyAssignments
     pub(crate) fn visit_this_property_assignments(&mut self, node: Node) -> Node {
         let mut is_static = false;
         let this_container = get_this_container(node, false, false);
@@ -915,7 +915,7 @@ impl DeclarationTransformer {
         )
     }
 
-    // Go: transformers/declarations/transform.go:2130 DeclarationTransformer.collectThisPropertyAssignments
+    // Go: transformers/declarations/transform.go:2171 DeclarationTransformer.collectThisPropertyAssignments
     // collectThisPropertyAssignments finds `this.x = expr` assignments in constructors, methods, and static blocks
     // of JS classes and synthesizes PropertyDeclaration nodes for each unique property name.
     pub(crate) fn collect_this_property_assignments(&mut self, class_node: Node) -> Vec<Node> {
@@ -950,7 +950,7 @@ impl DeclarationTransformer {
     }
 }
 
-// Go: transformers/declarations/transform.go:1507 isCommonJSAliasExport
+// Go: transformers/declarations/transform.go:1562 isCommonJSAliasExport
 pub(crate) fn is_common_js_alias_export(node: Node) -> bool {
     if is_binary_expression(node) && is_identifier(node.right()) {
         let symbol = node.symbol();
@@ -962,7 +962,7 @@ pub(crate) fn is_common_js_alias_export(node: Node) -> bool {
     false
 }
 
-// Go: transformers/declarations/transform.go:2110 isClassExtendingNull
+// Go: transformers/declarations/transform.go:2153 isClassExtendingNull
 pub(crate) fn is_class_extending_null(node: Node) -> bool {
     if node.is_nil() {
         return false;

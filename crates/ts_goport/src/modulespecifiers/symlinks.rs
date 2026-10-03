@@ -33,7 +33,7 @@ pub struct KnownSymlinks {
 // derives them.
 
 impl KnownSymlinks {
-    // Go: symlinks/knownsymlinks.go:76 NewKnownSymlink
+    // Go: symlinks/knownsymlinks.go:74 NewKnownSymlink
     pub fn new(current_directory: &str, use_case_sensitive_file_names: bool) -> KnownSymlinks {
         KnownSymlinks {
             cwd: current_directory.to_string(),
@@ -102,7 +102,7 @@ impl KnownSymlinks {
         self.files.insert(symlink_path, realpath.to_string());
     }
 
-    // Go: symlinks/knownsymlinks.go:97 ProcessResolution
+    // Go: symlinks/knownsymlinks.go:93 ProcessResolution
     pub fn process_resolution(&mut self, original_path: &str, resolved_file_name: &str) {
         if original_path.is_empty() || resolved_file_name.is_empty() {
             return;
@@ -132,7 +132,7 @@ impl KnownSymlinks {
         }
     }
 
-    // Go: symlinks/knownsymlinks.go:119 guessDirectorySymlink
+    // Go: symlinks/knownsymlinks.go:114 guessDirectorySymlink
     fn guess_directory_symlink(&self, a: &str, b: &str, cwd: &str) -> (String, String) {
         let mut a_parts =
             tspath::get_path_components(&tspath::get_normalized_absolute_path(a, cwd), "");
@@ -164,7 +164,7 @@ impl KnownSymlinks {
         (String::new(), String::new())
     }
 
-    // Go: symlinks/knownsymlinks.go:137 isNodeModulesOrScopedPackageDirectory
+    // Go: symlinks/knownsymlinks.go:132 isNodeModulesOrScopedPackageDirectory
     fn is_node_modules_or_scoped_package_directory(&self, s: &str) -> bool {
         !s.is_empty()
             && (tspath::get_canonical_file_name(s, self.use_case_sensitive_file_names)

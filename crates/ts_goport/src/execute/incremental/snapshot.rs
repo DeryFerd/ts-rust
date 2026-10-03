@@ -88,7 +88,7 @@ pub fn port_text_range(file: Node, pos: i32, end: i32) -> TextRange {
     TextRange::new(port_byte_offset(&text, pos), port_byte_offset(&text, end))
 }
 
-// Go: incremental/snapshot.go:151 DiagnosticsOrBuildInfoDiagnosticsWithFileName
+// Go: incremental/snapshot.go:153 DiagnosticsOrBuildInfoDiagnosticsWithFileName
 // PORT: Go nil `diagnostics` is `None`; it marks "not converted yet".
 // PORT: testing. Go maps hold pointers to these, and the Go test harness
 // compares the old and new program's pointers (tsctests/sys.go OnProgram).
@@ -121,7 +121,7 @@ pub fn new_diagnostics_id() -> u64 {
 }
 
 impl BuildInfoDiagnosticWithFileName {
-    // Go: incremental/snapshot.go:156 toDiagnostic
+    // Go: incremental/snapshot.go:158 toDiagnostic
     #[must_use]
     pub fn to_diagnostic(&self, file: Node) -> Diagnostic {
         let mut file_for_diagnostic = Node::NIL;

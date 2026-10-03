@@ -177,7 +177,7 @@ fn normalize_walk_dir_error(err: Result<(), FsError>) -> Result<(), FsError> {
 // (`DirEntryInfo::NotExist`). See `walk_dir` for when `Stat` runs.
 fn new_walk_dir_entry(file_system: &dyn Fs, path: &str, name: &str, mode: FileMode) -> DirEntry {
     let info = if mode.intersects(FileMode::SYMLINK) {
-        // Go: vfs/walkdir.go:178 walkDirFileInfo
+        // Go: vfs/walkdir.go:174 walkDirFileInfo
         DirEntryInfo::Known(FileInfo {
             name: name.to_string(),
             size: 0,

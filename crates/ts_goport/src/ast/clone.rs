@@ -9,7 +9,7 @@
 use crate::astdata::NodeData as D;
 use crate::prelude::*;
 
-// Go: ast/ast.go:112 cloneNode
+// Go: ast/ast.go:114 cloneNode
 // PORT: Go name `cloneNode` is `clone_node_from`, because
 // `NodeFactory::clone_node` is Go `Node.Clone`.
 fn clone_node_from(updated: Node, original: Node, hooks: &NodeFactoryHooks) -> Node {

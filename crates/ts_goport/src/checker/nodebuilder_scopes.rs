@@ -234,7 +234,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/nodebuilderscopes.go:186 bindPatternWorker (closure in enterNewScope)
+    // Go: checker/nodebuilderscopes.go:184 bindPatternWorker (closure in enterNewScope)
     // PORT: the Go closure returns after the first element it handles, and so
     // does this method.
     fn enter_new_scope_bind_pattern(&mut self, p: Node, adds: &mut Vec<(String, SymbolId)>) {
@@ -247,7 +247,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/nodebuilderscopes.go:200 bindElementWorker (closure in enterNewScope)
+    // Go: checker/nodebuilderscopes.go:198 bindElementWorker (closure in enterNewScope)
     fn enter_new_scope_bind_element(&mut self, e: Node, adds: &mut Vec<(String, SymbolId)>) {
         if e.name().is_some() && is_binding_pattern(e.name()) {
             self.enter_new_scope_bind_pattern(e.name(), adds);

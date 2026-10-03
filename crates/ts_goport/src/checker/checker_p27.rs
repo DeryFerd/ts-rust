@@ -9,13 +9,13 @@ use crate::prelude::*;
 use smallvec::SmallVec;
 
 impl Checker {
-    // Go: checker/checker.go:24046 isVariadicTupleElement
+    // Go: checker/checker.go:24609 isVariadicTupleElement
     pub fn is_variadic_tuple_element(&mut self, node: Node) -> bool {
         self.get_tuple_element_flags(node)
             .intersects(ElementFlags::VARIADIC)
     }
 
-    // Go: checker/checker.go:24050 getArrayOrTupleTargetType
+    // Go: checker/checker.go:24613 getArrayOrTupleTargetType
     pub fn get_array_or_tuple_target_type(&mut self, node: Node) -> TypeId {
         let readonly = self.is_readonly_type_operator(node.parent());
         let element_type = self.get_array_element_type_node(node);
@@ -33,12 +33,12 @@ impl Checker {
         self.get_tuple_target_type(&element_infos, readonly)
     }
 
-    // Go: checker/checker.go:24062 isReadonlyTypeOperator
+    // Go: checker/checker.go:24625 isReadonlyTypeOperator
     pub fn is_readonly_type_operator(&self, node: Node) -> bool {
         is_type_operator_node(node) && node.operator() == SyntaxKind::ReadonlyKeyword
     }
 
-    // Go: checker/checker.go:24066 getTypeFromNamedTupleTypeNode
+    // Go: checker/checker.go:24629 getTypeFromNamedTupleTypeNode
     pub fn get_type_from_named_tuple_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let resolved = if node.dot_dot_dot_token().is_some() {
@@ -56,7 +56,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:24078 getTypeFromRestTypeNode
+    // Go: checker/checker.go:24641 getTypeFromRestTypeNode
     pub fn get_type_from_rest_type_node(&mut self, node: Node) -> TypeId {
         let mut type_node = node.type_();
         let element_type_node = self.get_array_element_type_node(type_node);
@@ -66,7 +66,7 @@ impl Checker {
         self.get_type_from_type_node(type_node)
     }
 
-    // Go: checker/checker.go:24087 getArrayElementTypeNode
+    // Go: checker/checker.go:24650 getArrayElementTypeNode
     pub fn get_array_element_type_node(&self, node: Node) -> Node {
         match node.kind() {
             SyntaxKind::ParenthesizedType => {
@@ -93,13 +93,13 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:24107 getTypeFromOptionalTypeNode
+    // Go: checker/checker.go:24670 getTypeFromOptionalTypeNode
     pub fn get_type_from_optional_type_node(&mut self, node: Node) -> TypeId {
         let t = self.get_type_from_type_node(node.type_());
         self.add_optionality_ex(t, true /*isProperty*/, true /*isOptional*/)
     }
 
-    // Go: checker/checker.go:24111 getTypeFromUnionTypeNode
+    // Go: checker/checker.go:24674 getTypeFromUnionTypeNode
     pub fn get_type_from_union_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let alias = self.get_alias_for_type_node(node);
@@ -119,7 +119,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:24120 getTypeFromIntersectionTypeNode
+    // Go: checker/checker.go:24683 getTypeFromIntersectionTypeNode
     pub fn get_type_from_intersection_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let alias = self.get_alias_for_type_node(node);
@@ -155,7 +155,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:24141 getTypeFromTemplateTypeNode
+    // Go: checker/checker.go:24704 getTypeFromTemplateTypeNode
     pub fn get_type_from_template_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let spans = node.template_spans().nodes().to_vec();
@@ -172,7 +172,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:24157 getTypeFromMappedTypeNode
+    // Go: checker/checker.go:24720 getTypeFromMappedTypeNode
     pub fn get_type_from_mapped_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let t = self.new_object_type(ObjectFlags::MAPPED, node.symbol());
@@ -187,7 +187,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:24171 getTypeFromConditionalTypeNode
+    // Go: checker/checker.go:24734 getTypeFromConditionalTypeNode
     pub fn get_type_from_conditional_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let check_type = self.get_type_from_type_node(node.check_type());
@@ -246,7 +246,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:24202 getConditionalType
+    // Go: checker/checker.go:24765 getConditionalType
     pub fn get_conditional_type(
         &mut self,
         root: Rc<RefCell<ConditionalRoot>>,
@@ -499,7 +499,7 @@ impl Checker {
     // type. Note that recursion is possible only through aliased conditional types, so we only increment the tail
     // recursion counter for those.
     // PORT: Go returns `(nil, nil)` for no root; here `(None, MapperId::NIL)`.
-    // Go: checker/checker.go:24352 getTailRecursionRoot
+    // Go: checker/checker.go:24915 getTailRecursionRoot
     pub fn get_tail_recursion_root(
         &mut self,
         new_type: TypeId,
@@ -545,7 +545,7 @@ impl Checker {
         (None, MapperId::NIL)
     }
 
-    // Go: checker/checker.go:24371 isSimpleTupleType
+    // Go: checker/checker.go:24934 isSimpleTupleType
     pub fn is_simple_tuple_type(&self, node: Node) -> bool {
         is_tuple_type_node(node)
             && !node.elements().is_empty()
@@ -557,7 +557,7 @@ impl Checker {
             })
     }
 
-    // Go: checker/checker.go:24377 isDeferredType
+    // Go: checker/checker.go:24940 isDeferredType
     pub fn is_deferred_type(&mut self, t: TypeId, check_tuples: bool) -> bool {
         if self.is_generic_type(t) {
             return true;
@@ -573,7 +573,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:24381 getPermissiveInstantiation
+    // Go: checker/checker.go:24944 getPermissiveInstantiation
     pub fn get_permissive_instantiation(&mut self, t: TypeId) -> TypeId {
         if self
             .ty(t)
@@ -596,7 +596,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:24394 getRestrictiveInstantiation
+    // Go: checker/checker.go:24957 getRestrictiveInstantiation
     pub fn get_restrictive_instantiation(&mut self, t: TypeId) -> TypeId {
         if self
             .ty(t)
@@ -632,7 +632,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:24413 getRestrictiveTypeParameter
+    // Go: checker/checker.go:24976 getRestrictiveTypeParameter
     pub fn get_restrictive_type_parameter(&mut self, t: TypeId) -> TypeId {
         let constraint = self.ty(t).as_type_parameter().constraint;
         if constraint.is_nil() && self.get_constraint_declaration(t).is_nil()
@@ -656,7 +656,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:24427 restrictiveMapperWorker
+    // Go: checker/checker.go:24990 restrictiveMapperWorker
     pub fn restrictive_mapper_worker(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER) {
             return self.get_restrictive_type_parameter(t);
@@ -664,7 +664,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:24434 permissiveMapperWorker
+    // Go: checker/checker.go:24997 permissiveMapperWorker
     pub fn permissive_mapper_worker(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER) {
             return self.wildcard_type;
@@ -672,7 +672,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:24441 getTrueTypeFromConditionalType
+    // Go: checker/checker.go:25004 getTrueTypeFromConditionalType
     pub fn get_true_type_from_conditional_type(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).as_conditional_type().resolved_true_type.is_nil() {
             let (true_type_node, mapper) = {
@@ -686,7 +686,7 @@ impl Checker {
         self.ty(t).as_conditional_type().resolved_true_type
     }
 
-    // Go: checker/checker.go:24449 getFalseTypeFromConditionalType
+    // Go: checker/checker.go:25012 getFalseTypeFromConditionalType
     pub fn get_false_type_from_conditional_type(&mut self, t: TypeId) -> TypeId {
         if self
             .ty(t)
@@ -705,7 +705,7 @@ impl Checker {
         self.ty(t).as_conditional_type().resolved_false_type
     }
 
-    // Go: checker/checker.go:24457 getInferredTrueTypeFromConditionalType
+    // Go: checker/checker.go:25020 getInferredTrueTypeFromConditionalType
     pub fn get_inferred_true_type_from_conditional_type(&mut self, t: TypeId) -> TypeId {
         if self
             .ty(t)
@@ -730,7 +730,7 @@ impl Checker {
         self.ty(t).as_conditional_type().resolved_inferred_true_type
     }
 
-    // Go: checker/checker.go:24469 getTypeFromInferTypeNode
+    // Go: checker/checker.go:25032 getTypeFromInferTypeNode
     pub fn get_type_from_infer_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let symbol = self.get_symbol_of_declaration(node.type_parameter());
@@ -740,7 +740,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:24477 getTypeFromImportTypeNode
+    // Go: checker/checker.go:25040 getTypeFromImportTypeNode
     pub fn get_type_from_import_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let n = node;
@@ -874,7 +874,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:24552 getIdentifierChain
+    // Go: checker/checker.go:25115 getIdentifierChain
     pub fn get_identifier_chain(&self, node: Node) -> Vec<Node> {
         if is_identifier(node) {
             return vec![node];
@@ -884,7 +884,7 @@ impl Checker {
         chain
     }
 
-    // Go: checker/checker.go:24559 resolveImportSymbolType
+    // Go: checker/checker.go:25122 resolveImportSymbolType
     pub fn resolve_import_symbol_type(
         &mut self,
         node: Node,
@@ -902,7 +902,7 @@ impl Checker {
         self.get_type_reference_type(node, resolved_symbol)
     }
 
-    // Go: checker/checker.go:24570 createTypeFromGenericGlobalType
+    // Go: checker/checker.go:25133 createTypeFromGenericGlobalType
     pub fn create_type_from_generic_global_type(
         &mut self,
         generic_global_type: TypeId,
@@ -914,7 +914,7 @@ impl Checker {
         self.empty_object_type
     }
 
-    // Go: checker/checker.go:24577 getGlobalStrictFunctionType
+    // Go: checker/checker.go:25140 getGlobalStrictFunctionType
     pub fn get_global_strict_function_type(&mut self, name: &str) -> TypeId {
         if self.strict_bind_call_apply {
             return self.get_global_type(name, 0 /*arity*/, true /*reportErrors*/);
@@ -922,7 +922,7 @@ impl Checker {
         self.global_function_type
     }
 
-    // Go: checker/checker.go:24584 getGlobalImportMetaExpressionType
+    // Go: checker/checker.go:25147 getGlobalImportMetaExpressionType
     pub fn get_global_import_meta_expression_type(&mut self) -> TypeId {
         if self.deferred_global_import_meta_expression_type.is_nil() {
             // Create a synthetic type `ImportMetaExpression { meta: MetaProperty }`
@@ -942,7 +942,7 @@ impl Checker {
         self.deferred_global_import_meta_expression_type
     }
 
-    // Go: checker/checker.go:24599 createIterableType
+    // Go: checker/checker.go:25162 createIterableType
     pub fn create_iterable_type(&mut self, iterated_type: TypeId) -> TypeId {
         let iterable = (self.get_global_iterable_type_checked.clone())(self);
         let void_type = self.void_type;
@@ -953,12 +953,12 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:24603 createArrayType
+    // Go: checker/checker.go:25166 createArrayType
     pub fn create_array_type(&mut self, element_type: TypeId) -> TypeId {
         self.create_array_type_ex(element_type, false /*readonly*/)
     }
 
-    // Go: checker/checker.go:24607 createArrayTypeEx
+    // Go: checker/checker.go:25170 createArrayTypeEx
     pub fn create_array_type_ex(&mut self, element_type: TypeId, readonly: bool) -> TypeId {
         let target = if readonly {
             self.global_readonly_array_type
@@ -968,7 +968,7 @@ impl Checker {
         self.create_type_from_generic_global_type(target, &[element_type])
     }
 
-    // Go: checker/checker.go:24611 getTupleElementFlags
+    // Go: checker/checker.go:25174 getTupleElementFlags
     pub fn get_tuple_element_flags(&self, node: Node) -> ElementFlags {
         match node.kind() {
             SyntaxKind::OptionalType => {
@@ -998,7 +998,7 @@ impl Checker {
         ElementFlags::REQUIRED
     }
 
-    // Go: checker/checker.go:24630 getTupleElementInfo
+    // Go: checker/checker.go:25193 getTupleElementInfo
     pub fn get_tuple_element_info(&self, node: Node) -> TupleElementInfo {
         TupleElementInfo {
             flags: self.get_tuple_element_flags(node),
@@ -1010,7 +1010,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:24637 createTupleType
+    // Go: checker/checker.go:25200 createTupleType
     pub fn create_tuple_type(&mut self, element_types: &[TypeId]) -> TypeId {
         let element_infos: Vec<TupleElementInfo> = element_types
             .iter()
@@ -1022,7 +1022,7 @@ impl Checker {
         self.create_tuple_type_ex(element_types, &element_infos, false /*readonly*/)
     }
 
-    // Go: checker/checker.go:24642 createTupleTypeEx
+    // Go: checker/checker.go:25205 createTupleTypeEx
     pub fn create_tuple_type_ex(
         &mut self,
         element_types: &[TypeId],
@@ -1038,7 +1038,7 @@ impl Checker {
         tuple_target
     }
 
-    // Go: checker/checker.go:24653 getTupleTargetType
+    // Go: checker/checker.go:25216 getTupleTargetType
     pub fn get_tuple_target_type(
         &mut self,
         element_infos: &[TupleElementInfo],
@@ -1067,7 +1067,7 @@ impl Checker {
     //
     // Note that the generic type created by this function has no symbol associated with it. The same
     // is true for each of the synthesized type parameters.
-    // Go: checker/checker.go:24677 createTupleTargetType
+    // Go: checker/checker.go:25240 createTupleTargetType
     pub fn create_tuple_target_type(
         &mut self,
         element_infos: &[TupleElementInfo],
@@ -1165,7 +1165,7 @@ impl Checker {
     }
 
     // PORT: Go returns nil when `index >= length`; here `TypeId::NIL`.
-    // Go: checker/checker.go:24732 getElementTypeOfSliceOfTupleType
+    // Go: checker/checker.go:25295 getElementTypeOfSliceOfTupleType
     pub fn get_element_type_of_slice_of_tuple_type(
         &mut self,
         t: TypeId,
@@ -1203,13 +1203,13 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:24753 getRestTypeOfTupleType
+    // Go: checker/checker.go:25316 getRestTypeOfTupleType
     pub fn get_rest_type_of_tuple_type(&mut self, t: TypeId) -> TypeId {
         let fixed_length = self.target_tuple_type(t).fixed_length;
         self.get_element_type_of_slice_of_tuple_type(t, fixed_length, 0, false, false)
     }
 
-    // Go: checker/checker.go:24757 getTupleElementTypeOutOfStartCount
+    // Go: checker/checker.go:25320 getTupleElementTypeOutOfStartCount
     pub fn get_tuple_element_type_out_of_start_count(
         &mut self,
         t: TypeId,
@@ -1230,24 +1230,24 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:24770 isGenericType
+    // Go: checker/checker.go:25333 isGenericType
     pub fn is_generic_type(&mut self, t: TypeId) -> bool {
         !self.get_generic_object_flags(t).is_empty()
     }
 
-    // Go: checker/checker.go:24774 isGenericObjectType
+    // Go: checker/checker.go:25337 isGenericObjectType
     pub fn is_generic_object_type(&mut self, t: TypeId) -> bool {
         self.get_generic_object_flags(t)
             .intersects(ObjectFlags::IS_GENERIC_OBJECT_TYPE)
     }
 
-    // Go: checker/checker.go:24778 isGenericIndexType
+    // Go: checker/checker.go:25341 isGenericIndexType
     pub fn is_generic_index_type(&mut self, t: TypeId) -> bool {
         self.get_generic_object_flags(t)
             .intersects(ObjectFlags::IS_GENERIC_INDEX_TYPE)
     }
 
-    // Go: checker/checker.go:24782 getGenericObjectFlags
+    // Go: checker/checker.go:25345 getGenericObjectFlags
     pub fn get_generic_object_flags(&mut self, t: TypeId) -> ObjectFlags {
         let mut combined_flags = ObjectFlags::NONE;
         let flags = self.ty(t).flags;
@@ -1289,7 +1289,7 @@ impl Checker {
         combined_flags
     }
 
-    // Go: checker/checker.go:24806 isGenericTupleType
+    // Go: checker/checker.go:25369 isGenericTupleType
     pub fn is_generic_tuple_type(&self, t: TypeId) -> bool {
         self.is_tuple_type(t)
             && self
@@ -1298,7 +1298,7 @@ impl Checker {
                 .intersects(ElementFlags::VARIADIC)
     }
 
-    // Go: checker/checker.go:24810 isGenericMappedType
+    // Go: checker/checker.go:25373 isGenericMappedType
     pub fn is_generic_mapped_type(&mut self, t: TypeId) -> bool {
         if self.ty(t).object_flags.intersects(ObjectFlags::MAPPED) {
             let constraint = self.get_constraint_type_from_mapped_type(t);
@@ -1326,7 +1326,7 @@ impl Checker {
     // type parameters in the union with a special never type that is treated as a literal in `getReducedType`, we can cause
     // the `getReducedType` logic to reduce the resulting type if possible (since only intersections with conflicting
     // literal-typed properties are reducible).
-    // Go: checker/checker.go:24834 isGenericReducibleType
+    // Go: checker/checker.go:25397 isGenericReducibleType
     pub fn is_generic_reducible_type(&mut self, t: TypeId) -> bool {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::UNION)
@@ -1345,7 +1345,7 @@ impl Checker {
         flags.intersects(TypeFlags::INTERSECTION) && self.is_reducible_intersection(t)
     }
 
-    // Go: checker/checker.go:24839 isReducibleIntersection
+    // Go: checker/checker.go:25402 isReducibleIntersection
     pub fn is_reducible_intersection(&mut self, t: TypeId) -> bool {
         if self
             .ty(t)
@@ -1366,7 +1366,7 @@ impl Checker {
         self.get_reduced_type(filled) != filled
     }
 
-    // Go: checker/checker.go:24847 getUniqueLiteralTypeForTypeParameter
+    // Go: checker/checker.go:25410 getUniqueLiteralTypeForTypeParameter
     pub fn get_unique_literal_type_for_type_parameter(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER) {
             return self.unique_literal_type;
@@ -1374,7 +1374,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:24854 getConditionalFlowTypeOfType
+    // Go: checker/checker.go:25417 getConditionalFlowTypeOfType
     pub fn get_conditional_flow_type_of_type(&mut self, t: TypeId, node: Node) -> TypeId {
         if let Some(facts) = frozen_node_store_facts(node) {
             // PERF: hono P7-C7. The loop adds a constraint only under a
@@ -1480,7 +1480,7 @@ impl Checker {
     }
 
     // PORT: Go returns nil for no implied constraint; here `TypeId::NIL`.
-    // Go: checker/checker.go:24891 getImpliedConstraint
+    // Go: checker/checker.go:25454 getImpliedConstraint
     pub fn get_implied_constraint(
         &mut self,
         t: TypeId,
@@ -1502,7 +1502,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:24901 isUnaryTupleTypeNode
+// Go: checker/checker.go:25464 isUnaryTupleTypeNode
 pub fn is_unary_tuple_type_node(node: Node) -> bool {
     is_tuple_type_node(node) && node.elements().len() == 1
 }
@@ -1538,7 +1538,7 @@ impl Checker {
     // PERF: always inlined. A `data` built before the call is still copied
     // into the slot with a 168-byte `memcpy`, so the hot constructors call
     // `new_type_with` and build their data in its closure.
-    // Go: checker/checker.go:24905 newType
+    // Go: checker/checker.go:25468 newType
     #[inline(always)]
     pub fn new_type(
         &mut self,
@@ -1589,12 +1589,12 @@ impl Checker {
         id
     }
 
-    // Go: checker/checker.go:24919 newIntrinsicType
+    // Go: checker/checker.go:25482 newIntrinsicType
     pub fn new_intrinsic_type(&mut self, flags: TypeFlags, intrinsic_name: &str) -> TypeId {
         self.new_intrinsic_type_ex(flags, intrinsic_name, ObjectFlags::NONE)
     }
 
-    // Go: checker/checker.go:24923 newIntrinsicTypeEx
+    // Go: checker/checker.go:25486 newIntrinsicTypeEx
     pub fn new_intrinsic_type_ex(
         &mut self,
         flags: TypeFlags,
@@ -1607,7 +1607,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:24929 createWideningType
+    // Go: checker/checker.go:25492 createWideningType
     pub fn create_widening_type(&mut self, non_widening_type: TypeId) -> TypeId {
         if self.strict_null_checks {
             return non_widening_type;
@@ -1623,7 +1623,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:24938 createUnknownUnionType
+    // Go: checker/checker.go:25501 createUnknownUnionType
     pub fn create_unknown_union_type(&mut self) -> TypeId {
         if self.strict_null_checks {
             let undefined_type = self.undefined_type;
@@ -1634,7 +1634,7 @@ impl Checker {
         self.unknown_type
     }
 
-    // Go: checker/checker.go:24945 newLiteralType
+    // Go: checker/checker.go:25508 newLiteralType
     pub fn new_literal_type(
         &mut self,
         flags: TypeFlags,

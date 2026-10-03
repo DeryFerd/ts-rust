@@ -16,17 +16,17 @@ use crate::prelude::*;
 //
 
 impl Printer {
-    // Go: printer/printer.go:2458 emitKeywordExpression
+    // Go: printer/printer.go:2475 emitKeywordExpression
     pub(crate) fn emit_keyword_expression(&mut self, node: Node) {
         self.emit_keyword_node(node);
     }
 
-    // Go: printer/printer.go:2462 emitArrayLiteralExpressionElement
+    // Go: printer/printer.go:2479 emitArrayLiteralExpressionElement
     pub(crate) fn emit_array_literal_expression_element(&mut self, node: Node) {
         self.emit_expression(node, OperatorPrecedence::SPREAD);
     }
 
-    // Go: printer/printer.go:2466 emitArrayLiteralExpression
+    // Go: printer/printer.go:2483 emitArrayLiteralExpression
     pub(crate) fn emit_array_literal_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_list(
@@ -43,7 +43,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2472 emitObjectLiteralExpression
+    // Go: printer/printer.go:2489 emitObjectLiteralExpression
     pub(crate) fn emit_object_literal_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         let indented = self.should_emit_indented(node);
@@ -74,7 +74,7 @@ impl Printer {
 
     // 1..toString is a valid property access, emit a dot after the literal
     // Also emit a dot if expression is a integer const enum value - it will appear in generated code as numeric literal
-    // Go: printer/printer.go:2488 mayNeedDotDotForPropertyAccess
+    // Go: printer/printer.go:2505 mayNeedDotDotForPropertyAccess
     pub(crate) fn may_need_dot_dot_for_property_access(&mut self, expression: Node) -> bool {
         let expression = skip_partially_emitted_expressions(expression);
         if is_numeric_literal(expression) {
@@ -96,7 +96,7 @@ impl Printer {
         false
     }
 
-    // Go: printer/printer.go:2503 emitPropertyAccessExpression
+    // Go: printer/printer.go:2520 emitPropertyAccessExpression
     pub(crate) fn emit_property_access_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_expression(
@@ -146,7 +146,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2536 emitElementAccessExpression
+    // Go: printer/printer.go:2553 emitElementAccessExpression
     pub(crate) fn emit_element_access_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_expression(
@@ -174,12 +174,12 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2546 emitArgument
+    // Go: printer/printer.go:2563 emitArgument
     pub(crate) fn emit_argument(&mut self, node: Node) {
         self.emit_expression(node, OperatorPrecedence::SPREAD);
     }
 
-    // Go: printer/printer.go:2550 emitCallee
+    // Go: printer/printer.go:2567 emitCallee
     pub(crate) fn emit_callee(&mut self, callee: Node, parent_node: Node) {
         if self.should_emit_indirect_call(parent_node) {
             self.write_punctuation("(");
@@ -205,7 +205,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:2566 emitCallExpression
+    // Go: printer/printer.go:2583 emitCallExpression
     pub(crate) fn emit_call_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_callee(node.expression(), node);
@@ -220,7 +220,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2575 emitNewExpression
+    // Go: printer/printer.go:2592 emitNewExpression
     pub(crate) fn emit_new_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(SyntaxKind::NewKeyword, node.pos(), WriteKind::KEYWORD, node);
@@ -243,7 +243,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2590 emitTemplateLiteral
+    // Go: printer/printer.go:2607 emitTemplateLiteral
     pub(crate) fn emit_template_literal(&mut self, node: Node) {
         match node.kind() {
             SyntaxKind::NoSubstitutionTemplateLiteral => {
@@ -254,7 +254,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:2601 emitTaggedTemplateExpression
+    // Go: printer/printer.go:2618 emitTaggedTemplateExpression
     pub(crate) fn emit_tagged_template_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_callee(node.tag(), node);
@@ -264,7 +264,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2610 emitTypeAssertionExpression
+    // Go: printer/printer.go:2627 emitTypeAssertionExpression
     pub(crate) fn emit_type_assertion_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.write_punctuation("<");
@@ -274,7 +274,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2619 emitParenthesizedExpression
+    // Go: printer/printer.go:2636 emitParenthesizedExpression
     pub(crate) fn emit_parenthesized_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         let open_paren_pos = self.emit_token(
@@ -300,7 +300,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2634 emitFunctionExpression
+    // Go: printer/printer.go:2651 emitFunctionExpression
     pub(crate) fn emit_function_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.generate_name_if_needed(node.name());
@@ -319,7 +319,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2652 emitConciseBody
+    // Go: printer/printer.go:2669 emitConciseBody
     pub(crate) fn emit_concise_body(&mut self, node: Node) {
         if is_block(node) {
             self.emit_function_body(node);
@@ -339,7 +339,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:2670 emitArrowFunction
+    // Go: printer/printer.go:2687 emitArrowFunction
     pub(crate) fn emit_arrow_function(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_modifier_list(node, node.modifiers(), false /*allowDecorators*/);
@@ -358,7 +358,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2688 emitDeleteExpression
+    // Go: printer/printer.go:2705 emitDeleteExpression
     pub(crate) fn emit_delete_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -372,7 +372,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2696 emitTypeOfExpression
+    // Go: printer/printer.go:2713 emitTypeOfExpression
     pub(crate) fn emit_type_of_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -386,7 +386,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2704 emitVoidExpression
+    // Go: printer/printer.go:2721 emitVoidExpression
     pub(crate) fn emit_void_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -400,7 +400,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2712 emitAwaitExpression
+    // Go: printer/printer.go:2729 emitAwaitExpression
     pub(crate) fn emit_await_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -414,7 +414,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2720 emitPrefixUnaryExpression
+    // Go: printer/printer.go:2737 emitPrefixUnaryExpression
     pub(crate) fn emit_prefix_unary_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         let operator = node.operator();
@@ -448,7 +448,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2750 emitPostfixUnaryExpression
+    // Go: printer/printer.go:2767 emitPostfixUnaryExpression
     pub(crate) fn emit_postfix_unary_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_expression(node.operand(), OperatorPrecedence::LEFT_HAND_SIDE);
@@ -465,7 +465,7 @@ impl Printer {
     // literal expressions or binary plus expressions that all share the same literal kind.
     // It is used to determine whether the right-hand operand of a binary plus expression can be
     // emitted without parentheses.
-    // Go: printer/printer.go:2761 getLiteralKindOfBinaryPlusOperand
+    // Go: printer/printer.go:2778 getLiteralKindOfBinaryPlusOperand
     pub(crate) fn get_literal_kind_of_binary_plus_operand(&mut self, node: Node) -> SyntaxKind {
         let node = skip_partially_emitted_expressions(node);
 
@@ -490,7 +490,7 @@ impl Printer {
         SyntaxKind::Unknown
     }
 
-    // Go: printer/printer.go:2789 getBinaryExpressionPrecedence
+    // Go: printer/printer.go:2806 getBinaryExpressionPrecedence
     pub(crate) fn get_binary_expression_precedence(
         &mut self,
         node: Node,
@@ -572,7 +572,7 @@ impl Printer {
         (left_prec, right_prec)
     }
 
-    // Go: printer/printer.go:2859 emitBinaryExpression
+    // Go: printer/printer.go:2872 emitBinaryExpression
     pub(crate) fn emit_binary_expression(&mut self, node: Node) {
         let (mut left_prec, mut right_prec) = self.get_binary_expression_precedence(node);
         let emitted_left = skip_partially_emitted_expressions(node.left());
@@ -613,7 +613,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2880 emitShortCircuitExpression
+    // Go: printer/printer.go:2893 emitShortCircuitExpression
     pub(crate) fn emit_short_circuit_expression(&mut self, node: Node) {
         if is_binary_operation(
             skip_partially_emitted_expressions(node),
@@ -625,7 +625,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:2888 emitConditionalExpression
+    // Go: printer/printer.go:2901 emitConditionalExpression
     pub(crate) fn emit_conditional_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         let lines_before_question =
@@ -655,7 +655,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2910 emitTemplateExpression
+    // Go: printer/printer.go:2923 emitTemplateExpression
     pub(crate) fn emit_template_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_template_head(node.head());
@@ -668,7 +668,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2917 emitYieldExpression
+    // Go: printer/printer.go:2930 emitYieldExpression
     pub(crate) fn emit_yield_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -685,7 +685,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2928 emitSpreadElement
+    // Go: printer/printer.go:2941 emitSpreadElement
     pub(crate) fn emit_spread_element(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -698,7 +698,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2935 emitClassExpression
+    // Go: printer/printer.go:2948 emitClassExpression
     pub(crate) fn emit_class_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.generate_name_if_needed(node.name());
@@ -738,13 +738,13 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2964 emitOmittedExpression
+    // Go: printer/printer.go:2977 emitOmittedExpression
     pub(crate) fn emit_omitted_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2968 emitExpressionWithTypeArguments
+    // Go: printer/printer.go:2981 emitExpressionWithTypeArguments
     pub(crate) fn emit_expression_with_type_arguments(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_expression(node.expression(), OperatorPrecedence::MEMBER);
@@ -752,7 +752,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2979 emitAsExpression
+    // Go: printer/printer.go:2988 emitAsExpression
     pub(crate) fn emit_as_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_expression(node.expression(), OperatorPrecedence::RELATIONAL);
@@ -763,7 +763,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2989 emitSatisfiesExpression
+    // Go: printer/printer.go:2998 emitSatisfiesExpression
     pub(crate) fn emit_satisfies_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_expression(node.expression(), OperatorPrecedence::RELATIONAL);
@@ -774,7 +774,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:2999 emitNonNullExpression
+    // Go: printer/printer.go:3008 emitNonNullExpression
     pub(crate) fn emit_non_null_expression(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_expression(node.expression(), OperatorPrecedence::MEMBER);
@@ -782,7 +782,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3006 emitMetaProperty
+    // Go: printer/printer.go:3015 emitMetaProperty
     pub(crate) fn emit_meta_property(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -796,7 +796,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3014 emitPartiallyEmittedExpression
+    // Go: printer/printer.go:3023 emitPartiallyEmittedExpression
     pub(crate) fn emit_partially_emitted_expression(&mut self, mut node: Node) {
         // avoid reprinting parens for nested partially emitted expressions
         // PORT: Go `core.Stack[entry]` is a `Vec` of (node, state).
@@ -835,12 +835,12 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:3048 commentWillEmitNewLine
+    // Go: printer/printer.go:3057 commentWillEmitNewLine
     pub(crate) fn comment_will_emit_new_line(&self, comment: &CommentRange) -> bool {
         comment.kind == SyntaxKind::SingleLineCommentTrivia || comment.has_trailing_new_line
     }
 
-    // Go: printer/printer.go:3052 syntheticCommentWillEmitNewLine
+    // Go: printer/printer.go:3061 syntheticCommentWillEmitNewLine
     pub(crate) fn synthetic_comment_will_emit_new_line(
         &self,
         comment: &SynthesizedComment,
@@ -848,7 +848,7 @@ impl Printer {
         comment.kind == SyntaxKind::SingleLineCommentTrivia || comment.has_trailing_new_line
     }
 
-    // Go: printer/printer.go:3056 willEmitLeadingNewLine
+    // Go: printer/printer.go:3065 willEmitLeadingNewLine
     pub(crate) fn will_emit_leading_new_line(&mut self, node: Node) -> bool {
         if self.current_source_file.is_nil() {
             return false;
@@ -903,7 +903,7 @@ impl Printer {
 
     // parenthesizeExpressionForNoAsi wraps an expression in parens if we would emit a leading comment
     // that would introduce a line separator between the node and its parent.
-    // Go: printer/printer.go:3096 parenthesizeExpressionForNoAsi
+    // Go: printer/printer.go:3105 parenthesizeExpressionForNoAsi
     pub(crate) fn parenthesize_expression_for_no_asi(&mut self, node: Node) -> Node {
         if !self.comments_disabled {
             match node.kind() {
@@ -1030,13 +1030,13 @@ impl Printer {
         node
     }
 
-    // Go: printer/printer.go:3208 emitExpressionNoASI
+    // Go: printer/printer.go:3217 emitExpressionNoASI
     pub(crate) fn emit_expression_no_asi(&mut self, node: Node, precedence: OperatorPrecedence) {
         let node = self.parenthesize_expression_for_no_asi(node);
         self.emit_expression(node, precedence);
     }
 
-    // Go: printer/printer.go:3213 emitExpression
+    // Go: printer/printer.go:3222 emitExpression
     pub(crate) fn emit_expression(&mut self, node: Node, precedence: OperatorPrecedence) {
         let parens =
             get_expression_precedence(skip_partially_emitted_expressions(node)) < precedence;
@@ -1134,7 +1134,7 @@ impl Printer {
 //
 
 impl Printer {
-    // Go: printer/printer.go:3341 emitTemplateSpan
+    // Go: printer/printer.go:3350 emitTemplateSpan
     pub(crate) fn emit_template_span(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_expression(node.expression(), OperatorPrecedence::COMMA);
@@ -1142,12 +1142,12 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3348 emitTemplateSpanNode
+    // Go: printer/printer.go:3357 emitTemplateSpanNode
     pub(crate) fn emit_template_span_node(&mut self, node: Node) {
         self.emit_template_span(node);
     }
 
-    // Go: printer/printer.go:3352 emitSemicolonClassElement
+    // Go: printer/printer.go:3361 emitSemicolonClassElement
     pub(crate) fn emit_semicolon_class_element(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.write_trailing_semicolon();
@@ -1160,7 +1160,7 @@ impl Printer {
 //
 
 impl Printer {
-    // Go: printer/printer.go:3362 isEmptyBlock
+    // Go: printer/printer.go:3371 isEmptyBlock
     pub(crate) fn is_empty_block(&self, block: Node, statements: NodeList) -> bool {
         statements.nodes().is_empty()
             && (self.current_source_file.is_nil()
@@ -1171,7 +1171,7 @@ impl Printer {
                 ))
     }
 
-    // Go: printer/printer.go:3367 emitBlock
+    // Go: printer/printer.go:3376 emitBlock
     pub(crate) fn emit_block(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.generate_names(node);
@@ -1205,7 +1205,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3381 emitVariableStatement
+    // Go: printer/printer.go:3390 emitVariableStatement
     pub(crate) fn emit_variable_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_modifier_list(node, node.modifiers(), false /*allowDecorators*/);
@@ -1214,7 +1214,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3389 emitEmptyStatement
+    // Go: printer/printer.go:3398 emitEmptyStatement
     pub(crate) fn emit_empty_statement(&mut self, node: Node, is_embedded_statement: bool) {
         let state = self.enter_node(node);
 
@@ -1228,7 +1228,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3402 emitExpressionStatement
+    // Go: printer/printer.go:3411 emitExpressionStatement
     pub(crate) fn emit_expression_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
 
@@ -1273,7 +1273,7 @@ impl Printer {
     // instead of:
     //
     //	(function() { }())   -- parens around entire call
-    // Go: printer/printer.go:3442 emitIIFEWithParenthesizedCallee
+    // Go: printer/printer.go:3451 emitIIFEWithParenthesizedCallee
     pub(crate) fn emit_iife_with_parenthesized_callee(&mut self, node: Node) {
         // Walk through PartiallyEmittedExpression wrappers to find the call
         let call = skip_partially_emitted_expressions(node);
@@ -1295,7 +1295,7 @@ impl Printer {
         self.exit_node(call, state);
     }
 
-    // Go: printer/printer.go:3456 emitIfStatement
+    // Go: printer/printer.go:3465 emitIfStatement
     pub(crate) fn emit_if_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         let pos = self.emit_token(SyntaxKind::IfKeyword, node.pos(), WriteKind::KEYWORD, node);
@@ -1332,7 +1332,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3477 emitWhileClause
+    // Go: printer/printer.go:3486 emitWhileClause
     pub(crate) fn emit_while_clause(&mut self, node: Node, expression: Node, start_pos: i32) {
         let pos = self.emit_token(
             SyntaxKind::WhileKeyword,
@@ -1356,7 +1356,7 @@ impl Printer {
         );
     }
 
-    // Go: printer/printer.go:3485 emitDoStatement
+    // Go: printer/printer.go:3494 emitDoStatement
     pub(crate) fn emit_do_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(SyntaxKind::DoKeyword, node.pos(), WriteKind::KEYWORD, node);
@@ -1372,7 +1372,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3500 emitWhileStatement
+    // Go: printer/printer.go:3509 emitWhileStatement
     pub(crate) fn emit_while_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_while_clause(node, node.expression(), node.pos());
@@ -1380,7 +1380,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3507 emitForInitializer
+    // Go: printer/printer.go:3516 emitForInitializer
     pub(crate) fn emit_for_initializer(&mut self, node: Node) {
         if node.kind() == SyntaxKind::VariableDeclarationList {
             self.emit_variable_declaration_list(node);
@@ -1389,7 +1389,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:3515 emitForStatement
+    // Go: printer/printer.go:3524 emitForStatement
     pub(crate) fn emit_for_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         let mut pos = self.emit_token(SyntaxKind::ForKeyword, node.pos(), WriteKind::KEYWORD, node);
@@ -1436,7 +1436,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3541 emitForInStatement
+    // Go: printer/printer.go:3550 emitForInStatement
     pub(crate) fn emit_for_in_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         let pos = self.emit_token(SyntaxKind::ForKeyword, node.pos(), WriteKind::KEYWORD, node);
@@ -1467,7 +1467,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3556 emitForOfStatement
+    // Go: printer/printer.go:3565 emitForOfStatement
     pub(crate) fn emit_for_of_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         let open_paren_pos =
@@ -1503,7 +1503,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3575 emitContinueStatement
+    // Go: printer/printer.go:3584 emitContinueStatement
     pub(crate) fn emit_continue_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -1520,7 +1520,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3586 emitBreakStatement
+    // Go: printer/printer.go:3595 emitBreakStatement
     pub(crate) fn emit_break_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -1537,7 +1537,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3597 emitReturnStatement
+    // Go: printer/printer.go:3606 emitReturnStatement
     pub(crate) fn emit_return_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -1554,7 +1554,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3608 emitWithStatement
+    // Go: printer/printer.go:3617 emitWithStatement
     pub(crate) fn emit_with_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         let pos = self.emit_token(
@@ -1581,7 +1581,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3619 emitSwitchStatement
+    // Go: printer/printer.go:3628 emitSwitchStatement
     pub(crate) fn emit_switch_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         let pos = self.emit_token(
@@ -1609,7 +1609,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3631 emitLabeledStatement
+    // Go: printer/printer.go:3640 emitLabeledStatement
     pub(crate) fn emit_labeled_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_label_identifier(node.label());
@@ -1630,7 +1630,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3647 emitThrowStatement
+    // Go: printer/printer.go:3656 emitThrowStatement
     pub(crate) fn emit_throw_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -1645,7 +1645,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3656 emitTryStatement
+    // Go: printer/printer.go:3665 emitTryStatement
     pub(crate) fn emit_try_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(SyntaxKind::TryKeyword, node.pos(), WriteKind::KEYWORD, node);
@@ -1675,7 +1675,7 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3674 emitDebuggerStatement
+    // Go: printer/printer.go:3683 emitDebuggerStatement
     pub(crate) fn emit_debugger_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.emit_token(
@@ -1688,13 +1688,13 @@ impl Printer {
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3681 emitNotEmittedStatement
+    // Go: printer/printer.go:3690 emitNotEmittedStatement
     pub(crate) fn emit_not_emitted_statement(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.exit_node(node, state);
     }
 
-    // Go: printer/printer.go:3685 emitNotEmittedTypeElement
+    // Go: printer/printer.go:3694 emitNotEmittedTypeElement
     pub(crate) fn emit_not_emitted_type_element(&mut self, node: Node) {
         let state = self.enter_node(node);
         self.exit_node(node, state);

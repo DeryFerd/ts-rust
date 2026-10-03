@@ -141,7 +141,7 @@ impl ESModuleTransformer {
         result
     }
 
-    // Go: transformers/moduletransforms/esmodule.go:105 ESModuleTransformer.visitImportDeclaration
+    // Go: transformers/moduletransforms/esmodule.go:103 ESModuleTransformer.visitImportDeclaration
     fn visit_import_declaration(&mut self, node: Node) -> Node {
         if !self
             .compiler_options
@@ -164,7 +164,7 @@ impl ESModuleTransformer {
         )
     }
 
-    // Go: transformers/moduletransforms/esmodule.go:119 ESModuleTransformer.visitImportEqualsDeclaration
+    // Go: transformers/moduletransforms/esmodule.go:117 ESModuleTransformer.visitImportEqualsDeclaration
     fn visit_import_equals_declaration(&mut self, node: Node) -> Node {
         // Though an error in es2020 modules, in node-flavor es2020 modules, we can helpfully transform this to a synthetic `require` call
         // To give easy access to a synchronous `require` in node-flavor esm. We do the transform even in scenarios where we error, but `import.meta.url`
@@ -202,7 +202,7 @@ impl ESModuleTransformer {
         single_or_many(Some(&statements), f)
     }
 
-    // Go: transformers/moduletransforms/esmodule.go:151 ESModuleTransformer.appendExportsOfImportEqualsDeclaration
+    // Go: transformers/moduletransforms/esmodule.go:152 ESModuleTransformer.appendExportsOfImportEqualsDeclaration
     fn append_exports_of_import_equals_declaration(
         &mut self,
         mut statements: Vec<Node>,
@@ -250,7 +250,7 @@ impl ESModuleTransformer {
         statement
     }
 
-    // Go: transformers/moduletransforms/esmodule.go:197 ESModuleTransformer.visitExportDeclaration
+    // Go: transformers/moduletransforms/esmodule.go:196 ESModuleTransformer.visitExportDeclaration
     fn visit_export_declaration(&mut self, node: Node) -> Node {
         if node.module_specifier().is_nil() {
             return node;
@@ -315,7 +315,7 @@ impl ESModuleTransformer {
         single_or_many(Some(&[import_decl, export_decl]), f)
     }
 
-    // Go: transformers/moduletransforms/esmodule.go:266 ESModuleTransformer.visitImportOrRequireCall
+    // Go: transformers/moduletransforms/esmodule.go:258 ESModuleTransformer.visitImportOrRequireCall
     fn visit_import_or_require_call(&mut self, node: Node) -> Node {
         let args = node.arguments().to_vec();
         if args.is_empty() {
@@ -351,7 +351,7 @@ impl ESModuleTransformer {
         )
     }
 
-    // Go: transformers/moduletransforms/esmodule.go:299 ESModuleTransformer.createRequireCall
+    // Go: transformers/moduletransforms/esmodule.go:290 ESModuleTransformer.createRequireCall
     fn create_require_call(
         &mut self,
         node: Node, /*ImportDeclaration | ImportEqualsDeclaration | ExportDeclaration*/
@@ -481,7 +481,7 @@ fn visit_in(node: Node, v: &mut NodeVisitor<'_, &mut ESModuleTransformer>) -> No
     }
 }
 
-// Go: transformers/moduletransforms/esmodule.go:256 ESModuleTransformer.visitCallExpression
+// Go: transformers/moduletransforms/esmodule.go:248 ESModuleTransformer.visitCallExpression
 /// Runs on the running root visitor `v` (`v.ctx` is `tx`), so a plain call
 /// visits its children without a new visitor.
 fn visit_call_expression_in(node: Node, v: &mut NodeVisitor<'_, &mut ESModuleTransformer>) -> Node {

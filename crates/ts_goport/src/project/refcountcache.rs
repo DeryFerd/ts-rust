@@ -80,7 +80,7 @@ impl<K: Eq + Hash + Clone, V: Clone, AcquireArgs> RefCountCache<K, V, AcquireArg
         self.entries.borrow().contains_key(identity)
     }
 
-    // Go: project/refcountcache.go:60 AcquireOrError (tsgo#4712)
+    // Go: project/refcountcache.go:66 AcquireOrError (tsgo#4712)
     // AcquireOrError retrieves an existing entry (incrementing its refcount) or produces a new one via
     // produce. If produce returns an error, no entry is stored and the error is returned, so callers can
     // cache only successful results. produce runs while holding the new entry's lock, so concurrent
@@ -116,7 +116,7 @@ impl<K: Eq + Hash + Clone, V: Clone, AcquireArgs> RefCountCache<K, V, AcquireArg
         }
     }
 
-    // Go: project/refcountcache.go:62 Ref
+    // Go: project/refcountcache.go:85 Ref
     // Ref increments the reference count for an existing entry.
     // Panics if the entry does not exist.
     pub fn ref_(&self, identity: &K) {
@@ -133,7 +133,7 @@ impl<K: Eq + Hash + Clone, V: Clone, AcquireArgs> RefCountCache<K, V, AcquireArg
         entry.ref_count.set(entry.ref_count.get() + 1);
     }
 
-    // Go: project/refcountcache.go:82 Deref
+    // Go: project/refcountcache.go:105 Deref
     // Deref decrements the reference count for an entry.
     // When the refcount reaches zero, the entry is removed from the cache
     // (unless DisableDeletion is set).
@@ -148,7 +148,7 @@ impl<K: Eq + Hash + Clone, V: Clone, AcquireArgs> RefCountCache<K, V, AcquireArg
         }
     }
 
-    // Go: project/refcountcache.go:98 loadOrStoreNewLockedEntry
+    // Go: project/refcountcache.go:121 loadOrStoreNewLockedEntry
     // loadOrStoreNewLockedEntry loads an existing entry or creates a new one.
     // The returned entry's mutex is locked and its refCount is incremented
     // (or initialized to 1 in the case of a new entry).

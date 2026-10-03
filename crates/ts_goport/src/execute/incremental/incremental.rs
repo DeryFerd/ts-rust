@@ -67,7 +67,7 @@ pub fn new_build_info_reader(host: Rc<dyn CompilerHost>) -> Rc<dyn BuildInfoRead
 // incremental/host.go
 // ---------------------------------------------------------------------------
 
-// Go: incremental/host.go:9 Host
+// Go: incremental/host.go:10 Host
 // PORT: Go `time.Time` is `Option<SystemTime>`; `None` is the Go zero time
 // (as in `vfs::FileInfo::mod_time`).
 pub trait Host {
@@ -76,7 +76,7 @@ pub trait Host {
     fn set_m_time(&self, file_name: &str, m_time: Option<SystemTime>) -> Result<(), FsError>;
 }
 
-// Go: incremental/host.go:14 host
+// Go: incremental/host.go:16 host
 // PORT: Go unexported type behind the `Host` interface.
 pub struct HostImpl {
     host: Rc<dyn CompilerHost>,
@@ -99,7 +99,7 @@ impl Host for HostImpl {
     }
 }
 
-// Go: incremental/host.go:28 CreateHost
+// Go: incremental/host.go:34 CreateHost
 #[must_use]
 pub fn create_host(compiler_host: Rc<dyn CompilerHost>) -> Rc<dyn Host> {
     Rc::new(HostImpl {
@@ -107,7 +107,7 @@ pub fn create_host(compiler_host: Rc<dyn CompilerHost>) -> Rc<dyn Host> {
     })
 }
 
-// Go: incremental/host.go:32 GetMTime
+// Go: incremental/host.go:38 GetMTime
 #[must_use]
 pub fn get_m_time(host: &dyn CompilerHost, file_name: &str) -> Option<SystemTime> {
     let stat = host.fs().stat(file_name);

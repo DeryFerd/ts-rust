@@ -160,13 +160,13 @@ impl TypeMapper {
 
 // TypeMapperBase
 
-// Go: checker/mapper.go:84 TypeMapperBase
+// Go: checker/mapper.go:102 TypeMapperBase
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TypeMapperBase;
 
 // SimpleTypeMapper
 
-// Go: checker/mapper.go:94 SimpleTypeMapper
+// Go: checker/mapper.go:112 SimpleTypeMapper
 #[derive(Clone, Debug, Default)]
 pub struct SimpleTypeMapper {
     pub source: TypeId,
@@ -177,7 +177,7 @@ pub struct SimpleTypeMapper {
 
 // ArrayTypeMapper
 
-// Go: checker/mapper.go:122 ArrayTypeMapper
+// Go: checker/mapper.go:143 ArrayTypeMapper
 #[derive(Clone, Debug, Default)]
 pub struct ArrayTypeMapper {
     pub sources: SharedList<TypeId>,
@@ -188,7 +188,7 @@ pub struct ArrayTypeMapper {
 
 // ArrayToSingleTypeMapper
 
-// Go: checker/mapper.go:154 ArrayToSingleTypeMapper
+// Go: checker/mapper.go:176 ArrayToSingleTypeMapper
 #[derive(Clone, Debug, Default)]
 pub struct ArrayToSingleTypeMapper {
     pub sources: Vec<TypeId>,
@@ -199,7 +199,7 @@ pub struct ArrayToSingleTypeMapper {
 
 // DeferredTypeMapper
 
-// Go: checker/mapper.go:179 DeferredTypeMapper
+// Go: checker/mapper.go:203 DeferredTypeMapper
 #[derive(Clone)]
 pub struct DeferredTypeMapper {
     pub sources: Vec<TypeId>,
@@ -210,7 +210,7 @@ pub struct DeferredTypeMapper {
 
 // FunctionTypeMapper
 
-// Go: checker/mapper.go:207 FunctionTypeMapper
+// Go: checker/mapper.go:232 FunctionTypeMapper
 #[derive(Clone)]
 pub struct FunctionTypeMapper {
     pub fn_: TypeMapperFn,
@@ -218,7 +218,7 @@ pub struct FunctionTypeMapper {
 
 // MergedTypeMapper
 
-// Go: checker/mapper.go:225 MergedTypeMapper
+// Go: checker/mapper.go:250 MergedTypeMapper
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MergedTypeMapper {
     pub m1: MapperId,
@@ -227,7 +227,7 @@ pub struct MergedTypeMapper {
 
 // CompositeTypeMapper
 
-// Go: checker/mapper.go:249 CompositeTypeMapper
+// Go: checker/mapper.go:274 CompositeTypeMapper
 // PORT: the Go `c *Checker` field is dropped; `mapper_map` gets the checker.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CompositeTypeMapper {
@@ -237,7 +237,7 @@ pub struct CompositeTypeMapper {
 
 // InferenceTypeMapper
 
-// Go: checker/mapper.go:275 InferenceTypeMapper
+// Go: checker/mapper.go:300 InferenceTypeMapper
 // PORT: the Go `c *Checker` field is dropped; `mapper_map` gets the checker.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InferenceTypeMapper {
@@ -351,7 +351,7 @@ impl Checker {
 
     // Factory functions
 
-    // Go: checker/mapper.go:41 newTypeMapper
+    // Go: checker/mapper.go:44 newTypeMapper
     pub fn new_type_mapper(&mut self, sources: &[TypeId], targets: &[TypeId]) -> MapperId {
         if sources.len() == 1 {
             return self.new_simple_type_mapper(sources[0], targets[0]);
@@ -371,7 +371,7 @@ impl Checker {
         self.new_array_type_mapper_shared(sources, targets)
     }
 
-    // Go: checker/mapper.go:48 combineTypeMappers
+    // Go: checker/mapper.go:51 combineTypeMappers
     pub fn combine_type_mappers(&mut self, m1: MapperId, m2: MapperId) -> MapperId {
         if m1.is_some() {
             return self.new_composite_type_mapper(m1, m2);
@@ -379,7 +379,7 @@ impl Checker {
         m2
     }
 
-    // Go: checker/mapper.go:54 mapTypeWithCompositeMapper
+    // Go: checker/mapper.go:58 mapTypeWithCompositeMapper
     pub fn map_type_with_composite_mapper(
         &mut self,
         t: TypeId,
@@ -396,7 +396,7 @@ impl Checker {
         self.get_mapped_type(t, m2)
     }
 
-    // Go: checker/mapper.go:55 mergeTypeMappers
+    // Go: checker/mapper.go:69 mergeTypeMappers
     pub fn merge_type_mappers(&mut self, m1: MapperId, m2: MapperId) -> MapperId {
         if m1.is_some() {
             return self.new_merged_type_mapper(m1, m2);
@@ -404,7 +404,7 @@ impl Checker {
         m2
     }
 
-    // Go: checker/mapper.go:62 prependTypeMapping
+    // Go: checker/mapper.go:76 prependTypeMapping
     pub fn prepend_type_mapping(
         &mut self,
         source: TypeId,
@@ -420,7 +420,7 @@ impl Checker {
         self.new_merged_type_mapper(simple, mapper)
     }
 
-    // Go: checker/mapper.go:69 appendTypeMapping
+    // Go: checker/mapper.go:83 appendTypeMapping
     pub fn append_type_mapping(
         &mut self,
         mapper: MapperId,
@@ -438,7 +438,7 @@ impl Checker {
 
     // Maps forward-references to later types parameters to the empty object type.
     // This is used during inference when instantiating type parameter defaults.
-    // Go: checker/mapper.go:78 newBackreferenceMapper
+    // Go: checker/mapper.go:92 newBackreferenceMapper
     pub fn new_backreference_mapper(
         &mut self,
         context: InferenceContextId,
@@ -453,7 +453,7 @@ impl Checker {
         self.new_array_to_single_type_mapper(&type_parameters, unknown_type)
     }
 
-    // Go: checker/mapper.go:100 newSimpleTypeMapper
+    // Go: checker/mapper.go:118 newSimpleTypeMapper
     #[inline(always)]
     pub fn new_simple_type_mapper(&mut self, source: TypeId, target: TypeId) -> MapperId {
         // Go: checker/mapper.go:119 (*SimpleTypeMapper).MapsThisOnly
@@ -465,7 +465,7 @@ impl Checker {
         }))
     }
 
-    // Go: checker/mapper.go:128 newArrayTypeMapper
+    // Go: checker/mapper.go:149 newArrayTypeMapper
     // PORT: Go keeps the caller's slices; we copy them. Go callers do not
     // mutate these slices after building the mapper.
     pub fn new_array_type_mapper(&mut self, sources: &[TypeId], targets: &[TypeId]) -> MapperId {
@@ -489,7 +489,7 @@ impl Checker {
         }))
     }
 
-    // Go: checker/mapper.go:160 newArrayToSingleTypeMapper
+    // Go: checker/mapper.go:182 newArrayToSingleTypeMapper
     #[inline(always)]
     pub fn new_array_to_single_type_mapper(
         &mut self,
@@ -505,7 +505,7 @@ impl Checker {
         }))
     }
 
-    // Go: checker/mapper.go:185 newDeferredTypeMapper
+    // Go: checker/mapper.go:209 newDeferredTypeMapper
     pub fn new_deferred_type_mapper(
         &mut self,
         sources: &[TypeId],
@@ -520,22 +520,22 @@ impl Checker {
         }))
     }
 
-    // Go: checker/mapper.go:212 newFunctionTypeMapper
+    // Go: checker/mapper.go:237 newFunctionTypeMapper
     pub fn new_function_type_mapper(&mut self, fn_: TypeMapperFn) -> MapperId {
         self.alloc_type_mapper(TypeMapper::Function(FunctionTypeMapper { fn_ }))
     }
 
-    // Go: checker/mapper.go:231 newMergedTypeMapper
+    // Go: checker/mapper.go:256 newMergedTypeMapper
     pub fn new_merged_type_mapper(&mut self, m1: MapperId, m2: MapperId) -> MapperId {
         self.alloc_type_mapper(TypeMapper::Merged(MergedTypeMapper { m1, m2 }))
     }
 
-    // Go: checker/mapper.go:256 newCompositeTypeMapper
+    // Go: checker/mapper.go:281 newCompositeTypeMapper
     pub fn new_composite_type_mapper(&mut self, m1: MapperId, m2: MapperId) -> MapperId {
         self.alloc_type_mapper(TypeMapper::Composite(CompositeTypeMapper { m1, m2 }))
     }
 
-    // Go: checker/mapper.go:282 newInferenceTypeMapper
+    // Go: checker/mapper.go:307 newInferenceTypeMapper
     pub fn new_inference_type_mapper(&mut self, n: InferenceContextId, fixing: bool) -> MapperId {
         self.alloc_type_mapper(TypeMapper::Inference(InferenceTypeMapper { n, fixing }))
     }

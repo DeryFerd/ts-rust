@@ -26,7 +26,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1722 esDecoratorTransformer.visitThisExpression
+    // Go: transformers/estransforms/esdecorator.go:1724 esDecoratorTransformer.visitThisExpression
     pub(super) fn visit_this_expression(&mut self, node: Node) -> Node {
         if self.class_this.is_some() {
             return self.class_this;
@@ -34,7 +34,7 @@ impl EsDecoratorTransformer {
         node
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1729 esDecoratorTransformer.visitCallExpression
+    // Go: transformers/estransforms/esdecorator.go:1731 esDecoratorTransformer.visitCallExpression
     pub(super) fn visit_call_expression(&mut self, node: Node) -> Node {
         if is_super_property(node.expression()) && self.class_this.is_some() {
             let expression = self.visit_node(node.expression());
@@ -52,7 +52,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1742 esDecoratorTransformer.visitTaggedTemplateExpression
+    // Go: transformers/estransforms/esdecorator.go:1744 esDecoratorTransformer.visitTaggedTemplateExpression
     pub(super) fn visit_tagged_template_expression(&mut self, node: Node) -> Node {
         if is_super_property(node.tag()) && self.class_this.is_some() {
             let tag = self.visit_node(node.tag());
@@ -74,7 +74,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1755 esDecoratorTransformer.visitPropertyAccessExpression
+    // Go: transformers/estransforms/esdecorator.go:1757 esDecoratorTransformer.visitPropertyAccessExpression
     pub(super) fn visit_property_access_expression(&mut self, node: Node) -> Node {
         if is_super_property(node)
             && is_identifier(node.name())
@@ -93,7 +93,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1767 esDecoratorTransformer.visitElementAccessExpression
+    // Go: transformers/estransforms/esdecorator.go:1769 esDecoratorTransformer.visitElementAccessExpression
     pub(super) fn visit_element_access_expression(&mut self, node: Node) -> Node {
         if is_super_property(node) && self.class_this.is_some() && self.class_super.is_some() {
             let property_name = self.visit_node(node.argument_expression());
@@ -108,7 +108,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1794 esDecoratorTransformer.visitParameterDeclaration
+    // Go: transformers/estransforms/esdecorator.go:1798 esDecoratorTransformer.visitParameterDeclaration
     // 8.6.3 RS: IteratorBindingInitialization
     //
     //	SingleNameBinding : BindingIdentifier Initializer?
@@ -162,7 +162,7 @@ impl EsDecoratorTransformer {
         updated
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1865 esDecoratorTransformer.visitNamedEvaluationSite
+    // Go: transformers/estransforms/esdecorator.go:1870 esDecoratorTransformer.visitNamedEvaluationSite
     /// visitNamedEvaluationSite replaces Strada's visitPropertyAssignment, visitVariableDeclaration,
     /// and visitBindingElement, which all share the same logic.
     pub(super) fn visit_named_evaluation_site(&mut self, mut node: Node, class_expr: Node) -> Node {
@@ -177,7 +177,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1890 esDecoratorTransformer.visitForStatement
+    // Go: transformers/estransforms/esdecorator.go:1893 esDecoratorTransformer.visitForStatement
     pub(super) fn visit_for_statement(&mut self, node: Node) -> Node {
         let initializer = self.discarded_visitor_visit_node(node.initializer());
         let condition = self.visit_node(node.condition());
@@ -192,12 +192,12 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1902 esDecoratorTransformer.visitExpressionStatement
+    // Go: transformers/estransforms/esdecorator.go:1905 esDecoratorTransformer.visitExpressionStatement
     pub(super) fn visit_expression_statement(&mut self, node: Node) -> Node {
         self.with_visitor(Self::discarded_value_visit, |v| v.visit_each_child(node))
     }
 
-    // Go: transformers/estransforms/esdecorator.go:1906 esDecoratorTransformer.visitBinaryExpression
+    // Go: transformers/estransforms/esdecorator.go:1909 esDecoratorTransformer.visitBinaryExpression
     pub(super) fn visit_binary_expression(&mut self, mut node: Node, discarded: bool) -> Node {
         let ec = self.ec();
         let f = ec.factory();
@@ -338,7 +338,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2016 esDecoratorTransformer.visitPreOrPostfixUnaryExpression
+    // Go: transformers/estransforms/esdecorator.go:2019 esDecoratorTransformer.visitPreOrPostfixUnaryExpression
     pub(super) fn visit_pre_or_postfix_unary_expression(
         &mut self,
         node: Node,
@@ -425,7 +425,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2098 esDecoratorTransformer.visitReferencedPropertyName
+    // Go: transformers/estransforms/esdecorator.go:2099 esDecoratorTransformer.visitReferencedPropertyName
     /// Returns `(referencedName, updatedName)`.
     pub(super) fn visit_referenced_property_name(&mut self, node: Node) -> (Node, Node) {
         let ec = self.ec();
@@ -452,7 +452,7 @@ impl EsDecoratorTransformer {
         (referenced_name, updated_name)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2117 esDecoratorTransformer.visitPropertyName
+    // Go: transformers/estransforms/esdecorator.go:2118 esDecoratorTransformer.visitPropertyName
     pub(super) fn visit_property_name(&mut self, node: Node) -> Node {
         if is_computed_property_name(node) {
             return self.visit_computed_property_name(node);
@@ -460,7 +460,7 @@ impl EsDecoratorTransformer {
         self.visit_node(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2124 esDecoratorTransformer.visitComputedPropertyName
+    // Go: transformers/estransforms/esdecorator.go:2125 esDecoratorTransformer.visitComputedPropertyName
     pub(super) fn visit_computed_property_name(&mut self, node: Node) -> Node {
         let mut expression = self.visit_node(node.expression());
         if !is_simple_inlineable_expression(expression) {
@@ -471,7 +471,7 @@ impl EsDecoratorTransformer {
             .update_computed_property_name(node, expression)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2133 esDecoratorTransformer.visitDestructuringAssignmentTarget
+    // Go: transformers/estransforms/esdecorator.go:2134 esDecoratorTransformer.visitDestructuringAssignmentTarget
     pub(super) fn visit_destructuring_assignment_target(&mut self, node: Node) -> Node {
         if is_object_literal_expression(node) || is_array_literal_expression(node) {
             return self.visit_assignment_pattern(node);
@@ -506,7 +506,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2166 esDecoratorTransformer.visitAssignmentElement
+    // Go: transformers/estransforms/esdecorator.go:2168 esDecoratorTransformer.visitAssignmentElement
     pub(super) fn visit_assignment_element(&mut self, mut node: Node) -> Node {
         // 13.15.5.5 RS: IteratorDestructuringAssignmentEvaluation
         //   AssignmentElement : DestructuringAssignmentTarget Initializer?
@@ -538,7 +538,7 @@ impl EsDecoratorTransformer {
         self.visit_destructuring_assignment_target(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2187 esDecoratorTransformer.visitAssignmentRestElement
+    // Go: transformers/estransforms/esdecorator.go:2190 esDecoratorTransformer.visitAssignmentRestElement
     pub(super) fn visit_assignment_rest_element(&mut self, node: Node) -> Node {
         if is_left_hand_side_expression(node.expression()) {
             let expression = self.visit_destructuring_assignment_target(node.expression());
@@ -547,7 +547,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2197 esDecoratorTransformer.visitArrayAssignmentElement
+    // Go: transformers/estransforms/esdecorator.go:2200 esDecoratorTransformer.visitArrayAssignmentElement
     pub(super) fn visit_array_assignment_element(&mut self, node: Node) -> Node {
         go_assert!(is_array_binding_or_assignment_element(node));
         if is_spread_element(node) {
@@ -559,7 +559,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2208 esDecoratorTransformer.visitAssignmentPropertyNode
+    // Go: transformers/estransforms/esdecorator.go:2211 esDecoratorTransformer.visitAssignmentPropertyNode
     pub(super) fn visit_assignment_property_node(&mut self, node: Node) -> Node {
         // AssignmentProperty : PropertyName `:` AssignmentElement
         // AssignmentElement : DestructuringAssignmentTarget Initializer?
@@ -599,7 +599,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2234 esDecoratorTransformer.visitShorthandAssignmentProperty
+    // Go: transformers/estransforms/esdecorator.go:2237 esDecoratorTransformer.visitShorthandAssignmentProperty
     pub(super) fn visit_shorthand_assignment_property(&mut self, mut node: Node) -> Node {
         // AssignmentProperty : IdentifierReference Initializer?
 
@@ -623,7 +623,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2250 esDecoratorTransformer.visitAssignmentRestProperty
+    // Go: transformers/estransforms/esdecorator.go:2253 esDecoratorTransformer.visitAssignmentRestProperty
     pub(super) fn visit_assignment_rest_property(&mut self, node: Node) -> Node {
         if is_left_hand_side_expression(node.expression()) {
             let expression = self.visit_destructuring_assignment_target(node.expression());
@@ -635,7 +635,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2260 esDecoratorTransformer.visitObjectAssignmentElement
+    // Go: transformers/estransforms/esdecorator.go:2263 esDecoratorTransformer.visitObjectAssignmentElement
     pub(super) fn visit_object_assignment_element(&mut self, node: Node) -> Node {
         go_assert!(is_object_binding_or_assignment_element(node));
         if is_spread_assignment(node) {
@@ -650,7 +650,7 @@ impl EsDecoratorTransformer {
         self.visit_each_child(node)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2274 esDecoratorTransformer.visitAssignmentPattern
+    // Go: transformers/estransforms/esdecorator.go:2277 esDecoratorTransformer.visitAssignmentPattern
     pub(super) fn visit_assignment_pattern(&mut self, node: Node) -> Node {
         if is_array_literal_expression(node) {
             let elements = self.with_visitor(Self::visit_array_assignment_element, |v| {
@@ -670,7 +670,7 @@ impl EsDecoratorTransformer {
             .update_object_literal_expression(node, properties, node.multi_line())
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2286 esDecoratorTransformer.visitExportAssignment
+    // Go: transformers/estransforms/esdecorator.go:2289 esDecoratorTransformer.visitExportAssignment
     pub(super) fn visit_export_assignment(&mut self, node: Node) -> Node {
         // 16.2.3.7 RS: Evaluation
         //   ExportDeclaration : `export` `default` AssignmentExpression `;`
@@ -680,7 +680,7 @@ impl EsDecoratorTransformer {
         self.visit_named_evaluation_site(node, node.expression())
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2295 esDecoratorTransformer.visitParenthesizedExpression
+    // Go: transformers/estransforms/esdecorator.go:2298 esDecoratorTransformer.visitParenthesizedExpression
     pub(super) fn visit_parenthesized_expression(&mut self, node: Node, discarded: bool) -> Node {
         // 8.4.5 RS: NamedEvaluation
         //   ParenthesizedExpression : `(` Expression `)`
@@ -697,7 +697,7 @@ impl EsDecoratorTransformer {
             .update_parenthesized_expression(node, expression)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2312 esDecoratorTransformer.visitPartiallyEmittedExpression
+    // Go: transformers/estransforms/esdecorator.go:2315 esDecoratorTransformer.visitPartiallyEmittedExpression
     pub(super) fn visit_partially_emitted_expression(
         &mut self,
         node: Node,
@@ -714,7 +714,7 @@ impl EsDecoratorTransformer {
             .update_partially_emitted_expression(node, expression)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2326 esDecoratorTransformer.prependExpressions
+    // Go: transformers/estransforms/esdecorator.go:2329 esDecoratorTransformer.prependExpressions
     /// prependExpressions prepends a list of expressions before a target expression, preserving
     /// parenthesization. If expression is nil, the pending expressions are inlined alone.
     pub(super) fn prepend_expressions(&self, pending: &[Node], expression: Node) -> Node {
@@ -735,7 +735,7 @@ impl EsDecoratorTransformer {
         f.inline_expressions(&exprs)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2348 esDecoratorTransformer.injectPendingExpressions
+    // Go: transformers/estransforms/esdecorator.go:2350 esDecoratorTransformer.injectPendingExpressions
     pub(super) fn inject_pending_expressions(&mut self, expression: Node) -> Node {
         let result = self.prepend_expressions(&self.pending_expressions, expression);
         go_assert!(result.is_some());
@@ -745,7 +745,7 @@ impl EsDecoratorTransformer {
         result
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2357 esDecoratorTransformer.injectPendingInitializers
+    // Go: transformers/estransforms/esdecorator.go:2359 esDecoratorTransformer.injectPendingInitializers
     pub(super) fn inject_pending_initializers(
         &self,
         ci: &ClassInfoRef,
@@ -769,7 +769,7 @@ impl EsDecoratorTransformer {
         result
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2372 esDecoratorTransformer.transformAllDecoratorsOfDeclaration
+    // Go: transformers/estransforms/esdecorator.go:2374 esDecoratorTransformer.transformAllDecoratorsOfDeclaration
     /// Transforms all of the decorators for a declaration into an array of expressions.
     pub(super) fn transform_all_decorators_of_declaration(
         &mut self,
@@ -785,7 +785,7 @@ impl EsDecoratorTransformer {
         result
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2384 esDecoratorTransformer.transformDecorator
+    // Go: transformers/estransforms/esdecorator.go:2386 esDecoratorTransformer.transformDecorator
     /// Transforms a decorator into an expression.
     pub(super) fn transform_decorator(&mut self, decorator: Node) -> Node {
         let expression = self.visit_node(decorator.expression());
@@ -807,7 +807,7 @@ impl EsDecoratorTransformer {
         expression
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2398 esDecoratorTransformer.createCallBinding
+    // Go: transformers/estransforms/esdecorator.go:2400 esDecoratorTransformer.createCallBinding
     /// Returns `(target, thisArg)`.
     pub(super) fn create_call_binding(&self, expression: Node) -> (Node, Node) {
         let ec = &self.emit_context;
@@ -859,7 +859,7 @@ impl EsDecoratorTransformer {
         (expression, f.new_void_zero_expression())
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2438 esDecoratorTransformer.shouldBeCapturedInTempVariable
+    // Go: transformers/estransforms/esdecorator.go:2441 esDecoratorTransformer.shouldBeCapturedInTempVariable
     pub(super) fn should_be_captured_in_temp_variable(&self, node: Node) -> bool {
         // This is a simplified version of the general shouldBeCapturedInTempVariable from
         // nodeFactory with cacheIdentifiers=true, since createCallBinding in this transform
@@ -876,7 +876,7 @@ impl EsDecoratorTransformer {
         }
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2458 esDecoratorTransformer.createDescriptorMethod
+    // Go: transformers/estransforms/esdecorator.go:2462 esDecoratorTransformer.createDescriptorMethod
     /// Creates a "value", "get", or "set" method for a pseudo-PropertyDescriptor object created for
     /// a private element.
     #[allow(clippy::too_many_arguments)]
@@ -932,7 +932,7 @@ impl EsDecoratorTransformer {
         method
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2503 esDecoratorTransformer.createMethodDescriptorObject
+    // Go: transformers/estransforms/esdecorator.go:2507 esDecoratorTransformer.createMethodDescriptorObject
     /// Creates a pseudo-PropertyDescriptor object used when decorating a private MethodDeclaration.
     pub(super) fn create_method_descriptor_object(
         &mut self,
@@ -956,7 +956,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2517 esDecoratorTransformer.createGetAccessorDescriptorObject
+    // Go: transformers/estransforms/esdecorator.go:2521 esDecoratorTransformer.createGetAccessorDescriptorObject
     /// Creates a pseudo-PropertyDescriptor object used when decorating a private GetAccessor.
     pub(super) fn create_get_accessor_descriptor_object(
         &mut self,
@@ -979,7 +979,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2529 esDecoratorTransformer.createSetAccessorDescriptorObject
+    // Go: transformers/estransforms/esdecorator.go:2533 esDecoratorTransformer.createSetAccessorDescriptorObject
     /// Creates a pseudo-PropertyDescriptor object used when decorating a private SetAccessor.
     pub(super) fn create_set_accessor_descriptor_object(
         &mut self,
@@ -1003,7 +1003,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2544 esDecoratorTransformer.createAccessorPropertyDescriptorObject
+    // Go: transformers/estransforms/esdecorator.go:2547 esDecoratorTransformer.createAccessorPropertyDescriptorObject
     /// Creates a pseudo-PropertyDescriptor object used when decorating a private auto-accessor PropertyDeclaration.
     /// The descriptor contains get/set methods that access the generated backing field.
     pub(super) fn create_accessor_property_descriptor_object(
@@ -1085,7 +1085,7 @@ impl EsDecoratorTransformer {
         })
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2587 esDecoratorTransformer.createMethodDescriptorForwarder
+    // Go: transformers/estransforms/esdecorator.go:2585 esDecoratorTransformer.createMethodDescriptorForwarder
     /// Creates a MethodDeclaration that forwards its invocation to a PropertyDescriptor object.
     pub(super) fn create_method_descriptor_forwarder(
         &mut self,
@@ -1114,7 +1114,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2606 esDecoratorTransformer.createGetAccessorDescriptorForwarder
+    // Go: transformers/estransforms/esdecorator.go:2604 esDecoratorTransformer.createGetAccessorDescriptorForwarder
     /// Creates a GetAccessor that forwards its invocation to a PropertyDescriptor object.
     pub(super) fn create_get_accessor_descriptor_forwarder(
         &mut self,
@@ -1147,7 +1147,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2629 esDecoratorTransformer.createSetAccessorDescriptorForwarder
+    // Go: transformers/estransforms/esdecorator.go:2627 esDecoratorTransformer.createSetAccessorDescriptorForwarder
     /// Creates a SetAccessor that forwards its invocation to a PropertyDescriptor object.
     pub(super) fn create_set_accessor_descriptor_forwarder(
         &mut self,
@@ -1187,7 +1187,7 @@ impl EsDecoratorTransformer {
         )
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2655 esDecoratorTransformer.createMetadata
+    // Go: transformers/estransforms/esdecorator.go:2651 esDecoratorTransformer.createMetadata
     pub(super) fn create_metadata(&self, name: Node, class_super: Node) -> Node {
         let f = self.emit_context.factory();
 
@@ -1234,7 +1234,7 @@ impl EsDecoratorTransformer {
         f.new_variable_statement(ModifierList::NIL, var_decl_list)
     }
 
-    // Go: transformers/estransforms/esdecorator.go:2689 esDecoratorTransformer.createSymbolMetadata
+    // Go: transformers/estransforms/esdecorator.go:2686 esDecoratorTransformer.createSymbolMetadata
     pub(super) fn create_symbol_metadata(&self, target: Node, value: Node) -> Node {
         let ec = &self.emit_context;
         let f = ec.factory();

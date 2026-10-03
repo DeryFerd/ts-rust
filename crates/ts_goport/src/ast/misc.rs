@@ -162,43 +162,43 @@ pub struct RepopulateDiagnosticInfo {
 // PORT: `core::Diagnostic` has no `messageKey` field. The message key is
 // always `message.key()`.
 impl Diagnostic {
-    // Go: ast/diagnostic.go:50 File
+    // Go: ast/diagnostic.go:58 File
     #[must_use]
     pub fn file(&self) -> Node {
         self.file
     }
 
-    // Go: ast/diagnostic.go:51 Pos
+    // Go: ast/diagnostic.go:59 Pos
     #[must_use]
     pub fn pos(&self) -> i32 {
         self.pos
     }
 
-    // Go: ast/diagnostic.go:52 End
+    // Go: ast/diagnostic.go:60 End
     #[must_use]
     pub fn end(&self) -> i32 {
         self.end
     }
 
-    // Go: ast/diagnostic.go:53 Len
+    // Go: ast/diagnostic.go:61 Len
     #[must_use]
     pub fn len(&self) -> i32 {
         self.end - self.pos
     }
 
-    // Go: ast/diagnostic.go:54 Loc
+    // Go: ast/diagnostic.go:62 Loc
     #[must_use]
     pub fn loc(&self) -> TextRange {
         TextRange::new(self.pos, self.end)
     }
 
-    // Go: ast/diagnostic.go:55 Code
+    // Go: ast/diagnostic.go:63 Code
     #[must_use]
     pub fn code(&self) -> i32 {
         self.code
     }
 
-    // Go: ast/diagnostic.go:56 Category
+    // Go: ast/diagnostic.go:64 Category
     #[must_use]
     pub fn category(&self) -> crate::diagnostics::Category {
         self.category
@@ -216,7 +216,7 @@ impl Diagnostic {
         &self.message_text
     }
 
-    // Go: ast/diagnostic.go:57 MessageKey
+    // Go: ast/diagnostic.go:67 MessageKey
     // PORT: a diagnostic with the Go nil message (`NIL_MESSAGE`) has the key
     // "", as in Go.
     #[must_use]
@@ -224,70 +224,70 @@ impl Diagnostic {
         self.message.key()
     }
 
-    // Go: ast/diagnostic.go:58 MessageArgs
+    // Go: ast/diagnostic.go:68 MessageArgs
     #[must_use]
     pub fn message_args(&self) -> &[String] {
         &self.message_args
     }
 
-    // Go: ast/diagnostic.go:59 MessageChain
+    // Go: ast/diagnostic.go:69 MessageChain
     #[must_use]
     pub fn message_chain(&self) -> &[Diagnostic] {
         &self.message_chain
     }
 
-    // Go: ast/diagnostic.go:60 RelatedInformation
+    // Go: ast/diagnostic.go:70 RelatedInformation
     #[must_use]
     pub fn related_information(&self) -> &[Diagnostic] {
         &self.related_information
     }
 
-    // Go: ast/diagnostic.go:61 ReportsUnnecessary
+    // Go: ast/diagnostic.go:71 ReportsUnnecessary
     #[must_use]
     pub fn reports_unnecessary(&self) -> bool {
         self.reports_unnecessary
     }
 
-    // Go: ast/diagnostic.go:62 ReportsDeprecated
+    // Go: ast/diagnostic.go:72 ReportsDeprecated
     #[must_use]
     pub fn reports_deprecated(&self) -> bool {
         self.reports_deprecated
     }
 
-    // Go: ast/diagnostic.go:63 SkippedOnNoEmit
+    // Go: ast/diagnostic.go:73 SkippedOnNoEmit
     #[must_use]
     pub fn skipped_on_no_emit(&self) -> bool {
         self.skipped_on_no_emit
     }
 
-    // Go: ast/diagnostic.go:64 RepopulateInfo
+    // Go: ast/diagnostic.go:74 RepopulateInfo
     #[must_use]
     pub fn repopulate_info(&self) -> Option<std::sync::Arc<RepopulateDiagnosticInfo>> {
         self.repopulate_info.clone()
     }
 
-    // Go: ast/diagnostic.go:66 SetFile
+    // Go: ast/diagnostic.go:76 SetFile
     pub fn set_file(&mut self, file: Node) {
         self.file = file;
     }
 
-    // Go: ast/diagnostic.go:67 SetLocation
+    // Go: ast/diagnostic.go:77 SetLocation
     pub fn set_location(&mut self, loc: TextRange) {
         self.pos = loc.pos();
         self.end = loc.end();
     }
 
-    // Go: ast/diagnostic.go:68 SetCategory
+    // Go: ast/diagnostic.go:78 SetCategory
     pub fn set_category(&mut self, category: crate::diagnostics::Category) {
         self.category = category;
     }
 
-    // Go: ast/diagnostic.go:69 SetSkippedOnNoEmit
+    // Go: ast/diagnostic.go:79 SetSkippedOnNoEmit
     pub fn set_skipped_on_no_emit(&mut self) {
         self.skipped_on_no_emit = true;
     }
 
-    // Go: ast/diagnostic.go:70 SetRepopulateInfo
+    // Go: ast/diagnostic.go:80 SetRepopulateInfo
     pub fn set_repopulate_info(&mut self, info: Option<std::sync::Arc<RepopulateDiagnosticInfo>>) {
         self.repopulate_info = info;
     }
@@ -299,14 +299,14 @@ impl Diagnostic {
         self
     }
 
-    // Go: ast/diagnostic.go:72 SetMessageChain
+    // Go: ast/diagnostic.go:88 SetMessageChain
     // PORT: Go returns the receiver for chaining; this returns `&mut Self`.
     pub fn set_message_chain(&mut self, message_chain: Vec<Diagnostic>) -> &mut Self {
         self.message_chain = message_chain;
         self
     }
 
-    // Go: ast/diagnostic.go:77 AddMessageChain
+    // Go: ast/diagnostic.go:93 AddMessageChain
     pub fn add_message_chain(&mut self, message_chain: Option<Diagnostic>) -> &mut Self {
         if let Some(message_chain) = message_chain {
             self.message_chain.push(message_chain);
@@ -314,13 +314,13 @@ impl Diagnostic {
         self
     }
 
-    // Go: ast/diagnostic.go:84 SetRelatedInfo
+    // Go: ast/diagnostic.go:100 SetRelatedInfo
     pub fn set_related_info(&mut self, related_information: Vec<Diagnostic>) -> &mut Self {
         self.related_information = related_information;
         self
     }
 
-    // Go: ast/diagnostic.go:89 AddRelatedInfo
+    // Go: ast/diagnostic.go:105 AddRelatedInfo
     pub fn add_related_info(&mut self, related_information: Option<Diagnostic>) -> &mut Self {
         if let Some(related_information) = related_information {
             self.related_information.push(related_information);
@@ -328,7 +328,7 @@ impl Diagnostic {
         self
     }
 
-    // Go: ast/diagnostic.go:96 Clone
+    // Go: ast/diagnostic.go:112 Clone
     // PORT: Go `d.Clone()` is a shallow copy; use the derived `Clone::clone`.
     // Go shares the slices between the copies, but no Go caller mutates them
     // in place after cloning, so a deep clone behaves the same.
@@ -438,7 +438,7 @@ pub fn is_nil_message(message: &'static crate::diagnostics::Message) -> bool {
     std::ptr::eq(message, NIL_MESSAGE)
 }
 
-// Go: diagnostics/diagnostics.go:117 Format
+// Go: diagnostics/diagnostics.go:129 Format
 // PORT: also Go `diagnostics.Localize` with the default locale; the port has
 // only the English messages. `Message::format` replaces the placeholders,
 // and Go panics on a bad placeholder.
@@ -579,7 +579,7 @@ fn new_ad_hoc_message(message: &str) -> &'static crate::diagnostics::Message {
     leaked
 }
 
-// Go: ast/diagnostic.go:138 NewDiagnostic
+// Go: ast/diagnostic.go:218 NewDiagnostic
 #[must_use]
 pub fn new_diagnostic(
     file: Node,
@@ -606,7 +606,7 @@ pub fn new_diagnostic(
     }
 }
 
-// Go: ast/diagnostic.go:152 NewDiagnosticChain
+// Go: ast/diagnostic.go:232 NewDiagnosticChain
 #[must_use]
 pub fn new_diagnostic_chain(
     chain: Option<Diagnostic>,
@@ -624,7 +624,7 @@ pub fn new_diagnostic_chain(
     new_diagnostic(Node::NIL, TextRange::new(0, 0), message, args)
 }
 
-// Go: ast/diagnostic.go:159 NewCompilerDiagnostic
+// Go: ast/diagnostic.go:239 NewCompilerDiagnostic
 // PORT: Go `core.UndefinedTextRange()` is `TextRange{-1, -1}`.
 #[must_use]
 pub fn new_compiler_diagnostic(
@@ -634,7 +634,7 @@ pub fn new_compiler_diagnostic(
     new_diagnostic(Node::NIL, TextRange::new(-1, -1), message, args)
 }
 
-// Go: ast/diagnostic.go:223 NewExternalDiagnostic (tsgo#4712)
+// Go: ast/diagnostic.go:247 NewExternalDiagnostic (tsgo#4712)
 // NewExternalDiagnostic creates a diagnostic reported by an external source such as a content mapper.
 // The message text is already localized (the external source owns localization) and the code is shown
 // with the given source prefix (e.g. "vue") instead of "TS". The location refers to the file's original,
@@ -696,7 +696,7 @@ pub struct DiagnosticsCollection {
 }
 
 impl DiagnosticsCollection {
-    // Go: ast/diagnostic.go:172 Add
+    // Go: ast/diagnostic.go:269 Add
     // #4825: returns the stored diagnostic: an equal one that is already
     // stored, or `diagnostic`.
     pub fn add(&mut self, diagnostic: Diagnostic) -> &mut Diagnostic {
@@ -743,7 +743,7 @@ impl DiagnosticsCollection {
             .find(|&collision| equal_diagnostics(&self.diagnostics[collision], diagnostic))
     }
 
-    // Go: ast/diagnostic.go:191 Lookup
+    // Go: ast/diagnostic.go:330 Lookup
     // PORT: returns the stored diagnostic (Go returns the pointer).
     pub fn lookup(&mut self, diagnostic: &Diagnostic) -> Option<&mut Diagnostic> {
         let diagnostics = if diagnostic.file().is_some() {
@@ -762,13 +762,13 @@ impl DiagnosticsCollection {
         None
     }
 
-    // Go: ast/diagnostic.go:207 GetGlobalDiagnostics
+    // Go: ast/diagnostic.go:346 GetGlobalDiagnostics
     pub fn get_global_diagnostics(&mut self) -> Vec<Diagnostic> {
         let ids = self.get_global_diagnostics_locked();
         ids.iter().map(|&id| self.diagnostics[id].clone()).collect()
     }
 
-    // Go: ast/diagnostic.go:214 getGlobalDiagnosticsLocked
+    // Go: ast/diagnostic.go:353 getGlobalDiagnosticsLocked
     // PORT: returns positions in `diagnostics` (Go returns the pointers).
     fn get_global_diagnostics_locked(&mut self) -> Vec<usize> {
         if !self.non_file_diagnostics_sorted {
@@ -779,7 +779,7 @@ impl DiagnosticsCollection {
         self.non_file_diagnostics.clone()
     }
 
-    // Go: ast/diagnostic.go:222 GetDiagnosticsForFile
+    // Go: ast/diagnostic.go:361 GetDiagnosticsForFile
     // #4825: takes the source file, not its name.
     pub fn get_diagnostics_for_file(&mut self, file: Node) -> Vec<Diagnostic> {
         self.get_diagnostics_for_file_name(source_file_file_name(file))
@@ -798,7 +798,7 @@ impl DiagnosticsCollection {
         self.file_diagnostics.keys().copied()
     }
 
-    // Go: ast/diagnostic.go:229 getDiagnosticsForFileLocked
+    // Go: ast/diagnostic.go:368 getDiagnosticsForFileLocked
     // PORT: returns positions in `diagnostics` (Go returns the pointers).
     // Takes the file name, the key of the lists.
     fn get_diagnostics_for_file_locked(&mut self, path: &'static str) -> Vec<usize> {
@@ -812,7 +812,7 @@ impl DiagnosticsCollection {
         self.file_diagnostics.get(path).cloned().unwrap_or_default()
     }
 
-    // Go: ast/diagnostic.go:237 GetDiagnostics
+    // Go: ast/diagnostic.go:377 GetDiagnostics
     #[must_use]
     pub fn get_diagnostics(&self) -> Vec<Diagnostic> {
         let mut diagnostics: Vec<Diagnostic> = Vec::with_capacity(self.count as usize);
@@ -835,7 +835,7 @@ fn sort_diagnostic_ids(ids: &mut [usize], diagnostics: &[Diagnostic]) {
     });
 }
 
-// Go: ast/diagnostic.go:288 diagnosticLocationKey (#4825)
+// Go: ast/diagnostic.go:312 diagnosticLocationKey (#4825)
 // PORT: `path` is the file name (see `DiagnosticsCollection`). Go `loc` is
 // `pos` and `end`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -846,7 +846,7 @@ struct DiagnosticLocationKey {
     code: i32,
 }
 
-// Go: ast/diagnostic.go:294 getDiagnosticLocationKey (#4825)
+// Go: ast/diagnostic.go:318 getDiagnosticLocationKey (#4825)
 // PORT: `get_diagnostic_path` is the Go path part: the file name, or "" when
 // there is no file.
 fn get_diagnostic_location_key(diagnostic: &Diagnostic) -> DiagnosticLocationKey {
@@ -858,7 +858,7 @@ fn get_diagnostic_location_key(diagnostic: &Diagnostic) -> DiagnosticLocationKey
     }
 }
 
-// Go: ast/diagnostic.go:250 getDiagnosticPath
+// Go: ast/diagnostic.go:390 getDiagnosticPath
 // PORT: returns `&'static str` (file names live for the program).
 fn get_diagnostic_path(d: &Diagnostic) -> &'static str {
     if d.file().is_some() {
@@ -867,7 +867,7 @@ fn get_diagnostic_path(d: &Diagnostic) -> &'static str {
     ""
 }
 
-// Go: ast/diagnostic.go:257 EqualDiagnostics
+// Go: ast/diagnostic.go:397 EqualDiagnostics
 #[must_use]
 pub fn equal_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> bool {
     if std::ptr::eq(d1, d2) {
@@ -882,7 +882,7 @@ pub fn equal_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> bool {
             .all(|(a, b)| equal_diagnostics(a, b))
 }
 
-// Go: ast/diagnostic.go:381 EqualDiagnosticsNoRelatedInfo
+// Go: ast/diagnostic.go:405 EqualDiagnosticsNoRelatedInfo
 #[must_use]
 pub fn equal_diagnostics_no_related_info(d1: &Diagnostic, d2: &Diagnostic) -> bool {
     if std::ptr::eq(d1, d2) {
@@ -906,7 +906,7 @@ pub fn equal_diagnostics_no_related_info(d1: &Diagnostic, d2: &Diagnostic) -> bo
             .all(|(a, b)| equal_message_chain(a, b))
 }
 
-// Go: ast/diagnostic.go:395 getDiagnosticMessageIdentity (#4825, tsgo#4712)
+// Go: ast/diagnostic.go:419 getDiagnosticMessageIdentity (#4825, tsgo#4712)
 // PORT: a port diagnostic has its message, or `NIL_MESSAGE` for the Go nil
 // message, whose text and key are both "" (see
 // `new_diagnostic_from_serialized`). Go `message.String()` is the message
@@ -921,7 +921,7 @@ fn get_diagnostic_message_identity(diagnostic: &Diagnostic) -> &str {
     diagnostic.message_key()
 }
 
-// Go: ast/diagnostic.go:276 equalMessageChain
+// Go: ast/diagnostic.go:429 equalMessageChain
 fn equal_message_chain(c1: &Diagnostic, c2: &Diagnostic) -> bool {
     if std::ptr::eq(c1, c2) {
         return true;
@@ -945,7 +945,7 @@ fn ordering_to_int(ordering: std::cmp::Ordering) -> i32 {
     }
 }
 
-// Go: ast/diagnostic.go:285 compareMessageChainSize
+// Go: ast/diagnostic.go:438 compareMessageChainSize
 fn compare_message_chain_size(c1: &[Diagnostic], c2: &[Diagnostic]) -> i32 {
     let mut c = c2.len() as i32 - c1.len() as i32;
     if c != 0 {
@@ -960,7 +960,7 @@ fn compare_message_chain_size(c1: &[Diagnostic], c2: &[Diagnostic]) -> i32 {
     0
 }
 
-// Go: ast/diagnostic.go:299 compareMessageChainContent
+// Go: ast/diagnostic.go:452 compareMessageChainContent
 fn compare_message_chain_content(c1: &[Diagnostic], c2: &[Diagnostic]) -> i32 {
     for i in 0..c1.len() {
         let mut c = ordering_to_int(compare_go_bytes_slices(
@@ -982,7 +982,7 @@ fn compare_message_chain_content(c1: &[Diagnostic], c2: &[Diagnostic]) -> i32 {
     0
 }
 
-// Go: ast/diagnostic.go:315 compareRelatedInfo
+// Go: ast/diagnostic.go:468 compareRelatedInfo
 fn compare_related_info(r1: &[Diagnostic], r2: &[Diagnostic]) -> i32 {
     let mut c = r2.len() as i32 - r1.len() as i32;
     if c != 0 {
@@ -997,7 +997,7 @@ fn compare_related_info(r1: &[Diagnostic], r2: &[Diagnostic]) -> i32 {
     0
 }
 
-// Go: ast/diagnostic.go:458 CompareDiagnostics
+// Go: ast/diagnostic.go:482 CompareDiagnostics
 #[must_use]
 pub fn compare_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
     if std::ptr::eq(d1, d2) {
@@ -1363,7 +1363,7 @@ pub struct FlowSwitchClauseData {
     pub clause_end: i32,   // End index of case/default clause range
 }
 
-// Go: ast/flow.go:52 NewFlowSwitchClauseData
+// Go: ast/flow.go:50 NewFlowSwitchClauseData
 // PORT: returns the data value instead of a synthetic `*Node` (see the struct).
 #[must_use]
 pub fn new_flow_switch_clause_data(
@@ -1379,7 +1379,7 @@ pub fn new_flow_switch_clause_data(
 }
 
 impl FlowSwitchClauseData {
-    // Go: ast/flow.go:60 IsEmpty
+    // Go: ast/flow.go:58 IsEmpty
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.clause_start == self.clause_end
@@ -1396,7 +1396,7 @@ pub struct FlowReduceLabelData {
     pub antecedents: Vec<FlowNodeId>, // Temporary antecedent list
 }
 
-// Go: ast/flow.go:72 NewFlowReduceLabelData
+// Go: ast/flow.go:70 NewFlowReduceLabelData
 // PORT: returns the data value instead of a synthetic `*Node` (see the struct).
 #[must_use]
 pub fn new_flow_reduce_label_data(
@@ -1524,7 +1524,7 @@ pub fn compute_position_map(text: &str) -> PositionMap {
 }
 
 impl PositionMap {
-    // Go: ast/positionmap.go:61 IsAsciiOnly
+    // Go: ast/positionmap.go:64 IsAsciiOnly
     // IsAsciiOnly returns true if the text is ASCII-only,
     // meaning UTF-8 and UTF-16 offsets are identical.
     #[must_use]
@@ -1532,7 +1532,7 @@ impl PositionMap {
         self.ascii_only
     }
 
-    // Go: ast/positionmap.go:66 UTF8ToUTF16
+    // Go: ast/positionmap.go:69 UTF8ToUTF16
     // UTF8ToUTF16 converts a UTF-8 byte offset to a UTF-16 code unit offset.
     #[must_use]
     pub fn utf8_to_utf16(&self, utf8_offset: i32) -> i32 {
@@ -1556,7 +1556,7 @@ impl PositionMap {
         utf8_offset - self.entries[lo - 1].delta
     }
 
-    // Go: ast/positionmap.go:88 UTF16ToUTF8
+    // Go: ast/positionmap.go:91 UTF16ToUTF8
     // UTF16ToUTF8 converts a UTF-16 code unit offset to a UTF-8 byte offset.
     #[must_use]
     pub fn utf16_to_utf8(&self, utf16_offset: i32) -> i32 {

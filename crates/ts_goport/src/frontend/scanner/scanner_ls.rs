@@ -9,7 +9,7 @@
 use crate::frontend::prelude::*;
 use crate::frontend::scanner::{Scanner, new_scanner};
 
-// Go: scanner/scanner.go:2519 GetScannerForSourceFile
+// Go: scanner/scanner.go:2505 GetScannerForSourceFile
 // PORT: the scanner borrows the text of `source_file`, so the caller holds
 // it (`let text = source_file_text(source_file);`) while it scans.
 pub fn get_scanner_for_source_file(source_file: Node, text: &str, pos: i32) -> Scanner<'_> {
@@ -22,7 +22,7 @@ pub fn get_scanner_for_source_file(source_file: Node, text: &str, pos: i32) -> S
     s
 }
 
-// Go: scanner/scanner.go:2738 GetECMAPositionOfLineAndByteOffset
+// Go: scanner/scanner.go:2724 GetECMAPositionOfLineAndByteOffset
 /// GetECMAPositionOfLineAndByteOffset converts a 0-based line number and byte offset
 /// from line start back to an absolute byte position in the source text.
 /// Uses ECMAScript line separators.

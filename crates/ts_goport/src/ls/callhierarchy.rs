@@ -10,7 +10,7 @@ use crate::ls::prelude::*;
 use crate::spanmap::Feature;
 use std::cell::OnceCell;
 
-// Go: ls/callhierarchy.go:21 CallHierarchyDeclaration
+// Go: ls/callhierarchy.go:23 CallHierarchyDeclaration
 pub type CallHierarchyDeclaration = Node;
 
 // PORT: Go `findImplementationOrAllInitialDeclarations` and
@@ -23,7 +23,7 @@ pub enum CallHierarchyDeclarationOrDeclarations {
     Nodes(Vec<Node>),
 }
 
-// Go: ls/callhierarchy.go:24 isNamedExpression
+// Go: ls/callhierarchy.go:26 isNamedExpression
 // Indictates whether a node is named function or class expression.
 pub fn is_named_expression(node: Node) -> bool {
     if node.is_nil() {
@@ -36,7 +36,7 @@ pub fn is_named_expression(node: Node) -> bool {
     name.is_some() && is_identifier(name)
 }
 
-// Go: ls/callhierarchy.go:35 isVariableLike
+// Go: ls/callhierarchy.go:37 isVariableLike
 pub fn is_variable_like(node: Node) -> bool {
     if node.is_nil() {
         return false;
@@ -44,7 +44,7 @@ pub fn is_variable_like(node: Node) -> bool {
     is_property_declaration(node) || is_variable_declaration(node)
 }
 
-// Go: ls/callhierarchy.go:43 isAssignedExpression
+// Go: ls/callhierarchy.go:45 isAssignedExpression
 // Indicates whether a node is a function, arrow, or class expression assigned to a constant variable or class property.
 pub fn is_assigned_expression(node: Node) -> bool {
     if node.is_nil() {
@@ -73,7 +73,7 @@ pub fn is_assigned_expression(node: Node) -> bool {
     get_combined_node_flags(parent).intersects(NodeFlags::CONST) || is_property_declaration(parent)
 }
 
-// Go: ls/callhierarchy.go:73 isPossibleCallHierarchyDeclaration
+// Go: ls/callhierarchy.go:75 isPossibleCallHierarchyDeclaration
 // Indicates whether a node could possibly be a call hierarchy declaration.
 //
 // See `resolveCallHierarchyDeclaration` for the specific rules.
@@ -94,7 +94,7 @@ pub fn is_possible_call_hierarchy_declaration(node: Node) -> bool {
         || is_set_accessor_declaration(node)
 }
 
-// Go: ls/callhierarchy.go:93 isValidCallHierarchyDeclaration
+// Go: ls/callhierarchy.go:95 isValidCallHierarchyDeclaration
 // Indicates whether a node is a valid a call hierarchy declaration.
 //
 // See `resolveCallHierarchyDeclaration` for the specific rules.
@@ -122,7 +122,7 @@ pub fn is_valid_call_hierarchy_declaration(node: Node) -> bool {
         || is_assigned_expression(node)
 }
 
-// Go: ls/callhierarchy.go:118 getCallHierarchyDeclarationReferenceNode
+// Go: ls/callhierarchy.go:120 getCallHierarchyDeclarationReferenceNode
 // Gets the node that can be used as a reference to a call hierarchy declaration.
 pub fn get_call_hierarchy_declaration_reference_node(node: Node) -> Node {
     if node.is_nil() {
@@ -154,7 +154,7 @@ pub fn get_call_hierarchy_declaration_reference_node(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ls/callhierarchy.go:147 getSymbolOfCallHierarchyDeclaration
+// Go: ls/callhierarchy.go:149 getSymbolOfCallHierarchyDeclaration
 // Gets the symbol for a call hierarchy declaration.
 pub fn get_symbol_of_call_hierarchy_declaration(c: &mut Checker, node: Node) -> SymbolId {
     if is_class_static_block_declaration(node) {
@@ -167,7 +167,7 @@ pub fn get_symbol_of_call_hierarchy_declaration(c: &mut Checker, node: Node) -> 
     c.get_symbol_at_location_exported(location)
 }
 
-// Go: ls/callhierarchy.go:159 getCallHierarchyItemName
+// Go: ls/callhierarchy.go:161 getCallHierarchyItemName
 // Gets the text and range for the name of a call hierarchy declaration.
 // PORT: Go named results `(text string, pos int, end int)` are a tuple.
 pub fn get_call_hierarchy_item_name(
@@ -251,7 +251,7 @@ pub fn get_call_hierarchy_item_name(
     (text, name_pos, decl_name.end())
 }
 
-// Go: ls/callhierarchy.go:219 getTextOfCallHierarchyName
+// Go: ls/callhierarchy.go:221 getTextOfCallHierarchyName
 pub fn get_text_of_call_hierarchy_name(
     program: &compiler::NewProgram,
     source_node: Node,
@@ -301,7 +301,7 @@ pub fn get_text_of_call_hierarchy_name(
     text
 }
 
-// Go: ls/callhierarchy.go:248 getCallHierarchyItemContainerName
+// Go: ls/callhierarchy.go:250 getCallHierarchyItemContainerName
 pub fn get_call_hierarchy_item_container_name(
     program: &compiler::NewProgram,
     node: Node,
@@ -377,7 +377,7 @@ pub fn get_call_hierarchy_item_container_name(
     String::new()
 }
 
-// Go: ls/callhierarchy.go:296 moveRangePastModifiers
+// Go: ls/callhierarchy.go:298 moveRangePastModifiers
 pub fn move_range_past_modifiers(node: Node) -> TextRange {
     let modifiers = node.modifiers();
     if modifiers.is_some() && !modifiers.nodes().is_empty() {
@@ -388,7 +388,7 @@ pub fn move_range_past_modifiers(node: Node) -> TextRange {
     TextRange::new(node.pos(), node.end())
 }
 
-// Go: ls/callhierarchy.go:305 findImplementation
+// Go: ls/callhierarchy.go:307 findImplementation
 // Finds the implementation of a function-like declaration, if one exists.
 pub fn find_implementation(c: &mut Checker, node: Node) -> Node {
     if node.is_nil() {
@@ -424,7 +424,7 @@ pub fn find_implementation(c: &mut Checker, node: Node) -> Node {
     node
 }
 
-// Go: ls/callhierarchy.go:335 findAllInitialDeclarations
+// Go: ls/callhierarchy.go:337 findAllInitialDeclarations
 // PORT: Go returns nil or a non-empty slice; nil is an empty `Vec`.
 pub fn find_all_initial_declarations(c: &mut Checker, node: Node) -> Vec<Node> {
     if is_class_static_block_declaration(node) {
@@ -479,7 +479,7 @@ pub fn find_all_initial_declarations(c: &mut Checker, node: Node) -> Vec<Node> {
     declarations
 }
 
-// Go: ls/callhierarchy.go:386 findImplementationOrAllInitialDeclarations
+// Go: ls/callhierarchy.go:388 findImplementationOrAllInitialDeclarations
 // Find the implementation or the first declaration for a call hierarchy declaration.
 // PORT: Go returns `any` (see `CallHierarchyDeclarationOrDeclarations`).
 pub fn find_implementation_or_all_initial_declarations(
@@ -509,7 +509,7 @@ pub fn find_implementation_or_all_initial_declarations(
     CallHierarchyDeclarationOrDeclarations::Node(node)
 }
 
-// Go: ls/callhierarchy.go:408 resolveCallHierarchyDeclaration
+// Go: ls/callhierarchy.go:410 resolveCallHierarchyDeclaration
 // Resolves the call hierarchy declaration for a node.
 // PORT: Go returns `any`; a nil result is `None`.
 pub fn resolve_call_hierarchy_declaration(
@@ -676,7 +676,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/callhierarchy.go:526 callSite
+// Go: ls/callhierarchy.go:533 callSite
 #[derive(Clone, Copy, Debug)]
 pub struct CallSite {
     pub declaration: Node,
@@ -684,7 +684,7 @@ pub struct CallSite {
     pub source_file: Node,
 }
 
-// Go: ls/callhierarchy.go:532 convertEntryToCallSite
+// Go: ls/callhierarchy.go:539 convertEntryToCallSite
 pub fn convert_entry_to_call_site(entry: &Rc<RefCell<ReferenceEntry>>) -> Option<CallSite> {
     let (kind, node) = {
         let e = entry.borrow();
@@ -722,7 +722,7 @@ pub fn convert_entry_to_call_site(entry: &Rc<RefCell<ReferenceEntry>>) -> Option
     })
 }
 
-// Go: ls/callhierarchy.go:561 getCallSiteGroupKey
+// Go: ls/callhierarchy.go:568 getCallSiteGroupKey
 // PORT: Go `ast.NodeId` is the `u64` from `get_node_id`.
 pub fn get_call_site_group_key(site: &CallSite) -> u64 {
     get_node_id(site.declaration)
@@ -759,7 +759,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/callhierarchy.go:580 incomingEntry
+// Go: ls/callhierarchy.go:593 incomingEntry
 // PORT: the three `sync.Once` + value pairs are `OnceCell` fields filled on
 // first use.
 pub struct IncomingEntry<'a> {
@@ -774,7 +774,7 @@ pub struct IncomingEntry<'a> {
 }
 
 impl IncomingEntry<'_> {
-    // Go: ls/callhierarchy.go:596 getSourceFile
+    // Go: ls/callhierarchy.go:609 getSourceFile
     pub fn get_source_file(&self) -> Node {
         *self
             .source_file
@@ -782,9 +782,9 @@ impl IncomingEntry<'_> {
     }
 }
 
-// Go: ls/callhierarchy.go:594 var _ lsproto.HasTextDocumentPosition = (*incomingEntry)(nil)
+// Go: ls/callhierarchy.go:607 var _ lsproto.HasTextDocumentPosition = (*incomingEntry)(nil)
 impl lsproto::HasTextDocumentURI for IncomingEntry<'_> {
-    // Go: ls/callhierarchy.go:603 TextDocumentURI
+    // Go: ls/callhierarchy.go:616 TextDocumentURI
     fn text_document_uri(&self) -> lsproto::DocumentUri {
         self.document_uri
             .get_or_init(|| {
@@ -797,7 +797,7 @@ impl lsproto::HasTextDocumentURI for IncomingEntry<'_> {
 }
 
 impl lsproto::HasTextDocumentPosition for IncomingEntry<'_> {
-    // Go: ls/callhierarchy.go:610 TextDocumentPosition
+    // Go: ls/callhierarchy.go:623 TextDocumentPosition
     fn text_document_position(&self) -> lsproto::Position {
         *self.position.get_or_init(|| {
             let start = get_token_pos_of_node(
@@ -811,7 +811,7 @@ impl lsproto::HasTextDocumentPosition for IncomingEntry<'_> {
 }
 
 impl LanguageService {
-    // Go: ls/callhierarchy.go:619 getIncomingCalls
+    // Go: ls/callhierarchy.go:632 getIncomingCalls
     // Gets the call sites that call into the provided call hierarchy declaration.
     pub fn get_incoming_calls(
         &self,
@@ -891,7 +891,7 @@ impl LanguageService {
         Ok(result)
     }
 
-    // Go: ls/callhierarchy.go:660 symbolAndEntriesToIncomingCalls
+    // Go: ls/callhierarchy.go:678 symbolAndEntriesToIncomingCalls
     pub fn symbol_and_entries_to_incoming_calls(
         &self,
         ctx: &Context,
@@ -940,14 +940,14 @@ impl LanguageService {
     }
 }
 
-// Go: ls/callhierarchy.go:691 callSiteCollector
+// Go: ls/callhierarchy.go:711 callSiteCollector
 pub struct CallSiteCollector<'a> {
     pub program: &'a compiler::NewProgram,
     pub call_sites: Vec<CallSite>,
 }
 
 impl CallSiteCollector<'_> {
-    // Go: ls/callhierarchy.go:696 recordCallSite
+    // Go: ls/callhierarchy.go:716 recordCallSite
     pub fn record_call_site(&mut self, node: Node) {
         let mut target = Node::NIL;
 
@@ -1003,7 +1003,7 @@ impl CallSiteCollector<'_> {
         }
     }
 
-    // Go: ls/callhierarchy.go:749 collect
+    // Go: ls/callhierarchy.go:769 collect
     pub fn collect(&mut self, node: Node) {
         if node.is_nil() {
             return;
@@ -1117,7 +1117,7 @@ impl CallSiteCollector<'_> {
     }
 }
 
-// Go: ls/callhierarchy.go:849 collectCallSites
+// Go: ls/callhierarchy.go:869 collectCallSites
 // PORT: Go passes `c *checker.Checker`, leased by `getOutgoingCalls`. The
 // collector calls `resolveCallHierarchyDeclaration`, which leases the program
 // checker again (Go shares one checker between both leases). A Rust
@@ -1246,7 +1246,7 @@ impl LanguageService {
         Some(lsproto::CallHierarchyOutgoingCall { to, from_ranges })
     }
 
-    // Go: ls/callhierarchy.go:938 getOutgoingCalls
+    // Go: ls/callhierarchy.go:964 getOutgoingCalls
     // Gets the call sites that call out of the provided call hierarchy declaration.
     // PORT: Go returns nil or a non-empty slice; nil is an empty `Vec`.
     pub fn get_outgoing_calls(
@@ -1305,7 +1305,7 @@ impl LanguageService {
         result
     }
 
-    // Go: ls/callhierarchy.go:1003 ProvidePrepareCallHierarchy
+    // Go: ls/callhierarchy.go:1004 ProvidePrepareCallHierarchy
     pub fn provide_prepare_call_hierarchy(
         &self,
         ctx: &Context,
@@ -1337,7 +1337,7 @@ impl LanguageService {
         })
     }
 
-    // Go: ls/callhierarchy.go:1027 ProvideCallHierarchyIncomingCalls
+    // Go: ls/callhierarchy.go:1028 ProvideCallHierarchyIncomingCalls
     pub fn provide_call_hierarchy_incoming_calls(
         &self,
         ctx: &Context,

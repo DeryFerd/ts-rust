@@ -15,7 +15,7 @@ use crate::prelude::*;
 // `jsx_implicit_import_container: SymbolId`.
 
 impl Checker {
-    // Go: checker/jsx.go:929 getEffectiveFirstArgumentForJsxSignature
+    // Go: checker/jsx.go:925 getEffectiveFirstArgumentForJsxSignature
     pub fn get_effective_first_argument_for_jsx_signature(
         &mut self,
         signature: SignatureId,
@@ -29,7 +29,7 @@ impl Checker {
         self.get_jsx_props_type_from_class_type(signature, node)
     }
 
-    // Go: checker/jsx.go:936 getJsxPropsTypeFromCallSignature
+    // Go: checker/jsx.go:932 getJsxPropsTypeFromCallSignature
     pub fn get_jsx_props_type_from_call_signature(
         &mut self,
         sig: SignatureId,
@@ -48,7 +48,7 @@ impl Checker {
         props_type
     }
 
-    // Go: checker/jsx.go:946 getJsxPropsTypeFromClassType
+    // Go: checker/jsx.go:942 getJsxPropsTypeFromClassType
     pub fn get_jsx_props_type_from_class_type(
         &mut self,
         sig: SignatureId,
@@ -125,7 +125,7 @@ impl Checker {
         apparent_attributes_type
     }
 
-    // Go: checker/jsx.go:993 getJsxPropsTypeForSignatureFromMember
+    // Go: checker/jsx.go:989 getJsxPropsTypeForSignatureFromMember
     pub fn get_jsx_props_type_for_signature_from_member(
         &mut self,
         sig: SignatureId,
@@ -159,7 +159,7 @@ impl Checker {
         self.get_type_of_property_of_type(instance_type, forced_lookup_location)
     }
 
-    // Go: checker/jsx.go:1022 getJsxManagedAttributesFromLocatedAttributes
+    // Go: checker/jsx.go:1018 getJsxManagedAttributesFromLocatedAttributes
     pub fn get_jsx_managed_attributes_from_located_attributes(
         &mut self,
         context: Node,
@@ -181,7 +181,7 @@ impl Checker {
         attributes_type
     }
 
-    // Go: checker/jsx.go:1034 instantiateAliasOrInterfaceWithDefaults
+    // Go: checker/jsx.go:1030 instantiateAliasOrInterfaceWithDefaults
     pub fn instantiate_alias_or_interface_with_defaults(
         &mut self,
         managed_sym: SymbolId,
@@ -240,7 +240,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/jsx.go:1054 getJsxLibraryManagedAttributes
+    // Go: checker/jsx.go:1050 getJsxLibraryManagedAttributes
     pub fn get_jsx_library_managed_attributes(&mut self, jsx_namespace: SymbolId) -> SymbolId {
         if jsx_namespace.is_some() {
             let exports = self.sym(jsx_namespace).exports;
@@ -249,7 +249,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/jsx.go:1061 getJsxElementTypeSymbol
+    // Go: checker/jsx.go:1057 getJsxElementTypeSymbol
     pub fn get_jsx_element_type_symbol(&mut self, jsx_namespace: SymbolId) -> SymbolId {
         // JSX.ElementType [symbol]
         if jsx_namespace.is_some() {
@@ -267,7 +267,7 @@ impl Checker {
     // or "" if it has 0 properties (which means every
     //
     //	non-intrinsic elements' attributes type is the element instance type)
-    // Go: checker/jsx.go:1077 getJsxElementPropertiesName
+    // Go: checker/jsx.go:1073 getJsxElementPropertiesName
     pub fn get_jsx_element_properties_name(&mut self, jsx_namespace: SymbolId) -> String {
         self.get_name_from_jsx_element_attributes_container(
             "ElementAttributesProperty",
@@ -275,7 +275,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/jsx.go:1081 getJsxElementChildrenPropertyName
+    // Go: checker/jsx.go:1077 getJsxElementChildrenPropertyName
     pub fn get_jsx_element_children_property_name(&mut self, jsx_namespace: SymbolId) -> String {
         if self.compiler_options.jsx == JsxEmit::REACT_JSX
             || self.compiler_options.jsx == JsxEmit::REACT_JSX_DEV
@@ -295,7 +295,7 @@ impl Checker {
     // @param nameOfAttribPropContainer a string of value JsxNames.ElementAttributesPropertyNameContainer or JsxNames.ElementChildrenAttributeNameContainer
     //
     //	if other string is given or the container doesn't exist, return undefined.
-    // Go: checker/jsx.go:1095 getNameFromJsxElementAttributesContainer
+    // Go: checker/jsx.go:1091 getNameFromJsxElementAttributesContainer
     pub fn get_name_from_jsx_element_attributes_container(
         &mut self,
         name_of_attrib_prop_container: &str,
@@ -341,7 +341,7 @@ impl Checker {
         INTERNAL_SYMBOL_NAME_MISSING.to_string()
     }
 
-    // Go: checker/jsx.go:1118 getStaticTypeOfReferencedJsxConstructor
+    // Go: checker/jsx.go:1114 getStaticTypeOfReferencedJsxConstructor
     pub fn get_static_type_of_referenced_jsx_constructor(&mut self, context: Node) -> TypeId {
         if is_jsx_opening_fragment(context) {
             return self.get_jsx_fragment_type(context);
@@ -368,7 +368,7 @@ impl Checker {
         tag_type
     }
 
-    // Go: checker/jsx.go:1139 getIntrinsicAttributesTypeFromStringLiteralType
+    // Go: checker/jsx.go:1135 getIntrinsicAttributesTypeFromStringLiteralType
     pub fn get_intrinsic_attributes_type_from_string_literal_type(
         &mut self,
         t: TypeId,
@@ -398,7 +398,7 @@ impl Checker {
         self.any_type
     }
 
-    // Go: checker/jsx.go:1161 getJsxReferenceKind
+    // Go: checker/jsx.go:1157 getJsxReferenceKind
     pub fn get_jsx_reference_kind(&mut self, node: Node) -> JsxReferenceKind {
         if is_jsx_intrinsic_tag_name(node.tag_name()) {
             return JsxReferenceKind::MIXED;
@@ -420,7 +420,7 @@ impl Checker {
         JsxReferenceKind::MIXED
     }
 
-    // Go: checker/jsx.go:1175 createSignatureForJSXIntrinsic
+    // Go: checker/jsx.go:1171 createSignatureForJSXIntrinsic
     pub fn create_signature_for_jsx_intrinsic(
         &mut self,
         node: Node,
@@ -454,7 +454,7 @@ impl Checker {
     // Get attributes type of the given intrinsic opening-like Jsx element by resolving the tag name.
     // The function is intended to be called from a function which has checked that the opening element is an intrinsic element.
     // @param node an intrinsic JSX opening-like element
-    // Go: checker/jsx.go:1192 getIntrinsicAttributesTypeFromJsxOpeningLikeElement
+    // Go: checker/jsx.go:1188 getIntrinsicAttributesTypeFromJsxOpeningLikeElement
     pub fn get_intrinsic_attributes_type_from_jsx_opening_like_element(
         &mut self,
         node: Node,
@@ -505,7 +505,7 @@ impl Checker {
     // property (in which case nodeLinks.jsxFlags will be IntrinsicNamedElement) or an intrinsic
     // string index signature (in which case nodeLinks.jsxFlags will be IntrinsicIndexedElement).
     // May also return unknownSymbol if both of these lookups fail.
-    // Go: checker/jsx.go:1218 getIntrinsicTagSymbol
+    // Go: checker/jsx.go:1214 getIntrinsicTagSymbol
     pub fn get_intrinsic_tag_symbol(&mut self, node: Node) -> SymbolId {
         let resolved_symbol = self.symbol_node_links.get(node).resolved_symbol;
         if resolved_symbol.is_some() {
@@ -565,7 +565,7 @@ impl Checker {
         unknown_symbol
     }
 
-    // Go: checker/jsx.go:1261 getJsxStatelessElementTypeAt
+    // Go: checker/jsx.go:1257 getJsxStatelessElementTypeAt
     pub fn get_jsx_stateless_element_type_at(&mut self, location: Node) -> TypeId {
         let jsx_element_type = self.get_jsx_element_type_at(location);
         if jsx_element_type.is_nil() {
@@ -575,7 +575,7 @@ impl Checker {
         self.get_union_type(&[jsx_element_type, null_type])
     }
 
-    // Go: checker/jsx.go:1269 getJsxElementClassTypeAt
+    // Go: checker/jsx.go:1265 getJsxElementClassTypeAt
     pub fn get_jsx_element_class_type_at(&mut self, location: Node) -> TypeId {
         let t = self.get_jsx_type("ElementClass", location);
         if self.is_error_type(t) {
@@ -584,12 +584,12 @@ impl Checker {
         t
     }
 
-    // Go: checker/jsx.go:1277 getJsxElementTypeAt
+    // Go: checker/jsx.go:1273 getJsxElementTypeAt
     pub fn get_jsx_element_type_at(&mut self, location: Node) -> TypeId {
         self.get_jsx_type("Element", location)
     }
 
-    // Go: checker/jsx.go:1281 getJsxElementTypeTypeAt
+    // Go: checker/jsx.go:1277 getJsxElementTypeTypeAt
     pub fn get_jsx_element_type_type_at(&mut self, location: Node) -> TypeId {
         let ns = self.get_jsx_namespace_at(location);
         if ns.is_nil() {
@@ -607,7 +607,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/jsx.go:1297 getJsxType
+    // Go: checker/jsx.go:1293 getJsxType
     pub fn get_jsx_type(&mut self, name: &str, location: Node) -> TypeId {
         let namespace = self.get_jsx_namespace_at(location);
         if namespace.is_some() {
@@ -623,7 +623,7 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/jsx.go:1308 getJsxNamespaceAt
+    // Go: checker/jsx.go:1304 getJsxNamespaceAt
     pub fn get_jsx_namespace_at(&mut self, location: Node) -> SymbolId {
         // PORT: Go `links` is nil only when `location` is nil. Links are
         // re-fetched from the store instead of holding a pointer.
@@ -679,7 +679,7 @@ impl Checker {
         s
     }
 
-    // Go: checker/jsx.go:1343 getJsxNamespace
+    // Go: checker/jsx.go:1339 getJsxNamespace
     pub fn get_jsx_namespace(&mut self, location: Node) -> String {
         if location.is_some() {
             let file = get_source_file_of_node(location);
@@ -751,7 +751,7 @@ impl Checker {
         self._jsx_namespace.clone()
     }
 
-    // Go: checker/jsx.go:1392 getLocalJsxNamespace
+    // Go: checker/jsx.go:1388 getLocalJsxNamespace
     pub fn get_local_jsx_namespace(&mut self, file: Node) -> String {
         let local_jsx_namespace = self.source_file_links.get(file).local_jsx_namespace.clone();
         if !local_jsx_namespace.is_empty() {
@@ -772,7 +772,7 @@ impl Checker {
         String::new()
     }
 
-    // Go: checker/jsx.go:1408 getJsxFactoryEntity
+    // Go: checker/jsx.go:1404 getJsxFactoryEntity
     pub fn get_jsx_factory_entity(&mut self, location: Node) -> Node {
         if location.is_some() {
             self.get_jsx_namespace(location);
@@ -787,7 +787,7 @@ impl Checker {
         self._jsx_factory_entity
     }
 
-    // Go: checker/jsx.go:1418 getJsxFragmentFactoryEntity
+    // Go: checker/jsx.go:1414 getJsxFragmentFactoryEntity
     pub fn get_jsx_fragment_factory_entity(&mut self, location: Node) -> Node {
         if location.is_some() {
             let file = get_source_file_of_node(location);
@@ -815,7 +815,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/jsx.go:1439 parseIsolatedEntityName
+    // Go: checker/jsx.go:1435 parseIsolatedEntityName
     pub fn parse_isolated_entity_name(&mut self, name: &str) -> Node {
         let result = crate::frontend::parser::parse_isolated_entity_name(name);
         if result.is_some() {
@@ -824,7 +824,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/jsx.go:1454 getJsxNamespaceContainerForImplicitImport
+    // Go: checker/jsx.go:1449 getJsxNamespaceContainerForImplicitImport
     pub fn get_jsx_namespace_container_for_implicit_import(&mut self, location: Node) -> SymbolId {
         let file = get_source_file_of_node(location);
         let container = self
@@ -890,7 +890,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/jsx.go:1480 getJSXRuntimeImportSpecifier
+    // Go: checker/jsx.go:1486 getJSXRuntimeImportSpecifier
     pub fn get_jsx_runtime_import_specifier(&mut self, file: Node) -> (String, Node) {
         // PORT: Go `c.program.GetJSXRuntimeImportSpecifier(file.Path())` is the
         // program.rs free function of the same snake name.
@@ -898,7 +898,7 @@ impl Checker {
     }
 }
 
-// Go: checker/jsx.go:1447 markAsSynthetic
+// Go: checker/jsx.go:1443 markAsSynthetic
 // PORT: the isolated parse has no file store, so its nodes are factory
 // nodes and `set_node_loc` can write them.
 pub fn mark_as_synthetic(node: Node) -> bool {

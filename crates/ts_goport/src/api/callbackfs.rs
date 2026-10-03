@@ -13,7 +13,7 @@ use crate::gostd::{Context, GoError, errors};
 use crate::ipc::Conn;
 use std::time::SystemTime;
 
-// Go: callbackfs.go:19 callbackFS
+// Go: callbackfs.go:20 callbackFS
 // callbackFS wraps a base filesystem and delegates certain operations
 // to the client via RPC callbacks. This allows the API client to provide
 // a virtual filesystem (e.g., in-memory files for testing).
@@ -44,7 +44,7 @@ const CALLBACK_WRITE_FILE: &str = "writeFile";
 // ts#64158
 const CALLBACK_REMOVE_FILE: &str = "removeFile";
 
-// Go: callbackfs.go:37 isCallbackName
+// Go: callbackfs.go:40 isCallbackName
 fn is_callback_name(name: &str) -> bool {
     matches!(
         name,
@@ -58,7 +58,7 @@ fn is_callback_name(name: &str) -> bool {
     )
 }
 
-// Go: callbackfs.go:53 newCallbackFS
+// Go: callbackfs.go:58 newCallbackFS
 // newCallbackFS creates a new callbackFS wrapping the given base filesystem.
 // The callbacks slice specifies which filesystem operations should be delegated
 // to the client (e.g., "readFile", "fileExists").
@@ -155,7 +155,7 @@ impl MarshalerTo for WriteFilePayload {
 }
 
 impl CallbackFS {
-    // Go: callbackfs.go:70 SetConnection
+    // Go: callbackfs.go:75 SetConnection
     // SetConnection sets the RPC connection for callbacks.
     // This must be called after the transport connection is established
     // but before any filesystem operations that need callbacks.
@@ -164,13 +164,13 @@ impl CallbackFS {
         *self.conn.borrow_mut() = Some(conn);
     }
 
-    // Go: callbackfs.go:76 isEnabled
+    // Go: callbackfs.go:81 isEnabled
     // isEnabled returns true if the named callback is enabled.
     fn is_enabled(&self, name: &str) -> bool {
         self.enabled_callbacks.get(name).copied().unwrap_or(false)
     }
 
-    // Go: callbackfs.go:81 call
+    // Go: callbackfs.go:86 call
     // call invokes a callback on the client and returns the result.
     // PORT: Go `arg any` is any value that marshals (`AnyValue`).
     fn call(&self, name: &str, arg: impl AnyValue) -> Result<Vec<u8>, GoError> {
@@ -200,13 +200,13 @@ fn panic_error(err: &GoError) -> ! {
 }
 
 impl Fs for CallbackFS {
-    // Go: callbackfs.go:94 UseCaseSensitiveFileNames
+    // Go: callbackfs.go:99 UseCaseSensitiveFileNames
     // UseCaseSensitiveFileNames implements vfs.FS.
     fn use_case_sensitive_file_names(&self) -> bool {
         self.base.use_case_sensitive_file_names()
     }
 
-    // Go: callbackfs.go:104 ReadFile
+    // Go: callbackfs.go:109 ReadFile
     // ReadFile implements vfs.FS.
     //
     // The readFile callback uses a wrapped response format to distinguish three states:
@@ -233,7 +233,7 @@ impl Fs for CallbackFS {
         self.base.read_file(path)
     }
 
-    // Go: callbackfs.go:127 FileExists
+    // Go: callbackfs.go:132 FileExists
     // FileExists implements vfs.FS.
     fn file_exists(&self, path: &str) -> bool {
         if self.is_enabled(CALLBACK_FILE_EXISTS) {
@@ -248,7 +248,7 @@ impl Fs for CallbackFS {
         self.base.file_exists(path)
     }
 
-    // Go: callbackfs.go:141 DirectoryExists
+    // Go: callbackfs.go:146 DirectoryExists
     // DirectoryExists implements vfs.FS.
     fn directory_exists(&self, path: &str) -> bool {
         if self.is_enabled(CALLBACK_DIRECTORY_EXISTS) {
@@ -263,7 +263,7 @@ impl Fs for CallbackFS {
         self.base.directory_exists(path)
     }
 
-    // Go: callbackfs.go:155 GetAccessibleEntries
+    // Go: callbackfs.go:160 GetAccessibleEntries
     // GetAccessibleEntries implements vfs.FS.
     fn get_accessible_entries(&self, path: &str) -> Entries {
         if self.is_enabled(CALLBACK_GET_ACCESSIBLE_ENTRIES) {
@@ -290,7 +290,7 @@ impl Fs for CallbackFS {
         self.base.get_accessible_entries(path)
     }
 
-    // Go: callbackfs.go:181 Realpath
+    // Go: callbackfs.go:186 Realpath
     // Realpath implements vfs.FS.
     fn realpath(&self, path: &str) -> String {
         if self.is_enabled(CALLBACK_REALPATH) {
@@ -310,7 +310,7 @@ impl Fs for CallbackFS {
         self.base.realpath(path)
     }
 
-    // Go: callbackfs.go:202 WriteFile
+    // Go: callbackfs.go:204 WriteFile
     // WriteFile implements vfs.FS.
     // PORT: Go returns the callback error; it is `FsError::Other` with its
     // text.
@@ -331,13 +331,13 @@ impl Fs for CallbackFS {
         self.base.write_file(path, data)
     }
 
-    // Go: callbackfs.go:204 AppendFile
+    // Go: callbackfs.go:222 AppendFile
     // AppendFile implements vfs.FS - always delegates to base (no callback support).
     fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         self.base.append_file(path, data)
     }
 
-    // Go: callbackfs.go:209 Remove
+    // Go: callbackfs.go:227 Remove
     // Remove implements vfs.FS.
     // PORT: Go returns the callback error; it is `FsError::Other` with its
     // text (as in `write_file`).
@@ -352,7 +352,7 @@ impl Fs for CallbackFS {
         self.base.remove(path)
     }
 
-    // Go: callbackfs.go:214 Chtimes
+    // Go: callbackfs.go:236 Chtimes
     // Chtimes implements vfs.FS - always delegates to base (no callback support).
     fn chtimes(
         &self,
@@ -363,7 +363,7 @@ impl Fs for CallbackFS {
         self.base.chtimes(path, a_time, m_time)
     }
 
-    // Go: callbackfs.go:219 Stat
+    // Go: callbackfs.go:241 Stat
     // Stat implements vfs.FS - always delegates to base (no callback support).
     fn stat(&self, path: &str) -> Option<FileInfo> {
         self.base.stat(path)

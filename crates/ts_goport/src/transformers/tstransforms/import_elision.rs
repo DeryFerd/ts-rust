@@ -182,12 +182,12 @@ impl TransformerVisit for ImportElisionTransformer {
 }
 
 impl ImportElisionTransformer {
-    // Go: transformers/tstransforms/importelision.go:121 ImportElisionTransformer.shouldEmitAliasDeclaration
+    // Go: transformers/tstransforms/importelision.go:129 ImportElisionTransformer.shouldEmitAliasDeclaration
     fn should_emit_alias_declaration(&self, node: Node) -> bool {
         is_in_js_file(node) || self.is_referenced_alias_declaration(node)
     }
 
-    // Go: transformers/tstransforms/importelision.go:125 ImportElisionTransformer.shouldEmitImportEqualsDeclaration
+    // Go: transformers/tstransforms/importelision.go:133 ImportElisionTransformer.shouldEmitImportEqualsDeclaration
     fn should_emit_import_equals_declaration(&self, node: Node) -> bool {
         // preserve old compiler's behavior: emit import declaration (even if we do not consider them referenced) when
         // - current file is not external module
@@ -197,19 +197,19 @@ impl ImportElisionTransformer {
                 && self.is_top_level_value_import_equals_with_entity_name(node))
     }
 
-    // Go: transformers/tstransforms/importelision.go:132 ImportElisionTransformer.isReferencedAliasDeclaration
+    // Go: transformers/tstransforms/importelision.go:140 ImportElisionTransformer.isReferencedAliasDeclaration
     fn is_referenced_alias_declaration(&self, node: Node) -> bool {
         let node = self.emit_context.parse_node(node);
         node.is_nil() || self.emit_resolver.is_referenced_alias_declaration(node)
     }
 
-    // Go: transformers/tstransforms/importelision.go:137 ImportElisionTransformer.isValueAliasDeclaration
+    // Go: transformers/tstransforms/importelision.go:145 ImportElisionTransformer.isValueAliasDeclaration
     fn is_value_alias_declaration(&self, node: Node) -> bool {
         let node = self.emit_context.parse_node(node);
         node.is_nil() || self.emit_resolver.is_value_alias_declaration(node)
     }
 
-    // Go: transformers/tstransforms/importelision.go:142 ImportElisionTransformer.isTopLevelValueImportEqualsWithEntityName
+    // Go: transformers/tstransforms/importelision.go:150 ImportElisionTransformer.isTopLevelValueImportEqualsWithEntityName
     fn is_top_level_value_import_equals_with_entity_name(&self, node: Node) -> bool {
         let node = self.emit_context.parse_node(node);
         node.is_some()

@@ -127,7 +127,7 @@ impl Emitter {
         self.writer.as_ref().expect("nil writer").borrow_mut()
     }
 
-    // Go: compiler/emitter.go:45 emitter.emit
+    // Go: compiler/emitter.go:46 emitter.emit
     pub fn emit(&mut self) {
         let _trace = crate::tracing::get().map(|tr| {
             tr.push(
@@ -184,7 +184,7 @@ impl Emitter {
         transformers
     }
 
-    // Go: compiler/emitter.go:59 emitter.runScriptTransformers
+    // Go: compiler/emitter.go:68 emitter.runScriptTransformers
     fn run_script_transformers(
         &self,
         emit_context: &Rc<EmitContext>,
@@ -204,7 +204,7 @@ impl Emitter {
         source_file
     }
 
-    // Go: compiler/emitter.go:69 emitter.runDeclarationTransformers
+    // Go: compiler/emitter.go:78 emitter.runDeclarationTransformers
     fn run_declaration_transformers(
         &self,
         emit_context: &Rc<EmitContext>,
@@ -335,7 +335,7 @@ impl Emitter {
         self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
     }
 
-    // Go: compiler/emitter.go:223 emitter.emitDeclarationFile
+    // Go: compiler/emitter.go:221 emitter.emitDeclarationFile
     fn emit_declaration_file(
         &mut self,
         source_file: Node,
@@ -681,7 +681,7 @@ impl Emitter {
         diagnostics.get_diagnostics()
     }
 
-    // Go: compiler/emitter.go:374 emitter.writeText
+    // Go: compiler/emitter.go:395 emitter.writeText
     fn write_text(
         &self,
         file_name: &str,
@@ -694,7 +694,7 @@ impl Emitter {
         crate::printer::EmitHost::write_file(self.host.as_ref(), file_name, text)
     }
 
-    // Go: compiler/emitter.go:397 emitter.getSourceMapDirectory
+    // Go: compiler/emitter.go:417 emitter.getSourceMapDirectory
     fn get_source_map_directory(
         &self,
         map_options: &CompilerOptions,
@@ -726,7 +726,7 @@ impl Emitter {
         get_directory_path(&normalize_path(file_path))
     }
 
-    // Go: compiler/emitter.go:422 emitter.getSourceMappingURL
+    // Go: compiler/emitter.go:443 emitter.getSourceMappingURL
     fn get_source_mapping_url(
         &self,
         map_options: &CompilerOptions,
@@ -806,7 +806,7 @@ impl crate::sourcemap::source::Source for DeclarationMapSource {
     }
 }
 
-// Go: compiler/emitter.go:84 getModuleTransformer
+// Go: compiler/emitter.go:90 getModuleTransformer
 fn get_module_transformer(opts: &TransformOptions) -> Option<TransformerBox> {
     use crate::transformers::moduletransforms;
     match opts.compiler_options.get_emit_module_kind() {
@@ -865,7 +865,7 @@ struct ScriptTransformChoice {
     emit_resolver_references: bool,
 }
 
-// Go: compiler/emitter.go:107 getScriptTransformers (its first lines)
+// Go: compiler/emitter.go:112 getScriptTransformers (its first lines)
 fn script_transform_choice(options: &CompilerOptions, source_file: Node) -> ScriptTransformChoice {
     // JS files don't use reference calculations as they don't do import elision, no need to calculate it
     let import_elision_enabled =
@@ -929,7 +929,7 @@ fn may_have_enum_declaration(source_file: Node) -> bool {
             .any(|extra| is_enum(extra.local_symbol))
 }
 
-// Go: compiler/emitter.go:107 getScriptTransformers
+// Go: compiler/emitter.go:112 getScriptTransformers
 pub fn get_script_transformers(
     emit_context: &Rc<EmitContext>,
     host: &Rc<crate::program::EmitHost>,
@@ -1041,13 +1041,13 @@ pub fn parsed_source_file(file: Node) -> Node {
     file
 }
 
-// Go: compiler/emitter.go:380 shouldEmitSourceMaps
+// Go: compiler/emitter.go:402 shouldEmitSourceMaps
 fn should_emit_source_maps(map_options: &CompilerOptions, source_file: Node) -> bool {
     (map_options.source_map.is_true() || map_options.inline_source_map.is_true())
         && !file_extension_is(source_file_file_name(source_file), ".json")
 }
 
-// Go: compiler/emitter.go:385 getSourceRoot
+// Go: compiler/emitter.go:407 getSourceRoot
 fn get_source_root(map_options: &CompilerOptions) -> String {
     // Normalize source root and make sure it has trailing "/" so that it can be used to combine paths with the
     // relative paths of the sources list in the sourcemap

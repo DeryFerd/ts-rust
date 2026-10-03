@@ -138,7 +138,7 @@ impl ToBuildInfo<'_> {
         file_id_list_id
     }
 
-    // Go: incremental/snapshottobuildinfo.go:103 toRelativeToBuildInfoCompilerOptionValue
+    // Go: incremental/snapshottobuildinfo.go:109 toRelativeToBuildInfoCompilerOptionValue
     fn to_relative_to_build_info_compiler_option_value(
         &self,
         option: &CommandLineOption,
@@ -167,7 +167,7 @@ impl ToBuildInfo<'_> {
         v
     }
 
-    // Go: incremental/snapshottobuildinfo.go:118 toBuildInfoDiagnosticsFromFileNameDiagnostics
+    // Go: incremental/snapshottobuildinfo.go:124 toBuildInfoDiagnosticsFromFileNameDiagnostics
     fn to_build_info_diagnostics_from_file_name_diagnostics(
         &mut self,
         diagnostics: &[BuildInfoDiagnosticWithFileName],
@@ -207,7 +207,7 @@ impl ToBuildInfo<'_> {
             .collect()
     }
 
-    // Go: incremental/snapshottobuildinfo.go:143 toBuildInfoDiagnosticsFromDiagnostics
+    // Go: incremental/snapshottobuildinfo.go:151 toBuildInfoDiagnosticsFromDiagnostics
     fn to_build_info_diagnostics_from_diagnostics(
         &mut self,
         file_path: &Path,
@@ -257,7 +257,7 @@ impl ToBuildInfo<'_> {
             .collect()
     }
 
-    // Go: incremental/snapshottobuildinfo.go:183 toBuildInfoDiagnosticsOfFile
+    // Go: incremental/snapshottobuildinfo.go:193 toBuildInfoDiagnosticsOfFile
     fn to_build_info_diagnostics_of_file(
         &mut self,
         file_path: &Path,
@@ -281,7 +281,7 @@ impl ToBuildInfo<'_> {
         None
     }
 
-    // Go: incremental/snapshottobuildinfo.go:199 collectRootFiles
+    // Go: incremental/snapshottobuildinfo.go:209 collectRootFiles
     fn collect_root_files(&mut self) {
         for file_name in command_line().file_names() {
             let redirect = get_parse_file_redirect(file_name);
@@ -303,7 +303,7 @@ impl ToBuildInfo<'_> {
         }
     }
 
-    // Go: incremental/snapshottobuildinfo.go:213 setFileInfoAndEmitSignatures
+    // Go: incremental/snapshottobuildinfo.go:223 setFileInfoAndEmitSignatures
     fn set_file_info_and_emit_signatures(&mut self) {
         let snapshot = self.snapshot;
         let mut file_infos = Vec::new();
@@ -525,7 +525,7 @@ impl ToBuildInfo<'_> {
         }
     }
 
-    // Go: incremental/snapshottobuildinfo.go:339 setEmitDiagnostics
+    // Go: incremental/snapshottobuildinfo.go:349 setEmitDiagnostics
     // PORT: Go `core.Map` keeps a nil entry for a file whose cached lists are
     // both empty. It marshals as `null` (`BuildInfoDiagnosticsOfFilePtr`).
     fn set_emit_diagnostics(&mut self) {
@@ -590,7 +590,7 @@ impl ToBuildInfo<'_> {
         self.build_info.root = Some(roots);
     }
 
-    // Go: incremental/snapshottobuildinfo.go:374 setPackageJsons
+    // Go: incremental/snapshottobuildinfo.go:383 setPackageJsons
     fn set_package_jsons(&mut self) {
         let snapshot = self.snapshot;
         if let Some(package_jsons) = &snapshot.package_jsons

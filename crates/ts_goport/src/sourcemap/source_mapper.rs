@@ -417,7 +417,7 @@ fn try_parse_base64_url(url: &str) -> (&str, bool) {
     (url, true)
 }
 
-// Go: scanner/scanner.go:2755 ComputePositionOfLineAndUTF16Character
+// Go: scanner/scanner.go:2741 ComputePositionOfLineAndUTF16Character
 // ComputePositionOfLineAndUTF16Character converts a line and UTF-16 character offset
 // back to a byte position. The character parameter is measured in UTF-16 code units.
 // It scans from the line start to correctly handle multi-byte characters.
@@ -507,7 +507,7 @@ fn utf16_rune_len(r: i32) -> i32 {
     }
 }
 
-// Go: core/core.go:810 DeduplicateSorted
+// Go: core/core.go:847 DeduplicateSorted
 // PORT: Go package `core`; not ported elsewhere in the crate.
 fn deduplicate_sorted<T: Copy>(slice: Vec<T>, is_equal: impl Fn(&T, &T) -> bool) -> Vec<T> {
     if slice.is_empty() {

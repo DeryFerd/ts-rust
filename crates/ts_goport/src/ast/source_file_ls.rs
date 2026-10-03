@@ -31,7 +31,7 @@ thread_local! {
         const { RefCell::new(PerFileMap::new()) };
 }
 
-// Go: ast/ast.go:2407 SourceFileDataKey
+// Go: ast/ast.go:2386 SourceFileDataKey
 /// SourceFileDataKey identifies lazily-computed data attached to a SourceFile by
 /// another package. Prefer regular SourceFile fields for ast-owned data.
 // PORT: Go `key sourceFileDataKey` is `u64` (Go `type sourceFileDataKey
@@ -60,16 +60,16 @@ impl<T> std::fmt::Debug for SourceFileDataKey<T> {
     }
 }
 
-// Go: ast/ast.go:2414 sourceFileDataKeyCounter
+// Go: ast/ast.go:2393 sourceFileDataKeyCounter
 static SOURCE_FILE_DATA_KEY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-// Go: ast/ast.go:2416 sourceFileDataCell
+// Go: ast/ast.go:2395 sourceFileDataCell
 // PORT: Go `once sync.Once` and `value T` are one `OnceCell<T>`.
 pub struct SourceFileDataCell<T> {
     value: OnceCell<T>,
 }
 
-// Go: ast/ast.go:2421 NewSourceFileDataKey
+// Go: ast/ast.go:2400 NewSourceFileDataKey
 pub fn new_source_file_data_key<T>() -> SourceFileDataKey<T> {
     SourceFileDataKey {
         // Go `atomic.Uint64.Add(1)` returns the new value.
@@ -124,7 +124,7 @@ fn source_file_get_data_cell<T: 'static>(
     })
 }
 
-// Go: ast/ast.go:2462 TokenCacheKey
+// Go: ast/ast.go:2441 TokenCacheKey
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TokenCacheKey {
     parent: Node,
@@ -180,7 +180,7 @@ pub fn source_file_get_or_create_token(
     token
 }
 
-// Go: ast/ast.go:2807 createToken
+// Go: ast/ast.go:2935 createToken
 /// `kind` should be a token kind.
 fn create_token(kind: SyntaxKind, file: Node, pos: i32, end: i32, flags: TokenFlags) -> Node {
     // Go: if file.tokenFactory == nil { file.tokenFactory = NewNodeFactory(NodeFactoryHooks{}) }

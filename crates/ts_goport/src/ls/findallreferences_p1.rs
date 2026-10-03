@@ -132,7 +132,7 @@ go_enum!(EntryKind, i32 {
     SEARCHED_PROPERTY_FOUND_LOCAL = 5;
 });
 
-// Go: ls/findallreferences.go:105 ReferenceEntry
+// Go: ls/findallreferences.go:104 ReferenceEntry
 // PORT: Go `*core.TextRange` and `*lsproto.Location` are `Option`s. Go
 // `*ast.SourceFile` is the file root `Node` (nil is `Node::NIL`).
 #[derive(Clone, Debug, Default)]
@@ -147,13 +147,13 @@ pub struct ReferenceEntry {
 }
 
 impl ReferenceEntry {
-    // Go: ls/findallreferences.go:114 Node
+    // Go: ls/findallreferences.go:115 Node
     // Node returns the AST node for this reference entry.
     pub fn node(&self) -> Node {
         self.node
     }
 
-    // Go: ls/findallreferences.go:119 IsNodeEntry
+    // Go: ls/findallreferences.go:120 IsNodeEntry
     // IsNodeEntry returns true if this is a node-backed reference entry.
     pub fn is_node_entry(&self) -> bool {
         self.node.is_some()
@@ -161,13 +161,13 @@ impl ReferenceEntry {
 }
 
 impl SymbolAndEntries {
-    // Go: ls/findallreferences.go:124 References
+    // Go: ls/findallreferences.go:125 References
     // References returns the reference entries for this symbol.
     pub fn references(&self) -> &[Rc<RefCell<ReferenceEntry>>] {
         &self.references
     }
 
-    // Go: ls/findallreferences.go:129 DefinitionNode
+    // Go: ls/findallreferences.go:130 DefinitionNode
     // DefinitionNode returns the defining AST node for this symbol, if any.
     // PORT: reading `symbol.Declarations` takes the symbol arena.
     pub fn definition_node(&self, symbols: &SymbolArena) -> Node {
@@ -183,7 +183,7 @@ impl SymbolAndEntries {
         Node::NIL
     }
 
-    // Go: ls/findallreferences.go:142 DefinitionSymbol
+    // Go: ls/findallreferences.go:143 DefinitionSymbol
     pub fn definition_symbol(&self) -> SymbolId {
         let Some(definition) = &self.definition else {
             return SymbolId::NIL;
@@ -191,7 +191,7 @@ impl SymbolAndEntries {
         definition.symbol
     }
 
-    // Go: ls/findallreferences.go:149 canUseDefinitionSymbol
+    // Go: ls/findallreferences.go:150 canUseDefinitionSymbol
     pub fn can_use_definition_symbol(&self) -> bool {
         let Some(definition) = &self.definition else {
             return false;
@@ -211,7 +211,7 @@ impl SymbolAndEntries {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:169 getRangeOfEntry
+    // Go: ls/findallreferences.go:168 getRangeOfEntry
     pub fn get_range_of_entry(&self, entry: &Rc<RefCell<ReferenceEntry>>) -> lsproto::Range {
         self.resolve_entry(entry)
             .borrow()
@@ -221,7 +221,7 @@ impl<P: ProgramView> LanguageService<P> {
             .range
     }
 
-    // Go: ls/findallreferences.go:173 getRangeOfEntryForFeature
+    // Go: ls/findallreferences.go:172 getRangeOfEntryForFeature
     pub fn get_range_of_entry_for_feature(
         &self,
         entry: &Rc<RefCell<ReferenceEntry>>,
@@ -231,7 +231,7 @@ impl<P: ProgramView> LanguageService<P> {
         (location.range, ok)
     }
 
-    // Go: ls/findallreferences.go:178 getFileNameOfEntry
+    // Go: ls/findallreferences.go:177 getFileNameOfEntry
     pub fn get_file_name_of_entry(
         &self,
         entry: &Rc<RefCell<ReferenceEntry>>,
@@ -245,7 +245,7 @@ impl<P: ProgramView> LanguageService<P> {
             .clone()
     }
 
-    // Go: ls/findallreferences.go:187 getLocationOfEntryForFeature
+    // Go: ls/findallreferences.go:181 getLocationOfEntryForFeature
     pub fn get_location_of_entry_for_feature(
         &self,
         entry: &Rc<RefCell<ReferenceEntry>>,
@@ -265,7 +265,7 @@ impl<P: ProgramView> LanguageService<P> {
         (location, fidelity.is_single_segment())
     }
 
-    // Go: ls/findallreferences.go:193 resolveEntrySource
+    // Go: ls/findallreferences.go:187 resolveEntrySource
     pub fn resolve_entry_source(&self, entry: &Rc<RefCell<ReferenceEntry>>) {
         let mut e = entry.borrow_mut();
         if e.source_file.is_nil() {
@@ -281,7 +281,7 @@ impl<P: ProgramView> LanguageService<P> {
         }
     }
 
-    // Go: ls/findallreferences.go:204 resolveEntry
+    // Go: ls/findallreferences.go:198 resolveEntry
     // PORT: Go returns the same pointer; here a clone of the same handle.
     pub fn resolve_entry(
         &self,
@@ -304,14 +304,14 @@ impl<P: ProgramView> LanguageService<P> {
     }
 }
 
-// Go: ls/findallreferences.go:214 newNodeEntryWithKind
+// Go: ls/findallreferences.go:208 newNodeEntryWithKind
 pub fn new_node_entry_with_kind(node: Node, kind: EntryKind) -> Rc<RefCell<ReferenceEntry>> {
     let e = new_node_entry(node);
     e.borrow_mut().kind = kind;
     e
 }
 
-// Go: ls/findallreferences.go:220 newNodeEntry
+// Go: ls/findallreferences.go:214 newNodeEntry
 pub fn new_node_entry(node: Node) -> Rc<RefCell<ReferenceEntry>> {
     // creates nodeEntry with `kind == entryKindNode`
     let name = node.name();
@@ -323,7 +323,7 @@ pub fn new_node_entry(node: Node) -> Rc<RefCell<ReferenceEntry>> {
     }))
 }
 
-// Go: ls/findallreferences.go:229 getContextNodeForNodeEntry
+// Go: ls/findallreferences.go:223 getContextNodeForNodeEntry
 pub fn get_context_node_for_node_entry(node: Node) -> Node {
     if is_declaration(node) {
         return get_context_node(node);
@@ -406,7 +406,7 @@ pub fn get_context_node_for_node_entry(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ls/findallreferences.go:292 getContextNode
+// Go: ls/findallreferences.go:286 getContextNode
 pub fn get_context_node(node: Node) -> Node {
     if node.is_nil() {
         return Node::NIL;
@@ -463,7 +463,7 @@ pub fn get_context_node(node: Node) -> Node {
     }
 }
 
-// Go: ls/findallreferences.go:341 getRangeOfNode
+// Go: ls/findallreferences.go:335 getRangeOfNode
 pub fn get_range_of_node(node: Node, mut source_file: Node, end_node: Node) -> TextRange {
     if source_file.is_nil() {
         source_file = get_source_file_of_node(node);
@@ -483,7 +483,7 @@ pub fn get_range_of_node(node: Node, mut source_file: Node, end_node: Node) -> T
     TextRange::new(start, end)
 }
 
-// Go: ls/findallreferences.go:348 isValidReferencePosition
+// Go: ls/findallreferences.go:354 isValidReferencePosition
 pub fn is_valid_reference_position(node: Node, search_symbol_name: &str) -> bool {
     match node.kind() {
         SyntaxKind::PrivateIdentifier => {
@@ -513,12 +513,12 @@ pub fn is_valid_reference_position(node: Node, search_symbol_name: &str) -> bool
     }
 }
 
-// Go: ls/findallreferences.go:372 isForRenameWithPrefixAndSuffixText
+// Go: ls/findallreferences.go:378 isForRenameWithPrefixAndSuffixText
 pub fn is_for_rename_with_prefix_and_suffix_text(options: RefOptions) -> bool {
     options.use_ == ReferenceUse::RENAME && options.use_aliases_for_rename
 }
 
-// Go: ls/findallreferences.go:376 skipPastExportOrImportSpecifierOrUnion
+// Go: ls/findallreferences.go:382 skipPastExportOrImportSpecifierOrUnion
 pub fn skip_past_export_or_import_specifier_or_union(
     symbol: SymbolId,
     node: Node,
@@ -568,7 +568,7 @@ pub fn skip_past_export_or_import_specifier_or_union(
     SymbolId::NIL
 }
 
-// Go: ls/findallreferences.go:401 getSymbolScope
+// Go: ls/findallreferences.go:407 getSymbolScope
 // PORT: Go reads the symbol without a checker and calls the package
 // function `checker.IsExternalModuleSymbol`, which is a `Checker` method
 // here. The checker is the first parameter.
@@ -661,7 +661,7 @@ pub fn get_symbol_scope(c: &Checker, symbol: SymbolId) -> Node {
 
 // === functions on (*ls) ===
 
-// Go: ls/findallreferences.go:474 position
+// Go: ls/findallreferences.go:480 position
 // PORT: Go `position`; the Rust type name is `Position`. Write
 // `lsproto::Position` qualified in ls code.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -673,20 +673,20 @@ pub struct Position {
 // Go: ls/findallreferences.go:479 `var _ lsproto.HasTextDocumentPosition = (*position)(nil)`
 
 impl HasTextDocumentURI for Position {
-    // Go: ls/findallreferences.go:481 TextDocumentURI
+    // Go: ls/findallreferences.go:487 TextDocumentURI
     fn text_document_uri(&self) -> lsproto::DocumentUri {
         self.uri.clone()
     }
 }
 
 impl HasTextDocumentPosition for Position {
-    // Go: ls/findallreferences.go:482 TextDocumentPosition
+    // Go: ls/findallreferences.go:488 TextDocumentPosition
     fn text_document_position(&self) -> lsproto::Position {
         self.pos
     }
 }
 
-// Go: ls/findallreferences.go:484 nonLocalDefinition
+// Go: ls/findallreferences.go:490 nonLocalDefinition
 // PORT: Go embeds `position`; here the field `position`, and the two
 // `HasTextDocument*` impls below forward to it. The Go `sync.OnceValue`
 // functions close over the language service, so the struct borrows it
@@ -713,7 +713,7 @@ impl HasTextDocumentPosition for NonLocalDefinition<'_> {
     }
 }
 
-// Go: ls/findallreferences.go:490 getFileAndStartPosFromDeclaration
+// Go: ls/findallreferences.go:496 getFileAndStartPosFromDeclaration
 // PORT: Go `core.TextPos` is `i32`.
 pub fn get_file_and_start_pos_from_declaration(declaration: Node) -> (Node, i32) {
     let file = get_source_file_of_node(declaration);
@@ -727,7 +727,7 @@ pub fn get_file_and_start_pos_from_declaration(declaration: Node) -> (Node, i32)
 }
 
 impl LanguageService {
-    // Go: ls/findallreferences.go:498 getNonLocalDefinition
+    // Go: ls/findallreferences.go:504 getNonLocalDefinition
     pub fn get_non_local_definition(
         &self,
         ctx: &Context,
@@ -814,7 +814,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/findallreferences.go:545 isDefinitionVisible
+// Go: ls/findallreferences.go:561 isDefinitionVisible
 // This is special handling to determine if we should load up more projects and find location in other projects
 // By default arrows (and such other ast kinds) are not visible as declaration emitter doesnt need them
 // But we want to handle them specially so that they are visible if their parent is visible
@@ -869,7 +869,7 @@ pub fn is_definition_visible(
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:584 forEachOriginalDefinitionLocation
+    // Go: ls/findallreferences.go:600 forEachOriginalDefinitionLocation
     pub fn for_each_original_definition_location(
         &self,
         ctx: &Context,
@@ -920,7 +920,7 @@ impl<P: ProgramView> LanguageService<P> {
     }
 }
 
-// Go: ls/findallreferences.go:615 symbolEntryTransformOptions
+// Go: ls/findallreferences.go:631 symbolEntryTransformOptions
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SymbolEntryTransformOptions {
     // Force the result to be Location objects.
@@ -929,7 +929,7 @@ pub struct SymbolEntryTransformOptions {
     pub drop_origin_nodes: bool,
 }
 
-// Go: ls/findallreferences.go:622 SymbolAndEntriesData
+// Go: ls/findallreferences.go:638 SymbolAndEntriesData
 #[derive(Clone, Debug, Default)]
 pub struct SymbolAndEntriesData {
     pub original_node: Node,
@@ -938,7 +938,7 @@ pub struct SymbolAndEntriesData {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:652 provideSymbolsAndEntries
+    // Go: ls/findallreferences.go:644 provideSymbolsAndEntries
     // PORT: Go passes the URI by value; here by reference.
     pub fn provide_symbols_and_entries(
         &self,
@@ -994,7 +994,7 @@ impl<P: ProgramView> LanguageService<P> {
         (combined, ok)
     }
 
-    // Go: ls/findallreferences.go:685 provideSymbolsAndEntriesAtPosition
+    // Go: ls/findallreferences.go:677 provideSymbolsAndEntriesAtPosition
     pub fn provide_symbols_and_entries_at_position(
         &self,
         ctx: &Context,
@@ -1110,7 +1110,7 @@ impl<P: ProgramView> LanguageService<P> {
         )
     }
 
-    // Go: ls/findallreferences.go:673 getSymbolAndEntries
+    // Go: ls/findallreferences.go:726 getSymbolAndEntries
     pub fn get_symbol_and_entries(
         &self,
         ctx: &Context,
@@ -1177,7 +1177,7 @@ impl CrossProjectSearch for ImplementationsSearch {
 }
 
 impl LanguageService {
-    // Go: ls/findallreferences.go:694 ProvideReferences
+    // Go: ls/findallreferences.go:747 ProvideReferences
     pub fn provide_references(
         &self,
         ctx: &Context,
@@ -1199,7 +1199,7 @@ impl LanguageService {
         )
     }
 
-    // Go: ls/findallreferences.go:765 provideReferencesFromData
+    // Go: ls/findallreferences.go:761 provideReferencesFromData
     pub fn provide_references_from_data(
         &self,
         ctx: &Context,
@@ -1222,7 +1222,7 @@ impl LanguageService {
         )
     }
 
-    // Go: ls/findallreferences.go:708 ProvideVSReferences
+    // Go: ls/findallreferences.go:775 ProvideVSReferences
     pub fn provide_vs_references(
         &self,
         ctx: &Context,
@@ -1246,7 +1246,7 @@ impl LanguageService {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:783 symbolAndEntriesToReferences
+    // Go: ls/findallreferences.go:789 symbolAndEntriesToReferences
     pub fn symbol_and_entries_to_references(
         &self,
         ctx: &Context,
@@ -1277,7 +1277,7 @@ impl<P: ProgramView> LanguageService<P> {
 }
 
 impl LanguageService {
-    // Go: ls/findallreferences.go:794 symbolAndEntriesToVSReferences
+    // Go: ls/findallreferences.go:800 symbolAndEntriesToVSReferences
     pub fn symbol_and_entries_to_vs_references(
         &self,
         ctx: &Context,
@@ -1381,7 +1381,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/findallreferences.go:793 referencedSymbolDefinitionInfo
+// Go: ls/findallreferences.go:866 referencedSymbolDefinitionInfo
 // referencedSymbolDefinitionInfo holds the computed info for a definition
 #[derive(Clone, Debug, Default)]
 pub struct ReferencedSymbolDefinitionInfo {
@@ -1391,7 +1391,7 @@ pub struct ReferencedSymbolDefinitionInfo {
 }
 
 impl LanguageService {
-    // Go: ls/findallreferences.go:867 definitionToReferencedSymbolDefinitionInfo
+    // Go: ls/findallreferences.go:873 definitionToReferencedSymbolDefinitionInfo
     // definitionToReferencedSymbolDefinitionInfo converts a Definition to display info
     pub fn definition_to_referenced_symbol_definition_info(
         &self,
@@ -1618,7 +1618,7 @@ impl LanguageService {
         }
     }
 
-    // Go: ls/findallreferences.go:906 getDefinitionKindAndDisplayParts
+    // Go: ls/findallreferences.go:997 getDefinitionKindAndDisplayParts
     // getDefinitionKindAndDisplayParts returns the classified display text for a symbol definition.
     // PORT: Go returns a non-nil `*lsproto.VSClassifiedTextElement`; here
     // the value.
@@ -1673,7 +1673,7 @@ impl LanguageService {
         }
     }
 
-    // Go: ls/findallreferences.go:925 ProvideImplementations
+    // Go: ls/findallreferences.go:1016 ProvideImplementations
     pub fn provide_implementations(
         &self,
         ctx: &Context,
@@ -1688,7 +1688,7 @@ impl LanguageService {
         )
     }
 
-    // Go: ls/findallreferences.go:929 provideImplementationsEx
+    // Go: ls/findallreferences.go:1020 provideImplementationsEx
     pub fn provide_implementations_ex(
         &self,
         ctx: &Context,
@@ -1711,7 +1711,7 @@ impl LanguageService {
         )
     }
 
-    // Go: ls/findallreferences.go:1041 provideImplementationsFromData
+    // Go: ls/findallreferences.go:1034 provideImplementationsFromData
     pub fn provide_implementations_from_data(
         &self,
         ctx: &Context,
@@ -1737,7 +1737,7 @@ impl LanguageService {
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:1028 symbolAndEntriesToImplementations
+    // Go: ls/findallreferences.go:1048 symbolAndEntriesToImplementations
     pub fn symbol_and_entries_to_implementations(
         &self,
         ctx: &Context,
@@ -1780,7 +1780,7 @@ impl<P: ProgramView> LanguageService<P> {
     }
 
     // == functions for conversions ==
-    // Go: ls/findallreferences.go:1048 convertSymbolAndEntriesToLocations
+    // Go: ls/findallreferences.go:1068 convertSymbolAndEntriesToLocations
     // PORT: takes `ctx` to read the definition symbol through the request
     // checker (see the file header).
     pub fn convert_symbol_and_entries_to_locations(
@@ -1808,7 +1808,7 @@ impl<P: ProgramView> LanguageService<P> {
     }
 }
 
-// Go: ls/findallreferences.go:1065 isDeclarationOfSymbol
+// Go: ls/findallreferences.go:1081 isDeclarationOfSymbol
 // PORT: reading `target.Declarations` takes the symbol arena.
 pub fn is_declaration_of_symbol(symbols: &SymbolArena, node: Node, target: SymbolId) -> bool {
     if node.is_nil() || target.is_nil() {
@@ -1843,7 +1843,7 @@ pub fn is_declaration_of_symbol(symbols: &SymbolArena, node: Node, target: Symbo
 }
 
 impl<P: ProgramView> LanguageService<P> {
-    // Go: ls/findallreferences.go:1113 convertEntriesToLocations
+    // Go: ls/findallreferences.go:1105 convertEntriesToLocations
     pub fn convert_entries_to_locations(
         &self,
         entries: &[Rc<RefCell<ReferenceEntry>>],
@@ -1859,7 +1859,7 @@ impl<P: ProgramView> LanguageService<P> {
         locations
     }
 
-    // Go: ls/findallreferences.go:1113 convertEntriesToLocationLinks
+    // Go: ls/findallreferences.go:1116 convertEntriesToLocationLinks
     pub fn convert_entries_to_location_links(
         &self,
         entries: &[Rc<RefCell<ReferenceEntry>>],
@@ -1910,7 +1910,7 @@ impl<P: ProgramView> LanguageService<P> {
         links
     }
 
-    // Go: ls/findallreferences.go:1146 mergeReferences
+    // Go: ls/findallreferences.go:1149 mergeReferences
     // PORT: Go variadic `referencesToMerge ...[]*SymbolAndEntries` is a
     // `Vec` of lists (a nil list is empty). Go returns a non-nil slice.
     pub fn merge_references(
@@ -1984,7 +1984,7 @@ impl<P: ProgramView> LanguageService<P> {
         result
     }
 
-    // Go: ls/findallreferences.go:1094 GetReferencedSymbolsForNode
+    // Go: ls/findallreferences.go:1202 GetReferencedSymbolsForNode
     // GetReferencedSymbolsForNode returns all referenced symbols and their reference entries for the given node.
     // It returns all referenced symbols and their reference entries for the given node across the provided source files.
     // PORT: the unexported `getReferencedSymbolsForNode` has the same snake
@@ -2010,7 +2010,7 @@ impl<P: ProgramView> LanguageService<P> {
     }
 }
 
-// Go: ls/findallreferences.go:1102 SignatureUsage
+// Go: ls/findallreferences.go:1210 SignatureUsage
 // SignatureUsage represents a single usage of a signature declaration,
 // pairing the reference name node with its containing call expression (if any).
 #[derive(Clone, Copy, Debug, Default)]
@@ -2020,7 +2020,7 @@ pub struct SignatureUsage {
 }
 
 impl LanguageService {
-    // Go: ls/findallreferences.go:1110 GetSignatureUsages
+    // Go: ls/findallreferences.go:1218 GetSignatureUsages
     // GetSignatureUsages returns all usages of a signature declaration as name-call pairs.
     // For each reference to the signature's name, it returns the reference node and
     // the call expression it appears in (nil if the reference is not in a call position).
@@ -2098,7 +2098,7 @@ impl LanguageService {
 impl<P: ProgramView> LanguageService<P> {
     // === functions for find all ref implementation ===
 
-    // Go: ls/findallreferences.go:1161 getReferencedSymbolsForNode
+    // Go: ls/findallreferences.go:1269 getReferencedSymbolsForNode
     // PORT: Go holds the checker for the whole function. Here the checker is
     // borrowed around each use, and `getReferencedSymbolsForModule` gets it
     // as its last argument (findallreferences_p2.rs) instead of asking the

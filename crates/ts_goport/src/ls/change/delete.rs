@@ -2,7 +2,7 @@
 
 use crate::ls::change::prelude::*;
 
-// Go: ls/change/delete.go:18 deleteDeclaration
+// Go: ls/change/delete.go:17 deleteDeclaration
 /// deleteDeclaration deletes a node with smart handling for different node types.
 /// This handles special cases like import specifiers in lists, parameters, etc.
 // PORT: Go `deletedNodesInLists map[*ast.Node]bool` only ever holds `true`,
@@ -182,7 +182,7 @@ pub fn delete_declaration(
     }
 }
 
-// Go: ls/change/delete.go:105 deleteDefaultImport
+// Go: ls/change/delete.go:104 deleteDefaultImport
 fn delete_default_import(t: &mut Tracker, source_file: Node, import_clause: Node) {
     if import_clause.named_bindings().is_nil() {
         // Delete the whole import
@@ -222,7 +222,7 @@ fn delete_default_import(t: &mut Tracker, source_file: Node, import_clause: Node
     }
 }
 
-// Go: ls/change/delete.go:127 deleteImportBinding
+// Go: ls/change/delete.go:124 deleteImportBinding
 fn delete_import_binding(t: &mut Tracker, source_file: Node, node: Node) {
     let import_clause = node.parent();
     if import_clause.name().is_some() {
@@ -249,7 +249,7 @@ fn delete_import_binding(t: &mut Tracker, source_file: Node, node: Node) {
     }
 }
 
-// Go: ls/change/delete.go:148 deleteVariableDeclaration
+// Go: ls/change/delete.go:144 deleteVariableDeclaration
 fn delete_variable_declaration(
     t: &mut Tracker,
     deleted_nodes_in_lists: &mut IndexSet<Node>,
@@ -324,7 +324,7 @@ fn delete_variable_declaration(
     }
 }
 
-// Go: ls/change/delete.go:187 deleteNode
+// Go: ls/change/delete.go:183 deleteNode
 /// deleteNode deletes a node with the specified trivia options.
 /// Warning: This deletes comments too.
 fn delete_node(
@@ -343,7 +343,7 @@ fn delete_node(
     );
 }
 
-// Go: ls/change/delete.go:195 deleteNodeInList
+// Go: ls/change/delete.go:189 deleteNodeInList
 fn delete_node_in_list(
     t: &mut Tracker,
     deleted_nodes_in_lists: &mut IndexSet<Node>,
@@ -402,7 +402,7 @@ fn delete_node_in_list(
 }
 
 impl Tracker {
-    // Go: ls/change/delete.go:229 startPositionToDeleteNodeInList
+    // Go: ls/change/delete.go:221 startPositionToDeleteNodeInList
     /// startPositionToDeleteNodeInList finds the first non-whitespace position in the leading trivia of the node
     pub fn start_position_to_delete_node_in_list(&self, source_file: Node, node: Node) -> i32 {
         let start = self.get_adjusted_start_position(
@@ -422,7 +422,7 @@ impl Tracker {
         )
     }
 
-    // Go: ls/change/delete.go:234 endPositionToDeleteNodeInList
+    // Go: ls/change/delete.go:226 endPositionToDeleteNodeInList
     fn end_position_to_delete_node_in_list(
         &self,
         source_file: Node,
@@ -479,13 +479,13 @@ impl Tracker {
     }
 }
 
-// Go: ls/change/delete.go:258 positionsAreOnSameLine
+// Go: ls/change/delete.go:250 positionsAreOnSameLine
 pub fn positions_are_on_same_line(pos1: i32, pos2: i32, source_file: Node) -> bool {
     format::get_line_start_position_for_position(pos1, source_file)
         == format::get_line_start_position_for_position(pos2, source_file)
 }
 
-// Go: ls/change/delete.go:263 hasJSDocNodes
+// Go: ls/change/delete.go:255 hasJSDocNodes
 /// hasJSDocNodes checks if a node has JSDoc comments
 fn has_js_doc_nodes(node: Node) -> bool {
     if node.is_nil() {

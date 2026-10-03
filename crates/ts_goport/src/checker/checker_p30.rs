@@ -6,7 +6,7 @@ use crate::prelude::*;
 use smallvec::SmallVec;
 
 impl Checker {
-    // Go: checker/checker.go:26861 getPropertyTypeForIndexType
+    // Go: checker/checker.go:27466 getPropertyTypeForIndexType
     pub fn get_property_type_for_index_type(
         &mut self,
         original_object_type: TypeId,
@@ -463,7 +463,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:27075 typeHasStaticProperty
+    // Go: checker/checker.go:27680 typeHasStaticProperty
     pub fn type_has_static_property(&mut self, prop_name: &str, containing_type: TypeId) -> bool {
         let containing_symbol = self.ty(containing_type).symbol;
         if containing_symbol.is_some() {
@@ -476,7 +476,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:27083 getSuggestionForNonexistentProperty
+    // Go: checker/checker.go:27688 getSuggestionForNonexistentProperty
     pub fn get_suggestion_for_nonexistent_property(
         &mut self,
         name: &str,
@@ -490,7 +490,7 @@ impl Checker {
         String::new()
     }
 
-    // Go: checker/checker.go:27091 getSuggestionForNonexistentIndexSignature
+    // Go: checker/checker.go:27696 getSuggestionForNonexistentIndexSignature
     pub fn get_suggestion_for_nonexistent_index_signature(
         &mut self,
         object_type: TypeId,
@@ -525,7 +525,7 @@ impl Checker {
         suggestion + "." + suggested_method
     }
 
-    // Go: checker/checker.go:27112 getSuggestedTypeForNonexistentStringLiteralType
+    // Go: checker/checker.go:27717 getSuggestedTypeForNonexistentStringLiteralType
     pub fn get_suggested_type_for_nonexistent_string_literal_type(
         &mut self,
         source: TypeId,
@@ -558,7 +558,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:27117 getIndexNodeForAccessExpression
+// Go: checker/checker.go:27722 getIndexNodeForAccessExpression
 pub fn get_index_node_for_access_expression(access_node: Node) -> Node {
     match access_node.kind() {
         SyntaxKind::ElementAccessExpression => return access_node.argument_expression(),
@@ -570,7 +570,7 @@ pub fn get_index_node_for_access_expression(access_node: Node) -> Node {
 }
 
 impl Checker {
-    // Go: checker/checker.go:27129 errorIfWritingToReadonlyIndex
+    // Go: checker/checker.go:27734 errorIfWritingToReadonlyIndex
     pub fn error_if_writing_to_readonly_index(
         &mut self,
         index_info: IndexInfoId,
@@ -591,7 +591,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:27135 isSelfTypeAccess
+    // Go: checker/checker.go:27740 isSelfTypeAccess
     pub fn is_self_type_access(&mut self, name: Node, parent: SymbolId) -> bool {
         name.kind() == SyntaxKind::ThisKeyword
             || parent.is_some()
@@ -599,7 +599,7 @@ impl Checker {
                 && parent == self.get_resolved_symbol(get_first_identifier(name))
     }
 
-    // Go: checker/checker.go:27139 isAssignmentToReadonlyEntity
+    // Go: checker/checker.go:27744 isAssignmentToReadonlyEntity
     pub fn is_assignment_to_readonly_entity(
         &mut self,
         expr: Node,
@@ -770,7 +770,7 @@ impl Checker {
                     .all(|i| self.is_string_index_signature_only_type(self.type_at(t, i))))
     }
 
-    // Go: checker/checker.go:27230 shouldDeferIndexedAccessType
+    // Go: checker/checker.go:27835 shouldDeferIndexedAccessType
     pub fn should_defer_indexed_access_type(
         &mut self,
         object_type: TypeId,
@@ -794,7 +794,7 @@ impl Checker {
             || self.is_generic_reducible_type(object_type)
     }
 
-    // Go: checker/checker.go:27241 indexTypeLessThan
+    // Go: checker/checker.go:27846 indexTypeLessThan
     pub fn index_type_less_than(&mut self, index_type: TypeId, limit: i32) -> bool {
         self.every_type(index_type, &mut |c: &mut Checker, t: TypeId| {
             if c.ty(t)
@@ -811,7 +811,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:27254 getNoInferType
+    // Go: checker/checker.go:27859 getNoInferType
     pub fn get_no_infer_type(&mut self, t: TypeId) -> TypeId {
         if self.is_no_infer_target_type(t) {
             let unknown_type = self.unknown_type;
@@ -820,7 +820,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:27261 isNoInferTargetType
+    // Go: checker/checker.go:27866 isNoInferTargetType
     pub fn is_no_infer_target_type(&mut self, t: TypeId) -> bool {
         // This is effectively a more conservative and predictable form of couldContainTypeVariables. We want to
         // preserve NoInfer<T> only for types that could contain type variables, but we don't want to exhaustively
@@ -837,7 +837,7 @@ impl Checker {
                 && !self.is_pattern_literal_type(t))
     }
 
-    // Go: checker/checker.go:27271 getSubstitutionType
+    // Go: checker/checker.go:27876 getSubstitutionType
     pub fn get_substitution_type(&mut self, base_type: TypeId, constraint: TypeId) -> TypeId {
         if self
             .ty(constraint)
@@ -851,7 +851,7 @@ impl Checker {
         self.get_or_create_substitution_type(base_type, constraint)
     }
 
-    // Go: checker/checker.go:27278 getOrCreateSubstitutionType
+    // Go: checker/checker.go:27883 getOrCreateSubstitutionType
     pub fn get_or_create_substitution_type(
         &mut self,
         base_type: TypeId,
@@ -871,7 +871,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:27288 getBaseConstraintOrType
+    // Go: checker/checker.go:27893 getBaseConstraintOrType
     pub fn get_base_constraint_or_type(&mut self, t: TypeId) -> TypeId {
         let constraint = self.get_base_constraint_of_type(t);
         if constraint.is_some() {
@@ -880,7 +880,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:27296 getBaseConstraintOfType
+    // Go: checker/checker.go:27901 getBaseConstraintOfType
     pub fn get_base_constraint_of_type(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).flags.intersects(
             TypeFlags::INSTANTIABLE_NON_PRIMITIVE
@@ -900,7 +900,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:27307 getResolvedBaseConstraint
+    // Go: checker/checker.go:27912 getResolvedBaseConstraint
     pub fn get_resolved_base_constraint(&mut self, t: TypeId, stack: &[RecursionId]) -> TypeId {
         let Some(constrained) = self.ty(t).data.as_constrained_type() else {
             return t;
@@ -973,7 +973,7 @@ impl Checker {
         constraint
     }
 
-    // Go: checker/checker.go:27350 computeBaseConstraint
+    // Go: checker/checker.go:27955 computeBaseConstraint
     pub fn compute_base_constraint(&mut self, t: TypeId, stack: &[RecursionId]) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::TYPE_PARAMETER) {
@@ -1104,7 +1104,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:27460 getNextBaseConstraint
+    // Go: checker/checker.go:28058 getNextBaseConstraint
     pub fn get_next_base_constraint(&mut self, t: TypeId, stack: &[RecursionId]) -> TypeId {
         if t.is_nil() {
             return TypeId::NIL;
@@ -1118,7 +1118,7 @@ impl Checker {
 
     // Return true if type might be of the given kind. A union or intersection type might be of a given
     // kind if at least one constituent type is of the given kind.
-    // Go: checker/checker.go:27473 maybeTypeOfKind
+    // Go: checker/checker.go:28071 maybeTypeOfKind
     pub fn maybe_type_of_kind(&mut self, t: TypeId, kind: TypeFlags) -> bool {
         let flags = self.ty(t).flags;
         if flags.intersects(kind) {
@@ -1135,7 +1135,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:27487 maybeTypeOfKindConsideringBaseConstraint
+    // Go: checker/checker.go:28085 maybeTypeOfKindConsideringBaseConstraint
     pub fn maybe_type_of_kind_considering_base_constraint(
         &mut self,
         t: TypeId,
@@ -1148,12 +1148,12 @@ impl Checker {
         base_constraint.is_some() && self.maybe_type_of_kind(base_constraint, kind)
     }
 
-    // Go: checker/checker.go:27495 allTypesAssignableToKind
+    // Go: checker/checker.go:28093 allTypesAssignableToKind
     pub fn all_types_assignable_to_kind(&mut self, source: TypeId, kind: TypeFlags) -> bool {
         self.all_types_assignable_to_kind_ex(source, kind, false)
     }
 
-    // Go: checker/checker.go:27499 allTypesAssignableToKindEx
+    // Go: checker/checker.go:28097 allTypesAssignableToKindEx
     pub fn all_types_assignable_to_kind_ex(
         &mut self,
         source: TypeId,
@@ -1169,12 +1169,12 @@ impl Checker {
         self.is_type_assignable_to_kind_ex(source, kind, strict)
     }
 
-    // Go: checker/checker.go:27508 isTypeAssignableToKind
+    // Go: checker/checker.go:28106 isTypeAssignableToKind
     pub fn is_type_assignable_to_kind(&mut self, source: TypeId, kind: TypeFlags) -> bool {
         self.is_type_assignable_to_kind_ex(source, kind, false)
     }
 
-    // Go: checker/checker.go:27512 isTypeAssignableToKindEx
+    // Go: checker/checker.go:28110 isTypeAssignableToKindEx
     pub fn is_type_assignable_to_kind_ex(
         &mut self,
         source: TypeId,
@@ -1228,7 +1228,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:27531 isConstEnumObjectType
+    // Go: checker/checker.go:28129 isConstEnumObjectType
     pub fn is_const_enum_object_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         ty.object_flags.intersects(ObjectFlags::ANONYMOUS)
@@ -1236,12 +1236,12 @@ impl Checker {
             && self.is_const_enum_symbol(ty.symbol)
     }
 
-    // Go: checker/checker.go:27535 isConstEnumSymbol
+    // Go: checker/checker.go:28133 isConstEnumSymbol
     pub fn is_const_enum_symbol(&self, symbol: SymbolId) -> bool {
         self.sym(symbol).flags.intersects(SymbolFlags::CONST_ENUM)
     }
 
-    // Go: checker/checker.go:27539 compareProperties
+    // Go: checker/checker.go:28137 compareProperties
     pub fn compare_properties(
         &mut self,
         source_prop: SymbolId,
@@ -1281,7 +1281,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:27566 compareTypesEqual
+// Go: checker/checker.go:28164 compareTypesEqual
 // PORT: a free function because it only compares handles. Pass it as
 // `&mut |_: &mut Checker, s, t| compare_types_equal(s, t)`.
 pub fn compare_types_equal(s: TypeId, t: TypeId) -> Ternary {
@@ -1292,7 +1292,7 @@ pub fn compare_types_equal(s: TypeId, t: TypeId) -> Ternary {
 }
 
 impl Checker {
-    // Go: checker/checker.go:27573 markPropertyAsReferenced
+    // Go: checker/checker.go:28171 markPropertyAsReferenced
     pub fn mark_property_as_referenced(
         &mut self,
         prop: SymbolId,
@@ -1333,7 +1333,7 @@ impl Checker {
         self.symbol_reference_links.get(target).reference_kinds |= SymbolFlags::ALL;
     }
 
-    // Go: checker/checker.go:27599 expandSignatureParametersWithTupleMembers
+    // Go: checker/checker.go:28197 expandSignatureParametersWithTupleMembers
     // PORT: restType is a *TypeReference in Go; it is passed as its TypeId.
     pub fn expand_signature_parameters_with_tuple_members(
         &mut self,
@@ -1373,7 +1373,7 @@ impl Checker {
         expanded
     }
 
-    // Go: checker/checker.go:27625 getUniqAssociatedNamesFromTupleType
+    // Go: checker/checker.go:28223 getUniqAssociatedNamesFromTupleType
     // PORT: t is a *TypeReference in Go; it is passed as its TypeId.
     pub fn get_uniq_associated_names_from_tuple_type(
         &mut self,
@@ -1411,19 +1411,19 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:27654 hasRestParameter
+// Go: checker/checker.go:28252 hasRestParameter
 pub fn has_rest_parameter(signature: Node) -> bool {
     let last = signature.parameters().last().unwrap_or(Node::NIL);
     last.is_some() && is_rest_parameter(last)
 }
 
-// Go: checker/checker.go:27659 isRestParameter
+// Go: checker/checker.go:28257 isRestParameter
 pub fn is_rest_parameter(param: Node) -> bool {
     param.dot_dot_dot_token().is_some()
 }
 
 impl Checker {
-    // Go: checker/checker.go:27663 getNameFromIndexInfo
+    // Go: checker/checker.go:28261 getNameFromIndexInfo
     // PORT: a Checker method because it reads the IndexInfo arena.
     pub fn get_name_from_index_info(&self, info: IndexInfoId) -> String {
         let declaration = self.index_info(info).declaration;
@@ -1433,7 +1433,7 @@ impl Checker {
         "x".to_string()
     }
 
-    // Go: checker/checker.go:27670 isUnknownLikeUnionType
+    // Go: checker/checker.go:28268 isUnknownLikeUnionType
     pub fn is_unknown_like_union_type(&mut self, t: TypeId) -> bool {
         if self.strict_null_checks && self.ty(t).flags.intersects(TypeFlags::UNION) {
             if !self
@@ -1468,7 +1468,7 @@ impl Checker {
     // Return true the given type is a primitive union type where no two literal type constituents are
     // comparable. Specifically, that means (a) the union doesn't contain literals from different enum
     // types, and (b) the union doesn't contain both enum literals and string or number literals.
-    // Go: checker/checker.go:27821 isUniformUnionType
+    // Go: checker/checker.go:28285 isUniformUnionType
     pub fn is_uniform_union_type(&mut self, t: TypeId) -> bool {
         if self
             .ty(t)
@@ -1496,7 +1496,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:27831 computeIsUniformUnionType
+    // Go: checker/checker.go:28295 computeIsUniformUnionType
     pub fn compute_is_uniform_union_type(&mut self, types: &[TypeId]) -> bool {
         let mut enum_symbol = SymbolId::NIL;
         let mut has_string_or_number_literal = false;
@@ -1523,7 +1523,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:27684 containsUndefinedType
+    // Go: checker/checker.go:28319 containsUndefinedType
     pub fn contains_undefined_type(&self, t: TypeId) -> bool {
         let mut t = t;
         if self.ty(t).flags.intersects(TypeFlags::UNION) {
@@ -1532,7 +1532,7 @@ impl Checker {
         self.ty(t).flags.intersects(TypeFlags::UNDEFINED)
     }
 
-    // Go: checker/checker.go:27691 typeHasCallOrConstructSignatures
+    // Go: checker/checker.go:28326 typeHasCallOrConstructSignatures
     pub fn type_has_call_or_construct_signatures(&mut self, t: TypeId) -> bool {
         self.ty(t).flags.intersects(TypeFlags::STRUCTURED_TYPE)
             && !self
@@ -1541,7 +1541,7 @@ impl Checker {
                 .is_empty()
     }
 
-    // Go: checker/checker.go:27695 getNormalizedType
+    // Go: checker/checker.go:28330 getNormalizedType
     pub fn get_normalized_type(&mut self, t: TypeId, writing: bool) -> TypeId {
         let mut t = t;
         loop {
@@ -1580,7 +1580,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:27732 getSimplifiedType
+    // Go: checker/checker.go:28367 getSimplifiedType
     pub fn get_simplified_type(&mut self, t: TypeId, writing: bool) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::INDEXED_ACCESS) {
@@ -1594,7 +1594,7 @@ impl Checker {
     // Transform an indexed access to a simpler form, if possible. Return the simpler form, or return
     // the type itself if no transformation is possible. The writing flag indicates that the type is
     // the target of an assignment.
-    // Go: checker/checker.go:27745 getSimplifiedIndexedAccessType
+    // Go: checker/checker.go:28380 getSimplifiedIndexedAccessType
     pub fn get_simplified_indexed_access_type(&mut self, t: TypeId, writing: bool) -> TypeId {
         let key = CachedTypeKey {
             kind: if writing {
@@ -1623,7 +1623,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:27760 getSimplifiedIndexedAccessTypeWorker
+    // Go: checker/checker.go:28395 getSimplifiedIndexedAccessTypeWorker
     pub fn get_simplified_indexed_access_type_worker(
         &mut self,
         t: TypeId,
