@@ -568,3 +568,216 @@ os_child_test! {
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
+
+/// The import of `rpkg`, a package whose node_modules directory is a
+/// symlink (`symlinked_rpkg`).
+const RPKG_INDEX: &str = "import { r } from \"rpkg\";\n";
+
+/// Adds `store/rpkg` and `store/rpkg2`, two copies of a package, and
+/// `node_modules/rpkg`, a symlink to the first.
+#[cfg(unix)]
+fn symlinked_rpkg(root: &str) {
+    for copy in ["rpkg", "rpkg2"] {
+        write(
+            root,
+            &format!("store/{copy}/package.json"),
+            r#"{ "name": "rpkg", "version": "1.0.0", "types": "index.d.ts" }"#,
+        );
+        write(
+            root,
+            &format!("store/{copy}/index.d.ts"),
+            "export declare const r: number;",
+        );
+    }
+    point_rpkg(root, "rpkg");
+}
+
+/// Points the symlink `node_modules/rpkg` to `store/<copy>`.
+#[cfg(unix)]
+fn point_rpkg(root: &str, copy: &str) {
+    let link = format!("{root}/node_modules/rpkg");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(format!("{root}/store/{copy}"), &link).unwrap();
+}
+
+/// The resolution of `name` in `src/index.ts`: the resolved file name and
+/// the original path, relative to the project root.
+#[cfg(unix)]
+fn resolution(session: &Rc<Session>, root: &str, name: &str) -> (String, String) {
+    let program = program(session, &file_uri(root, "src/index.ts"));
+    let index = tspath::to_path(&format!("{root}/src/index.ts"), root, true);
+    let modules = program
+        .processed_files
+        .resolved_modules
+        .get(&index)
+        .expect("resolutions of src/index.ts");
+    let (_, module) = modules
+        .iter()
+        .find(|(key, _)| key.name == name)
+        .unwrap_or_else(|| panic!("no resolution of {name}"));
+    let relative = |name: &str| name.replace(root, "<root>");
+    (
+        relative(&module.resolved_file_name),
+        relative(&module.original_path),
+    )
+}
+
+os_child_test! {
+    /// The disk changes during a load: after the workers resolved the keys
+    /// of the previous load and before the loader starts (a test hook), a
+    /// new directory gets a file, a package gets a new file and a package
+    /// symlink points to another copy. The loader takes the worker answers,
+    /// which saw the old disk, and then resolves new keys that make the
+    /// same `directory_exists`, `file_exists` and `realpath` calls. As in Go,
+    /// whose snapshot caches the first answer of each call, each such call
+    /// must give the answer that the load took, so the program has one
+    /// answer for each path.
+    #[cfg(unix)]
+    fn a_load_has_one_answer_per_path_when_the_disk_changes_during_it() {
+        let root = make_project("onepath");
+        symlinked_rpkg(&root);
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        let uri = file_uri(&root, "src/index.ts");
+        open(&session, &uri, &format!("{INDEX}{RPKG_INDEX}"));
+        program(&session, &uri);
+        let changed_root = root.clone();
+        resolve_ahead::set_after_workers(Some(Rc::new(move || {
+            let root = &changed_root;
+            write(root, "src/missing/x.ts", "export const x = 4;");
+            write(root, "node_modules/pkg/other.ts", "export const o = 5;");
+            point_rpkg(root, "rpkg2");
+        })));
+        edit(
+            &session,
+            &uri,
+            2,
+            (10, 0),
+            (10, 0),
+            "import { x as x2 } from \"./missing/x.js\";\n\
+             import { o as o2 } from \"pkg/other.js\";\n\
+             import { r as r2 } from \"rpkg/index.js\";\n",
+        );
+        program(&session, &uri);
+        resolve_ahead::set_after_workers(None);
+        let stats = last_stats();
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+        assert_eq!(stats.loader.rejected, 0, "{stats:?}");
+        for (taken, own) in [
+            ("./missing/x", "./missing/x.js"),
+            ("pkg/other", "pkg/other.js"),
+            ("rpkg", "rpkg/index.js"),
+        ] {
+            assert_eq!(
+                resolution(&session, &root, own).0,
+                resolution(&session, &root, taken).0,
+                "{own} and {taken}"
+            );
+        }
+        assert_eq!(
+            resolution(&session, &root, "rpkg"),
+            (
+                "<root>/store/rpkg/index.d.ts".to_string(),
+                "<root>/node_modules/rpkg/index.d.ts".to_string()
+            )
+        );
+        resolve_ahead::set_mode(None);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+os_child_test! {
+    /// A load takes the answers of the workers, and the workers' parses of
+    /// the package.json files stay on the workers. A later lookup of the
+    /// program's resolver (`Program::get_package_json_info`, as auto-imports
+    /// make) must find the package.json lookups of the taken answers, as Go's
+    /// one cache of the load's resolutions has them, with no file system
+    /// call: here the disk changed after the load and the snapshot's lookup
+    /// cache is empty, so a call would find the new disk. `broken` has a
+    /// package.json but no types file, and `not-installed` has no directory;
+    /// no file of the program is in them, so the loader did not look them up
+    /// itself.
+    fn a_later_package_json_lookup_uses_the_taken_answers() {
+        let root = make_project("pjlookup");
+        write(
+            &root,
+            "node_modules/broken/package.json",
+            r#"{ "name": "broken", "version": "1.0.0", "types": "gone.d.ts" }"#,
+        );
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        let uri = file_uri(&root, "src/index.ts");
+        open(
+            &session,
+            &uri,
+            &format!("{INDEX}import {{ z }} from \"broken\";\n"),
+        );
+        program(&session, &uri);
+        edit_index(&session, &root, 2, "import { d } from \"./sub/d\";\n");
+        let stats = last_stats();
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+        let program = program(&session, &uri);
+        let broken = format!("{root}/node_modules/broken/package.json");
+        let not_installed = format!("{root}/node_modules/not-installed/package.json");
+        let resolver = program
+            .processed_files
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.as_default_resolver())
+            .expect("the default resolver");
+        for name in [&broken, &not_installed] {
+            assert!(
+                resolver.caches.package_json_info_cache.get(name).is_none(),
+                "the loader looked up {name} itself"
+            );
+        }
+        std::fs::remove_dir_all(format!("{root}/node_modules/broken")).unwrap();
+        write(
+            &root,
+            "node_modules/not-installed/package.json",
+            r#"{ "name": "not-installed", "version": "1.0.0" }"#,
+        );
+        let snapshot = session.snapshot();
+        let config = tspath::to_path(&format!("{root}/tsconfig.json"), &root, true);
+        let project = snapshot
+            .project_collection
+            .configured_project(&config)
+            .expect("configured project");
+        let source = project
+            .borrow()
+            .host
+            .as_ref()
+            .expect("host")
+            .source_fs
+            .source
+            .borrow()
+            .clone();
+        let lookups = source.fs();
+        ts_goport::frontend::vfs::Fs::as_any(&*lookups)
+            .and_then(|fs| fs.downcast_ref::<project::snapshotfs::CachedLayeredFileSystem>())
+            .expect("the snapshot's lookup cache")
+            .fs
+            .clear_cache();
+        let info = program
+            .get_package_json_info(&broken)
+            .expect("the package.json of broken");
+        let (name, _) = info
+            .get_contents()
+            .expect("contents")
+            .header_fields
+            .name
+            .get_value();
+        assert_eq!(name, "broken");
+        assert!(
+            program.get_package_json_info(&not_installed).is_none(),
+            "a package.json in a directory that the load found missing"
+        );
+        resolve_ahead::set_mode(None);
+        drop(program);
+        drop(project);
+        drop(snapshot);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}

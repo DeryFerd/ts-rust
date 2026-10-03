@@ -228,6 +228,25 @@ pub struct Caches {
     /// The loader's resolver during a resolve-ahead program load
     /// (compiler/resolve_ahead.rs). The load removes it at its end.
     pub ahead: RefCell<Option<AheadLink>>,
+
+    /// The loader's resolver after a resolve-ahead load: the package.json
+    /// lookups of the worker answers that it took, by the path of the
+    /// package.json: whether its directory and the file exist. Go has them
+    /// in the one package.json cache of the load's resolutions; here a
+    /// later lookup of the resolver makes its cache entry from them, with
+    /// no file system call (`ahead_package_json`).
+    // PORT: not in Go (perf). The worker's parse stays on the worker.
+    pub ahead_package_jsons: RefCell<FxHashMap<Path, AheadPackageJson>>,
+}
+
+/// A package.json lookup of a worker answer that the loader took
+/// (`Caches::ahead_package_jsons`).
+// PORT: not in Go (perf).
+#[derive(Clone, Copy, Debug)]
+pub struct AheadPackageJson {
+    pub directory_exists: bool,
+    /// The package.json file exists.
+    pub exists: bool,
 }
 
 /// The loader's resolver in a resolve-ahead program load
@@ -252,6 +271,9 @@ pub struct AheadLink {
     /// found there (`AheadQueue::find`).
     pub cursor: Cell<usize>,
     pub stats: Cell<AheadStats>,
+    /// The package.json call groups (`AheadCall::PackageJson`) of the taken
+    /// answers that `Caches::ahead_package_jsons` has, by address.
+    pub package_jsons: RefCell<FxHashSet<usize>>,
 }
 
 /// The keys of the previous load, which the resolve-ahead workers resolve
@@ -487,6 +509,7 @@ impl Caches {
             worker_package_jsons: RefCell::new(Vec::new()),
             worker_lookups: RefCell::new(Vec::new()),
             ahead: RefCell::new(None),
+            ahead_package_jsons: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -502,7 +525,9 @@ impl Caches {
         self.parsed_patterns_for_paths.clear();
         let worker_package_jsons = std::mem::take(&mut *self.worker_package_jsons.borrow_mut());
         let worker_lookups = std::mem::take(&mut *self.worker_lookups.borrow_mut());
+        let ahead_package_jsons = std::mem::take(&mut *self.ahead_package_jsons.borrow_mut());
         drop(type_ref_directives);
+        drop(ahead_package_jsons);
         // PERF: in the language server, resolve-ahead workers made most of
         // these answers; they free them (with none, they drop here).
         crate::frontend::compiler::resolve_ahead::drop_on_worker(Box::new((
@@ -564,21 +589,26 @@ pub struct SharedResolution<T> {
 /// One file system call of a resolve-ahead worker's resolution
 /// (compiler/resolve_ahead.rs), with its answer. Before the loader takes
 /// the answer, it checks each call on its own file system and replays the
-/// side effects of the call (`AheadLink::accept`).
+/// side effects of the call (`AheadLink::accept`). The name of a
+/// `FileExists` or `DirectoryExists` call is its path (the worker does not
+/// share an answer with another name), so the loader's caches by name and
+/// by path both find it.
 // PORT: not in Go (perf). Go resolves in each parse task on the host's
 // file system, which tracks the calls itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AheadCall {
-    /// `file_exists` of a name whose path is `path`. `known`: the worker
-    /// took the answer from the files that the workers found in earlier
-    /// loads, not from the OS, so the loader checks it itself.
+    /// `file_exists` of `path`. `known`: the worker took the answer from
+    /// what the workers found in earlier loads, not from the OS during
+    /// this load, so the loader asks its own file system.
     FileExists {
         path: Path,
         exists: bool,
         known: bool,
     },
-    /// A `directory_exists` that gave false.
-    MissingDirectory { path: Path },
+    /// `directory_exists` of `path`.
+    DirectoryExists { path: Path, exists: bool },
+    /// `realpath` of `name`.
+    Realpath { name: String, real: String },
     /// `read_file`: the xxh3 hash of the text, `None` when the file could
     /// not be read.
     Read {
@@ -589,15 +619,20 @@ pub enum AheadCall {
     /// entry (no `PackageJson` in them). One worker's answers that read the
     /// entry share them, so the loader checks them once per load.
     PackageJson(Arc<[AheadCall]>),
+    /// A `DirectoryExists` or `Realpath` that all the answers of the job
+    /// share (compiler/resolve_ahead.rs `WorkerStats`), so the loader checks
+    /// it once per load.
+    Shared(Arc<AheadCall>),
 }
 
 impl AheadCall {
     /// Calls `f` with each call of `calls`, the calls of a `PackageJson`
-    /// in its place.
+    /// or `Shared` in its place.
     pub fn each(calls: &[AheadCall], f: &mut impl FnMut(&AheadCall)) {
         for call in calls {
             match call {
                 AheadCall::PackageJson(group) => AheadCall::each(group, f),
+                AheadCall::Shared(call) => AheadCall::each(std::slice::from_ref(&**call), f),
                 call => f(call),
             }
         }
@@ -757,38 +792,48 @@ fn log_ahead_package_json(entry: &InfoCacheEntry) {
 }
 
 /// The calls of Go `getPackageJsonInfo` for `entry`. `None` when the worker
-/// did not read its package.json from a file that the loader can check, or
-/// when the entry was kept from an earlier job and its directory is gone:
-/// Go's lookup asks whether the directory exists, and the loader does not
-/// check a directory that exists. The next job drops such an entry.
+/// did not read its package.json from a file that the loader can check,
+/// when a name is not its path (`AheadCall`), or when the entry was kept
+/// from an earlier job and its directory is gone now: Go's lookup asks
+/// whether the directory exists. The next job drops such an entry. The
+/// worker knows the package.json of a kept entry from an earlier job, so
+/// the loader asks its own file system for it (`known`).
 fn package_json_calls(entry: &InfoCacheEntry, state: &mut AheadThread) -> Option<Arc<[AheadCall]>> {
     let to_path = |name: &str| {
-        to_path(
+        Some(to_path(
             name,
             &state.current_directory,
             state.use_case_sensitive_file_names,
-        )
+        ))
+        .filter(|path| path.as_str() == name)
+    };
+    let directory = AheadCall::DirectoryExists {
+        path: to_path(&entry.package_directory)?,
+        exists: entry.directory_exists,
     };
     if !entry.directory_exists {
-        return Some(Arc::new([AheadCall::MissingDirectory {
-            path: to_path(&entry.package_directory),
-        }]));
+        return Some(Arc::new([directory]));
     }
     let file_name = combine_paths(&entry.package_directory, &["package.json"]);
+    let kept = state.kept.contains(&file_name);
     let exists = AheadCall::FileExists {
-        path: to_path(&file_name),
+        path: to_path(&file_name)?,
         exists: entry.exists(),
-        known: false,
+        known: kept,
     };
     if !entry.exists() {
-        return Some(Arc::new([exists]));
+        return Some(Arc::new([directory, exists]));
     }
-    if state.kept.contains(&file_name) && !(state.directory_exists)(&entry.package_directory) {
+    if kept && !(state.directory_exists)(&entry.package_directory) {
         state.reads.remove(&file_name);
         return None;
     }
     let hash = *state.reads.get(&file_name)?;
-    Some(Arc::new([exists, AheadCall::Read { file_name, hash }]))
+    Some(Arc::new([
+        directory,
+        exists,
+        AheadCall::Read { file_name, hash },
+    ]))
 }
 
 /// Marks the resolution that runs on this thread as not shareable: it made
@@ -1067,7 +1112,67 @@ impl Caches {
         ahead.stats.set(stats);
         let found = found.filter(|_| accepted)?;
         self.note_worker_package_jsons(&found.package_jsons);
+        if let Some(calls) = &found.ahead {
+            self.note_ahead_package_jsons(ahead, calls);
+        }
         Some(found.value)
+    }
+
+    /// Keeps the package.json lookups of a taken answer's calls in
+    /// `ahead_package_jsons`, once per call group and load. A group is the
+    /// `directory_exists` of the package directory and, when it exists, the
+    /// `file_exists` of its package.json (`package_json_calls`).
+    fn note_ahead_package_jsons(&self, ahead: &AheadLink, calls: &[AheadCall]) {
+        for call in calls {
+            let AheadCall::PackageJson(group) = call else {
+                continue;
+            };
+            let address = Arc::as_ptr(group).cast::<AheadCall>() as usize;
+            if !ahead.package_jsons.borrow_mut().insert(address) {
+                continue;
+            }
+            let (path, lookup) = match &group[..] {
+                [
+                    AheadCall::DirectoryExists {
+                        path,
+                        exists: false,
+                    },
+                ] => (
+                    Path(combine_paths(path.as_str(), &["package.json"])),
+                    AheadPackageJson {
+                        directory_exists: false,
+                        exists: false,
+                    },
+                ),
+                [
+                    AheadCall::DirectoryExists { exists: true, .. },
+                    AheadCall::FileExists { path, exists, .. },
+                    ..,
+                ] => (
+                    path.clone(),
+                    AheadPackageJson {
+                        directory_exists: true,
+                        exists: *exists,
+                    },
+                ),
+                _ => continue,
+            };
+            self.ahead_package_jsons
+                .borrow_mut()
+                .entry(path)
+                .or_insert(lookup);
+        }
+    }
+
+    /// The lookup of `package_json_path` by a worker answer that the loader
+    /// took (`ahead_package_jsons`), if one made it. The keys are names that
+    /// are their paths (`AheadCall`), so the name finds its key.
+    #[must_use]
+    pub fn ahead_package_json(&self, package_json_path: &str) -> Option<AheadPackageJson> {
+        self.ahead_package_jsons
+            .borrow()
+            .get(package_json_path)
+            .copied()
     }
 
     /// Takes the package.json lookups of the resolution that just ended.
