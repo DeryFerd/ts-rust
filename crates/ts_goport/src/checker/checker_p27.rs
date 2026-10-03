@@ -1376,6 +1376,12 @@ impl Checker {
 
     // Go: checker/checker.go:25417 getConditionalFlowTypeOfType
     pub fn get_conditional_flow_type_of_type(&mut self, t: TypeId, node: Node) -> TypeId {
+        // PORT: from the SourceFile or its EndOfFile token, Go's walk reaches
+        // the nil parent of the SourceFile, and `IsParameterDeclaration(nil)`
+        // dereferences it. The shortcuts below skip that walk.
+        if matches!(node.kind(), SyntaxKind::SourceFile | SyntaxKind::EndOfFile) {
+            crate::core::go_nil_dereference();
+        }
         if let Some(facts) = frozen_node_store_facts(node) {
             // PERF: hono P7-C7. The loop adds a constraint only under a
             // ConditionalType or MappedType parent, and its other tests have no

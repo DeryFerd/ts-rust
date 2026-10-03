@@ -2569,6 +2569,13 @@ pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
     if state().alias_resolver {
         return ModuleKind::ES_NEXT;
     }
+    // PORT: Go `sourceFile.FileName()` dereferences a nil file, for example
+    // the context file of a node builder with no enclosing declaration
+    // (checker/nodebuilderimpl.go:686). The port's file info of nil has no
+    // name.
+    if source_file.is_nil() {
+        go_nil_dereference();
+    }
     let info = source_file_info(source_file);
     with_file_options_and_meta(source_file, |options, meta| {
         get_emit_module_format_of_file_worker(&info.file_name, options, meta)

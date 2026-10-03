@@ -604,13 +604,29 @@ impl<'a> Parser<'a> {
     // PORT: Go sets `list.Loc` after `NewNodeList`. Rust lists are immutable
     // once created, so the factory takes the range at creation.
     pub fn new_node_list(&mut self, loc: TextRange, nodes: &[Node]) -> NodeList {
+        let loc = self.jsdoc_tail_range(loc);
         self.factory.new_node_list_with_loc(nodes, loc)
     }
 
     // Go: parser/parser.go:5953 newModifierList
     // PORT: see new_node_list.
     pub fn new_modifier_list(&mut self, loc: TextRange, nodes: &[Node]) -> ModifierList {
+        let loc = self.jsdoc_tail_range(loc);
         self.factory.new_modifier_list_with_loc(nodes, loc)
+    }
+
+    /// `loc` with the positions in the cut tail of a JSDoc text mapped to
+    /// the file (see `parse_js_doc_comment`).
+    #[inline]
+    fn jsdoc_tail_range(&self, loc: TextRange) -> TextRange {
+        if loc.end() >= self.jsdoc_tail_first {
+            TextRange::new(
+                self.jsdoc_tail_pos(loc.pos()),
+                self.jsdoc_tail_pos(loc.end()),
+            )
+        } else {
+            loc
+        }
     }
 
     // Go: parser/parser.go:5959 finishNode
@@ -621,6 +637,7 @@ impl<'a> Parser<'a> {
 
     // Go: parser/parser.go:5963 finishNodeWithEnd
     pub fn finish_node_with_end(&mut self, node: Node, pos: i32, end: i32) -> Node {
+        let loc = self.jsdoc_tail_range(TextRange::new(pos, end));
         let mut flags = self.context_flags;
         if self.has_parse_error() {
             flags |= NodeFlags::THIS_NODE_HAS_ERROR;
@@ -629,8 +646,8 @@ impl<'a> Parser<'a> {
         // PORT: one store write for the Go `Loc` and `Flags` writes. A node
         // of the parse store has no binder flags yet, so `Flags |= flags`
         // equals Go `node.Flags = node.Flags | flags`.
-        if !finish_store_node(node, TextRange::new(pos, end), flags) {
-            set_node_loc(node, TextRange::new(pos, end));
+        if !finish_store_node(node, loc, flags) {
+            set_node_loc(node, loc);
             set_node_flags(node, node.flags() | flags);
         }
         self.override_parent_in_immediate_children(node);

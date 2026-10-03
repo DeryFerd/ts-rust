@@ -198,6 +198,139 @@ fn test_encode_source_file_with_unicode_escapes() {
     t.finish();
 }
 
+/// The kind, range and string bytes of each encoded node from the end of
+/// file token on, one line per node.
+fn encoded_nodes_from_end_of_file(encoded: &[u8]) -> Vec<String> {
+    let offset_nodes = read_uint32(encoded, HEADER_OFFSET_NODES) as usize;
+    let offset_string_offsets = read_uint32(encoded, HEADER_OFFSET_STRING_OFFSETS);
+    let offset_strings = read_uint32(encoded, HEADER_OFFSET_STRING_DATA) as usize;
+    let mut lines = Vec::new();
+    for i in (offset_nodes + NODE_SIZE..encoded.len()).step_by(NODE_SIZE) {
+        let kind = read_uint32(encoded, i + NODE_OFFSET_KIND);
+        if lines.is_empty() && kind as i16 != SyntaxKind::EndOfFile as i16 {
+            continue;
+        }
+        let mut line = if kind == SYNTAX_KIND_NODE_LIST {
+            "NodeList".to_string()
+        } else {
+            go_kind_string(kind as i16)
+        };
+        line.push_str(&format!(
+            " [{}, {})",
+            read_uint32(encoded, i + NODE_OFFSET_POS),
+            read_uint32(encoded, i + NODE_OFFSET_END)
+        ));
+        let data = read_uint32(encoded, i + NODE_OFFSET_DATA);
+        if data & NODE_DATA_TYPE_MASK == NODE_DATA_TYPE_STRING {
+            let at = (offset_string_offsets + (data & NODE_DATA_STRING_INDEX_MASK) * 4) as usize;
+            let (start, end) = (read_uint32(encoded, at), read_uint32(encoded, at + 4));
+            let bytes = &encoded[offset_strings + start as usize..offset_strings + end as usize];
+            line.push_str(&format!(" \"{}\"", bytes.escape_ascii()));
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+// PORT: no Go counterpart (optapifuzz1 A). An unterminated JSDoc comment at
+// the end of a file whose last 2 bytes split a char. Go cuts the comment
+// text 2 bytes before the end (parser/jsdoc.go:163) and keeps the bytes of
+// the split char, which its scanner reads as RuneError. The port panicked on
+// that cut. Each expected list is Go N's getSourceFile answer for the same
+// text. A JS file parses JSDoc at once, a TS file when the encoder reads it.
+#[test]
+fn test_encode_source_file_jsdoc_cut_inside_a_char() {
+    let cases: [(&str, ScriptKind, &[u8], &[&str]); 5] = [
+        (
+            "/a.js",
+            ScriptKind::JS,
+            "/** x 😀".as_bytes(),
+            &[
+                "KindEndOfFile [30, 39)",
+                "KindJSDoc [30, 39)",
+                "NodeList [31, 39)",
+                "KindJSDocText [31, 39) \"x \\xf0\\x9f\"",
+            ],
+        ),
+        (
+            "/a.ts",
+            ScriptKind::TS,
+            b"/** x \xe6\x97\xa5\xff",
+            &[
+                "KindEndOfFile [30, 39)",
+                "KindJSDoc [30, 39)",
+                "NodeList [31, 39)",
+                "KindJSDocText [31, 39) \"x \\xe6\\x97\"",
+            ],
+        ),
+        (
+            "/b.js",
+            ScriptKind::JS,
+            b"/** x \xc3\xa9\xe6",
+            &[
+                "KindEndOfFile [30, 39)",
+                "KindJSDoc [30, 39)",
+                "NodeList [31, 38)",
+                "KindJSDocText [31, 38) \"x \\xc3\"",
+            ],
+        ),
+        (
+            "/c.js",
+            ScriptKind::JS,
+            b"/** @param {\xe6\x97\xa5\xff",
+            &[
+                "KindEndOfFile [30, 45)",
+                "KindJSDoc [30, 45)",
+                "NodeList [31, 35)",
+                "NodeList [35, 45)",
+                "KindJSDocParameterTag [35, 45)",
+                "KindIdentifier [36, 41) \"param\"",
+                "KindIdentifier [43, 43) \"\"",
+                "KindJSDocTypeExpression [42, 43)",
+                "KindTypeReference [43, 43)",
+                "KindIdentifier [43, 43) \"\"",
+                "NodeList [43, 45)",
+                "KindJSDocText [43, 45) \"\\xe6\\x97\"",
+            ],
+        ),
+        (
+            "/d.js",
+            ScriptKind::JS,
+            "/** @param {string} a 😀".as_bytes(),
+            &[
+                "KindEndOfFile [30, 55)",
+                "KindJSDoc [30, 55)",
+                "NodeList [31, 35)",
+                "NodeList [35, 55)",
+                "KindJSDocParameterTag [35, 55)",
+                "KindIdentifier [36, 41) \"param\"",
+                "KindIdentifier [51, 52) \"a\"",
+                "KindJSDocTypeExpression [42, 50)",
+                "KindStringKeyword [43, 49)",
+                "NodeList [53, 55)",
+                "KindJSDocText [53, 55) \"\\xf0\\x9f\"",
+            ],
+        ),
+    ];
+    for (name, script_kind, comment, want) in cases {
+        let mut bytes = b"function f(a, b) { return a; }\n".to_vec();
+        bytes.extend_from_slice(comment);
+        let text: &'static str = Box::leak(go_string_from_bytes(bytes).into_boxed_str());
+        let file = Rc::new(parser::parse_source_file(
+            &SourceFileParseOptions {
+                file_name: name.to_string(),
+                path: Path(name.to_string()),
+                ..Default::default()
+            },
+            text,
+            script_kind,
+        ));
+        program::note_parsed_source_file(&file);
+        let (buf, _) = encode_source_file(file.root).expect("assert.NilError");
+        assert_eq!(encoded_nodes_from_end_of_file(&buf), want, "{name}");
+    }
+}
+
 // Go: api/encoder/encoder_test.go:112 TestBuildNodeIndexTableMatchesEncode
 #[test]
 fn test_build_node_index_table_matches_encode() {

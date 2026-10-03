@@ -1,5 +1,6 @@
 mod contentmapper_watch;
 mod file_delete;
+mod jsdoc_cut;
 mod showconfig;
 mod tsbuild_a;
 mod tsbuild_b;

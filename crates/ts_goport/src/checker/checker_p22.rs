@@ -499,6 +499,13 @@ impl Checker {
         if resolved.is_some() {
             return resolved;
         }
+        // PORT: Go `declaration.Parameters()` dereferences nil for a node
+        // that is not function-like (the API can pass any node). The port's
+        // nil list reads as empty, so it would make and register a
+        // signature. Nothing before Go's first read has a side effect.
+        if declaration.parameter_list().is_nil() {
+            crate::core::go_nil_dereference();
+        }
         let mut parameters: Vec<SymbolId> = Vec::new();
         let mut flags = SignatureFlags::NONE;
         let mut this_parameter = SymbolId::NIL;

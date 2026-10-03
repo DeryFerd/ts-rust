@@ -2324,7 +2324,10 @@ impl Node {
         if let Some(h) = try_store_header(self) {
             return h.kind;
         }
-        assert!(self.is_some(), "nil node dereference");
+        // Go reads the kind of a nil node.
+        if self.is_nil() {
+            crate::core::go_nil_dereference();
+        }
         unreachable!("node {self:?} is not synthetic and has no store")
     }
 

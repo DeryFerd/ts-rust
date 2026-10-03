@@ -14,6 +14,7 @@ use crate::frontend::scanner::scanner_p1::{
     ErrorCallback, Scanner, ScannerState, TEXT_TO_KEYWORD, new_scanner,
 };
 use smallvec::SmallVec;
+use std::cell::OnceCell;
 use std::sync::LazyLock;
 
 // Go: parser.go:19 ParsingContext
@@ -180,6 +181,17 @@ pub struct Parser<'a> {
     pub reparsed_clones: Vec<Node>,
 
     pub store: usize,
+
+    /// The owner of a JSDoc text whose cut splits a char, given by the
+    /// caller of the parse (see `parse_js_doc_comment`).
+    pub jsdoc_cut_text: Option<&'a OnceCell<String>>,
+    /// When the cut of the JSDoc text in parse splits a char: the position
+    /// after the first kept byte in the cut text, else `i32::MAX`. A node,
+    /// list or diagnostic that ends there or later may need a map to the
+    /// file (`jsdoc_tail_pos`).
+    pub jsdoc_tail_first: i32,
+    /// The comment end of the JSDoc text in parse.
+    pub jsdoc_tail_end: i32,
 }
 
 // Go: parser.go:104 newParser
@@ -215,6 +227,9 @@ pub fn new_parser<'a>() -> Parser<'a> {
         current_parent: Node::NIL,
         reparsed_clones: Vec::new(),
         store: 0,
+        jsdoc_cut_text: None,
+        jsdoc_tail_first: i32::MAX,
+        jsdoc_tail_end: 0,
     };
     res.initialize_closures();
     res
@@ -262,8 +277,10 @@ pub fn parse_source_file(
     script_kind: ScriptKind,
 ) -> ParsedSourceFile {
     let source_text: FileText = source_text.into();
+    let jsdoc_cut_text = OnceCell::new();
     let mut p = new_parser();
     p.initialize_state(opts, &source_text, script_kind);
+    p.jsdoc_cut_text = Some(&jsdoc_cut_text);
     // lsshells M3c: each version of an edited file is a new parse, so a
     // freeable parse (`crate::ast::is_freeable_parse`) interns the name,
     // which all its versions share, instead of leaking it again.
@@ -322,8 +339,10 @@ pub fn parse_source_file_detached(
     script_kind: ScriptKind,
 ) -> DetachedParse {
     let source_text: FileText = source_text.into();
+    let jsdoc_cut_text = OnceCell::new();
     let mut p = new_parser();
     p.initialize_state(opts, &source_text, script_kind);
+    p.jsdoc_cut_text = Some(&jsdoc_cut_text);
     let file_name: &'static str = Box::leak(opts.file_name.clone().into_boxed_str());
     // Drop what a parse that panicked left on this thread.
     let _ = take_detached_file_store();
