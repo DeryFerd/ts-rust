@@ -5615,6 +5615,15 @@ impl Node {
 
     // Go: ast.go:1581 EagerJSDoc
     /// JSDoc nodes that are already parsed and cached. It never parses.
+    // PORT: Go reads `jsdocCache`, which also holds the entries that a lazy
+    // parse (`resolveJSDoc`) added. The port keeps those in `LAZY_JSDOC`
+    // (`program::cached_lazy_js_doc`), so a miss in the parse cache of a
+    // lazy file reads them. Without that read, `checkSourceElement` missed
+    // a `{@link}` that the comment prefilter does not see (a form feed
+    // after `@link`) when an earlier `@deprecated` lookup parsed the
+    // comment, and the import that the link names was reported unused.
+    // Go shares the cache between its checkers; each port thread has its
+    // own (`LAZY_JSDOC`).
     #[must_use]
     pub fn eager_js_doc(self, file: Node) -> NodeSlice {
         if self.parser_flags(NodeFlags::HAS_JS_DOC).is_empty() {
@@ -5635,7 +5644,13 @@ impl Node {
         if is_file_store_before_program(file.file_index()) {
             return file_store_js_doc(file.file_index(), self).unwrap_or(NodeSlice::NIL);
         }
-        cached_js_doc(file, &source_file_info(file), self).unwrap_or(NodeSlice::NIL)
+        let info = source_file_info(file);
+        match cached_js_doc(file, &info, self) {
+            Some(jsdocs) => jsdocs,
+            None if info.has_lazy_js_doc => crate::program::cached_lazy_js_doc(self)
+                .map_or(NodeSlice::NIL, NodeSlice::from_nodes),
+            None => NodeSlice::NIL,
+        }
     }
 }
 

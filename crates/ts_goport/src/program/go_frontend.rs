@@ -345,7 +345,7 @@ pub(super) fn resolve_lazy_js_doc(
     info: &SourceFileInfo,
     node: Node,
 ) -> &'static [Node] {
-    if let Some(jsdocs) = LAZY_JSDOC.with(|cache| cache.borrow().get(&node).copied()) {
+    if let Some(jsdocs) = cached_lazy_js_doc(node) {
         return jsdocs;
     }
     let parse_options = SourceFileParseOptions {
@@ -368,6 +368,13 @@ pub(super) fn resolve_lazy_js_doc(
     );
     LAZY_JSDOC.with(|cache| cache.borrow_mut().write().insert(node, jsdocs));
     jsdocs
+}
+
+/// The entry that `resolve_lazy_js_doc` cached for `node` on this thread,
+/// or `None`. It never parses (Go `EagerJSDoc` reads `jsdocCache`, which
+/// holds such entries; `Node::eager_js_doc`).
+pub(crate) fn cached_lazy_js_doc(node: Node) -> Option<&'static [Node]> {
+    LAZY_JSDOC.with(|cache| cache.borrow().get(&node).copied())
 }
 
 // Go: compiler/program.go:122 FileExists (the Go frontend program)
