@@ -31,14 +31,15 @@
 //! build info file of a config when it has parsed it, and the orchestrator
 //! queues the read of a config that it parsed (`queue_read`), so the reads
 //! run while the graph is made. The threads take the queued configs first:
-//! the orchestrator waits for each config before it makes the graph. When the graph is made, the orchestrator keeps the reads that
-//! its checks can use (`finish_reads`; the rules are in orchestrator.rs
+//! the orchestrator waits for each config before it makes the graph. When
+//! the graph is made, the orchestrator keeps the reads that its checks can
+//! use (`finish_reads`; the rules are in orchestrator.rs
 //! `start_build_info_prefetch`) and drops the others. A read only reads,
 //! and the build writes nothing before its graph is made. For those rules,
 //! a thread also finds the key of the build info file of each config it
-//! parsed (`PathKeys::build_info_key`), before the orchestrator can take the
-//! config, so before the graph is made, where the orchestrator finds the
-//! keys (`build_info_key`).
+//! parsed (`PathKeys::build_info_key`) before the orchestrator can take the
+//! config, so before the graph is made, as the orchestrator does for the
+//! other keys (`build_info_key`).
 //!
 //! The pool starts a thread for each queued job that no thread is free
 //! for, up to `MAX_PREFETCH_THREADS` and the cores. A new thread starts the
