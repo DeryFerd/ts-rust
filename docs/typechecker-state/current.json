@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "status": "active",
   "decision": "REVIEW",
-  "updated": "2026-10-03T16:57:06.299116+00:00",
-  "reason": "Batch recovery-continuation-go-checker-port-47 accepted at R162. Batch recovery-continuation-go-checker-port-48 opened at R163.",
+  "updated": "2026-10-03T21:48:38.032337+00:00",
+  "reason": "R164 bound in batch recovery-continuation-go-checker-port-48.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -831,12 +831,12 @@
     "ordinaryQuery": null,
     "localCheck": null,
     "acceptance": null,
-    "recoveryRevision": 163,
-    "hypothesis": "Two skeptic-checked lanes and a root fix on R162 go in at pin 673a5f17d713 with no -p output change on the 4 projects: projfix1 (TS6059 from the common source directory in config diagnostics and clones, explainFiles relative names, Go nil panic for a top-level array tsconfig) and noop1 (tsc -b noop: one prefetch pool, per-task mtimes, stats by directory fd: wide noop 1.80 to 1.87x Go, query-chain 2.5x), and the prefetch panic fix (a panic after the config parse reaches the orchestrator, no hang): every R162 test name keeps its status (5 new), the gate has 0 regressions, the LSP and API oracles keep every class, np-suite keeps 879/879.",
-    "sourceFingerprint": "ed8ab540c277a6b4ea34c669541a152817813036af1ec7963c4c9965678dbd66",
-    "beforeEditingSourceFingerprint": "242ed622b95398eb22ec7739178df28e9e6f423db2b1bacdeeb30146559181c5",
+    "recoveryRevision": 164,
+    "hypothesis": "The R163 STOP repair on the R163 source goes in at pin 673a5f17d713 with no -p output change on the 4 projects: no prefetched source mtime outlives its build (status_prefetch dropped at the end of build_all_tasks), so tsc -b -w after a content-mapper error reads the disk as Go and reports InputFileNewer; os_mod_times keeps ELOOP as stat; a prefetch thread ended by a panic counts as ended; the pool drop closes configs: every R162 test name keeps its status (R163's 5 new plus 2), the gate has 0 regressions, the LSP and API oracles keep every class, np-suite keeps 879/879; with R163's content (projfix1, noop1, prefetch panic fix).",
+    "sourceFingerprint": "5ad104478563988cde056dd96d2b44ca8e7d48a0d9b66176fea333b3d25d79db",
+    "beforeEditingSourceFingerprint": "ed8ab540c277a6b4ea34c669541a152817813036af1ec7963c4c9965678dbd66",
     "sourceBindingStatus": "SOURCE_BOUND",
-    "commit": "3ff758c1c",
+    "commit": "556cb0d73",
     "completedRuns": [],
     "compilerAccepted": false,
     "passingCredit": false,
@@ -850,7 +850,7 @@
       "agent": "a72c9cf2e4e086567",
       "verdict": "PENDING"
     },
-    "nextPermittedAction": "Run the R163 pipeline (candidate.sh side)."
+    "nextPermittedAction": "Run the R164 pipeline (candidate.sh side)."
   },
   "parallelModelPreference": {
     "model": "GPT-6 Astra",
