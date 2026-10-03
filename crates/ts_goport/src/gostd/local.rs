@@ -327,7 +327,9 @@ pub fn note_message_gap(gap: Duration) {
 // is cold (hono 6.5 ms, 12.7% of the edit) and the client waits for it, so
 // it goes after the answer.
 pub fn drop_after_pause(value: Box<dyn Any>) {
-    if LOCAL.with(|l| l.paused.get()) {
+    // The thread may be ending, after its queues (a checker pool that
+    // another thread-local holds): then `value` drops now.
+    if LOCAL.try_with(|l| l.paused.get()).unwrap_or(false) {
         drop_later(value);
     } else {
         drop(value);
