@@ -22,6 +22,9 @@
 //! launcher whose caller ignores SIGCHLD still gets its worker's exit
 //! (`drop_go_signals`); and the signals that Go unblocks at start end the
 //! run also when the caller blocked them (`GO_UNBLOCKED`).
+//!
+//! The hold: a launcher holds each signal until its worker catches it,
+//! each on its own (`caught`).
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Seek, Write};
@@ -382,6 +385,136 @@ fn a_tsgo_whose_caller_ignores_sighup() {
     }
 }
 
+/// A signal that a launcher gets before its worker has set its handlers
+/// waits until the worker catches it (bin/tsgo.rs `caught`), as Go sets its
+/// handlers before `main`: SIGTERM waits for `notify_context` (a plain
+/// compile goes on after it, as in Go), whose thread ends at it. The test
+/// stops the worker (SIGSTOP) as soon as it has started (its `arg0` is a
+/// worker's), sends SIGTERM to the launcher, checks that it did not reach
+/// the worker (`ShdPnd` in /proc), and lets the worker go on. The thread of
+/// `notify_context` must then end well before the wait's limit
+/// (`HOLD_LIMIT`, 2 s after the worker's start), so a wait for another
+/// thread (`ready_thread`) fails the test. SIGQUIT to the launcher then
+/// ends the run with Go's text and exit 2. A worker that the test stopped
+/// too late (it catches SIGTERM) ends with its launcher and the run starts
+/// again, up to `ATTEMPTS` times; where no attempt is in time, the test
+/// says so and passes.
+#[test]
+fn a_launcher_holds_a_signal_until_its_worker_catches_it() {
+    const ATTEMPTS: usize = 20;
+    for _ in 0..ATTEMPTS {
+        let (_read, write, _) = small_pipe();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tsgo"))
+            .arg("--all")
+            .env("GOPORT_LAUNCH", "1")
+            .stdout(Stdio::from(write))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        let worker = loop {
+            // Before its exec, the child is the launcher's copy.
+            let started = child_of(child.id()).filter(|worker| {
+                std::fs::read(format!("/proc/{worker}/cmdline"))
+                    .is_ok_and(|cmdline| cmdline.starts_with(b"tsgo-worker "))
+            });
+            if let Some(worker) = started {
+                break worker;
+            }
+            assert!(child.try_wait().unwrap().is_none(), "ended before a worker");
+            assert!(start.elapsed() < LIMIT, "no worker in {LIMIT:?}");
+        };
+        let worker_pid = Pid::from_raw(worker.cast_signed()).unwrap();
+        rustix::process::kill_process(worker_pid, Signal::STOP).unwrap();
+        let status = loop {
+            let status = std::fs::read_to_string(format!("/proc/{worker}/status")).unwrap();
+            if field(&status, "State:").starts_with('T') {
+                break status;
+            }
+            assert!(start.elapsed() < LIMIT, "the worker did not stop");
+        };
+        if mask(&status, "SigCgt:") & bit(Signal::TERM) != 0 {
+            // Too late. The worker gets its parent-death SIGKILL.
+            child.kill().unwrap();
+            child.wait().unwrap();
+            continue;
+        }
+        let launcher = Pid::from_child(&child);
+        rustix::process::kill_process(launcher, Signal::TERM).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the launcher ended while its worker was stopped"
+        );
+        let status = std::fs::read_to_string(format!("/proc/{worker}/status")).unwrap();
+        let pending = mask(&status, "ShdPnd:") & bit(Signal::TERM);
+        assert_eq!(pending, 0, "sent on before the worker caught it");
+        rustix::process::kill_process(worker_pid, Signal::CONT).unwrap();
+        let resumed = Instant::now();
+        // The worker catches SIGTERM and has no `notify_context` thread, now
+        // and 50 ms later (it starts a moment after the handler).
+        let mut ended_once = false;
+        loop {
+            let status = std::fs::read_to_string(format!("/proc/{worker}/status")).unwrap();
+            let ended = mask(&status, "SigCgt:") & bit(Signal::TERM) != 0
+                && !has_thread(worker, "signal.NotifyContext");
+            if ended && ended_once {
+                break;
+            }
+            ended_once = ended;
+            assert!(
+                resumed.elapsed() < Duration::from_secs(1),
+                "the thread of notify_context still runs 1 s after the worker went on"
+            );
+            std::thread::sleep(Duration::from_millis(if ended { 50 } else { 1 }));
+        }
+        rustix::process::kill_process(launcher, Signal::QUIT).unwrap();
+        let (status, stderr) = end_of(child, "hold");
+        assert_eq!(status.code(), Some(2), "{status} {stderr}");
+        assert!(quit_once(&stderr), "{stderr}");
+        return;
+    }
+    eprintln!("skipped: no worker was stopped before it caught SIGTERM");
+}
+
+/// A SIGINT to the whole process group (a terminal's Ctrl-C) reaches the
+/// launcher and its worker. The worker's `notify_context` thread ends at its
+/// own copy, so the launcher's copy waits for that thread until the wait's
+/// limit (bin/tsgo.rs `HOLD_LIMIT`, 2 s after the worker's start). A signal
+/// that then comes to the launcher only does not wait behind it: SIGQUIT
+/// ends the run at once with Go's text and exit 2, and SIGHUP ends it by
+/// SIGHUP, as in Go. Where `env --default-signal` cannot run, the test says
+/// so and passes.
+#[test]
+fn a_launcher_does_not_hold_a_signal_behind_another() {
+    let probe = Command::new("env").args(DEFAULT_HUP).arg("true").status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `env --default-signal=HUP` cannot run here");
+        return;
+    }
+    for signal in [Signal::QUIT, Signal::HUP] {
+        let case = format!("SIGINT to the group, then {signal:?} to the launcher");
+        // `env` execs tsgo, so the started process is the launcher.
+        let mut command = Command::new(DEFAULT_HUP[0]);
+        command
+            .args(&DEFAULT_HUP[1..])
+            .arg(env!("CARGO_BIN_EXE_tsgo"))
+            .process_group(0);
+        let signals = [(GROUP, Signal::INT), (0, signal)];
+        let (status, stderr, ended) = signal_run(command, "1", &signals, &case);
+        if signal == Signal::QUIT {
+            assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+            assert!(quit_once(&stderr), "{case}: {stderr}");
+        } else {
+            assert_eq!(status.signal(), Some(1), "{case}: {status} {stderr}");
+        }
+        assert!(
+            ended < Duration::from_secs(1),
+            "{case}: ended {ended:?} after the signal"
+        );
+    }
+}
+
 /// A launcher whose worker cannot start runs the work itself (bin/tsgo.rs
 /// `launch`), as a run that never was a launcher: a plain compile goes on
 /// after SIGINT and SIGTERM, and SIGQUIT ends it with Go's text and exit 2.
@@ -557,6 +690,39 @@ fn small_pipe() -> (OwnedFd, OwnedFd, u64) {
     let fill = std::fs::File::from(write.try_clone().unwrap());
     (&fill).write_all(&vec![b'\n'; filled]).unwrap();
     (read, write, filled as u64)
+}
+
+/// The bit of `signal` in a signal mask of /proc/<pid>/status.
+fn bit(signal: Signal) -> u64 {
+    1 << (signal.as_raw() - 1)
+}
+
+/// The value of the line `name` of /proc/<pid>/status `status`.
+fn field<'a>(status: &'a str, name: &str) -> &'a str {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(name))
+        .unwrap_or_else(|| panic!("no {name} in {status}"))
+        .trim()
+}
+
+/// The signal mask of the line `name` (`SigCgt:`, `ShdPnd:`) of
+/// /proc/<pid>/status `status`.
+fn mask(status: &str, name: &str) -> u64 {
+    u64::from_str_radix(field(status, name), 16).unwrap()
+}
+
+/// Whether the process `pid` has a thread named `name` (the kernel keeps
+/// the first 15 bytes of a name).
+fn has_thread(pid: u32, name: &str) -> bool {
+    let name = &name.as_bytes()[..name.len().min(15)];
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().any(|task| {
+        std::fs::read(task.path().join("comm"))
+            .is_ok_and(|comm| comm.strip_suffix(b"\n") == Some(name))
+    })
 }
 
 /// `env` with the default action of SIGHUP, also when the test runs under
