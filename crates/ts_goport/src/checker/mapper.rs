@@ -49,7 +49,10 @@ pub enum TypeMapper {
     Inference(InferenceTypeMapper),
 }
 
+// 32-bit targets (wasm32) have smaller pointers and do not check this.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<TypeMapper>() == 16);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<ArrayTypeMapper>() == 48);
 
 impl Default for TypeMapper {

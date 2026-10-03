@@ -3,7 +3,7 @@
 //! `TestSubscribeSubfileUpdate` (`watcher_test.go`), and the Linux and darwin
 //! cases of Go `Default` (`watcher.go`). On Linux `fswatch::default()` is
 //! fanotify when `fanotify_init` succeeds (Linux 5.13 or later with the
-//! needed permission), else inotify, as in Go. On macOS it is FSEvents.
+//! needed permission), else inotify, as in Go. On macOS it is `FSEvents`.
 //!
 //! PORT: Go runs each test on every available backend (`runForEachWatcher`).
 //! `go_baselines` `units_platform/fswatch_watcher.rs` ports that. This binary

@@ -320,6 +320,8 @@ pub struct InferenceContext {
     pub rare: Option<Box<InferenceContextRare>>,
 }
 
+// 32-bit targets (wasm32) have smaller pointers and do not check this.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<InferenceContext>() == 56);
 
 /// The fields of Go `InferenceContext` that only signature inference sets.
@@ -425,6 +427,8 @@ pub struct InferenceInfo {
     pub implied_arity: i32,
 }
 
+// 32-bit targets (wasm32) have smaller pointers and do not check this.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<InferenceInfo>() == 32);
 
 /// The candidate lists of an `InferenceInfo`.
