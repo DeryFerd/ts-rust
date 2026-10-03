@@ -1012,7 +1012,7 @@ macro_rules! data_is_variant {
 /// (binder.go: `ExportContext`, `ContainsThis`, `ReachabilityAndEmitFlags`
 /// = `HasImplicitReturn | HasExplicitReturn | HasAsyncFunctions`,
 /// `Unreachable`, `ThisNodeOrAnySubNodesHasError`). `NodeBindData::
-/// added_flags` holds only these (checked in debug builds by
+/// added_flags` holds only these (checked, in release builds too, by
 /// `ast::bind_store_records`, which ORs them into the node record), so for
 /// a mask without them Go `node.Flags & mask` is the parser flags `& mask`
 /// (`Node::parser_flags`).
