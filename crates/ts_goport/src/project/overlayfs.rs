@@ -344,10 +344,22 @@ pub struct OverlayFS {
 }
 
 /// Go `map[tspath.Path]map[tspath.Path]string` of `overlayFS.overlayDirectories`.
-// PORT: Go ranges over a directory map (`GetAccessibleEntries`), and a
-// small Go map gives a rotation of its insertion order. The inner map is an
-// `IndexMap` (insertion order), Go's most common answer; an FxHashMap gave
-// orders that Go never gives (editfuzz2 R1).
+// PORT: Go ranges over a directory map (`GetAccessibleEntries`). A Go map
+// of at most 8 entries is one group of 8 slots: an insert takes the first
+// free slot, a delete frees its slot, and a range starts at a random slot
+// and wraps. Go makes the directory maps again from `overlays` at each
+// change (`createOverlayDirectories`) and never deletes from them. So the
+// slots hold the children in the order of the range over `overlays`, and Go
+// gives a rotation of that order. The inner map is an `IndexMap` (insertion
+// order), filled in the order of the port's `overlays`. When that order is
+// Go's slot order of `overlays`, the port gives the rotation that starts at
+// the first slot, which Go can give. Go can differ in two cases:
+// - A close and then an open: Go puts the new overlay in the free slot of
+//   the closed one, but the port puts it last (`shift_remove`, then insert).
+// - Above 8 entries (in `overlays` or in one directory): Go's order depends
+//   on the hash seed of the map.
+// An FxHashMap gave orders that Go never gives, also with no close
+// (editfuzz2 R1).
 pub type OverlayDirectories = FxHashMap<tspath::Path, IndexMap<tspath::Path, String>>;
 
 // Go: project/overlayfs.go:198 LayeredFileSystem (ts#64291)
