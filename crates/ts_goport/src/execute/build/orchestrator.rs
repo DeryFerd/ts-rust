@@ -1114,7 +1114,15 @@ impl Orchestrator {
             if name.is_empty() {
                 continue;
             }
-            let build_info_key = keys.build_info_key(&name)?;
+            // PORT: perf. A prefetch thread found most keys before the graph
+            // was made, as this does.
+            let build_info_key = match pool
+                .as_ref()
+                .and_then(|pool| pool.build_info_key(path, &name))
+            {
+                Some(key) => key,
+                None => keys.build_info_key(&name),
+            }?;
             *named.entry(build_info_key.clone()).or_default() += 1;
             let build_info_path = self.to_path(&name);
             let keeps = task

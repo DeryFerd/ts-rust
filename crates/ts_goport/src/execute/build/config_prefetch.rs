@@ -33,7 +33,11 @@
 //! the graph is made. When the graph is made, the orchestrator keeps the reads that
 //! its checks can use (`finish_reads`; the rules are in orchestrator.rs
 //! `start_build_info_prefetch`) and drops the others. A read only reads,
-//! and the build writes nothing before its graph is made.
+//! and the build writes nothing before its graph is made. For those rules,
+//! a thread also finds the key of the build info file of each config it
+//! parsed (`PathKeys::build_info_key`), before the orchestrator can take the
+//! config, so before the graph is made, where the orchestrator finds the
+//! keys (`build_info_key`).
 //!
 //! The pool starts a thread for each queued job that no thread is free
 //! for, up to `MAX_PREFETCH_THREADS` and the cores. A new thread starts the
@@ -42,6 +46,7 @@
 
 use crate::execute::build::build_task::{StatusCheckOptions, StatusPrefetch};
 use crate::execute::build::host::TscExtendedConfigCache;
+use crate::execute::build::shared_outputs::PathKeys;
 use crate::execute::incremental::build_info::BuildInfo;
 use crate::execute::incremental::incremental::parse_build_info;
 use crate::frontend::prelude::*;
@@ -178,6 +183,10 @@ impl BuildInfoSlot {
 struct ReadJob {
     read: Arc<BuildInfoRead>,
     slot: Arc<BuildInfoSlot>,
+    /// The key of the file (`PathKeys::build_info_key`) that a thread found
+    /// before the graph was made; None when the orchestrator queued the
+    /// read.
+    key: Option<Option<String>>,
 }
 
 struct Queue {
@@ -308,7 +317,7 @@ impl PrefetchPool {
         };
         let spawn = {
             let mut queue = lock(&self.shared.queue);
-            let Some(job) = add_read(&mut queue, path, read) else {
+            let Some(job) = add_read(&mut queue, path, read, None) else {
                 return;
             };
             queue.reads.push_back(job);
@@ -357,6 +366,7 @@ impl PrefetchPool {
                         let job = ReadJob {
                             read: Arc::new(read),
                             slot: Arc::default(),
+                            key: None,
                         };
                         queue.reads.push_back(job.clone());
                         job
@@ -374,6 +384,18 @@ impl PrefetchPool {
         spawn_threads(&self.shared, spawn);
         let runs = lock(&self.shared.queue).threads > 0;
         runs.then_some(slots)
+    }
+
+    /// The key of the build info file `name` (`PathKeys::build_info_key`)
+    /// that a thread found for the config at `path`, when it found one for
+    /// that name.
+    pub(crate) fn build_info_key(&self, path: &Path, name: &str) -> Option<Option<String>> {
+        let queue = lock(&self.shared.queue);
+        let job = queue.reads_by_config.get(path)?;
+        if job.read.name != name {
+            return None;
+        }
+        job.key.clone()
     }
 
     /// The match of a thread for the config at `path`, when its inputs
@@ -533,14 +555,20 @@ fn queue_configs(shared: &Arc<Shared>, configs: &[String]) {
 
 /// Adds `read` for the config at `path` to the reads (`reads_by_config`),
 /// unless a read is there for it or no job is queued any more. Gives the
-/// added read, which the caller runs or queues.
-fn add_read(queue: &mut Queue, path: &Path, read: BuildInfoRead) -> Option<ReadJob> {
+/// added read, which the caller runs or queues. `key` as in `ReadJob`.
+fn add_read(
+    queue: &mut Queue,
+    path: &Path,
+    read: BuildInfoRead,
+    key: Option<Option<String>>,
+) -> Option<ReadJob> {
     if queue.closed || queue.reads_by_config.contains_key(path) {
         return None;
     }
     let job = ReadJob {
         read: Arc::new(read),
         slot: Arc::default(),
+        key,
     };
     queue.reads_by_config.insert(path.clone(), job.clone());
     Some(job)
@@ -622,8 +650,8 @@ fn run_thread(shared: &Arc<Shared>) {
 }
 
 /// Parses `config` for its slot. Before the orchestrator can take the
-/// slot, queues its references and adds its build info read, which it
-/// gives to run next.
+/// slot, queues its references and adds its build info read with the key
+/// of the file, which it gives to run next.
 fn parse_config(
     shared: &Arc<Shared>,
     options: &ParseOptions,
@@ -673,7 +701,9 @@ fn parse_config(
     if let Ok(Some((references, read))) = parsed {
         queue_configs(shared, &references);
         if let Some(read) = read {
-            own_read = add_read(&mut lock(&shared.queue), &path, read);
+            let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
+            let key = PathKeys::new(&fs, &shared.compare_paths_options).build_info_key(&read.name);
+            own_read = add_read(&mut lock(&shared.queue), &path, read, Some(key));
         }
     }
     *lock(&slot.state) = SlotState::Done(matched);
