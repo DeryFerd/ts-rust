@@ -1,0 +1,95 @@
+# Format, lint, build and test on every pull request and on each push to main that changes code.
+# The full protected set (TestLocal shards, gate, bound runs, LSP and API oracles, np-suite) stays in
+# the revision pipeline (scripts/goport/candidate.sh). This workflow is a fast check that the tree
+# builds and its own tests pass on Linux and macOS.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "tools/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "UPSTREAM.json"
+      - ".github/workflows/ci.yml"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -C debuginfo=0
+  # The toolchain of shipped bins, fmt and clippy (scripts/goport/README.md, "Build toolchain").
+  RUSTUP_TOOLCHAIN: 1.93.0
+
+jobs:
+  lint:
+    name: fmt, codegen, clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal -c rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all -- --check
+      - name: Generated AST files match the codegen
+        run: |
+          cargo run --locked --quiet -p ts_ast_codegen -- check crates/ts_goport/src/astdata/syntax_kind.rs
+          cargo run --locked --quiet -p ts_ast_codegen -- check-ast crates/ts_goport/src/astdata/ast_generated.rs
+      # The packages of the revision quality step (candidate.sh): 0 warnings.
+      - run: cargo clippy --locked -p ts_goport -p goport_util -p goport_lsproto --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      # One test thread, as goport-tests.sh runs them.
+      RUST_TEST_THREADS: 1
+    steps:
+      - uses: actions/checkout@v5
+      # main's Go pin is the saved state's batch.upstreamPin.to. UPSTREAM.json "current" can be an older
+      # pin until the default pin switch (AGENTS.md, "Pin").
+      - name: Resolve the Go pin
+        id: pin
+        run: |
+          key=$(jq -r '.batch.upstreamPin.to // empty' docs/typechecker-state/current.json)
+          python3 scripts/upstream/pin.py show ${key:+"$key"} > "$RUNNER_TEMP/pin.json"
+          jq -r '"repo=\(.repo)", "commit=\(.commit)", "subdir=\(.subdir // "")"' "$RUNNER_TEMP/pin.json" >> "$GITHUB_OUTPUT"
+      - name: Check out the pinned Go source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ steps.pin.outputs.repo }}
+          ref: ${{ steps.pin.outputs.commit }}
+          path: go-pin
+          sparse-checkout: ${{ steps.pin.outputs.subdir }}
+          persist-credentials: false
+      - run: echo "TS_GO_REPO=$GITHUB_WORKSPACE/go-pin${SUBDIR:+/$SUBDIR}" >> "$GITHUB_ENV"
+        env:
+          SUBDIR: ${{ steps.pin.outputs.subdir }}
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build
+        run: |
+          cargo test --release --locked --workspace --no-run
+          cargo test --release --locked -p ts_goport --test go_baselines --no-run
+      - name: Unit and integration tests
+        run: cargo test --release --locked --workspace
+      # go_baselines has `test = false`, so --workspace skips it. TestLocal (about 12,700 compiler
+      # cases) runs in 4 shards in goport-tests.sh and is too slow for these runners; the rest of the
+      # default go_baselines set runs here.
+      - name: Go baselines
+        run: cargo test --release --locked -p ts_goport --test go_baselines -- --exact --skip compiler_runner::test_local
