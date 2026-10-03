@@ -401,7 +401,7 @@ fn write_event(buf: &mut String, event: &TraceEvent<'_>) {
 /// Go `json.Deterministic(true)` map output: the keys in byte order.
 fn write_args(buf: &mut String, args: &[(&'static str, Arg)]) {
     let mut sorted: Vec<&(&'static str, Arg)> = args.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    crate::gostd::slices::stable_sort_by(&mut sorted, |a, b| a.0.cmp(b.0));
     buf.push('{');
     for (i, (key, value)) in sorted.into_iter().enumerate() {
         if i > 0 {

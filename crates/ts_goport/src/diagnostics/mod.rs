@@ -41,7 +41,9 @@ impl fmt::Display for Category {
 pub struct Message {
     code: u32,
     category: Category,
+    /// "" in a catalog entry of the wasm build (`Message::catalog`).
     key: &'static str,
+    /// "" in a catalog entry of the wasm build (`Message::catalog`).
     text: &'static str,
     reports_unnecessary: bool,
     elided_in_compatibility_pyramid: bool,
@@ -49,6 +51,9 @@ pub struct Message {
 }
 
 impl Message {
+    /// A message made outside the catalog: `ast::NIL_MESSAGE` and the ad
+    /// hoc messages (code 0, key ""), and the messages that Go removed
+    /// (`diag.rs`). It keeps its key and text on every target.
     #[doc(hidden)]
     #[must_use]
     pub const fn new(
@@ -60,6 +65,8 @@ impl Message {
         elided_in_compatibility_pyramid: bool,
         reports_deprecated: bool,
     ) -> Self {
+        // The wasm build tells catalog entries by their code with no key.
+        assert!(code == 0 || !key.is_empty(), "a message with a code has a key");
         Self {
             code,
             category,
@@ -69,6 +76,39 @@ impl Message {
             elided_in_compatibility_pyramid,
             reports_deprecated,
         }
+    }
+
+    /// An entry of the generated `CATALOG`. The wasm build leaves out its
+    /// key (144 KB for all) and text (151 KB): `key` makes the key from the
+    /// text, and `text` reads the texts that `parts/goport_util/build.rs`
+    /// packed.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn catalog(
+        code: u32,
+        category: Category,
+        key: &'static str,
+        text: &'static str,
+        reports_unnecessary: bool,
+        elided_in_compatibility_pyramid: bool,
+        reports_deprecated: bool,
+    ) -> Self {
+        let packed = cfg!(target_family = "wasm");
+        Self {
+            code,
+            category,
+            key: if packed { "" } else { key },
+            text: if packed { "" } else { text },
+            reports_unnecessary,
+            elided_in_compatibility_pyramid,
+            reports_deprecated,
+        }
+    }
+
+    /// wasm: true for a catalog entry, which has a code and no key.
+    #[cfg(target_family = "wasm")]
+    const fn packed(self) -> bool {
+        self.code != 0 && self.key.is_empty()
     }
 
     #[must_use]
@@ -81,14 +121,56 @@ impl Message {
         self.category
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[must_use]
     pub const fn key(self) -> &'static str {
         self.key
     }
 
+    /// wasm: the key. A catalog entry makes it from its text as Go's
+    /// generator does (`message_key`), once.
+    #[cfg(target_family = "wasm")]
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, PoisonError};
+        if !self.packed() {
+            return self.key;
+        }
+        static KEYS: Mutex<Option<HashMap<u32, &'static str>>> = Mutex::new(None);
+        let mut keys = KEYS.lock().unwrap_or_else(PoisonError::into_inner);
+        keys.get_or_insert_with(HashMap::new)
+            .entry(self.code)
+            .or_insert_with(|| Box::leak(message_key(self.text(), self.code).into_boxed_str()))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     #[must_use]
     pub const fn text(self) -> &'static str {
         self.text
+    }
+
+    /// wasm: the text. A catalog entry reads it from the packed texts of
+    /// the catalog, which the first read unpacks.
+    #[cfg(target_family = "wasm")]
+    #[must_use]
+    pub fn text(self) -> &'static str {
+        if !self.packed() {
+            return self.text;
+        }
+        static TEXTS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+        let texts = TEXTS.get_or_init(|| {
+            let packed = include_bytes!(concat!(env!("OUT_DIR"), "/diagnostic_texts.lzma"));
+            let texts: &'static str =
+                Box::leak(crate::frontend::bundled::unpack(packed).into_boxed_str());
+            let texts: Vec<&'static str> = texts.split_terminator('\0').collect();
+            assert_eq!(texts.len(), CATALOG.len(), "a packed text for each catalog entry");
+            texts
+        });
+        let index = CATALOG
+            .binary_search_by_key(&self.code, |message| message.code)
+            .expect("a catalog message");
+        texts[index]
     }
 
     #[must_use]
@@ -112,12 +194,13 @@ impl Message {
     ///
     /// Returns an error if the message references an argument that was not supplied.
     pub fn format(self, arguments: &[String]) -> Result<String, FormatError> {
+        let text = self.text();
         if arguments.is_empty() {
-            return Ok(self.text.to_owned());
+            return Ok(text.to_owned());
         }
 
-        let mut output = String::with_capacity(self.text.len());
-        let mut remaining = self.text;
+        let mut output = String::with_capacity(text.len());
+        let mut remaining = text;
         while let Some(open) = remaining.find('{') {
             output.push_str(&remaining[..open]);
             remaining = &remaining[open + 1..];
@@ -238,12 +321,90 @@ pub fn message_by_code(code: u32) -> Option<&'static Message> {
 /// Looks up a diagnostic message by its generated localization key.
 #[must_use]
 pub fn message_by_key(key: &str) -> Option<&'static Message> {
-    CATALOG.iter().find(|message| message.key() == key)
+    #[cfg(not(target_family = "wasm"))]
+    return CATALOG.iter().find(|message| message.key() == key);
+    // wasm makes keys on demand, so it finds the message by the code that
+    // ends every key.
+    #[cfg(target_family = "wasm")]
+    key.rsplit_once('_')
+        .and_then(|(_, code)| message_by_code(code.parse().ok()?))
+        .filter(|message| message.key() == key)
 }
+
+/// The key of a message with `text` and `code`: Go's
+/// `internal/diagnostics/generate.go` `convertPropertyName`. Each `*`,
+/// `/` and `:` becomes a word, each other character that is not a letter
+/// or digit becomes `_`; runs of `_` become one; leading `_` before a
+/// non-digit and one trailing `_` go; the result is cut to 100 bytes and
+/// gets `_<code>`.
+// PORT: not in Go at run time. The wasm build makes its keys with it.
+#[cfg(any(test, target_family = "wasm"))]
+fn message_key(text: &str, code: u32) -> String {
+    let mut name = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '*' => name.push_str("_Asterisk"),
+            '/' => name.push_str("_Slash"),
+            ':' => name.push_str("_Colon"),
+            c if c.is_alphabetic() || c.is_numeric() => name.push(c),
+            _ => name.push('_'),
+        }
+    }
+    // `_+` -> `_`
+    let mut collapsed = String::with_capacity(name.len());
+    for c in name.chars() {
+        if !(c == '_' && collapsed.ends_with('_')) {
+            collapsed.push(c);
+        }
+    }
+    // `^_+(\D)` -> `$1` (after the collapse there is at most one `_`)
+    let mut key = match collapsed.strip_prefix('_') {
+        Some(rest) if rest.chars().next().is_some_and(|c| !c.is_ascii_digit()) => rest.to_string(),
+        _ => collapsed,
+    };
+    // `_$` -> ``
+    if key.ends_with('_') {
+        key.pop();
+    }
+    if key.len() > 100 {
+        key.truncate(100);
+    }
+    format!("{key}_{code}")
+}
+
+/// The catalog text reader of the wasm build (`parts/goport_util/build.rs`),
+/// for its test.
+#[cfg(test)]
+#[path = "../../parts/goport_util/catalog_texts.rs"]
+mod catalog_texts;
 
 #[cfg(test)]
 mod tests {
-    use super::{CATALOG, Category, Diagnostic, message_by_code, message_by_key};
+    use super::{CATALOG, Category, Diagnostic, message_by_code, message_by_key, message_key};
+
+    /// The wasm build packs the texts that `catalog_texts` reads from the
+    /// catalog source; they must be the texts of the catalog.
+    #[test]
+    fn catalog_texts_reads_every_text() {
+        let texts = super::catalog_texts::catalog_texts(include_str!("catalog.rs"));
+        let texts: Vec<&str> = texts.split_terminator('\0').collect();
+        let want: Vec<&str> = CATALOG.iter().map(|message| message.text()).collect();
+        assert_eq!(texts, want);
+    }
+
+    /// The wasm build makes each key from its text (`message_key`); it
+    /// must give the generated key of every message.
+    #[test]
+    fn message_key_makes_every_generated_key() {
+        for message in CATALOG {
+            assert_eq!(
+                message_key(message.text(), message.code()),
+                message.key(),
+                "{}",
+                message.code()
+            );
+        }
+    }
 
     #[test]
     fn generated_catalog_is_complete_and_sorted() {

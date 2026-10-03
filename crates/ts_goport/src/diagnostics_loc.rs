@@ -162,7 +162,9 @@ static LOCALIZED_MESSAGES_CACHE: LazyLock<
 /// (tests/go_baselines/units_platform/diagnostics_locale.rs); Go tests it
 /// from inside the package.
 pub fn get_localized_messages(loc: &language::Tag) -> Option<&'static LocaleMessages> {
-    if *loc == language::Tag::UND {
+    // PORT: the wasm build has no catalogs (1 MB; see npm/wasm/README.md),
+    // so every locale gives English there. The link drops the catalogs.
+    if cfg!(target_family = "wasm") || *loc == language::Tag::UND {
         return None;
     }
 

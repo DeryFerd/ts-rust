@@ -12,6 +12,7 @@
 //!
 //! Both builds read the same lib parse and bind snapshots:
 //! `bundled_lib_name` gives the base name of a lib file in either form.
+//! The wasm build reads none (see `embed::bundled_lib_name`).
 
 use crate::frontend::prelude::*;
 

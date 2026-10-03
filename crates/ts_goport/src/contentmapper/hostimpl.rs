@@ -33,6 +33,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+/// wasm cannot start a process (execute/tsc/compile.rs `spawn_process`), so
+/// no mapper has a connection there: its dial always fails. The wasm build
+/// calls this where a connection would be used, so that the compiler leaves
+/// the mapper protocol (ipc and the requests) out of the wasm module.
+// PORT: not in Go.
+#[cfg(target_family = "wasm")]
+fn no_mapper_connection() {
+    unreachable!("wasm cannot start a content mapper process");
+}
+
 // PORT: Go mutexes do not poison.
 fn lock<T: ?Sized>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1378,7 +1388,12 @@ pub fn new_host_with_options(
             let spawned = spawner.spawn(&mapper.manifest.exec, &mapper.package_directory, stderr);
             mapper_timing.spawn.record(spawn_start);
             let mut rwc: Arc<dyn ProcessExitState> = match spawned {
-                Ok(rwc) => rwc,
+                Ok(rwc) => {
+                    // PORT: not in Go (see `no_mapper_connection`).
+                    #[cfg(target_family = "wasm")]
+                    no_mapper_connection();
+                    rwc
+                }
                 Err(err) => {
                     return Err(InitializeError {
                         kind: InitializeErrorKind::PROCESS_START,
@@ -1555,6 +1570,9 @@ impl HostImpl {
         }
         let mapper = entry.borrow().mapper.clone();
         let (conn, _, diagnostic_source) = self.conn_for_locked(&mapper)?;
+        // PORT: not in Go (see `no_mapper_connection`).
+        #[cfg(target_family = "wasm")]
+        no_mapper_connection();
         let (config_file_name, project_handle, compiler_options) = {
             let entry = entry.borrow();
             (
@@ -1701,6 +1719,9 @@ impl HostImpl {
                 );
             }
         };
+        // PORT: not in Go (see `no_mapper_connection`).
+        #[cfg(target_family = "wasm")]
+        no_mapper_connection();
         let mapper_timing = self.timing.mapper(&mapper.identity());
         let start = mapper_timing.start_request();
         let raw = conn.call(
@@ -1834,6 +1855,11 @@ impl HostImpl {
         let conns = self.conns.borrow();
         let entry = conns.as_ref()?.get(identity)?.clone();
         let conn = entry.borrow().conn.clone();
+        // PORT: not in Go (see `no_mapper_connection`).
+        #[cfg(target_family = "wasm")]
+        if conn.is_some() {
+            no_mapper_connection();
+        }
         conn
     }
 }
@@ -2271,7 +2297,7 @@ impl Project for ProjectLease {
             }
             files.extend(entry.borrow().watched_files.iter().cloned());
         }
-        files.sort();
+        crate::gostd::slices::stable_sort_by(&mut files, Ord::cmp);
         files.dedup();
         Ok(files)
     }

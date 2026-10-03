@@ -706,11 +706,12 @@ fn flush_writes(
         .map(|(index, (path, ..))| (path, index))
         .collect();
     // A file's JS and declaration can emit on two threads, each in order.
-    writes.sort_by_key(|write| {
+    let key = |write: &BufferedWrite| {
         let output = write.file_name.as_str();
         let declaration = is_declaration_file_name(output.strip_suffix(".map").unwrap_or(output));
         (order.get(&write.source).copied(), declaration)
-    });
+    };
+    crate::gostd::slices::stable_sort_by(&mut writes, |a, b| key(a).cmp(&key(b)));
     let files: Vec<&mut [BufferedWrite]> =
         writes.chunk_by_mut(|a, b| a.source == b.source).collect();
     let threads = MAX_FLUSH_THREADS

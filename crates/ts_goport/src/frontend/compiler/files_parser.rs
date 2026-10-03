@@ -2,6 +2,7 @@
 //! `getProcessedFiles`).
 
 use crate::frontend::prelude::*;
+use crate::gostd::slices::stable_sort_by;
 use crate::program::ThreadBudget;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -1145,7 +1146,7 @@ impl FilesParser {
             .cloned()
             .collect();
         // PORT: Go sorts by the bytes of the paths (see `compare_go_bytes`).
-        keys.sort_by(|a, b| compare_go_bytes(a.as_str(), b.as_str()));
+        stable_sort_by(&mut keys, |a, b| compare_go_bytes(a.as_str(), b.as_str()));
         for key in keys {
             let value = loader
                 .path_for_lib_file_resolutions
@@ -1632,7 +1633,8 @@ impl PrefetchStats {
             .chain(&self.unusable)
             .map(|name| (size(name), name))
             .collect();
-        own.sort_by_key(|&(size, _)| std::cmp::Reverse(size));
+        // Largest first.
+        stable_sort_by(&mut own, |a, b| b.0.cmp(&a.0));
         let bytes: u64 = own.iter().map(|(size, _)| size).sum();
         eprintln!(
             "goport prefetch: loader parsed {} files ({} KB): claimed {}, not queued {}, unusable {}; took {} worker parses; waited {} times ({:.1} ms); largest: {}",
@@ -1911,6 +1913,11 @@ impl PrefetchPool {
 
     /// Starts `workers` more parse workers on the queue of this pool.
     fn add_workers(&mut self, workers: usize) {
+        // wasm32-wasip1 has no threads, so no worker can start. Saying so
+        // leaves the worker thread out of the wasm module.
+        if cfg!(target_family = "wasm") {
+            return;
+        }
         for _ in 0..workers {
             let shared = self.shared.clone();
             // A worker that cannot start only makes the parse less parallel.

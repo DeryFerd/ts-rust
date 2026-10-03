@@ -3666,7 +3666,8 @@ const PUBLISH_THREADS: usize = 4;
 // thread. The result does not depend on the split.
 fn publish_stores(stores: &mut [FileStore], base: usize) {
     let total: usize = stores.iter().map(FileStore::publish_work).sum();
-    if total < PARALLEL_PUBLISH_WORK {
+    // wasm has one thread.
+    if cfg!(target_family = "wasm") || total < PARALLEL_PUBLISH_WORK {
         publish_run(stores, base);
         return;
     }
