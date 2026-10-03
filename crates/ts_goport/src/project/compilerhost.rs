@@ -388,6 +388,7 @@ impl compiler::CompilerHost for CompilerHost {
         }
         let (open_files, open_directories) = files.open_files_over_os()?;
         let load = AheadCheck {
+            lookups: files.cached_fs()?,
             reads: RefCell::new(FxHashMap::default()),
             package_jsons: RefCell::new(FxHashSet::default()),
         };
@@ -449,9 +450,14 @@ impl compiler::CompilerHost for CompilerHost {
 /// - `file_exists`: the snapshot's cached file of the path decides, if it
 ///   has one (`SnapshotFSBuilder::cached_file_state`). A cached file that
 ///   needs a reload fails the check: the loader's lookup would read it.
-///   Else the layered file system decides, which the worker read the same
-///   way (open files over the OS), unless the worker's answer is `known`
-///   (not read in this load): then the check asks the layered file system.
+///   Else the snapshot's lookup cache decides (Go `cachedvfs` of the
+///   layered file system, which the worker read the same way: open files
+///   over the OS). When it has no answer for the path yet, the worker's
+///   answer becomes its answer (`CachedFs::agree_file_exists`), unless the
+///   worker's answer is `known` (not found in this load): then the check
+///   asks the layered file system through the cache.
+/// - `directory_exists` and `realpath`: the snapshot's lookup cache
+///   decides in the same way.
 /// - a read is the loader's own read (`SourceFS::get_file`: it tracks the
 ///   file, caches it and notes a `node_modules` realpath alias), made at
 ///   the moment the loader would make it, since every call before it gave
@@ -462,9 +468,16 @@ impl compiler::CompilerHost for CompilerHost {
 ///   directory a missing directory, as the loader's calls would note them.
 /// - the calls of a package.json cache entry (`AheadCall::PackageJson`)
 ///   are checked and replayed once per load: the snapshot does not change
-///   during the load, and the replay notes the same paths again.
+///   its answers during the load, and the replay notes the same paths
+///   again.
+///
+/// A worker answer that the check stores in the lookup cache and that a
+/// later call of the answer rejects stays there: the worker got it from
+/// the disk during this load, as one of Go's calls could have.
 /// What `accept_ahead_answer` keeps during one load.
 struct AheadCheck {
+    /// The snapshot's lookup cache (`SnapshotFSBuilder::cached_fs`).
+    lookups: Rc<vfs::CachedFs>,
     /// The hash of each file that the check read, by name.
     reads: RefCell<FxHashMap<String, Option<u128>>>,
     /// The package.json call groups that passed the check and were
@@ -507,14 +520,18 @@ fn check_ahead_call(
             // The worker asked the OS through the open files, as the
             // layered file system does; a known answer is checked here
             // (the same call as the loader's own lookup).
-            CachedFileState::Absent => {
-                !*known || vfs::Fs::file_exists(&*files.fs, path.as_str()) == *exists
+            CachedFileState::Absent if *known => {
+                vfs::Fs::file_exists(&*load.lookups, path.as_str()) == *exists
             }
+            CachedFileState::Absent => load.lookups.agree_file_exists(path.as_str(), *exists),
             CachedFileState::Live => *exists,
             CachedFileState::NoValue => !*exists,
             CachedFileState::NeedsReload => false,
         },
-        AheadCall::MissingDirectory { .. } => true,
+        AheadCall::DirectoryExists { path, exists } => {
+            load.lookups.agree_directory_exists(path.as_str(), *exists)
+        }
+        AheadCall::Realpath { name, real } => load.lookups.agree_realpath(name, real),
         AheadCall::Read { file_name, hash } => {
             let known = load.reads.borrow().get(file_name).copied();
             let read = known.unwrap_or_else(|| {
@@ -537,8 +554,13 @@ fn check_ahead_call(
 fn replay_ahead_call(source_fs: &SourceFS, load: &AheadCheck, call: &AheadCall) {
     match call {
         AheadCall::FileExists { path, .. } => source_fs.track_path(path),
-        AheadCall::MissingDirectory { path } => source_fs.note_missing_directory(path),
-        AheadCall::Read { .. } => {}
+        AheadCall::DirectoryExists {
+            path,
+            exists: false,
+        } => source_fs.note_missing_directory(path),
+        AheadCall::DirectoryExists { exists: true, .. }
+        | AheadCall::Realpath { .. }
+        | AheadCall::Read { .. } => {}
         AheadCall::PackageJson(group) => {
             if load.package_jsons.borrow_mut().insert(group_key(group)) {
                 for call in group.iter() {

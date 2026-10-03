@@ -3,13 +3,28 @@
 //! resolved, while the loader of the new load runs (lspp95 plan, step 1).
 //!
 //! The loader stays serial. It takes a worker answer only when the answer
-//! passes its host's check (`ResolveAheadHost::accept`): every file system
-//! call of the worker's resolution gives the same answer on the loader's
-//! file system, and the check replays the side effects of the calls (seen
-//! files, missing directories, file reads) at the moment the loader's own
-//! resolution would make them. Else the loader resolves the key itself. So
-//! the program, its file order and the watched files are the same as with
-//! no workers.
+//! passes its host's check (`ResolveAheadHost::accept`). The worker logs
+//! the file system calls of its resolution with their answers
+//! (`AheadCall`); a call that the check cannot do again (a directory
+//! listing, a stat, a read of an open file) makes the answer unshareable.
+//! The check gives each call to the host's snapshot file system as the
+//! loader's own call would go there, at the moment the loader's own
+//! resolution would make it:
+//!
+//! - a read is the loader's read, and its text must have the worker's hash;
+//! - a `file_exists`, `directory_exists` or `realpath` must agree with the
+//!   snapshot's answer for the path. When the snapshot has no answer yet,
+//!   the worker's answer, which the worker got during this load, becomes
+//!   the snapshot's answer, as the first call of a load fills Go's
+//!   per-snapshot cache. A `file_exists` answer that the workers know from
+//!   an earlier load is asked of the snapshot's file system.
+//!
+//! So the load has one answer for each path, also when the disk changes
+//! during the load. The check also replays the side effects of the calls
+//! (seen files, missing directories). If an answer does not pass, the
+//! loader resolves the key itself. So the program, its file order and the
+//! watched files are those of a load with no workers whose calls found the
+//! disk as the workers found it.
 // PORT: not in Go (perf). Go resolves in each parse task, on all threads;
 // the port's loader resolves on one thread (contract 10).
 
@@ -128,6 +143,19 @@ pub fn wait_for_frees() {
             .wait(state)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
+}
+
+thread_local! {
+    /// `set_after_workers` on this thread.
+    static AFTER_WORKERS: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Runs `hook` in each `Mode::Force` load on this thread after its workers
+/// left the job and before its loader starts (`None`: no hook). A test
+/// changes the disk there, during the load. For tests.
+#[doc(hidden)]
+pub fn set_after_workers(hook: Option<Rc<dyn Fn()>>) {
+    AFTER_WORKERS.with(|after| *after.borrow_mut() = hook);
 }
 
 /// The workers' view of a host's file system: the OS file system with the
@@ -305,6 +333,9 @@ impl ResolveAhead {
             && let Some((job, workers)) = job.as_ref().zip(Workers::get())
         {
             workers.wait_left(job);
+            if let Some(hook) = AFTER_WORKERS.with(|after| after.borrow().clone()) {
+                hook();
+            }
         }
         ResolveAhead {
             job,
@@ -980,7 +1011,9 @@ impl ResolutionHost for AheadResolutionHost {
 /// A worker's file system: the OS file system of its thread with the open
 /// files of the host over it (project/overlayfs.rs `OverlayFS`), and the
 /// workers' stat cache. It logs each call (`note_ahead_call`). A call that
-/// the loader cannot check makes the answer unshareable.
+/// the loader cannot check makes the answer unshareable: a directory
+/// listing, a stat, a write, a read of an open file, or a `file_exists` or
+/// `directory_exists` of a name that is not its path (`AheadCall`).
 struct AheadFs {
     os: Rc<dyn Fs>,
     job: Arc<Job>,
@@ -1015,6 +1048,17 @@ impl AheadFs {
             view.use_case_sensitive_file_names,
         )
     }
+
+    /// Logs `call`, a call of `name` whose path is `path`, or makes the
+    /// answer unshareable when they differ: the loader's caches find a
+    /// call by its name and its side effects by its path.
+    fn note_call(name: &str, path: Path, call: impl FnOnce(Path) -> AheadCall) {
+        if path.as_str() == name {
+            note_ahead_call(call(path));
+        } else {
+            note_ahead_unshareable(None);
+        }
+    }
 }
 
 impl Fs for AheadFs {
@@ -1041,8 +1085,8 @@ impl Fs for AheadFs {
                 .file_exists(path, || self.os.file_exists(path));
             (exists, false)
         };
-        note_ahead_call(AheadCall::FileExists {
-            path: canonical,
+        AheadFs::note_call(path, canonical, |path| AheadCall::FileExists {
+            path,
             exists,
             known,
         });
@@ -1095,9 +1139,10 @@ impl Fs for AheadFs {
     // Go: project/overlayfs.go:297 overlayFS.DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {
         let (exists, canonical) = self.directory_lookup(path);
-        if !exists {
-            note_ahead_call(AheadCall::MissingDirectory { path: canonical });
-        }
+        AheadFs::note_call(path, canonical, |path| AheadCall::DirectoryExists {
+            path,
+            exists,
+        });
         exists
     }
 
@@ -1115,7 +1160,12 @@ impl Fs for AheadFs {
 
     // Go: project/overlayfs.go:360 overlayFS.Realpath
     fn realpath(&self, path: &str) -> String {
-        self.job.stats.realpath(path, || self.os.realpath(path))
+        let real = self.job.stats.realpath(path, || self.os.realpath(path));
+        note_ahead_call(AheadCall::Realpath {
+            name: path.to_string(),
+            real: real.clone(),
+        });
+        real
     }
 }
 
@@ -1147,13 +1197,18 @@ fn debug_check_answer(
         AheadCall::FileExists { path, .. } => {
             seen.insert(path.clone());
         }
-        AheadCall::MissingDirectory { path } => {
+        AheadCall::DirectoryExists {
+            path,
+            exists: false,
+        } => {
             missing.insert(path.clone());
         }
         AheadCall::Read { file_name, .. } => {
             seen.insert((scratch.to_path)(file_name));
         }
-        AheadCall::PackageJson(_) => {}
+        AheadCall::DirectoryExists { exists: true, .. }
+        | AheadCall::Realpath { .. }
+        | AheadCall::PackageJson(_) => {}
     });
     let (own_seen, own_missing) = (scratch.tracked)();
     assert!(

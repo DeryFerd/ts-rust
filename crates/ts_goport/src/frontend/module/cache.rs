@@ -564,21 +564,26 @@ pub struct SharedResolution<T> {
 /// One file system call of a resolve-ahead worker's resolution
 /// (compiler/resolve_ahead.rs), with its answer. Before the loader takes
 /// the answer, it checks each call on its own file system and replays the
-/// side effects of the call (`AheadLink::accept`).
+/// side effects of the call (`AheadLink::accept`). The name of a
+/// `FileExists` or `DirectoryExists` call is its path (the worker does not
+/// share an answer with another name), so the loader's caches by name and
+/// by path both find it.
 // PORT: not in Go (perf). Go resolves in each parse task on the host's
 // file system, which tracks the calls itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AheadCall {
-    /// `file_exists` of a name whose path is `path`. `known`: the worker
-    /// took the answer from the files that the workers found in earlier
-    /// loads, not from the OS, so the loader checks it itself.
+    /// `file_exists` of `path`. `known`: the worker took the answer from
+    /// what the workers found in earlier loads, not from the OS during
+    /// this load, so the loader asks its own file system.
     FileExists {
         path: Path,
         exists: bool,
         known: bool,
     },
-    /// A `directory_exists` that gave false.
-    MissingDirectory { path: Path },
+    /// `directory_exists` of `path`.
+    DirectoryExists { path: Path, exists: bool },
+    /// `realpath` of `name`.
+    Realpath { name: String, real: String },
     /// `read_file`: the xxh3 hash of the text, `None` when the file could
     /// not be read.
     Read {
@@ -757,38 +762,48 @@ fn log_ahead_package_json(entry: &InfoCacheEntry) {
 }
 
 /// The calls of Go `getPackageJsonInfo` for `entry`. `None` when the worker
-/// did not read its package.json from a file that the loader can check, or
-/// when the entry was kept from an earlier job and its directory is gone:
-/// Go's lookup asks whether the directory exists, and the loader does not
-/// check a directory that exists. The next job drops such an entry.
+/// did not read its package.json from a file that the loader can check,
+/// when a name is not its path (`AheadCall`), or when the entry was kept
+/// from an earlier job and its directory is gone now: Go's lookup asks
+/// whether the directory exists. The next job drops such an entry. The
+/// worker knows the package.json of a kept entry from an earlier job, so
+/// the loader asks its own file system for it (`known`).
 fn package_json_calls(entry: &InfoCacheEntry, state: &mut AheadThread) -> Option<Arc<[AheadCall]>> {
     let to_path = |name: &str| {
-        to_path(
+        Some(to_path(
             name,
             &state.current_directory,
             state.use_case_sensitive_file_names,
-        )
+        ))
+        .filter(|path| path.as_str() == name)
+    };
+    let directory = AheadCall::DirectoryExists {
+        path: to_path(&entry.package_directory)?,
+        exists: entry.directory_exists,
     };
     if !entry.directory_exists {
-        return Some(Arc::new([AheadCall::MissingDirectory {
-            path: to_path(&entry.package_directory),
-        }]));
+        return Some(Arc::new([directory]));
     }
     let file_name = combine_paths(&entry.package_directory, &["package.json"]);
+    let kept = state.kept.contains(&file_name);
     let exists = AheadCall::FileExists {
-        path: to_path(&file_name),
+        path: to_path(&file_name)?,
         exists: entry.exists(),
-        known: false,
+        known: kept,
     };
     if !entry.exists() {
-        return Some(Arc::new([exists]));
+        return Some(Arc::new([directory, exists]));
     }
-    if state.kept.contains(&file_name) && !(state.directory_exists)(&entry.package_directory) {
+    if kept && !(state.directory_exists)(&entry.package_directory) {
         state.reads.remove(&file_name);
         return None;
     }
     let hash = *state.reads.get(&file_name)?;
-    Some(Arc::new([exists, AheadCall::Read { file_name, hash }]))
+    Some(Arc::new([
+        directory,
+        exists,
+        AheadCall::Read { file_name, hash },
+    ]))
 }
 
 /// Marks the resolution that runs on this thread as not shareable: it made

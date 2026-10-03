@@ -1131,12 +1131,23 @@ impl SnapshotFSBuilder {
         }
     }
 
+    /// The cache of this snapshot's file system lookups (Go
+    /// `cachedLayeredFileSystem`'s `*cachedvfs.FS`), which a resolve-ahead
+    /// load fills with the answers that it takes (`CachedFs::agree_*`).
+    pub fn cached_fs(&self) -> Option<Rc<vfs::CachedFs>> {
+        Some(self.cached_layered()?.fs.clone())
+    }
+
+    fn cached_layered(&self) -> Option<&CachedLayeredFileSystem> {
+        vfs::Fs::as_any(&*self.fs)?.downcast_ref::<CachedLayeredFileSystem>()
+    }
+
     /// When the layered file system is the overlay file system over the
     /// OS file system of this thread (`bundled::is_wrapped_os_fs`), as in
     /// the language server: the paths of its open files and of the
     /// directories that have open files in them. Else `None`.
     pub fn open_files_over_os(&self) -> Option<(FxHashSet<tspath::Path>, FxHashSet<tspath::Path>)> {
-        let cached = vfs::Fs::as_any(&*self.fs)?.downcast_ref::<CachedLayeredFileSystem>()?;
+        let cached = self.cached_layered()?;
         let layered: &dyn vfs::Fs = &*cached.layered;
         let overlay = as_overlay_fs(layered)?;
         if !crate::frontend::bundled::is_wrapped_os_fs(&overlay.host) {

@@ -65,6 +65,60 @@ impl CachedFs {
     }
 }
 
+// PORT: not in Go. A language server load takes the answers of the
+// resolve-ahead workers (compiler/resolve_ahead.rs, project/compilerhost.rs)
+// as if its own call had made them: each method gives true when `answer`
+// is the answer of this cache for `path`, and stores it when the cache has
+// none yet. So the load has one answer per path, as with Go's calls. With
+// the cache off it asks the file system, as Go's call would.
+impl CachedFs {
+    pub fn agree_file_exists(&self, path: &str, answer: bool) -> bool {
+        self.agree(&self.file_exists_cache, path, answer, || {
+            self.fs.file_exists(path)
+        })
+    }
+
+    pub fn agree_directory_exists(&self, path: &str, answer: bool) -> bool {
+        self.agree(&self.directory_exists_cache, path, answer, || {
+            self.fs.directory_exists(path)
+        })
+    }
+
+    pub fn agree_realpath(&self, path: &str, answer: &str) -> bool {
+        if !self.enabled.get() {
+            return self.fs.realpath(path) == answer;
+        }
+        let mut cache = self.realpath_cache.borrow_mut();
+        match cache.get(path) {
+            Some(cached) => cached == answer,
+            None => {
+                cache.insert(path.to_string(), answer.to_string());
+                true
+            }
+        }
+    }
+
+    fn agree(
+        &self,
+        cache: &RefCell<FxHashMap<String, bool>>,
+        path: &str,
+        answer: bool,
+        ask: impl FnOnce() -> bool,
+    ) -> bool {
+        if !self.enabled.get() {
+            return ask() == answer;
+        }
+        let mut cache = cache.borrow_mut();
+        match cache.get(path) {
+            Some(&cached) => cached == answer,
+            None => {
+                cache.insert(path.to_string(), answer);
+                true
+            }
+        }
+    }
+}
+
 impl Fs for CachedFs {
     // Go: cachedvfs.go:48 DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {

@@ -566,3 +566,121 @@ os_child_test! {
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
+
+/// The import of `rpkg`, a package whose node_modules directory is a
+/// symlink (`symlinked_rpkg`).
+const RPKG_INDEX: &str = "import { r } from \"rpkg\";\n";
+
+/// Adds `store/rpkg` and `store/rpkg2`, two copies of a package, and
+/// `node_modules/rpkg`, a symlink to the first.
+#[cfg(unix)]
+fn symlinked_rpkg(root: &str) {
+    for copy in ["rpkg", "rpkg2"] {
+        write(
+            root,
+            &format!("store/{copy}/package.json"),
+            r#"{ "name": "rpkg", "version": "1.0.0", "types": "index.d.ts" }"#,
+        );
+        write(
+            root,
+            &format!("store/{copy}/index.d.ts"),
+            "export declare const r: number;",
+        );
+    }
+    point_rpkg(root, "rpkg");
+}
+
+/// Points the symlink `node_modules/rpkg` to `store/<copy>`.
+#[cfg(unix)]
+fn point_rpkg(root: &str, copy: &str) {
+    let link = format!("{root}/node_modules/rpkg");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(format!("{root}/store/{copy}"), &link).unwrap();
+}
+
+/// The resolution of `name` in `src/index.ts`: the resolved file name and
+/// the original path, relative to the project root.
+#[cfg(unix)]
+fn resolution(session: &Rc<Session>, root: &str, name: &str) -> (String, String) {
+    let program = program(session, &file_uri(root, "src/index.ts"));
+    let index = tspath::to_path(&format!("{root}/src/index.ts"), root, true);
+    let modules = program
+        .processed_files
+        .resolved_modules
+        .get(&index)
+        .expect("resolutions of src/index.ts");
+    let (_, module) = modules
+        .iter()
+        .find(|(key, _)| key.name == name)
+        .unwrap_or_else(|| panic!("no resolution of {name}"));
+    let relative = |name: &str| name.replace(root, "<root>");
+    (
+        relative(&module.resolved_file_name),
+        relative(&module.original_path),
+    )
+}
+
+os_child_test! {
+    /// The disk changes during a load: after the workers resolved the keys
+    /// of the previous load and before the loader starts (a test hook), a
+    /// new directory gets a file, a package gets a new file and a package
+    /// symlink points to another copy. The loader takes the worker answers,
+    /// which saw the old disk, and then resolves new keys that make the
+    /// same `directory_exists`, `file_exists` and `realpath` calls. As in Go,
+    /// whose snapshot caches the first answer of each call, each such call
+    /// must give the answer that the load took, so the program has one
+    /// answer for each path.
+    #[cfg(unix)]
+    fn a_load_has_one_answer_per_path_when_the_disk_changes_during_it() {
+        let root = make_project("onepath");
+        symlinked_rpkg(&root);
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        let uri = file_uri(&root, "src/index.ts");
+        open(&session, &uri, &format!("{INDEX}{RPKG_INDEX}"));
+        program(&session, &uri);
+        let changed_root = root.clone();
+        resolve_ahead::set_after_workers(Some(Rc::new(move || {
+            let root = &changed_root;
+            write(root, "src/missing/x.ts", "export const x = 4;");
+            write(root, "node_modules/pkg/other.ts", "export const o = 5;");
+            point_rpkg(root, "rpkg2");
+        })));
+        edit(
+            &session,
+            &uri,
+            2,
+            (10, 0),
+            (10, 0),
+            "import { x as x2 } from \"./missing/x.js\";\n\
+             import { o as o2 } from \"pkg/other.js\";\n\
+             import { r as r2 } from \"rpkg/index.js\";\n",
+        );
+        program(&session, &uri);
+        resolve_ahead::set_after_workers(None);
+        let stats = last_stats();
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+        assert_eq!(stats.loader.rejected, 0, "{stats:?}");
+        for (taken, own) in [
+            ("./missing/x", "./missing/x.js"),
+            ("pkg/other", "pkg/other.js"),
+            ("rpkg", "rpkg/index.js"),
+        ] {
+            assert_eq!(
+                resolution(&session, &root, own).0,
+                resolution(&session, &root, taken).0,
+                "{own} and {taken}"
+            );
+        }
+        assert_eq!(
+            resolution(&session, &root, "rpkg"),
+            (
+                "<root>/store/rpkg/index.d.ts".to_string(),
+                "<root>/node_modules/rpkg/index.d.ts".to_string()
+            )
+        );
+        resolve_ahead::set_mode(None);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
