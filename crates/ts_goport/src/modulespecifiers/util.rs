@@ -2,8 +2,10 @@
 
 use crate::prelude::*;
 
+#[cfg(not(target_family = "wasm"))]
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
+#[cfg(not(target_family = "wasm"))]
 use crate::gostd::regexp;
 
 use super::deps;
@@ -44,6 +46,7 @@ pub fn path_is_bare_specifier(path: &str) -> bool {
 }
 
 // Go: modulespecifiers/util.go:19 regexPatternCacheKey
+#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct RegexPatternCacheKey {
     pattern: String,
@@ -55,11 +58,13 @@ struct RegexPatternCacheKey {
 // this code (the declaration emitter), so the port keeps the lock. A panic
 // under the lock (an unported regexp feature) must not block later calls,
 // so a poisoned lock is used as is.
+#[cfg(not(target_family = "wasm"))]
 static REGEX_PATTERN_CACHE: LazyLock<
     RwLock<FxHashMap<RegexPatternCacheKey, Option<Arc<regexp::Regexp>>>>,
 > = LazyLock::new(Default::default);
 
 // Go: modulespecifiers/util.go:46 IsExcludedByRegex
+#[cfg(not(target_family = "wasm"))]
 pub fn is_excluded_by_regex(module_specifier: &str, excludes: &[String]) -> bool {
     for pattern in excludes {
         let Some(re) = string_to_regex(pattern) else {
@@ -72,7 +77,22 @@ pub fn is_excluded_by_regex(module_specifier: &str, excludes: &[String]) -> bool
     false
 }
 
+/// The wasm build runs tsc only, and tsc passes default user preferences
+/// (the checker's node builder and `get_module_specifier`), so `excludes`
+/// is always empty there. Only the language service fills it, from the
+/// editor's `autoImportSpecifierExcludeRegexes`. This leaves the Go regexp
+/// engine and the unicode tables that only it uses out of the wasm module.
+// PORT: not in Go.
+#[cfg(target_family = "wasm")]
+pub fn is_excluded_by_regex(_module_specifier: &str, excludes: &[String]) -> bool {
+    if !excludes.is_empty() {
+        unreachable!("the wasm build has no regexp engine for autoImportSpecifierExcludeRegexes");
+    }
+    false
+}
+
 // Go: modulespecifiers/util.go:59 stringToRegex
+#[cfg(not(target_family = "wasm"))]
 fn string_to_regex(pattern: &str) -> Option<Arc<regexp::Regexp>> {
     let mut pattern = pattern;
     let mut case_insensitive = false;
