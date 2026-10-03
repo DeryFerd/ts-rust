@@ -1716,7 +1716,10 @@ pub fn get_text_of_node_from_source_text(
     if !include_trivia {
         pos = skip_trivia(source_text, pos);
     }
-    let mut text: Cow<'_, str> = Cow::Borrowed(&source_text[pos as usize..node.end() as usize]);
+    // PORT: a node of a JSDoc comment that ends the file inside a char can
+    // start or end inside that char (parser `jsdoc_text_cut`). Go slices the
+    // bytes there; `go_cut_slice` keeps the cut bytes as Go does.
+    let mut text = go_cut_slice(source_text, pos as usize, node.end() as usize);
     if is_js_doc_type_expression_or_child(node) {
         text = Cow::Owned(normalize_js_doc_type_source_text(&text));
     }

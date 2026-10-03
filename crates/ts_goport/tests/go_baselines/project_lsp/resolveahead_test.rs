@@ -20,7 +20,7 @@ use ts_goport::lsp::lsproto;
 use ts_goport::project::{self, Session, SessionInit, SessionOptions};
 
 use super::projecttestutil;
-use super::util::{CHANGED, bg, edit, generate_file_events, open, program, uri};
+use super::util::{CHANGED, bg, close, edit, generate_file_events, open, program, uri};
 
 /// A test in a child process with no OS override, with the environment
 /// variables `$env` set.
@@ -259,16 +259,30 @@ fn open_index(session: &Rc<Session>, root: &str) {
 /// Adds an import at the top of `src/index.ts` (version 2), which makes a
 /// new program load.
 fn add_import(session: &Rc<Session>, root: &str) {
+    edit_index(session, root, 2, "import { d } from \"./sub/d\";\n");
+}
+
+/// Puts `text` at the top of `src/index.ts` as `version`, and loads the
+/// program.
+fn edit_index(session: &Rc<Session>, root: &str, version: i32, text: &str) {
     let uri = file_uri(root, "src/index.ts");
-    edit(
-        session,
-        &uri,
-        2,
-        (0, 0),
-        (0, 0),
-        "import { d } from \"./sub/d\";\n",
-    );
+    edit(session, &uri, version, (0, 0), (0, 0), text);
     program(session, &uri);
+}
+
+/// The counts of the last resolve-ahead load on this thread.
+fn last_stats() -> LoadStats {
+    resolve_ahead::last_stats().expect("no resolve-ahead load")
+}
+
+/// Ends this test process when the test has not ended after `seconds`, so
+/// a load that waits forever fails the test.
+fn watchdog(seconds: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(seconds));
+        eprintln!("watchdog: the test did not end in {seconds} s");
+        std::process::exit(3);
+    });
 }
 
 os_child_test! {
@@ -425,5 +439,130 @@ os_child_test! {
         });
         assert!(stats.loader.taken > 0, "{stats:?}");
         assert!(stats.loader.missing > 0, "{stats:?}");
+    }
+}
+
+os_child_test! {
+    /// A rejected answer makes the workers drop what they keep (the known
+    /// files and the package.json parses). When a load on another thread
+    /// has the workers at the next load, the next load that has them must
+    /// still start with none.
+    fn a_rejected_answer_drops_the_kept_state_while_the_workers_are_taken() {
+        let root = make_project("heldreject");
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        open_index(&session, &root);
+        add_import(&session, &root);
+        resolve_ahead::wait_for_frees();
+        // An npm install: the cached node_modules files need a reload, so
+        // the check rejects the answers that look them up.
+        let events =
+            generate_file_events(1001, &file_uri(&root, "node_modules/pkg/f%d.d.ts"), CHANGED);
+        session.did_change_watched_files(&bg(), &events);
+        edit_index(&session, &root, 3, "import { b as b2 } from \"./sub/b\";\n");
+        let stats = last_stats();
+        assert!(stats.loader.rejected >= 1, "{stats:?}");
+        assert!(stats.known_files > 0, "{stats:?}");
+        resolve_ahead::wait_for_frees();
+        let held = resolve_ahead::hold_workers();
+        edit_index(&session, &root, 4, "import { a as a2 } from \"./a\";\n");
+        let stats = last_stats();
+        assert_eq!(stats.loader.taken, 0, "the workers ran: {stats:?}");
+        drop(held);
+        edit_index(&session, &root, 5, "import { c as c2 } from \"../lib/c\";\n");
+        let stats = last_stats();
+        assert!(stats.loader.taken > 0, "{stats:?}");
+        assert_eq!(stats.known_files, 0, "{stats:?}");
+        resolve_ahead::set_mode(None);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+os_child_test! {
+    /// A worker that panics outside a resolution (a port bug; a test hook
+    /// makes one) must not make a load that waits for the workers
+    /// (`Mode::Force`) wait forever, nor leave the pool: that load resolves
+    /// its keys itself, and the next load takes every answer again.
+    fn a_worker_panic_outside_a_resolution_makes_the_load_serial() {
+        watchdog(120);
+        let stats = same_with_and_without("panic", &|session, root| {
+            open_index(session, root);
+            resolve_ahead::inject_worker_panic(true);
+            add_import(session, root);
+            resolve_ahead::inject_worker_panic(false);
+            if let Some(stats) = resolve_ahead::last_stats() {
+                assert!(stats.worker_panic, "{stats:?}");
+                assert_eq!(stats.loader.taken, 0, "{stats:?}");
+            }
+            edit_index(session, root, 3, "import { b as b2 } from \"./sub/b\";\n");
+        });
+        assert!(!stats.worker_panic, "{stats:?}");
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+    }
+}
+
+/// The project of `a_released_project_drops_the_kept_state` in `other/`,
+/// with its own package.
+const OTHER_MAIN: &str =
+    "import { q } from \"./q\";\nimport { r } from \"opkg\";\nexport const both = [q, r];\n";
+const OTHER_FILES: &[(&str, &str)] = &[
+    (
+        "other/tsconfig.json",
+        r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler", "noLib": true, "strict": true }, "include": ["src"] }"#,
+    ),
+    ("other/src/main.ts", OTHER_MAIN),
+    ("other/src/q.ts", "export const q = 1;"),
+    (
+        "other/node_modules/opkg/package.json",
+        r#"{ "name": "opkg", "version": "1.0.0", "types": "index.d.ts" }"#,
+    ),
+    (
+        "other/node_modules/opkg/index.d.ts",
+        "export declare const r: number;",
+    ),
+];
+
+os_child_test! {
+    /// The workers keep the files that the answers of a project's loads
+    /// found, from load to load of the project. When the project's
+    /// programs are released (its only open file is closed and the file of
+    /// another project opens), they drop them: the next job, of the other
+    /// project, starts with no known file.
+    fn a_released_project_drops_the_kept_state() {
+        let root = make_project("released");
+        for (name, text) in OTHER_FILES {
+            write(&root, name, text);
+        }
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        open_index(&session, &root);
+        add_import(&session, &root);
+        resolve_ahead::wait_for_frees();
+        edit_index(&session, &root, 3, "import { b as b2 } from \"./sub/b\";\n");
+        let stats = last_stats();
+        assert!(stats.known_files > 0, "{stats:?}");
+        close(&session, &file_uri(&root, "src/index.ts"));
+        let main = file_uri(&root, "other/src/main.ts");
+        open(&session, &main, OTHER_MAIN);
+        program(&session, &main);
+        let config = tspath::to_path(&format!("{root}/tsconfig.json"), &root, true);
+        assert!(
+            session
+                .snapshot()
+                .project_collection
+                .configured_project(&config)
+                .is_none(),
+            "the first project is still open"
+        );
+        resolve_ahead::wait_for_frees();
+        edit(&session, &main, 2, (0, 0), (0, 0), "import { q as q2 } from \"./q\";\n");
+        program(&session, &main);
+        let stats = last_stats();
+        assert!(stats.loader.taken > 0, "{stats:?}");
+        assert_eq!(stats.known_files, 0, "{stats:?}");
+        resolve_ahead::set_mode(None);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

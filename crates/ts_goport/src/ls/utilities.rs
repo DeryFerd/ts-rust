@@ -10,7 +10,6 @@
 use crate::ls::prelude::*;
 
 use crate::frontend::parser::ParsedSourceFile;
-use crate::scanner_util::{GoUnit, go_unit_bytes, go_unit_cut_at};
 use crate::spanmap::{Feature, Fidelity};
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -2000,29 +1999,28 @@ pub fn is_source_file_with_global_exports(node: Node) -> bool {
     node.is_some() && is_source_file(node) && file_bind_data(node).global_exports.is_some()
 }
 
-/// Go `text[lo:hi]` on the port form `text` (see `GO_STRING_MARKER`). Go
-/// slices bytes, so `lo` or `hi` can cut a char: Go keeps the cut bytes and
-/// reads each one as a RuneError of size 1. Here each cut byte is an invalid
-/// byte unit (`go_string_from_bytes`), so the result is longer than
-/// `hi - lo` at a cut. A slice at unit boundaries is borrowed.
-// PORT: an out of range bound panics with the Go runtime text. Go checks
-// `hi` against the length first, then `lo` against `hi`; a negative bound is
-// printed alone. A content-mapped file reaches the JSDoc snippet checks with
-// empty text in Go at B too, and the LSP error response carries the text.
-// PORT: a bound `k` bytes into a unit of `g` Go bytes is Go's bound `k`
-// bytes into the unit's Go bytes, at most `g` (`go_byte_offset`). So a
-// bound inside a marker unit (also at the char boundary between its two
-// chars) cuts the unit's Go bytes, and the rest of that unit is not in the
-// slice. A real U+FDD0 is two markers, and its first holds Go's 3 bytes.
+/// Go `text[lo:hi]` on the port form `text` (see `GO_STRING_MARKER`): the
+/// bounds check of `go_check_slice_bounds`, then `go_cut_slice`, which keeps
+/// the Go bytes of a char that a bound cuts.
 pub fn go_text_slice(text: &str, lo: i32, hi: i32) -> Cow<'_, str> {
+    go_check_slice_bounds(text, lo, hi);
+    crate::scanner_util::go_cut_slice(text, lo as usize, hi as usize)
+}
+
+/// The bounds check of Go `text[lo:hi]` on the port form `text`: an out of
+/// range bound panics with the Go runtime text.
+// PORT: Go checks `hi` against the length first, then `lo` against `hi`; a
+// negative bound is printed alone. The panic names Go's numbers. Go's length
+// is `go_len`, and a position past the text (from `UTF16ToUTF8`) is Go's
+// position plus the port bytes of the text that Go does not have. A
+// content-mapped file reaches the JSDoc snippet checks with empty text in Go
+// at B too, and the LSP error response carries the text.
+pub fn go_check_slice_bounds(text: &str, lo: i32, hi: i32) {
     let len = text.len();
     if hi < 0 {
         crate::core::go_panic(format!("runtime error: slice bounds out of range [:{hi}]"));
     }
     if hi as usize > len {
-        // PORT: the panic names Go's numbers. Go's length is `go_len`, and
-        // a position past the text (from `UTF16ToUTF8`) is Go's position
-        // plus the port bytes of the text that Go does not have.
         let go_len = crate::scanner_util::go_len(text);
         let go_hi = i64::from(hi) - (len - go_len) as i64;
         crate::core::go_panic(format!(
@@ -2036,42 +2034,6 @@ pub fn go_text_slice(text: &str, lo: i32, hi: i32) -> Cow<'_, str> {
         crate::core::go_panic(format!(
             "runtime error: slice bounds out of range [{lo}:{hi}]"
         ));
-    }
-    let (lo, hi) = (lo as usize, hi as usize);
-    let lo_cut = go_unit_cut_at(text, lo);
-    let hi_cut = go_unit_cut_at(text, hi);
-    if lo_cut.is_none() && hi_cut.is_none() {
-        return Cow::Borrowed(&text[lo..hi]);
-    }
-    // The Go bytes of the cut unit at `at` from `from` to `to` port bytes
-    // into it.
-    let cut_bytes = |at: usize, unit: GoUnit, from: usize, to: usize| -> Vec<u8> {
-        let mut buf = [0u8; 4];
-        let bytes = go_unit_bytes(unit, &mut buf);
-        bytes[(from - at).min(bytes.len())..(to - at).min(bytes.len())].to_vec()
-    };
-    match (lo_cut, hi_cut) {
-        (Some((at, unit, _)), Some((hi_at, _, _))) if hi_at == at => {
-            Cow::Owned(go_string_from_bytes(cut_bytes(at, unit, lo, hi)))
-        }
-        _ => {
-            // The whole units are `head..tail`; the bytes around them are
-            // cut.
-            let (mut out, head) = match lo_cut {
-                Some((at, unit, size)) => (
-                    go_string_from_bytes(cut_bytes(at, unit, lo, at + size)),
-                    at + size,
-                ),
-                None => (String::new(), lo),
-            };
-            let (tail, suffix) = match hi_cut {
-                Some((at, unit, _)) => (at, go_string_from_bytes(cut_bytes(at, unit, at, hi))),
-                None => (hi, String::new()),
-            };
-            out.push_str(&text[head..tail]);
-            out.push_str(&suffix);
-            Cow::Owned(out)
-        }
     }
 }
 
