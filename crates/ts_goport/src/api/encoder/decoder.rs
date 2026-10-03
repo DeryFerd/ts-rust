@@ -265,14 +265,14 @@ impl AstDecoder<'_> {
     }
 }
 
-// Go: api/encoder/decoder.go:194 childIterator
+// Go: api/encoder/decoder.go:197 childIterator
 /// childIterator helps walk through children based on a bitmask.
 pub struct ChildIterator<'a> {
     indices: &'a [i64],
     pos: i64,
 }
 
-// Go: api/encoder/decoder.go:199 newChildIter
+// Go: api/encoder/decoder.go:202 newChildIter
 pub fn new_child_iter(indices: &[i64]) -> ChildIterator<'_> {
     ChildIterator { indices, pos: 0 }
 }
@@ -521,7 +521,7 @@ impl AstDecoder<'_> {
     }
 }
 
-// Go: api/encoder/decoder.go:331 readLE32
+// Go: api/encoder/decoder.go:343 readLE32
 fn read_le32(data: &[u8], offset: i64) -> u32 {
     if offset < 0 || offset + 4 > data.len() as i64 {
         return 0;
@@ -534,7 +534,7 @@ fn read_le32(data: &[u8], offset: i64) -> u32 {
 // from the 6-bit commonData that were packed by the corresponding
 // getNodeCommonData_* function.
 
-// Go: api/encoder/decoder.go:342 decodeNodeCommonData_SyntheticExpression
+// Go: api/encoder/decoder.go:354 decodeNodeCommonData_SyntheticExpression
 // PORT: Go returns `(any, bool)`; the `any` is the checker type, `TypeId` here.
 pub fn decode_node_common_data_synthetic_expression(_common_data: u8) -> (TypeId, bool) {
     panic!("SyntheticExpression should never be decoded")

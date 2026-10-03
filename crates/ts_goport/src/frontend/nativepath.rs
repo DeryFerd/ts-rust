@@ -74,7 +74,7 @@ pub fn realpath(path: &str) -> Result<String, FsError> {
         .map_err(|err| FsError::path("lstat", path, err))
 }
 
-// Go: realpath_windows.go:12 Realpath
+// Go: realpath_windows.go:13 Realpath
 // This implementation is based on what Node's fs.realpath.native does, via libuv: https://github.com/libuv/libuv/blob/ec5a4b54f7da7eeb01679005c615fee9633cdb3b/src/win/fs.c#L2937
 // PORT: `std::fs::canonicalize` makes Go's calls: CreateFileW with no access,
 // all share modes, OPEN_EXISTING and FILE_FLAG_BACKUP_SEMANTICS (Go
@@ -109,7 +109,7 @@ fn ignoring_eintr<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     }
 }
 
-// Go: symlink_windows.go:10 IsSymlinkOrReparsePoint
+// Go: symlink_windows.go:8 IsSymlinkOrReparsePoint
 /// Reports whether `path` has FILE_ATTRIBUTE_REPARSE_POINT (a symlink, a
 /// junction or another reparse point).
 ///

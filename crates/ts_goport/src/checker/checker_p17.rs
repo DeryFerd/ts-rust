@@ -30,7 +30,7 @@ fn is_resolved_p17(resolved_module: Option<&ResolvedModule>) -> bool {
 }
 
 impl Checker {
-    // Go: checker/checker.go:14829 reportNonExportedMember
+    // Go: checker/checker.go:15151 reportNonExportedMember
     pub fn report_non_exported_member(
         &mut self,
         name: Node,
@@ -115,7 +115,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:14861 reportInvalidImportEqualsExportMember
+    // Go: checker/checker.go:15183 reportInvalidImportEqualsExportMember
     pub fn report_invalid_import_equals_export_member(
         &mut self,
         name: Node,
@@ -143,7 +143,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:14871 getTargetOfExportSpecifier
+    // Go: checker/checker.go:15193 getTargetOfExportSpecifier
     pub fn get_target_of_export_specifier(
         &mut self,
         node: Node,
@@ -189,7 +189,7 @@ impl Checker {
         resolved
     }
 
-    // Go: checker/checker.go:14896 getTargetOfExportAssignment
+    // Go: checker/checker.go:15218 getTargetOfExportAssignment
     pub fn get_target_of_export_assignment(&mut self, node: Node) -> SymbolId {
         // An `export =` / `export default` inside a namespace/module block is a grammar error;
         // checkExportAssignment reports it and returns without resolving the expression. Mirror that
@@ -204,14 +204,14 @@ impl Checker {
         resolved
     }
 
-    // Go: checker/checker.go:14902 getTargetOfBinaryExpression
+    // Go: checker/checker.go:15232 getTargetOfBinaryExpression
     pub fn get_target_of_binary_expression(&mut self, node: Node) -> SymbolId {
         let resolved = self.get_target_of_alias_like_expression(node.right());
         self.mark_symbol_of_alias_declaration_if_type_only(node, Node::NIL);
         resolved
     }
 
-    // Go: checker/checker.go:14908 getTargetOfAliasLikeExpression
+    // Go: checker/checker.go:15238 getTargetOfAliasLikeExpression
     pub fn get_target_of_alias_like_expression(&mut self, expression: Node) -> SymbolId {
         if is_class_expression(expression) {
             let t = self.check_expression_cached(expression);
@@ -234,7 +234,7 @@ impl Checker {
         self.get_resolved_symbol_or_nil(expression)
     }
 
-    // Go: checker/checker.go:14923 getTargetOfNamespaceExportDeclaration
+    // Go: checker/checker.go:15253 getTargetOfNamespaceExportDeclaration
     pub fn get_target_of_namespace_export_declaration(&mut self, node: Node) -> SymbolId {
         if can_have_symbol(node.parent()) {
             let resolved = self.resolve_external_module_symbol(
@@ -247,7 +247,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:14932 getTargetOfAccessExpression
+    // Go: checker/checker.go:15262 getTargetOfAccessExpression
     pub fn get_target_of_access_expression(&mut self, node: Node) -> SymbolId {
         if is_binary_expression(node.parent()) {
             let expr = node.parent();
@@ -258,7 +258,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:14942 getModuleSpecifierForImportOrExport
+    // Go: checker/checker.go:15272 getModuleSpecifierForImportOrExport
     pub fn get_module_specifier_for_import_or_export(&mut self, node: Node) -> Node {
         match node.kind() {
             SyntaxKind::ImportClause => return get_module_specifier_from_node(node.parent()),
@@ -285,7 +285,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:14964 getModuleSpecifierFromNode
+// Go: checker/checker.go:15294 getModuleSpecifierFromNode
 pub fn get_module_specifier_from_node(node: Node) -> Node {
     match node.kind() {
         SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration => {
@@ -301,7 +301,7 @@ pub fn get_module_specifier_from_node(node: Node) -> Node {
 }
 
 impl Checker {
-    // Go: checker/checker.go:14995 markSymbolOfAliasDeclarationIfTypeOnly
+    // Go: checker/checker.go:15325 markSymbolOfAliasDeclarationIfTypeOnly
     //
     // Marks a symbol as type-only if its declaration is syntactically type-only.
     // If it is not itself marked type-only, but resolves to a type-only alias
@@ -336,7 +336,7 @@ impl Checker {
         links.type_only_declaration.is_some()
     }
 
-    // Go: checker/checker.go:15013 resolveExternalModuleName
+    // Go: checker/checker.go:15343 resolveExternalModuleName
     pub fn resolve_external_module_name(
         &mut self,
         location: Node,
@@ -360,7 +360,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:15022 getCannotResolveModuleNameErrorForSpecificModule
+    // Go: checker/checker.go:15352 getCannotResolveModuleNameErrorForSpecificModule
     pub fn get_cannot_resolve_module_name_error_for_specific_module(
         &mut self,
         module_name: Node,
@@ -378,7 +378,7 @@ impl Checker {
         None
     }
 
-    // Go: checker/checker.go:15034 resolveExternalModuleNameWorker
+    // Go: checker/checker.go:15364 resolveExternalModuleNameWorker
     pub fn resolve_external_module_name_worker(
         &mut self,
         location: Node,
@@ -405,7 +405,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:15041 getExternalModuleFileFromDeclaration
+    // Go: checker/checker.go:15371 getExternalModuleFileFromDeclaration
     pub fn get_external_module_file_from_declaration(&mut self, declaration: Node) -> Node {
         let mut specifier = Node::NIL;
         if declaration.kind() == SyntaxKind::ModuleDeclaration {
@@ -438,7 +438,7 @@ impl Checker {
         decl
     }
 
-    // Go: checker/checker.go:15061 resolveExternalModule
+    // Go: checker/checker.go:15395 resolveExternalModule
     pub fn resolve_external_module(
         &mut self,
         location: Node,
@@ -931,7 +931,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:15653 tryResolvePatternAmbientModule
+    // Go: checker/checker.go:15692 tryResolvePatternAmbientModule
     // Resolves the module reference to a pattern ambient module, if one exists.
     // If a resolved symbol from regular module resolution exists and we have an empty import attributes type,
     // we prefer the resolved symbol.
@@ -1010,13 +1010,13 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:15346 resolutionExtensionIsTSOrJson
+// Go: checker/checker.go:15744 resolutionExtensionIsTSOrJson
 pub fn resolution_extension_is_ts_or_json(ext: &str) -> bool {
     tspath_p17::extension_is_ts(ext) || ext == tspath_p17::EXTENSION_JSON
 }
 
 impl Checker {
-    // Go: checker/checker.go:15350 getSuggestedImportSource
+    // Go: checker/checker.go:15748 getSuggestedImportSource
     pub fn get_suggested_import_source(
         &mut self,
         module_reference: &str,
@@ -1051,7 +1051,7 @@ impl Checker {
         import_source_without_extension.to_string()
     }
 
-    // Go: checker/checker.go:15373 getSuggestedImportExtension
+    // Go: checker/checker.go:15771 getSuggestedImportExtension
     pub fn get_suggested_import_extension(
         &mut self,
         extensionless_import_path: &str,
@@ -1091,7 +1091,7 @@ impl Checker {
         ""
     }
 
-    // Go: checker/checker.go:15397 errorOnImplicitAnyModule
+    // Go: checker/checker.go:15795 errorOnImplicitAnyModule
     // PORT: Go takes `*module.ResolvedModule` and dereferences it without a nil
     // check. Every caller passes a resolved module, so this takes a reference.
     pub fn error_on_implicit_any_module(
@@ -1129,7 +1129,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/checker.go:15418 createModuleNotFoundChain
+    // Go: checker/checker.go:15816 createModuleNotFoundChain
     pub fn create_module_not_found_chain(
         &mut self,
         _resolved_module: &ResolvedModule,
@@ -1161,7 +1161,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:15436 createModeMismatchDetails
+    // Go: checker/checker.go:15834 createModeMismatchDetails
     pub fn create_mode_mismatch_details(
         &mut self,
         source_file: Node,
@@ -1176,7 +1176,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:15445 tryFindAmbientModule
+    // Go: checker/checker.go:15843 tryFindAmbientModule
     pub fn try_find_ambient_module(
         &mut self,
         module_name: &str,
@@ -1197,7 +1197,7 @@ impl Checker {
         symbol
     }
 
-    // Go: checker/checker.go:15457 GetAmbientModules
+    // Go: checker/checker.go:15855 GetAmbientModules
     // PORT: Go `sync.Once` becomes the `ambient_modules_once` flag.
     pub fn get_ambient_modules(&mut self) -> Vec<SymbolId> {
         if !self.ambient_modules_once {
@@ -1219,7 +1219,7 @@ impl Checker {
         self.ambient_modules.clone()
     }
 
-    // Go: checker/checker.go:15468 resolveExternalModuleSymbol
+    // Go: checker/checker.go:15875 resolveExternalModuleSymbol
     pub fn resolve_external_module_symbol(
         &mut self,
         module_symbol: SymbolId,
@@ -1238,7 +1238,7 @@ impl Checker {
         module_symbol
     }
 
-    // Go: checker/checker.go:15480 resolveESModuleSymbol
+    // Go: checker/checker.go:15887 resolveESModuleSymbol
     //
     // Resolves the given external module symbol, possibly removing call and construct signatures or creating a
     // wrapper module with a synthetic default.
@@ -1362,7 +1362,7 @@ impl Checker {
         symbol
     }
 
-    // Go: checker/checker.go:15536 hasSignatures
+    // Go: checker/checker.go:15943 hasSignatures
     pub fn has_signatures(&mut self, t: TypeId) -> bool {
         !self
             .get_signatures_of_structured_type(t, SignatureKind::CALL)
@@ -1373,7 +1373,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:15540 isESMFormatImportImportingCommonjsFormatFile
+// Go: checker/checker.go:15947 isESMFormatImportImportingCommonjsFormatFile
 pub fn is_esm_format_import_importing_commonjs_format_file(
     usage_mode: ResolutionMode,
     target_mode: ResolutionMode,
@@ -1382,7 +1382,7 @@ pub fn is_esm_format_import_importing_commonjs_format_file(
 }
 
 impl Checker {
-    // Go: checker/checker.go:15544 getTypeWithSyntheticDefaultOnly
+    // Go: checker/checker.go:15951 getTypeWithSyntheticDefaultOnly
     pub fn get_type_with_synthetic_default_only(
         &mut self,
         t: TypeId,
@@ -1417,7 +1417,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:15558 getTypeWithSyntheticDefaultImportType
+    // Go: checker/checker.go:15965 getTypeWithSyntheticDefaultImportType
     pub fn get_type_with_synthetic_default_import_type(
         &mut self,
         t: TypeId,
@@ -1481,7 +1481,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:15585 isCommonJSRequire
+    // Go: checker/checker.go:15993 isCommonJSRequire
     pub fn is_common_js_require(&mut self, node: Node) -> bool {
         if !is_require_call(node, true /*requireStringLiteralLikeArgument*/) {
             return false;
@@ -1528,7 +1528,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:15618 createDefaultPropertyWrapperForModule
+    // Go: checker/checker.go:16026 createDefaultPropertyWrapperForModule
     pub fn create_default_property_wrapper_for_module(
         &mut self,
         symbol: SymbolId,
@@ -1554,7 +1554,7 @@ impl Checker {
         self.new_anonymous_type(anonymous_symbol, member_table, &[], &[], &[])
     }
 
-    // Go: checker/checker.go:15628 cloneTypeAsModuleType
+    // Go: checker/checker.go:16040 cloneTypeAsModuleType
     pub fn clone_type_as_module_type(
         &mut self,
         symbol: SymbolId,
@@ -1594,7 +1594,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:15643 getTargetOfAliasDeclaration
+    // Go: checker/checker.go:16055 getTargetOfAliasDeclaration
     pub fn get_target_of_alias_declaration(&mut self, node: Node) -> SymbolId {
         if node.is_nil() {
             return SymbolId::NIL;
@@ -1644,7 +1644,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/checker.go:15679 resolveEntityName
+    // Go: checker/checker.go:16091 resolveEntityName
     //
     // Resolves a qualified name and any involved aliases.
     pub fn resolve_entity_name(
@@ -1837,13 +1837,13 @@ pub(crate) mod tspath_p17 {
         EXTENSION_JSON,
     ];
 
-    // Go: tspath/path.go:938 ComparePathsOptions
+    // Go: tspath/path.go:988 ComparePathsOptions
     pub struct ComparePathsOptions {
         pub use_case_sensitive_file_names: bool,
         pub current_directory: String,
     }
 
-    // Go: tspath/path.go:947 ComparePathsOptions.getEqualityComparer
+    // Go: tspath/path.go:997 ComparePathsOptions.getEqualityComparer
     // PORT: `stringutil.GetStringEqualityComparer(!o.UseCaseSensitiveFileNames)`.
     fn equal_with_options(options: &ComparePathsOptions, a: &str, b: &str) -> bool {
         if !options.use_case_sensitive_file_names {
@@ -1890,27 +1890,27 @@ pub(crate) mod tspath_p17 {
         }
     }
 
-    // Go: tspath/path.go:26 isAnyDirectorySeparator
+    // Go: tspath/path.go:27 isAnyDirectorySeparator
     fn is_any_directory_separator(ch: u8) -> bool {
         ch == b'/' || ch == b'\\'
     }
 
-    // Go: tspath/path.go:37 IsRootedDiskPath
+    // Go: tspath/path.go:38 IsRootedDiskPath
     pub fn is_rooted_disk_path(path: &str) -> bool {
         get_encoded_root_length(path) > 0
     }
 
-    // Go: tspath/path.go:66 PathIsAbsolute
+    // Go: tspath/path.go:67 PathIsAbsolute
     fn path_is_absolute(path: &str) -> bool {
         get_encoded_root_length(path) != 0
     }
 
-    // Go: tspath/path.go:70 HasTrailingDirectorySeparator
+    // Go: tspath/path.go:71 HasTrailingDirectorySeparator
     fn has_trailing_directory_separator(path: &str) -> bool {
         !path.is_empty() && is_any_directory_separator(path.as_bytes()[path.len() - 1])
     }
 
-    // Go: tspath/path.go:90 CombinePaths
+    // Go: tspath/path.go:91 CombinePaths
     // PORT: Go builds into one `strings.Builder` and slices from `start`; the
     // result string is the same as building the current result directly.
     fn combine_paths(first_path: &str, paths: &[&str]) -> String {
@@ -1933,14 +1933,14 @@ pub(crate) mod tspath_p17 {
         result
     }
 
-    // Go: tspath/path.go:133 GetPathComponents
+    // Go: tspath/path.go:134 GetPathComponents
     fn get_path_components(path: &str, current_directory: &str) -> Vec<String> {
         let path = combine_paths(current_directory, &[path]);
         let root_length = get_root_length(&path);
         path_components(&path, root_length)
     }
 
-    // Go: tspath/path.go:138 pathComponents
+    // Go: tspath/path.go:139 pathComponents
     fn path_components(path: &str, root_length: usize) -> Vec<String> {
         let root = &path[..root_length];
         let mut rest: Vec<String> = path[root_length..].split('/').map(str::to_string).collect();
@@ -1952,12 +1952,12 @@ pub(crate) mod tspath_p17 {
         result
     }
 
-    // Go: tspath/path.go:147 IsVolumeCharacter
+    // Go: tspath/path.go:148 IsVolumeCharacter
     fn is_volume_character(ch: u8) -> bool {
         ch.is_ascii_lowercase() || ch.is_ascii_uppercase()
     }
 
-    // Go: tspath/path.go:151 getFileUrlVolumeSeparatorEnd
+    // Go: tspath/path.go:152 getFileUrlVolumeSeparatorEnd
     fn get_file_url_volume_separator_end(url: &[u8], start: usize) -> i32 {
         if url.len() <= start {
             return -1;
@@ -1975,7 +1975,7 @@ pub(crate) mod tspath_p17 {
         -1
     }
 
-    // Go: tspath/path.go:168 GetEncodedRootLength
+    // Go: tspath/path.go:169 GetEncodedRootLength
     fn get_encoded_root_length(path: &str) -> i32 {
         let b = path.as_bytes();
         let ln = b.len();
@@ -2048,7 +2048,7 @@ pub(crate) mod tspath_p17 {
         0
     }
 
-    // Go: tspath/path.go:242 GetRootLength
+    // Go: tspath/path.go:243 GetRootLength
     fn get_root_length(path: &str) -> usize {
         let root_length = get_encoded_root_length(path);
         if root_length < 0 {
@@ -2057,7 +2057,7 @@ pub(crate) mod tspath_p17 {
         root_length as usize
     }
 
-    // Go: tspath/path.go:250 GetDirectoryPath
+    // Go: tspath/path.go:251 GetDirectoryPath
     pub fn get_directory_path(path: &str) -> String {
         let path = normalize_slashes(path);
 
@@ -2074,7 +2074,7 @@ pub(crate) mod tspath_p17 {
         path[..(root_length as isize).max(last) as usize].to_string()
     }
 
-    // Go: tspath/path.go:269 GetPathFromPathComponents
+    // Go: tspath/path.go:270 GetPathFromPathComponents
     pub fn get_path_from_path_components(path_components: &[String]) -> String {
         if path_components.is_empty() {
             return String::new();
@@ -2088,12 +2088,12 @@ pub(crate) mod tspath_p17 {
         root + &path_components[1..].join("/")
     }
 
-    // Go: tspath/path.go:282 NormalizeSlashes
+    // Go: tspath/path.go:283 NormalizeSlashes
     pub fn normalize_slashes(path: &str) -> String {
         path.replace('\\', "/")
     }
 
-    // Go: tspath/path.go:286 reducePathComponents
+    // Go: tspath/path.go:287 reducePathComponents
     fn reduce_path_components(components: Vec<String>) -> Vec<String> {
         if components.is_empty() {
             return Vec::new();
@@ -2121,7 +2121,7 @@ pub(crate) mod tspath_p17 {
         reduced
     }
 
-    // Go: tspath/path.go:393 GetNormalizedAbsolutePath
+    // Go: tspath/path.go:394 GetNormalizedAbsolutePath
     pub fn get_normalized_absolute_path(file_name: &str, current_directory: &str) -> String {
         let mut root_length = get_root_length(file_name);
         let file_name = if root_length == 0 && !current_directory.is_empty() {
@@ -2254,7 +2254,7 @@ pub(crate) mod tspath_p17 {
         file_name
     }
 
-    // Go: tspath/path.go:514 simpleNormalizePath
+    // Go: tspath/path.go:515 simpleNormalizePath
     // PORT: Go returns `(string, bool)`; `None` is `("", false)`.
     fn simple_normalize_path(path: &str) -> Option<String> {
         // Most paths don't require normalization
@@ -2274,7 +2274,7 @@ pub(crate) mod tspath_p17 {
         None
     }
 
-    // Go: tspath/path.go:531 hasRelativePathSegment
+    // Go: tspath/path.go:532 hasRelativePathSegment
     // hasRelativePathSegment reports whether p contains ".", "..", "./", "../", "/.", "/..", "//", "/./", or "/../".
     fn has_relative_path_segment(p: &str) -> bool {
         let b = p.as_bytes();
@@ -2344,7 +2344,7 @@ pub(crate) mod tspath_p17 {
         (seg_len == 1 && dot_count == 1) || (seg_len == 2 && dot_count == 2)
     }
 
-    // Go: tspath/path.go:599 NormalizePath
+    // Go: tspath/path.go:600 NormalizePath
     fn normalize_path(path: &str) -> String {
         let path = normalize_slashes(path);
         if let Some(normalized) = simple_normalize_path(&path) {
@@ -2357,7 +2357,7 @@ pub(crate) mod tspath_p17 {
         normalized
     }
 
-    // Go: tspath/path.go:611 GetCanonicalFileName
+    // Go: tspath/path.go:612 GetCanonicalFileName
     fn get_canonical_file_name(file_name: &str, use_case_sensitive_file_names: bool) -> String {
         if use_case_sensitive_file_names {
             return file_name.to_string();
@@ -2365,7 +2365,7 @@ pub(crate) mod tspath_p17 {
         to_file_name_lower_case(file_name)
     }
 
-    // Go: tspath/path.go:638 ToFileNameLowerCase
+    // Go: tspath/path.go:674 ToFileNameLowerCase
     // PORT: Go `unicode.ToLower` maps one rune to one rune. Rust
     // `char::to_lowercase` can yield several; a multi-rune result keeps the
     // original rune, which matches Go for those runes. Go `strings.Map`
@@ -2389,7 +2389,7 @@ pub(crate) mod tspath_p17 {
         })
     }
 
-    // Go: tspath/path.go:687 ToPath
+    // Go: tspath/path.go:723 ToPath
     // PORT: Go `tspath.Path` is a string type; this returns the string.
     pub fn to_path(
         file_name: &str,
@@ -2404,7 +2404,7 @@ pub(crate) mod tspath_p17 {
         get_canonical_file_name(&non_canonicalized_path, use_case_sensitive_file_names)
     }
 
-    // Go: tspath/path.go:697 RemoveTrailingDirectorySeparator
+    // Go: tspath/path.go:733 RemoveTrailingDirectorySeparator
     fn remove_trailing_directory_separator(path: &str) -> &str {
         if has_trailing_directory_separator(path) {
             return &path[..path.len() - 1];
@@ -2412,7 +2412,7 @@ pub(crate) mod tspath_p17 {
         path
     }
 
-    // Go: tspath/path.go:708 RemoveTrailingDirectorySeparators
+    // Go: tspath/path.go:744 RemoveTrailingDirectorySeparators
     fn remove_trailing_directory_separators(path: &str) -> &str {
         let mut path = path;
         while has_trailing_directory_separator(path) {
@@ -2421,7 +2421,7 @@ pub(crate) mod tspath_p17 {
         path
     }
 
-    // Go: tspath/path.go:715 EnsureTrailingDirectorySeparator
+    // Go: tspath/path.go:751 EnsureTrailingDirectorySeparator
     fn ensure_trailing_directory_separator(path: &str) -> String {
         if !has_trailing_directory_separator(path) {
             return format!("{path}/");
@@ -2429,7 +2429,7 @@ pub(crate) mod tspath_p17 {
         path.to_string()
     }
 
-    // Go: tspath/path.go:729 GetPathComponentsRelativeTo
+    // Go: tspath/path.go:765 GetPathComponentsRelativeTo
     pub fn get_path_components_relative_to(
         from: &str,
         to: &str,
@@ -2475,7 +2475,7 @@ pub(crate) mod tspath_p17 {
         result
     }
 
-    // Go: tspath/path.go:773 GetRelativePathFromDirectory
+    // Go: tspath/path.go:809 GetRelativePathFromDirectory
     pub fn get_relative_path_from_directory(
         from_directory: &str,
         to: &str,
@@ -2488,7 +2488,7 @@ pub(crate) mod tspath_p17 {
         get_path_from_path_components(&path_components)
     }
 
-    // Go: tspath/path.go:781 GetRelativePathFromFile
+    // Go: tspath/path.go:817 GetRelativePathFromFile
     pub fn get_relative_path_from_file(
         from: &str,
         to: &str,
@@ -2501,7 +2501,7 @@ pub(crate) mod tspath_p17 {
         ))
     }
 
-    // Go: tspath/path.go:840 GetBaseFileName
+    // Go: tspath/path.go:876 GetBaseFileName
     // PERF: returns a slice of `path`. NormalizeSlashes swaps one byte for
     // one byte, and the base name has no separator, so the same byte range
     // of `path` holds the same text. Only a path with a backslash builds the
@@ -2530,7 +2530,7 @@ pub(crate) mod tspath_p17 {
         get_root_length(path).max(after_last)..path.len()
     }
 
-    // Go: tspath/path.go:866 GetAnyExtensionFromPath
+    // Go: tspath/path.go:902 GetAnyExtensionFromPath
     pub fn get_any_extension_from_path(
         path: &str,
         extensions: &[&str],
@@ -2553,7 +2553,7 @@ pub(crate) mod tspath_p17 {
         }
     }
 
-    // Go: tspath/path.go:881 getAnyExtensionFromPathWorker
+    // Go: tspath/path.go:931 getAnyExtensionFromPathWorker
     // PORT: the Go equality comparer is `stringutil.GetStringEqualityComparer(ignoreCase)`.
     fn get_any_extension_from_path_worker(
         path: &str,
@@ -2569,7 +2569,7 @@ pub(crate) mod tspath_p17 {
         String::new()
     }
 
-    // Go: tspath/path.go:891 tryGetExtensionFromPath
+    // Go: tspath/path.go:941 tryGetExtensionFromPath
     fn try_get_extension_from_path_with(path: &str, extension: &str, ignore_case: bool) -> String {
         let extension = if !extension.starts_with('.') {
             format!(".{extension}")
@@ -2590,7 +2590,7 @@ pub(crate) mod tspath_p17 {
         String::new()
     }
 
-    // Go: tspath/path.go:904 PathIsRelative
+    // Go: tspath/path.go:954 PathIsRelative
     pub fn path_is_relative(path: &str) -> bool {
         // True if path is ".", "..", or starts with "./", "../", ".\\", or "..\\".
         if path == "." || path == ".." {
@@ -2606,7 +2606,7 @@ pub(crate) mod tspath_p17 {
         false
     }
 
-    // Go: tspath/path.go:924 EnsurePathIsNonModuleName
+    // Go: tspath/path.go:974 EnsurePathIsNonModuleName
     fn ensure_path_is_non_module_name(path: &str) -> String {
         if !path_is_absolute(path) && !path_is_relative(path) {
             return format!("./{path}");
@@ -2614,7 +2614,7 @@ pub(crate) mod tspath_p17 {
         path.to_string()
     }
 
-    // Go: tspath/path.go:931 IsExternalModuleNameRelative
+    // Go: tspath/path.go:981 IsExternalModuleNameRelative
     pub fn is_external_module_name_relative(module_name: &str) -> bool {
         // TypeScript 1.0 spec (April 2014): 11.2.1
         // An external module name is "relative" if the first term is "." or "..".
@@ -2622,17 +2622,17 @@ pub(crate) mod tspath_p17 {
         path_is_relative(module_name) || is_rooted_disk_path(module_name)
     }
 
-    // Go: tspath/path.go:1045 FileExtensionIs
+    // Go: tspath/path.go:1095 FileExtensionIs
     pub fn file_extension_is(path: &str, extension: &str) -> bool {
         path.len() > extension.len() && path.ends_with(extension)
     }
 
-    // Go: tspath/path.go:1089 HasExtension
+    // Go: tspath/path.go:1139 HasExtension
     pub fn has_extension(file_name: &str) -> bool {
         get_base_file_name(file_name).contains('.')
     }
 
-    // Go: tspath/extension.go:40 ExtensionIsTs
+    // Go: tspath/extension.go:39 ExtensionIsTs
     pub fn extension_is_ts(ext: &str) -> bool {
         ext == EXTENSION_TS
             || ext == EXTENSION_TSX
@@ -2782,7 +2782,7 @@ mod core_p17 {
             || EXCLUSIVELY_PREFIXED_NODE_CORE_MODULES.contains(&name)
     }
 
-    // Go: core/core.go:687 ShouldRewriteModuleSpecifier
+    // Go: core/core.go:724 ShouldRewriteModuleSpecifier
     pub fn should_rewrite_module_specifier(
         specifier: &str,
         compiler_options: &CompilerOptions,
@@ -2819,7 +2819,7 @@ mod core_p17 {
         best_pattern
     }
 
-    // Go: core/pattern.go:23 Pattern.Matches
+    // Go: core/pattern.go:22 Pattern.Matches
     // PORT: for `ast.PatternAmbientModule.Pattern`, which always has a star
     // (see `find_best_pattern_match`).
     pub fn pattern_matches(value: &PatternAmbientModule, candidate: &str) -> bool {

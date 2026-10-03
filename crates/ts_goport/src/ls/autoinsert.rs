@@ -8,7 +8,7 @@ use crate::lsp::lsproto;
 use crate::spanmap::Feature;
 
 impl LanguageService {
-    // Go: ls/autoinsert.go:14 ProvideOnAutoInsert
+    // Go: ls/autoinsert.go:13 ProvideOnAutoInsert
     pub fn provide_on_auto_insert(
         &self,
         _ctx: &Context,
@@ -90,7 +90,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/autoinsert.go:68 isUnclosedTag
+// Go: ls/autoinsert.go:77 isUnclosedTag
 // PORT: Go takes `*ast.JsxElement`; the node handle is the JsxElement node.
 fn is_unclosed_tag(node: Node) -> bool {
     let opening_element = node.opening_element();
@@ -110,7 +110,7 @@ fn is_unclosed_tag(node: Node) -> bool {
     false
 }
 
-// Go: ls/autoinsert.go:84 isUnclosedFragment
+// Go: ls/autoinsert.go:93 isUnclosedFragment
 // PORT: Go takes `*ast.JsxFragment`; the node handle is the JsxFragment node.
 fn is_unclosed_fragment(node: Node) -> bool {
     let closing_fragment = node.closing_fragment();

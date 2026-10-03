@@ -93,7 +93,7 @@ impl SyncConn {
         }
     }
 
-    // Go: ipc/conn_sync.go:84 handleRequest
+    // Go: ipc/conn_sync.go:86 handleRequest
     // handleRequest processes an incoming request.
     // PORT: Go recovers panics in a deferred function; `go_recover` covers
     // the same body (the handler call and the response write). Go
@@ -209,7 +209,7 @@ impl SyncConn {
         Ok(())
     }
 
-    // Go: ipc/conn_sync.go:161 handleNotification
+    // Go: ipc/conn_sync.go:164 handleNotification
     // handleNotification processes an incoming notification.
     fn handle_notification(&self, ctx: &Context, msg: Message) {
         let _ = self
@@ -217,7 +217,7 @@ impl SyncConn {
             .handle_notification(ctx, &msg.method, msg.params);
     }
 
-    // Go: ipc/conn_sync.go:167 Call
+    // Go: ipc/conn_sync.go:170 Call
     // Call sends a request to the client and waits for a response.
     // This method is safe to call from multiple goroutines - calls are serialized.
     pub fn call(
@@ -273,7 +273,7 @@ impl SyncConn {
         }
     }
 
-    // Go: ipc/conn_sync.go:204 Notify
+    // Go: ipc/conn_sync.go:224 Notify
     // Notify sends a notification to the client (no response expected).
     pub fn notify(
         &self,
@@ -369,7 +369,7 @@ mod tests {
         }
     }
 
-    // Go: ipc/conn_sync_test.go:44 panicHandler
+    // Go: ipc/conn_sync_test.go:45 panicHandler
     struct PanicHandler;
 
     impl Handler for PanicHandler {

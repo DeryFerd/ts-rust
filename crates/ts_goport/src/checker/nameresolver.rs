@@ -760,7 +760,7 @@ impl NameResolver {
         result
     }
 
-    // Go: binder/nameresolver.go:346 useOuterVariableScopeInParameter
+    // Go: binder/nameresolver.go:354 useOuterVariableScopeInParameter
     pub fn use_outer_variable_scope_in_parameter<H: NameResolverHost>(
         &self,
         c: &mut H,
@@ -814,13 +814,13 @@ impl NameResolver {
         false
     }
 
-    // Go: binder/nameresolver.go:372 requiresScopeChange
+    // Go: binder/nameresolver.go:380 requiresScopeChange
     pub fn requires_scope_change(&self, node: Node) -> bool {
         self.requires_scope_change_worker(node.name())
             || node.initializer().is_some() && self.requires_scope_change_worker(node.initializer())
     }
 
-    // Go: binder/nameresolver.go:377 requiresScopeChangeWorker
+    // Go: binder/nameresolver.go:385 requiresScopeChangeWorker
     pub fn requires_scope_change_worker(&self, node: Node) -> bool {
         match node.kind() {
             SyntaxKind::ArrowFunction
@@ -855,7 +855,7 @@ impl NameResolver {
         }
     }
 
-    // Go: binder/nameresolver.go:402 error
+    // Go: binder/nameresolver.go:410 error
     pub fn error<H: NameResolverHost>(
         &self,
         c: &mut H,
@@ -869,7 +869,7 @@ impl NameResolver {
         // Default implementation does not report errors
     }
 
-    // Go: binder/nameresolver.go:409 getSymbolOfDeclaration
+    // Go: binder/nameresolver.go:417 getSymbolOfDeclaration
     pub fn get_symbol_of_declaration<H: NameResolverHost>(
         &self,
         c: &mut H,
@@ -883,7 +883,7 @@ impl NameResolver {
         node.symbol()
     }
 
-    // Go: binder/nameresolver.go:418 lookup
+    // Go: binder/nameresolver.go:426 lookup
     // PORT: takes the name interned (see `resolve`).
     pub fn lookup<H: NameResolverHost>(
         &self,
@@ -907,7 +907,7 @@ impl NameResolver {
         SymbolId::NIL
     }
 
-    // Go: binder/nameresolver.go:434 argumentsSymbol
+    // Go: binder/nameresolver.go:442 argumentsSymbol
     pub fn arguments_symbol<H: NameResolverHost>(&self, c: &mut H) -> SymbolId {
         if self.arguments_symbol.get().is_nil() {
             // Default implementation synthesizes a transient symbol for `arguments`
@@ -922,7 +922,7 @@ impl NameResolver {
     }
 }
 
-// Go: binder/nameresolver.go:442 GetLocalSymbolForExportDefault
+// Go: binder/nameresolver.go:450 GetLocalSymbolForExportDefault
 pub fn get_local_symbol_for_export_default(symbols: &SymbolArena, symbol: SymbolId) -> SymbolId {
     if !is_export_default_symbol(symbols, symbol) || symbols.sym(symbol).declarations.is_empty() {
         return SymbolId::NIL;
@@ -936,14 +936,14 @@ pub fn get_local_symbol_for_export_default(symbols: &SymbolArena, symbol: Symbol
     SymbolId::NIL
 }
 
-// Go: binder/nameresolver.go:455 isExportDefaultSymbol
+// Go: binder/nameresolver.go:463 isExportDefaultSymbol
 pub fn is_export_default_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
     symbol.is_some()
         && !symbols.sym(symbol).declarations.is_empty()
         && has_syntactic_modifier(symbols.sym(symbol).declarations[0], ModifierFlags::DEFAULT)
 }
 
-// Go: binder/nameresolver.go:459 getIsDeferredContext
+// Go: binder/nameresolver.go:467 getIsDeferredContext
 // PERF: `kind` is `location.kind()`, which the caller has read (see
 // `resolve_name`). `location` is not nil.
 pub fn get_is_deferred_context(location: Node, kind: SyntaxKind, last_location: Node) -> bool {
@@ -975,7 +975,7 @@ pub fn get_is_deferred_context(location: Node, kind: SyntaxKind, last_location: 
     get_immediately_invoked_function_expression(location).is_nil()
 }
 
-// Go: binder/nameresolver.go:477 isTypeParameterSymbolDeclaredInContainer
+// Go: binder/nameresolver.go:485 isTypeParameterSymbolDeclaredInContainer
 pub fn is_type_parameter_symbol_declared_in_container(
     symbols: &SymbolArena,
     symbol: SymbolId,

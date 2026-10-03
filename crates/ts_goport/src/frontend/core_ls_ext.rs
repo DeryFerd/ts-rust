@@ -127,7 +127,7 @@ pub fn map_non_nil<T, U>(
     result
 }
 
-// Go: core/core.go:297 FirstNonZero
+// Go: core/core.go:295 FirstNonZero
 // PORT: the Go zero value is `T::default()`.
 pub fn first_non_zero<T: Default + PartialEq>(values: impl IntoIterator<Item = T>) -> T {
     let zero = T::default();
@@ -139,7 +139,7 @@ pub fn first_non_zero<T: Default + PartialEq>(values: impl IntoIterator<Item = T
     zero
 }
 
-// Go: core/core.go:359 MinAllFunc
+// Go: core/core.go:357 MinAllFunc
 // MinAllFunc returns all minimum elements from xs according to the comparison function cmp.
 pub fn min_all_func<T: Clone>(xs: &[T], mut cmp: impl FnMut(&T, &T) -> i32) -> Vec<T> {
     if xs.is_empty() {
@@ -163,12 +163,12 @@ pub fn min_all_func<T: Clone>(xs: &[T], mut cmp: impl FnMut(&T, &T) -> i32) -> V
     mins
 }
 
-// Go: core/core.go:726 comparableValuesEqual
+// Go: core/core.go:763 comparableValuesEqual
 pub fn comparable_values_equal<T: GoComparable>(a: &T, b: &T) -> bool {
     a.go_eq(b)
 }
 
-// Go: core/core.go:734 DiffMaps
+// Go: core/core.go:771 DiffMaps
 // DiffMaps compares two maps m1 and m2 and calls the provided callbacks for added, removed, and changed entries.
 // onAdded is called for each key-value pair that is in m2 but not in m1.
 // onRemoved is called for each key-value pair that is in m1 but not in m2.
@@ -190,7 +190,7 @@ pub fn diff_maps<K, V: GoComparable>(
     );
 }
 
-// Go: core/core.go:742 DiffMapsFunc
+// Go: core/core.go:779 DiffMapsFunc
 // DiffMapsFunc compares two maps m1 and m2 and calls the provided callbacks for added, removed, and changed entries.
 // onAdded is called for each key-value pair that is in m2 but not in m1.
 // onRemoved is called for each key-value pair that is in m1 but not in m2.
@@ -233,7 +233,7 @@ pub fn diff_maps_func<K, V1, V2>(
     });
 }
 
-// Go: core/core.go:766 CopyMapInto
+// Go: core/core.go:803 CopyMapInto
 // CopyMapInto is maps.Copy, unless dst is nil, in which case it clones and returns src.
 // Use CopyMapInto anywhere you would use maps.Copy preceded by a nil check and map initialization.
 // PORT: a nil `dst` is `None`. `M` is any owned map or set (`FxHashMap`,
@@ -252,7 +252,7 @@ where
     }
 }
 
-// Go: core/core.go:775 UnorderedEqual
+// Go: core/core.go:812 UnorderedEqual
 // UnorderedEqual returns true if s1 and s2 contain the same elements, regardless of order.
 pub fn unordered_equal<T: Eq + Hash>(s1: &[T], s2: &[T]) -> bool {
     if s1.len() != s2.len() {
@@ -272,7 +272,7 @@ pub fn unordered_equal<T: Eq + Hash>(s1: &[T], s2: &[T]) -> bool {
     true
 }
 
-// Go: core/core.go:830 CompareBooleans
+// Go: core/core.go:867 CompareBooleans
 // CompareBooleans treats true as greater than false.
 pub fn compare_booleans(a: bool, b: bool) -> i32 {
     if a && !b {

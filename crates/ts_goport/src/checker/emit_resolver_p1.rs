@@ -80,7 +80,7 @@ pub fn new_emit_resolver(checker: &Checker) -> EmitResolver {
 }
 
 impl Checker {
-    // Go: checker/checker.go:31911 GetEmitResolver
+    // Go: checker/checker.go:32651 GetEmitResolver
     // PORT: `sync.Once` is the `Option` in `emit_resolver`.
     pub fn get_emit_resolver(&mut self) -> Rc<EmitResolver> {
         if self.emit_resolver.is_none() {
@@ -90,7 +90,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:31911 GetEmitResolver, for a checker that a
+// Go: checker/checker.go:32651 GetEmitResolver, for a checker that a
 // language-service pool shares as `Rc<RefCell<Checker>>`.
 // PORT: the resolver also links to `checker`, so `with_checker` can reach it
 // on the dispatch thread (Go `r.checker`). The checker owns one resolver, so
@@ -525,7 +525,7 @@ impl EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:573 EmitResolver.RequiresAddingImplicitUndefinedUnsafe
+    // Go: checker/emitresolver.go:577 EmitResolver.RequiresAddingImplicitUndefinedUnsafe
     // PORT: body of Go `RequiresAddingImplicitUndefinedUnsafe` with the
     // checker passed in, for callers inside a node builder call.
     pub fn requires_adding_implicit_undefined_unsafe_worker(
@@ -542,7 +542,7 @@ impl EmitResolver {
         self.requires_adding_implicit_undefined(c, declaration, symbol, enclosing_declaration)
     }
 
-    // Go: checker/emitresolver.go:581 EmitResolver.requiresAddingImplicitUndefined
+    // Go: checker/emitresolver.go:585 EmitResolver.requiresAddingImplicitUndefined
     pub fn requires_adding_implicit_undefined(
         &self,
         c: &mut Checker,
@@ -772,32 +772,32 @@ impl crate::printer::EmitResolver for EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:847 EmitResolver.GetReferencedExportContainer
+    // Go: checker/emitresolver.go:858 EmitResolver.GetReferencedExportContainer
     fn get_referenced_export_container(&self, node: Node, prefix_locals: bool) -> Node {
         EmitResolver::get_referenced_export_container(self, node, prefix_locals)
     }
 
-    // Go: checker/emitresolver.go:864 EmitResolver.GetReferencedImportDeclaration
+    // Go: checker/emitresolver.go:875 EmitResolver.GetReferencedImportDeclaration
     fn get_referenced_import_declaration(&self, node: Node) -> Node {
         EmitResolver::get_referenced_import_declaration(self, node)
     }
 
-    // Go: checker/emitresolver.go:889 EmitResolver.GetReferencedValueDeclarations
+    // Go: checker/emitresolver.go:904 EmitResolver.GetReferencedValueDeclarations
     fn get_referenced_value_declarations(&self, node: Node) -> Vec<Node> {
         EmitResolver::get_referenced_value_declarations(self, node)
     }
 
-    // Go: checker/emitresolver.go:878 EmitResolver.GetReferencedValueDeclaration
+    // Go: checker/emitresolver.go:889 EmitResolver.GetReferencedValueDeclaration
     fn get_referenced_value_declaration(&self, node: Node) -> Node {
         EmitResolver::get_referenced_value_declaration(self, node)
     }
 
-    // Go: checker/emitresolver.go:909 EmitResolver.GetElementAccessExpressionName
+    // Go: checker/emitresolver.go:924 EmitResolver.GetElementAccessExpressionName
     fn get_element_access_expression_name(&self, expression: Node) -> String {
         EmitResolver::get_element_access_expression_name(self, expression)
     }
 
-    // Go: checker/emitresolver.go:920 EmitResolver.GetReferencedMemberValueDeclaration
+    // Go: checker/emitresolver.go:935 EmitResolver.GetReferencedMemberValueDeclaration
     fn get_referenced_member_value_declaration(&self, node: Node) -> Node {
         EmitResolver::get_referenced_member_value_declaration(self, node)
     }
@@ -807,37 +807,37 @@ impl crate::printer::EmitResolver for EmitResolver {
         self.with_checker(|c| c.sym(symbol).value_declaration)
     }
 
-    // Go: checker/emitresolver.go:689 EmitResolver.IsReferencedAliasDeclaration
+    // Go: checker/emitresolver.go:697 EmitResolver.IsReferencedAliasDeclaration
     fn is_referenced_alias_declaration(&self, node: Node) -> bool {
         EmitResolver::is_referenced_alias_declaration(self, node)
     }
 
-    // Go: checker/emitresolver.go:715 EmitResolver.IsValueAliasDeclaration
+    // Go: checker/emitresolver.go:723 EmitResolver.IsValueAliasDeclaration
     fn is_value_alias_declaration(&self, node: Node) -> bool {
         EmitResolver::is_value_alias_declaration(self, node)
     }
 
-    // Go: checker/emitresolver.go:781 EmitResolver.IsTopLevelValueImportEqualsWithEntityName
+    // Go: checker/emitresolver.go:789 EmitResolver.IsTopLevelValueImportEqualsWithEntityName
     fn is_top_level_value_import_equals_with_entity_name(&self, node: Node) -> bool {
         EmitResolver::is_top_level_value_import_equals_with_entity_name(self, node)
     }
 
-    // Go: checker/emitresolver.go:800 EmitResolver.MarkLinkedReferencesRecursively
+    // Go: checker/emitresolver.go:808 EmitResolver.MarkLinkedReferencesRecursively
     fn mark_linked_references_recursively(&self, file: Node) {
         EmitResolver::mark_linked_references_recursively(self, file)
     }
 
-    // Go: checker/emitresolver.go:821 EmitResolver.GetExternalModuleFileFromDeclaration
+    // Go: checker/emitresolver.go:832 EmitResolver.GetExternalModuleFileFromDeclaration
     fn get_external_module_file_from_declaration(&self, node: Node) -> Node {
         EmitResolver::get_external_module_file_from_declaration(self, node)
     }
 
-    // Go: checker/emitresolver.go:1136 EmitResolver.GetEffectiveDeclarationFlags
+    // Go: checker/emitresolver.go:1151 EmitResolver.GetEffectiveDeclarationFlags
     fn get_effective_declaration_flags(&self, node: Node, flags: ModifierFlags) -> ModifierFlags {
         EmitResolver::get_effective_declaration_flags(self, node, flags)
     }
 
-    // Go: checker/emitresolver.go:1157 EmitResolver.GetTypeReferenceSerializationKind
+    // Go: checker/emitresolver.go:1165 EmitResolver.GetTypeReferenceSerializationKind
     fn get_type_reference_serialization_kind(
         &self,
         name: Node,
@@ -846,7 +846,7 @@ impl crate::printer::EmitResolver for EmitResolver {
         EmitResolver::get_type_reference_serialization_kind(self, name, serial_scope)
     }
 
-    // Go: checker/emitresolver.go:1150 EmitResolver.GetConstantValue
+    // Go: checker/emitresolver.go:1158 EmitResolver.GetConstantValue
     fn get_constant_value(&self, node: Node) -> Option<LiteralValue> {
         EmitResolver::get_constant_value(self, node)
     }
@@ -861,7 +861,7 @@ impl crate::printer::EmitResolver for EmitResolver {
         self.with_checker(|c| c.get_jsx_fragment_factory_entity(location))
     }
 
-    // Go: checker/emitresolver.go:858 EmitResolver.SetReferencedImportDeclaration
+    // Go: checker/emitresolver.go:869 EmitResolver.SetReferencedImportDeclaration
     fn set_referenced_import_declaration(&self, node: Node, ref_: Node) {
         EmitResolver::set_referenced_import_declaration(self, node, ref_)
     }
@@ -928,7 +928,7 @@ impl crate::printer::EmitResolver for EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:677 EmitResolver.IsSymbolAccessible
+    // Go: checker/emitresolver.go:685 EmitResolver.IsSymbolAccessible
     fn is_symbol_accessible(
         &self,
         symbol: SymbolId,
@@ -956,22 +956,22 @@ impl crate::printer::EmitResolver for EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:667 EmitResolver.IsExpandoFunctionDeclaration
+    // Go: checker/emitresolver.go:675 EmitResolver.IsExpandoFunctionDeclaration
     fn is_expando_function_declaration(&self, node: Node) -> bool {
         EmitResolver::is_expando_function_declaration(self, node)
     }
 
-    // Go: checker/emitresolver.go:652 EmitResolver.IsExpandoFunctionDeclarationUnsafe
+    // Go: checker/emitresolver.go:660 EmitResolver.IsExpandoFunctionDeclarationUnsafe
     fn is_expando_function_declaration_unsafe(&self, node: Node) -> bool {
         EmitResolver::is_expando_function_declaration_unsafe(self, node)
     }
 
-    // Go: checker/emitresolver.go:639 EmitResolver.IsLiteralConstDeclaration
+    // Go: checker/emitresolver.go:643 EmitResolver.IsLiteralConstDeclaration
     fn is_literal_const_declaration(&self, node: Node) -> bool {
         EmitResolver::is_literal_const_declaration(self, node)
     }
 
-    // Go: checker/emitresolver.go:564 EmitResolver.RequiresAddingImplicitUndefined
+    // Go: checker/emitresolver.go:568 EmitResolver.RequiresAddingImplicitUndefined
     fn requires_adding_implicit_undefined(
         &self,
         node: Node,
@@ -992,12 +992,12 @@ impl crate::printer::EmitResolver for EmitResolver {
         self.with_checker(|c| self.is_declaration_visible(c, node))
     }
 
-    // Go: checker/emitresolver.go:901 EmitResolver.IsNameResolvable
+    // Go: checker/emitresolver.go:916 EmitResolver.IsNameResolvable
     fn is_name_resolvable(&self, location: Node, name: &str) -> bool {
         EmitResolver::is_name_resolvable(self, location, name)
     }
 
-    // Go: checker/emitresolver.go:504 EmitResolver.IsImportRequiredByAugmentation
+    // Go: checker/emitresolver.go:508 EmitResolver.IsImportRequiredByAugmentation
     fn is_import_required_by_augmentation(&self, decl: Node) -> bool {
         // node = r.emitContext.ParseNode(node)
         if !is_parse_tree_node(decl) {
@@ -1037,7 +1037,7 @@ impl crate::printer::EmitResolver for EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:540 EmitResolver.IsDefinitelyReferenceToGlobalSymbolObject
+    // Go: checker/emitresolver.go:544 EmitResolver.IsDefinitelyReferenceToGlobalSymbolObject
     fn is_definitely_reference_to_global_symbol_object(&self, node: Node) -> bool {
         if !is_property_access_expression(node)
             || !is_identifier(node.name())
@@ -1155,17 +1155,17 @@ impl crate::printer::EmitResolver for EmitResolver {
         self.with_checker(|c| self.is_optional_parameter(c, node))
     }
 
-    // Go: checker/emitresolver.go:1284 EmitResolver.IsThisPropertyAssignmentDeclarationRedundant
+    // Go: checker/emitresolver.go:1292 EmitResolver.IsThisPropertyAssignmentDeclarationRedundant
     fn is_this_property_assignment_declaration_redundant(&self, node: Node) -> bool {
         EmitResolver::is_this_property_assignment_declaration_redundant(self, node)
     }
 
-    // Go: checker/emitresolver.go:1249 EmitResolver.GetPropertiesOfContainerFunction
+    // Go: checker/emitresolver.go:1257 EmitResolver.GetPropertiesOfContainerFunction
     fn get_properties_of_container_function(&self, node: Node) -> Vec<SymbolId> {
         EmitResolver::get_properties_of_container_function(self, node)
     }
 
-    // Go: checker/emitresolver.go:573 EmitResolver.RequiresAddingImplicitUndefinedUnsafe
+    // Go: checker/emitresolver.go:577 EmitResolver.RequiresAddingImplicitUndefinedUnsafe
     // PORT: Go takes no lock because its callers already hold it. The trait
     // method has no checker argument, so it borrows the checker from the pool.
     // It must not be called while a checker is lent out. Callers that hold
@@ -1186,14 +1186,14 @@ impl crate::printer::EmitResolver for EmitResolver {
         })
     }
 
-    // Go: checker/emitresolver.go:889 EmitResolver.GetReferencedValueDeclarationUnsafe
+    // Go: checker/emitresolver.go:900 EmitResolver.GetReferencedValueDeclarationUnsafe
     // PORT: see `requires_adding_implicit_undefined_unsafe`. Callers that
     // hold the checker use `get_referenced_value_declaration_unsafe_worker`.
     fn get_referenced_value_declaration_unsafe(&self, node: Node) -> Node {
         EmitResolver::get_referenced_value_declaration_unsafe(self, node)
     }
 
-    // Go: checker/emitresolver.go:959 EmitResolver.CreateTypeOfDeclaration
+    // Go: checker/emitresolver.go:974 EmitResolver.CreateTypeOfDeclaration
     fn create_type_of_declaration(
         &self,
         emit_context: &EmitContext,
@@ -1214,7 +1214,7 @@ impl crate::printer::EmitResolver for EmitResolver {
         )
     }
 
-    // Go: checker/emitresolver.go:935 EmitResolver.CreateReturnTypeOfSignatureDeclaration
+    // Go: checker/emitresolver.go:950 EmitResolver.CreateReturnTypeOfSignatureDeclaration
     fn create_return_type_of_signature_declaration(
         &self,
         emit_context: &EmitContext,
@@ -1235,7 +1235,7 @@ impl crate::printer::EmitResolver for EmitResolver {
         )
     }
 
-    // Go: checker/emitresolver.go:947 EmitResolver.CreateTypeParametersOfSignatureDeclaration
+    // Go: checker/emitresolver.go:962 EmitResolver.CreateTypeParametersOfSignatureDeclaration
     fn create_type_parameters_of_signature_declaration(
         &self,
         emit_context: &EmitContext,
@@ -1256,7 +1256,7 @@ impl crate::printer::EmitResolver for EmitResolver {
         )
     }
 
-    // Go: checker/emitresolver.go:973 EmitResolver.CreateLiteralConstValue
+    // Go: checker/emitresolver.go:988 EmitResolver.CreateLiteralConstValue
     fn create_literal_const_value(
         &self,
         emit_context: &EmitContext,
@@ -1266,7 +1266,7 @@ impl crate::printer::EmitResolver for EmitResolver {
         EmitResolver::create_literal_const_value(self, emit_context, node, tracker)
     }
 
-    // Go: checker/emitresolver.go:1034 EmitResolver.CreateTypeOfExpression
+    // Go: checker/emitresolver.go:1049 EmitResolver.CreateTypeOfExpression
     fn create_type_of_expression(
         &self,
         emit_context: &EmitContext,
@@ -1287,7 +1287,7 @@ impl crate::printer::EmitResolver for EmitResolver {
         )
     }
 
-    // Go: checker/emitresolver.go:1046 EmitResolver.CreateLateBoundIndexSignatures
+    // Go: checker/emitresolver.go:1061 EmitResolver.CreateLateBoundIndexSignatures
     fn create_late_bound_index_signatures(
         &self,
         emit_context: &EmitContext,
@@ -1308,7 +1308,7 @@ impl crate::printer::EmitResolver for EmitResolver {
         )
     }
 
-    // Go: checker/emitresolver.go:1264 EmitResolver.TryJSTypeNodeToTypeNode
+    // Go: checker/emitresolver.go:1272 EmitResolver.TryJSTypeNodeToTypeNode
     fn try_js_type_node_to_type_node(
         &self,
         emit_context: &EmitContext,

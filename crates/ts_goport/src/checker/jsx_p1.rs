@@ -18,7 +18,7 @@ pub struct JsxElementLinks {
     pub first_jsx_tag_in_file: Node,             // The first JSX tag in the file
 }
 
-// Go: checker/jsx.go:41 JsxNames
+// Go: checker/jsx.go:42 JsxNames
 // PORT: Go `var JsxNames = struct{...}{...}`. Two spellings are provided so
 // both `JsxNames.intrinsic_elements` (the value, like Go) and
 // `JsxNames::INTRINSIC_ELEMENTS` (associated consts) work. The braced struct
@@ -68,7 +68,7 @@ impl JsxNames {
     pub const LIBRARY_MANAGED_ATTRIBUTES: &'static str = "LibraryManagedAttributes";
 }
 
-// Go: checker/jsx.go:67 ReactNames
+// Go: checker/jsx.go:66 ReactNames
 // PORT: same two spellings as `JsxNames`.
 #[derive(Clone, Copy, Debug)]
 pub struct ReactNamesValues {
@@ -87,13 +87,13 @@ impl ReactNames {
 }
 
 impl Checker {
-    // Go: checker/jsx.go:73 checkJsxElement
+    // Go: checker/jsx.go:72 checkJsxElement
     pub fn check_jsx_element(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         self.check_node_deferred(node);
         self.get_jsx_element_type_at(node)
     }
 
-    // Go: checker/jsx.go:78 checkJsxElementDeferred
+    // Go: checker/jsx.go:77 checkJsxElementDeferred
     pub fn check_jsx_element_deferred(&mut self, node: Node) {
         let opening_element = node.opening_element();
         let closing_element = node.closing_element();
@@ -107,7 +107,7 @@ impl Checker {
         self.check_jsx_children(node, CheckMode::NORMAL);
     }
 
-    // Go: checker/jsx.go:90 checkJsxExpression
+    // Go: checker/jsx.go:89 checkJsxExpression
     pub fn check_jsx_expression(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         self.check_grammar_jsx_expression(node);
         if node.expression().is_nil() {
@@ -120,18 +120,18 @@ impl Checker {
         t
     }
 
-    // Go: checker/jsx.go:102 checkJsxSelfClosingElement
+    // Go: checker/jsx.go:101 checkJsxSelfClosingElement
     pub fn check_jsx_self_closing_element(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         self.check_node_deferred(node);
         self.get_jsx_element_type_at(node)
     }
 
-    // Go: checker/jsx.go:107 checkJsxSelfClosingElementDeferred
+    // Go: checker/jsx.go:106 checkJsxSelfClosingElementDeferred
     pub fn check_jsx_self_closing_element_deferred(&mut self, node: Node) {
         self.check_jsx_opening_like_element_or_opening_fragment(node);
     }
 
-    // Go: checker/jsx.go:111 checkJsxFragment
+    // Go: checker/jsx.go:110 checkJsxFragment
     pub fn check_jsx_fragment(&mut self, node: Node) -> TypeId {
         self.check_jsx_opening_like_element_or_opening_fragment(node.opening_fragment());
         // by default, jsx:'react' will use jsxFactory = React.createElement and jsxFragmentFactory = React.Fragment
@@ -159,13 +159,13 @@ impl Checker {
         }
     }
 
-    // Go: checker/jsx.go:128 checkJsxAttributes
+    // Go: checker/jsx.go:126 checkJsxAttributes
     pub fn check_jsx_attributes(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         self.check_node_deferred(node);
         self.create_jsx_attributes_type_from_attributes_property(node.parent(), check_mode)
     }
 
-    // Go: checker/jsx.go:132 checkJsxOpeningLikeElementOrOpeningFragment
+    // Go: checker/jsx.go:131 checkJsxOpeningLikeElementOrOpeningFragment
     pub fn check_jsx_opening_like_element_or_opening_fragment(&mut self, node: Node) {
         let is_node_opening_like_element = is_jsx_opening_like_element(node);
         if is_node_opening_like_element {
@@ -289,7 +289,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/jsx.go:201 inferJsxTypeArguments
+    // Go: checker/jsx.go:198 inferJsxTypeArguments
     // PORT: Go passes `context.inferences`; `infer_types` takes the context id
     // (same as other ported callers).
     pub fn infer_jsx_type_arguments(
@@ -316,7 +316,7 @@ impl Checker {
         self.get_inferred_types(context)
     }
 
-    // Go: checker/jsx.go:208 getContextualTypeForJsxExpression
+    // Go: checker/jsx.go:205 getContextualTypeForJsxExpression
     pub fn get_contextual_type_for_jsx_expression(
         &mut self,
         node: Node,
@@ -334,7 +334,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/jsx.go:218 getContextualTypeForJsxAttribute
+    // Go: checker/jsx.go:215 getContextualTypeForJsxAttribute
     pub fn get_contextual_type_for_jsx_attribute(
         &mut self,
         attribute: Node,
@@ -355,7 +355,7 @@ impl Checker {
         self.get_contextual_type(attribute.parent(), context_flags)
     }
 
-    // Go: checker/jsx.go:232 getContextualJsxElementAttributesType
+    // Go: checker/jsx.go:229 getContextualJsxElementAttributesType
     pub fn get_contextual_jsx_element_attributes_type(
         &mut self,
         node: Node,
@@ -374,7 +374,7 @@ impl Checker {
         self.get_contextual_type_for_argument_at_index(node, 0)
     }
 
-    // Go: checker/jsx.go:245 getContextualTypeForChildJsxExpression
+    // Go: checker/jsx.go:242 getContextualTypeForChildJsxExpression
     pub fn get_contextual_type_for_child_jsx_expression(
         &mut self,
         node: Node,
@@ -421,7 +421,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/jsx.go:269 discriminateContextualTypeByJSXAttributes
+    // Go: checker/jsx.go:266 discriminateContextualTypeByJSXAttributes
     pub fn discriminate_contextual_type_by_jsx_attributes(
         &mut self,
         node: Node,
@@ -488,7 +488,7 @@ impl Checker {
         discriminated
     }
 
-    // Go: checker/jsx.go:294 elaborateJsxComponents
+    // Go: checker/jsx.go:296 elaborateJsxComponents
     pub fn elaborate_jsx_components(
         &mut self,
         node: Node,
@@ -680,7 +680,7 @@ impl Checker {
 // elaboration helpers. Stored in closures, so it is an `Rc<dyn Fn>`.
 pub type JsxInvalidTextDiagnosticFn = Rc<dyn Fn(&mut Checker) -> (&'static Message, Vec<String>)>;
 
-// Go: checker/jsx.go:367 JsxElaborationElement
+// Go: checker/jsx.go:369 JsxElaborationElement
 // PORT: Go `createDiagnostic func(prop *ast.Node) *ast.Diagnostic` (nil-able)
 // is `Option<Rc<dyn Fn(&mut Checker, Node) -> Diagnostic>>`.
 #[derive(Clone, Default)]
@@ -703,7 +703,7 @@ pub struct JsxChildrenIterator {
 }
 
 impl JsxChildrenIterator {
-    // Go: checker/jsx.go:374 generateJsxChildren (loop body)
+    // Go: checker/jsx.go:376 generateJsxChildren (loop body)
     pub fn next(&mut self, c: &mut Checker) -> Option<JsxElaborationElement> {
         let children = self.node.children().nodes().to_vec();
         while self.index < children.len() {
@@ -728,7 +728,7 @@ impl JsxChildrenIterator {
 }
 
 impl Checker {
-    // Go: checker/jsx.go:374 generateJsxChildren
+    // Go: checker/jsx.go:376 generateJsxChildren
     pub fn generate_jsx_children(
         &mut self,
         node: Node,
@@ -742,7 +742,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/jsx.go:391 getElaborationElementForJsxChild
+    // Go: checker/jsx.go:393 getElaborationElementForJsxChild
     pub fn get_elaboration_element_for_jsx_child(
         &mut self,
         child: Node,
@@ -793,7 +793,7 @@ impl Checker {
         panic!("Unhandled case in getElaborationElementForJsxChild")
     }
 
-    // Go: checker/jsx.go:418 elaborateIterableOrArrayLikeTargetElementwise
+    // Go: checker/jsx.go:420 elaborateIterableOrArrayLikeTargetElementwise
     // PORT: Go `iter.Seq[JsxElaborationElement]` is the lazy `JsxChildrenIterator`
     // (its only producer is `generateJsxChildren`).
     pub fn elaborate_iterable_or_array_like_target_elementwise(
@@ -954,7 +954,7 @@ impl Checker {
         reported_error
     }
 
-    // Go: checker/jsx.go:483 getSuggestedSymbolForNonexistentJSXAttribute
+    // Go: checker/jsx.go:485 getSuggestedSymbolForNonexistentJSXAttribute
     pub fn get_suggested_symbol_for_nonexistent_jsx_attribute(
         &mut self,
         name: &str,
@@ -985,7 +985,7 @@ impl Checker {
         self.get_spelling_suggestion_for_name(name, &properties, SymbolFlags::VALUE)
     }
 
-    // Go: checker/jsx.go:498 getJSXFragmentType
+    // Go: checker/jsx.go:500 getJSXFragmentType
     pub fn get_jsx_fragment_type(&mut self, node: Node) -> TypeId {
         // An opening fragment is required in order for `getJsxNamespace` to give the fragment factory
         let file = get_source_file_of_node(node);
@@ -1054,7 +1054,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/jsx.go:543 resolveJsxOpeningLikeElement
+    // Go: checker/jsx.go:545 resolveJsxOpeningLikeElement
     pub fn resolve_jsx_opening_like_element(
         &mut self,
         node: Node,
@@ -1149,7 +1149,7 @@ impl Checker {
     // @param node a JSX opening-like element we are trying to figure its call signature
     // @param signature a candidate signature we are trying whether it is a call signature
     // @param relation a relationship to check parameter and argument type
-    // Go: checker/jsx.go:589 checkApplicableSignatureForJsxCallLikeElement
+    // Go: checker/jsx.go:591 checkApplicableSignatureForJsxCallLikeElement
     pub fn check_applicable_signature_for_jsx_call_like_element(
         &mut self,
         node: Node,
@@ -1331,7 +1331,7 @@ impl Checker {
     // @return an anonymous type (similar to the one returned by checkObjectLiteral) in which its properties are attributes property.
     // @remarks Because this function calls getSpreadType, it needs to use the same checks as checkObjectLiteral,
     // which also calls getSpreadType.
-    // Go: checker/jsx.go:708 createJsxAttributesTypeFromAttributesProperty
+    // Go: checker/jsx.go:710 createJsxAttributesTypeFromAttributesProperty
     pub fn create_jsx_attributes_type_from_attributes_property(
         &mut self,
         opening_like_element: Node,
@@ -1626,7 +1626,7 @@ impl Checker {
         spread
     }
 
-    // Go: checker/jsx.go:873 checkJsxAttribute
+    // Go: checker/jsx.go:869 checkJsxAttribute
     pub fn check_jsx_attribute(&mut self, node: Node, check_mode: CheckMode) -> TypeId {
         if node.initializer().is_some() {
             return self.check_expression_for_mutable_location(node.initializer(), check_mode);
@@ -1635,7 +1635,7 @@ impl Checker {
         self.true_type
     }
 
-    // Go: checker/jsx.go:881 checkJsxChildren
+    // Go: checker/jsx.go:877 checkJsxChildren
     pub fn check_jsx_children(&mut self, node: Node, check_mode: CheckMode) -> Vec<TypeId> {
         let mut child_types: Vec<TypeId> = Vec::new();
         for child in node.children().nodes() {
@@ -1656,7 +1656,7 @@ impl Checker {
         child_types
     }
 
-    // Go: checker/jsx.go:900 getUninstantiatedJsxSignaturesOfType
+    // Go: checker/jsx.go:896 getUninstantiatedJsxSignaturesOfType
     pub fn get_uninstantiated_jsx_signatures_of_type(
         &mut self,
         element_type: TypeId,

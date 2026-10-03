@@ -12,7 +12,7 @@ use crate::spanmap;
 use crate::spanmap::{Feature, SpanMap};
 
 impl LanguageService {
-    // Go: ls/format.go:18 toLSProtoTextEdits
+    // Go: ls/format.go:19 toLSProtoTextEdits
     // PORT: Go returns a nil slice when an edit does not map exactly; that
     // is an empty `Vec`. The callers put `&edits` in the response, and Go
     // JSON (v2) writes a nil slice as `[]`, as for an empty one.
@@ -33,7 +33,7 @@ impl LanguageService {
         result
     }
 
-    // Go: ls/format.go:27 ProvideFormatDocument
+    // Go: ls/format.go:34 ProvideFormatDocument
     pub fn provide_format_document(
         &self,
         ctx: &Context,
@@ -63,7 +63,7 @@ impl LanguageService {
         })
     }
 
-    // Go: ls/format.go:54 getFormattingEditsForMappedRange
+    // Go: ls/format.go:56 getFormattingEditsForMappedRange
     // getFormattingEditsForMappedRange formats each formatting-enabled verbatim intersection with originalRange.
     // Duplicate formatting projections are unsupported. If mappings overlap anyway, each original-text position
     // is formatted only once, preferring the earliest and then longest applicable mapping.
@@ -142,7 +142,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/format.go:106 mappedFormattingRange
+// Go: ls/format.go:107 mappedFormattingRange
 #[derive(Clone, Debug)]
 struct MappedFormattingRange {
     projection: Node,
@@ -198,7 +198,7 @@ fn non_overlapping_formatting_ranges(
 }
 
 impl LanguageService {
-    // Go: ls/format.go:152 ProvideFormatDocumentRange
+    // Go: ls/format.go:151 ProvideFormatDocumentRange
     pub fn provide_format_document_range(
         &self,
         ctx: &Context,
@@ -237,7 +237,7 @@ impl LanguageService {
         })
     }
 
-    // Go: ls/format.go:59 ProvideFormatDocumentOnType
+    // Go: ls/format.go:180 ProvideFormatDocumentOnType
     pub fn provide_format_document_on_type(
         &self,
         ctx: &Context,
@@ -276,7 +276,7 @@ impl LanguageService {
         })
     }
 
-    // Go: ls/format.go:78 getFormattingEditsForRange
+    // Go: ls/format.go:207 getFormattingEditsForRange
     fn get_formatting_edits_for_range(
         &self,
         ctx: &Context,
@@ -292,7 +292,7 @@ impl LanguageService {
         crate::format::format_selection(ctx, file, r.pos(), r.end())
     }
 
-    // Go: ls/format.go:88 getFormattingEditsForDocument
+    // Go: ls/format.go:217 getFormattingEditsForDocument
     fn get_formatting_edits_for_document(
         &self,
         ctx: &Context,
@@ -307,7 +307,7 @@ impl LanguageService {
         crate::format::format_document(ctx, file)
     }
 
-    // Go: ls/format.go:97 getFormattingEditsAfterKeystroke
+    // Go: ls/format.go:226 getFormattingEditsAfterKeystroke
     fn get_formatting_edits_after_keystroke(
         &self,
         ctx: &Context,
@@ -336,7 +336,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/format.go:128 getRangeOfEnclosingComment
+// Go: ls/format.go:257 getRangeOfEnclosingComment
 // Unlike the TS implementation, this function *will not* compute default values for
 // `precedingToken` and `tokenAtPosition`.
 // It is the caller's responsibility to call `astnav.GetTokenAtPosition` to compute a default `tokenAtPosition`,

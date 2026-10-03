@@ -72,7 +72,7 @@ pub struct ProjectAndTextDocumentPosition<'l> {
     pub for_original_location: bool,
 }
 
-// Go: ls/crossproject.go:31 response
+// Go: ls/crossproject.go:32 response
 #[derive(Clone, Debug, Default)]
 pub struct Response<Resp> {
     pub complete: bool,
@@ -80,7 +80,7 @@ pub struct Response<Resp> {
     pub for_original_location: bool,
 }
 
-// Go: ls/crossproject.go:37 CrossProjectOrchestrator
+// Go: ls/crossproject.go:38 CrossProjectOrchestrator
 // PORT: Go `*LanguageService` results are new language services owned by
 // the caller (`Option` for nil). Go `iter.Seq[Project]` is a push iterator:
 // `yield_` gets each project and returns false to stop.
@@ -544,13 +544,13 @@ where
     Req: HasTextDocumentPosition,
     Resp: Clone + Default,
 {
-    // Go: ls/crossproject.go:69 canSearchProject (closure)
+    // Go: ls/crossproject.go:75 canSearchProject (closure)
     fn can_search_project(&self, project: &Rc<dyn Project>) -> bool {
         let searched = self.results.borrow().contains_key(&project.id());
         !searched
     }
 
-    // Go: ls/crossproject.go:78 enqueueItem (closure)
+    // Go: ls/crossproject.go:84 enqueueItem (closure)
     fn enqueue_item(&self, item: ProjectAndTextDocumentPosition<'a>) {
         let response = Rc::new(RefCell::new(Response::<Resp>::default()));
         {
@@ -793,7 +793,7 @@ where
         }
     }
 
-    // Go: ls/crossproject.go:96 the session calls of the queued function
+    // Go: ls/crossproject.go:102 the session calls of the queued function
     // (step 4) and the response (step 5): phase 3 of an item.
     fn commit_item(&self, slot: Slot<'a, Resp>) {
         let Slot {
@@ -863,7 +863,7 @@ where
         }
     }
 
-    // Go: ls/crossproject.go:169 getResultsIterator (closure)
+    // Go: ls/crossproject.go:184 getResultsIterator (closure)
     // PORT: returns the values the Go iterator yields, in order.
     fn get_results_iterator(&self) -> Vec<Resp> {
         let mut yielded: Vec<Resp> = Vec::new();
@@ -910,7 +910,7 @@ where
     }
 }
 
-// Go: ls/crossproject.go:283 combineLocationArray
+// Go: ls/crossproject.go:298 combineLocationArray
 // PORT: Go `locations *[]T` is read only: `&[T]`.
 pub fn combine_location_array<T: HasLocation + Clone>(
     mut combined: Vec<T>,
@@ -925,7 +925,7 @@ pub fn combine_location_array<T: HasLocation + Clone>(
     combined
 }
 
-// Go: ls/crossproject.go:296 combineResponseLocations
+// Go: ls/crossproject.go:311 combineResponseLocations
 // PORT: Go returns a non-nil `*[]lsproto.Location`: always `Some`.
 pub fn combine_response_locations<T: HasLocations>(
     results: &[T],
@@ -940,14 +940,14 @@ pub fn combine_response_locations<T: HasLocations>(
     Some(combined)
 }
 
-// Go: ls/crossproject.go:307 combineReferences
+// Go: ls/crossproject.go:322 combineReferences
 pub fn combine_references(results: &[lsproto::ReferencesResponse]) -> lsproto::ReferencesResponse {
     lsproto::LocationsOrNull {
         locations: combine_response_locations(results),
     }
 }
 
-// Go: ls/crossproject.go:311 combineVSReferences
+// Go: ls/crossproject.go:326 combineVSReferences
 pub fn combine_vs_references(
     results: &[lsproto::VSReferencesResponse],
 ) -> lsproto::VSReferencesResponse {
@@ -980,7 +980,7 @@ pub fn combine_vs_references(
     }
 }
 
-// Go: ls/crossproject.go:339 combineImplementations
+// Go: ls/crossproject.go:354 combineImplementations
 pub fn combine_implementations(
     results: &[lsproto::ImplementationResponse],
 ) -> lsproto::ImplementationResponse {
@@ -1002,7 +1002,7 @@ pub fn combine_implementations(
     }
 }
 
-// Go: ls/crossproject.go:352 combineRenameResponse
+// Go: ls/crossproject.go:367 combineRenameResponse
 // PORT: Go `combined` is a Go map, which the response marshals in random
 // order. It is an `IndexMap` in first-insert order. Go ranges over each
 // response's `Changes` map in random order; this uses its insertion order.
@@ -1069,7 +1069,7 @@ pub fn combine_rename_response(results: &[lsproto::RenameResponse]) -> lsproto::
     lsproto::WorkspaceEditOrNull::default()
 }
 
-// Go: ls/crossproject.go:408 combineIncomingCalls
+// Go: ls/crossproject.go:423 combineIncomingCalls
 pub fn combine_incoming_calls(
     results: &[lsproto::CallHierarchyIncomingCallsResponse],
 ) -> lsproto::CallHierarchyIncomingCallsResponse {

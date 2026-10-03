@@ -4,7 +4,7 @@ use crate::diagnostics::Message;
 use crate::prelude::*;
 
 impl Checker {
-    // Go: checker/grammarchecks.go:18 grammarErrorOnFirstToken
+    // Go: checker/grammarchecks.go:19 grammarErrorOnFirstToken
     pub fn grammar_error_on_first_token(
         &mut self,
         node: Node,
@@ -20,7 +20,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:28 grammarErrorAtPos
+    // Go: checker/grammarchecks.go:29 grammarErrorAtPos
     pub fn grammar_error_at_pos(
         &mut self,
         node_for_source_file: Node,
@@ -42,7 +42,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:37 grammarErrorOnNode
+    // Go: checker/grammarchecks.go:38 grammarErrorOnNode
     pub fn grammar_error_on_node(
         &mut self,
         node: Node,
@@ -57,7 +57,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:46 grammarErrorOnNodeSkippedOnNoEmit
+    // Go: checker/grammarchecks.go:47 grammarErrorOnNodeSkippedOnNoEmit
     pub fn grammar_error_on_node_skipped_on_no_emit(
         &mut self,
         node: Node,
@@ -75,7 +75,7 @@ impl Checker {
     }
 }
 
-// Go: checker/grammarchecks.go:57 getIdentifierFromEntityNameExpression
+// Go: checker/grammarchecks.go:58 getIdentifierFromEntityNameExpression
 pub fn get_identifier_from_entity_name_expression(node: Node) -> Node {
     match node.kind() {
         SyntaxKind::Identifier => node,
@@ -85,7 +85,7 @@ pub fn get_identifier_from_entity_name_expression(node: Node) -> Node {
 }
 
 impl Checker {
-    // Go: checker/grammarchecks.go:68 checkGrammarRegularExpressionLiteral
+    // Go: checker/grammarchecks.go:69 checkGrammarRegularExpressionLiteral
     // PORT: Go caches the scanner in `c.regExpScanner`; that field is not part
     // of the Rust `Checker` (see checker_p01), so a fresh scanner is used here.
     // The scanner is reset to the same state either way. The Go error callback
@@ -156,7 +156,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:99 checkGrammarPrivateIdentifierExpression
+    // Go: checker/grammarchecks.go:100 checkGrammarPrivateIdentifierExpression
     pub fn check_grammar_private_identifier_expression(&mut self, priv_id: Node) -> bool {
         let priv_id_as_node = priv_id;
         if get_containing_class(priv_id).is_nil() {
@@ -194,7 +194,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:119 checkGrammarMappedType
+    // Go: checker/grammarchecks.go:120 checkGrammarMappedType
     pub fn check_grammar_mapped_type(&mut self, node: Node) -> bool {
         // PORT: Go reads the `Members` field (a `*NodeList`); the Go
         // `Members()` method returns the same nodes for a mapped type.
@@ -209,7 +209,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:126 checkGrammarDecorator
+    // Go: checker/grammarchecks.go:127 checkGrammarDecorator
     pub fn check_grammar_decorator(&mut self, decorator: Node) -> bool {
         let source_file = get_source_file_of_node(decorator);
         if !self.has_parse_diagnostics(source_file) {
@@ -292,7 +292,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:198 checkGrammarExportDeclaration
+    // Go: checker/grammarchecks.go:199 checkGrammarExportDeclaration
     pub fn check_grammar_export_declaration(&mut self, node: Node) -> bool {
         // PORT: Go reads the `IsTypeOnly` field; the Go `IsTypeOnly()` method
         // returns it for an export declaration.
@@ -306,7 +306,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:205 checkGrammarModuleElementContext
+    // Go: checker/grammarchecks.go:206 checkGrammarModuleElementContext
     pub fn check_grammar_module_element_context(
         &mut self,
         node: Node,
@@ -322,7 +322,7 @@ impl Checker {
         !is_in_appropriate_context
     }
 
-    // Go: checker/grammarchecks.go:213 checkGrammarModifiers
+    // Go: checker/grammarchecks.go:214 checkGrammarModifiers
     pub fn check_grammar_modifiers(
         &mut self,
         node: Node, /*Union[HasModifiers, HasDecorators, HasIllegalModifiers, HasIllegalDecorators]*/
@@ -1124,7 +1124,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:570 reportObviousModifierErrors
+    // Go: checker/grammarchecks.go:571 reportObviousModifierErrors
     pub fn report_obvious_modifier_errors(&mut self, node: Node) -> bool {
         let modifier = self.find_first_illegal_modifier(node);
         if modifier.is_nil() {
@@ -1133,7 +1133,7 @@ impl Checker {
         self.grammar_error_on_first_token(modifier, diag::Modifiers_cannot_appear_here, args![])
     }
 
-    // Go: checker/grammarchecks.go:578 findFirstModifierExcept
+    // Go: checker/grammarchecks.go:579 findFirstModifierExcept
     pub fn find_first_modifier_except(&self, node: Node, allowed_modifier: SyntaxKind) -> Node {
         let modifier = node
             .modifier_nodes()
@@ -1146,7 +1146,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/grammarchecks.go:586 findFirstIllegalModifier
+    // Go: checker/grammarchecks.go:587 findFirstIllegalModifier
     pub fn find_first_illegal_modifier(&self, node: Node) -> Node {
         match node.kind() {
             SyntaxKind::GetAccessor
@@ -1215,7 +1215,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/grammarchecks.go:641 reportObviousDecoratorErrors
+    // Go: checker/grammarchecks.go:642 reportObviousDecoratorErrors
     pub fn report_obvious_decorator_errors(&mut self, node: Node) -> bool {
         let decorator = self.find_first_illegal_decorator(node);
         if decorator.is_nil() {
@@ -1224,7 +1224,7 @@ impl Checker {
         self.grammar_error_on_first_token(decorator, diag::Decorators_are_not_valid_here, args![])
     }
 
-    // Go: checker/grammarchecks.go:649 findFirstIllegalDecorator
+    // Go: checker/grammarchecks.go:650 findFirstIllegalDecorator
     pub fn find_first_illegal_decorator(&self, node: Node) -> Node {
         if can_have_illegal_decorators(node) {
             let decorator = node
@@ -1238,7 +1238,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/grammarchecks.go:658 checkGrammarAsyncModifier
+    // Go: checker/grammarchecks.go:659 checkGrammarAsyncModifier
     pub fn check_grammar_async_modifier(&mut self, node: Node, async_modifier: Node) -> bool {
         match node.kind() {
             SyntaxKind::MethodDeclaration
@@ -1257,7 +1257,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/grammarchecks.go:670 checkGrammarForDisallowedTrailingComma
+    // Go: checker/grammarchecks.go:671 checkGrammarForDisallowedTrailingComma
     pub fn check_grammar_for_disallowed_trailing_comma(
         &mut self,
         list: NodeList,
@@ -1276,7 +1276,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:677 checkGrammarTypeParameterList
+    // Go: checker/grammarchecks.go:678 checkGrammarTypeParameterList
     pub fn check_grammar_type_parameter_list(
         &mut self,
         type_parameters: NodeList,
@@ -1297,7 +1297,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:686 checkGrammarParameterList
+    // Go: checker/grammarchecks.go:687 checkGrammarParameterList
     pub fn check_grammar_parameter_list(&mut self, parameters: NodeList) -> bool {
         let mut seen_optional_parameter = false;
         let parameter_nodes = parameters.nodes();
@@ -1361,7 +1361,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:721 checkGrammarForUseStrictSimpleParameterList
+    // Go: checker/grammarchecks.go:722 checkGrammarForUseStrictSimpleParameterList
     pub fn check_grammar_for_use_strict_simple_parameter_list(&mut self, node: Node) -> bool {
         if self.language_version >= ScriptTarget::ES2016 {
             let body = node.body();
@@ -1425,7 +1425,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:757 checkGrammarFunctionLikeDeclaration
+    // Go: checker/grammarchecks.go:758 checkGrammarFunctionLikeDeclaration
     pub fn check_grammar_function_like_declaration(&mut self, node: Node) -> bool {
         // Prevent cascading error by short-circuit
         let file = get_source_file_of_node(node);
@@ -1442,14 +1442,14 @@ impl Checker {
                 && self.check_grammar_for_use_strict_simple_parameter_list(node))
     }
 
-    // Go: checker/grammarchecks.go:766 checkGrammarClassLikeDeclaration
+    // Go: checker/grammarchecks.go:767 checkGrammarClassLikeDeclaration
     pub fn check_grammar_class_like_declaration(&mut self, node: Node) -> bool {
         let file = get_source_file_of_node(node);
         self.check_grammar_class_declaration_heritage_clauses(node, file)
             || self.check_grammar_type_parameter_list(node.type_parameter_list(), file)
     }
 
-    // Go: checker/grammarchecks.go:771 checkGrammarArrowFunction
+    // Go: checker/grammarchecks.go:772 checkGrammarArrowFunction
     pub fn check_grammar_arrow_function(&mut self, node: Node, file: Node) -> bool {
         if !is_arrow_function(node) {
             return false;
@@ -1486,7 +1486,7 @@ impl Checker {
             )
     }
 
-    // Go: checker/grammarchecks.go:795 checkGrammarIndexSignatureParameters
+    // Go: checker/grammarchecks.go:796 checkGrammarIndexSignatureParameters
     pub fn check_grammar_index_signature_parameters(&mut self, node: Node) -> bool {
         let parameters = node.parameter_list();
         let param_nodes = parameters.nodes();
@@ -1580,13 +1580,13 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:839 checkGrammarIndexSignature
+    // Go: checker/grammarchecks.go:840 checkGrammarIndexSignature
     pub fn check_grammar_index_signature(&mut self, node: Node) -> bool {
         // Prevent cascading error by short-circuit
         self.check_grammar_modifiers(node) || self.check_grammar_index_signature_parameters(node)
     }
 
-    // Go: checker/grammarchecks.go:844 checkGrammarForAtLeastOneTypeArgument
+    // Go: checker/grammarchecks.go:845 checkGrammarForAtLeastOneTypeArgument
     pub fn check_grammar_for_at_least_one_type_argument(
         &mut self,
         node: Node,
@@ -1608,7 +1608,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:854 checkGrammarTypeArguments
+    // Go: checker/grammarchecks.go:855 checkGrammarTypeArguments
     pub fn check_grammar_type_arguments(&mut self, node: Node, type_arguments: NodeList) -> bool {
         self.check_grammar_for_disallowed_trailing_comma(
             type_arguments,
@@ -1616,7 +1616,7 @@ impl Checker {
         ) || self.check_grammar_for_at_least_one_type_argument(node, type_arguments)
     }
 
-    // Go: checker/grammarchecks.go:858 checkGrammarTaggedTemplateChain
+    // Go: checker/grammarchecks.go:859 checkGrammarTaggedTemplateChain
     pub fn check_grammar_tagged_template_chain(&mut self, node: Node) -> bool {
         if node.question_dot_token().is_some() || node.flags().intersects(NodeFlags::OPTIONAL_CHAIN)
         {
@@ -1629,7 +1629,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:865 checkGrammarHeritageClause
+    // Go: checker/grammarchecks.go:866 checkGrammarHeritageClause
     pub fn check_grammar_heritage_clause(&mut self, node: Node) -> bool {
         let types = node.types();
         if self.check_grammar_for_disallowed_trailing_comma(types, diag::Trailing_comma_not_allowed)
@@ -1656,7 +1656,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/grammarchecks.go:884 checkGrammarExpressionWithTypeArguments
+    // Go: checker/grammarchecks.go:885 checkGrammarExpressionWithTypeArguments
     pub fn check_grammar_expression_with_type_arguments(
         &mut self,
         node: Node, /*Union[ExpressionWithTypeArguments, TypeQuery]*/
@@ -1674,7 +1674,7 @@ impl Checker {
         self.check_grammar_type_arguments(node, node.type_argument_list())
     }
 
-    // Go: checker/grammarchecks.go:891 checkGrammarClassDeclarationHeritageClauses
+    // Go: checker/grammarchecks.go:892 checkGrammarClassDeclarationHeritageClauses
     pub fn check_grammar_class_declaration_heritage_clauses(
         &mut self,
         node: Node,
@@ -1745,7 +1745,7 @@ impl Checker {
 // Rust port, so this file keeps a private copy (like checker_p06/p17).
 fn file_extension_is_one_of_gc1(path: &str, extensions: &[&str]) -> bool {
     for ext in extensions {
-        // Go: tspath/path.go:1045 FileExtensionIs
+        // Go: tspath/path.go:1095 FileExtensionIs
         if path.len() > ext.len() && path.ends_with(ext) {
             return true;
         }

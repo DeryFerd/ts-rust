@@ -10,7 +10,7 @@ use crate::frontend::prelude::*;
 use std::io;
 use std::time::SystemTime;
 
-// Go: vfs.go:12 FS
+// Go: vfs.go:11 FS
 // FS is a file system abstraction.
 // PORT: Go interface values are shared pointers, so every method takes
 // `&self`. Implementations that cache use interior mutability. Go
@@ -73,7 +73,7 @@ pub trait Fs {
     }
 }
 
-// Go: vfs.go:52 Entries
+// Go: vfs.go:47 Entries
 #[derive(Clone, Debug, Default)]
 pub struct Entries {
     pub files: Vec<String>,
@@ -155,7 +155,7 @@ impl std::ops::BitOrAssign for FileMode {
     }
 }
 
-// Go: vfs.go:68 FileInfo (= io/fs.FileInfo)
+// Go: vfs.go:63 FileInfo (= io/fs.FileInfo)
 // PORT: the Go interface becomes a plain value. `Sys()` is not ported
 // (nothing in scope reads it). `mod_time: None` is the Go zero time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -200,7 +200,7 @@ pub enum DirEntryInfo {
     NotExist,
 }
 
-// Go: vfs.go:65 DirEntry (= io/fs.DirEntry)
+// Go: vfs.go:60 DirEntry (= io/fs.DirEntry)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirEntry {
     pub name: String,
@@ -432,7 +432,7 @@ impl Common {
         }
     }
 
-    // Go: internal.go:144 ReadFile
+    // Go: internal.go:131 ReadFile
     pub fn read_file(&self, path: &str) -> (String, bool) {
         let (fsys, _, rest) = self.root_and_path(path);
         let Some(fsys) = fsys else {
@@ -459,7 +459,7 @@ impl Common {
     }
 }
 
-// Go: internal.go:170 decodeBytes
+// Go: internal.go:157 decodeBytes
 // PORT: takes the bytes instead of a Go string that holds them. Go returns
 // the bytes unchanged, so a Go string can hold invalid UTF-8. A Rust String
 // cannot, so the text is the port form of the Go string
@@ -489,7 +489,7 @@ fn decode_bytes(mut s: Vec<u8>) -> (String, bool) {
     (crate::scanner_util::go_string_from_bytes(s), true)
 }
 
-// Go: internal.go:188 decodeUtf16
+// Go: internal.go:175 decodeUtf16
 // PORT: `order binary.ByteOrder` is `big_endian`. Go `binary.Read` reads
 // len(s)/2 values and ignores an odd last byte; it cannot fail here.
 // `utf16.Decode` replaces unpaired surrogates with U+FFFD, like

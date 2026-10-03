@@ -11,7 +11,7 @@ use crate::frontend::module;
 use crate::frontend::parser;
 use crate::frontend::vfs::Fs as _;
 
-// Go: project/autoimport.go:15 autoImportBuilderFS
+// Go: project/autoimport.go:16 autoImportBuilderFS
 // PORT: the untracked map stores Go nil handles too (Go `LoadOrStore` of a
 // nil `fh` caches the miss), so its values are `Option`.
 pub struct AutoImportBuilderFS {
@@ -27,13 +27,13 @@ impl FileSource for AutoImportBuilderFS {
         self.snapshot_fs_builder.fs.clone()
     }
 
-    // Go: project/autoimport.go:63 FileExists
+    // Go: project/autoimport.go:57 FileExists
     // FileExists implements FileSource.
     fn file_exists(&self, file_name: &str, path: &tspath::Path) -> bool {
         self.snapshot_fs_builder.file_exists(file_name, path)
     }
 
-    // Go: project/autoimport.go:58 GetAccessibleEntries
+    // Go: project/autoimport.go:52 GetAccessibleEntries
     // PORT: after FileExists because the Rust trait lists it last.
     fn get_accessible_entries(&self, path: &str) -> vfs::Entries {
         self.snapshot_fs_builder.get_accessible_entries(path)
@@ -41,14 +41,14 @@ impl FileSource for AutoImportBuilderFS {
 }
 
 impl FileHandleSource for AutoImportBuilderFS {
-    // Go: project/autoimport.go:28 GetFile
+    // Go: project/autoimport.go:29 GetFile
     // GetFile implements FileSource.
     fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>> {
         let path = (self.snapshot_fs_builder.to_path)(file_name);
         self.get_file_by_path(file_name, &path)
     }
 
-    // Go: project/autoimport.go:34 GetFileByPath
+    // Go: project/autoimport.go:35 GetFileByPath
     // GetFileByPath implements FileSource.
     fn get_file_by_path(&self, file_name: &str, path: &tspath::Path) -> Option<Rc<dyn FileHandle>> {
         // We want to avoid long-term caching of files referenced only by auto-imports, so we
@@ -87,7 +87,7 @@ impl FileHandleSource for AutoImportBuilderFS {
 // PORT: no Go counterpart.
 pub type AutoImportParseKeys = RefCell<FxHashMap<tspath::Path, ParseCacheKey>>;
 
-// Go: project/autoimport.go:67 autoImportRegistryCloneHost
+// Go: project/autoimport.go:61 autoImportRegistryCloneHost
 // PORT: `filesMu` is dropped; `files` is written after sharing, so it is a
 // `RefCell`. `kept_files` has no Go counterpart (see `dispose`).
 pub struct AutoImportRegistryCloneHost {
@@ -100,7 +100,7 @@ pub struct AutoImportRegistryCloneHost {
     pub kept_files: Rc<AutoImportParseKeys>,
 }
 
-// Go: project/autoimport.go:79 newAutoImportRegistryCloneHost
+// Go: project/autoimport.go:73 newAutoImportRegistryCloneHost
 // PORT: `kept_files` is the session's `auto_import_parse_keys`.
 pub fn new_auto_import_registry_clone_host(
     project_collection: Rc<ProjectCollection>,
@@ -136,7 +136,7 @@ impl module::ResolutionHost for AutoImportRegistryCloneHost {
         &*self.fs
     }
 
-    // Go: project/autoimport.go:100 GetCurrentDirectory
+    // Go: project/autoimport.go:94 GetCurrentDirectory
     // GetCurrentDirectory implements autoimport.RegistryCloneHost.
     fn get_current_directory(&self) -> &str {
         &self.current_directory
@@ -145,7 +145,7 @@ impl module::ResolutionHost for AutoImportRegistryCloneHost {
 
 // Go: project/autoimport.go:77 `var _ autoimport.RegistryCloneHost = (*autoImportRegistryCloneHost)(nil)`
 impl autoimport::RegistryCloneHost for AutoImportRegistryCloneHost {
-    // Go: project/autoimport.go:105 GetDefaultProject
+    // Go: project/autoimport.go:99 GetDefaultProject
     // GetDefaultProject implements autoimport.RegistryCloneHost.
     // ts#64319: the project ID (Go nil is `None`).
     fn get_default_project(
@@ -166,7 +166,7 @@ impl autoimport::RegistryCloneHost for AutoImportRegistryCloneHost {
         )
     }
 
-    // Go: project/autoimport.go:145 GetProgramForProject
+    // Go: project/autoimport.go:139 GetProgramForProject
     // GetProgramForProject implements autoimport.RegistryCloneHost.
     // ts#64319: Go asserts the `autoimport.ProjectID` to a project `ID`; every
     // Rust `ProjectID` holds an ID string.
@@ -181,7 +181,7 @@ impl autoimport::RegistryCloneHost for AutoImportRegistryCloneHost {
         program
     }
 
-    // Go: project/autoimport.go:114 GetPackageJson
+    // Go: project/autoimport.go:108 GetPackageJson
     // GetPackageJson implements autoimport.RegistryCloneHost.
     fn get_package_json(&self, file_name: &str) -> Option<Rc<packagejson::InfoCacheEntry>> {
         // !!! ref-counted shared cache
@@ -218,7 +218,7 @@ impl autoimport::RegistryCloneHost for AutoImportRegistryCloneHost {
         }))
     }
 
-    // Go: project/autoimport.go:154 GetSourceFile
+    // Go: project/autoimport.go:152 GetSourceFile
     // GetSourceFile implements autoimport.RegistryCloneHost.
     // PORT: Go `*ast.SourceFile` is the file root `Node` (`file.root`).
     fn get_source_file(&self, file_name: &str, path: &tspath::Path) -> Node {
@@ -239,7 +239,7 @@ impl autoimport::RegistryCloneHost for AutoImportRegistryCloneHost {
         result.file.root
     }
 
-    // Go: project/autoimport.go:174 Dispose
+    // Go: project/autoimport.go:172 Dispose
     // Dispose implements autoimport.RegistryCloneHost.
     // PORT: Go derefs every key, and its GC frees the parses. Here a file
     // that the clone parsed is kept for good anyway: the alias resolver

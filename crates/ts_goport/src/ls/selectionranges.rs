@@ -6,10 +6,10 @@ use crate::frontend::scanner::get_trailing_comment_ranges;
 use crate::spanmap::Feature;
 use std::cell::Cell;
 
-// Go: ls/selectionranges.go:15 maxSelectionRangeDepth
+// Go: ls/selectionranges.go:14 maxSelectionRangeDepth
 const MAX_SELECTION_RANGE_DEPTH: usize = 1000;
 
-// Go: ls/selectionranges.go:17 selectionRangeBuilder
+// Go: ls/selectionranges.go:16 selectionRangeBuilder
 // PORT: Go reads the capacity with `cap(b.ranges)`. A Rust `Vec` can hold
 // more than it was asked for, so the capacity is a field.
 struct SelectionRangeBuilder {
@@ -18,7 +18,7 @@ struct SelectionRangeBuilder {
     capacity: usize,
 }
 
-// Go: ls/selectionranges.go:22 newSelectionRangeBuilder
+// Go: ls/selectionranges.go:21 newSelectionRangeBuilder
 fn new_selection_range_builder(capacity: usize) -> SelectionRangeBuilder {
     SelectionRangeBuilder {
         ranges: Vec::with_capacity(capacity),
@@ -28,7 +28,7 @@ fn new_selection_range_builder(capacity: usize) -> SelectionRangeBuilder {
 }
 
 impl SelectionRangeBuilder {
-    // Go: ls/selectionranges.go:28 push
+    // Go: ls/selectionranges.go:27 push
     fn push(&mut self, selection_range: lsproto::Range) {
         if self.ranges.len() < self.capacity {
             self.ranges.push(selection_range);
@@ -39,7 +39,7 @@ impl SelectionRangeBuilder {
         self.oldest_index = (self.oldest_index + 1) % self.ranges.len();
     }
 
-    // Go: ls/selectionranges.go:38 build
+    // Go: ls/selectionranges.go:37 build
     fn build(
         &self,
         mut result: Option<lsproto::SelectionRange>,
@@ -56,7 +56,7 @@ impl SelectionRangeBuilder {
 }
 
 impl LanguageService {
-    // Go: ls/selectionranges.go:49 ProvideSelectionRanges
+    // Go: ls/selectionranges.go:48 ProvideSelectionRanges
     pub fn provide_selection_ranges(
         &self,
         ctx: &Context,
@@ -91,7 +91,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/selectionranges.go:70 getSelectionChildren
+// Go: ls/selectionranges.go:69 getSelectionChildren
 fn get_selection_children(factory: &NodeFactory, node: Node, source_file: Node) -> Vec<Node> {
     if !is_mapped_type_node(node) {
         return get_children_from_non_js_doc_node(node, source_file);
@@ -145,7 +145,7 @@ fn get_selection_children(factory: &NodeFactory, node: Node, source_file: Node) 
     ]
 }
 
-// Go: ls/selectionranges.go:115 groupChildren
+// Go: ls/selectionranges.go:114 groupChildren
 fn group_children(
     factory: &NodeFactory,
     children: &[Node],
@@ -170,7 +170,7 @@ fn group_children(
     result
 }
 
-// Go: ls/selectionranges.go:135 splitChildren
+// Go: ls/selectionranges.go:134 splitChildren
 fn split_children(
     factory: &NodeFactory,
     children: &[Node],
@@ -218,7 +218,7 @@ fn split_children(
     result
 }
 
-// Go: ls/selectionranges.go:180 createSyntaxList
+// Go: ls/selectionranges.go:179 createSyntaxList
 fn create_syntax_list(factory: &NodeFactory, children: &[Node]) -> Node {
     let list = factory.new_syntax_list(children);
     set_node_loc(
@@ -228,7 +228,7 @@ fn create_syntax_list(factory: &NodeFactory, children: &[Node]) -> Node {
     list
 }
 
-// Go: ls/selectionranges.go:186 getSmartSelectionRange
+// Go: ls/selectionranges.go:185 getSmartSelectionRange
 // PORT: Go builds the `*lsproto.SelectionRange` chain in `ranges.build`. The
 // closures share `ranges`, `last_range` and `next` through `RefCell` and
 // `Cell`, as Go closures share the locals. Go returns nil for a

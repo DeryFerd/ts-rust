@@ -7,7 +7,7 @@ use crate::gostd::unicode;
 
 // Port of Go `ls/lsutil/utilities.go`.
 
-// Go: ls/lsutil/utilities.go:16 ProbablyUsesSemicolons
+// Go: ls/lsutil/utilities.go:15 ProbablyUsesSemicolons
 // PORT: Go `visit` is a recursive closure over the counters. Here it is a
 // nested fn that takes them by reference.
 pub fn probably_uses_semicolons(file: Node) -> bool {
@@ -93,7 +93,7 @@ pub fn probably_uses_semicolons(file: Node) -> bool {
     with_semicolon * n_statements_to_observe > without_semicolon
 }
 
-// Go: ls/lsutil/utilities.go:78 ShouldUseUriStyleNodeCoreModules
+// Go: ls/lsutil/utilities.go:77 ShouldUseUriStyleNodeCoreModules
 pub fn should_use_uri_style_node_core_modules(
     file: Node,
     program: &crate::frontend::compiler::NewProgram,
@@ -117,7 +117,7 @@ pub fn should_use_uri_style_node_core_modules(
     program.uses_uri_style_node_core_modules()
 }
 
-// Go: ls/lsutil/utilities.go:92 QuotePreferenceFromString
+// Go: ls/lsutil/utilities.go:91 QuotePreferenceFromString
 pub fn quote_preference_from_string(str: Node) -> QuotePreference {
     if str.token_flags().intersects(TokenFlags::SINGLE_QUOTE) {
         return QuotePreference::SINGLE;
@@ -125,7 +125,7 @@ pub fn quote_preference_from_string(str: Node) -> QuotePreference {
     QuotePreference::DOUBLE
 }
 
-// Go: ls/lsutil/utilities.go:99 GetQuotePreference
+// Go: ls/lsutil/utilities.go:98 GetQuotePreference
 pub fn get_quote_preference(source_file: Node, preferences: &UserPreferences) -> QuotePreference {
     if !preferences.quote_preference.0.is_empty() && preferences.quote_preference.0 != "auto" {
         if preferences.quote_preference.0 == "single" {
@@ -144,7 +144,7 @@ pub fn get_quote_preference(source_file: Node, preferences: &UserPreferences) ->
     QuotePreference::DOUBLE
 }
 
-// Go: ls/lsutil/utilities.go:116 ModuleSymbolToValidIdentifier
+// Go: ls/lsutil/utilities.go:115 ModuleSymbolToValidIdentifier
 // PORT: reading `moduleSymbol.Name` needs the symbol arena, so it is the
 // first parameter (as for Go `ast` functions that take a symbol).
 pub fn module_symbol_to_valid_identifier(
@@ -159,7 +159,7 @@ pub fn module_symbol_to_valid_identifier(
     module_specifier_to_valid_identifier(&module_name, force_capitalize)
 }
 
-// Go: ls/lsutil/utilities.go:120 ModuleSpecifierToValidIdentifier
+// Go: ls/lsutil/utilities.go:123 ModuleSpecifierToValidIdentifier
 // PORT: Go `[]rune(s)` turns invalid UTF-8 into U+FFFD; a Rust `&str` is
 // always valid, so `chars()` gives the same runes.
 pub fn module_specifier_to_valid_identifier(
@@ -205,7 +205,7 @@ pub fn module_specifier_to_valid_identifier(
     format!("_{res_string}")
 }
 
-// Go: ls/lsutil/utilities.go:155 IsNonContextualKeyword
+// Go: ls/lsutil/utilities.go:158 IsNonContextualKeyword
 pub fn is_non_contextual_keyword(token: SyntaxKind) -> bool {
     is_keyword_kind(token) && !is_contextual_keyword(token)
 }

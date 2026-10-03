@@ -176,13 +176,13 @@ impl Checker {
         self.symbols_to_array(symbols)
     }
 
-    // Go: checker/services.go:121 GetExportsOfModule
+    // Go: checker/services.go:132 GetExportsOfModule
     pub fn get_exports_of_module_exported(&mut self, symbol: SymbolId) -> Vec<SymbolId> {
         let exports = self.get_exports_of_module(symbol);
         self.symbols_to_array(exports)
     }
 
-    // Go: checker/services.go:125 ForEachExportAndPropertyOfModule
+    // Go: checker/services.go:136 ForEachExportAndPropertyOfModule
     // PORT: Go ranges over Go maps; the tables keep insertion order.
     pub fn for_each_export_and_property_of_module(
         &mut self,
@@ -224,12 +224,12 @@ impl Checker {
         }
     }
 
-    // Go: checker/services.go:154 IsValidPropertyAccess
+    // Go: checker/services.go:165 IsValidPropertyAccess
     pub fn is_valid_property_access_exported(&mut self, node: Node, property_name: &str) -> bool {
         self.is_valid_property_access(node, property_name)
     }
 
-    // Go: checker/services.go:158 isValidPropertyAccess
+    // Go: checker/services.go:169 isValidPropertyAccess
     pub fn is_valid_property_access(&mut self, node: Node, property_name: &str) -> bool {
         match node.kind() {
             SyntaxKind::PropertyAccessExpression => {
@@ -271,7 +271,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/services.go:170 isValidPropertyAccessWithType
+    // Go: checker/services.go:181 isValidPropertyAccessWithType
     pub fn is_valid_property_access_with_type(
         &mut self,
         node: Node,
@@ -289,7 +289,7 @@ impl Checker {
             && self.is_property_accessible(node, is_super, false /*isWrite*/, t, prop)
     }
 
-    // Go: checker/services.go:188 IsValidPropertyAccessForCompletions
+    // Go: checker/services.go:199 IsValidPropertyAccessForCompletions
     // Checks if an existing property access is valid for completions purposes.
     // node: a property access-like node where we want to check if we can access a property.
     // This node does not need to be an access of the property we are checking.
@@ -315,7 +315,7 @@ impl Checker {
         // Previously we validated the 'this' type of methods but this adversely affected performance. See #31377 for more context.
     }
 
-    // Go: checker/services.go:199 GetAllPossiblePropertiesOfTypes
+    // Go: checker/services.go:210 GetAllPossiblePropertiesOfTypes
     // PORT: Go returns `maps.Values(props)` (random order). The table keeps
     // insertion order.
     pub fn get_all_possible_properties_of_types(&mut self, types: &[TypeId]) -> Vec<SymbolId> {
@@ -345,61 +345,61 @@ impl Checker {
         self.symbols.values(props)
     }
 
-    // Go: checker/services.go:221 IsUnknownSymbol
+    // Go: checker/services.go:232 IsUnknownSymbol
     pub fn is_unknown_symbol(&self, symbol: SymbolId) -> bool {
         symbol == self.unknown_symbol
     }
 
-    // Go: checker/services.go:225 IsUndefinedSymbol
+    // Go: checker/services.go:236 IsUndefinedSymbol
     pub fn is_undefined_symbol(&self, symbol: SymbolId) -> bool {
         symbol == self.undefined_symbol
     }
 
-    // Go: checker/services.go:229 IsArgumentsSymbol
+    // Go: checker/services.go:240 IsArgumentsSymbol
     pub fn is_arguments_symbol(&self, symbol: SymbolId) -> bool {
         symbol == self.arguments_symbol
     }
 
-    // Go: checker/services.go:234 GetNonOptionalType
+    // Go: checker/services.go:245 GetNonOptionalType
     // Originally from services.ts
     pub fn get_non_optional_type(&mut self, t: TypeId) -> TypeId {
         self.remove_optional_type_marker(t)
     }
 
-    // Go: checker/services.go:238 GetStringIndexType
+    // Go: checker/services.go:249 GetStringIndexType
     pub fn get_string_index_type(&mut self, t: TypeId) -> TypeId {
         let string_type = self.string_type;
         self.get_index_type_of_type(t, string_type)
     }
 
-    // Go: checker/services.go:242 GetNumberIndexType
+    // Go: checker/services.go:253 GetNumberIndexType
     pub fn get_number_index_type(&mut self, t: TypeId) -> TypeId {
         let number_type = self.number_type;
         self.get_index_type_of_type(t, number_type)
     }
 
-    // Go: checker/services.go:246 GetElementTypeOfArrayType
+    // Go: checker/services.go:257 GetElementTypeOfArrayType
     pub fn get_element_type_of_array_type_exported(&mut self, t: TypeId) -> TypeId {
         self.get_element_type_of_array_type(t)
     }
 
-    // Go: checker/services.go:250 GetCallSignatures
+    // Go: checker/services.go:261 GetCallSignatures
     pub fn get_call_signatures(&mut self, t: TypeId) -> Vec<SignatureId> {
         self.get_signatures_of_type(t, SignatureKind::CALL).to_vec()
     }
 
-    // Go: checker/services.go:254 GetConstructSignatures
+    // Go: checker/services.go:265 GetConstructSignatures
     pub fn get_construct_signatures(&mut self, t: TypeId) -> Vec<SignatureId> {
         self.get_signatures_of_type(t, SignatureKind::CONSTRUCT)
             .to_vec()
     }
 
-    // Go: checker/services.go:258 GetApparentProperties
+    // Go: checker/services.go:269 GetApparentProperties
     pub fn get_apparent_properties(&mut self, t: TypeId) -> Vec<SymbolId> {
         self.get_augmented_properties_of_type(t)
     }
 
-    // Go: checker/services.go:262 getAugmentedPropertiesOfType
+    // Go: checker/services.go:273 getAugmentedPropertiesOfType
     pub fn get_augmented_properties_of_type(&mut self, t: TypeId) -> Vec<SymbolId> {
         let t = self.get_apparent_type(t);
         let properties = self.get_properties_of_type(t);
@@ -433,7 +433,7 @@ impl Checker {
             .to_vec()
     }
 
-    // Go: checker/services.go:285 TryGetMemberInModuleExportsAndProperties
+    // Go: checker/services.go:296 TryGetMemberInModuleExportsAndProperties
     pub fn try_get_member_in_module_exports_and_properties(
         &mut self,
         member_name: &str,
@@ -457,7 +457,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/services.go:303 TryGetMemberInModuleExports
+    // Go: checker/services.go:314 TryGetMemberInModuleExports
     pub fn try_get_member_in_module_exports(
         &mut self,
         member_name: &str,
@@ -467,7 +467,7 @@ impl Checker {
         self.symbols.get(symbol_table, member_name)
     }
 
-    // Go: checker/services.go:308 shouldTreatPropertiesOfExternalModuleAsExports
+    // Go: checker/services.go:319 shouldTreatPropertiesOfExternalModuleAsExports
     pub fn should_treat_properties_of_external_module_as_exports(
         &self,
         resolved_external_module_type: TypeId,
@@ -485,7 +485,7 @@ impl Checker {
             || self.is_tuple_type(resolved_external_module_type)
     }
 
-    // Go: checker/services.go:316 GetContextualType
+    // Go: checker/services.go:327 GetContextualType
     pub fn get_contextual_type_exported(
         &mut self,
         node: Node,
@@ -499,7 +499,7 @@ impl Checker {
         self.get_contextual_type(node, context_flags)
     }
 
-    // Go: checker/services.go:323 runWithInferenceBlockedFromSourceNode
+    // Go: checker/services.go:334 runWithInferenceBlockedFromSourceNode
     // PORT: no guard restores the flags if `f` panics; Go has no defer here either.
     pub fn run_with_inference_blocked_from_source_node<T>(
         &mut self,
@@ -526,7 +526,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/services.go:344 GetResolvedSignatureForSignatureHelp
+    // Go: checker/services.go:355 GetResolvedSignatureForSignatureHelp
     pub fn get_resolved_signature_for_signature_help(
         &mut self,
         node: Node,
@@ -537,7 +537,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/services.go:356 runWithoutResolvedSignatureCaching
+    // Go: checker/services.go:367 runWithoutResolvedSignatureCaching
     // PORT: Go saves the links by pointer (`map[*SignatureLinks]*Signature`,
     // `map[*ValueSymbolLinks]*Type`). Here the saved values are keyed by
     // node and symbol and written back through the link stores after `f`.
@@ -580,7 +580,7 @@ impl Checker {
         f(self)
     }
 
-    // Go: checker/services.go:385 SkipAlias
+    // Go: checker/services.go:396 SkipAlias
     // PORT: the Go package function `SkipAlias(symbol, checker)`
     // (utilities.go:1622) is already `Checker::skip_alias`, so this method
     // ends in `_exported`.
@@ -591,7 +591,7 @@ impl Checker {
         symbol
     }
 
-    // Go: checker/services.go:392 GetRootSymbols
+    // Go: checker/services.go:403 GetRootSymbols
     pub fn get_root_symbols(&mut self, symbol: SymbolId) -> Vec<SymbolId> {
         let roots = self.get_immediate_root_symbols(symbol);
         if roots.is_empty() {
@@ -604,7 +604,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/services.go:404 GetMappedTypeSymbolOfProperty
+    // Go: checker/services.go:415 GetMappedTypeSymbolOfProperty
     pub fn get_mapped_type_symbol_of_property(&self, symbol: SymbolId) -> SymbolId {
         if let Some(value_links) = self.value_symbol_links.try_get(symbol) {
             return self.ty(value_links.containing_type).symbol;
@@ -612,7 +612,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/services.go:411 getImmediateRootSymbols
+    // Go: checker/services.go:422 getImmediateRootSymbols
     pub fn get_immediate_root_symbols(&mut self, symbol: SymbolId) -> Vec<SymbolId> {
         if self
             .sym(symbol)
@@ -654,7 +654,7 @@ impl Checker {
         Vec::new()
     }
 
-    // Go: checker/services.go:442 tryGetTarget
+    // Go: checker/services.go:453 tryGetTarget
     pub fn try_get_target(&mut self, symbol: SymbolId) -> SymbolId {
         let mut target = SymbolId::NIL;
         let mut next = symbol;
@@ -674,7 +674,7 @@ impl Checker {
         target
     }
 
-    // Go: checker/services.go:461 GetExportSymbolOfSymbol
+    // Go: checker/services.go:472 GetExportSymbolOfSymbol
     pub fn get_export_symbol_of_symbol(&self, symbol: SymbolId) -> SymbolId {
         let export_symbol = self.sym(symbol).export_symbol;
         self.get_merged_symbol(if export_symbol.is_some() {
@@ -684,7 +684,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/services.go:465 GetExportSpecifierLocalTargetSymbol
+    // Go: checker/services.go:476 GetExportSpecifierLocalTargetSymbol
     pub fn get_export_specifier_local_target_symbol(&mut self, node: Node) -> SymbolId {
         // node should be ExportSpecifier | Identifier
         match node.kind() {
@@ -731,7 +731,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/services.go:484 GetShorthandAssignmentValueSymbol
+    // Go: checker/services.go:495 GetShorthandAssignmentValueSymbol
     pub fn get_shorthand_assignment_value_symbol(&mut self, location: Node) -> SymbolId {
         if location.is_some() && location.kind() == SyntaxKind::ShorthandPropertyAssignment {
             return self.resolve_entity_name(
@@ -745,7 +745,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/services.go:497 GetSymbolsOfParameterPropertyDeclaration
+    // Go: checker/services.go:508 GetSymbolsOfParameterPropertyDeclaration
     /**
      * Get symbols that represent parameter-property-declaration as parameter and as property declaration
      * @param parameter a parameterDeclaration node
@@ -777,7 +777,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/services.go:513 IsDeclarationUsed
+    // Go: checker/services.go:524 IsDeclarationUsed
     // IsDeclarationUsed checks if an import declaration identifier is used in the source file.
     // This is primarily used for organizing imports to determine which imports can be removed.
     pub fn is_declaration_used(
@@ -807,7 +807,7 @@ impl Checker {
         self.is_symbol_referenced_in_file(source_file, identifier, symbol)
     }
 
-    // Go: checker/services.go:541 IsSymbolReferencedInFile
+    // Go: checker/services.go:552 IsSymbolReferencedInFile
     // IsSymbolReferencedInFile checks if a symbol is referenced in the source file (besides its definition).
     // This is used as a quick check for whether a symbol is used at all in a file.
     pub fn is_symbol_referenced_in_file(
@@ -848,7 +848,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/services.go:576 GetReferencesToSymbolInFile
+    // Go: checker/services.go:587 GetReferencesToSymbolInFile
     // GetReferencesToSymbolInFile returns all identifier nodes in the file that reference the given symbol.
     pub fn get_references_to_symbol_in_file(
         &mut self,
@@ -891,7 +891,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/services.go:613 getLocalSymbolForExportSpecifier
+    // Go: checker/services.go:624 getLocalSymbolForExportSpecifier
     pub fn get_local_symbol_for_export_specifier(
         &mut self,
         reference_location: Node,
@@ -908,7 +908,7 @@ impl Checker {
     }
 }
 
-// Go: checker/services.go:622 isExportSpecifierAlias
+// Go: checker/services.go:633 isExportSpecifierAlias
 pub fn is_export_specifier_alias(reference_location: Node, export_specifier: Node) -> bool {
     go_assert!(
         export_specifier.property_name() == reference_location
@@ -971,7 +971,7 @@ pub fn get_possible_symbol_reference_positions(
 }
 
 impl Checker {
-    // Go: checker/services.go:689 GetTypeArgumentConstraint
+    // Go: checker/services.go:700 GetTypeArgumentConstraint
     pub fn get_type_argument_constraint_exported(&mut self, node: Node) -> TypeId {
         if !is_type_node(node) {
             return TypeId::NIL;
@@ -979,7 +979,7 @@ impl Checker {
         self.get_type_argument_constraint(node)
     }
 
-    // Go: checker/services.go:697 getUninstantiatedSignatures
+    // Go: checker/services.go:708 getUninstantiatedSignatures
     // getUninstantiatedSignatures gets generic signatures from the function's/constructor's type.
     pub fn get_uninstantiated_signatures(&mut self, node: Node) -> Vec<SignatureId> {
         match node.kind() {
@@ -1012,7 +1012,7 @@ impl Checker {
         Vec::new()
     }
 
-    // Go: checker/services.go:716 getTypeParameterConstraintForPositionAcrossSignatures
+    // Go: checker/services.go:727 getTypeParameterConstraintForPositionAcrossSignatures
     pub fn get_type_parameter_constraint_for_position_across_signatures(
         &mut self,
         signatures: &[SignatureId],
@@ -1033,7 +1033,7 @@ impl Checker {
         self.get_union_type(&relevant_constraints)
     }
 
-    // Go: checker/services.go:731 getTypeArgumentConstraint
+    // Go: checker/services.go:742 getTypeArgumentConstraint
     pub fn get_type_argument_constraint(&mut self, node: Node) -> TypeId {
         let mut type_argument_position: i32 = -1;
         if has_type_arguments(node.parent()) {
@@ -1123,7 +1123,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/services.go:805 IsTypeInvalidDueToUnionDiscriminant
+    // Go: checker/services.go:816 IsTypeInvalidDueToUnionDiscriminant
     pub fn is_type_invalid_due_to_union_discriminant(
         &mut self,
         contextual_type: TypeId,
@@ -1160,7 +1160,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/services.go:830 GetExportsAndPropertiesOfModule
+    // Go: checker/services.go:841 GetExportsAndPropertiesOfModule
     // Unlike `getExportsOfModule`, this includes properties of an `export =` value.
     pub fn get_exports_and_properties_of_module(
         &mut self,
@@ -1179,13 +1179,13 @@ impl Checker {
         exports
     }
 
-    // Go: checker/services.go:842 getExportsOfModuleAsArray
+    // Go: checker/services.go:853 getExportsOfModuleAsArray
     pub fn get_exports_of_module_as_array(&mut self, module_symbol: SymbolId) -> Vec<SymbolId> {
         let exports = self.get_exports_of_module(module_symbol);
         self.symbols_to_array(exports)
     }
 
-    // Go: checker/services.go:847 GetJsxIntrinsicTagNamesAt
+    // Go: checker/services.go:858 GetJsxIntrinsicTagNamesAt
     // Returns all the properties of the Jsx.IntrinsicElements interface.
     // PORT: Go `JsxNames.IntrinsicElements` is the string "IntrinsicElements"
     // (as in jsx_p2.rs).
@@ -1197,12 +1197,12 @@ impl Checker {
         self.get_properties_of_type_exported(intrinsics)
     }
 
-    // Go: checker/services.go:855 GetContextualTypeForJsxAttribute
+    // Go: checker/services.go:866 GetContextualTypeForJsxAttribute
     pub fn get_contextual_type_for_jsx_attribute_exported(&mut self, attribute: Node) -> TypeId {
         self.get_contextual_type_for_jsx_attribute(attribute, ContextFlags::NONE)
     }
 
-    // Go: checker/services.go:888 getResolvedSignatureWorker
+    // Go: checker/services.go:899 getResolvedSignatureWorker
     pub fn get_resolved_signature_worker(
         &mut self,
         node: Node,
@@ -1224,7 +1224,7 @@ impl Checker {
         (res, candidates_out_array)
     }
 
-    // Go: checker/services.go:900 GetCandidateSignaturesForStringLiteralCompletions
+    // Go: checker/services.go:911 GetCandidateSignaturesForStringLiteralCompletions
     pub fn get_candidate_signatures_for_string_literal_completions(
         &mut self,
         call: Node,
@@ -1256,13 +1256,13 @@ impl Checker {
         candidates
     }
 
-    // Go: checker/services.go:925 GetTypeAtPosition
+    // Go: checker/services.go:936 GetTypeAtPosition
     // GetTypeAtPosition returns the type of a parameter at a given index in a signature.
     pub fn get_type_at_position_exported(&mut self, s: SignatureId, pos: i32) -> TypeId {
         self.get_type_at_position(s, pos)
     }
 
-    // Go: checker/services.go:929 GetTypeParameterAtPosition
+    // Go: checker/services.go:940 GetTypeParameterAtPosition
     pub fn get_type_parameter_at_position(&mut self, s: SignatureId, pos: i32) -> TypeId {
         let t = self.get_type_at_position(s, pos);
         if self.ty(t).is_index() {
@@ -1277,7 +1277,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/services.go:942 GetContextualTypeForArrayLiteralAtPosition
+    // Go: checker/services.go:953 GetContextualTypeForArrayLiteralAtPosition
     // GetContextualTypeForArrayLiteralAtPosition returns the contextual type for an element at the given position
     // in an array with the given contextual type.
     pub fn get_contextual_type_for_array_literal_at_position(
@@ -1314,7 +1314,7 @@ impl Checker {
     }
 }
 
-// Go: checker/services.go:970 knownGenericTypeNames
+// Go: checker/services.go:981 knownGenericTypeNames
 static KNOWN_GENERIC_TYPE_NAMES: LazyLock<FxHashSet<&'static str>> = LazyLock::new(|| {
     [
         "Array",
@@ -1342,13 +1342,13 @@ static KNOWN_GENERIC_TYPE_NAMES: LazyLock<FxHashSet<&'static str>> = LazyLock::n
     .collect()
 });
 
-// Go: checker/services.go:993 isKnownGenericTypeName
+// Go: checker/services.go:1004 isKnownGenericTypeName
 pub fn is_known_generic_type_name(name: &str) -> bool {
     KNOWN_GENERIC_TYPE_NAMES.contains(name)
 }
 
 impl Checker {
-    // Go: checker/services.go:998 GetFirstTypeArgumentFromKnownType
+    // Go: checker/services.go:1009 GetFirstTypeArgumentFromKnownType
     pub fn get_first_type_argument_from_known_type(&mut self, t: TypeId) -> TypeId {
         let object_flags = self.ty(t).object_flags;
         let symbol = self.ty(t).symbol;
@@ -1381,7 +1381,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/services.go:1015 GetPropertySymbolsFromContextualType
+    // Go: checker/services.go:1026 GetPropertySymbolsFromContextualType
     // Gets all symbols for one property. Does not get symbols for every property.
     pub fn get_property_symbols_from_contextual_type(
         &mut self,
@@ -1453,7 +1453,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/services.go:1060 GetPropertySymbolOfDestructuringAssignment
+    // Go: checker/services.go:1071 GetPropertySymbolOfDestructuringAssignment
     // Gets the property symbol corresponding to the property in destructuring assignment
     // 'property1' from
     //
@@ -1475,7 +1475,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/services.go:1079 getTypeOfAssignmentPattern
+    // Go: checker/services.go:1090 getTypeOfAssignmentPattern
     // Gets the type of object literal or array literal of destructuring assignment.
     // { a } from
     //
@@ -1579,12 +1579,12 @@ impl Checker {
         )
     }
 
-    // Go: checker/services.go:1109 GetSignatureFromDeclaration
+    // Go: checker/services.go:1120 GetSignatureFromDeclaration
     pub fn get_signature_from_declaration_exported(&mut self, node: Node) -> SignatureId {
         self.get_signature_from_declaration(node)
     }
 
-    // Go: checker/services.go:1114 IsLibSymbolForHoverVerbosity
+    // Go: checker/services.go:1125 IsLibSymbolForHoverVerbosity
     // IsLibSymbolForHoverVerbosity returns true if a symbol is declared in a lib file.
     // PORT: Go `c.program.IsSourceFileDefaultLibrary(sf.Path())` is the
     // program.rs free function over the installed program; `Path()` is the
@@ -1602,7 +1602,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/services.go:1129 IsLibTypeForHoverVerbosity
+    // Go: checker/services.go:1140 IsLibTypeForHoverVerbosity
     // IsLibTypeForHoverVerbosity returns true if a type is declared in a lib file.
     // Don't expand types like Array or Promise, instead treating them as opaque.
     pub fn is_lib_type_for_hover_verbosity(&self, t: TypeId) -> bool {

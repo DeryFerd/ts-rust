@@ -65,13 +65,13 @@ fn count_path_components(path: &str) -> i32 {
     path[initial..].matches('/').count() as i32
 }
 
-// Go: checker/nodebuilderimpl.go:1064 sortedSymbolNamePair
+// Go: checker/nodebuilderimpl.go:1081 sortedSymbolNamePair
 struct SortedSymbolNamePair {
     sym: SymbolId,
     name: String,
 }
 
-// Go: checker/nodebuilderimpl.go:1769 SignatureToSignatureDeclarationOptions
+// Go: checker/nodebuilderimpl.go:1858 SignatureToSignatureDeclarationOptions
 #[derive(Default)]
 pub struct SignatureToSignatureDeclarationOptions {
     pub modifiers: Vec<Node>,
@@ -79,7 +79,7 @@ pub struct SignatureToSignatureDeclarationOptions {
     pub question_token: Node,
 }
 
-// Go: checker/nodebuilderimpl.go:1155 canHaveModuleSpecifier
+// Go: checker/nodebuilderimpl.go:1172 canHaveModuleSpecifier
 pub fn can_have_module_specifier(node: Node) -> bool {
     if node.is_nil() {
         return false;
@@ -100,12 +100,12 @@ pub fn can_have_module_specifier(node: Node) -> bool {
     )
 }
 
-// Go: checker/nodebuilderimpl.go:1176 TryGetModuleSpecifierFromDeclaration
-// Go: checker/nodebuilderimpl.go:1184 tryGetModuleSpecifierFromDeclarationWorker
+// Go: checker/nodebuilderimpl.go:1193 TryGetModuleSpecifierFromDeclaration
+// Go: checker/nodebuilderimpl.go:1201 tryGetModuleSpecifierFromDeclarationWorker
 // PORT: both are already ported as `try_get_module_specifier_from_declaration`
 // in checker/extras.rs. This file calls that function.
 
-// Go: checker/nodebuilderimpl.go:2145 hasTypeAnnotation
+// Go: checker/nodebuilderimpl.go:2234 hasTypeAnnotation
 pub fn has_type_annotation(declaration: Node) -> bool {
     if declaration.is_nil() || declaration.type_().is_nil() {
         return false;
@@ -119,7 +119,7 @@ pub fn has_type_annotation(declaration: Node) -> bool {
 }
 
 impl Checker {
-    // Go: checker/nodebuilderimpl.go:1019 lookupTypeParameterNodes
+    // Go: checker/nodebuilderimpl.go:1036 lookupTypeParameterNodes
     // PORT: `typeParameterSymbolList` is keyed by `SymbolId` for Go
     // `ast.GetSymbolId(symbol)`. The two are one to one.
     pub fn lookup_type_parameter_nodes(
@@ -158,7 +158,7 @@ impl Checker {
         NodeList::NIL
     }
 
-    // Go: checker/nodebuilderimpl.go:1044 lookupSymbolChain
+    // Go: checker/nodebuilderimpl.go:1061 lookupSymbolChain
     pub fn lookup_symbol_chain(
         &mut self,
         b: &Nb,
@@ -171,7 +171,7 @@ impl Checker {
         self.lookup_symbol_chain_worker(b, symbol, meaning, yield_module_symbol)
     }
 
-    // Go: checker/nodebuilderimpl.go:1049 lookupSymbolChainWorker
+    // Go: checker/nodebuilderimpl.go:1066 lookupSymbolChainWorker
     pub fn lookup_symbol_chain_worker(
         &mut self,
         b: &Nb,
@@ -213,7 +213,7 @@ impl Checker {
         chain
     }
 
-    // Go: checker/nodebuilderimpl.go:1070 getSymbolChain
+    // Go: checker/nodebuilderimpl.go:1087 getSymbolChain
     /// `end_of_chain` is false for recursive calls. Non-recursive calls always output something.
     fn get_symbol_chain(
         &mut self,
@@ -338,7 +338,7 @@ impl Checker {
         Vec::new()
     }
 
-    // Go: checker/nodebuilderimpl.go:1136 sortByBestName
+    // Go: checker/nodebuilderimpl.go:1153 sortByBestName
     // PORT: the Go receiver is NodeBuilderImpl but only `b_.ch` is used, so
     // this is a Checker method without `b`.
     fn sort_by_best_name(&mut self, a: &SortedSymbolNamePair, b: &SortedSymbolNamePair) -> i32 {
@@ -360,7 +360,7 @@ impl Checker {
         self.compare_symbols(a.sym, b.sym) // must sort symbols for stable ordering
     }
 
-    // Go: checker/nodebuilderimpl.go:1244 getSpecifierForModuleSymbol
+    // Go: checker/nodebuilderimpl.go:1249 getSpecifierForModuleSymbol
     // PORT: the specifier cache key is `(path, mode)` for Go
     // `module.ModeAwareCacheKey{Name, Mode}`.
     pub fn get_specifier_for_module_symbol(
@@ -527,7 +527,7 @@ impl Checker {
         self.module_specifier_result_for_symbol(b, result, original_import_attributes_type, symbol)
     }
 
-    // Go: checker/nodebuilderimpl.go:1336 moduleSpecifierResultForSymbol
+    // Go: checker/nodebuilderimpl.go:1340 moduleSpecifierResultForSymbol
     pub fn module_specifier_result_for_symbol(
         &mut self,
         b: &Nb,
@@ -548,7 +548,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/nodebuilderimpl.go:1343 moduleSpecifierResolvesToSymbol
+    // Go: checker/nodebuilderimpl.go:1347 moduleSpecifierResolvesToSymbol
     pub fn module_specifier_resolves_to_symbol(
         &mut self,
         b: &Nb,
@@ -575,7 +575,7 @@ impl Checker {
         resolved.is_some() && self.get_merged_symbol(resolved) == self.get_merged_symbol(symbol)
     }
 
-    // Go: checker/nodebuilderimpl.go:1355 createImportAttributesForModuleSpecifier
+    // Go: checker/nodebuilderimpl.go:1359 createImportAttributesForModuleSpecifier
     pub fn create_import_attributes_for_module_specifier(
         &mut self,
         b: &Nb,
@@ -643,7 +643,7 @@ impl Checker {
         f.new_import_attributes(SyntaxKind::WithKeyword, f.new_node_list(&attributes), false)
     }
 
-    // Go: checker/nodebuilderimpl.go:1312 typeParameterToDeclarationWithConstraint
+    // Go: checker/nodebuilderimpl.go:1401 typeParameterToDeclarationWithConstraint
     pub fn type_parameter_to_declaration_with_constraint(
         &mut self,
         b: &Nb,
@@ -677,7 +677,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/nodebuilderimpl.go:1345 setTextRange
+    // Go: checker/nodebuilderimpl.go:1434 setTextRange
     /// Unlike the utilities `setTextRange`, this checks if the `location` we're trying to set on `range` is within the
     /// same file as the active context. If not, the range is not applied. This prevents us from copying ranges across files,
     /// which will confuse the node printer (as it assumes all node ranges are within the current file).
@@ -728,7 +728,7 @@ impl Checker {
         range
     }
 
-    // Go: checker/nodebuilderimpl.go:1379 typeParameterShadowsOtherTypeParameterInScope
+    // Go: checker/nodebuilderimpl.go:1468 typeParameterShadowsOtherTypeParameterInScope
     fn type_parameter_shadows_other_type_parameter_in_scope(
         &mut self,
         b: &Nb,
@@ -748,7 +748,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/nodebuilderimpl.go:1387 typeParameterToName
+    // Go: checker/nodebuilderimpl.go:1476 typeParameterToName
     // PORT: `typeParameterNames` is keyed by `TypeId` for Go `typeParameter.id`.
     pub fn type_parameter_to_name(&mut self, b: &Nb, type_parameter: TypeId) -> Node {
         if nb_flags(b).intersects(NodeBuilderFlags::GENERATE_NAMES_FOR_SHADOWED_TYPE_PARAMS) {
@@ -822,12 +822,12 @@ impl Checker {
         result
     }
 
-    // Go: checker/nodebuilderimpl.go:1433 isMappedTypeHomomorphic
+    // Go: checker/nodebuilderimpl.go:1522 isMappedTypeHomomorphic
     fn is_mapped_type_homomorphic(&mut self, mapped: TypeId) -> bool {
         self.get_homomorphic_type_variable(mapped).is_some()
     }
 
-    // Go: checker/nodebuilderimpl.go:1437 isHomomorphicMappedTypeWithNonHomomorphicInstantiation
+    // Go: checker/nodebuilderimpl.go:1526 isHomomorphicMappedTypeWithNonHomomorphicInstantiation
     fn is_homomorphic_mapped_type_with_non_homomorphic_instantiation(
         &mut self,
         mapped: TypeId,
@@ -838,7 +838,7 @@ impl Checker {
             && self.is_mapped_type_homomorphic(target)
     }
 
-    // Go: checker/nodebuilderimpl.go:1441 createMappedTypeNodeFromType
+    // Go: checker/nodebuilderimpl.go:1530 createMappedTypeNodeFromType
     pub fn create_mapped_type_node_from_type(&mut self, b: &Nb, t: TypeId) -> Node {
         debug_assert!(self.ty(t).flags.intersects(TypeFlags::OBJECT));
         let e = nb_e(b);
@@ -1041,7 +1041,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/nodebuilderimpl.go:1557 typePredicateToTypePredicateNode
+    // Go: checker/nodebuilderimpl.go:1646 typePredicateToTypePredicateNode
     pub fn type_predicate_to_type_predicate_node(
         &mut self,
         b: &Nb,
@@ -1072,7 +1072,7 @@ impl Checker {
             .new_type_predicate_node(asserts_modifier, parameter_name, type_node)
     }
 
-    // Go: checker/nodebuilderimpl.go:1580 typeToTypeNodeHelperWithPossibleReusableTypeNode
+    // Go: checker/nodebuilderimpl.go:1669 typeToTypeNodeHelperWithPossibleReusableTypeNode
     fn type_to_type_node_helper_with_possible_reusable_type_node(
         &mut self,
         b: &Nb,
@@ -1097,7 +1097,7 @@ impl Checker {
         self.type_to_type_node(b, t)
     }
 
-    // Go: checker/nodebuilderimpl.go:1594 typeParameterToDeclaration
+    // Go: checker/nodebuilderimpl.go:1683 typeParameterToDeclaration
     pub fn type_parameter_to_declaration(&mut self, b: &Nb, parameter: TypeId) -> Node {
         let constraint = self.get_constraint_of_type_parameter(parameter);
         let mut constraint_node = Node::NIL;
@@ -1112,12 +1112,12 @@ impl Checker {
         self.type_parameter_to_declaration_with_constraint(b, parameter, constraint_node)
     }
 
-    // Go: checker/nodebuilderimpl.go:1603 symbolToTypeParameterDeclarations
+    // Go: checker/nodebuilderimpl.go:1692 symbolToTypeParameterDeclarations
     pub fn symbol_to_type_parameter_declarations(&mut self, b: &Nb, symbol: SymbolId) -> Vec<Node> {
         self.type_parameters_to_type_parameter_declarations(b, symbol)
     }
 
-    // Go: checker/nodebuilderimpl.go:1607 typeParametersToTypeParameterDeclarations
+    // Go: checker/nodebuilderimpl.go:1696 typeParametersToTypeParameterDeclarations
     pub fn type_parameters_to_type_parameter_declarations(
         &mut self,
         b: &Nb,
@@ -1144,7 +1144,7 @@ impl Checker {
         Vec::new()
     }
 
-    // Go: checker/nodebuilderimpl.go:1626 getEffectiveParameterDeclaration
+    // Go: checker/nodebuilderimpl.go:1715 getEffectiveParameterDeclaration
     // PORT: a free function in Go. It reads symbols, so it is a `&self`
     // Checker method here.
     pub fn get_effective_parameter_declaration(&self, symbol: SymbolId) -> Node {
@@ -1159,7 +1159,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/nodebuilderimpl.go:1637 symbolToParameterDeclaration
+    // Go: checker/nodebuilderimpl.go:1726 symbolToParameterDeclaration
     pub fn symbol_to_parameter_declaration(
         &mut self,
         b: &Nb,
@@ -1226,7 +1226,7 @@ impl Checker {
         parameter_node
     }
 
-    // Go: checker/nodebuilderimpl.go:1674 parameterToParameterDeclarationName
+    // Go: checker/nodebuilderimpl.go:1763 parameterToParameterDeclarationName
     pub(crate) fn parameter_to_parameter_declaration_name(
         &mut self,
         b: &Nb,
@@ -1257,7 +1257,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/nodebuilderimpl.go:1696 cloneBindingName
+    // Go: checker/nodebuilderimpl.go:1785 cloneBindingName
     // PORT: Go keeps one `b.cloneBindingNameVisitor` whose visit function is
     // `b.cloneBindingName`. Here the visitor is built per call, because its
     // callback needs `&mut self`. The checker and `b` travel in the visitor
@@ -1303,7 +1303,7 @@ impl Checker {
         visited
     }
 
-    // Go: checker/nodebuilderimpl.go:1722 serializeTypeForExpression
+    // Go: checker/nodebuilderimpl.go:1811 serializeTypeForExpression
     pub fn serialize_type_for_expression(&mut self, b: &Nb, expr: Node) -> Node {
         // !!! TODO: shim, add node reuse
         let regular = self.get_regular_type_of_expression(expr);
@@ -1313,7 +1313,7 @@ impl Checker {
         self.type_to_type_node(b, t)
     }
 
-    // Go: checker/nodebuilderimpl.go:1728 serializeInferredReturnTypeForSignature
+    // Go: checker/nodebuilderimpl.go:1817 serializeInferredReturnTypeForSignature
     fn serialize_inferred_return_type_for_signature(
         &mut self,
         b: &Nb,
@@ -1345,7 +1345,7 @@ impl Checker {
         return_type_node
     }
 
-    // Go: checker/nodebuilderimpl.go:1748 typePredicateToTypePredicateNodeHelper
+    // Go: checker/nodebuilderimpl.go:1837 typePredicateToTypePredicateNodeHelper
     fn type_predicate_to_type_predicate_node_helper(
         &mut self,
         b: &Nb,
@@ -1379,7 +1379,7 @@ impl Checker {
             .new_type_predicate_node(asserts_modifier, parameter_name, type_node)
     }
 
-    // Go: checker/nodebuilderimpl.go:1775 signatureToSignatureDeclarationHelper
+    // Go: checker/nodebuilderimpl.go:1864 signatureToSignatureDeclarationHelper
     pub fn signature_to_signature_declaration_helper(
         &mut self,
         b: &Nb,
@@ -1612,7 +1612,7 @@ impl Checker {
         node
     }
 
-    // Go: checker/nodebuilderimpl.go:1895 getExpandedParameters
+    // Go: checker/nodebuilderimpl.go:1984 getExpandedParameters
     pub fn get_expanded_parameters(
         &mut self,
         sig: SignatureId,
@@ -1663,7 +1663,7 @@ impl Checker {
         vec![sig_parameters]
     }
 
-    // Go: checker/nodebuilderimpl.go:1900 getExpandedParameters.getUniqAssociatedNamesFromTupleType
+    // Go: checker/nodebuilderimpl.go:1989 getExpandedParameters.getUniqAssociatedNamesFromTupleType
     // PORT: a Go closure inside getExpandedParameters. It captures nothing
     // but `c`, so it is a private method. The name has a prefix because
     // checker.go has a different function with the Go name.
@@ -1711,7 +1711,7 @@ impl Checker {
         names
     }
 
-    // Go: checker/nodebuilderimpl.go:1939 getExpandedParameters.expandSignatureParametersWithTupleMembers
+    // Go: checker/nodebuilderimpl.go:2028 getExpandedParameters.expandSignatureParametersWithTupleMembers
     // PORT: a Go closure inside getExpandedParameters. `sig.parameters` is
     // passed in as `sig_parameters`. The name has a prefix because
     // checker.go has a different function with the Go name.
@@ -1754,7 +1754,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/nodebuilderimpl.go:1983 tryGetThisParameterDeclaration
+    // Go: checker/nodebuilderimpl.go:2072 tryGetThisParameterDeclaration
     fn try_get_this_parameter_declaration(&mut self, b: &Nb, signature: SignatureId) -> Node {
         let (this_parameter, declaration) = {
             let s = self.sig(signature);
@@ -1779,7 +1779,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/nodebuilderimpl.go:2006 serializeReturnTypeForSignature
+    // Go: checker/nodebuilderimpl.go:2095 serializeReturnTypeForSignature
     /// Serializes the return type of the signature by first trying to use the syntactic printer if possible and falling back to the checker type if not.
     // PORT: `enclosingSymbolTypes` is keyed by `SymbolId` for Go
     // `ast.GetSymbolId(symbol)`. The pseudochecker result is held in an
@@ -1882,7 +1882,7 @@ impl Checker {
         return_type_node
     }
 
-    // Go: checker/nodebuilderimpl.go:2061 isTriviallySerializableComputedName
+    // Go: checker/nodebuilderimpl.go:2150 isTriviallySerializableComputedName
     fn is_trivially_serializable_computed_name(&mut self, b: &Nb, e: Node) -> bool {
         let shape_good = e.is_some()
             && e.name().is_some()
@@ -1899,7 +1899,7 @@ impl Checker {
             == SymbolAccessibility::ACCESSIBLE
     }
 
-    // Go: checker/nodebuilderimpl.go:2070 indexInfoToObjectComputedNamesOrSignatureDeclaration
+    // Go: checker/nodebuilderimpl.go:2159 indexInfoToObjectComputedNamesOrSignatureDeclaration
     pub fn index_info_to_object_computed_names_or_signature_declaration(
         &mut self,
         b: &Nb,
@@ -1979,7 +1979,7 @@ impl Checker {
         vec![self.index_info_to_index_signature_declaration_helper(b, index_info, type_node)]
     }
 
-    // Go: checker/nodebuilderimpl.go:2121 indexInfoToIndexSignatureDeclarationHelper
+    // Go: checker/nodebuilderimpl.go:2210 indexInfoToIndexSignatureDeclarationHelper
     pub fn index_info_to_index_signature_declaration_helper(
         &mut self,
         b: &Nb,

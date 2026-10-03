@@ -137,7 +137,7 @@ pub static KNOWN_RECURSIVE_SEARCH_PACKAGES: LazyLock<FxHashSet<&'static str>> =
         .collect()
     });
 
-// Go: ls/autoimport/registry.go:81 newProgramStructure
+// Go: ls/autoimport/registry.go:86 newProgramStructure
 go_enum!(NewProgramStructure, i32 {
     FALSE = 0; // newProgramStructureFalse
     SAME_FILE_NAMES = 1; // newProgramStructureSameFileNames
@@ -198,7 +198,7 @@ fn copy_resolver_options(opts: &module::ResolverOptions) -> module::ResolverOpti
     }
 }
 
-// Go: ls/autoimport/registry.go:93 bucketBuildPreferences
+// Go: ls/autoimport/registry.go:98 bucketBuildPreferences
 // bucketBuildPreferences holds user preferences that affect how a bucket is
 // built. When any of these change between builds, the bucket must be rebuilt.
 // Adding a new preference here automatically integrates it into the rebuild
@@ -209,7 +209,7 @@ pub struct BucketBuildPreferences {
     pub auto_import_entrypoint_directory_search: Tristate,
 }
 
-// Go: ls/autoimport/registry.go:98 bucketBuildPreferencesFromUserPreferences
+// Go: ls/autoimport/registry.go:103 bucketBuildPreferencesFromUserPreferences
 pub fn bucket_build_preferences_from_user_preferences(
     prefs: &lsutil::UserPreferences,
 ) -> BucketBuildPreferences {
@@ -220,7 +220,7 @@ pub fn bucket_build_preferences_from_user_preferences(
 }
 
 impl BucketBuildPreferences {
-    // Go: ls/autoimport/registry.go:105 Equal
+    // Go: ls/autoimport/registry.go:110 Equal
     pub fn equal(&self, other: &BucketBuildPreferences) -> bool {
         unordered_equal(&self.file_exclude_patterns, &other.file_exclude_patterns)
             && self.auto_import_entrypoint_directory_search
@@ -235,7 +235,7 @@ impl BucketBuildPreferences {
     }
 }
 
-// Go: ls/autoimport/registry.go:124 BucketState
+// Go: ls/autoimport/registry.go:129 BucketState
 // BucketState represents the dirty state of a bucket.
 // In general, a bucket can be used for an auto-imports request if it is clean
 // or if the only edited file is the one that was requested for auto-imports.
@@ -286,7 +286,7 @@ impl BucketState {
         b
     }
 
-    // Go: ls/autoimport/registry.go:158 Dirty
+    // Go: ls/autoimport/registry.go:163 Dirty
     pub fn dirty(&self) -> bool {
         self.multiple_files_dirty
             || !self.dirty_file.is_empty()
@@ -294,7 +294,7 @@ impl BucketState {
             || set_len(self.dirty_packages.as_ref()) > 0
     }
 
-    // Go: ls/autoimport/registry.go:162 DirtyFile
+    // Go: ls/autoimport/registry.go:167 DirtyFile
     pub fn dirty_file_exported(&self) -> tspath::Path {
         if self.multiple_files_dirty {
             return tspath::Path::default();
@@ -302,7 +302,7 @@ impl BucketState {
         self.dirty_file.clone()
     }
 
-    // Go: ls/autoimport/registry.go:169 DirtyPackages
+    // Go: ls/autoimport/registry.go:174 DirtyPackages
     pub fn dirty_packages_exported(&self) -> Option<&FxHashSet<String>> {
         if self.multiple_files_dirty {
             return None;
@@ -310,12 +310,12 @@ impl BucketState {
         self.dirty_packages.as_ref()
     }
 
-    // Go: ls/autoimport/registry.go:176 RecursiveSearchPackages
+    // Go: ls/autoimport/registry.go:181 RecursiveSearchPackages
     pub fn recursive_search_packages_exported(&self) -> Option<&FxHashSet<String>> {
         self.recursive_search_packages.as_ref()
     }
 
-    // Go: ls/autoimport/registry.go:180 possiblyNeedsRebuildForFile
+    // Go: ls/autoimport/registry.go:185 possiblyNeedsRebuildForFile
     pub fn possibly_needs_rebuild_for_file(
         &self,
         file: &tspath::Path,
@@ -329,13 +329,13 @@ impl BucketState {
             || set_len(self.dirty_packages.as_ref()) > 0
     }
 
-    // Go: ls/autoimport/registry.go:187 hasDirtyFileBesides
+    // Go: ls/autoimport/registry.go:192 hasDirtyFileBesides
     pub fn has_dirty_file_besides(&self, file: &tspath::Path) -> bool {
         self.multiple_files_dirty || !self.dirty_file.is_empty() && self.dirty_file != *file
     }
 }
 
-// Go: ls/autoimport/registry.go:195 recursiveSearchSubset
+// Go: ls/autoimport/registry.go:200 recursiveSearchSubset
 // recursiveSearchSubset reports whether target is a subset of current.
 // nil represents "all packages" — a superset of every concrete set.
 // Returns true if the current set already covers everything the target needs,
@@ -355,7 +355,7 @@ pub fn recursive_search_subset(
     set_is_subset_of(target, current)
 }
 
-// Go: ls/autoimport/registry.go:207 RegistryBucket
+// Go: ls/autoimport/registry.go:212 RegistryBucket
 // PORT: see the file header. Go nil maps that are only read are empty maps
 // (`paths`, `ambient_module_names`); `package_files` keeps nil (`None`)
 // because Go tests it.
@@ -411,7 +411,7 @@ pub struct RegistryBucket {
     pub index: Option<Rc<RefCell<Index<Rc<Export>>>>>,
 }
 
-// Go: ls/autoimport/registry.go:258 newRegistryBucket
+// Go: ls/autoimport/registry.go:263 newRegistryBucket
 pub fn new_registry_bucket() -> Rc<RegistryBucket> {
     Rc::new(RegistryBucket {
         state: RefCell::new(BucketState {
@@ -437,7 +437,7 @@ impl RegistryBucket {
         })
     }
 
-    // Go: ls/autoimport/registry.go:282 markProjectFileDirty
+    // Go: ls/autoimport/registry.go:287 markProjectFileDirty
     // markProjectFileDirty should only be called within a Change call on the dirty map.
     // Buckets are considered immutable once in a finalized registry. Should only
     // be used for project buckets.
@@ -450,7 +450,7 @@ impl RegistryBucket {
         }
     }
 
-    // Go: ls/autoimport/registry.go:294 markNodeModulesDirty
+    // Go: ls/autoimport/registry.go:299 markNodeModulesDirty
     // markNodeModulesDirty should only be called within a Change call on the dirty map.
     // Buckets are considered immutable once in a finalized registry. If packageName is
     // non-empty, that package is marked for granular update. Otherwise, the entire bucket
@@ -482,7 +482,7 @@ impl dirty::Cloneable for Rc<RegistryBucket> {
     }
 }
 
-// Go: ls/autoimport/registry.go:309 directory
+// Go: ls/autoimport/registry.go:314 directory
 #[derive(Clone, Debug, Default)]
 pub struct Directory {
     pub name: String,
@@ -507,7 +507,7 @@ impl dirty::Cloneable for Rc<RefCell<Directory>> {
     }
 }
 
-// Go: ls/autoimport/registry.go:323 Registry
+// Go: ls/autoimport/registry.go:328 Registry
 // PORT: Go `func(fileName string) tspath.Path` is `Rc<dyn Fn(&str) -> tspath::Path>`.
 // Go `*collections.SyncMap[tspath.Path, string]` specifier caches are
 // `Rc<RefCell<FxHashMap<tspath::Path, String>>>` (shared between registries).
@@ -529,7 +529,7 @@ pub struct Registry {
     pub specifier_cache: FxHashMap<tspath::Path, Rc<RefCell<FxHashMap<tspath::Path, String>>>>,
 }
 
-// Go: ls/autoimport/registry.go:341 NewRegistry
+// Go: ls/autoimport/registry.go:346 NewRegistry
 // PORT: map-ls-completions 2.5 returns the value; callers share it as
 // `Rc<Registry>`.
 pub fn new_registry(
@@ -549,7 +549,7 @@ pub fn new_registry(
 }
 
 impl Registry {
-    // Go: ls/autoimport/registry.go:349 IsPreparedForImportingFile
+    // Go: ls/autoimport/registry.go:354 IsPreparedForImportingFile
     // PORT: Go allows a nil receiver; `r` is `None` for it.
     pub fn is_prepared_for_importing_file(
         r: Option<&Registry>,
@@ -592,7 +592,7 @@ impl Registry {
         true
     }
 
-    // Go: ls/autoimport/registry.go:378 NodeModulesDirectories
+    // Go: ls/autoimport/registry.go:383 NodeModulesDirectories
     pub fn node_modules_directories(&self) -> FxHashMap<tspath::Path, String> {
         let mut dirs: FxHashMap<tspath::Path, String> = FxHashMap::default();
         for (dir_path, dir) in &self.directories {
@@ -649,7 +649,7 @@ impl Registry {
     }
 }
 
-// Go: ls/autoimport/registry.go:412 BucketStats
+// Go: ls/autoimport/registry.go:417 BucketStats
 #[derive(Clone, Debug, Default)]
 pub struct BucketStats {
     pub name: String,
@@ -660,7 +660,7 @@ pub struct BucketStats {
     pub package_names: Option<FxHashSet<String>>,
 }
 
-// Go: ls/autoimport/registry.go:421 CacheStats
+// Go: ls/autoimport/registry.go:426 CacheStats
 #[derive(Clone, Debug, Default)]
 pub struct CacheStats {
     pub project_buckets: Vec<BucketStats>,
@@ -669,7 +669,7 @@ pub struct CacheStats {
 }
 
 impl Registry {
-    // Go: ls/autoimport/registry.go:427 GetCacheStats
+    // Go: ls/autoimport/registry.go:432 GetCacheStats
     // PORT: Go returns `*CacheStats`; the port returns the value.
     pub fn get_cache_stats(&self) -> CacheStats {
         let mut stats = CacheStats {
@@ -734,7 +734,7 @@ impl Registry {
     }
 }
 
-// Go: ls/autoimport/registry.go:482 RegistryChange
+// Go: ls/autoimport/registry.go:487 RegistryChange
 // PORT: Go `collections.Set[lsproto.DocumentUri]` values are `FxHashSet`;
 // Go `*lsutil.UserPreferences` is `Option` (nil is `None`).
 #[derive(Clone, Debug, Default)]
@@ -768,7 +768,7 @@ pub fn should_stop_build(ctx: &Context) -> bool {
     ctx.err().is_some() && ctx.value(&DISCARD_ON_CANCEL_KEY).is_some()
 }
 
-// Go: ls/autoimport/registry.go:495 RegistryCloneHost
+// Go: ls/autoimport/registry.go:500 RegistryCloneHost
 // PORT: Go embeds `module.ResolutionHost` and repeats its `FS()`; both come
 // from the supertrait (`fs`, `get_current_directory`). Go
 // `*compiler.Program` is `Rc<compiler::NewProgram>` (nil is `None`), Go
@@ -787,7 +787,7 @@ pub trait RegistryCloneHost: module::ResolutionHost {
     fn dispose(&self);
 }
 
-// Go: ls/autoimport/registry.go:505 registryBuilder
+// Go: ls/autoimport/registry.go:510 registryBuilder
 // PORT: Go `*dirty.Map` / `*dirty.MapBuilder` are the `Rc` handles that
 // `dirty::new_map` / `dirty::new_map_builder` return.
 pub struct RegistryBuilder {
@@ -817,7 +817,7 @@ pub struct RegistryBuilder {
     >,
 }
 
-// Go: ls/autoimport/registry.go:520 newRegistryBuilder
+// Go: ls/autoimport/registry.go:525 newRegistryBuilder
 // PORT: the dirty maps copy their base maps (see `dirty::new_map`); Go shares them.
 pub fn new_registry_builder(
     registry: Rc<Registry>,
@@ -847,7 +847,7 @@ pub fn new_registry_builder(
 }
 
 impl RegistryBuilder {
-    // Go: ls/autoimport/registry.go:535 Build
+    // Go: ls/autoimport/registry.go:540 Build
     pub fn build(&self) -> Rc<Registry> {
         Rc::new(Registry {
             to_path: self.base.to_path.clone(),
@@ -861,7 +861,7 @@ impl RegistryBuilder {
         })
     }
 
-    // Go: ls/autoimport/registry.go:548 updateBucketAndDirectoryExistence
+    // Go: ls/autoimport/registry.go:553 updateBucketAndDirectoryExistence
     pub fn update_bucket_and_directory_existence(
         &self,
         change: &RegistryChange,
@@ -1072,7 +1072,7 @@ impl RegistryBuilder {
         }
     }
 
-    // Go: ls/autoimport/registry.go:698 markBucketsDirty
+    // Go: ls/autoimport/registry.go:707 markBucketsDirty
     // PORT: Go ranges over the clean-bucket maps while deleting the current
     // key; the port ranges over a copy of the keys, which visits the same keys.
     pub fn mark_buckets_dirty(
@@ -1239,14 +1239,14 @@ impl RegistryBuilder {
         mark_files_dirty(&change.changed);
     }
 
-    // Go: ls/autoimport/registry.go:782 updateIndexes
+    // Go: ls/autoimport/registry.go:791 updateIndexes
     pub fn update_indexes(
         &mut self,
         ctx: &Context,
         change: &RegistryChange,
         logger: &Option<Rc<logging::LogTree>>,
     ) {
-        // Go: ls/autoimport/registry.go:783 nodeModulesBucketTask
+        // Go: ls/autoimport/registry.go:792 nodeModulesBucketTask
         struct NodeModulesBucketTask {
             entry: Rc<dirty::MapEntry<tspath::Path, Rc<RegistryBucket>>>,
             dependency_names: Option<FxHashSet<String>>,
@@ -1794,7 +1794,7 @@ impl RegistryBuilder {
     }
 }
 
-// Go: ls/autoimport/registry.go:1119 hasNewNonNodeModulesFiles
+// Go: ls/autoimport/registry.go:1137 hasNewNonNodeModulesFiles
 // PORT: Go `program` can be nil; it is read only for a
 // `newProgramStructureDifferentFileNames` bucket, where nil panics as in Go.
 pub fn has_new_non_node_modules_files(
@@ -1819,7 +1819,7 @@ pub fn has_new_non_node_modules_files(
     false
 }
 
-// Go: ls/autoimport/registry.go:1134 isIgnoredFile
+// Go: ls/autoimport/registry.go:1152 isIgnoredFile
 // PORT: only `FileName()` and `Path()` are read, so the program's
 // `ParsedSourceFile` is passed (see the file header).
 pub fn is_ignored_file(program: &compiler::NewProgram, file: &ParsedSourceFile) -> bool {
@@ -1827,7 +1827,7 @@ pub fn is_ignored_file(program: &compiler::NewProgram, file: &ParsedSourceFile) 
         || ls_program::is_global_typings_file(program, file.file_name())
 }
 
-// Go: ls/autoimport/registry.go:1141 hasSymlinkToNodeModules
+// Go: ls/autoimport/registry.go:1159 hasSymlinkToNodeModules
 // hasSymlinkToNodeModules checks if a file's realpath has a symlink that points
 // to a node_modules directory. This is used to skip files in the project bucket
 // that would be duplicated by the node_modules bucket via their symlink.
@@ -1883,7 +1883,7 @@ pub fn has_symlink_to_node_modules(
     found
 }
 
-// Go: ls/autoimport/registry.go:1192 failedAmbientModuleLookupSource
+// Go: ls/autoimport/registry.go:1210 failedAmbientModuleLookupSource
 // PORT: Go `mu sync.Mutex` is dropped (one thread).
 #[derive(Clone, Debug, Default)]
 pub struct FailedAmbientModuleLookupSource {
@@ -1891,7 +1891,7 @@ pub struct FailedAmbientModuleLookupSource {
     pub package_name: String,
 }
 
-// Go: ls/autoimport/registry.go:1198 bucketBuildResult
+// Go: ls/autoimport/registry.go:1216 bucketBuildResult
 // PORT: Go `error` is `Option<GoError>`; Go nil sync maps and sets are
 // `None`.
 pub struct BucketBuildResult {
@@ -1932,7 +1932,7 @@ fn new_bucket_build_result(
 }
 
 impl RegistryBuilder {
-    // Go: ls/autoimport/registry.go:1215 buildProjectBucket
+    // Go: ls/autoimport/registry.go:1234 buildProjectBucket
     // PORT: Go `result.bucket = &RegistryBucket{}` comes first and its fields
     // are set at the end; the port makes the bucket at the end (nothing reads
     // it in between). `getChecker` is `create_checker_pool` (serial).
@@ -2070,7 +2070,7 @@ impl RegistryBuilder {
         close_pool();
     }
 
-    // Go: ls/autoimport/registry.go:1299 computeDependenciesForNodeModulesDirectory
+    // Go: ls/autoimport/registry.go:1321 computeDependenciesForNodeModulesDirectory
     // PORT: Go returns a `*collections.Set[string]`; nil is `None`.
     pub fn compute_dependencies_for_node_modules_directory(
         &self,
@@ -2128,7 +2128,7 @@ impl RegistryBuilder {
     }
 }
 
-// Go: ls/autoimport/registry.go:1334 discoveredPackage
+// Go: ls/autoimport/registry.go:1356 discoveredPackage
 // discoveredPackage represents a package found during the discovery phase.
 // It holds the resolved package.json and realpath for deduplication.
 // When both a real package and a corresponding @types package exist (e.g., react + @types/react),
@@ -2145,7 +2145,7 @@ pub struct DiscoveredPackage {
     pub is_local: bool,         // true if realpath is within the workspace root
 }
 
-// Go: ls/autoimport/registry.go:1347 perPackageExtractionResult
+// Go: ls/autoimport/registry.go:1369 perPackageExtractionResult
 // perPackageExtractionResult holds the extraction output for one physical package.
 // Produced once per unique realpath during the extraction phase, then installed
 // into every bucket that needs it during the bucket-building phase.
@@ -2165,7 +2165,7 @@ pub struct PerPackageExtractionResult {
     pub failed_ambient_module_lookup_targets: Rc<RefCell<IndexSet<String>>>,
 }
 
-// Go: ls/autoimport/registry.go:1361 packageExtractionResult
+// Go: ls/autoimport/registry.go:1383 packageExtractionResult
 // packageExtractionResult holds the results of extracting exports from a set of packages.
 pub struct PackageExtractionResult {
     pub exports: IndexMap<tspath::Path, Vec<Rc<Export>>>,
@@ -2181,7 +2181,7 @@ pub struct PackageExtractionResult {
 }
 
 impl RegistryBuilder {
-    // Go: ls/autoimport/registry.go:1375 discoverBucketPackages
+    // Go: ls/autoimport/registry.go:1397 discoverBucketPackages
     // discoverBucketPackages resolves the package.json and realpath for each package name
     // in a node_modules directory. This is the discovery phase of the three-phase extraction pipeline.
     // PORT: `ctx` is the port's, for `should_stop_build` (Go has no context
@@ -2261,7 +2261,7 @@ impl RegistryBuilder {
         result
     }
 
-    // Go: ls/autoimport/registry.go:1422 extractPackage
+    // Go: ls/autoimport/registry.go:1444 extractPackage
     // extractPackage extracts exports from a single package.json.
     // This runs once per unique realpath during the extraction phase.
     // Returns nil if the package has no extractable entrypoints.
@@ -2502,7 +2502,7 @@ impl RegistryBuilder {
     }
 }
 
-// Go: ls/autoimport/registry.go:1553 installExtractions
+// Go: ls/autoimport/registry.go:1575 installExtractions
 // installExtractions aggregates pre-extracted per-package results into a single
 // packageExtractionResult for one bucket. This is the install phase of the three-phase pipeline.
 pub fn install_extractions(
@@ -2593,7 +2593,7 @@ pub fn install_extractions(
 }
 
 impl RegistryBuilder {
-    // Go: ls/autoimport/registry.go:1602 buildNodeModulesBucket
+    // Go: ls/autoimport/registry.go:1624 buildNodeModulesBucket
     pub fn build_node_modules_bucket(
         &self,
         ctx: &Context,
@@ -2729,7 +2729,7 @@ impl RegistryBuilder {
         result.err = ctx.err();
     }
 
-    // Go: ls/autoimport/registry.go:1691 updateNodeModulesBucket
+    // Go: ls/autoimport/registry.go:1713 updateNodeModulesBucket
     // updateNodeModulesBucket performs a granular update of the node_modules bucket,
     // re-extracting only the dirty packages and merging with the existing bucket.
     pub fn update_node_modules_bucket(
@@ -2910,7 +2910,7 @@ impl RegistryBuilder {
         result.err = ctx.err();
     }
 
-    // Go: ls/autoimport/registry.go:1810 getNearestAncestorDirectoryWithPackageJson
+    // Go: ls/autoimport/registry.go:1832 getNearestAncestorDirectoryWithPackageJson
     pub fn get_nearest_ancestor_directory_with_package_json(
         &self,
         file_path: &tspath::Path,
@@ -2938,7 +2938,7 @@ impl RegistryBuilder {
             .0
     }
 
-    // Go: ls/autoimport/registry.go:1819 resolveAmbientModuleName
+    // Go: ls/autoimport/registry.go:1841 resolveAmbientModuleName
     pub fn resolve_ambient_module_name(
         &self,
         module_name: &str,

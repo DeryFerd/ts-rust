@@ -7,19 +7,19 @@
 
 use crate::ls::prelude::*;
 
-// Go: ls/file_rename.go:20 pathUpdater
+// Go: ls/file_rename.go:22 pathUpdater
 // PORT: a Go func type. `createPathUpdater` returns it boxed; other functions
 // take it as `&PathUpdater`.
 pub type PathUpdater<'a> = dyn Fn(&str) -> (String, bool) + 'a;
 
-// Go: ls/file_rename.go:22 toImport
+// Go: ls/file_rename.go:24 toImport
 #[derive(Clone, Debug, Default)]
 pub struct ToImport {
     pub new_file_name: String,
     pub updated: bool,
 }
 
-// Go: ls/file_rename.go:27 movedFile
+// Go: ls/file_rename.go:29 movedFile
 #[derive(Clone, Debug, Default)]
 pub struct MovedFile {
     pub source_file: Node,
@@ -27,7 +27,7 @@ pub struct MovedFile {
 }
 
 impl LanguageService {
-    // Go: ls/file_rename.go:27 GetEditsForFileRename
+    // Go: ls/file_rename.go:34 GetEditsForFileRename
     pub fn get_edits_for_file_rename(
         &self,
         ctx: &Context,
@@ -133,7 +133,7 @@ impl LanguageService {
         new_path_updater(self.use_case_sensitive_file_names(), old_path, new_path)
     }
 
-    // Go: ls/file_rename.go:94 updateTsconfigFiles
+    // Go: ls/file_rename.go:112 updateTsconfigFiles
     pub fn update_tsconfig_files(
         &self,
         program: &compiler::NewProgram,
@@ -263,7 +263,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/file_rename.go:159 updatePathsProperty
+// Go: ls/file_rename.go:177 updatePathsProperty
 pub fn update_paths_property(
     config_file: Node,
     config_dir: &str,
@@ -293,7 +293,7 @@ pub fn update_paths_property(
     found_exact_match
 }
 
-// Go: ls/file_rename.go:172 tryUpdateConfigString
+// Go: ls/file_rename.go:190 tryUpdateConfigString
 pub fn try_update_config_string(
     config_file: Node,
     config_dir: &str,
@@ -366,7 +366,7 @@ fn new_path_updater(
 }
 
 impl LanguageService {
-    // Go: ls/file_rename.go:190 updateRelativePath
+    // Go: ls/file_rename.go:208 updateRelativePath
     pub fn update_relative_path(
         &self,
         old_to_new: &PathUpdater<'_>,
@@ -389,7 +389,7 @@ impl LanguageService {
         )
     }
 
-    // Go: ls/file_rename.go:199 updateImportsForFileRename
+    // Go: ls/file_rename.go:217 updateImportsForFileRename
     pub fn update_imports_for_file_rename(
         &self,
         program: &compiler::NewProgram,
@@ -464,7 +464,7 @@ impl LanguageService {
         }
     }
 
-    // Go: ls/file_rename.go:233 getUpdatedImportSpecifier
+    // Go: ls/file_rename.go:258 getUpdatedImportSpecifier
     // We assume the source file did not move to a different program.
     // PORT: Go passes the program as the `ModuleSpecifierGenerationHost`;
     // here that is `modulespecifiers::ProgramHost` (the installed program).
@@ -538,7 +538,7 @@ impl LanguageService {
     }
 }
 
-// Go: ls/file_rename.go:282 getSourceFileToImport
+// Go: ls/file_rename.go:308 getSourceFileToImport
 // PORT: Go returns `*toImport`; nil is `None`.
 pub fn get_source_file_to_import(
     program: &compiler::NewProgram,
@@ -569,7 +569,7 @@ pub fn get_source_file_to_import(
     None
 }
 
-// Go: ls/file_rename.go:301 getUpdatedImportSpecifierFromMovedSourceFiles
+// Go: ls/file_rename.go:327 getUpdatedImportSpecifierFromMovedSourceFiles
 // As a fall back for unresolved modules, we'll check every file affected by the rename to see if any of them would match
 // the import specifier, and if so, we'll obtain the updated specifier for that file.
 // PORT: Go passes the program as the `ModuleSpecifierGenerationHost`; here
@@ -619,7 +619,7 @@ pub fn get_updated_import_specifier_from_moved_source_files(
     String::new()
 }
 
-// Go: ls/file_rename.go:341 createStringTextRange
+// Go: ls/file_rename.go:362 createStringTextRange
 pub fn create_string_text_range(source_file: Node, node: Node) -> TextRange {
     TextRange::new(
         get_token_pos_of_node(node, source_file, false) + 1,
@@ -627,7 +627,7 @@ pub fn create_string_text_range(source_file: Node, node: Node) -> TextRange {
     )
 }
 
-// Go: ls/file_rename.go:345 getTsConfigObjectLiteralExpression
+// Go: ls/file_rename.go:366 getTsConfigObjectLiteralExpression
 // PORT: Go returns `*ast.ObjectLiteralExpression`; nil is `Node::NIL`.
 pub fn get_ts_config_object_literal_expression(ts_config_source_file: Node) -> Node {
     if ts_config_source_file.is_some()
@@ -642,7 +642,7 @@ pub fn get_ts_config_object_literal_expression(ts_config_source_file: Node) -> N
     Node::NIL
 }
 
-// Go: ls/file_rename.go:355 forEachObjectProperty
+// Go: ls/file_rename.go:376 forEachObjectProperty
 // PORT: Go `cb func(property *ast.PropertyAssignment, propertyName string)`.
 pub fn for_each_object_property(object_literal: Node, cb: &mut dyn FnMut(Node, &str)) {
     if object_literal.is_nil() {
@@ -659,7 +659,7 @@ pub fn for_each_object_property(object_literal: Node, cb: &mut dyn FnMut(Node, &
     }
 }
 
-// Go: ls/file_rename.go:369 relativePathFromDirectory
+// Go: ls/file_rename.go:390 relativePathFromDirectory
 pub fn relative_path_from_directory(
     from_directory: &str,
     to: &str,
@@ -675,7 +675,7 @@ pub fn relative_path_from_directory(
     )
 }
 
-// Go: ls/file_rename.go:373 relativeImportPathFromDirectory
+// Go: ls/file_rename.go:394 relativeImportPathFromDirectory
 pub fn relative_import_path_from_directory(
     from_directory: &str,
     to: &str,
@@ -688,7 +688,7 @@ pub fn relative_import_path_from_directory(
     ))
 }
 
-// Go: ls/file_rename.go:377 isAmbientModuleSymbol
+// Go: ls/file_rename.go:398 isAmbientModuleSymbol
 // PORT: Go reads `symbol.Declarations` without a checker; the symbol arena
 // is the first parameter, as for ast helpers that take a symbol.
 pub fn is_ambient_module_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {

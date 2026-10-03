@@ -5,7 +5,7 @@
 use crate::prelude::*;
 
 impl Checker {
-    // Go: checker/checker.go:17614 getBindingElementTypeFromParentType
+    // Go: checker/checker.go:18043 getBindingElementTypeFromParentType
     pub fn get_binding_element_type_from_parent_type(
         &mut self,
         declaration: Node,
@@ -170,7 +170,7 @@ impl Checker {
         self.widen_type_inferred_from_initializer(declaration, union)
     }
 
-    // Go: checker/checker.go:17699 getRestType
+    // Go: checker/checker.go:18128 getRestType
     pub fn get_rest_type(
         &mut self,
         source: TypeId,
@@ -257,7 +257,7 @@ impl Checker {
     //
     // We construct a synthetic element access expression corresponding to 'obj.x' such that the control
     // flow analyzer doesn't have to handle all the different syntactic forms.
-    // Go: checker/checker.go:17756 getFlowTypeOfDestructuring
+    // Go: checker/checker.go:18185 getFlowTypeOfDestructuring
     pub fn get_flow_type_of_destructuring(&mut self, node: Node, declared_type: TypeId) -> TypeId {
         let reference = self.get_synthetic_element_access(node);
         if reference.is_some() {
@@ -266,7 +266,7 @@ impl Checker {
         declared_type
     }
 
-    // Go: checker/checker.go:17764 getSyntheticElementAccess
+    // Go: checker/checker.go:18193 getSyntheticElementAccess
     pub fn get_synthetic_element_access(&mut self, node: Node) -> Node {
         let parent_access = self.get_parent_element_access(node);
         if parent_access.is_some() && get_flow_node_of_node(parent_access).is_some() {
@@ -298,7 +298,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:17789 getParentElementAccess
+    // Go: checker/checker.go:18218 getParentElementAccess
     pub fn get_parent_element_access(&mut self, node: Node) -> Node {
         let ancestor = node.parent().parent();
         match ancestor.kind() {
@@ -319,7 +319,7 @@ impl Checker {
     // used as the contextual type of an initializer associated with the binding pattern. Also, for a destructuring
     // parameter with no type annotation or initializer, the type implied by the binding pattern becomes the type of
     // the parameter.
-    // Go: checker/checker.go:17811 getTypeFromBindingPattern
+    // Go: checker/checker.go:18240 getTypeFromBindingPattern
     pub fn get_type_from_binding_pattern(
         &mut self,
         pattern: Node,
@@ -349,7 +349,7 @@ impl Checker {
     }
 
     // Return the type implied by an object binding pattern
-    // Go: checker/checker.go:17828 getTypeFromObjectBindingPattern
+    // Go: checker/checker.go:18257 getTypeFromObjectBindingPattern
     pub fn get_type_from_object_binding_pattern(
         &mut self,
         pattern: Node,
@@ -408,7 +408,7 @@ impl Checker {
     }
 
     // Return the type implied by an array binding pattern
-    // Go: checker/checker.go:17864 getTypeFromArrayBindingPattern
+    // Go: checker/checker.go:18293 getTypeFromArrayBindingPattern
     pub fn get_type_from_array_binding_pattern(
         &mut self,
         pattern: Node,
@@ -475,7 +475,7 @@ impl Checker {
     // Return the type implied by a binding pattern element. This is the type of the initializer of the element if
     // one is present. Otherwise, if the element is itself a binding pattern, it is the type implied by the binding
     // pattern. Otherwise, it is the type any.
-    // Go: checker/checker.go:17913 getTypeFromBindingElement
+    // Go: checker/checker.go:18342 getTypeFromBindingElement
     pub fn get_type_from_binding_element(
         &mut self,
         element: Node,
@@ -520,7 +520,7 @@ impl Checker {
         self.any_type
     }
 
-    // Go: checker/checker.go:17940 declarationBelongsToPrivateAmbientMember
+    // Go: checker/checker.go:18369 declarationBelongsToPrivateAmbientMember
     pub fn declaration_belongs_to_private_ambient_member(&self, declaration: Node) -> bool {
         let mut member_declaration = get_root_declaration(declaration);
         if is_parameter_declaration(member_declaration) {
@@ -529,7 +529,7 @@ impl Checker {
         is_private_within_ambient(member_declaration)
     }
 
-    // Go: checker/checker.go:17948 getTypeOfPrototypeProperty
+    // Go: checker/checker.go:18377 getTypeOfPrototypeProperty
     pub fn get_type_of_prototype_property(&mut self, prototype: SymbolId) -> TypeId {
         // TypeScript 1.0 spec (April 2014): 8.4
         // Every class automatically contains a static property member named 'prototype',
@@ -553,7 +553,7 @@ impl Checker {
     // PORT: Go `thisAssignmentDeclarationKind` consts (checker.go:17961) are
     // generated in `crate::flags` as `ThisAssignmentDeclarationKind`.
 
-    // Go: checker/checker.go:17970 getWidenedTypeForAssignmentDeclaration
+    // Go: checker/checker.go:18399 getWidenedTypeForAssignmentDeclaration
     pub fn get_widened_type_for_assignment_declaration(&mut self, symbol: SymbolId) -> TypeId {
         let mut t = TypeId::NIL;
         let (kind, location) = self.is_constructor_declared_this_property(symbol);
@@ -636,7 +636,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:18023 getAssignmentDeclarationInitializerType
+    // Go: checker/checker.go:18452 getAssignmentDeclarationInitializerType
     pub fn get_assignment_declaration_initializer_type(&mut self, node: Node) -> TypeId {
         if is_binary_expression(node) {
             let t: TypeId;
@@ -676,7 +676,7 @@ impl Checker {
     //
     //	const f: { (): void, a: string[] } = () => {};
     //	f.a = [];
-    // Go: checker/checker.go:18054 hasParentWithTypeAnnotation
+    // Go: checker/checker.go:18483 hasParentWithTypeAnnotation
     pub fn has_parent_with_type_annotation(&mut self, symbol: SymbolId) -> bool {
         let parent = self.sym(symbol).parent;
         if parent.is_some() {
@@ -697,7 +697,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:18063 containsSameNamedThisProperty
+    // Go: checker/checker.go:18492 containsSameNamedThisProperty
     pub fn contains_same_named_this_property(
         &mut self,
         this_property: Node,
@@ -715,7 +715,7 @@ impl Checker {
         visit(self, this_property, expression)
     }
 
-    // Go: checker/checker.go:18077 getTypeFromPropertyDescriptor
+    // Go: checker/checker.go:18506 getTypeFromPropertyDescriptor
     pub fn get_type_from_property_descriptor(&mut self, node: Node) -> TypeId {
         let object_literal_type = self.check_expression_cached(node);
         let value_type = self.get_type_of_property_of_type(object_literal_type, "value");
@@ -742,7 +742,7 @@ impl Checker {
     // A property is considered a constructor declared property when all declaration sites are this.xxx assignments,
     // when no declaration sites have JSDoc type annotations, and when at least one declaration site is in the body of
     // a class constructor.
-    // Go: checker/checker.go:18098 isConstructorDeclaredThisProperty
+    // Go: checker/checker.go:18527 isConstructorDeclaredThisProperty
     pub fn is_constructor_declared_this_property(
         &mut self,
         symbol: SymbolId,
@@ -801,7 +801,7 @@ impl Checker {
         (kind, location)
     }
 
-    // Go: checker/checker.go:18143 isGlobalSymbolConstructor
+    // Go: checker/checker.go:18572 isGlobalSymbolConstructor
     pub fn is_global_symbol_constructor(&mut self, node: Node) -> bool {
         let symbol = self.get_symbol_of_node(node);
         let global_symbol = (self
@@ -810,7 +810,7 @@ impl Checker {
         global_symbol.is_some() && symbol == global_symbol
     }
 
-    // Go: checker/checker.go:18149 widenTypeForVariableLikeDeclaration
+    // Go: checker/checker.go:18578 widenTypeForVariableLikeDeclaration
     pub fn widen_type_for_variable_like_declaration(
         &mut self,
         t: TypeId,
@@ -858,7 +858,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:18182 reportImplicitAny
+    // Go: checker/checker.go:18611 reportImplicitAny
     pub fn report_implicit_any(
         &mut self,
         declaration: Node,
@@ -1028,12 +1028,12 @@ impl Checker {
         );
     }
 
-    // Go: checker/checker.go:18262 getWidenedType
+    // Go: checker/checker.go:18695 getWidenedType
     pub fn get_widened_type(&mut self, t: TypeId) -> TypeId {
         self.get_widened_type_with_context(t, None /*context*/)
     }
 
-    // Go: checker/checker.go:18266 getWidenedTypeWithContext
+    // Go: checker/checker.go:18699 getWidenedTypeWithContext
     // PORT: Go `*WideningContext` is `Option<Rc<RefCell<WideningContext>>>`
     // (nil is `None`).
     pub fn get_widened_type_with_context(
@@ -1122,7 +1122,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:18307 getWidenedTypeOfObjectLiteral
+    // Go: checker/checker.go:18740 getWidenedTypeOfObjectLiteral
     pub fn get_widened_type_of_object_literal(
         &mut self,
         t: TypeId,
@@ -1187,7 +1187,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:18339 getWidenedProperty
+    // Go: checker/checker.go:18772 getWidenedProperty
     pub fn get_widened_property(
         &mut self,
         prop: SymbolId,
@@ -1213,7 +1213,7 @@ impl Checker {
 }
 
 impl WideningContext {
-    // Go: checker/checker.go:18357 WideningContext.getChildContext
+    // Go: checker/checker.go:18790 WideningContext.getChildContext
     // PORT: the child keeps a `Weak` to its parent, so this takes the
     // parent's `Rc` instead of `&self`. Call as
     // `WideningContext::get_child_context(&ctx, name)`.
@@ -1237,7 +1237,7 @@ impl WideningContext {
 }
 
 impl Checker {
-    // Go: checker/checker.go:18369 getPropertiesOfContext
+    // Go: checker/checker.go:18802 getPropertiesOfContext
     // PORT: Go tests `resolvedProperties == nil`. The Rust field is a `Vec`,
     // so an empty result is computed again on the next call. The inputs are
     // cached, so the result is the same.
@@ -1265,7 +1265,7 @@ impl Checker {
         context.borrow().resolved_properties.clone()
     }
 
-    // Go: checker/checker.go:18384 getSiblingsOfContext
+    // Go: checker/checker.go:18817 getSiblingsOfContext
     // PORT: Go tests `siblings == nil`. The Rust field is a `Vec`, so an
     // empty result is computed again on the next call. The inputs are
     // cached, so the result is the same.
@@ -1299,7 +1299,7 @@ impl Checker {
         context.borrow().siblings.clone()
     }
 
-    // Go: checker/checker.go:18400 getUndefinedProperty
+    // Go: checker/checker.go:18833 getUndefinedProperty
     pub fn get_undefined_property(&mut self, prop: SymbolId) -> SymbolId {
         let name = self.sym(prop).name.to_string();
         if let Some(&cached) = self.undefined_properties.get(&name) {
@@ -1314,7 +1314,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:18410 getTypeOfEnumMember
+    // Go: checker/checker.go:18843 getTypeOfEnumMember
     pub fn get_type_of_enum_member(&mut self, symbol: SymbolId) -> TypeId {
         if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
             let t = self.get_declared_type_of_enum_member(symbol);
@@ -1323,7 +1323,7 @@ impl Checker {
         self.value_symbol_links.get(symbol).resolved_type
     }
 
-    // Go: checker/checker.go:18418 getTypeOfAccessors
+    // Go: checker/checker.go:18851 getTypeOfAccessors
     pub fn get_type_of_accessors(&mut self, symbol: SymbolId) -> TypeId {
         if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
             if !self.push_type_resolution(
@@ -1431,7 +1431,7 @@ impl Checker {
         self.value_symbol_links.get(symbol).resolved_type
     }
 
-    // Go: checker/checker.go:18473 getWriteTypeOfAccessors
+    // Go: checker/checker.go:18906 getWriteTypeOfAccessors
     pub fn get_write_type_of_accessors(&mut self, symbol: SymbolId) -> TypeId {
         if self.value_symbol_links.get(symbol).write_type.is_nil() {
             if !self.push_type_resolution(
@@ -1476,7 +1476,7 @@ impl Checker {
         self.value_symbol_links.get(symbol).write_type
     }
 
-    // Go: checker/checker.go:18505 getTypeOfAlias
+    // Go: checker/checker.go:18938 getTypeOfAlias
     pub fn get_type_of_alias(&mut self, symbol: SymbolId) -> TypeId {
         if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
             if !self.push_type_resolution(

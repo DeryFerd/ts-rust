@@ -13,7 +13,7 @@
 use crate::astdata::NodeData;
 use crate::prelude::*;
 
-// Go: binder/binder.go:44 ExpandoAssignmentInfo
+// Go: binder/binder.go:45 ExpandoAssignmentInfo
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExpandoAssignmentInfo {
     pub node: Node,
@@ -21,7 +21,7 @@ pub struct ExpandoAssignmentInfo {
     pub block_scope_container: Node,
 }
 
-// Go: binder/binder.go:50 Binder
+// Go: binder/binder.go:51 Binder
 //
 // PORT: `bindFunc` (a cached closure over `b.bind`) is not stored; callers
 // use a closure over `self.bind` at the call site. `symbolArena` becomes
@@ -79,7 +79,7 @@ pub struct Binder {
     pub common_js_module_indicator: Node,
 }
 
-// Go: binder/binder.go:85 ActiveLabel
+// Go: binder/binder.go:84 ActiveLabel
 #[derive(Clone, Debug, Default)]
 pub struct ActiveLabel {
     pub next: Option<Rc<RefCell<ActiveLabel>>>,
@@ -90,12 +90,12 @@ pub struct ActiveLabel {
 }
 
 impl ActiveLabel {
-    // Go: binder/binder.go:93 BreakTarget
+    // Go: binder/binder.go:92 BreakTarget
     pub fn break_target_exported(&self) -> FlowNodeId {
         self.break_target
     }
 
-    // Go: binder/binder.go:94 ContinueTarget
+    // Go: binder/binder.go:93 ContinueTarget
     pub fn continue_target_exported(&self) -> FlowNodeId {
         self.continue_target
     }
@@ -128,8 +128,8 @@ impl FlowNode {
     }
 }
 
-// Go: binder/binder.go:96 BindSourceFile
-// Go: binder/binder.go:121 bindSourceFile
+// Go: binder/binder.go:95 BindSourceFile
+// Go: binder/binder.go:120 bindSourceFile
 //
 // PORT: `getBinder`/`putBinder` (a sync.Pool) are not needed. `symbols` is
 // the program-wide arena; it is moved into the binder and moved back when
@@ -604,7 +604,7 @@ impl Binder {
 }
 
 impl Binder {
-    // Go: binder/binder.go:134 newSymbol
+    // Go: binder/binder.go:132 newSymbol
     pub fn new_symbol(&mut self, flags: SymbolFlags, name: impl Into<Name>) -> SymbolId {
         self.symbol_count += 1;
         self.symbols.new_symbol(flags, name)
@@ -618,7 +618,7 @@ impl Binder {
      * @param includes - The SymbolFlags that node has in addition to its declaration type (eg: export, ambient, etc.)
      * @param excludes - The flags which node cannot be declared alongside in a symbol table. Used to report forbidden declarations.
      */
-    // Go: binder/binder.go:150 declareSymbol
+    // Go: binder/binder.go:148 declareSymbol
     pub fn declare_symbol(
         &mut self,
         symbol_table: SymbolTable,
@@ -638,7 +638,7 @@ impl Binder {
         )
     }
 
-    // Go: binder/binder.go:154 declareSymbolEx
+    // Go: binder/binder.go:152 declareSymbolEx
     pub fn declare_symbol_ex(
         &mut self,
         symbol_table: SymbolTable,
@@ -853,7 +853,7 @@ impl Binder {
 
     // Should not be called on a declaration with a computed property name,
     // unless it is a well known Symbol.
-    // Go: binder/binder.go:306 getDeclarationName
+    // Go: binder/binder.go:301 getDeclarationName
     // PORT: returns the interned name, so a declaration interns its text once
     // and allocates nothing for an identifier name. `&mut self` only to note
     // a private identifier name in the arena (`note_private_name`).
@@ -1905,7 +1905,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:818 declareModuleSymbol
+    // Go: binder/binder.go:821 declareModuleSymbol
     pub fn declare_module_symbol(&mut self, node: Node) -> ModuleInstanceState {
         let state = get_module_instance_state(node);
         let instantiated = state != ModuleInstanceState::NON_INSTANTIATED;
@@ -1925,7 +1925,7 @@ impl Binder {
         state
     }
 
-    // Go: binder/binder.go:825 bindNamespaceExportDeclaration
+    // Go: binder/binder.go:828 bindNamespaceExportDeclaration
     pub fn bind_namespace_export_declaration(&mut self, node: Node) {
         if !node.modifiers().is_nil() {
             self.error_on_node(node, diag::Modifiers_cannot_appear_here, vec![]);
@@ -1962,7 +1962,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:841 bindImportClause
+    // Go: binder/binder.go:844 bindImportClause
     pub fn bind_import_clause(&mut self, node: Node) {
         if node.name().is_some() {
             self.declare_symbol_and_add_to_symbol_table(
@@ -1973,7 +1973,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:847 bindExportDeclaration
+    // Go: binder/binder.go:850 bindExportDeclaration
     pub fn bind_export_declaration(&mut self, node: Node) {
         let export_clause = node.export_clause();
         let container_symbol = self.node_symbol(self.container);
@@ -2003,7 +2003,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:860 bindExportAssignment
+    // Go: binder/binder.go:863 bindExportAssignment
     pub fn bind_export_assignment(&mut self, node: Node) {
         let container = self.container;
         let container_symbol = self.node_symbol(container);
@@ -2029,7 +2029,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:877 bindJsxAttributes
+    // Go: binder/binder.go:880 bindJsxAttributes
     pub fn bind_jsx_attributes(&mut self, node: Node) {
         self.bind_anonymous_declaration(
             node,
@@ -2038,7 +2038,7 @@ impl Binder {
         );
     }
 
-    // Go: binder/binder.go:881 bindJsxAttribute
+    // Go: binder/binder.go:884 bindJsxAttribute
     pub fn bind_jsx_attribute(
         &mut self,
         node: Node,
@@ -2048,7 +2048,7 @@ impl Binder {
         self.declare_symbol_and_add_to_symbol_table(node, symbol_flags, symbol_excludes);
     }
 
-    // Go: binder/binder.go:885 setExportContextFlag
+    // Go: binder/binder.go:888 setExportContextFlag
     pub fn set_export_context_flag(&mut self, node: Node) {
         // A declaration source file or ambient module declaration that contains no export declarations (but possibly regular
         // declarations with export modifiers) is an export context in which declarations are implicitly exported.
@@ -2061,7 +2061,7 @@ impl Binder {
         }
     }
 
-    // Go: binder/binder.go:895 hasExportDeclarations
+    // Go: binder/binder.go:898 hasExportDeclarations
     pub fn has_export_declarations(&self, node: Node) -> bool {
         let mut statements: Vec<Node> = Vec::new();
         match node.kind() {

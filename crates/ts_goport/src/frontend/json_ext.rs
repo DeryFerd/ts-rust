@@ -1519,7 +1519,7 @@ pub fn unmarshal_struct_fields(
     }
 }
 
-// Go: internal/json/json.go:41 MarshalIndent with
+// Go: internal/json/json.go:40 MarshalIndent with
 // jsontext.WithIndentPrefix(prefix) and jsontext.WithIndent(indent):
 // multiline output, a space after each colon, no space after commas, no
 // newline inside an empty object or array, no trailing newline.

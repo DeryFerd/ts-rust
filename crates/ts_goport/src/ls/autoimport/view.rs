@@ -100,7 +100,7 @@ pub fn new_view(
 }
 
 impl View {
-    // Go: ls/autoimport/view.go:50 getAllowedEndings
+    // Go: ls/autoimport/view.go:58 getAllowedEndings
     pub fn get_allowed_endings(&self) -> Vec<modulespecifiers::ModuleSpecifierEnding> {
         if self.allowed_endings.borrow().is_none() {
             let resolution_mode =
@@ -126,7 +126,7 @@ impl View {
     }
 }
 
-// Go: ls/autoimport/view.go:65 QueryKind
+// Go: ls/autoimport/view.go:73 QueryKind
 go_enum!(QueryKind, i32 {
     WORD_PREFIX = 0; // QueryKindWordPrefix
     EXACT_MATCH = 1; // QueryKindExactMatch
@@ -134,7 +134,7 @@ go_enum!(QueryKind, i32 {
 });
 
 impl View {
-    // Go: ls/autoimport/view.go:73 Search
+    // Go: ls/autoimport/view.go:81 Search
     // PORT: `search_exported`, because Go also has the unexported `search`.
     // Go `bucket.Index` is a pointer; a nil index panics as in Go.
     pub fn search_exported(&self, query: &str, kind: QueryKind) -> Vec<Rc<Export>> {
@@ -155,7 +155,7 @@ impl View {
         self.search(&search_fn)
     }
 
-    // Go: ls/autoimport/view.go:90 SearchByExportID
+    // Go: ls/autoimport/view.go:98 SearchByExportID
     pub fn search_by_export_id(&self, id: &ExportID) -> Vec<Rc<Export>> {
         let search = |bucket: &RegistryBucket| -> Vec<Rc<Export>> {
             let index = bucket
@@ -174,7 +174,7 @@ impl View {
         self.search(&search)
     }
 
-    // Go: ls/autoimport/view.go:100 search
+    // Go: ls/autoimport/view.go:108 search
     // PORT: Go `*collections.Set[string]` `allowedPackages` is
     // `Option<FxHashSet<String>>` (`None` is nil).
     pub fn search(
@@ -274,7 +274,7 @@ impl View {
     }
 }
 
-// Go: ls/autoimport/view.go:167 FixAndExport
+// Go: ls/autoimport/view.go:175 FixAndExport
 #[derive(Clone, Debug)]
 pub struct FixAndExport {
     pub fix: Rc<Fix>,

@@ -135,7 +135,7 @@ impl Message {
         Ok(())
     }
 
-    // Go: jsonrpc.go:80 MarshalJSON
+    // Go: jsonrpc.go:76 MarshalJSON
     // PORT: Go returns bytes. The text is in the port form (see
     // `scanner_util::GO_STRING_MARKER`), so its Go bytes are returned.
     pub fn marshal_json(&self) -> Result<Vec<u8>, GoError> {
@@ -199,7 +199,7 @@ impl UnmarshalerFrom for RawMessage {
     }
 }
 
-// Go: jsonrpc.go:84 RequestMessage
+// Go: jsonrpc.go:80 RequestMessage
 #[derive(Debug, Default)]
 pub struct RequestMessage {
     pub jsonrpc: crate::jsonrpc::JSONRPCVersion,
@@ -295,7 +295,7 @@ impl UnmarshalerFrom for RawRequestMessage {
     }
 }
 
-// Go: jsonrpc.go:125 ResponseMessage
+// Go: jsonrpc.go:118 ResponseMessage
 // PORT: `id` has no omitzero in Go, so a nil id writes `null`.
 #[derive(Debug, Default)]
 pub struct ResponseMessage {

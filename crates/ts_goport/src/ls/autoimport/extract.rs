@@ -661,7 +661,7 @@ impl SymbolExtractor<'_> {
         (Some(export), target_symbol)
     }
 
-    // Go: ls/autoimport/extract.go:368 tryResolveSymbol
+    // Go: ls/autoimport/extract.go:366 tryResolveSymbol
     pub fn try_resolve_symbol(
         &mut self,
         symbol: SymbolId,
@@ -746,7 +746,7 @@ impl SymbolExtractor<'_> {
     }
 }
 
-// Go: ls/autoimport/extract.go:412 shouldIgnoreSymbol
+// Go: ls/autoimport/extract.go:410 shouldIgnoreSymbol
 // PORT: the arena parameter as in `try_get_module_id_and_file_name_of_module_symbol`.
 pub fn should_ignore_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
     if symbols.sym(symbol).flags.intersects(SymbolFlags::PROTOTYPE) {
@@ -755,7 +755,7 @@ pub fn should_ignore_symbol(symbols: &SymbolArena, symbol: SymbolId) -> bool {
     false
 }
 
-// Go: ls/autoimport/extract.go:419 getSyntax
+// Go: ls/autoimport/extract.go:417 getSyntax
 // PORT: the arena parameter as in `try_get_module_id_and_file_name_of_module_symbol`.
 pub fn get_syntax(symbols: &SymbolArena, symbol: SymbolId) -> ExportSyntax {
     for &decl in symbols.sym(symbol).declarations.iter() {
@@ -794,7 +794,7 @@ pub fn get_syntax(symbols: &SymbolArena, symbol: SymbolId) -> ExportSyntax {
     ExportSyntax::NONE
 }
 
-// Go: ls/autoimport/extract.go:450 isUnusableName
+// Go: ls/autoimport/extract.go:448 isUnusableName
 pub fn is_unusable_name(name: &str) -> bool {
     name.is_empty()
         || name == "_default"
@@ -803,7 +803,7 @@ pub fn is_unusable_name(name: &str) -> bool {
         || name == INTERNAL_SYMBOL_NAME_EXPORT_EQUALS
 }
 
-// Go: ls/autoimport/extract.go:463 fileNameForDefaultExportName
+// Go: ls/autoimport/extract.go:461 fileNameForDefaultExportName
 // fileNameForDefaultExportName returns the best file name to use when deriving
 // a fallback identifier for a default-like export. It prefers the target symbol's
 // source file (closest to the export origin), falls back to the module's original

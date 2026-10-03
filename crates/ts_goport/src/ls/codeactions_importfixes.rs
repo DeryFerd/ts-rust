@@ -18,7 +18,7 @@ use crate::ls::prelude::*;
 use crate::frontend::core_ls_ext::compare_booleans;
 use std::sync::LazyLock;
 
-// Go: ls/codeactions_importfixes.go:21 importFixErrorCodes
+// Go: ls/codeactions_importfixes.go:20 importFixErrorCodes
 // PORT: `diagnostics.X.Code()` is `int32`; `Message::code` is `u32`.
 static IMPORT_FIX_ERROR_CODES: LazyLock<Vec<i32>> = LazyLock::new(|| {
     vec![
@@ -46,10 +46,10 @@ static IMPORT_FIX_ERROR_CODES: LazyLock<Vec<i32>> = LazyLock::new(|| {
     ]
 });
 
-// Go: ls/codeactions_importfixes.go:46 importFixID
+// Go: ls/codeactions_importfixes.go:45 importFixID
 const IMPORT_FIX_ID: &str = "fixMissingImport";
 
-// Go: ls/codeactions_importfixes.go:50 ImportFixProvider
+// Go: ls/codeactions_importfixes.go:49 ImportFixProvider
 // ImportFixProvider is the CodeFixProvider for import-related fixes
 pub static IMPORT_FIX_PROVIDER: LazyLock<CodeFixProvider> = LazyLock::new(|| CodeFixProvider {
     error_codes: IMPORT_FIX_ERROR_CODES.clone(),
@@ -58,7 +58,7 @@ pub static IMPORT_FIX_PROVIDER: LazyLock<CodeFixProvider> = LazyLock::new(|| Cod
     get_all_code_actions: Some(get_all_import_code_actions),
 });
 
-// Go: ls/codeactions_importfixes.go:57 fixInfo
+// Go: ls/codeactions_importfixes.go:56 fixInfo
 #[derive(Clone)]
 struct FixInfo {
     fix: Rc<autoimport::Fix>,
@@ -67,7 +67,7 @@ struct FixInfo {
     is_jsx_namespace_fix: bool,
 }
 
-// Go: ls/codeactions_importfixes.go:64 getImportCodeActions
+// Go: ls/codeactions_importfixes.go:63 getImportCodeActions
 fn get_import_code_actions(
     ctx: &Context,
     fix_context: &CodeFixContext<'_>,
@@ -109,7 +109,7 @@ fn get_import_code_actions(
     Ok(actions)
 }
 
-// Go: ls/codeactions_importfixes.go:94 getAllImportCodeActions
+// Go: ls/codeactions_importfixes.go:95 getAllImportCodeActions
 fn get_all_import_code_actions(
     ctx: &Context,
     fix_context: &CodeFixContext<'_>,
@@ -178,7 +178,7 @@ fn get_all_import_code_actions(
     }))
 }
 
-// Go: ls/codeactions_importfixes.go:151 addImportFromDiagnostic
+// Go: ls/codeactions_importfixes.go:152 addImportFromDiagnostic
 // addImportFromDiagnostic finds the best import fix for a diagnostic and adds it to the adder.
 fn add_import_from_diagnostic(
     ctx: &Context,
@@ -203,7 +203,7 @@ fn add_import_from_diagnostic(
     Ok(())
 }
 
-// Go: ls/codeactions_importfixes.go:170 getFixInfos
+// Go: ls/codeactions_importfixes.go:171 getFixInfos
 fn get_fix_infos(
     ctx: &Context,
     fix_context: &CodeFixContext<'_>,
@@ -304,7 +304,7 @@ fn get_fix_infos(
     Ok(sort_fix_info(info, fix_context, &view))
 }
 
-// Go: ls/codeactions_importfixes.go:241 getFixesInfoForUMDImport
+// Go: ls/codeactions_importfixes.go:244 getFixesInfoForUMDImport
 fn get_fixes_info_for_umd_import(
     token: Node,
     view: &autoimport::View,
@@ -486,13 +486,13 @@ fn get_type_only_promotion_fix(
     }))
 }
 
-// Go: ls/codeactions_importfixes.go:377 symbolNameInfo
+// Go: ls/codeactions_importfixes.go:375 symbolNameInfo
 struct SymbolNameInfo {
     name: String,
     is_type_only: bool, // whether the symbol currently resolves to a type-only import
 }
 
-// Go: ls/codeactions_importfixes.go:382 getSymbolNamesToImport
+// Go: ls/codeactions_importfixes.go:380 getSymbolNamesToImport
 fn get_symbol_names_to_import(
     source_file: Node,
     ch: &mut Checker,
@@ -564,7 +564,7 @@ fn get_symbol_names_to_import(
     }]
 }
 
-// Go: ls/codeactions_importfixes.go:413 needsJsxNamespaceFix
+// Go: ls/codeactions_importfixes.go:411 needsJsxNamespaceFix
 fn needs_jsx_namespace_fix(jsx_namespace: &str, symbol_token: Node, ch: &mut Checker) -> bool {
     if is_intrinsic_jsx_name(symbol_token.text()) {
         return true;
@@ -592,12 +592,12 @@ fn needs_jsx_namespace_fix(jsx_namespace: &str, symbol_token: Node, ch: &mut Che
     false
 }
 
-// Go: ls/codeactions_importfixes.go:427 jsxModeNeedsExplicitImport
+// Go: ls/codeactions_importfixes.go:425 jsxModeNeedsExplicitImport
 fn jsx_mode_needs_explicit_import(jsx: JsxEmit) -> bool {
     jsx == JsxEmit::REACT || jsx == JsxEmit::REACT_NATIVE
 }
 
-// Go: ls/codeactions_importfixes.go:431 sortFixInfo
+// Go: ls/codeactions_importfixes.go:429 sortFixInfo
 fn sort_fix_info(
     fixes: Vec<FixInfo>,
     fix_context: &CodeFixContext<'_>,

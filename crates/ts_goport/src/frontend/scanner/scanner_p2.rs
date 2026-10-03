@@ -99,7 +99,7 @@ impl NumberFragment {
 }
 
 impl<'a> Scanner<'a> {
-    // Go: scanner/scanner.go:1237 ReScanJsxToken
+    // Go: scanner/scanner.go:1221 ReScanJsxToken
     pub fn re_scan_jsx_token(&mut self, allow_multiline_jsx_text: bool) -> SyntaxKind {
         self.scanner_state.pos = self.scanner_state.full_start_pos;
         self.scanner_state.token_start = self.scanner_state.full_start_pos;
@@ -107,7 +107,7 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:1244 ReScanHashToken
+    // Go: scanner/scanner.go:1228 ReScanHashToken
     pub fn re_scan_hash_token(&mut self) -> SyntaxKind {
         if self.scanner_state.token == SyntaxKind::PrivateIdentifier {
             self.scanner_state.pos = self.scanner_state.token_start + 1;
@@ -116,7 +116,7 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:1252 ReScanQuestionToken
+    // Go: scanner/scanner.go:1236 ReScanQuestionToken
     pub fn re_scan_question_token(&mut self) -> SyntaxKind {
         if self.scanner_state.token != SyntaxKind::QuestionQuestionToken {
             panic!("'reScanQuestionToken' should only be called on a '??'");
@@ -126,12 +126,12 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:1261 ScanJsxToken
+    // Go: scanner/scanner.go:1245 ScanJsxToken
     pub fn scan_jsx_token(&mut self) -> SyntaxKind {
         self.scan_jsx_token_ex(true /*allowMultilineJsxText*/)
     }
 
-    // Go: scanner/scanner.go:1265 ScanJsxTokenEx
+    // Go: scanner/scanner.go:1249 ScanJsxTokenEx
     pub fn scan_jsx_token_ex(&mut self, allow_multiline_jsx_text: bool) -> SyntaxKind {
         self.scanner_state.full_start_pos = self.scanner_state.pos;
         self.scanner_state.token_start = self.scanner_state.pos;
@@ -213,7 +213,7 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:1333 ScanJsxIdentifier
+    // Go: scanner/scanner.go:1317 ScanJsxIdentifier
     // Scans a JSX identifier; these differ from normal identifiers in that they allow dashes
     pub fn scan_jsx_identifier(&mut self) -> SyntaxKind {
         // PORT: Go `tokenIsIdentifierOrKeyword` from scanner/utilities.go is
@@ -233,7 +233,7 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:1360 ScanJsxAttributeValue
+    // Go: scanner/scanner.go:1330 ScanJsxAttributeValue
     pub fn scan_jsx_attribute_value(&mut self) -> SyntaxKind {
         self.scanner_state.full_start_pos = self.scanner_state.pos;
         // Skip whitespace between '=' and the value so tokenStart lands on the
@@ -255,14 +255,14 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    // Go: scanner/scanner.go:1379 ReScanJsxAttributeValue
+    // Go: scanner/scanner.go:1349 ReScanJsxAttributeValue
     pub fn re_scan_jsx_attribute_value(&mut self) -> SyntaxKind {
         self.scanner_state.pos = self.scanner_state.full_start_pos;
         self.scanner_state.token_start = self.scanner_state.full_start_pos;
         self.scan_jsx_attribute_value()
     }
 
-    // Go: scanner/scanner.go:1386 ScanJSDocCommentTextToken
+    // Go: scanner/scanner.go:1356 ScanJSDocCommentTextToken
     /** In addition to the usual JSDoc ast.Kinds, can also return ast.KindJSDocCommentTextToken */
     pub fn scan_js_doc_comment_text_token(&mut self, in_backticks: bool) -> SyntaxKind {
         self.scanner_state.full_start_pos = self.scanner_state.pos;
@@ -311,7 +311,7 @@ impl<'a> Scanner<'a> {
         self.scanner_state.token
     }
 
-    // Go: scanner/scanner.go:1422 CanFollowJSDocAt
+    // Go: scanner/scanner.go:1392 CanFollowJSDocAt
     // Peek at the character at the current scanner position (expected to be right after '@')
     // and return true if a JSDoc tag can follow. Identifier starts indicate a tag name.
     // Whitespace, newlines, and EOF are also accepted to support incomplete tags for code completion.
@@ -324,7 +324,7 @@ impl<'a> Scanner<'a> {
         is_identifier_start(ch) || is_white_space_single_line(ch) || is_line_break(ch)
     }
 
-    // Go: scanner/scanner.go:1430 ScanJSDocToken
+    // Go: scanner/scanner.go:1400 ScanJSDocToken
     pub fn scan_js_doc_token(&mut self) -> SyntaxKind {
         self.scanner_state.full_start_pos = self.scanner_state.pos;
         self.scanner_state.token_flags = TokenFlags::NONE;
@@ -562,7 +562,7 @@ impl<'a> Scanner<'a> {
         None
     }
 
-    // Go: scanner/scanner.go:1598 scanString
+    // Go: scanner/scanner.go:1585 scanString
     // PORT: returns the token value. A plain string is a slice of the source
     // text (see `text_token_value`), so it needs no copy or intern. The
     // source text is in the port form (see `scanner_util::GO_STRING_MARKER`),
@@ -644,7 +644,7 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    // Go: scanner/scanner.go:1650 scanTemplateAndSetTokenValue
+    // Go: scanner/scanner.go:1637 scanTemplateAndSetTokenValue
     pub(crate) fn scan_template_and_set_token_value(
         &mut self,
         should_emit_invalid_escape_error: bool,
@@ -722,7 +722,7 @@ impl<'a> Scanner<'a> {
         token
     }
 
-    // Go: scanner/scanner.go:1690 scanEscapeSequence
+    // Go: scanner/scanner.go:1689 scanEscapeSequence
     // PORT: the `String` form of `scan_escape_sequence_into`, for regexp.rs.
     // The string and template scanners call `scan_escape_sequence_into`.
     pub(crate) fn scan_escape_sequence(&mut self, flags: EscapeSequenceScanningFlags) -> String {
@@ -731,7 +731,7 @@ impl<'a> Scanner<'a> {
         out
     }
 
-    // Go: scanner/scanner.go:1690 scanEscapeSequence
+    // Go: scanner/scanner.go:1689 scanEscapeSequence
     // PORT: Go returns strings that can hold a CESU-8 lone surrogate
     // (`EncodeJSStringRune`). A Rust `String` cannot; `push_js_string_rune`
     // writes a valid-UTF-8 escape form instead (see
@@ -974,7 +974,7 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    // Go: scanner/scanner.go:1868 scanUnicodeEscape
+    // Go: scanner/scanner.go:1854 scanUnicodeEscape
     // Known to be at \u
     pub(crate) fn scan_unicode_escape(&mut self, should_emit_invalid_escape_error: bool) -> i32 {
         self.scanner_state.pos += 2;
@@ -1031,7 +1031,7 @@ impl<'a> Scanner<'a> {
         hex_value as i32
     }
 
-    // Go: scanner/scanner.go:1925 scanLowSurrogateEscape
+    // Go: scanner/scanner.go:1911 scanLowSurrogateEscape
     // scanLowSurrogateEscape attempts to consume a low-surrogate Unicode escape
     // (either '\uLow' or '\u{Low}') immediately following an already-scanned high
     // surrogate and combine them into a single supplementary code point. This
@@ -1058,7 +1058,7 @@ impl<'a> Scanner<'a> {
         None
     }
 
-    // Go: scanner/scanner.go:1945 peekUnicodeEscape
+    // Go: scanner/scanner.go:1931 peekUnicodeEscape
     // Current character is known to be a backslash. Check for Unicode escape of the form '\uXXXX'
     // or '\u{XXXXXX}' and return code point value if valid Unicode escape is found. Otherwise return -1.
     pub(crate) fn peek_unicode_escape(&mut self) -> i32 {
@@ -1073,7 +1073,7 @@ impl<'a> Scanner<'a> {
         -1
     }
 
-    // Go: scanner/scanner.go:1957 scanNumber
+    // Go: scanner/scanner.go:1943 scanNumber
     pub(crate) fn scan_number(&mut self) -> SyntaxKind {
         let mut start = self.scanner_state.pos;
         let fixed_part;
@@ -1234,7 +1234,7 @@ impl<'a> Scanner<'a> {
         result
     }
 
-    // Go: scanner/scanner.go:2057 scanNumberFragment
+    // Go: scanner/scanner.go:2043 scanNumberFragment
     // PORT: returns a `NumberFragment` so a fragment without separators
     // needs no `String`.
     pub(crate) fn scan_number_fragment(&mut self) -> NumberFragment {
@@ -1296,7 +1296,7 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    // Go: scanner/scanner.go:2103 scanDigits
+    // Go: scanner/scanner.go:2089 scanDigits
     // PORT: returns an owned `String` (Go returns a substring of the text).
     pub(crate) fn scan_digits(&mut self) -> (String, bool) {
         let start = self.scanner_state.pos;
@@ -1313,7 +1313,7 @@ impl<'a> Scanner<'a> {
         )
     }
 
-    // Go: scanner/scanner.go:2115 scanHexDigits
+    // Go: scanner/scanner.go:2101 scanHexDigits
     pub(crate) fn scan_hex_digits(
         &mut self,
         min_count: i32,
@@ -1388,7 +1388,7 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    // Go: scanner/scanner.go:2164 scanBinaryOrOctalDigits
+    // Go: scanner/scanner.go:2150 scanBinaryOrOctalDigits
     pub(crate) fn scan_binary_or_octal_digits(&mut self, base: i32) -> String {
         let mut sb = String::new();
         let mut allow_separator = false;
@@ -1435,7 +1435,7 @@ impl<'a> Scanner<'a> {
         sb
     }
 
-    // Go: scanner/scanner.go:2195 scanBigIntSuffix
+    // Go: scanner/scanner.go:2181 scanBigIntSuffix
     pub(crate) fn scan_big_int_suffix(&mut self) -> SyntaxKind {
         if self.char() == 'n' as i32 {
             let mut value = format!("{}n", self.scanner_state.token_value);
@@ -1472,7 +1472,7 @@ impl<'a> Scanner<'a> {
         SyntaxKind::NumericLiteral
     }
 
-    // Go: scanner/scanner.go:2220 scanInvalidCharacter
+    // Go: scanner/scanner.go:2206 scanInvalidCharacter
     pub(crate) fn scan_invalid_character(&mut self) {
         let (_, size) = self.char_and_size();
         self.error_at(

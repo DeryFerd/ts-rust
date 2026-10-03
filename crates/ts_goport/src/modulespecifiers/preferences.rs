@@ -79,7 +79,7 @@ fn infer_preference(
     ModuleSpecifierEnding::Minimal
 }
 
-// Go: modulespecifiers/preferences.go:66 getModuleSpecifierEndingPreference
+// Go: modulespecifiers/preferences.go:69 getModuleSpecifierEndingPreference
 fn get_module_specifier_ending_preference(
     pref: ImportModuleSpecifierEndingPreference,
     resolution_mode: ResolutionMode,
@@ -130,7 +130,7 @@ fn get_module_specifier_ending_preference(
     infer_preference(resolution_mode, source_file, module_resolution_is_node_next)
 }
 
-// Go: modulespecifiers/preferences.go:115 getPreferredEnding
+// Go: modulespecifiers/preferences.go:114 getPreferredEnding
 fn get_preferred_ending(
     prefs: &UserPreferences,
     host: &dyn ModuleSpecifierGenerationHost,
@@ -237,7 +237,7 @@ pub fn get_allowed_endings_in_preferred_order(
     }
 }
 
-// Go: modulespecifiers/preferences.go:207 getModuleSpecifierPreferences
+// Go: modulespecifiers/preferences.go:213 getModuleSpecifierPreferences
 pub(crate) fn get_module_specifier_preferences<'a>(
     prefs: &'a UserPreferences,
     host: &'a dyn ModuleSpecifierGenerationHost,

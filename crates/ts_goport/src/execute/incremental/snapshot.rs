@@ -88,7 +88,7 @@ pub fn port_text_range(file: Node, pos: i32, end: i32) -> TextRange {
     TextRange::new(port_byte_offset(&text, pos), port_byte_offset(&text, end))
 }
 
-// Go: incremental/snapshot.go:151 DiagnosticsOrBuildInfoDiagnosticsWithFileName
+// Go: incremental/snapshot.go:153 DiagnosticsOrBuildInfoDiagnosticsWithFileName
 // PORT: Go nil `diagnostics` is `None`; it marks "not converted yet".
 // PORT: testing. Go maps hold pointers to these, and the Go test harness
 // compares the old and new program's pointers (tsctests/sys.go OnProgram).
@@ -121,7 +121,7 @@ pub fn new_diagnostics_id() -> u64 {
 }
 
 impl BuildInfoDiagnosticWithFileName {
-    // Go: incremental/snapshot.go:156 toDiagnostic
+    // Go: incremental/snapshot.go:158 toDiagnostic
     #[must_use]
     pub fn to_diagnostic(&self, file: Node) -> Diagnostic {
         let mut file_for_diagnostic = Node::NIL;
@@ -164,7 +164,7 @@ impl BuildInfoDiagnosticWithFileName {
         diagnostic
     }
 
-    // Go: incremental/snapshot.go:201 toDiagnosticWithoutRepopulate
+    // Go: incremental/snapshot.go:212 toDiagnosticWithoutRepopulate
     #[must_use]
     pub fn to_diagnostic_without_repopulate(&self, file: Node) -> Diagnostic {
         let message_chain = self
@@ -193,7 +193,7 @@ impl BuildInfoDiagnosticWithFileName {
     }
 }
 
-// Go: incremental/snapshot.go:188 repopulateDiagnosticChain
+// Go: incremental/snapshot.go:199 repopulateDiagnosticChain
 // repopulateDiagnosticChain recomputes a diagnostic chain entry that depends on
 // program state which may have changed between incremental builds.
 #[must_use]
@@ -212,7 +212,7 @@ pub fn repopulate_diagnostic_chain(b: &BuildInfoDiagnosticWithFileName, file: No
     }
 }
 
-// Go: incremental/snapshot.go:224 repopulateModeMismatchChain
+// Go: incremental/snapshot.go:236 repopulateModeMismatchChain
 #[must_use]
 pub fn repopulate_mode_mismatch_chain(
     b: &BuildInfoDiagnosticWithFileName,
@@ -245,7 +245,7 @@ pub fn repopulate_mode_mismatch_chain(
     )
 }
 
-// Go: incremental/snapshot.go:251 repopulateModuleNotFoundChain
+// Go: incremental/snapshot.go:263 repopulateModuleNotFoundChain
 #[must_use]
 pub fn repopulate_module_not_found_chain(
     b: &BuildInfoDiagnosticWithFileName,
@@ -291,7 +291,7 @@ pub fn repopulate_module_not_found_chain(
 }
 
 impl DiagnosticsOrBuildInfoDiagnosticsWithFileName {
-    // Go: incremental/snapshot.go:283 getDiagnostics
+    // Go: incremental/snapshot.go:295 getDiagnostics
     pub fn get_diagnostics(&mut self, file: Node) -> Vec<Diagnostic> {
         if let Some(diagnostics) = &self.diagnostics {
             return diagnostics.clone();
@@ -307,7 +307,7 @@ impl DiagnosticsOrBuildInfoDiagnosticsWithFileName {
     }
 }
 
-// Go: incremental/snapshot.go:295 snapshot
+// Go: incremental/snapshot.go:306 snapshot
 // PORT: Go `options *core.CompilerOptions` is `&'static`: the program
 // options are static, and `buildInfoToSnapshot` leaks the options it reads
 // (one per process). `compiler.ProgramLike.Options` needs `&'static`.
@@ -397,13 +397,13 @@ impl Snapshot {
         }
     }
 
-    // Go: incremental/snapshot.go:342 addFileToChangeSet
+    // Go: incremental/snapshot.go:354 addFileToChangeSet
     pub fn add_file_to_change_set(&mut self, file_path: Path) {
         self.changed_files_set.insert(file_path);
         self.build_info_emit_pending = true;
     }
 
-    // Go: incremental/snapshot.go:347 addFileToAffectedFilesPendingEmit
+    // Go: incremental/snapshot.go:359 addFileToAffectedFilesPendingEmit
     pub fn add_file_to_affected_files_pending_emit(
         &mut self,
         file_path: Path,
@@ -422,7 +422,7 @@ impl Snapshot {
         self.build_info_emit_pending = true;
     }
 
-    // Go: incremental/snapshot.go:356 getAllFilesExcludingDefaultLibraryFile
+    // Go: incremental/snapshot.go:368 getAllFilesExcludingDefaultLibraryFile
     pub fn get_all_files_excluding_default_library_file(&self, first_source_file: Node) -> &[Node] {
         self.all_files_excluding_default_library_file
             .get_or_init(|| {
@@ -445,7 +445,7 @@ impl Snapshot {
             })
     }
 
-    // Go: incremental/snapshot.go:384 computeSignatureWithDiagnostics
+    // Go: incremental/snapshot.go:396 computeSignatureWithDiagnostics
     #[must_use]
     pub fn compute_signature_with_diagnostics(
         &self,
@@ -456,13 +456,13 @@ impl Snapshot {
         compute_signature_with_diagnostics(file, text, data, self.hash_with_text)
     }
 
-    // Go: incremental/snapshot.go:423 computeHash
+    // Go: incremental/snapshot.go:436 computeHash
     #[must_use]
     pub fn compute_hash(&self, text: &str) -> String {
         compute_hash(text, self.hash_with_text)
     }
 
-    // Go: incremental/snapshot.go:427 canUseIncrementalState
+    // Go: incremental/snapshot.go:440 canUseIncrementalState
     #[must_use]
     pub fn can_use_incremental_state(&self) -> bool {
         if !self.options.is_incremental() && self.options.build.is_true() {
@@ -473,7 +473,7 @@ impl Snapshot {
     }
 }
 
-// Go: incremental/snapshot.go:377 getTextHandlingSourceMapForSignature
+// Go: incremental/snapshot.go:389 getTextHandlingSourceMapForSignature
 #[must_use]
 pub fn get_text_handling_source_map_for_signature<'a>(
     text: &'a str,
@@ -485,7 +485,7 @@ pub fn get_text_handling_source_map_for_signature<'a>(
     text
 }
 
-// Go: incremental/snapshot.go:384 computeSignatureWithDiagnostics
+// Go: incremental/snapshot.go:396 computeSignatureWithDiagnostics
 // PORT: the body of the Go method, as a free function over `hashWithText`,
 // so emit `WriteFile` callbacks on the checker threads can call it without
 // the snapshot.
@@ -504,7 +504,7 @@ pub fn compute_signature_with_diagnostics(
     compute_hash(&builder, hash_with_text)
 }
 
-// Go: incremental/snapshot.go:393 diagnosticToStringBuilder
+// Go: incremental/snapshot.go:405 diagnosticToStringBuilder
 pub fn diagnostic_to_string_builder(
     diagnostic: Option<&Diagnostic>,
     file: Node,

@@ -20,7 +20,7 @@ const _KIND_NAME: &str = "InferredConfiguredSynthetic";
 const _KIND_INDEX: [u8; 4] = [0, 8, 18, 27];
 
 impl Kind {
-    // Go: project/project_stringer_generated.go:19 Kind.String
+    // Go: project/project_stringer_generated.go:20 Kind.String
     pub fn string(&self) -> String {
         let i = self.0;
         let idx = i64::from(i); // Go: int(i) - 0

@@ -44,7 +44,7 @@ pub fn new_es_next_transformer(opts: &TransformOptions) -> Option<TransformerBox
 // 2023: no new downlevel syntax
 // 2022: class static blocks and class fields are handled by newClassFieldsTransformer
 
-// Go: transformers/estransforms/definitions.go:15 NewES2021Transformer
+// Go: transformers/estransforms/definitions.go:16 NewES2021Transformer
 pub fn new_es2021_transformer(opts: &TransformOptions) -> Option<TransformerBox> {
     chain(
         opts,
@@ -55,7 +55,7 @@ pub fn new_es2021_transformer(opts: &TransformOptions) -> Option<TransformerBox>
     )
 }
 
-// Go: transformers/estransforms/definitions.go:16 NewES2020Transformer
+// Go: transformers/estransforms/definitions.go:17 NewES2020Transformer
 pub fn new_es2020_transformer(opts: &TransformOptions) -> Option<TransformerBox> {
     chain(
         opts,
@@ -67,7 +67,7 @@ pub fn new_es2020_transformer(opts: &TransformOptions) -> Option<TransformerBox>
     )
 }
 
-// Go: transformers/estransforms/definitions.go:17 NewES2019Transformer
+// Go: transformers/estransforms/definitions.go:18 NewES2019Transformer
 pub fn new_es2019_transformer(opts: &TransformOptions) -> Option<TransformerBox> {
     chain(
         opts,
@@ -75,7 +75,7 @@ pub fn new_es2019_transformer(opts: &TransformOptions) -> Option<TransformerBox>
     )
 }
 
-// Go: transformers/estransforms/definitions.go:18 NewES2018Transformer
+// Go: transformers/estransforms/definitions.go:19 NewES2018Transformer
 pub fn new_es2018_transformer(opts: &TransformOptions) -> Option<TransformerBox> {
     chain(
         opts,
@@ -88,12 +88,12 @@ pub fn new_es2018_transformer(opts: &TransformOptions) -> Option<TransformerBox>
     )
 }
 
-// Go: transformers/estransforms/definitions.go:19 NewES2017Transformer
+// Go: transformers/estransforms/definitions.go:20 NewES2017Transformer
 pub fn new_es2017_transformer(opts: &TransformOptions) -> Option<TransformerBox> {
     chain(opts, &[&new_es2018_transformer, &new_async_transformer])
 }
 
-// Go: transformers/estransforms/definitions.go:20 NewES2016Transformer
+// Go: transformers/estransforms/definitions.go:21 NewES2016Transformer
 pub fn new_es2016_transformer(opts: &TransformOptions) -> Option<TransformerBox> {
     chain(
         opts,
@@ -101,7 +101,7 @@ pub fn new_es2016_transformer(opts: &TransformOptions) -> Option<TransformerBox>
     )
 }
 
-// Go: transformers/estransforms/definitions.go:23 GetESTransformer
+// Go: transformers/estransforms/definitions.go:24 GetESTransformer
 pub fn get_es_transformer(opts: &TransformOptions) -> Option<TransformerBox> {
     let options = opts.compiler_options;
     match options.get_emit_script_target() {

@@ -167,12 +167,12 @@ pub fn try_get_extension_from_path(p: &str) -> &'static str {
     ""
 }
 
-// Go: tspath/extension.go:65 RemoveExtension
+// Go: tspath/extension.go:75 RemoveExtension
 pub fn remove_extension<'a>(path: &'a str, extension: &str) -> &'a str {
     &path[..path.len() - extension.len()]
 }
 
-// Go: tspath/extension.go:69 FileExtensionIsOneOf
+// Go: tspath/extension.go:79 FileExtensionIsOneOf
 pub fn file_extension_is_one_of(path: &str, extensions: &[&str]) -> bool {
     for ext in extensions {
         if file_extension_is(path, ext) {
@@ -182,7 +182,7 @@ pub fn file_extension_is_one_of(path: &str, extensions: &[&str]) -> bool {
     false
 }
 
-// Go: tspath/extension.go:78 TryExtractTSExtension
+// Go: tspath/extension.go:88 TryExtractTSExtension
 pub fn try_extract_ts_extension(file_name: &str) -> &'static str {
     for ext in SUPPORTED_TS_EXTENSIONS_FOR_EXTRACT_EXTENSION {
         if file_extension_is(file_name, ext) {
@@ -192,38 +192,38 @@ pub fn try_extract_ts_extension(file_name: &str) -> &'static str {
     ""
 }
 
-// Go: tspath/extension.go:87 HasTSFileExtension
+// Go: tspath/extension.go:97 HasTSFileExtension
 pub fn has_ts_file_extension(path: &str) -> bool {
     file_extension_is_one_of(path, SUPPORTED_TS_EXTENSIONS_FLAT)
 }
 
-// Go: tspath/extension.go:91 HasImplementationTSFileExtension
+// Go: tspath/extension.go:101 HasImplementationTSFileExtension
 pub fn has_implementation_ts_file_extension(path: &str) -> bool {
     file_extension_is_one_of(path, SUPPORTED_TS_IMPLEMENTATION_EXTENSIONS)
         && !is_declaration_file_name(path)
 }
 
-// Go: tspath/extension.go:95 HasJSFileExtension
+// Go: tspath/extension.go:105 HasJSFileExtension
 pub fn has_js_file_extension(path: &str) -> bool {
     file_extension_is_one_of(path, SUPPORTED_JS_EXTENSIONS_FLAT)
 }
 
-// Go: tspath/extension.go:99 HasJSONFileExtension
+// Go: tspath/extension.go:109 HasJSONFileExtension
 pub fn has_json_file_extension(path: &str) -> bool {
     file_extension_is(path, EXTENSION_JSON)
 }
 
-// Go: tspath/extension.go:103 IsDeclarationFileName
+// Go: tspath/extension.go:113 IsDeclarationFileName
 pub fn is_declaration_file_name(file_name: &str) -> bool {
     !get_declaration_file_extension(file_name).is_empty()
 }
 
-// Go: tspath/extension.go:107 ExtensionIsOneOf
+// Go: tspath/extension.go:117 ExtensionIsOneOf
 pub fn extension_is_one_of(ext: &str, extensions: &[&str]) -> bool {
     extensions.contains(&ext)
 }
 
-// Go: tspath/extension.go:111 GetDeclarationFileExtension
+// Go: tspath/extension.go:121 GetDeclarationFileExtension
 pub fn get_declaration_file_extension(file_name: &str) -> String {
     let base = get_base_file_name(file_name);
     for ext in SUPPORTED_DECLARATION_EXTENSIONS {
@@ -239,7 +239,7 @@ pub fn get_declaration_file_extension(file_name: &str) -> String {
     String::new()
 }
 
-// Go: tspath/extension.go:127 GetDeclarationEmitExtensionForPath
+// Go: tspath/extension.go:137 GetDeclarationEmitExtensionForPath
 pub fn get_declaration_emit_extension_for_path(path: &str) -> String {
     if file_extension_is_one_of(path, &[EXTENSION_MJS, EXTENSION_MTS]) {
         EXTENSION_DMTS.to_string()
@@ -259,7 +259,7 @@ pub fn get_declaration_emit_extension_for_path(path: &str) -> String {
     }
 }
 
-// Go: tspath/extension.go:149 ChangeAnyExtension
+// Go: tspath/extension.go:159 ChangeAnyExtension
 // ChangeAnyExtension changes the extension of a path to the provided extension if it has one of the provided extensions.
 //
 // ChangeAnyExtension("/path/to/file.ext", ".js", ".ext") === "/path/to/file.js"
@@ -285,7 +285,7 @@ pub fn change_any_extension(
     path.to_string()
 }
 
-// Go: tspath/extension.go:164 ChangeExtension
+// Go: tspath/extension.go:174 ChangeExtension
 pub fn change_extension(path: &str, new_extension: &str) -> String {
     change_any_extension(
         path,
@@ -295,7 +295,7 @@ pub fn change_extension(path: &str, new_extension: &str) -> String {
     )
 }
 
-// Go: tspath/extension.go:173 ChangeFullExtension
+// Go: tspath/extension.go:183 ChangeFullExtension
 // Like `changeAnyExtension`, but declaration file extensions are recognized
 // and replaced starting from the `.d`.
 //
@@ -314,7 +314,7 @@ pub fn change_full_extension(path: &str, new_extension: &str) -> String {
     change_extension(path, new_extension)
 }
 
-// Go: tspath/extension.go:185 GetPossibleOriginalInputExtensionForExtension
+// Go: tspath/extension.go:195 GetPossibleOriginalInputExtensionForExtension
 pub fn get_possible_original_input_extension_for_extension(path: &str) -> Vec<String> {
     if file_extension_is_one_of(path, &[EXTENSION_DMTS, EXTENSION_MJS, EXTENSION_MTS]) {
         return vec![EXTENSION_MTS.to_string(), EXTENSION_MJS.to_string()];

@@ -215,7 +215,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
         )
     }
 
-    // Go: project/dirty/map.go:86 Add
+    // Go: project/dirty/map.go:89 Add
     // Add sets a new entry in the dirty map without checking if it exists
     // in the base map. The entry added is considered dirty, so it should
     // be a fresh value, mutable until finalized (i.e., it will not be cloned
@@ -244,7 +244,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
         }
     }
 
-    // Go: project/dirty/map.go:110 TryDelete
+    // Go: project/dirty/map.go:106 TryDelete
     pub fn try_delete(&self, key: &K) -> bool {
         if let (Some(entry), true) = self.get(key) {
             entry.delete();
@@ -260,7 +260,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
         }
     }
 
-    // Go: project/dirty/map.go:124 Range
+    // Go: project/dirty/map.go:120 Range
     // PORT: the dirty entries are copied out first so `fn_` can change the
     // map. The base loop holds its own `Rc` of the base map, as Go ranges
     // over the map value it read (a `clear` in `fn_` does not change it).
@@ -297,13 +297,13 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
         }
     }
 
-    // Go: project/dirty/map.go:147 Clear
+    // Go: project/dirty/map.go:144 Clear
     pub fn clear(&self) {
         *self.dirty.borrow_mut() = IndexMap::new();
         *self.base.borrow_mut() = Rc::new(FxHashMap::default());
     }
 
-    // Go: project/dirty/map.go:152 Finalize
+    // Go: project/dirty/map.go:149 Finalize
     // PORT: returns an owned map for callers that keep a plain `FxHashMap`.
     // When nothing changed, that is a copy of the base map.
     // `finalize_shared` returns the base map itself, as Go does.
@@ -312,7 +312,7 @@ impl<K: Eq + Hash + Clone, V: Cloneable + Clone> Map<K, V> {
         (Rc::unwrap_or_clone(result), changed)
     }
 
-    // Go: project/dirty/map.go:152 Finalize
+    // Go: project/dirty/map.go:149 Finalize
     // PORT: when nothing changed, the result is the base map (an `Rc` clone),
     // as in Go. Otherwise it is a new map.
     pub fn finalize_shared(&self) -> (Rc<FxHashMap<K, V>>, bool) {

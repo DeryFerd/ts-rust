@@ -1921,7 +1921,7 @@ impl NodeList {
         self.loc().end()
     }
 
-    // Go: ast.go:137 HasTrailingComma
+    // Go: ast.go:139 HasTrailingComma
     #[must_use]
     pub fn has_trailing_comma(self) -> bool {
         let nodes = self.nodes();
@@ -2151,7 +2151,7 @@ impl ModifierList {
         self.node_list().loc()
     }
 
-    // Go: ast.go:155 ModifierList.ModifierFlags (set at ast.go:162)
+    // Go: ast.go:157 ModifierList.ModifierFlags (set at ast.go:162)
     /// Go `modifiers.ModifierFlags`. NONE when nil.
     // PERF: store and synthetic lists hold Go `ModifiersToFlags(nodes)`,
     // stored when the factory made the list (`new_store_modifier_list`,
@@ -2176,7 +2176,7 @@ impl ModifierList {
 // Visitor helpers
 // ──────────────────────────────────────────────────────────────────────
 
-// Go: ast.go:29 visit
+// Go: ast.go:31 visit
 fn visit(v: &mut dyn FnMut(Node) -> bool, node: Node) -> bool {
     if node.is_some() {
         return v(node);
@@ -2184,7 +2184,7 @@ fn visit(v: &mut dyn FnMut(Node) -> bool, node: Node) -> bool {
     false
 }
 
-// Go: ast.go:36 visitNodes
+// Go: ast.go:38 visitNodes
 fn visit_nodes(v: &mut dyn FnMut(Node) -> bool, nodes: NodeSlice) -> bool {
     for node in nodes {
         if v(node) {
@@ -2194,7 +2194,7 @@ fn visit_nodes(v: &mut dyn FnMut(Node) -> bool, nodes: NodeSlice) -> bool {
     false
 }
 
-// Go: ast.go:45 visitNodeList
+// Go: ast.go:47 visitNodeList
 fn visit_node_list(v: &mut dyn FnMut(Node) -> bool, node_list: NodeList) -> bool {
     if node_list.is_some() {
         return visit_nodes(v, node_list.nodes());
@@ -2202,7 +2202,7 @@ fn visit_node_list(v: &mut dyn FnMut(Node) -> bool, node_list: NodeList) -> bool
     false
 }
 
-// Go: ast.go:52 visitModifiers
+// Go: ast.go:54 visitModifiers
 fn visit_modifiers(v: &mut dyn FnMut(Node) -> bool, modifiers: ModifierList) -> bool {
     if modifiers.is_some() {
         return visit_nodes(v, modifiers.nodes());
@@ -2481,7 +2481,7 @@ impl Node {
     // Go: ast.go:199 Modifiers
     modifiers_variants!(modifiers_accessor! {});
 
-    // Go: ast.go:205 ParameterList
+    // Go: ast.go:217 ParameterList
     /// Go `FunctionLikeData().Parameters`. Nil for other nodes.
     // PORT: Go dereferences a nil FunctionLikeData here; we return nil.
     #[must_use]
@@ -2509,7 +2509,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:206 Parameters
+    // Go: ast.go:218 Parameters
     #[must_use]
     pub fn parameters(self) -> NodeSlice {
         self.parameter_list().nodes()
@@ -2527,7 +2527,7 @@ impl Node {
         facts
     }
 
-    // Go: ast.go:217 Decorators
+    // Go: ast.go:229 Decorators
     #[must_use]
     pub fn decorators(self) -> NodeSlice {
         let modifiers = self.modifiers();
@@ -2555,7 +2555,7 @@ impl Node {
         slice
     }
 
-    // Go: ast.go:229 Symbol
+    // Go: ast.go:241 Symbol
     // PORT: Go reads `DeclarationData().Symbol`. The binder only sets the
     // symbol on declaration nodes, so reading the bind data directly is the
     // same.
@@ -2569,13 +2569,13 @@ impl Node {
         }
     }
 
-    // Go: ast.go:237 LocalSymbol
+    // Go: ast.go:249 LocalSymbol
     #[must_use]
     pub fn local_symbol(self) -> SymbolId {
         self.bind_extra(|e| e.local_symbol)
     }
 
-    // Go: ast.go:245 Locals
+    // Go: ast.go:257 Locals
     // PERF: U1 (d). Go `Locals()` is nil when `LocalsContainerData()` is nil.
     // A frozen store node whose kind is no locals container gives nil from
     // the kind table, without the binder data lookup. The binder sets locals
@@ -2867,7 +2867,7 @@ fn joined_text(n: Node, build: impl FnOnce() -> String) -> &'static str {
 }
 
 impl Node {
-    // Go: ast.go:253 Body
+    // Go: ast.go:265 Body
     // PORT: also covers ClassStaticBlockDeclaration, whose Go `Body` field
     // has no generated accessor.
     #[must_use]
@@ -3036,7 +3036,7 @@ impl Node {
         get_identifier_token(self.text()) != SyntaxKind::Identifier
     }
 
-    // Go: ast.go:299 Expression
+    // Go: ast.go:311 Expression
     // PERF: U4 (CH6). A published store node reads its expression child from
     // the store column (`frozen_store_child`), as `Node::name` does.
     #[must_use]
@@ -3069,7 +3069,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:375 RawText
+    // Go: ast.go:387 RawText
     // PORT: also covers NoSubstitutionTemplateLiteral, whose Go `RawText`
     // field has no generated accessor.
     #[must_use]
@@ -3089,7 +3089,7 @@ impl Node {
         }
     }
 
-    // Go: ast.go:465 ArgumentList
+    // Go: ast.go:477 ArgumentList
     #[must_use]
     pub fn argument_list(self) -> NodeList {
         list_of!(self, |d| match d {
@@ -3100,13 +3100,13 @@ impl Node {
         .unwrap_or(NodeList::NIL)
     }
 
-    // Go: ast.go:475 Arguments
+    // Go: ast.go:487 Arguments
     #[must_use]
     pub fn arguments(self) -> NodeSlice {
         self.argument_list().nodes()
     }
 
-    // Go: ast.go:483 TypeArgumentList
+    // Go: ast.go:495 TypeArgumentList
     // PERF: C2. A published store node whose data has no list gives nil from
     // the store column (`frozen_store_lacks_type_arguments`), without its
     // node data. A node with a list reads it from the data.
@@ -3133,13 +3133,13 @@ impl Node {
         .unwrap_or(NodeList::NIL)
     }
 
-    // Go: ast.go:507 TypeArguments
+    // Go: ast.go:519 TypeArguments
     #[must_use]
     pub fn type_arguments(self) -> NodeSlice {
         self.type_argument_list().nodes()
     }
 
-    // Go: ast.go:515 TypeParameterList
+    // Go: ast.go:527 TypeParameterList
     #[must_use]
     pub fn type_parameter_list(self) -> NodeList {
         list_by_data!(
@@ -3170,13 +3170,13 @@ impl Node {
         )
     }
 
-    // Go: ast.go:536 TypeParameters
+    // Go: ast.go:548 TypeParameters
     #[must_use]
     pub fn type_parameters(self) -> NodeSlice {
         self.type_parameter_list().nodes()
     }
 
-    // Go: ast.go:544 MemberList
+    // Go: ast.go:556 MemberList
     #[must_use]
     pub fn member_list(self) -> NodeList {
         let list = list_by_data!(
@@ -3195,13 +3195,13 @@ impl Node {
         list
     }
 
-    // Go: ast.go:562 Members
+    // Go: ast.go:574 Members
     #[must_use]
     pub fn members(self) -> NodeSlice {
         self.member_list().nodes()
     }
 
-    // Go: ast.go:570 StatementList
+    // Go: ast.go:582 StatementList
     #[must_use]
     pub fn statement_list(self) -> NodeList {
         list_by_data!(
@@ -3212,13 +3212,13 @@ impl Node {
         )
     }
 
-    // Go: ast.go:584 Statements
+    // Go: ast.go:596 Statements
     #[must_use]
     pub fn statements(self) -> NodeSlice {
         self.statement_list().nodes()
     }
 
-    // Go: ast.go:592 CanHaveStatements
+    // Go: ast.go:604 CanHaveStatements
     #[must_use]
     pub fn can_have_statements(self) -> bool {
         matches!(
@@ -3231,7 +3231,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:601 ModifierFlags
+    // Go: ast.go:613 ModifierFlags
     // PERF: U1 (b). A frozen store node reads its flags from the store column
     // (`frozen_store_modifier_flags`), without its node data and list.
     #[must_use]
@@ -3243,13 +3243,13 @@ impl Node {
         self.modifiers().modifier_flags()
     }
 
-    // Go: ast.go:609 ModifierNodes
+    // Go: ast.go:621 ModifierNodes
     #[must_use]
     pub fn modifier_nodes(self) -> NodeSlice {
         self.modifiers().nodes()
     }
 
-    // Go: ast.go:617 Type
+    // Go: ast.go:629 Type
     // PORT: also covers JsDocVariadicType, whose Go `Type` field has no
     // generated accessor.
     // PERF: C2. A published store node reads its type child from the store
@@ -3270,7 +3270,7 @@ impl Node {
         type_arms!(by_data!(self, Node::NIL,), opt, req)
     }
 
-    // Go: ast.go:739 Initializer
+    // Go: ast.go:751 Initializer
     // PERF: C2, as `Node::type_`. A node with both a type and an
     // initializer keeps only the type in the column; its initializer reads
     // take the node data.
@@ -3310,7 +3310,7 @@ impl Node {
     // the node data.
     initializer_arms!(initializer_data_accessor!(), opt, req);
 
-    // Go: ast.go:793 TagName
+    // Go: ast.go:805 TagName
     #[must_use]
     pub fn tag_name(self) -> Node {
         by_data!(
@@ -3345,7 +3345,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:847 PropertyName
+    // Go: ast.go:859 PropertyName
     #[must_use]
     pub fn property_name(self) -> Node {
         by_data!(
@@ -3355,7 +3355,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:859 PropertyNameOrName
+    // Go: ast.go:871 PropertyNameOrName
     #[must_use]
     pub fn property_name_or_name(self) -> Node {
         let name = self.property_name();
@@ -3365,7 +3365,7 @@ impl Node {
         name
     }
 
-    // Go: ast.go:867 IsTypeOnly
+    // Go: ast.go:879 IsTypeOnly
     #[must_use]
     pub fn is_type_only(self) -> bool {
         with_data!(self, |d| match d {
@@ -3378,7 +3378,7 @@ impl Node {
         })
     }
 
-    // Go: ast.go:884 CommentList
+    // Go: ast.go:896 CommentList
     #[must_use]
     pub fn comment_list(self) -> NodeList {
         list_by_data!(
@@ -3412,13 +3412,13 @@ impl Node {
         )
     }
 
-    // Go: ast.go:934 Comments
+    // Go: ast.go:946 Comments
     #[must_use]
     pub fn comments(self) -> NodeSlice {
         self.comment_list().nodes()
     }
 
-    // Go: ast.go:942 Label
+    // Go: ast.go:954 Label
     #[must_use]
     pub fn label(self) -> Node {
         let f = self.file_index();
@@ -3450,7 +3450,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:964 Children
+    // Go: ast.go:978 Children
     #[must_use]
     pub fn children(self) -> NodeList {
         list_by_data!(
@@ -3461,7 +3461,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:974 ModuleSpecifier
+    // Go: ast.go:988 ModuleSpecifier
     #[must_use]
     pub fn module_specifier(self) -> Node {
         let f = self.file_index();
@@ -3473,7 +3473,7 @@ impl Node {
         })
     }
 
-    // Go: ast.go:986 ImportClause
+    // Go: ast.go:1000 ImportClause
     #[must_use]
     pub fn import_clause(self) -> Node {
         by_data!(
@@ -3483,7 +3483,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:996 Statement
+    // Go: ast.go:1010 Statement
     #[must_use]
     pub fn statement(self) -> Node {
         by_data!(
@@ -3500,7 +3500,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:1014 PropertyList
+    // Go: ast.go:1028 PropertyList
     #[must_use]
     pub fn property_list(self) -> NodeList {
         list_by_data!(
@@ -3522,13 +3522,13 @@ impl Node {
         )
     }
 
-    // Go: ast.go:1024 Properties
+    // Go: ast.go:1038 Properties
     #[must_use]
     pub fn properties(self) -> NodeSlice {
         self.property_list().nodes()
     }
 
-    // Go: ast.go:1032 ElementList
+    // Go: ast.go:1046 ElementList
     #[must_use]
     pub fn element_list(self) -> NodeList {
         list_by_data!(
@@ -3545,13 +3545,13 @@ impl Node {
         )
     }
 
-    // Go: ast.go:1048 Elements
+    // Go: ast.go:1062 Elements
     #[must_use]
     pub fn elements(self) -> NodeSlice {
         self.element_list().nodes()
     }
 
-    // Go: ast.go:1056 PostfixToken
+    // Go: ast.go:1070 PostfixToken
     // PERF: U4 (bind A). A published store node reads the token from the store
     // column (`frozen_store_child`), as `Node::name` does.
     #[must_use]
@@ -3582,7 +3582,7 @@ impl Node {
     // from the node data.
     postfix_arms!(postfix_token_data_accessor!(), opt);
 
-    // Go: ast.go:1080 QuestionToken
+    // Go: ast.go:1094 QuestionToken
     // PERF: U4 (bind A), as `Node::postfix_token`.
     #[must_use]
     pub fn question_token(self) -> Node {
@@ -3628,7 +3628,7 @@ impl Node {
     // `QuestionToken`.
     question_arms!(own_question_token_accessor!(), some_opt, some_req);
 
-    // Go: ast.go:1098 QuestionDotToken
+    // Go: ast.go:1112 QuestionDotToken
     #[must_use]
     pub fn question_dot_token(self) -> Node {
         by_data!(
@@ -3643,7 +3643,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:1112 TypeExpression
+    // Go: ast.go:1126 TypeExpression
     // PORT: also covers the JSDoc `@this` and `@overload` tags, whose Go
     // `TypeExpression` fields have no generated accessor.
     #[must_use]
@@ -3667,7 +3667,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:1132 ClassName
+    // Go: ast.go:1146 ClassName
     #[must_use]
     pub fn class_name(self) -> Node {
         by_data!(
@@ -3677,7 +3677,7 @@ impl Node {
         )
     }
 
-    // Go: ast.go:1144 Contains
+    // Go: ast.go:1158 Contains
     /// Reports whether `self` contains `descendant` by walking up the parent
     /// links. Panics if a non-SourceFile ancestor has no parent.
     #[must_use]
@@ -4382,7 +4382,7 @@ fn walk_children<'d>(data: &'d NodeData, w: &mut impl ChildVisit<'d>) -> bool {
         }
         NodeData::JsDocSignature(d) => ol!(d.type_parameters) || l!(d.parameters) || o!(d.type_),
         NodeData::JsDocNameReference(d) => n!(d.name),
-        // Go: ast.go:3042 forEachChild_JSDocParameterOrPropertyTag
+        // Go: ast.go:3170 forEachChild_JSDocParameterOrPropertyTag
         NodeData::JsDocParameterOrPropertyTag(d) => {
             n!(d.tag_name)
                 || (d.is_name_first && (n!(d.name) || o!(d.type_expression)))
@@ -5615,6 +5615,15 @@ impl Node {
 
     // Go: ast.go:1581 EagerJSDoc
     /// JSDoc nodes that are already parsed and cached. It never parses.
+    // PORT: Go reads `jsdocCache`, which also holds the entries that a lazy
+    // parse (`resolveJSDoc`) added. The port keeps those in `LAZY_JSDOC`
+    // (`program::cached_lazy_js_doc`), so a miss in the parse cache of a
+    // lazy file reads them. Without that read, `checkSourceElement` missed
+    // a `{@link}` that the comment prefilter does not see (a form feed
+    // after `@link`) when an earlier `@deprecated` lookup parsed the
+    // comment, and the import that the link names was reported unused.
+    // Go shares the cache between its checkers; each port thread has its
+    // own (`LAZY_JSDOC`).
     #[must_use]
     pub fn eager_js_doc(self, file: Node) -> NodeSlice {
         if self.parser_flags(NodeFlags::HAS_JS_DOC).is_empty() {
@@ -5635,7 +5644,13 @@ impl Node {
         if is_file_store_before_program(file.file_index()) {
             return file_store_js_doc(file.file_index(), self).unwrap_or(NodeSlice::NIL);
         }
-        cached_js_doc(file, &source_file_info(file), self).unwrap_or(NodeSlice::NIL)
+        let info = source_file_info(file);
+        match cached_js_doc(file, &info, self) {
+            Some(jsdocs) => jsdocs,
+            None if info.has_lazy_js_doc => crate::program::cached_lazy_js_doc(self)
+                .map_or(NodeSlice::NIL, NodeSlice::from_nodes),
+            None => NodeSlice::NIL,
+        }
     }
 }
 
@@ -6422,7 +6437,7 @@ fn compute_declaration_map(file: Node) -> FxHashMap<String, Vec<Node>> {
     result
 }
 
-// Go: ast.go:2959 GetDeclarationName
+// Go: ast.go:3087 GetDeclarationName
 /// The plain text name of a declaration, or "" when it has none.
 #[must_use]
 pub fn get_declaration_name(declaration: Node) -> String {

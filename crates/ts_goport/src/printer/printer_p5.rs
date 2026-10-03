@@ -29,7 +29,7 @@ thread_local! {
     static COMMENT_RANGE_FACTORY: NodeFactory = NodeFactory::default();
 }
 
-// Go: scanner/scanner.go:2813 GetLeadingCommentRanges
+// Go: scanner/scanner.go:2799 GetLeadingCommentRanges
 // PORT: the free functions below have no printer, so they use a plain
 // `ast` factory; the scanner does not allocate nodes with it.
 fn get_leading_comment_ranges(text: &str, pos: i32) -> Vec<CommentRange> {
@@ -37,7 +37,7 @@ fn get_leading_comment_ranges(text: &str, pos: i32) -> Vec<CommentRange> {
         .with(|f| crate::frontend::scanner::get_leading_comment_ranges(f, text, pos))
 }
 
-// Go: scanner/scanner.go:2817 GetTrailingCommentRanges
+// Go: scanner/scanner.go:2803 GetTrailingCommentRanges
 fn get_trailing_comment_ranges(text: &str, pos: i32) -> Vec<CommentRange> {
     COMMENT_RANGE_FACTORY
         .with(|f| crate::frontend::scanner::get_trailing_comment_ranges(f, text, pos))
@@ -54,7 +54,7 @@ impl Printer {
     // Lists
     //
 
-    // Go: printer/printer.go:4695 emitList
+    // Go: printer/printer.go:4726 emitList
     pub(crate) fn emit_list(
         &mut self,
         emit: fn(&mut Printer, Node),
@@ -76,7 +76,7 @@ impl Printer {
         );
     }
 
-    // Go: printer/printer.go:4703 emitListRange
+    // Go: printer/printer.go:4734 emitListRange
     pub(crate) fn emit_list_range(
         &mut self,
         emit: fn(&mut Printer, Node),
@@ -171,7 +171,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:4770 hasTrailingComma
+    // Go: printer/printer.go:4801 hasTrailingComma
     pub(crate) fn has_trailing_comma(&mut self, parent_node: Node, children: NodeList) -> bool {
         // NodeList.HasTrailingComma() is unreliable on transformed nodes as some nodes may have been removed. In the event
         // we believe we may need to emit a trailing comma, we must first look to the respective node list on the original
@@ -257,7 +257,7 @@ impl Printer {
         false
     }
 
-    // Go: printer/printer.go:4844 writeDelimiter
+    // Go: printer/printer.go:4875 writeDelimiter
     pub(crate) fn write_delimiter(&mut self, format: ListFormat) {
         let delimiter = format & ListFormat::DELIMITERS_MASK;
         if delimiter == ListFormat::NONE {
@@ -280,7 +280,7 @@ impl Printer {
     // Emits a list without brackets or raising events.
     //
     // NOTE: You probably don't want to call this directly and should be using `emitList` instead.
-    // Go: printer/printer.go:4866 emitListItems
+    // Go: printer/printer.go:4897 emitListItems
     pub(crate) fn emit_list_items(
         &mut self,
         emit: fn(&mut Printer, Node),
@@ -467,7 +467,7 @@ impl Printer {
     // General
     //
 
-    // Go: printer/printer.go:5013 Emit
+    // Go: printer/printer.go:5044 Emit
     pub fn emit(&mut self, node: Node, source_file: Node) -> String {
         // ensure a reusable writer
         if self.own_writer.is_none() {
@@ -491,14 +491,14 @@ impl Printer {
         text
     }
 
-    // Go: printer/printer.go:5026 EmitSourceFile
+    // Go: printer/printer.go:5057 EmitSourceFile
     // PORT: `_exported` suffix, because the unexported Go `emitSourceFile`
     // has the same snake name.
     pub fn emit_source_file_exported(&mut self, source_file: Node) -> String {
         self.emit(source_file, source_file)
     }
 
-    // Go: printer/printer.go:5030 setSourceFile
+    // Go: printer/printer.go:5061 setSourceFile
     pub(crate) fn set_source_file(&mut self, source_file: Node) {
         self.current_source_file = source_file;
         // PERF: clear the one-entry caches of the current file (printer_p1).
@@ -524,7 +524,7 @@ impl Printer {
         // !!!
     }
 
-    // Go: printer/printer.go:5045 Write
+    // Go: printer/printer.go:5076 Write
     // PORT: `_exported` suffix, because the unexported Go `write` has the
     // same snake name.
     pub fn write_exported(
@@ -691,7 +691,7 @@ impl Printer {
     // Comments
     //
 
-    // Go: printer/printer.go:5257 emitCommentsBeforeNode
+    // Go: printer/printer.go:5291 emitCommentsBeforeNode
     pub(crate) fn emit_comments_before_node(&mut self, node: Node) -> Option<CommentState> {
         if !self.should_emit_comments(node) {
             return None;
@@ -719,7 +719,7 @@ impl Printer {
         })
     }
 
-    // Go: printer/printer.go:5280 emitCommentsAfterNode
+    // Go: printer/printer.go:5314 emitCommentsAfterNode
     pub(crate) fn emit_comments_after_node(&mut self, node: Node, state: Option<CommentState>) {
         let Some(state) = state else {
             return;
@@ -760,7 +760,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5305 emitCommentsBeforeToken
+    // Go: printer/printer.go:5339 emitCommentsBeforeToken
     pub(crate) fn emit_comments_before_token(
         &mut self,
         token: SyntaxKind,
@@ -801,7 +801,7 @@ impl Printer {
         (Some(CommentState::default()), pos)
     }
 
-    // Go: printer/printer.go:5337 emitCommentsAfterToken
+    // Go: printer/printer.go:5371 emitCommentsAfterToken
     pub(crate) fn emit_comments_after_token(
         &mut self,
         token: SyntaxKind,
@@ -826,7 +826,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5348 emitDetachedCommentsBeforeStatementList
+    // Go: printer/printer.go:5382 emitDetachedCommentsBeforeStatementList
     pub(crate) fn emit_detached_comments_before_statement_list(
         &mut self,
         node: Node,
@@ -860,7 +860,7 @@ impl Printer {
         })
     }
 
-    // Go: printer/printer.go:5370 emitDetachedCommentsAfterStatementList
+    // Go: printer/printer.go:5404 emitDetachedCommentsAfterStatementList
     pub(crate) fn emit_detached_comments_after_statement_list(
         &mut self,
         node: Node,
@@ -885,7 +885,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5386 emitLeadingCommentsOfNode
+    // Go: printer/printer.go:5420 emitLeadingCommentsOfNode
     pub(crate) fn emit_leading_comments_of_node(
         &mut self,
         node: Node,
@@ -937,7 +937,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5421 emitTrailingCommentsOfNode
+    // Go: printer/printer.go:5455 emitTrailingCommentsOfNode
     pub(crate) fn emit_trailing_comments_of_node(
         &mut self,
         node: Node,
@@ -966,7 +966,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5439 emitLeadingSyntheticCommentsOfNode
+    // Go: printer/printer.go:5473 emitLeadingSyntheticCommentsOfNode
     pub(crate) fn emit_leading_synthetic_comments_of_node(
         &mut self,
         node: Node,
@@ -981,7 +981,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5449 emitLeadingSynthesizedComment
+    // Go: printer/printer.go:5483 emitLeadingSynthesizedComment
     pub(crate) fn emit_leading_synthesized_comment(&mut self, comment: &SynthesizedComment) {
         if comment.has_leading_new_line || comment.kind == SyntaxKind::SingleLineCommentTrivia {
             self.writer_p5().write_line();
@@ -994,7 +994,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5461 emitTrailingSyntheticCommentsOfNode
+    // Go: printer/printer.go:5495 emitTrailingSyntheticCommentsOfNode
     pub(crate) fn emit_trailing_synthetic_comments_of_node(
         &mut self,
         node: Node,
@@ -1009,7 +1009,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5471 emitTrailingSynthesizedComment
+    // Go: printer/printer.go:5505 emitTrailingSynthesizedComment
     pub(crate) fn emit_trailing_synthesized_comment(&mut self, comment: &SynthesizedComment) {
         if !self.writer_p5().is_at_start_of_line() {
             self.writer_p5().write_space(" ");
@@ -1020,7 +1020,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5488 writeSynthesizedComment
+    // Go: printer/printer.go:5522 writeSynthesizedComment
     pub(crate) fn write_synthesized_comment(&mut self, comment: &SynthesizedComment) {
         let text = format_synthesized_comment(comment);
         let mut line_map: Vec<i32> = Vec::new();
@@ -1035,7 +1035,7 @@ impl Printer {
         );
     }
 
-    // Go: printer/printer.go:5497 emitLeadingComments
+    // Go: printer/printer.go:5531 emitLeadingComments
     pub(crate) fn emit_leading_comments(&mut self, mut pos: i32, elided: bool) -> bool {
         // Emit the leading comments only if the container's pos doesn't match because the container should take care of emitting these comments
         if self.comments_disabled
@@ -1100,7 +1100,7 @@ impl Printer {
         self.emit_comments(&comments, CommentSeparator::AFTER)
     }
 
-    // Go: printer/printer.go:5544 shouldEmitCommentIfTripleSlash
+    // Go: printer/printer.go:5578 shouldEmitCommentIfTripleSlash
     pub(crate) fn should_emit_comment_if_triple_slash(
         &self,
         comment: CommentRange,
@@ -1113,7 +1113,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5555 shouldEmitNewLineBeforeLeadingCommentOfPosition
+    // Go: printer/printer.go:5589 shouldEmitNewLineBeforeLeadingCommentOfPosition
     pub(crate) fn should_emit_new_line_before_leading_comment_of_position(
         &self,
         pos: i32,
@@ -1127,7 +1127,7 @@ impl Printer {
         compute_line_of_position(&line_map, pos) != compute_line_of_position(&line_map, comment_pos)
     }
 
-    // Go: printer/printer.go:5562 emitLeadingCommentsOfPosition
+    // Go: printer/printer.go:5596 emitLeadingCommentsOfPosition
     pub(crate) fn emit_leading_comments_of_position(&mut self, pos: i32) {
         if self.comments_disabled || pos == -1 {
             return;
@@ -1136,7 +1136,7 @@ impl Printer {
         self.emit_leading_comments(pos, false /*elided*/);
     }
 
-    // Go: printer/printer.go:5570 emitTrailingComments
+    // Go: printer/printer.go:5604 emitTrailingComments
     pub(crate) fn emit_trailing_comments(&mut self, pos: i32, comment_separator: CommentSeparator) {
         if self.comments_disabled {
             return;
@@ -1161,7 +1161,7 @@ impl Printer {
         self.emit_comments(&comments, comment_separator);
     }
 
-    // Go: printer/printer.go:5590 emitTrailingCommentsOfPosition
+    // Go: printer/printer.go:5624 emitTrailingCommentsOfPosition
     pub(crate) fn emit_trailing_comments_of_position(
         &mut self,
         pos: i32,
@@ -1210,7 +1210,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5635 emitDetachedCommentsAndUpdateCommentsInfo
+    // Go: printer/printer.go:5669 emitDetachedCommentsAndUpdateCommentsInfo
     pub(crate) fn emit_detached_comments_and_update_comments_info(
         &mut self,
         text_range: TextRange,
@@ -1224,7 +1224,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5644 emitDetachedComments
+    // Go: printer/printer.go:5678 emitDetachedComments
     // PORT: Go returns `(result, hasResult)`; this returns `Some(result)`
     // when `hasResult` is true.
     pub(crate) fn emit_detached_comments(
@@ -1320,7 +1320,7 @@ impl Printer {
         result
     }
 
-    // Go: printer/printer.go:5731 emitComments
+    // Go: printer/printer.go:5765 emitComments
     pub(crate) fn emit_comments(
         &mut self,
         comments: &[CommentRange],
@@ -1359,14 +1359,14 @@ impl Printer {
         true
     }
 
-    // Go: printer/printer.go:5763 emitComment
+    // Go: printer/printer.go:5797 emitComment
     pub(crate) fn emit_comment(&mut self, comment: CommentRange) {
         self.emit_pos(comment.pos());
         self.write_comment_range(comment);
         self.emit_pos(comment.end());
     }
 
-    // Go: printer/printer.go:5769 isTripleSlashComment
+    // Go: printer/printer.go:5803 isTripleSlashComment
     pub(crate) fn is_triple_slash_comment(&self, comment: CommentRange) -> bool {
         self.current_source_file.is_some()
             && is_recognized_triple_slash_comment(&self.current_source_file_text(), comment)
@@ -1376,7 +1376,7 @@ impl Printer {
     // Source Maps
     //
 
-    // Go: printer/printer.go:5778 setSourceMapSource
+    // Go: printer/printer.go:5812 setSourceMapSource
     pub(crate) fn set_source_map_source(&mut self, source: SourceMapSource) {
         if self.source_maps_disabled {
             return;
@@ -1424,7 +1424,7 @@ impl Printer {
         self.most_recent_source_map_source_index = self.source_map_source_index;
     }
 
-    // Go: printer/printer.go:5806 emitPos
+    // Go: printer/printer.go:5840 emitPos
     pub(crate) fn emit_pos(&mut self, mut pos: i32) {
         if self.source_maps_disabled
             || self.source_map_source.is_nil()
@@ -1504,7 +1504,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5843 emitSourcePos
+    // Go: printer/printer.go:5904 emitSourcePos
     pub(crate) fn emit_source_pos(&mut self, source: SourceMapSource, pos: i32) {
         if source != self.source_map_source {
             let saved_source_map_source = self.source_map_source.clone();
@@ -1522,7 +1522,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5872 emitSourceMapsBeforeNode
+    // Go: printer/printer.go:5933 emitSourceMapsBeforeNode
     pub(crate) fn emit_source_maps_before_node(&mut self, node: Node) -> Option<SourceMapState> {
         if !self.should_emit_source_maps(node) {
             return None;
@@ -1554,7 +1554,7 @@ impl Printer {
         })
     }
 
-    // Go: printer/printer.go:5896 emitSourceMapsAfterNode
+    // Go: printer/printer.go:5957 emitSourceMapsAfterNode
     pub(crate) fn emit_source_maps_after_node(
         &mut self,
         node: Node,
@@ -1579,7 +1579,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5915 emitSourceMapsBeforeToken
+    // Go: printer/printer.go:5976 emitSourceMapsBeforeToken
     pub(crate) fn emit_source_maps_before_token(
         &mut self,
         token: SyntaxKind,
@@ -1612,7 +1612,7 @@ impl Printer {
         })
     }
 
-    // Go: printer/printer.go:5937 emitSourceMapsAfterToken
+    // Go: printer/printer.go:5998 emitSourceMapsAfterToken
     pub(crate) fn emit_source_maps_after_token(
         &mut self,
         token: SyntaxKind,
@@ -1641,7 +1641,7 @@ impl Printer {
     // Name Generation
     //
 
-    // Go: printer/printer.go:5959 shouldReuseTempVariableScope
+    // Go: printer/printer.go:6020 shouldReuseTempVariableScope
     pub(crate) fn should_reuse_temp_variable_scope(&self, node: Node) -> bool {
         node.is_some()
             && self
@@ -1650,19 +1650,19 @@ impl Printer {
                 .intersects(EmitFlags::REUSE_TEMP_VARIABLE_SCOPE)
     }
 
-    // Go: printer/printer.go:5963 pushNameGenerationScope
+    // Go: printer/printer.go:6024 pushNameGenerationScope
     pub(crate) fn push_name_generation_scope(&mut self, node: Node) {
         let reuse = self.should_reuse_temp_variable_scope(node);
         self.name_generator.push_scope(reuse);
     }
 
-    // Go: printer/printer.go:5967 popNameGenerationScope
+    // Go: printer/printer.go:6028 popNameGenerationScope
     pub(crate) fn pop_name_generation_scope(&mut self, node: Node) {
         let reuse = self.should_reuse_temp_variable_scope(node);
         self.name_generator.pop_scope(reuse);
     }
 
-    // Go: printer/printer.go:5971 generateAllNames
+    // Go: printer/printer.go:6032 generateAllNames
     pub(crate) fn generate_all_names(&mut self, nodes: NodeList) {
         if nodes.is_nil() {
             return;
@@ -1672,7 +1672,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:5980 generateNames
+    // Go: printer/printer.go:6041 generateNames
     pub(crate) fn generate_names(&mut self, node: Node) {
         if node.is_nil() {
             return;
@@ -1758,7 +1758,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:6040 generateAllMemberNames
+    // Go: printer/printer.go:6101 generateAllMemberNames
     pub(crate) fn generate_all_member_names(&mut self, nodes: NodeList) {
         if nodes.is_nil() {
             return;
@@ -1768,7 +1768,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:6049 generateMemberNames
+    // Go: printer/printer.go:6110 generateMemberNames
     pub(crate) fn generate_member_names(&mut self, node: Node) {
         if node.is_nil() {
             return;
@@ -1788,7 +1788,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:6066 generateNameIfNeeded
+    // Go: printer/printer.go:6127 generateNameIfNeeded
     pub(crate) fn generate_name_if_needed(&mut self, name: Node) {
         if name.is_some() {
             if is_member_name(name) {
@@ -1800,13 +1800,13 @@ impl Printer {
     }
 
     // Generate the text for a generated identifier or private identifier
-    // Go: printer/printer.go:6077 generateName
+    // Go: printer/printer.go:6138 generateName
     pub(crate) fn generate_name(&mut self, name: Node) {
         let _ = self.sync_name_generator().generate_name(name);
     }
 
     // Returns a value indicating whether a name is unique globally or within the current file.
-    // Go: printer/printer.go:6082 isFileLevelUniqueNameInCurrentFile
+    // Go: printer/printer.go:6143 isFileLevelUniqueNameInCurrentFile
     pub(crate) fn is_file_level_unique_name_in_current_file(
         &self,
         name: &str,
@@ -1827,7 +1827,7 @@ impl Printer {
     // Scoped operations
     //
 
-    // Go: printer/printer.go:6094 enterNode
+    // Go: printer/printer.go:6155 enterNode
     pub(crate) fn enter_node(&mut self, node: Node) -> PrinterState {
         let mut state = PrinterState::default();
 
@@ -1840,7 +1840,7 @@ impl Printer {
         state
     }
 
-    // Go: printer/printer.go:6106 exitNode
+    // Go: printer/printer.go:6167 exitNode
     pub(crate) fn exit_node(&mut self, node: Node, previous_state: PrinterState) {
         self.emit_source_maps_after_node(node, previous_state.source_map_state);
         self.emit_comments_after_node(node, previous_state.comment_state);
@@ -1850,7 +1850,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:6115 enterTokenNode
+    // Go: printer/printer.go:6176 enterTokenNode
     pub(crate) fn enter_token_node(&mut self, node: Node, flags: TokenEmitFlags) -> PrinterState {
         let mut state = PrinterState::default();
 
@@ -1867,7 +1867,7 @@ impl Printer {
         state
     }
 
-    // Go: printer/printer.go:6131 exitTokenNode
+    // Go: printer/printer.go:6192 exitTokenNode
     pub(crate) fn exit_token_node(&mut self, node: Node, previous_state: PrinterState) {
         self.emit_source_maps_after_node(node, previous_state.source_map_state);
         self.emit_comments_after_node(node, previous_state.comment_state);
@@ -1877,7 +1877,7 @@ impl Printer {
         }
     }
 
-    // Go: printer/printer.go:6150 enterToken
+    // Go: printer/printer.go:6211 enterToken
     pub(crate) fn enter_token(
         &mut self,
         token: SyntaxKind,
@@ -1893,7 +1893,7 @@ impl Printer {
         (state, pos)
     }
 
-    // Go: printer/printer.go:6157 exitToken
+    // Go: printer/printer.go:6218 exitToken
     pub(crate) fn exit_token(
         &mut self,
         token: SyntaxKind,
@@ -1911,7 +1911,7 @@ impl Printer {
     }
 }
 
-// Go: printer/printer.go:5481 formatSynthesizedComment
+// Go: printer/printer.go:5515 formatSynthesizedComment
 pub(crate) fn format_synthesized_comment(comment: &SynthesizedComment) -> String {
     if comment.kind == SyntaxKind::MultiLineCommentTrivia {
         return format!("/*{}*/", comment.text);
@@ -1919,14 +1919,14 @@ pub(crate) fn format_synthesized_comment(comment: &SynthesizedComment) -> String
     format!("//{}", comment.text)
 }
 
-// Go: printer/printer.go:5723 commentSeparator
+// Go: printer/printer.go:5757 commentSeparator
 go_enum!(CommentSeparator, u32 {
     NONE = 0; // commentSeparatorNone
     BEFORE = 1; // commentSeparatorBefore
     AFTER = 2; // commentSeparatorAfter
 });
 
-// Go: printer/printer.go:6140 tokenEmitFlags
+// Go: printer/printer.go:6201 tokenEmitFlags
 go_flags!(TokenEmitFlags, u32 {
     NO_COMMENTS = 1 << 0; // tefNoComments
     INDENT_LEADING_COMMENTS = 1 << 1; // tefIndentLeadingComments
@@ -1935,7 +1935,7 @@ go_flags!(TokenEmitFlags, u32 {
     NONE = 0; // tefNone
 });
 
-// Go: printer/printer.go:6162 ListFormat
+// Go: printer/printer.go:6223 ListFormat
 go_flags!(ListFormat, i32 {
     NONE = 0; // LFNone
 
@@ -2024,7 +2024,7 @@ go_flags!(ListFormat, i32 {
     IMPORT_CLAUSE_ENTRIES = ListFormat::IMPORT_ATTRIBUTES.0; // Deprecated: Use LFImportAttributes
 });
 
-// Go: printer/printer.go:6252 getOpeningBracket
+// Go: printer/printer.go:6313 getOpeningBracket
 pub(crate) fn get_opening_bracket(format: ListFormat) -> &'static str {
     let brackets = format & ListFormat::BRACKETS_MASK;
     if brackets == ListFormat::BRACES {
@@ -2040,7 +2040,7 @@ pub(crate) fn get_opening_bracket(format: ListFormat) -> &'static str {
     }
 }
 
-// Go: printer/printer.go:6267 getClosingBracket
+// Go: printer/printer.go:6328 getClosingBracket
 pub(crate) fn get_closing_bracket(format: ListFormat) -> &'static str {
     let brackets = format & ListFormat::BRACKETS_MASK;
     if brackets == ListFormat::BRACES {

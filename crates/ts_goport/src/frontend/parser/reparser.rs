@@ -202,7 +202,7 @@ impl<'a> Parser<'a> {
         name
     }
 
-    // Go: parser/reparser.go:54 reparseTags
+    // Go: parser/reparser.go:58 reparseTags
     /// Hosted tags find a host and add their children to the correct location under the host.
     /// Unhosted tags add synthetic nodes to the reparse list.
     pub fn reparse_tags(&mut self, parent: Node, js_doc: &[Node]) {
@@ -221,7 +221,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser/reparser.go:70 reparseUnhosted
+    // Go: parser/reparser.go:74 reparseUnhosted
     fn reparse_unhosted(&mut self, tag: Node, parent: Node, js_doc: Node) {
         match tag.kind() {
             SyntaxKind::JsDocTypedefTag => {
@@ -369,7 +369,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser/reparser.go:144 reparseJSDocSignature
+    // Go: parser/reparser.go:146 reparseJSDocSignature
     fn reparse_js_doc_signature(
         &mut self,
         js_signature: Node,
@@ -530,7 +530,7 @@ impl<'a> Parser<'a> {
         signature
     }
 
-    // Go: parser/reparser.go:239 reparseJSDocTypeLiteral
+    // Go: parser/reparser.go:244 reparseJSDocTypeLiteral
     fn reparse_js_doc_type_literal(&mut self, t: Node) -> Node {
         if t.is_nil() {
             return Node::NIL;
@@ -591,7 +591,7 @@ impl<'a> Parser<'a> {
         self.add_deep_clone_reparse(t)
     }
 
-    // Go: parser/reparser.go:281 reparseJSDocComment
+    // Go: parser/reparser.go:285 reparseJSDocComment
     fn reparse_js_doc_comment(&mut self, node: Node, tag: Node) {
         let comment = tag.comment_list();
         if comment.is_some() {
@@ -612,7 +612,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser/reparser.go:293 gatherTypeParameters
+    // Go: parser/reparser.go:297 gatherTypeParameters
     fn gather_type_parameters(&mut self, j: Node, typedef_or_callback: bool) -> NodeList {
         let mut type_parameters: Vec<Node> = Vec::new();
         let mut pos = -1;
@@ -664,7 +664,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser/reparser.go:342 reparseHosted
+    // Go: parser/reparser.go:346 reparseHosted
     fn reparse_hosted(&mut self, tag: Node, parent: Node, js_doc: Node) {
         let mut parent = parent;
         match tag.kind() {
@@ -1078,7 +1078,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Go: parser/reparser.go:596 makeQuestionIfOptional
+    // Go: parser/reparser.go:615 makeQuestionIfOptional
     fn make_question_if_optional(&mut self, parameter: Node) -> Node {
         let mut question_token = Node::NIL;
         if parameter.is_bracketed()
@@ -1092,7 +1092,7 @@ impl<'a> Parser<'a> {
         question_token
     }
 
-    // Go: parser/reparser.go:665 makeNewCast
+    // Go: parser/reparser.go:678 makeNewCast
     fn make_new_cast(&mut self, t: Node, e: Node, is_assertion: bool) -> Node {
         let assert = if is_assertion {
             self.factory.new_as_expression(e, t)
@@ -1103,7 +1103,7 @@ impl<'a> Parser<'a> {
         assert
     }
 
-    // Go: parser/reparser.go:687 createExportModifier
+    // Go: parser/reparser.go:700 createExportModifier
     fn create_export_modifier(&mut self, location_node: Node) -> ModifierList {
         let export_modifier = self.factory.new_modifier(SyntaxKind::ExportKeyword);
         set_node_loc(export_modifier, location_node.loc());
@@ -1111,7 +1111,7 @@ impl<'a> Parser<'a> {
         self.new_modifier_list(location_node.loc(), &[export_modifier])
     }
 
-    // Go: parser/reparser.go:698 getInnermostNameOfJSDocNamespace
+    // Go: parser/reparser.go:711 getInnermostNameOfJSDocNamespace
     /// Returns the innermost identifier from a JSDoc namespace chain
     /// (ModuleDeclaration). For a simple identifier, it returns the identifier
     /// itself. For "A.B.C", it returns the identifier "C".
@@ -1130,7 +1130,7 @@ impl<'a> Parser<'a> {
         full_name
     }
 
-    // Go: parser/reparser.go:721 wrapInJSDocNamespace
+    // Go: parser/reparser.go:733 wrapInJSDocNamespace
     /// Wraps a statement (typically a type alias) in namespace declarations
     /// for a JSDoc dotted name. For name "A.B.C" and a type alias for C, this
     /// makes `namespace A { namespace B { type C = ... } }`. If the name is a
@@ -1167,7 +1167,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-// Go: parser/reparser.go:607 findMatchingParameter
+// Go: parser/reparser.go:625 findMatchingParameter
 // PORT: returns the parameter node, or nil for Go `(nil, false)`.
 fn find_matching_parameter(fun: Node, parameter_tag: Node, js_doc: Node) -> Node {
     let mut tag_index: i64 = -1;
@@ -1197,7 +1197,7 @@ fn find_matching_parameter(fun: Node, parameter_tag: Node, js_doc: Node) -> Node
     Node::NIL
 }
 
-// Go: parser/reparser.go:631 skipSatisfiesExpressions
+// Go: parser/reparser.go:650 skipSatisfiesExpressions
 fn skip_satisfies_expressions(node: Node) -> Node {
     let mut node = node;
     while node.is_some() && node.kind() == SyntaxKind::SatisfiesExpression {
@@ -1206,7 +1206,7 @@ fn skip_satisfies_expressions(node: Node) -> Node {
     node
 }
 
-// Go: parser/reparser.go:638 getFunctionLikeHost
+// Go: parser/reparser.go:657 getFunctionLikeHost
 fn get_function_like_host(host: Node) -> Node {
     let mut fun = host;
     match host.kind() {
@@ -1234,7 +1234,7 @@ fn get_function_like_host(host: Node) -> Node {
     Node::NIL
 }
 
-// Go: parser/reparser.go:676 getClassLikeData
+// Go: parser/reparser.go:689 getClassLikeData
 // PORT: Go returns the `*ClassLikeBase` data. Here the class node (or nil);
 // callers read and write its fields through the node.
 fn get_class_like_data(parent: Node) -> Node {

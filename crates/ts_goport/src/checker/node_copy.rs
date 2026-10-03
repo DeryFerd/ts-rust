@@ -955,7 +955,7 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         }
     }
 
-    // Go: checker/nodecopy.go:447 tryVisitSimpleTypeNode
+    // Go: checker/nodecopy.go:452 tryVisitSimpleTypeNode
     fn try_visit_simple_type_node(&mut self, node: Node) -> Node {
         let inner_node = skip_parentheses(node);
         match inner_node.kind() {
@@ -972,7 +972,7 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         self.visit_node(node)
     }
 
-    // Go: checker/nodecopy.go:463 visitExistingNodeTreeSymbolsWorker
+    // Go: checker/nodecopy.go:468 visitExistingNodeTreeSymbolsWorker
     fn visit_existing_node_tree_symbols_worker(&mut self, mut node: Node) -> Node {
         let b = self.ctx.b;
         let e = self.ctx.e;
@@ -1419,7 +1419,7 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
 }
 
 impl<'a> ExistingNodeTreeVisitor<'a> {
-    // Go: checker/nodecopy.go:822 visitor Visit func (inside getExistingNodeTreeVisitor)
+    // Go: checker/nodecopy.go:827 visitor Visit func (inside getExistingNodeTreeVisitor)
     fn existing_node_tree_visit(&mut self, node: Node) -> Node {
         // If there was an error in a sibling node bail early, the result will be discarded anyway
         if self.ctx.bound.borrow().had_error {
@@ -1500,7 +1500,7 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         res
     }
 
-    // Go: checker/nodecopy.go:885 NodeVisitorHooks.VisitNode (inside getExistingNodeTreeVisitor)
+    // Go: checker/nodecopy.go:890 NodeVisitorHooks.VisitNode (inside getExistingNodeTreeVisitor)
     fn hook_visit_node(&mut self, node: Node) -> Node {
         // Capture if the current node is in the current file so node lists knoww if they can keep positions or not
         let old_non_local_node = self.ctx.non_local_node;
