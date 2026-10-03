@@ -915,22 +915,26 @@ impl Checker {
     // PORT: Go ranges over a map, so its order is random. Here the counts keep
     // the order in which each name is first seen (constituent order, then
     // property order), so the result and the types it makes are deterministic.
+    // PERF: the counts are keyed by the name id with FxHash, and each lookup
+    // passes the `Name`, so no name text is hashed, compared or copied (Go
+    // hashes the text).
     pub fn some_property_reduces_to_never(&mut self, t: TypeId) -> bool {
         // Collect declaration counts for each property across all constituent types of the intersection.
-        let mut counts: IndexMap<Name, i32> = IndexMap::new();
-        let types = self.ty(t).types().to_vec();
-        for u in types {
+        let mut counts: FxIndexMap<u32, i32> = FxIndexMap::default();
+        for i in 0..self.ty(t).types().len() {
+            let u = self.type_at(t, i);
             let props = self.get_properties_of_type(u);
             for &prop in props.iter() {
-                *counts.entry(self.sym(prop).name.clone()).or_insert(0) += 1;
+                *counts.entry(self.sym(prop).name.id()).or_insert(0) += 1;
             }
         }
         // Check if any property appears in more than one constituent type and reduces to 'never'.
-        for (prop_name, count) in counts {
+        for (id, count) in counts {
             if count > 1 {
-                let prop = self.get_property_of_union_or_intersection_type(
+                let prop_name = Name::from_id(id);
+                let prop = self.get_property_of_union_or_intersection_type_key(
                     t,
-                    prop_name.as_str(),
+                    TableKey::Name(&prop_name),
                     true, /*skipObjectFunctionPropertyAugment*/
                 );
                 if prop.is_some() && self.is_never_reduced_property(prop) {
