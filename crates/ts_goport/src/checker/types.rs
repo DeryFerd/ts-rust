@@ -834,10 +834,15 @@ const _: () = assert!(std::mem::offset_of!(Type, data) == 24);
 const _: () = assert!(std::mem::offset_of!(TypeReference, object.mapper) + 4 <= 40);
 const _: () = assert!(std::mem::size_of::<TypeData>() == std::mem::size_of::<TypeReference>());
 
+/// Go's runtime panic for a failed type assertion `t.data.(*want)` on data
+/// of another struct (types.go:709-727).
 #[cold]
 #[inline(never)]
-fn type_cast_panic(want: &str) -> ! {
-    panic!("interface conversion: TypeData is not {want}")
+fn type_cast_panic(have: &TypeData, want: &str) -> ! {
+    crate::core::go_panic(format!(
+        "interface conversion: checker.TypeData is *checker.{}, not *checker.{want}",
+        have.go_struct_name()
+    ))
 }
 
 impl Type {
@@ -866,14 +871,14 @@ impl Type {
     pub fn as_intrinsic_type(&self) -> &IntrinsicType {
         match &self.data {
             TypeData::Intrinsic(d) => d,
-            _ => type_cast_panic("IntrinsicType"),
+            other => type_cast_panic(other, "IntrinsicType"),
         }
     }
     #[inline]
     pub fn as_intrinsic_type_mut(&mut self) -> &mut IntrinsicType {
         match &mut self.data {
             TypeData::Intrinsic(d) => d,
-            _ => type_cast_panic("IntrinsicType"),
+            other => type_cast_panic(other, "IntrinsicType"),
         }
     }
 
@@ -882,14 +887,14 @@ impl Type {
     pub fn as_literal_type(&self) -> &LiteralType {
         match &self.data {
             TypeData::Literal(d) => d,
-            _ => type_cast_panic("LiteralType"),
+            other => type_cast_panic(other, "LiteralType"),
         }
     }
     #[inline]
     pub fn as_literal_type_mut(&mut self) -> &mut LiteralType {
         match &mut self.data {
             TypeData::Literal(d) => d,
-            _ => type_cast_panic("LiteralType"),
+            other => type_cast_panic(other, "LiteralType"),
         }
     }
 
@@ -898,14 +903,14 @@ impl Type {
     pub fn as_unique_es_symbol_type(&self) -> &UniqueESSymbolType {
         match &self.data {
             TypeData::UniqueESSymbol(d) => d,
-            _ => type_cast_panic("UniqueESSymbolType"),
+            other => type_cast_panic(other, "UniqueESSymbolType"),
         }
     }
     #[inline]
     pub fn as_unique_es_symbol_type_mut(&mut self) -> &mut UniqueESSymbolType {
         match &mut self.data {
             TypeData::UniqueESSymbol(d) => d,
-            _ => type_cast_panic("UniqueESSymbolType"),
+            other => type_cast_panic(other, "UniqueESSymbolType"),
         }
     }
 
@@ -914,14 +919,14 @@ impl Type {
     pub fn as_tuple_type(&self) -> &TupleType {
         match &self.data {
             TypeData::Tuple(d) => d,
-            _ => type_cast_panic("TupleType"),
+            other => type_cast_panic(other, "TupleType"),
         }
     }
     #[inline]
     pub fn as_tuple_type_mut(&mut self) -> &mut TupleType {
         match &mut self.data {
             TypeData::Tuple(d) => d,
-            _ => type_cast_panic("TupleType"),
+            other => type_cast_panic(other, "TupleType"),
         }
     }
 
@@ -930,14 +935,14 @@ impl Type {
     pub fn as_instantiation_expression_type(&self) -> &InstantiationExpressionType {
         match &self.data {
             TypeData::InstantiationExpression(d) => d,
-            _ => type_cast_panic("InstantiationExpressionType"),
+            other => type_cast_panic(other, "InstantiationExpressionType"),
         }
     }
     #[inline]
     pub fn as_instantiation_expression_type_mut(&mut self) -> &mut InstantiationExpressionType {
         match &mut self.data {
             TypeData::InstantiationExpression(d) => d,
-            _ => type_cast_panic("InstantiationExpressionType"),
+            other => type_cast_panic(other, "InstantiationExpressionType"),
         }
     }
 
@@ -946,14 +951,14 @@ impl Type {
     pub fn as_mapped_type(&self) -> &MappedType {
         match &self.data {
             TypeData::Mapped(d) => d,
-            _ => type_cast_panic("MappedType"),
+            other => type_cast_panic(other, "MappedType"),
         }
     }
     #[inline]
     pub fn as_mapped_type_mut(&mut self) -> &mut MappedType {
         match &mut self.data {
             TypeData::Mapped(d) => d,
-            _ => type_cast_panic("MappedType"),
+            other => type_cast_panic(other, "MappedType"),
         }
     }
 
@@ -962,14 +967,14 @@ impl Type {
     pub fn as_reverse_mapped_type(&self) -> &ReverseMappedType {
         match &self.data {
             TypeData::ReverseMapped(d) => d,
-            _ => type_cast_panic("ReverseMappedType"),
+            other => type_cast_panic(other, "ReverseMappedType"),
         }
     }
     #[inline]
     pub fn as_reverse_mapped_type_mut(&mut self) -> &mut ReverseMappedType {
         match &mut self.data {
             TypeData::ReverseMapped(d) => d,
-            _ => type_cast_panic("ReverseMappedType"),
+            other => type_cast_panic(other, "ReverseMappedType"),
         }
     }
 
@@ -978,14 +983,14 @@ impl Type {
     pub fn as_evolving_array_type(&self) -> &EvolvingArrayType {
         match &self.data {
             TypeData::EvolvingArray(d) => d,
-            _ => type_cast_panic("EvolvingArrayType"),
+            other => type_cast_panic(other, "EvolvingArrayType"),
         }
     }
     #[inline]
     pub fn as_evolving_array_type_mut(&mut self) -> &mut EvolvingArrayType {
         match &mut self.data {
             TypeData::EvolvingArray(d) => d,
-            _ => type_cast_panic("EvolvingArrayType"),
+            other => type_cast_panic(other, "EvolvingArrayType"),
         }
     }
 
@@ -994,14 +999,14 @@ impl Type {
     pub fn as_type_parameter(&self) -> &TypeParameter {
         match &self.data {
             TypeData::TypeParameter(d) => d,
-            _ => type_cast_panic("TypeParameter"),
+            other => type_cast_panic(other, "TypeParameter"),
         }
     }
     #[inline]
     pub fn as_type_parameter_mut(&mut self) -> &mut TypeParameter {
         match &mut self.data {
             TypeData::TypeParameter(d) => d,
-            _ => type_cast_panic("TypeParameter"),
+            other => type_cast_panic(other, "TypeParameter"),
         }
     }
 
@@ -1010,14 +1015,14 @@ impl Type {
     pub fn as_union_type(&self) -> &UnionType {
         match &self.data {
             TypeData::Union(d) => d,
-            _ => type_cast_panic("UnionType"),
+            other => type_cast_panic(other, "UnionType"),
         }
     }
     #[inline]
     pub fn as_union_type_mut(&mut self) -> &mut UnionType {
         match &mut self.data {
             TypeData::Union(d) => d,
-            _ => type_cast_panic("UnionType"),
+            other => type_cast_panic(other, "UnionType"),
         }
     }
 
@@ -1026,14 +1031,14 @@ impl Type {
     pub fn as_intersection_type(&self) -> &IntersectionType {
         match &self.data {
             TypeData::Intersection(d) => d,
-            _ => type_cast_panic("IntersectionType"),
+            other => type_cast_panic(other, "IntersectionType"),
         }
     }
     #[inline]
     pub fn as_intersection_type_mut(&mut self) -> &mut IntersectionType {
         match &mut self.data {
             TypeData::Intersection(d) => d,
-            _ => type_cast_panic("IntersectionType"),
+            other => type_cast_panic(other, "IntersectionType"),
         }
     }
 
@@ -1042,14 +1047,14 @@ impl Type {
     pub fn as_index_type(&self) -> &IndexType {
         match &self.data {
             TypeData::Index(d) => d,
-            _ => type_cast_panic("IndexType"),
+            other => type_cast_panic(other, "IndexType"),
         }
     }
     #[inline]
     pub fn as_index_type_mut(&mut self) -> &mut IndexType {
         match &mut self.data {
             TypeData::Index(d) => d,
-            _ => type_cast_panic("IndexType"),
+            other => type_cast_panic(other, "IndexType"),
         }
     }
 
@@ -1058,14 +1063,14 @@ impl Type {
     pub fn as_indexed_access_type(&self) -> &IndexedAccessType {
         match &self.data {
             TypeData::IndexedAccess(d) => d,
-            _ => type_cast_panic("IndexedAccessType"),
+            other => type_cast_panic(other, "IndexedAccessType"),
         }
     }
     #[inline]
     pub fn as_indexed_access_type_mut(&mut self) -> &mut IndexedAccessType {
         match &mut self.data {
             TypeData::IndexedAccess(d) => d,
-            _ => type_cast_panic("IndexedAccessType"),
+            other => type_cast_panic(other, "IndexedAccessType"),
         }
     }
 
@@ -1074,14 +1079,14 @@ impl Type {
     pub fn as_template_literal_type(&self) -> &TemplateLiteralType {
         match &self.data {
             TypeData::TemplateLiteral(d) => d,
-            _ => type_cast_panic("TemplateLiteralType"),
+            other => type_cast_panic(other, "TemplateLiteralType"),
         }
     }
     #[inline]
     pub fn as_template_literal_type_mut(&mut self) -> &mut TemplateLiteralType {
         match &mut self.data {
             TypeData::TemplateLiteral(d) => d,
-            _ => type_cast_panic("TemplateLiteralType"),
+            other => type_cast_panic(other, "TemplateLiteralType"),
         }
     }
 
@@ -1090,14 +1095,14 @@ impl Type {
     pub fn as_string_mapping_type(&self) -> &StringMappingType {
         match &self.data {
             TypeData::StringMapping(d) => d,
-            _ => type_cast_panic("StringMappingType"),
+            other => type_cast_panic(other, "StringMappingType"),
         }
     }
     #[inline]
     pub fn as_string_mapping_type_mut(&mut self) -> &mut StringMappingType {
         match &mut self.data {
             TypeData::StringMapping(d) => d,
-            _ => type_cast_panic("StringMappingType"),
+            other => type_cast_panic(other, "StringMappingType"),
         }
     }
 
@@ -1106,14 +1111,14 @@ impl Type {
     pub fn as_substitution_type(&self) -> &SubstitutionType {
         match &self.data {
             TypeData::Substitution(d) => d,
-            _ => type_cast_panic("SubstitutionType"),
+            other => type_cast_panic(other, "SubstitutionType"),
         }
     }
     #[inline]
     pub fn as_substitution_type_mut(&mut self) -> &mut SubstitutionType {
         match &mut self.data {
             TypeData::Substitution(d) => d,
-            _ => type_cast_panic("SubstitutionType"),
+            other => type_cast_panic(other, "SubstitutionType"),
         }
     }
 
@@ -1122,34 +1127,35 @@ impl Type {
     pub fn as_conditional_type(&self) -> &ConditionalType {
         match &self.data {
             TypeData::Conditional(d) => d,
-            _ => type_cast_panic("ConditionalType"),
+            other => type_cast_panic(other, "ConditionalType"),
         }
     }
     #[inline]
     pub fn as_conditional_type_mut(&mut self) -> &mut ConditionalType {
         match &mut self.data {
             TypeData::Conditional(d) => d,
-            _ => type_cast_panic("ConditionalType"),
+            other => type_cast_panic(other, "ConditionalType"),
         }
     }
 
     // Casts for embedded struct types
     // PORT: Go returns nil for kinds without the embedded struct, and the
-    // caller then panics on field access. These panic at the cast instead.
-    // Use `self.data.as_x()` (returns `Option`) for Go nil checks.
+    // caller then panics on field access. These panic at the cast instead,
+    // with Go's nil dereference text. Use `self.data.as_x()` (returns
+    // `Option`) for Go nil checks.
 
     // Go: checker/types.go:712 Type.AsConstrainedType
     #[inline]
     pub fn as_constrained_type(&self) -> &ConstrainedType {
         self.data
             .as_constrained_type()
-            .unwrap_or_else(|| type_cast_panic("ConstrainedType"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
     #[inline]
     pub fn as_constrained_type_mut(&mut self) -> &mut ConstrainedType {
         self.data
             .as_constrained_type_mut()
-            .unwrap_or_else(|| type_cast_panic("ConstrainedType"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     // Go: checker/types.go:713 Type.AsStructuredType
@@ -1157,13 +1163,13 @@ impl Type {
     pub fn as_structured_type(&self) -> &StructuredType {
         self.data
             .as_structured_type()
-            .unwrap_or_else(|| type_cast_panic("StructuredType"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
     #[inline]
     pub fn as_structured_type_mut(&mut self) -> &mut StructuredType {
         self.data
             .as_structured_type_mut()
-            .unwrap_or_else(|| type_cast_panic("StructuredType"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     // Go: checker/types.go:714 Type.AsObjectType
@@ -1171,13 +1177,13 @@ impl Type {
     pub fn as_object_type(&self) -> &ObjectType {
         self.data
             .as_object_type()
-            .unwrap_or_else(|| type_cast_panic("ObjectType"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
     #[inline]
     pub fn as_object_type_mut(&mut self) -> &mut ObjectType {
         self.data
             .as_object_type_mut()
-            .unwrap_or_else(|| type_cast_panic("ObjectType"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     // Go: checker/types.go:715 Type.AsTypeReference
@@ -1185,13 +1191,13 @@ impl Type {
     pub fn as_type_reference(&self) -> &TypeReference {
         self.data
             .as_type_reference()
-            .unwrap_or_else(|| type_cast_panic("TypeReference"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
     #[inline]
     pub fn as_type_reference_mut(&mut self) -> &mut TypeReference {
         self.data
             .as_type_reference_mut()
-            .unwrap_or_else(|| type_cast_panic("TypeReference"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     // Go: checker/types.go:716 Type.AsInterfaceType
@@ -1199,13 +1205,13 @@ impl Type {
     pub fn as_interface_type(&self) -> &InterfaceType {
         self.data
             .as_interface_type()
-            .unwrap_or_else(|| type_cast_panic("InterfaceType"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
     #[inline]
     pub fn as_interface_type_mut(&mut self) -> &mut InterfaceType {
         self.data
             .as_interface_type_mut()
-            .unwrap_or_else(|| type_cast_panic("InterfaceType"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     // Go: checker/types.go:717 Type.AsUnionOrIntersectionType
@@ -1213,13 +1219,13 @@ impl Type {
     pub fn as_union_or_intersection_type(&self) -> &UnionOrIntersectionType {
         self.data
             .as_union_or_intersection_type()
-            .unwrap_or_else(|| type_cast_panic("UnionOrIntersectionType"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
     #[inline]
     pub fn as_union_or_intersection_type_mut(&mut self) -> &mut UnionOrIntersectionType {
         self.data
             .as_union_or_intersection_type_mut()
-            .unwrap_or_else(|| type_cast_panic("UnionOrIntersectionType"))
+            .unwrap_or_else(|| crate::core::go_nil_dereference())
     }
 
     // PORT: Go returns a fresh slice (`[]*Type{t}`) for the default case, so
@@ -1496,6 +1502,34 @@ pub enum TypeData {
     EvolvingArray(Box<EvolvingArrayType>),
     Union(ArenaBox<UnionType>),
     Intersection(ArenaBox<IntersectionType>),
+}
+
+impl TypeData {
+    /// The name of the Go struct of this data (`*checker.<name>`).
+    fn go_struct_name(&self) -> &'static str {
+        match self {
+            TypeData::Intrinsic(_) => "IntrinsicType",
+            TypeData::Literal(_) => "LiteralType",
+            TypeData::UniqueESSymbol(_) => "UniqueESSymbolType",
+            TypeData::TypeParameter(_) => "TypeParameter",
+            TypeData::Index(_) => "IndexType",
+            TypeData::IndexedAccess(_) => "IndexedAccessType",
+            TypeData::TemplateLiteral(_) => "TemplateLiteralType",
+            TypeData::StringMapping(_) => "StringMappingType",
+            TypeData::Substitution(_) => "SubstitutionType",
+            TypeData::Conditional(_) => "ConditionalType",
+            TypeData::Object(_) => "ObjectType",
+            TypeData::TypeReference(_) => "TypeReference",
+            TypeData::Interface(_) => "InterfaceType",
+            TypeData::Tuple(_) => "TupleType",
+            TypeData::InstantiationExpression(_) => "InstantiationExpressionType",
+            TypeData::Mapped(_) => "MappedType",
+            TypeData::ReverseMapped(_) => "ReverseMappedType",
+            TypeData::EvolvingArray(_) => "EvolvingArrayType",
+            TypeData::Union(_) => "UnionType",
+            TypeData::Intersection(_) => "IntersectionType",
+        }
+    }
 }
 
 // PORT: the arena keeps a dummy `Type` at index 0, so `TypeData` needs a

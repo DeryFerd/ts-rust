@@ -1519,6 +1519,11 @@ impl Checker {
                 0
             };
         if pos < param_count {
+            // PORT: Go indexes with the int `pos`, so a negative one (an API
+            // argument index) panics with the runtime text.
+            if pos < 0 {
+                crate::core::go_panic(format!("runtime error: index out of range [{pos}]"));
+            }
             let parameter = self.sig(signature).parameters[pos as usize];
             return self.get_type_of_parameter(parameter);
         }

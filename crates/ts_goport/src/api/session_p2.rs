@@ -628,10 +628,11 @@ impl Session {
         }
 
         // PORT: Go converts any int32 to `ast.Kind` (int16). A value that is
-        // no SyntaxKind has no Rust value; it panics here (Go's node builder
-        // has no case for it either).
-        let kind = SyntaxKind::try_from(params.kind as u16)
-            .unwrap_or_else(|_| panic!("ast.Kind({}) is not a syntax kind", params.kind));
+        // no SyntaxKind has no Rust value. Go's node builder builds the parts
+        // and then panics in the default case of its kind switch
+        // (nodebuilderimpl.go:1972). `Unknown` takes the same path: the
+        // builder compares the kind only with signature kinds.
+        let kind = SyntaxKind::try_from(params.kind as u16).unwrap_or(SyntaxKind::Unknown);
         let node = setup
             .checker
             .borrow_mut()
@@ -1828,6 +1829,19 @@ impl Session {
         }
         let symbol = checker_symbol(&setup.checker, &owner, symbol);
 
+        // PORT: Go's getImmediateAliasedSymbol asserts that the symbol is an
+        // alias (checker.go:2197). The checker's assert is a debug_assert!,
+        // so that no Go assert panic is new on a CLI path; this request can
+        // name any symbol, so it asserts here.
+        go_assert!(
+            setup
+                .checker
+                .borrow()
+                .sym(symbol)
+                .flags
+                .intersects(SymbolFlags::ALIAS),
+            "Should only get Alias here."
+        );
         let aliased = setup
             .checker
             .borrow_mut()
@@ -2597,8 +2611,34 @@ impl Session {
             }
             let lang_svc =
                 self.setup_language_service(snapshot, Rc::clone(program), &params.project, "")?;
-            let internal_pos =
-                source_file_get_position_map(source_file).utf16_to_utf8(params.position as i32);
+            // PORT: Go converts the uint32 position to a 64-bit int, and
+            // UTF16ToUTF8 adds the delta of the last entry to a position past
+            // all entries. A position past i32::MAX is past any text. With no
+            // trigger character, Go's first read of it is the JSDoc snippet
+            // slice `text[lineStart:position]` (ls/jsdoc_snippet.go:77).
+            // Otherwise the port runs with i32::MAX, which takes the same
+            // branches, but a panic there names that bound.
+            let position_map = source_file_get_position_map(source_file);
+            let go_position = i64::from(params.position)
+                + i64::from(position_map.entries.last().map_or(0, |e| e.delta));
+            let internal_pos = match i32::try_from(go_position) {
+                Ok(_) => position_map.utf16_to_utf8(params.position as i32),
+                Err(_) => {
+                    if params.trigger_character.is_none()
+                        && !lang_svc
+                            .user_preferences()
+                            .enable_js_doc_completions
+                            .is_false()
+                    {
+                        let len = crate::scanner_util::go_len(&source_file_text(source_file));
+                        crate::core::go_panic(format!(
+                            "runtime error: slice bounds out of range [:{go_position}] with length {len}"
+                        ));
+                    }
+                    i32::MAX
+                }
+            };
+            drop(position_map);
             let result = lang_svc.get_completions_at_position_exported(
                 ctx,
                 source_file,
