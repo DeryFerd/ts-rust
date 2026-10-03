@@ -64,9 +64,9 @@ To try the example, run `python3 -m http.server -d npm/wasm` and open
 ## How it works
 
 - `crates/ts_wasm` is the module: `tsc` from `ts_goport` for `wasm32-wasip1`. The `wasm` cargo
-  profile (opt-level z, fat LTO) and wasm-opt make it 5.4 MB (2.3 MB gzip, 1.8 MB brotli). The
+  profile (opt-level z, fat LTO) and wasm-opt make it 5.1 MB (2.2 MB gzip, 1.8 MB brotli). The
   libs are in it, packed with LZMA. `scripts/wasm/build.sh` tells how to build a module that
-  checks about 17% faster at 6.5 MB.
+  checks 17 to 20% faster at 6.2 MB. The diagnostic message texts are packed too.
 - The host (`core.js`) gives the file system through two imports (`ts_host.fs`, `fs_take`), and a
   small WASI shim gives clocks, random bytes, stdout and stderr. There is no WASI file system and
   no `node:wasi`.
