@@ -195,7 +195,12 @@ impl<'a> Parser<'a> {
             let mut err_loc = name.loc();
             if err_loc.len() == 0 {
                 // missing name, emit error on the character before the missing name node
-                err_loc = TextRange::new(name.loc().pos() - 1, name.loc().pos());
+                // PORT: Go `pos-1` is one Go byte back (`go_offset_before`).
+                let pos = name.loc().pos();
+                err_loc = TextRange::new(
+                    crate::scanner_util::go_offset_before(self.source_text, pos),
+                    pos,
+                );
             }
             self.parse_error_at_range(err_loc, diag::Identifier_expected, args![]);
         }

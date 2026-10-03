@@ -472,6 +472,57 @@ pub fn go_slice(s: &str, from: usize, to: usize) -> Cow<'_, str> {
     }
 }
 
+/// Go `s[lo:hi]` with port offsets `lo <= hi <= s.len()` (see
+/// `GO_STRING_MARKER`). Go slices bytes, so `lo` or `hi` can cut a char: Go
+/// keeps the cut bytes and reads each one as a RuneError of size 1. Here
+/// each cut byte is an invalid byte unit (`go_string_from_bytes`), so the
+/// result is longer than `hi - lo` at a cut. A slice at unit boundaries is
+/// borrowed.
+// PORT: a bound `k` bytes into a unit of `g` Go bytes is Go's bound `k`
+// bytes into the unit's Go bytes, at most `g` (`go_byte_offset`). So a bound
+// inside a marker unit (also at the char boundary between its two chars)
+// cuts the unit's Go bytes, and the rest of that unit is not in the slice. A
+// real U+FDD0 is two markers, and its first holds Go's 3 bytes. Such bounds
+// come from Go positions inside a char: the JSDoc tail cut (parser
+// `jsdoc_text_cut`) and LSP positions inside a surrogate pair.
+pub fn go_cut_slice(s: &str, lo: usize, hi: usize) -> Cow<'_, str> {
+    let lo_cut = go_unit_cut_at(s, lo);
+    let hi_cut = go_unit_cut_at(s, hi);
+    if lo_cut.is_none() && hi_cut.is_none() {
+        return Cow::Borrowed(&s[lo..hi]);
+    }
+    // The Go bytes of the cut unit at `at` from `from` to `to` port bytes
+    // into it.
+    let cut_bytes = |at: usize, unit: GoUnit, from: usize, to: usize| -> Vec<u8> {
+        let mut buf = [0u8; 4];
+        let bytes = go_unit_bytes(unit, &mut buf);
+        bytes[(from - at).min(bytes.len())..(to - at).min(bytes.len())].to_vec()
+    };
+    match (lo_cut, hi_cut) {
+        (Some((at, unit, _)), Some((hi_at, _, _))) if hi_at == at => {
+            Cow::Owned(go_string_from_bytes(cut_bytes(at, unit, lo, hi)))
+        }
+        _ => {
+            // The whole units are `head..tail`; the bytes around them are
+            // cut.
+            let (mut out, head) = match lo_cut {
+                Some((at, unit, size)) => (
+                    go_string_from_bytes(cut_bytes(at, unit, lo, at + size)),
+                    at + size,
+                ),
+                None => (String::new(), lo),
+            };
+            let (tail, suffix) = match hi_cut {
+                Some((at, unit, _)) => (at, go_string_from_bytes(cut_bytes(at, unit, at, hi))),
+                None => (hi, String::new()),
+            };
+            out.push_str(&s[head..tail]);
+            out.push_str(&suffix);
+            Cow::Owned(out)
+        }
+    }
+}
+
 /// Go `[]rune(s)` on the Go bytes of the port form `s`: each byte that is
 /// not valid UTF-8 is one U+FFFD. A lone surrogate unit is 3 such bytes.
 pub fn go_runes(s: &str) -> Vec<char> {
@@ -778,6 +829,31 @@ pub fn port_byte_offset(text: &str, go_pos: i32) -> i32 {
         port = at + size;
     }
     (port + (go_pos - go)) as i32
+}
+
+/// Go `pos-1` on the port offset `pos` of the port form `text`: the port
+/// offset of the Go byte before `pos`. Go steps back one byte, which can be
+/// inside the char before `pos`. A `pos` of 0 or less, or past the end,
+/// gives `pos - 1`.
+// PORT: a valid char has the same bytes in both forms, so only a marker
+// unit (see `GO_STRING_MARKER`) differs from `pos - 1`. Go offset `k` into
+// a unit of `g` Go bytes is port offset `at + k` (`port_byte_offset`), and
+// a `pos` `k` bytes into a unit is Go offset `min(k, g)` in it
+// (`go_byte_offset`).
+pub fn go_offset_before(text: &str, pos: i32) -> i32 {
+    let bytes = text.as_bytes();
+    if pos <= 0 || pos as usize > bytes.len() || bytes[pos as usize - 1] < 0x80 {
+        return pos - 1;
+    }
+    let p = pos as usize;
+    let (at, go_k) = match go_unit_cut_at(text, p) {
+        Some((at, unit, _)) => (at, (p - at).min(unit.go_len())),
+        None => {
+            let (unit, size) = go_unit_before(text, p);
+            (p - size, unit.go_len())
+        }
+    };
+    (at + go_k - 1) as i32
 }
 
 /// `go_byte_offset` and `port_byte_offset` for many offsets of one text,

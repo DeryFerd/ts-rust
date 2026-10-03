@@ -161,7 +161,7 @@ type ProgramTest = (
     ScriptTarget,
 );
 
-// Go: compiler/program_test.go:129 programTestCases
+// Go: compiler/program_test.go:133 programTestCases
 #[rustfmt::skip]
 const PROGRAM_TEST_CASES: &[ProgramTest] = &[
     (
@@ -217,7 +217,7 @@ const PROGRAM_TEST_CASES: &[ProgramTest] = &[
     ),
 ];
 
-// Go: compiler/program_test.go:225 TestProgram
+// Go: compiler/program_test.go:229 TestProgram
 // PORT: the Go subtests run on one map file system each. Here they run in
 // one child process with one map file system (the OS override is set once
 // per process); each subtest writes its files over the previous ones, and
@@ -275,7 +275,7 @@ fn test_program() {
     });
 }
 
-// Go: compiler/program_test.go:267 TestIncludeProcessorDiagnosticsWithMissingFileCasing
+// Go: compiler/program_test.go:271 TestIncludeProcessorDiagnosticsWithMissingFileCasing
 #[test]
 fn test_include_processor_diagnostics_with_missing_file_casing() {
     in_child(
@@ -325,7 +325,7 @@ fn test_include_processor_diagnostics_with_missing_file_casing() {
     );
 }
 
-// Go: checker/checker_test.go:19 TestGetSymbolAtLocation
+// Go: checker/checker_test.go:20 TestGetSymbolAtLocation
 #[test]
 fn test_get_symbol_at_location() {
     in_child(module_path!(), "test_get_symbol_at_location", || {
@@ -389,6 +389,59 @@ foo.bar;";
         }
         done.call();
     });
+}
+
+// PORT: no Go counterpart (followups11 item 1). Go `EagerJSDoc` (ast.go:1581)
+// reads the file's JSDoc cache, which also holds the comments that a lazy
+// parse (`resolveJSDoc`, ast.go:2745) added. The parser defers a TS comment
+// whose `{@link}` its prefilter misses (`{@link<form feed>Foo}`). The call
+// `f()` before `f` reads that comment lazily (the `@deprecated` check), so
+// `checkSourceElement` (checker.go:2296) sees the link and marks `Foo` used.
+// Go N reports nothing; before 6472f970b the port reported TS6133 "'Foo' is
+// declared but its value is never read".
+#[test]
+fn test_lazy_js_doc_link_marks_its_target_used() {
+    in_child(
+        module_path!(),
+        "test_lazy_js_doc_link_marks_its_target_used",
+        || {
+            let map_fs = MapFs::from_map(
+                [
+                    (
+                        "/a.ts",
+                        "import { Foo } from \"./foo\";\nf();\n/** @deprecated {@link\u{C}Foo} */\nexport function f() {}\n",
+                    ),
+                    ("/foo.ts", "export class Foo {}\n"),
+                    (
+                        "/tsconfig.json",
+                        r#"{"compilerOptions":{"strict":true,"noUnusedLocals":true,"noEmit":true,"module":"esnext","target":"es2022"},"files":["a.ts","foo.ts"]}"#,
+                    ),
+                ],
+                false, /*useCaseSensitiveFileNames*/
+            );
+            install_map_fs(&map_fs, "/");
+            let fs = bundled::wrap_fs(map_fs.fs());
+            let host = new_compiler_host("/", fs, &bundled::lib_path(), None, None, None);
+            let (parsed, errors) = get_parsed_command_line_of_config_file(
+                "/tsconfig.json",
+                Some(&CompilerOptions::default()),
+                None,
+                &HostAsParseConfigHost(host),
+                None,
+            );
+            assert_eq!(errors.len(), 0, "Expected no errors in parsed command line");
+            let p =
+                new_program_with_config(map_fs.fs(), "/", Rc::new(parsed.expect("parsed config")));
+            let _current = ls_program::enter(&p);
+            let file = source_file(&p, "/a.ts").root;
+            let codes: Vec<i32> =
+                ls_program::get_semantic_diagnostics(&p, &context::background(), file)
+                    .iter()
+                    .map(Diagnostic::code)
+                    .collect();
+            assert_eq!(codes, Vec::<i32>::new());
+        },
+    );
 }
 
 /// A compiler host used as a `tsoptions.ParseConfigHost`.

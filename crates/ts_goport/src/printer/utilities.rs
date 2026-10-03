@@ -1141,19 +1141,36 @@ pub fn is_recognized_triple_slash_comment(text: &str, comment_range: CommentRang
 }
 
 // Go: printer/utilities.go:852 isJSDocLikeText
+// PORT: Go `comment.Len()` counts Go bytes (`comment_go_len_at_least`).
+// The bytes at `pos+2` and `pos+3` follow the ASCII `/*`: a byte there is
+// ASCII in the port form exactly when it is in Go, so the compares agree.
 pub(crate) fn is_js_doc_like_text(text: &str, comment: CommentRange) -> bool {
     let bytes = text.as_bytes();
     comment.kind == SyntaxKind::MultiLineCommentTrivia
-        && comment.len() >= 5
+        && comment_go_len_at_least(text, comment, 5)
         && bytes[(comment.pos() + 2) as usize] == b'*'
         && bytes[(comment.pos() + 3) as usize] != b'/'
 }
 
 // Go: printer/utilities.go:859 IsPinnedComment
+// PORT: Go `comment.Len() > 5` counts Go bytes (`comment_go_len_at_least`).
 pub fn is_pinned_comment(text: &str, comment: CommentRange) -> bool {
     comment.kind == SyntaxKind::MultiLineCommentTrivia
-        && comment.len() > 5
+        && comment_go_len_at_least(text, comment, 6)
         && text.as_bytes()[(comment.pos() + 2) as usize] == b'!'
+}
+
+/// Reports whether Go `comment.Len()`, the Go bytes of the comment, is at
+/// least `n`.
+// PORT: a marker unit (see `scanner_util::GO_STRING_MARKER`) has more port
+// bytes than Go bytes, at most 7 for 1. A port length below `n` or at least
+// `7 * n` decides it; only a short comment counts its Go bytes.
+fn comment_go_len_at_least(text: &str, comment: CommentRange, n: i32) -> bool {
+    let len = comment.len();
+    len >= n
+        && (len >= 7 * n
+            || crate::scanner_util::go_len(&text[comment.pos() as usize..comment.end() as usize])
+                >= n as usize)
 }
 
 // Go: printer/utilities.go:865 calculateIndent
@@ -1343,6 +1360,36 @@ mod tests {
                     assert_eq!(skipped, full, "{text:?} {quote:?} {flags:?}");
                 }
             }
+        }
+    }
+
+    /// `isJSDocLikeText` and `IsPinnedComment` compare Go `comment.Len()`,
+    /// the Go bytes (printer/utilities.go:852 and :859). An invalid byte is
+    /// 1 Go byte and 7 port bytes, so `/**` + FF is 4 Go bytes and not JSDoc
+    /// like, and `/*!` + FF + `x` is 5 and not pinned. Declaration emit of a
+    /// file that ends in `/**` + FF wrote the comment where Go writes none.
+    #[test]
+    fn comment_checks_count_go_bytes() {
+        let comment = |go: &[u8]| {
+            let text = crate::scanner_util::go_string_from_bytes(go.to_vec());
+            let range = CommentRange {
+                text_range: TextRange::new(0, text.len() as i32),
+                kind: SyntaxKind::MultiLineCommentTrivia,
+                has_trailing_new_line: false,
+            };
+            (text, range)
+        };
+        for (go, jsdoc_like, pinned) in [
+            (&b"/**\xFF"[..], false, false),
+            (b"/**\xFF*", true, false),
+            (b"/*!\xFFx", false, false),
+            (b"/*!\xFFx*", false, true),
+            (b"/*!\xED\xA0\x80", false, true),
+            (b"/**\xEF\xB7\x90", true, false),
+        ] {
+            let (text, range) = comment(go);
+            assert_eq!(is_js_doc_like_text(&text, range), jsdoc_like, "{go:?}");
+            assert_eq!(is_pinned_comment(&text, range), pinned, "{go:?}");
         }
     }
 
